@@ -44,7 +44,7 @@ def _isolate_runtime_syncs(monkeypatch):
     ):
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setattr(
-        "opensquilla.gateway.rpc_onboarding._sync_image_generation",
+        "opensquilla.gateway.setup_config_runtime.sync_media_runtime",
         lambda config: None,
     )
 
@@ -716,11 +716,11 @@ async def test_active_credential_clear_persist_failure_leaves_runtime_untouched(
     ctx = _admin_ctx(cfg)
     sync_attempts: list[str] = []
     monkeypatch.setattr(
-        "opensquilla.gateway.rpc_onboarding._persist",
+        "opensquilla.gateway.adapters.setup_config.persist_setup_candidate",
         lambda *args, **kwargs: (_ for _ in ()).throw(OSError("synthetic write failure")),
     )
     monkeypatch.setattr(
-        "opensquilla.gateway.rpc_onboarding._sync_provider_selector",
+        "opensquilla.gateway.provider_runtime.sync_provider_selector",
         lambda *args: sync_attempts.append("selector"),
     )
 
@@ -762,7 +762,7 @@ async def test_profile_credential_clear_persist_failure_keeps_config_and_pool(
     )
     ctx = _admin_ctx(cfg)
     monkeypatch.setattr(
-        "opensquilla.gateway.rpc_onboarding._persist",
+        "opensquilla.gateway.adapters.setup_config.persist_setup_candidate",
         lambda *args, **kwargs: (_ for _ in ()).throw(OSError("synthetic write failure")),
     )
     try:

@@ -16,6 +16,7 @@ import {
   type RouterVisualMode,
 } from '@/utils/chat/routerVisualMode'
 import type { DiscoveredModelsByProvider } from '@/composables/setup/useSetupProviderForm'
+import type { ConfigureRouter } from '@/modules/setupWorkflow'
 
 export interface SetupTierValue {
   provider: string
@@ -82,7 +83,7 @@ export function buildRouterPayload(
   mode: string,
   defaultTier: string,
   tierValues: Record<string, SetupTierValue>,
-): Record<string, unknown> {
+): ConfigureRouter {
   const tiers: Record<string, Record<string, unknown>> = {}
   Object.entries(tierValues).forEach(([name, tier]) => {
     const tierName = normalizeRouterTier(name) || name
@@ -583,7 +584,7 @@ export function useSetupRouterForm() {
     routerVisualMode.value = normalizeRouterVisualMode(value)
   }
 
-  function payload(): Record<string, unknown> {
+  function payload(): ConfigureRouter {
     const mode = routerMode.value === 'disabled'
       ? 'disabled'
       : hasMixedTierProviders.value

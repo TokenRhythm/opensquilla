@@ -1,0 +1,265 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://opensquilla.dev/contracts/gateway/v4/platform/onboarding-channel-disable.schema.json",
+  "title": "OpenSquilla onboarding.channel.disable Contract",
+  "description": "Language-neutral Contract for the existing onboarding.channel.disable Gateway v4 wire behavior.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "request": {
+      "$ref": "#/$defs/OnboardingChannelDisableRequestFrame"
+    },
+    "response": {
+      "$ref": "#/$defs/OnboardingChannelDisableResponseFrame"
+    }
+  },
+  "x-opensquilla-wire": {
+    "protocol": "opensquilla-websocket-json",
+    "version": 4,
+    "compatibility": "exact-json-tree"
+  },
+  "x-opensquilla-codegen": {
+    "python": {
+      "tool": "datamodel-code-generator",
+      "version": "0.75.1",
+      "target": "pydantic_v2.BaseModel"
+    },
+    "typescript": {
+      "tool": "json-schema-to-typescript",
+      "version": "15.0.4"
+    },
+    "runtimeValidation": {
+      "tool": "ajv",
+      "version": "8.17.1",
+      "mode": "standalone-adapter-only"
+    }
+  },
+  "x-opensquilla-method": {
+    "name": "onboarding.channel.disable",
+    "kind": "command",
+    "scope": "operator.admin",
+    "guestAllowed": false,
+    "idempotency": "idempotent",
+    "timeout": {
+      "policy": "transport"
+    },
+    "capability": {
+      "kind": "method-availability",
+      "name": "onboarding.channel.disable"
+    },
+    "request": "#/$defs/OnboardingChannelDisableRequestFrame",
+    "params": "#/$defs/OnboardingChannelDisableParams",
+    "response": "#/$defs/OnboardingChannelDisableResponseFrame",
+    "result": "#/$defs/OnboardingChannelDisableResult",
+    "errors": [
+      {
+        "code": "INVALID_REQUEST"
+      },
+      {
+        "code": "onboarding.channel.not_found"
+      },
+      {
+        "code": "UNAUTHORIZED"
+      },
+      {
+        "code": "UNAVAILABLE",
+        "retryable": true
+      },
+      {
+        "code": "INTERNAL_ERROR"
+      }
+    ]
+  },
+  "$defs": {
+    "ChannelLiveApplyOutcome": {
+      "type": "string",
+      "enum": [
+        "started",
+        "rebuilt",
+        "removed",
+        "unchanged",
+        "pending_restart",
+        "failed"
+      ]
+    },
+    "OnboardingChannelDisableParams": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": [
+        "name"
+      ],
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "OnboardingChannelDisableResult": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": [
+        "changed",
+        "restartRequired",
+        "liveApply",
+        "configPath",
+        "name",
+        "enabled"
+      ],
+      "properties": {
+        "changed": {
+          "type": "boolean"
+        },
+        "restartRequired": {
+          "type": "boolean"
+        },
+        "liveApply": {
+          "oneOf": [
+            {
+              "type": "object",
+              "additionalProperties": {
+                "$ref": "#/$defs/ChannelLiveApplyOutcome"
+              }
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "configPath": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "enabled": {
+          "const": false
+        }
+      }
+    },
+    "OnboardingChannelDisableRequestFrame": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "id",
+        "method",
+        "params"
+      ],
+      "properties": {
+        "type": {
+          "const": "req"
+        },
+        "id": {
+          "type": "string"
+        },
+        "method": {
+          "const": "onboarding.channel.disable"
+        },
+        "params": {
+          "$ref": "#/$defs/OnboardingChannelDisableParams"
+        }
+      }
+    },
+    "RpcError": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": [
+        "code",
+        "message"
+      ],
+      "properties": {
+        "code": {
+          "type": "string"
+        },
+        "message": {
+          "type": "string"
+        },
+        "details": {},
+        "retryable": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "retry_after_ms": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "accepted": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        }
+      }
+    },
+    "OnboardingChannelDisableOkResponseFrame": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "id",
+        "ok",
+        "payload"
+      ],
+      "properties": {
+        "type": {
+          "const": "res"
+        },
+        "id": {
+          "type": "string"
+        },
+        "ok": {
+          "const": true
+        },
+        "payload": {
+          "$ref": "#/$defs/OnboardingChannelDisableResult"
+        },
+        "error": {
+          "type": "null"
+        }
+      }
+    },
+    "OnboardingChannelDisableErrorResponseFrame": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "id",
+        "ok",
+        "error"
+      ],
+      "properties": {
+        "type": {
+          "const": "res"
+        },
+        "id": {
+          "type": "string"
+        },
+        "ok": {
+          "const": false
+        },
+        "payload": {
+          "type": "null"
+        },
+        "error": {
+          "$ref": "#/$defs/RpcError"
+        }
+      }
+    },
+    "OnboardingChannelDisableResponseFrame": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/OnboardingChannelDisableOkResponseFrame"
+        },
+        {
+          "$ref": "#/$defs/OnboardingChannelDisableErrorResponseFrame"
+        }
+      ]
+    }
+  }
+}

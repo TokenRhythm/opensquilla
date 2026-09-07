@@ -4,12 +4,10 @@ import { watch } from 'vue'
 import {
   claimSessionBootstrapAdmission,
   clearPrimedSessionBootstrapAdmission,
-  OPTIONAL_SESSION_RPC_TIMEOUT_MS,
+  OPTIONAL_SESSION_READ_TIMEOUT_MS,
   optionalSessionRpcAllowed,
-  optionalSessionRpcCallOptions,
+  optionalSessionReadOptions,
   primeSessionBootstrapAdmission,
-  sandboxSetupRpcCallOptions,
-  waitForSessionRpcConnection,
 } from './sessionBootstrapAdmission'
 
 afterEach(() => {
@@ -18,40 +16,9 @@ afterEach(() => {
 
 describe('session bootstrap admission', () => {
   it('allows ordinary metadata latency before recovering a stuck connection', () => {
-    expect(OPTIONAL_SESSION_RPC_TIMEOUT_MS).toBe(10_000)
-    expect(optionalSessionRpcCallOptions).toEqual({
+    expect(OPTIONAL_SESSION_READ_TIMEOUT_MS).toBe(10_000)
+    expect(optionalSessionReadOptions).toEqual({
       timeoutMs: 10_000,
-      timeoutAction: 'reconnect',
-      abortAction: 'reject',
-    })
-  })
-
-  it('keeps connection waiting local to the waiter even when request timeout recycles', async () => {
-    const waitForConnection = vi.fn().mockResolvedValue(undefined)
-    const controller = new AbortController()
-
-    await waitForSessionRpcConnection(
-      { waitForConnection },
-      {
-        timeoutMs: 10_000,
-        signal: controller.signal,
-        timeoutAction: 'reconnect',
-        abortAction: 'reconnect',
-      },
-    )
-
-    expect(waitForConnection).toHaveBeenCalledWith(
-      10_000,
-      controller.signal,
-      { timeoutAction: 'reject', abortAction: 'reject' },
-    )
-  })
-
-  it('lets the first live sandbox verification finish without recycling the socket', () => {
-    expect(sandboxSetupRpcCallOptions).toEqual({
-      timeoutMs: 45_000,
-      timeoutAction: 'reject',
-      abortAction: 'reject',
     })
   })
 

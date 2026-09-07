@@ -4,7 +4,10 @@ from __future__ import annotations
 
 from typing import Any
 
-_SESSIONS_CHANGED_SCHEMA_VERSION = 1
+from opensquilla.contracts.adapters.sessions_changed_contract import (
+    SESSIONS_CHANGED_SCHEMA_VERSION,
+    validate_sessions_changed_payload,
+)
 
 
 def build_sessions_changed_payload(
@@ -23,11 +26,14 @@ def build_sessions_changed_payload(
         run_status = "idle"
 
     payload: dict[str, Any] = {
-        "schema_version": _SESSIONS_CHANGED_SCHEMA_VERSION,
+        "schema_version": SESSIONS_CHANGED_SCHEMA_VERSION,
         "key": session_key,
         "reason": reason,
     }
     if run_status is not None:
         payload["run_status"] = run_status
     payload.update({key: value for key, value in state.items() if value is not None})
-    return payload
+    # Keep one authored producer invariant.  The adapter validates the
+    # canonical shape while returning the same mapping so extension fields and
+    # insertion order remain exactly as the v4 wire producer supplied them.
+    return validate_sessions_changed_payload(payload, allow_legacy=False)

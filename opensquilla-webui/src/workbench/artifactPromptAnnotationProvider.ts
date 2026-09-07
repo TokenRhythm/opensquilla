@@ -1,46 +1,13 @@
-import type { RpcCallOptions } from '@/lib/rpc'
 import type {
   PromptAnnotation,
-  PromptAnnotationCreateRequest,
-  PromptAnnotationDiscardRequest,
   PromptAnnotationFreshness,
-  PromptAnnotationFocusRequest,
-  PromptAnnotationFocusResponse,
-  PromptAnnotationFocusResult,
-  PromptAnnotationResponse,
   PromptAnnotationSnapshot,
-  PromptAnnotationsListResponse,
   PromptAnnotationStatus,
-  PromptAnnotationUpdateRequest,
 } from '@/types/promptAnnotations'
 
-export const PROMPT_ANNOTATION_RPC_METHODS = {
-  create: 'artifacts.prompt_annotations.create',
-  list: 'artifacts.prompt_annotations.list',
-  update: 'artifacts.prompt_annotations.update',
-  discard: 'artifacts.prompt_annotations.discard',
-  focus: 'artifacts.prompt_annotations.focus',
-} as const
+export type { ArtifactPromptAnnotationProvider } from '@/modules/artifactWorkbench'
 
-type PromptAnnotationRpc = {
-  supportsMethod?: (method: string) => boolean
-  markMethodUnavailable?: (method: string) => void
-  call: <T = unknown>(
-    method: string,
-    params?: Record<string, unknown>,
-    options?: RpcCallOptions,
-  ) => Promise<T>
-}
-
-export interface ArtifactPromptAnnotationProvider {
-  list(sessionKey: string, signal?: AbortSignal): Promise<PromptAnnotation[]>
-  create(request: PromptAnnotationCreateRequest): Promise<PromptAnnotation | null>
-  update(request: PromptAnnotationUpdateRequest): Promise<PromptAnnotation | null>
-  discard(request: PromptAnnotationDiscardRequest): Promise<PromptAnnotation | null>
-  focus(request: PromptAnnotationFocusRequest): Promise<PromptAnnotationFocusResult | null>
-}
-
-function objectValue(value: unknown): Record<string, unknown> | null {
+export function objectValue(value: unknown): Record<string, unknown> | null {
   return value !== null && typeof value === 'object' && !Array.isArray(value)
     ? value as Record<string, unknown>
     : null
@@ -214,110 +181,5 @@ export function normalizePromptAnnotationSnapshot(
       'sent_order',
       'order',
     )),
-  }
-}
-
-function methodNotFound(error: unknown): boolean {
-  const raw = objectValue(error)
-  const message = error instanceof Error ? error.message : String(error)
-  return raw?.code === 'METHOD_NOT_FOUND' || /method not found/i.test(message)
-}
-
-function signalOptions(signal?: AbortSignal): RpcCallOptions {
-  return {
-    timeoutMs: 10_000,
-    timeoutAction: 'reject',
-    abortAction: 'reject',
-    ...(signal ? { signal } : {}),
-  }
-}
-
-export function createRpcArtifactPromptAnnotationProvider(
-  rpc: PromptAnnotationRpc,
-): ArtifactPromptAnnotationProvider {
-  async function call<T>(
-    method: string,
-    params: Record<string, unknown>,
-    signal?: AbortSignal,
-  ): Promise<T | null> {
-    if (rpc.supportsMethod?.(method) === false) return null
-    try {
-      return await rpc.call<T>(method, params, signalOptions(signal))
-    } catch (error) {
-      if (!methodNotFound(error)) throw error
-      rpc.markMethodUnavailable?.(method)
-      return null
-    }
-  }
-
-  return {
-    async list(sessionKey, signal) {
-      const response = await call<PromptAnnotationsListResponse>(
-        PROMPT_ANNOTATION_RPC_METHODS.list,
-        { sessionKey, status: 'draft' },
-        signal,
-      )
-      return Array.isArray(response?.annotations)
-        ? response.annotations
-            .map(value => normalizePromptAnnotation(value, { sessionKey }))
-            .filter((item): item is PromptAnnotation => item !== null)
-        : []
-    },
-    async create(request) {
-      const response = await call<PromptAnnotationResponse>(PROMPT_ANNOTATION_RPC_METHODS.create, {
-        annotationId: request.annotationId,
-        sessionKey: request.sessionKey,
-        documentId: request.documentId,
-        revisionId: request.revisionId,
-        selection: {
-          selectionId: request.selection.selectionId,
-          tagName: request.selection.tagName,
-          elementPath: request.selection.elementPath,
-          elementProofSha256: request.selection.elementProofSha256,
-          ...(request.selection.domSha256
-            ? { domSha256: request.selection.domSha256 }
-            : {}),
-        },
-        ...(request.body !== undefined ? { body: request.body } : {}),
-      })
-      return normalizePromptAnnotation(response?.annotation, { sessionKey: request.sessionKey })
-    },
-    async update(request) {
-      const response = await call<PromptAnnotationResponse>(PROMPT_ANNOTATION_RPC_METHODS.update, {
-        annotationId: request.annotationId,
-        sessionKey: request.sessionKey,
-        body: request.body,
-        expectedStateRevision: request.expectedStateRevision,
-      })
-      return normalizePromptAnnotation(response?.annotation, { sessionKey: request.sessionKey })
-    },
-    async discard(request) {
-      const response = await call<PromptAnnotationResponse>(PROMPT_ANNOTATION_RPC_METHODS.discard, {
-        annotationId: request.annotationId,
-        sessionKey: request.sessionKey,
-        expectedStateRevision: request.expectedStateRevision,
-      })
-      return normalizePromptAnnotation(response?.annotation, { sessionKey: request.sessionKey })
-    },
-    async focus(request) {
-      const response = await call<PromptAnnotationFocusResponse>(
-        PROMPT_ANNOTATION_RPC_METHODS.focus,
-        {
-          sessionKey: request.sessionKey,
-          annotationId: request.annotationId,
-        },
-      )
-      const annotationId = typeof response?.annotationId === 'string'
-        ? response.annotationId.trim()
-        : ''
-      const documentId = typeof response?.documentId === 'string'
-        ? response.documentId.trim()
-        : ''
-      return response?.focused === true
-        && annotationId === request.annotationId
-        && Boolean(documentId)
-        ? { focused: true, annotationId, documentId }
-        : null
-    },
   }
 }

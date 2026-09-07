@@ -1,0 +1,62 @@
+{
+  "format": 1,
+  "cases": [
+    {
+      "id": "canonical-turn-complete",
+      "coverage": "canonical-schema-version",
+      "expectation": "exact",
+      "wire": {
+        "schema_version": 1,
+        "key": "agent:main:turn-1",
+        "reason": "turn_complete",
+        "run_status": "idle"
+      }
+    },
+    {
+      "id": "canonical-integral-float-version",
+      "coverage": "json-number-compatibility",
+      "expectation": "exact",
+      "wire": {
+        "schema_version": 1.0,
+        "key": "agent:main:float-version",
+        "reason": "created"
+      }
+    },
+    {
+      "id": "canonical-task-projection-with-extensions",
+      "coverage": "canonical-open-extensions",
+      "expectation": "exact",
+      "wire": {
+        "schema_version": 1,
+        "key": "agent:main:task-1",
+        "reason": "task_queued",
+        "status": "running",
+        "changed_task": {
+          "task_id": "task-1",
+          "status": "queued"
+        },
+        "epoch": 4
+      }
+    },
+    {
+      "id": "legacy-static-cron",
+      "coverage": "legacy-scheduler-payload",
+      "expectation": "exact",
+      "wire": {
+        "key": "cron:reminder:run:1234",
+        "reason": "cron_static_message",
+        "taskId": "cron:reminder:run:1234",
+        "status": "succeeded"
+      }
+    },
+    {
+      "id": "legacy-system-event",
+      "coverage": "legacy-unversioned-minimal",
+      "expectation": "exact",
+      "wire": {
+        "key": "agent:main:system",
+        "reason": "cron_system_event"
+      }
+    }
+  ]
+}

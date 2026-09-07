@@ -40,20 +40,44 @@ describe('App sidebar chrome contract', () => {
     expect(singleDelete).toContain('appStore.removePendingApprovalsForSessions(deleted)')
   })
 
-  it('uses the write-scoped rename RPC for sidebar session titles', () => {
+  it('uses the domain SessionLifecycle for sidebar session titles', () => {
     const renameStart = appSource.indexOf('async function onRenameSession')
     const renameEnd = appSource.indexOf('function removeLocalSessions', renameStart)
     const renameHandler = appSource.slice(renameStart, renameEnd)
 
-    expect(renameHandler).toContain("rpcStore.call('sessions.rename'")
-    expect(renameHandler).not.toContain("rpcStore.call('sessions.patch'")
+    expect(renameHandler).toContain('sessionLifecycle.rename({ key, title: next })')
+    expect(renameHandler).not.toContain("rpcStore.call('sessions.rename'")
   })
 
   it('bounds automatic sidebar RPCs after chat bootstrap admission', () => {
     expect(appSource).toContain('useSessions(sessionDirectory)')
-    expect(appSource).toContain('useAgentOptions(optionalSessionRpcCallOptions)')
-    expect(appSource).toContain(
-      'useSessionListSubscription({\n  rpc: rpcStore,\n  callOptions: optionalSessionRpcCallOptions,',
+    expect(appSource).toContain('useAgentOptions(agentCatalog, optionalSessionReadOptions)')
+    expect(appSource).toContain('SESSION_DIRECTORY_CHANGES_KEY')
+    expect(appSource).toContain('sessionDirectoryChanges.resume()')
+    expect(appSource).not.toContain('useSessionListSubscription')
+  })
+
+  it('admits the app-wide cron lease after critical chat bootstrap traffic', () => {
+    const subscribeStart = appSource.indexOf('function subscribeCronEventsWhenAdmitted')
+    const subscribeEnd = appSource.indexOf('function resumeAutomaticAppRpc', subscribeStart)
+    const subscribeCron = appSource.slice(subscribeStart, subscribeEnd)
+    expect(subscribeCron).toContain('optionalSessionRpcAllowed.value')
+    expect(subscribeCron).toContain('cronFinishedSubscription = cronScheduler.subscribe')
+
+    const mountedStart = appSource.indexOf('onMounted(() =>')
+    const mountedEnd = appSource.indexOf('onUnmounted(() =>', mountedStart)
+    expect(appSource.slice(mountedStart, mountedEnd)).not.toContain(
+      'cronFinishedSubscription = cronScheduler.subscribe',
     )
+  })
+
+  it('keeps app-wide approval awareness behind ApprovalCenter', () => {
+    expect(appSource).toContain('APPROVAL_CENTER_KEY')
+    expect(appSource).toContain('approvalCenter.snapshot()')
+    expect(appSource).toContain('approvalCenter.subscribe(onApprovalEvent)')
+    expect(appSource).not.toContain("fetch('/api/approvals'")
+    expect(appSource).not.toContain("rpcStore.on('exec.approval")
+    expect(appSource).not.toContain("rpcStore.on('plugin.approval")
+    expect(appSource).not.toContain("rpcStore.on('_state', onApproval")
   })
 })

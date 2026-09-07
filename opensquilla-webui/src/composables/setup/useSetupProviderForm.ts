@@ -1,5 +1,13 @@
 import { computed, ref, type ComputedRef, type Ref } from 'vue'
-import { useRpcStore } from '@/stores/rpc'
+import type {
+  ConfigurePrimaryProvider,
+  DiscoverPrimaryModels,
+  ProbePrimaryProvider,
+  ProfileProbe,
+  SetupDiscoveryResult,
+  SetupWorkflow,
+  UpsertProfile,
+} from '@/modules/setupWorkflow'
 
 interface ProviderField {
   name: string
@@ -558,10 +566,23 @@ function camel(name: string): string {
   return String(name || '').replace(/_([a-z])/g, (_, c) => c.toUpperCase())
 }
 
-export function buildProviderPayload(providerId: string, values: Record<string, unknown>): Record<string, unknown> {
-  const payload: Record<string, unknown> = { providerId }
+type ProviderConfigurationCommand = ConfigurePrimaryProvider & UpsertProfile
+type ProviderConnectionCommand = ProbePrimaryProvider & DiscoverPrimaryModels & ProfileProbe
+
+export function buildProviderPayload(
+  providerId: string,
+  values: Record<string, unknown>,
+): ProviderConfigurationCommand {
+  const payload: ProviderConfigurationCommand = { providerId }
   Object.entries(values).forEach(([key, value]) => {
-    if (value !== '' && value !== undefined) payload[camel(key)] = value
+    if (value === '' || value === undefined) return
+    switch (camel(key)) {
+      case 'model': payload.model = String(value); break
+      case 'apiKey': payload.apiKey = String(value); break
+      case 'apiKeyEnv': payload.apiKeyEnv = String(value); break
+      case 'baseUrl': payload.baseUrl = String(value); break
+      case 'proxy': payload.proxy = String(value); break
+    }
   })
   return payload
 }
@@ -574,7 +595,7 @@ export function hasEffectiveProvider(config: ProviderConfig, status: SetupStatus
   return ['explicit', 'env', 'not_required'].includes(String(status.llmSource || ''))
 }
 
-export function useSetupProviderForm() {
+export function useSetupProviderForm(setupWorkflow: SetupWorkflow) {
   const providerSelected = ref('')
   const providerFieldValues = ref<Record<string, unknown>>({})
   const touchedFields = ref<Set<string>>(new Set())
@@ -650,9 +671,9 @@ export function useSetupProviderForm() {
   // Params for probe/discover: the CURRENT form values, including an unsaved
   // pasted key — this is what makes "test before save" possible. Empty values
   // are dropped (the gateway falls back to the stored config / spec env key).
-  function connectionParams(defaultModel = '', modelOverride?: string): Record<string, unknown> {
+  function connectionParams(defaultModel = '', modelOverride?: string): ProviderConnectionCommand {
     const p = payload()
-    const params: Record<string, unknown> = { providerId: providerSelected.value }
+    const params: ProviderConnectionCommand = { providerId: providerSelected.value }
     for (const key of ['apiKey', 'apiKeyEnv', 'baseUrl', 'proxy'] as const) {
       if (p[key] !== undefined) params[key] = p[key]
     }
@@ -663,7 +684,7 @@ export function useSetupProviderForm() {
     return params
   }
 
-  function profileDraftParams(defaultModel = '', modelOverride?: string): Record<string, unknown> {
+  function profileDraftParams(defaultModel = '', modelOverride?: string): ProfileProbe {
     const params = connectionParams(defaultModel, modelOverride)
     // Empty endpoint fields are meaningful in a draft: they mean “remove the
     // stored override and use the registry/global fallback”. buildProviderPayload
@@ -691,28 +712,21 @@ export function useSetupProviderForm() {
     discoverPromise = null
     discoverPromiseForceRefresh = false
     connection.value = { ...freshConnection(providerSelected.value), phase: 'probing' }
-    const rpc = useRpcStore()
     let outcome: ConnectionState
     try {
       const params = connectionParams(options.defaultModel, options.modelOverride)
       const draftParams = profileDraftParams(options.defaultModel, options.modelOverride)
-      const res = await rpc.call<{
-        ok?: boolean
-        failureKind?: string
-        message?: string
-        firstResponseMs?: number
-        totalMs?: number
-        latencyMs?: number
-      }>(
-        options.draftProfile
-          ? 'onboarding.llmProfile.draft.probe'
-          : (options.storedProfile ? 'onboarding.llmProfile.probe' : 'onboarding.provider.probe'),
-        options.draftProfile
-          ? draftParams
-          : (options.storedProfile
-              ? { providerId: providerSelected.value, model: params.model || options.defaultModel || '' }
-              : params),
-      )
+      let res: SetupDiscoveryResult
+      if (options.draftProfile) {
+        res = await setupWorkflow.profile.probeDraftProfile(draftParams)
+      } else if (options.storedProfile) {
+        res = await setupWorkflow.profile.probeProfile({
+          providerId: providerSelected.value,
+          model: params.model || options.defaultModel || '',
+        }) as SetupDiscoveryResult
+      } else {
+        res = await setupWorkflow.provider.probePrimary(params) as SetupDiscoveryResult
+      }
       if (epoch !== connectionEpoch) return
       const timings = normalizeProbeTimings(res)
       if (res?.ok) {
@@ -769,31 +783,22 @@ export function useSetupProviderForm() {
       })
     }
     const epoch = connectionEpoch
-    const rpc = useRpcStore()
     const request = (async () => {
       try {
-        const res = await rpc.call<{
-          ok?: boolean
-          failureKind?: string
-          detail?: string
-          source?: string
-          models?: unknown
-          catalog?: unknown
-        }>(
-          options.draftProfile
-            ? 'onboarding.llmProfile.draft.models.discover'
-            : (options.storedProfile
-                ? 'onboarding.llmProfile.models.discover'
-                : 'onboarding.models.discover'),
-          {
-            ...(options.draftProfile
-              ? profileDraftParams('', options.modelOverride)
-              : (options.storedProfile
-                  ? { providerId: providerSelected.value }
-                  : connectionParams('', options.modelOverride))),
-            ...(options.forceRefresh ? { forceRefresh: true } : {}),
-          },
-        )
+        const payload = {
+          ...(options.draftProfile
+            ? profileDraftParams('', options.modelOverride)
+            : connectionParams('', options.modelOverride)),
+          ...(options.forceRefresh ? { forceRefresh: true } : {}),
+        }
+        const res = options.draftProfile
+          ? await setupWorkflow.profile.discoverDraftProfileModels(payload)
+          : (options.storedProfile
+              ? await setupWorkflow.profile.discoverProfileModels({
+                  providerId: providerSelected.value,
+                  ...(options.forceRefresh ? { forceRefresh: true } : {}),
+                })
+              : await setupWorkflow.provider.discoverPrimaryModels(payload))
         if (epoch !== connectionEpoch) return
         if (res?.ok) {
           const modelSource = res.source === 'live' ? 'live' : 'none'
@@ -977,7 +982,7 @@ export function useSetupProviderForm() {
     resetConnection()
   }
 
-  function payload(): Record<string, unknown> {
+  function payload(): ProviderConfigurationCommand {
     // Hard guard (independent of UI state): never submit both a pasted key and
     // an env reference. A non-empty pasted api_key wins; otherwise the env
     // reference is used. buildProviderPayload drops empty values.

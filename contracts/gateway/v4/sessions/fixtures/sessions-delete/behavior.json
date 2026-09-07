@@ -1,0 +1,9 @@
+{
+  "format_version": 1,
+  "kind": "behavior",
+  "cases": [
+    { "id": "behavior.partial", "coverage": "one key failure does not hide successful deletions", "expectation": "exact" },
+    { "id": "behavior.original-key", "coverage": "deleted retains caller key spelling", "expectation": "exact" },
+    { "id": "behavior.lifecycle-fences", "coverage": "cleanup and runtime eviction remain in one handler", "expectation": "exact" }
+  ]
+}

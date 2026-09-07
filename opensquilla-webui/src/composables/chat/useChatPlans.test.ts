@@ -59,6 +59,20 @@ function harness({ draft = false }: { draft?: boolean } = {}) {
       return vi.fn()
     }),
   }
+  const planCenter = {
+    available: () => true,
+    setMode: (sessionKey: string, mode: string, expectedRevision: number) => rpc.call('plans.setMode', { sessionKey, mode, expectedRevision }),
+    revise: (sessionKey: string, request: { revisionId: string; prompt: string }, clientRequestId: string) => rpc.call('plans.revise', { sessionKey, planRevisionId: request.revisionId, prompt: request.prompt, clientRequestId }),
+    implement: (sessionKey: string, target: { revisionId: string }, clientRequestId: string, options?: { intent?: string }) => rpc.call('plans.implement', { sessionKey, planRevisionId: target.revisionId, clientRequestId, ...(options?.intent ? { intent: options.intent } : {}) }),
+    cancelRun: (sessionKey: string, runId: string, expectedStateRevision?: number) => rpc.call('plans.cancelRun', { sessionKey, runId, ...(expectedStateRevision !== undefined ? { expectedStateRevision } : {}) }),
+    subscribe: (listener: (event: any) => void) => {
+      const unsubs = ['session.event.collaboration_mode', 'session.event.plan_revision', 'session.event.plan_run'].map(name => {
+        const handler = (...args: unknown[]) => listener({ kind: name.endsWith('run') ? 'run' : name.endsWith('revision') ? 'revision' : 'collaboration', sessionKey: (args[0] as Record<string, unknown>)?.session_key, collaboration: (args[0] as Record<string, unknown>)?.collaboration, plan: (args[0] as Record<string, unknown>)?.plan_revision, run: (args[0] as Record<string, unknown>)?.plan_run })
+        return rpc.on(name, handler)
+      })
+      return { close: () => unsubs.forEach(unsub => unsub()) }
+    },
+  }
   const sessionKey = ref(SESSION_ONE)
   const currentEpoch = ref(0)
   const isStreaming = ref(false)
@@ -67,7 +81,7 @@ function harness({ draft = false }: { draft?: boolean } = {}) {
   const notifyError = vi.fn()
   const onMutationAccepted = vi.fn()
   const api = useChatPlans({
-    rpc,
+    planCenter,
     sessionKey,
     currentEpoch,
     isStreaming,

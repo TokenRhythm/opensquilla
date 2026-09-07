@@ -1,0 +1,14 @@
+{
+  "format_version": 1,
+  "kind": "behavior",
+  "cases": [
+    { "id": "behavior.full", "coverage": "omitting both anchors copies the complete transcript", "expectation": "exact" },
+    { "id": "behavior.before-exclusive", "coverage": "beforeMessageId copies only entries before the selected message", "expectation": "exact" },
+    { "id": "behavior.before-first-present", "coverage": "before-message aliases use first-present semantics and a present null camel alias suppresses the snake alias", "expectation": "exact" },
+    { "id": "behavior.through-inclusive", "coverage": "throughTurnId copies one verified terminal turn inclusively", "expectation": "exact" },
+    { "id": "behavior.through-alias-consensus", "coverage": "every present through-turn alias must be a matching non-empty string", "expectation": "exact" },
+    { "id": "behavior.anchor-conflict", "coverage": "a truthy before-message anchor and through-turn anchor are mutually exclusive", "expectation": "exact" },
+    { "id": "behavior.numbered-title", "coverage": "an omitted or empty title retains numbered fork-title generation", "expectation": "exact" },
+    { "id": "behavior.through-ack", "coverage": "through-turn success includes forkMode and the normalized throughTurnId", "expectation": "exact" }
+  ]
+}

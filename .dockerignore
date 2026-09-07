@@ -59,6 +59,7 @@ install.ps1
 
 # --- Build artefacts --------------------------------------------------------
 dist
+opensquilla-webui/dist
 build
 *.egg-info
 **/node_modules

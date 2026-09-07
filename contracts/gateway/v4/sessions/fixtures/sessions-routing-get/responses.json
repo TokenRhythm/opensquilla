@@ -1,0 +1,6 @@
+{
+  "cases": [
+    {"id": "durable-direct", "coverage": "canonical durable session snapshot", "expectation": "exact", "wire": {"type": "res", "id": "get-1", "ok": true, "payload": {"key": "agent:main:webchat:one", "sessionKey": "agent:main:webchat:one", "mode": "direct", "revision": 0, "source": "session", "initialized": true, "appliesTo": "next_accepted_turn"}}},
+    {"id": "global-fallback", "coverage": "draft fallback snapshot", "expectation": "exact", "wire": {"type": "res", "id": "get-2", "ok": true, "payload": {"mode": "router", "revision": 0, "source": "global", "initialized": false, "appliesTo": "next_accepted_turn"}}}
+  ]
+}

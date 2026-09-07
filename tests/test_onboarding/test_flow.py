@@ -1467,6 +1467,7 @@ def test_interactive_feishu_websocket_prompts_only_core_fields(tmp_path, monkeyp
 
     from opensquilla.onboarding import flow
 
+    monkeypatch.setattr("opensquilla.__version__", "0.5.4")
     target = tmp_path / "c.toml"
     console_output = StringIO()
     monkeypatch.setattr(
@@ -1527,7 +1528,7 @@ def test_interactive_feishu_websocket_prompts_only_core_fields(tmp_path, monkeyp
     assert "OPENSQUILLA_INSTALL_EXTRAS" not in normalized_out
     assert "uv tool install --python 3.12 --force" in normalized_out
     assert "opensquilla[recommended]" in normalized_out
-    assert "https://github.com/opensquilla/opensquilla/releases/download/" in out
+    assert "https://github.com/TokenRhythm/opensquilla/releases/download/" in out
     assert "v0.5.4" in out
     assert "opensquilla.ai/install." not in normalized_out
     assert "uv sync --extra recommended" in normalized_out
@@ -2672,7 +2673,7 @@ def test_installed_reinstall_command_pins_the_running_release_wheel(monkeypatch)
     lines = flow._installed_reinstall_command_lines()
 
     assert (
-        "https://github.com/opensquilla/opensquilla/releases/download/"
+        "https://github.com/TokenRhythm/opensquilla/releases/download/"
         "v0.6.0/opensquilla-0.6.0-py3-none-any.whl" in lines
     )
     assert "opensquilla[recommended]" in lines

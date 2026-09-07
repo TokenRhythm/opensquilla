@@ -157,3 +157,84 @@ def test_generic_contract_toolchain_is_real_and_deterministic(tmp_path: Path) ->
         check=True,
         text=True,
     )
+
+
+def test_required_alternatives_preserve_actual_params_types(tmp_path: Path) -> None:
+    goal_revision = {
+        "expectedGoalId": "synthetic-goal",
+        "expectedStateRevision": 1,
+        "clientRequestId": "00000000-0000-4000-8000-000000000001",
+    }
+    session_keys = ("sessionKey", "session_key", "key")
+    cases = [
+        ("agents.create", {}, ("id", "agentId", "name")),
+        ("cron.runs", {"limit": 1}, ("id", "job_id")),
+        ("goals.capabilities", {}, session_keys),
+        ("goals.clear", goal_revision, session_keys),
+        ("goals.edit", {**goal_revision, "objective": "synthetic edit"}, session_keys),
+        ("goals.pause", goal_revision, session_keys),
+        ("goals.resume", goal_revision, session_keys),
+        (
+            "goals.set",
+            {
+                "objective": "synthetic objective",
+                "clientRequestId": "00000000-0000-4000-8000-000000000001",
+                "clientMessageId": "00000000-0000-4000-8000-000000000002",
+            },
+            session_keys,
+        ),
+        ("goals.status", {}, session_keys),
+        ("config.patch", {}, ("patch", "patches")),
+        ("sessions.routing.get", {}, session_keys),
+        ("skills.install.cancel", {}, ("operationId", "operation_id")),
+        ("skills.uninstall", {"allowDrift": False}, ("name", "installId", "install_id")),
+    ]
+    specs = {spec.wire_name: spec for spec in runner.discover_contracts()}
+    usage: list[str] = []
+    for index, (method, required, alternatives) in enumerate(cases):
+        spec = specs[method]
+        original = json.dumps(spec.document, sort_keys=True)
+        rendered = runner.render_generic(spec, validator_roles=())
+        assert json.dumps(spec.document, sort_keys=True) == original
+        (tmp_path / f"{spec.typescript_stem}.ts").write_text(
+            _artifact(rendered, f"{spec.typescript_stem}.ts"), encoding="utf-8",
+        )
+        name = f"Params{index}"
+        usage.append(
+            f"import type {{ {spec.target('params')} as {name} }} "
+            f"from './{spec.typescript_stem}'"
+        )
+        values = [
+            {**required, key: {} if method == "config.patch" else "synthetic-id"}
+            for key in alternatives
+        ]
+        invalid_values = [required, {**values[0], alternatives[0]: 42}]
+        if spec.document["$defs"][spec.target("params")].get("additionalProperties") is False:
+            invalid_values.append({**values[0], "futureField": True})
+        else:
+            values.append({**values[0], "futureField": True})
+        if method == "agents.create":
+            values.append({"id": None, "enabled": None})
+        if method == "config.patch":
+            values.append({"patch": {}, "patches": {}})
+            invalid_values.append({"patch": None})
+        if method.startswith("goals.") and "clientRequestId" in required:
+            invalid_values.append({key: value for key, value in values[0].items()
+                                   if key != "clientRequestId"})
+        for number, value in enumerate(values):
+            usage.append(f"const valid{index}_{number}: {name} = {json.dumps(value)}")
+        for number, value in enumerate(invalid_values):
+            usage.extend([
+                "// @ts-expect-error Params must retain required aliases and property types",
+                f"const invalid{index}_{number}: {name} = {json.dumps(value)}",
+            ])
+    usage_path = tmp_path / "params.typecheck.ts"
+    usage_path.write_text("\n".join(usage) + "\n", encoding="utf-8")
+    subprocess.run(
+        runner._resolved_command([
+            "npm", "--prefix", "opensquilla-webui", "exec", "--", "tsc",
+            "--noEmit", "--strict", "--skipLibCheck", "--target", "ES2022",
+            "--module", "ESNext", "--moduleResolution", "Bundler", str(usage_path),
+        ]),
+        cwd=ROOT, check=True, text=True,
+    )

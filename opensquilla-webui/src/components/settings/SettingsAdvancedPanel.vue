@@ -39,14 +39,6 @@ const runTrace = ref(readBool(RUNTRACE_KEY))
 function setApprovalPoll(on: boolean) { approvalPoll.value = on; writeBool(APPROVAL_KEY, on) }
 function setRunTrace(on: boolean) { runTrace.value = on; writeBool(RUNTRACE_KEY, on) }
 
-// --- foldLiveTurn: default ON; '0' is the only OFF value ---
-const FOLD_KEY = 'opensquilla.chat.foldLiveTurn'
-const foldOn = ref(localStorageGet(FOLD_KEY) !== '0')
-function setFold(on: boolean) {
-  foldOn.value = on
-  try { localStorage.setItem(FOLD_KEY, on ? '1' : '0') } catch { /* private mode */ }
-}
-
 // --- answerReveal: "min,max" milliseconds, min >= 0 and max >= min ---
 const REVEAL_KEY = 'opensquilla.chat.answerReveal'
 const REVEAL_DEFAULT: [number, number] = [1800, 4000]
@@ -116,17 +108,6 @@ const agentConfigAriaLabel = computed(() =>
     </div>
 
     <h4 class="advanced-group advanced-group--section">{{ t('setup.advanced.experimentsGroup') }}</h4>
-
-    <label class="control-row">
-      <div class="control-row__label-block">
-        <span class="control-row__label">{{ t('setup.advanced.foldLabel') }}</span>
-        <span class="control-row__desc">{{ t('setup.advanced.foldDesc') }}</span>
-      </div>
-      <div class="control-row__control">
-        <span class="labs-hint">{{ t('setup.advanced.reload') }}</span>
-        <ControlSwitch name="labs_fold_live_turn" :checked="foldOn" :aria-label="t('setup.advanced.foldAria')" @change="setFold" />
-      </div>
-    </label>
 
     <div class="control-row control-row--stack">
       <div class="control-row__label-block">

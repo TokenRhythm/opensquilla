@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import pytest
 
-from opensquilla.gateway.boot import _make_auto_propose_tool_invoker
+from opensquilla.gateway.boot import _make_auto_propose_tool_context
+from opensquilla.skills.meta.orchestrator import make_tool_invoker_from_handler
+from opensquilla.tools.dispatch import build_tool_handler
 from opensquilla.tools.registry import ToolRegistry
 from opensquilla.tools.types import ToolSpec
 
@@ -25,9 +27,11 @@ async def test_auto_propose_tool_invoker_uses_preflight_allowlist() -> None:
         ToolSpec(name="blocked", description="blocked", parameters={}),
         blocked,
     )
-    invoker = _make_auto_propose_tool_invoker(
-        registry,
-        allowed_tools=frozenset({"allowed"}),
+    invoker = make_tool_invoker_from_handler(
+        tool_handler=build_tool_handler(
+            registry,
+            _make_auto_propose_tool_context(allowed_tools=frozenset({"allowed"})),
+        ),
     )
 
     assert await invoker("allowed", {}) == "ok"

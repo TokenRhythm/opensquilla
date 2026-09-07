@@ -26,10 +26,12 @@ npm ci
 npm run dev
 ```
 
-Use Node.js 22.12 or newer. The Vue build under
-`src/opensquilla/gateway/static/dist/` is generated and ignored by Git; local
-Desktop packaging verifies it against the current frontend source before
-PyInstaller runs.
+Use Node.js 22.12 or newer. Vite writes the Vue build under
+`opensquilla-webui/dist/`; `npm run build` then verifies and explicitly stages
+the same bytes under `src/opensquilla/gateway/static/dist/` for Python
+packaging. Both directories are generated and ignored by Git. Local Desktop
+packaging consumes the source-owned artifact and verifies it before PyInstaller
+runs.
 
 On first run, the shell opens a setup window for provider, model, base URL, and
 API key. The key is encrypted with Electron `safeStorage` when available, and a

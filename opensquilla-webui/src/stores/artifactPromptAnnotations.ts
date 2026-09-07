@@ -1,6 +1,7 @@
 import { defineStore } from 'pinia'
 import { computed, markRaw, ref, shallowRef } from 'vue'
 
+import type { ArtifactPromptAnnotationProvider } from '@/modules/artifactWorkbench'
 import type {
   PromptAnnotation,
   PromptAnnotationCreateRequest,
@@ -11,7 +12,6 @@ import {
   PROMPT_ANNOTATION_MAX_COUNT,
   promptAnnotationBodyWithinLimit,
 } from '@/types/promptAnnotations'
-import type { ArtifactPromptAnnotationProvider } from '@/workbench/artifactPromptAnnotationProvider'
 
 export const PROMPT_ANNOTATION_CREATE_AMBIGUOUS = 'ARTIFACT_ANNOTATION_CREATE_AMBIGUOUS'
 export const PROMPT_ANNOTATION_CREATE_CONFLICT = 'ARTIFACT_ANNOTATION_CREATE_CONFLICT'

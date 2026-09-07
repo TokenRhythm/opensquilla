@@ -1,7 +1,6 @@
 // @vitest-environment happy-dom
 import { describe, it, expect, beforeEach, vi, afterEach } from 'vitest'
 import { setActivePinia, createPinia } from 'pinia'
-import { nextTick } from 'vue'
 import en from '@/locales/en.json'
 import zhHans from '@/locales/zh-Hans.json'
 import de from '@/locales/de.json'
@@ -14,8 +13,16 @@ import i18n, {
   isSupportedLocale,
 } from '@/i18n'
 import { useAppStore } from '@/stores/app'
-import { useRpcStore } from '@/stores/rpc'
 import { useToasts } from '@/composables/useToasts'
+import type { AppSettings, SettingChange, SettingsMutation } from '@/modules/appSettings'
+
+function bindAppSettings(
+  store: ReturnType<typeof useAppStore>,
+  patchSafe = vi.fn(async (_changes: readonly SettingChange[]) => ({} as SettingsMutation)),
+) {
+  store.bindAppSettings({ patchSafe } as unknown as AppSettings)
+  return patchSafe
+}
 
 function flatten(obj: Record<string, unknown>, prefix = '', out: Record<string, unknown> = {}) {
   for (const [k, v] of Object.entries(obj)) {
@@ -135,71 +142,58 @@ describe('appStore locale state', () => {
   })
 
   it('syncs an explicit language selection to the Gateway channel-notice locale', async () => {
-    const rpc = useRpcStore()
-    rpc.state = 'connected'
-    rpc.methods = ['config.patch.safe']
-    const call = vi.spyOn(rpc, 'call').mockResolvedValue({})
     const store = useAppStore()
+    const patchSafe = bindAppSettings(store)
 
     await store.setLocale('zh-Hans')
 
-    expect(call).toHaveBeenCalledWith('config.patch.safe', {
-      patches: { 'control_ui.default_locale': 'zh-Hans' },
-    })
+    expect(patchSafe).toHaveBeenCalledWith([
+      { path: 'control_ui.default_locale', value: 'zh-Hans' },
+    ])
     expect(store.pendingChannelNoticeLocale).toBeNull()
     expect(localStorage.getItem('opensquilla-locale-sync-pending')).toBeNull()
   })
 
   it('keeps a disconnected explicit selection and syncs it after reconnect', async () => {
-    const rpc = useRpcStore()
-    rpc.state = 'disconnected'
-    rpc.methods = ['config.patch.safe']
-    const call = vi.spyOn(rpc, 'call').mockResolvedValue({})
     const store = useAppStore()
 
     await store.setLocale('zh-Hans')
 
-    expect(call).not.toHaveBeenCalled()
     expect(store.pendingChannelNoticeLocale).toBe('zh-Hans')
     expect(localStorage.getItem('opensquilla-locale-sync-pending')).toBe('zh-Hans')
     const toasts = useToasts().toasts.value
     expect(toasts[toasts.length - 1]).toMatchObject({ tone: 'warn' })
 
-    rpc.state = 'connected'
-    await nextTick()
-    await vi.waitFor(() => expect(call).toHaveBeenCalledTimes(1))
+    const patchSafe = bindAppSettings(store)
+    await store.syncLocaleToGateway()
 
-    expect(call).toHaveBeenCalledWith('config.patch.safe', {
-      patches: { 'control_ui.default_locale': 'zh-Hans' },
-    })
+    expect(patchSafe).toHaveBeenCalledWith([
+      { path: 'control_ui.default_locale', value: 'zh-Hans' },
+    ])
     expect(store.pendingChannelNoticeLocale).toBeNull()
   })
 
-  it('retries a pending locale sync after the connected handshake publishes methods', async () => {
-    const rpc = useRpcStore()
-    rpc.state = 'disconnected'
-    const call = vi.spyOn(rpc, 'call').mockResolvedValue({})
+  it('retries a pending locale sync after the domain adapter becomes available', async () => {
     const store = useAppStore()
 
     await store.setLocale('zh-Hans')
-    rpc.state = 'connected'
-    await nextTick()
-    expect(call).not.toHaveBeenCalled()
+    expect(store.pendingChannelNoticeLocale).toBe('zh-Hans')
 
-    rpc.methods = ['config.patch.safe']
-    await vi.waitFor(() => expect(call).toHaveBeenCalledTimes(1))
-    expect(call).toHaveBeenCalledWith('config.patch.safe', {
-      patches: { 'control_ui.default_locale': 'zh-Hans' },
-    })
+    const patchSafe = bindAppSettings(store)
+    await store.syncLocaleToGateway({ warnOnUnavailable: false })
+
+    expect(patchSafe).toHaveBeenCalledWith([
+      { path: 'control_ui.default_locale', value: 'zh-Hans' },
+    ])
     expect(store.pendingChannelNoticeLocale).toBeNull()
   })
 
   it('retains a failed locale sync without rolling back the local interface', async () => {
-    const rpc = useRpcStore()
-    rpc.state = 'connected'
-    rpc.methods = ['config.patch.safe']
-    const call = vi.spyOn(rpc, 'call').mockRejectedValue(new Error('disk full'))
     const store = useAppStore()
+    const patchSafe = vi.fn(async (_changes: readonly SettingChange[]) => {
+      throw new Error('disk full')
+    })
+    bindAppSettings(store, patchSafe)
 
     await store.setLocale('zh-Hans')
 
@@ -208,7 +202,7 @@ describe('appStore locale state', () => {
     const toasts = useToasts().toasts.value
     expect(toasts[toasts.length - 1]).toMatchObject({ tone: 'warn' })
 
-    call.mockResolvedValueOnce({})
+    patchSafe.mockResolvedValueOnce({} as never)
     await store.syncLocaleToGateway()
 
     expect(store.pendingChannelNoticeLocale).toBeNull()
@@ -229,36 +223,30 @@ describe('appStore locale state', () => {
   })
 
   it('initLocale never writes the Gateway locale from browser-local state', async () => {
-    const rpc = useRpcStore()
-    rpc.state = 'connected'
-    rpc.methods = ['config.patch.safe']
-    const call = vi.spyOn(rpc, 'call').mockResolvedValue({})
     localStorage.setItem('opensquilla-locale', 'zh-Hans')
     const store = useAppStore()
+    const patchSafe = bindAppSettings(store)
 
     await store.initLocale()
 
     expect(store.locale).toBe('zh-Hans')
-    expect(call).not.toHaveBeenCalled()
+    expect(patchSafe).not.toHaveBeenCalled()
   })
 
   it('syncs the Desktop client locale to the Gateway on startup', async () => {
-    const rpc = useRpcStore()
-    rpc.state = 'connected'
-    rpc.methods = ['config.patch.safe']
-    const call = vi.spyOn(rpc, 'call').mockResolvedValue({})
     ;(window as unknown as { opensquillaDesktop?: unknown }).opensquillaDesktop = {
       getOsLocale: async () => 'zh-CN',
     }
     const store = useAppStore()
+    const patchSafe = bindAppSettings(store)
 
     await store.initLocale()
 
     expect(store.locale).toBe('zh-Hans')
     await vi.waitFor(() => {
-      expect(call).toHaveBeenCalledWith('config.patch.safe', {
-        patches: { 'control_ui.default_locale': 'zh-Hans' },
-      })
+      expect(patchSafe).toHaveBeenCalledWith([
+        { path: 'control_ui.default_locale', value: 'zh-Hans' },
+      ])
     })
     expect(store.pendingChannelNoticeLocale).toBeNull()
   })

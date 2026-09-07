@@ -2,10 +2,14 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import { effectScope, ref } from 'vue'
 import type { RpcEventHandler } from '@/lib/rpc'
 import type { InterruptViewState } from '@/types/parts'
+import { projectApprovalDisplayArgs } from '@/adapters/gateway/approvalCenterV4Contract'
+import { createConversationEventsTestHarness } from '@/testing/conversationEvents.test-helper'
+import { clarificationSubmissionFromTestRpc } from '@/testing/conversationAncillary.test-helper'
 import {
-  safeApprovalDisplayArgs,
   useChatApprovals,
 } from './useChatApprovals'
+
+const safeApprovalDisplayArgs = projectApprovalDisplayArgs
 
 afterEach(() => {
   vi.unstubAllGlobals()
@@ -19,21 +23,76 @@ function deferred<T>() {
 
 async function harness(statusResult: unknown = { found: true, pending: true, resolved: false }) {
   const handlers = new Map<string, RpcEventHandler>()
-  const rpcCall = vi.fn(async <T,>() => statusResult as T)
+  const listeners = new Set<(event: any) => void>()
+  const rpcCall = vi.fn(async <T,>(_method?: string, _params?: Record<string, unknown>) => statusResult as T)
   const appendInterruptFrame = vi.fn()
   const interruptState = ref<ReadonlyMap<string, InterruptViewState>>(new Map())
   const scope = effectScope()
+  const conversationEvents = createConversationEventsTestHarness()
+  const approvalCenter: any = {
+    snapshot: vi.fn(async () => {
+      const response = await fetch('/api/approvals')
+      const data = await response.json() as { pending?: any[] }
+      return { mode: 'prompt' as const, pending: (data.pending || []).map(item => {
+        const params = item.params && typeof item.params === 'object' ? item.params : null
+        const kind = String(item.approvalKind || params?.approvalKind || params?.approval_kind || '')
+        const command = String(item.command || '')
+        const args = item.args || (params?.args && typeof params.args === 'object' ? params.args : null)
+        const displayKind = item.displayKind || (kind === 'sandbox_path' ? 'path_access' : kind === 'sandbox_network' ? 'network_access' : command ? 'run_command' : 'sensitive_operation')
+        const displayTarget = item.displayTarget || (displayKind === 'path_access' ? String(args?.path || '') : displayKind === 'network_access' ? String(args?.host || args?.bundle_id || '') : '')
+        return {
+        id: String(item.id || ''), namespace: item.namespace === 'plugin' ? 'plugin' : 'exec',
+        toolName: String(item.toolName || item.pluginId || item.actionKind || ''),
+        command, approvalKind: kind, args: safeApprovalDisplayArgs(kind, args), warning: String(item.warning || ''), agent: String(item.agent || ''),
+        sessionKey: String(item.sessionKey || ''), deadline: Number(item.deadline) || 0,
+        displayKind, displayTarget,
+        destructive: item.destructive === true, irreversible: item.irreversible === true,
+        backupState: item.backupState,
+        }
+      }) }
+    }),
+    status: vi.fn(async (_namespace: string, id: string) => {
+      await rpcCall('exec.approval.status', { id })
+      return { ...(statusResult as any), id, namespace: 'exec', consumed: false, resolutionInProgress: (statusResult as any).resolutionInProgress === true, approved: (statusResult as any).approved === true, resolution: String((statusResult as any).resolution || ''), deadline: null }
+    }),
+    resolve: vi.fn(async () => statusResult as any),
+    extend: vi.fn(async () => ({ ...(statusResult as any), id: 'approval', namespace: 'exec', deadline: 0, consumed: false, resolutionInProgress: false, approved: false, resolution: '' })),
+    subscribe: vi.fn((listener: (event: any) => void) => { listeners.add(listener); return { close: () => listeners.delete(listener) } }),
+    subscribeAvailability: vi.fn((listener: (state: 'available' | 'recovering' | 'unavailable') => void) => { handlers.set('_state', listener as any); return { close: vi.fn() } }),
+    dispose: vi.fn(),
+  }
+  for (const wire of ['exec.approval.requested', 'exec.approval.updated', 'exec.approval.resolved', 'plugin.approval.requested', 'plugin.approval.updated', 'plugin.approval.resolved']) {
+    handlers.set(wire, ((payload: any) => {
+      const requested = wire.endsWith('.requested')
+      const updated = wire.endsWith('.updated')
+      const id = String(payload.approval_id || payload.approvalId || '')
+      const namespace = wire.startsWith('plugin.') ? 'plugin' : 'exec'
+      const approval = requested || updated ? {
+        ...(() => {
+          const kind = String(payload.approval_kind || payload.approvalKind || '')
+          const command = String(payload.command || '')
+          const displayKind = payload.display_kind || payload.displayKind || (kind === 'sandbox_path' ? 'path_access' : kind === 'sandbox_network' ? 'network_access' : command ? 'run_command' : 'sensitive_operation')
+          const args = safeApprovalDisplayArgs(kind, payload.args || null)
+          return { approvalKind: kind, command, args, displayKind, displayTarget: payload.display_target || payload.displayTarget || (displayKind === 'path_access' ? String(args?.path || '') : displayKind === 'network_access' ? String(args?.host || args?.bundle_id || '') : '') }
+        })(),
+        id, namespace, toolName: String(payload.tool_name || payload.toolName || ''),
+        warning: String(payload.warning || ''), agent: String(payload.agent || ''),
+        sessionKey: String(payload.session_key || payload.sessionKey || ''), deadline: Number(payload.deadline) || 0,
+
+        destructive: payload.destructive === true, irreversible: payload.irreversible === true, backupState: payload.backup_state || payload.backupState,
+      } : undefined
+      listeners.forEach(listener => listener({ kind: requested ? 'requested' : updated ? 'updated' : 'resolved', approvalId: id, namespace, approval, sessionKey: approval?.sessionKey || null, approved: typeof payload.approved === 'boolean' ? payload.approved : null, resolution: payload.resolution || null, emittedAt: payload.emitted_at || payload.created_at || null, activityOrder: payload.stream_seq, needsHydration: requested && (!Object.prototype.hasOwnProperty.call(payload, 'args') || !Object.prototype.hasOwnProperty.call(payload, 'warning')) }))
+    }) as any)
+  }
   const approvals = scope.run(() => useChatApprovals({
-    rpc: {
-      call: rpcCall as <T = unknown>(
+    approvalCenter,
+    conversationEvents: conversationEvents.events,
+    clarificationSubmission: clarificationSubmissionFromTestRpc({
+      call: rpcCall as (
         method: string,
         params?: Record<string, unknown>,
-      ) => Promise<T>,
-      on: vi.fn((event: string, handler: RpcEventHandler) => {
-        handlers.set(event, handler)
-        return () => handlers.delete(event)
-      }),
-    },
+      ) => Promise<unknown>,
+    }),
     sessionKey: ref('agent:main:web'),
     runStatus: ref({ status: 'idle', label: '', task: null }),
     stream: {
@@ -48,7 +107,16 @@ async function harness(statusResult: unknown = { found: true, pending: true, res
   const unsubscribe = approvals.subscribe()
   await vi.waitFor(() => expect(fetch).toHaveBeenCalled())
   vi.mocked(fetch).mockClear()
-  return { approvals, handlers, rpcCall, appendInterruptFrame, interruptState, unsubscribe, scope }
+  return {
+    approvals,
+    handlers,
+    rpcCall,
+    appendInterruptFrame,
+    interruptState,
+    emitToolResult: conversationEvents.emitToolResult,
+    unsubscribe,
+    scope,
+  }
 }
 
 function installSnapshot(pending: unknown[] = []) {
@@ -194,7 +262,7 @@ describe('approval reconnect recovery', () => {
         args: null,
         warning: '',
       })
-      runtime.handlers.get('_state')?.('connected')
+      runtime.handlers.get('_state')?.('available')
       await vi.waitFor(() => {
         expect(runtime.interruptState.value.get('gone')?.resolution).toBe('unavailable')
       })
@@ -226,7 +294,7 @@ describe('approval reconnect recovery', () => {
         args: null,
         warning: '',
       })
-      runtime.handlers.get('_state')?.('connected')
+      runtime.handlers.get('_state')?.('available')
       await vi.waitFor(() => expect(runtime.rpcCall).toHaveBeenCalled())
       runtime.handlers.get('exec.approval.resolved')?.({
         approval_id: 'race',
@@ -363,11 +431,11 @@ describe('clarify tool-result recovery', () => {
     installSnapshot()
     const runtime = await harness()
     try {
-      runtime.handlers.get('session.event.tool_result')?.({
-        session_key: 'agent:main:web',
-        tool_use_id: 'request-input-1',
+      runtime.emitToolResult({
+        key: 'agent:main:web',
+        id: 'request-input-1',
         name: 'request_user_input',
-        result,
+        approvalResult: result,
       })
 
       expect(runtime.approvals.pendingClarify.value).toEqual({
@@ -393,7 +461,7 @@ describe('clarify tool-result recovery', () => {
       expect(runtime.rpcCall).toHaveBeenLastCalledWith('chat.clarify_submit', {
         sessionKey: 'agent:main:web',
         fields: { scope: 'focused' },
-        request_id: 'input-request-1',
+        requestId: 'input-request-1',
         run_id: 'plan-run-1',
       })
       expect(runtime.approvals.pendingClarify.value).toBeNull()
@@ -429,11 +497,11 @@ describe('clarify tool-result recovery', () => {
     installSnapshot()
     const runtime = await harness()
     try {
-      runtime.handlers.get('session.event.tool_result')?.({
-        session_key: 'agent:main:web',
-        tool_use_id: 'request-input-1',
+      runtime.emitToolResult({
+        key: 'agent:main:web',
+        id: 'request-input-1',
         name: 'request_user_input',
-        result: planClarifyResult,
+        approvalResult: planClarifyResult,
       })
       runtime.rpcCall.mockRejectedValueOnce(new Error('connection lost after send'))
       await runtime.approvals.submitClarify({ scope: 'focused' })
@@ -462,11 +530,11 @@ describe('clarify tool-result recovery', () => {
     installSnapshot()
     const runtime = await harness()
     try {
-      runtime.handlers.get('session.event.tool_result')?.({
-        session_key: 'agent:main:web',
-        tool_use_id: 'request-input-1',
+      runtime.emitToolResult({
+        key: 'agent:main:web',
+        id: 'request-input-1',
         name: 'request_user_input',
-        result: planClarifyResult,
+        approvalResult: planClarifyResult,
       })
       runtime.rpcCall.mockRejectedValueOnce(new Error('gateway unavailable'))
       await runtime.approvals.submitClarify({ scope: 'focused' })
@@ -486,18 +554,18 @@ describe('clarify tool-result recovery', () => {
     installSnapshot()
     const runtime = await harness()
     try {
-      const handler = runtime.handlers.get('session.event.tool_result')
-      handler?.({
-        session_key: 'agent:main:web',
-        tool_use_id: 'request-input-1',
+      const handler = runtime.emitToolResult
+      handler({
+        key: 'agent:main:web',
+        id: 'request-input-1',
         name: 'request_user_input',
-        result: clarifyResult,
+        approvalResult: clarifyResult,
       })
-      handler?.({
-        session_key: 'agent:main:web',
-        tool_use_id: 'request-input-1',
+      handler({
+        key: 'agent:main:web',
+        id: 'request-input-1',
         name: 'request_user_input',
-        result: {
+        approvalResult: {
           kind: 'user_input',
           status: 'answered',
           paused: false,
@@ -525,11 +593,11 @@ describe('clarify tool-result recovery', () => {
     installSnapshot()
     const runtime = await harness()
     try {
-      runtime.handlers.get('session.event.tool_result')?.({
-        session_key: 'agent:main:web',
-        tool_use_id: 'request-input-1',
+      runtime.emitToolResult({
+        key: 'agent:main:web',
+        id: 'request-input-1',
         name: 'request_user_input',
-        result: planClarifyResult,
+        approvalResult: planClarifyResult,
       })
       runtime.rpcCall.mockRejectedValueOnce(new Error('gateway unavailable'))
 
@@ -557,25 +625,25 @@ describe('clarify tool-result recovery', () => {
     const runtime = await harness()
     const submitted = deferred<unknown>()
     try {
-      const handler = runtime.handlers.get('session.event.tool_result')
-      handler?.({
-        session_key: 'agent:main:web',
-        tool_use_id: 'request-input-1',
+      const handler = runtime.emitToolResult
+      handler({
+        key: 'agent:main:web',
+        id: 'request-input-1',
         name: 'request_user_input',
-        result: planClarifyResult,
+        approvalResult: planClarifyResult,
       })
       runtime.rpcCall.mockImplementationOnce(async <T,>() => await submitted.promise as T)
       const firstSubmit = runtime.approvals.submitClarify({ scope: 'focused' })
       await vi.waitFor(() => expect(runtime.rpcCall).toHaveBeenCalledWith(
         'chat.clarify_submit',
-        expect.objectContaining({ request_id: 'input-request-1' }),
+        expect.objectContaining({ requestId: 'input-request-1' }),
       ))
 
-      handler?.({
-        session_key: 'agent:main:web',
-        tool_use_id: 'request-input-2',
+      handler({
+        key: 'agent:main:web',
+        id: 'request-input-2',
         name: 'request_user_input',
-        result: {
+        approvalResult: {
           ...planClarifyResult,
           request_id: 'input-request-2',
           run_id: 'plan-run-2',
@@ -601,22 +669,22 @@ describe('clarify tool-result recovery', () => {
     installSnapshot()
     const runtime = await harness()
     try {
-      const handler = runtime.handlers.get('session.event.tool_result')
-      handler?.({
-        session_key: 'agent:main:web',
-        tool_use_id: 'request-input-2',
+      const handler = runtime.emitToolResult
+      handler({
+        key: 'agent:main:web',
+        id: 'request-input-2',
         name: 'request_user_input',
-        result: {
+        approvalResult: {
           ...planClarifyResult,
           request_id: 'input-request-2',
           run_id: 'plan-run-2',
         },
       })
-      handler?.({
-        session_key: 'agent:main:web',
-        tool_use_id: 'request-input-1',
+      handler({
+        key: 'agent:main:web',
+        id: 'request-input-1',
         name: 'request_user_input',
-        result: {
+        approvalResult: {
           kind: 'user_input',
           status: 'answered',
           paused: false,
@@ -637,12 +705,12 @@ describe('clarify tool-result recovery', () => {
     installSnapshot()
     const runtime = await harness()
     try {
-      const handler = runtime.handlers.get('session.event.tool_result')
-      handler?.({
-        session_key: 'agent:main:web',
-        tool_use_id: 'request-input-1',
+      const handler = runtime.emitToolResult
+      handler({
+        key: 'agent:main:web',
+        id: 'request-input-1',
         name: 'request_user_input',
-        result: {
+        approvalResult: {
           kind: 'user_input',
           status: 'answered',
           paused: false,
@@ -652,11 +720,11 @@ describe('clarify tool-result recovery', () => {
       })
       const appendCount = runtime.appendInterruptFrame.mock.calls.length
 
-      handler?.({
-        session_key: 'agent:main:web',
-        tool_use_id: 'request-input-1',
+      handler({
+        key: 'agent:main:web',
+        id: 'request-input-1',
         name: 'request_user_input',
-        result: planClarifyResult,
+        approvalResult: planClarifyResult,
       })
 
       expect(runtime.approvals.pendingClarify.value).toBeNull()
@@ -672,11 +740,11 @@ describe('clarify tool-result recovery', () => {
     installSnapshot()
     const runtime = await harness()
     try {
-      runtime.handlers.get('session.event.tool_result')?.({
-        session_key: 'agent:main:web',
-        tool_use_id: 'legacy-clarify',
+      runtime.emitToolResult({
+        key: 'agent:main:web',
+        id: 'legacy-clarify',
         name: 'request_user_input',
-        result: {
+        approvalResult: {
           ...clarifyResult,
           request_id: undefined,
         },

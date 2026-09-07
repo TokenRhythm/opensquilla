@@ -3,14 +3,18 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { useCronRuns } from './useCronRuns'
 import type { CronRun } from '@/types/cron'
+import type { CronScheduler } from '@/modules/cronScheduler'
 
 const mocks = vi.hoisted(() => ({
   rpcCall: vi.fn(),
 }))
 
-vi.mock('@/stores/rpc', () => ({
-  useRpcStore: () => ({ call: mocks.rpcCall }),
-}))
+const scheduler = {
+  listRuns: async (jobId: string) => {
+    const result = await mocks.rpcCall('cron.runs', { id: jobId }) as { runs: CronRun[] }
+    return result.runs
+  },
+} as unknown as CronScheduler
 
 function deferred<T>() {
   let resolve!: (value: T) => void
@@ -35,7 +39,7 @@ describe('useCronRuns', () => {
     ))
 
     const selectedId = ref<string | null>(null)
-    const state = useCronRuns(selectedId)
+    const state = useCronRuns(scheduler, selectedId)
 
     selectedId.value = 'job-a'
     await nextTick()

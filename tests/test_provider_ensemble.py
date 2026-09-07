@@ -17,7 +17,14 @@ from opensquilla.contracts.turn_execution import (
     TurnExecutionContext,
     TurnIdentity,
 )
-from opensquilla.engine.usage_accounting import normalize_provider_usage
+from opensquilla.engine.usage_accounting import (
+    UsageAccountingScope,
+    UsageCallResult,
+    UsageCallStart,
+    UsageExecutionContext,
+    bind_usage_accounting_scope,
+    normalize_provider_usage,
+)
 from opensquilla.gateway.config import GatewayConfig
 from opensquilla.provider import (
     ChatConfig,
@@ -83,6 +90,37 @@ class _FakeRegistry:
 
     def provider_for(self, cfg: ProviderConfig) -> _FakeProvider:
         return _FakeProvider(cfg, self)
+
+
+@dataclass
+class _RecordingUsageSink:
+    started: list[UsageCallStart] = field(default_factory=list)
+    finalized: list[tuple[UsageCallStart, UsageCallResult]] = field(
+        default_factory=list
+    )
+    unknown: list[tuple[UsageCallStart, str]] = field(default_factory=list)
+
+    async def start(self, call: UsageCallStart) -> None:
+        self.started.append(call)
+
+    async def finalize(self, call: UsageCallStart, result: UsageCallResult) -> None:
+        self.finalized.append((call, result))
+
+    async def mark_unknown(self, call: UsageCallStart, reason: str) -> None:
+        self.unknown.append((call, reason))
+
+
+def _usage_scope(sink: _RecordingUsageSink) -> UsageAccountingScope:
+    return UsageAccountingScope(
+        sink=sink,
+        context=UsageExecutionContext(
+            execution_id="ensemble-execution",
+            agent_run_id="ensemble-run",
+            turn_id="ensemble-turn",
+            session_id="ensemble-session",
+            agent_id="main",
+        ),
+    )
 
 
 class _ExactProjectionMixin:
@@ -669,9 +707,26 @@ async def test_tokenrhythm_b5_default_quorum_reconciles_five_physical_receipts(
         quorum_grace_seconds=0.1,
         shuffle_candidates=False,
     )
+    sink = _RecordingUsageSink()
 
-    events = await _collect(provider)
+    with bind_usage_accounting_scope(_usage_scope(sink)):
+        events = await _collect(provider)
 
+    assert provider.accounts_physical_usage is True
+    expected_legs = [
+        ("tokenrhythm", model) for model in [*proposer_models, "agg"]
+    ]
+    assert sorted((call.provider, call.model) for call in sink.started) == sorted(
+        expected_legs
+    )
+    assert sorted((call.provider, call.model) for call, _ in sink.finalized) == sorted(
+        expected_legs
+    )
+    assert sink.unknown == []
+    assert all(call.provider != "zhipu" for call in sink.started)
+    assert "".join(
+        event.text for event in events if isinstance(event, TextDeltaEvent)
+    ) == "final"
     done = next(event for event in events if isinstance(event, DoneEvent))
     assert done.billing_receipt is None
     assert done.cost_source == "provider_billed"
@@ -769,9 +824,31 @@ async def test_tokenrhythm_b5_explicit_quorum_uses_fixed_fallback_when_unmet(
         quorum_grace_seconds=0,
         shuffle_candidates=False,
     )
+    sink = _RecordingUsageSink()
 
-    events = await _collect(provider)
+    with bind_usage_accounting_scope(_usage_scope(sink)):
+        events = await _collect(provider)
 
+    assert sorted((call.provider, call.model) for call in sink.started) == [
+        ("tokenrhythm", "fallback"),
+        ("tokenrhythm", "p1"),
+        ("tokenrhythm", "p2"),
+        ("tokenrhythm", "p3"),
+        ("tokenrhythm", "p4"),
+    ]
+    assert sorted((call.provider, call.model) for call, _ in sink.finalized) == [
+        ("tokenrhythm", "fallback"),
+        ("tokenrhythm", "p1"),
+        ("tokenrhythm", "p2"),
+        ("tokenrhythm", "p3"),
+    ]
+    assert [
+        (call.provider, call.model, reason) for call, reason in sink.unknown
+    ] == [("tokenrhythm", "p4", "provider_error:503")]
+    assert all(call.provider != "zhipu" for call in sink.started)
+    assert "".join(
+        event.text for event in events if isinstance(event, TextDeltaEvent)
+    ) == "fallback"
     assert [call["model"] for call in registry.calls] == [
         "p1",
         "p2",
@@ -818,6 +895,252 @@ async def test_tokenrhythm_b5_explicit_quorum_uses_fixed_fallback_when_unmet(
     assert result.cache_read_tokens == sum(item.cache_read_tokens for item in result.items)
     assert result.cache_write_tokens == sum(item.cache_write_tokens for item in result.items)
     assert [item.billing_receipt for item in result.items] == receipts
+
+
+@pytest.mark.asyncio
+async def test_selector_wrapped_ensemble_accounts_only_physical_members(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from opensquilla.engine.runtime import _SelectorFallbackProvider
+
+    registry = _FakeRegistry(
+        {
+            "p1": _FakePlan(
+                [TextDeltaEvent(text="draft p1"), _tokenrhythm_done("p1", scale=1)]
+            ),
+            "p2": _FakePlan(
+                [TextDeltaEvent(text="draft p2"), _tokenrhythm_done("p2", scale=2)]
+            ),
+            "agg": _FakePlan(
+                [TextDeltaEvent(text="final"), _tokenrhythm_done("agg", scale=3)]
+            ),
+        }
+    )
+    monkeypatch.setattr("opensquilla.provider.ensemble._build_provider", registry.provider_for)
+    ensemble = EnsembleProvider(
+        profile_name="selector-accounting",
+        proposers=[_tokenrhythm_member("p1"), _tokenrhythm_member("p2")],
+        aggregator=_tokenrhythm_member("agg"),
+        min_successful_proposers=2,
+        proposer_timeout_seconds=1,
+        aggregator_timeout_seconds=1,
+        shuffle_candidates=False,
+    )
+
+    class _Selector:
+        active_provider_id = "zhipu"
+        current_config = ProviderConfig(provider="zhipu", model="outer-glm")
+
+    provider = _SelectorFallbackProvider(ensemble, _Selector())
+    sink = _RecordingUsageSink()
+
+    with bind_usage_accounting_scope(_usage_scope(sink)):
+        events = [
+            event
+            async for event in provider.chat(
+                [Message(role="user", content="answer this")],
+                config=ChatConfig(max_tokens=99, thinking=False),
+            )
+        ]
+
+    assert [(call.call_index, call.provider, call.model) for call in sink.started] == [
+        (1, "tokenrhythm", "p1"),
+        (2, "tokenrhythm", "p2"),
+        (3, "tokenrhythm", "agg"),
+    ]
+    assert [call.call_index for call, _ in sink.finalized] == [1, 2, 3]
+    assert sink.unknown == []
+    assert [call["model"] for call in registry.calls] == ["p1", "p2", "agg"]
+    assert "".join(
+        event.text for event in events if isinstance(event, TextDeltaEvent)
+    ) == "final"
+
+
+@pytest.mark.asyncio
+async def test_selector_fallback_after_ensemble_failure_has_no_outer_usage_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from opensquilla.engine.runtime import _SelectorFallbackProvider
+
+    registry = _FakeRegistry(
+        {
+            "p1": _FakePlan(
+                [TextDeltaEvent(text="draft"), _tokenrhythm_done("p1", scale=1)]
+            ),
+            "agg": _FakePlan(
+                [
+                    ErrorEvent(
+                        message="unavailable",
+                        code="503",
+                        model_usage_breakdown=[
+                            {
+                                "provider": "tokenrhythm",
+                                "model": "agg",
+                                "input_tokens": 0,
+                                "output_tokens": 0,
+                            }
+                        ],
+                    )
+                ]
+            ),
+            "fallback": _FakePlan(
+                [
+                    TextDeltaEvent(text="fallback"),
+                    DoneEvent(
+                        input_tokens=7,
+                        output_tokens=2,
+                        billed_cost=0.25,
+                        model="fallback",
+                    ),
+                ]
+            ),
+        }
+    )
+    monkeypatch.setattr("opensquilla.provider.ensemble._build_provider", registry.provider_for)
+    ensemble = EnsembleProvider(
+        profile_name="selector-accounting",
+        proposers=[_tokenrhythm_member("p1")],
+        aggregator=_tokenrhythm_member("agg"),
+        min_successful_proposers=1,
+        all_failed_policy="error",
+        proposer_timeout_seconds=1,
+        aggregator_timeout_seconds=1,
+        shuffle_candidates=False,
+    )
+    fallback = registry.provider_for(
+        ProviderConfig(provider="anthropic", model="fallback")
+    )
+
+    class _Selector:
+        active_provider_id = "zhipu"
+        current_config = ProviderConfig(provider="zhipu", model="outer-glm")
+
+        def next_fallback_after_failure(self, exc: Exception) -> Any:
+            del exc
+            self.active_provider_id = "anthropic"
+            self.current_config = ProviderConfig(
+                provider="anthropic",
+                model="fallback",
+            )
+            return fallback
+
+    provider = _SelectorFallbackProvider(ensemble, _Selector())
+    sink = _RecordingUsageSink()
+
+    with bind_usage_accounting_scope(_usage_scope(sink)):
+        events = [
+            event
+            async for event in provider.chat(
+                [Message(role="user", content="answer this")],
+                config=ChatConfig(max_tokens=99, thinking=False),
+            )
+        ]
+
+    assert [(call.call_index, call.provider, call.model) for call in sink.started] == [
+        (1, "tokenrhythm", "p1"),
+        (2, "tokenrhythm", "agg"),
+        (3, "tokenrhythm", "agg"),
+        (4, "anthropic", "fallback"),
+    ]
+    assert sink.unknown == []
+    assert [
+        (call.call_index, call.provider, call.model) for call, _ in sink.finalized
+    ] == [
+        (1, "tokenrhythm", "p1"),
+        (2, "tokenrhythm", "agg"),
+        (3, "tokenrhythm", "agg"),
+        (4, "anthropic", "fallback"),
+    ]
+    assert [call["model"] for call in registry.calls] == [
+        "p1",
+        "agg",
+        "agg",
+        "fallback",
+    ]
+    fallback_activity = next(
+        event for event in events if getattr(event, "phase", "") == "fallback"
+    )
+    assert (fallback_activity.retry_attempt, fallback_activity.retry_limit) == (1, 1)
+    assert "".join(
+        event.text for event in events if isinstance(event, TextDeltaEvent)
+    ) == "fallback"
+
+
+@pytest.mark.asyncio
+async def test_ensemble_closes_physical_stream_without_usage_as_unknown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registry = _FakeRegistry(
+        {
+            "p1": _FakePlan([TextDeltaEvent(text="incomplete")]),
+            "agg": _FakePlan([DoneEvent(model="agg")]),
+        }
+    )
+    monkeypatch.setattr("opensquilla.provider.ensemble._build_provider", registry.provider_for)
+    provider = EnsembleProvider(
+        profile_name="tokenrhythm-accounting",
+        proposers=[_tokenrhythm_member("p1")],
+        aggregator=_tokenrhythm_member("agg"),
+        min_successful_proposers=1,
+        all_failed_policy="error",
+        proposer_timeout_seconds=1,
+        aggregator_timeout_seconds=1,
+        shuffle_candidates=False,
+    )
+    sink = _RecordingUsageSink()
+
+    with bind_usage_accounting_scope(_usage_scope(sink)):
+        events = await _collect(provider)
+
+    assert any(isinstance(event, ErrorEvent) for event in events)
+    assert sink.finalized == []
+    assert [(call.provider, call.model, reason) for call, reason in sink.unknown] == [
+        ("tokenrhythm", "p1", "provider_stream_ended_without_usage")
+    ]
+
+
+@pytest.mark.asyncio
+async def test_ensemble_closes_cancelled_physical_stream_as_unknown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    gate = asyncio.Event()
+    started = asyncio.Event()
+    closed = asyncio.Event()
+    registry = _FakeRegistry(
+        {
+            "p1": _FakePlan(
+                [DoneEvent(model="p1")],
+                gate=gate,
+                started=started,
+                closed=closed,
+            ),
+            "agg": _FakePlan([DoneEvent(model="agg")]),
+        }
+    )
+    monkeypatch.setattr("opensquilla.provider.ensemble._build_provider", registry.provider_for)
+    provider = EnsembleProvider(
+        profile_name="tokenrhythm-accounting",
+        proposers=[_tokenrhythm_member("p1")],
+        aggregator=_tokenrhythm_member("agg"),
+        min_successful_proposers=1,
+        proposer_timeout_seconds=10,
+        aggregator_timeout_seconds=1,
+        shuffle_candidates=False,
+    )
+    sink = _RecordingUsageSink()
+
+    with bind_usage_accounting_scope(_usage_scope(sink)):
+        task = asyncio.create_task(_collect(provider))
+        await asyncio.wait_for(started.wait(), timeout=1)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    assert closed.is_set() is True
+    assert sink.finalized == []
+    assert [(call.provider, call.model, reason) for call, reason in sink.unknown] == [
+        ("tokenrhythm", "p1", "cancelled")
+    ]
 
 
 def _ensemble_for_validation(

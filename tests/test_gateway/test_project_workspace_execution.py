@@ -17,7 +17,7 @@ import pytest
 
 from opensquilla.application.approval_queue import ApprovalQueue
 from opensquilla.engine.types import DoneEvent
-from opensquilla.gateway import rpc_sessions
+from opensquilla.gateway import admission_preparation, rpc_sessions
 from opensquilla.gateway.agent_tasks import get_agent_task_registry
 from opensquilla.gateway.auth import Principal
 from opensquilla.gateway.boot import dispatch_task_runtime_turn
@@ -75,7 +75,7 @@ def _stable_safe_capability(monkeypatch: pytest.MonkeyPatch) -> None:
             ),
         )
 
-    monkeypatch.setattr(rpc_sessions, "current_sandbox_capability_report", report)
+    monkeypatch.setattr(admission_preparation, "current_sandbox_capability_report", report)
 
 
 @dataclass
@@ -323,7 +323,17 @@ async def test_turn_tool_context_uses_project_directory(tmp_path: Path) -> None:
         ran = asyncio.Event()
 
         class Runner:
-            async def run(self, message: str, session_key: str, **kwargs: Any):
+            async def run(
+                self,
+                message: str,
+                session_key: str,
+                *,
+                expected_session_id: str | None = None,
+                expected_session_epoch: int | None = None,
+                **kwargs: Any,
+            ):
+                captured["expected_session_id"] = expected_session_id
+                captured["expected_session_epoch"] = expected_session_epoch
                 captured.update(kwargs)
                 ran.set()
                 yield DoneEvent()
@@ -345,6 +355,10 @@ async def test_turn_tool_context_uses_project_directory(tmp_path: Path) -> None:
 
         assert response.ok is True
         assert captured["tool_context"].workspace_dir == project.path
+        session = await stack.storage.get_session("agent:main:webchat:project-tool-context")
+        assert session is not None
+        assert captured["expected_session_id"] == session.session_id
+        assert captured["expected_session_epoch"] == int(session.epoch or 0)
 
 
 @pytest.mark.asyncio
@@ -407,7 +421,15 @@ async def test_non_owner_can_continue_an_existing_project_session(
         ran = asyncio.Event()
 
         class Runner:
-            async def run(self, message: str, session_key: str, **kwargs: Any):
+            async def run(
+                self,
+                message: str,
+                session_key: str,
+                *,
+                expected_session_id: str | None = None,
+                expected_session_epoch: int | None = None,
+                **kwargs: Any,
+            ):
                 captured.update(kwargs)
                 ran.set()
                 yield DoneEvent()
@@ -664,7 +686,15 @@ async def test_project_first_send_without_task_runtime_is_atomic(
         run_count = 0
 
         class Runner:
-            async def run(self, message: str, session_key: str, **kwargs: Any):
+            async def run(
+                self,
+                message: str,
+                session_key: str,
+                *,
+                expected_session_id: str | None = None,
+                expected_session_epoch: int | None = None,
+                **kwargs: Any,
+            ):
                 nonlocal run_count
                 run_count += 1
                 ran.set()
@@ -859,7 +889,15 @@ async def test_origin_workspace_tamper_cannot_change_project_tool_context(
         ran = asyncio.Event()
 
         class Runner:
-            async def run(self, message: str, session_key: str, **kwargs: Any):
+            async def run(
+                self,
+                message: str,
+                session_key: str,
+                *,
+                expected_session_id: str | None = None,
+                expected_session_epoch: int | None = None,
+                **kwargs: Any,
+            ):
                 captured.update(kwargs)
                 ran.set()
                 yield DoneEvent()
@@ -878,7 +916,7 @@ async def test_origin_workspace_tamper_cannot_change_project_tool_context(
 
 
 @pytest.mark.asyncio
-async def test_legacy_implicit_full_project_context_remains_full(
+async def test_legacy_implicit_full_project_context_uses_global_default(
     tmp_path: Path,
 ) -> None:
     async with open_stack(tmp_path / "sessions.db") as stack:
@@ -901,7 +939,15 @@ async def test_legacy_implicit_full_project_context_remains_full(
         ran = asyncio.Event()
 
         class Runner:
-            async def run(self, message: str, session_key: str, **kwargs: Any):
+            async def run(
+                self,
+                message: str,
+                session_key: str,
+                *,
+                expected_session_id: str | None = None,
+                expected_session_epoch: int | None = None,
+                **kwargs: Any,
+            ):
                 captured.update(kwargs)
                 ran.set()
                 yield DoneEvent()
@@ -918,11 +964,14 @@ async def test_legacy_implicit_full_project_context_remains_full(
 
         assert response.ok is True
         assert captured["tool_context"].run_mode == "full"
-        assert captured["tool_context"].sandbox_run_context.run_mode_source is None
+        assert (
+            captured["tool_context"].sandbox_run_context.run_mode_source
+            == "operator_default"
+        )
 
 
 @pytest.mark.asyncio
-async def test_explicit_full_project_context_preserves_user_provenance(
+async def test_saved_user_full_project_context_uses_global_default_provenance(
     tmp_path: Path,
 ) -> None:
     async with open_stack(tmp_path / "sessions.db") as stack:
@@ -946,7 +995,15 @@ async def test_explicit_full_project_context_preserves_user_provenance(
         ran = asyncio.Event()
 
         class Runner:
-            async def run(self, message: str, session_key: str, **kwargs: Any):
+            async def run(
+                self,
+                message: str,
+                session_key: str,
+                *,
+                expected_session_id: str | None = None,
+                expected_session_epoch: int | None = None,
+                **kwargs: Any,
+            ):
                 captured.update(kwargs)
                 ran.set()
                 yield DoneEvent()
@@ -963,7 +1020,10 @@ async def test_explicit_full_project_context_preserves_user_provenance(
 
         assert response.ok is True
         assert captured["tool_context"].run_mode == "full"
-        assert captured["tool_context"].sandbox_run_context.run_mode_source == "user"
+        assert (
+            captured["tool_context"].sandbox_run_context.run_mode_source
+            == "operator_default"
+        )
 
 
 @pytest.mark.parametrize(
@@ -1002,7 +1062,15 @@ async def test_direct_web_project_turn_preserves_authorized_request_mode_at_exec
         captured: dict[str, Any] = {}
 
         class Runner:
-            async def run(self, message: str, session_key: str, **kwargs: Any):
+            async def run(
+                self,
+                message: str,
+                session_key: str,
+                *,
+                expected_session_id: str | None = None,
+                expected_session_epoch: int | None = None,
+                **kwargs: Any,
+            ):
                 captured.update(kwargs)
                 yield DoneEvent()
 
@@ -1045,7 +1113,7 @@ async def test_direct_web_project_turn_preserves_authorized_request_mode_at_exec
 @pytest.mark.parametrize(
     ("requested_mode", "expected_mode", "expected_mode_source"),
     [
-        (None, "safe", "operator_default"),
+        (None, "full", "operator_default"),
         ("full", "full", "user"),
     ],
 )
@@ -1111,7 +1179,15 @@ async def test_direct_web_unbound_turn_refreshes_durable_context_before_typed_ov
         captured: dict[str, Any] = {}
 
         class Runner:
-            async def run(self, message: str, session_key: str, **kwargs: Any):
+            async def run(
+                self,
+                message: str,
+                session_key: str,
+                *,
+                expected_session_id: str | None = None,
+                expected_session_epoch: int | None = None,
+                **kwargs: Any,
+            ):
                 captured.update(kwargs)
                 yield DoneEvent()
 
@@ -1228,7 +1304,15 @@ async def test_direct_web_unbound_workspace_revocation_uses_configured_base(
         captured: dict[str, Any] = {}
 
         class Runner:
-            async def run(self, message: str, session_key: str, **kwargs: Any):
+            async def run(
+                self,
+                message: str,
+                session_key: str,
+                *,
+                expected_session_id: str | None = None,
+                expected_session_epoch: int | None = None,
+                **kwargs: Any,
+            ):
                 captured.update(kwargs)
                 yield DoneEvent()
 
@@ -1252,7 +1336,7 @@ async def test_direct_web_unbound_workspace_revocation_uses_configured_base(
         assert response.ok is True
         assert workspace_revoked is True
         tool_context = captured["tool_context"]
-        assert tool_context.run_mode == "safe"
+        assert tool_context.run_mode == "full"
         assert tool_context.workspace_dir == str(configured_workspace.resolve())
         assert tool_context.workspace_dir != str(saved_workspace.resolve())
         assert [grant.domain for grant in tool_context.sandbox_run_context.domains] == [
@@ -1600,7 +1684,15 @@ async def test_project_turn_fresh_mode_controls_real_filesystem_and_network_enfo
         target = Path(project.path) / "guarded.txt"
 
         class Runner:
-            async def run(self, message: str, session_key: str, **kwargs: Any):
+            async def run(
+                self,
+                message: str,
+                session_key: str,
+                *,
+                expected_session_id: str | None = None,
+                expected_session_epoch: int | None = None,
+                **kwargs: Any,
+            ):
                 tool_context = kwargs["tool_context"]
                 token = current_tool_context.set(tool_context)
                 try:
@@ -2385,7 +2477,15 @@ async def test_direct_project_cancellation_after_commit_still_starts_once(
         run_count = 0
 
         class Runner:
-            async def run(self, message: str, session_key: str, **kwargs: Any):
+            async def run(
+                self,
+                message: str,
+                session_key: str,
+                *,
+                expected_session_id: str | None = None,
+                expected_session_epoch: int | None = None,
+                **kwargs: Any,
+            ):
                 nonlocal run_count
                 run_count += 1
                 ran.set()
@@ -2583,6 +2683,9 @@ async def test_explicit_standard_project_drives_real_sandbox_filesystem_runtime(
                     self,
                     message: str,
                     session_key: str,
+                    *,
+                    expected_session_id: str | None = None,
+                    expected_session_epoch: int | None = None,
                     **kwargs: Any,
                 ):
                     project_ctx = kwargs["tool_context"]
@@ -2649,6 +2752,9 @@ async def test_explicit_standard_project_drives_real_sandbox_filesystem_runtime(
                     self,
                     message: str,
                     session_key: str,
+                    *,
+                    expected_session_id: str | None = None,
+                    expected_session_epoch: int | None = None,
                     **kwargs: Any,
                 ):
                     full_ctx = kwargs["tool_context"]
@@ -2723,6 +2829,9 @@ async def test_explicit_full_project_bypasses_unavailable_sandbox_backend(
                     self,
                     message: str,
                     session_key: str,
+                    *,
+                    expected_session_id: str | None = None,
+                    expected_session_epoch: int | None = None,
                     **kwargs: Any,
                 ):
                     project_ctx = kwargs["tool_context"]
@@ -2773,7 +2882,7 @@ async def test_explicit_full_project_bypasses_unavailable_sandbox_backend(
 
 
 @pytest.mark.asyncio
-async def test_authenticated_project_safe_soft_lands_when_native_backend_is_unavailable(
+async def test_authenticated_project_safe_is_rejected_when_native_backend_is_unavailable(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2792,48 +2901,14 @@ async def test_authenticated_project_safe_soft_lands_when_native_backend_is_unav
     async def report(_config: Any) -> CapabilityReport:
         return unavailable
 
-    monkeypatch.setattr(rpc_sessions, "current_sandbox_capability_report", report)
-    queue = ApprovalQueue(db_path=str(tmp_path / "approvals.sqlite"))
-    active_token = None
-    try:
-        async with open_stack(tmp_path / "sessions.db") as stack:
-            project_path = tmp_path / "project"
-            sibling = tmp_path / "sibling"
-            sibling.mkdir()
-            project = await add_project(stack, project_path)
-            assert project is not None
-            outside = sibling / "outside.txt"
-            outcomes: dict[str, Any] = {}
-            completed = asyncio.Event()
+    monkeypatch.setattr(admission_preparation, "current_sandbox_capability_report", report)
+    async with open_stack(tmp_path / "sessions.db") as stack:
+        project_path = tmp_path / "project"
+        project = await add_project(stack, project_path)
+        assert project is not None
 
-            runtime = configure_runtime(
-                SandboxSettings(
-                    run_mode="standard",
-                    backend="noop",
-                    allow_legacy_mode=True,
-                ),
-                approval_queue=queue,
-                workspace=project_path,
-                default_run_mode=RunMode.FULL,
-            )
-            runtime.backend = UnavailableBackend("test unavailable")
-
-            class Runner:
-                async def run(
-                    self,
-                    message: str,
-                    session_key: str,
-                    **kwargs: Any,
-                ):
-                    outcomes["tool_context"] = kwargs["tool_context"]
-                    completed.set()
-                    yield DoneEvent()
-
-            stack.context.task_runtime = None
-            stack.context.turn_runner = Runner()
-            response = await get_dispatcher().dispatch(
-                "project-unavailable-proof",
-                "sessions.send",
+        with pytest.raises(rpc_sessions.RpcHandlerError) as raised:
+            await rpc_sessions._handle_sessions_send_contract(
                 {
                     "key": "agent:main:webchat:project-unavailable-proof",
                     "message": "write",
@@ -2848,23 +2923,7 @@ async def test_authenticated_project_safe_soft_lands_when_native_backend_is_unav
                 },
                 stack.context,
             )
-            await asyncio.wait_for(completed.wait(), timeout=2.0)
 
-            assert response.ok is True
-            project_ctx = outcomes["tool_context"]
-            assert project_ctx.run_mode == "full"
-            assert project_ctx.workspace_dir == str(project_path.resolve())
-            assert full_host_access_for_context(project_ctx) is True
-
-            active_token = current_tool_context.set(project_ctx)
-            try:
-                await fs.write_file(str(outside), "soft-landed-full")
-            finally:
-                current_tool_context.reset(active_token)
-                active_token = None
-            assert outside.read_text(encoding="utf-8") == "soft-landed-full"
-    finally:
-        if active_token is not None:
-            current_tool_context.reset(active_token)
-        reset_runtime()
-        queue.close()
+        assert raised.value.code == "SANDBOX_MODE_UNAVAILABLE"
+        assert raised.value.details is not None
+        assert raised.value.details["code"] == "backend_unavailable"

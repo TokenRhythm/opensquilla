@@ -200,6 +200,8 @@ class CompactionPersistPort(Protocol):
         source_preimage: tuple[tuple[Any, ...], ...] | None = None,
         source_boundary_message_id: str | None = None,
         source_boundary_entry_id: int | None = None,
+        expected_session_id: str | None = None,
+        expected_session_epoch: int | None = None,
     ) -> bool | None: ...
 
 @runtime_checkable
@@ -381,6 +383,8 @@ class StreamConsumerStageInput:
     compaction_source_preimage: tuple[tuple[Any, ...], ...] | None = None
     compaction_source_boundary_message_id: str | None = None
     compaction_source_boundary_entry_id: int | None = None
+    expected_session_id: str | None = None
+    expected_session_epoch: int | None = None
     # Original ingress mode.  Internal Goal continuations and heartbeats use
     # ``system_event``; their text is held until the terminal snapshot can be
     # canonicalized so silent-reply protocol markers never flash on a client.
@@ -1540,6 +1544,14 @@ class _CompactionHandler:
                 if event.compaction_timeout_seconds is not None:
                     persist_kwargs["compaction_timeout_seconds"] = (
                         event.compaction_timeout_seconds
+                    )
+                if (
+                    inp.expected_session_id is not None
+                    or inp.expected_session_epoch is not None
+                ):
+                    persist_kwargs["expected_session_id"] = inp.expected_session_id
+                    persist_kwargs["expected_session_epoch"] = (
+                        inp.expected_session_epoch
                     )
                 installed = await self._persist.persist_and_notify(**persist_kwargs)
                 if installed is False:

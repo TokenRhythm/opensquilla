@@ -55,8 +55,8 @@ describe('ChatView artifact preview routing', () => {
     const source = chatViewSource.slice(start, end)
 
     expect(start).toBeGreaterThan(-1)
-    expect(source).toContain('artifactDownloadUrl(artifact, window.location.origin')
-    expect(source).toContain("downloadBlob(blob, artifact.name || 'artifact')")
+    expect(source).toContain('artifactWorkbench.content.fetchArtifact(artifact')
+    expect(source).toContain("downloadBlob(result.blob, artifact.name || 'artifact')")
     expect(source).not.toContain('openCurrent')
     expect(source).not.toContain('headArtifact')
   })

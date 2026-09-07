@@ -44,13 +44,12 @@ function summary(source: UsageTotals, selectedCurrency: 'USD' | 'CNY') {
     serverTotals: computed(() => source),
     currency,
     cnyRate: 7.25,
-    rowVal: (row, ...keys) => keys.map(key => row[key]).find(item => item != null),
     fmtCost: (usd, options) => formatUsageCost(
       usd,
       currency.value,
       7.25,
       options?.decimals,
-      options?.source as Record<string, unknown> | undefined,
+      options?.source,
     ),
     sourceCompositionHint: () => '',
   })
@@ -81,13 +80,12 @@ describe('usage total native billing presentation', () => {
       serverTotals: computed(() => source),
       currency,
       cnyRate: 7.25,
-      rowVal: (row, ...keys) => keys.map(key => row[key]).find(item => item != null),
       fmtCost: (usd, options) => formatUsageCost(
         usd,
         currency.value,
         7.25,
         options?.decimals,
-        options?.source as Record<string, unknown> | undefined,
+        options?.source,
       ),
       sourceCompositionHint: () => '',
     })

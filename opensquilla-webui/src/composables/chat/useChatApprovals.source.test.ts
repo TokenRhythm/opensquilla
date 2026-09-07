@@ -7,7 +7,8 @@ describe('useChatApprovals clarify submit source contract', () => {
     expect(source).toContain('requestOverride?: ChatClarifyRequest')
     expect(source).toContain('const request = requestOverride || pendingClarify.value')
     expect(source).toContain('if (!requestOverride && clarifySubmitted.value) return')
-    expect(source).toContain('if (request.runId) params.run_id = request.runId')
+    expect(source).toContain('await clarificationSubmission.submit({')
+    expect(source).toContain('...(request.runId ? { runId: request.runId } : {})')
   })
 
   it('optimistically acknowledges the click before the backend finishes', () => {

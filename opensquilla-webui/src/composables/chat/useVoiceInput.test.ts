@@ -2,7 +2,40 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import i18n from '@/i18n'
 import { useToasts } from '@/composables/useToasts'
-import { useVoiceInput } from './useVoiceInput'
+import { useVoiceInput as useVoiceInputComposable } from './useVoiceInput'
+import { AudioTranscriptionError } from '@/modules/audioTranscription'
+
+function useVoiceInput() {
+  return useVoiceInputComposable({
+    async transcribe({ recording, mimeType, signal }) {
+      const form = new FormData()
+      form.append('file', recording, 'voice.webm')
+      form.append('mime', mimeType)
+      const headers: Record<string, string> = {}
+      const token = sessionStorage.getItem('opensquilla.wsToken') || ''
+      if (token) headers.Authorization = `Bearer ${token}`
+      const response = await fetch('/api/audio/transcribe', {
+        method: 'POST',
+        headers,
+        body: form,
+        credentials: 'same-origin',
+        signal,
+      })
+      const data = await response.json().catch(() => ({})) as {
+        text?: string
+        error?: string
+        code?: string
+      }
+      if (!response.ok) {
+        const kind = response.status === 503 || data.code === 'UNAVAILABLE'
+          ? 'unavailable'
+          : 'failed'
+        throw new AudioTranscriptionError(kind, data.error || `HTTP ${response.status}`)
+      }
+      return String(data.text || '').trim()
+    },
+  })
+}
 
 // useToasts is a module-level singleton, so this is the same queue the
 // composable writes to.

@@ -2834,9 +2834,12 @@ async def test_rpc_sandbox_resume_clears_denial_pause(monkeypatch) -> None:
     )
 
     result = await _handle_sandbox_resume({"sessionKey": key}, _ctx(manager))
+    repeated = await _handle_sandbox_resume({"sessionKey": key}, _ctx(manager))
 
     assert result["resumed"] is True
+    assert repeated["resumed"] is False
     assert result["autonomousPaused"] is False
+    assert repeated["autonomousPaused"] is False
     assert await ledger.is_paused(key) is False
 
 

@@ -10,7 +10,7 @@ from typing import Any
 from opensquilla.artifact_session import ArtifactSessionService
 from opensquilla.artifacts import ArtifactStore
 from opensquilla.engine.types import ArtifactEvent
-from opensquilla.gateway.rpc_workbench_resources import (
+from opensquilla.gateway.workbench_resource_runtime import (
     adopt_generated_deliverable_if_editable,
 )
 

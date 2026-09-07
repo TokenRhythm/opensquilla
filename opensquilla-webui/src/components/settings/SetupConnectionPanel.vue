@@ -1,46 +1,29 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue'
+import { computed, inject, onMounted, ref } from 'vue'
 import { useI18n } from 'vue-i18n'
-import { useRpcStore } from '@/stores/rpc'
+import { GATEWAY_ACCESS_KEY } from '@/modules/gatewayAccess'
 
 const { t } = useI18n()
 
 // Gateway connection editor. This is the one Settings section that must work
 // while the gateway is NOT connected — it is exactly how you point the UI at a
 // reachable gateway. It therefore owns its own form state and talks only to the
-// rpc store + browser storage; it never depends on catalog/readiness RPCs, so
+// Gateway Access seam; it never depends on catalog/readiness RPCs, so
 // it renders outside SettingsDialog's `!loaded` gate.
-
-const WS_URL_KEY = 'opensquilla.wsUrl'
-const WS_TOKEN_KEY = 'opensquilla.wsToken'
-
-const rpc = useRpcStore()
+const injectedGatewayAccess = inject(GATEWAY_ACCESS_KEY)
+if (!injectedGatewayAccess) throw new Error('GatewayAccess was not provided')
+const gatewayAccess = injectedGatewayAccess
 
 const wsUrl = ref('')
 const wsToken = ref('')
 
-function defaultRpcUrl(): string {
-  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:'
-  return `${proto}//${location.host}/ws`
-}
-
-function loadConnectionSettings(): { url: string; token: string } {
-  let url = defaultRpcUrl()
-  let token = ''
-  try { url = localStorage.getItem(WS_URL_KEY) || url } catch { /* private mode */ }
-  try { token = sessionStorage.getItem(WS_TOKEN_KEY) || '' } catch { /* private mode */ }
-  return { url, token }
-}
-
 onMounted(() => {
-  const settings = loadConnectionSettings()
-  wsUrl.value = settings.url
-  wsToken.value = settings.token
+  wsUrl.value = gatewayAccess.loadConnectionEndpoint()
 })
 
 const statusState = computed(() => {
-  if (rpc.isConnecting) return 'connecting'
-  if (rpc.isConnected) return 'connected'
+  if (gatewayAccess.availability === 'preparing') return 'connecting'
+  if (gatewayAccess.availability === 'available') return 'connected'
   return 'disconnected'
 })
 
@@ -59,19 +42,21 @@ const statusLabel = computed(() => {
 const statusReason = computed(() => {
   if (statusState.value === 'connected') return t('setup.connection.reasonConnected')
   if (statusState.value === 'connecting') return t('setup.connection.reasonConnecting')
-  if (rpc.error) return t('setup.connection.reasonFailed', { error: rpc.error })
+  if (gatewayAccess.connectionError) {
+    return t('setup.connection.reasonFailed', { error: gatewayAccess.connectionError })
+  }
   return t('setup.connection.reasonDisconnected')
 })
 
 function connect() {
   const url = wsUrl.value.trim()
   const token = wsToken.value.trim()
-  rpc.disconnect()
-  void rpc.connect(url, token || undefined)
+  gatewayAccess.disconnect()
+  void gatewayAccess.connect({ endpoint: url, credential: token || undefined })
 }
 
 function disconnect() {
-  rpc.disconnect()
+  gatewayAccess.disconnect()
 }
 </script>
 

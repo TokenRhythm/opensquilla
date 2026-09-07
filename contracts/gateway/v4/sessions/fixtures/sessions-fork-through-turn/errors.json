@@ -1,0 +1,48 @@
+{
+  "format_version": 1,
+  "kind": "error",
+  "cases": [
+    {
+      "id": "error.invalid-request-missing-anchor",
+      "coverage": "required-through-turn-anchor",
+      "expectation": "exact",
+      "wire": { "type": "res", "id": "fork-through-missing-anchor", "ok": false, "payload": null, "error": { "code": "INVALID_REQUEST", "message": "params.throughTurnId is required", "details": null, "retryable": false, "retry_after_ms": null, "accepted": null } }
+    },
+    {
+      "id": "error.invalid-request-before-presence",
+      "coverage": "forbidden-before-message-alias",
+      "expectation": "exact",
+      "wire": { "type": "res", "id": "fork-through-before", "ok": false, "payload": null, "error": { "code": "INVALID_REQUEST", "message": "sessions.forkThroughTurn does not accept beforeMessageId", "details": null, "retryable": false, "retry_after_ms": null, "accepted": null } }
+    },
+    {
+      "id": "error.not-found",
+      "coverage": "missing-terminal-turn",
+      "expectation": "exact",
+      "wire": { "type": "res", "id": "fork-through-missing", "ok": false, "payload": null, "error": { "code": "NOT_FOUND", "message": "'Session not found: agent:main:webchat:missing'", "details": null, "retryable": false, "retry_after_ms": null, "accepted": null } }
+    },
+    {
+      "id": "error.unauthorized",
+      "coverage": "operator-write-scope",
+      "expectation": "exact",
+      "wire": { "type": "res", "id": "fork-through-unauthorized", "ok": false, "payload": null, "error": { "code": "UNAUTHORIZED", "message": "operator.write scope required", "details": null, "retryable": false, "retry_after_ms": null, "accepted": null } }
+    },
+    {
+      "id": "error.unavailable",
+      "coverage": "runtime-unavailable",
+      "expectation": "exact",
+      "wire": { "type": "res", "id": "fork-through-unavailable", "ok": false, "payload": null, "error": { "code": "UNAVAILABLE", "message": "Session runtime is unavailable", "details": null, "retryable": true, "retry_after_ms": null, "accepted": null } }
+    },
+    {
+      "id": "error.storage-busy",
+      "coverage": "retryable-storage-contention",
+      "expectation": "exact",
+      "wire": { "type": "res", "id": "fork-through-busy", "ok": false, "payload": null, "error": { "code": "STORAGE_BUSY", "message": "Session storage is busy", "details": { "operation": "fork-through-turn" }, "retryable": true, "retry_after_ms": 125, "accepted": null } }
+    },
+    {
+      "id": "error.internal",
+      "coverage": "unexpected-handler-failure",
+      "expectation": "exact",
+      "wire": { "type": "res", "id": "fork-through-internal", "ok": false, "payload": null, "error": { "code": "INTERNAL_ERROR", "message": "Internal error", "details": null, "retryable": false, "retry_after_ms": null, "accepted": null } }
+    }
+  ]
+}

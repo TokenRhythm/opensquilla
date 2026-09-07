@@ -7,16 +7,95 @@ import {
   skillInstallRequiresRiskAcknowledgement,
   skillInstallWasRateLimited,
   skillRegistryOperationKey,
-  useSkillRegistry,
+  useSkillRegistry as useSkillRegistryModel,
 } from './useSkillRegistry'
 import { createSkillMutationGate } from './useSkillMutationGate'
-import { useSkillProposals } from './useSkillProposals'
+import { useSkillProposals as useSkillProposalsModel } from './useSkillProposals'
+import type { SkillCatalog } from '@/modules/skillCatalog'
 
 const pushToast = vi.hoisted(() => vi.fn())
 
 vi.mock('@/composables/useToasts', () => ({
   useToasts: () => ({ pushToast }),
 }))
+
+type RpcCall = (method: string, params?: Record<string, unknown>) => Promise<any>
+
+function catalogFromCall(
+  call: RpcCall,
+  hasRpcMethod: (method: string) => boolean = () => false,
+): SkillCatalog {
+  return {
+    list: async () => (await call('skills.list', { includeLifecycle: true })).skills || [],
+    detail: skill => call('skills.get', { name: skill.name, includeLifecycle: true }),
+    search: async (query, options) => {
+      const result = await call('skills.search', {
+        query,
+        limit: options?.limit ?? 20,
+        source: options?.source || 'clawhub',
+      })
+      return {
+        results: result.results || [],
+        diagnostics: result.diagnostics || [],
+        message: result.message || '',
+      }
+    },
+    reload: () => call('skills.reload'),
+    install: request => call('skills.install', {
+      identifier: request.identifier,
+      source: request.source,
+      ...(request.operationId ? { operationId: request.operationId } : {}),
+      ...(request.riskConfirmation
+        ? { force: true, riskConfirmation: request.riskConfirmation }
+        : {}),
+    }),
+    supportsInstallCancellation: () => hasRpcMethod('skills.install.cancel'),
+    cancelInstall: operationId => call('skills.install.cancel', { operationId }),
+    installDependencies: request => call('skills.deps.install', {
+      name: request.name,
+      install_id: request.dependencyId,
+      ...(request.skillInstallId ? { installId: request.skillInstallId } : {}),
+      ...(request.instanceId ? { instanceId: request.instanceId } : {}),
+    }),
+    uninstall: request => call('skills.uninstall', {
+      ...(request.name ? { name: request.name } : {}),
+      ...(request.installId ? { installId: request.installId } : {}),
+    }),
+    proposals: async () => ({
+      proposals: (await call('exec.proposals.list')).proposals || [],
+      autoEnabledSkills: (await call('exec.proposals.auto_enabled.list')).skills || [],
+      settings: (await call('exec.proposals.settings.get')).settings || null,
+    }),
+    updateProposalSettings: changes => call('exec.proposals.settings.set', { ...changes }),
+    proposal: proposalId => call('exec.proposals.show', { proposal_id: proposalId }),
+    acceptProposal: (proposalId, options) => call('exec.proposals.accept', {
+      proposal_id: proposalId,
+      ...(options?.force ? { force: true } : {}),
+    }),
+    rejectProposal: proposalId => call('exec.proposals.reject', { proposal_id: proposalId }),
+    disableAutoEnabledSkill: name => call('exec.proposals.auto_enabled.disable', { name }),
+  }
+}
+
+function asCatalog(source: SkillCatalog | { call: RpcCall; hasRpcMethod?: (method: string) => boolean }) {
+  return 'call' in source
+    ? catalogFromCall(source.call, source.hasRpcMethod)
+    : source
+}
+
+function useSkillRegistry(
+  source: SkillCatalog | { call: RpcCall; hasRpcMethod?: (method: string) => boolean },
+  ...rest: Parameters<typeof useSkillRegistryModel> extends [unknown, ...infer Tail] ? Tail : never
+) {
+  return useSkillRegistryModel(asCatalog(source), ...rest)
+}
+
+function useSkillProposals(
+  source: SkillCatalog | { call: RpcCall; hasRpcMethod?: (method: string) => boolean },
+  ...rest: Parameters<typeof useSkillProposalsModel> extends [unknown, ...infer Tail] ? Tail : never
+) {
+  return useSkillProposalsModel(asCatalog(source), ...rest)
+}
 
 afterEach(() => {
   vi.restoreAllMocks()
@@ -202,7 +281,7 @@ describe('useSkillRegistry install state', () => {
     const loadData = vi.fn(async () => true)
     const registry = useSkillRegistry({
       call,
-      supportsMethod: (method: string) => method === 'skills.install.cancel',
+      hasRpcMethod: (method: string) => method === 'skills.install.cancel',
     } as never, loadData)
     registry.githubUrl.value = [
       'https://github.com/acme/one',
@@ -244,7 +323,7 @@ describe('useSkillRegistry install state', () => {
     const loadData = vi.fn(async () => true)
     const registry = useSkillRegistry({
       call,
-      supportsMethod: (method: string) => method === 'skills.install.cancel',
+      hasRpcMethod: (method: string) => method === 'skills.install.cancel',
     } as never, loadData)
     registry.githubUrl.value = [
       'https://github.com/acme/one',

@@ -1,7 +1,87 @@
-import type { ArtifactPayload } from './rpc'
-import type { SessionSteerV2Params } from './rpc'
+import type { ArtifactPayload } from './artifacts'
 import type { PromptAnnotationSnapshot } from './promptAnnotations'
 import type { IconName } from '@/utils/icons'
+import type { ConversationRoutingSnapshot } from '@/modules/conversationEventContent'
+
+export interface RawSessionTask {
+  status?: string
+  task_id?: string
+  taskId?: string
+  turn_id?: string
+  turnId?: string
+  started_at?: number | string
+  startedAt?: number | string
+  finished_at?: number | string
+  finishedAt?: number | string
+  turn_outcome?: Record<string, unknown>
+  turnOutcome?: Record<string, unknown>
+  document_mutation_outcome?: Record<string, unknown>
+  documentMutationOutcome?: Record<string, unknown>
+  steer_capability?: ChatSteerCapability
+  steerCapability?: ChatSteerCapability
+}
+
+export type ProviderActivityPhase =
+  | 'requesting'
+  | 'reasoning'
+  | 'retry_wait'
+  | 'retrying'
+  | 'fallback'
+
+export type ProviderActivityReason =
+  | 'initial'
+  | 'rate_limited'
+  | 'provider_overloaded'
+  | 'transport_transient'
+  | 'reasoning_only'
+  | 'empty_response'
+  | 'stream_incomplete'
+  | 'invalid_response'
+  | 'context_overflow'
+  | 'unknown'
+
+export interface ApprovalStatusPayload {
+  found?: boolean
+  id?: string
+  namespace?: string
+  pending?: boolean
+  resolved?: boolean
+  approved?: boolean
+  resolution?: string
+  resolutionInProgress?: boolean
+  consumed?: boolean
+  deadline?: number
+}
+
+export type AssistantDelivery = 'visible' | 'suppressed'
+export type AssistantSuppressionReason = 'no_reply' | 'heartbeat_ack'
+
+export interface ChatSendAttachmentPayload {
+  type: string
+  mime: string
+  name: string
+  data?: string
+  file_uuid?: string
+}
+
+/** Exact editable document head bound to one chat send attempt. */
+export interface ChatDocumentContext {
+  documentId: string
+  headRevisionId: string
+}
+
+export interface SessionSteerV2Params {
+  key: string
+  message: string
+  expected_turn_id: string
+  client_request_id: string
+  client_message_id: string
+  pendingInputId?: string
+  requestFingerprint?: string
+  expectedRevision?: number
+  surface_id?: string
+  _source?: { elevated?: string; runMode?: 'safe' | 'full' }
+}
 
 export interface Attachment {
   kind: 'inline' | 'staged' | 'inline_pending' | 'uploading' | 'failed'
@@ -345,6 +425,8 @@ export interface ChatTurnOutcome {
 }
 
 export interface ChatRunTask {
+  /** Control ownership projected independently from persisted outcome identity. */
+  ownershipTaskId?: string
   status?: string
   cancel_requested?: boolean
   cancelRequested?: boolean
@@ -602,7 +684,7 @@ export interface ChatMessage {
   reasoningPresentationPending?: boolean
   activitySnapshot?: ActivitySnapshotV2
   activitySnapshotIncomplete?: boolean
-  routerDecision?: import('./rpc').RouterDecisionPayload | null
+  routerDecision?: ConversationRoutingSnapshot | null
   /** Routing-only usage projection for a split historical answer segment. */
   routerUsage?: ChatUsagePayload
   routerModelCallId?: string

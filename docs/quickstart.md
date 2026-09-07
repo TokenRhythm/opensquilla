@@ -17,7 +17,7 @@ UI, SquillaRouter, memory/search support, and safe local defaults.
 Install the current release wheel with the recommended extras:
 
 ```sh
-uv tool install --python 3.12 "opensquilla[recommended] @ https://github.com/opensquilla/opensquilla/releases/download/v0.5.4/opensquilla-0.5.4-py3-none-any.whl"
+uv tool install --python 3.12 "opensquilla[recommended] @ https://github.com/TokenRhythm/opensquilla/releases/download/v0.5.4/opensquilla-0.5.4-py3-none-any.whl"
 ```
 
 The `recommended` extra includes SquillaRouter dependencies and memory/search
@@ -208,7 +208,7 @@ Use source install when you want a checkout-backed install:
 
 ```sh
 git lfs install
-git clone https://github.com/opensquilla/opensquilla.git
+git clone https://github.com/TokenRhythm/opensquilla.git
 cd opensquilla
 git lfs pull --include="src/opensquilla/squilla_router/models/**"
 bash scripts/install_source.sh
@@ -242,4 +242,4 @@ release wheel instead.
 
 ---
 
-[Docs index](README.md) · [Product guide](../README.product.md) · [Improve this page](contributing-docs.md) · [Report a docs issue](https://github.com/opensquilla/opensquilla/issues/new?template=docs_report.yml)
+[Docs index](README.md) · [Product guide](../README.product.md) · [Improve this page](contributing-docs.md) · [Report a docs issue](https://github.com/TokenRhythm/opensquilla/issues/new?template=docs_report.yml)

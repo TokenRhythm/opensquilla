@@ -126,7 +126,6 @@
         ref="previewRef"
         :agent-edit-in-progress="agentEditInProgress"
         :artifact="headArtifact"
-        :auth-token="authToken"
         :base-origin="baseOrigin"
         :native-html="nativeHtml"
         :native-surface-state="nativeSurfaceState"
@@ -271,7 +270,7 @@ import type {
   ArtifactDocumentActions,
   ArtifactDocumentWorkspaceSnapshot,
 } from '@/types/artifactDocuments'
-import type { ArtifactPayload } from '@/types/rpc'
+import type { ArtifactPayload } from '@/types/artifacts'
 import {
   PROMPT_ANNOTATION_MAX_BODY_LENGTH,
   promptAnnotationBodyWithinLimit,
@@ -302,7 +301,6 @@ const props = withDefaults(defineProps<{
   documentSnapshot?: ArtifactDocumentWorkspaceSnapshot
   initialSection?: 'preview' | 'source'
   initialSectionRequestId?: number
-  authToken?: string
   baseOrigin?: string
   nativeHtml?: boolean
   nativeSurfaceState?: 'crashed' | 'error' | 'loading' | 'ready'
@@ -337,7 +335,6 @@ const props = withDefaults(defineProps<{
   documentFeatures: true,
   initialSection: 'preview',
   initialSectionRequestId: 0,
-  authToken: '',
   baseOrigin: '',
   nativeHtml: false,
   nativeSurfaceState: 'loading',

@@ -23,7 +23,6 @@ from xml.etree import ElementTree as ET
 
 import structlog
 
-from opensquilla.sandbox.backend.unavailable import UnavailableBackend
 from opensquilla.sandbox.backup_vault import BackupReceiptSummary, summarize_backup_receipts
 from opensquilla.sandbox.destructive_backup import DestructiveBackupGate
 from opensquilla.sandbox.directory_listing import format_directory_entry
@@ -886,15 +885,6 @@ async def _run_sandbox_operation_if_required(
                 filesystem=filesystem_permissions,
             ),
         )
-    if (
-        trusted_sandbox_active()
-        and ctx is not None
-        and ctx.is_owner
-        and runtime is not None
-        and isinstance(runtime.backend, UnavailableBackend)
-        and operation.kind not in {"create_source", "edit_source"}
-    ):
-        return None
     return await SandboxOperationRuntime(
         runtime,
         host_execution_active=full_host_access_active() or host_execution_active,
@@ -1778,7 +1768,7 @@ async def read_file(path: str, offset: int | None = None, limit: int | None = No
         },
     },
     required=["path"],
-    exposed_by_default=False,
+    default_access="deny",
     plan_access=PlanAccess.READ_ONLY,
 )
 async def read_source(path: str, start_line: int = 1, end_line: int | None = None) -> str:
@@ -2271,7 +2261,7 @@ def _resolve_scratch_write_path(path: str) -> tuple[Path, str]:
         },
     },
     required=["path", "content"],
-    exposed_by_default=False,
+    default_access="deny",
     sandbox=SandboxToolDescriptor.filesystem(
         kind="fs.write",
         argv_factory=lambda a: ("fs.write_scratch", str(a.get("path", ""))),
@@ -2337,7 +2327,7 @@ async def write_scratch(path: str, content: str) -> str:
     },
     required=["path", "content"],
     runtime_only_arguments=("approval_id",),
-    exposed_by_default=False,
+    default_access="deny",
     sandbox=SandboxToolDescriptor.filesystem(
         kind="fs.write",
         argv_factory=lambda a: ("fs.create_source", str(a.get("path", ""))),
@@ -2887,7 +2877,7 @@ async def edit_file(
     },
     required=["path", "expected_revision", "edits"],
     runtime_only_arguments=("approval_id",),
-    exposed_by_default=False,
+    default_access="deny",
     sandbox=SandboxToolDescriptor.filesystem(
         kind="fs.edit",
         argv_factory=lambda a: ("fs.edit", str(a.get("path", ""))),
@@ -3918,7 +3908,7 @@ def _source_symbol_query_matches(
         },
     },
     required=[],
-    exposed_by_default=False,
+    default_access="deny",
     plan_access=PlanAccess.READ_ONLY,
 )
 async def source_symbols(

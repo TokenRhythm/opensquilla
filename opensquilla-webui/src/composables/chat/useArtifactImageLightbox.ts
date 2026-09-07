@@ -6,7 +6,7 @@ import {
   type InjectionKey,
   type ShallowRef,
 } from 'vue'
-import type { ArtifactPayload } from '@/types/rpc'
+import type { ArtifactPayload } from '@/types/artifacts'
 
 export interface ArtifactImageLightboxRequest {
   artifact: ArtifactPayload

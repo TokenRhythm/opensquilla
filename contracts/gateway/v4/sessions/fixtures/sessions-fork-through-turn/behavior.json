@@ -1,0 +1,12 @@
+{
+  "format_version": 1,
+  "kind": "behavior",
+  "cases": [
+    { "id": "behavior.required-anchor", "coverage": "a non-empty through-turn anchor is mandatory", "expectation": "exact" },
+    { "id": "behavior.inclusive-terminal-turn", "coverage": "the selected verified terminal turn is copied inclusively", "expectation": "exact" },
+    { "id": "behavior.no-full-fallback", "coverage": "missing or invalid turn material fails instead of silently creating a full fork", "expectation": "exact" },
+    { "id": "behavior.before-presence", "coverage": "either before-message alias is rejected whenever present, including null", "expectation": "exact" },
+    { "id": "behavior.alias-consensus", "coverage": "every present through-turn alias must be a matching non-empty string", "expectation": "exact" },
+    { "id": "behavior.capability-ack", "coverage": "success proves forkMode=through_turn and echoes the normalized throughTurnId", "expectation": "exact" }
+  ]
+}

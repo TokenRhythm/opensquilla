@@ -30,6 +30,8 @@ jobs:
     name: Build verified Web UI artifact
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    outputs:
+      webui_mode: ${{ steps.webui-contract.outputs.mode }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -44,8 +46,16 @@ jobs:
           set -euo pipefail
           if [[ -f opensquilla-webui/.node-version \
              && -f opensquilla-webui/package-lock.json \
-             && -f opensquilla-webui/scripts/verify-dist.mjs ]]; then
+             && -f opensquilla-webui/scripts/verify-dist.mjs \
+             && -f opensquilla-webui/scripts/stage-dist.mjs ]]; then
             echo "mode=source-built" >> "${GITHUB_OUTPUT}"
+          elif [[ -f opensquilla-webui/.node-version \
+               && -f opensquilla-webui/package-lock.json \
+               && -f opensquilla-webui/scripts/verify-dist.mjs ]]; then
+            # Tags from the pre-staging era still build Vite directly into the
+            # Python package path. Keep those tags repairable without asking
+            # them to execute a script that did not exist at that revision.
+            echo "mode=legacy-source-built" >> "${GITHUB_OUTPUT}"
           elif [[ -f src/opensquilla/gateway/static/dist/index.html ]]; then
             # Tags created before generated artifacts were removed from Git
             # remain repairable through the documented existing-tag input.
@@ -56,7 +66,7 @@ jobs:
           fi
 
       - name: Set up Node.js
-        if: steps.webui-contract.outputs.mode == 'source-built'
+        if: steps.webui-contract.outputs.mode != 'legacy-committed'
         uses: actions/setup-node@v4
         with:
           node-version-file: opensquilla-webui/.node-version
@@ -64,12 +74,12 @@ jobs:
           cache-dependency-path: opensquilla-webui/package-lock.json
 
       - name: Install Web UI dependencies
-        if: steps.webui-contract.outputs.mode == 'source-built'
+        if: steps.webui-contract.outputs.mode != 'legacy-committed'
         working-directory: opensquilla-webui
         run: npm ci
 
       - name: Build and verify Web UI
-        if: steps.webui-contract.outputs.mode == 'source-built'
+        if: steps.webui-contract.outputs.mode != 'legacy-committed'
         working-directory: opensquilla-webui
         run: |
           npm run build
@@ -103,10 +113,24 @@ jobs:
           print("Validated legacy committed Web UI artifact")
           PY
 
-      - name: Upload Web UI artifact
+      - name: Upload source-owned Web UI artifact
+        if: steps.webui-contract.outputs.mode == 'source-built'
         uses: actions/upload-artifact@v4
         with:
-          # Keep the name stable when only failed consumer jobs are rerun.
+          # The source-owned directory is the hand-off boundary; consumers
+          # explicitly stage it into the Python package.
+          name: opensquilla-release-webui-dist
+          path: opensquilla-webui/dist/
+          if-no-files-found: error
+          retention-days: 31
+          overwrite: true
+
+      - name: Upload legacy Web UI artifact
+        if: steps.webui-contract.outputs.mode != 'source-built'
+        uses: actions/upload-artifact@v4
+        with:
+          # Existing tags may still contain a committed artifact. Keep that
+          # repair path compatible while new builds use opensquilla-webui/dist.
           name: opensquilla-release-webui-dist
           path: src/opensquilla/gateway/static/dist/
           if-no-files-found: error
@@ -139,7 +163,7 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: opensquilla-release-webui-dist
-          path: src/opensquilla/gateway/static/dist/
+          path: ${{ needs.build-control-ui.outputs.webui_mode == 'source-built' && 'opensquilla-webui/dist/' || 'src/opensquilla/gateway/static/dist/' }}
 
       - name: Hydrate router assets
         shell: bash
@@ -174,8 +198,18 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Set up Node.js for Web UI staging
+        if: needs.build-control-ui.outputs.webui_mode == 'source-built'
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: opensquilla-webui/.node-version
+
       - name: Install uv
         run: python -m pip install uv
+
+      - name: Stage verified Web UI artifact for packaging
+        if: needs.build-control-ui.outputs.webui_mode == 'source-built'
+        run: node opensquilla-webui/scripts/stage-dist.mjs
 
       - name: Check tag version
         if: ${{ github.event_name == 'push' || github.event.inputs.tag != '' }}
@@ -217,6 +251,7 @@ jobs:
           if [[ -f scripts/verify_webui_artifact.py ]]; then
             python scripts/verify_webui_artifact.py \
               --forbid-personal-bgm \
+              --dist src/opensquilla/gateway/static/dist \
               --wheel "${wheels[0]}"
           else
             WHEEL_PATH="${wheels[0]}" python - <<'PY'
@@ -328,7 +363,7 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: opensquilla-release-webui-dist
-          path: src/opensquilla/gateway/static/dist/
+          path: ${{ needs.build-control-ui.outputs.webui_mode == 'source-built' && 'opensquilla-webui/dist/' || 'src/opensquilla/gateway/static/dist/' }}
 
       - name: Hydrate router assets
         run: git lfs pull --include="src/opensquilla/squilla_router/models/**"
@@ -349,6 +384,10 @@ jobs:
           node-version: "22.12.0"
           cache: npm
           cache-dependency-path: desktop/electron/package-lock.json
+
+      - name: Stage verified Web UI artifact for Desktop
+        if: needs.build-control-ui.outputs.webui_mode == 'source-built'
+        run: node opensquilla-webui/scripts/stage-dist.mjs
 
       - name: Install Electron dependencies
         working-directory: desktop/electron
@@ -480,7 +519,7 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: opensquilla-release-webui-dist
-          path: src/opensquilla/gateway/static/dist/
+          path: ${{ needs.build-control-ui.outputs.webui_mode == 'source-built' && 'opensquilla-webui/dist/' || 'src/opensquilla/gateway/static/dist/' }}
 
       - name: Hydrate router assets
         shell: bash
@@ -502,6 +541,10 @@ jobs:
           node-version: "22.12.0"
           cache: npm
           cache-dependency-path: desktop/electron/package-lock.json
+
+      - name: Stage verified Web UI artifact for Desktop
+        if: needs.build-control-ui.outputs.webui_mode == 'source-built'
+        run: node opensquilla-webui/scripts/stage-dist.mjs
 
       - name: Configure DigiCert KeyLocker credentials
         shell: pwsh
@@ -1175,13 +1218,17 @@ jobs:
           overwrite: true
 
   audit-downloaded-macos-release:
-    name: Audit downloaded macOS draft assets
+    name: Audit downloaded macOS Draft (v${{ matrix.baseline-version }} upgrade)
     if: ${{ github.event_name == 'push' || github.event.inputs.tag != '' }}
     needs: prestage-draft-updater-assets
     runs-on: macos-latest
     timeout-minutes: 75
     permissions:
       contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        baseline-version: ['0.5.3', '0.5.4']
     steps:
       - name: Checkout release verification helpers
         uses: actions/checkout@v4
@@ -1320,20 +1367,22 @@ jobs:
           validate_app "${mounted}/OpenSquilla.app"
           hdiutil detach "${mounted}" -quiet
 
-      - name: Verify official v0.5.3 macOS updater discovery, download, apply, and relaunch
+      - name: Verify official baseline macOS updater discovery, download, apply, and relaunch
         if: ${{ needs.prestage-draft-updater-assets.outputs.prerelease == 'false' }}
         env:
           GH_TOKEN: ${{ github.token }}
+          BASELINE_VERSION: ${{ matrix.baseline-version }}
         shell: bash
         run: |
           set -euo pipefail
           .github/scripts/verify-release-macos-real-update.sh \
-            updater-rehearsal/channel-manifest.json downloaded-asset
+            updater-rehearsal/channel-manifest.json downloaded-asset "${BASELINE_VERSION}"
 
       - name: Verify preview macOS installer replacement compatibility
         if: ${{ needs.prestage-draft-updater-assets.outputs.prerelease == 'true' }}
         env:
           GH_TOKEN: ${{ github.token }}
+          BASELINE_VERSION: ${{ matrix.baseline-version }}
         shell: bash
         run: |
           set -euo pipefail
@@ -1343,13 +1392,13 @@ jobs:
             exit 1
           fi
           .github/scripts/verify-release-macos-upgrade.sh \
-            "${candidates[0]}" downloaded-preview-asset
+            "${candidates[0]}" downloaded-preview-asset "${BASELINE_VERSION}"
 
   audit-downloaded-windows-release:
-    name: Audit downloaded Windows Draft (${{ matrix.install-mode }} install)
+    name: Audit downloaded Windows Draft (v${{ matrix.baseline-version }}, ${{ matrix.install-mode }} install)
     if: ${{ github.event_name == 'push' || github.event.inputs.tag != '' }}
     needs: prestage-draft-updater-assets
-    # Match the build-time upgrade gate while v0.5.3 is the baseline.
+    # Match the build-time gate because v0.5.3 remains an upgrade baseline.
     runs-on: windows-2022
     timeout-minutes: 120
     permissions:
@@ -1357,6 +1406,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        baseline-version: ['0.5.3', '0.5.4']
         install-mode: [default, custom]
     steps:
       - name: Checkout release verification helpers
@@ -1423,12 +1473,13 @@ jobs:
             }
           }
 
-      - name: Verify official v0.5.3 Windows updater download and installer handoff
+      - name: Verify official baseline Windows updater download and installer handoff
         if: ${{ needs.prestage-draft-updater-assets.outputs.prerelease == 'false' }}
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
           INSTALL_MODE: ${{ matrix.install-mode }}
+          BASELINE_VERSION: ${{ matrix.baseline-version }}
         run: |
           $ErrorActionPreference = 'Stop'
           # This gate covers pre-handoff failure isolation and a successful normal NSIS
@@ -1441,7 +1492,8 @@ jobs:
             -CandidateInstaller $candidates[0].FullName `
             -Label "downloaded-asset-$env:INSTALL_MODE" `
             -RealUpdateChannelManifest updater-rehearsal/channel-manifest.json `
-            -InstallMode $env:INSTALL_MODE
+            -InstallMode $env:INSTALL_MODE `
+            -BaselineVersion $env:BASELINE_VERSION
 
       - name: Verify preview Windows installer replacement compatibility
         if: ${{ needs.prestage-draft-updater-assets.outputs.prerelease == 'true' }}
@@ -1449,6 +1501,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           INSTALL_MODE: ${{ matrix.install-mode }}
+          BASELINE_VERSION: ${{ matrix.baseline-version }}
         run: |
           $ErrorActionPreference = 'Stop'
           $candidates = @(Get-ChildItem 'release-audit/OpenSquilla-*-win-x64.exe' -File)
@@ -1458,4 +1511,5 @@ jobs:
           .github/scripts/verify-release-windows-upgrade.ps1 `
             -CandidateInstaller $candidates[0].FullName `
             -Label "downloaded-preview-$env:INSTALL_MODE" `
-            -InstallMode $env:INSTALL_MODE
+            -InstallMode $env:INSTALL_MODE `
+            -BaselineVersion $env:BASELINE_VERSION

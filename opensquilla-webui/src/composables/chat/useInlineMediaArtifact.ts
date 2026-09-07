@@ -1,6 +1,6 @@
-import { computed, nextTick, onUnmounted, ref, watch, type Ref } from 'vue'
-import type { ArtifactPayload } from '@/types/rpc'
-import { fetchArtifactBlob } from '@/utils/chat/artifactAccess'
+import { computed, inject, nextTick, onUnmounted, ref, watch, type Ref } from 'vue'
+import type { ArtifactPayload } from '@/types/artifacts'
+import { ARTIFACT_WORKBENCH_KEY } from '@/modules/artifactWorkbench'
 
 export type InlineMediaKind = 'audio' | 'video'
 export type InlineMediaState = 'idle' | 'loading' | 'ready' | 'error' | 'unsupported'
@@ -8,7 +8,6 @@ export type InlineMediaState = 'idle' | 'loading' | 'ready' | 'error' | 'unsuppo
 interface InlineMediaArtifactOptions {
   artifact: () => ArtifactPayload
   sessionKey: () => string | undefined
-  authToken: () => string | undefined
   kind: InlineMediaKind
   element: Ref<HTMLMediaElement | null>
 }
@@ -19,6 +18,9 @@ interface InlineMediaArtifactOptions {
  * the artifact identity or its session context changes.
  */
 export function useInlineMediaArtifact(options: InlineMediaArtifactOptions) {
+  const injectedArtifactWorkbench = inject(ARTIFACT_WORKBENCH_KEY)
+  if (!injectedArtifactWorkbench) throw new Error('ArtifactWorkbench was not provided')
+  const artifactWorkbench = injectedArtifactWorkbench
   const state = ref<InlineMediaState>('idle')
   const objectUrl = ref('')
   let requestController: AbortController | null = null
@@ -72,10 +74,8 @@ export function useInlineMediaArtifact(options: InlineMediaArtifactOptions) {
     requestController = controller
     state.value = 'loading'
     try {
-      const fetched = await fetchArtifactBlob(options.artifact(), {
-        baseOrigin: window.location.origin,
+      const fetched = await artifactWorkbench.content.fetchArtifact(options.artifact(), {
         sessionKey: options.sessionKey(),
-        authToken: options.authToken(),
         signal: controller.signal,
         requireSameOrigin: true,
       })
@@ -110,7 +110,7 @@ export function useInlineMediaArtifact(options: InlineMediaArtifactOptions) {
   }
 
   watch(
-    () => [identity.value, options.sessionKey() || '', options.authToken() || ''],
+    () => [identity.value, options.sessionKey() || ''],
     (_next, previous) => { if (previous) reset() },
   )
 

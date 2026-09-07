@@ -1,0 +1,135 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://opensquilla.dev/contracts/gateway/v4/sessions/sessions-messages-snapshot.schema.json",
+  "title": "OpenSquilla sessions.messages.snapshot Contract",
+  "description": "Language-neutral Contract for the compact capability-projected v4 live-turn snapshot.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "request": { "$ref": "#/$defs/SessionsMessagesSnapshotRequestFrame" },
+    "response": { "$ref": "#/$defs/SessionsMessagesSnapshotResponseFrame" }
+  },
+  "x-opensquilla-wire": { "protocol": "opensquilla-websocket-json", "version": 4, "compatibility": "exact-json-tree" },
+  "x-opensquilla-codegen": {
+    "python": { "tool": "datamodel-code-generator", "version": "0.75.1", "target": "pydantic_v2.BaseModel" },
+    "typescript": { "tool": "json-schema-to-typescript", "version": "15.0.4" },
+    "runtimeValidation": { "tool": "ajv", "version": "8.17.1", "mode": "standalone-adapter-only" }
+  },
+  "x-opensquilla-method": {
+    "name": "sessions.messages.snapshot",
+    "kind": "query",
+    "scope": "operator.read",
+    "guestAllowed": true,
+    "idempotency": "read-only",
+    "timeout": { "policy": "caller" },
+    "capability": { "kind": "method-availability", "name": "sessions.messages.snapshot" },
+    "request": "#/$defs/SessionsMessagesSnapshotRequestFrame",
+    "params": "#/$defs/SessionsMessagesSnapshotParams",
+    "response": "#/$defs/SessionsMessagesSnapshotResponseFrame",
+    "result": "#/$defs/SessionsMessagesSnapshotResult",
+    "errors": [
+      { "code": "INVALID_REQUEST", "semantics": "missing-or-non-string-key" },
+      { "code": "UNAUTHORIZED" },
+      { "code": "INTERNAL_ERROR" }
+    ]
+  },
+  "$defs": {
+    "SessionsMessagesSnapshotParams": {
+      "title": "sessions.messages.snapshot params",
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["key"],
+      "properties": { "key": { "type": "string" } }
+    },
+    "SessionsMessagesSnapshotLegacyNonObjectParams": {
+      "anyOf": [
+        { "type": "array", "items": {} },
+        { "type": "string" },
+        { "type": "number" },
+        { "type": "boolean" }
+      ]
+    },
+    "SessionsMessagesSnapshotRequestFrame": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "id", "method"],
+      "properties": {
+        "type": { "const": "req" },
+        "id": { "type": "string" },
+        "method": { "const": "sessions.messages.snapshot" },
+        "params": {
+          "anyOf": [
+            { "$ref": "#/$defs/SessionsMessagesSnapshotParams" },
+            { "$ref": "#/$defs/SessionsMessagesSnapshotLegacyNonObjectParams" },
+            { "type": "null" }
+          ]
+        }
+      }
+    },
+    "SessionLiveSnapshotEvent": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["event", "payload"],
+      "properties": {
+        "event": { "type": "string", "pattern": "^session\\.event\\." },
+        "payload": { "type": "object", "additionalProperties": true }
+      }
+    },
+    "SessionsMessagesSnapshotResult": {
+      "title": "sessions.messages.snapshot result",
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["key", "task_id", "stream_generation", "current_stream_seq", "events"],
+      "properties": {
+        "key": { "type": "string" },
+        "task_id": { "type": ["string", "null"] },
+        "stream_generation": { "type": "string" },
+        "current_stream_seq": { "type": "integer", "minimum": 0 },
+        "events": { "type": "array", "items": { "$ref": "#/$defs/SessionLiveSnapshotEvent" } }
+      }
+    },
+    "RpcError": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["code", "message"],
+      "properties": {
+        "code": { "type": "string" },
+        "message": { "type": "string" },
+        "details": {},
+        "retryable": { "type": ["boolean", "null"] },
+        "retry_after_ms": { "type": ["integer", "null"], "minimum": 0 },
+        "accepted": { "type": ["boolean", "null"] }
+      }
+    },
+    "SessionsMessagesSnapshotOkResponseFrame": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "id", "ok", "payload"],
+      "properties": {
+        "type": { "const": "res" },
+        "id": { "type": "string" },
+        "ok": { "const": true },
+        "payload": { "$ref": "#/$defs/SessionsMessagesSnapshotResult" },
+        "error": { "type": "null" }
+      }
+    },
+    "SessionsMessagesSnapshotErrorResponseFrame": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "id", "ok", "error"],
+      "properties": {
+        "type": { "const": "res" },
+        "id": { "type": "string" },
+        "ok": { "const": false },
+        "payload": { "type": "null" },
+        "error": { "$ref": "#/$defs/RpcError" }
+      }
+    },
+    "SessionsMessagesSnapshotResponseFrame": {
+      "oneOf": [
+        { "$ref": "#/$defs/SessionsMessagesSnapshotOkResponseFrame" },
+        { "$ref": "#/$defs/SessionsMessagesSnapshotErrorResponseFrame" }
+      ]
+    }
+  }
+}

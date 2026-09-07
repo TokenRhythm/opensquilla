@@ -196,7 +196,7 @@
 </template>
 
 <script setup lang="ts">
-import { nextTick, onActivated, onDeactivated, onUnmounted, ref } from 'vue'
+import { inject, nextTick, onActivated, onDeactivated, onUnmounted, ref } from 'vue'
 import { useI18n } from 'vue-i18n'
 import Icon from '@/components/Icon.vue'
 import ControlSwitch from '@/components/ControlSwitch.vue'
@@ -212,31 +212,15 @@ import { createSkillMutationGate } from '@/composables/skills/useSkillMutationGa
 import { useSkillRegistry } from '@/composables/skills/useSkillRegistry'
 import { skillLayerHelp, skillLayerLabel, useSkillsCatalog } from '@/composables/skills/useSkillsCatalog'
 import { useToasts } from '@/composables/useToasts'
-import { useRpcStore } from '@/stores/rpc'
 import type { Proposal, Skill } from '@/types/skills'
-
-interface SkillReloadError {
-  name?: string
-  path?: string
-  message?: string
-  kept_previous?: boolean
-}
-
-interface SkillReloadResult {
-  success: boolean
-  changed: boolean
-  partial: boolean
-  generation: number
-  added?: string[]
-  removed?: string[]
-  modified?: string[]
-  errors?: SkillReloadError[]
-}
+import { SKILL_CATALOG_KEY, type SkillReloadResult } from '@/modules/skillCatalog'
 
 const { t } = useI18n()
 const skillsOverviewOpen = ref(false)
 const { pushToast } = useToasts()
-const rpc = useRpcStore()
+const injectedSkillCatalog = inject(SKILL_CATALOG_KEY)
+if (!injectedSkillCatalog) throw new Error('SkillCatalog was not provided')
+const skillCatalog = injectedSkillCatalog
 const addSkillOpen = ref(false)
 const reloading = ref(false)
 const selectedProposal = ref<Proposal | null>(null)
@@ -245,7 +229,7 @@ const proposalsPanelRef = ref<InstanceType<typeof PendingSkillProposals> | null>
 let loadData: () => Promise<boolean>
 const mutationGate = createSkillMutationGate()
 
-const proposalsModel = useSkillProposals(rpc, async () => { await loadData() }, mutationGate)
+const proposalsModel = useSkillProposals(skillCatalog, async () => { await loadData() }, mutationGate)
 const {
   proposals,
   autoEnabledSkills,
@@ -260,7 +244,7 @@ const {
   disableAutoEnabled,
 } = proposalsModel
 
-const catalog = useSkillsCatalog(rpc, {
+const catalog = useSkillsCatalog(skillCatalog, {
   proposals,
   autoEnabledSkills,
   proposalsSettings,
@@ -292,8 +276,7 @@ async function manualReload() {
   if (reloading.value || !mutationGate.acquire('reload')) return
   reloading.value = true
   try {
-    await rpc.waitForConnection()
-    const result = await rpc.call<SkillReloadResult>('skills.reload')
+    const result = await skillCatalog.reload()
     // Always redraw from the catalog the Gateway is actually serving. On a
     // failed publish this is the prior last-known-good generation.
     const listed = await loadData()
@@ -330,7 +313,7 @@ async function manualReload() {
   }
 }
 
-const registry = useSkillRegistry(rpc, loadData, mutationGate)
+const registry = useSkillRegistry(skillCatalog, loadData, mutationGate)
 const {
   registryQuery,
   githubUrl,
@@ -356,7 +339,7 @@ const {
   uninstallSkill,
 } = registry
 
-const skillDetail = useSkillDetailController({ rpc, installDeps })
+const skillDetail = useSkillDetailController({ catalog: skillCatalog, installDeps })
 const {
   selectedSkill,
   selectedSkillLoading,

@@ -57,7 +57,7 @@ from opensquilla.runtime_target import runtime_target
 
 _LAYOUT_VERSION = "v1"
 _OSS_BASE = "https://opensquilla-releases.oss-cn-beijing.aliyuncs.com/runtime-packs"
-_GITHUB_BASE = "https://github.com/opensquilla/runtime-packs/releases/download"
+_GITHUB_BASE = "https://github.com/TokenRhythm/runtime-packs/releases/download"
 _COPY_CHUNK_SIZE = 1024 * 1024
 _INSTALL_LOCK_TIMEOUT_SECONDS = 900.0
 _PROBE_TIMEOUT_SECONDS = 30.0

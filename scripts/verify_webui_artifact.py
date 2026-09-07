@@ -16,7 +16,11 @@ MANIFEST_NAME = "webui-artifact-manifest.json"
 WHEEL_PREFIX = "opensquilla/gateway/static/dist/"
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_WEBUI_ROOT = REPOSITORY_ROOT / "opensquilla-webui"
-DEFAULT_DIST_DIR = REPOSITORY_ROOT / "src/opensquilla/gateway/static/dist"
+# The WebUI package owns the generated output.  ``src/.../static/dist`` is a
+# deliberately explicit staging destination used only by package builders and
+# runtime consumers; it is not a Vite build directory.
+DEFAULT_DIST_DIR = DEFAULT_WEBUI_ROOT / "dist"
+STAGED_DIST_RELATIVE = Path("src/opensquilla/gateway/static/dist")
 SOURCE_INPUT_ROOTS = (
     ".node-version",
     ".env",
@@ -355,7 +359,7 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         "--dist",
         type=Path,
         default=DEFAULT_DIST_DIR,
-        help="generated WebUI directory",
+        help="generated WebUI directory (defaults to opensquilla-webui/dist)",
     )
     parser.add_argument(
         "--webui-root",

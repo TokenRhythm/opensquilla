@@ -8,13 +8,13 @@ import {
 
 describe('effectiveComposerRunMode', () => {
   it.each(['not_setup', 'setting_up', 'failed', 'unavailable'] as const)(
-    'soft-lands a stale Safe preference in Full Access while setup is %s',
+    'never turns a saved Safe preference into Full Access while setup is %s',
     (state) => {
       expect(effectiveComposerRunMode(
         'safe',
         { state, platform: 'win32', message: '', requiresAdmin: true },
         null,
-      )).toBe('full')
+      )).toBe('safe')
     },
   )
 
@@ -30,8 +30,8 @@ describe('effectiveComposerRunMode', () => {
     expect(effectiveComposerRunMode('safe', null, null)).toBe('safe')
   })
 
-  it('shows Full Access until the initial setup check resolves', () => {
-    expect(effectiveComposerRunMode('safe', null, null, false)).toBe('full')
+  it('never turns Safe into Full Access before the initial setup check resolves', () => {
+    expect(effectiveComposerRunMode('safe', null, null, false)).toBe('safe')
   })
 
   it('preserves an active task lock even if setup status changes', () => {
@@ -54,6 +54,19 @@ describe('effectiveComposerRunMode', () => {
   it('ignores Safe selection until the initial setup check resolves', () => {
     expect(composerRunModeSelectionAction('safe', null, false, false)).toBe('ignore')
     expect(composerRunModeSelectionAction('full', null, false, false)).toBe('persist')
+  })
+
+  it.each(['failed', 'unavailable', 'setting_up'] as const)(
+    'ignores Safe selection when setup is %s even if setup availability is stale',
+    state => {
+      const status = { state, platform: 'win32', message: '', requiresAdmin: false }
+      expect(composerRunModeSelectionAction('safe', status, true)).toBe('ignore')
+      expect(composerRunModeSelectionAction('full', status, true)).toBe('persist')
+    },
+  )
+
+  it('does not select Safe without an authoritative status', () => {
+    expect(composerRunModeSelectionAction('safe', null, false)).toBe('ignore')
   })
 
   it('persists Safe only after setup succeeds', async () => {

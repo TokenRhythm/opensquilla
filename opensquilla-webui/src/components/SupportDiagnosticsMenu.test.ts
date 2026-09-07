@@ -5,13 +5,11 @@ import type { App } from 'vue'
 const mocks = vi.hoisted(() => ({
   route: { path: '/overview' },
   routerPush: vi.fn(),
-  rpcCall: vi.fn(),
-  waitForConnection: vi.fn(),
+  readiness: vi.fn(),
+  downloadSupportBundle: vi.fn(),
   pushToast: vi.fn(),
   copyText: vi.fn(),
   downloadBlob: vi.fn(),
-  filenameFromContentDisposition: vi.fn(),
-  fetch: vi.fn(),
   messages: {
     'monitorSupport.title': 'Support & diagnostics',
     'monitorSupport.menuLabel': 'Support and diagnostics actions',
@@ -62,13 +60,6 @@ vi.mock('vue-i18n', () => ({
   }),
 }))
 
-vi.mock('@/stores/rpc', () => ({
-  useRpcStore: () => ({
-    call: mocks.rpcCall,
-    waitForConnection: mocks.waitForConnection,
-  }),
-}))
-
 vi.mock('@/composables/useToasts', () => ({
   useToasts: () => ({ pushToast: mocks.pushToast }),
 }))
@@ -76,7 +67,6 @@ vi.mock('@/composables/useToasts', () => ({
 vi.mock('@/utils/browser', () => ({
   copyTextWithFallback: mocks.copyText,
   downloadBlob: mocks.downloadBlob,
-  filenameFromContentDisposition: mocks.filenameFromContentDisposition,
 }))
 
 vi.mock('@/components/Icon.vue', async () => {
@@ -104,9 +94,14 @@ async function flush() {
 async function mountMenu() {
   const { createApp } = await import('vue')
   const Component = (await import('./SupportDiagnosticsMenu.vue')).default
+  const { OBSERVABILITY_KEY } = await import('@/modules/observability')
   const el = document.createElement('div')
   document.body.appendChild(el)
   const app = createApp(Component)
+  app.provide(OBSERVABILITY_KEY, {
+    readiness: mocks.readiness,
+    downloadSupportBundle: mocks.downloadSupportBundle,
+  } as never)
   app.mount(el)
   mountedApps.push({ app, el })
   await flush()
@@ -119,22 +114,16 @@ beforeEach(() => {
   vi.clearAllMocks()
   mocks.route.path = '/overview'
 
-  mocks.waitForConnection.mockResolvedValue(undefined)
-  mocks.rpcCall.mockResolvedValue({
+  mocks.readiness.mockResolvedValue({
     status: 'degraded',
     configPath: ['', 'Users', 'dummyuser', '.opensquilla', 'config.toml'].join('/'),
     gatewayUrl: 'ws://127.0.0.1:18791/ws',
   })
   mocks.copyText.mockResolvedValue(undefined)
-  mocks.filenameFromContentDisposition.mockReturnValue('opensquilla-support.zip')
-  mocks.fetch.mockResolvedValue({
-    ok: true,
-    blob: vi.fn(async () => new Blob(['bundle'])),
-    headers: new Headers({
-      'content-disposition': 'attachment; filename="opensquilla-support.zip"',
-    }),
+  mocks.downloadSupportBundle.mockResolvedValue({
+    blob: new Blob(['bundle']),
+    filename: 'opensquilla-support.zip',
   })
-  vi.stubGlobal('fetch', mocks.fetch)
 })
 
 afterEach(() => {
@@ -227,8 +216,7 @@ describe('SupportDiagnosticsMenu', () => {
     el.querySelector<HTMLButtonElement>('[data-testid="support-copy-readiness"]')!.click()
     await flush()
 
-    expect(mocks.waitForConnection).toHaveBeenCalledTimes(1)
-    expect(mocks.rpcCall).toHaveBeenCalledWith('doctor.status', {
+    expect(mocks.readiness).toHaveBeenCalledWith({
       agentId: 'main',
       deep: true,
     })
@@ -260,17 +248,8 @@ describe('SupportDiagnosticsMenu', () => {
     confirm!.click()
     await flush()
 
-    expect(mocks.fetch).toHaveBeenCalledTimes(1)
-    const [url, init] = mocks.fetch.mock.calls[0] as [string, RequestInit]
-    expect(url).toBe('/api/v1/diagnostics/bundle')
-    expect(init.method).toBe('POST')
-    expect(init.credentials).toBe('same-origin')
-    expect(init.headers).toEqual({
-      'Content-Type': 'application/json',
-      Authorization: 'Bearer test-owner-token',
-    })
-    expect(JSON.parse(String(init.body))).toEqual({
-      include_content: false,
+    expect(mocks.downloadSupportBundle).toHaveBeenCalledWith({
+      includeContent: false,
       days: 1,
     })
     expect(mocks.downloadBlob).toHaveBeenCalledWith(expect.any(Blob), 'opensquilla-support.zip')

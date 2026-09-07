@@ -1,14 +1,10 @@
 import { getCurrentScope, onScopeDispose, ref, watch, type Ref } from 'vue'
 
-import type { RpcClientError } from '@/lib/rpc'
+import { MetaRunCenterError, type MetaRunCenter } from '@/modules/metaRunCenter'
 import type {
-  MetaSetupInstallResponse,
   MetaSetupJob,
-  MetaSetupPlanResponse,
   MetaSetupReadiness,
-  MetaSetupRunResponse,
   MetaSetupState,
-  MetaSetupStatusResponse,
 } from '@/types/metaSetup'
 import type { HiddenControlDispatchResult } from '@/types/chat'
 import { createClientRequestId } from '@/utils/chat/messageIdentity'
@@ -48,15 +44,10 @@ export {
 } from './metaSetupRepository'
 export type { MetaSetupStorage } from './metaSetupRepository'
 
-type RpcClient = {
-  call: <T = unknown>(method: string, params?: Record<string, unknown>) => Promise<T>
-  waitForConnection?: (timeoutMs?: number) => Promise<void>
-}
-
 export type MetaDraftDiscardOutcome = 'discarded' | 'accepted' | 'unconfirmed'
 
 export interface UseMetaSkillSetupOptions {
-  rpc: RpcClient
+  metaRunCenter: MetaRunCenter
   currentSessionKey: Ref<string>
   dispatchHidden: (
     providerText: string,
@@ -123,11 +114,6 @@ export function useMetaSkillSetup(options: UseMetaSkillSetupOptions) {
   let installInFlight = false
   let cancelInFlight = false
   let disposed = false
-
-  async function rpcCall<T>(method: string, params?: Record<string, unknown>): Promise<T> {
-    if (options.rpc.waitForConnection) await options.rpc.waitForConnection(15_000)
-    return options.rpc.call<T>(method, params)
-  }
 
   function stopPolling(): void {
     if (pollTimer !== null) {
@@ -272,7 +258,7 @@ export function useMetaSkillSetup(options: UseMetaSkillSetupOptions) {
     }
 
     try {
-      const result = await rpcCall<MetaSetupRunResponse>('meta.run', {
+      const result = await options.metaRunCenter.launch({
         name,
         sessionKey,
         clientRequestId: stableClientRequestId,
@@ -308,7 +294,7 @@ export function useMetaSkillSetup(options: UseMetaSkillSetupOptions) {
         return
       }
 
-      if (result?.setup_required) {
+      if (result?.setupRequired) {
         const nextReadiness = result.readiness || readiness
         clearPersistedJobMarker(sessionKey)
         const next = confirmState(
@@ -335,8 +321,7 @@ export function useMetaSkillSetup(options: UseMetaSkillSetupOptions) {
       )
     } catch (error) {
       if (!isCurrent(token) || !setupState.value) return
-      const rpcError = error as RpcClientError | undefined
-      if (rpcError?.code === 'META_DRAFT_DISCARDED') {
+      if (error instanceof MetaRunCenterError && error.code === 'draft-discarded') {
         // A cancellation committed in another tab wins over this stale setup
         // checkpoint. Consume it terminally without restoring sendable text.
         removePendingMetaDiscard(sessionKey, stableClientRequestId, discardStorage)
@@ -407,12 +392,11 @@ export function useMetaSkillSetup(options: UseMetaSkillSetupOptions) {
   async function pollJob(jobId: string, sessionKey: string, token: number): Promise<void> {
     if (!isCurrent(token)) return
     try {
-      const result = await rpcCall<MetaSetupStatusResponse>('meta.setup.status', {
+      const result = await options.metaRunCenter.setupStatus({
         jobId,
         sessionKey,
       })
       if (!isCurrent(token)) return
-      if (!result?.job) throw new Error(result?.error || 'Setup status is unavailable')
       await applyJob(result.job, token)
     } catch (error) {
       if (!isCurrent(token) || !setupState.value) return
@@ -436,15 +420,15 @@ export function useMetaSkillSetup(options: UseMetaSkillSetupOptions) {
     persistSetupCheckpoint(current)
     setupState.value = transitionMetaSetupState(current, { type: 'install_started' })
     try {
-      const result = await rpcCall<MetaSetupInstallResponse>('meta.setup.install', {
+      const result = await options.metaRunCenter.setupInstall({
         name: current.name,
         sessionKey: current.sessionKey,
         confirmed: true,
-        action_ids: current.actionIds,
+        actionIds: current.actionIds,
       })
       if (!isCurrent(token)) return
 
-      if (result?.already_ready) {
+      if (result.alreadyReady) {
         await resumeAfterSetup(
           current.name,
           current.sessionKey,
@@ -453,7 +437,6 @@ export function useMetaSkillSetup(options: UseMetaSkillSetupOptions) {
         )
         return
       }
-      if (!result?.job) throw new Error(result?.error || 'Setup did not start')
       persistJob(current.sessionKey, result.job.job_id)
       persistLaunch(
         current.sessionKey,
@@ -510,7 +493,7 @@ export function useMetaSkillSetup(options: UseMetaSkillSetupOptions) {
       return
     }
     try {
-      const result = await rpcCall<MetaSetupStatusResponse>('meta.setup.status', {
+      const result = await options.metaRunCenter.setupStatus({
         jobId: persistedJobId,
         sessionKey: originatingSessionKey,
       })
@@ -518,12 +501,6 @@ export function useMetaSkillSetup(options: UseMetaSkillSetupOptions) {
         return 'deferred' as const
       }
       if (!isCurrent(token)) return
-      if (!result?.job) {
-        const unavailable = result?.error || 'Setup status is unavailable'
-        if (!isMissingJobError(unavailable)) throw new Error(unavailable)
-        setupState.value = recoverFromMissingJob(originatingSessionKey, next)
-        return
-      }
       const checkpoint = readPersistedSetupCheckpoint(originatingSessionKey)
       const persistedLaunch = readPersistedLaunch(originatingSessionKey)
       const incumbentLaunch = checkpoint?.launchText || persistedLaunch
@@ -705,14 +682,9 @@ export function useMetaSkillSetup(options: UseMetaSkillSetupOptions) {
       return
     }
     try {
-      const result = await rpcCall<MetaSetupPlanResponse>('meta.setup.plan', {
-        name: current.name,
-      })
+      const result = await options.metaRunCenter.setupPlan(current.name)
       if (!isCurrent(token) || !setupState.value) return
       if (options.currentSessionKey.value !== current.sessionKey) return
-      if (!result?.ok || !result.readiness) {
-        throw new Error(result?.error || 'MetaSkill readiness could not be checked')
-      }
 
       if (result.readiness.ready) {
         await resumeAfterSetup(
@@ -921,17 +893,11 @@ export function useMetaSkillSetup(options: UseMetaSkillSetupOptions) {
     }
     const token = beginOperation()
     try {
-      const result = await rpcCall<MetaSetupStatusResponse>('meta.setup.status', {
+      const result = await options.metaRunCenter.setupStatus({
         jobId,
         sessionKey,
       })
       if (!isCurrent(token) || sessionKey !== options.currentSessionKey.value) return
-      if (!result?.job) {
-        const unavailable = result?.error || 'Setup status is unavailable'
-        if (!isMissingJobError(unavailable)) throw new Error(unavailable)
-        setupState.value = recoverFromMissingJob(sessionKey)
-        return
-      }
       const readiness = result.job.readiness || {}
       setupState.value = {
         ...(checkpoint || {}),

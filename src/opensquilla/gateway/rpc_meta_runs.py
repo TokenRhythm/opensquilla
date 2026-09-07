@@ -14,6 +14,10 @@ from opensquilla.engine.steps.meta_command import (
     pending_meta_launch_put,
     pending_meta_replay_put,
 )
+from opensquilla.gateway.adapters.meta_run_center_contract import (
+    register_meta_run_center_contract,
+)
+from opensquilla.gateway.guest_rpc_policy import is_guest_rpc_method_allowed
 from opensquilla.gateway.protocol import (
     ERROR_INVALID_REQUEST,
     ERROR_NOT_FOUND,
@@ -26,7 +30,7 @@ from opensquilla.gateway.rpc import (
     RpcUnavailableError,
     get_dispatcher,
 )
-from opensquilla.gateway.scopes import ADMIN_SCOPE, WRITE_SCOPE
+from opensquilla.gateway.scopes import ADMIN_SCOPE
 from opensquilla.gateway.session_services import get_session_storage
 from opensquilla.persistence.meta_run_query import parse_since_ms
 from opensquilla.persistence.meta_run_writer import (
@@ -426,7 +430,6 @@ async def _handle_meta_runs_failures(params: Any, ctx: RpcContext) -> dict[str, 
     return {"runs": [_serialize_record_summary(row) for row in hydrated]}
 
 
-@_d.method("meta.runs.recovery", scope="operator.admin")
 async def _handle_meta_runs_recovery(params: Any, ctx: RpcContext) -> dict[str, Any]:
     """Return the latest unresolved failed-run ribbon for one session.
 
@@ -500,7 +503,6 @@ async def _handle_meta_runs_draft(params: Any, ctx: RpcContext) -> dict[str, Any
     }
 
 
-@_d.method("meta.runs.confirm_preflight", scope="operator.admin")
 async def _handle_meta_runs_confirm_preflight(params: Any, ctx: RpcContext) -> dict[str, Any]:
     writer = _writer_from_context(ctx)
     p = params if isinstance(params, dict) else {}
@@ -549,7 +551,6 @@ async def _handle_meta_runs_diff(params: Any, ctx: RpcContext) -> dict[str, Any]
     }
 
 
-@_d.method("meta.runs.replay", scope="operator.admin")
 async def _handle_meta_runs_replay(params: Any, ctx: RpcContext) -> dict[str, Any]:
     writer = _writer_from_context(ctx)
     p = params if isinstance(params, dict) else {}
@@ -854,7 +855,6 @@ async def _run_meta_setup_job(
         job.finished_at_ms = int(time.time() * 1000)
 
 
-@_d.method("meta.setup.plan", scope="operator.read")
 async def _handle_meta_setup_plan(params: Any, ctx: RpcContext) -> dict[str, Any]:
     p = params if isinstance(params, dict) else {}
     name = str(p.get("name") or "")
@@ -870,7 +870,6 @@ async def _handle_meta_setup_plan(params: Any, ctx: RpcContext) -> dict[str, Any
     return {"ok": True, "name": name, "readiness": readiness.to_dict()}
 
 
-@_d.method("meta.setup.install", scope="operator.admin")
 async def _handle_meta_setup_install(params: Any, ctx: RpcContext) -> dict[str, Any]:
     """Start an explicitly confirmed setup in the background."""
 
@@ -957,7 +956,6 @@ async def _handle_meta_setup_install(params: Any, ctx: RpcContext) -> dict[str, 
     return {"ok": True, "job": job.to_dict(), "reused": False}
 
 
-@_d.method("meta.setup.status", scope="operator.read")
 async def _handle_meta_setup_status(params: Any, ctx: RpcContext) -> dict[str, Any]:
     p = params if isinstance(params, dict) else {}
     _prune_meta_setup_jobs()
@@ -1011,7 +1009,6 @@ def _require_meta_draft_owner(ctx: RpcContext) -> None:
     )
 
 
-@_d.method("meta.drafts.list", scope=WRITE_SCOPE)
 async def _handle_meta_drafts_list(params: Any, ctx: RpcContext) -> dict[str, Any]:
     """Return live, unaccepted launch drafts for crash/app-restart recovery."""
 
@@ -1067,7 +1064,6 @@ async def _handle_meta_drafts_list(params: Any, ctx: RpcContext) -> dict[str, An
     }
 
 
-@_d.method("meta.drafts.discard", scope=WRITE_SCOPE)
 async def _handle_meta_drafts_discard(params: Any, ctx: RpcContext) -> dict[str, Any]:
     """Forget one launch only after an explicit user discard."""
 
@@ -1116,7 +1112,6 @@ async def _handle_meta_drafts_discard(params: Any, ctx: RpcContext) -> dict[str,
     }
 
 
-@_d.method("meta.run", scope="operator.write")
 async def _handle_meta_run(params: Any, ctx: RpcContext) -> dict[str, Any]:
     """Stamp a pending meta-skill launch for the ``/meta`` command surface.
 
@@ -1411,3 +1406,27 @@ async def _handle_meta_run(params: Any, ctx: RpcContext) -> dict[str, Any]:
     if draft_disposition is not None:
         result["drafted"] = True
     return result
+
+
+_META_RUN_CENTER_CONTRACT_IMPLEMENTATIONS = {
+    "meta.drafts.list": _handle_meta_drafts_list,
+    "meta.drafts.discard": _handle_meta_drafts_discard,
+    "meta.run": _handle_meta_run,
+    "meta.runs.confirm_preflight": _handle_meta_runs_confirm_preflight,
+    "meta.runs.recovery": _handle_meta_runs_recovery,
+    "meta.runs.replay": _handle_meta_runs_replay,
+    "meta.setup.plan": _handle_meta_setup_plan,
+    "meta.setup.install": _handle_meta_setup_install,
+    "meta.setup.status": _handle_meta_setup_status,
+}
+
+_META_RUN_CENTER_CONTRACT_HANDLERS = {
+    method: register_meta_run_center_contract(
+        _d,
+        method,
+        implementation,
+        internal_error=RpcHandlerError,
+        guest_allowed_checker=is_guest_rpc_method_allowed,
+    )
+    for method, implementation in _META_RUN_CENTER_CONTRACT_IMPLEMENTATIONS.items()
+}

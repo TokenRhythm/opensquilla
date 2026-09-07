@@ -5,7 +5,7 @@
   "description": "Electron desktop shell for the OpenSquilla Control UI.",
   "repository": {
     "type": "git",
-    "url": "https://github.com/opensquilla/opensquilla.git"
+    "url": "https://github.com/TokenRhythm/opensquilla.git"
   },
   "type": "module",
   "main": "dist/main.js",
@@ -90,7 +90,7 @@
     "publish": [
       {
         "provider": "github",
-        "owner": "opensquilla",
+        "owner": "TokenRhythm",
         "repo": "opensquilla"
       }
     ],

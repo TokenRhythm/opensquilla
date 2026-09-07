@@ -1,16 +1,29 @@
 import { createPinia, setActivePinia } from 'pinia'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
+import type { ArtifactDocumentProvider } from '@/modules/artifactWorkbench'
 import type { ArtifactDocumentWorkspace } from '@/types/artifactDocuments'
-import type { ArtifactPayload } from '@/types/rpc'
+import type { ArtifactPayload } from '@/types/artifacts'
 import {
   createLegacyArtifactWorkspace,
-  type ArtifactDocumentProvider,
 } from '@/workbench/artifactDocumentProvider'
 import {
   artifactDocumentWorkspaceKey,
   useArtifactDocumentsStore,
 } from './artifactDocuments'
+import { ArtifactProductFailure } from '@/utils/artifactProductErrors'
+
+function ambiguousArtifactFailure(message: string): ArtifactProductFailure {
+  return new ArtifactProductFailure(
+    'DOCUMENT_UNAVAILABLE',
+    message,
+    undefined,
+    false,
+    null,
+    null,
+    true,
+  )
+}
 
 const artifact: ArtifactPayload = {
   id: 'artifact-1',
@@ -308,10 +321,7 @@ describe('artifact documents store', () => {
   it('keeps restore and revert request identities stable across ambiguous retries', async () => {
     const workspace = editableWorkspace()
     const provider = providerWithLoad(vi.fn().mockResolvedValue(workspace))
-    const responseLost = () => Object.assign(new Error('response lost'), {
-      code: 'RPC_TRANSPORT_ERROR',
-      accepted: null,
-    })
+    const responseLost = () => ambiguousArtifactFailure('response lost')
     vi.mocked(provider.restoreRevision).mockRejectedValue(responseLost())
     vi.mocked(provider.revertChangeSet).mockRejectedValue(responseLost())
     const store = useArtifactDocumentsStore()
@@ -342,10 +352,7 @@ describe('artifact documents store', () => {
 
   it('accepts a durable applied restore resolution without replaying the write', async () => {
     const workspace = editableWorkspace()
-    const responseLost = Object.assign(new Error('private transport detail'), {
-      code: 'RPC_TRANSPORT_ERROR',
-      accepted: null,
-    })
+    const responseLost = ambiguousArtifactFailure('private transport detail')
     const provider = providerWithLoad(vi.fn().mockResolvedValue(workspace))
     vi.mocked(provider.restoreRevision).mockRejectedValue(responseLost)
     provider.resolveMutation = vi.fn(async () => ({
@@ -370,10 +377,7 @@ describe('artifact documents store', () => {
 
   it('releases a not-applied restore identity before the next retry', async () => {
     const workspace = editableWorkspace()
-    const responseLost = Object.assign(new Error('private transport detail'), {
-      code: 'RPC_TRANSPORT_ERROR',
-      accepted: null,
-    })
+    const responseLost = ambiguousArtifactFailure('private transport detail')
     const provider = providerWithLoad(vi.fn().mockResolvedValue(workspace))
     vi.mocked(provider.restoreRevision)
       .mockRejectedValueOnce(responseLost)

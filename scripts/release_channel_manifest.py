@@ -19,7 +19,10 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 
 SCHEMA_VERSION = 1
-GITHUB_RELEASE_PAGE_ROOT = "https://github.com/opensquilla/opensquilla/releases/tag"
+GITHUB_RELEASE_PAGE_ROOT = "https://github.com/TokenRhythm/opensquilla/releases/tag"
+# Existing v1 clients require this exact URL spelling. Keep it for every v1
+# channel indefinitely so clients that skip releases can still discover updates.
+LEGACY_V1_RELEASE_PAGE_ROOT = "https://github.com/opensquilla/opensquilla/releases/tag"
 _TAG_RE = re.compile(
     r"^v(?P<major>0|[1-9]\d*)[.](?P<minor>0|[1-9]\d*)[.]"
     r"(?P<patch>0|[1-9]\d*)(?:rc(?P<rc>0|[1-9]\d*))?$"
@@ -116,7 +119,7 @@ def _published_at(value: object, *, field: str) -> str:
 
 
 def _release_url(tag: str) -> str:
-    return f"{GITHUB_RELEASE_PAGE_ROOT}/{tag}"
+    return f"{LEGACY_V1_RELEASE_PAGE_ROOT}/{tag}"
 
 
 def _expected_platforms(version: ReleaseVersion) -> dict[str, dict[str, str]]:
@@ -160,8 +163,8 @@ def build_manifest(
 
     published_at = _published_at(release.get("publishedAt"), field="release publishedAt")
     release_url = release.get("url")
-    expected_release_url = _release_url(tag)
-    if release_url != expected_release_url:
+    expected_release_url = f"{GITHUB_RELEASE_PAGE_ROOT}/{tag}"
+    if release_url not in (expected_release_url, _release_url(tag)):
         raise ManifestError(
             f"release url must be the canonical GitHub Release URL: {expected_release_url}"
         )
@@ -183,7 +186,7 @@ def build_manifest(
         "baseVersion": version.base,
         "prerelease": version.prerelease,
         "publishedAt": published_at,
-        "releaseUrl": release_url,
+        "releaseUrl": _release_url(tag),
         "sha256sums": "SHA256SUMS",
         "platforms": platforms,
     }

@@ -13,9 +13,9 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/opensquilla/opensquilla/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/opensquilla/opensquilla/ci.yml?style=for-the-badge" alt="CI"></a>
+  <a href="https://github.com/TokenRhythm/opensquilla/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/TokenRhythm/opensquilla/ci.yml?style=for-the-badge" alt="CI"></a>
   <a href="https://opensquilla.ai/"><img src="https://img.shields.io/badge/website-opensquilla.ai-blue?style=for-the-badge" alt="Website"></a>
-  <a href="https://github.com/opensquilla/opensquilla/releases"><img src="https://img.shields.io/github/v/release/opensquilla/opensquilla?include_prereleases&style=for-the-badge" alt="GitHub release"></a>
+  <a href="https://github.com/TokenRhythm/opensquilla/releases"><img src="https://img.shields.io/github/v/release/TokenRhythm/opensquilla?include_prereleases&style=for-the-badge" alt="GitHub release"></a>
   <a href="https://www.python.org/downloads/"><img src="https://img.shields.io/badge/python-3.12%2B-blue?style=for-the-badge" alt="Python 3.12+"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache%202.0-blue?style=for-the-badge" alt="Apache 2.0 License"></a>
 </p>
@@ -106,8 +106,8 @@ PowerShell 安装器会通过 `winget` 自动装好它；而**终端快速安装
 
 0.5.4 桌面安装包将 Vue 控制台和网关运行时打包在一个 Electron 外壳中。
 
-- macOS Apple Silicon:<https://github.com/opensquilla/opensquilla/releases/download/v0.5.4/OpenSquilla-0.5.4-mac-arm64.dmg>
-- Windows x64:<https://github.com/opensquilla/opensquilla/releases/download/v0.5.4/OpenSquilla-0.5.4-win-x64.exe>
+- macOS Apple Silicon:<https://github.com/TokenRhythm/opensquilla/releases/download/v0.5.4/OpenSquilla-0.5.4-mac-arm64.dmg>
+- Windows x64:<https://github.com/TokenRhythm/opensquilla/releases/download/v0.5.4/OpenSquilla-0.5.4-win-x64.exe>
 
 中国大陆下载可直接使用 OSS 的固定安装包链接：
 
@@ -150,7 +150,7 @@ $env:Path = "$env:USERPROFILE\.local\bin;" + $env:Path
 **2. 安装 OpenSquilla**——所有平台命令相同。
 
 ```sh
-uv tool install --python 3.12 "opensquilla[recommended] @ https://github.com/opensquilla/opensquilla/releases/download/v0.5.4/opensquilla-0.5.4-py3-none-any.whl"
+uv tool install --python 3.12 "opensquilla[recommended] @ https://github.com/TokenRhythm/opensquilla/releases/download/v0.5.4/opensquilla-0.5.4-py3-none-any.whl"
 ```
 
 这会从 release URL 安装 OpenSquilla wheel，再由 `uv` 下载所选 extra 所声明的依赖。
@@ -171,7 +171,7 @@ opensquilla gateway run
 > PATH 设置命令。
 
 如需完全锁定版本的安装，请使用带版本号的 wheel URL:
-`https://github.com/opensquilla/opensquilla/releases/download/v0.5.4/opensquilla-0.5.4-py3-none-any.whl`。
+`https://github.com/TokenRhythm/opensquilla/releases/download/v0.5.4/opensquilla-0.5.4-py3-none-any.whl`。
 
 <a id="install-from-source"></a>
 
@@ -185,7 +185,7 @@ opensquilla gateway run
 
    ```sh
    git lfs install
-   git clone https://github.com/opensquilla/opensquilla.git
+   git clone https://github.com/TokenRhythm/opensquilla.git
    cd opensquilla
    git lfs pull --include="src/opensquilla/squilla_router/models/**"
    ```
@@ -533,11 +533,11 @@ opensquilla gateway run --listen 0.0.0.0 --port 18791
 **Docker**
 
 预构建的多架构镜像(`amd64`/`arm64`)会随每个发布标签发布到
-`ghcr.io/opensquilla/opensquilla`——完整的容器部署指南见
+`ghcr.io/tokenrhythm/opensquilla`——完整的容器部署指南见
 [`docs/docker.md`](docs/docker.md)(家庭服务器与 NAS、带 token 认证的局域网访问、升级):
 
 ```sh
-OPENSQUILLA_GATEWAY_IMAGE=ghcr.io/opensquilla/opensquilla:latest docker compose up -d
+OPENSQUILLA_GATEWAY_IMAGE=ghcr.io/tokenrhythm/opensquilla:latest docker compose up -d
 ```
 
 不设置 `OPENSQUILLA_GATEWAY_IMAGE` 时,compose 路径运行一个你自己构建的
@@ -652,8 +652,8 @@ OpenSquilla 的灵感来自
 感谢所有为 OpenSquilla 做出贡献的人。
 
 <p align="center">
-  <a href="https://github.com/opensquilla/opensquilla/graphs/contributors">
-    <img src="https://contrib.rocks/image?repo=opensquilla/opensquilla&max=100&columns=10" alt="OpenSquilla contributors" />
+  <a href="https://github.com/TokenRhythm/opensquilla/graphs/contributors">
+    <img src="https://contrib.rocks/image?repo=TokenRhythm/opensquilla&max=100&columns=10" alt="OpenSquilla contributors" />
   </a>
 </p>
 
@@ -663,7 +663,7 @@ OpenSquilla 的灵感来自
 
 我们欢迎各种形式的贡献——bug 报告、功能想法、文档、新的提供商或渠道适配器、技能，以及
 核心运行时方面的开发。请参阅 [`CONTRIBUTING.md`](CONTRIBUTING.md)，然后到
-[GitHub](https://github.com/opensquilla/opensquilla) 上提 issue 或 pull request。
+[GitHub](https://github.com/TokenRhythm/opensquilla) 上提 issue 或 pull request。
 
 [行为准则](CODE_OF_CONDUCT.md) · [安全](SECURITY.md) ·
 [支持](SUPPORT.md) · [许可证](LICENSE)（Apache-2.0）

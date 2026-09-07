@@ -8,11 +8,11 @@ class Opensquilla < Formula
   include Language::Python::Virtualenv
 
   desc "Microkernel Python agent runtime with MCP tools and multi-channel messaging"
-  homepage "https://github.com/OpenSquilla/opensquilla"
-  url "https://github.com/OpenSquilla/opensquilla/archive/refs/tags/v0.1.0.tar.gz"
+  homepage "https://github.com/TokenRhythm/opensquilla"
+  url "https://github.com/TokenRhythm/opensquilla/archive/refs/tags/v0.1.0.tar.gz"
   sha256 "0000000000000000000000000000000000000000000000000000000000000000"
   license "Apache-2.0"
-  head "https://github.com/OpenSquilla/opensquilla.git", branch: "main"
+  head "https://github.com/TokenRhythm/opensquilla.git", branch: "main"
 
   depends_on "node" => :build
   depends_on "python@3.13"

@@ -24,8 +24,17 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 
+from opensquilla.contracts.generated.v4.sessions_create_metadata import (
+    SESSIONS_CREATE_METHOD,
+)
+from opensquilla.contracts.generated.v4.sessions_delete_metadata import (
+    SESSIONS_DELETE_METHOD,
+)
 from opensquilla.contracts.generated.v4.sessions_list_metadata import (
     SESSIONS_LIST_METHOD,
+)
+from opensquilla.contracts.generated.v4.sessions_rename_metadata import (
+    SESSIONS_RENAME_METHOD,
 )
 from opensquilla.contracts.generated.v4.sessions_resolve_metadata import (
     SESSIONS_RESOLVE_METHOD,
@@ -256,7 +265,7 @@ METHOD_SCOPES: dict[str, str] = {
     "documents.editSessions.heartbeat": WRITE_SCOPE,
     "documents.editSessions.close": WRITE_SCOPE,
     "search.query": WRITE_SCOPE,
-    "sessions.create": WRITE_SCOPE,
+    SESSIONS_CREATE_METHOD: WRITE_SCOPE,
     "sessions.fork": WRITE_SCOPE,
     "sessions.forkThroughTurn": WRITE_SCOPE,
     "sessions.send": WRITE_SCOPE,
@@ -299,10 +308,10 @@ METHOD_SCOPES: dict[str, str] = {
     # 0.0.0.0 listen, where even a 127.0.0.1 peer is not the local owner and so gets
     # REMOTE_OPERATOR_SCOPES (no admin) — surfacing as "Failed to delete session"
     # (issues #357, #307).
-    "sessions.delete": WRITE_SCOPE,
+    SESSIONS_DELETE_METHOD: WRITE_SCOPE,
     # Display-name-only session rename. Deployment/model rebinding remains on
     # the separately admin-gated sessions.patch surface.
-    "sessions.rename": WRITE_SCOPE,
+    SESSIONS_RENAME_METHOD: WRITE_SCOPE,
     "sessions.promptCacheKeepalive.set": WRITE_SCOPE,
     "sandbox.workspace.set": WRITE_SCOPE,  # OpenSquilla-only; owner-guarded handler.
     "sandbox.mount.add": WRITE_SCOPE,  # OpenSquilla-only; owner-guarded handler.

@@ -3,7 +3,7 @@ import { dirname, extname, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 const scriptDir = dirname(fileURLToPath(import.meta.url))
-const distDir = resolve(scriptDir, '../../src/opensquilla/gateway/static/dist')
+const distDir = resolve(scriptDir, '../dist')
 const assetsDir = resolve(distDir, 'assets')
 
 function javascriptFiles(root) {

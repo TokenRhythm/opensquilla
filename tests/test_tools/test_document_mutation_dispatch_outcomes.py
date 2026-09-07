@@ -81,7 +81,7 @@ def _registry(handler: Any) -> ToolRegistry:
             parameters={"mutations": {"type": "array"}},
             required=["mutations"],
             runtime_only_arguments=frozenset({"_tool_use_id"}),
-            exposed_by_default=False,
+            default_access="deny",
         ),
         handler,
     )

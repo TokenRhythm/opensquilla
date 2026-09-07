@@ -19,7 +19,7 @@ from opensquilla.gateway import rpc_chat as rpc_chat_module
 from opensquilla.gateway.rpc import RpcContext
 from opensquilla.gateway.rpc_chat import (
     _clarify_fields_to_text,
-    _handle_chat_clarify_submit,
+    _submit_clarification,
 )
 from opensquilla.skills.meta.clarify_text import parse_clarify_reply
 from opensquilla.skills.meta.types import ClarifyField, ClarifyStepConfig
@@ -96,20 +96,20 @@ def test_clarify_fields_to_text_roundtrips_through_real_parser():
 async def test_clarify_submit_rejects_non_dict_params():
     ctx = RpcContext(conn_id="c", principal=SimpleNamespace(role="operator"))
     with pytest.raises(ValueError, match="sessionKey, fields"):
-        await _handle_chat_clarify_submit(None, ctx)
+        await _submit_clarification(None, ctx)
     with pytest.raises(ValueError, match="sessionKey, fields"):
-        await _handle_chat_clarify_submit("not-a-dict", ctx)  # type: ignore[arg-type]
+        await _submit_clarification("not-a-dict", ctx)  # type: ignore[arg-type]
 
 
 @pytest.mark.asyncio
 async def test_clarify_submit_rejects_empty_fields():
     ctx = RpcContext(conn_id="c", principal=SimpleNamespace(role="operator"))
     with pytest.raises(ValueError, match="non-empty mapping"):
-        await _handle_chat_clarify_submit(
+        await _submit_clarification(
             {"sessionKey": "S1", "fields": {}}, ctx,
         )
     with pytest.raises(ValueError, match="non-empty mapping"):
-        await _handle_chat_clarify_submit(
+        await _submit_clarification(
             {"sessionKey": "S1", "fields": "not a dict"}, ctx,
         )
 
@@ -120,17 +120,18 @@ async def test_clarify_submit_allows_all_empty_values_for_server_autofill(monkey
     can be inferred from context instead of trapping the user in the form."""
     captured: dict = {}
 
-    async def _fake_send(send_params, ctx):
+    async def _fake_admit(send_params, *, surface):
+        assert surface == "webchat"
         captured["send_params"] = send_params
         return {"ok": True, "sessionKey": send_params["sessionKey"]}
 
     monkeypatch.setattr(
-        "opensquilla.gateway.rpc_chat._handle_chat_send",
-        _fake_send,
+        "opensquilla.gateway.rpc_chat._chat_turn_admission_adapter",
+        lambda _ctx: SimpleNamespace(admit=_fake_admit),
     )
 
     ctx = RpcContext(conn_id="c", principal=SimpleNamespace(role="operator"))
-    result = await _handle_chat_clarify_submit(
+    result = await _submit_clarification(
         {"sessionKey": "S1", "fields": {"a": "", "b": None}},
         ctx,
     )
@@ -149,18 +150,22 @@ async def test_clarify_submit_forwards_to_chat_send(monkeypatch):
     text + clarify_submit intent + run_id tagged on _source."""
     captured: dict = {}
 
-    async def _fake_send(send_params, ctx):
+    async def _fake_admit(send_params, *, surface):
+        assert surface == "webchat"
         captured["send_params"] = send_params
-        captured["ctx"] = ctx
         return {"ok": True, "sessionKey": send_params["sessionKey"]}
 
+    def _fake_adapter(actual_ctx):
+        captured["ctx"] = actual_ctx
+        return SimpleNamespace(admit=_fake_admit)
+
     monkeypatch.setattr(
-        "opensquilla.gateway.rpc_chat._handle_chat_send",
-        _fake_send,
+        "opensquilla.gateway.rpc_chat._chat_turn_admission_adapter",
+        _fake_adapter,
     )
 
     ctx = RpcContext(conn_id="c", principal=SimpleNamespace(role="operator"))
-    result = await _handle_chat_clarify_submit(
+    result = await _submit_clarification(
         {
             "sessionKey": "agent:main:webchat:abc",
             "fields": {"destination": "Tokyo", "days": 5},
@@ -209,7 +214,7 @@ async def test_clarify_submit_with_request_id_resolves_same_turn(monkeypatch):
         task_runtime=Runtime(),
     )
 
-    result = await _handle_chat_clarify_submit(
+    result = await _submit_clarification(
         {
             "sessionKey": "agent:main:webchat:abc",
             "request_id": "input-1",
@@ -238,14 +243,19 @@ async def test_clarify_submit_logs_safe_entry_metadata(monkeypatch):
     exposing field values in gateway logs."""
     captured: dict = {}
 
-    async def _fake_send(send_params, ctx):
+    async def _fake_send(send_params, *, surface):
+        assert surface == "webchat"
         return {"ok": True, "sessionKey": send_params["sessionKey"]}
 
     def _fake_info(event, **kwargs):
         captured["event"] = event
         captured["kwargs"] = kwargs
 
-    monkeypatch.setattr(rpc_chat_module, "_handle_chat_send", _fake_send)
+    monkeypatch.setattr(
+        rpc_chat_module,
+        "_chat_turn_admission_adapter",
+        lambda _ctx: SimpleNamespace(admit=_fake_send),
+    )
     real_log = rpc_chat_module.log
 
     class _InfoLog:
@@ -258,7 +268,7 @@ async def test_clarify_submit_logs_safe_entry_metadata(monkeypatch):
     monkeypatch.setattr(rpc_chat_module, "log", _InfoLog())
 
     ctx = RpcContext(conn_id="c", principal=SimpleNamespace(role="operator"))
-    await _handle_chat_clarify_submit(
+    await _submit_clarification(
         {
             "sessionKey": "agent:main:webchat:abc",
             "fields": {"review": "ok"},
@@ -281,17 +291,18 @@ async def test_clarify_submit_works_without_run_id(monkeypatch):
     flows through normally."""
     captured: dict = {}
 
-    async def _fake_send(send_params, ctx):
+    async def _fake_admit(send_params, *, surface):
+        assert surface == "webchat"
         captured["send_params"] = send_params
         return {"ok": True, "sessionKey": send_params["sessionKey"]}
 
     monkeypatch.setattr(
-        "opensquilla.gateway.rpc_chat._handle_chat_send",
-        _fake_send,
+        "opensquilla.gateway.rpc_chat._chat_turn_admission_adapter",
+        lambda _ctx: SimpleNamespace(admit=_fake_admit),
     )
 
     ctx = RpcContext(conn_id="c", principal=SimpleNamespace(role="operator"))
-    await _handle_chat_clarify_submit(
+    await _submit_clarification(
         {"sessionKey": "S1", "fields": {"x": "y"}},
         ctx,
     )

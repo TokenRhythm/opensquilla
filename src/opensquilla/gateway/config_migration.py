@@ -318,6 +318,7 @@ def migrate_config_payload(
     """
     builder = _MigrationBuilder(payload=copy.deepcopy(data))
 
+    _strip_removed_sandbox_fields(builder)
     _normalize_memory_fields(builder, emit_diagnostics=emit_diagnostics)
     _normalize_agent_token_saving_fields(
         builder,
@@ -354,6 +355,16 @@ def _payload_config_version(payload: dict[str, Any]) -> int:
     if isinstance(value, bool) or not isinstance(value, int):
         return 0
     return int(value)
+
+
+def _strip_removed_sandbox_fields(builder: _MigrationBuilder) -> None:
+    """Always-run: strip sandbox fields removed from the strict settings model."""
+    sandbox = builder.payload.get("sandbox")
+    if not isinstance(sandbox, dict):
+        return
+    if "auto_setup" in sandbox:
+        sandbox.pop("auto_setup")
+        builder.removed_fields.append("sandbox.auto_setup")
 
 
 def _normalize_memory_fields(

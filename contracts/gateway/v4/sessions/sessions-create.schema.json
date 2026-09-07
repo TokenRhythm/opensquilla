@@ -1,0 +1,158 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://opensquilla.dev/contracts/gateway/v4/sessions/sessions-create.schema.json",
+  "title": "OpenSquilla sessions.create Contract",
+  "description": "Language-neutral Contract for the v4 sessions.create command. Generated wire types may be imported only by Gateway adapters and Contract tests.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "request": { "$ref": "#/$defs/SessionsCreateRequestFrame" },
+    "response": { "$ref": "#/$defs/SessionsCreateResponseFrame" }
+  },
+  "x-opensquilla-wire": {
+    "protocol": "opensquilla-websocket-json",
+    "version": 4,
+    "compatibility": "exact-json-tree"
+  },
+  "x-opensquilla-codegen": {
+    "python": { "tool": "datamodel-code-generator", "version": "0.75.1", "target": "pydantic_v2.BaseModel" },
+    "typescript": { "tool": "json-schema-to-typescript", "version": "15.0.4" },
+    "runtimeValidation": { "tool": "ajv", "version": "8.17.1", "mode": "standalone-adapter-only" }
+  },
+  "x-opensquilla-method": {
+    "name": "sessions.create",
+    "kind": "command",
+    "scope": "operator.write",
+    "guestAllowed": false,
+    "idempotency": "non-idempotent",
+    "timeout": { "policy": "caller" },
+    "capability": { "kind": "method-availability", "name": "sessions.create" },
+    "request": "#/$defs/SessionsCreateRequestFrame",
+    "params": "#/$defs/SessionsCreateParams",
+    "response": "#/$defs/SessionsCreateResponseFrame",
+    "result": "#/$defs/SessionsCreateResult",
+    "errors": [
+      { "code": "INVALID_PARAMS", "semantics": "legacy parameter and deployment validation" },
+      { "code": "OWNER_REQUIRED", "semantics": "project workspace requires a local owner" },
+      {
+        "code": "AGENT_NOT_FOUND",
+        "wireCode": "agent.not_found",
+        "semantics": "requested agent is not registered"
+      },
+      { "code": "WORKSPACE_NOT_FOUND", "semantics": "requested project workspace is missing" },
+      { "code": "WORKSPACE_UNAVAILABLE", "semantics": "requested project workspace cannot be opened" },
+      { "code": "UNAUTHORIZED" },
+      { "code": "UNAVAILABLE", "retryable": true },
+      { "code": "STORAGE_BUSY", "retryable": true, "retryAfterMs": true, "details": true },
+      { "code": "INVALID_REQUEST" },
+      { "code": "NOT_FOUND" },
+      { "code": "INTERNAL_ERROR" }
+    ]
+  },
+  "$defs": {
+    "SessionsCreateParams": {
+      "title": "sessions.create params",
+      "description": "The implementation accepts omitted/null params and retains historical aliases. Unknown fields remain open for older clients and future additive fields.",
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "agentId": { "type": ["string", "null"] },
+        "displayName": { "type": ["string", "null"] },
+        "message": { "type": ["string", "null"] },
+        "model": { "type": ["string", "null"] },
+        "kind": { "type": ["string", "null"] },
+        "sessionKind": { "type": ["string", "null"] },
+        "workspaceId": { "type": ["string", "null"] },
+        "workspace_id": { "type": ["string", "null"] },
+        "provider": { "type": ["string", "null"] },
+        "providerOverride": { "type": ["string", "null"] },
+        "provider_override": { "type": ["string", "null"] },
+        "authProfile": { "type": ["string", "null"] },
+        "authProfileOverride": { "type": ["string", "null"] },
+        "auth_profile": { "type": ["string", "null"] },
+        "auth_profile_override": { "type": ["string", "null"] }
+      }
+    },
+    "SessionsCreateLegacyNonObjectParams": {
+      "description": "v4 ReqFrame.params is Any. Non-object values are coerced to an empty parameter object by the existing implementation.",
+      "anyOf": [
+        { "type": "array", "items": {} },
+        { "type": "string" },
+        { "type": "number" },
+        { "type": "boolean" }
+      ]
+    },
+    "SessionsCreateRequestFrame": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "id", "method"],
+      "properties": {
+        "type": { "const": "req" },
+        "id": { "type": "string" },
+        "method": { "const": "sessions.create" },
+        "params": {
+          "anyOf": [
+            { "$ref": "#/$defs/SessionsCreateParams" },
+            { "$ref": "#/$defs/SessionsCreateLegacyNonObjectParams" },
+            { "type": "null" }
+          ]
+        }
+      }
+    },
+    "SessionsCreateResult": {
+      "description": "The durable session identity. The no-session-manager compatibility path returns key, sessionId and note; a seeded message adds seededMessage.",
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["key", "sessionId"],
+      "properties": {
+        "key": { "type": "string" },
+        "sessionId": { "type": "string" },
+        "seededMessage": { "type": "boolean" },
+        "note": { "type": "string" }
+      }
+    },
+    "RpcError": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["code", "message"],
+      "properties": {
+        "code": { "type": "string" },
+        "message": { "type": "string" },
+        "details": {},
+        "retryable": { "type": ["boolean", "null"] },
+        "retry_after_ms": { "type": ["integer", "null"] },
+        "accepted": { "type": ["boolean", "null"] }
+      }
+    },
+    "SessionsCreateOkResponseFrame": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "id", "ok", "payload"],
+      "properties": {
+        "type": { "const": "res" },
+        "id": { "type": "string" },
+        "ok": { "const": true },
+        "payload": { "$ref": "#/$defs/SessionsCreateResult" },
+        "error": { "type": "null" }
+      }
+    },
+    "SessionsCreateErrorResponseFrame": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "id", "ok", "error"],
+      "properties": {
+        "type": { "const": "res" },
+        "id": { "type": "string" },
+        "ok": { "const": false },
+        "payload": { "type": "null" },
+        "error": { "$ref": "#/$defs/RpcError" }
+      }
+    },
+    "SessionsCreateResponseFrame": {
+      "oneOf": [
+        { "$ref": "#/$defs/SessionsCreateOkResponseFrame" },
+        { "$ref": "#/$defs/SessionsCreateErrorResponseFrame" }
+      ]
+    }
+  }
+}

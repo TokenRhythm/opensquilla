@@ -190,11 +190,12 @@
 import { ref, computed, inject, onMounted, onUnmounted, onActivated, onDeactivated } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { useRouter } from 'vue-router'
-import { useRpcStore } from '@/stores/rpc'
-import { useRequest } from '@/composables/useRequest'
 import { requestUsageSnapshot } from '@/composables/usage/useUsageQuery'
 import { effectiveCnyPerUsd } from '@/composables/usage/nativeBilling'
 import { SESSION_DIRECTORY_KEY } from '@/modules/sessionDirectory'
+import { PROVIDER_CONFIGURATION_KEY, type ProviderStatusRow } from '@/modules/providerConfiguration'
+import { OBSERVABILITY_KEY } from '@/modules/observability'
+import { CHANNEL_ADMINISTRATION_KEY } from '@/modules/channelAdministration'
 import type { UsageSnapshot } from '@/types/usage'
 import { useToasts } from '@/composables/useToasts'
 import { isOwnedGatewayConnection } from '@/composables/useCliInvocation'
@@ -265,33 +266,24 @@ interface UsageData {
   totalCostUsd?: number
 }
 
-// providers.status row — only the fields the overview reads. `latency` is a
-// newer optional TTFT summary; older gateways omit it entirely.
-interface ProviderStatusRow {
-  providerId?: string
-  active?: boolean
-  latency?: {
-    p50TtftMs?: number | null
-    p95TtftMs?: number | null
-    samples?: number | null
-    windowMinutes?: number | null
-  } | null
-}
-
-interface ProvidersStatusData {
-  providers?: ProviderStatusRow[]
-}
-
 // ---------------------------------------------------------------------------
 // Stores & Router
 // ---------------------------------------------------------------------------
 
 const { t } = useI18n()
 const router = useRouter()
-const rpc = useRpcStore()
 const injectedSessionDirectory = inject(SESSION_DIRECTORY_KEY)
 if (!injectedSessionDirectory) throw new Error('SessionDirectory was not provided')
 const sessionDirectory = injectedSessionDirectory
+const injectedProviderConfiguration = inject(PROVIDER_CONFIGURATION_KEY)
+if (!injectedProviderConfiguration) throw new Error('ProviderConfiguration was not provided')
+const providerConfiguration = injectedProviderConfiguration
+const injectedObservability = inject(OBSERVABILITY_KEY)
+if (!injectedObservability) throw new Error('Observability was not provided')
+const observability = injectedObservability
+const injectedChannelAdministration = inject(CHANNEL_ADMINISTRATION_KEY)
+if (!injectedChannelAdministration) throw new Error('ChannelAdministration was not provided')
+const channelAdministration = injectedChannelAdministration
 const { pushToast } = useToasts()
 const platform = usePlatform()
 
@@ -300,12 +292,16 @@ const platform = usePlatform()
 // ---------------------------------------------------------------------------
 
 const HIDDEN_EVIDENCE_KEYS = new Set(['restart_required', 'restartRequired'])
-// Per-panel useRequest instances
-const { data: statusData, refresh: refreshStatus } = useRequest<StatusData>(
-  'status',
-  undefined,
-  { errorLabel: 'Failed to load status', immediate: false },
-)
+const statusData = ref<StatusData | null>(null)
+async function refreshStatus(): Promise<StatusData | null> {
+  try {
+    const result = await observability.gatewayStatus() as StatusData
+    statusData.value = result
+    return result
+  } catch {
+    return null
+  }
+}
 const usageData = ref<UsageData | null>(null)
 const usageSnapshot = ref<UsageSnapshot | null>(null)
 
@@ -370,7 +366,7 @@ const costLine = computed<string>(() => {
 
 async function refreshUsage(epoch: UsageLoadEpoch): Promise<UsageData | null> {
   try {
-    const snapshot = await requestUsageSnapshot(rpc, 'all', {
+    const snapshot = await requestUsageSnapshot(observability, 'all', {
       days: false,
       models: false,
       sessions: false,
@@ -593,8 +589,7 @@ const channelChipHint = computed(() => {
 
 async function loadChannelStats() {
   try {
-    const res = await rpc.call<{ channels?: Array<{ status?: string; configured?: boolean; pendingPairings?: number }> }>('channels.status')
-    const rows = (res.channels || []).filter(ch => ch && ch.configured !== false)
+    const rows = (await channelAdministration.status()).filter(ch => ch && ch.configured !== false)
     channelStats.value = {
       total: rows.length,
       connected: rows.filter(ch => ch.status === 'connected').length,
@@ -668,8 +663,7 @@ async function loadHealth({ deep, silent = false }: HealthLoadOptions) {
   }
 
   try {
-    await rpc.waitForConnection()
-    const response = await rpc.call<HealthReport>('doctor.status', { agentId: 'main', deep })
+    const response = await observability.readiness({ agentId: 'main', deep }) as HealthReport
     const data = withoutLegacyMigrationFinding(response)
     if (!data.gatewayUrl) data.gatewayUrl = gatewayContextUrl()
     healthError.value = null
@@ -685,9 +679,8 @@ async function loadHealth({ deep, silent = false }: HealthLoadOptions) {
 
 async function loadProviderStatus() {
   try {
-    await rpc.waitForConnection()
-    const data = await rpc.call<ProvidersStatusData>('providers.status', {})
-    providerRows.value = Array.isArray(data?.providers) ? data.providers : []
+    const data = await providerConfiguration.status()
+    providerRows.value = [...data.providers]
   } catch {
     // Latency is optional telemetry; the overview must render without it.
   }

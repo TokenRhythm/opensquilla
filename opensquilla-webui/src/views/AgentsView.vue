@@ -280,10 +280,9 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed, nextTick } from 'vue'
+import { ref, computed, inject, nextTick } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { useRouter } from 'vue-router'
-import { useRpcStore } from '@/stores/rpc'
 import Icon from '@/components/Icon.vue'
 import ErrorState from '@/components/ErrorState.vue'
 import LoadingSpinner from '@/components/LoadingSpinner.vue'
@@ -292,17 +291,21 @@ import { isAgentBuiltin, useAgentDrawer } from '@/composables/agents/useAgentDra
 import { useDialogA11y } from '@/composables/useDialogA11y'
 import type { Agent } from '@/types/agents'
 import { useToasts } from '@/composables/useToasts'
+import { AGENT_CATALOG_KEY, AgentCatalogError } from '@/modules/agentCatalog'
+import type { CreateAgentCommand } from '@/modules/agentCatalog'
 
 // ---------------------------------------------------------------------------
 // State
 // ---------------------------------------------------------------------------
 
 const { t } = useI18n()
-const rpc = useRpcStore()
+const injectedAgentCatalog = inject(AGENT_CATALOG_KEY)
+if (!injectedAgentCatalog) throw new Error('AgentCatalog was not provided')
+const agentCatalog = injectedAgentCatalog
 const { pushToast } = useToasts()
 const router = useRouter()
 
-const { agents, loadData, loading, error } = useAgentsData()
+const { agents, loadData, loading, error } = useAgentsData(agentCatalog)
 const newId = ref('')
 const newName = ref('')
 
@@ -390,17 +393,16 @@ async function onInlineAdd() {
   const id = newId.value.trim()
   const name = newName.value.trim()
   if (!id) return
-  const payload: Record<string, unknown> = { id }
-  if (name) payload.name = name
+  const payload: CreateAgentCommand = { id, ...(name ? { name } : {}) }
   try {
-    await rpc.call('agents.create', payload)
+    await agentCatalog.create(payload)
     pushToast(t('console.agents.toastCreated', { id }), { tone: 'ok' })
     newId.value = ''
     newName.value = ''
     await loadData()
   } catch (err: unknown) {
-    const code = rpcErrorCode(err)
-    if (code === 'agent.exists') pushToast(t('console.agents.toastExists', { id }), { tone: 'danger' })
+    const kind = agentCatalogErrorKind(err)
+    if (kind === 'already-exists') pushToast(t('console.agents.toastExists', { id }), { tone: 'danger' })
     else pushToast(t('console.agents.toastCreateFailed', { msg: errorMessage(err) }), { tone: 'danger' })
   }
 }
@@ -430,7 +432,7 @@ async function onSave() {
       saving.value = false
       return
     }
-    await rpc.call('agents.update', payload)
+    await agentCatalog.update(payload)
     pushToast(t('console.agents.toastUpdated', { id: drawerAgentId.value }), { tone: 'ok' })
     await loadData()
     const updated = agents.value.find(a => a.id === drawerAgentId.value)
@@ -438,11 +440,11 @@ async function onSave() {
       applyUpdatedAgent(updated)
     }
   } catch (err: unknown) {
-    const code = rpcErrorCode(err)
+    const kind = agentCatalogErrorKind(err)
     const msg = errorMessage(err)
     let friendly = t('console.agents.toastSaveFailed', { msg })
-    if (code === 'agent.not_found') friendly = t('console.agents.toastNotFound', { id: drawerAgentId.value })
-    if (code === 'agent.builtin_immutable') friendly = t('console.agents.toastBuiltinImmutable', { id: drawerAgentId.value })
+    if (kind === 'not-found') friendly = t('console.agents.toastNotFound', { id: drawerAgentId.value })
+    if (kind === 'immutable') friendly = t('console.agents.toastBuiltinImmutable', { id: drawerAgentId.value })
     pushToast(friendly, { tone: 'danger' })
   } finally {
     saving.value = false
@@ -463,7 +465,7 @@ async function deleteAgent(id?: string) {
   )
   if (!ok) return
   try {
-    await rpc.call('agents.delete', { id })
+    await agentCatalog.remove(id)
     pushToast(t('console.agents.toastDeleted', { id }), { tone: 'ok' })
     await loadData()
   } catch (err: unknown) {
@@ -515,10 +517,8 @@ function errorMessage(err: unknown): string {
   return err instanceof Error ? err.message : String(err)
 }
 
-function rpcErrorCode(err: unknown): string {
-  if (!err || typeof err !== 'object' || !('code' in err)) return ''
-  const code = (err as { code?: unknown }).code
-  return typeof code === 'string' ? code : ''
+function agentCatalogErrorKind(err: unknown): AgentCatalogError['kind'] | null {
+  return err instanceof AgentCatalogError ? err.kind : null
 }
 </script>
 

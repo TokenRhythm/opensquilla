@@ -1,5 +1,5 @@
 import { computed, ref, type ComputedRef } from 'vue'
-import { stripRedactionSentinels } from '@/composables/setup/channelRpc'
+import { stripChannelRedactionSentinels } from '@/modules/channelSetup'
 
 interface ChannelSpec {
   type: string
@@ -181,7 +181,7 @@ export function useSetupChannelsForm() {
       if (visible.has(key)) filtered[key] = value
     }
     if (mode.value !== 'edit') {
-      return stripRedactionSentinels(buildChannelEntry(channelType.value, filtered))
+      return stripChannelRedactionSentinels(buildChannelEntry(channelType.value, filtered))
     }
     // Edit mode: untouched stored secrets contribute '' → dropped by
     // buildChannelEntry → key omitted → server-side keep-current merge.
@@ -193,7 +193,7 @@ export function useSetupChannelsForm() {
     // The identity key must survive even if a spec ever hides or blanks the
     // name field — it is what the server matches the existing entry on.
     entry.name = editName.value
-    return stripRedactionSentinels(entry)
+    return stripChannelRedactionSentinels(entry)
   }
 
   // Current value of a field (user edit, else its default) — used both to render

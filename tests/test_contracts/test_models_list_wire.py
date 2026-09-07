@@ -8,8 +8,8 @@ public RPC field names are stable).
 - Adding a key requires deliberately extending the frozen sets in this file —
   that friction is the point: wire additions should be a conscious decision.
 
-The row and error shapes are frozen at ``_model_info_to_wire`` /
-``_list_error_to_wire``, the pure builders the ``models.list`` handler maps
+The row and error shapes are frozen at the provider-configuration Adapter
+projection builders that the ``models.list`` handler maps
 over selector results; the envelope is frozen by driving the handler with a
 fully synthetic in-memory selector stub — zero network either way.
 """
@@ -21,12 +21,12 @@ from types import SimpleNamespace
 import httpx
 import pytest
 
-from opensquilla.gateway.rpc import RpcContext
-from opensquilla.gateway.rpc_models import (
-    _handle_models_list,
-    _list_error_to_wire,
-    _model_info_to_wire,
+from opensquilla.gateway.adapters.provider_configuration import (
+    model_info_to_projection,
+    model_list_error_to_projection,
 )
+from opensquilla.gateway.rpc import RpcContext
+from opensquilla.gateway.rpc_models import _handle_models_list
 from opensquilla.provider.selector import (
     ModelListResult,
     ModelSelector,
@@ -77,7 +77,7 @@ def _synthetic_model(**overrides) -> dict:
 
 
 def test_model_row_keys_are_frozen() -> None:
-    row = _model_info_to_wire(_synthetic_model())
+    row = model_info_to_projection(_synthetic_model())
     assert set(row) == MODEL_ROW_KEYS
     assert set(row["pricing"]) == MODEL_PRICING_KEYS
 
@@ -85,7 +85,7 @@ def test_model_row_keys_are_frozen() -> None:
 def test_model_row_values_map_from_model_info() -> None:
     # Field-name mapping (snake_case ModelInfo -> camelCase wire) is part of
     # the contract: clients read contextWindow/pricing.inputPer1k literally.
-    row = _model_info_to_wire(_synthetic_model())
+    row = model_info_to_projection(_synthetic_model())
     assert row["id"] == "test-provider/test-model"
     assert row["name"] == "Test Model"
     assert row["provider"] == "test-provider"
@@ -115,7 +115,7 @@ def test_model_row_carries_normalized_provider_metadata() -> None:
         },
     }
 
-    row = _model_info_to_wire(_synthetic_model(metadata=metadata))
+    row = model_info_to_projection(_synthetic_model(metadata=metadata))
 
     assert row["metadata"] == metadata
 
@@ -139,7 +139,10 @@ def test_tokenrhythm_wire_prefers_declared_values_and_explicit_false(monkeypatch
                 supports_vision=True,
             )
 
-    monkeypatch.setattr("opensquilla.gateway.rpc_models._catalog", _Catalog())
+    monkeypatch.setattr(
+        "opensquilla.gateway.adapters.provider_configuration._catalog",
+        _Catalog(),
+    )
     metadata = {
         "schemaVersion": 1,
         "declared": {
@@ -154,7 +157,7 @@ def test_tokenrhythm_wire_prefers_declared_values_and_explicit_false(monkeypatch
         },
     }
 
-    row = _model_info_to_wire(
+    row = model_info_to_projection(
         _synthetic_model(
             provider="tokenrhythm",
             model_id="qwen3.8-max",
@@ -183,7 +186,10 @@ def test_tokenrhythm_wire_uses_authority_resolved_model_info_without_rewriting_m
                 reasoning_format="none",
             )
 
-    monkeypatch.setattr("opensquilla.gateway.rpc_models._catalog", _Catalog())
+    monkeypatch.setattr(
+        "opensquilla.gateway.adapters.provider_configuration._catalog",
+        _Catalog(),
+    )
     metadata = {
         "schemaVersion": 1,
         "declared": {
@@ -194,7 +200,7 @@ def test_tokenrhythm_wire_uses_authority_resolved_model_info_without_rewriting_m
         "published": None,
     }
 
-    row = _model_info_to_wire(
+    row = model_info_to_projection(
         _synthetic_model(
             provider="tokenrhythm",
             model_id="qwen3.8-max",
@@ -214,13 +220,13 @@ def test_tokenrhythm_wire_uses_authority_resolved_model_info_without_rewriting_m
 def test_model_row_carries_catalog_provenance() -> None:
     # A model unknown to every catalog layer still resolves to a synthesized
     # entry, so ``source``/``reasoningFormat`` are always renderable strings.
-    row = _model_info_to_wire(_synthetic_model())
+    row = model_info_to_projection(_synthetic_model())
     assert isinstance(row["source"], str) and row["source"]
     assert isinstance(row["reasoningFormat"], str) and row["reasoningFormat"]
 
 
 def test_error_row_keys_are_frozen() -> None:
-    err = _list_error_to_wire(
+    err = model_list_error_to_projection(
         ProviderListError(
             provider="test-provider",
             model_hint="test-provider/test-model",
@@ -243,17 +249,17 @@ def test_error_row_keys_are_frozen() -> None:
 def test_model_row_capability_strings_are_frozen() -> None:
     # Capability strings are matched verbatim by the handler's
     # ``capabilities`` filter and by client-side capability badges.
-    with_tools = _model_info_to_wire(_synthetic_model())
+    with_tools = model_info_to_projection(_synthetic_model())
     assert with_tools["capabilities"] == ["chat", "tools"]
 
-    without_tools = _model_info_to_wire(_synthetic_model(supports_tools=False))
+    without_tools = model_info_to_projection(_synthetic_model(supports_tools=False))
     assert without_tools["capabilities"] == ["chat"]
 
 
 def test_model_row_name_falls_back_to_the_model_id() -> None:
     # Clients rely on ``name`` always being renderable even when a provider
     # returns no display name.
-    row = _model_info_to_wire(_synthetic_model(display_name=""))
+    row = model_info_to_projection(_synthetic_model(display_name=""))
     assert row["name"] == "test-provider/test-model"
 
 

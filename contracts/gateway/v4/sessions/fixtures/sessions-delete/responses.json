@@ -1,0 +1,27 @@
+{
+  "format_version": 1,
+  "kind": "response",
+  "cases": [
+    {
+      "id": "response.deleted",
+      "coverage": "single-success",
+      "expectation": "exact",
+      "wire": { "type": "res", "id": "delete-1", "ok": true, "payload": { "deleted": ["agent:main:webchat:abc123"], "errors": [] }, "error": null }
+    },
+    {
+      "id": "response.partial",
+      "coverage": "partial-success-preserves-input-spelling",
+      "expectation": "exact",
+      "wire": {
+        "type": "res",
+        "id": "delete-2",
+        "ok": true,
+        "payload": {
+          "deleted": ["agent:main:webchat:one"],
+          "errors": ["webchat:missing: 'Session not found: webchat:missing'"]
+        },
+        "error": null
+      }
+    }
+  ]
+}

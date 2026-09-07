@@ -1,7 +1,7 @@
 import { describe, it, expect, vi } from 'vitest'
 import { foldTurn, TurnAccumulator } from './foldTurn'
 import type { ChatToolCall, ChatToolCallGroup } from '@/types/chat'
-import type { ArtifactPayload } from '@/types/rpc'
+import type { ArtifactPayload } from '@/types/artifacts'
 import type { Frame } from '@/types/turnlog'
 import type { InterruptViewState } from '@/types/parts'
 

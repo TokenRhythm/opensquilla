@@ -1,4 +1,10 @@
 import { expect, test, type Page } from '@playwright/test'
+import {
+  chatHistoryPayload,
+  sessionMessagesHydratePayload,
+  sessionMessagesSnapshotPayload,
+  sessionMessagesSubscribePayload,
+} from './support/session-read-fixtures'
 
 const CONTROL_URL = '/control/'
 const SESSION_KEY = 'agent:main:webchat:e2e-history-hydration'
@@ -28,7 +34,14 @@ function helloResponse(tickIntervalMs: number) {
   })
 }
 
-function basePayload(method: string): unknown {
+function requestSessionKey(
+  frame: { params?: Record<string, unknown> },
+  fallback = SESSION_KEY,
+): string {
+  return String(frame.params?.key || frame.params?.sessionKey || fallback)
+}
+
+function basePayload(method: string, sessionKey = SESSION_KEY): unknown {
   const payloads: Record<string, unknown> = {
     'agents.list': { agents: [] },
     'commands.list_for_surface': { commands: [] },
@@ -39,18 +52,9 @@ function basePayload(method: string): unknown {
     },
     'models.routing.get': { mode: 'direct' },
     'sessions.list': { sessions: [], has_more: false },
-    'sessions.messages.subscribe': {
-      subscribed: true,
-      replay_complete: true,
-      current_stream_seq: 0,
-      run_status: 'idle',
-    },
-    'sessions.messages.hydrate': {
-      subscribed: true,
-      replay_complete: true,
-      current_stream_seq: 0,
-      run_status: 'idle',
-    },
+    'sessions.messages.snapshot': sessionMessagesSnapshotPayload(sessionKey),
+    'sessions.messages.subscribe': sessionMessagesSubscribePayload(sessionKey),
+    'sessions.messages.hydrate': sessionMessagesHydratePayload(sessionKey),
     'usage.status': { sessions: [] },
   }
   return payloads[method] ?? {}
@@ -80,7 +84,8 @@ async function stubApprovals(page: Page) {
 }
 
 test('keeps the conversation usable while startup and long history are delayed', async ({ page }) => {
-  let releaseHistory: (() => void) | undefined
+  let historyReleased = false
+  const pendingHistoryResponses: Array<() => void> = []
   let chatSendRequests = 0
   let usageRequests = 0
   const receivedMethods: string[] = []
@@ -114,40 +119,43 @@ test('keeps the conversation usable while startup and long history are delayed',
           sessionRequestOrder.push(method)
         }
         if (method === 'chat.history') {
-          releaseHistory = () => ws.send(successResponse(String(frame.id), {
-            messages: longHistoryMessages(),
-            has_more: true,
-            oldest_cursor: 'cursor-50',
-            newest_cursor: 'cursor-100',
-            canonical_available: true,
-            canonical_complete: true,
-          }))
+          const messages = longHistoryMessages()
+          const respond = () => ws.send(successResponse(
+            String(frame.id),
+            chatHistoryPayload(messages, {
+              has_more: true,
+              oldest_cursor: 'cursor-50',
+              newest_cursor: 'cursor-100',
+              history_scope: 'latest_window',
+              loaded_count: messages.length,
+              page_size: Number(frame.params?.limit) || 50,
+            }),
+          ))
+          if (historyReleased) respond()
+          else pendingHistoryResponses.push(respond)
           return
         }
         if (method === 'sessions.messages.snapshot') {
-          ws.send(successResponse(String(frame.id), {
-            key: SESSION_KEY,
-            events: [],
-            current_stream_seq: 0,
-          }))
+          ws.send(successResponse(
+            String(frame.id),
+            sessionMessagesSnapshotPayload(requestSessionKey(frame)),
+          ))
           return
         }
         if (method === 'sessions.messages.subscribe') {
-          ws.send(successResponse(String(frame.id), {
-            subscribed: true,
-            hydration_complete: false,
-            replay_complete: true,
-            current_stream_seq: 0,
-            run_status: 'idle',
-          }))
+          ws.send(successResponse(
+            String(frame.id),
+            sessionMessagesSubscribePayload(requestSessionKey(frame), {
+              hydration_complete: false,
+            }),
+          ))
           return
         }
         if (method === 'sessions.messages.hydrate') {
-          ws.send(successResponse(String(frame.id), {
-            hydration_complete: true,
-            workspaceId: null,
-            run_status: 'idle',
-          }))
+          ws.send(successResponse(
+            String(frame.id),
+            sessionMessagesHydratePayload(requestSessionKey(frame)),
+          ))
           return
         }
         if (method === 'sessions.list') {
@@ -179,7 +187,10 @@ test('keeps the conversation usable while startup and long history are delayed',
           return
         }
         if (method === 'usage.status') usageRequests += 1
-        ws.send(successResponse(String(frame.id), basePayload(method)))
+        ws.send(successResponse(
+          String(frame.id),
+          basePayload(method, requestSessionKey(frame)),
+        ))
       } catch {}
     })
   })
@@ -191,7 +202,7 @@ test('keeps the conversation usable while startup and long history are delayed',
   const thread = page.locator('.chat-thread')
   const composer = page.getByRole('textbox', { name: 'Message to send' })
 
-  await expect.poll(() => Boolean(releaseHistory)).toBe(true)
+  await expect.poll(() => pendingHistoryResponses.length).toBeGreaterThan(0)
   const criticalStartupOrder = [
     'sessions.messages.subscribe',
     'sessions.messages.snapshot',
@@ -238,7 +249,8 @@ test('keeps the conversation usable while startup and long history are delayed',
   await page.getByRole('button', { name: 'Send', exact: true }).click()
   await expect.poll(() => chatSendRequests).toBe(1)
 
-  releaseHistory?.()
+  historyReleased = true
+  pendingHistoryResponses.splice(0).forEach(respond => respond())
   await expect(page.getByText('Hydration complete.')).toBeVisible()
   await expect(hiddenRecovery).toHaveCount(0)
   await expect(page.getByTestId('history-load-sentinel')).toBeAttached()
@@ -283,39 +295,33 @@ test('recovers from stuck automatic metadata before sending', async ({ page }) =
         // stuck, every later request on this socket remains queued behind it.
         if (socketNumber === 1 && metadataStuck) return
         if (method === 'sessions.messages.snapshot') {
-          ws.send(successResponse(String(frame.id), {
-            key: SESSION_KEY,
-            events: [],
-            current_stream_seq: 0,
-          }))
+          ws.send(successResponse(
+            String(frame.id),
+            sessionMessagesSnapshotPayload(requestSessionKey(frame)),
+          ))
           return
         }
         if (method === 'sessions.messages.subscribe') {
-          ws.send(successResponse(String(frame.id), {
-            subscribed: true,
-            hydration_complete: true,
-            replay_complete: true,
-            current_stream_seq: 0,
-            run_status: 'idle',
-          }))
+          ws.send(successResponse(
+            String(frame.id),
+            sessionMessagesSubscribePayload(requestSessionKey(frame)),
+          ))
           return
         }
         if (method === 'sessions.messages.hydrate') {
-          ws.send(successResponse(String(frame.id), {
-            hydration_complete: true,
-            run_status: 'idle',
-          }))
+          ws.send(successResponse(
+            String(frame.id),
+            sessionMessagesHydratePayload(requestSessionKey(frame)),
+          ))
           return
         }
         if (method === 'chat.history') {
-          ws.send(successResponse(String(frame.id), {
-            messages: [],
-            has_more: false,
-            oldest_cursor: null,
-            newest_cursor: null,
-            canonical_available: true,
-            canonical_complete: true,
-          }))
+          ws.send(successResponse(
+            String(frame.id),
+            chatHistoryPayload([], {
+              page_size: Number(frame.params?.limit) || 50,
+            }),
+          ))
           return
         }
         if (method === 'chat.send') {
@@ -328,7 +334,10 @@ test('recovers from stuck automatic metadata before sending', async ({ page }) =
           }))
           return
         }
-        ws.send(successResponse(String(frame.id), basePayload(method)))
+        ws.send(successResponse(
+          String(frame.id),
+          basePayload(method, requestSessionKey(frame)),
+        ))
       } catch {}
     })
   })
@@ -352,6 +361,7 @@ test('recovers from stuck automatic metadata before sending', async ({ page }) =
 
 test('shows a recoverable initial failure and retries it', async ({ page }) => {
   let historyRequests = 0
+  let allowHistoryRecovery = false
   let releaseRetry: (() => void) | undefined
 
   await stubApprovals(page)
@@ -376,7 +386,7 @@ test('shows a recoverable initial failure and retries it', async ({ page }) => {
         }
         if (frame.method === 'chat.history') {
           historyRequests += 1
-          if (historyRequests <= 2) {
+          if (!allowHistoryRecovery) {
             ws.send(JSON.stringify({
               type: 'res',
               id: String(frame.id),
@@ -384,21 +394,25 @@ test('shows a recoverable initial failure and retries it', async ({ page }) => {
               error: { code: 'HISTORY_UNAVAILABLE', message: 'offline', retryable: true },
             }))
           } else {
-            releaseRetry = () => ws.send(successResponse(String(frame.id), {
-              messages: [{
-                role: 'assistant',
-                text: 'History recovered after retry.',
-                id: 'history-recovered',
-                timestamp: Math.floor(Date.now() / 1000),
-              }],
-              has_more: false,
-              canonical_available: true,
-              canonical_complete: true,
-            }))
+            const messages = [{
+              role: 'assistant',
+              text: 'History recovered after retry.',
+              id: 'history-recovered',
+              timestamp: Math.floor(Date.now() / 1000),
+            }]
+            releaseRetry = () => ws.send(successResponse(
+              String(frame.id),
+              chatHistoryPayload(messages, {
+                page_size: Number(frame.params?.limit) || 50,
+              }),
+            ))
           }
           return
         }
-        ws.send(successResponse(String(frame.id), basePayload(String(frame.method))))
+        ws.send(successResponse(
+          String(frame.id),
+          basePayload(String(frame.method), requestSessionKey(frame)),
+        ))
       } catch {}
     })
   })
@@ -420,7 +434,10 @@ test('shows a recoverable initial failure and retries it', async ({ page }) => {
   await expect(composer).toBeEditable()
   await expect(page.locator('.chat-empty')).toHaveCount(0)
 
+  const failedHistoryRequests = historyRequests
+  allowHistoryRecovery = true
   await retry.click()
+  await expect.poll(() => historyRequests).toBe(failedHistoryRequests + 1)
   await expect.poll(() => Boolean(releaseRetry)).toBe(true)
   const retrying = page.locator(
     '[data-testid="chat-session-recovery-status"][data-recovery-state="history-retrying"]',
@@ -432,7 +449,7 @@ test('shows a recoverable initial failure and retries it', async ({ page }) => {
   releaseRetry?.()
   await expect(page.getByText('History recovered after retry.')).toBeVisible()
   await expect(retrying).toHaveCount(0)
-  expect(historyRequests).toBe(3)
+  expect(historyRequests).toBe(failedHistoryRequests + 1)
 })
 
 test('terminates stalled history and live hydration despite ongoing ticks, then recovers on a new socket', async ({ page }) => {
@@ -491,7 +508,9 @@ test('terminates stalled history and live hydration despite ongoing ticks, then 
         if (frame.method === 'sessions.messages.snapshot') {
           ws.send(successResponse(String(frame.id), {
             key: SESSION_KEY,
+            task_id: null,
             events: [],
+            stream_generation: 'history-hydration-generation',
             current_stream_seq: 0,
           }))
           return
@@ -511,8 +530,13 @@ test('terminates stalled history and live hydration despite ongoing ticks, then 
               has_more: start > 0,
               oldest_cursor: start > 0 ? `cursor-${start}` : null,
               newest_cursor: `cursor-${end}`,
+              history_scope: start > 0 ? 'latest_window' : 'complete',
+              loaded_count: messages.length,
+              page_size: requestedLimit,
               canonical_available: true,
               canonical_complete: true,
+              compaction_summaries: [],
+              turn_outcomes: [],
             }))
             return
           }
@@ -533,8 +557,15 @@ test('terminates stalled history and live hydration despite ongoing ticks, then 
               ? `cursor-${seededTranscript.length - messages.length}`
               : null,
             newest_cursor: 'cursor-320',
+            history_scope: messages.length < seededTranscript.length
+              ? 'latest_window'
+              : 'complete',
+            loaded_count: messages.length,
+            page_size: requestedLimit,
             canonical_available: true,
             canonical_complete: true,
+            compaction_summaries: [],
+            turn_outcomes: [],
           }))
           return
         }
@@ -546,13 +577,37 @@ test('terminates stalled history and live hydration despite ongoing ticks, then 
           if (faultInjected) recoveredSubscribeSocket = socketId
           ws.send(successResponse(String(frame.id), {
             subscribed: true,
+            key: SESSION_KEY,
+            stream_generation: 'history-hydration-generation',
             replay_complete: true,
+            replay_gap_reason: null,
+            replayed_count: 0,
             current_stream_seq: 0,
+            workspaceId: null,
+            projectWorkspace: null,
+            projectWorkspaceDeferred: false,
+            active_task_group_ids: [],
+            run_mode_lock: { locked: false },
+            pendingUserInputs: [],
+            collaboration: null,
+            routing: null,
+            currentPlan: null,
+            activePlanRun: null,
+            goal: null,
+            goalSnapshotStreamSeq: null,
+            tasks: [],
+            active_task: null,
+            last_task: null,
             run_status: 'idle',
+            hydration_complete: true,
+            deferred_fields: [],
           }))
           return
         }
-        ws.send(successResponse(String(frame.id), basePayload(String(frame.method))))
+        ws.send(successResponse(
+          String(frame.id),
+          basePayload(String(frame.method), requestSessionKey(frame)),
+        ))
       } catch {}
     })
   })
@@ -706,11 +761,10 @@ test('preserves a Sessions Hub auto-send draft when live recovery terminates', a
           return
         }
         if (frame.method === 'sessions.messages.snapshot') {
-          ws.send(successResponse(String(frame.id), {
-            key: String(frame.params?.key || ''),
-            events: [],
-            current_stream_seq: 0,
-          }))
+          ws.send(successResponse(
+            String(frame.id),
+            sessionMessagesSnapshotPayload(requestSessionKey(frame, 'session:new')),
+          ))
           return
         }
         if (frame.method === 'sessions.messages.subscribe') {
@@ -718,12 +772,10 @@ test('preserves a Sessions Hub auto-send draft when live recovery terminates', a
             heldSubscribeRequests += 1
             return
           }
-          ws.send(successResponse(String(frame.id), {
-            subscribed: true,
-            replay_complete: true,
-            current_stream_seq: 0,
-            run_status: 'idle',
-          }))
+          ws.send(successResponse(
+            String(frame.id),
+            sessionMessagesSubscribePayload(requestSessionKey(frame, 'session:new')),
+          ))
           return
         }
         if (frame.method === 'chat.send') {
@@ -734,7 +786,13 @@ test('preserves a Sessions Hub auto-send draft when live recovery terminates', a
           }))
           return
         }
-        ws.send(successResponse(String(frame.id), basePayload(String(frame.method))))
+        ws.send(successResponse(
+          String(frame.id),
+          basePayload(
+            String(frame.method),
+            requestSessionKey(frame, 'session:new'),
+          ),
+        ))
       } catch {}
     })
   })
@@ -795,20 +853,17 @@ test('cancels delayed auto-send when the user edits the draft before live is rea
           return
         }
         if (frame.method === 'sessions.messages.snapshot') {
-          ws.send(successResponse(String(frame.id), {
-            key: String(frame.params?.key || ''),
-            events: [],
-            current_stream_seq: 0,
-          }))
+          ws.send(successResponse(
+            String(frame.id),
+            sessionMessagesSnapshotPayload(requestSessionKey(frame, 'session:new')),
+          ))
           return
         }
         if (frame.method === 'sessions.messages.subscribe') {
-          releaseSubscription = () => ws.send(successResponse(String(frame.id), {
-            subscribed: true,
-            replay_complete: true,
-            current_stream_seq: 0,
-            run_status: 'idle',
-          }))
+          releaseSubscription = () => ws.send(successResponse(
+            String(frame.id),
+            sessionMessagesSubscribePayload(requestSessionKey(frame, 'session:new')),
+          ))
           return
         }
         if (frame.method === 'chat.send') {
@@ -819,7 +874,13 @@ test('cancels delayed auto-send when the user edits the draft before live is rea
           }))
           return
         }
-        ws.send(successResponse(String(frame.id), basePayload(String(frame.method))))
+        ws.send(successResponse(
+          String(frame.id),
+          basePayload(
+            String(frame.method),
+            requestSessionKey(frame, 'session:new'),
+          ),
+        ))
       } catch {}
     })
   })
@@ -843,7 +904,9 @@ test('cancels delayed auto-send when the user edits the draft before live is rea
 })
 
 test('keeps loaded messages visible when an earlier page fails and retries inline', async ({ page }) => {
-  let historyRequests = 0
+  let latestHistoryRequests = 0
+  let earlierHistoryRequests = 0
+  let allowEarlierRetry = false
   let releaseEarlierRetry: (() => void) | undefined
 
   await stubApprovals(page)
@@ -867,17 +930,19 @@ test('keeps loaded messages visible when an earlier page fails and retries inlin
           return
         }
         if (frame.method === 'chat.history') {
-          historyRequests += 1
-          if (historyRequests === 1) {
-            ws.send(successResponse(String(frame.id), {
-              messages: longHistoryMessages(),
+          if (frame.params?.before == null) {
+            latestHistoryRequests += 1
+            const messages = longHistoryMessages()
+            ws.send(successResponse(String(frame.id), chatHistoryPayload(messages, {
               has_more: true,
               oldest_cursor: 'cursor-50',
               newest_cursor: 'cursor-100',
-              canonical_available: true,
-              canonical_complete: true,
-            }))
-          } else if (historyRequests === 2) {
+              history_scope: 'latest_window',
+              loaded_count: messages.length,
+              page_size: Number(frame.params?.limit) || 50,
+            })))
+          } else if (!allowEarlierRetry) {
+            earlierHistoryRequests += 1
             ws.send(JSON.stringify({
               type: 'res',
               id: String(frame.id),
@@ -885,23 +950,27 @@ test('keeps loaded messages visible when an earlier page fails and retries inlin
               error: { code: 'HISTORY_UNAVAILABLE', message: 'offline', retryable: true },
             }))
           } else {
-            releaseEarlierRetry = () => ws.send(successResponse(String(frame.id), {
-              messages: [{
-                role: 'assistant',
-                text: 'Earlier page recovered.',
-                id: 'earlier-message',
-                timestamp: Math.floor(Date.now() / 1000) - 3600,
-              }],
-              has_more: false,
-              oldest_cursor: null,
-              newest_cursor: 'cursor-50',
-              canonical_available: true,
-              canonical_complete: true,
-            }))
+            earlierHistoryRequests += 1
+            const messages = [{
+              role: 'assistant',
+              text: 'Earlier page recovered.',
+              id: 'earlier-message',
+              timestamp: Math.floor(Date.now() / 1000) - 3600,
+            }]
+            releaseEarlierRetry = () => ws.send(successResponse(
+              String(frame.id),
+              chatHistoryPayload(messages, {
+                newest_cursor: 'cursor-50',
+                page_size: Number(frame.params?.limit) || 50,
+              }),
+            ))
           }
           return
         }
-        ws.send(successResponse(String(frame.id), basePayload(String(frame.method))))
+        ws.send(successResponse(
+          String(frame.id),
+          basePayload(String(frame.method), requestSessionKey(frame)),
+        ))
       } catch {}
     })
   })
@@ -914,14 +983,16 @@ test('keeps loaded messages visible when an earlier page fails and retries inlin
 
   await expect(page.getByText('Hydration complete.')).toBeVisible()
   await thread.evaluate(element => element.scrollTo({ top: 0 }))
-  await expect.poll(() => historyRequests).toBe(2)
+  await expect.poll(() => earlierHistoryRequests).toBe(1)
 
   const retry = page.getByTestId('history-load-retry')
   await expect(retry).toContainText('Earlier messages failed to load · Retry')
   await expect(loadState).toHaveCount(0)
   await expect(page.getByText(/History row 1\./).first()).toBeVisible()
 
+  allowEarlierRetry = true
   await retry.click()
+  await expect.poll(() => earlierHistoryRequests).toBe(2)
   await expect.poll(() => Boolean(releaseEarlierRetry)).toBe(true)
   await expect(page.getByText('Loading earlier messages…')).toBeVisible()
   await expect(thread).toBeFocused()
@@ -929,7 +1000,8 @@ test('keeps loaded messages visible when an earlier page fails and retries inlin
   releaseEarlierRetry?.()
   await expect(page.getByText('Earlier page recovered.')).toBeVisible()
   await expect(retry).toHaveCount(0)
-  expect(historyRequests).toBe(3)
+  expect(latestHistoryRequests).toBeGreaterThan(0)
+  expect(earlierHistoryRequests).toBe(2)
 })
 
 test('ignores a late history response after navigating to another session', async ({ page }) => {
@@ -980,45 +1052,49 @@ test('ignores a late history response after navigating to another session', asyn
           return
         }
         if (frame.method === 'sessions.messages.snapshot') {
-          ws.send(successResponse(String(frame.id), {
-            key: String(frame.params?.key || ''),
-            events: [],
-            current_stream_seq: 0,
-          }))
+          ws.send(successResponse(
+            String(frame.id),
+            sessionMessagesSnapshotPayload(requestSessionKey(frame)),
+          ))
           return
         }
         if (frame.method === 'chat.history') {
           const requestedSession = String(frame.params?.sessionKey || '')
           if (requestedSession === SESSION_A) {
-            releaseOldHistory = () => ws.send(successResponse(String(frame.id), {
-              messages: [{
-                role: 'assistant',
-                text: 'Late history from session A must stay hidden.',
-                id: 'late-session-a-history',
-                timestamp: Math.floor(Date.now() / 1000) - 60,
-              }],
-              has_more: false,
-              canonical_available: true,
-              canonical_complete: true,
-            }))
+            const messages = [{
+              role: 'assistant',
+              text: 'Late history from session A must stay hidden.',
+              id: 'late-session-a-history',
+              timestamp: Math.floor(Date.now() / 1000) - 60,
+            }]
+            releaseOldHistory = () => ws.send(successResponse(
+              String(frame.id),
+              chatHistoryPayload(messages, {
+                page_size: Number(frame.params?.limit) || 50,
+              }),
+            ))
             return
           }
           if (requestedSession === SESSION_B) {
-            ws.send(successResponse(String(frame.id), {
-              messages: [{
-                role: 'assistant',
-                text: 'Current history from session B.',
-                id: 'current-session-b-history',
-                timestamp: Math.floor(Date.now() / 1000),
-              }],
-              has_more: false,
-              canonical_available: true,
-              canonical_complete: true,
-            }))
+            const messages = [{
+              role: 'assistant',
+              text: 'Current history from session B.',
+              id: 'current-session-b-history',
+              timestamp: Math.floor(Date.now() / 1000),
+            }]
+            ws.send(successResponse(
+              String(frame.id),
+              chatHistoryPayload(messages, {
+                page_size: Number(frame.params?.limit) || 50,
+              }),
+            ))
             return
           }
         }
-        ws.send(successResponse(String(frame.id), basePayload(String(frame.method))))
+        ws.send(successResponse(
+          String(frame.id),
+          basePayload(String(frame.method), requestSessionKey(frame)),
+        ))
       } catch {}
     })
   })

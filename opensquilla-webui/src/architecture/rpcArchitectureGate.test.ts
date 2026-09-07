@@ -21,7 +21,6 @@ import {
   resolveSourceImport,
 } from '../../scripts/lib/rpc-architecture-imports.mjs'
 import { collectHttpBoundaryOperations } from '../../scripts/lib/http-architecture-provenance.mjs'
-import { exactTransportDebtFailures } from '../../scripts/lib/exact-transport-debt.mjs'
 import { collectRpcTransportOperations } from '../../scripts/lib/rpc-symbol-provenance.mjs'
 
 const fixtureRoot = resolve('rpc-architecture-fixture')
@@ -208,22 +207,27 @@ describe('private Gateway transport import fence', () => {
     })).not.toBeNull()
   })
 
-  it('allows only the private transport composition root to import useRpcStore', () => {
+  it.each([
+    'src/adapters/gateway/sessionDirectoryV4.ts',
+    'src/adapters/gateway/privateTransports.ts',
+    'src/views/ChatView.vue',
+  ])('keeps useRpcStore out of %s', (importer) => {
     expect(gatewayAdapterRpcStoreImportViolation({
       root: fixtureRoot,
-      importer: 'src/adapters/gateway/sessionDirectoryV4.ts',
-      specifier: '@/stores/rpc.js',
+      importer,
+      specifier: '@/stores/rpc',
     })).toBe(
-      'src/adapters/gateway/sessionDirectoryV4.ts: Gateway Adapters must consume the private transport Interface instead of useRpcStore.',
+      `${importer}: useRpcStore may be imported only by the composition root or tests.`,
     )
+  })
+
+  it.each([
+    'src/main.ts',
+    'src/views/ChatView.test.ts',
+  ])('allows the useRpcStore seed only at %s', (importer) => {
     expect(gatewayAdapterRpcStoreImportViolation({
       root: fixtureRoot,
-      importer: 'src/adapters/gateway/privateTransports.ts',
-      specifier: '../../stores/rpc.js',
-    })).toBeNull()
-    expect(gatewayAdapterRpcStoreImportViolation({
-      root: fixtureRoot,
-      importer: 'src/views/ChatView.vue',
+      importer,
       specifier: '@/stores/rpc',
     })).toBeNull()
   })
@@ -275,7 +279,7 @@ describe('private Gateway transport import fence', () => {
   })
 })
 
-describe('Gateway HTTP boundary debt syntax', () => {
+describe('Gateway HTTP boundary provenance syntax', () => {
   it('tracks API path fragments, auth storage, and both protected headers', () => {
     const operations = collectHttpBoundaryOperations({
       ts,
@@ -355,19 +359,9 @@ describe('Gateway HTTP boundary debt syntax', () => {
     expect(operations).toEqual([])
   })
 
-  it('rejects both unapproved growth and stale HTTP debt entries', () => {
-    expect(exactTransportDebtFailures(
-      'httpApiEndpoint',
-      new Map([['src/old.ts', 1]]),
-      new Map([['src/new.ts', 1]]),
-    )).toEqual([
-      'src/new.ts: unexpected raw transport httpApiEndpoint (1); add a domain Adapter instead.',
-      'src/old.ts: stale raw transport httpApiEndpoint debt (1); remove it from its lane file.',
-    ])
-  })
 })
 
-describe('raw RPC call ledger syntax', () => {
+describe('raw RPC call provenance syntax', () => {
   it.each([
     ['renamed.call("sessions.list")', 'renamed'],
     ['gateway["call"]("sessions.list")', 'gateway'],
@@ -434,7 +428,7 @@ describe('raw RPC call ledger syntax', () => {
   })
 })
 
-describe('raw RPC member debt syntax', () => {
+describe('raw RPC member provenance syntax', () => {
   it.each([
     ['rpc.on("sessions.changed", handler)', 'on', 'rpc'],
     ['rpc["supportsMethod"]("sessions.list")', 'supportsMethod', 'rpc'],
@@ -1293,7 +1287,7 @@ describe('whole-program boundary export fence', () => {
       }),
     })
     expect(failures).toContain(
-      'src/adapters/gateway/bypass.ts: Gateway Adapters must consume the private transport Interface instead of useRpcStore.',
+      'src/adapters/gateway/bypass.ts: useRpcStore may be imported only by the composition root or tests.',
     )
   })
 

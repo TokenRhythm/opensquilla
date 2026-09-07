@@ -2033,7 +2033,7 @@ def _installed_reinstall_command_lines() -> str:
 
     if _RELEASE_VERSION_RE.match(__version__):
         wheel_url = (
-            "https://github.com/opensquilla/opensquilla/releases/download/"
+            "https://github.com/TokenRhythm/opensquilla/releases/download/"
             f"v{__version__}/opensquilla-{__version__}-py3-none-any.whl"
         )
         return (
@@ -2044,7 +2044,7 @@ def _installed_reinstall_command_lines() -> str:
         "  uv tool install --python 3.12 --force "
         "\"opensquilla[recommended] @ <wheel-url>\"\n"
         "  (use the wheel from the latest release: "
-        "https://github.com/opensquilla/opensquilla/releases/latest)\n"
+        "https://github.com/TokenRhythm/opensquilla/releases/latest)\n"
     )
 
 

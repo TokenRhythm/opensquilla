@@ -25,9 +25,37 @@ from opensquilla.engine.turn_runner.attachment_stage import (
 )
 from opensquilla.gateway.input_normalization import normalize_incoming_text
 from opensquilla.provider.types import ContentBlockText
-from opensquilla.token_estimation import estimate_attachment_text_tokens
+from opensquilla.token_estimation import (
+    estimate_attachment_text_tokens,
+    estimate_material_text_tokens,
+)
 
 DOCX_MIME = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+
+
+class _MaterialParityEncoding:
+    """Keep attachment-routing fixtures independent of optional tokenizer loading."""
+
+    def encode(
+        self,
+        text: str,
+        *,
+        disallowed_special: tuple[str, ...] = (),
+    ) -> list[int]:
+        del disallowed_special
+        return [0] * estimate_material_text_tokens(text)
+
+
+@pytest.fixture(autouse=True)
+def _use_deterministic_material_encoding(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Exercise format accounting without depending on tiktoken cache timing."""
+
+    from opensquilla import token_estimation
+
+    encoding = _MaterialParityEncoding()
+    monkeypatch.setattr(token_estimation, "_get_encoding", lambda: encoding)
 
 
 class _RuntimeAttachmentBuilder:

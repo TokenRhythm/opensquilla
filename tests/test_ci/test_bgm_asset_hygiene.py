@@ -6,6 +6,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[2]
 MUSIC_ROOTS = (
     "opensquilla-webui/public/music",
+    "opensquilla-webui/dist/music",
     "src/opensquilla/gateway/static/dist/music",
 )
 AUDIO_EXTENSIONS = ("mp3", "m4a", "ogg", "flac", "wav")

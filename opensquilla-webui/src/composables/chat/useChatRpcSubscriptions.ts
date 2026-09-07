@@ -1,106 +1,103 @@
-import type {
-  AnswerGenerationResetPayload,
-  ArtifactPayload,
-  CompactionPayload,
-  CronResultPayload,
-  EnsembleProgressPayload,
-  InputDispositionPayload,
-  ProviderActivityPayload,
-  RouterDecisionPayload,
-  SessionEventPayload,
-  SubagentCompletionPayload,
-  TextDeltaPayload,
-  ToolDeltaPayload,
-  ToolEndPayload,
-  ToolResultPayload,
-  ToolUsePayload,
-  WarningPayload,
-} from '@/types/rpc'
-import type { RpcEventHandler } from '@/lib/rpc'
+import {
+  type ConversationEventHandle,
+  type ConversationEventHub,
+} from '@/modules/conversationEventHub'
+import type { ConversationSessionRuntime } from '@/modules/conversationSessionRuntime'
+import type { ConversationEvent } from '@/modules/conversationEvents'
 
-type RpcSubscriptionClient = {
-  on(event: string, handler: RpcEventHandler): () => void
+/**
+ * Composition-root bridge for the Conversation event lane.
+ *
+ * The bridge intentionally has no wire event names or payload DTOs. The v4
+ * adapter owns those details and emits one decoded message; this small bridge
+ * remains as a compatibility bridge while the composition root owns a shared
+ * ConversationSessionRuntime. It never creates a second source when that
+ * runtime is supplied.
+ */
+export type ChatRpcSubscriptionHandlers = {
+  onEvent: (message: ConversationEvent) => void
+  onConnectionState?: (state: string) => void
+  onDecodeError?: (error: unknown) => void
 }
 
-export type ChatRpcSubscriptionHandlers = {
-  onAnswerGenerationReset: (payload: AnswerGenerationResetPayload) => void
-  onTextDelta: (payload: TextDeltaPayload) => void
-  onToolUseStart: (payload: ToolUsePayload) => void
-  onToolUseDelta: (payload: ToolDeltaPayload) => void
-  onToolUseEnd: (payload: ToolEndPayload) => void
-  onToolResult: (payload: ToolResultPayload) => void
-  onArtifact: (payload: ArtifactPayload) => void
-  onStateChange: (payload: SessionEventPayload) => void
-  onRunHeartbeat: (payload: SessionEventPayload) => void
-  onProviderActivity: (payload: ProviderActivityPayload) => void
-  onCompaction: (payload: CompactionPayload, meta: unknown) => void
-  onWarning: (payload: WarningPayload) => void
-  onInputDisposition: (payload: InputDispositionPayload) => void
-  onCronResult: (payload: CronResultPayload) => void
-  onSubagentCompletion: (payload: SubagentCompletionPayload) => void
-  onEpochChanged: (payload: SessionEventPayload) => void
-  onSessionsChanged: (payload: SessionEventPayload) => void
-  onTaskQueued: (payload: SessionEventPayload) => void
-  onTaskRunning: (payload: SessionEventPayload) => void
-  onTaskGroupWaiting: (payload: SessionEventPayload) => void
-  onTaskGroupSynthesizing: (payload: SessionEventPayload) => void
-  onTaskGroupDone: (payload: SessionEventPayload) => void
-  onTaskGroupFailed: (payload: SessionEventPayload) => void
-  onRouterDecision: (payload: RouterDecisionPayload) => void
-  onEnsembleProgress: (payload: EnsembleProgressPayload) => void
-  onRouterControlReplay: (payload: SessionEventPayload) => void
-  onAny: (rawEvent: string, rawPayload: unknown) => void
-  onConnectionState: (state: string) => void
+export interface ChatRpcSubscriptionOptions {
+  /** Return the currently visible session key for logical event fencing. */
+  getSessionKey?: () => string
+  /** Shared runtime owner; avoids a second event source for this composition root. */
+  runtime: Pick<ConversationSessionRuntime<ConversationEvent, never>, 'events'>
 }
 
 export function useChatRpcSubscriptions(
-  rpc: RpcSubscriptionClient,
   handlers: ChatRpcSubscriptionHandlers,
+  options: ChatRpcSubscriptionOptions,
 ) {
-  let unsubs: Array<() => void> = []
+  const hub: ConversationEventHub<ConversationEvent> = options.runtime.events
+  let activeHandle: ConversationEventHandle<ConversationEvent> | null = null
+  let activeKey = ''
+  let detachEvent: (() => void) | null = null
+  let detachState: (() => void) | null = null
+  let detachDecodeError: (() => void) | null = null
 
   function subscribe(): () => void {
     unsubscribe()
-    unsubs = [
-      rpc.on('session.event.answer_generation_reset', handlers.onAnswerGenerationReset),
-      rpc.on('session.event.text_delta', handlers.onTextDelta),
-      rpc.on('session.event.tool_use_start', handlers.onToolUseStart),
-      rpc.on('session.event.tool_use_delta', handlers.onToolUseDelta),
-      rpc.on('session.event.tool_use_end', handlers.onToolUseEnd),
-      rpc.on('session.event.tool_result', handlers.onToolResult),
-      rpc.on('session.event.artifact', handlers.onArtifact),
-      rpc.on('session.event.state_change', handlers.onStateChange),
-      rpc.on('session.event.run_heartbeat', handlers.onRunHeartbeat),
-      rpc.on('session.event.provider_activity', handlers.onProviderActivity),
-      rpc.on('session.event.compaction', handlers.onCompaction),
-      rpc.on('session.event.warning', handlers.onWarning),
-      rpc.on('session.event.input_disposition', handlers.onInputDisposition),
-      rpc.on('session.event.cron_result', handlers.onCronResult),
-      rpc.on('session.event.subagent_completion', handlers.onSubagentCompletion),
-      rpc.on('session.epoch_changed', handlers.onEpochChanged),
-      rpc.on('sessions.changed', handlers.onSessionsChanged),
-      rpc.on('task.queued', handlers.onTaskQueued),
-      rpc.on('task.running', handlers.onTaskRunning),
-      rpc.on('session.event.task_group.waiting', handlers.onTaskGroupWaiting),
-      rpc.on('session.event.task_group.synthesizing', handlers.onTaskGroupSynthesizing),
-      rpc.on('session.event.task_group.done', handlers.onTaskGroupDone),
-      rpc.on('session.event.task_group.failed', handlers.onTaskGroupFailed),
-      rpc.on('session.event.router_decision', handlers.onRouterDecision),
-      rpc.on('session.event.ensemble_progress', handlers.onEnsembleProgress),
-      rpc.on('session.event.router_control_replay', handlers.onRouterControlReplay),
-      rpc.on('*', handlers.onAny),
-      rpc.on('_state', handlers.onConnectionState),
-    ]
+    // The empty-key handle preserves the existing Conversation-wide reducer
+    // view when no key provider is supplied. ChatView supplies its current
+    // session key, so positively tagged events from another session are fenced
+    // before they reach the reducer.
+    activeKey = String(options.getSessionKey?.() || '')
+    activeHandle = hub.open(activeKey)
+    detachEvent = activeHandle.observe(handlers.onEvent)
+    if (handlers.onConnectionState) {
+      detachState = hub.observeConnectionState(handlers.onConnectionState)
+    }
+    if (handlers.onDecodeError) {
+      detachDecodeError = hub.observeDecodeError(handlers.onDecodeError)
+    }
     return unsubscribe
   }
 
   function unsubscribe() {
-    unsubs.forEach(fn => fn())
-    unsubs = []
+    detachEvent?.()
+    detachEvent = null
+    detachState?.()
+    detachState = null
+    detachDecodeError?.()
+    detachDecodeError = null
+    activeHandle?.close()
+    activeHandle = null
+  }
+
+  /** Switch the logical owner without touching the physical source. */
+  function setSessionKey(key: string) {
+    activeKey = String(key || '')
+    if (!activeHandle) return
+    detachEvent?.()
+    detachEvent = null
+    activeHandle.close()
+    activeHandle = hub.open(activeKey)
+    detachEvent = activeHandle.observe(handlers.onEvent)
+  }
+
+  /** Open an additional logical stream without acquiring another WebSocket. */
+  function open(
+    key: string,
+    listener: (message: ConversationEvent) => void = handlers.onEvent,
+  ) {
+    const handle = hub.open(key)
+    const detach = handle.observe(listener)
+    return {
+      handle,
+      unsubscribe: () => {
+        detach()
+        handle.close()
+      },
+    }
   }
 
   return {
     subscribe,
     unsubscribe,
+    open,
+    setSessionKey,
   }
 }

@@ -12,10 +12,10 @@ function source() {
       options?: RpcCallOptions,
     ) => Promise<T>,
     on: vi.fn((_event: string, _handler: RpcEventHandler) => vi.fn()),
-    supportsMethod: vi.fn((method: string) => method === 'sessions.list'),
-    supportsEvent: vi.fn((event: string) => event === 'sessions.changed'),
-    markMethodUnavailable: vi.fn(),
-    waitForConnection: vi.fn(async () => undefined),
+    hasRpcMethod: vi.fn((method: string) => method === 'sessions.list'),
+    hasRpcEvent: vi.fn((event: string) => event === 'sessions.changed'),
+    rememberUnsupportedMethod: vi.fn(),
+    ready: vi.fn(async () => undefined),
   }
 }
 
@@ -47,7 +47,7 @@ describe('private Gateway transports', () => {
       { view: 'session-list-v1', limit: 25 },
       callOptions,
     )
-    expect(rpcSource.waitForConnection).toHaveBeenCalledWith(
+    expect(rpcSource.ready).toHaveBeenCalledWith(
       4321,
       controller.signal,
       { timeoutAction: 'reject', abortAction: 'reconnect' },
@@ -63,9 +63,9 @@ describe('private Gateway transports', () => {
     expect(transports.rpc.generation).toBe(7)
     transports.rpc.markUnsupported('legacy.method')
 
-    expect(rpcSource.supportsMethod).toHaveBeenCalledWith('sessions.list')
-    expect(rpcSource.supportsEvent).toHaveBeenCalledWith('sessions.changed')
-    expect(rpcSource.markMethodUnavailable).toHaveBeenCalledWith('legacy.method')
+    expect(rpcSource.hasRpcMethod).toHaveBeenCalledWith('sessions.list')
+    expect(rpcSource.hasRpcEvent).toHaveBeenCalledWith('sessions.changed')
+    expect(rpcSource.rememberUnsupportedMethod).toHaveBeenCalledWith('legacy.method')
   })
 
   it('owns idempotent event unsubscription', () => {

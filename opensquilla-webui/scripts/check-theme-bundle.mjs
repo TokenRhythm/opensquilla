@@ -8,7 +8,8 @@ import { fileURLToPath } from 'node:url'
 // entry JS/CSS referenced by index.html), while still being emitted as their own
 // on-demand chunks. Run after `vite build`.
 const root = fileURLToPath(new URL('..', import.meta.url))
-const dist = join(root, '..', 'src', 'opensquilla', 'gateway', 'static', 'dist')
+// Vite owns the source artifact; packaging stages it explicitly afterwards.
+const dist = join(root, 'dist')
 const themesDir = join(root, 'src', 'themes')
 const indexHtml = join(dist, 'index.html')
 

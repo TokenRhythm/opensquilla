@@ -16,29 +16,16 @@ import {
   normalizeRouterVisualMode,
 } from '@/utils/chat/routerVisualMode'
 import { useRouterVisualEffectsPreference } from '@/composables/useRouterVisualEffectsPreference'
+import type { AppSettings } from '@/modules/appSettings'
 import {
-  waitForSessionRpcConnection,
-} from '@/composables/chat/sessionBootstrapAdmission'
-import type { RpcCallOptions, RpcConnectionWaitOptions } from '@/lib/rpc'
-
-type RpcClient = {
-  waitForConnection: (
-    timeoutMs?: number,
-    signal?: AbortSignal,
-    actions?: RpcConnectionWaitOptions,
-  ) => Promise<void>
-  call: <T = unknown>(
-    method: string,
-    params?: Record<string, unknown>,
-    callOptions?: RpcCallOptions,
-  ) => Promise<T>
-  on?: (event: string, handler: (payload: unknown) => void) => () => void
-  supportsMethod?: (method: string) => boolean
-}
+  ProviderConfigurationError,
+  type ModelRouting,
+} from '@/modules/providerConfiguration'
 
 export interface UseChatFeatureTogglesOptions {
-  rpc: RpcClient
-  readCallOptions?: RpcCallOptions
+  appSettings: AppSettings
+  modelRouting: ModelRouting
+  readOptions?: { readonly signal?: AbortSignal }
   setGlobalElevatedMode: (mode: string) => void
   loadCurrentSessionUsage: () => void | Promise<void>
 }
@@ -106,11 +93,7 @@ function parseCapabilitiesByMode(value: unknown): ModelRoutingCapabilitiesByMode
 }
 
 function isMethodNotFound(error: unknown): boolean {
-  const candidate = record(error)
-  const message = error instanceof Error
-    ? error.message
-    : String(candidate?.message || error || '')
-  return candidate?.code === 'METHOD_NOT_FOUND' || /method not found/i.test(message)
+  return error instanceof ProviderConfigurationError && error.code === 'unsupported'
 }
 
 export function useChatFeatureToggles(options: UseChatFeatureTogglesOptions) {
@@ -258,14 +241,7 @@ export function useChatFeatureToggles(options: UseChatFeatureTogglesOptions) {
     const eventGeneration = modelRoutingEventGeneration
     let cfg: ChatFeatureConfig | undefined
     try {
-      await waitForSessionRpcConnection(options.rpc, options.readCallOptions)
-      cfg = options.readCallOptions
-        ? await options.rpc.call<ChatFeatureConfig>(
-            'config.get',
-            undefined,
-            options.readCallOptions,
-          )
-        : await options.rpc.call<ChatFeatureConfig>('config.get')
+      cfg = await options.appSettings.readAll({ signal: options.readOptions?.signal }) as ChatFeatureConfig
       if (requestGeneration !== modelRoutingRequestGeneration) return
       await applyFeatureConfig(cfg, { refreshUsage: true })
       if (requestGeneration !== modelRoutingRequestGeneration) return
@@ -278,18 +254,8 @@ export function useChatFeatureToggles(options: UseChatFeatureTogglesOptions) {
         }
         return
       }
-      if (options.rpc.supportsMethod?.('models.routing.get') === false) {
-        await applyLegacyModelRoutingFallback(cfg)
-        return
-      }
       try {
-        const routing = options.readCallOptions
-          ? await options.rpc.call<ModelRoutingSnapshot>(
-              'models.routing.get',
-              undefined,
-              options.readCallOptions,
-            )
-          : await options.rpc.call<ModelRoutingSnapshot>('models.routing.get')
+        const routing = await options.modelRouting.get({ signal: options.readOptions?.signal })
         if (
           requestGeneration === modelRoutingRequestGeneration
           && eventGeneration === modelRoutingEventGeneration
@@ -358,13 +324,8 @@ export function useChatFeatureToggles(options: UseChatFeatureTogglesOptions) {
     const previous = codingModeEnabled.value
     codingModeSettingsBusy.value = true
     try {
-      await options.rpc.waitForConnection()
-      await options.rpc.call('config.patch.safe', {
-        patches: {
-          'skills.coding_mode': nextEnabled,
-        },
-      })
-      const cfg = await options.rpc.call<ChatFeatureConfig>('config.get')
+      await options.appSettings.patchSafe([{ path: 'skills.coding_mode', value: nextEnabled }])
+      const cfg = await options.appSettings.readAll()
       await applyFeatureConfig(cfg)
       return codingModeEnabled.value === nextEnabled
     } catch (err) {
@@ -396,12 +357,9 @@ export function useChatFeatureToggles(options: UseChatFeatureTogglesOptions) {
     routerSettingsBusy.value = true
     llmEnsembleSettingsBusy.value = true
     try {
-      await options.rpc.waitForConnection()
-      await options.rpc.call('models.routing.set', {
-        mode: nextMode === 'off'
-          ? 'direct'
-          : nextMode === 'squilla_router' ? 'router' : 'ensemble',
-      })
+      await options.modelRouting.setRouting(
+        nextMode === 'off' ? 'direct' : nextMode === 'squilla_router' ? 'router' : 'ensemble',
+      )
       await loadFeatureToggles()
     } catch (err) {
       routerEnabled.value = previousRouter
@@ -428,12 +386,10 @@ export function useChatFeatureToggles(options: UseChatFeatureTogglesOptions) {
       if (document.visibilityState === 'visible') schedule()
     }
     const onFocus = () => schedule()
-    const unbindRouting = options.rpc.on?.('models.routing.changed', (payload) => {
+    const unbindRouting = options.modelRouting.subscribeChanged((payload) => {
       modelRoutingEventGeneration += 1
-      if (payload && typeof payload === 'object') {
-        applyModelRoutingSnapshot(payload as ModelRoutingSnapshot)
-        scheduleHistorySync?.()
-      }
+      applyModelRoutingSnapshot(payload)
+      scheduleHistorySync?.()
     })
     document.addEventListener('visibilitychange', onVisibility)
     window.addEventListener('focus', onFocus)
@@ -441,7 +397,7 @@ export function useChatFeatureToggles(options: UseChatFeatureTogglesOptions) {
       if (timer) clearTimeout(timer)
       document.removeEventListener('visibilitychange', onVisibility)
       window.removeEventListener('focus', onFocus)
-      unbindRouting?.()
+      unbindRouting?.close()
     }
   }
 

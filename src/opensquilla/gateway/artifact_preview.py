@@ -22,6 +22,15 @@ from starlette.requests import Request
 from starlette.responses import FileResponse, JSONResponse, Response
 from starlette.routing import Route
 
+from opensquilla.application.artifact_workbench import (
+    CandidatePreviewGrant,
+    PreviewLeaseCreate,
+    PreviewLeaseGrant,
+    PreviewLeaseIdentity,
+    PreviewLeaseRenewal,
+    PreviewMaterialApplication,
+    PreviewMaterialPort,
+)
 from opensquilla.artifacts import (
     ArtifactBundleUnsupportedError,
     ArtifactIntegrityError,
@@ -646,6 +655,129 @@ class ArtifactPreviewLeaseService:
         self._expired_token_hashes[lease.token_hash] = now
 
 
+class GatewayPreviewMaterialPort(PreviewMaterialPort):
+    """Adapt the existing preview lease state machine to domain commands."""
+
+    def __init__(self, service: ArtifactPreviewLeaseService) -> None:
+        self._service = service
+
+    def _grant(self, lease: ArtifactPreviewLease, token: str) -> PreviewLeaseGrant:
+        return PreviewLeaseGrant(
+            lease_id=lease.lease_id,
+            token=token,
+            entrypoint=lease.entrypoint,
+            mode=lease.mode,
+            client=lease.client,
+            source=dict(lease.source),
+            expires_at=self._service.expires_at(lease),
+        )
+
+    async def create_lease(self, command: PreviewLeaseCreate) -> PreviewLeaseGrant:
+        lease, token = await asyncio.to_thread(
+            self._service.create,
+            artifact_id=command.artifact_id,
+            session_id=command.session_id,
+            session_key=command.session_key,
+            mode=command.mode,
+            client=command.client,
+        )
+        return self._grant(lease, token)
+
+    async def renew_lease(self, identity: PreviewLeaseIdentity) -> PreviewLeaseRenewal:
+        lease = self._service.renew(
+            identity.lease_id,
+            session_id=identity.session_id,
+            session_key=identity.session_key,
+        )
+        return PreviewLeaseRenewal(
+            lease_id=lease.lease_id,
+            expires_at=self._service.expires_at(lease),
+        )
+
+    async def revoke_lease(self, identity: PreviewLeaseIdentity) -> None:
+        self._service.revoke(
+            identity.lease_id,
+            session_id=identity.session_id,
+            session_key=identity.session_key,
+        )
+
+    async def resolve_candidate(self, handle: str) -> CandidatePreviewGrant:
+        binding = self._service.resolve_candidate_preview(handle)
+        if self._service.listener_port is None:
+            raise PreviewLeaseError("preview listener is unavailable")
+        lease, token = await asyncio.to_thread(
+            self._service.create,
+            artifact_id=binding.artifact_id,
+            session_id=binding.session_id,
+            session_key=binding.session_key,
+            mode=binding.mode,
+            client="desktop",
+        )
+        previous_lease_id = binding.lease_id
+        attached = self._service.attach_candidate_lease(
+            handle,
+            lease.lease_id,
+            expected_artifact_id=binding.artifact_id,
+            expected_session_id=binding.session_id,
+            expected_session_key=binding.session_key,
+            expected_mode=binding.mode,
+        )
+        if not attached:
+            try:
+                await asyncio.to_thread(
+                    self._service.revoke,
+                    lease.lease_id,
+                    session_id=binding.session_id,
+                    session_key=binding.session_key,
+                )
+            except PreviewLeaseError as exc:
+                log.debug(
+                    "gateway.artifact_preview_candidate_revoke_failed",
+                    lease_id=lease.lease_id,
+                    session_id=binding.session_id,
+                    artifact_id=binding.artifact_id,
+                    candidate_handle=handle,
+                    error=str(exc),
+                )
+            raise PreviewLeaseNotFoundError("candidate preview not found")
+        if previous_lease_id and previous_lease_id != lease.lease_id:
+            try:
+                await asyncio.to_thread(
+                    self._service.revoke,
+                    previous_lease_id,
+                    session_id=binding.session_id,
+                    session_key=binding.session_key,
+                )
+            except PreviewLeaseError as exc:
+                log.debug(
+                    "gateway.artifact_preview_previous_lease_revoke_failed",
+                    lease_id=previous_lease_id,
+                    session_id=binding.session_id,
+                    artifact_id=binding.artifact_id,
+                    candidate_handle=handle,
+                    error=str(exc),
+                )
+        return CandidatePreviewGrant(
+            candidate_handle=handle,
+            candidate_artifact_id=binding.artifact_id,
+            scope_id=binding.session_key,
+            lease=self._grant(lease, token),
+        )
+
+    async def release_candidate(self, handle: str) -> None:
+        binding = self._service.retire_candidate_preview(handle)
+        if binding is not None and binding.lease_id:
+            try:
+                await asyncio.to_thread(
+                    self._service.revoke,
+                    binding.lease_id,
+                    session_id=binding.session_id,
+                    session_key=binding.session_key,
+                )
+            except PreviewLeaseError:
+                pass
+
+
 def create_artifact_preview_resource_app(
     service: ArtifactPreviewLeaseService,
 ) -> Starlette:
@@ -691,6 +823,7 @@ def register_artifact_preview_routes(
     """Register authenticated lease controls and the remote offline transport."""
 
     lease_service = service or ArtifactPreviewLeaseService(config=config)
+    preview_material = PreviewMaterialApplication(GatewayPreviewMaterialPort(lease_service))
 
     async def create_lease(request: Request) -> Response:
         if not request_origin_allowed(request, config):
@@ -742,13 +875,14 @@ def register_artifact_preview_routes(
                 )
         artifact_id = str(request.path_params.get("artifact_id") or "")
         try:
-            lease, token = await asyncio.to_thread(
-                lease_service.create,
-                artifact_id=artifact_id,
-                session_id=session_id,
-                session_key=session_key,
-                mode=effective_mode,
-                client=client,
+            grant = await preview_material.create(
+                PreviewLeaseCreate(
+                    session_key=session_key,
+                    session_id=session_id,
+                    artifact_id=artifact_id,
+                    mode=effective_mode,
+                    client=client,
+                )
             )
         except PreviewLeaseLimitError:
             return _api_error("Preview lease limit reached", "PREVIEW_LEASE_LIMIT", 429)
@@ -765,18 +899,19 @@ def register_artifact_preview_routes(
 
         use_loopback_transport = client == "desktop" or effective_mode == "full"
         if use_loopback_transport:
-            launch_url = lease_service.full_launch_url(token, lease.entrypoint)
-            preview_origin = f"http://p-{token}.localhost:{lease_service.listener_port}"
+            launch_url = lease_service.full_launch_url(grant.token, grant.entrypoint)
+            preview_origin = (
+                f"http://p-{grant.token}.localhost:{lease_service.listener_port}"
+            )
         else:
             encoded_entrypoint = quote(
-                lease.entrypoint.lstrip("/"),
+                grant.entrypoint.lstrip("/"),
                 safe=_URL_PATH_SAFE,
             )
-            launch_url = f"/api/v1/artifact-preview/{token}/{encoded_entrypoint}"
+            launch_url = f"/api/v1/artifact-preview/{grant.token}/{encoded_entrypoint}"
             preview_origin = None
         payload = _lease_payload(
-            lease_service,
-            lease,
+            grant,
             launch_url=launch_url,
             preview_origin=preview_origin,
         )
@@ -795,10 +930,8 @@ def register_artifact_preview_routes(
             return _api_error("Preview lease not found", "NOT_FOUND", 404)
         lease_id = str(request.path_params.get("lease_id") or "")
         try:
-            lease = lease_service.renew(
-                lease_id,
-                session_id=session_id,
-                session_key=session_key,
+            renewal = await preview_material.renew(
+                PreviewLeaseIdentity(session_key, session_id, lease_id)
             )
         except PreviewLeaseExpiredError:
             return _api_error("Preview lease expired", "PREVIEW_LEASE_EXPIRED", 410)
@@ -807,8 +940,8 @@ def register_artifact_preview_routes(
         response = JSONResponse(
             {
                 "version": 1,
-                "lease_id": lease.lease_id,
-                "expires_at": lease_service.expires_at(lease),
+                "lease_id": renewal.lease_id,
+                "expires_at": renewal.expires_at,
             }
         )
         _set_control_no_store(response)
@@ -825,10 +958,8 @@ def register_artifact_preview_routes(
             return _api_error("Preview lease not found", "NOT_FOUND", 404)
         lease_id = str(request.path_params.get("lease_id") or "")
         try:
-            lease_service.revoke(
-                lease_id,
-                session_id=session_id,
-                session_key=session_key,
+            await preview_material.revoke(
+                PreviewLeaseIdentity(session_key, session_id, lease_id)
             )
         except PreviewLeaseExpiredError:
             return _api_error("Preview lease expired", "PREVIEW_LEASE_EXPIRED", 410)
@@ -863,81 +994,22 @@ def register_artifact_preview_routes(
         ):
             return _api_error("Invalid candidate preview request", "INVALID_REQUEST", 400)
         try:
-            binding = lease_service.resolve_candidate_preview(body["candidateHandle"])
-            if lease_service.listener_port is None:
-                raise PreviewLeaseError("preview listener is unavailable")
-            lease, token = await asyncio.to_thread(
-                lease_service.create,
-                artifact_id=binding.artifact_id,
-                session_id=binding.session_id,
-                session_key=binding.session_key,
-                # The bridge supplies only an opaque handle.  The service
-                # derives mode from the matching canonical lease and defaults
-                # to offline; never let a request field or a stale candidate
-                # lease escalate an unproven preview to full mode.
-                mode=binding.mode,
-                client="desktop",
-            )
-            previous_lease_id = binding.lease_id
-            attached = lease_service.attach_candidate_lease(
-                body["candidateHandle"],
-                lease.lease_id,
-                expected_artifact_id=binding.artifact_id,
-                expected_session_id=binding.session_id,
-                expected_session_key=binding.session_key,
-                expected_mode=binding.mode,
-            )
-            if not attached:
-                # The opaque mapping may have been retired while the artifact
-                # was being materialized.  Do not leave the newly-created
-                # lease reachable without a mapping that can later revoke it.
-                try:
-                    await asyncio.to_thread(
-                        lease_service.revoke,
-                        lease.lease_id,
-                        session_id=binding.session_id,
-                        session_key=binding.session_key,
-                    )
-                except PreviewLeaseError as exc:
-                    log.debug(
-                        "gateway.artifact_preview_candidate_revoke_failed",
-                        lease_id=lease.lease_id,
-                        session_id=binding.session_id,
-                        artifact_id=binding.artifact_id,
-                        candidate_handle=body["candidateHandle"],
-                        error=str(exc),
-                    )
-                raise PreviewLeaseNotFoundError("candidate preview not found")
-            if previous_lease_id and previous_lease_id != lease.lease_id:
-                try:
-                    await asyncio.to_thread(
-                        lease_service.revoke,
-                        previous_lease_id,
-                        session_id=binding.session_id,
-                        session_key=binding.session_key,
-                    )
-                except PreviewLeaseError as exc:
-                    log.debug(
-                        "gateway.artifact_preview_previous_lease_revoke_failed",
-                        lease_id=previous_lease_id,
-                        session_id=binding.session_id,
-                        artifact_id=binding.artifact_id,
-                        candidate_handle=body["candidateHandle"],
-                        error=str(exc),
-                    )
-            launch_url = lease_service.full_launch_url(token, lease.entrypoint)
+            candidate = await preview_material.resolve_candidate(body["candidateHandle"])
+            grant = candidate.lease
+            launch_url = lease_service.full_launch_url(grant.token, grant.entrypoint)
             payload = _lease_payload(
-                lease_service,
-                lease,
+                grant,
                 launch_url=launch_url,
-                preview_origin=f"http://p-{token}.localhost:{lease_service.listener_port}",
+                preview_origin=(
+                    f"http://p-{grant.token}.localhost:{lease_service.listener_port}"
+                ),
             )
             payload.update(
                 {
-                    "candidate_handle": body["candidateHandle"],
-                    "candidate_artifact_id": binding.artifact_id,
-                    "scope_id": binding.session_key,
-                    "lease_id": lease.lease_id,
+                    "candidate_handle": candidate.candidate_handle,
+                    "candidate_artifact_id": candidate.candidate_artifact_id,
+                    "scope_id": candidate.scope_id,
+                    "lease_id": grant.lease_id,
                 }
             )
         except PreviewLeaseLimitError:
@@ -960,19 +1032,7 @@ def register_artifact_preview_routes(
         handle = str(request.path_params.get("candidate_handle") or "")
         if _CANDIDATE_HANDLE_RE.fullmatch(handle) is None:
             return _api_error("Invalid candidate preview handle", "INVALID_REQUEST", 400)
-        binding = lease_service.retire_candidate_preview(handle)
-        if binding is not None and binding.lease_id:
-            try:
-                await asyncio.to_thread(
-                    lease_service.revoke,
-                    binding.lease_id,
-                    session_id=binding.session_id,
-                    session_key=binding.session_key,
-                )
-            except PreviewLeaseError:
-                # The lease is already expired/revoked; the mapping removal is
-                # the authoritative cleanup boundary.
-                pass
+        await preview_material.release_candidate(handle)
         response = Response(status_code=204)
         _set_control_no_store(response)
         return response
@@ -1249,22 +1309,21 @@ def _force_offline() -> bool:
 
 
 def _lease_payload(
-    service: ArtifactPreviewLeaseService,
-    lease: ArtifactPreviewLease,
+    grant: PreviewLeaseGrant,
     *,
     launch_url: str,
     preview_origin: str | None,
 ) -> dict[str, Any]:
     return {
         "version": 1,
-        "lease_id": lease.lease_id,
-        "effective_mode": lease.mode,
+        "lease_id": grant.lease_id,
+        "effective_mode": grant.mode,
         "launch_url": launch_url,
         "preview_origin": preview_origin,
-        "entrypoint": lease.entrypoint,
-        "expires_at": service.expires_at(lease),
+        "entrypoint": grant.entrypoint,
+        "expires_at": grant.expires_at,
         "idle_timeout_seconds": PREVIEW_LEASE_IDLE_SECONDS,
-        "source": lease.source,
+        "source": grant.source,
     }
 
 

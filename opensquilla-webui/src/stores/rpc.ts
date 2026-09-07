@@ -108,10 +108,10 @@ export const useRpcStore = defineStore('rpc', () => {
   })
   const canManageProjectWorkspaces = computed(() =>
     isLocalOwner.value
-    && supportsMethod('workspaces.list'))
+    && hasRpcMethod('workspaces.list'))
   const canChooseProject = computed(() =>
     canManageProjectWorkspaces.value
-    && supportsMethod('workspaces.open'))
+    && hasRpcMethod('workspaces.open'))
 
   function clearConnectionIdentity(): void {
     policy.value = null
@@ -251,15 +251,15 @@ export const useRpcStore = defineStore('rpc', () => {
     clearConnectionIdentity()
   }
 
-  function supportsMethod(method: string): boolean {
+  function hasRpcMethod(method: string): boolean {
     return methods.value.includes(method) && !unavailableMethods.value.has(method)
   }
 
-  function supportsEvent(event: string): boolean {
+  function hasRpcEvent(event: string): boolean {
     return events.value.includes(event)
   }
 
-  function markMethodUnavailable(method: string): void {
+  function rememberUnsupportedMethod(method: string): void {
     if (!method) return
     unavailableMethods.value = new Set([...unavailableMethods.value, method])
   }
@@ -288,13 +288,13 @@ export const useRpcStore = defineStore('rpc', () => {
     return client.value.on(event, handler)
   }
 
-  function waitForConnection(
+  function ready(
     timeoutMs?: number,
     signal?: AbortSignal,
     actions?: RpcConnectionWaitOptions,
   ): Promise<void> {
     if (!client.value) return Promise.reject(new Error('RPC client not initialized'))
-    return client.value.waitForConnection(timeoutMs, signal, actions)
+    return client.value.ready(timeoutMs, signal, actions)
   }
 
   function recoverConnectionGeneration(
@@ -322,12 +322,12 @@ export const useRpcStore = defineStore('rpc', () => {
     connect,
     applyLinkTokenFromUrl,
     disconnect,
-    supportsMethod,
-    supportsEvent,
-    markMethodUnavailable,
+    hasRpcMethod,
+    hasRpcEvent,
+    rememberUnsupportedMethod,
     call,
     on,
-    waitForConnection,
+    ready,
     recoverConnectionGeneration,
   }
 })

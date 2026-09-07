@@ -1,0 +1,44 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://opensquilla.dev/contracts/gateway/v4/conversation/sessions-abort.schema.json",
+  "title": "OpenSquilla sessions.abort Contract",
+  "description": "Language-neutral Contract for session- and exact-task cancellation.",
+  "type": "object", "additionalProperties": false,
+  "properties": { "request": { "$ref": "#/$defs/SessionsAbortRequestFrame" }, "response": { "$ref": "#/$defs/SessionsAbortResponseFrame" } },
+  "x-opensquilla-wire": { "protocol": "opensquilla-websocket-json", "version": 4, "compatibility": "exact-json-tree" },
+  "x-opensquilla-codegen": {
+    "python": { "tool": "datamodel-code-generator", "version": "0.75.1", "target": "pydantic_v2.BaseModel" },
+    "typescript": { "tool": "json-schema-to-typescript", "version": "15.0.4" },
+    "runtimeValidation": { "tool": "ajv", "version": "8.17.1", "mode": "standalone-adapter-only" }
+  },
+  "x-opensquilla-method": {
+    "name": "sessions.abort", "kind": "command", "scope": "operator.write", "guestAllowed": false,
+    "idempotency": "idempotent", "timeout": { "policy": "caller" },
+    "capability": { "kind": "method-availability", "name": "sessions.abort" },
+    "request": "#/$defs/SessionsAbortRequestFrame", "params": "#/$defs/SessionsAbortParams",
+    "response": "#/$defs/SessionsAbortResponseFrame", "result": "#/$defs/SessionsAbortResult",
+    "errors": [
+      { "code": "INVALID_REQUEST" }, { "code": "UNAUTHORIZED" }, { "code": "NOT_FOUND" },
+      { "code": "UNAVAILABLE", "retryable": true },
+      { "code": "STORAGE_BUSY", "retryable": true, "retryAfterMs": true, "details": true },
+      { "code": "CANCEL_TIMEOUT", "retryable": true }, { "code": "INTERNAL_ERROR" }
+    ]
+  },
+  "$defs": {
+    "SessionsAbortParams": {
+      "type": "object", "additionalProperties": true,
+      "properties": {
+        "key": { "type": ["string", "null"] }, "sessionKey": { "type": ["string", "null"] }, "session_key": { "type": ["string", "null"] },
+        "task_id": { "type": ["string", "null"] }, "taskId": { "type": ["string", "null"] },
+        "scope": { "type": ["string", "null"] }, "source": { "type": ["string", "null"] }
+      }
+    },
+    "SessionsAbortLegacyNonObjectParams": { "anyOf": [{ "type": "array", "items": {} }, { "type": "string" }, { "type": "number" }, { "type": "boolean" }] },
+    "SessionsAbortRequestFrame": { "type": "object", "additionalProperties": false, "required": ["type", "id", "method"], "properties": { "type": { "const": "req" }, "id": { "type": "string" }, "method": { "const": "sessions.abort" }, "params": { "anyOf": [{ "$ref": "#/$defs/SessionsAbortParams" }, { "$ref": "#/$defs/SessionsAbortLegacyNonObjectParams" }, { "type": "null" }] } } },
+    "SessionsAbortResult": { "type": "object", "additionalProperties": true },
+    "RpcError": { "type": "object", "additionalProperties": true, "required": ["code", "message"], "properties": { "code": { "type": "string" }, "message": { "type": "string" }, "details": {}, "retryable": { "type": ["boolean", "null"] }, "retry_after_ms": { "type": ["integer", "null"], "minimum": 0 }, "accepted": { "type": ["boolean", "null"] } } },
+    "SessionsAbortOkResponseFrame": { "type": "object", "additionalProperties": false, "required": ["type", "id", "ok", "payload"], "properties": { "type": { "const": "res" }, "id": { "type": "string" }, "ok": { "const": true }, "payload": { "$ref": "#/$defs/SessionsAbortResult" }, "error": { "type": "null" } } },
+    "SessionsAbortErrorResponseFrame": { "type": "object", "additionalProperties": false, "required": ["type", "id", "ok", "error"], "properties": { "type": { "const": "res" }, "id": { "type": "string" }, "ok": { "const": false }, "payload": { "type": "null" }, "error": { "$ref": "#/$defs/RpcError" } } },
+    "SessionsAbortResponseFrame": { "oneOf": [{ "$ref": "#/$defs/SessionsAbortOkResponseFrame" }, { "$ref": "#/$defs/SessionsAbortErrorResponseFrame" }] }
+  }
+}

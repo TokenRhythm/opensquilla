@@ -1,10 +1,12 @@
 import { describe, expect, it, vi } from 'vitest'
 
-import type { ArtifactPayload } from '@/types/rpc'
+import type { ArtifactPayload } from '@/types/artifacts'
 import {
   ARTIFACT_DOCUMENT_RPC_METHODS,
-  createLegacyArtifactWorkspace,
   createRpcArtifactDocumentProvider,
+} from '@/adapters/gateway/artifactDocumentsV4'
+import {
+  createLegacyArtifactWorkspace,
   isOfficeArtifact,
   normalizeArtifactChangeSet,
   normalizeArtifactDocument,
@@ -289,8 +291,8 @@ describe('artifact document provider', () => {
     })
     const provider = createRpcArtifactDocumentProvider({
       call: call as unknown as GenericRpcCall,
-      supportsMethod: method => supported.has(method),
-      markMethodUnavailable: vi.fn(),
+      hasRpcMethod: method => supported.has(method),
+      rememberUnsupportedMethod: vi.fn(),
     })
 
     const workspace = await provider.loadWorkspace({
@@ -366,8 +368,8 @@ describe('artifact document provider', () => {
     })
     const provider = createRpcArtifactDocumentProvider({
       call: call as unknown as GenericRpcCall,
-      supportsMethod: method => supported.has(method),
-      markMethodUnavailable: vi.fn(),
+      hasRpcMethod: method => supported.has(method),
+      rememberUnsupportedMethod: vi.fn(),
     })
 
     const artifact = {
@@ -422,8 +424,8 @@ describe('artifact document provider', () => {
     })
     const provider = createRpcArtifactDocumentProvider({
       call: call as unknown as GenericRpcCall,
-      supportsMethod: () => true,
-      markMethodUnavailable: vi.fn(),
+      hasRpcMethod: () => true,
+      rememberUnsupportedMethod: vi.fn(),
     })
 
     const source = await provider.readSource({
@@ -472,8 +474,8 @@ describe('artifact document provider', () => {
     })
     const provider = createRpcArtifactDocumentProvider({
       call: call as unknown as GenericRpcCall,
-      supportsMethod: () => true,
-      markMethodUnavailable: vi.fn(),
+      hasRpcMethod: () => true,
+      rememberUnsupportedMethod: vi.fn(),
     })
 
     await expect(provider.resolveMutation?.({
@@ -548,8 +550,8 @@ describe('artifact document provider', () => {
     })
     const provider = createRpcArtifactDocumentProvider({
       call: call as unknown as GenericRpcCall,
-      supportsMethod: () => true,
-      markMethodUnavailable: vi.fn(),
+      hasRpcMethod: () => true,
+      rememberUnsupportedMethod: vi.fn(),
     })
 
     const started = await provider.startEditSession?.({
@@ -571,6 +573,11 @@ describe('artifact document provider', () => {
     const saved = await provider.patchSource({
       sessionKey: 'session-a',
       documentId: 'doc-html',
+      expectedHeadRevisionId: 'rev-1',
+      expectedSourceSha256: 'a'.repeat(64),
+      expectedStateRevision: 1,
+      offsetEncoding: 'unicode-code-point',
+      patches: [{ startOffset: 0, endOffset: 0, replacement: '<main />' }],
       editSessionId: heartbeat!.editSessionId,
       expectedEditSessionStateRevision: heartbeat!.stateRevision,
       expectedLastSavedRevisionId: heartbeat!.lastSavedRevisionId,
@@ -596,20 +603,20 @@ describe('artifact document provider', () => {
       mode: 'edit',
     })?.editSessionId).toBe('camel-id')
 
-    const markMethodUnavailable = vi.fn()
+    const rememberUnsupportedMethod = vi.fn()
     const legacy = createRpcArtifactDocumentProvider({
       call: vi.fn().mockRejectedValue(Object.assign(new Error('Method not found'), {
         code: 'METHOD_NOT_FOUND',
       })),
-      supportsMethod: () => true,
-      markMethodUnavailable,
+      hasRpcMethod: () => true,
+      rememberUnsupportedMethod,
     })
     await expect(legacy.startEditSession?.({
       sessionKey: 'session-a',
       documentId: 'doc-html',
       mode: 'edit',
     })).resolves.toBeNull()
-    expect(markMethodUnavailable).toHaveBeenCalledWith(
+    expect(rememberUnsupportedMethod).toHaveBeenCalledWith(
       ARTIFACT_DOCUMENT_RPC_METHODS.editSessionStart,
     )
   })
@@ -629,8 +636,8 @@ describe('artifact document provider', () => {
     })
     const provider = createRpcArtifactDocumentProvider({
       call: call as unknown as GenericRpcCall,
-      supportsMethod: method => method === ARTIFACT_DOCUMENT_RPC_METHODS.legacyGet,
-      markMethodUnavailable: vi.fn(),
+      hasRpcMethod: method => method === ARTIFACT_DOCUMENT_RPC_METHODS.legacyGet,
+      rememberUnsupportedMethod: vi.fn(),
     })
 
     const workspace = await provider.loadWorkspace(officeArtifact, 'session-a')
@@ -716,8 +723,8 @@ describe('artifact document provider', () => {
     })
     const provider = createRpcArtifactDocumentProvider({
       call: call as unknown as GenericRpcCall,
-      supportsMethod: method => supported.has(method),
-      markMethodUnavailable: vi.fn(),
+      hasRpcMethod: method => supported.has(method),
+      rememberUnsupportedMethod: vi.fn(),
     })
 
     const workspace = await provider.loadWorkspace(officeArtifact, 'session-a')
@@ -772,8 +779,8 @@ describe('artifact document provider', () => {
     })
     const provider = createRpcArtifactDocumentProvider({
       call: call as unknown as GenericRpcCall,
-      supportsMethod: method => supported.has(method),
-      markMethodUnavailable: vi.fn(),
+      hasRpcMethod: method => supported.has(method),
+      rememberUnsupportedMethod: vi.fn(),
     })
 
     await expect(provider.loadWorkspace({
@@ -811,8 +818,8 @@ describe('artifact document provider', () => {
     })
     const provider = createRpcArtifactDocumentProvider({
       call: call as unknown as GenericRpcCall,
-      supportsMethod: () => true,
-      markMethodUnavailable: vi.fn(),
+      hasRpcMethod: () => true,
+      rememberUnsupportedMethod: vi.fn(),
     })
 
     const workspace = await provider.loadWorkspace({
@@ -837,5 +844,14 @@ describe('artifact document provider', () => {
     expect(workspace.revisions).toHaveLength(1)
     expect(workspace.changeSets).toEqual([])
     expect(workspace.document.capabilities.reason).toBe('office-editor-unavailable')
+  })
+
+  it('rejects non-object results before legacy projection', async () => {
+    const provider = createRpcArtifactDocumentProvider({
+      call: vi.fn().mockResolvedValue(7) as unknown as GenericRpcCall,
+      hasRpcMethod: () => true,
+    })
+
+    await expect(provider.getCapabilities()).rejects.toThrow('invalid response')
   })
 })

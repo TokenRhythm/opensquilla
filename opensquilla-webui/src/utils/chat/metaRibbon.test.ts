@@ -14,25 +14,25 @@ import {
 describe('metaRibbon completed progress', () => {
   it('shows a completed run as total of total even when optional steps never emitted terminal states', () => {
     const ribbon = createRibbon({
-      run_id: 'run-1',
-      meta_skill_name: 'meta-kid-project-planner',
+      runId: 'run-1',
+      metaSkillName: 'meta-kid-project-planner',
       language: 'en',
       total: 4,
       steps: [
-        { id: 'a', label: 'A', kind: 'llm_chat', depends_on: [] },
-        { id: 'b', label: 'B', kind: 'llm_chat', depends_on: [] },
-        { id: 'optional_c', label: 'Optional C', kind: 'llm_chat', depends_on: [] },
-        { id: 'optional_d', label: 'Optional D', kind: 'llm_chat', depends_on: [] },
+        { id: 'a', label: 'A', kind: 'llm_chat', dependsOn: [] },
+        { id: 'b', label: 'B', kind: 'llm_chat', dependsOn: [] },
+        { id: 'optional_c', label: 'Optional C', kind: 'llm_chat', dependsOn: [] },
+        { id: 'optional_d', label: 'Optional D', kind: 'llm_chat', dependsOn: [] },
       ],
     })
 
     completeRun(ribbon, {
-      run_id: 'run-1',
+      runId: 'run-1',
       outcome: 'ok',
-      completed_steps: ['a', 'b'],
-      failed_steps: [],
-      recovered_steps: [],
-      skipped_steps: [],
+      completedSteps: ['a', 'b'],
+      failedSteps: [],
+      recoveredSteps: [],
+      skippedSteps: [],
     })
 
     expect(progressPercent(ribbon)).toBe(100)
@@ -43,15 +43,15 @@ describe('metaRibbon completed progress', () => {
 describe('metaRibbon rescue actions', () => {
   it('suppresses the duplicate partial-context choice without removing backend compatibility', () => {
     const ribbon = createRibbon({
-      run_id: 'run-1',
-      meta_skill_name: 'meta-paper-write',
+      runId: 'run-1',
+      metaSkillName: 'meta-paper-write',
       language: 'en',
       total: 1,
-      steps: [{ id: 'compile', label: 'Compile', kind: 'skill_exec', depends_on: [] }],
+      steps: [{ id: 'compile', label: 'Compile', kind: 'skill_exec', dependsOn: [] }],
     })
     updateStep(ribbon, {
-      run_id: 'run-1',
-      step_id: 'compile',
+      runId: 'run-1',
+      stepId: 'compile',
       state: 'failed',
       error: 'Compilation failed',
       rescue: {
@@ -64,12 +64,12 @@ describe('metaRibbon rescue actions', () => {
       },
     })
     completeRun(ribbon, {
-      run_id: 'run-1',
+      runId: 'run-1',
       outcome: 'failed',
-      completed_steps: [],
-      failed_steps: ['compile'],
-      recovered_steps: [],
-      skipped_steps: [],
+      completedSteps: [],
+      failedSteps: ['compile'],
+      recoveredSteps: [],
+      skippedSteps: [],
     })
 
     expect(RESCUE_ACTION_IDS.has('retry-with-partial-context')).toBe(true)
