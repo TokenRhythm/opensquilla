@@ -1,6 +1,5 @@
 import { setTimeout as delay } from 'node:timers/promises'
 import { closeElectronWithDeadline } from './e2e-shutdown-helpers.mjs'
-import { captureWindowsProcessStart } from './windows-wait-chain-diagnostics.mjs'
 
 // Preserve the production Gateway's shutdown request, 80s exit observation,
 // and 6s + 5s hard-kill backstops without changing any interaction budget.
@@ -23,9 +22,7 @@ export async function captureFirstSendDiagnostic(operation, timeoutMs = 3_000) {
   }
 }
 
-export async function captureElectronProcessIdentity(app, timeoutMs = 3_000, {
-  captureWindowsStartTime = false,
-} = {}) {
+export async function captureElectronProcessIdentity(app, timeoutMs = 3_000) {
   // Playwright 1.60 launches cmd.exe on Windows. Its process() is the wrapper;
   // capture the actual Electron PID while the main-process protocol is live.
   const wrapperPid = app.process()?.pid ?? null
@@ -37,11 +34,6 @@ export async function captureElectronProcessIdentity(app, timeoutMs = 3_000, {
     wrapperPid,
     electronPid: Number.isSafeInteger(result) && result > 0 ? result : null,
     ...(result?.diagnosticError ? { diagnosticError: result.diagnosticError } : {}),
-  }
-  if (captureWindowsStartTime && process.platform === 'win32' && identity.electronPid) {
-    const windowsIdentity = await captureWindowsProcessStart(identity.electronPid)
-    if (windowsIdentity.status === 'complete') identity.windowsStartTimeTicks = windowsIdentity.startTicks
-    else identity.windowsIdentityDiagnostic = windowsIdentity.status
   }
   return identity
 }
@@ -64,184 +56,7 @@ export function electronProcessSnapshot(identity) {
   return snapshot
 }
 
-export async function installQuitDiagnosticProbe(app, diagnosticFile, { extended = false } = {}) {
-  await app.evaluate(({ app, BrowserWindow, webContents, dialog }, { file, extended }) => {
-    const fs = process.getBuiltinModule('fs')
-    const log = (event, detail = {}) => {
-      try {
-        fs.appendFileSync(file, JSON.stringify({
-          event, at: new Date().toISOString(), pid: process.pid, ...detail,
-        }) + '\n')
-      } catch (error) {
-        // Extended observations must not create a new uncaught exception or
-        // modal dialog. Keep the standard probe unchanged as a control.
-        if (!extended) throw error
-      }
-    }
-    if (extended) {
-      // The first-send caller admits only a new, isolated synthetic profile
-      // and scrubs provider secrets before launch. Never install these hooks
-      // for the standard gate or inspect environment/credential contents.
-      const boundedText = (value, limit) => typeof value === 'string'
-        ? value.slice(0, limit)
-          .replace(/\bBearer\s+[^\s"']+/gi, 'Bearer [redacted]')
-          .replace(/\b((?:api[_-]?key|access[_-]?token|token|password|secret)["']?\s*[:=]\s*["']?)[^\s,;"']+/gi, '$1[redacted]')
-          .slice(0, limit)
-        : '[non-string]'
-      let evidenceCount = 0
-      let recordingEvidence = false
-      const recordErrorEvidence = (event, details) => {
-        if (recordingEvidence || evidenceCount >= 4) return
-        recordingEvidence = true
-        evidenceCount++
-        try {
-          log(event, details())
-        } catch {
-          // Property access, formatting and writes are best-effort only.
-        } finally {
-          recordingEvidence = false
-        }
-      }
-      const originalShowErrorBox = dialog.showErrorBox
-      dialog.showErrorBox = function (...args) {
-        recordErrorEvidence('dialog-show-error-box', () => ({
-          title: boundedText(args[0], 256),
-          content: boundedText(args[1], 4_096),
-          callStack: boundedText(new Error('showErrorBox called').stack, 4_096),
-        }))
-        // Even failed diagnostics must call the original method exactly as
-        // requested; its blocking behavior, return value and error survive.
-        return Reflect.apply(originalShowErrorBox, this, args)
-      }
-      process.on('uncaughtExceptionMonitor', (error, origin) => {
-        recordErrorEvidence('uncaught-exception-monitor', () => ({
-          origin: origin === 'uncaughtException' || origin === 'unhandledRejection' ? origin : 'unknown',
-          name: boundedText(error?.name, 128),
-          message: boundedText(error?.message, 1_024),
-          stack: boundedText(error?.stack, 4_096),
-        }))
-      })
-    }
-    const resourceSnapshot = () => {
-      try {
-        const resourceTypes = {}
-        for (const type of process.getActiveResourcesInfo()) {
-          resourceTypes[type] = (resourceTypes[type] || 0) + 1
-        }
-        const detail = {
-          resourceTypes,
-          windowCount: BrowserWindow.getAllWindows().length,
-          webContentsCount: webContents.getAllWebContents().length,
-        }
-        if (extended) {
-          const activeRequestTypes = {}
-          for (const request of process._getActiveRequests?.() || []) {
-            const type = request?.constructor?.name || 'Unknown'
-            activeRequestTypes[type] = (activeRequestTypes[type] || 0) + 1
-          }
-          const streamState = stream => ({
-            destroyed: stream.destroyed,
-            writableEnded: stream.writableEnded,
-            writableFinished: stream.writableFinished,
-            writableLength: stream.writableLength,
-          })
-          detail.activeRequestTypes = activeRequestTypes
-          detail.webContents = webContents.getAllWebContents().map(contents => {
-            const metadata = { id: contents.id }
-            try {
-              return {
-                ...metadata,
-                type: contents.getType(),
-                destroyed: contents.isDestroyed(),
-                osProcessId: contents.getOSProcessId(),
-                electronDebuggerAttached: contents.debugger.isAttached(),
-              }
-            } catch (error) {
-              return { ...metadata, diagnosticError: String(error?.message || error).slice(0, 500) }
-            }
-          })
-          const childStreamState = stream => stream ? {
-            destroyed: stream.destroyed,
-            readableEnded: stream.readableEnded,
-            writableFinished: stream.writableFinished,
-          } : null
-          detail.activeChildProcesses = (process._getActiveHandles?.() || [])
-            .filter(handle => handle?.constructor?.name === 'ChildProcess')
-            .map(child => ({
-              pid: child.pid,
-              exitCode: child.exitCode,
-              signalCode: child.signalCode,
-              connected: child.connected,
-              stdin: childStreamState(child.stdin),
-              stdout: childStreamState(child.stdout),
-              stderr: childStreamState(child.stderr),
-            }))
-          detail.stdio = {
-            stdout: streamState(process.stdout),
-            stderr: streamState(process.stderr),
-          }
-        }
-        return detail
-      } catch (error) {
-        return { resourceDiagnosticError: String(error?.message || error).slice(0, 500) }
-      }
-    }
-    const originalExit = app.exit
-    app.exit = function (...args) {
-      log('app-exit-entered', resourceSnapshot())
-      try {
-        const result = originalExit.apply(this, args)
-        log('app-exit-returned', resourceSnapshot())
-        if (extended) {
-          // Observe whether the main event loop runs again without keeping it
-          // alive or changing the application's requested exit behavior.
-          setImmediate(() => log('app-exit-next-turn', resourceSnapshot())).unref()
-          for (const delayMs of [100, 1_000]) {
-            setTimeout(() => log('app-exit-after-delay', {
-              delayMs, ...resourceSnapshot(),
-            }), delayMs).unref()
-          }
-        }
-        return result
-      } catch (error) {
-        log('app-exit-threw', { error: String(error?.message || error).slice(0, 500) })
-        throw error
-      }
-    }
-    app.once('quit', (_event, exitCode) => log('quit', { exitCode }))
-    if (extended) {
-      app.once('will-quit', () => log('will-quit', resourceSnapshot()))
-      process.once('beforeExit', exitCode => log('process-before-exit', { exitCode, ...resourceSnapshot() }))
-      process.once('exit', exitCode => log('process-exit', { exitCode, ...resourceSnapshot() }))
-      for (const contents of webContents.getAllWebContents()) {
-        const webContentsId = contents.id
-        contents.once('destroyed', () => log('web-contents-destroyed', { webContentsId }))
-      }
-    }
-    for (const window of BrowserWindow.getAllWindows()) {
-      const windowId = window.id
-      window.once('closed', () => log('window-closed', { windowId }))
-    }
-    log('probe-installed', resourceSnapshot())
-  }, { file: diagnosticFile, extended })
-}
-
-export async function quitElectronOnNextTurn(app, identity, timeoutMs) {
-  if (!identity?.electronPid || !identity?.wrapperPid) {
-    throw new Error('Deferred quit diagnostic requires both observed process identities')
-  }
-  const child = app.process()
-  // Keep the debugger connection alive during the production asynchronous
-  // drain. Playwright's normal close() disconnects it immediately after quit().
-  await app.evaluate(({ app }) => { setImmediate(() => app.quit()) })
-  await observeNaturalElectronExit(child, identity, timeoutMs)
-}
-
-export async function closeElectronAfterRemovingRoutes(app, identity, timeoutMs) {
-  return closeElectronAndObserveExit(app, identity, timeoutMs, true)
-}
-
-export async function closeElectronAndObserveExit(app, identity, timeoutMs, removeRoutes = false) {
+export async function closeElectronAndObserveExit(app, identity, timeoutMs) {
   if (!identity?.electronPid || !identity?.wrapperPid) {
     throw new Error('Electron shutdown requires both observed process identities')
   }
@@ -249,7 +64,6 @@ export async function closeElectronAndObserveExit(app, identity, timeoutMs, remo
   // Playwright disposes its ElectronApplication dispatcher after close(), so
   // retain the child handle before asking it to close.
   const child = app.process()
-  if (removeRoutes) await app.context().unrouteAll({ behavior: 'wait' })
   await app.close()
   await observeNaturalElectronExit(child, identity, Math.max(0, deadline - Date.now()))
 }
@@ -273,8 +87,6 @@ export async function cleanupPackagedFirstSend({
   app,
   provider,
   diagnostics,
-  deferQuit = false,
-  unrouteBeforeQuit = false,
   processIdentity,
   emit = line => console.error(line),
   onPhase = () => {},
@@ -290,11 +102,7 @@ export async function cleanupPackagedFirstSend({
       const result = await closeElectronWithDeadline({
         app: {
           process: () => child,
-          close: () => unrouteBeforeQuit
-            ? closeElectronAfterRemovingRoutes(app, processIdentity, electronTimeoutMs)
-            : deferQuit
-              ? quitElectronOnNextTurn(app, processIdentity, electronTimeoutMs)
-              : closeElectronAndObserveExit(app, processIdentity, electronTimeoutMs),
+          close: () => closeElectronAndObserveExit(app, processIdentity, electronTimeoutMs),
         },
         phase: 'packaged-first-send',
         diagnostics,

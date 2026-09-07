@@ -1,14 +1,9 @@
 import assert from 'node:assert/strict'
 import { spawn } from 'node:child_process'
-import { EventEmitter, once } from 'node:events'
+import { once } from 'node:events'
 import { createServer } from 'node:http'
 import { createConnection } from 'node:net'
 import { setTimeout as delay } from 'node:timers/promises'
-import { appendFileSync } from 'node:fs'
-import { mkdtemp, readFile, rmdir, unlink, writeFile } from 'node:fs/promises'
-import { tmpdir } from 'node:os'
-import { join } from 'node:path'
-import { runInNewContext } from 'node:vm'
 
 import {
   closeHttpServerWithDeadline,
@@ -19,12 +14,8 @@ import {
   captureFirstSendDiagnostic,
   cleanupPackagedFirstSend,
   closeElectronAndObserveExit,
-  closeElectronAfterRemovingRoutes,
   electronProcessSnapshot,
-  installQuitDiagnosticProbe,
-  quitElectronOnNextTurn,
 } from './packaged-first-send-cleanup.mjs'
-import { captureWindowsProcessStart, captureWindowsWaitChain } from './windows-wait-chain-diagnostics.mjs'
 
 const fixtureProcesses = []
 const fixtureServers = []
@@ -86,230 +77,12 @@ async function assertProcessExited(pid) {
   assert.fail(`Synthetic child ${pid} was not reaped`)
 }
 
-async function testExtendedErrorProbe() {
-  const directory = await mkdtemp(join(tmpdir(), 'opensquilla-quit-error-probe-'))
-  const paths = ['standard', 'extended', 'write-failure', 'fatal'].map(name => join(directory, `${name}.jsonl`))
-  const records = async path => (await readFile(path, 'utf8')).trim().split('\n').map(line => JSON.parse(line))
-  async function fixture(file, { extended = false, append = appendFileSync, original } = {}) {
-    const observedProcess = new EventEmitter()
-    Object.assign(observedProcess, {
-      pid: process.pid,
-      getBuiltinModule: name => {
-        assert.equal(name, 'fs')
-        return { appendFileSync: append }
-      },
-      getActiveResourcesInfo: () => [],
-      stdout: {}, stderr: {},
-    })
-    const electronApp = new EventEmitter()
-    electronApp.exit = () => 'original-exit-result'
-    const calls = []
-    const originalShowErrorBox = original || function (...args) {
-      calls.push({ receiver: this, args })
-      return 'original-dialog-result'
-    }
-    const dialog = { showErrorBox: originalShowErrorBox }
-    const electron = { app: electronApp, dialog,
-      BrowserWindow: { getAllWindows: () => [] }, webContents: { getAllWebContents: () => [] } }
-    await installQuitDiagnosticProbe({
-      evaluate: async (callback, options) => runInNewContext(`(${callback.toString()})(electron, options)`, {
-        electron, options, process: observedProcess,
-        setImmediate: () => ({ unref() {} }), setTimeout: () => ({ unref() {} }),
-      }),
-    }, file, { extended })
-    return { observedProcess, electronApp, dialog, originalShowErrorBox, calls }
-  }
-  try {
-    const standard = await fixture(paths[0])
-    assert.equal(standard.dialog.showErrorBox, standard.originalShowErrorBox)
-    assert.equal(standard.observedProcess.listenerCount('uncaughtExceptionMonitor'), 0)
-    assert.equal(standard.dialog.showErrorBox('standard title', 'standard content'), 'original-dialog-result')
-    assert.equal((await records(paths[0])).some(record => record.event === 'dialog-show-error-box'), false)
-
-    const extended = await fixture(paths[1], { extended: true })
-    assert.equal(extended.observedProcess.listenerCount('uncaughtException'), 0,
-      'an uncaughtException listener would suppress Electron default error handling')
-    const receiver = { syntheticReceiver: true }
-    const title = 'synthetic-title-'.repeat(100)
-    const content = 'Bearer synthetic-bearer-token token=synthetic-token "apiKey":"synthetic-api-key"\n' + 'x'.repeat(10_000)
-    assert.equal(extended.dialog.showErrorBox.call(receiver, title, content, 42), 'original-dialog-result')
-    assert.equal(extended.calls[0].receiver, receiver)
-    assert.deepEqual(extended.calls[0].args, [title, content, 42], 'redaction must never change original arguments')
-    const observedError = new Error('synthetic observed exception')
-    observedError.stack = 'synthetic-stack\n' + 's'.repeat(10_000)
-    extended.observedProcess.emit('uncaughtExceptionMonitor', observedError, 'uncaughtException')
-    for (let index = 0; index < 10; index++) extended.dialog.showErrorBox('bounded count', 'synthetic')
-    const errorRecords = (await records(paths[1])).filter(record => /dialog-show|uncaught-exception/.test(record.event))
-    assert.equal(errorRecords.length, 4, 'error evidence must stop after its shared bounded record budget')
-    assert.equal(extended.calls.length, 11, 'exhausted diagnostics must still invoke every original dialog')
-    const dialogRecord = errorRecords[0]
-    assert.equal(dialogRecord.title.length, 256)
-    assert.ok(dialogRecord.content.length <= 4_096 && dialogRecord.callStack.length <= 4_096)
-    assert.match(dialogRecord.callStack, /showErrorBox called/)
-    for (const canary of ['synthetic-bearer-token', 'synthetic-token', 'synthetic-api-key']) {
-      assert.equal(dialogRecord.content.includes(canary), false)
-    }
-    const monitorRecord = errorRecords.find(record => record.event === 'uncaught-exception-monitor')
-    assert.equal(monitorRecord.message, observedError.message)
-    assert.equal(monitorRecord.stack.length, 4_096)
-    assert.equal(monitorRecord.origin, 'uncaughtException')
-
-    let failingProbe
-    let failWrites = false
-    let writeAttempts = 0
-    let originalCalls = 0
-    const originalError = new Error('synthetic original dialog failure')
-    failingProbe = await fixture(paths[2], {
-      extended: true,
-      original: () => { originalCalls++; throw originalError },
-      append: (...args) => {
-        if (!failWrites) return appendFileSync(...args)
-        writeAttempts++
-        failingProbe.observedProcess.emit('uncaughtExceptionMonitor', new Error('synthetic recursive log failure'), 'uncaughtException')
-        throw new Error('synthetic write rejected')
-      },
-    })
-    failWrites = true
-    assert.throws(() => failingProbe.dialog.showErrorBox('write failure', 'synthetic'), error => error === originalError)
-    assert.equal(originalCalls, 1, 'the original throwing dialog must run once even when logging fails')
-    assert.equal(writeAttempts, 1, 'logging must not recurse through the error monitor')
-    assert.doesNotThrow(() => failingProbe.observedProcess.emit('uncaughtExceptionMonitor', {
-      get name() { throw new Error('synthetic inaccessible error property') },
-    }, 'uncaughtException'))
-    assert.equal(failingProbe.electronApp.exit(), 'original-exit-result', 'extended logging errors must not prevent app.exit')
-
-    // A real isolated Node process must still terminate on an uncaught error.
-    // Only its synthetic exception is logged; no real Electron/profile starts.
-    const childEnvironment = {}
-    for (const name of ['SystemRoot', 'WINDIR', 'TEMP', 'TMP']) {
-      if (process.env[name] !== undefined) childEnvironment[name] = process.env[name]
-    }
-    const childSource = `
-      import { EventEmitter } from 'node:events';
-      import { installQuitDiagnosticProbe } from ${JSON.stringify(new URL('./packaged-first-send-cleanup.mjs', import.meta.url).href)};
-      const app = new EventEmitter(); app.exit = () => {};
-      const electron = { app, dialog: { showErrorBox() {} }, BrowserWindow: { getAllWindows: () => [] }, webContents: { getAllWebContents: () => [] } };
-      await installQuitDiagnosticProbe({ evaluate: (callback, options) => callback(electron, options) }, ${JSON.stringify(paths[3])}, { extended: true });
-      if (process.listenerCount('uncaughtException') !== 0) throw new Error('unexpected exception handler');
-      setImmediate(() => { throw new Error('synthetic fatal monitor control'); });
-    `
-    const fatalChild = spawn(process.execPath, ['--input-type=module', '-e', childSource], {
-      env: childEnvironment, stdio: 'ignore', windowsHide: true,
-    })
-    fixtureProcesses.push(fatalChild)
-    assert.deepEqual(await once(fatalChild, 'close', { signal: AbortSignal.timeout(5_000) }), [1, null])
-    await assertProcessExited(fatalChild.pid)
-    const fatalRecord = (await records(paths[3])).find(record => record.event === 'uncaught-exception-monitor')
-    assert.equal(fatalRecord.message, 'synthetic fatal monitor control')
-    assert.match(fatalRecord.stack, /synthetic fatal monitor control/)
-    console.log('PASS extended error probe: original dialog semantics, bounded/redacted evidence, write failure/reentry, fatal monitor stays fatal')
-  } finally {
-    for (const path of paths) await unlink(path).catch(error => { if (error.code !== 'ENOENT') throw error })
-    await rmdir(directory)
-  }
-}
-
 try {
-  await testExtendedErrorProbe()
-  if (process.platform === 'win32') {
-    const target = await startChild()
-    const nativeIdentity = await captureWindowsProcessStart(target.child.pid)
-    assert.equal(nativeIdentity.status, 'complete')
-    const targetIdentity = { electronPid: target.child.pid, windowsStartTimeTicks: nativeIdentity.startTicks }
-    const nativeChain = await captureWindowsWaitChain(targetIdentity)
-    assert.equal(nativeChain.status, 'complete')
-    assert.ok(nativeChain.records.some(record => !record.kind
-      && (Array.isArray(record.nodes) || Number.isSafeInteger(record.error))),
-    'phase markers alone do not establish that a native query returned')
-    const missing = await captureWindowsWaitChain({ ...targetIdentity, electronPid: 2147483647 })
-    assert.equal(missing.records.find(record => record.kind === 'target').status, 'not-found')
-    const mismatch = await captureWindowsWaitChain({
-      ...targetIdentity, windowsStartTimeTicks: String(BigInt(nativeIdentity.startTicks) + 1n),
-    })
-    assert.equal(mismatch.records.find(record => record.kind === 'target').status, 'identity-mismatch')
-    const fixtureDirectory = await mkdtemp(join(tmpdir(), 'opensquilla-wct-test-'))
-    const fixturePath = join(fixtureDirectory, 'helper.ps1')
-    try {
-      await writeFile(fixturePath, 'param($TargetPid,$ExpectedStartTicks)\nStart-Sleep -Seconds 60\n')
-      const stalled = await captureWindowsWaitChain(targetIdentity, { helperPath: fixturePath, timeoutMs: 250 })
-      assert.equal(stalled.status, 'timeout')
-      assert.equal(stalled.helperExitObserved, true)
-      await assertProcessExited(stalled.helperPid)
-      assert.equal(target.child.exitCode, null, 'WCT containment must never terminate the target')
-      const phase = { kind: 'phase', phase: 'query-start', pid: target.child.pid, tid: 123, elapsedMs: 0 }
-      const chain = { tid: 123, cycle: false, nodes: [{ type: 3, status: 6 }] }
-      const safePrefix = `param($TargetPid,$ExpectedStartTicks)
-[Console]::Out.WriteLine('${JSON.stringify({ ...phase, objectName: 'synthetic-not-to-emit' })}')
-[Console]::Out.WriteLine('${JSON.stringify({ ...chain, nodes: [{ ...chain.nodes[0], objectName: 'synthetic-not-to-emit' }] })}')
-`
-      await writeFile(fixturePath, `${safePrefix}
-[Console]::Error.WriteLine('synthetic-stderr-not-to-emit')
-[Console]::Out.Write('{"kind":"phase","phase":"query-ret')
-[Console]::Out.Flush()
-Start-Sleep -Seconds 60
-`)
-      const partial = await captureWindowsWaitChain(targetIdentity, { helperPath: fixturePath })
-      assert.equal(partial.status, 'timeout', 'partial records must never promote timeout to success')
-      assert.equal(partial.helperExitObserved, true)
-      assert.deepEqual(partial.records, [phase, chain])
-      assert.deepEqual(partial.outputParse, {
-        status: 'incomplete-tail', invalidLines: 0, discardedTailLines: 1, excessLines: 0,
-      })
-      assert.equal(JSON.stringify(partial).includes('synthetic-'), false)
-      assert.equal(Object.hasOwn(partial, 'stdout'), false)
-      assert.equal(Object.hasOwn(partial, 'stderr'), false)
-      await assertProcessExited(partial.helperPid)
-      assert.equal(target.child.exitCode, null, 'partial WCT timeout must leave the target alive')
-      await writeFile(fixturePath, `${safePrefix}
-[Console]::Out.WriteLine('complete-invalid-json')
-[Console]::Out.Write('x' * 70000)
-Start-Sleep -Seconds 60
-`)
-      const oversized = await captureWindowsWaitChain(targetIdentity, { helperPath: fixturePath })
-      assert.equal(oversized.status, 'output-limit')
-      assert.deepEqual(oversized.records, [phase, chain])
-      assert.deepEqual(oversized.outputParse, {
-        status: 'invalid-record', invalidLines: 1, discardedTailLines: 1, excessLines: 0,
-      })
-      assert.equal(Object.hasOwn(oversized, 'stdout'), false)
-      assert.equal(JSON.stringify(oversized).includes('synthetic-'), false)
-      assert.equal(oversized.helperExitObserved, true)
-      await assertProcessExited(oversized.helperPid)
-      assert.equal(target.child.exitCode, null, 'output containment must leave the target alive')
-      await writeFile(fixturePath, `${safePrefix}
-[Console]::Out.WriteLine('{"kind":"phase","phase":"unknown","pid":${target.child.pid},"elapsedMs":0}')
-`)
-      const invalidPhase = await captureWindowsWaitChain(targetIdentity, { helperPath: fixturePath })
-      assert.equal(invalidPhase.status, 'invalid-output', 'a complete invalid line must not look successful')
-      assert.deepEqual(invalidPhase.records, [phase, chain])
-      assert.deepEqual(invalidPhase.outputParse, {
-        status: 'invalid-record', invalidLines: 1, discardedTailLines: 0, excessLines: 0,
-      })
-      await writeFile(fixturePath, `param($TargetPid,$ExpectedStartTicks)
-[Console]::Out.WriteLine('{"tid":123,"cycle":false,"nodes":[{"type":3,"status":6,"objectName":"synthetic-not-to-emit"}]}')
-`)
-      const filtered = await captureWindowsWaitChain(targetIdentity, { helperPath: fixturePath })
-      assert.equal(filtered.status, 'complete')
-      assert.equal(JSON.stringify(filtered).includes('synthetic-not-to-emit'), false)
-      assert.deepEqual(filtered.records[0].nodes, [{ type: 3, status: 6 }])
-      await writeFile(fixturePath, `param($TargetPid,$ExpectedStartTicks)
-[Console]::Out.WriteLine('{"tid":123,"cycle":false,"nodes":[{"type":8,"status":3,"pid":456,"tid":123},{"type":8,"status":6,"pid":789,"tid":0}]}')
-`)
-      const processOnlyTerminal = await captureWindowsWaitChain(targetIdentity, { helperPath: fixturePath })
-      assert.equal(processOnlyTerminal.status, 'complete')
-      assert.deepEqual(processOnlyTerminal.records[0].nodes[1], { type: 8, status: 6, pid: 789, tid: 0 })
-    } finally {
-      await unlink(fixturePath)
-      await rmdir(fixtureDirectory)
-    }
-    target.child.send('quit')
-    await assertProcessExited(target.child.pid)
-  }
   const naturalWrapper = await startChild()
   const naturalElectron = await startChild()
-  await quitElectronOnNextTurn({
+  await closeElectronAndObserveExit({
     process: () => naturalWrapper.child,
-    evaluate: async () => {
+    close: async () => {
       naturalElectron.child.send('quit')
       naturalWrapper.child.send('quit')
     },
@@ -319,9 +92,9 @@ Start-Sleep -Seconds 60
 
   const exitedWrapper = await startChild()
   const liveElectron = await startChild()
-  await assert.rejects(quitElectronOnNextTurn({
+  await assert.rejects(closeElectronAndObserveExit({
     process: () => exitedWrapper.child,
-    evaluate: async () => {
+    close: async () => {
       const exited = once(exitedWrapper.child, 'exit')
       exitedWrapper.child.send('quit')
       await exited
@@ -334,57 +107,6 @@ Start-Sleep -Seconds 60
     close: async () => {},
   }, { wrapperPid: exitedWrapper.child.pid, electronPid: liveElectron.child.pid }, 25),
   /left an observed Electron or wrapper process alive/)
-  await assert.rejects(closeElectronAfterRemovingRoutes({
-    process: () => exitedWrapper.child,
-    context: () => ({ unrouteAll: async () => {} }),
-    close: async () => {},
-  }, { wrapperPid: exitedWrapper.child.pid, electronPid: liveElectron.child.pid }, 25),
-  /left an observed Electron or wrapper process alive/)
-
-  const unroutedWrapper = await startChild()
-  const unroutedElectron = await startChild()
-  let releaseRoute
-  let closeCalled = false
-  const removingRoutes = new Promise(resolve => { releaseRoute = resolve })
-  const unroutedClose = closeElectronAfterRemovingRoutes({
-    process: () => {
-      assert.equal(closeCalled, false, 'Playwright process() is unavailable after close() disposes the app')
-      return unroutedWrapper.child
-    },
-    context: () => ({ unrouteAll: options => {
-      assert.deepEqual(options, { behavior: 'wait' })
-      return removingRoutes
-    } }),
-    close: async () => {
-      closeCalled = true
-      unroutedElectron.child.send('quit')
-      unroutedWrapper.child.send('quit')
-    },
-  }, { wrapperPid: unroutedWrapper.child.pid, electronPid: unroutedElectron.child.pid }, 5_000)
-  await delay(25)
-  assert.equal(closeCalled, false, 'quit must wait for outstanding route handlers')
-  releaseRoute()
-  await unroutedClose
-  assert.equal(unroutedWrapper.child.exitCode, 0)
-  await assertProcessExited(unroutedElectron.child.pid)
-
-  const stuckRoute = await startChild()
-  await assert.rejects(cleanupPackagedFirstSend({
-    app: {
-      process: () => stuckRoute.child,
-      context: () => ({ unrouteAll: () => new Promise(() => {}) }),
-      close: async () => { assert.fail('close must not run before route removal finishes') },
-    },
-    unrouteBeforeQuit: true,
-    processIdentity: { wrapperPid: stuckRoute.child.pid, electronPid: stuckRoute.child.pid },
-    electronTimeoutMs: 25,
-    emit: () => {},
-  }), error => {
-    assert.equal(error.errors[0].cause.code, 'DESKTOP_E2E_SHUTDOWN_TIMEOUT')
-    return true
-  })
-  await assertProcessExited(stuckRoute.child.pid)
-
   const { child } = await startChild()
   const defaultElectron = await startChild()
   const provider = await startProvider()
@@ -458,7 +180,7 @@ Start-Sleep -Seconds 60
     provider: hangingProvider,
     electronTimeoutMs: 25,
     providerTimeoutMs: 100,
-    diagnostics: cause => ({ timeoutCode: cause.code }),
+    diagnostics: () => ({ ownedFixture: true }),
     emit: line => shutdownLogs.push(JSON.parse(line)),
     onPhase: (phase, details) => hangingPhases.push({ phase, ...details }),
   }), error => {
@@ -472,7 +194,7 @@ Start-Sleep -Seconds 60
   assert.equal(forced.forcedExitSucceeded, true, 'even successful containment must fail this gate')
   assert.equal(hangingProvider.server.listening, false, 'provider cleanup must run after Electron failure')
   assert.equal(shutdownLogs[0].process.pid, hanging.child.pid)
-  assert.equal(shutdownLogs[0].diagnostics.timeoutCode, 'DESKTOP_E2E_SHUTDOWN_TIMEOUT')
+  assert.equal(shutdownLogs[0].diagnostics.ownedFixture, true)
   await assertProcessExited(hanging.child.pid)
   assert.equal(electronProcessSnapshot(identity).wrapperPidExists, false)
   assert.equal(electronProcessSnapshot(identity).electronPidExists, true)
@@ -512,7 +234,7 @@ Start-Sleep -Seconds 60
     return true
   })
   assert.equal(rejectedProvider.server.listening, false)
-  console.log('Packaged first-send cleanup checks passed: graceful, deferred/unroute natural exit, hung routes and Electron tree, active HTTP, close rejection')
+  console.log('Packaged first-send cleanup checks passed: natural dual-PID zero exit, surviving Electron rejection, hung Electron tree, active HTTP, close rejection')
 } finally {
   for (const { server, sockets } of fixtureServers) {
     server.closeAllConnections?.()

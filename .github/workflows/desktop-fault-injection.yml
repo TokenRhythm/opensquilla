@@ -317,16 +317,6 @@ jobs:
           npm run build
           if ($LASTEXITCODE -ne 0) { throw 'Harness compilation failed.' }
 
-      - name: Validate native stack collector against an owned process
-        if: inputs.run_windows_release_audit
-        timeout-minutes: 3
-        working-directory: desktop/electron
-        shell: pwsh
-        run: |
-          Write-Host "Native stack collector runner: $env:RUNNER_OS / $env:ImageOS / $env:ImageVersion"
-          node scripts/test-windows-native-stack-diagnostics.mjs
-          if ($LASTEXITCODE -ne 0) { throw 'Native stack collector controls failed.' }
-
       - name: Download Windows installer
         uses: actions/download-artifact@v4
         with:
@@ -395,44 +385,9 @@ jobs:
           AUDIT_STAGE: ${{ steps.stage.outputs.stage }}
         run: |
           $userData = Join-Path $env:AUDIT_STAGE 'first-send-user-data'
-          $diagnostics = Join-Path $env:AUDIT_STAGE 'playwright-quit-diagnostics.jsonl'
           node scripts/test-packaged-first-send-renderer.mjs `
-            --executable $env:CANDIDATE_EXE --user-data-dir $userData `
-            --quit-diagnostics-file $diagnostics
+            --executable $env:CANDIDATE_EXE --user-data-dir $userData
           if ($LASTEXITCODE -ne 0) { throw 'Signed installed first-send audit failed.' }
-
-      - name: Diagnose native teardown of the signed candidate
-        if: ${{ failure() && steps.first_send.outcome == 'failure' && inputs.run_windows_release_audit }}
-        timeout-minutes: 5
-        working-directory: desktop/electron
-        shell: pwsh
-        env:
-          CANDIDATE_EXE: ${{ steps.stage.outputs.app }}
-          AUDIT_STAGE: ${{ steps.stage.outputs.stage }}
-        run: |
-          $userData = Join-Path $env:AUDIT_STAGE 'native-quit-user-data'
-          $diagnostics = Join-Path $env:AUDIT_STAGE 'quit-diagnostics.jsonl'
-          node scripts/test-packaged-first-send-renderer.mjs `
-            --executable $env:CANDIDATE_EXE --user-data-dir $userData `
-            --iterations 1 --extended-quit-diagnostics --quit-diagnostics-file $diagnostics
-          if ($LASTEXITCODE -ne 0) { throw 'Native teardown diagnostic failed.' }
-
-      - name: Compare quit with independently owned debug connections
-        if: ${{ failure() && steps.first_send.outcome == 'failure' && inputs.run_windows_release_audit }}
-        timeout-minutes: 5
-        working-directory: desktop/electron
-        shell: pwsh
-        env:
-          CANDIDATE_EXE: ${{ steps.stage.outputs.app }}
-          AUDIT_STAGE: ${{ steps.stage.outputs.stage }}
-        run: |
-          $userData = Join-Path $env:AUDIT_STAGE 'owned-transport-user-data'
-          $diagnostics = Join-Path $env:AUDIT_STAGE 'owned-quit-diagnostics.jsonl'
-          node scripts/test-packaged-first-send-renderer.mjs `
-            --executable $env:CANDIDATE_EXE --user-data-dir $userData `
-            --iterations 1 --extended-quit-diagnostics --owned-electron-launcher `
-            --quit-diagnostics-file $diagnostics
-          if ($LASTEXITCODE -ne 0) { throw 'Owned transport diagnostic failed.' }
 
       - name: Run fault-injection scenarios
         if: ${{ !inputs.run_windows_release_audit }}
@@ -481,11 +436,6 @@ jobs:
             ${{ steps.stage.outputs.stage }}/scenarios/*/user-data/logs/gateway.log
             ${{ steps.stage.outputs.stage }}/scenarios/*/launch-stdio.log
             ${{ steps.stage.outputs.stage }}/first-send-user-data/logs/*.log
-            ${{ steps.stage.outputs.stage }}/native-quit-user-data/logs/*.log
-            ${{ steps.stage.outputs.stage }}/owned-transport-user-data/logs/*.log
-            ${{ steps.stage.outputs.stage }}/owned-quit-diagnostics.jsonl
-            ${{ steps.stage.outputs.stage }}/quit-diagnostics.jsonl
-            ${{ steps.stage.outputs.stage }}/playwright-quit-diagnostics.jsonl
           if-no-files-found: warn
           retention-days: 14
 

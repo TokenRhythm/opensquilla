@@ -20,12 +20,8 @@ import {
   captureFirstSendDiagnostic,
   cleanupPackagedFirstSend,
   electronProcessSnapshot,
-  installQuitDiagnosticProbe,
 } from './packaged-first-send-cleanup.mjs'
 import { DESKTOP_GATEWAY_STARTUP_TIMEOUT_MS } from '../dist/gateway-lifecycle.js'
-import { captureWindowsWaitChain } from './windows-wait-chain-diagnostics.mjs'
-import { captureWindowsNativeStacks } from './windows-native-stack-diagnostics.mjs'
-import { launchOwnedElectronDiagnostic } from './owned-electron-diagnostic-launcher.mjs'
 
 const DEFAULT_ITERATIONS = 20
 const SEND_TIMEOUT_MS = 45_000
@@ -238,35 +234,6 @@ assertSecretScrubbingBoundary()
 const executablePath = resolve(requiredOption('--executable'))
 const userDataDir = resolve(requiredOption('--user-data-dir'))
 const iterations = optionalIntegerOption('--iterations', DEFAULT_ITERATIONS)
-const deferQuit = process.argv.includes('--defer-quit')
-const unrouteBeforeQuit = process.argv.includes('--unroute-before-quit')
-const extendedQuitDiagnostics = process.argv.includes('--extended-quit-diagnostics')
-const ownedElectronLauncher = process.argv.includes('--owned-electron-launcher')
-assert.equal(deferQuit && unrouteBeforeQuit, false, 'quit diagnostic modes must be selected separately')
-assert.ok(!ownedElectronLauncher || (process.platform === 'win32'
-  && extendedQuitDiagnostics && !deferQuit && !unrouteBeforeQuit),
-'owned transport launch is a separate Windows extended diagnostic')
-const quitMode = ownedElectronLauncher ? 'owned-transport-diagnostic'
-  : deferQuit ? 'deferred-diagnostic' : unrouteBeforeQuit ? 'unroute-diagnostic' : 'playwright-close'
-const quitDiagnosticFile = deferQuit || unrouteBeforeQuit || extendedQuitDiagnostics || process.argv.includes('--quit-diagnostics-file')
-  ? resolve(requiredOption('--quit-diagnostics-file'))
-  : null
-if (quitDiagnosticFile) {
-  const within = (parent, file) => {
-    const child = relative(resolve(parent), file)
-    return child !== '' && !isAbsolute(child) && child !== '..' && !child.startsWith(`..${sep}`)
-  }
-  assert.ok(
-    [tmpdir(), process.env.RUNNER_TEMP].filter(Boolean).some(root => within(root, quitDiagnosticFile)),
-    'quit diagnostics must use an independent temporary file',
-  )
-  assert.ok(
-    relative(userDataDir, quitDiagnosticFile) !== '' && !within(userDataDir, quitDiagnosticFile),
-    'quit diagnostics must not write the app profile',
-  )
-  await writeFile(quitDiagnosticFile, '', { flag: 'wx' })
-}
-
 let app
 let provider
 let runError
@@ -453,12 +420,6 @@ try {
     disableNetworkObservability: true,
     model: 'opensquilla-packaged-first-send-gate',
     scrubProviderSecrets: true,
-    ...(ownedElectronLauncher ? {
-      launchElectron: options => launchOwnedElectronDiagnostic({
-        ...options,
-        onEvent: transport => reportPhase('owned-electron-transport', { transport }),
-      }),
-    } : {}),
     env: {
       GITHUB_ACTIONS: '0',
       OPENSQUILLA_LLM_CONTEXT_WINDOW_TOKENS: '131072',
@@ -467,9 +428,7 @@ try {
       no_proxy: '127.0.0.1,localhost,::1',
     },
   })
-  electronProcessIdentity = await captureElectronProcessIdentity(app, 3_000, {
-    captureWindowsStartTime: extendedQuitDiagnostics,
-  })
+  electronProcessIdentity = await captureElectronProcessIdentity(app)
   reportPhase('electron-launch-complete', { processes: electronProcessIdentity })
 
   await app.context().route((url) => {
@@ -480,9 +439,6 @@ try {
   })
   const page = await app.firstWindow({ timeout: 60_000 })
   rendererPage = page
-  if (quitDiagnosticFile) {
-    await installQuitDiagnosticProbe(app, quitDiagnosticFile, { extended: extendedQuitDiagnostics })
-  }
   reportPhase('renderer-window-ready')
   await waitFor(
     () => page.url().startsWith('opensquilla-app://desktop/chat'),
@@ -629,15 +585,6 @@ try {
     'each new-task iteration must materialize one distinct session',
   )
   reportPhase('renderer-checks-complete', { completedChatSends: rpcSendCounts.size })
-  if (extendedQuitDiagnostics) {
-    // Compare the same launch identity while Electron is still responsive.
-    // This diagnostic runs after the business timing marker and has no bearing
-    // on either renderer assertions or the later natural-exit requirement.
-    const windowsWaitChain = await captureFirstSendDiagnostic(
-      () => captureWindowsWaitChain(electronProcessIdentity), 6_000,
-    )
-    reportPhase('healthy-windows-wait-chain', { windowsWaitChain })
-  }
 } catch (error) {
   runError = error
   // Report the original failure before attempting any potentially slow cleanup.
@@ -659,27 +606,12 @@ try {
     await cleanupPackagedFirstSend({
       app,
       provider,
-      deferQuit,
-      unrouteBeforeQuit,
       processIdentity: electronProcessIdentity,
-      diagnosticTimeoutMs: extendedQuitDiagnostics ? 8_000 : 3_000,
-      diagnostics: async cause => {
-        const detail = {
-          processes: electronProcessSnapshot(electronProcessIdentity),
-          desktopLog: await readDesktopLogSummary(userDataDir),
-          rendererBeforeCleanup: failureRendererSnapshot,
-        }
-        if (extendedQuitDiagnostics && cause?.code === 'DESKTOP_E2E_SHUTDOWN_TIMEOUT') {
-          // Sampling starts only after the unchanged 100-second exit gate has
-          // failed. Both collectors are bounded and own only their helpers.
-          const [windowsWaitChain, windowsNativeStacks] = await Promise.all([
-            captureWindowsWaitChain(electronProcessIdentity),
-            captureWindowsNativeStacks(electronProcessIdentity),
-          ])
-          Object.assign(detail, { windowsWaitChain, windowsNativeStacks })
-        }
-        return detail
-      },
+      diagnostics: async () => ({
+        processes: electronProcessSnapshot(electronProcessIdentity),
+        desktopLog: await readDesktopLogSummary(userDataDir),
+        rendererBeforeCleanup: failureRendererSnapshot,
+      }),
       onPhase: reportPhase,
     })
   } catch (error) {
@@ -696,9 +628,6 @@ if (runError) {
     iterations,
     completedChatSends: rpcSendCounts.size,
     provider: provider?.counts(),
-    quitMode,
-    quitDiagnosticFile,
-    extendedQuitDiagnostics,
     renderer: {
       pageErrors: pageErrors.length,
       consoleErrors: consoleErrors.length,
@@ -728,9 +657,6 @@ console.log(JSON.stringify({
   ok: true,
   executable: basename(executablePath),
   iterations,
-  quitMode,
-  quitDiagnosticFile,
-  extendedQuitDiagnostics,
   viewports: { wide: Math.ceil(iterations / 2), tight: Math.floor(iterations / 2) },
   rpc: { chatSend: rpcSendCounts.size, uniqueSessions: new Set(rpcSessions.values()).size },
   provider: provider?.counts(),
