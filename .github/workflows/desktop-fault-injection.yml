@@ -369,6 +369,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'Harness compilation failed.' }
 
       - name: Verify signed installed first-send
+        id: first_send
         if: inputs.run_windows_release_audit
         timeout-minutes: 15
         working-directory: desktop/electron
@@ -378,8 +379,27 @@ jobs:
           AUDIT_STAGE: ${{ steps.stage.outputs.stage }}
         run: |
           $userData = Join-Path $env:AUDIT_STAGE 'first-send-user-data'
-          node scripts/test-packaged-first-send-renderer.mjs --executable $env:CANDIDATE_EXE --user-data-dir $userData
+          $diagnostics = Join-Path $env:AUDIT_STAGE 'playwright-quit-diagnostics.jsonl'
+          node scripts/test-packaged-first-send-renderer.mjs `
+            --executable $env:CANDIDATE_EXE --user-data-dir $userData `
+            --quit-diagnostics-file $diagnostics
           if ($LASTEXITCODE -ne 0) { throw 'Signed installed first-send audit failed.' }
+
+      - name: Diagnose deferred quit of the signed candidate
+        if: ${{ failure() && steps.first_send.outcome == 'failure' && inputs.run_windows_release_audit }}
+        timeout-minutes: 5
+        working-directory: desktop/electron
+        shell: pwsh
+        env:
+          CANDIDATE_EXE: ${{ steps.stage.outputs.app }}
+          AUDIT_STAGE: ${{ steps.stage.outputs.stage }}
+        run: |
+          $userData = Join-Path $env:AUDIT_STAGE 'deferred-quit-user-data'
+          $diagnostics = Join-Path $env:AUDIT_STAGE 'quit-diagnostics.jsonl'
+          node scripts/test-packaged-first-send-renderer.mjs `
+            --executable $env:CANDIDATE_EXE --user-data-dir $userData `
+            --iterations 1 --defer-quit --quit-diagnostics-file $diagnostics
+          if ($LASTEXITCODE -ne 0) { throw 'Deferred quit diagnostic failed.' }
 
       - name: Run fault-injection scenarios
         if: ${{ !inputs.run_windows_release_audit }}
@@ -428,6 +448,9 @@ jobs:
             ${{ steps.stage.outputs.stage }}/scenarios/*/user-data/logs/gateway.log
             ${{ steps.stage.outputs.stage }}/scenarios/*/launch-stdio.log
             ${{ steps.stage.outputs.stage }}/first-send-user-data/logs/*.log
+            ${{ steps.stage.outputs.stage }}/deferred-quit-user-data/logs/*.log
+            ${{ steps.stage.outputs.stage }}/quit-diagnostics.jsonl
+            ${{ steps.stage.outputs.stage }}/playwright-quit-diagnostics.jsonl
           if-no-files-found: warn
           retention-days: 14
 

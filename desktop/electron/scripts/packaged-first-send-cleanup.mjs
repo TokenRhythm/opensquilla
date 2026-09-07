@@ -55,10 +55,61 @@ export function electronProcessSnapshot(identity) {
   return snapshot
 }
 
+export async function installQuitDiagnosticProbe(app, diagnosticFile) {
+  await app.evaluate(({ app, BrowserWindow }, file) => {
+    const fs = process.getBuiltinModule('fs')
+    const log = (event, detail = {}) => fs.appendFileSync(file, JSON.stringify({
+      event, at: new Date().toISOString(), pid: process.pid, ...detail,
+    }) + '\n')
+    const originalExit = app.exit
+    app.exit = function (...args) {
+      log('app-exit-entered')
+      try {
+        const result = originalExit.apply(this, args)
+        log('app-exit-returned')
+        return result
+      } catch (error) {
+        log('app-exit-threw', { error: String(error?.message || error).slice(0, 500) })
+        throw error
+      }
+    }
+    app.once('quit', (_event, exitCode) => log('quit', { exitCode }))
+    for (const window of BrowserWindow.getAllWindows()) {
+      const windowId = window.id
+      window.once('closed', () => log('window-closed', { windowId }))
+    }
+    log('probe-installed', { windowCount: BrowserWindow.getAllWindows().length })
+  }, diagnosticFile)
+}
+
+export async function quitElectronOnNextTurn(app, identity, timeoutMs) {
+  if (!identity?.electronPid || !identity?.wrapperPid) {
+    throw new Error('Deferred quit diagnostic requires both observed process identities')
+  }
+  const child = app.process()
+  // Keep the debugger connection alive during the production asynchronous
+  // drain. Playwright's normal close() disconnects it immediately after quit().
+  await app.evaluate(({ app }) => { setImmediate(() => app.quit()) })
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    const state = electronProcessSnapshot(identity)
+    if (child.exitCode !== null || child.signalCode !== null) {
+      if (child.exitCode !== 0 || child.signalCode !== null) {
+        throw new Error('Deferred quit did not produce a natural zero exit code')
+      }
+      if (state.wrapperPidExists === false && state.electronPidExists === false) return
+    }
+    await delay(25)
+  }
+  throw new Error('Deferred quit left an observed Electron or wrapper process alive')
+}
+
 export async function cleanupPackagedFirstSend({
   app,
   provider,
   diagnostics,
+  deferQuit = false,
+  processIdentity,
   emit = line => console.error(line),
   onPhase = () => {},
   electronTimeoutMs = ELECTRON_CLEANUP_TIMEOUT_MS,
@@ -69,7 +120,10 @@ export async function cleanupPackagedFirstSend({
     onPhase('electron-cleanup-start')
     try {
       const result = await closeElectronWithDeadline({
-        app,
+        app: deferQuit ? {
+          process: () => app.process(),
+          close: () => quitElectronOnNextTurn(app, processIdentity, electronTimeoutMs),
+        } : app,
         phase: 'packaged-first-send',
         diagnostics,
         emit,

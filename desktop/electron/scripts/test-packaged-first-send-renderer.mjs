@@ -1,7 +1,8 @@
 import assert from 'node:assert/strict'
 import { createServer } from 'node:http'
-import { readFile, readdir } from 'node:fs/promises'
-import { basename, resolve } from 'node:path'
+import { readFile, readdir, writeFile } from 'node:fs/promises'
+import { basename, isAbsolute, relative, resolve, sep } from 'node:path'
+import { tmpdir } from 'node:os'
 import { setTimeout as delay } from 'node:timers/promises'
 
 import {
@@ -19,6 +20,7 @@ import {
   captureFirstSendDiagnostic,
   cleanupPackagedFirstSend,
   electronProcessSnapshot,
+  installQuitDiagnosticProbe,
 } from './packaged-first-send-cleanup.mjs'
 import { DESKTOP_GATEWAY_STARTUP_TIMEOUT_MS } from '../dist/gateway-lifecycle.js'
 
@@ -233,6 +235,25 @@ assertSecretScrubbingBoundary()
 const executablePath = resolve(requiredOption('--executable'))
 const userDataDir = resolve(requiredOption('--user-data-dir'))
 const iterations = optionalIntegerOption('--iterations', DEFAULT_ITERATIONS)
+const deferQuit = process.argv.includes('--defer-quit')
+const quitDiagnosticFile = deferQuit || process.argv.includes('--quit-diagnostics-file')
+  ? resolve(requiredOption('--quit-diagnostics-file'))
+  : null
+if (quitDiagnosticFile) {
+  const within = (parent, file) => {
+    const child = relative(resolve(parent), file)
+    return child !== '' && !isAbsolute(child) && child !== '..' && !child.startsWith(`..${sep}`)
+  }
+  assert.ok(
+    [tmpdir(), process.env.RUNNER_TEMP].filter(Boolean).some(root => within(root, quitDiagnosticFile)),
+    'quit diagnostics must use an independent temporary file',
+  )
+  assert.ok(
+    relative(userDataDir, quitDiagnosticFile) !== '' && !within(userDataDir, quitDiagnosticFile),
+    'quit diagnostics must not write the app profile',
+  )
+  await writeFile(quitDiagnosticFile, '', { flag: 'wx' })
+}
 
 let app
 let provider
@@ -439,6 +460,7 @@ try {
   })
   const page = await app.firstWindow({ timeout: 60_000 })
   rendererPage = page
+  if (quitDiagnosticFile) await installQuitDiagnosticProbe(app, quitDiagnosticFile)
   reportPhase('renderer-window-ready')
   await waitFor(
     () => page.url().startsWith('opensquilla-app://desktop/chat'),
@@ -606,6 +628,8 @@ try {
     await cleanupPackagedFirstSend({
       app,
       provider,
+      deferQuit,
+      processIdentity: electronProcessIdentity,
       diagnostics: async () => ({
         processes: electronProcessSnapshot(electronProcessIdentity),
         desktopLog: await readDesktopLogSummary(userDataDir),
@@ -627,6 +651,8 @@ if (runError) {
     iterations,
     completedChatSends: rpcSendCounts.size,
     provider: provider?.counts(),
+    quitMode: deferQuit ? 'deferred-diagnostic' : 'playwright-close',
+    quitDiagnosticFile,
     renderer: {
       pageErrors: pageErrors.length,
       consoleErrors: consoleErrors.length,
@@ -656,6 +682,8 @@ console.log(JSON.stringify({
   ok: true,
   executable: basename(executablePath),
   iterations,
+  quitMode: deferQuit ? 'deferred-diagnostic' : 'playwright-close',
+  quitDiagnosticFile,
   viewports: { wide: Math.ceil(iterations / 2), tight: Math.floor(iterations / 2) },
   rpc: { chatSend: rpcSendCounts.size, uniqueSessions: new Set(rpcSessions.values()).size },
   provider: provider?.counts(),

@@ -14,6 +14,7 @@ import {
   captureFirstSendDiagnostic,
   cleanupPackagedFirstSend,
   electronProcessSnapshot,
+  quitElectronOnNextTurn,
 } from './packaged-first-send-cleanup.mjs'
 
 const fixtureProcesses = []
@@ -25,6 +26,7 @@ async function startChild(withDescendant = false) {
     const descendant = ${withDescendant} ? spawn(process.execPath,
       ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore', windowsHide: true }) : null;
     process.send({ descendantPid: descendant?.pid || null });
+    process.on('message', message => { if (message === 'quit') process.exit(0); });
     setInterval(() => {}, 1000);
   `
   const child = spawn(process.execPath, ['-e', source], {
@@ -76,6 +78,31 @@ async function assertProcessExited(pid) {
 }
 
 try {
+  const naturalWrapper = await startChild()
+  const naturalElectron = await startChild()
+  await quitElectronOnNextTurn({
+    process: () => naturalWrapper.child,
+    evaluate: async () => {
+      naturalElectron.child.send('quit')
+      naturalWrapper.child.send('quit')
+    },
+  }, { wrapperPid: naturalWrapper.child.pid, electronPid: naturalElectron.child.pid }, 5_000)
+  assert.equal(naturalWrapper.child.exitCode, 0)
+  await assertProcessExited(naturalElectron.child.pid)
+
+  const exitedWrapper = await startChild()
+  const liveElectron = await startChild()
+  await assert.rejects(quitElectronOnNextTurn({
+    process: () => exitedWrapper.child,
+    evaluate: async () => {
+      const exited = once(exitedWrapper.child, 'exit')
+      exitedWrapper.child.send('quit')
+      await exited
+    },
+  }, { wrapperPid: exitedWrapper.child.pid, electronPid: liveElectron.child.pid }, 25),
+  /left an observed Electron or wrapper process alive/)
+  assert.equal(liveElectron.child.exitCode, null, 'natural observation must never kill Electron')
+
   const { child } = await startChild()
   const provider = await startProvider()
   const phases = []

@@ -295,9 +295,16 @@ def windows_upgrade_harness(tmp_path: Path) -> tuple[str, Path]:
     wrapper = tmp_path / "upgrade-harness.ps1"
     helper_scripts = tmp_path / ".github" / "scripts"
     helper_scripts.mkdir(parents=True)
-    shutil.copyfile(
-        SCRIPTS / "verify-release-windows-upgrade.ps1",
-        helper_scripts / "verify-release-windows-upgrade.ps1",
+    helper_source = (SCRIPTS / "verify-release-windows-upgrade.ps1").read_text(encoding="utf-8")
+    known_folder_read = "$programsDirectory = Get-NSISUserProgramsDirectory"
+    assert helper_source.count(known_folder_read) == 1
+    # Replace only the native Windows KnownFolder boundary. The fixture's NSIS
+    # stub installs there independently of the helper's overwritten LOCALAPPDATA.
+    (helper_scripts / "verify-release-windows-upgrade.ps1").write_text(
+        helper_source.replace(
+            known_folder_read, "$programsDirectory = $env:SYNTHETIC_USER_PROGRAMS"
+        ),
+        encoding="utf-8",
     )
     # Isolate signature verification at its real script boundary. The production
     # helper keeps mandatory verification; these version fixtures have no signed
@@ -327,7 +334,8 @@ $global:LASTEXITCODE = 0
 $ErrorActionPreference = 'Stop'
 function New-SyntheticDesktop {
   param([string]$Path, [string]$Version)
-  $fileVersion = $Version.Split('-')[0] + '.0'
+  if ($Version -notmatch '^(\d+\.\d+\.\d+)') { throw 'Invalid synthetic numeric version.' }
+  $fileVersion = $Matches[1] + '.0'
   $source = @"
 [assembly: System.Reflection.AssemblyInformationalVersion("$Version")]
 [assembly: System.Reflection.AssemblyFileVersion("$fileVersion")]
@@ -377,7 +385,7 @@ public class SyntheticDesktop {}
   }
 }
 $baselinePe = Join-Path $PSScriptRoot 'baseline.exe'
-New-SyntheticDesktop -Path $baselinePe -Version '0.5.4'
+New-SyntheticDesktop -Path $baselinePe -Version $env:SYNTHETIC_BASELINE_PRODUCT_VERSION
 $replacementPe = Join-Path $PSScriptRoot 'replacement.exe'
 if ($env:SYNTHETIC_INSTALLED_VERSION -ne 'no-op') {
   New-SyntheticDesktop -Path $replacementPe -Version $env:SYNTHETIC_INSTALLED_VERSION
@@ -397,8 +405,12 @@ function Start-Process {
   $script:installerCount += 1
   $destination = @($ArgumentList | Where-Object { $_.StartsWith('/D=') })
   $installPath = if ($destination.Count) { $destination[0].Substring(3) } else {
-    Join-Path $env:LOCALAPPDATA 'Programs/OpenSquilla'
+    if ($env:SYNTHETIC_WRONG_DEFAULT_ROOT -eq '1') {
+      Join-Path $env:LOCALAPPDATA 'unrelated/OpenSquilla'
+    } else { Join-Path $env:SYNTHETIC_USER_PROGRAMS 'OpenSquilla' }
   }
+  $argumentMode = if ($destination.Count) { 'custom' } else { 'default' }
+  Write-Host "SYNTHETIC_INSTALLER_MODE:$script:installerCount`:$argumentMode"
   $runtime = Join-Path $installPath 'resources/runtime'
   New-Item -ItemType Directory -Force -Path $runtime | Out-Null
   foreach ($metadata in @('runtime-manifest.json', 'runtime-pack-catalog.json')) {
@@ -454,10 +466,18 @@ def _run_windows_upgrade_helper(
     install_mode: str = "custom",
     manifest: dict[str, object] | None = None,
     signature_failure: str = "",
+    baseline_product_version: str = "0.5.4",
+    wrong_default_root: bool = False,
+    existing_default_root: bool = False,
 ) -> subprocess.CompletedProcess[str]:
     pwsh, wrapper = harness
     candidate = wrapper.parent / candidate_name
     candidate.touch()
+    known_programs = wrapper.parent / "known-folder" / "Programs"
+    if existing_default_root:
+        existing = known_programs / "OpenSquilla"
+        existing.mkdir(parents=True)
+        (existing / "preserve.txt").write_text("existing installation", encoding="utf-8")
     manifest_path = wrapper.parent / "channel.json"
     if manifest is not None:
         manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
@@ -476,6 +496,9 @@ def _run_windows_upgrade_helper(
             "SYNTHETIC_MANIFEST": str(manifest_path) if manifest is not None else "",
             "SYNTHETIC_SIGNATURE_ARGUMENTS": str(wrapper.parent / "signature-arguments.json"),
             "SYNTHETIC_SIGNATURE_FAILURE": signature_failure,
+            "SYNTHETIC_BASELINE_PRODUCT_VERSION": baseline_product_version,
+            "SYNTHETIC_USER_PROGRAMS": str(known_programs),
+            "SYNTHETIC_WRONG_DEFAULT_ROOT": "1" if wrong_default_root else "",
         },
         capture_output=True,
         text=True,
@@ -497,7 +520,7 @@ def _assert_windows_signature_arguments(
     installed = (
         sandbox / "OpenSquilla"
         if install_mode == "custom"
-        else sandbox / "localappdata/Programs/OpenSquilla"
+        else root / "known-folder/Programs/OpenSquilla"
     )
     assert Path(captured["InstallerPath"]) == root / f"OpenSquilla-{candidate}-win-x64.exe"
     assert Path(captured["InstalledRoot"]) == installed
@@ -511,6 +534,10 @@ def _assert_windows_signature_arguments(
         ("0.5.5-rc1", "no-op"),
         ("0.5.5-rc1", "0.5.5-rc0"),
         ("0.5.5-rc1", "0.5.5-RC1"),
+        ("0.5.5", "0.5.5.1"),
+        ("0.5.5", "0.5.5.0.0"),
+        ("0.5.5", "0.5.50"),
+        ("0.5.5-rc1", "0.5.5.0"),
     ],
 )
 def test_windows_replacement_rejects_successful_installer_with_stale_app(
@@ -550,9 +577,127 @@ def test_windows_replacement_accepts_exact_installed_candidate_version(
     assert result.returncode != 0  # Stop before any real application is launched.
     assert "SYNTHETIC_INSTALLER_EXIT_ZERO:2" in result.stdout
     assert "POST_INSTALL_LAUNCH_REACHED" in result.stderr
+    assert f"SYNTHETIC_INSTALLER_MODE:1:{install_mode}" in result.stdout
+    assert f"SYNTHETIC_INSTALLER_MODE:2:{install_mode}" in result.stdout
     _assert_windows_signature_arguments(
         windows_upgrade_harness, candidate=candidate, install_mode=install_mode
     )
+
+
+@pytest.mark.parametrize("install_mode", ["default", "custom"])
+def test_windows_upgrade_accepts_zero_revision_for_stable_pe_versions(
+    windows_upgrade_harness: tuple[str, Path], install_mode: str
+) -> None:
+    result = _run_windows_upgrade_helper(
+        windows_upgrade_harness,
+        candidate_name="OpenSquilla-0.5.5-win-x64.exe",
+        installed_version="0.5.5.0",
+        baseline_product_version="0.5.4.0",
+        install_mode=install_mode,
+    )
+    assert result.returncode != 0
+    assert "POST_INSTALL_LAUNCH_REACHED" in result.stderr
+    assert f"SYNTHETIC_INSTALLER_MODE:1:{install_mode}" in result.stdout
+    assert f"SYNTHETIC_INSTALLER_MODE:2:{install_mode}" in result.stdout
+    _assert_windows_signature_arguments(
+        windows_upgrade_harness, candidate="0.5.5", install_mode=install_mode
+    )
+
+
+@pytest.mark.parametrize("baseline_product_version", ["0.5.4.1", "0.5.40"])
+def test_windows_upgrade_rejects_other_baseline_pe_versions(
+    windows_upgrade_harness: tuple[str, Path], baseline_product_version: str
+) -> None:
+    result = _run_windows_upgrade_helper(
+        windows_upgrade_harness,
+        candidate_name="OpenSquilla-0.5.5-win-x64.exe",
+        installed_version="0.5.5.0",
+        baseline_product_version=baseline_product_version,
+    )
+    assert result.returncode != 0
+    assert (
+        f"Expected official v0.5.4, found installed version: {baseline_product_version}"
+        in result.stderr
+    )
+    assert "SYNTHETIC_INSTALLER_EXIT_ZERO:2" not in result.stdout
+    assert "POST_INSTALL_LAUNCH_REACHED" not in result.stderr
+
+
+def test_windows_default_install_rejects_unrelated_executable_outside_known_folder(
+    windows_upgrade_harness: tuple[str, Path],
+) -> None:
+    result = _run_windows_upgrade_helper(
+        windows_upgrade_harness,
+        candidate_name="OpenSquilla-0.5.5-win-x64.exe",
+        installed_version="0.5.5",
+        install_mode="default",
+        wrong_default_root=True,
+    )
+    assert result.returncode != 0
+    assert (
+        "default installation did not publish OpenSquilla.exe at the expected installation root"
+        in result.stderr
+    )
+    assert "SYNTHETIC_INSTALLER_EXIT_ZERO:2" not in result.stdout
+    assert not (windows_upgrade_harness[1].parent / "signature-arguments.json").exists()
+
+
+def test_windows_default_install_refuses_existing_installation_before_download(
+    windows_upgrade_harness: tuple[str, Path],
+) -> None:
+    result = _run_windows_upgrade_helper(
+        windows_upgrade_harness,
+        candidate_name="OpenSquilla-0.5.5-win-x64.exe",
+        installed_version="0.5.5",
+        install_mode="default",
+        existing_default_root=True,
+    )
+    assert result.returncode != 0
+    assert "requires a fresh runner" in result.stderr
+    assert "BASELINE_DOWNLOAD_REACHED" not in result.stdout
+    sentinel = windows_upgrade_harness[1].parent / "known-folder/Programs/OpenSquilla/preserve.txt"
+    assert sentinel.read_text(encoding="utf-8") == "existing installation"
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Native Windows KnownFolder read")
+def test_windows_nsis_known_folder_is_independent_of_localappdata_environment(
+    windows_upgrade_harness: tuple[str, Path],
+) -> None:
+    pwsh, wrapper = windows_upgrade_harness
+    # Parse and invoke only the read-only native resolver, never the installer body.
+    command = r"""
+$ErrorActionPreference = 'Stop'
+$ast = [Management.Automation.Language.Parser]::ParseFile(
+  $env:SYNTHETIC_ORIGINAL_HELPER, [ref]$null, [ref]$null
+)
+$function = $ast.Find({ param($node)
+  $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+  $node.Name -eq 'Get-NSISUserProgramsDirectory'
+}, $true)
+Invoke-Expression $function.Extent.Text
+$before = Get-NSISUserProgramsDirectory
+$env:LOCALAPPDATA = $env:SYNTHETIC_SHADOW_LOCALAPPDATA
+$after = Get-NSISUserProgramsDirectory
+@{ before = $before; after = $after } | ConvertTo-Json -Compress
+"""
+    result = subprocess.run(
+        [pwsh, "-NoProfile", "-NonInteractive", "-Command", command],
+        cwd=wrapper.parent,
+        env={
+            **os.environ,
+            "SYNTHETIC_ORIGINAL_HELPER": str(SCRIPTS / "verify-release-windows-upgrade.ps1"),
+            "SYNTHETIC_SHADOW_LOCALAPPDATA": str(wrapper.parent / "shadow-localappdata"),
+        },
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    paths = json.loads(result.stdout)
+    assert Path(paths["before"]).is_absolute()
+    assert paths["before"] == paths["after"]
+    assert not Path(paths["after"]).is_relative_to(wrapper.parent)
 
 
 @pytest.mark.parametrize("install_mode", ["default", "custom"])
