@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, nextTick, ref, watch } from 'vue'
+import { computed, inject, nextTick, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import Icon from '@/components/Icon.vue'
 import ControlSwitch from '@/components/ControlSwitch.vue'
@@ -9,16 +9,21 @@ import SetupCommandBlock from '@/components/setup/SetupCommandBlock.vue'
 import SetupProviderCredentialCard from '@/components/setup/SetupProviderCredentialCard.vue'
 import SetupProviderRecommendation from '@/components/setup/SetupProviderRecommendation.vue'
 import SetupModelCombobox from '@/components/setup/SetupModelCombobox.vue'
+import SetupModelOverrides from '@/components/setup/SetupModelOverrides.vue'
 import SetupProviderCatalogDialog from '@/components/setup/SetupProviderCatalogDialog.vue'
 import type {
   ConnectionState,
   DiscoveredModel,
   ProviderCredentialPanelState,
 } from '@/composables/setup/useSetupProviderForm'
-import { parseContextWindowInput } from '@/composables/setup/useSettingsPromotedForm'
+import { APP_SETTINGS_KEY } from '@/modules/appSettings'
+import { SETUP_WORKFLOW_KEY } from '@/modules/setupWorkflow'
+import { formatTokenCountInput, parseTokenCountInput } from '@/composables/setup/useSettingsPromotedForm'
 import { localizedRelativeTime } from '@/utils/messageTime'
 
 const { t, locale } = useI18n()
+const appSettings = inject(APP_SETTINGS_KEY)!
+const setupWorkflow = inject(SETUP_WORKFLOW_KEY)!
 
 interface ProviderOption {
   providerId: string
@@ -50,6 +55,9 @@ interface ProviderPanelContract {
   providerEnvCommand: string
   llmTimeoutSeconds: number
   contextWindowTokens: string
+  maxOutputTokens: string
+  modelSupportsVision: boolean
+  modelSupportsVideo: boolean
   contextWindowGlobal: number | null
   effectiveMaxTokens: {
     value: number
@@ -109,6 +117,8 @@ const emit = defineEmits<{
   updateProviderField: [name: string, value: unknown]
   updateLlmTimeout: [value: number]
   updateContextWindow: [value: string]
+  updateMaxOutputTokens: [value: string]
+  updateCap: [name: 'vision' | 'video', value: boolean]
   probeConnection: []
   refreshModels: []
   saveProvider: []
@@ -118,6 +128,7 @@ const emit = defineEmits<{
   selectConfiguredProvider: [value: string]
   removeProviderProfile: [value: string]
   addProvider: [value: string]
+  createCustomProvider: [value: string]
   probeConfiguredProvider: [value: string]
   activateProvider: [providerId: string]
   updateImageGenerationOptIn: [enabled: boolean]
@@ -127,11 +138,213 @@ const addOpen = ref(false)
 const editorOpen = ref(false)
 const listExpanded = ref(false)
 const addButtonRef = ref<HTMLButtonElement | null>(null)
+const customAddButtonRef = ref<HTMLButtonElement | null>(null)
 const editorHeadingRef = ref<HTMLElement | null>(null)
 const editorDialogRef = ref<HTMLElement | null>(null)
 const sectionRef = ref<HTMLElement | null>(null)
 const pendingRemoval = ref<{ providerId: string; index: number } | null>(null)
 const dialogInvoker = ref<HTMLElement | null>(null)
+
+// ---------------------------------------------------------------------------
+// Cherry-style custom provider form state. Shown in the add dialog as the
+// default view; the original provider catalog opens one level deeper from it.
+// ---------------------------------------------------------------------------
+interface CustomModelParams {
+  contextWindow: string
+  maxOutputTokens: string
+  supportsVision: boolean
+  supportsVideo: boolean
+}
+
+interface CustomModelRow {
+  id: string
+  name: string
+  params: CustomModelParams
+  paramsOpen: boolean
+}
+
+function emptyCustomModelParams(): CustomModelParams {
+  return { contextWindow: '', maxOutputTokens: '', supportsVision: false, supportsVideo: false }
+}
+
+const customFormVisible = ref(false)
+const customProviderId = ref('')
+const customDisplayName = ref('')
+const customBaseUrl = ref('')
+const customProtocol = ref('openai-completions')
+const customApiKey = ref('')
+const customModels = ref<CustomModelRow[]>([])
+const customFetching = ref(false)
+const customCreating = ref(false)
+const customManualHint = ref(false)
+const customError = ref('')
+
+const CUSTOM_PROVIDER_ID_PATTERN = /^[a-z][a-z0-9_-]*$/
+
+const CUSTOM_PROTOCOL_OPTIONS = [
+  { value: 'openai-completions', label: 'openai-completions' },
+  { value: 'openai-responses', label: 'openai-responses' },
+  { value: 'anthropic-messages', label: 'anthropic-messages' },
+] as const
+
+function resetCustomProviderForm() {
+  customProviderId.value = ''
+  customDisplayName.value = ''
+  customBaseUrl.value = ''
+  customProtocol.value = 'openai-completions'
+  customApiKey.value = ''
+  customModels.value = []
+  customFetching.value = false
+  customCreating.value = false
+  customManualHint.value = false
+  customError.value = ''
+}
+
+const customProviderIdError = computed(() => {
+  const id = customProviderId.value.trim().toLowerCase()
+  if (id && !CUSTOM_PROVIDER_ID_PATTERN.test(id)) {
+    return t('setup.provider.customErrorInvalidId')
+  }
+  if (id && configuredIds.value.has(id)) {
+    return t('setup.provider.customErrorDuplicate')
+  }
+  return ''
+})
+
+const customFormReady = computed(() => {
+  const id = customProviderId.value.trim().toLowerCase()
+  return Boolean(id)
+    && !customProviderIdError.value
+    && customBaseUrl.value.trim().length > 0
+    && customApiKey.value.trim().length > 0
+})
+
+// True when modal is in "add new provider" flow (not editing existing).
+const isAddFlow = computed(() => addOpen.value || customFormVisible.value)
+
+function addCustomModelRow() {
+  customModels.value.push({ id: '', name: '', params: emptyCustomModelParams(), paramsOpen: true })
+}
+
+function updateCustomModelCap(row: CustomModelRow, name: 'vision' | 'video', value: boolean) {
+  if (name === 'vision') row.params.supportsVision = value
+  else row.params.supportsVideo = value
+}
+
+// Build the deep-merge payload for the `models.<provider>."<model_id>"` config
+// subtree (the same layer the Settings per-model override UI writes). Blank
+// numeric fields and unchecked capability switches are omitted so catalog
+// values stay in charge.
+function customModelOverridePayload(providerId: string): Record<string, unknown> | null {
+  const byModel: Record<string, Record<string, unknown>> = {}
+  for (const row of customModels.value) {
+    const modelId = row.id.trim()
+    if (!modelId) continue
+    const fields: Record<string, unknown> = {}
+    const contextWindow = parseTokenCountInput(row.params.contextWindow)
+    if (contextWindow !== null) fields.context_window = contextWindow
+    const maxOutput = parseTokenCountInput(row.params.maxOutputTokens)
+    if (maxOutput !== null) fields.max_output_tokens = maxOutput
+    if (row.params.supportsVision) fields.supports_vision = true
+    if (row.params.supportsVideo) fields.supports_video = true
+    if (Object.keys(fields).length) byModel[modelId] = fields
+  }
+  if (!Object.keys(byModel).length) return null
+  return { models: { [providerId]: byModel } }
+}
+async function saveCustomModelOverrides(providerId: string): Promise<void> {
+  const patch = customModelOverridePayload(providerId)
+  if (!patch) return
+  await appSettings.merge(patch as import('@/modules/appSettings').SettingsObject)
+}
+
+function removeCustomModelRow(index: number) {
+  customModels.value.splice(index, 1)
+}
+
+function discoverErrorDetail(err: unknown): string {
+  if (err instanceof Error) return err.message
+  if (typeof err === 'string') return err
+  if (err && typeof err === 'object') {
+    const record = err as { message?: unknown; detail?: unknown }
+    if (typeof record.message === 'string' && record.message) return record.message
+    if (typeof record.detail === 'string' && record.detail) return record.detail
+  }
+  return String(err ?? 'unknown error')
+}
+
+async function fetchCustomModels() {
+  const baseUrl = customBaseUrl.value.trim()
+  if (!baseUrl || customFetching.value) return
+  customFetching.value = true
+  customError.value = ''
+  try {
+    const res = await setupWorkflow.provider.discoverCustomProviderModels({
+      baseUrl,
+      apiKey: customApiKey.value.trim(),
+    })
+    const payload = (res ?? {}) as Record<string, unknown>
+    if (payload.ok === false) {
+      throw new Error(String(payload.error ?? 'unknown error'))
+    }
+    const models = Array.isArray(payload.models) ? payload.models : []
+    const discovered = models
+      .filter((row: unknown): row is Record<string, unknown> => Boolean(row) && typeof row === 'object')
+      .map(row => ({
+        id: String(row.id ?? '').trim(),
+        name: String(row.label ?? row.id ?? '').trim(),
+      }))
+      .filter(item => item.id)
+    if (discovered.length > 0) {
+      customModels.value = discovered.map(item => ({
+        id: item.id,
+        name: item.name || item.id,
+        params: emptyCustomModelParams(),
+        paramsOpen: true,
+      }))
+      customManualHint.value = false
+    } else {
+      customManualHint.value = true
+    }
+  } catch (err) {
+    customError.value = t('setup.provider.customErrorFetchModels', { detail: discoverErrorDetail(err) })
+  } finally {
+    customFetching.value = false
+  }
+}
+
+async function createCustomProvider() {
+  if (!customFormReady.value || customCreating.value) return
+  const providerId = customProviderId.value.trim().toLowerCase()
+  const models = customModels.value
+    .map(row => row.id.trim())
+    .filter(Boolean)
+  customCreating.value = true
+  customError.value = ''
+  try {
+    // Persist the per-model parameters first: on failure the provider is not
+    // created and the form stays open, so nothing partial is left behind.
+    try {
+      await saveCustomModelOverrides(providerId)
+    } catch (err) {
+      customError.value = t('setup.provider.customErrorSaveParams', { detail: discoverErrorDetail(err) })
+      return
+    }
+    await setupWorkflow.profile.upsertProfile({
+      providerId,
+      baseUrl: customBaseUrl.value.trim(),
+      apiKey: customApiKey.value.trim(),
+      model: models[0] || '',
+    })
+    resetCustomProviderForm()
+    closeAddPicker()
+    emit('selectConfiguredProvider', providerId)
+  } catch (err) {
+    customError.value = t('setup.provider.customErrorCreateFailed', { detail: discoverErrorDetail(err) })
+  } finally {
+    customCreating.value = false
+  }
+}
 
 const selectedProviderLabel = computed(() => (
   props.panel.credentialPanel?.providerLabel || props.panel.providerSelected
@@ -193,9 +406,10 @@ function chooseAddProvider(providerId: string) {
 }
 
 function closeAddPicker(restoreFocus = true) {
-  if (!addOpen.value && !editorOpen.value) return
+  if (!addOpen.value && !editorOpen.value && !customFormVisible.value) return
   addOpen.value = false
   editorOpen.value = false
+  customFormVisible.value = false
   if (restoreFocus) {
     const target = dialogInvoker.value ?? addButtonRef.value
     void nextTick(() => target?.focus())
@@ -216,7 +430,19 @@ function toggleAddPicker() {
     return
   }
   dialogInvoker.value = addButtonRef.value
+  customFormVisible.value = false
   addOpen.value = true
+  editorOpen.value = true
+}
+
+function toggleCustomProvider() {
+  if (editorOpen.value) {
+    closeAddPicker()
+    return
+  }
+  dialogInvoker.value = customAddButtonRef.value
+  addOpen.value = false
+  customFormVisible.value = true
   editorOpen.value = true
 }
 
@@ -226,6 +452,7 @@ function selectConfigured(providerId: string) {
     : null
   editorOpen.value = true
   addOpen.value = false
+  customFormVisible.value = false
   emit('selectConfiguredProvider', providerId)
 }
 
@@ -323,8 +550,9 @@ const modelSectionDesc = computed(() => {
 
 watch(() => props.panel.providerSelected, (value, previous) => {
   if (!value || value === previous) return
-  const selectedFromPicker = addOpen.value
+  const selectedFromPicker = addOpen.value || customFormVisible.value
   addOpen.value = false
+  customFormVisible.value = false
   if (selectedFromPicker) editorOpen.value = true
   void nextTick(() => {
     const credentialInput = selectedFromPicker
@@ -345,6 +573,11 @@ const hasSavableProviderChange = computed(() => (
 watch(() => props.saving, (saving, wasSaving) => {
   if (!wasSaving || saving || hasSavableProviderChange.value) return
   closeAddPicker()
+})
+
+watch(customFormVisible, visible => {
+  if (visible) return
+  resetCustomProviderForm()
 })
 
 watch(() => props.panel.configuredProviders, rows => {
@@ -581,34 +814,44 @@ const contextWindowAuto = computed<number | null>(() => {
   return typeof row?.contextWindow === 'number' ? row.contextWindow : null
 })
 
-const contextWindowOverride = computed<number | null>(() => (
-  parseContextWindowInput(props.panel.contextWindowTokens)
-))
-
-// Precedence mirrors the backend resolver (provider/resolution.py): a per-model
-// override wins, else the global llm.context_window_tokens layer, else the
-// auto-detected discovery window.
-const contextWindowEffective = computed<{ value: number | null; source: 'override' | 'config' | 'auto' }>(() => {
-  if (contextWindowOverride.value != null) {
-    return { value: contextWindowOverride.value, source: 'override' }
-  }
-  if (props.panel.contextWindowGlobal != null && props.panel.contextWindowGlobal > 0) {
-    return { value: props.panel.contextWindowGlobal, source: 'config' }
-  }
-  return { value: contextWindowAuto.value, source: 'auto' }
+const maxOutputAuto = computed<number | null>(() => {
+  if (!currentModelId.value) return null
+  const row = props.panel.connection.models.find(m => m.id === currentModelId.value)
+  return typeof row?.maxOutputTokens === 'number' && row.maxOutputTokens > 0
+    ? row.maxOutputTokens
+    : null
 })
 
-const contextWindowReadout = computed(() => t('setup.provider.contextWindowReadout', {
-  auto: contextWindowAuto.value != null
-    ? String(contextWindowAuto.value)
-    : t('setup.provider.contextWindowUnknown'),
-  override: contextWindowOverride.value != null
-    ? String(contextWindowOverride.value)
-    : t('setup.provider.contextWindowNone'),
-  effective: contextWindowEffective.value.value != null
-    ? String(contextWindowEffective.value.value)
-    : t('setup.provider.contextWindowUnknown'),
-}))
+// Engine-fallback placeholders (not a precedence reimplementation): the input's
+// gray hint shows what the engine will assume when the field is left blank —
+// local runtimes default to 8k, cloud deployments to the 200k floor (mirrors
+// provider/model_catalog.py DEFAULT_CONTEXT_WINDOW and the local 8192 num_ctx).
+const contextWindowHint = computed(() => {
+  if (contextWindowAuto.value != null) return formatTokenCountInput(contextWindowAuto.value)
+  return props.panel.providerIsLocal ? '8192' : '200k'
+})
+
+const maxOutputHint = computed(() => {
+  if (maxOutputAuto.value != null) return formatTokenCountInput(maxOutputAuto.value)
+  return props.panel.providerIsLocal ? '8192' : '16k'
+})
+
+// Warn only from the saved/override picture: local runtimes commonly truncate
+// silently below this window.
+const effectiveContextForWarning = computed<number | null>(() => {
+  const override = parseTokenCountInput(props.panel.contextWindowTokens)
+  if (override != null) return override
+  if (props.panel.contextWindowGlobal != null && props.panel.contextWindowGlobal > 0) {
+    return props.panel.contextWindowGlobal
+  }
+  return contextWindowAuto.value
+})
+
+const showContextWindowWarning = computed(() => (
+  props.panel.providerIsLocal
+  && effectiveContextForWarning.value != null
+  && effectiveContextForWarning.value <= LOCAL_CONTEXT_WINDOW_WARN_TOKENS
+))
 
 const effectiveMaxTokensReadout = computed(() => {
   if (props.panel.effectiveMaxTokensPending) {
@@ -639,11 +882,15 @@ const catalogSyncReadout = computed(() => {
   return ago ? t('setup.provider.modelCatalogSynced', { ago }) : ''
 })
 
-const showContextWindowWarning = computed(() => (
-  props.panel.providerIsLocal
-  && contextWindowEffective.value.value != null
-  && contextWindowEffective.value.value <= LOCAL_CONTEXT_WINDOW_WARN_TOKENS
-))
+const modelOverridesProp = computed(() => ({
+  contextWindow: props.panel.contextWindowTokens,
+  maxOutputTokens: props.panel.maxOutputTokens,
+  supportsVision: props.panel.modelSupportsVision,
+  supportsVideo: props.panel.modelSupportsVideo,
+  contextWindowHint: contextWindowHint.value,
+  maxOutputHint: maxOutputHint.value,
+  disabled: !currentModelId.value,
+}))
 
 const showTokenRhythmRecommendation = computed(() => {
   const hasTokenRhythm = props.panel.runtimeProviders.some(
@@ -673,18 +920,32 @@ const tokenRhythmCredentialReplacementRequired = computed(() => (
         <h3 class="control-section__title">{{ t('setup.provider.pageTitle') }}</h3>
         <p class="control-section__desc">{{ t('setup.provider.pageDesc') }}</p>
       </div>
-      <button
-        ref="addButtonRef"
-        type="button"
-        class="btn btn--primary setup-provider-page__add"
-        data-provider-picker-trigger
-        aria-controls="setup-provider-editor-dialog"
-        :aria-expanded="editorOpen ? 'true' : 'false'"
-        @click="toggleAddPicker"
-      >
-        <Icon name="plus" :size="15" aria-hidden="true" />
-        {{ t('setup.provider.addProvider') }}
-      </button>
+      <div class="setup-provider-page__actions">
+        <button
+          ref="customAddButtonRef"
+          type="button"
+          class="btn btn--primary setup-provider-page__add"
+          data-custom-provider-trigger
+          aria-controls="setup-provider-editor-dialog"
+          :aria-expanded="editorOpen ? 'true' : 'false'"
+          @click="toggleCustomProvider"
+        >
+          <Icon name="plus" :size="15" aria-hidden="true" />
+          {{ t('setup.provider.addCustomProvider') }}
+        </button>
+        <button
+          ref="addButtonRef"
+          type="button"
+          class="btn btn--primary setup-provider-page__add"
+          data-provider-picker-trigger
+          aria-controls="setup-provider-editor-dialog"
+          :aria-expanded="editorOpen ? 'true' : 'false'"
+          @click="toggleAddPicker"
+        >
+          <Icon name="plus" :size="15" aria-hidden="true" />
+          {{ t('setup.provider.addProvider') }}
+        </button>
+      </div>
     </div>
 
     <fieldset
@@ -884,6 +1145,17 @@ const tokenRhythmCredentialReplacementRequired = computed(() => (
           {{ t('setup.provider.configureModelRouting') }}
           <Icon name="chevronRight" :size="15" aria-hidden="true" />
         </button>
+        <!-- The read-only card replaces the model combobox, which would be the
+             home of the per-model parameter controls. Render them inline here
+             so the active provider's params stay editable; model *selection*
+             itself remains owned by Model Routing. -->
+        <SetupModelOverrides
+          class="setup-model-combobox__overrides"
+          v-bind="modelOverridesProp"
+          @update-context-window="emit('updateContextWindow', $event)"
+          @update-max-output-tokens="emit('updateMaxOutputTokens', $event)"
+          @update-cap="(name, value) => emit('updateCap', name, value)"
+        />
       </div>
       <template v-else v-for="field in modelFields" :key="field.name">
         <SetupModelCombobox
@@ -892,7 +1164,11 @@ const tokenRhythmCredentialReplacementRequired = computed(() => (
           :value="panel.providerFieldValue(field)"
           :models="panel.connection.models"
           :model-source="panel.connection.modelSource"
+          :overrides="modelOverridesProp"
           @update="(val) => emit('updateProviderField', 'model', val)"
+          @update-context-window="emit('updateContextWindow', $event)"
+          @update-max-output-tokens="emit('updateMaxOutputTokens', $event)"
+          @update-cap="(name, value) => emit('updateCap', name, value)"
         />
         <SetupField
           v-else
@@ -965,34 +1241,13 @@ const tokenRhythmCredentialReplacementRequired = computed(() => (
         </template>
       </section>
 
-      <section v-if="panel.editingPrimary && modelFields.length" class="setup-provider-options__group">
-      <label class="control-row">
-        <div class="control-row__label-block">
-          <span class="control-row__label">{{ t('setup.provider.contextWindowIdentityLabel', { provider: selectedProviderLabel, model: currentModelId || t('setup.provider.contextWindowNoModel') }) }}</span>
-          <span class="control-row__desc">{{ t('setup.provider.contextWindowIdentityDesc') }}</span>
-        </div>
-        <div class="control-row__control setup-context-window">
-          <input
-            class="control-input control-input--narrow"
-            :value="panel.contextWindowTokens"
-            name="setup_provider_context_window"
-            type="number"
-            min="0"
-            step="1024"
-            inputmode="numeric"
-            :placeholder="t('setup.provider.contextWindowAuto')"
-            :disabled="!currentModelId"
-            @input="emit('updateContextWindow', ($event.target as HTMLInputElement).value)"
-          >
-          <span class="setup-context-window__readout" aria-live="polite">{{ contextWindowReadout }}</span>
-        </div>
-      </label>
-      <div v-if="showContextWindowWarning" class="setup-warning">
-        {{ t('setup.provider.contextWindowLocalWarning', { tokens: contextWindowEffective.value }) }}
+      <div
+        v-if="panel.editingPrimary && modelFields.length && showContextWindowWarning"
+        class="setup-warning"
+      >
+        {{ t('setup.provider.contextWindowLocalWarning', { tokens: effectiveContextForWarning }) }}
       </div>
-      </section>
     </details>
-
     <details v-if="panel.editingPrimary" class="setup-provider-global-settings" :open="panel.providerAdvancedOpen">
       <summary class="control-row control-row--divider">
         {{ t('setup.provider.runtimeDefaultsTitle') }}
@@ -1078,15 +1333,19 @@ const tokenRhythmCredentialReplacementRequired = computed(() => (
             <header class="setup-provider-modal__head">
               <div class="setup-provider-modal__heading">
                 <span class="setup-provider-modal__mark" aria-hidden="true">
-                  <Icon :name="addOpen ? 'plus' : 'cloud'" :size="18" />
+                  <Icon :name="customFormVisible || addOpen ? 'plus' : 'cloud'" :size="18" />
                 </span>
                 <div>
                   <h4 id="setup-provider-modal-title">
-                    {{ addOpen
-                      ? t('setup.provider.catalogTitle')
-                      : t('setup.provider.editingTitle', { provider: selectedProviderLabel }) }}
+                    {{ customFormVisible
+                      ? t('setup.provider.customCreate')
+                      : (addOpen
+                        ? t('setup.provider.catalogTitle')
+                        : t('setup.provider.editingTitle', { provider: selectedProviderLabel })) }}
                   </h4>
-                  <p>{{ addOpen ? t('setup.provider.catalogDesc') : t('setup.provider.pageDesc') }}</p>
+                  <p>{{ customFormVisible
+                    ? t('setup.provider.customProviderIdHint')
+                    : (addOpen ? t('setup.provider.catalogDesc') : t('setup.provider.pageDesc')) }}</p>
                 </div>
               </div>
               <button
@@ -1100,6 +1359,189 @@ const tokenRhythmCredentialReplacementRequired = computed(() => (
             </header>
 
             <div class="setup-provider-modal__body">
+
+              <form
+                v-if="customFormVisible"
+                class="setup-provider-modal__form setup-provider-custom-form"
+                @submit.prevent="createCustomProvider()"
+              >
+                <label class="control-row">
+                  <div class="control-row__label-block">
+                    <span class="control-row__label">{{ t('setup.provider.customProviderIdLabel') }}</span>
+                    <span class="control-row__desc">{{ t('setup.provider.customProviderIdHint') }}</span>
+                  </div>
+                  <div class="control-row__control">
+                    <input
+                      v-model="customProviderId"
+                      class="control-input"
+                      name="custom_provider_id"
+                      type="text"
+                      autocomplete="off"
+                      spellcheck="false"
+                      @input="customProviderId = customProviderId.trim().toLowerCase()"
+                    >
+                  </div>
+                </label>
+                <p v-if="customProviderIdError" class="setup-warning" role="alert">
+                  {{ customProviderIdError }}
+                </p>
+
+                <label class="control-row">
+                  <div class="control-row__label-block">
+                    <span class="control-row__label">{{ t('setup.provider.customDisplayNameLabel') }}</span>
+                  </div>
+                  <div class="control-row__control">
+                    <input
+                      v-model="customDisplayName"
+                      class="control-input"
+                      name="custom_display_name"
+                      type="text"
+                      autocomplete="off"
+                    >
+                  </div>
+                </label>
+
+                <label class="control-row">
+                  <div class="control-row__label-block">
+                    <span class="control-row__label">{{ t('setup.provider.customBaseUrlLabel') }}</span>
+                  </div>
+                  <div class="control-row__control">
+                    <input
+                      v-model="customBaseUrl"
+                      class="control-input"
+                      name="custom_base_url"
+                      type="url"
+                      autocomplete="off"
+                      spellcheck="false"
+                      :placeholder="t('setup.provider.customBaseUrlPlaceholder')"
+                    >
+                  </div>
+                </label>
+
+                <label class="control-row">
+                  <div class="control-row__label-block">
+                    <span class="control-row__label">{{ t('setup.provider.customProtocolLabel') }}</span>
+                  </div>
+                  <div class="control-row__control">
+                    <select v-model="customProtocol" class="control-input" name="custom_protocol">
+                      <option
+                        v-for="option in CUSTOM_PROTOCOL_OPTIONS"
+                        :key="option.value"
+                        :value="option.value"
+                      >{{ option.label }}</option>
+                    </select>
+                  </div>
+                </label>
+
+                <label class="control-row">
+                  <div class="control-row__label-block">
+                    <span class="control-row__label">{{ t('setup.provider.customApiKeyLabel') }}</span>
+                  </div>
+                  <div class="control-row__control">
+                    <input
+                      v-model="customApiKey"
+                      class="control-input"
+                      name="custom_api_key"
+                      type="password"
+                      autocomplete="off"
+                      :placeholder="t('setup.provider.customApiKeyPlaceholder')"
+                    >
+                  </div>
+                </label>
+
+                <section class="setup-provider-modal__endpoint">
+                  <div class="setup-provider-options__head">
+                    <h5>{{ t('setup.provider.customModelsTitle') }}</h5>
+                    <p>{{ t('setup.provider.customModelsFetchHint') }}</p>
+                  </div>
+
+                  <button
+                    type="button"
+                    class="btn btn--ghost"
+                    :disabled="!customBaseUrl.trim() || customFetching"
+                    @click="fetchCustomModels()"
+                  >
+                    {{ customFetching ? '…' : t('setup.provider.customModelsFetch') }}
+                  </button>
+
+                  <p v-if="customManualHint" class="setup-warning" role="status">
+                    {{ t('setup.provider.customModelsManualHint') }}
+                  </p>
+                  <p
+                    v-else-if="customModels.length === 0"
+                    class="setup-provider-custom-form__empty"
+                  >
+                    {{ t('setup.provider.customModelsEmpty') }}
+                  </p>
+
+                  <div
+                    v-for="(row, index) in customModels"
+                    :key="index"
+                    class="setup-provider-custom-form__model-item"
+                  >
+                    <div class="setup-provider-custom-form__model-row">
+                      <input
+                        v-model="row.id"
+                        class="control-input"
+                        type="text"
+                        spellcheck="false"
+                        :placeholder="t('setup.provider.customModelIdPlaceholder')"
+                      >
+                      <input
+                        v-model="row.name"
+                        class="control-input"
+                        type="text"
+                        :placeholder="t('setup.provider.customModelNamePlaceholder')"
+                      >
+                      <button
+                        type="button"
+                        class="btn btn--ghost btn--icon setup-provider-custom-form__params-toggle"
+                        :class="{ 'is-open': row.paramsOpen }"
+                        :aria-label="t('setup.provider.modelOverridesTitle')"
+                        :aria-expanded="row.paramsOpen ? 'true' : 'false'"
+                        @click="row.paramsOpen = !row.paramsOpen"
+                      >
+                        <Icon name="chevronDown" :size="15" aria-hidden="true" />
+                      </button>
+                      <button
+                        type="button"
+                        class="btn btn--ghost btn--icon"
+                        :aria-label="t('setup.provider.customModelsRemove')"
+                        @click="removeCustomModelRow(index)"
+                      >
+                        <Icon name="x" :size="15" aria-hidden="true" />
+                      </button>
+                    </div>
+                    <SetupModelOverrides
+                      v-if="row.paramsOpen"
+                      class="setup-provider-custom-form__model-params"
+                      :context-window="row.params.contextWindow"
+                      :max-output-tokens="row.params.maxOutputTokens"
+                      :supports-vision="row.params.supportsVision"
+                      :supports-video="row.params.supportsVideo"
+                      :context-window-hint="t('setup.provider.contextWindowAuto')"
+                      :max-output-hint="t('setup.provider.contextWindowAuto')"
+                      @update-context-window="row.params.contextWindow = $event"
+                      @update-max-output-tokens="row.params.maxOutputTokens = $event"
+                      @update-cap="(name, value) => updateCustomModelCap(row, name, value)"
+                    />
+                  </div>
+
+                  <button
+                    type="button"
+                    class="btn btn--ghost"
+                    @click="addCustomModelRow()"
+                  >
+                    {{ t('setup.provider.customModelsAdd') }}
+                  </button>
+                </section>
+
+                <p v-if="customError" class="setup-warning" role="alert">
+                  {{ customError }}
+                </p>
+
+              </form>
+
               <SetupProviderCatalogDialog
                 v-if="addOpen"
                 :open="addOpen"
@@ -1111,7 +1553,7 @@ const tokenRhythmCredentialReplacementRequired = computed(() => (
               />
 
               <div
-                v-if="!addOpen && panel.providerSelected && replacesCurrentProvider"
+                v-if="!isAddFlow && panel.providerSelected && replacesCurrentProvider"
                 class="setup-warning setup-provider-modal__compat-warning"
                 role="status"
               >
@@ -1119,7 +1561,7 @@ const tokenRhythmCredentialReplacementRequired = computed(() => (
               </div>
 
               <fieldset
-                v-if="!addOpen && panel.providerSelected"
+                v-if="!isAddFlow && panel.providerSelected"
                 class="setup-provider-modal__form"
                 :disabled="providerBusy || saving"
               >
@@ -1214,7 +1656,22 @@ const tokenRhythmCredentialReplacementRequired = computed(() => (
               </fieldset>
             </div>
 
-            <footer v-if="!addOpen && panel.providerSelected" class="setup-provider-modal__footer">
+            <footer v-if="customFormVisible" class="setup-provider-modal__footer">
+              <span class="setup-provider-modal__footer-spacer"></span>
+              <button
+                type="button"
+                class="btn btn--ghost"
+                @click="cancelAndClose()"
+              >{{ t('common.cancel') }}</button>
+              <button
+                type="button"
+                class="btn btn--primary"
+                :disabled="!customFormReady || customCreating"
+                @click="createCustomProvider()"
+              >{{ customCreating ? '…' : t('setup.provider.saveChanges') }}</button>
+            </footer>
+
+            <footer v-if="!addOpen && !customFormVisible && panel.providerSelected" class="setup-provider-modal__footer">
               <button
                 v-if="panel.profileSaveSupported && panelIsStoredProvider && selectedConfiguredProvider"
                 type="button"
@@ -1272,6 +1729,13 @@ const tokenRhythmCredentialReplacementRequired = computed(() => (
   display: grid;
   gap: var(--sp-1);
   min-width: 0;
+}
+
+.setup-provider-page__actions {
+  align-items: center;
+  display: flex;
+  flex: 0 0 auto;
+  gap: var(--sp-2);
 }
 
 .setup-provider-page__add {
@@ -1873,6 +2337,41 @@ const tokenRhythmCredentialReplacementRequired = computed(() => (
   min-height: 0;
   overflow-y: auto;
   padding: var(--sp-5);
+}
+
+.setup-provider-custom-form {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-3);
+}
+
+.setup-provider-custom-form__model-row {
+  align-items: center;
+  display: flex;
+  gap: var(--sp-2);
+}
+
+.setup-provider-custom-form__model-row .control-input {
+  flex: 1 1 0;
+}
+
+.setup-provider-custom-form__model-item {
+  display: grid;
+  gap: var(--sp-2);
+}
+
+.setup-provider-custom-form__model-item + .setup-provider-custom-form__model-item {
+  margin-top: 10px;
+}
+
+.setup-provider-custom-form__params-toggle.is-open {
+  transform: rotate(180deg);
+}
+
+.setup-provider-custom-form__empty {
+  color: var(--text-muted);
+  font-size: var(--fs-sm);
+  margin: 0;
 }
 
 .setup-provider-modal__compat-warning {

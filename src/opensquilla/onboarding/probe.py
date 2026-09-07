@@ -33,7 +33,7 @@ from opensquilla.provider.auxiliary_budget import (
 )
 from opensquilla.provider.failures import ProviderFailureKind, classify_provider_error
 from opensquilla.provider.protocol import LLMProvider
-from opensquilla.provider.registry import get_provider_spec
+from opensquilla.provider.registry import UnknownProviderError, get_provider_spec
 from opensquilla.provider.selector import (
     ProviderBuildError,
     _exception_status_code,
@@ -390,6 +390,7 @@ def _discover_model_row(info: ModelInfo, provider_id: str) -> dict[str, object]:
     )
     safe_vision = info.supports_vision or entry.supports_vision
     vision_enabled = False if vision is False else safe_vision
+    video_enabled = info.supports_video or entry.supports_video
     capabilities: list[str] = ["chat"]
     if tools_enabled:
         capabilities.append("tools")
@@ -397,6 +398,8 @@ def _discover_model_row(info: ModelInfo, provider_id: str) -> dict[str, object]:
         capabilities.append("reasoning")
     if vision_enabled:
         capabilities.append("vision")
+    if video_enabled:
+        capabilities.append("video")
 
     pricing: dict[str, float] | None = None
     if info.input_cost_per_1k > 0 or info.output_cost_per_1k > 0:
@@ -571,7 +574,21 @@ async def discover_selectable_provider_models(
     subdomains).
     """
     provider_id = (provider_id or "").strip()
-    spec = get_provider_spec(provider_id)  # raises UnknownProviderError(ValueError)
+    try:
+        spec = get_provider_spec(provider_id)  # raises UnknownProviderError(ValueError)
+    except UnknownProviderError:
+        # Allow custom OpenAI-compatible providers created through the UI to be
+        # discovered immediately, without a gateway restart. If a base URL is
+        # supplied, register the provider dynamically and retry.
+        if base_url:
+            from opensquilla.provider.registry import register_profile_provider
+
+            if register_profile_provider(provider_id, base_url):
+                spec = get_provider_spec(provider_id)
+            else:
+                raise
+        else:
+            raise
     if not spec.runtime_supported:
         raise ValueError(f"Provider '{provider_id}' has no runtime support to discover.")
 

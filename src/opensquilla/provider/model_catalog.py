@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import fnmatch
+import re
 import tomllib
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
@@ -68,7 +69,9 @@ class _TokenRhythmSnapshotSidecars:
 # model-metadata layer (live catalog, models.dev snapshot, packaged static
 # fallback), "default" is a hardcoded engine default.
 MaxTokensSource = Literal["override", "catalog", "default"]
-ContextWindowSource = Literal["override", "catalog", "default"]
+ContextWindowSource = Literal[
+    "override", "config", "catalog", "default"
+]
 
 # Local runtimes (Ollama, …) have unqualified model ids that miss the catalog
 # and the packaged corrections, so the 200k cloud default would make the turn
@@ -278,6 +281,7 @@ def _corrections_budget_fallback(model_id: str) -> tuple[int, int] | None:
     )
 
 
+
 def _live_layer_fields(info: ModelInfo | None) -> dict[str, Any]:
     """Fields the live provider catalog knows, adapted per-1k → per-Mtok.
 
@@ -293,6 +297,7 @@ def _live_layer_fields(info: ModelInfo | None) -> dict[str, Any]:
         "supports_reasoning": info.supports_reasoning,
         "supports_tools": info.supports_tools,
         "supports_vision": info.supports_vision,
+        "supports_video": info.supports_video,
     }
     if info.display_name:
         fields["display_name"] = info.display_name
@@ -382,6 +387,7 @@ def _snapshot_layer_fields(provider_id: str, model_id: str) -> dict[str, Any]:
         ("reasoning", "supports_reasoning"),
         ("tools", "supports_tools"),
         ("vision", "supports_vision"),
+        ("video", "supports_video"),
     ):
         if snapshot_key in entry:
             fields[field_name] = bool(entry[snapshot_key])
@@ -416,6 +422,7 @@ def _capabilities_from_entry(entry: ModelCatalogEntry) -> ModelCapabilities:
         supports_reasoning=supports_reasoning,
         supports_tools=entry.supports_tools,
         supports_vision=entry.supports_vision,
+        supports_video=entry.supports_video,
         reasoning_format=reasoning_format if supports_reasoning else "none",
     )
 
@@ -460,9 +467,24 @@ class ModelCatalog:
             declared_by_authority={},
         )
         self._warned_max_token_overrides: set[tuple[str, str, int, int]] = set()
+        self._profile_default_windows: dict[str, int] = {}
 
     def __len__(self) -> int:
         return len(self._models)
+
+    def set_profile_default_windows(self, windows: Mapping[str, int]) -> None:
+        cleaned: dict[str, int] = {}
+        for provider_id, window in (windows or {}).items():
+            pid = str(provider_id or "").strip().lower()
+            if not pid:
+                continue
+            try:
+                value = int(window)
+            except (TypeError, ValueError):
+                continue
+            if value > 0:
+                cleaned[pid] = value
+        self._profile_default_windows = cleaned
 
     def _populate_from_data(self, models: list[dict]) -> None:
         """Parse a list of OpenRouter model dicts into ModelInfo entries."""
@@ -487,6 +509,7 @@ class ModelCatalog:
                 supports_reasoning="reasoning" in supported or "reasoning_effort" in supported,
                 supports_tools="tools" in supported or "tool_choice" in supported,
                 supports_vision="image" in input_modalities,
+                supports_video="video" in input_modalities,
                 input_cost_per_1k=_price_per_1k(pricing.get("prompt")),
                 output_cost_per_1k=_price_per_1k(pricing.get("completion")),
             )
@@ -546,14 +569,18 @@ class ModelCatalog:
         ):
             supports_tools = info.supports_tools
             supports_vision = info.supports_vision
+            supports_video = info.supports_video
             if isinstance(override_fields.get("supports_tools"), bool):
                 supports_tools = override_fields["supports_tools"]
             if isinstance(override_fields.get("supports_vision"), bool):
                 supports_vision = override_fields["supports_vision"]
+            if isinstance(override_fields.get("supports_video"), bool):
+                supports_video = override_fields["supports_video"]
             return ModelCapabilities(
                 supports_reasoning=True,
                 supports_tools=supports_tools,
                 supports_vision=supports_vision,
+                supports_video=supports_video,
                 reasoning_format=(
                     override_reasoning_format
                     if isinstance(override_reasoning_format, str)
@@ -1281,6 +1308,7 @@ class ModelCatalog:
             ("reasoning", "supports_reasoning"),
             ("tools", "supports_tools"),
             ("vision", "supports_vision"),
+            ("video", "supports_video"),
         ):
             value = None
             if declared is not None:
@@ -1380,6 +1408,7 @@ class ModelCatalog:
                     for value, field_name in (
                         (declared.capabilities.tools, "supports_tools"),
                         (declared.capabilities.vision, "supports_vision"),
+                        (declared.capabilities.video, "supports_video"),
                     ):
                         if value is not None:
                             fields[field_name] = value
@@ -1620,6 +1649,13 @@ class ModelCatalog:
         budgets = _corrections_budget_fallback(model_id)
         if budgets is not None and budgets[1] > 0:
             return budgets[1], "catalog"
+        # Profile-scoped default window (``[llm_profiles.<id>].context_window_tokens``)
+        # — an explicit operator value for the whole profile deployment, more
+        # specific than the global llm.context_window_tokens and trusted by the
+        # ensemble member budget rebinding ("config" source).
+        profile_window = self._profile_default_windows.get(provider_id)
+        if profile_window and int(profile_window) > 0:
+            return int(profile_window), "config"
         if provider and provider.strip().lower() in LOCAL_RUNTIME_PROVIDERS:
             return _LOCAL_CONTEXT_WINDOW, "default"
         return DEFAULT_CONTEXT_WINDOW, "default"

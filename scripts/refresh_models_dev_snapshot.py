@@ -80,6 +80,7 @@ def _trim_model(entry: dict) -> dict | None:
         "reasoning": bool(entry.get("reasoning")),
         "tools": bool(entry.get("tool_call")),
         "vision": "image" in inputs,
+        "video": "video" in inputs,
     }
     cost = entry.get("cost")
     if isinstance(cost, dict):

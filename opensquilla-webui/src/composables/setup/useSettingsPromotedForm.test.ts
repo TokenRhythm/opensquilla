@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { useSettingsPromotedForm, parseContextWindowInput } from './useSettingsPromotedForm'
+import { useSettingsPromotedForm, formatTokenCountInput, parseTokenCountInput } from './useSettingsPromotedForm'
 
 // The audio TTS tuning fields (voice/model/base_url/language_code) are accepted
 // and applied by the backend (mutations.upsert_audio_provider); these cover the
@@ -68,10 +68,10 @@ describe('useSettingsPromotedForm — audio TTS fields', () => {
   })
 })
 
-// The per-model context-window override persists through config.patch's
-// deep-merge `patch` envelope because model ids ("qwen3:8b",
-// "deepseek/deepseek-v4-pro") contain separators that break dot-path patches.
-describe('useSettingsPromotedForm — context-window override', () => {
+// The per-model overrides persist through config.patch's deep-merge `patch`
+// envelope because model ids ("qwen3:8b", "deepseek/deepseek-v4-pro") contain
+// separators that break dot-path patches.
+describe('useSettingsPromotedForm — per-model overrides', () => {
   it('seeds from the saved provider+model override and stays pristine', () => {
     const f = useSettingsPromotedForm()
     f.initFromConfig({
@@ -79,18 +79,19 @@ describe('useSettingsPromotedForm — context-window override', () => {
       models: { ollama: { 'qwen3:8b': { context_window: 16384 } } },
     })
     expect(f.contextWindowTokens.value).toBe('16384')
-    expect(f.contextWindowDirty.value).toBe(false)
-    expect(f.contextWindowPatch('ollama', 'qwen3:8b')).toBeNull() // pristine → nothing to send
+    expect(f.modelOverridesDirty.value).toBe(false)
+    expect(f.modelOverridesPatch('ollama', 'qwen3:8b')).toBeNull() // pristine → nothing to send
   })
 
-  it('leaves the field blank when no override is saved for the model', () => {
+  it('leaves the fields blank when no override is saved for the model', () => {
     const f = useSettingsPromotedForm()
     f.initFromConfig({
       llm: { provider: 'openrouter', model: 'deepseek/deepseek-v4-pro' },
       models: { ollama: { 'qwen3:8b': { context_window: 16384 } } },
     })
     expect(f.contextWindowTokens.value).toBe('')
-    expect(f.contextWindowDirty.value).toBe(false)
+    expect(f.maxOutputTokens.value).toBe('')
+    expect(f.modelOverridesDirty.value).toBe(false)
   })
 
   it('builds a deep-merge patch keyed by the raw model id when edited', () => {
@@ -98,7 +99,7 @@ describe('useSettingsPromotedForm — context-window override', () => {
     f.initFromConfig({ llm: { provider: 'ollama', model: 'qwen3:8b' } })
     f.setContextWindowTokens('32768')
     expect(f.contextWindowDirty.value).toBe(true)
-    expect(f.contextWindowPatch('ollama', 'qwen3:8b')).toEqual({
+    expect(f.modelOverridesPatch('ollama', 'qwen3:8b')).toEqual({
       models: { ollama: { 'qwen3:8b': { context_window: 32768 } } },
     })
   })
@@ -111,7 +112,7 @@ describe('useSettingsPromotedForm — context-window override', () => {
     })
     f.setContextWindowTokens('')
     expect(f.contextWindowDirty.value).toBe(true)
-    expect(f.contextWindowPatch('ollama', 'qwen3:8b')).toEqual({
+    expect(f.modelOverridesPatch('ollama', 'qwen3:8b')).toEqual({
       models: { ollama: { 'qwen3:8b': { context_window: null } } },
     })
   })
@@ -123,57 +124,135 @@ describe('useSettingsPromotedForm — context-window override', () => {
       models: { ollama: { 'qwen3:8b': { context_window: 16384 } } },
     })
     f.setContextWindowTokens('0')
-    expect(f.contextWindowPatch('ollama', 'qwen3:8b')).toEqual({
+    expect(f.modelOverridesPatch('ollama', 'qwen3:8b')).toEqual({
       models: { ollama: { 'qwen3:8b': { context_window: null } } },
     })
-    expect(f.contextWindowPatch('ollama', '')).toBeNull()
-    expect(f.contextWindowPatch('', 'qwen3:8b')).toBeNull()
+    expect(f.modelOverridesPatch('ollama', '')).toBeNull()
+    expect(f.modelOverridesPatch('', 'qwen3:8b')).toBeNull()
   })
 
-  it('reloading config rebaselines the field so a saved value is no longer dirty', () => {
+  it('sends max_output_tokens overrides through the same patch envelope', () => {
+    const f = useSettingsPromotedForm()
+    f.initFromConfig({ llm: { provider: 'ollama', model: 'qwen3:8b' } })
+    f.setMaxOutputTokens('4096')
+    expect(f.maxOutputDirty.value).toBe(true)
+    expect(f.modelOverridesPatch('ollama', 'qwen3:8b')).toEqual({
+      models: { ollama: { 'qwen3:8b': { max_output_tokens: 4096 } } },
+    })
+  })
+
+  it('capability checkboxes only force true; unchecking deletes the override', () => {
+    const f = useSettingsPromotedForm()
+    f.initFromConfig({
+      llm: { provider: 'ollama', model: 'qwen3:8b' },
+      models: {
+        ollama: { 'qwen3:8b': { supports_vision: true, supports_video: true } },
+      },
+    })
+    expect(f.modelSupportsVision.value).toBe(true)
+    expect(f.modelSupportsVideo.value).toBe(true)
+    expect(f.modelCapsDirty.value).toBe(false)
+
+    // Unchecking a saved-true capability deletes the stored override.
+    f.setModelCap('video', false)
+    expect(f.modelCapsDirty.value).toBe(true)
+    expect(f.modelOverridesPatch('ollama', 'qwen3:8b')).toEqual({
+      models: { ollama: { 'qwen3:8b': { supports_video: null } } },
+    })
+
+    // Re-checking restores the baseline, so the draft is pristine again.
+    f.setModelCap('video', true)
+    expect(f.modelCapsDirty.value).toBe(false)
+    expect(f.modelOverridesPatch('ollama', 'qwen3:8b')).toBeNull()
+  })
+
+  it('checking a capability that is not saved forces the override on', () => {
+    const f = useSettingsPromotedForm()
+    f.initFromConfig({ llm: { provider: 'ollama', model: 'qwen3:8b' } })
+    f.setModelCap('vision', true)
+    f.setModelCap('video', true)
+    expect(f.modelCapsDirty.value).toBe(true)
+    expect(f.modelOverridesPatch('ollama', 'qwen3:8b')).toEqual({
+      models: { ollama: { 'qwen3:8b': { supports_vision: true, supports_video: true } } },
+    })
+  })
+
+  it('reloading config rebaselines the fields so saved values are no longer dirty', () => {
     const f = useSettingsPromotedForm()
     f.initFromConfig({ llm: { provider: 'ollama', model: 'qwen3:8b' } })
     f.setContextWindowTokens('32768')
-    expect(f.contextWindowDirty.value).toBe(true)
+    f.setMaxOutputTokens('4096')
+    expect(f.modelOverridesDirty.value).toBe(true)
     f.initFromConfig({
       llm: { provider: 'ollama', model: 'qwen3:8b' },
-      models: { ollama: { 'qwen3:8b': { context_window: 32768 } } },
+      models: {
+        ollama: { 'qwen3:8b': { context_window: 32768, max_output_tokens: 4096 } },
+      },
     })
     expect(f.contextWindowTokens.value).toBe('32768')
-    expect(f.contextWindowDirty.value).toBe(false)
+    expect(f.maxOutputTokens.value).toBe('4096')
+    expect(f.modelOverridesDirty.value).toBe(false)
   })
 
-  it('reseeds value + baseline from the saved override for a switched provider+model', () => {
+  it('reseeds values + baselines from the saved overrides for a switched provider+model', () => {
     const f = useSettingsPromotedForm()
     const config = {
       llm: { provider: 'ollama', model: 'qwen3:8b' },
       models: {
-        ollama: { 'qwen3:8b': { context_window: 16384 } },
-        vllm: { 'meta/llama-4': { context_window: 65536 } },
+        ollama: { 'qwen3:8b': { context_window: 16384, supports_vision: true } },
+        vllm: { 'meta/llama-4': { context_window: 65536, supports_video: true } },
       },
     }
     f.initFromConfig(config)
     expect(f.contextWindowTokens.value).toBe('16384')
+    expect(f.modelSupportsVision.value).toBe(true)
 
     // Provider switch: reseed from the new provider+model override, pristine.
-    f.reseedContextWindow(config, 'vllm', 'meta/llama-4')
+    f.reseedModelOverrides(config, 'vllm', 'meta/llama-4')
     expect(f.contextWindowTokens.value).toBe('65536')
-    expect(f.contextWindowDirty.value).toBe(false)
+    expect(f.modelSupportsVision.value).toBe(false)
+    expect(f.modelSupportsVideo.value).toBe(true)
+    expect(f.modelOverridesDirty.value).toBe(false)
 
-    // Model switch to one with no saved override: clears the field, pristine.
-    f.reseedContextWindow(config, 'vllm', 'meta/llama-4-mini')
+    // Model switch to one with no saved override: clears everything, pristine.
+    f.reseedModelOverrides(config, 'vllm', 'meta/llama-4-mini')
     expect(f.contextWindowTokens.value).toBe('')
-    expect(f.contextWindowDirty.value).toBe(false)
+    expect(f.modelSupportsVideo.value).toBe(false)
+    expect(f.modelOverridesDirty.value).toBe(false)
   })
 })
 
-describe('parseContextWindowInput', () => {
+describe('parseTokenCountInput', () => {
   it('returns a floored positive integer or null for blank/zero/non-numeric', () => {
-    expect(parseContextWindowInput('16384')).toBe(16384)
-    expect(parseContextWindowInput('32768.9')).toBe(32768)
-    expect(parseContextWindowInput('')).toBeNull()
-    expect(parseContextWindowInput('0')).toBeNull()
-    expect(parseContextWindowInput('-5')).toBeNull()
-    expect(parseContextWindowInput('abc')).toBeNull()
+    expect(parseTokenCountInput('16384')).toBe(16384)
+    expect(parseTokenCountInput('32768.9')).toBe(32768)
+    expect(parseTokenCountInput('')).toBeNull()
+    expect(parseTokenCountInput('0')).toBeNull()
+    expect(parseTokenCountInput('-5')).toBeNull()
+    expect(parseTokenCountInput('abc')).toBeNull()
+  })
+
+  it('accepts k/M unit suffixes case-insensitively', () => {
+    expect(parseTokenCountInput('64k')).toBe(64000)
+    expect(parseTokenCountInput('64K')).toBe(64000)
+    expect(parseTokenCountInput('1M')).toBe(1_000_000)
+    expect(parseTokenCountInput('1m')).toBe(1_000_000)
+    expect(parseTokenCountInput('1.5M')).toBe(1_500_000)
+    expect(parseTokenCountInput('0.5k')).toBe(500)
+    expect(parseTokenCountInput(' 1M ')).toBe(1_000_000)
+    expect(parseTokenCountInput('1kb')).toBeNull()
+    expect(parseTokenCountInput('k')).toBeNull()
+    expect(parseTokenCountInput('1MB')).toBeNull()
+  })
+
+  it('formats saved counts losslessly in compact k/M form', () => {
+    expect(formatTokenCountInput(1024000)).toBe('1024k')
+    expect(formatTokenCountInput(1_000_000)).toBe('1M')
+    expect(formatTokenCountInput(960000)).toBe('960k')
+    expect(formatTokenCountInput(8192)).toBe('8192')
+    expect(formatTokenCountInput(0)).toBe('')
+    expect(formatTokenCountInput(null)).toBe('')
+    // Round-trips back through the parser unchanged.
+    expect(parseTokenCountInput(formatTokenCountInput(1024000))).toBe(1024000)
   })
 })

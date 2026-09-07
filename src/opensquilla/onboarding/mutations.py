@@ -41,7 +41,10 @@ from opensquilla.onboarding.image_generation_specs import (
 from opensquilla.onboarding.image_generation_state import (
     apply_image_generation_intent,
 )
-from opensquilla.onboarding.provider_specs import get_provider_setup_spec
+from opensquilla.onboarding.provider_specs import (
+    ProviderSetupSpec,
+    get_provider_setup_spec,
+)
 from opensquilla.onboarding.redaction import (
     REDACTED_PLACEHOLDER,
     is_redacted_secret_sentinel,
@@ -2643,7 +2646,29 @@ def upsert_llm_profile(
     on such a change every omitted credential source is cleared fail-closed.
     """
     provider = str(provider_id or "").strip().lower()
-    spec = get_provider_setup_spec(provider)
+    spec: ProviderSetupSpec
+    try:
+        spec = get_provider_setup_spec(provider)
+    except KeyError:
+        # Custom providers ("自选服务商") use arbitrary ids outside the
+        # built-in setup catalog. Mirror probe.py: register the id as a
+        # dynamic OpenAI-compatible provider from its base URL (the request
+        # one, else the stored profile's) so the catalog lookup resolves;
+        # without any base URL an unknown id stays an error. Registration is
+        # idempotent and the dynamic spec carries runtime_supported=True.
+        from opensquilla.provider.registry import register_profile_provider
+
+        existing_base_url = ""
+        profile_keys = _llm_profile_storage_keys(config, provider)
+        if profile_keys:
+            existing_base_url = str(
+                getattr(config.llm_profiles.get(profile_keys[0]), "base_url", "") or ""
+            ).strip()
+        if not register_profile_provider(
+            provider, str(base_url or "").strip() or existing_base_url
+        ):
+            raise
+        spec = get_provider_setup_spec(provider)
     if not spec.runtime_supported:
         raise ValueError(
             f"provider {provider!r} is not runtime-supported and cannot be configured"
@@ -2676,6 +2701,11 @@ def upsert_llm_profile(
         effective_base_url = str(base_url or "").strip()
     if spec.requires_base_url and not (effective_base_url or spec.default_base_url):
         raise ValueError(f"provider {provider!r} requires a base_url")
+
+    if effective_base_url:
+        from opensquilla.provider.registry import register_profile_provider
+
+        register_profile_provider(provider, effective_base_url)
 
     old_endpoint = existing_base_url or str(spec.default_base_url or "").strip()
     next_endpoint = effective_base_url or str(spec.default_base_url or "").strip()

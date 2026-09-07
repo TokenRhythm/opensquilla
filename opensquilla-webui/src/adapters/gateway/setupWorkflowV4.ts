@@ -99,6 +99,11 @@ export function createV4SetupWorkflow(rpc: RpcTransport): SetupWorkflow {
     discoverPrimaryModels(command, request) {
       return requestContract(rpc, setupContracts.modelsDiscover, wireParams(command), request) as Promise<SetupDiscoveryResult>
     },
+    discoverCustomProviderModels(command, request) {
+      // Custom OpenAI-compatible endpoints are not registered providers, so
+      // model listing goes through the dedicated no-persist discovery RPC.
+      return rpc.request('onboarding.customProvider.models.discover', wireParams(command), options(request?.signal)) as Promise<SetupDiscoveryResult>
+    },
     revealActiveCredential(providerId, request) {
       return requestContract(rpc, setupContracts.credentialReveal, { providerId }, request)
     },

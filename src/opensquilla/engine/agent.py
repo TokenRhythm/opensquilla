@@ -3409,6 +3409,9 @@ class Agent:
                     supports_vision=bool(
                         getattr(resolved_capabilities, "supports_vision", False)
                     ),
+                    supports_video=bool(
+                        getattr(resolved_capabilities, "supports_video", False)
+                    ),
                     reasoning_format=str(
                         getattr(resolved_capabilities, "reasoning_format", "none")
                         or "none"

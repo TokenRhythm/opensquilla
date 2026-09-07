@@ -170,10 +170,16 @@ export interface SetupCatalogPort {
 }
 export interface SetupStatusPort { status(options?: SetupRequestOptions): Promise<SetupStatus> }
 
+export interface DiscoverCustomProviderModels {
+  baseUrl: string
+  apiKey?: string | null
+}
+
 export interface ProviderSetup {
   configurePrimary(command: ConfigurePrimaryProvider, options?: SetupRequestOptions): Promise<SetupStatus>
   probePrimary(command: ProbePrimaryProvider, options?: SetupRequestOptions): Promise<SetupStatus>
   discoverPrimaryModels(command: DiscoverPrimaryModels, options?: SetupRequestOptions): Promise<SetupDiscoveryResult>
+  discoverCustomProviderModels(command: DiscoverCustomProviderModels, options?: SetupRequestOptions): Promise<SetupDiscoveryResult>
   revealActiveCredential(providerId: string, options?: SetupRequestOptions): Promise<SetupStatus>
   clearActiveCredential(providerId: string, options?: SetupRequestOptions): Promise<SetupStatus>
 }

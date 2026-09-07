@@ -133,7 +133,17 @@ def resolve_provider_deployment(
     try:
         spec = get_provider_spec(provider)
     except UnknownProviderError:
-        return _unready(provider, model_id, "unknown_provider")
+        # Dynamic profile providers: any [llm_profiles.<name>] with a base_url
+        # auto-registers on first resolution. This makes config edits hot — no
+        # gateway restart needed — because every turn re-runs this path against
+        # the live config object.
+        try:
+            from opensquilla.provider.registry import register_profile_providers
+
+            register_profile_providers(config)
+            spec = get_provider_spec(provider)
+        except UnknownProviderError:
+            return _unready(provider, model_id, "unknown_provider")
     if not spec.runtime_supported:
         return _unready(provider, model_id, "runtime_unsupported")
 
