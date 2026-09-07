@@ -1341,6 +1341,8 @@ def test_signing_source_changes_select_contracts_and_release_packaging(
         "desktop/electron/scripts/packaged-first-send-cleanup.mjs",
         "desktop/electron/scripts/test-packaged-first-send-cleanup.mjs",
         "desktop/electron/scripts/test-packaged-first-send-renderer.mjs",
+        "desktop/electron/scripts/session-recovery-transport-contract.mjs",
+        "desktop/electron/scripts/test-packaged-session-recovery.mjs",
         "tests/test_ci/test_release_signing_preflight.py",
         "tests/test_ci/test_windows_signatures.py",
     ],

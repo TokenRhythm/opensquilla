@@ -56,17 +56,32 @@ export function electronProcessSnapshot(identity) {
 }
 
 export async function installQuitDiagnosticProbe(app, diagnosticFile) {
-  await app.evaluate(({ app, BrowserWindow }, file) => {
+  await app.evaluate(({ app, BrowserWindow, webContents }, file) => {
     const fs = process.getBuiltinModule('fs')
     const log = (event, detail = {}) => fs.appendFileSync(file, JSON.stringify({
       event, at: new Date().toISOString(), pid: process.pid, ...detail,
     }) + '\n')
+    const resourceSnapshot = () => {
+      try {
+        const resourceTypes = {}
+        for (const type of process.getActiveResourcesInfo()) {
+          resourceTypes[type] = (resourceTypes[type] || 0) + 1
+        }
+        return {
+          resourceTypes,
+          windowCount: BrowserWindow.getAllWindows().length,
+          webContentsCount: webContents.getAllWebContents().length,
+        }
+      } catch (error) {
+        return { resourceDiagnosticError: String(error?.message || error).slice(0, 500) }
+      }
+    }
     const originalExit = app.exit
     app.exit = function (...args) {
-      log('app-exit-entered')
+      log('app-exit-entered', resourceSnapshot())
       try {
         const result = originalExit.apply(this, args)
-        log('app-exit-returned')
+        log('app-exit-returned', resourceSnapshot())
         return result
       } catch (error) {
         log('app-exit-threw', { error: String(error?.message || error).slice(0, 500) })
@@ -78,7 +93,7 @@ export async function installQuitDiagnosticProbe(app, diagnosticFile) {
       const windowId = window.id
       window.once('closed', () => log('window-closed', { windowId }))
     }
-    log('probe-installed', { windowCount: BrowserWindow.getAllWindows().length })
+    log('probe-installed', resourceSnapshot())
   }, diagnosticFile)
 }
 
@@ -90,18 +105,34 @@ export async function quitElectronOnNextTurn(app, identity, timeoutMs) {
   // Keep the debugger connection alive during the production asynchronous
   // drain. Playwright's normal close() disconnects it immediately after quit().
   await app.evaluate(({ app }) => { setImmediate(() => app.quit()) })
+  await observeNaturalElectronExit(child, identity, timeoutMs)
+}
+
+export async function closeElectronAfterRemovingRoutes(app, identity, timeoutMs) {
+  if (!identity?.electronPid || !identity?.wrapperPid) {
+    throw new Error('Unroute quit diagnostic requires both observed process identities')
+  }
+  // Playwright disposes its ElectronApplication dispatcher after close(), so
+  // retain the child handle before asking it to close.
+  const child = app.process()
+  await app.context().unrouteAll({ behavior: 'wait' })
+  await app.close()
+  await observeNaturalElectronExit(child, identity, timeoutMs)
+}
+
+async function observeNaturalElectronExit(child, identity, timeoutMs) {
   const deadline = Date.now() + timeoutMs
   while (Date.now() < deadline) {
     const state = electronProcessSnapshot(identity)
     if (child.exitCode !== null || child.signalCode !== null) {
       if (child.exitCode !== 0 || child.signalCode !== null) {
-        throw new Error('Deferred quit did not produce a natural zero exit code')
+        throw new Error('Electron quit did not produce a natural zero exit code')
       }
       if (state.wrapperPidExists === false && state.electronPidExists === false) return
     }
     await delay(25)
   }
-  throw new Error('Deferred quit left an observed Electron or wrapper process alive')
+  throw new Error('Electron quit left an observed Electron or wrapper process alive')
 }
 
 export async function cleanupPackagedFirstSend({
@@ -109,6 +140,7 @@ export async function cleanupPackagedFirstSend({
   provider,
   diagnostics,
   deferQuit = false,
+  unrouteBeforeQuit = false,
   processIdentity,
   emit = line => console.error(line),
   onPhase = () => {},
@@ -119,10 +151,13 @@ export async function cleanupPackagedFirstSend({
   if (app) {
     onPhase('electron-cleanup-start')
     try {
+      const diagnosticChild = deferQuit || unrouteBeforeQuit ? app.process() : null
       const result = await closeElectronWithDeadline({
-        app: deferQuit ? {
-          process: () => app.process(),
-          close: () => quitElectronOnNextTurn(app, processIdentity, electronTimeoutMs),
+        app: deferQuit || unrouteBeforeQuit ? {
+          process: () => diagnosticChild,
+          close: () => unrouteBeforeQuit
+            ? closeElectronAfterRemovingRoutes(app, processIdentity, electronTimeoutMs)
+            : quitElectronOnNextTurn(app, processIdentity, electronTimeoutMs),
         } : app,
         phase: 'packaged-first-send',
         diagnostics,

@@ -671,7 +671,12 @@ def test_release_workflow_gates_built_and_downloaded_installers_on_profile_reten
         "sendButton.isDisabled()",
         "expectedLastMessage",
         "healthyNavigationSocketIds.size",
-        "socketCount > 1",
+        "assertConcurrentRecoveryTransport",
+        "socketPolicies.get(recoverySocketIndex)?.concurrent_history_reads",
+        "newSocketCount: nextSocketIndex - recoverySocketCountBaseline",
+        "closeCount: physicalCloseCount - recoveryCloseCountBaseline",
+        "const terminalTransport = recoveryTransportSample()",
+        "const recoveredTransport = recoveryTransportSample()",
     ):
         assert contract in session_recovery_smoke
     assert "page.clock" not in session_recovery_smoke

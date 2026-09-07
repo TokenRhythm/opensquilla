@@ -13,6 +13,7 @@ import {
   captureElectronProcessIdentity,
   captureFirstSendDiagnostic,
   cleanupPackagedFirstSend,
+  closeElectronAfterRemovingRoutes,
   electronProcessSnapshot,
   quitElectronOnNextTurn,
 } from './packaged-first-send-cleanup.mjs'
@@ -102,6 +103,56 @@ try {
   }, { wrapperPid: exitedWrapper.child.pid, electronPid: liveElectron.child.pid }, 25),
   /left an observed Electron or wrapper process alive/)
   assert.equal(liveElectron.child.exitCode, null, 'natural observation must never kill Electron')
+  await assert.rejects(closeElectronAfterRemovingRoutes({
+    process: () => exitedWrapper.child,
+    context: () => ({ unrouteAll: async () => {} }),
+    close: async () => {},
+  }, { wrapperPid: exitedWrapper.child.pid, electronPid: liveElectron.child.pid }, 25),
+  /left an observed Electron or wrapper process alive/)
+
+  const unroutedWrapper = await startChild()
+  const unroutedElectron = await startChild()
+  let releaseRoute
+  let closeCalled = false
+  const removingRoutes = new Promise(resolve => { releaseRoute = resolve })
+  const unroutedClose = closeElectronAfterRemovingRoutes({
+    process: () => {
+      assert.equal(closeCalled, false, 'Playwright process() is unavailable after close() disposes the app')
+      return unroutedWrapper.child
+    },
+    context: () => ({ unrouteAll: options => {
+      assert.deepEqual(options, { behavior: 'wait' })
+      return removingRoutes
+    } }),
+    close: async () => {
+      closeCalled = true
+      unroutedElectron.child.send('quit')
+      unroutedWrapper.child.send('quit')
+    },
+  }, { wrapperPid: unroutedWrapper.child.pid, electronPid: unroutedElectron.child.pid }, 5_000)
+  await delay(25)
+  assert.equal(closeCalled, false, 'quit must wait for outstanding route handlers')
+  releaseRoute()
+  await unroutedClose
+  assert.equal(unroutedWrapper.child.exitCode, 0)
+  await assertProcessExited(unroutedElectron.child.pid)
+
+  const stuckRoute = await startChild()
+  await assert.rejects(cleanupPackagedFirstSend({
+    app: {
+      process: () => stuckRoute.child,
+      context: () => ({ unrouteAll: () => new Promise(() => {}) }),
+      close: async () => { assert.fail('close must not run before route removal finishes') },
+    },
+    unrouteBeforeQuit: true,
+    processIdentity: { wrapperPid: stuckRoute.child.pid, electronPid: stuckRoute.child.pid },
+    electronTimeoutMs: 25,
+    emit: () => {},
+  }), error => {
+    assert.equal(error.errors[0].cause.code, 'DESKTOP_E2E_SHUTDOWN_TIMEOUT')
+    return true
+  })
+  await assertProcessExited(stuckRoute.child.pid)
 
   const { child } = await startChild()
   const provider = await startProvider()
@@ -198,7 +249,7 @@ try {
     providerTimeoutMs: 100,
   }), AggregateError)
   assert.equal(rejectedProvider.server.listening, false)
-  console.log('Packaged first-send cleanup checks passed: graceful, hung Electron tree, active HTTP, close rejection')
+  console.log('Packaged first-send cleanup checks passed: graceful, deferred/unroute natural exit, hung routes and Electron tree, active HTTP, close rejection')
 } finally {
   for (const { server, sockets } of fixtureServers) {
     server.closeAllConnections?.()

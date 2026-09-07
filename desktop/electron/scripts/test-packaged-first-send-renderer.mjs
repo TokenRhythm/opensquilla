@@ -236,7 +236,10 @@ const executablePath = resolve(requiredOption('--executable'))
 const userDataDir = resolve(requiredOption('--user-data-dir'))
 const iterations = optionalIntegerOption('--iterations', DEFAULT_ITERATIONS)
 const deferQuit = process.argv.includes('--defer-quit')
-const quitDiagnosticFile = deferQuit || process.argv.includes('--quit-diagnostics-file')
+const unrouteBeforeQuit = process.argv.includes('--unroute-before-quit')
+assert.equal(deferQuit && unrouteBeforeQuit, false, 'quit diagnostic modes must be selected separately')
+const quitMode = deferQuit ? 'deferred-diagnostic' : unrouteBeforeQuit ? 'unroute-diagnostic' : 'playwright-close'
+const quitDiagnosticFile = deferQuit || unrouteBeforeQuit || process.argv.includes('--quit-diagnostics-file')
   ? resolve(requiredOption('--quit-diagnostics-file'))
   : null
 if (quitDiagnosticFile) {
@@ -629,6 +632,7 @@ try {
       app,
       provider,
       deferQuit,
+      unrouteBeforeQuit,
       processIdentity: electronProcessIdentity,
       diagnostics: async () => ({
         processes: electronProcessSnapshot(electronProcessIdentity),
@@ -651,7 +655,7 @@ if (runError) {
     iterations,
     completedChatSends: rpcSendCounts.size,
     provider: provider?.counts(),
-    quitMode: deferQuit ? 'deferred-diagnostic' : 'playwright-close',
+    quitMode,
     quitDiagnosticFile,
     renderer: {
       pageErrors: pageErrors.length,
@@ -682,7 +686,7 @@ console.log(JSON.stringify({
   ok: true,
   executable: basename(executablePath),
   iterations,
-  quitMode: deferQuit ? 'deferred-diagnostic' : 'playwright-close',
+  quitMode,
   quitDiagnosticFile,
   viewports: { wide: Math.ceil(iterations / 2), tight: Math.floor(iterations / 2) },
   rpc: { chatSend: rpcSendCounts.size, uniqueSessions: new Set(rpcSessions.values()).size },

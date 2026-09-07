@@ -14,6 +14,55 @@ SCRIPTS = ROOT / ".github" / "scripts"
 DRIVER = ROOT / "desktop/electron/scripts/test-packaged-real-update-flow.mjs"
 
 
+@pytest.mark.parametrize(
+    ("overrides", "expected_error"),
+    [
+        ({}, None),
+        ({"concurrentHistoryReads": False}, "hello must advertise concurrent history reads"),
+        ({"concurrentHistoryReads": None}, "hello must advertise concurrent history reads"),
+        ({"concurrentHistoryReads": "true"}, "hello must advertise concurrent history reads"),
+        ({"socketCount": 0}, "exactly one target WebSocket"),
+        ({"socketCount": 2}, "exactly one target WebSocket"),
+        ({"newSocketCount": 1}, "must not create a replacement WebSocket"),
+        ({"closeCount": 1}, "must not close the healthy WebSocket"),
+    ],
+)
+def test_packaged_recovery_requires_concurrent_transport_continuity(
+    overrides: dict[str, object], expected_error: str | None
+) -> None:
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("Node.js is required for the packaged recovery contract")
+    contract = ROOT / "desktop/electron/scripts/session-recovery-transport-contract.mjs"
+    sample = {
+        "concurrentHistoryReads": True,
+        "socketCount": 1,
+        "newSocketCount": 0,
+        "closeCount": 0,
+        **overrides,
+    }
+    result = subprocess.run(
+        [
+            node,
+            "--input-type=module",
+            "-e",
+            f"import {{ assertConcurrentRecoveryTransport }} from {json.dumps(contract.as_uri())};"
+            f"console.log(JSON.stringify(assertConcurrentRecoveryTransport({json.dumps(sample)})));",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=10,
+    )
+    if expected_error:
+        assert result.returncode != 0
+        assert expected_error in result.stderr
+        assert not result.stdout
+    else:
+        assert result.returncode == 0, result.stderr
+        assert json.loads(result.stdout) == sample
+
+
 def test_downloaded_release_audits_cover_both_official_baselines() -> None:
     workflow = yaml.safe_load(
         (ROOT / ".github/workflows/wheelhouse-release.yml").read_text(encoding="utf-8")
