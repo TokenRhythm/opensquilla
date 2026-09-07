@@ -12,6 +12,8 @@ from opensquilla.engine.stream_wrappers import (
 )
 from opensquilla.engine.types import (
     AnswerGenerationResetEvent,
+    ControlTerminalEvent,
+    ControlTerminalReason,
     DoneEvent,
     RunHeartbeatEvent,
     TextDeltaEvent,
@@ -573,3 +575,132 @@ async def test_unmarked_stream_keeps_legacy_idle_timeout_behavior() -> None:
             heartbeat_interval=None,
         ):
             pass
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("context_bound", [False, True])
+@pytest.mark.parametrize("stop_early", [False, True])
+async def test_composed_stream_closes_source_once_in_its_owner_context(
+    context_bound: bool,
+    stop_early: bool,
+) -> None:
+    owner: ContextVar[str | None] = ContextVar("composed_stream_owner", default=None)
+    started_by: list[asyncio.Task | None] = []
+    closed_by: list[asyncio.Task | None] = []
+    reset_errors: list[ValueError] = []
+
+    async def source():
+        started_by.append(asyncio.current_task())
+        token = owner.set("turn")
+        try:
+            yield TextDeltaEvent(text="first")
+            yield TextDeltaEvent(text="second")
+        finally:
+            closed_by.append(asyncio.current_task())
+            try:
+                owner.reset(token)
+            except ValueError as exc:
+                reset_errors.append(exc)
+
+    raw = source()
+    stream = wrap_stream(raw, idle_timeout=1.0, context_bound=context_bound)
+    seen: list[str] = []
+    try:
+        async with asyncio.timeout(_HARD_LIMIT):
+            async for event in stream:
+                seen.append(event.text)
+                if stop_early:
+                    break
+            await stream.aclose()
+            await stream.aclose()
+
+        assert seen == (["first"] if stop_early else ["first", "second"])
+        assert closed_by == started_by
+        assert reset_errors == []
+        assert owner.get() is None
+    finally:
+        # Keep a failed close-chain assertion from leaving a live generator.
+        await stream.aclose()
+        await raw.aclose()
+
+
+@pytest.mark.asyncio
+async def test_composed_heartbeat_closes_source_after_cancellation_terminal() -> None:
+    owner: ContextVar[str | None] = ContextVar("heartbeat_turn_owner", default=None)
+    ready = asyncio.Event()
+    started_by: list[asyncio.Task | None] = []
+    closed_by: list[asyncio.Task | None] = []
+    reset_errors: list[ValueError] = []
+    terminal_yielded: list[bool] = []
+
+    async def source():
+        started_by.append(asyncio.current_task())
+        token = owner.set("turn")
+        try:
+            yield TextDeltaEvent(text="partial")
+            ready.set()
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            terminal_yielded.append(True)
+            yield ControlTerminalEvent(
+                turn_id="turn-synthetic",
+                assistant_message_id="assistant-synthetic",
+                sequence=1,
+                reason=ControlTerminalReason.CANCEL,
+            )
+            raise
+        finally:
+            closed_by.append(asyncio.current_task())
+            try:
+                owner.reset(token)
+            except ValueError as exc:
+                reset_errors.append(exc)
+
+    raw = source()
+    stream = wrap_stream(raw, heartbeat_interval=15.0, context_bound=True)
+
+    async def consume() -> None:
+        async for _event in stream:
+            pass
+
+    consumer = asyncio.create_task(consume())
+    try:
+        async with asyncio.timeout(_HARD_LIMIT):
+            await ready.wait()
+            consumer.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await consumer
+            await stream.aclose()
+
+        assert terminal_yielded == [True]
+        assert closed_by == started_by
+        assert reset_errors == []
+        assert owner.get() is None
+    finally:
+        if not consumer.done():
+            consumer.cancel()
+        await asyncio.gather(consumer, return_exceptions=True)
+        await stream.aclose()
+        await raw.aclose()
+
+
+@pytest.mark.asyncio
+async def test_composed_stream_accepts_an_iterator_without_aclose() -> None:
+    class Source:
+        def __init__(self) -> None:
+            self.events = iter([TextDeltaEvent(text="first"), DoneEvent(text="done")])
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            try:
+                return next(self.events)
+            except StopIteration:
+                raise StopAsyncIteration from None
+
+    stream = wrap_stream(Source(), context_bound=True)
+    events = [event async for event in stream]
+    await stream.aclose()
+
+    assert [event.text for event in events] == ["first", "done"]
