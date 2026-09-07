@@ -1263,7 +1263,7 @@ def test_v4_request_contains_current_history_assistant_and_route_context() -> No
 
 
 @pytest.mark.asyncio
-async def test_default_text_only_ladder_projects_image_without_prompt_injection(
+async def test_catalog_text_only_ladder_projects_image_without_prompt_injection(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
@@ -1275,6 +1275,15 @@ async def test_default_text_only_ladder_projects_image_without_prompt_injection(
         "What is in this screenshot?",
         attachments=[{"type": "image", "mime_type": "image/png"}],
     )
+    catalog = ModelCatalog()
+    catalog._populate_from_data(
+        [
+            {"id": tier["model"], "architecture": {"input_modalities": ["text"]}}
+            for name, tier in ctx.config.squilla_router.tiers.items()
+            if name in {"c0", "c1", "c2", "c3"}
+        ]
+    )
+    monkeypatch.setattr("opensquilla.provider.model_catalog._shared_catalog", catalog)
 
     routed = await apply_squilla_router(ctx)
 
@@ -1297,7 +1306,7 @@ async def test_default_text_only_ladder_projects_image_without_prompt_injection(
 
 
 @pytest.mark.asyncio
-async def test_tokenrhythm_default_image_route_uses_configured_direct_marker(
+async def test_tokenrhythm_default_image_route_uses_configured_catalog_vision(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
@@ -1307,7 +1316,7 @@ async def test_tokenrhythm_default_image_route_uses_configured_direct_marker(
     )
     config = GatewayConfig()
     assert config.squilla_router.tiers["c2"]["model"] == "kimi-k2.7-code"
-    assert config.squilla_router.tiers["c2"]["supports_image"] is False
+    config.squilla_router.tiers["c2"]["supports_image"] = False
     ctx = TurnContext(
         message="What is in this screenshot?",
         session_key="test-tokenrhythm-image",
@@ -1321,9 +1330,10 @@ async def test_tokenrhythm_default_image_route_uses_configured_direct_marker(
 
     routed = await apply_squilla_router(ctx)
 
-    assert routed.metadata["routed_tier"] == "c1"
-    assert routed.model == config.squilla_router.tiers["c1"]["model"]
-    assert routed.metadata["image_input_mode"] == "marker"
+    assert routed.metadata["routed_tier"] == "c2"
+    assert routed.model == config.squilla_router.tiers["c2"]["model"]
+    assert routed.metadata["image_input_mode"] == "native"
+    assert routed.metadata["routed_model_vision_support"] == "supported"
     assert routed.metadata["router_fallback_chain"] == []
 
 
@@ -1958,6 +1968,15 @@ async def test_image_attachment_without_multimodal_c_tier_uses_marker(
         attachments=[{"type": "image", "mime_type": "image/png"}],
     )
     ctx.config.squilla_router.tiers["image_model"]["supports_image"] = False
+    catalog = ModelCatalog()
+    catalog._populate_from_data(
+        [
+            {"id": tier["model"], "architecture": {"input_modalities": ["text"]}}
+            for name, tier in ctx.config.squilla_router.tiers.items()
+            if name in {"c0", "c1", "c2", "c3"}
+        ]
+    )
+    monkeypatch.setattr("opensquilla.provider.model_catalog._shared_catalog", catalog)
 
     result = await apply_squilla_router(ctx)
 
@@ -1985,8 +2004,8 @@ async def test_caption_less_image_attachment_still_routes_to_vision_tier(
         routed = await apply_squilla_router(ctx)
 
         assert routed.metadata["routing_source"] == "image_route"
-        assert routed.metadata["routed_tier"] == "c1"
-        assert routed.metadata["image_input_mode"] == "marker"
+        assert routed.metadata["routed_tier"] == "c3"
+        assert routed.metadata["image_input_mode"] == "native"
 
 
 @pytest.mark.asyncio
@@ -2005,6 +2024,15 @@ async def test_caption_less_image_without_multimodal_c_tier_uses_marker(
         attachments=[{"type": "image", "mime_type": "image/png"}],
     )
     ctx.config.squilla_router.tiers["image_model"]["supports_image"] = False
+    catalog = ModelCatalog()
+    catalog._populate_from_data(
+        [
+            {"id": tier["model"], "architecture": {"input_modalities": ["text"]}}
+            for name, tier in ctx.config.squilla_router.tiers.items()
+            if name in {"c0", "c1", "c2", "c3"}
+        ]
+    )
+    monkeypatch.setattr("opensquilla.provider.model_catalog._shared_catalog", catalog)
 
     result = await apply_squilla_router(ctx)
 

@@ -321,8 +321,8 @@ def _merge_router_tiers(
         if deployment_changed and "supports_image" not in override:
             # Capability evidence belongs to a deployment identity. A model-
             # only/provider-only override must not inherit the managed preset's
-            # declaration for a different deployment. Omission stays unknown;
-            # an explicit false in the override remains authoritative.
+            # legacy declaration for a different deployment. These fields
+            # remain readable for older clients, not runtime capability facts.
             current.pop("supports_image", None)
             current.pop("supportsImage", None)
         # A pre-``ensemble_enabled`` client can still submit an explicit
@@ -353,18 +353,13 @@ def _canonical_tier_value(tier: Mapping[str, Any]) -> dict[str, Any]:
     legacy_selection_mode = str(
         tier.get("ensemble_selection_mode", tier.get("ensembleSelectionMode", "")) or ""
     ).strip()
-    if "supports_image" in tier:
-        supports_image: bool | None = bool(tier.get("supports_image"))
-    elif "supportsImage" in tier:
-        supports_image = bool(tier.get("supportsImage"))
-    else:
-        supports_image = None
+    # Retired image switches do not change the semantic routing preset.
+    # Keep old values in the stored mapping for client compatibility only.
     return {
         "provider": str(tier.get("provider") or "").strip().lower(),
         "model": str(tier.get("model") or "").strip(),
         "description": str(tier.get("description") or "").strip(),
         "thinking_level": (str(thinking or "").strip() or None),
-        "supports_image": supports_image,
         "image_only": bool(tier.get("image_only", tier.get("imageOnly", False))),
         "ensemble_enabled": ensemble_enabled,
         # Once the new tri-state field exists it owns execution. Retained

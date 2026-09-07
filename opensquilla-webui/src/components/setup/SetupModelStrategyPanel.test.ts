@@ -317,6 +317,9 @@ describe('SetupModelStrategyPanel', () => {
     expect(el.querySelector('[aria-label="c0 request entry"]')).toBeTruthy()
     expect(el.querySelector('.setup-tier-table__row.is-head')?.textContent)
       .toContain('Request entry')
+    expect(el.querySelector('[aria-label$="supports image"]')).toBeNull()
+    expect(el.querySelector('[data-testid="router-image-capability-hint"]')?.textContent)
+      .toContain('detected automatically from provider metadata and request results')
 
     app.unmount()
   })

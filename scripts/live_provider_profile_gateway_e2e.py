@@ -406,6 +406,12 @@ def _write_config(
             int(model_context_window_tokens),
         )
     if model_supports_vision_override is not None:
+        # The offline single-call fixture supplies deployment facts for every
+        # configured leg; retired tier switches cannot stand in for metadata.
+        for tier in (tier_overrides or {}).values():
+            tier_model = str(tier.get("model") or "").strip()
+            if tier_model and tier_model != model_supports_vision_override:
+                model_override_fields.setdefault(tier_model, {})["supports_vision"] = False
         model_override_fields.setdefault(model_supports_vision_override, {})[
             "supports_vision"
         ] = True
@@ -493,19 +499,18 @@ def _tokenrhythm_attachment_tiers() -> dict[str, dict[str, Any]]:
         raise RuntimeError("TokenRhythm preset has no image_model tier")
     if image_tier.get("model") != ATTACHMENT_CAPACITY_MODEL:
         raise RuntimeError("TokenRhythm image_model does not match the verified live fixture")
-    unsafe_fallback_slots = [
+    missing_slots = [
         slot
         for slot in TEXT_PROFILE_SLOTS
         if not isinstance(tiers.get(slot), dict)
-        or tiers[slot].get("supports_image") is not False
+        or not str(tiers[slot].get("model") or "").strip()
     ]
-    if unsafe_fallback_slots:
-        raise RuntimeError(
-            "TokenRhythm attachment gate requires every text fallback to be explicitly "
-            "non-vision before any live request"
-        )
+    if missing_slots:
+        raise RuntimeError("TokenRhythm attachment gate requires configured c0-c3 models")
     tiers["c2"] = {**image_tier, "image_only": False}
     del tiers["image_model"]
+    for tier in tiers.values():
+        tier.pop("supports_image", None)
     return tiers
 
 

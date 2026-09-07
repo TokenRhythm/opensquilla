@@ -1191,6 +1191,7 @@
       "colModel": "Modell",
       "colThinking": "Denken",
       "colImage": "Bild",
+      "imageCapabilityAutomatic": "Die Bildfähigkeit wird automatisch anhand von Anbieter-Metadaten und Anfrageergebnissen erkannt; eine manuelle Einstellung ist nicht erforderlich.",
       "tierProviderAria": "{tier}-Anfrageeingang",
       "tierProviderManagedByEnsemble": "Durch Mehrmodell-Fusion bestimmt",
       "tierProviderManagedByEnsembleAria": "Der {tier}-Anfrageeingang wird durch den Plan der Mehrmodell-Fusion bestimmt",

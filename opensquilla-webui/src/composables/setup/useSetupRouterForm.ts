@@ -22,6 +22,7 @@ export interface SetupTierValue {
   provider: string
   model: string
   thinkingLevel: string
+  /** Accepted for older clients; image capability is resolved by the gateway. */
   supportsImage?: boolean
   ensembleEnabled?: boolean
   ensembleSelectionMode?: string
@@ -92,9 +93,6 @@ export function buildRouterPayload(
       provider: tier.provider,
       model: tier.model,
       thinkingLevel: tier.thinkingLevel,
-    }
-    if (typeof tier.supportsImage === 'boolean') {
-      tierPayload.supportsImage = tier.supportsImage
     }
     if (sharedEnsembleTier && typeof tier.ensembleEnabled === 'boolean') {
       tierPayload.ensembleEnabled = tier.ensembleEnabled
@@ -450,11 +448,6 @@ export function useSetupRouterForm() {
         provider: tier.provider || '',
         model: tier.model || '',
         thinkingLevel: tier.thinkingLevel || tier.thinking_level || '',
-        supportsImage: typeof tier.supportsImage === 'boolean'
-          ? tier.supportsImage
-          : typeof tier.supports_image === 'boolean'
-            ? tier.supports_image
-            : undefined,
         ensembleEnabled: tierName === 'c3'
           ? typeof tier.ensembleEnabled === 'boolean'
             ? tier.ensembleEnabled
@@ -472,7 +465,7 @@ export function useSetupRouterForm() {
   }
 
   function updateTierField(name: string, key: keyof SetupTierValue, value: string | boolean) {
-    if (name === IMAGE_TIER) return
+    if (name === IMAGE_TIER || key === 'supportsImage') return
     const tier = tierValues.value[name]
     if (!tier) return
     if (key === 'ensembleEnabled' && (normalizeRouterTier(name) || name) !== 'c3') return
@@ -494,7 +487,6 @@ export function useSetupRouterForm() {
           ...tier,
           provider,
           model: '',
-          supportsImage: undefined,
           ensembleEnabled: dynamicMember
             ? tier.ensembleEnabled
             : tier.ensembleEnabled === undefined
@@ -505,17 +497,10 @@ export function useSetupRouterForm() {
       }
       return
     }
-    if (key === 'supportsImage') {
-      tier.supportsImage = Boolean(value)
-    } else if (key === 'model') {
+    if (key === 'model') {
       const model = String(value)
       if (model === tier.model) return
       tier.model = model
-      // Capability evidence is scoped to the prior deployment identity. The
-      // switch still renders off for an unknown model, but an untouched switch
-      // must stay omitted so the Gateway can probe instead of treating it as
-      // an operator-authored negative declaration.
-      tier.supportsImage = undefined
     } else if (key === 'ensembleEnabled') {
       tier.ensembleEnabled = Boolean(value)
     } else {
@@ -546,7 +531,6 @@ export function useSetupRouterForm() {
         provider: tier.provider,
         model: tier.model,
         thinkingLevel: tier.thinkingLevel,
-        supportsImage: tier.supportsImage,
         ensembleEnabled: tier.ensembleEnabled,
         ensembleSelectionMode: tier.ensembleSelectionMode,
       }))

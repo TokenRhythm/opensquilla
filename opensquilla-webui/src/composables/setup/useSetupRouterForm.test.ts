@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest'
 import { computed } from 'vue'
-import { routerTierProviderParticipates, useSetupRouterForm } from './useSetupRouterForm'
+import { buildRouterPayload, routerTierProviderParticipates, useSetupRouterForm } from './useSetupRouterForm'
 
 // openrouter-mix is backend-supported but was unreachable in the WebUI. The
 // round-trip is subtle: it is the only enabled mode whose tier_profile is null,
@@ -48,7 +48,6 @@ describe('useSetupRouterForm — openrouter-mix round-trip', () => {
       provider: 'openai',
       model: 'saved/vision-model',
       thinkingLevel: 'high',
-      supportsImage: true,
     }))
     form.updateTierField('c0', 'model', 'configured/new-text-model')
     expect(form.payload()).toMatchObject({
@@ -187,7 +186,6 @@ describe('useSetupRouterForm — openrouter-mix round-trip', () => {
           provider: 'openrouter',
           model: 'deepseek/deepseek-v4-flash',
           thinkingLevel: 'high',
-          supportsImage: false,
         },
       },
     })
@@ -227,7 +225,7 @@ describe('useSetupRouterForm — openrouter-mix round-trip', () => {
     expect(f.payload()).not.toHaveProperty('tiers.c0.supportsImage')
   })
 
-  it('round-trips an explicit false image declaration unchanged', () => {
+  it.each([false, true])('ignores a legacy image declaration of %s when saving', (supportsImage) => {
     const f = useSetupRouterForm()
     f.initFromConfig({
       enabled: true,
@@ -236,12 +234,28 @@ describe('useSetupRouterForm — openrouter-mix round-trip', () => {
         c0: {
           provider: 'openrouter',
           model: 'operator/text-model',
-          supports_image: false,
+          supports_image: supportsImage,
         },
       },
     }, {}, 'openrouter')
 
-    expect(f.payload()).toHaveProperty('tiers.c0.supportsImage', false)
+    f.updateTierField('c0', 'supportsImage', !supportsImage)
+    expect(f.payload()).not.toHaveProperty('tiers.c0.supportsImage')
+    expect(makePanel(f, true).value.tierRows[0]).not.toHaveProperty('supportsImage')
+  })
+
+  it('does not serialize retired capability fields supplied by an older caller', () => {
+    const payload = buildRouterPayload('custom', 'c0', {
+      c0: {
+        provider: 'configured-provider',
+        model: 'configured-model',
+        thinkingLevel: '',
+        supportsImage: true,
+      },
+    })
+    expect(payload.tiers?.c0).toEqual({
+      provider: 'configured-provider', model: 'configured-model', thinkingLevel: '',
+    })
   })
 
   it('round-trips a tier-managed ensemble profile from snake case', () => {

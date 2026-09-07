@@ -49,7 +49,6 @@ from opensquilla.engine.routing.policy_data import DEFAULT_CONTEXT_WINDOW_TOKENS
 from opensquilla.engine.steps.router_decision_record import stage_router_decision
 from opensquilla.provider.context_capabilities import provider_state_continuity_diagnostic
 from opensquilla.provider.model_catalog import shared_catalog
-from opensquilla.provider.types import ModelCapabilities
 from opensquilla.router_control import RouterControlHoldStore
 from opensquilla.router_runtime_diagnostics import (
     classify_router_runtime_error,
@@ -186,43 +185,27 @@ def _configured_text_tiers(tiers: Mapping[str, Any] | object) -> list[str]:
     return configured
 
 
-def _declared_tier_vision_support(raw: Mapping[str, Any]) -> str | None:
-    """Read an explicit Router tier declaration without collapsing omission.
-
-    The public ``supports_image`` field historically defaults to ``false`` in
-    serialized configs.  A missing key, however, means that the operator did
-    not make a capability claim and should remain probeable (``None`` here),
-    rather than being treated as a definitive text-only model.
-    """
-
-    if "supports_image" not in raw:
-        return None
-    value = raw.get("supports_image")
-    if value is True:
-        return "supported"
-    if value is False:
-        return "unsupported"
-    return None
-
-
 def _tier_deployment_vision_support(ctx: TurnContext, raw: Mapping[str, Any]) -> str:
     """Resolve one configured c-tier's tri-state vision evidence.
 
-    An explicit Router declaration wins.  For omitted declarations, consult
-    the shared deployment catalog when available; resolver failures remain
+    The shared deployment catalog owns capability evidence. Legacy tier
+    switches remain readable but do not override it. Resolver failures remain
     ``unknown`` so the provider can be probed exactly once by the execution
     layer.  This helper deliberately does not infer support from a model name.
     """
 
-    declared = _declared_tier_vision_support(raw)
-    if declared is not None:
-        return declared
     model = str(raw.get("model") or "").strip()
     if not model:
         return "unsupported"
     llm = getattr(getattr(ctx, "config", None), "llm", None)
     active_provider = str(getattr(llm, "provider", "") or "").strip()
-    provider = str(raw.get("provider") or active_provider).strip()
+    router = getattr(getattr(ctx, "config", None), "squilla_router", None)
+    tier_provider = str(raw.get("provider") or "").strip()
+    provider = (
+        tier_provider
+        if bool(getattr(router, "cross_provider_tiers", False)) and tier_provider
+        else active_provider or tier_provider
+    )
     if not provider:
         return "unknown"
     resolver = getattr(shared_catalog(), "resolve_deployment_vision_support", None)
@@ -255,9 +238,9 @@ def _router_image_fallback_chain(
 ) -> list[dict[str, str]]:
     """Build the remaining authorized native-image probe chain.
 
-    Image requests may start on a tier whose declaration is optimistic or
-    unknown.  Explicitly text-only tiers have already supplied a definitive
-    answer and therefore need no physical image request.  Supported and
+    Image requests may start on a tier with known support or unknown
+    capability. Catalog-proven text-only tiers have already supplied a
+    definitive answer and therefore need no physical image request. Supported and
     unknown configured tiers remain probeable; after the last rejection the
     Agent applies its Direct-style marker projection.  The chain is canonical
     and deterministic, independent of TOML declaration order, and never
@@ -1324,7 +1307,9 @@ def _capacity_safe_tier(
         if not isinstance(raw, dict):
             continue
         tier = TierConfig.from_value(raw)
-        if not tier.model or (requires_image and not tier.supports_image):
+        if not tier.model or (
+            requires_image and _tier_deployment_vision_support(ctx, raw) == "unsupported"
+        ):
             continue
         declared_provider = (tier.provider or active_provider).strip().lower()
         if active_provider_only and declared_provider != active_provider:
@@ -1584,6 +1569,7 @@ def _context_window_tokens(ctx: TurnContext, router_cfg: object) -> int:
 
 
 def _tier_capability_facts(
+    ctx: TurnContext,
     tiers: dict,
     valid_tiers: list[str],
     active_provider: str,
@@ -1594,11 +1580,8 @@ def _tier_capability_facts(
     data only). Every field is emitted as ``None`` unless the shared model
     catalog gives a definite signal, so the gate never acts on ignorance:
 
-    - ``supports_vision`` is known only when the resolved entry is NOT
-      synthesized and ``get_capabilities`` returned something other than
-      the empty :class:`ModelCapabilities` — an empty result covers both
-      "no layer knew any capability" and the anthropic/ollama flag-gated
-      early return, none of which is a definite non-vision signal.
+    - ``supports_vision`` uses the same deployment-scoped tri-state evidence
+      as image routing. Missing metadata is not a definite non-vision signal.
     - ``context_window`` is known only when
       ``resolve_context_window_with_source`` attributes the value to the
       catalog (live/snapshot/corrections) or to a per-model ``[models.*]``
@@ -1606,7 +1589,6 @@ def _tier_capability_facts(
       estimates, not knowledge.
     """
     catalog = shared_catalog()
-    empty_capabilities = ModelCapabilities()
     facts: dict[str, TierCapability] = {}
     for name in valid_tiers:
         tier = TierConfig.from_value(tiers.get(name))
@@ -1614,12 +1596,8 @@ def _tier_capability_facts(
             facts[name] = TierCapability()
             continue
         provider = (tier.provider or active_provider or "").strip().lower()
-        supports_vision: bool | None = None
-        entry = catalog.resolve_entry(tier.model, provider=provider)
-        if entry.source != "synthesized":
-            capabilities = catalog.get_capabilities(tier.model, provider_name=provider)
-            if capabilities != empty_capabilities:
-                supports_vision = capabilities.supports_vision
+        support = _tier_deployment_vision_support(ctx, tiers[name])
+        supports_vision = None if support == "unknown" else support == "supported"
         window, window_source = catalog.resolve_context_window_with_source(tier.model, provider)
         # Operator-declared [models.*] windows count as definite facts for the
         # capability gate, same as catalog knowledge; only engine defaults
@@ -2161,7 +2139,7 @@ async def apply_squilla_router(ctx: TurnContext) -> TurnContext:
         ctx.metadata["router_image_configured_tiers"] = list(configured_tiers)
 
         if executable_image_tiers:
-            # Prefer declared/catalog-proven support over an unknown probe, then
+            # Prefer catalog-proven support over an unknown probe, then
             # use canonical c0<c1<c2<c3 order for deterministic routing.
             ordered_image_tiers = sorted(
                 executable_image_tiers,
@@ -2181,10 +2159,7 @@ async def apply_squilla_router(ctx: TurnContext) -> TurnContext:
                     material_tokens=material_estimated_tokens,
                     request_input_tokens=material_estimated_tokens,
                     # ``ordered_image_tiers`` has already been filtered by the
-                    # tri-state catalog/declaration facts above.  Passing
-                    # ``requires_image`` here would re-read the legacy boolean
-                    # field and reject an intentionally unknown (probeable)
-                    # declaration.
+                    # tri-state deployment evidence above.
                     requires_image=False,
                     active_provider_only=_capacity_active_provider_only(router_cfg),
                     rollout_phase=rollout_phase,
@@ -2718,6 +2693,7 @@ async def apply_squilla_router(ctx: TurnContext) -> TurnContext:
             context_window_tokens=_context_window_tokens(ctx, router_cfg),
             turn_has_image=turn_needs_image,
             tier_capabilities=_tier_capability_facts(
+                ctx,
                 tiers,
                 valid_tiers,
                 str(getattr(getattr(ctx.config, "llm", None), "provider", "") or ""),

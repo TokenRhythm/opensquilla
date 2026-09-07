@@ -2,6 +2,7 @@ export interface RouterTier {
   provider: string
   model: string
   description?: string
+  /** Read compatibility only; the gateway resolves model capability. */
   supportsImage?: boolean
   imageOnly?: boolean
   thinkingLevel?: string
@@ -20,7 +21,11 @@ function canonicalTierKey(name: string): string {
 }
 
 function cloneRouterTiers(tiers: Record<string, RouterTier>): Record<string, RouterTier> {
-  return Object.fromEntries(Object.entries(tiers).map(([name, tier]) => [name, { ...tier }]))
+  return Object.fromEntries(Object.entries(tiers).map(([name, tier]) => {
+    const copy = { ...tier }
+    delete copy.supportsImage
+    return [name, copy]
+  }))
 }
 
 function normalizeBooleanSetting(raw: unknown, fallback: boolean): boolean {
@@ -58,9 +63,6 @@ export function normalizeRouterTiers(
     const hasEnsembleEnabled = Object.prototype.hasOwnProperty.call(tier, 'ensembleEnabled')
       || Object.prototype.hasOwnProperty.call(tier, 'ensemble_enabled')
     const ensembleEnabled = tier.ensembleEnabled ?? tier.ensemble_enabled
-    const hasSupportsImage = Object.prototype.hasOwnProperty.call(tier, 'supportsImage')
-      || Object.prototype.hasOwnProperty.call(tier, 'supports_image')
-    const supportsImage = tier.supportsImage ?? tier.supports_image
     const normalizedTier: RouterTier = {
       ...out[name],
       provider,
@@ -71,15 +73,6 @@ export function normalizeRouterTiers(
       ...(hasEnsembleEnabled
         ? { ensembleEnabled: normalizeBooleanSetting(ensembleEnabled, false) }
         : {}),
-    }
-    if (hasSupportsImage) {
-      normalizedTier.supportsImage = normalizeBooleanSetting(supportsImage, false)
-    } else {
-      // A persisted row owns its deployment identity. Do not inherit a
-      // capability declaration from the managed fallback for a model whose
-      // config omitted that field; omission is probeable, while false is an
-      // authoritative operator declaration.
-      delete normalizedTier.supportsImage
     }
     out[name] = normalizedTier
   }

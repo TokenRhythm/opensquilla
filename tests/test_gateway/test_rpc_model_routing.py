@@ -560,7 +560,7 @@ def test_model_routing_capability_projection_isolates_one_mode_failure(
             "unsupported",
             {
                 "admission": "allowed",
-                "reason": "router_image_route_available",
+                "reason": "router_image_route_unavailable",
             },
         ),
         (
@@ -568,7 +568,7 @@ def test_model_routing_capability_projection_isolates_one_mode_failure(
             "supported",
             {
                 "admission": "allowed",
-                "reason": "router_image_route_unavailable",
+                "reason": "router_image_route_available",
             },
         ),
         (
@@ -578,8 +578,8 @@ def test_model_routing_capability_projection_isolates_one_mode_failure(
             },
             "unknown",
             {
-                "admission": "allowed",
-                "reason": "router_image_route_available",
+                "admission": "unknown",
+                "reason": "capability_unknown",
             },
         ),
     ],

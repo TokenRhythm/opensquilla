@@ -33,10 +33,9 @@ def _router_image_route(config: Any) -> tuple[str, dict[str, Any], str] | None:
 
     This is a public admission snapshot of the runtime Router policy, not a
     separate routing implementation: only user-configured c0-c3 deployments
-    participate, explicit declarations win over catalog guesses, explicit
-    denials are skipped, and proven support is preferred over an unknown
-    deployment that the execution layer may probe.  The legacy ``image_model``
-    row is intentionally non-executable.
+    participate, deployment capability denials are skipped, and proven support
+    is preferred over an unknown deployment that the execution layer may probe.
+    The legacy ``image_model`` row is intentionally non-executable.
     """
 
     router = getattr(config, "squilla_router", None)
@@ -56,37 +55,17 @@ def _router_image_route(config: Any) -> tuple[str, dict[str, Any], str] | None:
         if not model or (c3_fusion_active and name == HIGHEST_TEXT_TIER):
             continue
 
-        declared = tier.get("supports_image") if "supports_image" in tier else None
-        if declared is True:
-            support = "supported"
-        elif declared is False:
-            support = "unsupported"
-        else:
-            tier_provider = _clean(tier.get("provider"))
-            provider = (
-                tier_provider if cross_provider and tier_provider else active_provider
-            )
-            provider = provider or tier_provider
-            use_active_authority = not provider or provider == active_provider
-            support = _deployment_vision_support(
-                model=model,
-                provider=provider,
-                api_key=(
-                    str(getattr(llm, "api_key", "") or "")
-                    if use_active_authority
-                    else ""
-                ),
-                base_url=(
-                    str(getattr(llm, "base_url", "") or "")
-                    if use_active_authority
-                    else ""
-                ),
-                proxy=(
-                    str(getattr(llm, "proxy", "") or "")
-                    if use_active_authority
-                    else ""
-                ),
-            )
+        tier_provider = _clean(tier.get("provider"))
+        provider = tier_provider if cross_provider and tier_provider else active_provider
+        provider = provider or tier_provider
+        use_active_authority = not provider or provider == active_provider
+        support = _deployment_vision_support(
+            model=model,
+            provider=provider,
+            api_key=(str(getattr(llm, "api_key", "") or "") if use_active_authority else ""),
+            base_url=(str(getattr(llm, "base_url", "") or "") if use_active_authority else ""),
+            proxy=(str(getattr(llm, "proxy", "") or "") if use_active_authority else ""),
+        )
         if support in {"supported", "unknown"}:
             candidates.append((name, tier, support))
 

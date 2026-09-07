@@ -32,14 +32,22 @@ assert.deepEqual(resaved, loaded)
 assert.equal(Object.hasOwn(resaved.c3, 'ensembleEnabled'), false)
 assert.equal(Object.hasOwn(resaved.c0, 'supportsImage'), false)
 
-const explicitUnsupported = normalizeRouterTiers(
-  { ...legacyCredentialTiers, c0: { ...legacyCredentialTiers.c0, supports_image: false } },
-  currentFallback,
-)
-assert.equal(explicitUnsupported.c0.supportsImage, false)
+for (const key of ['supports_image', 'supportsImage']) {
+  for (const value of [false, true]) {
+    const legacyCapability = normalizeRouterTiers(
+      { ...legacyCredentialTiers, c0: { ...legacyCredentialTiers.c0, [key]: value } },
+      currentFallback,
+    )
+    assert.equal(Object.hasOwn(legacyCapability.c0, 'supportsImage'), false)
+    assert.equal(Object.hasOwn(legacyCapability.c0, 'supports_image'), false)
+    assert.equal(legacyCapability.c0.model, legacyCredentialTiers.c0.model)
+  }
+}
 
 const fresh = normalizeRouterTiers(undefined, currentFallback)
 assert.equal(fresh.c3.ensembleEnabled, true)
+assert.equal(Object.hasOwn(fresh.c0, 'supportsImage'), false)
+assert.equal(Object.hasOwn(fresh.c3, 'supportsImage'), false)
 
 const explicitSnakeCase = normalizeRouterTiers(
   { ...legacyCredentialTiers, c3: { ...legacyCredentialTiers.c3, ensemble_enabled: true } },

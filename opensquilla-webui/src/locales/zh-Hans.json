@@ -1279,6 +1279,7 @@
       "colModel": "模型",
       "colThinking": "思考",
       "colImage": "图像",
+      "imageCapabilityAutomatic": "图片能力根据服务商元数据和实际请求结果自动判断，无需手动设置。",
       "tierProviderAria": "{tier} 请求入口",
       "tierProviderManagedByEnsemble": "由多模型融合决定",
       "tierProviderManagedByEnsembleAria": "{tier} 请求入口由多模型融合方案决定",

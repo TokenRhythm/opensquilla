@@ -300,6 +300,13 @@ async def test_large_attachment_foreign_hold_veto_fails_closed(monkeypatch) -> N
 
 @pytest.mark.asyncio
 async def test_image_attachments_bypass_text_hold(monkeypatch) -> None:
+    class _TextCatalog:
+        def resolve_deployment_vision_support(self, _model: str, **_kwargs: object) -> str:
+            return "unsupported"
+
+    monkeypatch.setattr(
+        "opensquilla.engine.steps.squilla_router.shared_catalog", lambda: _TextCatalog()
+    )
     cfg = _router_cfg(_router_tier_profile_defaults("openrouter"))
     target = resolve_router_control_target(cfg, "tier:c3")
     store = RouterControlHoldStore()

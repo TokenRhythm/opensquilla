@@ -1235,7 +1235,6 @@ export function useChatRenderedMessages(options: UseChatRenderedMessagesOptions)
     const normalized = normalizeRouterTier(tier)
     return options.routerTierConfigs.value[normalized] || {
       model: options.routerModels.value[normalized] || '',
-      supportsImage: false,
       imageOnly: false,
     }
   }

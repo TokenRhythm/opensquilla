@@ -1191,6 +1191,7 @@
       "colModel": "Modelo",
       "colThinking": "Razonamiento",
       "colImage": "Imagen",
+      "imageCapabilityAutomatic": "La capacidad de imagen se detecta automáticamente a partir de los metadatos del proveedor y los resultados de las solicitudes; no requiere ajustes manuales.",
       "tierProviderAria": "Entrada de solicitud de {tier}",
       "tierProviderManagedByEnsemble": "Determinada por la fusión multimodelo",
       "tierProviderManagedByEnsembleAria": "La entrada de solicitud de {tier} la determina el plan de fusión multimodelo",

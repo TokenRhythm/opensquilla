@@ -171,6 +171,9 @@ class _FakeModelCatalog:
     ) -> ModelCapabilities:
         return ModelCapabilities(supports_vision=model_id == _VISION_MODEL)
 
+    def resolve_deployment_vision_support(self, model_id: str, **_kwargs: Any) -> str:
+        return "supported" if model_id == _VISION_MODEL else "unsupported"
+
 
 class _EventSink:
     authenticated = True
@@ -362,6 +365,10 @@ def _message_has_image(message: Message) -> bool:
 @pytest.fixture
 async def _e2e_stack(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setenv("OPENSQUILLA_OPENROUTER_LIVE_PRICING", "0")
+    monkeypatch.setattr(
+        "opensquilla.provider.model_catalog.ModelCatalog.resolve_deployment_vision_support",
+        _FakeModelCatalog.resolve_deployment_vision_support,
+    )
     monkeypatch.setattr(squilla_router_step, "_get_strategy", lambda _cfg: _TextTierStrategy())
     config = _configure_gateway(tmp_path)
     store = UploadStore(marker_dir=tmp_path / "upload-markers")

@@ -10658,13 +10658,18 @@ class TurnRunner:
                 "gate_history",
             }
             if isinstance(tiers, Mapping):
-                for raw_tier in tiers.values():
+                for tier_name, raw_tier in tiers.items():
                     if not isinstance(raw_tier, Mapping):
                         continue
-                    if requires_image and not bool(raw_tier.get("supports_image", False)):
+                    if requires_image and normalize_text_tier(tier_name) is None:
                         continue
-                    if not requires_image and bool(raw_tier.get("image_only", False)):
+                    if bool(raw_tier.get("image_only", False)):
                         continue
+                    if not str(raw_tier.get("model") or "").strip():
+                        continue
+                    # Every configured c-tier may be reached by a native probe
+                    # or the final marker fallback. Legacy image switches do
+                    # not establish the physical deployment's capabilities.
                     _add(raw_tier.get("provider") or active_provider)
 
         # Unknown/legacy selector shapes retain the previous conservative

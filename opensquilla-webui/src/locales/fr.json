@@ -1191,6 +1191,7 @@
       "colModel": "Modèle",
       "colThinking": "Réflexion",
       "colImage": "Image",
+      "imageCapabilityAutomatic": "La prise en charge des images est détectée automatiquement à partir des métadonnées du fournisseur et des résultats des requêtes ; aucun réglage manuel n’est nécessaire.",
       "tierProviderAria": "Entrée de requête {tier}",
       "tierProviderManagedByEnsemble": "Déterminée par la fusion multimodèle",
       "tierProviderManagedByEnsembleAria": "L’entrée de requête {tier} est déterminée par le plan de fusion multimodèle",

@@ -228,7 +228,6 @@ export function useChatFeatureToggles(options: UseChatFeatureTogglesOptions) {
         ).trim()
         tierConfigs[lower] = {
           model: typeof model === 'string' ? model.trim() : '',
-          supportsImage: rawTierRecord.supports_image === true || rawTierRecord.supportsImage === true,
           imageOnly: rawTierRecord.image_only === true || rawTierRecord.imageOnly === true,
           // New Gateways expose the explicit execution switch. Older PR
           // snapshots only expose the legacy selection mode, which still

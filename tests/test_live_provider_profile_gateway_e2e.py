@@ -788,14 +788,15 @@ def test_attachment_capacity_config_is_single_call_with_configured_vision_c2(
     assert "image_model" not in data["squilla_router"]["tiers"]
     assert data["squilla_router"]["tiers"]["c2"] == tiers["c2"]
     assert tiers["c2"]["model"] == "kimi-k2.6"
-    assert tiers["c2"]["supports_image"] is True
     assert tiers["c2"]["image_only"] is False
-    assert all(tiers[slot]["supports_image"] is False for slot in ("c0", "c1", "c3"))
+    assert all("supports_image" not in tiers[slot] for slot in ("c0", "c1", "c2", "c3"))
     assert (
         data["models"]["tokenrhythm"]["deepseek-v4-pro-0813"]["context_window"]
         == e2e.ATTACHMENT_CAPACITY_BASE_CONTEXT_WINDOW_TOKENS
     )
     assert data["models"]["tokenrhythm"]["kimi-k2.6"]["supports_vision"] is True
+    for slot in ("c0", "c1", "c3"):
+        assert data["models"]["tokenrhythm"][tiers[slot]["model"]]["supports_vision"] is False
 
 
 def test_attachment_capacity_runner_reaches_provider_through_real_gateway(

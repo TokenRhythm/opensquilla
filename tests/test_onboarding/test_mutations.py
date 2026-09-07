@@ -9,6 +9,7 @@ from opensquilla.gateway.llm_runtime import resolve_llm_runtime_config
 from opensquilla.onboarding.mutations import (
     LlmProfileActivationError,
     MutationResult,
+    _tiers_equal_after_canonical_normalization,
     list_channel_entries,
     remove_channel,
     set_channel_enabled,
@@ -1658,6 +1659,21 @@ def test_upsert_router_persists_explicit_single_model_over_the_recommended_c3_de
     persisted = res.config.to_toml_dict()["squilla_router"]["tiers"]["c3"]
     assert persisted["ensemble_enabled"] is False
     assert res.public_payload["mode"] == "custom"
+
+
+@pytest.mark.parametrize("legacy_field", ["supports_image", "supportsImage"])
+@pytest.mark.parametrize("legacy_value", [True, False])
+def test_retired_image_switch_does_not_customize_a_preset(
+    legacy_field: str, legacy_value: bool,
+):
+    preset = {"c2": {"provider": "synthetic", "model": "configured-model"}}
+    saved = {"c2": {**preset["c2"], legacy_field: legacy_value}}
+
+    assert _tiers_equal_after_canonical_normalization(saved, preset)
+    assert saved["c2"][legacy_field] is legacy_value
+    assert not _tiers_equal_after_canonical_normalization(
+        {"c2": {**saved["c2"], "model": "different-model"}}, preset
+    )
 
 
 def test_upsert_router_forces_image_model_role_invariants():

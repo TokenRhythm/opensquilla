@@ -382,20 +382,36 @@ def facts_catalog() -> Iterator[ModelCatalog]:
         set_shared_catalog(None)
 
 
+def _facts_context(provider: str = "mainprov") -> TurnContext:
+    config = GatewayConfig(llm={"provider": provider})
+    config.squilla_router.cross_provider_tiers = True
+    return TurnContext(
+        message="",
+        session_key="capability-facts",
+        config=config,
+        provider=None,
+        model="",
+        tool_defs=[],
+        system_prompt="",
+    )
+
+
 def test_facts_definite_signals_from_catalog(facts_catalog: ModelCatalog) -> None:
     tiers = {
         "c0": {"model": "dummy-small-live-1"},
         "c1": {"model": "dummy-mini-unknown-1"},
         "c2": {"model": "dummy-vis-live-1"},
     }
-    facts = _tier_capability_facts(tiers, ["c0", "c1", "c2"], "mainprov")
+    facts = _tier_capability_facts(
+        _facts_context("openrouter"), tiers, ["c0", "c1", "c2"], "openrouter"
+    )
     assert facts["c0"] == TierCapability(supports_vision=False, context_window=8_000)
     assert facts["c2"] == TierCapability(supports_vision=True, context_window=200_000)
 
 
 def test_facts_synthesized_entry_gives_no_signal(facts_catalog: ModelCatalog) -> None:
     facts = _tier_capability_facts(
-        {"c1": {"model": "dummy-mini-unknown-1"}}, ["c1"], "mainprov"
+        _facts_context(), {"c1": {"model": "dummy-mini-unknown-1"}}, ["c1"], "mainprov"
     )
     assert facts["c1"] == TierCapability(supports_vision=None, context_window=None)
 
@@ -407,17 +423,16 @@ def test_facts_user_override_window_counts_as_definite(facts_catalog: ModelCatal
         {"mainprov/dummy-pinned-window-1": {"context_window": 64_000}}
     )
     facts = _tier_capability_facts(
-        {"c1": {"model": "dummy-pinned-window-1"}}, ["c1"], "mainprov"
+        _facts_context(), {"c1": {"model": "dummy-pinned-window-1"}}, ["c1"], "mainprov"
     )
     assert facts["c1"].context_window == 64_000
 
 
-def test_facts_anthropic_flag_gated_caps_stay_unknown(facts_catalog: ModelCatalog) -> None:
-    # The user-override layer claims vision for this model. Under a normal
-    # provider that is a definite signal; under anthropic the capabilities
-    # are flag-gated to the empty ModelCapabilities() for one release, so
-    # the gate must treat the same claim as unknown.
+def test_facts_keep_capability_evidence_provider_scoped(facts_catalog: ModelCatalog) -> None:
+    # Explicit evidence for one provider cannot authorize a different
+    # provider's deployment with the same model identifier.
     overridden = _tier_capability_facts(
+        _facts_context(),
         {"c2": {"model": "dummy-anthropic-x", "provider": "anthroprov"}},
         ["c2"],
         "mainprov",
@@ -425,6 +440,7 @@ def test_facts_anthropic_flag_gated_caps_stay_unknown(facts_catalog: ModelCatalo
     assert overridden["c2"].supports_vision is True
 
     anthropic_facts = _tier_capability_facts(
+        _facts_context(),
         {"c2": {"model": "dummy-anthropic-x", "provider": "anthropic"}},
         ["c2"],
         "mainprov",
@@ -435,7 +451,7 @@ def test_facts_anthropic_flag_gated_caps_stay_unknown(facts_catalog: ModelCatalo
 
 
 def test_facts_blank_model_gives_no_signal(facts_catalog: ModelCatalog) -> None:
-    facts = _tier_capability_facts({"c0": {"model": ""}}, ["c0"], "mainprov")
+    facts = _tier_capability_facts(_facts_context(), {"c0": {"model": ""}}, ["c0"], "mainprov")
     assert facts["c0"] == TierCapability()
 
 

@@ -10,7 +10,6 @@
 //   • readonly   — preset preview: no editable controls at all.
 import { computed, nextTick, onBeforeUnmount, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
-import ControlSwitch from '@/components/ControlSwitch.vue'
 import Icon from '@/components/Icon.vue'
 import SetupModelCombobox from '@/components/setup/SetupModelCombobox.vue'
 import type {
@@ -61,7 +60,7 @@ const props = withDefaults(defineProps<{
 })
 
 const emit = defineEmits<{
-  updateTierField: [name: string, key: 'provider' | 'model' | 'thinkingLevel' | 'supportsImage' | 'ensembleEnabled' | 'ensembleSelectionMode', value: string | boolean]
+  updateTierField: [name: string, key: 'provider' | 'model' | 'thinkingLevel' | 'ensembleEnabled' | 'ensembleSelectionMode', value: string | boolean]
   migrateLegacyEnsemble: []
 }>()
 
@@ -175,15 +174,6 @@ function providerFieldDisabled(row: SetupTierRow): boolean {
   // remediation control itself. The legacy image row is retained only for
   // configuration compatibility and cannot assign an executable deployment.
   return props.disabled || row.name === IMAGE_TIER
-}
-
-function imageSwitchDisabled(row: SetupTierRow): boolean {
-  return rowFieldsDisabled(row) || (row.name === 'c3' && tierEnsembleActive(row))
-}
-
-function displayedImageSupport(row: SetupTierRow): boolean {
-  if (row.name === 'c3' && tierEnsembleActive(row)) return false
-  return row.supportsImage === true
 }
 
 function modelChoiceValue(row: SetupTierRow): string {
@@ -629,7 +619,7 @@ const allowsFloatingContent = computed(() => (
     :aria-disabled="disabled ? 'true' : undefined"
   >
     <div class="setup-tier-table__row is-head" role="row">
-      <span>{{ t('setup.router.colTier') }}</span><span v-if="showProviderColumn">{{ t('setup.router.colProvider') }}</span><span>{{ t('setup.router.colModel') }}</span><span>{{ t('setup.router.colThinking') }}</span><span>{{ t('setup.router.colImage') }}</span>
+      <span>{{ t('setup.router.colTier') }}</span><span v-if="showProviderColumn">{{ t('setup.router.colProvider') }}</span><span>{{ t('setup.router.colModel') }}</span><span>{{ t('setup.router.colThinking') }}</span>
     </div>
     <div
       v-for="tier in rows"
@@ -761,7 +751,6 @@ const allowsFloatingContent = computed(() => (
             ? t('setup.router.tierThinkingManagedByEnsembleAria', { tier: tier.name })
             : t('setup.router.tierThinkingAria', { tier: tier.name })"
         >{{ thinkingManagedByEnsemble(tier) ? t('setup.router.tierThinkingManagedByEnsemble') : tier.thinkingLevel || '-' }}</span>
-        <ControlSwitch :checked="displayedImageSupport(tier)" :disabled="true" :aria-label="t('setup.router.tierImageAria', { tier: tier.name })" />
       </template>
       <template v-else>
         <div class="setup-tier-table__model-cell">
@@ -865,7 +854,6 @@ const allowsFloatingContent = computed(() => (
         <select v-else :value="tier.thinkingLevel" :aria-label="t('setup.router.tierThinkingAria', { tier: tier.name })" :disabled="rowFieldsDisabled(tier)" @change="emit('updateTierField', tier.name, 'thinkingLevel', ($event.target as HTMLSelectElement).value)">
           <option v-for="v in THINKING_LEVELS" :key="v" :value="v">{{ v || '-' }}</option>
         </select>
-        <ControlSwitch :checked="displayedImageSupport(tier)" :disabled="imageSwitchDisabled(tier)" :aria-label="t('setup.router.tierImageAria', { tier: tier.name })" @change="(v) => emit('updateTierField', tier.name, 'supportsImage', v)" />
       </template>
       <span
         v-if="tier.name === 'c3' && !readonly"
@@ -890,7 +878,7 @@ const allowsFloatingContent = computed(() => (
 }
 
 .setup-tier-table--without-provider .setup-tier-table__row {
-  grid-template-columns: 140px minmax(0, 1fr) 120px 60px;
+  grid-template-columns: 140px minmax(0, 1fr) 120px;
 }
 
 .setup-tier-table__provider-cell {

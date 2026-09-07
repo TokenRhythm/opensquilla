@@ -1191,6 +1191,7 @@
       "colModel": "モデル",
       "colThinking": "思考",
       "colImage": "画像",
+      "imageCapabilityAutomatic": "画像対応はプロバイダーのメタデータとリクエストの結果から自動判定されます。手動設定は不要です。",
       "tierProviderAria": "{tier} のリクエスト入口",
       "tierProviderManagedByEnsemble": "マルチモデル融合が決定",
       "tierProviderManagedByEnsembleAria": "{tier} のリクエスト入口はマルチモデル融合プランによって決まります",

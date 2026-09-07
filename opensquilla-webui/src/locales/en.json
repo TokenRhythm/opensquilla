@@ -1280,6 +1280,7 @@
       "colModel": "Model",
       "colThinking": "Thinking",
       "colImage": "Image",
+      "imageCapabilityAutomatic": "Image capability is detected automatically from provider metadata and request results; no manual setting is needed.",
       "tierProviderAria": "{tier} request entry",
       "tierProviderManagedByEnsemble": "Determined by Multi-model fusion",
       "tierProviderManagedByEnsembleAria": "{tier} request entry is determined by the Multi-model fusion plan",
