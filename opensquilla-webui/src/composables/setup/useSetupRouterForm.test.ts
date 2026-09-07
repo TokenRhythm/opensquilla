@@ -19,7 +19,7 @@ function makePanel(form: ReturnType<typeof useSetupRouterForm>, isOpenrouter: bo
 }
 
 describe('useSetupRouterForm — openrouter-mix round-trip', () => {
-  it('preserves the inactive legacy image row without editing it or enabling cross-provider routing', () => {
+  it('hides the inactive image row without losing saved config or enabling cross-provider routing', () => {
     const form = useSetupRouterForm()
     form.initFromConfig({
       enabled: true,
@@ -43,12 +43,7 @@ describe('useSetupRouterForm — openrouter-mix round-trip', () => {
     expect(form.payload()).toEqual(saved)
     expect(form.hasMixedTierProviders.value).toBe(false)
     expect(form.payload()).not.toHaveProperty('crossProviderTiers')
-    expect(makePanel(form, true).value.tierRows).toContainEqual(expect.objectContaining({
-      name: 'image_model',
-      provider: 'openai',
-      model: 'saved/vision-model',
-      thinkingLevel: 'high',
-    }))
+    expect(makePanel(form, true).value.tierRows.map(row => row.name)).toEqual(['c0'])
     form.updateTierField('c0', 'model', 'configured/new-text-model')
     expect(form.payload()).toMatchObject({
       tiers: {

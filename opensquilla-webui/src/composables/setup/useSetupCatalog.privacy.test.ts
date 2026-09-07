@@ -2619,9 +2619,8 @@ describe('useSetupCatalog fresh-install provider semantics', () => {
 
     api.updateTierField('image_model', 'model', 'vision-model-v2')
     expect(api.modelStrategyPanel.value.router.tierEnsembleStatusFresh).toBe(true)
-    expect(api.modelStrategyPanel.value.router.tierRows).toContainEqual(expect.objectContaining({
+    expect(api.modelStrategyPanel.value.router.tierRows).not.toContainEqual(expect.objectContaining({
       name: 'image_model',
-      model: 'vision-model',
     }))
     expect(api.modelStrategyPanel.value.router.tierEnsembleStatus).toMatchObject({
       runtimeStatus: 'blocked',
@@ -3306,10 +3305,9 @@ describe('useSetupCatalog configured provider management', () => {
     expect(api.routerPanel.value.tierRows).toEqual(expect.arrayContaining([
       expect.objectContaining({ name: 'c0', provider: 'openrouter', model: 'legacy-model' }),
       expect.objectContaining({ name: 'c1', provider: 'deepseek', model: 'deepseek-chat' }),
-      expect.objectContaining({ name: 'image_model', provider: 'deepseek', model: 'deepseek-vision' }),
     ]))
-    // The dedicated image route is independent and must never be imported as
-    // a text proposer when the user converts a legacy dynamic plan.
+    expect(api.routerPanel.value.tierRows.map(row => row.name)).toEqual(['c0', 'c1'])
+    // A retained image-model configuration must not become an Ensemble member.
     expect(api.ensemblePanel.value.tierCandidates).toEqual([
       expect.objectContaining({ provider: 'deepseek', model: 'deepseek-chat', source: 'tier' }),
     ])

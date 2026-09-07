@@ -525,7 +525,7 @@ export function useSetupRouterForm() {
 
   function tierRows(textTiers: readonly string[]): SetupTierRow[] {
     return Object.entries(tierValues.value)
-      .filter(([name]) => textTiers.includes(name) || name === IMAGE_TIER)
+      .filter(([name]) => name !== IMAGE_TIER && textTiers.includes(name))
       .map(([name, tier]) => ({
         name,
         provider: tier.provider,

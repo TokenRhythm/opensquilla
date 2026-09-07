@@ -703,8 +703,9 @@ describe('SetupTierTable — editable routing rows', () => {
     app.unmount()
   })
 
-  it('keeps the legacy image row visible and disabled while explaining C0–C3 routing', async () => {
+  it.each([false, true])('hides the image row in editable and preset tables (readonly=%s)', async (readonly) => {
     const { app, el } = await mountTable({
+      readonly,
       rows: [
         {
           ...ROWS[1],
@@ -728,18 +729,14 @@ describe('SetupTierTable — editable routing rows', () => {
     })
 
     expect(el.querySelector('[aria-label="c3 supports image"]')).toBeNull()
-    const imageModel = el.querySelector<HTMLInputElement>('input[aria-label="image_model model"]')!
-    expect(imageModel.value).toBe('vision-model')
-    expect(imageModel.disabled).toBe(true)
-    expect(imageModel.closest('[role="row"]')?.querySelector('.setup-tier-table__provider-warning')).toBeNull()
-    expect(el.querySelector('[aria-label="image_model request entry"]')?.getAttribute('aria-invalid')).toBeNull()
-    expect(el.querySelector<HTMLSelectElement>('select[aria-label="image_model request entry"]')?.disabled).toBe(true)
-    expect(el.querySelector<HTMLSelectElement>('select[aria-label="image_model thinking level"]')?.disabled).toBe(true)
-    expect(el.querySelector<HTMLSelectElement>('select[aria-label="c3 request entry"]')?.disabled).toBe(false)
+    expect(el.querySelectorAll('[role="row"]')).toHaveLength(2)
+    expect(el.querySelector('[aria-label="image_model model"]')).toBeNull()
+    expect(el.querySelector('[aria-label="image_model request entry"]')).toBeNull()
+    expect(el.querySelector('[aria-label="image_model thinking level"]')).toBeNull()
     expect(el.querySelector('[aria-label="image_model supports image"]')).toBeNull()
-    expect(el.textContent).toContain('Router image processing uses only configured C0–C3 models')
-    expect(el.textContent).toContain('Legacy compatibility setting: this model is preserved but not used for image input')
-    expect(el.textContent).toContain('Configure an image-capable model in C0–C3')
+    expect(el.querySelector('[aria-label="C3 processing mode or model"]')).toBeTruthy()
+    expect(el.textContent).not.toContain('vision-model')
+    expect(el.textContent).not.toContain('Legacy compatibility setting')
     app.unmount()
   })
 

@@ -80,6 +80,7 @@ const ensembleDetailsAnchor = ref<HTMLElement | null>(null)
 const ensembleTooltipUsesViewport = ref(false)
 const ensembleTooltipPlacement = ref<'top' | 'bottom'>('top')
 const ensembleTooltipStyle = ref<Record<string, string>>({})
+const visibleRows = computed(() => props.rows.filter(row => row.name !== IMAGE_TIER))
 
 function catalogFor(row: SetupTierRow): DiscoveredModelCatalog {
   const provider = row.provider.trim().toLowerCase()
@@ -120,7 +121,6 @@ function providerOptionsFor(row: SetupTierRow): SetupProviderOption[] {
 }
 
 function credentialFor(row: SetupTierRow): SetupProviderCredentialStatus | undefined {
-  if (row.name === IMAGE_TIER) return undefined
   const provider = row.provider.trim().toLowerCase()
   return props.providerCredentialStatus.find(status => (
     String(status.provider || '').trim().toLowerCase() === provider
@@ -161,19 +161,11 @@ function providerManagedByEnsemble(row: SetupTierRow): boolean {
 }
 
 function rowFieldsDisabled(row: SetupTierRow): boolean {
-  if (row.name === IMAGE_TIER) return true
   // The saved C3 provider/model are only the sleeping single-model draft while
   // shared fusion is selected. An unavailable draft provider must not trap the
   // user in fusion or make the active shared plan appear unavailable.
   if (providerManagedByEnsemble(row)) return props.disabled
   return dependentFieldsDisabled(row)
-}
-
-function providerFieldDisabled(row: SetupTierRow): boolean {
-  // An invalid/retired saved provider disables its dependent fields, not the
-  // remediation control itself. The legacy image row is retained only for
-  // configuration compatibility and cannot assign an executable deployment.
-  return props.disabled || row.name === IMAGE_TIER
 }
 
 function modelChoiceValue(row: SetupTierRow): string {
@@ -582,7 +574,7 @@ function updateModelChoice(row: SetupTierRow, value: string) {
 
 const showProviderColumn = computed(() => {
   if (props.readonly) return true
-  if (props.rows.some(row => (
+  if (visibleRows.value.some(row => (
     !providerManagedByEnsemble(row) && credentialFor(row)?.available === false
   ))) return true
 
@@ -594,7 +586,7 @@ const showProviderColumn = computed(() => {
   if (configuredProviders.size !== 1) return true
 
   const [onlyProvider] = [...configuredProviders]
-  return props.rows.some(row => (
+  return visibleRows.value.some(row => (
     !providerManagedByEnsemble(row)
     && row.provider.trim().toLowerCase() !== onlyProvider
   ))
@@ -602,9 +594,9 @@ const showProviderColumn = computed(() => {
 
 // The combobox dropdown and compact-plan tooltip are absolutely positioned;
 // the table's rounded-corner overflow clip must open whenever either floats.
-const hasCombobox = computed(() => props.rows.some(row => hasLiveCatalog(row)))
+const hasCombobox = computed(() => visibleRows.value.some(row => hasLiveCatalog(row)))
 const allowsFloatingContent = computed(() => (
-  hasCombobox.value || props.rows.some(row => compactSharedTierEnsembleActive(row))
+  hasCombobox.value || visibleRows.value.some(row => compactSharedTierEnsembleActive(row))
 ))
 </script>
 
@@ -622,12 +614,12 @@ const allowsFloatingContent = computed(() => (
       <span>{{ t('setup.router.colTier') }}</span><span v-if="showProviderColumn">{{ t('setup.router.colProvider') }}</span><span>{{ t('setup.router.colModel') }}</span><span>{{ t('setup.router.colThinking') }}</span>
     </div>
     <div
-      v-for="tier in rows"
+      v-for="tier in visibleRows"
       :key="tier.name"
       class="setup-tier-table__row"
-      :class="{ 'is-disabled': providerFieldDisabled(tier) }"
+      :class="{ 'is-disabled': disabled }"
       role="row"
-      :aria-disabled="providerFieldDisabled(tier) ? 'true' : undefined"
+      :aria-disabled="disabled ? 'true' : undefined"
     >
       <span class="setup-tier-table__tier">{{ tierLabel(tier.name) }}</span>
       <template v-if="showProviderColumn">
@@ -646,7 +638,7 @@ const allowsFloatingContent = computed(() => (
             :value="tier.provider.trim().toLowerCase()"
             :aria-label="t('setup.router.tierProviderAria', { tier: tier.name })"
             :aria-invalid="credentialFor(tier) && !credentialFor(tier)?.available ? 'true' : undefined"
-            :disabled="providerFieldDisabled(tier)"
+            :disabled="disabled"
             @change="emit('updateTierField', tier.name, 'provider', ($event.target as HTMLSelectElement).value)"
           >
             <option v-if="!tier.provider" value="" disabled>-</option>
@@ -740,9 +732,6 @@ const allowsFloatingContent = computed(() => (
           >{{ ensemblePlanBlockedReasonLabel }}</small>
           <small v-if="showInlineImageRule(tier)" class="setup-tier-table__model-note">
             {{ t('setup.router.tierEnsembleImageRouting') }}
-          </small>
-          <small v-if="tier.name === IMAGE_TIER" class="setup-tier-table__model-note">
-            {{ t('setup.router.tierLegacyImageRouting') }}
           </small>
         </div>
         <span
@@ -840,9 +829,6 @@ const allowsFloatingContent = computed(() => (
           >{{ ensemblePlanBlockedReasonLabel }}</small>
           <small v-if="showInlineImageRule(tier)" class="setup-tier-table__model-note">
             {{ t('setup.router.tierEnsembleImageRouting') }}
-          </small>
-          <small v-if="tier.name === IMAGE_TIER" class="setup-tier-table__model-note">
-            {{ t('setup.router.tierLegacyImageRouting') }}
           </small>
         </div>
         <span
