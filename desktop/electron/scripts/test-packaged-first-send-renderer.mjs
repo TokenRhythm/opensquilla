@@ -24,6 +24,7 @@ import {
 } from './packaged-first-send-cleanup.mjs'
 import { DESKTOP_GATEWAY_STARTUP_TIMEOUT_MS } from '../dist/gateway-lifecycle.js'
 import { captureWindowsWaitChain } from './windows-wait-chain-diagnostics.mjs'
+import { captureWindowsNativeStacks } from './windows-native-stack-diagnostics.mjs'
 import { launchOwnedElectronDiagnostic } from './owned-electron-diagnostic-launcher.mjs'
 
 const DEFAULT_ITERATIONS = 20
@@ -661,15 +662,24 @@ try {
       deferQuit,
       unrouteBeforeQuit,
       processIdentity: electronProcessIdentity,
-      diagnosticTimeoutMs: extendedQuitDiagnostics ? 6_000 : 3_000,
-      diagnostics: async cause => ({
-        processes: electronProcessSnapshot(electronProcessIdentity),
-        desktopLog: await readDesktopLogSummary(userDataDir),
-        rendererBeforeCleanup: failureRendererSnapshot,
-        ...(extendedQuitDiagnostics && cause?.code === 'DESKTOP_E2E_SHUTDOWN_TIMEOUT'
-          ? { windowsWaitChain: await captureWindowsWaitChain(electronProcessIdentity) }
-          : {}),
-      }),
+      diagnosticTimeoutMs: extendedQuitDiagnostics ? 8_000 : 3_000,
+      diagnostics: async cause => {
+        const detail = {
+          processes: electronProcessSnapshot(electronProcessIdentity),
+          desktopLog: await readDesktopLogSummary(userDataDir),
+          rendererBeforeCleanup: failureRendererSnapshot,
+        }
+        if (extendedQuitDiagnostics && cause?.code === 'DESKTOP_E2E_SHUTDOWN_TIMEOUT') {
+          // Sampling starts only after the unchanged 100-second exit gate has
+          // failed. Both collectors are bounded and own only their helpers.
+          const [windowsWaitChain, windowsNativeStacks] = await Promise.all([
+            captureWindowsWaitChain(electronProcessIdentity),
+            captureWindowsNativeStacks(electronProcessIdentity),
+          ])
+          Object.assign(detail, { windowsWaitChain, windowsNativeStacks })
+        }
+        return detail
+      },
       onPhase: reportPhase,
     })
   } catch (error) {

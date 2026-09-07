@@ -483,3 +483,11 @@ def test_reused_windows_audits_require_signatures_without_signing_credentials() 
     assert "--owned-electron-launcher" in diagnostic["run"]
     assert "--iterations 1" in diagnostic["run"]
     assert first_send["steps"].index(diagnostic) > first_send["steps"].index(gate)
+    native_control = next(
+        step for step in first_send["steps"]
+        if step["name"] == "Validate native stack collector against an owned process"
+    )
+    assert native_control["if"] == "inputs.run_windows_release_audit"
+    assert "test-windows-native-stack-diagnostics.mjs" in native_control["run"]
+    assert "continue-on-error" not in native_control
+    assert first_send["steps"].index(native_control) < first_send["steps"].index(gate)

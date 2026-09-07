@@ -374,6 +374,16 @@ jobs:
           npm run build
           if ($LASTEXITCODE -ne 0) { throw 'Harness compilation failed.' }
 
+      - name: Validate native stack collector against an owned process
+        if: inputs.run_windows_release_audit
+        timeout-minutes: 3
+        working-directory: desktop/electron
+        shell: pwsh
+        run: |
+          Write-Host "Native stack collector runner: $env:RUNNER_OS / $env:ImageOS / $env:ImageVersion"
+          node scripts/test-windows-native-stack-diagnostics.mjs
+          if ($LASTEXITCODE -ne 0) { throw 'Native stack collector controls failed.' }
+
       - name: Verify signed installed first-send
         id: first_send
         if: inputs.run_windows_release_audit
