@@ -448,7 +448,7 @@ def test_model_routing_public_snapshot_exposes_complete_capability_matrix(
         },
         "ensemble": {
             "image_input": {
-                "admission": "blocked",
+                "admission": "allowed",
                 "reason": "ensemble_mode_unsupported",
             }
         },
@@ -523,7 +523,7 @@ def test_model_routing_capability_projection_isolates_one_mode_failure(
         "unknown",
     }
     assert capabilities["ensemble"]["image_input"] == {
-        "admission": "blocked",
+        "admission": "allowed",
         "reason": "ensemble_mode_unsupported",
     }
 
@@ -1041,16 +1041,17 @@ async def test_inactive_router_capability_change_broadcasts_public_snapshot(
             "enabled": False,
             "rollout_phase": "observe",
             "tiers": {
-                "c1": {"model": "router-text", "supports_image": True},
+                "c1": {"model": "router-text"},
             },
         },
     )
     ctx, events = _routing_event_ctx(config, monkeypatch)
     before = model_routing_public_snapshot(config)
     assert before["mode"] == "ensemble"
-    assert before["capabilities_by_mode"]["router"]["image_input"][
-        "admission"
-    ] == "blocked"
+    assert before["capabilities_by_mode"]["router"]["image_input"] == {
+        "admission": "allowed",
+        "reason": "router_image_route_unavailable",
+    }
 
     response = await _handle_config_patch(
         {"patches": {"squilla_router.tiers.c1.model": "router-vision"}},

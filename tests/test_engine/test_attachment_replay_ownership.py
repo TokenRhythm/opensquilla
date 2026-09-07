@@ -157,3 +157,36 @@ async def test_manifest_save_rechecks_owner_inside_write_transaction(
         )
     assert save_attempted is True
     assert await manager.get_context_states(node.session_key, valid_only=False) == []
+
+
+@pytest.mark.parametrize("replacement", ["reset", "epoch"])
+async def test_bound_attachment_owner_failure_stops_pipeline(
+    replay_session: Any, monkeypatch: pytest.MonkeyPatch, replacement: str
+) -> None:
+    runner, _, other_manager, node, entry, _ = replay_session
+    if replacement == "reset":
+        await other_manager.apply_intent(node.session_key, SessionIntent.RESET_SAME_KEY)
+    else:
+        await other_manager.storage.increment_epoch(node.session_key)
+    pipeline_entered = False
+
+    async def unexpected_pipeline(*args: Any, **kwargs: Any) -> Any:
+        nonlocal pipeline_entered
+        pipeline_entered = True
+        raise AssertionError("A retired bound prompt must not reach pipeline steps")
+
+    monkeypatch.setattr("opensquilla.engine.pipeline.run_pipeline", unexpected_pipeline)
+    with pytest.raises(StaleEpochError):
+        await runner._run_pipeline(
+            "Inspect the attachment again.",
+            node.session_key,
+            MagicMock(),
+            None,
+            [],
+            "system",
+            [],
+            bound_user_message_id=entry.message_id,
+            expected_session_id=node.session_id,
+            expected_session_epoch=node.epoch,
+        )
+    assert pipeline_entered is False

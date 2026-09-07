@@ -501,9 +501,7 @@ def test_global_fixed_lineup_suppresses_provider_switch_conflicts_and_warnings()
         shared_selection_mode="static_openrouter_b5",
         ensemble_globally_enabled=True,
     )
-    assert len(warnings) == 1
-    assert "image_model" in warnings[0]
-    assert "openai" in warnings[0]
+    assert warnings == []
 
 
 # ---------------------------------------------------------------------------
@@ -1623,10 +1621,14 @@ def test_upsert_router_surfaces_cross_provider_warning() -> None:
     assert any("cross-provider" in w.lower() for w in res.warnings)
 
 
-def test_upsert_router_no_warning_for_matching_tiers() -> None:
+def test_upsert_router_no_cross_provider_warning_for_matching_tiers() -> None:
     cfg = GatewayConfig()
     res = upsert_router(cfg, mode="recommended")
-    assert res.warnings == []
+    assert len(res.warnings) == 1
+    assert "legacy image_model" in res.warnings[0]
+    assert "preserved for compatibility" in res.warnings[0]
+    assert "not used for image input" in res.warnings[0]
+    assert not any("cross-provider" in warning.lower() for warning in res.warnings)
 
 
 def test_upsert_router_model_override_keeps_omitted_vision_support_unknown() -> None:

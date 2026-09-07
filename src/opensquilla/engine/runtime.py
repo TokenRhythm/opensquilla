@@ -9914,6 +9914,11 @@ class TurnRunner:
                             bound_attachment_ids
                         )
             except Exception as exc:  # noqa: BLE001 - marker IDs are additive
+                if (
+                    (expected_session_id is not None or expected_session_epoch is not None)
+                    and _has_session_storage(self._session_manager)
+                ):
+                    raise
                 log.debug(
                     "turn_runner.bound_attachment_ids_unavailable",
                     message_id=bound_user_message_id,
@@ -10832,7 +10837,7 @@ class TurnRunner:
         trim_last_user: bool,
         bound_slice_applied: bool,
         image_replay_entry_indexes: Collection[int] = (),
-        allowed_image_attachment_ids: Collection[str] | None = None,
+        allowed_image_attachment_ids: frozenset[str] | None = None,
         media_root: Path | None = None,
         session_id: str | None = None,
         materialize_historical_attachments: bool = False,
