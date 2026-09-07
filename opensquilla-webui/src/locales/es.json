@@ -4192,6 +4192,11 @@
       "expired": "El registro de enrutamiento de este mensaje ha caducado",
       "failed": "No se pudo registrar tu valoración"
     }
+,
+    "enhancePrompt": {
+      "enhanceLabel": "Mejorar el prompt",
+      "emptyHint": "Escribe un mensaje primero para mejorarlo"
+    }
   },
   "shared": {
     "loading": "Cargando",
