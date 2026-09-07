@@ -8,11 +8,13 @@ from typing import Any
 import pytest
 
 from opensquilla.application.session_history import (
+    CanonicalHistoryReadError,
     HistoryPage,
     SessionHistoryApplication,
     SessionHistoryQuery,
     paginate_transcript,
 )
+from opensquilla.history_cursor import HistoryCursorInvalidatedError
 
 
 def entry(index: int) -> SimpleNamespace:
@@ -92,7 +94,7 @@ async def test_canonical_page_is_preferred_and_metadata_is_normalized() -> None:
             "session_key": "agent:main:webchat:history",
             "limit": 2,
             "before": (3, 3),
-            "after": (1, 1),
+            "after": None,
         }
     ]
 
@@ -169,11 +171,32 @@ def test_paginate_transcript_preserves_latest_window_and_after_cursor() -> None:
 
     latest, latest_more = paginate_transcript(rows, limit=2)
     forward, forward_more = paginate_transcript(rows, limit=2, after=(2, 2))
-    missing, missing_more = paginate_transcript(rows, limit=2, after=(99, 99))
 
     assert [getattr(row, "id") for row in latest] == [4, 5]
     assert latest_more is True
     assert [getattr(row, "id") for row in forward] == [3, 4]
     assert forward_more is True
-    assert [getattr(row, "id") for row in missing] == [4, 5]
-    assert missing_more is True
+    with pytest.raises(HistoryCursorInvalidatedError):
+        paginate_transcript(rows, limit=2, after=(99, 99))
+
+
+@pytest.mark.asyncio
+async def test_canonical_failure_is_not_misreported_as_stale_by_active_fallback() -> None:
+    active = ActivePort([entry(1)])
+    failure = CanonicalHistoryReadError("canonical projection failed")
+
+    class BrokenCanonical(CanonicalPort):
+        async def read_canonical_page(self, *args: Any, **kwargs: Any) -> HistoryPage | None:
+            raise failure
+
+    app = SessionHistoryApplication(active=active, canonical=BrokenCanonical())
+    with pytest.raises(CanonicalHistoryReadError) as caught:
+        await app.read_page(
+            SessionHistoryQuery(
+                session_key="agent:main:webchat:history",
+                limit=1,
+                before=(2, 2),
+            )
+        )
+
+    assert caught.value is failure

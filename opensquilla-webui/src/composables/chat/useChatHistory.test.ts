@@ -6,6 +6,7 @@ import { useChatHistory } from './useChatHistory'
 import type { ChatMessage, ChatTurnOutcome } from '@/types/chat'
 import { RpcTimeoutError } from '@/lib/rpc'
 import {
+  SessionReadHistoryCursorError,
   SessionReadSessionMissingError,
   type SessionReadCompactionSummary,
   type SessionReadHistoryPage,
@@ -2184,6 +2185,47 @@ describe('useChatHistory canonical pagination', () => {
     await api.loadEarlierHistory()
     expect(api.historyState.value.loadEarlierError).toBe(false)
     expect(readHistory).toHaveBeenCalledTimes(3)
+  })
+
+  it('replaces stale canonical rows by retrying a rejected cursor from latest', async () => {
+    const { api, readHistory, historyFixture, messages } = makeHistory(false)
+    historyFixture
+      .mockResolvedValueOnce({
+        messages: [historyMessage('m4')],
+        hasMore: true,
+        oldestCursor: 'cursor-4',
+        newestCursor: 'cursor-4',
+        canonicalAvailable: true,
+      })
+      .mockRejectedValueOnce(
+        new SessionReadHistoryCursorError('stale', 'cursor rejected'),
+      )
+      .mockResolvedValueOnce({
+        messages: [historyMessage('m9')],
+        hasMore: false,
+        oldestCursor: 'cursor-9',
+        newestCursor: 'cursor-9',
+        canonicalAvailable: true,
+      })
+
+    await api.loadHistory()
+    await api.loadEarlierHistory()
+    await api.retryHistory()
+
+    expect(readHistory).toHaveBeenNthCalledWith(
+      2,
+      'before',
+      'cursor-4',
+      expect.any(Object),
+    )
+    expect(readHistory).toHaveBeenNthCalledWith(3, 'latest', null, expect.any(Object))
+    expect(messages.value.map(message => message.messageId)).toEqual(['m9'])
+    expect(api.historyState.value).toMatchObject({
+      oldestCursor: 'cursor-9',
+      newestCursor: 'cursor-9',
+      loadEarlierError: false,
+      recoveryError: false,
+    })
   })
 
   it('surfaces and retries an initial history request failure', async () => {

@@ -16,7 +16,7 @@ from urllib.parse import quote
 
 import structlog
 
-from opensquilla.application.session_history import SessionHistoryQuery
+from opensquilla.application.session_history import SessionHistoryQuery, cursor_for_entry
 from opensquilla.artifact_session import (
     ArtifactSessionService,
     MutationAttempt,
@@ -29,7 +29,7 @@ from opensquilla.gateway.adapters.session_history import (
     parse_history_cursor,
 )
 from opensquilla.gateway.adapters.turn_admission import webchat_session_key
-from opensquilla.gateway.rpc.registry import RpcContext, RpcUnavailableError
+from opensquilla.gateway.rpc.registry import RpcContext, RpcHandlerError, RpcUnavailableError
 from opensquilla.gateway.session_services import get_session_lock, get_session_storage
 from opensquilla.gateway.terminal_activity import (
     is_usage_accounting_barrier,
@@ -37,6 +37,10 @@ from opensquilla.gateway.terminal_activity import (
     safe_retry_after_ms,
     terminal_activity_snapshot,
     usage_barrier_replay_proof,
+)
+from opensquilla.history_cursor import (
+    HistoryCursorInvalidatedError,
+    HistoryCursorInvalidError,
 )
 from opensquilla.session.storage import StorageBusyError, bounded_interactive_storage_reads
 from opensquilla.session.terminal_reply import build_terminal_reply
@@ -488,10 +492,10 @@ async def _chat_history_turn_outcomes(
 def _chat_history_cursor(entry: object | None) -> str | None:
     if entry is None:
         return None
-    created_at = getattr(entry, "created_at", "")
-    stable_id = getattr(entry, "id", None) or getattr(entry, "message_id", "")
-    if created_at in {None, ""} or stable_id in {None, ""}:
+    cursor = cursor_for_entry(entry)
+    if cursor is None:
         return None
+    created_at, stable_id = cursor
     return f"{created_at}|{stable_id}"
 
 
@@ -751,11 +755,22 @@ async def read_chat_history_v4(params: dict | None, ctx: RpcContext) -> dict:
     mgr = _require_chat_session_manager(ctx)
     history_adapter = SessionHistoryStorageAdapter(mgr)
     history_application = history_adapter.application()
+    try:
+        parsed_before = parse_history_cursor(before)
+        parsed_after = (
+            None if parsed_before is not None else parse_history_cursor(after)
+        )
+    except HistoryCursorInvalidError as exc:
+        raise RpcHandlerError(
+            "HISTORY_CURSOR_INVALID",
+            "The history cursor is invalid. Reload history from the latest page.",
+        ) from exc
+
     history_query = SessionHistoryQuery(
         session_key=session_key,
         limit=limit,
-        before=parse_history_cursor(before),
-        after=parse_history_cursor(after),
+        before=parsed_before,
+        after=parsed_after,
         include_canonical=include_canonical,
     )
 
@@ -829,7 +844,19 @@ async def read_chat_history_v4(params: dict | None, ctx: RpcContext) -> dict:
                 finally:
                     if acquired:
                         history_lock.release()
-    except KeyError:
+    except HistoryCursorInvalidatedError as exc:
+        raise RpcHandlerError(
+            "HISTORY_CURSOR_INVALIDATED",
+            "The history cursor no longer belongs to this session. "
+            "Reload from the latest page.",
+        ) from exc
+    except KeyError as exc:
+        if parsed_before is not None or parsed_after is not None:
+            raise RpcHandlerError(
+                "HISTORY_CURSOR_INVALIDATED",
+                "The history cursor no longer belongs to this session. "
+                "Reload from the latest page.",
+            ) from exc
         if _is_webchat_session_key(session_key):
             return _empty_chat_history_payload(limit)
         raise
@@ -838,6 +865,15 @@ async def read_chat_history_v4(params: dict | None, ctx: RpcContext) -> dict:
         session_key,
         include_summaries=include_summaries,
     )
+    oldest_cursor = _chat_history_cursor(page_entries[0]) if page_entries else None
+    newest_cursor = _chat_history_cursor(page_entries[-1]) if page_entries else None
+    continuation_cursor = newest_cursor if parsed_after is not None else oldest_cursor
+    # Older archives may contain rows created before original integer ids were
+    # preserved. Keep those rows visible, but do not advertise an unusable
+    # pagination boundary.
+    if has_more and continuation_cursor is None:
+        has_more = False
+
     if summaries:
         history_scope = "compacted"
     elif has_more:
@@ -862,8 +898,8 @@ async def read_chat_history_v4(params: dict | None, ctx: RpcContext) -> dict:
             session_key=session_key,
         ),
         "has_more": has_more,
-        "oldest_cursor": _chat_history_cursor(page_entries[0]) if page_entries else None,
-        "newest_cursor": _chat_history_cursor(page_entries[-1]) if page_entries else None,
+        "oldest_cursor": oldest_cursor,
+        "newest_cursor": newest_cursor,
         "history_scope": history_scope,
         "loaded_count": len(page_entries),
         "page_size": limit,

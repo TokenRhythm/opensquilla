@@ -1,6 +1,9 @@
 import { ref } from 'vue'
 import type { SessionInspection } from '@/modules/sessionInspection'
-import type { SessionReadMessage } from '@/modules/sessionReadLifecycle'
+import {
+  SessionReadHistoryCursorError,
+  type SessionReadMessage,
+} from '@/modules/sessionReadLifecycle'
 import type { TurnCommands } from '@/modules/turnCommands'
 
 // The inspect drawer composes a bounded preview with canonical transcript pages.
@@ -44,6 +47,7 @@ export function useSessionInspect(sessionInspection: SessionInspection) {
   let failedTranscriptRequest: {
     key: string
     before: string | number | null
+    reloadLatest?: boolean
   } | null = null
   const loadedEarlierCursors = new Set<string>()
 
@@ -142,8 +146,13 @@ export function useSessionInspect(sessionInspection: SessionInspection) {
       if (seq === requestSeq && applied === true) {
         loadedEarlierCursors.add(String(cursor))
       }
-    } catch {
-      if (seq === requestSeq) loadEarlierError.value = true
+    } catch (error) {
+      if (seq === requestSeq) {
+        if (error instanceof SessionReadHistoryCursorError) {
+          failedTranscriptRequest = { key: currentKey, before: null, reloadLatest: true }
+        }
+        loadEarlierError.value = true
+      }
     } finally {
       if (seq === requestSeq) loadingEarlier.value = false
     }
@@ -158,8 +167,9 @@ export function useSessionInspect(sessionInspection: SessionInspection) {
 
   function retryHistory(beforeApply?: () => void) {
     const failed = failedTranscriptRequest
-    if (failed?.key === currentKey && failed.before != null) {
-      return requestEarlier(failed.before, beforeApply)
+    if (failed?.key === currentKey) {
+      if (failed.reloadLatest) return load(currentKey)
+      if (failed.before != null) return requestEarlier(failed.before, beforeApply)
     }
     if (canonicalAvailable.value === false) {
       return currentKey ? load(currentKey) : undefined

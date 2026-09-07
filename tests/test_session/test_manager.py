@@ -14,6 +14,7 @@ from unittest.mock import AsyncMock
 import pytest
 import pytest_asyncio
 
+from opensquilla.history_cursor import HistoryCursorInvalidatedError
 from opensquilla.session import manager as session_manager_module
 from opensquilla.session.compaction import CompactionConfig, CompactionResult
 from opensquilla.session.context_view import (
@@ -4476,6 +4477,129 @@ async def test_canonical_transcript_page_reads_one_snapshot_during_compaction(
         "snapshot-2",
         "snapshot-3",
     ]
+
+
+@pytest.mark.asyncio
+async def test_canonical_page_rejects_unknown_and_cross_session_cursors(manager):
+    first = await manager.create("agent:main:webchat:cursor-a")
+    second = await manager.create("agent:main:webchat:cursor-b")
+    await manager.append_message(first.session_key, "user", "first")
+    await manager.append_message(second.session_key, "user", "second")
+    anchor = (await manager.get_transcript(first.session_key))[0]
+    assert anchor.id is not None
+
+    for cursor in ((anchor.created_at, anchor.id), (9_999_999, 9_999_999)):
+        with pytest.raises(HistoryCursorInvalidatedError):
+            await manager.get_canonical_transcript_page(
+                second.session_key,
+                limit=10,
+                before=cursor,
+            )
+
+
+@pytest.mark.asyncio
+async def test_canonical_page_keeps_unaddressable_legacy_archive_rows(manager):
+    node = await manager.create("agent:main:webchat:legacy-cursor")
+    await manager._storage.conn.execute(
+        """
+        INSERT INTO compacted_transcript_entries (
+            session_id, session_key, original_entry_id, message_id, role,
+            content, created_at, archived_at, schema_version
+        ) VALUES (?, ?, NULL, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            node.session_id,
+            node.session_key,
+            "legacy-message",
+            "user",
+            "legacy content",
+            10,
+            20,
+            1,
+        ),
+    )
+    await manager._storage.conn.commit()
+
+    page = await manager.get_canonical_transcript_page(node.session_key, limit=10)
+
+    assert [entry.content for entry in page.entries] == ["legacy content"]
+    assert page.entries[0].id is None
+    assert page.canonical_complete is False
+
+
+@pytest.mark.asyncio
+async def test_cursor_validation_and_page_share_one_sqlite_snapshot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    db_path = tmp_path / "history-cursor-snapshot.db"
+    writer_storage = SessionStorage(str(db_path))
+    await writer_storage.connect()
+    writer = SessionManager(writer_storage, inject_time_prefix=False)
+    node = await writer.create("agent:main:webchat:cursor-snapshot")
+    for index in range(3):
+        await writer_storage.append_transcript_entry(
+            TranscriptEntry(
+                session_id=node.session_id,
+                session_key=node.session_key,
+                message_id=f"snapshot-{index}",
+                role="user",
+                content=f"message {index}",
+                created_at=1_000 + index,
+            )
+        )
+    anchor = (await writer.get_transcript(node.session_key))[0]
+    assert anchor.id is not None
+
+    reader_storage = SessionStorage(str(db_path))
+    await reader_storage.connect()
+    original_execute = reader_storage.conn.execute
+    deletion_injected = False
+
+    async def delete_after_snapshot() -> None:
+        nonlocal deletion_injected
+        if deletion_injected:
+            return
+        await writer_storage.delete_transcript(node.session_id)
+        deletion_injected = True
+
+    class DeleteAfterFetch:
+        def __init__(self, delegate: Any) -> None:
+            self._delegate = delegate
+            self._cursor: Any = None
+
+        async def __aenter__(self):
+            self._cursor = await self._delegate.__aenter__()
+            return self
+
+        async def fetchall(self):
+            rows = await self._cursor.fetchall()
+            await delete_after_snapshot()
+            return rows
+
+        async def __aexit__(self, *args: Any):
+            return await self._delegate.__aexit__(*args)
+
+    def execute(sql: str, params: Any = ()):
+        result = original_execute(sql, params)
+        if "WITH cursor_anchor AS" in " ".join(sql.split()):
+            return DeleteAfterFetch(result)
+        return result
+
+    monkeypatch.setattr(reader_storage.conn, "execute", execute)
+    try:
+        entries, has_more = await reader_storage.get_canonical_transcript_page(
+            node.session_id,
+            limit=10,
+            after=(anchor.created_at, anchor.id),
+        )
+    finally:
+        await reader_storage.close()
+        await writer_storage.close()
+
+    assert deletion_injected is True
+    assert has_more is False
+    assert [entry.message_id for entry in entries] == ["snapshot-1", "snapshot-2"]
 
 
 @pytest.mark.asyncio

@@ -1,6 +1,7 @@
 import {
   SessionReadContractError,
   SessionReadFailure,
+  SessionReadHistoryCursorError,
   SessionReadLeaseClosedError,
   SessionReadSessionMissingError,
 } from '@/modules/sessionReadLifecycle'
@@ -10,6 +11,7 @@ export function mapSessionReadError(error: unknown): Error {
   if (
     error instanceof SessionReadFailure
     || error instanceof SessionReadContractError
+    || error instanceof SessionReadHistoryCursorError
     || error instanceof SessionReadLeaseClosedError
     || error instanceof SessionReadSessionMissingError
   ) return error
@@ -17,6 +19,13 @@ export function mapSessionReadError(error: unknown): Error {
   const code = failure.code?.toUpperCase()
   if (code === 'NOT_FOUND' || code === 'SESSION_NOT_FOUND') {
     return new SessionReadSessionMissingError(failure.message, error)
+  }
+  if (code === 'HISTORY_CURSOR_INVALID' || code === 'HISTORY_CURSOR_INVALIDATED') {
+    return new SessionReadHistoryCursorError(
+      code === 'HISTORY_CURSOR_INVALID' ? 'invalid' : 'stale',
+      failure.message,
+      error,
+    )
   }
   const kind = code === 'RPC_ABORTED' || (error instanceof Error && error.name === 'AbortError')
     ? 'aborted'
