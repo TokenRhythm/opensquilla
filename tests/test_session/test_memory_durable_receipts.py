@@ -1,5 +1,6 @@
 import asyncio
 import threading
+from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from typing import Any
 
@@ -597,6 +598,7 @@ async def test_record_memory_checkpoint_receipt_db_uses_remaining_deadline(
     tmp_path, monkeypatch
 ):
     import opensquilla.memory.checkpoint as checkpoint
+    import opensquilla.session.compaction as compaction
 
     class Clock:
         now = 100.0
@@ -606,6 +608,23 @@ async def test_record_memory_checkpoint_receipt_db_uses_remaining_deadline(
 
     clock = Clock()
     monkeypatch.setattr("opensquilla.session.compaction.time", clock)
+    timeout_arguments: list[float] = []
+    active_timeout: asyncio.Timeout | None = None
+
+    @asynccontextmanager
+    async def _controlled_timeout(delay: float):
+        nonlocal active_timeout
+        timeout_arguments.append(delay)
+        # The fake clock owns this test's budget. Let real filesystem work
+        # finish, then trigger the real asyncio cancellation at DB admission.
+        async with asyncio.timeout(None) as timeout:
+            active_timeout = timeout
+            try:
+                yield timeout
+            finally:
+                active_timeout = None
+
+    monkeypatch.setattr(compaction, "asyncio", SimpleNamespace(timeout=_controlled_timeout))
     storage = await SessionStorage.open(tmp_path / "sessions.db")
     manager = SessionManager(storage, checkpoint_workspace_dir=tmp_path / "workspace")
     original_append = checkpoint.append_checkpoint_events
@@ -628,11 +647,15 @@ async def test_record_memory_checkpoint_receipt_db_uses_remaining_deadline(
             expected_session_id=None,
             expected_session_epoch=None,
         ):
+            assert _receipt.status == "checkpoint_saved"
             assert expected_session_id == node.session_id
             assert expected_session_epoch == int(node.epoch or 0)
             remaining = compaction_remaining_seconds(config)
             assert remaining is not None
             remaining_at_upsert.append(remaining)
+            assert timeout_arguments[-1] == pytest.approx(0.05)
+            assert active_timeout is not None
+            active_timeout.reschedule(asyncio.get_running_loop().time())
             await never_release.wait()
             raise AssertionError("cancelled receipt upsert must not resume")
 
@@ -647,6 +670,7 @@ async def test_record_memory_checkpoint_receipt_db_uses_remaining_deadline(
             )
 
         assert exc_info.value.phase == "checkpointing"
+        assert isinstance(exc_info.value.__cause__, TimeoutError)
         assert remaining_at_upsert == pytest.approx([0.05])
         assert config.deadline_at_monotonic == pytest.approx(100.2)
         rows = await storage.list_memory_durable_receipts(session_key=key)
