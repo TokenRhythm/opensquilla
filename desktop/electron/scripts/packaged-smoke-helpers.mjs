@@ -70,6 +70,7 @@ export async function launchPackagedCandidate({
   model,
   env = {},
   scrubProviderSecrets = false,
+  launchElectron = options => electron.launch(options),
 }) {
   await writeSyntheticCredential(userDataDir, {
     baseUrl,
@@ -79,7 +80,7 @@ export async function launchPackagedCandidate({
   const inheritedEnv = scrubProviderSecrets
     ? environmentWithoutProviderSecrets(process.env)
     : process.env
-  return electron.launch({
+  return launchElectron({
     executablePath,
     args: [
       '--use-mock-keychain',

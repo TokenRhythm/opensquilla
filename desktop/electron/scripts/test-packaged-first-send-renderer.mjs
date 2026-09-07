@@ -24,6 +24,7 @@ import {
 } from './packaged-first-send-cleanup.mjs'
 import { DESKTOP_GATEWAY_STARTUP_TIMEOUT_MS } from '../dist/gateway-lifecycle.js'
 import { captureWindowsWaitChain } from './windows-wait-chain-diagnostics.mjs'
+import { launchOwnedElectronDiagnostic } from './owned-electron-diagnostic-launcher.mjs'
 
 const DEFAULT_ITERATIONS = 20
 const SEND_TIMEOUT_MS = 45_000
@@ -239,8 +240,13 @@ const iterations = optionalIntegerOption('--iterations', DEFAULT_ITERATIONS)
 const deferQuit = process.argv.includes('--defer-quit')
 const unrouteBeforeQuit = process.argv.includes('--unroute-before-quit')
 const extendedQuitDiagnostics = process.argv.includes('--extended-quit-diagnostics')
+const ownedElectronLauncher = process.argv.includes('--owned-electron-launcher')
 assert.equal(deferQuit && unrouteBeforeQuit, false, 'quit diagnostic modes must be selected separately')
-const quitMode = deferQuit ? 'deferred-diagnostic' : unrouteBeforeQuit ? 'unroute-diagnostic' : 'playwright-close'
+assert.ok(!ownedElectronLauncher || (process.platform === 'win32'
+  && extendedQuitDiagnostics && !deferQuit && !unrouteBeforeQuit),
+'owned transport launch is a separate Windows extended diagnostic')
+const quitMode = ownedElectronLauncher ? 'owned-transport-diagnostic'
+  : deferQuit ? 'deferred-diagnostic' : unrouteBeforeQuit ? 'unroute-diagnostic' : 'playwright-close'
 const quitDiagnosticFile = deferQuit || unrouteBeforeQuit || extendedQuitDiagnostics || process.argv.includes('--quit-diagnostics-file')
   ? resolve(requiredOption('--quit-diagnostics-file'))
   : null
@@ -446,6 +452,12 @@ try {
     disableNetworkObservability: true,
     model: 'opensquilla-packaged-first-send-gate',
     scrubProviderSecrets: true,
+    ...(ownedElectronLauncher ? {
+      launchElectron: options => launchOwnedElectronDiagnostic({
+        ...options,
+        onEvent: transport => reportPhase('owned-electron-transport', { transport }),
+      }),
+    } : {}),
     env: {
       GITHUB_ACTIONS: '0',
       OPENSQUILLA_LLM_CONTEXT_WINDOW_TOKENS: '131072',

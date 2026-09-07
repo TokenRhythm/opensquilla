@@ -443,6 +443,9 @@ def test_reused_windows_audits_require_signatures_without_signing_credentials() 
         assert "inputs.source_run_id != ''" in jobs[name]["if"]
     audit = jobs["windows-release-upgrade-audit"]
     assert "inputs.run_windows_release_audit" in audit["if"]
+    assert "inputs.run_windows_upgrade_matrix" in audit["if"]
+    triggers = workflow.get("on", workflow.get(True))
+    assert triggers["workflow_dispatch"]["inputs"]["run_windows_upgrade_matrix"]["default"] is True
     assert "inputs.windows_source_run_id != ''" in audit["if"]
     assert "github.actor == 'Open-Squilla'" in audit["if"]
     assert audit["strategy"]["matrix"] == {
@@ -470,3 +473,13 @@ def test_reused_windows_audits_require_signatures_without_signing_credentials() 
     assert gate["if"] == "inputs.run_windows_release_audit"
     assert "test-packaged-first-send-renderer.mjs" in gate["run"]
     assert gate["timeout-minutes"] == 15
+    assert "--owned-electron-launcher" not in gate["run"]
+    diagnostic = next(
+        step for step in first_send["steps"]
+        if step["name"] == "Compare quit with independently owned debug connections"
+    )
+    assert "failure()" in diagnostic["if"]
+    assert "steps.first_send.outcome == 'failure'" in diagnostic["if"]
+    assert "--owned-electron-launcher" in diagnostic["run"]
+    assert "--iterations 1" in diagnostic["run"]
+    assert first_send["steps"].index(diagnostic) > first_send["steps"].index(gate)

@@ -1340,6 +1340,8 @@ def test_signing_source_changes_select_contracts_and_release_packaging(
         "desktop/electron/scripts/e2e-shutdown-helpers.mjs",
         "desktop/electron/scripts/capture-windows-wait-chain.ps1",
         "desktop/electron/scripts/windows-wait-chain-diagnostics.mjs",
+        "desktop/electron/scripts/owned-electron-diagnostic-launcher.mjs",
+        "desktop/electron/scripts/packaged-smoke-helpers.mjs",
         "desktop/electron/scripts/packaged-first-send-cleanup.mjs",
         "desktop/electron/scripts/test-packaged-first-send-cleanup.mjs",
         "desktop/electron/scripts/test-packaged-first-send-renderer.mjs",
