@@ -347,7 +347,7 @@
       "lifecycle": "stable",
       "name": "chat.history",
       "schema": "conversation/chat-history.schema.json",
-      "schemaSha256": "1e03b12ae015c0875c29d943c0f8d1969bd225b69978c2a8a36e0135785cab85"
+      "schemaSha256": "8e280ed656a595a3d9cf4fafd1d6c9ec064c5f648a94b529c43cbb13d1a688a8"
     },
     {
       "lifecycle": "stable",
@@ -1460,7 +1460,7 @@
     "generatorSha256": "0e0b513d7844d926e5f2c6065e64e4b523a1f8df2023317327ee6e05bfa29038",
     "methodCount": 214,
     "schemaCount": 224,
-    "schemaTreeSha256": "7479e55aa84897a526ea6a8c8b5dca3f995ffb7fdde4dc57bc84123e21cdf8fc"
+    "schemaTreeSha256": "14d1fcbfa3c80144c3fe0547f604b12ac54aa5e29492c40230fc9ce34919b934"
   },
   "wireVersion": 4
 }
