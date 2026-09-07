@@ -67,7 +67,24 @@ function decodePublicDebuggerHelp(bytes) {
   return { encoding, text }
 }
 
-async function captureCdbCapabilities(directory) {
+/**
+ * @param {string} directory
+ * @param {{kind: 'capabilities'} | {kind: 'initialization', child: import('node:child_process').ChildProcess,
+ *   identity: {electronPid: number, windowsStartTimeTicks: string}}} mode
+ */
+async function captureCdbCapabilities(directory, mode = { kind: 'capabilities' }) {
+  assert.ok(['capabilities', 'initialization'].includes(mode?.kind), 'Only fixed CDB selftest modes are supported')
+  const initialization = mode.kind === 'initialization'
+  if (initialization) {
+    assert.ok(Number.isSafeInteger(mode.identity?.electronPid) && mode.identity.electronPid > 0)
+    assert.equal(mode.child?.pid, mode.identity.electronPid, 'Initialization can only inspect its owned Node child')
+    assert.equal(mode.child.exitCode, null)
+    assert.equal(mode.child.signalCode, null)
+    assert.equal(mode.child.connected, true, 'Owned Node IPC must still be connected')
+    assert.ok(typeof mode.identity.windowsStartTimeTicks === 'string' && /^\d{15,20}$/.test(mode.identity.windowsStartTimeTicks))
+  }
+  const control = initialization ? 'native-cdb-initialization' : 'native-cdb-capabilities'
+  const maxBytes = (initialization ? 16 : 64) * 1024
   const sdkRoot = process.env['ProgramFiles(x86)']
   const debuggerPath = sdkRoot && join(sdkRoot, 'Windows Kits', '10', 'Debuggers', 'x64', 'cdb.exe')
   let toolBytes
@@ -77,20 +94,28 @@ async function captureCdbCapabilities(directory) {
     if (error.code !== 'ENOENT') throw new Error('Cannot read the SDK CDB capability tool')
   }
   if (!toolBytes) {
-    console.log('SKIP native CDB capabilities: Windows SDK CDB is unavailable')
+    console.log(`SKIP ${control}: Windows SDK CDB is unavailable`)
     return { status: 'unavailable' }
   }
   const sha256 = createHash('sha256').update(toolBytes).digest('hex')
-  const workDirectory = join(directory, 'cdb-capabilities-work')
+  const workDirectory = join(directory, initialization ? 'cdb-initialization-work' : 'cdb-capabilities-work')
   await mkdir(workDirectory)
+  const symbolDirectory = join(workDirectory, 'symbols')
+  if (initialization) await mkdir(symbolDirectory)
   const env = {}
   for (const name of ['SystemRoot', 'WINDIR', 'ComSpec', 'PATHEXT', 'PATH', 'TEMP', 'TMP', 'USERPROFILE', 'LOCALAPPDATA', 'APPDATA']) {
     if (process.env[name] !== undefined) env[name] = process.env[name]
   }
-  // Public SDK usage only: no PID, process name, attach option, -c, or dump.
-  // The empty cwd and scrubbed environment also prevent inherited debugger init.
-  const child = spawn(debuggerPath, ['-?'], {
-    cwd: workDirectory, env, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'],
+  // No arbitrary argv: either public usage or noninvasive initialization of
+  // this test's credential-free Node child, with only a fixed marker and detach.
+  // Never request stack frames, registers, memory, dumps, or product inspection.
+  const args = initialization ? [
+    '-pvr', '-pd', '-noshell', '-nosqm', '-sins', '-ses', '-netsym:no',
+    '-y', symbolDirectory, '-p', String(mode.identity.electronPid),
+    '-c', '.echo OPENSQUILLA_NATIVE_INIT_READY;qd',
+  ] : ['-?']
+  const child = spawn(debuggerPath, args, {
+    cwd: workDirectory, env, windowsHide: true, stdio: [initialization ? 'pipe' : 'ignore', 'pipe', 'pipe'],
   })
   const stdout = [], stderr = []
   let stdoutBytes = 0, stderrBytes = 0, capturedBytes = 0, nulByteCount = 0
@@ -106,22 +131,23 @@ async function captureCdbCapabilities(directory) {
     if (isStdout) stdoutBytes += chunk.length
     else stderrBytes += chunk.length
     for (const byte of chunk) nulByteCount += Number(byte === 0)
-    const remaining = Math.max(0, 64 * 1024 - capturedBytes)
+    const remaining = Math.max(0, maxBytes - capturedBytes)
     if (remaining) {
       const kept = chunk.subarray(0, remaining)
       chunks.push(kept)
       capturedBytes += kept.length
     }
-    if (stdoutBytes + stderrBytes > 64 * 1024) { outputLimited = true; killOwnedHelp() }
+    if (stdoutBytes + stderrBytes > maxBytes) { outputLimited = true; killOwnedHelp() }
   }
   child.stdout.on('data', chunk => consume(stdout, chunk, true))
   child.stderr.on('data', chunk => consume(stderr, chunk, false))
   try {
-    await within(closed, 3_000, 'SDK CDB usage command timed out')
+    await within(closed, 3_000, 'SDK CDB selftest command timed out')
   } catch { timedOut = true }
   finally {
     if (!closeObserved) killOwnedHelp()
-    await within(closed, 2_000, 'SDK CDB usage cleanup timed out').catch(() => {})
+    await within(closed, 2_000, 'SDK CDB selftest cleanup timed out').catch(() => {})
+    child.stdin?.destroy()
     child.stdout.destroy()
     child.stderr.destroy()
     child.unref()
@@ -130,15 +156,23 @@ async function captureCdbCapabilities(directory) {
   const out = decodePublicDebuggerHelp(stdoutBuffer), err = decodePublicDebuggerHelp(stderrBuffer)
   const helpText = out.text + (out.text && err.text ? '\n' : '') + err.text
   const version = helpText.match(/\bVersion\s+(\d+(?:\.\d+){3})\b/i)?.[1] ?? null
-  const capabilities = { control: 'native-cdb-capabilities',
+  const initializationReady = helpText.split(/\r?\n/).some(line => line.trim() === 'OPENSQUILLA_NATIVE_INIT_READY')
+  const capabilities = { control,
     status: !closeObserved ? 'containment-failed' : spawnFailed ? 'spawn-error'
-      : outputLimited ? 'output-limit' : timedOut ? 'timeout' : 'complete',
+      : outputLimited ? 'output-limit' : timedOut ? 'timeout'
+        : initialization && (child.exitCode !== 0 || child.signalCode !== null) ? 'exit-error'
+          : initialization && !initializationReady ? 'marker-missing' : 'complete',
     version, sha256, exitCode: child.exitCode, signal: child.signalCode, closeObserved,
     stdoutBytes, stderrBytes, capturedBytes, nulByteCount,
     stdoutFirst2Hex: stdoutBuffer.subarray(0, 2).toString('hex'), stderrFirst2Hex: stderrBuffer.subarray(0, 2).toString('hex'),
-    stdoutEncoding: out.encoding, stderrEncoding: err.encoding, helpText }
+    stdoutEncoding: out.encoding, stderrEncoding: err.encoding,
+    ...(initialization ? {
+      ownedIdentity: { electronPid: mode.identity.electronPid, windowsStartTimeTicks: mode.identity.windowsStartTimeTicks },
+      initializationReady,
+      stdoutText: out.text, stderrText: err.text,
+    } : { helpText }) }
   console.log(JSON.stringify(capabilities))
-  assert.equal(closeObserved, true, 'Owned SDK usage child must close within its cleanup deadline')
+  assert.equal(closeObserved, true, 'Owned SDK selftest child must close within its cleanup deadline')
   return capabilities
 }
 
@@ -158,6 +192,10 @@ if (process.platform !== 'win32') {
   const directory = await mkdtemp(join(tmpdir(), 'opensquilla-native-stacks-test-'))
   const helperPath = join(directory, 'helper.ps1')
   const descendantPath = join(directory, 'descendant.json')
+  const targetEnv = {}
+  for (const name of ['SystemRoot', 'WINDIR', 'ComSpec', 'PATHEXT', 'PATH', 'TEMP', 'TMP', 'USERPROFILE', 'LOCALAPPDATA', 'APPDATA']) {
+    if (process.env[name] !== undefined) targetEnv[name] = process.env[name]
+  }
   const target = spawn(process.execPath, ['-e', `
     process.on('message', message => {
       if (message === 'quit') process.exit(0);
@@ -165,7 +203,7 @@ if (process.platform !== 'win32') {
     });
     setInterval(() => {}, 1000);
     process.send('ready');
-  `], { windowsHide: true, stdio: ['ignore', 'ignore', 'ignore', 'ipc'] })
+  `], { env: targetEnv, windowsHide: true, stdio: ['ignore', 'ignore', 'ignore', 'ipc'] })
   let descendantIdentity
   let checks = 0
   async function targetResponsive() {
@@ -304,6 +342,11 @@ Start-Sleep -Seconds 60
     // is mandatory. Only genuine missing-tool status skips the native positive.
     // Capability discovery runs first, with only -? and no target parameters.
     const capabilities = await captureCdbCapabilities(directory)
+    const initialization = await captureCdbCapabilities(directory, { kind: 'initialization', child: target, identity })
+    // Initialization failure is diagnostic evidence, never a substitute for
+    // the unchanged real native-capture assertions that follow.
+    await targetResponsive()
+    if (initialization.sha256 && capabilities.sha256) assert.equal(initialization.sha256, capabilities.sha256)
     const native = await captureWindowsNativeStacks(identity)
     // These records have already passed the collector's metadata whitelist.
     // Preserve tool/version/phase/exit evidence even when the control fails.
@@ -313,6 +356,7 @@ Start-Sleep -Seconds 60
       assert.equal(nativeTool.sha256, capabilities.sha256, 'Capability help and capture must use the same SDK CDB bytes')
       if (capabilities.version) assert.equal(nativeTool.version, capabilities.version)
     }
+    if (nativeTool && initialization.sha256) assert.equal(nativeTool.sha256, initialization.sha256)
     if (native.status === 'unavailable') {
       assert.equal(native.records.some(record => record.kind === 'frame'), false)
       console.log('SKIP native CDB positive: Windows SDK CDB is unavailable')
