@@ -111,24 +111,44 @@ def _deterministic_gate(
     skills: list[SkillSpec],
     available_tools: set[str],
     elig_ctx: EligibilityContext | None = None,
+    drop_reasons: dict[str, str] | None = None,
 ) -> list[SkillSpec]:
-    """Pure-Python gate: eligibility, requires_tools, fallback, visibility."""
+    """Pure-Python gate: eligibility, requires_tools, fallback, visibility.
+
+    When ``drop_reasons`` is provided, each dropped skill's stable reason
+    code is recorded there (skill ID -> reason code) so the step output can
+    explain *why* a skill was dropped, not only *that* it survived.
+    """
     ctx_elig = elig_ctx or _elig_ctx
     gated: list[SkillSpec] = []
+
+    def _drop(skill: SkillSpec, reason: str) -> None:
+        if drop_reasons is not None:
+            drop_reasons[_skill_id(skill)] = reason
+
     with _elig_ctx_lock:
         for s in skills:
             if s.disable_model_invocation:
+                _drop(s, "disable_model_invocation")
                 continue
             if not check_eligibility(s, ctx_elig):
+                _drop(s, "eligibility_failed")
                 continue
             if s.requires_tools and not all(t in available_tools for t in s.requires_tools):
+                _drop(s, "missing_required_tools")
                 continue
             if s.fallback_for_toolsets and any(
                 t in available_tools for t in s.fallback_for_toolsets
             ):
+                _drop(s, "superseded_by_toolset")
                 continue
             gated.append(s)
     return gated
+
+
+def _skill_id(skill: SkillSpec) -> str:
+    """Stable skill identifier used across filter metadata and logs."""
+    return getattr(skill, "id", None) or getattr(skill, "name", None) or ""
 
 
 async def filter_skills(ctx: TurnContext) -> TurnContext:
@@ -145,6 +165,7 @@ async def filter_skills(ctx: TurnContext) -> TurnContext:
     tools_cfg = getattr(ctx.config, "tools", None) if ctx.config else None
     if getattr(tools_cfg, "profile", None) == "memory_only":
         ctx.metadata["filtered_skill_ids"] = []
+        ctx.metadata["filtered_skill_reasons"] = {}
         ctx.metadata["skill_count"] = 0
         ctx.metadata["skills_prompt_chars"] = 0
         log.debug("skills_filter.skipped", reason="memory_only")
@@ -174,12 +195,26 @@ async def filter_skills(ctx: TurnContext) -> TurnContext:
     # ── deterministic gate (no LLM, pure Python) ──
     available_tools = {t.name for t in ctx.tool_defs} if ctx.tool_defs else set()
     skills_cfg_for_gate = getattr(ctx.config, "skills", None) if ctx.config else None
-    gated = _deterministic_gate(all_skills, available_tools, _eligibility_ctx(skills_cfg_for_gate))
+    gate_drop_reasons: dict[str, str] = {}
+    gated = _deterministic_gate(
+        all_skills,
+        available_tools,
+        _eligibility_ctx(skills_cfg_for_gate),
+        drop_reasons=gate_drop_reasons,
+    )
     # Hide meta-skills from the model whenever auto-trigger is off (manual-only
     # mode) or the subsystem is fully disabled. They remain in the loader so the
     # /meta command can still enumerate and run them.
+    meta_drop_reasons: dict[str, str] = {}
     if not (meta_skill_enabled and meta_auto_trigger):
+        meta_hidden_ids = {
+            _skill_id(s)
+            for s in gated
+            if getattr(s, "kind", "skill") == "meta" and _skill_id(s)
+        }
         gated = [s for s in gated if getattr(s, "kind", "skill") != "meta"]
+        for hidden_id in meta_hidden_ids:
+            meta_drop_reasons[hidden_id] = "meta_hidden_auto_trigger_off"
         for key in (
             "meta_match",
             "meta_match_trigger",
@@ -258,19 +293,47 @@ async def filter_skills(ctx: TurnContext) -> TurnContext:
     else:
         filtered = filterable
 
+    # Record why each filterable skill was dropped by retrieval. With the
+    # filter disabled nothing is dropped; a retriever that returns fewer
+    # than top_k non-empty results with candidates available indicates a
+    # full retrieval failure (see HybridRetriever.retrieve's fail paths),
+    # otherwise anything not selected is recorded as not_in_top_k.
+    retrieval_drop_reasons: dict[str, str] = {}
+    if filter_enabled and filtered != filterable:
+        if not filtered and filterable:
+            failed_reason = "retrieval_failed"
+            for s in filterable:
+                sid = _skill_id(s)
+                if sid:
+                    retrieval_drop_reasons[sid] = failed_reason
+        else:
+            kept = {_skill_id(s) for s in filtered}
+            for s in filterable:
+                sid = _skill_id(s)
+                if sid and sid not in kept:
+                    retrieval_drop_reasons[sid] = "not_in_top_k"
+
     final = pinned + filtered
 
     # Publish the post-filter skill-ID list so the pipeline wrapper can
     # surface it in the decision log's PipelineStepRecord. Non-mutating
     # additive read for callers that don't consume the metadata.
+    # ``filtered_skill_reasons`` complements the survivor list with a stable
+    # reason code per dropped skill (gate / meta-visibility / retrieval),
+    # addressing issue #54: "filtered_skill_ids records which skills
+    # survived but not why any were dropped".
     try:
         ctx.metadata["filtered_skill_ids"] = [
-            getattr(s, "id", None) or getattr(s, "name", None)
-            for s in filtered
-            if getattr(s, "id", None) or getattr(s, "name", None)
+            _skill_id(s) for s in filtered if _skill_id(s)
         ]
+        ctx.metadata["filtered_skill_reasons"] = {
+            **gate_drop_reasons,
+            **meta_drop_reasons,
+            **retrieval_drop_reasons,
+        }
     except Exception:  # pragma: no cover — metadata is best-effort
         ctx.metadata["filtered_skill_ids"] = []
+        ctx.metadata["filtered_skill_reasons"] = {}
 
     from opensquilla.skills.injector import SkillInjector
 
@@ -310,11 +373,7 @@ async def filter_skills(ctx: TurnContext) -> TurnContext:
     # but cannot tell which skills were chosen vs missed — the diagnostic
     # signal needed to debug recall quality (e.g. "why did 'commit my
     # changes to git' not surface `git`?").
-    pinned_ids = [
-        getattr(s, "id", None) or getattr(s, "name", None)
-        for s in pinned
-        if getattr(s, "id", None) or getattr(s, "name", None)
-    ]
+    pinned_ids = [_skill_id(s) for s in pinned if _skill_id(s)]
     filtered_ids = ctx.metadata.get("filtered_skill_ids") or []
     log.debug(
         "skills_filter.applied",
@@ -335,6 +394,7 @@ async def filter_skills(ctx: TurnContext) -> TurnContext:
         ),
         pinned_skills=pinned_ids,
         filtered_skills=filtered_ids,
+        dropped_skills=dict(ctx.metadata.get("filtered_skill_reasons") or {}),
     )
 
     if skills_prompt and injection_mode == "user_context":

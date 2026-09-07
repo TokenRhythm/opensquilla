@@ -105,6 +105,10 @@ class PipelineStepRecord:
     applied: bool
     routed_tier: str | None = None
     filtered_skill_ids: list[str] | None = None
+    # skill ID -> stable drop reason code (gate / meta-visibility / retrieval).
+    # Additive companion to ``filtered_skill_ids``; readers of older rows see
+    # None via _filter_payload.
+    filtered_skill_reasons: dict[str, str] | None = None
     routing_source: RoutingSource = "none"
     confidence: float | None = None
     fallback_reason: str | None = None

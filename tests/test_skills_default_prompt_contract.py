@@ -487,6 +487,7 @@ async def test_lexical_skill_filter_is_opt_in_and_dependency_free(
     assert "<name>weather-local</name>" in prompt
     assert "<name>github-local</name>" not in prompt
     assert ctx.metadata["filtered_skill_ids"] == ["weather-local"]
+    assert ctx.metadata["filtered_skill_reasons"] == {"github-local": "not_in_top_k"}
     assert ctx.metadata["skill_count"] == 1
 
 
