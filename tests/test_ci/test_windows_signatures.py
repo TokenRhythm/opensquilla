@@ -1,16 +1,18 @@
 """Exercise the production verifier in PowerShell with mocked OS trust boundaries.
 
-No certificates or signing credentials are used. The fixture exposes placeholder
-SignTool applications and functions at the same paths, so SDK/PATH discovery and
-target selection run unchanged while tool results and Authenticode data are controlled.
+No certificates or signing credentials are used. Windows uses functions at
+placeholder application paths; POSIX uses executable stubs. SDK/PATH discovery
+and target selection run unchanged while tool and Authenticode results are controlled.
 """
 
 from __future__ import annotations
 
 import json
 import os
+import shlex
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -21,6 +23,19 @@ POLICY = ROOT / ".github/signing/windows-signing-policy.json"
 POWERSHELLS = list(
     dict.fromkeys(path for name in ("pwsh", "powershell") if (path := shutil.which(name)))
 )
+
+POSIX_TOOL = """
+import json
+import os
+import sys
+from pathlib import Path
+
+scenario = json.loads(Path(os.environ["SCENARIO_PATH"]).read_text())
+record = {"kind": "tool", "path": sys.argv[1], "arguments": sys.argv[2:]}
+with Path(os.environ["CALLS_PATH"]).open("a") as output:
+    output.write(json.dumps(record) + "\\n")
+sys.exit(scenario["exitCode"])
+"""
 
 WRAPPER = r"""
 $ErrorActionPreference = 'Stop'
@@ -117,9 +132,18 @@ class VerifierFixture:
 
     def tool(self, path: Path) -> Path:
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.touch()
+        if os.name == "nt":
+            path.touch()
+            self.scenario["tools"].append(str(path))
+        else:
+            # POSIX PowerShell resolves absolute executable paths before
+            # functions. Supply a real executable instead of an empty .exe.
+            path.write_text(
+                f"#!/bin/sh\nexec {shlex.quote(sys.executable)} "
+                f'-c {shlex.quote(POSIX_TOOL)} "$0" "$@"\n',
+                encoding="utf-8",
+            )
         path.chmod(0o755)
-        self.scenario["tools"].append(str(path))
         return path
 
     def sdk_tool(self, version: str, *, native: bool = False, arch: str = "x64") -> Path:
