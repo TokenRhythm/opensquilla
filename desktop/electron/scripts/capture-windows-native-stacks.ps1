@@ -271,8 +271,11 @@ function Invoke-NativeCapture {
             $value = [Environment]::GetEnvironmentVariable($name)
             if ($null -ne $value) { $startInfo.Environment[$name] = $value }
         }
+        # Noninvasive -pvr does not create a debug attachment. Do not add -pd:
+        # the runner SDK rejects that separate detach-on-exit mechanism before
+        # executing commands. Owned-target capture/forced-close controls gate use.
         # SDK CDB 10.0.26100.8249 accepts -netsyms:no; its help misspells it.
-        foreach ($argument in @('-pvr', '-pd', '-noshell', '-nosqm', '-sins', '-ses', '-netsyms:no',
+        foreach ($argument in @('-pvr', '-noshell', '-nosqm', '-sins', '-ses', '-netsyms:no',
             '-y', $symbolDirectory, '-p', $TargetPid.ToString(), '-c', ($commands -join ';'))) {
             $startInfo.ArgumentList.Add($argument)
         }

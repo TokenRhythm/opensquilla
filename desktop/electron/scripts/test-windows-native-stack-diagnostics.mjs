@@ -137,7 +137,7 @@ async function captureCdbCapabilities(directory, mode = { kind: 'capabilities' }
   // this test's credential-free Node child, with only a fixed marker and detach.
   // Never request stack frames, registers, memory, dumps, or product inspection.
   const args = initialization ? [
-    '-pvr', '-pd', '-noshell', '-nosqm', '-sins', '-ses', '-netsyms:no',
+    '-pvr', '-noshell', '-nosqm', '-sins', '-ses', '-netsyms:no',
     '-y', symbolDirectory, '-p', String(mode.identity.electronPid),
     '-c', '.echo OPENSQUILLA_NATIVE_INIT_READY;qd',
   ] : switchCapability ? cdbSwitchCapabilityVariants[mode.variant] : ['-?']
@@ -420,7 +420,7 @@ Start-Sleep -Seconds 60
         if (process.env[name] !== undefined) debuggerEnv[name] = process.env[name]
       }
       const debuggerChild = spawn(debuggerPath, [
-        '-pvr', '-pd', '-noshell', '-nosqm', '-sins', '-ses', '-netsyms:no',
+        '-pvr', '-noshell', '-nosqm', '-sins', '-ses', '-netsyms:no',
         '-y', symbolDirectory, '-p', String(target.pid), '-c', '.echo OPENSQUILLA_NATIVE_TEST_READY',
       ], { cwd: workDirectory, env: debuggerEnv, windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] })
       let rawBytes = 0
