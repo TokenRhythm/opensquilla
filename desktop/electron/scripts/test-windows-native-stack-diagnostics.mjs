@@ -193,6 +193,9 @@ Start-Sleep -Seconds 60
     // When the SDK exists, exercising CDB on this IPC-ready owned Node process
     // is mandatory. Only genuine missing-tool status skips the native positive.
     const native = await captureWindowsNativeStacks(identity)
+    // These records have already passed the collector's metadata whitelist.
+    // Preserve tool/version/phase/exit evidence even when the control fails.
+    console.log(JSON.stringify({ control: 'native-cdb-capture', native }))
     if (native.status === 'unavailable') {
       assert.equal(native.records.some(record => record.kind === 'frame'), false)
       console.log('SKIP native CDB positive: Windows SDK CDB is unavailable')
