@@ -41,6 +41,116 @@ function writeRecord(record) {
   return `[Console]::Out.WriteLine(${literal(JSON.stringify(record))})\n`
 }
 
+function decodePublicDebuggerHelp(bytes) {
+  let encoding = 'utf8'
+  let offset = 0
+  if (bytes[0] === 0xff && bytes[1] === 0xfe) { encoding = 'utf16le-bom'; offset = 2 }
+  else if (bytes[0] === 0xfe && bytes[1] === 0xff) { encoding = 'utf16be-bom'; offset = 2 }
+  else if (bytes[0] === 0xef && bytes[1] === 0xbb && bytes[2] === 0xbf) { encoding = 'utf8-bom'; offset = 3 }
+  else if (bytes.length >= 32) {
+    const pairs = Math.floor(bytes.length / 2)
+    let evenNuls = 0, oddNuls = 0, evenAscii = 0, oddAscii = 0
+    const isHelpAscii = byte => byte === 9 || byte === 10 || byte === 13 || (byte >= 32 && byte <= 126)
+    for (let index = 0; index < pairs * 2; index += 2) {
+      evenNuls += Number(bytes[index] === 0)
+      oddNuls += Number(bytes[index + 1] === 0)
+      evenAscii += Number(isHelpAscii(bytes[index]))
+      oddAscii += Number(isHelpAscii(bytes[index + 1]))
+    }
+    if (oddNuls / pairs >= 0.8 && evenNuls / pairs <= 0.05 && evenAscii / pairs >= 0.7) encoding = 'utf16le-strong-nul-pattern'
+    else if (evenNuls / pairs >= 0.8 && oddNuls / pairs <= 0.05 && oddAscii / pairs >= 0.7) encoding = 'utf16be-strong-nul-pattern'
+  }
+  const payload = bytes.subarray(offset)
+  const text = encoding.startsWith('utf16be')
+    ? Buffer.from(payload.subarray(0, payload.length - payload.length % 2)).swap16().toString('utf16le')
+    : payload.toString(encoding.startsWith('utf16le') ? 'utf16le' : 'utf8')
+  return { encoding, text }
+}
+
+async function captureCdbCapabilities(directory) {
+  const sdkRoot = process.env['ProgramFiles(x86)']
+  const debuggerPath = sdkRoot && join(sdkRoot, 'Windows Kits', '10', 'Debuggers', 'x64', 'cdb.exe')
+  let toolBytes
+  try {
+    toolBytes = debuggerPath ? await readFile(debuggerPath) : null
+  } catch (error) {
+    if (error.code !== 'ENOENT') throw new Error('Cannot read the SDK CDB capability tool')
+  }
+  if (!toolBytes) {
+    console.log('SKIP native CDB capabilities: Windows SDK CDB is unavailable')
+    return { status: 'unavailable' }
+  }
+  const sha256 = createHash('sha256').update(toolBytes).digest('hex')
+  const workDirectory = join(directory, 'cdb-capabilities-work')
+  await mkdir(workDirectory)
+  const env = {}
+  for (const name of ['SystemRoot', 'WINDIR', 'ComSpec', 'PATHEXT', 'PATH', 'TEMP', 'TMP', 'USERPROFILE', 'LOCALAPPDATA', 'APPDATA']) {
+    if (process.env[name] !== undefined) env[name] = process.env[name]
+  }
+  // Public SDK usage only: no PID, process name, attach option, -c, or dump.
+  // The empty cwd and scrubbed environment also prevent inherited debugger init.
+  const child = spawn(debuggerPath, ['-?'], {
+    cwd: workDirectory, env, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'],
+  })
+  const stdout = [], stderr = []
+  let stdoutBytes = 0, stderrBytes = 0, capturedBytes = 0, nulByteCount = 0
+  let closeObserved = false, spawnFailed = false, outputLimited = false, timedOut = false
+  const closed = new Promise(resolve => child.once('close', (...result) => { closeObserved = true; resolve(result) }))
+  child.on('error', () => { spawnFailed = true })
+  const killOwnedHelp = () => {
+    if (!closeObserved && child.exitCode === null && child.signalCode === null) {
+      try { child.kill('SIGKILL') } catch { /* final close observation records failure */ }
+    }
+  }
+  const consume = (chunks, chunk, isStdout) => {
+    if (isStdout) stdoutBytes += chunk.length
+    else stderrBytes += chunk.length
+    for (const byte of chunk) nulByteCount += Number(byte === 0)
+    const remaining = Math.max(0, 64 * 1024 - capturedBytes)
+    if (remaining) {
+      const kept = chunk.subarray(0, remaining)
+      chunks.push(kept)
+      capturedBytes += kept.length
+    }
+    if (stdoutBytes + stderrBytes > 64 * 1024) { outputLimited = true; killOwnedHelp() }
+  }
+  child.stdout.on('data', chunk => consume(stdout, chunk, true))
+  child.stderr.on('data', chunk => consume(stderr, chunk, false))
+  try {
+    await within(closed, 3_000, 'SDK CDB usage command timed out')
+  } catch { timedOut = true }
+  finally {
+    if (!closeObserved) killOwnedHelp()
+    await within(closed, 2_000, 'SDK CDB usage cleanup timed out').catch(() => {})
+    child.stdout.destroy()
+    child.stderr.destroy()
+    child.unref()
+  }
+  const stdoutBuffer = Buffer.concat(stdout), stderrBuffer = Buffer.concat(stderr)
+  const out = decodePublicDebuggerHelp(stdoutBuffer), err = decodePublicDebuggerHelp(stderrBuffer)
+  const helpText = out.text + (out.text && err.text ? '\n' : '') + err.text
+  const version = helpText.match(/\bVersion\s+(\d+(?:\.\d+){3})\b/i)?.[1] ?? null
+  const capabilities = { control: 'native-cdb-capabilities',
+    status: !closeObserved ? 'containment-failed' : spawnFailed ? 'spawn-error'
+      : outputLimited ? 'output-limit' : timedOut ? 'timeout' : 'complete',
+    version, sha256, exitCode: child.exitCode, signal: child.signalCode, closeObserved,
+    stdoutBytes, stderrBytes, capturedBytes, nulByteCount,
+    stdoutFirst2Hex: stdoutBuffer.subarray(0, 2).toString('hex'), stderrFirst2Hex: stderrBuffer.subarray(0, 2).toString('hex'),
+    stdoutEncoding: out.encoding, stderrEncoding: err.encoding, helpText }
+  console.log(JSON.stringify(capabilities))
+  assert.equal(closeObserved, true, 'Owned SDK usage child must close within its cleanup deadline')
+  return capabilities
+}
+
+const syntheticUsage = 'Microsoft Windows Debugger Version 10.0.26100.1\r\nUsage: cdb -?\r\n'
+assert.deepEqual(decodePublicDebuggerHelp(Buffer.from(syntheticUsage)), { encoding: 'utf8', text: syntheticUsage })
+assert.deepEqual(decodePublicDebuggerHelp(Buffer.from(syntheticUsage, 'utf16le')),
+  { encoding: 'utf16le-strong-nul-pattern', text: syntheticUsage })
+assert.deepEqual(decodePublicDebuggerHelp(Buffer.concat([Buffer.from([0xff, 0xfe]), Buffer.from(syntheticUsage, 'utf16le')])),
+  { encoding: 'utf16le-bom', text: syntheticUsage })
+assert.deepEqual(decodePublicDebuggerHelp(Buffer.concat([Buffer.from([0xfe, 0xff]), Buffer.from(syntheticUsage, 'utf16le').swap16()])),
+  { encoding: 'utf16be-bom', text: syntheticUsage })
+
 if (process.platform !== 'win32') {
   assert.deepEqual(await captureWindowsNativeStacks({}), { status: 'unsupported-platform' })
   console.log('SKIP Windows native stack controls: unsupported platform')
@@ -192,10 +302,17 @@ Start-Sleep -Seconds 60
 
     // When the SDK exists, exercising CDB on this IPC-ready owned Node process
     // is mandatory. Only genuine missing-tool status skips the native positive.
+    // Capability discovery runs first, with only -? and no target parameters.
+    const capabilities = await captureCdbCapabilities(directory)
     const native = await captureWindowsNativeStacks(identity)
     // These records have already passed the collector's metadata whitelist.
     // Preserve tool/version/phase/exit evidence even when the control fails.
     console.log(JSON.stringify({ control: 'native-cdb-capture', native }))
+    const nativeTool = native.records.find(record => record.kind === 'tool')
+    if (nativeTool && capabilities.sha256) {
+      assert.equal(nativeTool.sha256, capabilities.sha256, 'Capability help and capture must use the same SDK CDB bytes')
+      if (capabilities.version) assert.equal(nativeTool.version, capabilities.version)
+    }
     if (native.status === 'unavailable') {
       assert.equal(native.records.some(record => record.kind === 'frame'), false)
       console.log('SKIP native CDB positive: Windows SDK CDB is unavailable')
