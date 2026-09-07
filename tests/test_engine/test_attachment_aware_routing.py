@@ -6,6 +6,7 @@ import asyncio
 import base64
 import io
 import zipfile
+from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
 
@@ -23,7 +24,11 @@ from opensquilla.engine.turn_runner.attachment_stage import (
     AttachmentStageInput,
     rebind_attachment_prompt,
 )
+from opensquilla.gateway.config import GatewayConfig, SquillaRouterConfig
 from opensquilla.gateway.input_normalization import normalize_incoming_text
+from opensquilla.provider import ChatConfig, EnsembleProvider, Message
+from opensquilla.provider.model_catalog import ModelCatalog
+from opensquilla.provider.selector import ProviderConfig
 from opensquilla.provider.types import ContentBlockText
 from opensquilla.token_estimation import (
     estimate_attachment_text_tokens,
@@ -76,6 +81,66 @@ class _RuntimeAttachmentBuilder:
             workspace_dir=workspace_dir,
             session_id=session_id,
         )
+
+
+class _PipelineProvider:
+    provider_name = "openrouter"
+
+    def chat(
+        self,
+        messages: list[Message],
+        tools: list[Any] | None = None,
+        config: ChatConfig | None = None,
+    ) -> AsyncIterator[Any]:
+        raise AssertionError("routing regression must not start provider chat")
+
+    async def list_models(self) -> list[Any]:
+        return []
+
+
+class _PipelineSelector:
+    def __init__(self) -> None:
+        self._config = ProviderConfig(
+            provider="openrouter",
+            model="small-fixed",
+            api_key="sk-synthetic",
+            base_url="https://example.invalid/v1",
+        )
+
+    @property
+    def current_config(self) -> ProviderConfig:
+        return self._config
+
+    @property
+    def active_provider_id(self) -> str:
+        return self._config.provider
+
+    def remaining_chain(self) -> list[ProviderConfig]:
+        return [self._config]
+
+    def override_model(self, model: str) -> None:
+        self._config = ProviderConfig(
+            provider=self._config.provider,
+            model=model,
+            api_key=self._config.api_key,
+            base_url=self._config.base_url,
+            proxy=self._config.proxy,
+            provider_routing=dict(self._config.provider_routing),
+        )
+
+    def resolve(self) -> _PipelineProvider:
+        return _PipelineProvider()
+
+
+class _C3Strategy:
+    async def classify(
+        self,
+        message: str,
+        valid_tiers: list[str],
+        routing_history: list[dict] | None = None,
+        **kwargs: object,
+    ) -> tuple[str, float, str, dict[str, str]]:
+        return "c3", 0.99, "synthetic", {"route_class": "R3"}
 
 
 def _inline_attachment(payload: bytes, mime: str, name: str) -> dict[str, str]:
@@ -220,6 +285,104 @@ async def test_stats_measure_exact_provider_visible_text_for_rendered_formats(
     assert output.stats.estimated_tokens == sum(
         estimate_attachment_text_tokens(block.text) for block in visible_blocks
     )
+
+
+@pytest.mark.parametrize("attachment_kind", ["txt", "pdf", "docx"])
+@pytest.mark.asyncio
+async def test_capacity_route_does_not_restore_an_unsafe_ensemble_fixed_model(
+    monkeypatch: pytest.MonkeyPatch,
+    attachment_kind: str,
+) -> None:
+    """The physical Ensemble fallback must not undo a proven attachment route."""
+
+    material = (
+        "[]{}!@#$%^&*()_+-=|;:,./?0123456789ABCDEF\n" * 4_200
+    )[:160_000]
+    if attachment_kind == "txt":
+        attachment = _inline_attachment(material.encode(), "text/plain", "sample.txt")
+    elif attachment_kind == "pdf":
+        attachment = _inline_attachment(
+            _pdf_bytes(material),
+            "application/pdf",
+            "sample.pdf",
+        )
+    else:
+        attachment = _inline_attachment(
+            _docx_bytes(material),
+            DOCX_MIME,
+            "sample.docx",
+        )
+    materialized, _builder = await _materialize(attachment)
+
+    catalog = ModelCatalog()
+    catalog.set_user_overrides(
+        {
+            "openrouter/small-fixed": {
+                "context_window": 64_000,
+                "max_output_tokens": 4_000,
+            },
+            "openrouter/large-tier": {
+                "context_window": 256_000,
+                "max_output_tokens": 4_000,
+            },
+        }
+    )
+    monkeypatch.setattr("opensquilla.provider.model_catalog._shared_catalog", catalog)
+    monkeypatch.setattr(
+        "opensquilla.engine.steps.squilla_router._get_strategy",
+        lambda _config: _C3Strategy(),
+    )
+    config = GatewayConfig(
+        llm={
+            "provider": "openrouter",
+            "model": "small-fixed",
+            "api_key": "sk-synthetic",
+            "base_url": "https://example.invalid/v1",
+            "max_tokens": 4_000,
+        },
+        squilla_router=SquillaRouterConfig(
+            enabled=True,
+            auto_thinking=False,
+            tiers={
+                "c3": {
+                    "provider": "openrouter",
+                    "model": "large-tier",
+                    "ensemble_enabled": True,
+                }
+            },
+            default_tier="c3",
+        ),
+        llm_ensemble={
+            "enabled": False,
+            "selection_mode": "static_openrouter_b5",
+        },
+    )
+    selector = _PipelineSelector()
+
+    turn, provider = await TurnRunner(
+        provider_selector=None,
+        config=config,
+        model_catalog=catalog,
+    )._run_pipeline(
+        "inspect attachment",
+        f"agent:main:ensemble-capacity-{attachment_kind}",
+        _PipelineProvider(),
+        selector,
+        [],
+        "system prompt",
+        [attachment],
+        attachment_materialization=materialized.stats,
+        history_capacity_estimate_complete=True,
+    )
+
+    assert 30_000 < materialized.stats.estimated_tokens < 50_000
+    assert turn.metadata["routed_model"] == "large-tier"
+    assert turn.metadata["ensemble_wrap_skipped_reason"] == (
+        "fixed_fallback_request_capacity"
+    )
+    assert turn.model == "large-tier"
+    assert selector.current_config.model == "large-tier"
+    assert not isinstance(provider, EnsembleProvider)
 
 
 @pytest.mark.asyncio
