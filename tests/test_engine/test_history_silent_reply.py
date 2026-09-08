@@ -237,6 +237,7 @@ async def test_exact_history_fails_closed_after_reset_without_mixing_replacement
             model_capabilities=None,
         ),
         set_history=MagicMock(),
+        set_request_image_context=MagicMock(),
     )
     try:
         with pytest.raises(StaleEpochError, match="context-state read"):
@@ -304,6 +305,7 @@ async def test_exact_history_discards_retired_owner_emergency_override_after_res
             model_capabilities=None,
         ),
         set_history=MagicMock(),
+        set_request_image_context=MagicMock(),
     )
 
     try:

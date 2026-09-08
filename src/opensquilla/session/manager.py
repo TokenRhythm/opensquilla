@@ -1921,7 +1921,7 @@ class SessionManager:
                                 session_id=parent.session_id,
                                 source_message_id=entry.message_id,
                             )
-                            if is_prefix_fork and entry.role == "user"
+                            if entry.role == "user"
                             else entry.content
                         ),
                         tool_calls=entry.tool_calls,

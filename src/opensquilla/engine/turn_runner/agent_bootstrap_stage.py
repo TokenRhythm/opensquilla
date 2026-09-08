@@ -561,6 +561,8 @@ def _route_max_history_turns(metadata: dict[str, Any]) -> int:
 
 
 def _preserve_historical_images(metadata: dict[str, Any]) -> bool:
+    if metadata.get("router_vision_followup_gate_source") == "explicit_opt_out":
+        return False
     image_route_reason = metadata.get("image_route_reason")
     return bool(
         image_route_reason == "gate_history"

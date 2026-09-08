@@ -213,6 +213,28 @@ async def test_gate_skips_when_current_turn_has_image() -> None:
     assert out.metadata.get("router_vision_followup_needs_image") is not True
 
 
+@pytest.mark.parametrize("gate_enabled", [False, True])
+async def test_existing_image_opt_out_beats_current_upload_and_explicit_id(
+    gate_enabled: bool,
+) -> None:
+    ctx = _ctx(
+        "Compare the previous image.",
+        {
+            "router_vision_followup_gate_source": "explicit_opt_out",
+            "router_vision_followup_needs_image": True,
+            "image_intent_attachment_ids": ["att_previous"],
+        },
+    )
+    ctx.config.squilla_router.vision_followup_gate_enabled = gate_enabled
+    ctx.attachments.append({"mime": "image/png", "data": "abc"})
+
+    out = await apply_vision_followup_gate(ctx)
+
+    assert out.metadata["router_vision_followup_gate_source"] == "explicit_opt_out"
+    assert out.metadata["router_vision_followup_needs_image"] is False
+    assert len(out.attachments) == 1
+
+
 @pytest.mark.asyncio
 async def test_prompt_annotation_skips_history_image_gate_and_keeps_artifact_floor(
     monkeypatch: pytest.MonkeyPatch,

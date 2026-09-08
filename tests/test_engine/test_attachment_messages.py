@@ -27,11 +27,37 @@ from opensquilla.provider.types import (
     ContentBlockImage,
     ContentBlockText,
 )
-from opensquilla.session.attachment_manifest import legacy_attachment_id
+from opensquilla.session.attachment_manifest import (
+    legacy_attachment_id,
+    preserve_attachment_occurrence_ids,
+)
 
 
 def _b64(payload: bytes) -> str:
     return base64.b64encode(payload).decode("ascii")
+
+
+@pytest.mark.parametrize(
+    ("attachments", "expected"),
+    [
+        ([{"mime": "image/png", "attachment_id": "att_id_only"}], None),
+        ([{"mime": "image/png", "data": "c3ludGhldGlj"}], True),
+        ([{"mime": "image/png", "sha256_ref": "a" * 64}], True),
+        ([{"mime": "image/png", "missing_reason": "attachment persistence disabled"}], False),
+        ([
+            {"mime": "image/png", "sha256_ref": "a" * 64},
+            {"mime": "image/png", "missing_reason": "attachment persistence disabled"},
+        ], None),
+        ([{"mime": "application/pdf", "sha256_ref": "a" * 64}], None),
+    ],
+)
+def test_current_image_retention_requires_saved_material_evidence(
+    attachments: list[dict[str, str]],
+    expected: bool | None,
+) -> None:
+    envelope = json.dumps({"text": "inspect", "attachments": attachments})
+
+    assert TurnRunner._image_retention_from_envelope(envelope) is expected
 
 
 def _sample_pdf_bytes(text: str = "Hello PDF Text") -> bytes:
@@ -239,9 +265,14 @@ def test_forked_legacy_historical_image_keeps_allowed_attachment_id() -> None:
         index=0,
         sha256=hashlib.sha256(payload).hexdigest(),
     )
+    forked_content = preserve_attachment_occurrence_ids(
+        content,
+        session_id="parent-session",
+        source_message_id=message_id,
+    )
 
     out = TurnRunner._maybe_unpack_attachments(
-        content,
+        forked_content,
         preserve_image_attachments=True,
         allowed_image_attachment_ids=frozenset({parent_attachment_id}),
         session_id="child-session",

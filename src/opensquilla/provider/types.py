@@ -680,6 +680,8 @@ class ContentBlockImage(BaseModel):
     # Request-local provenance only.  It binds marker/retry decisions to the
     # canonical occurrence without ever entering a provider wire payload.
     attachment_id: str | None = Field(default=None, exclude=True, repr=False)
+    # In-memory image bytes alone do not prove that a later turn can replay them.
+    durable_retained: bool | None = Field(default=None, exclude=True, repr=False)
 
 
 class ContentBlockDocument(BaseModel):

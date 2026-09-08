@@ -1236,6 +1236,79 @@ async def test_resource_inventory_preserves_inline_and_staged_attachment_occurre
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("staged", [False, True])
+async def test_legacy_attachment_upgrade_preserves_cached_refs_and_document_bindings(
+    resource_env,
+    monkeypatch: pytest.MonkeyPatch,
+    staged: bool,
+) -> None:
+    env = resource_env
+    payload = b"<!doctype html><h1>legacy attachment</h1>"
+    envelope, _writes = build_transcript_attachment_envelope(
+        text="legacy upload",
+        attachments=[{
+            "type": "text/html",
+            "name": "legacy.html",
+            "data": base64.b64encode(payload).decode("ascii"),
+            "_was_staged": staged,
+        }],
+        session_id=env.session.session_id,
+        media_root=Path(env.config.attachments.media_root),
+        persist_enabled=True,
+    )
+    raw = json.loads(envelope)
+    raw["attachments"][0].pop("attachment_id")
+    await env.storage.append_transcript_entry(
+        TranscriptEntry(
+            session_id=env.session.session_id,
+            session_key=SESSION_KEY,
+            message_id="legacy-upgrade-message",
+            role="user",
+            content=json.dumps(raw),
+        )
+    )
+
+    def pre_upgrade_id(*, session_id: str, message_id: str, index: int, sha256: str) -> str:
+        digest = hashlib.sha256(
+            f"{session_id}\0{message_id}\0{index}\0{sha256}".encode()
+        ).digest()[:18]
+        return "att_legacy_" + base64.urlsafe_b64encode(digest).decode("ascii").rstrip("=")
+
+    cached_id = pre_upgrade_id(
+        session_id=env.session.session_id,
+        message_id="legacy-upgrade-message",
+        index=0,
+        sha256=hashlib.sha256(payload).hexdigest(),
+    )
+    with monkeypatch.context() as previous_version:
+        previous_version.setattr(resource_rpc, "legacy_attachment_id", pre_upgrade_id)
+        imported = await _import_attachment(env, cached_id, key="legacy-before-upgrade")
+
+    fetched = await _dispatch(
+        env,
+        "workbench.resources.get",
+        {
+            "sessionKey": SESSION_KEY,
+            "resource": {"type": "attachment", "id": cached_id},
+        },
+    )
+    assert fetched.error is None, fetched.error
+    assert fetched.payload["resource"]["resource"]["id"] == cached_id
+    reopened = await _dispatch(
+        env,
+        "workbench.resources.open",
+        {
+            "sessionKey": SESSION_KEY,
+            "resource": {"type": "attachment", "id": cached_id},
+        },
+    )
+    assert reopened.error is None, reopened.error
+    assert reopened.payload["resolution"] == {"status": "current"}
+    assert reopened.payload["document"]["id"] == imported["document"]["id"]
+    assert reopened.payload["binding"]["source"]["attachmentId"] == cached_id
+
+
+@pytest.mark.asyncio
 async def test_historical_attachment_ids_are_stable_per_message_occurrence(
     resource_env,
 ) -> None:

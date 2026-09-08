@@ -40,7 +40,7 @@ _IMAGE_OPTOUT_RE = re.compile(
     re.I,
 )
 _PREVIOUS_IMAGE_REF_RE = re.compile(
-    r"\b(?:previous|last|earlier|above|that|the)\b"
+    r"\b(?:previous|last|earlier|above|that)\b"
     r".{0,50}\b(?:image|picture|photo|screenshot|screen|diagram)\b"
     r"|"
     r"\b(?:image|picture|photo|screenshot|screen|diagram)\b"
@@ -354,11 +354,11 @@ async def _run_gate_or_fallback(ctx: TurnContext) -> TurnContext:
 
 
 async def apply_vision_followup_gate(ctx: TurnContext) -> TurnContext:
+    if ctx.metadata.get("router_vision_followup_gate_source") == "explicit_opt_out":
+        _apply_explicit_opt_out(ctx)
+        return ctx
     if not _gate_enabled(ctx):
         ctx.metadata["router_vision_followup_gate_decision"] = "disabled"
-        return ctx
-    if _attachments_include_image(ctx.attachments):
-        ctx.metadata["router_vision_followup_gate_decision"] = "current_image"
         return ctx
     if ctx.metadata.get("image_intent_attachment_ids"):
         if _current_text_explicitly_opts_out_image(ctx):
@@ -371,6 +371,17 @@ async def apply_vision_followup_gate(ctx: TurnContext) -> TurnContext:
             ctx.metadata["router_vision_followup_gate_reason"] = (
                 "current turn references a canonical attachment ID"
             )
+        return ctx
+    if _attachments_include_image(ctx.attachments):
+        if _current_text_explicitly_opts_out_image(ctx):
+            _apply_explicit_opt_out(ctx)
+        elif (
+            ctx.metadata.get("router_history_has_recent_image") is True
+            and _current_text_explicitly_requests_previous_image(ctx)
+        ):
+            _apply_explicit_previous_image_request(ctx)
+        else:
+            ctx.metadata["router_vision_followup_gate_decision"] = "current_image"
         return ctx
     if ctx.metadata.get("router_history_has_recent_image") is not True:
         ctx.metadata["router_vision_followup_gate_decision"] = "not_applicable"

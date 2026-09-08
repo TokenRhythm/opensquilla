@@ -250,6 +250,163 @@ async def test_fallback_realigns_only_when_provider_call_starts() -> None:
     assert metadata["savings_routed_price_per_m"] == 0.0
 
 
+@pytest.mark.parametrize(
+    ("through_agent", "primary_support"),
+    [
+        (False, "unsupported"),
+        (True, "unsupported"),
+        (True, "unknown"),
+        (True, "tool_then_unsupported"),
+    ],
+)
+@pytest.mark.parametrize("fallback_support", ["supported", "unknown", "unsupported"])
+async def test_each_selector_leg_projects_canonical_images(
+    through_agent: bool,
+    primary_support: str,
+    fallback_support: str,
+    fallback_rejects_images: bool = False,
+) -> None:
+    from opensquilla.provider.protocol import count_provider_image_blocks
+
+    class _Provider:
+        provider_name = "openai"
+
+        def __init__(self, *, primary: bool) -> None:
+            self.primary = primary
+            self.calls: list[list[Message]] = []
+
+        async def chat(self, messages, tools=None, config=None):
+            del tools, config
+            self.calls.append(messages)
+            if self.primary:
+                if primary_support == "tool_then_unsupported" and len(self.calls) == 1:
+                    yield ToolUseStartEvent(tool_use_id="observe-1", tool_name="observe")
+                    yield ToolUseEndEvent(
+                        tool_use_id="observe-1", tool_name="observe", arguments={}
+                    )
+                    yield DoneEvent(stop_reason="tool_use")
+                elif primary_support == "unknown" and count_provider_image_blocks(messages):
+                    yield ErrorEvent(
+                        code="image_input_unsupported",
+                        message="This deployment does not support image input.",
+                    )
+                else:
+                    yield ErrorEvent(code="503", message="Provider unavailable")
+                return
+            if fallback_rejects_images and count_provider_image_blocks(messages):
+                yield ErrorEvent(
+                    code="image_input_unsupported",
+                    message="This fallback deployment does not support image input.",
+                )
+                return
+            yield TextDeltaEvent(text="configured fallback reply")
+            yield DoneEvent(model="configured-fallback")
+
+    primary_config = SimpleNamespace(provider="openai", model="configured-primary")
+    fallback_config = SimpleNamespace(provider="openai", model="configured-fallback")
+    primary = _Provider(primary=True)
+    fallback = _Provider(primary=False)
+
+    class _Selector:
+        current_config = primary_config
+
+        def next_fallback_after_failure(self, _error):
+            self.current_config = fallback_config
+            return fallback
+
+    metadata: dict[str, Any] = {}
+    wrapper = _SelectorFallbackProvider(primary, _Selector(), turn_metadata=metadata)
+    wrapper.configure_fallback_deployment_vision_support(
+        [(fallback_config, fallback_support)]
+    )
+    wrapper.configure_fallback_deployment_limits(
+        [
+            (
+                fallback_config,
+                0,
+                0,
+                ModelCapabilities(supports_vision=fallback_support == "supported"),
+            )
+        ]
+    )
+    messages = [
+        Message(
+            role="user",
+            content=[ContentBlockImage(media_type="image/png", data="c3ludGhldGlj")],
+        )
+    ]
+    tool_calls: list[str] = []
+
+    async def handle_tool(call):
+        tool_calls.append(call.tool_use_id)
+        return ToolResult(
+            tool_use_id=call.tool_use_id, tool_name=call.tool_name, content="observed"
+        )
+
+    if through_agent:
+        agent = Agent(
+            provider=wrapper,
+            config=AgentConfig(
+                model_id="configured-primary",
+                model_vision_support=(
+                    "unknown" if primary_support == "unknown" else "unsupported"
+                ),
+                max_provider_retries=0,
+                metadata=metadata,
+            ),
+            tool_definitions=(
+                [
+                    ToolDefinition(
+                        name="observe",
+                        description="Observe once.",
+                        input_schema=ToolInputSchema(properties={}, required=[]),
+                    )
+                ]
+                if primary_support == "tool_then_unsupported"
+                else None
+            ),
+            tool_handler=handle_tool,
+        )
+        events = [event async for event in agent.run_turn("Describe it.", extra_messages=messages)]
+    else:
+        # Wrapper callers supply canonical input directly; precise image
+        # rejection retries are owned by Agent.
+        events = [
+            event async for event in wrapper.chat(
+                messages, config=ChatConfig(model_vision_support="unsupported")
+            )
+        ]
+
+    assert not any(getattr(event, "kind", "") == "error" for event in events)
+    assert len(fallback.calls) == (2 if fallback_rejects_images else 1)
+    assert count_provider_image_blocks(primary.calls[-1]) == 0
+    expected_native = fallback_support != "unsupported" and not (
+        primary_support == "tool_then_unsupported" and fallback_support == "unknown"
+    )
+    assert count_provider_image_blocks(fallback.calls[0]) == int(expected_native)
+    if fallback_rejects_images:
+        assert [count_provider_image_blocks(call) for call in primary.calls] == [1, 0]
+        assert [count_provider_image_blocks(call) for call in fallback.calls] == [1, 0]
+        expected_native = False
+    assert count_provider_image_blocks(messages) == 1
+    assert metadata["image_input_mode"] == (
+        "native" if expected_native else "marker"
+    )
+    assert metadata["image_input_stage"] == "fallback"
+    assert tool_calls == (["observe-1"] if primary_support == "tool_then_unsupported" else [])
+    if through_agent and expected_native:
+        assert wrapper.active_model_vision_support(ChatConfig()) == "supported"
+
+
+async def test_each_unknown_deployment_gets_its_own_safe_marker_retry() -> None:
+    await test_each_selector_leg_projects_canonical_images(
+        through_agent=True,
+        primary_support="unknown",
+        fallback_support="unknown",
+        fallback_rejects_images=True,
+    )
+
+
 async def test_precise_image_rejection_bypasses_generic_selector_fallback() -> None:
     class _Primary:
         provider_name = "openai"
@@ -2235,7 +2392,7 @@ async def test_invalid_response_fallback_preserves_empty_response_without_vision
         assert done_events[-1].output_tokens == 1024
         assert done_events[-1].reasoning_tokens == 1023
     assert metadata["image_input_mode"] == "native"
-    assert metadata["image_input_reason"] == "model_vision_unsupported"
+    assert metadata["image_input_reason"] == "model_vision_supported"
     assert metadata["image_input_stage"] == "primary"
     assert metadata["routed_model"] == "vision-primary"
     assert metadata["executed_model"] == "vision-primary"

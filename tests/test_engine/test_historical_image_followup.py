@@ -5,6 +5,7 @@ import json
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock
 
@@ -13,11 +14,18 @@ import pytest
 from opensquilla.attachment_refs import write_transcript_material
 from opensquilla.engine import Agent, AgentConfig
 from opensquilla.engine.pipeline import TurnContext
-from opensquilla.engine.runtime import TurnRunner
+from opensquilla.engine.runtime import TurnRunner, _SelectorFallbackProvider
 from opensquilla.engine.steps.squilla_router import apply_squilla_router
 from opensquilla.engine.steps.vision_followup_gate import apply_vision_followup_gate
 from opensquilla.gateway.config import GatewayConfig
-from opensquilla.provider import ChatConfig, DoneEvent, Message, ModelCapabilities, TextDeltaEvent
+from opensquilla.provider import (
+    ChatConfig,
+    DoneEvent,
+    ErrorEvent,
+    Message,
+    ModelCapabilities,
+    TextDeltaEvent,
+)
 from opensquilla.provider.types import ContentBlockImage, ContentBlockText
 from opensquilla.session.attachment_manifest import (
     ATTACHMENT_MANIFEST_PROVIDER,
@@ -187,6 +195,153 @@ def _message_has_marker(message: Message, marker: str) -> bool:
     ) or isinstance(message.content, str) and marker in message.content
 
 
+@pytest.mark.parametrize("image_source", ["active", "archive", "bound", "agent_history"])
+async def test_text_primary_fallback_recovers_selected_historical_original(
+    image_source: str,
+) -> None:
+    manager = _CanonicalSessionManager()
+    key = "agent:main:historical-selector-fallback"
+    await manager.create(key)
+    image_entry = _TranscriptEntry(
+        "user", _inline_image_envelope("Describe this image.", b"original"), "image-source"
+    )
+    current = _TranscriptEntry("user", "Use the previous image.", "current")
+    manager._canonical[key] = [image_entry, current]
+    manager._transcripts[key] = (
+        [current] if image_source == "archive" else [image_entry, current]
+    )
+    primary_config = SimpleNamespace(provider="openai", model="configured-text")
+    fallback_config = SimpleNamespace(provider="openai", model="configured-vision")
+
+    class _TextPrimary(_CapturingProvider):
+        async def _stream(self):
+            yield ErrorEvent(code="503", message="Provider unavailable")
+
+    primary = _TextPrimary()
+    fallback = _CapturingProvider()
+
+    class _Selector:
+        current_config = primary_config
+
+        def next_fallback_after_failure(self, _error):
+            self.current_config = fallback_config
+            return fallback
+
+    wrapper = _SelectorFallbackProvider(primary, _Selector())
+    wrapper.configure_fallback_deployment_vision_support([(fallback_config, "supported")])
+    wrapper.configure_fallback_deployment_limits([
+        (fallback_config, 0, 0, ModelCapabilities(supports_vision=True))
+    ])
+    agent = Agent(
+        provider=wrapper,
+        config=AgentConfig(
+            model_id="configured-text",
+            model_vision_support="unsupported",
+            preserve_historical_images=image_source != "bound",
+            metadata={"attachment_count": 0},
+            max_provider_retries=0,
+        ),
+    )
+    if image_source == "agent_history":
+        agent.set_history([
+            Message(role="user", content=[
+                ContentBlockImage(media_type="image/png", data=_b64(b"original"))
+            ])
+        ])
+    else:
+        runner = TurnRunner(
+            provider_selector=MagicMock(), session_manager=manager,
+            config=GatewayConfig(llm={"provider": "openai"}),
+        )
+        await runner._load_history(
+            agent, key,
+            bound_user_message_id="image-source" if image_source == "bound" else "current",
+        )
+
+    events = [event async for event in agent.run_turn(current.content)]
+
+    assert not any(event.kind == "error" for event in events)
+    assert len(primary.calls) == len(fallback.calls) == 1
+    assert not any(_message_has_image(message) for message in primary.calls[0]["messages"])
+    assert [
+        block.data
+        for message in fallback.calls[0]["messages"]
+        if isinstance(message.content, list)
+        for block in message.content
+        if isinstance(block, ContentBlockImage)
+    ] == [_b64(b"original")]
+
+
+@pytest.mark.parametrize("archived", [False, True])
+@pytest.mark.parametrize("opt_out", [False, True])
+async def test_current_upload_and_previous_image_selection_are_independent(
+    archived: bool, opt_out: bool,
+) -> None:
+    from opensquilla.engine.turn_runner.agent_bootstrap_stage import _preserve_historical_images
+
+    manager = _CanonicalSessionManager()
+    key = "agent:main:compare-current-and-previous"
+    await manager.create(key)
+    previous = _TranscriptEntry(
+        "user", _inline_image_envelope("Previous upload.", b"previous-original"), "previous"
+    )
+    text = (
+        "Ignore the previous image; describe the new upload."
+        if opt_out else "Compare the new upload with the previous image."
+    )
+    current = _TranscriptEntry(
+        "user", _inline_image_envelope(text, b"current-original"), "current"
+    )
+    manager._canonical[key] = [previous, current]
+    manager._transcripts[key] = [current] if archived else [previous, current]
+    config = GatewayConfig(llm={"provider": "openai"})
+    metadata: dict[str, Any] = {
+        "attachment_count": 1,
+        "image_attachment_ids": ["att_current"],
+        "router_history_has_recent_image": True,
+        "router_turns_since_last_image": 1,
+    }
+    if opt_out:
+        metadata["image_intent_attachment_ids"] = ["att_previous"]
+        metadata["image_route_reason"] = "gate_history"
+    ctx = TurnContext(
+        message=text, raw_message=text, session_key=key,
+        model="configured-vision", config=config,
+        attachments=[{"mime": "image/png", "data": _b64(b"current-original")}],
+        provider=_CapturingProvider(), tool_defs=[], system_prompt="", metadata=metadata,
+    )
+    await apply_vision_followup_gate(ctx)
+    assert _preserve_historical_images(ctx.metadata) is not opt_out
+    provider = _CapturingProvider()
+    agent = Agent(
+        provider=provider,
+        config=AgentConfig(
+            model_vision_support="supported", metadata=ctx.metadata,
+            # The explicit veto must beat an older bootstrap/config flag too.
+            preserve_historical_images=True,
+        ),
+    )
+    runner = TurnRunner(provider_selector=MagicMock(), session_manager=manager, config=config)
+    await runner._load_history(agent, key, bound_user_message_id="current")
+    current_message = Message(role="user", content=[
+        ContentBlockImage(
+            media_type="image/png", data=_b64(b"current-original"), attachment_id="att_current"
+        ),
+    ])
+    events = [event async for event in agent.run_turn(text, extra_messages=[current_message])]
+
+    assert not any(event.kind == "error" for event in events)
+    payloads = [
+        block.data for message in provider.calls[0]["messages"]
+        if isinstance(message.content, list) for block in message.content
+        if isinstance(block, ContentBlockImage)
+    ]
+    assert payloads == (
+        [_b64(b"current-original")]
+        if opt_out else [_b64(b"previous-original"), _b64(b"current-original")]
+    )
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("vision_support", "expects_image"),
@@ -236,7 +391,7 @@ async def test_bound_image_message_reprojects_after_model_switch(
     assert any(
         _message_has_marker(message, "Image replay context for this request")
         for message in sent
-    ) is expects_image
+    )
     assert manager._transcripts[key][0].content == envelope
 
 

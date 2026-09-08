@@ -62,7 +62,7 @@ def test_legacy_attachment_id_matches_stable_algorithm() -> None:
         index=0,
         sha256="a" * 64,
     )
-    forked = legacy_attachment_id(
+    different_session = legacy_attachment_id(
         session_id="session-b",
         message_id="message-1",
         index=0,
@@ -86,13 +86,8 @@ def test_legacy_attachment_id_matches_stable_algorithm() -> None:
         index=0,
         sha256="b" * 64,
     )
-    digest = hashlib.sha256(
-        ("message-1\0" + "0" + "\0" + "a" * 64).encode("utf-8")
-    ).digest()[:18]
-    expected = "att_legacy_" + base64.urlsafe_b64encode(digest).decode("ascii").rstrip("=")
-    assert first == expected
-    assert first == forked
-    assert len({first, different_index, different_message, different_hash}) == 4
+    assert first == "att_legacy_9LhnXo-KjnfgK_FBOAv5tBag"
+    assert len({first, different_session, different_index, different_message, different_hash}) == 5
     assert first.startswith("att_legacy_")
 
 

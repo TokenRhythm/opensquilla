@@ -3631,12 +3631,9 @@ class Agent:
             preserve_tool_call_reasoning=thinking_enabled,
             preserve_reasoning_content=preserve_reasoning_content,
         )
-        declared_vision_support = str(
-            getattr(self.config, "model_vision_support", "unknown") or "unknown"
-        ).strip().lower()
         preserve_historical_images = bool(
             self.config.preserve_historical_images
-            and declared_vision_support != "unsupported"
+            and self.config.metadata.get("router_vision_followup_gate_source") != "explicit_opt_out"
         )
         history = _strip_historical_image_blocks(
             history,
@@ -7034,13 +7031,25 @@ class Agent:
             .casefold()
             == "ensemble"
         )
+        selector_projects_images = (
+            getattr(self.provider, "projects_image_input_per_leg", False) is True
+        )
+        selector_image_provider: Any = self.provider if selector_projects_images else None
         image_projection_forced = bool(
             forced_image_rejection
-            or self.config.model_vision_support == "unsupported"
-            or provider_is_ensemble
+            or self.config.metadata.get("image_input_projection_required") is True
+        )
+        image_projection_forced_deployment = (
+            selector_image_provider.active_deployment_config()
+            if selector_projects_images
+            else None
         )
         image_projection_marker_state: ImageMarkerState = ImageMarkerState.NOT_ANALYZED
-        if image_projection_forced:
+        if (
+            image_projection_forced
+            or self.config.model_vision_support == "unsupported"
+            or provider_is_ensemble
+        ):
             image_input_reason = (
                 "ensemble_text_only"
                 if provider_is_ensemble and not forced_image_rejection
@@ -7121,23 +7130,9 @@ class Agent:
         # history and make a later vision-capable turn unable to recover the
         # original attachment.
         canonical_sanitized_history = list(sanitized_history)
-        declared_vision_support = str(
-            self.config.model_vision_support or "unknown"
-        ).strip().lower()
         preserve_historical_images = bool(
             self.config.preserve_historical_images
-            and declared_vision_support != "unsupported"
-            and (
-                declared_vision_support in {"supported", "unknown"}
-                or (
-                    self.config.model_capabilities is not None
-                    and getattr(
-                        self.config.model_capabilities,
-                        "supports_vision",
-                        False,
-                    )
-                )
-            )
+            and self.config.metadata.get("router_vision_followup_gate_source") != "explicit_opt_out"
         )
         sanitized_history = _strip_historical_image_blocks(
             sanitized_history,
@@ -8646,6 +8641,7 @@ class Agent:
                 # must not consume the generic retry budget or select an
                 # unconfigured model.
                 _image_marker_retry_done = False
+                image_marker_retry_deployments: list[Any] = []
                 provider_activity_id = uuid.uuid4().hex
                 next_provider_activity_reason: _ProviderActivityReason = "initial"
                 while _retry_attempt <= _fallback.max_retries:
@@ -8933,12 +8929,31 @@ class Agent:
                             "image_probe_unsafe_after_irreversible_effect"
                         )
                         self.config.metadata["image_input_stage"] = "primary"
+                    # Selector fallback must retain the image-bearing input;
+                    # this projected view is only for the active leg's local
+                    # admission, loop detection, and diagnostics.
+                    canonical_request_messages = request_messages
+                    force_current_image_marker = image_projection_forced and (
+                        not selector_projects_images
+                        or selector_image_provider.active_deployment_config()
+                        == image_projection_forced_deployment
+                    )
+                    if selector_projects_images:
+                        selector_image_provider.configure_image_request_projection(
+                            force_marker=force_current_image_marker,
+                            marker_state=image_projection_marker_state,
+                            forbid_unknown_probe=turn_image_retry_barrier_crossed,
+                            reason=(
+                                str(self.config.metadata.get("image_input_reason") or "")
+                                or None
+                            ),
+                        )
                     request_messages, image_projection_result = (
                         self._project_image_input_for_provider(
                             request_messages,
                             chat_config=chat_cfg,
                             force_marker=(
-                                image_projection_forced
+                                force_current_image_marker
                                 or barrier_requires_image_marker
                             ),
                             marker_state=image_projection_marker_state,
@@ -8966,7 +8981,12 @@ class Agent:
                         )
                         if (
                             validation_image_failure.is_unsupported
-                            and not _image_marker_retry_done
+                            and (
+                                not _image_marker_retry_done
+                                or selector_projects_images
+                                and selector_image_provider.active_deployment_config()
+                                not in image_marker_retry_deployments
+                            )
                             and not turn_image_retry_barrier_crossed
                         ):
                             image_fallback = getattr(
@@ -8993,6 +9013,13 @@ class Agent:
                             # visible output or side effect is emitted.
                             _image_marker_retry_done = True
                             image_projection_forced = True
+                            if selector_projects_images:
+                                image_projection_forced_deployment = (
+                                    selector_image_provider.active_deployment_config()
+                                )
+                                image_marker_retry_deployments.append(
+                                    image_projection_forced_deployment
+                                )
                             self.config.metadata["image_input_mode"] = (
                                 ImageProjectionMode.MARKER.value
                             )
@@ -9124,6 +9151,10 @@ class Agent:
                         request_messages = self._append_identical_request_loop_nudge(
                             request_messages
                         )
+                        if selector_projects_images:
+                            canonical_request_messages = self._append_identical_request_loop_nudge(
+                                canonical_request_messages
+                            )
                         if _call_attempt == 0:
                             self.config.metadata["identical_request_loop_perturbations"] = (
                                 self.config.metadata.get(
@@ -9508,7 +9539,9 @@ class Agent:
                                         self._execution_context
                                     )
                                 raw_stream = provider_chat(
-                                    request_messages,
+                                    canonical_request_messages
+                                    if selector_projects_images
+                                    else request_messages,
                                     **provider_chat_kwargs,
                                 )
                             else:
@@ -9517,7 +9550,9 @@ class Agent:
                                 # scripted synthetic failure (see provider/types.py).
                                 raw_stream = self._failure_injector.chat(
                                     self.provider,
-                                    request_messages,
+                                    canonical_request_messages
+                                    if selector_projects_images
+                                    else request_messages,
                                     tools=provider_tools_for_call,
                                     config=call_chat_cfg,
                                     execution_context=self._execution_context,
@@ -12516,7 +12551,11 @@ class Agent:
                     if not _got_error:
                         if (
                             _got_done_event
-                            and image_projection_result.output_image_count > 0
+                            and (
+                                selector_image_provider.last_image_request_had_native_images
+                                if selector_projects_images
+                                else image_projection_result.output_image_count > 0
+                            )
                         ):
                             # A completed native image request is exact runtime
                             # evidence for this deployment. Preserve it across
@@ -12565,7 +12604,12 @@ class Agent:
                         )
                         if (
                             image_failure.is_unsupported
-                            and not _image_marker_retry_done
+                            and (
+                                not _image_marker_retry_done
+                                or selector_projects_images
+                                and selector_image_provider.active_deployment_config()
+                                not in image_marker_retry_deployments
+                            )
                             and not attempt_irreversible_output_emitted
                             and not turn_image_retry_barrier_crossed
                         ):
@@ -12600,6 +12644,13 @@ class Agent:
                             # no unconfigured model is introduced.
                             _image_marker_retry_done = True
                             image_projection_forced = True
+                            if selector_projects_images:
+                                image_projection_forced_deployment = (
+                                    selector_image_provider.active_deployment_config()
+                                )
+                                image_marker_retry_deployments.append(
+                                    image_projection_forced_deployment
+                                )
                             image_projection_marker_state = (
                                 ImageMarkerState.ANALYSIS_FAILED
                             )

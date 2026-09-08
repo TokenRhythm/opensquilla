@@ -30,6 +30,7 @@ from opensquilla.gateway.app import create_gateway_app
 from opensquilla.gateway.auth import Principal
 from opensquilla.gateway.config import GatewayConfig
 from opensquilla.gateway.rpc import RpcContext, get_dispatcher
+from opensquilla.gateway.transcripts import build_transcript_attachment_envelope
 from opensquilla.gateway.uploads import (
     AttachmentNotFoundError,
     UploadStore,
@@ -46,6 +47,7 @@ from opensquilla.provider.types import (
 from opensquilla.session.manager import SessionManager
 from opensquilla.session.storage import SessionStorage
 from opensquilla.token_estimation import estimate_tokens
+from opensquilla.tools.types import ToolContext
 
 _PNG_BYTES = (
     b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01"
@@ -549,6 +551,69 @@ async def test_gateway_single_text_model_projects_marker_and_continues(
         sha,
     )
     assert material_path.read_bytes() == _PNG_BYTES
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("persist_transcripts", [True, False])
+async def test_runner_image_marker_matches_persisted_attachment_retention(
+    _e2e_stack: dict[str, Any],
+    persist_transcripts: bool,
+) -> None:
+    config: GatewayConfig = _e2e_stack["config"]
+    config.squilla_router.enabled = False
+    config.attachments.persist_transcripts = persist_transcripts
+    manager: SessionManager = _e2e_stack["manager"]
+    runner: TurnRunner = _e2e_stack["runner"]
+    text_provider: _RecordingProvider = _e2e_stack["text_provider"]
+    vision_provider: _RecordingProvider = _e2e_stack["vision_provider"]
+    selector: _RecordingSelector = _e2e_stack["selector"]
+    key = "agent:main:image-retention"
+    session = await manager.create(session_key=key, agent_id="main")
+    attachment = {
+        "type": "image/png", "name": "sample.png", "_was_staged": True,
+        "data": base64.b64encode(_PNG_BYTES).decode("ascii"),
+    }
+    envelope, writes = build_transcript_attachment_envelope(
+        text="Inspect this image.", attachments=[attachment],
+        session_id=session.session_id,
+        media_root=Path(config.attachments.media_root or ""),
+        persist_enabled=persist_transcripts,
+    )
+    saved_image = json.loads(envelope)["attachments"][0]
+    if not persist_transcripts:
+        assert saved_image["missing_reason"] == "attachment persistence disabled"
+        assert not {"attachment_id", "sha256_ref", "data"}.intersection(saved_image)
+        assert writes == []
+    current = await manager.append_message(key, "user", envelope)
+    context = ToolContext(is_owner=True, workspace_dir=config.workspace_dir)
+
+    async for _ in runner.run(
+        "Inspect this image.", session_key=key, tool_context=context,
+        attachments=[attachment], bound_user_message_id=current.message_id,
+    ):
+        pass
+
+    sent_messages = text_provider.calls[-1]["messages"]
+    assert not any(_message_has_image(message) for message in sent_messages)
+    assert ("原图已保留" in str(sent_messages)) is persist_transcripts
+    if not persist_transcripts:
+        assert "原图未持久化" in str(sent_messages)
+        assert "重新上传" in str(sent_messages)
+    selector.model = _VISION_MODEL
+    config.llm.model = _VISION_MODEL
+    followup = await manager.append_message(key, "user", "Analyze the previous image again.")
+    async for _ in runner.run(
+        followup.content, session_key=key, tool_context=context,
+        bound_user_message_id=followup.message_id,
+    ):
+        pass
+
+    followup_messages = vision_provider.calls[-1]["messages"]
+    assert any(_message_has_image(message) for message in followup_messages) is persist_transcripts
+    if not persist_transcripts:
+        assert "历史图片不可用" in str(followup_messages)
+        assert "重新上传" in str(followup_messages)
+        assert "原图已保留" not in str(followup_messages)
 
 
 @pytest.mark.asyncio

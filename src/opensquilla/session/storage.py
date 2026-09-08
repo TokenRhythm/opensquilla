@@ -28,6 +28,7 @@ from functools import wraps
 from typing import TYPE_CHECKING, Any, Concatenate, cast
 
 from opensquilla.compat import aiosqlite
+from opensquilla.session.attachment_manifest import preserve_attachment_occurrence_ids
 from opensquilla.session.cost_rollup import rollup_cost_source
 from opensquilla.session.goals import (
     GOAL_EFFECTIVE_CONTEXT_DETAIL_KEY,
@@ -14834,26 +14835,45 @@ class SessionStorage:
                 """,
                 (target_session_id, target_session_key, source_session_id),
             )
-            if terminal_outcome_projections is None:
-                return
             async with conn.execute(
-                "SELECT id, turn_context FROM compacted_transcript_entries "
+                "SELECT id, role, message_id, content, turn_context "
+                "FROM compacted_transcript_entries "
                 "WHERE session_id = ?",
                 (target_session_id,),
             ) as cursor:
                 rows = await cursor.fetchall()
             for row in rows:
+                content = row["content"]
+                rebound_content = (
+                    preserve_attachment_occurrence_ids(
+                        content,
+                        session_id=source_session_id,
+                        source_message_id=row["message_id"],
+                    )
+                    if row["role"] == "user"
+                    else content
+                )
                 context = _json_object_or_none(row["turn_context"])
                 turn_id = turn_id_from_context(context)
-                rebound_context = attach_fork_terminal_outcome_projection(
-                    context,
-                    terminal_outcome_projections.get(turn_id or ""),
+                rebound_context = (
+                    attach_fork_terminal_outcome_projection(
+                        context,
+                        terminal_outcome_projections.get(turn_id or ""),
+                    )
+                    if terminal_outcome_projections is not None
+                    else context
                 )
-                if rebound_context == context:
+                if rebound_content == content and rebound_context == context:
                     continue
                 await conn.execute(
-                    "UPDATE compacted_transcript_entries SET turn_context = ? WHERE id = ?",
-                    (_serialize(rebound_context), row["id"]),
+                    "UPDATE compacted_transcript_entries "
+                    "SET content = ?, turn_context = ? WHERE id = ?",
+                    (
+                        rebound_content,
+                        _serialize(rebound_context) if rebound_context != context
+                        else row["turn_context"],
+                        row["id"],
+                    ),
                 )
 
     @_serialized_read

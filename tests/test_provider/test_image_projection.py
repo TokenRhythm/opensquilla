@@ -239,6 +239,73 @@ def test_marker_preserves_maximum_length_manifest_id() -> None:
     assert attachment_id in image_marker(attachment_id=attachment_id)
 
 
+@pytest.mark.parametrize("state", [
+    ImageMarkerState.NOT_ANALYZED,
+    ImageMarkerState.ANALYSIS_FAILED,
+    ImageMarkerState.NOT_REREAD,
+    ImageMarkerState.NOT_SENT,
+])
+@pytest.mark.parametrize("durable_retained", [True, False, None])
+def test_marker_only_promises_retention_with_durable_evidence(
+    state: ImageMarkerState,
+    durable_retained: bool | None,
+) -> None:
+    marker = image_marker(
+        state,
+        attachment_id="att_saved_image",
+        durable_retained=durable_retained,
+    )
+
+    assert "att_saved_image" in marker
+    assert ("原图已保留" in marker) is (durable_retained is True)
+    if durable_retained is False:
+        assert "原图未持久化" in marker
+        assert "重新上传" in marker
+    elif durable_retained is None:
+        assert "原图保留状态未确认" in marker
+
+
+def test_marker_retention_is_per_image_and_excluded_from_provider_payload() -> None:
+    retained_image = ContentBlockImage(
+        media_type="image/png", data="saved", attachment_id="att_saved",
+        durable_retained=True,
+    )
+    transient_image = ContentBlockImage(
+        media_type="image/png", data="current", durable_retained=False,
+    )
+    nested_image = {
+        "type": "image", "media_type": "image/png", "data": "nested",
+        "attachment_id": "att_nested", "durable_retained": False,
+    }
+    canonical = [Message(role="user", content=[
+        retained_image,
+        transient_image,
+        ContentBlockToolResult(tool_use_id="nested", content=[nested_image]),
+    ])]
+
+    result = project_messages(canonical, mode="marker")
+
+    markers = [decision.marker or "" for decision in result.decisions]
+    assert "原图已保留" in markers[0]
+    assert "原图未持久化" in markers[1]
+    assert "原图未持久化" in markers[2]
+    native = project_messages(canonical, mode="native")
+    assert "durable_retained" not in native.messages[0].model_dump_json()
+    assert count_image_blocks(canonical) == 3
+    assert transient_image.durable_retained is False
+
+
+def test_current_image_binding_records_disabled_retention_without_an_id() -> None:
+    canonical = [Message(role="user", content=[_image()])]
+
+    bound = bind_image_attachment_ids(canonical, (), durable_retained=False)
+    projection = project_messages(bound, mode="marker")
+
+    assert "原图未持久化" in (projection.decisions[0].marker or "")
+    assert projection.decisions[0].attachment_id is None
+    assert canonical[0].content[0].durable_retained is None
+
+
 def test_image_error_classifier_only_caches_precise_unsupported_evidence() -> None:
     assert (
         classify_image_input_error(

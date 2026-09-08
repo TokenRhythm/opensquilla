@@ -3,8 +3,8 @@
 The transcript is the source of truth for user input and attachments.  This
 module deliberately operates on a deep copy of that transcript and produces
 the view for one *physical* provider call.  In particular, replacing an image
-with a text marker here never changes the persisted message, which lets a
-later turn (or a different configured model) recover the original image.
+with a text marker here never changes the persisted message. When attachment
+retention is enabled, a later turn can recover the original image.
 
 Only the projection boundary belongs here.  Session storage, model selection,
 and retry orchestration can consume the value objects below without making the
@@ -274,12 +274,20 @@ def image_marker(
     state: ImageMarkerState | str = ImageMarkerState.NOT_ANALYZED,
     *,
     attachment_id: str | None = None,
+    durable_retained: bool | None = None,
 ) -> str:
-    """Build the stable, model-visible marker for one omitted image."""
+    """Build an omitted-image marker without guessing durable retention."""
 
     normalized = normalize_marker_state(state)
     safe_id = _safe_attachment_id(attachment_id)
-    suffix = f"原图已保留：{safe_id}" if safe_id else "原图已保留"
+    if durable_retained is True:
+        suffix = "原图已保留"
+    elif durable_retained is False:
+        suffix = "原图未持久化；后续如需分析请重新上传"
+    else:
+        suffix = "原图保留状态未确认"
+    if safe_id:
+        suffix += f"：{safe_id}"
     if normalized is ImageMarkerState.ANALYSIS_FAILED:
         return f"[图片分析失败：本回合无法读取原图；{suffix}]"
     if normalized is ImageMarkerState.NOT_REREAD:
@@ -485,11 +493,15 @@ def _bound_image_attachment_ids(value: object) -> set[str]:
 def bind_image_attachment_ids(
     messages: Sequence[Message],
     attachment_ids: Sequence[str],
+    *,
+    durable_retained: bool | None = None,
 ) -> list[Message]:
     """Return a deep copy with IDs bound to otherwise-unbound typed images.
 
     This is used for the current upload envelope after persistence assigned its
-    canonical occurrence IDs.  The field is internal/excluded from provider
+    canonical occurrence IDs. Retention evidence applies only to this upload
+    envelope and can be false even when no durable IDs were assigned.
+    The fields are internal/excluded from provider
     serialization; it exists only to keep marker decisions correct when a
     request also contains historical or nested tool-result images.
     """
@@ -506,7 +518,14 @@ def bind_image_attachment_ids(
                 next_id += 1
             return value.model_copy(
                 deep=True,
-                update={"attachment_id": attachment_id},
+                update={
+                    "attachment_id": attachment_id,
+                    "durable_retained": (
+                        durable_retained
+                        if durable_retained is not None
+                        else value.durable_retained
+                    ),
+                },
             )
         if isinstance(value, ContentBlockToolResult):
             return value.model_copy(deep=True, update={"content": visit(value.content)})
@@ -572,9 +591,15 @@ def _project_content_value(value: object, context: _ProjectionContext) -> tuple[
                     f"[图片派生描述（{_safe_attachment_id(attachment_id)}）：{surrogate}]"
                 )
             else:
-                marker_text = image_marker(state, attachment_id=attachment_id)
+                marker_text = image_marker(
+                    state, attachment_id=attachment_id,
+                    durable_retained=value.durable_retained,
+                )
         else:
-            marker_text = image_marker(state, attachment_id=attachment_id)
+            marker_text = image_marker(
+                state, attachment_id=attachment_id,
+                durable_retained=value.durable_retained,
+            )
         context.decisions.append(
             ImageProjectionDecision(
                 ordinal,
@@ -636,7 +661,10 @@ def _project_content_value(value: object, context: _ProjectionContext) -> tuple[
             marker_text = (
                 f"[图片派生描述（{_safe_attachment_id(attachment_id)}）：{surrogate}]"
                 if surrogate and attachment_id
-                else image_marker(state, attachment_id=attachment_id)
+                else image_marker(
+                    state, attachment_id=attachment_id,
+                    durable_retained=value.get("durable_retained"),
+                )
             )
             context.decisions.append(
                 ImageProjectionDecision(
@@ -652,8 +680,12 @@ def _project_content_value(value: object, context: _ProjectionContext) -> tuple[
                 # Mapping-shaped compatibility blocks cannot express a
                 # Pydantic excluded field, so remove request-local provenance
                 # explicitly before the native provider boundary.
+                has_provenance = (
+                    "attachment_id" in cloned_mapping or "durable_retained" in cloned_mapping
+                )
                 cloned_mapping.pop("attachment_id", None)
-                return cloned_mapping, False
+                cloned_mapping.pop("durable_retained", None)
+                return cloned_mapping, has_provenance
             # Keep dictionary-shaped content dictionary-shaped.  Adapters that
             # accept untyped tool-result blocks can serialize this naturally.
             return {"type": "text", "text": marker_text}, True

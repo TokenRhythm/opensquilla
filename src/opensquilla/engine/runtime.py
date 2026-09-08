@@ -2256,6 +2256,8 @@ def _selector_execution_leg_failure_code(
 class _SelectorFallbackProvider:
     """Provider wrapper that switches to selector fallback on pre-content errors."""
 
+    projects_image_input_per_leg = True
+
     def __init__(
         self,
         provider: Any,
@@ -2275,6 +2277,11 @@ class _SelectorFallbackProvider:
         self._pending_fallback_hops = 0
         self._last_executed_model = ""
         self._last_request_had_tools = False
+        self._image_marker_deployment: _FallbackDeploymentIdentity | None = None
+        self._image_marker_state = ImageMarkerState.NOT_ANALYZED
+        self._image_marker_reason: str | None = None
+        self._image_probe_forbidden = False
+        self.last_image_request_had_native_images = False
         self._fallback_limits: dict[tuple[str, str], tuple[int, int]] = {}
         self._fallback_deployment_limits: dict[
             _FallbackDeploymentIdentity, tuple[int, int]
@@ -2502,6 +2509,25 @@ class _SelectorFallbackProvider:
                 result.append(normalized)
         return tuple(result)
 
+    def configure_image_request_projection(
+        self,
+        *,
+        force_marker: bool,
+        marker_state: ImageMarkerState,
+        forbid_unknown_probe: bool,
+        reason: str | None,
+    ) -> None:
+        """Bind explicit retry policy to one request, not its result telemetry."""
+
+        self._image_marker_deployment = (
+            _fallback_deployment_identity(self.active_deployment_config())
+            if force_marker
+            else None
+        )
+        self._image_marker_state = marker_state
+        self._image_marker_reason = reason
+        self._image_probe_forbidden = forbid_unknown_probe
+
     def _project_image_messages_for_active_leg(
         self,
         messages: Sequence[Any],
@@ -2511,8 +2537,8 @@ class _SelectorFallbackProvider:
     ) -> list[Any]:
         """Build a fresh request view for the currently selected deployment.
 
-        ``Agent`` performs the same projection at its retry boundary.  The
-        selector wrapper repeats it here because a fallback is a new physical
+        ``Agent`` retains a projected view for admission and diagnostics but
+        passes canonical input to this wrapper because a fallback is a new physical
         request with a different capability fact.  In particular, a known
         text-only fallback receives a truthful marker instead of a terminal
         admission error; an unknown deployment remains native and can be
@@ -2545,62 +2571,55 @@ class _SelectorFallbackProvider:
             ).strip().lower()
 
         turn_metadata = self._turn_metadata
-        force_marker = bool(
-            isinstance(turn_metadata, Mapping)
-            and (
-                turn_metadata.get("image_input_projection_required") is True
-                or str(turn_metadata.get("image_input_mode") or "")
-                in {"marker", "text_only"}
-            )
+        force_marker = self._image_marker_deployment == _fallback_deployment_identity(
+            self.active_deployment_config()
         )
+        unsafe_probe = self._image_probe_forbidden and support == "unknown"
         ensemble_text_only = provider_kind == "ensemble" or provider_name == "ensemble"
-        should_marker = force_marker or support == "unsupported" or ensemble_text_only
-
-        # A native projection is still a deep copy. This prevents a provider
-        # from mutating the list it received and contaminating the next
-        # selector leg.
-        if not should_marker:
-            return project_messages(
-                messages,
-                mode=ImageProjectionMode.NATIVE,
-            ).messages
+        should_marker = (
+            force_marker or unsafe_probe or support == "unsupported" or ensemble_text_only
+        )
 
         if ensemble_text_only:
             reason = "ensemble_text_only"
+        elif force_marker:
+            reason = self._image_marker_reason or "configured_marker_fallback"
+        elif unsafe_probe:
+            reason = "image_probe_unsafe_after_irreversible_effect"
         elif support == "unsupported":
             reason = "model_vision_unsupported"
         else:
-            reason = str(
-                turn_metadata.get("image_input_reason")
-                if isinstance(turn_metadata, Mapping)
-                else ""
-            ).strip() or "configured_marker_fallback"
-        marker_state = ImageMarkerState.NOT_ANALYZED
-        if isinstance(turn_metadata, Mapping):
-            existing_state = str(
-                turn_metadata.get("image_input_marker_state") or ""
-            ).strip().lower()
-            if existing_state in {state.value for state in ImageMarkerState}:
-                marker_state = ImageMarkerState(existing_state)
+            reason = "capability_probe" if support == "unknown" else "model_vision_supported"
+        marker_state = (
+            self._image_marker_state if force_marker else ImageMarkerState.NOT_ANALYZED
+        )
+        mode = ImageProjectionMode.MARKER if should_marker else ImageProjectionMode.NATIVE
 
         projection = project_messages(
             messages,
-            mode=ImageProjectionMode.MARKER,
+            mode=mode,
             marker_state=marker_state,
             attachment_ids=self._image_attachment_ids_from_metadata(
                 self._turn_metadata or active_config
             ),
         )
-        if projection.marker_count and isinstance(turn_metadata, dict):
+        self.last_image_request_had_native_images = projection.output_image_count > 0
+        if projection.input_image_count and isinstance(turn_metadata, dict):
             # These fields describe the physical leg that is about to run.
             # A previous native probe must not leave stale metadata after a
             # configured text-only fallback receives marker projection.
-            turn_metadata["image_input_mode"] = ImageProjectionMode.MARKER.value
+            turn_metadata["image_input_mode"] = mode.value
             turn_metadata["image_input_reason"] = reason
             turn_metadata["image_input_count"] = projection.input_image_count
+            turn_metadata["image_input_output_count"] = projection.output_image_count
+            turn_metadata["image_input_marker_count"] = projection.marker_count
             turn_metadata["image_input_stage"] = stage
-            turn_metadata["image_input_marker_state"] = marker_state.value
-        assert_text_only_messages(projection.messages)
+            if should_marker:
+                turn_metadata["image_input_marker_state"] = marker_state.value
+            else:
+                turn_metadata.pop("image_input_marker_state", None)
+        if should_marker:
+            assert_text_only_messages(projection.messages)
         return projection.messages
 
     def _advance_past_explicit_tool_denials(
@@ -6068,19 +6087,27 @@ class TurnRunner:
                 att_out.extra_messages,
                 effective_runtime_message,
             )
-            current_attachment_ids = turn.metadata.get("image_attachment_ids")
-            if (
-                extra_msgs
-                and isinstance(current_attachment_ids, Sequence)
-                and not isinstance(current_attachment_ids, (str, bytes, bytearray))
-            ):
+            current_attachment_ids = turn.metadata.get(
+                "current_image_attachment_ids", turn.metadata.get("image_attachment_ids")
+            )
+            if extra_msgs:
+                current_ids = (
+                    current_attachment_ids
+                    if isinstance(current_attachment_ids, Sequence)
+                    and not isinstance(current_attachment_ids, (str, bytes, bytearray))
+                    else ()
+                )
+                durable_retained = turn.metadata.get("image_attachment_durable_retained")
+                if not isinstance(durable_retained, bool):
+                    durable_retained = None
                 extra_msgs = bind_image_attachment_ids(
                     extra_msgs,
                     [
                         value
-                        for value in current_attachment_ids
+                        for value in current_ids
                         if isinstance(value, str) and value.strip()
                     ],
+                    durable_retained=durable_retained,
                 )
             attachment_turn_input = (
                 effective_runtime_message if extra_msgs is None else ""
@@ -9905,12 +9932,16 @@ class TurnRunner:
                     None,
                 )
                 if bound_entry is not None:
+                    bound_content = str(getattr(bound_entry, "content", "") or "")
                     bound_attachment_ids = self._attachment_ids_from_envelope(
-                        str(getattr(bound_entry, "content", "") or ""),
+                        bound_content,
                         image_only=True,
                     )
+                    initial_metadata["image_attachment_durable_retained"] = (
+                        self._image_retention_from_envelope(bound_content)
+                    )
                     if bound_attachment_ids:
-                        initial_metadata["image_attachment_ids"] = list(
+                        initial_metadata["current_image_attachment_ids"] = list(
                             bound_attachment_ids
                         )
             except Exception as exc:  # noqa: BLE001 - marker IDs are additive
@@ -14411,25 +14442,19 @@ class TurnRunner:
                 )
         bound_slice_applied = bool(bound_skip_indexes)
         agent_config = getattr(agent, "config", None)
-        model_caps = getattr(agent_config, "model_capabilities", None)
-        declared_vision_support = str(
-            getattr(agent_config, "model_vision_support", "unknown") or "unknown"
-        ).strip().lower()
-        # ``supports_vision`` is the legacy boolean catalog field.  The
-        # tri-state deployment fact is authoritative when present: an unknown
-        # deployment may still be probed once, while an explicit unsupported
-        # deployment must receive markers.
-        preserve_image_history = bool(
-            getattr(agent_config, "preserve_historical_images", False)
-            and declared_vision_support != "unsupported"
-            and (
-                declared_vision_support in {"supported", "unknown"}
-                or getattr(model_caps, "supports_vision", False)
-            )
-        )
         metadata = getattr(agent_config, "metadata", {})
         if not isinstance(metadata, Mapping):
             metadata = {}
+        history_images_opted_out = (
+            metadata.get("router_vision_followup_gate_source") == "explicit_opt_out"
+        )
+        # Select canonical attachments from intent, not the primary model's
+        # capability: a configured selector fallback may still need the bytes.
+        preserve_image_history = bool(
+            getattr(agent_config, "preserve_historical_images", False)
+            and not history_images_opted_out
+        )
+        current_attachment_count = _non_negative_int(metadata.get("attachment_count"))
 
         requested_attachment_id_list: list[str] = []
         seen_requested_attachment_ids: set[str] = set()
@@ -14438,6 +14463,10 @@ class TurnRunner:
             "image_intent_attachment_ids",
             "attachment_ids",
         ):
+            if history_images_opted_out or (
+                key == "image_attachment_ids" and current_attachment_count > 0
+            ):
+                continue
             raw_ids = metadata.get(key)
             if isinstance(raw_ids, str):
                 values: Sequence[Any] = (raw_ids,)
@@ -14468,9 +14497,6 @@ class TurnRunner:
         # as an attachment replay only when that exact persisted row is an
         # image envelope; every ordinary bound text turn also has zero current
         # attachments and must not pull unrelated archived images into scope.
-        current_attachment_count = _non_negative_int(
-            metadata.get("attachment_count")
-        )
         bound_attachment_replay_candidate = bool(
             bound_user_message_id and current_attachment_count == 0
         )
@@ -14488,13 +14514,16 @@ class TurnRunner:
                     break
 
         # A compacted image is outside the active transcript. Read the
-        # canonical archive for an explicit ID, a routed image follow-up, or a
-        # vision-capable model whose route requested historical replay.
+        # canonical archive for an explicit historical ID or a follow-up that
+        # requested replay. A new upload alone does not select old images.
         independent_replay_signal = bool(
-            requested_attachment_ids
-            or metadata.get("image_route_reason") in {"current_turn", "gate_history"}
-            or metadata.get("router_vision_followup_needs_image") is True
-            or preserve_image_history
+            not history_images_opted_out
+            and (
+                requested_attachment_ids
+                or metadata.get("image_route_reason") == "gate_history"
+                or metadata.get("router_vision_followup_needs_image") is True
+                or preserve_image_history
+            )
         )
         canonical_lookup_required = bool(
             independent_replay_signal
@@ -14529,16 +14558,8 @@ class TurnRunner:
         replay_signal = bool(
             independent_replay_signal or bound_attachment_replay_requested
         )
-        replay_images_natively = bool(
-            declared_vision_support != "unsupported"
-            and (
-                preserve_image_history
-                or requested_attachment_ids
-                or bound_attachment_replay_requested
-                or metadata.get("router_vision_followup_needs_image") is True
-            )
-        )
-        if replay_images_natively and agent_config is not None:
+        replay_selected_images = replay_signal
+        if replay_selected_images and agent_config is not None:
             # Agent performs a final history sanitation pass immediately
             # before provider projection.  Carry the resolved image intent to
             # that pass so an explicitly rehydrated canonical image is not
@@ -14648,7 +14669,7 @@ class TurnRunner:
                         str(getattr(entry, "content", "") or "")
                     )
                 ]
-                if lookback > 0
+                if lookback > 0 and independent_replay_signal
                 else []
             )
             if requested_attachment_ids:
@@ -14693,7 +14714,7 @@ class TurnRunner:
                         if entry_message_id:
                             requested_source_message_ids.add(entry_message_id)
                 candidate_entries = explicit_matches
-                if replay_images_natively and requested_source_message_ids:
+                if replay_selected_images and requested_source_message_ids:
                     image_replay_entry_indexes.update(
                         index
                         for index, entry in enumerate(transcript)
@@ -14798,7 +14819,7 @@ class TurnRunner:
                     continue
                 replay_content = self._maybe_unpack_attachments(
                     raw_content,
-                    preserve_image_attachments=replay_images_natively,
+                    preserve_image_attachments=replay_selected_images,
                     allowed_image_attachment_ids=requested_image_id_filter,
                     materialize_historical_attachments=materialize_historical_attachments,
                     media_root=self._attachment_media_root(),
@@ -14824,9 +14845,7 @@ class TurnRunner:
             for entry in bound_image_replay_entries:
                 replay_content = self._maybe_unpack_attachments(
                     str(getattr(entry, "content", "") or ""),
-                    preserve_image_attachments=(
-                        declared_vision_support != "unsupported"
-                    ),
+                    preserve_image_attachments=True,
                     materialize_historical_attachments=(
                         materialize_historical_attachments
                     ),
@@ -15138,6 +15157,45 @@ class TurnRunner:
         return tuple(result)
 
     @staticmethod
+    def _image_retention_from_envelope(content: str) -> bool | None:
+        """Confirm current-upload retention from saved material, not logical IDs.
+
+        A mixed or incomplete envelope has no shared retention fact. Its
+        current-upload markers stay conservative instead of promising replay.
+        """
+
+        try:
+            parsed = json.loads(content)
+        except (json.JSONDecodeError, ValueError):
+            return None
+        attachments = parsed.get("attachments") if isinstance(parsed, dict) else None
+        if not isinstance(attachments, list):
+            return None
+        retention: list[bool | None] = []
+        for attachment in attachments:
+            if not isinstance(attachment, dict):
+                continue
+            mime = (
+                attachment.get("type")
+                or attachment.get("mime")
+                or attachment.get("media_type")
+            )
+            if not isinstance(mime, str) or not mime.startswith("image/"):
+                continue
+            if attachment.get("missing_reason"):
+                retention.append(False)
+            elif any(
+                isinstance(attachment.get(key), str) and attachment[key]
+                for key in ("data", "sha256_ref")
+            ):
+                retention.append(True)
+            else:
+                retention.append(None)
+        if retention and all(value is retention[0] for value in retention):
+            return retention[0]
+        return None
+
+    @staticmethod
     def _attachment_ids_from_envelope(
         content: str,
         *,
@@ -15350,6 +15408,7 @@ class TurnRunner:
                                 media_type=media_type,
                                 data=data,
                                 attachment_id=attachment_id,
+                                durable_retained=True,
                             )
                         )
                         preserved_image = True
@@ -15394,6 +15453,7 @@ class TurnRunner:
                                 media_type=media_type,
                                 data=base64.b64encode(raw_bytes).decode("ascii"),
                                 attachment_id=attachment_id,
+                                durable_retained=True,
                             )
                         )
                         preserved_image = True

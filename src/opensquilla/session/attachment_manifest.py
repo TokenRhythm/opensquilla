@@ -159,16 +159,15 @@ def legacy_attachment_id(
 ) -> str:
     """Derive the stable ID used when an old envelope has no occurrence ID.
 
-    The input uses the source message, ordinal and content hash.  Attachment
-    lookup remains session-scoped, while omitting the session identity keeps
-    the logical occurrence stable when a transcript is fully forked.  The
-    ``session_id`` argument is retained for call-site compatibility.
+    Preserve the session-scoped derivation used by existing workbench
+    references and document bindings. Forks bind this source ID explicitly
+    before changing the envelope's owning session or message identity.
     """
 
     if isinstance(index, bool) or not isinstance(index, int) or index < 0:
         raise AttachmentManifestError("attachment index must be a non-negative integer")
     digest = hashlib.sha256(
-        f"{message_id}\0{index}\0{sha256 or ''}".encode()
+        f"{session_id}\0{message_id}\0{index}\0{sha256 or ''}".encode()
     ).digest()[:18]
     token = base64.urlsafe_b64encode(digest).decode("ascii").rstrip("=")
     return f"att_legacy_{token}"
@@ -418,11 +417,11 @@ def preserve_attachment_occurrence_ids(
     session_id: str,
     source_message_id: str,
 ) -> str | None:
-    """Bind legacy occurrence IDs before copying an envelope to a new message.
+    """Bind legacy occurrence IDs before copying an envelope to a fork.
 
-    Prefix forks intentionally allocate new message identities.  Persist the
-    source occurrence identity in the copied envelope so existing attachment
-    references remain valid independently of the copied message's new ID.
+    Every fork changes the owning session; prefix forks also allocate new
+    message identities. Persist the source occurrence identity in the copied
+    envelope so existing attachment references remain valid in the child.
     Only missing or invalid attachment IDs change; material and user text are
     retained, and an already bound envelope keeps its original serialization.
     """

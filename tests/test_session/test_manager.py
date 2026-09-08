@@ -19,6 +19,7 @@ from opensquilla.session.attachment_manifest import (
     ATTACHMENT_MANIFEST_STATE_KIND,
     attachment_manifest_from_context_state,
     build_attachment_manifest,
+    manifest_context_state,
 )
 from opensquilla.session.compaction import CompactionConfig, CompactionResult
 from opensquilla.session.context_view import (
@@ -2142,8 +2143,10 @@ async def test_full_fork_preserves_attachment_message_id_for_manifest_rebuild(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("archived", [False, True])
 async def test_full_fork_preserves_legacy_attachment_id_from_compacted_archive(
     manager,
+    archived: bool,
 ) -> None:
     parent = await manager.create("agent:main:legacy-attachment-fork-parent")
     image_content = json.dumps(
@@ -2173,12 +2176,14 @@ async def test_full_fork_preserves_legacy_attachment_id_from_compacted_archive(
     )
     [parent_occurrence] = parent_manifest.occurrences
 
-    assert await manager.persist_compaction_result(
-        parent.session_key,
-        f"legacy image attachment_id={parent_occurrence.attachment_id}",
-        [{"role": "user", "content": "active tail"}],
-        compaction_id="cmp-parent-legacy-attachment-fork",
-    )
+    await manager.save_context_state(manifest_context_state(parent_manifest))
+    if archived:
+        assert await manager.persist_compaction_result(
+            parent.session_key,
+            f"legacy image attachment_id={parent_occurrence.attachment_id}",
+            [{"role": "user", "content": "active tail"}],
+            compaction_id="cmp-parent-legacy-attachment-fork",
+        )
     child = await manager.branch(
         parent.session_key,
         "agent:main:legacy-attachment-fork-child",
@@ -2190,6 +2195,14 @@ async def test_full_fork_preserves_legacy_attachment_id_from_compacted_archive(
         entry for entry in child_canonical if entry.message_id == parent_image.message_id
     )
     assert child_image.message_id == parent_image.message_id
+    assert json.loads(child_image.content)["attachments"][0]["attachment_id"] == (
+        parent_occurrence.attachment_id
+    )
+    parent_canonical = await manager.get_canonical_transcript(parent.session_key)
+    unchanged_parent_image = next(
+        entry for entry in parent_canonical if entry.message_id == parent_image.message_id
+    )
+    assert unchanged_parent_image.content == image_content
     child_manifest = build_attachment_manifest(
         child_canonical,
         session_id=child.session_id,
