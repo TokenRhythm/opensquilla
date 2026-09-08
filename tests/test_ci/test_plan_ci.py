@@ -801,6 +801,7 @@ def test_windows_specific_platform_change_stays_on_windows(
         "desktop/electron/scripts/test-windows-update-handoff.mjs",
         "desktop/electron/scripts/test-windows-update-coordinator.mjs",
         "desktop/electron/scripts/test-windows-update-integration.mjs",
+        "desktop/electron/scripts/test-windows-update-refresh.mjs",
         "desktop/electron/scripts/test-windows-update-electron.mjs",
         "desktop/electron/scripts/fixtures/windows-update-electron/main.template.mjs",
     ],
@@ -824,8 +825,11 @@ def test_desktop_static_executes_windows_update_contracts() -> None:
     workflow = yaml.safe_load(Path(".github/workflows/ci.yml").read_text(encoding="utf-8"))
     job = workflow["jobs"]["desktop-check"]
     step = next(step for step in job["steps"] if step["name"] == "Run desktop unit tests")
-    for name in ("security", "cache", "handoff", "coordinator", "integration"):
+    package = json.loads(Path("desktop/electron/package.json").read_text(encoding="utf-8"))
+    commands = package["scripts"]["test:windows-update"].split(" && ")
+    for name in ("security", "cache", "handoff", "coordinator", "integration", "refresh"):
         assert f"node scripts/test-windows-update-{name}.mjs" in step["run"].splitlines()
+        assert f"node scripts/test-windows-update-{name}.mjs" in commands
 
 
 @pytest.mark.parametrize(

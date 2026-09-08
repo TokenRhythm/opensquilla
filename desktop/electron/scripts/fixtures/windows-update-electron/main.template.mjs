@@ -15,10 +15,11 @@ const { WindowsUpdateCoordinator, WindowsUpdatePreparationError } = await module
 const { WindowsUpdateSecurityError } = await moduleAt('windows-update-security.js')
 const { WindowsUpdateHandoffError, launchWindowsInstaller: realLaunchWindowsInstaller } = await moduleAt('windows-update-handoff.js')
 const { loadWindowsUpdateCache, saveWindowsUpdateCache, verifyCachedInstaller: realVerifyCachedInstaller } = await moduleAt('windows-update-cache.js')
-const { UpdateChannelError, updateAssetUrl } = await moduleAt('update-channel.js')
+const { UpdateChannelError, updateAssetUrl, candidateFromUpdateChannel } = await moduleAt('update-channel.js')
+const { UpdateCheckScheduler, isUpdateCheckAllowed } = await moduleAt('update-check-scheduler.js')
 const { isDesktopRendererDocumentUrl } = await moduleAt('desktop-renderer-protocol.js')
 
-const counts = { signatures: 0, registry: 0, stops: 0, launches: 0, resumes: 0 }
+const counts = { signatures: 0, registry: 0, stops: 0, launches: 0, resumes: 0, channels: 0 }
 let mode = { signature: 'ok', launch: 'missing', holdVerification: false, holdDrain: false }
 let releaseVerification = null
 let releaseDrain = null
@@ -59,6 +60,8 @@ let desktopUpdateSource = null
 let desktopUpdateFallbackUsed = false
 const lastSuccessfulUpdateSource = 'oss'
 const desktopLocale = 'en'
+const UPDATE_CHECK_REPEAT_DELAY_MS = 86_400_000
+let nativeUpdateReady = null
 
 // These are explicit test boundaries, not a production verifier bypass. Every
 // executable cache still uses the real canonical metadata, size and SHA checks.
@@ -79,7 +82,6 @@ const promptForMainWindowClose = () => { throw new Error('unexpected close promp
 const createApplicationMenu = () => {}
 const createWindowsTray = () => { windowsTray = {} }
 const destroyWindowsTray = () => { windowsTray = null }
-const desktopUpdateCheckScheduler = { stop: () => {} }
 const artifactPreviewLeaseBroker = { clear: () => {}, revokeAll: async () => {} }
 const nativeWorkbenchSurfaces = { destroyAll: async () => {} }
 const desktopArtifactBridgeLoopback = { close: async () => {} }
@@ -133,6 +135,21 @@ async function verifyCachedInstaller(directory, descriptor, currentVersion, opti
   })
 }
 async function assertUnambiguousWindowsInstallation() { counts.registry += 1 }
+async function fetchDesktopUpdateChannel() {
+  counts.channels += 1
+  // Only transport is supplied: resolveDesktopUpdate and the production
+  // channel validator still construct and compare the actual candidate.
+  return {
+    schemaVersion: 1, tag: 'v0.5.6', version: '0.5.6', baseVersion: '0.5.6', prerelease: false,
+    publishedAt: '2026-09-09T00:00:00Z',
+    releaseUrl: 'https://github.com/TokenRhythm/opensquilla/releases/tag/v0.5.6', sha256sums: 'SHA256SUMS',
+    platforms: {
+      'win32-x64': { feed: 'latest.yml', installer: 'OpenSquilla-0.5.6-win-x64.exe' },
+      'darwin-arm64': { feed: 'latest-mac.yml', installer: 'OpenSquilla-0.5.6-mac-arm64.dmg', archive: 'OpenSquilla-0.5.6-mac-arm64.zip' },
+    },
+  }
+}
+const chooseDesktopUpdateSource = async () => ({ source: 'oss', fallbackUsed: false })
 async function stopOwnedGatewaysForUpdate() {
   counts.stops += 1
   if (mode.holdDrain) await new Promise(resolve => { releaseDrain = resolve })
@@ -174,6 +191,8 @@ globalThis.windowsUpdateFixture = {
     counts, state: desktopUpdateSnapshot(), appExitPhase, updateApplying, updateInstallHandoffReady,
     quitRequestedDuringUpdateDrain, gatewayPids: liveLifecycleOwnedGatewayProcesses().map(child => child.pid),
     userData: app.getPath('userData'), home: process.env.HOME,
+    installFlagPresent: Object.hasOwn(process.env, 'OPENSQUILLA_DESKTOP_ENABLE_WIN_INSTALL'),
+    verifiedInstallerPath: verifiedManualInstallerPath, cacheDescriptor: windowsUpdateCacheDescriptor,
     runtime: { electron: process.versions.electron, node: process.versions.node, platform: process.platform, arch: process.arch },
     verificationHeld: releaseVerification !== null, drainHeld: releaseDrain !== null,
     visible: mainWindow?.isVisible(), destroyed: mainWindow?.isDestroyed(),

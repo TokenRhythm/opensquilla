@@ -89,7 +89,11 @@ export function useDesktopUpdatePresentation(
   })
 
   const title = computed(() => {
-    if (retryError.value) return t('updates.desktop.installErrorTitle')
+    if (retryError.value) {
+      const checkFailed = update.state.value.errorCode === 'source_unreachable'
+        || update.state.value.errorCode === 'manifest_invalid'
+      return t(checkFailed ? 'updates.desktop.errorTitle' : 'updates.desktop.installErrorTitle')
+    }
     if (status.value === 'applying') return t(manualInstall.value ? 'updates.desktop.manualApplyingStatus' : 'updates.desktop.applyingStatus')
     if (status.value === 'downloaded') {
       return manualInstall.value

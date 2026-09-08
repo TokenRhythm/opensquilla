@@ -7,7 +7,7 @@ import { dirname, join, relative, resolve } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { _electron as electron } from 'playwright'
 import ts from 'typescript'
-import { createWindowsUpdateCacheDescriptor, saveWindowsUpdateCache } from '../dist/windows-update-cache.js'
+import { createWindowsUpdateCacheDescriptor, loadWindowsUpdateCache, saveWindowsUpdateCache } from '../dist/windows-update-cache.js'
 import { environmentWithoutProviderSecrets, waitFor as waitForPackaged } from './packaged-smoke-helpers.mjs'
 import { closeElectronWithDeadline } from './e2e-shutdown-helpers.mjs'
 
@@ -43,10 +43,12 @@ const names = [
   'desktopUpdateSnapshot', 'publishDesktopUpdateState', 'setDesktopUpdateState',
   'restoreDownloadedUpdateRetryState', 'classifyDesktopUpdateError', 'desktopUpdateErrorMessage',
   'applyWindowsInstaller', 'applyDownloadedUpdate', 'handleMainWindowClose', 'trustedMainWindowControlIpc',
+  'desktopUpdateCheckAllowed', 'runDesktopUpdateCheck', 'checkForUpdates', 'showUpdateError',
+  'desktopUpdatePlatform', 'resolveDesktopUpdate',
 ]
 for (const name of names) assert.ok(functions.has(name), `production ${name} must exist`)
 const statements = []
-const wantedChannels = new Set(['desktop:update:managed', 'desktop:update:supported', 'desktop:update:state', 'desktop:update:relaunch'])
+const wantedChannels = new Set(['desktop:update:managed', 'desktop:update:supported', 'desktop:update:state', 'desktop:update:relaunch', 'desktop:update:check'])
 for (const node of parsed.statements) {
   if (!ts.isExpressionStatement(node) || !ts.isCallExpression(node.expression)) continue
   const call = node.expression
@@ -58,7 +60,10 @@ for (const node of parsed.statements) {
   }
 }
 assert.equal(statements.length, wantedChannels.size + 1, 'use all production update IPC handlers and the real quit callback')
-const extracted = ts.transpileModule([...names.map(name => functions.get(name)), ...statements].join('\n'), {
+const schedulerStatement = parsed.statements.find(statement => ts.isVariableStatement(statement)
+  && statement.declarationList.declarations.some(declaration => declaration.name.getText(parsed) === 'desktopUpdateCheckScheduler'))
+assert.ok(schedulerStatement, 'extract the actual production scheduler wiring')
+const extracted = ts.transpileModule([...names.map(name => functions.get(name)), schedulerStatement.getText(parsed), ...statements].join('\n'), {
   compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ESNext },
 }).outputText
 const template = await readFile(join(packageRoot, 'scripts/fixtures/windows-update-electron/main.template.mjs'), 'utf8')
@@ -99,7 +104,7 @@ await build({
   build: { outDir: rendererRoot, emptyOutDir: true, rollupOptions: { input: rendererHtml } },
 })
 
-async function launchCase(name) {
+async function launchCase(name, { installEnabled = true } = {}) {
   const userData = join(isolationRoot, name, 'userData')
   const home = join(isolationRoot, name, 'home')
   const logPath = join(outputRoot, `${name}.jsonl`)
@@ -114,12 +119,15 @@ async function launchCase(name) {
   await saveWindowsUpdateCache(directory, createWindowsUpdateCacheDescriptor(candidate, createHash('sha256').update(bytes).digest('hex'), bytes.length))
   const configPath = join(isolationRoot, `${name}.json`)
   await writeFile(configPath, JSON.stringify({ packageRoot, rendererRoot, logPath, isolationRoot, nodePath: process.execPath }))
+  const childEnv = { ...environmentWithoutProviderSecrets(process.env), HOME: home, USERPROFILE: home,
+    OPENSQUILLA_TEST_FIXTURE_CONFIG: configPath,
+    ELECTRON_DISABLE_SECURITY_WARNINGS: 'true', NO_PROXY: '127.0.0.1,localhost' }
+  if (installEnabled) childEnv.OPENSQUILLA_DESKTOP_ENABLE_WIN_INSTALL = '1'
+  else delete childEnv.OPENSQUILLA_DESKTOP_ENABLE_WIN_INSTALL
   runningApp = await electron.launch({
     ...(executablePath ? { executablePath: resolve(executablePath) } : {}),
     args: [`--user-data-dir=${userData}`, fixtureRoot],
-    env: { ...environmentWithoutProviderSecrets(process.env), HOME: home, USERPROFILE: home,
-      OPENSQUILLA_TEST_FIXTURE_CONFIG: configPath, OPENSQUILLA_DESKTOP_ENABLE_WIN_INSTALL: '1',
-      ELECTRON_DISABLE_SECURITY_WARNINGS: 'true', NO_PROXY: '127.0.0.1,localhost' },
+    env: childEnv,
     timeout: 30_000,
   })
   const app = runningApp
@@ -130,14 +138,43 @@ async function launchCase(name) {
   assert.equal(await realpath(initial.userData), await realpath(userData))
   assert.equal(resolve(initial.home), resolve(home))
   assert.equal(initial.state.status, 'downloaded')
-  assert.equal(initial.state.canInstall, true)
+  assert.equal(initial.state.canInstall, installEnabled)
+  assert.equal(initial.installFlagPresent, installEnabled)
   assert.equal(initial.gatewayPids.length, 1)
-  await page.locator('[data-testid="settings-update-relaunch"]').waitFor({ state: 'visible' })
-  return { app, page, snapshot, name, logPath,
+  await page.locator('[data-testid="settings-update-download"]').waitFor({ state: 'visible' })
+  await page.locator('[data-testid="settings-update-relaunch"]').waitFor({ state: installEnabled ? 'visible' : 'hidden' })
+  return { app, page, snapshot, name, logPath, directory,
     configure: patch => app.evaluate((_electron, patch) => globalThis.windowsUpdateFixture.configure(patch), patch),
     screenshot: label => page.screenshot({ path: join(outputRoot, `${name}-${label}.png`), fullPage: true }),
   }
 }
+
+  {
+    const f = await launchCase('cache-refresh-default-off', { installEnabled: false })
+    assert.ok(await loadWindowsUpdateCache(f.directory))
+    await f.screenshot('cached-b')
+    await f.page.getByRole('button', { name: 'Check', exact: true }).click()
+    await waitFor(async () => {
+      const current = await f.snapshot()
+      return current.state.status === 'available' && current.state.latestVersion === '0.5.6'
+    }, 'a newer controlled channel candidate through real Check IPC')
+    await f.page.locator('.settings-update__meta').getByText('0.5.6', { exact: false }).waitFor({ state: 'visible' })
+    const refreshed = await f.snapshot()
+    assert.equal(refreshed.state.canInstall, false)
+    assert.equal(refreshed.verifiedInstallerPath, null)
+    assert.equal(refreshed.cacheDescriptor, null)
+    assert.equal(await loadWindowsUpdateCache(f.directory), null)
+    assert.equal(refreshed.counts.channels, 1)
+    assert.equal(refreshed.counts.stops, 0)
+    assert.equal(refreshed.counts.launches, 0)
+    await f.page.locator('[data-testid="settings-update-relaunch"]').waitFor({ state: 'hidden' })
+    await f.screenshot('available-c')
+    const closed = f.app.waitForEvent('close', { timeout: 15_000 })
+    await f.app.evaluate(({ app }) => app.quit())
+    await closed
+    runningApp = null
+    results.push({ case: f.name, passed: true, canInstall: false, from: '0.5.5', to: '0.5.6' })
+  }
 
   {
     const f = await launchCase('signature-and-quit')
@@ -226,6 +263,7 @@ async function launchCase(name) {
     ok: true, status: 'passed', runId, sourceSha256: createHash('sha256').update(source).digest('hex'),
     sourceFiles: Object.fromEntries(await Promise.all([
       'desktop/electron/src/main.ts', 'desktop/electron/src/preload.cts',
+      'desktop/electron/src/update-channel.ts', 'desktop/electron/src/update-check-scheduler.ts',
       'desktop/electron/src/windows-update-cache.ts', 'desktop/electron/src/windows-update-coordinator.ts',
       'desktop/electron/src/windows-update-handoff.ts', 'desktop/electron/src/desktop-window-lifecycle.ts',
       'opensquilla-webui/src/components/DesktopUpdateIndicator.vue',
@@ -234,7 +272,7 @@ async function launchCase(name) {
       'opensquilla-webui/src/composables/useDesktopUpdatePresentation.ts',
     ].map(async name => [name, createHash('sha256').update(await readFile(resolve(packageRoot, '../..', name))).digest('hex')]))),
     evidence: 'Real Electron IPC, production preload, production Vue update components, AST-extracted production lifecycle functions',
-    limits: 'Signature/registry are test seams; Node fake Gateway and node.exe --updated only; no NSIS, signed-upgrade or full packaged-main claim.',
+    limits: 'Signature, registry, channel and asset-probe are test seams; Node fake Gateway and node.exe --updated only; no NSIS, signed-upgrade or full packaged-main claim.',
     results,
   }
   await writeFile(reportPath, `${JSON.stringify(report, null, 2)}\n`)

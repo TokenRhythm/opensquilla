@@ -851,6 +851,7 @@ jobs:
           node scripts/test-windows-update-handoff.mjs
           node scripts/test-windows-update-coordinator.mjs
           node scripts/test-windows-update-integration.mjs
+          node scripts/test-windows-update-refresh.mjs
           node scripts/test-desktop-locale.mjs
           node scripts/test-desktop-zoom-shortcuts.mjs --contracts-only
           node scripts/test-desktop-profile-substrate.mjs

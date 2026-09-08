@@ -132,6 +132,53 @@ describe('useDesktopUpdatePresentation', () => {
     host.remove()
   })
 
+  it.each([
+    ['source_unreachable', 'Update check failed'],
+    ['manifest_invalid', 'Update check failed'],
+    ['install_failed', 'Could not start installation'],
+    ['signature_unavailable', 'Could not start installation'],
+    ['signature_invalid', 'Could not start installation'],
+  ] as const)('keeps a cached installer actionable and titles %s by its failed operation', (errorCode, expectedTitle) => {
+    i18n.global.locale.value = 'en'
+    const state = ref<DesktopUpdateState>({
+      ...BASE_STATE,
+      status: 'downloaded',
+      installMode: 'manual',
+      canNativeInstall: false,
+      canInstall: true,
+      errorCode,
+    })
+    const source = {
+      state,
+      actionBusy: ref(false),
+      latestVersion: computed(() => '2.0.0'),
+      localizedError: computed(() => 'Safe localized recovery instruction'),
+    }
+    let presentation!: ReturnType<typeof useDesktopUpdatePresentation>
+    const host = document.createElement('div')
+    document.body.appendChild(host)
+    const app = createApp(defineComponent({
+      setup() {
+        presentation = useDesktopUpdatePresentation(source)
+        return () => h('div')
+      },
+    }))
+    app.use(i18n)
+    app.mount(host)
+
+    expect(presentation.retryError.value).toBe(true)
+    expect(presentation.title.value).toBe(expectedTitle)
+    expect(presentation.description.value).toBe('Safe localized recovery instruction')
+    expect(presentation.severity.value).toBe('danger')
+    expect(presentation.canInstall.value).toBe(true)
+    expect(presentation.canDownload.value).toBe(true)
+    expect(presentation.busy.value).toBe(false)
+    expect(state.value.canCheck).toBe(true)
+
+    app.unmount()
+    host.remove()
+  })
+
   it('recomputes localized presentation when the active locale changes', async () => {
     i18n.global.locale.value = 'en'
     const state = ref<DesktopUpdateState>({ ...BASE_STATE })

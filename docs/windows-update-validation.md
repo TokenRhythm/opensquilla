@@ -18,6 +18,7 @@ node scripts/test-windows-update-cache.mjs
 node scripts/test-windows-update-handoff.mjs
 node scripts/test-windows-update-coordinator.mjs
 node scripts/test-windows-update-integration.mjs
+node scripts/test-windows-update-refresh.mjs
 ```
 
 The ordinary `desktop-static` CI lane runs these deterministic contracts.
@@ -64,6 +65,15 @@ does not sign files, start installers, or use a verification bypass. A historica
 signed installer can validate these file checks; it cannot stand in for baseline
 A containing the new updater. Keep the report's source and artifact hashes with
 the UI screenshots when recording local results.
+
+Cached manual installers do not block update discovery. A check revalidates and
+reuses the cache when the channel still advertises the same candidate. A changed
+or withdrawn candidate clears the old ready path and persisted cache record;
+the installer bytes are not executed or deleted. If discovery fails, a cache
+that passes verification remains available, with a check error for an explicit
+request. Download, reveal, installation and lifecycle ownership still prevent
+concurrent candidate replacement. The refresh regression runs with the handoff
+switch absent so the default Windows manual path is covered too.
 
 ## Existing users: retain the manual upgrade gates
 

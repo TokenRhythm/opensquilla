@@ -11136,10 +11136,14 @@ async function downloadNativeDesktopUpdateWithFallback(): Promise<void> {
 }
 
 function desktopUpdateCheckAllowed(): boolean {
+  if (isQuitting || desktopWriters.closed) return false
   return isUpdateCheckAllowed({
     downloading: updateDownloadInProgress || windowsUpdateCacheRestore !== null || (manualInstallerActionInProgress && desktopUpdateCandidate !== null),
     applying: updateApplying,
-    downloaded: downloadedUpdateVersion !== null || desktopUpdateStatus === 'downloaded',
+    // A manual installer is a reusable cache, not a pending native update.
+    // Keep discovery available so a newer or withdrawn candidate can replace it.
+    downloaded: desktopUpdateInstallMode() !== 'manual'
+      && (downloadedUpdateVersion !== null || desktopUpdateStatus === 'downloaded'),
   })
 }
 
@@ -11193,6 +11197,7 @@ async function runDesktopUpdateCheck(): Promise<void> {
   }
 
   if (nativeAutoUpdateEnabled()) initAutoUpdater()
+  const manualInstall = desktopUpdateInstallMode() === 'manual'
   const failureFallback: DesktopUpdateFailureFallback = {
     state: desktopUpdateSnapshot(),
     candidate: desktopUpdateCandidate,
@@ -11206,7 +11211,51 @@ async function runDesktopUpdateCheck(): Promise<void> {
     errorCode: null,
   })
   try {
-    const resolved = await resolveDesktopUpdate()
+    let resolved: ResolvedDesktopUpdate | null
+    try {
+      resolved = await resolveDesktopUpdate()
+    } catch (err) {
+      if (isQuitting || updateApplying || desktopWriters.closed) return
+      // Discovery failure must not discard an already downloaded installer.
+      // Verify it again before restoring actions, including on manual checks.
+      if (manualInstall && failureFallback.state.status === 'downloaded' && failureFallback.candidate) {
+        const cached = await verifyCachedInstaller(
+          windowsUpdateDownloadDirectory(), windowsUpdateCacheDescriptor, app.getVersion(),
+          { expectedCandidate: failureFallback.candidate },
+        )
+        if (isQuitting || updateApplying || desktopWriters.closed) return
+        if (cached) {
+          publishVerifiedWindowsInstaller(cached,
+            failureFallback.state.source ?? lastSuccessfulUpdateSource ?? 'oss',
+            failureFallback.state.fallbackUsed)
+          if (desktopUpdateCheckScheduler.consumeManualRequest()) {
+            const errorCode = classifyDesktopUpdateError(err)
+            setDesktopUpdateState({ errorCode, error: desktopUpdateErrorMessage(errorCode) })
+          }
+          return
+        }
+        await clearWindowsUpdateCache()
+        throw new UpdateChannelError('integrity_failed', 'The cached Windows installer is no longer valid.')
+      }
+      throw err
+    }
+    if (isQuitting || updateApplying || desktopWriters.closed) return
+    if (manualInstall) {
+      // Only the currently advertised candidate may regain downloaded status.
+      // A changed/withdrawn candidate also invalidates persisted metadata, so a
+      // subsequent restart cannot silently restore the superseded installer.
+      const cached = resolved ? await verifyCachedInstaller(
+        windowsUpdateDownloadDirectory(), windowsUpdateCacheDescriptor, app.getVersion(),
+        { expectedCandidate: resolved.candidate },
+      ) : null
+      if (isQuitting || updateApplying || desktopWriters.closed) return
+      if (cached && resolved) {
+        publishVerifiedWindowsInstaller(cached, resolved.source, resolved.fallbackUsed)
+        return
+      }
+      await clearWindowsUpdateCache()
+      if (isQuitting || updateApplying || desktopWriters.closed) return
+    }
     if (!resolved) {
       desktopUpdateCandidate = null
       nativeUpdateReady = null
@@ -11224,7 +11273,6 @@ async function runDesktopUpdateCheck(): Promise<void> {
       })
       return
     }
-    const manualInstall = desktopUpdateInstallMode() === 'manual'
     if (manualInstall) {
       verifiedManualInstallerPath = null
       desktopUpdateCandidate = resolved.candidate
@@ -11243,8 +11291,17 @@ async function runDesktopUpdateCheck(): Promise<void> {
     }
     await checkNativeDesktopUpdate(resolved)
   } catch (err) {
+    if (isQuitting || updateApplying || desktopWriters.closed) return
     console.error('[updater] checkForUpdates failed', err)
-    showUpdateError(err, failureFallback)
+    if (manualInstall) {
+      verifiedManualInstallerPath = null
+      if (classifyDesktopUpdateError(err) === 'signature_invalid') {
+        await clearWindowsUpdateCache().catch(() => {})
+      }
+    }
+    if (isQuitting || updateApplying || desktopWriters.closed) return
+    // A failed cache verification must never restore the old ready state.
+    showUpdateError(err, manualInstall && failureFallback.state.status === 'downloaded' ? null : failureFallback)
   }
 }
 
