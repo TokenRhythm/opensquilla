@@ -110,7 +110,9 @@
         "desktop/electron/scripts/test-desktop-gateway-ownership.mjs",
         "desktop/electron/scripts/test-desktop-gateway-orphan-recovery-flow.mjs",
         "desktop/electron/scripts/test-desktop-window-background-flow.mjs",
-        "desktop/electron/scripts/test-desktop-theme-flow.mjs"
+        "desktop/electron/scripts/test-desktop-theme-flow.mjs",
+        "desktop/electron/scripts/test-windows-update-*.mjs",
+        "desktop/electron/src/windows-update-*.ts"
       ]
     },
     "workbench": {
@@ -301,6 +303,7 @@
         "scripts/install_source.*",
         "start.*",
         "tests/test_ci/test_upgrade_baselines.py",
+        "tests/test_ci/test_windows_signed_update_audit.py",
         "tests/test_ci/test_release_signing_preflight.py",
         "tests/test_ci/test_windows_signatures.py",
         "tests/test_packaging/**",

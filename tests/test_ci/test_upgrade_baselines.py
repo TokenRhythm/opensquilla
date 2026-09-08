@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shutil
@@ -308,6 +309,7 @@ def rehearsal_driver(tmp_path: Path) -> tuple[str, Path]:
     shutil.copyfile(DRIVER, driver)
     (tmp_path / "packaged-smoke-helpers.mjs").write_text(
         """
+import { EventEmitter } from 'node:events'
 export function requiredOption(name) {
   const index = process.argv.indexOf(name)
   if (index < 0 || !process.argv[index + 1]) throw new Error(`Missing ${name}`)
@@ -318,10 +320,29 @@ export async function waitFor(check) {
 }
 export async function launchPackagedCandidate({ env }) {
   console.log('SYNTHETIC_DESKTOP_LAUNCHED')
+  const signed = process.env.SYNTHETIC_UPDATE_MODE === 'signed-handoff'
+  if (signed && (env.OPENSQUILLA_DESKTOP_ENABLE_WIN_INSTALL !== '1'
+      || env.OPENSQUILLA_DESKTOP_ENABLE_WIN_UPDATE !== '0'
+      || env.OPENSQUILLA_DESKTOP_MOCK_UPDATE_VERSION !== '')) {
+    throw new Error('signed handoff must use the production installation path')
+  }
   let checks = 0
   const version = process.env.SYNTHETIC_BASELINE_VERSION
-  return {
-    firstWindow: async () => ({ evaluate: async (callback) => {
+  const app = new EventEmitter()
+  return Object.assign(app, {
+    firstWindow: async () => ({
+      locator: (selector) => ({
+        waitFor: async () => {},
+        isEnabled: async () => true,
+        click: async () => {
+          console.log(`SYNTHETIC_UI_CLICK:${selector}`)
+          if (selector.includes('desktop-update-relaunch')) {
+            console.log('SYNTHETIC_RELAUNCH_REQUESTED')
+            queueMicrotask(() => app.emit('close'))
+          }
+        },
+      }),
+      evaluate: async (callback) => {
       const body = callback.toString()
       if (body.includes('typeof window')) return true
       if (body.includes('getUpdateState')) return { currentVersion: version }
@@ -335,15 +356,29 @@ export async function launchPackagedCandidate({ env }) {
         const manifest = await response.json()
         return {
           status: 'available', latestVersion: manifest.version,
-          source: 'oss', installMode: 'native',
+          source: 'oss', installMode: signed ? 'manual' : 'native',
         }
       }
-      if (body.includes('downloadUpdate')) throw new Error(`DOWNLOAD_REACHED:${version}`)
+      if (body.includes('downloadUpdate')) {
+        if (process.env.SYNTHETIC_COMPLETE_SIGNED !== '1') {
+          throw new Error(`DOWNLOAD_REACHED:${version}`)
+        }
+        return {
+          status: 'downloaded', latestVersion: process.env.SYNTHETIC_CANDIDATE_VERSION,
+          source: 'oss', installMode: 'manual', progress: 100,
+          canInstall: process.env.SYNTHETIC_CAN_INSTALL === '1',
+        }
+      }
+      if (body.includes('relaunchToUpdate')) {
+        console.log('SYNTHETIC_RELAUNCH_REQUESTED')
+        queueMicrotask(() => app.emit('close'))
+        return true
+      }
       throw new Error(`unexpected desktop call: ${body}`)
     } }),
-    process: () => ({ killed: false }),
+    process: () => ({ killed: false, pid: 12345 }),
     close: async () => {},
-  }
+  })
 }
 """,
         encoding="utf-8",
@@ -357,12 +392,24 @@ def _run_rehearsal_driver(
     baseline: str | None,
     installed: str,
     candidate: str = "0.5.5",
+    mode: str = "native",
+    source_sha: str | None = "a" * 40,
+    expected_sha: str | None = hashlib.sha256(b"candidate artifact").hexdigest(),
+    cached_bytes: bytes = b"candidate artifact",
+    complete_signed: bool = False,
+    can_install: bool = True,
 ) -> subprocess.CompletedProcess[str]:
     node, driver = rehearsal_driver
     manifest = driver.parent / "channel.json"
     manifest.write_text(
         json.dumps(
-            {"schemaVersion": 1, "version": candidate, "tag": f"v{candidate}", "prerelease": False}
+            {
+                "schemaVersion": 1,
+                "version": candidate,
+                "tag": f"v{candidate}",
+                "prerelease": False,
+                "platforms": {"win32-x64": {"installer": f"OpenSquilla-{candidate}-win-x64.exe"}},
+            }
         ),
         encoding="utf-8",
     )
@@ -378,13 +425,29 @@ def _run_rehearsal_driver(
         "--expected-version",
         candidate,
         "--mode",
-        "native",
+        mode,
     ]
     if baseline is not None:
         arguments.extend(["--baseline-version", baseline])
+    if mode == "signed-handoff":
+        arguments.extend(["--ready-output", str(driver.parent / "handoff.json")])
+        if source_sha is not None:
+            arguments.extend(["--source-sha", source_sha])
+        if expected_sha is not None:
+            arguments.extend(["--expected-sha256", expected_sha])
+        cache = driver.parent / "user-data" / "update-downloads"
+        cache.mkdir(parents=True, exist_ok=True)
+        (cache / f"OpenSquilla-{candidate}-win-x64.exe").write_bytes(cached_bytes)
     return subprocess.run(
         arguments,
-        env={**os.environ, "SYNTHETIC_BASELINE_VERSION": installed},
+        env={
+            **os.environ,
+            "SYNTHETIC_BASELINE_VERSION": installed,
+            "SYNTHETIC_CANDIDATE_VERSION": candidate,
+            "SYNTHETIC_UPDATE_MODE": mode,
+            "SYNTHETIC_COMPLETE_SIGNED": "1" if complete_signed else "0",
+            "SYNTHETIC_CAN_INSTALL": "1" if can_install else "0",
+        },
         capture_output=True,
         text=True,
         check=False,
@@ -429,6 +492,86 @@ def test_rehearsal_driver_rejects_invalid_versions_before_launch(
     assert result.returncode != 0
     assert message in result.stderr
     assert "SYNTHETIC_DESKTOP_LAUNCHED" not in result.stdout
+
+
+@pytest.mark.parametrize("baseline", [None, "0.5.3", "0.5.4", "0.5.5rc1"])
+def test_signed_handoff_rejects_missing_or_legacy_baseline_before_launch(
+    rehearsal_driver: tuple[str, Path], baseline: str | None
+) -> None:
+    result = _run_rehearsal_driver(
+        rehearsal_driver,
+        baseline=baseline,
+        installed=baseline or "0.5.3",
+        candidate="0.5.6",
+        mode="signed-handoff",
+    )
+    assert result.returncode != 0
+    assert "signed-handoff requires" in result.stderr
+    assert "SYNTHETIC_DESKTOP_LAUNCHED" not in result.stdout
+
+
+@pytest.mark.parametrize("missing", ["source_sha", "expected_sha"])
+def test_signed_handoff_requires_pinned_artifact_before_launch(
+    rehearsal_driver: tuple[str, Path], missing: str
+) -> None:
+    result = _run_rehearsal_driver(
+        rehearsal_driver,
+        baseline="0.5.5",
+        installed="0.5.5",
+        candidate="0.5.6",
+        mode="signed-handoff",
+        **{missing: None},
+    )
+    assert result.returncode != 0
+    assert "signed-handoff requires --ready-output" in result.stderr
+    assert "SYNTHETIC_DESKTOP_LAUNCHED" not in result.stdout
+
+
+@pytest.mark.parametrize("fault", ["capability-denied", "cache-replaced"])
+def test_signed_handoff_rejects_unverified_or_changed_candidate(
+    rehearsal_driver: tuple[str, Path], fault: str
+) -> None:
+    result = _run_rehearsal_driver(
+        rehearsal_driver,
+        baseline="0.5.5",
+        installed="0.5.5",
+        candidate="0.5.6",
+        mode="signed-handoff",
+        complete_signed=True,
+        can_install=fault != "capability-denied",
+        cached_bytes=b"tampered" if fault == "cache-replaced" else b"candidate artifact",
+    )
+    assert result.returncode != 0
+    assert "SYNTHETIC_RELAUNCH_REQUESTED" not in result.stdout
+    assert not (rehearsal_driver[1].parent / "handoff.json").exists()
+
+
+def test_signed_handoff_records_only_handoff_until_outer_audit_verifies_install(
+    rehearsal_driver: tuple[str, Path],
+) -> None:
+    result = _run_rehearsal_driver(
+        rehearsal_driver,
+        baseline="0.5.5",
+        installed="0.5.5",
+        candidate="0.5.6",
+        mode="signed-handoff",
+        complete_signed=True,
+    )
+    assert result.returncode == 0, result.stderr
+    output = json.loads((rehearsal_driver[1].parent / "handoff.json").read_text(encoding="utf-8"))
+    assert output["ok"] is False
+    assert output["stage"] == "installer-handoff"
+    assert output["handoffObserved"] is True
+    assert output["requiresPostInstallVerification"] is True
+    assert output["installMode"] == "manual"
+    assert output["mode"] == "signed-handoff"
+    assert output["canInstall"] is True
+    assert output["fromVersion"] == "0.5.5"
+    assert output["toVersion"] == "0.5.6"
+    assert output["sha256"] == hashlib.sha256(b"candidate artifact").hexdigest()
+    assert output["sourceSha"] == "a" * 40
+    assert 'SYNTHETIC_UI_CLICK:[data-testid="desktop-update-indicator"]' in result.stdout
+    assert 'SYNTHETIC_UI_CLICK:[data-testid="desktop-update-relaunch"]' in result.stdout
 
 
 @pytest.fixture

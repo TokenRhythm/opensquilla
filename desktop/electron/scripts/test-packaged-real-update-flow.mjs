@@ -18,13 +18,24 @@ const userDataDir = resolve(requiredOption('--user-data-dir'))
 const manifestPath = resolve(requiredOption('--channel-manifest'))
 const expectedVersion = requiredOption('--expected-version')
 const mode = requiredOption('--mode')
+if (!['native', 'manual', 'signed-handoff'].includes(mode)) {
+  throw new Error(`--mode must be native, manual, or signed-handoff, received ${mode}`)
+}
+const signedHandoff = mode === 'signed-handoff'
+const stableVersion = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/
+if (signedHandoff && !process.argv.includes('--baseline-version')) {
+  throw new Error('signed-handoff requires an explicit --baseline-version with the new installer capability')
+}
 const baselineVersion = process.argv.includes('--baseline-version')
   ? requiredOption('--baseline-version')
   : '0.5.3'
-if (!['0.5.3', '0.5.4'].includes(baselineVersion)) {
+if (signedHandoff && (!stableVersion.test(baselineVersion) || ['0.5.3', '0.5.4'].includes(baselineVersion))) {
+  throw new Error('signed-handoff requires a canonical stable baseline containing the new installer capability; 0.5.3/0.5.4 use manual mode')
+}
+if (!signedHandoff && !['0.5.3', '0.5.4'].includes(baselineVersion)) {
   throw new Error('--baseline-version must be 0.5.3 or 0.5.4')
 }
-if (!/^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/.test(expectedVersion)) {
+if (!stableVersion.test(expectedVersion)) {
   throw new Error('--expected-version must be a canonical stable version')
 }
 const baselineParts = baselineVersion.split('.').map(Number)
@@ -42,14 +53,18 @@ const expectedShaIndex = process.argv.indexOf('--expected-sha256')
 const expectedSha256 = expectedShaIndex >= 0
   ? String(process.argv[expectedShaIndex + 1]).trim().toLowerCase()
   : null
+const sourceSha = process.argv.includes('--source-sha') ? requiredOption('--source-sha') : null
 
-if (!['native', 'manual'].includes(mode)) {
-  throw new Error(`--mode must be native or manual, received ${mode}`)
-}
 if (mode === 'manual' && (!readyOutput || (!installDir && !defaultInstall) || !expectedSha256)) {
   throw new Error(
     'manual mode requires --ready-output, --expected-sha256, and one installation mode',
   )
+}
+if (signedHandoff && (!readyOutput || !expectedSha256 || !/^[0-9a-f]{40}$/.test(sourceSha || ''))) {
+  throw new Error('signed-handoff requires --ready-output, --expected-sha256, and a full lowercase --source-sha from the candidate build')
+}
+if (signedHandoff && (installDir || defaultInstall)) {
+  throw new Error('signed-handoff uses the installed baseline directory; --install-dir/--default-install are manual-mode options')
 }
 if (installDir && defaultInstall) {
   throw new Error('--install-dir and --default-install are mutually exclusive')
@@ -97,6 +112,7 @@ try {
     executablePath,
     userDataDir,
     model: 'opensquilla-real-updater-rehearsal',
+    scrubProviderSecrets: true,
     env: {
       GITHUB_ACTIONS: '0',
       OPENSQUILLA_DESKTOP_DISABLE_AUTO_UPDATE: '0',
@@ -104,6 +120,12 @@ try {
       OPENSQUILLA_DESKTOP_UPDATE_SOURCE: 'oss',
       OPENSQUILLA_RECOVERY_OFFLINE: '1',
       OPENSQUILLA_TESTING: '0',
+      // Exercise the production signed installer path. Neither the legacy
+      // native Windows opt-in nor the mock updater may replace its verifier.
+      OPENSQUILLA_DESKTOP_ENABLE_WIN_INSTALL: signedHandoff ? '1' : '0',
+      OPENSQUILLA_DESKTOP_ENABLE_WIN_UPDATE: '0',
+      OPENSQUILLA_DESKTOP_MOCK_UPDATE_VERSION: '',
+      OPENSQUILLA_DESKTOP_MOCK_UPDATE_DIALOG_RESPONSES: '',
     },
   })
   const page = await app.firstWindow({ timeout: 60_000 })
@@ -127,7 +149,7 @@ try {
   assert.equal(available.status, 'available', JSON.stringify(available))
   assert.equal(available.latestVersion, expectedVersion)
   assert.equal(available.source, 'oss')
-  assert.equal(available.installMode, mode)
+  assert.equal(available.installMode, signedHandoff ? 'manual' : mode)
   assert.ok(
     channelRequests >= 2 && channelRequests <= 4,
     `official update discovery made an unexpected number of requests: ${channelRequests}`,
@@ -138,6 +160,10 @@ try {
   assert.equal(downloaded.latestVersion, expectedVersion)
   assert.equal(downloaded.progress, 100)
   assert.equal(downloaded.source, 'oss')
+  if (signedHandoff) {
+    assert.equal(downloaded.installMode, 'manual')
+    assert.equal(downloaded.canInstall, true, 'the signed candidate must pass the production installation gate')
+  }
 
   const result = {
     ok: true,
@@ -232,6 +258,49 @@ try {
     handedOff = appClosed
     if (!appClosed) await app.close()
     app = null
+  } else if (signedHandoff) {
+    const installerName = manifest.platforms['win32-x64'].installer
+    assert.equal(installerName, `OpenSquilla-${expectedVersion}-win-x64.exe`)
+    const installer = resolve(userDataDir, 'update-downloads', installerName)
+    const actualSha256 = createHash('sha256').update(await readFile(installer)).digest('hex')
+    assert.equal(actualSha256, expectedSha256, 'verified cache does not match the signed candidate artifact')
+    const handoffStartedAt = new Date().toISOString()
+    const closed = once(app, 'close')
+    const indicator = page.locator('[data-testid="desktop-update-indicator"]')
+    await indicator.waitFor({ state: 'visible', timeout: 30_000 })
+    await indicator.click()
+    const install = page.locator('[data-testid="desktop-update-relaunch"]')
+    await install.waitFor({ state: 'visible', timeout: 30_000 })
+    assert.equal(await install.isEnabled(), true, 'the signed installer action must be available in the real UI')
+    await install.click()
+    await Promise.race([
+      closed,
+      delay(180_000, undefined, { ref: false }).then(() => {
+        throw new Error(`signed v${baselineVersion} did not hand off to its verified installer`)
+      }),
+    ])
+    handedOff = true
+    app = null
+    // Process exit is a handoff observation, not proof that NSIS installed B.
+    // The outer packaged audit must check B's PE version, signatures, startup,
+    // Gateway and profile before treating this rehearsal as successful.
+    const handoffResult = {
+      ...result,
+      ok: false,
+      stage: 'installer-handoff',
+      requiresPostInstallVerification: true,
+      handoffObserved: true,
+      mode,
+      canInstall: true,
+      sourceSha,
+      downloadedInstaller: installer,
+      sha256: actualSha256,
+      handoffStartedAt,
+      oldProcessClosedAt: new Date().toISOString(),
+      desktopLog: resolve(userDataDir, 'logs', 'desktop.log'),
+    }
+    await writeFile(readyOutput, `${JSON.stringify(handoffResult, null, 2)}\n`, { mode: 0o600 })
+    console.log(JSON.stringify(handoffResult))
   } else {
     assert.equal(downloaded.installMode, 'native')
     const closed = once(app, 'close')

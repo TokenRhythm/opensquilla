@@ -846,6 +846,11 @@ jobs:
           node scripts/test-secret-storage-policy.mjs
           node scripts/test-update-resolver.mjs
           node scripts/test-update-check-scheduler.mjs
+          node scripts/test-windows-update-security.mjs
+          node scripts/test-windows-update-cache.mjs
+          node scripts/test-windows-update-handoff.mjs
+          node scripts/test-windows-update-coordinator.mjs
+          node scripts/test-windows-update-integration.mjs
           node scripts/test-desktop-locale.mjs
           node scripts/test-desktop-zoom-shortcuts.mjs --contracts-only
           node scripts/test-desktop-profile-substrate.mjs
@@ -1801,6 +1806,19 @@ jobs:
               ;;
           esac
 
+          # The Linux static lane covers the deterministic update contracts.
+          # These two scripts additionally exercise real Windows verification
+          # and registry boundaries when run on the owning platform.
+          if [[ "${RUNNER_OS}" == "Windows" &&
+                ( "${{ matrix.shard }}" == 'ownership' ||
+                  "${{ matrix.shard }}" == 'ownership-workbench' ||
+                  "${{ matrix.shard }}" == 'all' ) ]]; then
+            entries+=(
+              'windows-update-security:scripts/test-windows-update-security.mjs'
+              'windows-update-handoff:scripts/test-windows-update-handoff.mjs'
+            )
+          fi
+
           for entry in "${entries[@]}"
           do
             name="${entry%%:*}"
@@ -1963,6 +1981,7 @@ jobs:
           command -v pwsh
           uv run pytest \
             tests/test_ci/test_upgrade_baselines.py \
+            tests/test_ci/test_windows_signed_update_audit.py \
             tests/test_ci/test_release_signing_preflight.py \
             tests/test_ci/test_windows_signatures.py \
             tests/test_scripts/test_build_wheelhouse_zip.py \

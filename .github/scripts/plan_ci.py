@@ -264,7 +264,11 @@ _NONCRITICAL_CI_SCRIPT_TARGETS: Final[dict[str, tuple[str, ...]]] = {
     ),
     ".github/scripts/verify-release-windows-upgrade.ps1": (
         "tests/test_ci/test_upgrade_baselines.py",
+        "tests/test_ci/test_windows_signed_update_audit.py",
         "tests/test_release_consistency.py",
+    ),
+    ".github/scripts/verify-release-windows-signed-update.ps1": (
+        "tests/test_ci/test_windows_signed_update_audit.py",
     ),
     ".github/scripts/verify_desktop_slim_size.py": (
         "tests/test_scripts/test_verify_desktop_slim_size.py",
@@ -752,7 +756,9 @@ def _os_scope(path: str) -> set[str]:
     scopes: set[str] = set()
     if path.endswith(".ps1") or any(
         token in lowered
-        for token in ("/windows/", "_windows", "windows_", "/win32/", "-windows")
+        for token in (
+            "/windows/", "/windows-", "_windows", "windows_", "/win32/", "-windows"
+        )
     ):
         scopes.add("windows-latest")
     if any(

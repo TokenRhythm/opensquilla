@@ -789,6 +789,99 @@ def test_windows_specific_platform_change_stays_on_windows(
     assert "windows_specific_changed" in plan["reason_codes"]
 
 
+@pytest.mark.parametrize(
+    "path",
+    [
+        "desktop/electron/src/windows-update-security.ts",
+        "desktop/electron/src/windows-update-cache.ts",
+        "desktop/electron/src/windows-update-handoff.ts",
+        "desktop/electron/src/windows-update-coordinator.ts",
+        "desktop/electron/scripts/test-windows-update-security.mjs",
+        "desktop/electron/scripts/test-windows-update-cache.mjs",
+        "desktop/electron/scripts/test-windows-update-handoff.mjs",
+        "desktop/electron/scripts/test-windows-update-coordinator.mjs",
+        "desktop/electron/scripts/test-windows-update-integration.mjs",
+    ],
+)
+def test_windows_update_changes_select_static_and_windows_ownership(
+    tmp_path: Path, suite_config: dict[str, Any], path: str
+) -> None:
+    plan = _plan(tmp_path, suite_config, path)
+
+    assert plan["full_fallback"] is False
+    assert _matrix(plan) == {("windows-latest", "ownership")}
+    assert {"desktop-static", "desktop-recovery-e2e", "windows-high-risk"}.issubset(
+        plan["required_suites"]
+    )
+    assert "macos-recovery" not in plan["required_suites"]
+
+
+def test_desktop_static_executes_windows_update_contracts() -> None:
+    import yaml
+
+    workflow = yaml.safe_load(Path(".github/workflows/ci.yml").read_text(encoding="utf-8"))
+    job = workflow["jobs"]["desktop-check"]
+    step = next(step for step in job["steps"] if step["name"] == "Run desktop unit tests")
+    for name in ("security", "cache", "handoff", "coordinator", "integration"):
+        assert f"node scripts/test-windows-update-{name}.mjs" in step["run"].splitlines()
+
+
+@pytest.mark.parametrize(
+    ("runner_os", "shard", "expected"),
+    [
+        ("Windows", "ownership", True),
+        ("Windows", "all", True),
+        ("Windows", "profiles", False),
+        ("Windows", "workbench", False),
+        ("Linux", "ownership", False),
+    ],
+)
+def test_windows_update_native_checks_stay_in_ownership_cells(
+    runner_os: str, shard: str, expected: bool
+) -> None:
+    import shutil
+
+    import yaml
+
+    bash = shutil.which("bash")
+    if not bash:
+        pytest.skip("Bash is required to verify the workflow case selection")
+    workflow = yaml.safe_load(Path(".github/workflows/ci.yml").read_text(encoding="utf-8"))
+    job = workflow["jobs"]["desktop-recovery-e2e"]
+    step = next(
+        step for step in job["steps"] if step["name"] == "Run compiled Desktop recovery flows"
+    )
+    dispatch = (
+        step["run"]
+        .split("# The Linux static lane covers", 1)[1]
+        .split('for entry in "${entries[@]}"', 1)[0]
+    )
+    # Execute only the shell's selection block, never the workflow tests.
+    dispatch = dispatch[dispatch.index('if [[ "${RUNNER_OS}"') :].replace(
+        "${{ matrix.shard }}", shard
+    )
+    selection = (
+        f"RUNNER_OS='{runner_os}'\nentries=()\n{dispatch}\nprintf '%s\\n' \"${{entries[@]}}\"\n"
+    )
+    result = subprocess.run(
+        [bash, "-s"],
+        # Binary stdin preserves LF when the Python host is Windows.
+        input=selection.encode("utf-8"),
+        capture_output=True,
+        check=True,
+        timeout=15,
+    )
+    entries = result.stdout.decode("utf-8").strip().splitlines()
+    assert entries == (
+        [
+            "windows-update-security:scripts/test-windows-update-security.mjs",
+            "windows-update-handoff:scripts/test-windows-update-handoff.mjs",
+        ]
+        if expected
+        else []
+    )
+
+
 def test_toolchain_and_packaging_changes_select_dedicated_suites(
     tmp_path: Path, suite_config: dict[str, Any]
 ) -> None:
@@ -1266,6 +1359,8 @@ def test_upgrade_source_only_changes_select_baseline_contract(
     expected = [existing_target, "tests/test_ci/test_upgrade_baselines.py"]
     if path == ".github/workflows/wheelhouse-release.yml":
         expected.append("tests/test_ci/test_release_signing_preflight.py")
+    if path == ".github/scripts/verify-release-windows-upgrade.ps1":
+        expected.append("tests/test_ci/test_windows_signed_update_audit.py")
     assert plan["python_targets"] == sorted(expected)
     assert "python-targeted" in plan["required_suites"]
     assert plan["full_fallback"] is False
@@ -1279,6 +1374,8 @@ def test_upgrade_source_only_changes_select_baseline_contract(
         ".github/workflows/wheelhouse-release.yml",
         "desktop/electron/scripts/test-packaged-real-update-flow.mjs",
         "tests/test_ci/test_upgrade_baselines.py",
+        "tests/test_ci/test_windows_signed_update_audit.py",
+        ".github/scripts/verify-release-windows-signed-update.ps1",
     ],
 )
 def test_upgrade_contract_inputs_change_release_packaging_digest(
@@ -1311,6 +1408,7 @@ def test_release_packaging_executes_upgrade_baseline_contract() -> None:
     assert "command -v node" in step["run"]
     assert "command -v pwsh" in step["run"]
     assert "tests/test_ci/test_upgrade_baselines.py" in step["run"].split()
+    assert "tests/test_ci/test_windows_signed_update_audit.py" in step["run"].split()
     assert "tests/test_ci/test_release_signing_preflight.py" in step["run"].split()
     assert "tests/test_ci/test_windows_signatures.py" in step["run"].split()
 
@@ -1325,6 +1423,10 @@ def test_release_packaging_executes_upgrade_baseline_contract() -> None:
         (
             ".github/scripts/verify-windows-signatures.ps1",
             "tests/test_ci/test_windows_signatures.py",
+        ),
+        (
+            ".github/scripts/verify-release-windows-signed-update.ps1",
+            "tests/test_ci/test_windows_signed_update_audit.py",
         ),
     ],
 )
