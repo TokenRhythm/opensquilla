@@ -1115,3 +1115,62 @@ def test_workspace_budget_degrades_materialization_to_marker(tmp_path: Path) -> 
     assert "workspace attachment budget exceeded" in wrapped.text
     files = list((workspace / ".opensquilla" / "attachments").rglob("*-blob.bin"))
     assert files == []
+
+
+@pytest.mark.parametrize("temporary_root", [True, False])
+@pytest.mark.parametrize("mime", ["image/png", "image/tiff"])
+def test_unpersisted_current_images_do_not_create_permanent_workspace_copies(
+    tmp_path: Path, temporary_root: bool, mime: str,
+) -> None:
+    workspace = tmp_path / "workspace"
+    scratch = tmp_path / "scratch"
+    out = TurnRunner._build_attachment_messages(
+        "Compare attachments", [
+            {"type": mime, "data": _b64(b"image-bytes"), "name": "image.png"},
+            {"type": "text/plain", "data": _b64(b"text content"), "name": "note.txt"},
+        ], workspace_dir=workspace, session_id="session-a", persist_image_material=False,
+        image_workspace_dir=scratch if temporary_root else None,
+    )
+    assert out is not None
+    images = [block for block in out[0].content if isinstance(block, ContentBlockImage)]
+    if mime == "image/png":
+        assert images[0].data == _b64(b"image-bytes")
+    else:
+        assert not images
+    assert not list(workspace.rglob("*.png"))
+    assert next(workspace.rglob("*.txt")).read_bytes() == b"text content"
+    if temporary_root:
+        image_path = next(scratch.rglob("*.png"))
+        assert image_path.read_bytes() == b"image-bytes"
+        assert str(image_path) in str(out)
+    else:
+        assert not scratch.exists()
+
+
+@pytest.mark.parametrize("preserve_image", [True, False])
+def test_disabling_persistence_does_not_copy_or_remove_existing_history_images(
+    tmp_path: Path, preserve_image: bool,
+) -> None:
+    from opensquilla.attachment_refs import write_transcript_material
+
+    media_root = tmp_path / "media"
+    workspace = tmp_path / "workspace"
+    sha, material_path, _ = write_transcript_material(
+        media_root=media_root, session_id="session-a", payload=b"old image",
+    )
+    envelope = json.dumps({"text": "old message", "attachments": [
+        {"type": "image/png", "name": "old.png", "size": 9, "sha256_ref": sha},
+        {"type": "text/plain", "name": "note.txt", "data": _b64(b"old text")},
+    ]})
+    out = TurnRunner._maybe_unpack_attachments(
+        envelope, preserve_image_attachments=preserve_image,
+        materialize_historical_attachments=True, media_root=media_root,
+        workspace_dir=workspace, session_id="session-a", persist_image_material=False,
+    )
+    assert not list(workspace.rglob("*.png"))
+    assert material_path.read_bytes() == b"old image"
+    assert next(workspace.rglob("*.txt")).read_bytes() == b"old text"
+    if preserve_image:
+        assert any(isinstance(block, ContentBlockImage) for block in out)
+    else:
+        assert "historical attachment omitted: old.png" in out

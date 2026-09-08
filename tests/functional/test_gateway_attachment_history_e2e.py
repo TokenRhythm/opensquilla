@@ -10,7 +10,9 @@ from __future__ import annotations
 import asyncio
 import base64
 import hashlib
+import io
 import json
+import re
 import uuid
 from collections.abc import AsyncIterator
 from pathlib import Path
@@ -614,6 +616,187 @@ async def test_runner_image_marker_matches_persisted_attachment_retention(
         assert "历史图片不可用" in str(followup_messages)
         assert "重新上传" in str(followup_messages)
         assert "原图已保留" not in str(followup_messages)
+
+
+@pytest.mark.asyncio
+async def test_gateway_unpersisted_upload_is_tool_readable_only_during_turn(
+    _e2e_stack: dict[str, Any],
+) -> None:
+    from PIL import Image
+
+    from opensquilla.provider.types import ToolUseEndEvent, ToolUseStartEvent
+    from opensquilla.tools.builtin import media
+    from opensquilla.tools.registry import ToolRegistry, get_default_registry
+    from opensquilla.tools.types import current_tool_context
+
+    config = _e2e_stack["config"]
+    config.squilla_router.enabled = False
+    config.attachments.persist_transcripts = False
+    runner = _e2e_stack["runner"]
+    registry = ToolRegistry()
+    registered = get_default_registry().get("image")
+    assert registered is not None
+    tool_results = []
+    paths: list[Path] = []
+
+    async def inspect_image(**arguments):
+        context = current_tool_context.get()
+        path = Path(arguments["path"])
+        assert context is not None and context.scratch_dir
+        assert path.is_relative_to(Path(context.scratch_dir))
+        assert path.is_file()
+        result = await media.image(**arguments)
+        tool_results.append(json.loads(result))
+        return result
+
+    registry.register(registered.spec, inspect_image)
+    runner._tool_registry = registry
+    provider = _e2e_stack["text_provider"]
+
+    async def chat(messages, tools=None, config=None):
+        provider.calls.append({"messages": messages, "tools": tools, "config": config})
+        if len(provider.calls) == 1:
+            assert any(tool.name == "image" for tool in tools)
+            markers = [
+                block.text for message in messages if isinstance(message.content, list)
+                for block in message.content if isinstance(block, ContentBlockText)
+                and "[attachment available:" in block.text
+            ]
+            match = re.search(r" at ([^\]]+)\]", "\n".join(markers))
+            assert match is not None
+            path = Path(match.group(1))
+            paths.append(path)
+            assert path.read_bytes() == payload
+            yield ToolUseStartEvent(tool_use_id="inspect", tool_name="image")
+            yield ToolUseEndEvent(tool_use_id="inspect", tool_name="image", arguments={
+                "path": str(path), "prompt": "Inspect the uploaded image",
+            })
+            yield DoneEvent(stop_reason="tool_use")
+        else:
+            assert paths[0].is_file()
+            yield TextDeltaEvent(text="Image is not analyzed")
+            yield DoneEvent(stop_reason="end_turn")
+
+    provider.chat = chat
+    manager = _e2e_stack["manager"]
+    key = "agent:main:temporary-upload"
+    session = await manager.create(session_key=key, agent_id="main")
+    sink = _e2e_stack["sink"]
+    _e2e_stack["subscription_manager"].subscribe_messages(sink.conn_id, key)
+    buffer = io.BytesIO()
+    Image.new("RGB", (2, 2), "blue").save(buffer, format="PNG")
+    payload = buffer.getvalue()
+    file_uuid = await _e2e_stack["store"].put(name="first.png", mime="image/png", payload=payload)
+    await _send_session_turn(
+        ctx=_e2e_stack["ctx"], key=key, sink=sink,
+        message="Inspect this upload", attachments=[_file_uuid_attachment(file_uuid)],
+    )
+    assert tool_results and tool_results[0]["status"] == "not_analyzed"
+    assert paths and all(not path.exists() for path in paths)
+    assert not list(Path(config.workspace_dir).rglob("*.png"))
+    assert not (Path(config.attachments.media_root) / "transcripts" / session.session_id).exists()
+    transcript = await manager.get_canonical_transcript(key)
+    saved = next(json.loads(entry.content) for entry in transcript
+                 if '"attachments"' in str(entry.content or ""))
+    assert saved["attachments"][0]["missing_reason"] == "attachment persistence disabled"
+    assert not {"attachment_id", "data", "sha256_ref", "ref"}.intersection(
+        saved["attachments"][0]
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("terminal", ["provider_error", "bootstrap_error", "cancel"])
+async def test_unpersisted_image_cleanup_before_agent_creation(
+    _e2e_stack: dict[str, Any], terminal: str,
+) -> None:
+    config = _e2e_stack["config"]
+    config.squilla_router.enabled = False
+    config.attachments.persist_transcripts = False
+    runner = _e2e_stack["runner"]
+    paths = []
+    await _e2e_stack["manager"].create(
+        session_key="agent:main:temporary-early-exit", agent_id="main",
+    )
+    reached = asyncio.Event()
+    stage = (
+        runner._provider_and_tools_stage if terminal == "provider_error"
+        else runner._prompt_assembler_stage
+    )
+
+    async def fail(inp):
+        context = getattr(inp, "effective_tool_context", None) or inp.tool_context
+        paths.append(Path(context.scratch_dir))
+        assert paths[-1].exists()
+        if terminal != "provider_error":
+            assert list(paths[-1].rglob("*.png"))
+        reached.set()
+        if terminal == "cancel":
+            await asyncio.Event().wait()
+        raise ValueError("test stage failure")
+
+    stage.run = fail
+
+    async def run():
+        return [event async for event in runner.run(
+            "Inspect image", session_key="agent:main:temporary-early-exit",
+            tool_context=ToolContext(is_owner=True, workspace_dir=config.workspace_dir),
+            attachments=[{
+                "type": "image/png", "name": "sample.png",
+                "data": base64.b64encode(_PNG_BYTES).decode("ascii"),
+            }],
+        )]
+
+    task = asyncio.create_task(run())
+    await asyncio.wait_for(reached.wait(), 2.0)
+    if terminal == "cancel":
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    else:
+        await task
+    assert paths and all(not path.exists() for path in paths)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("persist_images", [True, False])
+async def test_attachment_worker_uses_accepted_turn_persistence_policy(
+    _e2e_stack: dict[str, Any], persist_images: bool,
+) -> None:
+    from opensquilla.engine.runtime import accepted_turn_config_scope
+
+    config = _e2e_stack["config"]
+    config.squilla_router.enabled = False
+    config.attachments.persist_transcripts = not persist_images
+    accepted = config.model_copy(deep=True)
+    accepted.attachments.persist_transcripts = persist_images
+    runner = _e2e_stack["runner"]
+    key = "agent:main:accepted-image-policy"
+    await _e2e_stack["manager"].create(session_key=key, agent_id="main")
+    paths = []
+    original = runner._prompt_assembler_stage.run
+
+    async def observe(inp):
+        if persist_images:
+            assert inp.effective_tool_context.scratch_dir is None
+        else:
+            root = Path(inp.effective_tool_context.scratch_dir)
+            paths.extend(root.rglob("*.png"))
+            assert paths
+        return await original(inp)
+
+    runner._prompt_assembler_stage.run = observe
+    with accepted_turn_config_scope(accepted):
+        events = [event async for event in runner.run(
+            "Inspect image", session_key=key,
+            tool_context=ToolContext(is_owner=True, workspace_dir=config.workspace_dir),
+            attachments=[{
+                "type": "image/png", "name": "sample.png",
+                "data": base64.b64encode(_PNG_BYTES).decode("ascii"),
+            }],
+        )]
+    assert not [event for event in events if type(event).__name__ == "ErrorEvent"]
+    assert bool(list(Path(config.workspace_dir).rglob("*.png"))) is persist_images
+    assert all(not path.exists() for path in paths)
 
 
 @pytest.mark.asyncio

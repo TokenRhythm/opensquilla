@@ -20,6 +20,7 @@ import math
 import os
 import platform
 import re
+import tempfile
 import time
 import uuid
 from collections import deque
@@ -5834,6 +5835,7 @@ class TurnRunner:
         # the normal-completion path does.
         current_text_parts: list[str] = []
         stream_state: _StreamState | None = None
+        attachment_cleanup: Callable[[], None] | None = None
         self._emit_turn_event(
             "turn_start",
             trace_context,
@@ -5937,6 +5939,37 @@ class TurnRunner:
 
             transcript_snapshot = TurnTranscriptSnapshot[Any](_load_turn_transcript)
 
+            persist_image_material = (
+                getattr(
+                    getattr(self._turn_config(), "attachments", None),
+                    "persist_transcripts", True,
+                ) is not False
+            )
+            image_workspace_dir: str | None = None
+            image_failure_cleanup: Callable[[], None] | None = None
+            if (
+                not persist_image_material
+                and tool_context is not None
+                and any(
+                    (_normalize_attachment_mime(
+                        item.get("type") or item.get("mime") or item.get("media_type")
+                    ) or "").startswith("image/")
+                    for item in (attachments or [])
+                )
+            ):
+                previous_scratch = tool_context.scratch_dir
+                if previous_scratch:
+                    Path(previous_scratch).mkdir(parents=True, exist_ok=True)
+                temporary_images = tempfile.TemporaryDirectory(
+                    prefix="image-input-", dir=previous_scratch or None,
+                )
+                image_workspace_dir = temporary_images.name
+                if not previous_scratch:
+                    # Freeze tool policy only after the turn-local read root is known.
+                    tool_context = replace(tool_context, scratch_dir=image_workspace_dir)
+                image_failure_cleanup = temporary_images.cleanup
+                attachment_cleanup = image_failure_cleanup
+
             pt_outcome = await self._provider_and_tools_stage.run(
                 ProviderAndToolsStageInput(
                     session_key=session_key,
@@ -6012,6 +6045,8 @@ class TurnRunner:
                 and timeout > 0
                 else None
             )
+            # Once the worker is admitted, it owns failure cleanup until it has stopped.
+            attachment_cleanup = None
             att_outcome = await self._attachment_stage.run(
                 AttachmentStageInput(
                     effective_runtime_message=runtime_message,
@@ -6026,8 +6061,14 @@ class TurnRunner:
                         generated_normalization_attachment_count
                     ),
                     timeout_seconds=attachment_timeout,
+                    persist_image_material=persist_image_material,
+                    image_workspace_dir=image_workspace_dir,
+                    failure_cleanup=image_failure_cleanup,
                 )
             )
+            attachment_cleanup = image_failure_cleanup
+            if attachment_cleanup is not None and tool_context is not None:
+                tool_context.turn_cleanup_callbacks.append(attachment_cleanup)
             att_out = att_outcome.require_output()
 
             turn_usage_scope: UsageAccountingScope | None = None
@@ -7584,6 +7625,15 @@ class TurnRunner:
                     else None
                 ),
             )
+
+        finally:
+            if attachment_cleanup is not None:
+                attachment_cleanup()
+                if (
+                    tool_context is not None
+                    and attachment_cleanup in tool_context.turn_cleanup_callbacks
+                ):
+                    tool_context.turn_cleanup_callbacks.remove(attachment_cleanup)
 
     @staticmethod
     def _write_trace_event(
@@ -10963,6 +11013,12 @@ class TurnRunner:
                 else:
                     projected_content = self._maybe_unpack_attachments(
                         raw_content,
+                        persist_image_material=(
+                            getattr(
+                                getattr(self._turn_config(), "attachments", None),
+                                "persist_transcripts", True,
+                            ) is not False
+                        ),
                         preserve_image_attachments=preserve_image,
                         materialize_historical_attachments=(
                             materialize_historical_attachments
@@ -14832,6 +14888,12 @@ class TurnRunner:
                     continue
                 replay_content = self._maybe_unpack_attachments(
                     raw_content,
+                    persist_image_material=(
+                        getattr(
+                            getattr(self._turn_config(), "attachments", None),
+                            "persist_transcripts", True,
+                        ) is not False
+                    ),
                     preserve_image_attachments=replay_selected_images,
                     allowed_image_attachment_ids=requested_image_id_filter,
                     materialize_historical_attachments=materialize_historical_attachments,
@@ -14858,6 +14920,12 @@ class TurnRunner:
             for entry in bound_image_replay_entries:
                 replay_content = self._maybe_unpack_attachments(
                     str(getattr(entry, "content", "") or ""),
+                    persist_image_material=(
+                        getattr(
+                            getattr(self._turn_config(), "attachments", None),
+                            "persist_transcripts", True,
+                        ) is not False
+                    ),
                     preserve_image_attachments=True,
                     materialize_historical_attachments=(
                         materialize_historical_attachments
@@ -15263,6 +15331,7 @@ class TurnRunner:
         historical_materializer: AttachmentWorkspaceMaterializer | None = None,
         source_message_id: str | None = None,
         include_envelope_text: bool = True,
+        persist_image_material: bool = True,
     ) -> Any:
         """Reduce persisted attachment envelopes to text-only history.
 
@@ -15475,6 +15544,7 @@ class TurnRunner:
                 historical_materializer is not None
                 and session_id
                 and _is_materializable_attachment_mime(media_type)
+                and (persist_image_material or not media_type.startswith("image/"))
             ):
                 materializer = historical_materializer
                 result = None
@@ -15581,6 +15651,8 @@ class TurnRunner:
         session_id: str | None = None,
         workspace_attachment_budget_bytes: int | None = None,
         cancel_check: Callable[[], None] | None = None,
+        persist_image_material: bool = True,
+        image_workspace_dir: str | Path | None = None,
     ) -> list | None:
         """Build a multimodal user message that carries the attachments.
 
@@ -15613,6 +15685,14 @@ class TurnRunner:
         attachment_blocks: list[Any] = []
         office_batch_decompressed_budget = [_OFFICE_DECOMPRESSED_LIMIT]
         turn_materializer: AttachmentWorkspaceMaterializer | None = None
+        image_materializer = (
+            AttachmentWorkspaceMaterializer(
+                media_root=media_root or Path("."),
+                workspace_dir=image_workspace_dir,
+                materializable_mimes=None,
+                disk_budget_bytes=workspace_attachment_budget_bytes,
+            ) if image_workspace_dir is not None else None
+        )
         if workspace_dir:
             # One instance per turn so the attachment batch shares a single
             # budget scan instead of re-walking the tree per attachment.
@@ -15678,8 +15758,9 @@ class TurnRunner:
             name_raw = att.get("name")
             filename = _sanitize_attachment_filename(name_raw)
             material_marker = ""
-            if turn_materializer is not None:
-                materializer = turn_materializer
+            temporary_image = media_type.startswith("image/") and not persist_image_material
+            materializer = image_materializer if temporary_image else turn_materializer
+            if materializer is not None:
                 if is_attachment_ref(att):
                     result = materializer.materialize(att, session_id=session_id)
                 else:
@@ -15691,6 +15772,10 @@ class TurnRunner:
                     )
                 if cancel_check is not None:
                     cancel_check()
+                if temporary_image and result.rel_path and image_workspace_dir is not None:
+                    result = replace(
+                        result, rel_path=str(Path(image_workspace_dir) / result.rel_path)
+                    )
                 prefix = (
                     "attachment available"
                     if result.available

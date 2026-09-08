@@ -3,6 +3,8 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 from opensquilla.engine.turn_runner.harness import _TurnRunnerAttachmentMessageBuilderAdapter
 
 
@@ -61,3 +63,38 @@ def test_attachment_builder_adapter_prefers_resolved_workspace(tmp_path: Path) -
             "workspace_attachment_budget_bytes": None,
         }
     ]
+
+
+@pytest.mark.parametrize("cancellable", [True, False])
+@pytest.mark.parametrize("explicit", [None, True, False])
+def test_attachment_builder_preserves_explicit_turn_image_policy(
+    tmp_path: Path, cancellable: bool, explicit: bool | None,
+) -> None:
+    from types import SimpleNamespace
+
+    calls = []
+
+    class _Runner:
+        _config = SimpleNamespace(attachments=SimpleNamespace(persist_transcripts=True))
+
+        def _turn_config(self):
+            return SimpleNamespace(attachments=SimpleNamespace(persist_transcripts=False))
+
+        def _attachment_media_root(self):
+            return tmp_path / "media"
+
+        def _build_attachment_messages(self, *args, **kwargs):
+            calls.append(kwargs)
+
+    adapter = _TurnRunnerAttachmentMessageBuilderAdapter(_Runner())  # type: ignore[arg-type]
+    kwargs = {"persist_image_material": explicit, "image_workspace_dir": tmp_path / "scratch"}
+    if cancellable:
+        adapter.build_cancellable("hello", [], cancel_check=lambda: None, **kwargs)
+    else:
+        adapter.build("hello", [], **kwargs)
+    assert len(calls) == 1
+    if explicit is True:
+        assert "persist_image_material" not in calls[0]
+    else:
+        assert calls[0]["persist_image_material"] is False
+        assert calls[0]["image_workspace_dir"] == tmp_path / "scratch"

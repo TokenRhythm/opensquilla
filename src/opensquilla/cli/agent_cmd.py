@@ -320,6 +320,7 @@ async def run_agent_once(
             failure_mode="raise",
             accept_opaque=bool(getattr(attachments_cfg, "accept_opaque", True)),
             opaque_limit_bytes=opaque_cap if isinstance(opaque_cap, int) else None,
+            persist_enabled=bool(getattr(attachments_cfg, "persist_transcripts", True)),
         )
         message = ingested_attachments.text
         run_attachments = ingested_attachments.attachments

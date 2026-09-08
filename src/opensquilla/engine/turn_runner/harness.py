@@ -1673,7 +1673,10 @@ class _TurnRunnerAttachmentMessageBuilderAdapter(AttachmentMessageBuilderPort):
         *,
         workspace_dir: str | Path | None = None,
         session_id: str | None = None,
+        persist_image_material: bool | None = None,
+        image_workspace_dir: str | Path | None = None,
     ) -> list[Any] | None:
+        image_kwargs = self._image_material_kwargs(persist_image_material, image_workspace_dir)
         return self._runner._build_attachment_messages(
             message,
             attachments,
@@ -1684,7 +1687,27 @@ class _TurnRunnerAttachmentMessageBuilderAdapter(AttachmentMessageBuilderPort):
             workspace_attachment_budget_bytes=(
                 workspace_attachment_budget_from_config(self._runner._config)
             ),
+            **image_kwargs,
         )
+
+    def _image_material_kwargs(
+        self,
+        persist_image_material: bool | None,
+        image_workspace_dir: str | Path | None,
+    ) -> dict[str, Any]:
+        if persist_image_material is None:
+            turn_config = getattr(self._runner, "_turn_config", None)
+            config = turn_config() if callable(turn_config) else self._runner._config
+            persist_image_material = (
+                getattr(getattr(config, "attachments", None), "persist_transcripts", True)
+                is not False
+            )
+        if persist_image_material:
+            return {}
+        return {
+            "persist_image_material": False,
+            "image_workspace_dir": image_workspace_dir,
+        }
 
     def build_cancellable(
         self,
@@ -1694,7 +1717,10 @@ class _TurnRunnerAttachmentMessageBuilderAdapter(AttachmentMessageBuilderPort):
         workspace_dir: str | Path | None = None,
         session_id: str | None = None,
         cancel_check: Callable[[], None],
+        persist_image_material: bool | None = None,
+        image_workspace_dir: str | Path | None = None,
     ) -> list[Any] | None:
+        image_kwargs = self._image_material_kwargs(persist_image_material, image_workspace_dir)
         return self._runner._build_attachment_messages(
             message,
             attachments,
@@ -1706,6 +1732,7 @@ class _TurnRunnerAttachmentMessageBuilderAdapter(AttachmentMessageBuilderPort):
                 workspace_attachment_budget_from_config(self._runner._config)
             ),
             cancel_check=cancel_check,
+            **image_kwargs,
         )
 
 
