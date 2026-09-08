@@ -1963,6 +1963,8 @@ jobs:
           command -v pwsh
           uv run pytest \
             tests/test_ci/test_upgrade_baselines.py \
+            tests/test_ci/test_release_signing_preflight.py \
+            tests/test_ci/test_windows_signatures.py \
             tests/test_scripts/test_build_wheelhouse_zip.py \
             tests/test_install_scripts.py \
             tests/test_root_start_scripts.py \

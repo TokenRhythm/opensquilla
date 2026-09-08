@@ -157,6 +157,9 @@ export const useAppStore = defineStore('app', () => {
   let themeWatchStop: (() => void) | null = null
   let localeSyncPromise: Promise<void> | null = null
   let localeSyncWarningShown = false
+  let localeSelectionRevision = 0
+  let pendingLocaleSyncRevision = 0
+  let pendingLocaleSyncAutomatic = false
   let appSettings: AppSettings | null = null
 
   function bindAppSettings(settings: AppSettings) {
@@ -267,15 +270,23 @@ export const useAppStore = defineStore('app', () => {
     document.documentElement.setAttribute('dir', 'ltr')
   }
 
-  function savePendingLocaleSync(code: LocaleCode) {
+  function savePendingLocaleSync(code: LocaleCode, automatic = false) {
+    pendingLocaleSyncRevision += 1
+    pendingLocaleSyncAutomatic = automatic
     pendingChannelNoticeLocale.value = code
-    try { localStorage.setItem(LOCALE_SYNC_PENDING_KEY, code) } catch {}
+    // Startup resolves again after a restart. Only explicit selections need a
+    // durable retry, and startup must never replace an existing explicit one.
+    if (!automatic) {
+      try { localStorage.setItem(LOCALE_SYNC_PENDING_KEY, code) } catch {}
+    }
   }
 
-  function clearPendingLocaleSync(code: LocaleCode) {
-    if (pendingChannelNoticeLocale.value !== code) return
+  function clearPendingLocaleSync(revision: number) {
+    if (pendingLocaleSyncRevision !== revision) return
     pendingChannelNoticeLocale.value = null
-    try { localStorage.removeItem(LOCALE_SYNC_PENDING_KEY) } catch {}
+    if (!pendingLocaleSyncAutomatic) {
+      try { localStorage.removeItem(LOCALE_SYNC_PENDING_KEY) } catch {}
+    }
   }
 
   function notifyLocaleSyncPending() {
@@ -288,27 +299,49 @@ export const useAppStore = defineStore('app', () => {
     { warnOnUnavailable = true }: { warnOnUnavailable?: boolean } = {},
   ): Promise<void> {
     if (localeSyncPromise) return localeSyncPromise
+    let attemptedRevision = pendingLocaleSyncRevision
     localeSyncPromise = (async () => {
       while (pendingChannelNoticeLocale.value) {
+        attemptedRevision = pendingLocaleSyncRevision
         if (!appSettings) {
           if (warnOnUnavailable) notifyLocaleSyncPending()
           return
         }
         const target = pendingChannelNoticeLocale.value
+        const revision = pendingLocaleSyncRevision
+        const settings = appSettings
         try {
-          await appSettings.patchSafe([
+          if (pendingLocaleSyncAutomatic) {
+            const current = await settings.read('control_ui.default_locale')
+            // A user can explicitly choose even the same locale during this
+            // read. That new intent still needs its own durable write.
+            if (revision !== pendingLocaleSyncRevision) continue
+            if (current === target) {
+              clearPendingLocaleSync(revision)
+              localeSyncWarningShown = false
+              continue
+            }
+          }
+          await settings.patchSafe([
             { path: 'control_ui.default_locale', value: target },
           ])
-          clearPendingLocaleSync(target)
+          clearPendingLocaleSync(revision)
           localeSyncWarningShown = false
         } catch {
-          // Keep the latest explicit selection for the next successful connection.
+          if (revision !== pendingLocaleSyncRevision) continue
+          // Retry the current intent after reconnect, retaining whether it was
+          // automatic or an explicit selection.
           if (warnOnUnavailable) notifyLocaleSyncPending()
           return
         }
       }
     })().finally(() => {
       localeSyncPromise = null
+      // A selection can finish loading between the last loop check and this
+      // finalizer. Drain that newer intent, without retrying a failed one here.
+      if (pendingChannelNoticeLocale.value && pendingLocaleSyncRevision !== attemptedRevision) {
+        return syncLocaleToGateway({ warnOnUnavailable })
+      }
     })
     return localeSyncPromise
   }
@@ -321,6 +354,7 @@ export const useAppStore = defineStore('app', () => {
   // Gateway-wide channel-notice setting without making a disconnected startup
   // noisy. Browser clients remain read-only until an explicit language choice.
   async function initLocale() {
+    const selectionRevision = localeSelectionRevision
     let osLocale: string | undefined
     const platform = getPlatform()
     try {
@@ -331,13 +365,15 @@ export const useAppStore = defineStore('app', () => {
     const resolved = resolveInitialLocale(osLocale)
     try {
       await loadLocaleMessages(resolved)
+      if (selectionRevision !== localeSelectionRevision) return
       locale.value = resolved
       applyLocale(resolved)
       if (platform.capabilities.isDesktop) {
-        savePendingLocaleSync(resolved)
+        if (!pendingChannelNoticeLocale.value) savePendingLocaleSync(resolved, true)
         void syncLocaleToGateway({ warnOnUnavailable: false })
       }
     } catch {
+      if (selectionRevision !== localeSelectionRevision) return
       locale.value = 'en'
       applyLocale('en')
     }
@@ -345,12 +381,14 @@ export const useAppStore = defineStore('app', () => {
 
   async function setLocale(code: LocaleCode) {
     if (!isSupportedLocale(code)) return
+    const selectionRevision = ++localeSelectionRevision
     let target = code
     try {
       await loadLocaleMessages(target)
     } catch {
       target = 'en'
     }
+    if (selectionRevision !== localeSelectionRevision) return
     locale.value = target
     try { localStorage.setItem('opensquilla-locale', target) } catch {}
     applyLocale(target)

@@ -56,6 +56,21 @@ function renderedMessagesFor(
   })
 }
 
+describe('useChatRenderedMessages scheduled provenance', () => {
+  it('keeps persisted sources and labels live cron completions before history arrives', () => {
+    const api = renderedMessagesFor([
+      { role: 'user', text: 'Run the inventory check.', ts: 1, provenanceKind: 'cron' },
+      { role: 'assistant', text: '12 items.', ts: 2, turnRunKind: 'cron_turn' },
+      { role: 'user', text: 'Scheduled trigger is a useful label.', ts: 3 },
+      { role: 'assistant', text: 'A normal follow-up.', ts: 4, turnRunKind: 'session_turn' },
+      { role: 'assistant', text: 'Persisted result.', ts: 5, provenanceKind: 'cron' },
+    ])
+
+    expect(api.renderedMessages.value.map(message => message.provenanceKind))
+      .toEqual(['cron', 'cron', undefined, undefined, 'cron'])
+  })
+})
+
 describe('useChatRenderedMessages annotation-only user turns', () => {
   it('keeps the live optimistic row when prompt annotations are the only visible payload', () => {
     const api = renderedMessagesFor([{

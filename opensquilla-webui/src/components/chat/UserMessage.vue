@@ -27,6 +27,14 @@
          above the text bubble, never packed inside it — text gets a filled
          bubble, images render as bordered bare media, files as icon chips. -->
     <div class="msg-user-stack">
+      <span
+        v-if="message.provenanceKind === 'cron'"
+        class="msg-user-cron-source"
+        data-testid="cron-input-source"
+      >
+        <Icon name="cron" :size="12" aria-hidden="true" />
+        {{ t('chat.provenance.scheduledTrigger') }}
+      </span>
       <div
         v-if="message.promptAnnotations?.length"
         class="msg-prompt-annotations"
@@ -523,6 +531,18 @@ function activateAttachment(attachment: DisplayAttachment) {
   align-items: flex-end;
   gap: 0.375rem;
   min-width: 0;
+}
+
+.msg-user-cron-source {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-1);
+  padding: 1px var(--sp-2);
+  border: 1px solid color-mix(in srgb, var(--accent) 26%, var(--border));
+  border-radius: var(--radius-full);
+  background: color-mix(in srgb, var(--accent) 8%, var(--bg-surface));
+  color: var(--text-muted);
+  font-size: var(--fs-xs);
 }
 
 .msg-user-steer-status {

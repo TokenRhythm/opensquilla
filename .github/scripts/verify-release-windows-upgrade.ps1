@@ -13,6 +13,52 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+
+function Test-InstalledProductVersion {
+  param([string]$Actual, [string]$Expected)
+  if ([string]::IsNullOrWhiteSpace($Actual)) { return $false }
+  $value = $Actual.Trim()
+  if ($value -ceq $Expected) { return $true }
+  # Windows PE resources can append a zero revision to stable SemVer. Never
+  # discard a prerelease identity or accept another revision/version prefix.
+  return (
+    $Expected -cmatch '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$' -and
+    $value -ceq "$Expected.0"
+  )
+}
+
+function Get-NSISUserProgramsDirectory {
+  # electron-builder multiUser.nsh uses FOLDERID_UserProgramFiles, independent
+  # of the APPDATA/LOCALAPPDATA environment used to isolate the test profile.
+  if (-not ('OpenSquilla.ReleaseValidation.KnownFolders' -as [type])) {
+    Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+namespace OpenSquilla.ReleaseValidation {
+  public static class KnownFolders {
+    [DllImport("shell32.dll")]
+    private static extern int SHGetKnownFolderPath(
+      [MarshalAs(UnmanagedType.LPStruct)] Guid folder, uint flags,
+      IntPtr token, out IntPtr path);
+    public static string UserPrograms() {
+      IntPtr path = IntPtr.Zero;
+      try {
+        // Resolve without creating or requiring an existing Programs directory.
+        int result = SHGetKnownFolderPath(
+          new Guid("5CD7AEE2-2219-4A67-B85D-6C9CE15660CB"), 0x4000, IntPtr.Zero, out path);
+        if (result != 0) Marshal.ThrowExceptionForHR(result);
+        return Marshal.PtrToStringUni(path);
+      } finally {
+        if (path != IntPtr.Zero) Marshal.FreeCoTaskMem(path);
+      }
+    }
+  }
+}
+'@ | Out-Null
+  }
+  return [OpenSquilla.ReleaseValidation.KnownFolders]::UserPrograms()
+}
+
 $repository = 'TokenRhythm/opensquilla'
 $oldTag = "v$BaselineVersion"
 $oldAsset = "OpenSquilla-$BaselineVersion-win-x64.exe"
@@ -54,13 +100,33 @@ $sessionRecoverySmoke = Join-Path $PWD 'desktop\electron\scripts\test-packaged-s
 $realUpdateDriver = Join-Path $PWD 'desktop\electron\scripts\test-packaged-real-update-flow.mjs'
 $realUpdateResult = Join-Path $sandbox 'real-update-result.json'
 $externalSentinels = Join-Path $sandbox 'synthetic-system-tools'
+$signatureVerifier = Join-Path $PWD '.github\scripts\verify-windows-signatures.ps1'
+$installDir = if ($InstallMode -eq 'custom') {
+  Join-Path $sandbox 'OpenSquilla'
+} else {
+  $programsDirectory = Get-NSISUserProgramsDirectory
+  if (-not $programsDirectory -or -not [IO.Path]::IsPathRooted($programsDirectory)) {
+    throw 'NSIS UserProgramFiles must resolve to an absolute directory.'
+  }
+  $programsRoot = [IO.Path]::GetFullPath($programsDirectory)
+  $defaultInstallRoot = [IO.Path]::GetFullPath((Join-Path $programsRoot 'OpenSquilla'))
+  if (-not $defaultInstallRoot.StartsWith(
+    $programsRoot.TrimEnd([IO.Path]::DirectorySeparatorChar) + [IO.Path]::DirectorySeparatorChar,
+    [StringComparison]::OrdinalIgnoreCase
+  )) {
+    throw 'NSIS default installation escaped the UserProgramFiles directory.'
+  }
+  if (Test-Path -LiteralPath $defaultInstallRoot) {
+    throw 'NSIS default installation requires a fresh runner without an existing OpenSquilla directory.'
+  }
+  $defaultInstallRoot
+}
 $env:APPDATA = $appData
 $env:LOCALAPPDATA = $localAppData
 $env:OPENSQUILLA_DESKTOP_DISABLE_AUTO_UPDATE = '1'
 $env:OPENSQUILLA_RECOVERY_OFFLINE = '1'
 
 New-Item -ItemType Directory -Force -Path $oldDir, $appData, $localAppData | Out-Null
-$installDir = if ($InstallMode -eq 'custom') { Join-Path $sandbox 'OpenSquilla' } else { '' }
 gh release download $oldTag --repo $repository --pattern $oldAsset --dir $oldDir
 if ($LASTEXITCODE -ne 0) { throw "Failed to download the $oldTag Windows installer." }
 $oldInstaller = Join-Path $oldDir $oldAsset
@@ -89,16 +155,12 @@ try {
     -Wait -PassThru
   if ($old.ExitCode -ne 0) { throw "$oldTag installer failed with exit code $($old.ExitCode)." }
 
-  if ($InstallMode -eq 'default') {
-    $oldApp = Get-ChildItem -LiteralPath $localAppData -Filter 'OpenSquilla.exe' -File -Recurse |
-      Select-Object -First 1
-    if (-not $oldApp) { throw "$oldTag default installation did not publish OpenSquilla.exe." }
-    $installDir = $oldApp.Directory.FullName
-  }
-
   $oldAppPath = Join-Path $installDir 'OpenSquilla.exe'
+  if (-not (Test-Path -LiteralPath $oldAppPath -PathType Leaf)) {
+    throw "$oldTag $InstallMode installation did not publish OpenSquilla.exe at the expected installation root."
+  }
   $oldProductVersion = ([Diagnostics.FileVersionInfo]::GetVersionInfo($oldAppPath)).ProductVersion
-  if (-not $oldProductVersion -or $oldProductVersion.Trim() -ne $BaselineVersion) {
+  if (-not (Test-InstalledProductVersion -Actual $oldProductVersion -Expected $BaselineVersion)) {
     throw "Expected official $oldTag, found installed version: $oldProductVersion"
   }
   # v0.5.3 bundles developer tools; v0.5.4 uses the slim Runtime Pack layout.
@@ -173,7 +235,9 @@ try {
       throw "Official $oldTag downloaded installer bytes differ from the Draft candidate."
     }
   } else {
-    $installed = Start-Process -FilePath $candidate -ArgumentList @('/S', "/D=$installDir") `
+    $candidateArguments = @('/S')
+    if ($InstallMode -eq 'custom') { $candidateArguments += "/D=$installDir" }
+    $installed = Start-Process -FilePath $candidate -ArgumentList $candidateArguments `
       -Wait -PassThru
     if ($installed.ExitCode -ne 0) {
       throw "Candidate installer failed with exit code $($installed.ExitCode)."
@@ -196,12 +260,17 @@ try {
   if (-not (Test-Path -LiteralPath $app -PathType Leaf)) {
     throw 'Candidate installation did not publish OpenSquilla.exe.'
   }
+  & $signatureVerifier -InstallerPath $candidate -InstalledRoot $installDir
+  if ($LASTEXITCODE -ne 0) {
+    throw 'Candidate or installed Windows Authenticode verification failed.'
+  }
+
   $actualProductVersion = ([Diagnostics.FileVersionInfo]::GetVersionInfo($app)).ProductVersion
   if (-not $actualProductVersion) {
     throw 'Installed OpenSquilla.exe does not declare a ProductVersion.'
   }
   $actualProductVersion = $actualProductVersion.Trim()
-  if ($actualProductVersion -cne $expectedInstalledVersion) {
+  if (-not (Test-InstalledProductVersion -Actual $actualProductVersion -Expected $expectedInstalledVersion)) {
     throw (
       "Installed OpenSquilla.exe ProductVersion $actualProductVersion does not match " +
       "the rehearsed version $expectedInstalledVersion."

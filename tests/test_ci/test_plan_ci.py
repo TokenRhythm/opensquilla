@@ -1263,9 +1263,10 @@ def test_upgrade_source_only_changes_select_baseline_contract(
 ) -> None:
     plan = _plan(tmp_path, suite_config, path)
 
-    assert plan["python_targets"] == sorted(
-        [existing_target, "tests/test_ci/test_upgrade_baselines.py"]
-    )
+    expected = [existing_target, "tests/test_ci/test_upgrade_baselines.py"]
+    if path == ".github/workflows/wheelhouse-release.yml":
+        expected.append("tests/test_ci/test_release_signing_preflight.py")
+    assert plan["python_targets"] == sorted(expected)
     assert "python-targeted" in plan["required_suites"]
     assert plan["full_fallback"] is False
     assert plan["desktop_matrix"] == []
@@ -1310,6 +1311,62 @@ def test_release_packaging_executes_upgrade_baseline_contract() -> None:
     assert "command -v node" in step["run"]
     assert "command -v pwsh" in step["run"]
     assert "tests/test_ci/test_upgrade_baselines.py" in step["run"].split()
+    assert "tests/test_ci/test_release_signing_preflight.py" in step["run"].split()
+    assert "tests/test_ci/test_windows_signatures.py" in step["run"].split()
+
+
+@pytest.mark.parametrize(
+    ("path", "target"),
+    [
+        (
+            ".github/scripts/release_signing_preflight.py",
+            "tests/test_ci/test_release_signing_preflight.py",
+        ),
+        (
+            ".github/scripts/verify-windows-signatures.ps1",
+            "tests/test_ci/test_windows_signatures.py",
+        ),
+    ],
+)
+def test_signing_source_changes_select_contracts_and_release_packaging(
+    tmp_path: Path, suite_config: dict[str, Any], path: str, target: str
+) -> None:
+    plan = _plan(tmp_path, suite_config, path)
+    assert plan["full_fallback"] is False
+    assert {"python-targeted", "release-packaging"} <= set(plan["required_suites"])
+    assert plan["python_targets"] == [target]
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        ".github/scripts/release_signing_preflight.py",
+        ".github/scripts/verify-windows-signatures.ps1",
+        ".github/signing/windows-signing-policy.json",
+        ".github/workflows/desktop-fault-injection.yml",
+        "desktop/electron/scripts/build-signed-windows.cjs",
+        "desktop/electron/scripts/e2e-shutdown-helpers.mjs",
+        "desktop/electron/scripts/packaged-smoke-helpers.mjs",
+        "desktop/electron/scripts/packaged-first-send-cleanup.mjs",
+        "desktop/electron/scripts/test-packaged-first-send-cleanup.mjs",
+        "desktop/electron/scripts/test-packaged-first-send-renderer.mjs",
+        "desktop/electron/scripts/session-recovery-transport-contract.mjs",
+        "desktop/electron/scripts/test-packaged-session-recovery.mjs",
+        "tests/test_ci/test_release_signing_preflight.py",
+        "tests/test_ci/test_windows_signatures.py",
+    ],
+)
+def test_signing_inputs_invalidate_cached_release_contract_results(
+    tmp_path: Path, suite_config: dict[str, Any], path: str
+) -> None:
+    dependency = tmp_path / path
+    dependency.parent.mkdir(parents=True)
+    dependency.write_text("first\n", encoding="utf-8")
+    first = _plan(tmp_path, suite_config, ".github/scripts/release_signing_preflight.py")
+    dependency.write_text("second\n", encoding="utf-8")
+    second = _plan(tmp_path, suite_config, ".github/scripts/release_signing_preflight.py")
+    for suite in ("python-targeted", "release-packaging"):
+        assert first["suite_execution_digests"][suite] != second["suite_execution_digests"][suite]
 
 
 @pytest.mark.parametrize(

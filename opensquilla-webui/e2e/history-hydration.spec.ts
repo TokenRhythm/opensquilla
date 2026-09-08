@@ -1117,3 +1117,161 @@ test('ignores a late history response after navigating to another session', asyn
   await expect(page.getByText('Late history from session A must stay hidden.')).toHaveCount(0)
   await expect.poll(() => new URL(page.url()).searchParams.get('session')).toBe(SESSION_B)
 })
+
+test.describe('Automation conversation continuation', () => {
+  const SESSION_KEY = 'cron:inventory:run:first'
+  const ORIGINAL_RESULT = 'The scheduled inventory check counted 12 items.'
+  const FOLLOWUP = 'Explain the inventory count'
+  const REPLY = 'The count includes 8 stored items and 4 displayed items.'
+
+  async function installAutomationConversation(
+    page: Page,
+    sessionKey = SESSION_KEY,
+    scheduledPrompt?: string,
+  ) {
+    const requests: Array<{ method: string, params: Record<string, unknown> }> = []
+    const history: Array<Record<string, unknown>> = [{
+      role: 'assistant',
+      text: ORIGINAL_RESULT,
+      message_id: 'automation-result',
+      timestamp: '2026-01-01T09:00:00Z',
+      provenance_kind: 'cron',
+      provenance_source_tool: 'cron:inventory',
+    }]
+    if (scheduledPrompt) {
+      history.unshift({
+        role: 'user', text: scheduledPrompt, message_id: 'automation-prompt',
+        timestamp: '2026-01-01T08:59:59Z',
+        provenance_kind: 'cron', provenance_source_tool: 'cron:inventory',
+        provenance_source_session_key: sessionKey,
+      })
+    }
+    await page.addInitScript(() => localStorage.setItem('opensquilla-locale', 'en'))
+    await page.route('**/api/system/update', route => route.fulfill({ json: {} }))
+    await page.route('**/api/elevated-mode', route => route.fulfill({ json: { enabled: false } }))
+    await page.route('**/api/approvals', route => route.fulfill({
+      json: { pending: [], mode: 'prompt', allowPatterns: [], denyPatterns: [] },
+    }))
+    await page.routeWebSocket(/\/ws$/, ws => {
+      const respond = (id: unknown, payload: unknown) => ws.send(JSON.stringify({
+        type: 'res', id, ok: true, payload,
+      }))
+      ws.send(JSON.stringify({ type: 'event', event: 'connect.challenge', payload: {} }))
+      ws.onMessage(raw => {
+        const frame = JSON.parse(String(raw))
+        if (frame.type === 'ping') {
+          ws.send(JSON.stringify({ type: 'pong' }))
+          return
+        }
+        if (frame.type !== 'req') return
+        const method = String(frame.method)
+        const params = frame.params || {}
+        requests.push({ method, params })
+        if (method === 'connect') {
+          ws.send(JSON.stringify({
+            protocol: 3,
+            policy: { tick_interval_ms: 30_000 },
+            auth: { principal: { isOwner: true } },
+          }))
+          return
+        }
+        if (method === 'chat.history') {
+          respond(frame.id, chatHistoryPayload(history))
+          return
+        }
+        if (method === 'chat.send') {
+          history.push({
+            role: 'user', text: params.message, message_id: 'followup-user',
+            timestamp: '2026-01-01T09:01:00Z',
+            turn_context: { turn_id: 'followup-turn' },
+          }, {
+            role: 'assistant', text: REPLY, message_id: 'followup-assistant',
+            timestamp: '2026-01-01T09:01:01Z',
+            turn_context: { turn_id: 'followup-turn' },
+          })
+          respond(frame.id, {
+            sessionKey, status: 'accepted', accepted: true,
+            task_id: 'followup-turn', turn_id: 'followup-turn', message_id: 'followup-user',
+          })
+          return
+        }
+        const payloads: Record<string, unknown> = {
+          'agents.list': { agents: [] },
+          'commands.list_for_surface': { commands: [] },
+          'config.get': { squilla_router: { enabled: false }, permissions: {}, skills: {} },
+          'models.routing.get': { mode: 'direct' },
+          'onboarding.status': { audioConfigured: false },
+          'sandbox.run_mode.preference.get': { runMode: 'full', source: 'config' },
+          'sessions.resolve': { session_key: sessionKey, session_id: 'automation-session' },
+          'sessions.list': {
+            sessions: [{
+              key: sessionKey, title: 'Inventory automation',
+              sessionKind: sessionKey.startsWith('cron:') ? 'cron' : 'chat',
+              surface: sessionKey.startsWith('cron:') ? 'cron' : 'webchat',
+              interactive: true, conversationKind: 'direct', effectiveAgentId: 'main',
+              updatedAt: 100, messageCount: history.length, status: 'ok', runStatus: 'idle',
+            }],
+            has_more: false,
+          },
+          'sessions.messages.subscribe': sessionMessagesSubscribePayload(sessionKey),
+          'sessions.messages.hydrate': sessionMessagesHydratePayload(sessionKey),
+          'sessions.messages.snapshot': sessionMessagesSnapshotPayload(sessionKey),
+          'sessions.messages.unsubscribe': { subscribed: false },
+          'sessions.subscribe': { subscribed: true },
+          'usage.status': { sessions: [] },
+        }
+        respond(frame.id, payloads[method] ?? {})
+      })
+    })
+    return requests
+  }
+
+  for (const sessionKey of [SESSION_KEY, 'agent:main:webchat:inventory']) {
+    test(`scheduled sources survive reload and exclude manual follow-ups in ${sessionKey}`, async ({ page }) => {
+      const prompt = 'Count the stored and displayed inventory items.'
+      const requests = await installAutomationConversation(page, sessionKey, prompt)
+      await page.goto('/control/chat?session=' + encodeURIComponent(sessionKey))
+      await expect(page.getByTestId('cron-input-source')).toHaveText('Scheduled trigger')
+      await expect(page.locator('.msg-user-bubble').filter({ hasText: prompt })).toHaveCount(1)
+      await expect(page.locator('.msg-provenance-chip')).toHaveText('Scheduled')
+
+      const composer = page.getByRole('textbox', { name: 'Message to send' })
+      await composer.fill(FOLLOWUP)
+      await composer.press('Enter')
+      await expect.poll(() => requests.filter(request => request.method === 'chat.send').length).toBe(1)
+      expect(requests.find(request => request.method === 'chat.send')!.params.sessionKey).toBe(sessionKey)
+
+      await page.reload()
+      await expect(page.locator('.msg-user-bubble')).toHaveCount(2)
+      await expect(page.locator('.msg-ai').filter({ hasText: REPLY })).toHaveCount(1)
+      await expect(page.getByTestId('cron-input-source')).toHaveCount(1)
+      await expect(page.getByTestId('cron-input-source')).toHaveText('Scheduled trigger')
+      await expect(page.locator('.msg-provenance-chip')).toHaveCount(1)
+      await expect(composer).toBeEditable()
+    })
+  }
+
+  test('automation run supports a follow-up in the original conversation after reload', async ({ page }) => {
+    const requests = await installAutomationConversation(page)
+    const route = '/control/chat?session=' + encodeURIComponent(SESSION_KEY)
+    await page.goto(route)
+    await expect(page.locator('.msg-ai')).toContainText(ORIGINAL_RESULT)
+    const composer = page.getByRole('textbox', { name: 'Message to send' })
+    await expect(composer).toBeEditable()
+    await composer.fill(FOLLOWUP)
+    await composer.press('Enter')
+
+    await expect.poll(() => requests.filter(request => request.method === 'chat.send').length).toBe(1)
+    const send = requests.find(request => request.method === 'chat.send')!
+    expect(send.params.sessionKey).toBe(SESSION_KEY)
+    expect(send.params.message).toBe(FOLLOWUP)
+    expect(requests.filter(request => ['sessions.create', 'sessions.fork'].includes(request.method))).toEqual([])
+
+    await page.reload()
+    await expect(page.locator('.msg-ai').filter({ hasText: ORIGINAL_RESULT })).toHaveCount(1)
+    await expect(page.locator('.msg-user-bubble')).toContainText(FOLLOWUP)
+    await expect(page.locator('.msg-ai').filter({ hasText: REPLY })).toHaveCount(1)
+    await expect(composer).toBeEditable()
+    await expect(page).toHaveURL(new RegExp(encodeURIComponent(SESSION_KEY)))
+  })
+})

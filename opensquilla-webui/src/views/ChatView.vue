@@ -616,14 +616,7 @@
       />
     </div>
 
-    <div
-      v-if="isCronSession"
-      class="chat-composer-read-only"
-      role="status"
-      aria-live="polite"
-    >{{ t('chat.cronSessionReadOnly') }}</div>
     <ChatComposer
-      v-else
       ref="composerRef"
       v-model="inputText"
       :attachments="pendingAttachments"
@@ -778,7 +771,6 @@ import { GATEWAY_ACCESS_KEY } from '@/modules/gatewayAccess'
 import {
   SESSION_DIRECTORY_KEY,
   SessionDirectoryError,
-  isCronSessionKey,
 } from '@/modules/sessionDirectory'
 import { SESSION_LIFECYCLE_KEY } from '@/modules/sessionLifecycle'
 import { PENDING_INPUT_QUEUE_KEY } from '@/modules/pendingInputQueue'
@@ -1293,7 +1285,6 @@ function cancelActiveProjectValidation() {
 const isCompactViewport = useMediaQuery('(max-width: 480px)')
 const isDesktopViewport = useMediaQuery('(min-width: 769px)')
 const landingAgentId = computed(() => agentIdFromSessionKey(sessionKey.value))
-const isCronSession = computed(() => isCronSessionKey(sessionKey.value))
 // True when the current draft opened with prefilled composer text (Sessions
 // Hub task input); the landing suggestion chips stay out of the way then.
 const landingPrefilled = ref(false)
@@ -7079,11 +7070,5 @@ watch(
   width: 100%;
   height: 1px;
   pointer-events: none;
-}
-
-.chat-composer-read-only {
-  padding: 0.75rem 1rem;
-  color: var(--text-muted);
-  text-align: center;
 }
 </style>

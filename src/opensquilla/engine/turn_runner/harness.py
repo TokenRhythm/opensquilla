@@ -1743,6 +1743,7 @@ class _TurnRunnerTranscriptAppendAdapter(TranscriptAppendPort):
         assistant_message_id: str | None = None,
         expected_session_id: str | None = None,
         expected_session_epoch: int | None = None,
+        provenance: dict[str, Any] | None = None,
     ) -> TranscriptAppendResult:
         from opensquilla.engine.runtime import _accepts_keyword_arg
 
@@ -1769,6 +1770,8 @@ class _TurnRunnerTranscriptAppendAdapter(TranscriptAppendPort):
             append_kwargs["expected_session_id"] = expected_session_id
         if expected_session_epoch is not None:
             append_kwargs["expected_session_epoch"] = expected_session_epoch
+        if provenance is not None:
+            append_kwargs["provenance"] = provenance
         entry = await self._runner._append_session_message(session_key, **append_kwargs)
         raw_message_id = getattr(entry, "message_id", None)
         message_id = (

@@ -2655,7 +2655,15 @@ def test_packaged_session_recovery_gate_uses_installed_electron_and_real_gateway
     assert "server.send(message)" in recovery
     assert "client.send(message)" in recovery
     assert "page.clock" not in recovery
-    assert "socketCount > 1" in recovery
+    assert "assertConcurrentRecoveryTransport" in recovery
+    assert "socketPolicies.get(recoverySocketIndex)?.concurrent_history_reads" in recovery
+    assert "newSocketCount: nextSocketIndex - recoverySocketCountBaseline" in recovery
+    assert "closeCount: physicalCloseCount - recoveryCloseCountBaseline" in recovery
+    assert "const terminalTransport = recoveryTransportSample()" in recovery
+    assert "const recoveredTransport = recoveryTransportSample()" in recovery
+    assert "await cleanupPackagedFirstSend" in recovery
+    assert "processesAfterCleanup: electronProcessSnapshot(processIdentity)" in recovery
+    assert "app?.close().catch(() => {})" not in recovery
     assert "healthyNavigationSocketIds.size" in recovery
     assert "expectedLastMessage" in recovery
     assert "preservedDraft" in recovery
@@ -2822,15 +2830,16 @@ def test_windows_release_workflow_fails_fast_after_gateway_build_failure() -> No
     workflow = _read(".github/workflows/wheelhouse-release.yml")
     windows_build = _section(
         workflow,
-        "      - name: Build unsigned Windows installer",
+        "      - name: Build signed Windows installer",
         "      - name: Verify Electron package",
     )
 
-    assert "shell: bash" in windows_build
-    assert "set -euo pipefail" in windows_build
+    assert "shell: pwsh" in windows_build
+    assert "if ($LASTEXITCODE -ne 0) { throw 'Gateway build failed.' }" in windows_build
     assert windows_build.index("npm run build:gateway") < windows_build.index(
         "          npm run build\n"
     )
+    assert "node scripts/build-signed-windows.cjs" in windows_build
 
 
 def test_desktop_native_artifact_open_allows_active_documents_with_file_extensions() -> None:
@@ -2925,7 +2934,7 @@ def test_desktop_renderer_logging_is_trusted_bounded_and_lifecycle_aware() -> No
         "function currentMainWindow(): BrowserWindow | null",
     )
 
-    assert "details.frame !== window.webContents.mainFrame" in create_window
+    assert "if (!isLiveMainFrameConsoleMessage(window, details)) return" in create_window
     assert "new RendererConsoleLogLimiter()" in create_window
     assert "app.getPath('home')" in create_window
     assert "webContents.on('render-process-gone'" in create_window
@@ -3390,7 +3399,7 @@ def test_desktop_e2e_shutdown_helpers_bound_windows_cleanup_without_masking_fail
 def test_desktop_dual_source_update_resolver_wires_static_channels() -> None:
     # Stable and same-base preview discovery uses a rate-limit-free static OSS
     # manifest. Versioned assets then use a strict OSS/GitHub generic feed with
-    # runtime fallback; unsigned Windows verifies an exact versioned installer
+    # runtime fallback; Windows verifies an exact versioned installer
     # against the release SHA256SUMS (OSS mirror first, canonical GitHub
     # Release as fail-over) before revealing it.
     main_ts = _read("desktop/electron/src/main.ts")

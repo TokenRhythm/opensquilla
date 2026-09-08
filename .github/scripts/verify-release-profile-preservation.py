@@ -4,10 +4,12 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import re
 import sqlite3
 import sys
+import tomllib
 from pathlib import Path
 
 _LABEL_PATTERN = re.compile(r"[A-Za-z0-9._-]{1,80}")
@@ -342,6 +344,44 @@ def seed_profile(home: Path, label: str, *, external_root: Path | None = None) -
             raise RuntimeError(f"seeded sessions.db failed PRAGMA quick_check: {result!r}")
 
 
+def _config_change_summary(expected: str, actual: str) -> str:
+    """Diagnose preservation failures without printing configuration values."""
+
+    def changed_paths(before: dict, after: dict, prefix: str = "") -> list[str]:
+        missing = object()
+        paths: list[str] = []
+        for key in sorted(before.keys() | after.keys()):
+            path = f"{prefix}.{key}" if prefix else key
+            old, new = before.get(key, missing), after.get(key, missing)
+            if old == new:
+                continue
+            if isinstance(old, dict) or isinstance(new, dict):
+                paths.extend(
+                    changed_paths(
+                        old if isinstance(old, dict) else {},
+                        new if isinstance(new, dict) else {},
+                        path,
+                    )
+                )
+            else:
+                paths.append(path)
+        return paths
+
+    try:
+        paths = changed_paths(tomllib.loads(expected), tomllib.loads(actual))
+        semantic_change = {"changed_paths": paths[:20], "changed_path_count": len(paths)}
+    except tomllib.TOMLDecodeError:
+        semantic_change = {"invalid_toml": True}
+    return json.dumps(
+        {
+            "expected_text_sha256": hashlib.sha256(expected.encode("utf-8")).hexdigest(),
+            "actual_text_sha256": hashlib.sha256(actual.encode("utf-8")).hexdigest(),
+            **semantic_change,
+        },
+        sort_keys=True,
+    )
+
+
 def verify_profile(
     home: Path,
     label: str,
@@ -365,7 +405,10 @@ def verify_profile(
     )
     if actual_config != expected_config:
         phase = "after expected runtime migration" if runtime_migrated else "during installation"
-        raise AssertionError(f"config.toml changed unexpectedly {phase}")
+        raise AssertionError(
+            f"config.toml changed unexpectedly {phase}: "
+            f"{_config_change_summary(expected_config, actual_config)}"
+        )
 
     _verify_exact_bytes(
         _runtime_pack_sentinel_path(home),

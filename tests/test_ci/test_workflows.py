@@ -541,7 +541,13 @@ def test_skill_hub_contract_is_integrated_into_canonical_ci() -> None:
         "tests/test_skills_manifest.py",
         "tests/test_skills_bundled_baseline.py",
         "tests/test_skills_hot_reload.py",
-        "tests/test_skills_default_prompt_contract.py",
+        "tests/test_skill_catalog_projection.py",
+        "tests/test_gateway/test_meta_catalog_compatibility.py",
+        "tests/test_gateway/test_rpc_commands.py",
+        "tests/test_migration/test_legacy_config_fixtures.py",
+        "tests/test_skills/test_catalog_upgrade_retirement.py",
+        "tests/test_skills/test_sop_compiler.py",
+        "tests/unit/cli/tui/test_opentui_completion_catalog.py",
         "tests/test_skills_loader_namespaces.py",
         "tests/test_skills_tree.py",
         "tests/test_skills_hub_archive.py",
@@ -2245,7 +2251,7 @@ def test_container_repository_is_lowercase_through_verification_and_promotion(
 def test_organization_guards_keep_the_maintainer_restriction() -> None:
     jobs = _workflow("desktop-fault-injection.yml")["jobs"]
     guards = [job["if"] for job in jobs.values() if "github.repository" in job.get("if", "")]
-    assert len(guards) == 3
+    assert len(guards) == 4
     for guard in guards:
         assert "github.repository == 'TokenRhythm/opensquilla'" in guard
         assert "github.actor == 'Open-Squilla'" in guard

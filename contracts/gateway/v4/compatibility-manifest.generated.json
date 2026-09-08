@@ -373,7 +373,7 @@
       "lifecycle": "stable",
       "name": "chat.send",
       "schema": "conversation/chat-send.schema.json",
-      "schemaSha256": "85a8137aeff9a9c5f6ac3491dfadbfdf8050935f019d4bdab0cee78ce13c48d9"
+      "schemaSha256": "ee0da1e5d87a98bcd4c73cffc666b71f76f9d0500fb50f245ad251f549a47a17"
     },
     {
       "lifecycle": "stable",
@@ -1307,7 +1307,7 @@
       "lifecycle": "stable",
       "name": "sessions.send",
       "schema": "conversation/sessions-send.schema.json",
-      "schemaSha256": "7a1fb4de4d1a5ea5714703bcf21d15ccec633d8b8f3a4ea55319e10a04d7435e"
+      "schemaSha256": "3382c9945ecbccda159ee5389b93af498ffdad1aa5716aedf961feb553b82ce7"
     },
     {
       "canonicalName": "sessions.steer.v2",
@@ -1476,7 +1476,7 @@
     "generatorSha256": "053df928840129e254a7f609e46832d8ee8ee1c241cf225632dcded3f996297e",
     "methodCount": 217,
     "schemaCount": 226,
-    "schemaTreeSha256": "277d4cc091ff6b3ecd532384925daf003f8601d3a1328a9b5b3b886058f63885"
+    "schemaTreeSha256": "de65ac0d9ad183c07500a98a92328888aae9615c9b5e7991e136b5e2cea8fe63"
   },
   "wireVersion": 4
 }
