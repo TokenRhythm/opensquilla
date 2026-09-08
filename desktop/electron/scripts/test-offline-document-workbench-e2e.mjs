@@ -50,7 +50,7 @@ await run(
     'run',
     'pytest',
     '-q',
-    'tests/test_live_artifact_prompt_annotations_e2e.py::test_owned_gateway_html_workbench_lifecycle_is_offline_and_immutable',
+    'tests/test_gateway/test_offline_document_workbench_e2e.py::test_owned_gateway_html_workbench_lifecycle_is_offline_and_immutable',
   ],
 )
 

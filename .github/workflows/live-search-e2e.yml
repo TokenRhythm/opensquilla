@@ -18,7 +18,7 @@ concurrency:
 
 jobs:
   live-search-e2e:
-    name: Live search provider and agent gates
+    name: Live search provider gates
     runs-on: ubuntu-latest
     timeout-minutes: 30
 
@@ -26,9 +26,6 @@ jobs:
       PYTHONPATH: ${{ github.workspace }}
       OPENSQUILLA_TURN_CALL_LOG: "0"
       OPENSQUILLA_LIVE_SEARCH: "1"
-      OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
-      OPENROUTER_BASE_URL: ${{ vars.OPENROUTER_BASE_URL || 'https://openrouter.ai/api/v1' }}
-      LLM_TEST_MODEL: ${{ vars.LLM_TEST_MODEL || 'openai/gpt-4o-mini' }}
       TAVILY_API_KEY: ${{ secrets.TAVILY_API_KEY }}
       BRAVE_SEARCH_API_KEY: ${{ secrets.BRAVE_SEARCH_API_KEY }}
       EXA_API_KEY: ${{ secrets.EXA_API_KEY }}
@@ -58,10 +55,6 @@ jobs:
       - name: Fail if required live search secrets are missing
         shell: bash
         run: |
-          if [ -z "$OPENROUTER_API_KEY" ]; then
-            echo "OPENROUTER_API_KEY GitHub secret is required"
-            exit 1
-          fi
           if [ -z "$TAVILY_API_KEY" ]; then
             echo "TAVILY_API_KEY GitHub secret is required"
             exit 1
@@ -86,7 +79,6 @@ jobs:
         run: |
           timeout 180s uv run pytest \
             tests/live/test_search_retrieval_live.py \
-            tests/live/test_web_search_agent_e2e.py \
             -m live_search \
             -q -s
 

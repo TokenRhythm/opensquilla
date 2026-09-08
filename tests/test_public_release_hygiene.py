@@ -169,7 +169,9 @@ def test_public_testing_guidance_documents_the_private_boundary() -> None:
         "credential-free",
         "tests/_private/",
         "must not be committed",
-        "Live Release E2E",
+        "LLM Smoke",
+        "Live Search E2E",
+        "Live Telegram Smoke",
     ]
 
     for phrase in required_phrases:

@@ -2050,12 +2050,12 @@ def test_live_release_e2e_workflow_is_manual_and_separates_private_inputs() -> N
     text = (WORKFLOW_DIR / "live-release-e2e.yml").read_text(encoding="utf-8")
 
     assert _trigger_keys(data) == {"workflow_dispatch"}
-    assert "tests/functional/test_gateway_llm_e2e.py" in text
     assert "tests/functional/test_live_channel_telegram_smoke.py" in text
     assert "test_webui_browser_chat_e2e.py" not in text
     assert "OPENSQUILLA_WEBUI_BROWSER_CHAT_E2E" not in text
     assert "playwright install chromium" not in text
-    assert "OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}" in text
+    assert "OPENROUTER_API_KEY" not in text
+    assert data["jobs"]["live-release-e2e"]["if"] == "${{ inputs.run_telegram_channel }}"
     assert (
         "OPENSQUILLA_LIVE_TELEGRAM_BOT_TOKEN: "
         "${{ secrets.OPENSQUILLA_LIVE_TELEGRAM_BOT_TOKEN }}"
@@ -2072,19 +2072,14 @@ def test_default_ci_stays_offline_and_does_not_run_live_gates() -> None:
 
     assert "OPENROUTER_API_KEY" not in text
     assert "OPENSQUILLA_LIVE_TELEGRAM" not in text
-    assert "OPENSQUILLA_GATEWAY_LLM_E2E" not in text
     assert "OPENSQUILLA_WEBUI_BROWSER_E2E" not in text
     assert "OPENSQUILLA_WEBUI_BROWSER_CHAT_E2E" not in text
-    assert "test_gateway_llm_e2e.py" not in text
     assert "test_live_channel_telegram_smoke.py" not in text
 
 
 def test_live_release_e2e_fails_fast_when_required_provider_secret_is_missing() -> None:
     text = (WORKFLOW_DIR / "live-release-e2e.yml").read_text(encoding="utf-8")
 
-    assert "Fail if OpenRouter secret is missing" in text
-    assert 'if [ -z "$OPENROUTER_API_KEY" ]; then' in text
-    assert "OPENROUTER_API_KEY GitHub secret is required" in text
     assert "Fail if Telegram secrets are missing when channel smoke is enabled" in text
     assert 'if [ -z "$OPENSQUILLA_LIVE_TELEGRAM_BOT_TOKEN" ]' in text
     assert 'if [ -z "$OPENSQUILLA_LIVE_TELEGRAM_CHAT_ID" ]' in text

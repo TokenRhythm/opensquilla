@@ -145,16 +145,24 @@ def test_ordinary_python_change_selects_targets_without_full_fallback(
 
 
 def test_pr_1347_test_only_change_uses_exact_targets_and_windows_shards(
+    tmp_path: Path,
     suite_config: dict[str, Any],
 ) -> None:
     paths = [
         "tests/test_gateway/test_rpc_sessions.py",
-        "tests/test_live_artifact_prompt_annotations_e2e.py",
+        "tests/test_gateway/test_offline_document_workbench_e2e.py",
         "tests/test_recovery/test_recovery_cmd.py",
     ]
     importing_consumer = "tests/test_gateway/test_p1a_exact_abort_contract.py"
+    for path in paths:
+        _write_test_module(tmp_path, path)
+    _write_test_module(
+        tmp_path,
+        importing_consumer,
+        "import tests.test_gateway.test_rpc_sessions\n",
+    )
 
-    plan = plan_changes(paths, repo=Path.cwd(), config=suite_config)
+    plan = plan_changes(paths, repo=tmp_path, config=suite_config)
 
     assert plan["full_fallback"] is False
     assert plan["python_targets"] == sorted([*paths, importing_consumer])

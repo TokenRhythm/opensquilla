@@ -138,7 +138,6 @@
       "tests/test_execution_status_contract.py",
       "tests/test_git_runtime.py",
       "tests/test_github_issue_link_sync.py",
-      "tests/test_long_task_fault_proxy.py",
       "tests/test_lossless_toml.py",
       "tests/test_memory/test_profile_import.py",
       "tests/test_meta_skill_openclaw_lifestyle_comparison.py",
@@ -227,7 +226,6 @@
       "tests/test_sandbox/test_windows_default_runner.py",
       "tests/test_scripts/test_check_treatment_delivery.py",
       "tests/test_scripts/test_exp_quarantine.py",
-      "tests/test_scripts/test_live_meta_skill_creator_e2e.py",
       "tests/test_skill_pdf_toolkit.py",
       "tests/test_skills/test_awesome_webpage_meta_skill.py",
       "tests/test_skills/test_clarify_schema_protocol.py",
@@ -724,10 +722,6 @@
       "tests/test_identity/test_user_profile_prompt.py",
       "tests/test_identity/test_workspace_injection_scan.py",
       "tests/test_inference_postprocess_rules.py",
-      "tests/test_live_long_task_case_driver.py",
-      "tests/test_live_mixed_provider_gateway.py",
-      "tests/test_live_multi_provider_matrix.py",
-      "tests/test_live_provider_profile_gateway_e2e.py",
       "tests/test_mcp_server/test_bridge.py",
       "tests/test_mcp_server/test_gateway_client.py",
       "tests/test_memory/test_store_vec_extension_cleanup.py",
@@ -841,7 +835,6 @@
       "tests/test_scheduler/test_webhook_delivery.py",
       "tests/test_scripts/test_analyze_dashscope_payload_risk.py",
       "tests/test_scripts/test_check_docker_image_lock.py",
-      "tests/test_scripts/test_live_meta_soft_activation_e2e.py",
       "tests/test_scripts/test_meta_trigger_accuracy_script.py",
       "tests/test_scripts/test_refresh_models_dev_snapshot.py",
       "tests/test_scripts/test_replay_finalize_gate.py",
@@ -1322,10 +1315,9 @@
       "tests/test_engine/turn_runner/test_stream_consumer_stage_unit.py",
       "tests/test_engine/turn_runner/test_turn_finalizer_paused_im_layout.py",
       "tests/test_envelope_policy_deny_cap.py",
+      "tests/test_gateway/test_offline_document_workbench_e2e.py",
       "tests/test_gemini_thought_signature.py",
       "tests/test_install_scripts.py",
-      "tests/test_live_artifact_prompt_annotations_e2e.py",
-      "tests/test_live_long_task_release_gate.py",
       "tests/test_llm_ensemble_config.py",
       "tests/test_mcp/test_sse_client.py",
       "tests/test_mcp_server/test_cli.py",
@@ -1501,23 +1493,11 @@
       "reason": "Reviewed affinity exception for an environment-independent test; rebalance the measured Windows critical path using three comparable successful runs."
     },
     {
-      "path": "tests/test_live_long_task_case_driver.py",
-      "from": "gateway-sqlite",
-      "to": "recovery-migration",
-      "reason": "Rebalance the measured Windows critical path using three comparable successful runs."
-    },
-    {
-      "path": "tests/test_live_multi_provider_matrix.py",
-      "from": "gateway-sqlite",
-      "to": "recovery-migration",
-      "reason": "Rebalance the measured Windows critical path using three comparable successful runs."
-    },
-    {
       "path": "tests/test_observability/test_bundle.py",
       "from": "gateway-sqlite",
-      "to": "desktop-installer-contracts",
+      "to": "recovery-migration",
       "affinity_exception": true,
-      "reason": "Reviewed affinity exception for an environment-independent test; rebalance the measured Windows critical path using three comparable successful runs."
+      "reason": "Retain the reviewed environment-independent affinity exception and balance the remaining historical Windows weights after retiring model E2E harnesses."
     },
     {
       "path": "tests/test_persistence/test_router_decision_writer.py",
@@ -1525,6 +1505,13 @@
       "to": "core",
       "affinity_exception": true,
       "reason": "Reviewed affinity exception for an environment-independent test; rebalance the measured Windows critical path using three comparable successful runs."
+    },
+    {
+      "path": "tests/test_persistence/test_turn_error_writer.py",
+      "from": "gateway-sqlite",
+      "to": "recovery-migration",
+      "affinity_exception": true,
+      "reason": "Balance the remaining historical Windows weights after retiring model E2E harnesses; these synthetic SQLite tests need no shard-specific setup."
     },
     {
       "path": "tests/test_sandbox/test_windows_default_capability.py",

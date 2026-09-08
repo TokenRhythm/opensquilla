@@ -51,7 +51,6 @@ def test_meta_skill_authoring_doc_matches_current_runtime_contract() -> None:
         "final_text_mode",
         "xml_escape",
         "truncate",
-        "scripts/live_meta_soft_activation_e2e.py",
         "disable-model-invocation",
     ]
     for snippet in required_snippets:

@@ -37,8 +37,6 @@ pytest_file_selection_arg = SHARD_MODULE["_pytest_file_selection_arg"]
 
 OFFLINE_MARKER_EXCLUSIONS = {
     "tests/functional/test_agent_synthetic_golden.py",
-    "tests/functional/test_gateway_llm_e2e.py",
-    "tests/functional/test_live_agent_context_boundary_e2e.py",
     "tests/functional/test_live_channel_telegram_smoke.py",
     "tests/functional/test_live_openrouter_compaction.py",
     "tests/functional/test_llm_smoke.py",
@@ -60,10 +58,8 @@ OFFLINE_MARKER_EXCLUSIONS = {
     "tests/integration/cli/tui_real_terminal/test_terminal_changes.py",
     "tests/live/test_search_api_matrix_live.py",
     "tests/live/test_skill_hub_canary_live.py",
-    "tests/live/test_multi_provider_matrix_live.py",
     "tests/live/test_search_retrieval_live.py",
     "tests/live/test_tokenrhythm_catalog_live.py",
-    "tests/live/test_web_search_agent_e2e.py",
     "tests/test_skills/test_meta_router_live.py",
     "tests/test_skills/test_meta_skill_creator_smoke_live.py",
 }
@@ -188,10 +184,6 @@ RECENTLY_ADDED_ACTIVE_TESTS = {
     "tests/test_migrations/test_v030_meta_control_intents.py",
     "tests/test_migrations/test_v031_meta_launch_drafts.py",
     "tests/test_migrations/test_v032_meta_launch_discard_tombstones.py",
-    "tests/test_live_mixed_provider_gateway.py",
-    "tests/test_live_long_task_case_driver.py",
-    "tests/test_live_long_task_release_gate.py",
-    "tests/test_live_multi_provider_matrix.py",
     "tests/test_live_tokenrhythm_billing_audit.py",
     "tests/test_onboarding/test_llm_profiles.py",
     "tests/test_onboarding/test_image_generation_model_discovery.py",
@@ -204,7 +196,6 @@ RECENTLY_ADDED_ACTIVE_TESTS = {
     "tests/test_provider_terminal_evidence_anthropic_codex.py",
     "tests/test_provider_text_tool_normalization.py",
     "tests/test_provider_tokenrhythm_correlation.py",
-    "tests/test_long_task_fault_proxy.py",
     "tests/test_recovery/test_atomic_and_locking.py",
     "tests/test_recovery/test_cleanup.py",
     "tests/test_recovery/test_engine.py",
@@ -402,14 +393,6 @@ def test_runner_saturated_subprocess_contracts_are_marked_ci_serial() -> None:
     assert "pytest.mark.ci_serial" in _function_decorators(
         Path("tests/test_scripts/test_verify_webui_artifact.py"),
         "test_node_and_python_source_fingerprints_share_order_and_line_endings",
-    )
-    assert "pytest.mark.ci_serial" in _function_decorators(
-        Path("tests/test_live_long_task_case_driver.py"),
-        "test_fault_case_executes_through_isolated_gateway_without_real_provider",
-    )
-    assert "pytest.mark.ci_serial" in _function_decorators(
-        Path("tests/test_live_long_task_case_driver.py"),
-        "test_fault_429_case_proves_retry_after_was_not_violated",
     )
     assert "pytest.mark.ci_serial" in _function_decorators(
         Path("tests/test_recovery/test_atomic_and_locking.py"),
@@ -612,10 +595,9 @@ def test_windows_assignment_snapshot_governs_reviewed_rebalancing() -> None:
         "tests/test_gateway/test_project_workspace_execution.py",
         "tests/test_gateway/test_rpc_meta_runs.py",
         "tests/test_gateway/test_rpc_router_decisions.py",
-        "tests/test_live_long_task_case_driver.py",
-        "tests/test_live_multi_provider_matrix.py",
         "tests/test_observability/test_bundle.py",
         "tests/test_persistence/test_router_decision_writer.py",
+        "tests/test_persistence/test_turn_error_writer.py",
         "tests/test_sandbox/test_windows_default_capability.py",
         "tests/test_skills/test_meta_resume.py",
     }
@@ -626,7 +608,7 @@ def test_windows_assignment_snapshot_governs_reviewed_rebalancing() -> None:
     assert moved_paths == expected_moved_paths
     assert set(assignments) == set(historical_test_weights())
     assert {str(override["path"]) for override in overrides} == expected_moved_paths
-    assert sum(override.get("affinity_exception") is True for override in overrides) == 6
+    assert sum(override.get("affinity_exception") is True for override in overrides) == 7
     assert guardrails == {
         "max_moved_files": 10,
         "max_moved_fraction": 0.02,
@@ -785,6 +767,9 @@ def test_affinity_overflow_moves_only_environment_independent_tests() -> None:
     assert moved == {
         "tests/test_ci/test_migrations_packaged.py": "core",
         "tests/test_gateway/test_goal_rpc.py": "desktop-installer-contracts",
+        "tests/test_gateway/test_offline_document_workbench_e2e.py": (
+            "desktop-installer-contracts"
+        ),
         "tests/test_gateway/test_project_workspace_execution.py": (
             "desktop-installer-contracts"
         ),
@@ -792,11 +777,12 @@ def test_affinity_overflow_moves_only_environment_independent_tests() -> None:
         "tests/test_gateway/test_rpc_router_decisions.py": (
             "desktop-installer-contracts"
         ),
-        "tests/test_observability/test_bundle.py": "desktop-installer-contracts",
+        "tests/test_observability/test_bundle.py": "recovery-migration",
         "tests/test_persistence/test_meta_run_writer.py": (
             "desktop-installer-contracts"
         ),
         "tests/test_persistence/test_router_decision_writer.py": "core",
+        "tests/test_persistence/test_turn_error_writer.py": "recovery-migration",
     }
     assert shard_for_test("tests/test_recovery/test_atomic_and_locking.py") == (
         "recovery-migration"

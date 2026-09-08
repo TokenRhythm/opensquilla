@@ -438,10 +438,7 @@ Before sharing or enabling a MetaSkill:
    reflect the workflow's true side effects.
 7. If supporting `meta_skill.auto_trigger = true`, run deterministic trigger
    checks with `scripts/meta_trigger_accuracy.py`.
-8. If supporting `meta_skill.auto_trigger = true`, run model-decision soft
-   activation checks with
-   `scripts/live_meta_soft_activation_e2e.py --env-file /path/to/.env`.
-9. For generated skills, inspect the Web UI proposal detail and its auto-enable
+8. For generated skills, inspect the Web UI proposal detail and its auto-enable
    audit before accepting or enabling.
 
 ## Troubleshooting

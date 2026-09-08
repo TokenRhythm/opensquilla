@@ -1,15 +1,11 @@
 #!/usr/bin/env python3
 # ruff: noqa: E402,I001
-"""Meta-skill validation matrix and live judge helper.
+"""Meta-skill fixture validation and independent LLM judge helper.
 
-This script intentionally separates three concerns:
+Validate declared fixture materials, prepare empty evidence bundles, or judge a
+captured bundle with an LLM using a strict JSON rubric.
 
-1. Validate that all declared fixture materials exist.
-2. Run the low-cost live harnesses that already exercise LLM meta activation
-   and meta-skill-creator.
-3. Judge a captured E2E bundle with an LLM using a strict JSON rubric.
-
-It never prints provider API keys. Live calls require the caller to provide an
+It never prints provider API keys. Judge calls require the caller to provide an
 env file or pre-populated environment variables.
 """
 
@@ -21,7 +17,6 @@ import json
 import os
 import re
 import sys
-import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -122,134 +117,6 @@ def write_empty_bundle(case_id: str, output: Path) -> dict[str, Any]:
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(json.dumps(bundle, ensure_ascii=False, indent=2), encoding="utf-8")
     return {"ok": True, "bundle": str(output)}
-
-
-def run_live_smokes(
-    *,
-    provider: str,
-    model: str,
-    creator_model: str,
-    home: Path | None,
-    bundle_dir: Path | None,
-) -> dict[str, Any]:
-    from scripts.live_meta_skill_creator_e2e import run_live_meta_skill_creator_e2e
-    from scripts.live_meta_soft_activation_e2e import run_live_meta_soft_activation_e2e
-
-    base_home = home or Path(tempfile.mkdtemp(prefix="opensquilla-meta-validation-"))
-    base_home.mkdir(parents=True, exist_ok=True)
-    soft = run_live_meta_soft_activation_e2e(
-        home=base_home / "soft-activation",
-        provider=provider,
-        model=model,
-    )
-    creator = run_live_meta_skill_creator_e2e(
-        home=base_home / "creator",
-        provider=provider,
-        model=creator_model,
-        auto_enable=True,
-        auto_enable_max_risk="low",
-    )
-    result = {
-        "ok": bool(soft.get("ok")) and bool(creator.get("ok")),
-        "home": str(base_home),
-        "soft_activation": _scrub_live_result(soft),
-        "creator": _scrub_live_result(creator),
-    }
-    if bundle_dir is not None:
-        result["judge_bundles"] = write_live_smoke_bundles(result, bundle_dir)
-    return result
-
-
-def write_live_smoke_bundles(result: dict[str, Any], bundle_dir: Path) -> list[dict[str, Any]]:
-    bundle_dir.mkdir(parents=True, exist_ok=True)
-    bundles = [
-        _soft_activation_bundle(result.get("soft_activation", {})),
-        _creator_bundle(result.get("creator", {})),
-    ]
-    written: list[dict[str, Any]] = []
-    for bundle in bundles:
-        output = bundle_dir / f"{bundle['case_id']}.bundle.json"
-        output.write_text(json.dumps(bundle, ensure_ascii=False, indent=2), encoding="utf-8")
-        written.append({"case_id": bundle["case_id"], "bundle": str(output)})
-    return written
-
-
-def _soft_activation_bundle(soft: dict[str, Any]) -> dict[str, Any]:
-    case = _case_by_id("A1_live_soft_activation")
-    observed = soft.get("observed_tool_results", [])
-    steps = [
-        {"step_id": str(item).removeprefix("meta-step:"), "status": "ok"}
-        for item in observed
-        if str(item).startswith("meta-step:")
-    ]
-    return {
-        "case_id": case["case_id"],
-        "skill_name": case.get("skill_name"),
-        "prompt": _prompt_for_case(case),
-        "materials": case.get("materials", []),
-        "expected_steps": case.get("expected_steps", []),
-        "expected_artifacts": case.get("expected_artifacts", []),
-        "selected_meta_skill": soft.get("model_decision", {}).get("selected_meta_skill", ""),
-        "step_trace": steps,
-        "final_text": soft.get("final_text", ""),
-        "artifacts": [],
-        "errors": soft.get("cases", [{}])[0].get("errors", []),
-        "raw_evidence": {
-            "model_decision": soft.get("model_decision", {}),
-            "observed_tool_results": observed,
-            "meta_invoke_result": soft.get("meta_invoke_result", ""),
-        },
-    }
-
-
-def _creator_bundle(creator: dict[str, Any]) -> dict[str, Any]:
-    case = _case_by_id("C4_live_meta_skill_creator_history_summary")
-    expected_steps = case.get("expected_steps", [])
-    proposal = creator.get("persist", {})
-    return {
-        "case_id": case["case_id"],
-        "skill_name": case.get("skill_name"),
-        "prompt": _prompt_for_case(case),
-        "materials": case.get("materials", []),
-        "expected_steps": expected_steps,
-        "expected_artifacts": case.get("expected_artifacts", []),
-        "selected_meta_skill": "meta-skill-creator",
-        "step_trace": [{"step_id": step, "status": "ok"} for step in expected_steps],
-        "final_text": json.dumps(
-            {
-                "name": creator.get("llm_slots", {}).get("name"),
-                "triggers": creator.get("llm_slots", {}).get("triggers", []),
-                "lint": creator.get("lint", {}),
-                "smoke": creator.get("smoke", {}),
-                "persist": proposal,
-            },
-            ensure_ascii=False,
-        ),
-        "artifacts": [
-            {
-                "type": "proposal",
-                "id": proposal.get("proposal_id"),
-                "name": creator.get("llm_slots", {}).get("name"),
-                "path": proposal.get("auto_enable", {}).get("skill_path"),
-            }
-        ],
-        "errors": [],
-    }
-
-
-def _scrub_live_result(value: Any) -> Any:
-    if isinstance(value, dict):
-        scrubbed = {}
-        for key, item in value.items():
-            lower = str(key).lower()
-            if "key" in lower or "token" in lower or "secret" in lower:
-                scrubbed[key] = "[REDACTED]"
-            else:
-                scrubbed[key] = _scrub_live_result(item)
-        return scrubbed
-    if isinstance(value, list):
-        return [_scrub_live_result(item) for item in value]
-    return value
 
 
 def _judge_prompt(bundle: dict[str, Any]) -> str:
@@ -357,13 +224,6 @@ def main(argv: list[str] | None = None) -> int:
     bundle_p.add_argument("--case-id", required=True)
     bundle_p.add_argument("--output", type=Path, required=True)
 
-    live_p = sub.add_parser("run-live-smokes", help="Run low-cost live LLM smoke harnesses.")
-    live_p.add_argument("--provider", default="openrouter")
-    live_p.add_argument("--model", default="deepseek/deepseek-v4-flash")
-    live_p.add_argument("--creator-model", default="deepseek/deepseek-v4-pro")
-    live_p.add_argument("--home", type=Path)
-    live_p.add_argument("--bundle-dir", type=Path)
-
     judge_p = sub.add_parser("judge-bundle", help="Judge a captured E2E bundle with an LLM.")
     judge_p.add_argument("--bundle", type=Path, required=True)
     judge_p.add_argument("--provider", default="openrouter")
@@ -379,14 +239,6 @@ def main(argv: list[str] | None = None) -> int:
         result = check_materials(load_cases())
     elif args.cmd == "write-empty-bundle":
         result = write_empty_bundle(args.case_id, args.output)
-    elif args.cmd == "run-live-smokes":
-        result = run_live_smokes(
-            provider=args.provider,
-            model=args.model,
-            creator_model=args.creator_model,
-            home=args.home,
-            bundle_dir=args.bundle_dir,
-        )
     elif args.cmd == "judge-bundle":
         result = run_judge(
             args.bundle,

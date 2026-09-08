@@ -1,15 +1,14 @@
+"""Offline document workflows through a real loopback Gateway and provider."""
+
 from __future__ import annotations
 
 import asyncio
 import base64
 import hashlib
 import http.server
-import importlib.util
 import json
 import os
 import sqlite3
-import subprocess
-import sys
 import threading
 from pathlib import Path
 from typing import Any
@@ -17,31 +16,12 @@ from urllib.parse import quote
 from urllib.request import urlopen
 
 import pytest
+from gateway_helpers import offline_document_workbench as e2e
 
 from opensquilla.artifacts import ArtifactStore
 from opensquilla.gateway.transcripts import build_transcript_attachment_envelope
 from opensquilla.session.models import TranscriptEntry
 from opensquilla.session.storage import SessionStorage
-
-
-def _load_module():
-    script = (
-        Path(__file__).resolve().parents[1]
-        / "scripts"
-        / "live_artifact_prompt_annotations_e2e.py"
-    )
-    spec = importlib.util.spec_from_file_location(
-        "live_artifact_prompt_annotations_e2e",
-        script,
-    )
-    assert spec is not None and spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = module
-    spec.loader.exec_module(module)
-    return module
-
-
-e2e = _load_module()
 
 
 def _router_bundle_is_hydrated(bundle: Path | None = None) -> bool:
@@ -74,20 +54,6 @@ def _router_bundle_is_hydrated(bundle: Path | None = None) -> bool:
         except OSError:
             return False
     return True
-
-
-def test_router_bundle_hydration_guard_detects_lfs_pointer(tmp_path: Path) -> None:
-    manifest = {"files": [{"path": "model.onnx"}]}
-    (tmp_path / "artifact_manifest.json").write_text(
-        json.dumps(manifest),
-        encoding="utf-8",
-    )
-    model = tmp_path / "model.onnx"
-    model.write_bytes(b"version https://git-lfs.github.com/spec/v1\n")
-    assert _router_bundle_is_hydrated(tmp_path) is False
-
-    model.write_bytes(b"hydrated-router-model")
-    assert _router_bundle_is_hydrated(tmp_path) is True
 
 
 class _DeterministicArtifactProvider:
@@ -395,381 +361,6 @@ class _DeterministicArtifactProvider:
         )
 
 
-def test_scenario_matrix_has_approved_42_63_64_budget() -> None:
-    e2e._assert_scenario_plan()
-
-    assert sum(row.expected_physical_calls for row in e2e.SCENARIOS) == 42
-    assert e2e.WORST_CASE_PHYSICAL_CALLS == 63
-    assert e2e.HARD_PHYSICAL_CALL_CAP == 64
-    assert sum(row.zero_call_preflight for row in e2e.SCENARIOS) == 3
-    mutation_cases = [row for row in e2e.SCENARIOS if not row.zero_call_preflight]
-    assert mutation_cases
-    assert all(
-        row.expected_tools == e2e._ANNOTATION_TOOLS
-        for row in mutation_cases
-    )
-
-
-def test_physical_call_budget_refuses_overrun() -> None:
-    with pytest.raises(ValueError, match="between 63 and 64"):
-        e2e.PhysicalCallBudget(hard_cap=62)
-
-    budget = e2e.PhysicalCallBudget(hard_cap=64)
-    budget.reserve("baseline", 42)
-    budget.reserve("retry", 16)
-    budget.reserve("ensemble_extra", 5)
-    budget.claim("baseline", 42)
-    budget.claim("retry", 16)
-    budget.claim("ensemble_extra", 5)
-
-    assert budget.observed == 63
-    with pytest.raises(RuntimeError, match="exceeded"):
-        budget.claim("ensemble_extra")
-
-
-def test_direct_repair_loop_requires_one_decision_per_provider_request() -> None:
-    exact = (
-        ("document_inspect",),
-        ("document_read",),
-        ("document_patch",),
-        ("document_browser_inspect",),
-        ("document_browser_screenshot",),
-        ("document_patch",),
-        ("document_browser_inspect",),
-        ("document_finish",),
-        (),
-    )
-    assert e2e._direct_repair_loop_verified(exact) is True
-
-    grouped_read_and_patch = (
-        exact[0],
-        ("document_read", "document_patch"),
-        *exact[3:],
-    )
-    assert e2e._direct_repair_loop_verified(grouped_read_and_patch) is False
-
-
-def test_worker_environment_contains_only_tokenrhythm_provider_secret(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setenv("OPENAI_API_KEY", "ambient-openai-secret")
-    monkeypatch.setenv("TOKENRHYTHM_BASE_URL", "https://attacker.invalid")
-    monkeypatch.setenv("HTTP_PROXY", "https://proxy.invalid")
-
-    env = e2e._worker_environment("synthetic-rotated-key")
-
-    assert env["TOKENRHYTHM_API_KEY"] == "synthetic-rotated-key"
-    assert "OPENAI_API_KEY" not in env
-    assert "TOKENRHYTHM_BASE_URL" not in env
-    assert "HTTP_PROXY" not in env
-    assert "HOME" not in env
-    assert env["PYTHONUNBUFFERED"] == "1"
-    assert env["OPENSQUILLA_LIVE_DISABLE_DOTENV"] == "1"
-
-
-def test_isolated_home_environment_supports_path_home_in_child(tmp_path: Path) -> None:
-    isolated_home = tmp_path / "user-state"
-    isolated_home.mkdir()
-    env = e2e._worker_environment("synthetic-rotated-key")
-
-    e2e._apply_isolated_home_environment(env, isolated_home)
-
-    result = subprocess.run(
-        [sys.executable, "-c", "from pathlib import Path; print(Path.home())"],
-        check=True,
-        capture_output=True,
-        env=env,
-        text=True,
-    )
-    assert Path(result.stdout.strip()) == isolated_home.resolve()
-    assert env["HOME"] == str(isolated_home.resolve())
-    assert env["USERPROFILE"] == str(isolated_home.resolve())
-
-
-@pytest.mark.skipif(os.name != "nt", reason="Windows isolated-profile migration smoke")
-def test_isolated_home_environment_supports_lightweight_sandbox_migration(
-    tmp_path: Path,
-) -> None:
-    isolated_home = tmp_path / "user-state"
-    isolated_home.mkdir()
-    config = isolated_home / "config.toml"
-    config.write_text('[sandbox]\nrun_mode = "trusted"\n', encoding="utf-8")
-    env = e2e._worker_environment("synthetic-rotated-key")
-    e2e._apply_isolated_home_environment(env, isolated_home)
-    env["PYTHONPATH"] = str(e2e.SRC_DIR)
-    code = (
-        "from pathlib import Path; import sys; "
-        "from opensquilla.sandbox.upgrade_migration import SandboxUpgradeCoordinator; "
-        "report = SandboxUpgradeCoordinator(Path(sys.argv[1])).run(); "
-        "assert report.ok, report; "
-        "assert report.status == 'committed', report; "
-        "assert 'run_mode = \"safe\"' in "
-        "(Path(sys.argv[1]) / 'config.toml').read_text(encoding='utf-8'); "
-        "print('sandbox-migration-complete', flush=True)"
-    )
-
-    try:
-        subprocess.run(
-            [sys.executable, "-c", code, str(isolated_home)],
-            check=True,
-            capture_output=True,
-            env=env,
-            text=True,
-            timeout=30,
-        )
-    except subprocess.TimeoutExpired as exc:
-        raise AssertionError(
-            f"isolated Windows sandbox migration timed out: stdout={exc.stdout!r} "
-            f"stderr={exc.stderr!r}"
-        ) from exc
-    except subprocess.CalledProcessError as exc:
-        raise AssertionError(
-            f"isolated Windows sandbox migration failed: stdout={exc.stdout!r} "
-            f"stderr={exc.stderr!r}"
-        ) from exc
-
-
-def test_live_harness_checks_each_feature_default_independently(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    app_store = tmp_path / "opensquilla-webui" / "src" / "stores" / "app.ts"
-    app_store.parent.mkdir(parents=True)
-    app_store.write_text(
-        "artifactPromptAnnotations: false,\ndocumentWorkbenchResources: false,\n",
-        encoding="utf-8",
-    )
-    monkeypatch.setattr(e2e, "REPO_ROOT", tmp_path)
-
-    assert e2e._feature_defaults() == {
-        "artifactPromptAnnotations": False,
-        "documentWorkbenchResources": False,
-    }
-    app_store.write_text(
-        "artifactPromptAnnotations: false,\ndocumentWorkbenchResources: true,\n",
-        encoding="utf-8",
-    )
-    assert e2e._feature_defaults() == {
-        "artifactPromptAnnotations": False,
-        "documentWorkbenchResources": True,
-    }
-    app_store.write_text(
-        "artifactPromptAnnotations: hasNativeBridge(),\n"
-        "documentWorkbenchResources: true,\n",
-        encoding="utf-8",
-    )
-    assert e2e._feature_defaults() == {
-        "artifactPromptAnnotations": True,
-        "documentWorkbenchResources": True,
-    }
-
-
-def test_incomplete_report_is_explicit_safe_and_zero_call(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(
-        e2e,
-        "_feature_defaults",
-        lambda: {
-            "artifactPromptAnnotations": True,
-            "documentWorkbenchResources": True,
-        },
-    )
-    report = e2e._incomplete_report(hard_cap=64)
-    e2e._assert_report_safe(report, {"TOKENRHYTHM_API_KEY": "secret-never-present"})
-
-    assert report["certification"] == "incomplete"
-    assert report["featureDefaultEnabled"] is True
-    assert report["featureDefaults"] == {
-        "artifactPromptAnnotations": True,
-        "documentWorkbenchResources": True,
-    }
-    assert report["physicalCallBudget"]["observed"] == 0
-    assert all(row["status"] == "not_run" for row in report["cases"])
-    assert report["reasonCodes"] == ["live_gateway_executor_failed"]
-    assert all(row["providerCalled"] is False for row in report["cases"])
-
-
-def _passing_evidence(scenario) -> object:
-    if scenario.zero_call_preflight:
-        return e2e.CaseEvidence(
-            before_hash_verified=True,
-            mode_verified=True,
-            router_tier_verified=True,
-            passed=True,
-            status="passed",
-            reason_code="none",
-        )
-    return e2e.CaseEvidence(
-        observed_physical_calls=scenario.expected_physical_calls,
-        provider_called=True,
-        before_hash_verified=True,
-        after_hash_verified=True,
-        single_revision_verified=True,
-        single_change_set_verified=True,
-        accepted_annotations_verified=True,
-        mode_verified=True,
-        router_tier_verified=True,
-        observed_tools=tuple(
-            sorted({"document_inspect", e2e._expected_writer_name(scenario)})
-        ),
-        writer_calls=e2e._expected_writer_calls(scenario),
-        writer_attempts=e2e._expected_writer_calls(scenario),
-        proposer_tool_calls=0,
-        aggregator_tools_verified=True,
-        revert_verified=True,
-        passed=True,
-        status="passed",
-        reason_code="none",
-    )
-
-
-def test_certification_reserves_each_case_and_completes_from_evidence_not_feature_defaults(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    events: list[str] = []
-    original_reserve = e2e.PhysicalCallBudget.reserve
-
-    def recording_reserve(self, kind, count):
-        events.append(f"reserve:{kind}:{count}")
-        return original_reserve(self, kind, count)
-
-    monkeypatch.setattr(e2e.PhysicalCallBudget, "reserve", recording_reserve)
-    monkeypatch.setattr(
-        e2e,
-        "_feature_defaults",
-        lambda: {
-            "artifactPromptAnnotations": True,
-            "documentWorkbenchResources": True,
-        },
-    )
-
-    class FakeDriver:
-        async def start(self) -> None:
-            events.append("start")
-
-        async def run_case(self, scenario):
-            events.append(f"run:{scenario.case}")
-            return _passing_evidence(scenario)
-
-        async def close(self) -> None:
-            events.append("close")
-
-    report = asyncio.run(e2e._run_certification(FakeDriver(), hard_cap=64))
-    e2e._assert_report_safe(report, {})
-
-    for scenario in e2e.SCENARIOS:
-        run = f"run:{scenario.case}"
-        assert run in events
-        if scenario.expected_physical_calls:
-            reservation = f"reserve:baseline:{scenario.expected_physical_calls}"
-            assert events.index(reservation) < events.index(run)
-    assert events[-1] == "close"
-    assert report["certification"] == "complete"
-    assert report["featureDefaultEnabled"] is True
-    assert report["reasonCodes"] == []
-    assert report["physicalCallBudget"]["observed"] == 42
-    assert all(row["status"] == "passed" for row in report["cases"])
-
-
-def test_certification_closes_driver_and_never_invents_report_after_executor_failure() -> None:
-    events: list[str] = []
-
-    class FailingDriver:
-        async def start(self) -> None:
-            events.append("start")
-
-        async def run_case(self, scenario):
-            events.append(f"run:{scenario.case}")
-            raise RuntimeError("synthetic executor failure")
-
-        async def close(self) -> None:
-            events.append("close")
-
-    with pytest.raises(RuntimeError, match="synthetic executor failure"):
-        asyncio.run(e2e._run_certification(FailingDriver(), hard_cap=64))
-    assert events == ["start", "run:discarded_annotation_zero_call", "close"]
-
-
-def test_certification_rejects_case_that_exceeds_its_pre_reserved_calls() -> None:
-    class OverrunningDriver:
-        async def start(self) -> None:
-            return None
-
-        async def run_case(self, scenario):
-            if scenario.zero_call_preflight:
-                return _passing_evidence(scenario)
-            return e2e.CaseEvidence(
-                observed_physical_calls=scenario.expected_physical_calls + 1,
-                provider_called=True,
-            )
-
-        async def close(self) -> None:
-            return None
-
-    with pytest.raises(RuntimeError, match="reserved physical-call budget"):
-        asyncio.run(e2e._run_certification(OverrunningDriver(), hard_cap=64))
-
-
-@pytest.mark.asyncio
-async def test_wait_for_task_retries_transient_storage_busy(tmp_path: Path) -> None:
-    driver = e2e.GatewayCertificationDriver(
-        temp_root=tmp_path,
-        api_key="synthetic",
-        timeout_seconds=1.0,
-        provider_endpoint="http://127.0.0.1:9/v1",
-        preload_router=False,
-    )
-
-    class Client:
-        calls = 0
-
-        async def call(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
-            assert method == "sessions.bootstrap"
-            assert params == {"key": "agent:main:test", "limit": 100}
-            self.calls += 1
-            if self.calls == 1:
-                raise e2e.GatewayRPCError(
-                    method,
-                    code="STORAGE_BUSY",
-                    message="Session storage is temporarily busy. Retry this operation.",
-                )
-            return {"tasks": [{"task_id": "task-1", "status": "succeeded"}]}
-
-    client = Client()
-    driver.client = client
-
-    task = await driver._wait_for_task("agent:main:test", "task-1")
-
-    assert task["status"] == "succeeded"
-    assert client.calls == 2
-
-
-@pytest.mark.asyncio
-async def test_wait_for_task_does_not_retry_other_rpc_errors(tmp_path: Path) -> None:
-    driver = e2e.GatewayCertificationDriver(
-        temp_root=tmp_path,
-        api_key="synthetic",
-        timeout_seconds=1.0,
-        provider_endpoint="http://127.0.0.1:9/v1",
-        preload_router=False,
-    )
-
-    class Client:
-        calls = 0
-
-        async def call(self, method: str, _params: dict[str, Any]) -> dict[str, Any]:
-            self.calls += 1
-            raise e2e.GatewayRPCError(method, code="FORBIDDEN", message="denied")
-
-    client = Client()
-    driver.client = client
-
-    with pytest.raises(e2e.GatewayRPCError, match="FORBIDDEN"):
-        await driver._wait_for_task("agent:main:test", "task-1")
-    assert client.calls == 1
-
-
 @pytest.mark.ci_serial
 @pytest.mark.asyncio
 async def test_owned_gateway_preflights_use_real_rpc_bridge_and_zero_provider_calls(
@@ -777,7 +368,6 @@ async def test_owned_gateway_preflights_use_real_rpc_bridge_and_zero_provider_ca
 ) -> None:
     driver = e2e.GatewayCertificationDriver(
         temp_root=tmp_path,
-        api_key="synthetic-key-must-never-be-sent",
         timeout_seconds=20.0,
         # Any accidental provider request fails immediately.  The three
         # preflights must be rejected by ingress/selection before that point.
@@ -806,7 +396,6 @@ async def test_owned_gateway_html_workbench_lifecycle_is_offline_and_immutable(
     provider.start()
     driver = e2e.GatewayCertificationDriver(
         temp_root=tmp_path,
-        api_key="synthetic-key-for-loopback-provider-only",
         timeout_seconds=20.0,
         provider_endpoint=provider.endpoint,
         allow_local_test_model_overrides=True,
@@ -1201,7 +790,6 @@ async def test_owned_gateway_mutations_use_real_rpc_and_local_provider(
     provider.start()
     driver = e2e.GatewayCertificationDriver(
         temp_root=tmp_path,
-        api_key="synthetic-key-for-local-provider-only",
         # The first routed case cold-loads the recommended local router model.
         # Keep this below the live harness default while allowing that one-time
         # startup cost on slower CI hosts.
@@ -1255,191 +843,3 @@ async def test_owned_gateway_mutations_use_real_rpc_and_local_provider(
     finally:
         await driver.close()
         provider.close()
-
-
-def test_report_guard_rejects_runtime_payload_fields_and_call_overrun() -> None:
-    report = e2e._incomplete_report(hard_cap=64)
-    report["prompt"] = "must not persist"
-    with pytest.raises(RuntimeError, match="top-level schema"):
-        e2e._assert_report_safe(report, {})
-
-    report = e2e._incomplete_report(hard_cap=64)
-    report["physicalCallBudget"]["observed"] = 65
-    with pytest.raises(RuntimeError, match="physical-call cap"):
-        e2e._assert_report_safe(report, {})
-
-
-def test_report_guard_rejects_forged_passing_mutation_evidence() -> None:
-    evidence = {
-        scenario.case: _passing_evidence(scenario)
-        for scenario in e2e.SCENARIOS
-    }
-    report = e2e._report(hard_cap=64, evidences=evidence)
-    e2e._assert_report_safe(report, {})
-
-    direct = next(row for row in report["cases"] if row["case"] == "direct_single_annotation")
-    direct["writerCalls"] = 0
-    with pytest.raises(RuntimeError, match="passed mutation"):
-        e2e._assert_report_safe(report, {})
-
-
-def test_local_model_capability_override_is_loopback_only(tmp_path: Path) -> None:
-    with pytest.raises(ValueError, match="loopback provider"):
-        e2e.GatewayCertificationDriver(
-            temp_root=tmp_path,
-            api_key="synthetic",
-            timeout_seconds=20.0,
-            provider_endpoint="https://tokenrhythm.studio/v1",
-            allow_local_test_model_overrides=True,
-        )
-
-
-def test_main_requires_both_attestations_before_worker(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    output = tmp_path / "report.json"
-    monkeypatch.setenv("TOKENRHYTHM_API_KEY", "synthetic-rotated-key")
-    monkeypatch.setattr(
-        e2e,
-        "_launch_worker",
-        lambda **_kwargs: pytest.fail("worker must not start without attestations"),
-    )
-    monkeypatch.setattr(sys, "argv", ["e2e", "--output", str(output)])
-    assert e2e.main() == 2
-    assert not output.exists()
-
-    monkeypatch.setattr(
-        sys,
-        "argv",
-        ["e2e", "--output", str(output), "--confirm-live-cost"],
-    )
-    assert e2e.main() == 2
-    assert not output.exists()
-
-
-@pytest.mark.parametrize("matrix_timeout", [299, 901])
-def test_main_rejects_out_of_bounds_matrix_timeout_before_worker(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-    matrix_timeout: int,
-) -> None:
-    output = tmp_path / "report.json"
-    monkeypatch.setenv("TOKENRHYTHM_API_KEY", "synthetic-rotated-key")
-    monkeypatch.setattr(
-        e2e,
-        "_launch_worker",
-        lambda **_kwargs: pytest.fail("worker must not start with an invalid matrix timeout"),
-    )
-    monkeypatch.setattr(
-        sys,
-        "argv",
-        [
-            "e2e",
-            "--output",
-            str(output),
-            "--confirm-live-cost",
-            "--confirm-rotated-key",
-            "--matrix-timeout-seconds",
-            str(matrix_timeout),
-        ],
-    )
-
-    assert e2e.main() == 2
-    assert not output.exists()
-
-
-def test_launch_worker_keeps_case_and_matrix_timeouts_separate(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    observed: dict[str, object] = {}
-
-    def fake_run(command, **kwargs):
-        observed["command"] = command
-        observed["timeout"] = kwargs["timeout"]
-        observed["cwd"] = kwargs["cwd"]
-        observed["env"] = kwargs["env"]
-        kwargs["stdout"].write(
-            json.dumps(e2e._incomplete_report(hard_cap=e2e.HARD_PHYSICAL_CALL_CAP))
-        )
-        kwargs["stdout"].flush()
-        return subprocess.CompletedProcess(command, 0)
-
-    monkeypatch.setattr(e2e.subprocess, "run", fake_run)
-
-    report = e2e._launch_worker(
-        api_key="synthetic-rotated-key",
-        hard_cap=e2e.HARD_PHYSICAL_CALL_CAP,
-        timeout_seconds=17.0,
-        matrix_timeout_seconds=444.0,
-    )
-
-    command = observed["command"]
-    assert isinstance(command, list)
-    case_timeout_index = command.index("--timeout-seconds") + 1
-    assert command[case_timeout_index] == "17.0"
-    assert "--matrix-timeout-seconds" not in command
-    assert observed["timeout"] == 444.0
-    worker_root = Path(str(observed["cwd"])).resolve()
-    worker_env = observed["env"]
-    assert isinstance(worker_env, dict)
-    assert Path(worker_env["HOME"]) == worker_root / "user-state"
-    assert Path(worker_env["USERPROFILE"]) == worker_root / "user-state"
-    assert report["certification"] == "incomplete"
-
-
-def test_live_parser_defaults_to_glm_safe_case_timeout() -> None:
-    args = e2e._parser().parse_args(
-        [
-            "--output",
-            "/tmp/opensquilla-prompt-annotations.json",
-            "--confirm-live-cost",
-            "--confirm-rotated-key",
-        ]
-    )
-
-    assert args.timeout_seconds == e2e.DEFAULT_CASE_TIMEOUT_SECONDS == 120.0
-
-
-def test_launch_worker_rejects_unbounded_matrix_timeout() -> None:
-    with pytest.raises(ValueError, match="bounded certification window"):
-        e2e._launch_worker(
-            api_key="synthetic-rotated-key",
-            hard_cap=e2e.HARD_PHYSICAL_CALL_CAP,
-            timeout_seconds=17.0,
-            matrix_timeout_seconds=e2e.MAX_MATRIX_TIMEOUT_SECONDS + 1,
-        )
-
-
-def test_main_runs_real_isolated_scaffold_without_network_and_returns_incomplete(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    output = tmp_path / "report.json"
-    key = "synthetic-rotated-key-never-persist"
-    monkeypatch.setenv("TOKENRHYTHM_API_KEY", key)
-    monkeypatch.delenv("TOKENRHYTHM_BASE_URL", raising=False)
-    monkeypatch.setattr(
-        sys,
-        "argv",
-        [
-            "e2e",
-            "--output",
-            str(output),
-            "--confirm-live-cost",
-            "--confirm-rotated-key",
-        ],
-    )
-
-    assert e2e.main() == 1
-    payload = json.loads(output.read_text(encoding="utf-8"))
-    assert payload["certification"] == "incomplete"
-    assert payload["physicalCallBudget"]["observed"] == 0
-    assert key not in output.read_text(encoding="utf-8")
-    if os.name != "nt":
-        assert output.stat().st_mode & 0o777 == 0o600
-    printed = capsys.readouterr()
-    assert key not in printed.out
-    assert key not in printed.err
-    assert "cases" not in printed.out
