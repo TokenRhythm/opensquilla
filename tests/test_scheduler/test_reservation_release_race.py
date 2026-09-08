@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -21,6 +21,8 @@ async def test_release_does_not_overwrite_concurrent_job_changes(
     await store.open()
     await writer.open()
     cleanup: asyncio.Task[bool] | None = None
+    cleanup_updated_at: datetime | None = None
+    concurrent_updated_at: datetime | None = None
     try:
         job = CronJob(id="job", name="original", cron_expr="*/5 * * * *", handler_key="test")
         await store.save(job)
@@ -34,7 +36,11 @@ async def test_release_does_not_overwrite_concurrent_job_changes(
         execute = store._db().execute
 
         def observe_write(sql, params=()):
-            if sql.lstrip().startswith(("INSERT", "UPDATE")) and "scheduler_jobs" in sql:
+            nonlocal cleanup_updated_at
+            statement = sql.lstrip()
+            if statement.startswith("UPDATE") and "scheduler_jobs" in statement:
+                cleanup_updated_at = datetime.fromisoformat(tuple(params)[2])
+            if statement.startswith(("INSERT", "UPDATE")) and "scheduler_jobs" in statement:
                 write_started.set()
             return execute(sql, params)
 
@@ -48,8 +54,11 @@ async def test_release_does_not_overwrite_concurrent_job_changes(
         else:
             changed = await writer.get(job.id)
             assert changed is not None
+            assert cleanup_updated_at is not None
             changed.name = "edited while cleanup waited"
             changed.payload = {"message": "keep this new configuration"}
+            changed.updated_at = cleanup_updated_at + timedelta(seconds=1)
+            concurrent_updated_at = changed.updated_at
             if concurrent_edit == "replace_owner":
                 changed.reservation_token = "new-owner"
                 changed.reserved_by = "replacement-worker"
@@ -67,6 +76,8 @@ async def test_release_does_not_overwrite_concurrent_job_changes(
             assert current is not None
             assert current.name == "edited while cleanup waited"
             assert current.payload == {"message": "keep this new configuration"}
+            assert concurrent_updated_at is not None
+            assert current.updated_at == concurrent_updated_at
             if concurrent_edit == "replace_owner":
                 assert released is False
                 assert current.reservation_token == "new-owner"

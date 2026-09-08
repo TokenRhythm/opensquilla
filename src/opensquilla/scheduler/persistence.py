@@ -841,7 +841,7 @@ class JobStore:
                 reserved_by = '',
                 reservation_source = '',
                 scheduled_run_at = NULL,
-                updated_at = ?
+                updated_at = MAX(updated_at, ?)
             WHERE id = ? AND reservation_token = ?
             """,
             (
