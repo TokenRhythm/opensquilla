@@ -10,7 +10,6 @@
 //   • readonly   — preset preview: no editable controls at all.
 import { computed, nextTick, onBeforeUnmount, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
-import ControlSwitch from '@/components/ControlSwitch.vue'
 import Icon from '@/components/Icon.vue'
 import SetupModelCombobox from '@/components/setup/SetupModelCombobox.vue'
 import type {
@@ -24,6 +23,7 @@ import type {
   DiscoveredModelsByProvider,
 } from '@/composables/setup/useSetupProviderForm'
 import { ROUTER_DYNAMIC_SELECTION_MODE } from '@/types/generated/router_tier_contract'
+import { IMAGE_TIER } from '@/utils/chat/routerTiers'
 
 const { t } = useI18n()
 
@@ -60,7 +60,7 @@ const props = withDefaults(defineProps<{
 })
 
 const emit = defineEmits<{
-  updateTierField: [name: string, key: 'provider' | 'model' | 'thinkingLevel' | 'supportsImage' | 'ensembleEnabled' | 'ensembleSelectionMode', value: string | boolean]
+  updateTierField: [name: string, key: 'provider' | 'model' | 'thinkingLevel' | 'ensembleEnabled' | 'ensembleSelectionMode', value: string | boolean]
   migrateLegacyEnsemble: []
 }>()
 
@@ -80,6 +80,7 @@ const ensembleDetailsAnchor = ref<HTMLElement | null>(null)
 const ensembleTooltipUsesViewport = ref(false)
 const ensembleTooltipPlacement = ref<'top' | 'bottom'>('top')
 const ensembleTooltipStyle = ref<Record<string, string>>({})
+const visibleRows = computed(() => props.rows.filter(row => row.name !== IMAGE_TIER))
 
 function catalogFor(row: SetupTierRow): DiscoveredModelCatalog {
   const provider = row.provider.trim().toLowerCase()
@@ -165,22 +166,6 @@ function rowFieldsDisabled(row: SetupTierRow): boolean {
   // user in fusion or make the active shared plan appear unavailable.
   if (providerManagedByEnsemble(row)) return props.disabled
   return dependentFieldsDisabled(row)
-}
-
-function providerFieldDisabled(): boolean {
-  // An invalid/retired saved provider disables its dependent fields, not the
-  // remediation control itself. C3 fusion only disables C3's own image input;
-  // the dedicated image route remains an independent editable capability.
-  return props.disabled
-}
-
-function imageSwitchDisabled(row: SetupTierRow): boolean {
-  return rowFieldsDisabled(row) || (row.name === 'c3' && tierEnsembleActive(row))
-}
-
-function displayedImageSupport(row: SetupTierRow): boolean {
-  if (row.name === 'c3' && tierEnsembleActive(row)) return false
-  return row.supportsImage
 }
 
 function modelChoiceValue(row: SetupTierRow): string {
@@ -589,7 +574,7 @@ function updateModelChoice(row: SetupTierRow, value: string) {
 
 const showProviderColumn = computed(() => {
   if (props.readonly) return true
-  if (props.rows.some(row => (
+  if (visibleRows.value.some(row => (
     !providerManagedByEnsemble(row) && credentialFor(row)?.available === false
   ))) return true
 
@@ -601,7 +586,7 @@ const showProviderColumn = computed(() => {
   if (configuredProviders.size !== 1) return true
 
   const [onlyProvider] = [...configuredProviders]
-  return props.rows.some(row => (
+  return visibleRows.value.some(row => (
     !providerManagedByEnsemble(row)
     && row.provider.trim().toLowerCase() !== onlyProvider
   ))
@@ -609,9 +594,9 @@ const showProviderColumn = computed(() => {
 
 // The combobox dropdown and compact-plan tooltip are absolutely positioned;
 // the table's rounded-corner overflow clip must open whenever either floats.
-const hasCombobox = computed(() => props.rows.some(row => hasLiveCatalog(row)))
+const hasCombobox = computed(() => visibleRows.value.some(row => hasLiveCatalog(row)))
 const allowsFloatingContent = computed(() => (
-  hasCombobox.value || props.rows.some(row => compactSharedTierEnsembleActive(row))
+  hasCombobox.value || visibleRows.value.some(row => compactSharedTierEnsembleActive(row))
 ))
 </script>
 
@@ -626,15 +611,15 @@ const allowsFloatingContent = computed(() => (
     :aria-disabled="disabled ? 'true' : undefined"
   >
     <div class="setup-tier-table__row is-head" role="row">
-      <span>{{ t('setup.router.colTier') }}</span><span v-if="showProviderColumn">{{ t('setup.router.colProvider') }}</span><span>{{ t('setup.router.colModel') }}</span><span>{{ t('setup.router.colThinking') }}</span><span>{{ t('setup.router.colImage') }}</span>
+      <span>{{ t('setup.router.colTier') }}</span><span v-if="showProviderColumn">{{ t('setup.router.colProvider') }}</span><span>{{ t('setup.router.colModel') }}</span><span>{{ t('setup.router.colThinking') }}</span>
     </div>
     <div
-      v-for="tier in rows"
+      v-for="tier in visibleRows"
       :key="tier.name"
       class="setup-tier-table__row"
-      :class="{ 'is-disabled': providerFieldDisabled() }"
+      :class="{ 'is-disabled': disabled }"
       role="row"
-      :aria-disabled="providerFieldDisabled() ? 'true' : undefined"
+      :aria-disabled="disabled ? 'true' : undefined"
     >
       <span class="setup-tier-table__tier">{{ tierLabel(tier.name) }}</span>
       <template v-if="showProviderColumn">
@@ -653,7 +638,7 @@ const allowsFloatingContent = computed(() => (
             :value="tier.provider.trim().toLowerCase()"
             :aria-label="t('setup.router.tierProviderAria', { tier: tier.name })"
             :aria-invalid="credentialFor(tier) && !credentialFor(tier)?.available ? 'true' : undefined"
-            :disabled="providerFieldDisabled()"
+            :disabled="disabled"
             @change="emit('updateTierField', tier.name, 'provider', ($event.target as HTMLSelectElement).value)"
           >
             <option v-if="!tier.provider" value="" disabled>-</option>
@@ -755,7 +740,6 @@ const allowsFloatingContent = computed(() => (
             ? t('setup.router.tierThinkingManagedByEnsembleAria', { tier: tier.name })
             : t('setup.router.tierThinkingAria', { tier: tier.name })"
         >{{ thinkingManagedByEnsemble(tier) ? t('setup.router.tierThinkingManagedByEnsemble') : tier.thinkingLevel || '-' }}</span>
-        <ControlSwitch :checked="displayedImageSupport(tier)" :disabled="true" :aria-label="t('setup.router.tierImageAria', { tier: tier.name })" />
       </template>
       <template v-else>
         <div class="setup-tier-table__model-cell">
@@ -856,7 +840,6 @@ const allowsFloatingContent = computed(() => (
         <select v-else :value="tier.thinkingLevel" :aria-label="t('setup.router.tierThinkingAria', { tier: tier.name })" :disabled="rowFieldsDisabled(tier)" @change="emit('updateTierField', tier.name, 'thinkingLevel', ($event.target as HTMLSelectElement).value)">
           <option v-for="v in THINKING_LEVELS" :key="v" :value="v">{{ v || '-' }}</option>
         </select>
-        <ControlSwitch :checked="displayedImageSupport(tier)" :disabled="imageSwitchDisabled(tier)" :aria-label="t('setup.router.tierImageAria', { tier: tier.name })" @change="(v) => emit('updateTierField', tier.name, 'supportsImage', v)" />
       </template>
       <span
         v-if="tier.name === 'c3' && !readonly"
@@ -881,7 +864,7 @@ const allowsFloatingContent = computed(() => (
 }
 
 .setup-tier-table--without-provider .setup-tier-table__row {
-  grid-template-columns: 140px minmax(0, 1fr) 120px 60px;
+  grid-template-columns: 140px minmax(0, 1fr) 120px;
 }
 
 .setup-tier-table__provider-cell {

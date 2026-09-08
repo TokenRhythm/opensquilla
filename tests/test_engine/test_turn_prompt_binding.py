@@ -706,13 +706,18 @@ async def test_router_capacity_accepts_retained_missing_reason_marker() -> None:
         preserve_image_attachments=True,
     )
 
-    marker = "[historical attachment omitted: lost.png (image/png)]"
+    marker = "[historical attachment omitted: lost.png (image/png);"
     marker_count = sum(
         message.content.count(marker)
         for message in replay.messages
         if isinstance(message.content, str)
     )
     assert marker_count == 1
+    assert any(
+        "历史图片不可用" in message.content and "原图已保留" not in message.content
+        for message in replay.messages
+        if isinstance(message.content, str)
+    )
     assert replay.estimate_complete is True
     assert context["history_capacity_message_count"] == 2
     assert context["history_capacity_estimate_complete"] is True

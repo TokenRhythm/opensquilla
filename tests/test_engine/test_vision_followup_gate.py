@@ -213,6 +213,79 @@ async def test_gate_skips_when_current_turn_has_image() -> None:
     assert out.metadata.get("router_vision_followup_needs_image") is not True
 
 
+@pytest.mark.parametrize("gate_enabled", [False, True])
+async def test_existing_image_opt_out_beats_current_upload_and_explicit_id(
+    gate_enabled: bool,
+) -> None:
+    ctx = _ctx(
+        "Compare the previous image.",
+        {
+            "router_vision_followup_gate_source": "explicit_opt_out",
+            "router_vision_followup_needs_image": True,
+            "image_intent_attachment_ids": ["att_previous"],
+        },
+    )
+    ctx.config.squilla_router.vision_followup_gate_enabled = gate_enabled
+    ctx.attachments.append({"mime": "image/png", "data": "abc"})
+
+    out = await apply_vision_followup_gate(ctx)
+
+    assert out.metadata["router_vision_followup_gate_source"] == "explicit_opt_out"
+    assert out.metadata["router_vision_followup_needs_image"] is False
+    assert len(out.attachments) == 1
+
+
+@pytest.mark.parametrize("gate_enabled", [False, True])
+@pytest.mark.parametrize("current_upload", [False, True])
+@pytest.mark.parametrize(
+    "message",
+    [
+        "Ignore the earlier screenshot att_example; answer the text question.",
+        "忽略之前那张截图 att_example，只回答文字问题。",
+    ],
+)
+async def test_current_text_opt_out_overrides_attachment_id_intent(
+    gate_enabled: bool, current_upload: bool, message: str,
+) -> None:
+    ctx = _ctx(
+        message,
+        {
+            "router_history_has_recent_image": True,
+            "router_vision_followup_gate_source": "explicit_attachment_id",
+            "router_vision_followup_needs_image": True,
+            "image_intent_attachment_ids": ["att_example"],
+        },
+    )
+    ctx.config.squilla_router.vision_followup_gate_enabled = gate_enabled
+    if current_upload:
+        ctx.attachments.append({"mime": "image/png", "data": "abc"})
+
+    out = await apply_vision_followup_gate(ctx)
+
+    assert out.metadata["router_vision_followup_gate_decision"] == "text_only"
+    assert out.metadata["router_vision_followup_gate_source"] == "explicit_opt_out"
+    assert out.metadata["router_vision_followup_needs_image"] is False
+    assert len(out.attachments) == int(current_upload)
+
+
+async def test_disabled_gate_preserves_positive_attachment_id_intent() -> None:
+    ctx = _ctx(
+        "Describe the earlier screenshot att_example.",
+        {
+            "router_vision_followup_gate_source": "explicit_attachment_id",
+            "router_vision_followup_needs_image": True,
+            "image_intent_attachment_ids": ["att_example"],
+        },
+    )
+    ctx.config.squilla_router.vision_followup_gate_enabled = False
+
+    out = await apply_vision_followup_gate(ctx)
+
+    assert out.metadata["router_vision_followup_gate_decision"] == "disabled"
+    assert out.metadata["router_vision_followup_gate_source"] == "explicit_attachment_id"
+    assert out.metadata["router_vision_followup_needs_image"] is True
+
+
 @pytest.mark.asyncio
 async def test_prompt_annotation_skips_history_image_gate_and_keeps_artifact_floor(
     monkeypatch: pytest.MonkeyPatch,
@@ -500,8 +573,8 @@ async def test_gate_accepts_text_only_json() -> None:
     assert out.metadata["router_vision_followup_gate_confidence"] == 0.84
 
 
-@pytest.mark.asyncio
-async def test_gate_respects_explicit_english_image_opt_out() -> None:
+@pytest.mark.parametrize("gate_enabled", [False, True])
+async def test_gate_respects_explicit_english_image_opt_out(gate_enabled: bool) -> None:
     ctx = _ctx(
         "Do not use or inspect the previous image. Reply exactly: TEXT-ONLY",
         {
@@ -510,6 +583,8 @@ async def test_gate_respects_explicit_english_image_opt_out() -> None:
         },
     )
 
+    ctx.config.squilla_router.vision_followup_gate_enabled = gate_enabled
+
     out = await apply_vision_followup_gate(ctx)
 
     assert out.metadata["router_vision_followup_gate_decision"] == "text_only"
@@ -517,8 +592,8 @@ async def test_gate_respects_explicit_english_image_opt_out() -> None:
     assert out.metadata["router_vision_followup_needs_image"] is False
 
 
-@pytest.mark.asyncio
-async def test_gate_respects_explicit_chinese_image_opt_out() -> None:
+@pytest.mark.parametrize("gate_enabled", [False, True])
+async def test_gate_respects_explicit_chinese_image_opt_out(gate_enabled: bool) -> None:
     ctx = _ctx(
         "不要看上一张图片，直接回答：TEXT-ONLY",
         {
@@ -526,6 +601,8 @@ async def test_gate_respects_explicit_chinese_image_opt_out() -> None:
             "router_turns_since_last_image": 1,
         },
     )
+
+    ctx.config.squilla_router.vision_followup_gate_enabled = gate_enabled
 
     out = await apply_vision_followup_gate(ctx)
 

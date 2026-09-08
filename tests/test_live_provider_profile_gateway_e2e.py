@@ -756,7 +756,7 @@ def test_attachment_capacity_seed_uses_only_isolated_session_state(tmp_path: Pat
     assert session_state == (0, "router")
 
 
-def test_attachment_capacity_config_is_single_call_and_includes_image_tier(
+def test_attachment_capacity_config_is_single_call_with_configured_vision_c2(
     tmp_path: Path,
 ) -> None:
     config_path = tmp_path / "gateway.toml"
@@ -785,14 +785,18 @@ def test_attachment_capacity_config_is_single_call_and_includes_image_tier(
     assert data["agent_runtime_timeout_seconds"] == 75.0
     assert data["task_runtime"]["turn_hard_deadline_s"] == 75.0
     assert data["naming"]["enabled"] is False
-    assert data["squilla_router"]["tiers"]["image_model"] == tiers["image_model"]
-    assert data["squilla_router"]["tiers"]["image_model"]["model"] == "kimi-k2.6"
-    assert all(tiers[slot]["supports_image"] is False for slot in e2e.TEXT_PROFILE_SLOTS)
+    assert "image_model" not in data["squilla_router"]["tiers"]
+    assert data["squilla_router"]["tiers"]["c2"] == tiers["c2"]
+    assert tiers["c2"]["model"] == "kimi-k2.6"
+    assert tiers["c2"]["image_only"] is False
+    assert all("supports_image" not in tiers[slot] for slot in ("c0", "c1", "c2", "c3"))
     assert (
         data["models"]["tokenrhythm"]["deepseek-v4-pro-0813"]["context_window"]
         == e2e.ATTACHMENT_CAPACITY_BASE_CONTEXT_WINDOW_TOKENS
     )
     assert data["models"]["tokenrhythm"]["kimi-k2.6"]["supports_vision"] is True
+    for slot in ("c0", "c1", "c3"):
+        assert data["models"]["tokenrhythm"][tiers[slot]["model"]]["supports_vision"] is False
 
 
 def test_attachment_capacity_runner_reaches_provider_through_real_gateway(
@@ -866,6 +870,8 @@ def test_attachment_capacity_runner_reaches_provider_through_real_gateway(
     assert case["usage"]["physical_response_count"] == 1
     assert case["usage"]["compaction_count"] == 0
     assert case["usage"]["provider_proof_fits"] is True
+    assert case["usage"]["provider_proof_media_blocks"] == 3
+    assert case["usage"]["route_max_history_turns"] == 1
 
 
 @pytest.mark.parametrize(
@@ -938,7 +944,8 @@ def test_attachment_capacity_runner_bounds_provider_http_failures_to_one_call(
 @pytest.mark.parametrize(
     ("mode", "expected_failure", "expected_response_count"),
     [
-        ("empty", "implementation", 0),
+        # An empty SSE body has no terminal evidence and raises incomplete_stream.
+        ("empty", "transport", 0),
         ("truncated", "implementation", 0),
         ("marker_missing", "implementation", 1),
         ("timeout", "transport", 0),
@@ -1174,7 +1181,7 @@ def _attachment_capacity_evidence_records(
             {
                 "step_name": "apply_squilla_router",
                 "routing_source": "image_route",
-                "routed_tier": "image_model",
+                "routed_tier": "c2",
             }
         ],
     }

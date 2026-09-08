@@ -17,6 +17,7 @@ import {
   closeElectronWithDeadline,
   closeHttpServerWithDeadline,
   desktopShutdownEvidenceSince,
+  gatewayProcessSnapshot,
   trackHttpServerConnections,
 } from './e2e-shutdown-helpers.mjs'
 import { terminateWindowsProcessTree } from '../dist/windows-process-tree.js'
@@ -28,6 +29,37 @@ const outputPath = join(root, 'reports', 'cases.jsonl')
 const emitted = []
 
 try {
+  for (const scheme of [
+    'windows-creation-filetime:', 'linux-proc-start-ticks:', 'posix-ps-lstart:',
+  ]) {
+    const record = { pid: 1234, start_identity: `${scheme}old` }
+    const probePid = pid => assert.equal(pid, record.pid)
+    const recycled = gatewayProcessSnapshot(record, {
+      probePid,
+      readStartIdentity: () => `${scheme}new`,
+    })
+    assert.equal(recycled.pidPresent, true)
+    assert.equal(recycled.identityConflict, true)
+    assert.equal(recycled.alive, false, 'PID reuse must not keep the old Gateway alive')
+    for (const liveStartIdentity of [record.start_identity, null, 'runtime-start:unknown']) {
+      assert.equal(gatewayProcessSnapshot(record, {
+        probePid,
+        readStartIdentity: () => liveStartIdentity,
+      }).alive, true, 'matching or unprovable identities must keep waiting')
+    }
+    assert.equal(gatewayProcessSnapshot(record, {
+      probePid: () => { throw Object.assign(new Error('missing'), { code: 'ESRCH' }) },
+      readStartIdentity: () => { assert.fail('an absent PID needs no identity probe') },
+    }).alive, false)
+    assert.equal(gatewayProcessSnapshot(record, {
+      probePid: () => { throw Object.assign(new Error('denied'), { code: 'EPERM' }) },
+      readStartIdentity: () => null,
+    }).alive, true, 'a denied probe is not exit evidence')
+  }
+  assert.equal(gatewayProcessSnapshot({ pid: 1234, start_identity: 'runtime-start:old' }, {
+    probePid: () => {},
+    readStartIdentity: () => 'windows-creation-filetime:new',
+  }).alive, true, 'an opaque recorded identity cannot prove PID reuse')
   const telemetry = startCaseTelemetry({
     caseName: 'direct-case',
     os: 'TestOS',

@@ -100,7 +100,8 @@ _DO_NOT_REPEAT_MARKERS = ("do not repeat", "don't repeat", "不要重复", "不�
 _ARTIFACT_MARKERS = ("artifact", "generated artifact", "附件", "产物")
 _DECISION_PREFIXES = ("decision:", "rationale:", "reason:", "decided:", "决定:", "原因:")
 _IDENTIFIER_RE = re.compile(
-    r"\b(?:[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
+    r"(?<![A-Za-z0-9_-])att_[A-Za-z0-9_-]{8,160}(?![A-Za-z0-9_-])"
+    r"|\b(?:[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
     r"|[0-9a-fA-F]{12,64})\b"
 )
 _ARTIFACT_NAME_RE = re.compile(

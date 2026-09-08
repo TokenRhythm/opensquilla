@@ -248,11 +248,11 @@ def test_route_plan_freezes_text_candidates_aliases_ensemble_and_winner() -> Non
     assert event.router_tier_snapshot == snapshot
 
 
-def test_route_plan_freezes_only_executable_image_candidates() -> None:
+def test_route_plan_freezes_configured_image_candidates_without_legacy_tier() -> None:
     turn = _turn()
     turn.metadata.update(
         {
-            "routed_tier": "image_model",
+            "routed_tier": "c0",
             "routed_provider": "image-provider",
             "routed_model": "image/winner",
             "routing_source": "image_route",
@@ -305,15 +305,69 @@ def test_route_plan_freezes_only_executable_image_candidates() -> None:
         "tiers": [
             {
                 "tier": "c0",
-                "provider": "vision-provider",
-                "model": "vision/fallback",
-                "execution_kind": "single_model",
-            },
-            {
-                "tier": "image_model",
                 "provider": "image-provider",
                 "model": "image/winner",
                 "execution_kind": "single_model",
             },
+            {
+                "tier": "c1",
+                "provider": "text-provider",
+                "model": "text/only",
+                "execution_kind": "single_model",
+            },
         ],
     }
+
+
+def test_route_plan_image_marker_snapshot_keeps_four_configured_text_tiers() -> None:
+    turn = _turn()
+    turn.metadata.update(
+        routed_tier="c1",
+        routed_model="text/actual-winner",
+        routing_source="image_route",
+        image_input_mode="marker",
+    )
+    turn.config = SimpleNamespace(
+        squilla_router=SimpleNamespace(
+            tiers={
+                **{
+                    f"c{index}": {
+                        "model": f"text/configured-{index}",
+                        "supports_image": False,
+                    }
+                    for index in range(4)
+                },
+                "image_model": {
+                    "model": "legacy/unused-vision",
+                    "supports_image": True,
+                    "image_only": True,
+                },
+            }
+        ),
+        llm_ensemble=SimpleNamespace(enabled=False),
+    )
+
+    plan = pin_route_plan(
+        turn,
+        turn_id="turn-snapshot-image-marker",
+        provider="provider-a",
+        model="text/actual-winner",
+        context_window=32_000,
+        capabilities=ModelCapabilities(supports_vision=False),
+        effective_thinking=False,
+    )
+
+    assert plan is not None and plan.router_tier_snapshot is not None
+    snapshot = plan.router_tier_snapshot.as_dict()
+    assert snapshot["request_kind"] == "image"
+    assert [entry["tier"] for entry in snapshot["tiers"]] == ["c0", "c1", "c2", "c3"]
+    assert [entry["model"] for entry in snapshot["tiers"]] == [
+        "text/configured-0",
+        "text/actual-winner",
+        "text/configured-2",
+        "text/configured-3",
+    ]
+    assert turn.metadata["route_plan"]["router_tier_snapshot"] == snapshot
+    event = build_router_decision_event(turn)
+    assert event is not None
+    assert event.router_tier_snapshot == snapshot

@@ -118,6 +118,7 @@ class GatewayAdmissionRuntime:
                 opaque_limit_bytes=opaque_cap if isinstance(opaque_cap, int) else None,
                 allow_material_refs=allow_material_refs,
                 expected_material_scope=session_id if allow_material_refs else None,
+                persist_enabled=bool(getattr(config, "persist_transcripts", True)),
             )
         except attachment_ingest.AttachmentResolutionError as exc:
             raise RpcHandlerError(

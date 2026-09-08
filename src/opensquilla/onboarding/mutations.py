@@ -312,6 +312,19 @@ def _merge_router_tiers(
         tier_name = normalize_text_tier(name) or str(name)
         override = _normalize_tier_payload(tier_name, raw_override)
         current = dict(merged.get(tier_name, {}))
+        deployment_changed = any(
+            field_name in override
+            and str(override.get(field_name) or "").strip()
+            != str(current.get(field_name) or "").strip()
+            for field_name in ("provider", "model")
+        )
+        if deployment_changed and "supports_image" not in override:
+            # Capability evidence belongs to a deployment identity. A model-
+            # only/provider-only override must not inherit the managed preset's
+            # legacy declaration for a different deployment. These fields
+            # remain readable for older clients, not runtime capability facts.
+            current.pop("supports_image", None)
+            current.pop("supportsImage", None)
         # A pre-``ensemble_enabled`` client can still submit an explicit
         # per-tier selection mode.  That legacy field is an ownership
         # boundary: do not let a managed preset's new shared-plan flag turn
@@ -340,12 +353,13 @@ def _canonical_tier_value(tier: Mapping[str, Any]) -> dict[str, Any]:
     legacy_selection_mode = str(
         tier.get("ensemble_selection_mode", tier.get("ensembleSelectionMode", "")) or ""
     ).strip()
+    # Retired image switches do not change the semantic routing preset.
+    # Keep old values in the stored mapping for client compatibility only.
     return {
         "provider": str(tier.get("provider") or "").strip().lower(),
         "model": str(tier.get("model") or "").strip(),
         "description": str(tier.get("description") or "").strip(),
         "thinking_level": (str(thinking or "").strip() or None),
-        "supports_image": bool(tier.get("supports_image", tier.get("supportsImage", False))),
         "image_only": bool(tier.get("image_only", tier.get("imageOnly", False))),
         "ensemble_enabled": ensemble_enabled,
         # Once the new tri-state field exists it owns execution. Retained
@@ -507,6 +521,8 @@ def _cross_provider_tier_warnings(
         ensemble_globally_enabled=ensemble_globally_enabled,
     )
     for tier_name in sorted(tiers):
+        if tier_name == "image_model":
+            continue
         tier = tiers.get(tier_name)
         if not isinstance(tier, dict):
             continue
@@ -1258,6 +1274,14 @@ def upsert_router(
             ),
             llm_profiles=getattr(config, "llm_profiles", None),
         )
+        legacy_image_tier = (router_payload.get("tiers") or {}).get("image_model")
+        if isinstance(legacy_image_tier, dict) and legacy_image_tier.get("model"):
+            warnings.append(
+                "The legacy image_model setting is preserved for compatibility "
+                "but is not used for image input. Configure an image-capable "
+                "model in c0-c3; if none can process images, the turn continues "
+                "with an image-not-analyzed marker and keeps the original image."
+            )
 
     new_cfg = _clone(config)
     new_cfg.squilla_router = SquillaRouterConfig(**router_payload)

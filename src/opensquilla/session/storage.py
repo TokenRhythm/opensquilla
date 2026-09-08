@@ -28,6 +28,7 @@ from functools import wraps
 from typing import TYPE_CHECKING, Any, Concatenate, cast
 
 from opensquilla.compat import aiosqlite
+from opensquilla.session.attachment_manifest import preserve_attachment_occurrence_ids
 from opensquilla.session.cost_rollup import rollup_cost_source
 from opensquilla.session.goals import (
     GOAL_EFFECTIVE_CONTEXT_DETAIL_KEY,
@@ -14834,26 +14835,45 @@ class SessionStorage:
                 """,
                 (target_session_id, target_session_key, source_session_id),
             )
-            if terminal_outcome_projections is None:
-                return
             async with conn.execute(
-                "SELECT id, turn_context FROM compacted_transcript_entries "
+                "SELECT id, role, message_id, content, turn_context "
+                "FROM compacted_transcript_entries "
                 "WHERE session_id = ?",
                 (target_session_id,),
             ) as cursor:
                 rows = await cursor.fetchall()
             for row in rows:
+                content = row["content"]
+                rebound_content = (
+                    preserve_attachment_occurrence_ids(
+                        content,
+                        session_id=source_session_id,
+                        source_message_id=row["message_id"],
+                    )
+                    if row["role"] == "user"
+                    else content
+                )
                 context = _json_object_or_none(row["turn_context"])
                 turn_id = turn_id_from_context(context)
-                rebound_context = attach_fork_terminal_outcome_projection(
-                    context,
-                    terminal_outcome_projections.get(turn_id or ""),
+                rebound_context = (
+                    attach_fork_terminal_outcome_projection(
+                        context,
+                        terminal_outcome_projections.get(turn_id or ""),
+                    )
+                    if terminal_outcome_projections is not None
+                    else context
                 )
-                if rebound_context == context:
+                if rebound_content == content and rebound_context == context:
                     continue
                 await conn.execute(
-                    "UPDATE compacted_transcript_entries SET turn_context = ? WHERE id = ?",
-                    (_serialize(rebound_context), row["id"]),
+                    "UPDATE compacted_transcript_entries "
+                    "SET content = ?, turn_context = ? WHERE id = ?",
+                    (
+                        rebound_content,
+                        _serialize(rebound_context) if rebound_context != context
+                        else row["turn_context"],
+                        row["id"],
+                    ),
                 )
 
     @_serialized_read
@@ -15486,15 +15506,41 @@ class SessionStorage:
     # ── SessionContextState CRUD ─────────────────────────────────────────────
 
     async def save_context_state(
-        self, state: SessionContextState
+        self,
+        state: SessionContextState,
+        *,
+        expected_session_id: str | None = None,
+        expected_session_epoch: int | None = None,
     ) -> SessionContextState:
         """Persist portable or provider-native context state for later replay."""
+        _validate_optional_session_owner(
+            session_id=expected_session_id,
+            session_epoch=expected_session_epoch,
+        )
+        if (expected_session_id is None) != (expected_session_epoch is None):
+            raise ValueError("context state write requires an exact session owner")
+        if expected_session_id is not None and state.session_id != expected_session_id:
+            raise ValueError("context state does not match the expected session owner")
         state.session_key = canonicalize_session_key(state.session_key)
         data = state.model_dump(exclude={"id"})
         cols = list(data.keys())
         placeholders = ", ".join("?" for _ in cols)
         values = [_serialize(data[c]) for c in cols]
         async with self._write_transaction("save_context_state") as conn:
+            if expected_session_id is not None:
+                assert expected_session_epoch is not None
+                if not await _matches_session_owner_on_conn(
+                    conn,
+                    session_key=state.session_key,
+                    session_id=expected_session_id,
+                    session_epoch=expected_session_epoch,
+                ):
+                    await self._raise_stale_epoch(
+                        conn,
+                        session_key=state.session_key,
+                        expected_epoch=expected_session_epoch,
+                        expected_session_id=expected_session_id,
+                    )
             async with conn.execute(
                 "INSERT INTO session_context_states "
                 f"({', '.join(cols)}) VALUES ({placeholders})",

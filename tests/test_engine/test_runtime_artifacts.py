@@ -1207,6 +1207,9 @@ async def test_turn_runner_streams_artifact_event_and_persists_history(tmp_path)
             def set_history(self, history) -> None:
                 self.history = history
 
+            def set_request_image_context(self, messages) -> None:
+                assert messages == []
+
         history_capture = _HistoryCapture()
         await runner._load_history(agent=history_capture, session_key=session_key)
         assert "[generated artifact omitted: runtime.txt (text/plain)]" in str(

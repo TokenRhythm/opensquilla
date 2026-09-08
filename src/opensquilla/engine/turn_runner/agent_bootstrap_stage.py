@@ -561,8 +561,14 @@ def _route_max_history_turns(metadata: dict[str, Any]) -> int:
 
 
 def _preserve_historical_images(metadata: dict[str, Any]) -> bool:
+    if metadata.get("router_vision_followup_gate_source") == "explicit_opt_out":
+        return False
     image_route_reason = metadata.get("image_route_reason")
-    return image_route_reason in {"current_turn", "gate_history"}
+    return bool(
+        image_route_reason == "gate_history"
+        or metadata.get("router_vision_followup_needs_image") is True
+        or metadata.get("image_intent_attachment_ids")
+    )
 
 
 @runtime_checkable
@@ -858,6 +864,68 @@ class AgentBootstrapStage:
             turn=inp.turn,
         )
         agent_metadata = inp.turn.metadata
+        routed_model_vision_support = agent_metadata.get(
+            "routed_model_vision_support"
+        )
+        effective_model_vision_support: Literal[
+            "supported", "unsupported", "unknown"
+        ] = (
+            routed_model_vision_support
+            if routed_model_vision_support
+            in {"supported", "unsupported", "unknown"}
+            else catalog.vision_support
+        )
+        route_provider = str(
+            agent_metadata.get("routed_provider")
+            or inp.active_provider_id
+            or ""
+        )
+        fallback_sources = (
+            agent_metadata.get("router_fallback_chain"),
+            agent_metadata.get("selector_execution_chain"),
+        )
+        fallback_vision_support: dict[
+            tuple[str, str],
+            Literal["supported", "unsupported", "unknown"],
+        ] = {}
+        fallback_vision_support_by_model: dict[
+            str,
+            Literal["supported", "unsupported", "unknown"] | None,
+        ] = {}
+        for raw_fallbacks in fallback_sources:
+            if not isinstance(raw_fallbacks, list):
+                continue
+            for raw_fallback in raw_fallbacks:
+                if not isinstance(raw_fallback, dict):
+                    continue
+                fallback_model = str(raw_fallback.get("model") or "").strip()
+                fallback_provider = str(
+                    raw_fallback.get("provider") or route_provider
+                ).strip()
+                support = raw_fallback.get("vision_support")
+                if (
+                    fallback_model
+                    and fallback_provider
+                    and support in {"supported", "unsupported", "unknown"}
+                ):
+                    fallback_vision_support.setdefault(
+                        (fallback_provider.lower(), fallback_model),
+                        support,
+                    )
+                    prior_support = fallback_vision_support_by_model.get(
+                        fallback_model
+                    )
+                    if (
+                        fallback_model not in fallback_vision_support_by_model
+                        or prior_support == support
+                    ):
+                        fallback_vision_support_by_model[fallback_model] = support
+                    else:
+                        # Provider-mismatch route mode may execute a configured
+                        # foreign model id through the active aggregator. Use
+                        # model-only evidence only when every declaration for
+                        # that id agrees.
+                        fallback_vision_support_by_model[fallback_model] = None
         fallback_capabilities: dict[
             tuple[str, str],
             tuple[int, int, ModelCapabilities | None],
@@ -913,7 +981,17 @@ class AgentBootstrapStage:
                     )
                 )
                 private_fallback_vision_support.append(
-                    (deployment, fallback_catalog.vision_support)
+                    (
+                        deployment,
+                        fallback_vision_support.get(
+                            (fallback_provider.lower(), fallback_model),
+                            fallback_vision_support_by_model.get(
+                                fallback_model,
+                                fallback_catalog.vision_support,
+                            )
+                            or fallback_catalog.vision_support,
+                        ),
+                    )
                 )
                 fallback_capabilities.setdefault(
                     (fallback_provider, fallback_model),
@@ -923,15 +1001,6 @@ class AgentBootstrapStage:
                         fallback_catalog.capabilities,
                     ),
                 )
-        route_provider = str(
-            agent_metadata.get("routed_provider")
-            or inp.active_provider_id
-            or ""
-        )
-        fallback_sources = (
-            agent_metadata.get("router_fallback_chain"),
-            agent_metadata.get("selector_execution_chain"),
-        )
         for raw_fallbacks in fallback_sources:
             if not isinstance(raw_fallbacks, list):
                 continue
@@ -1078,7 +1147,7 @@ class AgentBootstrapStage:
             flush_workspace_dir=aux.flush_workspace_dir,
             model_capabilities=catalog.capabilities,
             model_tools_capability_verified=active_artifact_tools_verified,
-            model_vision_support=catalog.vision_support,
+            model_vision_support=effective_model_vision_support,
             thinking=aux.thinking,
             tool_result_projection_max_inline_chars=(aux.tool_result_projection_max_inline_chars),
             tool_result_fresh_diagnostic_policy_enabled=(

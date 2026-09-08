@@ -29,6 +29,7 @@ from opensquilla.gateway.generated_artifact_adoption import GeneratedArtifactAdo
 from opensquilla.gateway.rpc import RpcContext, RpcUnavailableError, get_dispatcher
 from opensquilla.gateway.scopes import METHOD_SCOPES, READ_SCOPE, WRITE_SCOPE
 from opensquilla.gateway.transcripts import build_transcript_attachment_envelope
+from opensquilla.session.attachment_manifest import legacy_attachment_id
 from opensquilla.session.manager import SessionManager
 from opensquilla.session.models import TranscriptEntry
 from opensquilla.session.storage import SessionStorage
@@ -1235,12 +1236,86 @@ async def test_resource_inventory_preserves_inline_and_staged_attachment_occurre
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("staged", [False, True])
+async def test_legacy_attachment_upgrade_preserves_cached_refs_and_document_bindings(
+    resource_env,
+    monkeypatch: pytest.MonkeyPatch,
+    staged: bool,
+) -> None:
+    env = resource_env
+    payload = b"<!doctype html><h1>legacy attachment</h1>"
+    envelope, _writes = build_transcript_attachment_envelope(
+        text="legacy upload",
+        attachments=[{
+            "type": "text/html",
+            "name": "legacy.html",
+            "data": base64.b64encode(payload).decode("ascii"),
+            "_was_staged": staged,
+        }],
+        session_id=env.session.session_id,
+        media_root=Path(env.config.attachments.media_root),
+        persist_enabled=True,
+    )
+    raw = json.loads(envelope)
+    raw["attachments"][0].pop("attachment_id")
+    await env.storage.append_transcript_entry(
+        TranscriptEntry(
+            session_id=env.session.session_id,
+            session_key=SESSION_KEY,
+            message_id="legacy-upgrade-message",
+            role="user",
+            content=json.dumps(raw),
+        )
+    )
+
+    def pre_upgrade_id(*, session_id: str, message_id: str, index: int, sha256: str) -> str:
+        digest = hashlib.sha256(
+            f"{session_id}\0{message_id}\0{index}\0{sha256}".encode()
+        ).digest()[:18]
+        return "att_legacy_" + base64.urlsafe_b64encode(digest).decode("ascii").rstrip("=")
+
+    cached_id = pre_upgrade_id(
+        session_id=env.session.session_id,
+        message_id="legacy-upgrade-message",
+        index=0,
+        sha256=hashlib.sha256(payload).hexdigest(),
+    )
+    with monkeypatch.context() as previous_version:
+        previous_version.setattr(resource_rpc, "legacy_attachment_id", pre_upgrade_id)
+        imported = await _import_attachment(env, cached_id, key="legacy-before-upgrade")
+
+    fetched = await _dispatch(
+        env,
+        "workbench.resources.get",
+        {
+            "sessionKey": SESSION_KEY,
+            "resource": {"type": "attachment", "id": cached_id},
+        },
+    )
+    assert fetched.error is None, fetched.error
+    assert fetched.payload["resource"]["resource"]["id"] == cached_id
+    reopened = await _dispatch(
+        env,
+        "workbench.resources.open",
+        {
+            "sessionKey": SESSION_KEY,
+            "resource": {"type": "attachment", "id": cached_id},
+        },
+    )
+    assert reopened.error is None, reopened.error
+    assert reopened.payload["resolution"] == {"status": "current"}
+    assert reopened.payload["document"]["id"] == imported["document"]["id"]
+    assert reopened.payload["binding"]["source"]["attachmentId"] == cached_id
+
+
+@pytest.mark.asyncio
 async def test_historical_attachment_ids_are_stable_per_message_occurrence(
     resource_env,
 ) -> None:
     env = resource_env
     html = b"<h1>historical</h1>"
-    for message_id, name in (("legacy-one", "one.html"), ("legacy-two", "two.html")):
+    message_specs = (("legacy-one", "one.html"), ("legacy-two", "two.html"))
+    for message_id, name in message_specs:
         attachment = {
             "type": "text/html",
             "data": base64.b64encode(html).decode("ascii"),
@@ -1274,8 +1349,27 @@ async def test_historical_attachment_ids_are_stable_per_message_occurrence(
     first_ids = [item["resource"]["id"] for item in first.payload["resources"]]
     second_ids = [item["resource"]["id"] for item in second.payload["resources"]]
     assert first_ids == second_ids
+    assert first_ids == [
+        legacy_attachment_id(
+            session_id=env.session.session_id,
+            message_id=message_id,
+            index=0,
+            sha256=hashlib.sha256(html).hexdigest(),
+        )
+        for message_id, _name in message_specs
+    ]
     assert len(set(first_ids)) == 2
     assert all(item.startswith("att_legacy_") for item in first_ids)
+
+    child_key = "agent:main:webchat:workbench-resources-legacy-fork"
+    await env.manager.branch(SESSION_KEY, child_key, fork_transcript=True)
+    forked = await _dispatch(
+        env,
+        "workbench.resources.list",
+        {"sessionKey": child_key, "types": ["attachment"]},
+    )
+    assert forked.error is None, forked.error
+    assert [item["resource"]["id"] for item in forked.payload["resources"]] == first_ids
 
 
 @pytest.mark.asyncio
