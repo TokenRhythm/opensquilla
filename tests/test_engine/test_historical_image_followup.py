@@ -342,6 +342,77 @@ async def test_current_upload_and_previous_image_selection_are_independent(
     )
 
 
+@pytest.mark.parametrize("gate_enabled", [False, True])
+@pytest.mark.parametrize("current_upload", [False, True])
+async def test_current_text_image_opt_out_reaches_provider_when_gate_disabled(
+    gate_enabled: bool, current_upload: bool,
+) -> None:
+    from opensquilla.engine.turn_runner.agent_bootstrap_stage import _preserve_historical_images
+
+    manager = _CanonicalSessionManager()
+    key = "agent:main:image-reference-opt-out"
+    node = await manager.create(key)
+    previous = _TranscriptEntry(
+        "user", _inline_image_envelope("Previous upload.", b"previous-original"), "previous"
+    )
+    previous_id = build_attachment_manifest(
+        [previous], session_id=node.session_id, session_key=key,
+    ).occurrences[0].attachment_id
+    text = f"Ignore the previous image {previous_id}; answer only the text question."
+    current = _TranscriptEntry(
+        "user",
+        _inline_image_envelope(text, b"current-original") if current_upload else text,
+        "current",
+    )
+    manager._canonical[key] = [previous, current]
+    manager._transcripts[key] = [previous, current]
+    config = GatewayConfig(llm={"provider": "openai"})
+    config.squilla_router.vision_followup_gate_enabled = gate_enabled
+    metadata: dict[str, Any] = {
+        "attachment_count": int(current_upload),
+        "image_intent_attachment_ids": [previous_id],
+        "router_vision_followup_needs_image": True,
+        "router_vision_followup_gate_source": "explicit_attachment_id",
+    }
+    attachments = (
+        [{"mime": "image/png", "data": _b64(b"current-original")}]
+        if current_upload else []
+    )
+    provider = _CapturingProvider()
+    ctx = TurnContext(
+        message=text, raw_message=text, session_key=key, config=config,
+        model="configured-vision", provider=provider, tool_defs=[],
+        system_prompt="", attachments=attachments, metadata=metadata,
+    )
+    await apply_vision_followup_gate(ctx)
+    agent = Agent(
+        provider=provider,
+        config=AgentConfig(
+            model_vision_support="supported", metadata=ctx.metadata,
+            preserve_historical_images=_preserve_historical_images(ctx.metadata),
+        ),
+    )
+    runner = TurnRunner(provider_selector=MagicMock(), session_manager=manager, config=config)
+    await runner._load_history(agent, key, bound_user_message_id="current")
+    extra_messages = (
+        [Message(role="user", content=[
+            ContentBlockImage(media_type="image/png", data=_b64(b"current-original"))
+        ])]
+        if current_upload else None
+    )
+    events = [event async for event in agent.run_turn(text, extra_messages=extra_messages)]
+
+    assert not any(event.kind == "error" for event in events)
+    payloads = [
+        block.data for message in provider.calls[0]["messages"]
+        if isinstance(message.content, list) for block in message.content
+        if isinstance(block, ContentBlockImage)
+    ]
+    assert payloads == ([_b64(b"current-original")] if current_upload else [])
+    assert ctx.metadata["router_vision_followup_gate_source"] == "explicit_opt_out"
+    assert ctx.metadata["router_vision_followup_needs_image"] is False
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("vision_support", "expects_image"),
