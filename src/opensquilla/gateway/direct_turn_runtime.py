@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import inspect
 from collections.abc import Awaitable, Callable
 from dataclasses import asdict
@@ -275,13 +276,14 @@ async def run_direct_turn(
             "agent_stream_heartbeat_interval_seconds",
             15.0,
         )
-        async for event in wrap_stream(
+        composed_stream = wrap_stream(
             raw_stream,
             idle_timeout=idle_timeout,
             heartbeat_interval=heartbeat_interval,
             heartbeat_message="Agent run is still active",
             context_bound=is_context_bound_owner(runner),
-        ):
+        )
+        async for event in composed_stream:
             if isinstance(event, AnswerGenerationResetEvent):
                 event_dict = serialize_public_event(event)
             else:
@@ -362,10 +364,26 @@ async def run_direct_turn(
             {"message": error_message, "code": event_code},
         )
     finally:
-        if guest_profile is not None:
-            guest_profile.cleanup()
-        if "turn_scope" in locals():
-            turn_scope.__exit__(None, None, None)
+        try:
+            # Each wrapper closes its upstream in the task that advanced it,
+            # preserving the runner's ContextVar ownership through teardown.
+            if "composed_stream" in locals():
+                stream_to_close: Any | None = composed_stream
+            elif "raw_stream" in locals():
+                stream_to_close = raw_stream
+            else:
+                stream_to_close = None
+            close = getattr(stream_to_close, "aclose", None)
+            if close is not None:
+                with contextlib.suppress(Exception):
+                    await close()
+        finally:
+            try:
+                if guest_profile is not None:
+                    guest_profile.cleanup()
+            finally:
+                if "turn_scope" in locals():
+                    turn_scope.__exit__(None, None, None)
         if not terminal_emitted:
             try:
                 await emit_terminal_once(
