@@ -210,6 +210,7 @@ class TranscriptAppendPort(Protocol):
         assistant_message_id: str | None = None,
         expected_session_id: str | None = None,
         expected_session_epoch: int | None = None,
+        provenance: dict[str, Any] | None = None,
     ) -> TranscriptAppendResult | bool: ...
 
 @runtime_checkable
@@ -845,6 +846,13 @@ class TurnFinalizerStage:
                 ),
                 "token_count": token_count,
             }
+            if inp.run_kind == "cron_turn":
+                provenance = {"kind": "cron", "source_session_key": inp.session_key}
+                if isinstance(inp.input_provenance, dict):
+                    job_id = inp.input_provenance.get("job_id")
+                    if isinstance(job_id, str) and job_id:
+                        provenance["source_tool"] = f"cron:{job_id}"
+                append_kwargs["provenance"] = provenance
             if assistant_message_id is not None:
                 append_kwargs["assistant_message_id"] = assistant_message_id
             if inp.expected_session_id is not None:

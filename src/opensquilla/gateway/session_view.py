@@ -327,7 +327,7 @@ def _last_activity_at(session: Any, task_rows: list[Any], now_ms: int) -> int:
 
 
 def _interactive(session_kind: str, surface: str) -> bool:
-    return session_kind == "chat" and surface == "webchat"
+    return session_kind == "cron" or (session_kind == "chat" and surface == "webchat")
 
 
 def _channel_context(session: Any, surface: str) -> dict[str, str] | None:

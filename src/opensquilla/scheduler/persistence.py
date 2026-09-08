@@ -830,15 +830,31 @@ class JobStore:
         job_id: str,
         reservation_token: str,
     ) -> bool:
-        current = await self.get(job_id)
-        if current is None or current.reservation_token != reservation_token:
-            return False
-        clear_reservation(current)
-        if current.status == JobStatus.RUNNING:
-            current.status = JobStatus.PENDING
-        current.updated_at = datetime.now(UTC)
-        await self.save(current)
-        return True
+        # Fence the cleanup in the write itself. A read followed by save()
+        # can overwrite a new owner or resurrect a concurrently deleted job.
+        async with self._db().execute(
+            """
+            UPDATE scheduler_jobs
+            SET status = CASE WHEN status = ? THEN ? ELSE status END,
+                reservation_token = '',
+                reserved_at = NULL,
+                reserved_by = '',
+                reservation_source = '',
+                scheduled_run_at = NULL,
+                updated_at = MAX(updated_at, ?)
+            WHERE id = ? AND reservation_token = ?
+            """,
+            (
+                JobStatus.RUNNING.value,
+                JobStatus.PENDING.value,
+                datetime.now(UTC).isoformat(),
+                job_id,
+                reservation_token,
+            ),
+        ) as cur:
+            released = cur.rowcount == 1
+        await self._db().commit()
+        return released
 
     async def delete(self, job_id: str) -> None:
         await self._db().execute("DELETE FROM scheduler_jobs WHERE id = ?", (job_id,))

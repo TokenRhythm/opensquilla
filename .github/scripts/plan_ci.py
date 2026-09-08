@@ -239,6 +239,12 @@ _NONCRITICAL_CI_SCRIPT_TARGETS: Final[dict[str, tuple[str, ...]]] = {
     ".github/scripts/prestage-release-to-oss.sh": (
         "tests/test_scripts/test_prestage_release_to_oss.py",
     ),
+    ".github/scripts/release_signing_preflight.py": (
+        "tests/test_ci/test_release_signing_preflight.py",
+    ),
+    ".github/scripts/verify-windows-signatures.ps1": (
+        "tests/test_ci/test_windows_signatures.py",
+    ),
     ".github/scripts/verify-release-macos-real-update.sh": (
         "tests/test_ci/test_upgrade_baselines.py",
         "tests/test_release_consistency.py",
@@ -1490,6 +1496,7 @@ def _add_noncritical_ci_path(
         targets.add("tests/test_ci/test_workflows.py")
         if path == ".github/workflows/wheelhouse-release.yml":
             targets.add("tests/test_ci/test_upgrade_baselines.py")
+            targets.add("tests/test_ci/test_release_signing_preflight.py")
         reasons.add("workflow_contract_changed")
         return True
     script_targets = _NONCRITICAL_CI_SCRIPT_TARGETS.get(path)
@@ -1501,7 +1508,9 @@ def _add_noncritical_ci_path(
     if path.startswith(
         (
             ".github/scripts/prestage-release-to-oss",
+            ".github/scripts/release_signing_preflight",
             ".github/scripts/verify-release-",
+            ".github/scripts/verify-windows-signatures",
             ".github/scripts/verify_desktop_slim_size",
         )
     ):

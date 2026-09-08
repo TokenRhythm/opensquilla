@@ -6,6 +6,12 @@ import {
   requiredOption,
   waitFor,
 } from './packaged-smoke-helpers.mjs'
+import { assertConcurrentRecoveryTransport } from './session-recovery-transport-contract.mjs'
+import {
+  captureElectronProcessIdentity,
+  cleanupPackagedFirstSend,
+  electronProcessSnapshot,
+} from './packaged-first-send-cleanup.mjs'
 
 const LONG_SESSION_MESSAGE_COUNT = 320
 const TERMINAL_RECOVERY_TIMEOUT_MS = 35_000
@@ -26,10 +32,15 @@ const expectedLastMessage =
 const preservedDraft = 'Synthetic draft preserved through packaged session recovery.'
 
 let app
+let processIdentity = {}
+let runError
+let recoveryResult
 let injectHang = false
 let socketCount = 0
 let nextSocketIndex = 0
 let healthyCloseCount = 0
+let physicalCloseCount = 0
+const socketPolicies = new Map()
 const healthyNavigationSocketIds = new Set()
 const healthySubscribeKeys = []
 let heldHistoryRequests = 0
@@ -48,6 +59,11 @@ try {
       OPENSQUILLA_TESTING: '0',
     },
   })
+  processIdentity = await captureElectronProcessIdentity(app)
+  console.error(JSON.stringify({
+    event: 'packaged_session_recovery_launched',
+    processes: electronProcessSnapshot(processIdentity),
+  }))
   await app.context().routeWebSocket(/\/ws$/, (client) => {
     const socketIndex = nextSocketIndex++
     let targetSocketCounted = false
@@ -59,6 +75,7 @@ try {
     const server = client.connectToServer()
 
     client.onClose(() => {
+      physicalCloseCount += 1
       if (!injectHang) healthyCloseCount += 1
     })
 
@@ -98,14 +115,17 @@ try {
       try {
         server.send(message)
       } catch {
-        // A deadline intentionally retires the socket; its peer can close
-        // between the message callback and this forwarding attempt.
+        // Setup navigation or application cleanup can close the peer between
+        // the message callback and this forwarding attempt.
       }
     })
 
     server.onMessage((message) => {
       try {
         const frame = JSON.parse(String(message))
+        if (typeof frame?.protocol === 'number') {
+          socketPolicies.set(socketIndex, frame.policy)
+        }
         if (frame?.type === 'event' && frame.event === 'tick') {
           serverTickCount += 1
         }
@@ -209,6 +229,21 @@ try {
   )
   assert.equal(socketCount, 0, 'healthy navigation must not enter recovery')
 
+  const [recoverySocketIndex] = healthyNavigationSocketIds
+  const concurrentHistoryReads = socketPolicies.get(recoverySocketIndex)?.concurrent_history_reads
+  assert.equal(
+    concurrentHistoryReads,
+    true,
+    'candidate Gateway hello must advertise concurrent history reads',
+  )
+  const recoverySocketCountBaseline = nextSocketIndex
+  const recoveryCloseCountBaseline = physicalCloseCount
+  const recoveryTransportSample = () => assertConcurrentRecoveryTransport({
+    concurrentHistoryReads,
+    socketCount,
+    newSocketCount: nextSocketIndex - recoverySocketCountBaseline,
+    closeCount: physicalCloseCount - recoveryCloseCountBaseline,
+  })
   injectHang = true
   await sessionRow(switchSessionKey).locator('.sidebar-history-item').click()
   await waitFor(
@@ -270,7 +305,9 @@ try {
     terminalElapsedMs <= TERMINAL_RECOVERY_TIMEOUT_MS,
     `packaged recovery exceeded its terminal budget: ${terminalElapsedMs}ms`,
   )
-  assert.ok(socketCount > 1, 'local bootstrap timeout must retire the blocked socket')
+  // Concurrent-read timeouts reject only the held RPC. Recycling this shared
+  // socket would interrupt unrelated work and violate the advertised policy.
+  const terminalTransport = recoveryTransportSample()
   assert.ok(heldHistoryRequests > 0, 'history hang was not exercised')
   assert.ok(heldSubscribeRequests > 0, 'live subscription hang was not exercised')
   assert.equal(await composer.isEditable(), true)
@@ -304,6 +341,7 @@ try {
   assert.equal(await composer.inputValue(), preservedDraft)
   assert.equal(await recoveredMessage.isVisible(), true)
   assert.equal(await thread.getAttribute('aria-busy'), 'false')
+  const recoveredTransport = recoveryTransportSample()
   const recoveredViewportSample = await recoveredMessage.evaluate((message) => {
     const threadElement = message.closest('.chat-thread')
     if (!(threadElement instanceof HTMLElement)) return null
@@ -330,7 +368,7 @@ try {
     'the retained message 0320 must remain inside the recovered conversation viewport',
   )
 
-  console.log(JSON.stringify({
+  recoveryResult = {
     ok: true,
     executable: basename(executablePath),
     sessionKey,
@@ -345,8 +383,35 @@ try {
     socketCount,
     serverTickCount,
     terminalElapsedMs,
+    terminalTransport,
+    recoveredTransport,
     recoveredViewportSample,
-  }, null, 2))
+  }
+} catch (error) {
+  runError = error
+  console.error(JSON.stringify({
+    event: 'packaged_session_recovery_failed_before_cleanup',
+    error: error?.stack || error?.message || String(error),
+  }))
 } finally {
-  await app?.close().catch(() => {})
+  try {
+    await cleanupPackagedFirstSend({
+      app,
+      processIdentity,
+      diagnostics: () => ({ processes: electronProcessSnapshot(processIdentity) }),
+      onPhase: (phase, detail = {}) => console.error(JSON.stringify({
+        event: 'packaged_session_recovery_cleanup', phase, ...detail,
+      })),
+    })
+  } catch (error) {
+    console.error(error)
+    // Keep the recovery failure primary when cleanup also fails.
+    runError ??= error
+  }
 }
+
+if (runError) throw runError
+console.log(JSON.stringify({
+  ...recoveryResult,
+  processesAfterCleanup: electronProcessSnapshot(processIdentity),
+}, null, 2))

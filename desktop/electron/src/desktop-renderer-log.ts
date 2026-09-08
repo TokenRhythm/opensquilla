@@ -1,4 +1,4 @@
-// Pure helpers for persisting renderer-side observability to desktop.log.
+// Boundary and formatting helpers for persisting renderer observability to desktop.log.
 //
 // The Control UI runs in the renderer process, so a purely front-end failure
 // (a thrown error or an unhandled promise rejection) otherwise leaves no trace:
@@ -19,6 +19,32 @@ export interface RendererConsoleMessage {
   message: string
   sourceId: string
   lineNumber: number
+}
+
+interface RendererConsoleWindow {
+  isDestroyed(): boolean
+  readonly webContents: {
+    isDestroyed(): boolean
+    readonly mainFrame: unknown
+  }
+}
+
+/** Late console events must not dereference disposed Electron frame owners. */
+export function isLiveMainFrameConsoleMessage(
+  window: RendererConsoleWindow,
+  details: { readonly frame: unknown },
+): boolean {
+  try {
+    if (window.isDestroyed()) return false
+    const contents = window.webContents
+    if (contents.isDestroyed()) return false
+    const frame = details.frame
+    return frame != null && frame === contents.mainFrame
+  } catch {
+    // Native getters can already be disposed while teardown emits its final
+    // console events. Observability must never raise a main-process error box.
+    return false
+  }
 }
 
 /** A structured log entry ready to hand to `desktopLog(event, detail)`. */

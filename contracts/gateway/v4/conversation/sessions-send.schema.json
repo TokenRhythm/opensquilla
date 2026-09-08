@@ -34,7 +34,6 @@
       { "code": "QUEUE_FULL", "retryable": true },
       { "code": "QUEUE_FULL_DIRTY", "details": true },
       { "code": "SESSION_CHANGED", "retryable": true },
-      { "code": "SESSION_NOT_INTERACTIVE", "retryable": false },
       { "code": "IDEMPOTENCY_CONFLICT" }, { "code": "INTERNAL_ERROR" }
     ]
   },

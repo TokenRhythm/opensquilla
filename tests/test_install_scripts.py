@@ -338,7 +338,9 @@ def test_source_powershell_preserves_native_failure_exit_codes(
             "FAKE_UV_EXIT": str(uv_exit),
             "OPENSQUILLA_INSTALL_PROFILE": "core",
             "OPENSQUILLA_PREFIX": str(tmp_path / "prefix"),
-            "PATH": f"{fake_bin}{os.pathsep}{env['PATH']}",
+            # Keep the preliminary Python capability probe on the test runtime,
+            # so an unrelated older ambient Python cannot mask npm/uv failures.
+            "PATH": os.pathsep.join((str(fake_bin), str(Path(sys.executable).parent), env["PATH"])),
         }
     )
     result = subprocess.run(

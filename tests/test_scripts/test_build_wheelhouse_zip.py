@@ -11,6 +11,7 @@ from types import SimpleNamespace
 from zipfile import ZipFile
 
 import pytest
+import yaml
 
 SCRIPT_PATH = Path(__file__).resolve().parents[2] / "scripts" / "build_wheelhouse_zip.py"
 REPO_ROOT = SCRIPT_PATH.parents[1]
@@ -932,11 +933,17 @@ def test_release_workflow_publishes_wheel_and_electron_assets_without_portable()
     assert "concurrency:" in workflow
     assert "release-assets-${{" in workflow
     assert "cancel-in-progress: false" in workflow
-    assert "timeout-minutes: 90" in workflow
-    assert workflow.count("timeout-minutes: 150") == 2
-    assert workflow.count("timeout-minutes: 75") == 1
-    assert workflow.count("timeout-minutes: 120") == 1
-    assert "timeout-minutes: 20" in workflow
+    jobs = yaml.safe_load(workflow)["jobs"]
+    for name, minutes in {
+        "build-release-assets": 90,
+        "build-desktop-macos": 150,
+        "build-desktop-windows": 150,
+        "audit-downloaded-macos-release": 75,
+        "audit-downloaded-windows-release": 120,
+        "audit-internal-windows-artifact": 120,
+        "publish-release": 20,
+    }.items():
+        assert jobs[name]["timeout-minutes"] == minutes
     assert "build-desktop-macos:" in workflow
     assert "build-desktop-windows:" in workflow
     assert "Validate workflow inputs" in workflow

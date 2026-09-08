@@ -2245,7 +2245,7 @@ def test_container_repository_is_lowercase_through_verification_and_promotion(
 def test_organization_guards_keep_the_maintainer_restriction() -> None:
     jobs = _workflow("desktop-fault-injection.yml")["jobs"]
     guards = [job["if"] for job in jobs.values() if "github.repository" in job.get("if", "")]
-    assert len(guards) == 3
+    assert len(guards) == 4
     for guard in guards:
         assert "github.repository == 'TokenRhythm/opensquilla'" in guard
         assert "github.actor == 'Open-Squilla'" in guard
