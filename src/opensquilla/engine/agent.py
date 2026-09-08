@@ -2948,6 +2948,10 @@ class Agent:
         self._session_key = session_key
         self._turn_call_logger = turn_call_logger
         self._tool_registry: ToolRegistry | None = tool_registry
+        # Some handlers retain the ingress context even when budget setup
+        # replaces our copy. Bind turn-local image authority on both objects.
+        self._ingress_tool_context = tool_context
+        self._image_analysis_provider_wrapper: Callable[[Any], Any] | None = None
         if (
             tool_context is not None
             and self.config.runtime_events_path
@@ -4254,6 +4258,48 @@ class Agent:
                 seen.add(normalized)
                 values.append(normalized)
         return tuple(values)
+
+    def _image_analysis_target(self) -> tuple[Any, ChatConfig] | None:
+        """Resolve one tool request without granting any new routing authority."""
+
+        config = ChatConfig(
+            max_tokens=min(self.config.max_tokens, 4096),
+            timeout=self.config.request_timeout,
+            model_capabilities=self.config.model_capabilities,
+            model_vision_support=self.config.model_vision_support,
+            physical_attempt_limit=1,
+            provider_request_max_chars=self._provider_request_proof_max_chars(),
+            context_window_tokens_global_override=(
+                self.config.context_window_tokens_global_override
+            ),
+            provider_request_max_chars_explicit_cap=(
+                max(0, int(self.config.provider_request_proof_max_chars or 0))
+                if self.config.provider_request_proof_max_chars_explicit else 0
+            ),
+        )
+        support: Any = config.model_vision_support
+        resolver = getattr(self.provider, "active_model_vision_support", None)
+        if callable(resolver):
+            try:
+                support = resolver(config)
+            except Exception:  # noqa: BLE001 - strict tool authority gate
+                return None
+        if str(support or "unknown").strip().lower() != "supported":
+            return None
+        identity = provider_metadata(self.provider)
+        if "ensemble" in {identity.provider_kind, identity.provider_name}:
+            return None
+        resolve_target = getattr(self.provider, "image_analysis_target", None)
+        if callable(resolve_target):
+            target: tuple[Any, ChatConfig] | None = resolve_target(config)
+            if target is None:
+                return None
+            provider, config = target
+        else:
+            provider = self.provider
+        if self._image_analysis_provider_wrapper is not None:
+            provider = self._image_analysis_provider_wrapper(provider)
+        return provider, config
 
     def _active_model_vision_support_for_call(self, config: Any) -> str:
         """Resolve tri-state evidence for the exact physical selector leg."""
@@ -6800,6 +6846,15 @@ class Agent:
         self._active_artifact_writer_intent_id = None
         self._artifact_writer_rejected_proposal_digests.clear()
 
+        image_context_bindings: list[
+            tuple[ToolContext, Callable[[], tuple[Any, Any] | None] | None]
+        ] = []
+        for image_context in (self._ingress_tool_context, self._tool_context):
+            if image_context is not None and not any(
+                image_context is bound for bound, _previous in image_context_bindings
+            ):
+                image_context_bindings.append((image_context, image_context.image_analysis_target))
+                image_context.image_analysis_target = self._image_analysis_target
         try:
             if self._session_key:
                 clear_sandbox_approval_denials(self._session_key)
@@ -6828,6 +6883,9 @@ class Agent:
                 ):
                     yield event
         finally:
+            self._image_analysis_provider_wrapper = None
+            for image_context, previous in image_context_bindings:
+                image_context.image_analysis_target = previous
             self._request_image_context = []
             # A staged candidate is never an implicit commit.  If the turn is
             # cancelled, times out, or exits without document_finish, reject
@@ -7935,6 +7993,104 @@ class Agent:
                 ),
                 code="turn_llm_call_budget_exceeded",
             )
+
+        agent = self
+
+        class _ImageAnalysisProvider:
+            """Charge one auxiliary request to this turn's existing budget."""
+
+            def __init__(self, physical_provider: Any) -> None:
+                self.physical_provider = physical_provider
+                self.admitted = False
+
+            def __getattr__(self, name: str) -> Any:
+                return getattr(self.physical_provider, name)
+
+            def _admit_auxiliary_request(self) -> None:
+                nonlocal turn_llm_calls
+                if image_projection_forced and (
+                    not selector_projects_images
+                    or selector_image_provider.active_deployment_config()
+                    == image_projection_forced_deployment
+                ):
+                    raise RuntimeError("image_capability_rejected")
+                error = _turn_budget_error() or _turn_llm_call_budget_error(turn_llm_calls + 1)
+                if error is not None:
+                    raise RuntimeError(error.code)
+                # No await between checking and reserving: parallel tools
+                # share the same call counter, just like primary requests.
+                turn_llm_calls += 1
+                self.admitted = True
+
+            async def chat(self, messages: Any, config: Any) -> AsyncIterator[Any]:
+                nonlocal total_input_tokens, total_output_tokens, total_reasoning_tokens
+                nonlocal total_cached_tokens, total_cache_write_tokens, total_billed_cost
+                nonlocal total_provider_billed_entries, total_unbilled_entries
+                nonlocal total_missing_cost_entries, turn_has_error_usage_receipt
+                nonlocal image_projection_forced, image_projection_forced_deployment
+                nonlocal image_projection_marker_state
+                if not self.admitted:
+                    self._admit_auxiliary_request()
+                metadata = provider_metadata(self.physical_provider)
+                provider_id = metadata.provider_id or metadata.provider_name
+                receipt_seen = False
+                stream = self.physical_provider.chat(messages=messages, config=config)
+                try:
+                    async for event in stream:
+                        if isinstance(event, ProviderErrorEvent) and classify_image_failure(
+                            event, provider_name=metadata.provider_name,
+                        ).is_unsupported:
+                            image_projection_forced = True
+                            image_projection_marker_state = ImageMarkerState.ANALYSIS_FAILED
+                            image_projection_forced_deployment = (
+                                selector_image_provider.active_deployment_config()
+                                if selector_projects_images else None
+                            )
+                        if not receipt_seen and (
+                            isinstance(event, ProviderDoneEvent)
+                            or isinstance(event, ProviderErrorEvent)
+                            and has_known_provider_usage_receipt(event)
+                        ):
+                            receipt_seen = True
+                            usage = normalize_provider_usage(
+                                event, default_provider=provider_id, default_model=metadata.model,
+                                completed_at_ms=0, resolve_estimates=False,
+                            )
+                            total_input_tokens += usage.input_tokens
+                            total_output_tokens += usage.output_tokens
+                            total_reasoning_tokens += usage.reasoning_tokens
+                            total_cached_tokens += usage.cache_read_tokens
+                            total_cache_write_tokens += usage.cache_write_tokens
+                            total_billed_cost += usage.billed_cost_nanos / 1_000_000_000
+                            total_missing_cost_entries += usage.missing_usage_entries
+                            turn_has_error_usage_receipt |= isinstance(event, ProviderErrorEvent)
+                            turn_model_usage_breakdown.extend(
+                                _normalized_usage_breakdown_rows(event, usage)
+                            )
+                            for item in usage.items:
+                                total_provider_billed_entries += int(
+                                    item.cost_source in {"provider_billed", "mixed"}
+                                )
+                                total_unbilled_entries += int(item.cost_source != "provider_billed")
+                                if agent._usage_tracker and agent._session_key:
+                                    agent._usage_tracker.add(
+                                        agent._session_key, input_tokens=item.input_tokens,
+                                        output_tokens=item.output_tokens, model_id=item.model,
+                                        cache_read_tokens=item.cache_read_tokens,
+                                        cache_write_tokens=item.cache_write_tokens,
+                                        billed_cost=item.billed_cost_nanos / 1_000_000_000,
+                                        provider=item.provider, cost_source=item.cost_source,
+                                    )
+                            _accumulate_turn_cost(
+                                event, default_provider=provider_id, default_model=metadata.model,
+                            )
+                        yield event
+                finally:
+                    close = getattr(stream, "aclose", None)
+                    if callable(close):
+                        await close()
+
+        self._image_analysis_provider_wrapper = _ImageAnalysisProvider
 
         pending_input_batch_staged = False
         staged_pending_input_message: Message | None = None
@@ -10651,6 +10807,22 @@ class Agent:
                                 # live context-window gauge below.
                                 if valid_usage_breakdown:
                                     turn_model_usage_breakdown.extend(valid_usage_breakdown)
+                                else:
+                                    # Auxiliary image receipts can share this
+                                    # turn. Retain the primary contribution too,
+                                    # instead of reporting only auxiliary rows.
+                                    turn_model_usage_breakdown.extend(
+                                        _normalized_usage_breakdown_rows(
+                                            raw_ev,
+                                            normalize_provider_usage(
+                                                raw_ev,
+                                                default_provider=executed_provider_id,
+                                                default_model=physical_usage_model,
+                                                completed_at_ms=0,
+                                                resolve_estimates=False,
+                                            ),
+                                        )
+                                    )
                                 if self._usage_tracker and self._session_key:
                                     # Forward the provider's real per-call billed_cost so
                                     # the per-model breakdown can show actual numbers
@@ -25382,6 +25554,19 @@ class Agent:
             "_opensquilla_available_tools",
             getattr(self._raw_tool_handler, "_opensquilla_available_tools", frozenset()),
         )
+        parent_explicit_request_cap = max(
+            0,
+            int(self.config.provider_request_proof_max_chars or 0),
+        )
+        child_provider_request_max_chars = child_target.provider_request_max_chars
+        if (
+            self.config.provider_request_proof_max_chars_explicit
+            and parent_explicit_request_cap > 0
+        ):
+            child_provider_request_max_chars = min(
+                child_provider_request_max_chars,
+                parent_explicit_request_cap,
+            )
         child_cfg = AgentConfig(
             max_iterations=spec.max_iterations,
             timeout=spec.timeout,
@@ -25436,8 +25621,13 @@ class Agent:
             tool_result_provider_request_max_chars=(
                 self.config.tool_result_provider_request_max_chars
             ),
-            provider_request_proof_max_chars=child_target.provider_request_max_chars,
-            provider_request_proof_max_chars_explicit=False,
+            provider_request_proof_max_chars=child_provider_request_max_chars,
+            provider_request_proof_max_chars_explicit=(
+                self.config.provider_request_proof_max_chars_explicit
+            ),
+            context_window_tokens_global_override=(
+                self.config.context_window_tokens_global_override
+            ),
             tool_use_argument_provider_request_max_chars=(
                 self.config.tool_use_argument_provider_request_max_chars
             ),
@@ -25529,6 +25719,7 @@ class Agent:
             tool_result_store_disk_budget_bytes=(self.config.tool_result_store_disk_budget_bytes),
             tool_result_store_retention_seconds=(self.config.tool_result_store_retention_seconds),
             model_capabilities=child_target.model_capabilities,
+            model_vision_support=child_target.model_vision_support,
             compaction_execution_plan=child_target.compaction_plan,
         )
         return Agent(

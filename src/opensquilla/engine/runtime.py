@@ -274,13 +274,14 @@ from opensquilla.provider.protocol import (
     validate_provider_chat_admission,
 )
 from opensquilla.provider.types import (
-    EnsembleProgressEvent as ProviderEnsembleProgressEvent,
-)
-from opensquilla.provider.types import (
+    ChatConfig,
     ProviderGenerationResetEvent,
     ProviderRequestCorrelation,
     VisionSupport,
     derive_provider_request_correlation,
+)
+from opensquilla.provider.types import (
+    EnsembleProgressEvent as ProviderEnsembleProgressEvent,
 )
 from opensquilla.router_control import (
     RouterControlHoldStore,
@@ -2707,6 +2708,18 @@ class _SelectorFallbackProvider:
             if raw_support in {"supported", "unsupported", "unknown"}
             else "unknown"
         )
+
+    def image_analysis_target(self, config: ChatConfig) -> tuple[Any, ChatConfig] | None:
+        """Expose only the current physical leg, never its fallback chain."""
+
+        active_config = self._config_for_active_leg(config)
+        identity = provider_metadata(self._provider)
+        if (
+            active_config.model_vision_support != "supported"
+            or "ensemble" in {identity.provider_kind, identity.provider_name}
+        ):
+            return None
+        return self._provider, active_config
 
     def mark_active_model_vision_supported(self) -> None:
         """Remember a successful native image request for this exact leg."""

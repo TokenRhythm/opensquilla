@@ -134,7 +134,7 @@ def configure_audio(config: Any | None) -> None:
 @tool(
     name="image",
     description=(
-        "Analyze an image using a vision-capable model. "
+        "Analyze an image using the current model when it supports image input. "
         "Accepts only a real local file path or HTTP(S) URL. "
         "Do not call this tool for images already attached to the current chat turn; "
         "use the attachment content directly. "
@@ -192,13 +192,21 @@ async def image(path: str, prompt: str = "Describe this image") -> str:
     try:
         description = await _call_vision_provider(b64_data, media_type, prompt)
         model_used = "provider"
+    except _ImageAnalysisUnavailableError:
+        return json.dumps(
+            {
+                "status": "not_analyzed",
+                "note": "Image not analyzed: the current model has no confirmed image capability",
+                "path": path,
+            }
+        )
     except ToolError:
         raise
     except Exception:
         return json.dumps(
             {
-                "status": "not_available",
-                "note": "Vision provider not configured or unavailable",
+                "status": "analysis_failed",
+                "note": "Image analysis failed on the current model; no other model was called",
                 "path": path,
             }
         )
@@ -420,6 +428,9 @@ async def _complete_from_stream(provider: Any, messages: list, config: Any = Non
         budget = resolve_auxiliary_request_budget(
             provider,
             max_output_tokens=int(getattr(config, "max_tokens", 0) or 0),
+            context_window_tokens=int(
+                getattr(config, "context_window_tokens_global_override", 0) or 0
+            ),
         )
         config = config.model_copy(
             update={
@@ -431,6 +442,9 @@ async def _complete_from_stream(provider: Any, messages: list, config: Any = Non
         budget = resolve_auxiliary_request_budget(
             provider,
             max_output_tokens=int(getattr(config, "max_tokens", 0) or 0),
+            context_window_tokens=int(
+                getattr(config, "context_window_tokens_global_override", 0) or 0
+            ),
             provider_request_max_chars=int(
                 getattr(config, "provider_request_max_chars", 0) or 0
             ),
@@ -447,6 +461,9 @@ async def _complete_from_stream(provider: Any, messages: list, config: Any = Non
         max_tokens=budget.max_input_tokens,
         system=str(getattr(config, "system", "") or ""),
     )
+    admit = getattr(provider, "_admit_auxiliary_request", None)
+    if callable(admit):
+        admit()
     scope = current_usage_accounting_scope()
     close_stream = None
     if scope is None:
@@ -480,17 +497,22 @@ async def _complete_from_stream(provider: Any, messages: list, config: Any = Non
     return "".join(text_parts)
 
 
-async def _call_vision_provider(b64_data: str, media_type: str, prompt: str) -> str:
-    """Send image to provider vision API. Raises if provider not available."""
-    try:
-        from opensquilla.provider.selector import ModelSelector, SelectorConfig
-        from opensquilla.provider.types import ContentBlockImage, ContentBlockText, Message
+class _ImageAnalysisUnavailableError(RuntimeError):
+    """The current turn does not authorize a vision request."""
 
-        cfg = _resolve_vision_provider_config(default_model="openai/gpt-4o-mini")
-        selector = ModelSelector(SelectorConfig(primary=cfg))
-        provider = selector.resolve()
-    except Exception as exc:
-        raise RuntimeError(f"Provider not available: {exc}") from exc
+
+async def _call_vision_provider(b64_data: str, media_type: str, prompt: str) -> str:
+    """Analyze once on the turn's current physical deployment, without fallback."""
+    from opensquilla.provider.image_projection import ImageProjectionMode, project_messages
+    from opensquilla.provider.protocol import validate_provider_chat_admission
+    from opensquilla.provider.types import ContentBlockImage, ContentBlockText, Message
+
+    context = current_tool_context.get()
+    resolve_target = context.image_analysis_target if context is not None else None
+    target = resolve_target() if resolve_target is not None else None
+    if target is None:
+        raise _ImageAnalysisUnavailableError
+    provider, config = target
 
     vision_message = Message(
         role="user",
@@ -499,13 +521,17 @@ async def _call_vision_provider(b64_data: str, media_type: str, prompt: str) -> 
             ContentBlockText(text=prompt),
         ],
     )
+    messages = project_messages([vision_message], mode=ImageProjectionMode.NATIVE).messages
+    admission_error = validate_provider_chat_admission(provider, messages, config)
+    if admission_error is not None:
+        raise RuntimeError(admission_error.code)
     correlation = derive_provider_request_correlation(
         current_provider_request_correlation(),
         execution_id=uuid.uuid4().hex,
         call_kind="auxiliary.media",
     )
     with bind_provider_request_correlation(correlation):
-        return await _complete_from_stream(provider, [vision_message])
+        return await _complete_from_stream(provider, messages, config)
 
 
 # ---------------------------------------------------------------------------
