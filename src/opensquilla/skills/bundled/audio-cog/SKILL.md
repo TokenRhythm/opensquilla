@@ -1,5 +1,9 @@
 ---
 name: audio-cog
+visibility: internal
+invocation: meta_only
+owner_meta_skills:
+  - AwesomeWebpageMetaSkill
 description: "OpenSquilla-compatible audio generation adapter for webpage audio requests. Prefer OpenRouter config/API key in OpenSquilla; preserve the upstream CellCog workflow only as optional ClawHub provenance."
 description_zh: "与OpenSquilla兼容的音频生成适配器，用于网页音频请求。优先使用OpenSquilla中的OpenRouter配置/API密钥；仅将上游CellCog工作流作为可选的ClawHub来源保留。"
 metadata:

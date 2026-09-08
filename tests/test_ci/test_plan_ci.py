@@ -1152,6 +1152,13 @@ def test_skill_hub_inputs_select_all_three_contract_platforms(
         "tests/test_skills/test_hub_deps_subprocess.py",
         "tests/test_skills/test_loader_turn_snapshot.py",
         "tests/test_cli/test_skills_reload_cmd.py",
+        "tests/test_skill_catalog_projection.py",
+        "tests/test_gateway/test_meta_catalog_compatibility.py",
+        "tests/test_gateway/test_rpc_commands.py",
+        "tests/test_migration/test_legacy_config_fixtures.py",
+        "tests/test_skills/test_catalog_upgrade_retirement.py",
+        "tests/test_skills/test_sop_compiler.py",
+        "tests/unit/cli/tui/test_opentui_completion_catalog.py",
     ],
 )
 def test_skill_hub_related_test_change_keeps_three_platform_suite(
@@ -1163,6 +1170,7 @@ def test_skill_hub_related_test_change_keeps_three_platform_suite(
         config=suite_config,
     )
 
+    assert plan["full_fallback"] is False
     assert "skill-hub" in plan["required_suites"]
     assert _platform_cells(plan, "skill-hub") == {
         ("ubuntu-latest", "default"),

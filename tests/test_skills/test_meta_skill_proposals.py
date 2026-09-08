@@ -1,24 +1,31 @@
-"""Tests for skill-creator-proposals bundled skill (write/list/accept/reject)."""
+"""Tests for the in-process MetaSkill proposal store."""
 
 from __future__ import annotations
 
 import json
-import subprocess
-import sys
 from pathlib import Path
 
-REPO = Path(__file__).resolve().parents[2]
-_BUNDLED = REPO / "src" / "opensquilla" / "skills" / "bundled"
-PROPOSALS = _BUNDLED / "skill-creator-proposals" / "scripts" / "proposals.py"
+from opensquilla.skills.proposals_lib import accept_proposal, list_proposals, write_proposal
 
 
 def _run(action: str, *args, home: Path, **kwargs) -> dict:
-    cmd = [sys.executable, str(PROPOSALS), "--action", action,
-           "--home", str(home), *args]
-    for k, v in kwargs.items():
-        cmd.extend([f"--{k.replace('_', '-')}", str(v)])
-    proc = subprocess.run(cmd, capture_output=True, text=True, check=True)
-    return json.loads(proc.stdout)
+    del args
+    if action == "write_proposal":
+        return write_proposal(
+            home,
+            kwargs.pop("skill_md_inline"),
+            json.loads(kwargs.pop("lint_result")),
+            json.loads(kwargs.pop("smoke_result")),
+            creator_mode=kwargs.pop("creator_mode", ""),
+            acceptance_result=kwargs.pop("acceptance_result", None),
+            runtime_e2e_result=kwargs.pop("runtime_e2e_result", None),
+            **kwargs,
+        )
+    if action == "accept":
+        return accept_proposal(home, kwargs["proposal_id"])
+    if action == "list":
+        return list_proposals(home)
+    raise AssertionError(action)
 
 
 SAMPLE_SKILL_MD = """---
@@ -33,7 +40,7 @@ provenance:
 composition:
   steps:
     - id: a
-      skill: summarize
+      skill: docx
       with:
         task: "{{ inputs.user_message | xml_escape | truncate(512) }}"
 ---
@@ -113,17 +120,3 @@ def test_accept_rejects_path_traversal_proposal_id(tmp_path: Path) -> None:
         out = _run("accept", home=home, proposal_id=bad_id)
         assert out["status"] == "error", f"should reject {bad_id!r}, got: {out}"
         assert "invalid proposal_id" in out["reason"]
-
-
-def test_proposals_cli_works_without_explicit_home(monkeypatch, tmp_path: Path) -> None:
-    """N17: --home is optional; defaults to default_opensquilla_home()."""
-    monkeypatch.setenv("OPENSQUILLA_STATE_DIR", str(tmp_path))
-    # Run with NO --home; only --action and required action-specific args
-    proc = subprocess.run(
-        [sys.executable, str(PROPOSALS), "--action", "list"],
-        capture_output=True,
-        text=True,
-    )
-    assert proc.returncode == 0, f"argparse should accept missing --home: {proc.stderr}"
-    out = json.loads(proc.stdout)
-    assert "proposals" in out  # empty list ok; just shouldn't crash

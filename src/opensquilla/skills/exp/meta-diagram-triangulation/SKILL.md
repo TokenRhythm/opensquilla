@@ -1,5 +1,8 @@
 ---
 name: meta-diagram-triangulation
+visibility: experimental
+invocation: experimental_internal
+disable-model-invocation: true
 description: "Scan a target codebase path, classify the most informative diagram kind, then render it as BOTH a PlantUML source file AND a draw.io XML in parallel, and compose them into a single architecture doc. Use when writing an RFC or onboarding doc and you want a text-friendly (PlantUML) and an editable (drawio) view of the same architecture."
 kind: meta
 meta_priority: 55

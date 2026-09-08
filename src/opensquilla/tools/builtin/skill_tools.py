@@ -18,6 +18,7 @@ from opensquilla.process_tree import (
     capture_process_tree_owner,
     create_owned_subprocess_exec,
 )
+from opensquilla.skills.catalog_policy import can_view_skill, project_public_catalog
 from opensquilla.skills.hub.defaults import (
     build_default_skill_installer,
     get_default_skill_router,
@@ -33,7 +34,12 @@ from opensquilla.skills.hub.management import SkillManagementService
 from opensquilla.skills.hub.router import search_router_with_diagnostics
 from opensquilla.skills.types import SkillInstallSpec, SkillLayer, SkillSpec
 from opensquilla.tools.registry import tool
-from opensquilla.tools.types import PlanAccess, ToolError, current_tool_context
+from opensquilla.tools.types import (
+    PlanAccess,
+    ToolError,
+    current_meta_skill_owner,
+    current_tool_context,
+)
 
 if TYPE_CHECKING:
     from opensquilla.skills.loader import SkillLoader
@@ -49,9 +55,7 @@ _MUTABLE_LAYERS = frozenset({SkillLayer.WORKSPACE})
 def _reject_guest_skill_tool(tool_name: str) -> None:
     ctx = current_tool_context.get()
     if ctx is not None and ctx.guest_safe:
-        raise ToolError(
-            f"GUEST_TOOL_UNAVAILABLE: {tool_name} is unavailable to anonymous guests"
-        )
+        raise ToolError(f"GUEST_TOOL_UNAVAILABLE: {tool_name} is unavailable to anonymous guests")
 
 
 class _NoCatalogMutationError(Exception):
@@ -231,9 +235,7 @@ def _render_skill_md(
     fm: dict[str, Any] = {"name": name, "description": safe_desc}
     if triggers:
         fm["triggers"] = [_sanitize_yaml_value(t) for t in triggers]
-    frontmatter = yaml.safe_dump(
-        fm, sort_keys=False, allow_unicode=True, width=100000
-    ).strip()
+    frontmatter = yaml.safe_dump(fm, sort_keys=False, allow_unicode=True, width=100000).strip()
     return f"---\n{frontmatter}\n---\n\n{content}"
 
 
@@ -383,13 +385,9 @@ def create_skill_tools(
         if management_service is not None
         else None
     )
-    resource_lockfile_path = (
-        Path(injected_lockfile_path) if injected_lockfile_path else None
-    )
+    resource_lockfile_path = Path(injected_lockfile_path) if injected_lockfile_path else None
     injected_skill_router = (
-        getattr(management_service, "router", None)
-        if management_service is not None
-        else None
+        getattr(management_service, "router", None) if management_service is not None else None
     )
 
     @tool(
@@ -401,7 +399,11 @@ def create_skill_tools(
         _reject_guest_skill_tool("skill_list")
         if _loader is None:
             return "No skill loader available."
-        skills = _active_skills()
+        skills = project_public_catalog(
+            _active_skills(),
+            coding_mode=_skill_available("code-task"),
+            include_stable_meta=False,
+        )
         if not skills:
             return "No skills installed."
 
@@ -415,7 +417,7 @@ def create_skill_tools(
 
         ctx = EligibilityContext.auto()
         lines = [f"Available skills ({len(skills)}):"]
-        for s in sorted(skills, key=lambda x: x.name):
+        for s in skills:
             report = diagnose_eligibility(s, ctx)
             lines.append(f"  - {s.name}: {s.description}")
             if not report.eligible:
@@ -470,6 +472,17 @@ def create_skill_tools(
             skill = None
         else:
             skill = _active_skill(name)
+        if skill is not None and not can_view_skill(
+            skill,
+            coding_mode=_skill_available("code-task"),
+            owner_meta_skill=current_meta_skill_owner.get(),
+        ):
+            logger.info(
+                "skill_view.blocked_by_catalog_policy",
+                skill=name,
+                visibility=str(getattr(skill, "visibility", "")),
+            )
+            skill = None
         if skill is None:
             return (
                 f"Skill not found: {name}. This skill is not available in the "
@@ -482,9 +495,7 @@ def create_skill_tools(
         if file_path:
             normalized_path = file_path.strip().lstrip("./")
             if normalized_path in {"", "SKILL.md"}:
-                return _expanded_skill_body(skill) or (
-                    f"(Skill '{name}' has no body content)"
-                )
+                return _expanded_skill_body(skill) or (f"(Skill '{name}' has no body content)")
 
             from pathlib import Path
 
@@ -571,9 +582,7 @@ def create_skill_tools(
             "status": "ok",
             "query": clean_query,
             "source": source_id or "all",
-            "results": [
-                _community_result_to_dict(row, installed) for row in report.results
-            ],
+            "results": [_community_result_to_dict(row, installed) for row in report.results],
         }
         if report.diagnostics:
             payload["diagnostics"] = [item.to_dict() for item in report.diagnostics]
@@ -715,14 +724,16 @@ def create_skill_tools(
 
         serializer = getattr(result, "to_dict", None)
         payload: dict[str, Any] = dict(serializer()) if callable(serializer) else {}
-        payload.update({
-            "status": "installed" if result.success else "failed",
-            "success": result.success,
-            "name": result.name,
-            "identifier": clean_identifier,
-            "source": source_id,
-            "message": result.message,
-        })
+        payload.update(
+            {
+                "status": "installed" if result.success else "failed",
+                "success": result.success,
+                "name": result.name,
+                "identifier": clean_identifier,
+                "source": source_id,
+                "message": result.message,
+            }
+        )
         if result.path:
             payload["path"] = result.path
         if result.scan:
@@ -738,8 +749,7 @@ def create_skill_tools(
                 )
             )
             payload["message"] = (
-                f"{result.message} The current turn keeps its pinned Skill catalog; "
-                f"{visibility}"
+                f"{result.message} The current turn keeps its pinned Skill catalog; {visibility}"
             )
             payload["effectiveFrom"] = "next_turn"
         return json.dumps(payload)
@@ -792,7 +802,7 @@ def create_skill_tools(
 
         exit_code, stdout, stderr, timed_out = await _run_install_argv(argv)
         if exit_code == 0 and not timed_out:
-            from opensquilla.engine.steps.skills_filter import (
+            from opensquilla.engine.steps.skill_catalog_projection import (
                 invalidate_skill_eligibility_cache,
             )
 

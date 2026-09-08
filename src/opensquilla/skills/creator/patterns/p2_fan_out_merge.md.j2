@@ -50,9 +50,6 @@ composition:
         query: "{{ b.task }}: {{ '{{' }} inputs.user_message | xml_escape | truncate(512) {{ '}}' }}"
         window_days: "30"
         include: "co_occurrences,meta_usage"
-{%- elif branch_kind == "skill_exec" and b.skill == "git-diff" %}
-        mode: cached_fallback_worktree
-        cwd: "{{ '{{' }} inputs.workspace_dir | default('.') {{ '}}' }}"
 {%- else %}
         task: "{{ b.task }}: {{ '{{' }} inputs.user_message | xml_escape | truncate(512) {{ '}}' }}"
 {%- endif %}
@@ -80,9 +77,6 @@ composition:
         query: "{{ merge.task }}: {{ '{{' }} inputs.user_message | xml_escape | truncate(512) {{ '}}' }}"
         window_days: "30"
         include: "co_occurrences,meta_usage"
-{%- elif merge_kind == "skill_exec" and merge.skill == "git-diff" %}
-        mode: cached_fallback_worktree
-        cwd: "{{ '{{' }} inputs.workspace_dir | default('.') {{ '}}' }}"
 {%- else %}
         task: {{ merge.task | tojson }}
 {%- for b in branches %}
@@ -113,9 +107,6 @@ composition:
         query: "{{ tail.task }}: {{ '{{' }} inputs.user_message | xml_escape | truncate(512) {{ '}}' }}"
         window_days: "30"
         include: "co_occurrences,meta_usage"
-{%- elif tail_kind == "skill_exec" and tail.skill == "git-diff" %}
-        mode: cached_fallback_worktree
-        cwd: "{{ '{{' }} inputs.workspace_dir | default('.') {{ '}}' }}"
 {%- else %}
         task: {{ tail.task | tojson }}
         upstream: "{{ '{{' }} outputs.{{ merge.id }} | truncate(2000) {{ '}}' }}"

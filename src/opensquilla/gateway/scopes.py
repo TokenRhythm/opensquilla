@@ -222,6 +222,7 @@ METHOD_SCOPES: dict[str, str] = {
     "usage.cost": READ_SCOPE,
     "usage.query": READ_SCOPE,
     "meta.list": READ_SCOPE,  # OpenSquilla-only; invokable meta-skill catalog.
+    "meta.inspect": READ_SCOPE,  # OpenSquilla-only; body-free stable dependency tree.
     "meta.setup.plan": READ_SCOPE,  # OpenSquilla-only; dependency setup preview.
     "meta.setup.status": READ_SCOPE,  # OpenSquilla-only; background setup progress.
     "meta.runs.list": READ_SCOPE,

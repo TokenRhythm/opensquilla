@@ -357,23 +357,8 @@ auto_schedule = false
 # cron = "0 3 * * *"
 
 [skills]
-# Experimental skill relevance filtering. Default is off; deterministic
-# skill gating still runs for visibility, platform, and tool availability.
-filter_enabled = false
-filter_top_k = 5
 max_skills_prompt_chars = 8000
 # injection_mode = "system"  # "system", "user_context", or "user_message"
-
-# The default lexical strategy is dependency-free. "semantic" and "hybrid"
-# are legacy experimental modes that need the bundled BGE ONNX backend
-# (onnxruntime + transformers tokenizer + the int8 ONNX export shipped under
-# squilla_router/models/v4.2_phase3_inference/bge_onnx/). Install via
-# `uv sync --extra recommended`. If unavailable, they degrade to lexical-only.
-# filter_strategy = "lexical"   # "lexical" | "semantic" | "hybrid"
-# filter_lexical_top_n = 20
-# filter_semantic_top_n = 20
-# filter_rrf_k = 60
-# filter_embedding_model = "BAAI/bge-small-zh-v1.5"
 
 [task_runtime]
 # Server-side agent turn queue. Same-session tasks are serialized;

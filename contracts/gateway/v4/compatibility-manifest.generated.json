@@ -704,6 +704,18 @@
     },
     {
       "lifecycle": "stable",
+      "name": "meta.inspect",
+      "schema": "meta/meta-inspect.schema.json",
+      "schemaSha256": "227d68672eb35f9b932945de916663db25054c8547a7e62ed8c800013c279719"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "meta.list",
+      "schema": "meta/meta-list.schema.json",
+      "schemaSha256": "9fcd18dc7d1c2e5d75cc3407a2afb1266539456e186e1139e30c2c590efd88fc"
+    },
+    {
+      "lifecycle": "stable",
       "name": "meta.run",
       "schema": "meta/meta-run.schema.json",
       "schemaSha256": "9a07117a5189afc6a757041cc890f22b5ed2b32b2c93bfbf499fb7cc404a3905"
@@ -1461,10 +1473,10 @@
   "protocol": "opensquilla-websocket-json",
   "source": {
     "eventFamilyCount": 9,
-    "generatorSha256": "a4d9386a5dc58a59682c72a551d23aac995b95619a0d504abec20ef047671e00",
-    "methodCount": 215,
-    "schemaCount": 224,
-    "schemaTreeSha256": "4cad213cb5943a1f97618e7e6e6526761afe9e4a69db83ae2d5519309202be18"
+    "generatorSha256": "053df928840129e254a7f609e46832d8ee8ee1c241cf225632dcded3f996297e",
+    "methodCount": 217,
+    "schemaCount": 226,
+    "schemaTreeSha256": "de65ac0d9ad183c07500a98a92328888aae9615c9b5e7991e136b5e2cea8fe63"
   },
   "wireVersion": 4
 }

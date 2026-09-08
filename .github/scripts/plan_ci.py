@@ -150,7 +150,13 @@ _SKILL_HUB_TESTS: Final = frozenset(
         "tests/test_skills_manifest.py",
         "tests/test_skills_bundled_baseline.py",
         "tests/test_skills_hot_reload.py",
-        "tests/test_skills_default_prompt_contract.py",
+        "tests/test_skill_catalog_projection.py",
+        "tests/test_gateway/test_meta_catalog_compatibility.py",
+        "tests/test_gateway/test_rpc_commands.py",
+        "tests/test_migration/test_legacy_config_fixtures.py",
+        "tests/test_skills/test_catalog_upgrade_retirement.py",
+        "tests/test_skills/test_sop_compiler.py",
+        "tests/unit/cli/tui/test_opentui_completion_catalog.py",
         "tests/test_skills_loader_namespaces.py",
         "tests/test_skills_tree.py",
         "tests/test_skills_hub_archive.py",
@@ -1331,11 +1337,16 @@ def _repository_files_for_validation(repo: Path) -> list[str]:
             if (path.is_file() or path.is_symlink())
             and ".git" not in path.relative_to(repo).parts
         )
-    return sorted(
+    paths = [
         item.decode("utf-8", errors="strict")
         for item in completed.stdout.split(b"\0")
         if item
-    )
+    ]
+    # ``git ls-files --cached`` retains paths deleted in an uncommitted
+    # worktree. They are useful to change classification but cannot be parsed
+    # as current test-module sources, so exclude only physically absent paths
+    # from repository-content validation.
+    return sorted(path for path in paths if (repo / path).exists())
 
 
 def _validate_execution_input_patterns(

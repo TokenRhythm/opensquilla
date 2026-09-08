@@ -1,5 +1,8 @@
 ---
 name: meta-web-to-pdf-briefing
+visibility: experimental
+invocation: experimental_internal
+disable-model-invocation: true
 description: "Render a topic into a distributable PDF briefing in three steps: web search → bullet summary → styled PDF. Trigger when the user asks for a PDF briefing on a single topic."
 kind: meta
 meta_priority: 50

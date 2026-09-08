@@ -966,7 +966,7 @@ def test_catalog_exposes_candidates_shadowed_instances_and_diagnostics(
     assert snapshot.get_candidate_by_instance_id(snapshot.shadowed[0].instance_id) is not None
 
 
-def test_v15_snapshot_round_trips_candidate_view_and_invalidates_v14(
+def test_v16_snapshot_round_trips_candidate_view_and_invalidates_v15(
     tmp_path: Path,
 ) -> None:
     low = tmp_path / "low"
@@ -982,7 +982,7 @@ def test_v15_snapshot_round_trips_candidate_view_and_invalidates_v14(
     )
     loader.load_all()
     data = json.loads(snapshot_path.read_text(encoding="utf-8"))
-    assert data["version"] == 15
+    assert data["version"] == 16
     assert len(data["candidates"]) == 2
     assert len(data["shadowed"]) == 1
 
@@ -998,9 +998,9 @@ def test_v15_snapshot_round_trips_candidate_view_and_invalidates_v14(
     ]
     assert [skill.description for skill in restored.snapshot().shadowed] == ["low"]
 
-    # v14 has no managed compile-profile dependency. It must miss so Community
-    # candidates cannot be restored with trusted execution fields.
-    data["version"] = 14
+    # v15 has no catalog visibility/invocation policy fields. It must miss so
+    # candidates cannot be restored into the wrong public execution domain.
+    data["version"] = 15
     data.pop("candidates", None)
     data.pop("shadowed", None)
     data.pop("diagnostics", None)

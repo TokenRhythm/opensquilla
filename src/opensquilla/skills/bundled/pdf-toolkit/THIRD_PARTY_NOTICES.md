@@ -13,12 +13,11 @@ This skill requires:
 - `reportlab` (BSD-3-Clause license,
   <https://www.reportlab.com/>) for PDF generation
 
-## Scope vs `nano-pdf`
+## Scope
 
-This skill ships alongside the existing `nano-pdf` bundled skill but does
-not replace it. `nano-pdf` wraps a natural-language LLM rewriter; this skill
-wraps deterministic structural operations. Trigger words and descriptions
-were chosen to keep the two from competing in skill retrieval.
+This skill wraps deterministic structural operations and is OpenSquilla's
+single public PDF entry. Natural-language drafting remains model reasoning;
+the mutation and generation steps described here stay explicit and auditable.
 
 ## License
 

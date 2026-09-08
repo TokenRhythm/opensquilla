@@ -1,5 +1,9 @@
 ---
 name: paper-artifact-runtime
+visibility: internal
+invocation: meta_only
+owner_meta_skills:
+  - meta-paper-write
 description: "Internal cross-platform artifact persistence, assembly, citation-audit, and PDF compilation runtime for meta-paper-write."
 user-invocable: false
 disable-model-invocation: true

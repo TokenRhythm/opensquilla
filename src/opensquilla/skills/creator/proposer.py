@@ -4,8 +4,6 @@ from __future__ import annotations
 
 import json
 import re as _re
-import subprocess
-import sys
 import tempfile
 from collections.abc import Callable
 from contextvars import ContextVar
@@ -26,12 +24,6 @@ from .runtime_e2e import run_runtime_e2e_gate
 
 _TEMPLATES_DIR = Path(__file__).resolve().parent / "patterns"
 _log = structlog.get_logger(__name__)
-_CREATOR_INTERNAL_SKILLS = {
-    "meta-skill-creator",
-    "skill-creator-linter",
-    "skill-creator-proposals",
-    "skill-creator-smoke-test",
-}
 
 
 class _FillSlotsValidationError(ValueError):
@@ -77,8 +69,6 @@ def _creator_step_kind(skill_name: str) -> str:
     describe a command. Pure text transforms should use ``llm_chat`` to avoid
     spawning a tool-capable sub-agent that may return no visible final text.
     """
-    if skill_name == "summarize":
-        return "llm_chat"
     bundled = Path(__file__).resolve().parents[1] / "bundled"
     loader = SkillLoader(
         bundled_dir=bundled,
@@ -299,7 +289,7 @@ def _call_llm_for_slots(prompt: str, **kwargs: Any) -> str:
 
 
 def _build_catalog_summary() -> str:
-    """Enumerate available bundled skills (name + 1-line description).
+    """Enumerate creator-authorized skills (name + 1-line description).
 
     Meta-skills and creator-internal helper skills are intentionally excluded
     — the runtime's agent executor rejects ``kind: meta`` composed inside
@@ -318,12 +308,10 @@ def _build_catalog_summary() -> str:
         snapshot_path=Path(tempfile.gettempdir()) / "creator-catalog-snap.json",
     )
     loader.invalidate_cache()
+    from opensquilla.skills.catalog_policy import project_creator_catalog
+
     lines: list[str] = []
-    for spec in loader.load_all():
-        if spec.name in _CREATOR_INTERNAL_SKILLS:
-            continue
-        if getattr(spec, "kind", "skill") == "meta":
-            continue
+    for spec in project_creator_catalog(loader.load_all()):
         first_line = (spec.description or "").split("\n", 1)[0][:120]
         lines.append(f"- {spec.name}: {first_line}")
     return "\n".join(lines)
@@ -339,7 +327,7 @@ def _build_pattern_example(pattern_id: str) -> dict:
     if pattern_id == "p1_sequential":
         return {
             "name": "example-pipeline",
-            "description": "A 2-step example that extracts PDF text then summarizes it.",
+            "description": "A 2-step example that extracts PDF text then creates a brief.",
             "meta_priority": 50,
             "triggers": ["example trigger phrase"],
             "steps": [
@@ -351,8 +339,8 @@ def _build_pattern_example(pattern_id: str) -> dict:
                 },
                 {
                     "id": "digest",
-                    "skill": "summarize",
-                    "task": "Summarize the extracted text",
+                    "skill": "docx",
+                    "task": "Create a brief from the extracted text",
                     "with_keys": {},
                 },
             ],
@@ -361,23 +349,28 @@ def _build_pattern_example(pattern_id: str) -> dict:
         return {
             "name": "example-fan-out",
             "description": (
-                "Gather weather and POI info in parallel, then merge into a travel itinerary."
+                "Gather research and repository evidence in parallel, then create a report."
             ),
             "meta_priority": 50,
             "triggers": ["example fan-out trigger"],
             "branches": [
-                {"id": "weather", "skill": "weather", "task": "Fetch weather", "with_keys": {}},
+                {
+                    "id": "research",
+                    "skill": "deep-research",
+                    "task": "Gather cited evidence",
+                    "with_keys": {},
+                },
                 {
                     "id": "poi",
-                    "skill": "multi-search-engine",
-                    "task": "Search POIs",
+                    "skill": "github",
+                    "task": "Inspect repository evidence",
                     "with_keys": {},
                 },
             ],
             "merge": {
                 "id": "itin",
-                "skill": "summarize",
-                "task": "Combine into itinerary",
+                "skill": "docx",
+                "task": "Combine evidence into a report",
                 "with_keys": {},
             },
             "tail": None,
@@ -394,7 +387,7 @@ def _build_pattern_example(pattern_id: str) -> dict:
             "steps": [
                 {
                     "id": "intake",
-                    "skill": "summarize",
+                    "skill": "deep-research",
                     "task": "Extract constraints and missing information",
                     "with_keys": {},
                 },
@@ -406,8 +399,8 @@ def _build_pattern_example(pattern_id: str) -> dict:
                 },
                 {
                     "id": "decision",
-                    "skill": "summarize",
-                    "task": "Produce final answer with caveats and next actions",
+                    "skill": "docx",
+                    "task": "Produce a report with caveats and next actions",
                     "with_keys": {},
                 },
             ],
@@ -641,7 +634,7 @@ def real_fixture_gen(
     llm_chat,
     fixture_gen_model: str,
 ) -> str:
-    """LLM-driven fixture gen for skill-creator-smoke-test Step 2.
+    """LLM-driven fixture generation for the in-process creator smoke gate.
 
     Phase 1 fallback to deterministic when llm_chat is None. Real LLM wiring
     deferred to follow-on iteration.
@@ -703,19 +696,9 @@ def _deterministic_fixture(skill_md: str, kind: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Paths to bundled helper scripts (resolved once at module load time).
-# ---------------------------------------------------------------------------
-
-_LINT_SCRIPT = (
-    Path(__file__).resolve().parents[1]
-    / "bundled" / "skill-creator-linter" / "scripts" / "lint.py"
-)
-_BUNDLED_DIR = _LINT_SCRIPT.parents[2]
-
-_PROPOSALS_SCRIPT = (
-    Path(__file__).resolve().parents[1]
-    / "bundled" / "skill-creator-proposals" / "scripts" / "proposals.py"
-)
+# Creator gates and proposal storage are ordinary runtime modules; they are
+# not model-visible helper Skills.
+_BUNDLED_DIR = Path(__file__).resolve().parents[1] / "bundled"
 
 _RUNTIME_E2E_CONTEXT: ContextVar[dict[str, Any] | None] = ContextVar(
     "opensquilla_meta_skill_runtime_e2e_context",
@@ -752,23 +735,14 @@ def reset_smoke_fixture_context(token) -> None:
 # ---------------------------------------------------------------------------
 
 def meta_skill_lint_run(skill_md: str, gates: str = "G1,G2") -> str:
-    """Run skill-creator-linter on the given SKILL.md text. Returns JSON.
+    """Run the in-process creator linter on the given SKILL.md text. Returns JSON.
 
     Gates parameter is a comma-separated list (e.g. "G1,G2"). Default
     runs both G1 (structural lint) and G2 (scheduler dry-run).
     """
-    proc = subprocess.run(
-        [sys.executable, str(_LINT_SCRIPT), "--skill-md-stdin", "--gates", gates],
-        input=skill_md, capture_output=True, text=True, check=False,
-    )
-    if proc.returncode != 0:
-        # Even on failure, lint.py prints JSON to stdout — return it
-        return proc.stdout or json.dumps({
-            "error": "linter subprocess exited non-zero",
-            "stderr": proc.stderr[:500],
-            "returncode": proc.returncode,
-        })
-    return proc.stdout
+    from opensquilla.skills.creator.lint_runtime import lint_meta_skill
+
+    return json.dumps(lint_meta_skill(skill_md, gates), ensure_ascii=False)
 
 
 def meta_skill_smoke_run(
@@ -811,29 +785,20 @@ def meta_skill_persist_proposal(
 ) -> str:
     """Write a proposal candidate to ~/.opensquilla/proposals/<id>/. Returns JSON."""
     home_path = Path(home).expanduser() if home else None
-    args = [sys.executable, str(_PROPOSALS_SCRIPT),
-            "--action", "write_proposal",
-            "--skill-md-inline", skill_md,
-            "--lint-result", lint_result,
-            "--smoke-result", smoke_result,
-            "--creator-mode", creator_mode,
-            "--acceptance-result", acceptance_result,
-            "--runtime-e2e-result", runtime_e2e_result,
-            "--collision-result", collision_result,
-            "--risk-result", risk_result]
-    if home:
-        args.extend(["--home", home])
-    proc = subprocess.run(args, capture_output=True, text=True, check=False)
-    if proc.returncode != 0:
-        return proc.stdout or json.dumps({
-            "error": "proposals subprocess exited non-zero",
-            "stderr": proc.stderr[:500],
-            "returncode": proc.returncode,
-        })
-    try:
-        out = json.loads(proc.stdout)
-    except json.JSONDecodeError:
-        return proc.stdout
+    from opensquilla.paths import default_opensquilla_home
+    from opensquilla.skills.proposals_lib import write_proposal
+
+    out = write_proposal(
+        home_path or default_opensquilla_home(),
+        skill_md,
+        json.loads(lint_result),
+        json.loads(smoke_result),
+        creator_mode=creator_mode,
+        acceptance_result=acceptance_result,
+        runtime_e2e_result=runtime_e2e_result,
+        collision_result=collision_result,
+        risk_result=risk_result,
+    )
     if (
         auto_enable_manual
         and out.get("status") == "ok"
@@ -915,7 +880,7 @@ async def emit_text_tool(text: str) -> str:
 @tool(
     name="meta_skill_lint_run",
     description=(
-        "Run skill-creator-linter G1+G2 on a SKILL.md candidate. "
+        "Run the in-process MetaSkill creator G1+G2 gates on a SKILL.md candidate. "
         "Returns JSON with G1/G2 pass status + diagnostics."
     ),
     params={

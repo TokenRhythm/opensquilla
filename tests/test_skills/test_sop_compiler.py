@@ -792,6 +792,58 @@ def test_loader_compiles_meta_sop_at_load_time(tmp_path: Path) -> None:
     assert sop.composition_raw["steps"][0]["id"] == "s1"
 
 
+@pytest.mark.parametrize("layer", ["personal", "project"])
+@pytest.mark.parametrize(
+    ("policy", "visibility", "invocation", "discoverable"),
+    [
+        ("", "meta", "meta_only", True),
+        ("visibility: internal\n", "internal", "meta_only", False),
+        ("invocation: experimental_internal\n", "meta", "experimental_internal", False),
+        ("disable-model-invocation: true\n", "meta", "meta_only", False),
+    ],
+)
+def test_authored_sop_policy_survives_compile_and_snapshot(
+    layer: str,
+    policy: str,
+    visibility: str,
+    invocation: str,
+    discoverable: bool,
+    tmp_path: Path,
+) -> None:
+    from opensquilla.skills.catalog_policy import project_public_catalog
+    from opensquilla.skills.loader import SkillLoader
+
+    skills_dir = tmp_path / layer
+    ordinary = skills_dir / "tiny-runner"
+    ordinary.mkdir(parents=True)
+    (ordinary / "SKILL.md").write_text(
+        "---\nname: tiny-runner\ndescription: Synthetic step.\n---\nReturn a summary.\n",
+        encoding="utf-8",
+    )
+    sop_dir = skills_dir / "authored-sop"
+    sop_dir.mkdir()
+    (sop_dir / "SKILL.md").write_text(
+        "---\nname: authored-sop\ndescription: Synthetic SOP.\nkind: meta_sop\n"
+        f"{policy}---\n## Phase 1: Summarize\nRun `tiny-runner`. Save as `summary`.\n",
+        encoding="utf-8",
+    )
+    kwargs = {f"{layer}_agents_dir": skills_dir, "snapshot_path": tmp_path / "snapshot.json"}
+
+    for loader in (SkillLoader(**kwargs), SkillLoader(**kwargs)):
+        sop = loader.get_by_name("authored-sop")
+        assert sop is not None
+        assert sop.kind == "meta"
+        assert sop.visibility == visibility
+        assert sop.invocation == invocation
+        assert bool(sop.disable_model_invocation) == ("disable-model-invocation" in policy)
+        assert sop.composition_raw["steps"][0]["skill"] == "tiny-runner"
+        assert ("authored-sop" in {spec.name for spec in loader.list_meta_specs()}) is discoverable
+        ordinary_catalog = project_public_catalog(
+            loader.load_all(), coding_mode=False, include_stable_meta=False
+        )
+        assert "authored-sop" not in {spec.name for spec in ordinary_catalog}
+
+
 def test_loader_skips_malformed_meta_sop(tmp_path: Path) -> None:
     """If the SOP fails to compile, the loader logs and skips the skill
     (matches behaviour for malformed regular skills)."""

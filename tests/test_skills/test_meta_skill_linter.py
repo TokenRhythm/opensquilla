@@ -1,32 +1,20 @@
-"""Tests for skill-creator-linter (G1 + G2 gates)."""
+"""Tests for the in-process MetaSkill creator G1/G2 gates."""
 
 from __future__ import annotations
 
-import json
-import os
-import subprocess
-import sys
 from pathlib import Path
 
 import pytest
 
+from opensquilla.skills.creator.lint_runtime import lint_meta_skill
+
 REPO = Path(__file__).resolve().parents[2]
-_LINTER_DIR = REPO / "src" / "opensquilla" / "skills" / "bundled" / "skill-creator-linter"
 _BUNDLED_DIR = REPO / "src" / "opensquilla" / "skills" / "bundled"
 _EXP_DIR = REPO / "src" / "opensquilla" / "skills" / "exp"
-LINT = _LINTER_DIR / "scripts" / "lint.py"
 
 
 def _run_lint(skill_md: str, gates: str = "G1,G2") -> dict:
-    proc = subprocess.run(
-        [sys.executable, str(LINT), "--gates", gates, "--skill-md-stdin"],
-        input=skill_md,
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        env={**os.environ, "PYTHONIOENCODING": "utf-8"},
-    )
-    return json.loads(proc.stdout)
+    return lint_meta_skill(skill_md, gates=gates)
 
 
 VALID_P1 = """---
@@ -45,7 +33,7 @@ composition:
       with:
         task: "Extract: {{ inputs.user_message | xml_escape | truncate(512) }}"
     - id: digest
-      skill: summarize
+      skill: docx
       depends_on: [extract]
       with:
         text: "{{ outputs.extract | truncate(2000) }}"
@@ -80,9 +68,8 @@ def test_g2_passes_on_valid_p1() -> None:
 
 
 EXISTING_META_BUNDLES = [
-    "meta-pdf-intelligence", "meta-travel-planner",
-    "meta-migration-assistant",
-    "meta-stack-trace-investigator", "meta-paper-write",
+    "meta-paper-write",
+    "meta-short-drama",
     "meta-skill-creator",
 ]
 
@@ -147,7 +134,7 @@ def test_g1_rejects_nested_meta_skill_reference() -> None:
     assert out["G1"]["passed"] is False
     assert any(
         "meta-paper-write" in d
-        and ("nested" in d.lower() or "kind: meta" in d)
+        and ("unknown" in d.lower() or "nested" in d.lower() or "kind: meta" in d)
         for d in out["G1"]["diagnostics"]
     ), f"Expected nested meta-skill diagnostic; got: {out['G1']['diagnostics']}"
 
@@ -180,11 +167,11 @@ provenance:
 composition:
   steps:
     - id: a
-      skill: summarize
+      skill: docx
       with:
         task: "{{ inputs.user_message }}"
     - id: b
-      skill: memory
+      skill: pdf-toolkit
       depends_on: [a]
       with:
         text: "{{ outputs.a }}"
