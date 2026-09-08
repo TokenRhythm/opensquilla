@@ -2134,7 +2134,13 @@ def test_desktop_update_actions_are_guarded_against_reentry() -> None:
     assert "if (!desktopUpdateCheckAllowed()) return" in check_update
     assert "downloading: updateDownloadInProgress ||" in check_allowed
     assert "applying: updateApplying" in check_allowed
-    assert "downloaded: downloadedUpdateVersion !== null" in check_allowed
+    # Manual installer caches must not suppress discovery of a newer or
+    # withdrawn candidate. Native updates still block checks while downloaded.
+    assert "downloaded: desktopUpdateInstallMode() !== 'manual'" in check_allowed
+    assert (
+        "&& (downloadedUpdateVersion !== null || desktopUpdateStatus === 'downloaded')"
+        in check_allowed
+    )
     assert "if (!mockDownloadedUpdate && !downloadedUpdateVersion) return" in apply_update
     assert apply_update.index("if (updateApplying) return") < apply_update.index(
         "if (!mockDownloadedUpdate && !downloadedUpdateVersion) return"
@@ -3469,7 +3475,8 @@ def test_desktop_dual_source_update_resolver_wires_static_channels() -> None:
     )
     assert "autoUpdater.allowDowngrade = false" in resolver_feed
     assert "current?.rc !== null" in resolver_feed
-    assert "const resolved = await resolveDesktopUpdate()" in check
+    assert "let resolved: ResolvedDesktopUpdate | null" in check
+    assert "resolved = await resolveDesktopUpdate()" in check
     assert "await checkNativeDesktopUpdate(resolved)" in check
     assert "result?.isUpdateAvailable !== true" in native_check
     assert "result?.isUpdateAvailable !== true" in native_download
