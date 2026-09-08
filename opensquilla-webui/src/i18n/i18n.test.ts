@@ -19,9 +19,26 @@ import type { AppSettings, SettingChange, SettingsMutation } from '@/modules/app
 function bindAppSettings(
   store: ReturnType<typeof useAppStore>,
   patchSafe = vi.fn(async (_changes: readonly SettingChange[]) => ({} as SettingsMutation)),
+  read = vi.fn(async (_path: string) => 'en'),
 ) {
-  store.bindAppSettings({ patchSafe } as unknown as AppSettings)
+  store.bindAppSettings({ patchSafe, read } as unknown as AppSettings)
   return patchSafe
+}
+
+function deferred<T>() {
+  let resolve!: (value: T) => void
+  let reject!: (error: Error) => void
+  const promise = new Promise<T>((accept, fail) => {
+    resolve = accept
+    reject = fail
+  })
+  return { promise, resolve, reject }
+}
+
+function desktopLocale(code: string) {
+  ;(window as unknown as { opensquillaDesktop?: unknown }).opensquillaDesktop = {
+    getOsLocale: async () => code,
+  }
 }
 
 function flatten(obj: Record<string, unknown>, prefix = '', out: Record<string, unknown> = {}) {
@@ -248,6 +265,195 @@ describe('appStore locale state', () => {
         { path: 'control_ui.default_locale', value: 'zh-Hans' },
       ])
     })
+    expect(store.pendingChannelNoticeLocale).toBeNull()
+  })
+
+  it('keeps the profile untouched when the Desktop startup locale already matches', async () => {
+    desktopLocale('en-US')
+    const store = useAppStore()
+    const read = vi.fn(async (_path: string) => 'en')
+    const patchSafe = bindAppSettings(store, undefined, read)
+
+    await store.initLocale()
+    await store.syncLocaleToGateway()
+
+    expect(read).toHaveBeenCalledWith('control_ui.default_locale')
+    expect(patchSafe).not.toHaveBeenCalled()
+    expect(store.pendingChannelNoticeLocale).toBeNull()
+    expect(localStorage.getItem('opensquilla-locale-sync-pending')).toBeNull()
+  })
+
+  it('retains an automatic comparison until the Gateway adapter becomes available', async () => {
+    desktopLocale('en-US')
+    const store = useAppStore()
+    await store.initLocale()
+    expect(store.pendingChannelNoticeLocale).toBe('en')
+    expect(localStorage.getItem('opensquilla-locale-sync-pending')).toBeNull()
+
+    const read = vi.fn(async (_path: string) => 'en')
+    const patchSafe = bindAppSettings(store, undefined, read)
+    await store.syncLocaleToGateway()
+
+    expect(read).toHaveBeenCalledOnce()
+    expect(patchSafe).not.toHaveBeenCalled()
+    expect(store.pendingChannelNoticeLocale).toBeNull()
+  })
+
+  it('retries a failed automatic read before synchronizing a different locale', async () => {
+    desktopLocale('zh-CN')
+    const store = useAppStore()
+    const read = vi.fn(async (_path: string) => 'en')
+      .mockRejectedValueOnce(new Error('disconnected'))
+    const patchSafe = bindAppSettings(store, undefined, read)
+    await store.initLocale()
+    await vi.waitFor(() => expect(read).toHaveBeenCalledOnce())
+    expect(store.pendingChannelNoticeLocale).toBe('zh-Hans')
+    expect(patchSafe).not.toHaveBeenCalled()
+
+    await store.syncLocaleToGateway()
+
+    expect(read).toHaveBeenCalledTimes(2)
+    expect(patchSafe).toHaveBeenCalledExactlyOnceWith([
+      { path: 'control_ui.default_locale', value: 'zh-Hans' },
+    ])
+    expect(store.pendingChannelNoticeLocale).toBeNull()
+  })
+
+  it('persists an explicit selection even when its effective value already matches', async () => {
+    const store = useAppStore()
+    const read = vi.fn(async (_path: string) => 'en')
+    const patchSafe = bindAppSettings(store, undefined, read)
+
+    await store.setLocale('en')
+
+    expect(read).not.toHaveBeenCalled()
+    expect(patchSafe).toHaveBeenCalledExactlyOnceWith([
+      { path: 'control_ui.default_locale', value: 'en' },
+    ])
+  })
+
+  it('waits for reconnect after a failed automatic patch and compares again', async () => {
+    desktopLocale('zh-CN')
+    const store = useAppStore()
+    const read = vi.fn(async (_path: string) => 'en')
+    const pendingPatch = deferred<SettingsMutation>()
+    const patchSafe = vi.fn((_changes: readonly SettingChange[]) => pendingPatch.promise)
+    bindAppSettings(store, patchSafe, read)
+    await store.initLocale()
+    await vi.waitFor(() => expect(patchSafe).toHaveBeenCalledOnce())
+    const initialSync = store.syncLocaleToGateway({ warnOnUnavailable: false })
+    pendingPatch.reject(new Error('disconnected after write'))
+    await initialSync
+
+    expect(read).toHaveBeenCalledOnce()
+    expect(patchSafe).toHaveBeenCalledOnce()
+    expect(store.pendingChannelNoticeLocale).toBe('zh-Hans')
+    read.mockResolvedValue('zh-Hans')
+    await store.syncLocaleToGateway()
+
+    expect(read).toHaveBeenCalledTimes(2)
+    expect(patchSafe).toHaveBeenCalledOnce()
+    expect(store.pendingChannelNoticeLocale).toBeNull()
+  })
+
+  it('does not replace an explicit selection when startup locale resolution finishes later', async () => {
+    const osLocale = deferred<string>()
+    ;(window as unknown as { opensquillaDesktop?: unknown }).opensquillaDesktop = {
+      getOsLocale: () => osLocale.promise,
+    }
+    const store = useAppStore()
+    const read = vi.fn(async (_path: string) => 'en')
+    const patchSafe = bindAppSettings(store, undefined, read)
+    const startup = store.initLocale()
+    await store.setLocale('ja')
+    osLocale.resolve('en-US')
+    await startup
+
+    expect(store.locale).toBe('ja')
+    expect(read).not.toHaveBeenCalled()
+    expect(patchSafe).toHaveBeenCalledExactlyOnceWith([
+      { path: 'control_ui.default_locale', value: 'ja' },
+    ])
+    expect(localStorage.getItem('opensquilla-locale')).toBe('ja')
+    expect(store.pendingChannelNoticeLocale).toBeNull()
+  })
+
+  it.each(['matching', 'failed'])('preserves same-value explicit intent during a %s automatic read', async (outcome) => {
+    desktopLocale('en-US')
+    const store = useAppStore()
+    const pendingRead = deferred<string>()
+    const read = vi.fn((_path: string) => pendingRead.promise)
+    const patchSafe = bindAppSettings(store, undefined, read)
+    await store.initLocale()
+    await vi.waitFor(() => expect(read).toHaveBeenCalledOnce())
+
+    const selection = store.setLocale('en')
+    await vi.waitFor(() => expect(localStorage.getItem('opensquilla-locale-sync-pending')).toBe('en'))
+    if (outcome === 'matching') pendingRead.resolve('en')
+    else pendingRead.reject(new Error('disconnected'))
+    await selection
+
+    expect(patchSafe).toHaveBeenCalledExactlyOnceWith([
+      { path: 'control_ui.default_locale', value: 'en' },
+    ])
+    expect(store.pendingChannelNoticeLocale).toBeNull()
+    expect(localStorage.getItem('opensquilla-locale-sync-pending')).toBeNull()
+  })
+
+  it('keeps the latest explicit choice while an automatic read is pending', async () => {
+    desktopLocale('en-US')
+    const store = useAppStore()
+    const pendingRead = deferred<string>()
+    const read = vi.fn((_path: string) => pendingRead.promise)
+    const patchSafe = bindAppSettings(store, undefined, read)
+    await store.initLocale()
+    await vi.waitFor(() => expect(read).toHaveBeenCalledOnce())
+
+    const first = store.setLocale('zh-Hans')
+    const latest = store.setLocale('ja')
+    await vi.waitFor(() => expect(store.locale).toBe('ja'))
+    pendingRead.resolve('en')
+    await Promise.all([first, latest])
+
+    expect(patchSafe).toHaveBeenCalledExactlyOnceWith([
+      { path: 'control_ui.default_locale', value: 'ja' },
+    ])
+    expect(localStorage.getItem('opensquilla-locale')).toBe('ja')
+    expect(store.pendingChannelNoticeLocale).toBeNull()
+  })
+
+  it('does not strand an explicit selection queued as an automatic read completes', async () => {
+    desktopLocale('en-US')
+    const store = useAppStore()
+    const pendingRead = deferred<string>()
+    const read = vi.fn((_path: string) => pendingRead.promise)
+    const patchSafe = bindAppSettings(store, undefined, read)
+    await store.initLocale()
+    await vi.waitFor(() => expect(read).toHaveBeenCalledOnce())
+
+    pendingRead.resolve('en')
+    await store.setLocale('en')
+
+    expect(patchSafe).toHaveBeenCalledExactlyOnceWith([
+      { path: 'control_ui.default_locale', value: 'en' },
+    ])
+    expect(store.pendingChannelNoticeLocale).toBeNull()
+  })
+
+  it('keeps a durable explicit retry when Desktop startup resolves another locale', async () => {
+    localStorage.setItem('opensquilla-locale-sync-pending', 'ja')
+    desktopLocale('en-US')
+    const store = useAppStore()
+    const read = vi.fn(async (_path: string) => 'en')
+    const patchSafe = bindAppSettings(store, undefined, read)
+
+    await store.initLocale()
+    await store.syncLocaleToGateway()
+
+    expect(read).not.toHaveBeenCalled()
+    expect(patchSafe).toHaveBeenCalledExactlyOnceWith([
+      { path: 'control_ui.default_locale', value: 'ja' },
+    ])
     expect(store.pendingChannelNoticeLocale).toBeNull()
   })
 })

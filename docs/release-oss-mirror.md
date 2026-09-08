@@ -94,7 +94,7 @@ condition and verified again after upload. A changed asset under an already
 mirrored tag is rejected; publish corrected release bytes under a new tag
 instead.
 
-Unsigned Windows clients do not execute an OSS object directly. They fetch the
+Windows clients do not execute an OSS object directly. They fetch the
 matching release's `SHA256SUMS` from the OSS mirror first (itself verified
 against the GitHub Release at mirror time), falling back to the canonical
 GitHub Release copy when the mirror object is missing or unreadable. They then

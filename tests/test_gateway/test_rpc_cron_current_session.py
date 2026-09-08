@@ -957,7 +957,15 @@ async def test_current_session_agent_run_uses_bound_session_transcript_without_f
     assert "exec_command" in tool_context.denied_tools
     assert "web_fetch" in tool_context.denied_tools
     assert await session_manager.read_transcript(SESSION_KEY) == [
-        {"role": "user", "content": "drink water"},
+        {
+            "role": "user",
+            "content": "drink water",
+            "provenance": {
+                "kind": "cron",
+                "source_session_key": SESSION_KEY,
+                "source_tool": "cron:drink",
+            },
+        },
         {"role": "assistant", "content": "drink logged"},
     ]
     assert forward_calls == []
@@ -1201,7 +1209,15 @@ async def test_current_webchat_agent_run_treats_same_session_transcript_as_deliv
     assert result.summary == "drink logged"
     assert result.delivery_status == "delivered|ws:skipped|fwd:skipped"
     assert await session_manager.read_transcript(SESSION_KEY) == [
-        {"role": "user", "content": "drink water"},
+        {
+            "role": "user",
+            "content": "drink water",
+            "provenance": {
+                "kind": "cron",
+                "source_session_key": SESSION_KEY,
+                "source_tool": "cron:drink",
+            },
+        },
         {"role": "assistant", "content": "drink logged"},
     ]
 

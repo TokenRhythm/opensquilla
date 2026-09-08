@@ -147,10 +147,11 @@ profile data during a normal uninstall.
 Code signing policy: [`docs/code-signing-policy.md`](docs/code-signing-policy.md).
 
 > [!NOTE]
-> Windows builds are currently unsigned. If SmartScreen appears, choose
-> **More info** → **Run anyway**. If Smart App Control or enterprise policy
-> blocks the unsigned app, use [Quick terminal install](#quick-terminal-install)
-> instead.
+> The published v0.5.4 Windows installer remains unsigned. The current Release
+> Assets workflow Authenticode signs new Windows installers as Beijing
+> TokenRhythm Technologies Co., Ltd. SmartScreen reputation can still take time
+> to build for a new publisher or application. If enterprise policy blocks the
+> Desktop app, use [Quick terminal install](#quick-terminal-install) instead.
 
 ### Quick terminal install
 

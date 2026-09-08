@@ -15,7 +15,6 @@ from opensquilla.application.turn_admission import AdmitTurn, PendingInputGuard
 from opensquilla.run_mode import RunMode
 from opensquilla.session.models import TurnIngressReceipt
 from opensquilla.session.storage import TurnAcceptanceResult
-from opensquilla.session_key import is_cron_session_key
 
 
 @dataclass
@@ -40,7 +39,7 @@ class _ReplayStorage:
         self.events.append("replay")
         assert identity == {
             "source_scope": "web:web:operator",
-            "request_session_key": self.acceptance.receipt.request_session_key,
+            "request_session_key": "agent:main:webchat:one",
             "client_request_id": "request-one",
         }
         return self.acceptance
@@ -99,9 +98,9 @@ class _ReplayPorts:
         }
 
 
-def _command(session_key: str = "agent:main:webchat:one") -> AdmitTurn:
+def _command() -> AdmitTurn:
     return AdmitTurn(
-        session_key,
+        "agent:main:webchat:one",
         "synthetic message",
         "session",
         client_request_id="request-one",
@@ -111,20 +110,14 @@ def _command(session_key: str = "agent:main:webchat:one") -> AdmitTurn:
     )
 
 
-def test_cron_namespace_match_is_case_sensitive() -> None:
-    assert is_cron_session_key("cron:job-one:run:one") is True
-    assert is_cron_session_key(" CRON:job-one:run:one ") is False
-    assert is_cron_session_key("cron:") is False
-
-
-def _acceptance(session_key: str = "agent:main:webchat:one") -> TurnAcceptanceResult:
+def _acceptance() -> TurnAcceptanceResult:
     return TurnAcceptanceResult(
         TurnIngressReceipt(
             source_scope="web:web:operator",
-            request_session_key=session_key,
+            request_session_key="agent:main:webchat:one",
             client_request_id="request-one",
             request_fingerprint="fingerprint-one",
-            accepted_session_key=session_key,
+            accepted_session_key="agent:main:webchat:one",
             session_id="session-one",
             message_id="message-one",
             task_id="turn-one",
@@ -212,32 +205,3 @@ async def test_pending_replay_validates_and_atomically_consumes_exact_revision()
         }
     ]
     assert ports.events.index("consume-pending") < ports.events.index("project")
-
-
-async def test_cron_session_rejects_fresh_turn_after_receipt_lookup() -> None:
-    key = "cron:job-one:run:run-one"
-    ports = _ReplayPorts(acceptance=_acceptance(key))
-
-    async def _missing_receipt(**_identity):
-        ports.events.append("replay")
-        return None
-
-    ports.storage.replay_turn_ingress_receipt = _missing_receipt
-
-    with pytest.raises(AdmissionError) as caught:
-        await DurableTurnAdmission(ports).admit(_command(key))
-
-    assert caught.value.kind == "SESSION_NOT_INTERACTIVE"
-    assert caught.value.accepted is False
-    assert ports.events[:4] == ["intent-enter", "authority-enter", "normalize", "replay"]
-    assert "project" not in ports.events
-
-
-async def test_cron_session_replays_an_existing_accepted_turn() -> None:
-    key = "cron:job-one:run:run-one"
-    ports = _ReplayPorts(acceptance=_acceptance(key))
-
-    result = await DurableTurnAdmission(ports).admit(_command(key))
-
-    assert result["replayed"] is True
-    assert ports.events.index("replay") < ports.events.index("project")

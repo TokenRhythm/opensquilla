@@ -329,6 +329,10 @@ const args = [
   'opensquilla',
   '--collect-all',
   'sqlite_vec',
+  // Tool search loads Unicode blocks through importlib.resources, outside
+  // PyInstaller's static import discovery of the anyascii._data subpackage.
+  '--collect-all',
+  'anyascii',
   '--collect-data',
   'certifi',
   '--hidden-import',

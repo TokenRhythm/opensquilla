@@ -374,48 +374,6 @@ async def test_internal_send_can_supply_trusted_background_run_kind(tmp_path: Pa
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("method", "key_field"),
-    [("chat.send", "sessionKey"), ("sessions.send", "key")],
-)
-async def test_public_send_rejects_cron_session_without_acceptance_side_effects(
-    tmp_path: Path,
-    method: str,
-    key_field: str,
-) -> None:
-    async with _open_real_stack(tmp_path / "cron-send.db") as stack:
-        cron_key = "cron:job-1:run:run-1"
-        await stack.manager.create(
-            cron_key,
-            agent_id="main",
-            display_name="Cron run",
-        )
-
-        response = await get_dispatcher().dispatch(
-            f"rpc-cron-send-{method}",
-            method,
-            {
-                key_field: cron_key,
-                "message": "unexpected follow-up",
-                "clientRequestId": f"cron-send-{method}",
-            },
-            stack.context,
-        )
-
-        assert response.ok is False
-        assert response.error is not None
-        assert response.error.code == "SESSION_NOT_INTERACTIVE"
-        assert response.error.retryable is False
-        assert response.error.accepted is False
-        assert _table_counts(stack.db_path) == {
-            "transcript_entries": 0,
-            "agent_tasks": 0,
-            "turn_ingress_receipts": 0,
-        }
-        _assert_no_runtime_acceptance_state(stack.runtime)
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
     ("message", "display_text"),
     [("/coding", "//coding"), ("//usr/bin/env", "///usr/bin/env")],
 )
@@ -4201,3 +4159,96 @@ async def test_chat_send_forwards_client_request_id_into_atomic_acceptance(
             "agent_tasks": 1,
             "turn_ingress_receipts": 1,
         }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("method", "key_field"),
+    [("chat.send", "sessionKey"), ("sessions.send", "key")],
+)
+@pytest.mark.parametrize("cron_key", ["cron:inventory", "cron:inventory:run:first"])
+async def test_public_send_continues_automation_session_with_queue_and_replay(
+    tmp_path: Path,
+    method: str,
+    key_field: str,
+    cron_key: str,
+) -> None:
+    db_path = tmp_path / "automation-chat.db"
+    async with _open_real_stack(db_path) as stack:
+        session = await stack.manager.create(cron_key, agent_id="main")
+        for role, content in [("user", "Check the sample inventory"), ("assistant", "Count: 12")]:
+            await stack.manager.append_message(
+                cron_key, role=role, content=content, provenance={"kind": "cron"}
+            )
+        original = await stack.storage.get_transcript(session.session_id)
+        first = await get_dispatcher().dispatch(
+            "automation-first",
+            method,
+            {
+                key_field: cron_key,
+                "message": "Explain the inventory count",
+                "clientRequestId": "automation-first",
+                "queueMode": "followup",
+            },
+            stack.context,
+        )
+        assert first.ok is True
+        await stack.wait_until_running()
+
+        params = {
+            key_field: cron_key,
+            "message": "Include the sample categories",
+            "clientRequestId": "automation-second",
+            "queueMode": "followup",
+        }
+        second = await get_dispatcher().dispatch("automation-second", method, params, stack.context)
+        replay = await get_dispatcher().dispatch("automation-replay", method, params, stack.context)
+
+        assert second.ok is True
+        assert replay.ok is True
+        assert replay.payload["replayed"] is True
+        assert replay.payload["task_id"] == second.payload["task_id"]
+        assert replay.payload["message_id"] == second.payload["message_id"]
+        assert len(stack.received_runs) == 1
+        pending = await stack.storage.get_agent_task(second.payload["task_id"])
+        assert pending is not None
+        assert str(pending.status) == "queued"
+        assert pending.details["session_id"] == session.session_id
+        assert pending.details["session_epoch"] == session.epoch
+
+        stack.release_handler.set()
+        for accepted in (first, second):
+            terminal = await stack.runtime.wait(accepted.payload["task_id"], timeout=2.0)
+            assert str(terminal.status) == "succeeded"
+        assert len(stack.received_runs) == 2
+        for run in stack.received_runs:
+            assert run.envelope.session_key == cron_key
+            assert run.envelope.session_id == session.session_id
+            assert run.envelope.session_epoch == session.epoch
+            assert run.run_kind == "session_turn"
+
+        entries = await stack.storage.get_transcript(session.session_id)
+        assert [entry.model_dump() for entry in entries[:2]] == [
+            entry.model_dump() for entry in original
+        ]
+        assert [entry.content for entry in entries[2:]] == [
+            "Explain the inventory count",
+            "Include the sample categories",
+        ]
+        assert _table_counts(db_path) == {
+            "transcript_entries": 4,
+            "agent_tasks": 2,
+            "turn_ingress_receipts": 2,
+        }
+
+    reopened = await SessionStorage.open(str(db_path))
+    try:
+        restored = await reopened.get_session(cron_key)
+        assert restored is not None
+        assert (restored.session_id, restored.epoch) == (session.session_id, session.epoch)
+        restored_entries = await reopened.get_transcript(session.session_id)
+        assert [entry.model_dump() for entry in restored_entries] == [
+            entry.model_dump() for entry in entries
+        ]
+    finally:
+        await reopened.close()

@@ -574,7 +574,7 @@ export function useChatRenderedMessages(options: UseChatRenderedMessagesOptions)
           ? msg.activitySnapshotIncomplete
           : undefined,
         interrupted: msg.interrupted,
-        provenanceKind: msg.provenanceKind,
+        provenanceKind: msg.provenanceKind || (msg.turnRunKind === 'cron_turn' ? 'cron' : undefined),
         provenanceSourceSessionKey: msg.provenanceSourceSessionKey,
         provenanceSourceTool: msg.provenanceSourceTool,
         stopNotice: msg.stopNotice,
