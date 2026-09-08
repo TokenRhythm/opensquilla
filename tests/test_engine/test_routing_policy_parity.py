@@ -24,16 +24,12 @@ the capacity floor became a hard lower bound for physical fallback. Their
 goldens therefore include the sanitized floor tier and omit fallback models
 below it; the remaining corpus still pins the original extraction parity.
 
-The image-bypass cases were intentionally recaptured for the #1195 reopen
-after attachment capacity became mandatory for every attachment turn. Those
-entries include the capacity-required marker, material estimate, thinking
-reserve, and capacity-filtered fallback chain. Non-attachment cases retain
-their prior byte-identical behavior.
-
-The missing image-tier case was intentionally recaptured after Router image
-admission began returning a structured rejection instead of raising a runtime
-configuration exception. Its golden pins the stable rejection metadata while
-the later provider admission layer owns the user-facing error event.
+The image-bypass cases were intentionally recaptured for the configured-only
+multimodal policy. Router now evaluates only c0-c3, treats omitted capability
+as probeable, prefers proven support, and never executes the legacy
+``image_model`` row. Their goldens pin the strict configured fallback chain
+and image projection metadata; non-attachment cases retain their prior
+byte-identical behavior.
 
 Classifier outputs are injected through a fake strategy: the corpus never
 loads the LightGBM/ONNX bundle, touches the network, or needs credentials.
@@ -260,7 +256,7 @@ def build_corpus() -> list[Case]:
     )
     cases.append(
         Case(
-            name="image_without_image_tier_errors",
+            name="image_without_legacy_image_tier_uses_c_ladder",
             tiers={k: v for k, v in synthetic_tiers().items() if k != "image_model"},
             attachments=[{"type": "image/png"}],
             classify_expected=False,

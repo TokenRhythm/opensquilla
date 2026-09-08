@@ -30,6 +30,7 @@ import asyncio
 import concurrent.futures
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
@@ -232,6 +233,9 @@ class AttachmentStageInput:
     session_id: str | None = None
     generated_normalization_attachment_count: int = 0
     timeout_seconds: float | None = None
+    persist_image_material: bool | None = None
+    image_workspace_dir: str | Path | None = None
+    failure_cleanup: Callable[[], None] | None = None
 
 
 @dataclass(frozen=True)
@@ -318,6 +322,13 @@ class AttachmentStage:
         )
 
         def _prepare() -> tuple[list[Any] | None, AttachmentMaterializationStats]:
+            image_kwargs = (
+                {
+                    "persist_image_material": inp.persist_image_material,
+                    "image_workspace_dir": inp.image_workspace_dir,
+                }
+                if inp.persist_image_material is not None else {}
+            )
             build_cancellable = getattr(self._builder, "build_cancellable", None)
             if callable(build_cancellable):
                 extra = build_cancellable(
@@ -326,6 +337,7 @@ class AttachmentStage:
                     workspace_dir=inp.workspace_dir,
                     session_id=inp.session_id,
                     cancel_check=control.check,
+                    **image_kwargs,
                 )
             else:
                 extra = self._builder.build(
@@ -333,6 +345,7 @@ class AttachmentStage:
                     attachments,
                     workspace_dir=inp.workspace_dir,
                     session_id=inp.session_id,
+                    **image_kwargs,
                 )
             control.check()
             stats = _materialization_stats(
@@ -351,14 +364,22 @@ class AttachmentStage:
             )
         except TimeoutError as exc:
             control.cancel()
+            if inp.failure_cleanup is not None:
+                inp.failure_cleanup()
             raise TimeoutError(
                 f"attachment preparation timed out after {timeout_seconds:g}s"
             ) from exc
+        except BaseException:
+            if inp.failure_cleanup is not None:
+                inp.failure_cleanup()
+            raise
 
         remaining_seconds = deadline_at_monotonic - time.monotonic()
         if remaining_seconds <= 0:
             self._admission.release()
             control.cancel()
+            if inp.failure_cleanup is not None:
+                inp.failure_cleanup()
             raise TimeoutError(
                 f"attachment preparation timed out after {timeout_seconds:g}s"
             )
@@ -368,6 +389,8 @@ class AttachmentStage:
             future = loop.run_in_executor(self._executor, _prepare)
         except BaseException:
             self._admission.release()
+            if inp.failure_cleanup is not None:
+                inp.failure_cleanup()
             raise
         def _release_admission(done: asyncio.Future[Any]) -> None:
             self._admission.release()
@@ -375,6 +398,10 @@ class AttachmentStage:
                 done.exception()
 
         future.add_done_callback(_release_admission)
+        def _cleanup_failed_worker(_done: asyncio.Future[Any]) -> None:
+            if inp.failure_cleanup is not None:
+                inp.failure_cleanup()
+
         try:
             extra_messages, stats = await asyncio.wait_for(
                 asyncio.shield(future),
@@ -382,12 +409,20 @@ class AttachmentStage:
             )
         except asyncio.CancelledError:
             control.cancel()
+            if inp.failure_cleanup is not None:
+                future.add_done_callback(_cleanup_failed_worker)
             raise
         except TimeoutError as exc:
             control.cancel()
+            if inp.failure_cleanup is not None:
+                future.add_done_callback(_cleanup_failed_worker)
             raise TimeoutError(
                 f"attachment preparation timed out after {timeout_seconds:g}s"
             ) from exc
+        except BaseException:
+            if inp.failure_cleanup is not None:
+                inp.failure_cleanup()
+            raise
         turn_input = (
             inp.effective_runtime_message if extra_messages is None else ""
         )

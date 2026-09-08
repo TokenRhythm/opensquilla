@@ -58,6 +58,11 @@ from .deployment import (
 )
 from .error_redaction import redact_upstream_error_code, redact_upstream_error_text
 from .failures import ProviderFailureKind, classify_provider_error
+from .image_projection import (
+    ImageMarkerState,
+    assert_text_only_messages,
+    project_messages,
+)
 from .model_catalog import resolve_effective_context_window, shared_catalog
 from .protocol import (
     LLMProvider,
@@ -120,6 +125,24 @@ ENSEMBLE_FIXED_TERMINAL_MESSAGE = (
     "model also failed. Check the fixed provider, model, and credentials, "
     "then try again."
 )
+
+
+def _ensemble_request_messages(messages: list[Message]) -> list[Message]:
+    """Return a fresh text-only object graph for one physical member call.
+
+    Ensemble is a text-only virtual model.  Re-project at every provider
+    boundary instead of sharing the coordinator's list across concurrent
+    proposers or retries: a provider adapter that mutates its input must not
+    contaminate a sibling leg, and no nested image may reach a member.
+    """
+
+    projection = project_messages(
+        messages,
+        mode="marker",
+        marker_state=ImageMarkerState.NOT_ANALYZED,
+    )
+    assert_text_only_messages(projection.messages)
+    return projection.messages
 log = structlog.get_logger(__name__)
 
 
@@ -2225,14 +2248,19 @@ class EnsembleProvider:
         )
 
     def validate_chat_request(self, messages: list[Message]) -> ErrorEvent | None:
-        """Reject typed image input before any ensemble leg can start."""
+        """Validate the already-projected outer Ensemble request.
+
+        Ensemble is intentionally a text-only virtual model.  Its public
+        ``chat`` boundary projects image blocks to truthful markers before any
+        member is called, so a residual image here indicates a programming
+        error rather than a user-facing capability failure.
+        """
 
         if count_provider_image_blocks(messages) <= 0:
             return None
-        return ErrorEvent(
-            message=ENSEMBLE_MULTIMODAL_UNSUPPORTED_MESSAGE,
-            code=ENSEMBLE_MULTIMODAL_UNSUPPORTED_CODE,
-        )
+        # Keep this method side-effect free for callers that use it as an
+        # admission probe; ``_chat_unbounded`` performs the actual projection.
+        return None
 
     async def list_models(self) -> list[ModelInfo]:
         models: list[ModelInfo] = []
@@ -2398,6 +2426,22 @@ class EnsembleProvider:
         *,
         execution_context: TurnExecutionContext | None = None,
     ) -> AsyncGenerator[StreamEvent, None]:
+        projection = project_messages(
+            messages,
+            mode="marker",
+            marker_state=ImageMarkerState.NOT_ANALYZED,
+        )
+        if projection.marker_count:
+            if config is not None and isinstance(getattr(config, "__dict__", None), dict):
+                metadata = getattr(config, "metadata", None)
+                if isinstance(metadata, dict):
+                    metadata["image_input_mode"] = "marker"
+                    metadata["image_input_reason"] = "ensemble_text_only"
+                    metadata["image_input_count"] = projection.input_image_count
+                    metadata["image_input_marker_count"] = projection.marker_count
+            messages = projection.messages
+            assert_text_only_messages(messages)
+
         validation_error = self.validate_chat_request(messages)
         if validation_error is not None:
             yield validation_error
@@ -3074,7 +3118,11 @@ class EnsembleProvider:
 
         provider_stream = _provider_stream_with_lifecycle(
             lambda: self._account_physical_stream(
-                lambda: provider.chat(messages, tools=tools, config=chat_cfg),
+                lambda: provider.chat(
+                    _ensemble_request_messages(messages),
+                    tools=tools,
+                    config=chat_cfg,
+                ),
                 provider=member.provider_config.provider,
                 model=member.provider_config.model,
             ),
@@ -3512,7 +3560,11 @@ class EnsembleProvider:
                 )
                 heartbeat_stream = _provider_stream_with_lifecycle(
                     lambda: self._account_physical_stream(
-                        lambda: provider.chat(messages, tools=tools, config=config),
+                        lambda: provider.chat(
+                            _ensemble_request_messages(messages),
+                            tools=tools,
+                            config=config,
+                        ),
                         provider=self.aggregator.provider_config.provider,
                         model=self.aggregator.provider_config.model,
                     ),
@@ -4118,7 +4170,7 @@ class EnsembleProvider:
                 async for event in _provider_stream_with_lifecycle(
                     lambda: self._account_physical_stream(
                         lambda: provider.chat(
-                            fixed_messages,
+                            _ensemble_request_messages(fixed_messages),
                             tools=tools,
                             config=config,
                         ),

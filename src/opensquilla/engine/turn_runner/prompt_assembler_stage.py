@@ -121,6 +121,13 @@ class RunPipelineRequest:
         default=None,
         repr=False,
     )
+    bound_user_message_id: str | None = field(default=None, repr=False)
+    expected_session_id: str | None = field(default=None, repr=False)
+    expected_session_epoch: int | None = field(default=None, repr=False)
+    transcript_snapshot: TurnTranscriptSnapshot[Any] | None = field(
+        default=None,
+        repr=False,
+    )
 
 # ---------------------------------------------------------------------------
 # Ports — narrow Protocols so the stage is unit-testable without the full
@@ -577,6 +584,10 @@ class PromptAssemblerStage:
                 if inp.attachments
                 else None
             ),
+            bound_user_message_id=inp.bound_user_message_id,
+            transcript_snapshot=inp.transcript_snapshot,
+            expected_session_id=inp.expected_session_id,
+            expected_session_epoch=inp.expected_session_epoch,
         )
         turn, provider = await self._pipeline_executor.run_pipeline(request)
 

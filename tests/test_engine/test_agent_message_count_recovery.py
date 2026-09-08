@@ -17,6 +17,7 @@ from opensquilla.engine.types import CompactionEvent
 from opensquilla.gateway.config import GatewayConfig
 from opensquilla.provider import (
     ChatConfig,
+    ContentBlockImage,
     ContentBlockToolResult,
     ContentBlockToolUse,
     Message,
@@ -633,6 +634,54 @@ async def test_message_limit_recovery_retries_once_below_headroom_without_rewrit
         "[Request context for this turn]" in str(message.content)
         for message in agent._history
     )
+
+
+@pytest.mark.asyncio
+async def test_message_limit_recovery_preserves_referenced_and_uploaded_images(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    compact_requests: list[Any] = []
+    _install_exact_compactor(monkeypatch, compact_requests)
+    provider = _ExactMessageLimitProvider([100, None])
+    agent = Agent(
+        provider=provider,
+        config=AgentConfig(
+            max_provider_retries=0,
+            flush_enabled=False,
+            model_vision_support="supported",
+            model_capabilities=ModelCapabilities(supports_vision=True),
+        ),
+    )
+    agent.set_history(_plain_history())
+    recovered_image = ContentBlockImage(
+        data="b2xkLWltYWdl", media_type="image/png", attachment_id="att_recovered",
+    )
+    current_image = ContentBlockImage(
+        data="bmV3LWltYWdl", media_type="image/png", attachment_id="att_current",
+    )
+    agent.set_request_image_context([Message(role="user", content=[recovered_image])])
+
+    events = [
+        event async for event in agent.run_turn(
+            "Compare the images.",
+            extra_messages=[Message(role="user", content=[current_image])],
+        )
+    ]
+
+    assert len(provider.calls) == 2
+    assert len(compact_requests) == 1
+    assert not any(isinstance(event, ErrorEvent) for event in events)
+    for messages in provider.calls:
+        images = [
+            block
+            for message in messages
+            if isinstance(message.content, list)
+            for block in message.content
+            if isinstance(block, ContentBlockImage)
+        ]
+        assert images == [recovered_image, current_image]
+    assert not any("b2xkLWltYWdl" in str(entry) for entry in compact_requests[0].entries)
+    assert agent._request_image_context == []
 
 
 @pytest.mark.asyncio

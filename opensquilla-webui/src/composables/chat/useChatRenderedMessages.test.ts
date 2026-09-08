@@ -1199,6 +1199,150 @@ describe('useChatRenderedMessages immutable route history', () => {
   })
 })
 
+describe('useChatRenderedMessages image router candidates', () => {
+  it('preserves an actually executed legacy winner in restored history', () => {
+    const api = renderedMessagesFor([{
+      role: 'user',
+      text: 'Describe the shape.',
+      ts: 1,
+      attachments: [{
+        kind: 'file',
+        displayId: 'historical-image',
+        renderKey: 'historical-image',
+        name: 'shape.png',
+        mime: 'image/png',
+      }],
+    }, {
+      role: 'assistant',
+      text: 'A circle.',
+      ts: 2,
+      restoredFromHistory: true,
+      usage: {
+        routed_tier: 'image_model',
+        routed_model: 'historical/actual-winner',
+        routing_source: 'image_route',
+        router_tier_snapshot: {
+          version: 1,
+          request_kind: 'image',
+          tiers: [{
+            tier: 'image_model',
+            model: 'historical/actual-winner',
+            execution_kind: 'single_model',
+          }],
+        },
+      },
+    }], undefined, true)
+
+    const strip = api.renderedMessages.value.find(message => message.isRouterStrip)
+    expect(strip?.gridCells?.map(cell => cell.model)).toEqual(['historical/actual-winner'])
+    expect(strip?.winnerIdx).toBe(0)
+    expect(strip?.routerStatic).toBe(true)
+  })
+
+  it.each(['live', 'settled', 'restored'])(
+    'excludes implicit legacy image candidates from %s image routes',
+    (stage) => {
+      for (const snapshotKind of ['none', 'legacy', 'current']) {
+        const textEntries = [0, 1, 2, 3].map(index => ({
+          tier: `c${index}`,
+          model: `text/configured-${index}`,
+          execution_kind: 'single_model',
+        }))
+        const snapshot = snapshotKind === 'none' ? undefined : {
+          version: 1,
+          request_kind: 'image',
+          tiers: snapshotKind === 'legacy' ? [
+            textEntries[1],
+            { tier: 'image_model', model: 'legacy/unused-vision', execution_kind: 'single_model' },
+          ] : textEntries,
+        }
+        const route = {
+          tier: 'c1',
+          model: 'text/actual-winner',
+          source: 'image_route',
+          ...(snapshot ? { router_tier_snapshot: snapshot } : {}),
+        }
+        const messages: ChatMessage[] = [{
+          role: 'user',
+          text: 'Describe the attached shapes.',
+          ts: 1,
+          turnId: 'turn-image-candidates',
+          attachments: [{
+            kind: 'file',
+            displayId: 'synthetic-image',
+            renderKey: 'synthetic-image',
+            name: 'shapes.png',
+            mime: 'image/png',
+          }],
+        }]
+        if (stage !== 'restored') {
+          messages.push({
+            role: 'router',
+            text: '',
+            ts: 2,
+            turnId: 'turn-image-candidates',
+            provenanceKind: 'router_decision',
+            routerDecision: route,
+          })
+        }
+        if (stage !== 'live') {
+          messages.push({
+            role: 'assistant',
+            text: 'The image was not analyzed.',
+            ts: 3,
+            turnId: 'turn-image-candidates',
+            restoredFromHistory: stage === 'restored',
+            usage: {
+              routed_tier: route.tier,
+              routed_model: route.model,
+              routing_source: route.source,
+              route_plan: route,
+            },
+          })
+        }
+        const configs: Record<string, ChatRouterTierConfig> = Object.fromEntries(
+          textEntries.map(entry => [entry.tier, {
+            model: entry.model,
+            supportsImage: false,
+            imageOnly: false,
+          }]),
+        )
+        configs.image_model = {
+          model: 'legacy/unused-vision',
+          supportsImage: true,
+          imageOnly: true,
+        }
+        const before = JSON.stringify(messages)
+        const api = useChatRenderedMessages({
+          messages: ref(messages),
+          sessionKey: ref('agent:main:webchat:image-candidates'),
+          routerSlots: ref(Object.keys(configs)),
+          routerModels: ref({}),
+          routerTierConfigs: ref(configs),
+          routerVisualEffectsEnabled: ref(true),
+          routerVisualMode: ref('real_candidates'),
+          renderMarkdown: text => text,
+          stripGeneratedArtifactMarkers: text => text,
+          stripTimePrefix: text => text,
+          isSubagentCompletionMessage: () => false,
+        })
+
+        const strips = api.renderedMessages.value.filter(message => message.isRouterStrip)
+        expect(strips).toHaveLength(1)
+        const strip = strips[0]!
+        expect(strip.gridCells?.flatMap(cell => cell.tiers).sort()).toEqual(
+          snapshotKind === 'legacy' ? ['c1'] : ['c0', 'c1', 'c2', 'c3'],
+        )
+        expect(strip.gridCells?.some(cell => cell.model === 'legacy/unused-vision')).toBe(false)
+        expect(strip.gridCells?.[strip.winnerIdx ?? -1]?.model).toBe('text/actual-winner')
+        expect(strip.routerStatic).toBe(stage === 'restored')
+        expect(strip.routerSettled).toBe(stage === 'settled')
+        expect(JSON.stringify(messages)).toBe(before)
+      }
+    },
+  )
+})
+
 describe('useChatRenderedMessages router visual mode', () => {
   it('keeps real-candidates mode limited to callable router tiers', () => {
     const api = renderedMessagesForRouterVisualMode('real_candidates')

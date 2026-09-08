@@ -777,6 +777,7 @@ async def _accept_turn(
                             media_root=media_root,
                             pending_input_id=pending_input_id,
                             target_session_id=session_id,
+                            persist_enabled=persist_enabled,
                             disk_budget_bytes=(
                                 disk_budget if isinstance(disk_budget, int) else None
                             ),

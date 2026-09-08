@@ -26,6 +26,13 @@ const CAPABILITIES_BY_MODE: ModelRoutingCapabilitiesByMode = {
   },
 }
 
+const EFFECTIVE_CAPABILITIES_BY_MODE: ModelRoutingCapabilitiesByMode = {
+  ...CAPABILITIES_BY_MODE,
+  ensemble: {
+    image_input: { admission: 'allowed', reason: 'ensemble_mode_unsupported' },
+  },
+}
+
 function deferred<T>() {
   let resolve!: (value: T | PromiseLike<T>) => void
   const promise = new Promise<T>((res) => {
@@ -340,8 +347,8 @@ describe('useChatFeatureToggles model routing mode', () => {
     expect(api.modelRoutingMode.value).toBe('off')
   })
 
-  it('applies canonical image admission and preserves old-Gateway defaults', async () => {
-    const blocked = createHarness({
+  it('allows capability degradation while preserving real Gateway blocks', async () => {
+    const degraded = createHarness({
       configGetResults: [{}],
       routingGetResults: [{
         mode: 'direct',
@@ -351,9 +358,23 @@ describe('useChatFeatureToggles model routing mode', () => {
         },
       }],
     })
-    await blocked.api.loadFeatureToggles()
-    expect(blocked.api.globalImageInputAdmission.value).toBe('blocked')
-    expect(blocked.api.globalImageInputAdmissionReason.value).toBe('model_vision_unsupported')
+    await degraded.api.loadFeatureToggles()
+    expect(degraded.api.globalImageInputAdmission.value).toBe('allowed')
+    expect(degraded.api.globalImageInputAdmissionReason.value).toBe('model_vision_unsupported')
+
+    const policyBlocked = createHarness({
+      configGetResults: [{}],
+      routingGetResults: [{
+        mode: 'direct',
+        image_input: {
+          admission: 'blocked',
+          reason: 'attachment_policy_denied',
+        },
+      }],
+    })
+    await policyBlocked.api.loadFeatureToggles()
+    expect(policyBlocked.api.globalImageInputAdmission.value).toBe('blocked')
+    expect(policyBlocked.api.globalImageInputAdmissionReason.value).toBe('attachment_policy_denied')
 
     const legacyDirect = createHarness({
       configGetResults: [{ llm_ensemble: { enabled: false } }],
@@ -367,7 +388,7 @@ describe('useChatFeatureToggles model routing mode', () => {
       routingGetResults: [{ mode: 'ensemble' }],
     })
     await legacyEnsemble.api.loadFeatureToggles()
-    expect(legacyEnsemble.api.globalImageInputAdmission.value).toBe('blocked')
+    expect(legacyEnsemble.api.globalImageInputAdmission.value).toBe('allowed')
     expect(legacyEnsemble.api.globalImageInputAdmissionReason.value).toBe(
       'ensemble_mode_unsupported',
     )
@@ -417,8 +438,8 @@ describe('useChatFeatureToggles model routing mode', () => {
 
     await api.loadFeatureToggles()
 
-    expect(api.modelRoutingCapabilitiesByMode.value).toEqual(CAPABILITIES_BY_MODE)
-    expect(api.globalImageInputAdmission.value).toBe('blocked')
+    expect(api.modelRoutingCapabilitiesByMode.value).toEqual(EFFECTIVE_CAPABILITIES_BY_MODE)
+    expect(api.globalImageInputAdmission.value).toBe('allowed')
   })
 
   it('clears the whole matrix when a later snapshot is missing or partial', async () => {
@@ -446,13 +467,43 @@ describe('useChatFeatureToggles model routing mode', () => {
     })
 
     await api.loadFeatureToggles()
-    expect(api.modelRoutingCapabilitiesByMode.value).toEqual(CAPABILITIES_BY_MODE)
+    expect(api.modelRoutingCapabilitiesByMode.value).toEqual(EFFECTIVE_CAPABILITIES_BY_MODE)
 
     await api.loadFeatureToggles()
     expect(api.modelRoutingCapabilitiesByMode.value).toBeNull()
 
     await api.loadFeatureToggles()
     expect(api.modelRoutingCapabilitiesByMode.value).toBeNull()
+  })
+
+  it('normalizes capability limits in the per-mode matrix while retaining policy blocks', async () => {
+    const { api } = createHarness({
+      configGetResults: [{}],
+      routingGetResults: [{
+        mode: 'direct',
+        capabilities_by_mode: {
+          direct: {
+            image_input: { admission: 'blocked', reason: 'model_vision_unsupported' },
+          },
+          router: {
+            image_input: { admission: 'blocked', reason: 'attachment_policy_denied' },
+          },
+          ensemble: CAPABILITIES_BY_MODE.ensemble,
+        },
+      }],
+    })
+
+    await api.loadFeatureToggles()
+
+    expect(api.modelRoutingCapabilitiesByMode.value).toEqual({
+      direct: {
+        image_input: { admission: 'allowed', reason: 'model_vision_unsupported' },
+      },
+      router: {
+        image_input: { admission: 'blocked', reason: 'attachment_policy_denied' },
+      },
+      ensemble: EFFECTIVE_CAPABILITIES_BY_MODE.ensemble,
+    })
   })
 
   it('does not let a late routing GET overwrite a newer changed event', async () => {
@@ -556,7 +607,7 @@ describe('useChatFeatureToggles model routing mode', () => {
 
     expect(api.codingModeEnabled.value).toBe(false)
     expect(api.modelRoutingMode.value).toBe('squilla_router')
-    expect(api.modelRoutingCapabilitiesByMode.value).toEqual(CAPABILITIES_BY_MODE)
+    expect(api.modelRoutingCapabilitiesByMode.value).toEqual(EFFECTIVE_CAPABILITIES_BY_MODE)
   })
 
   it('clears a prior canonical matrix when the connected Gateway lacks routing RPC', async () => {
@@ -577,14 +628,14 @@ describe('useChatFeatureToggles model routing mode', () => {
     })
 
     await api.loadFeatureToggles()
-    expect(api.modelRoutingCapabilitiesByMode.value).toEqual(CAPABILITIES_BY_MODE)
+    expect(api.modelRoutingCapabilitiesByMode.value).toEqual(EFFECTIVE_CAPABILITIES_BY_MODE)
 
     supportsRouting = false
     await api.loadFeatureToggles()
 
     expect(api.modelRoutingCapabilitiesByMode.value).toBeNull()
     expect(api.modelRoutingMode.value).toBe('llm_ensemble')
-    expect(api.globalImageInputAdmission.value).toBe('blocked')
+    expect(api.globalImageInputAdmission.value).toBe('allowed')
     expect(api.globalImageInputAdmissionReason.value).toBe('ensemble_mode_unsupported')
   })
 
@@ -607,7 +658,7 @@ describe('useChatFeatureToggles model routing mode', () => {
     await api.loadFeatureToggles()
     await api.loadFeatureToggles()
 
-    expect(api.modelRoutingCapabilitiesByMode.value).toEqual(CAPABILITIES_BY_MODE)
+    expect(api.modelRoutingCapabilitiesByMode.value).toEqual(EFFECTIVE_CAPABILITIES_BY_MODE)
     expect(api.modelRoutingMode.value).toBe('squilla_router')
     expect(api.globalImageInputAdmission.value).toBe('allowed')
   })

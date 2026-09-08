@@ -136,7 +136,7 @@ describe('SetupTierTable — editable routing rows', () => {
     app.unmount()
   })
 
-  it('renders provider, model, thinking, and image controls', async () => {
+  it('renders routing controls without manual image capability inputs', async () => {
     const { app, el } = await mountTable()
 
     const table = el.querySelector('[role="table"]')
@@ -147,7 +147,7 @@ describe('SetupTierTable — editable routing rows', () => {
     expect(head?.textContent).toContain('Request entry')
     expect(head?.textContent).toContain('Model')
     expect(head?.textContent).toContain('Thinking')
-    expect(head?.textContent).toContain('Image')
+    expect(head?.textContent).not.toContain('Image')
 
     const requestEntry = el.querySelector('[aria-label="c0 request entry"]')
     expect(requestEntry?.tagName).toBe('SELECT')
@@ -157,7 +157,7 @@ describe('SetupTierTable — editable routing rows', () => {
     expect(model?.value).toBe('deepseek/deepseek-v4-flash')
     expect(model?.disabled).toBe(false)
     expect(el.querySelector<HTMLSelectElement>('select[aria-label="c0 thinking level"]')?.value).toBe('high')
-    expect(el.querySelector<HTMLInputElement>('input[aria-label="c0 supports image"]')).toBeTruthy()
+    expect(el.querySelector('[aria-label$="supports image"]')).toBeNull()
 
     app.unmount()
   })
@@ -220,7 +220,7 @@ describe('SetupTierTable — editable routing rows', () => {
     expect(tooltip.textContent).toContain('Current fusion plan is ready')
     expect(tooltip.textContent)
       .toContain('Fixed and fallback model: OpenRouter · deepseek/deepseek-v4-pro')
-    expect(tooltip.textContent).toContain('image requests still use the Image model configuration')
+    expect(tooltip.textContent).toContain('Router image processing uses only configured C0–C3 models')
     expect(details.dataset.open).toBe('false')
     details.parentElement?.dispatchEvent(new MouseEvent('mouseenter'))
     await nextTick()
@@ -703,8 +703,9 @@ describe('SetupTierTable — editable routing rows', () => {
     app.unmount()
   })
 
-  it('disables only C3 image input while keeping the dedicated image route editable', async () => {
+  it.each([false, true])('hides the image row in editable and preset tables (readonly=%s)', async (readonly) => {
     const { app, el } = await mountTable({
+      readonly,
       rows: [
         {
           ...ROWS[1],
@@ -720,20 +721,22 @@ describe('SetupTierTable — editable routing rows', () => {
           supportsImage: true,
         },
       ],
-      providerOptions: [{ providerId: 'openai', label: 'OpenAI' }],
+      providerCredentialStatus: [{ provider: 'openai', available: false }],
+      providerOptions: [
+        { providerId: 'openai', label: 'OpenAI' },
+        { providerId: 'openrouter', label: 'OpenRouter' },
+      ],
     })
 
-    const c3Image = el.querySelector<HTMLInputElement>('input[aria-label="c3 supports image"]')!
-    expect(c3Image.checked).toBe(false)
-    expect(c3Image.disabled).toBe(true)
-    const imageModel = el.querySelector<HTMLInputElement>('input[aria-label="image_model model"]')!
-    expect(imageModel.value).toBe('vision-model')
-    expect(imageModel.disabled).toBe(false)
-    expect(el.querySelector<HTMLSelectElement>('select[aria-label="image_model thinking level"]')?.disabled).toBe(false)
-    const imageModelSwitch = el.querySelector<HTMLInputElement>('input[aria-label="image_model supports image"]')!
-    expect(imageModelSwitch.checked).toBe(true)
-    expect(imageModelSwitch.disabled).toBe(false)
-    expect(el.textContent).toContain('image requests still use the Image model configuration')
+    expect(el.querySelector('[aria-label="c3 supports image"]')).toBeNull()
+    expect(el.querySelectorAll('[role="row"]')).toHaveLength(2)
+    expect(el.querySelector('[aria-label="image_model model"]')).toBeNull()
+    expect(el.querySelector('[aria-label="image_model request entry"]')).toBeNull()
+    expect(el.querySelector('[aria-label="image_model thinking level"]')).toBeNull()
+    expect(el.querySelector('[aria-label="image_model supports image"]')).toBeNull()
+    expect(el.querySelector('[aria-label="C3 processing mode or model"]')).toBeTruthy()
+    expect(el.textContent).not.toContain('vision-model')
+    expect(el.textContent).not.toContain('Legacy compatibility setting')
     app.unmount()
   })
 
@@ -761,7 +764,7 @@ describe('SetupTierTable — editable routing rows', () => {
     expect(provider.closest('[role="row"]')?.getAttribute('aria-disabled')).toBeNull()
     expect(el.querySelector<HTMLInputElement>('input[aria-label="c0 model"]')?.disabled).toBe(true)
     expect(el.querySelector<HTMLSelectElement>('select[aria-label="c0 thinking level"]')?.disabled).toBe(true)
-    expect(el.querySelector<HTMLInputElement>('input[aria-label="c0 supports image"]')?.disabled).toBe(true)
+    expect(el.querySelector('[aria-label="c0 supports image"]')).toBeNull()
     provider.value = 'openrouter'
     provider.dispatchEvent(new Event('change', { bubbles: true }))
     expect(onUpdateTierField).toHaveBeenCalledWith('c0', 'provider', 'openrouter')
@@ -791,7 +794,7 @@ describe('SetupTierTable — editable routing rows', () => {
     expect(el.querySelector<HTMLSelectElement>('select[aria-label="c0 request entry"]')?.disabled).toBe(true)
     expect(el.querySelector<HTMLInputElement>('input[aria-label="c0 model"]')?.disabled).toBe(true)
     expect(el.querySelector<HTMLSelectElement>('select[aria-label="c0 thinking level"]')?.disabled).toBe(true)
-    expect(el.querySelector<HTMLInputElement>('input[aria-label="c0 supports image"]')?.disabled).toBe(true)
+    expect(el.querySelector('[aria-label="c0 supports image"]')).toBeNull()
 
     app.unmount()
   })
@@ -936,7 +939,7 @@ describe('SetupTierTable — readonly preview mode', () => {
     expect(el.querySelectorAll('select').length).toBe(0)
     expect(el.querySelector('input[role="combobox"]')).toBeNull()
     // The image switch stays visible (disabled) so the preview shows state.
-    expect(el.querySelector<HTMLInputElement>('input[aria-label="c0 supports image"]')?.disabled).toBe(true)
+    expect(el.querySelector('[aria-label="c0 supports image"]')).toBeNull()
 
     app.unmount()
   })

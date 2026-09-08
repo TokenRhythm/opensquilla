@@ -3177,6 +3177,7 @@ async def _ingest_channel_message_attachments(
         materialized,
         failure_mode="mark",
         mark_bytes_as_staged=True,
+        persist_enabled=bool(getattr(attachments_cfg, "persist_transcripts", True)),
         accept_opaque=bool(getattr(attachments_cfg, "accept_opaque", True)),
         opaque_limit_bytes=opaque_cap if isinstance(opaque_cap, int) else None,
     )

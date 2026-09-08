@@ -59,6 +59,7 @@ from opensquilla.provider.ensemble import (
     ensemble_runtime_status,
 )
 from opensquilla.provider.failures import ProviderFailureKind
+from opensquilla.provider.image_projection import count_image_blocks
 from opensquilla.provider.request_proof import project_final_request_payload
 from opensquilla.provider.selector import ProviderConfig
 from opensquilla.provider.types import (
@@ -1223,14 +1224,21 @@ def _ensemble_for_validation(
     ],
     ids=["base64", "historical-url", "mixed", "typed-tool-result"],
 )
-async def test_ensemble_rejects_typed_images_before_starting_any_leg(
+async def test_ensemble_projects_typed_images_before_starting_any_leg(
     monkeypatch: pytest.MonkeyPatch,
     messages: list[Message],
 ) -> None:
+    original_snapshot = [
+        message.model_dump(mode="json", exclude_none=True) for message in messages
+    ]
     registry = _FakeRegistry(
         {
-            "p1": _FakePlan([DoneEvent(model="p1")]),
-            "agg": _FakePlan([DoneEvent(model="agg")]),
+            "p1": _FakePlan(
+                [TextDeltaEvent(text="draft"), DoneEvent(model="p1")]
+            ),
+            "agg": _FakePlan(
+                [TextDeltaEvent(text="final"), DoneEvent(model="agg")]
+            ),
         }
     )
     monkeypatch.setattr("opensquilla.provider.ensemble._build_provider", registry.provider_for)
@@ -1238,19 +1246,51 @@ async def test_ensemble_rejects_typed_images_before_starting_any_leg(
 
     events = [event async for event in provider.chat(messages)]
 
-    assert len(events) == 1
-    assert isinstance(events[0], ErrorEvent)
-    assert events[0].code == "ensemble_multimodal_unsupported"
-    assert events[0].message == (
-        "Ensemble does not support image input yet. "
-        "Switch to a single-model routing mode and try again."
+    assert [call["model"] for call in registry.calls] == ["p1", "agg"]
+    assert all(count_image_blocks(call["messages"]) == 0 for call in registry.calls)
+    assert "图片未分析" in str(registry.calls[0]["messages"])
+    assert count_image_blocks(messages) == 1
+    assert [
+        message.model_dump(mode="json", exclude_none=True) for message in messages
+    ] == original_snapshot
+    assert not any(isinstance(event, ErrorEvent) for event in events)
+    assert any(isinstance(event, DoneEvent) for event in events)
+
+
+@pytest.mark.asyncio
+async def test_ensemble_gives_each_physical_member_a_fresh_text_only_copy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registry = _FakeRegistry(
+        {
+            "p1": _FakePlan([TextDeltaEvent(text="one"), DoneEvent(model="p1")]),
+            "p2": _FakePlan([TextDeltaEvent(text="two"), DoneEvent(model="p2")]),
+            "agg": _FakePlan([TextDeltaEvent(text="final"), DoneEvent(model="agg")]),
+        }
     )
-    assert registry.calls == []
+    monkeypatch.setattr("opensquilla.provider.ensemble._build_provider", registry.provider_for)
+    provider = _ensemble_for_validation(proposers=[_member("p1"), _member("p2")])
+    messages = [
+        Message(
+            role="user",
+            content=[ContentBlockImage(media_type="image/png", data="aW1hZ2U=")],
+        )
+    ]
+
+    events = [event async for event in provider.chat(messages)]
+
+    calls = {call["model"]: call for call in registry.calls}
+    assert set(calls) == {"p1", "p2", "agg"}
+    assert calls["p1"]["messages"] is not calls["p2"]["messages"]
+    assert calls["p1"]["messages"][0] is not calls["p2"]["messages"][0]
+    assert all(count_image_blocks(call["messages"]) == 0 for call in calls.values())
+    assert count_image_blocks(messages) == 1
+    assert any(isinstance(event, DoneEvent) for event in events)
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("all_failed_policy", ["error", "fallback_single"])
-async def test_ensemble_image_validation_precedes_empty_lineup_fallback(
+async def test_ensemble_image_projection_preserves_empty_lineup_policy(
     all_failed_policy: Literal["error", "fallback_single"],
 ) -> None:
     registry = _FakeRegistry(
@@ -1276,10 +1316,16 @@ async def test_ensemble_image_validation_precedes_empty_lineup_fallback(
 
     events = [event async for event in provider.chat(messages)]
 
-    assert [getattr(event, "code", "") for event in events] == [
-        "ensemble_multimodal_unsupported"
-    ]
-    assert registry.calls == []
+    if all_failed_policy == "error":
+        assert [getattr(event, "code", "") for event in events] == [
+            "ensemble_no_proposers"
+        ]
+        assert registry.calls == []
+    else:
+        assert [call["model"] for call in registry.calls] == ["fallback"]
+        assert count_image_blocks(registry.calls[0]["messages"]) == 0
+        assert "图片未分析" in str(registry.calls[0]["messages"])
+        assert not any(isinstance(event, ErrorEvent) for event in events)
 
 
 def test_ensemble_image_validation_does_not_guess_untyped_or_document_content() -> None:

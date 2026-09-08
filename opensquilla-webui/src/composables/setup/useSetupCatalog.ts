@@ -1756,7 +1756,6 @@ function routerConflictsWithTarget(value: string): boolean {
       provider: tier.provider || '',
       model: tier.model || '',
       thinkingLevel: tier.thinkingLevel || tier.thinking_level || '',
-      supportsImage: tier.supportsImage || tier.supports_image || false,
       ensembleEnabled: typeof tier.ensembleEnabled === 'boolean'
         ? tier.ensembleEnabled
         : tier.ensemble_enabled,
@@ -3022,7 +3021,7 @@ function setRouterVisualMode(value: string) {
 
 function updateTierField(
   name: string,
-  key: 'provider' | 'model' | 'thinkingLevel' | 'supportsImage' | 'ensembleEnabled' | 'ensembleSelectionMode',
+  key: 'provider' | 'model' | 'thinkingLevel' | 'ensembleEnabled' | 'ensembleSelectionMode',
   value: string | boolean,
 ) {
   routerForm.updateTierField(name, key, value)

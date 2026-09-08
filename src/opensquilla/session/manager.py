@@ -22,10 +22,19 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from opensquilla.contracts.turn_execution import AssistantMessageReservation
 from opensquilla.engine.steps.inject_time_prefix import stamp as _stamp_time_prefix
 from opensquilla.paths import default_opensquilla_home, native_io_path
+from opensquilla.session.attachment_manifest import (
+    AttachmentManifest,
+    AttachmentManifestError,
+    attachment_manifest_from_context_state,
+    build_attachment_manifest,
+    manifest_context_state,
+    preserve_attachment_occurrence_ids,
+)
 from opensquilla.session.compaction import (
     CompactionConfig,
     CompactionRequest,
     CompactionResult,
+    _attachment_safe_obligation_entries,
     arm_compaction_deadline,
     await_compaction_phase,
     compact_context,
@@ -121,6 +130,68 @@ class _ForkTerminalOutcomeResolution:
     projections: dict[str, dict[str, Any]]
     active_turn_ids: frozenset[str]
     invalid_turn_ids: frozenset[str]
+
+
+def _merge_attachment_manifest_state(
+    *,
+    node: SessionNode,
+    entries: Sequence[TranscriptEntry],
+    context_states: Sequence[SessionContextState] = (),
+) -> SessionContextState | None:
+    """Build a portable attachment index without putting media in state.
+
+    Compaction may run on databases created before the canonical archive was
+    complete.  In that case retain the newest valid manifest and merge the
+    rows visible in this snapshot instead of replacing a fuller index with a
+    partial one.  The returned row is inserted in the same rewrite transaction
+    as the summary by the caller.
+    """
+
+    prior: AttachmentManifest | None = None
+    ordered_states = sorted(
+        (
+            state
+            for state in context_states
+            if getattr(state, "state_kind", "") == "attachment_manifest_v1"
+            and getattr(state, "provider", "") == "portable"
+            and bool(getattr(state, "valid", True))
+        ),
+        key=lambda state: (
+            int(getattr(state, "created_at", 0) or 0),
+            int(getattr(state, "id", 0) or 0),
+        ),
+    )
+    for state in reversed(ordered_states):
+        try:
+            prior = attachment_manifest_from_context_state(state)
+            break
+        except (AttachmentManifestError, TypeError, ValueError):
+            continue
+
+    # The canonical snapshot is authoritative.  A collision or malformed
+    # manifest must abort compaction rather than archive media without the
+    # index needed to recover it later.
+    rebuilt = build_attachment_manifest(
+        entries,
+        session_id=node.session_id,
+        session_key=node.session_key,
+    )
+
+    if prior is None and (rebuilt is None or not rebuilt.occurrences):
+        return None
+    if prior is not None and rebuilt is not None:
+        manifest = prior.merge(
+            rebuilt.occurrences,
+            covered_through_id=max(
+                prior.covered_through_id,
+                rebuilt.covered_through_id,
+            ),
+        )
+    else:
+        manifest = prior or rebuilt
+    if manifest is None or not manifest.occurrences:
+        return None
+    return manifest_context_state(manifest)
 
 
 _COMPACTION_SINGLEFLIGHT_LOCK = threading.Lock()
@@ -419,6 +490,7 @@ def _compaction_entry_payloads(entries: list[TranscriptEntry]) -> list[dict[str,
         payloads.append(
             {
                 "id": entry.id,
+                "session_id": entry.session_id,
                 "message_id": entry.message_id,
                 "role": entry.role,
                 "content": silent_reply.content or "",
@@ -1837,8 +1909,21 @@ class SessionManager:
                     forked = TranscriptEntry(
                         session_id=child.session_id,
                         session_key=new_session_key,
+                        message_id=(
+                            entry.message_id
+                            if not is_prefix_fork
+                            else str(uuid.uuid4())
+                        ),
                         role=entry.role,
-                        content=entry.content,
+                        content=(
+                            preserve_attachment_occurrence_ids(
+                                entry.content,
+                                session_id=parent.session_id,
+                                source_message_id=entry.message_id,
+                            )
+                            if entry.role == "user"
+                            else entry.content
+                        ),
                         tool_calls=entry.tool_calls,
                         tool_call_id=entry.tool_call_id,
                         reasoning_content=entry.reasoning_content,
@@ -1991,7 +2076,15 @@ class SessionManager:
                 session_id=child.session_id,
                 session_key=new_session_key,
                 role=entry.role,
-                content=entry.content,
+                content=(
+                    preserve_attachment_occurrence_ids(
+                        entry.content,
+                        session_id=parent.session_id,
+                        source_message_id=entry.message_id,
+                    )
+                    if entry.role == "user"
+                    else entry.content
+                ),
                 tool_calls=entry.tool_calls,
                 tool_call_id=entry.tool_call_id,
                 reasoning_content=entry.reasoning_content,
@@ -2676,14 +2769,36 @@ class SessionManager:
         return persisted
 
     async def get_canonical_transcript(
-        self, session_key: str, limit: int | None = None
+        self,
+        session_key: str,
+        limit: int | None = None,
+        *,
+        expected_session_id: str | None = None,
+        expected_session_epoch: int | None = None,
     ) -> list[TranscriptEntry]:
         """Return archived compacted rows plus the active transcript tail."""
         session_key = canonicalize_session_key(session_key)
         node = await self._storage.get_session(session_key)
         if node is None:
             raise KeyError(f"Session not found: {session_key}")
-        return await self._storage.get_canonical_transcript(node.session_id, limit=limit)
+        _require_expected_session_owner(
+            node,
+            expected_session_id=expected_session_id,
+            expected_session_epoch=expected_session_epoch,
+            operation="canonical transcript read",
+        )
+        entries = await self._storage.get_canonical_transcript(node.session_id, limit=limit)
+        if expected_session_id is not None or expected_session_epoch is not None:
+            current = await self._storage.get_session(session_key)
+            if current is None:
+                raise StaleEpochError("Session owner changed during canonical transcript read")
+            _require_expected_session_owner(
+                current,
+                expected_session_id=expected_session_id,
+                expected_session_epoch=expected_session_epoch,
+                operation="canonical transcript read",
+            )
+        return entries
 
     async def get_canonical_transcript_page(
         self,
@@ -2783,9 +2898,19 @@ class SessionManager:
             status=status,
         )
 
-    async def save_context_state(self, state: SessionContextState) -> SessionContextState:
+    async def save_context_state(
+        self,
+        state: SessionContextState,
+        *,
+        expected_session_id: str | None = None,
+        expected_session_epoch: int | None = None,
+    ) -> SessionContextState:
         """Persist portable or provider-specific context state."""
-        return await self._storage.save_context_state(state)
+        return await self._storage.save_context_state(
+            state,
+            expected_session_id=expected_session_id,
+            expected_session_epoch=expected_session_epoch,
+        )
 
     async def get_context_states(
         self,
@@ -3111,6 +3236,8 @@ class SessionManager:
     ) -> CompactionResult:
         """Generate and atomically install one frozen compaction candidate."""
 
+        import structlog as _structlog
+
         result = await compact_context(
             CompactionRequest(
                 session_id=node.session_id,
@@ -3129,8 +3256,6 @@ class SessionManager:
         if result.removed_count == 0 and not result.replaced_previous_summary:
             return result
         if not result.summary:
-            import structlog as _structlog
-
             _structlog.get_logger(__name__).warning(
                 "session_compaction.empty_summary_not_persisted",
                 session_key=session_key,
@@ -3284,6 +3409,18 @@ class SessionManager:
                 current_node,
                 summary_record,
             )
+            # Keep attachment identity/material state in the same atomic
+            # rewrite as the summary.  The canonical archive is queried here
+            # (before the write transaction) so a compacted image can still be
+            # rehydrated after the active row is removed.
+            canonical_entries_for_manifest = (
+                await self._storage.get_canonical_transcript(current_node.session_id)
+            )
+            manifest_state = _merge_attachment_manifest_state(
+                node=current_node,
+                entries=canonical_entries_for_manifest,
+                context_states=current_context_states,
+            )
             # Cancellation/deadline wins until this point. Once the atomic
             # SQLite rewrite starts, wait for its real outcome so a committed
             # summary can never be reported as cancelled.
@@ -3301,7 +3438,12 @@ class SessionManager:
                     node=current_node,
                     summary=summary_record,
                     entries=kept_entries,
-                    context_states=[context_state] if context_state is not None else None,
+                    context_states=[
+                        state
+                        for state in (context_state, manifest_state)
+                        if state is not None
+                    ]
+                    or None,
                     archived_entries=removed_entries,
                     expected_source_entries=current_entries,
                     expected_source_preimage=preimage,
@@ -3489,6 +3631,8 @@ class SessionManager:
             raw_removed_entries = [
                 {
                     "id": entry.id,
+                    "session_id": entry.session_id,
+                    "message_id": entry.message_id,
                     "role": entry.role,
                     "content": entry.content or "",
                     "tool_calls": entry.tool_calls,
@@ -3508,7 +3652,9 @@ class SessionManager:
                     else structured_summary.critical_carry_forward
                 )
             else:
-                obligations = extract_compaction_obligations(raw_removed_entries)
+                obligations = extract_compaction_obligations(
+                    _attachment_safe_obligation_entries(raw_removed_entries)
+                )
                 structured_summary, coverage = build_structured_summary_from_text(
                     summary,
                     obligations,
@@ -3572,6 +3718,15 @@ class SessionManager:
         node.compaction_count = (node.compaction_count or 0) + 1
         node.updated_at = _now_ms()
         context_state = self._portable_structured_summary_state(node, summary_record)
+        canonical_entries_for_manifest = (
+            await self._storage.get_canonical_transcript(node.session_id)
+        )
+        existing_states = await self._storage.get_context_states(session_key)
+        manifest_state = _merge_attachment_manifest_state(
+            node=node,
+            entries=canonical_entries_for_manifest,
+            context_states=existing_states,
+        )
         if deadline_config is not None:
             require_compaction_time(deadline_config, phase="committing")
         commit_started = time.monotonic()
@@ -3588,7 +3743,12 @@ class SessionManager:
                 node=node,
                 summary=summary_record,
                 entries=rewritten_entries,
-                context_states=[context_state] if context_state is not None else None,
+                context_states=[
+                    state
+                    for state in (context_state, manifest_state)
+                    if state is not None
+                ]
+                or None,
                 archived_entries=removed_entries if summary_record is not None else None,
                 expected_session_id=expected_session_id,
                 expected_session_epoch=expected_session_epoch,
