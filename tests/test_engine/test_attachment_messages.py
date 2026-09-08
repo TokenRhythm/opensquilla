@@ -1142,7 +1142,11 @@ def test_unpersisted_current_images_do_not_create_permanent_workspace_copies(
     if temporary_root:
         image_path = next(scratch.rglob("*.png"))
         assert image_path.read_bytes() == b"image-bytes"
-        assert str(image_path) in str(out)
+        assert any(
+            str(image_path) in block.text
+            for block in out[0].content
+            if isinstance(block, ContentBlockText)
+        )
     else:
         assert not scratch.exists()
 
