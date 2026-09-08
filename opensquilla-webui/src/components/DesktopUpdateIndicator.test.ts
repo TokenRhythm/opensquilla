@@ -287,6 +287,90 @@ describe('DesktopUpdateIndicator', () => {
     app.unmount()
   })
 
+  it('repositions an open popover across viewport breakpoints and removes its resize listener', async () => {
+    const originalWidth = window.innerWidth
+    const resize = (width: number) => {
+      Object.defineProperty(window, 'innerWidth', { configurable: true, value: width })
+      window.dispatchEvent(new Event('resize'))
+    }
+    resize(1440)
+    const removeListener = vi.spyOn(window, 'removeEventListener')
+    const { app, el } = await mountIndicator(desktopUpdateApi({ status: 'downloaded' }))
+    let unmounted = false
+    try {
+      const trigger = el.querySelector('[data-testid="desktop-update-indicator"]') as HTMLButtonElement
+      vi.spyOn(trigger, 'getBoundingClientRect').mockImplementation(() => ({
+        right: window.innerWidth > 768 ? 1150 : window.innerWidth - 20,
+        bottom: window.innerWidth > 768 ? 114 : 124,
+      } as DOMRect))
+      trigger.click()
+      await settle()
+      const dialog = document.querySelector('[data-chat-topbar-popover="desktop-update"]') as HTMLElement
+      expect(dialog.style.right).toBe('290px')
+      expect(dialog.style.left).toBe('')
+      resize(390)
+      await settle()
+      expect(dialog.style.left).toBe('var(--sp-3)')
+      expect(dialog.style.right).toBe('var(--sp-3)')
+      expect(dialog.style.top).toBe('132px')
+      resize(1440)
+      await settle()
+      expect(dialog.style.right).toBe('290px')
+      expect(dialog.style.left).toBe('')
+      expect(dialog.style.top).toBe('122px')
+      trigger.click()
+      await settle()
+      expect(removeListener.mock.calls.filter(([name]) => name === 'resize')).toHaveLength(1)
+      trigger.click()
+      await settle()
+      app.unmount()
+      unmounted = true
+      expect(removeListener.mock.calls.filter(([name]) => name === 'resize')).toHaveLength(2)
+    } finally {
+      if (!unmounted) app.unmount()
+      removeListener.mockRestore()
+      resize(originalWidth)
+    }
+  })
+
+  it('focuses the dialog without selecting installation and keeps Tab within its actions', async () => {
+    const api = desktopUpdateApi({ status: 'downloaded', canNativeInstall: false, canInstall: true, installMode: 'manual' })
+    const { app, el } = await mountIndicator(api)
+    ;(el.querySelector('[data-testid="desktop-update-indicator"]') as HTMLButtonElement).click()
+    await settle()
+    const dialog = document.querySelector('[data-chat-topbar-popover="desktop-update"]') as HTMLElement
+    const install = document.querySelector('[data-testid="desktop-update-relaunch"]') as HTMLButtonElement
+    const later = document.querySelector('[data-testid="desktop-update-later"]') as HTMLButtonElement
+    expect(document.activeElement).toBe(dialog)
+    expect(api.relaunchToUpdate).not.toHaveBeenCalled()
+
+    const tab = (shiftKey = false) => {
+      const event = new KeyboardEvent('keydown', { key: 'Tab', shiftKey, bubbles: true, cancelable: true })
+      document.dispatchEvent(event)
+      expect(event.defaultPrevented).toBe(true)
+    }
+    tab()
+    expect(document.activeElement).toBe(install)
+    tab(true)
+    expect(document.activeElement).toBe(later)
+    tab()
+    expect(document.activeElement).toBe(install)
+    app.unmount()
+  })
+
+  it('retains keyboard focus in progress dialogs with no enabled actions', async () => {
+    const api = desktopUpdateApi({ status: 'downloading', progress: 42 })
+    const { app, el } = await mountIndicator(api)
+    ;(el.querySelector('[data-testid="desktop-update-indicator"]') as HTMLButtonElement).click()
+    await settle()
+    const dialog = document.querySelector('[data-chat-topbar-popover="desktop-update"]') as HTMLElement
+    const tab = new KeyboardEvent('keydown', { key: 'Tab', bubbles: true, cancelable: true })
+    document.dispatchEvent(tab)
+    expect(tab.defaultPrevented).toBe(true)
+    expect(document.activeElement).toBe(dialog)
+    app.unmount()
+  })
+
   it('closes the update popover on Escape and restores its trigger', async () => {
     const api = desktopUpdateApi({ status: 'available', latestVersion: '99.0.0' })
     const { app, el } = await mountIndicator(api)
@@ -330,6 +414,14 @@ describe('DesktopUpdateIndicator', () => {
       },
     }))
     blocker.mount(blockerRoot)
+
+    const blockedTab = new KeyboardEvent('keydown', {
+      key: 'Tab',
+      bubbles: true,
+      cancelable: true,
+    })
+    document.dispatchEvent(blockedTab)
+    expect(blockedTab.defaultPrevented).toBe(false)
 
     const blockedEscape = new KeyboardEvent('keydown', {
       key: 'Escape',

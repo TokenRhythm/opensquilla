@@ -1431,7 +1431,7 @@ jobs:
           key: electron-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('desktop/electron/package-lock.json') }}
 
       - name: Install WebUI recovery dependencies
-        if: ${{ (runner.os == 'Windows' || runner.os == 'macOS') && matrix.shard == 'profiles' }}
+        if: ${{ ((runner.os == 'Windows' || runner.os == 'macOS') && matrix.shard == 'profiles') || (runner.os == 'Windows' && (matrix.shard == 'ownership' || matrix.shard == 'ownership-workbench' || matrix.shard == 'all')) }}
         working-directory: opensquilla-webui
         shell: bash
         run: npm ci
@@ -1807,8 +1807,8 @@ jobs:
           esac
 
           # The Linux static lane covers the deterministic update contracts.
-          # These two scripts additionally exercise real Windows verification
-          # and registry boundaries when run on the owning platform.
+          # Windows also exercises native verification/registry boundaries and
+          # the production IPC, update UI and lifecycle in isolated Electron.
           if [[ "${RUNNER_OS}" == "Windows" &&
                 ( "${{ matrix.shard }}" == 'ownership' ||
                   "${{ matrix.shard }}" == 'ownership-workbench' ||
@@ -1816,6 +1816,7 @@ jobs:
             entries+=(
               'windows-update-security:scripts/test-windows-update-security.mjs'
               'windows-update-handoff:scripts/test-windows-update-handoff.mjs'
+              'windows-update-electron:scripts/test-windows-update-electron.mjs'
             )
           fi
 
@@ -1852,6 +1853,7 @@ jobs:
             ${{ runner.temp }}/desktop-recovery-e2e/desktop-e2e-cases.jsonl
             ${{ runner.temp }}/desktop-recovery-e2e/retry-classifications.jsonl
             ${{ runner.temp }}/desktop-recovery-e2e/retry-evidence
+            ${{ runner.temp }}/desktop-recovery-e2e/windows-update-electron
           if-no-files-found: error
           retention-days: 14
 

@@ -36,6 +36,35 @@ The PowerShell orchestration contracts replace OS/process boundaries in a
 temporary copy. They check dispatch, refusal, evidence scope and probe arguments;
 they do not establish that a signed installer works.
 
+### Local Windows process and signature checks
+
+Install the WebUI dependencies as well as the Electron dependencies before the
+rendered lifecycle test. From `desktop/electron`, run:
+
+```powershell
+npm run build
+node scripts/test-windows-update-electron.mjs --output-dir "$env:TEMP\opensquilla-electron-evidence"
+node scripts/test-windows-update-authenticode-local.mjs --installer C:\signed-audit\OpenSquilla-0.5.4-win-x64.exe --evidence-dir "$env:TEMP\opensquilla-signature-evidence"
+```
+
+The Electron fixture compiles the current production update components and uses
+the production preload, extracted update IPC handlers and quit callback inside
+a real Electron process. It checks failure recovery, repeated actions and quit
+ordering with real child processes. Signature and installation-identity results
+are injected; a Node process represents an owned Gateway, and the harmless Node
+`--updated` launch represents the installer. This is process integration
+evidence, not a packaged Gateway or NSIS upgrade. The Windows ownership CI cells
+run this fixture and retain its reports.
+
+The separate Authenticode check requires an existing signed installer and a new
+evidence directory inside the OS temporary directory. It calls the production
+Windows verifier and cache code, including a fresh-process cache read and
+rejection of altered file copies. It
+does not sign files, start installers, or use a verification bypass. A historical
+signed installer can validate these file checks; it cannot stand in for baseline
+A containing the new updater. Keep the report's source and artifact hashes with
+the UI screenshots when recording local results.
+
 ## Existing users: retain the manual upgrade gates
 
 Official 0.5.3 and 0.5.4 clients do not contain the experimental handoff. Keep

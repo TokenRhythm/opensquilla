@@ -112,6 +112,7 @@
         "desktop/electron/scripts/test-desktop-window-background-flow.mjs",
         "desktop/electron/scripts/test-desktop-theme-flow.mjs",
         "desktop/electron/scripts/test-windows-update-*.mjs",
+        "desktop/electron/scripts/fixtures/windows-update-electron/**",
         "desktop/electron/src/windows-update-*.ts"
       ]
     },

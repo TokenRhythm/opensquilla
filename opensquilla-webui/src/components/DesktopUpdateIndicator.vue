@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, nextTick, onMounted, ref } from 'vue'
+import { computed, nextTick, onMounted, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import Icon from './Icon.vue'
 import { useDesktopUpdate } from '@/composables/useDesktopUpdate'
@@ -12,6 +12,7 @@ const { t } = useI18n()
 const update = useDesktopUpdate()
 const open = ref(false)
 const triggerRef = ref<HTMLButtonElement | null>(null)
+const popoverRef = ref<HTMLElement | null>(null)
 const popoverStyle = ref<Record<string, string>>({})
 useChatTopbarPopoverCoordination('desktop-update', open)
 const popoverIsTopmost = useDialogLayer(computed(() => open.value))
@@ -51,11 +52,19 @@ function positionPopover() {
   }
 }
 
+watch(open, (isOpen, _wasOpen, onCleanup) => {
+  if (!isOpen) return
+  window.addEventListener('resize', positionPopover)
+  onCleanup(() => window.removeEventListener('resize', positionPopover))
+})
+
 async function toggle() {
   open.value = !open.value
   if (open.value) {
     await nextTick()
     positionPopover()
+    // Announce the dialog without placing initial focus on Quit and install.
+    popoverRef.value?.focus()
   }
 }
 
@@ -80,11 +89,31 @@ useDocumentEvent('click', (event) => {
 })
 
 useDocumentEvent('keydown', event => {
-  if (event.defaultPrevented || event.key !== 'Escape') return
+  if (event.defaultPrevented) return
   if (!open.value || !popoverIsTopmost.value) return
-  event.preventDefault()
-  open.value = false
-  triggerRef.value?.focus()
+  if (event.key === 'Escape') {
+    event.preventDefault()
+    open.value = false
+    triggerRef.value?.focus()
+    return
+  }
+  if (event.key !== 'Tab') return
+  const root = popoverRef.value
+  if (!root) return
+  const buttons = Array.from(root.querySelectorAll<HTMLButtonElement>('button:not([disabled])'))
+  const first = buttons[0]
+  const last = buttons[buttons.length - 1]
+  const active = document.activeElement
+  if (!first || !last) {
+    event.preventDefault()
+    root.focus()
+  } else if (event.shiftKey && (active === first || active === root || !root.contains(active))) {
+    event.preventDefault()
+    last.focus()
+  } else if (!event.shiftKey && (active === last || active === root || !root.contains(active))) {
+    event.preventDefault()
+    first.focus()
+  }
 })
 </script>
 
@@ -108,9 +137,11 @@ useDocumentEvent('keydown', event => {
     <Teleport to="body">
       <div
         v-if="open"
+        ref="popoverRef"
         class="desktop-update__popover"
         :style="popoverStyle"
         role="dialog"
+        tabindex="-1"
         :aria-label="title"
         data-chat-topbar-popover="desktop-update"
       >

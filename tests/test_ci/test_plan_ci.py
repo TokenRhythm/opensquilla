@@ -801,6 +801,8 @@ def test_windows_specific_platform_change_stays_on_windows(
         "desktop/electron/scripts/test-windows-update-handoff.mjs",
         "desktop/electron/scripts/test-windows-update-coordinator.mjs",
         "desktop/electron/scripts/test-windows-update-integration.mjs",
+        "desktop/electron/scripts/test-windows-update-electron.mjs",
+        "desktop/electron/scripts/fixtures/windows-update-electron/main.template.mjs",
     ],
 )
 def test_windows_update_changes_select_static_and_windows_ownership(
@@ -876,9 +878,30 @@ def test_windows_update_native_checks_stay_in_ownership_cells(
         [
             "windows-update-security:scripts/test-windows-update-security.mjs",
             "windows-update-handoff:scripts/test-windows-update-handoff.mjs",
+            "windows-update-electron:scripts/test-windows-update-electron.mjs",
         ]
         if expected
         else []
+    )
+
+
+def test_windows_update_electron_has_frontend_dependencies_and_evidence_upload() -> None:
+    import yaml
+
+    workflow = yaml.safe_load(Path(".github/workflows/ci.yml").read_text(encoding="utf-8"))
+    steps = workflow["jobs"]["desktop-recovery-e2e"]["steps"]
+    dependencies = next(
+        step for step in steps if step["name"] == "Install WebUI recovery dependencies"
+    )
+    assert dependencies["working-directory"] == "opensquilla-webui"
+    assert dependencies["run"] == "npm ci"
+    for shard in ("ownership", "ownership-workbench", "all"):
+        assert f"matrix.shard == '{shard}'" in dependencies["if"]
+    summary = next(step for step in steps if step["name"] == "Upload Desktop recovery summary")
+    assert "desktop-recovery-e2e/windows-update-electron" in summary["with"]["path"]
+    package = json.loads(Path("desktop/electron/package.json").read_text(encoding="utf-8"))
+    assert package["scripts"]["test:windows-update-electron"] == (
+        "npm run build && node scripts/test-windows-update-electron.mjs"
     )
 
 
