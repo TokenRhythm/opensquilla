@@ -124,26 +124,32 @@ def test_packaged_recovery_preserves_original_failure_after_cleanup(
         + "}\n",
         encoding="utf-8",
     )
-    result = subprocess.run(
-        [
-            node,
-            str(tmp_path / "test-packaged-session-recovery.mjs"),
-            "--executable",
-            str(tmp_path / "synthetic.exe"),
-            "--user-data-dir",
-            str(tmp_path / "profile"),
-            "--session-key",
-            "synthetic-main",
-            "--switch-session-key",
-            "synthetic-peer",
-            "--label",
-            "synthetic",
-        ],
-        capture_output=True,
-        text=True,
-        check=False,
-        timeout=10,
-    )
+    # This is a synthetic error/cleanup contract, not a recovery-latency check.
+    # Allow Windows CI headroom for Node startup and captured-pipe completion.
+    try:
+        result = subprocess.run(
+            [
+                node,
+                str(tmp_path / "test-packaged-session-recovery.mjs"),
+                "--executable",
+                str(tmp_path / "synthetic.exe"),
+                "--user-data-dir",
+                str(tmp_path / "profile"),
+                "--session-key",
+                "synthetic-main",
+                "--switch-session-key",
+                "synthetic-peer",
+                "--label",
+                "synthetic",
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=30 if os.name == "nt" else 10,
+        )
+    except subprocess.TimeoutExpired as error:
+        error.add_note(f"Captured stdout: {error.stdout!r}\nCaptured stderr: {error.stderr!r}")
+        raise
     assert result.returncode != 0
     assert "packaged_session_recovery_failed_before_cleanup" in result.stderr
     assert "synthetic-cleanup-ran" in result.stderr
