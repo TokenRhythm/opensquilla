@@ -1159,6 +1159,7 @@
     "tests/test_scheduler/test_parser.py": 0.033,
     "tests/test_scheduler/test_parser_tz.py": 0.608,
     "tests/test_scheduler/test_persistence.py": 1.236,
+    "tests/test_scheduler/test_reservation_release_race.py": 0.01,
     "tests/test_scheduler/test_rpc_webhook_delivery.py": 0.051,
     "tests/test_scheduler/test_schedule_compute_notify.py": 0.01,
     "tests/test_scheduler/test_schedule_normalizer.py": 0.017,

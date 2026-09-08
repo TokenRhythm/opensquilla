@@ -828,6 +828,7 @@
       "tests/test_scheduler/test_parser.py",
       "tests/test_scheduler/test_parser_tz.py",
       "tests/test_scheduler/test_persistence.py",
+      "tests/test_scheduler/test_reservation_release_race.py",
       "tests/test_scheduler/test_rpc_webhook_delivery.py",
       "tests/test_scheduler/test_schedule_compute_notify.py",
       "tests/test_scheduler/test_schedule_normalizer.py",
