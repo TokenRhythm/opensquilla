@@ -474,6 +474,7 @@
     "tests/test_engine/turn_runner/test_canonical_text_contract.py": 0.05,
     "tests/test_engine/turn_runner/test_compaction_and_history_stage_snapshot.py": 1.233,
     "tests/test_engine/turn_runner/test_compaction_and_history_stage_unit.py": 0.05,
+    "tests/test_engine/turn_runner/test_cron_provenance.py": 0.01,
     "tests/test_engine/turn_runner/test_harness_agent_factory_adapter.py": 0.02,
     "tests/test_engine/turn_runner/test_input_normalization_metadata.py": 0.023,
     "tests/test_engine/turn_runner/test_input_stage_snapshot.py": 0.509,

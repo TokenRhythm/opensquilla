@@ -126,6 +126,7 @@
       "tests/test_engine/test_usage_event_accounting.py",
       "tests/test_engine/test_usage_tracker.py",
       "tests/test_engine/turn_runner/test_canonical_text_contract.py",
+      "tests/test_engine/turn_runner/test_cron_provenance.py",
       "tests/test_engine/turn_runner/test_provider_and_tools_stage_snapshot.py",
       "tests/test_engine/turn_runner/test_router_control_replay_event.py",
       "tests/test_engine/turn_runner/test_stream_consumer_stage_snapshot.py",
