@@ -1,5 +1,8 @@
 ---
 name: meta-github-pr-watch-digest
+visibility: experimental
+invocation: experimental_internal
+disable-model-invocation: true
 description: "Inspect the user's open GitHub PRs / failing CI / new issues via `gh`, summarize into 3 buckets (to-review / awaiting-me / CI-red), and persist follow-ups to memory."
 kind: meta
 meta_priority: 45

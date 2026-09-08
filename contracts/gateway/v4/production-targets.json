@@ -640,6 +640,20 @@
     },
     {
       "kind": "method",
+      "wireName": "meta.inspect",
+      "roles": [
+        "result"
+      ]
+    },
+    {
+      "kind": "method",
+      "wireName": "meta.list",
+      "roles": [
+        "result"
+      ]
+    },
+    {
+      "kind": "method",
       "wireName": "meta.run",
       "roles": [
         "result"

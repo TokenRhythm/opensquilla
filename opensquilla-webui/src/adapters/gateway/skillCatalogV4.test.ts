@@ -5,7 +5,8 @@ function adapter(call: ReturnType<typeof vi.fn>, supports = true) {
   return createV4SkillCatalog({
     request: call,
     ready: vi.fn(async () => {}),
-    supports: vi.fn(() => supports),
+    supports: vi.fn((method: string) => supports && !method.startsWith('meta.')),
+    markUnsupported: vi.fn(),
   } as Parameters<typeof createV4SkillCatalog>[0])
 }
 

@@ -82,7 +82,7 @@ export interface ProposalSettingsUpdate {
 
 export interface SkillCatalog {
   list(options?: { readonly signal?: AbortSignal }): Promise<readonly Skill[]>
-  detail(skill: Pick<Skill, 'name' | 'instance_id' | 'install_id'>, options?: {
+  detail(skill: Pick<Skill, 'name' | 'kind' | 'instance_id' | 'install_id' | 'active' | 'lifecycle'>, options?: {
     readonly signal?: AbortSignal
   }): Promise<Skill>
   search(query: string, options?: {

@@ -69,7 +69,7 @@ async def test_skills_reload_forces_running_loader_and_returns_stable_diff(tmp_p
 
 @pytest.mark.asyncio
 async def test_skills_reload_no_change_keeps_generation(tmp_path) -> None:
-    from opensquilla.engine.steps import skills_filter
+    from opensquilla.engine.steps import skill_catalog_projection
 
     managed_dir = tmp_path / "managed"
     _write_skill(managed_dir, "plotter")
@@ -77,8 +77,8 @@ async def test_skills_reload_no_change_keeps_generation(tmp_path) -> None:
     ctx = RpcContext(conn_id="test", skill_loader=loader)
     await rpc_skills._handle_skills_list(None, ctx)
     generation = loader.snapshot().generation
-    skills_filter._elig_ctx.has_bin_cache["newly-installed-tool"] = False
-    skills_filter._elig_ctx.env_cache["UPDATED_TOKEN"] = None
+    skill_catalog_projection._elig_ctx.has_bin_cache["newly-installed-tool"] = False
+    skill_catalog_projection._elig_ctx.env_cache["UPDATED_TOKEN"] = None
 
     payload = await rpc_skills._handle_skills_reload(None, ctx)
 
@@ -89,8 +89,8 @@ async def test_skills_reload_no_change_keeps_generation(tmp_path) -> None:
     assert payload["removed"] == []
     assert payload["modified"] == []
     assert payload["errors"] == []
-    assert skills_filter._elig_ctx.has_bin_cache == {}
-    assert skills_filter._elig_ctx.env_cache == {}
+    assert skill_catalog_projection._elig_ctx.has_bin_cache == {}
+    assert skill_catalog_projection._elig_ctx.env_cache == {}
 
 
 @pytest.mark.asyncio
@@ -148,12 +148,13 @@ async def test_skills_list_serializes_invocation_visibility_flags(tmp_path) -> N
     loader = SkillLoader(managed_dir=managed_dir, snapshot_path=tmp_path / "snapshot.json")
 
     payload = await rpc_skills._handle_skills_list(
-        None,
+        {"includeLifecycle": True},
         RpcContext(conn_id="test", skill_loader=loader),
     )
 
-    assert payload["skills"][0]["user_invocable"] is True
-    assert payload["skills"][0]["disable_model_invocation"] is True
+    row = next(item for item in payload["skills"] if item["name"] == "manual-only")
+    assert row["user_invocable"] is True
+    assert row["disable_model_invocation"] is True
 
 
 @pytest.mark.asyncio

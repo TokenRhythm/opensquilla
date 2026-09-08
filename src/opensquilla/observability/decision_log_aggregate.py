@@ -107,9 +107,8 @@ def aggregate_meta_usage(
         window_days: time window for inclusion.
         meta_names: set of skill names where kind == "meta". When None,
             falls back to the name-prefix heuristic (skill.startswith("meta-")).
-            The heuristic is less accurate because helper bundles like
-            skill-creator-linter / skill-creator-proposals / skill-creator-smoke-test
-            are kind=skill but share the prefix (N12 fix).
+            The heuristic is less accurate because ordinary user Skills may
+            legitimately share the prefix (N12 fix).
     """
     cutoff = datetime.now(UTC) - timedelta(days=window_days)
     counter: Counter[str] = Counter()

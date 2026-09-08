@@ -1,5 +1,8 @@
 ---
 name: meta-research-to-slide-deck
+visibility: experimental
+invocation: experimental_internal
+disable-model-invocation: true
 description: "Use this meta-skill instead of answering directly when the user needs a researched presentation, leadership briefing, competitive analysis deck, or source-backed slide outline that benefits from multi-skill orchestration across search, source curation, synthesis, slides, and document export."
 kind: meta
 meta_priority: 63

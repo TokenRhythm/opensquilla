@@ -117,9 +117,9 @@ SESSIONS_LIST_LITERAL_ALLOWLIST: Counter[str] = Counter(
     }
 )
 SESSIONS_LIST_GATEWAY_ADAPTER = PACKAGE_ROOT / "gateway" / "adapters" / "sessions_list_contract.py"
-RUNTIME_RPC_METHOD_BASELINE = 306
-RUNTIME_RPC_METHOD_DIGEST = "b95b0d01e58f0d2b221b459b322c5cf0b05f050d567186b703bd67f6260a8fc4"
-STATIC_RPC_DECORATOR_BASELINE = 87
+RUNTIME_RPC_METHOD_BASELINE = 307
+RUNTIME_RPC_METHOD_DIGEST = "b04339a7122faa95336eda0f3a6a688a55e6fe8f73bbeb1f5e79082a74e35a48"
+STATIC_RPC_DECORATOR_BASELINE = 86
 
 # Physical lines in the sessions/runtime slice remain tracked for the final
 # closure measurement below.  The temporary S2a cumulative growth budget was
@@ -1306,6 +1306,8 @@ def test_static_rpc_decorator_sites_are_exact_and_contract_methods_are_adapter_r
             "workspaces.pin",
             "workspaces.remove",
             "workspaces.history.delete",
+            "meta.list",
+            "meta.inspect",
             "meta.drafts.list",
             "meta.drafts.discard",
             "meta.run",

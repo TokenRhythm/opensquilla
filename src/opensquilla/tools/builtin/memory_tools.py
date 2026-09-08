@@ -699,7 +699,9 @@ def create_memory_tools(
             "for ordinary task deliverables such as reports, JSON outputs, or "
             "result files. Use MEMORY.md for long-term facts (mode=replace) and "
             "memory/YYYY-MM-DD.md for daily notes (mode=append). Profile/bootstrap "
-            "files such as USER.md are edited with filesystem tools, not memory_save."
+            "files such as USER.md are edited with filesystem tools, not memory_save. "
+            "Before replacing an existing file, read its complete contents and preserve "
+            "unrelated facts."
         ),
         params={
             "content": {"type": "string", "description": "Content to save"},
@@ -812,7 +814,8 @@ def create_memory_tools(
         name="memory_delete",
         description=(
             "Delete a memory source file and remove it from the search index. "
-            "Use to correct wrong memories or remove outdated information."
+            "Use only when the user requests deletion of the entire memory file. "
+            "To forget or correct one fact, edit the file and preserve its other contents."
         ),
         params={
             "path": {

@@ -53,9 +53,6 @@ composition:
         query: "{{ step.task }}: {{ '{{' }} inputs.user_message | xml_escape | truncate(512) {{ '}}' }}"
         window_days: "30"
         include: "co_occurrences,meta_usage,router_fixtures"
-{%- elif step_kind == "skill_exec" and step.skill == "git-diff" %}
-        mode: cached_fallback_worktree
-        cwd: "{{ '{{' }} inputs.workspace_dir | default('.') {{ '}}' }}"
 {%- else %}
 {%- if loop.first %}
         task: "{{ step.task }}: {{ '{{' }} inputs.user_message | xml_escape | truncate(512) {{ '}}' }}"

@@ -36,7 +36,14 @@ from opensquilla.skills.meta.orchestrator import (
 from opensquilla.skills.meta.parser import MetaPlanError, parse_meta_plan
 from opensquilla.skills.meta.scheduler import _localized_request_template, _localized_step_label
 from opensquilla.skills.meta.types import MetaMatch, MetaPlan, MetaResult, MetaStep, RouteCase
-from opensquilla.skills.types import SkillLayer, SkillPlatformMeta, SkillRequires, SkillSpec
+from opensquilla.skills.types import (
+    SkillInvocation,
+    SkillLayer,
+    SkillPlatformMeta,
+    SkillRequires,
+    SkillSpec,
+    SkillVisibility,
+)
 from opensquilla.tool_boundary import ToolResult
 
 # ---------------------------------------------------------------------------
@@ -71,6 +78,8 @@ def _make_meta_spec(
         composition_raw=composition,
         final_text_mode=final_text_mode,
         output_contract=output_contract or {},
+        visibility=(SkillVisibility.META if kind == "meta" else SkillVisibility.PUBLIC),
+        invocation=(SkillInvocation.META_ONLY if kind == "meta" else SkillInvocation.DIRECT),
     )
 
 
@@ -1098,60 +1107,6 @@ async def test_meta_resolution_ignores_trigger_inside_raw_page_dump() -> None:
 
     assert "meta_match" not in out.metadata
     assert "meta_skill_match" not in out.metadata
-
-
-@pytest.mark.asyncio
-async def test_meta_resolution_semantic_fallback_matches_without_trigger(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    import importlib
-    meta_resolution_module = importlib.import_module(
-        "opensquilla.engine.steps.meta_resolution",
-    )
-
-    spec = _make_meta_spec(
-        name="meta-pdf-intelligence",
-        composition={"steps": [{"id": "a", "skill": "summarize"}]},
-        triggers=["PDF analysis"],
-        priority=55,
-    )
-    loader = _FakeLoader([spec])
-
-    class FakeRetriever:
-        def __init__(self, **kwargs: Any) -> None:
-            assert kwargs["strategy"] == "hybrid"
-
-        def retrieve(self, skills: list[SkillSpec], query: str, top_k: int = 1) -> list[SkillSpec]:
-            assert query == "帮我看一下这个文档，重点讲结论和风险"
-            assert top_k == 1
-            return [skills[0]]
-
-    monkeypatch.setattr(meta_resolution_module, "HybridRetriever", FakeRetriever)
-
-    ctx = SimpleNamespace(
-        message="帮我看一下这个文档，重点讲结论和风险",
-        semantic_message="帮我看一下这个文档，重点讲结论和风险",
-        session_key="semantic-session",
-        metadata={"skill_loader": loader},
-        system_prompt=("base prompt", ""),
-        config=SimpleNamespace(
-            skills=SimpleNamespace(filter_strategy="lexical"),
-            meta_skill=SimpleNamespace(enabled=True, auto_trigger=True),
-        ),
-    )
-
-    out = await meta_resolution(ctx)  # type: ignore[arg-type]
-
-    assert out.metadata["meta_match"].plan.name == "meta-pdf-intelligence"
-    assert out.metadata["meta_match_source"] == "semantic"
-    assert out.metadata["meta_match_trigger"] == "semantic"
-    assert out.metadata["meta_activation_mode"] == "hint"
-    assert "meta_match_tool_choice" not in out.metadata
-    hint = str(out.system_prompt)
-    assert "Activation mode: hint" in hint
-    assert 'meta_invoke(name="meta-pdf-intelligence")' in hint
-    assert "Do not answer directly" in hint
-    assert "Do not call ordinary tools before `meta_invoke`" in hint
 
 
 @pytest.mark.asyncio

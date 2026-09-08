@@ -67,14 +67,10 @@ _RISK_ORDER = {"low": 0, "medium": 1, "high": 2}
 # ``metadata.opensquilla.capabilities`` / ``risk`` in their manifests.
 _HIGH_RISK_SKILLS = frozenset({
     "github",
-    "tmux",
 })
 
 _MEDIUM_RISK_SKILLS = frozenset({
     "docx",
-    "html-to-pdf",
-    "latex-compile",
-    "nano-pdf",
     "pdf-toolkit",
     "pptx",
     "xlsx",
@@ -82,7 +78,6 @@ _MEDIUM_RISK_SKILLS = frozenset({
 
 _LOW_RISK_SKILLS = frozenset({
     "history-explorer",
-    "summarize",
 })
 
 _CAPABILITY_RISK = {

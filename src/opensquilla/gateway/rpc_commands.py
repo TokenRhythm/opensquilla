@@ -79,6 +79,8 @@ async def _meta_skill_argument_choices(
     Mirrors the ``meta.list`` filter: invokable ``kind="meta"`` skills only, and
     empty when the subsystem is disabled. Sorted for a stable menu.
     """
+    from opensquilla.skills.catalog_policy import is_invokable_meta
+    from opensquilla.skills.eligibility import is_skill_available
     from opensquilla.skills.meta.enabled import is_meta_skill_enabled
     from opensquilla.skills.meta.readiness import (
         assess_meta_skill_readiness,
@@ -104,11 +106,18 @@ async def _meta_skill_argument_choices(
 
     def project_choices() -> list[dict[str, Any]]:
         skill_index = {skill.name: skill for skill in specs}
+        skills_config = getattr(config, "skills", None)
         choices = []
         for spec in specs:
-            if getattr(spec, "kind", "skill") != "meta":
+            if not is_invokable_meta(spec):
                 continue
             if getattr(spec, "disable_model_invocation", False):
+                continue
+            if not is_skill_available(
+                spec.name,
+                disabled=getattr(skills_config, "disabled", None),
+                coding_mode=bool(getattr(skills_config, "coding_mode", False)),
+            ):
                 continue
             readiness = assess_meta_skill_readiness(
                 spec,

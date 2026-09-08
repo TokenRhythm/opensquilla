@@ -1,5 +1,8 @@
 ---
 name: meta-pre-commit-quality-gate
+visibility: experimental
+invocation: experimental_internal
+disable-model-invocation: true
 description: "Run three quality gates (ruff + mypy + pytest) in parallel over the staged diff, then arbitrate a single BLOCK/APPROVE verdict. Use before committing changes locally when you want a comprehensive pre-commit gate beyond per-file linting — exactly the same gate set CI enforces."
 kind: meta
 meta_priority: 70

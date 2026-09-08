@@ -31,7 +31,6 @@ from opensquilla.gateway.boot import (
     build_services,
     build_task_runtime_run_kwargs,
     dispatch_task_runtime_turn,
-    emit_skill_filter_banner,
     validate_squilla_router_runtime,
 )
 from opensquilla.gateway.channel_dispatch import _stamp_channel_admin_principal
@@ -328,7 +327,6 @@ def test_start_gateway_server_releases_pid_lock_when_build_services_fails(
         reconcile,
     )
     monkeypatch.setattr(boot, "_setup_file_logging", lambda config: None)
-    monkeypatch.setattr(boot, "emit_skill_filter_banner", lambda config: None)
     monkeypatch.setattr(
         "opensquilla.gateway.pidlock.GatewayPidLock.acquire",
         lambda self: events.append("acquire"),
@@ -375,7 +373,6 @@ def test_failed_second_start_does_not_reset_active_stream_generation(
         {"text": "still live"},
     )
     monkeypatch.setattr(boot, "_setup_file_logging", lambda config: None)
-    monkeypatch.setattr(boot, "emit_skill_filter_banner", lambda config: None)
 
     def reject_second_owner(_self: Any) -> None:
         raise RuntimeError("gateway already owns pid lock")
@@ -423,7 +420,6 @@ def test_failed_desktop_ownership_does_not_reset_active_stream_generation(
         {"text": "still live"},
     )
     monkeypatch.setattr(boot, "_setup_file_logging", lambda config: None)
-    monkeypatch.setattr(boot, "emit_skill_filter_banner", lambda config: None)
     monkeypatch.setattr(
         "opensquilla.gateway.pidlock.GatewayPidLock.acquire",
         lambda self: events.append("acquire"),
@@ -585,7 +581,6 @@ def test_start_gateway_server_starts_telemetry_after_listener_and_runtime_are_re
     monkeypatch.setattr(boot.uvicorn, "Server", FakeUvicornServer)
     monkeypatch.setattr(boot, "_desktop_router_preload_enabled", lambda: False)
     monkeypatch.setattr(boot, "_setup_file_logging", lambda config: None)
-    monkeypatch.setattr(boot, "emit_skill_filter_banner", lambda config: None)
     monkeypatch.setattr(boot, "_ensure_sandbox_setup_on_boot", fake_sandbox_startup)
     monkeypatch.setattr(
         "opensquilla.observability.install_telemetry.start_background_install_telemetry",
@@ -1305,7 +1300,6 @@ async def test_embedded_gateway_defers_sandbox_until_inprocess_ready(
         fake_initialize,
     )
     monkeypatch.setattr(boot, "_setup_file_logging", lambda config: None)
-    monkeypatch.setattr(boot, "emit_skill_filter_banner", lambda config: None)
     monkeypatch.setattr(
         "opensquilla.gateway.pidlock.GatewayPidLock.acquire",
         lambda self: None,
@@ -1553,7 +1547,6 @@ async def test_start_gateway_server_shares_diagnostics_state_between_app_and_tur
     monkeypatch.setattr("opensquilla.engine.runtime.TurnRunner", FakeTurnRunner)
     monkeypatch.setattr(boot, "build_services", fake_build_services)
     monkeypatch.setattr(boot, "_setup_file_logging", lambda config: None)
-    monkeypatch.setattr(boot, "emit_skill_filter_banner", lambda config: None)
     monkeypatch.setattr(
         "opensquilla.gateway.pidlock.GatewayPidLock.acquire",
         lambda self: None,
@@ -1638,7 +1631,6 @@ async def test_start_gateway_server_creates_default_subscription_manager(
     monkeypatch.setattr("opensquilla.gateway.event_bridge.EventBridge", FakeEventBridge)
     monkeypatch.setattr(boot, "build_services", fake_build_services)
     monkeypatch.setattr(boot, "_setup_file_logging", lambda config: None)
-    monkeypatch.setattr(boot, "emit_skill_filter_banner", lambda config: None)
     monkeypatch.setattr(
         "opensquilla.gateway.pidlock.GatewayPidLock.acquire",
         lambda self: None,
@@ -1738,7 +1730,6 @@ async def test_start_gateway_server_schedules_router_preload_after_channels(
     monkeypatch.setattr("opensquilla.engine.runtime.TurnRunner", FakeTurnRunner)
     monkeypatch.setattr(boot, "build_services", fake_build_services)
     monkeypatch.setattr(boot, "_setup_file_logging", lambda config: None)
-    monkeypatch.setattr(boot, "emit_skill_filter_banner", lambda config: None)
     monkeypatch.setattr(boot, "create_background_task", fake_create_background_task)
     monkeypatch.setattr(boot.uvicorn, "Server", FakeServer)
     monkeypatch.setattr(
@@ -1828,7 +1819,6 @@ def test_start_gateway_server_passes_tls_files_to_uvicorn(
     monkeypatch.setattr("opensquilla.engine.runtime.TurnRunner", FakeTurnRunner)
     monkeypatch.setattr(boot, "build_services", fake_build_services)
     monkeypatch.setattr(boot, "_setup_file_logging", lambda config: None)
-    monkeypatch.setattr(boot, "emit_skill_filter_banner", lambda config: None)
     monkeypatch.setattr(boot, "create_background_task", fake_create_background_task)
     monkeypatch.setattr(boot.uvicorn, "Config", FakeUvicornConfig)
     monkeypatch.setattr(boot.uvicorn, "Server", FakeServer)
@@ -1942,7 +1932,6 @@ async def test_start_gateway_server_wires_cron_failure_dispatcher(
     monkeypatch.setattr("opensquilla.engine.runtime.TurnRunner", FakeTurnRunner)
     monkeypatch.setattr(boot, "build_services", fake_build_services)
     monkeypatch.setattr(boot, "_setup_file_logging", lambda config: None)
-    monkeypatch.setattr(boot, "emit_skill_filter_banner", lambda config: None)
     monkeypatch.setattr(scheduler_jobs, "set_failure_dispatcher", _record_dispatcher)
     monkeypatch.setattr("opensquilla.gateway.pidlock.GatewayPidLock.acquire", lambda self: None)
     monkeypatch.setattr("opensquilla.gateway.pidlock.GatewayPidLock.release", lambda self: None)
@@ -2106,7 +2095,6 @@ async def test_start_gateway_server_wires_meta_skill_auto_propose_routes(
     monkeypatch.setattr("opensquilla.engine.runtime.TurnRunner", FakeTurnRunner)
     monkeypatch.setattr(boot, "build_services", fake_build_services)
     monkeypatch.setattr(boot, "_setup_file_logging", lambda config: None)
-    monkeypatch.setattr(boot, "emit_skill_filter_banner", lambda config: None)
     monkeypatch.setattr(
         auto_handler_mod,
         "make_auto_propose_handler",
@@ -2639,34 +2627,6 @@ def test_router_boot_validation_still_fails_when_required_bundle_missing(tmp_pat
 
     with pytest.raises(RuntimeError, match="missing V4 bundle files"):
         validate_squilla_router_runtime(config)
-
-
-def test_skill_filter_banner_accepts_tokenizers_without_transformers(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    from opensquilla.memory.embedding import LocalEmbeddingProvider
-
-    def fake_find_spec(name: str):
-        if name in {"onnxruntime", "tokenizers"}:
-            return object()
-        if name == "transformers":
-            return None
-        raise AssertionError(name)
-
-    monkeypatch.setattr("importlib.util.find_spec", fake_find_spec)
-    monkeypatch.setattr(
-        LocalEmbeddingProvider,
-        "_bundled_onnx_dir",
-        classmethod(lambda cls, model_name: tmp_path),
-    )
-
-    emit_skill_filter_banner(
-        SimpleNamespace(filter_enabled=True, filter_strategy="semantic", filter_embedding_model="")
-    )
-
-    assert "ONNX embedding backend not available" not in caplog.text
 
 
 @pytest.mark.asyncio

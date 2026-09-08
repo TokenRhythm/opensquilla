@@ -196,7 +196,7 @@ def test_runtime_does_not_hard_auto_invoke_meta_match() -> None:
 
 
 @pytest.mark.asyncio
-async def test_runtime_pipeline_runs_meta_resolution_before_skill_filter(
+async def test_runtime_pipeline_runs_meta_resolution_before_catalog_projection(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -232,7 +232,7 @@ async def test_runtime_pipeline_runs_meta_resolution_before_skill_filter(
     )
 
     step_names = [record.step_name for record in turn.metadata["pipeline_steps"]]
-    assert step_names.index("meta_resolution") < step_names.index("filter_skills")
+    assert step_names.index("meta_resolution") < step_names.index("resolve_skill_catalog")
     assert turn.metadata["meta_match"].plan.name == "meta-tiny"
     assert "meta_invoke(name=\"meta-tiny\")" in str(turn.system_prompt)
     assert "meta-tiny" in str(turn.system_prompt)
@@ -285,7 +285,7 @@ async def test_runtime_pipeline_restores_mainline_meta_and_coding_order(
         "meta_resolution",
         "enforce_coding_mode",
         "meta_command_launch",
-        "filter_skills",
+        "resolve_skill_catalog",
         "inject_subagent_grounding",
         "inject_platform_hint",
         "apply_prompt_cache",
@@ -353,7 +353,7 @@ async def test_restricted_artifact_pipeline_projects_no_workspace_or_skills(
     assert turn.metadata["skill_count"] == 0
     assert turn.metadata["skills_rendered_count"] == 0
     assert turn.metadata["skills_prompt_chars"] == 0
-    assert turn.metadata["filtered_skill_ids"] == []
+    assert turn.metadata["skill_catalog_ids"] == []
     assert turn.skill_catalog is None
     assert "skill_catalog_generation" not in turn.metadata
     assert "meta_match" not in turn.metadata
@@ -370,7 +370,7 @@ async def test_restricted_artifact_pipeline_projects_no_workspace_or_skills(
 
 
 @pytest.mark.asyncio
-async def test_runtime_pipeline_pins_meta_skill_when_skill_filter_enabled(
+async def test_runtime_pipeline_pins_meta_skill_when_catalog_projection_enabled(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -387,8 +387,6 @@ async def test_runtime_pipeline_pins_meta_skill_when_skill_filter_enabled(
 
     loader = _make_loader_with_meta(tmp_path)
     skills_cfg = SimpleNamespace(
-        filter_enabled=True,
-        filter_top_k=5,
         max_skills_prompt_chars=8000,
         injection_mode="system",
     )
@@ -522,7 +520,7 @@ async def test_pipeline_hides_meta_skill_from_prompt_when_auto_trigger_off(
     runner._skill_loader = loader
 
     turn, _provider = await runner._run_pipeline(
-        "what is the capital of France?",  # non-triggering: isolates skills_filter
+        "what is the capital of France?",  # non-triggering: isolates skill_catalog_projection
         "agent:main:test-meta-hidden",
         None,
         None,
@@ -534,7 +532,7 @@ async def test_pipeline_hides_meta_skill_from_prompt_when_auto_trigger_off(
     )
 
     assert "meta-tiny" not in str(turn.system_prompt)
-    assert "meta-tiny" not in (turn.metadata.get("filtered_skill_ids") or [])
+    assert "meta-tiny" not in (turn.metadata.get("skill_catalog_ids") or [])
 
 
 @pytest.mark.asyncio
@@ -553,7 +551,7 @@ async def test_pipeline_shows_meta_skill_when_auto_trigger_on(
     runner._skill_loader = loader
 
     turn, _provider = await runner._run_pipeline(
-        "what is the capital of France?",  # non-triggering: isolates skills_filter
+        "what is the capital of France?",  # non-triggering: isolates skill_catalog_projection
         "agent:main:test-meta-shown",
         None,
         None,

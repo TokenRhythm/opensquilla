@@ -13,6 +13,13 @@ from opensquilla.contracts.tool_presentation import ToolPresentationCategory
 from opensquilla.contracts.turn_execution import SurfaceCapabilities
 from opensquilla.sandbox.operation_runtime import SandboxToolDescriptor
 
+# Set only by the trusted Meta scheduler around its internal skill_view
+# preface. It is intentionally separate from model-supplied tool arguments.
+current_meta_skill_owner: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "current_meta_skill_owner",
+    default="",
+)
+
 
 class CallerKind(StrEnum):
     """Entry-point caller type — used in ToolContext for filtering decisions."""

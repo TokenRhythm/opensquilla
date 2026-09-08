@@ -1,5 +1,8 @@
 ---
 name: meta-spreadsheet-insight
+visibility: experimental
+invocation: experimental_internal
+disable-model-invocation: true
 description: "Turn an Excel workbook into business insight: structured read → trend/anomaly summary → write back to a new 'Insights' sheet → persist KPIs to memory."
 kind: meta
 meta_priority: 55
