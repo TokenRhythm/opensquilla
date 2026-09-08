@@ -113,6 +113,8 @@ def build_transcript_attachment_envelope(
 
     When ``disk_budget_bytes`` is provided and a staged write would exceed it,
     the function raises instead of falling back to persistent inline base64.
+    With persistence disabled, every attachment shape becomes metadata plus
+    an unavailable marker; existing material is neither linked nor deleted.
     """
 
     persisted_attachments: list[dict[str, Any]] = []
@@ -123,6 +125,25 @@ def build_transcript_attachment_envelope(
             attachment.get("type") or attachment.get("mime") or attachment.get("media_type")
         )
         name = attachment.get("name", "attachment")
+        if not persist_enabled:
+            size = attachment.get("size")
+            if not isinstance(size, int) or isinstance(size, bool) or size < 0:
+                size = None
+                data = attachment.get("data")
+                if isinstance(data, str):
+                    try:
+                        size = len(base64.b64decode(data, validate=True))
+                    except (ValueError, TypeError):
+                        pass
+            persisted_attachments.append(
+                {
+                    "name": name,
+                    "mime": media_type,
+                    "size": size,
+                    "missing_reason": "attachment persistence disabled",
+                }
+            )
+            continue
         if is_attachment_ref(attachment):
             sha = attachment["sha256"]
             persisted_attachments.append(
@@ -139,7 +160,7 @@ def build_transcript_attachment_envelope(
         if not isinstance(data, str) or not isinstance(media_type, str):
             continue
 
-        if persist_enabled and _was_staged(attachment):
+        if _was_staged(attachment):
             try:
                 payload = base64.b64decode(data, validate=True)
             except (ValueError, TypeError) as exc:
@@ -178,27 +199,6 @@ def build_transcript_attachment_envelope(
                     "name": name,
                     "mime": media_type,
                     "size": len(payload),
-                }
-            )
-        elif _was_staged(attachment):
-            try:
-                payload = base64.b64decode(data, validate=True)
-            except (ValueError, TypeError) as exc:
-                log.warning("transcript.persist_decode_failed name=%s err=%s", name, exc)
-                persisted_attachments.append(
-                    {
-                        "name": name,
-                        "mime": media_type,
-                        "missing_reason": "attachment decode failed",
-                    }
-                )
-                continue
-            persisted_attachments.append(
-                {
-                    "name": name,
-                    "mime": media_type,
-                    "size": len(payload),
-                    "missing_reason": "attachment persistence disabled",
                 }
             )
         else:

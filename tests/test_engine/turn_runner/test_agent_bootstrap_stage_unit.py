@@ -627,6 +627,80 @@ async def test_bootstrap_installs_known_fallback_limits_on_provider_wrapper() ->
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("declared_fallback_provider", ["provider-b", "foreign-provider"])
+async def test_router_vision_declarations_override_stale_catalog_for_each_leg(
+    declared_fallback_provider: str,
+) -> None:
+    primary = _ResolvedCatalog(
+        max_tokens=16_384,
+        context_window=128_000,
+        capabilities=ModelCapabilities(supports_vision=False),
+        vision_support="unsupported",
+    )
+    fallback = SimpleNamespace(
+        provider="provider-b",
+        model="fallback/model",
+        api_key="fallback-key",
+        base_url="",
+        proxy="",
+    )
+
+    class _Catalog:
+        def lookup(self, model_id: str, provider: str = "") -> _ResolvedCatalog:
+            if (provider, model_id) == ("provider-a", "primary/model"):
+                return primary
+            assert model_id == "fallback/model"
+            assert provider in {"provider-b", "foreign-provider"}
+            return replace(primary, max_tokens=8_192, context_window=64_000)
+
+    class _Provider:
+        vision_entries: list[tuple[Any, str]] = []
+
+        def fallback_deployment_configs(self) -> tuple[Any, ...]:
+            return (fallback,)
+
+        def configure_fallback_deployment_limits(self, _limits: Any) -> None:
+            return None
+
+        def configure_fallback_deployment_vision_support(
+            self,
+            entries: list[tuple[Any, str]],
+        ) -> None:
+            self.vision_entries = entries
+
+        def configure_fallback_limits(self, _limits: Any) -> None:
+            return None
+
+    provider = _Provider()
+    turn = _make_turn(
+        metadata={
+            "routed_provider": "provider-a",
+            "routed_model": "primary/model",
+            "routed_model_vision_support": "supported",
+            "router_fallback_chain": [
+                {
+                    "provider": declared_fallback_provider,
+                    "model": "fallback/model",
+                    "vision_support": "supported",
+                }
+            ],
+        }
+    )
+
+    out = await _make_stage(catalog=_Catalog()).run(
+        _make_input(
+            provider=provider,
+            turn=turn,
+            resolved_model="primary/model",
+            active_provider_id="provider-a",
+        )
+    )
+
+    assert out.output.agent_config.model_vision_support == "supported"
+    assert provider.vision_entries == [(fallback, "supported")]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("fallback_supports_tools", [True, False])
 async def test_fallback_capability_does_not_downgrade_active_model_verification(
     fallback_supports_tools: bool,

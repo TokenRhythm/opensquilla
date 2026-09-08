@@ -13,7 +13,6 @@ from typing import Any, Literal
 
 from opensquilla.provider.types import ModelCapabilities, ProviderRequestCorrelation
 from opensquilla.router_tiers import (
-    IMAGE_TIER,
     TEXT_TIERS,
     TierConfig,
     effective_ensemble_selection_mode,
@@ -22,8 +21,6 @@ from opensquilla.router_tiers import (
     tier_ensemble_active,
     tier_ensemble_execution,
 )
-
-_ROUTER_SNAPSHOT_TIER_ORDER = (*TEXT_TIERS, IMAGE_TIER)
 
 
 @dataclass(frozen=True, slots=True)
@@ -257,7 +254,12 @@ def _router_tier_snapshot(
     router = getattr(config, "squilla_router", None)
     tiers = normalize_tier_mapping(getattr(router, "tiers", None))
     normalized_winner = normalize_tier_id(winner_tier)
-    if not tiers or normalized_winner is None or not winner_model:
+    if (
+        not tiers
+        or normalized_winner is None
+        or normalized_winner not in TEXT_TIERS
+        or not winner_model
+    ):
         return None
 
     request_kind: Literal["text", "image"] = (
@@ -265,7 +267,6 @@ def _router_tier_snapshot(
         if _text(metadata.get("routing_source")) == "image_route"
         or bool(metadata.get("image_route_reason"))
         or bool(metadata.get("router_vision_followup_needs_image"))
-        or normalized_winner == IMAGE_TIER
         else "text"
     )
     shared_selection_mode = effective_ensemble_selection_mode(config)
@@ -276,17 +277,14 @@ def _router_tier_snapshot(
     )
 
     entries: list[RouterTierSnapshotEntry] = []
-    for tier in _ROUTER_SNAPSHOT_TIER_ORDER:
+    # Text-only tiers remain eligible for the image-not-analyzed marker path.
+    for tier in TEXT_TIERS:
         tier_config = TierConfig.from_value(tiers.get(tier))
-        if not tier_config.model:
+        if not tier_config.model or tier_config.image_only:
             continue
         if request_kind == "image":
-            if not tier_config.supports_image:
-                continue
             if tier == TEXT_TIERS[-1] and c3_fusion_active:
                 continue
-        elif tier_config.image_only or tier == IMAGE_TIER:
-            continue
 
         selection_mode, _binding = tier_ensemble_execution(
             tiers,
@@ -318,7 +316,7 @@ def _router_tier_snapshot(
     )
     if winner_index is None:
         entries.append(winner_entry)
-        entries.sort(key=lambda item: _ROUTER_SNAPSHOT_TIER_ORDER.index(item.tier))
+        entries.sort(key=lambda item: TEXT_TIERS.index(item.tier))
     else:
         entries[winner_index] = winner_entry
 

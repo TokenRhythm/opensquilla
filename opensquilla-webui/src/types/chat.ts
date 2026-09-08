@@ -243,7 +243,8 @@ export interface ChatRouterCell {
 
 export interface ChatRouterTierConfig {
   model: string
-  supportsImage: boolean
+  /** Accepted from legacy snapshots, not used to determine capability. */
+  supportsImage?: boolean
   imageOnly: boolean
   ensembleEnabled?: boolean
 }

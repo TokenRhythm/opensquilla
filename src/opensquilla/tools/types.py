@@ -272,6 +272,11 @@ class ToolContext:
     disclosed_tool_names: set[str] = field(default_factory=set, repr=False)
     tool_search_index: Any | None = field(default=None, repr=False)
     tool_search_namespaces: dict[str, str] = field(default_factory=dict, repr=False)
+    # Resolve at invocation time: a selector may have changed deployment since
+    # the turn started. No independent model selection is authorized by a tool.
+    image_analysis_target: Callable[[], tuple[Any, Any] | None] | None = field(
+        default=None, repr=False
+    )
 
     def __post_init__(self) -> None:
         # A restricted turn's ceiling is an authority boundary, not a policy

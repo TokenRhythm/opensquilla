@@ -20,6 +20,7 @@ import math
 import os
 import platform
 import re
+import tempfile
 import time
 import uuid
 from collections import deque
@@ -233,6 +234,7 @@ from opensquilla.provider import (
     ErrorEvent as ProviderErrorEvent,
 )
 from opensquilla.provider import (
+    ImageMarkerState,
     ModelCapabilities,
     ProviderActivityEvent,
     ProviderFailureKind,
@@ -240,6 +242,7 @@ from opensquilla.provider import (
     ProviderRecoveryAction,
     classify_provider_error,
     decide_recovery_action,
+    image_marker,
 )
 from opensquilla.provider import (
     ReasoningDeltaEvent as ProviderReasoningDeltaEvent,
@@ -253,26 +256,33 @@ from opensquilla.provider import (
 from opensquilla.provider import (
     ToolUseStartEvent as ProviderToolUseStartEvent,
 )
+from opensquilla.provider.image_projection import (
+    ImageProjectionMode,
+    assert_text_only_messages,
+    bind_image_attachment_ids,
+    classify_image_failure,
+    project_messages,
+)
 from opensquilla.provider.model_catalog import (
     resolve_effective_context_window,
     shared_catalog,
 )
 from opensquilla.provider.protocol import (
     count_provider_image_blocks,
-    image_input_admission_error,
     project_provider_final_request,
     project_provider_message_count,
     provider_metadata,
     validate_provider_chat_admission,
 )
 from opensquilla.provider.types import (
-    EnsembleProgressEvent as ProviderEnsembleProgressEvent,
-)
-from opensquilla.provider.types import (
+    ChatConfig,
     ProviderGenerationResetEvent,
     ProviderRequestCorrelation,
     VisionSupport,
     derive_provider_request_correlation,
+)
+from opensquilla.provider.types import (
+    EnsembleProgressEvent as ProviderEnsembleProgressEvent,
 )
 from opensquilla.router_control import (
     RouterControlHoldStore,
@@ -2248,6 +2258,8 @@ def _selector_execution_leg_failure_code(
 class _SelectorFallbackProvider:
     """Provider wrapper that switches to selector fallback on pre-content errors."""
 
+    projects_image_input_per_leg = True
+
     def __init__(
         self,
         provider: Any,
@@ -2267,6 +2279,11 @@ class _SelectorFallbackProvider:
         self._pending_fallback_hops = 0
         self._last_executed_model = ""
         self._last_request_had_tools = False
+        self._image_marker_deployment: _FallbackDeploymentIdentity | None = None
+        self._image_marker_state = ImageMarkerState.NOT_ANALYZED
+        self._image_marker_reason: str | None = None
+        self._image_probe_forbidden = False
+        self.last_image_request_had_native_images = False
         self._fallback_limits: dict[tuple[str, str], tuple[int, int]] = {}
         self._fallback_deployment_limits: dict[
             _FallbackDeploymentIdentity, tuple[int, int]
@@ -2454,6 +2471,159 @@ class _SelectorFallbackProvider:
             or getattr(capabilities, "supports_tools", None) is not False
         )
 
+    @staticmethod
+    def _image_attachment_ids_from_metadata(config: Any) -> tuple[str, ...]:
+        """Read stable attachment ids without making a provider call.
+
+        The selector wrapper is deliberately a transport boundary and must
+        not inspect or mutate the canonical transcript.  It only needs the
+        optional ids already stamped on the per-turn config so a marker can
+        point back to the preserved attachment.
+        """
+
+        metadata = config if isinstance(config, Mapping) else getattr(config, "metadata", None)
+        if not isinstance(metadata, Mapping):
+            return ()
+        result: list[str] = []
+        seen: set[str] = set()
+        for key in (
+            "image_attachment_ids",
+            "image_intent_attachment_ids",
+            "attachment_ids",
+        ):
+            raw_ids = metadata.get(key)
+            if isinstance(raw_ids, str):
+                values: Sequence[Any] = (raw_ids,)
+            elif isinstance(raw_ids, Sequence) and not isinstance(
+                raw_ids,
+                (bytes, bytearray),
+            ):
+                values = raw_ids
+            else:
+                continue
+            for value in values:
+                if not isinstance(value, str) or not value.strip():
+                    continue
+                normalized = value.strip()[:164]
+                if normalized in seen:
+                    continue
+                seen.add(normalized)
+                result.append(normalized)
+        return tuple(result)
+
+    def configure_image_request_projection(
+        self,
+        *,
+        force_marker: bool,
+        marker_state: ImageMarkerState,
+        forbid_unknown_probe: bool,
+        reason: str | None,
+    ) -> None:
+        """Bind explicit retry policy to one request, not its result telemetry."""
+
+        self._image_marker_deployment = (
+            _fallback_deployment_identity(self.active_deployment_config())
+            if force_marker
+            else None
+        )
+        self._image_marker_state = marker_state
+        self._image_marker_reason = reason
+        self._image_probe_forbidden = forbid_unknown_probe
+
+    def _project_image_messages_for_active_leg(
+        self,
+        messages: Sequence[Any],
+        config: Any,
+        *,
+        stage: str,
+    ) -> list[Any]:
+        """Build a fresh request view for the currently selected deployment.
+
+        ``Agent`` retains a projected view for admission and diagnostics but
+        passes canonical input to this wrapper because a fallback is a new physical
+        request with a different capability fact.  In particular, a known
+        text-only fallback receives a truthful marker instead of a terminal
+        admission error; an unknown deployment remains native and can be
+        probed once by the provider.
+        """
+
+        active_config = self._config_for_active_leg(config)
+        support = str(
+            getattr(active_config, "model_vision_support", "unknown") or "unknown"
+        ).strip().lower()
+        if support not in {"supported", "unsupported", "unknown"}:
+            support = "unknown"
+
+        provider_kind = ""
+        provider_name = ""
+        try:
+            identity = provider_metadata(self._provider)
+            provider_kind = str(
+                getattr(identity, "provider_kind", "") or ""
+            ).strip().lower()
+            provider_name = str(
+                getattr(identity, "provider_name", "") or ""
+            ).strip().lower()
+        except Exception:  # noqa: BLE001 - metadata is optional at this boundary
+            provider_kind = str(
+                getattr(self._provider, "provider_kind", "") or ""
+            ).strip().lower()
+            provider_name = str(
+                getattr(self._provider, "provider_name", "") or ""
+            ).strip().lower()
+
+        turn_metadata = self._turn_metadata
+        force_marker = self._image_marker_deployment == _fallback_deployment_identity(
+            self.active_deployment_config()
+        )
+        unsafe_probe = self._image_probe_forbidden and support == "unknown"
+        ensemble_text_only = provider_kind == "ensemble" or provider_name == "ensemble"
+        should_marker = (
+            force_marker or unsafe_probe or support == "unsupported" or ensemble_text_only
+        )
+
+        if ensemble_text_only:
+            reason = "ensemble_text_only"
+        elif force_marker:
+            reason = self._image_marker_reason or "configured_marker_fallback"
+        elif unsafe_probe:
+            reason = "image_probe_unsafe_after_irreversible_effect"
+        elif support == "unsupported":
+            reason = "model_vision_unsupported"
+        else:
+            reason = "capability_probe" if support == "unknown" else "model_vision_supported"
+        marker_state = (
+            self._image_marker_state if force_marker else ImageMarkerState.NOT_ANALYZED
+        )
+        mode = ImageProjectionMode.MARKER if should_marker else ImageProjectionMode.NATIVE
+
+        projection = project_messages(
+            messages,
+            mode=mode,
+            marker_state=marker_state,
+            attachment_ids=self._image_attachment_ids_from_metadata(
+                self._turn_metadata or active_config
+            ),
+        )
+        self.last_image_request_had_native_images = projection.output_image_count > 0
+        if projection.input_image_count and isinstance(turn_metadata, dict):
+            # These fields describe the physical leg that is about to run.
+            # A previous native probe must not leave stale metadata after a
+            # configured text-only fallback receives marker projection.
+            turn_metadata["image_input_mode"] = mode.value
+            turn_metadata["image_input_reason"] = reason
+            turn_metadata["image_input_count"] = projection.input_image_count
+            turn_metadata["image_input_output_count"] = projection.output_image_count
+            turn_metadata["image_input_marker_count"] = projection.marker_count
+            turn_metadata["image_input_stage"] = stage
+            if should_marker:
+                turn_metadata["image_input_marker_state"] = marker_state.value
+            else:
+                turn_metadata.pop("image_input_marker_state", None)
+        if should_marker:
+            assert_text_only_messages(projection.messages)
+        return projection.messages
+
     def _advance_past_explicit_tool_denials(
         self,
         *,
@@ -2524,6 +2694,42 @@ class _SelectorFallbackProvider:
         """Return the private ProviderConfig for the current physical head."""
 
         return getattr(self._selector, "current_config", None)
+
+    def active_model_vision_support(self, config: Any) -> VisionSupport:
+        """Return exact tri-state evidence for the current physical leg."""
+
+        active_config = self._config_for_active_leg(config)
+        raw_support: Any = getattr(
+            active_config,
+            "model_vision_support",
+            "unknown",
+        )
+        return (
+            cast(VisionSupport, raw_support)
+            if raw_support in {"supported", "unsupported", "unknown"}
+            else "unknown"
+        )
+
+    def image_analysis_target(self, config: ChatConfig) -> tuple[Any, ChatConfig] | None:
+        """Expose only the current physical leg, never its fallback chain."""
+
+        active_config = self._config_for_active_leg(config)
+        identity = provider_metadata(self._provider)
+        if (
+            active_config.model_vision_support != "supported"
+            or "ensemble" in {identity.provider_kind, identity.provider_name}
+        ):
+            return None
+        return self._provider, active_config
+
+    def mark_active_model_vision_supported(self) -> None:
+        """Remember a successful native image request for this exact leg."""
+
+        current_config = getattr(self._selector, "current_config", None)
+        if current_config is not None:
+            self._fallback_deployment_vision_support[
+                _fallback_deployment_identity(current_config)
+            ] = "supported"
 
     def configure_fallback_deployment_limits(
         self,
@@ -2973,6 +3179,66 @@ class _SelectorFallbackProvider:
             requires_tools=self._last_request_had_tools,
         )
 
+    def fallback_after_image_rejection(self, reason: str) -> bool:
+        """Advance to the next configured Router image probe, if any.
+
+        Router image routes install a strict c0-c3-only selector chain.  This
+        method deliberately uses that static chain instead of plugin failover,
+        records the exact rejected deployment as text-only for the rest of the
+        turn, and accepts unknown candidates for one native probe.  Direct and
+        Ensemble requests return ``False`` so their same-model marker policy
+        remains intact.
+        """
+
+        metadata = self._turn_metadata
+        if not isinstance(metadata, dict) or not (
+            metadata.get("router_fallback_strict") is True
+            and metadata.get("routing_source") == "image_route"
+            and metadata.get("image_input_mode") != "marker"
+        ):
+            return False
+
+        current_config = getattr(self._selector, "current_config", None)
+        if current_config is not None:
+            self._fallback_deployment_vision_support[
+                _fallback_deployment_identity(current_config)
+            ] = "unsupported"
+
+        next_matching = getattr(self._selector, "next_fallback_matching", None)
+        if not callable(next_matching):
+            return False
+
+        def _probeable(candidate: Any) -> bool:
+            return (
+                self._fallback_deployment_vision_support.get(
+                    _fallback_deployment_identity(candidate),
+                    "unknown",
+                )
+                != "unsupported"
+            )
+
+        try:
+            self._provider = next_matching(predicate=_probeable)
+        except Exception:  # noqa: BLE001 - exhaustion selects marker fallback
+            return False
+        self._note_fallback_hop()
+        metadata["router_image_probe_failure_count"] = (
+            int(metadata.get("router_image_probe_failure_count") or 0) + 1
+        )
+        metadata["router_fallback_reason"] = "image_capability_rejection"
+        metadata["image_input_reason"] = "router_next_configured_image_probe"
+        metadata["image_input_stage"] = "fallback"
+        log.info(
+            "selector.image_probe_fallback",
+            reason=reason,
+            provider=self.active_provider_id,
+            model=str(
+                getattr(getattr(self._selector, "current_config", None), "model", "")
+                or ""
+            ),
+        )
+        return True
+
     def fallback_after_invalid_response_with_capabilities(
         self,
         reason: str,
@@ -3052,7 +3318,14 @@ class _SelectorFallbackProvider:
         *,
         reject_unknown_capability: bool,
     ) -> ProviderErrorEvent | None:
-        """Return and record an image admission error for the active physical leg."""
+        """Keep legacy admission API while making image handling non-terminal.
+
+        Images are projected by :meth:`_project_image_messages_for_active_leg`
+        immediately before this check.  Unknown capability is intentionally
+        probed once, and an explicit text-only fact is represented by a marker
+        rather than an ``ErrorEvent``.  The keyword is retained for callers
+        and third-party subclasses compiled against the old seam.
+        """
 
         raw_vision_support = getattr(config, "model_vision_support", "unknown")
         vision_support: VisionSupport = (
@@ -3060,26 +3333,28 @@ class _SelectorFallbackProvider:
             if raw_vision_support in {"supported", "unsupported", "unknown"}
             else "unknown"
         )
-        error = image_input_admission_error(
-            messages,
-            vision_support=vision_support,
-            reject_unknown=reject_unknown_capability,
-        )
-        if error is None:
-            return None
         image_count = _count_image_blocks(messages)
-        if self._turn_metadata is not None:
-            self._turn_metadata["image_input_mode"] = "rejected"
-            self._turn_metadata["image_input_reason"] = (
-                "capability_unknown"
-                if vision_support == "unknown"
-                else "model_vision_unsupported"
+        if image_count and self._turn_metadata is not None:
+            # A residual image here indicates a caller bypassed the projection
+            # helper. Do not turn that programming seam into a user-visible
+            # terminal error; retain bounded diagnostics and let the provider
+            # (or Agent's precise image-failure retry) remain authoritative.
+            self._turn_metadata.setdefault(
+                "image_input_mode",
+                "native" if vision_support != "unsupported" else "marker",
+            )
+            self._turn_metadata.setdefault(
+                "image_input_reason",
+                "capability_probe" if vision_support == "unknown" else "model_vision_unsupported",
             )
             self._turn_metadata["image_input_count"] = image_count
             self._turn_metadata["image_input_stage"] = (
                 "fallback" if self._used_fallback else "primary"
             )
-        return error
+        # ``reject_unknown_capability`` is deliberately ignored.  Unknown is
+        # not evidence of unsupported capability and must not strand a turn.
+        del reject_unknown_capability
+        return None
 
     def validate_chat_admission(
         self,
@@ -3169,6 +3444,11 @@ class _SelectorFallbackProvider:
         active_provider = self._provider
         active_provider_id, active_model = self._active_deployment()
         active_config = self._config_for_active_leg(config)
+        physical_messages = self._project_image_messages_for_active_leg(
+            messages,
+            active_config,
+            stage="fallback" if self._used_fallback else "primary",
+        )
         if (
             tools
             and getattr(
@@ -3183,7 +3463,7 @@ class _SelectorFallbackProvider:
                 code="model_tools_unsupported",
             )
             return
-        validation_error = self.validate_chat_admission(messages, config)
+        validation_error = self.validate_chat_admission(physical_messages, config)
         if validation_error is not None:
             yield validation_error
             return
@@ -3212,7 +3492,7 @@ class _SelectorFallbackProvider:
 
         def primary_stream_factory() -> AsyncGenerator[Any, None]:
             return _selector_safe_stream(
-                lambda: active_provider.chat(messages, **primary_chat_kwargs),
+                lambda: active_provider.chat(physical_messages, **primary_chat_kwargs),
                 content_started=lambda: emitted_user_visible_content,
             )
 
@@ -3348,10 +3628,21 @@ class _SelectorFallbackProvider:
                     else 0
                 )
                 local_admission_escalation = local_admission_fallback_index > 0
-                if isinstance(event, ProviderErrorEvent) and (
-                    _should_use_selector_fallback(self.provider_name, event)
-                    or event.code == "invalid_stream_order"
-                    or local_admission_escalation
+                precise_image_capability_rejection = bool(
+                    isinstance(event, ProviderErrorEvent)
+                    and classify_image_failure(
+                        event,
+                        provider_name=active_provider_id or self.provider_name,
+                    ).is_unsupported
+                )
+                if (
+                    isinstance(event, ProviderErrorEvent)
+                    and not precise_image_capability_rejection
+                    and (
+                        _should_use_selector_fallback(self.provider_name, event)
+                        or event.code == "invalid_stream_order"
+                        or local_admission_escalation
+                    )
                 ):
                     if not local_admission_escalation:
                         self._record_health_failure(event)
@@ -3461,6 +3752,11 @@ class _SelectorFallbackProvider:
                     fallback_provider = self._provider
                     fallback_provider_id, fallback_model = self._active_deployment()
                     fallback_config = self._config_for_active_leg(config)
+                    fallback_messages = self._project_image_messages_for_active_leg(
+                        messages,
+                        fallback_config,
+                        stage="fallback",
+                    )
                     if (
                         tools
                         and getattr(
@@ -3478,7 +3774,7 @@ class _SelectorFallbackProvider:
                         )
                         return
                     fallback_admission_error = self._reject_unsupported_image_input(
-                        messages,
+                        fallback_messages,
                         fallback_config,
                         reject_unknown_capability=True,
                     )
@@ -3487,7 +3783,7 @@ class _SelectorFallbackProvider:
                         return
                     fallback_validation_error = validate_provider_chat_admission(
                         fallback_provider,
-                        messages,
+                        fallback_messages,
                         fallback_config,
                     )
                     if fallback_validation_error is not None:
@@ -3577,7 +3873,7 @@ class _SelectorFallbackProvider:
                     def fallback_stream_factory() -> AsyncGenerator[Any, None]:
                         return _selector_safe_stream(
                             lambda: fallback_provider.chat(
-                                messages,
+                                fallback_messages,
                                 tools=tools,
                                 config=fallback_config,
                                 **(
@@ -5539,6 +5835,7 @@ class TurnRunner:
         # the normal-completion path does.
         current_text_parts: list[str] = []
         stream_state: _StreamState | None = None
+        attachment_cleanup: Callable[[], None] | None = None
         self._emit_turn_event(
             "turn_start",
             trace_context,
@@ -5642,6 +5939,37 @@ class TurnRunner:
 
             transcript_snapshot = TurnTranscriptSnapshot[Any](_load_turn_transcript)
 
+            persist_image_material = (
+                getattr(
+                    getattr(self._turn_config(), "attachments", None),
+                    "persist_transcripts", True,
+                ) is not False
+            )
+            image_workspace_dir: str | None = None
+            image_failure_cleanup: Callable[[], None] | None = None
+            if (
+                not persist_image_material
+                and tool_context is not None
+                and any(
+                    (_normalize_attachment_mime(
+                        item.get("type") or item.get("mime") or item.get("media_type")
+                    ) or "").startswith("image/")
+                    for item in (attachments or [])
+                )
+            ):
+                previous_scratch = tool_context.scratch_dir
+                if previous_scratch:
+                    Path(previous_scratch).mkdir(parents=True, exist_ok=True)
+                temporary_images = tempfile.TemporaryDirectory(
+                    prefix="image-input-", dir=previous_scratch or None,
+                )
+                image_workspace_dir = temporary_images.name
+                if not previous_scratch:
+                    # Freeze tool policy only after the turn-local read root is known.
+                    tool_context = replace(tool_context, scratch_dir=image_workspace_dir)
+                image_failure_cleanup = temporary_images.cleanup
+                attachment_cleanup = image_failure_cleanup
+
             pt_outcome = await self._provider_and_tools_stage.run(
                 ProviderAndToolsStageInput(
                     session_key=session_key,
@@ -5717,6 +6045,8 @@ class TurnRunner:
                 and timeout > 0
                 else None
             )
+            # Once the worker is admitted, it owns failure cleanup until it has stopped.
+            attachment_cleanup = None
             att_outcome = await self._attachment_stage.run(
                 AttachmentStageInput(
                     effective_runtime_message=runtime_message,
@@ -5731,8 +6061,14 @@ class TurnRunner:
                         generated_normalization_attachment_count
                     ),
                     timeout_seconds=attachment_timeout,
+                    persist_image_material=persist_image_material,
+                    image_workspace_dir=image_workspace_dir,
+                    failure_cleanup=image_failure_cleanup,
                 )
             )
+            attachment_cleanup = image_failure_cleanup
+            if attachment_cleanup is not None and tool_context is not None:
+                tool_context.turn_cleanup_callbacks.append(attachment_cleanup)
             att_out = att_outcome.require_output()
 
             turn_usage_scope: UsageAccountingScope | None = None
@@ -5805,6 +6141,28 @@ class TurnRunner:
                 att_out.extra_messages,
                 effective_runtime_message,
             )
+            current_attachment_ids = turn.metadata.get(
+                "current_image_attachment_ids", turn.metadata.get("image_attachment_ids")
+            )
+            if extra_msgs:
+                current_ids = (
+                    current_attachment_ids
+                    if isinstance(current_attachment_ids, Sequence)
+                    and not isinstance(current_attachment_ids, (str, bytes, bytearray))
+                    else ()
+                )
+                durable_retained = turn.metadata.get("image_attachment_durable_retained")
+                if not isinstance(durable_retained, bool):
+                    durable_retained = None
+                extra_msgs = bind_image_attachment_ids(
+                    extra_msgs,
+                    [
+                        value
+                        for value in current_ids
+                        if isinstance(value, str) and value.strip()
+                    ],
+                    durable_retained=durable_retained,
+                )
             attachment_turn_input = (
                 effective_runtime_message if extra_msgs is None else ""
             )
@@ -5999,20 +6357,26 @@ class TurnRunner:
             forced_image_rejection_reason = str(
                 turn.metadata.get("image_input_forced_rejection_reason", "") or ""
             ).strip()
-            image_input_preflight_blocked = bool(
+            image_input_projection_required = bool(
                 forced_image_rejection_reason
                 or (
                     current_turn_image_count > 0
                     and agent_config.model_vision_support == "unsupported"
                 )
+                or turn.metadata.get("image_input_projection_required") is True
             )
-            if image_input_preflight_blocked:
-                turn.metadata["image_input_mode"] = "rejected"
+            if image_input_projection_required:
+                turn.metadata["image_input_mode"] = "marker"
                 turn.metadata["image_input_reason"] = (
                     forced_image_rejection_reason or "model_vision_unsupported"
                 )
                 turn.metadata["image_input_count"] = current_turn_image_count
                 turn.metadata["image_input_stage"] = "primary"
+            # Kept as a named local for frame-walking compatibility tests.  A
+            # missing image capability is no longer an admission block and
+            # must never suppress compaction; the physical request is shaped
+            # to text later at the shared provider boundary.
+            image_input_preflight_blocked = False
             # 6. Compaction (t3 + preflight) + history load + request-context
             # prepend. CompactionAndHistoryStage owns the four-call sequence
             # (t3_upgrade → preflight → load_history → prepend_request_context_prompt).
@@ -7261,6 +7625,15 @@ class TurnRunner:
                     else None
                 ),
             )
+
+        finally:
+            if attachment_cleanup is not None:
+                attachment_cleanup()
+                if (
+                    tool_context is not None
+                    and attachment_cleanup in tool_context.turn_cleanup_callbacks
+                ):
+                    tool_context.turn_cleanup_callbacks.remove(attachment_cleanup)
 
     @staticmethod
     def _write_trace_event(
@@ -9299,6 +9672,10 @@ class TurnRunner:
         usage_execution_context: UsageExecutionContext | None = None,
         provider_request_correlation: ProviderRequestCorrelation | None = None,
         router_history_replay_request: RouterHistoryReplayRequest | None = None,
+        bound_user_message_id: str | None = None,
+        transcript_snapshot: TurnTranscriptSnapshot[Any] | None = None,
+        expected_session_id: str | None = None,
+        expected_session_epoch: int | None = None,
     ) -> tuple[Any, Any]:
         """Run the pre-turn pipeline and re-resolve provider if model changed.
 
@@ -9547,6 +9924,100 @@ class TurnRunner:
             initial_metadata["attachment_image_count"] = int(
                 attachment_materialization.image_count
             )
+        if not restricted_tool_boundary:
+            attachment_reference_text = "\n".join(
+                value
+                for value in (semantic_message, message)
+                if isinstance(value, str) and value.strip()
+            )
+            candidate_attachment_ids = tuple(
+                dict.fromkeys(
+                    (
+                        *self._attachment_ids_from_text(attachment_reference_text),
+                        *self._attachment_ids_from_resource_refs(attachments),
+                    )
+                )
+            )
+            explicit_attachment_ids = await self._validated_image_attachment_ids(
+                session_key,
+                candidate_attachment_ids,
+                transcript_snapshot=transcript_snapshot,
+                expected_session_id=expected_session_id,
+                expected_session_epoch=expected_session_epoch,
+            )
+            if explicit_attachment_ids:
+                # A canonical occurrence ID is deterministic image intent.  It
+                # must survive even when the source row is outside the normal
+                # history lookback, and it must reach Router before the archive
+                # is rehydrated later in ``_load_history``.
+                initial_metadata["image_intent_attachment_ids"] = list(
+                    explicit_attachment_ids
+                )
+                initial_metadata["router_vision_followup_needs_image"] = True
+                initial_metadata["router_vision_followup_gate_source"] = (
+                    "explicit_attachment_id"
+                )
+        if bound_user_message_id:
+            try:
+                bound_entries: Sequence[Any]
+                if transcript_snapshot is not None:
+                    bound_entries = await transcript_snapshot.get_entries()
+                elif self._session_manager is not None:
+                    owner_kwargs: dict[str, Any] = {}
+                    if _require_optional_exact_session_owner(
+                        expected_session_id, expected_session_epoch
+                    ):
+                        getter = self._session_manager.get_transcript
+                        if all(
+                            _accepts_explicit_keyword_arg(getter, name)
+                            for name in ("expected_session_id", "expected_session_epoch")
+                        ):
+                            owner_kwargs = {
+                                "expected_session_id": expected_session_id,
+                                "expected_session_epoch": expected_session_epoch,
+                            }
+                        elif _has_session_storage(self._session_manager):
+                            raise RuntimeError(
+                                "Bound image replay requires exact session ownership"
+                            )
+                    bound_entries = await self._session_manager.get_transcript(
+                        session_key, **owner_kwargs
+                    )
+                else:
+                    bound_entries = []
+                bound_entry = next(
+                    (
+                        entry
+                        for entry in bound_entries
+                        if str(getattr(entry, "message_id", "") or "")
+                        == bound_user_message_id
+                    ),
+                    None,
+                )
+                if bound_entry is not None:
+                    bound_content = str(getattr(bound_entry, "content", "") or "")
+                    bound_attachment_ids = self._attachment_ids_from_envelope(
+                        bound_content,
+                        image_only=True,
+                    )
+                    initial_metadata["image_attachment_durable_retained"] = (
+                        self._image_retention_from_envelope(bound_content)
+                    )
+                    if bound_attachment_ids:
+                        initial_metadata["current_image_attachment_ids"] = list(
+                            bound_attachment_ids
+                        )
+            except Exception as exc:  # noqa: BLE001 - marker IDs are additive
+                if (
+                    (expected_session_id is not None or expected_session_epoch is not None)
+                    and _has_session_storage(self._session_manager)
+                ):
+                    raise
+                log.debug(
+                    "turn_runner.bound_attachment_ids_unavailable",
+                    message_id=bound_user_message_id,
+                    error=type(exc).__name__,
+                )
         if input_provenance:
             if isinstance(input_provenance, dict):
                 normalized_provenance = dict(input_provenance)
@@ -9734,23 +10205,34 @@ class TurnRunner:
                 from opensquilla.engine.selector_override import (
                     apply_model_override,
                     cross_provider_tier_config,
+                    resolve_strict_router_fallback_chain,
                 )
 
+                turn_config = self._turn_config()
+                active_provider_id = getattr(
+                    cloned_selector,
+                    "active_provider_id",
+                    "",
+                )
                 provider = apply_model_override(
                     cloned_selector,
                     turn.model,
                     turn_metadata=turn.metadata,
                     realign_routed_model=False,
                     tier_provider_config=cross_provider_tier_config(
-                        self._turn_config(),
+                        turn_config,
                         turn.metadata,
                         turn.model,
-                        active_provider_id=getattr(
-                            cloned_selector,
-                            "active_provider_id",
-                            "",
-                        ),
+                        active_provider_id=active_provider_id,
                         session_key=turn.session_key,
+                    ),
+                    strict_router_fallback_chain=(
+                        resolve_strict_router_fallback_chain(
+                            turn_config,
+                            turn.metadata,
+                            active_provider_id=active_provider_id,
+                            session_key=turn.session_key,
+                        )
                     ),
                 )
             return turn, provider
@@ -9961,18 +10443,31 @@ class TurnRunner:
             from opensquilla.engine.selector_override import (
                 apply_model_override,
                 cross_provider_tier_config,
+                resolve_strict_router_fallback_chain,
             )
 
+            turn_config = self._turn_config()
+            active_provider_id = getattr(
+                cloned_selector,
+                "active_provider_id",
+                "",
+            )
             provider = apply_model_override(
                 cloned_selector,
                 turn.model,
                 turn_metadata=turn.metadata,
                 realign_routed_model=False,
                 tier_provider_config=cross_provider_tier_config(
-                    self._turn_config(),
+                    turn_config,
                     turn.metadata,
                     turn.model,
-                    active_provider_id=getattr(cloned_selector, "active_provider_id", ""),
+                    active_provider_id=active_provider_id,
+                    session_key=turn.session_key,
+                ),
+                strict_router_fallback_chain=resolve_strict_router_fallback_chain(
+                    turn_config,
+                    turn.metadata,
+                    active_provider_id=active_provider_id,
                     session_key=turn.session_key,
                 ),
             )
@@ -10257,13 +10752,18 @@ class TurnRunner:
                 "gate_history",
             }
             if isinstance(tiers, Mapping):
-                for raw_tier in tiers.values():
+                for tier_name, raw_tier in tiers.items():
                     if not isinstance(raw_tier, Mapping):
                         continue
-                    if requires_image and not bool(raw_tier.get("supports_image", False)):
+                    if requires_image and normalize_text_tier(tier_name) is None:
                         continue
-                    if not requires_image and bool(raw_tier.get("image_only", False)):
+                    if bool(raw_tier.get("image_only", False)):
                         continue
+                    if not str(raw_tier.get("model") or "").strip():
+                        continue
+                    # Every configured c-tier may be reached by a native probe
+                    # or the final marker fallback. Legacy image switches do
+                    # not establish the physical deployment's capabilities.
                     _add(raw_tier.get("provider") or active_provider)
 
         # Unknown/legacy selector shapes retain the previous conservative
@@ -10436,6 +10936,7 @@ class TurnRunner:
         trim_last_user: bool,
         bound_slice_applied: bool,
         image_replay_entry_indexes: Collection[int] = (),
+        allowed_image_attachment_ids: frozenset[str] | None = None,
         media_root: Path | None = None,
         session_id: str | None = None,
         materialize_historical_attachments: bool = False,
@@ -10512,6 +11013,12 @@ class TurnRunner:
                 else:
                     projected_content = self._maybe_unpack_attachments(
                         raw_content,
+                        persist_image_material=(
+                            getattr(
+                                getattr(self._turn_config(), "attachments", None),
+                                "persist_transcripts", True,
+                            ) is not False
+                        ),
                         preserve_image_attachments=preserve_image,
                         materialize_historical_attachments=(
                             materialize_historical_attachments
@@ -10520,6 +11027,8 @@ class TurnRunner:
                         session_id=session_id,
                         workspace_dir=workspace_dir,
                         historical_materializer=historical_materializer,
+                        allowed_image_attachment_ids=allowed_image_attachment_ids,
+                        source_message_id=getattr(entry, "message_id", None),
                     )
                 if require_capacity_proof and recognized and valid:
                     persisted_token_count = (
@@ -13665,6 +14174,233 @@ class TurnRunner:
         )
         return False
 
+    async def _canonical_transcript_for_attachment_replay(
+        self,
+        session_key: str,
+        active_entries: Sequence[Any],
+        *,
+        expected_session_id: str | None = None,
+        expected_session_epoch: int | None = None,
+    ) -> list[Any]:
+        """Read the raw archive only when image replay needs it.
+
+        Ordinary provider history intentionally remains the compacted active
+        tail plus durable summaries.  A vision follow-up, however, may need an
+        image row that compaction moved to ``compacted_transcript_entries``.
+        This helper keeps that recovery read-only and falls back to the active
+        snapshot for older/fake session managers that do not expose the
+        canonical API.
+        """
+
+        exact_owner = _require_optional_exact_session_owner(
+            expected_session_id, expected_session_epoch
+        )
+        manager = self._session_manager
+        getter = getattr(manager, "get_canonical_transcript", None)
+        if not callable(getter):
+            if exact_owner and _has_session_storage(manager):
+                raise RuntimeError("canonical history reader does not support exact ownership")
+            return list(active_entries)
+        getter_kwargs: dict[str, Any] = {}
+        if exact_owner:
+            if all(
+                _accepts_explicit_keyword_arg(getter, name)
+                for name in ("expected_session_id", "expected_session_epoch")
+            ):
+                getter_kwargs["expected_session_id"] = expected_session_id
+                getter_kwargs["expected_session_epoch"] = expected_session_epoch
+            elif _has_session_storage(manager):
+                raise RuntimeError("canonical history reader does not support exact ownership")
+        try:
+            canonical = getter(session_key, **getter_kwargs)
+            if inspect.isawaitable(canonical):
+                canonical = await canonical
+            if canonical:
+                return list(canonical)
+        except Exception as exc:  # noqa: BLE001 - replay must not block a turn
+            if exact_owner and _has_session_storage(manager):
+                raise
+            log.warning(
+                "turn_runner.canonical_attachment_replay_failed",
+                session_key=session_key,
+                error=type(exc).__name__,
+            )
+        return list(active_entries)
+
+    async def _validated_image_attachment_ids(
+        self,
+        session_key: str,
+        candidate_ids: Sequence[str],
+        *,
+        transcript_snapshot: TurnTranscriptSnapshot[Any] | None = None,
+        expected_session_id: str | None = None,
+        expected_session_epoch: int | None = None,
+    ) -> tuple[str, ...]:
+        """Resolve current-input references to image occurrences in this session."""
+
+        exact_owner = _require_optional_exact_session_owner(
+            expected_session_id, expected_session_epoch
+        )
+        if not candidate_ids or self._session_manager is None:
+            return ()
+        try:
+            if transcript_snapshot is not None:
+                active_entries = list(await transcript_snapshot.get_entries())
+            else:
+                get_transcript = self._session_manager.get_transcript
+                getter_kwargs: dict[str, Any] = {}
+                if exact_owner:
+                    if all(
+                        _accepts_explicit_keyword_arg(get_transcript, name)
+                        for name in ("expected_session_id", "expected_session_epoch")
+                    ):
+                        getter_kwargs["expected_session_id"] = expected_session_id
+                        getter_kwargs["expected_session_epoch"] = expected_session_epoch
+                    elif _has_session_storage(self._session_manager):
+                        raise RuntimeError(
+                            "session history reader does not support exact ownership"
+                        )
+                active_entries = list(await get_transcript(session_key, **getter_kwargs))
+            canonical_entries = await self._canonical_transcript_for_attachment_replay(
+                session_key,
+                active_entries,
+                expected_session_id=expected_session_id,
+                expected_session_epoch=expected_session_epoch,
+            )
+            session_id = (
+                expected_session_id
+                if exact_owner
+                else await self._resolve_session_id_for_log(session_key)
+            )
+            if not session_id:
+                return ()
+            from opensquilla.session.attachment_manifest import build_attachment_manifest
+
+            manifest = build_attachment_manifest(
+                canonical_entries,
+                session_id=session_id,
+                session_key=session_key,
+            )
+            by_id = {
+                occurrence.attachment_id: occurrence
+                for occurrence in manifest.occurrences
+            }
+            return tuple(
+                attachment_id
+                for attachment_id in candidate_ids
+                if attachment_id in by_id
+                and str(by_id[attachment_id].mime).lower().startswith("image/")
+            )
+        except Exception as exc:  # noqa: BLE001 - an unverified ID stays text-only
+            if exact_owner and _has_session_storage(self._session_manager):
+                raise
+            log.debug(
+                "turn_runner.image_attachment_reference_unverified",
+                session_key=session_key,
+                error=type(exc).__name__,
+            )
+            return ()
+
+    async def _persist_attachment_manifest_best_effort(
+        self,
+        session_key: str,
+        entries: Sequence[Any],
+        *,
+        expected_session_id: str | None = None,
+        expected_session_epoch: int | None = None,
+    ) -> None:
+        """Lazily backfill the portable attachment index for this session.
+
+        Older sessions have no manifest row.  Building it on the first replay
+        read keeps migration online and lets later compaction commits merge the
+        same metadata atomically.  Equality is checked against the newest
+        valid row so ordinary turns do not append unbounded duplicate states.
+        """
+
+        exact_owner = _require_optional_exact_session_owner(
+            expected_session_id, expected_session_epoch
+        )
+        manager = self._session_manager
+        saver = getattr(manager, "save_context_state", None)
+        getter = getattr(manager, "get_context_states", None)
+        if not callable(saver) or not callable(getter) or not entries:
+            return
+        owner_kwargs: dict[str, Any] = {}
+        if exact_owner:
+            if all(
+                _accepts_explicit_keyword_arg(method, name)
+                for method in (getter, saver)
+                for name in ("expected_session_id", "expected_session_epoch")
+            ):
+                owner_kwargs["expected_session_id"] = expected_session_id
+                owner_kwargs["expected_session_epoch"] = expected_session_epoch
+            elif _has_session_storage(manager):
+                raise RuntimeError("attachment manifest storage does not support exact ownership")
+        try:
+            from opensquilla.session.attachment_manifest import (
+                ATTACHMENT_MANIFEST_PROVIDER,
+                ATTACHMENT_MANIFEST_STATE_KIND,
+                AttachmentManifestError,
+                attachment_manifest_from_context_state,
+                build_attachment_manifest,
+                manifest_context_state,
+            )
+
+            session_id = (
+                expected_session_id
+                if exact_owner
+                else await self._resolve_session_id_for_log(session_key)
+            )
+            if not session_id:
+                return
+            manifest = build_attachment_manifest(
+                entries,
+                session_id=session_id,
+                session_key=session_key,
+            )
+            if not manifest.occurrences:
+                return
+            states = await getter(
+                session_key,
+                provider=ATTACHMENT_MANIFEST_PROVIDER,
+                state_kind=ATTACHMENT_MANIFEST_STATE_KIND,
+                **owner_kwargs,
+            )
+            latest = None
+            for state in sorted(
+                states or [],
+                key=lambda item: (
+                    int(getattr(item, "created_at", 0) or 0),
+                    int(getattr(item, "id", 0) or 0),
+                ),
+                reverse=True,
+            ):
+                try:
+                    latest = attachment_manifest_from_context_state(state)
+                    break
+                except (AttachmentManifestError, TypeError, ValueError):
+                    continue
+            if latest is not None:
+                manifest = latest.merge(
+                    manifest.occurrences,
+                    covered_through_id=manifest.covered_through_id,
+                )
+            if (
+                latest is not None
+                and latest.occurrences == manifest.occurrences
+                and latest.covered_through_id == manifest.covered_through_id
+            ):
+                return
+            await saver(manifest_context_state(manifest), **owner_kwargs)
+        except Exception as exc:  # noqa: BLE001 - manifest is additive
+            if exact_owner and _has_session_storage(manager):
+                raise
+            log.debug(
+                "turn_runner.attachment_manifest_persist_skipped",
+                session_key=session_key,
+                error=type(exc).__name__,
+            )
+
     async def _load_history(
         self,
         agent: Agent,
@@ -13690,6 +14426,7 @@ class TurnRunner:
         assistant replies. When the id is absent or not found, fall back to the
         positional trim.
         """
+        agent.set_request_image_context([])
         if self._session_manager is None:
             return None
 
@@ -13718,7 +14455,9 @@ class TurnRunner:
                     transcript_kwargs["expected_session_epoch"] = expected_session_epoch
             transcript = await get_transcript(session_key, **transcript_kwargs)
 
+        from opensquilla.engine.history import reconstruct_messages_from_entry
         from opensquilla.provider import Message
+        from opensquilla.provider.types import ContentBlockImage, ContentBlockText
 
         history: list[Message] = []
         summary_markers: list[str] = []
@@ -13771,11 +14510,137 @@ class TurnRunner:
                     transcript_len=len(transcript),
                 )
         bound_slice_applied = bool(bound_skip_indexes)
-        model_caps = getattr(getattr(agent, "config", None), "model_capabilities", None)
-        preserve_image_history = bool(
-            getattr(getattr(agent, "config", None), "preserve_historical_images", False)
-            and getattr(model_caps, "supports_vision", False)
+        agent_config = getattr(agent, "config", None)
+        metadata = getattr(agent_config, "metadata", {})
+        if not isinstance(metadata, Mapping):
+            metadata = {}
+        history_images_opted_out = (
+            metadata.get("router_vision_followup_gate_source") == "explicit_opt_out"
         )
+        # Select canonical attachments from intent, not the primary model's
+        # capability: a configured selector fallback may still need the bytes.
+        preserve_image_history = bool(
+            getattr(agent_config, "preserve_historical_images", False)
+            and not history_images_opted_out
+        )
+        current_attachment_count = _non_negative_int(metadata.get("attachment_count"))
+
+        requested_attachment_id_list: list[str] = []
+        seen_requested_attachment_ids: set[str] = set()
+        for key in (
+            "image_attachment_ids",
+            "image_intent_attachment_ids",
+            "attachment_ids",
+        ):
+            if history_images_opted_out or (
+                key == "image_attachment_ids" and current_attachment_count > 0
+            ):
+                continue
+            raw_ids = metadata.get(key)
+            if isinstance(raw_ids, str):
+                values: Sequence[Any] = (raw_ids,)
+            elif isinstance(raw_ids, Sequence) and not isinstance(
+                raw_ids, (bytes, bytearray)
+            ):
+                values = raw_ids
+            else:
+                continue
+            for value in values:
+                if not isinstance(value, str) or not value.strip():
+                    continue
+                normalized_id = value.strip()[:164]
+                if normalized_id in seen_requested_attachment_ids:
+                    continue
+                seen_requested_attachment_ids.add(normalized_id)
+                requested_attachment_id_list.append(normalized_id)
+        requested_attachment_ids = tuple(requested_attachment_id_list)
+        requested_image_id_filter = (
+            frozenset(requested_attachment_ids)
+            if requested_attachment_ids
+            else None
+        )
+
+        # A queued/retried task may keep the original persisted user-message
+        # id while the client sends no attachment bytes on the second
+        # execution (for example after changing to a vision model).  Treat it
+        # as an attachment replay only when that exact persisted row is an
+        # image envelope; every ordinary bound text turn also has zero current
+        # attachments and must not pull unrelated archived images into scope.
+        bound_attachment_replay_candidate = bool(
+            bound_user_message_id and current_attachment_count == 0
+        )
+        bound_row_has_image: bool | None = None
+        if bound_attachment_replay_candidate:
+            for entry in transcript:
+                if (
+                    getattr(entry, "role", None) == "user"
+                    and str(getattr(entry, "message_id", "") or "")
+                    == bound_user_message_id
+                ):
+                    bound_row_has_image = self._attachment_envelope_has_image(
+                        str(getattr(entry, "content", "") or "")
+                    )
+                    break
+
+        # A compacted image is outside the active transcript. Read the
+        # canonical archive for an explicit historical ID or a follow-up that
+        # requested replay. A new upload alone does not select old images.
+        independent_replay_signal = bool(
+            not history_images_opted_out
+            and (
+                requested_attachment_ids
+                or metadata.get("image_route_reason") == "gate_history"
+                or metadata.get("router_vision_followup_needs_image") is True
+                or preserve_image_history
+            )
+        )
+        canonical_lookup_required = bool(
+            independent_replay_signal
+            or (
+                bound_attachment_replay_candidate
+                and bound_row_has_image is None
+            )
+        )
+        canonical_transcript = (
+            await self._canonical_transcript_for_attachment_replay(
+                session_key,
+                transcript,
+                expected_session_id=expected_session_id,
+                expected_session_epoch=expected_session_epoch,
+            )
+            if canonical_lookup_required and not restricted_turn
+            else list(transcript)
+        )
+        if bound_attachment_replay_candidate and bound_row_has_image is None:
+            bound_row_has_image = any(
+                getattr(entry, "role", None) == "user"
+                and str(getattr(entry, "message_id", "") or "")
+                == bound_user_message_id
+                and self._attachment_envelope_has_image(
+                    str(getattr(entry, "content", "") or "")
+                )
+                for entry in canonical_transcript
+            )
+        bound_attachment_replay_requested = bool(
+            bound_attachment_replay_candidate and bound_row_has_image is True
+        )
+        replay_signal = bool(
+            independent_replay_signal or bound_attachment_replay_requested
+        )
+        replay_selected_images = replay_signal
+        if replay_selected_images and agent_config is not None:
+            # Agent performs a final history sanitation pass immediately
+            # before provider projection.  Carry the resolved image intent to
+            # that pass so an explicitly rehydrated canonical image is not
+            # downgraded a second time.
+            agent_config.preserve_historical_images = True
+        if not restricted_turn:
+            await self._persist_attachment_manifest_best_effort(
+                session_key,
+                canonical_transcript,
+                expected_session_id=expected_session_id,
+                expected_session_epoch=expected_session_epoch,
+            )
         workspace_dir = getattr(getattr(agent, "config", None), "workspace_dir", None)
         materialize_historical_attachments = bool(
             getattr(
@@ -13794,8 +14659,15 @@ class TurnRunner:
             or 0
         )
         image_replay_entry_indexes: set[int] = set()
+        request_image_replay_entries: list[Any] = []
+        bound_image_replay_entries: list[Any] = []
+        requested_source_message_ids: set[str] = set()
         image_replay_session_id: str | None = None
-        if preserve_image_history and lookback > 0:
+        if replay_signal and (
+            lookback > 0
+            or bound_attachment_replay_requested
+            or requested_attachment_ids
+        ):
             current_user_entry_index = bound_index
             if current_user_entry_index is None:
                 current_user_entry_index = (
@@ -13814,19 +14686,154 @@ class TurnRunner:
                 and isinstance(getattr(entry, "content", None), str)
                 and bool(str(getattr(entry, "content", "")).strip())
             ]
-            image_replay_entry_indexes = set(user_entry_indexes[-lookback:])
+            if preserve_image_history and lookback > 0:
+                image_replay_entry_indexes = set(user_entry_indexes[-lookback:])
             image_replay_session_id = expected_session_id
             if image_replay_session_id is None:
                 image_replay_session_id = await self._resolve_session_id_for_log(session_key)
             if image_replay_session_id is None:
                 image_replay_session_id = session_key
+
+            if bound_attachment_replay_requested:
+                bound_image_replay_entries = [
+                    entry
+                    for entry in canonical_transcript
+                    if getattr(entry, "role", None) == "user"
+                    and str(getattr(entry, "message_id", "") or "")
+                    == bound_user_message_id
+                    and self._attachment_envelope_has_image(
+                        str(getattr(entry, "content", "") or "")
+                    )
+                ][:1]
+            # The id-bound prompt and later queued user prompts are never
+            # historical replay candidates. On the simple path exclude the
+            # final active user row, matching the normal trim behavior.
+            excluded_canonical_message_ids: set[str] = set()
+            if bound_user_message_id:
+                bound_found = False
+                for entry in canonical_transcript:
+                    message_id = str(getattr(entry, "message_id", "") or "")
+                    if getattr(entry, "role", None) != "user":
+                        continue
+                    if message_id == bound_user_message_id:
+                        bound_found = True
+                    if bound_found and message_id:
+                        excluded_canonical_message_ids.add(message_id)
+            elif trim_last_user:
+                for entry in reversed(canonical_transcript):
+                    if getattr(entry, "role", None) == "user":
+                        message_id = str(getattr(entry, "message_id", "") or "")
+                        if message_id:
+                            excluded_canonical_message_ids.add(message_id)
+                        break
+
+            candidate_entries = (
+                [
+                    entry
+                    for entry in canonical_transcript
+                    if getattr(entry, "role", None) == "user"
+                    and str(getattr(entry, "message_id", "") or "")
+                    not in excluded_canonical_message_ids
+                    and self._attachment_envelope_has_image(
+                        str(getattr(entry, "content", "") or "")
+                    )
+                ]
+                if lookback > 0 and independent_replay_signal
+                else []
+            )
+            if requested_attachment_ids:
+                try:
+                    from opensquilla.session.attachment_manifest import (
+                        build_attachment_manifest,
+                    )
+
+                    requested_manifest = build_attachment_manifest(
+                        canonical_transcript,
+                        session_id=image_replay_session_id or session_key,
+                        session_key=session_key,
+                    )
+                    requested_source_message_ids = {
+                        occurrence.source_message_id
+                        for occurrence in requested_manifest.by_ids(
+                            requested_attachment_ids
+                        )
+                    }
+                except Exception:  # noqa: BLE001 - raw envelope IDs still work
+                    requested_source_message_ids = set()
+                explicit_matches: list[Any] = []
+                for entry in canonical_transcript:
+                    if getattr(entry, "role", None) != "user":
+                        continue
+                    if (
+                        str(getattr(entry, "message_id", "") or "")
+                        in excluded_canonical_message_ids
+                    ):
+                        continue
+                    entry_message_id = str(
+                        getattr(entry, "message_id", "") or ""
+                    )
+                    if (
+                        entry_message_id in requested_source_message_ids
+                        or self._attachment_envelope_contains_ids(
+                            str(getattr(entry, "content", "") or ""),
+                            requested_attachment_ids,
+                        )
+                    ):
+                        explicit_matches.append(entry)
+                        if entry_message_id:
+                            requested_source_message_ids.add(entry_message_id)
+                candidate_entries = explicit_matches
+                if replay_selected_images and requested_source_message_ids:
+                    image_replay_entry_indexes.update(
+                        index
+                        for index, entry in enumerate(transcript)
+                        if str(getattr(entry, "message_id", "") or "")
+                        in requested_source_message_ids
+                    )
+            else:
+                candidate_entries = candidate_entries[-lookback:]
+            active_message_ids = {
+                str(getattr(entry, "message_id", "") or "")
+                for entry in transcript
+                if getattr(entry, "message_id", None)
+            }
+            replayed_active_message_ids = {
+                str(getattr(transcript[index], "message_id", "") or "")
+                for index in image_replay_entry_indexes
+            }
+            request_image_replay_entries = [
+                entry
+                for entry in candidate_entries
+                if requested_attachment_ids
+                or str(getattr(entry, "message_id", "") or "") not in active_message_ids
+                or str(getattr(entry, "message_id", "") or "") in replayed_active_message_ids
+            ]
+            # Requested attachments are injected after ordinary history is
+            # limited. Do not also send their bytes from an active raw row.
+            request_image_message_ids = {
+                str(getattr(entry, "message_id", "") or "")
+                for entry in request_image_replay_entries
+            }
+            image_replay_entry_indexes.difference_update(
+                index
+                for index, entry in enumerate(transcript)
+                if str(getattr(entry, "message_id", "") or "")
+                in request_image_message_ids
+            )
         attachment_replay_session_id = image_replay_session_id
-        if attachment_replay_session_id is None and materialize_historical_attachments:
+        history_has_image_envelope = any(
+            getattr(entry, "role", None) == "user"
+            and self._attachment_envelope_has_image(
+                str(getattr(entry, "content", "") or "")
+            )
+            for entry in transcript
+        )
+        if attachment_replay_session_id is None and (
+            materialize_historical_attachments or history_has_image_envelope
+        ):
             attachment_replay_session_id = expected_session_id
             if attachment_replay_session_id is None:
-                attachment_replay_session_id = await self._resolve_session_id_for_log(
-                    session_key
-                )
+                attachment_replay_session_id = await self._resolve_session_id_for_log(session_key)
             if attachment_replay_session_id is None:
                 attachment_replay_session_id = session_key
         history_materializer: AttachmentWorkspaceMaterializer | None = None
@@ -13860,6 +14867,7 @@ class TurnRunner:
             image_replay_entry_indexes=image_replay_entry_indexes,
             media_root=self._attachment_media_root(),
             session_id=attachment_replay_session_id,
+            allowed_image_attachment_ids=requested_image_id_filter,
             materialize_historical_attachments=materialize_historical_attachments,
             workspace_dir=workspace_dir,
             historical_materializer=history_materializer,
@@ -13867,6 +14875,99 @@ class TurnRunner:
         )
         history = list(replay.messages)
         summary_markers.extend(replay.legacy_summary_markers)
+
+        # Image selection belongs to this request, even when its source row
+        # lives in the archive or outside the ordinary history window. Bind
+        # only attachment content as protected input; do not replay old user
+        # instructions as new instructions alongside it.
+        request_image_context: list[Message] = []
+        if request_image_replay_entries:
+            for entry in request_image_replay_entries:
+                raw_content = str(getattr(entry, "content", "") or "")
+                if not raw_content:
+                    continue
+                replay_content = self._maybe_unpack_attachments(
+                    raw_content,
+                    persist_image_material=(
+                        getattr(
+                            getattr(self._turn_config(), "attachments", None),
+                            "persist_transcripts", True,
+                        ) is not False
+                    ),
+                    preserve_image_attachments=replay_selected_images,
+                    allowed_image_attachment_ids=requested_image_id_filter,
+                    materialize_historical_attachments=materialize_historical_attachments,
+                    media_root=self._attachment_media_root(),
+                    session_id=attachment_replay_session_id,
+                    workspace_dir=workspace_dir,
+                    historical_materializer=history_materializer,
+                    source_message_id=getattr(entry, "message_id", None),
+                    include_envelope_text=False,
+                )
+                request_image_context.extend(
+                    reconstruct_messages_from_entry(
+                        "user",
+                        replay_content,
+                        None,
+                        None,
+                    )
+                )
+        if bound_image_replay_entries:
+            # The caller re-appends the bound prompt text, so inject only its
+            # attachment projection here.  This works for both active and
+            # compacted rows and avoids duplicating the user instruction.
+            bound_attachment_history: list[Message] = []
+            for entry in bound_image_replay_entries:
+                replay_content = self._maybe_unpack_attachments(
+                    str(getattr(entry, "content", "") or ""),
+                    persist_image_material=(
+                        getattr(
+                            getattr(self._turn_config(), "attachments", None),
+                            "persist_transcripts", True,
+                        ) is not False
+                    ),
+                    preserve_image_attachments=True,
+                    materialize_historical_attachments=(
+                        materialize_historical_attachments
+                    ),
+                    media_root=self._attachment_media_root(),
+                    session_id=attachment_replay_session_id,
+                    workspace_dir=workspace_dir,
+                    historical_materializer=history_materializer,
+                    source_message_id=getattr(entry, "message_id", None),
+                    include_envelope_text=False,
+                )
+                if replay_content:
+                    bound_attachment_history.extend(
+                        reconstruct_messages_from_entry(
+                            "user",
+                            replay_content,
+                            None,
+                            None,
+                        )
+                    )
+            if bound_attachment_history:
+                request_image_context.extend(bound_attachment_history)
+        for replay_message in request_image_context:
+            if isinstance(replay_message.content, list) and any(
+                isinstance(block, ContentBlockImage) for block in replay_message.content
+            ):
+                # This note belongs only to the request-local projection. A
+                # later text fallback may replace the blocks with markers.
+                replay_message.content = [
+                    ContentBlockText(
+                        text=(
+                            "Image replay context for this request: native image blocks below "
+                            "are preserved originals reattached from earlier conversation turns; "
+                            "no new upload is required. Determine current image availability "
+                            "from these blocks or their fallback markers, not prior assistant "
+                            "claims that an image was not analyzed."
+                        )
+                    ),
+                    *replay_message.content,
+                ]
+                break
+        agent.set_request_image_context(request_image_context)
         if restricted_turn:
             # Context states, durable summaries, and legacy summary markers
             # were produced before this turn's restricted provider projection.
@@ -14057,16 +15158,180 @@ class TurnRunner:
         return False
 
     @staticmethod
+    def _attachment_envelope_contains_ids(
+        content: str,
+        attachment_ids: Sequence[str],
+    ) -> bool:
+        """Return whether an envelope names one of the requested occurrences."""
+
+        if not content or not content.lstrip().startswith("{"):
+            return False
+        try:
+            parsed = json.loads(content)
+        except (json.JSONDecodeError, ValueError):
+            return False
+        if not isinstance(parsed, dict):
+            return False
+        wanted = {value.strip() for value in attachment_ids if value.strip()}
+        if not wanted:
+            return False
+        atts = parsed.get("attachments") or []
+        if not isinstance(atts, list):
+            return False
+        return any(
+            isinstance(att, dict)
+            and isinstance(att.get("attachment_id"), str)
+            and att["attachment_id"].strip() in wanted
+            for att in atts
+        )
+
+    @staticmethod
+    def _attachment_ids_from_text(content: str) -> tuple[str, ...]:
+        """Extract bounded canonical attachment references from current input."""
+
+        if not isinstance(content, str) or "att_" not in content:
+            return ()
+        from opensquilla.session.attachment_manifest import valid_attachment_id
+
+        result: list[str] = []
+        seen: set[str] = set()
+        for match in re.finditer(
+            r"(?<![A-Za-z0-9_-])(att_[A-Za-z0-9_-]{8,160})(?![A-Za-z0-9_-])",
+            content,
+        ):
+            attachment_id = valid_attachment_id(match.group(1))
+            if attachment_id is None or attachment_id in seen:
+                continue
+            seen.add(attachment_id)
+            result.append(attachment_id)
+        return tuple(result)
+
+    @staticmethod
+    def _attachment_ids_from_resource_refs(
+        attachments: Sequence[Mapping[str, Any]],
+    ) -> tuple[str, ...]:
+        """Read canonical attachment IDs from structured resource references."""
+
+        from opensquilla.session.attachment_manifest import valid_attachment_id
+
+        result: list[str] = []
+        seen: set[str] = set()
+        for attachment in attachments:
+            if not isinstance(attachment, Mapping):
+                continue
+            for key in ("resourceRef", "resource_ref", "resource"):
+                raw_ref = attachment.get(key)
+                if not isinstance(raw_ref, Mapping):
+                    continue
+                resource_type = str(
+                    raw_ref.get("type") or raw_ref.get("resource_type") or ""
+                ).strip().lower()
+                if resource_type != "attachment":
+                    continue
+                attachment_id = valid_attachment_id(
+                    raw_ref.get("id") or raw_ref.get("resource_id")
+                )
+                if attachment_id is None or attachment_id in seen:
+                    continue
+                seen.add(attachment_id)
+                result.append(attachment_id)
+        return tuple(result)
+
+    @staticmethod
+    def _image_retention_from_envelope(content: str) -> bool | None:
+        """Confirm current-upload retention from saved material, not logical IDs.
+
+        A mixed or incomplete envelope has no shared retention fact. Its
+        current-upload markers stay conservative instead of promising replay.
+        """
+
+        try:
+            parsed = json.loads(content)
+        except (json.JSONDecodeError, ValueError):
+            return None
+        attachments = parsed.get("attachments") if isinstance(parsed, dict) else None
+        if not isinstance(attachments, list):
+            return None
+        retention: list[bool | None] = []
+        for attachment in attachments:
+            if not isinstance(attachment, dict):
+                continue
+            mime = (
+                attachment.get("type")
+                or attachment.get("mime")
+                or attachment.get("media_type")
+            )
+            if not isinstance(mime, str) or not mime.startswith("image/"):
+                continue
+            if attachment.get("missing_reason"):
+                retention.append(False)
+            elif any(
+                isinstance(attachment.get(key), str) and attachment[key]
+                for key in ("data", "sha256_ref")
+            ):
+                retention.append(True)
+            else:
+                retention.append(None)
+        if retention and all(value is retention[0] for value in retention):
+            return retention[0]
+        return None
+
+    @staticmethod
+    def _attachment_ids_from_envelope(
+        content: str,
+        *,
+        image_only: bool = False,
+    ) -> tuple[str, ...]:
+        """Read bounded logical IDs from a persisted attachment envelope."""
+
+        if not content or not content.lstrip().startswith("{"):
+            return ()
+        try:
+            parsed = json.loads(content)
+        except (json.JSONDecodeError, ValueError):
+            return ()
+        if not isinstance(parsed, dict):
+            return ()
+        attachments = parsed.get("attachments")
+        if not isinstance(attachments, list):
+            return ()
+        from opensquilla.session.attachment_manifest import valid_attachment_id
+
+        result: list[str] = []
+        for attachment in attachments:
+            if not isinstance(attachment, dict):
+                continue
+            if image_only:
+                media_type = (
+                    attachment.get("type")
+                    or attachment.get("mime")
+                    or attachment.get("media_type")
+                )
+                if not (
+                    isinstance(media_type, str)
+                    and media_type.startswith("image/")
+                ):
+                    continue
+            attachment_id = valid_attachment_id(attachment.get("attachment_id"))
+            if attachment_id is not None:
+                result.append(attachment_id)
+        return tuple(result)
+
+    @staticmethod
     def _maybe_unpack_attachments(
         content: str,
         *,
         preserve_image_attachments: bool = False,
+        allowed_image_attachment_ids: frozenset[str] | None = None,
         materialize_historical_attachments: bool = False,
         media_root: Path | None = None,
         session_id: str | None = None,
         workspace_dir: str | Path | None = None,
         workspace_attachment_budget_bytes: int | None = None,
         historical_materializer: AttachmentWorkspaceMaterializer | None = None,
+        source_message_id: str | None = None,
+        include_envelope_text: bool = True,
+        persist_image_material: bool = True,
     ) -> Any:
         """Reduce persisted attachment envelopes to text-only history.
 
@@ -14114,6 +15379,23 @@ class TurnRunner:
         omitted: list[str] = []
         replay_blocks: list[Any] = []
         preserved_image = False
+        occurrence_ids: dict[int, str] = {}
+        attachment_identity_session_id = session_id or "history"
+        try:
+            from opensquilla.session.attachment_manifest import (
+                extract_attachment_occurrences_from_envelope,
+            )
+
+            occurrence_ids = {
+                occurrence.ordinal: occurrence.attachment_id
+                for occurrence in extract_attachment_occurrences_from_envelope(
+                    content,
+                    session_id=attachment_identity_session_id,
+                    source_message_id=source_message_id or "unknown",
+                )
+            }
+        except (TypeError, ValueError):
+            occurrence_ids = {}
         if not materialize_historical_attachments:
             historical_materializer = None
         elif historical_materializer is None and session_id and workspace_dir:
@@ -14126,11 +15408,11 @@ class TurnRunner:
                 materializable_mimes=None,
                 disk_budget_bytes=workspace_attachment_budget_bytes,
             )
-        if preserve_image_attachments and text:
+        if preserve_image_attachments and include_envelope_text and text:
             from opensquilla.provider.types import ContentBlockText
 
             replay_blocks.append(ContentBlockText(text=text))
-        for att in atts:
+        for ordinal, att in enumerate(atts):
             if not isinstance(att, dict):
                 continue
             media_type = att.get("type") or att.get("mime") or att.get("media_type")
@@ -14151,17 +15433,65 @@ class TurnRunner:
             name = att.get("name")
             fallback = "image" if media_type.startswith("image/") else "attachment"
             label = name if isinstance(name, str) and name.strip() else fallback
-            if preserve_image_attachments and media_type in _IMAGE_ATTACHMENT_MIMES:
+            attachment_id = occurrence_ids.get(ordinal)
+            if attachment_id is None:
+                # Keep legacy IDs deterministic when an old envelope omitted
+                # them. This is metadata-only; no bytes or paths enter the
+                # marker or persisted state.
+                try:
+                    from opensquilla.session.attachment_manifest import legacy_attachment_id
+
+                    attachment_id = legacy_attachment_id(
+                        session_id=attachment_identity_session_id,
+                        message_id=source_message_id or "unknown",
+                        index=ordinal,
+                        sha256=(sha_ref if isinstance(sha_ref, str) else None),
+                    )
+                except Exception:  # noqa: BLE001 - marker identity is advisory
+                    attachment_id = None
+            image_replay_allowed = (
+                allowed_image_attachment_ids is None
+                or attachment_id in allowed_image_attachment_ids
+            )
+            if (
+                preserve_image_attachments
+                and image_replay_allowed
+                and media_type in _IMAGE_ATTACHMENT_MIMES
+            ):
                 from opensquilla.provider.types import ContentBlockImage
 
                 if isinstance(data, str) and data:
                     try:
                         base64.b64decode(data, validate=True)
                     except (binascii.Error, ValueError):
-                        omitted.append(f"[attachment unavailable: {label} ({media_type})]")
+                        omitted.append(
+                            image_marker(
+                                ImageMarkerState.UNAVAILABLE,
+                                attachment_id=attachment_id,
+                            )
+                        )
                     else:
+                        if (
+                            allowed_image_attachment_ids is not None
+                            and attachment_id is not None
+                        ):
+                            from opensquilla.provider.types import ContentBlockText
+
+                            replay_blocks.append(
+                                ContentBlockText(
+                                    text=(
+                                        "[historical image "
+                                        f"attachment_id={attachment_id}]"
+                                    )
+                                )
+                            )
                         replay_blocks.append(
-                            ContentBlockImage(media_type=media_type, data=data)
+                            ContentBlockImage(
+                                media_type=media_type,
+                                data=data,
+                                attachment_id=attachment_id,
+                                durable_retained=True,
+                            )
                         )
                         preserved_image = True
                     continue
@@ -14178,13 +15508,34 @@ class TurnRunner:
                     )
                     try:
                         raw_bytes = read_attachment_ref_bytes(ref, media_root=media_root)
-                    except (FileNotFoundError, ValueError) as exc:
-                        omitted.append(f"[attachment unavailable: {label}: {exc}]")
+                    except (FileNotFoundError, ValueError):
+                        omitted.append(
+                            image_marker(
+                                ImageMarkerState.UNAVAILABLE,
+                                attachment_id=attachment_id,
+                            )
+                        )
                     else:
+                        if (
+                            allowed_image_attachment_ids is not None
+                            and attachment_id is not None
+                        ):
+                            from opensquilla.provider.types import ContentBlockText
+
+                            replay_blocks.append(
+                                ContentBlockText(
+                                    text=(
+                                        "[historical image "
+                                        f"attachment_id={attachment_id}]"
+                                    )
+                                )
+                            )
                         replay_blocks.append(
                             ContentBlockImage(
                                 media_type=media_type,
                                 data=base64.b64encode(raw_bytes).decode("ascii"),
+                                attachment_id=attachment_id,
+                                durable_retained=True,
                             )
                         )
                         preserved_image = True
@@ -14193,6 +15544,7 @@ class TurnRunner:
                 historical_materializer is not None
                 and session_id
                 and _is_materializable_attachment_mime(media_type)
+                and (persist_image_material or not media_type.startswith("image/"))
             ):
                 materializer = historical_materializer
                 result = None
@@ -14231,7 +15583,24 @@ class TurnRunner:
                     )
                     omitted.append(render_attachment_material_marker(result, prefix=prefix))
                     continue
-            omitted.append(f"[historical attachment omitted: {label} ({media_type})]")
+            if media_type in _IMAGE_ATTACHMENT_MIMES:
+                marker = image_marker(
+                    (
+                        ImageMarkerState.UNAVAILABLE
+                        if missing_reason and not data and not sha_ref
+                        else ImageMarkerState.NOT_REREAD
+                    ),
+                    attachment_id=attachment_id,
+                )
+                # Retain the legacy phrase for clients/tests that recognize
+                # it, while adding the explicit state and stable ID required
+                # for a model switch after compaction.
+                omitted.append(
+                    f"[historical attachment omitted: {label} ({media_type}); "
+                    f"{marker[1:-1]}]"
+                )
+            else:
+                omitted.append(f"[historical attachment omitted: {label} ({media_type})]")
         if preserved_image:
             if omitted:
                 from opensquilla.provider.types import ContentBlockText
@@ -14239,8 +15608,10 @@ class TurnRunner:
                 replay_blocks.extend(ContentBlockText(text=marker) for marker in omitted)
             return replay_blocks
         if not omitted:
-            return text
-        return "\n".join([text, *omitted]).strip()
+            return text if include_envelope_text else ""
+        return "\n".join(
+            [*((text,) if include_envelope_text and text else ()), *omitted]
+        ).strip()
 
     @staticmethod
     def _maybe_unpack_assistant_artifacts(content: str) -> str:
@@ -14280,6 +15651,8 @@ class TurnRunner:
         session_id: str | None = None,
         workspace_attachment_budget_bytes: int | None = None,
         cancel_check: Callable[[], None] | None = None,
+        persist_image_material: bool = True,
+        image_workspace_dir: str | Path | None = None,
     ) -> list | None:
         """Build a multimodal user message that carries the attachments.
 
@@ -14312,6 +15685,14 @@ class TurnRunner:
         attachment_blocks: list[Any] = []
         office_batch_decompressed_budget = [_OFFICE_DECOMPRESSED_LIMIT]
         turn_materializer: AttachmentWorkspaceMaterializer | None = None
+        image_materializer = (
+            AttachmentWorkspaceMaterializer(
+                media_root=media_root or Path("."),
+                workspace_dir=image_workspace_dir,
+                materializable_mimes=None,
+                disk_budget_bytes=workspace_attachment_budget_bytes,
+            ) if image_workspace_dir is not None else None
+        )
         if workspace_dir:
             # One instance per turn so the attachment batch shares a single
             # budget scan instead of re-walking the tree per attachment.
@@ -14377,8 +15758,9 @@ class TurnRunner:
             name_raw = att.get("name")
             filename = _sanitize_attachment_filename(name_raw)
             material_marker = ""
-            if turn_materializer is not None:
-                materializer = turn_materializer
+            temporary_image = media_type.startswith("image/") and not persist_image_material
+            materializer = image_materializer if temporary_image else turn_materializer
+            if materializer is not None:
                 if is_attachment_ref(att):
                     result = materializer.materialize(att, session_id=session_id)
                 else:
@@ -14390,6 +15772,10 @@ class TurnRunner:
                     )
                 if cancel_check is not None:
                     cancel_check()
+                if temporary_image and result.rel_path and image_workspace_dir is not None:
+                    result = replace(
+                        result, rel_path=str(Path(image_workspace_dir) / result.rel_path)
+                    )
                 prefix = (
                     "attachment available"
                     if result.available
@@ -14407,7 +15793,19 @@ class TurnRunner:
                 continue
 
             if media_type in _IMAGE_ATTACHMENT_MIMES:
-                attachment_blocks.append(ContentBlockImage(media_type=media_type, data=data))
+                raw_attachment_id = att.get("attachment_id")
+                attachment_blocks.append(
+                    ContentBlockImage(
+                        media_type=media_type,
+                        data=data,
+                        attachment_id=(
+                            raw_attachment_id.strip()[:164]
+                            if isinstance(raw_attachment_id, str)
+                            and raw_attachment_id.strip()
+                            else None
+                        ),
+                    )
+                )
                 if material_marker:
                     attachment_blocks.append(ContentBlockText(text=material_marker))
             elif media_type == "application/pdf":

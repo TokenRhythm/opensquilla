@@ -3522,17 +3522,49 @@
   "message_len": 32,
   "message_tail": "please summarize this short note",
   "metadata": {
-   "applied_model": "dummy-vision-1",
+   "applied_model": "dummy-nano-1",
    "baseline_model": "dummy-base-model",
+   "image_input_mode": "native",
+   "image_input_reason": "configured_image_capable_tier",
    "image_route_reason": "current_turn",
    "large_context_capacity_required": true,
    "large_context_material_tokens": 8,
    "large_context_thinking_budget_tokens": 0,
    "rollout_phase": "observe",
    "route_max_history_turns": 1,
-   "routed_model": "dummy-vision-1",
-   "routed_tier": "image_model",
-   "router_fallback_chain": [],
+   "routed_model": "dummy-nano-1",
+   "routed_model_vision_support": "unknown",
+   "routed_tier": "c0",
+   "router_fallback_chain": [
+    {
+     "model": "dummy-mini-1",
+     "tier": "c1",
+     "vision_support": "unknown"
+    },
+    {
+     "model": "dummy-pro-1",
+     "tier": "c2",
+     "vision_support": "unknown"
+    },
+    {
+     "model": "dummy-max-1",
+     "tier": "c3",
+     "vision_support": "unknown"
+    }
+   ],
+   "router_fallback_strict": true,
+   "router_image_configured_tiers": [
+    "c0",
+    "c1",
+    "c2",
+    "c3"
+   ],
+   "router_image_tier_support": {
+    "c0": "unknown",
+    "c1": "unknown",
+    "c2": "unknown",
+    "c3": "unknown"
+   },
    "router_tier_provider_role": "direct",
    "routing_applied": true,
    "routing_confidence": 1.0,
@@ -3542,24 +3574,56 @@
    "savings_pct": 0.0,
    "savings_routed_price_per_m": 3.0
   },
-  "model": "dummy-vision-1"
+  "model": "dummy-nano-1"
  },
  "image_current_turn_bypass": {
   "error": null,
   "message_len": 32,
   "message_tail": "please summarize this short note",
   "metadata": {
-   "applied_model": "dummy-vision-1",
+   "applied_model": "dummy-nano-1",
    "baseline_model": "dummy-base-model",
+   "image_input_mode": "native",
+   "image_input_reason": "configured_image_capable_tier",
    "image_route_reason": "current_turn",
    "large_context_capacity_required": true,
    "large_context_material_tokens": 8,
    "large_context_thinking_budget_tokens": 0,
    "rollout_phase": "full",
    "route_max_history_turns": 1,
-   "routed_model": "dummy-vision-1",
-   "routed_tier": "image_model",
-   "router_fallback_chain": [],
+   "routed_model": "dummy-nano-1",
+   "routed_model_vision_support": "unknown",
+   "routed_tier": "c0",
+   "router_fallback_chain": [
+    {
+     "model": "dummy-mini-1",
+     "tier": "c1",
+     "vision_support": "unknown"
+    },
+    {
+     "model": "dummy-pro-1",
+     "tier": "c2",
+     "vision_support": "unknown"
+    },
+    {
+     "model": "dummy-max-1",
+     "tier": "c3",
+     "vision_support": "unknown"
+    }
+   ],
+   "router_fallback_strict": true,
+   "router_image_configured_tiers": [
+    "c0",
+    "c1",
+    "c2",
+    "c3"
+   ],
+   "router_image_tier_support": {
+    "c0": "unknown",
+    "c1": "unknown",
+    "c2": "unknown",
+    "c3": "unknown"
+   },
    "router_tier_provider_role": "direct",
    "routing_applied": true,
    "routing_confidence": 1.0,
@@ -3569,20 +3633,53 @@
    "savings_pct": 0.0,
    "savings_routed_price_per_m": 3.0
   },
-  "model": "dummy-vision-1"
+  "model": "dummy-nano-1"
  },
  "image_gate_history_bypass": {
   "error": null,
   "message_len": 32,
   "message_tail": "please summarize this short note",
   "metadata": {
-   "applied_model": "dummy-vision-1",
+   "applied_model": "dummy-nano-1",
    "baseline_model": "dummy-base-model",
+   "image_input_mode": "native",
+   "image_input_reason": "configured_image_capable_tier",
    "image_route_reason": "gate_history",
    "rollout_phase": "full",
    "route_max_history_turns": 8,
-   "routed_model": "dummy-vision-1",
-   "routed_tier": "image_model",
+   "routed_model": "dummy-nano-1",
+   "routed_model_vision_support": "unknown",
+   "routed_tier": "c0",
+   "router_fallback_chain": [
+    {
+     "model": "dummy-mini-1",
+     "tier": "c1",
+     "vision_support": "unknown"
+    },
+    {
+     "model": "dummy-pro-1",
+     "tier": "c2",
+     "vision_support": "unknown"
+    },
+    {
+     "model": "dummy-max-1",
+     "tier": "c3",
+     "vision_support": "unknown"
+    }
+   ],
+   "router_fallback_strict": true,
+   "router_image_configured_tiers": [
+    "c0",
+    "c1",
+    "c2",
+    "c3"
+   ],
+   "router_image_tier_support": {
+    "c0": "unknown",
+    "c1": "unknown",
+    "c2": "unknown",
+    "c3": "unknown"
+   },
    "router_tier_provider_role": "direct",
    "router_vision_followup_needs_image": true,
    "routing_applied": true,
@@ -3593,24 +3690,56 @@
    "savings_pct": 0.0,
    "savings_routed_price_per_m": 3.0
   },
-  "model": "dummy-vision-1"
+  "model": "dummy-nano-1"
  },
  "image_media_type_key_bypass": {
   "error": null,
   "message_len": 32,
   "message_tail": "please summarize this short note",
   "metadata": {
-   "applied_model": "dummy-vision-1",
+   "applied_model": "dummy-nano-1",
    "baseline_model": "dummy-base-model",
+   "image_input_mode": "native",
+   "image_input_reason": "configured_image_capable_tier",
    "image_route_reason": "current_turn",
    "large_context_capacity_required": true,
    "large_context_material_tokens": 8,
    "large_context_thinking_budget_tokens": 0,
    "rollout_phase": "full",
    "route_max_history_turns": 1,
-   "routed_model": "dummy-vision-1",
-   "routed_tier": "image_model",
-   "router_fallback_chain": [],
+   "routed_model": "dummy-nano-1",
+   "routed_model_vision_support": "unknown",
+   "routed_tier": "c0",
+   "router_fallback_chain": [
+    {
+     "model": "dummy-mini-1",
+     "tier": "c1",
+     "vision_support": "unknown"
+    },
+    {
+     "model": "dummy-pro-1",
+     "tier": "c2",
+     "vision_support": "unknown"
+    },
+    {
+     "model": "dummy-max-1",
+     "tier": "c3",
+     "vision_support": "unknown"
+    }
+   ],
+   "router_fallback_strict": true,
+   "router_image_configured_tiers": [
+    "c0",
+    "c1",
+    "c2",
+    "c3"
+   ],
+   "router_image_tier_support": {
+    "c0": "unknown",
+    "c1": "unknown",
+    "c2": "unknown",
+    "c3": "unknown"
+   },
    "router_tier_provider_role": "direct",
    "routing_applied": true,
    "routing_confidence": 1.0,
@@ -3620,21 +3749,66 @@
    "savings_pct": 0.0,
    "savings_routed_price_per_m": 3.0
   },
-  "model": "dummy-vision-1"
+  "model": "dummy-nano-1"
  },
- "image_without_image_tier_errors": {
+ "image_without_legacy_image_tier_uses_c_ladder": {
   "error": null,
   "message_len": 32,
   "message_tail": "please summarize this short note",
   "metadata": {
-   "image_input_forced_rejection_reason": "router_image_route_unavailable",
-   "image_input_mode": "rejected",
-   "image_input_reason": "router_image_route_unavailable",
+   "applied_model": "dummy-nano-1",
+   "baseline_model": "dummy-base-model",
+   "image_input_mode": "native",
+   "image_input_reason": "configured_image_capable_tier",
+   "image_route_reason": "current_turn",
    "large_context_capacity_required": true,
    "large_context_material_tokens": 8,
-   "routing_turn_index": 0
+   "large_context_thinking_budget_tokens": 0,
+   "rollout_phase": "full",
+   "route_max_history_turns": 1,
+   "routed_model": "dummy-nano-1",
+   "routed_model_vision_support": "unknown",
+   "routed_tier": "c0",
+   "router_fallback_chain": [
+    {
+     "model": "dummy-mini-1",
+     "tier": "c1",
+     "vision_support": "unknown"
+    },
+    {
+     "model": "dummy-pro-1",
+     "tier": "c2",
+     "vision_support": "unknown"
+    },
+    {
+     "model": "dummy-max-1",
+     "tier": "c3",
+     "vision_support": "unknown"
+    }
+   ],
+   "router_fallback_strict": true,
+   "router_image_configured_tiers": [
+    "c0",
+    "c1",
+    "c2",
+    "c3"
+   ],
+   "router_image_tier_support": {
+    "c0": "unknown",
+    "c1": "unknown",
+    "c2": "unknown",
+    "c3": "unknown"
+   },
+   "router_tier_provider_role": "direct",
+   "routing_applied": true,
+   "routing_confidence": 1.0,
+   "routing_source": "image_route",
+   "routing_turn_index": 0,
+   "savings_max_price_per_m": 3.0,
+   "savings_pct": 0.0,
+   "savings_routed_price_per_m": 3.0
   },
-  "model": "dummy-base-model"
+  "model": "dummy-nano-1"
  },
  "large_context_below_floor_boundary": {
   "error": null,

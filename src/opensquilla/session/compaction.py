@@ -8,7 +8,7 @@ import inspect
 import json
 import time
 import uuid
-from collections.abc import Awaitable, Callable, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal, cast
 
@@ -34,6 +34,14 @@ from opensquilla.provider.types import (
     derive_provider_request_correlation,
 )
 from opensquilla.redaction import redact_error_text
+from opensquilla.session.attachment_manifest import (
+    extract_attachment_occurrences_from_envelope,
+    legacy_attachment_id,
+    normalize_attachment_mime,
+    normalize_attachment_name,
+    valid_attachment_id,
+    valid_sha256,
+)
 from opensquilla.session.compaction_deployment import (
     MAX_COMPACTION_LLM_CALLS,
     CompactionExecutionPlan,
@@ -1128,7 +1136,47 @@ def _build_strict_identifier_instruction() -> str:
     )
 
 
-def _summarize_if_envelope(content: str) -> str:
+def _summary_attachment_id(
+    attachment: dict[str, Any],
+    *,
+    session_id: str,
+    message_id: str,
+    ordinal: int,
+    derived_id: str | None = None,
+) -> str:
+    """Return a stable, bounded ID for a compaction attachment descriptor.
+
+    Compaction receives a flattened entry payload rather than the full session
+    object.  Prefer the persisted occurrence ID; for legacy envelopes derive
+    the same deterministic namespace used by the attachment manifest.  The
+    fallback intentionally does not inspect or emit inline bytes.
+    """
+
+    # ``derived_id`` comes from the manifest parser, which validates an
+    # explicit occurrence ID and deterministically replaces an invalid one.
+    # Prefer it so an arbitrary path/token cannot be smuggled into a summary
+    # through the attachment_id field.
+    if derived_id:
+        return derived_id
+    explicit = valid_attachment_id(attachment.get("attachment_id"))
+    if explicit is not None:
+        return explicit
+    raw_sha = attachment.get("sha256_ref") or attachment.get("sha256")
+    sha = valid_sha256(raw_sha)
+    return legacy_attachment_id(
+        session_id=session_id or "compaction",
+        message_id=message_id or "unknown",
+        index=max(0, ordinal),
+        sha256=sha,
+    )
+
+
+def _summarize_if_envelope(
+    content: str,
+    *,
+    session_id: str = "",
+    message_id: str = "",
+) -> str:
     """Replace attachment-envelope JSON with a concise placeholder.
 
     User messages carrying images are persisted as
@@ -1138,30 +1186,165 @@ def _summarize_if_envelope(content: str) -> str:
     Detect the envelope shape and return ``text`` plus a short attachment
     descriptor instead. Non-envelope strings pass through unchanged.
     """
-    if not content.startswith('{"text":'):
-        return content
     try:
         parsed = json.loads(content)
     except (json.JSONDecodeError, ValueError):
         return content
-    if not isinstance(parsed, dict) or "text" not in parsed:
-        return content
-    text = parsed.get("text")
-    if not isinstance(text, str):
+    if not isinstance(parsed, dict):
         return content
     atts = parsed.get("attachments") or []
+    text = parsed.get("text")
+    if not isinstance(text, str):
+        # A malformed legacy envelope must still not expose attachment bytes
+        # or storage paths to the compactor.  Preserve an empty narrative and
+        # render whatever valid attachment descriptors remain.
+        if not isinstance(atts, list) or not atts:
+            return content
+        text = ""
     if not isinstance(atts, list) or not atts:
         return text
     descs: list[str] = []
-    for att in atts:
+    derived_ids: dict[int, str] = {}
+    try:
+        derived_ids = {
+            occurrence.ordinal: occurrence.attachment_id
+            for occurrence in extract_attachment_occurrences_from_envelope(
+                content,
+                session_id=session_id or "compaction",
+                source_message_id=message_id or "unknown",
+            )
+        }
+    except (TypeError, ValueError):
+        derived_ids = {}
+    for ordinal, att in enumerate(atts):
         if not isinstance(att, dict):
             continue
-        name = att.get("name") or "image"
-        media = att.get("type") or "image/*"
-        descs.append(f"{name} ({media})")
+        raw_name = att.get("name")
+        if isinstance(raw_name, str):
+            # Persisted display names should already be basenames, but legacy
+            # envelopes sometimes stored a local path.  A compaction summary
+            # needs a descriptor, never the host path.
+            raw_name = raw_name.replace("\\", "/").rsplit("/", 1)[-1]
+        name = normalize_attachment_name(raw_name, fallback="image")
+        media = normalize_attachment_mime(
+            att.get("mime") or att.get("type") or att.get("media_type")
+        )
+        attachment_id = _summary_attachment_id(
+            att,
+            session_id=session_id,
+            message_id=message_id,
+            ordinal=ordinal,
+            derived_id=derived_ids.get(ordinal),
+        )
+        descs.append(f"{name} ({media}; attachment_id={attachment_id})")
     if descs:
         return f"{text}\n[user attached: {', '.join(descs)}]"
     return text
+
+
+_COMPACTION_IMAGE_MARKER = (
+    "[image omitted from compaction input; original attachment remains in session history]"
+)
+_COMPACTION_IMAGE_BLOCK_TYPES = frozenset(
+    {"image", "image_url", "input_image", "output_image"}
+)
+_COMPACTION_IMAGE_PAYLOAD_KEYS = frozenset(
+    {"base64", "bytes", "data", "image_url", "path", "source", "url"}
+)
+
+
+def _is_known_image_mapping(value: Mapping[str, Any]) -> bool:
+    """Recognize persisted provider image blocks without inspecting prose."""
+
+    raw_type = value.get("type")
+    block_type = raw_type.strip().lower() if isinstance(raw_type, str) else ""
+    if block_type in _COMPACTION_IMAGE_BLOCK_TYPES or block_type.startswith("image/"):
+        return True
+    raw_mime = value.get("media_type") or value.get("mime")
+    mime = raw_mime.strip().lower() if isinstance(raw_mime, str) else ""
+    return mime.startswith("image/") and any(
+        key in value for key in _COMPACTION_IMAGE_PAYLOAD_KEYS
+    )
+
+
+def _project_compaction_images(value: Any) -> Any:
+    """Recursively replace known image blocks with a metadata-free marker.
+
+    Tool results can contain provider content blocks at arbitrary depth. The
+    canonical transcript retains those blocks, while both compaction inputs
+    and durable-obligation extraction consume this detached projection.
+    """
+
+    if isinstance(value, Mapping):
+        if _is_known_image_mapping(value):
+            return {"type": "text", "text": _COMPACTION_IMAGE_MARKER}
+        return {key: _project_compaction_images(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_project_compaction_images(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_project_compaction_images(item) for item in value)
+    if isinstance(value, str) and value.lstrip().startswith(("{", "[")):
+        # OpenAI-compatible function arguments and some tool results persist
+        # structured content as a JSON string. Preserve the original spelling
+        # unless that decoded value actually contains a known image block.
+        try:
+            parsed = json.loads(value)
+        except (json.JSONDecodeError, RecursionError, TypeError, ValueError):
+            return value
+        projected = _project_compaction_images(parsed)
+        if projected != parsed:
+            return json.dumps(projected, ensure_ascii=False, sort_keys=True)
+    return value
+
+
+def _attachment_safe_obligation_entries(
+    entries: Sequence[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Project attachment envelopes and image blocks before obligations.
+
+    Obligation extraction deliberately scans raw prose for paths and opaque
+    identifiers.  A persisted attachment envelope also contains storage-only
+    fields, while nested tool results may carry provider-native image blocks.
+    Scanning either raw value would incorrectly preserve media bytes, paths,
+    or path-shaped invalid IDs in the structured summary. Keep user text and
+    canonical occurrence IDs, but project known image blocks to a marker.
+    """
+
+    projected: list[dict[str, Any]] = []
+    for entry in entries:
+        safe_entry = dict(entry)
+        if "tool_calls" in safe_entry:
+            safe_entry["tool_calls"] = _project_compaction_images(
+                safe_entry.get("tool_calls")
+            )
+        content = str(entry.get("content") or "")
+        session_id = str(entry.get("session_id") or "compaction")
+        message_id = str(entry.get("message_id") or entry.get("id") or "unknown")
+        try:
+            occurrences = extract_attachment_occurrences_from_envelope(
+                content,
+                session_id=session_id,
+                source_message_id=message_id,
+            )
+        except (TypeError, ValueError):
+            occurrences = ()
+        if not occurrences:
+            projected.append(safe_entry)
+            continue
+
+        try:
+            envelope = json.loads(content)
+        except (json.JSONDecodeError, TypeError, ValueError):
+            envelope = {}
+        text = envelope.get("text") if isinstance(envelope, dict) else ""
+        safe_parts = [text] if isinstance(text, str) and text else []
+        safe_parts.extend(
+            f"[attachment reference: attachment_id={occurrence.attachment_id}]"
+            for occurrence in occurrences
+        )
+        safe_entry["content"] = "\n".join(safe_parts)
+        projected.append(safe_entry)
+    return projected
 
 
 def _preview_text(text: str, max_chars: int = 240) -> str:
@@ -1189,6 +1372,7 @@ def _summarize_tool_value(value: Any) -> str:
 
 
 def _summarize_tool_calls_for_llm(tool_calls: Any) -> str:
+    tool_calls = _project_compaction_images(tool_calls)
     if not isinstance(tool_calls, list) or not tool_calls:
         return ""
     lines = ["[tool payload summary]"]
@@ -1268,7 +1452,11 @@ def _format_chunk_for_llm(chunk: list[dict[str, Any]]) -> str:
     lines: list[str] = []
     for entry in chunk:
         role = entry.get("role", "unknown")
-        content = _summarize_if_envelope(str(entry.get("content") or ""))
+        content = _summarize_if_envelope(
+            str(entry.get("content") or ""),
+            session_id=str(entry.get("session_id") or ""),
+            message_id=str(entry.get("message_id") or entry.get("id") or ""),
+        )
         rendered_parts = [f"[{role}]: {content}"]
         tool_summary = _summarize_tool_calls_for_llm(entry.get("tool_calls"))
         if tool_summary:
@@ -1294,8 +1482,22 @@ def _summarize_chunk_fallback(chunk: list[dict[str, Any]], policy: str) -> str:
     lines.append(f"[Summary of {len(chunk)} messages]")
     for entry in chunk:
         role = entry.get("role", "unknown")
-        content = _summarize_if_envelope(str(entry.get("content") or ""))
-        preview = content[:200] + ("..." if len(content) > 200 else "")
+        content = _summarize_if_envelope(
+            str(entry.get("content") or ""),
+            session_id=str(entry.get("session_id") or ""),
+            message_id=str(entry.get("message_id") or entry.get("id") or ""),
+        )
+        # Attachment descriptors are durable lookup handles, not expendable
+        # prose.  Preview the user text while retaining the complete descriptor
+        # suffix even when the original prompt is long.
+        descriptor_index = content.rfind("\n[user attached:")
+        if descriptor_index >= 0 and content.endswith("]"):
+            preview = (
+                _preview_text(content[:descriptor_index], 200)
+                + content[descriptor_index:]
+            )
+        else:
+            preview = _preview_text(content, 200)
         lines.append(f"  [{role}]: {preview}")
         tool_summary = _summarize_tool_calls_for_llm(entry.get("tool_calls"))
         if tool_summary:
@@ -2195,7 +2397,7 @@ async def compact_context_new(request: CompactionRequest) -> CompactionResult:
     else:
         summary_source = "fallback"
 
-    obligation_entries = list(to_compact)
+    obligation_entries = _attachment_safe_obligation_entries(to_compact)
     if prev_summary:
         obligation_entries.insert(
             0,

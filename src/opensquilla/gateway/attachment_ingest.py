@@ -657,6 +657,7 @@ async def resolve_attachments(
     disk_budget_bytes: int | None = None,
     accept_opaque: bool = True,
     opaque_limit_bytes: int | None = None,
+    persist_enabled: bool = True,
 ) -> tuple[list[dict[str, Any]], list[str]]:
     if not any(isinstance(a, dict) and a.get("file_uuid") for a in validated):
         enforce_total_attachment_bytes(validated)
@@ -706,6 +707,10 @@ async def resolve_attachments(
             opaque_limit_bytes=opaque_limit_bytes,
         )
         item = materialized[0]
+        if not persist_enabled:
+            resolved.append(item)
+            consumed.append(ref)
+            continue
         if material_root is None or not session_id:
             raise ValueError(
                 f"attachments[{index}] file_uuid resolution requires a material target"
@@ -746,6 +751,7 @@ async def ingest_attachments(
     opaque_limit_bytes: int | None = None,
     allow_material_refs: bool = False,
     expected_material_scope: str | None = None,
+    persist_enabled: bool = True,
 ) -> AttachmentIngestResult:
     validated, failures = validate_attachments(
         raw_attachments,
@@ -765,6 +771,7 @@ async def ingest_attachments(
         disk_budget_bytes=disk_budget_bytes,
         accept_opaque=accept_opaque,
         opaque_limit_bytes=opaque_limit_bytes,
+        persist_enabled=persist_enabled,
     )
     if failures:
         markers = [failure.marker for failure in failures]

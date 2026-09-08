@@ -406,6 +406,12 @@ def _write_config(
             int(model_context_window_tokens),
         )
     if model_supports_vision_override is not None:
+        # The offline single-call fixture supplies deployment facts for every
+        # configured leg; retired tier switches cannot stand in for metadata.
+        for tier in (tier_overrides or {}).values():
+            tier_model = str(tier.get("model") or "").strip()
+            if tier_model and tier_model != model_supports_vision_override:
+                model_override_fields.setdefault(tier_model, {})["supports_vision"] = False
         model_override_fields.setdefault(model_supports_vision_override, {})[
             "supports_vision"
         ] = True
@@ -493,17 +499,18 @@ def _tokenrhythm_attachment_tiers() -> dict[str, dict[str, Any]]:
         raise RuntimeError("TokenRhythm preset has no image_model tier")
     if image_tier.get("model") != ATTACHMENT_CAPACITY_MODEL:
         raise RuntimeError("TokenRhythm image_model does not match the verified live fixture")
-    unsafe_fallback_slots = [
+    missing_slots = [
         slot
         for slot in TEXT_PROFILE_SLOTS
         if not isinstance(tiers.get(slot), dict)
-        or tiers[slot].get("supports_image") is not False
+        or not str(tiers[slot].get("model") or "").strip()
     ]
-    if unsafe_fallback_slots:
-        raise RuntimeError(
-            "TokenRhythm attachment gate requires every text fallback to be explicitly "
-            "non-vision before any live request"
-        )
+    if missing_slots:
+        raise RuntimeError("TokenRhythm attachment gate requires configured c0-c3 models")
+    tiers["c2"] = {**image_tier, "image_only": False}
+    del tiers["image_model"]
+    for tier in tiers.values():
+        tier.pop("supports_image", None)
     return tiers
 
 
@@ -647,6 +654,8 @@ def _attachment_capacity_fixture() -> dict[str, Any]:
             _inline_image("history-3a.png", payloads[2]),
             _inline_image("history-3b.png", payloads[3]),
         ]
+        images[2]["attachment_id"] = "att_capacity_history_3a"
+        images[3]["attachment_id"] = "att_capacity_history_3b"
         turns = [
             {
                 "user": _inline_history_envelope("Historical image turn one.", [images[0]]),
@@ -691,6 +700,7 @@ def _attachment_capacity_fixture() -> dict[str, Any]:
             "current_attachment": _inline_image("current.png", current_payload),
             "excluded_base64": [images[0]["data"], images[1]["data"]],
             "retained_base64": [images[2]["data"], images[3]["data"]],
+            "retained_attachment_ids": [images[2]["attachment_id"], images[3]["attachment_id"]],
             "metrics": {
                 "history_turn_count": len(turns),
                 "history_image_count": len(images),
@@ -1696,9 +1706,11 @@ def _run_tokenrhythm_attachment_capacity_in_temp(
                             {
                                 "sessionKey": session_key,
                                 "message": (
-                                    "请简短描述当前图片，不要调用工具，最后单独输出 "
+                                    "Briefly compare the current image with historical attachments "
+                                    + ", ".join(fixture["retained_attachment_ids"])
+                                    + ". Do not call tools. End with "
                                     + marker
-                                    + "。"
+                                    + "."
                                 ),
                                 "attachments": [
                                     {

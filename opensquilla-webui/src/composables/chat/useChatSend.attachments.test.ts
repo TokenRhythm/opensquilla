@@ -3866,7 +3866,7 @@ describe('useChatSend attachment payloads', () => {
     expect(queued.attachments).toEqual([failed])
   })
 
-  it('keeps a queued image intact while Ensemble routing cannot send it', async () => {
+  it('allows a queued Ensemble image to continue through marker degradation', async () => {
     const image: Attachment = {
       kind: 'staged',
       local_id: 32,
@@ -3887,9 +3887,11 @@ describe('useChatSend attachment payloads', () => {
     })
 
     await expect(api.sendQueuedSteer(queued)).resolves.toBe('not_sent')
-    await expect(api.sendQueuedFollowup(queued)).resolves.toBe('not_sent')
+    await expect(api.sendQueuedFollowup(queued)).resolves.toBe('accepted')
 
-    expect(rpc.call).not.toHaveBeenCalled()
+    expect(rpc.call).toHaveBeenCalledWith('chat.send', expect.objectContaining({
+      attachments: [expect.objectContaining({ mime: 'image/png' })],
+    }))
     expect(queued.attachments).toEqual([image])
     expect(inputText.value).toBe('unrelated live draft')
   })
@@ -6706,7 +6708,7 @@ describe('useChatSend attachment payloads', () => {
   })
 })
 
-describe('useChatSend Ensemble image guard', () => {
+describe('useChatSend image admission', () => {
   function readyAttachment(
     mime: string,
     overrides: Partial<Attachment> = {},
@@ -6721,7 +6723,7 @@ describe('useChatSend Ensemble image guard', () => {
     }
   }
 
-  it('blocks a direct Ensemble image send before any visible or RPC mutation', async () => {
+  it('allows a direct Ensemble image send for backend marker degradation', async () => {
     const image = readyAttachment('image/png', { name: 'photo.png' })
     const pendingAttachments = ref<Attachment[]>([image])
     const inputText = ref('describe this')
@@ -6735,14 +6737,19 @@ describe('useChatSend Ensemble image guard', () => {
 
     await api.onSend()
 
-    expect(rpc.call).not.toHaveBeenCalled()
-    expect(prepareAttachmentsForSend).not.toHaveBeenCalled()
-    expect(options.messages.value).toEqual([])
-    expect(inputText.value).toBe('describe this')
-    expect(pendingAttachments.value).toEqual([image])
+    expect(rpc.call).toHaveBeenCalledWith('chat.send', expect.objectContaining({
+      attachments: [expect.objectContaining({ mime: 'image/png' })],
+    }))
+    expect(prepareAttachmentsForSend).toHaveBeenCalledOnce()
+    expect(options.messages.value).toContainEqual(expect.objectContaining({
+      role: 'user',
+      text: 'describe this',
+    }))
+    expect(inputText.value).toBe('')
+    expect(pendingAttachments.value).toEqual([])
     expect(options.pendingSessionIntent.value).toBeNull()
-    expect(options.closeSlashMenu).not.toHaveBeenCalled()
-    expect(stream.startStreaming).not.toHaveBeenCalled()
+    expect(options.closeSlashMenu).toHaveBeenCalled()
+    expect(stream.startStreaming).toHaveBeenCalled()
   })
 
   it('blocks image sends while routing settings are being written', async () => {
@@ -6786,7 +6793,7 @@ describe('useChatSend Ensemble image guard', () => {
     },
   )
 
-  it('blocks explicitly unsupported image input before upload or draft mutation', async () => {
+  it('blocks an explicit image policy rejection before upload or draft mutation', async () => {
     const image = readyAttachment('image/png', { file_uuid: '' })
     const pendingAttachments = ref<Attachment[]>([image])
     const prepareAttachmentsForSend = vi.fn(async () => true)
@@ -6822,7 +6829,7 @@ describe('useChatSend Ensemble image guard', () => {
     }))
   })
 
-  it('rechecks routing after attachment preparation without consuming the draft', async () => {
+  it('continues when routing switches to Ensemble during attachment preparation', async () => {
     const image = readyAttachment('image/gif')
     const pendingAttachments = ref<Attachment[]>([image])
     const modelRoutingMode = ref<'off' | 'llm_ensemble'>('off')
@@ -6839,13 +6846,15 @@ describe('useChatSend Ensemble image guard', () => {
     await api.onSend()
 
     expect(prepareAttachmentsForSend).toHaveBeenCalledOnce()
-    expect(rpc.call).not.toHaveBeenCalled()
-    expect(options.messages.value).toEqual([])
-    expect(options.inputText.value).toBe('hello')
-    expect(pendingAttachments.value).toEqual([image])
+    expect(rpc.call).toHaveBeenCalledWith('chat.send', expect.objectContaining({
+      attachments: [expect.objectContaining({ mime: 'image/gif' })],
+    }))
+    expect(options.messages.value).toContainEqual(expect.objectContaining({ role: 'user' }))
+    expect(options.inputText.value).toBe('')
+    expect(pendingAttachments.value).toEqual([])
   })
 
-  it('blocks a recovered image retry without restoring it after switching to Ensemble', async () => {
+  it('retries a recovered image after the user switches to Ensemble', async () => {
     const image = readyAttachment('image/jpg', { name: 'photo.jpg' })
     const pendingAttachments = ref<Attachment[]>([image])
     const modelRoutingMode = ref<'off' | 'llm_ensemble'>('off')
@@ -6860,12 +6869,12 @@ describe('useChatSend Ensemble image guard', () => {
 
     await api.onSend()
 
-    expect(rpc.call).toHaveBeenCalledOnce()
+    expect(rpc.call).toHaveBeenCalledTimes(2)
     expect(options.inputText.value).toBe('')
     expect(pendingAttachments.value).toEqual([])
   })
 
-  it('preserves an auto-drained queued image after routing switches to Ensemble', async () => {
+  it('auto-drains a queued image after routing switches to Ensemble', async () => {
     vi.useFakeTimers()
     try {
       const image = readyAttachment('image/png')
@@ -6924,10 +6933,12 @@ describe('useChatSend Ensemble image guard', () => {
       await nextTick()
 
       expect(pending.pendingQueue.value).toEqual([])
-      expect(rpc.call).not.toHaveBeenCalled()
-      expect(options.messages.value).toEqual([])
-      expect(inputText.value).toBe('queued image')
-      expect(pendingAttachments.value).toEqual([image])
+      expect(rpc.call).toHaveBeenCalledWith('chat.send', expect.objectContaining({
+        attachments: [expect.objectContaining({ mime: 'image/png' })],
+      }))
+      expect(options.messages.value).toContainEqual(expect.objectContaining({ role: 'user' }))
+      expect(inputText.value).toBe('')
+      expect(pendingAttachments.value).toEqual([])
       pending.cleanup()
     } finally {
       vi.useRealTimers()

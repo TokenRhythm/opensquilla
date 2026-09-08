@@ -2565,7 +2565,7 @@ describe('useSetupCatalog fresh-install provider semantics', () => {
     app.unmount()
   })
 
-  it('invalidates saved C3 readiness when an independent image-model row is edited', async () => {
+  it('keeps saved C3 readiness when an inactive legacy image row rejects an edit', async () => {
     mockProviderState(
       {
         ...configuredProviderStatus('tokenrhythm'),
@@ -2618,7 +2618,10 @@ describe('useSetupCatalog fresh-install provider semantics', () => {
     expect(api.modelStrategyPanel.value.router.tierEnsembleStatusFresh).toBe(true)
 
     api.updateTierField('image_model', 'model', 'vision-model-v2')
-    expect(api.modelStrategyPanel.value.router.tierEnsembleStatusFresh).toBe(false)
+    expect(api.modelStrategyPanel.value.router.tierEnsembleStatusFresh).toBe(true)
+    expect(api.modelStrategyPanel.value.router.tierRows).not.toContainEqual(expect.objectContaining({
+      name: 'image_model',
+    }))
     expect(api.modelStrategyPanel.value.router.tierEnsembleStatus).toMatchObject({
       runtimeStatus: 'blocked',
       fixedFallbackReady: false,
@@ -3302,10 +3305,9 @@ describe('useSetupCatalog configured provider management', () => {
     expect(api.routerPanel.value.tierRows).toEqual(expect.arrayContaining([
       expect.objectContaining({ name: 'c0', provider: 'openrouter', model: 'legacy-model' }),
       expect.objectContaining({ name: 'c1', provider: 'deepseek', model: 'deepseek-chat' }),
-      expect.objectContaining({ name: 'image_model', provider: 'deepseek', model: 'deepseek-vision' }),
     ]))
-    // The dedicated image route is independent and must never be imported as
-    // a text proposer when the user converts a legacy dynamic plan.
+    expect(api.routerPanel.value.tierRows.map(row => row.name)).toEqual(['c0', 'c1'])
+    // A retained image-model configuration must not become an Ensemble member.
     expect(api.ensemblePanel.value.tierCandidates).toEqual([
       expect.objectContaining({ provider: 'deepseek', model: 'deepseek-chat', source: 'tier' }),
     ])

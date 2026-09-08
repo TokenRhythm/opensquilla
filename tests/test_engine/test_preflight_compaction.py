@@ -686,6 +686,9 @@ async def test_preflight_legacy_compactor_uses_id_safe_ephemeral_override(
         def set_history(self, history: list[Any]) -> None:
             self.history = history
 
+        def set_request_image_context(self, messages: list[Any]) -> None:
+            assert messages == []
+
     agent = _HistoryCapture()
     summary_context = await runner._load_history(
         agent,
@@ -1179,6 +1182,9 @@ async def test_preflight_compact_failure_uses_emergency_ephemeral_history_trim()
         def set_history(self, history: list[Any]) -> None:
             self.history = history
 
+        def set_request_image_context(self, messages: list[Any]) -> None:
+            assert messages == []
+
     agent = _HistoryCapture()
     summary_context = await runner._load_history(agent, session_key, trim_last_user=False)
 
@@ -1338,6 +1344,9 @@ async def test_preflight_empty_summary_uses_emergency_ephemeral_history_trim() -
         def set_history(self, history: list[Any]) -> None:
             self.history = history
 
+        def set_request_image_context(self, messages: list[Any]) -> None:
+            assert messages == []
+
     agent = _HistoryCapture()
     summary_context = await runner._load_history(agent, session_key, trim_last_user=False)
 
@@ -1393,6 +1402,9 @@ async def test_preflight_stale_preimage_skip_does_not_use_emergency_trim(
 
         def set_history(self, history: list[Any]) -> None:
             self.history = history
+
+        def set_request_image_context(self, messages: list[Any]) -> None:
+            assert messages == []
 
     agent = _HistoryCapture()
     summary_context = await runner._load_history(agent, session_key, trim_last_user=False)

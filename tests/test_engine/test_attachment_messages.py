@@ -27,10 +27,37 @@ from opensquilla.provider.types import (
     ContentBlockImage,
     ContentBlockText,
 )
+from opensquilla.session.attachment_manifest import (
+    legacy_attachment_id,
+    preserve_attachment_occurrence_ids,
+)
 
 
 def _b64(payload: bytes) -> str:
     return base64.b64encode(payload).decode("ascii")
+
+
+@pytest.mark.parametrize(
+    ("attachments", "expected"),
+    [
+        ([{"mime": "image/png", "attachment_id": "att_id_only"}], None),
+        ([{"mime": "image/png", "data": "c3ludGhldGlj"}], True),
+        ([{"mime": "image/png", "sha256_ref": "a" * 64}], True),
+        ([{"mime": "image/png", "missing_reason": "attachment persistence disabled"}], False),
+        ([
+            {"mime": "image/png", "sha256_ref": "a" * 64},
+            {"mime": "image/png", "missing_reason": "attachment persistence disabled"},
+        ], None),
+        ([{"mime": "application/pdf", "sha256_ref": "a" * 64}], None),
+    ],
+)
+def test_current_image_retention_requires_saved_material_evidence(
+    attachments: list[dict[str, str]],
+    expected: bool | None,
+) -> None:
+    envelope = json.dumps({"text": "inspect", "attachments": attachments})
+
+    assert TurnRunner._image_retention_from_envelope(envelope) is expected
 
 
 def _sample_pdf_bytes(text: str = "Hello PDF Text") -> bytes:
@@ -215,6 +242,100 @@ def test_historical_inline_image_envelope_can_replay_for_vision() -> None:
     assert len(image_blocks) == 1
     assert image_blocks[0].media_type == "image/png"
     assert image_blocks[0].data == _b64(b"\x89PNG\r\n\x1a\n")
+
+
+def test_forked_legacy_historical_image_keeps_allowed_attachment_id() -> None:
+    payload = b"legacy-fork-image"
+    message_id = "message-legacy-fork-image"
+    content = json.dumps(
+        {
+            "text": "continue from this legacy image",
+            "attachments": [
+                {
+                    "type": "image/png",
+                    "data": _b64(payload),
+                    "name": "legacy.png",
+                }
+            ],
+        }
+    )
+    parent_attachment_id = legacy_attachment_id(
+        session_id="parent-session",
+        message_id=message_id,
+        index=0,
+        sha256=hashlib.sha256(payload).hexdigest(),
+    )
+    forked_content = preserve_attachment_occurrence_ids(
+        content,
+        session_id="parent-session",
+        source_message_id=message_id,
+    )
+
+    out = TurnRunner._maybe_unpack_attachments(
+        forked_content,
+        preserve_image_attachments=True,
+        allowed_image_attachment_ids=frozenset({parent_attachment_id}),
+        session_id="child-session",
+        source_message_id=message_id,
+    )
+
+    assert isinstance(out, list)
+    image_blocks = [block for block in out if isinstance(block, ContentBlockImage)]
+    assert len(image_blocks) == 1
+    assert image_blocks[0].data == _b64(payload)
+    assert image_blocks[0].attachment_id == parent_attachment_id
+    assert any(
+        isinstance(block, ContentBlockText)
+        and block.text == f"[historical image attachment_id={parent_attachment_id}]"
+        for block in out
+    )
+
+
+def test_explicit_multi_image_replay_exposes_stable_id_to_image_mapping() -> None:
+    first_id = "att_abcdefgh"
+    second_id = "att_ijklmnop"
+    first_payload = b"first-image"
+    second_payload = b"second-image"
+    content = json.dumps(
+        {
+            "text": "Compare the referenced images.",
+            "attachments": [
+                {
+                    "attachment_id": first_id,
+                    "type": "image/png",
+                    "data": _b64(first_payload),
+                    "name": "first.png",
+                },
+                {
+                    "attachment_id": second_id,
+                    "type": "image/png",
+                    "data": _b64(second_payload),
+                    "name": "second.png",
+                },
+            ],
+        }
+    )
+
+    out = TurnRunner._maybe_unpack_attachments(
+        content,
+        preserve_image_attachments=True,
+        # Reference order is intentionally the reverse of transcript order;
+        # adjacent labels make the mapping unambiguous on the provider wire.
+        allowed_image_attachment_ids=frozenset((second_id, first_id)),
+    )
+
+    assert isinstance(out, list)
+    mapped_blocks = [
+        (out[index].text, out[index + 1].data)
+        for index in range(len(out) - 1)
+        if isinstance(out[index], ContentBlockText)
+        and out[index].text.startswith("[historical image attachment_id=")
+        and isinstance(out[index + 1], ContentBlockImage)
+    ]
+    assert mapped_blocks == [
+        (f"[historical image attachment_id={first_id}]", _b64(first_payload)),
+        (f"[historical image attachment_id={second_id}]", _b64(second_payload)),
+    ]
 
 
 def test_historical_image_ref_envelope_can_replay_for_vision(tmp_path: Path) -> None:
@@ -994,3 +1115,66 @@ def test_workspace_budget_degrades_materialization_to_marker(tmp_path: Path) -> 
     assert "workspace attachment budget exceeded" in wrapped.text
     files = list((workspace / ".opensquilla" / "attachments").rglob("*-blob.bin"))
     assert files == []
+
+
+@pytest.mark.parametrize("temporary_root", [True, False])
+@pytest.mark.parametrize("mime", ["image/png", "image/tiff"])
+def test_unpersisted_current_images_do_not_create_permanent_workspace_copies(
+    tmp_path: Path, temporary_root: bool, mime: str,
+) -> None:
+    workspace = tmp_path / "workspace"
+    scratch = tmp_path / "scratch"
+    out = TurnRunner._build_attachment_messages(
+        "Compare attachments", [
+            {"type": mime, "data": _b64(b"image-bytes"), "name": "image.png"},
+            {"type": "text/plain", "data": _b64(b"text content"), "name": "note.txt"},
+        ], workspace_dir=workspace, session_id="session-a", persist_image_material=False,
+        image_workspace_dir=scratch if temporary_root else None,
+    )
+    assert out is not None
+    images = [block for block in out[0].content if isinstance(block, ContentBlockImage)]
+    if mime == "image/png":
+        assert images[0].data == _b64(b"image-bytes")
+    else:
+        assert not images
+    assert not list(workspace.rglob("*.png"))
+    assert next(workspace.rglob("*.txt")).read_bytes() == b"text content"
+    if temporary_root:
+        image_path = next(scratch.rglob("*.png"))
+        assert image_path.read_bytes() == b"image-bytes"
+        assert any(
+            str(image_path) in block.text
+            for block in out[0].content
+            if isinstance(block, ContentBlockText)
+        )
+    else:
+        assert not scratch.exists()
+
+
+@pytest.mark.parametrize("preserve_image", [True, False])
+def test_disabling_persistence_does_not_copy_or_remove_existing_history_images(
+    tmp_path: Path, preserve_image: bool,
+) -> None:
+    from opensquilla.attachment_refs import write_transcript_material
+
+    media_root = tmp_path / "media"
+    workspace = tmp_path / "workspace"
+    sha, material_path, _ = write_transcript_material(
+        media_root=media_root, session_id="session-a", payload=b"old image",
+    )
+    envelope = json.dumps({"text": "old message", "attachments": [
+        {"type": "image/png", "name": "old.png", "size": 9, "sha256_ref": sha},
+        {"type": "text/plain", "name": "note.txt", "data": _b64(b"old text")},
+    ]})
+    out = TurnRunner._maybe_unpack_attachments(
+        envelope, preserve_image_attachments=preserve_image,
+        materialize_historical_attachments=True, media_root=media_root,
+        workspace_dir=workspace, session_id="session-a", persist_image_material=False,
+    )
+    assert not list(workspace.rglob("*.png"))
+    assert material_path.read_bytes() == b"old image"
+    assert next(workspace.rglob("*.txt")).read_bytes() == b"old text"
+    if preserve_image:
+        assert any(isinstance(block, ContentBlockImage) for block in out)
+    else:
+        assert "historical attachment omitted: old.png" in out

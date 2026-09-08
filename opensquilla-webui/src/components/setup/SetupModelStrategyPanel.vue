@@ -107,7 +107,7 @@ const emit = defineEmits<{
   updateFixedModel: [value: string]
   updateRouterDefaultTier: [value: string]
   updateRouterVisualMode: [value: string]
-  updateTierField: [name: string, key: 'provider' | 'model' | 'thinkingLevel' | 'supportsImage' | 'ensembleEnabled' | 'ensembleSelectionMode', value: string | boolean]
+  updateTierField: [name: string, key: 'provider' | 'model' | 'thinkingLevel' | 'ensembleEnabled' | 'ensembleSelectionMode', value: string | boolean]
   updateEnsembleScheme: [value: 'preset' | 'custom']
   addEnsembleCandidate: [provider: string, model: string, role: EnsembleCandidateRole]
   removeEnsembleCandidate: [candidate: EnsembleCandidateView]
@@ -825,6 +825,9 @@ function credentialLabel(candidate: EnsembleCandidateView): string {
           @update-tier-field="(name, key, value) => emit('updateTierField', name, key, value)"
           @migrate-legacy-ensemble="emit('migrateEnsembleLegacy')"
         />
+        <p class="control-section__desc" data-testid="router-image-capability-hint">
+          {{ t('setup.router.imageCapabilityAutomatic') }}
+        </p>
 
         <details
           class="setup-model-strategy__runtime setup-model-strategy__advanced"

@@ -21,7 +21,7 @@ export function encodeRouterShape(shape: RouterShape): string {
     enabled: shape.enabled === true,
     slots: shape.slots,
     models: shape.models,
-    configs: shape.configs,
+    configs: asTierConfigRecord(shape.configs),
   })
 }
 
@@ -80,7 +80,6 @@ function asTierConfigRecord(value: unknown): Record<string, ChatRouterTierConfig
     if (!isRecord(val)) return null
     out[key] = {
       model: typeof val.model === 'string' ? val.model : '',
-      supportsImage: val.supportsImage === true,
       imageOnly: val.imageOnly === true,
       ...(typeof val.ensembleEnabled === 'boolean'
         ? { ensembleEnabled: val.ensembleEnabled }

@@ -3277,11 +3277,17 @@ def test_desktop_orphan_recovery_has_a_real_electron_process_flow() -> None:
     assert "'orphan Desktop Gateway ownership verification'" in script
     assert "electronChildCleanup.remainingMs('verify-orphan-survived')" in script
     assert "await launchDesktop(" in script
-    assert "loaded.record.pid === firstRecord.pid" in script
+    assert "sameDesktopGatewayOwnershipInstance(loaded.record, firstRecord)" in script
     assert "verifyDesktopGatewayOwnership(loaded.record)" in script
     assert "'verified replacement Desktop Gateway ownership record'" in script
     assert "process.kill(secondRecord.pid, 'SIGKILL')" in script
-    assert "loaded.record.pid === secondRecord.pid" in script
+    assert "sameDesktopGatewayOwnershipInstance(loaded.record, secondRecord)" in script
+    assert "assert.notEqual(secondRecord.instance_nonce, firstRecord.instance_nonce)" in script
+    assert "assert.notEqual(thirdRecord.instance_nonce, secondRecord.instance_nonce)" in script
+    assert "return !gatewayProcessSnapshot(firstRecord).alive" in script
+    assert "return !gatewayProcessSnapshot(secondRecord).alive" in script
+    assert "function processAlive(pid)" not in script
+    assert "gatewayProcesses: ownedInstances.map" in script
     assert "assert.equal(thirdRecord.port, secondRecord.port)" in script
     assert "assert.equal(secondPage.url(), rendererUrlBeforeCrash)" in script
     assert "'renderer-observed-child-crash'" in script
@@ -3306,7 +3312,7 @@ def test_desktop_orphan_recovery_has_a_real_electron_process_flow() -> None:
     assert "closeElectronWithDeadline" in script
     assert "desktopShutdownEvidenceSince" in script
     assert "canAcceptWindowsElectronShutdownFallback" in script
-    assert "ownershipReleased && !processAlive(thirdRecord.pid)" in script
+    assert "ownershipReleased && !gatewayProcessSnapshot(thirdRecord).alive" in script
     assert "'successful-electron-shutdown'" in script
     assert "'finally-second-electron-shutdown'" in script
     assert "'finally-first-electron-shutdown'" in script

@@ -65,8 +65,11 @@ def _tier_payload(tier: dict[str, Any]) -> dict[str, Any]:
         "model": tier.get("model", ""),
         "description": tier.get("description", ""),
         "thinkingLevel": tier.get("thinking_level", ""),
-        "supportsImage": bool(tier.get("supports_image", False)),
     }
+    if "supports_image" in tier:
+        payload["supportsImage"] = bool(tier.get("supports_image"))
+    elif "supportsImage" in tier:
+        payload["supportsImage"] = bool(tier.get("supportsImage"))
     ensemble_enabled = tier.get("ensemble_enabled", tier.get("ensembleEnabled"))
     if isinstance(ensemble_enabled, bool):
         payload["ensembleEnabled"] = ensemble_enabled
