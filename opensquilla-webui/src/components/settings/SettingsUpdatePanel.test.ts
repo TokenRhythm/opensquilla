@@ -132,4 +132,57 @@ describe('SettingsUpdatePanel', () => {
     expect(el.querySelector('[data-testid="settings-update-relaunch"]')).toBeNull()
     app.unmount()
   })
+
+  it('offers installation as the primary Windows action while keeping installer reveal available', async () => {
+    const api = desktopUpdateApi({
+      status: 'downloaded', canNativeInstall: false, canInstall: true, installMode: 'manual',
+    }, {
+      isAutoUpdateEnabled: async () => false,
+      relaunchToUpdate: vi.fn(async () => ({
+        status: 'applying', canCheck: true, canNativeInstall: false, canInstall: false, installMode: 'manual',
+      })),
+    })
+    const { app, el } = await mountPanel(api)
+    const install = el.querySelector('[data-testid="settings-update-relaunch"]') as HTMLButtonElement
+    const reveal = el.querySelector('[data-testid="settings-update-download"]') as HTMLButtonElement
+    expect(install.textContent).toContain('Quit and install')
+    expect(install.classList.contains('btn--primary')).toBe(true)
+    expect(reveal.textContent).toContain('Show installer')
+    expect(reveal.classList.contains('btn--ghost')).toBe(true)
+    expect(el.textContent).not.toContain('shown in its folder')
+    expect(api.relaunchToUpdate).not.toHaveBeenCalled()
+    install.click()
+    await settle()
+    expect(api.relaunchToUpdate).toHaveBeenCalledTimes(1)
+    expect(el.textContent).toContain('Closing background services')
+    expect(el.textContent).toContain('installer will open when they have stopped')
+    expect(el.querySelector('[data-testid="settings-update-relaunch"]')).toBeNull()
+    expect(el.querySelector('[data-testid="settings-update-download"]')).toBeNull()
+    expect((el.querySelector('button') as HTMLButtonElement).disabled).toBe(true)
+    app.unmount()
+  })
+
+  it('does not install when an explicit shell permission is false', async () => {
+    const api = desktopUpdateApi({ status: 'downloaded', canInstall: false })
+    const { app, el } = await mountPanel(api)
+    expect(el.querySelector('[data-testid="settings-update-relaunch"]')).toBeNull()
+    expect(api.relaunchToUpdate).not.toHaveBeenCalled()
+    app.unmount()
+  })
+
+  it.each([
+    ['Close the other installed copy of OpenSquilla and retry.', 'Close the other installed copy of OpenSquilla and retry.'],
+    [null, 'could not prepare or open the installer'],
+  ])('retains a downloaded installer and presents its handoff recovery instruction (%s)', async (error, expected) => {
+    const api = desktopUpdateApi({
+      status: 'downloaded', canNativeInstall: false, canInstall: true, installMode: 'manual',
+      errorCode: 'install_failed', error,
+    }, { isAutoUpdateEnabled: async () => false })
+    const { app, el } = await mountPanel(api)
+    expect(el.textContent).toContain('Needs attention')
+    expect(el.textContent).toContain(expected)
+    expect(el.querySelector('[data-testid="settings-update-relaunch"]')).not.toBeNull()
+    expect(el.querySelector('[data-testid="settings-update-download"]')).not.toBeNull()
+    app.unmount()
+  })
 })

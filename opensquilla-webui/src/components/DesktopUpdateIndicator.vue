@@ -21,6 +21,7 @@ onMounted(update.init)
 const {
   status,
   manualInstall,
+  canDownload,
   canInstall,
   busy,
   indicatorLabel,
@@ -120,7 +121,7 @@ useDocumentEvent('keydown', event => {
         <p class="desktop-update__desc">{{ description }}</p>
         <div class="desktop-update__actions">
           <button
-            v-if="status === 'available' && canInstall"
+            v-if="status === 'available' && canDownload"
             type="button"
             class="btn btn--primary"
             data-testid="desktop-update-download"
@@ -131,7 +132,7 @@ useDocumentEvent('keydown', event => {
             <span>{{ manualInstall ? t('updates.desktop.downloadInstaller') : t('updates.desktop.download') }}</span>
           </button>
           <button
-            v-if="status === 'downloaded' && update.state.value.installMode === 'native'"
+            v-if="status === 'downloaded' && canInstall"
             type="button"
             class="btn btn--primary"
             data-testid="desktop-update-relaunch"
@@ -139,12 +140,13 @@ useDocumentEvent('keydown', event => {
             @click="relaunch"
           >
             <Icon name="refresh" :size="14" aria-hidden="true" />
-            <span>{{ t('updates.desktop.relaunch') }}</span>
+            <span>{{ t(manualInstall ? 'updates.desktop.quitAndInstall' : 'updates.desktop.relaunch') }}</span>
           </button>
           <button
             v-if="status === 'downloaded' && manualInstall"
             type="button"
-            class="btn btn--primary"
+            class="btn"
+            :class="canInstall ? 'btn--ghost' : 'btn--primary'"
             data-testid="desktop-update-show-installer"
             :disabled="busy"
             @click="download"

@@ -88,6 +88,16 @@ import {
   streamResponseToVerifiedFile,
 } from './update-verification.js'
 import { isUpdateCheckAllowed, UpdateCheckScheduler } from './update-check-scheduler.js'
+import { WindowsUpdateSecurityError } from './windows-update-security.js'
+import {
+  createWindowsUpdateCacheDescriptor,
+  loadWindowsUpdateCache,
+  saveWindowsUpdateCache,
+  verifyCachedInstaller,
+  type WindowsUpdateCacheDescriptor,
+} from './windows-update-cache.js'
+import { assertUnambiguousWindowsInstallation, launchWindowsInstaller, WindowsUpdateHandoffError } from './windows-update-handoff.js'
+import { WindowsUpdateCoordinator, WindowsUpdatePreparationError } from './windows-update-coordinator.js'
 import {
   canRevealDesktopApp,
   defaultDesktopPreferences,
@@ -3454,9 +3464,14 @@ const DESKTOP_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
     'update.manifestInvalid': 'The update information is invalid. Please try again later.',
     'update.sourceUnavailable': 'The update service is temporarily unavailable. Please try again later.',
     'update.checksumUnavailable': 'The installer cannot be verified because the official checksum is unavailable. No installer was opened.',
-    'update.integrityFailed': 'The downloaded installer failed integrity verification and was deleted.',
+    'update.integrityFailed': 'The installer failed integrity verification. Download the update again.',
     'update.downloadFailed': 'The update could not be downloaded. Please try again.',
     'update.installFailed': 'The update installer could not be opened. Please try again.',
+    'update.quitAndInstall': 'Quit and install',
+    'update.signatureInvalid': 'The installer signature does not match OpenSquilla. Download it again from the official release.',
+    'update.signatureUnavailable': 'Windows could not verify the installer signature. Try again; no installer was started.',
+    'update.installationAmbiguous': 'The current installation could not be identified uniquely. Use Show installer to select it in the installation wizard.',
+    'update.writersBusy': 'OpenSquilla is still saving changes. Let it finish, then try installing again.',
     'update.moveToApplications': 'Move OpenSquilla to your Applications folder to enable automatic updates, then try again.',
     'update.gatewayShutdownTimeout': 'OpenSquilla could not stop the local runtime. Try relaunching to update again.',
     'update.mockInstallTitle': 'Mock update restart',
@@ -3586,9 +3601,14 @@ const DESKTOP_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
     'update.manifestInvalid': '更新信息无效，请稍后重试。',
     'update.sourceUnavailable': '更新服务暂时不可用，请稍后重试。',
     'update.checksumUnavailable': '无法获取官方校验和，因此不能验证安装包；未打开任何安装包。',
-    'update.integrityFailed': '下载的安装包未通过完整性校验，已将其删除。',
+    'update.integrityFailed': '安装包未通过完整性校验。请重新下载更新。',
     'update.downloadFailed': '更新下载安装失败，请重试。',
     'update.installFailed': '无法打开更新安装包，请重试。',
+    'update.quitAndInstall': '退出并安装',
+    'update.signatureInvalid': '安装包签名与 OpenSquilla 不符，请从官方发布重新下载。',
+    'update.signatureUnavailable': 'Windows 暂时无法验证安装包签名，请重试；尚未启动安装程序。',
+    'update.installationAmbiguous': '无法唯一确定当前安装位置，请点击“显示安装包”并在安装向导中选择。',
+    'update.writersBusy': 'OpenSquilla 仍在保存更改，请等待完成后再次安装。',
     'update.moveToApplications': '请先将 OpenSquilla 移动到"应用程序"文件夹以启用自动更新，然后重试。',
     'update.gatewayShutdownTimeout': 'OpenSquilla 无法停止本地运行时。请再次尝试重启以更新。',
     'update.mockInstallTitle': '模拟重启更新',
@@ -3718,9 +3738,14 @@ const DESKTOP_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
     'update.manifestInvalid': 'アップデート情報が無効です。しばらくしてから再試行してください。',
     'update.sourceUnavailable': 'アップデートサービスを一時的に利用できません。後でもう一度お試しください。',
     'update.checksumUnavailable': '正規のチェックサムを取得できないため、インストーラを検証できません。インストーラは開かれていません。',
-    'update.integrityFailed': 'ダウンロードしたインストーラは整合性検証に失敗したため削除されました。',
+    'update.integrityFailed': 'インストーラーの整合性を確認できませんでした。更新を再ダウンロードしてください。',
     'update.downloadFailed': 'アップデートをダウンロードできませんでした。もう一度お試しください。',
     'update.installFailed': 'アップデートインストーラを開けませんでした。もう一度お試しください。',
+    'update.quitAndInstall': '終了してインストール',
+    'update.signatureInvalid': 'インストーラの署名が OpenSquilla と一致しません。公式リリースから再ダウンロードしてください。',
+    'update.signatureUnavailable': 'Windows が署名を検証できませんでした。再試行してください。インストーラは起動していません。',
+    'update.installationAmbiguous': '現在のインストール先を特定できません。「インストーラを表示」からウィザードで選択してください。',
+    'update.writersBusy': '変更を保存中です。完了後にインストールを再試行してください。',
     'update.moveToApplications': '自動アップデートを有効にするには、OpenSquilla を「アプリケーション」フォルダに移動してから再試行してください。',
     'update.gatewayShutdownTimeout': 'ローカルランタイムを停止できませんでした。もう一度、再起動してアップデートをお試しください。',
     'uninstall.confirmTitle': 'ローカルの OpenSquilla デスクトップデータを削除しますか？',
@@ -3848,9 +3873,14 @@ const DESKTOP_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
     'update.manifestInvalid': 'Les informations de mise à jour sont invalides. Réessayez plus tard.',
     'update.sourceUnavailable': 'Le service de mise à jour est temporairement indisponible. Réessayez plus tard.',
     'update.checksumUnavailable': 'Le programme d’installation ne peut pas être vérifié car la somme de contrôle officielle est indisponible. Aucun programme n’a été ouvert.',
-    'update.integrityFailed': 'Le programme d’installation téléchargé a échoué au contrôle d’intégrité et a été supprimé.',
+    'update.integrityFailed': 'Le programme d’installation a échoué au contrôle d’intégrité. Téléchargez à nouveau la mise à jour.',
     'update.downloadFailed': 'Impossible de télécharger la mise à jour. Réessayez.',
     'update.installFailed': 'Impossible d’ouvrir le programme d’installation. Réessayez.',
+    'update.quitAndInstall': 'Quitter et installer',
+    'update.signatureInvalid': 'La signature ne correspond pas à OpenSquilla. Téléchargez de nouveau la version officielle.',
+    'update.signatureUnavailable': 'Windows ne peut pas vérifier la signature. Réessayez ; le programme d’installation n’a pas été lancé.',
+    'update.installationAmbiguous': 'L’installation actuelle ne peut pas être identifiée. Affichez le programme d’installation pour la sélectionner dans l’assistant.',
+    'update.writersBusy': 'OpenSquilla enregistre encore les modifications. Réessayez après leur enregistrement.',
     'update.moveToApplications': 'Déplacez OpenSquilla dans votre dossier Applications pour activer les mises à jour automatiques, puis réessayez.',
     'update.gatewayShutdownTimeout': 'OpenSquilla n\'a pas pu arrêter le runtime local. Réessayez de relancer la mise à jour.',
     'uninstall.confirmTitle': 'Supprimer les données locales du bureau OpenSquilla ?',
@@ -3978,9 +4008,14 @@ const DESKTOP_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
     'update.manifestInvalid': 'Die Update-Informationen sind ungültig. Versuchen Sie es später erneut.',
     'update.sourceUnavailable': 'Der Update-Dienst ist vorübergehend nicht verfügbar. Versuchen Sie es später erneut.',
     'update.checksumUnavailable': 'Das Installationsprogramm kann nicht geprüft werden, weil die offizielle Prüfsumme nicht verfügbar ist. Es wurde nichts geöffnet.',
-    'update.integrityFailed': 'Das heruntergeladene Installationsprogramm hat die Integritätsprüfung nicht bestanden und wurde gelöscht.',
+    'update.integrityFailed': 'Das Installationsprogramm hat die Integritätsprüfung nicht bestanden. Lade das Update erneut herunter.',
     'update.downloadFailed': 'Das Update konnte nicht heruntergeladen werden. Versuchen Sie es erneut.',
     'update.installFailed': 'Das Update-Installationsprogramm konnte nicht geöffnet werden. Versuchen Sie es erneut.',
+    'update.quitAndInstall': 'Beenden und installieren',
+    'update.signatureInvalid': 'Die Signatur stimmt nicht mit OpenSquilla überein. Laden Sie die offizielle Version erneut herunter.',
+    'update.signatureUnavailable': 'Windows konnte die Signatur nicht prüfen. Versuchen Sie es erneut; die Installation wurde nicht gestartet.',
+    'update.installationAmbiguous': 'Die aktuelle Installation ist nicht eindeutig. Öffnen Sie das Installationsprogramm und wählen Sie sie im Assistenten aus.',
+    'update.writersBusy': 'OpenSquilla speichert noch Änderungen. Versuchen Sie die Installation danach erneut.',
     'update.moveToApplications': 'Verschieben Sie OpenSquilla in Ihren Programme-Ordner, um automatische Updates zu aktivieren, und versuchen Sie es erneut.',
     'update.gatewayShutdownTimeout': 'OpenSquilla konnte die lokale Laufzeitumgebung nicht stoppen. Versuchen Sie erneut, zum Aktualisieren neu zu starten.',
     'uninstall.confirmTitle': 'Lokale OpenSquilla-Desktop-Daten löschen?',
@@ -4108,9 +4143,14 @@ const DESKTOP_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
     'update.manifestInvalid': 'La información de actualización no es válida. Inténtalo más tarde.',
     'update.sourceUnavailable': 'El servicio de actualizaciones no está disponible temporalmente. Inténtalo más tarde.',
     'update.checksumUnavailable': 'No se puede verificar el instalador porque la suma de comprobación oficial no está disponible. No se abrió ningún instalador.',
-    'update.integrityFailed': 'El instalador descargado no superó la verificación de integridad y se eliminó.',
+    'update.integrityFailed': 'El instalador no superó la verificación de integridad. Descarga la actualización de nuevo.',
     'update.downloadFailed': 'No se pudo descargar la actualización. Inténtalo de nuevo.',
     'update.installFailed': 'No se pudo abrir el instalador de la actualización. Inténtalo de nuevo.',
+    'update.quitAndInstall': 'Salir e instalar',
+    'update.signatureInvalid': 'La firma no coincide con OpenSquilla. Descarga de nuevo la versión oficial.',
+    'update.signatureUnavailable': 'Windows no pudo verificar la firma. Inténtalo de nuevo; el instalador no se ha iniciado.',
+    'update.installationAmbiguous': 'No se pudo identificar la instalación actual. Muestra el instalador y selecciónala en el asistente.',
+    'update.writersBusy': 'OpenSquilla sigue guardando los cambios. Espera a que termine e intenta instalar de nuevo.',
     'update.moveToApplications': 'Mueve OpenSquilla a tu carpeta de Aplicaciones para habilitar las actualizaciones automáticas e inténtalo de nuevo.',
     'update.gatewayShutdownTimeout': 'OpenSquilla no pudo detener el runtime local. Intenta reiniciar para actualizar de nuevo.',
     'uninstall.confirmTitle': '¿Eliminar los datos locales de escritorio de OpenSquilla?',
@@ -4516,10 +4556,11 @@ function createApplicationMenu(): void {
   const appSubmenu: Electron.MenuItemConstructorOptions[] = [{ role: 'about' }]
   if (desktopUpdateMenuEnabled()) {
     appSubmenu.push({ type: 'separator' })
-    if (downloadedUpdateVersion !== null) {
+    if (downloadedUpdateVersion !== null || (windowsInstallerActionsSupported() && verifiedManualInstallerPath !== null)) {
       appSubmenu.push(
         {
-          label: desktopT('menu.relaunchToUpdate'),
+          label: windowsInstallerActionsSupported() ? desktopT('update.quitAndInstall') : desktopT('menu.relaunchToUpdate'),
+          enabled: !updateApplying && !manualInstallerActionInProgress,
           click: () => {
             void applyDownloadedUpdate()
           },
@@ -9718,7 +9759,9 @@ function stopGateway(): void {
 // latest-mac.yml feed that Squirrel.Mac consumes, so in-place auto-update is
 // safe. Windows keeps explicit manual installation even when an installer has
 // an Authenticode signature: the shell discovers and reveals the exact
-// versioned NSIS installer. OPENSQUILLA_DESKTOP_ENABLE_WIN_UPDATE=1 opts in to native
+// versioned NSIS installer. OPENSQUILLA_DESKTOP_ENABLE_WIN_INSTALL=1 enables the
+// signed full-installer handoff while its release gates are being rehearsed.
+// OPENSQUILLA_DESKTOP_ENABLE_WIN_UPDATE=1 opts in to native
 // Windows updating for local tests only; OPENSQUILLA_DESKTOP_DISABLE_AUTO_UPDATE
 // disables all shell-managed discovery.
 const { autoUpdater } = electronUpdater
@@ -9729,11 +9772,16 @@ let manualInstallerActionInProgress = false
 let updateApplying = false
 // A user/system quit that arrives while an update is still draining writers or
 // the gateway is deferred until that phase either fails safely or reaches the
-// updater-owned handoff. Only quitAndInstall may set handoff ready.
+// updater-owned handoff. A verified Windows installer spawn may also commit it.
 let updateInstallHandoffReady = false
 let quitRequestedDuringUpdateDrain = false
 let downloadedUpdateVersion: string | null = null
 let verifiedManualInstallerPath: string | null = null
+let windowsUpdateCacheDescriptor: WindowsUpdateCacheDescriptor | null = null
+let windowsUpdateCacheRestore: Promise<void> | null = null
+let windowsUpdateCacheRestoreAttempted = false
+const windowsUpdateCoordinator = new WindowsUpdateCoordinator()
+let windowsUpdateRecoveryGeneration = 0
 let updateGatewayShutdownProcess: ChildProcessWithoutNullStreams | null = null
 let mockDownloadedUpdate = false
 let mockUpdatePromptActive = false
@@ -9760,6 +9808,8 @@ type DesktopUpdateErrorCode =
   | 'integrity_failed'
   | 'download_failed'
   | 'install_failed'
+  | 'signature_invalid'
+  | 'signature_unavailable'
   | null
 
 interface DesktopUpdateState {
@@ -9773,6 +9823,7 @@ interface DesktopUpdateState {
   snoozedUntil: string | null
   canCheck: boolean
   canNativeInstall: boolean
+  canInstall?: boolean
   installMode: DesktopUpdateInstallMode
   releaseUrl: string | null
   source: DesktopUpdateSource | null
@@ -9932,6 +9983,89 @@ function desktopUpdateInstallMode(): DesktopUpdateInstallMode {
   return 'unsupported'
 }
 
+function windowsInstallerActionsSupported(): boolean {
+  // Default stays off until the signed A-to-B native installation matrix passes.
+  return process.platform === 'win32' && process.arch === 'x64'
+    && desktopUpdateManaged() && desktopUpdateInstallMode() === 'manual'
+    && process.env.OPENSQUILLA_DESKTOP_ENABLE_WIN_INSTALL === '1'
+}
+
+function windowsUpdateDownloadDirectory(): string {
+  return join(app.getPath('userData'), 'update-downloads')
+}
+
+async function clearWindowsUpdateCache(): Promise<void> {
+  windowsUpdateCacheDescriptor = null
+  verifiedManualInstallerPath = null
+  createApplicationMenu()
+  await saveWindowsUpdateCache(windowsUpdateDownloadDirectory(), null)
+}
+
+function publishVerifiedWindowsInstaller(
+  verified: { path: string; descriptor: WindowsUpdateCacheDescriptor; candidate: DesktopUpdateCandidate },
+  source: DesktopUpdateSource,
+  fallbackUsed = false,
+): void {
+  windowsUpdateCacheDescriptor = verified.descriptor
+  verifiedManualInstallerPath = verified.path
+  desktopUpdateCandidate = verified.candidate
+  setDesktopUpdateState({
+    status: 'downloaded', latestVersion: verified.candidate.version, progress: 100,
+    releaseUrl: updateAssetUrl(verified.candidate, source), source, fallbackUsed,
+    error: null, errorCode: null,
+  })
+  createApplicationMenu()
+}
+
+async function restoreWindowsUpdateCache(forceRetry = false): Promise<void> {
+  if (windowsUpdateCacheRestore) return windowsUpdateCacheRestore
+  if (forceRetry && !verifiedManualInstallerPath) windowsUpdateCacheRestoreAttempted = false
+  if (windowsUpdateCacheRestoreAttempted || process.platform !== 'win32'
+    || !desktopUpdateManaged() || desktopUpdateInstallMode() !== 'manual'
+    || isQuitting || updateApplying || desktopWriters.closed) return
+  windowsUpdateCacheRestoreAttempted = true
+  windowsUpdateCacheRestore = (async () => {
+    try {
+      loadDesktopUpdatePersistence()
+      const descriptor = await loadWindowsUpdateCache(windowsUpdateDownloadDirectory())
+      if (!descriptor) return
+      windowsUpdateCacheDescriptor = descriptor
+      const verified = await verifyCachedInstaller(windowsUpdateDownloadDirectory(), descriptor, app.getVersion())
+      if (!verified) {
+        await clearWindowsUpdateCache()
+        return
+      }
+      // A concurrent Quit/migration owns its state; never reopen actions under it.
+      if (isQuitting || updateApplying || desktopWriters.closed) {
+        windowsUpdateCacheRestoreAttempted = false
+        return
+      }
+      publishVerifiedWindowsInstaller(verified, lastSuccessfulUpdateSource ?? 'oss')
+      desktopLog('update_windows_cache_restored', { version: verified.candidate.version })
+    } catch (error) {
+      if (error instanceof WindowsUpdateSecurityError && error.code === 'signature_invalid') {
+        await clearWindowsUpdateCache().catch(() => {})
+      }
+      desktopLog('update_windows_cache_unavailable', { error: String(error) })
+      // Retain a cache whose verification tool is temporarily unavailable.
+      // An explicit Download can retry the verification without fetching bytes.
+      if (forceRetry) throw error
+    }
+  })().finally(() => { windowsUpdateCacheRestore = null })
+  return windowsUpdateCacheRestore
+}
+
+async function revalidateReadyWindowsInstaller(): Promise<string> {
+  const verified = await verifyCachedInstaller(
+    windowsUpdateDownloadDirectory(), windowsUpdateCacheDescriptor, app.getVersion(),
+    { expectedCandidate: desktopUpdateCandidate ?? undefined },
+  )
+  if (!verified || verified.path !== verifiedManualInstallerPath) {
+    throw new UpdateChannelError('integrity_failed', 'The downloaded Windows installer is no longer valid.')
+  }
+  return verified.path
+}
+
 function desktopUpdateStatePath(): string {
   // Update availability is application-global and may be read before profile
   // inspection, so it must never resolve through an untrusted selected H.
@@ -10019,6 +10153,7 @@ function desktopUpdateSnapshot(): DesktopUpdateState {
     snoozedUntil: activeDesktopUpdateSnoozeFor(latestVersion),
     canCheck: desktopUpdateManaged() || mockUpdateVersion() !== null,
     canNativeInstall: installMode === 'native',
+    canInstall: installMode === 'native' || windowsInstallerActionsSupported(),
     installMode,
     releaseUrl: desktopUpdateReleaseUrl,
     source: desktopUpdateSource,
@@ -10113,6 +10248,8 @@ function showUpdateDialog(
 }
 
 function classifyDesktopUpdateError(err: unknown): Exclude<DesktopUpdateErrorCode, null> {
+  if (err instanceof WindowsUpdateSecurityError) return err.code
+  if (err instanceof WindowsUpdateHandoffError) return 'install_failed'
   if (err instanceof UpdateChannelError) {
     if (err.code === 'manifest_invalid' || err.code === 'current_version_invalid') return 'manifest_invalid'
     if (err.code === 'checksum_unavailable') return 'checksum_unavailable'
@@ -10125,6 +10262,8 @@ function classifyDesktopUpdateError(err: unknown): Exclude<DesktopUpdateErrorCod
 }
 
 function desktopUpdateErrorMessage(code: Exclude<DesktopUpdateErrorCode, null>): string {
+  if (code === 'signature_invalid') return desktopT('update.signatureInvalid')
+  if (code === 'signature_unavailable') return desktopT('update.signatureUnavailable')
   if (code === 'manifest_invalid') return desktopT('update.manifestInvalid')
   if (code === 'checksum_unavailable') return desktopT('update.checksumUnavailable')
   if (code === 'integrity_failed') return desktopT('update.integrityFailed')
@@ -10203,21 +10342,36 @@ async function runMockUpdateFlow(version: string): Promise<void> {
 }
 
 async function downloadDesktopUpdate(): Promise<DesktopUpdateState> {
+  try {
+    await restoreWindowsUpdateCache(true)
+  } catch (error) {
+    const errorCode = classifyDesktopUpdateError(error)
+    return setDesktopUpdateState({ status: 'error', errorCode, error: desktopUpdateErrorMessage(errorCode) })
+  }
+  if (isQuitting || desktopWriters.closed || updateApplying || manualInstallerActionInProgress) return desktopUpdateSnapshot()
   if (
     desktopUpdateInstallMode() === 'manual'
     && desktopUpdateStatus === 'downloaded'
     && verifiedManualInstallerPath
   ) {
+    manualInstallerActionInProgress = true
     try {
+      await revalidateReadyWindowsInstaller()
       shell.showItemInFolder(verifiedManualInstallerPath)
     } catch (err) {
+      const errorCode = classifyDesktopUpdateError(err)
+      if (errorCode === 'integrity_failed' || errorCode === 'signature_invalid') {
+        await clearWindowsUpdateCache().catch(() => {})
+      }
       console.error('[updater] failed to reveal verified manual installer', err)
       return setDesktopUpdateState({
         status: 'error',
         progress: null,
-        error: desktopUpdateErrorMessage('install_failed'),
-        errorCode: 'install_failed',
+        error: desktopUpdateErrorMessage(errorCode),
+        errorCode,
       })
+    } finally {
+      manualInstallerActionInProgress = false
     }
     return desktopUpdateSnapshot()
   }
@@ -10261,9 +10415,19 @@ async function downloadDesktopUpdate(): Promise<DesktopUpdateState> {
       if (desktopUpdateStatus === 'checking') await checkForUpdates(true)
       if (!desktopUpdateCandidate) await checkForUpdates(true)
       const candidate = desktopUpdateCandidate
-      if (!candidate || desktopUpdateStatus !== 'available') return desktopUpdateSnapshot()
+      if (!candidate || !['available', 'error'].includes(desktopUpdateStatus)) return desktopUpdateSnapshot()
       updateDownloadInProgress = true
       verifiedManualInstallerPath = null
+
+      // Recover a previously completed download before probing or fetching bytes.
+      const cached = await verifyCachedInstaller(
+        windowsUpdateDownloadDirectory(), windowsUpdateCacheDescriptor, app.getVersion(),
+        { expectedCandidate: candidate },
+      )
+      if (cached) {
+        publishVerifiedWindowsInstaller(cached, desktopUpdateSource ?? lastSuccessfulUpdateSource ?? 'oss')
+        return desktopUpdateSnapshot()
+      }
 
       let chosen: { source: DesktopUpdateSource; fallbackUsed: boolean }
       try {
@@ -10292,37 +10456,44 @@ async function downloadDesktopUpdate(): Promise<DesktopUpdateState> {
       })
       try {
         const expectedSha256 = await fetchCanonicalWindowsInstallerDigest(candidate)
-        const verified = await downloadVerifiedWindowsInstallerWithFallback(
+        const downloaded = await downloadVerifiedWindowsInstallerWithFallback(
           candidate,
           chosen,
           expectedSha256,
         )
-        verifiedManualInstallerPath = verified.path
-        rememberSuccessfulUpdateSource(verified.source)
-        setDesktopUpdateState({
-          status: 'downloaded',
-          latestVersion: candidate.version,
-          progress: 100,
-          checkedAt: new Date().toISOString(),
-          releaseUrl: updateAssetUrl(candidate, verified.source),
-          source: verified.source,
-          fallbackUsed: verified.fallbackUsed,
-          error: null,
-          errorCode: null,
-        })
-        try {
-          shell.showItemInFolder(verified.path)
-        } catch (err) {
-          throw new UpdateChannelError(
-            'install_failed',
-            `The verified installer could not be shown: ${String(err instanceof Error ? err.message : err)}`,
-          )
+        windowsUpdateCacheDescriptor = createWindowsUpdateCacheDescriptor(
+          candidate, expectedSha256, (await stat(downloaded.path)).size,
+        )
+        // The completed SHA-checked download can survive a temporarily
+        // unavailable OS verifier. Metadata alone never makes it installable.
+        await saveWindowsUpdateCache(windowsUpdateDownloadDirectory(), windowsUpdateCacheDescriptor)
+        const verified = await verifyCachedInstaller(
+          windowsUpdateDownloadDirectory(), windowsUpdateCacheDescriptor, app.getVersion(),
+          { expectedCandidate: candidate, expectedSha256 },
+        )
+        if (!verified) {
+          throw new UpdateChannelError('integrity_failed', 'The downloaded Windows installer is no longer valid.')
         }
+        // Use the same canonical path for first download, restart restoration,
+        // and install-time identity checks, including userData ancestor junctions.
+        rememberSuccessfulUpdateSource(downloaded.source)
+        setDesktopUpdateState({ checkedAt: new Date().toISOString() })
+        publishVerifiedWindowsInstaller(verified, downloaded.source, downloaded.fallbackUsed)
       } catch (err) {
         console.error('[updater] failed to prepare verified manual installer', err)
+        const errorCode = classifyDesktopUpdateError(err)
+        if (errorCode === 'integrity_failed' || errorCode === 'signature_invalid') {
+          await clearWindowsUpdateCache().catch(() => {})
+        }
         showUpdateError(err)
         return desktopUpdateSnapshot()
       }
+      return desktopUpdateSnapshot()
+    } catch (err) {
+      if (err instanceof WindowsUpdateSecurityError && err.code === 'signature_invalid') {
+        await clearWindowsUpdateCache().catch(() => {})
+      }
+      showUpdateError(err)
       return desktopUpdateSnapshot()
     } finally {
       updateDownloadInProgress = false
@@ -10966,13 +11137,19 @@ async function downloadNativeDesktopUpdateWithFallback(): Promise<void> {
 
 function desktopUpdateCheckAllowed(): boolean {
   return isUpdateCheckAllowed({
-    downloading: updateDownloadInProgress || (manualInstallerActionInProgress && desktopUpdateCandidate !== null),
+    downloading: updateDownloadInProgress || windowsUpdateCacheRestore !== null || (manualInstallerActionInProgress && desktopUpdateCandidate !== null),
     applying: updateApplying,
     downloaded: downloadedUpdateVersion !== null || desktopUpdateStatus === 'downloaded',
   })
 }
 
 async function runDesktopUpdateCheck(): Promise<void> {
+  try {
+    await restoreWindowsUpdateCache(desktopUpdateCheckScheduler.manualRequestPending)
+  } catch (error) {
+    showUpdateError(error)
+    return
+  }
   // Keep this defensive guard even though the scheduler checks the same state:
   // download/apply events can change it between admission and execution.
   if (!desktopUpdateCheckAllowed()) return
@@ -11121,7 +11298,7 @@ function restoreDownloadedUpdateRetryState(
   writerAdmissionToken: symbol | null = null,
 ): boolean {
   if (writerAdmissionToken) desktopWriters.reopen(writerAdmissionToken)
-  downloadedUpdateVersion = pendingVersion
+  if (desktopUpdateInstallMode() !== 'manual') downloadedUpdateVersion = pendingVersion
   updateApplying = false
   updateInstallHandoffReady = false
   isQuitting = false
@@ -11139,11 +11316,130 @@ function restoreDownloadedUpdateRetryState(
   return true
 }
 
+async function stopOwnedGatewaysForUpdate(): Promise<boolean> {
+  return await stopAndJoinAllLifecycleOwnedGateways((child) => {
+    updateGatewayShutdownProcess = child
+    allowGracefulShutdownWhileQuitting = true
+    try {
+      stopGateway()
+    } finally {
+      allowGracefulShutdownWhileQuitting = false
+    }
+  })
+}
+
+async function applyWindowsInstaller(): Promise<void> {
+  await restoreWindowsUpdateCache()
+  const candidate = desktopUpdateCandidate
+  if (!candidate || desktopUpdateStatus !== 'downloaded' || !verifiedManualInstallerPath) return
+  let writerAdmissionToken: symbol | null = null
+  let installerPath = ''
+  const previouslyOwned = liveLifecycleOwnedGatewayProcesses().length > 0
+  const profileKey = desktopProfileKey()
+  let recoveryGeneration = 0
+  const assertCanHandoff = () => {
+    if (liveLifecycleOwnedGatewayProcesses().length > 0 || !writerAdmissionToken
+      || desktopWriters.hasOtherOwner(writerAdmissionToken) || desktopWriters.activeCount !== 0) {
+      throw new Error('The desktop is still busy; the Windows installer was not started.')
+    }
+  }
+  await windowsUpdateCoordinator.run({
+    canStart: () => windowsInstallerActionsSupported() && !isQuitting && appExitPhase === 'running'
+      && !updateApplying && !updateDownloadInProgress && !manualInstallerActionInProgress && !desktopWriters.closed,
+    started: () => {
+      recoveryGeneration = ++windowsUpdateRecoveryGeneration
+      updateApplying = true
+      setAppExitPhase('deferred', 'verifying Windows update before installation')
+      setDesktopUpdateState({ status: 'applying', error: null, errorCode: null })
+      createApplicationMenu()
+    },
+    verify: async () => {
+      installerPath = await revalidateReadyWindowsInstaller()
+      await assertUnambiguousWindowsInstallation(app.getPath('exe'))
+    },
+    closeWriters: () => {
+      if (desktopWriters.closed || isQuitting || desktopUpdateCandidate !== candidate) {
+        throw new Error('Another desktop operation superseded the Windows update.')
+      }
+      writerAdmissionToken = desktopWriters.close('apply signed Windows installer')
+    },
+    waitForWriters: async (signal) => desktopWriters.waitForAtMost(0, signal),
+    stopGateways: async () => {
+      isQuitting = true
+      setAppExitPhase('draining', 'stopping Gateway for Windows installer')
+      return await stopOwnedGatewaysForUpdate()
+    },
+    assertCanHandoff,
+    launchInstaller: async () => {
+      // Draining can take time. Recheck the actual bytes immediately before
+      // execution as well, so a replaced download never reaches NSIS.
+      if (await revalidateReadyWindowsInstaller() !== installerPath) {
+        throw new UpdateChannelError('integrity_failed', 'The installer changed while preparing the update.')
+      }
+      assertCanHandoff()
+      await launchWindowsInstaller(installerPath)
+    },
+    committed: () => {
+      updateGatewayShutdownProcess = null
+      updateInstallHandoffReady = true
+      setAppExitPhase('committed', 'Windows installer process started')
+      desktopLog('update_windows_installer_handoff', { version: candidate.version, tag: candidate.tag })
+      app.quit()
+    },
+    recover: async (error, gatewayStopStarted) => {
+      const errorCode = error instanceof WindowsUpdateSecurityError || error instanceof UpdateChannelError
+        ? classifyDesktopUpdateError(error) : 'install_failed'
+      if (errorCode === 'integrity_failed' || errorCode === 'signature_invalid') {
+        await clearWindowsUpdateCache().catch(() => {})
+      }
+      updateGatewayShutdownProcess = null
+      const foreignLifecycleOwnsExit = writerAdmissionToken
+        ? desktopWriters.hasOtherOwner(writerAdmissionToken) : desktopWriters.closed
+      if (foreignLifecycleOwnsExit) {
+        // Verification yields before we acquire writer admission. A concurrent
+        // recovery/cleanup may win; its exit and ownership state must survive.
+        if (writerAdmissionToken) desktopWriters.reopen(writerAdmissionToken)
+        updateApplying = false
+        setDesktopUpdateState({ status: verifiedManualInstallerPath ? 'downloaded' : 'error',
+          errorCode, error: desktopUpdateErrorMessage(errorCode) })
+        desktopLog('update_windows_superseded', { version: candidate.version })
+        return
+      }
+      const quitResumed = restoreDownloadedUpdateRetryState(candidate.version, writerAdmissionToken)
+      setDesktopUpdateState({
+        status: verifiedManualInstallerPath ? 'downloaded' : 'error',
+        errorCode,
+        error: error instanceof WindowsUpdateHandoffError && error.code === 'installation_ambiguous'
+          ? desktopT('update.installationAmbiguous')
+          : error instanceof WindowsUpdatePreparationError
+            ? desktopT(error.reason === 'writers_busy' ? 'update.writersBusy' : 'update.gatewayShutdownTimeout')
+            : desktopUpdateErrorMessage(errorCode),
+      })
+      desktopLog('update_windows_installer_failed', { version: candidate.version, errorCode, error: String(error) })
+      if (quitResumed || !gatewayStopStarted || !previouslyOwned) return
+      // If termination timed out, wait for these exact children. Never start a
+      // second Gateway or resurrect a profile after another lifecycle action.
+      const resume = () => {
+        if (recoveryGeneration !== windowsUpdateRecoveryGeneration || isQuitting || updateApplying
+          || desktopWriters.closed || appExitPhase !== 'running' || desktopProfileKey() !== profileKey
+          || liveLifecycleOwnedGatewayProcesses().length > 0) return
+        void openOrResumeDesktopApp().catch((resumeError) => {
+          desktopLog('update_windows_gateway_resume_failed', { error: String(resumeError) })
+        })
+      }
+      const stopping = liveLifecycleOwnedGatewayProcesses()
+      if (stopping.length === 0) resume()
+      else for (const child of stopping) child.once('exit', () => setImmediate(resume))
+    },
+  })
+}
+
 // Stop the owned gateway child and WAIT for it to exit before handing control to
 // the installer. The gateway holds the listen port + a PID lock and (on Windows)
 // open file handles under resources/runtime that the installer must overwrite —
 // orphaning it breaks the next launch. Mirrors the uninstall quiesce path.
 async function applyDownloadedUpdate(): Promise<void> {
+  if (windowsInstallerActionsSupported()) return await applyWindowsInstaller()
   if (updateApplying) return
   if (isQuitting || desktopWriters.closed) return
   if (!mockDownloadedUpdate && !downloadedUpdateVersion) return
@@ -11200,17 +11496,7 @@ async function applyDownloadedUpdate(): Promise<void> {
   })
   isQuitting = true
   setAppExitPhase('draining', 'stopping Gateway for downloaded update')
-  const exited = await stopAndJoinAllLifecycleOwnedGateways((child) => {
-    updateGatewayShutdownProcess = child
-    // We stay alive and await the exit below, so let the gateway take its
-    // Windows HTTP graceful drain instead of an immediate TerminateProcess.
-    allowGracefulShutdownWhileQuitting = true
-    try {
-      stopGateway()
-    } finally {
-      allowGracefulShutdownWhileQuitting = false
-    }
-  })
+  const exited = await stopOwnedGatewaysForUpdate()
   // Re-read the shared ownership set immediately before handoff. There is no
   // await between this check and quitAndInstall, so a child already stopping
   // for Retry/recovery cannot be skipped by the installer lifecycle.
@@ -11265,13 +11551,17 @@ async function applyDownloadedUpdate(): Promise<void> {
 // can install the verified archive in place.
 ipcMain.handle('desktop:update:managed', () => desktopUpdateManaged() || mockUpdateVersion() !== null)
 ipcMain.handle('desktop:update:supported', () => nativeAutoUpdateEnabled())
-ipcMain.handle('desktop:update:state', () => desktopUpdateSnapshot())
+ipcMain.handle('desktop:update:state', async () => {
+  await restoreWindowsUpdateCache()
+  return desktopUpdateSnapshot()
+})
 ipcMain.handle('desktop:update:check', async () => {
   await checkForUpdates(true)
   return desktopUpdateSnapshot()
 })
 ipcMain.handle('desktop:update:download', async () => downloadDesktopUpdate())
-ipcMain.handle('desktop:update:relaunch', async () => {
+ipcMain.handle('desktop:update:relaunch', async (event) => {
+  if (windowsInstallerActionsSupported() && !trustedMainWindowControlIpc(event)) return desktopUpdateSnapshot()
   await applyDownloadedUpdate()
   return desktopUpdateSnapshot()
 })
@@ -13970,8 +14260,8 @@ app.on('before-quit', (event) => {
   }
   // An updater drain owns the lifecycle until every writer and gateway has
   // exited. A user Quit or repeated signal during this phase is remembered and
-  // resumed if the update cannot hand off. Only quitAndInstall's synchronous
-  // handoff is allowed through this guard.
+  // resumed if the update cannot hand off. Native updater handoff or a verified
+  // Windows installer spawn is allowed through this guard.
   if (updateApplying) {
     if (updateInstallHandoffReady) {
       setAppExitPhase('committed', 'desktop updater owns exit')

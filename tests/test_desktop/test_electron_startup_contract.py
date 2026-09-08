@@ -2266,8 +2266,13 @@ def test_apply_downloaded_update_waits_for_actual_gateway_exit_before_install() 
     assert "hasGatewayProcessExited(child)" in wait_helper
     assert "child.once('exit', () => finish(true))" in wait_helper
     assert "setTimeout(resolve" not in apply_update
-    assert "await stopAndJoinAllLifecycleOwnedGateways(" in apply_update
-    assert apply_update.index("await stopAndJoinAllLifecycleOwnedGateways(") < apply_update.index(
+    shared_stop = _section(
+        main_ts, "async function stopOwnedGatewaysForUpdate", "async function applyWindowsInstaller"
+    )
+    assert "await stopAndJoinAllLifecycleOwnedGateways(" in shared_stop
+    assert "allowGracefulShutdownWhileQuitting = true" in shared_stop
+    assert "await stopOwnedGatewaysForUpdate()" in apply_update
+    assert apply_update.index("await stopOwnedGatewaysForUpdate()") < apply_update.index(
         "autoUpdater.quitAndInstall(false, true)"
     )
 
@@ -2281,7 +2286,7 @@ def test_apply_downloaded_update_timeout_restores_retry_state_before_returning()
     )
 
     assert "const pendingVersion = downloadedUpdateVersion" in apply_update
-    assert "const exited = await stopAndJoinAllLifecycleOwnedGateways(" in apply_update
+    assert "const exited = await stopOwnedGatewaysForUpdate()" in apply_update
     assert "if (!exited || liveLifecycleOwnedGatewayProcesses().length > 0)" in apply_update
     timeout_branch = _section(
         apply_update,
@@ -3139,7 +3144,11 @@ def test_desktop_update_and_recovery_join_every_lifecycle_owned_gateway() -> Non
 
     assert "await stopAndJoinAllLifecycleOwnedGateways()" in stop_wait
     assert "liveProcesses: liveLifecycleOwnedGatewayProcesses" in coordinator
-    assert "await stopAndJoinAllLifecycleOwnedGateways(" in apply_update
+    shared_stop = _section(
+        main_ts, "async function stopOwnedGatewaysForUpdate", "async function applyWindowsInstaller"
+    )
+    assert "await stopAndJoinAllLifecycleOwnedGateways(" in shared_stop
+    assert "await stopOwnedGatewaysForUpdate()" in apply_update
     assert "liveLifecycleOwnedGatewayProcesses().length > 0" in apply_update
     assert apply_update.index("liveLifecycleOwnedGatewayProcesses().length > 0") < (
         apply_update.index("autoUpdater.quitAndInstall(false, true)")
@@ -3471,9 +3480,9 @@ def test_desktop_dual_source_update_resolver_wires_static_channels() -> None:
     assert "manualInstallerActionInProgress = false" in manual_download
     assert "desktopUpdateStatus === 'checking'" in manual_download
     assert "await checkForUpdates(true)" in manual_download
-    assert "desktopUpdateStatus !== 'available'" in manual_download
+    assert "!['available', 'error'].includes(desktopUpdateStatus)" in manual_download
     assert "desktopUpdateErrorMessage('source_unreachable')" in manual_download
-    assert "'install_failed'" in manual_download
+    assert "const verified = await verifyCachedInstaller(" in manual_download
     assert "manualInstall" in check
     assert "updateAssetUrl(resolved.candidate, resolved.source)" in check
     assert "updateAssetUrl(candidate, source, 'SHA256SUMS')" in main_ts
@@ -3492,10 +3501,17 @@ def test_desktop_dual_source_update_resolver_wires_static_channels() -> None:
         "err.code === 'download_failed' || err.code === 'integrity_failed'"
         in verified_windows_download
     )
-    assert "source: verified.source" in manual_download
-    assert "fallbackUsed: verified.fallbackUsed" in manual_download
-    assert "rememberSuccessfulUpdateSource(verified.source)" in manual_download
-    assert "shell.showItemInFolder(verified.path)" in manual_download
+    assert (
+        "publishVerifiedWindowsInstaller(verified, downloaded.source, downloaded.fallbackUsed)"
+        in manual_download
+    )
+    assert "rememberSuccessfulUpdateSource(downloaded.source)" in manual_download
+    assert "shell.showItemInFolder" not in manual_download
+    assert (
+        manual_download.index("await saveWindowsUpdateCache(")
+        < manual_download.index("const verified = await verifyCachedInstaller(")
+        < manual_download.index("publishVerifiedWindowsInstaller(verified,")
+    )
     assert "shell.openExternal(installerUrl)" not in manual_download
     manual_discovery = _section(
         main_ts,

@@ -133,6 +133,7 @@ describe('DesktopUpdateIndicator', () => {
     const api = desktopUpdateApi({
       status: 'available',
       canNativeInstall: false,
+      canInstall: false,
       installMode: 'manual',
       source: 'oss',
     }, {
@@ -170,6 +171,76 @@ describe('DesktopUpdateIndicator', () => {
     await settle()
 
     expect(api.downloadUpdate).toHaveBeenCalledTimes(1)
+    app.unmount()
+  })
+
+  it('installs only an explicitly allowed Windows update and keeps shutdown progress visible', async () => {
+    const api = desktopUpdateApi({
+      status: 'downloaded',
+      canNativeInstall: false,
+      canInstall: true,
+      installMode: 'manual',
+    }, {
+      isAutoUpdateEnabled: async () => false,
+      relaunchToUpdate: vi.fn(async () => ({
+        status: 'applying', canCheck: true, canNativeInstall: false, canInstall: false, installMode: 'manual',
+      })),
+    })
+    const { app, el } = await mountIndicator(api)
+    ;(el.querySelector('[data-testid="desktop-update-indicator"]') as HTMLButtonElement).click()
+    await settle()
+
+    const install = document.querySelector('[data-testid="desktop-update-relaunch"]') as HTMLButtonElement
+    const reveal = document.querySelector('[data-testid="desktop-update-show-installer"]') as HTMLButtonElement
+    expect(install.textContent).toContain('Quit and install')
+    expect(install.classList.contains('btn--primary')).toBe(true)
+    expect(reveal.classList.contains('btn--ghost')).toBe(true)
+    expect(api.relaunchToUpdate).not.toHaveBeenCalled()
+    install.click()
+    await settle()
+
+    expect(api.relaunchToUpdate).toHaveBeenCalledTimes(1)
+    expect(api.downloadUpdate).not.toHaveBeenCalled()
+    expect(el.textContent).toContain('Closing background services')
+    expect(document.body.textContent).toContain('installer will open when they have stopped')
+    expect(document.querySelector('[data-testid="desktop-update-relaunch"]')).toBeNull()
+    expect(document.querySelector('[data-testid="desktop-update-show-installer"]')).toBeNull()
+    app.unmount()
+  })
+
+  it('shows a retryable signature failure even when the installer remains downloaded', async () => {
+    const api = desktopUpdateApi({
+      status: 'downloaded', canNativeInstall: false, canInstall: true, installMode: 'manual',
+      errorCode: 'signature_unavailable', error: 'raw verifier detail',
+    }, { isAutoUpdateEnabled: async () => false })
+    const { app, el } = await mountIndicator(api)
+    const trigger = el.querySelector('[data-testid="desktop-update-indicator"]') as HTMLButtonElement
+    expect(trigger.dataset.state).toBe('danger')
+    expect(trigger.textContent).toContain('Update issue')
+    trigger.click()
+    await settle()
+    expect(document.body.textContent).toContain('Could not start installation')
+    expect(document.body.textContent).toContain('could not verify the installer signature')
+    expect(document.body.textContent).not.toContain('raw verifier detail')
+    expect(document.querySelector('[data-testid="desktop-update-relaunch"]')).not.toBeNull()
+    expect(document.querySelector('[data-testid="desktop-update-show-installer"]')).not.toBeNull()
+    app.unmount()
+  })
+
+  it.each([
+    ['signature_invalid', 'signature is invalid'],
+    ['signature_unavailable', 'could not verify the installer signature'],
+  ])('localizes %s without offering installation', async (errorCode, expected) => {
+    const api = desktopUpdateApi({
+      status: 'error', canNativeInstall: false, canInstall: false, installMode: 'manual',
+      errorCode, error: 'raw signature verification command detail',
+    }, { isAutoUpdateEnabled: async () => false })
+    const { app, el } = await mountIndicator(api)
+    ;(el.querySelector('[data-testid="desktop-update-indicator"]') as HTMLButtonElement).click()
+    await settle()
+    expect(document.body.textContent).toContain(expected)
+    expect(document.body.textContent).not.toContain('raw signature verification command detail')
+    expect(document.querySelector('[data-testid="desktop-update-relaunch"]')).toBeNull()
     app.unmount()
   })
 
@@ -211,7 +282,7 @@ describe('DesktopUpdateIndicator', () => {
 
     ;(el.querySelector('[data-testid="desktop-update-indicator"]') as HTMLButtonElement).click()
     await settle()
-    expect(document.body.textContent).toContain('failed integrity verification and was deleted')
+    expect(document.body.textContent).toContain('failed integrity verification. Download the update again.')
     expect(document.body.textContent).not.toContain('deadbeef')
     app.unmount()
   })

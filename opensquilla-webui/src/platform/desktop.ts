@@ -65,6 +65,8 @@ const UPDATE_ERROR_CODES = new Set<DesktopUpdateErrorCode>([
   'manifest_invalid',
   'checksum_unavailable',
   'integrity_failed',
+  'signature_invalid',
+  'signature_unavailable',
   'download_failed',
   'install_failed',
 ])
@@ -373,6 +375,7 @@ function idleUpdateState(canNativeInstall: boolean, managed = canNativeInstall):
     snoozedUntil: null,
     canCheck: managed,
     canNativeInstall,
+    canInstall: canNativeInstall,
     installMode: canNativeInstall ? 'native' : managed ? 'manual' : 'unsupported',
     releaseUrl: null,
     source: null,
@@ -397,6 +400,9 @@ function normalizeUpdateState(
     : canNativeInstall
   const normalizedCanCheck = typeof raw.canCheck === 'boolean' ? raw.canCheck : managed
   const installMode = String(raw.installMode || '')
+  const normalizedInstallMode = UPDATE_INSTALL_MODES.has(installMode as DesktopUpdateInstallMode)
+    ? installMode as DesktopUpdateInstallMode
+    : normalizedNativeInstall ? 'native' : normalizedCanCheck ? 'manual' : 'unsupported'
   const errorCode = String(raw.errorCode || '')
   const source = String(raw.source || '')
   return {
@@ -412,9 +418,10 @@ function normalizeUpdateState(
     snoozedUntil: typeof raw.snoozedUntil === 'string' && raw.snoozedUntil ? raw.snoozedUntil : null,
     canCheck: normalizedCanCheck,
     canNativeInstall: normalizedNativeInstall,
-    installMode: UPDATE_INSTALL_MODES.has(installMode as DesktopUpdateInstallMode)
-      ? installMode as DesktopUpdateInstallMode
-      : normalizedNativeInstall ? 'native' : normalizedCanCheck ? 'manual' : 'unsupported',
+    canInstall: normalizedInstallMode !== 'unsupported' && (
+      typeof raw.canInstall === 'boolean' ? raw.canInstall : normalizedInstallMode === 'native'
+    ),
+    installMode: normalizedInstallMode,
     releaseUrl: typeof raw.releaseUrl === 'string' && raw.releaseUrl ? raw.releaseUrl : null,
     source: UPDATE_SOURCES.has(source as DesktopUpdateSource) ? source as DesktopUpdateSource : null,
     fallbackUsed: raw.fallbackUsed === true,

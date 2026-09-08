@@ -98,6 +98,19 @@ describe('useDesktopUpdatePresentation', () => {
     expect(presentation.description.value).toContain('2.0.0')
     expect(presentation.iconName.value).toBe('check')
     expect(presentation.manualInstall.value).toBe(true)
+    expect(presentation.canDownload.value).toBe(true)
+    expect(presentation.canInstall.value).toBe(false)
+
+    state.value = { ...state.value, canInstall: true }
+    await nextTick()
+    expect(presentation.canInstall.value).toBe(true)
+    expect(presentation.description.value).toContain('Quit and install')
+
+    state.value = { ...state.value, status: 'applying', canInstall: false }
+    await nextTick()
+    expect(presentation.busy.value).toBe(true)
+    expect(presentation.summary.value).toBe('Closing background services')
+    expect(presentation.description.value).toContain('installer will open when they have stopped')
 
     state.value = {
       ...state.value,
