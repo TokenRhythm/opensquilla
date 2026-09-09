@@ -390,6 +390,7 @@ METHOD_SCOPES: dict[str, str] = {
     "agents.files.set": ADMIN_SCOPE,
     "skills.install": ADMIN_SCOPE,
     "skills.install.cancel": ADMIN_SCOPE,
+    "skills.install.status": ADMIN_SCOPE,
     "skills.update": ADMIN_SCOPE,
     "skills.uninstall": ADMIN_SCOPE,
     "skills.reload": ADMIN_SCOPE,

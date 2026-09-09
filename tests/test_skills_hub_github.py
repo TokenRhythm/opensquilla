@@ -588,7 +588,7 @@ async def test_repository_root_reports_ambiguous_tree_to_management(
                     "path": "SKILL.md",
                     "type": "blob",
                     "mode": "100644",
-                    "size": DEFAULT_ARCHIVE_LIMITS.max_entry_bytes + 1,
+                    "size": 17,
                 }
             ],
             "FETCH_SIZE_LIMIT",
@@ -607,6 +607,12 @@ async def test_github_fetch_policy_diagnostics_reach_management(
 
     monkeypatch.setattr(httpx, "AsyncClient", _AsyncClient)
     monkeypatch.setattr(_AsyncClient, "tree_entries", tree_entries)
+    if expected_code == "FETCH_SIZE_LIMIT":
+        from dataclasses import replace
+        monkeypatch.setattr(
+            "opensquilla.skills.hub.github.DEFAULT_ARCHIVE_LIMITS",
+            replace(DEFAULT_ARCHIVE_LIMITS, max_entry_bytes=16),
+        )
     source = GitHubSource()
     service = SkillManagementService(
         router=SourceRouter([source]),
@@ -692,3 +698,44 @@ async def test_invalid_identifier_is_not_reported_as_remote_not_found(tmp_path: 
     result = await service.install("not-a-github-reference", "github")
 
     assert [item.code for item in result.diagnostics] == ["SOURCE_IDENTIFIER_INVALID"]
+
+
+@pytest.mark.asyncio
+async def test_repository_discovers_unique_skill_before_downloading(monkeypatch) -> None:
+    import httpx
+
+    monkeypatch.setattr(httpx, "AsyncClient", _AsyncClient)
+    monkeypatch.setattr(_AsyncClient, "requests", [])
+    monkeypatch.setattr(_AsyncClient, "tree_entries", [
+        row for row in _AsyncClient.tree_entries
+        if row["path"] != "skills/other/SKILL.md"
+    ])
+    bundle = await GitHubSource().fetch("https://github.com/acme/skillpack")
+    assert bundle is not None
+    assert set(bundle.files) == {"SKILL.md", "scripts/run.py", "assets/logo.bin"}
+    assert bundle.resolution.requested_identifier == "https://github.com/acme/skillpack"
+    assert bundle.resolution.skill_path == "skills/demo"
+    assert bundle.resolution.canonical_identifier == (
+        f"acme/skillpack@{_COMMIT}:skills/demo/SKILL.md"
+    )
+    assert not any("unrelated" in url for url, _ in _AsyncClient.requests)
+
+
+@pytest.mark.asyncio
+async def test_repository_candidates_are_pinned_without_body_downloads(monkeypatch) -> None:
+    import httpx
+
+    monkeypatch.setattr(httpx, "AsyncClient", _AsyncClient)
+    monkeypatch.setattr(_AsyncClient, "requests", [])
+    source = GitHubSource()
+    resolution = await source.resolve("https://github.com/acme/skillpack")
+    with pytest.raises(SkillSourceFetchError) as caught:
+        await source.fetch_resolved(resolution)
+    diagnostic = caught.value.diagnostics[0]
+    assert diagnostic.code == "SOURCE_TREE_AMBIGUOUS"
+    assert diagnostic.details["candidates"] == [
+        {"name": name, "path": f"skills/{name}",
+         "identifier": f"acme/skillpack@{_COMMIT}:skills/{name}/SKILL.md"}
+        for name in ("demo", "other")
+    ]
+    assert not any("raw.githubusercontent.com" in url for url, _ in _AsyncClient.requests)

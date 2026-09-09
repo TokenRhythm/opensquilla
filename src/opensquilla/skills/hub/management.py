@@ -48,8 +48,15 @@ from opensquilla.skills.hub.lockfile import (
     compute_sha256,
     compute_tree_sha256,
 )
+from opensquilla.skills.hub.operations import (
+    InstallOperations,
+    InstallOperationStore,
+    current_install_operation,
+    operation_database,
+    report_install_progress,
+)
 from opensquilla.skills.hub.router import SourceRouter
-from opensquilla.skills.hub.scanner import ScanResult, scan_skill_bundle
+from opensquilla.skills.hub.scanner import ScanResult, scan_skill_tree
 from opensquilla.skills.hub.source import (
     SkillBundle,
     SkillSource,
@@ -65,6 +72,7 @@ from opensquilla.skills.hub.transaction import (
     fsync_directory,
     fsync_staging_tree,
     guard_retained_recovery_journal,
+    managed_root_identity,
     path_is_occupied,
     recover_pending_skill_transaction,
     remove_transaction_journal,
@@ -72,6 +80,12 @@ from opensquilla.skills.hub.transaction import (
     staging_root,
     validate_transaction_journal_paths,
 )
+from opensquilla.skills.hub.tree_io import (
+    MAX_TREE_ENTRIES,
+    artifact_tree_digest,
+    validate_tree_entry_count,
+)
+from opensquilla.skills.io_worker import run_staging_worker
 from opensquilla.skills.manifest import (
     _parse_skill_frontmatter_strict,
     validate_hub_candidate,
@@ -85,8 +99,8 @@ _SAFE_NAME_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$")
 _SAFE_TRACKED_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _FRONTMATTER_RE = re.compile(r"^---\s*\r?\n(.*?)\r?\n---\s*\r?\n(.*)$", re.DOTALL)
 _MAX_MANAGED_SKILLS = 200
-_MAX_BUNDLE_ENTRIES = 2_048
-_MAX_BUNDLE_BYTES = 50 * 1024 * 1024
+_MAX_BUNDLE_ENTRIES = MAX_TREE_ENTRIES
+_MAX_BUNDLE_BYTES: int | None = None
 _MAX_BUNDLE_DEPTH = 32
 _DEGRADED_CAPABILITIES_KEY = "degraded_capabilities"
 _SCOPED_TOOL_PERMISSIONS_CAPABILITY = "scoped_tool_permissions"
@@ -417,6 +431,8 @@ class InstallResult:
                 "verdict": self.scan.verdict,
                 "strategy": self.scan.strategy,
                 "findings": [vars(item) for item in self.scan.findings],
+                "totalFindings": self.scan.total_findings,
+                "truncated": self.scan.truncated,
             }
         resolution_payload: dict[str, Any] | None = None
         if self.resolution is not None:
@@ -503,6 +519,7 @@ def _write_bundle(
     }
     try:
         validate_portable_file_paths(canonical_paths.values())
+        validate_tree_entry_count(canonical_paths.values(), limit=_MAX_BUNDLE_ENTRIES)
     except ValueError as exc:
         raise ValueError(f"bundle contains a portable path collision: {exc}") from None
     candidate_dir.mkdir(parents=True, exist_ok=False)
@@ -510,8 +527,8 @@ def _write_bundle(
         relative = canonical_paths[raw_name]
         content = value.encode("utf-8") if isinstance(value, str) else bytes(value)
         total_bytes += len(content)
-        if total_bytes > _MAX_BUNDLE_BYTES:
-            raise ValueError("bundle exceeds the 50 MiB expanded-size limit")
+        if _MAX_BUNDLE_BYTES is not None and total_bytes > _MAX_BUNDLE_BYTES:
+            raise ValueError("bundle exceeds configured expanded-size limit")
         destination = candidate_dir.joinpath(*relative.parts)
         destination.parent.mkdir(parents=True, exist_ok=True)
         with destination.open("xb") as handle:
@@ -570,7 +587,14 @@ def _normalize_legacy_manifest(
         )
         raise ValueError(f"bundle must contain exactly one root {expected}")
     manifest = manifests[0]
-    raw = manifest.read_bytes()
+    from opensquilla.skills.manifest import MAX_SKILL_FILE_BYTES
+
+    with manifest.open("rb") as handle:
+        raw = handle.read(MAX_SKILL_FILE_BYTES + 1)
+    if len(raw) > MAX_SKILL_FILE_BYTES:
+        raise _CandidateManifestError(
+            "MANIFEST_TOO_LARGE", f"SKILL.md exceeds {MAX_SKILL_FILE_BYTES} bytes",
+        )
     try:
         text = raw.decode("utf-8-sig")
     except UnicodeDecodeError as exc:
@@ -1159,11 +1183,22 @@ class SkillManagementService:
         self._journal_path = journal_path or default_journal_path(managed_dir)
         self._mutation_lock = mutation_lock or mutation_lock_for(managed_dir)
         self._offline = offline or loader is None
+        self._install_operations: InstallOperations | None = None
         self._recovery_required_diagnostics: tuple[SkillDiagnostic, ...] = ()
         bind_lockfile = getattr(loader, "bind_managed_lockfile", None)
         if callable(bind_lockfile):
             bind_lockfile(lockfile_path)
         self._observe_recovery(list(startup_recovery_diagnostics))
+
+    @property
+    def install_operations(self) -> InstallOperations:
+        if self._install_operations is None:
+            self._install_operations = InstallOperations(InstallOperationStore(
+                operation_database(self._journal_path),
+                root_id=managed_root_identity(self._managed_dir),
+            ))
+        self._install_operations.store.recover_orphans(self._journal_path)
+        return self._install_operations
 
     @property
     def managed_dir(self) -> Path:
@@ -1295,6 +1330,7 @@ class SkillManagementService:
         self,
         identifier: str,
         source_id: str,
+        destination: Path | None = None,
     ) -> tuple[SourceResolution | None, SkillBundle | None, list[SkillDiagnostic]]:
         diagnostics: list[SkillDiagnostic] = []
         try:
@@ -1390,7 +1426,12 @@ class SkillManagementService:
             return resolution, None, diagnostics
         try:
             fetch_resolved = getattr(source, "fetch_resolved", None) if source else None
-            if callable(fetch_resolved):
+            fetch_into = getattr(source, "fetch_resolved_into", None)
+            streaming_source = getattr(type(source), "fetch_resolved_into", None)
+            if (destination is not None and callable(fetch_into)
+                    and streaming_source is not SkillSource.fetch_resolved_into):
+                bundle = await fetch_into(resolution, destination)
+            elif callable(fetch_resolved):
                 bundle = await fetch_resolved(resolution)
             else:
                 bundle = await self._router.fetch(identifier, source_id)
@@ -1621,7 +1662,7 @@ class SkillManagementService:
             )
             if reload_result.success:
                 try:
-                    verify(self._loader.snapshot())
+                    await _run_postflight_worker(verify, self._loader.snapshot())
                 except RuntimeError:
                     pass
         reload_payload = reload_result.to_dict()
@@ -1662,7 +1703,10 @@ class SkillManagementService:
         candidate = verified_state.get("candidate")
         selected = bool(verified_state.get("selected", False))
         generation = int(verified_state.get("generation", reload_result.generation) or 0)
-        actual_tree = compute_tree_sha256(target) if target.exists() else ""
+        actual_tree = (
+            await _run_postflight_worker(compute_tree_sha256, target)
+            if target.exists() else ""
+        )
         if actual_tree != expected_tree:
             if not any(item.code == "POSTFLIGHT_TREE_DRIFT" for item in diagnostics):
                 diagnostics.append(
@@ -2006,7 +2050,29 @@ class SkillManagementService:
             )
             return self._recovery_required_result(recovery_name)
 
-        resolution, bundle, diagnostics = await self._resolve_and_fetch(identifier, source_id)
+        report_install_progress("downloading")
+        transaction_id = uuid.uuid4().hex
+        transaction_root = staging_root(self._managed_dir) / transaction_id
+        raw_candidate = transaction_root / "_candidate"
+        try:
+            ensure_safe_transaction_roots(self._managed_dir)
+            transaction_root.mkdir(parents=True, exist_ok=False)
+            resolution, bundle, diagnostics = await self._resolve_and_fetch(
+                identifier, source_id, raw_candidate,
+            )
+        except BaseException as exc:
+            cleanup_staging_transaction_reservation(
+                managed_dir=self._managed_dir, transaction_id=transaction_id,
+            )
+            if not isinstance(exc, Exception):
+                raise
+            return self._failure(
+                name=update_name or "", message=str(exc),
+                diagnostics=[_diagnostic(
+                    "CANDIDATE_PREPARATION_FAILED", str(exc),
+                    phase=DiagnosticPhase.ARCHIVE, blocking=True,
+                )], resolution=None,
+            )
         candidate_compatibility = SkillCompatibilityState.INSTRUCTION_ONLY
 
         def fail_before_mutation(
@@ -2053,19 +2119,13 @@ class SkillManagementService:
             )
 
         if resolution is None or bundle is None:
+            cleanup_staging_transaction_reservation(
+                managed_dir=self._managed_dir, transaction_id=transaction_id,
+            )
             return fail_before_mutation(
                 fallback_name="",
                 message=diagnostics[-1].message if diagnostics else "Source fetch failed",
             )
-        artifact_digest = str(
-            getattr(resolution, "artifact_digest", "")
-            or getattr(resolution, "expected_digest", "")
-            or _bundle_digest(bundle.files)
-        )
-        transaction_id = uuid.uuid4().hex
-        transaction_root = staging_root(self._managed_dir) / transaction_id
-        raw_candidate = transaction_root / "_candidate"
-
         def cleanup_pre_journal_reservation() -> None:
             diagnostics.extend(
                 cleanup_staging_transaction_reservation(
@@ -2076,8 +2136,24 @@ class SkillManagementService:
 
         try:
             ensure_safe_transaction_roots(self._managed_dir)
-            transaction_root.mkdir(parents=True, exist_ok=False)
-            _write_bundle(bundle.files, raw_candidate, bundle.file_modes)
+            if bundle.directory is None:
+                await run_staging_worker(
+                    _write_bundle, bundle.files, raw_candidate, bundle.file_modes,
+                )
+            elif bundle.directory != raw_candidate:
+                raise ValueError("Source returned a directory outside its staging reservation")
+            validate_tree_entry_count(
+                path.relative_to(raw_candidate).as_posix() for path in raw_candidate.rglob("*")
+            )
+            artifact_digest = str(
+                getattr(resolution, "artifact_digest", "")
+                or getattr(resolution, "expected_digest", "")
+                or (
+                    await run_staging_worker(artifact_tree_digest, bundle.directory)
+                    if bundle.directory
+                    else await run_staging_worker(_bundle_digest, bundle.files)
+                )
+            )
             candidate_dir, normalized = _normalize_legacy_manifest(
                 raw_candidate,
                 bundle=bundle,
@@ -2112,8 +2188,8 @@ class SkillManagementService:
                 return result
             spec = validation.spec
             name = spec.name
-            installed_tree = compute_tree_sha256(candidate_dir)
-            legacy_tree = compute_sha256(candidate_dir)
+            installed_tree = await run_staging_worker(compute_tree_sha256, candidate_dir)
+            legacy_tree = await run_staging_worker(compute_sha256, candidate_dir)
             manifest_digest = hashlib.sha256(
                 (candidate_dir / "SKILL.md").read_bytes()
             ).hexdigest()
@@ -2122,7 +2198,8 @@ class SkillManagementService:
                 resolution,
                 identifier,
             )
-            scan_result = scan_skill_bundle(_candidate_files(candidate_dir))
+            report_install_progress("scanning")
+            scan_result = await run_staging_worker(scan_skill_tree, candidate_dir)
             risk_confirmation_details: dict[str, Any] = {}
             risk_acknowledged = False
             if scan_result.verdict == "dangerous":
@@ -2148,7 +2225,7 @@ class SkillManagementService:
                 diagnostics.append(
                     _diagnostic(
                         "SCAN_CONFIRMATION_REQUIRED",
-                        f"Security scan found {len(scan_result.findings)} blocking finding(s)",
+                        f"Security scan found {scan_result.total_findings} blocking finding(s)",
                         phase=DiagnosticPhase.SECURITY,
                         blocking=True,
                         hint=(
@@ -2173,6 +2250,9 @@ class SkillManagementService:
                         },
                     )
                 )
+        except asyncio.CancelledError:
+            cleanup_pre_journal_reservation()
+            raise
         except _CandidateManifestError as exc:
             diagnostics.append(
                 _diagnostic(
@@ -2399,7 +2479,9 @@ class SkillManagementService:
                 if old_entry is not None:
                     if not target.is_dir() or target.is_symlink():
                         raise RuntimeError(f"Tracked Skill path is missing or unsafe: {target}")
-                    current_digest = _installed_digest(target, old_entry)
+                    current_digest = await _run_postflight_worker(
+                        _installed_digest, target, old_entry,
+                    )
                     expected_digest = old_entry.tree_sha256 or old_entry.sha256
                     if expected_digest and current_digest != expected_digest:
                         raise RuntimeError(
@@ -2583,6 +2665,7 @@ class SkillManagementService:
                     rollback=rollback,
                     lockfile_path=self._lockfile_path,
                 )
+                report_install_progress("committing")
                 fsync_staging_tree(candidate_dir)
                 fsync_directory(rollback.parent)
                 fsync_directory(rollback.parent.parent)
@@ -2744,11 +2827,18 @@ class SkillManagementService:
                     effective_from="next_turn" if self._loader is not None else "next_start",
                 )
                 if journal is not None:
+                    if journal.install_operation_id:
+                        journal.install_receipt = success_result.to_dict()
                     journal.advance("committed", self._journal_path)
                 durably_committed = True
                 if publication_barrier is not None:
                     publication_barrier.commit()
                 try:
+                    operation = current_install_operation()
+                    if operation is not None:
+                        operation.store.finish(
+                            operation.owner, operation.id, success_result.to_dict(),
+                        )
                     if journal is not None:
                         validate_transaction_journal_paths(
                             journal,
