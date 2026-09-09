@@ -371,7 +371,7 @@ async def _e2e_stack(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     )
     monkeypatch.setattr(squilla_router_step, "_get_strategy", lambda _cfg: _TextTierStrategy())
     config = _configure_gateway(tmp_path)
-    store = UploadStore(marker_dir=tmp_path / "upload-markers")
+    store = UploadStore(marker_dir=Path(config.attachments.media_root) / "uploads")
     set_upload_store(store)
     storage = SessionStorage(str(tmp_path / "sessions.sqlite"))
     await storage.connect()
