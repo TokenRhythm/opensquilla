@@ -46,6 +46,7 @@ from opensquilla.application.artifact_workbench import (
     AttachmentStagingApplication,
     AttachmentStagingPolicy,
 )
+from opensquilla.attachment_refs import inputs_material_path
 from opensquilla.contracts.attachments import (
     ALLOWED_MEDIA_TYPES,
     OPAQUE_ATTACHMENT_BYTES,
@@ -111,6 +112,8 @@ class _Entry:
     size: int
     path: Path
     expires_at: float
+    owner: str
+    resource_id: str
 
 
 class UploadStore:
@@ -192,7 +195,29 @@ class UploadStore:
         for marker_path in native_io_path(self.marker_dir).glob("u-*.meta"):
             file_uuid = marker_path.stem
             marker = self._read_marker(file_uuid)
-            if not marker or self._marker_expired(marker):
+            if not marker:
+                continue
+            if self._marker_expired(marker):
+                # Remove stale marker and its managed input payload during
+                # restart recovery; otherwise expired uploads would leak disk
+                # space until another process happened to sweep them.
+                owner = marker.get("owner")
+                resource_id = marker.get("resource_id")
+                name = marker.get("name")
+                if all(isinstance(v, str) and v for v in (owner, resource_id, name)):
+                    assert isinstance(owner, str)
+                    assert isinstance(resource_id, str)
+                    assert isinstance(name, str)
+                    stale_path = inputs_material_path(
+                        self.inputs_root.parent, owner, resource_id, name
+                    )
+                    try:
+                        stale_path.resolve().relative_to(self.inputs_root.resolve())
+                        native_io_path(stale_path).unlink(missing_ok=True)
+                        native_io_path(stale_path.parent).rmdir()
+                    except (OSError, ValueError):
+                        pass
+                self._delete_marker(file_uuid)
                 continue
             owner = marker.get("owner")
             resource_id = marker.get("resource_id")
@@ -202,12 +227,7 @@ class UploadStore:
             assert isinstance(owner, str)
             assert isinstance(resource_id, str)
             assert isinstance(name, str)
-            path = (
-                self.inputs_root
-                / self._safe_filename(owner)
-                / self._safe_filename(resource_id)
-                / self._safe_filename(name)
-            )
+            path = inputs_material_path(self.inputs_root.parent, owner, resource_id, name)
             try:
                 path.resolve().relative_to(self.inputs_root.resolve())
                 if not path.is_file():
@@ -230,6 +250,8 @@ class UploadStore:
                     size=size,
                     path=path,
                     expires_at=float(expires_at),
+                    owner=owner,
+                    resource_id=resource_id,
                 )
             except (OSError, ValueError):
                 continue
@@ -270,7 +292,7 @@ class UploadStore:
         return (value or "attachment")[:180]
 
     def _entry_path(self, file_uuid: str, name: str) -> Path:
-        return self.inputs_root / self._owner / file_uuid / self._safe_filename(name)
+        return inputs_material_path(self.inputs_root.parent, self._owner, file_uuid, name)
 
     @staticmethod
     def _atomic_write(path: Path, payload: bytes) -> None:
@@ -343,6 +365,8 @@ class UploadStore:
             size=len(payload),
             path=path,
             expires_at=expires_at,
+            owner=self._owner,
+            resource_id=file_uuid,
         )
 
         # Sweep before insert so the eviction loop runs at least once per
@@ -435,7 +459,76 @@ class UploadStore:
                 "mime": entry.mime,
                 "sha256": entry.sha256,
                 "size": entry.size,
+                "owner": entry.owner,
+                "resource_id": entry.resource_id,
             }
+
+    async def claim(
+        self,
+        file_uuid: str,
+        *,
+        owner: str,
+        material_root: Path | None = None,
+    ) -> dict[str, Any]:
+        """Promote an upload from its short-lived lease to a durable owner."""
+        owner_segment = self._safe_filename(owner)
+        if not owner_segment or owner_segment == "attachment":
+            raise ValueError("upload claim owner is invalid")
+        lock = await self._get_uuid_lock(file_uuid)
+        async with lock:
+            entry = self._entries.get(file_uuid)
+            if entry is None or entry.expires_at < self._now():
+                raise AttachmentNotFoundError(file_uuid)
+            target = inputs_material_path(
+                material_root or self.inputs_root.parent,
+                owner_segment,
+                entry.resource_id,
+                entry.name,
+            )
+            native_io_path(target.parent).mkdir(parents=True, exist_ok=True, mode=0o700)
+            if entry.path != target:
+                os.replace(native_io_path(entry.path), native_io_path(target))
+                try:
+                    native_io_path(entry.path.parent).rmdir()
+                except OSError:
+                    pass
+            entry.owner = owner_segment
+            entry.path = target
+            entry.expires_at = float("inf")
+            self._write_marker(
+                file_uuid,
+                {
+                    "sha256": entry.sha256,
+                    "mime": entry.mime,
+                    "name": entry.name,
+                    "size": entry.size,
+                    "expires_at": entry.expires_at,
+                    "owner": entry.owner,
+                    "resource_id": entry.resource_id,
+                },
+            )
+            return {
+                "name": entry.name,
+                "mime": entry.mime,
+                "sha256": entry.sha256,
+                "size": entry.size,
+                "owner": entry.owner,
+                "resource_id": entry.resource_id,
+            }
+
+    async def release_owner(self, owner: str) -> int:
+        """Release all claimed resources owned by a deleted session."""
+        owner_segment = self._safe_filename(owner)
+        targets = [
+            file_uuid
+            for file_uuid, entry in self._entries.items()
+            if entry.owner == owner_segment
+        ]
+        released = 0
+        for file_uuid in targets:
+            if await self.evict(file_uuid):
+                released += 1
+        return released
 
     async def evict(self, file_uuid: str) -> bool:
         """Explicit eviction; returns True if the entry existed."""

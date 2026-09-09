@@ -731,6 +731,10 @@ def tool_context_from_envelope(
         run_mode=run_mode.value if run_mode is not None else None,
         sandbox_mounts=sandbox_mounts,
         sandbox_run_context=sandbox_run_context,
+        attachment_read_roots=tuple(
+            value for value in envelope.metadata.get("attachment_read_roots", [])
+            if isinstance(value, str) and value
+        ) if isinstance(envelope.metadata.get("attachment_read_roots"), list) else (),
         session_key=envelope.session_key,
         session_epoch=envelope.session_epoch,
         channel_kind=envelope.channel_name or envelope.channel_type,

@@ -253,7 +253,7 @@ def test_file_uuid_resolved_via_store_returns_material_ref(
             session_id="s1",
         )
     )
-    assert consumed == [file_uuid]
+    assert consumed == []
     assert len(resolved) == 1
     item = resolved[0]
     assert "file_uuid" not in item
@@ -266,9 +266,10 @@ def test_file_uuid_resolved_via_store_returns_material_ref(
     sha = hashlib.sha256(pdf).hexdigest()
     assert item["sha256"] == sha
     assert item["material_id"] == sha
-    assert item["store"] == "transcript"
-    assert item["scope"] == "s1"
-    assert (tmp_path / "transcripts" / "s1" / sha).read_bytes() == pdf
+    assert item["store"] == "inputs"
+    assert item["owner"] == "s1"
+    assert item["resource_id"] == file_uuid
+    assert (store.inputs_root / "s1" / file_uuid / "r.pdf").read_bytes() == pdf
 
 
 def test_file_uuid_resolution_requires_material_target(store: UploadStore) -> None:
@@ -300,7 +301,7 @@ def test_file_uuid_resolution_revalidates_mime_from_staged_bytes(
         )
     )
 
-    assert consumed == [file_uuid]
+    assert consumed == []
     item = resolved[0]
     assert item["type"] == "application/pdf"
     assert item["mime"] == "application/pdf"
@@ -328,7 +329,7 @@ def test_file_uuid_resolution_allows_large_staged_pdf(
         )
     )
 
-    assert consumed == [file_uuid]
+    assert consumed == []
     item = resolved[0]
     assert item["type"] == "application/pdf"
     assert item["_was_staged"] is True
@@ -398,7 +399,7 @@ def test_file_uuid_resolution_accepts_staged_text_above_inline_threshold(
             session_id="s1",
         )
     )
-    assert consumed == ["u-large-text"]
+    assert consumed == []
     assert resolved[0]["kind"] == "attachment_ref"
     assert resolved[0]["mime"] == "text/csv"
     assert resolved[0]["size"] == len(payload)
@@ -853,7 +854,7 @@ def test_file_uuid_opaque_reference_resolves_with_store_mime(tmp_path: Path) -> 
             session_id="s1",
         )
     )
-    assert consumed == ["u-zip"]
+    assert consumed == []
     assert resolved[0]["kind"] == "attachment_ref"
     assert resolved[0]["mime"] == "application/zip"
     assert resolved[0]["size"] == len(payload)
@@ -979,3 +980,23 @@ def test_strict_mime_rejection_takes_precedence_over_full_store(tmp_path: Path) 
     )
     with pytest.raises(UploadUnsupportedMimeError):
         asyncio.run(strict.put("x.sh", "application/x-shellscript", b"#!/bin/sh\n"))
+
+@pytest.mark.asyncio
+async def test_claim_promotes_upload_to_session_owned_input_and_releases_quota(
+    tmp_path: Path,
+) -> None:
+    media_root = tmp_path / "media"
+    store = UploadStore(marker_dir=media_root / "uploads")
+    file_uuid = await store.put("note.txt", "text/plain", b"hello")
+
+    claimed = await store.claim(file_uuid, owner="session-a")
+    assert claimed["owner"] == "session-a"
+    assert claimed["resource_id"] == file_uuid
+    path = media_root / "inputs" / "session-a" / file_uuid / "note.txt"
+    assert path.read_bytes() == b"hello"
+    assert (await store.get(file_uuid))[1]["owner"] == "session-a"
+
+    assert await store.release_owner("session-a") == 1
+    with pytest.raises(AttachmentNotFoundError):
+        await store.get(file_uuid)
+    assert not path.exists()

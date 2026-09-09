@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import base64
 import binascii
+import hashlib
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
@@ -15,14 +17,13 @@ from opensquilla.attachment_refs import (
     PendingChatInputManifestConflictError,
     PendingChatInputManifestCorruptError,
     is_attachment_ref,
-    make_attachment_ref,
+    make_input_attachment_ref,
     make_pending_chat_input_attachment_ref,
     pending_chat_input_manifest_exists,
     read_attachment_ref_bytes,
     read_pending_chat_input_manifest,
     write_pending_chat_input_manifest,
     write_pending_chat_input_material,
-    write_transcript_material,
 )
 from opensquilla.contracts.attachment_sniff import sniff_mime_from_bytes
 from opensquilla.contracts.attachments import (
@@ -47,9 +48,11 @@ from opensquilla.contracts.attachments import (
     attachment_size_limit_for_mime,
     can_stage_attachment_mime,
     normalize_attachment_mime,
+    normalize_attachment_usage,
 )
 
 log = structlog.get_logger(__name__)
+_TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]{43}$")
 
 __all__ = [
     "ALLOWED_MEDIA_TYPES",
@@ -186,6 +189,9 @@ def normalize_attachments(raw_attachments: Any) -> list[dict[str, Any]]:
         media_type = attachment_media_type(item)
         if media_type is not None:
             item["type"] = media_type
+        usage = normalize_attachment_usage(item.get("usage"))
+        if usage is not None:
+            item["usage"] = usage
         normalized.append(item)
     return normalized
 
@@ -383,6 +389,36 @@ def validate_attachments(
             continue
 
         claimed = attachment_media_type(attachment)
+
+        local_grant = attachment.get("local_grant")
+        if isinstance(local_grant, str) and local_grant:
+            if has_data or has_uuid or not isinstance(attachment.get("size"), int):
+                _raise_or_mark(
+                    failure_mode=failure_mode,
+                    failures=failures,
+                    failure=_failure(
+                        index,
+                        attachment,
+                        "invalid_shape",
+                        "local_grant requires size and no data/file_uuid",
+                    ),
+                )
+                continue
+            if not 1 <= len(local_grant) <= 256 or not _TOKEN_RE.fullmatch(local_grant):
+                _raise_or_mark(
+                    failure_mode=failure_mode,
+                    failures=failures,
+                    failure=_failure(index, attachment, "invalid_data", "local_grant is invalid"),
+                )
+                continue
+            if claimed is None:
+                claimed = normalize_attachment_mime(_raw_claimed_mime(attachment)) or OPAQUE_MIME
+            item = dict(attachment)
+            item["type"] = claimed
+            item["name"] = _attachment_name(item, index)
+            item["size"] = attachment["size"]
+            validated.append(item)
+            continue
 
         if has_uuid:
             if claimed is not None:
@@ -659,7 +695,10 @@ async def resolve_attachments(
     opaque_limit_bytes: int | None = None,
     persist_enabled: bool = True,
 ) -> tuple[list[dict[str, Any]], list[str]]:
-    if not any(isinstance(a, dict) and a.get("file_uuid") for a in validated):
+    if not any(
+        isinstance(a, dict) and (a.get("file_uuid") or a.get("local_grant"))
+        for a in validated
+    ):
         enforce_total_attachment_bytes(validated)
         return validated, []
 
@@ -673,6 +712,54 @@ async def resolve_attachments(
     resolved: list[dict[str, Any]] = []
     consumed: list[str] = []
     for index, attachment in enumerate(validated, start=1):
+        if isinstance(attachment, dict) and isinstance(attachment.get("local_grant"), str):
+            try:
+                from opensquilla.gateway.desktop_artifact_bridge import (
+                    get_desktop_artifact_bridge_client,
+                )
+                client = get_desktop_artifact_bridge_client()
+                if client is None:
+                    raise ValueError("local file references are unavailable")
+                path = await client.resolve_local_file(
+                    grant=attachment["local_grant"],
+                    execution_environment=str(attachment.get("execution_environment") or "default"),
+                )
+                source = Path(path)
+                stat = source.stat()
+                if not source.is_file() or stat.st_size != attachment.get("size"):
+                    raise ValueError("local file changed after authorization")
+                digest = hashlib.sha256()
+                with source.open("rb") as handle:
+                    for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                        digest.update(chunk)
+                local_ref = {
+                    "kind": "attachment_ref",
+                    "type": attachment.get("type") or OPAQUE_MIME,
+                    "mime": attachment.get("type") or OPAQUE_MIME,
+                    "name": attachment.get("name") or "attachment",
+                    "size": stat.st_size,
+                    "sha256": digest.hexdigest(),
+                    "material_id": digest.hexdigest(),
+                    "store": "local",
+                    "scope": session_id,
+                    "source": "local",
+                    "_material_path": str(source),
+                    "_was_staged": True,
+                    **(
+                        {"usage": attachment["usage"]}
+                        if attachment.get("usage") in {"vision", "file"}
+                        else {}
+                    ),
+                }
+                resolved.append(local_ref)
+                continue
+            except Exception as exc:  # noqa: BLE001 - local grant failures are retryable
+                raise AttachmentResolutionError(
+                    f"attachments[{index}] local file grant could not be resolved; please upload",
+                    code=ATTACHMENT_EXPIRED_CODE,
+                    attachment_index=index,
+                    file_uuid=None,
+                ) from exc
         ref = attachment.get("file_uuid") if isinstance(attachment, dict) else None
         if not isinstance(ref, str):
             resolved.append(attachment)
@@ -716,23 +803,52 @@ async def resolve_attachments(
                 f"attachments[{index}] file_uuid resolution requires a material target"
             )
         raw_bytes, _was_bytes = _raw_bytes_from_data(item.get("data"), index=index)
-        sha, _path, _wrote = write_transcript_material(
-            media_root=material_root,
-            session_id=session_id,
-            payload=raw_bytes,
-            disk_budget_bytes=disk_budget_bytes,
-        )
+        # Recompute from the bytes rather than trusting adapter metadata.
+        # This also keeps compatibility with lightweight stores that omit a
+        # digest while guaranteeing the persisted ref addresses these bytes.
+        sha = hashlib.sha256(raw_bytes).hexdigest()
+        owner = meta.get("owner") or "uploads"
+        resource_id = meta.get("resource_id") or ref
+        claim = getattr(store, "claim", None)
+        if callable(claim):
+            try:
+                claimed_meta = await claim(
+                    ref, owner=session_id, material_root=material_root
+                )
+            except TypeError:
+                claimed_meta = await claim(ref, owner=session_id)
+            if isinstance(claimed_meta, dict):
+                owner = claimed_meta.get("owner") or owner
+                resource_id = claimed_meta.get("resource_id") or resource_id
+                meta = claimed_meta
+        stored_name = meta.get("name")
+        if not isinstance(owner, str) or not isinstance(resource_id, str):
+            raise ValueError(f"attachments[{index}] upload metadata is invalid")
+        if not isinstance(stored_name, str) or not stored_name:
+            raise ValueError(f"attachments[{index}] upload filename is invalid")
+        # The path is keyed by the store's sanitized filename. Ignore a caller
+        # supplied display-name override so the persisted ref resolves exactly
+        # to the bytes that were uploaded.
+        item["name"] = stored_name
+        # UploadStore already durably owns this file under inputs/<owner>/<resource>.
+        # Keep a logical managed ref so the accepted transcript does not depend on
+        # the short-lived upload UUID or a session-owned transcript copy.
         resolved.append(
-            make_attachment_ref(
+            make_input_attachment_ref(
                 sha256=sha,
                 name=item["name"],
                 mime=item["type"],
                 size=len(raw_bytes),
-                session_id=session_id,
+                owner=owner,
+                resource_id=resource_id,
                 source="upload",
+                usage=(
+                    item.get("usage")
+                    if item.get("usage") in {"vision", "file"}
+                    else None
+                ),
             )
         )
-        consumed.append(ref)
     enforce_total_attachment_bytes(resolved)
     return resolved, consumed
 
@@ -850,6 +966,32 @@ async def stage_pending_chat_input_attachments(
         file_uuid = attachment.get("file_uuid")
         source = "inline"
         item = attachment
+        local_grant = attachment.get("local_grant")
+        if isinstance(local_grant, str) and local_grant:
+            try:
+                from opensquilla.gateway.desktop_artifact_bridge import (
+                    get_desktop_artifact_bridge_client,
+                )
+                client = get_desktop_artifact_bridge_client()
+                if client is None:
+                    raise ValueError("local file references are unavailable")
+                path = await client.resolve_local_file(grant=local_grant)
+                source_path = Path(path)
+                if (
+                    not source_path.is_file()
+                    or source_path.stat().st_size != attachment.get("size")
+                ):
+                    raise ValueError("local file changed after authorization")
+                item = {k: v for k, v in attachment.items() if k != "local_grant"}
+                item["data"] = source_path.read_bytes()
+                source = "local"
+            except Exception as exc:  # noqa: BLE001 - map to a retryable send error
+                raise AttachmentResolutionError(
+                    f"attachments[{index}] local file grant could not be resolved; please upload",
+                    code=ATTACHMENT_EXPIRED_CODE,
+                    attachment_index=index,
+                    file_uuid=None,
+                ) from exc
         if isinstance(file_uuid, str) and file_uuid:
             try:
                 payload, meta = await upload_store.get(file_uuid)
@@ -902,6 +1044,11 @@ async def stage_pending_chat_input_attachments(
                 session_id=session_id,
                 pending_input_id=pending_input_id,
                 source=source,
+                usage=(
+                    item.get("usage")
+                    if item.get("usage") in {"vision", "file"}
+                    else None
+                ),
             )
         )
 

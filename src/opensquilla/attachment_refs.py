@@ -186,6 +186,41 @@ def _link_or_copy(src: Path, dst: Path) -> None:
     _atomic_write_bytes(dst, native_io_path(src).read_bytes())
 
 
+def copy_inputs_material(
+    *,
+    media_root: Path,
+    source_owner: str,
+    target_owner: str,
+    resource_ids: set[str] | frozenset[str] | None = None,
+) -> int:
+    """Copy managed input resources when a session fork changes ownership."""
+    source_dir = inputs_material_dir(media_root, source_owner, "resource").parent
+    native_source = native_io_path(source_dir)
+    if not native_source.is_dir() or native_source.is_symlink():
+        return 0
+    selected = None if resource_ids is None else {str(v) for v in resource_ids}
+    copied = 0
+    target_root = inputs_material_dir(media_root, target_owner, "resource").parent
+    for resource_dir in native_source.iterdir():
+        if not resource_dir.is_dir() or resource_dir.is_symlink():
+            continue
+        if selected is not None and resource_dir.name not in selected:
+            continue
+        target_dir = target_root / resource_dir.name
+        for source_path in resource_dir.iterdir():
+            if not source_path.is_file() or source_path.is_symlink():
+                continue
+            target_path = target_dir / source_path.name
+            if native_io_path(target_path).exists():
+                continue
+            try:
+                _link_or_copy(source_path, target_path)
+            except OSError:
+                continue
+            copied += 1
+    return copied
+
+
 def write_transcript_material(
     *,
     media_root: Path,
@@ -291,6 +326,43 @@ def copy_transcript_material(
     return copied
 
 
+def make_input_attachment_ref(
+    *,
+    sha256: str,
+    name: str,
+    mime: str,
+    size: int,
+    owner: str,
+    resource_id: str,
+    source: str,
+    usage: str | None = None,
+) -> dict[str, Any]:
+    """Create a managed original-file reference under ``inputs``."""
+    sha = _validate_sha256(sha256)
+    if not isinstance(owner, str) or not owner.strip():
+        raise ValueError("input attachment owner is required")
+    if not isinstance(resource_id, str) or not resource_id.strip():
+        raise ValueError("input attachment resource id is required")
+    ref = {
+        "kind": ATTACHMENT_REF_KIND,
+        "type": mime,
+        "mime": mime,
+        "name": name,
+        "size": size,
+        "sha256": sha,
+        "material_id": sha,
+        "store": INPUT_MATERIAL_STORE,
+        "scope": owner,
+        "owner": owner,
+        "resource_id": resource_id,
+        "source": source,
+        "_was_staged": True,
+    }
+    if usage in {"vision", "file"}:
+        ref["usage"] = usage
+    return ref
+
+
 def make_attachment_ref(
     *,
     sha256: str,
@@ -299,9 +371,10 @@ def make_attachment_ref(
     size: int,
     session_id: str,
     source: str,
+    usage: str | None = None,
 ) -> dict[str, Any]:
     sha = _validate_sha256(sha256)
-    return {
+    ref = {
         "kind": ATTACHMENT_REF_KIND,
         "type": mime,
         "mime": mime,
@@ -314,6 +387,9 @@ def make_attachment_ref(
         "source": source,
         "_was_staged": True,
     }
+    if usage in {"vision", "file"}:
+        ref["usage"] = usage
+    return ref
 
 
 def make_pending_chat_input_attachment_ref(
@@ -325,11 +401,12 @@ def make_pending_chat_input_attachment_ref(
     session_id: str,
     pending_input_id: str,
     source: str,
+    usage: str | None = None,
 ) -> dict[str, Any]:
     sha = _validate_sha256(sha256)
     pending_input_id = pending_input_id.strip()
     _pending_input_owner_segment(pending_input_id)
-    return {
+    ref = {
         "kind": ATTACHMENT_REF_KIND,
         "type": mime,
         "mime": mime,
@@ -343,6 +420,9 @@ def make_pending_chat_input_attachment_ref(
         "source": source,
         "_was_staged": True,
     }
+    if usage in {"vision", "file"}:
+        ref["usage"] = usage
+    return ref
 
 
 def write_pending_chat_input_manifest(
@@ -603,6 +683,11 @@ def promote_pending_chat_input_attachments(
                     read_attachment_ref_bytes(attachment, media_root=media_root)
                 ).decode("ascii"),
                 "_was_staged": True,
+                **(
+                    {"usage": attachment["usage"]}
+                    if attachment.get("usage") in {"vision", "file"}
+                    else {}
+                ),
             }
             for attachment in attachments
         ]
@@ -664,6 +749,11 @@ def promote_pending_chat_input_attachments(
                 size=len(payload),
                 session_id=target_session_id,
                 source="pending_chat_input",
+                usage=(
+                    attachment.get("usage")
+                    if attachment.get("usage") in {"vision", "file"}
+                    else None
+                ),
             )
         )
     return promoted
@@ -703,6 +793,11 @@ def attachment_ref_material_path(ref: dict[str, Any], *, media_root: Path) -> Pa
     if not is_attachment_ref(ref):
         raise ValueError("attachment is not a material ref")
     store = ref.get("store")
+    if store == "local":
+        path = ref.get("_material_path")
+        if not isinstance(path, str) or not path or not os.path.isabs(path):
+            raise ValueError("local attachment ref path is unavailable")
+        return Path(path)
     scope = ref.get("scope")
     if not isinstance(scope, str) or not scope:
         raise ValueError("attachment ref scope is required")

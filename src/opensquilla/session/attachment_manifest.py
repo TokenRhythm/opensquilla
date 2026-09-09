@@ -25,6 +25,7 @@ from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from typing import Any, Protocol, cast
 
+from opensquilla.contracts.attachments import normalize_attachment_usage
 from opensquilla.session.keys import canonicalize_session_key
 from opensquilla.session.models import SessionContextState
 
@@ -340,6 +341,7 @@ def _occurrence_from_item(
             if isinstance(item.get("pending_input_id"), str)
             else None
         ),
+        usage=normalize_attachment_usage(item.get("usage")),
     )
 
 
@@ -434,6 +436,7 @@ def preserve_attachment_occurrence_ids(
     *,
     session_id: str,
     source_message_id: str,
+    target_material_owner: str | None = None,
 ) -> str | None:
     """Bind legacy occurrence IDs before copying an envelope to a fork.
 
@@ -448,10 +451,21 @@ def preserve_attachment_occurrence_ids(
     if parsed is None:
         return content
     attachments = parsed.get("attachments")
-    if not isinstance(attachments, list) or not any(
-        isinstance(item, Mapping) and valid_attachment_id(item.get("attachment_id")) is None
+    if not isinstance(attachments, list):
+        return content
+    needs_rewrite = any(
+        isinstance(item, Mapping)
+        and (
+            valid_attachment_id(item.get("attachment_id")) is None
+            or (
+                target_material_owner
+                and item.get("store") == "inputs"
+                and item.get("owner") == session_id
+            )
+        )
         for item in attachments
-    ):
+    )
+    if not needs_rewrite:
         return content
     occurrences = extract_attachment_occurrences_from_envelope(
         parsed,
@@ -461,10 +475,18 @@ def preserve_attachment_occurrence_ids(
     copied_attachments = list(attachments)
     for occurrence in occurrences:
         item = attachments[occurrence.ordinal]
-        copied_attachments[occurrence.ordinal] = {
+        rewritten = {
             **item,
             "attachment_id": occurrence.attachment_id,
         }
+        if (
+            target_material_owner
+            and rewritten.get("store") == "inputs"
+            and rewritten.get("owner") == session_id
+        ):
+            rewritten["owner"] = target_material_owner
+            rewritten["scope"] = target_material_owner
+        copied_attachments[occurrence.ordinal] = rewritten
     return json.dumps(
         {**parsed, "attachments": copied_attachments},
         ensure_ascii=False,
@@ -490,6 +512,7 @@ class AttachmentOccurrence:
     owner: str | None = None
     resource_id: str | None = None
     pending_input_id: str | None = None
+    usage: str | None = None
 
     @property
     def message_id(self) -> str:
@@ -526,6 +549,8 @@ class AttachmentOccurrence:
         }
         if self.missing_reason:
             payload["missing_reason"] = self.missing_reason
+        if self.usage in {"vision", "file"}:
+            payload["usage"] = self.usage
         if self.store != "transcript":
             payload["store"] = self.store
             if self.owner:
@@ -583,6 +608,7 @@ class AttachmentOccurrence:
             if isinstance(raw.get("pending_input_id"), str)
             else None
         )
+        usage = normalize_attachment_usage(raw.get("usage"))
         return cls(
             attachment_id=attachment_id,
             source_entry_id=source_entry_id,
@@ -599,6 +625,7 @@ class AttachmentOccurrence:
             owner=owner,
             resource_id=resource_id,
             pending_input_id=pending_input_id,
+            usage=usage,
         )
 
 
@@ -681,6 +708,7 @@ def _merge_occurrence(
         owner=old.owner or new.owner,
         resource_id=old.resource_id or new.resource_id,
         pending_input_id=old.pending_input_id or new.pending_input_id,
+        usage=old.usage or new.usage,
     )
 
 

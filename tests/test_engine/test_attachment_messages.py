@@ -133,6 +133,28 @@ def test_image_emits_image_block() -> None:
     assert image_blocks[0].media_type == "image/png"
 
 
+def test_image_file_usage_emits_file_metadata_without_image_block(tmp_path: Path) -> None:
+    payload = b"\x89PNG\r\n\x1a\n"
+    out = TurnRunner._build_attachment_messages(
+        "read this as a file",
+        [{
+            "type": "image/png",
+            "data": _b64(payload),
+            "name": "diagram.png",
+            "usage": "file",
+        }],
+        workspace_dir=tmp_path / "workspace",
+        session_id="s-file-image",
+    )
+    assert out is not None
+    blocks = out[0].content
+    assert not any(isinstance(block, ContentBlockImage) for block in blocks)
+    text = "\n".join(block.text for block in blocks if isinstance(block, ContentBlockText))
+    assert "image attachment used as file" in text
+    assert "image pixels were not sent to the model" in text
+    assert "diagram.png (image/png" in text
+
+
 def test_inline_image_materializes_to_workspace_without_losing_vision_block(
     tmp_path: Path,
 ) -> None:
@@ -214,6 +236,26 @@ def test_image_ref_hydrates_for_current_provider_call(tmp_path: Path) -> None:
     assert workspace_paths[0].read_bytes() == payload
 
 
+def test_image_file_ref_uses_canonical_path_without_workspace_copy(tmp_path: Path) -> None:
+    payload = b"\x89PNG\r\n\x1a\n"
+    workspace = tmp_path / "workspace"
+    out = TurnRunner._build_attachment_messages(
+        "read as a file",
+        [{**_ref(tmp_path, payload, name="p.png", mime="image/png"), "usage": "file"}],
+        media_root=tmp_path,
+        workspace_dir=workspace,
+        session_id="s1",
+    )
+    assert out is not None
+    assert not any(isinstance(block, ContentBlockImage) for block in out[0].content)
+    marker = "\n".join(
+        block.text for block in out[0].content if isinstance(block, ContentBlockText)
+    )
+    assert "image attachment used as file" in marker
+    assert "transcripts/s1" in marker
+    assert not (workspace / ".opensquilla" / "attachments").exists()
+
+
 def test_historical_inline_image_envelope_can_replay_for_vision() -> None:
     content = json.dumps(
         {
@@ -240,6 +282,36 @@ def test_historical_inline_image_envelope_can_replay_for_vision() -> None:
     assert len(image_blocks) == 1
     assert image_blocks[0].media_type == "image/png"
     assert image_blocks[0].data == _b64(b"\x89PNG\r\n\x1a\n")
+
+
+def test_historical_inline_image_file_usage_stays_text_only(tmp_path: Path) -> None:
+    payload = b"\x89PNG\r\n\x1a\n"
+    content = json.dumps(
+        {
+            "text": "read this image as a file",
+            "attachments": [
+                {
+                    "type": "image/png",
+                    "data": _b64(payload),
+                    "name": "diagram.png",
+                    "usage": "file",
+                }
+            ],
+        }
+    )
+
+    out = TurnRunner._maybe_unpack_attachments(
+        content,
+        preserve_image_attachments=True,
+        materialize_historical_attachments=True,
+        media_root=tmp_path,
+        session_id="history-file-image",
+        workspace_dir=tmp_path / "workspace",
+    )
+
+    assert isinstance(out, str)
+    assert "historical attachment available" in out
+    assert "diagram.png (image/png" in out
 
 
 def test_forked_legacy_historical_image_keeps_allowed_attachment_id() -> None:

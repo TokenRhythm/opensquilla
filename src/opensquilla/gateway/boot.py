@@ -1514,7 +1514,7 @@ def build_session_material_cleanup(config: Any) -> Any:
     """
     from opensquilla.agents.scope import resolve_agent_workspace_dir
     from opensquilla.artifacts import ArtifactStore
-    from opensquilla.attachment_refs import transcript_material_dir
+    from opensquilla.attachment_refs import inputs_material_dir, transcript_material_dir
     from opensquilla.attachment_workspace import _safe_path_segment
     from opensquilla.paths import media_root_from_config
     from opensquilla.session.keys import parse_agent_id
@@ -1527,6 +1527,23 @@ def build_session_material_cleanup(config: Any) -> Any:
         rmtree_scoped(
             transcript_material_dir(media_root, session_id),
             expected_name=session_id,
+        )
+        # Managed input resources may be owned by the session rather than the
+        # short-lived upload lease. Release their upload-store bookkeeping
+        # before removing the owner bucket so quota admission does not retain
+        # stale claimed entries after session deletion.
+        try:
+            from opensquilla.gateway.uploads import get_upload_store
+
+            release_owner = getattr(get_upload_store(), "release_owner", None)
+            if callable(release_owner):
+                await release_owner(session_id)
+        except Exception:  # noqa: BLE001 - deletion cleanup is best effort
+            log.warning("session.input_upload_release_failed", session_id=session_id)
+        inputs_owner_dir = inputs_material_dir(media_root, session_id, "resource").parent
+        rmtree_scoped(
+            inputs_owner_dir,
+            expected_name=inputs_owner_dir.name,
         )
         # 2. Tool-visible workspace materialization (per-session segment under the
         #    per-agent workspace). Resolve the agent from the session key so the

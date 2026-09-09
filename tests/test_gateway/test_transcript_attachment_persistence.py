@@ -57,6 +57,31 @@ def test_inline_attachment_stored_in_transcript_envelope(tmp_path: Path) -> None
     assert writes == []
 
 
+def test_image_usage_is_persisted_and_rebuilt_for_replay(tmp_path: Path) -> None:
+    inline = {
+        "type": "image/png",
+        "data": _b64(b"\x89PNG\r\n\x1a\n"),
+        "name": "diagram.png",
+        "usage": "file",
+    }
+    envelope, _writes = build_transcript_attachment_envelope(
+        text="read as file",
+        attachments=[inline],
+        session_id="s1",
+        media_root=tmp_path,
+        persist_enabled=True,
+    )
+    persisted = json.loads(envelope)["attachments"][0]
+    assert persisted["usage"] == "file"
+
+    _text, replay = rebuild_attachments_for_replay(
+        envelope,
+        session_id="s1",
+        media_root=tmp_path,
+    )
+    assert replay[0]["usage"] == "file"
+
+
 def test_transcript_envelope_can_separate_provider_and_display_text(tmp_path: Path) -> None:
     inline = {"type": "image/png", "data": _b64(b"\x89PNG\r\n\x1a\n"), "name": "p.png"}
     envelope, _writes = build_transcript_attachment_envelope(

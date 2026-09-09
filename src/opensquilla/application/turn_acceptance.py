@@ -1002,10 +1002,21 @@ async def _accept_turn(
         or getattr(route_envelope, "channel_id", None)
         or str(getattr(route_envelope, "source_kind", "unknown"))
     )
+    attachment_read_roots = tuple(
+        sorted({
+            str(item.get("_material_path"))
+            for item in raw_attachments
+            if isinstance(item, dict)
+            and item.get("store") == "local"
+            and isinstance(item.get("_material_path"), str)
+            and item.get("_material_path")
+        })
+    )
     route_envelope = ports.refine_route(
         route_envelope,
         metadata={
             **route_envelope.metadata,
+            "attachment_read_roots": list(attachment_read_roots),
             "client_request_id": ingress_identity.client_request_id,
             "client_message_id": client_message_id,
             "surface_id": surface_id,
