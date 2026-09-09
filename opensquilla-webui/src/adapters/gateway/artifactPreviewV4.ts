@@ -150,14 +150,12 @@ export function createArtifactPreview(
   async function run() {
     if (disposed || inFlight) return
     if (state.value === 'loaded' && objectUrl.value) return
-    const artifact = options.artifact()
-    const baseOrigin = baseOriginSource()
-    const request = bindArtifactBinaryRequest(http, artifact, {
-      baseOrigin,
+    const request = options.artifact ? bindArtifactBinaryRequest(http, options.artifact(), {
+      baseOrigin: baseOriginSource(),
       policy: options.requireSameOrigin ? 'same-origin' : 'allow-external',
       variant: options.variant === 'thumbnail' ? 'thumbnail' : 'content',
-    })
-    if (!request) {
+    }) : null
+    if (!request && !options.loadBlob) {
       state.value = 'error'
       errorCode.value = 'network'
       return
@@ -181,17 +179,26 @@ export function createArtifactPreview(
     let timedOut = false
 
     try {
-      const response = await request.execute({
-        sessionKey: options.sessionKey?.(),
-        signal: controller.signal,
-        // The preview controller owns its timeout so retries and UI state
-        // stay domain-defined instead of inheriting the transport default.
-        timeoutMs: 0,
-      })
+      let blob: Blob
+      if (options.loadBlob) {
+        blob = await options.loadBlob(controller.signal)
+        if (blob.size > maxBytes) {
+          throw new ArtifactPreviewLoadError('too_large', 'Preview exceeds size limit')
+        }
+      } else {
+        if (!request) throw new ArtifactPreviewLoadError('network', 'Preview is unavailable')
+        const response = await request.execute({
+          sessionKey: options.sessionKey?.(),
+          signal: controller.signal,
+          // The preview controller owns its timeout so retries and UI state
+          // stay domain-defined instead of inheriting the transport default.
+          timeoutMs: 0,
+        })
 
-      const blob = await readBlobWithProgress(response, p => {
-        if (seq === runSeq) progress.value = p
-      }, maxBytes)
+        blob = await readBlobWithProgress(response, p => {
+          if (seq === runSeq) progress.value = p
+        }, maxBytes)
+      }
       if (disposed || seq !== runSeq) return
       if (options.acceptBlob && !options.acceptBlob(blob)) {
         throw new ArtifactPreviewLoadError('unsupported', 'Preview media type is unsupported')

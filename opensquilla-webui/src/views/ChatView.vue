@@ -226,6 +226,7 @@
           @edit-message="editMessage"
           @edit-attachment="editAttachmentResource"
           @preview-attachment="previewAttachmentResource"
+          @preview-image="previewImageAttachment"
           @reuse-prompt-annotation="reusePromptAnnotation"
           @regenerate-message="handleRegenerateMessage"
           @toggle-share-message="toggleShareMessage"
@@ -676,6 +677,7 @@
       @keydown="onTextareaKeydown"
       @remove-attachment="removeAttachment"
       @retry-attachment="retryAttachment"
+      @preview-image="previewPendingImage"
       @set-busy-send-mode="busySendMode = $event"
       @set-run-mode="setComposerRunMode"
       @set-session-routing-mode="setComposerSessionRoutingMode"
@@ -1086,6 +1088,7 @@ import {
 import {
   collectClipboardFiles,
   hasModelInputImageAttachment,
+  normalizeDisplayAttachment,
   isSendableAttachment,
   shouldCaptureFilePaste,
 } from '@/utils/chat/attachments'
@@ -2940,6 +2943,7 @@ const chatSessionRuntime = useChatSessionRuntime({
   restoreWidgetState,
   resetStreamLiveTurnState,
   resetDraftComposer: () => {
+    artifactImageLightbox.close()
     inputText.value = ''
     pendingAttachments.value = []
     resetComposerInputHistory()
@@ -4837,6 +4841,24 @@ function subagentBody(text: string): string {
 }
 
 /* ── Artifacts ─────────────────────────────────────────────────────── */
+
+function previewImageAttachment(attachment: DisplayAttachment, attachments: readonly DisplayAttachment[]) {
+  artifactImageLightbox.openAttachments({
+    attachment,
+    navigationAttachments: attachments,
+    sessionKey: sessionKey.value,
+  })
+}
+
+function previewPendingImage(attachment: Attachment) {
+  artifactImageLightbox.openAttachments({
+    attachment: normalizeDisplayAttachment(attachment),
+    navigationAttachments: pendingAttachments.value.map(attachment => normalizeDisplayAttachment(attachment)),
+    // Drafts have a provisional runtime key before a session exists in the URL.
+    // Keep local previews owned by the visible route used by App's dialog guard.
+    sessionKey: readSessionFromUrl(),
+  })
+}
 
 async function downloadAttachment(attachment: DisplayAttachment): Promise<boolean> {
   const result = await artifactWorkbench.content.fetchAttachment(attachment, {
@@ -6868,6 +6890,7 @@ watch(() => [route.path, route.query.agent, route.query.project], async () => {
   metaDraftRecovery.invalidate()
   const generation = draftProjectHydration.begin()
   if (!isDraftRoute()) return
+  artifactImageLightbox.close()
   if (!await syncDraftProjectFromRoute(generation)) return
   enterDraft()
   metaDraftRecovery.start(draftAgentId())

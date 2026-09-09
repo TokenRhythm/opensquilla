@@ -50,6 +50,30 @@ describe('createArtifactPreview', () => {
     controller.dispose()
   })
 
+  it('cancels attachment loading and ignores bytes returned after disposal', async () => {
+    let resolveBlob!: (blob: Blob) => void
+    let signal!: AbortSignal
+    const objectUrl = vi.spyOn(URL, 'createObjectURL')
+    const http = httpTransport(vi.fn())
+    const controller = createArtifactPreview(http, {
+      loadBlob: value => {
+        signal = value
+        return new Promise(resolve => { resolveBlob = resolve })
+      },
+      fullSize: true,
+    })
+    controller.load()
+    await vi.waitFor(() => expect(signal).toBeDefined())
+    controller.dispose()
+    expect(signal.aborted).toBe(true)
+    resolveBlob(new Blob(['image'], { type: 'image/png' }))
+    await Promise.resolve()
+    expect(objectUrl).not.toHaveBeenCalled()
+    expect(http.requestBinary).not.toHaveBeenCalled()
+    expect(controller.objectUrl.value).toBe('')
+    expect(controller.state.value).toBe('idle')
+  })
+
   it('aborts an active preview request when disposed', async () => {
     const observed: { signal?: AbortSignal } = {}
     const requestBinary = vi.fn(
