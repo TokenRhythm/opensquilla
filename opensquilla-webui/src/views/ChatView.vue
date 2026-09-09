@@ -3763,8 +3763,8 @@ applyPendingUserInputSnapshot = snapshot => {
   applyUserInputBootstrap({
     sessionKey: snapshot.sessionKey,
     epoch: snapshot.epoch,
-    streamSeq: snapshot.currentStreamSeq,
-    streamGeneration: snapshot.streamGeneration,
+    streamSeq: snapshot.pendingUserInputsCursor?.currentStreamSeq,
+    streamGeneration: snapshot.pendingUserInputsCursor?.streamGeneration,
     pendingUserInputs: [...snapshot.pendingUserInputs],
   })
 }

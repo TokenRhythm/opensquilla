@@ -305,8 +305,10 @@ function projectMetadata(
     runStatus: value.run_status,
     queuedTaskIds: Object.freeze([...(value.queued_task_ids ?? [])]),
     epoch: numberValue(value.epoch),
-    streamGeneration: textValue(raw.stream_generation) ?? readCursor?.stream_generation ?? null,
-    currentStreamSeq: numberValue(raw.current_stream_seq) ?? readCursor?.current_stream_seq ?? null,
+    pendingUserInputsCursor: Object.freeze({
+      streamGeneration: textValue(raw.stream_generation) ?? readCursor?.stream_generation ?? null,
+      currentStreamSeq: numberValue(raw.current_stream_seq) ?? readCursor?.current_stream_seq ?? null,
+    }),
     hydrationComplete: value.hydration_complete,
     deferredFields: Object.freeze([...value.deferred_fields]),
     additional: additionalFields(raw, METADATA_FIELDS),

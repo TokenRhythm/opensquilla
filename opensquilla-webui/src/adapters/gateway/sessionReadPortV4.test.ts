@@ -396,8 +396,7 @@ describe('v4 SessionReadPort Adapter', () => {
       activeTaskId: 'task-snapshot',
       initialMetadata: {
         hydrationComplete: false,
-        streamGeneration: 'stream-1',
-        currentStreamSeq: 9,
+        pendingUserInputsCursor: { streamGeneration: 'stream-1', currentStreamSeq: 9 },
         projectWorkspace: { display_name: 'Workspace One' },
       },
       snapshot: {
@@ -438,8 +437,7 @@ describe('v4 SessionReadPort Adapter', () => {
     history.resolve(historyResult())
     await expect(lease.metadata).resolves.toMatchObject({
       hydrationComplete: true,
-      streamGeneration: 'stream-1',
-      currentStreamSeq: 9,
+      pendingUserInputsCursor: { streamGeneration: 'stream-1', currentStreamSeq: 9 },
     })
     await expect(firstHistory).resolves.toMatchObject({ loadedCount: 1 })
 
@@ -476,8 +474,7 @@ describe('v4 SessionReadPort Adapter', () => {
       lastTask: { task_id: 'task-0' },
       queuedTaskIds: ['task-2'],
       epoch: 3,
-      streamGeneration: 'stream-1',
-      currentStreamSeq: 9,
+      pendingUserInputsCursor: { streamGeneration: 'stream-1', currentStreamSeq: 9 },
       hydrationComplete: true,
       additional: { future_metadata: { snake_value: true } },
     })
@@ -597,8 +594,7 @@ describe('v4 SessionReadPort Adapter', () => {
     // lower bound so an empty pending list cannot erase newer live questions.
     const expectedMetadata = {
       routing: { mode: 'manual' },
-      streamGeneration: 'stream-1',
-      currentStreamSeq: 9,
+      pendingUserInputsCursor: { streamGeneration: 'stream-1', currentStreamSeq: 9 },
     }
     await expect(firstRetry).resolves.toMatchObject(expectedMetadata)
     await expect(secondRetry).resolves.toMatchObject(expectedMetadata)
