@@ -151,4 +151,7 @@ def test_tool_context_appends_new_runtime_fields_after_legacy_fields() -> None:
         "tool_search_index",
         "tool_search_namespaces",
         "image_analysis_target",
+        "skill_install_turn",
     ]
+
+    assert ToolContext().skill_install_turn is None

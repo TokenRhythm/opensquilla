@@ -450,10 +450,18 @@ def test_deleted_unregistered_test_still_fails_closed(
     assert "unknown_path" in plan["reason_codes"]
 
 
+@pytest.mark.parametrize(
+    ("source", "skill_hub"),
+    [
+        ("src/opensquilla/engine/turn_runner/input_stage.py", False),
+        ("src/opensquilla/engine/runtime.py", True),
+        ("src/opensquilla/engine/agent.py", True),
+    ],
+)
 def test_shared_python_core_requests_complete_offline_python_only(
-    tmp_path: Path, suite_config: dict[str, Any]
+    tmp_path: Path, suite_config: dict[str, Any], source: str, skill_hub: bool,
 ) -> None:
-    plan = _plan(tmp_path, suite_config, "src/opensquilla/engine/runtime.py")
+    plan = _plan(tmp_path, suite_config, source)
 
     assert plan["full_fallback"] is False
     assert "python-full" in plan["required_suites"]
@@ -468,7 +476,15 @@ def test_shared_python_core_requests_complete_offline_python_only(
         ("ubuntu-latest", shard)
         for shard in suite_config["full_python_matrix"]["ubuntu"]
     }
-    assert plan["reason_codes"] == ["python_shared_core"]
+    assert plan["reason_codes"] == (
+        ["python_shared_core", "skill_hub_changed"] if skill_hub else ["python_shared_core"]
+    )
+    assert ("skill-hub" in plan["required_suites"]) is skill_hub
+    if skill_hub:
+        assert _platform_cells(plan, "skill-hub") == {
+            ("ubuntu-latest", "default"), ("macos-latest", "default"),
+            ("windows-latest", "default"),
+        }
 
 
 def test_generic_webui_change_does_not_wake_desktop_matrix(

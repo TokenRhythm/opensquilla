@@ -1905,6 +1905,7 @@ jobs:
             tests/test_skills_hub_doctor.py \
             tests/test_skills_hash_consumers.py \
             tests/test_skill_install_source.py \
+            tests/test_engine/test_skill_install_turn.py \
             tests/test_engine/test_skill_install_settlement.py \
             tests/test_gateway/test_skill_install_status.py \
             tests/test_skills/test_hub_install_operations.py \

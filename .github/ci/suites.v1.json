@@ -374,7 +374,9 @@
         "tests/test_gateway/test_skill_install_status.py",
         "tests/test_skills/test_hub_install_operations.py",
         "tests/test_skills/test_staging_io_worker.py",
-        "src/opensquilla/engine/agent.py"
+        "src/opensquilla/engine/agent.py",
+        "tests/test_engine/test_skill_install_turn.py",
+        "src/opensquilla/engine/runtime.py"
       ]
     },
     "managed-toolchain": {

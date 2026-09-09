@@ -285,6 +285,10 @@ class ToolContext:
         default=None, repr=False
     )
 
+    # Trusted install receipts are shared with built-in tools only for this turn.
+    # Appended to preserve positional compatibility; never serialize this state.
+    skill_install_turn: Any | None = field(default=None, repr=False)
+
     def __post_init__(self) -> None:
         # A restricted turn's ceiling is an authority boundary, not a policy
         # preference.  Normalize every caller (including embedded callers

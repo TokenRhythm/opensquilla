@@ -1527,6 +1527,7 @@
     "tests/test_engine/test_skill_install_settlement.py": 0.01,
     "tests/test_gateway/test_skill_install_status.py": 0.01,
     "tests/test_skills/test_hub_install_operations.py": 0.01,
-    "tests/test_skills/test_staging_io_worker.py": 0.01
+    "tests/test_skills/test_staging_io_worker.py": 0.01,
+    "tests/test_engine/test_skill_install_turn.py": 0.01
   }
 }

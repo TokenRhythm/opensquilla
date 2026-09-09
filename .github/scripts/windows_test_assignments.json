@@ -1299,6 +1299,7 @@
       "tests/test_engine/test_runtime_meta_invoke_surfacing.py",
       "tests/test_engine/test_runtime_tool_run_budget.py",
       "tests/test_engine/test_skill_install_settlement.py",
+      "tests/test_engine/test_skill_install_turn.py",
       "tests/test_engine/test_spawn_depth_unified.py",
       "tests/test_engine/test_stream_repetition_guard.py",
       "tests/test_engine/test_stream_wrappers.py",

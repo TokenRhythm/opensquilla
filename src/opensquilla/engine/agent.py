@@ -6850,6 +6850,15 @@ class Agent:
         self._projected_diagnostic_evidence = {}
         self._focused_retrieved_tool_result_handles = set()
         self._current_turn_message = message
+        from opensquilla.skills.install_turn import SkillInstallTurn
+
+        install_turn = SkillInstallTurn(semantic_message or message)
+        if self._tool_context is not None:
+            self._tool_context.skill_install_turn = install_turn
+            install_turn.finalization_allowed = not (
+                self._tool_context.goal_context or self._tool_context.plan_run_id
+                or self._tool_context.exclusive_tools is not None
+            )
         _meta_invoke_turn_count.set(0)
         usage_scope = current_usage_accounting_scope()
         reasoning_block_index = 0
@@ -15347,6 +15356,22 @@ class Agent:
                         finally:
                             for task in pending:
                                 tc = task_to_tool_call[task]
+                                if tc.tool_name == "skill_install_community":
+                                    from opensquilla.skills.install_source import (
+                                        resolve_install_source,
+                                    )
+
+                                    identifier = str(tc.arguments.get("identifier", ""))
+                                    source = resolve_install_source(
+                                        identifier, tc.arguments.get("source"),
+                                    )
+                                    receipt = install_turn.previous(identifier, source)
+                                    if receipt is not None:
+                                        results_by_id[tc.tool_use_id] = ToolResult(
+                                            tool_use_id=tc.tool_use_id,
+                                            tool_name=tc.tool_name,
+                                            content=json.dumps(receipt),
+                                        )
                                 result = results_by_id.get(tc.tool_use_id)
                                 if (
                                     result is None
@@ -15478,6 +15503,9 @@ class Agent:
                         yield event
 
                 for tc in tool_calls:
+                    peek_installs = getattr(pending_input_provider, "peek_pending", None)
+                    if callable(peek_installs) and peek_installs():
+                        install_turn.finalization_allowed = False
                     if dispatch_boundary is not None:
                         results_by_id[tc.tool_use_id] = _not_executed_after_dispatch_boundary(
                             tc,
@@ -15683,6 +15711,8 @@ class Agent:
                             # this provider batch. Pair every later tool call
                             # with a not-executed result, then perform exactly
                             # one tool-free final-summary model call.
+                            dispatch_boundary = mutex_result
+                        if mutex_result is not None and install_turn.complete:
                             dispatch_boundary = mutex_result
                         if _plan_run_checkpoint_enters_delivery_phase(mutex_result):
                             plan_run_delivery_only = True
@@ -16469,6 +16499,25 @@ class Agent:
                                     "asking the model to reassess the current patch once."
                                 ),
                             )
+                if install_turn.complete:
+                    if await _claim_pending_inputs_for_next_call():
+                        install_turn.finalization_allowed = False
+                    peek_installs = getattr(pending_input_provider, "peek_pending", None)
+                    if callable(peek_installs) and peek_installs():
+                        install_turn.finalization_allowed = False
+                if install_turn.complete:
+                    turn_messages.append(
+                        Message(role="user", content=tool_result_blocks)  # type: ignore[arg-type]
+                    )
+                    final_response_text = install_turn.final_text()
+                    final_text_parts[:] = [final_response_text]
+                    applied_model_call_boundaries.clear()
+                    yield TextDeltaEvent(
+                        text=final_response_text, presentation="answer",
+                        generation_epoch=generation_epoch,
+                    )
+                    last_executed_results = list(executed_results)
+                    break
                 budget_error = (
                     None if accepted_goal_terminal_status is not None else _turn_budget_error()
                 )
@@ -16604,7 +16653,11 @@ class Agent:
                     goal_terminal_final_status = accepted_goal_terminal_status
                     yield self._transition(AgentState.THINKING)
                     continue
-                await _claim_pending_inputs_for_next_call()
+                if await _claim_pending_inputs_for_next_call():
+                    install_turn.finalization_allowed = False
+                peek_installs = getattr(pending_input_provider, "peek_pending", None)
+                if callable(peek_installs) and peek_installs():
+                    install_turn.finalization_allowed = False
                 if progress_watchdog_guidance is not None:
                     turn_messages.append(Message(role="user", content=progress_watchdog_guidance))
                 if (

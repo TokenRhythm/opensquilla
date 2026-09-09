@@ -305,7 +305,10 @@ def _find_install_spec(skill_name: str, install_id: str) -> SkillInstallSpec:
     if skill is None or not _skill_available(skill_name):
         # Coding-mode-gated skills are reported as not-found so deps cannot be
         # previewed or installed via install_skill_deps while OFF (codex review).
-        raise ToolError(f"Skill not found: {skill_name}")
+        raise ToolError(
+            f"Skill not found: {skill_name} in this turn's catalog snapshot. "
+            "New installations become visible next turn; use the install receipt for status."
+        )
     if skill.metadata is None or not skill.metadata.install:
         raise ToolError(f"Skill has no install metadata: {skill_name}")
 
@@ -405,7 +408,10 @@ def create_skill_tools(
             include_stable_meta=False,
         )
         if not skills:
-            return "No skills installed."
+            return (
+                "No skills are available in this turn's catalog snapshot. "
+                "New installs appear next turn."
+            )
 
         from opensquilla.skills.eligibility import EligibilityContext, diagnose_eligibility
 
@@ -413,10 +419,16 @@ def create_skill_tools(
         # does not reveal a skill the agent cannot use.
         skills = [s for s in skills if _skill_available(s.name)]
         if not skills:
-            return "No skills installed."
+            return (
+                "No skills are available in this turn's catalog snapshot. "
+                "New installs appear next turn."
+            )
 
         ctx = EligibilityContext.auto()
-        lines = [f"Available skills ({len(skills)}):"]
+        lines = [
+            f"Available skills ({len(skills)}), current turn snapshot; "
+            "new installs appear next turn:"
+        ]
         for s in skills:
             report = diagnose_eligibility(s, ctx)
             lines.append(f"  - {s.name}: {s.description}")
@@ -489,7 +501,8 @@ def create_skill_tools(
                 "current skill catalog. Do not search host filesystem paths to "
                 "recover missing skills. Use skill_list to inspect available "
                 "skills, continue with available tools, or tell the user the "
-                "skill is not installed."
+                "skill is absent from this turn's fixed snapshot. A successful install "
+                "becomes visible next turn; absence here does not mean installation failed."
             )
 
         if file_path:
@@ -597,7 +610,9 @@ def create_skill_tools(
             "Install a Community skill from a GitHub URL, ClawHub, or another configured source. "
             "Use only when the user clearly asked to install a specific skill identifier "
             "or chose one exact result from skill_search_community. Do not use skill_create "
-            "for Community installs."
+            "for Community installs. The receipt is authoritative: after success, report it "
+            "without filesystem, config, reload, or same-turn catalog verification. For risk, "
+            "directory selection, or failure, report the required user action; do not retry."
         ),
         params={
             "identifier": {
@@ -662,6 +677,14 @@ def create_skill_tools(
         from opensquilla.skills.install_source import resolve_install_source
 
         source_id = resolve_install_source(clean_identifier, source)
+        from opensquilla.skills.install_turn import SkillInstallTurn
+
+        context = current_tool_context.get()
+        install_turn = getattr(context, "skill_install_turn", None)
+        if isinstance(install_turn, SkillInstallTurn):
+            previous = install_turn.previous(clean_identifier, source_id)
+            if previous is not None:
+                return json.dumps(previous)
 
         installer: Any = management_service
         if installer is None:
@@ -711,6 +734,21 @@ def create_skill_tools(
                     "The current turn keeps its pinned Skill catalog; "
                     "the installed catalog becomes observable from the next turn."
                 )
+            # The durable operation retains the complete result; the model needs
+            # lifecycle, source identity and actionable diagnostics, not reload data.
+            payload.pop("reload", None)
+            if not payload.get("success"):
+                payload["retryPolicy"] = "new_user_turn"
+            scan = payload.get("scan")
+            if isinstance(scan, dict):
+                payload["scan_verdict"] = scan.get("verdict")
+                payload["scan_findings"] = scan.get("findings", [])[:5]
+                payload["scan"] = {
+                    **scan, "findings": payload["scan_findings"],
+                    "truncated": bool(scan.get("truncated")) or len(scan.get("findings", [])) > 5,
+                }
+            if isinstance(install_turn, SkillInstallTurn):
+                install_turn.record(clean_identifier, source_id, payload)
             return json.dumps(payload)
         else:
             install = installer.install

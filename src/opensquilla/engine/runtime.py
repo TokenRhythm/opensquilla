@@ -5868,6 +5868,13 @@ class TurnRunner:
                 image_failure_cleanup = temporary_images.cleanup
                 attachment_cleanup = image_failure_cleanup
 
+            if tool_context is not None:
+                from opensquilla.skills.install_turn import SkillInstallTurn
+
+                tool_context = replace(
+                    tool_context,
+                    skill_install_turn=SkillInstallTurn(semantic_message or message),
+                )
             pt_outcome = await self._provider_and_tools_stage.run(
                 ProviderAndToolsStageInput(
                     session_key=session_key,
@@ -8344,6 +8351,20 @@ class TurnRunner:
             _resolve_submit_review(self._config) and not plan_mode and not attached_plan_run
         )
         if ctx is not None:
+            from opensquilla.skills.catalog_policy import project_public_catalog
+            from opensquilla.skills.install_turn import SkillInstallTurn
+
+            skill_tools: set[str] = set()
+            if isinstance(ctx.skill_install_turn, SkillInstallTurn):
+                skill_tools.update(ctx.skill_install_turn.surface_tools())
+            if project_public_catalog(
+                loaded_skills, coding_mode=ctx.coding_mode, include_stable_meta=False,
+            ):
+                skill_tools.update({"skill_list", "skill_view"})
+            if skill_tools:
+                if ctx.surfaced_tools is None:
+                    ctx.surfaced_tools = set()
+                ctx.surfaced_tools.update(skill_tools)
             # A lossy tool-result projection is only useful when the model can
             # recover the stored original. Surface the read-only retrieval tool
             # before the first schema is built; normal allow/deny/profile policy
