@@ -151,7 +151,9 @@ def test_validator_cli_selects_result_without_removing_full_verification() -> No
     }
 
 
-@pytest.mark.parametrize("operation", ["write", "check", "hash"])
+@pytest.mark.parametrize(
+    "operation", ["write", "check", "hash", "write-determinism", "check-determinism"]
+)
 @pytest.mark.parametrize("link_kind", ["directory", "artifact", "orphan"])
 def test_output_links_cannot_read_overwrite_or_remove_external_artifacts(
     tmp_path: Path,
@@ -191,3 +193,38 @@ def test_output_links_cannot_read_overwrite_or_remove_external_artifacts(
     assert target.read_text() == original
     if link_kind == "orphan":
         assert (target.parent / "stale.py").is_symlink()
+
+
+@pytest.mark.parametrize("operation", ["write-determinism", "check-determinism"])
+def test_second_render_cannot_redirect_composed_output_to_an_external_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    operation: str,
+) -> None:
+    destination = tmp_path / "verification"
+    source = runner.PYTHON_OUTPUT_ROOT / "review_probe.py"
+    target = destination / source.relative_to(ROOT)
+    target.parent.mkdir(parents=True)
+    target.write_text("previous\n", encoding="utf-8")
+    victim = tmp_path / "protected.py"
+    victim.write_text("preserved\n", encoding="utf-8")
+    probe = tmp_path / "link-probe"
+    try:
+        probe.symlink_to(victim)
+    except OSError as exc:
+        pytest.skip(f"filesystem link creation is unavailable: {exc}")
+    probe.unlink()
+    calls = 0
+
+    def render(*args: object, **kwargs: object) -> dict[Path, str]:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            target.unlink()
+            target.symlink_to(victim)
+        return {source: "replacement\n"}
+
+    monkeypatch.setattr(runner, "render_tree", render)
+    with pytest.raises(runner.ContractConfigurationError, match="link|outside"):
+        runner.run(operation, (), profile="verification", output_root=destination)
+    assert victim.read_text(encoding="utf-8") == "preserved\n"
