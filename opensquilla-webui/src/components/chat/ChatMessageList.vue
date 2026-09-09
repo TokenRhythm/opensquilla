@@ -57,6 +57,7 @@
           @edit="$emit('editMessage', $event)"
           @edit-attachment="$emit('editAttachment', $event)"
           @preview-attachment="$emit('previewAttachment', $event)"
+          @preview-image="$emit('previewImage', $event, messages[entry.index].attachments || [])"
           @reuse-prompt-annotation="$emit('reusePromptAnnotation', $event)"
           @toggle-share="$emit('toggleShareMessage', $event)"
         />
@@ -219,6 +220,7 @@ const emit = defineEmits<{
   editMessage: [message: ChatRenderedMessage]
   editAttachment: [attachment: import('@/types/chat').DisplayAttachment]
   previewAttachment: [attachment: import('@/types/chat').DisplayAttachment]
+  previewImage: [attachment: import('@/types/chat').DisplayAttachment, attachments: import('@/types/chat').DisplayAttachment[]]
   reusePromptAnnotation: [annotation: PromptAnnotationSnapshot]
   regenerateMessage: [
     message: ChatRenderedMessage,
