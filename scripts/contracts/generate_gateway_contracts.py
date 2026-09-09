@@ -2,9 +2,9 @@
 """Discover and generate every language-neutral Gateway v4 Contract.
 
 ``sessions.list`` predates this aggregate runner.  It deliberately keeps its
-original entry point so that adopting the runner does not rewrite its already
-reviewed generated artifacts.  New Contracts use the generic JSON Schema
-2020-12 path below.
+original entry point for its already-reviewed Python and TypeScript types.  Its
+runtime validators use the aggregate runner's browser-safe ESM path, as do new
+Contracts generated from the generic JSON Schema 2020-12 path below.
 """
 
 from __future__ import annotations
@@ -129,19 +129,16 @@ class ContractSpec:
 
     @property
     def outputs(self) -> tuple[Path, ...]:
-        # Generic validators are imported by the browser-side Vite adapter.
-        # They must be native ESM: Vite intentionally does not transform
-        # source-tree .cjs files during dev, so a named import would leave the
-        # browser with a CommonJS module that has no exports.  The legacy
-        # sessions.list generator remains byte-for-byte CJS compatible.
-        validator_suffix = "Validators.cjs" if self.uses_legacy_generator else "Validators.mjs"
-        declaration_suffix = ".d.cts" if self.uses_legacy_generator else ".d.mts"
+        # Validators are imported by browser-side Vite adapters. They must be
+        # native ESM: Vite intentionally does not transform source-tree .cjs
+        # files during dev, so a named import would leave the browser with a
+        # CommonJS module that has no exports.
         return (
             PYTHON_OUTPUT_ROOT / f"{self.python_stem}.py",
             PYTHON_OUTPUT_ROOT / f"{self.python_stem}_metadata.py",
             TYPESCRIPT_OUTPUT_ROOT / f"{self.typescript_stem}.ts",
-            TYPESCRIPT_OUTPUT_ROOT / f"{self.typescript_stem}{validator_suffix}",
-            TYPESCRIPT_OUTPUT_ROOT / f"{self.typescript_stem}Validators{declaration_suffix}",
+            TYPESCRIPT_OUTPUT_ROOT / f"{self.typescript_stem}Validators.mjs",
+            TYPESCRIPT_OUTPUT_ROOT / f"{self.typescript_stem}Validators.d.mts",
         )
 
     @property
@@ -1319,9 +1316,7 @@ def _render_validators(
     available = {role for role, _ in spec.targets}
     if roles is not None and (not set(roles) <= available or len(set(roles)) != len(roles)):
         raise ContractConfigurationError(f"invalid validator roles for {spec.wire_name}")
-    command = ["node", str(AJV_GENERATOR), str(spec.schema)]
-    if not spec.uses_legacy_generator:
-        command.append("--esm")
+    command = ["node", str(AJV_GENERATOR), str(spec.schema), "--esm"]
     if roles is not None:
         command.extend(["--roles", ",".join(roles)])
     validator = _capture(
@@ -1495,7 +1490,11 @@ def _load_legacy_generator(generator: Path) -> Any:
 
 
 def render_legacy(spec: ContractSpec) -> dict[Path, str]:
-    """Render frozen legacy bytes for type generation and compatibility tests."""
+    """Render the three frozen legacy type artifacts.
+
+    Runtime validators intentionally use ``_render_validators`` so production
+    adapters receive the same browser-safe ESM format as every other Contract.
+    """
     generator = next(
         generator
         for schema, generator in LEGACY_GENERATORS.items()
@@ -1513,14 +1512,8 @@ def render_legacy(spec: ContractSpec) -> dict[Path, str]:
     rendered = legacy.render()
     return dict(
         zip(
-            spec.outputs,
-            (
-                rendered.python,
-                rendered.python_metadata,
-                rendered.typescript,
-                rendered.validator_javascript,
-                rendered.validator_declarations,
-            ),
+            spec.outputs[:3],
+            (rendered.python, rendered.python_metadata, rendered.typescript),
             strict=True,
         )
     )
@@ -1853,11 +1846,10 @@ def render_tree(
     def render_contract(spec: ContractSpec) -> dict[Path, str]:
         roles = None if targets is None else targets.get((spec.contract_type, spec.wire_name), ())
         if spec.uses_legacy_generator:
-            frozen = render_legacy(spec)
-            artifacts = {path: frozen[path] for path in spec.outputs[:3]}
-            # Verification also materializes the two sessions.list roles
-            # absent from the frozen generator. Old bytes have a separate
-            # exact-output fixture, not a fabricated differential baseline.
+            artifacts = render_legacy(spec)
+            # Production now publishes the selected sessions.list result role;
+            # verification materializes all four roles. The legacy generator
+            # remains authoritative only for the three frozen type artifacts.
             artifacts.update(_render_validators(spec, roles))
             return artifacts
         return render_generic(spec, validator_roles=roles)

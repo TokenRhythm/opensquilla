@@ -1,4 +1,5 @@
 import { expect, test, type Page } from '@playwright/test'
+import { helloOkResponse } from './support/gateway-fixture'
 
 const CONTROL_URL = '/control/'
 const SESSION_KEY = 'agent:main:webchat:e2e-terminal-history-stale-live'
@@ -83,9 +84,8 @@ async function installStaleLiveFixture(page: Page) {
       }
       if (frame.type !== 'req') return
       if (frame.method === 'connect') {
-        ws.send(JSON.stringify({
-          protocol: 3,
-          policy: { tick_interval_ms: 30_000, concurrent_history_reads: true },
+        ws.send(helloOkResponse({
+          policy: { concurrent_history_reads: true },
         }))
         return
       }
@@ -133,7 +133,7 @@ async function installStaleLiveFixture(page: Page) {
         },
         'models.routing.get': { mode: 'direct' },
         'onboarding.status': { audioConfigured: false },
-        'sessions.list': { sessions: [], has_more: false },
+        'sessions.list': { sessions: [], count: 0, ts: 1_800_000_000, has_more: false },
         'sessions.messages.subscribe': staleLiveState,
         'sessions.messages.hydrate': staleLiveState,
         'sessions.messages.unsubscribe': { subscribed: false },

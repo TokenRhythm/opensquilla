@@ -1,4 +1,5 @@
 import { expect, test, type Page } from '@playwright/test'
+import { helloOkResponse } from './support/gateway-fixture'
 
 const CONTROL_URL = '/control/cron'
 
@@ -44,9 +45,7 @@ async function installCronRpc(page: Page, jobs: CronFixtureJob[]) {
       if (frame.type !== 'req' || frame.id === undefined) return
 
       if (frame.method === 'connect') {
-        ws.send(JSON.stringify({
-          protocol: 3,
-          policy: { tick_interval_ms: 30_000 },
+        ws.send(helloOkResponse({
           auth: { principal: { isOwner: true } },
           features: { methods: ['cron.list', 'workspaces.list'] },
         }))
@@ -58,7 +57,7 @@ async function installCronRpc(page: Page, jobs: CronFixtureJob[]) {
         'commands.list_for_surface': { commands: [] },
         'config.get': {},
         'cron.list': { jobs },
-        'sessions.list': { sessions: [], has_more: false },
+        'sessions.list': { sessions: [], count: 0, ts: 1_800_000_000, has_more: false },
         'usage.status': { sessions: [] },
         'workspaces.list': { workspaces: [] },
       }
