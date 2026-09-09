@@ -125,9 +125,7 @@ class ToolContext:
     # tools consult it so a concurrent catalog publish cannot change the
     # definitions visible halfway through a tool loop.
     skill_catalog: Any | None = None
-    # Armed by the engine (mutated in place, same pattern as
-    # router_control_turn_hold_applied) once the endgame git freeze margin is
-    # reached; shell tools then block workspace-reverting git commands.
+    # Deprecated, unused compatibility slot; preserve positional arguments.
     endgame_git_freeze_active: bool = False
     # New runtime-only fields stay at the end to preserve the public dataclass's
     # historical positional constructor contract for embedded callers.
@@ -143,14 +141,9 @@ class ToolContext:
     # matching model-facing description verbatim. None = mechanism off.
     tool_description_overrides: dict[str, str] | None = None
     tool_description_overrides_source: str | None = None  # "config" | "env_file"
-    # Set by the engine alongside the freeze margin reset: when True, a frozen
-    # git revert whose targeted diff is instrumentation-only (added print/log
-    # lines, nothing removed) is allowed through — cleaning up diagnostic
-    # output is exactly what the wrap-up window is for.
+    # Deprecated, unused compatibility slot; preserve positional arguments.
     endgame_git_freeze_instrumentation_exempt: bool = False
-    # Armed by the engine (mutated in place, pattern above) when the scratch
-    # verify-mirror lever is on: workspace write-deny messages then append
-    # guidance pointing at <scratch_dir>/verify-mirror/<workspace-relative-path>.
+    # Deprecated, unused compatibility slot; preserve positional arguments.
     scratch_verify_mirror_active: bool = False
 
     # Immutable Safe policy snapshot pinned at the start of this turn. New

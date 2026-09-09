@@ -4709,35 +4709,6 @@ def _resolve_finalize_evidence_gate(config: object) -> bool:
     return bool(getattr(prompt_cfg, "finalize_evidence_gate", False))
 
 
-_LEGACY_PROMPT_STYLE_ENV = "OPENSQUILLA_LEGACY_PROMPT_STYLE"
-_LEGACY_PROMPT_STYLE_ON = {"on", "1", "true", "yes"}
-_LEGACY_PROMPT_STYLE_OFF = {"off", "0", "false", "no"}
-
-
-def _resolve_legacy_prompt_style(config: object) -> bool:
-    """Resolve the opt-in legacy prompt style flag.
-
-    ``OPENSQUILLA_LEGACY_PROMPT_STYLE`` ("on"/"off") overrides
-    ``prompt.legacy_prompt_style`` from gateway config; default is off and
-    keeps the current prompt wording byte-identical. Unrecognized env values
-    raise instead of being silently ignored so a run manifest cannot record
-    an override the run did not actually apply.
-    """
-    env_value = os.environ.get(_LEGACY_PROMPT_STYLE_ENV, "").strip().lower()
-    if env_value:
-        if env_value in _LEGACY_PROMPT_STYLE_ON:
-            return True
-        if env_value in _LEGACY_PROMPT_STYLE_OFF:
-            return False
-        raise ValueError(
-            f"{_LEGACY_PROMPT_STYLE_ENV} must be one of: "
-            + ", ".join(sorted(_LEGACY_PROMPT_STYLE_ON | _LEGACY_PROMPT_STYLE_OFF))
-        )
-
-    prompt_cfg = getattr(config, "prompt", None)
-    return bool(getattr(prompt_cfg, "legacy_prompt_style", False))
-
-
 _SUBMIT_REVIEW_ENV = "OPENSQUILLA_SUBMIT_REVIEW"
 _SUBMIT_REVIEW_ON = {"on", "1", "true", "yes"}
 _SUBMIT_REVIEW_OFF = {"off", "0", "false", "no"}
@@ -9115,8 +9086,6 @@ class TurnRunner:
         finalize_evidence_gate = (
             False if restricted_tool_boundary else _resolve_finalize_evidence_gate(self._config)
         )
-        legacy_prompt_style = _resolve_legacy_prompt_style(self._config)
-
         agent_profile = AgentProfile(
             agent_id=agent_id,
             identity=AgentIdentity(
@@ -9132,7 +9101,6 @@ class TurnRunner:
             prompt_mode=prompt_mode,
             patch_evidence_protocol=patch_evidence_protocol,
             finalize_evidence_gate=finalize_evidence_gate,
-            legacy_prompt_style=legacy_prompt_style,
         )
         os_name = os.uname().sysname if hasattr(os, "uname") else platform.system()
         # The restricted provider projection must not contain a synthetic

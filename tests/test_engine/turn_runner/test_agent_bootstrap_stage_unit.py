@@ -28,7 +28,7 @@ from opensquilla.engine.turn_runner.agent_bootstrap_stage import (
     _ResolvedCatalog,
 )
 from opensquilla.engine.turn_runner.outcome import StageOutcome
-from opensquilla.engine.types import ThinkingLevel
+from opensquilla.engine.types import AgentConfig, ThinkingLevel
 from opensquilla.provider.types import ModelCapabilities
 from opensquilla.tools.types import ToolContext
 
@@ -376,23 +376,61 @@ async def test_length_capped_continuations_threads_to_agent_config() -> None:
     assert out.output.agent_config.length_capped_continuations == 3
 
 
+_RETIRED_EXPERIMENT_ENV_FIELDS = {
+    "OPENSQUILLA_REASONING_STREAM_CHAR_CAP": "reasoning_stream_char_cap",
+    "OPENSQUILLA_PLACEHOLDER_ESCALATION_THRESHOLD": "placeholder_escalation_threshold",
+    "OPENSQUILLA_MID_BUDGET_NO_DIFF_NUDGE": "mid_budget_no_diff_nudge",
+    "OPENSQUILLA_ENDGAME_FIX_DIRECTIVE_MARGIN_SECONDS": "endgame_fix_directive_margin_seconds",
+    "OPENSQUILLA_POST_WRITE_CONVERGENCE": "post_write_convergence_enabled",
+    "OPENSQUILLA_POST_WRITE_CONVERGENCE_WARN_THRESHOLD": "post_write_convergence_warn_threshold",
+    "OPENSQUILLA_POST_WRITE_CONVERGENCE_FINALIZE_AFTER_WARNING": (
+        "post_write_convergence_finalize_after_warning"
+    ),
+    "OPENSQUILLA_PATCH_HYGIENE_BLOCK": "patch_hygiene_block_mode",
+    "OPENSQUILLA_SCRATCH_VERIFY_MIRROR": "scratch_verify_mirror",
+    "OPENSQUILLA_ENDGAME_GIT_FREEZE_MARGIN_SECONDS": "endgame_git_freeze_margin_seconds",
+    "OPENSQUILLA_ENDGAME_GIT_FREEZE_INSTRUMENTATION_EXEMPT": (
+        "endgame_git_freeze_instrumentation_exempt"
+    ),
+}
+
+
 @pytest.mark.asyncio
-async def test_post_write_convergence_env_threads_to_agent_config(monkeypatch) -> None:
+@pytest.mark.parametrize("value", [None, "0", "1", "unexpected-old-value"])
+async def test_retired_experiment_env_does_not_activate_agent_config(monkeypatch, value) -> None:
+    for name in _RETIRED_EXPERIMENT_ENV_FIELDS:
+        if value is None:
+            monkeypatch.delenv(name, raising=False)
+        else:
+            monkeypatch.setenv(name, value)
+
     stage = _make_stage()
-    default_out = await stage.run(_make_input())
-    assert default_out.output.agent_config.post_write_convergence_enabled is False
+    out = await stage.run(_make_input())
+    defaults = AgentConfig()
 
-    monkeypatch.setenv("OPENSQUILLA_POST_WRITE_CONVERGENCE", "1")
-    monkeypatch.setenv("OPENSQUILLA_POST_WRITE_CONVERGENCE_WARN_THRESHOLD", "4")
-    monkeypatch.setenv("OPENSQUILLA_POST_WRITE_CONVERGENCE_FINALIZE_AFTER_WARNING", "2")
-    enabled_out = await stage.run(_make_input())
+    for field_name in _RETIRED_EXPERIMENT_ENV_FIELDS.values():
+        assert getattr(out.output.agent_config, field_name) == getattr(defaults, field_name)
 
-    assert enabled_out.output.agent_config.post_write_convergence_enabled is True
-    assert enabled_out.output.agent_config.post_write_convergence_warn_threshold == 4
-    assert (
-        enabled_out.output.agent_config.post_write_convergence_finalize_after_warning
-        == 2
-    )
+
+def test_retired_experiment_agent_config_keywords_remain_constructible() -> None:
+    legacy_values = {
+        "reasoning_stream_char_cap": 500,
+        "placeholder_escalation_threshold": 2,
+        "mid_budget_no_diff_nudge": True,
+        "endgame_fix_directive_margin_seconds": 120,
+        "post_write_convergence_enabled": True,
+        "post_write_convergence_warn_threshold": 4,
+        "post_write_convergence_finalize_after_warning": 2,
+        "patch_hygiene_block_mode": "protected_paths",
+        "scratch_verify_mirror": True,
+        "endgame_git_freeze_margin_seconds": 120,
+        "endgame_git_freeze_instrumentation_exempt": True,
+    }
+    config = AgentConfig(**legacy_values)
+
+    # These values remain constructor-compatible, not active runtime settings.
+    for field_name, value in legacy_values.items():
+        assert getattr(config, field_name) == value
 
 
 @pytest.mark.asyncio
@@ -405,66 +443,33 @@ async def test_tool_repeat_nudge_threshold_env_zero_disables_recovery(monkeypatc
 
 
 @pytest.mark.asyncio
-async def test_placeholder_escalation_and_wrapup_env_thread_to_agent_config(
+async def test_deadline_wrapup_env_threads_to_agent_config(
     monkeypatch,
 ) -> None:
     stage = _make_stage()
-    monkeypatch.delenv("OPENSQUILLA_PLACEHOLDER_ESCALATION_THRESHOLD", raising=False)
     monkeypatch.delenv("OPENSQUILLA_DEADLINE_WRAPUP_MARGIN_SECONDS", raising=False)
     default_out = await stage.run(_make_input())
-    assert default_out.output.agent_config.placeholder_escalation_threshold == 0
     assert default_out.output.agent_config.deadline_wrapup_margin_seconds == 0
 
-    monkeypatch.setenv("OPENSQUILLA_PLACEHOLDER_ESCALATION_THRESHOLD", "2")
     monkeypatch.setenv("OPENSQUILLA_DEADLINE_WRAPUP_MARGIN_SECONDS", "360")
     enabled_out = await stage.run(_make_input())
 
-    assert enabled_out.output.agent_config.placeholder_escalation_threshold == 2
     assert enabled_out.output.agent_config.deadline_wrapup_margin_seconds == 360
 
 
 @pytest.mark.asyncio
-async def test_final_diff_salvage_and_endgame_freeze_env_thread_to_agent_config(
+async def test_final_diff_salvage_env_threads_to_agent_config(
     monkeypatch,
 ) -> None:
     stage = _make_stage()
     monkeypatch.delenv("OPENSQUILLA_FINAL_DIFF_SALVAGE", raising=False)
-    monkeypatch.delenv("OPENSQUILLA_ENDGAME_GIT_FREEZE_MARGIN_SECONDS", raising=False)
     default_out = await stage.run(_make_input())
     assert default_out.output.agent_config.final_diff_salvage is False
-    assert default_out.output.agent_config.endgame_git_freeze_margin_seconds == 0
 
     monkeypatch.setenv("OPENSQUILLA_FINAL_DIFF_SALVAGE", "1")
-    monkeypatch.setenv("OPENSQUILLA_ENDGAME_GIT_FREEZE_MARGIN_SECONDS", "300")
     enabled_out = await stage.run(_make_input())
 
     assert enabled_out.output.agent_config.final_diff_salvage is True
-    assert enabled_out.output.agent_config.endgame_git_freeze_margin_seconds == 300
-
-
-@pytest.mark.asyncio
-async def test_reasoning_cap_and_mid_budget_nudge_env_thread_to_agent_config(
-    monkeypatch,
-) -> None:
-    stage = _make_stage()
-    monkeypatch.delenv("OPENSQUILLA_REASONING_STREAM_CHAR_CAP", raising=False)
-    monkeypatch.delenv("OPENSQUILLA_MID_BUDGET_NO_DIFF_NUDGE", raising=False)
-    default_out = await stage.run(_make_input())
-    assert default_out.output.agent_config.reasoning_stream_char_cap == 0
-    assert default_out.output.agent_config.mid_budget_no_diff_nudge is False
-
-    monkeypatch.setenv("OPENSQUILLA_REASONING_STREAM_CHAR_CAP", "20000")
-    monkeypatch.setenv("OPENSQUILLA_MID_BUDGET_NO_DIFF_NUDGE", "1")
-    enabled_out = await stage.run(_make_input())
-    assert enabled_out.output.agent_config.reasoning_stream_char_cap == 20000
-    assert enabled_out.output.agent_config.mid_budget_no_diff_nudge is True
-
-    # Garbage values fall back to the defaults instead of raising.
-    monkeypatch.setenv("OPENSQUILLA_REASONING_STREAM_CHAR_CAP", "banana")
-    monkeypatch.setenv("OPENSQUILLA_MID_BUDGET_NO_DIFF_NUDGE", "banana")
-    garbage_out = await stage.run(_make_input())
-    assert garbage_out.output.agent_config.reasoning_stream_char_cap == 0
-    assert garbage_out.output.agent_config.mid_budget_no_diff_nudge is False
 
 
 @pytest.mark.asyncio

@@ -163,7 +163,6 @@ from opensquilla.tools.run_mode import (
     trusted_sandbox_active,
 )
 from opensquilla.tools.source_diff_preservation import (
-    endgame_git_freeze_block_json,
     source_diff_preservation_block_json,
 )
 from opensquilla.tools.types import (
@@ -5625,23 +5624,6 @@ def _source_diff_preservation_shell_block(
     return None
 
 
-def _endgame_git_freeze_shell_block(
-    command: str,
-    *,
-    stdin: str | None = None,
-) -> str | None:
-    freeze_block = endgame_git_freeze_block_json(command=command)
-    if freeze_block is not None:
-        return freeze_block
-    if stdin is None:
-        return None
-    for stdin_chunk in _iter_stdin_guard_chunks(stdin):
-        freeze_block = endgame_git_freeze_block_json(command=stdin_chunk)
-        if freeze_block is not None:
-            return freeze_block
-    return None
-
-
 def _resolve_exec_timeout(timeout: float | int | None) -> float:
     if timeout is None:
         return _DEFAULT_EXEC_TIMEOUT
@@ -6673,12 +6655,6 @@ async def exec_command(
     scratch_block = _workspace_scratch_artifact_shell_block("exec_command", command, cwd)
     if scratch_block is not None:
         return json.dumps(scratch_block, ensure_ascii=False)
-    # Freeze first: when both guards would fire, the source-diff decision's
-    # candidate-lost marking and revert-observed events must not run for a
-    # command the freeze block prevents from executing at all.
-    endgame_freeze_block = _endgame_git_freeze_shell_block(command, stdin=stdin)
-    if endgame_freeze_block is not None:
-        return endgame_freeze_block
     source_diff_block = _source_diff_preservation_shell_block(command, cwd, stdin=stdin)
     if source_diff_block is not None:
         return source_diff_block
@@ -7195,11 +7171,6 @@ async def background_process(
     )
     if scratch_block is not None:
         return json.dumps(scratch_block, ensure_ascii=False)
-    # Freeze first, as in exec_command: no candidate-lost bookkeeping for a
-    # command the freeze block prevents from executing.
-    endgame_freeze_block = _endgame_git_freeze_shell_block(command)
-    if endgame_freeze_block is not None:
-        return endgame_freeze_block
     source_diff_block = _source_diff_preservation_shell_block(command, cwd)
     if source_diff_block is not None:
         return source_diff_block

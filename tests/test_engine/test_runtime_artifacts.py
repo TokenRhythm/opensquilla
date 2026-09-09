@@ -1914,7 +1914,6 @@ async def test_goal_terminal_result_is_an_immediate_tool_dispatch_boundary(
             max_provider_retries=0,
             max_turn_llm_calls=max_turn_llm_calls,
             max_turn_tool_errors=1 if terminal_accepted else 0,
-            reasoning_stream_char_cap=5,
             thinking=summary_mode in {"reasoning_stream", "thinking_error"},
         ),
         tool_definitions=[

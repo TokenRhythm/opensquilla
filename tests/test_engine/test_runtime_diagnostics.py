@@ -667,7 +667,6 @@ async def test_git_unavailable_skips_runtime_recovery_without_extra_model_retry(
             progress_watchdog_mode="log",
             tool_result_projection_max_inline_chars=10_000,
             tool_failure_loop_block_threshold=0,
-            post_write_convergence_enabled=True,
         ),
         tool_definitions=[_tool_def("exec_command")],
         tool_handler=handler,

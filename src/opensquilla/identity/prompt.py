@@ -76,7 +76,6 @@ def assemble_system_prompt(
         "prompt_mode": profile.prompt_mode,
         "patch_evidence_protocol": profile.patch_evidence_protocol,
         "finalize_evidence_gate": profile.finalize_evidence_gate,
-        "legacy_prompt_style": profile.legacy_prompt_style,
         "runtime_info": runtime_info,
         "docs_path": docs_path,
         "owner_line": owner_line,
