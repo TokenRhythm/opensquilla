@@ -22,17 +22,49 @@ def test_production_targets_preserve_every_approved_validator_role() -> None:
     specs = runner.discover_contracts()
     targets = runner.load_production_targets(specs)
 
-    assert len(targets) == 197
+    assert len(targets) == 198
     assert Counter(role for roles in targets.values() for role in roles) == {
-        "result": 188,
+        "result": 189,
         "params": 15,
         "payload": 8,
         "frame": 1,
     }
     assert sum(len(spec.targets) for spec in specs) == 877
-    assert ("method", "sessions.list") not in targets
+    assert targets[("method", "sessions.list")] == ("result",)
     assert targets[("method", "meta.list")] == ("result",)
     assert targets[("method", "meta.inspect")] == ("result",)
+
+
+def test_sessions_list_uses_browser_safe_esm_for_its_selected_validator(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sessions_list = next(
+        spec for spec in runner.discover_contracts() if spec.wire_name == "sessions.list"
+    )
+    commands: list[list[str]] = []
+
+    def capture(command: list[str], **_: object) -> str:
+        commands.append(command)
+        return "export const validateSessionsListResult = () => true\n"
+
+    monkeypatch.setattr(runner, "_capture", capture)
+    rendered = runner._render_validators(sessions_list, ("result",))
+
+    assert set(rendered) == set(sessions_list.outputs[3:])
+    assert sessions_list.outputs[3].name == "sessionsListValidators.mjs"
+    assert sessions_list.outputs[4].name == "sessionsListValidators.d.mts"
+    assert commands == [
+        [
+            "node",
+            str(AJV_GENERATOR),
+            str(sessions_list.schema),
+            "--esm",
+            "--roles",
+            "result",
+        ]
+    ]
+    assert "validateSessionsListResult" in rendered[sessions_list.outputs[4]]
+    assert "validateSessionsListRequestFrame" not in rendered[sessions_list.outputs[4]]
 
 
 @pytest.mark.parametrize(
