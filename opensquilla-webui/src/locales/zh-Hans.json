@@ -3070,7 +3070,14 @@
       "expandActivity": "展开安装活动",
       "collapseActivity": "收起安装活动",
       "selectSkillDirectory": "请选择技能目录",
+      "installPhase": {
+        "resolving": "解析技能来源",
+        "downloading": "下载技能文件",
+        "scanning": "扫描技能内容",
+        "committing": "保存安装结果"
+      },
       "queueStatus": {
+        "waiting": "等待安装结果",
         "selection_required": "待选择目录",
         "queued": "等待中",
         "installing": "安装中",

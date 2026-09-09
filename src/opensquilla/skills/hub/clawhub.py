@@ -25,6 +25,7 @@ from opensquilla.skills.hub.contracts import (
     SkillDiagnostic,
 )
 from opensquilla.skills.hub.github import GitHubSource
+from opensquilla.skills.hub.operations import report_install_progress
 from opensquilla.skills.hub.source import (
     SkillBundle,
     SkillMeta,
@@ -788,6 +789,7 @@ class ClawHubSource(SkillSource):
                                 with archive_path.open("wb") as output:
                                     async for chunk in response.aiter_bytes(CHUNK_SIZE):
                                         size += len(chunk)
+                                        report_install_progress("downloading", downloadedBytes=size)
                                         if exceeds_limit(
                                             size, DEFAULT_ARCHIVE_LIMITS.max_archive_bytes
                                         ):

@@ -28,6 +28,7 @@ from opensquilla.skills.hub.contracts import (
     DiagnosticSeverity,
     SkillDiagnostic,
 )
+from opensquilla.skills.hub.operations import report_install_progress
 from opensquilla.skills.hub.source import (
     SkillBundle,
     SkillMeta,
@@ -958,9 +959,11 @@ class GitHubSource(SkillSource):
                 file_modes: dict[str, int] = {}
                 pending = iter(selected)
                 actual_total = 0
+                completed_files = 0
+                report_install_progress("downloading", totalFiles=len(selected), completedFiles=0)
 
                 async def worker() -> None:
-                    nonlocal actual_total
+                    nonlocal actual_total, completed_files
                     for path, rel_path, _declared_size, file_mode in pending:
                         raw_url = (
                             f"https://raw.githubusercontent.com/{ref.repo_full}/"
@@ -969,6 +972,11 @@ class GitHubSource(SkillSource):
                         target = destination.joinpath(*PurePosixPath(rel_path).parts)
                         await _download_file(client, raw_url, target, self._headers())
                         actual_total += target.stat().st_size
+                        completed_files += 1
+                        report_install_progress(
+                            "downloading", completedFiles=completed_files,
+                            totalFiles=len(selected), downloadedBytes=actual_total,
+                        )
                         if exceeds_limit(actual_total, DEFAULT_ARCHIVE_LIMITS.max_expanded_bytes):
                             raise ValueError("Skill exceeds configured expanded-size limit")
                         if file_mode:

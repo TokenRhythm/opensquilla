@@ -2982,7 +2982,14 @@
       "expandActivity": "インストール状況を展開",
       "collapseActivity": "インストール状況を折りたたむ",
       "selectSkillDirectory": "スキルのディレクトリを選択",
+      "installPhase": {
+        "resolving": "スキルの取得元を確認中",
+        "downloading": "スキルファイルをダウンロード中",
+        "scanning": "スキルの内容を確認中",
+        "committing": "インストール結果を保存中"
+      },
       "queueStatus": {
+        "waiting": "インストール結果を待っています",
         "selection_required": "ディレクトリの選択待ち",
         "queued": "待機中",
         "installing": "インストール中",

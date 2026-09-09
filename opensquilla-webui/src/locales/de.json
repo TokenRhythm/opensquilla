@@ -2982,7 +2982,14 @@
       "expandActivity": "Installationsaktivität erweitern",
       "collapseActivity": "Installationsaktivität einklappen",
       "selectSkillDirectory": "Skill-Verzeichnis auswählen",
+      "installPhase": {
+        "resolving": "Skill-Quelle ermitteln",
+        "downloading": "Skill-Dateien herunterladen",
+        "scanning": "Skill-Inhalt prüfen",
+        "committing": "Installation speichern"
+      },
       "queueStatus": {
+        "waiting": "Installationsergebnis abwarten",
         "selection_required": "Verzeichnis auswählen",
         "queued": "Wartend",
         "installing": "Wird installiert",

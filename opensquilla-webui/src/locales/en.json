@@ -3070,7 +3070,14 @@
       "expandActivity": "Expand install activity",
       "collapseActivity": "Collapse install activity",
       "selectSkillDirectory": "Select a Skill directory",
+      "installPhase": {
+        "resolving": "Resolving Skill source",
+        "downloading": "Downloading Skill files",
+        "scanning": "Scanning Skill content",
+        "committing": "Saving installation"
+      },
       "queueStatus": {
+        "waiting": "Waiting for installation result",
         "selection_required": "Choose directory",
         "queued": "Queued",
         "installing": "Installing",

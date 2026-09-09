@@ -1,4 +1,5 @@
-import { computed, ref, type ComputedRef, type Ref } from 'vue'
+import { computed, ref, watch, getCurrentScope, onScopeDispose, type ComputedRef, type Ref } from 'vue'
+import { createSkillInstallReceipts } from './skillInstallReceipts'
 import i18n from '@/i18n'
 import type { SkillCatalog, SkillInstallResult } from '@/modules/skillCatalog'
 import { useToasts } from '@/composables/useToasts'
@@ -17,6 +18,7 @@ export type InstallResult = SkillInstallResult
 export type SkillInstallQueueStatus =
   | 'queued'
   | 'installing'
+  | 'waiting'
   | 'cancelling'
   | 'cancelled'
   | 'installed'
@@ -34,6 +36,7 @@ export interface SkillInstallQueueItem {
   status: SkillInstallQueueStatus
   result?: InstallResult
   error?: string
+  progress?: string
 }
 
 export function skillInstallRequiresRiskAcknowledgement(
@@ -246,6 +249,9 @@ export function useSkillRegistry(
 ): SkillRegistry {
   const { pushToast } = useToasts()
   const t = i18n.global.t
+  const receiptAbort = new AbortController()
+  if (getCurrentScope()) onScopeDispose(() => receiptAbort.abort())
+  const receipts = createSkillInstallReceipts(catalog, receiptAbort.signal)
   const registryQuery = ref('')
   const githubUrl = ref('')
   const registryResults = ref<RegistryResult[]>([])
@@ -273,6 +279,53 @@ export function useSkillRegistry(
   const uninstallingName = ref<string | null>(null)
   let searchRequestId = 0
   let cancelRequestedOperationId = ''
+
+  function showInstallProgress(item: SkillInstallQueueItem, phase: string) {
+    item.status = 'waiting'
+    if (['resolving', 'downloading', 'scanning', 'committing'].includes(phase)) {
+      item.progress = t(`cronSkills.registry.installPhase.${phase}`)
+    }
+  }
+
+  async function restoreInstallReceipts() {
+    if (!receipts.supported() || runningSource.value) return
+    let pending
+    try { pending = await receipts.pending() } catch { return }
+    if (!pending.length || !mutationGate.acquire('install_queue')) return
+    try {
+      for (const row of pending) {
+        const source = activitySource(row.source)
+        const item = requestToQueueItem(row)
+        item.status = 'waiting'
+        installActivities.value[source] = { items: [item], refreshWarning: '', phase: 'installing' }
+        const active = installActivities.value[source].items[0]!
+        runningSource.value = source
+        activeInstallOperation.value = { id: row.operationId, itemId: active.id, source }
+        try {
+          const result = await receipts.wait(row.operationId, status => showInstallProgress(active, status.phase))
+          active.result = result
+          active.status = result.recoveryRequired ? 'unknown' : result.cancelled ? 'cancelled' : result.success
+            ? (result.unchanged ? 'unchanged' : 'installed')
+            : skillInstallCandidates(result).length ? 'selection_required' : 'failed'
+          active.error = result.success || result.cancelled ? '' : result.message || ''
+          await refreshCatalogAfterBatch(source, [active])
+        } catch (error) {
+          active.status = 'unknown'
+          active.error = (error as Error).message
+        }
+        installActivities.value[source].phase = 'terminal'
+      }
+    } finally {
+      runningSource.value = null
+      activeInstallOperation.value = null
+      cancellingSource.value = null
+      mutationGate.release('install_queue')
+    }
+  }
+
+  watch(() => receipts.supported(), supported => {
+    if (supported) void restoreInstallReceipts()
+  }, { immediate: true })
 
   async function searchRegistry() {
     const query = registryQuery.value.trim()
@@ -379,7 +432,7 @@ export function useSkillRegistry(
       item.result = undefined
       installingId.value = item.id
       let rateLimited = false
-      const operationId = installCancellationSupported.value
+      const operationId = installCancellationSupported.value || receipts.supported()
         ? createInstallOperationId()
         : ''
       if (operationId) {
@@ -390,6 +443,10 @@ export function useSkillRegistry(
         }
       }
       try {
+        if (operationId && receipts.supported()) {
+          await receipts.remember({ operationId, identifier: item.identifier,
+            source: item.source, displayName: item.displayName })
+        }
         const res = await catalog.install({
           identifier: item.identifier,
           source: item.source,
@@ -397,10 +454,15 @@ export function useSkillRegistry(
           ...(riskConfirmation
             ? { riskConfirmation }
             : {}),
+        }).catch(async error => {
+          if (!operationId || !receipts.supported()) throw error
+          item.status = 'waiting'
+          return receipts.wait(operationId, status => showInstallProgress(item, status.phase))
         })
+        if (operationId && !res.recoveryRequired) receipts.forget(operationId)
         item.result = res
         item.displayName = res.name || item.displayName
-        item.status = res.cancelled
+        item.status = res.recoveryRequired ? 'unknown' : res.cancelled
           ? 'cancelled'
           : res.success
             ? (res.unchanged ? 'unchanged' : 'installed')
@@ -437,7 +499,7 @@ export function useSkillRegistry(
     for (const item of installActivities.value[source].items) {
       if (item.status !== 'queued'
         && item.status !== 'installing'
-        && item.status !== 'cancelling') continue
+        && item.status !== 'cancelling' && item.status !== 'waiting') continue
       item.status = 'unknown'
       item.error ||= t('cronSkills.registry.installResultUnknown')
     }

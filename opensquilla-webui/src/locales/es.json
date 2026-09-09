@@ -2982,7 +2982,14 @@
       "expandActivity": "Expandir actividad de instalación",
       "collapseActivity": "Contraer actividad de instalación",
       "selectSkillDirectory": "Selecciona un directorio de habilidades",
+      "installPhase": {
+        "resolving": "Resolviendo la fuente",
+        "downloading": "Descargando archivos",
+        "scanning": "Analizando el contenido",
+        "committing": "Guardando la instalación"
+      },
       "queueStatus": {
+        "waiting": "Esperando el resultado de instalación",
         "selection_required": "Elegir directorio",
         "queued": "En cola",
         "installing": "Instalando",

@@ -22,17 +22,18 @@ def test_production_targets_preserve_every_approved_validator_role() -> None:
     specs = runner.discover_contracts()
     targets = runner.load_production_targets(specs)
 
-    assert len(targets) == 197
+    assert len(targets) == 198
     assert Counter(role for roles in targets.values() for role in roles) == {
-        "result": 188,
+        "result": 189,
         "params": 15,
         "payload": 8,
         "frame": 1,
     }
-    assert sum(len(spec.targets) for spec in specs) == 877
+    assert sum(len(spec.targets) for spec in specs) == 881
     assert ("method", "sessions.list") not in targets
     assert targets[("method", "meta.list")] == ("result",)
     assert targets[("method", "meta.inspect")] == ("result",)
+    assert targets[("method", "skills.install.status")] == ("result",)
 
 
 @pytest.mark.parametrize(
