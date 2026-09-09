@@ -1,4 +1,5 @@
 import type { DisplayAttachment } from '@/types/chat'
+import { isImageAttachmentMime } from '@/utils/chat/attachments'
 import type {
   ArtifactAccessRequest,
   ArtifactContentAccess,
@@ -108,7 +109,9 @@ export async function fetchDisplayAttachmentBlob(
     }
   }
 
-  const encoded = attachment.downloadData || attachment.data
+  const dataUrl = attachment.dataUrl?.match(/^data:(image\/[^;,]+);base64,([\s\S]*)$/i)
+  const imageData = dataUrl && isImageAttachmentMime(dataUrl[1]) ? dataUrl[2] : undefined
+  const encoded = attachment.downloadData || attachment.data || imageData
   if (encoded) {
     const bytes = base64Bytes(encoded)
     if (!bytes) {

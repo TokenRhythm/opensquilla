@@ -226,8 +226,7 @@ export interface ArtifactContentAccess {
 export type ArtifactPreviewState = 'idle' | 'loading' | 'loaded' | 'timeout' | 'error'
 export type ArtifactPreviewErrorCode = 'network' | 'too_large' | 'unsupported' | null
 
-export interface ArtifactPreviewOptions {
-  artifact: () => ArtifactPayload
+export type ArtifactPreviewOptions = {
   sessionKey?: () => string | undefined
   variant?: 'content' | 'thumbnail'
   fullSize?: boolean
@@ -236,7 +235,10 @@ export interface ArtifactPreviewOptions {
   maxBytes?: number
   requireSameOrigin?: boolean
   acceptBlob?: (blob: Blob) => boolean
-}
+} & (
+  | { artifact: () => ArtifactPayload; loadBlob?: never }
+  | { artifact?: never; loadBlob: (signal: AbortSignal) => Promise<Blob> }
+)
 
 export interface ArtifactPreviewController {
   state: Ref<ArtifactPreviewState>
