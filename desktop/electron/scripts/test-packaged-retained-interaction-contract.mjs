@@ -1,8 +1,8 @@
 import assert from 'node:assert/strict'
 import { randomBytes } from 'node:crypto'
-import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises'
+import { mkdtemp, mkdir, readFile, realpath, rm, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { dirname, join, relative, resolve, sep } from 'node:path'
+import { basename, dirname, join, relative, resolve, sep } from 'node:path'
 import { test } from 'node:test'
 import { setTimeout as delay } from 'node:timers/promises'
 import { runInNewContext } from 'node:vm'
@@ -13,11 +13,14 @@ import { startRetainedProvider } from './fixtures/packaged-retained-interaction/
 // Pure fixture/loopback tests: never execute the dummy .exe, Electron, Gateway,
 // an installer, or a real profile. These results are not native acceptance.
 const credential = () => ({ provider: 'ollama', encryption: 'plain', apiKeyEnv: '', encryptedApiKey: '', searchApiKeyEnv: '', encryptedSearchApiKey: '', modelRoutingMode: 'direct', routerMode: 'disabled', model: 'opensquilla-release-session-recovery-smoke', baseUrl: 'http://127.0.0.1:11434' })
-async function fixture(t) {
-  const root = await mkdtemp(join(tmpdir(), 'opensquilla-retained-contract-'))
+async function fixture(t, temporaryDirectory = tmpdir()) {
+  // Hosted runners can expose TEMP through an alias or redirected parent.
+  // Allocate canonical fixture paths without weakening the audit's link guard.
+  const temporaryRoot = await realpath(temporaryDirectory)
+  const root = await mkdtemp(join(temporaryRoot, 'opensquilla-retained-contract-'))
   t.after(async () => {
     // Delete only this call's newly allocated temporary root, using one API.
-    const suffix = relative(resolve(tmpdir()), resolve(root))
+    const suffix = relative(resolve(temporaryRoot), resolve(root))
     assert.ok(suffix.startsWith('opensquilla-retained-contract-') && !suffix.includes(sep))
     await rm(root, { recursive: true, force: true })
   })
@@ -44,6 +47,18 @@ test('pinned synthetic inputs validate without rewriting credentials/config', as
   assert.equal(plan.provider.model, credential().model)
   await assertPreservedInputs(plan)
   assert.equal(await readFile(plan.credentialPath, 'utf8'), JSON.stringify(credential()))
+})
+test('redirected temporary parents yield canonical fixtures while audit aliases remain rejected', async t => {
+  const parent = await fixture(t)
+  const target = join(parent.root, 'temporary-target')
+  const alias = join(parent.root, 'temporary-alias')
+  await mkdir(target)
+  await symlink(target, alias, process.platform === 'win32' ? 'junction' : 'dir')
+  const f = await fixture(t, alias)
+  assert.equal(dirname(f.root), await realpath(target))
+  await verifyAuditInputs(f.manifestPath, f.outputDir)
+  const redirectedManifest = join(alias, basename(f.root), 'synthetic-profile', AUDIT_MARKER)
+  await assert.rejects(verifyAuditInputs(redirectedManifest, f.outputDir), /must not traverse redirected paths/)
 })
 test('PowerShell UTF-8 BOM is accepted but still included in preserved byte hashes', async t => {
   const f = await fixture(t)
