@@ -370,7 +370,7 @@ Ledger 审计快照：`1942bb33c0041a0e910b8f229089ff2d6f216dd3`。
 - [冻结工具与运行说明](https://github.com/Open-Squilla/swe-experiment-ledger/tree/d3b2173185d25430a6ba66ce1631af9aaeff291f/archives/opensquilla-experiment-control-plane/bbd0c429e106babeeec70a6c6d493b563696d576)；[逐文件 manifest](https://github.com/Open-Squilla/swe-experiment-ledger/blob/d3b2173185d25430a6ba66ce1631af9aaeff291f/archives/opensquilla-experiment-control-plane/bbd0c429e106babeeec70a6c6d493b563696d576/manifest.json) 记录原路径、mode、blob ID、SHA-256、行数、依赖和实际测试结果。
 - 已核对 GitHub 远端分支 SHA，并通过 contents API 取回同一 manifest blob ID `15ca31d8014ca639aad1206c109198d766fa7170`，之后才允许删除产品副本。
 
-D01 只移出 12 个脚本（4,450 行）、8 个专属测试（2,927 行）和原文档（63 行），整文件合计 7,440 行。八个测试为三个 `test_analyze_*`、两个 `test_check_*`，以及 `test_exp_ledger.py`、`test_exp_quarantine.py`、`test_replay_finalize_gate.py`；精确名单以 manifest 为准。
+D01 只移出 12 个脚本（4,450 行）、8 个专属测试（2,927 行）和原文档（63 行），整文件合计 7,440 行。八个测试为三个 `test_analyze_*`、两个 `test_check_*`，以及 `test_exp_ledger.py`、`test_exp_quarantine.py`、`test_replay_finalize_gate.py`；精确名单以 manifest 为准。连同 26 行引用清理，产品分支共删除 7,466 行；新增本方案文档 415 行，净减少 7,051 行，未新增运行时代码。
 
 其余修改限定为文档目录、gate 实现和 gate 测试的过时 module docstring、Windows assignments/durations 的八个对应记录。不会改运行逻辑、默认配置、工具名、参数槽位、env 消费者、安全策略或其他测试断言。Windows 的既有 overrides、guardrails 和 source_runs 历史证据保持不变。
 
@@ -384,7 +384,7 @@ D01 只移出 12 个脚本（4,450 行）、8 个专属测试（2,927 行）和�
 - 归档测试：原始源码 68 passed；归档 preflight 55 passed；归档完整测试 68 passed；11 个 CLI `--help` 通过。
 - 产品基线 preflight：27 passed。首次定向基线为 572 passed、3 failed、2 skipped；三个失败均为沙箱拒绝 `ps`，准确失败记录已保留。
 - 提升进程查询权限后，原失败的两个完整文件先通过 35 项 preflight，再运行完整定向基线：575 passed、2 skipped（107.93 秒）。未改测试、mock、skip 或产品代码。
-- 删除后验证：待 D01 删除提交执行；不能将基线结果当作删除后的结果。
+- 删除后验证：preflight 152 passed；完整定向测试 507 passed、2 skipped（111.85 秒）。JUnit 对比确认只少了迁往 ledger 的 68 个用例，所有存活用例结果与基线一致。独立审查确认两个 Python 文件除 module docstring 外 AST 完全一致、其他 Runtime 源码未变、Windows JSON 仅删除八个对应记录；lint、diff check、shard report 和活动引用检查均通过。
 
 两项既有跳过为 `test_live_xdist_worker_uses_isolated_runtime_roots` 的外层 xdist 条件，以及 `test_dockerignore_filters_real_build_context` 的 `OPENSQUILLA_DOCKERIGNORE_E2E` gate。它们不计为已验证；正常 PR CI 门禁保持原样。WebUI 脚本测试使用临时自造资产，不需要真实 WebUI build。没有启动真实 SWE、Provider 请求或历史实验命令。
 
