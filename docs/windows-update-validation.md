@@ -132,18 +132,20 @@ new client's own update path.
 
 ## Signed A-to-B handoff
 
-Use a disposable Windows account on a disposable Windows machine. Preinstall a
+Use a disposable Windows account, or an explicitly authorized host whose
+installation records have been checked and native Desktop profile is absent.
+Keep other source checkouts and CLI/portable profiles outside the audit.
+Preinstall a
 previously verified signed baseline A that contains both the new shell and the
 new update UI; stop A before this audit and leave the account's native
 `AppData\Roaming\OpenSquilla` directory absent.
-The same disposable account must be permitted to subscribe to
-`Win32_ProcessStartTrace`; on machines that deny it, use an elevated shell for
-that same account. Do not switch to another administrator's profile. The script
-registers the observer before seeding the profile and fails on access denial.
-An elevated audit shell also elevates its launched driver and baseline. Record
-that token context; it does not prove the ordinary unelevated client's UAC
-transition. The per-machine/UAC cell must separately exercise a baseline
-started at normal user privilege, with any privileged observer kept separate.
+For ordinary-user/UAC cells, select `ProcessObservationMode:
+standard-user-polling` and run the audit without elevation. This mode queries
+the observed B process's path, command line and creation time; it refuses an
+elevated launcher and does not claim a complete process-event trace. The
+default `cim-trace` mode still requires `Win32_ProcessStartTrace` access and
+fails before profile creation when subscription is denied. Elevating that
+mode also elevates A; it cannot prove an ordinary-user UAC transition.
 Prepare a newer signed stable candidate B and a rehearsal channel manifest
 from its immutable release assets. Both must satisfy the production Windows
 signing policy. No test certificate or verification bypass is accepted by the
@@ -167,6 +169,7 @@ placeholders, not an executable release recipe):
   "CandidateInstallerSha256": "<64 lowercase hex characters>",
   "CandidateSourceSha": "<40 lowercase hex characters>",
   "ChannelManifest": "C:\\signed-audit\\channel.json",
+  "ProcessObservationMode": "standard-user-polling",
   "InstallTimeoutSeconds": 600
 }
 ```
@@ -185,6 +188,15 @@ production signature policy are verified independently. It cannot infer or
 attest source identity from a binary. This mode rejects 0.5.3/0.5.4; the old
 manual parameter set keeps its original baseline validation and behavior.
 
+An approved branch can build Windows-only internal A/B artifacts through
+`Release Assets` with an empty `tag` and `internal_windows_only: true`.
+This keeps Web UI verification, production Windows signing and the original
+four legacy upgrade cells, while skipping Python/macOS packaging and aggregate
+publication. It does not publish a release or update OSS channels. Tagged
+releases reject this option before signing. The existing signing environment's
+branch restrictions and reviewer approval still apply; record each actual
+run/source SHA and artifact hash separately from the PR CI result.
+
 `EvidenceRoot` must be absent and inside the process temporary directory
 (`RUNNER_TEMP`, otherwise the OS temporary directory). The profile must be the
 account's actual native AppData directory and must not exist. The script seeds
@@ -193,7 +205,10 @@ only synthetic state there. It does not assume environment redirection or
 refused; it does not delete them or clean up the installation afterward.
 
 The outer helper first verifies A's version/hash and A/B production signatures,
-then launches the driver and captures process starts continuously. Keep an
+then launches the driver and observes process events or polls for B according
+to the selected mode. This preflight warms certificate caches; a cold-cache
+network cell requires a separate clean environment before any such verification.
+Keep an
 operator present throughout. Complete NSIS with Run OpenSquilla selected; do
 not launch B manually. After a new B main process with `--updated` is observed,
 confirm `FINISH-AUTOLAUNCH` only if B started from that Finish action. Electron
@@ -203,7 +218,8 @@ operator-attested and leaves `automaticRestartVerified` false.
 
 Next use B's actual tray Quit and confirm `QUIT`. The audit waits for B and its
 captured descendants to exit, binding each PID to its creation time. Timeout
-fails and preserves the scene; it never force-kills them. `normalQuitObserved`
+or a failed process query fails and preserves the scene; it never force-kills
+them. `normalQuitObserved`
 is scoped to that operator action and captured-process exit observation.
 
 The driver serves only the selected channel manifest on loopback. Installer
@@ -226,17 +242,24 @@ handoff diagnostics. The outer audit adds separately scoped postinstall evidence
 - `test-packaged-first-send-renderer.mjs` launches installed B with a separate
   absent `EvidenceRoot/first-send-new-profile`, verifying first send and owned
   Gateway readiness only for that new profile, using its synthetic provider.
-- `test-packaged-session-recovery.mjs` reopens the retained A/B profile with
-  seed-matching session keys and label, then
-  `verify-release-profile-preservation.py verify-runtime` checks the retained
-  synthetic state and external sentinels.
+- `test-packaged-retained-interaction.mjs` checks the credential hash captured
+  before A's handoff, visits the original seeded sessions, and creates a new
+  session for first send, a required `read_file` with an unpredictable sentinel,
+  real UI Stop, a follow-up send, normal Quit and same-profile restart. It never
+  rewrites the credential/config to make preservation pass. Three calls to the
+  original `verify-runtime` checker retain the exact old-history and external
+  sentinel assertions. Its independent report is bound to this audit ID,
+  source SHA and installed B hash; every required proof must be JSON `true`.
+  See the [probe contract](../desktop/electron/scripts/fixtures/packaged-retained-interaction/README.md).
 
 Even if every automated stage passes, the outer script returns **2** and writes
 `stage: postinstall-verified-with-gaps`, `ok: false`, and
-`releaseGatePassed: false`. A refusal/failure returns **1**. The evidence does
-not prove first send or a necessary tool call on the retained upgraded profile,
-chat Stop/restart, machine-proven Finish causality, or uninstall preservation.
-Record those separate native release gates before enabling the feature by
+`releaseGatePassed: false`. A refusal/failure returns **1**. The retained probe
+can establish interaction on the upgraded synthetic profile with a loopback
+provider; it does not establish NSIS/UAC cancellation, the full OS/path/scope
+matrix, cold certificate-network behavior, machine-proven Finish causality,
+or uninstall preservation. The former injected WebSocket recovery check is
+also separate. Record the outstanding native release gates before enabling the feature by
 default; do not reinterpret driver exit 0 or outer exit 2 as release success.
 
 Run this handoff for default and custom baseline installation directories.
