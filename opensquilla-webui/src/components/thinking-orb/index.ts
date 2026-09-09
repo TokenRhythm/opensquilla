@@ -1,0 +1,8 @@
+export { default as ThinkingOrb } from './ThinkingOrb.vue'
+export { modeRegistry } from './registry'
+export { registerBuiltinModes, ALL_STATES, STATE_LABELS } from './presets'
+export { registerShape } from './modes/MorphMode'
+export type { OrbState } from './presets'
+export type { OrbTheme } from './composables/useOrbTheme'
+export type { AnimationMode, FrameContext } from './engine/types'
+export { resetClock } from './engine/clock'

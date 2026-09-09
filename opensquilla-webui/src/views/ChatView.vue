@@ -324,10 +324,11 @@
           <div class="msg-ai-main">
             <ActivityDisclosure
               default-open
-              lifecycle="working"
+              :lifecycle="liveActivityProjection.lifecycle"
               :step-count="executionDockRun?.status === 'running' ? 0 : liveActivityStepCount"
               :failure-count="liveActivityFailureCount"
               :phase-label="liveActivityPhaseLabel"
+              :purpose-code="liveActivityPurposeCode"
               :elapsed-label="streamTurnElapsed"
               :stale="streamActivityStale"
             >
@@ -3925,6 +3926,15 @@ const liveActivityProjection = computed(() =>
 )
 const liveActivityPhaseLabel = computed(() => {
   return String(t('chat.activity.lifecycle.working'))
+})
+/** 当前活动集群的 purpose code（活跃 cluster 为 purposeRunning.*），用于细化 orb 动画状态 */
+const liveActivityPurposeCode = computed<string | null>(() => {
+  const projection = liveActivityProjection.value
+  if (!projection.currentClusterKey) return null
+  const cluster = projection.activityClusters.find(
+    c => c.key === projection.currentClusterKey,
+  )
+  return cluster?.purpose.code ?? null
 })
 const liveCurrentPhaseCode = computed(() => [...liveActivityProjection.value.statusSteps]
   .reverse()
