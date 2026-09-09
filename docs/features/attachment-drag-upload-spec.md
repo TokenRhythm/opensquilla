@@ -39,11 +39,12 @@ error states, retry behavior, and cross-platform desktop validation.
 - Preserve the existing attachment policy: max count, per-category size caps,
   total size cap, MIME sniffing, and staged upload TTL. Any file type is
   admitted; supported images retain canonical image input. Ordinary files
-  expose filename, MIME, size, and a tool-readable workspace path; their contents
+  expose filename, MIME, size, and a tool-readable managed path; their contents
   enter model context only after the agent reads them with available tools.
   Internally archived long user input retains its existing bounded preview.
   Existing upload payloads and attachment history remain readable without a
-  migration; workspace materialization and size limits remain unchanged.
+  migration; legacy inline history may still use workspace materialization for
+  compatibility, while managed references resolve from their logical resource.
 - Make upload progress and failure states visible in the composer.
 - Prevent sending while any attachment is still reading or uploading.
 - Ensure token-authenticated gateways can upload files by using the same bearer
