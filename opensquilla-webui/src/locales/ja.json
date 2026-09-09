@@ -3411,6 +3411,7 @@
     "liveConnecting": "リアルタイム更新を復元しています…",
     "liveConnectingConnected": "Gateway に接続済みです。このセッションのリアルタイム更新を復元しています…",
     "gatewayReconnecting": "Gateway に再接続しています…",
+    "automaticRecoveryDescription": "自動的に復旧しています。編集を続けられます。未送信のテキストと添付ファイルはここに保持されます。",
     "liveUnavailable": "リアルタイム更新を一時的に利用できません",
     "liveUnavailableDescription": "履歴は引き続き表示できます。送信前に再接続してください。",
     "liveUnavailableConnectedDescription": "Gateway には接続済みで、履歴も表示できます。リアルタイム更新の復元後に送信を再開できます。",

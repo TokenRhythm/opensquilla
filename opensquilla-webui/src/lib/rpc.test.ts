@@ -60,6 +60,12 @@ function establishConnection(
   })
 }
 
+/** Most RPC tests exercise an already authenticated connection. */
+function callOnReadySocket(client: RpcClient, ...args: Parameters<RpcClient['call']>) {
+  if (client.state !== 'connected') establishConnection(MockWebSocket.instances[MockWebSocket.instances.length - 1])
+  return client.call(...args)
+}
+
 describe('RpcClient', () => {
   beforeEach(() => {
     MockWebSocket.instances = []
@@ -67,6 +73,7 @@ describe('RpcClient', () => {
     localStorage.clear()
     vi.stubGlobal('WebSocket', MockWebSocket)
     vi.useFakeTimers()
+    vi.spyOn(Math, 'random').mockReturnValue(1)
   })
 
   afterEach(() => {
@@ -89,6 +96,7 @@ describe('RpcClient', () => {
     expect(firstFrame.params.caps).toEqual([
       'session.answer_generation_reset.v1',
       'session.turn_committed.v1',
+      'transport.probe.v1',
     ])
     expect(guestSessionKey).toMatch(/^osqg_[A-Za-z0-9_-]{43}$/)
     expect(localStorage.getItem('opensquilla.guestSessionKey')).toBe(guestSessionKey)
@@ -133,7 +141,7 @@ describe('RpcClient', () => {
     const socket = MockWebSocket.instances[0]
     socket.receive({ type: 'event', event: 'connect.challenge' })
 
-    const frame = JSON.parse(socket.sent[0]) as {
+    const frame = JSON.parse(socket.sent[socket.sent.length - 1]) as {
       params: { auth: { token: string; guestSessionKey: string } }
     }
     expect(frame.params.auth).toEqual({
@@ -148,12 +156,12 @@ describe('RpcClient', () => {
     client.connect('ws://rpc.test')
     const socket = MockWebSocket.instances[0]
 
-    const result = client.call(
+    const result = callOnReadySocket(client,
       'chat.send',
       { message: 'hello' },
       { timeoutMs: 100, timeoutAction: 'reconnect' }
     )
-    const request = JSON.parse(socket.sent[0]) as { id: string }
+    const request = JSON.parse(socket.sent[socket.sent.length - 1]) as { id: string }
     socket.receive({
       type: 'res',
       id: request.id,
@@ -197,7 +205,7 @@ describe('RpcClient', () => {
     const socket = MockWebSocket.instances[0]
     establishConnection(socket, { tick_interval_ms: 1_000_000 })
 
-    const result = client.call('chat.history', { sessionKey: 'session-1' })
+    const result = callOnReadySocket(client, 'chat.history', { sessionKey: 'session-1' })
     const request = JSON.parse(socket.sent[socket.sent.length - 1]) as {
       type: string
       id: string
@@ -211,7 +219,10 @@ describe('RpcClient', () => {
       method: 'chat.history',
       params: { sessionKey: 'session-1' },
     })
-    await vi.advanceTimersByTimeAsync(120_000)
+    for (let i = 0; i < 4; i++) {
+      await vi.advanceTimersByTimeAsync(30_000)
+      socket.receive({ type: 'pong' })
+    }
     expect(pendingCount(client)).toBe(1)
 
     socket.receive({ type: 'res', id: request.id, ok: true, payload: { messages: [] } })
@@ -226,8 +237,8 @@ describe('RpcClient', () => {
     client.connect('ws://rpc.test')
     const socket = MockWebSocket.instances[0]
 
-    const result = client.call('chat.history', {}, { onSent })
-    const request = JSON.parse(socket.sent[0]) as { id: string }
+    const result = callOnReadySocket(client, 'chat.history', {}, { onSent })
+    const request = JSON.parse(socket.sent[socket.sent.length - 1]) as { id: string }
 
     expect(onSent).toHaveBeenCalledOnce()
     expect(onSent).toHaveBeenCalledWith(expect.any(Number))
@@ -245,7 +256,7 @@ describe('RpcClient', () => {
     const generation = client.connectionGeneration
     const sentBefore = socket.sent.length
 
-    const stale = client.call(
+    const stale = callOnReadySocket(client,
       'sessions.messages.unsubscribe',
       { key: 'session-a' },
       { expectedGeneration: generation - 1 },
@@ -258,7 +269,7 @@ describe('RpcClient', () => {
     })
     expect(socket.sent).toHaveLength(sentBefore)
 
-    const current = client.call(
+    const current = callOnReadySocket(client,
       'sessions.messages.unsubscribe',
       { key: 'session-a' },
       { expectedGeneration: generation },
@@ -288,7 +299,7 @@ describe('RpcClient', () => {
       reason: 'generation_consistency_recovery',
     }))
 
-    await vi.advanceTimersByTimeAsync(0)
+    await vi.advanceTimersByTimeAsync(500)
     const replacement = MockWebSocket.instances[1]
     establishConnection(replacement)
 
@@ -304,12 +315,12 @@ describe('RpcClient', () => {
     client.connect('ws://rpc.test')
     const socket = MockWebSocket.instances[0]
 
-    const result = client.call(
+    const result = callOnReadySocket(client,
       'chat.history',
       { sessionKey: 'session-1' },
       { timeoutMs: 25 }
     )
-    const request = JSON.parse(socket.sent[0]) as {
+    const request = JSON.parse(socket.sent[socket.sent.length - 1]) as {
       type: string
       id: string
       method: string
@@ -347,8 +358,8 @@ describe('RpcClient', () => {
     client.connect('ws://rpc.test')
     const socket = MockWebSocket.instances[0]
 
-    const result = client.call('sessions.messages.snapshot', {}, { signal: controller.signal })
-    const request = JSON.parse(socket.sent[0]) as { id: string }
+    const result = callOnReadySocket(client, 'sessions.messages.snapshot', {}, { signal: controller.signal })
+    const request = JSON.parse(socket.sent[socket.sent.length - 1]) as { id: string }
     const caught = result.catch((error: unknown) => error)
     controller.abort()
 
@@ -366,33 +377,29 @@ describe('RpcClient', () => {
     client.disconnect()
   })
 
-  it('can recycle the current socket when an abort requests reconnect', async () => {
+  it('keeps legacy reconnect abort request-local', async () => {
     const client = new RpcClient()
-    const controller = new AbortController()
     client.connect('ws://rpc.test')
     const socket = MockWebSocket.instances[0]
-
-    const result = client.call(
-      'sessions.messages.subscribe',
-      {},
-      { signal: controller.signal, abortAction: 'reconnect' }
-    )
-    const caught = result.catch((error: unknown) => error)
+    establishConnection(socket)
+    const generation = client.connectionGeneration
+    const controller = new AbortController()
+    const result = callOnReadySocket(client, 'sessions.messages.subscribe', {}, {
+      signal: controller.signal, abortAction: 'reconnect',
+    }).catch(error => error)
     controller.abort()
-
-    expect(await caught).toBeInstanceOf(RpcAbortError)
-    expect(socket.readyState).toBe(MockWebSocket.CLOSED)
-    expect(pendingCount(client)).toBe(0)
-
-    await vi.advanceTimersByTimeAsync(0)
-    expect(MockWebSocket.instances).toHaveLength(2)
+    expect(await result).toBeInstanceOf(RpcAbortError)
+    expect(socket.readyState).toBe(MockWebSocket.OPEN)
+    expect(client.connectionGeneration).toBe(generation)
+    await vi.advanceTimersByTimeAsync(500)
+    expect(MockWebSocket.instances).toHaveLength(1)
     client.disconnect()
   })
 
   it('cleans pending calls synchronously on disconnect and socket close', async () => {
     const disconnectedClient = new RpcClient()
     disconnectedClient.connect('ws://rpc.test')
-    const disconnectResult = disconnectedClient.call('chat.history')
+    const disconnectResult = callOnReadySocket(disconnectedClient, 'chat.history')
     const disconnectError = disconnectResult.catch((error: unknown) => error)
 
     disconnectedClient.disconnect()
@@ -403,7 +410,7 @@ describe('RpcClient', () => {
     const closedClient = new RpcClient()
     closedClient.connect('ws://rpc.test')
     const closedSocket = MockWebSocket.instances[MockWebSocket.instances.length - 1]
-    const closeResult = closedClient.call('chat.history')
+    const closeResult = callOnReadySocket(closedClient, 'chat.history')
     const closeError = closeResult.catch((error: unknown) => error)
 
     closedSocket.close()
@@ -418,9 +425,10 @@ describe('RpcClient', () => {
     const onSent = vi.fn()
     client.connect('ws://rpc.test')
     const socket = MockWebSocket.instances[0]
+    establishConnection(socket)
     socket.throwOnSend = true
 
-    const error = await client.call(
+    const error = await callOnReadySocket(client,
       'chat.history',
       {},
       { onSent },
@@ -435,47 +443,31 @@ describe('RpcClient', () => {
     expect(pendingCount(client)).toBe(0)
     expect(socket.readyState).toBe(MockWebSocket.CLOSED)
 
-    await vi.advanceTimersByTimeAsync(0)
+    await vi.advanceTimersByTimeAsync(500)
     expect(MockWebSocket.instances).toHaveLength(2)
     client.disconnect()
   })
 
-  it('recycles on timeout without letting stale socket events close the replacement', async () => {
+  it('keeps a timed-out request local and delivers its sibling on the same socket', async () => {
     const client = new RpcClient()
     client.connect('ws://rpc.test')
-    const firstSocket = MockWebSocket.instances[0]
-    establishConnection(firstSocket)
-    expect(client.state).toBe('connected')
-
-    const sibling = client.call('sessions.messages.snapshot')
-    const siblingCaught = sibling.catch((error: unknown) => error)
-    const result = client.call('chat.history', {}, {
-      timeoutMs: 25,
-      timeoutAction: 'reconnect',
-    })
-    const request = JSON.parse(firstSocket.sent[firstSocket.sent.length - 1]) as { id: string }
-    const staleClose = firstSocket.onclose
-    const caught = result.catch((error: unknown) => error)
-
+    const socket = MockWebSocket.instances[0]
+    establishConnection(socket)
+    const generation = client.connectionGeneration
+    const sibling = callOnReadySocket(client, 'sessions.messages.snapshot')
+    const siblingId = JSON.parse(socket.sent[socket.sent.length - 1]).id
+    const result = callOnReadySocket(client, 'chat.history', {}, {
+      timeoutMs: 25, timeoutAction: 'reconnect',
+    }).catch(error => error)
+    const timedId = JSON.parse(socket.sent[socket.sent.length - 1]).id
     await vi.advanceTimersByTimeAsync(25)
-    expect(await caught).toBeInstanceOf(RpcTimeoutError)
-    await expect(siblingCaught).resolves.toMatchObject({
-      message: 'Connection recycled after chat.history terminated',
-      code: 'RPC_TRANSPORT_ERROR',
-      accepted: null,
-    })
-    await vi.runOnlyPendingTimersAsync()
-
-    const secondSocket = MockWebSocket.instances[1]
-    expect(secondSocket).toBeDefined()
-    establishConnection(secondSocket)
-    expect(client.state).toBe('connected')
-
-    staleClose?.({ code: 1006, reason: '', wasClean: false } as CloseEvent)
-    firstSocket.receive({ type: 'res', id: request.id, ok: true, payload: 'late' })
-
-    expect(client.state).toBe('connected')
-    expect(pendingCount(client)).toBe(0)
+    expect(await result).toBeInstanceOf(RpcTimeoutError)
+    expect(client.connectionGeneration).toBe(generation)
+    expect(socket.readyState).toBe(MockWebSocket.OPEN)
+    socket.receive({ type: 'res', id: timedId, ok: true, payload: 'late' })
+    expect(pendingCount(client)).toBe(1)
+    socket.receive({ type: 'res', id: siblingId, ok: true, payload: 'current' })
+    await expect(sibling).resolves.toBe('current')
     client.disconnect()
   })
 
@@ -488,11 +480,11 @@ describe('RpcClient', () => {
     })
 
     const sessionKeys = ['session-a', 'session-b', 'session-c', 'session-d']
-    const sessionRequests = sessionKeys.map(key => client.call(
+    const sessionRequests = sessionKeys.map(key => callOnReadySocket(client,
       'sessions.messages.snapshot',
       { key },
     ))
-    const optionalRead = client.call('sessions.list', {}, {
+    const optionalRead = callOnReadySocket(client, 'sessions.list', {}, {
       timeoutMs: 25,
       timeoutAction: 'reconnect',
     }).catch((error: unknown) => error)
@@ -574,33 +566,22 @@ describe('RpcClient', () => {
     client.disconnect()
   })
 
-  it('recycles the replacement socket when a wait spans a disconnected gap', async () => {
+  it('does not let an old ready waiter cancel a replacement handshake', async () => {
     const client = new RpcClient()
     client.connect('ws://rpc.test')
-    const firstSocket = MockWebSocket.instances[0]
-    establishConnection(firstSocket)
-    firstSocket.close()
-
-    const timedWait = client.ready(
-      1_025,
-      undefined,
-      { timeoutAction: 'reconnect' },
-    ).catch((error: unknown) => error)
-
-    await vi.advanceTimersByTimeAsync(1_000)
+    const original = MockWebSocket.instances[0]
+    establishConnection(original)
+    original.close()
+    const wait = client.ready(525, undefined, { timeoutAction: 'reconnect' }).catch(error => error)
+    await vi.advanceTimersByTimeAsync(500)
     const replacement = MockWebSocket.instances[1]
-    expect(replacement).toBeDefined()
-    expect(client.state).toBe('connecting')
-
+    const generation = client.connectionGeneration
     await vi.advanceTimersByTimeAsync(25)
-    await expect(timedWait).resolves.toBeInstanceOf(RpcTimeoutError)
-    expect(replacement.readyState).toBe(MockWebSocket.CLOSED)
-
-    await vi.advanceTimersByTimeAsync(1)
-    const retrySocket = MockWebSocket.instances[2]
-    expect(retrySocket).toBeDefined()
-    establishConnection(retrySocket)
-    await expect(client.ready(25)).resolves.toBeUndefined()
+    expect(await wait).toBeInstanceOf(RpcTimeoutError)
+    expect(replacement.readyState).toBe(MockWebSocket.OPEN)
+    expect(client.connectionGeneration).toBe(generation)
+    establishConnection(replacement)
+    await expect(client.ready()).resolves.toBeUndefined()
     client.disconnect()
   })
 
@@ -626,10 +607,10 @@ describe('RpcClient', () => {
     expect(diagnostics).toContainEqual(expect.objectContaining({
       phase: 'reconnect_scheduled',
       reconnectAttempt: 1,
-      delay: 1_000,
+      delay: 500,
     }))
 
-    await vi.advanceTimersByTimeAsync(999)
+    await vi.advanceTimersByTimeAsync(499)
     expect(MockWebSocket.instances).toHaveLength(1)
     await vi.advanceTimersByTimeAsync(1)
     expect(MockWebSocket.instances).toHaveLength(2)
@@ -648,7 +629,7 @@ describe('RpcClient', () => {
 
     expect(firstSocket.readyState).toBe(MockWebSocket.CLOSED)
     expect(client.state).toBe('disconnected')
-    await vi.advanceTimersByTimeAsync(999)
+    await vi.advanceTimersByTimeAsync(499)
     expect(MockWebSocket.instances).toHaveLength(1)
     await vi.advanceTimersByTimeAsync(1)
     expect(MockWebSocket.instances).toHaveLength(2)
@@ -666,7 +647,7 @@ describe('RpcClient', () => {
     await vi.advanceTimersByTimeAsync(5_000)
     expect(client.recoverConnectionGeneration(firstGeneration, 'replace for test')).toBe(true)
     expect(firstSocket.readyState).toBe(MockWebSocket.CLOSED)
-    await vi.advanceTimersByTimeAsync(0)
+    await vi.advanceTimersByTimeAsync(500)
 
     const replacement = MockWebSocket.instances[1]
     expect(replacement).toBeDefined()
@@ -693,6 +674,7 @@ describe('RpcClient', () => {
     socket.receive({
       protocol: 3,
       server: { version: 'test', conn_id: 'conn-test-1' },
+      auth: { principal: { authenticated: true } },
       policy: { tick_interval_ms: 30_000 },
     })
     socket.close(1012, 'service_restart')
@@ -791,7 +773,7 @@ describe('RpcClient', () => {
     expect(siblingListener).toHaveBeenCalledWith('disconnected')
     expect(consoleError).toHaveBeenCalledWith('[rpc] "_state" listener failed', error)
 
-    await vi.advanceTimersByTimeAsync(999)
+    await vi.advanceTimersByTimeAsync(499)
     expect(MockWebSocket.instances).toHaveLength(1)
     await vi.advanceTimersByTimeAsync(1)
     expect(MockWebSocket.instances).toHaveLength(2)
@@ -819,102 +801,81 @@ describe('RpcClient', () => {
     expect(consoleError).toHaveBeenCalledWith('[rpc] "_gap" listener failed', error)
     expect(socket.readyState).toBe(MockWebSocket.CLOSED)
 
-    await vi.advanceTimersByTimeAsync(999)
+    await vi.advanceTimersByTimeAsync(499)
     expect(MockWebSocket.instances).toHaveLength(1)
     await vi.advanceTimersByTimeAsync(1)
     expect(MockWebSocket.instances).toHaveLength(2)
     client.disconnect()
   })
 
-  it('stops after the fixed 1/2/4/8/15 second reconnect budget', async () => {
+  it('keeps one capped retry after more than twenty failures', async () => {
     const client = new RpcClient()
     client.connect('ws://rpc.test')
-
-    const delays = [1_000, 2_000, 4_000, 8_000, 15_000]
-    for (const [index, delay] of delays.entries()) {
-      MockWebSocket.instances[index].close()
+    for (let attempt = 0; attempt < 22; attempt++) {
+      MockWebSocket.instances[MockWebSocket.instances.length - 1].close()
+      const delay = Math.min(15_000, 500 * 2 ** attempt)
       await vi.advanceTimersByTimeAsync(delay - 1)
-      expect(MockWebSocket.instances).toHaveLength(index + 1)
+      expect(MockWebSocket.instances).toHaveLength(attempt + 1)
       await vi.advanceTimersByTimeAsync(1)
-      expect(MockWebSocket.instances).toHaveLength(index + 2)
+      expect(MockWebSocket.instances).toHaveLength(attempt + 2)
     }
-
-    MockWebSocket.instances[delays.length].close()
-    await vi.advanceTimersByTimeAsync(60_000)
-    expect(MockWebSocket.instances).toHaveLength(delays.length + 1)
+    establishConnection(MockWebSocket.instances[MockWebSocket.instances.length - 1])
+    expect(client.state).toBe('connected')
     client.disconnect()
   })
 
-  it('grants a fresh reconnect budget after an explicit connect', async () => {
+  it('does not replace a healthy socket for the same connection intent', async () => {
     const client = new RpcClient()
     client.connect('ws://rpc.test')
-
-    const delays = [1_000, 2_000, 4_000, 8_000, 15_000]
-    for (const [index, delay] of delays.entries()) {
-      MockWebSocket.instances[index].close()
-      await vi.advanceTimersByTimeAsync(delay)
-    }
-    MockWebSocket.instances[delays.length].close()
-    await vi.advanceTimersByTimeAsync(60_000)
-    expect(MockWebSocket.instances).toHaveLength(delays.length + 1)
-
+    const socket = MockWebSocket.instances[0]
+    establishConnection(socket)
     client.connect('ws://rpc.test')
-    const reconnected = MockWebSocket.instances[delays.length + 1]
-    expect(reconnected).toBeDefined()
-    reconnected.close()
-    await vi.advanceTimersByTimeAsync(999)
-    expect(MockWebSocket.instances).toHaveLength(delays.length + 2)
-    await vi.advanceTimersByTimeAsync(1)
-    expect(MockWebSocket.instances).toHaveLength(delays.length + 3)
+    client.ensureConnected()
+    expect(MockWebSocket.instances).toHaveLength(1)
     client.disconnect()
+    window.dispatchEvent(new Event('online'))
+    await vi.advanceTimersByTimeAsync(60_000)
+    expect(MockWebSocket.instances).toHaveLength(1)
   })
 
-  it('grants a fresh reconnect budget after a successful hello', async () => {
+  it('only resets backoff after a stable Hello, not a flapping Hello', async () => {
     const client = new RpcClient()
     client.connect('ws://rpc.test')
-
     MockWebSocket.instances[0].close()
-    await vi.advanceTimersByTimeAsync(1_000)
+    await vi.advanceTimersByTimeAsync(500)
+    establishConnection(MockWebSocket.instances[1])
     MockWebSocket.instances[1].close()
-    await vi.advanceTimersByTimeAsync(2_000)
-
-    const recovered = MockWebSocket.instances[2]
-    establishConnection(recovered)
-    recovered.close()
     await vi.advanceTimersByTimeAsync(999)
+    expect(MockWebSocket.instances).toHaveLength(2)
+    await vi.advanceTimersByTimeAsync(1)
+    const stable = MockWebSocket.instances[2]
+    establishConnection(stable)
+    await vi.advanceTimersByTimeAsync(30_000)
+    stable.close()
+    await vi.advanceTimersByTimeAsync(499)
     expect(MockWebSocket.instances).toHaveLength(3)
     await vi.advanceTimersByTimeAsync(1)
     expect(MockWebSocket.instances).toHaveLength(4)
     client.disconnect()
   })
 
-  it.each(['online', 'pageshow', 'visibilitychange'])(
-    'restarts an exhausted reconnect budget after a %s wake signal',
-    async (signal) => {
+  it.each(['online', 'pageshow', 'visibilitychange', 'resume'])(
+    'accelerates one recovery after %s without resetting retry streak',
+    async signal => {
       const client = new RpcClient()
       client.connect('ws://rpc.test')
-
-      const delays = [1_000, 2_000, 4_000, 8_000, 15_000]
-      for (const [index, delay] of delays.entries()) {
-        MockWebSocket.instances[index].close()
-        await vi.advanceTimersByTimeAsync(delay)
-      }
-      const saturated = MockWebSocket.instances[delays.length]
-      saturated.close()
-
-      const target = signal === 'visibilitychange' ? document : window
+      MockWebSocket.instances[0].close()
+      await vi.advanceTimersByTimeAsync(500)
+      MockWebSocket.instances[1].close()
+      const target = ['visibilitychange', 'resume'].includes(signal) ? document : window
       target.dispatchEvent(new Event(signal))
-      await vi.advanceTimersByTimeAsync(99)
-      expect(MockWebSocket.instances).toHaveLength(delays.length + 1)
+      await vi.advanceTimersByTimeAsync(100)
+      expect(MockWebSocket.instances).toHaveLength(3)
+      MockWebSocket.instances[2].close()
+      await vi.advanceTimersByTimeAsync(1_999)
+      expect(MockWebSocket.instances).toHaveLength(3)
       await vi.advanceTimersByTimeAsync(1)
-      expect(MockWebSocket.instances).toHaveLength(delays.length + 2)
-
-      const awakened = MockWebSocket.instances[delays.length + 1]
-      awakened.close()
-      await vi.advanceTimersByTimeAsync(999)
-      expect(MockWebSocket.instances).toHaveLength(delays.length + 2)
-      await vi.advanceTimersByTimeAsync(1)
-      expect(MockWebSocket.instances).toHaveLength(delays.length + 3)
+      expect(MockWebSocket.instances).toHaveLength(4)
       client.disconnect()
     },
   )
@@ -928,7 +889,7 @@ describe('RpcClient', () => {
     window.dispatchEvent(new Event('online'))
     window.dispatchEvent(new Event('pageshow'))
     document.dispatchEvent(new Event('visibilitychange'))
-    await vi.advanceTimersByTimeAsync(100)
+    await vi.advanceTimersByTimeAsync(5_000)
 
     expect(socket.sent.filter(frame => frame === '{"type":"ping"}')).toHaveLength(1)
     socket.receive({ type: 'pong' })
@@ -1046,44 +1007,51 @@ describe('RpcClient', () => {
     establishConnection(socket)
 
     document.dispatchEvent(new Event('visibilitychange'))
-    await vi.advanceTimersByTimeAsync(100)
+    await vi.advanceTimersByTimeAsync(5_000)
 
     expect(socket.sent).toContain('{"type":"ping"}')
     socket.receive({ type: 'pong' })
     client.disconnect()
   })
 
-  it('replaces a half-open socket after a wake probe receives no pong', async () => {
+  it('tolerates a short wake pause, then recovers a persistent half-open socket', async () => {
     const client = new RpcClient()
     client.connect('ws://rpc.test')
     const socket = MockWebSocket.instances[0]
-    establishConnection(socket)
-
+    establishConnection(socket, { transport_probe_nonce: true })
     window.dispatchEvent(new Event('pageshow'))
-    await vi.advanceTimersByTimeAsync(100)
-    expect(socket.sent).toContain('{"type":"ping"}')
-
-    await vi.advanceTimersByTimeAsync(3_000)
+    await vi.advanceTimersByTimeAsync(5_000)
+    const ping = JSON.parse(socket.sent[socket.sent.length - 1])
+    expect(ping).toMatchObject({ type: 'ping', nonce: expect.any(String) })
+    await vi.advanceTimersByTimeAsync(10_000)
+    expect(client.health).toBe('suspect')
+    socket.receive({ type: 'event', event: 'tick' })
+    await vi.advanceTimersByTimeAsync(20_000)
+    expect(socket.readyState).toBe(MockWebSocket.OPEN)
+    await vi.advanceTimersByTimeAsync(10_000)
     expect(socket.readyState).toBe(MockWebSocket.CLOSED)
-    await vi.advanceTimersByTimeAsync(1)
+    await vi.advanceTimersByTimeAsync(500)
     expect(MockWebSocket.instances).toHaveLength(2)
     client.disconnect()
   })
 
-  it('does not treat a duplicate hello as the pong required by an open wake probe', async () => {
+  it('does not accept a wrong nonce or duplicate Hello as control recovery', async () => {
     const client = new RpcClient()
     client.connect('ws://rpc.test')
     const socket = MockWebSocket.instances[0]
-    establishConnection(socket)
-
-    window.dispatchEvent(new Event('pageshow'))
-    await vi.advanceTimersByTimeAsync(100)
-    expect(socket.sent).toContain('{"type":"ping"}')
-
-    socket.receive({ protocol: 3, policy: { tick_interval_ms: 30_000 } })
-    await vi.advanceTimersByTimeAsync(3_000)
-
-    expect(socket.readyState).toBe(MockWebSocket.CLOSED)
+    establishConnection(socket, { transport_probe_nonce: true })
+    await vi.advanceTimersByTimeAsync(30_000)
+    const ping = JSON.parse(socket.sent[socket.sent.length - 1])
+    socket.receive({ type: 'pong', nonce: 'wrong' })
+    socket.receive({ protocol: 3, policy: {} })
+    await vi.advanceTimersByTimeAsync(10_000)
+    expect(client.health).toBe('suspect')
+    await vi.advanceTimersByTimeAsync(1_000)
+    const current = JSON.parse(socket.sent[socket.sent.length - 1])
+    expect(current.nonce).not.toBe(ping.nonce)
+    socket.receive({ type: 'pong', nonce: current.nonce })
+    expect(client.health).toBe('healthy')
+    expect(socket.readyState).toBe(MockWebSocket.OPEN)
     client.disconnect()
   })
 
@@ -1108,29 +1076,298 @@ describe('RpcClient', () => {
     client.disconnect()
   })
 
-  it('retires a half-connected socket when the handshake wait times out', async () => {
+  it('leaves handshake ownership with the client when a page waiter expires', async () => {
     const client = new RpcClient()
     client.connect('ws://rpc.test')
-    const firstSocket = MockWebSocket.instances[0]
-    const timedWait = client
-      .ready(
-        25,
-        undefined,
-        { timeoutAction: 'reconnect' },
-      )
-      .catch((error: unknown) => error)
-
+    const socket = MockWebSocket.instances[0]
+    const wait = client.ready(25, undefined, { timeoutAction: 'reconnect' }).catch(error => error)
     await vi.advanceTimersByTimeAsync(25)
-    await vi.advanceTimersByTimeAsync(1)
+    expect(await wait).toBeInstanceOf(RpcTimeoutError)
+    expect(socket.readyState).toBe(MockWebSocket.OPEN)
+    expect(MockWebSocket.instances).toHaveLength(1)
+    establishConnection(socket)
+    await expect(client.ready()).resolves.toBeUndefined()
+    client.disconnect()
+  })
 
-    await expect(timedWait).resolves.toBeInstanceOf(RpcTimeoutError)
-    expect(firstSocket.readyState).toBe(MockWebSocket.CLOSED)
-    expect(MockWebSocket.instances).toHaveLength(2)
+  it('never sends business requests before authenticated Hello', async () => {
+    const client = new RpcClient()
+    client.connect('ws://rpc.test')
+    await expect(client.call('chat.send', {})).rejects.toMatchObject({ accepted: false })
+    expect(MockWebSocket.instances[0].sent).toEqual([])
+    client.disconnect()
+  })
 
-    const secondSocket = MockWebSocket.instances[1]
-    establishConnection(secondSocket)
-    await expect(client.ready(25)).resolves.toBeUndefined()
+  it('blocks automatic recovery after credentialed guest downgrade until an explicit connection intent', async () => {
+    const client = new RpcClient()
+    const blocked = vi.fn()
+    client.on('_blocked', blocked)
+    client.connect('ws://rpc.test', 'bad-token')
+    const old = MockWebSocket.instances[0]
+    const lateHello = old.onmessage
+    establishConnection(old)
+    expect(client.lifecycle).toBe('blocked')
+    client.ensureConnected()
+    window.dispatchEvent(new Event('online'))
+    await vi.advanceTimersByTimeAsync(60_000)
+    expect(MockWebSocket.instances).toHaveLength(1)
+    expect(blocked).toHaveBeenCalledOnce()
+    client.connect('ws://rpc.test', 'new-token')
+    const socket = MockWebSocket.instances[1]
+    socket.receive({ type: 'event', event: 'connect.challenge' })
+    lateHello?.({ data: JSON.stringify({ protocol: 3, auth: { principal: { authenticated: true } } }) } as MessageEvent)
+    expect(client.state).toBe('connecting')
+    socket.receive({ protocol: 3, auth: { principal: { authenticated: true, isOwner: false } } })
     expect(client.state).toBe('connected')
     client.disconnect()
+  })
+
+  it('requires owner only for owner intent and installs identity before ready', () => {
+    const client = new RpcClient()
+    const trace: string[] = []
+    client.on('_hello', () => trace.push('identity'))
+    client.on('_state', state => { if (state === 'connected') trace.push('connected') })
+    client.connect('ws://rpc.test', 'desktop-token', { authentication: 'owner', key: 'profile:runtime' })
+    let socket = MockWebSocket.instances[0]
+    socket.receive({ type: 'event', event: 'connect.challenge' })
+    socket.receive({ protocol: 3, auth: { principal: { authenticated: true, isOwner: false } } })
+    expect(client.lifecycle).toBe('blocked')
+    expect(trace).toEqual([])
+    client.connect('ws://rpc.test', 'replacement-token', { authentication: 'owner', key: 'profile:runtime' })
+    socket = MockWebSocket.instances[1]
+    socket.receive({ type: 'event', event: 'connect.challenge' })
+    socket.receive({ protocol: 3, auth: { principal: { authenticated: true, isOwner: true } } })
+    expect(trace).toEqual(['identity', 'connected'])
+    client.disconnect()
+  })
+
+  it.each(['UNAUTHORIZED', 'INVALID_REQUEST'])('blocks permanent handshake %s without a storm', async code => {
+    const client = new RpcClient()
+    client.connect('ws://rpc.test')
+    const socket = MockWebSocket.instances[0]
+    socket.receive({ type: 'event', event: 'connect.challenge' })
+    const request = JSON.parse(socket.sent[socket.sent.length - 1])
+    socket.receive({ type: 'res', id: request.id, ok: false, error: { code } })
+    expect(client.lifecycle).toBe('blocked')
+    await vi.advanceTimersByTimeAsync(120_000)
+    expect(MockWebSocket.instances).toHaveLength(1)
+    client.disconnect()
+  })
+
+  it('keeps scope rejection request-local after valid Hello', async () => {
+    const client = new RpcClient()
+    client.connect('ws://rpc.test')
+    const socket = MockWebSocket.instances[0]
+    establishConnection(socket)
+    const request = client.call('settings.ownerOnly').catch(error => error)
+    const id = JSON.parse(socket.sent[socket.sent.length - 1]).id
+    socket.receive({ type: 'res', id, ok: false, error: { code: 'UNAUTHORIZED' } })
+    expect(await request).toMatchObject({ code: 'UNAUTHORIZED' })
+    expect(client.lifecycle).toBe('connected')
+    client.disconnect()
+  })
+
+  it('treats scheduler suspension as a fresh probe opportunity', async () => {
+    const client = new RpcClient()
+    client.connect('ws://rpc.test')
+    const socket = MockWebSocket.instances[0]
+    establishConnection(socket, { transport_probe_nonce: true })
+    await vi.advanceTimersByTimeAsync(30_000)
+    vi.setSystemTime(Date.now() + 300_000)
+    await vi.advanceTimersByTimeAsync(1_000)
+    expect(socket.readyState).toBe(MockWebSocket.OPEN)
+    await vi.advanceTimersByTimeAsync(5_000)
+    const probe = JSON.parse(socket.sent[socket.sent.length - 1])
+    socket.receive({ type: 'pong', nonce: probe.nonce })
+    expect(client.health).toBe('healthy')
+    expect(MockWebSocket.instances).toHaveLength(1)
+    client.disconnect()
+  })
+
+  it('retains the socket after registered successful gap recovery', async () => {
+    const client = new RpcClient()
+    client.connect('ws://rpc.test')
+    const socket = MockWebSocket.instances[0]
+    establishConnection(socket)
+    const recover = vi.fn(async () => true)
+    client.onGap(recover)
+    socket.receive({ type: 'event', event: 'demo', seq: 1 })
+    socket.receive({ type: 'event', event: 'demo', seq: 3 })
+    await vi.advanceTimersByTimeAsync(0)
+    expect(recover).toHaveBeenCalledOnce()
+    expect(socket.readyState).toBe(MockWebSocket.OPEN)
+    client.disconnect()
+  })
+
+  it('retries a failed gap recovery on the same healthy socket until it really succeeds', async () => {
+    const client = new RpcClient()
+    client.connect('ws://rpc.test')
+    const socket = MockWebSocket.instances[0]
+    establishConnection(socket)
+    const generation = client.connectionGeneration
+    const recover = vi.fn().mockResolvedValueOnce(false).mockResolvedValue(true)
+    client.onGap(recover)
+    socket.receive({ type: 'event', event: 'demo', seq: 1 })
+    socket.receive({ type: 'event', event: 'demo', seq: 3 })
+    await vi.advanceTimersByTimeAsync(0)
+    expect(recover).toHaveBeenCalledOnce()
+    expect(client.state).toBe('connected')
+    expect(socket.readyState).toBe(MockWebSocket.OPEN)
+    await vi.advanceTimersByTimeAsync(999)
+    expect(recover).toHaveBeenCalledOnce()
+    await vi.advanceTimersByTimeAsync(1)
+    expect(recover).toHaveBeenCalledTimes(2)
+    await vi.advanceTimersByTimeAsync(5000)
+    expect(recover).toHaveBeenCalledTimes(2)
+    expect(client.connectionGeneration).toBe(generation)
+    expect(MockWebSocket.instances).toHaveLength(1)
+    client.disconnect()
+  })
+
+  it('retains modern-client gap responsibility before a domain owner mounts and still delivers flow receipts', async () => {
+    const client = new RpcClient()
+    client.enableConsumptionFlow()
+    client.connect('ws://rpc.test')
+    const socket = MockWebSocket.instances[0]
+    establishConnection(socket)
+    const recoverAttempt = vi.spyOn(client, 'recoverGap')
+    const receive = vi.fn()
+    client.on('demo', receive)
+    socket.receive({ type: 'event', event: 'demo', seq: 1 })
+    socket.receive({ type: 'event', event: 'demo', seq: 3, meta: { flow: { delivery_epoch: 'epoch', delivery_id: 1 } } })
+    await vi.advanceTimersByTimeAsync(2050)
+    expect(recoverAttempt).toHaveBeenCalledTimes(3)
+    expect(receive).toHaveBeenCalledTimes(2)
+    expect(socket.readyState).toBe(MockWebSocket.OPEN)
+    const recoverOwner = vi.fn(async () => true)
+    client.onGap(recoverOwner)
+    await vi.advanceTimersByTimeAsync(1000)
+    expect(recoverOwner).toHaveBeenCalledOnce()
+    await vi.advanceTimersByTimeAsync(2000)
+    expect(recoverOwner).toHaveBeenCalledOnce()
+    expect(MockWebSocket.instances).toHaveLength(1)
+    client.disconnect()
+  })
+
+  it('coalesces consecutive gaps into one active recovery and one bounded retry timer', async () => {
+    const client = new RpcClient()
+    client.connect('ws://rpc.test')
+    const socket = MockWebSocket.instances[0]
+    establishConnection(socket)
+    const baselineTimers = vi.getTimerCount()
+    let finish!: (value: boolean) => void
+    const recover = vi.fn().mockReturnValueOnce(new Promise<boolean>(resolve => { finish = resolve })).mockResolvedValue(true)
+    client.onGap(recover)
+    for (const seq of [1, 3, 5, 7]) socket.receive({ type: 'event', event: 'demo', seq })
+    await vi.advanceTimersByTimeAsync(5000)
+    expect(recover).toHaveBeenCalledOnce()
+    expect(vi.getTimerCount()).toBe(baselineTimers)
+    finish(false)
+    await vi.advanceTimersByTimeAsync(0)
+    expect(vi.getTimerCount()).toBe(baselineTimers + 1)
+    for (const seq of [9, 11]) socket.receive({ type: 'event', event: 'demo', seq })
+    expect(vi.getTimerCount()).toBe(baselineTimers + 1)
+    await vi.advanceTimersByTimeAsync(1000)
+    expect(recover).toHaveBeenCalledTimes(2)
+    expect(recover).toHaveBeenLastCalledWith({ expected: 10, actual: 11, event: 'demo' })
+    await vi.advanceTimersByTimeAsync(3000)
+    expect(recover).toHaveBeenCalledTimes(2)
+    expect(MockWebSocket.instances).toHaveLength(1)
+    client.disconnect()
+  })
+
+  it('clears pending gap retries on explicit stop', async () => {
+    const client = new RpcClient()
+    client.connect('ws://rpc.test')
+    const socket = MockWebSocket.instances[0]
+    establishConnection(socket)
+    const recover = vi.fn(async () => false)
+    client.onGap(recover)
+    socket.receive({ type: 'event', event: 'demo', seq: 1 })
+    socket.receive({ type: 'event', event: 'demo', seq: 3 })
+    await vi.advanceTimersByTimeAsync(0)
+    client.disconnect()
+    expect(vi.getTimerCount()).toBe(0)
+    await vi.advanceTimersByTimeAsync(10000)
+    expect(recover).toHaveBeenCalledOnce()
+    expect(MockWebSocket.instances).toHaveLength(1)
+  })
+
+  it('ignores late gap recovery failure after a socket replacement', async () => {
+    const client = new RpcClient()
+    client.connect('ws://rpc.test')
+    const old = MockWebSocket.instances[0]
+    establishConnection(old)
+    let finish!: (value: boolean) => void
+    const recover = vi.fn().mockReturnValueOnce(new Promise<boolean>(resolve => { finish = resolve })).mockResolvedValue(true)
+    client.onGap(recover)
+    old.receive({ type: 'event', event: 'demo', seq: 1 })
+    old.receive({ type: 'event', event: 'demo', seq: 3 })
+    await vi.advanceTimersByTimeAsync(0)
+    old.close()
+    await vi.advanceTimersByTimeAsync(500)
+    const current = MockWebSocket.instances[1]
+    establishConnection(current)
+    finish(false)
+    await vi.advanceTimersByTimeAsync(3000)
+    expect(recover).toHaveBeenCalledOnce()
+    expect(current.readyState).toBe(MockWebSocket.OPEN)
+    current.receive({ type: 'event', event: 'demo', seq: 1 })
+    current.receive({ type: 'event', event: 'demo', seq: 3 })
+    await vi.advanceTimersByTimeAsync(0)
+    expect(recover).toHaveBeenCalledTimes(2)
+    expect(MockWebSocket.instances).toHaveLength(2)
+    client.disconnect()
+  })
+
+  it('clears a scheduled gap retry when a remote close replaces the socket', async () => {
+    const client = new RpcClient()
+    client.connect('ws://rpc.test')
+    const old = MockWebSocket.instances[0]
+    establishConnection(old)
+    const recover = vi.fn(async () => false)
+    client.onGap(recover)
+    old.receive({ type: 'event', event: 'demo', seq: 1 })
+    old.receive({ type: 'event', event: 'demo', seq: 3 })
+    await vi.advanceTimersByTimeAsync(0)
+    old.close()
+    await vi.advanceTimersByTimeAsync(500)
+    establishConnection(MockWebSocket.instances[1])
+    await vi.advanceTimersByTimeAsync(3000)
+    expect(recover).toHaveBeenCalledOnce()
+    expect(client.state).toBe('connected')
+    expect(MockWebSocket.instances).toHaveLength(2)
+    client.disconnect()
+  })
+
+  it('does not dispatch a queued obsolete gap read onto a new connection intent', async () => {
+    const client = new RpcClient()
+    client.connect('ws://rpc.test')
+    const old = MockWebSocket.instances[0]
+    establishConnection(old)
+    const recover = vi.fn(async () => true)
+    client.onGap(recover)
+    old.receive({ type: 'event', event: 'demo', seq: 1 })
+    old.receive({ type: 'event', event: 'demo', seq: 3 })
+    client.connect('ws://replacement.test')
+    establishConnection(MockWebSocket.instances[1])
+    await vi.advanceTimersByTimeAsync(3000)
+    expect(recover).not.toHaveBeenCalled()
+    expect(client.state).toBe('connected')
+    client.disconnect()
+  })
+
+  it('does not claim consumption from observers or unfinished domain work', async () => {
+    const client = new RpcClient()
+    client.on('demo', vi.fn())
+    await expect(client.consumeEvent('demo', {}, {})).rejects.toThrow('No consumption owner')
+    let finish!: (result: 'applied' | 'dirty') => void
+    client.onConsumedEvent('demo', () => new Promise(resolve => { finish = resolve }))
+    let completed = false
+    const result = client.consumeEvent('demo', {}, {}).then(value => { completed = true; return value })
+    await Promise.resolve()
+    expect(completed).toBe(false)
+    finish('applied')
+    await expect(result).resolves.toBe('applied')
   })
 })

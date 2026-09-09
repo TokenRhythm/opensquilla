@@ -282,6 +282,7 @@ export function useChatApprovals(options: UseChatApprovalsOptions) {
   let fetchInFlight = false
   let refetchQueued = false
   let statusGeneration = 0
+  let snapshotGeneration = 0
   let statusRpcUnavailable = false
   let statusRpcWarningShown = false
   const legacyPushBackfills = new Set<string>()
@@ -332,8 +333,12 @@ export function useChatApprovals(options: UseChatApprovalsOptions) {
       return
     }
     fetchInFlight = true
+    const snapshotAttempt = ++snapshotGeneration
+    const generation = statusGeneration
+    const key = sessionKey.value
     try {
       const data = await approvalCenter.snapshot()
+      if (snapshotAttempt !== snapshotGeneration || generation !== statusGeneration || key !== sessionKey.value) return
       const pending = data.pending || []
       options.onSnapshotCount?.(pending.length)
       syncSnapshot(pending)
@@ -345,6 +350,36 @@ export function useChatApprovals(options: UseChatApprovalsOptions) {
         refetchQueued = false
         void fetchSnapshot()
       }
+    }
+  }
+
+  async function reconcile() {
+    const key = sessionKey.value
+    const generation = ++statusGeneration
+    const snapshotAttempt = ++snapshotGeneration
+    const assertCurrent = () => {
+      if (sessionKey.value !== key || statusGeneration !== generation || snapshotAttempt !== snapshotGeneration) {
+        throw new Error('Approval reconciliation was superseded.')
+      }
+    }
+    const data = await approvalCenter.snapshot()
+    assertCurrent()
+    options.onSnapshotCount?.((data.pending || []).length)
+    syncSnapshot(data.pending || [])
+    // Absence from pending is not evidence of approval/denial. Recover the
+    // missed terminal outcome explicitly, and never claim success on a failed
+    // status read. Sequential reads bound in-flight work independently of the
+    // number of historical approval cards.
+    const pendingIds = new Set(data.pending.map(item => item.id))
+    const missing = [...interruptApprovals.values()].filter(item =>
+      !pendingIds.has(item.approvalId) && !interruptState.value.get(item.approvalId)?.resolution)
+    for (const item of missing) {
+      assertCurrent()
+      const status = await approvalCenter.status(item.namespace === 'plugin' ? 'plugin' : 'exec', item.approvalId)
+      assertCurrent()
+      applyApprovalStatus(item.approvalId, {
+        ...status, deadline: status.deadline === null ? undefined : status.deadline,
+      }, generation)
     }
   }
 
@@ -853,6 +888,7 @@ export function useChatApprovals(options: UseChatApprovalsOptions) {
     submitClarify,
     dismissClarify,
     applyUserInputBootstrap,
+    reconcile,
     subscribe,
     cleanup,
   }

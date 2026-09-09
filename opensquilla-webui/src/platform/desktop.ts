@@ -503,6 +503,9 @@ export function createDesktopPlatform(): Platform {
       return managedUpdateCapability(api)
     },
     gateway: {
+      ...(typeof desktopApi.onSystemResume === 'function'
+        ? { onResume: (callback: () => void) => desktopApi.onSystemResume!(callback) }
+        : {}),
       getStatus: () => requireDesktopApi().getGatewayStatus(),
       ...(typeof desktopApi.getGatewayConnection === 'function'
         ? {

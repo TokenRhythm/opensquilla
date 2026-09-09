@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest'
-import type { TransportEventHandler } from './transportTypes'
+import type { TransportEventHandler, TransportConsumptionHandler, TransportGapHandler } from './transportTypes'
 import { createConversationEventTransport } from './conversationEventTransport'
 import { projectConversationContent } from './conversationContentV4'
 import { createConversationRuntime } from '@/modules/conversationRuntime'
@@ -28,6 +28,28 @@ function harness() {
 }
 
 describe('conversation event transport adapter', () => {
+  it('preserves recovery scope and rejects unowned flow delivery instead of manufacturing dirty responsibility', async () => {
+    const consumed = new Map<string, TransportConsumptionHandler>()
+    let gap!: TransportGapHandler
+    const transport = createConversationEventTransport({
+      subscribe: () => ({ close() {} }),
+      subscribeConsumed: (event, handler) => { consumed.set(event, handler); return { close() {} } },
+      subscribeGap: handler => { gap = handler; return { close() {} } },
+    })
+    const recovery = vi.fn(async () => false)
+    transport.subscribe({ onEvent: () => undefined, onRecoveryRequired: recovery })
+    await expect(consumed.get('session.event.text_delta')!({ key: 'unknown', text: 'late' }, {})).rejects.toThrow('No conversation consumer')
+    await gap({ keys: ['beta'], global: false })
+    expect(recovery).toHaveBeenLastCalledWith({ keys: ['beta'], global: false })
+    await gap({ reason: 'legacy_sequence_gap' })
+    expect(recovery).toHaveBeenLastCalledWith({ keys: [], global: true })
+    const throwingConsumer = vi.fn(() => { throw new Error('superseded consumer') })
+    transport.subscribe({ onEvent: throwingConsumer })
+    await expect(consumed.get('session.event.text_delta')!({ key: 'alpha', text: 'late' }, {})).rejects.toThrow('superseded consumer')
+    expect(throwingConsumer).toHaveBeenCalledOnce()
+    transport.unsubscribe()
+  })
+
   it('preserves Cron replay reset facts through the existing shared runtime', () => {
     const { rpc, transport } = harness()
     const observed = vi.fn()

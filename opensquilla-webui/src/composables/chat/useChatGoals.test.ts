@@ -584,7 +584,8 @@ describe('useChatGoals', () => {
     expect(storage.entries()).toHaveLength(0)
   })
 
-  it('offers explicit takeover after automatic reattach fails without using Resume', async () => {
+  it('retries transient reattachment with the same token without takeover or Resume', async () => {
+    vi.useFakeTimers()
     const storage = new MemoryContinuityStorage()
     const first = harness(storage)
     first.rpc.call.mockResolvedValueOnce(mutation(goalPayload(), {
@@ -606,7 +607,7 @@ describe('useChatGoals', () => {
       }),
     })
     await flushAsyncWork()
-    expect(refreshed.api.connectionTakeoverAvailable.value).toBe(true)
+    expect(refreshed.api.connectionTakeoverAvailable.value).toBe(false)
 
     refreshed.rpc.call.mockResolvedValueOnce(mutation(goalPayload('active', {
       continuationDeferredReason: null,
@@ -615,18 +616,19 @@ describe('useChatGoals', () => {
     }), {
       continuityToken: 'continuity-token-2',
     }))
-    expect(await refreshed.api.takeOverConnection()).toBe(true)
+    await vi.advanceTimersByTimeAsync(500)
     expect(refreshed.goalContinuity.reattach).toHaveBeenLastCalledWith({
       sessionKey: SESSION_KEY,
       sessionId: SESSION_ID,
       epoch: 1,
       expectedGoalId: 'g1',
-      takeover: true,
+      continuityToken: 'continuity-token-1',
       sourceKind: 'web',
     })
     expect(refreshed.rpc.call).not.toHaveBeenCalledWith('goals.resume', expect.anything())
     expect(refreshed.api.activeGoal.value?.continuationDeferredReason).toBeNull()
     expect(storage.entries()[0]?.[1]).toContain('continuity-token-2')
+    vi.useRealTimers()
   })
 
   it('does not let a cursorless mutation response roll back a newer live execution state', async () => {

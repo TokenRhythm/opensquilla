@@ -260,6 +260,37 @@ async function flushAsyncWork() {
 }
 
 describe('v4 SessionReadPort Adapter', () => {
+  it('refreshes a live subscription in place and coalesces concurrent reconciliation', async () => {
+    const harness = makeHarness()
+    const lease = createV4SessionReadPort(harness.rpc).open(openRequest())
+    await lease.live
+    harness.calls.length = 0
+    const fresh = deferred<SessionsMessagesSnapshotResult>()
+    harness.results.set(SESSIONS_MESSAGES_SNAPSHOT_METHOD, fresh.promise)
+    const first = lease.reconcile()
+    const second = lease.reconcile()
+    await flushAsyncWork()
+    expect(harness.calls.map(call => call.method)).toEqual([SESSIONS_MESSAGES_SNAPSHOT_METHOD])
+    fresh.resolve(snapshotResult({ current_stream_seq: 42 }))
+    const [a, b] = await Promise.all([first, second])
+    expect(a).toBe(b)
+    expect(a.snapshotCursor?.currentStreamSeq).toBe(42)
+    expect(harness.calls.map(call => call.method)).toEqual([
+      SESSIONS_MESSAGES_SNAPSHOT_METHOD, SESSIONS_MESSAGES_HYDRATE_METHOD,
+    ])
+    await lease.close()
+  })
+
+  it('rejects original-lease reconciliation after a real connection generation change', async () => {
+    const harness = makeHarness()
+    const lease = createV4SessionReadPort(harness.rpc).open(openRequest())
+    await lease.live
+    harness.calls.length = 0
+    harness.setGeneration(8)
+    await expect(lease.reconcile()).rejects.toMatchObject({ kind: 'aborted' })
+    expect(harness.calls).toHaveLength(0)
+  })
+
   it.each([
     {
       name: 'an empty canonical key',

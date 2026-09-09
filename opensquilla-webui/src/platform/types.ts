@@ -464,6 +464,8 @@ export interface CliInvocation {
 }
 
 export interface PlatformGatewayApi {
+  /** Observation only: never restart the Gateway or reload the renderer. */
+  onResume?: (callback: () => void) => () => void
   getStatus(): Promise<GatewayStatus>
   getConnection?: () => Promise<DesktopGatewayConnection>
   onConnection?: (

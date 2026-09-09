@@ -35,6 +35,8 @@ GENERATED_WIRE_IMPORT_ALLOWLIST = frozenset(
         # Session read Contracts are consumed only by the Gateway registration
         # Adapter; Application Modules and handlers receive domain values.
         "src/opensquilla/gateway/adapters/session_read_contract.py",
+        # Additive connection-local snapshot and consumption control Contracts.
+        "src/opensquilla/gateway/adapters/connection_recovery_contract.py",
         # SandboxRuntime handlers stay legacy-compatible while generated
         # descriptors own registration metadata and success validation.
         "src/opensquilla/gateway/adapters/sandbox_runtime_contract.py",
@@ -117,8 +119,10 @@ SESSIONS_LIST_LITERAL_ALLOWLIST: Counter[str] = Counter(
     }
 )
 SESSIONS_LIST_GATEWAY_ADAPTER = PACKAGE_ROOT / "gateway" / "adapters" / "sessions_list_contract.py"
-RUNTIME_RPC_METHOD_BASELINE = 307
-RUNTIME_RPC_METHOD_DIGEST = "b04339a7122faa95336eda0f3a6a688a55e6fe8f73bbeb1f5e79082a74e35a48"
+# Existing 307 methods plus snapshot.read and transport.flow.update; exact
+# inventory remains pinned so this does not authorize unrelated wire growth.
+RUNTIME_RPC_METHOD_BASELINE = 309
+RUNTIME_RPC_METHOD_DIGEST = "9aa8200dba6e741c53dc443c0b455ae34f23388bc172fc90942da4c589cc2bea"
 STATIC_RPC_DECORATOR_BASELINE = 86
 
 # Physical lines in the sessions/runtime slice remain tracked for the final
@@ -180,7 +184,10 @@ F2_GATEWAY_COMPOSITION_ROOT = "opensquilla-webui/src/adapters/gateway/gatewayAda
 # Its structure is governed separately below and by the WebUI architecture
 # import gate.  The three stable Transport files totalled 1,125 physical lines
 # on the reviewed #1525 baseline.
-F2_TRANSPORT_FOUNDATION_LOC_CEILING = 1_125
+# Connection stability adds 69 reviewed lines at this private seam: one flow
+# owner, consumed/gap hooks, staging/install control and validated orphan-read
+# credit cleanup. Domain recovery stays outside the generic transport seam.
+F2_TRANSPORT_FOUNDATION_LOC_CEILING = 1_125 + 69
 
 WEBUI_SOURCE_ROOT = ROOT / "opensquilla-webui" / "src"
 WEBUI_LEGACY_TRANSPORT_IDENTIFIERS = (
@@ -1469,6 +1476,13 @@ def test_runtime_rpc_surface_is_exact_and_contract_methods_use_generic_adapter()
         assert entry is not None
         assert entry.name == method
         assert entry.required_scope == scope
+        assert entry.handler.__module__ == "opensquilla.gateway.adapters.contract_method"
+        assert entry.handler.__name__ == "handle_contract_method"
+
+    for method in ("sessions.messages.snapshot.read", "transport.flow.update"):
+        entry = registry.get_entry(method)
+        assert entry is not None
+        assert entry.required_scope == "operator.read"
         assert entry.handler.__module__ == "opensquilla.gateway.adapters.contract_method"
         assert entry.handler.__name__ == "handle_contract_method"
 

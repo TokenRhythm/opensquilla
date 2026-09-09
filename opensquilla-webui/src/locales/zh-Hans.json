@@ -3501,6 +3501,7 @@
     "liveConnecting": "正在恢复实时更新…",
     "liveConnectingConnected": "Gateway 已连接，正在恢复当前会话实时更新…",
     "gatewayReconnecting": "正在重新连接 Gateway…",
+    "automaticRecoveryDescription": "正在自动恢复，可继续编辑；未发送的文字和附件会保留在这里。",
     "liveUnavailable": "实时更新暂不可用",
     "liveUnavailableDescription": "历史消息仍可查看。请重新连接后再发送。",
     "liveUnavailableConnectedDescription": "Gateway 已连接，历史消息仍可查看；当前会话实时更新恢复后即可发送。",

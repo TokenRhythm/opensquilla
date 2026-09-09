@@ -15,6 +15,13 @@ const scriptDir = dirname(fileURLToPath(import.meta.url))
 const packageRoot = resolve(scriptDir, '..')
 const repoRoot = resolve(packageRoot, '../..')
 const ELECTRON_SHUTDOWN_TIMEOUT_MS = 15_000
+const flowControl = process.argv.includes('--flow-control')
+const connectionFaults = process.argv.includes('--connection-faults')
+const outageOption = process.argv.find(value => value.startsWith('--outage-ms='))
+const outageMs = outageOption ? Number(outageOption.split('=')[1]) : 5_000
+if (!Number.isInteger(outageMs) || outageMs < 5_000 || outageMs > 600_000) {
+  throw new Error('outage-ms must be an integer between 5000 and 600000')
+}
 
 async function waitFor(check, label, timeoutMs = 60_000) {
   const startedAt = Date.now()
@@ -52,12 +59,23 @@ async function mainWindowSnapshot(app) {
 const isolationRoot = await mkdtemp(join(tmpdir(), 'opensquilla-electron-window-close-test-'))
 const userDataDir = join(isolationRoot, 'chromium-user-data')
 const isolatedHome = join(isolationRoot, 'home')
+const isolatedRoaming = join(isolationRoot, 'AppData', 'Roaming')
+const isolatedLocal = join(isolationRoot, 'AppData', 'Local')
 let desktopApp
 let flowSucceeded = false
+let outage = false
+let reconnectAttempts = 0
+let acceptedSockets = 0
+let negotiatedFlow = false
+let warmRecoveryMs = null
+const routedClients = new Set()
+const routedServers = new WeakMap()
 
 try {
   await mkdir(userDataDir, { recursive: true })
   await mkdir(isolatedHome, { recursive: true })
+  await mkdir(isolatedRoaming, { recursive: true })
+  await mkdir(isolatedLocal, { recursive: true })
 
   // Use a synthetic keyless profile so the lifecycle test reaches the Control
   // UI without reading developer credentials or requiring an external model.
@@ -88,14 +106,19 @@ try {
       packageRoot,
     ],
     env: {
-      ...process.env,
+      ...Object.fromEntries(Object.entries(process.env).filter(([key]) => !(
+        /(^OPENSQUILLA_|TOKEN|SECRET|API_KEY|ACCESS_KEY|PRIVATE_KEY|PASSWORD|^ELECTRON_RUN_AS_NODE$)/i.test(key)
+      ))),
       HOME: isolatedHome,
       USERPROFILE: isolatedHome,
+      APPDATA: isolatedRoaming,
+      LOCALAPPDATA: isolatedLocal,
       OPENSQUILLA_DESKTOP_REPO_ROOT: repoRoot,
       OPENSQUILLA_DESKTOP_SECRET_STORAGE: 'plain',
       OPENSQUILLA_DESKTOP_DISABLE_AUTO_UPDATE: '1',
       OPENSQUILLA_AUTH_MODE: 'token',
       OPENSQUILLA_AUTH_TOKEN: 'synthetic-window-flow-operator-token',
+      OPENSQUILLA_GATEWAY_WS_TRANSPORT_FLOW_ENABLED: flowControl ? 'true' : 'false',
     },
   })
 
@@ -104,6 +127,35 @@ try {
     platform: process.platform,
   }))
   assert.equal(await realpath(runtimeIsolation.userData), await realpath(userDataDir))
+
+  const installFaultRoute = async () => {
+    await desktopApp.context().routeWebSocket(/\/ws$/, client => {
+      if (outage) {
+        reconnectAttempts++
+        client.close({ code: 1013, reason: 'Isolated connectivity fault' })
+        return
+      }
+      acceptedSockets++
+      routedClients.add(client)
+      const server = client.connectToServer()
+      routedServers.set(client, server)
+      client.onClose((code, reason) => {
+        routedClients.delete(client)
+        void server.close({ code, reason })
+      })
+      server.onClose((code, reason) => {
+        routedClients.delete(client)
+        void client.close({ code, reason })
+      })
+      server.onMessage(message => {
+        try {
+          const frame = JSON.parse(String(message))
+          if (frame?.policy?.transport_flow?.delivery_epoch) negotiatedFlow = true
+        } catch { /* Non-JSON frames remain transparent. */ }
+        client.send(message)
+      })
+    })
+  }
 
   const page = await desktopApp.firstWindow({ timeout: 60_000 })
   await page.waitForLoadState('domcontentloaded', { timeout: 60_000 }).catch(() => {})
@@ -120,6 +172,12 @@ try {
     // reconciliation that run before the Gateway process can be spawned.
     120_000,
   )
+  // Fixture setup only: install interception before the measured connection.
+  // No reload, refresh or navigation is permitted during fault recovery.
+  if (connectionFaults) {
+    await installFaultRoute()
+    await page.reload({ waitUntil: 'domcontentloaded' })
+  }
   const gatewayAccess = await page.evaluate(async () => {
     const connection = await window.opensquillaDesktop?.getGatewayConnection?.()
     const response = await fetch('/api/system/status', {
@@ -132,6 +190,69 @@ try {
   })
   assert.match(gatewayAccess.authToken, /^[0-9a-f]{64}$/)
   assert.equal(gatewayAccess.status, 200)
+
+  // Exercise the real preload -> platform resume bridge without suspending
+  // the developer's computer. The signal must preserve the live renderer.
+  const composer = page.locator('.chat-textarea').first()
+  await composer.waitFor({ state: 'visible', timeout: 60_000 })
+  const draft = 'isolated stability draft - never send'
+  await composer.fill(draft)
+  await composer.focus()
+  const resumeUrl = page.url()
+  await page.evaluate(() => {
+    window.__stabilityComposer = document.querySelector('.chat-textarea')
+    window.__stabilityResumeSignals = 0
+    window.__stabilityDetachResume = window.opensquillaDesktop.onSystemResume(() => {
+      window.__stabilityResumeSignals++
+    })
+  })
+  const cdp = await page.context().newCDPSession(page)
+  await cdp.send('Network.enable')
+  let socketsClosed = 0
+  cdp.on('Network.webSocketClosed', () => { socketsClosed++ })
+  await desktopApp.evaluate(({ powerMonitor }) => {
+    powerMonitor.emit('resume')
+    powerMonitor.emit('resume')
+  })
+  await waitFor(async () => (await page.evaluate(() => window.__stabilityResumeSignals)) === 2,
+    'preload system-resume bridge')
+  await delay(6_000)
+  assert.equal(page.url(), resumeUrl, 'resume must not navigate or reload')
+  assert.equal(await composer.inputValue(), draft, 'resume must preserve the unsent draft')
+  assert.equal(await page.evaluate(() => (
+    document.querySelector('.chat-textarea') === window.__stabilityComposer
+    && document.activeElement === window.__stabilityComposer
+  )), true, 'resume must preserve composer identity and focus')
+  assert.equal(socketsClosed, 0, 'healthy resume must not close a shared WebSocket')
+  await page.evaluate(() => window.__stabilityDetachResume())
+  await cdp.detach()
+
+  if (connectionFaults) {
+    await waitFor(async () => routedClients.size === 1, 'one measured Gateway connection')
+    if (flowControl) assert.equal(negotiatedFlow, true, 'candidate must negotiate flow control')
+    const acceptedBefore = acceptedSockets
+    outage = true
+    for (const client of [...routedClients]) {
+      routedClients.delete(client)
+      await client.close({ code: 1013, reason: 'Isolated network interruption' })
+      await routedServers.get(client)?.close({ code: 1013, reason: 'Isolated network interruption' })
+    }
+    await delay(outageMs)
+    assert.equal(await composer.inputValue(), draft, 'offline editing must preserve the draft')
+    outage = false
+    const recoverStarted = Date.now()
+    await page.evaluate(() => window.dispatchEvent(new Event('online')))
+    await waitFor(async () => acceptedSockets > acceptedBefore && !await page.locator('.chat-send-btn.btn--primary').isDisabled(),
+      'automatic warm recovery with no user action', 30_000)
+    warmRecoveryMs = Date.now() - recoverStarted
+    assert.equal(page.url(), resumeUrl)
+    assert.equal(await composer.inputValue(), draft)
+    assert.equal(await page.evaluate(() => (
+      document.querySelector('.chat-textarea') === window.__stabilityComposer
+      && document.activeElement === window.__stabilityComposer
+    )), true, 'actual reconnect must preserve composer identity and focus')
+    assert.ok(reconnectAttempts <= 8 + Math.ceil(outageMs / 5_000), 'interruption must not cause a reconnect storm')
+  }
 
   const preferences = await page.evaluate(
     () => window.opensquillaDesktop.getDesktopPreferences?.(),
@@ -360,6 +481,13 @@ try {
       secondInstanceDeepLink: true,
       openUrlDeepLink: true,
       minimizedRestored: minimized,
+      resumeBridgePreservedDraftAndSocket: true,
+      connectionFaults,
+      outageMs: connectionFaults ? outageMs : null,
+      flowControl,
+      negotiatedFlow,
+      reconnectAttempts,
+      warmRecoveryMs,
     }, null, 2))
   }
   flowSucceeded = true
@@ -380,6 +508,9 @@ try {
   ).catch(() => '')
   console.error(JSON.stringify({
     error: error instanceof Error ? error.message : String(error),
+    routedConnectionCount: routedClients.size,
+    acceptedSockets,
+    negotiatedFlow,
     windows,
     desktopLog,
   }, null, 2))

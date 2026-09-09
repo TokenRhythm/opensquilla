@@ -93,6 +93,9 @@ from opensquilla.engine.cache_break_monitor import (
 from opensquilla.engine.steps.router_decision_record import (
     drain_pending_flushes_for_sessions,
 )
+from opensquilla.gateway.adapters.connection_recovery_contract import (
+    register_connection_recovery_contract,
+)
 from opensquilla.gateway.adapters.pending_input_queue import (
     GatewayPendingInputQueueAdapter,
 )
@@ -4453,6 +4456,85 @@ async def _handle_sessions_messages_snapshot(params: dict | None, ctx: RpcContex
     )
 
 
+async def _snapshot_session_identity(ctx: RpcContext, key: str) -> tuple[str | None, int | None]:
+    from opensquilla.gateway.session_services import read_session_identity
+
+    return await read_session_identity(getattr(ctx, "session_manager", None), key)
+
+
+async def _handle_sessions_messages_snapshot_read(params: dict | None, ctx: RpcContext) -> dict:
+    from opensquilla.gateway.adapters.connection_recovery_contract import validate_recovery_params
+    from opensquilla.gateway.snapshot_transfer import SnapshotTransfer, SnapshotTransferError
+    from opensquilla.gateway.websocket import get_registry
+
+    try:
+        validate_recovery_params("sessions.messages.snapshot.read", params)
+    except ValueError as exc:
+        raise RpcHandlerError("INVALID_REQUEST", str(exc), accepted=False) from exc
+    assert isinstance(params, dict)
+    key = _require_key(params)
+    sync_revision = params["sync_revision"]
+    registry = get_registry()
+    connection = registry.get(ctx.conn_id)
+    if connection is None or connection.principal != ctx.principal:
+        raise RpcHandlerError("UNAUTHORIZED", "Connection identity is no longer current")
+    transfer = getattr(connection, "_snapshot_transfer", None)
+    if transfer is None:
+        transfer = SnapshotTransfer(
+            connection.reserve_transport_bytes, connection.release_transport_bytes
+        )
+        connection._snapshot_transfer = transfer
+        connection.add_transport_cleanup(transfer.close)
+    identity = await _snapshot_session_identity(ctx, key)
+    if registry.get(ctx.conn_id) is not connection:
+        raise RpcHandlerError("SNAPSHOT_STALE", "Connection is no longer current", accepted=False)
+    try:
+        snapshot_id = params.get("snapshot_id")
+        if snapshot_id is not None:
+            if transfer.identity != identity:
+                transfer.close()
+                raise SnapshotTransferError("SNAPSHOT_STALE")
+            if "segment_index" not in params:
+                raise SnapshotTransferError("INVALID_REQUEST")
+            result = transfer.read(key, sync_revision, snapshot_id, params["segment_index"])
+        else:
+            if params.get("segment_index", 0) != 0:
+                raise SnapshotTransferError("INVALID_REQUEST")
+            application = _build_session_read_application(ctx)
+            result = await transfer.create(
+                key,
+                sync_revision,
+                lambda: session_read_snapshot_to_v4(
+                    key,
+                    application.read_snapshot(key, client_caps=connection.client_caps),
+                ),
+                identity=identity,
+            )
+        # Encoding yields; a reset/delete-recreate or disconnect may have
+        # invalidated the captured owner while those bytes were being built.
+        current_identity = await _snapshot_session_identity(ctx, key)
+        if registry.get(ctx.conn_id) is not connection or current_identity != identity:
+            transfer.close()
+            raise SnapshotTransferError("SNAPSHOT_STALE")
+        if getattr(connection, "flow_enabled", False):
+            # Segment credit is released after bounded staging, not after the
+            # complete snapshot installs. The latter would deadlock recovery.
+            result["delivery"] = connection.reserve_snapshot_delivery(
+                len(result["data"]) + 4096, key, result["snapshot_id"], sync_revision
+            )
+        return result
+    except SnapshotTransferError as exc:
+        raise RpcHandlerError(
+            exc.code,
+            "Snapshot synchronization is temporarily unavailable"
+            if exc.code != "SNAPSHOT_TOO_LARGE"
+            else "Use paginated history for this snapshot",
+            retryable=exc.code in {"SNAPSHOT_BUSY", "SNAPSHOT_EXPIRED", "SNAPSHOT_STALE"},
+            retry_after_ms=250 if exc.code == "SNAPSHOT_BUSY" else None,
+            accepted=False,
+        ) from exc
+
+
 async def _handle_sessions_messages_unsubscribe(params: dict | None, ctx: RpcContext) -> None:
     key = _require_key(params)
     subscription_mgr = getattr(ctx, "subscription_manager", None)
@@ -4497,6 +4579,13 @@ _handle_sessions_messages_subscribe_contract = register_sessions_messages_subscr
 _handle_sessions_messages_hydrate_contract = register_sessions_messages_hydrate_contract(
     _d,
     _handle_sessions_messages_hydrate,
+    internal_error=RpcHandlerError,
+    guest_allowed_checker=is_guest_rpc_method_allowed,
+)
+_handle_sessions_messages_snapshot_read_contract = register_connection_recovery_contract(
+    _d,
+    "sessions.messages.snapshot.read",
+    _handle_sessions_messages_snapshot_read,
     internal_error=RpcHandlerError,
     guest_allowed_checker=is_guest_rpc_method_allowed,
 )

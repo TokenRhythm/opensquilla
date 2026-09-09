@@ -37,6 +37,7 @@ function createHarness(options: {
   getCompactionPlacement?: (compactionId: string) => 'activity' | 'standalone' | undefined
   observeStreamGeneration?: (signal: ConversationCursorSignal) => boolean
   supportsTurnCommitted?: boolean
+  onRecoveryRequired?: () => void
 } = {}) {
   const messages = ref<ChatMessage[]>(options.messages ?? [])
   const sessionKey = ref('agent:main:test')
@@ -91,6 +92,7 @@ function createHarness(options: {
   const restoreSteerIntoComposer = vi.fn(options.restoreSteerIntoComposer ?? (() => {}))
   const scope = effectScope()
   const rawApi = scope.run(() => useChatRpcEventHandlers({
+    onRecoveryRequired: options.onRecoveryRequired,
     sessionKey,
     currentEpoch: ref(0),
     lastStreamSeq,
@@ -2679,17 +2681,26 @@ describe('useChatRpcEventHandlers ensemble handoff', () => {
 })
 
 describe('useChatRpcEventHandlers ensemble activity', () => {
-  it('removes the transient connection-loss row after reconnect', () => {
+  it('marks a 65-event pending-acceptance overflow dirty instead of replaying a truncated tail', () => {
+    const onRecoveryRequired = vi.fn()
+    const { api, activeStreamTaskId, stream, stop } = createHarness({ onRecoveryRequired })
+    try {
+      activeStreamTaskId.value = PENDING_STREAM_TASK_ID
+      for (let seq = 1; seq <= 65; seq++) api.handlers.onTextDelta({
+        key: 'agent:main:test', task_id: 'task-overflow', stream_seq: seq, text: String(seq),
+      })
+      expect(onRecoveryRequired).toHaveBeenCalledOnce()
+      api.bindActiveStreamTask('task-overflow')
+      expect(stream.appendDelta).not.toHaveBeenCalled()
+    } finally { stop() }
+  })
+
+  it('does not inject a transcript row for an automatically recovered connection', () => {
     const { api, messages, stop } = createHarness()
 
     try {
       api.handlers.onConnectionState('disconnected')
-      expect(messages.value).toEqual([
-        expect.objectContaining({
-          role: 'system',
-          text: 'Connection lost — trying to reconnect…',
-        }),
-      ])
+      expect(messages.value).toEqual([])
 
       api.handlers.onConnectionState('connected')
       expect(messages.value).toEqual([])
@@ -2698,13 +2709,13 @@ describe('useChatRpcEventHandlers ensemble activity', () => {
     }
   })
 
-  it('does not duplicate the transient row while disconnected', () => {
+  it('keeps repeated disconnect notifications out of the transcript', () => {
     const { api, messages, stop } = createHarness()
 
     try {
       api.handlers.onConnectionState('disconnected')
       api.handlers.onConnectionState('disconnected')
-      expect(messages.value).toHaveLength(1)
+      expect(messages.value).toHaveLength(0)
     } finally {
       stop()
     }

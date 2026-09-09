@@ -782,6 +782,10 @@ class _ReplayConn:
         self.client_caps = client_caps
         self.events: list[tuple[str, dict, dict | None]] = []
 
+    def _retire_flow_subscription(self, key: str) -> None:
+        """This replay-only fake has no negotiated consumption-flow state."""
+        assert "transport.flow.v1" not in self.client_caps
+
     async def send_event(
         self,
         event: str,

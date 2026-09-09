@@ -1573,6 +1573,15 @@ export function useChatHistory(options: UseChatHistoryOptions) {
     }
   }
 
+  async function reconcileHistory(): Promise<SessionPhaseResult | void> {
+    const key = options.sessionKey.value
+    // A read admitted before the snapshot cannot prove a terminal transition
+    // after its watermark. Join it, then admit one fresh current-window read.
+    await activeHistory?.promise.catch(() => {})
+    if (options.sessionKey.value !== key) return { ok: false, cancelled: true }
+    return loadHistory({ nonReconnecting: true })
+  }
+
   function cleanup() {
     cancelActiveHistory()
     historySyncPending = false
@@ -1584,6 +1593,7 @@ export function useChatHistory(options: UseChatHistoryOptions) {
     historySessionKey,
     historyState,
     loadHistory,
+    reconcileHistory,
     loadEarlierHistory,
     retryHistory,
     markSessionMissing,

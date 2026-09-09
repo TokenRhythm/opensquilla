@@ -28,6 +28,9 @@ export interface SessionNavigationDiagEntry {
   wasClean?: boolean
   reconnectAttempt?: number
   delayMs?: number
+  recoveryMs?: number
+  loopLagMs?: number
+  maxLoopLagMs?: number
 }
 
 export type SessionNavigationDiagData = Omit<SessionNavigationDiagEntry, 't' | 'iso' | 'source'>
@@ -178,6 +181,15 @@ export function recordRpcTransportDiag(detail: unknown): SessionNavigationDiagEn
       : {}),
     ...(typeof value.delay === 'number' && Number.isFinite(value.delay)
       ? { delayMs: value.delay }
+      : {}),
+    ...(typeof value.recoveryMs === 'number' && Number.isFinite(value.recoveryMs) && value.recoveryMs >= 0
+      ? { recoveryMs: value.recoveryMs }
+      : {}),
+    ...(typeof value.loopLagMs === 'number' && Number.isFinite(value.loopLagMs) && value.loopLagMs >= 0
+      ? { loopLagMs: value.loopLagMs }
+      : {}),
+    ...(typeof value.maxLoopLagMs === 'number' && Number.isFinite(value.maxLoopLagMs) && value.maxLoopLagMs >= 0
+      ? { maxLoopLagMs: value.maxLoopLagMs }
       : {}),
     ...(reason ? { reason } : {}),
     ...(handoff

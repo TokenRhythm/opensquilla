@@ -143,6 +143,16 @@
       "wireNames": [
         "sessions.routing.changed"
       ]
+    },
+    {
+      "delivery": "live-only-best-effort",
+      "family": "transport.flow.dirty",
+      "schema": "transport/transport-flow-dirty.schema.json",
+      "schemaSha256": "5afafa2c3baca401b00b0cf666b1c1435fc8e5e18838e2c96873421368513d43",
+      "schemaVersion": 1,
+      "wireNames": [
+        "transport.flow.dirty"
+      ]
     }
   ],
   "format": 1,
@@ -1197,6 +1207,12 @@
     },
     {
       "lifecycle": "stable",
+      "name": "sessions.messages.snapshot.read",
+      "schema": "sessions/sessions-messages-snapshot-read.schema.json",
+      "schemaSha256": "526f7c0939799eb8b595897cd987b3f298d49f841affe159147ef1bafa3e5e94"
+    },
+    {
+      "lifecycle": "stable",
       "name": "sessions.messages.subscribe",
       "schema": "sessions/sessions-messages-subscribe.schema.json",
       "schemaSha256": "3cd9dc014552f9f959d1e4f6aac8bc9621b994c645b7d43030651e4e8b28cedb"
@@ -1393,6 +1409,12 @@
     },
     {
       "lifecycle": "stable",
+      "name": "transport.flow.update",
+      "schema": "transport/transport-flow-update.schema.json",
+      "schemaSha256": "c637cfebaf5aa6c70fa29c6349d36f091a6de2fe445fe125e49a332b2dd7f5e6"
+    },
+    {
+      "lifecycle": "stable",
       "name": "usage.cost",
       "schema": "conversation/usage-cost.schema.json",
       "schemaSha256": "9b2cc19bcf92c659bd92ce18d4ddf58ade65a0ae6ba8e78a0c4c2f3f0cbca206"
@@ -1472,11 +1494,11 @@
   ],
   "protocol": "opensquilla-websocket-json",
   "source": {
-    "eventFamilyCount": 9,
-    "generatorSha256": "053df928840129e254a7f609e46832d8ee8ee1c241cf225632dcded3f996297e",
-    "methodCount": 217,
-    "schemaCount": 226,
-    "schemaTreeSha256": "de65ac0d9ad183c07500a98a92328888aae9615c9b5e7991e136b5e2cea8fe63"
+    "eventFamilyCount": 10,
+    "generatorSha256": "2a1618f463d89cced7bfde22c9b7e7e8d6722986764dd8f261f43e60c8c86ca8",
+    "methodCount": 219,
+    "schemaCount": 229,
+    "schemaTreeSha256": "dd66f81129f3499baaf7261dd7e82b17eae9c6c3f10196054d2dade738543df7"
   },
   "wireVersion": 4
 }

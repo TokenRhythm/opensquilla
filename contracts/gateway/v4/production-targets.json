@@ -3,6 +3,21 @@
   "targets": [
     {
       "kind": "event",
+      "wireName": "transport.flow.dirty",
+      "roles": ["payload"]
+    },
+    {
+      "kind": "method",
+      "wireName": "transport.flow.update",
+      "roles": ["params", "result"]
+    },
+    {
+      "kind": "method",
+      "wireName": "sessions.messages.snapshot.read",
+      "roles": ["params", "result"]
+    },
+    {
+      "kind": "event",
       "wireName": "approval.events",
       "roles": [
         "payload"

@@ -1,4 +1,4 @@
-import { app, BrowserWindow, clipboard, dialog, Menu, ipcMain, nativeTheme, net as electronNet, protocol, safeStorage, shell, Tray } from 'electron'
+import { app, BrowserWindow, clipboard, dialog, Menu, ipcMain, nativeTheme, net as electronNet, powerMonitor, protocol, safeStorage, shell, Tray } from 'electron'
 import electronUpdater from 'electron-updater'
 import { spawn, spawnSync, type ChildProcess, type ChildProcessWithoutNullStreams } from 'node:child_process'
 import { createHash, randomUUID } from 'node:crypto'
@@ -14200,6 +14200,16 @@ if (!gotSingleInstanceLock) {
   })
 
   void app.whenReady().then(async () => {
+    // An OS wake is an observation, not permission to restart or reload.
+    const notifySystemResume = () => {
+      for (const window of BrowserWindow.getAllWindows()) {
+        if (!window.isDestroyed() && !window.webContents.isDestroyed()) {
+          window.webContents.send('desktop:system:resume')
+        }
+      }
+    }
+    powerMonitor.on('resume', notifySystemResume)
+    app.once('will-quit', () => powerMonitor.removeListener('resume', notifySystemResume))
     app.name = 'OpenSquilla'
     installDesktopRendererProtocol()
     desktopLocale = loadPersistedDesktopLocale() ?? resolveDesktopLocale()
