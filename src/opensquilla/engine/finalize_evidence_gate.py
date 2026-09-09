@@ -25,10 +25,6 @@ green results from unrelated suites do not override it; the challenge never
 demands patch minimality, never devalues self-written repros, fires only at
 finalize-time, and never blocks submission (bounded challenges, then the run
 finishes normally).
-
-The tracker is a pure, I/O-free state machine so the exact same semantics run
-inside the live agent loop and in offline transcript replay
-(``scripts/experiments/replay_finalize_gate.py``).
 """
 
 from __future__ import annotations

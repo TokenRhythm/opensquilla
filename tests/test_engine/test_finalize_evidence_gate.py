@@ -1,8 +1,4 @@
 """Unit tests for the pure finalize-time red-evidence gate module.
-
-The tracker/classifiers here are shared verbatim between the live agent loop
-and offline transcript replay (``scripts/experiments/replay_finalize_gate.py``),
-so these tests pin the exact detector semantics that both callers rely on.
 """
 
 from __future__ import annotations
