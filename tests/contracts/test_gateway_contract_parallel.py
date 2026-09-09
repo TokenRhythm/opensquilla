@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import sys
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from threading import Barrier, Lock
+from threading import Barrier, Event, Lock
 
 import pytest
 
@@ -170,6 +171,50 @@ def test_parallel_compiler_failure_preserves_complete_previous_tree(
     monkeypatch.setattr(runner, "render_generic", render)
     with pytest.raises(RuntimeError, match="synthetic compiler failure"):
         runner.run("write-determinism", specs, profile="verification", output_root=tmp_path, jobs=2)
+    assert {path: path.read_bytes() for path in tmp_path.rglob("*") if path.is_file()} == before
+
+
+def test_early_compiler_failure_cancels_queued_work_and_joins_active_compilers(
+    tmp_path: Path,
+    specs: tuple[runner.ContractSpec, ...],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _existing_tree(tmp_path, specs[0].outputs[0])
+    before = {path: path.read_bytes() for path in tmp_path.rglob("*") if path.is_file()}
+    release = Event()
+    compiler_started = Event()
+    lock = Lock()
+    started: set[str] = set()
+    finished: set[str] = set()
+
+    class ReleasingExecutor(ThreadPoolExecutor):
+        def shutdown(self, wait: bool = True, *, cancel_futures: bool = False) -> None:
+            # Keep active compilers blocked until shutdown has had the chance
+            # to cancel queued work, then let active compilers finish and join.
+            super().shutdown(wait=False, cancel_futures=cancel_futures)
+            release.set()
+            super().shutdown(wait=wait, cancel_futures=cancel_futures)
+
+    def render(spec: runner.ContractSpec, **_: object) -> dict[Path, str]:
+        with lock:
+            started.add(spec.wire_name)
+        try:
+            if spec == specs[0]:
+                assert compiler_started.wait(timeout=10)
+                raise RuntimeError("early compiler failure")
+            compiler_started.set()
+            assert release.wait(timeout=10)
+            return _artifacts(spec)
+        finally:
+            with lock:
+                finished.add(spec.wire_name)
+
+    monkeypatch.setattr(runner, "ThreadPoolExecutor", ReleasingExecutor)
+    monkeypatch.setattr(runner, "render_generic", render)
+    with pytest.raises(RuntimeError, match="early compiler failure"):
+        runner.run("write-determinism", specs, profile="verification", output_root=tmp_path, jobs=2)
+    assert 1 < len(started) < len(specs)
+    assert finished == started
     assert {path: path.read_bytes() for path in tmp_path.rglob("*") if path.is_file()} == before
 
 
