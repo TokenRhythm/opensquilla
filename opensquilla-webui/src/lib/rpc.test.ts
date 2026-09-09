@@ -1,10 +1,12 @@
 // @vitest-environment happy-dom
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import {
+  isHelloOkFrame,
   RpcAbortError,
   RpcClient,
   type RpcClientError,
   RpcTimeoutError,
+  WEB_RPC_PROTOCOL_VERSION,
 } from '@/lib/rpc'
 
 class MockWebSocket {
@@ -39,6 +41,10 @@ class MockWebSocket {
   receive(frame: unknown): void {
     this.onmessage?.({ data: JSON.stringify(frame) } as MessageEvent)
   }
+
+  receiveRaw(data: string): void {
+    this.onmessage?.({ data } as MessageEvent)
+  }
 }
 
 function pendingCount(client: RpcClient): number {
@@ -49,16 +55,104 @@ function pendingCount(client: RpcClient): number {
   )._pending.size
 }
 
+function helloOkFrame(
+  overrides: Record<string, unknown> = {},
+): Record<string, unknown> {
+  return {
+    type: 'hello-ok',
+    protocol: WEB_RPC_PROTOCOL_VERSION,
+    server: { version: 'test', conn_id: 'conn-test' },
+    features: { methods: [], events: [] },
+    snapshot: {},
+    policy: { tick_interval_ms: 30_000 },
+    auth: null,
+    ...overrides,
+  }
+}
+
 function establishConnection(
   socket: MockWebSocket,
   policy: Record<string, unknown> = {},
 ): void {
   socket.receive({ type: 'event', event: 'connect.challenge' })
-  socket.receive({
-    protocol: 3,
+  socket.receive(helloOkFrame({
     policy: { tick_interval_ms: 30_000, ...policy },
-  })
+  }))
 }
+
+describe('isHelloOkFrame', () => {
+  it('accepts a complete v3 frame with additive extension fields', () => {
+    expect(isHelloOkFrame(helloOkFrame({
+      extension: { future: true },
+      server: {
+        version: 'test',
+        conn_id: 'conn-test',
+        build: 'future-build',
+      },
+      features: {
+        methods: ['sessions.list'],
+        events: ['sessions.changed'],
+        futureCapability: true,
+      },
+    }))).toBe(true)
+  })
+
+  it.each([
+    ['a protocol-only object', { protocol: 3 }],
+    ['the wrong frame type', helloOkFrame({ type: 'hello' })],
+    ['a future protocol', helloOkFrame({ protocol: 4 })],
+    ['a non-integer protocol', helloOkFrame({ protocol: 3.5 })],
+    ['an empty server version', helloOkFrame({
+      server: { version: ' ', conn_id: 'conn-test' },
+    })],
+    ['a missing connection id', helloOkFrame({ server: { version: 'test' } })],
+    ['a malformed method list', helloOkFrame({
+      features: { methods: ['sessions.list', 42], events: [] },
+    })],
+    ['a missing event list', helloOkFrame({ features: { methods: [] } })],
+    ['a null snapshot', helloOkFrame({ snapshot: null })],
+    ['an array policy', helloOkFrame({ policy: [] })],
+    ['a malformed tick policy', helloOkFrame({ policy: { tick_interval_ms: '30000' } })],
+    ['a zero tick policy', helloOkFrame({ policy: { tick_interval_ms: 0 } })],
+    ['a negative tick policy', helloOkFrame({ policy: { tick_interval_ms: -1 } })],
+    ['a malformed concurrent-read policy', helloOkFrame({
+      policy: { concurrent_history_reads: 'yes' },
+    })],
+    ['a malformed optional-read list', helloOkFrame({
+      policy: { concurrent_optional_read_methods: ['sessions.list', 42] },
+    })],
+    ['a scalar auth payload', helloOkFrame({ auth: 'owner' })],
+  ])('rejects %s', (_label, frame) => {
+    expect(isHelloOkFrame(frame)).toBe(false)
+  })
+
+  it.each([
+    'max_payload',
+    'max_buffered_bytes',
+    'agent_stream_heartbeat_interval_ms',
+    'agent_stream_idle_timeout_ms',
+    'webui_stream_idle_grace_ms',
+    'client_ws_keepalive_timeout_ms',
+  ])('rejects a negative %s policy value', (field) => {
+    expect(isHelloOkFrame(helloOkFrame({
+      policy: { tick_interval_ms: 30_000, [field]: -1 },
+    }))).toBe(false)
+  })
+
+  it('allows zero for non-tick limits and disableable intervals', () => {
+    expect(isHelloOkFrame(helloOkFrame({
+      policy: {
+        max_payload: 0,
+        max_buffered_bytes: 0,
+        tick_interval_ms: 1,
+        agent_stream_heartbeat_interval_ms: 0,
+        agent_stream_idle_timeout_ms: 0,
+        webui_stream_idle_grace_ms: 0,
+        client_ws_keepalive_timeout_ms: 0,
+      },
+    }))).toBe(true)
+  })
+})
 
 describe('RpcClient', () => {
   beforeEach(() => {
@@ -83,13 +177,20 @@ describe('RpcClient', () => {
     firstSocket.receive({ type: 'event', event: 'connect.challenge' })
 
     const firstFrame = JSON.parse(firstSocket.sent[0]) as {
-      params: { auth: { guestSessionKey: string }; caps: string[] }
+      params: {
+        auth: { guestSessionKey: string }
+        caps: string[]
+        minProtocol: number
+        maxProtocol: number
+      }
     }
     const guestSessionKey = firstFrame.params.auth.guestSessionKey
     expect(firstFrame.params.caps).toEqual([
       'session.answer_generation_reset.v1',
       'session.turn_committed.v1',
     ])
+    expect(firstFrame.params.minProtocol).toBe(WEB_RPC_PROTOCOL_VERSION)
+    expect(firstFrame.params.maxProtocol).toBe(WEB_RPC_PROTOCOL_VERSION)
     expect(guestSessionKey).toMatch(/^osqg_[A-Za-z0-9_-]{43}$/)
     expect(localStorage.getItem('opensquilla.guestSessionKey')).toBe(guestSessionKey)
 
@@ -113,11 +214,9 @@ describe('RpcClient', () => {
     socket.receive({ type: 'event', event: 'connect.challenge' })
     const serverKey = 'osqg_BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB'
 
-    socket.receive({
-      protocol: 3,
-      policy: { tick_interval_ms: 30_000 },
+    socket.receive(helloOkFrame({
       auth: { guestSessionKey: serverKey },
-    })
+    }))
 
     expect(localStorage.getItem('opensquilla.guestSessionKey')).toBe(serverKey)
     client.disconnect()
@@ -143,17 +242,298 @@ describe('RpcClient', () => {
     client.disconnect()
   })
 
+  it('rejects a complete hello that arrives before the challenge and connect request', async () => {
+    const client = new RpcClient()
+    const helloHandler = vi.fn()
+    const diagnostics: Array<Record<string, unknown>> = []
+    client.on('_hello', helloHandler)
+    client.on('_transport', (detail: unknown) => {
+      diagnostics.push(detail as Record<string, unknown>)
+    })
+    client.connect('ws://rpc.test')
+    const socket = MockWebSocket.instances[0]
+
+    socket.receive(helloOkFrame())
+
+    expect(client.state).toBe('disconnected')
+    expect(socket.readyState).toBe(MockWebSocket.CLOSED)
+    expect(socket.sent).toEqual([])
+    expect(helloHandler).not.toHaveBeenCalled()
+    expect(diagnostics).toContainEqual(expect.objectContaining({
+      phase: 'handshake_invalid',
+      reason: 'connect_hello_invalid',
+    }))
+    expect(diagnostics).toContainEqual(expect.objectContaining({
+      phase: 'retire',
+      reason: 'connect_hello_invalid',
+    }))
+
+    await vi.advanceTimersByTimeAsync(999)
+    expect(MockWebSocket.instances).toHaveLength(1)
+    await vi.advanceTimersByTimeAsync(1)
+    expect(MockWebSocket.instances).toHaveLength(2)
+    client.disconnect()
+  })
+
+  it('retires a malformed hello immediately without exposing its payload', async () => {
+    const client = new RpcClient()
+    const helloHandler = vi.fn()
+    const gapHandler = vi.fn()
+    const diagnostics: Array<Record<string, unknown>> = []
+    client.on('_hello', helloHandler)
+    client.on('_gap', gapHandler)
+    client.on('_transport', (detail: unknown) => {
+      diagnostics.push(detail as Record<string, unknown>)
+    })
+    client.connect('ws://rpc.test')
+    const socket = MockWebSocket.instances[0]
+    socket.receive({ type: 'event', event: 'connect.challenge' })
+    expect(pendingCount(client)).toBe(1)
+
+    socket.receive({
+      protocol: WEB_RPC_PROTOCOL_VERSION,
+      auth: {
+        guestSessionKey: 'osqg_CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC',
+      },
+      privatePayload: 'hello-secret-marker',
+    })
+
+    expect(client.state).toBe('disconnected')
+    expect(socket.readyState).toBe(MockWebSocket.CLOSED)
+    expect(pendingCount(client)).toBe(0)
+    expect(helloHandler).not.toHaveBeenCalled()
+    expect(gapHandler).toHaveBeenCalledWith({
+      reason: 'connect_hello_invalid',
+      generation: expect.any(Number),
+    })
+    expect(diagnostics).toContainEqual(expect.objectContaining({
+      phase: 'reconnect_scheduled',
+      reconnectAttempt: 1,
+      delay: 1_000,
+    }))
+    expect(JSON.stringify(diagnostics)).not.toContain('hello-secret-marker')
+    expect(JSON.stringify(diagnostics)).not.toContain('osqg_CCCCC')
+    expect(localStorage.getItem('opensquilla.guestSessionKey'))
+      .not.toBe('osqg_CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC')
+    expect(socket.sent).not.toContain('{"type":"ping"}')
+
+    await vi.advanceTimersByTimeAsync(1_000)
+    expect(MockWebSocket.instances).toHaveLength(2)
+    client.disconnect()
+  })
+
+  it('does not deliver or sequence application events before Hello completes', () => {
+    const client = new RpcClient()
+    const sessionHandler = vi.fn()
+    const wildcardHandler = vi.fn()
+    const diagnostics: Array<Record<string, unknown>> = []
+    client.on('sessions.changed', sessionHandler)
+    client.on('*', wildcardHandler)
+    client.on('_transport', (detail: unknown) => {
+      diagnostics.push(detail as Record<string, unknown>)
+    })
+    client.connect('ws://rpc.test')
+    const socket = MockWebSocket.instances[0]
+    socket.receive({ type: 'event', event: 'connect.challenge', payload: { nonce: 'n' } })
+
+    socket.receive({
+      type: 'event',
+      event: 'sessions.changed',
+      seq: 91,
+      payload: { secret: 'must-not-cross-pre-hello' },
+    })
+
+    expect(sessionHandler).not.toHaveBeenCalled()
+    expect(wildcardHandler).not.toHaveBeenCalled()
+    expect((client as unknown as { _lastSeq: number })._lastSeq).toBe(0)
+    expect(socket.readyState).toBe(MockWebSocket.CLOSED)
+    expect(client.state).toBe('disconnected')
+    expect(diagnostics).toContainEqual(expect.objectContaining({
+      phase: 'handshake_invalid',
+      reason: 'connect_frame_before_hello',
+    }))
+    expect(JSON.stringify(diagnostics)).not.toContain('must-not-cross-pre-hello')
+    client.disconnect()
+  })
+
+  it.each([
+    ['malformed JSON', '{'],
+    ['JSON null', 'null'],
+    ['a JSON array', '[]'],
+    ['a JSON scalar', '"hello"'],
+  ])('rejects %s before Hello completes', (_label, wireFrame) => {
+    const client = new RpcClient()
+    const helloHandler = vi.fn()
+    const diagnostics: Array<Record<string, unknown>> = []
+    client.on('_hello', helloHandler)
+    client.on('_transport', (detail: unknown) => {
+      diagnostics.push(detail as Record<string, unknown>)
+    })
+    client.connect('ws://rpc.test')
+    const socket = MockWebSocket.instances[0]
+    socket.receive({ type: 'event', event: 'connect.challenge', payload: { nonce: 'n' } })
+
+    socket.receiveRaw(wireFrame)
+    socket.receive(helloOkFrame())
+
+    expect(helloHandler).not.toHaveBeenCalled()
+    expect(socket.readyState).toBe(MockWebSocket.CLOSED)
+    expect(client.state).toBe('disconnected')
+    expect(diagnostics).toContainEqual(expect.objectContaining({
+      phase: 'handshake_invalid',
+      reason: 'connect_frame_before_hello',
+    }))
+    client.disconnect()
+  })
+
+  it('accepts only the matching connect error response before Hello', () => {
+    const client = new RpcClient()
+    const diagnostics: Array<Record<string, unknown>> = []
+    client.on('_transport', (detail: unknown) => {
+      diagnostics.push(detail as Record<string, unknown>)
+    })
+    client.connect('ws://rpc.test')
+    const socket = MockWebSocket.instances[0]
+    socket.receive({ type: 'event', event: 'connect.challenge', payload: { nonce: 'n' } })
+    const connectFrame = JSON.parse(socket.sent[0]) as { id: string }
+
+    socket.receive({
+      type: 'res',
+      id: connectFrame.id,
+      ok: false,
+      error: { code: 'AUTH_DENIED', message: 'denied' },
+      seq: 92,
+    })
+
+    expect((client as unknown as { _lastSeq: number })._lastSeq).toBe(0)
+    expect(socket.readyState).toBe(MockWebSocket.CLOSED)
+    expect(client.state).toBe('disconnected')
+    expect(diagnostics).toContainEqual(expect.objectContaining({
+      phase: 'retire',
+      reason: 'connect_request_failure',
+    }))
+    client.disconnect()
+  })
+
+  it('rejects a connect error response for a different request id before Hello', () => {
+    const client = new RpcClient()
+    const diagnostics: Array<Record<string, unknown>> = []
+    client.on('_transport', (detail: unknown) => {
+      diagnostics.push(detail as Record<string, unknown>)
+    })
+    client.connect('ws://rpc.test')
+    const socket = MockWebSocket.instances[0]
+    socket.receive({ type: 'event', event: 'connect.challenge', payload: { nonce: 'n' } })
+    const connectFrame = JSON.parse(socket.sent[0]) as { id: string }
+
+    socket.receive({
+      type: 'res',
+      id: `${connectFrame.id}-different`,
+      ok: false,
+      error: { code: 'AUTH_DENIED', message: 'denied' },
+    })
+
+    expect(socket.readyState).toBe(MockWebSocket.CLOSED)
+    expect(client.state).toBe('disconnected')
+    expect(diagnostics).toContainEqual(expect.objectContaining({
+      phase: 'handshake_invalid',
+      reason: 'connect_frame_before_hello',
+    }))
+    client.disconnect()
+  })
+
+  it.each([
+    ['an unsupported protocol', helloOkFrame({ protocol: 4 })],
+    ['an incomplete server identity', helloOkFrame({ server: { version: 'test' } })],
+    ['malformed capabilities', helloOkFrame({
+      features: { methods: ['sessions.list'], events: [42] },
+    })],
+    ['a zero tick interval', helloOkFrame({ policy: { tick_interval_ms: 0 } })],
+    ['a negative tick interval', helloOkFrame({ policy: { tick_interval_ms: -1 } })],
+  ])('does not connect when hello has %s', (_label, frame) => {
+    const client = new RpcClient()
+    const diagnostics: Array<Record<string, unknown>> = []
+    client.on('_transport', (detail: unknown) => {
+      diagnostics.push(detail as Record<string, unknown>)
+    })
+    client.connect('ws://rpc.test')
+    const socket = MockWebSocket.instances[0]
+    socket.receive({ type: 'event', event: 'connect.challenge' })
+
+    socket.receive(frame)
+
+    expect(client.state).toBe('disconnected')
+    expect(socket.readyState).toBe(MockWebSocket.CLOSED)
+    expect(diagnostics).toContainEqual(expect.objectContaining({
+      phase: 'retire',
+      reason: 'connect_hello_invalid',
+    }))
+    client.disconnect()
+  })
+
+  it('does not reset reconnect backoff for an invalid hello', async () => {
+    const client = new RpcClient()
+    const diagnostics: Array<Record<string, unknown>> = []
+    client.on('_transport', (detail: unknown) => {
+      diagnostics.push(detail as Record<string, unknown>)
+    })
+    client.connect('ws://rpc.test')
+    MockWebSocket.instances[0].close()
+    await vi.advanceTimersByTimeAsync(1_000)
+
+    const replacement = MockWebSocket.instances[1]
+    replacement.receive({ type: 'event', event: 'connect.challenge' })
+    replacement.receive(helloOkFrame({ protocol: 4 }))
+
+    expect(replacement.readyState).toBe(MockWebSocket.CLOSED)
+    expect(diagnostics).toContainEqual(expect.objectContaining({
+      phase: 'reconnect_scheduled',
+      reconnectAttempt: 2,
+      delay: 2_000,
+    }))
+    await vi.advanceTimersByTimeAsync(1_999)
+    expect(MockWebSocket.instances).toHaveLength(2)
+    await vi.advanceTimersByTimeAsync(1)
+    expect(MockWebSocket.instances).toHaveLength(3)
+    client.disconnect()
+  })
+
+  it('accepts a valid hello with unknown additive fields after connect is sent', () => {
+    const client = new RpcClient()
+    const helloHandler = vi.fn()
+    client.on('_hello', helloHandler)
+    client.connect('ws://rpc.test')
+    const socket = MockWebSocket.instances[0]
+    socket.receive({ type: 'event', event: 'connect.challenge' })
+    const hello = helloOkFrame({
+      futureTopLevel: { enabled: true },
+      policy: { tick_interval_ms: 30_000, futurePolicy: true },
+    })
+
+    socket.receive(hello)
+
+    expect(client.state).toBe('connected')
+    expect(helloHandler).toHaveBeenCalledOnce()
+    expect(helloHandler).toHaveBeenCalledWith(hello)
+    expect(client.policy).toEqual({
+      tick_interval_ms: 30_000,
+      futurePolicy: true,
+    })
+    client.disconnect()
+  })
+
   it('preserves structured retry and acceptance metadata on the rejected error', async () => {
     const client = new RpcClient()
     client.connect('ws://rpc.test')
     const socket = MockWebSocket.instances[0]
+    establishConnection(socket)
 
     const result = client.call(
       'chat.send',
       { message: 'hello' },
       { timeoutMs: 100, timeoutAction: 'reconnect' }
     )
-    const request = JSON.parse(socket.sent[0]) as { id: string }
+    const request = JSON.parse(socket.sent[socket.sent.length - 1]) as { id: string }
     socket.receive({
       type: 'res',
       id: request.id,
@@ -225,9 +605,10 @@ describe('RpcClient', () => {
     const onSent = vi.fn()
     client.connect('ws://rpc.test')
     const socket = MockWebSocket.instances[0]
+    establishConnection(socket)
 
     const result = client.call('chat.history', {}, { onSent })
-    const request = JSON.parse(socket.sent[0]) as { id: string }
+    const request = JSON.parse(socket.sent[socket.sent.length - 1]) as { id: string }
 
     expect(onSent).toHaveBeenCalledOnce()
     expect(onSent).toHaveBeenCalledWith(expect.any(Number))
@@ -303,13 +684,14 @@ describe('RpcClient', () => {
     const client = new RpcClient()
     client.connect('ws://rpc.test')
     const socket = MockWebSocket.instances[0]
+    establishConnection(socket)
 
     const result = client.call(
       'chat.history',
       { sessionKey: 'session-1' },
       { timeoutMs: 25 }
     )
-    const request = JSON.parse(socket.sent[0]) as {
+    const request = JSON.parse(socket.sent[socket.sent.length - 1]) as {
       type: string
       id: string
       method: string
@@ -690,11 +1072,10 @@ describe('RpcClient', () => {
     client.connect('ws://secret-host/private-path', 'secret-token')
     const socket = MockWebSocket.instances[0]
     socket.receive({ type: 'event', event: 'connect.challenge' })
-    socket.receive({
-      protocol: 3,
+    socket.receive(helloOkFrame({
       server: { version: 'test', conn_id: 'conn-test-1' },
       policy: { tick_interval_ms: 30_000 },
-    })
+    }))
     socket.close(1012, 'service_restart')
 
     expect(diagnostics.map(item => item.phase)).toEqual([
@@ -977,7 +1358,7 @@ describe('RpcClient', () => {
 
     const replacement = MockWebSocket.instances[1]
     expect(replacement).toBeDefined()
-    firstSocket.receive({ protocol: 3, policy: { tick_interval_ms: 30_000 } })
+    firstSocket.receive(helloOkFrame())
 
     await vi.advanceTimersByTimeAsync(3_000)
 
@@ -1007,7 +1388,7 @@ describe('RpcClient', () => {
     const replacement = MockWebSocket.instances[1]
     replacement.readyState = MockWebSocket.OPEN
     establishConnection(replacement)
-    replacement.receive({ protocol: 3, policy: { tick_interval_ms: 30_000 } })
+    replacement.receive(helloOkFrame())
 
     await vi.advanceTimersByTimeAsync(3_001)
 
@@ -1080,7 +1461,7 @@ describe('RpcClient', () => {
     await vi.advanceTimersByTimeAsync(100)
     expect(socket.sent).toContain('{"type":"ping"}')
 
-    socket.receive({ protocol: 3, policy: { tick_interval_ms: 30_000 } })
+    socket.receive(helloOkFrame())
     await vi.advanceTimersByTimeAsync(3_000)
 
     expect(socket.readyState).toBe(MockWebSocket.CLOSED)

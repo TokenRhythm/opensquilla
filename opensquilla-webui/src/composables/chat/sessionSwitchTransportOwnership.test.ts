@@ -204,9 +204,13 @@ function authenticate(
 ) {
   socket.receive({ type: 'event', event: 'connect.challenge' })
   socket.receive({
+    type: 'hello-ok',
     protocol: 3,
+    server: { version: 'test', conn_id: connId },
+    features: { methods: [], events: [] },
+    snapshot: {},
     policy: { tick_interval_ms: 30_000, ...policy },
-    server: { conn_id: connId },
+    auth: null,
   })
 }
 
@@ -967,12 +971,16 @@ describe('session switch transport ownership', () => {
     expect(rpc.connectionGeneration).toBe(initialGeneration)
 
     socket.receive({
+      type: 'hello-ok',
       protocol: 3,
+      server: { version: 'test', conn_id: 'conn-history-stable' },
+      features: { methods: [], events: [] },
+      snapshot: {},
       policy: {
         tick_interval_ms: 30_000,
         concurrent_history_reads: false,
       },
-      server: { conn_id: 'conn-history-stable' },
+      auth: null,
     })
     const requestController = new AbortController()
     const history = rpc.call(

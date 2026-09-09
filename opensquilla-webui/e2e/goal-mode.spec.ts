@@ -1,4 +1,5 @@
 import { expect, test, type Page } from '@playwright/test'
+import { helloOkResponse } from './support/gateway-fixture'
 
 import { startRealGoalGateway } from './real-goal-gateway'
 import { test as isolatedGatewayTest } from './real-gateway.fixture'
@@ -137,9 +138,7 @@ async function installFakeGoalGateway(
       methods.push(method)
 
       if (method === 'connect') {
-        ws.send(JSON.stringify({
-          type: 'hello-ok',
-          protocol: 3,
+        ws.send(helloOkResponse({
           server: { version: 'e2e', conn_id: 'goal-mode-fake-gateway' },
           features: {
             methods: [
@@ -204,7 +203,7 @@ async function installFakeGoalGateway(
         },
         'models.routing.get': { mode: 'direct' },
         'onboarding.status': { audioConfigured: false },
-        'sessions.list': { sessions: [], has_more: false },
+        'sessions.list': { sessions: [], count: 0, ts: 1_800_000_000, has_more: false },
         'sessions.messages.snapshot': sessionMessagesSnapshotPayload(SESSION_KEY, {
           current_stream_seq: 0,
         }),
