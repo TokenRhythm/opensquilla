@@ -3,6 +3,13 @@
 Implementation started from `bbd0c429e106babeeec70a6c6d493b563696d576`
 (`origin/main` pinned by the approved 2026-09-09 plan).
 
+The local integration branch subsequently merged fetched `origin/main`
+`e4eb36b2deb8dcbb6572aa9a310492a28c8c01da` (image previews and archived
+experiment cleanup). Upstream functionality is retained; this change has not
+been pushed or published. Most existing generated-contract diffs are generator
+fingerprint changes caused by the explicitly added production validation roles,
+not changes to those methods' schemas.
+
 The contract is continuity of work, not an immortal TCP connection: a healthy
 Gateway stays usable; interrupted communication is repaired internally without
 discarding a draft, navigating the page, replaying a mutation, or restarting the
@@ -156,6 +163,37 @@ The fixture does not suspend the operator's computer or alter system networking.
 The real socket fixture uses loopback Uvicorn with the production reader,
 dispatcher and Python WebSocket peer. Unit counter tests are not presented as
 Windows packaged evidence, nor as proof of final business content in all domains.
+
+### Recorded development evidence (2026-09-09)
+
+- After the upstream integration: 441 WebUI unit-test files / 5,689 cases passed;
+  TypeScript checking and the production build passed. The combined Gateway,
+  existing session/guest, snapshot, flow, diagnostics, real-socket and RPC
+  architecture regression passed 461 cases. Six upstream Uvicorn/websockets
+  deprecation warnings remain visible; they are not suppressed.
+- Windows shard discovery/governance passed and includes the new connection
+  tests; it is not a substitute for running the entire Windows CI matrix.
+- Full generated-contract check passed. Full independent generation determinism
+  passed before the final one-resume constraint; that changed contract was then
+  independently regenerated twice and the complete tree checked again.
+- Native Windows Electron **source/development** client, negotiated flow enabled:
+
+| Injected unavailable interval | Backoff attempts during fault | Signal-to-operation available |
+| --- | --- | --- |
+| 5 seconds | 3 | 221ms |
+| 2 minutes | 14 | 204ms |
+| 10 minutes | 59 | 218ms |
+
+Each run preserved the same page, original composer, unsent draft and focus;
+healthy resume did not close the shared socket. These are single-run samples on
+an empty keyless test conversation, **not P95 measurements**, model-execution
+continuity proof, real network-adapter failure or packaged-candidate soak proof.
+They were collected before the final upstream rebuild. After the final upstream
+rebuild, the 5-second fault fixture passed again with negotiated flow enabled
+(3 backoff attempts, 217ms signal-to-operation available) and disabled
+(4 backoff attempts, 216ms). Both final runs preserved page/composer identity,
+draft and focus, retained a healthy socket on resume, and passed minimize/tray
+return checks. No real user profile or working conversation was used.
 
 ## Release gates still required
 
