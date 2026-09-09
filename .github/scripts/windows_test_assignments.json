@@ -274,6 +274,8 @@
       "tests/test_skills_hub_lockfile_contract.py",
       "tests/test_skills_hub_router.py",
       "tests/test_skills_hub_source.py",
+      "tests/test_skills_hub_streaming.py",
+      "tests/test_skills_hub_streaming_faults.py",
       "tests/test_skills_manifest.py",
       "tests/test_skills_third_party_notices.py",
       "tests/test_thinking_level_propagation.py",

@@ -588,7 +588,7 @@ async def test_repository_root_reports_ambiguous_tree_to_management(
                     "path": "SKILL.md",
                     "type": "blob",
                     "mode": "100644",
-                    "size": DEFAULT_ARCHIVE_LIMITS.max_entry_bytes + 1,
+                    "size": 17,
                 }
             ],
             "FETCH_SIZE_LIMIT",
@@ -607,6 +607,12 @@ async def test_github_fetch_policy_diagnostics_reach_management(
 
     monkeypatch.setattr(httpx, "AsyncClient", _AsyncClient)
     monkeypatch.setattr(_AsyncClient, "tree_entries", tree_entries)
+    if expected_code == "FETCH_SIZE_LIMIT":
+        from dataclasses import replace
+        monkeypatch.setattr(
+            "opensquilla.skills.hub.github.DEFAULT_ARCHIVE_LIMITS",
+            replace(DEFAULT_ARCHIVE_LIMITS, max_entry_bytes=16),
+        )
     source = GitHubSource()
     service = SkillManagementService(
         router=SourceRouter([source]),

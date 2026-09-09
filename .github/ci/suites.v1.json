@@ -365,7 +365,11 @@
         "tests/test_skills_manifest.py",
         "tests/test_skills_tree.py",
         "tests/test_tools/test_skill_view_resources.py",
-        "uv.lock"
+        "uv.lock",
+        "tests/test_skill_install_source.py",
+        "tests/test_skills_hub_streaming.py",
+        "tests/test_skills_hub_streaming_faults.py",
+        "src/opensquilla/application/skill_source.py"
       ]
     },
     "managed-toolchain": {
