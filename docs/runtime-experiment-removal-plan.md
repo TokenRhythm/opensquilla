@@ -366,9 +366,9 @@ Ledger 审计快照：`1942bb33c0041a0e910b8f229089ff2d6f216dd3`。
 
 - 产品分支：`codex/remove-experiment-control-plane`。
 - 实际删除基准：`bbd0c429e106babeeec70a6c6d493b563696d576`。D01 的 21 个文件与原审计基准 `f0981d61` 完全一致；采用最新 main 的 Windows 分片记录，不覆盖其间的其他修改。
-- Ledger 归档提交：[`d3b2173185d25430a6ba66ce1631af9aaeff291f`](https://github.com/Open-Squilla/swe-experiment-ledger/commit/d3b2173185d25430a6ba66ce1631af9aaeff291f)。
-- [冻结工具与运行说明](https://github.com/Open-Squilla/swe-experiment-ledger/tree/d3b2173185d25430a6ba66ce1631af9aaeff291f/archives/opensquilla-experiment-control-plane/bbd0c429e106babeeec70a6c6d493b563696d576)；[逐文件 manifest](https://github.com/Open-Squilla/swe-experiment-ledger/blob/d3b2173185d25430a6ba66ce1631af9aaeff291f/archives/opensquilla-experiment-control-plane/bbd0c429e106babeeec70a6c6d493b563696d576/manifest.json) 记录原路径、mode、blob ID、SHA-256、行数、依赖和实际测试结果。
-- 已核对 GitHub 远端分支 SHA，并通过 contents API 取回同一 manifest blob ID `15ca31d8014ca639aad1206c109198d766fa7170`，之后才允许删除产品副本。
+- Ledger 归档提交：[`4875258fa5dde48498da61e142482cdc63870a88`](https://github.com/Open-Squilla/swe-experiment-ledger/commit/4875258fa5dde48498da61e142482cdc63870a88)。 初始归档为 `d3b2173185d25430a6ba66ce1631af9aaeff291f`；后续提交只纠正 engine 来源仓库 URL 为已验证的 `TokenRhythm/opensquilla`，不改任何归档原文件或测试结果。
+- [冻结工具与运行说明](https://github.com/Open-Squilla/swe-experiment-ledger/tree/4875258fa5dde48498da61e142482cdc63870a88/archives/opensquilla-experiment-control-plane/bbd0c429e106babeeec70a6c6d493b563696d576)；[逐文件 manifest](https://github.com/Open-Squilla/swe-experiment-ledger/blob/4875258fa5dde48498da61e142482cdc63870a88/archives/opensquilla-experiment-control-plane/bbd0c429e106babeeec70a6c6d493b563696d576/manifest.json) 记录原路径、mode、blob ID、SHA-256、行数、依赖和实际测试结果。
+- 删除前已核对初始归档 `d3b2173185d25430a6ba66ce1631af9aaeff291f` 的远端分支 SHA，并通过 contents API 取回 manifest blob `15ca31d8014ca639aad1206c109198d766fa7170`；来源 URL 纠正后，又从固定提交 `4875258fa5dde48498da61e142482cdc63870a88` 取回并核对新版 manifest blob `08ccad7b5674b6049d4603e8339bff1c731423e9`。
 
 D01 只移出 12 个脚本（4,450 行）、8 个专属测试（2,927 行）和原文档（63 行），整文件合计 7,440 行。八个测试为三个 `test_analyze_*`、两个 `test_check_*`，以及 `test_exp_ledger.py`、`test_exp_quarantine.py`、`test_replay_finalize_gate.py`；精确名单以 manifest 为准。连同 26 行引用清理，产品分支共删除 7,466 行；新增本方案文档 415 行，净减少 7,051 行，未新增运行时代码。
 
