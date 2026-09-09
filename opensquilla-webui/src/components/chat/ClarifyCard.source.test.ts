@@ -9,12 +9,12 @@ const chatViewStyles = readFileSync(new URL('../../styles/chat-view.css', import
 
 describe('ClarifyCard submit feedback', () => {
   it('shows immediate visible feedback while a clarify reply is being sent', () => {
-    // Localized (i18n) but the feedback contract is unchanged: a busy/idle submit
-    // label, a live submit-status row, and the "reply received" outcome title.
+    // Sending feedback does not claim the agent received an unconfirmed reply.
     expect(source).toContain("busy ? t('chat.clarify.sendingReply') : t('chat.clarify.sendReply')")
     expect(source).toContain('data-testid="clarify-submit-status"')
-    expect(source).toContain("t('chat.clarify.sendingContinuing')")
-    expect(source).toContain("t('chat.clarify.replyReceived')")
+    expect(source).toContain("t('chat.clarify.sendingReply')")
+    expect(source).not.toContain("t('chat.clarify.sendingContinuing')")
+    expect(source).toContain("t('chat.clarify.expiredTitle')")
   })
 
   it('renders a prominent submitted banner instead of a low-contrast text row', () => {

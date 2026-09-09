@@ -273,7 +273,10 @@ const METADATA_FIELDS = new Set([
   'replayed_count',
 ])
 
-function projectMetadata(value: MetadataWire): SessionReadMetadata {
+function projectMetadata(
+  value: MetadataWire,
+  readCursor?: SessionsMessagesSubscribeResult,
+): SessionReadMetadata {
   const lock = value.run_mode_lock
   const raw = value as unknown as Record<string, unknown>
   const rawLock = lock as unknown as Record<string, unknown>
@@ -302,6 +305,8 @@ function projectMetadata(value: MetadataWire): SessionReadMetadata {
     runStatus: value.run_status,
     queuedTaskIds: Object.freeze([...(value.queued_task_ids ?? [])]),
     epoch: numberValue(value.epoch),
+    streamGeneration: textValue(raw.stream_generation) ?? readCursor?.stream_generation ?? null,
+    currentStreamSeq: numberValue(raw.current_stream_seq) ?? readCursor?.current_stream_seq ?? null,
     hydrationComplete: value.hydration_complete,
     deferredFields: Object.freeze([...value.deferred_fields]),
     additional: additionalFields(raw, METADATA_FIELDS),
@@ -343,6 +348,7 @@ async function hydrate(
   sessionKey: string,
   signal: AbortSignal,
   expectedGeneration: number,
+  readCursor: SessionsMessagesSubscribeResult,
 ): Promise<SessionReadMetadata> {
   const params: SessionsMessagesHydrateParams = { key: sessionKey }
   requireParams(SESSIONS_MESSAGES_HYDRATE_METHOD, params, validateSessionsMessagesHydrateParams)
@@ -362,7 +368,9 @@ async function hydrate(
     validateSessionsMessagesHydrateResult,
   )
   if (result.key !== sessionKey) throw invalidContract(SESSIONS_MESSAGES_HYDRATE_METHOD)
-  return projectMetadata(result)
+  // Hydration does not carry its own cursor. The preceding subscription is
+  // a lower bound, so a delayed empty snapshot cannot erase a newer live input.
+  return projectMetadata(result, readCursor)
 }
 
 async function optionalSnapshot(
@@ -567,6 +575,7 @@ export function createV4SessionReadPort(
             request.sessionKey,
             request.signal,
             expectedGeneration,
+            subscription,
           ))
         })
         void metadata.catch(() => {})
@@ -607,11 +616,15 @@ export function createV4SessionReadPort(
         function retryMetadata(): Promise<SessionReadMetadata> {
           if (closed || request.signal.aborted) return Promise.reject(abortError())
           if (retry) return retry
-          const current = criticalRequestsQueued.then(() => hydrate(
+          const current = Promise.all([
+            criticalRequestsQueued,
+            subscribePromise,
+          ]).then(([, subscription]) => hydrate(
             rpc,
             request.sessionKey,
             request.signal,
             expectedGeneration,
+            subscription,
           ))
           const observed = current.finally(() => {
             if (retry === observed) retry = null

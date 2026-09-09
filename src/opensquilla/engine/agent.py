@@ -15288,31 +15288,42 @@ class Agent:
                             payload=pending_user_input,
                         )
                         request_id = str(public_request["request_id"])
-                        pending_result = ToolResult(
-                            tool_use_id=tc.tool_use_id,
-                            tool_name=tc.tool_name,
-                            content=json.dumps(public_request, ensure_ascii=False),
-                            is_error=False,
-                        )
-                        projected_pending = await self._project_tool_result_for_delivery(
-                            pending_result,
-                            tool_call=tc,
-                        )
-                        yield ToolResultEvent(
-                            tool_use_id=projected_pending.tool_use_id,
-                            tool_name=projected_pending.tool_name,
-                            result=projected_pending.content,
-                            is_error=projected_pending.is_error,
-                            arguments=tc.arguments,
-                            execution_status=projected_pending.execution_status,
-                            effect_outcome=projected_pending.effect_outcome,
-                            generation_epoch=generation_epoch,
-                        )
+                        user_input_wait_started = _loop.time()
                         try:
+                            pending_result = ToolResult(
+                                tool_use_id=tc.tool_use_id,
+                                tool_name=tc.tool_name,
+                                content=json.dumps(public_request, ensure_ascii=False),
+                                is_error=False,
+                            )
+                            projected_pending = await self._project_tool_result_for_delivery(
+                                pending_result,
+                                tool_call=tc,
+                            )
+                            yield ToolResultEvent(
+                                tool_use_id=projected_pending.tool_use_id,
+                                tool_name=projected_pending.tool_name,
+                                result=projected_pending.content,
+                                is_error=projected_pending.is_error,
+                                arguments=tc.arguments,
+                                execution_status=projected_pending.execution_status,
+                                effect_outcome=projected_pending.effect_outcome,
+                                generation_epoch=generation_epoch,
+                            )
                             answers = await user_input_provider.wait_for_response(request_id)
-                        except asyncio.CancelledError:
+                        finally:
+                            # Human input suspends execution, including time the
+                            # consumer spends showing the yielded questionnaire.
+                            user_input_wait_duration = max(
+                                0.0,
+                                _loop.time() - user_input_wait_started,
+                            )
+                            tool_deadline += user_input_wait_duration
+                            if _total_deadline is not None:
+                                _total_deadline += user_input_wait_duration
+                            # Also close requests when projection, waiting, or
+                            # the event consumer fails or cancels the turn.
                             user_input_provider.cancel_request(request_id)
-                            raise
                         result = ToolResult(
                             tool_use_id=tc.tool_use_id,
                             tool_name=tc.tool_name,
