@@ -10,6 +10,8 @@ param(
   [string]$CandidateInstallerSha256,
   [string]$CandidateSourceSha,
   [string]$ChannelManifest,
+  [ValidateSet('cim-trace', 'standard-user-polling')]
+  [string]$ProcessObservationMode = 'cim-trace',
   [ValidateRange(30, 1800)][int]$InstallTimeoutSeconds = 600
 )
 
@@ -89,6 +91,28 @@ function Find-SignedRestartCandidate {
   } | Sort-Object StartedAt | Select-Object -Last 1) | Select-Object -First 1
 }
 
+function Test-SignedAuditElevated {
+  $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+  return ([Security.Principal.WindowsPrincipal]::new($identity)).IsInRole(
+    [Security.Principal.WindowsBuiltInRole]::Administrator)
+}
+
+function Get-SignedPollingStarts([string]$ExecutablePath) {
+  # Ordinary users can inspect their own long-lived Finish-page launch without
+  # elevating A just to subscribe to Win32_ProcessStartTrace. This is a snapshot,
+  # not a complete event trace or proof that NSIS caused the launch.
+  foreach ($process in @(Get-CimInstance Win32_Process -Filter "Name='OpenSquilla.exe'")) {
+    if ($process.ExecutablePath -ieq $ExecutablePath -and $process.CreationDate -and
+        $process.CommandLine) {
+      [pscustomobject]@{
+        Pid = [int]$process.ProcessId; ParentPid = [int]$process.ParentProcessId
+        StartedAt = $process.CreationDate.ToUniversalTime(); CreatedAt = $process.CreationDate
+        Path = [string]$process.ExecutablePath; CommandLine = [string]$process.CommandLine
+      }
+    }
+  }
+}
+
 function New-SignedAuditResult {
   param([string]$BaselineVersion, [string]$CandidateVersion, [string]$BaselineSourceSha,
     [string]$CandidateSourceSha, [string]$BaselineExecutableSha256, [string]$CandidateInstallerSha256)
@@ -105,8 +129,7 @@ function New-SignedAuditResult {
     firstSendVerified = $false; firstSendScope = 'new synthetic profile only'; sessionRecoveryVerified = $false
     normalQuitObserved = $false; stopAndRestartVerified = $false; profilePreserved = $false; toolCallVerified = $false
     gaps = @('Shell-brokered restart causality is operator-attested, not machine-proven.',
-      'First send and a necessary tool call on the retained upgraded profile are not exercised.',
-      'Chat Stop and a necessary tool call on the retained profile still require a separate native audit.',
+      'Retained-profile interaction requires the independently bound packaged probe.',
       'NSIS interruption after the old uninstaller starts has no verified rollback guarantee.',
       'Uninstall preservation is covered separately by the existing installer audit.')
   }
@@ -117,7 +140,9 @@ function Invoke-SignedWindowsUpdateAudit {
     [string]$InstallRoot, [string]$UserDataDir, [string]$EvidenceRoot,
     [string]$BaselineVersion, [string]$BaselineExecutableSha256, [string]$BaselineSourceSha,
     [string]$CandidateInstaller, [string]$CandidateInstallerSha256, [string]$CandidateSourceSha,
-    [string]$ChannelManifest, [int]$InstallTimeoutSeconds = 600
+    [string]$ChannelManifest, [int]$InstallTimeoutSeconds = 600,
+    [ValidateSet('cim-trace', 'standard-user-polling')]
+    [string]$ProcessObservationMode = 'cim-trace'
   )
   if ([Environment]::OSVersion.Platform -ne [PlatformID]::Win32NT) { throw 'This audit requires Windows.' }
   $repo = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '../..'))
@@ -125,9 +150,14 @@ function Invoke-SignedWindowsUpdateAudit {
   $temporary = if ($env:RUNNER_TEMP) { $env:RUNNER_TEMP } else { [IO.Path]::GetTempPath() }
   $planArguments = @{} + $PSBoundParameters
   $null = $planArguments.Remove('InstallTimeoutSeconds')
+  $null = $planArguments.Remove('ProcessObservationMode')
   $planArguments.NativeUserDataDir = $nativeUserData
   $planArguments.TemporaryRoot = $temporary
   $plan = Get-SignedAuditPlan @planArguments
+  $launcherElevated = Test-SignedAuditElevated
+  if ($ProcessObservationMode -eq 'standard-user-polling' -and $launcherElevated) {
+    throw 'Standard-user polling must launch A from a non-elevated shell to preserve the UAC test boundary.'
+  }
   foreach ($path in @($plan.Executable, $plan.CandidateInstaller, $plan.ChannelManifest)) {
     if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { throw "Required input is missing: $path" }
   }
@@ -153,6 +183,8 @@ function Invoke-SignedWindowsUpdateAudit {
   $result = New-SignedAuditResult $BaselineVersion $plan.CandidateVersion $BaselineSourceSha `
     $CandidateSourceSha $BaselineExecutableSha256 $CandidateInstallerSha256
   $result.provenance.channelManifestSha256 = (Get-FileHash -LiteralPath $plan.ChannelManifest -Algorithm SHA256).Hash.ToLowerInvariant()
+  $result.processObservationMode = $ProcessObservationMode
+  $result.clientLauncherElevated = $launcherElevated
   $sourceId = 'OpenSquilla.SignedUpdate.' + [guid]::NewGuid().ToString('N')
   $subscription = $null
   $automaticPid = $null
@@ -170,7 +202,11 @@ function Invoke-SignedWindowsUpdateAudit {
     # fresh native profile, so an access denial cannot consume that precondition.
     $queue = [Collections.Concurrent.ConcurrentQueue[object]]::new()
     $observer = @{ Queue = $queue; Executable = $plan.Executable }
-    $subscription = Register-CimIndicationEvent -Query 'SELECT * FROM Win32_ProcessStartTrace' `
+    if ($ProcessObservationMode -eq 'standard-user-polling') {
+      # Probe CIM access before consuming the fresh-profile precondition.
+      $null = @(Get-SignedPollingStarts $plan.Executable)
+    } else {
+      $subscription = Register-CimIndicationEvent -Query 'SELECT * FROM Win32_ProcessStartTrace' `
       -SourceIdentifier $sourceId -MessageData $observer -Action {
         $trace = $Event.SourceEventArgs.NewEvent
         if ($trace.ProcessName -ine 'OpenSquilla.exe') { return }
@@ -185,6 +221,7 @@ function Invoke-SignedWindowsUpdateAudit {
           })
         }
       }
+    }
     & python $probe seed --home $plan.Profile --label signed-update-audit --external-root (Join-Path $plan.EvidenceRoot 'external-sentinels') |
       Out-File -LiteralPath (Join-Path $plan.EvidenceRoot 'profile-seed.log')
     if ($LASTEXITCODE -ne 0) { throw 'Could not seed the isolated synthetic profile.' }
@@ -199,7 +236,8 @@ function Invoke-SignedWindowsUpdateAudit {
       Out-File -LiteralPath (Join-Path $plan.EvidenceRoot 'handoff-driver.log')
     if ($LASTEXITCODE -ne 0) { throw 'The packaged client did not complete a verified installer handoff.' }
     $handoff = Get-Content -LiteralPath $handoffPath -Raw | ConvertFrom-Json
-    if ($handoff.stage -ne 'installer-handoff' -or $handoff.handoffObserved -ne $true -or
+    if ($handoff.credentialSha256 -cnotmatch '^[0-9a-f]{64}$' -or
+        $handoff.stage -ne 'installer-handoff' -or $handoff.handoffObserved -ne $true -or
         $handoff.requiresPostInstallVerification -ne $true -or $handoff.ok -ne $false -or
         $handoff.fromVersion -cne $BaselineVersion -or $handoff.toVersion -cne $plan.CandidateVersion -or
         $handoff.sha256 -cne $CandidateInstallerSha256 -or $handoff.sourceSha -cne $CandidateSourceSha) {
@@ -214,6 +252,12 @@ function Invoke-SignedWindowsUpdateAudit {
     $deadline = [datetime]::UtcNow.AddSeconds($InstallTimeoutSeconds)
     $restart = $null
     while ([datetime]::UtcNow -lt $deadline) {
+      if ($ProcessObservationMode -eq 'standard-user-polling') {
+        $starts.Clear()
+        foreach ($observed in @(Get-SignedPollingStarts $plan.Executable)) {
+          $starts.Add($observed)
+        }
+      }
       $observed = $null
       while ($queue.TryDequeue([ref]$observed)) {
         if ($starts.Count -ge 1024) { throw 'Too many process starts; restart evidence is ambiguous.' }
@@ -266,7 +310,7 @@ function Invoke-SignedWindowsUpdateAudit {
     $deadline = [datetime]::UtcNow.AddSeconds([Math]::Min(90, $InstallTimeoutSeconds))
     do {
       $remaining = @($owned | Where-Object {
-        $process = Get-CimInstance Win32_Process -Filter "ProcessId=$($_.Pid)" -ErrorAction SilentlyContinue
+        $process = Get-CimInstance Win32_Process -Filter "ProcessId=$($_.Pid)" -ErrorAction Stop
         $process -and $process.CreationDate -eq $_.CreatedAt
       })
       if (-not $remaining.Count) { break }
@@ -281,22 +325,59 @@ function Invoke-SignedWindowsUpdateAudit {
       Out-File -LiteralPath (Join-Path $plan.EvidenceRoot 'first-send.log')
     if ($LASTEXITCODE -ne 0) { throw 'Installed B first-send/owned Gateway probe failed.' }
     $result.firstSendVerified = $true
-    & node (Join-Path $repo 'desktop/electron/scripts/test-packaged-session-recovery.mjs') `
-      --executable $plan.Executable --user-data-dir $plan.UserDataDir `
-      --label signed-update-audit `
-      --session-key 'agent:main:webchat:release-recovery-long-session' `
-      --switch-session-key 'agent:main:webchat:release-recovery-switch-session' 2>&1 |
-      Out-File -LiteralPath (Join-Path $plan.EvidenceRoot 'session-recovery.log')
-    if ($LASTEXITCODE -ne 0) { throw 'Installed B session recovery/relaunch probe failed.' }
-    $result.sessionRecoveryVerified = $true
+    $credentialPath = Join-Path $plan.UserDataDir 'desktop-credential.json'
+    $credentialSha = (Get-FileHash -LiteralPath $credentialPath -Algorithm SHA256).Hash.ToLowerInvariant()
+    if ($credentialSha -cne $handoff.credentialSha256) {
+      throw 'The retained desktop credential changed between A handoff and the B interaction probe.'
+    }
+    $interaction = [ordered]@{
+      schemaVersion = 1; purpose = 'opensquilla-synthetic-signed-update-audit'
+      auditId = [guid]::NewGuid().ToString('N'); seedLabel = 'signed-update-audit'
+      userDataDir = $plan.UserDataDir; executablePath = $plan.Executable
+      expectedVersion = $plan.CandidateVersion; sourceSha = $CandidateSourceSha
+      executableSha256 = (Get-FileHash -LiteralPath $plan.Executable -Algorithm SHA256).Hash.ToLowerInvariant()
+      credentialSha256 = $credentialSha
+      configSha256 = (Get-FileHash -LiteralPath (Join-Path $plan.Profile 'config.toml') -Algorithm SHA256).Hash.ToLowerInvariant()
+      externalSentinelsDir = Join-Path $plan.EvidenceRoot 'external-sentinels'
+    }
+    $interactionManifest = Join-Path $plan.UserDataDir 'retained-interaction-audit.json'
+    if (Test-Path -LiteralPath $interactionManifest) { throw 'The retained-interaction ownership marker already exists.' }
+    $interaction | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $interactionManifest -Encoding utf8
+    $interactionOutput = Join-Path $plan.EvidenceRoot 'retained-interaction'
+    & node (Join-Path $repo 'desktop/electron/scripts/test-packaged-retained-interaction.mjs') `
+      --audit-manifest $interactionManifest --output-dir $interactionOutput 2>&1 |
+      Out-File -LiteralPath (Join-Path $plan.EvidenceRoot 'retained-interaction.log')
+    if ($LASTEXITCODE -ne 0) { throw 'Installed B retained-profile interaction probe failed.' }
+    $interactionResult = Get-Content -LiteralPath (Join-Path $interactionOutput 'report.json') -Raw | ConvertFrom-Json
+    if ($interactionResult.ok -isnot [bool] -or $interactionResult.ok -ne $true -or
+        $interactionResult.status -cne 'passed' -or
+        $interactionResult.auditId -cne $interaction.auditId -or
+        $interactionResult.sourceSha -cne $interaction.sourceSha -or
+        $interactionResult.executableSha256 -cne $interaction.executableSha256) {
+      throw 'The retained-profile report does not match this installed B audit.'
+    }
+    foreach ($proof in @('credentialPreserved', 'configPreserved', 'oldSessionsVerified',
+        'oldSessionsUiVerified', 'firstSendVerified', 'toolReadVerified', 'stopVerified',
+        'restartVerified', 'normalQuitVerified')) {
+      if ($interactionResult.$proof -isnot [bool] -or $interactionResult.$proof -ne $true) {
+        throw "The retained-profile report lacks proof: $proof"
+      }
+    }
+    $result.firstSendScope = 'retained upgraded synthetic profile; loopback synthetic provider'
+    $result.retainedSessionsVerified = $true
+    $result.toolCallVerified = $true
+    $result.stopAndRestartVerified = $true
+    $result.credentialPreserved = $true
+    $result.retainedInteractionReport = Join-Path $interactionOutput 'report.json'
+    $result.gaps = @($result.gaps | Where-Object { $_ -ne 'Retained-profile interaction requires the independently bound packaged probe.' })
     & python $probe verify-runtime --home $plan.Profile --label signed-update-audit `
       --external-root (Join-Path $plan.EvidenceRoot 'external-sentinels') |
       Out-File -LiteralPath (Join-Path $plan.EvidenceRoot 'profile-preservation.log')
     if ($LASTEXITCODE -ne 0) { throw 'Postinstall probes changed retained profile data.' }
     $result.profilePreserved = $true
     $result.stage = 'postinstall-verified-with-gaps'
-    # Existing first-send uses a synthetic provider and does not call a tool.
-    # Keep releaseGatePassed/ok false and return 2 rather than greenwash that gap.
+    # One upgrade cell cannot certify the Windows 10/11, scope, cancellation,
+    # signature rejection, or network matrix. A separate aggregate gate is required.
     return 2
   } catch {
     $result.error = $_.Exception.Message

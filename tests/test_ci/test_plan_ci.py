@@ -835,14 +835,76 @@ def test_desktop_static_executes_windows_update_contracts() -> None:
         assert f"node scripts/test-windows-update-{name}.mjs" in commands
 
 
+_RETAINED_INTERACTION_INPUTS = [
+    "desktop/electron/scripts/test-packaged-retained-interaction.mjs",
+    "desktop/electron/scripts/test-packaged-retained-interaction-contract.mjs",
+    "desktop/electron/scripts/fixtures/packaged-retained-interaction/contract.mjs",
+    "desktop/electron/scripts/fixtures/packaged-retained-interaction/provider.mjs",
+    "desktop/electron/scripts/fixtures/packaged-retained-interaction/browser-probe.mjs",
+]
+
+
+@pytest.mark.parametrize("path", _RETAINED_INTERACTION_INPUTS)
+def test_retained_interaction_inputs_select_static_and_windows_ownership(
+    tmp_path: Path, suite_config: dict[str, Any], path: str
+) -> None:
+    plan = _plan(tmp_path, suite_config, path)
+
+    assert plan["full_fallback"] is False
+    assert _matrix(plan) == {("windows-latest", "ownership")}
+    assert {
+        "desktop-static", "desktop-recovery-e2e", "windows-high-risk",
+        "python-targeted", "release-packaging",
+    }.issubset(plan["required_suites"])
+    assert "macos-recovery" not in plan["required_suites"]
+    assert plan["python_targets"] == ["tests/test_ci/test_windows_signed_update_audit.py"]
+
+
+def test_retained_interaction_ci_executes_only_the_pure_contract() -> None:
+    import yaml
+
+    workflow_text = Path(".github/workflows/ci.yml").read_text(encoding="utf-8")
+    workflow = yaml.safe_load(workflow_text)
+    step = next(
+        step for step in workflow["jobs"]["desktop-check"]["steps"]
+        if step["name"] == "Run desktop unit tests"
+    )
+    command = "node scripts/test-packaged-retained-interaction-contract.mjs"
+    assert step["run"].splitlines().count(command) == 1
+    contract_script = Path(
+        "desktop/electron/scripts/test-packaged-retained-interaction-contract.mjs"
+    )
+    assert contract_script.is_file()
+    assert "scripts/test-packaged-retained-interaction.mjs" not in workflow_text
+
+
+@pytest.mark.parametrize("path", _RETAINED_INTERACTION_INPUTS)
+def test_retained_interaction_inputs_change_all_consuming_suite_digests(
+    tmp_path: Path, suite_config: dict[str, Any], path: str
+) -> None:
+    dependency = tmp_path / path
+    dependency.parent.mkdir(parents=True)
+    dependency.write_text("first\n", encoding="utf-8")
+    first = _plan(tmp_path, suite_config, path)
+    dependency.write_text("second\n", encoding="utf-8")
+    second = _plan(tmp_path, suite_config, path)
+
+    for suite in (
+        "desktop-static", "desktop-recovery-e2e", "python-targeted", "release-packaging"
+    ):
+        assert first["suite_execution_digests"][suite] != second["suite_execution_digests"][suite]
+
+
 @pytest.mark.parametrize(
     ("runner_os", "shard", "expected"),
     [
         ("Windows", "ownership", True),
+        ("Windows", "ownership-workbench", True),
         ("Windows", "all", True),
         ("Windows", "profiles", False),
         ("Windows", "workbench", False),
         ("Linux", "ownership", False),
+        ("macOS", "ownership", False),
     ],
 )
 def test_windows_update_native_checks_stay_in_ownership_cells(
@@ -886,6 +948,7 @@ def test_windows_update_native_checks_stay_in_ownership_cells(
             "windows-update-security:scripts/test-windows-update-security.mjs",
             "windows-update-handoff:scripts/test-windows-update-handoff.mjs",
             "windows-update-network:scripts/test-windows-update-network.mjs",
+            "packaged-retained-interaction-contract:scripts/test-packaged-retained-interaction-contract.mjs",
             "windows-update-electron:scripts/test-windows-update-electron.mjs",
         ]
         if expected

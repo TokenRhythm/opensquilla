@@ -27,7 +27,7 @@ if ($PSCmdlet.ParameterSetName -eq 'Signed') {
   $required = @('InstallRoot', 'UserDataDir', 'EvidenceRoot', 'BaselineVersion',
     'BaselineExecutableSha256', 'BaselineSourceSha', 'CandidateInstaller',
     'CandidateInstallerSha256', 'CandidateSourceSha', 'ChannelManifest')
-  $allowed = $required + @('InstallTimeoutSeconds')
+  $allowed = $required + @('InstallTimeoutSeconds', 'ProcessObservationMode')
   $arguments = @{}
   foreach ($property in $config.PSObject.Properties) {
     if ($property.Name -cnotin $allowed) { throw "Unknown signed audit field: $($property.Name)" }
