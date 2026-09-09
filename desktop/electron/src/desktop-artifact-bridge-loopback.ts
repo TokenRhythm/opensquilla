@@ -26,7 +26,7 @@ type AuditOutcome = 'allowed' | 'rejected' | 'failed'
 
 export interface DesktopArtifactBridgeLoopbackAudit {
   event: 'desktop_artifact_bridge_transport'
-  operation: 'capabilities' | 'bindingAcquire' | 'bindingRelease' | DesktopArtifactBridgeMethod | 'unknown'
+  operation: 'capabilities' | 'bindingAcquire' | 'bindingRelease' | 'localFileResolve' | DesktopArtifactBridgeMethod | 'unknown'
   outcome: AuditOutcome
   code: string
   durationMs: number
@@ -35,6 +35,11 @@ export interface DesktopArtifactBridgeLoopbackAudit {
 export interface DesktopArtifactBridgeLoopbackOptions {
   audit?(entry: DesktopArtifactBridgeLoopbackAudit): void
   now?: () => number
+  resolveLocalFile?(request: {
+    grant: string
+    subject: string
+    executionEnvironment: string
+  }): { ok: true, path: string } | { ok: false, code: string, message: string }
 }
 
 export interface DesktopArtifactBridgeLoopbackEnvironment extends NodeJS.ProcessEnv {
@@ -245,6 +250,10 @@ export class DesktopArtifactBridgeLoopbackTransport {
     return this.tokenText
   }
 
+  isStarted(): boolean {
+    return this.endpoint !== null && this.tokenText !== null
+  }
+
   async close(): Promise<void> {
     this.lifecycleEpoch += 1
     const server = this.server
@@ -348,6 +357,41 @@ export class DesktopArtifactBridgeLoopbackTransport {
             body.version as (typeof DESKTOP_ARTIFACT_BRIDGE_PROTOCOL_VERSIONS)[number],
           ),
         })
+        return
+      }
+
+      if (request.url === '/v1/local-files/resolve') {
+        operation = 'localFileResolve'
+        if (
+          !isObjectRecord(body)
+          || !exactKeys(body, ['version', 'grant', 'subject', 'executionEnvironment'])
+          || body.version !== 1
+          || typeof body.grant !== 'string'
+          || !/^[A-Za-z0-9_-]{43}$/.test(body.grant)
+          || typeof body.subject !== 'string'
+          || body.subject.length < 1
+          || body.subject.length > 256
+          || typeof body.executionEnvironment !== 'string'
+          || body.executionEnvironment.length < 1
+          || body.executionEnvironment.length > 256
+        ) {
+          throw new TransportRequestError(400, 'invalid-request', 'The local file grant request is invalid.')
+        }
+        const resolved = this.options.resolveLocalFile?.({
+          grant: body.grant,
+          subject: body.subject,
+          executionEnvironment: body.executionEnvironment,
+        })
+        if (!resolved) {
+          throw new TransportRequestError(503, 'unavailable', 'Local file grants are unavailable.')
+        }
+        this.assertBeforeDeadline(deadlineAt)
+        if (!resolved.ok) {
+          throw new TransportRequestError(409, resolved.code, resolved.message)
+        }
+        outcome = 'allowed'
+        code = 'ok'
+        writeJson(response, 200, { ok: true, value: { version: 1, path: resolved.path } })
         return
       }
 

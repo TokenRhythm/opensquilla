@@ -34,6 +34,7 @@ from opensquilla.attachment_refs import (
     is_attachment_ref,
     write_transcript_material,
 )
+from opensquilla.contracts.attachments import normalize_attachment_usage
 from opensquilla.prompt_annotations import normalize_prompt_annotation_snapshots
 
 log = logging.getLogger(__name__)
@@ -123,6 +124,7 @@ def build_transcript_attachment_envelope(
             attachment.get("type") or attachment.get("mime") or attachment.get("media_type")
         )
         name = attachment.get("name", "attachment")
+        usage = normalize_attachment_usage(attachment.get("usage"))
         if not persist_enabled:
             size = attachment.get("size")
             if not isinstance(size, int) or isinstance(size, bool) or size < 0:
@@ -139,6 +141,7 @@ def build_transcript_attachment_envelope(
                     "mime": media_type,
                     "size": size,
                     "missing_reason": "attachment persistence disabled",
+                    **({"usage": usage} if usage is not None else {}),
                 }
             )
             continue
@@ -151,6 +154,8 @@ def build_transcript_attachment_envelope(
                 "mime": media_type,
                 "size": attachment.get("size"),
             }
+            if usage is not None:
+                persisted["usage"] = usage
             # Transcript refs are historically session-scoped and can be
             # reconstructed from ``sha256_ref``. Managed input refs instead
             # need their logical resource identity to resolve a current path
@@ -208,6 +213,7 @@ def build_transcript_attachment_envelope(
                     "name": name,
                     "mime": media_type,
                     "size": len(payload),
+                    **({"usage": usage} if usage is not None else {}),
                 }
             )
         else:
@@ -217,6 +223,7 @@ def build_transcript_attachment_envelope(
                     "type": media_type,
                     "name": name,
                     "data": data,
+                    **({"usage": usage} if usage is not None else {}),
                 }
             )
 
@@ -315,6 +322,9 @@ def rebuild_attachments_for_replay(
             ref["mime"] = mime
             ref["size"] = size
             ref["source"] = entry.get("source") or "transcript"
+            usage = normalize_attachment_usage(entry.get("usage"))
+            if usage is not None:
+                ref["usage"] = usage
             ref["_was_staged"] = True
             missing_markers.append(attachment_ref_marker(ref))
         else:
@@ -331,10 +341,18 @@ def rebuild_attachments_for_replay(
             if isinstance(data, str) and isinstance(mime, str):
                 raw_name = entry.get("name", "attachment")
                 rebuilt.append(
+                    # Keep the optional usage field so a replay uses the same
+                    # image projection policy as the original send.
                     {
                         "type": mime,
                         "data": data,
                         "name": raw_name if isinstance(raw_name, str) else "attachment",
+                        **(
+                            {"usage": usage}
+                            if (usage := normalize_attachment_usage(entry.get("usage")))
+                            is not None
+                            else {}
+                        ),
                     }
                 )
 

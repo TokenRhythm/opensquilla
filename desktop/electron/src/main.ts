@@ -629,14 +629,13 @@ const gatewayState: GatewayState = {
   logPath: '',
 }
 
+let desktopArtifactBridgeLoopback: DesktopArtifactBridgeLoopbackTransport
+
 const desktopLocalFileGrants = new DesktopLocalFileGrantManager(() => ({
   owned: gatewayState.owned,
   status: gatewayState.status,
   instanceId: gatewayConnectionInstanceId,
-}), undefined, () => false)
-// The Gateway-side grant consumer is introduced by the following integration
-// batch. Keeping this false makes the current Desktop advertise upload
-// fallback and prevents issuing grants that no execution endpoint can consume.
+}), undefined, () => desktopArtifactBridgeLoopback.isStarted())
 
 function desktopGatewayConnectionSnapshot(): DesktopGatewayConnection {
   const ready = gatewayState.status === 'ready' && Boolean(gatewayState.url)
@@ -730,9 +729,10 @@ const desktopArtifactBridge = new DesktopArtifactBridge({
   getActiveTarget: () => nativeWorkbenchSurfaces.getActiveArtifactBridgeTarget(),
   acquireActiveTargetBinding: () => nativeWorkbenchSurfaces.acquireArtifactBridgeTargetBinding(),
 })
-const desktopArtifactBridgeLoopback = new DesktopArtifactBridgeLoopbackTransport(
+desktopArtifactBridgeLoopback = new DesktopArtifactBridgeLoopbackTransport(
   desktopArtifactBridge,
   {
+    resolveLocalFile: request => desktopLocalFileGrants.resolve(request),
     audit: entry => desktopLog(entry.event, {
       operation: entry.operation,
       outcome: entry.outcome,
@@ -11327,7 +11327,7 @@ ipcMain.handle('desktop:file:grant', (event, payload: unknown) => {
     name: typeof raw.name === 'string' ? raw.name : undefined,
     mime: typeof raw.mime === 'string' ? raw.mime : undefined,
     size: typeof raw.size === 'number' ? raw.size : undefined,
-    subject: `webcontents:${event.sender.id}`,
+    subject: 'desktop-gateway',
     executionEnvironment: typeof raw.executionEnvironment === 'string'
       ? raw.executionEnvironment
       : 'default',

@@ -286,6 +286,26 @@ describe('attachment send display serialization', () => {
     expect(JSON.stringify(display)).not.toContain('u-secret')
   })
 
+  it('preserves explicit image file usage through send and display projections', () => {
+    const image: Attachment & { kind: 'inline'; data: string } = {
+      kind: 'inline',
+      local_id: 12,
+      name: 'diagram.png',
+      mime: 'image/png',
+      data: 'aW1hZ2U=',
+      usage: 'file',
+    }
+
+    expect(serializeSendableAttachment(image).usage).toBe('file')
+    expect(serializeDisplayAttachment(image).usage).toBe('file')
+    expect(normalizeDisplayAttachment({
+      type: 'image/png',
+      name: 'diagram.png',
+      usage: 'file',
+      data: 'aW1hZ2U=',
+    }).usage).toBe('file')
+  })
+
   it('keeps SVG attachment markup download-only', () => {
     const attachment = normalizeDisplayAttachment({
       type: 'image/svg+xml; charset=utf-8',

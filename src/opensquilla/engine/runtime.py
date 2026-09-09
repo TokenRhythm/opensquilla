@@ -80,6 +80,9 @@ from opensquilla.contracts.attachments import (
 from opensquilla.contracts.attachments import (
     normalize_attachment_mime as _normalize_attachment_mime,
 )
+from opensquilla.contracts.attachments import (
+    normalize_attachment_usage as _normalize_attachment_usage,
+)
 from opensquilla.contracts.turn_execution import TurnExecutionContext
 from opensquilla.engine.agent import Agent, ToolHandler
 from opensquilla.engine.agent_injection import PendingInputProvider
@@ -13546,6 +13549,7 @@ class TurnRunner:
                 for attachment_id in candidate_ids
                 if attachment_id in by_id
                 and str(by_id[attachment_id].mime).lower().startswith("image/")
+                and getattr(by_id[attachment_id], "usage", None) != "file"
             )
         except Exception as exc:  # noqa: BLE001 - an unverified ID stays text-only
             if exact_owner and _has_session_storage(self._session_manager):
@@ -14513,6 +14517,8 @@ class TurnRunner:
             )
             if not isinstance(mime, str) or not mime.startswith("image/"):
                 continue
+            if _normalize_attachment_usage(attachment.get("usage")) == "file":
+                continue
             if attachment.get("missing_reason"):
                 retention.append(False)
             elif any(
@@ -14561,6 +14567,10 @@ class TurnRunner:
                     isinstance(media_type, str)
                     and media_type.startswith("image/")
                 ):
+                    continue
+                if _normalize_attachment_usage(attachment.get("usage")) == "file":
+                    # File-intent images are ordinary attachments for replay;
+                    # they must not seed vision follow-up routing metadata.
                     continue
             attachment_id = valid_attachment_id(attachment.get("attachment_id"))
             if attachment_id is not None:
@@ -14703,10 +14713,15 @@ class TurnRunner:
                 allowed_image_attachment_ids is None
                 or attachment_id in allowed_image_attachment_ids
             )
+            file_intent_image = (
+                media_type in _IMAGE_ATTACHMENT_MIMES
+                and _normalize_attachment_usage(att.get("usage")) == "file"
+            )
             if (
                 preserve_image_attachments
                 and image_replay_allowed
                 and media_type in _IMAGE_ATTACHMENT_MIMES
+                and not file_intent_image
             ):
                 from opensquilla.provider.types import ContentBlockImage
 
@@ -14800,7 +14815,11 @@ class TurnRunner:
                     media_type in _IMAGE_ATTACHMENT_MIMES
                     or not isinstance(sha_ref, str)
                 )
-                and (persist_image_material or not media_type.startswith("image/"))
+                and (
+                    persist_image_material
+                    or not media_type.startswith("image/")
+                    or file_intent_image
+                )
             ):
                 materializer = historical_materializer
                 result = None
@@ -15003,7 +15022,16 @@ class TurnRunner:
                 and att.get("source") == "input_normalization"
                 and att.get("_generated_by") == "input_normalization"
             )
-            needs_bytes = media_type in _IMAGE_ATTACHMENT_MIMES or generated_preview
+            file_intent_image = (
+                media_type in _IMAGE_ATTACHMENT_MIMES
+                and _normalize_attachment_usage(att.get("usage")) == "file"
+            )
+            # File-intent image refs are path-backed ordinary files; avoid
+            # hydrating their bytes before a tool explicitly reads them.
+            needs_bytes = (
+                (media_type in _IMAGE_ATTACHMENT_MIMES and not file_intent_image)
+                or generated_preview
+            )
             if is_attachment_ref(att):
                 missing_ref_marker = ""
                 raw_bytes = b""
@@ -15052,7 +15080,11 @@ class TurnRunner:
             temporary_image = media_type.startswith("image/") and not persist_image_material
             materializer = image_materializer if temporary_image else turn_materializer
             if materializer is not None and (
-                media_type in _IMAGE_ATTACHMENT_MIMES or not is_attachment_ref(att)
+                (
+                    media_type in _IMAGE_ATTACHMENT_MIMES
+                    and not file_intent_image
+                )
+                or not is_attachment_ref(att)
             ):
                 if is_attachment_ref(att):
                     result = materializer.materialize(att, session_id=session_id)
@@ -15094,7 +15126,7 @@ class TurnRunner:
                 attachment_blocks.append(ContentBlockText(text=wrapped))
                 continue
 
-            if media_type in _IMAGE_ATTACHMENT_MIMES:
+            if media_type in _IMAGE_ATTACHMENT_MIMES and not file_intent_image:
                 raw_attachment_id = att.get("attachment_id")
                 attachment_blocks.append(
                     ContentBlockImage(
@@ -15123,6 +15155,18 @@ class TurnRunner:
                 wrapped = _render_file_context_block(filename, media_type, preview)
                 attachment_blocks.append(ContentBlockText(text=wrapped))
             else:
+                if file_intent_image:
+                    details = (
+                        f"[image attachment used as file: {media_type}, "
+                        f"{attachment_size} bytes; image pixels were not sent to the model. "
+                        "Use available tools to read the file when needed.]"
+                    )
+                    if not material_marker:
+                        material_marker = "[attachment unavailable: tool path is unavailable]"
+                    details = "\n\n".join([details, material_marker])
+                    wrapped = _render_file_context_block(filename, media_type, details)
+                    attachment_blocks.append(ContentBlockText(text=wrapped))
+                    continue
                 details = (
                     f"[file attachment: {media_type}, {attachment_size} bytes; "
                     "content has not been read; content is not inlined. "
