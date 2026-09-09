@@ -10,6 +10,7 @@
     "core": [
       "tests/contracts/test_approval_center_contract.py",
       "tests/contracts/test_conversation_events_contract.py",
+      "tests/contracts/test_gateway_contract_parallel.py",
       "tests/contracts/test_goals_contract.py",
       "tests/contracts/test_r7_contract_freeze.py",
       "tests/functional/test_agent_context_boundary_e2e.py",
