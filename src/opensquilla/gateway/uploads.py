@@ -47,6 +47,7 @@ from opensquilla.application.artifact_workbench import (
     AttachmentStagingPolicy,
 )
 from opensquilla.attachment_refs import inputs_material_path
+from opensquilla.contracts.attachment_sniff import sniff_mime_from_bytes
 from opensquilla.contracts.attachments import (
     ALLOWED_MEDIA_TYPES,
     OPAQUE_ATTACHMENT_BYTES,
@@ -331,6 +332,9 @@ class UploadStore:
             raise UploadUnsupportedMimeError(f"mime {mime!r} is not allowed")
         if not self.accept_opaque and normalized_mime not in _ALLOWED_MIMES:
             raise UploadUnsupportedMimeError(f"mime {mime!r} is not allowed")
+        sniffed_mime = sniff_mime_from_bytes(payload)
+        if sniffed_mime in _ALLOWED_MIMES:
+            normalized_mime = sniffed_mime
         # Email stays non-stageable policy-wise, so its cap resolves to the
         # inline text ceiling even on this staged path. Strict deployments
         # keep the legacy stageable set (pdf/image/office), so text stays at
@@ -455,6 +459,29 @@ class UploadStore:
             if len(payload) != entry.size or hashlib.sha256(payload).hexdigest() != entry.sha256:
                 raise AttachmentLostInRestartError(file_uuid)
             return payload, {
+                "name": entry.name,
+                "mime": entry.mime,
+                "sha256": entry.sha256,
+                "size": entry.size,
+                "owner": entry.owner,
+                "resource_id": entry.resource_id,
+            }
+
+    async def metadata(self, file_uuid: str) -> dict[str, Any]:
+        """Return upload metadata without reading the payload into memory."""
+        await self._sweep_expired_locked()
+        lock = await self._get_uuid_lock(file_uuid)
+        async with lock:
+            entry = self._entries.get(file_uuid)
+            if entry is None or entry.expires_at < self._now():
+                raise AttachmentNotFoundError(file_uuid)
+            try:
+                stat = native_io_path(entry.path).stat()
+            except OSError as exc:
+                raise AttachmentNotFoundError(file_uuid) from exc
+            if stat.st_size != entry.size:
+                raise AttachmentLostInRestartError(file_uuid)
+            return {
                 "name": entry.name,
                 "mime": entry.mime,
                 "sha256": entry.sha256,

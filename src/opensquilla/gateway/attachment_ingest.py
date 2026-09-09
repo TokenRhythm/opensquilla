@@ -778,7 +778,12 @@ async def resolve_attachments(
             resolved.append(attachment)
             continue
         try:
-            payload, meta = await upload_store.get(ref)
+            metadata_reader = getattr(upload_store, "metadata", None)
+            payload: bytes | None = None
+            if persist_enabled and callable(metadata_reader):
+                meta = await metadata_reader(ref)
+            else:
+                payload, meta = await upload_store.get(ref)
         except AttachmentLostInRestartError as exc:
             raise AttachmentResolutionError(
                 f"attachments[{index}] uuid lost in gateway restart; please re-upload",
@@ -793,21 +798,27 @@ async def resolve_attachments(
                 attachment_index=index,
                 file_uuid=ref,
             ) from exc
-        candidate = {k: v for k, v in attachment.items() if k != "file_uuid"}
-        candidate["data"] = payload
-        if "type" not in candidate or not isinstance(candidate.get("type"), str):
-            candidate["type"] = meta["mime"]
-        if "name" not in candidate or not isinstance(candidate.get("name"), str):
-            candidate["name"] = meta["name"]
-        materialized, _failures = validate_attachments(
-            [candidate],
-            failure_mode="raise",
-            mark_bytes_as_staged=True,
-            accept_opaque=accept_opaque,
-            opaque_limit_bytes=opaque_limit_bytes,
-        )
-        item = materialized[0]
+        item: dict[str, Any]
         if not persist_enabled:
+            assert payload is not None
+            candidate = {k: v for k, v in attachment.items() if k != "file_uuid"}
+            candidate["data"] = payload
+            if "type" not in candidate or not isinstance(candidate.get("type"), str):
+                candidate["type"] = meta["mime"]
+            if "name" not in candidate or not isinstance(candidate.get("name"), str):
+                candidate["name"] = meta["name"]
+            materialized, _failures = validate_attachments(
+                [candidate],
+                failure_mode="raise",
+                mark_bytes_as_staged=True,
+                accept_opaque=accept_opaque,
+                opaque_limit_bytes=opaque_limit_bytes,
+            )
+            item = materialized[0]
+            sniffed = sniff_mime_from_bytes(payload)
+            if sniffed in ALLOWED_MEDIA_TYPES and item.get("type") != sniffed:
+                item["type"] = sniffed
+                item["mime"] = sniffed
             resolved.append(item)
             consumed.append(ref)
             continue
@@ -815,11 +826,27 @@ async def resolve_attachments(
             raise ValueError(
                 f"attachments[{index}] file_uuid resolution requires a material target"
             )
-        raw_bytes, _was_bytes = _raw_bytes_from_data(item.get("data"), index=index)
-        # Recompute from the bytes rather than trusting adapter metadata.
-        # This also keeps compatibility with lightweight stores that omit a
-        # digest while guaranteeing the persisted ref addresses these bytes.
-        sha = hashlib.sha256(raw_bytes).hexdigest()
+        if payload is not None:
+            candidate = {k: v for k, v in attachment.items() if k != "file_uuid"}
+            candidate["data"] = payload
+            if "type" not in candidate or not isinstance(candidate.get("type"), str):
+                candidate["type"] = meta["mime"]
+            if "name" not in candidate or not isinstance(candidate.get("name"), str):
+                candidate["name"] = meta["name"]
+            materialized, _failures = validate_attachments(
+                [candidate],
+                failure_mode="raise",
+                mark_bytes_as_staged=True,
+                accept_opaque=accept_opaque,
+                opaque_limit_bytes=opaque_limit_bytes,
+            )
+            item = materialized[0]
+            sniffed = sniff_mime_from_bytes(payload)
+            if sniffed in ALLOWED_MEDIA_TYPES and item.get("type") != sniffed:
+                item["type"] = sniffed
+                item["mime"] = sniffed
+        else:
+            item = {k: v for k, v in attachment.items() if k != "file_uuid"}
         owner = meta.get("owner") or "uploads"
         resource_id = meta.get("resource_id") or ref
         claim = getattr(store, "claim", None)
@@ -843,6 +870,16 @@ async def resolve_attachments(
         # supplied display-name override so the persisted ref resolves exactly
         # to the bytes that were uploaded.
         item["name"] = stored_name
+        item["type"] = meta["mime"] if isinstance(meta.get("mime"), str) else item.get("type")
+        item["mime"] = item["type"]
+        item["size"] = meta.get("size") if isinstance(meta.get("size"), int) else item.get("size")
+        sha = (
+            hashlib.sha256(payload).hexdigest()
+            if payload is not None
+            else meta.get("sha256")
+        )
+        if not isinstance(sha, str):
+            raise ValueError(f"attachments[{index}] upload digest is invalid")
         # UploadStore already durably owns this file under inputs/<owner>/<resource>.
         # Keep a logical managed ref so the accepted transcript does not depend on
         # the short-lived upload UUID or a session-owned transcript copy.
@@ -851,7 +888,7 @@ async def resolve_attachments(
                 sha256=sha,
                 name=item["name"],
                 mime=item["type"],
-                size=len(raw_bytes),
+                size=int(meta.get("size") or item.get("size") or 0),
                 owner=owner,
                 resource_id=resource_id,
                 source="upload",
