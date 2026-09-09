@@ -728,18 +728,31 @@ async def resolve_attachments(
                 stat = source.stat()
                 if not source.is_file() or stat.st_size != attachment.get("size"):
                     raise ValueError("local file changed after authorization")
-                digest = hashlib.sha256()
-                with source.open("rb") as handle:
-                    for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-                        digest.update(chunk)
+                usage = attachment.get("usage")
+                needs_content_identity = (
+                    str(attachment.get("type") or "").startswith("image/")
+                    and usage != "file"
+                )
+                if needs_content_identity:
+                    digest = hashlib.sha256()
+                    with source.open("rb") as handle:
+                        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                            digest.update(chunk)
+                    sha256 = digest.hexdigest()
+                else:
+                    # Ordinary local files are live path references. Derive an
+                    # opaque identity from the grant without reading the file.
+                    sha256 = hashlib.sha256(
+                        f"opensquilla-local:{attachment['local_grant']}".encode()
+                    ).hexdigest()
                 local_ref = {
                     "kind": "attachment_ref",
                     "type": attachment.get("type") or OPAQUE_MIME,
                     "mime": attachment.get("type") or OPAQUE_MIME,
                     "name": attachment.get("name") or "attachment",
                     "size": stat.st_size,
-                    "sha256": digest.hexdigest(),
-                    "material_id": digest.hexdigest(),
+                    "sha256": sha256,
+                    "material_id": sha256,
                     "store": "local",
                     "scope": session_id,
                     "source": "local",
