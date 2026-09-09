@@ -2,11 +2,16 @@
 
 from __future__ import annotations
 
+import asyncio
+import codecs
 import hashlib
+import os
 import re
 import stat
+import tempfile
+import weakref
 from dataclasses import dataclass, replace
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
 from typing import Any
 from urllib.parse import quote, unquote, urlparse
 
@@ -17,7 +22,6 @@ from opensquilla.skills.hub.archive import (
     DEFAULT_ARCHIVE_LIMITS,
     ArchiveNormalizationError,
     normalize_relative_path,
-    validate_portable_file_paths,
 )
 from opensquilla.skills.hub.contracts import (
     DiagnosticPhase,
@@ -34,8 +38,89 @@ from opensquilla.skills.hub.source import (
     source_invalid_response_error,
     source_transport_error,
 )
+from opensquilla.skills.hub.tree_io import (
+    CHUNK_SIZE,
+    artifact_tree_digest,
+    exceeds_limit,
+    validate_portable_tree,
+    validate_tree_entry_count,
+)
+from opensquilla.skills.io_worker import run_staging_worker
 
 log = structlog.get_logger(__name__)
+
+_DOWNLOAD_SLOTS: weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, asyncio.Semaphore] = (
+    weakref.WeakKeyDictionary()
+)
+
+
+def _download_slots() -> asyncio.Semaphore:
+    loop = asyncio.get_running_loop()
+    if loop not in _DOWNLOAD_SLOTS:
+        _DOWNLOAD_SLOTS[loop] = asyncio.Semaphore(8)
+    return _DOWNLOAD_SLOTS[loop]
+
+
+async def _download_file(client: Any, url: str, target: Path, headers: dict[str, str]) -> None:
+    import httpx
+
+    async with _download_slots():
+        for attempt in range(3):
+            try:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                with target.open("wb") as output:
+                    stream = getattr(client, "stream", None)
+                    if callable(stream):
+                        async with stream("GET", url, headers=headers) as response:
+                            raise_for_source_http_status(
+                                response,
+                                phase=DiagnosticPhase.FETCH,
+                                source_name="GitHub",
+                            )
+                            size = 0
+                            async for chunk in response.aiter_bytes(CHUNK_SIZE):
+                                size += len(chunk)
+                                if exceeds_limit(size, DEFAULT_ARCHIVE_LIMITS.max_entry_bytes):
+                                    raise SkillSourceFetchError.diagnostic(
+                                        "FETCH_SIZE_LIMIT",
+                                        "Skill file exceeds configured limit.",
+                                        phase=DiagnosticPhase.FETCH,
+                                    )
+                                output.write(chunk)
+                    else:
+                        response = await client.get(url, headers=headers)
+                        raise_for_source_http_status(
+                            response,
+                            phase=DiagnosticPhase.FETCH,
+                            source_name="GitHub",
+                        )
+                        if exceeds_limit(
+                            len(response.content), DEFAULT_ARCHIVE_LIMITS.max_entry_bytes
+                        ):
+                            raise ValueError("GitHub Skill file exceeds configured limit")
+                        output.write(response.content)
+                return
+            except SkillSourceFetchError as exc:
+                retryable = any(d.code == "FETCH_SERVER_FAILED" for d in exc.diagnostics)
+                if not retryable or attempt == 2:
+                    raise
+            except httpx.TransportError:
+                if attempt == 2:
+                    raise
+            await asyncio.sleep(0.25 * (2**attempt))
+
+
+def _manifest_prefix(path: Path) -> str:
+    decoder = codecs.getincrementaldecoder("utf-8")()
+    prefix = ""
+    with path.open("rb") as stream:
+        while chunk := stream.read(CHUNK_SIZE):
+            decoded = decoder.decode(chunk)
+            if len(prefix) < CHUNK_SIZE:
+                prefix += decoded[: CHUNK_SIZE - len(prefix)]
+        decoder.decode(b"", final=True)
+    return prefix
+
 
 _GITHUB_HOSTS = {"github.com", "www.github.com"}
 _RAW_GITHUB_HOST = "raw.githubusercontent.com"
@@ -122,7 +207,8 @@ def _select_skill_tree(
     for entry in entries:
         if not isinstance(entry, dict):
             raise source_invalid_response_error(
-                phase=DiagnosticPhase.FETCH, source_name="GitHub",
+                phase=DiagnosticPhase.FETCH,
+                source_name="GitHub",
             )
         raw_path = str(entry.get("path") or "")
         path = f"{tree_path_prefix}/{raw_path}" if tree_path_prefix else raw_path
@@ -133,15 +219,18 @@ def _select_skill_tree(
             normalized = normalize_relative_path(path).as_posix()
         except ArchiveNormalizationError as exc:
             raise SkillSourceFetchError.diagnostic(
-                "ARTIFACT_PATH_UNSAFE", "GitHub returned an unsafe manifest path.",
-                phase=DiagnosticPhase.SECURITY, path=path,
+                "ARTIFACT_PATH_UNSAFE",
+                "GitHub returned an unsafe manifest path.",
+                phase=DiagnosticPhase.SECURITY,
+                path=path,
             ) from exc
         if entry.get("type") == "blob":
             manifests.append(normalized)
     manifests.sort()
     if not manifests:
         raise SkillSourceFetchError.diagnostic(
-            "MANIFEST_MISSING", "The selected GitHub directory contains no Skill manifest.",
+            "MANIFEST_MISSING",
+            "The selected GitHub directory contains no Skill manifest.",
             phase=DiagnosticPhase.MANIFEST,
             hint="Choose a directory containing SKILL.md.",
         )
@@ -151,18 +240,24 @@ def _select_skill_tree(
             directory = str(PurePosixPath(path).parent)
             directory = "" if directory == "." else directory
             candidate = replace(ref, path=directory)
-            candidates.append({
-                "name": PurePosixPath(directory).name or ref.repo,
-                "path": directory,
-                "identifier": candidate.canonical_identifier,
-            })
+            candidates.append(
+                {
+                    "name": PurePosixPath(directory).name or ref.repo,
+                    "path": directory,
+                    "identifier": candidate.canonical_identifier,
+                }
+            )
         raise SkillSourceFetchError.diagnostic(
-            "SOURCE_TREE_AMBIGUOUS", "Select one Skill directory from this GitHub repository.",
+            "SOURCE_TREE_AMBIGUOUS",
+            "Select one Skill directory from this GitHub repository.",
             phase=DiagnosticPhase.ARCHIVE,
             details={
-                "manifests": manifests[:100], "selectionRequired": True,
-                "repository": ref.repo_full, "immutableRevision": ref.ref,
-                "candidateCount": len(manifests), "candidates": candidates,
+                "manifests": manifests[:100],
+                "selectionRequired": True,
+                "repository": ref.repo_full,
+                "immutableRevision": ref.ref,
+                "candidateCount": len(manifests),
+                "candidates": candidates,
             },
             hint="Install an exact candidate directory or specify a Skill subpath.",
         )
@@ -172,8 +267,10 @@ def _select_skill_tree(
         return ref, resolution
     selected = replace(ref, path=directory)
     return selected, replace(
-        resolution, canonical_identifier=selected.canonical_identifier,
-        skill_path=directory, upstream_url=selected.homepage,
+        resolution,
+        canonical_identifier=selected.canonical_identifier,
+        skill_path=directory,
+        upstream_url=selected.homepage,
         package_identifier=f"{selected.repo_full.casefold()}:{directory}",
     )
 
@@ -310,8 +407,7 @@ async def _fetch_tree_payload(
 def _github_tree_url(ref: _GitHubSkillRef, treeish: str, *, recursive: bool) -> str:
     suffix = "?recursive=1" if recursive else ""
     return (
-        f"https://api.github.com/repos/{ref.repo_full}/git/trees/"
-        f"{quote(treeish, safe='')}{suffix}"
+        f"https://api.github.com/repos/{ref.repo_full}/git/trees/{quote(treeish, safe='')}{suffix}"
     )
 
 
@@ -371,44 +467,6 @@ async def _fetch_explicit_subtree(
         _github_tree_url(ref, treeish, recursive=True),
         headers=headers,
     )
-
-
-async def _read_bounded_blob(
-    client: Any,
-    url: str,
-    *,
-    headers: dict[str, str],
-    aggregate_remaining: int,
-) -> bytes:
-    limit = min(DEFAULT_ARCHIVE_LIMITS.max_entry_bytes, aggregate_remaining)
-    stream = getattr(client, "stream", None)
-    if callable(stream):
-        chunks: list[bytes] = []
-        size = 0
-        async with stream("GET", url, headers=headers) as response:
-            raise_for_source_http_status(
-                response,
-                phase=DiagnosticPhase.FETCH,
-                source_name="GitHub",
-            )
-            async for chunk in response.aiter_bytes():
-                size += len(chunk)
-                if size > limit:
-                    raise ValueError("GitHub Skill blob exceeds the download limit")
-                chunks.append(chunk)
-        return b"".join(chunks)
-
-    # One-cycle compatibility for source adapter test doubles.
-    response = await client.get(url, headers=headers)
-    raise_for_source_http_status(
-        response,
-        phase=DiagnosticPhase.FETCH,
-        source_name="GitHub",
-    )
-    content = bytes(response.content)
-    if len(content) > limit:
-        raise ValueError("GitHub Skill blob exceeds the download limit")
-    return content
 
 
 def _bundle_digest(files: dict[str, str | bytes]) -> str:
@@ -562,8 +620,7 @@ class GitHubSource(SkillSource):
         commit = ref.ref.lower() if _COMMIT_RE.fullmatch(ref.ref) else ""
         if not commit:
             commit_url = (
-                f"https://api.github.com/repos/{ref.repo_full}/commits/"
-                f"{quote(ref.ref, safe='')}"
+                f"https://api.github.com/repos/{ref.repo_full}/commits/{quote(ref.ref, safe='')}"
             )
             try:
                 async with httpx.AsyncClient(timeout=15, trust_env=_trust_env()) as client:
@@ -588,9 +645,7 @@ class GitHubSource(SkillSource):
                     phase=DiagnosticPhase.SOURCE,
                     source_name="GitHub",
                 ) from exc
-            if not isinstance(response_data, dict) or not isinstance(
-                response_data.get("sha"), str
-            ):
+            if not isinstance(response_data, dict) or not isinstance(response_data.get("sha"), str):
                 raise source_invalid_response_error(
                     phase=DiagnosticPhase.SOURCE,
                     source_name="GitHub",
@@ -652,7 +707,30 @@ class GitHubSource(SkillSource):
             return None
 
     async def fetch_resolved(self, resolution: SourceResolution) -> SkillBundle | None:
-        """Fetch every file beneath the selected path at the resolved commit."""
+        """Preserve the in-memory source API for existing direct callers."""
+        with tempfile.TemporaryDirectory(prefix="skill-fetch-") as temporary:
+            bundle = await self.fetch_resolved_into(resolution, Path(temporary) / "tree")
+            if bundle is not None:
+                assert bundle.directory is not None
+                bundle.files = {
+                    path.relative_to(bundle.directory).as_posix(): _decode_file(
+                        "", path.read_bytes()
+                    )
+                    for path in bundle.directory.rglob("*")
+                    if path.is_file()
+                }
+                bundle.directory = None
+            return bundle
+
+    async def fetch_resolved_into(
+        self,
+        resolution: SourceResolution,
+        destination: Path,
+    ) -> SkillBundle | None:
+        """Validate the selected tree before concurrent, file-backed downloads."""
+
+        if type(self).fetch_resolved is not GitHubSource.fetch_resolved:
+            return await SkillSource.fetch_resolved_into(self, resolution, destination)
 
         import httpx
 
@@ -715,12 +793,15 @@ class GitHubSource(SkillSource):
                         )
 
                 ref, resolution = _select_skill_tree(
-                    tree_data["tree"], ref, resolution, tree_path_prefix=tree_path_prefix,
+                    tree_data["tree"],
+                    ref,
+                    resolution,
+                    tree_path_prefix=tree_path_prefix,
                 )
-                files: dict[str, str | bytes] = {}
                 selected: list[tuple[str, str, int, int]] = []
                 declared_total = 0
                 missing_modes = False
+                directories: list[str] = []
                 for item in tree_data["tree"]:
                     if not isinstance(item, dict):
                         raise source_invalid_response_error(
@@ -751,13 +832,19 @@ class GitHubSource(SkillSource):
                             path=path,
                         ) from None
                     rel_path = _relative_to_skill_dir(safe_path, ref.skill_dir)
-                    selected_root_entry = bool(
-                        ref.skill_dir and safe_path == ref.skill_dir
-                    )
+                    selected_root_entry = bool(ref.skill_dir and safe_path == ref.skill_dir)
                     if rel_path is None and not selected_root_entry:
                         continue
                     entry_type = str(item.get("type") or "")
                     if entry_type == "tree":
+                        if item.get("mode") not in {None, "", "040000", "40000"}:
+                            raise SkillSourceFetchError.diagnostic(
+                                "ARTIFACT_FILE_TYPE_UNSUPPORTED",
+                                "GitHub directory has unsupported file mode metadata.",
+                                phase=DiagnosticPhase.SECURITY, path=safe_path,
+                            )
+                        if rel_path:
+                            directories.append(rel_path)
                         continue
                     if entry_type != "blob":
                         log.warning(
@@ -774,12 +861,8 @@ class GitHubSource(SkillSource):
                     if not rel_path:
                         continue
                     relative = PurePosixPath(rel_path)
-                    if (
-                        len(relative.parts) > DEFAULT_ARCHIVE_LIMITS.max_depth
-                        or any(
-                            part.casefold() in _RESERVED_COMPONENTS
-                            for part in relative.parts
-                        )
+                    if len(relative.parts) > DEFAULT_ARCHIVE_LIMITS.max_depth or any(
+                        part.casefold() in _RESERVED_COMPONENTS for part in relative.parts
                     ):
                         log.warning("github.fetch_unsafe_skill_path", path=safe_path)
                         raise SkillSourceFetchError.diagnostic(
@@ -792,11 +875,11 @@ class GitHubSource(SkillSource):
                         declared_size = max(0, int(item.get("size") or 0))
                     except (TypeError, ValueError):
                         declared_size = 0
-                    if declared_size > DEFAULT_ARCHIVE_LIMITS.max_entry_bytes:
+                    if exceeds_limit(declared_size, DEFAULT_ARCHIVE_LIMITS.max_entry_bytes):
                         log.warning("github.fetch_entry_too_large", path=safe_path)
                         raise SkillSourceFetchError.diagnostic(
                             "FETCH_SIZE_LIMIT",
-                            f"GitHub Skill file exceeds the 50 MiB entry limit: {safe_path}",
+                            f"GitHub Skill file exceeds the configured entry limit: {safe_path}",
                             phase=DiagnosticPhase.FETCH,
                             path=safe_path,
                         )
@@ -825,20 +908,20 @@ class GitHubSource(SkillSource):
                     else:
                         missing_modes = True
                     declared_total += declared_size
-                    if declared_total > DEFAULT_ARCHIVE_LIMITS.max_expanded_bytes:
+                    if exceeds_limit(declared_total, DEFAULT_ARCHIVE_LIMITS.max_expanded_bytes):
                         log.warning(
                             "github.fetch_tree_too_large",
                             identifier=resolution.canonical_identifier,
                         )
                         raise SkillSourceFetchError.diagnostic(
                             "FETCH_SIZE_LIMIT",
-                            "GitHub Skill exceeds the 50 MiB expanded-size limit.",
+                            "GitHub Skill exceeds the configured expanded-size limit.",
                             phase=DiagnosticPhase.FETCH,
                         )
                     selected.append((safe_path, rel_path, declared_size, file_mode))
 
                 try:
-                    validate_portable_file_paths(item[1] for item in selected)
+                    validate_portable_tree((item[1] for item in selected), directories)
                 except ArchiveNormalizationError as exc:
                     log.warning("github.fetch_colliding_tree_path", error=str(exc))
                     raise SkillSourceFetchError.diagnostic(
@@ -847,35 +930,60 @@ class GitHubSource(SkillSource):
                         phase=DiagnosticPhase.SECURITY,
                     ) from None
 
-                if len(selected) > DEFAULT_ARCHIVE_LIMITS.max_entries:
-                    log.warning(
-                        "github.fetch_too_many_files",
-                        identifier=resolution.canonical_identifier,
+                try:
+                    validate_tree_entry_count(
+                        [item[1] for item in selected] + directories,
+                        limit=DEFAULT_ARCHIVE_LIMITS.max_entries,
                     )
+                    for directory in directories:
+                        if len(PurePosixPath(directory).parts) > DEFAULT_ARCHIVE_LIMITS.max_depth:
+                            raise ValueError("Skill directory exceeds depth limit")
+                        if any(
+                            part.casefold() in _RESERVED_COMPONENTS
+                            for part in PurePosixPath(directory).parts
+                        ):
+                            raise ValueError("Skill directory uses reserved path")
+                except ValueError as exc:
                     raise SkillSourceFetchError.diagnostic(
                         "FETCH_ENTRY_LIMIT",
-                        "GitHub Skill contains more than 2048 files.",
+                        str(exc),
                         phase=DiagnosticPhase.FETCH,
+                    ) from exc
+                destination.mkdir(parents=True, exist_ok=False)
+                for directory in directories:
+                    destination.joinpath(*PurePosixPath(directory).parts).mkdir(
+                        parents=True,
+                        exist_ok=True,
                     )
-
-                actual_total = 0
                 file_modes: dict[str, int] = {}
-                for path, rel_path, _declared_size, file_mode in selected:
-                    raw_url = (
-                        f"https://raw.githubusercontent.com/{ref.repo_full}/"
-                        f"{quote(ref.ref, safe='')}/{quote(path, safe='/')}"
-                    )
-                    remaining = DEFAULT_ARCHIVE_LIMITS.max_expanded_bytes - actual_total
-                    content = await _read_bounded_blob(
-                        client,
-                        raw_url,
-                        headers=self._headers(),
-                        aggregate_remaining=remaining,
-                    )
-                    actual_total += len(content)
-                    files[rel_path] = _decode_file(rel_path, content)
-                    if file_mode:
-                        file_modes[rel_path] = file_mode
+                pending = iter(selected)
+                actual_total = 0
+
+                async def worker() -> None:
+                    nonlocal actual_total
+                    for path, rel_path, _declared_size, file_mode in pending:
+                        raw_url = (
+                            f"https://raw.githubusercontent.com/{ref.repo_full}/"
+                            f"{quote(ref.ref, safe='')}/{quote(path, safe='/')}"
+                        )
+                        target = destination.joinpath(*PurePosixPath(rel_path).parts)
+                        await _download_file(client, raw_url, target, self._headers())
+                        actual_total += target.stat().st_size
+                        if exceeds_limit(actual_total, DEFAULT_ARCHIVE_LIMITS.max_expanded_bytes):
+                            raise ValueError("Skill exceeds configured expanded-size limit")
+                        if file_mode:
+                            file_modes[rel_path] = file_mode
+                            if os.name != "nt":
+                                target.chmod(file_mode & 0o777)
+
+                workers = [asyncio.create_task(worker()) for _ in range(min(8, len(selected)))]
+                try:
+                    await asyncio.gather(*workers)
+                finally:
+                    for task in workers:
+                        if not task.done():
+                            task.cancel()
+                    await asyncio.gather(*workers, return_exceptions=True)
         except SkillSourceFetchError:
             raise
         except Exception as exc:
@@ -903,12 +1011,11 @@ class GitHubSource(SkillSource):
         )
         manifest_paths = [
             path
-            for path in files
+            for _source_path, path, _size, _mode in selected
             if PurePosixPath(path).name in accepted_manifest_names
         ]
-        if (
-            len(manifest_paths) != 1
-            or PurePosixPath(manifest_paths[0]).parent != PurePosixPath(".")
+        if len(manifest_paths) != 1 or PurePosixPath(manifest_paths[0]).parent != PurePosixPath(
+            "."
         ):
             log.warning(
                 "github.fetch_ambiguous_manifest",
@@ -922,8 +1029,9 @@ class GitHubSource(SkillSource):
                 details={"manifests": manifest_paths},
                 hint="Use an explicit repository subpath containing one Skill.",
             )
-        skill_md = files[manifest_paths[0]]
-        if not isinstance(skill_md, str):
+        try:
+            skill_md = _manifest_prefix(destination / manifest_paths[0])
+        except UnicodeDecodeError:
             raise SkillSourceFetchError.diagnostic(
                 "MANIFEST_ENCODING_INVALID",
                 "The GitHub Skill manifest is not valid UTF-8 text.",
@@ -942,7 +1050,9 @@ class GitHubSource(SkillSource):
             homepage=ref.homepage,
             canonical_identifier=resolution.canonical_identifier,
         )
-        actual_digest = _bundle_digest(files)
+        actual_digest = await run_staging_worker(
+            artifact_tree_digest, destination, include_lengths=True,
+        )
         if resolution.expected_digest and resolution.expected_digest.lower() not in {
             actual_digest,
             f"sha256:{actual_digest}",
@@ -958,8 +1068,7 @@ class GitHubSource(SkillSource):
             )
         resolved = replace(resolution, expected_digest=actual_digest)
         if missing_modes and not any(
-            diagnostic.code == "FILE_MODE_UNAVAILABLE"
-            for diagnostic in resolved.diagnostics
+            diagnostic.code == "FILE_MODE_UNAVAILABLE" for diagnostic in resolved.diagnostics
         ):
             resolved = replace(
                 resolved,
@@ -975,7 +1084,7 @@ class GitHubSource(SkillSource):
             )
         return SkillBundle(
             name=name,
-            files=files,
+            directory=destination,
             meta=meta,
             resolution=resolved,
             file_modes=file_modes,
