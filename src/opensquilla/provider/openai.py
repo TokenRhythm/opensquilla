@@ -2997,6 +2997,24 @@ def _prompt_json_schema_config(
     )
 
 
+# Header names an operator must never override via ``extra_headers``: losing
+# them breaks auth and response framing for every adapter. Compared
+# case-insensitively because httpx normalises header names on the wire.
+_RESERVED_EXTRA_HEADER_NAMES = frozenset({"authorization", "content-type", "accept"})
+
+
+def merge_extra_headers(
+    headers: dict[str, str], extra: Mapping[str, str] | None
+) -> dict[str, str]:
+    """Merge operator-defined headers (e.g. a session header a routing
+    gateway requires), keeping adapter-managed framing intact."""
+    for name, value in (extra or {}).items():
+        if str(name).lower() in _RESERVED_EXTRA_HEADER_NAMES:
+            continue
+        headers[str(name)] = str(value)
+    return headers
+
+
 class OpenAIProvider:
     """Streams from OpenAI-compatible Chat Completions API (SSE)."""
 
@@ -3015,12 +3033,14 @@ class OpenAIProvider:
         compat: OpenAICompatPolicy | None = None,
         replay_provider_state: bool = True,
         provider_id: str | None = None,
+        extra_headers: Mapping[str, str] | None = None,
     ) -> None:
         self._api_key = clean_header_secret(api_key, label="LLM API key")
         self._model = model
         self._base_url = base_url.rstrip("/")
         self._proxy = _resolve_llm_proxy(proxy)
         self._org_id = org_id
+        self._extra_headers = dict(extra_headers or {})
         if not provider_kind:
             # Fallback for direct construction only (tests, ad-hoc
             # embedding): every production path flows through
@@ -3630,6 +3650,7 @@ class OpenAIProvider:
                 cfg.provider_request_correlation,
             )
         )
+        merge_extra_headers(headers, self._extra_headers)
         correlation = cfg.provider_request_correlation
         if (
             self._provider_kind == "openrouter"
@@ -6059,6 +6080,7 @@ class OpenAIProvider:
             else {}
         )
         headers.update(provider_app_headers(self._base_url))
+        merge_extra_headers(headers, self._extra_headers)
         safe_request_error: Exception | None = None
         cancelled_request_error: asyncio.CancelledError | None = None
         client: Any = None

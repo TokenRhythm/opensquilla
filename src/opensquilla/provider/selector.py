@@ -37,6 +37,10 @@ class ProviderConfig:
     org_id: str = ""
     proxy: str = ""  # explicit HTTP proxy URL
     provider_routing: dict[str, str] = field(default_factory=dict)
+    # Operator-defined extra HTTP headers, merged into upstream requests by
+    # adapters that support them (OpenAI-family). Adapter-managed framing
+    # (Authorization/Content-Type/Accept) always wins.
+    extra_headers: dict[str, str] = field(default_factory=dict)
     # False for cross-provider tier execution: provider-bound continuity
     # state minted elsewhere (thinking blocks / thought signatures) must not
     # be replayed to a provider that did not produce it.
@@ -237,6 +241,7 @@ class ProviderBuildContext:
     org_id: str = ""
     proxy: str = ""
     provider_routing: Mapping[str, str] = field(default_factory=dict)
+    extra_headers: Mapping[str, str] = field(default_factory=dict)
     replay_provider_state: bool = True
     # OllamaProvider knob; never populated today because ProviderConfig has
     # no num_ctx field — kept visible so the gap is explicit.
@@ -258,6 +263,7 @@ def _build_context(cfg: ProviderConfig, spec: ProviderSpec) -> ProviderBuildCont
         org_id=cfg.org_id,
         proxy=cfg.proxy,
         provider_routing=dict(cfg.provider_routing),
+        extra_headers=dict(cfg.extra_headers),
         replay_provider_state=cfg.replay_provider_state,
         auth_header_style=spec.auth_header_style,
         compat=spec.compat,
@@ -307,6 +313,8 @@ def _build_openai_compat(ctx: ProviderBuildContext) -> LLMProvider:
         kwargs["proxy"] = ctx.proxy
     if ctx.provider_routing:
         kwargs["provider_routing"] = ctx.provider_routing
+    if ctx.extra_headers:
+        kwargs["extra_headers"] = dict(ctx.extra_headers)
     return OpenAIProvider(**kwargs)
 
 
@@ -327,6 +335,8 @@ def _build_openai_responses(ctx: ProviderBuildContext) -> LLMProvider:
         kwargs["org_id"] = ctx.org_id
     if ctx.proxy:
         kwargs["proxy"] = ctx.proxy
+    if ctx.extra_headers:
+        kwargs["extra_headers"] = dict(ctx.extra_headers)
     return OpenAIResponsesProvider(**kwargs)
 
 
