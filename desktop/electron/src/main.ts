@@ -89,6 +89,10 @@ import {
 } from './update-verification.js'
 import { isUpdateCheckAllowed, UpdateCheckScheduler } from './update-check-scheduler.js'
 import {
+  DesktopLocalFileGrantManager,
+  type DesktopLocalFileGrantIssueRequest,
+} from './desktop-local-file-grant.js'
+import {
   canRevealDesktopApp,
   defaultDesktopPreferences,
   mainWindowCloseAction,
@@ -624,6 +628,15 @@ const gatewayState: GatewayState = {
   status: 'stopped',
   logPath: '',
 }
+
+const desktopLocalFileGrants = new DesktopLocalFileGrantManager(() => ({
+  owned: gatewayState.owned,
+  status: gatewayState.status,
+  instanceId: gatewayConnectionInstanceId,
+}), undefined, () => false)
+// The Gateway-side grant consumer is introduced by the following integration
+// batch. Keeping this false makes the current Desktop advertise upload
+// fallback and prevents issuing grants that no execution endpoint can consume.
 
 function desktopGatewayConnectionSnapshot(): DesktopGatewayConnection {
   const ready = gatewayState.status === 'ready' && Boolean(gatewayState.url)
@@ -11286,6 +11299,40 @@ ipcMain.handle('gateway:connection', (event) => {
     throw new Error('Untrusted Gateway connection request.')
   }
   return desktopGatewayConnectionSnapshot()
+})
+ipcMain.handle('desktop:file:capabilities', (event) => {
+  if (!trustedMainWindowControlIpc(event)) {
+    throw new Error('Untrusted local file capability request.')
+  }
+  return desktopLocalFileGrants.capabilities()
+})
+ipcMain.handle('desktop:file:grant', (event, payload: unknown) => {
+  if (!trustedMainWindowControlIpc(event)) {
+    return {
+      ok: false,
+      code: 'unavailable',
+      message: 'Local file references are unavailable to this window.',
+    }
+  }
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
+    return {
+      ok: false,
+      code: 'invalid-request',
+      message: 'The local file grant request is invalid.',
+    }
+  }
+  const raw = payload as Record<string, unknown>
+  const request: DesktopLocalFileGrantIssueRequest = {
+    path: typeof raw.path === 'string' ? raw.path : '',
+    name: typeof raw.name === 'string' ? raw.name : undefined,
+    mime: typeof raw.mime === 'string' ? raw.mime : undefined,
+    size: typeof raw.size === 'number' ? raw.size : undefined,
+    subject: `webcontents:${event.sender.id}`,
+    executionEnvironment: typeof raw.executionEnvironment === 'string'
+      ? raw.executionEnvironment
+      : 'default',
+  }
+  return desktopLocalFileGrants.issue(request)
 })
 ipcMain.handle('gateway:cli-invocation', async () => {
   const runtime = await resolveGatewayRuntime()

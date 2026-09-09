@@ -32,6 +32,25 @@ export interface DesktopGatewayConnection {
   error: string | null
 }
 
+export interface DesktopLocalFileCapabilities {
+  version: 1
+  available: boolean
+  reason?: string
+}
+
+export interface DesktopLocalFileGrant {
+  version: 1
+  grant: string
+  name: string
+  mime: string
+  size: number
+  expiresAt: number
+}
+
+export type DesktopLocalFileGrantResult =
+  | { ok: true, value: DesktopLocalFileGrant }
+  | { ok: false, code: string, message: string }
+
 export interface DesktopRetryStartupResult {
   ok: boolean
   error?: string
@@ -182,6 +201,13 @@ export interface PlatformFilesApi {
   chooseProjectDirectory?: (
     request?: ProjectDirectoryPickerRequest,
   ) => Promise<{ path: string } | null>
+  /** Query whether the Desktop Gateway can consume local file grants. */
+  getLocalFileCapabilities?: () => Promise<DesktopLocalFileCapabilities>
+  /** Prepare one native File without exposing its absolute path to the UI. */
+  prepareLocalFile?: (
+    file: File,
+    payload?: { executionEnvironment?: string },
+  ) => Promise<DesktopLocalFileGrantResult>
 }
 
 export interface NativeWorkbenchCreateSurfaceRequestV1 {

@@ -5,6 +5,8 @@ import type {
   ArtifactOpenRequest,
   DesktopMainWindowCloseBehavior,
   DesktopGatewayConnection,
+  DesktopLocalFileCapabilities,
+  DesktopLocalFileGrantResult,
   DesktopPreferences,
   DesktopRetryStartupResult,
   DesktopUpdateState,
@@ -49,6 +51,11 @@ declare global {
     onUpdateState?: (callback: (payload: unknown) => void) => () => void
     getGatewayStatus: () => Promise<DesktopSettings['gateway']>
     getGatewayConnection?: () => Promise<DesktopGatewayConnection>
+    getLocalFileCapabilities?: () => Promise<DesktopLocalFileCapabilities>
+    prepareLocalFile?: (
+      file: File,
+      payload?: { executionEnvironment?: string },
+    ) => Promise<DesktopLocalFileGrantResult>
     onGatewayConnectionChanged?: (
       callback: (payload: DesktopGatewayConnection) => void,
     ) => () => void
