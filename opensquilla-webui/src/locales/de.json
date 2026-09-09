@@ -2981,7 +2981,9 @@
       "clearActivity": "Aktivität löschen",
       "expandActivity": "Installationsaktivität erweitern",
       "collapseActivity": "Installationsaktivität einklappen",
+      "selectSkillDirectory": "Skill-Verzeichnis auswählen",
       "queueStatus": {
+        "selection_required": "Verzeichnis auswählen",
         "queued": "Wartend",
         "installing": "Wird installiert",
         "cancelling": "Wird abgebrochen",

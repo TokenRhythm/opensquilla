@@ -3,13 +3,22 @@
 from __future__ import annotations
 
 import io
+import os
 import re
 import stat
 import unicodedata
 import zipfile
 from collections.abc import Iterable
 from dataclasses import dataclass
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
+from typing import BinaryIO
+
+from opensquilla.skills.hub.tree_io import (
+    CHUNK_SIZE,
+    exceeds_limit,
+    validate_tree_entry_count,
+)
+from opensquilla.skills.io_worker import check_staging_cancelled
 
 
 class ArchiveNormalizationError(ValueError):
@@ -20,10 +29,10 @@ class ArchiveNormalizationError(ValueError):
 class ArchiveLimits:
     """Hard limits applied before Community archive contents enter quarantine."""
 
-    max_archive_bytes: int = 50 * 1024 * 1024
-    max_entries: int = 2_048
-    max_entry_bytes: int = 50 * 1024 * 1024
-    max_expanded_bytes: int = 50 * 1024 * 1024
+    max_archive_bytes: int | None = None
+    max_entries: int = 4_096
+    max_entry_bytes: int | None = None
+    max_expanded_bytes: int | None = None
     max_depth: int = 32
     max_compression_ratio: float = 100.0
 
@@ -34,6 +43,7 @@ class ArchiveNormalizationResult:
 
     files: dict[str, str | bytes]
     file_modes: dict[str, int]
+    file_names: tuple[str, ...] = ()
 
 
 DEFAULT_ARCHIVE_LIMITS = ArchiveLimits()
@@ -174,9 +184,7 @@ def _selected_skill_root(
             if selected_parts and path.parent.parts[-len(selected_parts) :] != selected_parts:
                 continue
             prefix = (
-                path.parent.parts[: -len(selected_parts)]
-                if selected_parts
-                else path.parent.parts
+                path.parent.parts[: -len(selected_parts)] if selected_parts else path.parent.parts
             )
             # GitHub and registry archives are accepted either flat or with one
             # packaging wrapper. Deeper implicit roots are intentionally not guessed.
@@ -194,9 +202,7 @@ def _selected_skill_root(
     if len(root_markers) > 1:
         raise ArchiveNormalizationError("archive contains multiple root Skill manifests")
 
-    wrapper_roots = {
-        path.parent for path in paths if _is_manifest(path) and len(path.parts) == 2
-    }
+    wrapper_roots = {path.parent for path in paths if _is_manifest(path) and len(path.parts) == 2}
     if len(wrapper_roots) != 1:
         raise ArchiveNormalizationError(
             "archive must contain SKILL.md at its root or inside one wrapper directory"
@@ -219,9 +225,7 @@ def _validated_mode(info: zipfile.ZipInfo) -> int:
     if _has_extra_field(info, _ASI_UNIX_EXTRA_ID):
         # ASi Unix metadata can encode link targets.  ZIP has no portable
         # hardlink contract, so fail closed instead of materializing a link.
-        raise ArchiveNormalizationError(
-            f"archive link metadata is unsupported: {info.filename}"
-        )
+        raise ArchiveNormalizationError(f"archive link metadata is unsupported: {info.filename}")
     if info.create_system != 3:
         return 0
     unix_mode = (info.external_attr >> 16) & 0xFFFF
@@ -267,21 +271,21 @@ def normalize_skill_archive(
 
 
 def normalize_skill_archive_result(
-    archive: bytes,
+    archive: bytes | Path,
     *,
     selected_subpath: str = "",
     limits: ArchiveLimits = DEFAULT_ARCHIVE_LIMITS,
+    destination: Path | None = None,
 ) -> ArchiveNormalizationResult:
     """Normalize an archive and retain safe POSIX permission metadata."""
 
-    if len(archive) > limits.max_archive_bytes:
+    archive_size = archive.stat().st_size if isinstance(archive, Path) else len(archive)
+    if exceeds_limit(archive_size, limits.max_archive_bytes):
         raise ArchiveNormalizationError("archive exceeds the compressed-size limit")
 
     try:
-        with zipfile.ZipFile(io.BytesIO(archive)) as zf:
+        with zipfile.ZipFile(archive if isinstance(archive, Path) else io.BytesIO(archive)) as zf:
             infos = zf.infolist()
-            if len(infos) > limits.max_entries:
-                raise ArchiveNormalizationError("archive contains too many files")
 
             normalized_infos: list[tuple[PurePosixPath, zipfile.ZipInfo, int]] = []
             seen_paths: set[PurePosixPath] = set()
@@ -309,7 +313,7 @@ def normalize_skill_archive_result(
                 if info.is_dir():
                     normalized_infos.append((path, info, mode))
                     continue
-                if info.file_size > limits.max_entry_bytes:
+                if exceeds_limit(info.file_size, limits.max_entry_bytes):
                     raise ArchiveNormalizationError(f"archive entry exceeds size limit: {path}")
                 if info.file_size and (
                     info.compress_size <= 0
@@ -319,14 +323,12 @@ def normalize_skill_archive_result(
                         f"archive entry exceeds compression-ratio limit: {path}"
                     )
                 declared_total += info.file_size
-                if declared_total > limits.max_expanded_bytes:
+                if exceeds_limit(declared_total, limits.max_expanded_bytes):
                     raise ArchiveNormalizationError("archive exceeds the expanded-size limit")
                 normalized_infos.append((path, info, mode))
 
             file_collision_keys = {
-                _collision_key(path)
-                for path, info, _mode in normalized_infos
-                if not info.is_dir()
+                _collision_key(path) for path, info, _mode in normalized_infos if not info.is_dir()
             }
             for path, _info, _mode in normalized_infos:
                 collision_key = _collision_key(path)
@@ -334,17 +336,13 @@ def normalize_skill_archive_result(
                     collision_key[:depth] in file_collision_keys
                     for depth in range(1, len(collision_key))
                 ):
-                    raise ArchiveNormalizationError(
-                        f"archive file/directory paths collide: {path}"
-                    )
+                    raise ArchiveNormalizationError(f"archive file/directory paths collide: {path}")
 
             file_paths = {path for path, info, _mode in normalized_infos if not info.is_dir()}
             validate_portable_file_paths(file_paths)
             root = _selected_skill_root(file_paths, selected_subpath)
             root_markers = {
-                path
-                for path in file_paths
-                if _is_manifest(path) and path.parent == root
+                path for path in file_paths if _is_manifest(path) and path.parent == root
             }
             skill_markers = {path for path in file_paths if _is_manifest(path)}
             if len(root_markers) != 1 or skill_markers != root_markers:
@@ -362,35 +360,67 @@ def normalize_skill_archive_result(
                         f"archive contains an entry outside the selected skill root: {path}"
                     )
 
+            selected = [
+                (relative, info, mode)
+                for path, info, mode in normalized_infos
+                if (relative := _relative_to_root(path, root)) is not None and relative.parts
+            ]
+            try:
+                validate_tree_entry_count(
+                    (path for path, _, _ in selected), limit=limits.max_entries
+                )
+            except ValueError as exc:
+                raise ArchiveNormalizationError(str(exc)) from exc
+            if destination is not None:
+                destination.mkdir(parents=True, exist_ok=False)
             files: dict[str, str | bytes] = {}
+            file_names: list[str] = []
             file_modes: dict[str, int] = {}
             actual_total = 0
-            for path, info, mode in normalized_infos:
+            for relative, info, mode in selected:
                 if info.is_dir():
+                    if destination is not None:
+                        destination.joinpath(*relative.parts).mkdir(parents=True, exist_ok=True)
                     continue
-                relative = _relative_to_root(path, root)
-                if relative is None or not relative.parts:
-                    continue
-                with zf.open(info, "r") as handle:
-                    content = handle.read(limits.max_entry_bytes + 1)
-                if len(content) > limits.max_entry_bytes:
-                    raise ArchiveNormalizationError(f"archive entry exceeds size limit: {path}")
-                actual_total += len(content)
-                if actual_total > limits.max_expanded_bytes:
-                    raise ArchiveNormalizationError("archive exceeds the expanded-size limit")
                 relative_name = relative.as_posix()
-                if relative_name in files:
-                    raise ArchiveNormalizationError(
-                        f"archive contains duplicate normalized path: {relative_name}"
-                    )
-                files[relative_name] = _decode_entry(relative, content)
+                file_names.append(relative_name)
+                buffer = io.BytesIO()
+                output: BinaryIO = buffer
+                if destination is not None:
+                    target = destination.joinpath(*relative.parts)
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    output = target.open("xb")
+                entry_size = 0
+                try:
+                    with zf.open(info, "r") as handle:
+                        while chunk := handle.read(CHUNK_SIZE):
+                            check_staging_cancelled()
+                            entry_size += len(chunk)
+                            actual_total += len(chunk)
+                            if exceeds_limit(entry_size, limits.max_entry_bytes):
+                                raise ArchiveNormalizationError("archive entry exceeds size limit")
+                            if exceeds_limit(actual_total, limits.max_expanded_bytes):
+                                raise ArchiveNormalizationError(
+                                    "archive exceeds expanded-size limit"
+                                )
+                            output.write(chunk)
+                    if destination is None:
+                        files[relative_name] = _decode_entry(relative, buffer.getvalue())
+                finally:
+                    output.close()
                 if mode:
                     file_modes[relative_name] = mode
+                    if destination is not None and os.name != "nt":
+                        target.chmod(mode & 0o777)
     except zipfile.BadZipFile as exc:
         raise ArchiveNormalizationError("download is not a valid ZIP archive") from exc
     except RuntimeError as exc:
         raise ArchiveNormalizationError(f"archive extraction failed: {exc}") from exc
 
-    if sum(PurePosixPath(path).name.casefold() in _MANIFEST_NAMES for path in files) != 1:
+    if sum(PurePosixPath(path).name.casefold() in _MANIFEST_NAMES for path in file_names) != 1:
         raise ArchiveNormalizationError("normalized archive root has no unique Skill manifest")
-    return ArchiveNormalizationResult(files=files, file_modes=file_modes)
+    return ArchiveNormalizationResult(
+        files=files,
+        file_modes=file_modes,
+        file_names=tuple(file_names),
+    )
