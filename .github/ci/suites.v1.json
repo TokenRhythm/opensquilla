@@ -113,6 +113,8 @@
         "desktop/electron/scripts/test-desktop-theme-flow.mjs",
         "desktop/electron/scripts/test-windows-update-*.mjs",
         "desktop/electron/scripts/fixtures/windows-update-electron/**",
+        "desktop/electron/scripts/test-packaged-retained-interaction*.mjs",
+        "desktop/electron/scripts/fixtures/packaged-retained-interaction/**",
         "desktop/electron/src/windows-update-*.ts"
       ]
     },
@@ -243,6 +245,8 @@
         "desktop/electron/scripts/test-session-recovery-transport-contract.mjs",
         "desktop/electron/scripts/test-packaged-session-recovery.mjs",
         "desktop/electron/scripts/test-packaged-real-update-flow.mjs",
+        "desktop/electron/scripts/test-packaged-retained-interaction*.mjs",
+        "desktop/electron/scripts/fixtures/packaged-retained-interaction/**",
         "migrations/**",
         "pyproject.toml",
         "scripts/**",
@@ -298,6 +302,8 @@
         "desktop/electron/scripts/test-session-recovery-transport-contract.mjs",
         "desktop/electron/scripts/test-packaged-session-recovery.mjs",
         "desktop/electron/scripts/test-packaged-real-update-flow.mjs",
+        "desktop/electron/scripts/test-packaged-retained-interaction*.mjs",
+        "desktop/electron/scripts/fixtures/packaged-retained-interaction/**",
         "install.*",
         "pyproject.toml",
         "scripts/build_wheelhouse_zip.py",

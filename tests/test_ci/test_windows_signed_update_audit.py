@@ -112,10 +112,44 @@ $global:SyntheticVersion = $options.BaselineVersion
 $global:TargetExecutable = Join-Path $options.InstallRoot 'OpenSquilla.exe'
 $global:CreatedAt = [datetime]::UtcNow.AddSeconds(-1)
 $global:QuitObserved = $false
-function Get-CimInstance { param($ClassName, $Filter, $ErrorAction)
-  if ($Filter -eq 'ProcessId=42' -and -not $global:QuitObserved) {
+function Test-SignedAuditElevated { return $env:AUDIT_ELEVATED -eq '1' }
+function Get-CimInstance {
+  [CmdletBinding()] param($ClassName, $Filter)
+  if ($Filter -eq "Name='OpenSquilla.exe'") {
+    $global:Calls.Add('poll-own-processes')
+    if ($env:AUDIT_FAIL -eq 'polling') { throw 'Synthetic CIM access denied.' }
+    if ($global:SyntheticVersion -eq '0.5.7' -and -not $global:QuitObserved) {
+      return [pscustomobject]@{
+        ProcessId = 42; ParentProcessId = 9; CreationDate = $global:CreatedAt
+        ExecutablePath = $global:TargetExecutable
+        CommandLine = '"OpenSquilla.exe" "--updated"'
+      }
+    }
+    return
+  }
+  if ($Filter -eq 'ProcessId=42' -and $global:QuitObserved) {
+    if ($env:AUDIT_FAIL -eq 'quit-cim-error') {
+      $global:Calls.Add('quit-cim-error')
+      Write-Error 'Synthetic CIM query unavailable; the original B is still alive.'
+      return
+    }
+    if ($env:AUDIT_FAIL -in @('quit-pid-reused', 'quit-still-alive')) {
+      $global:Calls.Add($env:AUDIT_FAIL)
+      $created = if ($env:AUDIT_FAIL -eq 'quit-pid-reused') {
+        $global:CreatedAt.AddSeconds(1)
+      } else { $global:CreatedAt }
+      return [pscustomobject]@{
+        ProcessId = 42; ExecutablePath = $global:TargetExecutable; CreationDate = $created
+      }
+    }
+    return
+  }
+  if ($Filter -eq 'ProcessId=42') {
+    $created = if ($env:AUDIT_FAIL -eq 'postinstall-pid-reused') {
+      $global:CreatedAt.AddSeconds(1)
+    } else { $global:CreatedAt }
     return [pscustomobject]@{
-      ExecutablePath = $global:TargetExecutable; CreationDate = $global:CreatedAt
+      ExecutablePath = $global:TargetExecutable; CreationDate = $created
     }
   }
 }
@@ -153,18 +187,26 @@ function node {
     $global:Calls.Add('handoff')
     if ($env:AUDIT_FAIL -eq 'handoff') { $global:LASTEXITCODE = 1; return }
     $when = [datetime]::UtcNow.AddSeconds(-1)
-    @{
+    $global:CreatedAt = $when.AddMilliseconds(1)
+    $credentialPath = Join-Path $options.UserDataDir 'desktop-credential.json'
+    $credentialHash = (Get-FileHash -LiteralPath $credentialPath -Algorithm SHA256).Hash
+    $handoff = @{
       stage = 'installer-handoff'; handoffObserved = $true; requiresPostInstallVerification = $true
       ok = $false; fromVersion = $options.BaselineVersion; toVersion = '0.5.7'
       sha256 = $options.CandidateInstallerSha256; sourceSha = $options.CandidateSourceSha
       handoffStartedAt = $when.ToString('o'); oldPid = 41
-    } | ConvertTo-Json | Set-Content (Get-ArgumentValue $values '--ready-output')
+      credentialSha256 = $credentialHash.ToLowerInvariant()
+    }
+    if ($env:AUDIT_FAIL -eq 'handoff-missing-credential') { $handoff.Remove('credentialSha256') }
+    if ($env:AUDIT_FAIL -eq 'handoff-stale-credential') { $handoff.credentialSha256 = '0' * 64 }
+    $handoff | ConvertTo-Json | Set-Content (Get-ArgumentValue $values '--ready-output')
     $global:SyntheticVersion = '0.5.7'
+    [IO.File]::WriteAllText($global:TargetExecutable, 'synthetic installed B')
     # A shell broker parent is valid observation, never machine causality proof.
-    $global:Queue.Enqueue([pscustomobject]@{
+    if ($global:Queue) { $global:Queue.Enqueue([pscustomobject]@{
       Pid = 42; ParentPid = 9; StartedAt = [datetime]::UtcNow; CreatedAt = $global:CreatedAt
       Path = $global:TargetExecutable; CommandLine = '"OpenSquilla.exe" "--updated"'
-    })
+    }) }
     return
   }
   if ($name -eq 'test-packaged-first-send-renderer.mjs') {
@@ -176,19 +218,71 @@ function node {
     }
     New-Item -ItemType Directory -Path $fresh | Out-Null
     if ($env:AUDIT_FAIL -eq 'first-send') { $global:LASTEXITCODE = 1 }
+    if ($env:AUDIT_FAIL -eq 'credential-changed') {
+      $credentialPath = Join-Path $options.UserDataDir 'desktop-credential.json'
+      [IO.File]::WriteAllText($credentialPath, 'changed retained credential')
+    }
     return
   }
-  if ($name -eq 'test-packaged-session-recovery.mjs') {
-    $global:Calls.Add('retained-session-recovery')
-    if ((Get-ArgumentValue $values '--user-data-dir') -ne $options.UserDataDir -or
-        (Get-ArgumentValue $values '--session-key') -ne
-          'agent:main:webchat:release-recovery-long-session' -or
-        (Get-ArgumentValue $values '--switch-session-key') -ne
-          'agent:main:webchat:release-recovery-switch-session' -or
-        (Get-ArgumentValue $values '--label') -ne 'signed-update-audit') {
-      throw 'Retained probe arguments do not match seed.'
+  if ($name -eq 'test-packaged-retained-interaction.mjs') {
+    $global:Calls.Add('retained-interaction')
+    $markerPath = Get-ArgumentValue $values '--audit-manifest'
+    $output = Get-ArgumentValue $values '--output-dir'
+    if ($markerPath -cne (Join-Path $options.UserDataDir 'retained-interaction-audit.json') -or
+        $output -cne (Join-Path $options.EvidenceRoot 'retained-interaction') -or
+        (Test-Path -LiteralPath $output)) {
+      throw 'Retained probe must bind the native retained profile and a fresh output directory.'
     }
-    if ($env:AUDIT_FAIL -eq 'session') { $global:LASTEXITCODE = 1 }
+    $marker = Get-Content -LiteralPath $markerPath -Raw | ConvertFrom-Json
+    if ($marker.schemaVersion -ne 1 -or
+        $marker.purpose -cne 'opensquilla-synthetic-signed-update-audit' -or
+        $marker.auditId -cnotmatch '^[0-9a-f]{32}$' -or
+        $marker.seedLabel -cne 'signed-update-audit' -or
+        $marker.userDataDir -cne $options.UserDataDir -or
+        $marker.executablePath -cne $global:TargetExecutable -or
+        $marker.expectedVersion -cne '0.5.7' -or
+        $marker.sourceSha -cne $options.CandidateSourceSha -or
+        $marker.externalSentinelsDir -cne (Join-Path $options.EvidenceRoot 'external-sentinels')) {
+      throw 'Retained marker does not bind this installed B and retained profile.'
+    }
+    $boundFiles = @{
+      executableSha256 = $global:TargetExecutable
+      credentialSha256 = Join-Path $options.UserDataDir 'desktop-credential.json'
+      configSha256 = Join-Path (Join-Path $options.UserDataDir 'opensquilla') 'config.toml'
+    }
+    foreach ($key in $boundFiles.Keys) {
+      $hash = (Get-FileHash -LiteralPath $boundFiles[$key] -Algorithm SHA256).Hash
+      if ($marker.$key -cne $hash.ToLowerInvariant()) {
+        throw "Retained marker does not pin actual input bytes: $key"
+      }
+    }
+    if ($env:AUDIT_FAIL -eq 'retained-missing-report') { return }
+    New-Item -ItemType Directory -Path $output | Out-Null
+    $markerHash = (Get-FileHash -LiteralPath $markerPath -Algorithm SHA256).Hash
+    $report = @{
+      schemaVersion = 1; ok = $true; status = 'passed'; auditId = $marker.auditId
+      sourceSha = $marker.sourceSha; executableSha256 = $marker.executableSha256
+      credentialSha256 = $marker.credentialSha256; configSha256 = $marker.configSha256
+      markerSha256 = $markerHash.ToLowerInvariant()
+      credentialPreserved = $true; configPreserved = $true; oldSessionsVerified = $true
+      oldSessionsUiVerified = $true; firstSendVerified = $true; toolReadVerified = $true
+      stopVerified = $true; restartVerified = $true; normalQuitVerified = $true
+    }
+    switch ($env:AUDIT_FAIL) {
+      'retained-stale-audit' { $report.auditId = '0' * 32 }
+      'retained-wrong-source' { $report.sourceSha = 'c' * 40 }
+      'retained-wrong-executable' { $report.executableSha256 = 'd' * 64 }
+      'retained-wrong-status' { $report.status = 'running' }
+      'retained-not-ok' { $report.ok = $false }
+      'retained-string-ok' { $report.ok = 'true' }
+      'retained-numeric-ok' { $report.ok = 1 }
+      'retained-proof-missing' { $report.Remove($env:AUDIT_PROOF) }
+      'retained-proof-false' { $report[$env:AUDIT_PROOF] = $false }
+      'retained-proof-string' { $report[$env:AUDIT_PROOF] = 'true' }
+      'retained-proof-numeric' { $report[$env:AUDIT_PROOF] = 1 }
+    }
+    $report | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $output 'report.json')
+    if ($env:AUDIT_FAIL -eq 'retained-exit') { $global:LASTEXITCODE = 1 }
     return
   }
   throw "Unexpected node command: $name"
@@ -198,7 +292,15 @@ function python {
   $global:Calls.Add("profile-$($values[1])")
   $global:LASTEXITCODE = 0
   if ($values[1] -eq 'seed') {
-    New-Item -ItemType Directory -Path (Get-ArgumentValue $values '--home') | Out-Null
+    $profile = Get-ArgumentValue $values '--home'
+    New-Item -ItemType Directory -Path $profile | Out-Null
+    $userData = Split-Path $profile -Parent
+    [IO.File]::WriteAllText((Join-Path $profile 'config.toml'), 'config_version = 1')
+    [IO.File]::WriteAllText((Join-Path $userData 'desktop-credential.json'),
+      '{"credential":"synthetic-no-access"}')
+    if ($env:AUDIT_FAIL -eq 'marker-existing') {
+      [IO.File]::WriteAllText((Join-Path $userData 'retained-interaction-audit.json'), '{}')
+    }
   } elseif ($values[1] -eq 'verify-runtime') {
     if ($env:AUDIT_FAIL -eq 'preservation') { $global:LASTEXITCODE = 1 }
   } else { throw 'Unexpected profile operation.' }
@@ -231,7 +333,7 @@ catch { $code = 1; $failure = $_.Exception.Message }
         ("signature-2", "signature-2"),
         ("quit", "normal-quit"),
         ("first-send", "first-send-new-profile"),
-        ("session", "retained-session-recovery"),
+        ("retained-exit", "retained-interaction"),
         ("preservation", "profile-verify-runtime"),
     ],
 )
@@ -253,22 +355,223 @@ def test_signed_audit_orchestration_stays_incomplete_and_stops_on_failure(
         "ok",
         "releaseGatePassed",
         "automaticRestartVerified",
-        "stopAndRestartVerified",
-        "toolCallVerified",
+        "sessionRecoveryVerified",
     ):
         assert result[unproven] is False
     if not failure:
         assert result["stage"] == "postinstall-verified-with-gaps"
-        assert result["firstSendScope"] == "new synthetic profile only"
+        assert result["firstSendScope"] == (
+            "retained upgraded synthetic profile; loopback synthetic provider"
+        )
         assert result["installedVersionVerified"] is True
         assert result["installedSignaturesVerified"] is True
-        assert result["sessionRecoveryVerified"] is True
+        assert result["retainedSessionsVerified"] is True
+        assert result["toolCallVerified"] is True
+        assert result["stopAndRestartVerified"] is True
+        assert result["credentialPreserved"] is True
         assert result["profilePreserved"] is True
         assert result["normalQuitObserved"] is True
+        assert "retained-session-recovery" not in execution["calls"]
         assert "operator confirmed" in result["restartAttestation"]
         assert execution["calls"].index("observe-before-click") < execution["calls"].index(
             "handoff"
         )
+        marker_path = Path(environment["AUDIT_NATIVE_PROFILE"]) / "retained-interaction-audit.json"
+        marker = json.loads(marker_path.read_text(encoding="utf-8-sig"))
+        report = json.loads(
+            Path(result["retainedInteractionReport"]).read_text(encoding="utf-8-sig")
+        )
+        assert report["auditId"] == marker["auditId"]
+        assert report["sourceSha"] == "b" * 40
+        assert report["executableSha256"] == hashlib.sha256(b"synthetic installed B").hexdigest()
+        assert report["markerSha256"] == hashlib.sha256(marker_path.read_bytes()).hexdigest()
+        credential = Path(environment["AUDIT_NATIVE_PROFILE"]) / "desktop-credential.json"
+        handoff = json.loads((evidence / "handoff.json").read_text(encoding="utf-8-sig"))
+        assert report["credentialSha256"] == handoff["credentialSha256"]
+        assert report["credentialSha256"] == hashlib.sha256(credential.read_bytes()).hexdigest()
+
+
+@pytest.mark.parametrize("failure", ["", "polling", "elevated"])
+def test_standard_user_observation_does_not_require_elevating_the_client(
+    audit_harness: tuple[Path, dict[str, str], Path], failure: str
+) -> None:
+    runner, environment, evidence = audit_harness
+    path = Path(environment["AUDIT_INPUT"])
+    options = json.loads(path.read_text(encoding="utf-8"))
+    options["ProcessObservationMode"] = "standard-user-polling"
+    path.write_text(json.dumps(options), encoding="utf-8")
+    run = _powershell(
+        runner,
+        **environment,
+        AUDIT_FAIL=failure,
+        AUDIT_ELEVATED="1" if failure == "elevated" else "0",
+    )
+    assert run.returncode == 0, run.stdout + run.stderr
+    execution = json.loads(Path(environment["AUDIT_OUTPUT"]).read_text(encoding="utf-8-sig"))
+    assert execution["code"] == (1 if failure else 2), execution
+    assert "observe-before-click" not in execution["calls"]
+    if failure:
+        assert "profile-seed" not in execution["calls"]
+        assert "handoff" not in execution["calls"]
+        assert not Path(environment["AUDIT_NATIVE_PROFILE"]).exists()
+    else:
+        assert execution["calls"].index("poll-own-processes") < execution["calls"].index("handoff")
+        result = json.loads((evidence / "result.json").read_text(encoding="utf-8-sig"))
+        assert result["processObservationMode"] == "standard-user-polling"
+        assert result["clientLauncherElevated"] is False
+        assert result["restartObservation"]["Pid"] == 42
+        assert result["normalQuitObserved"] is True
+        assert result["automaticRestartVerified"] is False
+        assert result["releaseGatePassed"] is False
+        assert result["toolCallVerified"] is True
+        assert result["stopAndRestartVerified"] is True
+        assert result["retainedSessionsVerified"] is True
+        assert result["sessionRecoveryVerified"] is False
+
+
+def _run_audit_case(
+    harness: tuple[Path, dict[str, str], Path],
+    *,
+    failure: str,
+    mode: str = "cim-trace",
+    proof: str = "",
+) -> tuple[dict, dict]:
+    runner, environment, evidence = harness
+    path = Path(environment["AUDIT_INPUT"])
+    options = json.loads(path.read_text(encoding="utf-8"))
+    options["ProcessObservationMode"] = mode
+    path.write_text(json.dumps(options), encoding="utf-8")
+    run = _powershell(runner, **environment, AUDIT_FAIL=failure, AUDIT_PROOF=proof)
+    assert run.returncode == 0, run.stdout + run.stderr
+    execution = json.loads(Path(environment["AUDIT_OUTPUT"]).read_text(encoding="utf-8-sig"))
+    result = json.loads((evidence / "result.json").read_text(encoding="utf-8-sig"))
+    return execution, result
+
+
+@pytest.mark.parametrize("mode", ["cim-trace", "standard-user-polling"])
+@pytest.mark.parametrize("failure", ["quit-cim-error", "quit-pid-reused", "quit-still-alive"])
+def test_quit_requires_a_successful_cim_query_and_uses_creation_identity(
+    audit_harness: tuple[Path, dict[str, str], Path], mode: str, failure: str
+) -> None:
+    execution, result = _run_audit_case(audit_harness, failure=failure, mode=mode)
+    old_identity_exited = failure == "quit-pid-reused"
+    assert execution["code"] == (2 if old_identity_exited else 1), execution
+    assert failure in execution["calls"]
+    assert result["normalQuitObserved"] is old_identity_exited
+    assert ("retained-interaction" in execution["calls"]) is old_identity_exited
+    assert result["ok"] is False
+    assert result["releaseGatePassed"] is False
+    if failure == "quit-cim-error":
+        assert "Synthetic CIM query unavailable" in result["error"]
+        assert "first-send-new-profile" not in execution["calls"]
+    elif failure == "quit-still-alive":
+        assert "did not exit after Quit" in result["error"]
+        assert "first-send-new-profile" not in execution["calls"]
+    else:
+        assert result["quitProcessSnapshot"][0]["Pid"] == 42
+        assert result["toolCallVerified"] is True
+
+
+@pytest.mark.parametrize("mode", ["cim-trace", "standard-user-polling"])
+def test_restart_pid_reuse_is_rejected_before_postinstall_quit(
+    audit_harness: tuple[Path, dict[str, str], Path], mode: str
+) -> None:
+    execution, result = _run_audit_case(audit_harness, failure="postinstall-pid-reused", mode=mode)
+    assert execution["code"] == 1
+    assert "changed identity before postinstall verification" in result["error"]
+    assert "normal-quit" not in execution["calls"]
+    assert "retained-interaction" not in execution["calls"]
+    assert result["normalQuitObserved"] is False
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        "retained-missing-report",
+        "retained-stale-audit",
+        "retained-wrong-source",
+        "retained-wrong-executable",
+        "retained-wrong-status",
+        "retained-not-ok",
+        "retained-string-ok",
+        "retained-numeric-ok",
+    ],
+)
+def test_retained_probe_requires_a_current_successful_bound_report(
+    audit_harness: tuple[Path, dict[str, str], Path], failure: str
+) -> None:
+    execution, result = _run_audit_case(audit_harness, failure=failure)
+    assert execution["code"] == 1, execution
+    assert execution["calls"][-1] == "retained-interaction"
+    assert result["stage"] == "failed"
+    assert result["toolCallVerified"] is False
+    assert result["stopAndRestartVerified"] is False
+    assert result.get("retainedSessionsVerified", False) is False
+    assert result["ok"] is False
+    assert result["releaseGatePassed"] is False
+
+
+@pytest.mark.parametrize("failure", ["retained-proof-missing", "retained-proof-false"])
+@pytest.mark.parametrize(
+    "proof",
+    [
+        "credentialPreserved",
+        "configPreserved",
+        "oldSessionsVerified",
+        "oldSessionsUiVerified",
+        "firstSendVerified",
+        "toolReadVerified",
+        "stopVerified",
+        "restartVerified",
+        "normalQuitVerified",
+    ],
+)
+def test_retained_probe_cannot_omit_any_required_proof(
+    audit_harness: tuple[Path, dict[str, str], Path], failure: str, proof: str
+) -> None:
+    execution, result = _run_audit_case(audit_harness, failure=failure, proof=proof)
+    assert execution["code"] == 1, execution
+    assert f"lacks proof: {proof}" in result["error"]
+    assert execution["calls"][-1] == "retained-interaction"
+    assert result["toolCallVerified"] is False
+    assert result["stopAndRestartVerified"] is False
+    assert result["profilePreserved"] is False
+    assert result["releaseGatePassed"] is False
+
+
+@pytest.mark.parametrize("failure", ["retained-proof-string", "retained-proof-numeric"])
+def test_retained_probe_proofs_must_be_json_booleans(
+    audit_harness: tuple[Path, dict[str, str], Path], failure: str
+) -> None:
+    execution, result = _run_audit_case(audit_harness, failure=failure, proof="credentialPreserved")
+    assert execution["code"] == 1, execution
+    assert "lacks proof: credentialPreserved" in result["error"]
+    assert result["toolCallVerified"] is False
+    assert result["releaseGatePassed"] is False
+
+
+@pytest.mark.parametrize(
+    ("failure", "last_call"),
+    [
+        ("handoff-missing-credential", "handoff"),
+        ("handoff-stale-credential", "first-send-new-profile"),
+        ("credential-changed", "first-send-new-profile"),
+        ("marker-existing", "first-send-new-profile"),
+    ],
+)
+def test_retained_inputs_must_match_the_handoff_and_have_a_fresh_marker(
+    audit_harness: tuple[Path, dict[str, str], Path], failure: str, last_call: str
+) -> None:
+    execution, result = _run_audit_case(audit_harness, failure=failure)
+    assert execution["code"] == 1, execution
+    assert execution["calls"][-1] == last_call
+    assert "retained-interaction" not in execution["calls"]
+    assert result["toolCallVerified"] is False
+    assert result["releaseGatePassed"] is False
+    if failure in {"handoff-stale-credential", "credential-changed"}:
+        assert "credential changed between A handoff" in result["error"]
+    elif failure == "marker-existing":
+        assert "ownership marker already exists" in result["error"]
 
 
 @pytest.mark.parametrize(

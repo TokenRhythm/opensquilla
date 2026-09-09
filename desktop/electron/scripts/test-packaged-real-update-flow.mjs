@@ -111,7 +111,11 @@ try {
   app = await launchPackagedCandidate({
     executablePath,
     userDataDir,
-    model: 'opensquilla-real-updater-rehearsal',
+    // The signed A-to-B audit retains the original seed provider. Changing it
+    // here would turn post-upgrade credential preservation into a false claim.
+    model: signedHandoff
+      ? 'opensquilla-release-session-recovery-smoke'
+      : 'opensquilla-real-updater-rehearsal',
     scrubProviderSecrets: true,
     env: {
       GITHUB_ACTIONS: '0',
@@ -264,6 +268,8 @@ try {
     const installer = resolve(userDataDir, 'update-downloads', installerName)
     const actualSha256 = createHash('sha256').update(await readFile(installer)).digest('hex')
     assert.equal(actualSha256, expectedSha256, 'verified cache does not match the signed candidate artifact')
+    const credentialSha256 = createHash('sha256')
+      .update(await readFile(resolve(userDataDir, 'desktop-credential.json'))).digest('hex')
     const handoffStartedAt = new Date().toISOString()
     const closed = once(app, 'close')
     const indicator = page.locator('[data-testid="desktop-update-indicator"]')
@@ -295,6 +301,7 @@ try {
       sourceSha,
       downloadedInstaller: installer,
       sha256: actualSha256,
+      credentialSha256,
       handoffStartedAt,
       oldProcessClosedAt: new Date().toISOString(),
       desktopLog: resolve(userDataDir, 'logs', 'desktop.log'),
