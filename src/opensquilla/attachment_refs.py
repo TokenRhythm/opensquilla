@@ -16,6 +16,7 @@ from opensquilla.paths import native_io_path
 ATTACHMENT_REF_KIND = "attachment_ref"
 TRANSCRIPT_MATERIAL_STORE = "transcript"
 PENDING_CHAT_INPUT_MATERIAL_STORE = "pending_chat_input"
+INPUT_MATERIAL_STORE = "inputs"
 _PENDING_CHAT_INPUT_DIR = ".pending-chat-inputs"
 _PENDING_CHAT_INPUT_MANIFEST = ".manifest.json"
 _PENDING_CHAT_INPUT_PROMOTIONS = ".promotions.json"
@@ -39,6 +40,30 @@ def is_attachment_ref(attachment: Any) -> bool:
 
 def transcript_material_dir(media_root: Path, session_id: str) -> Path:
     return Path(media_root) / "transcripts" / session_id
+
+
+def inputs_material_dir(media_root: Path, owner: str, resource_id: str) -> Path:
+    """Return the managed original-file directory for an input resource."""
+    owner_segment = _safe_material_segment(owner, fallback="owner")
+    resource_segment = _safe_material_segment(resource_id, fallback="resource")
+    return Path(media_root) / "inputs" / owner_segment / resource_segment
+
+
+def inputs_material_path(
+    media_root: Path,
+    owner: str,
+    resource_id: str,
+    filename: str,
+) -> Path:
+    return inputs_material_dir(media_root, owner, resource_id) / _safe_material_segment(
+        filename, fallback="attachment"
+    )
+
+
+def _safe_material_segment(value: str, *, fallback: str) -> str:
+    cleaned = str(value).replace("\\", "/").split("/")[-1].replace("\x00", "").strip()
+    cleaned = "".join(ch if ch.isalnum() or ch in "._-" else "_" for ch in cleaned)
+    return cleaned[:180] or fallback
 
 
 def _validate_sha256(value: Any) -> str:
@@ -98,18 +123,31 @@ def pending_chat_input_material_path(
 
 
 def _media_disk_usage_bytes(media_root: Path) -> int:
-    root = Path(media_root) / "transcripts"
-    native_root = native_io_path(root)
-    if not native_root.exists():
-        return 0
     total = 0
-    for path in native_root.rglob("*"):
-        try:
-            if path.is_file():
-                total += path.stat().st_size
-        except OSError:
+    for root in (Path(media_root) / "transcripts", Path(media_root) / "inputs"):
+        native_root = native_io_path(root)
+        if not native_root.exists():
             continue
+        for path in native_root.rglob("*"):
+            try:
+                if path.is_file():
+                    total += path.stat().st_size
+            except OSError:
+                continue
     return total
+
+
+def cleanup_inputs_material(media_root: Path, owner: str, resource_id: str) -> bool:
+    """Remove one managed original resource after its lease expires."""
+    path = native_io_path(inputs_material_dir(media_root, owner, resource_id))
+    if not path.is_dir() or path.is_symlink():
+        return False
+    shutil.rmtree(path)
+    try:
+        path.parent.rmdir()
+    except OSError:
+        pass
+    return True
 
 
 def _atomic_write_bytes(path: Path, data: bytes) -> None:
@@ -642,6 +680,26 @@ def attachment_ref_marker(
 
 
 def read_attachment_ref_bytes(ref: dict[str, Any], *, media_root: Path) -> bytes:
+    path = attachment_ref_material_path(ref, media_root=media_root)
+    payload = native_io_path(path).read_bytes()
+    sha = _validate_sha256(ref.get("sha256") or ref.get("material_id"))
+    actual_sha = hashlib.sha256(payload).hexdigest()
+    if actual_sha != sha:
+        raise ValueError("attachment material hash mismatch")
+    size = ref.get("size")
+    if isinstance(size, int) and size >= 0 and len(payload) != size:
+        raise ValueError("attachment material size mismatch")
+    return payload
+
+
+def attachment_ref_material_path(ref: dict[str, Any], *, media_root: Path) -> Path:
+    """Resolve a managed reference to its current material path.
+
+    Persisted references carry a logical store and resource identity; callers
+    must resolve the path from those fields at read time.  In particular, a
+    transcript reference is scoped to the supplied reference owner and never
+    accepts an arbitrary path supplied by a client or transcript envelope.
+    """
     if not is_attachment_ref(ref):
         raise ValueError("attachment is not a material ref")
     store = ref.get("store")
@@ -661,13 +719,16 @@ def read_attachment_ref_bytes(ref: dict[str, Any], *, media_root: Path) -> bytes
             pending_input_id,
             sha,
         )
+    elif store == INPUT_MATERIAL_STORE:
+        owner = ref.get("owner") or scope
+        resource_id = ref.get("resource_id") or ref.get("material_id")
+        name = ref.get("name")
+        if not all(isinstance(value, str) and value for value in (owner, resource_id, name)):
+            raise ValueError("input attachment ref metadata is required")
+        assert isinstance(owner, str)
+        assert isinstance(resource_id, str)
+        assert isinstance(name, str)
+        path = inputs_material_path(media_root, owner, resource_id, name)
     else:
         raise ValueError(f"unsupported attachment material store {store!r}")
-    payload = native_io_path(path).read_bytes()
-    actual_sha = hashlib.sha256(payload).hexdigest()
-    if actual_sha != sha:
-        raise ValueError("attachment material hash mismatch")
-    size = ref.get("size")
-    if isinstance(size, int) and size >= 0 and len(payload) != size:
-        raise ValueError("attachment material size mismatch")
-    return payload
+    return path

@@ -3403,3 +3403,57 @@ async def test_write_elevation_record_has_no_persistent_mount_choices(
     assert "choices" not in params
     assert params["action"]["prefix_rule"] == ["write_file"]
     assert not outside.exists()
+
+
+def test_managed_attachment_root_is_readable_without_widening_writes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir(exist_ok=True)
+    media_root = tmp_path / "media"
+    attachment = media_root / "inputs" / "owner" / "resource" / "report.pdf"
+    attachment.parent.mkdir(parents=True)
+    attachment.write_bytes(b"%PDF")
+
+    from opensquilla.sandbox.path_validation import MountDecision
+
+    monkeypatch.setattr(fs, "_active_sandbox_mounts", lambda: [])
+    monkeypatch.setattr(
+        fs,
+        "decide_path_access",
+        lambda *args, **kwargs: MountDecision(
+            status="request", normalized_path=str(attachment), access="rw", reason="outside"
+        ),
+    )
+    with tool_context(workspace) as ctx:
+        ctx.artifact_media_root = str(media_root)
+        ctx.attachment_read_roots = (str(attachment.parent),)
+        ctx.guest_safe = True
+        assert fs._sandbox_path_access_envelope(attachment, write=False) is None
+        # A read-only attachment grant must never authorize writes.
+        write_block = fs._sandbox_path_access_envelope(attachment, write=True)
+
+    assert write_block is not None
+    assert write_block["status"] == "blocked"
+
+
+def test_attachment_read_root_does_not_authorize_sibling_resource(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir(exist_ok=True)
+    media_root = tmp_path / "media"
+    allowed = media_root / "inputs" / "owner" / "resource-a"
+    sibling = media_root / "inputs" / "owner" / "resource-b" / "report.pdf"
+    allowed.mkdir(parents=True)
+    sibling.parent.mkdir(parents=True)
+    sibling.write_bytes(b"%PDF")
+
+    monkeypatch.setattr(fs, "_active_sandbox_mounts", lambda: [])
+    with tool_context(workspace) as ctx:
+        ctx.artifact_media_root = str(media_root)
+        ctx.attachment_read_roots = (str(allowed),)
+        ctx.guest_safe = True
+        assert fs._attachment_read_path_allowed(sibling) is False

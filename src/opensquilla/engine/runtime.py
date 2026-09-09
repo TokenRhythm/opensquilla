@@ -45,10 +45,9 @@ import structlog
 
 from opensquilla.artifacts import artifact_marker
 from opensquilla.attachment_refs import (
+    attachment_ref_material_path,
     is_attachment_ref,
-    make_attachment_ref,
     read_attachment_ref_bytes,
-    transcript_material_path,
 )
 from opensquilla.attachment_workspace import (
     AttachmentWorkspaceMaterializer,
@@ -61,37 +60,16 @@ from opensquilla.contracts.attachments import (
     ALLOWED_MEDIA_TYPES as _ALLOWED_ENGINE_MEDIA_TYPES,
 )
 from opensquilla.contracts.attachments import (
-    DOCX_MIME as _DOCX_MIME,
-)
-from opensquilla.contracts.attachments import (
-    EMAIL_ATTACHMENT_MIMES as _EMAIL_ATTACHMENT_MIMES,
-)
-from opensquilla.contracts.attachments import (
     IMAGE_ATTACHMENT_MIMES as _IMAGE_ATTACHMENT_MIMES,
 )
 from opensquilla.contracts.attachments import (
     MAX_ATTACHMENTS as _MAX_ATTACHMENT_COUNT,
 )
 from opensquilla.contracts.attachments import (
-    MBOX_MIME as _MBOX_MIME,
-)
-from opensquilla.contracts.attachments import (
-    MSG_MIME as _MSG_MIME,
-)
-from opensquilla.contracts.attachments import (
-    OFFICE_ATTACHMENT_MIMES as _OFFICE_ATTACHMENT_MIMES,
-)
-from opensquilla.contracts.attachments import (
     OPAQUE_MIME as _OPAQUE_MIME,
 )
 from opensquilla.contracts.attachments import (
-    PPTX_MIME as _PPTX_MIME,
-)
-from opensquilla.contracts.attachments import (
     TEXT_ATTACHMENT_MIMES as _ENGINE_TEXT_FAMILY_MIMES,
-)
-from opensquilla.contracts.attachments import (
-    XLSX_MIME as _XLSX_MIME,
 )
 from opensquilla.contracts.attachments import (
     attachment_size_limit_for_mime as _attachment_size_limit_for_mime,
@@ -4020,8 +3998,6 @@ class BootstrapSnapshot:
     report: list[BootstrapFileReport] = field(default_factory=list)
 
 
-_PDF_ATTACHMENT_TEXT_LIMIT = 200_000
-_TEXT_ATTACHMENT_TEXT_LIMIT = 200_000
 _PREVIEW_ONLY_TEXT_ATTACHMENT_CHARS = 4_000
 _PREVIEW_ONLY_TEXT_ATTACHMENT_LINES = 80
 
@@ -4081,12 +4057,6 @@ def _render_file_context_block(filename: str, mime: str, content: str) -> str:
     return f'<file name="{safe_name}" mime="{safe_mime}">\n{safe_content}\n</file>'
 
 
-def _truncate_attachment_text(text: str, *, limit: int = _PDF_ATTACHMENT_TEXT_LIMIT) -> str:
-    if len(text) <= limit:
-        return text
-    return text[:limit] + f"\n\n[attachment text truncated: {len(text)} chars total]"
-
-
 def _preview_attachment_text(
     text: str,
     *,
@@ -4108,20 +4078,51 @@ def _attachment_ref_material_path(
     attachment: dict[str, Any],
     *,
     media_root: Path | None,
+    session_id: str | None = None,
 ) -> str | None:
-    path = attachment.get("_material_path")
-    if isinstance(path, str) and path:
-        return path
     if media_root is None or not is_attachment_ref(attachment):
-        return None
-    scope = attachment.get("scope")
-    sha = attachment.get("sha256") or attachment.get("material_id")
-    if not isinstance(scope, str) or not isinstance(sha, str):
-        return None
+        path = attachment.get("_material_path")
+        return path if isinstance(path, str) and path else None
+    ref = dict(attachment)
+    # Transcript material is owned by the replaying session. Re-resolve that
+    # scope instead of trusting a path or stale parent-session scope persisted
+    # by an older envelope. Managed input refs retain their stable resource
+    # identity and owner while the current session supplies the access scope.
+    if session_id:
+        ref["scope"] = session_id
     try:
-        return str(transcript_material_path(media_root, scope, sha))
+        return str(attachment_ref_material_path(ref, media_root=media_root))
     except ValueError:
         return None
+
+
+def _historical_attachment_ref(
+    entry: dict[str, Any],
+    *,
+    session_id: str,
+    name: str,
+    mime: str,
+    size: int,
+) -> dict[str, Any]:
+    """Rebuild a managed ref from history metadata without retaining paths."""
+
+    ref: dict[str, Any] = {
+        "kind": "attachment_ref",
+        "type": mime,
+        "mime": mime,
+        "name": name,
+        "size": size,
+        "sha256": entry.get("sha256_ref"),
+        "material_id": entry.get("sha256_ref"),
+        "store": entry.get("store") or "transcript",
+        "scope": session_id,
+        "_was_staged": True,
+    }
+    for key in ("owner", "resource_id", "pending_input_id", "source"):
+        value = entry.get(key)
+        if isinstance(value, str) and value:
+            ref[key] = value
+    return ref
 
 
 def _render_preview_only_attachment_text(
@@ -4138,7 +4139,11 @@ def _render_preview_only_attachment_text(
         return "[attachment unavailable: declared text content is not valid UTF-8]"
 
     preview, truncated = _preview_attachment_text(decoded)
-    material_path = _attachment_ref_material_path(attachment, media_root=media_root)
+    material_path = _attachment_ref_material_path(
+        attachment,
+        media_root=media_root,
+        session_id=attachment.get("scope") if isinstance(attachment.get("scope"), str) else None,
+    )
     estimated_tokens = attachment.get("_material_estimated_tokens")
     estimated_line = (
         f"estimated_tokens: {estimated_tokens}"
@@ -4167,395 +4172,6 @@ def _render_preview_only_attachment_text(
         f"{preview}"
         f"{truncation}"
     )
-
-
-def _extract_pdf_attachment_text(
-    raw_bytes: bytes,
-    filename: str,
-    *,
-    cancel_check: Callable[[], None] | None = None,
-) -> str:
-    """Extract text from a PDF attachment before it reaches any provider.
-
-    PDFs are converted into plain text context so provider-specific document
-    block handling cannot silently drop files that an adapter does not know how
-    to encode.
-    """
-
-    import io
-
-    try:
-        import pdfplumber
-    except ImportError as exc:  # pragma: no cover - dependency is declared
-        raise ValueError("PDF text extraction requires pdfplumber") from exc
-
-    try:
-        page_texts: list[str] = []
-        with pdfplumber.open(io.BytesIO(raw_bytes)) as doc:
-            for index, page in enumerate(doc.pages, start=1):
-                if cancel_check is not None:
-                    cancel_check()
-                page_text = page.extract_text() or ""
-                if page_text.strip():
-                    page_texts.append(f"--- Page {index} ---\n{page_text}")
-    except Exception as exc:  # noqa: BLE001 - pdfplumber raises several parser errors
-        raise ValueError(f"PDF attachment {filename!r} could not be read: {exc}") from exc
-
-    extracted = "\n\n".join(page_texts).strip()
-    if not extracted:
-        raise ValueError(f"PDF attachment {filename!r} has no extractable text")
-    return _truncate_attachment_text(extracted)
-
-
-# Office documents are zip containers. Guard against decompression bombs by
-# rejecting archives whose declared uncompressed payload is implausibly large
-# before handing the bytes to a parser.
-_OFFICE_DECOMPRESSED_LIMIT = 200 * 1024 * 1024
-_XLSX_MAX_ROWS_PER_SHEET = 1000
-_XLSX_MAX_COLS = 64
-
-
-def _office_zip_guard(
-    raw_bytes: bytes,
-    filename: str,
-    *,
-    decompressed_limit: int | None = None,
-    batch_decompressed_budget: list[int] | None = None,
-    cancel_check: Callable[[], None] | None = None,
-) -> int:
-    # Measure the *actual* inflated size by streaming each member, not the
-    # central-directory ``file_size`` (which the uploader controls and can lie
-    # about). Reads in bounded chunks and aborts as soon as the running total
-    # crosses the limit, so a decompression bomb never inflates past the cap.
-    import io
-    import zipfile
-
-    chunk_size = 1024 * 1024
-    effective_limit = (
-        decompressed_limit
-        if isinstance(decompressed_limit, int) and decompressed_limit > 0
-        else _OFFICE_DECOMPRESSED_LIMIT
-    )
-    try:
-        with zipfile.ZipFile(io.BytesIO(raw_bytes)) as archive:
-            total = 0
-            for info in archive.infolist():
-                if cancel_check is not None:
-                    cancel_check()
-                with archive.open(info) as member:
-                    while True:
-                        if cancel_check is not None:
-                            cancel_check()
-                        block = member.read(chunk_size)
-                        if not block:
-                            break
-                        total += len(block)
-                        if batch_decompressed_budget is not None:
-                            batch_decompressed_budget[0] -= len(block)
-                        if total > effective_limit:
-                            raise ValueError(
-                                f"office attachment {filename!r} decompresses beyond "
-                                f"the {effective_limit} byte remaining batch safety limit"
-                            )
-                        if (
-                            batch_decompressed_budget is not None
-                            and batch_decompressed_budget[0] < 0
-                        ):
-                            raise ValueError(
-                                f"office attachment batch containing {filename!r} "
-                                f"decompresses beyond the {_OFFICE_DECOMPRESSED_LIMIT} "
-                                "byte safety limit"
-                            )
-            return total
-    except ValueError:
-        raise
-    except Exception as exc:  # noqa: BLE001 - zipfile raises several error types
-        raise ValueError(
-            f"office attachment {filename!r} is not a readable OOXML container: {exc}"
-        ) from exc
-
-
-def _extract_docx_text(raw_bytes: bytes) -> str:
-    import io
-
-    from docx import Document
-
-    document = Document(io.BytesIO(raw_bytes))
-    parts: list[str] = []
-    for paragraph in document.paragraphs:
-        text = paragraph.text.strip()
-        if text:
-            parts.append(text)
-    for table in document.tables:
-        for row in table.rows:
-            cells = [cell.text.strip() for cell in row.cells]
-            if any(cells):
-                parts.append(" | ".join(cells))
-    return "\n".join(parts).strip()
-
-
-def _extract_xlsx_text(raw_bytes: bytes) -> str:
-    import io
-
-    from openpyxl import load_workbook  # type: ignore[import-untyped]
-
-    workbook = load_workbook(io.BytesIO(raw_bytes), read_only=True, data_only=True)
-    try:
-        sheet_blocks: list[str] = []
-        for sheet in workbook.worksheets:
-            rows: list[str] = []
-            for row_index, row in enumerate(sheet.iter_rows(values_only=True)):
-                if row_index >= _XLSX_MAX_ROWS_PER_SHEET:
-                    rows.append(f"[sheet truncated at {_XLSX_MAX_ROWS_PER_SHEET} rows]")
-                    break
-                cells = ["" if value is None else str(value) for value in row[:_XLSX_MAX_COLS]]
-                if any(cells):
-                    rows.append(",".join(cells))
-            if rows:
-                sheet_blocks.append(f"=== Sheet: {sheet.title} ===\n" + "\n".join(rows))
-        return "\n\n".join(sheet_blocks).strip()
-    finally:
-        workbook.close()
-
-
-def _extract_pptx_text(raw_bytes: bytes) -> str:
-    import io
-
-    from pptx import Presentation
-
-    presentation = Presentation(io.BytesIO(raw_bytes))
-    slide_blocks: list[str] = []
-    for index, slide in enumerate(presentation.slides, start=1):
-        lines: list[str] = []
-        for shape in slide.shapes:
-            if not getattr(shape, "has_text_frame", False):
-                continue
-            for paragraph in shape.text_frame.paragraphs:
-                text = "".join(run.text for run in paragraph.runs).strip()
-                if text:
-                    lines.append(text)
-        notes = ""
-        if slide.has_notes_slide:
-            notes_frame = slide.notes_slide.notes_text_frame
-            if notes_frame is not None:
-                notes = notes_frame.text.strip()
-        block = f"--- Slide {index} ---"
-        if lines:
-            block += "\n" + "\n".join(lines)
-        if notes:
-            block += f"\n[Notes]\n{notes}"
-        slide_blocks.append(block)
-    return "\n\n".join(slide_blocks).strip()
-
-
-_OFFICE_EXTRACTORS: dict[str, Callable[[bytes], str]] = {
-    _DOCX_MIME: _extract_docx_text,
-    _XLSX_MIME: _extract_xlsx_text,
-    _PPTX_MIME: _extract_pptx_text,
-}
-
-
-def _extract_office_attachment_text(
-    raw_bytes: bytes,
-    filename: str,
-    media_type: str,
-    *,
-    decompressed_limit: int | None = None,
-    batch_decompressed_budget: list[int] | None = None,
-    cancel_check: Callable[[], None] | None = None,
-) -> str:
-    """Extract text from an OOXML office attachment before it reaches any provider.
-
-    docx/xlsx/pptx are zip containers that no provider adapter can encode, so they
-    are converted to bounded plain-text context, mirroring the PDF path.
-    """
-
-    extractor = _OFFICE_EXTRACTORS.get(media_type)
-    if extractor is None:  # pragma: no cover - guarded by the allow-list
-        raise ValueError(f"unsupported office media type {media_type!r}")
-    _office_zip_guard(
-        raw_bytes,
-        filename,
-        decompressed_limit=decompressed_limit,
-        batch_decompressed_budget=batch_decompressed_budget,
-        cancel_check=cancel_check,
-    )
-    if cancel_check is not None:
-        cancel_check()
-    try:
-        extracted = extractor(raw_bytes).strip()
-    except ValueError:
-        raise
-    except ImportError as exc:  # pragma: no cover - dependency is declared
-        raise ValueError(f"office text extraction requires a missing dependency: {exc}") from exc
-    except Exception as exc:  # noqa: BLE001 - parsers raise many error types
-        raise ValueError(f"office attachment {filename!r} could not be read: {exc}") from exc
-    if not extracted:
-        raise ValueError(f"office attachment {filename!r} has no extractable text")
-    if cancel_check is not None:
-        cancel_check()
-    return _truncate_attachment_text(extracted)
-
-
-_EMAIL_MAX_MESSAGES = 50
-
-
-def _strip_html_to_text(html: str) -> str:
-    """Conservative HTML -> text for email bodies.
-
-    Drops script/style/head blocks entirely (no execution, no leakage), turns
-    block tags into newlines, strips remaining tags, and unescapes entities.
-    """
-
-    import html as _html_mod
-    import re
-
-    hidden_block_re = re.compile(
-        r"(?is)<(script|style|head)\b(?:[^>]*>.*?(?:</\s*\1\s*>|$)|[^>]*$)"
-    )
-    cleaned = hidden_block_re.sub(" ", html)
-    cleaned = re.sub(r"(?i)<\s*(br|/p|/div|/tr|/li|/h[1-6])\s*>", "\n", cleaned)
-    cleaned = re.sub(r"(?s)<[^>]+>", " ", cleaned)
-    cleaned = _html_mod.unescape(cleaned)
-    lines = [line.strip() for line in cleaned.splitlines()]
-    return "\n".join(line for line in lines if line)
-
-
-def _render_one_email(message: Any) -> str:
-    headers: list[str] = []
-    for label in ("From", "To", "Cc", "Subject", "Date"):
-        value = message.get(label)
-        if value:
-            headers.append(f"{label}: {value}")
-
-    body_text = ""
-    try:
-        body_part = message.get_body(preferencelist=("plain", "html"))
-    except Exception:  # noqa: BLE001 - defensive against malformed parts
-        body_part = None
-    if body_part is not None:
-        try:
-            content = body_part.get_content()
-        except Exception:  # noqa: BLE001
-            content = ""
-        if not isinstance(content, str):
-            content = ""
-        if body_part.get_content_type() == "text/html":
-            body_text = _strip_html_to_text(content)
-        else:
-            body_text = content
-
-    attachment_lines: list[str] = []
-    try:
-        for part in message.iter_attachments():
-            name = part.get_filename() or "(unnamed)"
-            attachment_lines.append(f"  - {name} ({part.get_content_type()})")
-    except Exception:  # noqa: BLE001
-        pass
-
-    rendered = "\n".join(headers)
-    if body_text.strip():
-        rendered += "\n\n" + body_text.strip()
-    if attachment_lines:
-        rendered += "\n\n[attachments]\n" + "\n".join(attachment_lines)
-    return rendered.strip()
-
-
-def _extract_email_text(raw_bytes: bytes, media_type: str) -> str:
-    import email
-    import re
-    from email import policy
-
-    # Trust the resolved media type: the gateway sniffer/guard already settle
-    # eml-vs-mbox, so a .eml whose body happens to start with "From " is not
-    # mis-routed through the mbox splitter.
-    is_mbox = media_type == _MBOX_MIME
-    if is_mbox:
-        chunks = re.split(rb"(?m)^From .*\n", raw_bytes)
-        messages = [chunk for chunk in chunks if chunk.strip()][:_EMAIL_MAX_MESSAGES]
-        rendered: list[str] = []
-        for index, chunk in enumerate(messages, start=1):
-            message = email.message_from_bytes(chunk, policy=policy.default)
-            rendered.append(f"--- Message {index} ---\n{_render_one_email(message)}")
-        return "\n\n".join(rendered).strip()
-
-    message = email.message_from_bytes(raw_bytes, policy=policy.default)
-    return _render_one_email(message)
-
-
-def _extract_msg_text(raw_bytes: bytes) -> str:
-    import io
-
-    try:
-        import extract_msg
-    except ImportError as exc:
-        raise ValueError(
-            "Outlook .msg extraction requires the optional 'extract-msg' package "
-            "(install opensquilla[msg])"
-        ) from exc
-
-    message = extract_msg.openMsg(io.BytesIO(raw_bytes))
-    try:
-        headers: list[str] = []
-        for label, value in (
-            ("From", getattr(message, "sender", None)),
-            ("To", getattr(message, "to", None)),
-            ("Cc", getattr(message, "cc", None)),
-            ("Subject", getattr(message, "subject", None)),
-            ("Date", getattr(message, "date", None)),
-        ):
-            if value:
-                headers.append(f"{label}: {value}")
-
-        body = getattr(message, "body", None) or ""
-        if not body:
-            html_body = getattr(message, "htmlBody", None)
-            if isinstance(html_body, bytes):
-                html_body = html_body.decode("utf-8", "replace")
-            if isinstance(html_body, str) and html_body:
-                body = _strip_html_to_text(html_body)
-
-        attachment_lines: list[str] = []
-        for part in getattr(message, "attachments", None) or []:
-            name = (
-                getattr(part, "longFilename", None)
-                or getattr(part, "shortFilename", None)
-                or "(unnamed)"
-            )
-            attachment_lines.append(f"  - {name}")
-    finally:
-        try:
-            message.close()
-        except Exception:  # noqa: BLE001
-            pass
-
-    rendered = "\n".join(headers)
-    if isinstance(body, str) and body.strip():
-        rendered += "\n\n" + body.strip()
-    if attachment_lines:
-        rendered += "\n\n[attachments]\n" + "\n".join(attachment_lines)
-    return rendered.strip()
-
-
-def _extract_email_attachment_text(raw_bytes: bytes, filename: str, media_type: str) -> str:
-    """Extract text from an email attachment.
-
-    .eml/.mbox use the stdlib email/mailbox parsers (zero dependency); .msg uses
-    the optional extract-msg package and degrades gracefully if it is absent.
-    """
-
-    try:
-        if media_type == _MSG_MIME:
-            extracted = _extract_msg_text(raw_bytes).strip()
-        else:
-            extracted = _extract_email_text(raw_bytes, media_type).strip()
-    except ValueError:
-        raise
-    except Exception as exc:  # noqa: BLE001 - email parsers raise many error types
-        raise ValueError(f"email attachment {filename!r} could not be read: {exc}") from exc
-    if not extracted:
-        raise ValueError(f"email attachment {filename!r} has no extractable text")
-    return _truncate_attachment_text(extracted)
 
 
 # Strong past-tense / perfect-aspect phrases that signal the model is claiming
@@ -10571,13 +10187,12 @@ class TurnRunner:
             if not isinstance(label, str) or not label.strip():
                 label = "image"
             try:
-                ref = make_attachment_ref(
-                    sha256=sha_ref_text,
+                ref = _historical_attachment_ref(
+                    attachment,
+                    session_id=session_id,
                     name=label,
                     mime=media_type,
                     size=size,
-                    session_id=session_id,
-                    source="transcript",
                 )
                 read_attachment_ref_bytes(ref, media_root=media_root)
             except (OSError, ValueError):
@@ -15133,13 +14748,12 @@ class TurnRunner:
                 if isinstance(sha_ref, str) and sha_ref and media_root and session_id:
                     raw_size = att.get("size")
                     size = raw_size if isinstance(raw_size, int) else -1
-                    ref = make_attachment_ref(
-                        sha256=sha_ref,
+                    ref = _historical_attachment_ref(
+                        att,
+                        session_id=session_id,
                         name=label,
                         mime=media_type,
                         size=size,
-                        session_id=session_id,
-                        source="transcript",
                     )
                     try:
                         raw_bytes = read_attachment_ref_bytes(ref, media_root=media_root)
@@ -15178,7 +14792,14 @@ class TurnRunner:
             if (
                 historical_materializer is not None
                 and session_id
-                and _is_materializable_attachment_mime(media_type)
+                # Ordinary managed refs already have a canonical, scoped
+                # material path. Legacy inline envelopes may still need a
+                # compatibility workspace copy because they have no resource
+                # identity to resolve after replay.
+                and (
+                    media_type in _IMAGE_ATTACHMENT_MIMES
+                    or not isinstance(sha_ref, str)
+                )
                 and (persist_image_material or not media_type.startswith("image/"))
             ):
                 materializer = historical_materializer
@@ -15186,13 +14807,12 @@ class TurnRunner:
                 if isinstance(sha_ref, str) and sha_ref and media_root is not None:
                     raw_size = att.get("size")
                     size = raw_size if isinstance(raw_size, int) else -1
-                    ref = make_attachment_ref(
-                        sha256=sha_ref,
+                    ref = _historical_attachment_ref(
+                        att,
+                        session_id=session_id,
                         name=label,
                         mime=media_type,
                         size=size,
-                        session_id=session_id,
-                        source="transcript",
                     )
                     result = materializer.materialize(ref, session_id=session_id)
                 elif isinstance(data, str) and data:
@@ -15218,6 +14838,32 @@ class TurnRunner:
                     )
                     omitted.append(render_attachment_material_marker(result, prefix=prefix))
                     continue
+            if isinstance(sha_ref, str) and sha_ref and media_root is not None and session_id:
+                historical_size = att.get("size")
+                if not isinstance(historical_size, int):
+                    historical_size = -1
+                ref = _historical_attachment_ref(
+                    att,
+                    session_id=session_id,
+                    name=label,
+                    mime=media_type,
+                    size=historical_size,
+                )
+                material_path = _attachment_ref_material_path(
+                    ref,
+                    media_root=media_root,
+                    session_id=session_id,
+                )
+                if material_path and Path(material_path).is_file():
+                    omitted.append(
+                        f"[historical attachment available: {label} ({media_type}, "
+                        f"{ref.get('size', 0)} bytes) at {material_path}]"
+                    )
+                else:
+                    omitted.append(
+                        f"[historical attachment unavailable: {label} ({media_type})]"
+                    )
+                continue
             if media_type in _IMAGE_ATTACHMENT_MIMES:
                 marker = image_marker(
                     (
@@ -15291,16 +14937,10 @@ class TurnRunner:
     ) -> list | None:
         """Build a multimodal user message that carries the attachments.
 
-        The engine sees one normalised attachment shape. Provider
-        conversion is deliberately narrow:
-
-          * ``image/*``           -> ``ContentBlockImage`` plus a workspace
-                                     marker when a workspace is available
-          * ``application/pdf``   -> local text extraction, then ``ContentBlockText``
-          * text-family / json    -> ``ContentBlockText`` wrapped in an
-                                     ``<file name="…" mime="…">…</file>``
-                                     envelope with escaped filename and content
-                                     boundaries.
+        Images retain their canonical image blocks and material markers.
+        Ordinary files expose escaped metadata and a tool-readable workspace
+        path without extracting or inlining content. Internally archived long
+        inputs retain their bounded preview.
         """
 
         if not attachments:
@@ -15318,7 +14958,6 @@ class TurnRunner:
 
         prompt_block = ContentBlockText(text=message)
         attachment_blocks: list[Any] = []
-        office_batch_decompressed_budget = [_OFFICE_DECOMPRESSED_LIMIT]
         turn_materializer: AttachmentWorkspaceMaterializer | None = None
         image_materializer = (
             AttachmentWorkspaceMaterializer(
@@ -15357,19 +14996,31 @@ class TurnRunner:
                     media_type = normalized
                 else:
                     media_type = normalized or _OPAQUE_MIME
+            generated_preview = (
+                media_type in _ENGINE_TEXT_FAMILY_MIMES
+                and is_attachment_ref(att)
+                and att.get("_provider_inline_policy") == "preview_only"
+                and att.get("source") == "input_normalization"
+                and att.get("_generated_by") == "input_normalization"
+            )
+            needs_bytes = media_type in _IMAGE_ATTACHMENT_MIMES or generated_preview
             if is_attachment_ref(att):
                 missing_ref_marker = ""
-                if media_root is None:
-                    raise ValueError(f"attachments[{index}] media_root is required")
-                try:
-                    raw_bytes = read_attachment_ref_bytes(att, media_root=media_root)
-                except FileNotFoundError:
-                    raw_bytes = b""
-                    missing_ref_marker = "[attachment unavailable: material file is missing]"
-                except ValueError as exc:
-                    raw_bytes = b""
-                    missing_ref_marker = f"[attachment unavailable: {exc}]"
-                data = base64.b64encode(raw_bytes).decode("ascii") if raw_bytes else ""
+                raw_bytes = b""
+                if needs_bytes:
+                    if media_root is None:
+                        raise ValueError(f"attachments[{index}] media_root is required")
+                    try:
+                        raw_bytes = read_attachment_ref_bytes(att, media_root=media_root)
+                    except FileNotFoundError:
+                        missing_ref_marker = "[attachment unavailable: material file is missing]"
+                    except ValueError as exc:
+                        missing_ref_marker = f"[attachment unavailable: {exc}]"
+                data = (
+                    base64.b64encode(raw_bytes).decode("ascii")
+                    if raw_bytes and media_type in _IMAGE_ATTACHMENT_MIMES
+                    else ""
+                )
             else:
                 missing_ref_marker = ""
                 data_raw = att.get("data")
@@ -15380,11 +15031,19 @@ class TurnRunner:
                     raw_bytes = base64.b64decode(data, validate=True)
                 except (binascii.Error, ValueError) as exc:
                     raise ValueError(f"attachments[{index}].data must be valid base64") from exc
+            declared_size = att.get("size")
+            attachment_size = (
+                len(raw_bytes)
+                if raw_bytes or needs_bytes
+                else declared_size
+                if isinstance(declared_size, int) and declared_size >= 0
+                else 0
+            )
             max_bytes = _attachment_size_limit_for_mime(
                 media_type,
                 staged=(att.get("_was_staged") is True and _can_stage_attachment_mime(media_type)),
             )
-            if len(raw_bytes) > max_bytes:
+            if attachment_size > max_bytes:
                 raise ValueError(f"attachments[{index}] exceeds the {max_bytes} byte limit")
 
             name_raw = att.get("name")
@@ -15392,7 +15051,9 @@ class TurnRunner:
             material_marker = ""
             temporary_image = media_type.startswith("image/") and not persist_image_material
             materializer = image_materializer if temporary_image else turn_materializer
-            if materializer is not None:
+            if materializer is not None and (
+                media_type in _IMAGE_ATTACHMENT_MIMES or not is_attachment_ref(att)
+            ):
                 if is_attachment_ref(att):
                     result = materializer.materialize(att, session_id=session_id)
                 else:
@@ -15414,6 +15075,15 @@ class TurnRunner:
                     else "attachment unavailable"
                 )
                 material_marker = render_attachment_material_marker(result, prefix=prefix)
+            if is_attachment_ref(att) and not needs_bytes and not material_marker:
+                material_path = _attachment_ref_material_path(att, media_root=media_root)
+                if material_path and Path(material_path).is_file():
+                    material_marker = (
+                        f"[attachment available: {filename} ({media_type}, "
+                        f"{attachment_size} bytes) at {material_path}]"
+                    )
+                else:
+                    material_marker = "[attachment unavailable: tool path is unavailable]"
             if missing_ref_marker:
                 missing_text = (
                     "\n\n".join([missing_ref_marker, material_marker])
@@ -15440,98 +15110,27 @@ class TurnRunner:
                 )
                 if material_marker:
                     attachment_blocks.append(ContentBlockText(text=material_marker))
-            elif media_type == "application/pdf":
-                try:
-                    extracted_pdf_text = _extract_pdf_attachment_text(
-                        raw_bytes,
-                        filename,
-                        cancel_check=cancel_check,
-                    )
-                except ValueError as exc:
-                    extracted_pdf_text = (
-                        f"[attachment unavailable: PDF text could not be extracted: {exc}]"
-                    )
-                if material_marker:
-                    extracted_pdf_text = "\n\n".join(
-                        [
-                            extracted_pdf_text,
-                            material_marker,
-                            (
-                                "[attachment note: use the workspace path for PDF "
-                                "layout, images, colors, or edits; extracted text is "
-                                "only a preview.]"
-                            ),
-                        ]
-                    )
-                wrapped = _render_file_context_block(filename, media_type, extracted_pdf_text)
-                attachment_blocks.append(ContentBlockText(text=wrapped))
-            elif media_type in _OFFICE_ATTACHMENT_MIMES:
-                try:
-                    extracted_office_text = _extract_office_attachment_text(
-                        raw_bytes,
-                        filename,
-                        media_type,
-                        batch_decompressed_budget=office_batch_decompressed_budget,
-                        cancel_check=cancel_check,
-                    )
-                except ValueError as exc:
-                    extracted_office_text = (
-                        f"[attachment unavailable: document text could not be extracted: {exc}]"
-                    )
-                if material_marker:
-                    extracted_office_text = "\n\n".join([extracted_office_text, material_marker])
-                wrapped = _render_file_context_block(filename, media_type, extracted_office_text)
-                attachment_blocks.append(ContentBlockText(text=wrapped))
-            elif media_type in _EMAIL_ATTACHMENT_MIMES:
-                try:
-                    extracted_email_text = _extract_email_attachment_text(
-                        raw_bytes, filename, media_type
-                    )
-                except ValueError as exc:
-                    extracted_email_text = (
-                        f"[attachment unavailable: email could not be extracted: {exc}]"
-                    )
-                if material_marker:
-                    extracted_email_text = "\n\n".join([extracted_email_text, material_marker])
-                wrapped = _render_file_context_block(filename, media_type, extracted_email_text)
-                attachment_blocks.append(ContentBlockText(text=wrapped))
-            elif media_type in _ENGINE_TEXT_FAMILY_MIMES:
-                if is_attachment_ref(att) and att.get("_provider_inline_policy") == "preview_only":
-                    decoded_text = _render_preview_only_attachment_text(
-                        att,
-                        filename=filename,
-                        mime=media_type,
-                        raw_bytes=raw_bytes,
-                        media_root=media_root,
-                    )
-                else:
-                    try:
-                        decoded_text = _truncate_attachment_text(
-                            raw_bytes.decode("utf-8"),
-                            limit=_TEXT_ATTACHMENT_TEXT_LIMIT,
-                        )
-                    except UnicodeDecodeError:
-                        decoded_text = (
-                            "[attachment unavailable: declared text content is not valid UTF-8]"
-                        )
-                if material_marker:
-                    decoded_text = "\n\n".join([decoded_text, material_marker])
-                wrapped = _render_file_context_block(filename, media_type, decoded_text)
-                attachment_blocks.append(ContentBlockText(text=wrapped))
-            else:
-                # Opaque attachment: the raw bytes never reach the provider.
-                # The model gets an escaped metadata envelope plus the
-                # workspace marker so it can act on the file with tools.
-                sha = att.get("sha256") or att.get("sha256_ref")
-                details = f"[opaque attachment: {media_type}, {len(raw_bytes)} bytes"
-                if isinstance(sha, str) and sha:
-                    details += f", sha256 {sha}"
-                details += (
-                    "; content is not inlined. Inspect or convert the workspace "
-                    "copy with filesystem, shell, or code tools.]"
+            elif generated_preview:
+                preview = _render_preview_only_attachment_text(
+                    att,
+                    filename=filename,
+                    mime=media_type,
+                    raw_bytes=raw_bytes,
+                    media_root=media_root,
                 )
                 if material_marker:
-                    details = "\n\n".join([details, material_marker])
+                    preview = "\n\n".join([preview, material_marker])
+                wrapped = _render_file_context_block(filename, media_type, preview)
+                attachment_blocks.append(ContentBlockText(text=wrapped))
+            else:
+                details = (
+                    f"[file attachment: {media_type}, {attachment_size} bytes; "
+                    "content has not been read; content is not inlined. "
+                    "Use available tools to read the file when needed.]"
+                )
+                if not material_marker:
+                    material_marker = "[attachment unavailable: tool path is unavailable]"
+                details = "\n\n".join([details, material_marker])
                 wrapped = _render_file_context_block(filename, media_type, details)
                 attachment_blocks.append(ContentBlockText(text=wrapped))
 

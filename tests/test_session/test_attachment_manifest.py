@@ -146,6 +146,9 @@ def test_extracts_inline_ref_and_missing_occurrences_without_bytes_in_payload() 
                         "name": "stored.jpg",
                         "sha256_ref": sha,
                         "size": len(payload),
+                        "store": "inputs",
+                        "owner": "owner-1",
+                        "resource_id": "resource-1",
                     },
                     {
                         "name": "gone.png",
@@ -169,6 +172,10 @@ def test_extracts_inline_ref_and_missing_occurrences_without_bytes_in_payload() 
     assert inline.size == len(payload)
     assert stored.attachment_id == "att_explicit_123456"
     assert stored.material_state == MATERIAL_AVAILABLE
+    assert stored.store == "inputs"
+    assert stored.owner == "owner-1"
+    assert stored.resource_id == "resource-1"
+    assert stored.to_payload()["resource_id"] == "resource-1"
     assert missing.material_state == MATERIAL_MISSING
     assert missing.missing_reason == "material was pruned"
     assert all("data" not in occurrence.to_payload() for occurrence in occurrences)

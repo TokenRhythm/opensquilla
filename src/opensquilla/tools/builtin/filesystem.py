@@ -664,6 +664,82 @@ def _sandbox_path_access_enabled() -> bool:
     return True
 
 
+def _authorized_attachment_read_roots() -> tuple[Path, ...]:
+    """Return managed attachment roots readable by the current tool context.
+
+    Attachment material is outside the workspace and therefore must be granted
+    explicitly to the active turn. Transcript/workspace material is scoped to
+    the current session; future input resources can supply exact paths through
+    the runtime-only ``attachment_read_roots`` context attribute.
+    """
+    ctx = current_tool_context.get()
+    if ctx is None:
+        return ()
+    roots: list[Path] = []
+    media_root = getattr(ctx, "artifact_media_root", None)
+    session_id = getattr(ctx, "artifact_session_id", None)
+    if isinstance(media_root, str) and media_root and isinstance(session_id, str) and session_id:
+        from opensquilla.attachment_refs import transcript_material_dir
+
+        media_path = Path(media_root).expanduser().resolve(strict=False)
+        transcript_root = transcript_material_dir(media_path, session_id).resolve(strict=False)
+        roots.extend(
+            (
+                transcript_root,
+                (transcript_root / ".pending-chat-inputs").resolve(strict=False),
+            )
+        )
+    workspace = getattr(ctx, "workspace_dir", None)
+    if isinstance(workspace, str) and workspace and isinstance(session_id, str) and session_id:
+        from opensquilla.attachment_workspace import _safe_path_segment
+
+        workspace_path = Path(workspace).expanduser().resolve(strict=False)
+        roots.append(
+            (workspace_path / ".opensquilla" / "attachments" / _safe_path_segment(
+                session_id, fallback="session"
+            )).resolve(strict=False)
+        )
+    extra_roots = getattr(ctx, "attachment_read_roots", ())
+    if isinstance(extra_roots, (list, tuple, set, frozenset)):
+        for raw_root in extra_roots:
+            if isinstance(raw_root, (str, Path)) and str(raw_root):
+                roots.append(Path(raw_root).expanduser().resolve(strict=False))
+    return tuple(dict.fromkeys(roots))
+
+
+def _attachment_read_path_allowed(resolved: Path) -> bool:
+    """Whether *resolved* is inside an exact, read-only attachment grant."""
+    candidate = resolved.resolve(strict=False)
+    return any(_is_under_root(candidate, root) for root in _authorized_attachment_read_roots())
+
+
+def _managed_attachment_write_block(
+    resolved: Path,
+    original_path: str,
+) -> dict[str, object] | None:
+    """Reject writes to canonical attachment material, even in host mode."""
+    ctx = current_tool_context.get()
+    media_root = getattr(ctx, "artifact_media_root", None) if ctx is not None else None
+    if not isinstance(media_root, str) or not media_root:
+        return None
+    candidate = resolved.resolve(strict=False)
+    root = Path(media_root).expanduser().resolve(strict=False)
+    managed_roots = (root / "transcripts", root / "inputs")
+    if not any(_is_under_root(candidate, managed) for managed in managed_roots):
+        return None
+    return {
+        "status": "blocked",
+        "reason": "attachment_material_read_only",
+        "path": original_path,
+        "resolved_path": str(candidate),
+        "message": (
+            "Attachment originals are read-only; write the result to a workspace "
+            "or artifact."
+        ),
+        "retryable": False,
+    }
+
+
 def _active_sandbox_mounts() -> list[dict[str, object]]:
     mounts = current_tool_mounts()
     runtime = get_runtime()
@@ -755,7 +831,13 @@ def _sandbox_path_access_envelope(
     write: bool,
     approval_id: str | None = None,
 ) -> dict[str, object] | None:
+    if write:
+        managed_block = _managed_attachment_write_block(resolved, str(resolved))
+        if managed_block is not None:
+            return managed_block
     if not _sandbox_path_access_enabled():
+        return None
+    if not write and _attachment_read_path_allowed(resolved):
         return None
     if _memory_source_rel_path(resolved) is not None:
         return None

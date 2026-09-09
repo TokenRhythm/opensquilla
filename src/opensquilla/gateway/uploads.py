@@ -22,6 +22,10 @@ import asyncio
 import hashlib
 import json
 import logging
+import os
+import re
+import secrets
+import tempfile
 import time
 import uuid as _uuid
 import weakref
@@ -105,12 +109,12 @@ class _Entry:
     mime: str
     sha256: str
     size: int
-    bytes: bytes
+    path: Path
     expires_at: float
 
 
 class UploadStore:
-    """Bridge upload store: in-memory bytes + on-disk ``.meta`` markers.
+    """Bridge upload store backed by bounded, short-lived files.
 
     The store enforces the configured size and MIME caps so a malicious
     or buggy client cannot smuggle disallowed bytes past it. The route
@@ -125,8 +129,21 @@ class UploadStore:
         accept_opaque: bool = True,
         *,
         max_total_bytes: int = _DEFAULT_MAX_TOTAL_BYTES,
+        owner: str = "uploads",
     ) -> None:
         self.marker_dir: Path | None = Path(marker_dir) if marker_dir is not None else None
+        self._ephemeral_root: Path | None = None
+        self.media_root = (
+            self.marker_dir.parent if self.marker_dir is not None else None
+        )
+        if self.media_root is None:
+            self._ephemeral_root = Path(tempfile.mkdtemp(prefix="opensquilla-upload-"))
+        inputs_root = (
+            self.media_root / "inputs" if self.media_root is not None else self._ephemeral_root
+        )
+        assert inputs_root is not None
+        self.inputs_root: Path = inputs_root
+        self._owner = self._safe_filename(owner) or "uploads"
         self.ttl_seconds = ttl_seconds
         self.max_file_bytes = max_file_bytes
         self.accept_opaque = accept_opaque
@@ -141,6 +158,8 @@ class UploadStore:
         self._lock_for_locks = asyncio.Lock()
         if self.marker_dir is not None:
             native_io_path(self.marker_dir).mkdir(parents=True, exist_ok=True)
+        native_io_path(self.inputs_root).mkdir(parents=True, exist_ok=True)
+        self._restore_marked_entries()
 
     # ------------------------------------------------------------------ helpers
 
@@ -167,6 +186,53 @@ class UploadStore:
         except (OSError, json.JSONDecodeError):
             return None
 
+    def _restore_marked_entries(self) -> None:
+        if self.marker_dir is None:
+            return
+        for marker_path in native_io_path(self.marker_dir).glob("u-*.meta"):
+            file_uuid = marker_path.stem
+            marker = self._read_marker(file_uuid)
+            if not marker or self._marker_expired(marker):
+                continue
+            owner = marker.get("owner")
+            resource_id = marker.get("resource_id")
+            name = marker.get("name")
+            if not all(isinstance(v, str) and v for v in (owner, resource_id, name)):
+                continue
+            assert isinstance(owner, str)
+            assert isinstance(resource_id, str)
+            assert isinstance(name, str)
+            path = (
+                self.inputs_root
+                / self._safe_filename(owner)
+                / self._safe_filename(resource_id)
+                / self._safe_filename(name)
+            )
+            try:
+                path.resolve().relative_to(self.inputs_root.resolve())
+                if not path.is_file():
+                    continue
+                mime = marker.get("mime")
+                sha = marker.get("sha256")
+                size = marker.get("size")
+                expires_at = marker.get("expires_at")
+                if not all(isinstance(v, str) for v in (name, mime, sha)):
+                    continue
+                if not isinstance(size, int) or not isinstance(expires_at, (int, float)):
+                    continue
+                assert isinstance(name, str)
+                assert isinstance(mime, str)
+                assert isinstance(sha, str)
+                self._entries[file_uuid] = _Entry(
+                    name=name,
+                    mime=mime,
+                    sha256=sha,
+                    size=size,
+                    path=path,
+                    expires_at=float(expires_at),
+                )
+            except (OSError, ValueError):
+                continue
     def _marker_expired(self, marker: dict[str, Any]) -> bool:
         expires_at = marker.get("expires_at")
         if not isinstance(expires_at, (int, float, str)):
@@ -196,6 +262,32 @@ class UploadStore:
 
     def _now(self) -> float:
         return time.time()
+
+    @staticmethod
+    def _safe_filename(name: str) -> str:
+        value = Path(str(name)).name.replace("\x00", "").strip()
+        value = re.sub(r"[^A-Za-z0-9._@+=, -]+", "_", value).strip(" .")
+        return (value or "attachment")[:180]
+
+    def _entry_path(self, file_uuid: str, name: str) -> Path:
+        return self.inputs_root / self._owner / file_uuid / self._safe_filename(name)
+
+    @staticmethod
+    def _atomic_write(path: Path, payload: bytes) -> None:
+        native_io_path(path.parent).mkdir(parents=True, exist_ok=True, mode=0o700)
+        tmp = path.with_name(f".{path.name}.{secrets.token_hex(6)}.tmp")
+        try:
+            with open(native_io_path(tmp), "wb") as handle:
+                handle.write(payload)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.chmod(native_io_path(tmp), 0o600)
+            os.replace(native_io_path(tmp), native_io_path(path))
+        finally:
+            try:
+                native_io_path(tmp).unlink(missing_ok=True)
+            except OSError:
+                pass
 
     # ------------------------------------------------------------------ public
 
@@ -243,12 +335,13 @@ class UploadStore:
         file_uuid = f"u-{_uuid.uuid4().hex}"
         sha = hashlib.sha256(payload).hexdigest()
         expires_at = self._now() + self.ttl_seconds
+        path = self._entry_path(file_uuid, name)
         entry = _Entry(
             name=name,
             mime=normalized_mime,
             sha256=sha,
             size=len(payload),
-            bytes=payload,
+            path=path,
             expires_at=expires_at,
         )
 
@@ -273,6 +366,7 @@ class UploadStore:
                 )
             else:
                 admitted = True
+                self._atomic_write(path, payload)
                 self._entries[file_uuid] = entry
                 self._write_marker(
                     file_uuid,
@@ -282,6 +376,8 @@ class UploadStore:
                         "name": name,
                         "size": len(payload),
                         "expires_at": expires_at,
+                        "owner": self._owner,
+                        "resource_id": file_uuid,
                     },
                 )
         if not admitted:
@@ -289,6 +385,11 @@ class UploadStore:
             # of rejections cannot grow the lock dict without bound.
             async with self._lock_for_locks:
                 self._locks.pop(file_uuid, None)
+            try:
+                native_io_path(path).unlink(missing_ok=True)
+                native_io_path(path.parent).rmdir()
+            except OSError:
+                pass
             raise UploadStoreFullError(
                 f"upload store is full ({staged_total} of {self.max_total_bytes} "
                 f"bytes staged); staged uploads expire within "
@@ -315,8 +416,21 @@ class UploadStore:
             if entry.expires_at < self._now():
                 self._entries.pop(file_uuid, None)
                 self._delete_marker(file_uuid)
+                try:
+                    native_io_path(entry.path).unlink(missing_ok=True)
+                    native_io_path(entry.path.parent).rmdir()
+                except OSError:
+                    pass
                 raise AttachmentNotFoundError(file_uuid)
-            return entry.bytes, {
+            try:
+                payload = native_io_path(entry.path).read_bytes()
+            except OSError as exc:
+                self._entries.pop(file_uuid, None)
+                self._delete_marker(file_uuid)
+                raise AttachmentNotFoundError(file_uuid) from exc
+            if len(payload) != entry.size or hashlib.sha256(payload).hexdigest() != entry.sha256:
+                raise AttachmentLostInRestartError(file_uuid)
+            return payload, {
                 "name": entry.name,
                 "mime": entry.mime,
                 "sha256": entry.sha256,
@@ -329,7 +443,13 @@ class UploadStore:
         lock = await self._get_uuid_lock(file_uuid)
         async with lock:
             existed = file_uuid in self._entries
-            self._entries.pop(file_uuid, None)
+            entry = self._entries.pop(file_uuid, None)
+            if entry is not None:
+                try:
+                    native_io_path(entry.path).unlink(missing_ok=True)
+                    native_io_path(entry.path.parent).rmdir()
+                except OSError:
+                    pass
             self._delete_marker(file_uuid)
         async with self._lock_for_locks:
             self._locks.pop(file_uuid, None)
@@ -348,7 +468,13 @@ class UploadStore:
             # is in flight; this pass leaves it for the next sweep tick.
             if lock is not None and lock.locked():
                 continue
-            self._entries.pop(u, None)
+            entry = self._entries.pop(u, None)
+            if entry is not None:
+                try:
+                    native_io_path(entry.path).unlink(missing_ok=True)
+                    native_io_path(entry.path.parent).rmdir()
+                except OSError:
+                    pass
             self._delete_marker(u)
             removed.append(u)
             count += 1

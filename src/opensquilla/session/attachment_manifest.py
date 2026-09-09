@@ -308,6 +308,8 @@ def _occurrence_from_item(
             sha256=sha256_ref,
         )
 
+    raw_store = item.get("store")
+    store = raw_store if isinstance(raw_store, str) and raw_store else "transcript"
     return AttachmentOccurrence(
         attachment_id=attachment_id,
         source_entry_id=source_entry_id,
@@ -322,6 +324,22 @@ def _occurrence_from_item(
         material_state=material_state,
         created_at=created_at,
         missing_reason=missing_reason,
+        store=store,
+        owner=(
+            _bounded_text(item.get("owner"), fallback="", max_bytes=256) or None
+            if isinstance(item.get("owner"), str)
+            else None
+        ),
+        resource_id=(
+            _bounded_text(item.get("resource_id"), fallback="", max_bytes=256) or None
+            if isinstance(item.get("resource_id"), str)
+            else None
+        ),
+        pending_input_id=(
+            _bounded_text(item.get("pending_input_id"), fallback="", max_bytes=256) or None
+            if isinstance(item.get("pending_input_id"), str)
+            else None
+        ),
     )
 
 
@@ -468,6 +486,10 @@ class AttachmentOccurrence:
     source_entry_id: int | None = None
     created_at: int = 0
     missing_reason: str | None = None
+    store: str = "transcript"
+    owner: str | None = None
+    resource_id: str | None = None
+    pending_input_id: str | None = None
 
     @property
     def message_id(self) -> str:
@@ -504,6 +526,14 @@ class AttachmentOccurrence:
         }
         if self.missing_reason:
             payload["missing_reason"] = self.missing_reason
+        if self.store != "transcript":
+            payload["store"] = self.store
+            if self.owner:
+                payload["owner"] = self.owner
+            if self.resource_id:
+                payload["resource_id"] = self.resource_id
+            if self.pending_input_id:
+                payload["pending_input_id"] = self.pending_input_id
         return payload
 
     @classmethod
@@ -535,6 +565,24 @@ class AttachmentOccurrence:
             if isinstance(missing_reason_raw, str) and missing_reason_raw.strip()
             else None
         )
+        store = raw.get("store", "transcript")
+        if not isinstance(store, str) or not store:
+            store = "transcript"
+        owner = (
+            _bounded_text(raw.get("owner"), fallback="", max_bytes=256)
+            if isinstance(raw.get("owner"), str)
+            else None
+        ) or None
+        resource_id = (
+            _bounded_text(raw.get("resource_id"), fallback="", max_bytes=256)
+            if isinstance(raw.get("resource_id"), str)
+            else None
+        )
+        pending_input_id = (
+            _bounded_text(raw.get("pending_input_id"), fallback="", max_bytes=256)
+            if isinstance(raw.get("pending_input_id"), str)
+            else None
+        )
         return cls(
             attachment_id=attachment_id,
             source_entry_id=source_entry_id,
@@ -547,6 +595,10 @@ class AttachmentOccurrence:
             material_state=str(state),
             created_at=created_at,
             missing_reason=missing_reason,
+            store=store,
+            owner=owner,
+            resource_id=resource_id,
+            pending_input_id=pending_input_id,
         )
 
 
@@ -582,6 +634,22 @@ def _merge_occurrence(
         raise AttachmentManifestError(
             f"attachment ID collision for {old.attachment_id}"
         )
+    if (
+        old.store != "transcript"
+        and new.store != "transcript"
+        and (
+            old.store != new.store
+            or (old.owner and new.owner and old.owner != new.owner)
+            or (
+                old.resource_id
+                and new.resource_id
+                and old.resource_id != new.resource_id
+            )
+        )
+    ):
+        raise AttachmentManifestError(
+            f"attachment resource collision for {old.attachment_id}"
+        )
     # Prefer a usable material record over a degraded one, while retaining the
     # oldest source location for deterministic ordering.
     old_rank = (
@@ -609,6 +677,10 @@ def _merge_occurrence(
         created_at=min(old.created_at, new.created_at),
         name=(old.name if old.name != "attachment" else new.name),
         mime=(old.mime if old.mime != "application/octet-stream" else new.mime),
+        store=(old.store if old.store != "transcript" else new.store),
+        owner=old.owner or new.owner,
+        resource_id=old.resource_id or new.resource_id,
+        pending_input_id=old.pending_input_id or new.pending_input_id,
     )
 
 

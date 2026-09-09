@@ -499,14 +499,13 @@ async def test_current_turn_pdf_is_materialized_to_workspace_path(
     workspace_paths = list(
         (Path(config.workspace_dir or "") / ".opensquilla" / "attachments").glob("**/*.pdf")
     )
-    assert len(workspace_paths) == 1
-    assert workspace_paths[0].read_bytes() == pdf_bytes
+    assert workspace_paths == []
 
     sent_text = _all_provider_text(text_provider.calls[-1]["messages"])
-    assert "Machine Learning" in sent_text
+    assert "Machine Learning" not in sent_text
+    assert "content has not been read" in sent_text
     assert "attachment available: L11 RL.pdf (application/pdf" in sent_text
-    assert ".opensquilla/attachments/" in sent_text
-    assert workspace_paths[0].name in sent_text
+    assert str(material_path) in sent_text
 
 
 @pytest.mark.asyncio
@@ -552,7 +551,8 @@ async def test_current_turn_inline_pdf_is_materialized_to_workspace_path(
     assert workspace_paths[0].read_bytes() == pdf_bytes
 
     sent_text = _all_provider_text(text_provider.calls[-1]["messages"])
-    assert "Machine Learning" in sent_text
+    assert "Machine Learning" not in sent_text
+    assert "content has not been read" in sent_text
     assert "attachment available: L11 RL.pdf (application/pdf" in sent_text
     assert ".opensquilla/attachments/" in sent_text
     assert workspace_paths[0].name in sent_text
@@ -601,16 +601,13 @@ async def test_historical_pdf_followup_materializes_path_from_sha256_ref(
     sent_text = _all_provider_text(sent_messages)
     assert "historical attachment available: L11 RL.pdf (application/pdf" in sent_text
     assert "historical attachment omitted: L11 RL.pdf" not in sent_text
-    assert ".opensquilla/attachments/" in sent_text
+    assert "/transcripts/" in sent_text
+    assert ".opensquilla/attachments/" not in sent_text
     assert isinstance(sent_messages[-1].content, str)
     assert sent_messages[-1].content.startswith("把刚才那个 PDF")
-    workspace_paths = list(
+    assert not list(
         (Path(config.workspace_dir or "") / ".opensquilla" / "attachments").glob("**/*.pdf")
     )
-    assert len(workspace_paths) == 1
-    assert hashlib.sha256(workspace_paths[0].read_bytes()).digest() == hashlib.sha256(
-        pdf_bytes
-    ).digest()
 
 
 @pytest.mark.asyncio
@@ -849,14 +846,10 @@ async def test_attachment_filename_traversal_is_sanitized(
 
     workspace_root = Path(config.workspace_dir or "").resolve()
     workspace_paths = list((workspace_root / ".opensquilla" / "attachments").glob("**/*.pdf"))
-    assert len(workspace_paths) == 1
-    materialized = workspace_paths[0].resolve()
-    materialized.relative_to(workspace_root)
-    assert ".." not in materialized.relative_to(workspace_root).as_posix()
-    assert materialized.name.endswith("evil.pdf")
+    assert workspace_paths == []
     sent_text = _all_provider_text(text_provider.calls[-1]["messages"])
     assert "../" not in sent_text
-    assert ".opensquilla/attachments/" in sent_text
+    assert "/transcripts/" in sent_text
 
 
 @pytest.mark.asyncio
