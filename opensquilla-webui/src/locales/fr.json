@@ -2981,7 +2981,16 @@
       "clearActivity": "Effacer l’activité",
       "expandActivity": "Développer l’activité d’installation",
       "collapseActivity": "Réduire l’activité d’installation",
+      "selectSkillDirectory": "Sélectionnez un dossier de compétence",
+      "installPhase": {
+        "resolving": "Résolution de la source",
+        "downloading": "Téléchargement des fichiers",
+        "scanning": "Analyse du contenu",
+        "committing": "Enregistrement de l’installation"
+      },
       "queueStatus": {
+        "waiting": "En attente du résultat de l’installation",
+        "selection_required": "Choisir un dossier",
         "queued": "En attente",
         "installing": "Installation",
         "cancelling": "Annulation",

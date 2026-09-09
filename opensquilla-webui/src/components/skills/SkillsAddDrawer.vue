@@ -144,7 +144,7 @@
                   :data-status="item.status"
                 >
                   <span class="sk-add-queue-item__icon" aria-hidden="true">
-                    <span v-if="item.status === 'installing' || item.status === 'cancelling'" class="sk-spinner" aria-hidden="true" />
+                    <span v-if="item.status === 'installing' || item.status === 'waiting' || item.status === 'cancelling'" class="sk-spinner" aria-hidden="true" />
                     <Icon v-else-if="item.status === 'installed' || item.status === 'unchanged'" name="check" :size="18" />
                     <Icon v-else-if="item.status === 'failed' || item.status === 'unknown'" name="info" :size="18" />
                     <Icon v-else name="clock" :size="18" />
@@ -157,6 +157,7 @@
                         : t(`cronSkills.registry.queueStatus.${item.status}`) }}</span>
                     </div>
                     <code :title="item.identifier">{{ item.identifier }}</code>
+                    <p v-if="item.progress && (item.status === 'waiting' || item.status === 'installing')" aria-live="polite">{{ item.progress }}</p>
                     <p v-if="item.error" class="sk-add-queue-item__error">{{ item.error }}</p>
                     <p v-if="item.status === 'deferred'" class="sk-add-queue-item__note">
                       {{ t('cronSkills.registry.rateLimitDeferred') }}
@@ -174,6 +175,18 @@
                       class="sk-add-lifecycle"
                       :data-tone="item.lifecycleTone"
                     >{{ item.lifecycleLabel }}</span>
+                    <div v-if="item.status === 'selection_required'" role="group" :aria-label="t('cronSkills.registry.selectSkillDirectory')">
+                      <p>{{ t('cronSkills.registry.selectSkillDirectory') }}</p>
+                      <button
+                        v-for="candidate in item.candidates"
+                        :key="candidate.identifier"
+                        type="button"
+                        class="btn btn--sm btn--ghost"
+                        :disabled="installControlsBlocked"
+                        data-testid="skills-select-directory"
+                        @click="emit('retry', item.id, false, candidate.identifier)"
+                      >{{ candidate.path || candidate.name }}</button>
+                    </div>
                     <details v-if="item.diagnostics.length" class="sk-add-diagnostics">
                       <summary>{{ t('cronSkills.registry.diagnostics', { count: item.diagnostics.length }) }}</summary>
                       <div v-for="diagnostic in item.diagnostics" :key="`${diagnostic.phase}:${diagnostic.code}`">
@@ -383,6 +396,7 @@ import type {
 import {
   GITHUB_BATCH_MAX_REFERENCES,
   skillInstallRequiresRiskAcknowledgement,
+  skillInstallCandidates,
   skillRegistryOperationKey,
 } from '@/composables/skills/useSkillRegistry'
 import { skillLifecyclePresentation } from '@/composables/skills/useSkillsCatalog'
@@ -410,7 +424,7 @@ const emit = defineEmits<{
   search: []
   installGithub: []
   install: [identifier: string, source: string, displayName: string]
-  retry: [id: string, acknowledgeRisk?: boolean]
+  retry: [id: string, acknowledgeRisk?: boolean, candidateIdentifier?: string]
   cancelInstall: [source: SkillInstallSource]
   clearActivity: [source: SkillInstallSource]
 }>()
@@ -449,12 +463,12 @@ function settleActivityExpansion(source: SkillInstallSource) {
   if (props.runningSource === source
     || items.some(item => item.status === 'queued'
       || item.status === 'installing'
-      || item.status === 'cancelling')) {
+      || item.status === 'waiting' || item.status === 'cancelling')) {
     activityExpanded.value[source] = true
     return
   }
   activityExpanded.value[source] = items.some(item =>
-    item.status === 'failed' || item.status === 'unknown')
+    item.status === 'failed' || item.status === 'unknown' || item.status === 'selection_required')
 }
 
 const currentActivity = computed(() => props.activities[sourceMode.value])
@@ -470,7 +484,7 @@ function activityPhase(source: SkillInstallSource) {
   if (props.runningSource !== source) return 'terminal'
   return activity.items.some(item => item.status === 'queued'
     || item.status === 'installing'
-    || item.status === 'cancelling')
+    || item.status === 'waiting' || item.status === 'cancelling')
     ? 'installing'
     : 'refreshing'
 }
@@ -496,10 +510,11 @@ const completedCount = computed(() => currentItems.value.filter(item =>
     || item.status === 'unchanged'
     || item.status === 'failed'
     || item.status === 'unknown'
-    || item.status === 'cancelled').length)
+    || item.status === 'cancelled'
+    || item.status === 'selection_required').length)
 const currentIndex = computed(() => {
   const installing = currentItems.value.findIndex(item =>
-    item.status === 'installing' || item.status === 'cancelling')
+    item.status === 'installing' || item.status === 'waiting' || item.status === 'cancelling')
   return installing >= 0
     ? installing + 1
     : Math.min(completedCount.value + 1, currentItems.value.length)
@@ -562,7 +577,7 @@ const installAnnouncement = computed(() => {
 
 function sourceAttentionCount(source: SkillInstallSource): number {
   return props.activities[source].items.filter(item =>
-    item.status === 'failed' || item.status === 'unknown').length
+    item.status === 'failed' || item.status === 'unknown' || item.status === 'selection_required').length
 }
 
 function sourceAttentionLabel(source: SkillInstallSource): string {
@@ -694,6 +709,7 @@ const queueRows = computed(() => currentItems.value.map((item) => {
   return {
     ...item,
     requiresRiskAcknowledgement: skillInstallRequiresRiskAcknowledgement(item.result),
+    candidates: skillInstallCandidates(item.result),
     operationLabel: operationFailed
       ? t(item.result?.installed
         ? 'cronSkills.registry.existingInstallPreserved'

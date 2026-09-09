@@ -1363,6 +1363,12 @@
     },
     {
       "lifecycle": "stable",
+      "name": "skills.install.status",
+      "schema": "skills/skills-install-status.schema.json",
+      "schemaSha256": "8ed97d3207777b114f8efb90bbe9750d0964e694b2fcbcdc95f8cd12c658d57a"
+    },
+    {
+      "lifecycle": "stable",
       "name": "skills.list",
       "schema": "skills/skills-list.schema.json",
       "schemaSha256": "6a908eab50a8bd5355b9ccbfe8da690d1e52fcaeca82c1bb0e98268deff1bc52"
@@ -1473,10 +1479,10 @@
   "protocol": "opensquilla-websocket-json",
   "source": {
     "eventFamilyCount": 9,
-    "generatorSha256": "053df928840129e254a7f609e46832d8ee8ee1c241cf225632dcded3f996297e",
-    "methodCount": 217,
-    "schemaCount": 226,
-    "schemaTreeSha256": "de65ac0d9ad183c07500a98a92328888aae9615c9b5e7991e136b5e2cea8fe63"
+    "generatorSha256": "c6fa12fe23258aa7bbb5d490b43e6550d30c194c152e7e6748c2cb0a784481bd",
+    "methodCount": 218,
+    "schemaCount": 227,
+    "schemaTreeSha256": "54dfccf627fff969e1acdf4b5a459b6f0f77e9feaed7f3872d7e8cd3f7240bfc"
   },
   "wireVersion": 4
 }

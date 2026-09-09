@@ -1320,6 +1320,16 @@ async def _install_skill(
 ) -> SkillMutationResult:
     """Install a skill from a Community source."""
     operation_id = command.operation_id
+    installer = _management_service(ctx)
+    if operation_id and isinstance(installer, SkillManagementService):
+        result = await installer.install_operations.run(
+            _install_owner(ctx), operation_id,
+            {"identifier": command.identifier, "source": command.source, "force": command.force,
+             "replaceSource": command.replace_source,
+             "riskConfirmation": command.risk_confirmation},
+            lambda: _run_skill_install(command, ctx),
+        )
+        return cast(SkillMutationResult, result)
     operation_key = (
         _skill_install_operation_key(ctx, operation_id) if operation_id else None
     )
@@ -1363,7 +1373,7 @@ async def _run_skill_install(
         return {"success": False, "message": "No skill installer configured"}
 
     identifier = command.identifier
-    source_id = command.source
+    source_id = command.source or "clawhub"
     force = command.force
     replace_source = command.replace_source
     risk_confirmation = command.risk_confirmation
@@ -1427,7 +1437,12 @@ async def _cancel_skill_install(
     command: CancelSkillInstall,
     ctx: RpcContext,
 ) -> SkillCancelResult:
-    """Cancel one install owned by this connection and await its cleanup."""
+    """Cancel an owned install and wait for its commit or rollback result."""
+    installer = _management_service(ctx)
+    if isinstance(installer, SkillManagementService):
+        return cast(SkillCancelResult, await installer.install_operations.cancel(
+            _install_owner(ctx), command.operation_id,
+        ))
     operation_key = _skill_install_operation_key(ctx, command.operation_id)
     active_installs = _active_skill_installs(ctx)
     task = active_installs.get(operation_key)
@@ -1799,6 +1814,34 @@ async def _handle_skills_install(
     return await _skill_management(ctx).install(params)
 
 
+def _install_owner(ctx: RpcContext) -> str:
+    principal = ctx.principal
+    if principal.token_public_id:
+        return f"token:{principal.token_public_id}"
+    if principal.is_owner:
+        return "local-owner"
+    raise ValueError("Stable caller identity is required for Skill installation operations")
+
+
+async def _handle_skills_install_status(
+    params: dict[str, Any] | None, ctx: RpcContext,
+) -> dict[str, Any]:
+    if not isinstance(params, dict):
+        raise ValueError("params.operationId is required")
+    operation_id = GatewaySkillManagementAdapter._operation_id(params, required=True)
+    installer = _management_service(ctx)
+    if not isinstance(installer, SkillManagementService):
+        return {"operationId": operation_id, "state": "unknown", "phase": "unknown",
+                "terminal": True, "scope": ""}
+    owner = _install_owner(ctx)
+    receipt = installer.install_operations.store.read(owner, operation_id)
+    import hashlib
+    scope = hashlib.sha256(
+        f"{installer.journal_path}:{owner}".encode(),
+    ).hexdigest()
+    return {**receipt, "scope": scope}
+
+
 async def _handle_skills_install_cancel(
     params: dict[str, Any] | None,
     ctx: RpcContext,
@@ -1824,6 +1867,7 @@ for _skill_management_method, _skill_management_implementation in (
     ("skills.reload", _handle_skills_reload),
     ("skills.install", _handle_skills_install),
     ("skills.install.cancel", _handle_skills_install_cancel),
+    ("skills.install.status", _handle_skills_install_status),
     ("skills.deps.install", _handle_skills_deps_install),
     ("skills.uninstall", _handle_skills_uninstall),
 ):

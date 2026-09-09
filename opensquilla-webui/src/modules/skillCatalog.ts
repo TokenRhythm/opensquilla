@@ -13,6 +13,7 @@ import type {
 export interface SkillInstallResult {
   readonly success: boolean
   readonly cancelled?: boolean
+  readonly recoveryRequired?: boolean
   readonly unchanged?: boolean
   readonly name?: string
   readonly message?: string
@@ -80,7 +81,19 @@ export interface ProposalSettingsUpdate {
   readonly auto_enable_max_risk?: 'low' | 'medium' | 'high'
 }
 
+export interface SkillInstallStatus {
+  readonly operationId: string
+  readonly scope: string
+  readonly state: 'unknown' | 'running' | 'succeeded' | 'failed' | 'cancelled' | 'recovery_required'
+  readonly phase: string
+  readonly terminal: boolean
+  readonly progress?: Readonly<Record<string, unknown>>
+  readonly result?: SkillInstallResult
+}
+
 export interface SkillCatalog {
+  supportsInstallStatus?(): boolean
+  installStatus?(operationId: string, options?: { readonly signal?: AbortSignal }): Promise<SkillInstallStatus>
   list(options?: { readonly signal?: AbortSignal }): Promise<readonly Skill[]>
   detail(skill: Pick<Skill, 'name' | 'kind' | 'instance_id' | 'install_id' | 'active' | 'lifecycle'>, options?: {
     readonly signal?: AbortSignal

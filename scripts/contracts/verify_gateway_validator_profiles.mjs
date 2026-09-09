@@ -107,8 +107,8 @@ export async function verifyProfiles({ baselineRoot, verificationRoot } = {}) {
       result.roles++
     }
   }
-  assert.equal(result.roles, 877)
-  assert.equal(result.comparedRoles, baselineRoot ? 875 : selected.size)
+  assert.equal(result.roles, 881)
+  assert.equal(result.comparedRoles, baselineRoot ? 879 : selected.size)
   assert.deepEqual(result.rolesWithoutPositiveSeed, [], 'each role requires a positive seed')
   if (baselineRoot) assert.deepEqual(result.supplementalRoles, [
     'method:sessions.list:params', 'method:sessions.list:result',

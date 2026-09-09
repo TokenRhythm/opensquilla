@@ -322,6 +322,9 @@ class SkillTransactionJournal:
     old_lock_b64: str
     old_target_exists: bool = False
     old_target_sha256: str = ""
+    install_operation_id: str = ""
+    install_operation_owner: str = ""
+    install_receipt: dict[str, Any] | None = None
 
     @classmethod
     def prepare(
@@ -342,7 +345,11 @@ class SkillTransactionJournal:
         old_target_sha256 = (
             compute_tree_sha256(target) if old_target_exists else ""
         )
+        from opensquilla.skills.hub.operations import current_install_operation
+        install_operation = current_install_operation()
         journal = cls(
+            install_operation_id=install_operation.id if install_operation else "",
+            install_operation_owner=install_operation.owner if install_operation else "",
             operation=operation,
             phase="prepared",
             managed_root=str(managed_dir.resolve(strict=False)),
@@ -380,6 +387,11 @@ class SkillTransactionJournal:
             "old_lock_b64": self.old_lock_b64,
             "old_target_exists": self.old_target_exists,
             "old_target_sha256": self.old_target_sha256,
+            **({
+                "install_operation_id": self.install_operation_id,
+                "install_operation_owner": self.install_operation_owner,
+                "install_receipt": self.install_receipt,
+            } if self.install_operation_id else {}),
         }
 
     def write(self, path: Path) -> None:
@@ -442,6 +454,20 @@ class SkillTransactionJournal:
                 raise ValueError(
                     f"Skill transaction journal field {field!r} must be a boolean"
                 )
+        operation_id = data.get("install_operation_id", "")
+        operation_owner = data.get("install_operation_owner", "")
+        receipt = data.get("install_receipt")
+        if operation_id:
+            import uuid
+            uuid.UUID(operation_id)
+            if (not isinstance(operation_owner, str) or not operation_owner
+                    or len(operation_owner) > 512):
+                raise ValueError("Invalid install operation owner in journal")
+            if receipt is not None and (not isinstance(receipt, dict)
+                                        or type(receipt.get("success")) is not bool):
+                raise ValueError("Invalid install receipt in journal")
+        elif operation_owner or receipt is not None:
+            raise ValueError("Install receipt has no operation identity")
         phase = data["phase"]
         if phase not in _VALID_PHASES:
             raise ValueError(f"invalid Skill transaction phase: {phase}")
@@ -459,6 +485,9 @@ class SkillTransactionJournal:
             old_lock_b64=data["old_lock_b64"],
             old_target_exists=data["old_target_exists"],
             old_target_sha256=data["old_target_sha256"],
+            install_operation_id=operation_id,
+            install_operation_owner=operation_owner,
+            install_receipt=receipt,
         )
 
 
@@ -999,6 +1028,26 @@ def recover_pending_skill_transaction(
                 )
             )
             return recovered
+        if journal.install_operation_id:
+            from opensquilla.skills.hub.operations import InstallOperationStore, operation_database
+
+            store = InstallOperationStore(
+                operation_database(selected_journal), root_id=journal.managed_root_id,
+            )
+            if journal.phase == "committed" and journal.install_receipt is not None:
+                store.finish(journal.install_operation_owner, journal.install_operation_id,
+                             journal.install_receipt)
+            elif journal.phase != "committed":
+                store.finish(journal.install_operation_owner, journal.install_operation_id, {
+                    "success": False, "message": "Interrupted installation was rolled back.",
+                    "rollbackPerformed": True,
+                })
+            else:
+                store.finish(journal.install_operation_owner, journal.install_operation_id, {
+                    "success": False,
+                    "message": "Committed transaction has no recoverable receipt.",
+                    "recoveryRequired": True,
+                }, state="recovery_required")
         remove_transaction_journal(selected_journal)
         return recovered
     except Exception as exc:

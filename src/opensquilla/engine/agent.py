@@ -15116,6 +15116,16 @@ class Agent:
                                         timed_out=True,
                                     ),
                                 )
+                                if (
+                                    tc.tool_name == "skill_install_community"
+                                    and cancellation_policy == "must_settle"
+                                    and execution_task.done()
+                                    and not execution_task.cancelled()
+                                    and execution_task.exception() is None
+                                ):
+                                    # The installer settles cancellation against its durable
+                                    # commit receipt before returning. Preserve that result.
+                                    res = execution_task.result()
                         except asyncio.CancelledError:
                             if (
                                 execution_task is not None

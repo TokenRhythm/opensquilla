@@ -594,7 +594,7 @@ def create_skill_tools(
     @tool(
         name="skill_install_community",
         description=(
-            "Install a Community skill from ClawHub or another configured source. "
+            "Install a Community skill from a GitHub URL, ClawHub, or another configured source. "
             "Use only when the user clearly asked to install a specific skill identifier "
             "or chose one exact result from skill_search_community. Do not use skill_create "
             "for Community installs."
@@ -603,13 +603,12 @@ def create_skill_tools(
             "identifier": {
                 "type": "string",
                 "description": (
-                    "Exact source identifier or slug returned by skill_search_community."
+                    "GitHub repository or Skill directory URL, or an exact registry identifier."
                 ),
             },
             "source": {
                 "type": "string",
-                "description": "Source id, usually 'clawhub'.",
-                "default": "clawhub",
+                "description": "Optional source id. GitHub URLs infer github; slugs infer clawhub.",
             },
             "force": {
                 "type": "boolean",
@@ -638,10 +637,12 @@ def create_skill_tools(
         },
         required=["identifier"],
         owner_only=True,
+        execution_timeout_seconds=600,
+        cancellation_policy="must_settle",
     )
     async def skill_install_community(
         identifier: str,
-        source: str = "clawhub",
+        source: str | None = None,
         force: bool = False,
         risk_confirmation: str = "",
         replace_source: bool = False,
@@ -658,7 +659,9 @@ def create_skill_tools(
         clean_risk_confirmation = risk_confirmation.strip()
         if clean_risk_confirmation and not force:
             raise ToolError("risk_confirmation requires force=true")
-        source_id = str(source or "clawhub").strip() or "clawhub"
+        from opensquilla.skills.install_source import resolve_install_source
+
+        source_id = resolve_install_source(clean_identifier, source)
 
         installer: Any = management_service
         if installer is None:
@@ -671,13 +674,44 @@ def create_skill_tools(
             }
             installer = build_default_skill_installer(**builder_kwargs)
         if isinstance(installer, SkillManagementService):
-            result = await installer.install(
-                clean_identifier,
-                source_id,
-                force=force,
-                replace_source=replace_source,
-                risk_confirmation=clean_risk_confirmation,
-            )
+            import asyncio
+            import hashlib
+            import uuid
+
+            context = current_tool_context.get()
+            caller = f"{getattr(context, 'agent_id', '')}:{getattr(context, 'session_key', '')}"
+            owner = "agent:" + hashlib.sha256(caller.encode()).hexdigest()
+            operation_id = str(uuid.uuid4())
+
+            async def install_operation() -> dict[str, Any]:
+                installed = await installer.install(
+                    clean_identifier, source_id, force=force,
+                    replace_source=replace_source, risk_confirmation=clean_risk_confirmation,
+                )
+                return installed.to_dict()
+
+            try:
+                payload = await installer.install_operations.run(
+                    owner, operation_id,
+                    {"identifier": clean_identifier, "source": source_id, "force": force,
+                     "replaceSource": replace_source, "riskConfirmation": clean_risk_confirmation},
+                    install_operation,
+                )
+            except asyncio.CancelledError:
+                payload = await installer.install_operations.cancel(owner, operation_id)
+            payload = dict(payload)
+            payload.update({
+                "operationId": operation_id, "identifier": clean_identifier, "source": source_id,
+                "status": "installed" if payload.get("success") else "cancelled"
+                if payload.get("cancelled") else "failed",
+            })
+            if payload.get("success"):
+                payload["message"] = (
+                    f"{payload.get('message', '')} "
+                    "The current turn keeps its pinned Skill catalog; "
+                    "the installed catalog becomes observable from the next turn."
+                )
+            return json.dumps(payload)
         else:
             install = installer.install
             if replace_source and not supports_keyword_argument(install, "replace_source"):
@@ -723,7 +757,7 @@ def create_skill_tools(
                     result = exc.result
 
         serializer = getattr(result, "to_dict", None)
-        payload: dict[str, Any] = dict(serializer()) if callable(serializer) else {}
+        payload = dict(serializer()) if callable(serializer) else {}
         payload.update(
             {
                 "status": "installed" if result.success else "failed",
