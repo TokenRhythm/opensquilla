@@ -174,6 +174,18 @@
                       class="sk-add-lifecycle"
                       :data-tone="item.lifecycleTone"
                     >{{ item.lifecycleLabel }}</span>
+                    <div v-if="item.status === 'selection_required'" role="group" :aria-label="t('cronSkills.registry.selectSkillDirectory')">
+                      <p>{{ t('cronSkills.registry.selectSkillDirectory') }}</p>
+                      <button
+                        v-for="candidate in item.candidates"
+                        :key="candidate.identifier"
+                        type="button"
+                        class="btn btn--sm btn--ghost"
+                        :disabled="installControlsBlocked"
+                        data-testid="skills-select-directory"
+                        @click="emit('retry', item.id, false, candidate.identifier)"
+                      >{{ candidate.path || candidate.name }}</button>
+                    </div>
                     <details v-if="item.diagnostics.length" class="sk-add-diagnostics">
                       <summary>{{ t('cronSkills.registry.diagnostics', { count: item.diagnostics.length }) }}</summary>
                       <div v-for="diagnostic in item.diagnostics" :key="`${diagnostic.phase}:${diagnostic.code}`">
@@ -383,6 +395,7 @@ import type {
 import {
   GITHUB_BATCH_MAX_REFERENCES,
   skillInstallRequiresRiskAcknowledgement,
+  skillInstallCandidates,
   skillRegistryOperationKey,
 } from '@/composables/skills/useSkillRegistry'
 import { skillLifecyclePresentation } from '@/composables/skills/useSkillsCatalog'
@@ -410,7 +423,7 @@ const emit = defineEmits<{
   search: []
   installGithub: []
   install: [identifier: string, source: string, displayName: string]
-  retry: [id: string, acknowledgeRisk?: boolean]
+  retry: [id: string, acknowledgeRisk?: boolean, candidateIdentifier?: string]
   cancelInstall: [source: SkillInstallSource]
   clearActivity: [source: SkillInstallSource]
 }>()
@@ -694,6 +707,7 @@ const queueRows = computed(() => currentItems.value.map((item) => {
   return {
     ...item,
     requiresRiskAcknowledgement: skillInstallRequiresRiskAcknowledgement(item.result),
+    candidates: skillInstallCandidates(item.result),
     operationLabel: operationFailed
       ? t(item.result?.installed
         ? 'cronSkills.registry.existingInstallPreserved'

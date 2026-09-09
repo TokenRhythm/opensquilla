@@ -884,8 +884,8 @@ def skills_reload(
 @skills_app.command("install")
 def skills_install(
     identifier: str = typer.Argument(..., help="Skill name or identifier"),
-    source: str = typer.Option(
-        "clawhub",
+    source: str | None = typer.Option(
+        None,
         "--source",
         "-s",
         help=(
@@ -913,6 +913,9 @@ def skills_install(
 ) -> None:
     """Install a skill from a Community source."""
 
+    from opensquilla.skills.install_source import resolve_install_source
+
+    source = resolve_install_source(identifier, source)
     if risk_confirmation and not force:
         raise typer.BadParameter("--risk-confirmation requires --force")
 
