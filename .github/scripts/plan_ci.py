@@ -751,7 +751,18 @@ def _is_skill_hub_input(path: str) -> bool:
     )
 
 
+def _is_windows_retained_interaction_input(path: str) -> bool:
+    return path in {
+        "desktop/electron/scripts/test-packaged-retained-interaction.mjs",
+        "desktop/electron/scripts/test-packaged-retained-interaction-contract.mjs",
+    } or path.startswith("desktop/electron/scripts/fixtures/packaged-retained-interaction/")
+
+
 def _os_scope(path: str) -> set[str]:
+    # These neutral-named helpers belong to the signed Windows native audit.
+    # Their portable Node contract also runs in the Linux desktop-static lane.
+    if _is_windows_retained_interaction_input(path):
+        return {"windows-latest"}
     lowered = f"/{path.casefold()}"
     scopes: set[str] = set()
     if path.endswith(".ps1") or any(
@@ -1789,6 +1800,10 @@ def plan_changes(
             continue
 
         if path.startswith("desktop/"):
+            if _is_windows_retained_interaction_input(path):
+                suites.update({"python-targeted", "release-packaging"})
+                targets.add("tests/test_ci/test_windows_signed_update_audit.py")
+                reasons.add("windows_retained_interaction_contract_changed")
             os_scope = _os_scope(path)
             _add_os_reason_codes(os_scope, reasons)
             suites.update(

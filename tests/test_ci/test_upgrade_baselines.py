@@ -310,6 +310,8 @@ def rehearsal_driver(tmp_path: Path) -> tuple[str, Path]:
     (tmp_path / "packaged-smoke-helpers.mjs").write_text(
         """
 import { EventEmitter } from 'node:events'
+import { mkdir, writeFile } from 'node:fs/promises'
+import { join } from 'node:path'
 export function requiredOption(name) {
   const index = process.argv.indexOf(name)
   if (index < 0 || !process.argv[index + 1]) throw new Error(`Missing ${name}`)
@@ -318,9 +320,16 @@ export function requiredOption(name) {
 export async function waitFor(check) {
   if (!await check()) throw new Error('bridge unavailable')
 }
-export async function launchPackagedCandidate({ env }) {
+export async function launchPackagedCandidate({ env, userDataDir, model }) {
   console.log('SYNTHETIC_DESKTOP_LAUNCHED')
   const signed = process.env.SYNTHETIC_UPDATE_MODE === 'signed-handoff'
+  if (signed) {
+    if (model !== 'opensquilla-release-session-recovery-smoke') {
+      throw new Error('signed handoff must preserve the seed provider model')
+    }
+    await mkdir(userDataDir, { recursive: true })
+    await writeFile(join(userDataDir, 'desktop-credential.json'), 'synthetic retained credential')
+  }
   if (signed && (env.OPENSQUILLA_DESKTOP_ENABLE_WIN_INSTALL !== '1'
       || env.OPENSQUILLA_DESKTOP_ENABLE_WIN_UPDATE !== '0'
       || env.OPENSQUILLA_DESKTOP_MOCK_UPDATE_VERSION !== '')) {
@@ -569,6 +578,9 @@ def test_signed_handoff_records_only_handoff_until_outer_audit_verifies_install(
     assert output["fromVersion"] == "0.5.5"
     assert output["toVersion"] == "0.5.6"
     assert output["sha256"] == hashlib.sha256(b"candidate artifact").hexdigest()
+    assert (
+        output["credentialSha256"] == hashlib.sha256(b"synthetic retained credential").hexdigest()
+    )
     assert output["sourceSha"] == "a" * 40
     assert 'SYNTHETIC_UI_CLICK:[data-testid="desktop-update-indicator"]' in result.stdout
     assert 'SYNTHETIC_UI_CLICK:[data-testid="desktop-update-relaunch"]' in result.stdout

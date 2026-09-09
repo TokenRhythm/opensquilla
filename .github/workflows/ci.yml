@@ -853,6 +853,7 @@ jobs:
           node scripts/test-windows-update-integration.mjs
           node scripts/test-windows-update-refresh.mjs
           node scripts/test-windows-update-network.mjs
+          node scripts/test-packaged-retained-interaction-contract.mjs
           node scripts/test-desktop-locale.mjs
           node scripts/test-desktop-zoom-shortcuts.mjs --contracts-only
           node scripts/test-desktop-profile-substrate.mjs
@@ -1811,6 +1812,8 @@ jobs:
           # The Linux static lane covers the deterministic update contracts.
           # Windows also exercises native verification/registry boundaries and
           # the production IPC, update UI and lifecycle in isolated Electron.
+          # The retained-interaction contract is pure Node/loopback; the actual
+          # packaged native audit requires explicit artifacts and stays manual.
           if [[ "${RUNNER_OS}" == "Windows" &&
                 ( "${{ matrix.shard }}" == 'ownership' ||
                   "${{ matrix.shard }}" == 'ownership-workbench' ||
@@ -1819,6 +1822,7 @@ jobs:
               'windows-update-security:scripts/test-windows-update-security.mjs'
               'windows-update-handoff:scripts/test-windows-update-handoff.mjs'
               'windows-update-network:scripts/test-windows-update-network.mjs'
+              'packaged-retained-interaction-contract:scripts/test-packaged-retained-interaction-contract.mjs'
               'windows-update-electron:scripts/test-windows-update-electron.mjs'
             )
           fi
