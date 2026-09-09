@@ -333,7 +333,7 @@ class UploadStore:
         if not self.accept_opaque and normalized_mime not in _ALLOWED_MIMES:
             raise UploadUnsupportedMimeError(f"mime {mime!r} is not allowed")
         sniffed_mime = sniff_mime_from_bytes(payload)
-        if sniffed_mime in _ALLOWED_MIMES:
+        if normalized_mime in _ALLOWED_MIMES and sniffed_mime in _ALLOWED_MIMES:
             normalized_mime = sniffed_mime
         # Email stays non-stageable policy-wise, so its cap resolves to the
         # inline text ceiling even on this staged path. Strict deployments
