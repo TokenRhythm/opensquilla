@@ -7,6 +7,21 @@ the normal checksum, signature, cache, and shutdown gates before installation.
 The existing `OPENSQUILLA_DESKTOP_ENABLE_WIN_UPDATE` switch exercises a separate
 electron-updater path and must remain off during this rehearsal.
 
+## Product completion in the same PR
+
+The intended default Windows experience is **Check -> Download and verify ->
+Quit and install -> visible NSIS wizard -> launch the installed version**.
+Keep the implementation, restricted-network tests, native acceptance evidence,
+and the eventual default-enablement change in this PR. Passing CI while the
+entry remains opt-in does not complete that product delivery.
+
+Keep the PR Draft and the default switch off until the native matrix below is
+verified. Record the source SHAs, signed artifact hashes, installation mode,
+network conditions, and outcomes in the PR. Enable the entry in the same PR
+only after those gates pass, and verify CI again on that final change. The
+manual Show installer action remains available as a secondary action when the
+handoff is enabled and as the primary action for shells without that capability.
+
 ## Development checks
 
 From `desktop/electron`, build once and run:
@@ -19,6 +34,7 @@ node scripts/test-windows-update-handoff.mjs
 node scripts/test-windows-update-coordinator.mjs
 node scripts/test-windows-update-integration.mjs
 node scripts/test-windows-update-refresh.mjs
+node scripts/test-windows-update-network.mjs
 ```
 
 The ordinary `desktop-static` CI lane runs these deterministic contracts.
@@ -75,6 +91,34 @@ request. Download, reveal, installation and lifecycle ownership still prevent
 concurrent candidate replacement. The refresh regression runs with the handoff
 switch absent so the default Windows manual path is covered too.
 
+### Restricted networks
+
+The network regression runs the production discovery, source probing,
+checksum fetching, streaming download, hashing, and cache flow against a
+controlled transport. It rejects all non-OSS requests, including GitHub API
+and release downloads. It covers both OSS-first operation and fallback from
+GitHub, missing checksum metadata, changed bytes, and offline cache reuse.
+Windows signature results are an explicit test seam in this deterministic
+test; a passing result does not prove offline Authenticode verification.
+
+For native acceptance, test a disposable Windows 10/11 environment with GitHub
+unreachable while the complete OSS release is reachable. Include the channel
+JSON, `latest.yml`, installer, and `SHA256SUMS`; OSS promotion must occur only
+after all versioned assets and checksums have been uploaded and read back.
+Complete discovery, download, OS signature verification, cache reuse after
+restart, and the visible installer handoff under that restriction.
+
+Separately test a fresh Windows certificate cache with certificate-distribution
+and revocation endpoints unreachable, then with normal access. Record the
+system signature status, verifier elapsed time, user-visible error, retained
+download, and retry outcome. Do not clear the host certificate cache or change
+the host firewall for this test. The production verifier uses Windows system
+trust and a bounded PowerShell process; it does not promise a network-free
+certificate-chain check. Verification unavailable must remain distinct from
+successful verification, and retry must not abandon the client or its data.
+These checks also gate the new signature verification on the manual download
+path: leaving Quit and install disabled does not exclude that path.
+
 ## Existing users: retain the manual upgrade gates
 
 Official 0.5.3 and 0.5.4 clients do not contain the experimental handoff. Keep
@@ -96,6 +140,10 @@ The same disposable account must be permitted to subscribe to
 `Win32_ProcessStartTrace`; on machines that deny it, use an elevated shell for
 that same account. Do not switch to another administrator's profile. The script
 registers the observer before seeding the profile and fails on access denial.
+An elevated audit shell also elevates its launched driver and baseline. Record
+that token context; it does not prove the ordinary unelevated client's UAC
+transition. The per-machine/UAC cell must separately exercise a baseline
+started at normal user privilege, with any privileged observer kept separate.
 Prepare a newer signed stable candidate B and a rehearsal channel manifest
 from its immutable release assets. Both must satisfy the production Windows
 signing policy. No test certificate or verification bypass is accepted by the

@@ -29,7 +29,7 @@
     "test:sandbox-default": "npm run build && node scripts/test-desktop-sandbox-default.mjs",
     "test:update-resolver": "npm run build && node scripts/test-update-resolver.mjs",
     "test:update-scheduler": "npm run build && node scripts/test-update-check-scheduler.mjs",
-    "test:windows-update": "npm run build && node scripts/test-windows-update-security.mjs && node scripts/test-windows-update-cache.mjs && node scripts/test-windows-update-handoff.mjs && node scripts/test-windows-update-coordinator.mjs && node scripts/test-windows-update-integration.mjs && node scripts/test-windows-update-refresh.mjs",
+    "test:windows-update": "npm run build && node scripts/test-windows-update-security.mjs && node scripts/test-windows-update-cache.mjs && node scripts/test-windows-update-handoff.mjs && node scripts/test-windows-update-coordinator.mjs && node scripts/test-windows-update-integration.mjs && node scripts/test-windows-update-refresh.mjs && node scripts/test-windows-update-network.mjs",
     "test:windows-update-electron": "npm run build && node scripts/test-windows-update-electron.mjs",
     "test:desktop-locale": "npm run build && node scripts/test-desktop-locale.mjs",
     "test:desktop-renderer-protocol": "npm run build && node scripts/test-desktop-renderer-protocol.mjs",

@@ -152,12 +152,15 @@ describe('DesktopUpdateIndicator', () => {
     app.unmount()
   })
 
-  it('reveals a verified Windows installer without offering native relaunch', async () => {
+  it.each([
+    ['oss', false], ['github', false], ['oss', undefined], ['github', undefined],
+  ] as const)('keeps manual reveal primary for %s with canInstall=%s', async (source, canInstall) => {
     const api = desktopUpdateApi({
       status: 'downloaded',
       canNativeInstall: false,
+      ...(canInstall === undefined ? {} : { canInstall }),
       installMode: 'manual',
-      source: 'oss',
+      source,
     }, {
       isAutoUpdateEnabled: async () => false,
     })
@@ -166,11 +169,20 @@ describe('DesktopUpdateIndicator', () => {
     ;(el.querySelector('[data-testid="desktop-update-indicator"]') as HTMLButtonElement).click()
     await settle()
     expect(document.body.textContent).toContain('Verified installer ready')
+    const description = document.querySelector('.desktop-update__desc') as HTMLElement
+    expect(description.textContent).toContain('installer has been verified')
+    expect(description.textContent).toContain('run it manually when ready')
+    expect(description.textContent).not.toContain('GitHub')
     expect(document.querySelector('[data-testid="desktop-update-relaunch"]')).toBeNull()
-    ;(document.querySelector('[data-testid="desktop-update-show-installer"]') as HTMLButtonElement).click()
+    const reveal = document.querySelector('[data-testid="desktop-update-show-installer"]') as HTMLButtonElement
+    expect(reveal.classList.contains('btn--primary')).toBe(true)
+    expect(reveal.disabled).toBe(false)
+    expect(api.downloadUpdate).not.toHaveBeenCalled()
+    reveal.click()
     await settle()
 
     expect(api.downloadUpdate).toHaveBeenCalledTimes(1)
+    expect(api.relaunchToUpdate).not.toHaveBeenCalled()
     app.unmount()
   })
 
@@ -182,6 +194,9 @@ describe('DesktopUpdateIndicator', () => {
       installMode: 'manual',
     }, {
       isAutoUpdateEnabled: async () => false,
+      downloadUpdate: vi.fn(async () => ({
+        status: 'downloaded', canCheck: true, canNativeInstall: false, canInstall: true, installMode: 'manual',
+      })),
       relaunchToUpdate: vi.fn(async () => ({
         status: 'applying', canCheck: true, canNativeInstall: false, canInstall: false, installMode: 'manual',
       })),
@@ -195,12 +210,16 @@ describe('DesktopUpdateIndicator', () => {
     expect(install.textContent).toContain('Quit and install')
     expect(install.classList.contains('btn--primary')).toBe(true)
     expect(reveal.classList.contains('btn--ghost')).toBe(true)
+    reveal.click()
+    await settle()
+    expect(api.downloadUpdate).toHaveBeenCalledTimes(1)
     expect(api.relaunchToUpdate).not.toHaveBeenCalled()
+    expect(install.disabled).toBe(false)
     install.click()
     await settle()
 
     expect(api.relaunchToUpdate).toHaveBeenCalledTimes(1)
-    expect(api.downloadUpdate).not.toHaveBeenCalled()
+    expect(api.downloadUpdate).toHaveBeenCalledTimes(1)
     expect(el.textContent).toContain('Closing background services')
     expect(document.body.textContent).toContain('installer will open when they have stopped')
     expect(document.querySelector('[data-testid="desktop-update-relaunch"]')).toBeNull()
@@ -230,6 +249,7 @@ describe('DesktopUpdateIndicator', () => {
   it.each([
     ['signature_invalid', 'signature is invalid'],
     ['signature_unavailable', 'could not verify the installer signature'],
+    ['checksum_unavailable', 'official update checksum is unavailable. No installer was opened.'],
   ])('localizes %s without offering installation', async (errorCode, expected) => {
     const api = desktopUpdateApi({
       status: 'error', canNativeInstall: false, canInstall: false, installMode: 'manual',
@@ -241,6 +261,9 @@ describe('DesktopUpdateIndicator', () => {
     expect(document.body.textContent).toContain(expected)
     expect(document.body.textContent).not.toContain('raw signature verification command detail')
     expect(document.querySelector('[data-testid="desktop-update-relaunch"]')).toBeNull()
+    expect(document.querySelector('[data-testid="desktop-update-show-installer"]')).toBeNull()
+    expect(api.relaunchToUpdate).not.toHaveBeenCalled()
+    expect(api.downloadUpdate).not.toHaveBeenCalled()
     app.unmount()
   })
 

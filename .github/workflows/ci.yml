@@ -852,6 +852,7 @@ jobs:
           node scripts/test-windows-update-coordinator.mjs
           node scripts/test-windows-update-integration.mjs
           node scripts/test-windows-update-refresh.mjs
+          node scripts/test-windows-update-network.mjs
           node scripts/test-desktop-locale.mjs
           node scripts/test-desktop-zoom-shortcuts.mjs --contracts-only
           node scripts/test-desktop-profile-substrate.mjs
@@ -1817,6 +1818,7 @@ jobs:
             entries+=(
               'windows-update-security:scripts/test-windows-update-security.mjs'
               'windows-update-handoff:scripts/test-windows-update-handoff.mjs'
+              'windows-update-network:scripts/test-windows-update-network.mjs'
               'windows-update-electron:scripts/test-windows-update-electron.mjs'
             )
           fi

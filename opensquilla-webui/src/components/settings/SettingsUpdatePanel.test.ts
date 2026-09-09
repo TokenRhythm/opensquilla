@@ -110,25 +110,35 @@ describe('SettingsUpdatePanel', () => {
     app.unmount()
   })
 
-  it('shows the verified Windows installer again without a relaunch action', async () => {
+  it.each([
+    ['oss', false], ['github', false], ['oss', undefined], ['github', undefined],
+  ] as const)('keeps manual reveal primary for %s with canInstall=%s', async (source, canInstall) => {
     const api = desktopUpdateApi({
       status: 'downloaded',
       canNativeInstall: false,
+      ...(canInstall === undefined ? {} : { canInstall }),
       installMode: 'manual',
-      source: 'oss',
+      source,
     }, {
       isAutoUpdateEnabled: async () => false,
     })
     const { app, el } = await mountPanel(api)
 
     expect(el.textContent).toContain('Verified')
-    expect(el.textContent).toContain('verified against the canonical GitHub checksum')
+    const description = el.querySelector('.control-row__desc') as HTMLElement
+    expect(description.textContent).toContain('installer has been verified')
+    expect(description.textContent).toContain('run it manually when ready')
+    expect(description.textContent).not.toContain('GitHub')
     const show = el.querySelector('[data-testid="settings-update-download"]') as HTMLButtonElement
     expect(show.textContent).toContain('Show installer')
+    expect(show.classList.contains('btn--primary')).toBe(true)
+    expect(show.disabled).toBe(false)
+    expect(api.downloadUpdate).not.toHaveBeenCalled()
     show.click()
     await settle()
 
     expect(api.downloadUpdate).toHaveBeenCalledTimes(1)
+    expect(api.relaunchToUpdate).not.toHaveBeenCalled()
     expect(el.querySelector('[data-testid="settings-update-relaunch"]')).toBeNull()
     app.unmount()
   })
@@ -138,6 +148,9 @@ describe('SettingsUpdatePanel', () => {
       status: 'downloaded', canNativeInstall: false, canInstall: true, installMode: 'manual',
     }, {
       isAutoUpdateEnabled: async () => false,
+      downloadUpdate: vi.fn(async () => ({
+        status: 'downloaded', canCheck: true, canNativeInstall: false, canInstall: true, installMode: 'manual',
+      })),
       relaunchToUpdate: vi.fn(async () => ({
         status: 'applying', canCheck: true, canNativeInstall: false, canInstall: false, installMode: 'manual',
       })),
@@ -150,7 +163,11 @@ describe('SettingsUpdatePanel', () => {
     expect(reveal.textContent).toContain('Show installer')
     expect(reveal.classList.contains('btn--ghost')).toBe(true)
     expect(el.textContent).not.toContain('shown in its folder')
+    reveal.click()
+    await settle()
+    expect(api.downloadUpdate).toHaveBeenCalledTimes(1)
     expect(api.relaunchToUpdate).not.toHaveBeenCalled()
+    expect(install.disabled).toBe(false)
     install.click()
     await settle()
     expect(api.relaunchToUpdate).toHaveBeenCalledTimes(1)
