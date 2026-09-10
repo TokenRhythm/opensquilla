@@ -153,6 +153,7 @@ export interface UseChatRpcEventHandlersOptions {
   normalizeRunStatus: (status: string) => string
   sessionRunStatus: (source: ChatRunStatusSource | null | undefined) => ChatRunStatus
   applySessionRunState: (source: ChatRunStatusSource | null | undefined) => void
+  onTaskSettled?: (taskId: string, epoch?: number) => void
   queueRouterDecision: (payload: ConversationRoutingDecision, identityStreamSeq?: number) => void
   bindRouterDecisionToModelCall?: (
     modelCallId: string,
@@ -618,6 +619,7 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
     const taskId = chatTaskId(terminalTask) || payloadTaskId(payload)
     if (taskId) {
       settledTaskIds.add(taskId)
+      options.onTaskSettled?.(taskId, payload.epoch)
       pendingTerminalEvents.delete(taskId)
       pendingStreamEvents.delete(taskId)
     }

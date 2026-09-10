@@ -15,6 +15,7 @@
     v-else-if="part.interruptKind === 'clarify' && part.clarify"
     :request="part.clarify"
     :submitted="part.resolution === 'replied'"
+    :expired="part.resolution === 'expired' || part.resolution === 'unavailable'"
     :busy="part.busy"
     :error="part.error"
     @submit="fields => emit('clarify-submit', fields, part.clarify!)"

@@ -516,7 +516,7 @@ describe('clarify tool-result recovery', () => {
       expect(runtime.approvals.clarifyBusy.value).toBe(false)
       expect(runtime.approvals.clarifyError.value).toBe('')
       expect(runtime.interruptState.value.get('input-request-1')).toEqual({
-        resolution: 'replied',
+        resolution: 'expired',
         busy: false,
         error: '',
       })

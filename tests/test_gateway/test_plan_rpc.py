@@ -21,6 +21,7 @@ from opensquilla.gateway.rpc_sessions import (
     _handle_plans_cancel_run,
     _handle_plans_implement,
     _handle_plans_revise,
+    _handle_sessions_send_contract,
 )
 from opensquilla.gateway.task_runtime import TaskRun, TaskRuntime
 from opensquilla.session.manager import SessionManager
@@ -195,6 +196,10 @@ async def test_implement_binds_exact_run_injects_full_plan_and_rejects_duplicate
         assert "Never jump over the current step" in approved
         assert "one at a time in plan order" in approved
         assert "After the final completed checkpoint is accepted" in approved
+        assert "current step is the only unfinished step" in approved
+        assert "all of its other work and verification are complete" in approved
+        assert "Never use publication to stand in for unfinished work or verification" in approved
+        assert "Only claim an artifact was delivered after publication succeeds" in approved
         payload = json.loads(approved[approved.index("{") :])
         assert payload["markdown"] == stack.source_revision.markdown
         assert payload["steps"] == stack.source_revision.steps
@@ -234,6 +239,142 @@ async def test_implement_binds_exact_run_injects_full_plan_and_rejects_duplicate
         assert paused.status == "paused"
         assert paused.pause_reason == "manual_turn_finished"
         assert paused.active_task_id is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("interruption", ["paused", "blocked", "cancelled"])
+async def test_interrupted_plan_can_deliver_existing_artifact_in_a_new_turn(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    interruption: str,
+) -> None:
+    from opensquilla.tools.builtin.artifacts import publish_artifact
+    from opensquilla.tools.types import ToolContext, ToolError, current_tool_context
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    report = workspace / "report.txt"
+    report.write_text("Synthetic verified report.\n", encoding="utf-8")
+    entered = asyncio.Event()
+    wait_for_cancel = asyncio.Event()
+    contexts: list[ToolContext] = []
+    published: list[dict[str, Any]] = []
+
+    async def publish(context: ToolContext) -> dict[str, Any]:
+        context.workspace_dir = str(workspace)
+        context.artifact_media_root = str(tmp_path / "media")
+        context.artifact_session_id = "plan-recovery-artifact"
+        token = current_tool_context.set(context)
+        try:
+            return json.loads(await publish_artifact(path="report.txt"))
+        finally:
+            current_tool_context.reset(token)
+
+    async def handler(task: TaskRun) -> None:
+        context = task.envelope.tool_context(is_owner=True)
+        contexts.append(context)
+        if len(contexts) == 1:
+            run = await stack.storage.get_plan_run(str(context.plan_run_id))
+            assert run is not None
+            run = await stack.storage.checkpoint_plan_run(
+                run.run_id,
+                expected_state_revision=run.state_revision,
+                expected_active_task_id=task.task_id,
+                step_id="inspect",
+                step_status="completed",
+            )
+            if interruption == "blocked":
+                await stack.storage.checkpoint_plan_run(
+                    run.run_id,
+                    expected_state_revision=run.state_revision,
+                    expected_active_task_id=task.task_id,
+                    step_id="verify",
+                    step_status="blocked",
+                    reason="Synthetic verification blocker",
+                )
+            entered.set()
+            if interruption == "cancelled":
+                await wait_for_cancel.wait()
+            return
+        if interruption != "cancelled":
+            resumed = await stack.storage.get_plan_run(str(context.plan_run_id))
+            assert resumed is not None
+            assert resumed.status == "running"
+            assert resumed.current_step_id == "verify"
+            assert resumed.step_states[0]["status"] == "completed"
+        # Complete the synthetic verification before publishing as the last
+        # operation; publication must not stand in for unfinished work.
+        assert report.read_text(encoding="utf-8") == "Synthetic verified report.\n"
+        published.append(await publish(context))
+
+    monkeypatch.setattr(
+        "opensquilla.gateway.rpc_sessions._emit_to_subscribers",
+        _ignore_subscriber_event,
+    )
+    async with _open_plan_rpc_stack(tmp_path / "plan-delivery.sqlite", handler=handler) as stack:
+        implement_params = {
+            "sessionKey": SOURCE_KEY,
+            "planRevisionId": stack.source_revision.revision_id,
+            "clientRequestId": "initial-implementation",
+            "intent": "continue",
+        }
+        first = await _handle_plans_implement(implement_params, stack.context)
+        await asyncio.wait_for(entered.wait(), timeout=2.0)
+        run_id = first["planRun"]["runId"]
+        if interruption == "cancelled":
+            run = await stack.storage.get_plan_run(run_id)
+            assert run is not None
+            await _handle_plans_cancel_run(
+                {
+                    "sessionKey": SOURCE_KEY,
+                    "runId": run_id,
+                    "expectedStateRevision": run.state_revision,
+                },
+                stack.context,
+            )
+        await stack.runtime.wait(first["turn_id"], timeout=2.0)
+        interrupted = await stack.storage.get_plan_run(run_id)
+        assert interrupted is not None
+        assert interrupted.status == interruption
+        assert interrupted.current_step_id == "verify"
+        assert interrupted.step_states[0]["status"] == "completed"
+
+        if interruption == "cancelled":
+            with pytest.raises(ToolError, match="attached PlanRun is cancelled"):
+                await publish(contexts[0])
+            second = await _handle_sessions_send_contract(
+                {
+                    "key": SOURCE_KEY,
+                    "message": "Publish the existing report.txt.",
+                    "clientRequestId": "publish-after-cancellation",
+                    "intent": "continue",
+                    "queueMode": "followup",
+                },
+                stack.context,
+            )
+        else:
+            second = await _handle_plans_implement(
+                {**implement_params, "clientRequestId": "resume-implementation"},
+                stack.context,
+            )
+            assert second["planRun"]["runId"] == run_id
+
+        terminal = await stack.runtime.wait(second["turn_id"], timeout=2.0)
+        assert terminal.status == AgentTaskStatus.SUCCEEDED
+        assert len(contexts) == 2
+        assert contexts[1].plan_run_id == (None if interruption == "cancelled" else run_id)
+        assert len(published) == 1
+        assert published[0]["status"] == "published"
+        assert published[0]["artifact"]["name"] == "report.txt"
+        final = await stack.storage.get_plan_run(run_id)
+        assert final is not None
+        if interruption == "cancelled":
+            assert final.status == "cancelled"
+            assert final.step_states == interrupted.step_states
+        else:
+            assert final.status == "completed"
+            assert final.current_step_id is None
+            assert all(step["status"] == "completed" for step in final.step_states)
 
 
 @pytest.mark.asyncio
