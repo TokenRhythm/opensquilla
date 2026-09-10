@@ -84,6 +84,22 @@ def _configured_agent_model(config: object | None, normalized_agent_id: str) -> 
     return _string_value(_configured_agent_field(config, normalized_agent_id, "model"))
 
 
+def is_isolated_custom_agent(config: object | None, agent_id: str) -> bool:
+    """Return True if *agent_id* is a custom agent with its own workspace.
+
+    Custom agents declared in ``[[agents]]`` with a ``workspace`` field are
+    memory-isolated: they must NOT fall back to the ``main`` agent's retriever
+    or store.  The builtin ``main`` agent and unconfigured ids are never
+    isolated.
+    """
+    if config is None:
+        return False
+    normalized = normalize_agent_id(agent_id)
+    if normalized == "main":
+        return False
+    return _configured_agent_workspace(config, normalized) is not None
+
+
 def resolve_agent_state_dir(
     agent_id: str,
     config: object | None = None,
