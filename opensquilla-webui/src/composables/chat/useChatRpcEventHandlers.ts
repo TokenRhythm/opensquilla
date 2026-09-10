@@ -189,6 +189,8 @@ export interface UseChatRpcEventHandlersOptions {
   handleSessionConnectionState?: (state: string) => SessionBootstrapRun | undefined
   loadCurrentSessionUsage: () => void
   refreshRunModePreference?: () => void | Promise<void>
+  /** Register one bounded reconciliation responsibility after local overflow. */
+  onRecoveryRequired?: () => void
 }
 
 
@@ -369,6 +371,52 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
   const turnActivityLog: TurnActivityRecord[] = []
   const pendingTerminalEvents = new Map<string, BufferedTerminalEvent>()
   const pendingStreamEvents = new Map<string, BufferedPendingStreamEvent[]>()
+  let recoveryDirty = false
+  let recoveryFenced = false
+  let recoveryOverflow = false
+  let recoveryRevision = 0
+  const recoveryEvents: ConversationEvent[] = []
+  function markRecoveryDirty() {
+    pendingTerminalEvents.clear()
+    pendingStreamEvents.clear()
+    if (recoveryDirty) return
+    recoveryDirty = true
+    options.onRecoveryRequired?.()
+  }
+
+  function beginRecovery() {
+    recoveryRevision++
+    recoveryFenced = true
+    recoveryOverflow = false
+    recoveryEvents.length = 0
+  }
+
+  function finishRecovery(): boolean {
+    if (recoveryOverflow) return false
+    recoveryFenced = false
+    recoveryDirty = false
+    const buffered = recoveryEvents.splice(0)
+    for (const event of buffered) handleConversationEvent(event)
+    return !recoveryDirty
+  }
+
+  function consumeConversationEvent(message: ConversationEvent): 'applied' | 'dirty' {
+    if (message.kind === 'invalid') {
+      markRecoveryDirty()
+      return 'dirty'
+    }
+    if (recoveryFenced) {
+      if (!recoveryOverflow && recoveryEvents.length < MAX_PENDING_STREAM_EVENTS_PER_TASK) {
+        recoveryEvents.push(message)
+      } else {
+        recoveryEvents.length = 0
+        recoveryOverflow = true
+      }
+      return 'dirty'
+    }
+    handleConversationEvent(message)
+    return recoveryDirty ? 'dirty' : 'applied'
+  }
   const settledTaskIds = new Set<string>()
   const committedTaskIds = new Set<string>()
   const taskSucceededSyncedIds = new Set<string>()
@@ -423,10 +471,12 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
     }
     replaceAwaitingCommitTaskIds(taskIds => taskIds.add(taskId))
     const expectedSessionKey = sessionKey.value
+    const expectedRevision = recoveryRevision
     const timer = setTimeout(() => {
       awaitingCommitTimers.delete(taskId)
       if (
         sessionKey.value !== expectedSessionKey
+        || recoveryRevision !== expectedRevision
         || !awaitingCommitTaskIds.value.has(taskId)
         || committedTaskIds.has(taskId)
       ) return
@@ -580,6 +630,7 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
   ): boolean {
     if (!isCurrentSessionPayload(entry.payload)) return false
     if (isStaleEpoch(entry.payload)) return false
+    if (recoveryDirty) return true
     const terminalTask = entry.kind === 'session-change'
       ? terminalSessionChangeTask(entry.payload)
       : null
@@ -602,8 +653,8 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
     const existing = pendingTerminalEvents.get(taskId)
     if (!existing || priority >= existing.priority) {
       if (!existing && pendingTerminalEvents.size >= MAX_PENDING_TASK_BUCKETS) {
-        const oldestTaskId = pendingTerminalEvents.keys().next().value
-        if (typeof oldestTaskId === 'string') pendingTerminalEvents.delete(oldestTaskId)
+        markRecoveryDirty()
+        return true
       }
       pendingTerminalEvents.set(taskId, {
         ...entry,
@@ -631,6 +682,7 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
   ): boolean {
     if (!isCurrentSessionPayload(payload)) return false
     if (isStaleEpoch(payload)) return false
+    if (recoveryDirty) return true
     // Match the live admission guard for legacy frames that carry a turn id
     // before chat.send has supplied the accepted task id.
     const taskId = payloadTurnId(payload)
@@ -652,13 +704,16 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
     let buffered = pendingStreamEvents.get(taskId)
     if (!buffered) {
       if (pendingStreamEvents.size >= MAX_PENDING_TASK_BUCKETS) {
-        const oldestTaskId = pendingStreamEvents.keys().next().value
-        if (typeof oldestTaskId === 'string') pendingStreamEvents.delete(oldestTaskId)
+        markRecoveryDirty()
+        return true
       }
       buffered = []
       pendingStreamEvents.set(taskId, buffered)
     }
-    if (buffered.length >= MAX_PENDING_STREAM_EVENTS_PER_TASK) buffered.shift()
+    if (buffered.length >= MAX_PENDING_STREAM_EVENTS_PER_TASK) {
+      markRecoveryDirty()
+      return true
+    }
     buffered.push({ event, payload, ...(buffersSuccessor ? { replayWithoutSeq: true } : {}) })
     return true
   }
@@ -809,6 +864,8 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
         event === 'thinking-started'
         || event === 'thinking-delta'
         || event === 'thinking-ended'
+        || event === 'turn-completed'
+        || event === 'turn-failed'
       ) {
         handleSemanticEvent(event, payload)
       }
@@ -819,6 +876,8 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
 
   function restoreLiveTurnSnapshot(snapshot: SessionReadSnapshot) {
     if (!snapshot || snapshot.sessionKey !== sessionKey.value) return
+
+    recoveryDirty = false
 
     steerDelivery.resetTransientBoundaries()
     stream.resetLiveTurnState?.()
@@ -871,7 +930,8 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
         replayWithoutSeq: true,
       })
     }
-
+    if (snapshot.streamGeneration && options.streamGeneration) options.streamGeneration.value = snapshot.streamGeneration
+    if (typeof snapshot.currentStreamSeq === 'number') lastStreamSeq.value = snapshot.currentStreamSeq
   }
 
   function replayPendingTerminalEvent(entry: BufferedTerminalEvent) {
@@ -1141,6 +1201,11 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
 
 
   watch(sessionKey, () => {
+    recoveryRevision++
+    recoveryDirty = false
+    recoveryFenced = false
+    recoveryOverflow = false
+    recoveryEvents.length = 0
     streamThinking.value = null
     clearGenerationTracking()
     turnReasoningLog.length = 0
@@ -1424,9 +1489,12 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
       // B. Fail closed until a fresh authoritative projection arrives instead
       // of briefly declaring idle and draining C out of order.
       options.taskOwnership?.beginHydration()
-      void Promise.resolve(options.subscribeSession?.())
+      const subscription = options.subscribeSession?.()
+      const expectedKey = sessionKey.value
+      const expectedRevision = recoveryRevision
+      void Promise.resolve(subscription)
         .then((subscribed) => {
-          if (isAuthoritativeSessionSubscription(subscribed)) {
+          if (expectedKey === sessionKey.value && expectedRevision === recoveryRevision && isAuthoritativeSessionSubscription(subscribed)) {
             return options.onSessionSubscribed?.()
           }
         })
@@ -2454,17 +2522,7 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
     handleSemanticEvent(event.semanticKind, event.payload)
   }
 
-  let connectionLostNoted = false
-  let connectionLostNotice: ChatMessage | null = null
   let connectionStateGeneration = 0
-
-  function clearConnectionLostStatus() {
-    connectionLostNoted = false
-    if (!connectionLostNotice) return
-    const noticeIndex = messages.value.indexOf(connectionLostNotice)
-    if (noticeIndex >= 0) messages.value.splice(noticeIndex, 1)
-    connectionLostNotice = null
-  }
 
   function handleRpcConnectionState(state: string) {
     const stateGeneration = ++connectionStateGeneration
@@ -2476,12 +2534,14 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
       return
     }
     if (state === 'connected') {
-      clearConnectionLostStatus()
       stream.hideThinkingIndicator()
       const subscription = recovery?.live ?? options.subscribeSession?.()
+      const connectedKey = sessionKey.value
+      const connectedRevision = recoveryRevision
       void Promise.resolve(subscription)
         .then((subscribed) => {
-          if (isAuthoritativeSessionSubscription(subscribed)) {
+          if (connectedKey === sessionKey.value && connectedRevision === recoveryRevision
+            && connectionStateGeneration === stateGeneration && isAuthoritativeSessionSubscription(subscribed)) {
             return options.onSessionSubscribed?.()
           }
         })
@@ -2501,6 +2561,7 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
           () => {
             if (
               connectionStateGeneration === stateGeneration
+              && recoveryRevision === connectedRevision
               && sessionKey.value === connectedSessionKey
             ) {
               options.loadCurrentSessionUsage()
@@ -2520,18 +2581,9 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
       if (stream.isStreaming.value) stream.resetStreamIdleTimer({ progress: false })
     }
     if (state === 'disconnected' && stream.isStreaming.value) {
-      // Keep the idle watchdog armed so a run whose events never resume still
-      // times out honestly. The row is transient and removed after reconnect.
+      // Preserve the current bubble; the composition root owns one delayed,
+      // non-blocking notice instead of injecting connection rows into history.
       stream.showThinkingIndicator()
-      if (!connectionLostNoted) {
-        connectionLostNoted = true
-        connectionLostNotice = {
-          role: 'system',
-          text: 'Connection lost — trying to reconnect…',
-          ts: new Date().toISOString(),
-        }
-        messages.value.push(connectionLostNotice)
-      }
     }
   }
 
@@ -2571,6 +2623,9 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
   return {
     handlers,
     onConversationEvent: handleConversationEvent,
+    consumeConversationEvent,
+    beginRecovery,
+    finishRecovery,
     bindActiveStreamTask,
     restoreLiveTurnSnapshot,
     attachTurnReasoning,

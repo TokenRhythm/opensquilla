@@ -1422,7 +1422,19 @@ def test_desktop_recovery_e2e_runs_compiled_flows_on_all_release_platforms() -> 
         "matrix.shard == 'profiles' }}"
     )
     assert "history-hydration.spec.ts" in session_recovery["run"]
-    assert '--grep "terminates stalled"' in session_recovery["run"]
+    # Select by a stable contract tag, not the scenario's human-readable title.
+    # Renaming the test must not silently leave this release-platform gate empty.
+    assert '--grep "@session-hang-recovery"' in session_recovery["run"]
+    assert "--retries=0" in session_recovery["run"]
+    recovery_spec = Path("opensquilla-webui/e2e/history-hydration.spec.ts").read_text(
+        encoding="utf-8"
+    )
+    assert len(
+        re.findall(
+            r"test\('[^']+',\s*\{\s*tag: '@session-hang-recovery',?\s*\},\s*async",
+            recovery_spec,
+        )
+    ) == 1
     assert playwright_cache["uses"] == "actions/cache/restore@v4"
     assert playwright_cache["with"]["path"] == "${{ env.PLAYWRIGHT_BROWSERS_PATH }}"
     assert job["env"]["PLAYWRIGHT_BROWSERS_PATH"] == (

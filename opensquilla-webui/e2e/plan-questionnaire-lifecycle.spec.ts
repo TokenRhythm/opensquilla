@@ -29,7 +29,7 @@ async function installGateway(page: Page) {
     },
   }
   await page.addInitScript(() => localStorage.setItem('opensquilla-locale', 'en'))
-  await page.route('**/api/approvals', route => route.fulfill({ json: { pending: [] } }))
+  await page.route('**/api/approvals', route => route.fulfill({ json: { mode: 'prompt', pending: [] } }))
   await page.route('**/api/elevated-mode', route => route.fulfill({ json: { enabled: false } }))
   await page.route('**/api/system/update', route => route.fulfill({ json: {} }))
   await page.route('**/control/static/dist/opensquilla-mark.png', route => route.fulfill({ status: 204, body: '' }))
@@ -102,7 +102,7 @@ async function installGateway(page: Page) {
     restoreTerminalHistory() { restoreTerminalHistory = true },
     settle(event: string) {
       pending = false
-      if (event === 'task.timed_out') {
+      if (event === 'task.timeout') {
         // Failed tasks immediately synchronize their durable transcript.
         // An authoritative empty history would correctly remove the live row.
         terminalStatus = 'timeout'
@@ -150,14 +150,20 @@ async function openQuestionnaire(page: Page) {
 async function expectReceipt(page: Page, label: string) {
   const receipt = page.getByText(label, { exact: true })
   await expect(receipt).toBeAttached()
-  // Resolved timeline interrupts move into the collapsed Activity disclosure.
+  // Resolved timeline interrupts move into their activity disclosure. A
+  // terminal outcome may label its summary "Timed out", not "Activity".
   if (!await receipt.isVisible()) {
-    await page.getByRole('button', { name: /^Activity/ }).click()
+    const activity = page.getByTestId('assistant-activity').filter({ has: receipt })
+    await expect(activity).toHaveCount(1)
+    const summary = activity.locator(':scope > button[aria-controls]')
+    await expect(summary).toHaveAttribute('aria-expanded', 'false')
+    await summary.click()
+    await expect(summary).toHaveAttribute('aria-expanded', 'true')
   }
   await expect(receipt).toBeVisible()
 }
 
-for (const terminal of ['task.cancelled', 'task.timed_out', 'session.event.done']) {
+for (const terminal of ['task.cancelled', 'task.timeout', 'session.event.done']) {
   test(`questionnaire releases the composer on ${terminal} and ignores late replay`, async ({ page }) => {
     const { gateway, dock } = await openQuestionnaire(page)
     gateway.settle(terminal)

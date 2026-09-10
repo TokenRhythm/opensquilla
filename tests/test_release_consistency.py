@@ -740,7 +740,9 @@ def test_release_workflow_gates_built_and_downloaded_installers_on_profile_reten
         "chat-session-load-state",
         'data-recovery-state=\"history-error\"',
         'data-recovery-state=\"live-degraded\"',
-        "chat-session-recovery-retry",
+        "automatic recovery must not navigate the page",
+        "automatic recovery must preserve the original composer instance",
+        "automatic recovery must not move focus away from the draft",
         "composer.isEditable()",
         "sendButton.isDisabled()",
         "expectedLastMessage",
@@ -757,6 +759,15 @@ def test_release_workflow_gates_built_and_downloaded_installers_on_profile_reten
         "runError ??= error",
     ):
         assert contract in session_recovery_smoke
+    # Recovery must be observed through product-owned retries, not initiated
+    # by clicking the legacy manual control in the acceptance fixture.
+    assert "chat-session-recovery-retry" not in session_recovery_smoke
+    automatic_recovery = session_recovery_smoke[
+        session_recovery_smoke.index("  injectHang = false") :
+        session_recovery_smoke.index("  const recoveredTransport = recoveryTransportSample()")
+    ]
+    for manual_action in (".click(", ".reload(", ".goto(", ".focus("):
+        assert manual_action not in automatic_recovery
     assert "page.clock" not in session_recovery_smoke
     assert "app?.close().catch" not in session_recovery_smoke
     assert "unrouteBeforeQuit:" not in session_recovery_smoke

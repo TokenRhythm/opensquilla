@@ -3,8 +3,8 @@
     ref="statusRef"
     class="chat-session-recovery-status"
     :class="`chat-session-recovery-status--${state}`"
-    :role="isFailure ? 'alert' : 'status'"
-    :aria-live="isFailure ? 'assertive' : 'polite'"
+    :role="isFailure && !automatic ? 'alert' : 'status'"
+    :aria-live="isFailure && !automatic ? 'assertive' : 'polite'"
     aria-atomic="true"
     :data-recovery-state="state"
     data-testid="chat-session-recovery-status"
@@ -47,6 +47,7 @@ import type { ChatSessionRecoveryState } from '@/utils/chat/sessionLoadState'
 const props = defineProps<{
   state: ChatSessionRecoveryState
   transportState?: 'disconnected' | 'connecting' | 'connected'
+  automatic?: boolean
 }>()
 
 const emit = defineEmits<{
@@ -65,6 +66,7 @@ const isRetryableFailure = computed(() => (
 ))
 const isBusy = computed(() => !isFailure.value)
 const title = computed(() => {
+  if (props.automatic && props.state !== 'session-missing') return t('chat.gatewayReconnecting')
   switch (props.state) {
     case 'history-loading':
       return t('chat.loadingSession')
@@ -85,6 +87,7 @@ const title = computed(() => {
   }
 })
 const description = computed(() => {
+  if (props.automatic && props.state !== 'session-missing') return t('chat.automaticRecoveryDescription')
   switch (props.state) {
     case 'history-loading':
       return t('chat.loadingSessionDescription')
