@@ -739,17 +739,21 @@ test.describe('Live assistant activity lifecycle', () => {
     await expect(liveActivity.locator('[role="status"]')).toHaveCount(1)
     await expect(liveActivity.locator('.assistant-activity__live-failure')).toHaveCount(0)
     await expect(liveActivity.locator('.assistant-activity-status__row')).toHaveCount(0)
-    const liveMotion = await liveActivity.evaluate((element) => ({
-      dot: getComputedStyle(
-        element.querySelector<HTMLElement>('.assistant-activity__live-dot')!,
-      ).animationName,
-      label: getComputedStyle(
-        element.querySelector<HTMLElement>('.assistant-activity__live-label')!,
-      ).animationName,
-    }))
-    // The pulsing dot is the single working signal; the label is deliberately
-    // static (the shimmer gradient was removed as visual noise).
-    expect(liveMotion.dot).not.toBe('none')
+    const liveMotion = await liveActivity.evaluate((element) => {
+      const dot = element.querySelector<HTMLElement>('.assistant-activity__live-dot')
+      return {
+        orb: Boolean(element.querySelector('.assistant-activity__live-orb')),
+        dot: dot ? getComputedStyle(dot).animationName : 'absent',
+        label: getComputedStyle(
+          element.querySelector<HTMLElement>('.assistant-activity__live-label')!,
+        ).animationName,
+      }
+    })
+    // The live header carries exactly one working signal: the animated orb
+    // canvas, or — when the orb is degraded/unsupported — the pulsing CSS
+    // dot. The label stays deliberately static (the shimmer gradient was
+    // removed as visual noise).
+    expect(liveMotion.orb || liveMotion.dot !== 'none').toBe(true)
     expect(liveMotion.label).toBe('none')
 
     lifecycle.emit('session.event.tool_use_start', {
@@ -872,15 +876,23 @@ test.describe('Live assistant activity lifecycle', () => {
 
     const liveActivity = page.locator('.assistant-activity--live')
     await expect(liveActivity).toBeVisible()
-    const liveMotion = await liveActivity.evaluate((element) => ({
-      dot: getComputedStyle(
-        element.querySelector<HTMLElement>('.assistant-activity__live-dot')!,
-      ).animationName,
-      label: getComputedStyle(
-        element.querySelector<HTMLElement>('.assistant-activity__live-label')!,
-      ).animationName,
-    }))
-    expect(liveMotion).toEqual({ dot: 'none', label: 'none' })
+    const liveMotion = await liveActivity.evaluate((element) => {
+      const dot = element.querySelector<HTMLElement>('.assistant-activity__live-dot')
+      const orb = element.querySelector<HTMLElement>('.assistant-activity__live-orb')
+      return {
+        orbAnimation: orb ? getComputedStyle(orb).animationName : 'absent',
+        dot: dot ? getComputedStyle(dot).animationName : 'absent',
+        label: getComputedStyle(
+          element.querySelector<HTMLElement>('.assistant-activity__live-label')!,
+        ).animationName,
+      }
+    })
+    // Reduced motion must silence every CSS animation on the live header:
+    // the orb either mounts as a static single frame (no CSS animation) or
+    // degrades to the dot, which must also stay still under reduce.
+    expect(['absent', 'none']).toContain(liveMotion.orbAnimation)
+    expect(['absent', 'none']).toContain(liveMotion.dot)
+    expect(liveMotion.label).toBe('none')
   })
 })
 
