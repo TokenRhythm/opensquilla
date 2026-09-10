@@ -7,18 +7,20 @@ the normal checksum, signature, cache, and shutdown gates before installation.
 The existing `OPENSQUILLA_DESKTOP_ENABLE_WIN_UPDATE` switch exercises a separate
 electron-updater path and must remain off during this rehearsal.
 
-## Product completion in the same PR
+## Merge scope and default activation
 
 The intended default Windows experience is **Check -> Download and verify ->
 Quit and install -> visible NSIS wizard -> launch the installed version**.
-Keep the implementation, restricted-network tests, native acceptance evidence,
-and the eventual default-enablement change in this PR. Passing CI while the
-entry remains opt-in does not complete that product delivery.
+The implementation may merge with the entry **off by default** after its update
+and lifecycle contracts, one signed native A-to-B cached-input flow with retained
+profile interactions, and required PR/merge-queue CI pass. This experimental
+merge does not certify general availability or the entire release matrix.
 
-Keep the PR Draft and the default switch off until the native matrix below is
-verified. Record the source SHAs, signed artifact hashes, installation mode,
-network conditions, and outcomes in the PR. Enable the entry in the same PR
-only after those gates pass, and verify CI again on that final change. The
+Default activation is separate follow-up work. Complete the remaining native
+and restricted-network matrix below, record source SHAs, signed artifact hashes,
+installation mode, network conditions and outcomes, then validate the activation
+change in CI. No signing task, public channel update or release is authorized
+by this experimental merge. The
 manual Show installer action remains available as a secondary action when the
 handoff is enabled and as the primary action for shells without that capability.
 
@@ -313,7 +315,8 @@ B with the correct default profile, retained synthetic history and a connected
 Gateway. Installed signatures and ordinary tray Quit were verified. A separate
 fresh-profile first-send probe passed on the installed B.
 
-This is **not a completed native acceptance cell**. Preserve these boundaries:
+The earlier attempt did **not complete its native acceptance cell**. Its failures
+remain preserved, with the following findings:
 
 - The outer run blocked in a lab stdin relay: redirected PowerShell suppressed
   the `Read-Host` prompt the relay expected. Subsequent checks were independently
@@ -328,7 +331,7 @@ This is **not a completed native acceptance cell**. Preserve these boundaries:
   its default 8K context budget could not accommodate the agent/tool request.
   Prepare adequate model capacity in the **next A baseline**, then rerun A-to-B;
   do not rewrite an upgraded profile or bypass request budgets to claim success.
-  Retained tool use, Stop and restart remain unverified.
+  These observations alone did not verify retained tool use, Stop or restart.
 
 The follow-up harness now seeds adequate synthetic model capacity before A,
 emits explicit operator prompts even with redirected stdin, and recognizes the
@@ -341,13 +344,30 @@ sent a message after restart, quit normally twice, and passed final config,
 credential and profile checks (`os1584-cap-b720e1df`). This fresh synthetic
 preflight is not upgraded-profile or integrated A-to-B evidence.
 
+A later uninterrupted cached-input A-to-B run with audit code `2c40fa4c7`
+completed the visible NSIS upgrade in the existing Windows 11 per-user custom
+directory. Finish/Run launched B, the user used tray Quit, and the same outer
+audit then passed fresh first send, retained first send, real sentinel tool
+execution, Stop/stream cancellation, follow-up, same-profile restart and exact
+credential/config/history preservation. The retained interaction report is
+`ok: true`; the outer report intentionally remains `ok: false`, exits **2**,
+and records `postinstall-verified-with-gaps` and `releaseGatePassed: false`.
+Shell-brokered Finish/Run causality remains operator-attested. No rollback,
+uninstall, remote-download or source-fallback claim is added.
+
+Immutable local evidence digests (private profiles and logs are not committed):
+
+- Outer result SHA256: `72e06f29d24499c471f8d2bf754bb14755f9fb9af01e400d69be0f321353f1c1`.
+- Retained interaction SHA256: `8534a88295a47c66528a788fabefcbec8a39b9d62589b547e0fb458783c57560`.
+
 The user's original profile has been restored with all 4913 files hash-verified;
 the separate backup remains preserved.
 Local evidence and private profile data are not repository artifacts. This
 cached-input run does not verify download, public channels, blocked GitHub,
 cold certificate-chain networking, UAC/cancellation, or the full OS/scope matrix.
 
-The following native matrix remains required; deterministic CI or the synthetic
+The following native matrix remains required before default activation;
+deterministic CI or the synthetic
 PowerShell harness does not mark any row complete. Retain evidence per cell,
 including source SHAs, artifact hashes, installation roots, logs and outcome.
 
