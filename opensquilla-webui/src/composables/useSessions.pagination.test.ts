@@ -2,18 +2,29 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { createPinia, setActivePinia } from 'pinia'
 
 import { useRpcStore } from '@/stores/rpc'
-import type { SessionListEntry } from '@/contracts/generated/v4/sessionsList'
+import type {
+  SessionListEntry,
+  SessionsListResult,
+} from '@/contracts/generated/v4/sessionsList'
 import { createV4SessionDirectory } from '@/adapters/gateway/sessionDirectoryV4'
 import { createPrivateGatewayTransports } from '@/adapters/gateway/privateTransports'
 import { sessionMatches, useSessions } from './useSessions'
 
 interface SessionPageFixture {
-  sessions?: SessionListEntry[]
+  sessions: SessionListEntry[]
   keys?: SessionListEntry[]
   hasMore?: boolean
   has_more?: boolean
   nextCursor?: string | null
   next_cursor?: string | null
+}
+
+function sessionsListResult(fixture: SessionPageFixture): SessionsListResult {
+  return {
+    count: fixture.sessions.length,
+    ts: 1,
+    ...fixture,
+  }
 }
 
 function rows(start: number, end: number) {
@@ -41,7 +52,7 @@ describe('useSessions pagination', () => {
     const call = vi.spyOn(rpc, 'call').mockImplementation(async () => {
       const response = responses.shift()
       if (!response) throw new Error('unexpected sessions.list call')
-      return await response
+      return sessionsListResult(await response)
     })
     const transports = createPrivateGatewayTransports(rpc)
     return {
@@ -214,9 +225,9 @@ describe('useSessions pagination', () => {
     ])
   })
 
-  it('treats a legacy response without page metadata as terminal', async () => {
+  it('treats a response without page metadata as terminal', async () => {
     const legacyKeys = rows(0, 200).map(row => row.key)
-    const { call, sessions } = setup([{ keys: legacyKeys }])
+    const { call, sessions } = setup([{ sessions: legacyKeys }])
 
     await sessions.loadSessions()
     await sessions.loadMoreSessions()

@@ -2,6 +2,115 @@
 
 const ANSWER_GENERATION_RESET_CAPABILITY = 'session.answer_generation_reset.v1';
 const TURN_COMMITTED_CAPABILITY = 'session.turn_committed.v1';
+export const WEB_RPC_PROTOCOL_VERSION = 3 as const;
+
+export interface HelloOkFrame {
+  type: 'hello-ok';
+  protocol: typeof WEB_RPC_PROTOCOL_VERSION;
+  server: {
+    version: string;
+    conn_id: string;
+    [key: string]: unknown;
+  };
+  features: {
+    methods: string[];
+    events: string[];
+    [key: string]: unknown;
+  };
+  snapshot: Record<string, unknown>;
+  policy: Record<string, unknown>;
+  auth: Record<string, unknown> | null;
+  [key: string]: unknown;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function isStringArray(value: unknown): value is string[] {
+  return Array.isArray(value) && value.every((item) => typeof item === 'string');
+}
+
+const HELLO_POLICY_INTEGER_FIELDS = [
+  'max_payload',
+  'max_buffered_bytes',
+  'tick_interval_ms',
+  'agent_stream_heartbeat_interval_ms',
+  'agent_stream_idle_timeout_ms',
+  'webui_stream_idle_grace_ms',
+  'client_ws_keepalive_timeout_ms',
+] as const;
+
+function isHelloPolicy(value: unknown): value is Record<string, unknown> {
+  if (!isRecord(value)) return false;
+  for (const field of HELLO_POLICY_INTEGER_FIELDS) {
+    if (!Object.prototype.hasOwnProperty.call(value, field)) continue;
+    const fieldValue = value[field];
+    if (
+      typeof fieldValue !== 'number'
+      || !Number.isSafeInteger(fieldValue)
+      || fieldValue < 0
+      || (field === 'tick_interval_ms' && fieldValue === 0)
+    ) {
+      return false;
+    }
+  }
+  if (
+    Object.prototype.hasOwnProperty.call(value, 'concurrent_history_reads')
+    && typeof value.concurrent_history_reads !== 'boolean'
+  ) return false;
+  if (
+    Object.prototype.hasOwnProperty.call(value, 'concurrent_optional_read_methods')
+    && !isStringArray(value.concurrent_optional_read_methods)
+  ) return false;
+  return true;
+}
+
+/** Validate the authenticated Gateway handshake without rejecting additive fields. */
+export function isHelloOkFrame(value: unknown): value is HelloOkFrame {
+  if (!isRecord(value)) return false;
+  if (value.type !== 'hello-ok') return false;
+  if (
+    !Number.isInteger(value.protocol)
+    || value.protocol !== WEB_RPC_PROTOCOL_VERSION
+  ) {
+    return false;
+  }
+
+  const server = value.server;
+  if (
+    !isRecord(server)
+    || typeof server.version !== 'string'
+    || server.version.trim().length === 0
+    || typeof server.conn_id !== 'string'
+    || server.conn_id.trim().length === 0
+  ) {
+    return false;
+  }
+
+  const features = value.features;
+  if (
+    !isRecord(features)
+    || !isStringArray(features.methods)
+    || !isStringArray(features.events)
+  ) {
+    return false;
+  }
+
+  return (
+    isRecord(value.snapshot)
+    && isHelloPolicy(value.policy)
+    && (value.auth === null || isRecord(value.auth))
+  );
+}
+
+function isHelloOkCandidate(value: unknown): boolean {
+  return isRecord(value)
+    && (
+      value.type === 'hello-ok'
+      || Object.prototype.hasOwnProperty.call(value, 'protocol')
+    );
+}
 
 export interface RpcErrorDetail {
   code?: string;
@@ -18,6 +127,22 @@ export interface RpcClientError extends Error {
   retryable?: boolean;
   retry_after_ms?: number;
   accepted?: boolean | null;
+}
+
+function rpcResponseError(value: RpcErrorDetail | string | undefined): RpcClientError {
+  const message =
+    typeof value === 'string'
+      ? value
+      : (value && (value.message || value.code)) || 'RPC error';
+  const error = new Error(message) as RpcClientError;
+  if (value && typeof value === 'object') {
+    error.code = value.code;
+    error.details = value.details;
+    error.retryable = value.retryable;
+    error.retry_after_ms = value.retry_after_ms;
+    error.accepted = value.accepted;
+  }
+  return error;
 }
 
 export type RpcTerminationAction = 'reject' | 'reconnect';
@@ -98,7 +223,7 @@ export interface RpcFrame {
     methods?: string[];
     events?: string[];
   };
-  auth?: Record<string, unknown>;
+  auth?: Record<string, unknown> | null;
   seq?: number;
 }
 
@@ -484,6 +609,7 @@ export class RpcClient {
     this._ws = socket;
     this._armChallengeWatchdog(socket, generation);
     let handshakeRequestId: string | null = null;
+    let handshakeRequestSent = false;
 
     socket.onopen = () => {
       if (!this._isCurrentSocket(socket, generation)) return;
@@ -492,130 +618,160 @@ export class RpcClient {
 
     socket.onmessage = (ev: MessageEvent) => {
       if (!this._isCurrentSocket(socket, generation)) return;
-      let data: RpcFrame;
+      let parsed: unknown;
       try {
-        data = JSON.parse(ev.data);
+        parsed = JSON.parse(ev.data);
       } catch {
+        if (this._state === 'connecting') {
+          this._failInvalidHello(socket, generation, 'connect_frame_before_hello');
+        }
+        return;
+      }
+      if (!isRecord(parsed)) {
+        if (this._state === 'connecting') {
+          this._failInvalidHello(socket, generation, 'connect_frame_before_hello');
+        }
+        return;
+      }
+      const data = parsed as RpcFrame;
+
+      if (this._state === 'connecting') {
+        const helloCandidate = isHelloOkCandidate(parsed);
+        if (helloCandidate) {
+          if (
+            !handshakeRequestSent
+            || handshakeRequestId === null
+            || !isHelloOkFrame(parsed)
+          ) {
+            this._failInvalidHello(socket, generation);
+            return;
+          }
+
+          const hello = parsed;
+          // The authenticated Hello is a liveness proof for this exact socket.
+          // onmessage is generation/socket fenced above, and _clearWakeProbe
+          // refuses to clear a deadline owned by any replacement generation.
+          this._clearWakeProbe(generation);
+          this._clearHandshakeWatchdogs(generation);
+          this._emitTransport('hello', generation, {
+            reason: 'authenticated',
+            connId: hello.server.conn_id,
+          });
+          if (!this._isCurrentSocket(socket, generation)) return;
+          this._policy = hello.policy;
+          const serverGuestSessionKey = hello.auth?.guestSessionKey;
+          if (
+            typeof serverGuestSessionKey === 'string'
+            && GUEST_SESSION_KEY_PATTERN.test(serverGuestSessionKey)
+          ) {
+            this._guestSessionKey = serverGuestSessionKey;
+            persistGuestSessionKey(serverGuestSessionKey);
+          }
+          this._resolvePending(handshakeRequestId, hello, generation);
+          handshakeRequestId = null;
+          handshakeRequestSent = false;
+          // Only a completed protocol handshake proves recovery. Merely opening
+          // a socket must not reset backoff when a Gateway is repeatedly dying
+          // before connect completes.
+          this._reconnectAttempt = 0;
+          this._setState('connected');
+          this._emit('_hello', hello);
+          this._startPing();
+          this._startTickWatch();
+          return;
+        }
+
+        // Handshake: server sends connect.challenge, we reply with connect request.
+        // No pre-Hello frame participates in the application event sequence.
+        if (
+          data.type === 'event'
+          && data.event === 'connect.challenge'
+          && handshakeRequestId === null
+        ) {
+          this._clearChallengeWatchdog(generation);
+          this._emitTransport('challenge', generation, {
+            reason: 'server_challenge',
+          });
+          if (!this._isCurrentSocket(socket, generation)) return;
+          const authParams = {
+            auth: {
+              ...(this._token ? { token: this._token } : {}),
+              guestSessionKey: this._guestSessionKey || loadGuestSessionKey(),
+            },
+          };
+          const id = String(++this._reqId);
+          handshakeRequestId = id;
+          this._pending.set(id, {
+            resolve: () => {},
+            reject: (_err: Error) => {
+              this._recycleConnection(
+                generation,
+                new Error('Connect handshake failed'),
+                'connect_request_failure'
+              );
+            },
+            method: 'connect',
+            generation,
+            timeoutTimer: null,
+            signal: null,
+            abortHandler: null,
+          });
+          try {
+            socket.send(
+              JSON.stringify({
+                type: 'req',
+                id,
+                method: 'connect',
+                params: {
+                  minProtocol: WEB_RPC_PROTOCOL_VERSION,
+                  maxProtocol: WEB_RPC_PROTOCOL_VERSION,
+                  caps: [
+                    ANSWER_GENERATION_RESET_CAPABILITY,
+                    TURN_COMMITTED_CAPABILITY,
+                  ],
+                  client: { name: 'opensquilla-web' },
+                  ...authParams,
+                },
+              })
+            );
+            handshakeRequestSent = true;
+            this._armHelloWatchdog(socket, generation);
+          } catch (error) {
+            const sendError =
+              error instanceof Error ? error : new Error('Failed to send connect request');
+            this._rejectPending(id, sendError, generation);
+            this._recycleConnection(generation, sendError, 'connect_send_failure');
+          }
+          return;
+        }
+
+        // Authentication failures use the ordinary response envelope. Only an
+        // error for this exact connect request may run before Hello completes.
+        if (
+          handshakeRequestSent
+          && handshakeRequestId !== null
+          && data.type === 'res'
+          && data.id === handshakeRequestId
+          && data.ok === false
+        ) {
+          const id = handshakeRequestId;
+          handshakeRequestId = null;
+          handshakeRequestSent = false;
+          this._rejectPending(id, rpcResponseError(data.error), generation);
+          return;
+        }
+
+        this._failInvalidHello(socket, generation, 'connect_frame_before_hello');
         return;
       }
       if (!this._noteIncomingFrame(data)) return;
-
-      // Handshake: server sends connect.challenge, we reply with connect request
-      if (data.type === 'event' && data.event === 'connect.challenge') {
-        if (handshakeRequestId) return;
-        this._clearChallengeWatchdog(generation);
-        this._emitTransport('challenge', generation, {
-          reason: 'server_challenge',
-        });
-        if (!this._isCurrentSocket(socket, generation)) return;
-        const authParams = {
-          auth: {
-            ...(this._token ? { token: this._token } : {}),
-            guestSessionKey: this._guestSessionKey || loadGuestSessionKey(),
-          },
-        };
-        const id = String(++this._reqId);
-        handshakeRequestId = id;
-        this._pending.set(id, {
-          resolve: () => {},
-          reject: (_err: Error) => {
-            this._recycleConnection(
-              generation,
-              new Error('Connect handshake failed'),
-              'connect_request_failure'
-            );
-          },
-          method: 'connect',
-          generation,
-          timeoutTimer: null,
-          signal: null,
-          abortHandler: null,
-        });
-        try {
-          socket.send(
-            JSON.stringify({
-              type: 'req',
-              id,
-              method: 'connect',
-              params: {
-                minProtocol: 3,
-                maxProtocol: 3,
-                caps: [
-                  ANSWER_GENERATION_RESET_CAPABILITY,
-                  TURN_COMMITTED_CAPABILITY,
-                ],
-                client: { name: 'opensquilla-web' },
-                ...authParams,
-              },
-            })
-          );
-          this._armHelloWatchdog(socket, generation);
-        } catch (error) {
-          const sendError =
-            error instanceof Error ? error : new Error('Failed to send connect request');
-          this._rejectPending(id, sendError, generation);
-          this._recycleConnection(generation, sendError, 'connect_send_failure');
-        }
-        return;
-      }
-
-      // Handshake: HelloOk frame
-      if (data.protocol !== undefined && this._state === 'connecting') {
-        // The authenticated Hello is a liveness proof for this exact socket.
-        // onmessage is generation/socket fenced above, and _clearWakeProbe
-        // refuses to clear a deadline owned by any replacement generation.
-        this._clearWakeProbe(generation);
-        this._clearHandshakeWatchdogs(generation);
-        this._emitTransport('hello', generation, {
-          reason: 'authenticated',
-          ...(typeof data.server?.conn_id === 'string'
-            ? { connId: data.server.conn_id }
-            : {}),
-        });
-        if (!this._isCurrentSocket(socket, generation)) return;
-        this._policy = data.policy || null;
-        const serverGuestSessionKey = data.auth?.guestSessionKey;
-        if (
-          typeof serverGuestSessionKey === 'string'
-          && GUEST_SESSION_KEY_PATTERN.test(serverGuestSessionKey)
-        ) {
-          this._guestSessionKey = serverGuestSessionKey;
-          persistGuestSessionKey(serverGuestSessionKey);
-        }
-        if (handshakeRequestId) {
-          this._resolvePending(handshakeRequestId, data, generation);
-          handshakeRequestId = null;
-        }
-        // Only a completed protocol handshake proves recovery. Merely opening
-        // a socket must not reset backoff when a Gateway is repeatedly dying
-        // before connect completes.
-        this._reconnectAttempt = 0;
-        this._setState('connected');
-        this._emit('_hello', data);
-        this._startPing();
-        this._startTickWatch();
-        return;
-      }
 
       if (data.type === 'res') {
         const id = data.id ?? '';
         if (data.ok) {
           this._resolvePending(id, data.payload, generation);
         } else {
-          const err = data.error;
-          const message =
-            typeof err === 'string'
-              ? err
-              : (err && (err.message || err.code)) || 'RPC error';
-          const error = new Error(message) as RpcClientError;
-          if (err && typeof err === 'object') {
-            error.code = err.code;
-            error.details = err.details;
-            error.retryable = err.retryable;
-            error.retry_after_ms = err.retry_after_ms;
-            error.accepted = err.accepted;
-          }
-          this._rejectPending(id, error, generation);
+          this._rejectPending(id, rpcResponseError(data.error), generation);
         }
       } else if (data.type === 'event') {
         const meta = data.meta || {};
@@ -697,6 +853,20 @@ export class RpcClient {
     this._emit('_gap', { reason, generation });
     if (!this._isCurrentSocket(socket, generation)) return;
     this._retireCurrentSocket(new Error(message), false, reason);
+    this._scheduleReconnect();
+  }
+
+  private _failInvalidHello(
+    socket: WebSocket,
+    generation: number,
+    reason: string = 'connect_hello_invalid'
+  ): void {
+    if (!this._isCurrentSocket(socket, generation)) return;
+    this._emitTransport('handshake_invalid', generation, { reason });
+    if (!this._isCurrentSocket(socket, generation)) return;
+    this._emit('_gap', { reason, generation });
+    if (!this._isCurrentSocket(socket, generation)) return;
+    this._retireCurrentSocket(new Error('Invalid connect hello'), false, reason);
     this._scheduleReconnect();
   }
 

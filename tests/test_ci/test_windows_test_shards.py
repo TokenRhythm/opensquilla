@@ -786,6 +786,7 @@ def test_affinity_overflow_moves_only_environment_independent_tests() -> None:
     # These reviewed files need no shard-specific setup. Releasing them keeps
     # environment-dependent tests pinned while restoring an even critical path.
     assert moved == {
+        "tests/contracts/test_gateway_contract_parallel.py": "core",
         "tests/test_ci/test_migrations_packaged.py": "core",
         "tests/test_gateway/test_goal_rpc.py": "desktop-installer-contracts",
         "tests/test_gateway/test_project_workspace_execution.py": (

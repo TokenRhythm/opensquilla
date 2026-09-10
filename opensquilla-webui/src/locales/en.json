@@ -3069,7 +3069,9 @@
       "clearActivity": "Clear activity",
       "expandActivity": "Expand install activity",
       "collapseActivity": "Collapse install activity",
+      "selectSkillDirectory": "Select a Skill directory",
       "queueStatus": {
+        "selection_required": "Choose directory",
         "queued": "Queued",
         "installing": "Installing",
         "cancelling": "Cancelling",

@@ -81,6 +81,7 @@
   "weights_seconds": {
     "tests/contracts/test_approval_center_contract.py": 0.01,
     "tests/contracts/test_conversation_events_contract.py": 0.01,
+    "tests/contracts/test_gateway_contract_parallel.py": 0.01,
     "tests/contracts/test_gateway_contract_runner.py": 0.01,
     "tests/contracts/test_gateway_contract_toolchain_integration.py": 0.01,
     "tests/contracts/test_goals_contract.py": 0.01,

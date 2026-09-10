@@ -1,6 +1,7 @@
 import fs from 'node:fs'
 import path from 'node:path'
 import { expect, test, type Page } from '@playwright/test'
+import { helloOkResponse } from './support/gateway-fixture'
 
 import {
   chatHistoryPayload,
@@ -57,7 +58,7 @@ async function mockActivityHistory(page: Page, fixture: ActivityFixture = {}) {
       }
       if (frame.type !== 'req' || frame.id === undefined) return
       if (frame.method === 'connect') {
-        ws.send(JSON.stringify({ protocol: 3, policy: {} }))
+        ws.send(helloOkResponse())
         return
       }
       if (frame.method === 'chat.history') {
@@ -206,7 +207,7 @@ async function mockUnifiedTurnReceiptHistory(page: Page) {
       }
       if (frame.type !== 'req' || frame.id === undefined) return
       if (frame.method === 'connect') {
-        ws.send(JSON.stringify({ protocol: 3, policy: {} }))
+        ws.send(helloOkResponse())
         return
       }
       if (frame.method === 'chat.history') {
@@ -228,7 +229,7 @@ async function mockUnifiedTurnReceiptHistory(page: Page) {
           skills: {},
         },
         'onboarding.status': { audioConfigured: false },
-        'sessions.list': { sessions: [], has_more: false },
+        'sessions.list': { sessions: [], count: 0, ts: 1_800_000_000, has_more: false },
         'sessions.messages.subscribe': sessionMessagesSubscribePayload(
           sessionKey,
         ),
@@ -288,9 +289,8 @@ async function mockControlledActivityLifecycle(
       if (frame.type !== 'req') return
       const method = String(frame.method || '')
       if (method === 'connect') {
-        ws.send(JSON.stringify({
-          protocol: 3,
-          policy: { tick_interval_ms: 30_000, webui_stream_idle_grace_ms: 1_260_000 },
+        ws.send(helloOkResponse({
+          policy: { webui_stream_idle_grace_ms: 1_260_000 },
         }))
         return
       }
@@ -378,7 +378,7 @@ async function mockControlledActivityLifecycle(
           skills: {},
         },
         'onboarding.status': { audioConfigured: false },
-        'sessions.list': { sessions: [], has_more: false },
+        'sessions.list': { sessions: [], count: 0, ts: 1_800_000_000, has_more: false },
         'sessions.messages.subscribe': sessionMessagesSubscribePayload(
           LIFECYCLE_SESSION_KEY,
         ),
