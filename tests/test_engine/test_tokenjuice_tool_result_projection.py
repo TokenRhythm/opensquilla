@@ -346,7 +346,7 @@ async def test_agent_projects_tokenjuice_without_context_window_gate(
         content="pytest output\n" + ("x" * 1000),
     )
 
-    projected = await agent._canonicalize_tool_result(
+    projected = await agent._project_tool_result_for_llm(
         result,
         tool_call=ToolCall(
             tool_use_id="tool-1",
@@ -453,7 +453,7 @@ async def test_source_read_file_result_is_preserved_before_tokenjuice(
         content=source,
     )
 
-    projected = await agent._canonicalize_tool_result(
+    projected = await agent._project_tool_result_for_llm(
         result,
         tool_call=ToolCall(
             tool_use_id="tool-1",
@@ -516,7 +516,7 @@ async def test_exec_git_diff_result_is_preserved_before_tokenjuice(
         content=diff,
     )
 
-    projected = await agent._canonicalize_tool_result(
+    projected = await agent._project_tool_result_for_llm(
         result,
         tool_call=ToolCall(
             tool_use_id="tool-1",
@@ -567,7 +567,7 @@ async def test_exec_source_read_result_is_preserved_before_tokenjuice(
         content=source,
     )
 
-    projected = await agent._canonicalize_tool_result(
+    projected = await agent._project_tool_result_for_llm(
         result,
         tool_call=ToolCall(
             tool_use_id="tool-1",
@@ -614,7 +614,7 @@ async def test_broad_grep_result_is_not_semantically_preserved(
         content=content,
     )
 
-    projected = await agent._canonicalize_tool_result(
+    projected = await agent._project_tool_result_for_llm(
         result,
         tool_call=ToolCall(
             tool_use_id="tool-1",
@@ -648,7 +648,7 @@ async def test_tokenjuice_noop_preserves_tool_result(
         content="short output",
     )
 
-    projected = await agent._canonicalize_tool_result(result)
+    projected = await agent._project_tool_result_for_llm(result)
 
     assert projected is result
     assert projected.content == "short output"
@@ -678,7 +678,7 @@ async def test_tokenjuice_projection_preserves_raw_without_recovery_contract(
     )
     raw_output = "raw output\n" + ("x" * 8000)
 
-    projected = await agent._canonicalize_tool_result(
+    projected = await agent._project_tool_result_for_llm(
         ToolResult(
             tool_use_id="tool-1",
             tool_name="exec_command",
@@ -1104,7 +1104,7 @@ async def test_provider_call_without_retrieval_schema_restores_stored_raw_result
         session_key="agent:main:session-1",
     )
     raw = "diagnostic output\n" + ("x" * 10_000)
-    projected = await agent._canonicalize_tool_result(
+    projected = await agent._project_tool_result_for_llm(
         ToolResult(
             tool_use_id="tool-restore",
             tool_name="exec_command",
@@ -1709,7 +1709,7 @@ async def test_runtime_events_record_tokenjuice_projection_applied(
         tool_handler=_unused_retrieval_handler,
     )
 
-    projected = await agent._canonicalize_tool_result(
+    projected = await agent._project_tool_result_for_llm(
         ToolResult(
             tool_use_id="tool-1",
             tool_name="exec_command",
@@ -1780,7 +1780,7 @@ async def test_projection_envelope_includes_retrieval_hint_and_search_hints(
         + ("x" * 20_000)
     )
 
-    projected = await agent._canonicalize_tool_result(
+    projected = await agent._project_tool_result_for_llm(
         ToolResult(
             tool_use_id="tool-1",
             tool_name="exec_command",
@@ -1831,7 +1831,7 @@ async def test_tool_projection_noops_when_handle_envelope_would_grow_result(
         content="small output",
     )
 
-    projected = await agent._canonicalize_tool_result(result)
+    projected = await agent._project_tool_result_for_llm(result)
 
     assert projected is result
     assert projected.content == "small output"
@@ -1867,7 +1867,7 @@ async def test_full_trace_store_preserves_raw_snapshot_without_projection(
         content="line 1\nline 2\n",
     )
 
-    projected = await agent._canonicalize_tool_result(result)
+    projected = await agent._project_tool_result_for_llm(result)
 
     assert projected is result
     assert projected.content == "line 1\nline 2\n"
@@ -1907,8 +1907,8 @@ async def test_full_trace_store_reuses_snapshot_for_replayed_tool_result(
         content="same replayed output\n",
     )
 
-    first = await agent._canonicalize_tool_result(result)
-    second = await agent._canonicalize_tool_result(result)
+    first = await agent._project_tool_result_for_llm(result)
+    second = await agent._project_tool_result_for_llm(result)
 
     assert first is result
     assert second is result
@@ -1953,7 +1953,7 @@ async def test_tool_projection_noops_when_store_budget_rejects_raw_snapshot(
         content=content,
     )
 
-    projected = await agent._canonicalize_tool_result(result)
+    projected = await agent._project_tool_result_for_llm(result)
 
     assert projected is result
     assert projected.content == content
@@ -1998,7 +1998,7 @@ async def test_large_compressible_projection_stores_retrievable_raw_snapshot(
         content=content,
     )
 
-    projected = await agent._canonicalize_tool_result(result)
+    projected = await agent._project_tool_result_for_llm(result)
 
     assert projected is not result
     assert "[tool_result_projection]" in projected.content
@@ -2053,7 +2053,7 @@ async def test_json_guard_projection_includes_retrievable_raw_snapshot(
         content=content,
     )
 
-    projected = await agent._canonicalize_tool_result(result)
+    projected = await agent._project_tool_result_for_llm(result)
 
     assert projected is not result
     assert "[tool_result_projection]" in projected.content
@@ -2104,7 +2104,7 @@ async def test_json_guard_preserves_raw_content_when_store_budget_rejects_snapsh
         content=content,
     )
 
-    projected = await agent._canonicalize_tool_result(result)
+    projected = await agent._project_tool_result_for_llm(result)
 
     assert projected is result
     assert projected.content == content

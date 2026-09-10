@@ -89,10 +89,6 @@ def _was_staged(attachment: dict[str, Any]) -> bool:
     return bool(attachment.get("_was_staged"))
 
 
-def _transcript_dir(media_root: Path, session_id: str) -> Path:
-    return Path(media_root) / "transcripts" / session_id
-
-
 def build_transcript_attachment_envelope(
     *,
     text: str,

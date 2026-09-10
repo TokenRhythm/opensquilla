@@ -4,7 +4,7 @@ meta_invoke is registered with ``default_access="deny"`` so the tool
 catalogue stays clean in deployments that don't ship meta-skills. When
 at least one ``kind=meta`` skill IS loaded, ``_build_tools`` must add
 ``"meta_invoke"`` to ``ctx.surfaced_tools`` so the registry's visibility
-check at :func:`ToolRegistry._is_visible` lets it through.
+check at :func:`ToolRegistry._iter_visible_tools` lets it through.
 """
 
 from __future__ import annotations

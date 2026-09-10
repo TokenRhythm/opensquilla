@@ -309,10 +309,6 @@ def _set_cached_payload(cache_key: tuple[Any, ...], payload: dict[str, Any]) -> 
     )
 
 
-def _provider_order(options: SearchOptions) -> tuple[str, ...]:
-    return get_resolved_search_runtime().provider_order(options)
-
-
 def _coerce_search_error(provider_name: str, exc: Exception) -> SearchProviderError:
     if isinstance(exc, SearchProviderError):
         return exc

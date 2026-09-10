@@ -3053,11 +3053,6 @@ class _SelectorFallbackProvider:
                 return index
         return 0
 
-    def _can_escalate_local_admission_failure(self, config: Any = None) -> bool:
-        """Return whether any authorized leg has a larger context window."""
-
-        return self._local_admission_fallback_index(config) > 0
-
     def _skip_benched_fallbacks(self) -> None:
         """Advance past benched fallback deployments (opt-in ledger only).
 
@@ -8334,10 +8329,6 @@ class TurnRunner:
             known_skill_names=known_skill_names,
         )
         return tool_defs, tool_handler
-
-    def _filter_tool_defs_by_capability(self, tool_defs: list) -> list:
-        """Compatibility shim; runtime capability filtering is resolved in ToolContext."""
-        return tool_defs
 
     def _apply_runtime_capability_denies(self, ctx: ToolContext) -> ToolContext:
         from opensquilla.tools.policy import (

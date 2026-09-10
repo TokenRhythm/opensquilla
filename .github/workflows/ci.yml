@@ -47,7 +47,6 @@ jobs:
       source_successful_suites: ${{ steps.verify.outputs.source_successful_suites }}
       source_planner_digest: ${{ steps.verify.outputs.source_planner_digest }}
       source_suite_execution_digests: ${{ steps.verify.outputs.source_suite_execution_digests }}
-      combined_smoke_suites: ${{ steps.verify.outputs.combined_smoke_suites || '[]' }}
     steps:
       - name: Validate optimization mode
         id: mode
@@ -98,7 +97,6 @@ jobs:
           QUEUE_BASE_SHA: ${{ steps.verify.outputs.queue_base_sha }}
           QUEUE_HEAD_SHA: ${{ steps.verify.outputs.queue_head_sha }}
           QUEUE_TREE_SHA: ${{ steps.verify.outputs.queue_tree_sha }}
-          COMBINED_SMOKE_SUITES: ${{ steps.verify.outputs.combined_smoke_suites || '[]' }}
           REUSED_SUITES: ${{ steps.verify.outputs.reused_suites || '[]' }}
         shell: bash
         run: |
@@ -111,7 +109,6 @@ jobs:
             echo "- Candidates: \`${CANDIDATE_COUNT}\`"
             echo "- Artifact: \`${ARTIFACT_NAME}\`"
             echo "- Queue base/head/tree: \`${QUEUE_BASE_SHA}\` / \`${QUEUE_HEAD_SHA}\` / \`${QUEUE_TREE_SHA}\`"
-            echo "- Combined-tree domain smokes: \`${COMBINED_SMOKE_SUITES}\`"
             echo "- Reused suites: \`${REUSED_SUITES}\` (all other full-matrix suites must run)"
             if [[ "${REASON_CODE}" == "tree_mismatch" ]]; then
               echo "- Fast-path note: the PR evidence does not match this queue tree, so this entry runs the full fail-closed matrix. If main advanced, refresh the PR against the latest main and wait for a new green PR CI run before requeueing. Reuse is always decided against the future entry's exact base and tree."

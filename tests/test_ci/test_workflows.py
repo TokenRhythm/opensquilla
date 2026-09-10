@@ -406,9 +406,7 @@ def test_ci_fast_paths_keep_the_required_check_and_fail_closed() -> None:
     assert "fetch-depth" in str(jobs["queue-attestation"])
     assert "verify-queue" in str(jobs["queue-attestation"])
     assert "reason_code" in str(jobs["queue-attestation"])
-    assert jobs["queue-attestation"]["outputs"]["combined_smoke_suites"] == (
-        "${{ steps.verify.outputs.combined_smoke_suites || '[]' }}"
-    )
+    assert "combined_smoke_suites" not in jobs["queue-attestation"]["outputs"]
     assert not any(
         name.startswith("nightly_") for name in jobs["queue-attestation"]["outputs"]
     )
@@ -1085,9 +1083,15 @@ def test_pr_target_branch_workflow_runs_trusted_base_validator() -> None:
     assert "Validate target branch" in text
     assert job["name"] == "Validate target branch"
     assert job["timeout-minutes"] == 5
-    assert "github.event.repository.default_branch" in text
-    assert "hashFiles('.github/scripts/validate-pr-target-branch.sh') == ''" in text
-    assert "github.event.pull_request.head.sha" in text
+    checkouts = [
+        step for step in job["steps"] if step.get("uses") == "actions/checkout@v4"
+    ]
+    assert len(checkouts) == 1
+    assert "if" not in checkouts[0]
+    assert checkouts[0]["with"] == {
+        "ref": "${{ github.event.repository.default_branch }}",
+        "persist-credentials": False,
+    }
     assert "github.event.merge_group.base_ref" in text
     assert "github.event.merge_group.head_ref" in text
     assert "pull-requests: read" in text
@@ -1111,13 +1115,20 @@ def test_pr_target_validator_accepts_merge_group_base_ref(tmp_path: Path) -> Non
 def test_pr_body_lint_workflow_warns_from_trusted_base() -> None:
     data = _workflow("pr-body-lint.yml")
     text = (WORKFLOW_DIR / "pr-body-lint.yml").read_text(encoding="utf-8")
+    job = data["jobs"]["validate-body"]
 
     assert _trigger_keys(data) == {"pull_request"}
     assert "pull_request_target" not in text
     assert "Validate PR body fields" in text
-    assert "github.event.repository.default_branch" in text
-    assert "hashFiles('.github/scripts/validate_pr_body.py') == ''" in text
-    assert "github.event.pull_request.head.sha" in text
+    checkouts = [
+        step for step in job["steps"] if step.get("uses") == "actions/checkout@v4"
+    ]
+    assert len(checkouts) == 1
+    assert "if" not in checkouts[0]
+    assert checkouts[0]["with"] == {
+        "ref": "${{ github.event.repository.default_branch }}",
+        "persist-credentials": False,
+    }
     assert "pull-requests: read" in text
     assert PR_BODY_LINT.as_posix() in text
     assert "PR_BODY_LINT_STRICT: \"0\"" in text

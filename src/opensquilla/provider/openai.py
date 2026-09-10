@@ -765,13 +765,6 @@ def _extract_think_tags(text: str) -> str:
     return "\n".join(matches) if matches else ""
 
 
-def _strip_think_tags(text: str) -> str:
-    """Remove <think> tags from text, including unclosed trailing tags."""
-    result = re.sub(r"<think>[\s\S]*?</think>", "", text)
-    result = re.sub(r"<think>[\s\S]*$", "", result)
-    return result.strip()
-
-
 def _on_official_host(policy: OpenAICompatPolicy, base_url: str) -> bool:
     return bool(policy.official_host) and policy.official_host in base_url.lower()
 

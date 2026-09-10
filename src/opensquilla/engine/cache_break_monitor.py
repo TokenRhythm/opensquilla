@@ -41,12 +41,6 @@ def _message_prefix_messages(messages: list[Message], *, tail_count: int = 2) ->
     return list(messages[:-tail_count])
 
 
-def _message_prefix_payload(messages: list[Message], *, tail_count: int = 2) -> list[Any]:
-    return [
-        _jsonable(message) for message in _message_prefix_messages(messages, tail_count=tail_count)
-    ]
-
-
 def _message_prefix_item_kind(message: Message) -> str:
     content = message.content
     if isinstance(content, str):

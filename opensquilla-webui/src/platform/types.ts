@@ -141,7 +141,6 @@ export interface PlatformCapabilities {
   canManageLocalApiKeys: boolean
   canRevealGatewayLog: boolean
   canRestartGateway: boolean
-  hasDesktopOnboarding: boolean
   hasWebConfig: boolean
   /**
    * The operator likely has a terminal where `opensquilla` resolves (web

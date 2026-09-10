@@ -16,13 +16,6 @@ export function webchatSessionKey(agentId: string, suffix = 'default'): string {
   return 'agent:' + normalizeAgentId(agentId) + ':webchat:' + suffix
 }
 
-export function newWebchatSessionKey(
-  agentId: string,
-  suffix = Math.random().toString(36).slice(2, 10),
-): string {
-  return webchatSessionKey(agentId, suffix)
-}
-
 export function canonicalSessionKey(key: string): string {
   const value = (key || '').trim()
   if (!value || value === 'default' || value === 'webchat:default') return WEBCHAT_SESSION_KEY

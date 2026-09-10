@@ -818,31 +818,6 @@ def test_prepare_windows_portable_release_tree_includes_double_click_launcher(
     assert "$env:PYTHONIOENCODING = 'utf-8:replace'" in start_ps1
 
 
-def test_install_portable_wheelhouse_preinstalls_into_bundled_python(
-    tmp_path: Path,
-) -> None:
-    module = load_script()
-    release_root = tmp_path / "release"
-    package_dir = release_root / "packages"
-    site_packages = release_root / "runtime" / "python" / "Lib" / "site-packages"
-    package_dir.mkdir(parents=True)
-    site_packages.mkdir(parents=True)
-    wheel_path = package_dir / "demo-0.1.0-py3-none-any.whl"
-    with ZipFile(wheel_path, "w") as wheel:
-        wheel.writestr("demo_pkg/__init__.py", "VALUE = 1\n")
-        wheel.writestr("demo-0.1.0.dist-info/METADATA", "Name: demo\n")
-        wheel.writestr("demo-0.1.0.data/purelib/demo_extra.py", "EXTRA = 2\n")
-        wheel.writestr("demo-0.1.0.data/scripts/demo-script.py", "print('skip')\n")
-
-    module.install_portable_wheelhouse(release_root)
-
-    assert (site_packages / "demo_pkg" / "__init__.py").read_text(encoding="utf-8") == (
-        "VALUE = 1\n"
-    )
-    assert (site_packages / "demo_extra.py").read_text(encoding="utf-8") == "EXTRA = 2\n"
-    assert not (site_packages / "demo-script.py").exists()
-
-
 def test_create_zip_contains_release_directory_and_preserves_install_mode(tmp_path: Path) -> None:
     module = load_script()
     release_root = tmp_path / "OpenSquilla-0.1.0-macos-arm64-py312-recommended-wheelhouse"

@@ -304,22 +304,6 @@ def _pending_input_lock_for(pending_input_id: str) -> asyncio.Lock:
     return lock
 
 
-async def _pending_input_enqueue_lock(
-    ctx: RpcContext,
-    session_key: str,
-    pending_input_id: str,
-):
-    """Fence enqueue against session reset/delete after serializing its id."""
-
-    async with _pending_input_lock_for(pending_input_id):
-        session_lock = get_session_lock(ctx.turn_runner, session_key)
-        if session_lock is None:
-            yield
-        else:
-            async with session_lock:
-                yield
-
-
 log = structlog.get_logger(__name__)
 _ELEVATED_MODES = frozenset({"full"})
 _TRUSTED_ELEVATED_ALIASES = frozenset({"on", "bypass"})
@@ -706,14 +690,6 @@ async def _fork_with_numbered_title(
             raise KeyError(f"Session not found: {parent_key}")
         display_name = await _next_fork_display_name(ctx, storage, current_parent)
         return await create_with_display_name(display_name)
-
-
-def _clean_cancel_source(value: Any, default: str) -> str:
-    text = str(value or "").strip()
-    if not text:
-        return default
-    safe = "".join(ch if ch.isalnum() or ch in {"_", "-", ".", ":"} else "_" for ch in text)
-    return (safe.strip("_") or default)[:80]
 
 
 def _truncate_removed_entries(transcript: list[Any], max_messages: int) -> list[Any]:

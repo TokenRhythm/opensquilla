@@ -27,7 +27,6 @@ const loading = ref(false)
 const actionBusy = ref(false)
 
 let initialized = false
-let unsubscribe: (() => void) | null = null
 
 function updateState(next: DesktopUpdateState) {
   state.value = { ...idleUpdateState, ...next }
@@ -101,7 +100,7 @@ function initDesktopUpdate() {
   initialized = true
   const platform = getPlatform()
   if (platform.capabilities.isDesktop) {
-    unsubscribe = platform.updates.onState(updateState)
+    platform.updates.onState(updateState)
   }
   void refreshDesktopUpdate()
 }
@@ -149,9 +148,3 @@ export function useDesktopUpdate() {
 }
 
 export type DesktopUpdateController = ReturnType<typeof useDesktopUpdate>
-
-export function stopDesktopUpdateSubscriptionForTests() {
-  unsubscribe?.()
-  unsubscribe = null
-  initialized = false
-}

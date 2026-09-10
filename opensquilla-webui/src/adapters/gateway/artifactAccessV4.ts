@@ -16,11 +16,8 @@ import {
 import {
   artifactHttpAccessUrl,
   artifactHttpGatewayOpenUrl,
-  artifactHttpThumbnailUrl,
   bindArtifactBinaryRequest,
   bindArtifactOpenRequest,
-  isSameArtifactHttpOrigin,
-  isTrustedArtifactHttpUrl,
   runtimeArtifactHttpBaseOrigin,
 } from './privateArtifactHttpTransport'
 
@@ -125,14 +122,6 @@ function isolateOpenedWindow(opened: ArtifactWindowHandle): boolean {
   }
 }
 
-export function isSameOriginArtifactUrl(url: string, baseOrigin: string): boolean {
-  return isSameArtifactHttpOrigin(url, baseOrigin)
-}
-
-export function isTrustedArtifactTransportUrl(url: string, baseOrigin: string): boolean {
-  return isTrustedArtifactHttpUrl(url, baseOrigin)
-}
-
 interface ArtifactUrlOptions {
   readonly absolute?: boolean
 }
@@ -143,13 +132,6 @@ export function artifactAccessUrl(
   options: ArtifactUrlOptions = {},
 ): string {
   return artifactHttpAccessUrl(artifact, baseOrigin, options)
-}
-
-export function artifactThumbnailAccessUrl(
-  artifact: ArtifactPayload,
-  baseOrigin: string,
-): string {
-  return artifactHttpThumbnailUrl(artifact, baseOrigin)
 }
 
 export function artifactGatewayOpenUrl(artifact: ArtifactPayload, baseOrigin: string): string {

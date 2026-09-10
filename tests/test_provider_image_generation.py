@@ -1993,7 +1993,6 @@ def test_image_generation_capability_exposes_agent_tool_when_configured(monkeypa
     ctx = ToolContext(is_owner=True, caller_kind=CallerKind.WEB, agent_id="main")
     ctx = TurnRunner._apply_runtime_capability_denies(runner, ctx)
     tool_defs = runner._tool_registry.to_tool_definitions(ctx)
-    tool_defs = TurnRunner._filter_tool_defs_by_capability(runner, tool_defs)
     names = {tool.name for tool in tool_defs}
 
     assert "image_generate" in names
@@ -2021,7 +2020,6 @@ def test_image_generation_capability_does_not_expose_agent_tool_when_disabled(
     ctx = ToolContext(is_owner=True, caller_kind=CallerKind.WEB, agent_id="main")
     ctx = TurnRunner._apply_runtime_capability_denies(runner, ctx)
     tool_defs = runner._tool_registry.to_tool_definitions(ctx)
-    tool_defs = TurnRunner._filter_tool_defs_by_capability(runner, tool_defs)
     names = {tool.name for tool in tool_defs}
 
     assert "image_generate" not in names
