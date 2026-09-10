@@ -69,6 +69,7 @@ def test_partial_gate_keeps_shared_frontend_job_and_requires_full_coverage() -> 
     ("RESULT_WINDOWS_FULL", "skipped"), ("RESULT_WINDOWS_FULL", "failure"),
     ("RESULT_FRONTEND", "failure"), ("RESULT_CONTRACT_WINDOWS", "failure"),
     ("RESULT_PLANNER", "cancelled"),
+    ("QUEUE_PARTIAL", ""), ("QUEUE_PARTIAL", "false"), ("QUEUE_PARTIAL", "invalid"),
 ])
 def test_partial_gate_cannot_hide_missing_failed_or_cancelled_checks(key: str, value: str) -> None:
     env = _partial_env()

@@ -161,6 +161,12 @@ def check_ci_results(env: Mapping[str, str]) -> list[str]:
     required_suites = _read_required_suites(env, errors)
     if env.get("QUEUE_PARTIAL") == "true":
         _check_partial_coverage(env, required_suites, errors)
+    elif env.get("GITHUB_EVENT_NAME") == "merge_group":
+        try:
+            if required_suites != _full_queue_suites():
+                errors.append("Queue without partial proof must execute the full matrix.")
+        except (OSError, ValueError, KeyError, TypeError):
+            errors.append("Full queue coverage manifest is invalid.")
 
     required_results = {
         variable
@@ -177,6 +183,11 @@ def check_ci_results(env: Mapping[str, str]) -> list[str]:
         )
 
     return errors
+
+
+def _full_queue_suites() -> set[str]:
+    manifest = Path(__file__).resolve().parents[1] / "ci" / "suites.v1.json"
+    return set(json.loads(manifest.read_text(encoding="utf-8"))["full_suites"])
 
 
 def _check_partial_coverage(
@@ -202,8 +213,7 @@ def _check_partial_coverage(
             or not set(reused) <= {"frontend-validation", "tui"}
         ):
             raise ValueError("invalid reused suites")
-        manifest = Path(__file__).resolve().parents[1] / "ci" / "suites.v1.json"
-        full = set(json.loads(manifest.read_text(encoding="utf-8"))["full_suites"])
+        full = _full_queue_suites()
         if executed & set(reused) or executed | set(reused) != full:
             errors.append("Executed and reused suites must partition the full queue matrix.")
     except (OSError, ValueError, KeyError, TypeError):
