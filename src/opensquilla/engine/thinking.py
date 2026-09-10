@@ -29,6 +29,9 @@ def drop_reasoning(
     out: list[Message] = []
 
     for msg in messages:
+        if preserve_reasoning_content and msg.provider_replay is not None:
+            out.append(msg)
+            continue
         # Clear reasoning_content on any assistant message that has it
         if msg.role == "assistant" and msg.reasoning_content is not None:
             keep_tool_reasoning = preserve_tool_call_reasoning and _has_tool_use(msg.content)
@@ -45,6 +48,7 @@ def drop_reasoning(
                 out.append(
                     Message(
                         role="assistant",
+                        provider_replay=msg.provider_replay,
                         content=filtered,
                         reasoning_content=(
                             msg.reasoning_content if keep_reasoning_content else None
@@ -55,6 +59,7 @@ def drop_reasoning(
                 out.append(
                     Message(
                         role="assistant",
+                        provider_replay=msg.provider_replay,
                         content=msg.content,
                         reasoning_content=(
                             msg.reasoning_content if keep_reasoning_content else None
@@ -88,7 +93,7 @@ def drop_reasoning(
         if not filtered:
             filtered = [ContentBlockText(text="")]
 
-        out.append(Message(role="assistant", content=filtered))
+        out.append(msg.model_copy(update={"content": filtered}))
 
     return out if touched else messages
 

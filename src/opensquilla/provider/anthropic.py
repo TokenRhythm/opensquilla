@@ -46,6 +46,7 @@ log = structlog.get_logger(__name__)
 
 _ANTHROPIC_API_BASE = "https://api.anthropic.com"
 _ANTHROPIC_VERSION = "2023-06-01"
+_ANTHROPIC_REPLAY_PROTOCOL = "anthropic_messages"
 
 
 # The SKUs this adapter advertises from list_models. The LISTING SET is
@@ -111,6 +112,14 @@ def _build_message_payload(
 ) -> dict[str, Any]:
     if isinstance(msg.content, str):
         return {"role": msg.role, "content": msg.content}
+    # Canonical history now retains captured thinking across target changes.
+    # An explicit foreign carrier must not turn Gemini/OpenAI signatures into
+    # Anthropic thinking signatures. Legacy messages keep their existing path;
+    # native Anthropic source/model provenance is a separate adapter contract.
+    replay_provider_state = replay_provider_state and (
+        msg.provider_replay is None
+        or msg.provider_replay.protocol == _ANTHROPIC_REPLAY_PROTOCOL
+    )
     parts: list[dict[str, Any]] = []
     tool_result_parts: list[dict[str, Any]] = []
     for block in msg.content:

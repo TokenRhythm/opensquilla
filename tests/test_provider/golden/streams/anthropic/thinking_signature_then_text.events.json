@@ -26,6 +26,7 @@
     "model_usage_breakdown": [],
     "output_tokens": 9,
     "provider": "anthropic",
+    "provider_replay": null,
     "reasoning_content": "Let me think about this.",
     "reasoning_tokens": 0,
     "stop_reason": "end_turn",

@@ -45,6 +45,7 @@
     "model_usage_breakdown": [],
     "output_tokens": 12,
     "provider": "anthropic",
+    "provider_replay": null,
     "reasoning_content": null,
     "reasoning_tokens": 0,
     "stop_reason": "tool_use",

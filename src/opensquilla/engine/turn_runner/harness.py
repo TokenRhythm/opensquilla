@@ -1750,6 +1750,7 @@ class _TurnRunnerTranscriptAppendAdapter(TranscriptAppendPort):
         expected_session_id: str | None = None,
         expected_session_epoch: int | None = None,
         provenance: dict[str, Any] | None = None,
+        assistant_replay: dict[str, Any] | None = None,
     ) -> TranscriptAppendResult:
         from opensquilla.engine.runtime import _accepts_keyword_arg
 
@@ -1765,6 +1766,8 @@ class _TurnRunnerTranscriptAppendAdapter(TranscriptAppendPort):
             append_kwargs["message_id"] = assistant_message_id
         if reasoning_content is not None:
             append_kwargs["reasoning_content"] = reasoning_content
+        if assistant_replay is not None:
+            append_kwargs["assistant_replay"] = assistant_replay
         if (
             turn_usage is not None
             and _accepts_keyword_arg(session_manager.append_message, "turn_usage")

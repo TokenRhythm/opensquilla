@@ -17,6 +17,8 @@ from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol, cast
 
+from opensquilla.engine.types import public_agent_event_payload
+
 if TYPE_CHECKING:
     from opensquilla.engine.usage import UsageTracker
     from opensquilla.memory.manager import MemoryManager
@@ -1865,7 +1867,7 @@ async def _emit_task_runtime_stream_events(
     task's late ``tool_use_start`` / ``error`` / ``done`` events are
     indistinguishable from the current turn's and leak into it (issue #344).
     """
-    from dataclasses import asdict, is_dataclass
+    from dataclasses import is_dataclass
 
     from opensquilla.engine.stream_wrappers import wrap_stream
 
@@ -1889,7 +1891,7 @@ async def _emit_task_runtime_stream_events(
         context_bound=context_bound,
     ):
         if is_dataclass(event):
-            event_dict = asdict(event)
+            event_dict = public_agent_event_payload(event)
         else:
             event_dict = {
                 key: value

@@ -41,6 +41,13 @@
     "model_usage_breakdown": [],
     "output_tokens": 9,
     "provider": "openai",
+    "provider_replay": {
+      "model": "gpt-test",
+      "native_reasoning_content": null,
+      "protocol": "openai_chat_completions",
+      "reasoning_details": null,
+      "source": "openai_compat:89ed697549efac2ada97829f96f401db22726a687602f2f8718732a8db40c924"
+    },
     "reasoning_content": null,
     "reasoning_tokens": 0,
     "stop_reason": "tool_calls",

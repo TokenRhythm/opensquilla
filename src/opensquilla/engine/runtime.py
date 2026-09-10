@@ -1846,7 +1846,11 @@ class _SelectorPreTextBuffer:
                 payload,
                 ensure_ascii=False,
                 separators=(",", ":"),
-                default=str,
+                default=lambda value: (
+                    value.model_dump(mode="json")
+                    if callable(getattr(value, "model_dump", None))
+                    else str(value)
+                ),
             )
             return len(serialized.encode("utf-8"))
         except (TypeError, ValueError):
@@ -2360,6 +2364,14 @@ class _SelectorFallbackProvider:
         disable()
         self._provider = self._selector.resolve()
 
+    def requires_complete_reasoning_history(self, *, tools: Any, thinking: bool) -> bool:
+        requires = getattr(self._provider, "requires_complete_reasoning_history", None)
+        return callable(requires) and requires(tools=tools, thinking=thinking) is True
+
+    def can_replay_reasoning(self, message: Any) -> bool:
+        compatible = getattr(self._provider, "can_replay_reasoning", None)
+        return callable(compatible) and compatible(message) is True
+
     def _realign_routed_model_after_fallback(self) -> None:
         """Failover changed the running model — telemetry must follow.
 
@@ -2590,7 +2602,19 @@ class _SelectorFallbackProvider:
                 turn_metadata.pop("image_input_marker_state", None)
         if should_marker:
             assert_text_only_messages(projection.messages)
-        return projection.messages
+        result = projection.messages
+        if self.requires_complete_reasoning_history(
+            tools=self._last_request_had_tools,
+            thinking=bool(getattr(active_config, "thinking", False)),
+        ):
+            from opensquilla.engine.replay_compat import rebase_incomplete_reasoning_history
+
+            result, rebased = rebase_incomplete_reasoning_history(
+                list(result), compatible=self.can_replay_reasoning
+            )
+            if rebased and isinstance(turn_metadata, dict):
+                turn_metadata["reasoning_replay_context_rebuilt"] = True
+        return result
 
     def _advance_past_explicit_tool_denials(
         self,
@@ -5252,6 +5276,31 @@ class TurnRunner:
     async def _append_session_message(self, session_key: str, **append_kwargs: Any) -> Any:
         if self._session_manager is None:
             return None
+        assistant_replay = append_kwargs.get("assistant_replay")
+        if assistant_replay is not None and (
+            getattr(
+                getattr(self._turn_config(), "attachments", None), "persist_transcripts", True
+            ) is False
+        ):
+            from opensquilla.engine.history import decode_assistant_replay
+
+            # Normal completion and cancellation share this durable boundary.
+            # Keep request-local images in the live canonical messages, but do
+            # not retain their bytes in the transcript when persistence is off.
+            # The shared content projection preserves native reasoning and
+            # tool associations, including images nested inside tool results.
+            projection = project_messages(
+                decode_assistant_replay(assistant_replay),
+                mode=ImageProjectionMode.MARKER,
+                marker_state=ImageMarkerState.UNAVAILABLE,
+            )
+            if projection.changed:
+                append_kwargs["assistant_replay"] = {
+                    "version": 1,
+                    "messages": [
+                        message.model_dump(mode="json") for message in projection.messages
+                    ],
+                }
         async with self._session_write_context(session_key):
             return await self._session_manager.append_message(
                 session_key,
@@ -5628,6 +5677,7 @@ class TurnRunner:
         # the normal-completion path does.
         current_text_parts: list[str] = []
         stream_state: _StreamState | None = None
+        agent: Agent | None = None
         attachment_cleanup: Callable[[], None] | None = None
         self._emit_turn_event(
             "turn_start",
@@ -7015,6 +7065,17 @@ class TurnRunner:
             turn_segments[:] = normalized_segments
             final_text_parts[:] = [partial_text] if partial_text else []
             reasoning_content = "".join(reasoning_parts).strip()
+            assistant_replay = None
+            replay_snapshot = getattr(agent, "current_assistant_replay", None)
+            if callable(replay_snapshot):
+                try:
+                    assistant_replay = replay_snapshot()
+                except Exception:
+                    log.warning(
+                        "turn_runner.cancelled_replay_snapshot_failed",
+                        session_key=session_key,
+                        turn_id=turn_id,
+                    )
             cancelled_turn_usage: dict[str, Any] | None = None
             if self._session_manager is not None and pipeline_usage_context is not None:
                 storage = getattr(self._session_manager, "storage", None)
@@ -7037,6 +7098,7 @@ class TurnRunner:
                         )
             if (
                 partial_text or turn_segments or turn_artifacts or reasoning_content
+                or assistant_replay is not None
             ) and self._session_manager is not None:
                 try:
                     body = _cancelled_partial_response_text(partial_text, turn_artifacts)
@@ -7052,6 +7114,8 @@ class TurnRunner:
                         "reasoning_content": reasoning_content or None,
                         "assistant_message_id": (execution_context.identity.assistant_message_id),
                     }
+                    if assistant_replay is not None:
+                        append_kwargs["assistant_replay"] = assistant_replay
                     if expected_session_id is not None:
                         append_kwargs["expected_session_id"] = expected_session_id
                     if expected_session_epoch is not None:
@@ -10656,6 +10720,7 @@ class TurnRunner:
                 content=projected_content,
                 tool_calls=getattr(entry, "tool_calls", None),
                 reasoning_content=getattr(entry, "reasoning_content", None),
+                assistant_replay=getattr(entry, "assistant_replay", None),
                 turn_context=(turn_context if isinstance(turn_context, dict) else None),
                 estimate_complete=estimate_complete,
                 persisted_token_count=persisted_token_count,
@@ -13546,6 +13611,7 @@ class TurnRunner:
             "tool_calls": silent_reply.segments,
             "tool_call_id": getattr(entry, "tool_call_id", None),
             "reasoning_content": getattr(entry, "reasoning_content", None),
+            "assistant_replay": copy.deepcopy(getattr(entry, "assistant_replay", None)),
             "turn_usage": getattr(entry, "turn_usage", None),
             "turn_context": turn_context,
         }
@@ -13560,6 +13626,7 @@ class TurnRunner:
             tool_calls=raw.get("tool_calls"),
             tool_call_id=raw.get("tool_call_id"),
             reasoning_content=raw.get("reasoning_content"),
+            assistant_replay=copy.deepcopy(raw.get("assistant_replay")),
             turn_usage=raw.get("turn_usage"),
             turn_context=raw.get("turn_context"),
         )

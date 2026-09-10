@@ -126,6 +126,7 @@ class DoneEvent:
     # not carry a synthetic receipt; their physical breakdown rows do.
     billing_receipt: ProviderBillingReceipt | None = None
     generation_epoch: int | None = None
+    provider_replay: ProviderReplayState | None = None
 
     @property
     def upstream_cost_usd(self) -> float:
@@ -718,12 +719,33 @@ MessageContent = (
 )
 
 
+class ProviderReplayState(BaseModel):
+    """Continuation state returned by one accepted provider response.
+
+    ``source`` is an opaque, credential-free endpoint identity, not a URL or
+    request dump. Native blocks retain their original ordering and values;
+    adapters decide whether a target can consume them without changing this
+    canonical record. ``native_reasoning_content`` retains the actual response
+    field, distinct from the display text in ``Message.reasoning_content``
+    which can also be derived from aliases, native details, or thinking tags.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    protocol: str
+    source: str
+    model: str
+    reasoning_details: list[dict[str, Any]] | None = Field(default=None, repr=False)
+    native_reasoning_content: str | None = Field(default=None, repr=False)
+
+
 class Message(BaseModel):
     """A single conversation message."""
 
     role: Literal["user", "assistant"]
     content: MessageContent
     reasoning_content: str | None = None
+    provider_replay: ProviderReplayState | None = None
 
 
 # ---------------------------------------------------------------------------

@@ -11,6 +11,7 @@ import re
 import sys
 from collections import Counter
 from collections.abc import AsyncIterator, Iterator, Mapping
+from copy import deepcopy
 from dataclasses import asdict, dataclass, field
 from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from typing import Any, cast
@@ -52,7 +53,11 @@ from .error_redaction import (
 from .failures import retry_after_from_headers
 from .fx import TOKENRHYTHM_CNY_PER_USD, TOKENRHYTHM_CNY_PER_USD_NANOS
 from .model_catalog import shared_catalog
-from .model_identity import model_basename
+from .model_identity import (
+    DEEPSEEK_DIRECT_REASONING_MODEL_IDS,
+    DEEPSEEK_V4_MODEL_IDS,
+    model_basename,
+)
 from .protocol import ProviderConnectionConfig, ProviderMetadata
 from .reasoning_dialects import (
     ReasoningDisableArgs,
@@ -105,6 +110,7 @@ from .types import (
     ProviderHeartbeatEvent,
     ProviderMessageCountProjection,
     ProviderMessageLimitProof,
+    ProviderReplayState,
     ReasoningDeltaEvent,
     StreamEvent,
     TextDeltaEvent,
@@ -441,6 +447,116 @@ def _openrouter_generation_id_from_headers(
 
 
 _OPENAI_REASONING_TEXT_FIELDS = ("reasoning_content", "reasoning")
+_OPENAI_REPLAY_PROTOCOL = "openai_chat_completions"
+
+
+def _openai_replay_source(provider_kind: str, base_url: str) -> str:
+    """Identify the actual API route without persisting endpoint credentials.
+
+    Paths and query strings can themselves contain secrets, so the stored
+    identity is a digest. Keep route distinctions inside that digest while
+    normalizing harmless spelling differences (default ports and /v1 roots).
+    """
+    endpoint = urlparse(_versioned_api_url(base_url.rstrip("/"), "/v1/chat/completions"))
+    scheme = endpoint.scheme.lower()
+    port: int | str | None
+    try:
+        port = endpoint.port
+    except ValueError:
+        # Provenance must not add eager URL validation to provider setup.
+        # Keep malformed/out-of-range ports distinct from valid routes while
+        # leaving rejection to the existing endpoint policy and HTTP boundary.
+        port = f"invalid:{endpoint.netloc.rsplit('@', 1)[-1]}"
+    if port is None:
+        port = {"http": 80, "https": 443}.get(scheme)
+    identity = (
+        provider_kind,
+        scheme,
+        (endpoint.hostname or "").lower().rstrip("."),
+        port,
+        endpoint.path,
+        endpoint.params,
+        endpoint.query,
+    )
+    digest = hashlib.sha256(json.dumps(identity, ensure_ascii=False).encode("utf-8"))
+    return f"openai_compat:{digest.hexdigest()}"
+
+
+def _append_openai_reasoning_details(
+    collected: list[dict[str, Any]] | None,
+    payload: Mapping[str, Any],
+    *,
+    streaming: bool = False,
+) -> list[dict[str, Any]] | None:
+    """Assemble logical native blocks without merging opaque encrypted data.
+
+    OpenRouter streams text/summary blocks as consecutive deltas, sometimes
+    all with index zero. Sending those fragments as separate logical blocks
+    breaks continuation (OpenRouterTeam/ai-sdk-provider#520). Type transitions
+    preserve sequence boundaries; conflicting explicit identities do too.
+    Non-streaming responses already contain complete logical blocks.
+    """
+    details = payload.get("reasoning_details")
+    if details is None:
+        return collected
+    if not isinstance(details, list) or any(not isinstance(item, dict) for item in details):
+        raise ValueError("Provider returned malformed reasoning_details")
+    if collected is None:
+        collected = []
+    for detail in deepcopy(details):
+        text_field = {"reasoning.text": "text", "reasoning.summary": "summary"}.get(
+            detail.get("type")
+        )
+        if text_field is not None and text_field in detail:
+            value = detail[text_field]
+            if not isinstance(value, str) and not (text_field == "text" and value is None):
+                raise ValueError("Provider returned malformed reasoning_details")
+        previous = collected[-1] if collected else None
+        if (
+            not streaming
+            or text_field is None
+            or previous is None
+            or previous.get("type") != detail.get("type")
+        ):
+            collected.append(detail)
+            continue
+        metadata_conflicts = any(
+            key != text_field
+            and value not in (None, "")
+            and previous.get(key) not in (None, "")
+            and previous[key] != value
+            for key, value in detail.items()
+        )
+        if metadata_conflicts:
+            collected.append(detail)
+            continue
+        for key, value in detail.items():
+            if key == text_field:
+                previous_text = previous.get(key, "")
+                if text_field == "text":
+                    # OpenRouter permits null text on signature-only frames.
+                    # It contributes no text, regardless of arrival order.
+                    if value is None:
+                        continue
+                    if previous_text is None:
+                        previous_text = ""
+                if not isinstance(value, str) or not isinstance(previous_text, str):
+                    raise ValueError("Provider returned malformed reasoning_details")
+                previous[key] = previous_text + value
+            elif previous.get(key) in (None, ""):
+                previous[key] = value
+    return collected
+
+
+def _has_openai_reasoning_text(payload: Mapping[str, Any]) -> bool:
+    """Distinguish an explicitly empty response field from absent reasoning."""
+    if any(isinstance(payload.get(key), str) for key in _OPENAI_REASONING_TEXT_FIELDS):
+        return True
+    details = payload.get("reasoning_details")
+    return isinstance(details, list) and any(
+        isinstance(detail, Mapping) and isinstance(detail.get("text"), str)
+        for detail in details
+    )
 
 
 def _openai_reasoning_fragments(payload: Mapping[str, Any]) -> tuple[str, ...]:
@@ -461,6 +577,10 @@ def _openai_reasoning_fragments(payload: Mapping[str, Any]) -> tuple[str, ...]:
             text = detail.get("text")
             if isinstance(text, str) and text:
                 fragments.append(text)
+    # Gateways may expose both an alias and the same text in native details.
+    # Read one representation so UI deltas do not duplicate the reasoning.
+    if fragments:
+        return tuple(fragments)
     for reasoning_field in _OPENAI_REASONING_TEXT_FIELDS:
         text = payload.get(reasoning_field)
         if isinstance(text, str) and text:
@@ -2826,6 +2946,8 @@ def _build_openai_wire_messages(
     logical_index_map: dict[int, int] | None = None,
     reasoning_rule: ReasoningModelRule | None = None,
     reasoning_replay_stats: _ReasoningReplayStats | None = None,
+    replay_source: str | None = None,
+    replay_captured_reasoning_content: bool = False,
 ) -> list[dict[str, Any]]:
     """Build the exact OpenAI-compatible wire-message array, without I/O."""
     openai_messages: list[dict[str, Any]] = []
@@ -2860,21 +2982,27 @@ def _build_openai_wire_messages(
             openai_messages.append({"role": "system", "content": content_blocks})
         else:
             openai_messages.append({"role": "system", "content": cfg.system})
-    reasoning_echo_allowed = (
-        _reasoning_echo_allowed_indexes(messages, reasoning_echo_turns)
-        if include_reasoning_content
-        else None
-    )
+    reasoning_echo_allowed = _reasoning_echo_allowed_indexes(messages, reasoning_echo_turns)
     for message_index, message in enumerate(messages):
         if logical_index_map is not None:
             logical_index_map[message_index] = len(openai_messages)
         effective_thinking = _effective_policy_thinking(
             policy, model, thinking=cfg.thinking
         )
+        state = message.provider_replay
+        message_replays_provider_state = replay_provider_state and (
+            state is None
+            or (
+                state.protocol == _OPENAI_REPLAY_PROTOCOL
+                and state.source == replay_source
+                and state.model == model
+            )
+        )
+        echo_allowed = (
+            reasoning_echo_allowed is None or message_index in reasoning_echo_allowed
+        )
         message_replays_reasoning = (
-            include_reasoning_content
-            if reasoning_echo_allowed is None
-            else message_index in reasoning_echo_allowed
+            include_reasoning_content and message_replays_provider_state and echo_allowed
         )
         if (
             reasoning_rule is not None
@@ -2916,8 +3044,39 @@ def _build_openai_wire_messages(
                     policy, model, thinking=effective_thinking
                 )
             ),
-            replay_provider_state=replay_provider_state,
+            replay_provider_state=message_replays_provider_state,
         )
+        if (
+            replay_captured_reasoning_content
+            and provider_kind == "tokenrhythm"
+            and reasoning_rule is None
+            and message.role == "assistant"
+            and message_replays_provider_state
+            and echo_allowed
+            and state is not None
+            and state.native_reasoning_content is not None
+        ):
+            # The official relay accepts captured reasoning independently of
+            # its model's thinking-control dialect. Replay only the original
+            # field from this route, never normalized display text. Exact V4
+            # rules retain precedence, including their tool scope and limit.
+            for built_message in built_messages:
+                if built_message.get("role") == "assistant":
+                    built_message["reasoning_content"] = state.native_reasoning_content
+        if (
+            message.role == "assistant"
+            and message_replays_provider_state
+            and echo_allowed
+            and provider_kind == "openrouter"
+            and state is not None
+            and state.reasoning_details is not None
+        ):
+            for built_message in built_messages:
+                if built_message.get("role") == "assistant":
+                    built_message["reasoning_details"] = deepcopy(state.reasoning_details)
+                    # These are two representations of the same reasoning.
+                    # Native details retain the signatures and block order.
+                    built_message.pop("reasoning_content", None)
         if reasoning_replay_stats is not None and limit is not None:
             for built_message in built_messages:
                 tool_calls = built_message.get("tool_calls")
@@ -3035,6 +3194,11 @@ class OpenAIProvider:
         self.provider_id = (provider_id or self._provider_kind).strip()
         self._compat = compat or compat_policy_for_kind(self._provider_kind)
         self._replay_provider_state = replay_provider_state
+        self._replay_source = _openai_replay_source(self._provider_kind, self._base_url)
+        self._replay_captured_reasoning_content = (
+            self._provider_kind == "tokenrhythm"
+            and is_official_tokenrhythm_endpoint(self._base_url)
+        )
         self._provider_routing: Mapping[str, str] = provider_routing or {}
         # Strict routing pin: send {"only": [...], "allow_fallbacks": false}
         # instead of the default {"order": [...], "allow_fallbacks": true},
@@ -3064,6 +3228,49 @@ class OpenAIProvider:
         """Prevent provider-private reasoning/signature replay for this turn."""
 
         self._replay_provider_state = False
+
+    def can_replay_reasoning(self, message: Message) -> bool:
+        """Whether a captured assistant belongs to this continuation route.
+
+        This provenance check also accepts a captured response without any
+        reasoning. The wire projection separately applies field presence,
+        endpoint contracts, and request-local echo limits.
+        """
+        state = message.provider_replay
+        return bool(
+            self._replay_provider_state
+            and message.role == "assistant"
+            and state is not None
+            and state.protocol == _OPENAI_REPLAY_PROTOCOL
+            and state.source == self._replay_source
+            and state.model == self._model
+        )
+
+    def requires_complete_reasoning_history(
+        self, *, tools: list[ToolDefinition] | bool | None, thinking: bool
+    ) -> bool:
+        """Whether this known route requires reasoning on every past assistant.
+
+        This is a request contract, not a request to mutate stored history.
+        Aggregators with their own narrower rules (notably TokenRhythm) do
+        not inherit DeepSeek's direct-API contract merely from a model name.
+        """
+        if not tools or not thinking:
+            return False
+        model_id = model_basename(self._model)
+        if self._provider_kind == "deepseek":
+            return (
+                model_id in DEEPSEEK_DIRECT_REASONING_MODEL_IDS
+                and self._replay_source
+                == _openai_replay_source("deepseek", "https://api.deepseek.com")
+            )
+        if self._provider_kind == "openrouter" and self._model.startswith("deepseek/"):
+            return (
+                model_id in DEEPSEEK_V4_MODEL_IDS
+                and self._replay_source
+                == _openai_replay_source("openrouter", "https://openrouter.ai/api/v1")
+            )
+        return False
 
     def provider_metadata(self) -> ProviderMetadata:
         """Return read-only non-secret provider metadata for consumers."""
@@ -3123,6 +3330,8 @@ class OpenAIProvider:
             replay_provider_state=self._replay_provider_state,
             reasoning_echo_turns=self._reasoning_echo_turns,
             reasoning_rule=reasoning_rule,
+            replay_source=self._replay_source,
+            replay_captured_reasoning_content=self._replay_captured_reasoning_content,
         )
         return ProviderMessageCountProjection(
             actual_wire_messages=len(wire_messages) + additional_messages,
@@ -3177,6 +3386,8 @@ class OpenAIProvider:
             logical_index_map=logical_index_map,
             reasoning_rule=reasoning_rule,
             reasoning_replay_stats=reasoning_replay_stats,
+            replay_source=self._replay_source,
+            replay_captured_reasoning_content=self._replay_captured_reasoning_content,
         )
         wire_active_user_index = (
             logical_index_map.get(cfg.active_user_message_index)
@@ -3650,6 +3861,9 @@ class OpenAIProvider:
         # poison the next-index computation with a TypeError.
         streamed_thought_signature: str | None = None
         reasoning = ReasoningAccumulator()
+        reasoning_details: list[dict[str, Any]] | None = None
+        native_reasoning_content_parts: list[str] = []
+        reasoning_text_present = False
         tools_by_name = _tool_by_name(tools)
         text_tool_dialects = self._compat.text_tool_profile.dialects_for_model(
             self._model,
@@ -4208,6 +4422,24 @@ class OpenAIProvider:
                             # has received reasoning deltas, an empty-stream or
                             # timeout fallback retry would deliver (and bill)
                             # the turn twice.
+                            try:
+                                reasoning_details = _append_openai_reasoning_details(
+                                    reasoning_details, delta, streaming=True
+                                )
+                            except ValueError:
+                                yield ErrorEvent(
+                                    message="Provider returned malformed reasoning_details",
+                                    code="invalid_stream_frame",
+                                )
+                                return
+                            reasoning_text_present |= _has_openai_reasoning_text(delta)
+                            native_reasoning_content = delta.get("reasoning_content")
+                            if isinstance(native_reasoning_content, str):
+                                native_reasoning_content_parts.append(native_reasoning_content)
+                            if delta.get("reasoning_details"):
+                                # Opaque reasoning is still response progress;
+                                # do not retry and replace it as an empty stream.
+                                emitted_stream_event = True
                             for fragment in _openai_reasoning_fragments(delta):
                                 reasoning_event = reasoning.emit(fragment)
                                 if reasoning_event is None:
@@ -5069,7 +5301,9 @@ class OpenAIProvider:
                         stop_reason=stop_reason,
                         input_tokens=input_tokens,
                         output_tokens=output_tokens,
-                        reasoning_content=reasoning_text or None,
+                        reasoning_content=(
+                            reasoning_text or ("" if reasoning_text_present else None)
+                        ),
                         thinking_signature=gemini_thought_sig,
                         reasoning_tokens=reasoning_tokens,
                         cached_tokens=cached_tokens,
@@ -5079,6 +5313,16 @@ class OpenAIProvider:
                         cost_source=cost_source,
                         provider=self.provider_id,
                         billing_receipt=billing_receipt,
+                        provider_replay=ProviderReplayState(
+                            protocol=_OPENAI_REPLAY_PROTOCOL,
+                            source=self._replay_source,
+                            model=self._model,
+                            reasoning_details=reasoning_details,
+                            native_reasoning_content=(
+                                "".join(native_reasoning_content_parts)
+                                if native_reasoning_content_parts else None
+                            ),
+                        ),
                     )
 
         except asyncio.CancelledError:
@@ -5589,6 +5833,9 @@ class OpenAIProvider:
         assistant_text_parts: list[str] = []
         visible_assistant_text_parts: list[str] = []
         reasoning = ReasoningAccumulator()
+        reasoning_details: list[dict[str, Any]] | None = None
+        native_reasoning_content_parts: list[str] = []
+        reasoning_text_present = False
         inert_candidate_output = cfg.candidate_output_mode == "inert_artifact"
         candidate_artifact = (
             CandidateArtifactBuilder() if inert_candidate_output else None
@@ -5633,6 +5880,18 @@ class OpenAIProvider:
                     visible_assistant_text_parts.append(visible_text)
                     yield TextDeltaEvent(text=visible_text)
 
+            try:
+                reasoning_details = _append_openai_reasoning_details(reasoning_details, message)
+            except ValueError:
+                yield ErrorEvent(
+                    message="Provider returned malformed reasoning_details",
+                    code="invalid_stream_frame",
+                )
+                return
+            reasoning_text_present |= _has_openai_reasoning_text(message)
+            native_reasoning_content = message.get("reasoning_content")
+            if isinstance(native_reasoning_content, str):
+                native_reasoning_content_parts.append(native_reasoning_content)
             for fragment in _openai_reasoning_fragments(message):
                 reasoning_event = reasoning.emit(fragment)
                 if reasoning_event is not None:
@@ -6022,7 +6281,7 @@ class OpenAIProvider:
             stop_reason=stop_reason,
             input_tokens=input_tokens,
             output_tokens=output_tokens,
-            reasoning_content=reasoning_text or None,
+            reasoning_content=reasoning_text or ("" if reasoning_text_present else None),
             thinking_signature=cast(
                 "str | None",
                 tools_acc.first_metadata("thought_signature"),
@@ -6035,6 +6294,16 @@ class OpenAIProvider:
             cost_source=cost_source,
             provider=self.provider_id,
             billing_receipt=billing_receipt,
+            provider_replay=ProviderReplayState(
+                protocol=_OPENAI_REPLAY_PROTOCOL,
+                source=self._replay_source,
+                model=self._model,
+                reasoning_details=reasoning_details,
+                native_reasoning_content=(
+                    "".join(native_reasoning_content_parts)
+                    if native_reasoning_content_parts else None
+                ),
+            ),
         )
 
     async def list_models(self, *, raise_on_error: bool = False) -> list[ModelInfo]:
