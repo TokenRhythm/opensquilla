@@ -305,12 +305,12 @@ def sessions_export(
     result: dict[str, Any] | None = asyncio.run(_with_client(_run))
     if result is _CLIENT_UNAVAILABLE:
         console.print("[dim]Session export requires a running gateway.[/dim]")
-        return
+        raise typer.Exit(1)
     if result is _ACTION_FAILED:
-        return
+        raise typer.Exit(1)
     if result is None:
         console.print("[red]Session export returned no data.[/red]")
-        return
+        raise typer.Exit(1)
     target = output or Path(f"{session_id.replace(':', '-')}.{format}")
     if format == "json":
         target.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
