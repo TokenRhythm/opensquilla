@@ -9,6 +9,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from urllib.parse import urlsplit
 
+import httpx
 import pytest
 
 from opensquilla.env import trust_env
@@ -329,7 +330,7 @@ async def test_http_request_uses_explicit_context_proxy_kwargs(
             )
 
     monkeypatch.setattr(integration_mod, "SandboxProxyServer", FakeProxy)
-    monkeypatch.setattr(web_mod.httpx, "AsyncClient", FakeAsyncClient)
+    monkeypatch.setattr(httpx, "AsyncClient", FakeAsyncClient)
 
     payload = json.loads(await web_mod.http_request("http://allowed.test/path"))
 
@@ -468,8 +469,7 @@ async def test_windows_unready_boundary_blocks_decorated_network_tools(
         "_ensure_windows_proxy_allowlist_setup",
         _repair_failed,
     )
-    monkeypatch.setattr(web_mod.httpx, "AsyncClient", _UnexpectedClient)
-    monkeypatch.setattr(web_fetch_mod.httpx, "AsyncClient", _UnexpectedClient)
+    monkeypatch.setattr(httpx, "AsyncClient", _UnexpectedClient)
     monkeypatch.setattr(web_fetch_mod, "_check_ssrf", lambda url: None)
 
     http_payload = json.loads(await web_mod.http_request("https://example.com"))
