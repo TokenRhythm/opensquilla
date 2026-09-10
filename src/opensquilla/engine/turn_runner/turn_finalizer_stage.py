@@ -811,7 +811,11 @@ class TurnFinalizerStage:
             normalization.suppressed or getattr(done_event, "delivery", None) == "suppressed"
         ):
             from opensquilla.engine.history import decode_assistant_replay
-            from opensquilla.provider.types import ContentBlockText, ContentBlockThinking
+            from opensquilla.provider.types import (
+                ContentBlockRedactedThinking,
+                ContentBlockText,
+                ContentBlockThinking,
+            )
 
             # A pure control-token reply historically creates no assistant
             # row. Native metadata alone does not turn that silent response
@@ -823,7 +827,10 @@ class TurnFinalizerStage:
                 if message.role != "assistant" or (
                     isinstance(replay_content, list)
                     and any(
-                        not isinstance(block, ContentBlockText | ContentBlockThinking)
+                        not isinstance(
+                            block,
+                            ContentBlockText | ContentBlockThinking | ContentBlockRedactedThinking,
+                        )
                         for block in replay_content
                     )
                 ):

@@ -40,7 +40,27 @@ from opensquilla.provider import (
 from opensquilla.provider import (
     ToolUseStartEvent as ProviderToolUseStart,
 )
-from opensquilla.provider.types import ContentBlockImage
+from opensquilla.provider.types import (
+    ContentBlockImage,
+    ContentBlockRedactedThinking,
+    ProviderReplayState,
+)
+
+
+def test_sanitizing_native_replay_keeps_opaque_block_and_carrier_unchanged():
+    native = [{"type": "redacted_thinking", "data": "synthetic-opaque"}]
+    message = Message(
+        role="assistant",
+        content=[ContentBlockRedactedThinking(data="synthetic-opaque")],
+        provider_replay=ProviderReplayState(
+            protocol="anthropic_messages", source="synthetic-route", model="synthetic-model",
+            native_content=native,
+        ),
+    )
+    before = message.model_dump(mode="json")
+    sanitized, _ = sanitize_session_messages([message])
+    assert sanitized[0].model_dump(mode="json") == before
+    assert message.model_dump(mode="json") == before
 
 
 def _tool_definition(name: str) -> ToolDefinition:

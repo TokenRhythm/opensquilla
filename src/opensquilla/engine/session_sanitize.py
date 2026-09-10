@@ -23,7 +23,11 @@ from opensquilla.provider import (
     ContentBlockToolUse,
     Message,
 )
-from opensquilla.provider.types import ContentBlockDocument, ContentBlockImage
+from opensquilla.provider.types import (
+    ContentBlockDocument,
+    ContentBlockImage,
+    ContentBlockRedactedThinking,
+)
 
 _BLOCK_FIELDS: dict[str, set[str]] = {
     "text": {"type", "text"},
@@ -32,6 +36,7 @@ _BLOCK_FIELDS: dict[str, set[str]] = {
     "image": {"type", "source_type", "media_type", "data"},
     "document": {"type", "source_type", "media_type", "data", "title"},
     "thinking": {"type", "thinking", "signature"},
+    "redacted_thinking": {"type", "data"},
 }
 
 _BLOCK_MODELS: dict[str, type[BaseModel]] = {
@@ -41,6 +46,7 @@ _BLOCK_MODELS: dict[str, type[BaseModel]] = {
     "image": ContentBlockImage,
     "document": ContentBlockDocument,
     "thinking": ContentBlockThinking,
+    "redacted_thinking": ContentBlockRedactedThinking,
 }
 
 _HISTORICAL_TOOL_ARGUMENT_PROJECTION_PREFIX = "[historical_tool_argument_omitted]\n"

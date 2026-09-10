@@ -21,7 +21,12 @@ from opensquilla.provider import (
     ContentBlockToolUse,
     Message,
 )
-from opensquilla.provider.types import ContentBlockDocument, ContentBlockImage, ContentBlockThinking
+from opensquilla.provider.types import (
+    ContentBlockDocument,
+    ContentBlockImage,
+    ContentBlockRedactedThinking,
+    ContentBlockThinking,
+)
 from opensquilla.silent_reply import sanitize_historical_silent_reply
 
 _RECORDED_TOOL_HISTORY_PREFIX = "[Recorded tool history]"
@@ -397,6 +402,10 @@ def strip_historical_tool_pairs(
         if not changed:
             projected.append(message)
             continue
+        content = [
+            block for block in content
+            if not isinstance(block, ContentBlockThinking | ContentBlockRedactedThinking)
+        ]
         if not content:
             empty_removed += 1
             continue
@@ -764,7 +773,10 @@ def _project_unsigned_silent_replay(
         if (
             message.role != "assistant" or message.provider_replay is not None
             or isinstance(content, list)
-            and any(isinstance(block, ContentBlockThinking) for block in content)
+            and any(
+                isinstance(block, ContentBlockThinking | ContentBlockRedactedThinking)
+                for block in content
+            )
         ):
             projected.append(message)
             continue

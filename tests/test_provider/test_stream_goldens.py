@@ -357,6 +357,7 @@ def test_event_serialization_retains_native_replay_state() -> None:
         "source": "synthetic-route",
         "model": "synthetic-request-model",
         "native_reasoning_content": "Synthetic native reasoning.",
+        "native_content": None,
         "reasoning_details": [
             {"type": "reasoning.text", "text": "Synthetic reasoning",
              "signature": "dummy-signature"},

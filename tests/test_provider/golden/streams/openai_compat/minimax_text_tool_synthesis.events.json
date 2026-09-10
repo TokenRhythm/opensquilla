@@ -30,6 +30,7 @@
     "provider": "minimax",
     "provider_replay": {
       "model": "minimax-test-1",
+      "native_content": null,
       "native_reasoning_content": null,
       "protocol": "openai_chat_completions",
       "reasoning_details": null,

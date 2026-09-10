@@ -2,7 +2,12 @@
 
 from __future__ import annotations
 
-from opensquilla.provider import ContentBlockText, ContentBlockThinking, Message
+from opensquilla.provider import (
+    ContentBlockRedactedThinking,
+    ContentBlockText,
+    ContentBlockThinking,
+    Message,
+)
 
 
 def _has_tool_use(content: object) -> bool:
@@ -19,7 +24,7 @@ def drop_reasoning(
 ) -> list[Message]:
     """Strip thinking blocks AND reasoning_content from assistant messages.
 
-    - Removes ContentBlockThinking blocks from content lists (Anthropic)
+    - Removes thinking and redacted_thinking blocks from content lists (Anthropic)
     - Clears reasoning_content field (DeepSeek/OpenRouter)
     - Optionally preserves reasoning_content on assistant messages
     - Inserts placeholder text block if content becomes empty
@@ -41,7 +46,8 @@ def drop_reasoning(
                 filtered = [
                     b
                     for b in msg.content
-                    if keep_tool_reasoning or not isinstance(b, ContentBlockThinking)
+                    if keep_tool_reasoning
+                    or not isinstance(b, ContentBlockThinking | ContentBlockRedactedThinking)
                 ]
                 if not filtered:
                     filtered = [ContentBlockText(text="")]
@@ -80,7 +86,7 @@ def drop_reasoning(
         filtered = []
         changed = False
         for block in msg.content:
-            if isinstance(block, ContentBlockThinking):
+            if isinstance(block, ContentBlockThinking | ContentBlockRedactedThinking):
                 touched = True
                 changed = True
                 continue

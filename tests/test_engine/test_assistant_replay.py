@@ -15,6 +15,7 @@ from opensquilla.engine.history import (
     project_history_replay_capacity,
     reconstruct_messages_from_entry,
     repair_tool_pairing,
+    strip_historical_tool_pairs,
 )
 from opensquilla.provider.types import (
     ContentBlockText,
@@ -245,3 +246,110 @@ def test_unsigned_replay_does_not_guess_suppression_without_canonical_match(disp
     assert reconstruct_messages_from_entry(
         "assistant", display, None, assistant_replay=envelope,
     ) == [message]
+
+
+@pytest.mark.parametrize("visible_text", [False, True])
+def test_restricted_tool_history_cannot_reintroduce_anthropic_native_blocks(visible_text):
+    from opensquilla.provider.anthropic import AnthropicProvider
+    from opensquilla.provider.types import ChatConfig
+
+    provider = AnthropicProvider(
+        api_key="synthetic-key", model="claude-sonnet-4-6",
+        base_url="https://synthetic-anthropic.invalid",
+    )
+    native = [
+        {
+            "type": "thinking", "thinking": "synthetic private tool reasoning",
+            "signature": "synthetic-private-signature",
+        },
+        {"type": "redacted_thinking", "data": "synthetic-private-opaque"},
+        {
+            "type": "tool_use", "id": "synthetic-lookup", "name": "lookup",
+            "input": {"path": "/synthetic/private/file.txt"},
+        },
+    ]
+    if visible_text:
+        native.insert(2, {"type": "text", "text": "Synthetic public answer."})
+    message = Message.model_validate({
+        "role": "assistant", "content": native,
+        "reasoning_content": "synthetic private tool reasoning",
+        "provider_replay": {
+            "protocol": "anthropic_messages", "source": provider._replay_source,
+            "model": provider.model, "native_content": native,
+        },
+    })
+    result = Message.model_validate({
+        "role": "user", "content": [{
+            "type": "tool_result", "tool_use_id": "synthetic-lookup",
+            "content": "synthetic private tool result",
+        }],
+    })
+    envelope = {"version": 1, "messages": [message.model_dump(), result.model_dump()]}
+    original = deepcopy(envelope)
+    restored = decode_assistant_replay(envelope)
+    control, _ = provider._build_payload(restored, None, ChatConfig(), record_diagnostics=False)
+    assert control["messages"][0]["content"] == native
+    projected, stats = strip_historical_tool_pairs(restored)
+    assert stats.tool_uses_removed == stats.tool_results_removed == 1
+    assert envelope == original
+    assert [entry.model_dump() for entry in restored] == original["messages"]
+    if visible_text:
+        assert projected == [Message(
+            role="assistant", content=[ContentBlockText(text="Synthetic public answer.")],
+        )]
+    else:
+        assert projected == []
+    payload, _ = provider._build_payload(projected, None, ChatConfig(), record_diagnostics=False)
+    wire = json.dumps(payload)
+    assert "synthetic-private" not in wire
+    assert "synthetic private" not in wire
+    assert "/synthetic/private" not in wire
+    assert "thinking" not in wire
+
+
+@pytest.mark.parametrize("captured_value,accepted_value,mutation,expected", [
+    (3, 3, None, True),
+    (3.0, 3.0, None, True),
+    (True, True, None, True),
+    (3, 3.0, None, False),
+    (1, True, None, False),
+    (3, 3, "remove_tool", False),
+    (3, 3, "change_text", False),
+])
+def test_native_assistant_content_requires_unchanged_accepted_response(
+    captured_value, accepted_value, mutation, expected,
+):
+    from opensquilla.engine.agent import _native_assistant_content
+    from opensquilla.engine.types import ToolCall
+
+    native = [
+        {
+            "type": "thinking", "thinking": "Synthetic thought.",
+            "signature": "synthetic-signature",
+        },
+        {"type": "text", "text": "Synthetic answer."},
+        {
+            "type": "tool_use", "id": "synthetic-lookup", "name": "lookup",
+            "input": {"nested": {"value": captured_value}},
+        },
+    ]
+    state = ProviderReplayState(
+        protocol="anthropic_messages", source="synthetic-source", model="synthetic-model",
+        native_content=deepcopy(native),
+    )
+    original = state.model_dump_json()
+    calls = [] if mutation == "remove_tool" else [ToolCall(
+        tool_use_id="synthetic-lookup", tool_name="lookup",
+        arguments={"nested": {"value": accepted_value}},
+    )]
+    content = _native_assistant_content(
+        state,
+        response_text="Changed answer." if mutation == "change_text" else "Synthetic answer.",
+        tool_calls=calls,
+    )
+    if expected:
+        assert content is not None
+        assert json.dumps([block.model_dump() for block in content]) == json.dumps(native)
+    else:
+        assert content is None
+    assert state.model_dump_json() == original

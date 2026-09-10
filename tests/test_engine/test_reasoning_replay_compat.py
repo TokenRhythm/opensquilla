@@ -10,9 +10,11 @@ import pytest
 from opensquilla.engine import Agent, AgentConfig, ToolResult
 from opensquilla.engine.replay_compat import rebase_incomplete_reasoning_history
 from opensquilla.engine.runtime import _SelectorFallbackProvider
+from opensquilla.engine.thinking import drop_reasoning
 from opensquilla.engine.types import DoneEvent, ThinkingLevel
 from opensquilla.provider import (
     ChatConfig,
+    ContentBlockRedactedThinking,
     ContentBlockText,
     ContentBlockThinking,
     ContentBlockToolResult,
@@ -72,6 +74,7 @@ def test_rebase_consumes_legacy_tool_results_and_keeps_complete_tail_boundaries(
         role="assistant",
         content=[
             ContentBlockThinking(thinking="private thinking", signature="private signature"),
+            ContentBlockRedactedThinking(data="synthetic-private-opaque"),
             ContentBlockToolUse(id="old-call", name="record", input={"value": 7}),
         ],
     )
@@ -114,11 +117,32 @@ def test_rebase_consumes_legacy_tool_results_and_keeps_complete_tail_boundaries(
     assert "old-call" in projected[0].content and "already executed" in projected[0].content
     assert "private thinking" not in projected[0].content
     assert "private signature" not in projected[0].content
+    assert "synthetic-private-opaque" not in projected[0].content
     assert all(
         not isinstance(block, ContentBlockToolResult)
         for block in projected[0].content
         if not isinstance(projected[0].content, str)
     )
+
+
+@pytest.mark.parametrize("reasoning_content", [None, "private thinking"])
+def test_dropping_reasoning_also_removes_redacted_blocks_without_mutating_history(
+    reasoning_content,
+):
+    message = Message(
+        role="assistant",
+        content=[
+            ContentBlockThinking(thinking="private thinking", signature="synthetic-signature"),
+            ContentBlockRedactedThinking(data="synthetic-opaque"),
+            ContentBlockText(text="public answer"),
+        ],
+        reasoning_content=reasoning_content,
+    )
+    before = message.model_dump(mode="json")
+    projected = drop_reasoning([message])
+    assert projected[0].content == [ContentBlockText(text="public answer")]
+    assert projected[0].reasoning_content is None
+    assert message.model_dump(mode="json") == before
 
 
 def test_missing_last_record_rebases_prior_native_state_as_facts_not_opaque_data():

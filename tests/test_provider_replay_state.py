@@ -14,6 +14,7 @@ from opensquilla.provider.anthropic import AnthropicProvider
 from opensquilla.provider.openai import OpenAIProvider, _openai_replay_source
 from opensquilla.provider.types import (
     ChatConfig,
+    ContentBlockRedactedThinking,
     ContentBlockText,
     ContentBlockThinking,
     ContentBlockToolUse,
@@ -183,7 +184,7 @@ def test_foreign_target_withholds_native_state_without_mutating_history(target: 
 @pytest.mark.parametrize("protocol, enabled, expected_thinking", [
     ("openai_chat_completions", True, False),
     ("unknown_future_protocol", True, False),
-    ("anthropic_messages", True, True),
+    ("anthropic_messages", True, False),
     (None, True, True),
     ("anthropic_messages", False, False),
     (None, False, False),
@@ -327,9 +328,9 @@ def test_captured_native_details_replay_without_a_capability_catalog_entry(detai
 
 
 @pytest.mark.parametrize("tool_call, reasoning, expected", [
-    (False, "private reasoning", ""),
-    (True, "private reasoning", "private reasoning"),
-    (True, "x" * 50_001, ""),
+    pytest.param(False, "private reasoning", "", id="no-tool-call"),
+    pytest.param(True, "private reasoning", "private reasoning", id="tool-call"),
+    pytest.param(True, "x" * 50_001, "", id="oversized-reasoning"),
 ])
 def test_tokenrhythm_projects_captured_state_without_changing_canonical_reasoning(
     tool_call: bool, reasoning: str, expected: str
@@ -840,3 +841,293 @@ async def test_tokenrhythm_native_reasoning_survives_sqlite_reopen(
             assert payload["messages"][0]["reasoning_content"] == native
     finally:
         await storage.close()
+
+
+_ANTHROPIC_MODEL = "claude-synthetic"
+_ANTHROPIC_CONTENT: list[dict[str, Any]] = [
+    {"type": "thinking", "thinking": "First synthetic thought.", "signature": "sig-first-ab"},
+    {"type": "redacted_thinking", "data": "synthetic-opaque-redacted"},
+    {"type": "thinking", "thinking": "Second synthetic thought.", "signature": "sig-second-cd"},
+    {"type": "text", "text": "Synthetic tool request."},
+    {"type": "tool_use", "id": "call-synthetic", "name": "lookup", "input": {"value": 3}},
+]
+
+
+def _anthropic_provider(**kwargs: Any) -> AnthropicProvider:
+    return AnthropicProvider(
+        api_key="synthetic-key", model=kwargs.pop("model", _ANTHROPIC_MODEL),
+        base_url=kwargs.pop("base_url", "https://anthropic.example/v1"), **kwargs,
+    )
+
+
+def _anthropic_frames() -> list[dict[str, Any]]:
+    frames: list[dict[str, Any]] = [{
+        "type": "message_start", "message": {
+            "id": "msg-synthetic", "model": _ANTHROPIC_MODEL + "-resolved",
+            "usage": {"input_tokens": 10},
+        },
+    }]
+    for index, block in enumerate(_ANTHROPIC_CONTENT):
+        start = dict(block)
+        deltas = []
+        if block["type"] == "thinking":
+            start["thinking"] = block["thinking"][:6]
+            start["signature"] = block["signature"][:-2]
+            deltas = [
+                {"type": "thinking_delta", "thinking": block["thinking"][6:]},
+                {"type": "signature_delta", "signature": block["signature"][-2:-1]},
+                {"type": "signature_delta", "signature": block["signature"][-1:]},
+            ]
+        elif block["type"] == "text":
+            start["text"] = block["text"][:4]
+            deltas = [{"type": "text_delta", "text": block["text"][4:]}]
+        elif block["type"] == "tool_use":
+            start["input"] = {}
+            deltas = [{"type": "input_json_delta", "partial_json": '{"value":3}'}]
+        frames.append({"type": "content_block_start", "index": index, "content_block": start})
+        frames.extend({"type": "content_block_delta", "index": index, "delta": d} for d in deltas)
+        frames.append({"type": "content_block_stop", "index": index})
+    frames.extend([
+        {"type": "message_delta", "delta": {"stop_reason": "tool_use"},
+         "usage": {"output_tokens": 20}},
+        {"type": "message_stop"},
+    ])
+    return frames
+
+
+def _anthropic_sse(frames: list[dict[str, Any]]) -> bytes:
+    return b"".join(f"data: {json.dumps(frame)}\n\n".encode() for frame in frames)
+
+
+def _anthropic_message(provider: AnthropicProvider) -> Message:
+    return Message(
+        role="assistant",
+        content=[
+            ContentBlockThinking.model_validate(_ANTHROPIC_CONTENT[0]),
+            ContentBlockRedactedThinking.model_validate(_ANTHROPIC_CONTENT[1]),
+            ContentBlockThinking.model_validate(_ANTHROPIC_CONTENT[2]),
+            ContentBlockText.model_validate(_ANTHROPIC_CONTENT[3]),
+            ContentBlockToolUse.model_validate(_ANTHROPIC_CONTENT[4]),
+        ],
+        provider_replay=ProviderReplayState(
+            protocol="anthropic_messages", source=provider._replay_source, model=provider.model,
+            native_content=json.loads(json.dumps(_ANTHROPIC_CONTENT)),
+        ),
+    )
+
+
+async def test_anthropic_captures_each_native_block_and_signature_increment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_transport(monkeypatch, lambda request: httpx.Response(
+        200, content=_anthropic_sse(_anthropic_frames()),
+        headers={"content-type": "text/event-stream"},
+    ))
+    provider = _anthropic_provider()
+    events = [event async for event in provider.chat(
+        [Message(role="user", content="Synthetic input.")], config=ChatConfig(thinking=True),
+    )]
+    assert not [event for event in events if isinstance(event, ErrorEvent)]
+    done = next(event for event in events if isinstance(event, DoneEvent))
+    assert done.provider_replay is not None
+    assert done.provider_replay.native_content == _ANTHROPIC_CONTENT
+    assert done.provider_replay.protocol == "anthropic_messages"
+    assert done.provider_replay.source == provider._replay_source
+    assert done.provider_replay.model == _ANTHROPIC_MODEL
+    assert done.thinking_signature is None  # Multiple blocks have no single signature.
+    assert done.reasoning_content == "First synthetic thought.Second synthetic thought."
+    assert "".join(e.text for e in events if isinstance(e, ReasoningDeltaEvent)) == (
+        done.reasoning_content
+    )
+    assert "".join(e.text for e in events if isinstance(e, TextDeltaEvent)) == (
+        "Synthetic tool request."
+    )
+    restored = Message.model_validate_json(_anthropic_message(provider).model_dump_json())
+    restored.provider_replay = done.provider_replay
+    payload, _ = provider._build_payload([restored], None, ChatConfig(), record_diagnostics=False)
+    assert payload["messages"][0]["content"] == _ANTHROPIC_CONTENT
+    payload["messages"][0]["content"][0]["signature"] = "changed-request-copy"
+    assert done.provider_replay.native_content == _ANTHROPIC_CONTENT
+
+
+@pytest.mark.parametrize("target", [
+    {"model": "different-model"},
+    {"base_url": "https://other.example/v1"},
+    {"provider_id": "different-provider"},
+    {"replay_provider_state": False},
+], ids=["model", "endpoint", "provider", "disabled"])
+def test_anthropic_native_replay_requires_same_route(target: dict[str, Any]) -> None:
+    provider = _anthropic_provider()
+    message = _anthropic_message(provider)
+    before = message.model_dump_json()
+    assert provider.can_replay_reasoning(message)
+    target_provider = _anthropic_provider(**target)
+    assert not target_provider.can_replay_reasoning(message)
+    payload, _ = target_provider._build_payload(
+        [message], None, ChatConfig(), record_diagnostics=False,
+    )
+    assert payload["messages"][0]["content"] == _ANTHROPIC_CONTENT[3:]
+    assert message.model_dump_json() == before
+
+
+@pytest.mark.parametrize("change", [
+    "remove-tool", "change-text", "remove-thinking", "change-argument-type",
+])
+def test_anthropic_native_replay_cannot_restore_transformed_history(change: str) -> None:
+    provider = _anthropic_provider()
+    message = _anthropic_message(provider)
+    assert isinstance(message.content, list)
+    if change == "remove-tool":
+        message.content = [block for block in message.content if block.type != "tool_use"]
+    elif change == "change-text":
+        for block in message.content:
+            if block.type == "text":
+                block.text = "Filtered synthetic text."
+    elif change == "remove-thinking":
+        message.content = [block for block in message.content if block.type != "thinking"]
+    else:
+        for block in message.content:
+            if block.type == "tool_use":
+                block.input["value"] = 3.0
+    before = message.model_dump_json()
+    payload, _ = provider._build_payload([message], None, ChatConfig(), record_diagnostics=False)
+    content = payload["messages"][0]["content"]
+    assert not any(block["type"] in {"thinking", "redacted_thinking"} for block in content)
+    assert any(block["type"] == "tool_use" for block in content) is (change != "remove-tool")
+    if change == "change-text":
+        assert content[0] == {"type": "text", "text": "Filtered synthetic text."}
+    assert message.model_dump_json() == before
+
+
+async def test_anthropic_initial_tool_input_matches_captured_and_executable_arguments(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from opensquilla.provider.types import ToolUseEndEvent
+
+    frames = _anthropic_frames()
+    frames = [f for f in frames if not (f["type"] == "content_block_delta" and f["index"] == 4)]
+    for frame in frames:
+        if frame["type"] == "content_block_start" and frame["index"] == 4:
+            frame["content_block"]["input"] = {"value": 3}
+    _patch_transport(monkeypatch, lambda request: httpx.Response(
+        200, content=_anthropic_sse(frames), headers={"content-type": "text/event-stream"},
+    ))
+    events = [e async for e in _anthropic_provider().chat([Message(role="user", content="Input")])]
+    assert not [e for e in events if isinstance(e, ErrorEvent)]
+    tool = next(e for e in events if isinstance(e, ToolUseEndEvent))
+    assert tool.arguments == {"value": 3}
+    done = next(e for e in events if isinstance(e, DoneEvent))
+    assert done.provider_replay is not None
+    assert done.provider_replay.native_content == _ANTHROPIC_CONTENT
+
+
+@pytest.mark.parametrize("mode", ["no-thinking", "empty-thinking", "redacted-only"])
+async def test_anthropic_preserves_omitted_empty_and_redacted_thinking(
+    monkeypatch: pytest.MonkeyPatch, mode: str,
+) -> None:
+    content = [{"type": "text", "text": "Synthetic answer."}]
+    if mode == "empty-thinking":
+        content.insert(0, {"type": "thinking", "thinking": "", "signature": ""})
+    elif mode == "redacted-only":
+        content.insert(0, {"type": "redacted_thinking", "data": "synthetic-opaque"})
+    frames = [_anthropic_frames()[0]]
+    for index, block in enumerate(content):
+        frames.extend([
+            {"type": "content_block_start", "index": index, "content_block": block},
+            {"type": "content_block_stop", "index": index},
+        ])
+    frames.append({"type": "message_stop"})
+    _patch_transport(monkeypatch, lambda request: httpx.Response(
+        200, content=_anthropic_sse(frames), headers={"content-type": "text/event-stream"},
+    ))
+    events = [e async for e in _anthropic_provider().chat([Message(role="user", content="Input")])]
+    assert not [e for e in events if isinstance(e, ErrorEvent)]
+    done = next(e for e in events if isinstance(e, DoneEvent))
+    assert done.reasoning_content is None
+    assert done.provider_replay is not None
+    assert done.provider_replay.native_content == content
+
+
+@pytest.mark.parametrize("failure", [
+    "missing-terminal", "unclosed-thinking", "duplicate-start", "delta-after-stop",
+    "wrong-signature-type", "upstream-error", "missing-delta-index", "boolean-delta-index",
+    "missing-stop-index", "boolean-stop-index",
+])
+async def test_anthropic_rejected_stream_never_releases_native_state(
+    monkeypatch: pytest.MonkeyPatch, failure: str,
+) -> None:
+    frames = _anthropic_frames()
+    if failure == "missing-terminal":
+        frames.pop()
+    elif failure == "unclosed-thinking":
+        frames = [f for f in frames if not (f["type"] == "content_block_stop" and f["index"] == 0)]
+    elif failure == "duplicate-start":
+        frames.insert(2, frames[1])
+    elif failure == "delta-after-stop":
+        frames.insert(6, {"type": "content_block_delta", "index": 0, "delta": {
+            "type": "signature_delta", "signature": "late-signature",
+        }})
+    elif failure == "wrong-signature-type":
+        frames[3] = {"type": "content_block_delta", "index": 0,
+                     "delta": {"type": "signature_delta", "signature": ["invalid"]}}
+    elif failure in {"missing-delta-index", "boolean-delta-index"}:
+        if failure == "missing-delta-index":
+            frames[3].pop("index")
+        else:
+            frames[3]["index"] = False
+    elif failure in {"missing-stop-index", "boolean-stop-index"}:
+        if failure == "missing-stop-index":
+            frames[5].pop("index")
+        else:
+            frames[5]["index"] = False
+    else:
+        frames[-1] = {"type": "error", "error": {"type": "overloaded_error", "message": "Busy"}}
+    _patch_transport(monkeypatch, lambda request: httpx.Response(
+        200, content=_anthropic_sse(frames), headers={"content-type": "text/event-stream"},
+    ))
+    events = [e async for e in _anthropic_provider().chat([Message(role="user", content="Input")])]
+    assert [e for e in events if isinstance(e, ErrorEvent)]
+    assert not any(isinstance(e, DoneEvent) for e in events)
+
+
+async def test_anthropic_opaque_replay_cannot_be_truncated_to_fit_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(500)
+
+    _patch_transport(monkeypatch, handler)
+    monkeypatch.setenv("OPENSQUILLA_PROVIDER_COMPACTION_PROTECT_RECENT_ASSISTANT", "0")
+    provider = _anthropic_provider()
+    message = _anthropic_message(provider)
+    assert isinstance(message.content, list)
+    assert isinstance(message.content[1], ContentBlockRedactedThinking)
+    message.content[1].data = "synthetic-opaque" * 1000
+    assert message.provider_replay is not None
+    assert message.provider_replay.native_content is not None
+    message.provider_replay.native_content[1]["data"] = message.content[1].data
+    original = message.model_dump_json()
+    events = [event async for event in provider.chat(
+        [message, Message(role="user", content="Continue.")],
+        config=ChatConfig(provider_request_max_chars=1000),
+    )]
+    errors = [event for event in events if isinstance(event, ErrorEvent)]
+    assert requests == []
+    assert len(errors) == 1 and errors[0].code == "provider_request_budget_exhausted"
+    assert message.model_dump_json() == original
+
+
+def test_anthropic_source_identity_hides_credentials_and_normalizes_endpoint() -> None:
+    plain = _anthropic_provider(base_url="https://anthropic.example")
+    credentialed = _anthropic_provider(
+        base_url="https://synthetic-user:synthetic-password@ANTHROPIC.EXAMPLE:443/v1/",
+    )
+    assert plain._replay_source == credentialed._replay_source
+    assert "synthetic-user" not in credentialed._replay_source
+    assert "synthetic-password" not in credentialed._replay_source
+    assert plain._replay_source != _anthropic_provider(
+        base_url="https://anthropic.example/custom/v1",
+    )._replay_source

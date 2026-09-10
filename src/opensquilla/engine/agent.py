@@ -1867,14 +1867,60 @@ def _message_has_tool_use(message: Message) -> bool:
     return any(isinstance(block, ContentBlockToolUse) for block in message.content)
 
 
+def _native_assistant_content(
+    provider_replay: ProviderReplayState | None,
+    *,
+    response_text: str,
+    tool_calls: list[ToolCall],
+) -> list[Any] | None:
+    """Retain captured block order only for the response the engine accepted."""
+    if (
+        provider_replay is None
+        or provider_replay.protocol != "anthropic_messages"
+        or provider_replay.native_content is None
+    ):
+        return None
+    try:
+        content = Message.model_validate(
+            {"role": "assistant", "content": provider_replay.native_content},
+        ).content
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(content, list):
+        return None
+    # Recovery can replace visible text or remove unexecuted tools. Raw state
+    # must not restore either; the adapter also checks the eventual request view.
+    if "".join(block.text for block in content if isinstance(block, ContentBlockText)) != (
+        response_text
+    ):
+        return None
+    captured_tools = [block for block in content if isinstance(block, ContentBlockToolUse)]
+    accepted_tools = [
+        ContentBlockToolUse(id=tc.tool_use_id, name=tc.tool_name, input=tc.arguments)
+        for tc in tool_calls
+    ]
+    captured_json = json.dumps(
+        [block.model_dump(mode="json") for block in captured_tools], sort_keys=True,
+    )
+    accepted_json = json.dumps(
+        [block.model_dump(mode="json") for block in accepted_tools], sort_keys=True,
+    )
+    return content if captured_json == accepted_json else None
+
+
 def _build_reasoning_prefill_message(
     *,
     reasoning_content: str,
     thinking_signature: str | None,
     provider_replay: ProviderReplayState | None = None,
 ) -> Message:
+    native_content = _native_assistant_content(
+        provider_replay, response_text="", tool_calls=[],
+    )
     content: list[Any] = []
-    if thinking_signature:
+    if native_content is not None:
+        content = native_content
+    elif thinking_signature:
         content.append(
             ContentBlockThinking(
                 thinking=reasoning_content,
@@ -1932,9 +1978,16 @@ def _append_length_capped_continuation(
 ) -> str:
     visible_text = response_text
     if visible_text:
+        native_content = _native_assistant_content(
+            provider_replay, response_text=visible_text, tool_calls=[],
+        )
         turn_messages.append(
             Message(
-                role="assistant", content=[ContentBlockText(text=visible_text)],
+                role="assistant",
+                content=(
+                    native_content if native_content is not None
+                    else [ContentBlockText(text=visible_text)]
+                ),
                 reasoning_content=reasoning_content, provider_replay=provider_replay,
             )
         )
@@ -12966,6 +13019,11 @@ class Agent:
                             input=tc.arguments,
                         )
                     )
+                native_content = _native_assistant_content(
+                    iter_provider_replay, response_text=visible_text, tool_calls=tool_calls,
+                )
+                if native_content is not None:
+                    assistant_content = native_content
                 if assistant_content:
                     turn_messages.append(
                         Message(

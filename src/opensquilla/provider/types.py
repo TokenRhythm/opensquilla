@@ -35,8 +35,9 @@ class ReasoningDeltaEvent:
     not the final answer. Emitting it as its own event lets every layer keep
     the two apart from the source, so the renderer never has to guess a block's
     identity after the fact. The concatenation of these deltas equals
-    DoneEvent.reasoning_content, which remains the source of truth for non-TUI
-    consumers (signature replay, persistence, compaction, cost).
+    DoneEvent.reasoning_content for display and text consumers. Exact signed
+    continuation uses DoneEvent.provider_replay; concatenated text cannot
+    preserve individual thinking blocks or their signatures.
     """
 
     kind: Literal["reasoning_delta"] = field(default="reasoning_delta", init=False)
@@ -699,6 +700,13 @@ class ContentBlockThinking(BaseModel):
     signature: str | None = None
 
 
+class ContentBlockRedactedThinking(BaseModel):
+    """Opaque Anthropic continuation data; never display or summarize it."""
+
+    type: Literal["redacted_thinking"] = "redacted_thinking"
+    data: str = Field(repr=False)
+
+
 class ContentBlockCompaction(BaseModel):
     type: Literal["compaction"] = "compaction"
     content: str | None = None
@@ -714,6 +722,7 @@ MessageContent = (
         | ContentBlockImage
         | ContentBlockDocument
         | ContentBlockThinking
+        | ContentBlockRedactedThinking
         | ContentBlockCompaction
     ]
 )
@@ -737,6 +746,8 @@ class ProviderReplayState(BaseModel):
     model: str
     reasoning_details: list[dict[str, Any]] | None = Field(default=None, repr=False)
     native_reasoning_content: str | None = Field(default=None, repr=False)
+    # Ordered complete Anthropic blocks, including opaque continuation data.
+    native_content: list[dict[str, Any]] | None = Field(default=None, repr=False)
 
 
 class Message(BaseModel):

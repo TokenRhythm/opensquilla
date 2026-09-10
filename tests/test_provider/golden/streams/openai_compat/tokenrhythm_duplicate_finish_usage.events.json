@@ -36,6 +36,7 @@
     "provider": "tokenrhythm",
     "provider_replay": {
       "model": "deepseek-v4-flash",
+      "native_content": null,
       "native_reasoning_content": "Reasoning about the reply.",
       "protocol": "openai_chat_completions",
       "reasoning_details": null,

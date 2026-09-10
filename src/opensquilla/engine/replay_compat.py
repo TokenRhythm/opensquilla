@@ -9,6 +9,7 @@ from typing import Any
 from opensquilla.provider.types import (
     ContentBlockDocument,
     ContentBlockImage,
+    ContentBlockRedactedThinking,
     ContentBlockText,
     ContentBlockThinking,
     ContentBlockToolResult,
@@ -85,7 +86,7 @@ def recorded_context_message(messages: list[Message], *, introduction: str) -> M
             content = [
                 record_block(block)
                 for block in content
-                if not isinstance(block, ContentBlockThinking)
+                if not isinstance(block, ContentBlockThinking | ContentBlockRedactedThinking)
             ]
         records.append({"role": message.role, "content": content})
     text = introduction + "\n" + json.dumps(records, ensure_ascii=False, separators=(",", ":"))

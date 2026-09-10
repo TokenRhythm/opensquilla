@@ -28,6 +28,7 @@
     "provider": "openai",
     "provider_replay": {
       "model": "gpt-test",
+      "native_content": null,
       "native_reasoning_content": "Weigh the options.",
       "protocol": "openai_chat_completions",
       "reasoning_details": null,

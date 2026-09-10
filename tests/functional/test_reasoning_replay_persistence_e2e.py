@@ -6,10 +6,18 @@ import gzip
 import json
 import zlib
 from collections.abc import AsyncIterator
+from copy import deepcopy
 
 import httpx
 import pytest
 
+from opensquilla.engine.runtime import TurnRunner
+from opensquilla.engine.types import public_agent_event_payload
+from opensquilla.provider.selector import ModelSelector, ProviderConfig, SelectorConfig
+from opensquilla.session.manager import SessionManager
+from opensquilla.session.storage import SessionStorage
+from opensquilla.tools.registry import ToolRegistry
+from opensquilla.tools.types import ToolContext, ToolSpec
 from scripts import live_reasoning_replay_e2e as harness
 
 
@@ -31,6 +39,186 @@ class _SSE(httpx.AsyncByteStream):
         for frame in self.frames:
             yield f"data: {json.dumps(frame)}\n\n".encode()
         yield b"data: [DONE]\n\n"
+
+
+def _anthropic_response(call_index: int, model: str) -> tuple[list[dict], list[dict]]:
+    """Independent synthetic wire blocks, including separate per-block signatures."""
+    blocks = [
+        {
+            "type": "thinking",
+            "thinking": f"synthetic first thought {call_index}",
+            "signature": f"synthetic-signature-{call_index}-first",
+        },
+        {"type": "redacted_thinking", "data": f"synthetic-opaque-{call_index}"},
+        {
+            "type": "thinking",
+            "thinking": f"synthetic second thought {call_index}",
+            "signature": f"synthetic-signature-{call_index}-second",
+        },
+        {
+            "type": "text",
+            "text": (
+                "REPLAY_FIRST_OK" if call_index == 2 else
+                "REPLAY_SECOND_OK" if call_index == 4 else "Checking the synthetic value."
+            ),
+        },
+    ]
+    if call_index in {0, 1, 3}:
+        blocks.append({
+            "type": "tool_use", "id": f"synthetic-call-{call_index}",
+            "name": "replay_step", "input": {"value": {0: 7, 1: 18, 3: 23}[call_index]},
+        })
+    frames = [{
+        "type": "message_start",
+        "message": {
+            "id": f"synthetic-message-{call_index}", "type": "message", "role": "assistant",
+            "model": model, "content": [], "usage": {"input_tokens": 20, "output_tokens": 0},
+        },
+    }]
+    for index, block in enumerate(blocks):
+        if block["type"] == "redacted_thinking":
+            start = deepcopy(block)
+            deltas = []
+        elif block["type"] == "thinking":
+            start = {"type": "thinking", "thinking": "", "signature": ""}
+            deltas = [
+                {"type": "thinking_delta", "thinking": block["thinking"][:10]},
+                {"type": "thinking_delta", "thinking": block["thinking"][10:]},
+                {"type": "signature_delta", "signature": block["signature"][:12]},
+                {"type": "signature_delta", "signature": block["signature"][12:]},
+            ]
+        elif block["type"] == "text":
+            start = {"type": "text", "text": ""}
+            deltas = [{"type": "text_delta", "text": block["text"]}]
+        else:
+            start = {**block, "input": {}}
+            deltas = [{"type": "input_json_delta", "partial_json": json.dumps(block["input"])}]
+        frames.append({"type": "content_block_start", "index": index, "content_block": start})
+        frames.extend(
+            {"type": "content_block_delta", "index": index, "delta": delta}
+            for delta in deltas
+        )
+        frames.append({"type": "content_block_stop", "index": index})
+    frames.extend([
+        {
+            "type": "message_delta",
+            "delta": {"stop_reason": "tool_use" if call_index in {0, 1, 3} else "end_turn"},
+            "usage": {"output_tokens": 10},
+        },
+        {"type": "message_stop"},
+    ])
+    return blocks, frames
+
+
+@pytest.mark.asyncio
+async def test_anthropic_native_blocks_survive_tools_and_sqlite_restart(tmp_path, monkeypatch):
+    monkeypatch.setenv("OPENSQUILLA_LIVE_DISABLE_DOTENV", "1")
+    monkeypatch.setenv("OPENSQUILLA_TURN_CALL_LOG", "0")
+    endpoint = "https://synthetic-anthropic.invalid"
+    model = "claude-sonnet-4-6"
+    requests = []
+    returned_blocks = []
+
+    async def respond(request: httpx.Request) -> httpx.Response:
+        assert str(request.url) == endpoint + "/v1/messages"
+        payload = json.loads(request.content)
+        call_index = len(requests)
+        assert call_index < 5, "unexpected recovery or extra provider call"
+        requests.append(payload)
+        blocks, frames = _anthropic_response(call_index, model)
+        returned_blocks.append(blocks)
+        return httpx.Response(
+            200, stream=_SSE(frames), headers={"content-type": "text/event-stream"},
+        )
+
+    transport = httpx.MockTransport(respond)
+    real_client = httpx.AsyncClient
+
+    def client(*args, **kwargs):
+        kwargs["transport"] = transport
+        return real_client(*args, **kwargs)
+
+    monkeypatch.setattr(httpx, "AsyncClient", client)
+    config = harness._config(tmp_path, "anthropic", model, endpoint)
+    selector_config = SelectorConfig(primary=ProviderConfig(
+        provider="anthropic", model=model, base_url=endpoint, api_key="synthetic-test-key",
+    ))
+    registry = ToolRegistry()
+    tool_values = []
+
+    async def step(value: int) -> str:
+        tool_values.append(value)
+        return json.dumps({"next_value": value + 11})
+
+    registry.register(ToolSpec(
+        name="replay_step", description="Return the next synthetic value.",
+        parameters={"value": {"type": "integer"}}, required=["value"],
+    ), step)
+    key = "agent:main:synthetic-native-anthropic-replay"
+    db = tmp_path / "sessions.sqlite"
+    persisted_before = []
+    native_sources = set()
+    for turn, prompt in enumerate((harness.FIRST_PROMPT, harness.SECOND_PROMPT)):
+        storage = SessionStorage(str(db))
+        await storage.connect()
+        try:
+            manager = SessionManager(storage, inject_time_prefix=False)
+            if turn == 0:
+                await manager.create(session_key=key, agent_id="main")
+            else:
+                restored = await manager.get_canonical_transcript(key)
+                assert [row.assistant_replay for row in restored if row.role == "assistant"] == (
+                    persisted_before
+                )
+                assert len(requests) == 3
+            runner = TurnRunner(
+                provider_selector=ModelSelector(selector_config), tool_registry=registry,
+                session_manager=manager, config=config, model_catalog=harness._Catalog(),
+            )
+            user = await manager.append_message(key, "user", prompt)
+            events = [event async for event in runner.run(
+                prompt, session_key=key, bound_user_message_id=user.message_id,
+                tool_context=ToolContext(is_owner=True, workspace_dir=config.workspace_dir),
+            )]
+            assert not [event for event in events if event.kind == "error"]
+            assert any(event.kind == "done" for event in events)
+            # Compare actual next HTTP requests, not a serializer invoked in
+            # isolation. Call three has fresh storage/selector/runner state.
+            for call_index, payload in enumerate(requests):
+                assistant_content = [
+                    message["content"] for message in payload["messages"]
+                    if message["role"] == "assistant"
+                ]
+                assert assistant_content == returned_blocks[:call_index]
+            # Reasoning text remains intentionally available for presentation;
+            # native signatures, opaque data and private replay must not escape.
+            public = json.dumps([public_agent_event_payload(event) for event in events])
+            assert "assistant_replay" not in public
+            assert "synthetic-signature-" not in public
+            assert "synthetic-opaque-" not in public
+            rows = await manager.get_canonical_transcript(key)
+            saved = [row.assistant_replay for row in rows if row.role == "assistant"]
+            assert len(saved) == turn + 1
+            assistants = [
+                message for envelope in saved for message in envelope["messages"]
+                if message["role"] == "assistant"
+            ]
+            assert len(assistants) == len(returned_blocks)
+            for message, native in zip(assistants, returned_blocks, strict=True):
+                assert message["content"] == native
+                state = message["provider_replay"]
+                assert state["protocol"] == "anthropic_messages"
+                assert state["model"] == model
+                assert state["source"]
+                assert "synthetic-test-key" not in state["source"]
+                native_sources.add(state["source"])
+                assert state["native_content"] == native
+            persisted_before = deepcopy(saved)
+        finally:
+            await storage.close()
+    assert len(requests) == 5
+    assert tool_values == [7, 18, 23]
+    assert len(native_sources) == 1
 
 
 @pytest.mark.asyncio

@@ -26,7 +26,24 @@
     "model_usage_breakdown": [],
     "output_tokens": 9,
     "provider": "anthropic",
-    "provider_replay": null,
+    "provider_replay": {
+      "model": "claude-test",
+      "native_content": [
+        {
+          "signature": "sig-test-0001",
+          "thinking": "Let me think about this.",
+          "type": "thinking"
+        },
+        {
+          "text": "The answer is 4.",
+          "type": "text"
+        }
+      ],
+      "native_reasoning_content": null,
+      "protocol": "anthropic_messages",
+      "reasoning_details": null,
+      "source": "anthropic_messages:88de6bc5cbdabfcb718175fc8dc4043d4f15a7fd20e95c9a6acf790029a4610b"
+    },
     "reasoning_content": "Let me think about this.",
     "reasoning_tokens": 0,
     "stop_reason": "end_turn",
