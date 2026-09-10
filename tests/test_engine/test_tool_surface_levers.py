@@ -1,21 +1,8 @@
-"""Tool-surface levers: escalation runtime event + projection signal hints.
-
-Covers the placeholder-escalation runtime-event mirror emitted for
-OPENSQUILLA_PLACEHOLDER_ESCALATION_THRESHOLD, subagent propagation of the
-projection_signal_hints config field, and the projection signal-scan notice
-lines gated by OPENSQUILLA_PROJECTION_SIGNAL_HINTS with the pattern override
-OPENSQUILLA_PROJECTION_SIGNAL_PATTERNS (all off by default). Motivation: run
-harnesses only collect runtime events, so a lever that acts silently is
-indistinguishable from a delivery failure; and projected tool results can
-omit the very failure lines the next step depends on, so the notice should
-say where they are and how to retrieve them.
-"""
+"""Projection signal-scan notices, runtime events, and Child propagation."""
 
 from __future__ import annotations
 
-import asyncio
 import json
-from collections.abc import AsyncIterator
 from types import SimpleNamespace
 from typing import Any
 
@@ -24,54 +11,18 @@ import pytest
 import opensquilla.engine.agent as agent_mod
 from opensquilla.engine import Agent, AgentConfig, SubagentSpec, ToolResult
 from opensquilla.engine.agent import (
-    _INVALID_PROVIDER_CONTEXT_ARGUMENTS_KEY,
     _projection_signal_hints_enabled,
     _tool_result_signal_scan,
 )
 from opensquilla.provider import (
-    ChatConfig,
     ContentBlockToolResult,
     ContentBlockToolUse,
     Message,
     TextDeltaEvent,
-    ToolDefinition,
-    ToolInputSchema,
 )
 from opensquilla.provider import DoneEvent as ProviderDone
-from opensquilla.provider import TextDeltaEvent as ProviderText
-from opensquilla.provider import ToolUseEndEvent as ProviderToolUseEnd
-from opensquilla.provider import ToolUseStartEvent as ProviderToolUseStart
 from opensquilla.tools import ToolRegistry, tool
 from opensquilla.tools.dispatch import build_tool_handler
-
-
-class _SequenceProvider:
-    provider_name = "fake"
-
-    def __init__(self, streams: list[list[Any]]) -> None:
-        self.streams = streams
-        self.calls: list[dict[str, Any]] = []
-
-    def chat(
-        self,
-        messages: list[Message],
-        tools: list[Any] | None = None,
-        config: ChatConfig | None = None,
-    ) -> AsyncIterator[Any]:
-        index = len(self.calls)
-        self.calls.append({"messages": messages, "tools": tools})
-        events = self.streams[index] if index < len(self.streams) else self.streams[-1]
-        return self._stream(events)
-
-    async def _stream(self, events: list[Any]) -> AsyncIterator[Any]:
-        for event in events:
-            if isinstance(event, float):
-                await asyncio.sleep(event)
-                continue
-            yield event
-
-    async def list_models(self) -> list[Any]:
-        return []
 
 
 class _TextProvider:
@@ -91,50 +42,6 @@ class _TextProvider:
         return []
 
 
-def _placeholder_tool_call(tool_use_id: str) -> list[Any]:
-    return [
-        ProviderToolUseStart(tool_use_id=tool_use_id, tool_name="echo"),
-        ProviderToolUseEnd(
-            tool_use_id=tool_use_id,
-            tool_name="echo",
-            arguments={_INVALID_PROVIDER_CONTEXT_ARGUMENTS_KEY: True},
-        ),
-        ProviderDone(stop_reason="tool_use", input_tokens=3, output_tokens=1),
-    ]
-
-
-def _final_text() -> list[Any]:
-    return [
-        ProviderText(text="done"),
-        ProviderDone(stop_reason="stop", input_tokens=5, output_tokens=1),
-    ]
-
-
-def _echo_agent(provider: _SequenceProvider, config: AgentConfig) -> Agent:
-    async def tool_handler(call: object) -> ToolResult:
-        return ToolResult(
-            tool_use_id=getattr(call, "tool_use_id"),
-            tool_name=getattr(call, "tool_name"),
-            content="tool ok",
-        )
-
-    return Agent(
-        provider=provider,
-        config=config,
-        tool_definitions=[
-            ToolDefinition(
-                name="echo",
-                description="Echo.",
-                input_schema=ToolInputSchema(
-                    properties={"value": {"type": "string"}},
-                    required=["value"],
-                ),
-            )
-        ],
-        tool_handler=tool_handler,
-    )
-
-
 def _events_named(path, name: str) -> list[dict[str, Any]]:
     if not path.exists():
         return []
@@ -143,74 +50,6 @@ def _events_named(path, name: str) -> list[dict[str, Any]]:
         for line in path.read_text().splitlines()
         if line.strip() and json.loads(line).get("name") == name
     ]
-
-
-# ---------------------------------------------------------------------------
-# M1 — placeholder_escalation.injected runtime-event mirror
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.asyncio
-async def test_placeholder_escalation_writes_runtime_event(tmp_path) -> None:
-    runtime_events_path = tmp_path / "runtime_events.jsonl"
-    provider = _SequenceProvider(
-        [
-            _placeholder_tool_call("blocked-1"),
-            _placeholder_tool_call("blocked-2"),
-            _final_text(),
-        ]
-    )
-    agent = _echo_agent(
-        provider,
-        AgentConfig(
-            max_iterations=5,
-            placeholder_escalation_threshold=2,
-            runtime_events_path=str(runtime_events_path),
-            tool_result_store_session_key="agent:main:s1",
-            tool_result_store_agent_id="main",
-            retry_base_backoff_ms=0,
-            retry_max_backoff_ms=0,
-        ),
-    )
-
-    events = [event async for event in agent.run_turn("fix the bug")]
-
-    assert any(event.kind == "done" for event in events)
-    injected = _events_named(runtime_events_path, "placeholder_escalation.injected")
-    assert len(injected) == 1
-    event = injected[0]
-    assert event["feature"] == "placeholder_escalation"
-    assert event["action"] == "append_escalation_directive"
-    assert event["reason"] == "placeholder_offense_threshold"
-    assert event["offense_iterations"] == 2
-    assert event["threshold"] == 2
-    assert event["agent_id"] == "main"
-
-
-@pytest.mark.asyncio
-async def test_placeholder_escalation_unarmed_writes_no_runtime_event(tmp_path) -> None:
-    runtime_events_path = tmp_path / "runtime_events.jsonl"
-    provider = _SequenceProvider(
-        [
-            _placeholder_tool_call("blocked-1"),
-            _placeholder_tool_call("blocked-2"),
-            _final_text(),
-        ]
-    )
-    agent = _echo_agent(
-        provider,
-        AgentConfig(
-            max_iterations=5,
-            runtime_events_path=str(runtime_events_path),
-            retry_base_backoff_ms=0,
-            retry_max_backoff_ms=0,
-        ),
-    )
-
-    events = [event async for event in agent.run_turn("fix the bug")]
-
-    assert any(event.kind == "done" for event in events)
-    assert _events_named(runtime_events_path, "placeholder_escalation.injected") == []
 
 
 def test_child_agent_inherits_tool_surface_lever_fields() -> None:

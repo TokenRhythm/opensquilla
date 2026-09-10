@@ -1060,11 +1060,10 @@ class FinalizeEvidenceTracker:
     ) -> None:
         """Record an execution-tool call (``exec_command``-like).
 
-        ``evidence_credit=False`` (scratch verify-mirror hash guard) keeps
+        ``evidence_credit=False`` keeps
         side-effect tracking — deletions and stash state — but withholds all
-        verification crediting: the command ran against mirror copies that
-        no longer match their workspace originals, so its outcome says
-        nothing about the workspace in either polarity.
+        verification crediting when the command's outcome is not valid
+        evidence about the workspace in either polarity.
         """
 
         command_text = str(command or "")
@@ -1087,7 +1086,7 @@ class FinalizeEvidenceTracker:
         if classify_gate_command(command_text) != "execution":
             return
         if not evidence_credit:
-            # Hash-guarded mirror run against diverged copies: side effects
+            # Uncredited execution: side effects
             # above still counted, but the outcome is not verification
             # evidence — no verification count, no red-first candidacy, no
             # post-edit record. Green here must not satisfy red-first and

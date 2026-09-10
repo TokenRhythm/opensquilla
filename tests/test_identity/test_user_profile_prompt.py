@@ -2,8 +2,10 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from opensquilla.identity.prompt import assemble_system_prompt
-from opensquilla.identity.types import AgentProfile
+from opensquilla.identity.types import AgentIdentity, AgentProfile
 
 
 def test_default_user_template_names_profile_fields() -> None:
@@ -501,27 +503,34 @@ def test_headless_source_edit_prompt_omits_hidden_git_diff_guidance() -> None:
     assert "Inspect the final source diff with `git_diff`" not in prompt
 
 
-def test_legacy_prompt_style_restores_compact_directives() -> None:
-    prompt = assemble_system_prompt(
-        AgentProfile(agent_id="main", prompt_mode="full", legacy_prompt_style=True),
-        tools=["exec_command", "apply_patch"],
+@pytest.mark.parametrize(
+    "prompt_mode",
+    ["full", "minimal", "none", "headless_source_edit", "headless_repo_coding_scaffold"],
+)
+@pytest.mark.parametrize("tools", [None, ["exec_command", "apply_patch"]])
+@pytest.mark.parametrize(
+    "runtime_info", [None, {"os": "Linux", "shell": "/bin/bash", "workspace_dir": "/tmp/ws"}]
+)
+def test_retired_legacy_prompt_style_does_not_change_rendering(
+    prompt_mode, tools, runtime_info
+) -> None:
+    expected = assemble_system_prompt(
+        AgentProfile(agent_id="main", prompt_mode=prompt_mode),
+        tools=tools,
+        runtime_info=runtime_info,
     )
+    assert assemble_system_prompt(
+        AgentProfile(agent_id="main", prompt_mode=prompt_mode, legacy_prompt_style=True),
+        tools=tools,
+        runtime_info=runtime_info,
+    ) == expected
 
-    assert (
-        "## Tool Call Style\n\n"
-        "- Narrate what you are about to do before invoking a tool.\n"
-        "- Only call tools when the task genuinely requires it."
-    ) in prompt
-    assert (
-        "## Reply Guidelines\n\n"
-        "- Use the conversation's language for replies\n"
-        "- When uncertain, ask for clarification rather than guessing\n"
-        "- Prefer concise replies unless detail is requested"
-    ) in prompt
-    assert "Before invoking a tool, send a brief user-visible note" not in prompt
-    assert "same language as the user's current conversation" not in prompt
-    assert "If the user writes in Chinese" not in prompt
-    assert "Match reply length to the request" not in prompt
+
+def test_retired_legacy_prompt_style_preserves_profile_positional_slot() -> None:
+    profile = AgentProfile("main", AgentIdentity(), None, {}, "full", False, False, True, False)
+
+    assert profile.legacy_prompt_style is True
+    assert profile.inject_time_prefix is False
 
 
 def test_legacy_prompt_style_absent_by_default() -> None:
@@ -535,21 +544,13 @@ def test_legacy_prompt_style_absent_by_default() -> None:
     assert "Prefer concise replies unless detail is requested" not in prompt
 
 
-def test_legacy_prompt_style_restores_runtime_section_spacing() -> None:
+def test_default_prompt_preserves_runtime_section_spacing() -> None:
     runtime_info = {"os": "Linux", "shell": "/bin/bash", "workspace_dir": "/tmp/ws"}
 
-    legacy_prompt = assemble_system_prompt(
-        AgentProfile(agent_id="main", prompt_mode="full", legacy_prompt_style=True),
-        tools=["exec_command"],
-        runtime_info=runtime_info,
-    )
     default_prompt = assemble_system_prompt(
         AgentProfile(agent_id="main", prompt_mode="full"),
         tools=["exec_command"],
         runtime_info=runtime_info,
     )
 
-    # Legacy style keeps a blank separator line between the Runtime section
-    # and the next header; the current style renders them adjacent.
-    assert "- Shell: /bin/bash\n\n## Reply Guidelines" in legacy_prompt
     assert "- Shell: /bin/bash\n## Reply Guidelines" in default_prompt

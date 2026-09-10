@@ -381,7 +381,6 @@ def workspace_write_deny_block(
     command: str | None = None,
 ) -> dict[str, object]:
     guidance = _deny_retry_guidance()
-    guidance += _verify_mirror_guidance(match)
     payload: dict[str, object] = {
         "status": "blocked",
         "reason": "workspace_write_deny",
@@ -436,51 +435,4 @@ def _scratch_retry_guidance(ctx: ToolContext | None = None) -> str:
     return (
         " Temporary reproduction, debug, verification, or candidate-patch files "
         f"must be written under the configured scratch directory instead: {scratch_dir}."
-    )
-
-
-def verify_mirror_path(
-    match_path: str, resolved_path: str, ctx: ToolContext | None = None
-) -> str | None:
-    """Writable mirror path for a deny-blocked workspace file, or None.
-
-    Mirrors live under ``<scratch_dir>/verify-mirror/<workspace-relative-path>``
-    so a denied in-package test edit can still be exercised in scratch. Only
-    resolvable when a scratch directory and a workspace root are both
-    configured and the target sits inside the workspace.
-    """
-
-    active = ctx if ctx is not None else current_tool_context.get()
-    scratch_dir = getattr(active, "scratch_dir", None) if active is not None else None
-    if not scratch_dir:
-        return None
-    workspace = _workspace_root(active)
-    if workspace is None:
-        return None
-    try:
-        relative = (
-            Path(resolved_path).expanduser().resolve(strict=False).relative_to(workspace)
-        ).as_posix()
-    except ValueError:
-        return None
-    if not relative:
-        return None
-    scratch = Path(scratch_dir).expanduser().resolve(strict=False)
-    return (scratch / "verify-mirror" / relative).as_posix()
-
-
-def _verify_mirror_guidance(
-    match: WorkspaceWriteDenyMatch, ctx: ToolContext | None = None
-) -> str:
-    active = ctx if ctx is not None else current_tool_context.get()
-    if active is None or not getattr(active, "scratch_verify_mirror_active", False):
-        return ""
-    mirror = verify_mirror_path(match.path, match.resolved_path, active)
-    if not mirror:
-        return ""
-    return (
-        f" To exercise this file's checks without modifying it, copy it to the "
-        f"writable mirror {mirror} first, keep the mirror copy identical to the "
-        "workspace original, and add any new checks as separate files under the "
-        "same verify-mirror directory."
     )
