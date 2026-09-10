@@ -1,18 +1,4 @@
-"""TurnRunner._build_tools must actually expose ``submit`` under a
-restrictive profile allowlist when submit-review is enabled.
-
-``submit`` is registered with ``default_access="deny"``. Enabling
-submit-review adds it to ``ctx.surfaced_tools``, which lifts the
-default-access deny gate — but, by design, ``surfaced_tools`` does NOT
-relax the ``allowed_tools`` allowlist (see ``ToolContext.surfaced_tools``).
-Under the SWE profile ``repo_coding_scaffold_edit`` the allowlist is the
-10 scaffold tools, which omit ``submit``; so surfacing ALONE leaves the
-tool filtered as ``not_allowed`` and it never reaches the provider schema.
-
-Two prior paid SWE runs were inert for exactly this reason
-(provider_tool_schema tool_count=10, ``submit`` absent). ``_build_tools``
-must therefore also add ``submit`` to the allowlist when the lever is on.
-"""
+"""Retired submit must stay absent without hiding formal workflow controls."""
 
 from __future__ import annotations
 
@@ -50,59 +36,26 @@ def _runner_with_scaffold_profile() -> TurnRunner:
     return runner
 
 
-def test_build_tools_exposes_submit_under_scaffold_profile_when_enabled(
+@pytest.mark.parametrize("retired_value", [None, "", "off", "on", "1"])
+def test_retired_submit_env_does_not_expand_scaffold_tool_surface(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    retired_value: str | None,
 ) -> None:
-    monkeypatch.setenv("OPENSQUILLA_SUBMIT_REVIEW", "on")
+    if retired_value is None:
+        monkeypatch.delenv("OPENSQUILLA_SUBMIT_REVIEW", raising=False)
+    else:
+        monkeypatch.setenv("OPENSQUILLA_SUBMIT_REVIEW", retired_value)
     runner = _runner_with_scaffold_profile()
 
     ctx = ToolContext(is_owner=True, workspace_dir=str(tmp_path))
     tool_defs, _handler = runner._build_tools(ctx)
     names = {getattr(td, "name", "") for td in tool_defs}
 
-    assert "submit" in names, (
-        "submit must reach the tool surface under the scaffold profile when "
-        f"submit-review is on; got {sorted(names)}"
-    )
-    assert names == _MODEL_SCAFFOLD_TOOLS | {"submit"}
-    # surfaced_tools is mutated on the passed ctx before the policy step
-    # reassigns it; the allowlist add happens on the internal (replaced) ctx,
-    # so it is observable through the returned tool_defs above, not this ref.
-    assert ctx.surfaced_tools is not None and "submit" in ctx.surfaced_tools
-
-
-def test_build_tools_omits_submit_under_scaffold_profile_when_disabled(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.delenv("OPENSQUILLA_SUBMIT_REVIEW", raising=False)
-    runner = _runner_with_scaffold_profile()
-
-    ctx = ToolContext(is_owner=True, workspace_dir=str(tmp_path))
-    tool_defs, _handler = runner._build_tools(ctx)
-    names = {getattr(td, "name", "") for td in tool_defs}
-
-    assert "submit" not in names, (
-        f"submit must stay hidden when submit-review is off; got {sorted(names)}"
-    )
-    assert ctx.allowed_tools is None or "submit" not in ctx.allowed_tools
-
-
-def test_build_tools_env_off_overrides_config_on_under_scaffold_profile(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    # Env off wins even if a config field would enable it (mirrors the
-    # finalize-gate lever precedence).
-    monkeypatch.setenv("OPENSQUILLA_SUBMIT_REVIEW", "off")
-    runner = _runner_with_scaffold_profile()
-
-    ctx = ToolContext(is_owner=True, workspace_dir=str(tmp_path))
-    tool_defs, _handler = runner._build_tools(ctx)
-    names = {getattr(td, "name", "") for td in tool_defs}
-
+    assert names == _MODEL_SCAFFOLD_TOOLS
     assert "submit" not in names
+    assert ctx.surfaced_tools is None or "submit" not in ctx.surfaced_tools
+    assert ctx.allowed_tools is None or "submit" not in ctx.allowed_tools
 
 
 def test_build_tools_exposes_plan_run_delivery_controls_under_scaffold_profile(
@@ -128,7 +81,7 @@ def test_build_tools_exposes_plan_run_delivery_controls_under_scaffold_profile(
     assert plan_run_tools <= ctx.surfaced_tools
 
 
-def test_build_tools_plan_run_hides_submit_when_review_enabled(
+def test_build_tools_plan_run_ignores_retired_submit_env(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -145,7 +98,8 @@ def test_build_tools_plan_run_hides_submit_when_review_enabled(
 
     assert {"plan_run_checkpoint", "publish_artifact"} <= names
     assert "submit" not in names
-    assert "submit" in ctx.denied_tools
+    assert ctx.surfaced_tools is not None
+    assert "submit" not in ctx.surfaced_tools
 
 
 def test_build_tools_exposes_goal_controls_under_scaffold_profile(
@@ -190,3 +144,26 @@ def test_build_tools_goal_control_explicit_deny_remains_authoritative(
 
     assert "update_goal" not in names
     assert "update_goal_progress" in names
+
+
+@pytest.mark.parametrize("allowed_tools", [{"submit"}, set()])
+def test_retired_submit_allowlist_does_not_become_unrestricted(
+    tmp_path: Path, allowed_tools: set[str]
+) -> None:
+    runner = TurnRunner(
+        provider_selector=None,
+        config=GatewayConfig(tools={"also_allow": ["submit"]}),
+    )
+    runner._tool_registry = get_default_registry()
+    ctx = ToolContext(is_owner=True, workspace_dir=str(tmp_path), allowed_tools=allowed_tools)
+
+    tool_defs, _handler = runner._build_tools(ctx)
+
+    # The existing runtime always adds its authorized-tool discovery control,
+    # even to an empty allowlist; it must not expose any executable tool.
+    assert {definition.name for definition in tool_defs} == {"tool_search"}
+    assert ctx.allowed_tools is not None
+    assert not (ctx.allowed_tools - {"submit", "tool_search"})
+    assert {definition.name for definition in runner._tool_registry.to_tool_definitions(ctx)} == {
+        "tool_search"
+    }

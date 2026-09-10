@@ -242,35 +242,6 @@ def test_headless_repo_coding_scaffold_omits_hidden_git_tool_guidance() -> None:
     assert "Use `git_diff` to inspect the final source diff" not in prompt
 
 
-def test_patch_evidence_protocol_renders_when_enabled_in_scaffold_mode() -> None:
-    prompt = assemble_system_prompt(
-        AgentProfile(
-            agent_id="main",
-            prompt_mode="headless_repo_coding_scaffold",
-            patch_evidence_protocol=True,
-        ),
-        tools=[
-            "exec_command",
-            "read_file",
-            "edit_file",
-            "write_file",
-            "grep_search",
-            "glob_search",
-            "list_dir",
-            "git_status",
-            "git_diff",
-        ],
-    )
-
-    assert "## Patch Evidence Protocol" in prompt
-    assert "## Repository Coding Scaffold" in prompt
-    assert "not sufficient final evidence by itself" in prompt
-    assert "Do not modify existing test expectations" in prompt
-    assert "change hypothesis or inspect a different implementation layer" in prompt
-    assert "neighboring existing test" in prompt
-    assert "strongest command/output evidence" in prompt
-
-
 def test_patch_evidence_protocol_absent_by_default() -> None:
     scaffold_prompt = assemble_system_prompt(
         AgentProfile(agent_id="main", prompt_mode="headless_repo_coding_scaffold"),
@@ -283,6 +254,25 @@ def test_patch_evidence_protocol_absent_by_default() -> None:
 
     assert "## Patch Evidence Protocol" not in scaffold_prompt
     assert "## Patch Evidence Protocol" not in full_prompt
+
+
+@pytest.mark.parametrize(
+    "mode", ["full", "minimal", "none", "headless_source_edit", "headless_repo_coding_scaffold"]
+)
+@pytest.mark.parametrize("gate", [False, True])
+@pytest.mark.parametrize("tools", [None, ["exec_command", "read_file", "git_diff"]])
+def test_retired_patch_protocol_does_not_change_prompt(mode, gate, tools) -> None:
+    baseline = AgentProfile(agent_id="main", prompt_mode=mode, finalize_evidence_gate=gate)
+    legacy = AgentProfile(
+        agent_id="main",
+        prompt_mode=mode,
+        finalize_evidence_gate=gate,
+        patch_evidence_protocol=True,
+    )
+
+    assert assemble_system_prompt(legacy, tools=tools) == assemble_system_prompt(
+        baseline, tools=tools
+    )
 
 
 def test_patch_evidence_protocol_requires_tools() -> None:
