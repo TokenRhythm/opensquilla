@@ -247,6 +247,7 @@ class ArtifactEvent:
     store: str = "artifacts"
     has_thumbnail: bool = False
     generation_epoch: int = 0
+    publication_id: str = ""
 
 
 @dataclass
@@ -378,9 +379,6 @@ class DoneEvent:
     # positional DoneEvent construction keeps its historical field order.
     delivery: Literal["visible", "suppressed"] = "visible"
     suppression_reason: Literal["no_reply", "heartbeat_ack"] | None = None
-    # Authoritative document side-effect fact for restricted annotation turns.
-    # Presentation text may be model-generated; this receipt is runtime-owned.
-    document_mutation_outcome: dict[str, Any] | None = None
     generation_epoch: int = 0
     # First physical provider call that emitted visible output for the route
     # plan. Clients use this to keep its route card on the same answer segment.
@@ -741,12 +739,6 @@ class AgentConfig:
     compaction_protected_recent_messages: int = 0
     compaction_total_timeout_seconds: float = 120.0
     compaction_heartbeat_interval_seconds: float = 15.0
-    # Explicit per-turn authority boundary. Restricted turns (currently
-    # PromptAnnotation edits) must never send persisted history to an
-    # auxiliary compaction/flush model before or during the primary request.
-    # The runtime derives this from ToolContext.exclusive_tools; it is not a
-    # user-configurable inference from individual tool names.
-    restricted_turn: bool = False
     # Frozen runtime-only single-deployment chain for auxiliary compaction.
     # Kept opaque here to avoid coupling engine types to session internals.
     compaction_execution_plan: Any | None = field(
@@ -820,6 +812,7 @@ class AgentConfig:
     post_write_convergence_warn_threshold: int = 3
     # Deprecated, unused compatibility slot; preserve positional/keyword construction.
     post_write_convergence_finalize_after_warning: int = 3
+    # Deprecated export; retain the slot and path for legacy final-diff exclusion.
     patch_evidence_ledger_path: str | None = None
     # Finalize-time red-evidence gate (see engine.finalize_evidence_gate).
     # Off by default; enabled per run via OPENSQUILLA_FINALIZE_EVIDENCE_GATE.

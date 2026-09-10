@@ -859,7 +859,9 @@ def test_release_workflow_prestages_draft_without_advancing_channels() -> None:
     )
     for contract in (
         "OPENSQUILLA_DESKTOP_UPDATE_CHANNEL_ROOT",
-        "OPENSQUILLA_DESKTOP_UPDATE_SOURCE: 'oss'",
+        "OPENSQUILLA_DESKTOP_UPDATE_SOURCE: requireSourceFallback ? 'github' : 'oss'",
+        "const requireSourceFallback = downloadSourceMode === 'github-to-oss'",
+        "--download-source-mode requires signed-handoff download mode",
         "checkForUpdates()",
         "downloadUpdate()",
         "relaunchToUpdate()",

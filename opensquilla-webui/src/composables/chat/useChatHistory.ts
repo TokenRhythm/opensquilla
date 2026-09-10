@@ -1,3 +1,4 @@
+import { pageAnnotationSnapshots } from '@/types/pageContext'
 import { nextTick, ref, type Ref } from 'vue'
 import type {
   ChatMessage,
@@ -49,7 +50,7 @@ import {
 import { isImageInputUnsupported, localizedChatErrorMessage } from '@/utils/chat/errors'
 import { isUsageAccountingBarrier } from '@/utils/chat/usageAccountingFailure'
 import { interleaveHistoryModelCallSegments } from '@/utils/chat/historyModelCallSegments'
-import { normalizePromptAnnotationSnapshot } from '@/workbench/artifactPromptAnnotationProvider'
+import { normalizePromptAnnotationSnapshot } from '@/utils/chat/promptAnnotationHistory'
 
 function recordArray<T extends Record<string, unknown>>(value: unknown): T[] {
   return Array.isArray(value)
@@ -839,10 +840,12 @@ export function useChatHistory(options: UseChatHistoryOptions) {
       planRevisions: planRevisionsFromToolSegments(msg.toolCalls),
       timeline: recordArray<ChatTimelineSegment>(msg.timeline),
       attachments: normalizeDisplayAttachments([...msg.attachments], { messageId }),
-      promptAnnotations: msg.promptAnnotations
-        .map(normalizePromptAnnotationSnapshot)
-        .filter((item): item is PromptAnnotationSnapshot => item !== null)
-        .sort((left, right) => left.sentOrder - right.sentOrder),
+      promptAnnotations: msg.pageContext
+        ? pageAnnotationSnapshots(msg.pageContext)
+        : msg.promptAnnotations
+            .map(normalizePromptAnnotationSnapshot)
+            .filter((item): item is PromptAnnotationSnapshot => item !== null)
+            .sort((left, right) => (left.sentOrder || 0) - (right.sentOrder || 0)),
       provenanceKind: msg.provenance.kind || '',
       provenanceSourceSessionKey: msg.provenance.sourceSessionKey || '',
       provenanceSourceTool: msg.provenance.sourceTool || '',

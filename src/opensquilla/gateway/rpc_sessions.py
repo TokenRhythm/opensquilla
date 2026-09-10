@@ -14,7 +14,6 @@ import uuid
 import weakref
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from contextlib import asynccontextmanager
-from contextvars import ContextVar
 from dataclasses import replace
 from functools import partial
 from pathlib import Path
@@ -168,11 +167,7 @@ from opensquilla.gateway.adapters.turn_admission_contract import (
 from opensquilla.gateway.admission_failures import translate_admission_failure
 from opensquilla.gateway.admission_input import decode_admit_turn, source_hint_from_turn
 from opensquilla.gateway.admission_preparation import (
-    ArtifactBinding,
     PreparedRuntimeRoute,
-)
-from opensquilla.gateway.admission_preparation import (
-    bind_artifact as bind_admission_artifact,
 )
 from opensquilla.gateway.admission_preparation import (
     prepare_route as prepare_admission_route,
@@ -180,16 +175,12 @@ from opensquilla.gateway.admission_preparation import (
 from opensquilla.gateway.admission_runtime import GatewayAdmissionRuntime
 from opensquilla.gateway.admission_storage import GatewayAdmissionSessions, GatewayAdmissionStorage
 from opensquilla.gateway.agent_tasks import get_agent_task_registry
-from opensquilla.gateway.artifact_product_errors import (
-    ArtifactProductErrorCode,
-    artifact_product_error,
-    logged_artifact_product_error,
-)
 from opensquilla.gateway.compaction_target import (
     validate_gateway_session_deployment_override,
 )
 from opensquilla.gateway.guest_rpc_policy import is_guest_rpc_method_allowed
 from opensquilla.gateway.model_routing import model_routing_patches
+from opensquilla.gateway.page_context import resolve_page_context
 from opensquilla.gateway.pending_input_primitives import (
     GatewayPendingInputPrimitives,
     pending_input_projection,
@@ -321,72 +312,8 @@ _ELEVATED_MODES = frozenset({"full"})
 _TRUSTED_ELEVATED_ALIASES = frozenset({"on", "bypass"})
 
 
-def _prompt_annotation_source_only_context(context: Any) -> Any:
-    """Downgrade a PromptAnnotation turn when candidate preview is unavailable.
-
-    The autonomous ten-tool surface requires a live protocol-v4 Desktop
-    bridge: without it a writer could stage a DRAFT but could never obtain a
-    verification receipt or finish it.  Use the established source-only
-    compatibility surface instead of exposing a dead-end candidate loop.  The
-    source writer remains durable and the prompt explicitly tells the model
-    not to claim a preview verification it could not perform.
-    """
-
-    from opensquilla.gateway.artifact_contexts import (
-        PROMPT_ANNOTATION_SOURCE_TOOL_NAMES,
-    )
-    from opensquilla.prompt_annotations import render_active_prompt_annotation_context
-
-    snapshots = getattr(context, "snapshots", ())
-    return replace(
-        context,
-        tool_names=PROMPT_ANNOTATION_SOURCE_TOOL_NAMES,
-        request_context_prompt=(
-            render_active_prompt_annotation_context(
-                snapshots,
-                autonomous_loop=False,
-            )
-            or context.request_context_prompt
-        ),
-    )
 
 
-def _desktop_artifact_bridge_supports_candidate_loop(capabilities: Any) -> bool:
-    """Return whether the active Desktop surface can complete a candidate loop.
-
-    Protocol version alone is not enough: the v4 contract is also used for
-    non-HTML/office surfaces and for a shell whose active preview is still
-    loading.  Exposing the ten-tool contract in those states would create a
-    DRAFT that can be staged but can never obtain a verification receipt or
-    restore the canonical preview.  Require the capabilities that are stable
-    before the first candidate is bound; ``browserAct`` is intentionally not
-    required because the native surface enables it only after binding the
-    opaque candidate handle.
-    """
-
-    if capabilities is None:
-        return False
-    if isinstance(capabilities, Mapping):
-        version = capabilities.get("version")
-
-        def _flag(*names: str) -> bool:
-            return any(capabilities.get(name) is True for name in names)
-
-    else:
-        version = getattr(capabilities, "version", None)
-
-        def _flag(*names: str) -> bool:
-            return any(getattr(capabilities, name, None) is True for name in names)
-
-    values = (
-        _flag("available"),
-        _flag("browserInspect", "browser_inspect"),
-        _flag("bindCandidatePreview", "bind_candidate_preview"),
-        _flag("restoreCanonicalPreview", "restore_canonical_preview"),
-    )
-    return (
-        isinstance(version, int) and not isinstance(version, bool) and version >= 4 and all(values)
-    )
 
 
 def _emit_steer_metric(disposition: str, **labels: Any) -> None:
@@ -2988,63 +2915,6 @@ def _turn_source_scope(source_hint: dict[str, Any], ctx: RpcContext) -> str:
     return f"{caller_kind}:{channel_kind}:{principal_role}"[:256]
 
 
-async def _load_followup_annotation_focus(
-    storage: SessionStorage,
-    *,
-    session_id: str,
-    document_id: str,
-) -> str | None:
-    """Return a short read-only focus for the current document follow-up.
-
-    This is intentionally derived from the accepted transcript envelope rather
-    than reusing an annotation authority.  The current document context still
-    performs the normal owner, session, head, and CAS checks below.
-    """
-
-    try:
-        get_transcript = getattr(storage, "get_canonical_transcript", None)
-        if not callable(get_transcript):
-            get_transcript = storage.get_transcript
-        entries = await get_transcript(session_id)
-        from opensquilla.prompt_annotations import (
-            prompt_annotations_from_transcript_envelope,
-            render_followup_prompt_annotation_focus,
-        )
-
-        user_entries: list[tuple[int, Any, tuple[dict[str, Any], ...]]] = []
-        for index, entry in enumerate(entries):
-            if getattr(entry, "role", None) != "user":
-                continue
-            snapshots = prompt_annotations_from_transcript_envelope(getattr(entry, "content", None))
-            if snapshots:
-                user_entries.append((index, entry, snapshots))
-        if not user_entries:
-            return None
-
-        annotation_index, _entry, snapshots = user_entries[-1]
-        matching = tuple(
-            snapshot
-            for snapshot in snapshots
-            if isinstance(snapshot.get("document"), Mapping)
-            and snapshot["document"].get("id") == document_id
-        )
-        if not matching:
-            return None
-
-        later_user_turns = sum(
-            1 for entry in entries[annotation_index + 1 :] if getattr(entry, "role", None) == "user"
-        )
-        if later_user_turns > 1:
-            return None
-        return render_followup_prompt_annotation_focus(matching)
-    except Exception:  # noqa: BLE001 - context continuity must fail open.
-        log.debug(
-            "sessions.followup_annotation_focus_unavailable",
-            session_id=session_id,
-            document_id=document_id,
-            exc_info=True,
-        )
-        return None
 
 
 async def _accepted_turn_response(
@@ -3053,7 +2923,6 @@ async def _accepted_turn_response(
     client_request_id: str,
     storage: SessionStorage,
     turn_context: dict[str, Any] | None = None,
-    accepted_prompt_annotation_ids: Sequence[str] = (),
 ) -> AdmitTurnResult:
     payload = accepted_turn_payload(result, client_request_id=client_request_id)
     receipt = result.receipt
@@ -3061,11 +2930,7 @@ async def _accepted_turn_response(
     payload["user_message_id"] = receipt.message_id
     if receipt.task_id is not None:
         payload["turn_id"] = receipt.task_id
-    normalized_annotation_ids = [
-        item.strip()
-        for item in accepted_prompt_annotation_ids
-        if isinstance(item, str) and item.strip()
-    ]
+    normalized_annotation_ids: list[str] = []
     # A pending-input dispatch can be replayed after the staged row has been
     # consumed.  That replay only has the ingress receipt, not the original
     # RPC payload, so it cannot pass promptAnnotationIds directly.  Recover
@@ -3201,31 +3066,9 @@ async def _accepted_turn_response(
     return payload
 
 
-class _IngressTurnAuthorityScope:
-    """Own newly acquired turn authorities until runtime admission succeeds."""
-
-    def __init__(self) -> None:
-        self.authorities: list[Any] = []
-
-    def register(self, authority: Any) -> None:
-        self.authorities.append(authority)
-
-    async def close_untransferred(self) -> None:
-        for authority in tuple(self.authorities):
-            if getattr(authority, "ingress_owned", False) is not True:
-                continue
-            try:
-                await authority.aclose()
-            except asyncio.CancelledError:
-                raise
-            except Exception:  # noqa: BLE001 - preserve the ingress outcome
-                log.warning("sessions.send.turn_authority_cleanup_failed", exc_info=True)
 
 
-_INGRESS_TURN_AUTHORITY_SCOPE: ContextVar[_IngressTurnAuthorityScope | None] = ContextVar(
-    "opensquilla_ingress_turn_authority_scope",
-    default=None,
-)
+
 
 
 def _pending_input_storage(ctx: RpcContext) -> SessionStorage:
@@ -5720,12 +5563,6 @@ class _GatewayAdmissionPrimitives(GatewayAdmissionRuntime):
         self._emit_collaboration = partial(_publish_admission_collaboration, ctx)
         self._principal = ctx.principal
         self._clear_compaction = getattr(ctx.turn_runner, "clear_compacted_this_turn", None)
-        self._artifact_binding = partial(
-            bind_admission_artifact,
-            media_root=self.policy.media_root,
-            principal_actor_id=getattr(ctx.principal, "token_public_id", None),
-            event_emitter_factory=partial(_artifact_state_event_emitter, ctx),
-        )
         self._route_preparation = partial(
             prepare_admission_route,
             config=ctx.config,
@@ -5738,8 +5575,7 @@ class _GatewayAdmissionPrimitives(GatewayAdmissionRuntime):
                 ctx.principal, task_id, state_dir=ctx.config.state_dir
             ),
             event_emitter_factory=partial(_artifact_state_event_emitter, ctx),
-            candidate_loop_supported=_desktop_artifact_bridge_supports_candidate_loop,
-            source_only_context=_prompt_annotation_source_only_context,
+            page_context_resolver=partial(resolve_page_context, ctx=ctx),
         )
         self._run_mode_hint = partial(_trusted_run_mode_hint, ctx)
         self._elevated_hint = partial(_trusted_elevated_hint, ctx)
@@ -5755,8 +5591,7 @@ class _GatewayAdmissionPrimitives(GatewayAdmissionRuntime):
         client_request_id: str,
         storage: AdmissionStorage,
         turn_context: dict[str, Any] | None = None,
-        accepted_prompt_annotation_ids: Sequence[str] = (),
-    ) -> AdmitTurnResult:
+        ) -> AdmitTurnResult:
         self._require_storage(storage)
         if not isinstance(acceptance, TurnAcceptanceResult):
             raise TypeError("Accepted response requires a durable acceptance result")
@@ -5765,7 +5600,6 @@ class _GatewayAdmissionPrimitives(GatewayAdmissionRuntime):
             client_request_id=client_request_id,
             storage=self._native_storage,
             turn_context=turn_context,
-            accepted_prompt_annotation_ids=accepted_prompt_annotation_ids,
         )
 
     async def should_auto_title(
@@ -5823,19 +5657,6 @@ class _GatewayAdmissionPrimitives(GatewayAdmissionRuntime):
     def is_remote_guest(self, source: IncomingTurnSource) -> bool:
         return _is_remote_web_guest(self._principal, source_hint_from_turn(source))
 
-    async def bind_artifact(
-        self, command: AdmitTurn, *, key: str, session_id: str, session: Any
-    ) -> ArtifactBinding:
-        if self.storage is None or self._native_storage is None:
-            raise KeyError("No session storage available")
-        return await self._artifact_binding(
-            command,
-            key=key,
-            session_id=session_id,
-            session=session,
-            storage=self._native_storage,
-            load_followup_focus=partial(_load_followup_annotation_focus, self._native_storage),
-        )
 
     async def prepare_route(
         self,
@@ -5845,7 +5666,6 @@ class _GatewayAdmissionPrimitives(GatewayAdmissionRuntime):
         key: str,
         session_id: str,
         atomic_intent_plan: Any,
-        binding: ArtifactBinding,
         workspace_guard: Any,
     ) -> PreparedRuntimeRoute:
         if self.storage is None or self.sessions is None or self._native_storage is None:
@@ -5859,12 +5679,10 @@ class _GatewayAdmissionPrimitives(GatewayAdmissionRuntime):
             key=key,
             session_id=session_id,
             atomic_intent_plan=atomic_intent_plan,
-            binding=binding,
             workspace_guard=workspace_guard,
             run_mode_hint=self._run_mode_hint(source),
             elevated_hint=self._elevated_hint(source),
             guest_safe=self.is_remote_guest(command.source),
-            authority_scope=_INGRESS_TURN_AUTHORITY_SCOPE.get(),
         )
 
     @contextlib.asynccontextmanager
@@ -5876,49 +5694,13 @@ class _GatewayAdmissionPrimitives(GatewayAdmissionRuntime):
         else:
             yield
 
-    @contextlib.asynccontextmanager
-    async def authority_scope(self):
-        scope = _IngressTurnAuthorityScope()
-        token = _INGRESS_TURN_AUTHORITY_SCOPE.set(scope)
-        try:
-            yield
-        finally:
-            _INGRESS_TURN_AUTHORITY_SCOPE.reset(token)
-            await scope.close_untransferred()
 
-    async def release_untransferred_authorities(self) -> None:
-        scope = _INGRESS_TURN_AUTHORITY_SCOPE.get()
-        if scope is not None:
-            await scope.close_untransferred()
-            scope.authorities.clear()
 
     def clear_compaction_marker(self, key: str) -> None:
         if callable(self._clear_compaction):
             self._clear_compaction(key)
 
-    @staticmethod
-    def turn_authority(envelope: Any) -> Any:
-        return envelope.runtime_services.get("turn_authority_cleanup")
 
-    @staticmethod
-    def artifact_error(
-        kind: str,
-        cause: Exception | None = None,
-        *,
-        retryable: bool,
-        operation: str = "turn_acceptance",
-        session_key: str | None = None,
-    ) -> RpcHandlerError:
-        code = ArtifactProductErrorCode(kind.upper())
-        if cause is None:
-            return artifact_product_error(code, retryable=retryable)
-        return logged_artifact_product_error(
-            code,
-            cause,
-            operation=operation,
-            retryable=retryable,
-            session_key=session_key,
-        )
 
     async def publish_forked(self, key: str) -> None:
         await self._emit_forked(key)

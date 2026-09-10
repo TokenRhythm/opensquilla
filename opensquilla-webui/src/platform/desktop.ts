@@ -84,12 +84,12 @@ const NATIVE_SURFACE_EVENT_TYPES = new Set<NativeWorkbenchSurfaceEventType>([
   'error',
   'crashed',
   'escape',
+  'browser-opened',
   'annotation-selected',
   'annotation-draft-change',
   'annotation-submit',
   'annotation-cancel',
   'annotation-overlay-fallback',
-  'agent-edit-released',
 ])
 
 function normalizeArtifactAnnotationSelection(
@@ -103,10 +103,7 @@ function normalizeArtifactAnnotationSelection(
   const selectionId = typeof raw.selectionId === 'string' ? raw.selectionId : ''
   const tagName = typeof raw.tagName === 'string' ? raw.tagName : ''
   const elementPath = typeof raw.elementPath === 'string' ? raw.elementPath : ''
-  const elementProofSha256 = typeof raw.elementProofSha256 === 'string'
-    ? raw.elementProofSha256
-    : ''
-  const domSha256 = typeof raw.domSha256 === 'string' ? raw.domSha256 : ''
+  const targetRef = typeof raw.targetRef === 'string' ? raw.targetRef : ''
   const finite = (field: string) => typeof rect?.[field] === 'number'
     && Number.isFinite(rect[field])
   if (
@@ -114,8 +111,7 @@ function normalizeArtifactAnnotationSelection(
     || !/^[A-Za-z][A-Za-z0-9:_-]{0,127}$/.test(tagName)
     || !elementPath
     || elementPath.length > 4096
-    || !/^[a-f0-9]{64}$/i.test(elementProofSha256)
-    || (domSha256 !== '' && !/^[a-f0-9]{64}$/i.test(domSha256))
+    || !targetRef || targetRef.length > 256
     || !rect
     || !finite('x')
     || !finite('y')
@@ -126,8 +122,10 @@ function normalizeArtifactAnnotationSelection(
     selectionId,
     tagName: tagName.toLowerCase(),
     elementPath,
-    elementProofSha256: elementProofSha256.toLowerCase(),
-    ...(domSha256 ? { domSha256: domSha256.toLowerCase() } : {}),
+    targetRef,
+    ...(typeof raw.resourceId === 'string' ? { resourceId: raw.resourceId } : {}),
+    ...(typeof raw.selectionText === 'string' ? { selectionText: raw.selectionText } : {}),
+    ...(typeof raw.locatorHint === 'string' ? { locatorHint: raw.locatorHint } : {}),
     rect: {
       x: Number(rect.x),
       y: Number(rect.y),
@@ -183,6 +181,8 @@ function normalizeNativeSurfaceEvent(payload: unknown): NativeWorkbenchSurfaceEv
           ? { requestingOrigin: rawDetail.requestingOrigin }
           : {}),
         ...(typeof rawDetail.url === 'string' ? { url: rawDetail.url } : {}),
+        ...(typeof rawDetail.sessionKey === 'string' ? { sessionKey: rawDetail.sessionKey } : {}),
+        ...(typeof rawDetail.targetRef === 'string' ? { targetRef: rawDetail.targetRef } : {}),
         ...(typeof rawDetail.title === 'string' ? { title: rawDetail.title } : {}),
         ...(typeof rawDetail.loading === 'boolean' ? { loading: rawDetail.loading } : {}),
         ...(typeof rawDetail.canGoBack === 'boolean'
@@ -207,52 +207,23 @@ function normalizeNativeSurfaceEvent(payload: unknown): NativeWorkbenchSurfaceEv
   }
 }
 
-function normalizeArtifactScreenshotResult(
+function normalizeWorkbenchScreenshot(
   payload: unknown,
-): import('./types').NativeArtifactScreenshotResult {
+  targetRef: string,
+): import('./types').NativeWorkbenchScreenshot {
   const raw = payload && typeof payload === 'object'
-    ? payload as Record<string, unknown>
-    : {}
-  if (raw.ok !== true || raw.method !== 'screenshot') {
-    return {
-      ok: false,
-      method: 'screenshot',
-      code: typeof raw.code === 'string' ? raw.code : 'operation-failed',
-      message: typeof raw.message === 'string'
-        ? raw.message
-        : 'The Desktop artifact screenshot is unavailable.',
-    }
-  }
-  const value = raw.value && typeof raw.value === 'object'
-    ? raw.value as Record<string, unknown>
-    : null
-  const data = value?.data instanceof Uint8Array ? value.data : null
-  const width = Number(value?.width)
-  const height = Number(value?.height)
+    ? payload as Record<string, unknown> : {}
+  const width = Number(raw.width)
+  const height = Number(raw.height)
   if (
-    value?.mime !== 'image/png'
-    || !data
-    || data.byteLength < 1
-    || data.byteLength > 16 * 1024 * 1024
-    || !Number.isSafeInteger(width)
-    || !Number.isSafeInteger(height)
-    || width < 1
-    || height < 1
-    || width > 32_768
-    || height > 32_768
-  ) {
-    return {
-      ok: false,
-      method: 'screenshot',
-      code: 'invalid-response',
-      message: 'The Desktop artifact screenshot response is invalid.',
-    }
-  }
-  return {
-    ok: true,
-    method: 'screenshot',
-    value: { mime: 'image/png', data, width, height },
-  }
+    raw.targetRef !== targetRef || raw.mimeType !== 'image/png'
+    || typeof raw.dataBase64 !== 'string' || !raw.dataBase64.length
+    || raw.dataBase64.length > 24 * 1024 * 1024
+    || !/^[A-Za-z0-9+/]+={0,2}$/.test(raw.dataBase64)
+    || !Number.isSafeInteger(width) || !Number.isSafeInteger(height)
+    || width < 1 || height < 1 || width > 32_768 || height > 32_768
+  ) throw new Error('The Desktop page screenshot response is invalid.')
+  return { targetRef, mimeType: 'image/png', dataBase64: raw.dataBase64, width, height }
 }
 
 function desktopNativeWorkbenchApi(api: OpenSquillaDesktopApi): NativeWorkbenchApi | undefined {
@@ -328,13 +299,18 @@ function desktopNativeWorkbenchApi(api: OpenSquillaDesktopApi): NativeWorkbenchA
     ...(typeof api.closeArtifactAnnotationOverlay === 'function'
       ? { closeArtifactAnnotationOverlay: payload => api.closeArtifactAnnotationOverlay!(payload) }
       : {}),
-    ...(typeof api.screenshot === 'function'
+    ...(typeof api.getWorkbenchBrowserTarget === 'function'
+      ? { getWorkbenchBrowserTarget: payload => api.getWorkbenchBrowserTarget!(payload) } : {}),
+    ...(typeof api.focusWorkbenchAnnotation === 'function'
+      ? { focusWorkbenchAnnotation: payload => api.focusWorkbenchAnnotation!(payload) } : {}),
+    ...(typeof api.captureWorkbenchScreenshot === 'function'
       ? {
-          async screenshot(payload) {
-            return normalizeArtifactScreenshotResult(await api.screenshot!(payload))
+          async captureWorkbenchScreenshot(payload) {
+            return normalizeWorkbenchScreenshot(
+              await api.captureWorkbenchScreenshot!(payload), payload.targetRef,
+            )
           },
-        }
-      : {}),
+        } : {}),
     ...(typeof api.createArtifactPreviewLease === 'function'
       && typeof api.renewArtifactPreviewLease === 'function'
       && typeof api.revokeArtifactPreviewLease === 'function'

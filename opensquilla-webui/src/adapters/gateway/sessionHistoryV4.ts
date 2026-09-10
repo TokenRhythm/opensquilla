@@ -1,3 +1,4 @@
+import { normalizePageContext } from '@/types/pageContext'
 import type { TransportCallOptions as RpcCallOptions } from './transportTypes'
 import {
   CHAT_HISTORY_METHOD,
@@ -132,7 +133,7 @@ const MESSAGE_FIELDS = new Set([
   'id', 'message_id', 'transcript_id', 'role', 'text', 'timestamp', 'ts',
   'reasoning_content', 'reasoningContent', 'router_decision', 'routerDecision',
   'artifacts', 'tool_calls', 'toolCalls', 'timeline', 'attachments',
-  'prompt_annotations', 'promptAnnotations', 'provenance_kind',
+  'prompt_annotations', 'promptAnnotations', 'page_context', 'pageContext', 'provenance_kind',
   'provenance_source_session_key', 'provenance_source_tool', 'turn_context',
   'turnContext', 'usage', 'turn_usage', 'turnUsage', 'model', 'model_id',
   'input', 'input_tokens', 'inputTokens', 'output', 'output_tokens', 'outputTokens',
@@ -165,6 +166,7 @@ function projectMessage(value: ChatHistoryMessage, index: number): SessionReadMe
     timeline: projectUnknownArray(raw.timeline),
     attachments: projectObjectArray(raw.attachments),
     promptAnnotations: projectUnknownArray(raw.prompt_annotations ?? raw.promptAnnotations),
+    pageContext: normalizePageContext(raw.page_context ?? raw.pageContext) ?? undefined,
     provenance: Object.freeze({
       kind: textValue(value.provenance_kind),
       sourceSessionKey: textValue(value.provenance_source_session_key),

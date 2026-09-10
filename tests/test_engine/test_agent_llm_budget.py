@@ -24,6 +24,7 @@ from opensquilla.engine import (
     WarningEvent,
 )
 from opensquilla.engine.agent import _progress_watchdog_guidance_message
+from opensquilla.engine.progress_watchdog import ProgressObservation, ProgressWatchdog
 from opensquilla.engine.runtime import TurnRunner
 from opensquilla.engine.session_sanitize import session_payload_chars
 from opensquilla.engine.types import CompactionEvent
@@ -1793,6 +1794,132 @@ async def test_agent_progress_watchdog_can_warn_model_after_repeated_tool_errors
         and "Do not repeat the same action unchanged" in message.content
         for message in provider.calls[2]
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("initial_narration", [False, True], ids=["silent", "narrated"])
+@pytest.mark.parametrize(
+    (
+        "publication_content",
+        "publication_is_error",
+        "has_artifacts",
+        "expected_completed",
+        "followup_is_error",
+    ),
+    [
+        pytest.param('{"status":"published"}', False, True, True, True, id="published"),
+        pytest.param(
+            '{"status":"already_published"}', False, True, False, True,
+            id="duplicate-with-occurrence",
+        ),
+        pytest.param('{"status":"approval_pending"}', False, False, False, True, id="pending"),
+        pytest.param('{"status":"published"}', True, True, False, True, id="failed"),
+        pytest.param("invalid json", False, True, False, True, id="invalid-json"),
+        pytest.param("[]", False, True, False, True, id="non-object-json"),
+        pytest.param('{"status":"published"}', False, False, False, True, id="no-artifact"),
+        pytest.param(
+            '{"status":"published"}', False, True, True, False,
+            id="normal-tools-after-publication",
+        ),
+    ],
+)
+async def test_agent_progress_watchdog_tracks_only_current_completed_publications(
+    monkeypatch: pytest.MonkeyPatch,
+    initial_narration: bool,
+    publication_content: str,
+    publication_is_error: bool,
+    has_artifacts: bool,
+    expected_completed: bool,
+    followup_is_error: bool,
+) -> None:
+    class PublishThenToolsProvider(_RepeatedToolFailureThenDoneProvider):
+        async def _stream(self, call_number: int) -> AsyncIterator[Any]:
+            if call_number == 1:
+                if initial_narration:
+                    yield ProviderText(text="Publishing the report.")
+                yield ProviderToolUseStart(
+                    tool_use_id="publish-1", tool_name="publish_artifact",
+                )
+                yield ProviderToolUseEnd(
+                    tool_use_id="publish-1",
+                    tool_name="publish_artifact",
+                    arguments={"path": "report.txt"},
+                )
+                yield ProviderDone(stop_reason="tool_calls", input_tokens=1, output_tokens=1)
+                return
+            async for event in super()._stream(call_number - 1):
+                yield event
+
+    provider = PublishThenToolsProvider(tool_retries=2)
+    context = ToolContext()
+    calls: list[str] = []
+    observations: list[ProgressObservation] = []
+    observe = ProgressWatchdog.observe
+
+    def record_observation(self: ProgressWatchdog, observation: ProgressObservation):
+        observations.append(observation)
+        return observe(self, observation)
+
+    monkeypatch.setattr(ProgressWatchdog, "observe", record_observation)
+
+    async def tool_handler(call: ToolCall) -> ToolResult:
+        calls.append(call.tool_name)
+        if call.tool_name == "publish_artifact":
+            artifacts = [{
+                "id": "art-published",
+                "name": "report.txt",
+                "mime": "text/plain",
+                "publication_id": "publication-occurrence",
+            }] if has_artifacts else []
+            context.published_artifacts.extend(artifacts)
+            return ToolResult(
+                tool_use_id=call.tool_use_id,
+                tool_name=call.tool_name,
+                content=publication_content,
+                is_error=publication_is_error,
+                artifacts=artifacts,
+            )
+        return ToolResult(
+            tool_use_id=call.tool_use_id,
+            tool_name=call.tool_name,
+            content="syntax error" if followup_is_error else "verification passed",
+            is_error=followup_is_error,
+        )
+
+    agent = Agent(
+        provider=provider,
+        config=AgentConfig(
+            max_iterations=5,
+            flush_enabled=False,
+            progress_watchdog_mode="warn_model",
+            progress_watchdog_repeated_tool_error_threshold=2,
+            tool_failure_loop_block_threshold=0,
+        ),
+        tool_handler=tool_handler,
+        tool_context=context,
+    )
+
+    events = [event async for event in agent.run_turn("Publish the report and verify it")]
+
+    expected_text = ("Publishing the report." if initial_narration else "") + "handled"
+    assert any(isinstance(event, DoneEvent) and event.text == expected_text for event in events)
+    assert calls == ["publish_artifact", "exec_command", "exec_command"]
+    assert len(provider.calls) == 4
+    assert len(context.published_artifacts) == int(has_artifacts)
+    warnings = [
+        message.content
+        for message in provider.calls[-1]
+        if isinstance(message.content, str) and "[Runtime progress warning]" in message.content
+    ]
+    assert bool(warnings) is followup_is_error
+    if followup_is_error:
+        assert "Do not repeat the same action unchanged" in warnings[-1]
+    assert [observation.artifact_completed for observation in observations] == [
+        expected_completed, False, False,
+    ]
+    assert [observation.user_visible_output for observation in observations] == [
+        initial_narration, False, False,
+    ]
 
 
 @pytest.mark.asyncio

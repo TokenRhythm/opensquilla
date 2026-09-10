@@ -1481,7 +1481,7 @@ def test_desktop_recovery_e2e_runs_compiled_flows_on_all_release_platforms() -> 
     assert '"windows-loopback-no-buffer-space-v1"' in run["run"]
     assert '"macos-electron-foreground-prerequisite-v1"' in run["run"]
     assert '"cases": {"desktop-cleanup-flow"}' in run["run"]
-    assert '"cases": {"offline-document-workbench-e2e"}' in run["run"]
+    assert '"cases": {"native-workbench-v2"}' in run["run"]
     assert '"classification": matches[0] if retryable else "non_retryable"' in (
         run["run"]
     )
@@ -1513,21 +1513,6 @@ def test_desktop_recovery_e2e_runs_compiled_flows_on_all_release_platforms() -> 
     assert "node scripts/test-ci-case-telemetry.mjs" in desktop_unit["run"]
 
 
-_WINDOWS_WORKBENCH_BUFFER_ERROR = (
-    "electronApplication.evaluate: Error: "
-    "ERR_NO_BUFFER_SPACE (-176) loading 'http://127.0.0.1:54108/one'\n"
-)
-_WORKBENCH_NODE_SOURCE_EXCERPT = (
-    "file:///D:/synthetic/test-offline-document-workbench-e2e.mjs:27\n"
-    "    throw new Error(`${command} ${args.join(' ')} failed with exit code ${result.exitCode}`)\n"
-    "          ^\n"
-)
-_WORKBENCH_NATIVE_EXIT_WRAPPER = (
-    "Error: C:\\synthetic\\node.exe "
-    "D:\\synthetic\\test-native-workbench-v2-electron.mjs failed with exit code 1\n"
-)
-
-
 @pytest.mark.parametrize("line_ending", ("\n", "\r\n"), ids=("lf", "crlf"))
 @pytest.mark.parametrize(
     ("case_name", "runner_os", "message", "expected_signature"),
@@ -1540,7 +1525,7 @@ _WORKBENCH_NATIVE_EXIT_WRAPPER = (
             "windows-delete-helper-handoff-timeout-v1",
         ),
         (
-            "offline-document-workbench-e2e",
+            "native-workbench-v2",
             "Windows",
             "Traceback (most recent call last):\n"
             "    at synthetic_allowed_stack\n"
@@ -1551,7 +1536,7 @@ _WORKBENCH_NATIVE_EXIT_WRAPPER = (
             "windows-isolated-acl-worker-timeout-v1",
         ),
         (
-            "offline-document-workbench-e2e",
+            "native-workbench-v2",
             "Windows",
             "electronApplication.evaluate: Error: "
             "ERR_NO_BUFFER_SPACE (-176) loading 'http://127.0.0.1:54108/one'\n"
@@ -1563,19 +1548,7 @@ _WORKBENCH_NATIVE_EXIT_WRAPPER = (
             "windows-loopback-no-buffer-space-v1",
         ),
         (
-            "offline-document-workbench-e2e",
-            "Windows",
-            _WINDOWS_WORKBENCH_BUFFER_ERROR
-            + "    at synthetic_allowed_stack (native-workbench.mjs:1:1)\n\n"
-            + "Node.js v22.12.0\n"
-            + _WORKBENCH_NODE_SOURCE_EXCERPT
-            + "\n"
-            + _WORKBENCH_NATIVE_EXIT_WRAPPER
-            + "    at run (offline-workbench.mjs:27:11)\n",
-            "windows-loopback-no-buffer-space-v1",
-        ),
-        (
-            "offline-document-workbench-e2e",
+            "native-workbench-v2",
             "macOS",
             "electronApplication.evaluate: Error: "
             "ELECTRON_FOREGROUND_PREREQUISITE_MISSING: owner is not foreground\n"
@@ -1673,7 +1646,7 @@ def test_desktop_retry_classifier_rejects_similar_windows_loopback_failures(
         [
             sys.executable,
             "-",
-            "offline-document-workbench-e2e",
+            "native-workbench-v2",
             "Windows",
             str(log),
             str(output),
@@ -1689,78 +1662,6 @@ def test_desktop_retry_classifier_rejects_similar_windows_loopback_failures(
     assert record["classification"] == "non_retryable"
     assert record["retryable"] is False
     assert list(evidence.iterdir()) == []
-
-
-@pytest.mark.parametrize("runner_os", ("Windows", "macOS"))
-@pytest.mark.parametrize(
-    "source_excerpt",
-    (
-        _WORKBENCH_NODE_SOURCE_EXCERPT,
-        _WORKBENCH_NODE_SOURCE_EXCERPT.replace(
-            "test-offline-document-workbench-e2e.mjs", "other-e2e.mjs",
-        ),
-        _WORKBENCH_NODE_SOURCE_EXCERPT.split("\n", 1)[1],
-        _WORKBENCH_NODE_SOURCE_EXCERPT.replace("          ^\n", ""),
-        _WORKBENCH_NODE_SOURCE_EXCERPT.replace("args.join(' ')", "args.join(',')"),
-    ),
-    ids=("owned-context", "other-script", "missing-location", "missing-caret", "other-source"),
-)
-@pytest.mark.parametrize(
-    "additional_failure",
-    (
-        "",
-        "AssertionError: saved revision differs from the submitted document\n",
-        "Error: Gateway did not become healthy\n",
-        "FATAL: renderer process crashed while committing the document\n",
-    ),
-    ids=("none", "assertion", "error", "crash"),
-)
-def test_desktop_retry_classifier_never_hides_other_node_failures(
-    tmp_path: Path,
-    runner_os: str,
-    source_excerpt: str,
-    additional_failure: str,
-) -> None:
-    run = next(
-        step["run"]
-        for step in _workflow("ci.yml")["jobs"]["desktop-recovery-e2e"]["steps"]
-        if step.get("name") == "Run compiled Desktop recovery flows"
-    )
-    classifier = run.split("<<'PY'\n", 1)[1].split("\nPY\n", 1)[0]
-    log = tmp_path / "attempt-1.log"
-    output = tmp_path / "classifications.jsonl"
-    evidence = tmp_path / "evidence"
-    evidence.mkdir()
-    log.write_text(
-        _WINDOWS_WORKBENCH_BUFFER_ERROR
-        + source_excerpt
-        + "\n"
-        + _WORKBENCH_NATIVE_EXIT_WRAPPER
-        + additional_failure,
-        encoding="utf-8",
-    )
-    accepted_shape = (
-        runner_os == "Windows"
-        and source_excerpt == _WORKBENCH_NODE_SOURCE_EXCERPT
-        and not additional_failure
-    )
-
-    result = subprocess.run(
-        [
-            sys.executable, "-", "offline-document-workbench-e2e", runner_os,
-            str(log), str(output), str(evidence),
-        ],
-        input=classifier,
-        text=True,
-        check=False,
-    )
-    assert result.returncode == (0 if accepted_shape else 1)
-    record = json.loads(output.read_text(encoding="utf-8"))
-    assert record["retryable"] is accepted_shape
-    if not accepted_shape:
-        assert record["classification"] == "non_retryable"
-        assert record["blocked_markers"]
-        assert list(evidence.iterdir()) == []
 
 
 def test_desktop_retry_classifier_rejects_generic_product_failures(tmp_path: Path) -> None:
@@ -1784,7 +1685,7 @@ def test_desktop_retry_classifier_rejects_generic_product_failures(tmp_path: Pat
         [
             sys.executable,
             "-",
-            "offline-document-workbench-e2e",
+            "native-workbench-v2",
             "Windows",
             str(log),
             str(output),
@@ -1812,7 +1713,7 @@ def test_desktop_retry_classifier_rejects_generic_product_failures(tmp_path: Pat
         [
             sys.executable,
             "-",
-            "offline-document-workbench-e2e",
+            "native-workbench-v2",
             "macOS",
             str(log),
             str(output),
@@ -1871,7 +1772,7 @@ def test_desktop_retry_classifier_rejects_allowed_signature_with_another_termina
         [
             sys.executable,
             "-",
-            "offline-document-workbench-e2e",
+            "native-workbench-v2",
             "macOS",
             str(log),
             str(output),
@@ -1889,28 +1790,6 @@ def test_desktop_retry_classifier_rejects_allowed_signature_with_another_termina
     assert record["blocked_markers"] == [expected_marker]
     assert all("submitted document content" not in marker for marker in record["blocked_markers"])
     assert list(evidence.iterdir()) == []
-
-
-def test_v1_editor_failure_evidence_is_captured_before_desktop_shutdown() -> None:
-    script = Path(
-        "desktop/electron/scripts/test-v1-html-agent-edit-e2e.mjs"
-    ).read_text(encoding="utf-8")
-    finally_block = script.index("} finally {")
-    durable_check = script.index(
-        "evidence.durableMutation = await readDurableMutationEvidence", finally_block
-    )
-    failure_capture = script.index(
-        "failureEvidence = await captureFailureEvidence", finally_block
-    )
-    app_close = script.index(
-        "await closeDesktopApp(app, 'final-electron-shutdown')", finally_block
-    )
-
-    assert durable_check < failure_capture < app_close
-    assert "async function diagnosticCall" in script
-    assert "const gateway = await gatewayHealthSnapshot" in script
-    assert "renderer shell snapshot" in script
-    assert "failure-attempt-${attempt}-${Date.now()}" in script
 
 
 def test_ci_evidence_artifacts_are_replaceable_across_rerun_attempts() -> None:

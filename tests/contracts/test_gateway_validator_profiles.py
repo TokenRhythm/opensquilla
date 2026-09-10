@@ -22,20 +22,43 @@ def test_production_targets_preserve_every_approved_validator_role() -> None:
     specs = runner.discover_contracts()
     targets = runner.load_production_targets(specs)
 
-    assert len(targets) == 201
+    assert len(targets) == 192
     assert Counter(role for roles in targets.values() for role in roles) == {
-        "result": 191,
+        "result": 182,
         "params": 17,
         "payload": 9,
         "frame": 1,
     }
-    assert sum(len(spec.targets) for spec in specs) == 886
+    assert sum(len(spec.targets) for spec in specs) == 854
     assert targets[("method", "sessions.list")] == ("result",)
     assert targets[("method", "meta.list")] == ("result",)
     assert targets[("method", "meta.inspect")] == ("result",)
     assert targets[("method", "sessions.messages.snapshot.read")] == ("params", "result")
     assert targets[("method", "transport.flow.update")] == ("params", "result")
     assert targets[("event", "transport.flow.dirty")] == ("payload",)
+
+    retired_writes = {
+        "documents.editSessions.start",
+        "documents.editSessions.heartbeat",
+        "documents.editSessions.close",
+        "artifacts.prompt_annotations.create",
+        "artifacts.prompt_annotations.focus",
+        "artifacts.prompt_annotations.update",
+        "artifacts.prompt_annotations.discard",
+        "artifacts.source.patch",
+    }
+    method_specs = {spec.wire_name: spec for spec in specs if spec.contract_type == "method"}
+    assert retired_writes.isdisjoint(method_specs)
+    assert all(("method", name) not in targets for name in retired_writes)
+
+    # Eight write Contracts were retired. The ninth removed production result
+    # validator has no current UI consumer; its historical read Contract remains
+    # complete in the verification profile.
+    history_name = "artifacts.prompt_annotations.list"
+    assert {role for role, _ in method_specs[history_name].targets} == {
+        "request", "params", "response", "result",
+    }
+    assert ("method", history_name) not in targets
 
 
 def test_sessions_list_uses_browser_safe_esm_for_its_selected_validator(

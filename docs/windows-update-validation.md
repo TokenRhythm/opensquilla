@@ -1,8 +1,10 @@
 # Windows signed installer rehearsal
 
-The controlled Windows installer handoff is experimental and off by default.
-`OPENSQUILLA_DESKTOP_ENABLE_WIN_INSTALL=1` enables it in a packaged client that
-contains the implementation. It keeps the full installer download and requires
+The Windows x64 installer handoff is enabled by default in builds containing
+the activation change. `OPENSQUILLA_DESKTOP_ENABLE_WIN_INSTALL=0` disables it
+and restores the manual Show installer action. The previous opt-in value `1`
+continues to work. Restart the client after changing the environment variable.
+It keeps the full installer download and requires
 the normal checksum, signature, cache, and shutdown gates before installation.
 The existing `OPENSQUILLA_DESKTOP_ENABLE_WIN_UPDATE` switch exercises a separate
 electron-updater path and must remain off during this rehearsal.
@@ -11,18 +13,55 @@ electron-updater path and must remain off during this rehearsal.
 
 The intended default Windows experience is **Check -> Download and verify ->
 Quit and install -> visible NSIS wizard -> launch the installed version**.
-The implementation may merge with the entry **off by default** after its update
-and lifecycle contracts, one signed native A-to-B cached-input flow with retained
-profile interactions, and required PR/merge-queue CI pass. This experimental
-merge does not certify general availability or the entire release matrix.
+PR #1584 introduced the implementation with the entry **off by default**.
+Its update and lifecycle contracts, one signed native A-to-B cached-input flow
+with retained-profile interactions, and PR/merge-queue CI do not certify general
+availability or the entire release matrix.
 
-Default activation is separate follow-up work. Complete the remaining native
-and restricted-network matrix below, record source SHAs, signed artifact hashes,
-installation mode, network conditions and outcomes, then validate the activation
-change in CI. No signing task, public channel update or release is authorized
-by this experimental merge. The
+Default activation is delivered by follow-up PR #1606 under the bounded
+acceptance decision below. Record source SHAs, signed artifact hashes,
+installation mode, network conditions and outcomes separately from CI results.
+The earlier experimental merge alone did not authorize signing,
+public channel changes, or a release. The
 manual Show installer action remains available as a secondary action when the
 handoff is enabled and as the primary action for shells without that capability.
+
+### Activation acceptance scope
+
+The maintainer waived Windows 10 native acceptance for this activation on
+2026-09-10. Windows 10 remains in the supported Windows x64 scope; this waiver
+does not establish a tested Windows 10 upgrade. Record Windows 10 as
+**not tested / maintainer waived**,
+never as passed or as an unsupported platform.
+
+The maintainer subsequently authorized merging after the checks feasible on
+the existing Windows 11 host, with unavailable native scenarios recorded as
+unverified rather than blocking this activation. This supersedes the earlier
+requirement to keep PR #1606 in Draft until every matrix cell passes; it does
+not turn any missing evidence into a pass or waive required repository CI.
+
+Host evidence includes the signed cached A-to-B custom per-user upgrade and
+retained-profile interactions from PR #1584, three default-on/opt-out Electron
+UI/lifecycle scenarios, 12 real Authenticode/cache checks, a direct signed NSIS
+`--updated` cancellation before installation, and a real-registry refusal for
+an executable outside the registered installation. The Electron scenarios use
+explicit signature/registry and installer/Gateway fixtures. Direct NSIS
+cancellation is not cancellation after application handoff or UAC cancellation.
+
+Still unverified: Windows 10 native operation; a clean Windows certificate
+cache; OS-enforced GitHub blocking with complete remote discovery/download;
+the full default/custom path and per-user/per-machine matrix; ordinary-user
+UAC acceptance/cancellation; and all post-handoff cancellation/retained-profile
+matrix cells. Do not clear the daily-use host's certificate caches or alter its
+firewall merely to make those cells appear complete. The fuller matrix below
+remains the follow-up acceptance specification; its original default-activation
+gates are deferred by this recorded maintainer decision.
+
+The default-on source change alone is not evidence of a signed final release.
+CI fixtures and warm-cache checks cannot substitute for the missing native
+results. Existing installed clients are unaffected
+until a build containing the activation is installed; the first upgrade from
+an older manual client still follows that older client's UI.
 
 ## Development checks
 
@@ -91,7 +130,7 @@ the installer bytes are not executed or deleted. If discovery fails, a cache
 that passes verification remains available, with a check error for an explicit
 request. Download, reveal, installation and lifecycle ownership still prevent
 concurrent candidate replacement. The refresh regression runs with the handoff
-switch absent so the default Windows manual path is covered too.
+switch set to `0` so the emergency manual path is covered too.
 
 ### Restricted networks
 
@@ -103,7 +142,23 @@ GitHub, missing checksum metadata, changed bytes, and offline cache reuse.
 Windows signature results are an explicit test seam in this deterministic
 test; a passing result does not prove offline Authenticode verification.
 
-For native acceptance, test a disposable Windows 10/11 environment with GitHub
+The signed native download audit also accepts `DownloadSourceMode: "github-to-oss"`
+in its JSON configuration (or `-DownloadSourceMode github-to-oss` when invoking
+the signed helper directly). This mode launches the installed client with GitHub
+as its preferred asset source and requires both discovery and the verified
+download to report OSS with `fallbackUsed: true`. It refuses cached-input mode;
+legacy manual and macOS drivers retain their original OSS-only assertions.
+
+The audit still serves a controlled loopback channel and uses production asset
+URLs. Its `sourceFallbackVerified` result proves application fallback, not that
+GitHub was blocked at the OS network layer: an HTTP error can also cause fallback.
+`networkIsolationVerified` and `remotePublicationVerified` remain false. Attach
+independent guest network controls and negative/positive connection probes before
+crediting the GitHub-unreachable native cell. Default remote channel discovery
+requires its own evidence without a channel-root override. Neither this mode nor
+a passing driver contract opens the default activation gate.
+
+For the remaining native acceptance, test a disposable Windows 11 environment with GitHub
 unreachable while the complete OSS release is reachable. Include the channel
 JSON, `latest.yml`, installer, and `SHA256SUMS`; OSS promotion must occur only
 after all versioned assets and checksums have been uploaded and read back.

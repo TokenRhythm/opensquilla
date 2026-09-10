@@ -776,13 +776,12 @@ import { useSetupStatus } from '@/composables/setup/useSetupStatus'
 import { useAppStore } from '@/stores/app'
 import { useSandboxSetupStore } from '@/stores/sandboxSetup'
 import { useArtifactPromptAnnotationsStore } from '@/stores/artifactPromptAnnotations'
-import { useWorkbenchDocumentContextStore } from '@/stores/workbenchDocumentContext'
 import { useWorkbenchResourcesStore } from '@/stores/workbenchResources'
 import { useWorkbenchStore } from '@/workbench/store'
 import { usePlatform } from '@/platform'
 import {
   focusArtifactPromptAnnotation,
-  notifyArtifactPromptAnnotationsAccepted,
+  notifyPageAnnotationsSent,
   reuseArtifactPromptAnnotation,
 } from '@/workbench/promptAnnotations'
 import ActivityDisclosure from '@/components/chat/ActivityDisclosure.vue'
@@ -1035,8 +1034,6 @@ import {
 } from '@/utils/workbench/artifactPreview'
 import { findArtifactCard, focusArtifactInTranscript } from '@/utils/chat/artifactFocus'
 import {
-  ArtifactProductFailure,
-  artifactProductReasonCode,
   classifyArtifactProductError,
 } from '@/utils/artifactProductErrors'
 import {
@@ -1247,10 +1244,7 @@ function artifactPreviewItemForExplicitOpen(
 }
 
 const artifactPromptAnnotationsStore = useArtifactPromptAnnotationsStore()
-const workbenchDocumentContextStore = useWorkbenchDocumentContextStore()
 const workbenchResourcesStore = useWorkbenchResourcesStore()
-const artifactPromptAnnotationProvider = artifactWorkbench.promptAnnotations
-artifactPromptAnnotationsStore.setProvider(artifactPromptAnnotationProvider)
 const artifactImageLightbox = useArtifactImageLightbox()
 const platform = usePlatform()
 const router = useRouter()
@@ -1369,7 +1363,7 @@ const activePromptAnnotations = computed(() =>
   promptAnnotationsEnabled.value
     ? artifactPromptAnnotationsStore.activeDraftsForSession(sessionKey.value)
     : [])
-const sendablePromptAnnotationIds = computed(() =>
+const sendableAnnotationDraftIds = computed(() =>
   promptAnnotationsEnabled.value
     ? artifactPromptAnnotationsStore.sendableDraftsForSession(sessionKey.value)
       .map(annotation => annotation.annotationId)
@@ -1412,22 +1406,7 @@ async function jumpPromptAnnotation(annotationId: string) {
     pushToast(t('chat.promptAnnotations.focusUnavailable'), { tone: 'warn' })
     return
   }
-  try {
-    await artifactPromptAnnotationsStore.focus(annotationId)
-  } catch (error) {
-    const failure = error instanceof ArtifactProductFailure ? error : null
-    if (failure?.code === 'DOCUMENT_CHANGED') {
-      pushToast(t('chat.promptAnnotations.focusUnavailable'), { tone: 'warn' })
-      return
-    }
-    if (
-      failure?.code === 'ANNOTATION_UNAVAILABLE'
-      && artifactProductReasonCode(failure) === 'not_draft'
-    ) {
-      await artifactPromptAnnotationsStore.load(annotation.sessionKey, { force: true })
-    }
-    pushToast(t('chat.promptAnnotations.focusUnavailable'), { tone: 'warn' })
-  }
+
 }
 
 async function reusePromptAnnotation(annotation: PromptAnnotationSnapshot) {
@@ -3357,39 +3336,24 @@ const chatSend = useChatSend({
   acceptPendingWorkspaceBinding: activeProjectWorkspace.acceptPendingBinding,
   initialCollaborationMode,
   pendingForkBeforeMessageId,
-  promptAnnotationIds: sendablePromptAnnotationIds,
+  draftIds: sendableAnnotationDraftIds,
   idempotentReplayBlockedReason: liveSendBlockedReason,
-  currentDocumentContext: key => (
-    workbenchDocumentContextStore.currentDocumentContext(key)
-  ),
-  prepareDocumentContextForSend: (key, prepareOptions) => (
-    workbenchDocumentContextStore.prepareDocumentContextForSend(key, prepareOptions)
-  ),
   preparePromptAnnotationsForSend: async (ids, prepareOptions) => {
-    const targetDocuments = new Set(
-      artifactPromptAnnotationsStore.snapshotsForIds(ids).map(item => item.documentId),
-    )
-    for (const documentId of targetDocuments) {
-      const flushed = await workbenchDocumentContextStore.prepareDocumentForSend(
-        sessionKey.value,
-        documentId,
-        prepareOptions,
-      )
-      if (flushed === false) return false
-    }
     const prepared = await artifactPromptAnnotationsStore.prepareForSend(ids)
     return prepared && (prepareOptions?.isCurrent?.() ?? true)
   },
   promptAnnotationSnapshots: ids => artifactPromptAnnotationsStore.snapshotsForIds(ids),
-  acknowledgePromptAnnotations: (
-    requestedIds,
-    acceptedIds,
-    acceptedSessionKey,
-    requestSessionKey,
-  ) => {
-    artifactPromptAnnotationsStore.acknowledgeAccepted(requestedIds, acceptedIds)
-    notifyArtifactPromptAnnotationsAccepted({
-      acceptedIds: [...acceptedIds],
+  annotationAttachments: ids => artifactPromptAnnotationsStore.attachmentsForIds(ids),
+  acknowledgePromptAnnotations: (snapshots, acceptedSessionKey, requestSessionKey) => {
+    let removedIds: string[]
+    try {
+      removedIds = artifactPromptAnnotationsStore.acknowledgeSent(snapshots)
+    } catch {
+      pushToast(t('chat.promptAnnotations.discardFailed'), { tone: 'warn' })
+      return
+    }
+    notifyPageAnnotationsSent({
+      draftIds: removedIds,
       sessionKey: acceptedSessionKey,
       requestSessionKey,
     })
@@ -4557,7 +4521,10 @@ const queuedImageSendBlockedMessage = computed(() => {
 })
 
 const modelImageSendBlockedMessage = computed(() => {
-  return hasModelInputImageAttachment(pendingAttachments.value)
+  return hasModelInputImageAttachment([
+    ...pendingAttachments.value,
+    ...artifactPromptAnnotationsStore.attachmentsForIds(sendableAnnotationDraftIds.value),
+  ])
     ? queuedImageSendBlockedMessage.value
     : ''
 })
@@ -5001,7 +4968,7 @@ async function previewAttachmentResource(attachment: DisplayAttachment) {
     if (
       !current
       && resource.resource.type !== 'document'
-      && resource.capabilities.manualEdit
+      && resource.capabilities.edit
       && resource.sha256
     ) {
       const imported = await workbenchResourcesStore.importDocument(
@@ -5295,7 +5262,7 @@ async function openDeliverableWorkbenchResource(artifact: ArtifactPayload) {
     if (
       !current
       && resource.resource.type !== 'document'
-      && resource.capabilities.manualEdit
+      && resource.capabilities.edit
       && resource.sha256
     ) {
       const imported = await workbenchResourcesStore.importDocument(
@@ -6832,7 +6799,6 @@ onUnmounted(() => {
   cleanupSessionArtifacts()
   cleanupStream()
   cleanupCompaction()
-  artifactPromptAnnotationsStore.setProvider(null)
   cleanupVoiceInput()
   chatApprovals.cleanup()
   metaRuns.cleanup()

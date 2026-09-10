@@ -103,7 +103,11 @@ RECENTLY_ADDED_ACTIVE_TESTS = {
     "tests/test_application/test_session_history.py",
     "tests/test_application/test_session_read.py",
     "tests/test_application/test_session_transcript.py",
-    "tests/test_artifact_session/test_html_anchors.py",
+    "tests/test_artifact_session/test_retirement.py",
+    "tests/test_artifact_session/test_working_files.py",
+    "tests/test_engine/test_agent_file_context.py",
+    "tests/test_gateway/test_desktop_browser.py",
+    "tests/test_live_tokenrhythm_budget.py",
     "tests/test_ci/test_plan_ci.py",
     "tests/test_git_runtime.py",
     "tests/test_tools/test_gitless_write_tracking.py",
@@ -285,8 +289,6 @@ RECENTLY_ADDED_ACTIVE_TESTS = {
     "tests/test_contracts/test_ensemble_fallback_event_wire.py",
     "tests/test_contracts/test_turn_execution.py",
     "tests/test_engine/test_turn_control_terminal.py",
-    "tests/test_artifact_session/test_candidate_loop.py",
-    "tests/test_tools/test_document_browser_identity.py",
 }
 
 

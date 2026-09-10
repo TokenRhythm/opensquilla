@@ -173,11 +173,33 @@
       "failedDetail": "重新加载隔离浏览器以继续。"
     },
     "artifactAnnotation": {
-      "start": "批注预览", "stop": "退出批注模式", "selectElement": "选择页面元素进行批注", "selectElementShort": "选择元素", "unavailable": "当前无法使用预览批注。", "desktopEditingOnly": "请在桌面客户端中选择页面元素并让 AI 编辑。",
-      "createFailed": "无法附加所选页面元素。", "elementChanged": "所选元素在附加前发生了变化，请在当前预览中重新选择。", "rearmFailed": "元素选择器无法重新启动，批注模式已退出。请重新开启批注模式后再试。", "updateFailed": "无法保存批注草稿。", "discardFailed": "无法丢弃该批注。编辑框将保持打开，请重试。", "closeFailed": "无法关闭批注编辑框。请重试后再选择其他元素。", "replacementCleanupFailed": "新批注已保留，但无法删除之前的草稿。",
+      "start": "批注预览",
+      "stop": "退出批注模式",
+      "selectElement": "选择页面元素进行批注",
+      "selectElementShort": "选择元素",
+      "unavailable": "当前无法使用预览批注。",
+      "desktopEditingOnly": "请在桌面客户端中选择页面元素并让 AI 编辑。",
+      "createFailed": "无法附加所选页面元素。",
+      "elementChanged": "所选元素在附加前发生了变化，请在当前预览中重新选择。",
+      "rearmFailed": "元素选择器无法重新启动，批注模式已退出。请重新开启批注模式后再试。",
+      "updateFailed": "无法保存批注草稿。",
+      "discardFailed": "无法丢弃该批注。编辑框将保持打开，请重试。",
+      "closeFailed": "无法关闭批注编辑框。请重试后再选择其他元素。",
+      "replacementCleanupFailed": "新批注已保留，但无法删除之前的草稿。",
       "overlayFallback": "请在下方继续编辑批注。",
-      "fallbackTitle": "继续编辑批注", "fallbackDetail": "预览暂时隐藏，你的批注仍在。", "frozenPreview": "所选页面区域的预览",
-      "placeholder": "描述希望对这个区域进行的修改…", "newlineHint": "{shortcut} 换行", "keepDraft": "保留批注", "submit": "添加批注", "contextLabel": "当前选区", "bodyLabel": "页面批注", "emptyBody": "请描述希望的修改。", "reselectHint": "请在页面中选择对应区域。", "reuseHint": "已复制修改要求，请在页面中选择对应区域。"
+      "fallbackTitle": "继续编辑批注",
+      "fallbackDetail": "预览暂时隐藏，你的批注仍在。",
+      "frozenPreview": "所选页面区域的预览",
+      "placeholder": "描述希望对这个区域进行的修改…",
+      "newlineHint": "{shortcut} 换行",
+      "keepDraft": "保留批注",
+      "submit": "添加批注",
+      "contextLabel": "当前选区",
+      "bodyLabel": "页面批注",
+      "emptyBody": "请描述希望的修改。",
+      "reselectHint": "请在页面中选择对应区域。",
+      "reuseHint": "已复制修改要求，请在页面中选择对应区域。",
+      "screenshotUploadFailed": "页面截图未能附加。批注仍已保留，你可以手动添加图片。"
     },
     "artifactPreview": {
       "refresh": "刷新预览",
@@ -187,7 +209,6 @@
       "readyWithWarnings": "预览已运行，但存在警告。",
       "warningsShort": "存在警告",
       "suspended": "预览已暂停",
-      "agentEditInProgress": "编辑正在后台继续。",
       "nativePreview": "互动预览",
       "allowRemoteResources": "允许加载在线图片、样式和媒体",
       "blockRemoteResources": "禁止加载在线图片、样式和媒体",
@@ -229,7 +250,6 @@
     },
     "artifactErrors": {
       "documentChanged": "页面已更新。请刷新后再试。",
-      "editSessionRenewalRequired": "正在重新连接编辑功能。未保存的更改仍会保留。",
       "writeBusy": "页面正在更新，请稍后重试。",
       "mutationNotApplied": "页面未更新，可以重试。",
       "mutationOutcomePending": "无法确认更新结果，请打开页面检查。",
@@ -241,7 +261,8 @@
       "annotationUnavailable": "该批注暂时不可用。",
       "annotationBusy": "正在更新批注，请稍后重试。",
       "invalidRequest": "无法完成请求，请检查输入后重试。",
-      "internalError": "无法完成操作，请重试。"
+      "internalError": "无法完成操作，请重试。",
+      "documentEditingRetired": "请更新客户端并重新打开页面，将批注作为聊天输入发送。"
     },
     "artifactDocument": {
       "sections": "交付件文档区域",
@@ -290,22 +311,7 @@
       "revertFailed": "无法撤销此轮变更。文档可能已经变化，请检查最新版本后重试。",
       "commentCreateFailed": "无法添加批注，请检查文档最新状态后重试。",
       "commentResolveFailed": "无法解决批注，请检查批注最新状态后重试。",
-      "noElementSelected": "将光标放在一个 HTML 元素内",
-      "saving": "保存中…",
-      "saveSource": "保存",
-      "sourceUnavailable": "暂时无法读取 HTML 源码。",
-      "sourceConflict": "文档已在其他位置发生变化，请检查或重新加载后再保存。",
-      "copyUnsavedSource": "复制未保存源码",
-      "unsavedSourceCopied": "已复制未保存源码",
-      "copyUnsavedSourceFailed": "无法复制未保存源码。",
-      "discardAndLoadLatest": "丢弃并加载最新版本",
-      "sourceStatus": {
-        "ready": "就绪",
-        "saving": "保存中…",
-        "dirty": "未保存",
-        "saved": "已保存",
-        "error": "需要处理"
-      }
+      "sourceUnavailable": "暂时无法读取 HTML 源码。"
     }
   },
   "nav": {
@@ -3559,7 +3565,7 @@
     "audioUnsupported": "此浏览器无法播放这种音频格式，请改为下载文件。",
     "playVideo": "播放视频",
     "videoLoadFailed": "无法加载视频。",
-    "videoUnsupported": "此浏览器无法播放这种视频格式，请改为下载文件。",
+    "videoUnsupported": "此浏览器无法播放该视频。请改为下载。",
     "previewOf": "预览：{title}",
     "closePreview": "关闭预览",
     "previousImage": "上一张图片",
@@ -3568,7 +3574,6 @@
     "previewDownload": "预览下载",
     "previewTimedOut": "预览超时。",
     "previewFailed": "预览加载失败。",
-    "videoUnsupported": "此浏览器无法播放该视频。请改为下载。",
     "loadVideoPreview": "加载视频预览",
     "loadVideoPreviewFor": "加载视频预览 {title}",
     "videoPreviewLoading": "正在加载视频预览。下载过程中可以取消。",
@@ -4058,7 +4063,8 @@
         "generic": "当前任务暂不支持同轮引导。消息仍在排队。"
       },
       "clearQueue": "清空队列",
-      "removeMessage": "移除待发送消息 {index}"
+      "removeMessage": "移除待发送消息 {index}",
+      "annotationUpgradeRequired": "这条待发批注使用旧编辑器。请编辑消息，并重新选择页面后发送。"
     },
     "metaRuns": {
       "draft": "草稿",

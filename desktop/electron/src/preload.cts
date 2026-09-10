@@ -24,9 +24,6 @@ if (process.isMainFrame) contextBridge.exposeInMainWorld('opensquillaDesktop', {
     ipcRenderer.invoke('desktop:workspace:choose-directory', payload)
   ),
   getWorkbenchCapabilities: () => ipcRenderer.invoke('desktop:workbench:capabilities'),
-  getArtifactBridgeCapabilities: () => (
-    ipcRenderer.invoke('desktop:workbench:artifact:capabilities')
-  ),
   getArtifactAnnotationCapabilities: () => (
     ipcRenderer.invoke('desktop:workbench:annotation:capabilities')
   ),
@@ -39,24 +36,9 @@ if (process.isMainFrame) contextBridge.exposeInMainWorld('opensquillaDesktop', {
   closeArtifactAnnotationOverlay: (payload: unknown) => (
     ipcRenderer.invoke('desktop:workbench:annotation:close-overlay', payload)
   ),
-  captureSelection: (payload: unknown) => (
-    ipcRenderer.invoke('desktop:workbench:artifact:capture-selection', payload)
-  ),
-  browserInspect: (payload: unknown) => (
-    ipcRenderer.invoke('desktop:workbench:artifact:browser-inspect', payload)
-  ),
-  browserAct: (payload: unknown) => (
-    ipcRenderer.invoke('desktop:workbench:artifact:browser-act', payload)
-  ),
-  screenshot: (payload: unknown) => (
-    ipcRenderer.invoke('desktop:workbench:artifact:screenshot', payload)
-  ),
-  officeFlush: (payload: unknown) => (
-    ipcRenderer.invoke('desktop:workbench:artifact:office-flush', payload)
-  ),
-  reloadSurface: (payload: unknown) => (
-    ipcRenderer.invoke('desktop:workbench:artifact:reload-surface', payload)
-  ),
+  getWorkbenchBrowserTarget: (payload: unknown) => ipcRenderer.invoke('desktop:workbench:browser:target', payload),
+  focusWorkbenchAnnotation: (payload: unknown) => ipcRenderer.invoke('desktop:workbench:annotation:focus', payload),
+  captureWorkbenchScreenshot: (payload: unknown) => ipcRenderer.invoke('desktop:workbench:browser:screenshot', payload),
   createArtifactPreviewLease: (payload: unknown) => (
     ipcRenderer.invoke('desktop:workbench:preview-lease:create', payload)
   ),

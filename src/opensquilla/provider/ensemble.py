@@ -1426,8 +1426,6 @@ class EnsembleProvider:
         | None = None,
         _fallback_request_budget_member: EnsembleMemberConfig | None = None,
         _credential_pool_failure_reporter: CredentialPoolFailureReporter | None = None,
-        _artifact_tool_executor_capabilities: ModelCapabilities | None = None,
-        _artifact_tool_executor_capability_verified: bool = False,
         _provider_state_replay_activation_targets: Sequence[Any] | None = None,
     ) -> None:
         self.profile_name = profile_name
@@ -1483,13 +1481,6 @@ class EnsembleProvider:
         )
         self._fallback_request_budget_member = _fallback_request_budget_member
         self._credential_pool_failure_reporter = _credential_pool_failure_reporter
-        self.artifact_tool_executor_capabilities = (
-            _artifact_tool_executor_capabilities
-        )
-        self.artifact_tools_capability_verified = bool(
-            _artifact_tool_executor_capabilities is not None
-            and _artifact_tool_executor_capability_verified
-        )
         self._provider_state_replay_activation_targets = list(
             _provider_state_replay_activation_targets or []
         )
@@ -6966,7 +6957,6 @@ def build_ensemble_provider_from_config(
     _credential_pool_failure_reporter: CredentialPoolFailureReporter | None = None,
     _session_key: str = "",
     _fallback_selector: Any | None = None,
-    _artifact_mutation: bool = False,
     _selection_mode_override: str | None = None,
     _plan_provider_config: ProviderConfig | None = None,
     _dynamic_baseline_provider_config: ProviderConfig | None = None,
@@ -7010,25 +7000,6 @@ def build_ensemble_provider_from_config(
         )
     else:
         raise ValueError(f"unknown llm_ensemble.selection_mode {selection_mode!r}")
-    artifact_tool_executor_capabilities: ModelCapabilities | None = None
-    artifact_tool_executor_capability_verified = False
-    if _artifact_mutation:
-        if not aggregator.ready:
-            raise ValueError(
-                "artifact_ensemble_unavailable:aggregator_not_ready"
-            )
-        artifact_tool_executor_capabilities = _member_model_capabilities(
-            aggregator,
-            model_catalog=_model_catalog,
-        )
-        if artifact_tool_executor_capabilities.supports_tools is False:
-            raise ValueError(
-                "artifact_ensemble_unavailable:aggregator_tools_unsupported"
-            )
-        artifact_tool_executor_capability_verified = _member_tools_capability_is_verified(
-            aggregator,
-            model_catalog=_model_catalog,
-        )
     is_custom_b5 = selection_mode == CUSTOM_B5_SELECTION_MODE
     # Static and custom lineups share the fixed-lineup quorum/shuffle family.
     # Packaged static profiles additionally use tighter per-call timeouts.
@@ -7188,24 +7159,14 @@ def build_ensemble_provider_from_config(
     )
     effective_all_failed_policy = cast(
         Literal["fallback_single", "error"],
-        (
-            "error"
-            if _artifact_mutation
-            else getattr(ensemble_cfg, "all_failed_policy", "fallback_single")
-        ),
+        (getattr(ensemble_cfg, "all_failed_policy", "fallback_single")),
     )
-    effective_proposer_tools = (
-        False
-        if _artifact_mutation
-        else bool(getattr(ensemble_cfg, "proposer_tools", False))
-    )
-    if _artifact_mutation:
-        selection_plan["artifact_execution_policy"] = "aggregator_only"
+    effective_proposer_tools = bool(getattr(ensemble_cfg, "proposer_tools", False))
     return EnsembleProvider(
         profile_name=profile_name,
         proposers=proposers,
         aggregator=aggregator,
-        fallback_provider=None if _artifact_mutation else fallback_provider,
+        fallback_provider=(fallback_provider),
         fallback_provider_name=inherited_provider_config.provider,
         fallback_model=inherited_provider_config.model,
         fallback_api_key=inherited_provider_config.api_key,
@@ -7225,11 +7186,5 @@ def build_ensemble_provider_from_config(
         _member_request_budget_bindings=request_budget_bindings,
         _fallback_request_budget_member=fallback_request_budget_member,
         _credential_pool_failure_reporter=_credential_pool_failure_reporter,
-        _artifact_tool_executor_capabilities=artifact_tool_executor_capabilities,
-        _artifact_tool_executor_capability_verified=(
-            artifact_tool_executor_capability_verified
-        ),
-        _provider_state_replay_activation_targets=(
-            deferred_replay_activation_targets
-        ),
+        _provider_state_replay_activation_targets=(deferred_replay_activation_targets),
     )

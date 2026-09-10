@@ -264,8 +264,6 @@ class GatewayAdmissionStorage:
                     command.require_idle_for_current_plan_implementation
                 ),
                 goal_mutation=ClaimCurrentGoalMutation() if command.claim_current_goal else None,
-                prepared_prompt_annotation_targets=command.prepared_prompt_annotation_targets,
-                prompt_annotation_turn_id=command.prompt_annotation_turn_id,
                 pending_input_id=command.pending_input_id,
                 pending_input_fingerprint=command.pending_input_fingerprint,
                 pending_input_revision=command.pending_input_revision,

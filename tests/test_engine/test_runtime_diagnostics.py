@@ -497,6 +497,59 @@ async def test_plain_chat_finishes_when_git_is_unavailable(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("existing_ledger", [False, True])
+@pytest.mark.parametrize("tool_error", [False, True])
+async def test_retired_patch_ledger_does_not_write_on_turn_completion(
+    tmp_path, existing_ledger: bool, tool_error: bool
+) -> None:
+    ledger_path = tmp_path / "legacy-ledger.json"
+    original = b'{"historical": true}\n'
+    if existing_ledger:
+        ledger_path.write_bytes(original)
+
+    async def handler(call: ToolCall) -> ToolResult:
+        return ToolResult(
+            tool_use_id=call.tool_use_id,
+            tool_name=call.tool_name,
+            content="verification failed" if tool_error else "verification passed",
+            is_error=tool_error,
+        )
+
+    provider = _ThreeToolProvider(tool_turns=1)
+    agent = Agent(
+        provider=provider,
+        config=AgentConfig(
+            max_iterations=3,
+            max_turn_tool_errors=1 if tool_error else 0,
+            flush_enabled=False,
+            workspace_dir=str(tmp_path),
+            patch_evidence_ledger_path=str(ledger_path),
+        ),
+        tool_definitions=[_tool_def("exec_command")],
+        tool_handler=handler,
+        tool_context=ToolContext(workspace_dir=str(tmp_path)),
+    )
+
+    events = [event async for event in agent.run_turn("verify")]
+
+    assert any(event.kind == "tool_result" for event in events)
+    if tool_error:
+        assert provider.calls == 1
+        assert any(
+            event.kind == "error" and event.code == "turn_tool_error_budget_exceeded"
+            for event in events
+        )
+    else:
+        assert provider.calls == 2
+        assert any(event.kind == "done" for event in events)
+        assert not any(event.kind == "error" for event in events)
+    if existing_ledger:
+        assert ledger_path.read_bytes() == original
+    else:
+        assert not ledger_path.exists()
+
+
+@pytest.mark.asyncio
 async def test_agent_runtime_diagnostics_write_jsonl_without_model_hint(
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,
@@ -562,6 +615,7 @@ async def test_agent_source_loop_recovery_warns_model_once(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     runtime_events_path = tmp_path / "runtime_events.jsonl"
+    ledger_path = tmp_path / "retired-ledger.json"
     workspace = tmp_path / "repo"
     workspace.mkdir()
     monkeypatch.setattr(
@@ -591,6 +645,7 @@ async def test_agent_source_loop_recovery_warns_model_once(
         config=AgentConfig(
             max_iterations=5,
             runtime_events_path=str(runtime_events_path),
+            patch_evidence_ledger_path=str(ledger_path),
             runtime_recovery_mode="warn_model",
             progress_watchdog_mode="log",
             tool_result_projection_max_inline_chars=10_000,
@@ -621,6 +676,8 @@ async def test_agent_source_loop_recovery_warns_model_once(
     assert recovery["mode"] == "warn_model"
     assert recovery["injected_to_model"] is True
     assert recovery["evidence"]["diff_paths"] == ["src/lib.rs"]
+    assert recovery["verification_commands"] == []
+    assert not ledger_path.exists()
 
 
 @pytest.mark.asyncio

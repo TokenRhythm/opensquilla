@@ -27,7 +27,7 @@ const attachment: WorkbenchResource = {
     preview: true,
     download: true,
     selectionContext: false,
-    manualEdit: true,
+    manualEdit: false,
     agentEdit: false,
     edit: true,
     publish: false,
@@ -547,7 +547,7 @@ describe('workbench resources store', () => {
 
     await expect(store.importDocument('session-a', {
       ...attachment,
-      capabilities: { ...attachment.capabilities, manualEdit: false, edit: false },
+      capabilities: { ...attachment.capabilities, manualEdit: true, edit: false },
     })).rejects.toThrow('cannot be imported')
     expect(provider.importDocument).not.toHaveBeenCalled()
   })

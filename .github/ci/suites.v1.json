@@ -133,9 +133,8 @@
         "desktop/electron/scripts/test-native-workbench*.mjs",
         "desktop/electron/scripts/test-desktop-zoom*.mjs",
         "desktop/electron/scripts/test-native-workbench-v2-electron.mjs",
-        "desktop/electron/scripts/test-offline-document-workbench-e2e.mjs",
-        "desktop/electron/scripts/test-v1-html-agent-edit-e2e.mjs",
-        "desktop/electron/scripts/test-unsafe-legacy-recovery-no-write.mjs"
+        "desktop/electron/scripts/test-unsafe-legacy-recovery-no-write.mjs",
+        "desktop/electron/scripts/test-desktop-browser*.mjs"
       ]
     }
   },

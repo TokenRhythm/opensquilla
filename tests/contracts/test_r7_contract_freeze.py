@@ -222,9 +222,9 @@ def _specs_by_wire_name():
 def test_contract_inventory_freezes_all_webui_reachable_wire_names() -> None:
     specs = discover_contracts()
 
-    assert len(specs) == 229
+    assert len(specs) == 221
     assert Counter(spec.contract_type for spec in specs) == {
-        "method": 219,
+        "method": 211,
         "event": 10,
     }
     assert EXPECTED_METHOD_METADATA.keys() <= {spec.wire_name for spec in specs}

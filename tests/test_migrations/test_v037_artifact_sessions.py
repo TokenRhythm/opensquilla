@@ -19,6 +19,7 @@ ARTIFACT_MIGRATION_IDS = (
     "V038__artifact_prompt_annotations",
     "V039__artifact_mutation_attempts",
     "V040__document_resources",
+    "V041__retire_html_editor",
 )
 
 TABLES = {
@@ -39,8 +40,7 @@ def _artifact_schema(conn: sqlite3.Connection) -> dict[str, tuple[str, str]]:
         SCHEMA_OBJECTS,
     ).fetchall()
     return {
-        str(name): (str(kind), re.sub(r"\s+", " ", str(sql)).strip())
-        for name, kind, sql in rows
+        str(name): (str(kind), re.sub(r"\s+", " ", str(sql)).strip()) for name, kind, sql in rows
     }
 
 

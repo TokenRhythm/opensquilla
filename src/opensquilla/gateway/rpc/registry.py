@@ -186,9 +186,8 @@ class RpcContext:
     originating_envelope: Any = None  # Channel RouteEnvelope for RPC side effects
     protocol: int = 4
     sandbox_schema_version: int = 2
-    # Runtime-only candidate preview materializer.  The value stays inside the
-    # Gateway process and is copied into a turn envelope only for bound
-    # PromptAnnotation turns; no public RPC payload contains it.
+    # Runtime-only preview lease and resource service. It remains inside the
+    # Gateway process; public RPC payloads carry only scoped preview references.
     artifact_preview_service: Any = None
 
     @property

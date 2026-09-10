@@ -123,6 +123,10 @@ class _PostPublishToolLoopProvider:
             )
             yield ProviderDone(stop_reason="tool_use", input_tokens=1, output_tokens=1)
             return
+        if call_number > 2:
+            yield ProviderText(text="The presentation passed the quality check.")
+            yield ProviderDone(stop_reason="stop", input_tokens=1, output_tokens=1)
+            return
         yield ProviderToolUseStart(tool_use_id="qa-1", tool_name="qa_check")
         yield ProviderToolUseEnd(
             tool_use_id="qa-1",
@@ -470,6 +474,10 @@ class _FailedPublishProvider:
 
 class _RetryPublishProvider(_FailedPublishProvider):
     async def _stream(self, call_number: int) -> AsyncIterator[Any]:
+        if call_number > 2:
+            yield ProviderText(text="The regenerated presentation is ready.")
+            yield ProviderDone(stop_reason="stop", input_tokens=1, output_tokens=1)
+            return
         yield ProviderText(text="Regenerating the presentation. ")
         yield ProviderToolUseStart(
             tool_use_id=f"publish-{call_number}",
@@ -1279,7 +1287,7 @@ async def test_turn_runner_cancel_after_artifact_persists_recoverable_delivery_t
 
 
 @pytest.mark.asyncio
-async def test_turn_runner_suppresses_tools_after_successful_publish_artifact(
+async def test_turn_runner_keeps_tools_available_after_successful_publish_artifact(
     tmp_path,
 ) -> None:
     storage = SessionStorage(":memory:")
@@ -1320,22 +1328,24 @@ async def test_turn_runner_suppresses_tools_after_successful_publish_artifact(
         artifact_events = [event for event in events if isinstance(event, ArtifactEvent)]
         tool_starts = [event for event in events if isinstance(event, ToolUseStartEvent)]
 
-        assert provider.calls == 1
-        assert provider.tools_seen == [True]
-        assert forbidden_calls == []
-        assert [event.tool_name for event in tool_starts] == ["publish_artifact"]
+        assert provider.calls == 3
+        assert provider.tools_seen == [True, True, True]
+        assert forbidden_calls == ["report.pptx"]
+        assert [event.tool_name for event in tool_starts] == [
+            "publish_artifact", "qa_check"
+        ]
         assert artifact_events[0].id == "art-published"
         assert artifact_events[0].session_id == session.session_id
         text_deltas = [event.text for event in events if isinstance(event, TextDeltaEvent)]
         assert "".join(text_deltas) == done.text
         assert done.text.startswith("Preparing your presentation.")
-        assert "The generated file is ready" in done.text
+        assert done.text.endswith("The presentation passed the quality check.")
 
         transcript = await manager.get_transcript(session_key)
         assistant = [entry for entry in transcript if entry.role == "assistant"][-1]
         payload = json.loads(assistant.content)
         assert payload["artifacts"][0]["id"] == "art-published"
-        assert "The generated file is ready" in payload["text"]
+        assert payload["text"].endswith("The presentation passed the quality check.")
     finally:
         await storage.close()
 
@@ -3061,7 +3071,7 @@ async def test_turn_runner_clears_delivery_failure_after_same_target_retry_succe
 
         done = next(event for event in events if isinstance(event, DoneEvent))
         artifacts = [event for event in events if isinstance(event, ArtifactEvent)]
-        assert provider.calls == 2
+        assert provider.calls == 3
         assert [artifact.id for artifact in artifacts] == ["art-retried"]
         assert "File delivery failed:" not in done.text
 

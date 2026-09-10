@@ -173,11 +173,33 @@
       "failedDetail": "Lade den isolierten Browser neu, um fortzufahren."
     },
     "artifactAnnotation": {
-      "start": "Vorschau annotieren", "stop": "Annotieren beenden", "selectElement": "Seitenelement zum Annotieren auswählen", "selectElementShort": "Element wählen", "unavailable": "Vorschauannotation ist nicht verfügbar.", "desktopEditingOnly": "Seitenelemente können Sie in der Desktop-App auswählen und mit KI bearbeiten.",
-      "createFailed": "Das ausgewählte Element konnte nicht angehängt werden.", "elementChanged": "Das ausgewählte Element wurde vor dem Anhängen geändert. Wählen Sie es in der aktuellen Vorschau erneut aus.", "rearmFailed": "Der Annotationsmodus wurde beendet, weil die Elementauswahl nicht neu gestartet werden konnte. Aktivieren Sie ihn erneut.", "updateFailed": "Der Annotationsentwurf konnte nicht gespeichert werden.", "discardFailed": "Die Annotation konnte nicht verworfen werden und bleibt für einen erneuten Versuch geöffnet.", "closeFailed": "Der Annotationseditor konnte nicht geschlossen werden. Versuchen Sie es erneut.", "replacementCleanupFailed": "Die neue Annotation wurde beibehalten, aber der vorherige Entwurf konnte nicht entfernt werden.",
+      "start": "Vorschau annotieren",
+      "stop": "Annotieren beenden",
+      "selectElement": "Seitenelement zum Annotieren auswählen",
+      "selectElementShort": "Element wählen",
+      "unavailable": "Vorschauannotation ist nicht verfügbar.",
+      "desktopEditingOnly": "Seitenelemente können Sie in der Desktop-App auswählen und mit KI bearbeiten.",
+      "createFailed": "Das ausgewählte Element konnte nicht angehängt werden.",
+      "elementChanged": "Das ausgewählte Element wurde vor dem Anhängen geändert. Wählen Sie es in der aktuellen Vorschau erneut aus.",
+      "rearmFailed": "Der Annotationsmodus wurde beendet, weil die Elementauswahl nicht neu gestartet werden konnte. Aktivieren Sie ihn erneut.",
+      "updateFailed": "Der Annotationsentwurf konnte nicht gespeichert werden.",
+      "discardFailed": "Die Annotation konnte nicht verworfen werden und bleibt für einen erneuten Versuch geöffnet.",
+      "closeFailed": "Der Annotationseditor konnte nicht geschlossen werden. Versuchen Sie es erneut.",
+      "replacementCleanupFailed": "Die neue Annotation wurde beibehalten, aber der vorherige Entwurf konnte nicht entfernt werden.",
       "overlayFallback": "Setzen Sie die Anmerkung unten fort.",
-      "fallbackTitle": "Annotation fortsetzen", "fallbackDetail": "Die Vorschau ist vorübergehend ausgeblendet. Ihre Anmerkung bleibt erhalten.", "frozenPreview": "Vorschau des ausgewählten Seitenbereichs",
-      "placeholder": "Beschreiben Sie die Änderung für diesen Bereich…", "newlineHint": "{shortcut} für eine neue Zeile", "keepDraft": "Annotation behalten", "submit": "Annotation hinzufügen", "contextLabel": "Aktuelle Auswahl", "bodyLabel": "Seitenanmerkung", "emptyBody": "Beschreiben Sie die gewünschte Änderung.", "reselectHint": "Wählen Sie den passenden Bereich auf der Seite.", "reuseHint": "Die Änderungsanforderung wurde kopiert. Wählen Sie den passenden Bereich auf der Seite."
+      "fallbackTitle": "Annotation fortsetzen",
+      "fallbackDetail": "Die Vorschau ist vorübergehend ausgeblendet. Ihre Anmerkung bleibt erhalten.",
+      "frozenPreview": "Vorschau des ausgewählten Seitenbereichs",
+      "placeholder": "Beschreiben Sie die Änderung für diesen Bereich…",
+      "newlineHint": "{shortcut} für eine neue Zeile",
+      "keepDraft": "Annotation behalten",
+      "submit": "Annotation hinzufügen",
+      "contextLabel": "Aktuelle Auswahl",
+      "bodyLabel": "Seitenanmerkung",
+      "emptyBody": "Beschreiben Sie die gewünschte Änderung.",
+      "reselectHint": "Wählen Sie den passenden Bereich auf der Seite.",
+      "reuseHint": "Die Änderungsanforderung wurde kopiert. Wählen Sie den passenden Bereich auf der Seite.",
+      "screenshotUploadFailed": "Das Bildschirmfoto konnte nicht angehängt werden. Ihre Anmerkung bleibt erhalten; Sie können ein Bild manuell hinzufügen."
     },
     "artifactPreview": {
       "refresh": "Vorschau aktualisieren",
@@ -187,7 +209,6 @@
       "readyWithWarnings": "Die Vorschau wird mit Warnungen ausgeführt.",
       "warningsShort": "Warnungen",
       "suspended": "Vorschau pausiert",
-      "agentEditInProgress": "Die Bearbeitung wird im Hintergrund fortgesetzt.",
       "nativePreview": "Interaktive Vorschau",
       "allowRemoteResources": "Online-Bilder, -Stile und -Medien zulassen",
       "blockRemoteResources": "Online-Bilder, -Stile und -Medien blockieren",
@@ -229,7 +250,6 @@
     },
     "artifactErrors": {
       "documentChanged": "Die Seite wurde geändert. Aktualisiere sie, bevor du es erneut versuchst.",
-      "editSessionRenewalRequired": "Die Bearbeitung wird neu verbunden. Deine ungespeicherten Änderungen bleiben erhalten.",
       "writeBusy": "Die Seite wird gerade aktualisiert. Warte einen Moment und versuche es erneut.",
       "mutationNotApplied": "Die Seite wurde nicht aktualisiert. Du kannst es erneut versuchen.",
       "mutationOutcomePending": "Das Ergebnis der Aktualisierung kann nicht bestätigt werden. Öffne die Seite, um es zu prüfen.",
@@ -241,7 +261,8 @@
       "annotationUnavailable": "Diese Anmerkung ist vorübergehend nicht verfügbar.",
       "annotationBusy": "Die Anmerkungen werden gerade aktualisiert. Warte einen Moment und versuche es erneut.",
       "invalidRequest": "Die Anfrage konnte nicht abgeschlossen werden. Prüfe die Eingabe und versuche es erneut.",
-      "internalError": "Der Vorgang konnte nicht abgeschlossen werden. Versuche es erneut."
+      "internalError": "Der Vorgang konnte nicht abgeschlossen werden. Versuche es erneut.",
+      "documentEditingRetired": "Aktualisieren Sie die App und öffnen Sie die Seite erneut, um Anmerkungen als Chatnachricht zu senden."
     },
     "artifactDocument": {
       "sections": "Bereiche des Artefaktdokuments",
@@ -290,16 +311,7 @@
       "revertFailed": "Diese Änderung konnte nicht rückgängig gemacht werden. Prüfen Sie die neueste Version und versuchen Sie es erneut.",
       "commentCreateFailed": "Der Kommentar konnte nicht hinzugefügt werden. Prüfen Sie den neuesten Dokumentstand und versuchen Sie es erneut.",
       "commentResolveFailed": "Der Kommentar konnte nicht erledigt werden. Prüfen Sie den neuesten Kommentarstand und versuchen Sie es erneut.",
-      "noElementSelected": "Setzen Sie den Cursor in ein HTML-Element",
-      "saving": "Wird gespeichert…",
-      "saveSource": "Speichern",
-      "sourceUnavailable": "Der HTML-Quelltext ist nicht verfügbar.",
-      "sourceConflict": "Das Dokument wurde an anderer Stelle geändert. Bitte vor dem Speichern prüfen oder neu laden.",
-      "copyUnsavedSource": "Nicht gespeicherten Quelltext kopieren",
-      "unsavedSourceCopied": "Nicht gespeicherten Quelltext kopiert",
-      "copyUnsavedSourceFailed": "Der nicht gespeicherte Quelltext konnte nicht kopiert werden.",
-      "discardAndLoadLatest": "Verwerfen und neuesten Stand laden",
-      "sourceStatus": {"ready":"Bereit","saving":"Wird gespeichert…","dirty":"Nicht gespeichert","saved":"Gespeichert","error":"Aktion erforderlich"}
+      "sourceUnavailable": "Der HTML-Quelltext ist nicht verfügbar."
     }
   },
   "nav": {
@@ -3469,7 +3481,7 @@
     "audioUnsupported": "Dieser Browser kann dieses Audioformat nicht abspielen. Laden Sie die Datei stattdessen herunter.",
     "playVideo": "Video abspielen",
     "videoLoadFailed": "Video konnte nicht geladen werden.",
-    "videoUnsupported": "Dieser Browser kann dieses Videoformat nicht abspielen. Laden Sie die Datei stattdessen herunter.",
+    "videoUnsupported": "Dieser Browser kann dieses Video nicht wiedergeben. Laden Sie es stattdessen herunter.",
     "previewOf": "Vorschau: {title}",
     "closePreview": "Vorschau schließen",
     "previousImage": "Vorheriges Bild",
@@ -3478,7 +3490,6 @@
     "previewDownload": "Vorschau herunterladen",
     "previewTimedOut": "Zeitüberschreitung bei der Vorschau.",
     "previewFailed": "Vorschau konnte nicht geladen werden.",
-    "videoUnsupported": "Dieser Browser kann dieses Video nicht wiedergeben. Laden Sie es stattdessen herunter.",
     "loadVideoPreview": "Videovorschau laden",
     "loadVideoPreviewFor": "Videovorschau für {title} laden",
     "videoPreviewLoading": "Die Videovorschau wird geladen. Sie können den Download abbrechen.",
@@ -3968,7 +3979,8 @@
         "generic": "Lenken ist für die aktuelle Aufgabe nicht verfügbar. Die Nachricht bleibt in der Warteschlange."
       },
       "clearQueue": "Warteschlange leeren",
-      "removeMessage": "Ausstehende Nachricht {index} entfernen"
+      "removeMessage": "Ausstehende Nachricht {index} entfernen",
+      "annotationUpgradeRequired": "Diese Anmerkung verwendet den alten Editor. Bearbeiten Sie die Nachricht und wählen Sie die Seite vor dem Senden erneut aus."
     },
     "metaRuns": {
       "draft": "Entwurf",

@@ -41,6 +41,7 @@ import {
 } from './sessionHistoryV4'
 import {
   SessionReadContractError,
+  SessionReadFailure,
   type SessionReadActivity,
   type SessionReadHistoryPage,
   type SessionReadJsonObject,
@@ -399,11 +400,15 @@ async function optionalSnapshot(
   expectedGeneration: number,
   latch: SentLatch,
 ): Promise<SessionsMessagesSnapshotResult | null> {
+  let sentGeneration: number | null = null
   try {
     const raw = await rpc.request(
       SESSIONS_MESSAGES_SNAPSHOT_METHOD,
       params,
-      callOptions(signal, SNAPSHOT_TIMEOUT_MS, expectedGeneration, latch.sent),
+      callOptions(signal, SNAPSHOT_TIMEOUT_MS, expectedGeneration, generation => {
+        sentGeneration = generation
+        latch.sent(generation)
+      }),
     )
     return requireResult<SessionsMessagesSnapshotResult>(
       SESSIONS_MESSAGES_SNAPSHOT_METHOD,
@@ -418,6 +423,17 @@ async function optionalSnapshot(
       return null
     }
     const projected = mapSessionReadError(error)
+    if (
+      projected instanceof SessionReadFailure
+      && projected.kind === 'timeout'
+      && sentGeneration === expectedGeneration
+      && rpc.generation === expectedGeneration
+      && !signal.aborted
+    ) {
+      // A sent snapshot can miss its own deadline without invalidating the
+      // independently acknowledged live subscription or its replay cursor.
+      return null
+    }
     latch.failed(projected)
     throw projected
   }

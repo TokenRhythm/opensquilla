@@ -301,7 +301,6 @@ export const useArtifactDocumentsStore = defineStore('artifactDocuments', () => 
     if (!document.capabilities.revisions || !revision || revision.documentId !== document.documentId) {
       throw unavailableAction('Artifact revision restore is unavailable.')
     }
-    if (revision.revisionId === document.headRevisionId) return current.workspace
     const logicalRequestKey = JSON.stringify([
       'restore',
       sessionKey,

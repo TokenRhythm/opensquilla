@@ -277,35 +277,31 @@ export interface NativeArtifactAnnotationOverlayCloseRequest {
   rearm?: true
 }
 
-export interface NativeArtifactScreenshotRequest {
-  version: 3 | 4
+export interface NativeWorkbenchBrowserTarget {
+  targetRef: string
+  surfaceId: string
+  url: string
+  title: string
+  resourceId?: string
+  sessionKey: string
 }
 
-export interface NativeArtifactScreenshotValue {
-  mime: 'image/png'
-  data: Uint8Array
+export interface NativeWorkbenchScreenshot {
+  targetRef: string
+  mimeType: 'image/png'
+  dataBase64: string
   width: number
   height: number
 }
 
-export type NativeArtifactScreenshotResult = {
-  ok: true
-  method: 'screenshot'
-  value: NativeArtifactScreenshotValue
-} | {
-  ok: false
-  method: 'screenshot'
-  code: string
-  message: string
-}
-
 export interface NativeArtifactAnnotationSelection {
   selectionId: string
+  targetRef: string
+  resourceId?: string
   tagName: string
   elementPath: string
-  elementProofSha256: string
-  /** Compatibility diagnostic emitted by current Desktop shells. */
-  domSha256?: string
+  selectionText?: string
+  locatorHint?: string
   rect: { x: number; y: number; width: number; height: number }
 }
 
@@ -339,12 +335,12 @@ export type NativeWorkbenchSurfaceEventType =
   | 'error'
   | 'crashed'
   | 'escape'
+  | 'browser-opened'
   | 'annotation-selected'
   | 'annotation-draft-change'
   | 'annotation-submit'
   | 'annotation-cancel'
   | 'annotation-overlay-fallback'
-  | 'agent-edit-released'
 
 export interface NativeWorkbenchSurfaceEvent {
   version: NativeWorkbenchProtocolVersion
@@ -366,6 +362,8 @@ export interface NativeWorkbenchSurfaceEvent {
     path?: string
     reason?: string
     annotationId?: string
+    sessionKey?: string
+    targetRef?: string
     selection?: NativeArtifactAnnotationSelection
     body?: string
   }
@@ -423,9 +421,13 @@ export interface NativeWorkbenchApi {
   closeArtifactAnnotationOverlay?(
     request: NativeArtifactAnnotationOverlayCloseRequest,
   ): Promise<NativeWorkbenchSurfaceResult>
-  screenshot?(
-    request: NativeArtifactScreenshotRequest,
-  ): Promise<NativeArtifactScreenshotResult>
+  getWorkbenchBrowserTarget?(request: { surfaceId: string }): Promise<NativeWorkbenchBrowserTarget>
+  focusWorkbenchAnnotation?(request: {
+    surfaceId: string; targetRef: string; locatorHint: string
+  }): Promise<NativeWorkbenchSurfaceResult>
+  captureWorkbenchScreenshot?(request: {
+    surfaceId: string; targetRef: string
+  }): Promise<NativeWorkbenchScreenshot>
   createArtifactPreviewLease?(
     request: NativeArtifactPreviewLeaseCreateRequest,
   ): Promise<NativeArtifactPreviewLeaseBrokerResult>

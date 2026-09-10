@@ -215,7 +215,7 @@ async def test_queue_codec_preserves_staged_fingerprint_and_source_capture_polic
         "client_request_id": " request-one ",
         "client_message_id": " message-one ",
         "attachments": None,
-        "prompt_annotation_ids": [" annotation-one "],
+        "pageContext": {"targetRef": " page-one "},
         "_source": {
             "caller_kind": "cli",
             "channel_kind": "cli",
@@ -235,7 +235,7 @@ async def test_queue_codec_preserves_staged_fingerprint_and_source_capture_polic
         "clientRequestId": "request-one",
         "clientMessageId": "message-one",
         "displayText": "//literal text",
-        "promptAnnotationIds": ["annotation-one"],
+        "pageContext": {"targetRef": "page-one"},
     }
     assert {key: value for key, value in payload.items() if key != "_source"} == expected
     assert request_fingerprint(payload) == request_fingerprint(expected)

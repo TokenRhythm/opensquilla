@@ -289,6 +289,8 @@ describe('workbench resource provider', () => {
         mime: 'text/html',
       },
       materialized: true,
+      pageContext: { resourceId: 'document:doc-a' },
+      workingFile: '/workspace/page.html',
     }))
     const provider = createRpcWorkbenchResourceProvider({ call, hasRpcMethod: () => true })
 
@@ -304,6 +306,8 @@ describe('workbench resource provider', () => {
       disposition: 'document',
       resolution: { status: 'materialized' },
       materialized: true,
+      pageContext: { resourceId: 'document:doc-a' },
+      workingFile: '/workspace/page.html',
       document: { documentId: 'doc-a', headRevisionId: 'rev-a' },
       revision: { documentId: 'doc-a', revisionId: 'rev-a' },
     })

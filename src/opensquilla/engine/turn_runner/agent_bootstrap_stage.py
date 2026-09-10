@@ -20,7 +20,7 @@ future AgentConfig-validation early-yield branch.
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal, Protocol, runtime_checkable
 
 from opensquilla.engine.route_plan import pin_route_plan
@@ -284,10 +284,6 @@ class _AgentConfigAuxiliaries:
     tool_result_store_retention_seconds: int
     source_diff_preservation_mode: Literal["off", "log", "block"] | None
     source_diff_candidate_mode: Literal["off", "log", "warn_model"] | None
-    # Deprecated, unused compatibility slot; preserve construction and saved configs.
-    runtime_state_capsule_mode: Literal["off", "log", "inject"] | None = None
-    # Deprecated, unused compatibility slot; preserve construction and saved configs.
-    text_only_tool_recovery_mode: Literal["off", "log", "warn_model"] | None = None
     # Gateway ``prompt.finalize_evidence_gate`` (env still overrides).
     finalize_evidence_gate: bool = False
 
@@ -654,26 +650,6 @@ class AgentBootstrapStage:
                 inp.resolved_model,
                 inp.active_provider_id,
             )
-        artifact_executor_capabilities = getattr(
-            inp.provider,
-            "artifact_tool_executor_capabilities",
-            None,
-        )
-        if artifact_executor_capabilities is not None:
-            # A strict Artifact Ensemble grants tools only to its Aggregator.
-            # The configured single-model selector is merely the inherited
-            # deployment context and must not supply its capabilities.
-            catalog = replace(
-                catalog,
-                capabilities=artifact_executor_capabilities,
-                tools_capability_verified=bool(
-                    getattr(
-                        inp.provider,
-                        "artifact_tools_capability_verified",
-                        False,
-                    )
-                ),
-            )
 
         # Capacity diagnostics contain resolved numeric limits only. They are
         # safe for turn metadata and make catalog-vs-provider failures
@@ -967,10 +943,6 @@ class AgentBootstrapStage:
             compaction_protected_recent_messages=(aux.compaction_protected_recent_messages),
             compaction_total_timeout_seconds=aux.compaction_total_timeout_seconds,
             compaction_heartbeat_interval_seconds=aux.compaction_heartbeat_interval_seconds,
-            restricted_turn=bool(
-                inp.tool_context is not None
-                and getattr(inp.tool_context, "exclusive_tools", None) is not None
-            ),
             flush_workspace_dir=aux.flush_workspace_dir,
             model_capabilities=catalog.capabilities,
             model_tools_capability_verified=active_artifact_tools_verified,
@@ -1000,6 +972,7 @@ class AgentBootstrapStage:
                 "OPENSQUILLA_PROGRESS_WATCHDOG_FAILURE_ANCHOR_THRESHOLD",
                 AgentConfig().progress_watchdog_repeated_failure_anchor_threshold,
             ),
+            # Retain legacy final-diff exclusion; no longer enables ledger export.
             patch_evidence_ledger_path=(
                 os.environ.get("OPENSQUILLA_PATCH_EVIDENCE_LEDGER_PATH") or None
             ),

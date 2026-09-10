@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 import hashlib
+import importlib.util
 import io
 import json
 import os
 import shutil
+import sqlite3
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 from pptx import Presentation
@@ -18,9 +21,13 @@ from opensquilla.artifacts import (
     DEFAULT_ARTIFACT_MAX_BYTES,
     INSTALLER_ARTIFACT_MAX_BYTES,
     ArtifactBudgetError,
+    ArtifactBundle,
+    ArtifactBundleSourceFile,
     ArtifactIntegrityError,
     ArtifactNotFoundError,
+    ArtifactSource,
     ArtifactStore,
+    artifact_bundle_manifest,
     artifact_cursor,
     artifact_marker,
     artifact_payload,
@@ -202,35 +209,6 @@ def test_delete_ref_removes_only_the_requested_artifact(tmp_path: Path) -> None:
     assert store.resolve_for_download(second.id, session_id="session-1")[0] == second
 
 
-def test_list_internal_refs_is_bounded_and_excludes_listed_artifacts(tmp_path: Path) -> None:
-    store = ArtifactStore(tmp_path)
-    hidden = store.publish_bytes(
-        b"hidden",
-        session_id="session-1",
-        session_key="agent:main:session-1",
-        name="hidden.html",
-        mime="text/html",
-        source="document_html_agent_candidate:turn-hash",
-        visibility="internal",
-    )
-    listed = store.publish_bytes(
-        b"listed",
-        session_id="session-1",
-        session_key="agent:main:session-1",
-        name="listed.html",
-        mime="text/html",
-        source="document_html_agent_candidate:turn-hash",
-    )
-
-    refs = store.list_internal_refs(
-        "session-1",
-        source_suffix="_agent_candidate:turn-hash",
-        limit=1,
-    )
-    assert tuple(ref.id for ref in refs) == (hidden.id,)
-    assert listed.id not in {ref.id for ref in refs}
-
-
 def test_preallocated_artifact_id_is_exclusive_and_restart_deletable(
     tmp_path: Path,
 ) -> None:
@@ -242,7 +220,7 @@ def test_preallocated_artifact_id_is_exclusive_and_restart_deletable(
         session_key="agent:main:session-1",
         name="candidate.html",
         mime="text/html",
-        source="artifact_html_agent_edit",
+        source="publish_artifact",
         visibility="internal",
         artifact_id=artifact_id,
     )
@@ -258,7 +236,7 @@ def test_preallocated_artifact_id_is_exclusive_and_restart_deletable(
             session_key="agent:main:session-1",
             name="collision.html",
             mime="text/html",
-            source="artifact_html_agent_edit",
+            source="publish_artifact",
             artifact_id=artifact_id,
         )
     assert (
@@ -286,7 +264,7 @@ def test_reserved_bucket_cleanup_fails_closed_without_ownership_proof(
         session_key="agent:main:session-1",
         name="candidate.html",
         mime="text/html",
-        source="artifact_html_agent_edit",
+        source="publish_artifact",
         artifact_id=artifact_id,
     )
     marker = store.path_for(ref).parent / ARTIFACT_OWNERSHIP_MARKER_NAME
@@ -306,7 +284,7 @@ def test_publish_bytes_rejects_invalid_explicit_artifact_id(tmp_path: Path) -> N
             session_key="agent:main:session-1",
             name="candidate.html",
             mime="text/html",
-            source="artifact_html_agent_edit",
+            source="publish_artifact",
             artifact_id="../candidate",
         )
 
@@ -1018,8 +996,12 @@ async def test_publish_artifact_tool_allows_workspace_file_only(tmp_path: Path) 
     assert payload["artifact"]["local_path"] == str(output.resolve())
     assert "note" in payload
     assert "local_path" in payload["note"]
-    assert "final response" in payload["note"]
-    assert "Do not run more tools" in payload["note"]
+    assert "Do not run more tools" not in payload["note"]
+    assert "Send the final response now" not in payload["note"]
+    assert "unchanged file does not need to be published again" in payload["note"]
+    assert list(ctx.artifact_source_paths.values()) == [
+        ArtifactSource(str(output.resolve()), artifact_id=payload["artifact"]["id"])
+    ]
     # The frontend event path still gets the full payload (with download_url).
     assert len(ctx.published_artifacts) == 1
     full_artifact = ctx.published_artifacts[0]
@@ -1029,7 +1011,10 @@ async def test_publish_artifact_tool_allows_workspace_file_only(tmp_path: Path) 
         for k, v in payload["artifact"].items()
         if k not in {"workspace_path", "local_path"}
     }
-    assert {k: v for k, v in full_artifact.items() if k != "download_url"} == llm_artifact
+    assert {
+        k: v for k, v in full_artifact.items() if k not in {"download_url", "publication_id"}
+    } == llm_artifact
+    assert "publication_id" not in payload["artifact"]
 
 
 @pytest.mark.asyncio
@@ -1939,7 +1924,10 @@ async def test_publish_artifact_tool_hides_local_path_from_non_owner_channel(
     assert "local_path" not in payload["artifact"]
     assert "workspace_path" not in payload["artifact"]
     assert "local_path" not in payload["note"]
-    assert "final response" in payload["note"]
+    assert "Send the final response now" not in payload["note"]
+    assert list(ctx.artifact_source_paths.values()) == [
+        ArtifactSource(str(output.resolve()), artifact_id=payload["artifact"]["id"])
+    ]
 
 
 @pytest.mark.asyncio
@@ -2065,6 +2053,58 @@ async def test_publish_artifact_tool_reuses_existing_session_deliverable_across_
     assert len(ctx1.published_artifacts) == 1
     assert len(ctx2.published_artifacts) == 1
     assert ctx2.published_artifacts[0]["id"] == first["artifact"]["id"]
+
+
+@pytest.mark.parametrize(
+    ("caller_kind", "is_owner", "tracks_sources"),
+    [
+        (CallerKind.WEB, True, True),
+        (CallerKind.CLI, True, True),
+        (CallerKind.WEB, False, False),
+        (CallerKind.CHANNEL, True, False),
+    ],
+)
+async def test_publish_tracks_checked_source_paths_for_new_and_reused_refs(
+    tmp_path: Path, caller_kind: CallerKind, is_owner: bool, tracks_sources: bool,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    original = workspace / "original.txt"
+    duplicate = workspace / "duplicate.txt"
+    original.write_text("same synthetic bytes", encoding="utf-8")
+    duplicate.write_bytes(original.read_bytes())
+    options = {
+        "is_owner": is_owner, "caller_kind": caller_kind,
+        "workspace_dir": str(workspace), "artifact_media_root": str(tmp_path / "media"),
+        "artifact_session_id": "synthetic-session", "session_key": "agent:main:webchat:synthetic",
+    }
+    first_ctx = ToolContext(**options)
+    token = current_tool_context.set(first_ctx)
+    try:
+        first = json.loads(await publish_artifact(path=original.name))
+        reused = json.loads(await publish_artifact(path=duplicate.name))
+    finally:
+        current_tool_context.reset(token)
+    artifact_id = first["artifact"]["id"]
+    assert reused["status"] == "already_published"
+    assert reused["artifact"]["id"] == artifact_id
+    assert len(first_ctx.published_artifacts) == 1
+    assert set(first_ctx.artifact_source_paths.values()) == {
+        ArtifactSource(str(original.resolve()), artifact_id=artifact_id),
+        ArtifactSource(str(duplicate.resolve()), artifact_id=artifact_id),
+    }
+    assert ("local_path" in first["artifact"]) is tracks_sources
+    next_ctx = ToolContext(**options)
+    token = current_tool_context.set(next_ctx)
+    try:
+        existing = json.loads(await publish_artifact(path=original.name))
+    finally:
+        current_tool_context.reset(token)
+    assert existing["status"] == "already_published"
+    assert existing["artifact"]["id"] == artifact_id
+    assert list(next_ctx.artifact_source_paths.values()) == [
+        ArtifactSource(str(original.resolve()), artifact_id=artifact_id)
+    ]
 
 
 @pytest.mark.asyncio
@@ -2460,3 +2500,565 @@ def test_strip_artifact_markers_handles_bracket_in_name() -> None:
     cleaned = strip_artifact_markers_from_text(f"Done!\n{marker}\nAnything else?")
     assert "]" not in cleaned
     assert ".html" not in cleaned
+
+
+@pytest.fixture
+def html_evidence_export(tmp_path: Path):
+    script = (
+        Path(__file__).resolve().parents[1]
+        / "desktop/electron/scripts/live_html_evidence.py"
+    )
+    spec = importlib.util.spec_from_file_location("html_evidence_export", script)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    profile = tmp_path / "profile"
+    home = profile / "opensquilla"
+    database = home / "state/sessions.db"
+    database.parent.mkdir(parents=True)
+    with sqlite3.connect(database) as connection:
+        connection.executescript("""
+            CREATE TABLE sessions(session_id TEXT PRIMARY KEY);
+            INSERT INTO sessions VALUES ('session-1');
+            CREATE TABLE artifact_documents(
+                document_id TEXT PRIMARY KEY,session_id TEXT,head_revision_id TEXT
+            );
+            CREATE TABLE artifact_revisions(
+                revision_id TEXT PRIMARY KEY,document_id TEXT,artifact_id TEXT
+            );
+        """)
+    return SimpleNamespace(
+        module=module,
+        profile=profile,
+        database=database,
+        store=ArtifactStore(home / "media"),
+        output=tmp_path / "evidence",
+        run_root=tmp_path,
+    )
+
+
+@pytest.fixture
+def html_evidence_timeline(html_evidence_export):
+    fixture = html_evidence_export
+    connection = sqlite3.connect(":memory:")
+    connection.row_factory = sqlite3.Row
+    connection.execute("""
+        CREATE TABLE transcript_entries(
+            id INTEGER PRIMARY KEY,message_id TEXT,created_at INTEGER,role TEXT,
+            tool_call_id TEXT,tool_calls TEXT,content TEXT,reasoning_content TEXT
+        )
+    """)
+
+    def export(*turns):
+        for index, segments in enumerate(turns, 1):
+            connection.execute(
+                "INSERT INTO transcript_entries VALUES (?,?,?,'assistant',NULL,?,?,?)",
+                (index, f"message-{index}", index, json.dumps(segments),
+                 "PRIVATE_MESSAGE_SENTINEL", "PRIVATE_THOUGHT_SENTINEL"),
+            )
+        def forbid_message_reads(action, table, column, _database, _source):
+            if action == sqlite3.SQLITE_READ and table == "transcript_entries" and column in {
+                "content", "reasoning_content",
+            }:
+                return sqlite3.SQLITE_DENY
+            return sqlite3.SQLITE_OK
+
+        connection.set_authorizer(forbid_message_reads)
+        try:
+            return fixture.module.safe_sqlite_timeline(connection, {"transcript_entries"})
+        finally:
+            connection.set_authorizer(None)
+
+    yield SimpleNamespace(connection=connection, export=export)
+    connection.close()
+
+
+@pytest.mark.parametrize("failure,expected", [
+    ("missing", "exact_text_missing"),
+    ("multiple", "exact_text_multiple"),
+    ("patch-context", "patch_context_mismatch"),
+    ("patch-format", "patch_format"),
+    ("schema", "schema"),
+    ("permission", "permission"),
+])
+def test_html_evidence_classifies_persisted_production_tool_failures(
+    html_evidence_timeline, failure, expected,
+) -> None:
+    from opensquilla.engine.runtime import _persisted_tool_result_segment
+    from opensquilla.engine.types import ToolResultEvent
+    from opensquilla.tools.builtin.filesystem import _apply_edit_replacements, _EditReplacement
+    from opensquilla.tools.builtin.patch import Hunk, _apply_hunk, _parse_patch
+    from opensquilla.tools.envelope import build_tool_failure_envelope
+    from opensquilla.tools.types import InvalidToolArgumentsError
+
+    name = "edit_file"
+    try:
+        if failure in {"missing", "multiple"}:
+            _apply_edit_replacements(
+                "visible visible", [_EditReplacement(
+                    old_text="absent" if failure == "missing" else "visible",
+                    new_text="PRIVATE_REPLACEMENT_SENTINEL", label="old_text",
+                )], path="/private/tool-path-sentinel.html",
+            )
+        elif failure == "patch-context":
+            name = "apply_patch"
+            _apply_hunk(["actual\n"], Hunk(1, 1, 1, 1, ["-expected", "+replacement"]))
+        elif failure == "patch-format":
+            name = "apply_patch"
+            _parse_patch("PRIVATE_PATCH_SENTINEL")
+        elif failure == "schema":
+            raise InvalidToolArgumentsError("PRIVATE_ARGUMENT_SENTINEL")
+        else:
+            raise PermissionError("PRIVATE_PERMISSION_SENTINEL")
+    except (RetryableToolInputError, PermissionError) as error:
+        payload = json.dumps(build_tool_failure_envelope(error, name))
+    else:
+        pytest.fail("The production tool must reject this synthetic input")
+    segment = _persisted_tool_result_segment(ToolResultEvent(
+        tool_use_id="call-1", tool_name=name, result=payload, is_error=True,
+    ))
+    start = {"type": "tool_use", "tool_use_id": "call-1", "name": name,
+             "input": {"private": "PRIVATE_ARGUMENT_SENTINEL"}}
+    result = html_evidence_timeline.export([start, segment])
+
+    assert len(result["toolCalls"]) == len(result["toolResults"]) == 1
+    assert result["toolResults"][0]["is_error"] is True
+    assert result["toolResults"][0]["diagnostic_class"] == expected
+    serialized = json.dumps(result)
+    assert "PRIVATE_" not in serialized
+    assert "tool-path-sentinel" not in serialized
+    assert "user_message" not in serialized
+    assert "reasoning_content" not in serialized
+
+
+def test_html_evidence_filters_segments_and_deduplicates_within_each_turn(
+    html_evidence_timeline,
+) -> None:
+    use = {"type": "tool_use", "tool_use_id": "same-id", "name": "read_file",
+           "input": {"path": "PRIVATE_PATH_SENTINEL"}}
+    outcome = {"type": "tool_result", "tool_use_id": "same-id", "name": "read_file",
+               "result": "PRIVATE_OUTPUT_SENTINEL", "is_error": False}
+    result = html_evidence_timeline.export([
+        None, "PRIVATE_TEXT_SENTINEL", 12, {"type": "text", "text": "PRIVATE_TEXT_SENTINEL",
+        "name": "read_file", "tool_use_id": "not-a-tool"}, use, use, outcome, outcome,
+        {**outcome, "name": "PRIVATE_UNKNOWN_TOOL_SENTINEL", "tool_use_id": "unknown"},
+    ], [use, outcome])
+
+    assert len(result["toolCalls"]) == len(result["toolResults"]) == 2
+    assert [item["transcript_id"] for item in result["toolResults"]] == [1, 2]
+    assert all(item["diagnostic_class"] == "none" for item in result["toolResults"])
+    assert "PRIVATE_" not in json.dumps(result)
+
+
+@pytest.mark.parametrize("payload", [
+    "PRIVATE_RAW_SENTINEL",
+    {"error_class": "PRIVATE_ERROR_SENTINEL", "user_message": "PRIVATE_MESSAGE_SENTINEL"},
+    {"error_class": {"secret": "PRIVATE_NESTED_SENTINEL"}},
+    {"error_class": "RetryableToolInputError", "user_message": {
+        "secret": "PRIVATE_NESTED_SENTINEL",
+    }},
+    {"error_class": "RetryableToolInputError", "user_message":
+     "Unrecognized failure containing edit_file could not find old_text in PRIVATE_SENTINEL"},
+    {"cause": {"error_class": "PermissionError", "secret": "PRIVATE_NESTED_SENTINEL"}},
+])
+def test_html_evidence_unknown_failures_never_export_payloads(
+    html_evidence_timeline, payload,
+) -> None:
+    result = html_evidence_timeline.export([{
+        "type": "tool_result", "name": "edit_file", "tool_use_id": "call-1",
+        "is_error": True, "result": payload if isinstance(payload, str) else json.dumps(payload),
+        "execution_status": {"reason": {"secret": "PRIVATE_EXECUTION_SENTINEL"}},
+    }])
+
+    assert result["toolResults"][0]["diagnostic_class"] == "unknown"
+    assert "PRIVATE_" not in json.dumps(result)
+
+
+def test_html_evidence_filters_metadata_and_requires_boolean_error_flags(
+    html_evidence_timeline,
+) -> None:
+    connection = html_evidence_timeline.connection
+    connection.execute(
+        "INSERT INTO transcript_entries VALUES (20,?,?, 'assistant',NULL,?,NULL,NULL)",
+        ("PRIVATE MESSAGE SENTINEL", "PRIVATE TIMESTAMP SENTINEL", json.dumps([{
+            "type": "tool_result", "name": "edit_file", "tool_use_id": "call-1",
+            "is_error": "PRIVATE ERROR FLAG SENTINEL", "result": "PRIVATE OUTPUT SENTINEL",
+        }, {"type": "tool_result", "name": "edit_file", "tool_use_id": "PRIVATE ID SENTINEL",
+            "is_error": True, "result": "PRIVATE OUTPUT SENTINEL"}])),
+    )
+    result = html_evidence_timeline.export()
+
+    outcome, = result["toolResults"]
+    assert outcome["is_error"] is None
+    assert outcome["diagnostic_class"] == "unknown"
+    assert "message_id" not in outcome
+    assert "created_at" not in outcome
+    assert "PRIVATE" not in json.dumps(result)
+
+
+def test_html_evidence_preserves_truncation_scope_and_legacy_unknown_status(
+    html_evidence_timeline,
+) -> None:
+    from opensquilla.engine.runtime import _persisted_tool_result_segment
+    from opensquilla.engine.types import ToolResultEvent
+
+    segment = _persisted_tool_result_segment(ToolResultEvent(
+        tool_use_id="read-1", tool_name="read_file", result="PRIVATE_OUTPUT_SENTINEL" * 20,
+        is_error=False,
+    ), max_chars=24)
+    html_evidence_timeline.connection.execute(
+        "INSERT INTO transcript_entries VALUES (10,'legacy-message',10,'tool',"
+        "'legacy-call',NULL,'PRIVATE_LEGACY_OUTPUT_SENTINEL',NULL)"
+    )
+    result = html_evidence_timeline.export([segment, {
+        "type": "tool_result", "name": "read_file", "tool_use_id": "read-2",
+        "result": "PRIVATE_OUTPUT_SENTINEL", "is_error": False,
+        "execution_status": {"truncated": True, "secret": "PRIVATE_EXECUTION_SENTINEL"},
+    }])
+
+    persisted, execution, legacy = result["toolResults"]
+    assert persisted["persisted_result_truncated"] is True
+    assert "execution_status_truncated" not in persisted
+    assert persisted["diagnostic_class"] == execution["diagnostic_class"] == "none"
+    assert execution["execution_status_truncated"] is True
+    assert "persisted_result_truncated" not in execution
+    assert legacy["tool_call_id"] == "legacy-call"
+    assert legacy["is_error"] is None
+    assert legacy["diagnostic_class"] == "unknown"
+    assert "PRIVATE_" not in json.dumps(result)
+
+
+def test_html_evidence_exports_only_public_and_persisted_revision_bundles(
+    html_evidence_export,
+) -> None:
+    fixture = html_evidence_export
+    public = fixture.store.publish_bytes(
+        b"<!doctype html><h1>Public</h1>",
+        session_id="session-1",
+        session_key="agent:main:session-1",
+        name="public.html",
+        mime="text/html",
+        source="publish_artifact",
+    )
+    revisions = []
+    for label in ("history", "head", "unreferenced"):
+        bundle = ArtifactBundle(
+            entrypoint="index.html",
+            files=(
+                ArtifactBundleSourceFile(
+                    "index.html", "text/html", f"<!doctype html><h1>{label}</h1>".encode()
+                ),
+                ArtifactBundleSourceFile("assets/style.css", "text/css", label.encode()),
+            ),
+        )
+        ref = fixture.store.publish_bundle(
+            bundle,
+            session_id="session-1",
+            session_key="agent:main:session-1",
+            name="index.html",
+            mime="text/html",
+            source="artifact_revision",
+            visibility="internal",
+        )
+        revisions.append((ref, bundle))
+    history, head, unreferenced = (item[0] for item in revisions)
+    with sqlite3.connect(fixture.database) as connection:
+        connection.execute(
+            "INSERT INTO artifact_documents VALUES ('document-1','session-1','revision-head')"
+        )
+        connection.executemany(
+            "INSERT INTO artifact_revisions VALUES (?,'document-1',?)",
+            [("revision-history", history.id), ("revision-head", head.id)],
+        )
+    assert [ref.id for ref in fixture.store.list_refs(session_id="session-1", limit=20).refs] == [
+        public.id
+    ]
+
+    result = fixture.module.export_html_evidence(
+        fixture.profile, fixture.output, fixture.run_root
+    )
+
+    assert result["complete"] is True
+    assert result["errors"] == []
+    exported = {item["artifactId"]: item for item in result["published"]}
+    assert set(exported) == {public.id, history.id, head.id}
+    assert unreferenced.id not in exported
+    assert exported[history.id]["headDocumentIds"] == []
+    assert exported[head.id]["headDocumentIds"] == ["document-1"]
+    for ref, bundle in revisions[:2]:
+        item = exported[ref.id]
+        assert item["bundleDigest"] == artifact_bundle_manifest(bundle).bundle_digest
+        assert {file["path"]: file["sha256"] for file in item["files"]} == {
+            file.path: hashlib.sha256(file.data).hexdigest() for file in bundle.files
+        }
+        for file in bundle.files:
+            assert (fixture.run_root / item["directory"] / file.path).read_bytes() == file.data
+
+
+@pytest.mark.parametrize("include_owning_session", [False, True])
+def test_html_evidence_rejects_cross_session_revision_reference(
+    html_evidence_export, include_owning_session: bool
+) -> None:
+    fixture = html_evidence_export
+    foreign = fixture.store.publish_bytes(
+        b"<!doctype html><h1>Other session</h1>",
+        session_id="session-2",
+        session_key="agent:main:session-2",
+        name="foreign.html",
+        mime="text/html",
+        source="artifact_revision",
+        visibility="internal",
+    )
+    with sqlite3.connect(fixture.database) as connection:
+        connection.execute(
+            "INSERT INTO artifact_documents VALUES ('document-1','session-1','revision-1')"
+        )
+        connection.execute(
+            "INSERT INTO artifact_revisions VALUES ('revision-1','document-1',?)", (foreign.id,)
+        )
+        if include_owning_session:
+            connection.execute("INSERT INTO sessions VALUES ('session-2')")
+            connection.execute(
+                "INSERT INTO artifact_documents VALUES ('document-2','session-2','revision-2')"
+            )
+            connection.execute(
+                "INSERT INTO artifact_revisions VALUES ('revision-2','document-2',?)", (foreign.id,)
+            )
+
+    result = fixture.module.export_html_evidence(
+        fixture.profile, fixture.output, fixture.run_root
+    )
+
+    assert result["complete"] is False
+    assert {"artifactId": foreign.id, "errorClass": "ArtifactNotFoundError"} in result["errors"]
+    if include_owning_session:
+        assert len(result["published"]) == 1
+        assert result["published"][0]["artifactId"] == foreign.id
+        assert result["published"][0]["headDocumentIds"] == ["document-2"]
+    else:
+        assert result["published"] == []
+        assert not (fixture.output / "published" / foreign.id).exists()
+    assert result["rescue"]["files"]
+
+
+@pytest.mark.parametrize("failure", ["public-list", "revision-query"])
+def test_html_evidence_read_errors_keep_raw_rescue(
+    html_evidence_export, monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
+    fixture = html_evidence_export
+    payload = b"<!doctype html><h1>Preserve this material</h1>"
+    fixture.store.publish_bytes(
+        payload,
+        session_id="session-1",
+        session_key="agent:main:session-1",
+        name="recover.html",
+        mime="text/html",
+        source="publish_artifact",
+    )
+    if failure == "public-list":
+        def unavailable(self, **kwargs):
+            raise OSError("private read diagnostic must not be exported")
+
+        monkeypatch.setattr(ArtifactStore, "list_refs", unavailable)
+        error_class = "OSError"
+    else:
+        with sqlite3.connect(fixture.database) as connection:
+            connection.execute(
+                "ALTER TABLE artifact_revisions RENAME COLUMN document_id TO unavailable_column"
+            )
+        error_class = "OperationalError"
+
+    result = fixture.module.export_html_evidence(
+        fixture.profile, fixture.output, fixture.run_root
+    )
+
+    assert result["complete"] is False
+    assert any(item["errorClass"] == error_class for item in result["errors"])
+    assert "private read diagnostic" not in json.dumps(result)
+    rescued = result["rescue"]
+    expected_sha = hashlib.sha256(payload).hexdigest()
+    copied = next(file for file in rescued["files"] if file["sha256"] == expected_sha)
+    assert (fixture.run_root / rescued["directory"] / copied["path"]).read_bytes() == payload
+
+
+@pytest.fixture
+def html_evidence_source(html_evidence_export):
+    fixture = html_evidence_export
+    fixture.workspace = fixture.profile / "opensquilla/workspace"
+    fixture.workspace.mkdir(parents=True)
+    fixture.source = fixture.workspace / "index.html"
+    fixture.payload = (
+        b'<!doctype html><link rel="stylesheet" href="styles.css">'
+        b'<h1>Registration fixture</h1><script src="script.js"></script>'
+    )
+    fixture.source.write_bytes(fixture.payload)
+    (fixture.workspace / "styles.css").write_text('body { color: blue }')
+    (fixture.workspace / "script.js").write_text('document.title = "Synthetic registration";')
+    (fixture.workspace / "MEMORY.md").write_text("PRIVATE_MEMORY_SENTINEL")
+    (fixture.workspace / "unrelated.html").write_text("UNRELATED_SOURCE_SENTINEL")
+    fixture.ref = fixture.store.publish_bytes(
+        fixture.payload, session_id="session-1", session_key="agent:main:session-1",
+        name="index.html", mime="text/html", source="publish_artifact",
+    )
+    fixture.call = {"id": "publish-1", "name": "publish_artifact", "arguments": {
+        "path": "index.html", "bundle": "none",
+    }}
+    with sqlite3.connect(fixture.database) as connection:
+        connection.executescript("""
+            CREATE TABLE transcript_entries(
+                id INTEGER PRIMARY KEY,session_id TEXT,message_id TEXT,
+                created_at INTEGER,role TEXT,tool_call_id TEXT,tool_calls TEXT,content TEXT
+            );
+        """)
+        connection.execute(
+            "INSERT INTO transcript_entries VALUES (1,'session-1','message-1',1,'assistant',"
+            "NULL,?,'PRIVATE_THOUGHT_SENTINEL')", (json.dumps([fixture.call]),),
+        )
+    return fixture
+
+
+@pytest.mark.parametrize("argument_shape", ["native", "function-json", "input"])
+def test_html_evidence_marks_missing_references_and_preserves_exact_source_dependencies(
+    html_evidence_source, argument_shape: str,
+) -> None:
+    fixture = html_evidence_source
+    call = fixture.call
+    if argument_shape == "function-json":
+        call = {"id": "publish-1", "function": {
+            "name": "publish_artifact", "arguments": json.dumps(call["arguments"]),
+        }}
+    elif argument_shape == "input":
+        call = {"id": "publish-1", "name": "publish_artifact", "input": call["arguments"]}
+    with sqlite3.connect(fixture.database) as connection:
+        connection.execute("UPDATE transcript_entries SET tool_calls=?", (json.dumps([call]),))
+    result = fixture.module.export_html_evidence(
+        fixture.profile, fixture.output, fixture.run_root,
+    )
+    assert result["complete"] is False
+    published, = result["published"]
+    assert published["storageEvidenceComplete"] is True
+    assert published["projectEvidence"] == {
+        "complete": False, "warningCodes": ["missing_dependency"],
+        "missingPaths": ["script.js", "styles.css"],
+    }
+    assert [item["path"] for item in published["files"]] == ["index.html"]
+    recovered, = result["unpublishedDependencies"]
+    assert recovered["identityProof"] == "same_session_publish_path_and_entry_sha256"
+    assert recovered["complete"] is True
+    assert recovered["sourceLocator"] == "index.html"
+    assert {item["path"] for item in recovered["files"]} == {
+        "index.html", "styles.css", "script.js",
+    }
+    for item in recovered["files"]:
+        data = (fixture.run_root / recovered["directory"] / item["path"]).read_bytes()
+        assert data == (fixture.workspace / item["path"]).read_bytes()
+        assert hashlib.sha256(data).hexdigest() == item["sha256"]
+    for path in fixture.output.rglob("*"):
+        if path.is_file():
+            assert not any(marker in path.read_bytes() for marker in (
+                b"PRIVATE_MEMORY_SENTINEL", b"UNRELATED_SOURCE_SENTINEL",
+                b"PRIVATE_THOUGHT_SENTINEL",
+            ))
+    # The immutable publication has not been expanded to the recovered source bundle.
+    assert fixture.store.describe_preview_bundle(fixture.ref.id, session_id="session-1") is None
+
+
+@pytest.mark.parametrize("reason", [
+    "foreign-session", "changed-entry", "wrong-tool", "missing-locator", "missing-source",
+    "escaping-source", "symlink-source", "malformed-arguments",
+])
+def test_html_evidence_dependency_recovery_rejects_unproven_sources(
+    html_evidence_source, reason: str,
+) -> None:
+    fixture = html_evidence_source
+    call = fixture.call
+    if reason == "changed-entry":
+        fixture.source.write_bytes(fixture.payload + b"<!-- different version -->")
+    elif reason == "missing-source":
+        fixture.source.unlink()
+    elif reason == "wrong-tool":
+        call["name"] = "read_file"
+    elif reason == "missing-locator":
+        call["arguments"].pop("path")
+    elif reason == "escaping-source":
+        outside = fixture.run_root / "outside.html"
+        outside.write_bytes(fixture.payload)
+        call["arguments"]["path"] = str(outside)
+    elif reason == "symlink-source":
+        target = fixture.workspace / "actual.html"
+        fixture.source.rename(target)
+        try:
+            fixture.source.symlink_to(target)
+        except OSError:
+            pytest.skip("test host cannot create symlinks")
+    elif reason == "malformed-arguments":
+        call["arguments"] = "not json"
+    with sqlite3.connect(fixture.database) as connection:
+        connection.execute("UPDATE transcript_entries SET tool_calls=?", (json.dumps([call]),))
+        if reason == "foreign-session":
+            connection.execute("UPDATE transcript_entries SET session_id='session-2'")
+    result = fixture.module.export_html_evidence(
+        fixture.profile, fixture.output, fixture.run_root,
+    )
+    assert result["complete"] is False
+    assert len(result["published"]) == 1
+    assert result["unpublishedDependencies"] == []
+    assert not (fixture.output / "unpublished-dependencies").exists()
+
+
+def test_html_evidence_dependency_recovery_excludes_sensitive_and_escaping_references(
+    html_evidence_source,
+) -> None:
+    fixture = html_evidence_source
+    css = b'@import "MEMORY.md"; @import "../outside.css"; body { color: blue; }'
+    (fixture.workspace / "styles.css").write_bytes(css)
+    (fixture.workspace.parent / "outside.css").write_text("PRIVATE_OUTSIDE_SENTINEL")
+    from opensquilla.artifacts import _read_regular_bundle_file
+
+    with patch(
+        "opensquilla.artifacts._read_regular_bundle_file", wraps=_read_regular_bundle_file,
+    ) as reads:
+        result = fixture.module.export_html_evidence(
+            fixture.profile, fixture.output, fixture.run_root,
+        )
+    assert not any(
+        call.args[0] in {fixture.workspace / "MEMORY.md", fixture.workspace.parent / "outside.css"}
+        for call in reads.call_args_list
+    )
+    recovered, = result["unpublishedDependencies"]
+    assert recovered["complete"] is False
+    assert "outside_or_unsafe_dependency" in recovered["warningCodes"]
+    assert {item["path"] for item in recovered["files"]} == {
+        "index.html", "styles.css", "script.js",
+    }
+    for path in fixture.output.rglob("*"):
+        if path.is_file():
+            assert b"PRIVATE_MEMORY_SENTINEL" not in path.read_bytes()
+            assert b"PRIVATE_OUTSIDE_SENTINEL" not in path.read_bytes()
+
+
+@pytest.mark.parametrize("locator", ["MEMORY.md", "index.json", "memory/index.html"])
+def test_html_evidence_rejects_private_source_locator_before_read(
+    html_evidence_source, monkeypatch: pytest.MonkeyPatch, locator: str,
+) -> None:
+    fixture = html_evidence_source
+    private = fixture.workspace / locator
+    private.parent.mkdir(parents=True, exist_ok=True)
+    private.write_bytes(fixture.payload)
+    fixture.call["arguments"]["path"] = locator
+    with sqlite3.connect(fixture.database) as connection:
+        connection.execute(
+            "UPDATE transcript_entries SET tool_calls=?", (json.dumps([fixture.call]),),
+        )
+    read_bytes = Path.read_bytes
+
+    def guarded_read(path: Path):
+        assert path != private, "excluded source locator must not be opened even for hashing"
+        return read_bytes(path)
+
+    monkeypatch.setattr(Path, "read_bytes", guarded_read)
+    result = fixture.module.export_html_evidence(
+        fixture.profile, fixture.output, fixture.run_root,
+    )
+    assert result["complete"] is False
+    assert result["unpublishedDependencies"] == []

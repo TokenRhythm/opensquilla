@@ -173,11 +173,33 @@
       "failedDetail": "Rechargez le navigateur isolé pour continuer."
     },
     "artifactAnnotation": {
-      "start": "Annoter l’aperçu", "stop": "Arrêter l’annotation", "selectElement": "Sélectionnez un élément de page à annoter", "selectElementShort": "Choisir un élément", "unavailable": "L’annotation de l’aperçu est indisponible.", "desktopEditingOnly": "Sélectionnez et modifiez les éléments de la page avec l’IA dans l’application de bureau.",
-      "createFailed": "L’élément sélectionné n’a pas pu être joint.", "elementChanged": "L’élément sélectionné a changé avant d’être joint. Sélectionnez-le à nouveau dans l’aperçu actuel.", "rearmFailed": "Le mode annotation s’est arrêté, car le sélecteur n’a pas pu redémarrer. Réactivez-le pour réessayer.", "updateFailed": "Le brouillon d’annotation n’a pas pu être enregistré.", "discardFailed": "L’annotation n’a pas pu être supprimée. Elle reste ouverte pour réessayer.", "closeFailed": "L’éditeur d’annotation n’a pas pu être fermé. Réessayez.", "replacementCleanupFailed": "La nouvelle annotation a été conservée, mais l’ancien brouillon n’a pas pu être supprimé.",
+      "start": "Annoter l’aperçu",
+      "stop": "Arrêter l’annotation",
+      "selectElement": "Sélectionnez un élément de page à annoter",
+      "selectElementShort": "Choisir un élément",
+      "unavailable": "L’annotation de l’aperçu est indisponible.",
+      "desktopEditingOnly": "Sélectionnez et modifiez les éléments de la page avec l’IA dans l’application de bureau.",
+      "createFailed": "L’élément sélectionné n’a pas pu être joint.",
+      "elementChanged": "L’élément sélectionné a changé avant d’être joint. Sélectionnez-le à nouveau dans l’aperçu actuel.",
+      "rearmFailed": "Le mode annotation s’est arrêté, car le sélecteur n’a pas pu redémarrer. Réactivez-le pour réessayer.",
+      "updateFailed": "Le brouillon d’annotation n’a pas pu être enregistré.",
+      "discardFailed": "L’annotation n’a pas pu être supprimée. Elle reste ouverte pour réessayer.",
+      "closeFailed": "L’éditeur d’annotation n’a pas pu être fermé. Réessayez.",
+      "replacementCleanupFailed": "La nouvelle annotation a été conservée, mais l’ancien brouillon n’a pas pu être supprimé.",
       "overlayFallback": "Continuez l’annotation ci-dessous.",
-      "fallbackTitle": "Continuer l’annotation", "fallbackDetail": "L’aperçu est temporairement masqué. Votre annotation est toujours là.", "frozenPreview": "Aperçu de la zone de page sélectionnée",
-      "placeholder": "Décrivez la modification de cette zone…", "newlineHint": "{shortcut} pour aller à la ligne", "keepDraft": "Conserver l’annotation", "submit": "Ajouter l’annotation", "contextLabel": "Sélection actuelle", "bodyLabel": "Annotation de page", "emptyBody": "Décrivez la modification souhaitée.", "reselectHint": "Sélectionnez la zone correspondante sur la page.", "reuseHint": "La demande de modification a été copiée. Sélectionnez la zone correspondante sur la page."
+      "fallbackTitle": "Continuer l’annotation",
+      "fallbackDetail": "L’aperçu est temporairement masqué. Votre annotation est toujours là.",
+      "frozenPreview": "Aperçu de la zone de page sélectionnée",
+      "placeholder": "Décrivez la modification de cette zone…",
+      "newlineHint": "{shortcut} pour aller à la ligne",
+      "keepDraft": "Conserver l’annotation",
+      "submit": "Ajouter l’annotation",
+      "contextLabel": "Sélection actuelle",
+      "bodyLabel": "Annotation de page",
+      "emptyBody": "Décrivez la modification souhaitée.",
+      "reselectHint": "Sélectionnez la zone correspondante sur la page.",
+      "reuseHint": "La demande de modification a été copiée. Sélectionnez la zone correspondante sur la page.",
+      "screenshotUploadFailed": "La capture n’a pas pu être jointe. Votre annotation est conservée ; vous pouvez ajouter une image manuellement."
     },
     "artifactPreview": {
       "refresh": "Actualiser l’aperçu",
@@ -187,7 +209,6 @@
       "readyWithWarnings": "L’aperçu fonctionne avec des avertissements.",
       "warningsShort": "Avertissements",
       "suspended": "Aperçu en pause",
-      "agentEditInProgress": "La modification se poursuit en arrière-plan.",
       "nativePreview": "Aperçu interactif",
       "allowRemoteResources": "Autoriser les images, styles et médias en ligne",
       "blockRemoteResources": "Bloquer les images, styles et médias en ligne",
@@ -229,7 +250,6 @@
     },
     "artifactErrors": {
       "documentChanged": "La page a changé. Actualisez-la avant de réessayer.",
-      "editSessionRenewalRequired": "L’édition se reconnecte. Vos modifications non enregistrées sont conservées.",
       "writeBusy": "La page est en cours de mise à jour. Patientez un instant puis réessayez.",
       "mutationNotApplied": "La page n’a pas été mise à jour. Vous pouvez réessayer.",
       "mutationOutcomePending": "Impossible de confirmer le résultat de la mise à jour. Ouvrez la page pour vérifier.",
@@ -241,7 +261,8 @@
       "annotationUnavailable": "Cette annotation est temporairement indisponible.",
       "annotationBusy": "Les annotations sont en cours de mise à jour. Patientez un instant puis réessayez.",
       "invalidRequest": "Impossible de terminer la requête. Vérifiez la saisie puis réessayez.",
-      "internalError": "Impossible de terminer l’opération. Réessayez."
+      "internalError": "Impossible de terminer l’opération. Réessayez.",
+      "documentEditingRetired": "Mettez à jour le client et rouvrez la page pour envoyer vos annotations dans la conversation."
     },
     "artifactDocument": {
       "sections": "Sections du document de l’artefact",
@@ -290,16 +311,7 @@
       "revertFailed": "Cette modification n’a pas pu être annulée. Vérifiez la version la plus récente et réessayez.",
       "commentCreateFailed": "Le commentaire n’a pas pu être ajouté. Vérifiez l’état actuel du document et réessayez.",
       "commentResolveFailed": "Le commentaire n’a pas pu être résolu. Vérifiez son état actuel et réessayez.",
-      "noElementSelected": "Placez le curseur dans un élément HTML",
-      "saving": "Enregistrement…",
-      "saveSource": "Enregistrer",
-      "sourceUnavailable": "La source HTML est indisponible.",
-      "sourceConflict": "Le document a été modifié ailleurs. Vérifiez-le ou rechargez-le avant d’enregistrer.",
-      "copyUnsavedSource": "Copier la source non enregistrée",
-      "unsavedSourceCopied": "Source non enregistrée copiée",
-      "copyUnsavedSourceFailed": "Impossible de copier la source non enregistrée.",
-      "discardAndLoadLatest": "Ignorer et charger la dernière version",
-      "sourceStatus": {"ready":"Prêt","saving":"Enregistrement…","dirty":"Non enregistré","saved":"Enregistré","error":"Action requise"}
+      "sourceUnavailable": "La source HTML est indisponible."
     }
   },
   "nav": {
@@ -3469,7 +3481,7 @@
     "audioUnsupported": "Ce navigateur ne peut pas lire ce format audio. Téléchargez plutôt le fichier.",
     "playVideo": "Lire la vidéo",
     "videoLoadFailed": "Impossible de charger la vidéo.",
-    "videoUnsupported": "Ce navigateur ne peut pas lire ce format vidéo. Téléchargez plutôt le fichier.",
+    "videoUnsupported": "Ce navigateur ne peut pas lire cette vidéo. Téléchargez-la à la place.",
     "previewOf": "Aperçu : {title}",
     "closePreview": "Fermer l'aperçu",
     "previousImage": "Image précédente",
@@ -3478,7 +3490,6 @@
     "previewDownload": "Télécharger l'aperçu",
     "previewTimedOut": "L'aperçu a expiré.",
     "previewFailed": "Échec du chargement de l'aperçu.",
-    "videoUnsupported": "Ce navigateur ne peut pas lire cette vidéo. Téléchargez-la à la place.",
     "loadVideoPreview": "Charger l’aperçu vidéo",
     "loadVideoPreviewFor": "Charger l’aperçu vidéo de {title}",
     "videoPreviewLoading": "Chargement de l’aperçu vidéo. Vous pouvez annuler le téléchargement.",
@@ -3968,7 +3979,8 @@
         "generic": "La réorientation n'est pas disponible pour la tâche actuelle. Le message reste en file d'attente."
       },
       "clearQueue": "Vider la file",
-      "removeMessage": "Supprimer le message en attente {index}"
+      "removeMessage": "Supprimer le message en attente {index}",
+      "annotationUpgradeRequired": "Cette annotation utilise l’ancien éditeur. Modifiez le message et sélectionnez à nouveau la page avant de l’envoyer."
     },
     "metaRuns": {
       "draft": "Brouillon",

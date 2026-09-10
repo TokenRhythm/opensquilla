@@ -119,8 +119,14 @@ declare global {
     closeArtifactAnnotationOverlay?: (
       payload: import('./platform/types').NativeArtifactAnnotationOverlayCloseRequest,
     ) => Promise<import('./platform/types').NativeWorkbenchSurfaceResult>
-    screenshot?: (
-      payload: import('./platform/types').NativeArtifactScreenshotRequest,
+    getWorkbenchBrowserTarget?: (
+      payload: { surfaceId: string },
+    ) => Promise<import('./platform/types').NativeWorkbenchBrowserTarget>
+    focusWorkbenchAnnotation?: (
+      payload: { surfaceId: string; targetRef: string; locatorHint: string },
+    ) => Promise<import('./platform/types').NativeWorkbenchSurfaceResult>
+    captureWorkbenchScreenshot?: (
+      payload: { surfaceId: string; targetRef: string },
     ) => Promise<unknown>
     navigateWorkbenchSurface?: (
       payload: NativeWorkbenchNavigateRequest,

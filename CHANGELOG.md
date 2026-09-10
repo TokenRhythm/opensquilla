@@ -16,6 +16,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Changed
 
+- Retired the opt-in patch evidence ledger collector and JSON export. Legacy
+  path configuration remains accepted and excludes old diagnostic files from
+  final-diff checks, but no longer creates or overwrites a ledger. Recovery events
+  retain an empty `verification_commands` list; recovery decisions, source-diff
+  salvage, generic runtime events and model-visible defaults are unchanged.
 - Retired optional runtime experiments: strict/variant finalize challenges,
   submit review, patch-evidence prompts, tool-description overrides, tool-loop
   observation, runtime capsules, text-only tool nudges, and independent deadline
