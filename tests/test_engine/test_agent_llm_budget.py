@@ -8,6 +8,7 @@ from collections.abc import AsyncIterator
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
+from unittest.mock import Mock
 
 import pytest
 
@@ -1975,7 +1976,10 @@ def _init_git_repo_with_source(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_agent_warns_once_for_suspicious_final_diff_contract(tmp_path) -> None:
+@pytest.mark.parametrize("event_output", [False, True])
+async def test_agent_warns_once_for_suspicious_final_diff_contract(
+    tmp_path, monkeypatch, event_output
+) -> None:
     _init_git_repo_with_source(tmp_path)
     (tmp_path / "debug_case.py").write_text("print('repro')\n", encoding="utf-8")
     runtime_events_path = tmp_path / "runtime_events.jsonl"
@@ -1987,7 +1991,7 @@ async def test_agent_warns_once_for_suspicious_final_diff_contract(tmp_path) -> 
             flush_enabled=False,
             progress_watchdog_mode="log",
             final_diff_contract_mode="warn_model",
-            runtime_events_path=str(runtime_events_path),
+            runtime_events_path=str(runtime_events_path) if event_output else None,
         ),
         tool_context=ToolContext(
             workspace_dir=str(tmp_path),
@@ -2008,6 +2012,8 @@ async def test_agent_warns_once_for_suspicious_final_diff_contract(tmp_path) -> 
         ),
     )
 
+    observation = Mock(wraps=agent._final_diff_contract_observation)
+    monkeypatch.setattr(agent, "_final_diff_contract_observation", observation)
     events = [event async for event in agent.run_turn("Fix the failing parser test")]
 
     assert any(isinstance(event, DoneEvent) for event in events)
@@ -2023,6 +2029,10 @@ async def test_agent_warns_once_for_suspicious_final_diff_contract(tmp_path) -> 
         and event.code == "final_diff_contract_recovery"
         for event in events
     )
+    assert observation.call_count == (2 if event_output else 1)
+    if not event_output:
+        assert not runtime_events_path.exists()
+        return
     logged = [
         json.loads(line)
         for line in runtime_events_path.read_text(encoding="utf-8").splitlines()
@@ -2054,7 +2064,10 @@ async def test_agent_warns_once_for_suspicious_final_diff_contract(tmp_path) -> 
 
 
 @pytest.mark.asyncio
-async def test_agent_final_diff_contract_log_mode_does_not_prompt_model(tmp_path) -> None:
+@pytest.mark.parametrize("event_output", [False, True])
+async def test_agent_final_diff_contract_log_mode_does_not_prompt_model(
+    tmp_path, monkeypatch, event_output
+) -> None:
     _init_git_repo_with_source(tmp_path)
     (tmp_path / "debug_case.py").write_text("print('repro')\n", encoding="utf-8")
     runtime_events_path = tmp_path.parent / f"{tmp_path.name}-runtime_events.jsonl"
@@ -2066,11 +2079,13 @@ async def test_agent_final_diff_contract_log_mode_does_not_prompt_model(tmp_path
             flush_enabled=False,
             progress_watchdog_mode="log",
             final_diff_contract_mode="log",
-            runtime_events_path=str(runtime_events_path),
+            runtime_events_path=str(runtime_events_path) if event_output else None,
         ),
         tool_context=ToolContext(workspace_dir=str(tmp_path)),
     )
 
+    observation = Mock(wraps=agent._final_diff_contract_observation)
+    monkeypatch.setattr(agent, "_final_diff_contract_observation", observation)
     events = [event async for event in agent.run_turn("Fix the failing parser test")]
 
     assert any(isinstance(event, DoneEvent) for event in events)
@@ -2080,6 +2095,10 @@ async def test_agent_final_diff_contract_log_mode_does_not_prompt_model(tmp_path
         for event in events
         if isinstance(event, WarningEvent) and event.code == "final_diff_contract_recovery"
     ]
+    assert observation.call_count == int(event_output)
+    if not event_output:
+        assert not runtime_events_path.exists()
+        return
     logged = [
         json.loads(line)
         for line in runtime_events_path.read_text(encoding="utf-8").splitlines()
@@ -2158,7 +2177,10 @@ async def test_agent_final_diff_contract_warns_for_empty_diff_after_workspace_wr
 
 
 @pytest.mark.asyncio
-async def test_agent_records_final_diff_contract_on_finish_error_with_diff(tmp_path) -> None:
+@pytest.mark.parametrize("event_output", [False, True])
+async def test_agent_records_final_diff_contract_on_finish_error_with_diff(
+    tmp_path, monkeypatch, event_output
+) -> None:
     _init_git_repo_with_source(tmp_path)
     (tmp_path / "debug_case.py").write_text("print('repro')\n", encoding="utf-8")
     runtime_events_path = tmp_path.parent / f"{tmp_path.name}-error-runtime_events.jsonl"
@@ -2172,11 +2194,13 @@ async def test_agent_records_final_diff_contract_on_finish_error_with_diff(tmp_p
             flush_enabled=False,
             progress_watchdog_mode="log",
             final_diff_contract_mode="warn_model",
-            runtime_events_path=str(runtime_events_path),
+            runtime_events_path=str(runtime_events_path) if event_output else None,
         ),
         tool_context=ToolContext(workspace_dir=str(tmp_path)),
     )
 
+    observation = Mock(wraps=agent._final_diff_contract_observation)
+    monkeypatch.setattr(agent, "_final_diff_contract_observation", observation)
     events = [event async for event in agent.run_turn("Fix the failing parser test")]
 
     assert len(provider.calls) == 1
@@ -2196,6 +2220,10 @@ async def test_agent_records_final_diff_contract_on_finish_error_with_diff(tmp_p
         for event in events
         if isinstance(event, WarningEvent) and event.code == "final_diff_contract_recovery"
     ]
+    assert observation.call_count == int(event_output)
+    if not event_output:
+        assert not runtime_events_path.exists()
+        return
     logged = [
         json.loads(line)
         for line in runtime_events_path.read_text(encoding="utf-8").splitlines()

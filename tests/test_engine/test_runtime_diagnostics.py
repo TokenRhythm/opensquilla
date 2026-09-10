@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from typing import Any
+from unittest.mock import Mock
 
 import pytest
 
@@ -472,7 +473,7 @@ async def test_agent_skips_git_diff_diagnostics_when_no_observer_needs_them(
     events = [event async for event in agent.run_turn("run one command")]
 
     assert events
-    assert unavailable_git_runtime.resolution_calls
+    assert not unavailable_git_runtime.resolution_calls
 
 
 @pytest.mark.asyncio
@@ -493,7 +494,7 @@ async def test_plain_chat_finishes_when_git_is_unavailable(
 
     assert events
     assert provider.calls == 1
-    assert unavailable_git_runtime.resolution_calls
+    assert not unavailable_git_runtime.resolution_calls
 
 
 @pytest.mark.asyncio
@@ -547,6 +548,26 @@ async def test_retired_patch_ledger_does_not_write_on_turn_completion(
         assert ledger_path.read_bytes() == original
     else:
         assert not ledger_path.exists()
+
+
+def test_runtime_event_producers_do_not_prepare_unused_payloads(monkeypatch) -> None:
+    agent = Agent(provider=_ThreeToolProvider(tool_turns=0), config=AgentConfig())
+    unused = Mock(side_effect=AssertionError("unused event preparation"))
+    monkeypatch.setattr(agent, "_workspace_diff_paths_for_runtime_event", unused)
+    monkeypatch.setattr(agent, "_workspace_mutation_receipt_summary", unused)
+    monkeypatch.setattr("opensquilla.engine.agent.append_runtime_event", unused)
+    evidence = Mock()
+    evidence.to_event_details = unused
+    evidence.get = unused
+
+    agent._record_runtime_recovery_event(evidence, iteration=1, provider_call_count=1)
+    agent._record_final_diff_contract_event(
+        evidence, iteration=1, provider_call_count=1, mode="log", injected_to_model=False
+    )
+    agent._record_final_diff_salvage_event(
+        evidence, trigger="finalize", iteration=1, action="applied"
+    )
+    unused.assert_not_called()
 
 
 @pytest.mark.asyncio

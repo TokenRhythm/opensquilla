@@ -11920,8 +11920,16 @@ class Agent:
                         "final_diff_contract_mode",
                         "log",
                     )
-                    if final_diff_contract_mode != "off" and (
-                        not max_iterations_finalization_pending
+                    if (
+                        final_diff_contract_mode != "off"
+                        and not max_iterations_finalization_pending
+                        and (
+                            self.config.runtime_events_path
+                            or (
+                                final_diff_contract_mode == "warn_model"
+                                and not final_diff_contract_recovery_attempted
+                            )
+                        )
                     ):
                         final_diff_observation = self._final_diff_contract_observation()
                         if final_diff_observation is not None and (
@@ -12972,15 +12980,15 @@ class Agent:
                         if command and self._command_looks_like_focused_verification(command):
                             post_write_focused_verification_observed = True
                             result_text = self._tool_result_text_for_anchor(result.content)
-                            verification_state = self._classify_focused_verification_result(result)
-                            self._record_runtime_event(
-                                "focused_verification.classified",
-                                feature="verification",
-                                tool_name=result.tool_name,
-                                command=command[:500],
-                                state=verification_state,
-                                is_error=bool(result.is_error),
-                            )
+                            if self.config.runtime_events_path:
+                                self._record_runtime_event(
+                                    "focused_verification.classified",
+                                    feature="verification",
+                                    tool_name=result.tool_name,
+                                    command=command[:500],
+                                    state=self._classify_focused_verification_result(result),
+                                    is_error=bool(result.is_error),
+                                )
                             clean_validation_success = (
                                 self._tool_result_has_validation_success_signal(result_text)
                                 and not self._tool_result_has_failure_signal(result_text)
@@ -13577,7 +13585,7 @@ class Agent:
                 "final_diff_contract_mode",
                 "log",
             )
-            if final_diff_contract_mode != "off":
+            if final_diff_contract_mode != "off" and self.config.runtime_events_path:
                 final_diff_observation = self._final_diff_contract_observation()
                 if final_diff_observation is not None and (
                     final_diff_observation.diff_paths or final_diff_observation.suspicious
@@ -13944,6 +13952,8 @@ class Agent:
         injected_to_model: bool,
         hint_text: str | None = None,
     ) -> None:
+        if not self.config.runtime_events_path:
+            return
         details = observation.to_event_details()
         details.update(self._workspace_mutation_receipt_summary())
         event = {
@@ -14132,6 +14142,8 @@ class Agent:
         iteration: int,
         action: str,
     ) -> None:
+        if not self.config.runtime_events_path:
+            return
         event = {
             "feature": "final_diff_salvage",
             "name": f"final_diff_salvage.{action}",
@@ -15106,6 +15118,8 @@ class Agent:
         call_attempt: int | None = None,
         **details: Any,
     ) -> None:
+        if not self.config.runtime_events_path:
+            return
         hint_text_sha256 = (
             hashlib.sha256(decision.message.encode("utf-8")).hexdigest()
             if decision.message
