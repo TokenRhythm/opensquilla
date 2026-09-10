@@ -1,8 +1,10 @@
 # Windows signed installer rehearsal
 
-The controlled Windows installer handoff is experimental and off by default.
-`OPENSQUILLA_DESKTOP_ENABLE_WIN_INSTALL=1` enables it in a packaged client that
-contains the implementation. It keeps the full installer download and requires
+The Windows x64 installer handoff is enabled by default in builds containing
+the activation change. `OPENSQUILLA_DESKTOP_ENABLE_WIN_INSTALL=0` disables it
+and restores the manual Show installer action. The previous opt-in value `1`
+continues to work. Restart the client after changing the environment variable.
+It keeps the full installer download and requires
 the normal checksum, signature, cache, and shutdown gates before installation.
 The existing `OPENSQUILLA_DESKTOP_ENABLE_WIN_UPDATE` switch exercises a separate
 electron-updater path and must remain off during this rehearsal.
@@ -11,18 +13,34 @@ electron-updater path and must remain off during this rehearsal.
 
 The intended default Windows experience is **Check -> Download and verify ->
 Quit and install -> visible NSIS wizard -> launch the installed version**.
-The implementation may merge with the entry **off by default** after its update
-and lifecycle contracts, one signed native A-to-B cached-input flow with retained
-profile interactions, and required PR/merge-queue CI pass. This experimental
-merge does not certify general availability or the entire release matrix.
+PR #1584 introduced the implementation with the entry **off by default**.
+Its update and lifecycle contracts, one signed native A-to-B cached-input flow
+with retained-profile interactions, and PR/merge-queue CI do not certify general
+availability or the entire release matrix.
 
-Default activation is separate follow-up work. Complete the remaining native
+Default activation is prepared in follow-up PR #1606. Complete the remaining native
 and restricted-network matrix below, record source SHAs, signed artifact hashes,
 installation mode, network conditions and outcomes, then validate the activation
-change in CI. No signing task, public channel update or release is authorized
-by this experimental merge. The
+change in CI. The earlier experimental merge alone did not authorize signing,
+public channel changes, or a release. The
 manual Show installer action remains available as a secondary action when the
 handoff is enabled and as the primary action for shells without that capability.
+
+### Activation acceptance scope
+
+The maintainer waived Windows 10 native acceptance for this activation on
+2026-09-10. Windows 10 remains in the supported Windows x64 scope; this waiver
+does not establish a tested Windows 10 upgrade. It does not waive the remaining
+Windows 11 network, certificate-chain, UAC/cancellation, installation path/scope,
+or retained-profile checks. Record Windows 10 as **not tested / maintainer waived**,
+never as passed or as an unsupported platform.
+
+The default-on source change alone is not release approval. Keep PR #1606 in
+Draft until the remaining acceptance evidence is recorded. CI fixtures and
+warm-cache host checks must not substitute for the clean Windows certificate
+and native restricted-network cells. Existing installed clients are unaffected
+until a build containing the activation is installed; the first upgrade from
+an older manual client still follows that older client's UI.
 
 ## Development checks
 
@@ -91,7 +109,7 @@ the installer bytes are not executed or deleted. If discovery fails, a cache
 that passes verification remains available, with a check error for an explicit
 request. Download, reveal, installation and lifecycle ownership still prevent
 concurrent candidate replacement. The refresh regression runs with the handoff
-switch absent so the default Windows manual path is covered too.
+switch set to `0` so the emergency manual path is covered too.
 
 ### Restricted networks
 
@@ -119,7 +137,7 @@ crediting the GitHub-unreachable native cell. Default remote channel discovery
 requires its own evidence without a channel-root override. Neither this mode nor
 a passing driver contract opens the default activation gate.
 
-For native acceptance, test a disposable Windows 10/11 environment with GitHub
+For the remaining native acceptance, test a disposable Windows 11 environment with GitHub
 unreachable while the complete OSS release is reachable. Include the channel
 JSON, `latest.yml`, installer, and `SHA256SUMS`; OSS promotion must occur only
 after all versioned assets and checksums have been uploaded and read back.
