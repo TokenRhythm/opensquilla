@@ -1,18 +1,44 @@
+[CmdletBinding(DefaultParameterSetName = 'Manual')]
 param(
-  [Parameter(Mandatory = $true)]
+  [Parameter(Mandatory = $true, ParameterSetName = 'Manual')]
   [string]$CandidateInstaller,
-  [Parameter(Mandatory = $true)]
+  [Parameter(Mandatory = $true, ParameterSetName = 'Manual')]
   [ValidatePattern('^[A-Za-z0-9._-]{1,80}$')]
   [string]$Label,
+  [Parameter(ParameterSetName = 'Manual')]
   [switch]$VerifyLongRunningUpdateBanner,
+  [Parameter(ParameterSetName = 'Manual')]
   [string]$RealUpdateChannelManifest = '',
+  [Parameter(ParameterSetName = 'Manual')]
   [ValidateSet('custom', 'default')]
   [string]$InstallMode = 'custom',
+  [Parameter(ParameterSetName = 'Manual')]
   [ValidateSet('0.5.3', '0.5.4')]
-  [string]$BaselineVersion = '0.5.3'
+  [string]$BaselineVersion = '0.5.3',
+  [Parameter(Mandatory = $true, ParameterSetName = 'Signed')]
+  [string]$SignedAuditConfigPath
 )
 
 $ErrorActionPreference = 'Stop'
+
+if ($PSCmdlet.ParameterSetName -eq 'Signed') {
+  if (-not [IO.Path]::IsPathRooted($SignedAuditConfigPath)) { throw 'Signed audit config path must be absolute.' }
+  $config = Get-Content -LiteralPath $SignedAuditConfigPath -Raw | ConvertFrom-Json
+  $required = @('InstallRoot', 'UserDataDir', 'EvidenceRoot', 'BaselineVersion',
+    'BaselineExecutableSha256', 'BaselineSourceSha', 'CandidateInstaller',
+    'CandidateInstallerSha256', 'CandidateSourceSha', 'ChannelManifest')
+  $allowed = $required + @('InstallTimeoutSeconds', 'ProcessObservationMode', 'HandoffInputMode')
+  $arguments = @{}
+  foreach ($property in $config.PSObject.Properties) {
+    if ($property.Name -cnotin $allowed) { throw "Unknown signed audit field: $($property.Name)" }
+    $arguments[$property.Name] = $property.Value
+  }
+  foreach ($name in $required) {
+    if ($arguments[$name] -isnot [string] -or -not $arguments[$name]) { throw "Missing signed audit string: $name" }
+  }
+  & (Join-Path $PSScriptRoot 'verify-release-windows-signed-update.ps1') @arguments
+  exit $LASTEXITCODE
+}
 
 function Test-InstalledProductVersion {
   param([string]$Actual, [string]$Expected)

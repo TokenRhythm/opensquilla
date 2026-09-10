@@ -1204,6 +1204,95 @@ def test_squash_binding_reconstructs_the_tested_tree(tmp_path: Path) -> None:
     ) == _git(repo, "rev-parse", "HEAD^{tree}")
 
 
+@pytest.mark.parametrize("source_path,suite", [
+    ("opensquilla-webui/src/components/example.ts", "frontend-validation"),
+    ("src/opensquilla/cli/tui/opentui/package/src/example.mjs", "tui"),
+])
+def test_queue_reuses_unchanged_suite_and_requires_remaining_full_matrix(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, source_path: str, suite: str,
+) -> None:
+    repo, evidence, queue_base = _composition_fixture(
+        tmp_path, source_path=source_path, base_delta_path="docs/queue.md",
+    )
+    exact, _, source_run, details = _verify_composed_fixture(
+        repo=repo, attestation=evidence, queue_base=queue_base, monkeypatch=monkeypatch,
+    )
+    assert exact is False  # Partial proof must NEVER enter the exact fast path.
+    assert source_run == 123
+    assert details["partial"] == "true"
+    plan = json.loads(str(details["partial_plan"]))
+    assert plan["reused_suites"] == [suite]
+    full = MODULE["_plan_paths"](repo, [".ci/run-all"])
+    assert set(plan["required_suites"]) | {suite} == set(full["required_suites"])
+    assert suite not in plan["required_suites"]
+    assert "frontend-artifact" in plan["required_suites"]
+    assert "windows-high-risk" in plan["required_suites"]
+    assert plan["python_matrix"] == full["python_matrix"]
+    assert plan["desktop_matrix"] == full["desktop_matrix"]
+    assert plan["platform_matrix"] == [c for c in full["platform_matrix"] if c["suite"] != suite]
+
+
+@pytest.mark.parametrize("delta", [
+    "opensquilla-webui/src/changed.ts", "opensquilla-webui/package-lock.json",
+    "src/opensquilla/contracts/adapters/example.py", "src/opensquilla/__init__.py",
+    "scripts/contracts/example.py", "tests/contracts/example.py",
+    "uv.lock", "pyproject.toml", "unknown-ci-input.dat",
+])
+def test_partial_frontend_reuse_rejects_changed_inputs_or_unknown_delta(
+    tmp_path: Path, delta: str,
+) -> None:
+    repo, evidence, base = _composition_fixture(
+        tmp_path, source_path="opensquilla-webui/src/components/example.ts",
+        base_delta_path=delta,
+    )
+    with pytest.raises(AttestationError):
+        MODULE["partial_queue_plan"](repo=repo, attestation=evidence, queue_base_sha=base)
+
+
+def test_partial_reuse_requires_all_platforms_and_rejects_stale_proof(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo, evidence, base = _composition_fixture(
+        tmp_path, source_path="opensquilla-webui/src/components/example.ts",
+        base_delta_path="docs/queue.md",
+    )
+    incomplete = dict(evidence)
+    incomplete["platform_matrix"] = [
+        c for c in evidence["platform_matrix"]
+        if not (c["suite"] == "frontend-validation" and c["os"] == "windows-latest")
+    ]
+    with pytest.raises(AttestationError):
+        MODULE["partial_queue_plan"](repo=repo, attestation=incomplete, queue_base_sha=base)
+    evidence["root_issued_at"] = "2000-01-01T00:00:00Z"
+    exact, _, source, details = _verify_composed_fixture(
+        repo=repo, attestation=evidence, queue_base=base, monkeypatch=monkeypatch,
+    )
+    assert not exact and source is None
+    assert details["partial"] == "false"
+    assert details["partial_plan"] == ""
+
+
+@pytest.mark.parametrize("delta,expected", [
+    ("docs/queue.md", ["frontend-validation", "tui"]),
+    ("opensquilla-webui/src/components/base.ts", ["tui"]),
+    ("src/opensquilla/cli/tui/opentui/package/src/base.mjs", ["frontend-validation"]),
+])
+def test_partial_queue_supplements_only_invalidated_allowlisted_suites(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, delta: str, expected: list[str],
+) -> None:
+    repo, evidence, base = _composition_fixture(
+        tmp_path, source_path=".ci/run-all", base_delta_path=delta,
+    )
+    exact, _, source, details = _verify_composed_fixture(
+        repo=repo, attestation=evidence, queue_base=base, monkeypatch=monkeypatch,
+    )
+    assert exact is False and source == 123
+    assert details["partial"] == "true"
+    plan = json.loads(str(details["partial_plan"]))
+    assert plan["reused_suites"] == expected
+    assert set(plan["required_suites"]) & set(expected) == set()
+
+
 @pytest.mark.parametrize(
     ("full_plan_change", "paths", "plan_basis"),
     (

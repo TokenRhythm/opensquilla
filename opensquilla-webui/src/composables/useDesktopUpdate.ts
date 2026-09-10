@@ -49,6 +49,8 @@ function updateErrorTranslationKey(code: DesktopUpdateErrorCode): string {
   if (code === 'manifest_invalid') return 'updates.desktop.errorManifestInvalid'
   if (code === 'checksum_unavailable') return 'updates.desktop.errorChecksumUnavailable'
   if (code === 'integrity_failed') return 'updates.desktop.errorIntegrityFailed'
+  if (code === 'signature_invalid') return 'updates.desktop.errorSignatureInvalid'
+  if (code === 'signature_unavailable') return 'updates.desktop.errorSignatureUnavailable'
   if (code === 'download_failed') return 'updates.desktop.errorDownloadFailed'
   return 'updates.desktop.errorInstallFailed'
 }
@@ -114,11 +116,15 @@ export function useDesktopUpdate() {
   ))
   const visible = computed(() =>
     isManagedDesktopUpdate.value &&
-    TOPBAR_STATUSES.has(state.value.status) &&
+    (TOPBAR_STATUSES.has(state.value.status)
+      || (state.value.status === 'applying' && state.value.installMode === 'manual')) &&
     !snoozeActive(state.value),
   )
   const latestVersion = computed(() => state.value.latestVersion || state.value.currentVersion || '')
   const localizedError = computed(() => {
+    // The main process supplies a localized recovery instruction for installer
+    // handoff failures (for example, multiple installed copies).
+    if (state.value.errorCode === 'install_failed' && state.value.error) return state.value.error
     if (state.value.errorCode) return t(updateErrorTranslationKey(state.value.errorCode))
     return state.value.error || t('updates.desktop.errorFallback')
   })
