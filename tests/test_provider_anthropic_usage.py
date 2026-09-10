@@ -696,3 +696,119 @@ def test_list_models_rows_match_retired_known_models_table() -> None:
     rows = asyncio.run(AnthropicProvider(api_key="test").list_models())
 
     assert rows == expected
+
+
+# ---------------------------------------------------------------------------
+# Error events must carry partial usage already reported by message_start
+# (issue #1016) so the session ledger does not record $0 for an errored turn
+# where the provider billed partial input tokens.
+# ---------------------------------------------------------------------------
+
+
+def _patch_anthropic_transport(monkeypatch, body: bytes) -> None:
+    """Serve ``body`` as the SSE response for the adapter's HTTP call."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            content=body,
+        )
+
+    transport = httpx.MockTransport(handler)
+    real_async_client = httpx.AsyncClient
+
+    def patched_async_client(*args, **kwargs):
+        kwargs["transport"] = transport
+        return real_async_client(*args, **kwargs)
+
+    monkeypatch.setattr("opensquilla.provider.anthropic.httpx.AsyncClient", patched_async_client)
+
+
+def _collect_anthropic_error(provider, message) -> ErrorEvent:
+    async def _collect() -> ErrorEvent:
+        errors = []
+        async for ev in provider.chat([Message(role="user", content=message)], config=ChatConfig()):
+            if isinstance(ev, ErrorEvent):
+                errors.append(ev)
+        assert len(errors) == 1, f"expected exactly one ErrorEvent, got {len(errors)}"
+        return errors[0]
+
+    return asyncio.run(_collect())
+
+
+def _message_start_events() -> list[dict]:
+    return [
+        {
+            "type": "message_start",
+            "message": {
+                "id": "msg_t",
+                "model": "claude-test",
+                "usage": {"input_tokens": 100, "output_tokens": 0},
+            },
+        },
+        {"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}},
+        {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {"type": "text_delta", "text": "partial "},
+        },
+    ]
+
+
+def test_anthropic_error_event_carries_partial_usage_after_invalid_frame(monkeypatch) -> None:
+    """An invalid frame after message_start must not discard the 100 input tokens."""
+
+    body = _sse_body(_message_start_events()) + b"event: content_block_delta\ndata: {INVALID}\n\n"
+    _patch_anthropic_transport(monkeypatch, body)
+
+    err = _collect_anthropic_error(AnthropicProvider(api_key="test", model="claude-test"), "hi")
+
+    assert err.code == "invalid_stream_frame"
+    assert err.model_usage_breakdown, "partial usage from message_start must be carried"
+    row = err.model_usage_breakdown[0]
+    assert row["input_tokens"] == 100
+    assert row["output_tokens"] == 0
+    assert row["model"] == "claude-test"
+    assert row["cost_source"] == "opensquilla_estimate"
+
+    # Downstream: the usage ledger must finalize this as a known partial
+    # receipt instead of recording an unknown zero-cost turn.
+    from opensquilla.engine.usage_accounting import (
+        has_known_provider_usage_receipt,
+        normalize_provider_usage,
+    )
+
+    assert has_known_provider_usage_receipt(err) is True
+    result = normalize_provider_usage(
+        err,
+        default_provider="anthropic",
+        default_model="claude-test",
+        completed_at_ms=0,
+    )
+    assert result.input_tokens == 100
+
+
+def test_anthropic_error_event_carries_partial_usage_on_incomplete_stream(monkeypatch) -> None:
+    """A stream that ends before message_stop must still keep reported input tokens."""
+
+    body = _sse_body(_message_start_events())  # no message_stop
+    _patch_anthropic_transport(monkeypatch, body)
+
+    err = _collect_anthropic_error(AnthropicProvider(api_key="test", model="claude-test"), "hi")
+
+    assert err.code == "incomplete_stream"
+    assert err.model_usage_breakdown
+    assert err.model_usage_breakdown[0]["input_tokens"] == 100
+
+
+def test_anthropic_error_before_message_start_has_no_usage_breakdown(monkeypatch) -> None:
+    """An error before message_start means nothing was billed — keep the row empty."""
+
+    body = b"event: content_block_delta\ndata: {INVALID}\n\n"
+    _patch_anthropic_transport(monkeypatch, body)
+
+    err = _collect_anthropic_error(AnthropicProvider(api_key="test", model="claude-test"), "hi")
+
+    assert err.code == "invalid_stream_frame"
+    assert err.model_usage_breakdown == []
