@@ -414,6 +414,14 @@ claim. Because this feature updates the Windows shard assignment, the new queue
 trust policy requires the full queue matrix instead of reduced reused coverage;
 remote PR and merge-queue checks remain separate from the local results above.
 
+At pre-push, main had additionally advanced to
+`75712ec7ec6dbb67c9d92af065ec1a581e6bfe4a` (#1604 optional runtime-experiment
+cleanup). A virtual merge against that exact commit succeeds without textual
+conflicts. Overlapping Gateway configuration edits preserve deprecated fields;
+shard edits remove retired tests. The local runtime evidence remains pinned to
+the earlier baseline and does not validate these newer engine changes. Required
+PR/queue CI must validate the actual current merge state before integration.
+
 Earlier diagnostic runs on the #1597 build also encountered an unexplained
 Windows browser worker exit (`0xC0000409`) and one combined native composer/focus
 assertion failure after a two-minute flow-OFF outage. The latter did not record
