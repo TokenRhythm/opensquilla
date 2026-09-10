@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
@@ -36,6 +36,12 @@ class GeneratedArtifactAdopter:
     workspace: str | None = None
     preview_service: Any = None
     source_paths: dict[str, ArtifactSource] = field(default_factory=dict)
+
+    def with_source_paths(
+        self, source_paths: dict[str, ArtifactSource],
+    ) -> GeneratedArtifactAdopter:
+        """Bind a runtime turn's source records without mutating its caller."""
+        return replace(self, source_paths=source_paths)
 
     async def artifact_ids_for_source(self, source: ArtifactSource) -> set[str]:
         if self.workspace is None:

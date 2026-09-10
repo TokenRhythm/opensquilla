@@ -68,6 +68,9 @@ OFFLINE_MARKER_EXCLUSIONS = {
     "tests/test_skills/test_meta_skill_creator_smoke_live.py",
 }
 RECENTLY_ADDED_ACTIVE_TESTS = {
+    # Artifact source/version regressions use the declared provisional floor.
+    "tests/test_engine/test_artifact_delivery_sources.py",
+    "tests/test_engine/test_runtime_artifact_context.py",
     # New connection-stability suites use the declared 0.01s provisional floor
     # until a comparable three-run Windows refresh supplies measured timings.
     "tests/test_gateway/test_connection_stability_socket.py",
