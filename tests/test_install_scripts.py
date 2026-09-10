@@ -58,6 +58,16 @@ def test_release_installers_install_version_pinned_wheel_with_uv() -> None:
         assert "Next steps:" in script
 
 
+def test_shell_installers_fall_back_to_core_on_intel_macos() -> None:
+    scripts = [RELEASE_SH.read_text(encoding="utf-8"), SOURCE_SH.read_text(encoding="utf-8")]
+
+    for script in scripts:
+        assert '"$(uname -s)" == "Darwin"' in script
+        assert '"$(uname -m)" == "x86_64"' in script
+        assert "ONNX Runtime has no macOS x86_64 wheel" in script
+        assert 'profile="core"' in script
+
+
 def test_release_installer_rejects_non_release_selectors() -> None:
     ps1 = RELEASE_PS1.read_text(encoding="utf-8")
 
