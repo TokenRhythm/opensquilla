@@ -24,6 +24,15 @@ if (!['native', 'manual', 'signed-handoff', 'signed-cached-handoff'].includes(mo
 }
 const cachedHandoff = mode === 'signed-cached-handoff'
 const signedHandoff = mode === 'signed-handoff' || cachedHandoff
+const downloadSourceMode = process.argv.includes('--download-source-mode')
+  ? requiredOption('--download-source-mode') : 'oss'
+if (!['oss', 'github-to-oss'].includes(downloadSourceMode)) {
+  throw new Error('--download-source-mode must be oss or github-to-oss')
+}
+if (process.argv.includes('--download-source-mode') && mode !== 'signed-handoff') {
+  throw new Error('--download-source-mode requires signed-handoff download mode')
+}
+const requireSourceFallback = downloadSourceMode === 'github-to-oss'
 const stableVersion = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/
 if (signedHandoff && !process.argv.includes('--baseline-version')) {
   throw new Error('signed-handoff requires an explicit --baseline-version with the new installer capability')
@@ -136,7 +145,7 @@ const launchEnvironment = {
   GITHUB_ACTIONS: '0',
   OPENSQUILLA_DESKTOP_DISABLE_AUTO_UPDATE: '0',
   OPENSQUILLA_DESKTOP_UPDATE_CHANNEL_ROOT: channelRoot,
-  OPENSQUILLA_DESKTOP_UPDATE_SOURCE: 'oss',
+  OPENSQUILLA_DESKTOP_UPDATE_SOURCE: requireSourceFallback ? 'github' : 'oss',
   OPENSQUILLA_RECOVERY_OFFLINE: '1',
   OPENSQUILLA_TESTING: '0',
   OPENSQUILLA_DESKTOP_ENABLE_WIN_INSTALL: signedHandoff ? '1' : '0',
@@ -277,6 +286,9 @@ try {
     assert.equal(available.status, 'available', JSON.stringify(available))
     assert.equal(available.latestVersion, expectedVersion)
     assert.equal(available.source, 'oss')
+    if (requireSourceFallback) {
+      assert.equal(available.fallbackUsed, true, 'Discovery must fall back from the requested GitHub feed to OSS')
+    }
     assert.equal(available.installMode, signedHandoff ? 'manual' : mode)
     assert.ok(
       channelRequests >= 2 && channelRequests <= 4,
@@ -288,6 +300,9 @@ try {
     assert.equal(downloaded.latestVersion, expectedVersion)
     assert.equal(downloaded.progress, 100)
     assert.equal(downloaded.source, 'oss')
+    if (requireSourceFallback) {
+      assert.equal(downloaded.fallbackUsed, true, 'The verified download must retain the OSS fallback evidence')
+    }
     if (signedHandoff) {
       assert.equal(downloaded.installMode, 'manual')
       assert.equal(downloaded.canInstall, true, 'the signed candidate must pass the production installation gate')
@@ -434,6 +449,10 @@ try {
       inputMode: cachedHandoff ? 'verified-cache' : 'download',
       downloadVerified: !cachedHandoff,
       remotePublicationVerified: false,
+      downloadSourceMode: cachedHandoff ? null : downloadSourceMode,
+      sourceFallbackVerified: !cachedHandoff && requireSourceFallback,
+      discoveryScope: 'controlled loopback channel; production asset sources',
+      networkIsolationVerified: false,
       ...(cachedHandoff ? { ...cacheEvidence, cacheRestoreVerified: true } : {}),
       canInstall: true,
       sourceSha,

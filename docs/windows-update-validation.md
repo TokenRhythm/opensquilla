@@ -103,6 +103,22 @@ GitHub, missing checksum metadata, changed bytes, and offline cache reuse.
 Windows signature results are an explicit test seam in this deterministic
 test; a passing result does not prove offline Authenticode verification.
 
+The signed native download audit also accepts `DownloadSourceMode: "github-to-oss"`
+in its JSON configuration (or `-DownloadSourceMode github-to-oss` when invoking
+the signed helper directly). This mode launches the installed client with GitHub
+as its preferred asset source and requires both discovery and the verified
+download to report OSS with `fallbackUsed: true`. It refuses cached-input mode;
+legacy manual and macOS drivers retain their original OSS-only assertions.
+
+The audit still serves a controlled loopback channel and uses production asset
+URLs. Its `sourceFallbackVerified` result proves application fallback, not that
+GitHub was blocked at the OS network layer: an HTTP error can also cause fallback.
+`networkIsolationVerified` and `remotePublicationVerified` remain false. Attach
+independent guest network controls and negative/positive connection probes before
+crediting the GitHub-unreachable native cell. Default remote channel discovery
+requires its own evidence without a channel-root override. Neither this mode nor
+a passing driver contract opens the default activation gate.
+
 For native acceptance, test a disposable Windows 10/11 environment with GitHub
 unreachable while the complete OSS release is reachable. Include the channel
 JSON, `latest.yml`, installer, and `SHA256SUMS`; OSS promotion must occur only
