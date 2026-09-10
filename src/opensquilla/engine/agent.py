@@ -16618,11 +16618,11 @@ class Agent:
             return message.model_copy(update={"content": f"{message.content}\n\n{runtime_content}"})
         if isinstance(message.content, list):
             return message.model_copy(
-                       update={"content": [
-                           *message.content,
-                           ContentBlockText(text=f"\n\n{runtime_content}"),
-                       ]},
-                   )
+                update={"content": [
+                    *message.content,
+                    ContentBlockText(text=f"\n\n{runtime_content}"),
+                ]},
+            )
         return runtime_context_message
 
     @staticmethod
