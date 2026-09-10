@@ -1,21 +1,7 @@
-import assert from 'node:assert/strict'
 import { readFile } from 'node:fs/promises'
-
-import {
-  DESKTOP_ARTIFACT_BRIDGE_CONTRACT,
-  DESKTOP_ARTIFACT_BRIDGE_UNSUPPORTED_CAPABILITIES,
-  parseDesktopArtifactBrowserActRequest,
-  parseDesktopArtifactBrowserInspectRequest,
-  parseDesktopArtifactBindCandidatePreviewRequest,
-  parseDesktopArtifactCaptureSelectionRequest,
-  parseDesktopArtifactFocusAnnotationRequest,
-  parseDesktopArtifactOfficeFlushRequest,
-  parseDesktopArtifactReloadSurfaceRequest,
-  parseDesktopArtifactRestoreCanonicalPreviewRequest,
-  parseDesktopArtifactResolveAnnotationSelectionRequest,
-  parseDesktopArtifactScreenshotRequest,
-} from '../dist/desktop-artifact-bridge-contract.js'
-import { DesktopArtifactBridge } from '../dist/desktop-artifact-bridge.js'
+import assert from 'node:assert/strict'
+import { randomUUID } from 'node:crypto'
+import { DesktopBrowserError } from '../dist/desktop-browser.js'
 import {
   parseNativeWorkbenchAnnotationGeometry,
   parseNativeWorkbenchAnnotationModeRequest,
@@ -28,6 +14,7 @@ import {
   clampNativeWorkbenchSurfaceRect,
   NATIVE_WORKBENCH_CAPABILITIES,
   NATIVE_WORKBENCH_MAX_HTML_BYTES,
+  NATIVE_WORKBENCH_PROTOCOL_VERSION_V4,
   nativeWorkbenchArtifactRequestIsDocument,
   nativeWorkbenchArtifactUrl,
   nativeWorkbenchCssRectToDip,
@@ -37,6 +24,7 @@ import {
   nativeWorkbenchV2NetworkUrlAllowed,
   parseNativeWorkbenchCreateRequest,
   parseNativeWorkbenchNavigationRequest,
+  parseNativeWorkbenchNavigationUrl,
   parseNativeWorkbenchPermissionResponse,
   parseNativeWorkbenchSurfaceId,
   parseNativeWorkbenchSurfaceRectRequest,
@@ -46,6 +34,129 @@ const nativeWorkbenchSurfaceRuntime = await readFile(
   new URL('../dist/native-workbench-surface.js', import.meta.url),
   'utf8',
 )
+// Exercise the compiled manager method without starting an Electron application.
+const browserExecutorStart = nativeWorkbenchSurfaceRuntime.indexOf('    async executeBrowser(')
+const browserExecutorEnd = nativeWorkbenchSurfaceRuntime.indexOf('    async snapshotBrowser(', browserExecutorStart)
+assert.ok(browserExecutorStart >= 0 && browserExecutorEnd > browserExecutorStart)
+const executeBrowser = new Function(
+  'DesktopBrowserError', 'randomUUID', 'parseNativeWorkbenchNavigationUrl', 'NATIVE_WORKBENCH_PROTOCOL_VERSION_V4',
+  `return ({${nativeWorkbenchSurfaceRuntime.slice(browserExecutorStart, browserExecutorEnd)}}).executeBrowser`,
+)(DesktopBrowserError, randomUUID, parseNativeWorkbenchNavigationUrl, NATIVE_WORKBENCH_PROTOCOL_VERSION_V4)
+
+async function assertBrowserOpenPreservesForeground(sessionKey, switchWhileOpening, failure = null) {
+  const foreground = { id: 'foreground', visible: true, requestedRect: { x: 180, y: 90, width: 700, height: 500 } }
+  const switched = { id: 'switched', visible: false, requestedRect: { x: 240, y: 110, width: 620, height: 480 } }
+  const events = []
+  const rectCalls = []
+  const commands = []
+  const destroyed = []
+  const controller = new AbortController()
+  const setError = new Error('Synthetic viewport initialization failure')
+  const clearError = new Error('Synthetic viewport cleanup failure')
+  let openingRecord
+  let ownerDestroyed = false
+  let finishOpening
+  const opening = new Promise(resolve => { finishOpening = resolve })
+  const manager = {
+    surfaces: new Map([[foreground.id, foreground], [switched.id, switched]]),
+    activeSurfaceId: foreground.id,
+    isPrivilegedGatewayTarget: () => false,
+    async createSurface(request) {
+      openingRecord = {
+        id: request.surfaceId, scopeId: request.payload.scopeId, kind: request.kind,
+        url: request.payload.url, targetRef: `target-${request.surfaceId}`, visible: false,
+        owner: { isDestroyed: () => ownerDestroyed },
+        view: { webContents: { isDestroyed: () => false } },
+      }
+      this.surfaces.set(request.surfaceId, openingRecord)
+      await opening
+      return { ok: true }
+    },
+    async queueSurfaceOperation(key, operation) {
+      assert.equal(key, `operation:${openingRecord.targetRef}`)
+      return await operation()
+    },
+    async cdpCommand(record, method, params, beforeSend) {
+      beforeSend?.()
+      assert.equal(record, openingRecord)
+      assert.deepEqual(events, [], 'the UI must not adopt before viewport initialization completes')
+      commands.push({ method, params })
+      if (method === 'Emulation.setDeviceMetricsOverride') {
+        if (failure === 'cancel') controller.abort()
+        if (failure === 'owner-close') ownerDestroyed = true
+        if (failure === 'replace') this.surfaces.set(record.id, { ...record, targetRef: 'replacement-target' })
+        if (failure === 'close') { record.disposed = true; this.surfaces.delete(record.id) }
+        if (failure === 'set' || failure === 'both') throw setError
+      }
+      if (method === 'Emulation.clearDeviceMetricsOverride' && (failure === 'clear' || failure === 'both')) throw clearError
+    },
+    async destroyRecord(record) {
+      assert.equal(this.surfaces.get(record.id), record, 'initialization cleanup must never destroy a replacement')
+      destroyed.push(record)
+      this.surfaces.delete(record.id)
+    },
+    setSurfaceRect(request) {
+      rectCalls.push(request)
+      if (request.visible) {
+        for (const record of this.surfaces.values()) record.visible = record.id === request.surfaceId
+        this.activeSurfaceId = request.surfaceId
+      }
+    },
+    describeBrowserRecord: record => ({ targetRef: record.targetRef, sessionKey: record.scopeId, url: record.url }),
+    getBrowserTarget(surfaceId) { return this.describeBrowserRecord(this.surfaces.get(surfaceId)) },
+    emit(record, type, detail) { events.push({ surfaceId: record.id, type, detail }) },
+  }
+  const pending = executeBrowser.call(manager, { operation: 'open', sessionKey, url: 'https://example.test/background' }, controller.signal)
+  if (switchWhileOpening) {
+    foreground.visible = false
+    switched.visible = true
+    manager.activeSurfaceId = switched.id
+  }
+  finishOpening()
+  let target
+  if (failure) {
+    await assert.rejects(pending, error => {
+      if (failure === 'set' || failure === 'both') return error === setError
+      if (failure === 'clear') return error === clearError
+      return error.code === (failure === 'cancel' ? 'TIMEOUT' : 'TARGET_NOT_FOUND')
+    })
+  } else target = await pending
+  const expectedForeground = switchWhileOpening ? switched : foreground
+  assert.equal(manager.activeSurfaceId, expectedForeground.id, 'agent open must not replace the user-selected foreground')
+  assert.equal(expectedForeground.visible, true)
+  assert.deepEqual(rectCalls, [], 'only the adopting UI may assign a visible layout rectangle')
+  assert.deepEqual(commands[0], { method: 'Emulation.setDeviceMetricsOverride',
+    params: { width: 960, height: 720, deviceScaleFactor: 0, mobile: false } })
+  if (failure === 'replace' || failure === 'close' || failure === 'owner-close') {
+    assert.equal(commands.length, 1, 'no cleanup command may target a replaced or closed page')
+    assert.deepEqual(destroyed, failure === 'owner-close' ? [openingRecord] : [])
+    if (failure === 'replace') assert.equal(manager.surfaces.get(openingRecord.id).targetRef, 'replacement-target')
+  } else {
+    assert.deepEqual(commands[1], { method: 'Emulation.clearDeviceMetricsOverride', params: undefined })
+    assert.equal(commands.length, 2)
+  }
+  if (failure) {
+    assert.deepEqual(events, [])
+    if (failure !== 'replace' && failure !== 'close') assert.deepEqual(destroyed, [openingRecord])
+    return
+  }
+  assert.deepEqual(destroyed, [])
+  const created = [...manager.surfaces.values()].find(record => record.targetRef === target.targetRef)
+  assert.ok(created, 'a background target must remain available, not be destroyed')
+  assert.equal(created.visible, false)
+  assert.deepEqual((await executeBrowser.call(manager, { operation: 'list', sessionKey }, new AbortController().signal)).targets, [target])
+  assert.deepEqual(events, [{ surfaceId: created.id, type: 'browser-opened', detail: {
+    url: target.url, title: undefined, sessionKey, targetRef: target.targetRef,
+  } }])
+}
+for (const sessionKey of ['foreground-session', 'background-session']) {
+  await assertBrowserOpenPreservesForeground(sessionKey, false)
+  await assertBrowserOpenPreservesForeground(sessionKey, true)
+}
+for (const failure of ['set', 'clear', 'both', 'cancel', 'replace', 'close', 'owner-close']) {
+  await assertBrowserOpenPreservesForeground('background-session', false, failure)
+}
+
 const annotationHighlightConfig = nativeWorkbenchSurfaceRuntime.match(
   /const NATIVE_WORKBENCH_ANNOTATION_HIGHLIGHT_CONFIG = Object\.freeze\(\{([\s\S]*?)\n\}\);/,
 )?.[1]
@@ -56,116 +167,6 @@ assert.match(
   annotationHighlightConfig,
   /borderColor:\s*\{\s*r:\s*25,\s*g:\s*118,\s*b:\s*255,\s*a:\s*0\.95\s*\}/,
   'annotation selection must retain its visible blue border',
-)
-assert.match(
-  nativeWorkbenchSurfaceRuntime,
-  /NATIVE_WORKBENCH_BROWSER_SNAPSHOT_FUNCTION/,
-  'v4 HTML surfaces must expose a fixed browser snapshot function',
-)
-assert.match(
-  nativeWorkbenchSurfaceRuntime,
-  /NATIVE_WORKBENCH_BROWSER_TYPE_FUNCTION/,
-  'v4 HTML surfaces must expose bounded text input',
-)
-assert.match(
-  nativeWorkbenchSurfaceRuntime,
-  /closest\('form'\)[\s\S]*?side-effect-node/,
-  'browser actions must reject form and navigation side effects',
-)
-assert.match(
-  nativeWorkbenchSurfaceRuntime,
-  /Runtime\.exceptionThrown[\s\S]*?browserRuntimeException/,
-  'runtime exceptions must invalidate browser verification',
-)
-assert.match(
-  nativeWorkbenchSurfaceRuntime,
-  /record\.version === NATIVE_WORKBENCH_PROTOCOL_VERSION_V4[\s\S]*?browserInspect:/,
-  'browser inspection must be gated on protocol-v4',
-)
-assert.match(
-  nativeWorkbenchSurfaceRuntime,
-  /browserDocumentReady[\s\S]*?did-finish-load/,
-  'browser inspection must wait for a completed preview load',
-)
-assert.match(
-  nativeWorkbenchSurfaceRuntime,
-  /activePreviewArtifactId: record\.activePreviewArtifactId[\s\S]*?candidateHandle: record\.candidatePreview\?\.handle \?\? null/,
-  'browser snapshots must carry the active candidate identity',
-)
-assert.match(
-  nativeWorkbenchSurfaceRuntime,
-  /anchor\.candidateHandle !== \(record\.candidatePreview\?\.handle \?\? null\)/,
-  'browser anchors must remain bound to the candidate handle that carries SHA/epoch authority',
-)
-assert.match(
-  nativeWorkbenchSurfaceRuntime,
-  /async inspectBrowser\([\s\S]*?assertCandidateRequestBinding\(record, request\.candidateHandle\)[\s\S]*?record\.browserAnchors = anchors/,
-  'stale candidate inspections must not overwrite the active anchor table',
-)
-assert.match(
-  nativeWorkbenchSurfaceRuntime,
-  /record\.kind === 'artifact-preview'[\s\S]*?record\.version === NATIVE_WORKBENCH_PROTOCOL_VERSION_V4[\s\S]*?targetUrl !== record\.documentUrl[\s\S]*?agent-preview-navigation-denied/,
-  'v4 agent previews must reject renderer top-level navigation away from the trusted URL',
-)
-assert.match(
-  nativeWorkbenchSurfaceRuntime,
-  /record\.kind === 'artifact-preview'[\s\S]*?request\.action === 'back'[\s\S]*?request\.action === 'open-external'[\s\S]*?NAVIGATION_BLOCKED/,
-  'v4 agent preview IPC must reject history and external navigation bypasses',
-)
-assert.match(
-  nativeWorkbenchSurfaceRuntime,
-  /browserAct:\s*\([\s\S]*?record\.candidatePreview !== null[\s\S]*?record\.activePreviewArtifactId === record\.candidatePreview\.artifactId[\s\S]*?record\.mode === 'offline'/,
-  'browser actions must be advertised only for an offline candidate preview',
-)
-assert.match(
-  nativeWorkbenchSurfaceRuntime,
-  /async actBrowser\([\s\S]*?record\.candidatePreview === null[\s\S]*?record\.mode !== 'offline'/,
-  'browser actions must fail closed when the candidate binding is absent or full-network',
-)
-assert.match(
-  nativeWorkbenchSurfaceRuntime,
-  /assertCandidateRequestBinding\([\s\S]*?candidateHandle !== candidate\.handle[\s\S]*?candidateHandle !== undefined/,
-  'browser side effects must remain bound to the opaque candidate handle observed by the turn',
-)
-assert.match(
-  nativeWorkbenchSurfaceRuntime,
-  /binding\.mode !== 'offline'[\s\S]*?effectiveCandidateMode = 'offline'/,
-  'candidate preview bindings must be offline-only even when the process override is disabled',
-)
-assert.match(
-  nativeWorkbenchSurfaceRuntime,
-  /restoreCanonicalPreview\(\s*record,[\s\S]*?candidateHandle[\s\S]*?candidate\.handle !== candidateHandle/,
-  'a stale turn must not restore a newer candidate preview',
-)
-assert.match(
-  nativeWorkbenchSurfaceRuntime,
-  /const isCurrentRecord = this\.surfaces\.get\(record\.id\) === record[\s\S]*?if \(isCurrentRecord && this\.activeSurfaceId === record\.id\)/,
-  'a stale replacement teardown must not clear the new active surface binding',
-)
-assert.match(
-  nativeWorkbenchSurfaceRuntime,
-  /activeCandidatePreview[\s\S]*?nativeWorkbenchDownloadAllowed\(item\.hasUserGesture\(\), activeCandidatePreview\)/,
-  'candidate previews must never be downloadable while canonical previews retain gesture-gated saves',
-)
-assert.match(
-  nativeWorkbenchSurfaceRuntime,
-  /NATIVE_WORKBENCH_OFFLINE_REALM_GUARD\s*=\s*nativeWorkbenchOfflineRealmGuardSource\(false\)/,
-  'legacy offline previews must retain the WebRTC-only compatibility guard',
-)
-assert.match(
-  nativeWorkbenchSurfaceRuntime,
-  /NATIVE_WORKBENCH_CANDIDATE_OFFLINE_REALM_GUARD\s*=\s*\n?\s*nativeWorkbenchOfflineRealmGuardSource\(true\)/,
-  'candidate previews must use the stricter network side-effect guard',
-)
-assert.match(
-  nativeWorkbenchSurfaceRuntime,
-  /installOfflineRealmGuard\(record, true\)/,
-  'the strict offline guard must only be installed for a candidate bind',
-)
-assert.match(
-  nativeWorkbenchSurfaceRuntime,
-  /restoreCanonicalPreview[\s\S]*?removeOfflineRealmGuard\(record, true\)/,
-  'restoring canonical preview must remove the candidate-only guard first',
 )
 assert.match(
   nativeWorkbenchSurfaceRuntime,
@@ -186,11 +187,6 @@ assert.match(
   nativeWorkbenchSurfaceRuntime,
   /surfaceInstanceId: randomUUID\(\)[\s\S]*?return \{ ok: true, surfaceInstanceId: record\.surfaceInstanceId \}/,
   'surface creation must return the exact instance identity used to fence late picker events',
-)
-assert.match(
-  nativeWorkbenchSurfaceRuntime,
-  /annotationRecordForCleanupRequest\(surfaceId\) \{[\s\S]*?record\.kind === 'artifact-preview'[\s\S]*?isArtifactBridgeProtocolVersion\(record\.version\)[\s\S]*?!record\.disposed/,
-  'picker cleanup lookup must remain scoped to an undisposed artifact preview',
 )
 assert.match(
   nativeWorkbenchSurfaceRuntime,
@@ -243,18 +239,6 @@ assert.equal(
   }).payload.allowRemoteResources,
   true,
 )
-
-assert.deepEqual(NATIVE_WORKBENCH_CAPABILITIES, {
-  latestVersion: 4,
-  protocolVersions: [1, 2, 3, 4],
-  versions: [1, 2, 3, 4],
-  kinds: ['artifact-html', 'artifact-preview', 'url-preview'],
-  modes: ['full', 'offline'],
-  navigationActions: ['navigate', 'back', 'forward', 'reload', 'stop', 'open-external'],
-  permissionResponses: true,
-  artifactBridge: DESKTOP_ARTIFACT_BRIDGE_CONTRACT,
-  maxSurfaces: 8,
-})
 
 const previewOrigin = 'http://p-0123456789abcdef0123456789abcdef.localhost:48721'
 const parsedArtifactV2 = parseNativeWorkbenchCreateRequest({
@@ -435,163 +419,6 @@ assert.deepEqual(
     allow: false,
   },
 )
-
-assert.deepEqual(
-  parseDesktopArtifactCaptureSelectionRequest({ version: 3 }),
-  { version: 3 },
-)
-const selectionDigest = 'a'.repeat(64)
-const selectionElementProof = 'b'.repeat(64)
-const selectionStableElementProof = 'c'.repeat(64)
-const selectionAncestorClassCommitments = ['d'.repeat(64), 'e'.repeat(64)]
-const selectionProofV2 = {
-  stableElementProofSha256: selectionStableElementProof,
-  ancestorClassCommitments: selectionAncestorClassCommitments,
-}
-const activePreviewArtifactId = 'art-synthetic-preview'
-const selectionPath = JSON.stringify([
-  ['', 'html', 1],
-  ['', 'body', 1],
-  ['', 'button', 2],
-])
-assert.deepEqual(
-  parseDesktopArtifactResolveAnnotationSelectionRequest({
-    version: 3,
-    activePreviewArtifactId,
-    selectionId: 'selection_42',
-    tagName: 'button',
-    elementPath: selectionPath,
-    domSha256: selectionDigest,
-    elementProofSha256: selectionElementProof,
-  }),
-  {
-    version: 3,
-    activePreviewArtifactId,
-    selectionId: 'selection_42',
-    tagName: 'button',
-    elementPath: selectionPath,
-    domSha256: selectionDigest,
-    elementProofSha256: selectionElementProof,
-  },
-)
-assert.deepEqual(
-  parseDesktopArtifactResolveAnnotationSelectionRequest({
-    version: 3,
-    activePreviewArtifactId,
-    selectionId: 'selection_without_dom_digest',
-    tagName: 'button',
-    elementPath: selectionPath,
-    elementProofSha256: selectionElementProof,
-  }),
-  {
-    version: 3,
-    activePreviewArtifactId,
-    selectionId: 'selection_without_dom_digest',
-    tagName: 'button',
-    elementPath: selectionPath,
-    elementProofSha256: selectionElementProof,
-  },
-)
-assert.deepEqual(
-  parseDesktopArtifactFocusAnnotationRequest({
-    version: 3,
-    activePreviewArtifactId,
-    annotationId: 'annotation_42',
-    scopeId: 'synthetic:scope',
-    tagName: 'button',
-    elementPath: selectionPath,
-    elementProofSha256: selectionElementProof,
-  }),
-  {
-    version: 3,
-    activePreviewArtifactId,
-    annotationId: 'annotation_42',
-    scopeId: 'synthetic:scope',
-    tagName: 'button',
-    elementPath: selectionPath,
-    elementProofSha256: selectionElementProof,
-  },
-)
-assert.deepEqual(
-  parseDesktopArtifactFocusAnnotationRequest({
-    version: 3,
-    activePreviewArtifactId,
-    annotationId: 'annotation_v2',
-    scopeId: 'synthetic:scope',
-    tagName: 'button',
-    elementPath: selectionPath,
-    elementProofSha256: selectionElementProof,
-    annotationProofV2: selectionProofV2,
-  }),
-  {
-    version: 3,
-    activePreviewArtifactId,
-    annotationId: 'annotation_v2',
-    scopeId: 'synthetic:scope',
-    tagName: 'button',
-    elementPath: selectionPath,
-    elementProofSha256: selectionElementProof,
-    annotationProofV2: selectionProofV2,
-  },
-)
-for (const annotationProofV2 of [
-  {
-    ...selectionProofV2,
-    ancestorClassCommitments: [...selectionAncestorClassCommitments].reverse(),
-  },
-  {
-    ...selectionProofV2,
-    ancestorClassCommitments: [selectionAncestorClassCommitments[0], selectionAncestorClassCommitments[0]],
-  },
-  {
-    ...selectionProofV2,
-    ancestorClassCommitments: Array.from(
-      { length: 257 },
-      (_value, index) => index.toString(16).padStart(64, '0'),
-    ),
-  },
-  {
-    ...selectionProofV2,
-    unexpected: true,
-  },
-]) {
-  assert.throws(
-    () => parseDesktopArtifactFocusAnnotationRequest({
-      version: 3,
-      activePreviewArtifactId,
-      annotationId: 'annotation_invalid_v2',
-      scopeId: 'synthetic:scope',
-      tagName: 'button',
-      elementPath: selectionPath,
-      elementProofSha256: selectionElementProof,
-      annotationProofV2,
-    }),
-    /annotation proof-v2 is invalid/,
-  )
-}
-assert.throws(
-  () => parseDesktopArtifactResolveAnnotationSelectionRequest({
-    version: 3,
-    activePreviewArtifactId,
-    selectionId: 'selection_42',
-    tagName: 'button',
-    elementPath: selectionPath,
-    domSha256: selectionDigest,
-  }),
-  /annotation selection is invalid/,
-)
-assert.throws(
-  () => parseDesktopArtifactFocusAnnotationRequest({
-    version: 3,
-    activePreviewArtifactId,
-    annotationId: 'annotation_42',
-    scopeId: 'synthetic:scope',
-    tagName: 'button',
-    elementPath: selectionPath,
-    domSha256: selectionDigest,
-  }),
-  /annotation focus request is invalid/,
-)
 assert.deepEqual(
   parseNativeWorkbenchAnnotationModeRequest({
     version: 3,
@@ -735,26 +562,6 @@ assert.deepEqual(
   { version: 1, type: 'cancel' },
 )
 assert.deepEqual(
-  parseNativeWorkbenchAnnotationSelection({
-    tagName: 'button',
-    elementPath: selectionPath,
-    elementProofSha256: selectionElementProof,
-    annotationProofV2: selectionProofV2,
-    rect: { x: 1, y: 2, width: 30, height: 20 },
-    viewportWidth: 800,
-    viewportHeight: 600,
-  }),
-  {
-    tagName: 'button',
-    elementPath: selectionPath,
-    elementProofSha256: selectionElementProof,
-    annotationProofV2: selectionProofV2,
-    rect: { x: 1, y: 2, width: 30, height: 20 },
-    viewportWidth: 800,
-    viewportHeight: 600,
-  },
-)
-assert.deepEqual(
   parseNativeWorkbenchAnnotationGeometry({
     ok: true,
     rect: { x: -4, y: 2, width: 30, height: 20 },
@@ -776,414 +583,7 @@ assert.throws(
   }),
   /geometry is invalid/,
 )
-assert.deepEqual(
-  parseDesktopArtifactBrowserInspectRequest({
-    version: 3,
-    scope: 'viewport',
-    maxNodes: 100,
-  }),
-  { version: 3, scope: 'viewport', maxNodes: 100 },
-)
-assert.deepEqual(
-  parseDesktopArtifactBrowserInspectRequest({
-    version: 4,
-    scope: 'document',
-    maxNodes: 20,
-    identityOnly: true,
-    candidateHandle: 'candidate_0123456789abcdef',
-  }),
-  {
-    version: 4,
-    scope: 'document',
-    maxNodes: 20,
-    identityOnly: true,
-    candidateHandle: 'candidate_0123456789abcdef',
-  },
-)
-assert.deepEqual(
-  parseDesktopArtifactBrowserActRequest({
-    version: 4,
-    action: 'click',
-    anchor: 'a1',
-    candidateHandle: 'candidate_0123456789abcdef',
-  }),
-  {
-    version: 4,
-    action: 'click',
-    anchor: 'a1',
-    candidateHandle: 'candidate_0123456789abcdef',
-  },
-)
-assert.deepEqual(
-  parseDesktopArtifactBindCandidatePreviewRequest({
-    version: 4,
-    candidateHandle: 'candidate_0123456789abcdef',
-  }),
-  { version: 4, candidateHandle: 'candidate_0123456789abcdef' },
-)
-assert.deepEqual(
-  parseDesktopArtifactRestoreCanonicalPreviewRequest({
-    version: 4,
-    candidateHandle: 'candidate_0123456789abcdef',
-  }),
-  { version: 4, candidateHandle: 'candidate_0123456789abcdef' },
-)
-assert.deepEqual(
-  parseDesktopArtifactBrowserActRequest({
-    version: 3,
-    action: 'type',
-    anchor: 'node_42',
-    text: 'Synthetic input',
-    replace: true,
-  }),
-  {
-    version: 3,
-    action: 'type',
-    anchor: 'node_42',
-    text: 'Synthetic input',
-    replace: true,
-  },
-)
-assert.deepEqual(parseDesktopArtifactScreenshotRequest({ version: 3 }), { version: 3 })
-assert.deepEqual(
-  parseDesktopArtifactScreenshotRequest({
-    version: 4,
-    candidateHandle: 'candidate_0123456789abcdef',
-  }),
-  { version: 4, candidateHandle: 'candidate_0123456789abcdef' },
-)
-assert.deepEqual(parseDesktopArtifactOfficeFlushRequest({ version: 3 }), { version: 3 })
-assert.deepEqual(parseDesktopArtifactReloadSurfaceRequest({ version: 3 }), { version: 3 })
-assert.deepEqual(
-  parseDesktopArtifactReloadSurfaceRequest({
-    version: 4,
-    candidateHandle: 'candidate_0123456789abcdef',
-  }),
-  { version: 4, candidateHandle: 'candidate_0123456789abcdef' },
-)
 
-for (const [parse, payload] of [
-  [parseDesktopArtifactCaptureSelectionRequest, { version: 3, surfaceId: 'model-choice' }],
-  [parseDesktopArtifactResolveAnnotationSelectionRequest, {
-    version: 3,
-    activePreviewArtifactId,
-    selectionId: 'selection_42',
-    tagName: 'button',
-    elementPath: selectionPath,
-    domSha256: selectionDigest,
-    elementProofSha256: selectionElementProof,
-    url: 'file:///synthetic/secret',
-  }],
-  [parseDesktopArtifactFocusAnnotationRequest, {
-    version: 3,
-    activePreviewArtifactId,
-    annotationId: 'annotation_42',
-    scopeId: 'synthetic:scope',
-    tagName: 'button',
-    elementPath: selectionPath,
-    elementProofSha256: selectionElementProof,
-    selector: '#renderer-controlled',
-  }],
-  [parseDesktopArtifactBrowserInspectRequest, {
-    version: 3,
-    scope: 'document',
-    maxNodes: 20,
-    url: 'https://example.test',
-  }],
-  [parseDesktopArtifactBrowserInspectRequest, {
-    version: 3,
-    scope: 'document',
-    maxNodes: 20,
-    expression: 'document.cookie',
-  }],
-  [parseDesktopArtifactBrowserInspectRequest, {
-    version: 4,
-    scope: 'document',
-    maxNodes: 20,
-    candidateHandle: 'not-a-candidate-handle',
-  }],
-  [parseDesktopArtifactBrowserActRequest, {
-    version: 3,
-    action: 'click',
-    anchor: 'node_42',
-    cdpMethod: 'Runtime.evaluate',
-  }],
-  [parseDesktopArtifactBrowserActRequest, {
-    version: 3,
-    action: 'click',
-    selector: '#dangerous-arbitrary-selector',
-  }],
-  [parseDesktopArtifactBrowserActRequest, {
-    version: 4,
-    action: 'press',
-    key: 'Enter',
-    candidateHandle: 'https://example.invalid/candidate',
-  }],
-  [parseDesktopArtifactScreenshotRequest, { version: 3, surfaceId: 'model-choice' }],
-  [parseDesktopArtifactScreenshotRequest, {
-    version: 4,
-    candidateHandle: 'not-a-candidate-handle',
-  }],
-  [parseDesktopArtifactOfficeFlushRequest, { version: 3, adapter: 'renderer-chosen' }],
-  [parseDesktopArtifactReloadSurfaceRequest, { version: 3, url: 'file:///secret' }],
-  [parseDesktopArtifactReloadSurfaceRequest, {
-    version: 4,
-    candidateHandle: 'not-a-candidate-handle',
-  }],
-]) {
-  assert.throws(() => parse(payload), /Desktop artifact|browser anchor/)
-}
-assert.throws(
-  () => parseDesktopArtifactBrowserActRequest({
-    version: 3,
-    action: 'press',
-    key: 'F12',
-  }),
-  /supported Desktop artifact browser key/,
-)
-
-const unavailableBridge = new DesktopArtifactBridge({ getActiveTarget: () => null })
-assert.deepEqual(
-  unavailableBridge.getCapabilities(),
-  DESKTOP_ARTIFACT_BRIDGE_UNSUPPORTED_CAPABILITIES,
-)
-assert.deepEqual(
-  await unavailableBridge.captureSelection({ version: 3 }),
-  {
-    ok: false,
-    method: 'captureSelection',
-    code: 'unavailable',
-    message: 'No active protocol-v4 Desktop artifact surface is available.',
-  },
-)
-assert.equal(
-  (await unavailableBridge.screenshot({ version: 3, surfaceId: 'model-choice' })).code,
-  'invalid-request',
-)
-
-const missingHandlerBridge = new DesktopArtifactBridge({
-  getActiveTarget: () => ({
-    isCurrent: () => true,
-    capabilities: {
-      captureSelection: true,
-      resolveAnnotationSelection: false,
-      focusAnnotation: false,
-      browserInspect: false,
-      browserAct: false,
-      bindCandidatePreview: false,
-      restoreCanonicalPreview: false,
-      screenshot: false,
-      officeFlush: false,
-      reloadSurface: false,
-    },
-  }),
-})
-assert.equal(missingHandlerBridge.getCapabilities().available, true)
-assert.equal(missingHandlerBridge.getCapabilities().captureSelection, false)
-assert.equal(
-  (await missingHandlerBridge.captureSelection({ version: 3 })).code,
-  'unsupported',
-)
-assert.equal(
-  (await missingHandlerBridge.bindCandidatePreview({
-    version: 4,
-    candidateHandle: 'candidate_0123456789abcdef',
-  })).code,
-  'unsupported',
-)
-assert.equal(
-  (await missingHandlerBridge.restoreCanonicalPreview({
-    version: 4,
-    candidateHandle: 'candidate_0123456789abcdef',
-  })).code,
-  'unsupported',
-)
-
-const bridgeCalls = []
-const controlledBridge = new DesktopArtifactBridge({
-  getActiveTarget: () => ({
-    isCurrent: () => true,
-    capabilities: {
-      annotationProofV2: true,
-      captureSelection: true,
-      resolveAnnotationSelection: true,
-      focusAnnotation: true,
-      browserInspect: true,
-      browserAct: true,
-      bindCandidatePreview: false,
-      restoreCanonicalPreview: false,
-      screenshot: true,
-      officeFlush: false,
-      reloadSurface: true,
-    },
-    captureSelection: async request => {
-      bridgeCalls.push(['captureSelection', request])
-      return { kind: 'text', anchor: 'selection_1', text: 'Synthetic selection' }
-    },
-    resolveAnnotationSelection: async request => {
-      bridgeCalls.push(['resolveAnnotationSelection', request])
-      return {
-        activePreviewArtifactId: request.activePreviewArtifactId,
-        selectionId: request.selectionId,
-        tagName: request.tagName,
-        elementPath: request.elementPath,
-        ...(request.domSha256 === undefined ? {} : { domSha256: request.domSha256 }),
-        elementProofSha256: request.elementProofSha256,
-        scopeId: 'synthetic:scope',
-        rect: { x: 1, y: 2, width: 30, height: 20 },
-      }
-    },
-    focusAnnotation: async request => {
-      bridgeCalls.push(['focusAnnotation', request])
-      return {
-        focused: true,
-        activePreviewArtifactId: request.activePreviewArtifactId,
-      }
-    },
-    browserInspect: async request => {
-      bridgeCalls.push(['browserInspect', request])
-      return {
-        scope: request.scope,
-        nodes: [{ anchor: 'node_42', role: 'button', name: 'Run' }],
-        truncated: false,
-      }
-    },
-    browserAct: async request => {
-      bridgeCalls.push(['browserAct', request])
-      return { performed: true, changed: request.action === 'type' }
-    },
-    screenshot: async request => {
-      bridgeCalls.push(['screenshot', request])
-      return {
-        mime: 'image/png',
-        data: Uint8Array.of(137, 80, 78, 71),
-        width: 1,
-        height: 1,
-      }
-    },
-    reloadSurface: async request => {
-      bridgeCalls.push(['reloadSurface', request])
-      return { reloaded: true }
-    },
-  }),
-})
-assert.deepEqual(controlledBridge.getCapabilities(), {
-  version: 4,
-  available: true,
-  captureSelection: true,
-  resolveAnnotationSelection: true,
-  focusAnnotation: true,
-  annotationProofV2: true,
-  browserInspect: false,
-  browserAct: false,
-  bindCandidatePreview: false,
-  restoreCanonicalPreview: false,
-  screenshot: true,
-  officeFlush: false,
-  reloadSurface: true,
-})
-assert.equal(controlledBridge.getCapabilities(5).browserInspect, true)
-assert.equal(controlledBridge.getCapabilities(5).browserAct, true)
-assert.equal((await controlledBridge.captureSelection({ version: 3 })).ok, true)
-assert.equal((await controlledBridge.resolveAnnotationSelection({
-  version: 3,
-  activePreviewArtifactId,
-  selectionId: 'selection_42',
-  tagName: 'button',
-  elementPath: selectionPath,
-  domSha256: selectionDigest,
-  elementProofSha256: selectionElementProof,
-})).ok, true)
-assert.equal((await controlledBridge.focusAnnotation({
-  version: 3,
-  activePreviewArtifactId,
-  annotationId: 'annotation_42',
-  scopeId: 'synthetic:scope',
-  tagName: 'button',
-  elementPath: selectionPath,
-  elementProofSha256: selectionElementProof,
-})).ok, true)
-assert.equal((await controlledBridge.browserInspect({
-  version: 3,
-  scope: 'viewport',
-  maxNodes: 20,
-})).ok, true)
-assert.equal((await controlledBridge.browserAct({
-  version: 3,
-  action: 'type',
-  anchor: 'node_42',
-  text: 'Synthetic input',
-  replace: true,
-})).ok, true)
-assert.equal((await controlledBridge.screenshot({ version: 3 })).ok, true)
-assert.equal((await controlledBridge.officeFlush({ version: 3 })).code, 'unsupported')
-assert.equal((await controlledBridge.reloadSurface({ version: 3 })).ok, true)
-assert.deepEqual(
-  bridgeCalls.map(([method]) => method),
-  [
-    'captureSelection',
-    'resolveAnnotationSelection',
-    'focusAnnotation',
-    'browserInspect',
-    'browserAct',
-    'screenshot',
-    'reloadSurface',
-  ],
-)
-
-const candidateBridgeCalls = []
-const candidateBridge = new DesktopArtifactBridge({
-  getActiveTarget: () => ({
-    isCurrent: () => true,
-    capabilities: {
-      bindCandidatePreview: true,
-      restoreCanonicalPreview: true,
-    },
-    bindCandidatePreview: async request => {
-      candidateBridgeCalls.push(['bindCandidatePreview', request])
-      return { bound: true, candidateHandle: request.candidateHandle }
-    },
-    restoreCanonicalPreview: async request => {
-      candidateBridgeCalls.push(['restoreCanonicalPreview', request])
-      return { restored: true }
-    },
-  }),
-})
-assert.equal((await candidateBridge.bindCandidatePreview({
-  version: 4,
-  candidateHandle: 'candidate_0123456789abcdef',
-})).ok, true)
-assert.equal((await candidateBridge.restoreCanonicalPreview({
-  version: 4,
-  candidateHandle: 'candidate_0123456789abcdef',
-})).ok, true)
-assert.equal((await candidateBridge.bindCandidatePreview({
-  version: 3,
-  candidateHandle: 'candidate_0123456789abcdef',
-})).code, 'invalid-request')
-assert.deepEqual(candidateBridgeCalls, [
-  ['bindCandidatePreview', { version: 4, candidateHandle: 'candidate_0123456789abcdef' }],
-  ['restoreCanonicalPreview', {
-    version: 4,
-    candidateHandle: 'candidate_0123456789abcdef',
-  }],
-])
-
-let staleTargetCurrent = true
-let staleTargetCalled = false
-const staleTarget = {
-  isCurrent: () => staleTargetCurrent,
-  capabilities: { captureSelection: true },
-  captureSelection: async () => {
-    staleTargetCalled = true
-    return { kind: 'none' }
-  },
-}
-const staleBridge = new DesktopArtifactBridge({ getActiveTarget: () => staleTarget })
-const staleResultPromise = staleBridge.captureSelection({ version: 3 })
-staleTargetCurrent = false
-assert.equal((await staleResultPromise).code, 'unavailable')
-assert.equal(staleTargetCalled, false, 'queued requests must not retarget after the UI switches')
 
 assert.equal(parseNativeWorkbenchSurfaceId('artifact:one'), 'artifact:one')
 assert.throws(() => parseNativeWorkbenchSurfaceId('../artifact'), /valid native Workbench surface/)
@@ -1333,16 +733,6 @@ assert.equal(
   false,
 )
 assert.equal(nativeWorkbenchDownloadAllowed(true), true)
-assert.equal(
-  nativeWorkbenchDownloadAllowed(true, true),
-  false,
-  'candidate preview downloads must remain blocked even with a user gesture',
-)
-assert.equal(
-  nativeWorkbenchDownloadAllowed(false, true),
-  false,
-  'candidate preview downloads must remain blocked without a user gesture',
-)
 for (const untrustedGesture of [false, undefined, null, 1, 'true']) {
   assert.equal(
     nativeWorkbenchDownloadAllowed(untrustedGesture),
@@ -1376,3 +766,9 @@ assert.equal(
 )
 
 console.log('native Workbench surface contract checks passed')
+const pageSelection = { ok: true, tagName: 'button', elementPath: 'html > body > button', locatorHint: 'html > body > button', selectionText: 'Save', rect: {x:1,y:2,width:30,height:20}, viewportWidth:800, viewportHeight:600 }
+assert.equal(parseNativeWorkbenchAnnotationSelection(pageSelection).selectionText, 'Save')
+assert.throws(() => parseNativeWorkbenchAnnotationSelection({...pageSelection, locatorHint: 'x'.repeat(4097)}))
+assert.throws(() => parseNativeWorkbenchAnnotationSelection({...pageSelection, sourceAuthority: 'untrusted'}))
+assert.equal(NATIVE_WORKBENCH_CAPABILITIES.browser, true)
+console.log('Native Workbench contracts passed.')

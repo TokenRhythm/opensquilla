@@ -145,7 +145,10 @@ export interface ChatPendingItem {
   pendingUiId: string
   text: string
   /** Annotation batch retained when a follow-up is queued behind an active turn. */
-  promptAnnotationIds?: string[]
+  draftIds?: string[]
+  /** Upgrade recovery requires the user to select the page again before sending. */
+  retiredAnnotationInput?: boolean
+  pageContext?: import('./pageContext').ChatPageContext
   attachments: Attachment[]
   intent: string | null
   /** Slash-prefixed text that a complete command catalog classified as ordinary input. */

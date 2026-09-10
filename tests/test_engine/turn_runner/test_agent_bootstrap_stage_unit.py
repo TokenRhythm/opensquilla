@@ -30,7 +30,6 @@ from opensquilla.engine.turn_runner.agent_bootstrap_stage import (
 from opensquilla.engine.turn_runner.outcome import StageOutcome
 from opensquilla.engine.types import AgentConfig, ThinkingLevel
 from opensquilla.provider.types import ModelCapabilities
-from opensquilla.tools.types import ToolContext
 
 # ---------------------------------------------------------------------------
 # Recording fakes (one per port)
@@ -344,21 +343,6 @@ async def test_case01_success_all_defaults() -> None:
     assert o.agent_config.metadata["agent_max_iterations_source"] == "test budget"
 
 
-@pytest.mark.asyncio
-async def test_exclusive_tool_context_marks_agent_as_restricted_turn() -> None:
-    stage = _make_stage()
-
-    restricted = await stage.run(
-        _make_input(
-            tool_context=ToolContext(
-                exclusive_tools={"document_inspect"}
-            )
-        )
-    )
-    ordinary = await stage.run(_make_input(tool_context=ToolContext()))
-
-    assert restricted.output.agent_config.restricted_turn is True
-    assert ordinary.output.agent_config.restricted_turn is False
 
 
 @pytest.mark.asyncio
@@ -841,34 +825,6 @@ async def test_private_fallback_does_not_downgrade_fixed_glm_5_2_verification() 
     assert provider.private_limits[0][3] == ModelCapabilities(supports_tools=False)
 
 
-@pytest.mark.asyncio
-async def test_unverified_ensemble_aggregator_overrides_inherited_tool_denial() -> None:
-    inherited_catalog = _RecordingModelCatalog(
-        catalog=_ResolvedCatalog(
-            max_tokens=16_384,
-            context_window=200_000,
-            capabilities=ModelCapabilities(supports_tools=False),
-            tools_capability_verified=True,
-        )
-    )
-    provider = SimpleNamespace(
-        artifact_tool_executor_capabilities=ModelCapabilities(supports_tools=True),
-        artifact_tools_capability_verified=False,
-    )
-
-    out = await _make_stage(catalog=inherited_catalog).run(
-        _make_input(
-            provider=provider,
-            resolved_model="inherited-no-tools",
-            active_provider_id="tokenrhythm",
-        )
-    )
-
-    assert out.output.model_capabilities == ModelCapabilities(supports_tools=True)
-    assert out.output.agent_config.model_capabilities == ModelCapabilities(
-        supports_tools=True
-    )
-    assert out.output.agent_config.model_tools_capability_verified is False
 
 
 @pytest.mark.asyncio

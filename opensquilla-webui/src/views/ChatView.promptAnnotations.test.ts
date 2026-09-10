@@ -37,37 +37,6 @@ describe('ChatView prompt annotation focus and reuse', () => {
     expect(source).toContain("t('chat.promptAnnotations.editingBlocked')")
   })
 
-  it('activates the trusted preview before invoking the server focus RPC', () => {
-    const start = chatViewSource.indexOf('async function jumpPromptAnnotation(')
-    const end = chatViewSource.indexOf('\nasync function reusePromptAnnotation(', start)
-    const source = chatViewSource.slice(start, end)
-
-    expect(start).toBeGreaterThan(-1)
-    expect(source).toContain('const activated = await focusArtifactPromptAnnotation({')
-    expect(source).toContain('await artifactPromptAnnotationsStore.focus(annotationId)')
-    expect(source.indexOf('await focusArtifactPromptAnnotation({'))
-      .toBeLessThan(source.indexOf('artifactPromptAnnotationsStore.focus(annotationId)'))
-    expect(source).toContain("failure?.code === 'DOCUMENT_CHANGED'")
-    expect(source).toContain("artifactProductReasonCode(failure) === 'not_draft'")
-    expect(source).not.toContain('promptAnnotationRpcErrorCode')
-    expect(source).not.toContain('ARTIFACT_REVISION_CHANGED')
-    expect(source).not.toContain('ARTIFACT_ANNOTATION_NOT_DRAFT')
-    expect(source).not.toContain("if (annotation.freshness === 'stale') return")
-    expect(source).not.toContain('artifactPromptAnnotationsStore.markAnnotationStale(')
-  })
-
-  it('flushes a matching open document before preparing annotation drafts', () => {
-    const start = chatViewSource.indexOf('preparePromptAnnotationsForSend: async (ids')
-    const end = chatViewSource.indexOf('\n  promptAnnotationSnapshots:', start)
-    const source = chatViewSource.slice(start, end)
-
-    expect(start).toBeGreaterThan(-1)
-    expect(source).toContain('workbenchDocumentContextStore.prepareDocumentForSend(')
-    expect(source).toContain('artifactPromptAnnotationsStore.prepareForSend(ids)')
-    expect(source.indexOf('prepareDocumentForSend('))
-      .toBeLessThan(source.indexOf('prepareForSend(ids)'))
-  })
-
   it('reuses a history snapshot only through explicit current-DOM reselection', () => {
     const start = chatViewSource.indexOf('async function reusePromptAnnotation(')
     const end = chatViewSource.indexOf('\nconst promptCacheKeepaliveOpen', start)

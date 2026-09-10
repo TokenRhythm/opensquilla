@@ -69,7 +69,6 @@ def test_document_resource_capability_axes_are_independent(
         "_format_profile",
         lambda *_args, **_kwargs: resource_rpc._FormatProfile(
             kind=ArtifactKind.HTML,
-            adapter=None,
             preview=True,
             editable=False,
             agent_editable=agent_editable,
@@ -130,88 +129,6 @@ def test_workbench_resource_payloads_use_discriminated_ids_with_legacy_alias(
     }
 
 
-@pytest.mark.asyncio
-async def test_multifile_deliverable_is_preview_only_and_never_truncated_on_import(
-    resource_env,
-) -> None:
-    env = resource_env
-    ref = env.store.publish_bundle(
-        ArtifactBundle(
-            entrypoint="index.html",
-            files=(
-                ArtifactBundleSourceFile(
-                    path="index.html",
-                    mime="text/html",
-                    data=b"<link rel='stylesheet' href='style.css'><h1>bundle</h1>",
-                ),
-                ArtifactBundleSourceFile(
-                    path="style.css",
-                    mime="text/css",
-                    data=b"h1 { color: red; }",
-                ),
-            ),
-        ),
-        session_id=env.session.session_id,
-        session_key=SESSION_KEY,
-        name="bundle.html",
-        mime="text/html",
-        source="workbench-resource-bundle-test",
-    )
-    listed = await _dispatch(
-        env,
-        "workbench.resources.list",
-        {"sessionKey": SESSION_KEY, "types": ["deliverable"]},
-    )
-    assert listed.error is None, listed.error
-    deliverable = next(
-        item for item in listed.payload["resources"] if item["resource"]["id"] == ref.id
-    )
-    assert deliverable["capabilities"]["preview"] is True
-    assert deliverable["capabilities"]["edit"] is False
-    assert deliverable["capabilities"]["manualEdit"] is False
-    assert deliverable["capabilities"]["agentEdit"] is False
-    assert deliverable["capabilities"]["selectionContext"] is False
-
-    imported = await _dispatch(
-        env,
-        "documents.import",
-        {
-            "sessionKey": SESSION_KEY,
-            "source": {"type": "deliverable", "id": ref.id},
-            "mode": "copy",
-            "expectedSha256": ref.sha256,
-            "idempotencyKey": "must-not-truncate-bundle",
-        },
-    )
-    assert imported.error is not None
-    assert imported.error.code == "RESOURCE_UNSUPPORTED"
-    assert imported.error.details == {"reasonCode": "html_bundle_edit_not_supported"}
-    service = await ArtifactSessionService.from_session_storage(env.storage)
-    assert await service.list_documents(
-        session_key=SESSION_KEY,
-        session_id=env.session.session_id,
-        limit=10,
-    ) == ()
-
-    opened = await _dispatch(
-        env,
-        "workbench.resources.open",
-        {
-            "sessionKey": SESSION_KEY,
-            "resourceRef": {"type": "deliverable", "artifactId": ref.id},
-        },
-    )
-    assert opened.error is None, opened.error
-    assert opened.payload["disposition"] == "readonly"
-    assert opened.payload["resolution"] == {"status": "readonly"}
-    assert opened.payload["materialized"] is False
-    assert opened.payload["reasonCode"] == "html_bundle_edit_not_supported"
-    assert opened.payload["resource"]["resource"]["id"] == ref.id
-    assert await service.list_documents(
-        session_key=SESSION_KEY,
-        session_id=env.session.session_id,
-        limit=10,
-    ) == ()
 
 
 @pytest.mark.asyncio
@@ -268,11 +185,10 @@ async def test_stale_partial_single_file_bundle_is_safely_revalidated_for_editin
     )
     assert listed.error is None, listed.error
     capabilities_by_id = {
-        item["resource"]["id"]: item["capabilities"]
-        for item in listed.payload["resources"]
+        item["resource"]["id"]: item["capabilities"] for item in listed.payload["resources"]
     }
-    assert capabilities_by_id[stale_remote_import.id]["manualEdit"] is True
-    assert capabilities_by_id[actual_missing_dependency.id]["manualEdit"] is False
+    assert capabilities_by_id[stale_remote_import.id]["edit"] is True
+    assert capabilities_by_id[actual_missing_dependency.id]["edit"] is True
 
     imported = await _dispatch(
         env,
@@ -316,9 +232,7 @@ async def test_stale_partial_single_file_bundle_is_safely_revalidated_for_editin
             "idempotencyKey": "reject-actual-missing-dependency-bundle",
         },
     )
-    assert rejected.error is not None
-    assert rejected.error.code == "RESOURCE_UNSUPPORTED"
-    assert rejected.error.details == {"reasonCode": "html_bundle_edit_not_supported"}
+    assert rejected.error is None, rejected.error
 
 @pytest.fixture
 async def resource_env(tmp_path: Path):
@@ -334,6 +248,7 @@ async def resource_env(tmp_path: Path):
         ),
         state_dir=str(tmp_path / "state"),
         config_path=None,
+        workspace_dir=str(tmp_path / "workspace"),
     )
     ctx = RpcContext(
         conn_id="workbench-resource-test",
@@ -421,142 +336,75 @@ async def test_generated_deliverable_helper_adopts_supported_html_without_copyin
 @pytest.mark.asyncio
 async def test_mutation_resolution_projects_only_product_outcomes(resource_env) -> None:
     env = resource_env
-    original = b"<!doctype html><h1>Before</h1>"
     ref = env.store.publish_bytes(
-        original,
+        b"<h1>Original</h1>",
         session_id=env.session.session_id,
         session_key=SESSION_KEY,
-        name="resolve.html",
+        name="page.html",
         mime="text/html",
-        source="mutation-resolution-test",
+        source="test",
     )
-    service = await ArtifactSessionService.from_session_storage(env.storage)
-    adopted = await resource_rpc.adopt_generated_deliverable_if_editable(
-        service=service,
-        store=env.store,
-        session_key=SESSION_KEY,
-        session_id=env.session.session_id,
-        ref=ref,
-        actor=Actor(ActorKind.AGENT, "agent-main"),
-    )
-    assert adopted is not None
-    document, revision, _binding, _created = adopted
-
-    missing = await _dispatch(
+    opened = await _dispatch(
         env,
-        "artifacts.mutations.resolve",
+        "workbench.resources.open",
         {
             "sessionKey": SESSION_KEY,
-            "operation": "source.patch",
-            "requestId": "missing-request",
-            "documentId": document.document_id,
+            "resource": {"type": "deliverable", "id": ref.id},
         },
     )
-    assert missing.error is None
-    # The resolve request can race durable admission of an already-sent write.
-    # Absence is therefore unknown, never proof that a new request ID is safe.
-    assert missing.payload == {"status": "pending", "retryAfterMs": 250}
-
+    assert opened.error is None, opened.error
+    document_id = opened.payload["document"]["id"]
+    original_revision = opened.payload["revision"]["id"]
     for operation in (
+        "revision.restore",
+        "change.revert",
         "document.import",
         "workbench.resources.open",
         "document.publish",
     ):
-        admission_race = await _dispatch(
+        pending = await _dispatch(
             env,
             "artifacts.mutations.resolve",
             {
                 "sessionKey": SESSION_KEY,
                 "operation": operation,
-                "requestId": f"missing-{operation}",
+                "requestId": "missing-request",
+                "documentId": document_id,
             },
         )
-        assert admission_race.error is None
-        assert admission_race.payload == {"status": "pending", "retryAfterMs": 250}
-
-    pending_request_id = "pending-request"
-    pending_turn_id = f"manual-source-patch:{pending_request_id}"
-    pending_tool_id = "rpc-source-patch:pending-test"
-    await service.reserve_mutation_attempt(
-        document_id=document.document_id,
-        turn_id=pending_turn_id,
-        tool_use_id=pending_tool_id,
-        base_revision_id=revision.revision_id,
-        proposal_sha256="b" * 64,
-    )
-    pending = await _dispatch(
+        assert pending.error is None, pending.error
+        assert pending.payload == {"status": "pending", "retryAfterMs": 250}
+    saved = await _edit_working_document(env, document_id, "<h1>Updated</h1>")
+    restored = await _dispatch(
         env,
-        "artifacts.mutations.resolve",
+        "artifacts.revisions.restore",
         {
             "sessionKey": SESSION_KEY,
-            "operation": "source.patch",
-            "clientRequestId": pending_request_id,
-            "documentId": document.document_id,
+            "documentId": document_id,
+            "revisionId": original_revision,
+            "expectedHeadRevisionId": saved.revision.revision_id,
+            "expectedStateRevision": saved.document.state_revision,
+            "clientRequestId": "restore-current",
         },
     )
-    assert pending.error is None
-    assert pending.payload == {"status": "pending", "retryAfterMs": 250}
-
-    await service.mark_mutation_attempt_failed(
-        document_id=document.document_id,
-        turn_id=pending_turn_id,
-        tool_use_id=pending_tool_id,
-        failure_code="synthetic_failure",
-    )
-    failed = await _dispatch(
-        env,
-        "artifacts.mutations.resolve",
-        {
-            "sessionKey": SESSION_KEY,
-            "operation": "source.patch",
-            "requestId": pending_request_id,
-            "documentId": document.document_id,
-        },
-    )
-    assert failed.error is None
-    assert failed.payload == {"status": "not_applied"}
-
-    applied_request_id = "applied-request"
-    applied = await _dispatch(
-        env,
-        "artifacts.source.patch",
-        {
-            "sessionKey": SESSION_KEY,
-            "documentId": document.document_id,
-            "expectedHeadRevisionId": revision.revision_id,
-            "expectedStateRevision": document.state_revision,
-            "expectedSourceSha256": revision.artifact_sha256,
-            "offsetEncoding": "unicode-code-point",
-            "patches": [
-                {
-                    "startOffset": 0,
-                    "endOffset": len(original.decode("utf-8")),
-                    "replacement": "<!doctype html><h1>After</h1>",
-                }
-            ],
-            "clientRequestId": applied_request_id,
-        },
-    )
-    assert applied.error is None, applied.error
+    assert restored.error is None, restored.error
     resolved = await _dispatch(
         env,
         "artifacts.mutations.resolve",
         {
             "sessionKey": SESSION_KEY,
-            "operation": "source.patch",
-            "requestId": applied_request_id,
-            "documentId": document.document_id,
+            "operation": "revision.restore",
+            "requestId": "restore-current",
+            "documentId": document_id,
         },
     )
     assert resolved.error is None, resolved.error
     assert resolved.payload["status"] == "applied"
-    assert resolved.payload["result"] == {
-        "documentId": document.document_id,
-        "revisionId": applied.payload["source"]["revisionId"],
-        "sha256": applied.payload["source"]["sha256"],
-        "stateRevision": applied.payload["source"]["stateRevision"],
-    }
-    serialized = json.dumps(resolved.payload, sort_keys=True)
+    assert resolved.payload["result"]["revisionId"] == original_revision
+    assert restored.payload["revision"]["id"] == original_revision
+    assert restored.payload["document"]["headRevisionId"] == original_revision
+    service = await ArtifactSessionService.from_session_storage(env.storage)
+    assert len(await service.list_revisions(document_id)) == 2
     for internal_name in (
         "attemptId",
         "baseRevisionId",
@@ -565,7 +413,7 @@ async def test_mutation_resolution_projects_only_product_outcomes(resource_env) 
         "leaseId",
         "receipt",
     ):
-        assert internal_name not in serialized
+        assert internal_name not in json.dumps(resolved.payload)
 
 
 @pytest.mark.asyncio
@@ -717,6 +565,7 @@ async def test_resource_list_does_not_reserve_sqlite_writer_slot(tmp_path: Path)
         ),
         state_dir=str(tmp_path / "state"),
         config_path=None,
+        workspace_dir=str(tmp_path / "workspace"),
     )
     env = SimpleNamespace(
         storage=storage,
@@ -866,8 +715,8 @@ async def test_resources_open_silently_materializes_legacy_html_sources(resource
         document_id = first.payload["document"]["documentId"]
         document_ids.append(document_id)
         assert first.payload["resource"]["resource"]["documentId"] == document_id
-        assert first.payload["revision"]["revisionId"] == (
-            first.payload["document"]["headRevisionId"]
+        assert (
+            first.payload["revision"]["revisionId"] == (first.payload["document"]["headRevisionId"])
         )
 
         replay = await _dispatch(
@@ -880,19 +729,20 @@ async def test_resources_open_silently_materializes_legacy_html_sources(resource
         assert replay.payload["resolution"] == {"status": "current"}
         assert replay.payload["materialized"] is False
         assert replay.payload["document"]["documentId"] == document_id
-        assert replay.payload["revision"]["revisionId"] == (
-            first.payload["revision"]["revisionId"]
-        )
+        assert replay.payload["revision"]["revisionId"] == (first.payload["revision"]["revisionId"])
 
     assert len(set(document_ids)) == 2
     service = await ArtifactSessionService.from_session_storage(env.storage)
-    assert len(
-        await service.list_documents(
-            session_key=SESSION_KEY,
-            session_id=env.session.session_id,
-            limit=10,
+    assert (
+        len(
+            await service.list_documents(
+                session_key=SESSION_KEY,
+                session_id=env.session.session_id,
+                limit=10,
+            )
         )
-    ) == 2
+        == 2
+    )
 
 
 @pytest.mark.asyncio
@@ -924,14 +774,18 @@ async def test_attachment_preview_descriptor_is_read_only_and_content_free(resou
     preview = response.payload["preview"]
     assert preview["sandboxProfile"] == "opaque-offline"
     assert preview["network"] is False
-    assert preview["adapter"]["sourceSha256"] == hashlib.sha256(source).hexdigest()
+    assert preview["format"] == "html"
+    assert "adapter" not in preview
     assert "private preview heading" not in repr(response.payload)
     service = await ArtifactSessionService.from_session_storage(env.storage)
-    assert await service.list_documents(
-        session_key=SESSION_KEY,
-        session_id=env.session.session_id,
-        limit=10,
-    ) == ()
+    assert (
+        await service.list_documents(
+            session_key=SESSION_KEY,
+            session_id=env.session.session_id,
+            limit=10,
+        )
+        == ()
+    )
 
 
 @pytest.mark.asyncio
@@ -1002,11 +856,14 @@ async def test_invalid_html_attachments_fail_closed_without_read_side_writes(res
 
     assert await _sqlite_total_changes(env.storage) == changes_before_reads
     service = await ArtifactSessionService.from_session_storage(env.storage)
-    assert await service.list_documents(
-        session_key=SESSION_KEY,
-        session_id=env.session.session_id,
-        limit=10,
-    ) == ()
+    assert (
+        await service.list_documents(
+            session_key=SESSION_KEY,
+            session_id=env.session.session_id,
+            limit=10,
+        )
+        == ()
+    )
 
 
 @pytest.mark.asyncio
@@ -1163,16 +1020,13 @@ async def test_resource_inventory_preserves_inline_and_staged_attachment_occurre
         "message-inline",
     }
     assert all(item["capabilities"]["edit"] is True for item in attachments)
-    assert all(item["capabilities"]["manualEdit"] is True for item in attachments)
+    assert all(item["capabilities"]["manualEdit"] is False for item in attachments)
+    assert all(item["capabilities"]["edit"] is True for item in attachments)
     assert all(item["capabilities"]["agentEdit"] is False for item in attachments)
     assert all(item["capabilities"]["selectionContext"] is False for item in attachments)
     assert all(item["capabilities"]["publish"] is False for item in attachments)
-    assert all(
-        "downloadUrl" in item for item in attachments if item["name"] != "inline.html"
-    )
-    assert "downloadUrl" not in next(
-        item for item in attachments if item["name"] == "inline.html"
-    )
+    assert all("downloadUrl" in item for item in attachments if item["name"] != "inline.html")
+    assert "downloadUrl" not in next(item for item in attachments if item["name"] == "inline.html")
 
     inline_get = await _dispatch(
         env,
@@ -1223,7 +1077,7 @@ async def test_resource_inventory_preserves_inline_and_staged_attachment_occurre
     for document in after.payload["resources"]:
         capabilities = document["capabilities"]
         assert capabilities["preview"] is True
-        assert capabilities["manualEdit"] is True
+        assert capabilities["manualEdit"] is False
         assert capabilities["agentEdit"] is True
         assert capabilities["selectionContext"] is True
         assert capabilities["publish"] is True
@@ -1420,11 +1274,14 @@ async def test_import_is_session_scoped_and_recovers_reserved_candidate_after_cr
         idempotency_key="import-after-crash",
     )
     assert attempt.status is MutationAttemptStatus.RESERVED
-    assert await service.list_documents(
-        session_key=SESSION_KEY,
-        session_id=env.session.session_id,
-        limit=10,
-    ) == ()
+    assert (
+        await service.list_documents(
+            session_key=SESSION_KEY,
+            session_id=env.session.session_id,
+            limit=10,
+        )
+        == ()
+    )
     assert env.store.list_refs(session_id=env.session.session_id, limit=10).refs == ()
 
     monkeypatch.setattr(resource_rpc, "_ensure_internal_candidate", original)
@@ -1616,9 +1473,10 @@ async def test_resource_pagination_is_stable_and_url_type_is_reserved(
         },
     )
     assert second.error is None, second.error
-    assert second.payload["resources"][0]["resource"]["id"] != first.payload[
-        "resources"
-    ][0]["resource"]["id"]
+    assert (
+        second.payload["resources"][0]["resource"]["id"]
+        != first.payload["resources"][0]["resource"]["id"]
+    )
 
     await _append_attachment(
         env,
@@ -1716,11 +1574,14 @@ async def test_office_resource_exposes_stable_edit_unavailable_reason(
     assert forged_import.error.code == "RESOURCE_UNSUPPORTED"
     assert forged_import.error.details == {"reasonCode": "office_adapter_not_available"}
     service = await ArtifactSessionService.from_session_storage(env.storage)
-    assert await service.list_documents(
-        session_key=SESSION_KEY,
-        session_id=env.session.session_id,
-        limit=10,
-    ) == ()
+    assert (
+        await service.list_documents(
+            session_key=SESSION_KEY,
+            session_id=env.session.session_id,
+            limit=10,
+        )
+        == ()
+    )
 
     internal_ref = env.store.publish_bytes(
         b"synthetic-office-document",
@@ -1779,10 +1640,13 @@ async def test_office_resource_exposes_stable_edit_unavailable_reason(
     assert rejected_publish.error is not None
     assert rejected_publish.error.code == "RESOURCE_UNSUPPORTED"
     assert rejected_publish.error.details == {"reasonCode": "office_adapter_not_available"}
-    assert await service.list_document_publications(
-        session_id=env.session.session_id,
-        document_id=created.document.document_id,
-    ) == ()
+    assert (
+        await service.list_document_publications(
+            session_id=env.session.session_id,
+            document_id=created.document.document_id,
+        )
+        == ()
+    )
 
 
 @pytest.mark.asyncio
@@ -1893,22 +1757,8 @@ async def test_publish_receipt_pins_immutable_revision_and_recovers_promotion(
     assert emitted[1][2]["documentId"] == document_id
     assert emitted[1][2]["revisionId"] == revision_id
 
-    patched = await _dispatch(
-        env,
-        "artifacts.source.patch",
-        {
-            "sessionKey": SESSION_KEY,
-            "documentId": document_id,
-            "expectedHeadRevisionId": revision_id,
-            "expectedStateRevision": imported["document"]["stateRevision"],
-            "expectedSourceSha256": imported["revision"]["sha256"],
-            "patches": [
-                {"startOffset": 4, "endOffset": 18, "replacement": "changed"},
-            ],
-        },
-    )
-    assert patched.error is None, patched.error
-    assert patched.payload["revision"]["sha256"] != publication["sha256"]
+    patched = await _edit_working_document(env, document_id, "<h1>new current version</h1>")
+    assert patched.revision.artifact_sha256 != publication["sha256"]
 
     documents_before_open = await (
         await ArtifactSessionService.from_session_storage(env.storage)
@@ -1935,7 +1785,7 @@ async def test_publish_receipt_pins_immutable_revision_and_recovers_promotion(
     assert opened.payload["resolution"] == {"status": "current"}
     assert opened.payload["materialized"] is False
     assert opened.payload["document"]["documentId"] == document_id
-    assert opened.payload["revision"]["revisionId"] == patched.payload["revision"]["id"]
+    assert opened.payload["revision"]["revisionId"] == patched.revision.revision_id
     documents_after_open = await (
         await ArtifactSessionService.from_session_storage(env.storage)
     ).list_documents(
@@ -1979,22 +1829,8 @@ async def test_publish_explicitly_pins_non_head_revision_and_replays(resource_en
     )
     original_revision = imported["revision"]
     document_id = imported["document"]["id"]
-    patched = await _dispatch(
-        env,
-        "artifacts.source.patch",
-        {
-            "sessionKey": SESSION_KEY,
-            "documentId": document_id,
-            "expectedHeadRevisionId": original_revision["id"],
-            "expectedStateRevision": imported["document"]["stateRevision"],
-            "expectedSourceSha256": original_revision["sha256"],
-            "patches": [
-                {"startOffset": 4, "endOffset": 12, "replacement": "new head"},
-            ],
-        },
-    )
-    assert patched.error is None, patched.error
-    assert patched.payload["revision"]["id"] != original_revision["id"]
+    patched = await _edit_working_document(env, document_id, "<h1>new current version</h1>")
+    assert patched.revision.revision_id != original_revision["id"]
 
     params = {
         "sessionKey": SESSION_KEY,
@@ -2113,3 +1949,174 @@ async def test_legacy_document_open_preserves_preview_identity_and_is_idempotent
     assert imported.payload["document"]["id"] != first.payload["document"]["id"]
     assert imported.payload["revision"]["artifactId"] != ref.id
     assert imported.payload["revision"]["sha256"] == ref.sha256
+
+
+@pytest.mark.asyncio
+async def test_multifile_deliverable_import_and_publish_preserve_all_resources(
+    resource_env,
+) -> None:
+    env = resource_env
+    ref = env.store.publish_bundle(
+        ArtifactBundle(
+            entrypoint="index.html",
+            files=(
+                ArtifactBundleSourceFile(
+                    path="index.html",
+                    mime="text/html",
+                    data=b"<link rel='stylesheet' href='style.css'><h1>bundle</h1>",
+                ),
+                ArtifactBundleSourceFile(
+                    path="style.css",
+                    mime="text/css",
+                    data=b"h1 { color: red; }",
+                ),
+            ),
+        ),
+        session_id=env.session.session_id,
+        session_key=SESSION_KEY,
+        name="bundle.html",
+        mime="text/html",
+        source="workbench-resource-bundle-test",
+    )
+    listed = await _dispatch(
+        env,
+        "workbench.resources.list",
+        {"sessionKey": SESSION_KEY, "types": ["deliverable"]},
+    )
+    assert listed.error is None, listed.error
+    deliverable = next(
+        item for item in listed.payload["resources"] if item["resource"]["id"] == ref.id
+    )
+    assert deliverable["capabilities"]["preview"] is True
+    assert deliverable["capabilities"]["edit"] is True
+    assert deliverable["capabilities"]["manualEdit"] is False
+    opened = await _dispatch(
+        env,
+        "workbench.resources.open",
+        {
+            "sessionKey": SESSION_KEY,
+            "resource": {"type": "deliverable", "id": ref.id},
+        },
+    )
+    assert opened.error is None, opened.error
+    assert opened.payload["disposition"] == "document"
+    working = Path(opened.payload["workingFile"])
+    assert working.read_bytes() == b"<link rel='stylesheet' href='style.css'><h1>bundle</h1>"
+    assert (working.parent / "style.css").read_bytes() == b"h1 { color: red; }"
+    revision = opened.payload["revision"]
+    published = await _dispatch(
+        env,
+        "documents.publish",
+        {
+            "sessionKey": SESSION_KEY,
+            "documentId": opened.payload["document"]["id"],
+            "revisionId": revision["id"],
+            "idempotencyKey": "publish-complete-bundle",
+        },
+    )
+    assert published.error is None, published.error
+    artifact_id = published.payload["deliverable"]["id"]
+    restored_css = env.store.resolve_preview_resource(
+        artifact_id,
+        session_id=env.session.session_id,
+        logical_path="style.css",
+    )
+    assert restored_css.path.read_bytes() == b"h1 { color: red; }"
+    replayed = await _dispatch(
+        env,
+        "workbench.resources.open",
+        {
+            "sessionKey": SESSION_KEY,
+            "resource": {"type": "deliverable", "id": ref.id},
+        },
+    )
+    assert replayed.error is None, replayed.error
+    assert replayed.payload["workingFile"] == str(working)
+
+
+async def _edit_working_document(env, document_id: str, source: str):
+    from opensquilla.artifact_session.working_files import save_working_version
+
+    service = await ArtifactSessionService.from_session_storage(env.storage)
+    try:
+        binding = await resource_rpc.ensure_document_working_files(
+            env.ctx,
+            service=service,
+            session_key=SESSION_KEY,
+            session_id=env.session.session_id,
+            document_id=document_id,
+        )
+        binding.entry.write_text(source, encoding="utf-8")
+        saved = await save_working_version(
+            service,
+            env.store,
+            document_id=document_id,
+            session_key=SESSION_KEY,
+            session_id=env.session.session_id,
+            actor_id="test-turn",
+        )
+        assert saved is not None
+        return saved
+    finally:
+        await service.close()
+
+
+async def test_noop_restore_resolves_applied_without_visible_resource_change(resource_env):
+    env = resource_env
+    ref = env.store.publish_bytes(
+        b"<h1>Original</h1>",
+        session_id=env.session.session_id,
+        session_key=SESSION_KEY,
+        name="page.html",
+        mime="text/html",
+        source="test",
+    )
+    opened = await _dispatch(
+        env,
+        "workbench.resources.open",
+        {"sessionKey": SESSION_KEY, "resource": {"type": "deliverable", "id": ref.id}},
+    )
+    assert opened.error is None, opened.error
+    document = opened.payload["document"]
+    revision = opened.payload["revision"]
+    listed_before = await _dispatch(
+        env, "workbench.resources.list", {"sessionKey": SESSION_KEY, "types": ["document"]}
+    )
+    assert listed_before.error is None, listed_before.error
+    params = {
+        "sessionKey": SESSION_KEY,
+        "documentId": document["id"],
+        "revisionId": revision["id"],
+        "expectedHeadRevisionId": revision["id"],
+        "expectedStateRevision": document["stateRevision"],
+        "clientRequestId": "no-change-restore-resolve",
+    }
+    restored = await _dispatch(env, "artifacts.revisions.restore", params)
+    assert restored.error is None, restored.error
+    assert restored.payload["revision"]["id"] == revision["id"]
+    assert restored.payload["document"]["stateRevision"] == document["stateRevision"]
+    resolution = await _dispatch(
+        env,
+        "artifacts.mutations.resolve",
+        {
+            "sessionKey": SESSION_KEY,
+            "documentId": document["id"],
+            "operation": "revision.restore",
+            "requestId": params["clientRequestId"],
+        },
+    )
+    assert resolution.error is None, resolution.error
+    assert resolution.payload["status"] == "applied"
+    assert resolution.payload["result"]["revisionId"] == revision["id"]
+    listed_after = await _dispatch(
+        env, "workbench.resources.list", {"sessionKey": SESSION_KEY, "types": ["document"]}
+    )
+    assert listed_after.error is None, listed_after.error
+    assert listed_after.payload == listed_before.payload
+    changes = await _dispatch(
+        env, "artifacts.changes.list", {"sessionKey": SESSION_KEY, "documentId": document["id"]}
+    )
+    assert changes.error is None, changes.error
+    assert changes.payload["changeSets"] == []
+    service = await ArtifactSessionService.from_session_storage(env.storage)
+    assert len(await service.list_revisions(document["id"])) == 1

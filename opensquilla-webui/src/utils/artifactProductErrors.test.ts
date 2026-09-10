@@ -21,9 +21,9 @@ describe('artifact product error classification', () => {
     const error = mapped('ARTIFACT_EDIT_SESSION_STALE', { retryable: true })
 
     expect(classifyArtifactProductError(error)).toMatchObject({
-      code: 'EDIT_SESSION_RENEWAL_REQUIRED',
-      messageKey: 'workbench.artifactErrors.editSessionRenewalRequired',
-      recovery: 'reacquire-edit-session',
+      code: 'DOCUMENT_EDITING_RETIRED',
+      messageKey: 'workbench.artifactErrors.documentEditingRetired',
+      recovery: 'ask-user',
       retryable: true,
     })
     expect(classifyArtifactProductError(error).fallbackMessage)

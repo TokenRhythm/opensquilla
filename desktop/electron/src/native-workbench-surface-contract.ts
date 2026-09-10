@@ -1,16 +1,7 @@
-import {
-  DESKTOP_ARTIFACT_BRIDGE_CONTRACT,
-  DESKTOP_ARTIFACT_BRIDGE_PROTOCOL_VERSION,
-  DESKTOP_ARTIFACT_BRIDGE_PROTOCOL_VERSION_V3,
-  DESKTOP_ARTIFACT_BRIDGE_PROTOCOL_VERSION_V4,
-} from './desktop-artifact-bridge-contract.js'
-
 export const NATIVE_WORKBENCH_PROTOCOL_VERSION = 1 as const
 export const NATIVE_WORKBENCH_PROTOCOL_VERSION_V2 = 2 as const
-export const NATIVE_WORKBENCH_PROTOCOL_VERSION_V3 =
-  DESKTOP_ARTIFACT_BRIDGE_PROTOCOL_VERSION_V3
-export const NATIVE_WORKBENCH_PROTOCOL_VERSION_V4 =
-  DESKTOP_ARTIFACT_BRIDGE_PROTOCOL_VERSION_V4
+export const NATIVE_WORKBENCH_PROTOCOL_VERSION_V3 = 3 as const
+export const NATIVE_WORKBENCH_PROTOCOL_VERSION_V4 = 4 as const
 export const NATIVE_WORKBENCH_MAX_SURFACES = 8
 export const NATIVE_WORKBENCH_MAX_HTML_BYTES = 5 * 1024 * 1024
 export const NATIVE_WORKBENCH_ARTIFACT_SCHEME = 'opensquilla-artifact'
@@ -142,7 +133,7 @@ export interface NativeWorkbenchCapabilities {
   modes: readonly ['full', 'offline']
   navigationActions: typeof NATIVE_WORKBENCH_NAVIGATION_ACTIONS
   permissionResponses: true
-  artifactBridge: typeof DESKTOP_ARTIFACT_BRIDGE_CONTRACT
+  browser: true
   maxSurfaces: typeof NATIVE_WORKBENCH_MAX_SURFACES
 }
 
@@ -164,7 +155,7 @@ export const NATIVE_WORKBENCH_CAPABILITIES: NativeWorkbenchCapabilities = {
   modes: ['full', 'offline'],
   navigationActions: NATIVE_WORKBENCH_NAVIGATION_ACTIONS,
   permissionResponses: true,
-  artifactBridge: DESKTOP_ARTIFACT_BRIDGE_CONTRACT,
+  browser: true,
   maxSurfaces: NATIVE_WORKBENCH_MAX_SURFACES,
 }
 
@@ -196,12 +187,12 @@ export type NativeWorkbenchSurfaceEventType =
   | 'blocked-action'
   | 'capability-expired'
   | 'unresponsive'
+  | 'browser-opened'
   | 'annotation-selected'
   | 'annotation-draft-change'
   | 'annotation-submit'
   | 'annotation-cancel'
   | 'annotation-overlay-fallback'
-  | 'agent-edit-released'
 
 export interface NativeWorkbenchSurfaceEvent {
   version:
@@ -213,6 +204,8 @@ export interface NativeWorkbenchSurfaceEvent {
   type: NativeWorkbenchSurfaceEventType
   detail?: {
     message?: string
+    sessionKey?: string
+    targetRef?: string
     path?: string
     reason?: string
     url?: string
@@ -234,8 +227,9 @@ export interface NativeWorkbenchSurfaceEvent {
       selectionId: string
       tagName: string
       elementPath: string
-      domSha256?: string
-      elementProofSha256: string
+      targetRef: string
+      locatorHint: string
+      selectionText: string
       rect: NativeWorkbenchSurfaceRect
     }
   }
@@ -610,11 +604,7 @@ export function nativeWorkbenchMissingResourceIsLocal(
 
 export function nativeWorkbenchDownloadAllowed(
   hasUserGesture: unknown,
-  candidatePreviewActive = false,
 ): boolean {
-  // Canonical previews may still offer a user-confirmed native save dialog.
-  // Candidate bytes are an uncommitted, turn-local inspection surface and
-  // must never escape through a download, even when the page synthesizes a
-  // trusted user gesture.
-  return candidatePreviewActive !== true && hasUserGesture === true
+  // Saving a preview download remains a user-initiated native dialog.
+  return hasUserGesture === true
 }

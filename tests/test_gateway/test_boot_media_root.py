@@ -123,7 +123,7 @@ async def test_build_services_reconciles_artifact_mutations_before_ready(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("OPENSQUILLA_STATE_DIR", str(tmp_path / "state"))
-    calls: list[tuple[object, Path]] = []
+    calls: list[tuple[str, object]] = []
 
     def reject_background_task(coro):
         close = getattr(coro, "close", None)
@@ -131,27 +131,20 @@ async def test_build_services_reconciles_artifact_mutations_before_ready(
             close()
         raise AssertionError("unit tests must not schedule real sandbox setup")
 
-    async def fake_reconcile(service, store):
-        calls.append((service, store.media_root))
-        return type(
-            "Summary",
-            (),
-            {
-                "examined": 0,
-                "applied": 0,
-                "failed": 0,
-                "ambiguous": 0,
-                "deleted_candidates": 0,
-            },
-        )()
+    async def retire(service):
+        calls.append(("retire", service))
 
+    async def recover(service, store, **_kwargs):
+        calls.append(("recover", service))
+        return type("Summary", (), {"examined": 0})()
+
+    monkeypatch.setattr("opensquilla.gateway.boot.create_background_task", reject_background_task)
     monkeypatch.setattr(
-        "opensquilla.gateway.boot.create_background_task",
-        reject_background_task,
+        "opensquilla.artifact_session.ArtifactSessionService.retire_legacy_html_state", retire
     )
     monkeypatch.setattr(
-        "opensquilla.gateway.artifact_mutation_recovery.reconcile_pending_artifact_mutations",
-        fake_reconcile,
+        "opensquilla.gateway.document_resource_recovery.reconcile_pending_document_resources",
+        recover,
     )
     media = tmp_path / "media"
     services = await build_services(
@@ -163,7 +156,7 @@ async def test_build_services_reconciles_artifact_mutations_before_ready(
         seed_agent_workspaces=False,
     )
     try:
-        assert len(calls) == 1
-        assert calls[0][1] == media
+        assert [item[0] for item in calls] == ["retire", "recover"]
+        assert calls[0][1] is calls[1][1]
     finally:
         await services.close()

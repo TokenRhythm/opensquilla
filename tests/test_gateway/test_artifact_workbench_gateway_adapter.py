@@ -8,7 +8,6 @@ from opensquilla.application.artifact_workbench import (
     ArtifactCatalogQuery,
     ArtifactIdentity,
     DocumentImport,
-    PromptAnnotationCreate,
     WorkbenchResourceOpen,
     WorkbenchResourceQuery,
 )
@@ -192,37 +191,6 @@ async def test_resource_open_ignores_unrecognized_request_id_alias() -> None:
     assert calls[0].idempotency_key is None
 
 
-@pytest.mark.asyncio
-async def test_prompt_annotation_create_preserves_an_explicit_empty_body() -> None:
-    calls: list[PromptAnnotationCreate] = []
-
-    class Port:
-        async def create_annotation(
-            self, command: PromptAnnotationCreate
-        ) -> dict[str, object]:
-            calls.append(command)
-            return {"annotation": {}}
-
-    params = {
-        "sessionKey": "session-1",
-        "annotationId": "ann_12345678901234567890123456789012",
-        "documentId": "document-1",
-        "revisionId": "revision-1",
-        "selection": {
-            "selectionId": "selection-1",
-            "tagName": "img",
-            "elementPath": "[[\"\",\"img\",1]]",
-            "elementProofSha256": "a" * 64,
-        },
-        "body": "",
-    }
-    handler = GatewayArtifactWorkbenchAdapter.bind(
-        "artifacts.prompt_annotations.create", lambda _ctx: Port()
-    )
-
-    assert await handler(params, cast(RpcContext, object())) == {"annotation": {}}
-    assert len(calls) == 1
-    assert calls[0].body == ""
 
 
 @pytest.mark.asyncio
@@ -265,11 +233,6 @@ async def test_prompt_annotation_create_preserves_an_explicit_empty_body() -> No
             "limit must be a positive integer",
         ),
         (
-            "documents.editSessions.start",
-            {"sessionKey": "session-1", "documentId": "document-1", "mode": "view"},
-            "mode must be edit",
-        ),
-        (
             "artifacts.edit.capabilities",
             {"documentId": "document-1"},
             "sessionKey",
@@ -288,7 +251,7 @@ async def test_invalid_legacy_workbench_inputs_are_not_normalized_to_defaults(
 
 
 def test_all_workbench_methods_have_generated_descriptors_and_guest_policy() -> None:
-    assert len(ARTIFACT_WORKBENCH_CONTRACT_METHODS) == 30
+    assert len(ARTIFACT_WORKBENCH_CONTRACT_METHODS) == 22
     assert all(
         method in GATEWAY_METHOD_CONTRACTS
         for method in ARTIFACT_WORKBENCH_CONTRACT_METHODS
@@ -300,3 +263,19 @@ def test_all_workbench_methods_have_generated_descriptors_and_guest_policy() -> 
         for method in ARTIFACT_WORKBENCH_CONTRACT_METHODS
         if method not in {"artifacts.list", "artifacts.get"}
     )
+
+
+@pytest.mark.parametrize(
+    "method",
+    [
+        "documents.editSessions.start", "documents.editSessions.heartbeat",
+        "documents.editSessions.close", "artifacts.prompt_annotations.create",
+        "artifacts.prompt_annotations.focus", "artifacts.prompt_annotations.update",
+        "artifacts.prompt_annotations.discard", "artifacts.source.patch",
+    ],
+)
+def test_retired_editor_methods_have_no_executable_application_binding(method):
+    assert method not in GATEWAY_METHOD_CONTRACTS
+    assert method not in ARTIFACT_WORKBENCH_CONTRACT_METHODS
+    with pytest.raises(ValueError, match="unsupported Artifact Workbench method"):
+        GatewayArtifactWorkbenchAdapter.bind(method, lambda _ctx: object())

@@ -15,7 +15,6 @@ import {
 import { validateArtifactsListResult } from '@/contracts/generated/v4/artifactsListValidators.mjs'
 import type { ArtifactPayload } from '@/types/artifacts'
 import { createV4ArtifactDocuments } from './artifactDocumentsV4'
-import { createV4ArtifactPromptAnnotations } from './artifactPromptAnnotationsV4'
 import { createV4WorkbenchResources } from './workbenchResourcesV4'
 import { createV4ArtifactContentAccess } from './artifactAccessV4'
 import { createV4AttachmentContentAccess } from './attachmentAccessV4'
@@ -245,7 +244,6 @@ export function createV4ArtifactWorkbench(
     artifacts: createV4ArtifactCatalog(rpc),
     documents: createV4ArtifactDocuments(operationRpc),
     resources: createV4WorkbenchResources(operationRpc),
-    promptAnnotations: createV4ArtifactPromptAnnotations(operationRpc),
     content: { ...artifactContent, ...attachmentContent },
     previews: createV4ArtifactPreviews(http),
     subscribeDocumentChanges(listener): ArtifactWorkbenchSubscription {

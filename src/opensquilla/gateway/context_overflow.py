@@ -78,8 +78,7 @@ def _accepts_keyword_arg(func: Any, name: str) -> bool:
     if name in signature.parameters:
         return True
     return any(
-        param.kind is inspect.Parameter.VAR_KEYWORD
-        for param in signature.parameters.values()
+        param.kind is inspect.Parameter.VAR_KEYWORD for param in signature.parameters.values()
     )
 
 
@@ -303,16 +302,11 @@ async def _await_auto_summarize_flush_grace(
         "turn_id": turn_id,
         "checkpoint_exists": checkpoint_exists,
     }
-    if (
-        provider_request_correlation is not None
-        and _accepts_keyword_arg(
-            flush_service.execute,
-            "provider_request_correlation",
-        )
+    if provider_request_correlation is not None and _accepts_keyword_arg(
+        flush_service.execute,
+        "provider_request_correlation",
     ):
-        flush_kwargs["provider_request_correlation"] = (
-            provider_request_correlation
-        )
+        flush_kwargs["provider_request_correlation"] = provider_request_correlation
     task = asyncio.create_task(
         flush_service.execute(
             transcript,
@@ -489,7 +483,6 @@ async def apply_context_overflow_policy(
     budget_override: int | None = None,
     provider_request_correlation: ProviderRequestCorrelation | None = None,
     root_operation_id: str | None = None,
-    restricted_turn: bool = False,
 ) -> OverflowOutcome:
     """Apply the gateway's overflow policy to the upcoming turn.
 
@@ -548,18 +541,6 @@ async def apply_context_overflow_policy(
         estimated_tokens=estimated,
         budget_tokens=budget,
     )
-
-    if restricted_turn:
-        # Restricted Artifact turns cannot send the canonical transcript to a
-        # gateway compactor or flush model. Fail closed before checkpoint,
-        # flush, or SessionManager.compact_with_result can run.
-        outcome.reason = "restricted_turn_compaction_disabled"
-        outcome.refusal = _build_refusal_envelope(
-            estimated,
-            budget,
-            outcome.reason,
-        )
-        return outcome
 
     if policy == ContextOverflowPolicy.REFUSE:
         outcome.reason = "context_overflow"
@@ -621,9 +602,7 @@ async def apply_context_overflow_policy(
                 status="started",
                 tokens_before=estimated,
                 context_window_tokens=budget,
-                heartbeat_interval_seconds=(
-                    effective_compaction_config.heartbeat_interval_seconds
-                ),
+                heartbeat_interval_seconds=(effective_compaction_config.heartbeat_interval_seconds),
                 **compaction_effect_payload(status="started"),
                 **compaction_lifecycle_payload(
                     compaction_id,
@@ -734,16 +713,11 @@ async def apply_context_overflow_policy(
                     compact_kwargs["trigger_reason"] = "gateway_auto_summarize"
                 if _accepts_keyword_arg(compact_with_result, "flush_receipt_status"):
                     compact_kwargs["flush_receipt_status"] = flush_status
-                if (
-                    provider_request_correlation is not None
-                    and _accepts_keyword_arg(
-                        compact_with_result,
-                        "provider_request_correlation",
-                    )
+                if provider_request_correlation is not None and _accepts_keyword_arg(
+                    compact_with_result,
+                    "provider_request_correlation",
                 ):
-                    compact_kwargs["provider_request_correlation"] = (
-                        provider_request_correlation
-                    )
+                    compact_kwargs["provider_request_correlation"] = provider_request_correlation
                 compaction_result = await await_compaction_phase(
                     compact_with_result(
                         session_key,
@@ -1047,15 +1021,15 @@ async def apply_context_overflow_policy(
                 error=str(exc),
                 emergency_ephemeral=outcome.reason == "emergency_ephemeral",
             )
-            terminal_status = "completed" if durable_commit_won else (
-                "emergency_ephemeral"
-                if outcome.reason == "emergency_ephemeral"
-                else "failed"
+            terminal_status = (
+                "completed"
+                if durable_commit_won
+                else (
+                    "emergency_ephemeral" if outcome.reason == "emergency_ephemeral" else "failed"
+                )
             )
             terminal_reason = (
-                "post_commit_verification_failed"
-                if durable_commit_won
-                else outcome.reason
+                "post_commit_verification_failed" if durable_commit_won else outcome.reason
             )
             notify_compaction(
                 session_key,
