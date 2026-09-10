@@ -3,6 +3,7 @@
 import { createPinia, setActivePinia } from 'pinia'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { useRpcStore } from './rpc'
+import { createV4GatewayAccess } from '@/adapters/gateway/gatewayAccessV4'
 
 const connectCalls: Array<{ url: string; token?: string }> = []
 const clients: Array<{
@@ -12,6 +13,7 @@ const clients: Array<{
   recoverConnectionGeneration: ReturnType<typeof vi.fn>
   ensureConnected: ReturnType<typeof vi.fn>
   notifyResume: ReturnType<typeof vi.fn>
+  readonly lifecycle: string
   connectionGeneration: number
 }> = []
 
@@ -342,11 +344,22 @@ describe('rpc link-token bootstrap', () => {
     const store = useRpcStore()
     store.init()
     await vi.waitFor(() => expect(connectCalls).toHaveLength(1))
+    const lifecycle = vi.spyOn(clients[0], 'lifecycle', 'get').mockReturnValue('blocked')
+    clients[0].emit('_status', { lifecycle: 'blocked', health: 'suspect', reason: 'authentication_mismatch' })
     clients[0].emit('_blocked', { reason: 'authentication_mismatch' })
     await vi.waitFor(() => expect(getConnection).toHaveBeenCalledTimes(2))
+    expect(store.error).toBe('authentication_mismatch')
+    expect(connectCalls).toHaveLength(1)
     clients[0].emit('_blocked', { reason: 'authentication_mismatch' })
     await Promise.resolve()
     expect(getConnection).toHaveBeenCalledTimes(2)
+    await store.connect('ws://desktop/ws')
+    expect(getConnection).toHaveBeenCalledTimes(3)
+    expect(connectCalls).toEqual([
+      { url: base.wsUrl, token: base.authToken },
+      { url: base.wsUrl, token: base.authToken },
+    ])
+    lifecycle.mockRestore()
     store.$dispose()
   })
 
@@ -376,6 +389,249 @@ describe('rpc link-token bootstrap', () => {
     resolve({ ...base, revision: 2 })
     await vi.advanceTimersByTimeAsync(8_000)
     expect(connectCalls).toHaveLength(1)
+    store.$dispose()
+  })
+
+  it('preserves pending automatic recovery when a manual Desktop lookup also fails', async () => {
+    vi.useFakeTimers()
+    vi.spyOn(Math, 'random').mockReturnValue(1)
+    const payload = {
+      schemaVersion: 1, revision: 1, status: 'ready', instanceId: 'runtime-a',
+      profileFingerprint: 'profile-a', httpUrl: 'http://127.0.0.1:18791',
+      wsUrl: 'ws://127.0.0.1:18791/ws', authToken: 'token-a', error: null,
+    }
+    const getConnection = vi.fn()
+      .mockRejectedValueOnce(new Error('temporary'))
+      .mockRejectedValueOnce(new Error('still unavailable'))
+      .mockResolvedValue(payload)
+    window.opensquillaDesktop = {
+      getGatewayConnection: getConnection,
+      onGatewayConnectionChanged: vi.fn(() => () => {}),
+    } as unknown as OpenSquillaDesktopApi
+    const store = useRpcStore()
+    store.init()
+    await vi.advanceTimersByTimeAsync(0)
+    expect(getConnection).toHaveBeenCalledTimes(1)
+    await store.connect('ws://desktop/ws')
+    expect(getConnection).toHaveBeenCalledTimes(2)
+    await vi.advanceTimersByTimeAsync(1_000)
+    expect(getConnection).toHaveBeenCalledTimes(3)
+    expect(connectCalls).toEqual([{ url: payload.wsUrl, token: payload.authToken }])
+    store.disconnect()
+    await vi.advanceTimersByTimeAsync(15_000)
+    expect(getConnection).toHaveBeenCalledTimes(3)
+    store.$dispose()
+  })
+
+  it('reconnects the Desktop through its supervisor instead of browser form settings', async () => {
+    const first = {
+      schemaVersion: 1, revision: 1, status: 'ready', instanceId: 'runtime-a',
+      profileFingerprint: 'profile-a', httpUrl: 'http://127.0.0.1:18791',
+      wsUrl: 'ws://127.0.0.1:18791/ws', authToken: 'token-a', error: null,
+    }
+    const next = { ...first, revision: 2, instanceId: 'runtime-b',
+      wsUrl: 'ws://127.0.0.1:18792/ws', authToken: 'token-b' }
+    const getConnection = vi.fn().mockResolvedValueOnce(first).mockResolvedValue(next)
+    window.opensquillaDesktop = {
+      getGatewayConnection: getConnection,
+      onGatewayConnectionChanged: vi.fn(() => () => {}),
+    } as unknown as OpenSquillaDesktopApi
+    const store = useRpcStore()
+    store.init()
+    await vi.waitFor(() => expect(connectCalls).toHaveLength(1))
+    const access = createV4GatewayAccess(store)
+    access.disconnect()
+    await access.connect({ endpoint: 'ws://desktop/ws', credential: 'stale-form-token' })
+    expect(getConnection).toHaveBeenCalledTimes(2)
+    expect(connectCalls[connectCalls.length - 1]).toEqual({ url: next.wsUrl, token: next.authToken })
+    expect(localStorage.getItem('opensquilla.wsUrl')).toBeNull()
+    expect(sessionStorage.getItem('opensquilla.wsToken')).toBe(next.authToken)
+    store.$dispose()
+  })
+
+  it('keeps a healthy Desktop connection and identity when manual refresh is unchanged or fails', async () => {
+    const payload = {
+      schemaVersion: 1, revision: 1, status: 'ready', instanceId: 'runtime-a',
+      profileFingerprint: 'profile-a', httpUrl: 'http://127.0.0.1:18791',
+      wsUrl: 'ws://127.0.0.1:18791/ws', authToken: 'token-a', error: null,
+    }
+    const getConnection = vi.fn(async () => payload)
+    window.opensquillaDesktop = {
+      getGatewayConnection: getConnection,
+      onGatewayConnectionChanged: vi.fn(() => () => {}),
+    } as unknown as OpenSquillaDesktopApi
+    const store = useRpcStore()
+    store.init()
+    await vi.waitFor(() => expect(connectCalls).toHaveLength(1))
+    clients[0].emit('_hello', { auth: { principal: { isOwner: true } }, policy: { retained: true } })
+    await store.connect('ws://desktop/ws')
+    expect(connectCalls).toHaveLength(1)
+    expect(clients[0].disconnect).not.toHaveBeenCalled()
+    expect(store.isLocalOwner).toBe(true)
+    expect(store.policy).toEqual({ retained: true })
+    getConnection.mockRejectedValueOnce(new Error('IPC temporarily unavailable'))
+    await store.connect('ws://desktop/ws')
+    expect(store.error).toBeTruthy()
+    expect(store.state).toBe('connected')
+    expect(store.isLocalOwner).toBe(true)
+    expect(connectCalls).toHaveLength(1)
+    expect(clients[0].disconnect).not.toHaveBeenCalled()
+    store.$dispose()
+  })
+
+  it('coalesces manual Desktop requests and ignores a cancelled read after a new connection intent', async () => {
+    const payload = {
+      schemaVersion: 1, revision: 1, status: 'ready', instanceId: 'runtime-a',
+      profileFingerprint: 'profile-a', httpUrl: 'http://127.0.0.1:18791',
+      wsUrl: 'ws://127.0.0.1:18791/ws', authToken: 'token-a', error: null,
+    }
+    let resolveOld!: (value: typeof payload) => void
+    let resolveNew!: (value: typeof payload) => void
+    const getConnection = vi.fn()
+      .mockImplementationOnce(() => new Promise(resolve => { resolveOld = resolve }))
+      .mockImplementationOnce(() => new Promise(resolve => { resolveNew = resolve }))
+    window.opensquillaDesktop = {
+      getGatewayConnection: getConnection,
+      onGatewayConnectionChanged: vi.fn(() => () => {}),
+    } as unknown as OpenSquillaDesktopApi
+    const store = useRpcStore()
+    store.init()
+    const pending = store.connect('ws://desktop/ws')
+    const duplicate = store.connect('ws://desktop/ws')
+    await vi.waitFor(() => expect(getConnection).toHaveBeenCalledTimes(1))
+    expect(connectCalls).toHaveLength(0)
+    store.disconnect()
+    const current = store.connect('ws://desktop/ws')
+    await vi.waitFor(() => expect(getConnection).toHaveBeenCalledTimes(2))
+    resolveOld({ ...payload, revision: 99, wsUrl: 'ws://127.0.0.1:19999/ws' })
+    await Promise.all([pending, duplicate])
+    expect(connectCalls).toHaveLength(0)
+    resolveNew(payload)
+    await current
+    expect(connectCalls).toEqual([{ url: payload.wsUrl, token: payload.authToken }])
+    store.$dispose()
+  })
+
+  it('restarts an explicitly disconnected Desktop even when its descriptor is unchanged', async () => {
+    const payload = {
+      schemaVersion: 1, revision: 1, status: 'ready', instanceId: 'runtime-a',
+      profileFingerprint: 'profile-a', httpUrl: 'http://127.0.0.1:18791',
+      wsUrl: 'ws://127.0.0.1:18791/ws', authToken: 'token-a', error: null,
+    }
+    window.opensquillaDesktop = {
+      getGatewayConnection: vi.fn(async () => payload),
+      onGatewayConnectionChanged: vi.fn(() => () => {}),
+    } as unknown as OpenSquillaDesktopApi
+    const store = useRpcStore()
+    store.init()
+    await vi.waitFor(() => expect(connectCalls).toHaveLength(1))
+    store.disconnect()
+    await store.connect('ws://desktop/ws')
+    expect(connectCalls).toEqual([
+      { url: payload.wsUrl, token: payload.authToken },
+      { url: payload.wsUrl, token: payload.authToken },
+    ])
+    expect(store.state).toBe('connected')
+    store.$dispose()
+  })
+
+  it.each([
+    null,
+    { schemaVersion: 0 },
+    { schemaVersion: 1, revision: 2, status: 'ready', instanceId: 'runtime-a' },
+    { schemaVersion: 1, revision: 2, status: 'starting', error: 'Runtime is starting' },
+  ])('preserves the live Desktop connection when manual lookup returns unusable data: %j', async (invalid) => {
+    const payload = {
+      schemaVersion: 1, revision: 1, status: 'ready', instanceId: 'runtime-a',
+      profileFingerprint: 'profile-a', httpUrl: 'http://127.0.0.1:18791',
+      wsUrl: 'ws://127.0.0.1:18791/ws', authToken: 'token-a', error: null,
+    }
+    const getConnection = vi.fn().mockResolvedValueOnce(payload).mockResolvedValueOnce(invalid)
+    window.opensquillaDesktop = {
+      getGatewayConnection: getConnection,
+      onGatewayConnectionChanged: vi.fn(() => () => {}),
+    } as unknown as OpenSquillaDesktopApi
+    const store = useRpcStore()
+    store.init()
+    await vi.waitFor(() => expect(connectCalls).toHaveLength(1))
+    await store.connect('ws://desktop/ws')
+    expect(store.error).toBeTruthy()
+    expect(store.state).toBe('connected')
+    expect(clients[0].disconnect).not.toHaveBeenCalled()
+    expect(connectCalls).toHaveLength(1)
+    store.$dispose()
+  })
+
+  it('bounds a manual Desktop lookup and ignores its late result without discarding the live connection', async () => {
+    vi.useFakeTimers()
+    const payload = {
+      schemaVersion: 1, revision: 1, status: 'ready', instanceId: 'runtime-a',
+      profileFingerprint: 'profile-a', httpUrl: 'http://127.0.0.1:18791',
+      wsUrl: 'ws://127.0.0.1:18791/ws', authToken: 'token-a', error: null,
+    }
+    let resolve!: (value: typeof payload) => void
+    const getConnection = vi.fn().mockResolvedValueOnce(payload)
+      .mockImplementationOnce(() => new Promise(done => { resolve = done }))
+    window.opensquillaDesktop = {
+      getGatewayConnection: getConnection,
+      onGatewayConnectionChanged: vi.fn(() => () => {}),
+    } as unknown as OpenSquillaDesktopApi
+    const store = useRpcStore()
+    store.init()
+    await vi.advanceTimersByTimeAsync(0)
+    const pending = store.connect('ws://desktop/ws')
+    await vi.advanceTimersByTimeAsync(8_000)
+    await pending
+    expect(store.error).toBeTruthy()
+    expect(store.state).toBe('connected')
+    expect(clients[0].disconnect).not.toHaveBeenCalled()
+    resolve({ ...payload, revision: 99, wsUrl: 'ws://127.0.0.1:19999/ws' })
+    await vi.advanceTimersByTimeAsync(15_000)
+    expect(connectCalls).toEqual([{ url: payload.wsUrl, token: payload.authToken }])
+    expect(getConnection).toHaveBeenCalledTimes(2)
+    store.$dispose()
+  })
+
+  it('does not replace a newer Desktop notification with a delayed manual snapshot', async () => {
+    const payload = {
+      schemaVersion: 1, revision: 1, status: 'ready', instanceId: 'runtime-a',
+      profileFingerprint: 'profile-a', httpUrl: 'http://127.0.0.1:18791',
+      wsUrl: 'ws://127.0.0.1:18791/ws', authToken: 'token-a', error: null,
+    }
+    let publish!: (value: typeof payload) => void
+    let resolve!: (value: typeof payload) => void
+    const getConnection = vi.fn().mockResolvedValueOnce(payload)
+      .mockImplementationOnce(() => new Promise(done => { resolve = done }))
+    window.opensquillaDesktop = {
+      getGatewayConnection: getConnection,
+      onGatewayConnectionChanged: vi.fn(callback => { publish = callback; return () => {} }),
+    } as unknown as OpenSquillaDesktopApi
+    const store = useRpcStore()
+    store.init()
+    await vi.waitFor(() => expect(connectCalls).toHaveLength(1))
+    const pending = store.connect('ws://desktop/ws')
+    await vi.waitFor(() => expect(getConnection).toHaveBeenCalledTimes(2))
+    const newest = { ...payload, revision: 3, wsUrl: 'ws://127.0.0.1:18793/ws', authToken: 'token-c' }
+    publish(newest)
+    resolve({ ...payload, revision: 2, wsUrl: 'ws://127.0.0.1:18792/ws', authToken: 'token-b' })
+    await pending
+    expect(connectCalls).toEqual([
+      { url: payload.wsUrl, token: payload.authToken },
+      { url: newest.wsUrl, token: newest.authToken },
+    ])
+    expect(sessionStorage.getItem('opensquilla.wsToken')).toBe(newest.authToken)
+    store.$dispose()
+  })
+
+  it('continues to use explicit endpoint and credentials for browser connections', async () => {
+    const store = useRpcStore()
+    store.init()
+    await store.connect('wss://gateway.example/ws', 'browser-token')
+    expect(connectCalls[connectCalls.length - 1]).toEqual({
+      url: 'wss://gateway.example/ws', token: 'browser-token',
+    })
+    expect(localStorage.getItem('opensquilla.wsUrl')).toBe('wss://gateway.example/ws')
+    expect(sessionStorage.getItem('opensquilla.wsToken')).toBe('browser-token')
     store.$dispose()
   })
 })
