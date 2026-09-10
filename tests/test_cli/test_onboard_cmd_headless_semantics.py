@@ -272,6 +272,100 @@ def test_configure_provider_key_rotation_keeps_model_base_url_and_proxy(
     assert cfg.llm.api_key == "sk-new"
 
 
+def test_configure_provider_explicit_router_disabled_is_authoritative(
+    tmp_path, monkeypatch
+):
+    # Issue #1341: `configure provider --router disabled` on a fresh config
+    # used to drop the flag and synthesize the default tier ladder instead.
+    # The explicit flag must be authoritative, matching the command help.
+    target = tmp_path / "c.toml"
+    monkeypatch.setenv("OPENSQUILLA_GATEWAY_CONFIG_PATH", str(target))
+
+    result = runner.invoke(
+        app,
+        [
+            "onboard",
+            "configure",
+            "provider",
+            "--provider",
+            "vllm",
+            "--model",
+            "qa-model",
+            "--base-url",
+            "http://127.0.0.1:18001/v1",
+            "--router",
+            "disabled",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    cfg = load_config(target)
+    assert cfg.squilla_router.enabled is False
+
+
+def test_configure_provider_omitted_router_keeps_disabled_state(
+    tmp_path, monkeypatch
+):
+    # Keep-current contract: a provider re-save without --router must never
+    # re-enable a deliberately disabled router.
+    target = tmp_path / "c.toml"
+    target.write_text(
+        "[llm]\n"
+        'provider = "vllm"\n'
+        'model = "qa-model"\n'
+        "\n"
+        "[squilla_router]\n"
+        "enabled = false\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("OPENSQUILLA_GATEWAY_CONFIG_PATH", str(target))
+
+    result = runner.invoke(
+        app,
+        [
+            "onboard",
+            "configure",
+            "provider",
+            "--provider",
+            "vllm",
+            "--api-key",
+            "sk-new",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    cfg = load_config(target)
+    assert cfg.squilla_router.enabled is False
+    assert cfg.llm.api_key == "sk-new"
+
+
+def test_configure_provider_invalid_router_mode_exits_2(tmp_path, monkeypatch):
+    # Plumb-through makes an invalid --router a real mutation error: it must
+    # exit 2 with the mode validation message instead of being ignored.
+    target = tmp_path / "c.toml"
+    monkeypatch.setenv("OPENSQUILLA_GATEWAY_CONFIG_PATH", str(target))
+
+    result = runner.invoke(
+        app,
+        [
+            "onboard",
+            "configure",
+            "provider",
+            "--provider",
+            "vllm",
+            "--model",
+            "qa-model",
+            "--base-url",
+            "http://127.0.0.1:18001/v1",
+            "--router",
+            "nonsense",
+        ],
+    )
+
+    assert result.exit_code == 2, result.output
+    assert "router mode" in _plain(result.stderr)
+
+
 def test_onboard_provider_key_rotation_keeps_base_url_and_proxy(
     tmp_path, monkeypatch
 ):
