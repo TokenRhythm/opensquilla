@@ -600,12 +600,6 @@ _WORKSPACE_EDIT_TOOL_NAMES: frozenset[str] = frozenset(
         "write_file",
     }
 )
-_DIAGNOSTIC_RETRIEVAL_GATED_TOOL_NAMES: frozenset[str] = frozenset(
-    {
-        *_WORKSPACE_EDIT_TOOL_NAMES,
-        "finalize",
-    }
-)
 
 _meta_invoke_depth: ContextVar[int] = ContextVar("opensquilla_meta_invoke_depth", default=0)
 _meta_invoke_turn_count: ContextVar[int] = ContextVar(
@@ -1109,9 +1103,6 @@ _DOCUMENT_MUTATION_FINALIZATION_SYSTEM = (
     "Do not mention internal protocols, capabilities, identifiers, source text, or paths."
 )
 _AGGREGATE_TOOL_RESULT_MAX_SHARE = 0.25
-# Below this size a duplicate tool result is not worth eliding: the dedup stub
-# itself costs ~200 chars, so tiny repeated payloads would grow, not shrink.
-_PROVIDER_HISTORY_DEDUP_MIN_CHARS = 400
 _TOOL_ARGUMENT_HEARTBEAT_CHARS = 4096
 _PROVIDER_CONTEXT_PROJECTION_REUSED_REASON = "provider_context_projection_reused"
 _SEMANTIC_TOOL_RESULT_PROJECTION_SKIP_TOOLS = frozenset({"read_file", "git_diff"})
@@ -1151,66 +1142,6 @@ _TOOL_RESULT_HINT_PATTERN = re.compile(
 _TOOL_RESULT_HINT_PATH_PATTERN = re.compile(
     r"(?:[A-Za-z]:)?[./\\]?[A-Za-z0-9_.-]+(?:[/\\][A-Za-z0-9_.-]+)+(?::\d+)?"
 )
-_PROJECTION_SIGNAL_HINTS_ENV = "OPENSQUILLA_PROJECTION_SIGNAL_HINTS"
-_PROJECTION_SIGNAL_PATTERNS_ENV = "OPENSQUILLA_PROJECTION_SIGNAL_PATTERNS"
-_PROJECTION_SIGNAL_HINTS_ON = frozenset({"on", "1", "true", "yes"})
-_PROJECTION_SIGNAL_HINTS_OFF = frozenset({"off", "0", "false", "no"})
-# Default failure-signal pattern for the projection signal scan. Kept separate
-# from _TOOL_RESULT_HINT_PATTERN so the env override below can never perturb
-# search_hints selection. Case-sensitive on purpose: the anchors target the
-# capitalized/tool-emitted forms (FAILED, Traceback, AssertionError, ...).
-_PROJECTION_SIGNAL_DEFAULT_PATTERN = re.compile(
-    r"(?:\bFAILED\b|\bFAIL:|\bError\b|\bException\b|\bTraceback\b"
-    r"|\bAssertionError\b|\berror:|\bwarnings? summary\b"
-    r"|\bpanic(?:ked)?\b|\bfatal\b)"
-)
-_PROJECTION_SIGNAL_PATTERN_CACHE: dict[str, re.Pattern[str]] = {}
-
-
-def _projection_signal_hints_enabled(config_value: bool = False) -> bool:
-    """Resolve the projection signal-scan gate.
-
-    Unset defers to ``config_value`` (the AgentConfig field threaded from the
-    same env by the bootstrap stage; off by default). Recognized on/off values
-    override it; unrecognized values raise instead of being silently ignored
-    so a run manifest cannot record an override the run did not actually
-    apply.
-    """
-    raw = os.environ.get(_PROJECTION_SIGNAL_HINTS_ENV, "").strip().lower()
-    if not raw:
-        return bool(config_value)
-    if raw in _PROJECTION_SIGNAL_HINTS_ON:
-        return True
-    if raw in _PROJECTION_SIGNAL_HINTS_OFF:
-        return False
-    raise ValueError(
-        f"{_PROJECTION_SIGNAL_HINTS_ENV} must be one of: "
-        + ", ".join(sorted(_PROJECTION_SIGNAL_HINTS_ON | _PROJECTION_SIGNAL_HINTS_OFF))
-    )
-
-
-def _projection_signal_pattern() -> re.Pattern[str]:
-    """Return the failure-signal regex, honoring the env override.
-
-    A non-blank ``OPENSQUILLA_PROJECTION_SIGNAL_PATTERNS`` value replaces the
-    default pattern wholesale (write alternations into one regex). Compiled
-    overrides are cached by raw string; invalid regexes raise ValueError per
-    the manifest-honesty convention rather than silently falling back.
-    """
-    raw = os.environ.get(_PROJECTION_SIGNAL_PATTERNS_ENV, "").strip()
-    if not raw:
-        return _PROJECTION_SIGNAL_DEFAULT_PATTERN
-    cached = _PROJECTION_SIGNAL_PATTERN_CACHE.get(raw)
-    if cached is not None:
-        return cached
-    try:
-        compiled = re.compile(raw)
-    except re.error as exc:
-        raise ValueError(
-            f"{_PROJECTION_SIGNAL_PATTERNS_ENV} must be a valid regular expression: {exc}"
-        ) from exc
-    _PROJECTION_SIGNAL_PATTERN_CACHE[raw] = compiled
-    return compiled
 
 
 _PROVIDER_CONTEXT_REPAIR_PROMPT = (
@@ -1301,95 +1232,6 @@ def _tool_result_search_hints(content: str) -> str:
     if not lines:
         return ""
     return "search_hints:\n" + "\n".join(lines) + "\n"
-
-
-def _tool_result_signal_scan(
-    content: str,
-    *,
-    handle: str | None,
-    head_chars: int | None = None,
-    tail_chars: int | None = None,
-    preview_lines: frozenset[str] | None = None,
-) -> tuple[str, int, int | None]:
-    """Scan the omitted region of a projected tool result for failure signals.
-
-    Returns ``(rendered_lines, match_count, first_line_number)``. Line numbers
-    are 1-based over the FULL original ``content`` (the same coordinates
-    search_hints renders and retrieve_tool_result's ``L<num>`` query resolves
-    against the byte-identical stored record).
-
-    Omission model: with ``head_chars``/``tail_chars`` the omitted region is
-    the contiguous char span between the preserved head and tail; otherwise a
-    line counts as omitted when its exact text is absent from
-    ``preview_lines`` (the reducer-summarized preview). The membership check
-    is an approximation — a reducer that rewrites a matching line makes it
-    count as omitted even though a variant survives — but the rendered line
-    number still points at a real failure line in the original.
-
-    Returns ``("", 0, None)`` when there is nothing to report or no handle
-    exists to retrieve against.
-    """
-    if handle is None or not content:
-        return "", 0, None
-    pattern = _projection_signal_pattern()
-    omitted_start: int | None = None
-    omitted_end: int | None = None
-    if head_chars is not None:
-        omitted_start = max(0, int(head_chars))
-        omitted_end = len(content) - max(0, int(tail_chars or 0))
-        if omitted_end <= omitted_start:
-            return "", 0, None
-    match_count = 0
-    first_line_number: int | None = None
-    offset = 0
-    for line_number, line in enumerate(content.splitlines(), start=1):
-        line_start = offset
-        offset += len(line) + 1
-        if omitted_start is not None and omitted_end is not None:
-            if line_start + len(line) <= omitted_start or line_start >= omitted_end:
-                continue
-        elif preview_lines is not None and line in preview_lines:
-            continue
-        if not pattern.search(line[:_TOOL_RESULT_HINT_SCAN_MAX_CHARS]):
-            continue
-        match_count += 1
-        if first_line_number is None:
-            first_line_number = line_number
-    if match_count == 0 or first_line_number is None:
-        return "", 0, None
-    rendered = _render_projection_signal_lines(
-        handle=handle,
-        match_count=match_count,
-        first_line_number=first_line_number,
-    )
-    return rendered, match_count, first_line_number
-
-
-def _render_projection_signal_lines(
-    *,
-    handle: str | None,
-    match_count: int,
-    first_line_number: int | None,
-) -> str:
-    """Render the signal_scan notice lines for an already-computed scan.
-
-    Kept separate from the scan so the fresh-result path can scan once with
-    the size-gate probe's placeholder handle and re-render with the real
-    stored handle (both handle forms have identical length, so the probe
-    measures the true envelope size).
-    """
-    if handle is None or match_count <= 0 or first_line_number is None:
-        return ""
-    next_call_arguments = json.dumps(
-        {"handle": handle, "mode": "query", "query": f"L{first_line_number}"},
-        ensure_ascii=False,
-        sort_keys=True,
-    )
-    return (
-        f"signal_scan: {match_count} lines matching failure patterns in the "
-        f"omitted region (first at L{first_line_number})\n"
-        f"signal_next_call: retrieve_tool_result {next_call_arguments}\n"
-    )
 
 
 def _projection_event_argument_value(value: Any, *, key: str) -> Any:
@@ -2839,9 +2681,6 @@ class Agent:
         self._provider_tool_result_overrides: dict[str, ContentBlockToolResult] = {}
         self._provider_tool_result_frozen_overrides: dict[str, ContentBlockToolResult] = {}
         self._provider_tool_result_frozen_full_ids: set[str] = set()
-        self._provider_history_dedup_survivor_ids: set[str] = set()
-        self._projected_diagnostic_evidence: dict[str, dict[str, Any]] = {}
-        self._focused_retrieved_tool_result_handles: set[str] = set()
         self._tool_result_snapshot_cache: dict[
             tuple[str, str, str, str, str, str], ToolResultRecord
         ] = {}
@@ -4450,219 +4289,6 @@ class Agent:
             )
         return restored if changed else messages
 
-    def _fresh_diagnostic_policy_enabled(self) -> bool:
-        return bool(
-            getattr(
-                self.config,
-                "tool_result_fresh_diagnostic_policy_enabled",
-                False,
-            )
-        )
-
-    def _diagnostic_retrieval_gate_enabled(self) -> bool:
-        return bool(
-            getattr(
-                self.config,
-                "tool_result_diagnostic_retrieval_gate_enabled",
-                False,
-            )
-        )
-
-    def _fresh_diagnostic_inline_max_chars(self) -> int:
-        if not self._fresh_diagnostic_policy_enabled():
-            return 0
-        return max(
-            0,
-            int(
-                getattr(
-                    self.config,
-                    "tool_result_fresh_diagnostic_inline_max_chars",
-                    64_000,
-                )
-                or 0
-            ),
-        )
-
-    @staticmethod
-    def _tool_result_diagnostic_reason(result: ToolResult, content: str) -> str | None:
-        if result.is_error:
-            return "is_error"
-        status: Mapping[str, Any] = result.execution_status or {}
-        if isinstance(status, Mapping):
-            preservation_class = str(status.get("preservation_class") or "")
-            if preservation_class == "diagnostic":
-                return "diagnostic_preservation_class"
-            if str(status.get("status") or "") in {"error", "timeout", "cancelled"}:
-                return "diagnostic_execution_status"
-        scan = content[:_TOOL_RESULT_HINT_SCAN_MAX_CHARS]
-        if (
-            _TOOL_RESULT_HINT_PATTERN.search(scan)
-            and not _CLEAN_TEST_SUMMARY_RE.search(scan)
-            and not _CLEAN_PASSED_FAILED_SUMMARY_RE.search(scan)
-            and not _CLEAN_ERROR_COUNT_RE.search(scan)
-        ):
-            return "failure_anchor"
-        return None
-
-    def _record_fresh_diagnostic_result(
-        self,
-        *,
-        reason: str,
-        tool_name: str,
-        tool_use_id: str,
-        original_chars: int,
-    ) -> None:
-        self.config.metadata["tool_projection_fresh_diagnostic_results"] = (
-            self.config.metadata.get("tool_projection_fresh_diagnostic_results", 0) + 1
-        )
-        self._write_turn_call_log(
-            "tool_projection_fresh_diagnostic",
-            tool_use_id=tool_use_id,
-            name=tool_name,
-            reason=reason,
-            original_chars=original_chars,
-        )
-
-    def _record_projected_diagnostic_evidence(
-        self,
-        *,
-        handle: str | None,
-        tool_name: str,
-        tool_use_id: str,
-        reason: str,
-        original_chars: int,
-        projected_chars: int,
-    ) -> None:
-        self.config.metadata["tool_projection_fresh_diagnostic_projections"] = (
-            self.config.metadata.get("tool_projection_fresh_diagnostic_projections", 0) + 1
-        )
-        append_runtime_event(
-            self.config.runtime_events_path,
-            {
-                "feature": "tool_result_projection",
-                "name": "tool_projection_fresh_diagnostic",
-                "action": "projected",
-                "reason": reason,
-                "session_key": self._session_key,
-                "agent_id": self.config.tool_result_store_agent_id
-                or self.config.metadata.get("agent_id"),
-                "tool_name": tool_name,
-                "tool_use_id": tool_use_id,
-                "tool_result_handle": handle,
-                "tool_result_handle_present": bool(handle),
-                "original_chars": original_chars,
-                "projected_chars": projected_chars,
-            },
-        )
-        if not self._diagnostic_retrieval_gate_enabled():
-            return
-        if not handle:
-            return
-        self._projected_diagnostic_evidence[handle] = {
-            "tool_name": tool_name,
-            "tool_use_id": tool_use_id,
-            "reason": reason,
-            "original_chars": original_chars,
-            "projected_chars": projected_chars,
-        }
-
-    @staticmethod
-    def _retrieval_tool_call_handle(tc: ToolCall) -> str | None:
-        if tc.tool_name != "retrieve_tool_result":
-            return None
-        raw_handle = tc.arguments.get("handle")
-        if not isinstance(raw_handle, str):
-            return None
-        handle = raw_handle.strip()
-        return handle or None
-
-    @staticmethod
-    def _retrieval_tool_call_is_focused(tc: ToolCall) -> bool:
-        if tc.tool_name != "retrieve_tool_result":
-            return False
-        raw_mode = tc.arguments.get("mode")
-        mode = raw_mode.strip().lower() if isinstance(raw_mode, str) else ""
-        if mode in {"query", "grep", "slice", "head_tail", "raw_slice"}:
-            return True
-        return any(
-            isinstance(tc.arguments.get(key), str) and str(tc.arguments.get(key)).strip()
-            for key in ("query", "pattern")
-        ) or any(tc.arguments.get(key) is not None for key in ("start_line", "end_line", "offset"))
-
-    def _record_focused_diagnostic_retrieval(
-        self,
-        tc: ToolCall,
-        result: ToolResult,
-    ) -> None:
-        if result.is_error or not self._retrieval_tool_call_is_focused(tc):
-            return
-        handle = self._retrieval_tool_call_handle(tc)
-        if handle is None or handle not in self._projected_diagnostic_evidence:
-            return
-        self._focused_retrieved_tool_result_handles.add(handle)
-        self.config.metadata["tool_projection_diagnostic_retrievals"] = (
-            self.config.metadata.get("tool_projection_diagnostic_retrievals", 0) + 1
-        )
-        append_runtime_event(
-            self.config.runtime_events_path,
-            {
-                "feature": "tool_result_retrieval",
-                "name": "tool_projection_diagnostic_retrieval",
-                "session_key": self._session_key,
-                "agent_id": self.config.tool_result_store_agent_id
-                or self.config.metadata.get("agent_id"),
-                "tool_use_id": tc.tool_use_id,
-                "tool_name": tc.tool_name,
-                "tool_result_handle": handle,
-                "mode": tc.arguments.get("mode"),
-                "query": tc.arguments.get("query"),
-            },
-        )
-        self._write_turn_call_log(
-            "tool_projection_diagnostic_retrieval",
-            tool_use_id=tc.tool_use_id,
-            name=tc.tool_name,
-            tool_result_handle=handle,
-            mode=tc.arguments.get("mode"),
-            query=tc.arguments.get("query"),
-        )
-
-    def _projected_diagnostic_retrieval_gate_tool_result(self, tc: ToolCall) -> ToolResult | None:
-        if not self._diagnostic_retrieval_gate_enabled():
-            return None
-        if tc.tool_name not in _DIAGNOSTIC_RETRIEVAL_GATED_TOOL_NAMES:
-            return None
-        pending = [
-            (handle, details)
-            for handle, details in self._projected_diagnostic_evidence.items()
-            if handle not in self._focused_retrieved_tool_result_handles
-        ]
-        if not pending:
-            return None
-        handle, details = pending[-1]
-        self.config.metadata["tool_projection_diagnostic_retrieval_gate_blocks"] = (
-            self.config.metadata.get("tool_projection_diagnostic_retrieval_gate_blocks", 0) + 1
-        )
-        tool_name = str(details.get("tool_name") or "tool")
-        reason = str(details.get("reason") or "diagnostic")
-        return ToolResult(
-            tool_use_id=tc.tool_use_id,
-            tool_name=tc.tool_name,
-            content=(
-                "Runtime guard: this action depends on incomplete diagnostic evidence. "
-                f"The recent {tool_name} result was projected with preview_complete=false "
-                f"for reason {reason!r}. Before calling {tc.tool_name}, use "
-                "retrieve_tool_result with the projected tool_result_handle and a focused "
-                "query, grep, line slice, or raw_slice for the failing test, traceback, "
-                f"line reference, or error phrase. tool_result_handle: {handle}"
-            ),
-            is_error=True,
-            execution_status=runtime_execution_status(
-                "error",
-                reason="projected_diagnostic_requires_retrieval",
-            ),
-        )
-
     def _semantic_tool_result_projection_skip_reason(
         self,
         result: ToolResult,
@@ -4801,176 +4427,11 @@ class Agent:
             event["saved_chars"] = max(0, original_chars - projected_chars)
         append_runtime_event(self.config.runtime_events_path, event)
 
-    def _projection_signal_hints_active(self) -> bool:
-        return _projection_signal_hints_enabled(
-            bool(getattr(self.config, "projection_signal_hints", False))
-        )
-
-    def _record_projection_signal_hint_event(
-        self,
-        *,
-        builder: str,
-        tool_name: str,
-        tool_use_id: str,
-        tool_result_handle: str | None,
-        original_chars: int,
-        signal_match_lines: int,
-        signal_first_line: int | None,
-    ) -> None:
-        self.config.metadata["tool_projection_signal_hints"] = (
-            self.config.metadata.get("tool_projection_signal_hints", 0) + 1
-        )
-        append_runtime_event(
-            self.config.runtime_events_path,
-            {
-                "feature": "tool_result_projection",
-                "name": "projection_signal_hints",
-                "action": "hint_appended",
-                "mechanism": "signal_scan",
-                "mode": "log",
-                "session_key": self._session_key,
-                "agent_id": self.config.tool_result_store_agent_id
-                or self.config.metadata.get("agent_id"),
-                "tool_name": tool_name,
-                "tool_use_id": tool_use_id,
-                "tool_result_handle": tool_result_handle,
-                "original_chars": original_chars,
-                "signal_match_lines": signal_match_lines,
-                "signal_first_line": signal_first_line,
-                "builder": builder,
-            },
-        )
-
     @staticmethod
     def _count_image_blocks(messages: list[Message]) -> int:
         # Use the same recursive accounting as request projection so images
         # nested in tool-result content cannot bypass a text-only boundary.
         return count_projected_image_blocks(messages)
-
-    def _dedup_repeated_tool_results_for_provider(
-        self,
-        messages: list[Message],
-    ) -> list[Message]:
-        """Elide older byte-identical tool results in the provider view only.
-
-        Long single-turn episodes re-run the same read/grep/diff commands many
-        times, and full-history replay resends every identical payload on every
-        iteration. When ``provider_history_dedup_enabled`` is on, the newest
-        occurrence of each repeated result stays full and older duplicates are
-        replaced by a short stub naming the surviving ``tool_use_id``. The pass
-        never mutates persisted history; error results, artifact results, the
-        two most recent results, frozen-full results, and existing provider
-        projections are left untouched.
-        """
-        self._provider_history_dedup_survivor_ids = set()
-        if not getattr(self.config, "provider_history_dedup_enabled", False):
-            return messages
-        min_repeats = max(
-            2, int(getattr(self.config, "provider_history_dedup_min_repeats", 2) or 2)
-        )
-
-        tool_result_refs: list[tuple[int, int, ContentBlockToolResult]] = []
-        for message_index, message in enumerate(messages):
-            if not isinstance(message.content, list):
-                continue
-            for block_index, block in enumerate(message.content):
-                if isinstance(block, ContentBlockToolResult):
-                    tool_result_refs.append((message_index, block_index, block))
-        if len(tool_result_refs) < min_repeats:
-            return messages
-
-        recent_ids = {id(block) for _m, _b, block in tool_result_refs[-2:]}
-        by_digest: dict[str, list[tuple[int, int, ContentBlockToolResult, str]]] = {}
-        for message_index, block_index, block in tool_result_refs:
-            if not isinstance(block.content, str):
-                continue
-            content = block.content
-            if (
-                len(content) < _PROVIDER_HISTORY_DEDUP_MIN_CHARS
-                or block.is_error
-                or _tool_result_content_has_artifact(content)
-                or _tool_result_content_is_provider_projection(content)
-            ):
-                continue
-            digest = hashlib.sha256(content.encode("utf-8")).hexdigest()
-            by_digest.setdefault(digest, []).append((message_index, block_index, block, content))
-
-        replacements: dict[tuple[int, int], ContentBlockToolResult] = {}
-        survivor_ids: set[str] = set()
-        chars_saved = 0
-        for digest, occurrences in by_digest.items():
-            if len(occurrences) < min_repeats:
-                continue
-            survivor = occurrences[-1][2]
-            for message_index, block_index, block, content in occurrences[:-1]:
-                if id(block) in recent_ids:
-                    continue
-                if block.tool_use_id in self._provider_tool_result_frozen_full_ids:
-                    # Already shown to the model as final full content on a
-                    # prior request — never retroactively downgrade it, but
-                    # still counted above so newer duplicates get elided.
-                    continue
-                stub = (
-                    "[duplicate_tool_result_elided]\n"
-                    f"tool_use_id: {block.tool_use_id}\n"
-                    f"original_chars: {len(content)}\n"
-                    f"sha256: {digest}\n"
-                    f"identical_to_tool_use_id: {survivor.tool_use_id}\n"
-                    "reason: byte-identical content appears again at the newer "
-                    "tool result above; read it there instead of re-running the "
-                    "same command.\n"
-                )
-                replacements[(message_index, block_index)] = ContentBlockToolResult(
-                    tool_use_id=block.tool_use_id,
-                    content=stub,
-                    is_error=block.is_error,
-                )
-                chars_saved += max(0, len(content) - len(stub))
-                survivor_ids.add(survivor.tool_use_id)
-
-        if not replacements:
-            return messages
-
-        self._provider_history_dedup_survivor_ids = survivor_ids
-
-        projected: list[Message] = []
-        for message_index, message in enumerate(messages):
-            if not isinstance(message.content, list):
-                projected.append(message)
-                continue
-            next_content: list[Any] = []
-            message_changed = False
-            for block_index, block in enumerate(message.content):
-                replacement = replacements.get((message_index, block_index))
-                if replacement is None:
-                    next_content.append(block)
-                    continue
-                next_content.append(replacement)
-                message_changed = True
-            if not message_changed:
-                projected.append(message)
-                continue
-            projected.append(
-                Message(
-                    role=message.role,
-                    content=next_content,
-                    reasoning_content=getattr(message, "reasoning_content", None),
-                )
-            )
-
-        self.config.metadata["provider_history_dedup_applied"] = True
-        self.config.metadata["provider_history_dedup_elided"] = self.config.metadata.get(
-            "provider_history_dedup_elided", 0
-        ) + len(replacements)
-        self.config.metadata["provider_history_dedup_chars_saved"] = (
-            self.config.metadata.get("provider_history_dedup_chars_saved", 0) + chars_saved
-        )
-        self._write_turn_call_log(
-            "provider_history_dedup",
-            elided_tool_results=len(replacements),
-            chars_saved=chars_saved,
-        )
-        return projected
 
     def _compact_aggregate_tool_results_for_provider(
         self,
@@ -5043,7 +4504,6 @@ class Agent:
                 or _tool_result_content_is_provider_projection(content)
                 or semantic_skip_reason is not None
                 or block.tool_use_id in self._provider_tool_result_frozen_full_ids
-                or block.tool_use_id in self._provider_history_dedup_survivor_ids
             ):
                 if semantic_skip_reason is not None:
                     semantic_preserve_refs.append(
@@ -5087,24 +4547,6 @@ class Agent:
             handle_line = f"tool_result_handle: {stored.handle}\n" if stored is not None else ""
             retrieve_hint = _TOOL_RESULT_RETRIEVE_HINT if stored is not None else ""
             search_hints = _tool_result_search_hints(content) if stored is not None else ""
-            signal_lines = ""
-            if stored is not None and self._projection_signal_hints_active():
-                signal_lines, signal_matches, signal_first_line = _tool_result_signal_scan(
-                    content,
-                    handle=stored.handle,
-                    head_chars=len(head),
-                    tail_chars=len(tail),
-                )
-                if signal_lines:
-                    self._record_projection_signal_hint_event(
-                        builder="aggregate",
-                        tool_name=tool_name_by_use_id.get(block.tool_use_id, "tool"),
-                        tool_use_id=block.tool_use_id,
-                        tool_result_handle=stored.handle,
-                        original_chars=len(content),
-                        signal_match_lines=signal_matches,
-                        signal_first_line=signal_first_line,
-                    )
             compacted = (
                 "[aggregate_tool_result_compacted]\n"
                 f"tool_use_id: {block.tool_use_id}\n"
@@ -5114,7 +4556,6 @@ class Agent:
                 f"{handle_line}"
                 f"{retrieve_hint}"
                 f"{search_hints}"
-                f"{signal_lines}"
                 f"omitted_chars: {omitted}\n"
                 f"preview_complete: {str(omitted == 0).lower()}\n"
                 "reason: older non-error tool result compacted for provider context budget.\n"
@@ -5457,24 +4898,6 @@ class Agent:
             head = content[:head_chars]
             tail = content[-tail_chars:] if tail_chars else ""
         omitted = max(0, len(content) - len(head) - len(tail))
-        signal_lines = ""
-        if self._projection_signal_hints_active():
-            signal_lines, signal_matches, signal_first_line = _tool_result_signal_scan(
-                content,
-                handle=stored.handle,
-                head_chars=len(head),
-                tail_chars=len(tail),
-            )
-            if signal_lines:
-                self._record_projection_signal_hint_event(
-                    builder="provider_single",
-                    tool_name=tool_name,
-                    tool_use_id=tool_use_id,
-                    tool_result_handle=stored.handle,
-                    original_chars=len(content),
-                    signal_match_lines=signal_matches,
-                    signal_first_line=signal_first_line,
-                )
         projection = (
             "[tool_result_projection]\n"
             f"tool: {tool_name}\n"
@@ -5484,7 +4907,6 @@ class Agent:
             f"{handle_line}"
             f"{retrieve_hint}"
             f"{search_hints}"
-            f"{signal_lines}"
             f"omitted_chars: {omitted}\n"
             f"preview_complete: {str(omitted == 0).lower()}\n"
             f"reason: {reason}.\n"
@@ -5662,7 +5084,6 @@ class Agent:
         *,
         raw_content: str,
         projected_content: str,
-        signal_lines: str = "",
     ) -> str:
         return (
             "[tool_result_projection]\n"
@@ -5672,7 +5093,6 @@ class Agent:
             "preview_complete: false\n"
             f"{_TOOL_RESULT_RETRIEVE_HINT}"
             f"{_tool_result_search_hints(raw_content)}"
-            f"{signal_lines}"
             f"{projected_content}"
         )
 
@@ -5721,20 +5141,10 @@ class Agent:
         raw_content: str,
         arguments: dict[str, Any] | None = None,
     ) -> ToolResult:
-        signal_lines = ""
-        signal_matches = 0
-        signal_first_line: int | None = None
-        if self._projection_signal_hints_active():
-            signal_lines, signal_matches, signal_first_line = _tool_result_signal_scan(
-                raw_content,
-                handle=stored.handle,
-                preview_lines=frozenset(guarded_result.content.splitlines()),
-            )
         projected_content = self._tool_result_projection_payload(
             stored,
             raw_content=raw_content,
             projected_content=guarded_result.content,
-            signal_lines=signal_lines,
         )
         if len(projected_content) >= len(raw_content):
             return self._tool_result_projection_store_unavailable_noop(
@@ -5743,16 +5153,6 @@ class Agent:
                 arguments=arguments,
                 projected_chars=len(projected_content),
                 json_guard_applied=True,
-            )
-        if signal_lines:
-            self._record_projection_signal_hint_event(
-                builder="json_guard",
-                tool_name=guarded_result.tool_name,
-                tool_use_id=guarded_result.tool_use_id,
-                tool_result_handle=stored.handle,
-                original_chars=len(raw_content),
-                signal_match_lines=signal_matches,
-                signal_first_line=signal_first_line,
             )
 
         tokens_before = get_approx_tokens(raw_content)
@@ -5883,14 +5283,6 @@ class Agent:
             )
         json_guard_applied = guarded
 
-        diagnostic_reason = self._tool_result_diagnostic_reason(result, raw_snapshot_content)
-        if diagnostic_reason is not None:
-            self._record_fresh_diagnostic_result(
-                reason=diagnostic_reason,
-                tool_name=result.tool_name,
-                tool_use_id=result.tool_use_id,
-                original_chars=len(raw_snapshot_content),
-            )
         semantic_skip_reason = self._semantic_tool_result_projection_skip_reason(
             result,
             tool_call=tool_call,
@@ -5928,57 +5320,6 @@ class Agent:
                 json_guard_applied=json_guard_applied,
             )
             return result
-        fresh_diagnostic_cap = self._fresh_diagnostic_inline_max_chars()
-        if (
-            diagnostic_reason is not None
-            and fresh_diagnostic_cap > 0
-            and len(raw_snapshot_content) <= fresh_diagnostic_cap
-            and not json_guard_applied
-        ):
-            self.config.metadata["tool_projection_noops"] = (
-                self.config.metadata.get("tool_projection_noops", 0) + 1
-            )
-            self.config.metadata["tool_projection_fresh_diagnostic_one_hop_preserves"] = (
-                self.config.metadata.get(
-                    "tool_projection_fresh_diagnostic_one_hop_preserves",
-                    0,
-                )
-                + 1
-            )
-            append_runtime_event(
-                self.config.runtime_events_path,
-                {
-                    "feature": "tool_result_projection",
-                    "name": "tool_projection_fresh_diagnostic",
-                    "action": "one_hop_preserved",
-                    "reason": diagnostic_reason,
-                    "session_key": self._session_key,
-                    "agent_id": self.config.tool_result_store_agent_id
-                    or self.config.metadata.get("agent_id"),
-                    "tool_name": result.tool_name,
-                    "tool_use_id": result.tool_use_id,
-                    "original_chars": len(raw_snapshot_content),
-                },
-            )
-            self._write_turn_call_log(
-                "tool_projection_noop",
-                tool_use_id=result.tool_use_id,
-                name=result.tool_name,
-                original_chars=len(raw_snapshot_content),
-                reason="fresh_diagnostic_one_hop_preserved",
-                diagnostic_reason=diagnostic_reason,
-            )
-            self._record_tool_projection_runtime_event(
-                outcome="noop",
-                reason="fresh_diagnostic_one_hop_preserved",
-                tool_name=result.tool_name,
-                tool_use_id=result.tool_use_id,
-                original_chars=len(raw_snapshot_content),
-                arguments=projection_arguments,
-                is_error=result.is_error,
-                json_guard_applied=json_guard_applied,
-            )
-            return original_result
         reduction = reduce_tool_result_with_tokenjuice(
             tool_name=result.tool_name,
             content=result.content,
@@ -6034,24 +5375,10 @@ class Agent:
 
         stored: ToolResultRecord | None = None
         stored_handle: str | None = None
-        signal_matches = 0
-        signal_first_line: int | None = None
         if self.config.tool_result_store_dir:
             placeholder_handle = "tr-" + ("0" * 32)
-            # Scan once here and re-render with the real handle after the
-            # store write: placeholder and stored handles have identical
-            # length, so the probe below measures the true envelope size.
-            probe_signal_lines = ""
-            if self._projection_signal_hints_active():
-                (
-                    probe_signal_lines,
-                    signal_matches,
-                    signal_first_line,
-                ) = _tool_result_signal_scan(
-                    raw_snapshot_content,
-                    handle=placeholder_handle,
-                    preview_lines=frozenset(projected_content.splitlines()),
-                )
+            # Placeholder and stored handles have identical length, so this
+            # probe measures the envelope before committing a Store write.
             candidate_with_envelope = (
                 "[tool_result_projection]\n"
                 f"tool_result_handle: {placeholder_handle}\n"
@@ -6059,7 +5386,6 @@ class Agent:
                 f"original_chars: {len(raw_snapshot_content)}\n"
                 f"{_TOOL_RESULT_RETRIEVE_HINT}"
                 f"{_tool_result_search_hints(raw_snapshot_content)}"
-                f"{probe_signal_lines}"
                 f"{projected_content}"
             )
             if len(candidate_with_envelope) >= len(raw_snapshot_content):
@@ -6108,18 +5434,11 @@ class Agent:
                     reducer=reduction.reducer,
                     json_guard_applied=json_guard_applied,
                 )
-        signal_lines = ""
         if stored is not None:
-            signal_lines = _render_projection_signal_lines(
-                handle=stored.handle,
-                match_count=signal_matches,
-                first_line_number=signal_first_line,
-            )
             projected_content = self._tool_result_projection_payload(
                 stored,
                 raw_content=raw_snapshot_content,
                 projected_content=projected_content,
-                signal_lines=signal_lines,
             )
 
         if len(projected_content) >= len(raw_snapshot_content):
@@ -6148,17 +5467,6 @@ class Agent:
                 json_guard_applied=json_guard_applied,
             )
             return original_result
-
-        if signal_lines and stored is not None:
-            self._record_projection_signal_hint_event(
-                builder="fresh",
-                tool_name=result.tool_name,
-                tool_use_id=result.tool_use_id,
-                tool_result_handle=stored.handle,
-                original_chars=len(raw_snapshot_content),
-                signal_match_lines=signal_matches,
-                signal_first_line=signal_first_line,
-            )
 
         tokens_before = get_approx_tokens(raw_snapshot_content)
         tokens_after = get_approx_tokens(projected_content)
@@ -6196,15 +5504,6 @@ class Agent:
             is_error=result.is_error,
             json_guard_applied=json_guard_applied,
         )
-        if diagnostic_reason is not None:
-            self._record_projected_diagnostic_evidence(
-                handle=stored_handle,
-                tool_name=result.tool_name,
-                tool_use_id=result.tool_use_id,
-                reason=diagnostic_reason,
-                original_chars=len(raw_snapshot_content),
-                projected_chars=len(projected_content),
-            )
         return ToolResult(
             tool_use_id=result.tool_use_id,
             tool_name=result.tool_name,
@@ -6216,14 +5515,6 @@ class Agent:
             effect_outcome=result.effect_outcome,
             terminal_response_text=result.terminal_response_text,
         )
-
-    async def _canonicalize_tool_result(
-        self,
-        result: ToolResult,
-        *,
-        tool_call: ToolCall | None = None,
-    ) -> ToolResult:
-        return await self._project_tool_result_for_llm(result, tool_call=tool_call)
 
     def _record_provider_tool_result_projection(
         self,
@@ -6268,9 +5559,8 @@ class Agent:
                     continue
                 content = block.content if isinstance(block.content, str) else str(block.content)
                 if content.startswith("[duplicate_tool_result_elided]\n"):
-                    # Dedup elision depends on another block's current state
-                    # (its survivor), not solely on this block's own content —
-                    # never freeze it; let dedup recompute it every request.
+                    # Historical dedup markers refer to another result; do not
+                    # freeze them as self-contained projection evidence.
                     continue
                 if _tool_result_content_is_provider_projection(content):
                     self._freeze_provider_tool_result_projection(
@@ -6675,8 +5965,6 @@ class Agent:
     ) -> AsyncIterator[AgentEvent]:
         """Async generator that drives the state machine."""
         self._provider_tool_result_overrides = {}
-        self._projected_diagnostic_evidence = {}
-        self._focused_retrieved_tool_result_handles = set()
         self._current_turn_message = message
         _meta_invoke_turn_count.set(0)
         usage_scope = current_usage_accounting_scope()
@@ -14102,13 +13390,8 @@ class Agent:
                         recovery_read_paths=workspace_edit_gate_recovery_read_paths,
                         recovery_reads_remaining=(workspace_edit_gate_recovery_reads_remaining),
                     )
-                    diagnostic_retrieval_gate_result = (
-                        self._projected_diagnostic_retrieval_gate_tool_result(execution_tc)
-                    )
                     if gate_result is not None:
                         res = gate_result
-                    elif diagnostic_retrieval_gate_result is not None:
-                        res = diagnostic_retrieval_gate_result
                     elif preflight_result is not None:
                         res = preflight_result
                     else:
@@ -14195,7 +13478,6 @@ class Agent:
                                 failure_code="writer_tool_timed_out",
                             )
                     duration_ms = int((time.monotonic() - started) * 1000)
-                    self._record_focused_diagnostic_retrieval(execution_tc, res)
                     if len(self._effective_workspace_write_records()) > 0:
                         workspace_edit_gate_details = None
                         workspace_edit_gate_recovery_read_paths.clear()
@@ -17944,7 +17226,6 @@ class Agent:
         # not affect message cardinality.  Skip them during a count preview:
         # the normal paths update metadata, logs, and snapshot stores.
         if not preview:
-            source_messages = self._dedup_repeated_tool_results_for_provider(source_messages)
             source_messages = self._compact_aggregate_tool_results_for_provider(source_messages)
         source_messages = self._sanitize_projected_tool_use_arguments_for_provider(
             source_messages,
@@ -20866,20 +20147,6 @@ class Agent:
         ]
 
     @staticmethod
-    def _parse_tool_argument_projection(value: str) -> dict[str, str] | None:
-        if not value.startswith(_TOOL_ARGUMENT_PROJECTION_PREFIX):
-            return None
-        metadata: dict[str, str] = {}
-        for line in value.splitlines()[1:]:
-            if line in {"head:", "tail:"}:
-                break
-            key, separator, raw_value = line.partition(":")
-            if not separator:
-                continue
-            metadata[key.strip()] = raw_value.strip()
-        return metadata
-
-    @staticmethod
     def _provider_projection_placeholder(tool_name: str, field: str) -> str:
         return (
             f"[invalid_provider_context_projection:{tool_name}.{field}] "
@@ -22849,15 +22116,6 @@ class Agent:
             tool_result_projection_max_inline_chars=(
                 self.config.tool_result_projection_max_inline_chars
             ),
-            tool_result_fresh_diagnostic_policy_enabled=(
-                self.config.tool_result_fresh_diagnostic_policy_enabled
-            ),
-            tool_result_diagnostic_retrieval_gate_enabled=(
-                self.config.tool_result_diagnostic_retrieval_gate_enabled
-            ),
-            tool_result_fresh_diagnostic_inline_max_chars=(
-                self.config.tool_result_fresh_diagnostic_inline_max_chars
-            ),
             tool_result_dispatch_max_chars=self.config.tool_result_dispatch_max_chars,
             tool_result_dispatch_turn_max_chars=(self.config.tool_result_dispatch_turn_max_chars),
             tool_result_provider_request_max_chars=(
@@ -22895,9 +22153,6 @@ class Agent:
             repeated_tool_call_recovery_extra_tools=(
                 self.config.repeated_tool_call_recovery_extra_tools
             ),
-            provider_history_dedup_enabled=self.config.provider_history_dedup_enabled,
-            provider_history_dedup_min_repeats=(self.config.provider_history_dedup_min_repeats),
-            projection_signal_hints=self.config.projection_signal_hints,
             progress_watchdog_mode=self.config.progress_watchdog_mode,
             progress_watchdog_repeated_tool_error_threshold=(
                 self.config.progress_watchdog_repeated_tool_error_threshold

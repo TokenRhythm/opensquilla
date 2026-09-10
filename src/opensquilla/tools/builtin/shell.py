@@ -1544,12 +1544,6 @@ def _git_status_paths(output: str) -> list[str]:
     return paths
 
 
-def _sandbox_effectively_off() -> bool:
-    runtime = get_runtime()
-    effective = getattr(runtime, "effective", None) if runtime is not None else None
-    return runtime is None or not bool(getattr(effective, "sandbox_enabled", False))
-
-
 def _context_run_mode() -> str | None:
     return current_run_mode()
 
@@ -2267,16 +2261,6 @@ def _sandbox_shell_policy_cwd(cwd: str | None) -> Path | None:
     if cwd:
         return Path(cwd).expanduser().resolve(strict=False)
     return None
-
-
-def _trusted_windows_cmd_path() -> str:
-    comspec = os.environ.get("COMSPEC", "")
-    if _is_absolute_cmd_exe(comspec):
-        return comspec
-    system_root = os.environ.get("SystemRoot") or os.environ.get("SYSTEMROOT") or ""
-    if system_root and "\x00" not in system_root and ntpath.isabs(system_root):
-        return ntpath.join(system_root, "System32", "cmd.exe")
-    return r"C:\Windows\System32\cmd.exe"
 
 
 def _is_absolute_cmd_exe(path: str) -> bool:
@@ -5254,22 +5238,6 @@ def _runtime_readonly_shell_block(
                 "retryable": False,
             }
     return None
-
-
-def _windows_runtime_readonly_shell_block(
-    tool_name: str,
-    command: str,
-    workdir: str | None,
-    *,
-    stdin: str | None = None,
-) -> dict[str, object] | None:
-    return _runtime_readonly_shell_block(
-        tool_name,
-        command,
-        workdir,
-        stdin=stdin,
-        runtime=get_runtime(),
-    )
 
 
 def _runtime_python_environment_mutation(

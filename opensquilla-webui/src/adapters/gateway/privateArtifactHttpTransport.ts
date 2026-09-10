@@ -180,13 +180,6 @@ export function artifactHttpAccessUrl(
   return artifactContentUrl(artifact, baseOrigin, 'content', options.absolute === true)
 }
 
-export function artifactHttpThumbnailUrl(
-  artifact: ArtifactPayload,
-  baseOrigin: string,
-): string {
-  return artifactContentUrl(artifact, baseOrigin, 'thumbnail')
-}
-
 export function artifactHttpGatewayOpenUrl(
   artifact: ArtifactPayload,
   baseOrigin: string,

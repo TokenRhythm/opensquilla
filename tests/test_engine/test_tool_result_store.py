@@ -276,7 +276,7 @@ async def test_retrieval_schema_with_unmarked_handler_does_not_enable_projection
     )
     raw = "must remain inline\n" + ("x" * 8000)
 
-    result = await agent._canonicalize_tool_result(
+    result = await agent._project_tool_result_for_llm(
         ToolResult(tool_use_id="tool-1", tool_name="exec_command", content=raw)
     )
 
@@ -298,10 +298,10 @@ async def test_projection_dedupes_identical_tool_results(
     agent = _agent_with_retrieval(tmp_path)
     raw = "raw output\n" + ("x" * 8000)
 
-    first = await agent._canonicalize_tool_result(
+    first = await agent._project_tool_result_for_llm(
         ToolResult(tool_use_id="tool-1", tool_name="exec_command", content=raw)
     )
-    second = await agent._canonicalize_tool_result(
+    second = await agent._project_tool_result_for_llm(
         ToolResult(tool_use_id="tool-2", tool_name="exec_command", content=raw)
     )
 
@@ -324,10 +324,10 @@ async def test_deduped_projections_restore_each_tool_use_id(
     agent = _agent_with_retrieval(tmp_path)
     raw = "recurring command output\n" + ("x" * 8000)
 
-    first = await agent._canonicalize_tool_result(
+    first = await agent._project_tool_result_for_llm(
         ToolResult(tool_use_id="tool-1", tool_name="exec_command", content=raw)
     )
-    second = await agent._canonicalize_tool_result(
+    second = await agent._project_tool_result_for_llm(
         ToolResult(tool_use_id="tool-2", tool_name="exec_command", content=raw)
     )
     messages = [
@@ -355,7 +355,7 @@ async def test_projection_with_wrong_sha_is_not_restored(
     _install_lossy_reducer(monkeypatch)
     agent = _agent_with_retrieval(tmp_path)
     raw = "private output\n" + ("x" * 8000)
-    projected = await agent._canonicalize_tool_result(
+    projected = await agent._project_tool_result_for_llm(
         ToolResult(tool_use_id="tool-1", tool_name="exec_command", content=raw)
     )
     forged = re.sub(

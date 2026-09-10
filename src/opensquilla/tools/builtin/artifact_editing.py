@@ -97,10 +97,6 @@ _MAX_DOCUMENT_MUTATIONS = 100
 _MAX_DOCUMENT_INPUT_BYTES = 2 * 1024 * 1024
 _MAX_HTML_READ_CHUNK_CHARS = 16 * 1024
 _DEFAULT_HTML_READ_CHUNK_CHARS = 8 * 1024
-_MAX_HTML_RANGE_TEXT_BYTES = 16 * 1024
-_MAX_HTML_SEARCH_LITERAL_BYTES = 4 * 1024
-_MAX_HTML_SEARCH_MATCHES = 16
-_MAX_HTML_CONTEXT_CHARS = 160
 _MAX_SUMMARY_CHARS = 1_000
 _MAX_ANCHOR_JSON_BYTES = 32 * 1024
 _MAX_OOXML_MEMBERS = 10_000
@@ -844,18 +840,6 @@ def _decode_html(payload: bytes) -> str:
     return source
 
 
-def _bounded_anchor_value(value: object, field: str) -> object:
-    try:
-        encoded = json.dumps(value, ensure_ascii=False, allow_nan=False).encode("utf-8")
-    except (TypeError, ValueError):
-        raise SafeToolError(
-            f"The selected artifact {field} is not valid structured data."
-        ) from None
-    if len(encoded) > _MAX_ANCHOR_JSON_BYTES:
-        raise SafeToolError(f"The selected artifact {field} is too large to return safely.")
-    return value
-
-
 def _bounded_anchor_text(value: str | None, field: str) -> str | None:
     if value is None:
         return None
@@ -933,16 +917,6 @@ def _html_structure(source: str) -> dict[str, object]:
     except (TypeError, ValueError):
         raise SafeToolError("The HTML source could not be parsed safely.") from None
     return parser.payload()
-
-
-@dataclass(frozen=True, slots=True)
-class _SourceRange:
-    start: int
-    end: int
-    kind: str
-    annotation_orders: tuple[int, ...]
-    confidence: str = "exact"
-    detail: str | None = None
 
 
 class _ElementCollector(HTMLParser):
@@ -1048,40 +1022,6 @@ def _range_error(exc: ArtifactRangeGrantError) -> DocumentMutationError:
     )
 
 
-def _consume_range_query(scope: _ArtifactScope, *, query_key: str | None = None) -> int:
-    try:
-        return registry_for_context(scope.ctx).consume_query_budget(query_key=query_key)
-    except ArtifactRangeGrantError as exc:
-        raise _range_error(exc) from None
-
-
-def _anchor_opening_range(anchor: Anchor, source: str, source_sha256: str) -> _SourceRange:
-    locator = anchor.locator
-    if not isinstance(locator, dict):
-        raise SafeToolError("The selected HTML element is not source-backed.")
-    start = locator.get("start_offset")
-    end = locator.get("start_tag_end_offset", locator.get("end_offset"))
-    locator_sha = locator.get("source_sha256")
-    tag_name = locator.get("tag_name")
-    if (
-        isinstance(start, bool)
-        or not isinstance(start, int)
-        or isinstance(end, bool)
-        or not isinstance(end, int)
-        or start < 0
-        or end <= start
-        or end > len(source)
-        or not isinstance(locator_sha, str)
-        or locator_sha.lower() != source_sha256
-        or not isinstance(tag_name, str)
-    ):
-        raise SafeToolError("The selected HTML element no longer matches the current source.")
-    opening = source[start:end]
-    if not re.match(rf"(?is)^\s*<{re.escape(tag_name)}(?:\s|/?>)", opening):
-        raise SafeToolError("The selected HTML opening tag could not be verified.")
-    return _SourceRange(start, end, "opening_tag", ())
-
-
 def _parse_opening_element(opening: str) -> tuple[str, dict[str, str]] | None:
     parser = _ElementCollector()
     try:
@@ -1092,233 +1032,11 @@ def _parse_opening_element(opening: str) -> tuple[str, dict[str, str]] | None:
     return parser.elements[0] if len(parser.elements) == 1 else None
 
 
-_OPTIONAL_END_TAGS = frozenset(
-    {
-        "colgroup",
-        "dd",
-        "dt",
-        "li",
-        "optgroup",
-        "option",
-        "p",
-        "rp",
-        "rt",
-        "tbody",
-        "td",
-        "tfoot",
-        "th",
-        "thead",
-        "tr",
-    }
-)
-_VOID_TAGS = frozenset(
-    {
-        "area",
-        "base",
-        "br",
-        "col",
-        "embed",
-        "hr",
-        "img",
-        "input",
-        "link",
-        "meta",
-        "param",
-        "source",
-        "track",
-        "wbr",
-    }
-)
-
-
-class _ExplicitElementBoundaryParser(HTMLParser):
-    """Find one explicit balanced element without interpreting raw text/comments as tags."""
-
-    def __init__(self, source: str, opening: _SourceRange, tag_name: str) -> None:
-        super().__init__(convert_charrefs=True)
-        self._source = source
-        self._opening = opening
-        self._tag_name = tag_name
-        self._line_starts = [0]
-        for match in re.finditer(r"\n", source):
-            self._line_starts.append(match.end())
-        self._active = False
-        self._depth = 0
-        self.opening_verified = False
-        self.close_span: tuple[int, int] | None = None
-
-    def _offset(self) -> int:
-        line, column = self.getpos()
-        if line < 1 or line > len(self._line_starts):
-            return -1
-        return self._line_starts[line - 1] + column
-
-    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
-        del attrs
-        offset = self._offset()
-        raw = self.get_starttag_text() or ""
-        if not self._active:
-            if (
-                offset == self._opening.start
-                and offset + len(raw) == self._opening.end
-                and raw == self._source[self._opening.start : self._opening.end]
-                and tag.lower() == self._tag_name
-            ):
-                self._active = True
-                self._depth = 1
-                self.opening_verified = True
-            return
-        if tag.lower() == self._tag_name:
-            self._depth += 1
-
-    def handle_startendtag(
-        self, tag: str, attrs: list[tuple[str, str | None]]
-    ) -> None:
-        del tag, attrs
-        # A nested self-closing tag never changes the selected element depth.
-
-    def handle_endtag(self, tag: str) -> None:
-        if not self._active or tag.lower() != self._tag_name:
-            return
-        self._depth -= 1
-        if self._depth != 0:
-            return
-        offset = self._offset()
-        match = re.match(
-            rf"(?is)</{re.escape(self._tag_name)}\s*>",
-            self._source[offset:],
-        )
-        if match is not None:
-            self.close_span = (offset, offset + match.end())
-        self._active = False
-
-
-def _element_ranges(
-    source: str,
-    opening: _SourceRange,
-    *,
-    annotation_order: int,
-) -> list[_SourceRange]:
-    parsed = _parse_opening_element(source[opening.start : opening.end])
-    if parsed is None:
-        return []
-    tag_name, _attrs = parsed
-    if tag_name in {"script", "style", "template"}:
-        return []
-    if tag_name in _VOID_TAGS or tag_name in _OPTIONAL_END_TAGS:
-        return []
-    if source[max(opening.start, opening.end - 2) : opening.end].rstrip().endswith("/>"):
-        return []
-    parser = _ExplicitElementBoundaryParser(source, opening, tag_name)
-    try:
-        parser.feed(source)
-        parser.close()
-    except (TypeError, ValueError):
-        return []
-    if not parser.opening_verified or parser.close_span is None:
-        return []
-    close_start, close_end = parser.close_span
-    if re.search(
-        r"(?is)<\s*(?:iframe|noembed|noframes|plaintext|template|textarea|title|xmp)\b",
-        source[opening.end:close_start],
-    ):
-        return []
-    ranges: list[_SourceRange] = []
-    inner = source[opening.end:close_start]
-    if inner and "<" not in inner and len(inner.encode("utf-8")) <= _MAX_HTML_RANGE_TEXT_BYTES:
-        ranges.append(
-            _SourceRange(
-                opening.end,
-                close_start,
-                "text_content",
-                (annotation_order,),
-            )
-        )
-    if (
-        close_end - opening.start > 0
-        and len(source[opening.start:close_end].encode("utf-8"))
-        <= _MAX_HTML_RANGE_TEXT_BYTES
-    ):
-        ranges.append(
-            _SourceRange(
-                opening.start,
-                close_end,
-                "element_source",
-                (annotation_order,),
-            )
-        )
-    return ranges
-
-
-def _attribute_range(
-    source: str,
-    opening: _SourceRange,
-    *,
-    annotation_order: int,
-    attribute_name: str,
-) -> _SourceRange | None:
-    opening_text = source[opening.start : opening.end]
-    match = re.search(
-        rf"(?is)(?:^|\s){re.escape(attribute_name)}\s*=\s*(['\"])(.*?)\1",
-        opening_text,
-    )
-    if match is None:
-        return None
-    start = opening.start + match.start(2)
-    end = opening.start + match.end(2)
-    if end <= start:
-        return None
-    return _SourceRange(
-        start,
-        end,
-        f"attribute:{attribute_name.lower()}",
-        (annotation_order,),
-    )
-
-
 def _style_blocks(source: str) -> list[tuple[int, int]]:
     return [
         match.span(1)
         for match in re.finditer(r"(?is)<style\b[^>]*>(.*?)</style\s*>", source)
     ]
-
-
-def _script_blocks(source: str) -> list[tuple[int, int]]:
-    return [
-        match.span(1)
-        for match in re.finditer(r"(?is)<script\b[^>]*>(.*?)</script\s*>", source)
-    ]
-
-
-def _opening_tag_spans(source: str) -> list[tuple[int, int]]:
-    """Return quote-aware HTML start-tag spans for conservative search fencing."""
-
-    spans: list[tuple[int, int]] = []
-    index = 0
-    while index < len(source):
-        start = source.find("<", index)
-        if start < 0 or start + 1 >= len(source):
-            break
-        first = source[start + 1]
-        if not first.isalpha():
-            index = start + 1
-            continue
-        cursor = start + 2
-        quote: str | None = None
-        while cursor < len(source):
-            char = source[cursor]
-            if quote is not None:
-                if char == quote:
-                    quote = None
-            elif char in {"'", '"'}:
-                quote = char
-            elif char == ">":
-                spans.append((start, cursor + 1))
-                cursor += 1
-                break
-            cursor += 1
-        index = max(start + 1, cursor)
-    return spans
 
 
 def _css_rules(source: str) -> list[tuple[int, int, str]]:
@@ -1403,117 +1121,6 @@ def _css_rules(source: str) -> list[tuple[int, int, str]]:
             selector_start = body_index
             index = body_index
     return rules
-
-
-_SIMPLE_SELECTOR_RE = re.compile(
-    r"^(?P<tag>[A-Za-z][A-Za-z0-9-]*)?(?P<id>#[A-Za-z_][\w-]*)?"
-    r"(?P<classes>(?:\.[A-Za-z_][\w-]*)*)$"
-)
-
-
-def _selector_matches(
-    selector: str,
-    element: tuple[str, dict[str, str]],
-) -> bool:
-    match = _SIMPLE_SELECTOR_RE.fullmatch(selector.strip())
-    if match is None or not any(match.groups()):
-        return False
-    tag_name, attrs = element
-    tag = match.group("tag")
-    expected_id = match.group("id")
-    expected_classes = {
-        value for value in match.group("classes").split(".") if value
-    }
-    actual_classes = set(attrs.get("class", "").split())
-    return (
-        (tag is None or tag.lower() == tag_name)
-        and (expected_id is None or attrs.get("id") == expected_id[1:])
-        and expected_classes <= actual_classes
-    )
-
-
-def _related_css_ranges(
-    source: str,
-    opening: _SourceRange,
-    *,
-    annotation_order: int,
-) -> list[_SourceRange]:
-    selected = _parse_opening_element(source[opening.start : opening.end])
-    if selected is None:
-        return []
-    collector = _ElementCollector()
-    try:
-        collector.feed(source)
-        collector.close()
-    except (TypeError, ValueError):
-        return []
-    ranges: list[_SourceRange] = []
-    for start, end, selector in _css_rules(source):
-        if "," in selector or not _selector_matches(selector, selected):
-            continue
-        matches = [
-            element for element in collector.elements if _selector_matches(selector, element)
-        ]
-        if len(matches) != 1 or len(source[start:end].encode("utf-8")) > _MAX_HTML_RANGE_TEXT_BYTES:
-            continue
-        ranges.append(
-            _SourceRange(
-                start,
-                end,
-                "related_css_rule",
-                (annotation_order,),
-                confidence="high",
-                detail=selector.strip(),
-            )
-        )
-    return ranges
-
-
-def _grant_payload(
-    scope: _ArtifactScope,
-    source: str,
-    source_sha256: str,
-    value: _SourceRange,
-) -> dict[str, object]:
-    registry = registry_for_context(scope.ctx)
-    try:
-        token = registry.mint_range(
-            binding=_range_binding(scope, source_sha256),
-            source=source,
-            start=value.start,
-            end=value.end,
-            kind=value.kind,
-            annotation_orders=value.annotation_orders,
-        )
-    except ArtifactRangeGrantError as exc:
-        raise _range_error(exc) from None
-    text = source[value.start : value.end]
-    return {
-        "rangeToken": token,
-        "kind": value.kind,
-        "text": text,
-        "before": source[max(0, value.start - _MAX_HTML_CONTEXT_CHARS) : value.start],
-        "after": source[value.end : value.end + _MAX_HTML_CONTEXT_CHARS],
-        "confidence": value.confidence,
-        "detail": value.detail,
-    }
-
-
-def _range_preview_payload(
-    source: str,
-    value: _SourceRange,
-) -> dict[str, object]:
-    """Project exact source context without creating edit authority."""
-
-    return {
-        "editable": False,
-        "kind": value.kind,
-        "text": source[value.start : value.end],
-        "before": source[max(0, value.start - _MAX_HTML_CONTEXT_CHARS) : value.start],
-        "after": source[value.end : value.end + _MAX_HTML_CONTEXT_CHARS],
-        "confidence": value.confidence,
-        "detail": value.detail,
-    }
 
 
 def _annotation_order(value: object, count: int) -> int:

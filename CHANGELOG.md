@@ -43,6 +43,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   copies are not removed, and memory files and scheduled jobs stay in place.
   Old Meta workflow definitions that reference retired Skills must be updated
   by their authors; they are not automatically migrated.
+- Retired opt-in projection experiments: signal-scan hints, provider-history
+  deduplication, tiny compaction guards, configurable stub previews, and fresh
+  diagnostic preservation/retrieval gates. Existing configuration fields remain
+  accepted but no longer activate these mechanisms. Default Tokenjuice results,
+  Store/retrieval guarantees, fixed previews and compaction safety protections
+  remain unchanged; experimental diagnostic counters and events are removed.
 
 ### Fixed
 
