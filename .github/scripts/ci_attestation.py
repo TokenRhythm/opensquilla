@@ -41,6 +41,9 @@ COMPOSITION_BASELINE_SUITES: Final = frozenset({"readme-locale", "workflow-lint"
 COMPOSITION_COMBINED_SMOKE_TRUST_ROOT: Final = frozenset()
 TRUST_POLICY_MANIFEST: Final = ".github/ci/trust-policy.v1.json"
 TRUST_POLICY_SCHEMA_VERSION: Final = 1
+# Initially reuse only suites with audited, bounded inputs and fixed matrices.
+# Producers and Python/native integration suites continue to execute in the queue.
+PARTIAL_REUSE_SUITES: Final = frozenset({"frontend-validation", "tui"})
 
 
 class AttestationError(RuntimeError):
@@ -945,7 +948,7 @@ def validate_candidate(
             raise AttestationError("attestation tested tree does not match the queue")
         if tested_base_sha != queue_base_sha:
             raise AttestationError("attestation tested base does not match the queue")
-    elif match_kind == "composed":
+    elif match_kind in {"composed", "partial"}:
         if reconstructed_queue_tree != queue_tree_sha:
             raise AttestationError("pull request head and queue base do not reconstruct queue tree")
         if tested_base_sha == queue_base_sha:
@@ -1030,6 +1033,52 @@ def validate_candidate(
             raise AttestationError("current pull request target changed")
 
 
+def partial_queue_plan(
+    *, repo: Path, attestation: Mapping[str, Any], queue_base_sha: str
+) -> Mapping[str, Any]:
+    """Partition a FULL queue plan; never borrow coverage from the queue base.
+
+    The caller must authenticate the PR run before consuming this plan. A suite
+    needs identical execution inputs and the entire required platform matrix.
+    Unproved suites run in full, including artifact producers and shared jobs.
+    """
+    tested_base = _require_sha(attestation.get("base_sha"), "tested base SHA")
+    if subprocess.run(
+        ["git", "merge-base", "--is-ancestor", tested_base, queue_base_sha],
+        cwd=repo, capture_output=True, check=False,
+    ).returncode != 0:
+        raise AttestationError("partial evidence base is not an ancestor of queue base")
+    delta = _changed_paths(repo, tested_base, queue_base_sha)
+    if not delta or _plan_paths(repo, delta).get("full_fallback") is not False:
+        raise AttestationError("partial evidence base delta requires full fallback")
+    full = dict(_plan_paths(repo, [".ci/run-all"]))
+    suites = _validated_suites(attestation)
+    digests = _validated_execution_digests(attestation, suites)
+    cells = _validated_platform_matrix(attestation, suites)
+    reused = sorted(
+        suite for suite in PARTIAL_REUSE_SUITES & suites
+        if digests[suite] == full["suite_execution_digests"].get(suite)
+        and [cell for cell in cells if cell["suite"] == suite]
+        == [cell for cell in full["platform_matrix"] if cell["suite"] == suite]
+    )
+    if not reused:
+        raise AttestationError(
+            "only exact-tree pull request evidence may be reused: no reusable suites"
+        )
+    full["reused_suites"] = reused
+    full["required_suites"] = sorted(set(full["required_suites"]) - set(reused))
+    full["platform_matrix"] = [c for c in full["platform_matrix"] if c["suite"] not in reused]
+    full["suite_execution_digests"] = {
+        key: value for key, value in full["suite_execution_digests"].items() if key not in reused
+    }
+    full["reason_codes"] = ["verified_partial_pr_evidence"]
+    full.pop("plan_digest")
+    full["plan_digest"] = hashlib.sha256(
+        json.dumps(full, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    return full
+
+
 def verify_queue(
     *,
     repo: Path,
@@ -1044,6 +1093,9 @@ def verify_queue(
     details.update(
         candidate_count=0,
         artifact_name="",
+        partial="false",
+        partial_plan="",
+        reused_suites="[]",
         combined_smoke_suites=_canonical_suite_json(),
     )
     merge_group = event.get("merge_group")
@@ -1157,10 +1209,7 @@ def verify_queue(
                 tested_tree = _require_sha(
                     attestation.get("tested_tree_sha"), "attested tree SHA"
                 )
-                if tested_tree != queue_tree_sha:
-                    raise AttestationError(
-                        "only exact-tree pull request evidence may be reused"
-                    )
+                partial = tested_tree != queue_tree_sha
                 if attestation.get("source_event") != "pull_request":
                     raise AttestationError(
                         "only pull request evidence may be reused by the queue"
@@ -1174,7 +1223,7 @@ def verify_queue(
                     queue_tree_sha=queue_tree_sha,
                     queue_base_sha=queue_base_sha,
                     queue_policy_digest=queue_policy,
-                    match_kind="exact",
+                    match_kind="partial" if partial else "exact",
                     current_pull_request=current_pull_request,
                     reconstructed_queue_tree=reconstructed_tree,
                     repo=repo,
@@ -1196,6 +1245,20 @@ def verify_queue(
                 if latest_run_id != run_id:
                     raise AttestationError(
                         "evidence workflow run is not the latest authoritative PR run"
+                    )
+                if partial:
+                    plan = partial_queue_plan(
+                        repo=repo, attestation=attestation, queue_base_sha=queue_base_sha
+                    )
+                    details.update(
+                        reason_code="reusable_partial", partial="true",
+                        partial_plan=json.dumps(plan, sort_keys=True, separators=(",", ":")),
+                        reused_suites=json.dumps(plan["reused_suites"], separators=(",", ":")),
+                    )
+                    return (
+                        False,
+                        "trusted PR suites reused; remaining full queue suites must pass",
+                        run_id,
                     )
                 details["reason_code"] = "reusable_exact"
                 reason = "matching trusted exact-base, exact-tree PR CI evidence"
@@ -1508,6 +1571,9 @@ def _verify_queue_command(args: argparse.Namespace) -> int:
         Path(args.github_output) if args.github_output else None,
         {
             "reusable": str(reusable).lower(),
+            "partial": details.get("partial", "false"),
+            "partial_plan": details.get("partial_plan", ""),
+            "reused_suites": details.get("reused_suites", "[]"),
             "reason": reason,
             "reason_code": details.get("reason_code", "artifact_invalid"),
             "source_run_id": source_run_id or "",

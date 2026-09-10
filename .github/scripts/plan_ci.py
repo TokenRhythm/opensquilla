@@ -371,7 +371,11 @@ _FIXED_PLATFORM_MATRIX: Final[dict[str, tuple[tuple[str, str], ...]]] = {
     "workflow-lint": (("ubuntu-latest", "default"),),
     "readme-locale": (("ubuntu-latest", "default"),),
     "frontend-artifact": (("ubuntu-latest", "artifact"),),
-    "frontend-validation": (("ubuntu-latest", "validation"),),
+    "frontend-validation": (
+        ("ubuntu-latest", "validation"),
+        ("ubuntu-latest", "contract-verification"),
+        ("windows-latest", "contract-determinism"),
+    ),
     "wheel-webui-roundtrip": (("ubuntu-latest", "package"),),
     "webui-chat-recovery": (("ubuntu-latest", "chromium"),),
     "tui": (("ubuntu-latest", "default"),),

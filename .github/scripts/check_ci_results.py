@@ -7,6 +7,7 @@ import json
 import os
 import sys
 from collections.abc import Mapping
+from pathlib import Path
 from typing import Final
 
 PLANNER_RESULT: Final[tuple[str, str]] = ("RESULT_PLANNER", "Plan CI suites")
@@ -158,6 +159,8 @@ def check_ci_results(env: Mapping[str, str]) -> list[str]:
 
     _validate_suite_result_contract(errors)
     required_suites = _read_required_suites(env, errors)
+    if env.get("QUEUE_PARTIAL") == "true":
+        _check_partial_coverage(env, required_suites, errors)
 
     required_results = {
         variable
@@ -174,6 +177,37 @@ def check_ci_results(env: Mapping[str, str]) -> list[str]:
         )
 
     return errors
+
+
+def _check_partial_coverage(
+    env: Mapping[str, str], executed: set[str], errors: list[str]
+) -> None:
+    """A partial run still owes EVERY full-matrix suite, by proof or execution."""
+    if env.get("GITHUB_EVENT_NAME") != "merge_group":
+        errors.append("Partial evidence is valid only for merge_group.")
+    if env.get("QUEUE_EVIDENCE_RESULT") != "success":
+        errors.append("Partial evidence verifier must succeed.")
+    if env.get("QUEUE_CANARY_RESULT") != "success":
+        errors.append("Partial queue combined-tree canary must succeed.")
+    if not env.get("QUEUE_SOURCE_RUN_ID", "").isdigit() or int(
+        env.get("QUEUE_SOURCE_RUN_ID", "0")
+    ) <= 0:
+        errors.append("Partial evidence source run is missing.")
+    try:
+        reused = json.loads(env.get("QUEUE_REUSED_SUITES", ""))
+        if (
+            not isinstance(reused, list) or not reused
+            or any(not isinstance(suite, str) for suite in reused)
+            or reused != sorted(set(reused))
+            or not set(reused) <= {"frontend-validation", "tui"}
+        ):
+            raise ValueError("invalid reused suites")
+        manifest = Path(__file__).resolve().parents[1] / "ci" / "suites.v1.json"
+        full = set(json.loads(manifest.read_text(encoding="utf-8"))["full_suites"])
+        if executed & set(reused) or executed | set(reused) != full:
+            errors.append("Executed and reused suites must partition the full queue matrix.")
+    except (OSError, ValueError, KeyError, TypeError):
+        errors.append("Partial queue coverage is invalid.")
 
 
 def main() -> int:
