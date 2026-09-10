@@ -950,16 +950,6 @@ class _TurnRunnerAgentConfigBuilderAdapter(AgentConfigBuilderPort):
                 "source_diff_candidate_mode",
                 "log",
             ),
-            runtime_state_capsule_mode=getattr(
-                runner._config,
-                "runtime_state_capsule_mode",
-                "off",
-            ),
-            text_only_tool_recovery_mode=getattr(
-                runner._config,
-                "text_only_tool_recovery_mode",
-                "off",
-            ),
             finalize_evidence_gate=bool(
                 getattr(
                     getattr(runner._config, "prompt", None),

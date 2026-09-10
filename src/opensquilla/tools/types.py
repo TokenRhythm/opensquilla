@@ -136,10 +136,9 @@ class ToolContext:
     execution_id: str | None = None
     sandbox_session_manager: Any | None = None
     sandbox_gateway_config: Any | None = None
-    # Resolved per turn by the engine (see tools.description_overrides).
-    # Keys name a tool or a "tool.param" parameter; values replace the
-    # matching model-facing description verbatim. None = mechanism off.
+    # Deprecated, unused compatibility slot; preserve construction and saved configs.
     tool_description_overrides: dict[str, str] | None = None
+    # Deprecated, unused compatibility slot; preserve construction and saved configs.
     tool_description_overrides_source: str | None = None  # "config" | "env_file"
     # Deprecated, unused compatibility slot; preserve positional arguments.
     endgame_git_freeze_instrumentation_exempt: bool = False

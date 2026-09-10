@@ -346,7 +346,6 @@ from opensquilla.session.terminal_reply import (
 )
 from opensquilla.skills.toolchains.manager import managed_toolchain_state_scope
 from opensquilla.token_estimation import estimate_tokens
-from opensquilla.tools.description_overrides import resolve_tool_description_overrides
 from opensquilla.tools.run_mode import effective_run_mode_for_context
 from opensquilla.tools.types import (
     CallerKind,
@@ -4651,34 +4650,6 @@ def _resolve_identity_prompt_mode(config: object) -> str:
     return "full"
 
 
-_PATCH_EVIDENCE_PROTOCOL_ENV = "OPENSQUILLA_PATCH_EVIDENCE_PROTOCOL"
-_PATCH_EVIDENCE_PROTOCOL_ON = {"on", "1", "true", "yes"}
-_PATCH_EVIDENCE_PROTOCOL_OFF = {"off", "0", "false", "no"}
-
-
-def _resolve_patch_evidence_protocol(config: object) -> bool:
-    """Resolve the opt-in Patch Evidence Protocol prompt flag.
-
-    ``OPENSQUILLA_PATCH_EVIDENCE_PROTOCOL`` ("on"/"off") overrides
-    ``prompt.patch_evidence_protocol`` from gateway config; default is off.
-    Unrecognized env values raise instead of being silently ignored so a
-    run manifest cannot record an override the run did not actually apply.
-    """
-    env_value = os.environ.get(_PATCH_EVIDENCE_PROTOCOL_ENV, "").strip().lower()
-    if env_value:
-        if env_value in _PATCH_EVIDENCE_PROTOCOL_ON:
-            return True
-        if env_value in _PATCH_EVIDENCE_PROTOCOL_OFF:
-            return False
-        raise ValueError(
-            f"{_PATCH_EVIDENCE_PROTOCOL_ENV} must be one of: "
-            + ", ".join(sorted(_PATCH_EVIDENCE_PROTOCOL_ON | _PATCH_EVIDENCE_PROTOCOL_OFF))
-        )
-
-    prompt_cfg = getattr(config, "prompt", None)
-    return bool(getattr(prompt_cfg, "patch_evidence_protocol", False))
-
-
 _FINALIZE_EVIDENCE_GATE_ENV = "OPENSQUILLA_FINALIZE_EVIDENCE_GATE"
 _FINALIZE_EVIDENCE_GATE_ON = {"on", "1", "true", "yes"}
 _FINALIZE_EVIDENCE_GATE_OFF = {"off", "0", "false", "no"}
@@ -4707,39 +4678,6 @@ def _resolve_finalize_evidence_gate(config: object) -> bool:
 
     prompt_cfg = getattr(config, "prompt", None)
     return bool(getattr(prompt_cfg, "finalize_evidence_gate", False))
-
-
-_SUBMIT_REVIEW_ENV = "OPENSQUILLA_SUBMIT_REVIEW"
-_SUBMIT_REVIEW_ON = {"on", "1", "true", "yes"}
-_SUBMIT_REVIEW_OFF = {"off", "0", "false", "no"}
-
-
-def _resolve_submit_review(config: object) -> bool:
-    """Resolve the opt-in review-on-submit checkpoint flag at surface time.
-
-    ``OPENSQUILLA_SUBMIT_REVIEW`` ("on"/"off") overrides
-    ``config.submit_review_enabled``; default is off. The env read mirrors
-    ``engine.turn_runner.agent_bootstrap_stage._submit_review_from_env`` so the
-    tool-surfacing decision here agrees with the loop-side gate: the loop config
-    (``AgentConfig`` built in agent_bootstrap_stage) and the TurnRunner
-    ``self._config`` are distinct objects, so reading the config field alone
-    surfaces ``submit`` only when the two happen to share provenance. Reading the
-    same env var directly keeps surfacing and loop behaviour in lockstep.
-    Unrecognized env values raise instead of being silently ignored so an
-    experiment manifest cannot record a lever the run did not actually apply.
-    """
-    env_value = os.environ.get(_SUBMIT_REVIEW_ENV, "").strip().lower()
-    if env_value:
-        if env_value in _SUBMIT_REVIEW_ON:
-            return True
-        if env_value in _SUBMIT_REVIEW_OFF:
-            return False
-        raise ValueError(
-            f"{_SUBMIT_REVIEW_ENV} must be one of: "
-            + ", ".join(sorted(_SUBMIT_REVIEW_ON | _SUBMIT_REVIEW_OFF))
-        )
-
-    return bool(getattr(config, "submit_review_enabled", False))
 
 
 class _TaskOwnedSessionAppend:
@@ -5392,9 +5330,6 @@ class TurnRunner:
             )
         normalized_input_provenance = self._normalize_input_provenance(input_provenance)
         lock = self.get_session_lock(session_key)
-        # Resolved once per turn; ValueError propagates so a run manifest
-        # cannot record an override the run did not actually apply.
-        resolved_description_overrides = resolve_tool_description_overrides(self._config)
         effective_tool_context = replace(
             tool_context,
             session_key=session_key,
@@ -5403,12 +5338,6 @@ class TurnRunner:
             router_control_hold_store=self._router_control_hold_store,
             router_control_replay_depth=router_control_replay_depth,
             router_control_turn_hold_applied=False,
-            tool_description_overrides=(
-                resolved_description_overrides[0] if resolved_description_overrides else None
-            ),
-            tool_description_overrides_source=(
-                resolved_description_overrides[1] if resolved_description_overrides else None
-            ),
         )
         configured_state_dir = getattr(self._turn_config(), "state_dir", None)
 
@@ -8307,13 +8236,6 @@ class TurnRunner:
         attached_plan_run = bool(
             ctx is not None and str(getattr(ctx, "plan_run_id", "") or "").strip()
         )
-        # The coding submit/review handshake is a mutation workflow and has no
-        # meaning in Plan mode or an attached PlanRun implementation. It is
-        # suppressed at schema construction and again in Agent's special
-        # dispatch branch.
-        submit_review_enabled = (
-            _resolve_submit_review(self._config) and not plan_mode and not attached_plan_run
-        )
         if ctx is not None:
             # A lossy tool-result projection is only useful when the model can
             # recover the stored original. Surface the read-only retrieval tool
@@ -8329,10 +8251,6 @@ class TurnRunner:
                 ctx.surfaced_tools.add("meta_invoke")
             else:
                 ctx.denied_tools.add("meta_invoke")
-            if submit_review_enabled:
-                if ctx.surfaced_tools is None:
-                    ctx.surfaced_tools = set()
-                ctx.surfaced_tools.add("submit")
             if plan_mode:
                 if ctx.surfaced_tools is None:
                     ctx.surfaced_tools = set()
@@ -8390,8 +8308,6 @@ class TurnRunner:
             # not relax a profile allowlist. Restore only controls authorized
             # by this frozen turn context; explicit denies still win in the
             # registry visibility check.
-            if submit_review_enabled and ctx.allowed_tools is not None:
-                ctx.allowed_tools = set(ctx.allowed_tools) | {"submit"}
             if not plan_mode and attached_plan_run and ctx.allowed_tools is not None:
                 ctx.allowed_tools = set(ctx.allowed_tools) | {
                     "plan_run_checkpoint",
@@ -9087,9 +9003,6 @@ class TurnRunner:
         prompt_mode = (
             "minimal" if restricted_tool_boundary else _resolve_identity_prompt_mode(self._config)
         )
-        patch_evidence_protocol = (
-            False if restricted_tool_boundary else _resolve_patch_evidence_protocol(self._config)
-        )
         finalize_evidence_gate = (
             False if restricted_tool_boundary else _resolve_finalize_evidence_gate(self._config)
         )
@@ -9106,7 +9019,6 @@ class TurnRunner:
             agents_doc=agents_doc,
             workspace_files=workspace_files,
             prompt_mode=prompt_mode,
-            patch_evidence_protocol=patch_evidence_protocol,
             finalize_evidence_gate=finalize_evidence_gate,
         )
         os_name = os.uname().sysname if hasattr(os, "uname") else platform.system()

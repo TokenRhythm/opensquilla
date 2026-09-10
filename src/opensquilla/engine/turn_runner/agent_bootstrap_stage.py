@@ -43,23 +43,14 @@ if TYPE_CHECKING:
     from opensquilla.tools.types import ToolContext
 
 _PROGRESS_WATCHDOG_MODES = frozenset({"off", "log", "warn_model", "block"})
-_TOOL_LOOP_OBSERVER_MODES = frozenset({"off", "log"})
 _SOURCE_DIFF_PRESERVATION_MODES = frozenset({"off", "log", "block"})
 _SOURCE_DIFF_CANDIDATE_MODES = frozenset({"off", "log", "warn_model"})
-_RUNTIME_STATE_CAPSULE_MODES = frozenset({"off", "log", "inject"})
 _TRUE_ENV_VALUES = frozenset({"1", "true", "yes", "on", "enabled"})
 
 
 def _progress_watchdog_mode_from_env() -> Literal["off", "log", "warn_model", "block"]:
     raw = os.environ.get("OPENSQUILLA_PROGRESS_WATCHDOG_MODE", "off").strip().lower()
     if raw in _PROGRESS_WATCHDOG_MODES:
-        return raw  # type: ignore[return-value]
-    return "off"
-
-
-def _tool_loop_observer_mode_from_env() -> Literal["off", "log"]:
-    raw = os.environ.get("OPENSQUILLA_TOOL_LOOP_OBSERVER_MODE", "off").strip().lower()
-    if raw in _TOOL_LOOP_OBSERVER_MODES:
         return raw  # type: ignore[return-value]
     return "off"
 
@@ -118,33 +109,10 @@ def _source_diff_candidate_mode_from_env(
     return _normalize_source_diff_candidate_mode(config_value)
 
 
-def _runtime_state_capsule_mode_from_env(
-    config_value: str | None = None,
-) -> Literal["off", "log", "inject"]:
-    raw = os.environ.get("OPENSQUILLA_RUNTIME_STATE_CAPSULE_MODE")
-    if raw is None:
-        raw = config_value
-    if raw is None:
-        return "off"
-    normalized = raw.strip().lower()
-    if normalized in _RUNTIME_STATE_CAPSULE_MODES:
-        return normalized  # type: ignore[return-value]
-    return "off"
-
-
 def _post_tool_empty_recovery_mode_from_env() -> Literal["off", "log", "warn_model"]:
     return normalize_runtime_recovery_mode(
         os.environ.get("OPENSQUILLA_POST_TOOL_EMPTY_RECOVERY_MODE")
     )
-
-
-def _text_only_tool_recovery_mode_from_env(
-    config_value: str | None = None,
-) -> Literal["off", "log", "warn_model"]:
-    raw = os.environ.get("OPENSQUILLA_TEXT_ONLY_TOOL_RECOVERY_MODE")
-    if raw is None:
-        raw = config_value
-    return normalize_runtime_recovery_mode(raw, default="off")
 
 
 def _reasoning_prefill_recovery_mode_from_env() -> Literal["off", "log", "recover"]:
@@ -178,83 +146,6 @@ def _finalize_evidence_gate_from_env(config_value: bool = False) -> bool:
     raise ValueError(
         f"{_FINALIZE_EVIDENCE_GATE_ENV} must be one of: "
         + ", ".join(sorted(_FINALIZE_EVIDENCE_GATE_ON | _FINALIZE_EVIDENCE_GATE_OFF))
-    )
-
-
-_FINALIZE_EVIDENCE_STRICT_ENV = "OPENSQUILLA_FINALIZE_EVIDENCE_STRICT"
-
-
-def _finalize_evidence_strict_from_env(config_value: bool = False) -> bool:
-    """Resolve the opt-in strict mode of the finalize-time evidence gate.
-
-    Default off. A non-blank ``OPENSQUILLA_FINALIZE_EVIDENCE_STRICT``
-    overrides ``config_value``. Strict implies the gate itself (the loop
-    activates the tracker when either flag is on). Unrecognized env values
-    raise instead of being silently ignored so a run manifest cannot record
-    an override the run did not actually apply.
-    """
-    raw = os.environ.get(_FINALIZE_EVIDENCE_STRICT_ENV, "").strip().lower()
-    if not raw:
-        return bool(config_value)
-    if raw in _FINALIZE_EVIDENCE_GATE_ON:
-        return True
-    if raw in _FINALIZE_EVIDENCE_GATE_OFF:
-        return False
-    raise ValueError(
-        f"{_FINALIZE_EVIDENCE_STRICT_ENV} must be one of: "
-        + ", ".join(sorted(_FINALIZE_EVIDENCE_GATE_ON | _FINALIZE_EVIDENCE_GATE_OFF))
-    )
-
-
-_FINALIZE_VARIANT_CHALLENGE_ENV = "OPENSQUILLA_FINALIZE_VARIANT_CHALLENGE"
-
-
-def _finalize_variant_challenge_from_env(config_value: bool = False) -> bool:
-    """Resolve the opt-in finalize-time variant-sweep challenge flag.
-
-    Default off. A non-blank ``OPENSQUILLA_FINALIZE_VARIANT_CHALLENGE``
-    overrides ``config_value``. Unrecognized env values raise instead of
-    being silently ignored so a run manifest cannot record an override the
-    run did not actually apply.
-    """
-    raw = os.environ.get(_FINALIZE_VARIANT_CHALLENGE_ENV, "").strip().lower()
-    if not raw:
-        return bool(config_value)
-    if raw in _FINALIZE_EVIDENCE_GATE_ON:
-        return True
-    if raw in _FINALIZE_EVIDENCE_GATE_OFF:
-        return False
-    raise ValueError(
-        f"{_FINALIZE_VARIANT_CHALLENGE_ENV} must be one of: "
-        + ", ".join(sorted(_FINALIZE_EVIDENCE_GATE_ON | _FINALIZE_EVIDENCE_GATE_OFF))
-    )
-
-
-_SUBMIT_REVIEW_ENV = "OPENSQUILLA_SUBMIT_REVIEW"
-_SUBMIT_REVIEW_ON = frozenset({"on", "1", "true", "yes"})
-_SUBMIT_REVIEW_OFF = frozenset({"off", "0", "false", "no"})
-
-
-def _submit_review_from_env(config_value: bool = False) -> bool:
-    """Resolve the opt-in review-on-submit checkpoint flag.
-
-    Default off. A non-blank ``OPENSQUILLA_SUBMIT_REVIEW`` overrides
-    ``config_value``. Unlike the finalize-evidence gate there is no gateway aux
-    mirror: the review has no system-prompt section that could disagree with the
-    loop behaviour. Unrecognized env values raise instead of being silently
-    ignored so an experiment manifest cannot record a lever the run did not
-    actually apply.
-    """
-    raw = os.environ.get(_SUBMIT_REVIEW_ENV, "").strip().lower()
-    if not raw:
-        return bool(config_value)
-    if raw in _SUBMIT_REVIEW_ON:
-        return True
-    if raw in _SUBMIT_REVIEW_OFF:
-        return False
-    raise ValueError(
-        f"{_SUBMIT_REVIEW_ENV} must be one of: "
-        + ", ".join(sorted(_SUBMIT_REVIEW_ON | _SUBMIT_REVIEW_OFF))
     )
 
 
@@ -410,8 +301,10 @@ class _AgentConfigAuxiliaries:
     tool_result_store_retention_seconds: int
     source_diff_preservation_mode: Literal["off", "log", "block"] | None
     source_diff_candidate_mode: Literal["off", "log", "warn_model"] | None
-    runtime_state_capsule_mode: Literal["off", "log", "inject"] | None
-    text_only_tool_recovery_mode: Literal["off", "log", "warn_model"] | None
+    # Deprecated, unused compatibility slot; preserve construction and saved configs.
+    runtime_state_capsule_mode: Literal["off", "log", "inject"] | None = None
+    # Deprecated, unused compatibility slot; preserve construction and saved configs.
+    text_only_tool_recovery_mode: Literal["off", "log", "warn_model"] | None = None
     # Gateway ``prompt.finalize_evidence_gate`` (env still overrides).
     finalize_evidence_gate: bool = False
 
@@ -1148,17 +1041,6 @@ class AgentBootstrapStage:
             finalize_evidence_gate_enabled=_finalize_evidence_gate_from_env(
                 aux.finalize_evidence_gate
             ),
-            finalize_evidence_strict=_finalize_evidence_strict_from_env(
-                AgentConfig().finalize_evidence_strict
-            ),
-            submit_review_enabled=_submit_review_from_env(),
-            submit_review_diff_max_chars=_positive_int_from_env(
-                "OPENSQUILLA_SUBMIT_REVIEW_DIFF_MAX_CHARS",
-                AgentConfig().submit_review_diff_max_chars,
-            ),
-            finalize_variant_challenge=_finalize_variant_challenge_from_env(
-                AgentConfig().finalize_variant_challenge
-            ),
             provider_context_block_feedback=_bool_from_env(
                 "OPENSQUILLA_PROVIDER_CONTEXT_BLOCK_FEEDBACK",
                 AgentConfig().provider_context_block_feedback,
@@ -1178,10 +1060,6 @@ class AgentBootstrapStage:
             provider_error_thinking_fallback=_strict_bool_from_env(
                 "OPENSQUILLA_PROVIDER_ERROR_THINKING_FALLBACK",
                 AgentConfig().provider_error_thinking_fallback,
-            ),
-            deadline_thinking_off_margin_seconds=_nonnegative_int_from_env(
-                "OPENSQUILLA_DEADLINE_THINKING_OFF_MARGIN_SECONDS",
-                AgentConfig().deadline_thinking_off_margin_seconds,
             ),
             final_diff_salvage=_bool_from_env(
                 "OPENSQUILLA_FINAL_DIFF_SALVAGE",
@@ -1219,7 +1097,6 @@ class AgentBootstrapStage:
                 AgentConfig().provider_history_dedup_min_repeats,
             ),
             projection_signal_hints=_projection_signal_hints_from_env(),
-            tool_loop_observer_mode=_tool_loop_observer_mode_from_env(),
             runtime_recovery_mode=_runtime_recovery_mode_from_env(),
             runtime_recovery_source_loop_max_nudges=_positive_int_from_env(
                 "OPENSQUILLA_RUNTIME_RECOVERY_SOURCE_LOOP_MAX_NUDGES",
@@ -1232,13 +1109,7 @@ class AgentBootstrapStage:
             source_diff_candidate_mode=_source_diff_candidate_mode_from_env(
                 aux.source_diff_candidate_mode
             ),
-            runtime_state_capsule_mode=_runtime_state_capsule_mode_from_env(
-                aux.runtime_state_capsule_mode
-            ),
             post_tool_empty_recovery_mode=_post_tool_empty_recovery_mode_from_env(),
-            text_only_tool_recovery_mode=_text_only_tool_recovery_mode_from_env(
-                aux.text_only_tool_recovery_mode
-            ),
             reasoning_prefill_recovery_mode=_reasoning_prefill_recovery_mode_from_env(),
             runtime_events_path=(os.environ.get("OPENSQUILLA_RUNTIME_EVENTS_PATH") or None),
             provider_call_observer=self._provider_call_observer,

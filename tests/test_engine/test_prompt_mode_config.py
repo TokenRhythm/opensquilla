@@ -8,12 +8,9 @@ from opensquilla.engine.runtime import (
     TurnRunner,
     _resolve_finalize_evidence_gate,
     _resolve_identity_prompt_mode,
-    _resolve_patch_evidence_protocol,
-    _resolve_submit_review,
 )
 from opensquilla.engine.turn_runner.agent_bootstrap_stage import (
     _finalize_evidence_gate_from_env,
-    _finalize_evidence_strict_from_env,
 )
 from opensquilla.gateway.config import GatewayConfig
 
@@ -55,46 +52,6 @@ def test_identity_prompt_mode_env_accepts_headless_repo_coding_scaffold(monkeypa
     cfg = GatewayConfig(prompt={"mode": "auto"})
 
     assert _resolve_identity_prompt_mode(cfg) == "headless_repo_coding_scaffold"
-
-
-def test_patch_evidence_protocol_defaults_off(monkeypatch) -> None:
-    monkeypatch.delenv("OPENSQUILLA_PATCH_EVIDENCE_PROTOCOL", raising=False)
-
-    assert _resolve_patch_evidence_protocol(GatewayConfig()) is False
-
-
-def test_patch_evidence_protocol_config_opt_in(monkeypatch) -> None:
-    monkeypatch.delenv("OPENSQUILLA_PATCH_EVIDENCE_PROTOCOL", raising=False)
-    cfg = GatewayConfig(prompt={"patch_evidence_protocol": True})
-
-    assert _resolve_patch_evidence_protocol(cfg) is True
-
-
-def test_patch_evidence_protocol_env_on_overrides_config_off(monkeypatch) -> None:
-    monkeypatch.setenv("OPENSQUILLA_PATCH_EVIDENCE_PROTOCOL", "on")
-
-    assert _resolve_patch_evidence_protocol(GatewayConfig()) is True
-
-
-def test_patch_evidence_protocol_env_off_overrides_config_on(monkeypatch) -> None:
-    monkeypatch.setenv("OPENSQUILLA_PATCH_EVIDENCE_PROTOCOL", "off")
-    cfg = GatewayConfig(prompt={"patch_evidence_protocol": True})
-
-    assert _resolve_patch_evidence_protocol(cfg) is False
-
-
-def test_patch_evidence_protocol_env_blank_falls_through_to_config(monkeypatch) -> None:
-    monkeypatch.setenv("OPENSQUILLA_PATCH_EVIDENCE_PROTOCOL", "  ")
-    cfg = GatewayConfig(prompt={"patch_evidence_protocol": True})
-
-    assert _resolve_patch_evidence_protocol(cfg) is True
-
-
-def test_patch_evidence_protocol_env_rejects_unrecognized_value(monkeypatch) -> None:
-    monkeypatch.setenv("OPENSQUILLA_PATCH_EVIDENCE_PROTOCOL", "enabled")
-
-    with pytest.raises(ValueError, match="OPENSQUILLA_PATCH_EVIDENCE_PROTOCOL"):
-        _resolve_patch_evidence_protocol(GatewayConfig())
 
 
 def test_finalize_evidence_gate_defaults_off(monkeypatch) -> None:
@@ -190,62 +147,6 @@ def test_bootstrap_finalize_evidence_gate_env_off_overrides_config_on(monkeypatc
     assert _finalize_evidence_gate_from_env(True) is False
 
 
-def test_bootstrap_finalize_evidence_strict_env_defaults_off(monkeypatch) -> None:
-    monkeypatch.delenv("OPENSQUILLA_FINALIZE_EVIDENCE_STRICT", raising=False)
-
-    assert _finalize_evidence_strict_from_env() is False
-
-
-@pytest.mark.parametrize("value", ["on", "1", "true", "YES"])
-def test_bootstrap_finalize_evidence_strict_env_on(monkeypatch, value: str) -> None:
-    monkeypatch.setenv("OPENSQUILLA_FINALIZE_EVIDENCE_STRICT", value)
-
-    assert _finalize_evidence_strict_from_env() is True
-
-
-@pytest.mark.parametrize("value", ["off", "0", "false", "NO", "  "])
-def test_bootstrap_finalize_evidence_strict_env_off_or_blank(
-    monkeypatch, value: str
-) -> None:
-    monkeypatch.setenv("OPENSQUILLA_FINALIZE_EVIDENCE_STRICT", value)
-
-    assert _finalize_evidence_strict_from_env() is False
-
-
-def test_bootstrap_finalize_evidence_strict_env_rejects_unrecognized_value(
-    monkeypatch,
-) -> None:
-    monkeypatch.setenv("OPENSQUILLA_FINALIZE_EVIDENCE_STRICT", "enabled")
-
-    with pytest.raises(ValueError, match="OPENSQUILLA_FINALIZE_EVIDENCE_STRICT"):
-        _finalize_evidence_strict_from_env()
-
-
-def test_bootstrap_finalize_evidence_strict_uses_config_value_when_env_absent(
-    monkeypatch,
-) -> None:
-    monkeypatch.delenv("OPENSQUILLA_FINALIZE_EVIDENCE_STRICT", raising=False)
-
-    assert _finalize_evidence_strict_from_env(True) is True
-    assert _finalize_evidence_strict_from_env(False) is False
-
-
-def test_bootstrap_finalize_evidence_strict_env_blank_falls_through_to_config(
-    monkeypatch,
-) -> None:
-    monkeypatch.setenv("OPENSQUILLA_FINALIZE_EVIDENCE_STRICT", "  ")
-
-    assert _finalize_evidence_strict_from_env(True) is True
-
-
-def test_bootstrap_finalize_evidence_strict_env_off_overrides_config_on(
-    monkeypatch,
-) -> None:
-    monkeypatch.setenv("OPENSQUILLA_FINALIZE_EVIDENCE_STRICT", "off")
-
-    assert _finalize_evidence_strict_from_env(True) is False
-
-
 @pytest.mark.parametrize("env_value", [None, "0", "1", "on", "garbage"])
 @pytest.mark.parametrize("legacy_style", [False, True])
 def test_retired_legacy_prompt_inputs_do_not_change_runtime_prompt(
@@ -265,52 +166,36 @@ def test_retired_legacy_prompt_inputs_do_not_change_runtime_prompt(
     assert runner._assemble_prompt("main", tool_defs) == expected
 
 
-# ---------------------------------------------------------------------------
-# _resolve_submit_review — tool-surfacing decision (runtime side)
-#
-# Regression guard: the ``submit`` tool surfaces from the TurnRunner config
-# (``self._config``), which is a GatewayConfig that carries no
-# ``submit_review_enabled`` field. The loop-side flag lives on the separate
-# AgentConfig built by agent_bootstrap_stage, so reading the config field alone
-# left the tool unsurfaced even with OPENSQUILLA_SUBMIT_REVIEW=on. The resolver
-# must read the env var directly so surfacing tracks the loop-side gate.
-# ---------------------------------------------------------------------------
+@pytest.mark.parametrize("env_value", [None, "off", "on", "invalid-legacy-value"])
+def test_retired_prompt_protocol_env_and_saved_config_are_inert(monkeypatch, tmp_path, env_value):
+    monkeypatch.delenv("OPENSQUILLA_PATCH_EVIDENCE_PROTOCOL", raising=False)
+    runner = TurnRunner(provider_selector=None, config=GatewayConfig())
+    monkeypatch.setattr(runner, "_resolve_bootstrap_workspace_dir", lambda _: tmp_path)
+    monkeypatch.setattr(runner, "_resolve_memory_source_dir", lambda _: tmp_path)
+    definitions = [SimpleNamespace(name="exec_command")]
+    expected = runner._assemble_prompt("main", definitions)
+    if env_value is not None:
+        monkeypatch.setenv("OPENSQUILLA_PATCH_EVIDENCE_PROTOCOL", env_value)
+    runner._config = GatewayConfig(prompt={"patch_evidence_protocol": True})
+    assert runner._assemble_prompt("main", definitions) == expected
 
 
-def test_submit_review_defaults_off(monkeypatch) -> None:
-    monkeypatch.delenv("OPENSQUILLA_SUBMIT_REVIEW", raising=False)
+@pytest.mark.parametrize("env_value", ["on", "invalid-legacy-value", "/missing/overrides.toml"])
+def test_retired_description_overrides_do_not_change_tool_schemas(monkeypatch, env_value):
+    from opensquilla.tools.registry import get_default_registry
+    from opensquilla.tools.types import ToolContext
 
-    assert _resolve_submit_review(GatewayConfig()) is False
-
-
-def test_submit_review_env_on_surfaces_despite_missing_config_field(monkeypatch) -> None:
-    # GatewayConfig has no submit_review_enabled attribute; env must still win.
-    monkeypatch.setenv("OPENSQUILLA_SUBMIT_REVIEW", "on")
-
-    assert not hasattr(GatewayConfig(), "submit_review_enabled")
-    assert _resolve_submit_review(GatewayConfig()) is True
-
-
-def test_submit_review_config_opt_in_when_env_blank(monkeypatch) -> None:
-    monkeypatch.delenv("OPENSQUILLA_SUBMIT_REVIEW", raising=False)
-
-    assert _resolve_submit_review(SimpleNamespace(submit_review_enabled=True)) is True
-
-
-def test_submit_review_env_off_overrides_config_on(monkeypatch) -> None:
-    monkeypatch.setenv("OPENSQUILLA_SUBMIT_REVIEW", "off")
-
-    assert _resolve_submit_review(SimpleNamespace(submit_review_enabled=True)) is False
-
-
-def test_submit_review_env_blank_falls_through_to_config(monkeypatch) -> None:
-    monkeypatch.setenv("OPENSQUILLA_SUBMIT_REVIEW", "  ")
-
-    assert _resolve_submit_review(SimpleNamespace(submit_review_enabled=True)) is True
-
-
-def test_submit_review_env_rejects_unrecognized_value(monkeypatch) -> None:
-    monkeypatch.setenv("OPENSQUILLA_SUBMIT_REVIEW", "enabled")
-
-    with pytest.raises(ValueError, match="OPENSQUILLA_SUBMIT_REVIEW"):
-        _resolve_submit_review(GatewayConfig())
+    monkeypatch.setenv("OPENSQUILLA_TOOL_DESCRIPTION_OVERRIDES", env_value)
+    registry = get_default_registry()
+    baseline = ToolContext(is_owner=True, scratch_dir="/tmp/synthetic-scratch")
+    legacy = ToolContext(
+        is_owner=True,
+        scratch_dir="/tmp/synthetic-scratch",
+        tool_description_overrides={"exec_command": "obsolete", "exec_command.command": "obsolete"},
+        tool_description_overrides_source="env_file",
+    )
+    assert registry.to_tool_definitions(legacy) == registry.to_tool_definitions(baseline)
+    config = GatewayConfig(tools={"description_overrides": legacy.tool_description_overrides})
+    runner = TurnRunner(provider_selector=None, config=config)
+    runner._tool_registry = registry
+    assert runner._build_tools(legacy)[0] == runner._build_tools(baseline)[0]
