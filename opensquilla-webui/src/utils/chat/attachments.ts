@@ -6,6 +6,7 @@ type AttachmentProjectionInput = Attachment | DisplayAttachment | Readonly<Recor
 export type SendableAttachment = Attachment & (
   | { kind: 'inline'; data: string }
   | { kind: 'staged'; file_uuid: string }
+  | { kind: 'local'; local_grant: string }
 )
 
 export function isAttachmentBusy(attachment: Attachment): boolean {
@@ -112,6 +113,7 @@ function safeImageDataUrl(value: unknown, declaredMime: string): string | undefi
 export function isSendableAttachment(attachment: Attachment): attachment is SendableAttachment {
   if (attachment.kind === 'inline') return Boolean(attachment.data)
   if (attachment.kind === 'staged') return Boolean(attachment.file_uuid)
+  if (attachment.kind === 'local') return Boolean(attachment.local_grant)
   return false
 }
 
@@ -130,12 +132,27 @@ export function hasModelInputImageAttachment(attachments: readonly Attachment[])
 }
 
 export function serializeSendableAttachment(attachment: SendableAttachment): ChatSendAttachmentPayload {
+  const usage = attachment.usage === 'file' || attachment.usage === 'vision'
+    ? attachment.usage
+    : undefined
   if (attachment.kind === 'staged') {
     return {
       type: attachment.mime,
       file_uuid: attachment.file_uuid,
       mime: attachment.mime,
       name: attachment.name,
+      ...(usage ? { usage } : {}),
+    }
+  }
+  if (attachment.kind === 'local') {
+    return {
+      type: attachment.mime,
+      local_grant: attachment.local_grant,
+      execution_environment: attachment.execution_environment || 'default',
+      mime: attachment.mime,
+      name: attachment.name,
+      ...(typeof attachment.size === 'number' ? { size: attachment.size } : {}),
+      ...(usage ? { usage } : {}),
     }
   }
   return {
@@ -143,6 +160,7 @@ export function serializeSendableAttachment(attachment: SendableAttachment): Cha
     data: attachment.data,
     mime: attachment.mime,
     name: attachment.name,
+    ...(usage ? { usage } : {}),
   }
 }
 
@@ -154,8 +172,9 @@ export function serializeDisplayAttachment(attachment: SendableAttachment): Disp
     name: attachment.name,
     mime: attachment.mime,
     size: attachment.size,
+    ...(attachment.usage ? { usage: attachment.usage } : {}),
   }
-  if (attachment.kind === 'staged') {
+  if (attachment.kind === 'staged' || attachment.kind === 'local') {
     return { ...base, kind: 'staged', localFile: attachment.file }
   }
   const isImage = isImageDisplayAttachment(attachment)
@@ -211,6 +230,9 @@ export function normalizeDisplayAttachment(
     mime,
   )
   const rawKind = typeof record.kind === 'string' ? record.kind : ''
+  const usage = record.usage === 'file' || record.usage === 'vision'
+    ? record.usage
+    : undefined
   const kind: DisplayAttachment['kind'] = rawKind === 'staged' || sha
     ? 'staged'
     : rawKind === 'inline' || data || dataUrl
@@ -245,6 +267,7 @@ export function normalizeDisplayAttachment(
       : typeof record.attachment_id === 'string' && record.attachment_id.trim()
         ? record.attachment_id.trim()
         : undefined,
+    ...(usage ? { usage } : {}),
   }
 }
 

@@ -22,6 +22,10 @@ import asyncio
 import hashlib
 import json
 import logging
+import os
+import re
+import secrets
+import tempfile
 import time
 import uuid as _uuid
 import weakref
@@ -42,6 +46,8 @@ from opensquilla.application.artifact_workbench import (
     AttachmentStagingApplication,
     AttachmentStagingPolicy,
 )
+from opensquilla.attachment_refs import inputs_material_path
+from opensquilla.contracts.attachment_sniff import sniff_mime_from_bytes
 from opensquilla.contracts.attachments import (
     ALLOWED_MEDIA_TYPES,
     OPAQUE_ATTACHMENT_BYTES,
@@ -105,12 +111,14 @@ class _Entry:
     mime: str
     sha256: str
     size: int
-    bytes: bytes
+    path: Path
     expires_at: float
+    owner: str
+    resource_id: str
 
 
 class UploadStore:
-    """Bridge upload store: in-memory bytes + on-disk ``.meta`` markers.
+    """Bridge upload store backed by bounded, short-lived files.
 
     The store enforces the configured size and MIME caps so a malicious
     or buggy client cannot smuggle disallowed bytes past it. The route
@@ -125,8 +133,21 @@ class UploadStore:
         accept_opaque: bool = True,
         *,
         max_total_bytes: int = _DEFAULT_MAX_TOTAL_BYTES,
+        owner: str = "uploads",
     ) -> None:
         self.marker_dir: Path | None = Path(marker_dir) if marker_dir is not None else None
+        self._ephemeral_root: Path | None = None
+        self.media_root = (
+            self.marker_dir.parent if self.marker_dir is not None else None
+        )
+        if self.media_root is None:
+            self._ephemeral_root = Path(tempfile.mkdtemp(prefix="opensquilla-upload-"))
+        inputs_root = (
+            self.media_root / "inputs" if self.media_root is not None else self._ephemeral_root
+        )
+        assert inputs_root is not None
+        self.inputs_root: Path = inputs_root
+        self._owner = self._safe_filename(owner) or "uploads"
         self.ttl_seconds = ttl_seconds
         self.max_file_bytes = max_file_bytes
         self.accept_opaque = accept_opaque
@@ -141,6 +162,8 @@ class UploadStore:
         self._lock_for_locks = asyncio.Lock()
         if self.marker_dir is not None:
             native_io_path(self.marker_dir).mkdir(parents=True, exist_ok=True)
+        native_io_path(self.inputs_root).mkdir(parents=True, exist_ok=True)
+        self._restore_marked_entries()
 
     # ------------------------------------------------------------------ helpers
 
@@ -167,6 +190,72 @@ class UploadStore:
         except (OSError, json.JSONDecodeError):
             return None
 
+    def _restore_marked_entries(self) -> None:
+        if self.marker_dir is None:
+            return
+        for marker_path in native_io_path(self.marker_dir).glob("u-*.meta"):
+            file_uuid = marker_path.stem
+            marker = self._read_marker(file_uuid)
+            if not marker:
+                continue
+            if self._marker_expired(marker):
+                # Remove stale marker and its managed input payload during
+                # restart recovery; otherwise expired uploads would leak disk
+                # space until another process happened to sweep them.
+                owner = marker.get("owner")
+                resource_id = marker.get("resource_id")
+                name = marker.get("name")
+                if all(isinstance(v, str) and v for v in (owner, resource_id, name)):
+                    assert isinstance(owner, str)
+                    assert isinstance(resource_id, str)
+                    assert isinstance(name, str)
+                    stale_path = inputs_material_path(
+                        self.inputs_root.parent, owner, resource_id, name
+                    )
+                    try:
+                        stale_path.resolve().relative_to(self.inputs_root.resolve())
+                        native_io_path(stale_path).unlink(missing_ok=True)
+                        native_io_path(stale_path.parent).rmdir()
+                    except (OSError, ValueError):
+                        pass
+                self._delete_marker(file_uuid)
+                continue
+            owner = marker.get("owner")
+            resource_id = marker.get("resource_id")
+            name = marker.get("name")
+            if not all(isinstance(v, str) and v for v in (owner, resource_id, name)):
+                continue
+            assert isinstance(owner, str)
+            assert isinstance(resource_id, str)
+            assert isinstance(name, str)
+            path = inputs_material_path(self.inputs_root.parent, owner, resource_id, name)
+            try:
+                path.resolve().relative_to(self.inputs_root.resolve())
+                if not path.is_file():
+                    continue
+                mime = marker.get("mime")
+                sha = marker.get("sha256")
+                size = marker.get("size")
+                expires_at = marker.get("expires_at")
+                if not all(isinstance(v, str) for v in (name, mime, sha)):
+                    continue
+                if not isinstance(size, int) or not isinstance(expires_at, (int, float)):
+                    continue
+                assert isinstance(name, str)
+                assert isinstance(mime, str)
+                assert isinstance(sha, str)
+                self._entries[file_uuid] = _Entry(
+                    name=name,
+                    mime=mime,
+                    sha256=sha,
+                    size=size,
+                    path=path,
+                    expires_at=float(expires_at),
+                    owner=owner,
+                    resource_id=resource_id,
+                )
+            except (OSError, ValueError):
+                continue
     def _marker_expired(self, marker: dict[str, Any]) -> bool:
         expires_at = marker.get("expires_at")
         if not isinstance(expires_at, (int, float, str)):
@@ -197,6 +286,32 @@ class UploadStore:
     def _now(self) -> float:
         return time.time()
 
+    @staticmethod
+    def _safe_filename(name: str) -> str:
+        value = Path(str(name)).name.replace("\x00", "").strip()
+        value = re.sub(r"[^A-Za-z0-9._@+=, -]+", "_", value).strip(" .")
+        return (value or "attachment")[:180]
+
+    def _entry_path(self, file_uuid: str, name: str) -> Path:
+        return inputs_material_path(self.inputs_root.parent, self._owner, file_uuid, name)
+
+    @staticmethod
+    def _atomic_write(path: Path, payload: bytes) -> None:
+        native_io_path(path.parent).mkdir(parents=True, exist_ok=True, mode=0o700)
+        tmp = path.with_name(f".{path.name}.{secrets.token_hex(6)}.tmp")
+        try:
+            with open(native_io_path(tmp), "wb") as handle:
+                handle.write(payload)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.chmod(native_io_path(tmp), 0o600)
+            os.replace(native_io_path(tmp), native_io_path(path))
+        finally:
+            try:
+                native_io_path(tmp).unlink(missing_ok=True)
+            except OSError:
+                pass
+
     # ------------------------------------------------------------------ public
 
     async def put(self, name: str, mime: str, payload: bytes) -> str:
@@ -217,6 +332,9 @@ class UploadStore:
             raise UploadUnsupportedMimeError(f"mime {mime!r} is not allowed")
         if not self.accept_opaque and normalized_mime not in _ALLOWED_MIMES:
             raise UploadUnsupportedMimeError(f"mime {mime!r} is not allowed")
+        sniffed_mime = sniff_mime_from_bytes(payload)
+        if normalized_mime in _ALLOWED_MIMES and sniffed_mime in _ALLOWED_MIMES:
+            normalized_mime = sniffed_mime
         # Email stays non-stageable policy-wise, so its cap resolves to the
         # inline text ceiling even on this staged path. Strict deployments
         # keep the legacy stageable set (pdf/image/office), so text stays at
@@ -243,13 +361,16 @@ class UploadStore:
         file_uuid = f"u-{_uuid.uuid4().hex}"
         sha = hashlib.sha256(payload).hexdigest()
         expires_at = self._now() + self.ttl_seconds
+        path = self._entry_path(file_uuid, name)
         entry = _Entry(
             name=name,
             mime=normalized_mime,
             sha256=sha,
             size=len(payload),
-            bytes=payload,
+            path=path,
             expires_at=expires_at,
+            owner=self._owner,
+            resource_id=file_uuid,
         )
 
         # Sweep before insert so the eviction loop runs at least once per
@@ -273,6 +394,7 @@ class UploadStore:
                 )
             else:
                 admitted = True
+                self._atomic_write(path, payload)
                 self._entries[file_uuid] = entry
                 self._write_marker(
                     file_uuid,
@@ -282,6 +404,8 @@ class UploadStore:
                         "name": name,
                         "size": len(payload),
                         "expires_at": expires_at,
+                        "owner": self._owner,
+                        "resource_id": file_uuid,
                     },
                 )
         if not admitted:
@@ -289,6 +413,11 @@ class UploadStore:
             # of rejections cannot grow the lock dict without bound.
             async with self._lock_for_locks:
                 self._locks.pop(file_uuid, None)
+            try:
+                native_io_path(path).unlink(missing_ok=True)
+                native_io_path(path.parent).rmdir()
+            except OSError:
+                pass
             raise UploadStoreFullError(
                 f"upload store is full ({staged_total} of {self.max_total_bytes} "
                 f"bytes staged); staged uploads expire within "
@@ -315,13 +444,118 @@ class UploadStore:
             if entry.expires_at < self._now():
                 self._entries.pop(file_uuid, None)
                 self._delete_marker(file_uuid)
+                try:
+                    native_io_path(entry.path).unlink(missing_ok=True)
+                    native_io_path(entry.path.parent).rmdir()
+                except OSError:
+                    pass
                 raise AttachmentNotFoundError(file_uuid)
-            return entry.bytes, {
+            try:
+                payload = native_io_path(entry.path).read_bytes()
+            except OSError as exc:
+                self._entries.pop(file_uuid, None)
+                self._delete_marker(file_uuid)
+                raise AttachmentNotFoundError(file_uuid) from exc
+            if len(payload) != entry.size or hashlib.sha256(payload).hexdigest() != entry.sha256:
+                raise AttachmentLostInRestartError(file_uuid)
+            return payload, {
                 "name": entry.name,
                 "mime": entry.mime,
                 "sha256": entry.sha256,
                 "size": entry.size,
+                "owner": entry.owner,
+                "resource_id": entry.resource_id,
             }
+
+    async def metadata(self, file_uuid: str) -> dict[str, Any]:
+        """Return upload metadata without reading the payload into memory."""
+        await self._sweep_expired_locked()
+        lock = await self._get_uuid_lock(file_uuid)
+        async with lock:
+            entry = self._entries.get(file_uuid)
+            if entry is None or entry.expires_at < self._now():
+                raise AttachmentNotFoundError(file_uuid)
+            try:
+                stat = native_io_path(entry.path).stat()
+            except OSError as exc:
+                raise AttachmentNotFoundError(file_uuid) from exc
+            if stat.st_size != entry.size:
+                raise AttachmentLostInRestartError(file_uuid)
+            return {
+                "name": entry.name,
+                "mime": entry.mime,
+                "sha256": entry.sha256,
+                "size": entry.size,
+                "owner": entry.owner,
+                "resource_id": entry.resource_id,
+            }
+
+    async def claim(
+        self,
+        file_uuid: str,
+        *,
+        owner: str,
+        material_root: Path | None = None,
+    ) -> dict[str, Any]:
+        """Promote an upload from its short-lived lease to a durable owner."""
+        owner_segment = self._safe_filename(owner)
+        if not owner_segment or owner_segment == "attachment":
+            raise ValueError("upload claim owner is invalid")
+        lock = await self._get_uuid_lock(file_uuid)
+        async with lock:
+            entry = self._entries.get(file_uuid)
+            if entry is None or entry.expires_at < self._now():
+                raise AttachmentNotFoundError(file_uuid)
+            target = inputs_material_path(
+                material_root or self.inputs_root.parent,
+                owner_segment,
+                entry.resource_id,
+                entry.name,
+            )
+            native_io_path(target.parent).mkdir(parents=True, exist_ok=True, mode=0o700)
+            if entry.path != target:
+                os.replace(native_io_path(entry.path), native_io_path(target))
+                try:
+                    native_io_path(entry.path.parent).rmdir()
+                except OSError:
+                    pass
+            entry.owner = owner_segment
+            entry.path = target
+            entry.expires_at = float("inf")
+            self._write_marker(
+                file_uuid,
+                {
+                    "sha256": entry.sha256,
+                    "mime": entry.mime,
+                    "name": entry.name,
+                    "size": entry.size,
+                    "expires_at": entry.expires_at,
+                    "owner": entry.owner,
+                    "resource_id": entry.resource_id,
+                },
+            )
+            return {
+                "name": entry.name,
+                "mime": entry.mime,
+                "sha256": entry.sha256,
+                "size": entry.size,
+                "owner": entry.owner,
+                "resource_id": entry.resource_id,
+            }
+
+    async def release_owner(self, owner: str) -> int:
+        """Release all claimed resources owned by a deleted session."""
+        owner_segment = self._safe_filename(owner)
+        targets = [
+            file_uuid
+            for file_uuid, entry in self._entries.items()
+            if entry.owner == owner_segment
+        ]
+        released = 0
+        for file_uuid in targets:
+            if await self.evict(file_uuid):
+                released += 1
+        return released
 
     async def evict(self, file_uuid: str) -> bool:
         """Explicit eviction; returns True if the entry existed."""
@@ -329,7 +563,13 @@ class UploadStore:
         lock = await self._get_uuid_lock(file_uuid)
         async with lock:
             existed = file_uuid in self._entries
-            self._entries.pop(file_uuid, None)
+            entry = self._entries.pop(file_uuid, None)
+            if entry is not None:
+                try:
+                    native_io_path(entry.path).unlink(missing_ok=True)
+                    native_io_path(entry.path.parent).rmdir()
+                except OSError:
+                    pass
             self._delete_marker(file_uuid)
         async with self._lock_for_locks:
             self._locks.pop(file_uuid, None)
@@ -348,7 +588,13 @@ class UploadStore:
             # is in flight; this pass leaves it for the next sweep tick.
             if lock is not None and lock.locked():
                 continue
-            self._entries.pop(u, None)
+            entry = self._entries.pop(u, None)
+            if entry is not None:
+                try:
+                    native_io_path(entry.path).unlink(missing_ok=True)
+                    native_io_path(entry.path.parent).rmdir()
+                except OSError:
+                    pass
             self._delete_marker(u)
             removed.append(u)
             count += 1

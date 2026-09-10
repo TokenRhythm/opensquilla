@@ -146,6 +146,9 @@ def test_extracts_inline_ref_and_missing_occurrences_without_bytes_in_payload() 
                         "name": "stored.jpg",
                         "sha256_ref": sha,
                         "size": len(payload),
+                        "store": "inputs",
+                        "owner": "owner-1",
+                        "resource_id": "resource-1",
                     },
                     {
                         "name": "gone.png",
@@ -169,6 +172,10 @@ def test_extracts_inline_ref_and_missing_occurrences_without_bytes_in_payload() 
     assert inline.size == len(payload)
     assert stored.attachment_id == "att_explicit_123456"
     assert stored.material_state == MATERIAL_AVAILABLE
+    assert stored.store == "inputs"
+    assert stored.owner == "owner-1"
+    assert stored.resource_id == "resource-1"
+    assert stored.to_payload()["resource_id"] == "resource-1"
     assert missing.material_state == MATERIAL_MISSING
     assert missing.missing_reason == "material was pruned"
     assert all("data" not in occurrence.to_payload() for occurrence in occurrences)
@@ -408,3 +415,37 @@ def test_manifest_context_state_factory_and_decoder() -> None:
     assert state.cacheable is True
     assert state.covered_through_id == 22
     assert attachment_manifest_from_context_state(state) == manifest
+
+
+def test_preserve_occurrence_ids_rebinds_session_owned_input_refs() -> None:
+    content = json.dumps(
+        {
+            "text": "inspect",
+            "attachments": [
+                {
+                    "attachment_id": "att_existing_123",
+                    "type": "text/plain",
+                    "name": "note.txt",
+                    "store": "inputs",
+                    "owner": "parent-session",
+                    "scope": "parent-session",
+                    "resource_id": "u-1",
+                    "sha256": "a" * 64,
+                    "size": 5,
+                }
+            ],
+        }
+    )
+    rebound = preserve_attachment_occurrence_ids(
+        content,
+        session_id="parent-session",
+        source_message_id="message-1",
+        target_material_owner="child-session",
+    )
+    assert rebound is not None
+    payload = json.loads(rebound)
+    item = payload["attachments"][0]
+    assert item["attachment_id"] == "att_existing_123"
+    assert item["owner"] == "child-session"
+    assert item["scope"] == "child-session"
+    assert item["resource_id"] == "u-1"

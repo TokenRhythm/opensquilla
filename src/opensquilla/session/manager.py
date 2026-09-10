@@ -1920,6 +1920,7 @@ class SessionManager:
                                 entry.content,
                                 session_id=parent.session_id,
                                 source_message_id=entry.message_id,
+                                target_material_owner=child.session_id,
                             )
                             if entry.role == "user"
                             else entry.content
@@ -2081,6 +2082,7 @@ class SessionManager:
                         entry.content,
                         session_id=parent.session_id,
                         source_message_id=entry.message_id,
+                        target_material_owner=child.session_id,
                     )
                     if entry.role == "user"
                     else entry.content
@@ -2158,13 +2160,21 @@ class SessionManager:
             )
 
         def _copy_attachments() -> None:
-            from opensquilla.attachment_refs import copy_transcript_material
+            from opensquilla.attachment_refs import (
+                copy_inputs_material,
+                copy_transcript_material,
+            )
 
             copy_transcript_material(
                 media_root=media_root,
                 source_session_id=source_session_id,
                 target_session_id=target_session_id,
                 material_ids=attachment_hashes,
+            )
+            copy_inputs_material(
+                media_root=media_root,
+                source_owner=source_session_id,
+                target_owner=target_session_id,
             )
 
         try:

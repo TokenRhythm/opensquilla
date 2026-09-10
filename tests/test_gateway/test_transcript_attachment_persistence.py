@@ -24,7 +24,7 @@ from pathlib import Path
 
 import pytest
 
-from opensquilla.attachment_refs import make_attachment_ref
+from opensquilla.attachment_refs import inputs_material_path, make_attachment_ref
 from opensquilla.gateway.transcripts import (
     build_transcript_attachment_envelope,
     rebuild_attachments_for_replay,
@@ -55,6 +55,31 @@ def test_inline_attachment_stored_in_transcript_envelope(tmp_path: Path) -> None
     assert persisted["data"] == inline["data"]
     assert "sha256_ref" not in persisted
     assert writes == []
+
+
+def test_image_usage_is_persisted_and_rebuilt_for_replay(tmp_path: Path) -> None:
+    inline = {
+        "type": "image/png",
+        "data": _b64(b"\x89PNG\r\n\x1a\n"),
+        "name": "diagram.png",
+        "usage": "file",
+    }
+    envelope, _writes = build_transcript_attachment_envelope(
+        text="read as file",
+        attachments=[inline],
+        session_id="s1",
+        media_root=tmp_path,
+        persist_enabled=True,
+    )
+    persisted = json.loads(envelope)["attachments"][0]
+    assert persisted["usage"] == "file"
+
+    _text, replay = rebuild_attachments_for_replay(
+        envelope,
+        session_id="s1",
+        media_root=tmp_path,
+    )
+    assert replay[0]["usage"] == "file"
 
 
 def test_transcript_envelope_can_separate_provider_and_display_text(tmp_path: Path) -> None:
@@ -171,6 +196,46 @@ def test_enabled_persistence_keeps_material_reference_shape(tmp_path: Path) -> N
         "sha256_ref": "c" * 64, "name": "sample.pdf", "mime": "application/pdf", "size": 17,
     }
     assert writes == []
+
+
+def test_enabled_persistence_keeps_managed_resource_identity_without_path(
+    tmp_path: Path,
+) -> None:
+    attachment = {
+        "kind": "attachment_ref",
+        "sha256": "d" * 64,
+        "material_id": "d" * 64,
+        "store": "inputs",
+        "scope": "session-old",
+        "owner": "owner-1",
+        "resource_id": "resource-1",
+        "name": "report.pdf",
+        "mime": "application/pdf",
+        "type": "application/pdf",
+        "size": 7,
+        "_material_path": "/stale/absolute/path/report.pdf",
+    }
+
+    envelope, _ = build_transcript_attachment_envelope(
+        text="inspect",
+        attachments=[attachment],
+        session_id="session-old",
+        media_root=tmp_path,
+        persist_enabled=True,
+    )
+
+    persisted = json.loads(envelope)["attachments"][0]
+    persisted.pop("attachment_id")
+    assert persisted == {
+        "sha256_ref": "d" * 64,
+        "name": "report.pdf",
+        "mime": "application/pdf",
+        "size": 7,
+        "store": "inputs",
+        "owner": "owner-1",
+        "resource_id": "resource-1",
+    }
+    assert "_material_path" not in envelope
 
 
 # ---------------------------------------------------------------------------
@@ -340,6 +405,41 @@ def test_replay_preserves_sha256_ref_without_reinlining_bytes(tmp_path: Path) ->
     assert "[historical attachment omitted: r.pdf (application/pdf)]" in text
     assert attachments == []
     assert sha not in text
+
+
+def test_replay_resolves_managed_input_from_resource_metadata(tmp_path: Path) -> None:
+    """Historical managed refs use resource identity, never a stale path."""
+
+    payload = b"managed input"
+    resource_path = inputs_material_path(tmp_path, "owner-1", "resource-1", "report.pdf")
+    resource_path.parent.mkdir(parents=True, exist_ok=True)
+    resource_path.write_bytes(payload)
+    envelope = json.dumps(
+        {
+            "text": "replay managed input",
+            "attachments": [
+                {
+                    "sha256_ref": hashlib.sha256(payload).hexdigest(),
+                    "name": "report.pdf",
+                    "mime": "application/pdf",
+                    "size": len(payload),
+                    "store": "inputs",
+                    "owner": "owner-1",
+                    "resource_id": "resource-1",
+                }
+            ],
+        }
+    )
+
+    text, attachments = rebuild_attachments_for_replay(
+        envelope,
+        session_id="new-session-after-restart",
+        media_root=tmp_path,
+    )
+
+    assert "[historical attachment omitted: report.pdf (application/pdf)]" in text
+    assert "attachment unavailable" not in text
+    assert attachments == []
 
 
 # ---------------------------------------------------------------------------

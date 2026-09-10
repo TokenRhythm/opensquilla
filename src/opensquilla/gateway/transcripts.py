@@ -32,10 +32,9 @@ from opensquilla.attachment_refs import (
     AttachmentMaterialBudgetError,
     attachment_ref_marker,
     is_attachment_ref,
-    make_attachment_ref,
-    transcript_material_path,
     write_transcript_material,
 )
+from opensquilla.contracts.attachments import normalize_attachment_usage
 from opensquilla.prompt_annotations import normalize_prompt_annotation_snapshots
 
 log = logging.getLogger(__name__)
@@ -125,6 +124,7 @@ def build_transcript_attachment_envelope(
             attachment.get("type") or attachment.get("mime") or attachment.get("media_type")
         )
         name = attachment.get("name", "attachment")
+        usage = normalize_attachment_usage(attachment.get("usage"))
         if not persist_enabled:
             size = attachment.get("size")
             if not isinstance(size, int) or isinstance(size, bool) or size < 0:
@@ -141,20 +141,34 @@ def build_transcript_attachment_envelope(
                     "mime": media_type,
                     "size": size,
                     "missing_reason": "attachment persistence disabled",
+                    **({"usage": usage} if usage is not None else {}),
                 }
             )
             continue
         if is_attachment_ref(attachment):
             sha = attachment["sha256"]
-            persisted_attachments.append(
-                {
-                    "attachment_id": _new_attachment_id(),
-                    "sha256_ref": sha,
-                    "name": name,
-                    "mime": media_type,
-                    "size": attachment.get("size"),
-                }
-            )
+            persisted = {
+                "attachment_id": _new_attachment_id(),
+                "sha256_ref": sha,
+                "name": name,
+                "mime": media_type,
+                "size": attachment.get("size"),
+            }
+            if usage is not None:
+                persisted["usage"] = usage
+            # Transcript refs are historically session-scoped and can be
+            # reconstructed from ``sha256_ref``. Managed input refs instead
+            # need their logical resource identity to resolve a current path
+            # after restart, fork, or execution-environment changes. Never
+            # persist the optional absolute material path.
+            store = attachment.get("store")
+            if isinstance(store, str) and store and store != "transcript":
+                persisted["store"] = store
+                for key in ("owner", "resource_id", "pending_input_id", "source"):
+                    value = attachment.get(key)
+                    if isinstance(value, str) and value:
+                        persisted[key] = value
+            persisted_attachments.append(persisted)
             continue
         data = attachment.get("data")
         if not isinstance(data, str) or not isinstance(media_type, str):
@@ -199,6 +213,7 @@ def build_transcript_attachment_envelope(
                     "name": name,
                     "mime": media_type,
                     "size": len(payload),
+                    **({"usage": usage} if usage is not None else {}),
                 }
             )
         else:
@@ -208,6 +223,7 @@ def build_transcript_attachment_envelope(
                     "type": media_type,
                     "name": name,
                     "data": data,
+                    **({"usage": usage} if usage is not None else {}),
                 }
             )
 
@@ -256,7 +272,34 @@ def rebuild_attachments_for_replay(
             continue
         sha = entry.get("sha256_ref")
         if isinstance(sha, str) and sha:
-            path = transcript_material_path(media_root, session_id, sha)
+            store = entry.get("store") or "transcript"
+            ref: dict[str, Any] = {
+                "kind": "attachment_ref",
+                "sha256": sha,
+                "material_id": sha,
+                "name": _display_attachment_name(entry.get("name")),
+                "mime": entry.get("mime") or entry.get("type") or "application/octet-stream",
+                "size": entry.get("size"),
+                "store": store,
+                "scope": session_id,
+            }
+            for key in ("owner", "resource_id", "pending_input_id"):
+                value = entry.get(key)
+                if isinstance(value, str) and value:
+                    ref[key] = value
+            try:
+                from opensquilla.attachment_refs import attachment_ref_material_path
+
+                path = attachment_ref_material_path(ref, media_root=media_root)
+            except ValueError:
+                path = None
+            if path is None:
+                missing_markers.append(
+                    _MISSING_ATTACHMENT_TEMPLATE.format(
+                        name=_display_attachment_name(entry.get("name"))
+                    )
+                )
+                continue
             if not path.exists():
                 missing_markers.append(
                     _MISSING_ATTACHMENT_TEMPLATE.format(
@@ -275,15 +318,15 @@ def rebuild_attachments_for_replay(
                 continue
             raw_size = entry.get("size")
             size = raw_size if isinstance(raw_size, int) else path.stat().st_size
-            rebuilt_ref = make_attachment_ref(
-                sha256=sha,
-                name=_display_attachment_name(entry.get("name")),
-                mime=mime,
-                size=size,
-                session_id=session_id,
-                source="transcript",
-            )
-            missing_markers.append(attachment_ref_marker(rebuilt_ref))
+            ref["type"] = mime
+            ref["mime"] = mime
+            ref["size"] = size
+            ref["source"] = entry.get("source") or "transcript"
+            usage = normalize_attachment_usage(entry.get("usage"))
+            if usage is not None:
+                ref["usage"] = usage
+            ref["_was_staged"] = True
+            missing_markers.append(attachment_ref_marker(ref))
         else:
             missing_reason = entry.get("missing_reason")
             if isinstance(missing_reason, str) and missing_reason:
@@ -298,10 +341,18 @@ def rebuild_attachments_for_replay(
             if isinstance(data, str) and isinstance(mime, str):
                 raw_name = entry.get("name", "attachment")
                 rebuilt.append(
+                    # Keep the optional usage field so a replay uses the same
+                    # image projection policy as the original send.
                     {
                         "type": mime,
                         "data": data,
                         "name": raw_name if isinstance(raw_name, str) else "attachment",
+                        **(
+                            {"usage": usage}
+                            if (usage := normalize_attachment_usage(entry.get("usage")))
+                            is not None
+                            else {}
+                        ),
                     }
                 )
 

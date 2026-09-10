@@ -166,11 +166,6 @@ export function useChatAttachments(artifactContent?: ArtifactContentAccess) {
       // Anything else is an opaque attachment: it uploads under its resolved
       // label and the gateway stages the bytes for the agent workspace.
     }
-    const hardCap = attachmentHardCapBytes(mime)
-    if (file.size > hardCap) {
-      pushToast(i18n.global.t('chat.toast.fileTooLarge', { name: fileName, cap: formatMiB(hardCap) }), { tone: 'danger' })
-      return
-    }
     if (!canAcceptAttachment(fileName, file.size, batch)) return
 
     const localId = nextAttachmentId.value++
@@ -195,7 +190,24 @@ export function useChatAttachments(artifactContent?: ArtifactContentAccess) {
       return
     }
 
-    if (!canStageAttachmentMime(mime)) {
+    const localGrant = await tryPrepareLocalFile(file)
+    if (localGrant) {
+      pendingAttachments.value.push({
+        kind: 'local',
+        local_id: localId,
+        name: fileName,
+        mime,
+        size: file.size,
+        local_grant: localGrant.grant,
+        execution_environment: 'default',
+        expires_at: localGrant.expiresAt / 1000,
+        file,
+      })
+      return
+    }
+
+    const hardCap = attachmentHardCapBytes(mime)
+    if (file.size > hardCap || !canStageAttachmentMime(mime)) {
       pushToast(i18n.global.t('chat.toast.fileTooLarge', { name: fileName, cap: formatMiB(hardCap) }), { tone: 'danger' })
       return
     }
@@ -212,6 +224,7 @@ export function useChatAttachments(artifactContent?: ArtifactContentAccess) {
     const meta = await uploadAttachmentFile(file, mime)
     const idx = pendingAttachments.value.findIndex(a => a.local_id === localId)
     if (idx >= 0) {
+      const prior = pendingAttachments.value[idx]
       pendingAttachments.value[idx] = {
         kind: 'staged',
         local_id: localId,
@@ -222,6 +235,7 @@ export function useChatAttachments(artifactContent?: ArtifactContentAccess) {
         expires_at: meta.expiresAt,
         ttl_seconds: meta.ttlSeconds,
         file,
+        ...(prior?.usage ? { usage: prior.usage } : {}),
       }
     }
   }
@@ -242,8 +256,15 @@ export function useChatAttachments(artifactContent?: ArtifactContentAccess) {
       pushToast(`Cannot retry ${attachment.name}: select the file again`, { tone: 'danger' })
       return
     }
+    const usage = attachment.usage
     pendingAttachments.value.splice(index, 1)
     await addAttachment(attachment.file)
+    if (usage) {
+      const replacement = [...pendingAttachments.value]
+        .reverse()
+        .find(candidate => candidate.file === attachment.file)
+      if (replacement) replacement.usage = usage
+    }
   }
 
   function markAttachmentFailed(
@@ -263,6 +284,7 @@ export function useChatAttachments(artifactContent?: ArtifactContentAccess) {
         size: file.size,
         error,
         file,
+        ...(attachments[idx]?.usage ? { usage: attachments[idx].usage } : {}),
       }
     }
   }
@@ -274,6 +296,35 @@ export function useChatAttachments(artifactContent?: ArtifactContentAccess) {
   async function prepareAttachmentsForSend(options: AttachmentPreparationOptions = {}): Promise<boolean> {
     const isCurrent = options.isCurrent ?? (() => true)
     const attachments = options.attachments ?? pendingAttachments.value
+    const local = [...attachments].filter(localGrantNeedsRefresh)
+    for (const attachment of local) {
+      if (!isCurrent()) return false
+      if (!attachment.file) {
+        const index = attachments.findIndex(item => item.local_id === attachment.local_id)
+        if (index >= 0) attachments[index] = { ...attachment, kind: 'failed', error: 'Local file grant expired' }
+        return false
+      }
+      const grant = await tryPrepareLocalFile(attachment.file)
+      if (grant) {
+        const index = attachments.findIndex(item => item.local_id === attachment.local_id)
+        if (index >= 0) attachments[index] = {
+          ...attachment,
+          kind: 'local',
+          local_grant: grant.grant,
+          expires_at: grant.expiresAt / 1000,
+        }
+      } else {
+        const meta = await uploadAttachmentFile(attachment.file, attachment.mime)
+        const index = attachments.findIndex(item => item.local_id === attachment.local_id)
+        if (index >= 0) attachments[index] = {
+          ...attachment,
+          kind: 'staged',
+          file_uuid: meta.fileUuid,
+          expires_at: meta.expiresAt,
+          ttl_seconds: meta.ttlSeconds,
+        }
+      }
+    }
     const staged = [...attachments].filter(stagedUploadNeedsRefresh)
     for (const attachment of staged) {
       if (!isCurrent()) return false
@@ -309,6 +360,7 @@ export function useChatAttachments(artifactContent?: ArtifactContentAccess) {
           expires_at: meta.expiresAt,
           ttl_seconds: meta.ttlSeconds,
           file: attachment.file,
+          ...(attachment.usage ? { usage: attachment.usage } : {}),
         }
       } catch (err: unknown) {
         if (!isCurrent()) return false
@@ -372,6 +424,25 @@ export function useChatAttachments(artifactContent?: ArtifactContentAccess) {
 function uploadFailureMessage(err: unknown): string {
   if (err instanceof Error) return err.message
   return String(err)
+}
+
+async function tryPrepareLocalFile(file: File): Promise<{ grant: string, expiresAt: number } | null> {
+  const api = window.opensquillaDesktop
+  if (!api?.prepareLocalFile) return null
+  try {
+    const result = await api.prepareLocalFile(file, { executionEnvironment: 'default' })
+    if (result.ok && result.value.grant && result.value.expiresAt > Date.now()) {
+      return { grant: result.value.grant, expiresAt: result.value.expiresAt }
+    }
+  } catch {
+    // Upload fallback preserves compatibility with non-Desktop gateways.
+  }
+  return null
+}
+
+function localGrantNeedsRefresh(attachment: Attachment): boolean {
+  return attachment.kind === 'local'
+    && (!attachment.local_grant || typeof attachment.expires_at !== 'number' || attachment.expires_at * 1000 <= Date.now() + STAGED_UPLOAD_REFRESH_GRACE_MS)
 }
 
 function stagedUploadNeedsRefresh(attachment: Attachment): boolean {

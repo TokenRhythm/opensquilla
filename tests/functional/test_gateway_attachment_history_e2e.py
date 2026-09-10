@@ -403,7 +403,7 @@ async def _e2e_stack(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         _FakeModelCatalog.resolve_deployment_vision_support,
     )
     config = _configure_gateway(tmp_path)
-    store = UploadStore(marker_dir=tmp_path / "upload-markers")
+    store = UploadStore(marker_dir=Path(config.attachments.media_root) / "uploads")
     set_upload_store(store)
     storage = SessionStorage(str(tmp_path / "sessions.sqlite"))
     await storage.connect()

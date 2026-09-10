@@ -99,6 +99,10 @@ import {
 import { assertUnambiguousWindowsInstallation, launchWindowsInstaller, WindowsUpdateHandoffError } from './windows-update-handoff.js'
 import { WindowsUpdateCoordinator, WindowsUpdatePreparationError } from './windows-update-coordinator.js'
 import {
+  DesktopLocalFileGrantManager,
+  type DesktopLocalFileGrantIssueRequest,
+} from './desktop-local-file-grant.js'
+import {
   canRevealDesktopApp,
   defaultDesktopPreferences,
   mainWindowCloseAction,
@@ -635,6 +639,14 @@ const gatewayState: GatewayState = {
   logPath: '',
 }
 
+let desktopArtifactBridgeLoopback: DesktopArtifactBridgeLoopbackTransport
+
+const desktopLocalFileGrants = new DesktopLocalFileGrantManager(() => ({
+  owned: gatewayState.owned,
+  status: gatewayState.status,
+  instanceId: gatewayConnectionInstanceId,
+}), undefined, () => desktopArtifactBridgeLoopback.isStarted())
+
 function desktopGatewayConnectionSnapshot(): DesktopGatewayConnection {
   const ready = gatewayState.status === 'ready' && Boolean(gatewayState.url)
   const authToken = ready && gatewayState.owned && gatewayProcess
@@ -727,9 +739,10 @@ const desktopArtifactBridge = new DesktopArtifactBridge({
   getActiveTarget: () => nativeWorkbenchSurfaces.getActiveArtifactBridgeTarget(),
   acquireActiveTargetBinding: () => nativeWorkbenchSurfaces.acquireArtifactBridgeTargetBinding(),
 })
-const desktopArtifactBridgeLoopback = new DesktopArtifactBridgeLoopbackTransport(
+desktopArtifactBridgeLoopback = new DesktopArtifactBridgeLoopbackTransport(
   desktopArtifactBridge,
   {
+    resolveLocalFile: request => desktopLocalFileGrants.resolve(request),
     audit: entry => desktopLog(entry.event, {
       operation: entry.operation,
       outcome: entry.outcome,
@@ -11633,6 +11646,40 @@ ipcMain.handle('gateway:connection', (event) => {
     throw new Error('Untrusted Gateway connection request.')
   }
   return desktopGatewayConnectionSnapshot()
+})
+ipcMain.handle('desktop:file:capabilities', (event) => {
+  if (!trustedMainWindowControlIpc(event)) {
+    throw new Error('Untrusted local file capability request.')
+  }
+  return desktopLocalFileGrants.capabilities()
+})
+ipcMain.handle('desktop:file:grant', (event, payload: unknown) => {
+  if (!trustedMainWindowControlIpc(event)) {
+    return {
+      ok: false,
+      code: 'unavailable',
+      message: 'Local file references are unavailable to this window.',
+    }
+  }
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
+    return {
+      ok: false,
+      code: 'invalid-request',
+      message: 'The local file grant request is invalid.',
+    }
+  }
+  const raw = payload as Record<string, unknown>
+  const request: DesktopLocalFileGrantIssueRequest = {
+    path: typeof raw.path === 'string' ? raw.path : '',
+    name: typeof raw.name === 'string' ? raw.name : undefined,
+    mime: typeof raw.mime === 'string' ? raw.mime : undefined,
+    size: typeof raw.size === 'number' ? raw.size : undefined,
+    subject: 'desktop-gateway',
+    executionEnvironment: typeof raw.executionEnvironment === 'string'
+      ? raw.executionEnvironment
+      : 'default',
+  }
+  return desktopLocalFileGrants.issue(request)
 })
 ipcMain.handle('gateway:cli-invocation', async () => {
   const runtime = await resolveGatewayRuntime()

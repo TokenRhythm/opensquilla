@@ -1,7 +1,7 @@
 """Pre-router attachment materialization and post-router prompt rebind.
 
 The harness invokes ``AttachmentStage.run`` once after provider/tool setup and
-before prompt routing. Extracted text and typed media are then reused by
+before prompt routing. File metadata and typed media are then reused by
 compaction and provider delivery. A pure post-router helper replaces only the
 prompt block, without reading or parsing an attachment again.
 The bounded worker may materialize already-ingested uploads into the configured
@@ -10,9 +10,9 @@ Validation failures
 (count cap, disallowed
 media type, ref-without-media-root, invalid base64, oversize) raise
 ``ValueError`` from the port and propagate as-is to the outer terminal
-handler in ``_run_turn``. Per-attachment soft failures (missing ref
-bytes, PDF parse failure, text-family decode failure) are absorbed
-inside the build call into ``[attachment unavailable: …]`` placeholder
+handler in ``_run_turn``. Per-attachment soft failures (missing ref bytes or
+unavailable material paths) are absorbed inside the build call into
+``[attachment unavailable: …]`` placeholder
 text blocks; the stage records only their count.
 
 ``AttachmentStage`` does NOT call any ``TurnHook`` or
@@ -42,7 +42,6 @@ if TYPE_CHECKING:
     from opensquilla.engine.turn_runner.outcome import StageOutcome
 
 
-_UNAVAILABLE_MARKER = "[attachment unavailable:"
 _GENERATED_TEXT_ATTACHMENT_SOURCE = "input_normalization"
 _ATTACHMENT_PREPARATION_TIMEOUT_SECONDS = 30.0
 _ATTACHMENT_PREPARATION_WORKERS = 2
@@ -101,6 +100,9 @@ def _materialization_stats(
 
     estimated_tokens = 0
     generated_normalization_estimated_tokens = 0
+    # Ordinary files are never parsed during attachment preparation. Keep the
+    # legacy field for telemetry compatibility, but it must not count generic
+    # unavailable/path markers as parser failures.
     parse_failure_count = 0
     provider_visible_text_chars = 0
     image_count = 0
@@ -118,7 +120,6 @@ def _materialization_stats(
         if isinstance(block, ContentBlockText):
             provider_visible_text_chars += len(block.text)
             block_tokens = estimate_attachment_text_tokens(block.text)
-            parse_failure_count += block.text.count(_UNAVAILABLE_MARKER)
         elif isinstance(block, ContentBlockImage):
             image_count += 1
             block_tokens = estimate_provider_media_tokens(

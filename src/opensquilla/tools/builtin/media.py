@@ -866,6 +866,13 @@ async def pdf(
     path_block = _sensitive_media_path_block("pdf", p, path)
     if path_block is not None:
         return json.dumps(path_block)
+    # PDF extraction is an in-process reader, so it must apply the same path
+    # authorization as read_file/read_spreadsheet before opening the file.
+    from opensquilla.tools.builtin import filesystem
+
+    read_block = filesystem._sandbox_path_access_envelope(p, write=False)
+    if read_block is not None:
+        return json.dumps(read_block)
     if not p.exists():
         raise SafeToolError(f"PDF file not found: {path} (resolved={p})")
 

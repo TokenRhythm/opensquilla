@@ -1,4 +1,4 @@
-import { contextBridge, ipcRenderer } from 'electron'
+import { contextBridge, ipcRenderer, webUtils } from 'electron'
 
 if (process.isMainFrame) contextBridge.exposeInMainWorld('opensquillaDesktop', {
   getOsLocale: () => ipcRenderer.invoke('desktop:os-locale'),
@@ -11,6 +11,28 @@ if (process.isMainFrame) contextBridge.exposeInMainWorld('opensquillaDesktop', {
   dismissUpdate: () => ipcRenderer.invoke('desktop:update:dismiss'),
   getGatewayStatus: () => ipcRenderer.invoke('gateway:status'),
   getGatewayConnection: () => ipcRenderer.invoke('gateway:connection'),
+  getLocalFileCapabilities: () => ipcRenderer.invoke('desktop:file:capabilities'),
+  prepareLocalFile: (file: File, payload?: {
+    executionEnvironment?: string
+  }) => {
+    let path: string
+    try {
+      path = webUtils.getPathForFile(file)
+    } catch {
+      return Promise.resolve({
+        ok: false,
+        code: 'path-unavailable',
+        message: 'The native file path is unavailable.',
+      })
+    }
+    return ipcRenderer.invoke('desktop:file:grant', {
+      path,
+      name: file.name,
+      mime: file.type,
+      size: file.size,
+      executionEnvironment: payload?.executionEnvironment,
+    })
+  },
   getCliInvocation: () => ipcRenderer.invoke('gateway:cli-invocation'),
   revealGatewayLog: () => ipcRenderer.invoke('gateway:reveal-log'),
   getDesktopSettings: () => ipcRenderer.invoke('desktop:settings:get'),

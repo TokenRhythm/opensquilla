@@ -87,6 +87,9 @@ class ToolContext:
     task_id: str | None = None
     artifact_media_root: str | None = None
     artifact_session_id: str | None = None
+    # Exact managed attachment paths granted to this turn.  The filesystem
+    # readers treat these as read-only roots; they never widen write access.
+    attachment_read_roots: tuple[str, ...] = ()
     tool_result_store_dir: str | None = None
     tool_result_store_session_id: str | None = None
     artifact_max_bytes: int | None = None

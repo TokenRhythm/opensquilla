@@ -13,6 +13,25 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
+AttachmentUsage = Literal["vision", "file"]
+
+
+def normalize_attachment_usage(value: Any) -> AttachmentUsage | None:
+    """Normalize optional per-attachment model usage metadata.
+
+    Missing or unknown values intentionally return ``None`` so persisted
+    records from older clients keep their historical image behavior.
+    """
+
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip().lower()
+    if normalized in {"vision", "image", "visual", "native"}:
+        return "vision"
+    if normalized in {"file", "document", "download", "attachment"}:
+        return "file"
+    return None
+
 # Modern Office Open XML (OOXML) document MIME types. These are zip containers,
 # so they are extracted to text server-side rather than sent to a provider raw.
 DOCX_MIME = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
@@ -191,6 +210,7 @@ __all__ = [
     "ALLOWED_MEDIA_TYPES",
     "ATTACHMENT_CATEGORIES",
     "AttachmentCategory",
+    "AttachmentUsage",
     "IMAGE_ATTACHMENT_BYTES",
     "IMAGE_ATTACHMENT_MIMES",
     "INLINE_ATTACHMENT_BYTES",
@@ -209,4 +229,5 @@ __all__ = [
     "attachment_size_limit_for_mime",
     "can_stage_attachment_mime",
     "normalize_attachment_mime",
+    "normalize_attachment_usage",
 ]

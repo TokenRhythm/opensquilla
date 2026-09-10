@@ -372,10 +372,29 @@ async def _attachment_occurrences(
             durable = bool(_SHA256_RE.fullmatch(sha))
             payload: bytes
             if durable:
-                from opensquilla.attachment_refs import transcript_material_path
+                from opensquilla.attachment_refs import (
+                    attachment_ref_material_path,
+                )
 
                 try:
-                    material_path = transcript_material_path(media_root, session_id, sha)
+                    ref: dict[str, Any] = {
+                        "kind": "attachment_ref",
+                        "sha256": sha,
+                        "material_id": sha,
+                        "store": item.get("store") or "transcript",
+                        "scope": session_id,
+                        "name": name,
+                        "mime": mime,
+                        "size": item.get("size"),
+                    }
+                    for key in ("owner", "resource_id", "pending_input_id"):
+                        value = item.get(key)
+                        if isinstance(value, str) and value:
+                            ref[key] = value
+                    material_path = attachment_ref_material_path(
+                        ref,
+                        media_root=media_root,
+                    )
                     payload = native_io_path(material_path).read_bytes()
                 except (OSError, ValueError):
                     continue

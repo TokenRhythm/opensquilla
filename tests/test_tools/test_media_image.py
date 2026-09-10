@@ -604,3 +604,24 @@ async def test_fetch_image_url_uses_opted_in_environment_proxy_with_pinning(
     assert media_type == "image/png"
     assert seen["path"].startswith(f"http://127.0.0.1:{port}/")
     assert seen["host"] == f"proxy-target.test:{port}"
+
+
+@pytest.mark.asyncio
+async def test_pdf_applies_filesystem_read_authorization_before_opening(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from opensquilla.tools.builtin import filesystem
+
+    blocked = {
+        "status": "path_access_required",
+        "reason": "attachment_read_grant_required",
+    }
+    monkeypatch.setattr(
+        filesystem,
+        "_sandbox_path_access_envelope",
+        lambda _path, *, write: blocked if not write else None,
+    )
+    result = json.loads(await media.pdf(str(tmp_path / "unopened.pdf")))
+
+    assert result == blocked

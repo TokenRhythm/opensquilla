@@ -62,6 +62,12 @@ export interface ChatSendAttachmentPayload {
   name: string
   data?: string
   file_uuid?: string
+  size?: number
+  local_grant?: string
+  execution_environment?: string
+  expires_at_ms?: number
+  /** How the model should use an image attachment; omitted keeps legacy vision behavior. */
+  usage?: 'vision' | 'file'
 }
 
 /** Exact editable document head bound to one chat send attempt. */
@@ -84,7 +90,7 @@ export interface SessionSteerV2Params {
 }
 
 export interface Attachment {
-  kind: 'inline' | 'staged' | 'inline_pending' | 'uploading' | 'failed'
+  kind: 'inline' | 'staged' | 'local' | 'inline_pending' | 'uploading' | 'failed'
   local_id: number
   name: string
   mime: string
@@ -92,12 +98,16 @@ export interface Attachment {
   data?: string
   dataUrl?: string
   file_uuid?: string
+  local_grant?: string
+  execution_environment?: string
   expires_at?: number
   ttl_seconds?: number
   error?: string
   file?: File
   /** Server-owned bytes restored from the durable pending-input queue. */
   durable_material?: true
+  /** Explicit model usage for image attachments; absent means legacy vision behavior. */
+  usage?: 'vision' | 'file'
 }
 
 export interface DisplayAttachment {
@@ -117,6 +127,7 @@ export interface DisplayAttachment {
   sha256_ref?: string
   /** Session-scoped opaque identity for Workbench preview/import actions. */
   attachmentId?: string
+  usage?: 'vision' | 'file'
 }
 
 /**

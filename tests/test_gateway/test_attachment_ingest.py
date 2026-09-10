@@ -526,10 +526,10 @@ async def test_uuid_ingress_respects_persistence_without_consuming_upload(
     tmp_path: Path, persist_enabled: bool,
 ) -> None:
     payload = b"\x89PNG\r\n\x1a\n" + b"synthetic image material"
-    store = UploadStore(marker_dir=tmp_path / "upload-markers")
+    media_root = tmp_path / "media"
+    store = UploadStore(marker_dir=media_root / "uploads")
     file_uuid = await store.put("sample.png", "image/png", payload)
     original_upload = await store.get(file_uuid)
-    media_root = tmp_path / "media"
     options = {} if persist_enabled else {"persist_enabled": False, "disk_budget_bytes": 0}
 
     result = await ingest_attachments(
@@ -538,16 +538,18 @@ async def test_uuid_ingress_respects_persistence_without_consuming_upload(
     )
 
     assert result.failures == []
-    assert result.consumed_file_uuids == [file_uuid]
-    assert await store.get(file_uuid) == original_upload
+    assert result.consumed_file_uuids == ([] if persist_enabled else [file_uuid])
+    assert (await store.get(file_uuid))[0] == original_upload[0]
     assert len(result.attachments) == 1
     if persist_enabled:
         ref = result.attachments[0]
         assert is_attachment_ref(ref)
-        assert ref["scope"] == "accepted-session"
+        assert ref["store"] == "inputs"
+        assert ref["owner"] == "accepted-session"
+        assert ref["resource_id"] == file_uuid
         assert read_attachment_ref_bytes(ref, media_root=media_root) == payload
-        assert transcript_material_path(
-            media_root, "accepted-session", ref["sha256"],
+        assert (
+            media_root / "inputs" / "accepted-session" / file_uuid / "sample.png"
         ).read_bytes() == payload
     else:
         assert result.attachments == [{
@@ -626,3 +628,27 @@ async def test_queue_promotion_respects_persistence_and_retains_queue_material(
         assert {
             path: path.read_bytes() for path in media_root.rglob("*") if path.is_file()
         } == files_before
+
+@pytest.mark.asyncio
+async def test_persisted_upload_ref_uses_store_filename_and_survives_session_scope(
+    tmp_path: Path,
+) -> None:
+    media_root = tmp_path / "media"
+    store = UploadStore(marker_dir=media_root / "uploads")
+    file_uuid = await store.put("actual-name.txt", "text/plain", b"hello")
+
+    result = await ingest_attachments(
+        "inspect",
+        [{"file_uuid": file_uuid, "type": "text/plain", "name": "spoofed.txt"}],
+        store=store,
+        material_root=media_root,
+        session_id="source-session",
+    )
+
+    ref = result.attachments[0]
+    assert ref["store"] == "inputs"
+    assert ref["name"] == "actual-name.txt"
+    assert read_attachment_ref_bytes(ref, media_root=media_root) == b"hello"
+    assert not result.consumed_file_uuids
+    # The resource is claimed by the accepted session and survives the upload lease.
+    assert (media_root / "inputs" / "source-session" / file_uuid / "actual-name.txt").is_file()

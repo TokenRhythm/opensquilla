@@ -470,6 +470,46 @@ class DesktopArtifactBridgeClient:
 
         return isinstance(token, str) and secrets.compare_digest(self._token, token)
 
+    async def resolve_local_file(
+        self,
+        *,
+        grant: str,
+        subject: str = "desktop-gateway",
+        execution_environment: str = "default",
+        deadline_ms: int = 2_000,
+    ) -> str:
+        """Resolve one Desktop local-file grant immediately before reading it."""
+
+        if not isinstance(grant, str) or not _TOKEN_RE.fullmatch(grant):
+            raise ValueError("Desktop local file grant is invalid")
+        if not isinstance(subject, str) or not 1 <= len(subject) <= 256:
+            raise ValueError("Desktop local file grant subject is invalid")
+        if not isinstance(execution_environment, str) or not 1 <= len(execution_environment) <= 256:
+            raise ValueError("Desktop local file execution environment is invalid")
+        response = await self._post(
+            "/v1/local-files/resolve",
+            {
+                "version": 1,
+                "grant": grant,
+                "subject": subject,
+                "executionEnvironment": execution_environment,
+            },
+            deadline_ms=deadline_ms,
+        )
+        if response.get("ok") is not True:
+            raise self._response_error(response)
+        value = _record(response.get("value"), label="local file response")
+        if value.get("version") != 1 or not isinstance(value.get("path"), str):
+            raise DesktopArtifactBridgeError(
+                "invalid-response", "The Desktop local file response is invalid."
+            )
+        path = value.get("path")
+        if not isinstance(path, str) or not path or "\x00" in path:
+            raise DesktopArtifactBridgeError(
+                "invalid-response", "The Desktop local file path is invalid."
+            )
+        return path
+
     async def capabilities(self, *, deadline_ms: int = 2_000) -> DesktopArtifactBridgeCapabilities:
         try:
             response = await self._post(
@@ -1155,7 +1195,8 @@ class DesktopArtifactBridgeClient:
     async def _post(
         self,
         path: Literal[
-            "/v1/capabilities", "/v1/invoke", "/v1/bindings/acquire", "/v1/bindings/release"
+            "/v1/capabilities", "/v1/invoke", "/v1/bindings/acquire", "/v1/bindings/release",
+            "/v1/local-files/resolve",
         ],
         payload: dict[str, object],
         *,

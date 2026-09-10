@@ -58,6 +58,8 @@ export interface TurnSendAttachment {
   data?: string
   file_uuid?: string
   size?: number
+  /** Explicit model usage for image attachments; omitted preserves legacy behavior. */
+  usage?: 'vision' | 'file'
 }
 
 /**

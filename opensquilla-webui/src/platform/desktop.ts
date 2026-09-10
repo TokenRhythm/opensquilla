@@ -622,6 +622,15 @@ export function createDesktopPlatform(): Platform {
     },
     files: {
       openArtifact: (payload) => requireDesktopApi().openArtifact(payload),
+      ...(typeof window.opensquillaDesktop?.getLocalFileCapabilities === 'function'
+        && typeof window.opensquillaDesktop?.prepareLocalFile === 'function'
+        ? {
+            getLocalFileCapabilities: () => requireDesktopApi().getLocalFileCapabilities!(),
+            prepareLocalFile: (file: File, payload?: { executionEnvironment?: string }) => (
+              requireDesktopApi().prepareLocalFile!(file, payload)
+            ),
+          }
+        : {}),
       async chooseProjectDirectory(request) {
         const api = requireDesktopApi()
         if (typeof api.chooseProjectDirectory !== 'function') return null
