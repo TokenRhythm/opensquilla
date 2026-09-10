@@ -589,6 +589,26 @@ async def test_new_python_adapter_calls_unwrapped_legacy_implementation() -> Non
     assert isinstance(result["ts"], int)
 
 
+@pytest.mark.asyncio
+async def test_legacy_sessions_list_rejects_negative_limit_before_storage() -> None:
+    storage = _LegacyListStorage()
+    ctx = RpcContext(
+        conn_id="invalid-limit",
+        principal=Principal(
+            role="operator",
+            scopes=frozenset({"operator.admin"}),
+            is_owner=True,
+            authenticated=True,
+        ),
+        session_manager=SimpleNamespace(storage=storage),
+    )
+
+    with pytest.raises(ValueError, match=r"params\.limit must be >= 1"):
+        await _handle_sessions_list({"limit": -1}, ctx)
+
+    assert storage.list_calls == []
+
+
 @pytest.mark.parametrize(
     ("legacy_surface", "params", "expected_page_aliases"),
     [

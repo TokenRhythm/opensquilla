@@ -11,7 +11,7 @@ import typer
 from rich.table import Table
 
 from opensquilla.cli.gateway_rpc import confirm_or_exit, run_gateway_sync
-from opensquilla.cli.output import print_json
+from opensquilla.cli.output import exit_invalid_request, print_json
 from opensquilla.cli.ui import ACCENT_HEADER, console
 
 cron_app = typer.Typer(help="Inspect and manage scheduled OpenSquilla runs.")
@@ -858,6 +858,12 @@ def cron_runs(
     json_output: bool = typer.Option(False, "--json", help="Emit machine-readable JSON"),
 ) -> None:
     """List recent runs for a cron job."""
+    if limit < 1:
+        exit_invalid_request(
+            "--limit must be >= 1",
+            json_output=json_output,
+            details={"parameter": "limit", "minimum": 1},
+        )
 
     async def _run(client):
         return await client.call("cron.runs", {"id": job_id, "limit": limit})
