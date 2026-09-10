@@ -218,6 +218,10 @@ test('New Task removes ensemble DOM after a late legacy progress from an earlier
     // requestAnimationFrame observes the actual browser paint boundary.
     await page.evaluate(() => new Promise<void>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))))
     await capture('late-legacy-progress')
+    // T2 has not routed yet: its stale T1 event must not create another T1
+    // card. Keep running after this failure so the same baseline also records
+    // whether virtualized DOM survives the subsequent New Task transition.
+    expect.soft(await page.locator('.router-fx').count()).toBe(1)
     complete(1)
     await expect(page.locator('.chat-send-btn[aria-label="Send"]')).toBeVisible()
     await capture('before-virtual-scroll')
