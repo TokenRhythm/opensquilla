@@ -85,6 +85,14 @@ class CommandRegistry:
             context_factory(envelope),
         )
         reply_to = envelope.thread_id or envelope.channel_id
+        help_reply = _format_channel_help_reply(
+            name=name,
+            method=method,
+            res=res,
+            reply_to=reply_to,
+        )
+        if help_reply is not None:
+            return help_reply
         sandbox_reply = _format_channel_sandbox_reply(
             name=name,
             method=method,
@@ -112,6 +120,14 @@ class CommandRegistry:
         )
         if meta_reply is not None:
             return meta_reply
+        generic_reply = _format_channel_generic_reply(
+            name=name,
+            method=method,
+            res=res,
+            reply_to=reply_to,
+        )
+        if generic_reply is not None:
+            return generic_reply
         denied = bool(not res.ok and getattr(res.error, "code", "") == "UNAUTHORIZED")
         reason = "" if res.ok else f": {getattr(res.error, 'message', 'command failed')}"
         if res.ok:
@@ -127,6 +143,127 @@ class CommandRegistry:
             reply_to=envelope.thread_id or envelope.channel_id,
             metadata={"command": name, "method": method, "denied": denied},
         )
+
+
+def _format_channel_help_reply(
+    *,
+    name: str,
+    method: str,
+    res: Any,
+    reply_to: str | None,
+) -> OutgoingMessage | None:
+    """Render the channel /help output from the status RPC payload.
+
+    The unified registry binds channel ``/help`` to the ``status`` RPC, whose
+    payload carries no command catalog. Fetching one here would need another
+    dispatcher round-trip, so instead render the static channel-surface
+    command list straight from the canonical registry — same source of truth
+    the ``commands.list_for_surface`` RPC uses.
+    """
+    if name != "help" or method != "status":
+        return None
+    lines = [
+        f"{cmd.name} — {cmd.description_for(Surface.CHANNEL)}"
+        for cmd in DEFAULT_REGISTRY.for_surface(Surface.CHANNEL)
+    ]
+    body = "\n".join(lines) if lines else "No commands available."
+    return OutgoingMessage(
+        content=f"Available commands:\n{body}",
+        reply_to=reply_to,
+        metadata={"command": name, "method": method, "denied": False},
+    )
+
+
+def _format_channel_generic_reply(
+    *,
+    name: str,
+    method: str,
+    res: Any,
+    reply_to: str | None,
+) -> OutgoingMessage | None:
+    """Render list/status RPC payloads that lack a dedicated formatter.
+
+    Several channel commands (``/model``, ``/status``, ``/skills``,
+    ``/memory``, ``/usage``) dispatch to RPC methods whose payload carries
+    the actual answer, but the shared dispatch path would otherwise collapse
+    them into a generic ``/{name} completed`` line. This formatter extracts
+    a compact, human-readable summary from the known payload shapes.
+    """
+    if not res.ok:
+        return None
+    payload = res.payload if isinstance(res.payload, dict) else {}
+    lines: list[str] = []
+
+    if method == "models.list":
+        for m in payload.get("models") or []:
+            mid = str(m.get("id") or m.get("name") or "?")
+            prov = str(m.get("provider") or "")
+            ctx = m.get("contextWindow")
+            ctx_s = f", {ctx}" if ctx else ""
+            lines.append(f"{mid} ({prov}{ctx_s})")
+        if not lines:
+            lines.append("No models available.")
+    elif method == "status":
+        st = str(payload.get("status") or "unknown")
+        ver = str(payload.get("version") or "?")
+        prov = str(payload.get("provider") or "?")
+        sessions = payload.get("active_sessions")
+        uptime = payload.get("uptime_ms")
+        parts = [f"status: {st}", f"version: {ver}", f"provider: {prov}"]
+        if sessions is not None:
+            parts.append(f"active_sessions: {sessions}")
+        if uptime:
+            parts.append(f"uptime: {int(uptime) // 1000}s")
+        lines.append(" | ".join(parts))
+    elif method == "skills.list":
+        for s in payload.get("skills") or []:
+            if isinstance(s, dict):
+                lines.append(str(s.get("name") or "?"))
+        if not lines:
+            lines.append("No skills loaded.")
+    elif method == "doctor.memory.status":
+        backend = str(payload.get("backend") or "none")
+        status = str(payload.get("status") or "?")
+        entry_count = payload.get("entryCount")
+        size_bytes = payload.get("sizeBytes")
+        parts = [f"backend: {backend}", f"status: {status}"]
+        if entry_count is not None:
+            parts.append(f"entries: {entry_count}")
+        if size_bytes:
+            parts.append(f"size: {int(size_bytes) // 1024}KB")
+        lines.append(" | ".join(parts))
+    elif method == "chat.history":
+        for m in payload.get("messages") or []:
+            if not isinstance(m, dict):
+                continue
+            role = str(m.get("role") or "?")
+            content = str(m.get("content") or m.get("text") or "")
+            content = content.replace("\n", " ")[:120]
+            lines.append(f"[{role}] {content}")
+        if not lines:
+            lines.append("No history.")
+    elif method == "usage.status":
+        parts = []
+        for key, label in (
+            ("totalTokens", "tokens"),
+            ("totalCostUsd", "cost_usd"),
+            ("totalCacheReadTokens", "cache_read"),
+            ("totalInputTokens", "input"),
+            ("totalOutputTokens", "output"),
+            ("activeSessions", "active_sessions"),
+        ):
+            val = payload.get(key)
+            if val is not None:
+                parts.append(f"{label}: {val}")
+        lines.append(" | ".join(parts) if parts else "No usage data.")
+
+    if not lines:
+        return None
+    return OutgoingMessage(
+        content="\n".join(lines),
+        reply_to=reply_to,
+        metadata={"command": name, "method": method, "denied": False},
+    )
 
 
 def _channel_command_params(
