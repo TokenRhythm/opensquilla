@@ -24,7 +24,7 @@ import os
 import re
 from typing import Any, Final
 
-from opensquilla.tools.types import SafeToolUserMessage
+from opensquilla.tools.types import SafeToolUserMessage, ToolError
 
 # Class names whose instances represent transient infrastructure problems.
 # The list is intentionally conservative — subclass matching is handled by
@@ -163,6 +163,19 @@ def _sanitise_user_message(tool_name: str, exc: BaseException) -> str:
         return SafeToolUserMessage.user_message
     if class_name in _USER_MESSAGES:
         return _USER_MESSAGES[class_name]
+
+    # ToolError is raised by tool authors for invalid tool inputs; its message
+    # is authored for the user/model (e.g. cron "job_id required for add").
+    # Unlike unknown runtime exceptions it is safe to surface, but it still
+    # passes through the same sanitisation: traceback frames stripped and the
+    # message truncated.
+    if isinstance(exc, ToolError):
+        # Strip traceback frames BEFORE trimming whitespace: the frame regex
+        # requires leading whitespace (^\s+File ...), which .strip() would
+        # remove and silently disable the sanitisation.
+        message = _TRACEBACK_FRAME_RE.sub("", str(exc)).strip()
+        if message:
+            return message[:_USER_MESSAGE_MAX_CHARS]
 
     # Unknown classes: render a generic line that names the tool. Do NOT
     # interpolate str(exc) / repr(exc) — operators may have put secrets in
