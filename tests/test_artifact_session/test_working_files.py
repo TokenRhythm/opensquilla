@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import mimetypes
 from pathlib import Path
 
 import pytest
@@ -313,13 +314,18 @@ async def test_explicit_publication_versions_immutable_bundle_and_preserves_late
     assert await service.list_document_publications(session_id="test-session") == publications
 
 
+@pytest.mark.parametrize(
+    "javascript_mime", ("text/javascript", "application/javascript", "application/x-javascript"),
+)
 async def test_unchanged_bundle_publication_links_current_revision_without_adding_version(
-    working_document,
+    working_document, monkeypatch, javascript_mime,
 ):
+    from opensquilla.artifact_session.working_files import restore_working_revision
     from opensquilla.engine.types import ArtifactEvent
     from opensquilla.gateway.generated_artifact_adoption import GeneratedArtifactAdopter
 
     service, store, initial, binding = working_document
+    monkeypatch.setitem(mimetypes.types_map, ".js", javascript_mime)
     published = _publish_working_bundle(store, binding)
     assert published.id != initial.revision.artifact_id
     result = await save_working_version(
@@ -345,6 +351,34 @@ async def test_unchanged_bundle_publication_links_current_revision_without_addin
     )
     await adopter(ArtifactEvent(**published.to_dict()))
     assert len(await service.list_documents(session_key="test-key")) == 1
+
+    before_restore = await service.get_document(binding.document_id)
+    audits = await service.list_audit_events(binding.document_id)
+    _restored, receipt, replayed = await restore_working_revision(
+        service, store, document_id=binding.document_id,
+        session_key="test-key", session_id="test-session",
+        target_revision_id=before_restore.head_revision_id,
+        expected_head_revision_id=before_restore.head_revision_id,
+        expected_state_revision=before_restore.state_revision,
+        actor=Actor(kind=ActorKind.USER, actor_id="test-user"), turn_id="restore-mime-alias",
+    )
+    assert receipt.validation["no_op"] is True and not replayed
+    assert await service.get_document(binding.document_id) == before_restore
+    assert await service.list_audit_events(binding.document_id) == audits
+
+
+async def test_changed_resource_media_type_is_not_deduplicated(working_document, monkeypatch):
+    service, store, _initial, binding = working_document
+    monkeypatch.setitem(mimetypes.types_map, ".js", "application/json")
+    published = _publish_working_bundle(store, binding)
+    result = await save_working_version(
+        service, store, document_id=binding.document_id,
+        session_key="test-key", session_id="test-session",
+        actor_id="test-turn", published_ref=published,
+    )
+    assert result is not None
+    assert len(await service.list_revisions(binding.document_id)) == 2
+    assert (binding.root / "app.js").read_bytes() == b"window.ready=true"
 
 
 async def test_publication_replay_recovers_link_after_commit_before_reservation(

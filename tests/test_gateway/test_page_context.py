@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import json
+from pathlib import Path
 
 import pytest
 
@@ -140,8 +141,14 @@ async def test_page_resource_resolves_to_session_working_file_without_tool_restr
         assert response.error is None, response.error
         await stack.wait_until_running()
         task = stack.runtime._tasks[response.payload["task_id"]]
-        assert "workingFile" in task.message and str(tmp_path / "workspace") in task.message
-        assert "actual-page" in task.message
+        page_context = json.loads(
+            task.message.split("<page_context>", 1)[1].split("</page_context>", 1)[0]
+        )
+        working_file = Path(page_context["workingFile"])
+        assert working_file.is_relative_to(tmp_path / "workspace")
+        assert working_file.read_bytes() == b"<html><h1>Initial</h1></html>"
+        assert page_context["targetRef"] == "actual-page"
+        assert page_context["versionId"] == document.revision.revision_id
         assert len(await service.list_revisions(document.document.document_id)) == 1
         assert "artifact_context" not in task.envelope.runtime_services
         await service.close()

@@ -5,7 +5,6 @@ import { mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { isAbsolute, join, resolve } from 'node:path'
 import test from 'node:test'
-import { fileURLToPath } from 'node:url'
 import vm from 'node:vm'
 
 // Evaluate the actual helpers without the journey module's Electron startup.
@@ -243,8 +242,7 @@ test('functional ready binds the physical request log and rejects mixed modes', 
 test('request snapshots read functional HTTP outcomes separately from legacy accounting', async t => {
   const directory = await mkdtemp(join(tmpdir(), 'html-request-snapshot-'))
   t.after(() => rm(directory, { recursive: true, force: true }))
-  const root = fileURLToPath(new URL('../../../', import.meta.url))
-  const python = join(root, '.venv', process.platform === 'win32' ? 'Scripts/python.exe' : 'bin/python')
+  const python = process.platform === 'win32' ? 'python' : 'python3'
   const execute = (program, ...args) => execFileSync(python, ['-c', program, ...args], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] })
   const functional = join(directory, 'functional.sqlite'), budget = join(directory, 'budget.sqlite')
   execute(`import json,sqlite3,sys

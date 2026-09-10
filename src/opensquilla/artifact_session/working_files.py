@@ -72,6 +72,18 @@ def checked_path(root: Path, relative: str) -> Path:
     return path
 
 
+def _working_bundle_digest(bundle: ArtifactBundle) -> str:
+    # Host MIME registries use equivalent names for JavaScript. Normalize only
+    # for comparison, leaving persisted resource metadata and bytes intact.
+    files = tuple(
+        replace(item, mime="text/javascript")
+        if item.mime in {"application/javascript", "application/x-javascript"}
+        else item
+        for item in bundle.files
+    )
+    return artifact_bundle_manifest(replace(bundle, files=files)).bundle_digest
+
+
 @dataclass(frozen=True)
 class WorkingFiles:
     document_id: str
@@ -111,7 +123,7 @@ class WorkingFiles:
         return bundle
 
     def digest(self) -> str:
-        return artifact_bundle_manifest(self.bundle()).bundle_digest
+        return _working_bundle_digest(self.bundle())
 
 
 async def get_working_files(
@@ -569,7 +581,7 @@ async def restore_working_revision(
                             unchanged and current == binding
                             and binding.entry.exists() and binding.root.exists()
                             and await asyncio.to_thread(binding.digest)
-                            == artifact_bundle_manifest(bundle).bundle_digest
+                            == _working_bundle_digest(bundle)
                         )
                     except FileNotFoundError:
                         unchanged = False
@@ -728,8 +740,8 @@ async def save_working_version(
                 load_version_bundle, store, head.revision.artifact_id, session_id
             )
             unchanged = (
-                artifact_bundle_manifest(bundle).bundle_digest
-                == artifact_bundle_manifest(previous).bundle_digest
+                _working_bundle_digest(bundle)
+                == _working_bundle_digest(previous)
             )
             if unchanged:
                 if ref is None:

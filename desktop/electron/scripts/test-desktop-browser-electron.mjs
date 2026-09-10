@@ -145,7 +145,8 @@ try {
     manager.setSurfaceRect({surfaceId:'working',x:100,y:80,width:700,height:600,visible:true})
     manager.activateSurface('working')
     const record = manager.surfaces.get('working')
-    return {generation:record.annotationDocumentGeneration,instanceId:record.surfaceInstanceId}
+    return {generation:record.annotationDocumentGeneration,instanceId:record.surfaceInstanceId,
+      bounds:record.view.getBounds(),ownerBounds:record.owner.getContentBounds()}
   })
   const reload = await invoke({operation:'reload',targetRef:working.targetRef})
   assert.equal(reload.status,200)
@@ -166,7 +167,11 @@ try {
   assert.equal(afterReload.webContentsId,beforeWorking)
   assert.equal(afterReload.instanceId,beforeReload.instanceId)
   assert.equal(afterReload.visible,true)
-  assert.deepEqual(afterReload.bounds,{x:100,y:80,width:700,height:600})
+  assert.deepEqual(beforeReload.bounds,{x:100,y:80,
+    width:Math.min(700,beforeReload.ownerBounds.width-100),
+    height:Math.min(600,beforeReload.ownerBounds.height-80)})
+  assert.ok(beforeReload.bounds.width>0 && beforeReload.bounds.height>0)
+  assert.deepEqual(afterReload.bounds,beforeReload.bounds)
   assert.equal((await invoke({operation:'act',targetRef:working.targetRef,action:'click',ref:refreshedSnapshot.refs.find(item=>item.name==='Increment').ref})).code,'STALE_ELEMENT')
   const afterReloadSnapshot = await invoke({operation:'snapshot',targetRef:working.targetRef})
   assert.equal((await invoke({operation:'act',targetRef:working.targetRef,action:'click',ref:afterReloadSnapshot.refs.find(item=>item.name==='Increment').ref})).status,200)
