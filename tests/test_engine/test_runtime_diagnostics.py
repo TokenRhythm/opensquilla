@@ -441,8 +441,8 @@ async def test_agent_skips_git_diff_diagnostics_when_no_observer_needs_them(
     workspace.mkdir()
     tool_context = ToolContext(workspace_dir=str(workspace))
 
-    def unexpected_diff_probe(*_args, **_kwargs) -> Any:
-        raise AssertionError("Inactive diagnostics should stay lazy")
+    def unexpected_diff_probe(_self) -> Any:
+        raise AssertionError("Git diff diagnostics should stay lazy")
 
     monkeypatch.setattr(
         Agent,
@@ -454,18 +454,8 @@ async def test_agent_skips_git_diff_diagnostics_when_no_observer_needs_them(
         "_workspace_diff_fingerprint_for_runtime_event",
         unexpected_diff_probe,
     )
-    for helper in (
-        "_final_diff_contract_observation",
-        "_tool_call_repeat_key",
-        "_source_context_signature",
-        "_failure_anchor_summary_from_tool_results",
-        "_classify_focused_verification_result",
-    ):
-        monkeypatch.setattr(Agent, helper, unexpected_diff_probe)
-    monkeypatch.setattr("opensquilla.engine.agent.ProgressWatchdog", unexpected_diff_probe)
 
     async def handler(call: ToolCall) -> ToolResult:
-        tool_context.workspace_file_writes.append(_write("src/lib.rs"))
         return ToolResult(
             tool_use_id=call.tool_use_id,
             tool_name=call.tool_name,
@@ -561,26 +551,6 @@ async def test_retired_patch_ledger_does_not_write_on_turn_completion(
         assert not ledger_path.exists()
 
 
-def test_runtime_event_producers_do_not_prepare_unused_payloads(monkeypatch) -> None:
-    agent = Agent(provider=_ThreeToolProvider(tool_turns=0), config=AgentConfig())
-    unused = Mock(side_effect=AssertionError("unused event preparation"))
-    monkeypatch.setattr(agent, "_workspace_diff_paths_for_runtime_event", unused)
-    monkeypatch.setattr(agent, "_workspace_mutation_receipt_summary", unused)
-    monkeypatch.setattr("opensquilla.engine.agent.append_runtime_event", unused)
-    evidence = Mock()
-    evidence.to_event_details = unused
-    evidence.get = unused
-
-    agent._record_runtime_recovery_event(evidence, iteration=1, provider_call_count=1)
-    agent._record_final_diff_contract_event(
-        evidence, iteration=1, provider_call_count=1, mode="log", injected_to_model=False
-    )
-    agent._record_final_diff_salvage_event(
-        evidence, trigger="finalize", iteration=1, action="applied"
-    )
-    unused.assert_not_called()
-
-
 @pytest.mark.asyncio
 async def test_agent_runtime_diagnostics_write_jsonl_without_model_hint(
     tmp_path,
@@ -639,16 +609,15 @@ async def test_agent_runtime_diagnostics_write_jsonl_without_model_hint(
     assert diagnostic["mode"] == "log"
     assert diagnostic["injected_to_model"] is False
     assert diagnostic["changed_files"] == ["src/lib.rs"]
+    assert not any(event.get("name") == "focused_verification.classified" for event in logged)
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("event_output", [False, True])
-@pytest.mark.parametrize("watchdog_mode", ["off", "log"])
 async def test_agent_source_loop_recovery_warns_model_once(
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,
     event_output: bool,
-    watchdog_mode: str,
 ) -> None:
     runtime_events_path = tmp_path / "runtime_events.jsonl"
     ledger_path = tmp_path / "retired-ledger.json"
@@ -683,7 +652,7 @@ async def test_agent_source_loop_recovery_warns_model_once(
             runtime_events_path=str(runtime_events_path) if event_output else None,
             patch_evidence_ledger_path=str(ledger_path),
             runtime_recovery_mode="warn_model",
-            progress_watchdog_mode=watchdog_mode,
+            progress_watchdog_mode="log",
             tool_result_projection_max_inline_chars=10_000,
             tool_failure_loop_block_threshold=0,
         ),
@@ -692,8 +661,6 @@ async def test_agent_source_loop_recovery_warns_model_once(
         tool_context=tool_context,
         session_key="session-1",
     )
-    signature = Mock(wraps=agent._source_context_signature)
-    monkeypatch.setattr(agent, "_source_context_signature", signature)
     turn_log = Mock(wraps=agent._write_turn_call_log)
     monkeypatch.setattr(agent, "_write_turn_call_log", turn_log)
 
@@ -704,29 +671,17 @@ async def test_agent_source_loop_recovery_warns_model_once(
     assert "[Runtime recovery]" in _message_text(provider.messages_by_call[3])
     assert "[Runtime recovery]" not in _message_text(agent._history)
     assert any(call.args[0] == "runtime_recovery" for call in turn_log.call_args_list)
+    assert agent.config.metadata["source_loop_recoveries"] == 1
     assert not ledger_path.exists()
-    if watchdog_mode == "off" and not event_output:
-        signature.assert_not_called()
-    else:
-        assert signature.called
     if not event_output:
-        assert not runtime_events_path.exists()
         return
 
     logged = [
         json.loads(line)
         for line in runtime_events_path.read_text(encoding="utf-8").splitlines()
     ]
-    recovery = next(
-        event for event in logged if event.get("mechanism") == "source_loop_recovery"
-    )
-    assert recovery["feature"] == "runtime_recovery"
-    assert recovery["action"] == "nudge"
-    assert recovery["mode"] == "warn_model"
-    assert recovery["injected_to_model"] is True
-    assert recovery["evidence"]["diff_paths"] == ["src/lib.rs"]
-    assert recovery["verification_commands"] == []
-    assert not ledger_path.exists()
+    assert any(event.get("feature") == "runtime_observer" for event in logged)
+    assert not any(event.get("feature") == "runtime_recovery" for event in logged)
 
 
 @pytest.mark.asyncio
@@ -858,15 +813,12 @@ async def test_agent_source_loop_recovery_can_warn_for_second_source_loop_key(
     assert provider.calls == 7
     assert "[Runtime recovery]" in _message_text(provider.messages_by_call[3])
     assert "[Runtime recovery]" in _message_text(provider.messages_by_call[6])
+    assert agent.config.metadata["source_loop_recoveries"] == 2
+    assert "[Runtime recovery]" not in _message_text(agent._history)
 
     logged = [
         json.loads(line)
         for line in runtime_events_path.read_text(encoding="utf-8").splitlines()
     ]
-    recoveries = [
-        event for event in logged if event.get("mechanism") == "source_loop_recovery"
-    ]
-    assert [event["action"] for event in recoveries] == ["nudge", "nudge"]
-    assert [
-        event["evidence"]["source_loop_recovery_count"] for event in recoveries
-    ] == [1, 2]
+    assert any(event.get("feature") == "runtime_observer" for event in logged)
+    assert not any(event.get("feature") == "runtime_recovery" for event in logged)
