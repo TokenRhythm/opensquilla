@@ -19,11 +19,14 @@ from opensquilla.artifacts import (
     DEFAULT_ARTIFACT_MAX_BYTES,
     INSTALLER_ARTIFACT_SUFFIXES,
     ArtifactBudgetError,
+    ArtifactSource,
     ArtifactStore,
     _safe_filename,
+    artifact_bundle_manifest,
     artifact_mime_for_name,
     artifact_payload,
     artifact_publish_max_bytes_for_name,
+    collect_artifact_bundle,
 )
 from opensquilla.tools.path_aliases import resolve_workspace_alias
 from opensquilla.tools.types import ToolContext
@@ -172,14 +175,83 @@ def _text_mentions_written_file(final_text: str, record: dict[str, Any]) -> bool
     return any(candidate and candidate.casefold() in text for candidate in candidates)
 
 
-def _published_artifact_keys(ctx: ToolContext) -> set[tuple[str, str]]:
+def _same_source_file(first: Path, second: Path) -> bool:
+    """Match source aliases without merging distinct hardlink directory entries."""
+
+    try:
+        first = first.resolve(strict=True)
+        second = second.resolve(strict=True)
+        # Path equality folds case on Windows, including case-sensitive directories.
+        if str(first) == str(second):
+            return True
+        if not os.path.samestat(first.parent.stat(), second.parent.stat()):
+            return False
+        if first.name == second.name:
+            return True
+        if first.name.casefold() != second.name.casefold():
+            return False
+        if not os.path.samestat(first.stat(), second.stat()):
+            return False
+        # On macOS resolve() preserves caller casing. One actual directory entry
+        # proves a case alias; two entries may be intentional case-only hardlinks.
+        with os.scandir(first.parent) as entries:
+            return sum(
+                entry.name.casefold() == first.name.casefold() for entry in entries
+            ) == 1
+    except (OSError, RuntimeError, ValueError):
+        return False
+
+
+def _published_source_version_matches(
+    target: Path,
+    target_sha256: str,
+    source: ArtifactSource,
+    artifact: dict[str, Any],
+    *,
+    store: ArtifactStore,
+    workspace: Path,
+    session_id: str,
+) -> bool:
+    if artifact.get("sha256") != target_sha256:
+        return False
+    if not _same_source_file(Path(source.path), target):
+        return False
+    try:
+        published_bundle = store.describe_preview_bundle(
+            source.artifact_id, session_id=session_id,
+        )
+        if published_bundle is None:
+            return True
+        # An unchanged HTML entrypoint can still refer to changed CSS/JS/images.
+        current_bundle = collect_artifact_bundle(
+            source.path,
+            workspace_root=workspace,
+            mode=source.bundle_mode,
+            bundle_root=source.bundle_root,
+            entry_mime=artifact.get("mime"),
+        )
+        return (
+            current_bundle is not None
+            and artifact_bundle_manifest(current_bundle).bundle_digest
+            == published_bundle.bundle_digest
+        )
+    except (OSError, RuntimeError, ValueError):
+        # An unreadable source or stored snapshot is not proof of delivery.
+        return False
+
+
+def _published_artifact_keys(
+    ctx: ToolContext, *, source_artifact_ids: set[str],
+) -> set[tuple[str, str]]:
     return {
         (
             str(artifact.get("sha256")),
             _safe_filename(str(artifact.get("name"))),
         )
         for artifact in ctx.published_artifacts
-        if artifact.get("sha256") and artifact.get("name")
+        if artifact.get("sha256")
+        and artifact.get("name")
+        and artifact.get("id") not in source_artifact_ids
     }
 
 
@@ -222,8 +294,18 @@ def auto_publish_omitted_workspace_artifacts(
     published: list[dict[str, Any]] = []
     failure_summaries: list[str] = []
     resolved_target_keys: list[str] = []
-    seen_paths: set[Path] = set()
-    known_artifact_keys = _published_artifact_keys(ctx)
+    seen_paths: set[str] = set()
+    published_by_id = {artifact.get("id"): artifact for artifact in ctx.published_artifacts}
+    published_sources = [
+        (source, published_by_id[source.artifact_id])
+        for source in ctx.artifact_source_paths.values()
+        if source.artifact_id in published_by_id
+    ]
+    source_artifact_ids = {source.artifact_id for source, _ in published_sources}
+    # Name-based compatibility is only for tools without source publication facts.
+    known_artifact_keys = _published_artifact_keys(
+        ctx, source_artifact_ids=source_artifact_ids,
+    )
 
     for record in records:
         if not record.get("created"):
@@ -231,9 +313,9 @@ def auto_publish_omitted_workspace_artifacts(
             # files are tracked for diagnostics and are not deliverables.
             continue
         target = Path(str(record.get("path") or "")).expanduser().resolve(strict=False)
-        if target in seen_paths:
+        if str(target) in seen_paths:
             continue
-        seen_paths.add(target)
+        seen_paths.add(str(target))
         try:
             target.relative_to(workspace)
         except ValueError:
@@ -293,7 +375,13 @@ def auto_publish_omitted_workspace_artifacts(
                 workspace_dir=workspace,
             )
             name_key = artifact_delivery_name_target_key(target.name)
-            if artifact_key in known_artifact_keys:
+            if artifact_key in known_artifact_keys or any(
+                _published_source_version_matches(
+                    target, target_sha256, source, artifact,
+                    store=store, workspace=workspace, session_id=ctx.artifact_session_id,
+                )
+                for source, artifact in published_sources
+            ):
                 for resolved_key in (target_key, name_key):
                     if (
                         resolved_key is not None
@@ -308,6 +396,10 @@ def auto_publish_omitted_workspace_artifacts(
                 name=target.name,
                 mime=artifact_mime,
             )
+            if existing is not None and existing.id in source_artifact_ids:
+                # Its source/version already failed the check above. A matching
+                # display name cannot turn a different source into this file.
+                existing = None
             if existing is not None and any(
                 item.get("id") == existing.id for item in ctx.published_artifacts
             ):
@@ -317,7 +409,6 @@ def auto_publish_omitted_workspace_artifacts(
                         and resolved_key not in resolved_target_keys
                     ):
                         resolved_target_keys.append(resolved_key)
-                known_artifact_keys.add(artifact_key)
                 continue
             if existing is None:
                 disk_budget_bytes = (
@@ -352,10 +443,13 @@ def auto_publish_omitted_workspace_artifacts(
             payload = artifact_payload(ref)
             ctx.published_artifacts.append(payload)
             published.append(payload)
+            published_sources.append(
+                (ArtifactSource(str(target), bundle_mode="none", artifact_id=ref.id), payload)
+            )
+            source_artifact_ids.add(ref.id)
             for resolved_key in (target_key, name_key):
                 if resolved_key is not None and resolved_key not in resolved_target_keys:
                     resolved_target_keys.append(resolved_key)
-            known_artifact_keys.add(artifact_key)
         except (ArtifactBudgetError, OSError, ValueError) as exc:
             failure_summaries.append(f"auto-publish failed for {target.name}: {exc}")
             log.warning(
