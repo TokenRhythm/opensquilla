@@ -49,6 +49,33 @@ describe('router attempt ownership', () => {
     turn_id: turnId, stream_seq: seq, tier: 'c1', model: 'provider/selected', source: 'squilla_router',
   })
 
+  it('attaches untagged progress to the current tagged decision', () => {
+    const { runtime, messagesRef } = makeRuntime([{ role: 'user', text: 'q', ts: 0, turnId: 'turn-current' }])
+    runtime.queueRouterDecision(decision(10))
+    runtime.appendEnsembleProgress({
+      event_type: 'proposer_start', proposer_provider: 'provider', proposer_model: 'candidate',
+    })
+    const cards = messagesRef.value.filter(message => message.role === 'router')
+    expect(cards).toHaveLength(1)
+    expect(cards[0]?.ensemble?.models[0]?.model).toBe('candidate')
+  })
+
+  it('assigns untagged progress after replay to a new provisional card', () => {
+    const { runtime, messagesRef } = makeRuntime([{ role: 'user', text: 'q', ts: 0, turnId: 'turn-current' }])
+    runtime.queueRouterDecision(decision(10))
+    runtime.appendEnsembleProgress({ ...progress(), proposer_model: 'first' })
+    runtime.handleRouterControlReplay({ turn_id: 'turn-current', stream_seq: 20 })
+    runtime.appendEnsembleProgress({
+      event_type: 'proposer_start', proposer_provider: 'provider', proposer_model: 'second',
+    })
+    runtime.queueRouterDecision(decision(22))
+    const cards = messagesRef.value.filter(message => message.role === 'router')
+    expect(cards).toHaveLength(2)
+    expect(cards.map(card => card.messageId)).toEqual(['router-sess-10', 'router-sess-22'])
+    expect(cards.map(card => card.ensemble?.models.map(model => model.model)))
+      .toEqual([['first'], ['second']])
+  })
+
   it('uses the same boundary identity for live and snapshot replay', () => {
     const { runtime, messagesRef } = makeRuntime([{ role: 'user', text: 'q', ts: 0, turnId: 'turn-current' }])
     runtime.handleRouterControlReplay({ turn_id: 'turn-current', stream_seq: 10 })

@@ -436,7 +436,9 @@ export function useChatRouterDecisionRuntime(options: UseChatRouterDecisionRunti
     const member = memberFromEnsembleProgress(payload)
     if (!member) return
 
-    const turnId = payloadTurnId(payload)
+    // Older accepted progress events omit the turn/task id. Use the same
+    // transcript anchor as handoff and call binding, including after replay.
+    const turnId = payloadTurnId(payload) || latestExplicitTurnId()
     let target = findLiveRouterMessage(turnId)
 
     if (!target) {
