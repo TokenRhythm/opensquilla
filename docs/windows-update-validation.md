@@ -18,10 +18,10 @@ Its update and lifecycle contracts, one signed native A-to-B cached-input flow
 with retained-profile interactions, and PR/merge-queue CI do not certify general
 availability or the entire release matrix.
 
-Default activation is prepared in follow-up PR #1606. Complete the remaining native
-and restricted-network matrix below, record source SHAs, signed artifact hashes,
-installation mode, network conditions and outcomes, then validate the activation
-change in CI. The earlier experimental merge alone did not authorize signing,
+Default activation is delivered by follow-up PR #1606 under the bounded
+acceptance decision below. Record source SHAs, signed artifact hashes,
+installation mode, network conditions and outcomes separately from CI results.
+The earlier experimental merge alone did not authorize signing,
 public channel changes, or a release. The
 manual Show installer action remains available as a secondary action when the
 handoff is enabled and as the primary action for shells without that capability.
@@ -30,15 +30,36 @@ handoff is enabled and as the primary action for shells without that capability.
 
 The maintainer waived Windows 10 native acceptance for this activation on
 2026-09-10. Windows 10 remains in the supported Windows x64 scope; this waiver
-does not establish a tested Windows 10 upgrade. It does not waive the remaining
-Windows 11 network, certificate-chain, UAC/cancellation, installation path/scope,
-or retained-profile checks. Record Windows 10 as **not tested / maintainer waived**,
+does not establish a tested Windows 10 upgrade. Record Windows 10 as
+**not tested / maintainer waived**,
 never as passed or as an unsupported platform.
 
-The default-on source change alone is not release approval. Keep PR #1606 in
-Draft until the remaining acceptance evidence is recorded. CI fixtures and
-warm-cache host checks must not substitute for the clean Windows certificate
-and native restricted-network cells. Existing installed clients are unaffected
+The maintainer subsequently authorized merging after the checks feasible on
+the existing Windows 11 host, with unavailable native scenarios recorded as
+unverified rather than blocking this activation. This supersedes the earlier
+requirement to keep PR #1606 in Draft until every matrix cell passes; it does
+not turn any missing evidence into a pass or waive required repository CI.
+
+Host evidence includes the signed cached A-to-B custom per-user upgrade and
+retained-profile interactions from PR #1584, three default-on/opt-out Electron
+UI/lifecycle scenarios, 12 real Authenticode/cache checks, a direct signed NSIS
+`--updated` cancellation before installation, and a real-registry refusal for
+an executable outside the registered installation. The Electron scenarios use
+explicit signature/registry and installer/Gateway fixtures. Direct NSIS
+cancellation is not cancellation after application handoff or UAC cancellation.
+
+Still unverified: Windows 10 native operation; a clean Windows certificate
+cache; OS-enforced GitHub blocking with complete remote discovery/download;
+the full default/custom path and per-user/per-machine matrix; ordinary-user
+UAC acceptance/cancellation; and all post-handoff cancellation/retained-profile
+matrix cells. Do not clear the daily-use host's certificate caches or alter its
+firewall merely to make those cells appear complete. The fuller matrix below
+remains the follow-up acceptance specification; its original default-activation
+gates are deferred by this recorded maintainer decision.
+
+The default-on source change alone is not evidence of a signed final release.
+CI fixtures and warm-cache checks cannot substitute for the missing native
+results. Existing installed clients are unaffected
 until a build containing the activation is installed; the first upgrade from
 an older manual client still follows that older client's UI.
 
