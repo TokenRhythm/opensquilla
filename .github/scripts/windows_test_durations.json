@@ -377,7 +377,6 @@
     "tests/test_engine/test_meta_resolution_sticky.py": 0.067,
     "tests/test_engine/test_mid_budget_no_diff_nudge_lever.py": 32.325,
     "tests/test_engine/test_owner_cron_tool_policy.py": 0.01,
-    "tests/test_engine/test_patch_evidence_ledger.py": 0.325,
     "tests/test_engine/test_placeholder_escalation_and_wrapup.py": 17.887,
     "tests/test_engine/test_plan_run_reconciliation.py": 2.08,
     "tests/test_engine/test_preflight_compaction.py": 4.564,

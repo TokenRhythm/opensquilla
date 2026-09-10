@@ -284,10 +284,6 @@ class _AgentConfigAuxiliaries:
     tool_result_store_retention_seconds: int
     source_diff_preservation_mode: Literal["off", "log", "block"] | None
     source_diff_candidate_mode: Literal["off", "log", "warn_model"] | None
-    # Deprecated, unused compatibility slot; preserve construction and saved configs.
-    runtime_state_capsule_mode: Literal["off", "log", "inject"] | None = None
-    # Deprecated, unused compatibility slot; preserve construction and saved configs.
-    text_only_tool_recovery_mode: Literal["off", "log", "warn_model"] | None = None
     # Gateway ``prompt.finalize_evidence_gate`` (env still overrides).
     finalize_evidence_gate: bool = False
 
@@ -1000,6 +996,7 @@ class AgentBootstrapStage:
                 "OPENSQUILLA_PROGRESS_WATCHDOG_FAILURE_ANCHOR_THRESHOLD",
                 AgentConfig().progress_watchdog_repeated_failure_anchor_threshold,
             ),
+            # Retain legacy final-diff exclusion; no longer enables ledger export.
             patch_evidence_ledger_path=(
                 os.environ.get("OPENSQUILLA_PATCH_EVIDENCE_LEDGER_PATH") or None
             ),

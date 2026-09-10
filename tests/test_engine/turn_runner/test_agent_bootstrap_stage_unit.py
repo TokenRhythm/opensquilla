@@ -63,7 +63,6 @@ def _default_aux(
     flush_compaction_requires_safe_receipt: bool = False,
     source_diff_preservation_mode: str | None = "log",
     source_diff_candidate_mode: str | None = "log",
-    text_only_tool_recovery_mode: str | None = "off",
 ) -> _AgentConfigAuxiliaries:
     return _AgentConfigAuxiliaries(
         thinking=thinking,
@@ -93,18 +92,7 @@ def _default_aux(
         tool_result_store_retention_seconds=3600,
         source_diff_preservation_mode=source_diff_preservation_mode,
         source_diff_candidate_mode=source_diff_candidate_mode,
-        runtime_state_capsule_mode="off",
-        text_only_tool_recovery_mode=text_only_tool_recovery_mode,
     )
-
-
-def test_retired_auxiliary_fields_can_be_omitted_by_harness() -> None:
-    fields = vars(_default_aux()).copy()
-    fields.pop("runtime_state_capsule_mode")
-    fields.pop("text_only_tool_recovery_mode")
-    aux = _AgentConfigAuxiliaries(**fields)
-    assert aux.runtime_state_capsule_mode is None
-    assert aux.text_only_tool_recovery_mode is None
 
 
 @dataclass
@@ -1016,15 +1004,23 @@ async def test_retired_fresh_diagnostic_env_does_not_change_agent_config(monkeyp
 @pytest.mark.asyncio
 async def test_retired_text_only_tool_recovery_env_is_ignored(monkeypatch) -> None:
     monkeypatch.setenv("OPENSQUILLA_TEXT_ONLY_TOOL_RECOVERY_MODE", "warn_model")
-    stage = _make_stage(
-        aux=_RecordingAgentConfigBuilder(
-            aux=_default_aux(text_only_tool_recovery_mode="off")
-        )
-    )
+    stage = _make_stage()
 
     out = await stage.run(_make_input())
 
     assert out.output.agent_config.text_only_tool_recovery_mode == "off"
+
+
+@pytest.mark.asyncio
+async def test_retired_patch_ledger_env_preserves_legacy_diff_exclusion(
+    monkeypatch, tmp_path
+) -> None:
+    ledger_path = str(tmp_path / "legacy-ledger.json")
+    monkeypatch.setenv("OPENSQUILLA_PATCH_EVIDENCE_LEDGER_PATH", ledger_path)
+
+    out = await _make_stage().run(_make_input())
+
+    assert out.output.agent_config.patch_evidence_ledger_path == ledger_path
 
 
 @pytest.mark.asyncio
