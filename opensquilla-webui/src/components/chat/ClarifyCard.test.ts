@@ -82,6 +82,33 @@ afterEach(() => {
 })
 
 describe('ClarifyCard Plan questionnaire', () => {
+  it('shows sending feedback without claiming receipt before the Gateway accepts', async () => {
+    const { host } = mountCard(planQuestionnaire(), { busy: true })
+    await nextTick()
+    expect(host.querySelector('[data-testid="clarify-outcome"]')).toBeNull()
+    expect(host.querySelector('[data-testid="clarify-submit-status"]')?.textContent)
+      .toContain(i18n.global.t('chat.clarify.sendingReply'))
+    expect(host.textContent).not.toContain(i18n.global.t('chat.clarify.outcomeDoneTitle'))
+    expect(Array.from(host.querySelectorAll<HTMLInputElement>('input')).every(input => input.disabled)).toBe(true)
+  })
+
+  it('renders an expired question without answer controls or success text', async () => {
+    const { host } = mountCard(planQuestionnaire(), { expired: true })
+    await nextTick()
+    expect(host.querySelector('.clarify-outcome--expired')).toBeTruthy()
+    expect(host.textContent).toContain(i18n.global.t('chat.clarify.expiredTitle'))
+    expect(host.textContent).not.toContain(i18n.global.t('chat.clarify.outcomeDoneTitle'))
+    expect(host.querySelector('input, button, textarea')).toBeNull()
+  })
+
+  it('renders receipt only for a confirmed submitted reply', async () => {
+    const { host } = mountCard(planQuestionnaire(), { submitted: true })
+    await nextTick()
+    expect(host.textContent).toContain(i18n.global.t('chat.clarify.outcomeDoneTitle'))
+    expect(host.textContent).not.toContain(i18n.global.t('chat.clarify.expiredTitle'))
+    expect(host.querySelector('input, button, textarea')).toBeNull()
+  })
+
   it('keeps a complete long generic intro in a focusable scroll region', async () => {
     const request = planQuestionnaire()
     delete request.presentation

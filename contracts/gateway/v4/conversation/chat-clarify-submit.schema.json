@@ -62,6 +62,11 @@
         "retryable": true
       },
       {
+        "code": "USER_INPUT_EXPIRED",
+        "retryable": false,
+        "accepted": false
+      },
+      {
         "code": "INTERNAL_ERROR"
       }
     ]

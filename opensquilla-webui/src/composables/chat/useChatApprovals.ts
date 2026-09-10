@@ -1,4 +1,6 @@
 import type {
+  ConversationEventData,
+  ConversationEventIdentity,
   ConversationToolContent,
 } from '@/modules/conversationEventContent'
 import { computed, ref, watch, type Ref } from 'vue'
@@ -28,6 +30,10 @@ import type { ConversationEventHub } from '@/modules/conversationEventHub'
 import type { ConversationEvent } from '@/modules/conversationEvents'
 
 const MAX_RESOLVED_OUTCOMES = 4
+const CLARIFY_TERMINAL_EVENTS = new Set([
+  'task-succeeded', 'task-failed', 'task-timed-out', 'task-cancelled',
+  'task-abandoned', 'turn-failed', 'turn-completed',
+])
 
 // The chat approval poll is gone: approvals stream in as interrupt frames, and
 // the snapshot fetch is a one-shot hydration on subscribe / session-switch /
@@ -89,6 +95,12 @@ export interface ChatClarifyRequest {
   requestId?: string
   runId: string
   step: string
+}
+
+interface TrackedClarifyRequest {
+  request: ChatClarifyRequest
+  streamSeq?: number
+  streamGeneration?: string
 }
 
 interface ApprovalResolveResponse {
@@ -220,11 +232,10 @@ export function useChatApprovals(options: UseChatApprovalsOptions) {
   const clarifySubmitted = ref(false)
   const clarifyBusy = ref(false)
   const clarifyError = ref('')
-  // A request-scoped submit can cross the Gateway boundary even when its RPC
-  // acknowledgement is lost. Keep that uncertainty until either the submit
-  // response/tool outcome settles it or an authoritative reconnect snapshot
-  // confirms that the request is no longer pending.
-  const clarifySubmitAttempts = new Set<string>()
+  const clarifyRequests = new Map<string, TrackedClarifyRequest>()
+  const settledClarifyTasks = new Set<string>()
+  let clarifyContextGeneration = 0
+  let clarifyEpoch: number | null = null
 
   // Resolution view-state for inline interrupt parts is the shared `interruptState`
   // ref (keyed by approval id, or the clarify composite key). The fold reads it to
@@ -276,6 +287,44 @@ export function useChatApprovals(options: UseChatApprovalsOptions) {
     pendingClarify.value = null
     resetClarifyPresentation()
     return true
+  }
+
+  function settleClarify(key: string, resolution: 'replied' | 'expired') {
+    // An accepted answer remains an accepted answer if the owning task later
+    // stops. A missing pending record alone never proves that an answer landed.
+    if (interruptState.value.get(key)?.resolution !== 'replied') {
+      setInterruptState(key, { resolution, busy: false, error: '' })
+    }
+    clearPendingClarify(key)
+  }
+
+  function acceptClarifyContext(payload: ConversationEventIdentity, reset = false): boolean {
+    if (!isCurrentSessionPayload(payload, sessionKey.value)) return false
+    const epoch = payload.epoch
+    if (typeof epoch !== 'number' || !Number.isSafeInteger(epoch) || epoch < 0) return true
+    if (clarifyEpoch !== null && epoch < clarifyEpoch) return false
+    if (epoch !== clarifyEpoch) {
+      if (clarifyEpoch !== null || reset) {
+        clarifyContextGeneration++
+        for (const [key, item] of clarifyRequests) {
+          if (item.request.requestId) settleClarify(key, 'expired')
+        }
+        settledClarifyTasks.clear()
+      }
+      clarifyEpoch = epoch
+    }
+    return true
+  }
+
+  function handleClarifyTaskTerminal(
+    payload: ConversationEventIdentity & Pick<ConversationEventData, 'changed_task' | 'last_task'>,
+  ) {
+    const taskId = payload.task_id || payload.changed_task?.task_id || payload.last_task?.task_id
+    if (!taskId) return
+    settledClarifyTasks.add(taskId)
+    for (const [key, item] of clarifyRequests) {
+      if (item.request.requestId && item.request.runId === taskId) settleClarify(key, 'expired')
+    }
   }
 
   let pollTimer: ReturnType<typeof setInterval> | null = null
@@ -575,25 +624,34 @@ export function useChatApprovals(options: UseChatApprovalsOptions) {
 
   function handleToolResult(payload: ConversationToolContent) {
     if (!payload || typeof payload !== 'object') return
-    if (!isCurrentSessionPayload(payload, sessionKey.value)) return
     const outcome = userInputOutcomeFromValue(payload.approvalResult)
     if (outcome) {
-      clarifySubmitAttempts.delete(outcome.requestId)
-      setInterruptState(outcome.requestId, {
-        resolution: 'replied',
-        busy: false,
-        error: '',
-      })
-      clearPendingClarify(outcome.requestId)
+      settleClarify(outcome.requestId, outcome.status === 'answered' ? 'replied' : 'expired')
       return
     }
     const request = parseClarifyRequest(payload)
     if (!request) return
     const key = clarifyFrameKey(request)
-    // Tool-result replay and reconnect delivery can surface the paused half
-    // after its terminal outcome. Never resurrect an already-settled request or
-    // let a duplicate paused event undo optimistic submit feedback.
-    if (interruptState.value.get(key)?.resolution === 'replied') return
+    // Replay can deliver the paused half after the task or request settled.
+    if (interruptState.value.get(key)?.resolution) return
+    const current = pendingClarify.value && clarifyRequests.get(clarifyFrameKey(pendingClarify.value))
+    if (
+      current
+      && current.streamGeneration === payload.stream_generation
+      && typeof current.streamSeq === 'number'
+      && typeof payload.stream_seq === 'number'
+      && current.streamSeq > payload.stream_seq
+    ) return
+    clarifyRequests.set(key, {
+      request,
+      streamSeq: payload.stream_seq,
+      streamGeneration: payload.stream_generation,
+    })
+    if (request.requestId && settledClarifyTasks.has(request.runId)) {
+      settleClarify(key, 'expired')
+      return
+    }
+    if (pendingClarifyMatches(key) && clarifyBusy.value) return
     pendingClarify.value = request
     resetClarifyPresentation()
     // Mirror the clarify into the turn log so it folds into an inline interrupt
@@ -691,11 +749,24 @@ export function useChatApprovals(options: UseChatApprovalsOptions) {
   function subscribe(): () => void {
     const toolResultHandle = conversationEvents.open('')
     const detachToolResults = toolResultHandle.observe((message) => {
-      if (
-        message.kind !== 'conversation'
-        || message.event.semanticKind !== 'tool-result'
-      ) return
-      handleToolResult(message.event.payload)
+      if (message.kind === 'sessions-changed') {
+        const payload = message.payload
+        if (!acceptClarifyContext(payload)) return
+        const terminalTask = [payload.changed_task, payload.last_task].find(task => (
+          ['succeeded', 'failed', 'timed_out', 'timeout', 'cancelled', 'abandoned', 'interrupted'].includes(
+            String(task?.status || '').toLowerCase(),
+          )
+        ))
+        if (terminalTask) handleClarifyTaskTerminal({ ...payload, task_id: terminalTask.task_id })
+        return
+      }
+      if (message.kind !== 'conversation' || message.event.kind !== 'known') return
+      const event = message.event
+      const terminal = CLARIFY_TERMINAL_EVENTS.has(event.semanticKind)
+      if (event.semanticKind !== 'tool-result' && event.semanticKind !== 'session-epoch-changed' && !terminal) return
+      if (!acceptClarifyContext(event.payload, event.semanticKind === 'session-epoch-changed')) return
+      if (event.semanticKind === 'tool-result') handleToolResult(event.payload)
+      else if (terminal) handleClarifyTaskTerminal(event.payload)
     })
     const approvalEvents = approvalCenter.subscribe(event => {
       if (event.kind === 'requested') handleApprovalRequested(event)
@@ -722,49 +793,58 @@ export function useChatApprovals(options: UseChatApprovalsOptions) {
     const request = requestOverride || pendingClarify.value
     if (clarifyBusy.value || !request) return
     const key = clarifyFrameKey(request)
-    if (interruptState.value.get(key)?.resolution === 'replied') return
+    if (interruptState.value.get(key)?.resolution || interruptState.value.get(key)?.busy) return
+    if (request.requestId && settledClarifyTasks.has(request.runId)) {
+      settleClarify(key, 'expired')
+      return
+    }
     if (!requestOverride && clarifySubmitted.value) return
+    const ownerSession = sessionKey.value
+    const ownerGeneration = clarifyContextGeneration
+    const ownsCurrentContext = () => ownerSession === sessionKey.value
+      && ownerGeneration === clarifyContextGeneration
+    if (!clarifyRequests.has(key)) clarifyRequests.set(key, { request })
     const controlsPendingPresentation = pendingClarifyMatches(key)
     if (controlsPendingPresentation) {
       clarifyBusy.value = true
-      clarifySubmitted.value = true
+      clarifySubmitted.value = false
       clarifyError.value = ''
     }
-    if (request.requestId) clarifySubmitAttempts.add(key)
-    setInterruptState(key, { resolution: 'replied', busy: true, error: '' })
+    setInterruptState(key, { resolution: null, busy: true, error: '' })
     try {
       await clarificationSubmission.submit({
-        sessionKey: sessionKey.value,
+        sessionKey: ownerSession,
         fields,
         ...(request.requestId ? { requestId: request.requestId } : {}),
         ...(request.runId ? { runId: request.runId } : {}),
       })
-      clarifySubmitAttempts.delete(key)
+      if (!ownsCurrentContext()) return
       setInterruptState(key, { resolution: 'replied', busy: false })
       // request_id submissions resolve the exact paused tool call in the same
       // turn. A successful RPC is therefore authoritative and can release the
       // dock/composer immediately. Legacy clarifications create a new chat turn
       // and intentionally retain their existing submitted receipt.
       if (request.requestId) clearPendingClarify(key)
+      else if (pendingClarifyMatches(key)) clarifySubmitted.value = true
     } catch (err) {
+      if (!ownsCurrentContext()) return
       const message = 'Send failed — ' + (err instanceof Error ? err.message : String(err))
-      const stillPending = pendingClarifyMatches(key)
-      // A terminal tool result or authoritative empty snapshot can win the
-      // race with a rejected/lost RPC acknowledgement. Never reopen that
-      // already-settled request from the late rejection.
-      const terminalConfirmed = !stillPending
-        && interruptState.value.get(key)?.resolution === 'replied'
-      if (stillPending) {
+      if (interruptState.value.get(key)?.resolution) return
+      const code = err && typeof err === 'object' && 'code' in err ? String(err.code) : ''
+      if (request.requestId && (
+        code === 'USER_INPUT_EXPIRED'
+        || (err instanceof Error && err.message === 'pending user-input request was not found')
+      )) {
+        settleClarify(key, 'expired')
+        return
+      }
+      if (pendingClarifyMatches(key)) {
         clarifySubmitted.value = false
         clarifyError.value = message
       }
-      if (terminalConfirmed) {
-        clarifySubmitAttempts.delete(key)
-      } else {
-        setInterruptState(key, { resolution: null, busy: false, error: message })
-      }
+      setInterruptState(key, { resolution: null, busy: false, error: message })
     } finally {
-      if (pendingClarifyMatches(key)) clarifyBusy.value = false
+      if (ownsCurrentContext() && pendingClarifyMatches(key)) clarifyBusy.value = false
     }
   }
 
@@ -774,9 +854,14 @@ export function useChatApprovals(options: UseChatApprovalsOptions) {
   }
 
   function applyUserInputBootstrap(snapshot: {
+    sessionKey?: string
+    epoch?: number | null
+    streamSeq?: number | null
+    streamGeneration?: string | null
     pendingUserInputs?: unknown[]
     pending_user_inputs?: unknown[]
   }) {
+    if (!acceptClarifyContext({ key: snapshot.sessionKey, epoch: snapshot.epoch ?? undefined })) return
     const hasAuthoritativePendingList = Object.prototype.hasOwnProperty.call(
       snapshot,
       'pendingUserInputs',
@@ -788,19 +873,32 @@ export function useChatApprovals(options: UseChatApprovalsOptions) {
       .map(value => clarifyRequestFromValue(value))
       .filter((request): request is ChatClarifyRequest => request != null)
     const pendingKeys = new Set(requests.map(request => clarifyFrameKey(request)))
-    const current = pendingClarify.value
-    if (current?.requestId) {
-      const currentKey = clarifyFrameKey(current)
-      if (clarifySubmitAttempts.has(currentKey) && !pendingKeys.has(currentKey)) {
-        clarifySubmitAttempts.delete(currentKey)
-        setInterruptState(currentKey, { resolution: 'replied', busy: false, error: '' })
-        clearPendingClarify(currentKey)
+    const newerThanSnapshot = (item: TrackedClarifyRequest) => (
+      typeof snapshot.streamSeq === 'number'
+      && typeof item.streamSeq === 'number'
+      && item.streamGeneration === (snapshot.streamGeneration ?? undefined)
+      && item.streamSeq > snapshot.streamSeq
+    )
+    for (const [key, item] of clarifyRequests) {
+      if (item.request.requestId && !pendingKeys.has(key) && !newerThanSnapshot(item)) {
+        settleClarify(key, 'expired')
       }
     }
 
     for (const request of requests) {
       const key = clarifyFrameKey(request)
-      if (interruptState.value.get(key)?.resolution === 'replied') continue
+      if (interruptState.value.get(key)?.resolution) continue
+      if (request.requestId && settledClarifyTasks.has(request.runId)) {
+        settleClarify(key, 'expired')
+        continue
+      }
+      const current = pendingClarify.value && clarifyRequests.get(clarifyFrameKey(pendingClarify.value))
+      if (current && newerThanSnapshot(current) && !pendingClarifyMatches(key)) continue
+      if (!clarifyRequests.has(key)) clarifyRequests.set(key, {
+        request,
+        streamSeq: snapshot.streamSeq ?? undefined,
+        streamGeneration: snapshot.streamGeneration ?? undefined,
+      })
       const sameRequest = pendingClarifyMatches(key)
       pendingClarify.value = request
       // Do not make an in-flight submission actionable again just because a
@@ -821,6 +919,8 @@ export function useChatApprovals(options: UseChatApprovalsOptions) {
   // recovers approvals that were already pending (e.g. reload mid-approval) and
   // re-arms the opt-in recovery interval for the new session.
   watch(sessionKey, key => {
+    clarifyContextGeneration++
+    clarifyEpoch = null
     statusGeneration++
     stopFallbackPoll()
     approvalEntries.value = []
@@ -828,13 +928,15 @@ export function useChatApprovals(options: UseChatApprovalsOptions) {
     interruptState.value = new Map()
     interruptNamespaces.clear()
     interruptApprovals.clear()
-    clarifySubmitAttempts.clear()
+    clarifyRequests.clear()
+    settledClarifyTasks.clear()
     legacyPushBackfills.clear()
     dismissClarify()
     if (key) hydrateApprovals()
-  }, { immediate: true })
+  }, { immediate: true, flush: 'sync' })
 
   function cleanup() {
+    clarifyContextGeneration++
     statusGeneration++
     stopFallbackPoll()
   }

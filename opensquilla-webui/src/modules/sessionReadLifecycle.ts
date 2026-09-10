@@ -46,6 +46,11 @@ export interface SessionReadMetadata {
   readonly runStatus: string
   readonly queuedTaskIds: readonly string[]
   readonly epoch: number | null
+  /** Lower bound for pending-input hydration, not an authoritative transport cursor. */
+  readonly pendingUserInputsCursor?: {
+    readonly streamGeneration: string | null
+    readonly currentStreamSeq: number | null
+  }
   readonly hydrationComplete: boolean
   readonly deferredFields: readonly string[]
   readonly additional: SessionReadJsonObject
