@@ -6890,11 +6890,16 @@ watch(
 watch(() => [route.path, route.query.agent, route.query.project], async () => {
   durableRecoveryGeneration += 1
   metaDraftRecovery.invalidate()
-  const generation = draftProjectHydration.begin()
+  draftProjectHydration.invalidate()
   if (!isDraftRoute()) return
   artifactImageLightbox.close()
-  if (!await syncDraftProjectFromRoute(generation)) return
+  // Retire the previous session before optional project I/O. The shared view
+  // already renders /chat/new here; retaining its old key would also admit
+  // that session's delayed live events, history, and subscription snapshots.
   enterDraft()
+  const generation = draftProjectHydration.begin()
+  if (!await syncDraftProjectFromRoute(generation)) return
+  if (!draftProjectHydration.isCurrent(generation) || !isDraftRoute()) return
   metaDraftRecovery.start(draftAgentId())
 })
 
