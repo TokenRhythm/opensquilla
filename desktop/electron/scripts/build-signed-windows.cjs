@@ -53,6 +53,8 @@ async function main() {
   if (process.platform !== "win32") {
     throw new Error("Signed Windows packaging must run on Windows");
   }
+  const { verifyGatewayIntegrity } = await import("./gateway-integrity.mjs");
+  verifyGatewayIntegrity(repositoryRoot, path.join(projectDir, "runtime", "gateway"), { prepared: true });
   const policy = loadPolicy();
   const signTool = findSignTool();
   const electronBuilder = require(path.join(projectDir, "node_modules", "electron-builder"));

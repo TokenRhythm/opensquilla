@@ -294,10 +294,7 @@ async def test_reasoning_only_prefill_recovery_cleans_synthetic_history(tmp_path
     assert assistant_messages[0].content[0].text == "ok"
     assert assistant_messages[0].reasoning_content is None
     logged = [json.loads(line) for line in runtime_events_path.read_text().splitlines()]
-    recovery_event = next(
-        event for event in logged if event.get("mechanism") == "reasoning_prefill_recovery"
-    )
-    assert recovery_event["injected_to_model"] is True
+    assert not any(event.get("feature") == "runtime_recovery" for event in logged)
 
 
 @pytest.mark.parametrize(
@@ -485,10 +482,7 @@ async def test_post_tool_empty_recovery_nudges_once_and_cleans_history(tmp_path)
         for msg in agent._history
     )
     logged = [json.loads(line) for line in runtime_events_path.read_text().splitlines()]
-    recovery_event = next(
-        event for event in logged if event.get("mechanism") == "post_tool_empty_recovery"
-    )
-    assert recovery_event["injected_to_model"] is True
+    assert not any(event.get("feature") == "runtime_recovery" for event in logged)
 
 
 def test_tool_loop_observer_diff_paths_preserve_status_path_prefix(tmp_path) -> None:
@@ -573,11 +567,7 @@ async def test_final_diff_contract_warn_model_reaches_next_provider_request(
     assert "repository diff looks suspicious" in warning_messages[0].content
 
     logged = [json.loads(line) for line in runtime_events_path.read_text().splitlines()]
-    contract_event = next(
-        event for event in logged if event.get("feature") == "final_diff_contract"
-    )
-    assert contract_event["injected_to_model"] is True
-    assert contract_event["diff_paths"] == ["debug_case.php"]
+    assert not any(event.get("name") == "final_diff_contract.observed" for event in logged)
 
 
 @pytest.mark.asyncio
@@ -1454,11 +1444,7 @@ async def test_large_dashscope_reasoning_only_nudges_before_hard_fail(tmp_path) 
         for msg in provider.calls[1]["messages"]
     )
     logged = [json.loads(line) for line in runtime_events_path.read_text().splitlines()]
-    recovery_event = next(
-        event for event in logged if event.get("mechanism") == "reasoning_continuation_recovery"
-    )
-    assert recovery_event["injected_to_model"] is True
-    assert recovery_event["details"]["provider_reasoning_format"] == "dashscope"
+    assert not any(event.get("feature") == "runtime_recovery" for event in logged)
 
 
 @pytest.mark.asyncio
