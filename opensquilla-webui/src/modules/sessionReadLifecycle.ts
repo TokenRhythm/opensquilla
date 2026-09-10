@@ -1,3 +1,4 @@
+import type { ChatPageContext } from '@/types/pageContext'
 import type { InjectionKey } from 'vue'
 import type {
   ConversationCursor,
@@ -105,6 +106,7 @@ export interface SessionReadMessage {
   readonly timeline: readonly unknown[]
   readonly attachments: readonly SessionReadJsonObject[]
   readonly promptAnnotations: readonly unknown[]
+  readonly pageContext?: ChatPageContext
   readonly provenance: SessionReadMessageProvenance
   readonly turnContext: SessionReadTurnContext | null
   readonly usage: SessionReadJsonObject | null

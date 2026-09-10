@@ -6,7 +6,6 @@ import pytest
 
 from opensquilla.application.artifact_workbench import (
     ArtifactRecoveryApplication,
-    CandidatePreviewGrant,
     NativeArtifactOpen,
     NativeArtifactOpenApplication,
     PreviewLeaseCreate,
@@ -18,16 +17,13 @@ from opensquilla.application.artifact_workbench import (
 
 
 class _RecoveryPort:
+    async def retire_legacy_editor(self) -> None:
+        self.calls.append("retire")
+
     def __init__(self) -> None:
         self.calls: list[str] = []
 
-    async def recover_drafts(self) -> dict[str, int]:
-        self.calls.append("drafts")
-        return {"examined": 1, "rejected": 1}
 
-    async def recover_mutations(self) -> dict[str, int]:
-        self.calls.append("mutations")
-        return {"examined": 2, "applied": 2}
 
     async def recover_resources(self) -> dict[str, int]:
         self.calls.append("resources")
@@ -58,12 +54,7 @@ class _PreviewPort:
     async def revoke_lease(self, identity: PreviewLeaseIdentity) -> None:
         self.calls.append(("revoke", identity))
 
-    async def resolve_candidate(self, handle: str) -> CandidatePreviewGrant:
-        self.calls.append(("resolve_candidate", handle))
-        return CandidatePreviewGrant(handle, "artifact-1", "session-key", self.grant)
 
-    async def release_candidate(self, handle: str) -> None:
-        self.calls.append(("release_candidate", handle))
 
 
 class _NativeOpenPort:
@@ -80,9 +71,7 @@ async def test_artifact_recovery_application_preserves_dependency_order() -> Non
 
     report = await ArtifactRecoveryApplication(port).reconcile()
 
-    assert port.calls == ["drafts", "mutations", "resources"]
-    assert report.drafts == {"examined": 1, "rejected": 1}
-    assert report.mutations == {"examined": 2, "applied": 2}
+    assert port.calls == ["retire", "resources"]
     assert report.resources == {"imports_examined": 1, "imports_applied": 1}
 
 
@@ -96,15 +85,11 @@ async def test_preview_material_application_uses_fixed_semantic_commands() -> No
     assert await application.create(create) is port.grant
     assert (await application.renew(identity)).lease_id == "lease-1"
     await application.revoke(identity)
-    assert (await application.resolve_candidate("candidate_abcdefghijklmnop")).lease is port.grant
-    await application.release_candidate("candidate_abcdefghijklmnop")
 
     assert [name for name, _value in port.calls] == [
         "create",
         "renew",
         "revoke",
-        "resolve_candidate",
-        "release_candidate",
     ]
 
 

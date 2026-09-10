@@ -453,20 +453,19 @@ class _RecordingProvider:
 
     async def chat(self, messages, tools=None, config=None):
         self.requests.append([message.model_copy(deep=True) for message in messages])
-        yield ProviderText(text="Synthetic annotation applied.")
+        yield ProviderText(text="Synthetic follow-up completed.")
         yield ProviderDone(stop_reason="end_turn")
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("orphan", [False, True], ids=["interrupted-batch", "orphan-outcome"])
 @pytest.mark.parametrize("media", [False, True], ids=["text", "media"])
-@pytest.mark.parametrize("restricted", [False, True], ids=["ordinary", "restricted"])
-async def test_reloaded_tool_evidence_is_filtered_from_restricted_provider_requests(
-    tmp_path, monkeypatch, orphan, media, restricted,
+async def test_reloaded_tool_evidence_reaches_provider_without_changing_durable_replay(
+    tmp_path, monkeypatch, orphan, media,
 ):
     monkeypatch.setenv("OPENSQUILLA_TURN_CALL_LOG", "0")
     path = tmp_path / "sessions.db"
-    key = "agent:main:webchat:synthetic-restricted-replay"
+    key = "agent:main:webchat:synthetic-tool-replay"
     envelope = _replay(orphan=orphan, media=media)
     storage = SessionStorage(str(path))
     await storage.connect()
@@ -489,33 +488,27 @@ async def test_reloaded_tool_evidence_is_filtered_from_restricted_provider_reque
         agent = Agent(
             provider=provider,
             config=AgentConfig(
-                restricted_turn=restricted,
                 context_window_tokens=200_000,
                 materialize_historical_attachments=False,
                 preserve_historical_images=True,
                 model_capabilities=ModelCapabilities(supports_vision=True),
                 model_vision_support="supported",
             ),
-            tool_context=ToolContext(
-                exclusive_tools={"document_inspect"}, allowed_tools={"document_inspect"},
-            ) if restricted else None,
         )
-        await runner._load_history(
-            agent, key, trim_last_user=False, restricted_turn=restricted,
-        )
-        events = [event async for event in agent.run_turn("Apply the synthetic annotation.")]
+        await runner._load_history(agent, key, trim_last_user=False)
+        events = [event async for event in agent.run_turn("Continue the synthetic request.")]
 
         assert not [event for event in events if event.kind == "error"]
         assert len(provider.requests) == 1
         payload = json.dumps([message.model_dump() for message in provider.requests[0]])
         assert "Earlier ordinary request." in payload
-        assert "Apply the synthetic annotation." in payload
-        assert (_PRIVATE_PATH in payload) is not restricted
-        assert (_PRIVATE_OUTPUT in payload) is not restricted
-        assert (_MEDIA_BYTES in payload) is (media and not restricted)
+        assert "Continue the synthetic request." in payload
+        assert _PRIVATE_PATH in payload
+        assert _PRIVATE_OUTPUT in payload
+        assert (_MEDIA_BYTES in payload) is media
         if orphan:
             assert "Earlier visible answer." in payload
-        # Request projection must not erase the durable record for normal turns.
+        # Request projection must not erase the durable record.
         transcript = await manager.get_transcript(key)
         assert transcript[1].assistant_replay == envelope
     finally:

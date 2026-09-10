@@ -21,6 +21,7 @@ from uuid import uuid4
 import httpx
 import structlog
 
+from opensquilla.endpoint_identity import endpoint_replay_source
 from opensquilla.env import trust_env as _trust_env
 from opensquilla.execution_status import compact_provider_status, derive_is_error
 from opensquilla.safety.secret_redaction import redact_secret_text
@@ -451,35 +452,8 @@ _OPENAI_REPLAY_PROTOCOL = "openai_chat_completions"
 
 
 def _openai_replay_source(provider_kind: str, base_url: str) -> str:
-    """Identify the actual API route without persisting endpoint credentials.
-
-    Paths and query strings can themselves contain secrets, so the stored
-    identity is a digest. Keep route distinctions inside that digest while
-    normalizing harmless spelling differences (default ports and /v1 roots).
-    """
-    endpoint = urlparse(_versioned_api_url(base_url.rstrip("/"), "/v1/chat/completions"))
-    scheme = endpoint.scheme.lower()
-    port: int | str | None
-    try:
-        port = endpoint.port
-    except ValueError:
-        # Provenance must not add eager URL validation to provider setup.
-        # Keep malformed/out-of-range ports distinct from valid routes while
-        # leaving rejection to the existing endpoint policy and HTTP boundary.
-        port = f"invalid:{endpoint.netloc.rsplit('@', 1)[-1]}"
-    if port is None:
-        port = {"http": 80, "https": 443}.get(scheme)
-    identity = (
-        provider_kind,
-        scheme,
-        (endpoint.hostname or "").lower().rstrip("."),
-        port,
-        endpoint.path,
-        endpoint.params,
-        endpoint.query,
-    )
-    digest = hashlib.sha256(json.dumps(identity, ensure_ascii=False).encode("utf-8"))
-    return f"openai_compat:{digest.hexdigest()}"
+    endpoint = _versioned_api_url(base_url.rstrip("/"), "/v1/chat/completions")
+    return endpoint_replay_source("openai_compat", provider_kind, endpoint)
 
 
 def _append_openai_reasoning_details(

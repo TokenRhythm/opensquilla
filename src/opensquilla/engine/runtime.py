@@ -384,34 +384,6 @@ _T3_HANDLED: Final[str] = "handled"
 _T3_FLUSH_FAILED: Final[str] = "flush_failed"
 _T3_COMPACT_FAILED: Final[str] = "compact_failed"
 _IMAGE_GENERATION_TOOL_NAMES: Final[frozenset[str]] = frozenset({"image_generate"})
-_ARTIFACT_ENSEMBLE_BYPASS_OPERATIONS: Final[frozenset[str]] = frozenset({"browser_use"})
-_ARTIFACT_ENSEMBLE_AGGREGATOR_ONLY_OPERATIONS: Final[frozenset[str]] = frozenset(
-    {"selection_edit", "structural_edit", "conflict_recovery"}
-)
-
-
-def _artifact_ensemble_bypass_reason(metadata: object) -> str | None:
-    """Return a content-free reason for unsupported browser-use ensembles.
-
-    Source-backed prompt annotations deliberately keep the configured Ensemble:
-    proposers receive the same bounded annotation context without tools, while
-    the aggregator alone owns the Artifact tool surface and terminating write.
-    """
-
-    if not isinstance(metadata, dict):
-        return None
-    operation = metadata.get("artifact_operation_class")
-    if operation not in _ARTIFACT_ENSEMBLE_BYPASS_OPERATIONS:
-        return None
-    return "artifact_browser_use"
-
-
-def _artifact_requires_aggregator_only_ensemble(metadata: object) -> bool:
-    """Whether this turn must keep the configured Ensemble or fail closed."""
-
-    if not isinstance(metadata, dict):
-        return False
-    return metadata.get("artifact_operation_class") in _ARTIFACT_ENSEMBLE_AGGREGATOR_ONLY_OPERATIONS
 
 
 _ARTIFACT_DELIVERY_FAILURE_MARKER: Final[str] = "File delivery failed:"
@@ -5339,7 +5311,6 @@ class TurnRunner:
         pending_input_provider: PendingInputProvider | None = None,
         bound_user_message_id: str | None = None,
         assistant_message_sink: Callable[[str | None, str], None] | None = None,
-        document_mutation_outcome_sink: Callable[[dict[str, Any]], None] | None = None,
         root_turn_id: str | None = None,
         provider_request_correlation: ProviderRequestCorrelation | None = None,
         assistant_message_id: str | None = None,
@@ -5498,7 +5469,6 @@ class TurnRunner:
                         router_control_replay_depth=router_control_replay_depth,
                         bound_user_message_id=bound_user_message_id,
                         assistant_message_sink=assistant_message_sink,
-                        document_mutation_outcome_sink=document_mutation_outcome_sink,
                         root_turn_id=logical_turn_id,
                         provider_request_correlation=provider_request_correlation,
                         assistant_message_id=assistant_message_id,
@@ -5560,7 +5530,6 @@ class TurnRunner:
                             router_control_replay_depth=router_control_replay_depth,
                             bound_user_message_id=bound_user_message_id,
                             assistant_message_sink=assistant_message_sink,
-                            document_mutation_outcome_sink=document_mutation_outcome_sink,
                             root_turn_id=logical_turn_id,
                             provider_request_correlation=provider_request_correlation,
                             assistant_message_id=assistant_message_id,
@@ -5606,7 +5575,6 @@ class TurnRunner:
         pending_input_provider: PendingInputProvider | None = None,
         bound_user_message_id: str | None = None,
         assistant_message_sink: Callable[[str | None, str], None] | None = None,
-        document_mutation_outcome_sink: Callable[[dict[str, Any]], None] | None = None,
         root_turn_id: str | None = None,
         provider_request_correlation: ProviderRequestCorrelation | None = None,
         assistant_message_id: str | None = None,
@@ -6005,16 +5973,6 @@ class TurnRunner:
             final_prompt_str = final_prompt
             cache_breakpoints = pa_out.cache_breakpoints
             request_context_prompt = pa_out.request_context_prompt
-            artifact_request_context = getattr(
-                getattr(tool_context, "artifact_context", None),
-                "request_context_prompt",
-                None,
-            )
-            if isinstance(artifact_request_context, str) and artifact_request_context.strip():
-                request_context_prompt = _prepend_request_context_prompt(
-                    request_context_prompt,
-                    artifact_request_context,
-                )
             resolved_model = pa_out.resolved_model
             provider_name = pa_out.provider_name
             # Prompt assembly may resolve the mutable current session after a
@@ -6558,11 +6516,7 @@ class TurnRunner:
                         bound_user_message_id=bound_user_message_id,
                         provider_request_correlation=compaction_correlation,
                         consumer_admission=consumer_admission,
-                        consumer_admission_fingerprint=(consumer_admission_fingerprint),
-                        restricted_turn=bool(
-                            tool_context is not None
-                            and getattr(tool_context, "exclusive_tools", None) is not None
-                        ),
+                        consumer_admission_fingerprint=consumer_admission_fingerprint,
                         skip_compaction=image_input_preflight_blocked,
                         transcript_snapshot=transcript_snapshot,
                     )
@@ -6757,7 +6711,6 @@ class TurnRunner:
                     ingress_pipeline_steps=ingress_pipeline_steps,
                     router_control_replay_depth=router_control_replay_depth + 1,
                     assistant_message_sink=assistant_message_sink,
-                    document_mutation_outcome_sink=document_mutation_outcome_sink,
                     root_turn_id=turn_id,
                     provider_request_correlation=provider_request_correlation,
                     assistant_message_id=assistant_message_id,
@@ -6776,19 +6729,6 @@ class TurnRunner:
             error_message = stream_state.error_message
             pending_error_event = stream_state.pending_error_event
             done_event = stream_state.done_event
-            if (
-                done_event is not None
-                and done_event.document_mutation_outcome is not None
-                and document_mutation_outcome_sink is not None
-            ):
-                try:
-                    document_mutation_outcome_sink(dict(done_event.document_mutation_outcome))
-                except Exception:  # noqa: BLE001 - persistence continues below
-                    log.warning(
-                        "turn_runner.document_mutation_outcome_sink_failed",
-                        session_key=session_key,
-                        exc_info=True,
-                    )
             # Post-stage edge owned by the harness: flush remaining
             # text segment. The stage's post-stream notify already
             # fired (it is the last action of the stage body).
@@ -8383,12 +8323,6 @@ class TurnRunner:
             coding_mode = bool(getattr(skills_cfg, "coding_mode", False))
             ctx.denied_tools.update(coding_mode_denied_tools(coding_mode))
             ctx.coding_mode = coding_mode
-            # Policy/profile/runtime layers above may add tools. A restricted
-            # turn's capability ceiling is applied last and can never be
-            # widened by those lower-authority layers.
-            from opensquilla.tools.visibility import apply_exclusive_tool_ceiling
-
-            ctx = apply_exclusive_tool_ceiling(ctx)
             if ctx is not caller_ctx:
                 caller_ctx.allowed_tools = (
                     set(ctx.allowed_tools) if ctx.allowed_tools is not None else None
@@ -8602,8 +8536,7 @@ class TurnRunner:
             "would benefit from clarification. Once the threshold and true-impasse conditions "
             "are met, call update_goal with status=blocked instead of leaving it active.\n\n"
             "Artifact and terminal behavior:\n"
-            "- The general generated-file instruction to stop after publication yields to "
-            "this Active Goal policy. After publishing an artifact, do not publish the "
+            "- After publishing an artifact, do not publish the "
             "unchanged file again; re-audit the entire objective and continue any remaining "
             "work through the normal tools and turns.\n"
             "- After a successful terminal update, perform no more work and call no more "
@@ -8914,28 +8847,18 @@ class TurnRunner:
             if isinstance(configured_agent_name, str) and configured_agent_name.strip()
             else None
         )
-        restricted_tool_boundary = bootstrap_context_mode == "restricted_tool_boundary"
         bootstrap_workspace_dir = self._resolve_bootstrap_workspace_dir(agent_id)
         bootstrap_context_key = bootstrap_context_mode or "full"
         bootstrap_snap_key = (agent_id, session_key, bootstrap_context_key) if session_key else None
-        # An empty ``filenames`` iterable historically means "use the default
-        # bootstrap files" inside identity.workspace.  Do not attempt to
-        # express the PromptAnnotation boundary through ``filenames=()``:
-        # that silently loaded AGENTS/SOUL/TOOLS and the other bootstrap
-        # files.  Bypass both the cache and filesystem loader explicitly.
-        if restricted_tool_boundary:
-            workspace_files: dict[str, str] = {}
-            visible_bootstrap_report: list[Any] = []
-        else:
-            bootstrap_snap = (
-                self._bootstrap_snapshots.get(bootstrap_snap_key)
-                if bootstrap_snap_key is not None
-                else None
-            )
-        if not restricted_tool_boundary and bootstrap_snap is not None:
+        bootstrap_snap = (
+            self._bootstrap_snapshots.get(bootstrap_snap_key)
+            if bootstrap_snap_key is not None
+            else None
+        )
+        if bootstrap_snap is not None:
             workspace_files = dict(bootstrap_snap.workspace_files)
             visible_bootstrap_report = list(bootstrap_snap.report)
-        elif not restricted_tool_boundary:
+        else:
             safety_cfg = getattr(self._config, "safety", None) if self._config else None
             bootstrap_filenames: tuple[str, ...]
             bootstrap_filenames = (
@@ -8989,7 +8912,6 @@ class TurnRunner:
         stateless_prompt = bootstrap_context_mode in {
             "stateless",
             "stateless_keep_project_rules",
-            "restricted_tool_boundary",
         }
         private_memory_allowed = (
             False if stateless_prompt else allows_private_memory_prompt_injection(session_key)
@@ -9051,16 +8973,9 @@ class TurnRunner:
         )
         if agent_name is None and identity_fields is not None:
             agent_name = identity_fields.name
-        # Global coding prompt modes and evidence protocols describe a local
-        # workspace workflow.  PromptAnnotation has no workspace authority;
-        # force the small generic identity/tool preface and keep every coding
-        # or git-oriented protocol out of this provider projection.
-        prompt_mode = (
-            "minimal" if restricted_tool_boundary else _resolve_identity_prompt_mode(self._config)
-        )
-        finalize_evidence_gate = (
-            False if restricted_tool_boundary else _resolve_finalize_evidence_gate(self._config)
-        )
+        prompt_mode = _resolve_identity_prompt_mode(self._config)
+        finalize_evidence_gate = _resolve_finalize_evidence_gate(self._config)
+
         agent_profile = AgentProfile(
             agent_id=agent_id,
             identity=AgentIdentity(
@@ -9077,30 +8992,18 @@ class TurnRunner:
             finalize_evidence_gate=finalize_evidence_gate,
         )
         os_name = os.uname().sysname if hasattr(os, "uname") else platform.system()
-        # The restricted provider projection must not contain a synthetic
-        # "Working directory: restricted" line either: even though it is not
-        # a host path, it advertises a workspace contract that this turn does
-        # not possess.  Local docs paths are omitted for the same reason.
-        runtime_info = (
-            None
-            if restricted_tool_boundary
-            else {
-                "os": os_name,
-                "shell": os.environ.get("SHELL", ""),
-                "workspace_dir": str(workspace_dir or bootstrap_workspace_dir),
-            }
-        )
+        runtime_info = {
+            "os": os_name,
+            "shell": os.environ.get("SHELL", ""),
+            "workspace_dir": str(workspace_dir or bootstrap_workspace_dir),
+        }
         base_prompt = assemble_system_prompt(
             agent_profile,
             tools=[td.name for td in tool_defs] if tool_defs else None,
             memory=memory_text,
             runtime_info=runtime_info,
-            docs_path=(None if restricted_tool_boundary else self._resolve_docs_path()),
-            heartbeat_prompt=(
-                None
-                if restricted_tool_boundary
-                else getattr(self._config, "heartbeat_prompt", None)
-            ),
+            docs_path=(self._resolve_docs_path()),
+            heartbeat_prompt=(getattr(self._config, "heartbeat_prompt", None)),
         )
         # daily_notes, workspace_files, and extra_context are per-turn /
         # per-day volatile content. Keeping them in the cacheable base
@@ -9482,29 +9385,12 @@ class TurnRunner:
 
         _bounded_apply_squilla_router.__name__ = "apply_squilla_router"
 
-        restricted_tool_boundary = bool(
-            tool_context is not None and getattr(tool_context, "exclusive_tools", None) is not None
+        gate_chat, gate_model = self._make_vision_followup_gate_chat(
+            cloned_selector,
+            usage_execution_context,
         )
-        # DOM-backed PromptAnnotation turns are source-addressed and do not
-        # depend on historical image interpretation.  Do not even construct
-        # the auxiliary gate target: selector resolution and every physical
-        # auxiliary request are outside this restricted turn's call budget.
-        if restricted_tool_boundary:
-            gate_chat, gate_model = None, None
-        else:
-            gate_chat, gate_model = self._make_vision_followup_gate_chat(
-                cloned_selector,
-                usage_execution_context,
-            )
-        # A PromptAnnotation request is a self-contained ArtifactSession turn.
-        # Neither a pinned catalog nor the compatibility global loader may
-        # leak skills into its provider projection.
-        agent_skill_loader = None if restricted_tool_boundary else self._skill_loader
-        if (
-            not restricted_tool_boundary
-            and skill_catalog is not None
-            and self._skill_loader is not None
-        ):
+        agent_skill_loader = self._skill_loader
+        if skill_catalog is not None and self._skill_loader is not None:
             from opensquilla.skills.loader import PinnedSkillLoader
 
             agent_skill_loader = PinnedSkillLoader(skill_catalog, self._skill_loader)
@@ -9544,19 +9430,15 @@ class TurnRunner:
             # default_workspace_dir() and exec_command sandbox blocked
             # paths under ``/root/`` instead of the gateway workspace.
             "bootstrap_workspace_dir": (
-                ""
-                if restricted_tool_boundary
-                else (
-                    getattr(tool_context, "workspace_dir", None)
-                    or (
-                        str(
-                            self._resolve_bootstrap_workspace_dir(
-                                getattr(tool_context, "agent_id", "main") or "main"
-                            )
+                getattr(tool_context, "workspace_dir", None)
+                or (
+                    str(
+                        self._resolve_bootstrap_workspace_dir(
+                            getattr(tool_context, "agent_id", "main") or "main"
                         )
-                        if tool_context is not None
-                        else ""
                     )
+                    if tool_context is not None
+                    else ""
                 )
             ),
             # Opaque callable only: credential bytes never enter metadata,
@@ -9585,24 +9467,7 @@ class TurnRunner:
                 )
             ),
         }
-        if restricted_tool_boundary:
-            # Lock observability to the provider-visible projection.  These
-            # fields are deliberately explicit rather than relying on
-            # PromptReport's default values so later pipeline refactors cannot
-            # make an injected catalog look empty only in telemetry.
-            initial_metadata.update(
-                {
-                    "skill_catalog_ids": [],
-                    "skill_count": 0,
-                    "skills_rendered_count": 0,
-                    "skills_prompt_chars": 0,
-                    "router_vision_followup_gate_decision": "not_applicable",
-                    "router_vision_followup_gate_reason": ("prompt_annotation_dom_selection"),
-                    "router_vision_followup_gate_source": "prompt_annotation",
-                    "router_vision_followup_needs_image": False,
-                }
-            )
-        elif skill_catalog is not None:
+        if skill_catalog is not None:
             initial_metadata["skill_catalog_generation"] = int(
                 getattr(skill_catalog, "generation", 0)
             )
@@ -9643,39 +9508,38 @@ class TurnRunner:
             initial_metadata["attachment_image_count"] = int(
                 attachment_materialization.image_count
             )
-        if not restricted_tool_boundary:
-            attachment_reference_text = "\n".join(
-                value
-                for value in (semantic_message, message)
-                if isinstance(value, str) and value.strip()
-            )
-            candidate_attachment_ids = tuple(
-                dict.fromkeys(
-                    (
-                        *self._attachment_ids_from_text(attachment_reference_text),
-                        *self._attachment_ids_from_resource_refs(attachments),
-                    )
+        attachment_reference_text = "\n".join(
+            value
+            for value in (semantic_message, message)
+            if isinstance(value, str) and value.strip()
+        )
+        candidate_attachment_ids = tuple(
+            dict.fromkeys(
+                (
+                    *self._attachment_ids_from_text(attachment_reference_text),
+                    *self._attachment_ids_from_resource_refs(attachments),
                 )
             )
-            explicit_attachment_ids = await self._validated_image_attachment_ids(
-                session_key,
-                candidate_attachment_ids,
-                transcript_snapshot=transcript_snapshot,
-                expected_session_id=expected_session_id,
-                expected_session_epoch=expected_session_epoch,
+        )
+        explicit_attachment_ids = await self._validated_image_attachment_ids(
+            session_key,
+            candidate_attachment_ids,
+            transcript_snapshot=transcript_snapshot,
+            expected_session_id=expected_session_id,
+            expected_session_epoch=expected_session_epoch,
+        )
+        if explicit_attachment_ids:
+            # A canonical occurrence ID is deterministic image intent.  It
+            # must survive even when the source row is outside the normal
+            # history lookback, and it must reach Router before the archive
+            # is rehydrated later in ``_load_history``.
+            initial_metadata["image_intent_attachment_ids"] = list(
+                explicit_attachment_ids
             )
-            if explicit_attachment_ids:
-                # A canonical occurrence ID is deterministic image intent.  It
-                # must survive even when the source row is outside the normal
-                # history lookback, and it must reach Router before the archive
-                # is rehydrated later in ``_load_history``.
-                initial_metadata["image_intent_attachment_ids"] = list(
-                    explicit_attachment_ids
-                )
-                initial_metadata["router_vision_followup_needs_image"] = True
-                initial_metadata["router_vision_followup_gate_source"] = (
-                    "explicit_attachment_id"
-                )
+            initial_metadata["router_vision_followup_needs_image"] = True
+            initial_metadata["router_vision_followup_gate_source"] = (
+                "explicit_attachment_id"
+            )
         if bound_user_message_id:
             try:
                 bound_entries: Sequence[Any]
@@ -9784,15 +9648,6 @@ class TurnRunner:
         if tool_context is not None:
             initial_metadata["channel_kind"] = tool_context.channel_kind
             initial_metadata["channel_id"] = tool_context.channel_id
-            artifact_context = getattr(tool_context, "artifact_context", None)
-            artifact_format = getattr(artifact_context, "artifact_format", None)
-            artifact_operation = getattr(artifact_context, "operation_class", None)
-            if isinstance(artifact_format, str) and isinstance(artifact_operation, str):
-                # Content-free enums only. Document/anchor ids and selection
-                # material remain on the runtime ToolContext and never enter
-                # router telemetry or persisted pipeline metadata.
-                initial_metadata["artifact_format"] = artifact_format
-                initial_metadata["artifact_operation_class"] = artifact_operation
 
         # Budget gate (opt-in): seed the session's already-accumulated spend so
         # the router step can read it. Gated on an active limit, so the default
@@ -9835,7 +9690,7 @@ class TurnRunner:
             metadata=initial_metadata,
             raw_message=semantic_message,
             routing_hint=routing_hint,
-            skill_catalog=(None if restricted_tool_boundary else skill_catalog),
+            skill_catalog=(skill_catalog),
             provider_request_correlation=provider_request_correlation,
         )
         planning_turn = (
@@ -9843,33 +9698,24 @@ class TurnRunner:
             and str(getattr(tool_context, "collaboration_mode", "default")) == "plan"
         )
         pipeline_steps: list[TurnStep] = [resolve_model]
-        if not restricted_tool_boundary:
-            pipeline_steps.append(apply_vision_followup_gate)
+        pipeline_steps.append(apply_vision_followup_gate)
         pipeline_steps.extend(
             [
                 _bounded_apply_squilla_router,
                 observe_reasoning_hint,
             ]
         )
-        if not planning_turn and not restricted_tool_boundary:
+        if not planning_turn:
             pipeline_steps.extend([meta_resolution, enforce_coding_mode])
-        if restricted_tool_boundary:
-            # PromptAnnotation turns cannot be subagents/PlanRuns at ingress,
-            # and their prompt projection intentionally excludes skill, meta,
-            # coding-workspace and subagent bootstrap text.  Routing and cache
-            # behavior remain shared with ordinary Direct/Router/Ensemble
-            # turns.
-            pipeline_steps.extend([inject_platform_hint, apply_prompt_cache])
-        else:
-            pipeline_steps.extend(
-                [
-                    resolve_skill_catalog,
-                    inject_subagent_grounding,
-                    inject_platform_hint,
-                    apply_prompt_cache,
-                ]
-            )
-        if not planning_turn and not restricted_tool_boundary:
+        pipeline_steps.extend(
+            [
+                resolve_skill_catalog,
+                inject_subagent_grounding,
+                inject_platform_hint,
+                apply_prompt_cache,
+            ]
+        )
+        if not planning_turn:
             pipeline_steps.insert(-4, meta_command_launch)
         turn = await run_pipeline(turn, pipeline_steps)
         if router_history_replay_request is not None:
@@ -10162,30 +10008,11 @@ class TurnRunner:
                 ),
             )
 
-        artifact_ensemble_bypass = _artifact_ensemble_bypass_reason(turn.metadata)
-        artifact_requires_aggregator_ensemble = _artifact_requires_aggregator_only_ensemble(
-            turn.metadata
-        )
-
         def record_ensemble_unavailable(reason: str) -> None:
             turn.metadata["ensemble_wrap_skipped_reason"] = reason
             _record_fixed_ensemble_execution(reason)
-            if artifact_requires_aggregator_ensemble:
-                raise RuntimeError(f"artifact_ensemble_unavailable:{reason}")
 
-        if artifact_ensemble_bypass is not None:
-            record_ensemble_unavailable(artifact_ensemble_bypass)
-        if (
-            provider is None
-            and getattr(ensemble_cfg, "enabled", False)
-            and artifact_requires_aggregator_ensemble
-        ):
-            record_ensemble_unavailable("missing_primary_provider")
-        if (
-            provider is not None
-            and (ensemble_globally_enabled or tier_ensemble_mode)
-            and artifact_ensemble_bypass is None
-        ):
+        if provider is not None and (ensemble_globally_enabled or tier_ensemble_mode):
             from opensquilla.engine.selector_override import (
                 acquire_profile_credential,
                 report_profile_credential_failure,
@@ -10327,7 +10154,6 @@ class TurnRunner:
                     _credential_pool_failure_reporter=(report_profile_credential_failure),
                     _session_key=turn.session_key,
                     _fallback_selector=cloned_selector,
-                    _artifact_mutation=artifact_requires_aggregator_ensemble,
                     _selection_mode_override=selection_mode,
                     _plan_provider_config=plan_provider_config,
                     _dynamic_baseline_provider_config=initial_provider_config,
@@ -10614,7 +10440,6 @@ class TurnRunner:
         materialize_historical_attachments: bool = False,
         workspace_dir: str | Path | None = None,
         historical_materializer: AttachmentWorkspaceMaterializer | None = None,
-        restricted_turn: bool = False,
         require_capacity_proof: bool = False,
     ) -> Any:
         """Project transcript rows through the same replay decoder for all consumers."""
@@ -10643,11 +10468,7 @@ class TurnRunner:
                 and raw_content.startswith(_CONTEXT_SUMMARY_MARKER)
             ):
                 return HistoryReplayEntryProjection(
-                    legacy_summary_marker=(
-                        None
-                        if restricted_turn
-                        else _strip_context_summary_marker(raw_content)
-                    )
+                    legacy_summary_marker=_strip_context_summary_marker(raw_content)
                 )
             subagent_notice = _subagent_terminal_history_notice(entry)
             if subagent_notice is not None:
@@ -13994,7 +13815,6 @@ class TurnRunner:
         *,
         trim_last_user: bool = True,
         bound_user_message_id: str | None = None,
-        restricted_turn: bool = False,
         transcript_snapshot: TurnTranscriptSnapshot[Any] | None = None,
         expected_session_id: str | None = None,
         expected_session_epoch: int | None = None,
@@ -14049,7 +13869,7 @@ class TurnRunner:
         summary_markers: list[str] = []
         exact_owner = expected_session_id is not None or expected_session_epoch is not None
         emergency_overrides = getattr(self, "_emergency_compaction_overrides", {})
-        emergency_override = None if restricted_turn else emergency_overrides.pop(session_key, None)
+        emergency_override = emergency_overrides.pop(session_key, None)
         if emergency_override is not None:
             override_has_owner = (
                 emergency_override.expected_session_id is not None
@@ -14190,7 +14010,7 @@ class TurnRunner:
                 expected_session_id=expected_session_id,
                 expected_session_epoch=expected_session_epoch,
             )
-            if canonical_lookup_required and not restricted_turn
+            if canonical_lookup_required
             else list(transcript)
         )
         if bound_attachment_replay_candidate and bound_row_has_image is None:
@@ -14216,13 +14036,12 @@ class TurnRunner:
             # that pass so an explicitly rehydrated canonical image is not
             # downgraded a second time.
             agent_config.preserve_historical_images = True
-        if not restricted_turn:
-            await self._persist_attachment_manifest_best_effort(
-                session_key,
-                canonical_transcript,
-                expected_session_id=expected_session_id,
-                expected_session_epoch=expected_session_epoch,
-            )
+        await self._persist_attachment_manifest_best_effort(
+            session_key,
+            canonical_transcript,
+            expected_session_id=expected_session_id,
+            expected_session_epoch=expected_session_epoch,
+        )
         workspace_dir = getattr(getattr(agent, "config", None), "workspace_dir", None)
         materialize_historical_attachments = bool(
             getattr(
@@ -14430,8 +14249,7 @@ class TurnRunner:
             )
         # For a durable exact-owner turn, validate the owner before replay can
         # materialize transcript attachments into the shared workspace.  The
-        # same read is reused below for provider context; restricted turns
-        # intentionally omit its contents but still need the ownership fence.
+        # same read is reused below for provider context.
         context_states = (
             await self._load_context_states(
                 session_key,
@@ -14453,7 +14271,6 @@ class TurnRunner:
             materialize_historical_attachments=materialize_historical_attachments,
             workspace_dir=workspace_dir,
             historical_materializer=history_materializer,
-            restricted_turn=restricted_turn,
         )
         history = list(replay.messages)
         summary_markers.extend(replay.legacy_summary_markers)
@@ -14550,15 +14367,6 @@ class TurnRunner:
                 ]
                 break
         agent.set_request_image_context(request_image_context)
-        if restricted_turn:
-            # Context states, durable summaries, and legacy summary markers
-            # were produced before this turn's restricted provider projection.
-            # Their plain-text bodies may contain historical tool arguments or
-            # local paths, so omit them from this one provider view. Persisted
-            # state remains untouched for ordinary future turns.
-            if history:
-                agent.set_history(history)
-            return None
         if not exact_owner:
             context_states = await self._load_context_states(session_key)
         provider = getattr(agent, "provider", None)

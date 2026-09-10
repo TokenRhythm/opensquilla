@@ -1415,6 +1415,23 @@ async def dispatch_task_runtime_turn(
     try:
         with accepted_turn_config_scope(getattr(run, "accepted_config", None)):
             raw_stream = turn_runner.run(run.message, run.session_key, **run_kwargs)
+            adopter = run.envelope.runtime_services.get("generated_artifact_adopter")
+            from opensquilla.gateway.working_versions import with_working_versions
+
+            async def emit_working_version(payload: dict[str, Any]) -> None:
+                await event_emitter(run.session_key, "session.event.artifact_state", payload)
+
+            raw_stream = with_working_versions(
+                raw_stream,
+                config=config,
+                session_manager=session_manager,
+                session_key=run.session_key,
+                session_id=run.envelope.session_id or getattr(session, "session_id", None),
+                workspace=tool_context.workspace_dir,
+                actor_id=run.task_id,
+                event_emitter=getattr(adopter, "event_emitter", None) or emit_working_version,
+                preview_service=getattr(adopter, "preview_service", None),
+            )
             await _emit_task_runtime_stream_events(
                 raw_stream,
                 run.session_key,
@@ -1629,13 +1646,6 @@ def build_task_runtime_run_kwargs(
         # Internal-only callback: the finalizer supplies the exact assistant
         # row/content to TaskRuntime for durable channel delivery.
         kwargs["assistant_message_sink"] = assistant_message_sink
-    document_mutation_outcome_sink = getattr(
-        run,
-        "document_mutation_outcome_sink",
-        None,
-    )
-    if document_mutation_outcome_sink is not None:
-        kwargs["document_mutation_outcome_sink"] = document_mutation_outcome_sink
     return kwargs
 
 
@@ -2948,13 +2958,13 @@ async def build_services(
     # subprocesses. This prevents a profile file from manufacturing bridge
     # authority and leaves only the fixed-method runtime client in memory.
     try:
-        from opensquilla.gateway.desktop_artifact_bridge import (
-            initialize_desktop_artifact_bridge_client,
+        from opensquilla.browser import (
+            initialize_desktop_browser,
         )
 
-        initialize_desktop_artifact_bridge_client()
+        initialize_desktop_browser()
     except ValueError:
-        log.warning("artifact.desktop_bridge_environment_rejected")
+        log.warning("browser.desktop_environment_rejected")
 
     # ── Load .env files (cwd/.env > ~/.opensquilla/.env, never override existing) ──
     from opensquilla.env import load_env
@@ -3167,26 +3177,7 @@ async def build_services(
             recovery_report = await artifact_recovery.reconcile()
         finally:
             await artifact_recovery_service.close()
-        recovery_summary = recovery_report.mutations
-        draft_recovery_summary = recovery_report.drafts
         resource_recovery_summary = recovery_report.resources
-        if recovery_summary.get("examined", 0):
-            log.info(
-                "build_services.artifact_mutations_reconciled",
-                examined=recovery_summary.get("examined", 0),
-                applied=recovery_summary.get("applied", 0),
-                failed=recovery_summary.get("failed", 0),
-                ambiguous=recovery_summary.get("ambiguous", 0),
-                deleted_candidates=recovery_summary.get("deleted_candidates", 0),
-            )
-        if draft_recovery_summary.get("examined", 0):
-            log.info(
-                "build_services.artifact_drafts_reconciled",
-                examined=draft_recovery_summary.get("examined", 0),
-                rejected=draft_recovery_summary.get("rejected", 0),
-                ambiguous=draft_recovery_summary.get("ambiguous", 0),
-                deleted_candidates=draft_recovery_summary.get("deleted_candidates", 0),
-            )
         if (
             resource_recovery_summary.get("imports_examined", 0)
             + resource_recovery_summary.get("publishes_examined", 0)
@@ -5316,20 +5307,14 @@ async def start_gateway_server(
 
     if run:
         preview_service = server_handle._preview_service
-        # The isolated preview listener is also required by the Electron
-        # candidate loop.  Desktop-owned profiles intentionally disable the
-        # Control UI during startup, but browser verification still needs a
-        # loopback resource origin for the opaque candidate handle.  The
-        # process-local bridge client is the authority for this exception;
-        # ordinary headless gateways do not open a listener merely because
-        # the preview service was registered.
+        # Native preview resources use the isolated listener owned by this Gateway.
         desktop_bridge_available = False
         try:
-            from opensquilla.gateway.desktop_artifact_bridge import (
-                get_desktop_artifact_bridge_client,
+            from opensquilla.browser import (
+                get_desktop_browser,
             )
 
-            desktop_bridge_available = get_desktop_artifact_bridge_client() is not None
+            desktop_bridge_available = get_desktop_browser() is not None
         except Exception:  # noqa: BLE001 - listener startup remains fail-closed
             desktop_bridge_available = False
         if preview_service is not None and (

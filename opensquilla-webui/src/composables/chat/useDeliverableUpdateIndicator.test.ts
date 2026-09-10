@@ -17,16 +17,12 @@ function message(
     timeStr: '',
     showHeader: true,
     restoredFromHistory,
-    turnOutcome: {
-      turnId: id,
-      status: 'completed',
-      documentMutationOutcome: { version: 1, status, resultRevisionId: id },
-    },
+    artifacts: status === 'applied' ? [{ id, name: 'page.html', mime: 'text/html' }] : [],
   }
 }
 
 describe('useDeliverableUpdateIndicator', () => {
-  it('marks only newly applied live mutations and clears on acknowledgement', async () => {
+  it('marks only new artifact versions and clears on acknowledgement', async () => {
     const sessionKey = ref('session-a')
     const messages = ref<ChatRenderedMessage[]>([message('old', 'applied', true)])
     const isStreaming = ref(false)

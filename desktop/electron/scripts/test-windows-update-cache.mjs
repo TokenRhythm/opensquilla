@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { createHash } from 'node:crypto'
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import {
@@ -12,7 +12,7 @@ import {
 } from '../dist/windows-update-cache.js'
 import { WindowsUpdateSecurityError } from '../dist/windows-update-security.js'
 
-const directory = await mkdtemp(join(tmpdir(), 'opensquilla-update-cache-'))
+const directory = await realpath(await mkdtemp(join(tmpdir(), 'opensquilla-update-cache-')))
 try {
   const candidate = { tag: 'v0.5.5', version: '0.5.5', installer: 'OpenSquilla-0.5.5-win-x64.exe' }
   const bytes = Buffer.from('synthetic installer bytes, never executed')

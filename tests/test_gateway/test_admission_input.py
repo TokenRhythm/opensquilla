@@ -76,22 +76,25 @@ def test_explicit_fingerprint_payload_keeps_original_shape():
     assert original == {"message": "A" * LARGE_PASTE_CHARS, "attachments": []}
 
 
-@pytest.mark.parametrize("document", [False, True])
-def test_identity_retains_annotation_and_document_alias_normalization(document):
-    params = {"key": "agent:main:synthetic", "message": "edit"}
-    if document:
-        params["document_context"] = {"document_id": " doc ", "head_revision_id": " rev "}
-        expected = {
-            "message": "edit",
-            "documentContext": {
-                "documentId": "doc",
-                "headRevisionId": "rev",
-            },
-        }
-    else:
-        params["prompt_annotation_ids"] = [" annotation "]
-        expected = {"message": "edit", "promptAnnotationIds": ["annotation"]}
-    assert decode_admit_turn(params).request_fingerprint == request_fingerprint(expected)
+@pytest.mark.parametrize(
+    "field",
+    ["documentContext", "document_context", "promptAnnotationIds", "prompt_annotation_ids"],
+)
+def test_retired_context_fields_cannot_create_an_executable_turn(field):
+    from opensquilla.gateway.rpc import RpcHandlerError
+
+    with pytest.raises(RpcHandlerError) as caught:
+        decode_admit_turn({"key": "agent:main:synthetic", "message": "edit", field: {}})
+    assert caught.value.code == "DOCUMENT_EDITING_RETIRED"
+
+
+def test_page_context_identity_uses_normalized_user_content():
+    context = {"targetRef": " page-one ", "annotations": [{"text": "make it blue"}]}
+    params = {"key": "agent:main:synthetic", "message": "edit", "pageContext": context}
+    command = decode_admit_turn(params)
+    expected = {"targetRef": "page-one", "annotations": [{"text": "make it blue"}]}
+    assert command.page_context == expected
+    assert command.request_fingerprint == request_fingerprint({**params, "pageContext": expected})
 
 
 async def test_changed_large_paste_conflicts_with_existing_receipt_before_projection(tmp_path):
@@ -128,7 +131,6 @@ async def test_changed_large_paste_conflicts_with_existing_receipt_before_projec
         ),
         policy=AdmissionPolicy(tmp_path, True, None, None, True, RunMode.SAFE, RunMode.SAFE),
         explicit_ingress_intent=lambda _key: nullcontext(),
-        authority_scope=nullcontext,
         normalize_input=lambda command: normalize_incoming_text(
             command.message,
             source_hint={"caller_kind": "web"},
@@ -147,3 +149,75 @@ async def test_changed_large_paste_conflicts_with_existing_receipt_before_projec
         "replayed": True,
     }
     projection.assert_awaited_once()
+
+
+@pytest.mark.parametrize("surface", ["session", "webchat"])
+@pytest.mark.parametrize("outcome", ["found", "missing", "changed", "no_request_id", "spaced"])
+async def test_retired_requests_only_read_matching_durable_receipts(surface, outcome):
+    key = "agent:main:synthetic"
+    params = {
+        "key" if surface == "session" else "sessionKey": key,
+        "message": "Previously accepted input",
+        "clientRequestId": "request-synthetic",
+        "documentContext": {"documentId": "document-synthetic", "headRevisionId": "revision-old"},
+        "promptAnnotationIds": ["annotation-synthetic"],
+    }
+    fingerprint = request_fingerprint(params)
+    if outcome == "spaced":
+        params.pop("documentContext")
+        params.pop("promptAnnotationIds")
+        params["document_context"] = {
+            "document_id": " document-synthetic ", "head_revision_id": " revision-old "
+        }
+        params["prompt_annotation_ids"] = [" annotation-synthetic "]
+    if outcome == "no_request_id":
+        params.pop("clientRequestId")
+    acceptance = TurnAcceptanceResult(
+        TurnIngressReceipt(
+            source_scope="web:web:operator",
+            request_session_key=key,
+            client_request_id="request-synthetic",
+            request_fingerprint="different" if outcome == "changed" else fingerprint,
+            accepted_session_key=key,
+            session_id="session-synthetic",
+            message_id="message-synthetic",
+            task_id="turn-synthetic",
+        ),
+        replayed=True,
+        fresh_user_session=False,
+    )
+    lookup = AsyncMock(return_value=None if outcome == "missing" else acceptance)
+    projection = AsyncMock(return_value={"status": "accepted", "replayed": True})
+    # These ports deliberately omit session creation, input normalization,
+    # route preparation and task activation: receipt replay cannot use them.
+    ports = SimpleNamespace(
+        storage=SimpleNamespace(
+            capabilities=AdmissionStorageCapabilities(
+                receipts=True, meta_controls=False, atomic_acceptance=False
+            ),
+            replay_turn_ingress_receipt=lookup,
+        ),
+        explicit_ingress_intent=lambda _key: nullcontext(),
+        accepted_response=projection,
+    )
+    adapter = GatewayTurnAdmissionAdapter(DurableTurnAdmission(ports))
+    if outcome in {"found", "spaced"}:
+        result = await adapter.admit(params, surface=surface)
+        assert result["replayed"] is True
+        projection.assert_awaited_once()
+    else:
+        from opensquilla.gateway.rpc import RpcHandlerError
+
+        with pytest.raises(RpcHandlerError) as caught:
+            await adapter.admit(params, surface=surface)
+        expected = "IDEMPOTENCY_CONFLICT" if outcome == "changed" else "DOCUMENT_EDITING_RETIRED"
+        assert caught.value.code == expected
+        projection.assert_not_awaited()
+    if outcome == "no_request_id":
+        lookup.assert_not_awaited()
+    else:
+        assert lookup.await_args.kwargs == {
+            "source_scope": "web:webchat:operator" if surface == "webchat" else "web:web:operator",
+            "request_session_key": key,
+            "client_request_id": "request-synthetic",
+        }

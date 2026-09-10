@@ -58,15 +58,13 @@ def test_v040_upgrades_v039_and_enforces_resource_occurrence_constraints(
         _seed_document(conn)
         conn.commit()
 
-    applied = apply_pending(str(db_path), MIGRATIONS_DIR)
-    assert applied[0] == MIGRATION_ID
+    assert apply_pending(str(db_path), MIGRATIONS_DIR) == sorted(
+        path.stem for path in MIGRATIONS_DIR.glob("V*.py") if path.stem >= MIGRATION_ID
+    )
 
     with sqlite3.connect(db_path) as conn:
         tables = {
-            str(row[0])
-            for row in conn.execute(
-                "SELECT name FROM sqlite_master WHERE type='table'"
-            )
+            str(row[0]) for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
         }
         assert {
             "document_source_bindings",
@@ -96,9 +94,7 @@ def test_v040_upgrades_v039_and_enforces_resource_occurrence_constraints(
             ("b" * 64,),
         )
         with pytest.raises(sqlite3.IntegrityError):
-            conn.execute(
-                "UPDATE document_source_bindings SET source_name='changed.html'"
-            )
+            conn.execute("UPDATE document_source_bindings SET source_name='changed.html'")
         with pytest.raises(sqlite3.IntegrityError):
             conn.execute(
                 """
@@ -130,10 +126,7 @@ def test_v040_rolls_back_only_document_resource_objects(tmp_path: Path) -> None:
 
     with sqlite3.connect(db_path) as conn:
         tables = {
-            str(row[0])
-            for row in conn.execute(
-                "SELECT name FROM sqlite_master WHERE type='table'"
-            )
+            str(row[0]) for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
         }
     assert "document_source_bindings" not in tables
     assert "document_import_attempts" not in tables

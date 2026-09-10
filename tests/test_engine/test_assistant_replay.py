@@ -15,7 +15,6 @@ from opensquilla.engine.history import (
     project_history_replay_capacity,
     reconstruct_messages_from_entry,
     repair_tool_pairing,
-    strip_historical_tool_pairs,
 )
 from opensquilla.provider.types import (
     ContentBlockText,
@@ -249,7 +248,7 @@ def test_unsigned_replay_does_not_guess_suppression_without_canonical_match(disp
 
 
 @pytest.mark.parametrize("visible_text", [False, True])
-def test_restricted_tool_history_cannot_reintroduce_anthropic_native_blocks(visible_text):
+def test_interrupted_tool_history_quotes_facts_without_anthropic_private_blocks(visible_text):
     from opensquilla.provider.anthropic import AnthropicProvider
     from opensquilla.provider.types import ChatConfig
 
@@ -267,6 +266,7 @@ def test_restricted_tool_history_cannot_reintroduce_anthropic_native_blocks(visi
             "type": "tool_use", "id": "synthetic-lookup", "name": "lookup",
             "input": {"path": "/synthetic/private/file.txt"},
         },
+        {"type": "tool_use", "id": "unfinished-lookup", "name": "lookup", "input": {}},
     ]
     if visible_text:
         native.insert(2, {"type": "text", "text": "Synthetic public answer."})
@@ -289,22 +289,22 @@ def test_restricted_tool_history_cannot_reintroduce_anthropic_native_blocks(visi
     restored = decode_assistant_replay(envelope)
     control, _ = provider._build_payload(restored, None, ChatConfig(), record_diagnostics=False)
     assert control["messages"][0]["content"] == native
-    projected, stats = strip_historical_tool_pairs(restored)
-    assert stats.tool_uses_removed == stats.tool_results_removed == 1
+    projected = reconstruct_messages_from_entry(
+        "assistant", "", None, assistant_replay=envelope,
+    )
     assert envelope == original
     assert [entry.model_dump() for entry in restored] == original["messages"]
-    if visible_text:
-        assert projected == [Message(
-            role="assistant", content=[ContentBlockText(text="Synthetic public answer.")],
-        )]
-    else:
-        assert projected == []
+    assert len(projected) == 1 and projected[0].role == "user"
+    assert projected[0].reasoning_content is None and projected[0].provider_replay is None
     payload, _ = provider._build_payload(projected, None, ChatConfig(), record_diagnostics=False)
     wire = json.dumps(payload)
     assert "synthetic-private" not in wire
-    assert "synthetic private" not in wire
-    assert "/synthetic/private" not in wire
+    assert "synthetic private tool reasoning" not in wire
     assert "thinking" not in wire
+    assert "synthetic private tool result" in wire
+    assert "/synthetic/private/file.txt" in wire
+    assert "unfinished-lookup" in wire
+    assert ("Synthetic public answer." in wire) is visible_text
 
 
 @pytest.mark.parametrize("captured_value,accepted_value,mutation,expected", [

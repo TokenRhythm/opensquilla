@@ -201,7 +201,7 @@ async def test_ensemble_c3_is_text_only_and_lower_configured_vision_tier_wins(
 
 
 @pytest.mark.asyncio
-async def test_structural_edit_image_route_and_fallbacks_obey_c3_execution_floor(
+async def test_retired_artifact_metadata_preserves_configured_image_route_and_fallbacks(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _catalog_evidence(monkeypatch, supported=tuple(f"configured/c{index}" for index in range(4)))
@@ -226,16 +226,25 @@ async def test_structural_edit_image_route_and_fallbacks_obey_c3_execution_floor
 
     routed = await apply_squilla_router(ctx)
 
-    assert routed.metadata["routed_tier"] == "c3"
-    assert routed.model == "configured/c3"
+    expected_fallbacks = [
+        {"tier": "c1", "model": "configured/c1", "vision_support": "supported"},
+        {"tier": "c2", "model": "configured/c2", "vision_support": "supported"},
+        {"tier": "c3", "model": "configured/c3", "vision_support": "supported"},
+    ]
+    assert routed.metadata["routed_tier"] == "c0"
+    assert routed.model == "configured/c0"
     assert routed.metadata["image_input_mode"] == "native"
-    assert routed.metadata["router_fallback_chain"] == []
+    assert routed.metadata["router_fallback_chain"] == expected_fallbacks
+    assert "artifact_floor_applied" not in routed.metadata
 
     finalized = await finalize_squilla_router_capacity(routed)
 
-    assert finalized.metadata["routed_tier"] == "c3"
-    assert finalized.model == "configured/c3"
-    assert finalized.metadata["router_fallback_chain"] == []
+    assert finalized.metadata["routed_tier"] == "c0"
+    assert finalized.model == "configured/c0"
+    assert finalized.metadata["router_fallback_chain"] == expected_fallbacks
+    assert finalized.metadata["large_context_capacity_required"] is True
+    assert finalized.metadata.get("large_context_capacity_blocked") is not True
+    assert "artifact_floor_applied" not in finalized.metadata
 
 
 @pytest.mark.asyncio

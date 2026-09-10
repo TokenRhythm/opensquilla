@@ -1,4 +1,8 @@
-import { describe, expect, it, vi } from 'vitest'
+import { RpcTimeoutError } from '@/lib/rpc'
+import { createSessionReadLifecycle, type SessionReadPortLease } from '@/modules/sessionReadLifecycle'
+import { createConversationRuntime } from '@/modules/conversationRuntime'
+import { createConversationSubscriptionLifecycle } from '@/modules/conversationSubscriptionLifecycle'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { RpcCallOptions } from '@/lib/rpc'
 import { CHAT_HISTORY_METHOD, type ChatHistoryResult } from '@/contracts/generated/v4/chatHistory'
 import {
@@ -871,5 +875,144 @@ describe('v4 SessionReadPort Adapter', () => {
     await replacedLease.close()
     expect(replaced.calls.some(call => call.method === SESSIONS_MESSAGES_UNSUBSCRIBE_METHOD))
       .toBe(false)
+  })
+})
+
+function deadlineHarness(options: {
+  delayedAck?: boolean
+  preSend?: boolean
+  abortOwner?: boolean
+  changeGeneration?: boolean
+  snapshotError?: string
+  rejectSubscribe?: boolean
+  replayGap?: boolean
+} = {}) {
+  const base = makeHarness()
+  const ack = deferred<SessionsMessagesSubscribeResult>()
+  const lateSnapshot = deferred<SessionsMessagesSnapshotResult>()
+  const controller = new AbortController()
+  let subscribed = false
+  const delivered: string[] = []
+  base.results.set(SESSIONS_MESSAGES_SUBSCRIBE_METHOD, subscribeResult({
+    ...(options.replayGap ? { replay_complete: false, replay_gap_reason: 'trimmed' } : {}),
+  }))
+  base.requestMock.mockImplementation((method, params, callOptions) => {
+    base.calls.push({ method, params, options: callOptions })
+    if (method === SESSIONS_MESSAGES_SNAPSHOT_METHOD && options.preSend) {
+      return Promise.reject(new RpcTimeoutError(method, callOptions!.timeoutMs!))
+    }
+    callOptions?.onSent?.(base.rpc.generation)
+    if (method === SESSIONS_MESSAGES_SUBSCRIBE_METHOD) {
+      if (options.rejectSubscribe) return Promise.reject(new Error('subscribe rejected'))
+      subscribed = true
+      return options.delayedAck ? ack.promise : Promise.resolve(base.results.get(method))
+    }
+    if (method === SESSIONS_MESSAGES_UNSUBSCRIBE_METHOD) {
+      subscribed = false
+      return Promise.resolve(null)
+    }
+    if (method === SESSIONS_MESSAGES_SNAPSHOT_METHOD) {
+      return new Promise((resolve, reject) => {
+        const timer = setTimeout(() => {
+          if (options.abortOwner) controller.abort()
+          if (options.changeGeneration) base.setGeneration(8)
+          reject(options.snapshotError
+            ? Object.assign(new Error('snapshot rejected'), { code: options.snapshotError })
+            : new RpcTimeoutError(method, callOptions!.timeoutMs!))
+        }, callOptions!.timeoutMs)
+        lateSnapshot.promise.then(value => { clearTimeout(timer); resolve(value) }, reject)
+      })
+    }
+    return Promise.resolve(base.results.get(method))
+  })
+  return {
+    ...base, ack, lateSnapshot, controller,
+    isSubscribed: () => subscribed,
+    emit(name: string) { if (subscribed) delivered.push(name) },
+    delivered,
+  }
+}
+
+afterEach(() => { vi.useRealTimers() })
+
+describe('sent snapshot deadline regression', () => {
+  it.each([false, true])('retains actual subscription after 3s snapshot deadline (ACK delayed=%s)', async delayedAck => {
+    vi.useFakeTimers()
+    const harness = deadlineHarness({ delayedAck })
+    const lifecycle = createSessionReadLifecycle({
+      port: createV4SessionReadPort(harness.rpc),
+      runtime: createConversationRuntime(),
+      subscriptions: createConversationSubscriptionLifecycle<SessionReadPortLease>(),
+    })
+    const lease = lifecycle.open({ sessionKey: 'alpha', includeInitialHistory: false })
+    const outcome = lease.live.then(value => ({ value }), error => ({ error }))
+    try {
+      await lease.criticalRequestsQueued
+      const request = harness.calls.find(call => call.method === SESSIONS_MESSAGES_SNAPSHOT_METHOD)
+      expect(request?.options).toMatchObject({ timeoutMs: 3000, timeoutAction: 'reject', abortAction: 'reject', expectedGeneration: 7 })
+      await vi.advanceTimersByTimeAsync(2999)
+      expect(harness.isSubscribed()).toBe(true)
+      await vi.advanceTimersByTimeAsync(1)
+      expect(harness.isSubscribed(), 'a request-local snapshot deadline must not unregister the acknowledged stream').toBe(true)
+      await vi.advanceTimersByTimeAsync(4630)
+      harness.ack.resolve(subscribeResult())
+      await vi.advanceTimersByTimeAsync(0)
+      const result = await outcome
+      expect(result).toMatchObject({ value: { snapshot: null, sessionKey: 'alpha', activeTaskId: 'task-1' } })
+      expect(lifecycle.current()).toBe(lease)
+      harness.lateSnapshot.resolve(snapshotResult({ current_stream_seq: 900 }))
+      await vi.advanceTimersByTimeAsync(0)
+      expect(await lease.live).toMatchObject({ snapshot: null })
+      // Only server-delivered tick/terminal names are synthetic; the actual
+      // Port and lifecycle own the live registration and close decision.
+      harness.emit('tick')
+      await vi.advanceTimersByTimeAsync(600_000)
+      harness.emit('session.event.done')
+      harness.emit('session.event.turn_committed')
+      expect(harness.delivered).toEqual(['tick', 'session.event.done', 'session.event.turn_committed'])
+      expect(harness.calls.filter(call => call.method === SESSIONS_MESSAGES_SUBSCRIBE_METHOD)).toHaveLength(1)
+      expect(harness.calls.filter(call => call.method === SESSIONS_MESSAGES_UNSUBSCRIBE_METHOD)).toHaveLength(0)
+    } finally { await lease.close() }
+    expect(harness.isSubscribed()).toBe(false)
+  })
+
+  it('retains incomplete replay as a required history recovery without inventing a snapshot watermark', async () => {
+    vi.useFakeTimers()
+    const harness = deadlineHarness({ replayGap: true })
+    const lifecycle = createSessionReadLifecycle({
+      port: createV4SessionReadPort(harness.rpc),
+      runtime: createConversationRuntime(),
+      subscriptions: createConversationSubscriptionLifecycle<SessionReadPortLease>(),
+    })
+    const lease = lifecycle.open({ sessionKey: 'alpha', includeInitialHistory: false })
+    const outcome = lease.live.then(value => ({ value }), error => ({ error }))
+    try {
+      await lease.criticalRequestsQueued
+      await vi.advanceTimersByTimeAsync(3000)
+      expect(await outcome).toMatchObject({ value: { snapshot: null, reloadRequired: 'replayGap' } })
+      expect(harness.isSubscribed()).toBe(true)
+      expect(await lease.history.latest()).toMatchObject({ messages: [{ id: '41', messageId: 'message-1' }] })
+    } finally { await lease.close() }
+  })
+
+  it.each<{ name: string; options: NonNullable<Parameters<typeof deadlineHarness>[0]> }>([
+    { name: 'not actually sent', options: { preSend: true } },
+    { name: 'owner aborted', options: { abortOwner: true } },
+    { name: 'generation changed', options: { changeGeneration: true } },
+    { name: 'session missing', options: { snapshotError: 'SESSION_NOT_FOUND' } },
+    { name: 'subscribe rejected', options: { rejectSubscribe: true } },
+  ])('fails closed when $name', async ({ options }) => {
+    vi.useFakeTimers()
+    const harness = deadlineHarness(options)
+    const lease = createV4SessionReadPort(harness.rpc).open(openRequest(harness.controller.signal, false))
+    const outcome = lease.live.then(value => ({ value }), error => ({ error }))
+    const admitted = lease.criticalRequestsQueued.then(() => ({ ready: true }), error => ({ error }))
+    const metadata = lease.metadata.then(value => ({ value }), error => ({ error }))
+    try {
+      await vi.advanceTimersByTimeAsync(3000)
+      expect(await outcome).toHaveProperty('error')
+      if (options.preSend) expect(await admitted).toHaveProperty('error')
+      if (options.rejectSubscribe) expect(await metadata).toHaveProperty('error')
+    } finally { await lease.close() }
   })
 })

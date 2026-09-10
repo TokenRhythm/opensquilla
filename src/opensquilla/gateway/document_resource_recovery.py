@@ -138,6 +138,7 @@ def _materialize_internal_candidate(
     size: int,
     payload: bytes,
     source: str,
+    bundle_artifact_id: str | None = None,
 ) -> ArtifactRef:
     """Publish one preallocated candidate, repairing an owned partial bucket."""
 
@@ -159,16 +160,30 @@ def _materialize_internal_candidate(
 
     for retry in range(2):
         try:
-            store.publish_bytes(
-                payload,
-                session_id=session_id,
-                session_key=session_key,
-                name=name,
-                mime=mime,
-                source=source,
-                visibility="internal",
-                artifact_id=artifact_id,
-            )
+            if bundle_artifact_id is not None:
+                from opensquilla.artifact_session.working_files import load_version_bundle
+
+                store.publish_bundle(
+                    load_version_bundle(store, bundle_artifact_id, session_id),
+                    session_id=session_id,
+                    session_key=session_key,
+                    name=name,
+                    mime=mime,
+                    source=source,
+                    visibility="internal",
+                    artifact_id=artifact_id,
+                )
+            else:
+                store.publish_bytes(
+                    payload,
+                    session_id=session_id,
+                    session_key=session_key,
+                    name=name,
+                    mime=mime,
+                    source=source,
+                    visibility="internal",
+                    artifact_id=artifact_id,
+                )
         except FileExistsError:
             try:
                 return _verify_candidate(
@@ -272,6 +287,9 @@ async def _restore_import_candidate(
             size=attempt.source_size,
             payload=source.payload,
             source="document-import-restart-recovery",
+            bundle_artifact_id=(
+                source.resource_id if source.source_type is DocumentSourceType.DELIVERABLE else None
+            ),
         )
     except (ArtifactError, OSError, ValueError):
         return MutationAttemptStatus.AMBIGUOUS
@@ -395,6 +413,7 @@ async def _restore_publish_candidate(
             size=attempt.size,
             payload=payload,
             source="document-publish-restart-recovery",
+            bundle_artifact_id=revision.artifact_id,
         )
     except (ArtifactError, OSError, ValueError):
         return MutationAttemptStatus.AMBIGUOUS
@@ -582,8 +601,7 @@ def _merge_import(
         imports_examined=summary.imports_examined + 1,
         imports_applied=summary.imports_applied + (status is MutationAttemptStatus.APPLIED),
         imports_failed=summary.imports_failed + (status is MutationAttemptStatus.FAILED),
-        imports_ambiguous=summary.imports_ambiguous
-        + (status is MutationAttemptStatus.AMBIGUOUS),
+        imports_ambiguous=summary.imports_ambiguous + (status is MutationAttemptStatus.AMBIGUOUS),
         publishes_examined=summary.publishes_examined,
         publishes_applied=summary.publishes_applied,
         publishes_failed=summary.publishes_failed,

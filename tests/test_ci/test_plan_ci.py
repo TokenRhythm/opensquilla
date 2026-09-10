@@ -149,7 +149,7 @@ def test_pr_1347_test_only_change_uses_exact_targets_and_windows_shards(
 ) -> None:
     paths = [
         "tests/test_gateway/test_rpc_sessions.py",
-        "tests/test_live_artifact_prompt_annotations_e2e.py",
+        "tests/test_desktop/test_onboarding_main_process_flow_contract.py",
         "tests/test_recovery/test_recovery_cmd.py",
     ]
     importing_consumer = "tests/test_gateway/test_p1a_exact_abort_contract.py"

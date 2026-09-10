@@ -173,11 +173,33 @@
       "failedDetail": "Reload the isolated browser to continue."
     },
     "artifactAnnotation": {
-      "start": "Annotate preview", "stop": "Stop annotating", "selectElement": "Select a page element to annotate", "selectElementShort": "Select element", "unavailable": "Preview annotation is unavailable.", "desktopEditingOnly": "Select and edit page elements with AI in the desktop app.",
-      "createFailed": "The selected element could not be attached.", "elementChanged": "The selected element changed before it could be attached. Select it again in the current preview.", "rearmFailed": "Annotation mode stopped because the element picker could not be restarted. Turn annotation mode on to try again.", "updateFailed": "The annotation draft could not be saved.", "discardFailed": "The annotation could not be discarded. It remains open so you can try again.", "closeFailed": "The annotation editor could not be closed. Try again before selecting another element.", "replacementCleanupFailed": "The new annotation was kept, but the previous draft could not be removed.",
+      "start": "Annotate preview",
+      "stop": "Stop annotating",
+      "selectElement": "Select a page element to annotate",
+      "selectElementShort": "Select element",
+      "unavailable": "Preview annotation is unavailable.",
+      "desktopEditingOnly": "Select and edit page elements with AI in the desktop app.",
+      "createFailed": "The selected element could not be attached.",
+      "elementChanged": "The selected element changed before it could be attached. Select it again in the current preview.",
+      "rearmFailed": "Annotation mode stopped because the element picker could not be restarted. Turn annotation mode on to try again.",
+      "updateFailed": "The annotation draft could not be saved.",
+      "discardFailed": "The annotation could not be discarded. It remains open so you can try again.",
+      "closeFailed": "The annotation editor could not be closed. Try again before selecting another element.",
+      "replacementCleanupFailed": "The new annotation was kept, but the previous draft could not be removed.",
       "overlayFallback": "Continue the annotation below.",
-      "fallbackTitle": "Continue annotation", "fallbackDetail": "The preview is temporarily hidden. Your annotation is still here.", "frozenPreview": "Preview of the selected page area",
-      "placeholder": "Describe the change for this area…", "newlineHint": "{shortcut} for a new line", "keepDraft": "Keep annotation", "submit": "Add annotation", "contextLabel": "Current selection", "bodyLabel": "Page annotation", "emptyBody": "Describe the requested change.", "reselectHint": "Select the matching area on the page.", "reuseHint": "The modification request was copied. Select the matching area on the page."
+      "fallbackTitle": "Continue annotation",
+      "fallbackDetail": "The preview is temporarily hidden. Your annotation is still here.",
+      "frozenPreview": "Preview of the selected page area",
+      "placeholder": "Describe the change for this area…",
+      "newlineHint": "{shortcut} for a new line",
+      "keepDraft": "Keep annotation",
+      "submit": "Add annotation",
+      "contextLabel": "Current selection",
+      "bodyLabel": "Page annotation",
+      "emptyBody": "Describe the requested change.",
+      "reselectHint": "Select the matching area on the page.",
+      "reuseHint": "The modification request was copied. Select the matching area on the page.",
+      "screenshotUploadFailed": "The page capture could not be attached. Your annotation is still available; you can add an image manually."
     },
     "artifactPreview": {
       "refresh": "Refresh preview",
@@ -187,7 +209,6 @@
       "readyWithWarnings": "The preview is running with warnings.",
       "warningsShort": "Warnings",
       "suspended": "Preview paused",
-      "agentEditInProgress": "Editing is continuing in the background.",
       "nativePreview": "Interactive preview",
       "allowRemoteResources": "Allow online images, styles, and media",
       "blockRemoteResources": "Block online images, styles, and media",
@@ -229,7 +250,6 @@
     },
     "artifactErrors": {
       "documentChanged": "The page changed. Refresh it before trying again.",
-      "editSessionRenewalRequired": "Editing is reconnecting. Your unsaved changes are still available.",
       "writeBusy": "The page is being updated. Wait a moment and try again.",
       "mutationNotApplied": "The page was not updated. You can try again.",
       "mutationOutcomePending": "The update result cannot be confirmed. Open the page to check.",
@@ -241,7 +261,8 @@
       "annotationUnavailable": "This annotation is temporarily unavailable.",
       "annotationBusy": "Annotations are being updated. Wait a moment and try again.",
       "invalidRequest": "The request could not be completed. Check the input and try again.",
-      "internalError": "The operation could not be completed. Try again."
+      "internalError": "The operation could not be completed. Try again.",
+      "documentEditingRetired": "Update the client and reopen the page to send annotations as chat input."
     },
     "artifactDocument": {
       "sections": "Artifact document sections",
@@ -290,22 +311,7 @@
       "revertFailed": "This change could not be reverted. The document may have changed; review the latest version and retry.",
       "commentCreateFailed": "The comment could not be added. Review the latest document state and retry.",
       "commentResolveFailed": "The comment could not be resolved. Review the latest comment state and retry.",
-      "noElementSelected": "Place the cursor inside an HTML element",
-      "saving": "Saving…",
-      "saveSource": "Save",
-      "sourceUnavailable": "HTML source is unavailable.",
-      "sourceConflict": "The document changed elsewhere. Review or reload before saving.",
-      "copyUnsavedSource": "Copy unsaved source",
-      "unsavedSourceCopied": "Unsaved source copied",
-      "copyUnsavedSourceFailed": "The unsaved source could not be copied.",
-      "discardAndLoadLatest": "Discard and load latest",
-      "sourceStatus": {
-        "ready": "Ready",
-        "saving": "Saving…",
-        "dirty": "Unsaved",
-        "saved": "Saved",
-        "error": "Needs attention"
-      }
+      "sourceUnavailable": "HTML source is unavailable."
     }
   },
   "nav": {
@@ -3558,7 +3564,7 @@
     "audioUnsupported": "This browser cannot play this audio format. Download the file instead.",
     "playVideo": "Play video",
     "videoLoadFailed": "Video could not be loaded.",
-    "videoUnsupported": "This browser cannot play this video format. Download the file instead.",
+    "videoUnsupported": "This browser cannot play this video. Download it instead.",
     "previewOf": "Preview: {title}",
     "closePreview": "Close preview",
     "previousImage": "Previous image",
@@ -3567,7 +3573,6 @@
     "previewDownload": "Preview download",
     "previewTimedOut": "Preview timed out.",
     "previewFailed": "Preview failed to load.",
-    "videoUnsupported": "This browser cannot play this video. Download it instead.",
     "loadVideoPreview": "Load video preview",
     "loadVideoPreviewFor": "Load video preview for {title}",
     "videoPreviewLoading": "Loading the video preview. You can cancel while it downloads.",
@@ -4057,7 +4062,8 @@
         "generic": "Steer unavailable for the current task. The message remains queued."
       },
       "clearQueue": "Clear queue",
-      "removeMessage": "Remove pending message {index}"
+      "removeMessage": "Remove pending message {index}",
+      "annotationUpgradeRequired": "This queued annotation uses the retired editor. Edit the message and select the page again before sending."
     },
     "metaRuns": {
       "draft": "Draft",

@@ -178,41 +178,6 @@
     },
     {
       "kind": "method",
-      "wireName": "artifacts.prompt_annotations.create",
-      "roles": [
-        "result"
-      ]
-    },
-    {
-      "kind": "method",
-      "wireName": "artifacts.prompt_annotations.discard",
-      "roles": [
-        "result"
-      ]
-    },
-    {
-      "kind": "method",
-      "wireName": "artifacts.prompt_annotations.focus",
-      "roles": [
-        "result"
-      ]
-    },
-    {
-      "kind": "method",
-      "wireName": "artifacts.prompt_annotations.list",
-      "roles": [
-        "result"
-      ]
-    },
-    {
-      "kind": "method",
-      "wireName": "artifacts.prompt_annotations.update",
-      "roles": [
-        "result"
-      ]
-    },
-    {
-      "kind": "method",
       "wireName": "artifacts.revisions.list",
       "roles": [
         "result"
@@ -221,13 +186,6 @@
     {
       "kind": "method",
       "wireName": "artifacts.revisions.restore",
-      "roles": [
-        "result"
-      ]
-    },
-    {
-      "kind": "method",
-      "wireName": "artifacts.source.patch",
       "roles": [
         "result"
       ]
@@ -425,27 +383,6 @@
     {
       "kind": "method",
       "wireName": "doctor.status",
-      "roles": [
-        "result"
-      ]
-    },
-    {
-      "kind": "method",
-      "wireName": "documents.editSessions.close",
-      "roles": [
-        "result"
-      ]
-    },
-    {
-      "kind": "method",
-      "wireName": "documents.editSessions.heartbeat",
-      "roles": [
-        "result"
-      ]
-    },
-    {
-      "kind": "method",
-      "wireName": "documents.editSessions.start",
       "roles": [
         "result"
       ]

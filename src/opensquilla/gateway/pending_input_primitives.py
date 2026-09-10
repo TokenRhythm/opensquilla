@@ -69,8 +69,8 @@ def pending_input_payload(turn: AdmitTurn, confirmed_plain_text: bool) -> dict[s
             payload[name] = value
     if confirmed_plain_text:
         payload["confirmedPlainText"] = True
-    if turn.prompt_annotation_ids:
-        payload["promptAnnotationIds"] = list(turn.prompt_annotation_ids)
+    if turn.page_context is not None:
+        payload["pageContext"] = turn.page_context
     return payload
 
 
@@ -118,9 +118,8 @@ def pending_input_projection(
         result["displayText"] = display
     if payload.get("confirmedPlainText") is True:
         result["confirmedPlainText"] = True
-    annotations = payload.get("promptAnnotationIds")
-    if isinstance(annotations, list) and annotations:
-        result["promptAnnotationIds"] = [item for item in annotations if isinstance(item, str)][:16]
+    if isinstance(payload.get("pageContext"), dict):
+        result["pageContext"] = payload["pageContext"]
     routing = payload.get("initialRoutingMode")
     if isinstance(routing, str):
         result["initialRoutingMode"] = routing
@@ -158,6 +157,7 @@ def stored_pending_input(row: PendingChatInput) -> StoredPendingInput:
         has_non_text_semantics=any(
             row.payload.get(name) is not None
             for name in (
+                "pageContext",
                 "intent",
                 "model",
                 "model_id",

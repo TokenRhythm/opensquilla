@@ -104,13 +104,18 @@ async def _seed_document(
         artifact=_blob(internal),
         actor=USER,
     )
-    edit = await service.start_edit_session(
-        document_id=created.document.document_id,
-        user_id="editor",
-        ttl_ms=60_000,
-        actor=USER,
-        edit_session_id="edit-reset-seed",
-    )
+    # Existing profiles retain old lifecycle rows until the owning session is deleted.
+    async with storage._write_transaction("test.seed_historical_editor") as conn:
+        await conn.execute(
+            """INSERT INTO artifact_edit_sessions (
+                edit_session_id, document_id, base_revision_id, last_saved_revision_id,
+                mode, status, user_id, state_revision, expires_at,
+                last_access_at, created_at, updated_at
+            ) VALUES ('edit-reset-seed', ?, ?, ?, 'edit', 'closed', 'user', 1, 0, 1, 1, 1)""",
+            (created.document.document_id, created.revision.revision_id,
+             committed.revision.revision_id),
+        )
+    edit = await service.get_edit_session("edit-reset-seed")
     return service, (committed, edit), listed, internal
 
 

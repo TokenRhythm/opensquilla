@@ -1,3 +1,4 @@
+import { normalizePageContext } from '@/types/pageContext'
 import type { TransportCallOptions as RpcCallOptions } from './transportTypes'
 import { readTransportFailure } from './transportTypes'
 import {
@@ -227,9 +228,6 @@ function projectSendResult(raw: ChatSendResult | SessionsPendingInputsDispatchRe
       ? { terminalMessage: firstDefined(object, 'terminalMessage', 'terminal_message') as string }
       : {}),
     ...(optionalString(object.reason) !== undefined ? { reason: object.reason as string } : {}),
-    ...(Array.isArray(firstDefined(object, 'acceptedPromptAnnotationIds', 'accepted_prompt_annotation_ids'))
-      ? { acceptedPromptAnnotationIds: firstDefined(object, 'acceptedPromptAnnotationIds', 'accepted_prompt_annotation_ids') as string[] }
-      : {}),
   }
   const metadata = metadataFor(object, SEND_RESULT_KEYS)
   return metadata ? { ...result, metadata } : result
@@ -337,8 +335,9 @@ export function toWireSendParams(request: TurnSendParams): Record<string, unknow
     sessionKey,
     clientRequestId,
     clientMessageId,
-    promptAnnotationIds,
-    documentContext,
+    pageContext,
+    promptAnnotationIds: retiredAnnotationIds,
+    documentContext: retiredDocumentContext,
     source,
     intent,
     workspaceId,
@@ -355,8 +354,9 @@ export function toWireSendParams(request: TurnSendParams): Record<string, unknow
     key: legacyKey,
     client_request_id: legacyClientRequestId,
     client_message_id: legacyClientMessageId,
-    prompt_annotation_ids: legacyPromptAnnotationIds,
-    document_context: legacyDocumentContext,
+    prompt_annotation_ids: retiredLegacyAnnotationIds,
+    document_context: retiredLegacyDocumentContext,
+    page_context: legacyPageContext,
     _source: legacySource,
     workspace_id: legacyWorkspaceId,
     collaboration_mode: legacyCollaborationMode,
@@ -365,6 +365,12 @@ export function toWireSendParams(request: TurnSendParams): Record<string, unknow
     display_text: legacyDisplayText,
     ...extensions
   } = sourceRecord
+
+  if (retiredDocumentContext || retiredLegacyDocumentContext
+    || [retiredAnnotationIds, retiredLegacyAnnotationIds].some(value => Array.isArray(value) && value.length > 0)) {
+    throw new TurnCommandError('rejected', 'Reopen the page and send its annotations again.', 'DOCUMENT_EDITING_RETIRED', false)
+  }
+  const context = normalizePageContext(pageContext ?? legacyPageContext)
 
   return {
     ...extensions,
@@ -386,16 +392,7 @@ export function toWireSendParams(request: TurnSendParams): Record<string, unknow
       : legacyClientMessageId !== undefined
         ? { client_message_id: legacyClientMessageId }
         : {}),
-    ...(promptAnnotationIds !== undefined
-      ? { promptAnnotationIds }
-      : legacyPromptAnnotationIds !== undefined
-        ? { prompt_annotation_ids: legacyPromptAnnotationIds }
-        : {}),
-    ...(documentContext !== undefined
-      ? { documentContext }
-      : legacyDocumentContext !== undefined
-        ? { document_context: legacyDocumentContext }
-        : {}),
+    ...(context ? { pageContext: context } : {}),
     ...(source !== undefined
       ? { _source: source }
       : legacySource !== undefined

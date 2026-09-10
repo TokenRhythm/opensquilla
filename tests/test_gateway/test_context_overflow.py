@@ -465,32 +465,6 @@ async def test_auto_summarize_invokes_compaction_and_retries_once() -> None:
     assert outcome.tokens_after <= outcome.budget_tokens
 
 
-@pytest.mark.asyncio
-async def test_restricted_turn_refuses_before_gateway_auxiliary_compaction() -> None:
-    cfg = _cfg(
-        ContextOverflowPolicy.AUTO_SUMMARIZE,
-        budget=10,
-        flush_enabled=True,
-    )
-    sm = _CheckpointingSessionManager(_history(6, 40))
-    flush_service = SimpleNamespace(execute=AsyncMock())
-
-    outcome = await apply_context_overflow_policy(
-        config=cfg,
-        message="m",
-        transcript=sm._transcript,
-        session_key="agent:main:restricted-overflow",
-        session_manager=sm,
-        flush_service=flush_service,
-        restricted_turn=True,
-    )
-
-    assert outcome.over_budget is True
-    assert outcome.reason == "restricted_turn_compaction_disabled"
-    assert outcome.refusal is not None
-    assert sm.calls == []
-    assert sm.compact_calls == []
-    flush_service.execute.assert_not_awaited()
 
 
 @pytest.mark.asyncio

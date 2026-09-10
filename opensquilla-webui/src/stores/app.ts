@@ -56,7 +56,9 @@ const NATIVE_V3_ANNOTATION_BRIDGE_METHODS = [
   'setArtifactAnnotationMode',
   'showArtifactAnnotationOverlay',
   'closeArtifactAnnotationOverlay',
-  'screenshot',
+  'getWorkbenchBrowserTarget',
+  'focusWorkbenchAnnotation',
+  'captureWorkbenchScreenshot',
 ] as const
 
 function hasNativeV3AnnotationBridge(): boolean {

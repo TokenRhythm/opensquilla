@@ -15,7 +15,71 @@ import {
   cleanupPackagedFirstSend,
   closeElectronAndObserveExit,
   electronProcessSnapshot,
+  expectedShutdownCancellationIndices,
 } from './packaged-first-send-cleanup.mjs'
+
+const quitStart = { event: 'before_quit', gatewayDrainInFlight: false }
+const quitAccepted = { event: 'quit_gateway_shutdown_requested', accepted: true, alreadyStopping: false }
+const quitExited = { event: 'quit_gateway_exit', exited: true, hardTerminated: false }
+const cancelledDirectory = {
+  event: 'renderer_console', level: 'error',
+  message: '[useSessions] session directory error: Connection closed',
+}
+const normalQuit = [quitStart, quitAccepted, cancelledDirectory, quitExited]
+const quitLogCases = [
+  ['confirmed normal shutdown', normalQuit, [2], 0],
+  ['multiple exact cancellations', [quitStart, quitAccepted, cancelledDirectory, cancelledDirectory, quitExited], [2, 3], 0],
+  ['no cancellation', [quitStart, quitAccepted, quitExited], [], 0],
+  ['business phase', [cancelledDirectory, quitStart, quitAccepted, quitExited], [], 1],
+  ['before shutdown acceptance', [quitStart, cancelledDirectory, quitAccepted, quitExited], [], 1],
+  ['after Gateway exit', [quitStart, quitAccepted, quitExited, cancelledDirectory], [], 1],
+  ['business error alongside valid cancellation', [cancelledDirectory, ...normalQuit], [3], 1],
+  ['missing before_quit', normalQuit.slice(1), [], 1],
+  ['missing acceptance', [quitStart, cancelledDirectory, quitExited], [], 1],
+  ['missing exit', normalQuit.slice(0, -1), [], 1],
+  ['out of order acceptance', [quitAccepted, quitStart, cancelledDirectory, quitExited], [], 1],
+  ['second quit attempt', [quitStart, quitAccepted, cancelledDirectory, quitStart, quitExited], [], 1],
+  ['second accepted shutdown', [quitStart, quitAccepted, cancelledDirectory, quitAccepted, quitExited], [], 1],
+  ['second Gateway exit', [...normalQuit, quitExited], [], 1],
+  ['separate completed attempts', [...normalQuit, ...normalQuit], [], 2],
+  ...[false, null, 'true', 1, undefined].map(accepted => [
+    `acceptance must be boolean true: ${accepted}`,
+    [quitStart, { ...quitAccepted, accepted }, cancelledDirectory, quitExited], [], 1,
+  ]),
+  ...[false, null, 'true', 1, undefined].map(exited => [
+    `exit must be boolean true: ${exited}`,
+    [quitStart, quitAccepted, cancelledDirectory, { ...quitExited, exited }], [], 1,
+  ]),
+  ...[true, null, 'false', 0, undefined].map(hardTerminated => [
+    `natural exit must be boolean false: ${hardTerminated}`,
+    [quitStart, quitAccepted, cancelledDirectory, { ...quitExited, hardTerminated }], [], 1,
+  ]),
+  ...['quit_gateway_drain_failed', 'quit_gateway_still_running', 'renderer_unresponsive',
+    'renderer_process_gone', 'renderer_console_suppressed'].map(event => [
+    `intermediate failure: ${event}`,
+    [quitStart, quitAccepted, cancelledDirectory, { event }, quitExited], [], 1,
+  ]),
+  ['quit returned to running', [quitStart, quitAccepted, cancelledDirectory,
+    { event: 'desktop_exit_phase', to: 'running' }, quitExited], [], 1],
+  ['malformed record in interval', [quitStart, quitAccepted, cancelledDirectory, null, quitExited], [], 1],
+  ['other renderer failure', [quitStart, quitAccepted, cancelledDirectory,
+    { ...cancelledDirectory, message: 'TypeError: synthetic rendering failure' }, quitExited], [], 2],
+  ['forbidden failure', [quitStart, quitAccepted, cancelledDirectory,
+    { ...cancelledDirectory, message: '[ErrorBoundary] synthetic failure' }, quitExited], [], 2],
+  ['different error text', [quitStart, quitAccepted,
+    { ...cancelledDirectory, message: 'Connection closed' }, quitExited], [], 1],
+  ['extra error text', [quitStart, quitAccepted,
+    { ...cancelledDirectory, message: `${cancelledDirectory.message} unexpectedly` }, quitExited], [], 1],
+  ['different console level', [quitStart, quitAccepted,
+    { ...cancelledDirectory, level: 'warn' }, quitExited], [], 1],
+]
+for (const [name, records, expectedIndices, unexpectedCount] of quitLogCases) {
+  const expected = expectedShutdownCancellationIndices(records)
+  assert.deepEqual([...expected], expectedIndices, name)
+  assert.equal(records.filter(record => record?.event === 'renderer_console').length
+    - expected.size, unexpectedCount, `${name}: remaining errors`)
+}
+console.log(`First-send shutdown log classification checks passed: ${quitLogCases.length} synthetic cases`)
 
 const fixtureProcesses = []
 const fixtureServers = []

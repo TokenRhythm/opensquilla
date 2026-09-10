@@ -2,16 +2,15 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 from collections.abc import AsyncIterator
 from copy import deepcopy
 from typing import Any
-from urllib.parse import urlparse
 
 import httpx
 import structlog
 
+from opensquilla.endpoint_identity import endpoint_replay_source
 from opensquilla.env import trust_env as _trust_env
 from opensquilla.execution_status import derive_is_error
 
@@ -54,22 +53,7 @@ _ANTHROPIC_REPLAY_PROTOCOL = "anthropic_messages"
 
 
 def _anthropic_replay_source(provider_id: str, endpoint: str) -> str:
-    """Identify the actual Messages route without retaining endpoint secrets."""
-    parsed = urlparse(endpoint)
-    scheme = parsed.scheme.lower()
-    port: int | str | None
-    try:
-        port = parsed.port
-    except ValueError:
-        port = f"invalid:{parsed.netloc.rsplit('@', 1)[-1]}"
-    if port is None:
-        port = {"http": 80, "https": 443}.get(scheme)
-    identity = (
-        provider_id, scheme, (parsed.hostname or "").lower().rstrip("."), port,
-        parsed.path, parsed.params, parsed.query,
-    )
-    digest = hashlib.sha256(json.dumps(identity, ensure_ascii=False).encode("utf-8"))
-    return f"anthropic_messages:{digest.hexdigest()}"
+    return endpoint_replay_source("anthropic_messages", provider_id, endpoint)
 
 
 def _native_content_projection(content: list[dict[str, Any]]) -> list[dict[str, Any]]:

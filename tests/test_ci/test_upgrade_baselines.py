@@ -352,6 +352,9 @@ export async function waitFor(check) {
 }
 export async function launchPackagedCandidate({ env, userDataDir, model }) {
   console.log('SYNTHETIC_DESKTOP_LAUNCHED')
+  if (env.OPENSQUILLA_DESKTOP_UPDATE_SOURCE !== process.env.SYNTHETIC_EXPECTED_SOURCE) {
+    throw new Error('requested source was not passed to the packaged client')
+  }
   const signed = process.env.SYNTHETIC_UPDATE_MODE === 'signed-handoff'
   if (signed) {
     if (model !== 'opensquilla-release-session-recovery-smoke') {
@@ -396,6 +399,7 @@ export async function launchPackagedCandidate({ env, userDataDir, model }) {
         return {
           status: 'available', latestVersion: manifest.version,
           source: 'oss', installMode: signed ? 'manual' : 'native',
+          fallbackUsed: process.env.SYNTHETIC_FALLBACK_FAULT !== 'discovery',
         }
       }
       if (body.includes('downloadUpdate')) {
@@ -405,6 +409,7 @@ export async function launchPackagedCandidate({ env, userDataDir, model }) {
         return {
           status: 'downloaded', latestVersion: process.env.SYNTHETIC_CANDIDATE_VERSION,
           source: 'oss', installMode: 'manual', progress: 100,
+          fallbackUsed: process.env.SYNTHETIC_FALLBACK_FAULT !== 'download',
           canInstall: process.env.SYNTHETIC_CAN_INSTALL === '1',
         }
       }
@@ -437,6 +442,8 @@ def _run_rehearsal_driver(
     cached_bytes: bytes = b"candidate artifact",
     complete_signed: bool = False,
     can_install: bool = True,
+    download_source_mode: str | None = None,
+    fallback_fault: str = '',
 ) -> subprocess.CompletedProcess[str]:
     node, driver = rehearsal_driver
     manifest = driver.parent / "channel.json"
@@ -468,6 +475,8 @@ def _run_rehearsal_driver(
     ]
     if baseline is not None:
         arguments.extend(["--baseline-version", baseline])
+    if download_source_mode is not None:
+        arguments.extend(["--download-source-mode", download_source_mode])
     if mode == "signed-handoff":
         arguments.extend(["--ready-output", str(driver.parent / "handoff.json")])
         if source_sha is not None:
@@ -486,6 +495,10 @@ def _run_rehearsal_driver(
             "SYNTHETIC_UPDATE_MODE": mode,
             "SYNTHETIC_COMPLETE_SIGNED": "1" if complete_signed else "0",
             "SYNTHETIC_CAN_INSTALL": "1" if can_install else "0",
+            "SYNTHETIC_EXPECTED_SOURCE": (
+                "github" if download_source_mode == "github-to-oss" else "oss"
+            ),
+            "SYNTHETIC_FALLBACK_FAULT": fallback_fault,
         },
         capture_output=True,
         text=True,
@@ -616,6 +629,45 @@ def test_signed_handoff_records_only_handoff_until_outer_audit_verifies_install(
     assert output["sourceSha"] == "a" * 40
     assert 'SYNTHETIC_UI_CLICK:[data-testid="desktop-update-indicator"]' in result.stdout
     assert 'SYNTHETIC_UI_CLICK:[data-testid="desktop-update-relaunch"]' in result.stdout
+
+
+@pytest.mark.parametrize("fault", ["", "discovery", "download"])
+def test_signed_download_fallback_requires_both_stage_observations(
+    rehearsal_driver: tuple[str, Path], fault: str
+) -> None:
+    result = _run_rehearsal_driver(
+        rehearsal_driver, baseline="0.5.5", installed="0.5.5", candidate="0.5.6",
+        mode="signed-handoff", complete_signed=True,
+        download_source_mode="github-to-oss", fallback_fault=fault,
+    )
+    if fault:
+        assert result.returncode != 0
+        assert "SYNTHETIC_RELAUNCH_REQUESTED" not in result.stdout
+        assert not (rehearsal_driver[1].parent / "handoff.json").exists()
+    else:
+        assert result.returncode == 0, result.stderr
+        output = json.loads((rehearsal_driver[1].parent / "handoff.json").read_text())
+        assert output["sourceFallbackVerified"] is True
+        assert output["source"] == "oss"
+        assert output["networkIsolationVerified"] is False
+        assert output["remotePublicationVerified"] is False
+        assert output["discoveryScope"] == "controlled loopback channel; production asset sources"
+
+
+@pytest.mark.parametrize("mode,source", [
+    ("native", "github-to-oss"), ("manual", "oss"),
+    ("signed-cached-handoff", "github-to-oss"), ("signed-handoff", "invalid"),
+])
+def test_download_source_override_rejects_other_modes_before_launch(
+    rehearsal_driver: tuple[str, Path], mode: str, source: str
+) -> None:
+    result = _run_rehearsal_driver(
+        rehearsal_driver, baseline="0.5.5", installed="0.5.5",
+        candidate="0.5.6", mode=mode, download_source_mode=source,
+    )
+    assert result.returncode != 0
+    assert "--download-source-mode" in result.stderr
+    assert "SYNTHETIC_DESKTOP_LAUNCHED" not in result.stdout
 
 
 @pytest.fixture

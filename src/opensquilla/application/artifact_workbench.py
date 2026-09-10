@@ -8,11 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, NotRequired, Protocol, TypedDict
 
-_OPAQUE_ANNOTATION_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
-_HTML_TAG_NAME_RE = re.compile(r"^[a-zA-Z][a-zA-Z0-9:-]{0,127}$")
 _SHA256_RE = re.compile(r"^[a-f0-9]{64}$")
-_MAX_PROMPT_ANNOTATION_BYTES = 16_384
-_MAX_SOURCE_PATCHES = 100
 
 
 def _identity(value: str, label: str) -> str:
@@ -178,27 +174,8 @@ class ChangeRevert:
             raise ValueError("expected state revision must be positive")
 
 
-@dataclass(frozen=True, slots=True)
-class EditSessionStart:
-    session_key: str
-    document_id: str
-    client_request_id: str | None = None
-
-    def __post_init__(self) -> None:
-        DocumentIdentity(self.session_key, self.document_id)
 
 
-@dataclass(frozen=True, slots=True)
-class EditSessionMutation:
-    session_key: str
-    edit_session_id: str
-    expected_state_revision: int
-
-    def __post_init__(self) -> None:
-        _identity(self.session_key, "session key")
-        _identity(self.edit_session_id, "edit session id")
-        if self.expected_state_revision < 1:
-            raise ValueError("expected edit session state revision must be positive")
 
 
 @dataclass(frozen=True, slots=True)
@@ -211,83 +188,10 @@ class SourceRead:
         DocumentIdentity(self.session_key, self.document_id)
 
 
-@dataclass(frozen=True, slots=True)
-class SourceEdit:
-    start_offset: int
-    end_offset: int
-    replacement: str
-
-    def __post_init__(self) -> None:
-        if self.start_offset < 0 or self.end_offset < self.start_offset:
-            raise ValueError("source edit range is invalid")
 
 
-@dataclass(frozen=True, slots=True)
-class SourcePatch:
-    session_key: str
-    document_id: str
-    expected_head_revision_id: str
-    expected_source_sha256: str
-    expected_state_revision: int
-    edits: Sequence[SourceEdit]
-    request_id: str
-    offset_encoding: str = "unicode-code-point"
-    edit_session_id: str | None = None
-    expected_edit_session_state_revision: int | None = None
-    expected_last_saved_revision_id: str | None = None
-
-    def __post_init__(self) -> None:
-        DocumentIdentity(self.session_key, self.document_id)
-        _identity(self.expected_head_revision_id, "expected head revision id")
-        _identity(self.expected_source_sha256, "expected source digest")
-        _identity(self.request_id, "request id")
-        if self.expected_state_revision < 1:
-            raise ValueError("expected state revision must be positive")
-        if not self.edits:
-            raise ValueError("at least one source edit is required")
-        if len(self.edits) > _MAX_SOURCE_PATCHES:
-            raise ValueError("too many source edits")
-        if _SHA256_RE.fullmatch(self.expected_source_sha256.lower()) is None:
-            raise ValueError("expected source digest must be a SHA-256 value")
-        object.__setattr__(self, "expected_source_sha256", self.expected_source_sha256.lower())
-        edit_session_fields = (
-            self.edit_session_id,
-            self.expected_edit_session_state_revision,
-            self.expected_last_saved_revision_id,
-        )
-        if any(value is not None for value in edit_session_fields) and not all(
-            value is not None for value in edit_session_fields
-        ):
-            raise ValueError("edit session fencing fields must be supplied together")
 
 
-@dataclass(frozen=True, slots=True)
-class PromptAnnotationSelection:
-    selection_id: str
-    tag_name: str
-    element_path: str
-    element_proof_sha256: str
-    dom_sha256: str | None = None
-
-    def __post_init__(self) -> None:
-        for value, label in (
-            (self.selection_id, "selection id"),
-            (self.tag_name, "selection tag name"),
-            (self.element_path, "selection element path"),
-            (self.element_proof_sha256, "selection element proof"),
-        ):
-            _identity(value, label)
-        if _OPAQUE_ANNOTATION_ID_RE.fullmatch(self.selection_id) is None:
-            raise ValueError("selection id is invalid")
-        if _HTML_TAG_NAME_RE.fullmatch(self.tag_name) is None:
-            raise ValueError("selection tag name is invalid")
-        object.__setattr__(self, "tag_name", self.tag_name.lower())
-        if len(self.element_path) > 4096:
-            raise ValueError("selection element path is too long")
-        if _SHA256_RE.fullmatch(self.element_proof_sha256) is None:
-            raise ValueError("selection element proof must be a SHA-256 value")
-        if self.dom_sha256 is not None and _SHA256_RE.fullmatch(self.dom_sha256) is None:
-            raise ValueError("selection DOM proof must be a SHA-256 value")
 
 
 @dataclass(frozen=True, slots=True)
@@ -306,54 +210,10 @@ class PromptAnnotationQuery:
             raise ValueError("annotation page limit must be between 1 and 500")
 
 
-@dataclass(frozen=True, slots=True)
-class PromptAnnotationCreate:
-    session_key: str
-    annotation_id: str
-    document_id: str
-    selection: PromptAnnotationSelection
-    revision_id: str | None = None
-    body: str | None = None
-
-    def __post_init__(self) -> None:
-        DocumentIdentity(self.session_key, self.document_id)
-        _identity(self.annotation_id, "annotation id")
-        if _OPAQUE_ANNOTATION_ID_RE.fullmatch(self.annotation_id) is None:
-            raise ValueError("annotation id is invalid")
-        if self.revision_id is not None:
-            _identity(self.revision_id, "revision id")
-        self._validate_body()
-
-    def _validate_body(self) -> None:
-        if self.body is not None and len(self.body.encode("utf-8")) > _MAX_PROMPT_ANNOTATION_BYTES:
-            raise ValueError("annotation body must be no larger than 16 KiB")
 
 
-@dataclass(frozen=True, slots=True)
-class PromptAnnotationIdentity:
-    session_key: str
-    annotation_id: str
-
-    def __post_init__(self) -> None:
-        _identity(self.session_key, "session key")
-        _identity(self.annotation_id, "annotation id")
-        if _OPAQUE_ANNOTATION_ID_RE.fullmatch(self.annotation_id) is None:
-            raise ValueError("annotation id is invalid")
 
 
-@dataclass(frozen=True, slots=True)
-class PromptAnnotationMutation:
-    session_key: str
-    annotation_id: str
-    expected_state_revision: int
-    body: str | None = None
-
-    def __post_init__(self) -> None:
-        PromptAnnotationIdentity(self.session_key, self.annotation_id)
-        if self.expected_state_revision < 1:
-            raise ValueError("expected annotation state revision must be positive")
-        if self.body is not None and len(self.body.encode("utf-8")) > _MAX_PROMPT_ANNOTATION_BYTES:
-            raise ValueError("annotation body must be no larger than 16 KiB")
 
 
 @dataclass(frozen=True, slots=True)
@@ -654,6 +514,7 @@ class PreviewLeaseGrant:
     client: str
     source: Mapping[str, Any]
     expires_at: str
+    working_document_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -662,18 +523,10 @@ class PreviewLeaseRenewal:
     expires_at: str
 
 
-@dataclass(frozen=True, slots=True)
-class CandidatePreviewGrant:
-    candidate_handle: str
-    candidate_artifact_id: str
-    scope_id: str
-    lease: PreviewLeaseGrant
 
 
 @dataclass(frozen=True, slots=True)
 class WorkbenchRecoveryReport:
-    drafts: Mapping[str, int]
-    mutations: Mapping[str, int]
     resources: Mapping[str, int]
 
 
@@ -742,13 +595,6 @@ class ReceiptProjection(TypedDict, total=False):
     status: str
 
 
-class EditSessionProjection(TypedDict, total=False):
-    editSessionId: str
-    documentId: str
-    stateRevision: int
-    lastSavedRevisionId: str | None
-    status: str
-    expiresAt: str
 
 
 class SourceProjection(TypedDict, total=False):
@@ -840,31 +686,20 @@ class ChangeResult(TypedDict):
     changeSet: ChangeSetProjection
 
 
-class EditSessionResult(TypedDict):
-    editSession: EditSessionProjection
 
 
 class SourceResult(TypedDict):
     source: SourceProjection
 
 
-class SourcePatchResult(TypedDict):
-    editSession: EditSessionProjection
-    source: SourceProjection
 
 
 class AnnotationListResult(TypedDict):
     annotations: list[PromptAnnotationProjection]
 
 
-class AnnotationResult(TypedDict):
-    annotation: PromptAnnotationProjection
 
 
-class AnnotationFocusResult(TypedDict):
-    annotationId: str
-    documentId: str
-    focused: bool
 
 
 class ResourceListResult(TypedDict):
@@ -881,6 +716,8 @@ class ResourceResult(TypedDict):
 
 
 class ResourceOpenResult(TypedDict, total=False):
+    pageContext: Mapping[str, object]
+    workingFile: str
     resource: ResourceProjection
     disposition: str
     resolution: Mapping[str, object]
@@ -953,34 +790,19 @@ class ChangeHistoryPort(Protocol):
     async def revert_change(self, command: ChangeRevert) -> RevisionMutationResult: ...
 
 
-class DocumentEditSessionPort(Protocol):
-    async def start_edit_session(self, command: EditSessionStart) -> EditSessionResult: ...
-
-    async def heartbeat_edit_session(
-        self, command: EditSessionMutation
-    ) -> EditSessionResult: ...
-
-    async def close_edit_session(self, command: EditSessionMutation) -> EditSessionResult: ...
 
 
 class DocumentSourcePort(Protocol):
     async def read_source(self, query: SourceRead) -> SourceResult: ...
 
-    async def patch_source(self, command: SourcePatch) -> SourcePatchResult: ...
 
 
 class PromptAnnotationPort(Protocol):
     async def list_annotations(self, query: PromptAnnotationQuery) -> AnnotationListResult: ...
 
-    async def create_annotation(self, command: PromptAnnotationCreate) -> AnnotationResult: ...
 
-    async def focus_annotation(
-        self, identity: PromptAnnotationIdentity
-    ) -> AnnotationFocusResult: ...
 
-    async def update_annotation(self, command: PromptAnnotationMutation) -> AnnotationResult: ...
 
-    async def discard_annotation(self, command: PromptAnnotationMutation) -> AnnotationResult: ...
 
 
 class WorkbenchResourcePort(Protocol):
@@ -1038,15 +860,13 @@ class PreviewMaterialPort(Protocol):
 
     async def revoke_lease(self, identity: PreviewLeaseIdentity) -> None: ...
 
-    async def resolve_candidate(self, handle: str) -> CandidatePreviewGrant: ...
 
-    async def release_candidate(self, handle: str) -> None: ...
 
 
 class ArtifactRecoveryPort(Protocol):
-    async def recover_drafts(self) -> Mapping[str, int]: ...
+    async def retire_legacy_editor(self) -> None: ...
 
-    async def recover_mutations(self) -> Mapping[str, int]: ...
+
 
     async def recover_resources(self) -> Mapping[str, int]: ...
 
@@ -1112,18 +932,6 @@ class ChangeHistory:
         return await self._port.revert_change(command)
 
 
-class DocumentEditSession:
-    def __init__(self, port: DocumentEditSessionPort) -> None:
-        self._port = port
-
-    async def start(self, command: EditSessionStart) -> EditSessionResult:
-        return await self._port.start_edit_session(command)
-
-    async def heartbeat(self, command: EditSessionMutation) -> EditSessionResult:
-        return await self._port.heartbeat_edit_session(command)
-
-    async def close(self, command: EditSessionMutation) -> EditSessionResult:
-        return await self._port.close_edit_session(command)
 
 
 class DocumentSource:
@@ -1133,8 +941,6 @@ class DocumentSource:
     async def read(self, query: SourceRead) -> SourceResult:
         return await self._port.read_source(query)
 
-    async def patch(self, command: SourcePatch) -> SourcePatchResult:
-        return await self._port.patch_source(command)
 
 
 class PromptAnnotationApplication:
@@ -1144,17 +950,9 @@ class PromptAnnotationApplication:
     async def list(self, query: PromptAnnotationQuery) -> AnnotationListResult:
         return await self._port.list_annotations(query)
 
-    async def create(self, command: PromptAnnotationCreate) -> AnnotationResult:
-        return await self._port.create_annotation(command)
 
-    async def focus(self, identity: PromptAnnotationIdentity) -> AnnotationFocusResult:
-        return await self._port.focus_annotation(identity)
 
-    async def update(self, command: PromptAnnotationMutation) -> AnnotationResult:
-        return await self._port.update_annotation(command)
 
-    async def discard(self, command: PromptAnnotationMutation) -> AnnotationResult:
-        return await self._port.discard_annotation(command)
 
 
 class WorkbenchResourceApplication:
@@ -1280,26 +1078,19 @@ class PreviewMaterialApplication:
     async def revoke(self, identity: PreviewLeaseIdentity) -> None:
         await self._port.revoke_lease(identity)
 
-    async def resolve_candidate(self, handle: str) -> CandidatePreviewGrant:
-        return await self._port.resolve_candidate(_identity(handle, "candidate preview handle"))
 
-    async def release_candidate(self, handle: str) -> None:
-        await self._port.release_candidate(_identity(handle, "candidate preview handle"))
 
 
 class ArtifactRecoveryApplication:
-    """Run the three durable Workbench recovery passes in dependency order."""
+    """Retire legacy editor authority before recovering normal imports and publication."""
 
     def __init__(self, port: ArtifactRecoveryPort) -> None:
         self._port = port
 
     async def reconcile(self) -> WorkbenchRecoveryReport:
-        drafts = await self._port.recover_drafts()
-        mutations = await self._port.recover_mutations()
+        await self._port.retire_legacy_editor()
         resources = await self._port.recover_resources()
         return WorkbenchRecoveryReport(
-            drafts=dict(drafts),
-            mutations=dict(mutations),
             resources=dict(resources),
         )
 
@@ -1310,7 +1101,6 @@ class ArtifactWorkbench:
     documents: DocumentWorkspace
     revisions: RevisionHistory
     changes: ChangeHistory
-    edit_sessions: DocumentEditSession
     source: DocumentSource
     prompt_annotations: PromptAnnotationApplication
     resources: WorkbenchResourceApplication

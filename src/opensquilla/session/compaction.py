@@ -20,6 +20,7 @@ from opensquilla.env import trust_env as _trust_env
 from opensquilla.provider.app_attribution import provider_app_headers
 from opensquilla.provider.failures import classify_provider_error
 from opensquilla.provider.protocol import provider_connection_config
+from opensquilla.provider.replay_budget import project_message_replay_budget
 from opensquilla.provider.tokenrhythm_correlation import (
     redact_tokenrhythm_install_ids,
     tokenrhythm_correlation_headers,
@@ -531,7 +532,7 @@ def estimate_entry_model_replay_tokens(entry: Any) -> int:
         # reasoning. Only application-added artifact facts supplement them;
         # the turn's display aggregates must not count a second time.
         artifact_context = artifact_history_context(_entry_get(entry, "content"))
-        return _estimate_tokens(_json_text(assistant_replay)) + (
+        return _estimate_tokens(_json_text(_assistant_replay_budget_payload(assistant_replay))) + (
             _estimate_tokens(artifact_context) if artifact_context else 0
         )
 
@@ -558,6 +559,18 @@ def estimate_entry_model_replay_tokens(entry: Any) -> int:
     return content_tokens + extra_tokens
 
 
+def _assistant_replay_budget_payload(replay: Any) -> Any:
+    if not isinstance(replay, Mapping) or not isinstance(replay.get("messages"), list):
+        return replay
+    return {
+        **replay,
+        "messages": [
+            project_message_replay_budget(message) if isinstance(message, Mapping) else message
+            for message in replay["messages"]
+        ],
+    }
+
+
 def _entry_model_replay_payload(entry: Any) -> dict[str, Any]:
     """Return only fields that can affect provider-visible history replay."""
 
@@ -567,7 +580,10 @@ def _entry_model_replay_payload(entry: Any) -> dict[str, Any]:
     }
     assistant_replay = _entry_get(entry, "assistant_replay")
     if assistant_replay is not None:
-        replay_payload = {"role": payload["role"], "assistant_replay": assistant_replay}
+        replay_payload = {
+            "role": payload["role"],
+            "assistant_replay": _assistant_replay_budget_payload(assistant_replay),
+        }
         artifact_context = artifact_history_context(payload["content"])
         if artifact_context:
             replay_payload["artifact_context"] = artifact_context

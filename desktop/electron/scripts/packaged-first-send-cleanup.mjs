@@ -6,6 +6,38 @@ import { closeElectronWithDeadline } from './e2e-shutdown-helpers.mjs'
 const ELECTRON_CLEANUP_TIMEOUT_MS = 100_000
 const PROVIDER_CLEANUP_TIMEOUT_MS = 15_000
 
+export function expectedShutdownCancellationIndices(records) {
+  const positions = ['before_quit', 'quit_gateway_shutdown_requested', 'quit_gateway_exit']
+    .map(event => records.flatMap((record, index) => record?.event === event ? [index] : []))
+  // Multiple or incomplete quit attempts cannot establish one cancellation interval.
+  if (positions.some(indices => indices.length !== 1)) return new Set()
+  const [[before], [accepted], [exited]] = positions
+  if (!(before < accepted && accepted < exited)
+    || records[accepted].accepted !== true
+    || records[exited].exited !== true
+    || records[exited].hardTerminated !== false) return new Set()
+
+  const expected = new Set()
+  for (let index = before; index <= exited; index += 1) {
+    const record = records[index]
+    if (!record || record.event === 'quit_gateway_drain_failed'
+      || record.event === 'quit_gateway_still_running'
+      || record.event === 'renderer_unresponsive'
+      || record.event === 'renderer_process_gone'
+      || record.event === 'renderer_console_suppressed'
+      || (record.event === 'desktop_exit_phase' && record.to === 'running')) return new Set()
+    if (record.event === 'renderer_console') {
+      if (index > accepted && index < exited && record.level === 'error'
+        && record.message === '[useSessions] session directory error: Connection closed') {
+        expected.add(index)
+      } else {
+        return new Set()
+      }
+    }
+  }
+  return expected
+}
+
 export async function captureFirstSendDiagnostic(operation, timeoutMs = 3_000) {
   const controller = new AbortController()
   try {

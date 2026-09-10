@@ -6,14 +6,9 @@ import type {
   ArtifactDocument,
   ArtifactDocumentWorkspace,
   ArtifactEditCapabilities,
-  ArtifactEditSession,
-  ArtifactEditSessionCloseRequest,
-  ArtifactEditSessionHeartbeatRequest,
-  ArtifactEditSessionStartRequest,
   ArtifactMutationResolution,
   ArtifactMutationResolutionRequest,
   ArtifactRevision,
-  ArtifactSourcePatchResult,
   ArtifactSourceSnapshot,
 } from '@/types/artifactDocuments'
 import type { ArtifactPayload } from '@/types/artifacts'
@@ -29,14 +24,6 @@ import type {
   WorkbenchResourcesListResponse,
   WorkbenchResourceType,
 } from '@/types/workbenchResources'
-import type {
-  PromptAnnotation,
-  PromptAnnotationCreateRequest,
-  PromptAnnotationDiscardRequest,
-  PromptAnnotationFocusRequest,
-  PromptAnnotationFocusResult,
-  PromptAnnotationUpdateRequest,
-} from '@/types/promptAnnotations'
 
 export interface OpenArtifactDocument {
   readonly sessionKey: string
@@ -73,25 +60,6 @@ export interface ReadArtifactSource extends CloseArtifactDocument {
   readonly revisionId?: string
 }
 
-export interface ArtifactSourceChange {
-  readonly startOffset: number
-  readonly endOffset: number
-  readonly replacement: string
-}
-
-export interface PatchArtifactSource extends CloseArtifactDocument {
-  readonly expectedHeadRevisionId: string
-  readonly expectedSourceSha256: string
-  readonly expectedStateRevision: number
-  readonly patches: readonly [ArtifactSourceChange, ...ArtifactSourceChange[]]
-  readonly offsetEncoding?: 'unicode-code-point'
-  readonly editSessionId?: string
-  readonly expectedEditSessionStateRevision?: number
-  readonly expectedLastSavedRevisionId?: string
-  readonly clientRequestId?: string
-  readonly idempotencyKey?: string
-}
-
 export interface ArtifactDocumentProvider {
   getCapabilities(signal?: AbortSignal): Promise<ArtifactEditCapabilities>
   listDocuments(sessionKey: string, signal?: AbortSignal): Promise<ArtifactDocument[]>
@@ -100,17 +68,13 @@ export interface ArtifactDocumentProvider {
   listRevisions(documentId: string, sessionKey: string, signal?: AbortSignal): Promise<ArtifactRevision[]>
   listChangeSets(documentId: string, sessionKey: string, signal?: AbortSignal): Promise<ArtifactChangeSet[]>
   getChangeSet(documentId: string, changeSetId: string, sessionKey: string, signal?: AbortSignal): Promise<ArtifactChangeSet | null>
-  openDocument(request: OpenArtifactDocument, signal?: AbortSignal): Promise<{ document: ArtifactDocument | null; editSession: ArtifactEditSession | null }>
+  openDocument(request: OpenArtifactDocument, signal?: AbortSignal): Promise<{ document: ArtifactDocument | null }>
   closeDocument(request: CloseArtifactDocument, signal?: AbortSignal): Promise<ArtifactDocument | null>
   renameDocument(request: RenameArtifactDocument, signal?: AbortSignal): Promise<ArtifactDocument | null>
   restoreRevision(request: RestoreArtifactRevision, signal?: AbortSignal): Promise<ArtifactRevision | null>
   revertChangeSet(request: RevertArtifactChangeSet, signal?: AbortSignal): Promise<ArtifactChangeSet | null>
   readSource(request: ReadArtifactSource, signal?: AbortSignal): Promise<ArtifactSourceSnapshot | null>
-  patchSource(request: PatchArtifactSource, signal?: AbortSignal): Promise<ArtifactSourcePatchResult | null>
   resolveMutation?(request: ArtifactMutationResolutionRequest, signal?: AbortSignal): Promise<ArtifactMutationResolution | null>
-  startEditSession?(request: ArtifactEditSessionStartRequest, signal?: AbortSignal): Promise<ArtifactEditSession | null>
-  heartbeatEditSession?(request: ArtifactEditSessionHeartbeatRequest, signal?: AbortSignal): Promise<ArtifactEditSession | null>
-  closeEditSession?(request: ArtifactEditSessionCloseRequest, signal?: AbortSignal): Promise<ArtifactEditSession | null>
 }
 
 export interface WorkbenchResourceProvider {
@@ -123,14 +87,6 @@ export interface WorkbenchResourceProvider {
   importDocument(request: { sessionKey: string; source: WorkbenchResourceRef; expectedSha256: string; idempotencyKey: string; name?: string }, signal?: AbortSignal): Promise<DocumentImportResponse>
   publishDocument(request: { sessionKey: string; documentId: string; revisionId: string; idempotencyKey: string; name?: string }, signal?: AbortSignal): Promise<DocumentPublishResponse>
   resolveMutation?(request: ArtifactMutationResolutionRequest, signal?: AbortSignal): Promise<ArtifactMutationResolution | null>
-}
-
-export interface ArtifactPromptAnnotationProvider {
-  list(sessionKey: string, signal?: AbortSignal): Promise<PromptAnnotation[]>
-  create(request: PromptAnnotationCreateRequest): Promise<PromptAnnotation | null>
-  update(request: PromptAnnotationUpdateRequest): Promise<PromptAnnotation | null>
-  discard(request: PromptAnnotationDiscardRequest): Promise<PromptAnnotation | null>
-  focus(request: PromptAnnotationFocusRequest): Promise<PromptAnnotationFocusResult | null>
 }
 
 export interface ArtifactDocumentChange {
@@ -336,6 +292,7 @@ export interface ArtifactPreviewLease {
   preview_origin: string | null
   idle_timeout_seconds: number
   source: ArtifactPreviewLeaseSource
+  workingDocumentId?: string
 }
 
 export interface ArtifactPreviewLeaseRenewal {
@@ -389,7 +346,6 @@ export interface ArtifactWorkbench {
   readonly artifacts: ArtifactCatalog
   readonly documents: ArtifactDocumentProvider
   readonly resources: WorkbenchResourceProvider
-  readonly promptAnnotations: ArtifactPromptAnnotationProvider
   readonly content: ArtifactContentAccess
   readonly previews: ArtifactPreviewAccess
   subscribeDocumentChanges(

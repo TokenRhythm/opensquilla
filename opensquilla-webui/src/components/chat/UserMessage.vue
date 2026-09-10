@@ -418,7 +418,7 @@ function attachmentCanOpen(attachment: DisplayAttachment): boolean {
   const resource = workbenchAttachmentResource(attachment)
   if (!resource) return false
   if (!props.workbenchResourcePreviewEnabled && !props.workbenchResourceEditEnabled) return false
-  return resource.capabilities.preview === true || resource.capabilities.manualEdit === true
+  return resource.capabilities.preview === true || resource.capabilities.edit === true
 }
 
 function attachmentOpenReason(attachment: DisplayAttachment): string {
