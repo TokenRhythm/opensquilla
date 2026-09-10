@@ -74,7 +74,6 @@ def assemble_system_prompt(
         "memory": memory,
         "timezone": timezone,
         "prompt_mode": profile.prompt_mode,
-        "patch_evidence_protocol": profile.patch_evidence_protocol,
         "finalize_evidence_gate": profile.finalize_evidence_gate,
         "runtime_info": runtime_info,
         "docs_path": docs_path,

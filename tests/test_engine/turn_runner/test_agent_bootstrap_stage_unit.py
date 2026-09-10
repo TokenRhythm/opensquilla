@@ -101,6 +101,15 @@ def _default_aux(
     )
 
 
+def test_retired_auxiliary_fields_can_be_omitted_by_harness() -> None:
+    fields = vars(_default_aux()).copy()
+    fields.pop("runtime_state_capsule_mode")
+    fields.pop("text_only_tool_recovery_mode")
+    aux = _AgentConfigAuxiliaries(**fields)
+    assert aux.runtime_state_capsule_mode is None
+    assert aux.text_only_tool_recovery_mode is None
+
+
 @dataclass
 class _RecordingTimeoutBudget:
     budgets: _ResolvedBudgets = field(default_factory=_default_budgets)
@@ -377,6 +386,13 @@ async def test_length_capped_continuations_threads_to_agent_config() -> None:
 
 
 _RETIRED_EXPERIMENT_ENV_FIELDS = {
+    "OPENSQUILLA_FINALIZE_EVIDENCE_STRICT": "finalize_evidence_strict",
+    "OPENSQUILLA_FINALIZE_VARIANT_CHALLENGE": "finalize_variant_challenge",
+    "OPENSQUILLA_SUBMIT_REVIEW": "submit_review_enabled",
+    "OPENSQUILLA_TOOL_LOOP_OBSERVER_MODE": "tool_loop_observer_mode",
+    "OPENSQUILLA_RUNTIME_STATE_CAPSULE_MODE": "runtime_state_capsule_mode",
+    "OPENSQUILLA_TEXT_ONLY_TOOL_RECOVERY_MODE": "text_only_tool_recovery_mode",
+    "OPENSQUILLA_DEADLINE_THINKING_OFF_MARGIN_SECONDS": "deadline_thinking_off_margin_seconds",
     "OPENSQUILLA_REASONING_STREAM_CHAR_CAP": "reasoning_stream_char_cap",
     "OPENSQUILLA_PLACEHOLDER_ESCALATION_THRESHOLD": "placeholder_escalation_threshold",
     "OPENSQUILLA_MID_BUDGET_NO_DIFF_NUDGE": "mid_budget_no_diff_nudge",
@@ -414,6 +430,14 @@ async def test_retired_experiment_env_does_not_activate_agent_config(monkeypatch
 
 def test_retired_experiment_agent_config_keywords_remain_constructible() -> None:
     legacy_values = {
+        "finalize_evidence_strict": True,
+        "finalize_variant_challenge": True,
+        "submit_review_enabled": True,
+        "submit_review_diff_max_chars": 10,
+        "tool_loop_observer_mode": "log",
+        "runtime_state_capsule_mode": "inject",
+        "text_only_tool_recovery_mode": "warn_model",
+        "deadline_thinking_off_margin_seconds": 120,
         "reasoning_stream_char_cap": 500,
         "placeholder_escalation_threshold": 2,
         "mid_budget_no_diff_nudge": True,
@@ -999,7 +1023,7 @@ async def test_fresh_diagnostic_env_overrides_agent_token_config(monkeypatch) ->
 
 
 @pytest.mark.asyncio
-async def test_text_only_tool_recovery_env_overrides_config(monkeypatch) -> None:
+async def test_retired_text_only_tool_recovery_env_is_ignored(monkeypatch) -> None:
     monkeypatch.setenv("OPENSQUILLA_TEXT_ONLY_TOOL_RECOVERY_MODE", "warn_model")
     stage = _make_stage(
         aux=_RecordingAgentConfigBuilder(
@@ -1009,7 +1033,7 @@ async def test_text_only_tool_recovery_env_overrides_config(monkeypatch) -> None
 
     out = await stage.run(_make_input())
 
-    assert out.output.agent_config.text_only_tool_recovery_mode == "warn_model"
+    assert out.output.agent_config.text_only_tool_recovery_mode == "off"
 
 
 @pytest.mark.asyncio

@@ -69,19 +69,6 @@ SOUL.md defines durable voice and persona guidance for this workspace. Treat it 
 
 {% endif -%}
 
-{% if tools and patch_evidence_protocol -%}
-## Patch Evidence Protocol
-
-- Fix the underlying issue behavior, not just the symptom reproduced by a self-written script.
-- Prefer existing issue-relevant tests or focused package-level tests as final confirmation. A self-written repro is useful for diagnosis, but it is not sufficient final evidence by itself unless no existing test path is available.
-- Keep the patch minimal and localized to the issue behavior. If two serious attempts under the same hypothesis fail, change hypothesis or inspect a different implementation layer.
-- Do not modify existing test expectations unless the task explicitly asks for test changes.
-- After editing a core source file, run at least one neighboring existing test or a package-level focused test when feasible, to catch regressions in adjacent behavior.
-- Before finalizing, inspect the final diff and verify that every changed file directly supports the issue fix.
-- In the final response, briefly name the strongest command/output evidence that supports the patch, and mention residual failures only if they are unrelated or pre-existing.
-
-{% endif -%}
-
 {% if tools and finalize_evidence_gate -%}
 ## Reproduction Evidence
 
