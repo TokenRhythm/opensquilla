@@ -2744,20 +2744,23 @@ class GatewayConfig(BaseSettings):
     webui_stream_idle_grace_seconds: float = 630.0
     # Maximum time the WebUI WebSocket may sit silent before the gateway
     # closes it with code 1011 and emits ``gateway.client_ws_keepalive_timeout``.
-    # ``0`` disables the keepalive deadline entirely (legacy behaviour).
-    # Sleeping browsers commonly stop sending pings; without this knob the
-    # server retains half-open connections after suspend.
-    client_ws_keepalive_timeout_s: float = 120.0
+    # Disabled by default: sleeping renderers stop application pings without
+    # implying a dead transport. Native WebSocket keepalive remains enabled.
+    client_ws_keepalive_timeout_s: float = 0.0
+    # New consumption feedback is opt-in until every client data domain can
+    # acknowledge application or safely reconcile an explicitly dirty stream.
+    ws_transport_flow_enabled: bool = False
     # WebSocket per-connection outbound writer queue. When enabled, every connection gets a
     # bounded asyncio.Queue + dedicated writer task; producers enqueue and
-    # return immediately. Slow clients trigger a fast 1011 close instead of
-    # back-pressuring the turn pipeline. Kill switch is read at connection
+    # return immediately. Legacy peers retain overflow-close protection;
+    # negotiated flow peers instead pause replayable streams and reconcile.
+    # Kill switch is read at connection
     # registration time only — affects new connections only; existing
     # connections retain their startup-time behavior.
     ws_writer_queue_enabled: bool = True
-    # Per-connection outbox depth. 512 is ~17s of buffered text_delta at
-    # 30 Hz, comfortably within the SessionStreamRegistry replay window
-    # (max_events_per_session=500). Minimum 16 to avoid pathological
+    # Per-connection outbox depth. This bounds wire work, not session replay:
+    # capability filtering and concurrent sessions make those counts distinct.
+    # Minimum 16 to avoid pathological
     # configurations that can never enqueue.
     ws_writer_queue_maxsize: int = Field(default=512, ge=16)
     # Legacy alias for the old runtime timeout setting. Kept so existing

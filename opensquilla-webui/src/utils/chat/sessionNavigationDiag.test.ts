@@ -6,6 +6,7 @@ import {
   readSessionNavigationDiag,
   recordRpcTransportDiag,
   recordSessionNavigationDiag,
+  SESSION_NAVIGATION_DIAG_LIMIT,
   SESSION_NAVIGATION_DIAG_STORAGE_KEY,
   setSessionNavigationDiagStorageForTest,
   type SessionNavigationDiagStorage,
@@ -30,6 +31,45 @@ class MemoryStorage implements SessionNavigationDiagStorage {
 describe('sessionNavigationDiag', () => {
   afterEach(() => {
     setSessionNavigationDiagStorageForTest(null)
+  })
+
+  it('persists finite non-negative recovery metrics while filtering URLs, credentials and bodies', () => {
+    const memory = new MemoryStorage()
+    setSessionNavigationDiagStorageForTest(memory)
+    recordRpcTransportDiag({
+      phase: 'hello', generation: 5, recoveryMs: 0, loopLagMs: 12.5, maxLoopLagMs: 9000,
+      url: 'ws://private.example/ws', token: 'PRIVATE_TOKEN', payload: { text: 'PRIVATE_BODY' },
+      message: 'PRIVATE_MESSAGE',
+    })
+    expect(readSessionNavigationDiag()[0]).toMatchObject({
+      source: 'rpc.transport', recoveryMs: 0, loopLagMs: 12.5, maxLoopLagMs: 9000,
+    })
+    const serialized = memory.getItem(SESSION_NAVIGATION_DIAG_STORAGE_KEY) ?? ''
+    for (const secret of ['private.example', 'PRIVATE_TOKEN', 'PRIVATE_BODY', 'PRIVATE_MESSAGE']) {
+      expect(serialized).not.toContain(secret)
+    }
+  })
+
+  it.each([-1, Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY, '100', null, undefined, {}])(
+    'does not persist an invalid recovery metric value %s', value => {
+      setSessionNavigationDiagStorageForTest(new MemoryStorage())
+      recordRpcTransportDiag({ phase: 'hello', generation: 5, recoveryMs: value, loopLagMs: value, maxLoopLagMs: value })
+      const entry = readSessionNavigationDiag()[0]
+      expect(entry).not.toHaveProperty('recoveryMs')
+      expect(entry).not.toHaveProperty('loopLagMs')
+      expect(entry).not.toHaveProperty('maxLoopLagMs')
+    },
+  )
+
+  it('keeps recovery metrics in the existing bounded 200-entry diagnostic ring', () => {
+    setSessionNavigationDiagStorageForTest(new MemoryStorage())
+    for (let index = 0; index < SESSION_NAVIGATION_DIAG_LIMIT + 5; index++) {
+      recordRpcTransportDiag({ phase: 'hello', generation: index, recoveryMs: index, loopLagMs: 0, maxLoopLagMs: 0 })
+    }
+    const entries = readSessionNavigationDiag()
+    expect(entries).toHaveLength(200)
+    expect(entries[0].recoveryMs).toBe(204)
+    expect(entries[entries.length - 1].recoveryMs).toBe(5)
   })
 
   it('records newest entries first with opaque session correlation', () => {

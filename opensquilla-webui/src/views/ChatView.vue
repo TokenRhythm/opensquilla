@@ -139,23 +139,11 @@
           </div>
         </template>
         <ChatSessionRecoveryStatus
-          v-if="!forkTransition && historyState.sessionMissing"
-          :key="`${sessionKey}:missing`"
-          state="session-missing"
-        />
-        <ChatSessionRecoveryStatus
-          v-else-if="!forkTransition && visibleHistoryRecoveryState"
-          :key="`${sessionKey}:history`"
-          :state="visibleHistoryRecoveryState"
+          v-if="!forkTransition && recoveryNoticeVisible && recoveryNoticeState"
+          :state="recoveryNoticeState"
           :transport-state="gatewayConnectionState"
-          @retry="retryHistory"
-        />
-        <ChatSessionRecoveryStatus
-          v-if="!forkTransition && liveRecoveryState"
-          :key="`${sessionKey}:live`"
-          :state="liveRecoveryState"
-          :transport-state="gatewayConnectionState"
-          @retry="retryLive"
+          automatic
+          @retry="recoveryNoticeState.startsWith('live-') ? retryLive() : retryHistory()"
         />
         <div
           v-if="!forkTransition && showConfirmedEmptySession"
@@ -806,6 +794,7 @@ import ChatComposer from '@/components/chat/ChatComposer.vue'
 import ProjectWorkspacePickerDialog from '@/components/ProjectWorkspacePickerDialog.vue'
 import ChatMessageList from '@/components/chat/ChatMessageList.vue'
 import ChatSessionRecoveryStatus from '@/components/chat/ChatSessionRecoveryStatus.vue'
+import { useChatRecoveryNotice } from '@/composables/chat/useChatRecoveryNotice'
 import ChatStallNotice from '@/components/chat/ChatStallNotice.vue'
 import ClarifyCard from '@/components/chat/ClarifyCard.vue'
 import ConversationMinimap from '@/components/chat/ConversationMinimap.vue'
@@ -929,6 +918,7 @@ import {
 } from '@/modules/conversationSessionRuntime'
 import {
   SESSION_READ_LIFECYCLE_FACTORY_KEY,
+  SessionReadFailure,
   type SessionReadMetadata,
   type SessionReadPortLease,
   type SessionReadSnapshot,
@@ -1649,12 +1639,16 @@ const conversationSessionRuntime = createConversationSessionRuntime<
   SessionReadPortLease
 >({
   source: conversationEvents,
-  events: { sessionKey: conversationEventSessionKey },
+  events: {
+    sessionKey: conversationEventSessionKey,
+    invalidatesSession: event => event.kind === 'conversation' && event.event.semanticKind === 'session-epoch-changed',
+  },
 })
 const conversationRuntime = conversationSessionRuntime.cursor
 const sessionReadLifecycle = sessionReadLifecycleFactory.create({
   cursor: conversationRuntime,
   subscriptions: conversationSessionRuntime.subscriptions,
+  prepareReadRetirement: key => conversationSessionRuntime.events.prepareReadRetirement(key),
 })
 const activeTaskGroups = ref<Set<string>>(new Set())
 // Task id whose output the live stream renders; binds late events to the
@@ -2571,6 +2565,19 @@ const chatSessionSubscription = useChatSessionSubscription({
   resetStreamIdleTimer,
   resetStreamLiveTurnState,
   onLiveSnapshot: snapshot => restoreLiveTurnSnapshot(snapshot),
+  onReadStarted: () => {
+    conversationSessionRuntime.events.invalidateConsumption(sessionKey.value)
+    rpcEventHandlers.beginRecovery()
+  },
+  reconcileHistory: () => chatHistory.reconcileHistory(),
+  onReconciliationInstalled: async () => {
+    await chatApprovals.reconcile()
+  },
+  onSnapshotInstalled: () => {
+    if (!rpcEventHandlers.finishRecovery()) {
+      throw new SessionReadFailure('busy', 'Session recovery buffer overflow; retrying the latest snapshot.', true)
+    }
+  },
   onAuthoritativeIdle: () => {
     if (pendingQueueOwnerContext.value?.sessionKey !== sessionKey.value) {
       activeRunModeLock.value = null
@@ -2617,6 +2624,7 @@ const chatSessionSubscription = useChatSessionSubscription({
 })
 const {
   subscribeSession,
+  reconcileSession,
   retrySessionMetadata,
   cancelActiveSubscription,
   streamGeneration,
@@ -2633,6 +2641,8 @@ const chatSessionBootstrap = useChatSessionBootstrap({
       : await loadHistory({}, context)
   ),
   subscribeSession,
+  reconcileSession,
+  connectionState: gatewayConnectionState,
   cancelHistory: cancelActiveHistory,
   cancelSubscription: cancelActiveSubscription,
 })
@@ -2677,6 +2687,17 @@ function trackSessionBootstrapAdmission<T extends {
 }
 
 let postBootstrapMetadataStarted = false
+function startPostBootstrapMetadata() {
+  if (postBootstrapMetadataStarted) return
+  postBootstrapMetadataStarted = true
+  pendingFeatureToggleRefresh = false
+  void refreshPostBootstrapMetadata()
+  void loadFeatureToggles().then(() => {
+    if (!chatViewDisposed) unsubs.push(bindFeatureRefresh(scheduleHistorySync))
+  })
+  loadSlashCommands()
+}
+
 function schedulePostBootstrapMetadata(
   run: {
     generation: number
@@ -2693,12 +2714,7 @@ function schedulePostBootstrapMetadata(
         || sessionKey.value !== key
         || !isSessionBootstrapCurrent(run.generation, key)
       ) return
-      postBootstrapMetadataStarted = true
-      void refreshPostBootstrapMetadata()
-      void loadFeatureToggles().then(() => {
-        if (!chatViewDisposed) unsubs.push(bindFeatureRefresh(scheduleHistorySync))
-      })
-      loadSlashCommands()
+      startPostBootstrapMetadata()
     },
     () => {},
   )
@@ -3050,6 +3066,8 @@ function projectAcceptedGoalMessage({
 }
 
 const chatGoals = useChatGoals({
+  connectionEpoch: computed(() => gatewayAccess.subscriptionEpoch),
+  connectionAvailable: () => gatewayAccess.isAvailable && gatewayAccess.isAuthenticated,
   goalCenter,
   goalContinuity,
   sessionKey,
@@ -3815,6 +3833,7 @@ function onPlanQuestionnaireTouchEnd() {
 }
 
 const rpcEventHandlers = useChatRpcEventHandlers({
+  onRecoveryRequired: () => { void recoverCurrentSession() },
   onTaskSettled: (taskId, epoch) => chatPlans.noteTaskSettled(taskId, epoch),
   conversationRuntime,
   sessionKey,
@@ -4076,7 +4095,8 @@ const { stallActive, stallSeconds } = stallWatchdog
 const chatRpcSubscriptions = useChatRpcSubscriptions({
   // The private v4 adapter emits one semantic message. Feed that projection to
   // both business consumers without exposing protocol names in the view.
-  onEvent: (message) => {
+  onEvent: (message, consumption) => {
+    if (consumption && !consumption.isCurrent()) throw new Error('Conversation consumer was superseded.')
     if (message.kind === 'conversation' && message.event.kind === 'known' && message.event.semanticKind !== 'cron-result') {
       stallWatchdog.noteEvent(message.event.semanticKind, message.event.payload)
     } else if (message.kind === 'approval') {
@@ -4085,13 +4105,37 @@ const chatRpcSubscriptions = useChatRpcSubscriptions({
         message.payload,
       )
     }
-    rpcEventHandlers.onConversationEvent(message)
+    return rpcEventHandlers.consumeConversationEvent(message)
   },
+  onRecoveryRequired: recoverCurrentSession,
   onConnectionState: rpcEventHandlers.handlers.onConnectionState,
 }, {
   getSessionKey: () => sessionKey.value,
   runtime: conversationSessionRuntime,
 })
+
+let currentSessionRecovery: Promise<boolean> | null = null
+function recoverCurrentSession(scope?: { readonly keys: readonly string[], readonly global: boolean }): Promise<boolean> {
+  if (scope && (scope.global || scope.keys.length === 0 || scope.keys.some(key => key !== sessionKey.value))) {
+    return Promise.resolve(false)
+  }
+  if (currentSessionRecovery) return currentSessionRecovery
+  const key = sessionKey.value
+  const lease = sessionReadLifecycle.current()
+  const pending = retryLive().then(result => key === sessionKey.value && (
+    result.authoritative
+    // The current owner remains fenced and owns bounded automatic retries (or
+    // a truthful local stale state for an oversized snapshot). A read failure
+    // is not evidence that the shared transport must be recycled.
+    || (lease !== null && sessionReadLifecycle.current() === lease && !result.sessionMissing)
+  ))
+    .catch(() => false)
+  const observed = pending.finally(() => {
+    if (currentSessionRecovery === observed) currentSessionRecovery = null
+  })
+  currentSessionRecovery = observed
+  return observed
+}
 
 // Session switches drop the previous session's stall tracking entirely.
 watch(sessionKey, () => {
@@ -4343,14 +4387,16 @@ const visibleHistoryRecoveryState = computed(() => (
 const liveRecoveryState = computed(() => {
   if (historyState.value.sessionMissing) return null
   if (livePhase.value === 'degraded') return 'live-degraded' as const
-  if (
-    livePhase.value === 'connecting'
-    && historyRecoveryState.value === null
-  ) {
+  if (livePhase.value === 'connecting') {
     return 'live-connecting' as const
   }
   return null
 })
+
+const recoveryNoticeState = computed(() => historyState.value.sessionMissing
+  ? 'session-missing' as const
+  : liveRecoveryState.value ?? visibleHistoryRecoveryState.value)
+const recoveryNoticeVisible = useChatRecoveryNotice(recoveryNoticeState)
 
 const showConfirmedEmptySession = computed(() => shouldShowConfirmedEmptySession({
   isDraftLanding: isNewChatLanding.value,
@@ -6741,6 +6787,7 @@ onUnmounted(() => {
   cancelSessionBootstrap()
   conversationSessionRuntime.dispose()
   pendingSessionOptionalReads = null
+  pendingFeatureToggleRefresh = false
   releaseOptionalRpcAdmission?.()
   releaseOptionalRpcAdmission = null
   cancelActiveProjectValidation()
@@ -6951,9 +6998,19 @@ type SessionOptionalReadRequest = {
 }
 
 let pendingSessionOptionalReads: SessionOptionalReadRequest | null = null
+let pendingFeatureToggleRefresh = false
 
 function flushSessionOptionalReads() {
   if (!optionalSessionRpcAllowed.value) return
+  if (chatViewDisposed || !gatewayAccess.isAvailable) return
+  if (pendingFeatureToggleRefresh) {
+    pendingFeatureToggleRefresh = false
+    // A late first Hello can replace the pre-connection bootstrap generation.
+    // Its retired callback must not strand metadata: the same open gate can
+    // initialize it once, then later Hellos only refresh it (including drafts).
+    if (postBootstrapMetadataStarted) void loadFeatureToggles()
+    else startPostBootstrapMetadata()
+  }
   const pending = pendingSessionOptionalReads
   pendingSessionOptionalReads = null
   if (
@@ -7013,7 +7070,7 @@ watch(sessionKey, () => {
 // for the current Session then; older gateways simply remain on history/live.
 watch(() => gatewayAccess.availability, (state, previous) => {
   if (state !== 'available' || previous === 'available') return
-  void loadFeatureToggles()
+  pendingFeatureToggleRefresh = true
   if (
     sessionKey.value
     && pendingSessionIntent.value !== 'new_chat'
@@ -7023,6 +7080,8 @@ watch(() => gatewayAccess.availability, (state, previous) => {
       artifactMode: 'reconnect',
       forceAnnotations: true,
     })
+  } else {
+    flushSessionOptionalReads()
   }
 })
 

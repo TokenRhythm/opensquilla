@@ -68,6 +68,14 @@ OFFLINE_MARKER_EXCLUSIONS = {
     "tests/test_skills/test_meta_skill_creator_smoke_live.py",
 }
 RECENTLY_ADDED_ACTIVE_TESTS = {
+    # New connection-stability suites use the declared 0.01s provisional floor
+    # until a comparable three-run Windows refresh supplies measured timings.
+    "tests/test_gateway/test_connection_stability_socket.py",
+    "tests/test_gateway/test_snapshot_transfer.py",
+    "tests/test_gateway/test_snapshot_transfer_rpc.py",
+    "tests/test_gateway/test_transport_diagnostics.py",
+    "tests/test_gateway/test_transport_flow.py",
+    "tests/test_gateway/test_websocket_connection_stability.py",
     "tests/test_ci/test_windows_signed_update_audit.py",
     "tests/test_engine/test_attachment_replay_ownership.py",
     "tests/test_engine/test_router_configured_image_policy.py",
