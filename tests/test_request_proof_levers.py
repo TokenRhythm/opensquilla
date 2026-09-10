@@ -4,7 +4,6 @@ Covers OPENSQUILLA_PROVIDER_COMPACTION_PROTECT_RECENT_RESULTS,
 OPENSQUILLA_PROVIDER_COMPACTION_PROTECT_ERROR_RESULTS,
 OPENSQUILLA_PROVIDER_COMPACTION_PROTECT_UNRESOLVED_RESULTS,
 OPENSQUILLA_PROVIDER_COMPACTION_SKIP_PROJECTED,
-OPENSQUILLA_PROVIDER_COMPACTION_STUB_PREVIEW_CHARS, and
 OPENSQUILLA_PROVIDER_COMPACTION_NEVER_WORSE.
 """
 
@@ -528,7 +527,7 @@ _GOLDEN_PROOF_JSON: dict[int, str] = {
         '{"projection_adapter":"synthetic_adapter","execution_status_version":1,"status_projectio'
         'n_mode":"native_or_none","estimated_chars":9240,"estimated_tokens":2310,"proof_budget":1'
         '0300,"raw_proof_budget":10300,"effective_proof_budget":9270,"proof_headroom_chars":1030,'
-        '"fits":true,"compact_needed":true,"compaction_tier":0,"compaction_tiny_guard_chars":0,"c'
+        '"fits":true,"compact_needed":true,"compaction_tier":0,"c'
         'ompaction_protect_recent_assistant":false,"recent_tail_too_large":false,"compaction_not_'
         'smaller":false,"provider_window_mismatch":false,"fallback_reason":null,"top_contributors'
         '":[{"path":"$.messages[5].content[0].content","chars":1778},{"path":"$.messages[3].conte'
@@ -542,7 +541,7 @@ _GOLDEN_PROOF_JSON: dict[int, str] = {
         '{"projection_adapter":"synthetic_adapter","execution_status_version":1,"status_projectio'
         'n_mode":"native_or_none","estimated_chars":7849,"estimated_tokens":1962,"proof_budget":8'
         '800,"raw_proof_budget":8800,"effective_proof_budget":7920,"proof_headroom_chars":880,"fi'
-        'ts":true,"compact_needed":true,"compaction_tier":1,"compaction_tiny_guard_chars":0,"comp'
+        'ts":true,"compact_needed":true,"compaction_tier":1,"comp'
         'action_protect_recent_assistant":false,"recent_tail_too_large":false,"compaction_not_sma'
         'ller":false,"provider_window_mismatch":false,"fallback_reason":null,"top_contributors":['
         '{"path":"$.messages[3].content","chars":1151},{"path":"$.messages[5].content[0].content"'
@@ -555,7 +554,7 @@ _GOLDEN_PROOF_JSON: dict[int, str] = {
         '{"projection_adapter":"synthetic_adapter","execution_status_version":1,"status_projectio'
         'n_mode":"native_or_none","estimated_chars":7406,"estimated_tokens":1851,"proof_budget":8'
         '300,"raw_proof_budget":8300,"effective_proof_budget":7470,"proof_headroom_chars":830,"fi'
-        'ts":true,"compact_needed":true,"compaction_tier":2,"compaction_tiny_guard_chars":0,"comp'
+        'ts":true,"compact_needed":true,"compaction_tier":2,"comp'
         'action_protect_recent_assistant":false,"recent_tail_too_large":false,"compaction_not_sma'
         'ller":false,"provider_window_mismatch":false,"fallback_reason":null,"top_contributors":['
         '{"path":"$.messages[3].content","chars":1151},{"path":"$.messages[5].content[0].content"'
@@ -570,7 +569,7 @@ _GOLDEN_PROOF_JSON: dict[int, str] = {
         '{"projection_adapter":"synthetic_adapter","execution_status_version":1,"status_projectio'
         'n_mode":"native_or_none","estimated_chars":4386,"estimated_tokens":1096,"proof_budget":4'
         '900,"raw_proof_budget":4900,"effective_proof_budget":4388,"proof_headroom_chars":512,"fi'
-        'ts":true,"compact_needed":true,"compaction_tier":3,"compaction_tiny_guard_chars":0,"comp'
+        'ts":true,"compact_needed":true,"compaction_tier":3,"comp'
         'action_protect_recent_assistant":false,"recent_tail_too_large":false,"compaction_not_sma'
         'ller":false,"provider_window_mismatch":false,"fallback_reason":null,"top_contributors":['
         '{"path":"$.messages[4].content[1].input.note","chars":695},{"path":"$.messages[2].reason'
@@ -586,7 +585,7 @@ _GOLDEN_PROOF_JSON: dict[int, str] = {
         '{"projection_adapter":"synthetic_adapter","execution_status_version":1,"status_projectio'
         'n_mode":"native_or_none","estimated_chars":2043,"estimated_tokens":510,"proof_budget":26'
         '00,"raw_proof_budget":2600,"effective_proof_budget":2088,"proof_headroom_chars":512,"fit'
-        's":true,"compact_needed":true,"compaction_tier":4,"compaction_tiny_guard_chars":0,"compa'
+        's":true,"compact_needed":true,"compaction_tier":4,"compa'
         'ction_protect_recent_assistant":false,"recent_tail_too_large":false,"compaction_not_smal'
         'ler":false,"provider_window_mismatch":false,"fallback_reason":null,"top_contributors":[{'
         '"path":"$.messages[4].content[1].input.note","chars":695},{"path":"$.messages[7].content'
@@ -604,7 +603,7 @@ _GOLDEN_RAISE_PROOF_JSON = (
     '{"projection_adapter":"synthetic_adapter","execution_status_version":1,"status_projectio'
     'n_mode":"native_or_none","estimated_chars":4386,"estimated_tokens":1096,"proof_budget":4'
     '00,"raw_proof_budget":400,"effective_proof_budget":300,"proof_headroom_chars":100,"fits"'
-    ':false,"compact_needed":true,"compaction_tier":4,"compaction_tiny_guard_chars":0,"compac'
+    ':false,"compact_needed":true,"compaction_tier":4,"compac'
     'tion_protect_recent_assistant":false,"recent_tail_too_large":true,"compaction_not_smalle'
     'r":false,"provider_window_mismatch":false,"fallback_reason":"provider_request_budget_exh'
     'austed","top_contributors":[{"path":"$.messages[4].content[1].input.note","chars":695},{'
@@ -874,60 +873,6 @@ def test_skip_projected_can_be_rolled_back() -> None:
     assert "[provider_request_compacted:" in compacted["messages"][0]["content"]
 
 
-def test_stub_preview_on_argument_string_stub(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv(STUB_PREVIEW_CHARS_ENV, "11")
-    value = "abcdefghijklmnopqrstuvwxyz" * 12
-    compacted = _compact_argument_string(value, preview=False)
-    head, marker, tail = compacted.split("\n\n")
-    assert head == value[:11]
-    assert tail == value[-11:]
-    assert marker.startswith("[provider_request_tool_input_compacted:")
-
-
-def test_stub_preview_on_tool_arguments_fallback_stub(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setenv(STUB_PREVIEW_CHARS_ENV, "11")
-    value = "plain text arguments that are not json " * 40
-    stub = json.loads(_compact_tool_arguments(value, preview=False))
-    assert stub["preview_head"] == value[:11]
-    assert stub["preview_tail"] == value[-11:]
-    assert stub["original_chars"] == len(value)
-
-
-def test_stub_preview_on_tool_input_stub_extends_head_and_tail(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    value = {f"key_{index:02d}": "v" * 400 for index in range(20)}
-    raw = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-    baseline = _compact_tool_input(value)
-    monkeypatch.setenv(STUB_PREVIEW_CHARS_ENV, "500")
-    stub = _compact_tool_input(value)
-    assert stub["_opensquilla_compacted_tool_input"] is True
-    assert stub["head"] == raw[:500]
-    assert stub["tail"] == raw[-500:]
-    assert "preview_head" not in stub
-    assert len(stub["head"]) > len(baseline["head"])
-
-
-def test_stub_preview_on_tool_input_stub_subsumed_by_builtin_previews(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    value = {f"key_{index:02d}": "v" * 40 for index in range(20)}
-    baseline = _compact_tool_input(value)
-    monkeypatch.setenv(STUB_PREVIEW_CHARS_ENV, "11")
-    assert _compact_tool_input(value) == baseline
-
-
-def test_stub_preview_on_final_cap_stub(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv(STUB_PREVIEW_CHARS_ENV, "11")
-    arguments = json.dumps({"command": "inspect the build artifacts carefully " * 20})
-    stub = json.loads(_compact_tool_arguments_for_final_cap(arguments))
-    assert stub["_invalid_provider_context_arguments"] is True
-    assert stub["preview_head"] == arguments[:11]
-    assert stub["preview_tail"] == arguments[-11:]
-
-
 def test_stub_preview_never_leaks_scrubbed_arguments(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -937,56 +882,24 @@ def test_stub_preview_never_leaks_scrubbed_arguments(
     assert stub == {"_invalid_provider_context_arguments": True}
 
 
-def test_stub_preview_off_values(monkeypatch: pytest.MonkeyPatch) -> None:
-    value = "abcdefghijklmnopqrstuvwxyz" * 12
-    expected = _compact_argument_string(value, preview=False)
-    for off_value in ("", "0", "garbage", "false"):
-        monkeypatch.setenv(STUB_PREVIEW_CHARS_ENV, off_value)
-        assert _compact_argument_string(value, preview=False) == expected
-        assert "preview_head" not in expected
-
-
-def test_oversized_stub_preview_skipped_on_argument_string_stub(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    value = "abcdefghijklmnopqrstuvwxyz" * 12
-    baseline = _compact_argument_string(value, preview=False)
-    monkeypatch.setenv(STUB_PREVIEW_CHARS_ENV, str(len(value)))
-    assert _compact_argument_string(value, preview=False) == baseline
-    monkeypatch.setenv(STUB_PREVIEW_CHARS_ENV, str(len(value) // 2))
-    assert _compact_argument_string(value, preview=False) == baseline
-
-
-def test_oversized_stub_preview_skipped_on_tool_arguments_fallback_stub(
-    monkeypatch: pytest.MonkeyPatch,
+@pytest.mark.parametrize("legacy_value", ["0", "11", "500", "5000", "invalid"])
+def test_retired_stub_preview_cannot_change_default_stub_payloads(
+    monkeypatch: pytest.MonkeyPatch, legacy_value: str
 ) -> None:
     value = "plain text arguments that are not json " * 40
-    baseline = _compact_tool_arguments(value, preview=False)
-    monkeypatch.setenv(STUB_PREVIEW_CHARS_ENV, "5000")
-    compacted = _compact_tool_arguments(value, preview=False)
-    assert compacted == baseline
-    assert "preview_head" not in json.loads(compacted)
-    assert len(compacted) < len(value)
-
-
-def test_oversized_stub_preview_skipped_on_tool_input_stub(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    value = {f"key_{index:02d}": "v" * 40 for index in range(20)}
-    baseline = _compact_tool_input(value)
-    monkeypatch.setenv(STUB_PREVIEW_CHARS_ENV, "5000")
-    stub = _compact_tool_input(value)
-    assert stub == baseline
-    assert "preview_head" not in stub
-
-
-def test_oversized_stub_preview_skipped_on_final_cap_stub(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    arguments = json.dumps({"command": "inspect the build artifacts carefully"})
-    monkeypatch.setenv(STUB_PREVIEW_CHARS_ENV, "5000")
-    stub = json.loads(_compact_tool_arguments_for_final_cap(arguments))
-    assert stub == {"_invalid_provider_context_arguments": True}
+    tool_input = {f"key_{index:02d}": "v" * 400 for index in range(20)}
+    sites = (
+        lambda: _compact_argument_string(value, preview=False),
+        lambda: _compact_tool_arguments(value, preview=False),
+        lambda: _compact_tool_arguments_for_final_cap(value),
+        lambda: _compact_tool_input(tool_input),
+    )
+    baseline = [site() for site in sites]
+    raw = json.dumps(tool_input, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    assert baseline[-1]["head"] == raw[:360]
+    assert baseline[-1]["tail"] == raw[-120:]
+    monkeypatch.setenv(STUB_PREVIEW_CHARS_ENV, legacy_value)
+    assert [site() for site in sites] == baseline
 
 
 def test_never_worse_keeps_tiny_argument_value(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1062,41 +975,6 @@ def test_protect_recent_results_explicit_off_values_roll_back(
         compacted = _compact_tool_payload_once(_tier1_entries_payload())
         for content in _entry_contents(compacted):
             assert "[provider_request_compacted:" in content
-
-
-def test_stub_preview_alone_never_grows_scrub_path_stub(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    # The tool_use-input scrub runs on every request before tier 0; previews
-    # must never grow a fitting payload (regression: duplicated head/tail).
-    monkeypatch.setenv(STUB_PREVIEW_CHARS_ENV, "330")
-    value = {f"k{index:02d}": "v" * 55 for index in range(11)}
-    baseline = _compact_tool_input(value)
-    stub = _compact_tool_input(value)
-    assert _payload_chars(stub) <= _payload_chars(value)
-    assert stub == baseline
-
-
-def test_stub_preview_alone_never_grows_any_stub_site(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    # Previews either leave the site's output identical to lever-off or
-    # produce a replacement strictly smaller than the original value.
-    text = "sample argument text under compaction pressure " * 90
-    sites = (
-        lambda value: _compact_argument_string(value, preview=False),
-        lambda value: _compact_tool_arguments(value, preview=False),
-        _compact_tool_arguments_for_final_cap,
-    )
-    for preview_chars in ("47", "330"):
-        for size in (95, 700, 705, 720, 1393, 4000):
-            value = text[:size]
-            for site in sites:
-                monkeypatch.delenv(STUB_PREVIEW_CHARS_ENV, raising=False)
-                off_output = site(value)
-                monkeypatch.setenv(STUB_PREVIEW_CHARS_ENV, preview_chars)
-                on_output = site(value)
-                assert on_output == off_output or len(on_output) < len(value)
 
 
 def test_protect_error_results_ignores_quoted_error_fragments(

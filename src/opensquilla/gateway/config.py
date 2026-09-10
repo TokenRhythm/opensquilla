@@ -1406,6 +1406,7 @@ class AgentTokenSavingConfig(BaseSettings):
 
     # Tokenjuice projection is the default tool-result path.
     tool_result_projection_max_inline_chars: int = Field(default=60_000, ge=1000)
+    # Deprecated, unused. Accepted so existing configuration still loads.
     tool_result_fresh_diagnostic_policy_enabled: bool = Field(default=False)
     tool_result_diagnostic_retrieval_gate_enabled: bool = Field(default=False)
     tool_result_fresh_diagnostic_inline_max_chars: int = Field(default=64_000, ge=0)

@@ -368,7 +368,7 @@ async def test_agent_projects_tokenjuice_without_context_window_gate(
 
 
 @pytest.mark.asyncio
-async def test_fresh_diagnostic_under_cap_is_preserved_to_next_provider_call(
+async def test_retired_fresh_diagnostic_flag_does_not_bypass_tokenjuice(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     calls: list[dict[str, Any]] = []
@@ -416,11 +416,12 @@ async def test_fresh_diagnostic_under_cap_is_preserved_to_next_provider_call(
     assert len(provider.calls) == 2
     second_call_tool_result = _last_tool_result_content(provider.calls[1])
     assert second_call_tool_result == raw_output
-    assert calls == []
+    assert len(calls) == 1
     projected_event = next(event for event in events if isinstance(event, ToolResultEvent))
     assert projected_event.result == raw_output
-    assert agent.config.metadata["tool_projection_fresh_diagnostic_one_hop_preserves"] == 1
-    assert agent.config.metadata["tool_projection_fresh_diagnostic_results"] == 1
+    # No retrieval surface means the raw result still survives by the normal
+    # Store/retrieval contract, not the retired one-hop diagnostic policy.
+    assert not any("fresh_diagnostic" in key for key in agent.config.metadata)
 
 
 @pytest.mark.asyncio
@@ -896,9 +897,7 @@ async def test_run_turn_feeds_tokenjuice_reduced_tool_result_to_next_provider_ca
     assert "AssertionError" in second_call_tool_result
     assert "rootdir:" not in second_call_tool_result
     assert agent.config.metadata["tool_projection_backend"] == "tokenjuice"
-    assert agent.config.metadata["tool_projection_fresh_diagnostic_results"] == 1
-    assert agent.config.metadata["tool_projection_fresh_diagnostic_projections"] == 1
-    assert "tool_projection_fresh_diagnostic_one_hop_preserves" not in agent.config.metadata
+    assert not any("fresh_diagnostic" in key for key in agent.config.metadata)
     projected_event = next(event for event in events if isinstance(event, ToolResultEvent))
     delta_fragments = [
         event.json_fragment for event in events if isinstance(event, ToolUseDeltaEvent)
@@ -910,7 +909,7 @@ async def test_run_turn_feeds_tokenjuice_reduced_tool_result_to_next_provider_ca
 
 
 @pytest.mark.asyncio
-async def test_projected_diagnostic_requires_focused_retrieval_before_edit(
+async def test_retired_diagnostic_gate_does_not_force_retrieval_before_edit(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path,
 ) -> None:
@@ -997,11 +996,14 @@ async def test_projected_diagnostic_requires_focused_retrieval_before_edit(
         and event.is_error
         and "retrieve_tool_result" in event.result
     ]
-    assert blocked
-    assert executed_tool_names == ["exec_command", "retrieve_tool_result", "apply_patch"]
-    assert agent.config.metadata["tool_projection_fresh_diagnostic_projections"] == 1
-    assert agent.config.metadata["tool_projection_diagnostic_retrieval_gate_blocks"] == 1
-    assert agent.config.metadata["tool_projection_diagnostic_retrievals"] == 1
+    assert not blocked
+    assert executed_tool_names == [
+        "exec_command",
+        "apply_patch",
+        "retrieve_tool_result",
+        "apply_patch",
+    ]
+    assert not any("diagnostic" in key for key in agent.config.metadata)
 
 
 @pytest.mark.asyncio

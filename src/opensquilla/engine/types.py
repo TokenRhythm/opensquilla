@@ -785,13 +785,9 @@ class AgentConfig:
     tool_result_compression_summary_timeout_seconds: float = 20.0
     tool_result_compression_summary_input_max_chars: int = 60_000
     tool_result_projection_max_inline_chars: int = 60_000
-    # Fresh diagnostic delivery is experimental; unattended profiles should opt
-    # in only after model-specific validation.
+    # Deprecated, unused compatibility slots; preserve positional/keyword construction.
     tool_result_fresh_diagnostic_policy_enabled: bool = False
     tool_result_diagnostic_retrieval_gate_enabled: bool = False
-    # When the fresh diagnostic policy is enabled, keep bounded failures intact
-    # for the immediate handoff, then let older history/replay compaction handle
-    # long-term context pressure.
     tool_result_fresh_diagnostic_inline_max_chars: int = 64_000
     # Dispatch-layer tool result caps. 0 disables the cap. These run before
     # provider-request projection and are intended for unattended automation
@@ -912,22 +908,9 @@ class AgentConfig:
     reasoning_only_act_now: bool = False
     # Deprecated, unused compatibility slot; preserve positional/keyword construction.
     mid_budget_no_diff_nudge: bool = False
-    # Provider-view dedup of byte-identical repeated tool results. Off by
-    # default. When enabled, older duplicate tool_result payloads (same content
-    # emitted N+ times across iterations) are replaced in the provider request
-    # projection with a compact back-reference to the surviving newest copy;
-    # persisted history is never mutated. Set via
-    # OPENSQUILLA_PROVIDER_HISTORY_DEDUP.
+    # Deprecated, unused compatibility slots; preserve positional/keyword construction.
     provider_history_dedup_enabled: bool = False
-    # Minimum number of byte-identical copies of a tool result before dedup
-    # elides the older ones (keeps the newest copy full). Set via
-    # OPENSQUILLA_PROVIDER_HISTORY_DEDUP_MIN_REPEATS.
     provider_history_dedup_min_repeats: int = 2
-    # Append a failure-signal scan header to tool-result projection notices:
-    # the omitted region of the original output is scanned for failure-pattern
-    # lines and the notice gains a signal_scan summary plus a ready-to-copy
-    # retrieve_tool_result call for the first match. Off by default; enabled
-    # via OPENSQUILLA_PROJECTION_SIGNAL_HINTS.
     projection_signal_hints: bool = False
     # Deprecated, unused compatibility slot; preserve construction and saved configs.
     tool_loop_observer_mode: Literal["off", "log"] = "off"
