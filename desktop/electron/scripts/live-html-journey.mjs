@@ -898,7 +898,7 @@ print(json.dumps({'runtimeTimeoutSeconds':agent.timeout if value is None else va
         assert.equal(ledger.phase.case_id, ledgerCase, 'RELAY_PHASE_CASE_MISMATCH')
       },
     })
-    supplementalClient = withForegroundActions(supplementalClient, ['send', 'annotate', 'openArtifact', 'activatePage', 'clickInPage', 'preparePageState', 'reenter', 'restoreOriginalVersion', 'verifyButtonInteraction', 'attachFile', 'fillComposer', 'selectReviewedNonvisionModel'], name => foreground(`supplemental:${name}`))
+    supplementalClient = withForegroundActions(supplementalClient, ['capture', 'send', 'annotate', 'openArtifact', 'activatePage', 'clickInPage', 'preparePageState', 'reenter', 'restoreOriginalVersion', 'verifyButtonInteraction', 'attachFile', 'fillComposer', 'selectReviewedNonvisionModel'], name => foreground(`supplemental:${name}`))
     await runSupplementalScenario(caseId, supplementalClient)
   } else if (!preflightOnly) {
     businessDriver = createBusinessDriver(app, () => selectedPreviewId, async label => {

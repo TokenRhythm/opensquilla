@@ -197,12 +197,15 @@ for (const publiclyListed of [false, true]) test(`restore button observer checks
   const app = { evaluate: async () => ({ contents: [{ id: 2, visible: true, path: '/supplemental.html' }] }) }
   const client = await createSupplementalClient(app, page, { report, persist: async () => {}, readState: async () => structuredClone(state), interrupted: () => false })
   client.hasButton = async name => name === '开始体验'
+  let headingReads = 0
+  client.visibleTextIncludes = async text => text === '海岬研究' && ++headingReads >= 3
   if (publiclyListed) await assert.rejects(client.restoreOriginalVersion(snapshot()), /SUPPLEMENTAL_NOOP_RESTORE_PUBLIC_CHANGE/)
   else {
     const result = await client.restoreOriginalVersion(snapshot())
     assert.equal(result.repeated.noOp, true); assert.equal(result.repeated.distinctRequest, true)
   }
   assert.equal(clicks, 2); assert.equal(previewVisits, 2)
+  assert.ok(headingReads >= 3, 'restore must wait for the expected heading, even when the button already exists')
   assert.equal(report.events.length, 2)
   assert.ok(!JSON.stringify(report).includes('synthetic-private-body'))
 })
@@ -377,4 +380,27 @@ for (const taskId of ['nonvision-image-request', 'previous-turn', null]) test(`c
   ] })
   await runSupplementalScenario('attachment-capability', f.client)
   assert.equal(passed(f.checks), taskId === 'nonvision-image-request')
+})
+
+for (const target of [2, 3]) test(`native tab activation waits for delayed visibility for page ${target}`, async () => {
+  let selected = 1, visible = 1, pending
+  const tabs = { count: async () => 2, nth: index => ({
+    getAttribute: async () => String(selected === index),
+    click: async () => { selected = index; clearTimeout(pending); pending = setTimeout(() => { visible = index }, 50) },
+  }) }
+  const app = { evaluate: async () => ({ contents: [0, 1].map(index => ({ id: index + 2, visible: visible === index })) }) }
+  const page = { addInitScript: async () => {}, evaluate: async () => {}, locator: () => tabs }
+  const client = await createSupplementalClient(app, page, { interrupted: () => false })
+  try { await client.activatePage({ id: target }); assert.equal(visible + 2, target) }
+  finally { clearTimeout(pending) }
+})
+test('native tab activation keeps its deadline when visibility never changes', async t => {
+  let now = 0
+  t.mock.method(Date, 'now', () => now)
+  const tabs = { count: async () => 2, nth: () => ({ getAttribute: async () => 'false', click: async () => {} }) }
+  const app = { evaluate: async () => ({ contents: [{ id: 2, visible: false }, { id: 3, visible: true }] }) }
+  const page = { addInitScript: async () => {}, evaluate: async () => {}, locator: () => tabs }
+  const client = await createSupplementalClient(app, page, { interrupted: () => { now += 16000; return false } })
+  await assert.rejects(client.activatePage({ id: 2 }), error => error.message === 'SUPPLEMENTAL_WAIT_EXPIRED'
+    && error.diagnostic.stage === 'native-tab-activation' && error.diagnostic.waitMilliseconds === 30000)
 })

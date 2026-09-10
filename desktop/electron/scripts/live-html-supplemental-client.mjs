@@ -355,7 +355,9 @@ export async function createSupplementalClient(app, page, options) {
         await persist()
         await page.getByRole('tab', { name: /Preview|预览/ }).click()
         await wait(currentPreview, 'restored-native-page')
-        await wait(() => client.hasButton('开始体验'), 'restored-preview')
+        await wait(async () => await client.hasButton('开始体验')
+          && await client.visibleTextIncludes('海岬研究')
+          && !await client.visibleTextIncludes('暮色研究'), 'restored-preview')
         return { response, stateRevision: current.state_revision }
       }
       const restored = await apply(false)
@@ -418,8 +420,15 @@ export async function createSupplementalClient(app, page, options) {
       const tabs = page.locator('.workbench-host__tabs [role=tab],.workbench-host__tab')
       const count = await tabs.count()
       for (let index = 0; index < count; index += 1) {
-        await tabs.nth(index).click()
-        const state = await nativeObservation(app)
+        const tab = tabs.nth(index)
+        const wasSelected = await tab.getAttribute('aria-selected') === 'true'
+        const before = await nativeObservation(app)
+        const visibleIds = new Set(before.contents.filter(row => row.visible).map(row => row.id))
+        await tab.click()
+        const state = wasSelected ? await nativeObservation(app) : await wait(async () => {
+          const current = await nativeObservation(app)
+          return current.contents.some(row => row.visible && !visibleIds.has(row.id)) && current
+        }, 'native-tab-activation')
         if (state.contents.some(row => row.id === target.id && row.visible)) { selectedId = target.id; return }
       }
       throw new Error('SUPPLEMENTAL_PAGE_TAB_UNAVAILABLE')
