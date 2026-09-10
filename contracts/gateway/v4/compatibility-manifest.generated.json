@@ -371,7 +371,7 @@
       "lifecycle": "stable",
       "name": "chat.clarify_submit",
       "schema": "conversation/chat-clarify-submit.schema.json",
-      "schemaSha256": "58ec833adc647ea6877ca3e708f4a3e62be0de7a6d4521fdd78144452b8abc62"
+      "schemaSha256": "49ad25adf8a8ded9c0f1b6b644974d6c4de456311bd793e121cdac076dfbf1e8"
     },
     {
       "lifecycle": "stable",
@@ -1498,7 +1498,7 @@
     "generatorSha256": "7bf8664be8d703f6c8c9f34736f17a0d7c952825664fd3cefd410f45e059c764",
     "methodCount": 219,
     "schemaCount": 229,
-    "schemaTreeSha256": "dd66f81129f3499baaf7261dd7e82b17eae9c6c3f10196054d2dade738543df7"
+    "schemaTreeSha256": "88429c0689e7bf4eb5e13ceca663e201d0da071fa8f61ecd432d77db2d84a6d5"
   },
   "wireVersion": 4
 }

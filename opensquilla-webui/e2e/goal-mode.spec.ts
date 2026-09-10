@@ -141,6 +141,10 @@ async function installFakeGoalGateway(
       } catch {
         return
       }
+      if (frame.type === 'ping') {
+        ws.send(JSON.stringify({ type: 'pong' }))
+        return
+      }
       if (frame.type !== 'req') return
       const method = String(frame.method || '')
       methods.push(method)

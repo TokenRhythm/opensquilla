@@ -19,6 +19,8 @@ import { createConversationEventTransport } from '@/adapters/gateway/conversatio
 import type { TransportEventHandler } from '@/adapters/gateway/transportTypes'
 import type { ConversationCursorSignal } from '@/modules/conversationRuntime'
 import { steerUnavailableReason } from '@/utils/chat/steerAvailability'
+import { useChatTaskOwnership, type ChatTaskOwnershipApi } from './useChatTaskOwnership'
+import { useChatPlans } from './useChatPlans'
 
 function createHarness(options: {
   messages?: ChatMessage[]
@@ -42,10 +44,13 @@ function createHarness(options: {
   onRecoveryRequired?: () => void
   withRouterRuntime?: boolean
   withRecoveryFence?: boolean
+  taskOwnership?: ChatTaskOwnershipApi
 } = {}) {
   const messages = ref<ChatMessage[]>(options.messages ?? [])
   const sessionKey = ref('agent:main:test')
   const lastStreamSeq = ref(0)
+  const currentEpoch = ref(0)
+  const onTaskSettled = vi.fn()
   const activeTaskGroups = ref(new Set<string>())
   const activeStreamTaskId = ref('')
   const pendingQueue = ref<ChatPendingItem[]>(options.pendingQueue ?? [])
@@ -108,10 +113,12 @@ function createHarness(options: {
   const rawApi = scope.run(() => useChatRpcEventHandlers({
     onRecoveryRequired: options.onRecoveryRequired,
     sessionKey,
-    currentEpoch: ref(0),
+    currentEpoch,
     lastStreamSeq,
     observeStreamGeneration: options.observeStreamGeneration,
     activeTaskGroups,
+    taskOwnership: options.taskOwnership,
+    onTaskSettled,
     activeStreamTaskId,
     aborted: ref(false),
     messages,
@@ -182,6 +189,8 @@ function createHarness(options: {
     messages,
     sessionKey,
     lastStreamSeq,
+    currentEpoch,
+    onTaskSettled,
     stream,
     activeTaskGroups,
     activeStreamTaskId,
@@ -391,6 +400,183 @@ describe('router card recovery projection', () => {
       expect(rendered.value.filter(message => message.isRouterStrip)).toHaveLength(2)
       expect(rendered.value.find(message => message.isRouterStrip)?.routerTurnKey).toBe(originalKey)
     } finally { h.stop() }
+  })
+})
+
+describe('Plan task settlement notification', () => {
+  it.each(['task.cancelled', 'sessions.changed'])(
+    'settles the Plan only after buffered %s is applied by in-place recovery', event => {
+      const taskOwnership = useChatTaskOwnership()
+      taskOwnership.noteRunning('task-foreground')
+      taskOwnership.noteQueued('task-plan')
+      const h = createHarness({ taskOwnership, withRecoveryFence: true })
+      const scope = effectScope()
+      try {
+        h.currentEpoch.value = 4
+        h.activeStreamTaskId.value = 'task-foreground'
+        const plans = scope.run(() => useChatPlans({
+          planCenter: { available: () => true } as never,
+          sessionKey: h.sessionKey, currentEpoch: h.currentEpoch,
+          isStreaming: h.stream.isStreaming, inputText: ref('Keep my draft'),
+          createSessionKey: () => 'agent:main:new', agentId: () => 'main',
+          switchToSession: vi.fn(), focusComposer: vi.fn(), notifyError: vi.fn(),
+        }))!
+        h.onTaskSettled.mockImplementation((taskId: string, epoch?: number) => plans.noteTaskSettled(taskId, epoch))
+        h.api.beginRecovery()
+        const terminal = { task_id: 'task-plan', status: 'cancelled' }
+        h.api.handlers.onWireEventFixture(event, {
+          key: h.sessionKey.value, epoch: 4,
+          ...(event === 'sessions.changed'
+            ? { reason: 'task_terminal', changed_task: terminal }
+            : terminal),
+        })
+        expect(h.onTaskSettled).not.toHaveBeenCalled()
+        plans.applyBootstrap({
+          key: h.sessionKey.value, epoch: 4,
+          currentPlan: { revisionId: 'revision-1', planId: 'plan-1', title: 'Plan', markdown: 'Plan',
+            steps: [{ stepId: 'inspect', title: 'Inspect' }] },
+          activePlanRun: { runId: 'run-plan', planRevisionId: 'revision-1', status: 'running',
+            activeTaskId: 'task-plan', stateRevision: 1,
+            currentStepId: 'inspect', steps: [{ stepId: 'inspect', title: 'Inspect', status: 'in_progress' }] },
+        })
+        expect(plans.activePlanRun.value).toMatchObject({ status: 'running', activeTaskId: 'task-plan' })
+
+        expect(h.api.finishRecovery()).toBe(true)
+        expect(h.onTaskSettled).toHaveBeenCalledWith('task-plan', 4)
+        expect(plans.activePlanRun.value).toMatchObject({ status: 'paused', activeTaskId: undefined })
+        expect(plans.activePlanRun.value?.steps[0].status).toBe('in_progress')
+        expect(h.activeStreamTaskId.value).toBe('task-foreground')
+        expect(h.stream.endStreaming).not.toHaveBeenCalled()
+      } finally { scope.stop(); h.stop() }
+    },
+  )
+
+  it('does not settle a task from a superseded recovery or an old epoch', () => {
+    const h = createHarness({ withRecoveryFence: true })
+    try {
+      h.currentEpoch.value = 3
+      h.activeStreamTaskId.value = 'task-current'
+      h.api.beginRecovery()
+      h.api.handlers.onWireEventFixture('task.cancelled', {
+        key: h.sessionKey.value, task_id: 'task-current', epoch: 3,
+      })
+      h.currentEpoch.value = 4
+      h.api.beginRecovery()
+      expect(h.api.finishRecovery()).toBe(true)
+      h.api.handlers.onWireEventFixture('task.cancelled', {
+        key: h.sessionKey.value, task_id: 'task-current', epoch: 3,
+      })
+
+      expect(h.onTaskSettled).not.toHaveBeenCalled()
+      expect(h.stream.endStreaming).not.toHaveBeenCalled()
+      expect(h.activeStreamTaskId.value).toBe('task-current')
+    } finally { h.stop() }
+  })
+
+  it.each(['task.cancelled', 'task.timeout', 'task.failed', 'task.abandoned', 'task.succeeded', 'session.event.done', 'session.event.error'])(
+    'reports the owning task after %s', event => {
+      const h = createHarness()
+      try {
+        h.activeStreamTaskId.value = 'task-owner'
+        h.api.handlers.onWireEventFixture(event, { key: h.sessionKey.value, task_id: 'task-owner',
+          reason: event === 'session.event.done' ? 'aborted' : undefined, message: 'Task ended' })
+        expect(h.onTaskSettled).toHaveBeenCalledWith('task-owner', undefined)
+        expect(h.onTaskSettled.mock.calls.every(([taskId]) => taskId === 'task-owner')).toBe(true)
+      } finally { h.stop() }
+    },
+  )
+
+  it('reports a queued background cancellation without ending the foreground stream', () => {
+    const taskOwnership = useChatTaskOwnership()
+    taskOwnership.noteRunning('task-foreground')
+    taskOwnership.noteQueued('task-background')
+    const h = createHarness({ taskOwnership })
+    try {
+      h.activeStreamTaskId.value = 'task-foreground'
+      h.api.handlers.onWireEventFixture('task.cancelled', {
+        key: h.sessionKey.value, task_id: 'task-background',
+      })
+      expect(h.onTaskSettled).toHaveBeenCalledWith('task-background', undefined)
+      expect(h.stream.endStreaming).not.toHaveBeenCalled()
+      expect(h.activeStreamTaskId.value).toBe('task-foreground')
+    } finally { h.stop() }
+  })
+
+  it.each(['foreground', 'background'])('reports a changed-task-only sessions fallback for the %s owner', owner => {
+    const taskOwnership = useChatTaskOwnership()
+    taskOwnership.noteRunning('task-foreground')
+    if (owner === 'background') taskOwnership.noteQueued('task-background')
+    const h = createHarness({ taskOwnership })
+    try {
+      h.activeStreamTaskId.value = 'task-foreground'
+      h.api.handlers.onWireEventFixture('sessions.changed', {
+        key: h.sessionKey.value, reason: 'task_terminal',
+        changed_task: { task_id: `task-${owner}`, status: 'cancelled' },
+      })
+      expect(h.onTaskSettled).toHaveBeenCalledWith(`task-${owner}`, undefined)
+      if (owner === 'background') {
+        expect(h.stream.endStreaming).not.toHaveBeenCalled()
+        expect(h.activeStreamTaskId.value).toBe('task-foreground')
+      }
+    } finally { h.stop() }
+  })
+
+  it.each(['task.cancelled', 'sessions.changed'])('does not notify from another session or an older epoch: %s', event => {
+    const h = createHarness()
+    try {
+      h.currentEpoch.value = 3
+      h.activeStreamTaskId.value = 'task-owner'
+      const terminal = { task_id: 'task-owner', status: 'cancelled' }
+      const payload = event === 'sessions.changed'
+        ? { reason: 'task_terminal', changed_task: terminal }
+        : terminal
+      h.api.handlers.onWireEventFixture(event, { ...payload, key: 'agent:other:test', epoch: 3 })
+      h.api.handlers.onWireEventFixture(event, { ...payload, key: h.sessionKey.value, epoch: 2 })
+      expect(h.onTaskSettled).not.toHaveBeenCalled()
+      expect(h.stream.endStreaming).not.toHaveBeenCalled()
+    } finally { h.stop() }
+  })
+
+  it.each(['queued-background', 'inactive-stream', 'sessions-fallback'])('keeps an early new-epoch terminal through Plan bootstrap: %s', path => {
+    const taskOwnership = useChatTaskOwnership()
+    taskOwnership.noteRunning('task-foreground')
+    if (path === 'queued-background') taskOwnership.noteQueued('task-plan')
+    const h = createHarness({ taskOwnership })
+    const scope = effectScope()
+    try {
+      const plans = scope.run(() => useChatPlans({
+        planCenter: { available: () => true } as never,
+        sessionKey: h.sessionKey, currentEpoch: h.currentEpoch,
+        isStreaming: h.stream.isStreaming, inputText: ref(''),
+        createSessionKey: () => 'agent:main:new', agentId: () => 'main',
+        switchToSession: vi.fn(), focusComposer: vi.fn(), notifyError: vi.fn(),
+      }))!
+      h.onTaskSettled.mockImplementation((taskId: string, epoch?: number) => plans.noteTaskSettled(taskId, epoch))
+      h.activeStreamTaskId.value = path === 'queued-background' ? 'task-foreground' : 'task-plan'
+      if (path === 'inactive-stream') h.stream.isStreaming.value = false
+      if (path === 'sessions-fallback') {
+        h.api.handlers.onWireEventFixture('sessions.changed', {
+          key: h.sessionKey.value, epoch: 4, reason: 'task_terminal',
+          changed_task: { task_id: 'task-plan', status: 'cancelled' },
+        })
+      } else {
+        h.api.handlers.onWireEventFixture('task.cancelled', {
+          key: h.sessionKey.value, epoch: 4, task_id: 'task-plan',
+        })
+      }
+      expect(h.onTaskSettled).toHaveBeenCalledWith('task-plan', 4)
+      expect(h.currentEpoch.value).toBe(4)
+      plans.applyBootstrap({
+        key: h.sessionKey.value, epoch: 4,
+        currentPlan: { revisionId: 'revision-1', planId: 'plan-1', title: 'Plan', markdown: 'Plan',
+          steps: [{ stepId: 'inspect', title: 'Inspect' }] },
+        activePlanRun: { runId: 'run-plan', planRevisionId: 'revision-1', status: 'running',
+          activeTaskId: 'task-plan', stateRevision: 1,
+          currentStepId: 'inspect', steps: [{ stepId: 'inspect', title: 'Inspect', status: 'in_progress' }] },
+      })
+      expect(plans.activePlanRun.value).toMatchObject({ status: 'paused', activeTaskId: undefined })
+      expect(plans.activePlanRun.value?.steps[0].status).toBe('in_progress')
+    } finally { scope.stop(); h.stop() }
   })
 })
 

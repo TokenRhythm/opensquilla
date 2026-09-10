@@ -9,10 +9,11 @@ experiment cleanup), then integrated the 2026-09-10 pinned upstream
 `021063bc7327670dddd1bde1c83ceb742044c670`. The latter includes #1585 strict
 handshake/directory validation, #1595 parallel contract generation, #1598 Router
 replay isolation, and the upstream skill-source and retired-experiment changes.
+The PR preparation additionally integrates `9486415af7188335d9f18f45143bfe33ce97e890`
+(#1597 questionnaire waiting and task-terminal recovery).
 Retired-experiment file removals are unchanged from that upstream pin and remain
 recoverable from Git history; this adaptation does not introduce engine cleanup.
-Upstream functionality is retained; this change has not been pushed or
-published. Most existing generated-contract diffs are generator
+Upstream functionality is retained. Most existing generated-contract diffs are generator
 fingerprint changes caused by the explicitly added production validation roles,
 not changes to those methods' schemas.
 
@@ -163,7 +164,7 @@ The browser recovery matrix runs from `opensquilla-webui`, once for each
 explicit `OPENSQUILLA_GATEWAY_WS_TRANSPORT_FLOW_ENABLED=false/true` value:
 
 ```powershell
-npx playwright test assistant-activity.spec.ts composer-paste.spec.ts history-hydration.spec.ts session-created-card.spec.ts session-switch-transport.spec.ts goal-mode.spec.ts queue-steer.spec.ts share.spec.ts --project=chromium --workers=2 --retries=0
+npx playwright test assistant-activity.spec.ts composer-paste.spec.ts history-hydration.spec.ts session-created-card.spec.ts session-switch-transport.spec.ts goal-mode.spec.ts plan-questionnaire-lifecycle.spec.ts queue-steer.spec.ts share.spec.ts --project=chromium --workers=2 --retries=0
 ```
 
 Run its managed production Gateway with isolated state/config, HOME,
@@ -286,7 +287,7 @@ and runs the complete tooling rather than treating generation as sufficient.
 - Full production WebUI build, Electron TypeScript build, focused Ruff and
   whitespace/conflict checks passed.
 
-The latest production WebUI build (including the history-only recovery fix)
+That production WebUI build (including the history-only recovery fix)
 also passed four native Windows Electron source/development recovery runs:
 
 | Negotiated flow | Injected unavailable interval | Backoff attempts during fault | Signal-to-operation available |
@@ -303,6 +304,46 @@ policy, not only an environment flag. These are isolated keyless profiles and
 routed transport faults, not real working conversations or physical Windows
 sleep. The four timings are individual samples after the recovery signal,
 not outage-detection measurements, a P95 distribution, or packaged evidence.
+
+### PR preparation against #1597 (2026-09-10)
+
+The next pinned upstream is `9486415af7188335d9f18f45143bfe33ce97e890`.
+Its questionnaire and Plan lifecycle changes are additive to connection
+recovery, not a reason to replace the transport implementation:
+
+- In-place recovery supplies the completed snapshot's cursor as the lower
+  bound for pending-input hydration. A legacy peer without snapshot support
+  retains the confirmed subscription bound. The parameter stays required,
+  and the Goal cursor remains a separate domain.
+- A questionnaire arriving while metadata is in flight survives a late empty
+  response. A subsequent newer authoritative empty snapshot can still expire
+  an old questionnaire. Session, epoch and stream fencing remain in effect.
+- `onTaskSettled` updates the owning Plan alongside `onRecoveryRequired`.
+  Buffered terminal events are applied only after their recovery completes;
+  superseded recovery and old-epoch events cannot settle the current task.
+- The combined schema retains `USER_INPUT_EXPIRED` with `accepted=false` and
+  `retryable=false`. All generated merge conflicts are resolved by generation
+  from that schema, not by selecting one branch's generated artifacts.
+- Browser recovery coverage now includes the questionnaire lifecycle spec in
+  both flow modes. All profiles remain isolated and credential-free.
+
+Validation on this merged implementation:
+
+- Full WebUI unit suite: 442 files / 5,841 tests passed with four workers,
+  including a complete final rerun after replacing a test-only `Array.at()`
+  call with indexed access for the repository's existing TypeScript target.
+  No compiler target or test timeout was relaxed.
+- Gateway/session/snapshot/flow/real-WebSocket regressions, RPC and CI workflow
+  architecture checks, Plan and clarification RPCs, and mid-turn input tests:
+  601 passed. Six upstream Uvicorn/websockets deprecation warnings remain.
+- Complete Python contract suite with the real toolchain enabled: 405 passed,
+  18 unchanged conditional skips (17 Windows symlink-privilege limitations,
+  one existing parameter case without a result fixture). JavaScript tooling:
+  16 passed. Both production and verification deterministic generation passed;
+  finite differential validation covered all 886 roles, including 218 production
+  roles compared over 115,837 inputs, with no role missing a positive seed.
+- WebUI production build, artifact verification/staging, Electron TypeScript
+  build, focused Ruff and whitespace/conflict checks passed.
 
 ## Release gates still required
 

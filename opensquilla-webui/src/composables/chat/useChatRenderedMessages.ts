@@ -40,7 +40,7 @@ import { normalizeRouterTierSnapshot } from '@/utils/chat/routerTierSnapshot'
 import { clarifyRequestFromValue, userInputOutcomeFromValue } from '@/utils/chat/clarify'
 import type { RouterVisualMode } from '@/utils/chat/routerVisualMode'
 import type { ModelRoutingMode } from '@/types/modelRouting'
-import type { InterruptViewState } from '@/types/parts'
+import type { InterruptClarifyData, InterruptViewState } from '@/types/parts'
 import { toParts, type ToPartsInterrupt } from '@/utils/chat/toParts'
 import { toSources } from '@/utils/chat/toSources'
 import { createdSessionFromToolCall } from '@/utils/chat/createdSessions'
@@ -130,7 +130,10 @@ function clarifyInterruptFromValue(value: unknown): ToPartsInterrupt | null {
   }
 }
 
-function historicalClarifyInterrupts(segments: RawToolCallPayload[] | undefined): ToPartsInterrupt[] {
+function historicalClarifyInterrupts(
+  segments: RawToolCallPayload[] | undefined,
+  terminalOwner: string,
+): ToPartsInterrupt[] {
   if (!Array.isArray(segments) || !segments.length) return []
   const inputByToolId = new Map<string, unknown>()
   const out: ToPartsInterrupt[] = []
@@ -147,7 +150,9 @@ function historicalClarifyInterrupts(segments: RawToolCallPayload[] | undefined)
     out[existingIndex] = {
       ...existing,
       data: { ...existing.data, ...interrupt.data },
-      ...(interrupt.resolution ? { resolution: interrupt.resolution } : {}),
+      ...(existing.resolution === 'replied'
+        ? { resolution: 'replied' }
+        : interrupt.resolution ? { resolution: interrupt.resolution } : {}),
     } as ToPartsInterrupt
   }
 
@@ -169,16 +174,55 @@ function historicalClarifyInterrupts(segments: RawToolCallPayload[] | undefined)
     if (fromMatchingInput) {
       upsert({
         ...fromMatchingInput,
-        ...(outcome ? { resolution: 'replied' } : {}),
+        ...(outcome ? { resolution: outcome.status === 'answered' ? 'replied' : 'expired' } : {}),
       })
     } else if (outcome) {
       const existingIndex = indexByApprovalId.get(outcome.requestId)
       if (existingIndex != null) {
-        out[existingIndex] = { ...out[existingIndex], resolution: 'replied' }
+        upsert({
+          ...out[existingIndex],
+          resolution: outcome.status === 'answered' ? 'replied' : 'expired',
+        })
       }
     }
   }
-  return out
+  return out.map(interrupt => {
+    const data = interrupt.data as InterruptClarifyData
+    return terminalOwner && !interrupt.resolution && data.requestId && data.runId === terminalOwner
+      ? { ...interrupt, resolution: 'expired' }
+      : interrupt
+  })
+}
+
+function projectInterruptTimeline(
+  items: ChatStreamTimelineItem[],
+  historicalInterrupts: ToPartsInterrupt[],
+  terminalOwner: string,
+  interruptState: ReadonlyMap<string, InterruptViewState> | undefined,
+): ChatStreamTimelineItem[] {
+  const historicalById = new Map(historicalInterrupts.map(interrupt => [interrupt.approvalId, interrupt]))
+  return items.map(item => {
+    if (item.type !== 'interrupt') return item
+    const part = item.part
+    const state = interruptState?.get(item.approvalId)
+    const historical = historicalById.get(item.approvalId)
+    const isClarify = part.interruptKind === 'clarify'
+    const answered = isClarify && [part.resolution, historical?.resolution, state?.resolution].includes('replied')
+    const ownerEnded = terminalOwner && isClarify && part.clarify?.requestId
+      && part.clarify.runId === terminalOwner
+    // A detached streaming snapshot can precede the request's terminal event.
+    // Reproject both render surfaces without mutating the stored transcript.
+    return {
+      ...item,
+      part: {
+        ...part,
+        resolution: answered ? 'replied'
+          : state?.resolution ?? historical?.resolution ?? part.resolution ?? (ownerEnded ? 'expired' : null),
+        busy: state?.busy ?? part.busy,
+        error: state?.error ?? part.error,
+      },
+    }
+  })
 }
 
 function terminatesPriorAssistant(message: ChatMessage, priorAssistant?: ChatMessage): boolean {
@@ -517,6 +561,11 @@ export function useChatRenderedMessages(options: UseChatRenderedMessagesOptions)
           && plan.revisionId === options.currentPlanRevisionId?.value,
       }))
       const isPlanMessage = msg.role === 'assistant' && planRevisions.length > 0
+      const terminalOwner = msg.turnOutcome
+        && ['succeeded', 'failed', 'cancelled', 'timeout', 'abandoned', 'interrupted'].includes(msg.turnOutcome.status)
+        ? msg.turnOutcome.taskId || msg.turnOutcome.turnId
+        : ''
+      const historicalInterrupts = historicalClarifyInterrupts(msg.tool_calls, terminalOwner)
       const normalizedToolCalls = normalizeToolCalls(msg.tool_calls)
       const assistantRawText = msg.role === 'assistant'
         ? options.stripGeneratedArtifactMarkers(msg.text)
@@ -562,7 +611,12 @@ export function useChatRenderedMessages(options: UseChatRenderedMessagesOptions)
         // keep real process tools in the Activity timeline.
         toolCalls: normalizedToolCalls.filter(call => !isPlanMessage || call.name !== 'submit_plan'),
         timelineItems: applyActivityOrdersToTimeline(
-          stripPlanControlToolItems(normalizeMessageTimeline(msg, ownerKey), isPlanMessage),
+          stripPlanControlToolItems(projectInterruptTimeline(
+            normalizeMessageTimeline(msg, ownerKey),
+            historicalInterrupts,
+            terminalOwner,
+            options.interruptState?.value,
+          ), isPlanMessage),
           msg.activitySnapshot,
         ),
         planRevisions,
@@ -596,7 +650,7 @@ export function useChatRenderedMessages(options: UseChatRenderedMessagesOptions)
             options.renderMarkdown,
             toolCallGroups,
             ownerKey,
-            historicalClarifyInterrupts(msg.tool_calls),
+            historicalInterrupts,
             options.interruptState?.value,
           )
         : []

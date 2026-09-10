@@ -3770,9 +3770,16 @@ const {
   dismissClarify,
   applyUserInputBootstrap,
 } = chatApprovals
-applyPendingUserInputSnapshot = snapshot => applyUserInputBootstrap({
-  pendingUserInputs: [...snapshot.pendingUserInputs],
-})
+applyPendingUserInputSnapshot = snapshot => {
+  if (snapshot.deferredFields.includes('pendingUserInputs')) return
+  applyUserInputBootstrap({
+    sessionKey: snapshot.sessionKey,
+    epoch: snapshot.epoch,
+    streamSeq: snapshot.pendingUserInputsCursor?.currentStreamSeq,
+    streamGeneration: snapshot.pendingUserInputsCursor?.streamGeneration,
+    pendingUserInputs: [...snapshot.pendingUserInputs],
+  })
+}
 
 const dockedPlanQuestionnaire = computed(() => (
   pendingClarify.value?.presentation === 'plan_questionnaire_v1'
@@ -3857,6 +3864,7 @@ function onPlanQuestionnaireTouchEnd() {
 
 const rpcEventHandlers = useChatRpcEventHandlers({
   onRecoveryRequired: () => { void recoverCurrentSession() },
+  onTaskSettled: (taskId, epoch) => chatPlans.noteTaskSettled(taskId, epoch),
   conversationRuntime,
   sessionKey,
   currentEpoch,

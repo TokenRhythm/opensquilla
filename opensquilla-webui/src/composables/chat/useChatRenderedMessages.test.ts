@@ -2907,7 +2907,11 @@ describe('useChatRenderedMessages clarify history recovery', () => {
     })
   })
 
-  it('restores and settles a terminal request from its preserved request payload', () => {
+  it.each([
+    ['answered', 'replied'],
+    ['cancelled', 'expired'],
+    ['expired', 'expired'],
+  ] as const)('restores a %s request as %s from its preserved payload', (status, resolution) => {
     const api = renderedMessagesFor([
       {
         role: 'assistant',
@@ -2938,7 +2942,7 @@ describe('useChatRenderedMessages clarify history recovery', () => {
               },
             },
             result: JSON.stringify({
-              status: 'answered',
+              status,
               kind: 'user_input',
               paused: false,
               request_id: 'request-terminal-1',
@@ -2958,9 +2962,134 @@ describe('useChatRenderedMessages clarify history recovery', () => {
     expect(clarify?.key).toBe(
       'm-terminal-request-user-input:interrupt:request-terminal-1',
     )
-    expect(clarify?.resolution).toBe('replied')
+    expect(clarify?.resolution).toBe(resolution)
     expect(clarify?.clarify?.presentation).toBe('plan_questionnaire_v1')
   })
+
+  it.each(['succeeded', 'failed', 'cancelled', 'timeout', 'abandoned', 'interrupted'])(
+    'expires only unresolved structured input owned by the %s historical turn',
+    (status) => {
+      const request = (requestId: string | undefined, runId: string) => ({
+        status: 'input_required',
+        kind: 'user_input',
+        paused: true,
+        request_id: requestId,
+        run_id: runId,
+        step: 'scope',
+        clarify_schema: { fields: [{ name: 'scope', type: 'string' }] },
+      })
+      for (const hasTaskId of [true, false]) {
+        const owner = hasTaskId ? 'terminal-task' : 'terminal-turn'
+        const api = renderedMessagesFor([{
+          role: 'assistant', text: '', ts: 0, messageId: 'historical-questionnaire',
+          restoredFromHistory: true,
+          turnOutcome: {
+            turnId: 'terminal-turn',
+            ...(hasTaskId ? { taskId: owner } : {}),
+            status,
+          },
+          tool_calls: [
+            { type: 'tool_result', tool_use_id: 'pending', result: request('pending', owner) },
+            { type: 'tool_result', tool_use_id: 'accepted', result: request('accepted', owner) },
+            { type: 'tool_result', tool_use_id: 'other', result: request('other', 'other-task') },
+            { type: 'tool_result', tool_use_id: 'legacy', result: request(undefined, owner) },
+            {
+              type: 'tool_result', tool_use_id: 'accepted',
+              result: { kind: 'user_input', status: 'answered', paused: false, request_id: 'accepted' },
+            },
+          ],
+        }])
+        const clarifies = api.renderedMessages.value[0].parts?.filter(
+          (part): part is Extract<ChatPart, { type: 'interrupt' }> =>
+            part.type === 'interrupt' && part.interruptKind === 'clarify',
+        ) ?? []
+        expect(clarifies.map(part => part.resolution)).toEqual([
+          'expired', 'replied', null, null,
+        ])
+      }
+    },
+  )
+
+  it.each([
+    ['answered', 'expired'],
+    ['expired', 'answered'],
+  ] as const)('keeps accepted history after %s then %s and an expired live projection', (first, last) => {
+    const api = renderedMessagesFor([{
+      role: 'assistant', text: '', ts: 0, messageId: 'reordered-questionnaire',
+      turnOutcome: { turnId: 'terminal-turn', taskId: 'terminal-task', status: 'cancelled' },
+      tool_calls: [
+        {
+          type: 'tool_result', tool_use_id: 'question',
+          result: {
+            status: 'input_required', kind: 'user_input', paused: true,
+            request_id: 'accepted', run_id: 'terminal-task', step: 'scope',
+            clarify_schema: { fields: [{ name: 'scope', type: 'string' }] },
+          },
+        },
+        ...[first, last].map(status => ({
+          type: 'tool_result', tool_use_id: 'question',
+          result: { kind: 'user_input', status, paused: false, request_id: 'accepted' },
+        })),
+      ],
+    }], ref<ReadonlyMap<string, InterruptViewState>>(
+      new Map([['accepted', { resolution: 'expired', busy: false, error: '' }]]),
+    ))
+    const clarify = api.renderedMessages.value[0].parts?.find(
+      (part): part is Extract<ChatPart, { type: 'interrupt' }> =>
+        part.type === 'interrupt' && part.interruptKind === 'clarify',
+    )
+    expect(clarify?.resolution).toBe('replied')
+  })
+
+  it('updates a detached questionnaire timeline when its live request expires', () => {
+    const interrupt: Extract<ChatPart, { type: 'interrupt' }> = {
+      type: 'interrupt', interruptKind: 'clarify',
+      key: 'detached:interrupt:request-1',
+      clarify: { requestId: 'request-1', runId: 'task-1', step: 'scope', intro: '', fields: [] },
+      resolution: null, busy: false, error: '',
+    }
+    const interruptState = ref<ReadonlyMap<string, InterruptViewState>>(new Map())
+    const api = renderedMessagesFor([{
+      role: 'assistant', text: '', ts: 0, messageId: 'detached',
+      tool_calls: [],
+      timeline: [{ type: 'interrupt', approvalId: 'request-1' }],
+      interrupts: [interrupt],
+    }], interruptState)
+    const resolutions = () => {
+      const rendered = api.renderedMessages.value[0]
+      const part = rendered.parts?.find(item => item.type === 'interrupt')
+      const timeline = rendered.timelineItems?.find(item => item.type === 'interrupt')
+      return [part?.resolution, timeline?.part.resolution]
+    }
+    expect(resolutions()).toEqual([null, null])
+
+    interruptState.value = new Map([
+      ['request-1', { resolution: 'expired', busy: false, error: '' }],
+    ])
+    expect(resolutions()).toEqual(['expired', 'expired'])
+    expect(interrupt.resolution).toBeNull()
+  })
+
+  it.each([null, 'replied'] as const)(
+    'settles a frozen historical timeline while preserving its %s accepted outcome',
+    (resolution) => {
+      const api = renderedMessagesFor([{
+        role: 'assistant', text: '', ts: 0, messageId: 'frozen',
+        turnOutcome: { turnId: 'turn-1', taskId: 'task-1', status: 'cancelled' },
+        tool_calls: [],
+        timeline: [{ type: 'interrupt', approvalId: 'request-1' }],
+        interrupts: [{
+          type: 'interrupt', interruptKind: 'clarify', key: 'frozen:interrupt:request-1',
+          clarify: { requestId: 'request-1', runId: 'task-1', step: 'scope', intro: '', fields: [] },
+          resolution, busy: false, error: '',
+        }],
+      }])
+      const rendered = api.renderedMessages.value[0]
+      const expected = resolution || 'expired'
+      expect(rendered.parts?.find(part => part.type === 'interrupt')?.resolution).toBe(expected)
+      expect(rendered.timelineItems?.find(item => item.type === 'interrupt')?.part.resolution).toBe(expected)
+    },
+  )
 
   it('keeps consecutive requests distinct by requestId', () => {
     const request = (requestId: string) => ({
