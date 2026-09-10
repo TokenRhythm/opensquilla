@@ -2,6 +2,7 @@ import { copyFileSync, cpSync, existsSync, mkdirSync, readdirSync, readFileSync,
 import { dirname, join, resolve, sep } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { spawnSync } from 'node:child_process'
+import { assertRouterIntegrity, gatewayInputs, writeGatewayBuildRecord } from './gateway-integrity.mjs'
 
 const scriptDir = dirname(fileURLToPath(import.meta.url))
 const packageRoot = resolve(scriptDir, '..')
@@ -286,6 +287,8 @@ function externalizeControlUiArtifact() {
 
 assertControlUiArtifactReady()
 assertRouterAssetsReady()
+assertRouterIntegrity(routerBundleDir)
+const buildInputs = gatewayInputs(repoRoot)
 
 rmSync(runtimeGatewayDir, { recursive: true, force: true })
 mkdirSync(runtimeGatewayDir, { recursive: true })
@@ -400,3 +403,4 @@ if (result.status !== 0) {
 
 patchMacLightgbmRuntime()
 externalizeControlUiArtifact()
+writeGatewayBuildRecord(repoRoot, runtimeGatewayDir, buildInputs)

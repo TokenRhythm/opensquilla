@@ -6,6 +6,7 @@ import process from 'node:process'
 import { fileURLToPath } from 'node:url'
 
 import { verifyInstallerProgressPolicy } from './installer-progress-policy.mjs'
+import { verifyGatewayIntegrity } from './gateway-integrity.mjs'
 
 const scriptDir = dirname(fileURLToPath(import.meta.url))
 const packageRoot = resolve(scriptDir, '..')
@@ -227,6 +228,12 @@ async function verifyRuntime(root, label, { platform, executeCommands }) {
   }
 
   const files = await listFiles(root)
+  try {
+    verifyGatewayIntegrity(repoRoot, root, { platform })
+  } catch (error) {
+    fail(`${label} ${error instanceof Error ? error.message : String(error)}`)
+    return
+  }
   if (files.length === 0) {
     fail(`${label} runtime is empty: ${root}`)
     return
