@@ -6291,7 +6291,7 @@ class Agent:
         runtime_recovery_scaffolding_pending = False
         repeated_tool_call_key: tuple[str, str] | None = None
         repeated_tool_call_count = 0
-        repeated_tool_call_workspace_write_count = len(self._effective_workspace_write_records())
+        repeated_tool_call_workspace_write_count = 0
         repeated_tool_call_last_result_is_error = False
         last_executed_results: list[ToolResult] = []
         last_post_write_progress_count = self._post_write_progress_count()
@@ -6306,7 +6306,7 @@ class Agent:
         finalize_evidence_gate_keys: set[str] = set()
         recent_failure_anchor_summaries: list[str] = []
         progress_watchdog_mode = getattr(self.config, "progress_watchdog_mode", "log")
-        progress_watchdog = ProgressWatchdog(
+        progress_watchdog = None if progress_watchdog_mode == "off" else ProgressWatchdog(
             repeated_tool_error_threshold=max(
                 1,
                 int(
@@ -11570,12 +11570,10 @@ class Agent:
                                 "repeat_threshold": repeat_threshold,
                                 "workspace_write_count": current_workspace_write_count,
                             }
-                elif tool_calls:
+                elif tool_calls and repeated_tool_call_key is not None:
                     repeated_tool_call_key = None
                     repeated_tool_call_count = 0
-                    repeated_tool_call_workspace_write_count = len(
-                        self._effective_workspace_write_records()
-                    )
+                    repeated_tool_call_workspace_write_count = 0
                     repeated_tool_call_last_result_is_error = False
 
                 if repeated_tool_call_recovery_message is not None:
@@ -12912,7 +12910,7 @@ class Agent:
                     workspace_write_count=workspace_write_count,
                     mutation_receipt_counts=mutation_receipt_counts,
                 )
-                if len(tool_calls) == 1:
+                if repeated_tool_call_key is not None and len(tool_calls) == 1:
                     current_repeat_key = self._tool_call_repeat_key(tool_calls[0])
                     if current_repeat_key == repeated_tool_call_key:
                         repeated_tool_call_last_result_is_error = any(
@@ -12963,15 +12961,6 @@ class Agent:
                             ),
                             iteration=iterations,
                         )
-                source_context_signature = self._source_context_signature(
-                    tool_calls,
-                    executed_results,
-                )
-                successful_source_context_tool_result = source_context_signature is not None
-                successful_execution_tool_result = any(
-                    not result.is_error and result.tool_name in _EXECUTION_TOOL_NAMES
-                    for result in executed_results
-                )
                 if post_write_progress_count > 0:
                     for tc, result in zip(tool_calls, executed_results, strict=False):
                         if result.tool_name not in _EXECUTION_TOOL_NAMES:
@@ -13020,9 +13009,10 @@ class Agent:
                             else:
                                 post_write_focused_verification_success_observed = True
                                 last_post_write_failed_verification = None
-                failure_anchor_summary = self._failure_anchor_summary_from_tool_results(
-                    tool_calls,
-                    executed_results,
+                failure_anchor_summary = (
+                    self._failure_anchor_summary_from_tool_results(tool_calls, executed_results)
+                    if runtime_diagnostics is not None or progress_watchdog is not None
+                    else ""
                 )
                 if (
                     failure_anchor_summary
@@ -13072,10 +13062,14 @@ class Agent:
                         append_runtime_event(self.config.runtime_events_path, runtime_event)
                 progress_watchdog_guidance: str | None = None
                 watchdog_decision = None
+                source_context_signature: str | None = None
                 if (
                     accepted_goal_terminal_status is None
-                    and progress_watchdog_mode != "off"
+                    and progress_watchdog is not None
                 ):
+                    source_context_signature = self._source_context_signature(
+                        tool_calls, executed_results
+                    )
                     artifact_completed = False
                     for result in executed_results:
                         if (
@@ -13102,9 +13096,12 @@ class Agent:
                                 not result.is_error for result in executed_results
                             ),
                             successful_source_context_tool_result=(
-                                successful_source_context_tool_result
+                                source_context_signature is not None
                             ),
-                            successful_execution_tool_result=successful_execution_tool_result,
+                            successful_execution_tool_result=any(
+                                not result.is_error and result.tool_name in _EXECUTION_TOOL_NAMES
+                                for result in executed_results
+                            ),
                             source_context_signature=source_context_signature,
                             user_visible_output=bool(visible_text.strip()),
                             artifact_completed=artifact_completed,
@@ -13182,13 +13179,18 @@ class Agent:
                         max_nudges=runtime_recovery_source_loop_max_nudges,
                     )
                     if source_loop_recovery is not None:
-                        self._record_runtime_recovery_event(
-                            source_loop_recovery,
-                            iteration=iterations,
-                            provider_call_count=turn_llm_calls,
-                            workspace_write_count=workspace_write_count,
-                            source_context_signature=source_context_signature,
-                        )
+                        if self.config.runtime_events_path:
+                            if progress_watchdog is None:
+                                source_context_signature = self._source_context_signature(
+                                    tool_calls, executed_results
+                                )
+                            self._record_runtime_recovery_event(
+                                source_loop_recovery,
+                                iteration=iterations,
+                                provider_call_count=turn_llm_calls,
+                                workspace_write_count=workspace_write_count,
+                                source_context_signature=source_context_signature,
+                            )
                         recovery_event_key = source_loop_recovery.details.get("recovery_event_key")
                         if isinstance(recovery_event_key, str) and recovery_event_key:
                             source_loop_recovery_attempted_keys.add(recovery_event_key)

@@ -1597,7 +1597,7 @@ async def test_agent_recovers_repeated_successful_identical_exec_commands() -> N
 
 
 @pytest.mark.asyncio
-async def test_agent_repeated_git_diff_not_covered_by_default() -> None:
+async def test_agent_repeated_git_diff_not_covered_by_default(monkeypatch) -> None:
     provider = _RepeatedSuccessfulToolThenDoneProvider(
         tool_retries=4,
         tool_name="git_diff",
@@ -1625,9 +1625,12 @@ async def test_agent_repeated_git_diff_not_covered_by_default() -> None:
         tool_handler=_tool,
     )
 
+    repeat_key = Mock(side_effect=AssertionError("Ineligible tools need no repeat key"))
+    monkeypatch.setattr(agent, "_tool_call_repeat_key", repeat_key)
     events = [event async for event in agent.run_turn("show the current diff")]
 
     assert any(isinstance(event, DoneEvent) for event in events)
+    repeat_key.assert_not_called()
     assert handler_calls == 4
     assert not any(
         isinstance(event, WarningEvent) and event.code == "repeated_tool_call_recovery"

@@ -6,7 +6,7 @@ from unittest.mock import Mock
 
 import pytest
 
-from opensquilla.engine import Agent, AgentConfig, ToolCall, ToolResult
+from opensquilla.engine import Agent, AgentConfig, DoneEvent, ErrorEvent, ToolCall, ToolResult
 from opensquilla.engine.runtime_diagnostics import (
     RuntimeDiagnosticsObserver,
     classify_path,
@@ -441,8 +441,8 @@ async def test_agent_skips_git_diff_diagnostics_when_no_observer_needs_them(
     workspace.mkdir()
     tool_context = ToolContext(workspace_dir=str(workspace))
 
-    def unexpected_diff_probe(_self) -> Any:
-        raise AssertionError("Git diff diagnostics should stay lazy")
+    def unexpected_diff_probe(*_args, **_kwargs) -> Any:
+        raise AssertionError("Inactive diagnostics should stay lazy")
 
     monkeypatch.setattr(
         Agent,
@@ -454,8 +454,18 @@ async def test_agent_skips_git_diff_diagnostics_when_no_observer_needs_them(
         "_workspace_diff_fingerprint_for_runtime_event",
         unexpected_diff_probe,
     )
+    for helper in (
+        "_final_diff_contract_observation",
+        "_tool_call_repeat_key",
+        "_source_context_signature",
+        "_failure_anchor_summary_from_tool_results",
+        "_classify_focused_verification_result",
+    ):
+        monkeypatch.setattr(Agent, helper, unexpected_diff_probe)
+    monkeypatch.setattr("opensquilla.engine.agent.ProgressWatchdog", unexpected_diff_probe)
 
     async def handler(call: ToolCall) -> ToolResult:
+        tool_context.workspace_file_writes.append(_write("src/lib.rs"))
         return ToolResult(
             tool_use_id=call.tool_use_id,
             tool_name=call.tool_name,
@@ -472,7 +482,8 @@ async def test_agent_skips_git_diff_diagnostics_when_no_observer_needs_them(
 
     events = [event async for event in agent.run_turn("run one command")]
 
-    assert events
+    assert any(isinstance(event, DoneEvent) for event in events)
+    assert not any(isinstance(event, ErrorEvent) for event in events)
     assert not unavailable_git_runtime.resolution_calls
 
 
@@ -631,9 +642,13 @@ async def test_agent_runtime_diagnostics_write_jsonl_without_model_hint(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("event_output", [False, True])
+@pytest.mark.parametrize("watchdog_mode", ["off", "log"])
 async def test_agent_source_loop_recovery_warns_model_once(
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,
+    event_output: bool,
+    watchdog_mode: str,
 ) -> None:
     runtime_events_path = tmp_path / "runtime_events.jsonl"
     ledger_path = tmp_path / "retired-ledger.json"
@@ -665,10 +680,10 @@ async def test_agent_source_loop_recovery_warns_model_once(
         provider=provider,
         config=AgentConfig(
             max_iterations=5,
-            runtime_events_path=str(runtime_events_path),
+            runtime_events_path=str(runtime_events_path) if event_output else None,
             patch_evidence_ledger_path=str(ledger_path),
             runtime_recovery_mode="warn_model",
-            progress_watchdog_mode="log",
+            progress_watchdog_mode=watchdog_mode,
             tool_result_projection_max_inline_chars=10_000,
             tool_failure_loop_block_threshold=0,
         ),
@@ -677,6 +692,10 @@ async def test_agent_source_loop_recovery_warns_model_once(
         tool_context=tool_context,
         session_key="session-1",
     )
+    signature = Mock(wraps=agent._source_context_signature)
+    monkeypatch.setattr(agent, "_source_context_signature", signature)
+    turn_log = Mock(wraps=agent._write_turn_call_log)
+    monkeypatch.setattr(agent, "_write_turn_call_log", turn_log)
 
     events = [event async for event in agent.run_turn("fix the bug")]
 
@@ -684,6 +703,15 @@ async def test_agent_source_loop_recovery_warns_model_once(
     assert provider.calls == 4
     assert "[Runtime recovery]" in _message_text(provider.messages_by_call[3])
     assert "[Runtime recovery]" not in _message_text(agent._history)
+    assert any(call.args[0] == "runtime_recovery" for call in turn_log.call_args_list)
+    assert not ledger_path.exists()
+    if watchdog_mode == "off" and not event_output:
+        signature.assert_not_called()
+    else:
+        assert signature.called
+    if not event_output:
+        assert not runtime_events_path.exists()
+        return
 
     logged = [
         json.loads(line)
