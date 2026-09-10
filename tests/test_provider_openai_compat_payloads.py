@@ -1430,7 +1430,7 @@ def test_llm_trace_request_metadata_carries_compaction_proof(
     request_proof = rows[0]["metadata"]["request_proof"]
     assert request_proof["compaction_tier"] == 0
     assert request_proof["retry_count"] == 0
-    assert "compaction_tiny_guard_chars" in request_proof
+    assert "compaction_tiny_guard_chars" not in request_proof
     assert "compaction_protect_recent_assistant" in request_proof
 
 

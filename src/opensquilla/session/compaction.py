@@ -1956,22 +1956,6 @@ async def call_compaction_llm(
     return None
 
 
-def _merge_summaries(summaries: list[str]) -> str:
-    """Merge chunk summaries into a single cohesive summary.
-
-    Spec requirements: MUST PRESERVE active tasks + status, batch progress,
-    last user request, decisions + rationale, TODOs/open questions,
-    commitments/follow-ups. Prioritize recent context over older history.
-    """
-    if len(summaries) == 1:
-        return summaries[0]
-    merged_lines = ["[Merged context summary]"]
-    # Later summaries (more recent) appear last — they take priority
-    for i, summary in enumerate(summaries):
-        merged_lines.append(f"\n--- Part {i + 1} ---\n{summary}")
-    return "\n".join(merged_lines)
-
-
 def _fit_structured_summary_current_status(
     summary: Any,
     *,

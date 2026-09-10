@@ -609,9 +609,3 @@ def _parse_json_envelope(stdout: str) -> dict | None:
         except json.JSONDecodeError:
             continue
     return None
-
-
-def _decode(data) -> str:
-    if isinstance(data, bytes):
-        return data.decode(errors="replace")
-    return data or ""

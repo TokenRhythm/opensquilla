@@ -2,7 +2,6 @@ import { SessionReadFailure } from '@/modules/sessionReadLifecycle'
 
 export const SESSION_BOOTSTRAP_BUDGET_MS = 15_000
 export const SESSION_PHASE_ATTEMPT_BUDGET_MS = 7_000
-export const SESSION_SNAPSHOT_BUDGET_MS = 3_000
 
 export type SessionHistoryPhase = 'idle' | 'loading' | 'ready' | 'error'
 export type SessionLivePhase = 'idle' | 'connecting' | 'ready' | 'degraded'
@@ -38,29 +37,6 @@ export function isStorageBusy(error: unknown): boolean {
 
 export function retryAfterMs(error: unknown): number {
   return error instanceof SessionReadFailure ? error.retryAfterMs : 0
-}
-
-export function phaseRemainingMs(
-  context: SessionBootstrapPhaseContext,
-  now = Date.now(),
-): number {
-  return Math.max(0, Math.min(context.deadlineAt, context.attemptDeadlineAt) - now)
-}
-
-export function phaseTimeoutMs(
-  context: SessionBootstrapPhaseContext,
-  method: string,
-  maximumMs = SESSION_PHASE_ATTEMPT_BUDGET_MS,
-): number {
-  const remaining = phaseRemainingMs(context)
-  if (remaining <= 0) {
-    throw new SessionReadFailure(
-      'timeout',
-      `${method} exhausted the session bootstrap budget`,
-      true,
-    )
-  }
-  return Math.max(1, Math.min(maximumMs, remaining))
 }
 
 export function shouldRetrySessionPhase(error: unknown): boolean {

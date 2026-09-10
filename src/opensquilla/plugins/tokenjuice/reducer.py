@@ -20,15 +20,6 @@ def _failure_preserve_enabled() -> bool:
     return raw in _TRUE_ENV_VALUES
 
 
-def _compile_flags(flags: str = "") -> int:
-    compiled = 0
-    if "i" in flags:
-        compiled |= re.IGNORECASE
-    if "m" in flags:
-        compiled |= re.MULTILINE
-    return compiled
-
-
 def _patterns(values: Any) -> list[re.Pattern[str]]:
     if not isinstance(values, list):
         return []

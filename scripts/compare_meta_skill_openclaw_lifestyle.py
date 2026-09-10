@@ -694,10 +694,6 @@ async def _judge_lifestyle_with_retries(
     raise RuntimeError("; ".join(errors))
 
 
-def _lifestyle_judge_result_is_complete(judge_result: JudgeResult) -> bool:
-    return _normalized_lifestyle_judge_result(judge_result) is not None
-
-
 def _normalized_lifestyle_judge_result(judge_result: JudgeResult) -> JudgeResult | None:
     if not judge_result.rationale.strip():
         return None

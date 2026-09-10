@@ -2730,16 +2730,6 @@ def _posix_controller_matches(record: _PersistedOwnerRecord) -> bool:
     return _posix_anchor_command_matches(record)
 
 
-async def _wait_until(check: Any, timeout: float) -> bool:
-    deadline = asyncio.get_running_loop().time() + max(0.0, timeout)
-    while check():
-        remaining = deadline - asyncio.get_running_loop().time()
-        if remaining <= 0:
-            return False
-        await asyncio.sleep(min(_POLL_INTERVAL_SECONDS, remaining))
-    return True
-
-
 def _terminate_persisted_posix_owner_sync(reference: _PersistedOwnerRef) -> bool:
     record = reference.record
     if not _posix_controller_matches(record):

@@ -253,7 +253,3 @@ export function humanizeToken(value: string | null | undefined): string {
     .trim()
     .replace(/\b\w/g, (ch) => ch.toUpperCase())
 }
-
-export function safeId(value: string | null | undefined): string {
-  return String(value || '').replace(/[^a-zA-Z0-9_-]/g, '-')
-}

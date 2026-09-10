@@ -346,7 +346,7 @@ async def test_agent_projects_tokenjuice_without_context_window_gate(
         content="pytest output\n" + ("x" * 1000),
     )
 
-    projected = await agent._canonicalize_tool_result(
+    projected = await agent._project_tool_result_for_llm(
         result,
         tool_call=ToolCall(
             tool_use_id="tool-1",
@@ -368,7 +368,7 @@ async def test_agent_projects_tokenjuice_without_context_window_gate(
 
 
 @pytest.mark.asyncio
-async def test_fresh_diagnostic_under_cap_is_preserved_to_next_provider_call(
+async def test_retired_fresh_diagnostic_flag_does_not_bypass_tokenjuice(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     calls: list[dict[str, Any]] = []
@@ -416,11 +416,12 @@ async def test_fresh_diagnostic_under_cap_is_preserved_to_next_provider_call(
     assert len(provider.calls) == 2
     second_call_tool_result = _last_tool_result_content(provider.calls[1])
     assert second_call_tool_result == raw_output
-    assert calls == []
+    assert len(calls) == 1
     projected_event = next(event for event in events if isinstance(event, ToolResultEvent))
     assert projected_event.result == raw_output
-    assert agent.config.metadata["tool_projection_fresh_diagnostic_one_hop_preserves"] == 1
-    assert agent.config.metadata["tool_projection_fresh_diagnostic_results"] == 1
+    # No retrieval surface means the raw result still survives by the normal
+    # Store/retrieval contract, not the retired one-hop diagnostic policy.
+    assert not any("fresh_diagnostic" in key for key in agent.config.metadata)
 
 
 @pytest.mark.asyncio
@@ -453,7 +454,7 @@ async def test_source_read_file_result_is_preserved_before_tokenjuice(
         content=source,
     )
 
-    projected = await agent._canonicalize_tool_result(
+    projected = await agent._project_tool_result_for_llm(
         result,
         tool_call=ToolCall(
             tool_use_id="tool-1",
@@ -516,7 +517,7 @@ async def test_exec_git_diff_result_is_preserved_before_tokenjuice(
         content=diff,
     )
 
-    projected = await agent._canonicalize_tool_result(
+    projected = await agent._project_tool_result_for_llm(
         result,
         tool_call=ToolCall(
             tool_use_id="tool-1",
@@ -567,7 +568,7 @@ async def test_exec_source_read_result_is_preserved_before_tokenjuice(
         content=source,
     )
 
-    projected = await agent._canonicalize_tool_result(
+    projected = await agent._project_tool_result_for_llm(
         result,
         tool_call=ToolCall(
             tool_use_id="tool-1",
@@ -614,7 +615,7 @@ async def test_broad_grep_result_is_not_semantically_preserved(
         content=content,
     )
 
-    projected = await agent._canonicalize_tool_result(
+    projected = await agent._project_tool_result_for_llm(
         result,
         tool_call=ToolCall(
             tool_use_id="tool-1",
@@ -648,7 +649,7 @@ async def test_tokenjuice_noop_preserves_tool_result(
         content="short output",
     )
 
-    projected = await agent._canonicalize_tool_result(result)
+    projected = await agent._project_tool_result_for_llm(result)
 
     assert projected is result
     assert projected.content == "short output"
@@ -678,7 +679,7 @@ async def test_tokenjuice_projection_preserves_raw_without_recovery_contract(
     )
     raw_output = "raw output\n" + ("x" * 8000)
 
-    projected = await agent._canonicalize_tool_result(
+    projected = await agent._project_tool_result_for_llm(
         ToolResult(
             tool_use_id="tool-1",
             tool_name="exec_command",
@@ -896,9 +897,7 @@ async def test_run_turn_feeds_tokenjuice_reduced_tool_result_to_next_provider_ca
     assert "AssertionError" in second_call_tool_result
     assert "rootdir:" not in second_call_tool_result
     assert agent.config.metadata["tool_projection_backend"] == "tokenjuice"
-    assert agent.config.metadata["tool_projection_fresh_diagnostic_results"] == 1
-    assert agent.config.metadata["tool_projection_fresh_diagnostic_projections"] == 1
-    assert "tool_projection_fresh_diagnostic_one_hop_preserves" not in agent.config.metadata
+    assert not any("fresh_diagnostic" in key for key in agent.config.metadata)
     projected_event = next(event for event in events if isinstance(event, ToolResultEvent))
     delta_fragments = [
         event.json_fragment for event in events if isinstance(event, ToolUseDeltaEvent)
@@ -910,7 +909,7 @@ async def test_run_turn_feeds_tokenjuice_reduced_tool_result_to_next_provider_ca
 
 
 @pytest.mark.asyncio
-async def test_projected_diagnostic_requires_focused_retrieval_before_edit(
+async def test_retired_diagnostic_gate_does_not_force_retrieval_before_edit(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path,
 ) -> None:
@@ -997,11 +996,14 @@ async def test_projected_diagnostic_requires_focused_retrieval_before_edit(
         and event.is_error
         and "retrieve_tool_result" in event.result
     ]
-    assert blocked
-    assert executed_tool_names == ["exec_command", "retrieve_tool_result", "apply_patch"]
-    assert agent.config.metadata["tool_projection_fresh_diagnostic_projections"] == 1
-    assert agent.config.metadata["tool_projection_diagnostic_retrieval_gate_blocks"] == 1
-    assert agent.config.metadata["tool_projection_diagnostic_retrievals"] == 1
+    assert not blocked
+    assert executed_tool_names == [
+        "exec_command",
+        "apply_patch",
+        "retrieve_tool_result",
+        "apply_patch",
+    ]
+    assert not any("diagnostic" in key for key in agent.config.metadata)
 
 
 @pytest.mark.asyncio
@@ -1104,7 +1106,7 @@ async def test_provider_call_without_retrieval_schema_restores_stored_raw_result
         session_key="agent:main:session-1",
     )
     raw = "diagnostic output\n" + ("x" * 10_000)
-    projected = await agent._canonicalize_tool_result(
+    projected = await agent._project_tool_result_for_llm(
         ToolResult(
             tool_use_id="tool-restore",
             tool_name="exec_command",
@@ -1709,7 +1711,7 @@ async def test_runtime_events_record_tokenjuice_projection_applied(
         tool_handler=_unused_retrieval_handler,
     )
 
-    projected = await agent._canonicalize_tool_result(
+    projected = await agent._project_tool_result_for_llm(
         ToolResult(
             tool_use_id="tool-1",
             tool_name="exec_command",
@@ -1780,7 +1782,7 @@ async def test_projection_envelope_includes_retrieval_hint_and_search_hints(
         + ("x" * 20_000)
     )
 
-    projected = await agent._canonicalize_tool_result(
+    projected = await agent._project_tool_result_for_llm(
         ToolResult(
             tool_use_id="tool-1",
             tool_name="exec_command",
@@ -1831,7 +1833,7 @@ async def test_tool_projection_noops_when_handle_envelope_would_grow_result(
         content="small output",
     )
 
-    projected = await agent._canonicalize_tool_result(result)
+    projected = await agent._project_tool_result_for_llm(result)
 
     assert projected is result
     assert projected.content == "small output"
@@ -1867,7 +1869,7 @@ async def test_full_trace_store_preserves_raw_snapshot_without_projection(
         content="line 1\nline 2\n",
     )
 
-    projected = await agent._canonicalize_tool_result(result)
+    projected = await agent._project_tool_result_for_llm(result)
 
     assert projected is result
     assert projected.content == "line 1\nline 2\n"
@@ -1907,8 +1909,8 @@ async def test_full_trace_store_reuses_snapshot_for_replayed_tool_result(
         content="same replayed output\n",
     )
 
-    first = await agent._canonicalize_tool_result(result)
-    second = await agent._canonicalize_tool_result(result)
+    first = await agent._project_tool_result_for_llm(result)
+    second = await agent._project_tool_result_for_llm(result)
 
     assert first is result
     assert second is result
@@ -1953,7 +1955,7 @@ async def test_tool_projection_noops_when_store_budget_rejects_raw_snapshot(
         content=content,
     )
 
-    projected = await agent._canonicalize_tool_result(result)
+    projected = await agent._project_tool_result_for_llm(result)
 
     assert projected is result
     assert projected.content == content
@@ -1998,7 +2000,7 @@ async def test_large_compressible_projection_stores_retrievable_raw_snapshot(
         content=content,
     )
 
-    projected = await agent._canonicalize_tool_result(result)
+    projected = await agent._project_tool_result_for_llm(result)
 
     assert projected is not result
     assert "[tool_result_projection]" in projected.content
@@ -2053,7 +2055,7 @@ async def test_json_guard_projection_includes_retrievable_raw_snapshot(
         content=content,
     )
 
-    projected = await agent._canonicalize_tool_result(result)
+    projected = await agent._project_tool_result_for_llm(result)
 
     assert projected is not result
     assert "[tool_result_projection]" in projected.content
@@ -2104,7 +2106,7 @@ async def test_json_guard_preserves_raw_content_when_store_budget_rejects_snapsh
         content=content,
     )
 
-    projected = await agent._canonicalize_tool_result(result)
+    projected = await agent._project_tool_result_for_llm(result)
 
     assert projected is result
     assert projected.content == content

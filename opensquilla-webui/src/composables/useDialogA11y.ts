@@ -56,16 +56,6 @@ export function hasOpenDialogLayer(): boolean {
   return openDialogStack.length > 0
 }
 
-/** Reactive counterpart used by native surfaces that must disappear whenever
- * a DOM modal owns the window. The returned computed contains no dialog
- * identity or content; it only exposes whether the shared stack is non-empty. */
-export function useOpenDialogLayerState() {
-  return computed(() => {
-    void openDialogVersion.value
-    return openDialogStack.length > 0
-  })
-}
-
 /** True while a DOM layer that must paint above WebContentsView is open. */
 export function useNativeSurfaceOcclusionState() {
   return computed(() => {
