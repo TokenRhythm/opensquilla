@@ -65,9 +65,9 @@ export interface InterruptClarifyData {
 export type InterruptResolution =
   | 'approved'
   | 'denied'    // approval outcomes (explicit human deny)
-  | 'expired'   // approval lapsed without a response
+  | 'expired'   // approval or clarify request is no longer actionable
   | 'unavailable' // approval no longer exists on the authoritative Gateway
-  | 'replied'   // clarify submitted
+  | 'replied'   // clarify reply accepted by the Gateway
 
 /**
  * Resolution view-state for one interrupt, owned by a composable-side map keyed

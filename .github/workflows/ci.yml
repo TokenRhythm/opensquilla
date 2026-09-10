@@ -743,6 +743,7 @@ jobs:
           session-created-card.spec.ts
           session-switch-transport.spec.ts
           goal-mode.spec.ts
+          plan-questionnaire-lifecycle.spec.ts
           queue-steer.spec.ts
           share.spec.ts
           --project=chromium

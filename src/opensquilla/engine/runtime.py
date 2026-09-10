@@ -8784,10 +8784,17 @@ class TurnRunner:
                 "one at a time in plan order, following the currentStepId returned by "
                 "each successful checkpoint before continuing. Do not invent progress. "
                 "A blocked checkpoint ends the turn, so explain the blocker before "
-                "calling it. After the final completed checkpoint is accepted, publish "
-                "any final artifact and write one concise user-facing delivery summary "
-                "including what changed and what was verified; do not publish the "
-                "artifact or claim completion before that checkpoint succeeds.\n"
+                "calling it. If the current step is the only unfinished step and all "
+                "of its other work and verification are complete, you may call "
+                "publish_artifact as its final operation: the tool validates the "
+                "artifact and checkpoints that final step before publishing it. "
+                "Never use publication to stand in for unfinished work or verification. "
+                "If multiple steps remain, complete their work and record truthful "
+                "checkpoints in order before publishing. After the final completed "
+                "checkpoint is accepted, publish any final artifact that has not already "
+                "been published. Only claim an artifact was delivered after publication "
+                "succeeds. Finish with one concise user-facing summary of what changed "
+                "and was verified.\n"
                 + TurnRunner._render_plan_revision_context(revision)
             )
             run = getattr(ctx, "plan_run", None)

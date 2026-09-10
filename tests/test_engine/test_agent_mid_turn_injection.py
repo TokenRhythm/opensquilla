@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from collections.abc import AsyncIterator
 from typing import Any
@@ -837,9 +838,28 @@ async def test_terminal_control_tool_prevents_later_batch_calls_from_dispatching
 
 
 @pytest.mark.asyncio
-async def test_deferred_user_input_resumes_same_tool_call_without_user_injection() -> None:
+@pytest.mark.parametrize(("timeout", "iteration_timeout"), [(60, 600), (0, 60)])
+@pytest.mark.parametrize("answer_phase", ["immediate", "published", "waiting"])
+async def test_deferred_user_input_resumes_same_tool_call_without_user_injection(
+    monkeypatch: pytest.MonkeyPatch,
+    timeout: int,
+    iteration_timeout: int,
+    answer_phase: str,
+) -> None:
     provider = _DeferredUserInputProvider()
     broker = StructuredUserInputBroker()
+    loop = asyncio.get_running_loop()
+    real_time = loop.time
+    clock_offset = 0.0
+    monkeypatch.setattr(loop, "time", lambda: real_time() + clock_offset)
+    waiting = asyncio.Event()
+    original_wait = broker.wait_for_response
+
+    async def wait_for_response(request_id: str) -> dict[str, Any]:
+        waiting.set()
+        return await original_wait(request_id)
+
+    monkeypatch.setattr(broker, "wait_for_response", wait_for_response)
 
     async def _request_user_input(call: ToolCall) -> ToolResult:
         return ToolResult(
@@ -867,7 +887,11 @@ async def test_deferred_user_input_resumes_same_tool_call_without_user_injection
 
     agent = Agent(
         provider=provider,
-        config=AgentConfig(max_iterations=3),
+        config=AgentConfig(
+            max_iterations=3,
+            timeout=timeout,
+            iteration_timeout=iteration_timeout,
+        ),
         tool_definitions=[_tool_def("request_user_input")],
         tool_handler=_request_user_input,
         session_key="agent:main:webchat:deferred-input",
@@ -880,19 +904,48 @@ async def test_deferred_user_input_resumes_same_tool_call_without_user_injection
 
     stream = agent.run_turn("make a plan")
     events = []
-    async for event in stream:
-        events.append(event)
-        if isinstance(event, ToolResultEvent):
-            payload = json.loads(event.result)
-            if payload.get("status") == "input_required":
-                assert len(provider.calls) == 1
-                assert payload["request_id"]
-                broker.resolve(
-                    session_key="agent:main:webchat:deferred-input",
-                    request_id=payload["request_id"],
-                    fields={"scope": "Core"},
-                )
+    request: dict[str, Any] = {}
 
+    def answer() -> None:
+        broker.resolve(
+            session_key="agent:main:webchat:deferred-input",
+            request_id=request["request_id"],
+            fields={"scope": "Core"},
+        )
+
+    async def consume() -> None:
+        nonlocal clock_offset
+        async for event in stream:
+            events.append(event)
+            if isinstance(event, ToolResultEvent):
+                payload = json.loads(event.result)
+                if payload.get("status") == "input_required":
+                    assert len(provider.calls) == 1
+                    request.update(payload)
+                    if answer_phase == "published":
+                        # The consumer can keep the pending event on screen
+                        # before the generator reaches wait_for_response.
+                        clock_offset += 120.0
+                    if answer_phase != "waiting":
+                        answer()
+
+    consumer = asyncio.create_task(consume())
+    try:
+        if answer_phase == "waiting":
+            await asyncio.wait_for(waiting.wait(), timeout=5)
+            assert not consumer.done()
+            clock_offset += 120.0
+            answer()
+        # A published-phase jump also advances asyncio's watchdog clock;
+        # retain five real seconds beyond the simulated human wait.
+        await asyncio.wait_for(consumer, timeout=125 if answer_phase == "published" else 5)
+    finally:
+        if not consumer.done():
+            consumer.cancel()
+        await asyncio.gather(consumer, return_exceptions=True)
+
+    assert broker.pending_for_session("agent:main:webchat:deferred-input") == []
+    assert not any(event.kind == "error" for event in events)
     tool_results = [
         event for event in events if isinstance(event, ToolResultEvent)
     ]
@@ -922,6 +975,89 @@ async def test_deferred_user_input_resumes_same_tool_call_without_user_injection
     assert not any(
         message.role == "user" and _text_block_texts(message) == ["Core"]
         for message in second_request
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", ["cancelled", "failed"])
+async def test_deferred_user_input_cleans_up_when_wait_does_not_complete(
+    monkeypatch: pytest.MonkeyPatch,
+    outcome: str,
+) -> None:
+    provider = _DeferredUserInputProvider()
+    broker = StructuredUserInputBroker()
+    session_key = "agent:main:webchat:interrupted-input"
+    waiting = asyncio.Event()
+    fail_wait = asyncio.Event()
+    original_wait = broker.wait_for_response
+
+    async def wait_for_response(request_id: str) -> dict[str, Any]:
+        waiting.set()
+        if outcome == "failed":
+            await fail_wait.wait()
+            raise RuntimeError("synthetic input transport failure")
+        return await original_wait(request_id)
+
+    monkeypatch.setattr(broker, "wait_for_response", wait_for_response)
+
+    async def request_user_input(call: ToolCall) -> ToolResult:
+        return ToolResult(
+            tool_use_id=call.tool_use_id,
+            tool_name=call.tool_name,
+            content=json.dumps(
+                {
+                    "status": "input_required",
+                    "kind": "user_input",
+                    "paused": True,
+                    "clarify_schema": {
+                        "fields": [{"name": "scope", "type": "string", "required": True}],
+                    },
+                },
+            ),
+            terminates_turn=True,
+        )
+
+    agent = Agent(
+        provider=provider,
+        config=AgentConfig(max_iterations=3),
+        tool_definitions=[_tool_def("request_user_input")],
+        tool_handler=request_user_input,
+        session_key=session_key,
+        tool_context=ToolContext(
+            session_key=session_key,
+            task_id="interrupted-input-task",
+            user_input_provider=broker,
+        ),
+    )
+    events = []
+
+    async def consume() -> None:
+        async for event in agent.run_turn("make a plan"):
+            events.append(event)
+
+    consumer = asyncio.create_task(consume())
+    try:
+        await asyncio.wait_for(waiting.wait(), timeout=5)
+        assert len(broker.pending_for_session(session_key)) == 1
+        if outcome == "cancelled":
+            consumer.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await consumer
+        else:
+            fail_wait.set()
+            with pytest.raises(RuntimeError, match="synthetic input transport failure"):
+                await asyncio.wait_for(consumer, timeout=5)
+    finally:
+        if not consumer.done():
+            consumer.cancel()
+        await asyncio.gather(consumer, return_exceptions=True)
+
+    assert broker.pending_for_session(session_key) == []
+    assert len(provider.calls) == 1
+    assert not any(
+        isinstance(event, ToolResultEvent)
+        and json.loads(event.result).get("status") == "answered"
+        for event in events
     )
 
 
