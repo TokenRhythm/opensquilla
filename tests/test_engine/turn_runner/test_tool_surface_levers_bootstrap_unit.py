@@ -1,16 +1,4 @@
-"""Bootstrap-stage env threading for the tool-surface levers.
-
-Covers OPENSQUILLA_PROJECTION_SIGNAL_HINTS (off by default). Motivation: this
-knob must flow through the single sanctioned parse site
-(agent_bootstrap_stage) into AgentConfig with the SAME on/off vocabulary the
-runtime gate uses, so an unrecognized value fails at bootstrap instead of
-surviving as False and then raising mid-turn when the agent re-reads the env.
-The other tool-surface levers intentionally have no AgentConfig field:
-OPENSQUILLA_REPEATED_CALL_NOTICE is read from the environment by the dispatch
-layer per call, and OPENSQUILLA_TOOL_DESCRIPTION_OVERRIDES is resolved by the
-runtime per turn — a config field for either would be dead state the manifest
-could misreport.
-"""
+"""Bootstrap-stage compatibility for tool-surface controls."""
 
 from __future__ import annotations
 

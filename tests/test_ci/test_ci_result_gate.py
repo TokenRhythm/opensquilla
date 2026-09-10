@@ -42,6 +42,48 @@ def test_ci_result_gate_accepts_baseline_plan() -> None:
     assert check_ci_results(_env_for(BASELINE_SUITES)) == []
 
 
+def _partial_env() -> dict[str, str]:
+    suites = set(KNOWN_SUITES) - {"python-targeted", "frontend-validation"}
+    return {
+        **_env_for(suites), "GITHUB_EVENT_NAME": "merge_group", "QUEUE_PARTIAL": "true",
+        "QUEUE_EVIDENCE_RESULT": "success", "QUEUE_CANARY_RESULT": "success",
+        "QUEUE_SOURCE_RUN_ID": "123", "QUEUE_REUSED_SUITES": '["frontend-validation"]',
+    }
+
+
+def test_partial_gate_keeps_shared_frontend_job_and_requires_full_coverage() -> None:
+    env = _partial_env()
+    assert env["RESULT_FRONTEND"] == "success"  # Wheel roundtrip still runs.
+    assert env["RESULT_CONTRACT_WINDOWS"] == "skipped"
+    assert check_ci_results(env) == []
+
+
+@pytest.mark.parametrize("key,value", [
+    ("QUEUE_EVIDENCE_RESULT", "failure"), ("QUEUE_EVIDENCE_RESULT", "skipped"),
+    ("QUEUE_CANARY_RESULT", "cancelled"), ("QUEUE_CANARY_RESULT", "failure"),
+    ("QUEUE_SOURCE_RUN_ID", ""), ("QUEUE_SOURCE_RUN_ID", "0"),
+    ("GITHUB_EVENT_NAME", "pull_request"), ("QUEUE_REUSED_SUITES", "[]"),
+    ("QUEUE_REUSED_SUITES", '["windows-high-risk"]'),
+    ("QUEUE_REUSED_SUITES", '["frontend-validation","frontend-validation"]'),
+    ("QUEUE_REUSED_SUITES", "null"), ("QUEUE_REUSED_SUITES", '[{}]'),
+    ("RESULT_WINDOWS_FULL", "skipped"), ("RESULT_WINDOWS_FULL", "failure"),
+    ("RESULT_FRONTEND", "failure"), ("RESULT_CONTRACT_WINDOWS", "failure"),
+    ("RESULT_PLANNER", "cancelled"),
+    ("QUEUE_PARTIAL", ""), ("QUEUE_PARTIAL", "false"), ("QUEUE_PARTIAL", "invalid"),
+])
+def test_partial_gate_cannot_hide_missing_failed_or_cancelled_checks(key: str, value: str) -> None:
+    env = _partial_env()
+    env[key] = value
+    assert check_ci_results(env)
+
+
+def test_partial_gate_rejects_an_unaccounted_suite_even_with_green_remaining_jobs() -> None:
+    env = _partial_env()
+    required = set(json.loads(env["REQUIRED_SUITES"])) - {"windows-high-risk"}
+    env.update(_env_for(required))
+    assert any("partition" in error for error in check_ci_results(env))
+
+
 @pytest.mark.parametrize("result", ["skipped", "failure", "cancelled", ""])
 def test_frontend_requires_complete_verification_profile(result: str) -> None:
     env = _env_for(BASELINE_SUITES | {"frontend-validation"})

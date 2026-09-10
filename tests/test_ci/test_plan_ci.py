@@ -1209,6 +1209,12 @@ def test_python_dependency_changes_select_reviewed_full_ecosystem_coverage(
         suite_config["suites"]["frontend-validation"]["execution_inputs"]
     )
     assert {".gitattributes", "pyproject.toml", "uv.lock"} <= contract_inputs
+    assert {"src/opensquilla/__init__.py", "src/opensquilla/contracts/**"} <= contract_inputs
+    assert _platform_cells(plan, "frontend-validation") == {
+        ("ubuntu-latest", "validation"),
+        ("ubuntu-latest", "contract-verification"),
+        ("windows-latest", "contract-determinism"),
+    }
 
 
 @pytest.mark.parametrize(

@@ -235,10 +235,6 @@ def _native_is_file(path: str | Path) -> bool:
     return os.path.isfile(_native_io_path(path))
 
 
-def _native_is_dir(path: str | Path) -> bool:
-    return os.path.isdir(_native_io_path(path))
-
-
 def _read_config(home: Path) -> _ConfigView:
     config_path = home / "config.toml"
     try:

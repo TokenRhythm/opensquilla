@@ -1,6 +1,5 @@
 import assert from 'node:assert/strict'
 
-import { DesktopContextLock } from '../dist/desktop-context-lock.js'
 import { DesktopWriterAdmission } from '../dist/desktop-writer-admission.js'
 
 const writers = new DesktopWriterAdmission()
@@ -38,45 +37,5 @@ exclusive.finish()
 writers.reopen(exclusive.admissionToken)
 assert.equal(writers.closed, false)
 assert.equal(writers.activeCount, 0)
-
-const contextLock = new DesktopContextLock()
-let releaseFirst = () => {}
-let markFirstStarted = () => {}
-const firstMayFinish = new Promise((resolve) => {
-  releaseFirst = resolve
-})
-const firstStarted = new Promise((resolve) => {
-  markFirstStarted = resolve
-})
-const order = []
-const first = contextLock.runExclusive('profile-context', async () => {
-  order.push('first-start')
-  markFirstStarted()
-  await firstMayFinish
-  order.push('first-end')
-})
-const second = contextLock.runExclusive('profile-context', () => {
-  order.push('second')
-})
-await firstStarted
-assert.deepEqual(order, ['first-start'], 'same-key operations must not overlap')
-releaseFirst()
-await Promise.all([first, second])
-assert.deepEqual(order, ['first-start', 'first-end', 'second'])
-
-await assert.rejects(
-  contextLock.runExclusive('reentrant', () => contextLock.runExclusive('reentrant', () => {})),
-  /cannot be re-entered/,
-)
-await assert.rejects(
-  contextLock.runExclusive('failure-recovery', () => {
-    throw new Error('synthetic failure')
-  }),
-  /synthetic failure/,
-)
-await contextLock.runExclusive('failure-recovery', () => {
-  order.push('recovered')
-})
-assert.equal(order.at(-1), 'recovered', 'a rejected operation must not poison the queue')
 
 console.log('desktop profile substrate checks passed')

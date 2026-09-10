@@ -102,16 +102,6 @@ def _document_unsupported_fallback_text(title: str | None) -> str:
     return f"[document attached but not consumable by this model] ({label})"
 
 
-def _has_document_block(messages: list[Message]) -> bool:
-    for msg in messages:
-        if isinstance(msg.content, str):
-            continue
-        for block in msg.content:
-            if getattr(block, "type", None) == "document":
-                return True
-    return False
-
-
 def _build_message_payload(
     msg: Message,
     model: str | None = None,

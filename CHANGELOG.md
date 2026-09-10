@@ -16,6 +16,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Changed
 
+- Retired optional runtime experiments: strict/variant finalize challenges,
+  submit review, patch-evidence prompts, tool-description overrides, tool-loop
+  observation, runtime capsules, text-only tool nudges, and independent deadline
+  thinking cutoffs. Legacy configuration fields remain accepted but inert.
+  Base evidence gates, recovery, tool-result retrieval, Plan/Goal delivery, and
+  deadline wrap-up remain available. Strict-only counters and the retired
+  observers no longer emit runtime diagnostics.
 - The bundled Skill catalog now exposes eight ordinary entry points and three
   stable Meta workflows, with coding instructions available in coding mode.
   Internal helpers remain available to their owning workflows. The optional

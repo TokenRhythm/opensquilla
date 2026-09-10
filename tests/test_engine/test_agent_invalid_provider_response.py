@@ -357,7 +357,7 @@ async def test_length_capped_reasoning_recovery_disables_thinking_on_next_call(
 
 
 @pytest.mark.asyncio
-async def test_tool_loop_observer_logs_reasoning_only_runtime_event(tmp_path) -> None:
+async def test_retired_tool_loop_observer_keeps_reasoning_only_recovery(tmp_path) -> None:
     provider = _SequenceProvider(
         [
             [
@@ -396,26 +396,13 @@ async def test_tool_loop_observer_logs_reasoning_only_runtime_event(tmp_path) ->
 
     events = [event async for event in agent.run_turn("hello")]
 
-    assert any(event.kind == "done" for event in events)
+    assert len(provider.calls) == 2
+    assert any(event.kind == "done" and event.text == "ok" for event in events)
     logged = [json.loads(line) for line in runtime_events_path.read_text().splitlines()]
     observer_events = [
         event for event in logged if event.get("mechanism") == "tool_loop_observer"
     ]
-    assert [event["reason"] for event in observer_events] == ["reasoning_only"]
-    assert observer_events[0]["feature"] == "runtime_observer"
-    assert observer_events[0]["injected_to_model"] is False
-    assert observer_events[0]["iteration"] == 1
-    assert observer_events[0]["session_key"] == "agent:test:runtime-observer"
-    assert observer_events[0]["evidence"]["post_tool_turn"] is False
-    assert observer_events[0]["details"]["post_tool_turn"] is False
-    assert observer_events[0]["details"]["reasoning_tokens"] == 5
-    assert observer_events[0]["read_files"] == []
-    assert observer_events[0]["changed_files"] == []
-    assert observer_events[0]["diff_paths"] == []
-    assert observer_events[0]["verification_commands"] == []
-    assert observer_events[0]["hint_text_sha256"] is None
-    assert observer_events[0]["trigger_confidence"] == "observed_runtime_signal"
-    assert isinstance(observer_events[0]["created_at"], str)
+    assert observer_events == []
 
 
 @pytest.mark.asyncio

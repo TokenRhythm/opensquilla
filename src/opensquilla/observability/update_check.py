@@ -491,10 +491,6 @@ def _endpoint(channel: _UpdateChannel | None = None) -> str:
     return os.environ.get(UPDATE_CHECK_ENDPOINT_ENV, resolved.endpoint).strip()
 
 
-def _releases_page(channel: _UpdateChannel | None = None) -> str:
-    return (channel or _channel_for("0.0.0")).releases_page
-
-
 def _now_ts() -> int:
     return int(datetime.now(UTC).timestamp())
 

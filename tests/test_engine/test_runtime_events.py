@@ -11,7 +11,6 @@ from opensquilla.engine.turn_runner.agent_bootstrap_stage import (
     _runtime_recovery_mode_from_env,
     _source_diff_candidate_mode_from_env,
     _source_diff_preservation_mode_from_env,
-    _tool_loop_observer_mode_from_env,
 )
 
 
@@ -39,17 +38,6 @@ def test_append_runtime_event_ignores_missing_path(tmp_path) -> None:
     append_runtime_event(None, {"feature": "tool_loop_observer"})
 
     assert list(tmp_path.iterdir()) == []
-
-
-def test_tool_loop_observer_mode_env(monkeypatch) -> None:
-    monkeypatch.setenv("OPENSQUILLA_TOOL_LOOP_OBSERVER_MODE", "log")
-    assert _tool_loop_observer_mode_from_env() == "log"
-
-    monkeypatch.setenv("OPENSQUILLA_TOOL_LOOP_OBSERVER_MODE", "invalid")
-    assert _tool_loop_observer_mode_from_env() == "off"
-
-    monkeypatch.delenv("OPENSQUILLA_TOOL_LOOP_OBSERVER_MODE")
-    assert _tool_loop_observer_mode_from_env() == "off"
 
 
 def test_runtime_recovery_modes_from_env(monkeypatch) -> None:

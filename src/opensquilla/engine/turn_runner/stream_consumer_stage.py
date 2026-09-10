@@ -417,26 +417,6 @@ def _supports_generation_reset(inp: StreamConsumerStageInput) -> bool:
     return bool(context.surface.supports_generation_reset)
 
 
-def _control_reason_for_error_code(code: Any) -> Any | None:
-    """Map only typed control/error codes; provider failures stay recoverable."""
-
-    from opensquilla.engine.types import ControlTerminalReason
-
-    normalized = str(code or "").strip().lower().replace("-", "_")
-    return {
-        "agent_runtime_timeout": ControlTerminalReason.HARD_DEADLINE,
-        "hard_deadline": ControlTerminalReason.HARD_DEADLINE,
-        "hard_deadline_exceeded": ControlTerminalReason.HARD_DEADLINE,
-        "shutdown": ControlTerminalReason.SHUTDOWN,
-        "gateway_shutdown": ControlTerminalReason.SHUTDOWN,
-        "cancel": ControlTerminalReason.CANCEL,
-        "cancelled": ControlTerminalReason.CANCEL,
-        "canceled": ControlTerminalReason.CANCEL,
-        "platform_validation": ControlTerminalReason.PLATFORM_VALIDATION,
-        "platform_safety": ControlTerminalReason.PLATFORM_SAFETY,
-        "safety_control": ControlTerminalReason.PLATFORM_SAFETY,
-    }.get(normalized)
-
 # ---------------------------------------------------------------------------
 # Per-event handler classes
 # ---------------------------------------------------------------------------

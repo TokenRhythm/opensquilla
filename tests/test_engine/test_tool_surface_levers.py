@@ -176,7 +176,7 @@ async def test_fresh_projection_appends_signal_scan_when_enabled(
         tmp_path, runtime_events_path=str(runtime_events_path)
     )
 
-    projected = await agent._canonicalize_tool_result(
+    projected = await agent._project_tool_result_for_llm(
         ToolResult(
             tool_use_id="tool-1",
             tool_name="exec_command",
@@ -225,7 +225,7 @@ async def test_fresh_projection_unchanged_when_env_unset(
         tmp_path, runtime_events_path=str(runtime_events_path)
     )
 
-    projected = await agent._canonicalize_tool_result(
+    projected = await agent._project_tool_result_for_llm(
         ToolResult(
             tool_use_id="tool-1",
             tool_name="exec_command",
@@ -276,7 +276,7 @@ async def test_projection_signal_patterns_env_overrides_default(
         "DIAG_MARKER custom failure channel\n" + ("x" * 20_000)
     )
 
-    projected = await agent._canonicalize_tool_result(
+    projected = await agent._project_tool_result_for_llm(
         ToolResult(
             tool_use_id="tool-1",
             tool_name="exec_command",

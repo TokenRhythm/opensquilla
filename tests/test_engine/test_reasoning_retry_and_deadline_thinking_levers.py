@@ -1,8 +1,7 @@
-"""Provider thinking fallback and opt-in deadline thinking cutoff."""
+"""Provider thinking fallback and retired experiment compatibility."""
 
 from __future__ import annotations
 
-import json
 from collections.abc import AsyncIterator
 from typing import Any
 
@@ -114,6 +113,14 @@ async def test_retired_experiment_config_does_not_preempt_a_normal_turn() -> Non
         provider=provider,
         config=AgentConfig(
             thinking=ThinkingLevel.MEDIUM,
+            timeout=60,
+            deadline_thinking_off_margin_seconds=120,
+            finalize_evidence_strict=True,
+            finalize_variant_challenge=True,
+            submit_review_enabled=True,
+            tool_loop_observer_mode="log",
+            runtime_state_capsule_mode="inject",
+            text_only_tool_recovery_mode="warn_model",
             reasoning_stream_char_cap=5,
             placeholder_escalation_threshold=1,
             mid_budget_no_diff_nudge=True,
@@ -278,190 +285,24 @@ async def test_provider_error_thinking_fallback_strict_off_never_disables() -> N
     assert all(call["config"].thinking is True for call in provider.calls)
 
 
-@pytest.mark.asyncio
-async def test_deadline_thinking_off_disables_thinking_when_margin_reached() -> None:
-    provider = _SequenceProvider([_final_text()])
-    # margin > timeout: the cutoff arms at the first loop-top check.
-    agent = Agent(
-        provider=provider,
-        config=AgentConfig(
-            thinking=ThinkingLevel.MEDIUM,
-            timeout=30.0,
-            deadline_thinking_off_margin_seconds=60,
-        ),
-    )
-
-    events = [event async for event in agent.run_turn("fix the bug")]
-
-    assert any(event.kind == "done" for event in events)
-    disabled_config = provider.calls[0]["config"]
-    assert disabled_config.thinking is False
-    assert disabled_config.thinking_budget_tokens == 0
-    assert disabled_config.thinking_level is ThinkingLevel.OFF
-
-
-@pytest.mark.asyncio
-async def test_deadline_thinking_off_stays_off_for_subsequent_calls() -> None:
-    provider = _SequenceProvider([_echo_tool_call("use-1"), _final_text()])
-    agent = _echo_agent(
-        provider,
-        AgentConfig(
-            thinking=ThinkingLevel.MEDIUM,
-            timeout=30.0,
-            deadline_thinking_off_margin_seconds=60,
-            max_iterations=5,
-            retry_base_backoff_ms=0,
-            retry_max_backoff_ms=0,
-        ),
-    )
-
-    events = [event async for event in agent.run_turn("fix the bug")]
-
-    assert any(event.kind == "done" for event in events)
-    assert len(provider.calls) == 2
-    # Sticky: every call after arming runs with thinking off.
-    for call in provider.calls:
-        disabled_config = call["config"]
-        assert disabled_config.thinking is False
-        assert disabled_config.thinking_budget_tokens == 0
-        assert disabled_config.thinking_level is ThinkingLevel.OFF
-
-
-@pytest.mark.asyncio
-async def test_deadline_thinking_off_default_off() -> None:
-    provider = _SequenceProvider([_final_text()])
-    agent = Agent(
-        provider=provider,
-        config=AgentConfig(thinking=ThinkingLevel.MEDIUM, timeout=30.0),
-    )
-
-    events = [event async for event in agent.run_turn("fix the bug")]
-
-    assert any(event.kind == "done" for event in events)
-    assert provider.calls[0]["config"].thinking is True
-
-
-@pytest.mark.asyncio
-async def test_deadline_thinking_off_not_armed_when_margin_not_reached() -> None:
-    provider = _SequenceProvider([_final_text()])
-    # Large timeout, small margin: the trigger stays far in the future.
-    agent = Agent(
-        provider=provider,
-        config=AgentConfig(
-            thinking=ThinkingLevel.MEDIUM,
-            timeout=3600.0,
-            deadline_thinking_off_margin_seconds=60,
-        ),
-    )
-
-    events = [event async for event in agent.run_turn("fix the bug")]
-
-    assert any(event.kind == "done" for event in events)
-    assert provider.calls[0]["config"].thinking is True
-
-
-@pytest.mark.asyncio
-async def test_deadline_thinking_off_writes_runtime_event(tmp_path) -> None:
-    # Delivery gates read runtime_events.jsonl (the turn-call log is a raw
-    # debug stream run harnesses do not collect): arming must leave a
-    # deadline_thinking_off.armed event so the thinking-disabled endgame
-    # calls can be told apart from a treatment delivery failure.
-    runtime_events_path = tmp_path / "runtime_events.jsonl"
-    provider = _SequenceProvider([_echo_tool_call("use-1"), _final_text()])
-    agent = _echo_agent(
-        provider,
-        AgentConfig(
-            thinking=ThinkingLevel.MEDIUM,
-            timeout=30.0,
-            deadline_thinking_off_margin_seconds=60,
-            runtime_events_path=str(runtime_events_path),
-            max_iterations=5,
-            retry_base_backoff_ms=0,
-            retry_max_backoff_ms=0,
-        ),
-    )
-
-    events = [event async for event in agent.run_turn("fix the bug")]
-
-    assert any(event.kind == "done" for event in events)
-    armed_events = [
-        json.loads(line)
-        for line in runtime_events_path.read_text().splitlines()
-        if line.strip()
-        and json.loads(line).get("name") == "deadline_thinking_off.armed"
-    ]
-    # Arming is sticky and one-shot: exactly one event even though two
-    # provider calls run with thinking off.
-    assert len(armed_events) == 1
-    event = armed_events[0]
-    assert event["feature"] == "deadline_thinking_off"
-    assert event["action"] == "disable_thinking_until_deadline"
-    assert event["reason"] == "deadline_margin"
-    assert event["margin_seconds"] == 60
-    assert 0 <= event["remaining_seconds"] <= 30
-
-
-@pytest.mark.asyncio
-async def test_deadline_thinking_off_unarmed_writes_no_runtime_event(
-    tmp_path,
-) -> None:
-    runtime_events_path = tmp_path / "runtime_events.jsonl"
-    provider = _SequenceProvider([_final_text()])
-    # Large timeout, small margin: the trigger stays far in the future.
-    agent = Agent(
-        provider=provider,
-        config=AgentConfig(
-            thinking=ThinkingLevel.MEDIUM,
-            timeout=3600.0,
-            deadline_thinking_off_margin_seconds=60,
-            runtime_events_path=str(runtime_events_path),
-        ),
-    )
-
-    events = [event async for event in agent.run_turn("fix the bug")]
-
-    assert any(event.kind == "done" for event in events)
-    armed_events = []
-    if runtime_events_path.exists():
-        armed_events = [
-            json.loads(line)
-            for line in runtime_events_path.read_text().splitlines()
-            if line.strip()
-            and json.loads(line).get("name") == "deadline_thinking_off.armed"
-        ]
-    assert armed_events == []
-
-
-def test_env_plumbing_for_both_levers(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_reasoning_only_thinking_fallback_env_plumbing(monkeypatch: pytest.MonkeyPatch) -> None:
     # Helper-level check only; the full env -> bootstrap-stage -> AgentConfig
     # threading is covered in turn_runner/test_agent_bootstrap_stage_unit.py.
     from opensquilla.engine.turn_runner.agent_bootstrap_stage import (
         _bool_from_env,
-        _nonnegative_int_from_env,
     )
 
     monkeypatch.delenv("OPENSQUILLA_REASONING_ONLY_THINKING_FALLBACK", raising=False)
-    monkeypatch.delenv("OPENSQUILLA_DEADLINE_THINKING_OFF_MARGIN_SECONDS", raising=False)
     assert _bool_from_env("OPENSQUILLA_REASONING_ONLY_THINKING_FALLBACK", False) is False
-    assert (
-        _nonnegative_int_from_env("OPENSQUILLA_DEADLINE_THINKING_OFF_MARGIN_SECONDS", 0)
-        == 0
-    )
     monkeypatch.setenv("OPENSQUILLA_REASONING_ONLY_THINKING_FALLBACK", "1")
-    monkeypatch.setenv("OPENSQUILLA_DEADLINE_THINKING_OFF_MARGIN_SECONDS", "480")
     assert _bool_from_env("OPENSQUILLA_REASONING_ONLY_THINKING_FALLBACK", False) is True
-    assert (
-        _nonnegative_int_from_env("OPENSQUILLA_DEADLINE_THINKING_OFF_MARGIN_SECONDS", 0)
-        == 480
-    )
 
 
-def test_agent_config_defaults_keep_both_levers_off() -> None:
+def test_agent_config_preserves_thinking_fallback_defaults() -> None:
     config = AgentConfig()
 
     assert config.reasoning_only_thinking_fallback is False
     assert config.provider_error_thinking_fallback is True
-    assert config.deadline_thinking_off_margin_seconds == 0
 
 
 def test_provider_error_thinking_fallback_env_is_strict(

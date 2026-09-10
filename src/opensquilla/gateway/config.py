@@ -317,11 +317,7 @@ class ToolsConfig(BaseModel):
     allow: list[str] = Field(default_factory=list)
     deny: list[str] = Field(default_factory=list)
     also_allow: list[str] = Field(default_factory=list)
-    # Model-facing tool description overrides. Keys name a tool
-    # ("exec_command") or a parameter ("exec_command.command" — dotted keys
-    # must be quoted in TOML); values replace the matching description
-    # verbatim. Inert unless the OPENSQUILLA_TOOL_DESCRIPTION_OVERRIDES env
-    # var enables them ("config"/"on", or a .toml/.json override file path).
+    # Deprecated, unused compatibility slot; preserve construction and saved configs.
     description_overrides: dict[str, str] = Field(default_factory=dict)
     workspace_write_deny_globs: list[str] = Field(default_factory=list)
     file_edit_requires_fresh_read: bool | None = None
@@ -935,9 +931,7 @@ class PromptConfig(BaseModel):
         "headless_repo_coding_scaffold",
     ] = "auto"
     platform_hint_enabled: bool = True
-    # Opt-in additive "Patch Evidence Protocol" system-prompt section for
-    # repo-coding/patching sessions. Overridable per run via the
-    # OPENSQUILLA_PATCH_EVIDENCE_PROTOCOL env var ("on"/"off").
+    # Deprecated, unused compatibility slot; preserve construction and saved configs.
     patch_evidence_protocol: bool = False
     # Opt-in additive "Reproduction Evidence" system-prompt section plus the
     # loop-side finalize-time red-evidence gate (engine.finalize_evidence_gate).
@@ -2733,12 +2727,9 @@ class GatewayConfig(BaseSettings):
     # Source diff candidate ledger records recoverable source edit patches and
     # can surface lost candidate ids in final-diff recovery diagnostics.
     source_diff_candidate_mode: Literal["off", "log", "warn_model"] = "log"
-    # Runtime state capsule is an opt-in provider-visible factual summary for
-    # coding turns. ``log`` records telemetry only; ``inject`` adds it to the
-    # provider request view.
+    # Deprecated, unused compatibility slot; preserve construction and saved configs.
     runtime_state_capsule_mode: Literal["off", "log", "inject"] = "off"
-    # Text-only tool recovery is an opt-in guard for tool-capable turns where
-    # a model emits prose instead of a tool call.
+    # Deprecated, unused compatibility slot; preserve construction and saved configs.
     text_only_tool_recovery_mode: Literal["off", "log", "warn_model"] = "off"
     # Provider request timeout (single LLM HTTP/streaming request).
     llm_request_timeout_seconds: float = 120.0

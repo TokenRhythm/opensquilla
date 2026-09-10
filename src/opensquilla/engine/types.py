@@ -828,31 +828,17 @@ class AgentConfig:
     # Finalize-time red-evidence gate (see engine.finalize_evidence_gate).
     # Off by default; enabled per run via OPENSQUILLA_FINALIZE_EVIDENCE_GATE.
     finalize_evidence_gate_enabled: bool = False
-    # Strict mode for the finalize-time evidence gate: adds the
-    # zero_verification trigger (a change shipped without ever running a
-    # verification-level command draws one bounded challenge). Red-first
-    # state stays report-only. Implies the gate itself (strict on activates
-    # the tracker even when the base flag is off). Off by default; enabled
-    # per run via OPENSQUILLA_FINALIZE_EVIDENCE_STRICT.
+    # Deprecated, unused compatibility slot; preserve construction and saved configs.
     finalize_evidence_strict: bool = False
-    # Review-on-submit checkpoint (see engine.submit_review). Surfaces a
-    # ``submit`` tool and, when the model finishes with a non-empty diff, shows
-    # it a general hygiene checklist plus its own diff exactly once before the
-    # turn finalizes. Off by default; enabled per run via
-    # OPENSQUILLA_SUBMIT_REVIEW. ``submit_review_diff_max_chars`` bounds the diff
-    # body echoed into context (the per-file summary is always shown in full).
+    # Deprecated, unused compatibility slot; preserve construction and saved configs.
     submit_review_enabled: bool = False
+    # Deprecated, unused compatibility slot; preserve construction and saved configs.
     submit_review_diff_max_chars: int = 20000
     # Deprecated, unused compatibility slot; preserve positional/keyword construction.
     patch_hygiene_block_mode: Literal["off", "test_paths", "protected_paths"] = "off"
     # Deprecated, unused compatibility slot; preserve positional/keyword construction.
     scratch_verify_mirror: bool = False
-    # Finalize-time variant-sweep challenge. When on, the first finalizing
-    # response after source edits receives ONE uniform challenge turn asking
-    # the model to enumerate the distinct input/construct classes reachable
-    # by its changed code paths and run its verification against each. Fires
-    # at most once per turn and never spends the last LLM call or deadline
-    # slack. Off by default; set via OPENSQUILLA_FINALIZE_VARIANT_CHALLENGE.
+    # Deprecated, unused compatibility slot; preserve construction and saved configs.
     finalize_variant_challenge: bool = False
     # Keep rejection feedback visible when blocked compacted-placeholder tool
     # calls are projected out of provider requests: the blocked tool_use keeps
@@ -884,11 +870,7 @@ class AgentConfig:
     # with OPENSQUILLA_PROVIDER_ERROR_THINKING_FALLBACK so every request keeps
     # the frozen thinking contract.
     provider_error_thinking_fallback: bool = True
-    # Force thinking off for every provider call once remaining wall-clock
-    # time drops below this many seconds. 0 = off. Complements the wrap-up
-    # directive: the nudge alone leaves thinking enabled, so the model can
-    # still spend the entire margin inside a single reasoning stream. Set via
-    # OPENSQUILLA_DEADLINE_THINKING_OFF_MARGIN_SECONDS.
+    # Deprecated, unused compatibility slot; preserve construction and saved configs.
     deadline_thinking_off_margin_seconds: int = 0
     # Deprecated, unused compatibility slot; preserve positional/keyword construction.
     reasoning_stream_char_cap: int = 0
@@ -947,14 +929,17 @@ class AgentConfig:
     # retrieve_tool_result call for the first match. Off by default; enabled
     # via OPENSQUILLA_PROJECTION_SIGNAL_HINTS.
     projection_signal_hints: bool = False
+    # Deprecated, unused compatibility slot; preserve construction and saved configs.
     tool_loop_observer_mode: Literal["off", "log"] = "off"
     runtime_recovery_mode: Literal["off", "log", "warn_model"] = "log"
     runtime_recovery_source_loop_max_nudges: int = 1
     final_diff_contract_mode: Literal["off", "log", "warn_model"] = "log"
     source_diff_preservation_mode: Literal["off", "log", "block"] = "log"
     source_diff_candidate_mode: Literal["off", "log", "warn_model"] = "log"
+    # Deprecated, unused compatibility slot; preserve construction and saved configs.
     runtime_state_capsule_mode: Literal["off", "log", "inject"] = "off"
     post_tool_empty_recovery_mode: Literal["off", "log", "warn_model"] = "log"
+    # Deprecated, unused compatibility slot; preserve construction and saved configs.
     text_only_tool_recovery_mode: Literal["off", "log", "warn_model"] = "off"
     reasoning_prefill_recovery_mode: Literal["off", "log", "recover"] = "log"
     runtime_events_path: str | None = None

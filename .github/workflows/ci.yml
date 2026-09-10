@@ -31,6 +31,9 @@ jobs:
     timeout-minutes: 5
     outputs:
       reusable: ${{ steps.verify.outputs.reusable || 'false' }}
+      partial: ${{ steps.verify.outputs.partial || 'false' }}
+      partial_plan: ${{ steps.verify.outputs.partial_plan }}
+      reused_suites: ${{ steps.verify.outputs.reused_suites || '[]' }}
       reason: ${{ steps.verify.outputs.reason || steps.mode.outputs.reason }}
       reason_code: ${{ steps.verify.outputs.reason_code || steps.mode.outputs.reason_code }}
       source_run_id: ${{ steps.verify.outputs.source_run_id }}
@@ -44,7 +47,6 @@ jobs:
       source_successful_suites: ${{ steps.verify.outputs.source_successful_suites }}
       source_planner_digest: ${{ steps.verify.outputs.source_planner_digest }}
       source_suite_execution_digests: ${{ steps.verify.outputs.source_suite_execution_digests }}
-      combined_smoke_suites: ${{ steps.verify.outputs.combined_smoke_suites || '[]' }}
     steps:
       - name: Validate optimization mode
         id: mode
@@ -95,7 +97,7 @@ jobs:
           QUEUE_BASE_SHA: ${{ steps.verify.outputs.queue_base_sha }}
           QUEUE_HEAD_SHA: ${{ steps.verify.outputs.queue_head_sha }}
           QUEUE_TREE_SHA: ${{ steps.verify.outputs.queue_tree_sha }}
-          COMBINED_SMOKE_SUITES: ${{ steps.verify.outputs.combined_smoke_suites || '[]' }}
+          REUSED_SUITES: ${{ steps.verify.outputs.reused_suites || '[]' }}
         shell: bash
         run: |
           {
@@ -107,7 +109,7 @@ jobs:
             echo "- Candidates: \`${CANDIDATE_COUNT}\`"
             echo "- Artifact: \`${ARTIFACT_NAME}\`"
             echo "- Queue base/head/tree: \`${QUEUE_BASE_SHA}\` / \`${QUEUE_HEAD_SHA}\` / \`${QUEUE_TREE_SHA}\`"
-            echo "- Combined-tree domain smokes: \`${COMBINED_SMOKE_SUITES}\`"
+            echo "- Reused suites: \`${REUSED_SUITES}\` (all other full-matrix suites must run)"
             if [[ "${REASON_CODE}" == "tree_mismatch" ]]; then
               echo "- Fast-path note: the PR evidence does not match this queue tree, so this entry runs the full fail-closed matrix. If main advanced, refresh the PR against the latest main and wait for a new green PR CI run before requeueing. Reuse is always decided against the future entry's exact base and tree."
             fi
@@ -208,15 +210,21 @@ jobs:
 
       - name: Build canonical suite plan
         id: plan
+        env:
+          QUEUE_PARTIAL: ${{ github.event_name == 'merge_group' && env.CI_OPTIMIZATION_MODE == 'enforce' && needs.queue-attestation.result == 'success' && needs.queue-attestation.outputs.partial == 'true' }}
+          QUEUE_PARTIAL_PLAN: ${{ needs.queue-attestation.outputs.partial_plan }}
         shell: bash
         run: |
           set -euo pipefail
           plan_json="$(python3 .github/scripts/plan_ci.py "${CHANGED_FILES}" --repo .)"
           python3 - "${plan_json}" "${GITHUB_OUTPUT}" <<'PY'
           import json
+          import os
           import sys
 
           plan = json.loads(sys.argv[1])
+          if os.environ.get("QUEUE_PARTIAL") == "true":
+              plan = json.loads(os.environ["QUEUE_PARTIAL_PLAN"])
           output = sys.argv[2]
           with open(output, "a", encoding="utf-8") as handle:
               for key in (
@@ -2047,7 +2055,8 @@ jobs:
               || (github.event_name == 'merge_group'
                   && (vars.CI_OPTIMIZATION_MODE || 'enforce') == 'enforce'
                   && needs.queue-attestation.result == 'success'
-                  && needs.queue-attestation.outputs.reusable == 'true')) }}
+                  && (needs.queue-attestation.outputs.reusable == 'true'
+                      || needs.queue-attestation.outputs.partial == 'true'))) }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     env:
@@ -2228,6 +2237,11 @@ jobs:
           RESULT_RELEASE: ${{ needs.release-packaging.result }}
           RESULT_MANAGED_TOOLCHAIN_ARTIFACTS: ${{ needs.managed-toolchain-artifacts.result }}
           REQUIRED_SUITES: ${{ needs.plan-ci.outputs.required_suites }}
+          QUEUE_PARTIAL: ${{ github.event_name == 'merge_group' && env.CI_OPTIMIZATION_MODE == 'enforce' && needs.queue-attestation.outputs.partial == 'true' }}
+          QUEUE_EVIDENCE_RESULT: ${{ needs.queue-attestation.result }}
+          QUEUE_REUSED_SUITES: ${{ needs.queue-attestation.outputs.reused_suites || '[]' }}
+          QUEUE_SOURCE_RUN_ID: ${{ needs.queue-attestation.outputs.source_run_id }}
+          QUEUE_CANARY_RESULT: ${{ needs.main-canary.result }}
         run: python .github/scripts/check_ci_results.py
 
       - name: Create trusted CI evidence v2
@@ -2236,6 +2250,7 @@ jobs:
           ${{ env.CI_OPTIMIZATION_MODE != 'legacy'
               && (github.event_name == 'pull_request'
                   || (github.event_name == 'merge_group'
+                      && needs.queue-attestation.outputs.partial != 'true'
                       && !(env.CI_OPTIMIZATION_MODE == 'enforce'
                            && needs.queue-attestation.result == 'success'
                            && needs.queue-attestation.outputs.reusable == 'true'))) }}

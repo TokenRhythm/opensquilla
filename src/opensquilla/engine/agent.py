@@ -93,40 +93,12 @@ from opensquilla.engine.runtime_recovery import (
     source_loop_recovery_decision,
     supports_reasoning_prefill_replay,
 )
-from opensquilla.engine.runtime_state_capsule import (
-    build_runtime_state_capsule,
-    runtime_state_capsule_message,
-)
 from opensquilla.engine.session_sanitize import (
     SessionSanitizeResult,
     project_historical_tool_payloads,
     recoverable_tool_result_reference,
     sanitize_session_messages,
     session_payload_chars,
-)
-from opensquilla.engine.submit_review import (
-    SubmitAction,
-    SubmitReviewState,
-    build_submit_review_message,
-    evaluate_explicit_submit,
-)
-from opensquilla.engine.submit_review import (
-    confirmation_message as submit_review_confirmation_message,
-)
-from opensquilla.engine.submit_review import (
-    diff_is_truncated as submit_review_diff_is_truncated,
-)
-from opensquilla.engine.submit_review import (
-    empty_diff_note as submit_review_empty_diff_note,
-)
-from opensquilla.engine.submit_review import (
-    nudge_message as submit_review_nudge_message,
-)
-from opensquilla.engine.submit_review import (
-    observe_tool_activity as submit_review_observe_tool_activity,
-)
-from opensquilla.engine.submit_review import (
-    should_fire_implicit as submit_review_should_fire_implicit,
 )
 from opensquilla.engine.thinking import drop_reasoning
 from opensquilla.engine.tokenjuice_adapter import reduce_tool_result_with_tokenjuice
@@ -438,13 +410,6 @@ _PROVIDER_OUTPUT_CONTINUE_PROMPT = (
     "been written. If a tool call was interrupted or incomplete, regenerate a complete "
     "tool call from scratch."
 )
-_TEXT_ONLY_TOOL_RECOVERY_LIMIT = 2
-_TEXT_ONLY_TOOL_RECOVERY_MESSAGE = (
-    "[Runtime recovery]\n"
-    "Previous assistant turn had text only and no tool calls. If the task still "
-    "requires repo inspection, editing, or verification, call the appropriate tool "
-    "now; if complete, answer briefly."
-)
 _PLAN_RUN_RECONCILIATION_LIMIT = 1
 
 
@@ -538,32 +503,6 @@ _CLEAN_PASSED_FAILED_SUMMARY_RE = re.compile(
 _PLAIN_PASSED_SUMMARY_RE = re.compile(r"\b\d+\s+passed\b", re.IGNORECASE)
 _CLEAN_ERROR_COUNT_RE = re.compile(r"\b0\s+error\(s\)(?:\W|$)", re.IGNORECASE)
 _FAILED_FINALIZATION_RECOVERY_LIMIT = 3
-
-
-def _finalize_variant_challenge_message() -> str:
-    """Uniform one-shot variant-sweep challenge (finalize_variant_challenge).
-
-    Same text for every task and every fire: the wording names failure
-    classes in the abstract (alternate spellings of a construct, boundary
-    values, sibling shapes handled by the same logic, and reworks that
-    change contracts callers observe) and never any task-specific content.
-    """
-
-    return (
-        "[Variant sweep check]\n"
-        "Before you finish: enumerate the distinct input or construct classes "
-        "that can reach the code paths you changed (for example alternate "
-        "syntaxes or spellings of the same construct, boundary or edge-case "
-        "values, and sibling types or code shapes handled by the same logic). "
-        "Then run your verification against each class you listed, not only "
-        "the case from the task description. If any class fails, fix your "
-        "change and re-run until green. If this leads you to rework your "
-        "approach, preserve the behavior contracts callers can observe "
-        "unless the task itself asks to change them: the types of raised or "
-        "propagated errors, public signatures and return types, and output "
-        "formats. If every class passes, finish and briefly note which "
-        "classes you checked."
-    )
 
 
 _CODE_CHANGE_TASK_MARKERS: tuple[str, ...] = (
@@ -2909,7 +2848,6 @@ class Agent:
         self._patch_evidence_ledger: PatchEvidenceLedger | None = None
         self._runtime_git_state = GitRunState.OK
         self._runtime_git_skip_states_recorded: set[GitRunState] = set()
-        self._submit_review_git_state = GitRunState.OK
         if self.config.patch_evidence_ledger_path:
             self._patch_evidence_ledger = PatchEvidenceLedger(
                 path=self.config.patch_evidence_ledger_path,
@@ -6279,14 +6217,6 @@ class Agent:
             terminal_response_text=result.terminal_response_text,
         )
 
-    async def _canonicalize_tool_result(
-        self,
-        result: ToolResult,
-        *,
-        tool_call: ToolCall | None = None,
-    ) -> ToolResult:
-        return await self._project_tool_result_for_llm(result, tool_call=tool_call)
-
     def _record_provider_tool_result_projection(
         self,
         result: ToolResult,
@@ -7328,8 +7258,6 @@ class Agent:
         workspace_diff_recovery_attempted = False
         failed_tool_finalization_recovery_keys: set[str] = set()
         post_tool_empty_recovery_attempted = False
-        text_only_tool_recovery_injections = 0
-        text_only_tool_recovery_pending = False
         plan_run_reconciliation_attempts = 0
         attached_plan_run_id = str(getattr(self._tool_context, "plan_run_id", "") or "").strip()
         plan_run_delivery_only = _plan_run_steps_ready_for_delivery(
@@ -7351,27 +7279,12 @@ class Agent:
         post_write_focused_verification_observed = False
         post_write_focused_verification_success_observed = False
         last_post_write_failed_verification: dict[str, Any] | None = None
-        finalize_evidence_strict = bool(getattr(self.config, "finalize_evidence_strict", False))
         finalize_evidence_tracker = (
-            FinalizeEvidenceTracker(strict=finalize_evidence_strict)
-            if (
-                bool(getattr(self.config, "finalize_evidence_gate_enabled", False))
-                or finalize_evidence_strict
-            )
+            FinalizeEvidenceTracker()
+            if bool(getattr(self.config, "finalize_evidence_gate_enabled", False))
             else None
         )
         finalize_evidence_gate_keys: set[str] = set()
-        submit_review_enabled = (
-            bool(getattr(self.config, "submit_review_enabled", False)) and not attached_plan_run_id
-        )
-        submit_review_state = SubmitReviewState()
-        submit_review_diff_max_chars = int(
-            getattr(self.config, "submit_review_diff_max_chars", 20000)
-        )
-        finalize_variant_challenge_enabled = bool(
-            getattr(self.config, "finalize_variant_challenge", False)
-        )
-        finalize_variant_challenge_fired = False
         recent_failure_anchor_summaries: list[str] = []
         progress_watchdog_mode = getattr(self.config, "progress_watchdog_mode", "log")
         progress_watchdog = ProgressWatchdog(
@@ -8298,54 +8211,6 @@ class Agent:
                             remaining_seconds=int(remaining_seconds),
                             margin_seconds=wrapup_margin_seconds,
                         )
-
-                # Pre-deadline thinking cutoff: once remaining wall clock drops
-                # below the configured margin, thinking stays off for every
-                # remaining provider call so the final stretch is spent on tool
-                # calls rather than a single long reasoning stream.
-                thinking_off_margin_seconds = max(
-                    0,
-                    int(getattr(self.config, "deadline_thinking_off_margin_seconds", 0) or 0),
-                )
-                if (
-                    thinking_off_margin_seconds > 0
-                    and _total_deadline is not None
-                    and not deadline_thinking_off_armed
-                    and _loop.time() > _total_deadline - thinking_off_margin_seconds
-                ):
-                    deadline_thinking_off_armed = True
-                    self._write_turn_call_log(
-                        "turn_policy_decision",
-                        action="deadline_thinking_off",
-                        reason="deadline_margin",
-                        code="deadline_thinking_off",
-                        iteration=iterations,
-                        remaining_seconds=int(max(0.0, _total_deadline - _loop.time())),
-                        margin_seconds=thinking_off_margin_seconds,
-                    )
-                    # The turn-call log is a raw debug stream that run
-                    # harnesses do not collect; the runtime event is what
-                    # lets delivery gates tell this designed endgame
-                    # thinking cutoff (every later call runs
-                    # thinking-disabled) apart from a treatment delivery
-                    # failure.
-                    append_runtime_event(
-                        self.config.runtime_events_path,
-                        {
-                            "feature": "deadline_thinking_off",
-                            "name": "deadline_thinking_off.armed",
-                            "action": "disable_thinking_until_deadline",
-                            "reason": "deadline_margin",
-                            "iteration": iterations,
-                            "remaining_seconds": int(max(0.0, _total_deadline - _loop.time())),
-                            "margin_seconds": thinking_off_margin_seconds,
-                            "session_key": self._session_key,
-                            "agent_id": (
-                                self.config.tool_result_store_agent_id
-                                or self.config.metadata.get("agent_id")
-                            ),
-                        },
-                    )
 
                 iterations += 1
                 # The act-now message answers one reasoning-only failure; a
@@ -11153,30 +11018,6 @@ class Agent:
                             code="document_mutation_proposal_incomplete",
                         )
                         break
-                    if (
-                        attempt_classification.kind != _ProviderAttemptKind.OK
-                        # An engine-chosen preempt truncated the stream; the
-                        # incomplete attempt is self-inflicted, not a provider
-                        # failure signal for the tool-loop observer.
-                        and not _stream_policy_preempt
-                    ):
-                        self._record_tool_loop_runtime_event(
-                            reason=attempt_classification.kind.value,
-                            iteration=iterations,
-                            provider_call_count=turn_llm_calls,
-                            call_attempt=_call_attempt,
-                            provider_retry_attempt=_retry_attempt,
-                            post_tool_turn=post_tool_turn,
-                            got_done_event=_got_done_event,
-                            stop_reason=stop_reason,
-                            tool_call_count=len(tool_calls),
-                            pending_tool_count=len(pending_tools),
-                            visible_text_chars=len(response_text.strip()),
-                            reasoning_chars=len(iter_reasoning_content or ""),
-                            reasoning_tokens=iter_reasoning_tokens,
-                            input_tokens=iter_input_tokens,
-                            output_tokens=iter_output_tokens,
-                        )
                     if not _got_error and attempt_classification.kind != _ProviderAttemptKind.OK:
                         if goal_terminal_final_response_pending:
                             fallback_text = _goal_terminal_final_response_text()
@@ -11983,20 +11824,6 @@ class Agent:
                                 int(getattr(call_chat_cfg, "max_tokens", 0) or 0),
                             ),
                         )
-                        self._record_tool_loop_runtime_event(
-                            reason="provider_empty_response_terminal",
-                            iteration=iterations,
-                            provider_call_count=turn_llm_calls,
-                            call_attempt=_call_attempt,
-                            provider_retry_attempt=_retry_attempt,
-                            post_tool_turn=post_tool_turn,
-                            got_done_event=_got_done_event,
-                            stop_reason=stop_reason,
-                            input_tokens=iter_input_tokens,
-                            output_tokens=iter_output_tokens,
-                            reasoning_tokens=iter_reasoning_tokens,
-                            reasoning_chars=len(iter_reasoning_content or ""),
-                        )
                         if attempt_classification.kind == _ProviderAttemptKind.REASONING_ONLY:
                             if (attempt_classification.stop_reason or "").lower() == "length":
                                 terminal_message = (
@@ -12430,16 +12257,6 @@ class Agent:
                                 provider_retry_attempt=_retry_attempt,
                             )
                         ):
-                            self._record_tool_loop_runtime_event(
-                                reason="provider_empty_response_after_tool",
-                                iteration=iterations,
-                                provider_call_count=turn_llm_calls,
-                                call_attempt=_call_attempt,
-                                provider_retry_attempt=_retry_attempt,
-                                post_tool_turn=post_tool_turn,
-                                provider_error_code=safe_provider_error_code,
-                                retrying=True,
-                            )
                             delay = backoff_sleep(
                                 _retry_attempt,
                                 _fallback.base_backoff_ms,
@@ -13420,43 +13237,6 @@ class Agent:
                         self._execution_context.drop_pending_tool_buffers(
                             "invalid_provider_attempt"
                         )
-                    if text_only_tool_recovery_pending:
-                        text_only_mode = getattr(
-                            self.config,
-                            "text_only_tool_recovery_mode",
-                            "off",
-                        )
-                        self.config.metadata["text_only_tool_recovery_next_action_errors"] = (
-                            self.config.metadata.get(
-                                "text_only_tool_recovery_next_action_errors",
-                                0,
-                            )
-                            + 1
-                        )
-                        decision = RuntimeRecoveryDecision(
-                            action="observe",
-                            mechanism="text_only_tool_recovery",
-                            reason="next_action_after_recovery",
-                            mode=str(text_only_mode),
-                            injected_to_model=False,
-                            details={
-                                "next_action": "error",
-                                "provider_attempt_kind": final_classification.kind.value,
-                            },
-                        )
-                        self._record_runtime_recovery_event(
-                            decision,
-                            iteration=iterations,
-                            provider_call_count=turn_llm_calls,
-                        )
-                        self._write_turn_call_log(
-                            "runtime_recovery",
-                            action="observe",
-                            mode=text_only_mode,
-                            reason="text_only_next_action",
-                            details=decision.details,
-                        )
-                        text_only_tool_recovery_pending = False
                     logger.warning(
                         "provider.invalid_response_unhandled",
                         session_key=self._session_key,
@@ -13546,45 +13326,6 @@ class Agent:
                         presentation="answer",
                         generation_epoch=generation_epoch,
                     )
-                if text_only_tool_recovery_pending:
-                    text_only_mode = getattr(
-                        self.config,
-                        "text_only_tool_recovery_mode",
-                        "off",
-                    )
-                    next_action = (
-                        "tool_call" if tool_calls else "text" if visible_text.strip() else "empty"
-                    )
-                    metadata_key: str | None
-                    metadata_key = f"text_only_tool_recovery_next_action_{next_action}s"
-                    self.config.metadata[metadata_key] = (
-                        self.config.metadata.get(metadata_key, 0) + 1
-                    )
-                    decision = RuntimeRecoveryDecision(
-                        action="observe",
-                        mechanism="text_only_tool_recovery",
-                        reason="next_action_after_recovery",
-                        mode=str(text_only_mode),
-                        injected_to_model=False,
-                        details={
-                            "next_action": next_action,
-                            "tool_call_count": len(tool_calls),
-                            "visible_text_chars": len(visible_text),
-                        },
-                    )
-                    self._record_runtime_recovery_event(
-                        decision,
-                        iteration=iterations,
-                        provider_call_count=turn_llm_calls,
-                    )
-                    self._write_turn_call_log(
-                        "runtime_recovery",
-                        action="observe",
-                        mode=text_only_mode,
-                        reason="text_only_next_action",
-                        details=decision.details,
-                    )
-                    text_only_tool_recovery_pending = False
                 if visible_text:
                     final_text_parts.append(visible_text)
 
@@ -14003,90 +13744,6 @@ class Agent:
                         )
                         yield terminal_error
                         break
-                    text_only_mode = getattr(
-                        self.config,
-                        "text_only_tool_recovery_mode",
-                        "off",
-                    )
-                    tool_choice_none = (
-                        isinstance(call_chat_cfg.tool_choice, str)
-                        and call_chat_cfg.tool_choice.strip().lower() == "none"
-                    )
-                    text_only_candidate = (
-                        text_only_mode != "off"
-                        and bool(visible_text.strip())
-                        and bool(provider_tools_for_call)
-                        and not tool_choice_none
-                        and not last_executed_results
-                        and not max_iterations_finalization_pending
-                        and not artifact_delivery_final_response_pending
-                    )
-                    if text_only_candidate:
-                        self.config.metadata["text_only_tool_recovery_detections"] = (
-                            self.config.metadata.get(
-                                "text_only_tool_recovery_detections",
-                                0,
-                            )
-                            + 1
-                        )
-                        should_inject_text_only = (
-                            text_only_mode == "warn_model"
-                            and text_only_tool_recovery_injections < _TEXT_ONLY_TOOL_RECOVERY_LIMIT
-                        )
-                        decision = RuntimeRecoveryDecision(
-                            action="nudge" if should_inject_text_only else "observe",
-                            mechanism="text_only_tool_recovery",
-                            reason="text_only_no_tool_call",
-                            mode=str(text_only_mode),
-                            injected_to_model=should_inject_text_only,
-                            message=(
-                                _TEXT_ONLY_TOOL_RECOVERY_MESSAGE
-                                if should_inject_text_only
-                                else None
-                            ),
-                            details={
-                                "visible_text_chars": len(visible_text),
-                                "available_tool_count": len(provider_tools_for_call or []),
-                                "recovery_injections": text_only_tool_recovery_injections,
-                                "limit": _TEXT_ONLY_TOOL_RECOVERY_LIMIT,
-                            },
-                        )
-                        self._record_runtime_recovery_event(
-                            decision,
-                            iteration=iterations,
-                            provider_call_count=turn_llm_calls,
-                        )
-                        self._write_turn_call_log(
-                            "runtime_recovery",
-                            action=decision.action,
-                            mode=text_only_mode,
-                            reason=decision.reason,
-                            details=decision.details,
-                        )
-                        if should_inject_text_only:
-                            if visible_text and final_text_parts:
-                                final_text_parts.pop()
-                            turn_messages.append(
-                                Message(role="user", content=_TEXT_ONLY_TOOL_RECOVERY_MESSAGE)
-                            )
-                            runtime_recovery_scaffolding_pending = True
-                            text_only_tool_recovery_pending = True
-                            text_only_tool_recovery_injections += 1
-                            self.config.metadata["text_only_tool_recovery_injections"] = (
-                                self.config.metadata.get(
-                                    "text_only_tool_recovery_injections",
-                                    0,
-                                )
-                                + 1
-                            )
-                            yield WarningEvent(
-                                code="text_only_tool_recovery",
-                                message=(
-                                    "The model returned text without a tool call; "
-                                    "asking it to call tools if the task is not complete."
-                                ),
-                            )
-                            continue
                     if (
                         progress_watchdog_mode == "warn_model"
                         and not max_iterations_finalization_pending
@@ -14122,19 +13779,6 @@ class Agent:
                             recovery_message = self._failed_tool_finalization_recovery_message(
                                 failed_tool_finalization
                             )
-                            self._record_tool_loop_runtime_event(
-                                reason=str(failed_tool_finalization["reason"]),
-                                iteration=iterations,
-                                provider_call_count=turn_llm_calls,
-                                workspace_write_count=len(
-                                    self._effective_workspace_write_records()
-                                ),
-                                injected_to_model=True,
-                                hint_text_sha256=hashlib.sha256(
-                                    recovery_message.encode("utf-8")
-                                ).hexdigest(),
-                                details=failed_tool_finalization,
-                            )
                             if visible_text and final_text_parts:
                                 final_text_parts.pop()
                             turn_messages.append(Message(role="user", content=recovery_message))
@@ -14161,7 +13805,6 @@ class Agent:
                                 ),
                             )
                             continue
-                    submit_review_red_detected = False
                     if (
                         finalize_evidence_tracker is not None
                         and not max_iterations_finalization_pending
@@ -14176,7 +13819,6 @@ class Agent:
                             else None
                         )
                         if gate_observation is not None and gate_observation.should_challenge:
-                            submit_review_red_detected = True
                             gate_key = finalize_evidence_gate_key(gate_observation)
                             # Never spend the run's last LLM call or deadline
                             # slack on a challenge: with no headroom for a
@@ -14245,74 +13887,6 @@ class Agent:
                                 )
                                 continue
                     if (
-                        finalize_variant_challenge_enabled
-                        and not finalize_variant_challenge_fired
-                        and not max_iterations_finalization_pending
-                        and not artifact_delivery_final_response_pending
-                    ):
-                        variant_status = await self._workspace_git_status_porcelain()
-                        if variant_status and variant_status.strip():
-                            # Same headroom rule as the evidence gate: never
-                            # spend the run's last LLM call or deadline slack
-                            # on a challenge.
-                            variant_headroom = _turn_llm_call_budget_error(
-                                turn_llm_calls + 1
-                            ) is None and (
-                                _total_deadline is None or _loop.time() < _total_deadline
-                            )
-                            variant_message = (
-                                _finalize_variant_challenge_message() if variant_headroom else None
-                            )
-                            self.config.metadata["finalize_variant_challenge_detections"] = (
-                                self.config.metadata.get(
-                                    "finalize_variant_challenge_detections",
-                                    0,
-                                )
-                                + 1
-                            )
-                            self._record_runtime_event(
-                                "finalize_variant_challenge.challenge",
-                                feature="finalize_variant_challenge",
-                                reason="finalize_with_workspace_diff",
-                                iteration=iterations,
-                                provider_call_count=turn_llm_calls,
-                                injected_to_model=bool(variant_message),
-                            )
-                            if variant_message is not None:
-                                # One challenge per turn, fired or not again:
-                                # the sweep is uniform and non-escalating, so
-                                # a second injection would only burn budget.
-                                finalize_variant_challenge_fired = True
-                                if visible_text and final_text_parts:
-                                    final_text_parts.pop()
-                                turn_messages.append(Message(role="user", content=variant_message))
-                                self.config.metadata["finalize_variant_challenge_recoveries"] = (
-                                    self.config.metadata.get(
-                                        "finalize_variant_challenge_recoveries",
-                                        0,
-                                    )
-                                    + 1
-                                )
-                                self._write_turn_call_log(
-                                    "finalize_variant_challenge",
-                                    action="warn",
-                                    mode="on",
-                                    reason="finalize_with_workspace_diff",
-                                    details={
-                                        "iteration": iterations,
-                                        "provider_call_count": turn_llm_calls,
-                                    },
-                                )
-                                yield WarningEvent(
-                                    code="finalize_variant_challenge_recovery",
-                                    message=(
-                                        "The model attempted to finish; asking it "
-                                        "once to sweep the input classes reachable "
-                                        "by its change."
-                                    ),
-                                )
-                                continue
-                    if (
                         progress_watchdog_mode == "warn_model"
                         and not workspace_diff_recovery_attempted
                         and not max_iterations_finalization_pending
@@ -14321,18 +13895,6 @@ class Agent:
                         empty_diff_reason = await self._empty_diff_finalization_reason(visible_text)
                         if empty_diff_reason is not None:
                             recovery_message = self._empty_diff_recovery_message(empty_diff_reason)
-                            self._record_tool_loop_runtime_event(
-                                reason=empty_diff_reason,
-                                iteration=iterations,
-                                provider_call_count=turn_llm_calls,
-                                workspace_write_count=len(
-                                    self._effective_workspace_write_records()
-                                ),
-                                injected_to_model=True,
-                                hint_text_sha256=hashlib.sha256(
-                                    recovery_message.encode("utf-8")
-                                ).hexdigest(),
-                            )
                             workspace_diff_recovery_attempted = True
                             if visible_text and final_text_parts:
                                 final_text_parts.pop()
@@ -14363,89 +13925,6 @@ class Agent:
                                 message=(
                                     "The model attempted to finish without a clear "
                                     "workspace diff; asking it to reassess once."
-                                ),
-                            )
-                            continue
-                    if (
-                        submit_review_enabled
-                        and submit_review_state.stage == 0
-                        and not submit_review_red_detected
-                        and not max_iterations_finalization_pending
-                        and not artifact_delivery_final_response_pending
-                    ):
-                        submit_implicit_headroom_ok = _turn_llm_call_budget_error(
-                            turn_llm_calls + 1
-                        ) is None and (_total_deadline is None or _loop.time() < _total_deadline)
-                        implicit_capture = await self._workspace_submit_review_capture()
-                        if implicit_capture is None:
-                            self._record_runtime_event(
-                                "submit_review.skipped",
-                                feature="submit_review",
-                                reason="git_observation_unavailable",
-                                iteration=iterations,
-                                provider_call_count=turn_llm_calls,
-                                injected_to_model=False,
-                                git_state=self._submit_review_git_state.value,
-                            )
-                        else:
-                            implicit_file_index, implicit_diff_text = implicit_capture
-                            implicit_diff_empty = not (
-                                implicit_file_index.strip() or implicit_diff_text.strip()
-                            )
-                        if implicit_capture is not None and submit_review_should_fire_implicit(
-                            submit_review_state,
-                            enabled=submit_review_enabled,
-                            diff_empty=implicit_diff_empty,
-                            headroom_ok=submit_implicit_headroom_ok,
-                            other_gate_injected=False,
-                            red_detected=submit_review_red_detected,
-                            pending_flags_clear=True,
-                        ):
-                            submit_review_message = build_submit_review_message(
-                                implicit_file_index,
-                                implicit_diff_text,
-                                implicit=True,
-                                max_chars=submit_review_diff_max_chars,
-                            )
-                            submit_review_state.mark_reviewed("implicit")
-                            if visible_text and final_text_parts:
-                                final_text_parts.pop()
-                            turn_messages.append(
-                                Message(role="user", content=submit_review_message)
-                            )
-                            self.config.metadata["submit_review_implicit_recoveries"] = (
-                                self.config.metadata.get(
-                                    "submit_review_implicit_recoveries",
-                                    0,
-                                )
-                                + 1
-                            )
-                            self._record_runtime_event(
-                                "submit_review.implicit",
-                                feature="submit_review",
-                                reason="finalize_on_green_diff",
-                                iteration=iterations,
-                                provider_call_count=turn_llm_calls,
-                                injected_to_model=True,
-                                details={
-                                    "diff_truncated": submit_review_diff_is_truncated(
-                                        implicit_diff_text,
-                                        submit_review_diff_max_chars,
-                                    ),
-                                },
-                            )
-                            self._write_turn_call_log(
-                                "submit_review",
-                                action="warn",
-                                mode="implicit",
-                                reason="finalize_on_green_diff",
-                            )
-                            yield WarningEvent(
-                                code="submit_review_implicit",
-                                message=(
-                                    "The model finished with unreviewed workspace "
-                                    "changes; showing it a review of its own diff "
-                                    "once before finalizing."
                                 ),
                             )
                             continue
@@ -14619,25 +14098,8 @@ class Agent:
                         self._projected_diagnostic_retrieval_gate_tool_result(execution_tc)
                     )
                     if gate_result is not None:
-                        self._record_tool_loop_runtime_event(
-                            reason="workspace_edit_gate_blocked_tool_call",
-                            iteration=iterations,
-                            provider_call_count=turn_llm_calls,
-                            tool_name=tc.tool_name,
-                            gate_details=dict(workspace_edit_gate_details or {}),
-                            workspace_write_count=len(self._effective_workspace_write_records()),
-                            injected_to_model=True,
-                        )
                         res = gate_result
                     elif diagnostic_retrieval_gate_result is not None:
-                        self._record_tool_loop_runtime_event(
-                            reason="projected_diagnostic_requires_retrieval",
-                            iteration=iterations,
-                            provider_call_count=turn_llm_calls,
-                            tool_name=tc.tool_name,
-                            workspace_write_count=len(self._effective_workspace_write_records()),
-                            injected_to_model=True,
-                        )
                         res = diagnostic_retrieval_gate_result
                     elif preflight_result is not None:
                         res = preflight_result
@@ -14751,14 +14213,6 @@ class Agent:
                                     0,
                                 )
                                 + 1
-                            )
-                            self._record_tool_loop_runtime_event(
-                                reason="workspace_edit_gate_patch_recovery_enabled",
-                                iteration=iterations,
-                                provider_call_count=turn_llm_calls,
-                                tool_name=tc.tool_name,
-                                target_paths=sorted(workspace_edit_gate_recovery_read_paths),
-                                injected_to_model=False,
                             )
                     elif gate_recovery_read:
                         workspace_edit_gate_recovery_reads_remaining = max(
@@ -15068,119 +14522,6 @@ class Agent:
                             ),
                         )
                         continue
-                    if (
-                        submit_review_enabled
-                        and tc.tool_name == "submit"
-                        and str(
-                            getattr(
-                                self._tool_context,
-                                "collaboration_mode",
-                                "default",
-                            )
-                        )
-                        != "plan"
-                    ):
-                        # Control-only tool: never dispatched to the registry
-                        # (its body raises). Flush prior work so the captured
-                        # diff reflects every edit in this batch, then answer
-                        # the submit with the review/confirm text directly.
-                        async for event in _flush_parallel_batch(parallel_batch):
-                            yield event
-                        parallel_batch = []
-                        submit_capture = await self._workspace_submit_review_capture()
-                        if submit_capture is None:
-                            unavailable_payload = self._submit_review_git_unavailable_payload(
-                                self._submit_review_git_state
-                            )
-                            submit_result = ToolResult(
-                                tool_use_id=tc.tool_use_id,
-                                tool_name="submit",
-                                content=json.dumps(unavailable_payload, ensure_ascii=False),
-                                is_error=True,
-                                execution_status=runtime_execution_status(
-                                    "error",
-                                    reason=str(unavailable_payload["code"]).lower(),
-                                ),
-                                terminates_turn=True,
-                            )
-                            results_by_id[tc.tool_use_id] = submit_result
-                            dispatch_boundary = submit_result
-                            self._record_runtime_event(
-                                "submit_review.explicit_unavailable",
-                                feature="submit_review",
-                                reason="git_observation_unavailable",
-                                iteration=iterations,
-                                provider_call_count=turn_llm_calls,
-                                injected_to_model=False,
-                                git_state=self._submit_review_git_state.value,
-                                code=unavailable_payload["code"],
-                                terminates_turn=True,
-                            )
-                            continue
-                        submit_file_index, submit_diff_text = submit_capture
-                        submit_diff_empty = not (
-                            submit_file_index.strip() or submit_diff_text.strip()
-                        )
-                        submit_headroom_ok = _turn_llm_call_budget_error(
-                            turn_llm_calls + 1
-                        ) is None and (_total_deadline is None or _loop.time() < _total_deadline)
-                        submit_action = evaluate_explicit_submit(
-                            submit_review_state,
-                            diff_empty=submit_diff_empty,
-                            headroom_ok=submit_headroom_ok,
-                        )
-                        if submit_action is SubmitAction.SHOW_CHECKLIST:
-                            submit_content = build_submit_review_message(
-                                submit_file_index,
-                                submit_diff_text,
-                                implicit=False,
-                                max_chars=submit_review_diff_max_chars,
-                            )
-                        elif submit_action is SubmitAction.NUDGE:
-                            submit_content = submit_review_nudge_message()
-                        elif submit_action is SubmitAction.EMPTY_DIFF_NOTE:
-                            submit_content = submit_review_empty_diff_note()
-                        else:
-                            submit_content = submit_review_confirmation_message()
-                        # A confirming submit finalizes the turn: the model has
-                        # cleared the review handshake and asked to submit, so its
-                        # current workspace changes become the final answer and the
-                        # loop ends here — the same outcome as the model going quiet
-                        # with a non-empty diff. Ending on confirm (rather than
-                        # replying and looping) is what makes a repeated submit
-                        # unable to re-enter this branch, so the confirmed state can
-                        # never re-fire. The checklist/nudge/empty-diff replies keep
-                        # the turn open so the model can act on them.
-                        submit_terminates_turn = submit_action is SubmitAction.CONFIRM
-                        self._record_runtime_event(
-                            "submit_review.explicit",
-                            feature="submit_review",
-                            reason=submit_action.value,
-                            iteration=iterations,
-                            provider_call_count=turn_llm_calls,
-                            injected_to_model=True,
-                            details={
-                                "stage": submit_review_state.stage,
-                                "nudges": submit_review_state.nudges,
-                                "diff_empty": submit_diff_empty,
-                                "diff_truncated": submit_review_diff_is_truncated(
-                                    submit_diff_text,
-                                    submit_review_diff_max_chars,
-                                ),
-                                "terminates_turn": submit_terminates_turn,
-                            },
-                        )
-                        submit_result = ToolResult(
-                            tool_use_id=tc.tool_use_id,
-                            tool_name="submit",
-                            content=submit_content,
-                            is_error=False,
-                            terminates_turn=submit_terminates_turn,
-                        )
-                        results_by_id[tc.tool_use_id] = submit_result
-                        if submit_result.terminates_turn:
-                            dispatch_boundary = submit_result
-                        continue
                     if tc.tool_name == "meta_invoke":
                         async for event in _flush_parallel_batch(parallel_batch):
                             yield event
@@ -15197,11 +14538,6 @@ class Agent:
                         if meta_result is not None and meta_result.terminates_turn:
                             dispatch_boundary = meta_result
                         continue
-                    if submit_review_enabled:
-                        # Any real (non-submit) tool counts as work after a
-                        # review was shown; distinguishes continued work from an
-                        # immediate rubber-stamp re-submit.
-                        submit_review_observe_tool_activity(submit_review_state)
                     policy = _get_tool_concurrency_policy(
                         tc.tool_name,
                         tc.arguments,
@@ -15833,22 +15169,6 @@ class Agent:
                             watchdog_decision.reason,
                             watchdog_decision.details,
                         )
-                    self._record_tool_loop_runtime_event(
-                        reason=watchdog_decision.reason,
-                        iteration=iterations,
-                        provider_call_count=turn_llm_calls,
-                        watchdog_action=watchdog_decision.action,
-                        watchdog_mode=progress_watchdog_mode,
-                        details=watchdog_decision.details,
-                        workspace_write_count=workspace_write_count,
-                        source_context_signature=source_context_signature,
-                        injected_to_model=bool(watchdog_hint_text),
-                        hint_text_sha256=(
-                            hashlib.sha256(watchdog_hint_text.encode("utf-8")).hexdigest()
-                            if watchdog_hint_text
-                            else None
-                        ),
-                    )
                     self._write_turn_call_log(
                         "progress_watchdog",
                         action=watchdog_decision.action,
@@ -17205,101 +16525,6 @@ class Agent:
         self._runtime_git_state = state
         return status
 
-    async def _workspace_submit_review_capture(self) -> tuple[str, str] | None:
-        """Capture ``(per-file summary, unified diff)`` for the submit review.
-
-        The per-file summary comes from ``git status`` (so untracked scratch
-        files appear even though they are absent from ``git diff``); the diff
-        body is ``git diff HEAD`` for tracked changes. ``None`` means Git could
-        not authoritatively observe the repository and must never be treated as
-        an empty diff.
-        """
-        workspace = self._workspace_dir_for_status()
-        if workspace is None:
-            self._submit_review_git_state = GitRunState.NOT_REPOSITORY
-            return None
-
-        def _capture() -> tuple[GitRunState, tuple[str, str] | None]:
-            status_result = run_git(
-                ["status", "--porcelain=v1", "--untracked-files=all"],
-                cwd=workspace,
-                timeout=2.0,
-            )
-            if not status_result.ok:
-                return status_result.state, None
-            diff_result = run_git(["diff", "HEAD"], cwd=workspace, timeout=4.0)
-            if diff_result.ok:
-                diff_text = diff_result.stdout_text
-            else:
-                # ``git diff HEAD`` is invalid in a legitimate unborn
-                # repository. Confirm that this is still a repository with a
-                # symbolic, not-yet-created HEAD before falling back to the
-                # two comparisons that do work there. Other failures remain
-                # unknown and must not be presented as a clean review.
-                repository_result = run_git(
-                    ["rev-parse", "--is-inside-work-tree"],
-                    cwd=workspace,
-                    timeout=2.0,
-                )
-                if not repository_result.ok:
-                    return repository_result.state, None
-                if repository_result.stdout_text.strip().casefold() != "true":
-                    return GitRunState.NOT_REPOSITORY, None
-                head_result = run_git(
-                    ["rev-parse", "--verify", "HEAD"],
-                    cwd=workspace,
-                    timeout=2.0,
-                )
-                if head_result.ok:
-                    return diff_result.state, None
-                if head_result.state is not GitRunState.FAILED:
-                    return head_result.state, None
-                symbolic_head_result = run_git(
-                    ["symbolic-ref", "--quiet", "HEAD"],
-                    cwd=workspace,
-                    timeout=2.0,
-                )
-                if not symbolic_head_result.ok:
-                    return symbolic_head_result.state, None
-                cached_result = run_git(
-                    ["diff", "--cached"],
-                    cwd=workspace,
-                    timeout=4.0,
-                )
-                if not cached_result.ok:
-                    return cached_result.state, None
-                worktree_result = run_git(["diff"], cwd=workspace, timeout=4.0)
-                if not worktree_result.ok:
-                    return worktree_result.state, None
-                diff_text = cached_result.stdout_text + worktree_result.stdout_text
-            ignored_state, ignored_paths = self._workspace_ignored_diff_paths_observed(workspace)
-            if ignored_state is not GitRunState.OK:
-                return ignored_state, None
-            file_index = self._filter_ignored_porcelain_status(
-                status_result.stdout_text,
-                ignored_paths,
-            )
-            return GitRunState.OK, (file_index, diff_text)
-
-        state, capture = await asyncio.to_thread(_capture)
-        self._submit_review_git_state = state
-        return capture
-
-    @staticmethod
-    def _submit_review_git_unavailable_payload(state: GitRunState) -> dict[str, Any]:
-        code = "GIT_NOT_REPOSITORY" if state is GitRunState.NOT_REPOSITORY else "GIT_UNAVAILABLE"
-        return {
-            "status": "unavailable",
-            "code": code,
-            "reason": "submit_review_git_unavailable",
-            "git_state": state.value,
-            "retryable": False,
-            "message": (
-                "OpenSquilla could not inspect the workspace diff for submit review; "
-                "the submit request was ended without treating the workspace as clean."
-            ),
-        }
-
     @staticmethod
     def _porcelain_status_code(line: str) -> str:
         if len(line) >= 2:
@@ -17320,7 +16545,6 @@ class Agent:
     def _porcelain_status_is_new_file(line: str) -> bool:
         code = Agent._porcelain_status_code(line)
         return code == "??" or "A" in code
-
 
     @staticmethod
     def _is_root_scratch_artifact_path(path: str | None) -> bool:
@@ -18212,36 +17436,6 @@ class Agent:
             injected_to_model=False,
         )
 
-    def _record_tool_loop_runtime_event(self, *, reason: str, **details: Any) -> None:
-        if self.config.tool_loop_observer_mode != "log":
-            return
-        iteration = details.get("iteration")
-        hint_text_sha256 = details.pop("hint_text_sha256", None)
-        trigger_confidence = details.pop("trigger_confidence", "observed_runtime_signal")
-        runtime_diff_paths = self._workspace_diff_paths_for_runtime_event()
-        event = {
-            "feature": "runtime_observer",
-            "mechanism": "tool_loop_observer",
-            "mode": self.config.tool_loop_observer_mode,
-            "reason": reason,
-            "iteration": int(iteration) if isinstance(iteration, int) else iteration,
-            "session_key": self._session_key,
-            "agent_id": self.config.tool_result_store_agent_id
-            or self.config.metadata.get("agent_id"),
-            "injected_to_model": bool(details.pop("injected_to_model", False)),
-            "evidence": details,
-            "read_files": self._relative_paths_from_records(self._workspace_read_records()),
-            "changed_files": self._relative_paths_from_records(self._workspace_write_records()),
-            "diff_paths": runtime_diff_paths or [],
-            "git_state": self._runtime_git_state.value,
-            "diff_observed": runtime_diff_paths is not None,
-            "verification_commands": self._verification_commands_for_runtime_event(),
-            "hint_text_sha256": hint_text_sha256,
-            "trigger_confidence": trigger_confidence,
-            "details": details,
-        }
-        append_runtime_event(self.config.runtime_events_path, event)
-
     def _record_runtime_recovery_event(
         self,
         decision: RuntimeRecoveryDecision,
@@ -18286,7 +17480,6 @@ class Agent:
             "details": evidence,
         }
         append_runtime_event(self.config.runtime_events_path, event)
-
 
     @staticmethod
     def _relative_paths_from_records(records: list[dict[str, Any]]) -> list[str]:
@@ -18726,9 +17919,6 @@ class Agent:
         turn_objective_message: Message | None = None,
         preview: bool = False,
     ) -> tuple[list[Message], SessionSanitizeResult]:
-        capsule_message = self._runtime_state_capsule_provider_message(preview=preview)
-        if capsule_message is not None:
-            messages = [*messages, capsule_message]
         source_messages = self._with_request_context_messages(
             messages,
             request_context_message,
@@ -18757,49 +17947,6 @@ class Agent:
         if not preview:
             self._remember_provider_visible_tool_results(request_messages)
         return request_messages, sanitize_result
-
-    def _runtime_state_capsule_provider_message(self, *, preview: bool = False) -> Message | None:
-        if self._restricted_tool_boundary_active():
-            return None
-        mode = str(getattr(self.config, "runtime_state_capsule_mode", "off") or "off")
-        if mode not in {"log", "inject"}:
-            return None
-        ctx = self._tool_context or current_tool_context.get()
-        workspace = (
-            getattr(ctx, "workspace_dir", None)
-            if ctx is not None and getattr(ctx, "workspace_dir", None)
-            else self.config.workspace_dir
-        )
-        capsule = build_runtime_state_capsule(workspace=workspace, tool_context=ctx)
-        if preview:
-            # Durable final-envelope admission needs the real serialized
-            # capsule bytes. Keep preview side-effect free, but do not replace
-            # variable workspace state with a tiny placeholder that could
-            # admit an envelope the physical call cannot send.
-            return (
-                Message(
-                    role="user",
-                    content=runtime_state_capsule_message(capsule),
-                )
-                if mode == "inject"
-                else None
-            )
-        self.config.metadata["runtime_state_capsule_observed"] = (
-            self.config.metadata.get("runtime_state_capsule_observed", 0) + 1
-        )
-        self._record_runtime_event(
-            "runtime_state_capsule.observed",
-            feature="runtime_state_capsule",
-            mode=mode,
-            injected_to_model=mode == "inject",
-            capsule=capsule,
-        )
-        if mode != "inject":
-            return None
-        self.config.metadata["runtime_state_capsule_injected"] = (
-            self.config.metadata.get("runtime_state_capsule_injected", 0) + 1
-        )
-        return Message(role="user", content=runtime_state_capsule_message(capsule))
 
     async def _provider_request_messages_with_sanitize_async(
         self,
@@ -21711,20 +20858,6 @@ class Agent:
         ]
 
     @staticmethod
-    def _parse_tool_argument_projection(value: str) -> dict[str, str] | None:
-        if not value.startswith(_TOOL_ARGUMENT_PROJECTION_PREFIX):
-            return None
-        metadata: dict[str, str] = {}
-        for line in value.splitlines()[1:]:
-            if line in {"head:", "tail:"}:
-                break
-            key, separator, raw_value = line.partition(":")
-            if not separator:
-                continue
-            metadata[key.strip()] = raw_value.strip()
-        return metadata
-
-    @staticmethod
     def _provider_projection_placeholder(tool_name: str, field: str) -> str:
         return (
             f"[invalid_provider_context_projection:{tool_name}.{field}] "
@@ -23727,7 +22860,6 @@ class Agent:
             deadline_wrapup_margin_seconds=self.config.deadline_wrapup_margin_seconds,
             reasoning_only_thinking_fallback=self.config.reasoning_only_thinking_fallback,
             provider_error_thinking_fallback=(self.config.provider_error_thinking_fallback),
-            deadline_thinking_off_margin_seconds=(self.config.deadline_thinking_off_margin_seconds),
             final_diff_salvage=self.config.final_diff_salvage,
             max_iterations_deadline_extend_seconds=(
                 self.config.max_iterations_deadline_extend_seconds
@@ -23754,14 +22886,11 @@ class Agent:
             progress_watchdog_repeated_failure_anchor_threshold=(
                 self.config.progress_watchdog_repeated_failure_anchor_threshold
             ),
-            tool_loop_observer_mode=self.config.tool_loop_observer_mode,
             runtime_recovery_mode=self.config.runtime_recovery_mode,
             runtime_recovery_source_loop_max_nudges=(
                 self.config.runtime_recovery_source_loop_max_nudges
             ),
-            runtime_state_capsule_mode=self.config.runtime_state_capsule_mode,
             post_tool_empty_recovery_mode=self.config.post_tool_empty_recovery_mode,
-            text_only_tool_recovery_mode=self.config.text_only_tool_recovery_mode,
             reasoning_prefill_recovery_mode=self.config.reasoning_prefill_recovery_mode,
             runtime_events_path=self.config.runtime_events_path,
             max_safe_tool_concurrency=self.config.max_safe_tool_concurrency,

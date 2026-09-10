@@ -9,8 +9,7 @@ const SettingsView = () => import('@/views/web/SettingsView.vue')
 //
 // Registered behind capabilities.hasWebConfig, which is now true on BOTH
 // platforms — the desktop's local gateway serves the same Control UI RPC, so it
-// shares this dialog (plus a desktop-only Runtime section). desktopRoutes no
-// longer defines `/settings`, so there is no collision.
+// shares this dialog (plus a desktop-only Runtime section).
 export const webRoutes: RouteRecordRaw[] = [
   { path: '/settings', name: 'settings', component: SettingsView, meta: { title: 'Settings', titleKey: 'nav.settings', icon: 'settings', platforms: ['web', 'desktop'], viewKey: 'settings', routeTransition: 'none' } },
   { path: '/settings/:section', name: 'settings-section', component: SettingsView, meta: { title: 'Settings', titleKey: 'nav.settings', icon: 'settings', platforms: ['web', 'desktop'], viewKey: 'settings', routeTransition: 'none' } },

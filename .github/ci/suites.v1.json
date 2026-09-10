@@ -179,7 +179,8 @@
         "opensquilla-webui/**",
         "pyproject.toml",
         "scripts/contracts/**",
-        "src/opensquilla/contracts/generated/v4/**",
+        "src/opensquilla/__init__.py",
+        "src/opensquilla/contracts/**",
         "tests/contracts/**",
         "tests/fixtures/contracts/gateway/v4/**",
         "uv.lock"
@@ -203,6 +204,7 @@
     },
     "tui": {
       "execution_inputs": [
+        "opensquilla-webui/.node-version",
         "src/opensquilla/cli/tui/**",
         "packages/opensquilla-tui-host/**",
         "scripts/build_tui_host_companion.py",
