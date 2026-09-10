@@ -12,6 +12,7 @@ def _clear_search_env(monkeypatch) -> None:
         "BOCHA_SEARCH_API_KEY",
         "BRAVE_SEARCH_API_KEY",
         "IQS_SEARCH_API_KEY",
+        "SERPDIVE_API_KEY",
         "TAVILY_API_KEY",
         "EXA_API_KEY",
         "CUSTOM_EXA_KEY",
