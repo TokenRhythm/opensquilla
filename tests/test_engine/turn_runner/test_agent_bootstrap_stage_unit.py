@@ -84,9 +84,6 @@ def _default_aux(
         compaction_total_timeout_seconds=120.0,
         compaction_heartbeat_interval_seconds=15.0,
         tool_result_projection_max_inline_chars=60_000,
-        tool_result_fresh_diagnostic_policy_enabled=False,
-        tool_result_diagnostic_retrieval_gate_enabled=False,
-        tool_result_fresh_diagnostic_inline_max_chars=64_000,
         tool_result_dispatch_max_chars=0,
         tool_result_dispatch_turn_max_chars=0,
         tool_result_store_full_trace=False,
@@ -939,9 +936,6 @@ async def test_case06_model_with_capabilities_and_projection_limit() -> None:
         aux=replace(
             _default_aux(thinking=True),
             tool_result_projection_max_inline_chars=1234,
-            tool_result_fresh_diagnostic_policy_enabled=True,
-            tool_result_diagnostic_retrieval_gate_enabled=True,
-            tool_result_fresh_diagnostic_inline_max_chars=12_345,
         )
     )
     factory = _RecordingAgentFactory()
@@ -951,31 +945,28 @@ async def test_case06_model_with_capabilities_and_projection_limit() -> None:
     assert out.output.model_capabilities is caps
     assert out.output.agent_config.thinking is True
     assert out.output.agent_config.tool_result_projection_max_inline_chars == 1234
-    assert out.output.agent_config.tool_result_fresh_diagnostic_policy_enabled is True
-    assert out.output.agent_config.tool_result_diagnostic_retrieval_gate_enabled is True
-    assert out.output.agent_config.tool_result_fresh_diagnostic_inline_max_chars == 12_345
+    assert out.output.agent_config.tool_result_fresh_diagnostic_policy_enabled is False
+    assert out.output.agent_config.tool_result_diagnostic_retrieval_gate_enabled is False
+    assert out.output.agent_config.tool_result_fresh_diagnostic_inline_max_chars == 64_000
 
 
 @pytest.mark.asyncio
-async def test_fresh_diagnostic_env_overrides_agent_token_config(monkeypatch) -> None:
+async def test_retired_fresh_diagnostic_env_does_not_change_agent_config(monkeypatch) -> None:
     monkeypatch.setenv("OPENSQUILLA_TOOL_RESULT_FRESH_DIAGNOSTIC_POLICY_ENABLED", "true")
     monkeypatch.setenv("OPENSQUILLA_TOOL_RESULT_DIAGNOSTIC_RETRIEVAL_GATE_ENABLED", "1")
     monkeypatch.setenv("OPENSQUILLA_TOOL_RESULT_FRESH_DIAGNOSTIC_INLINE_MAX_CHARS", "2048")
     aux_builder = _RecordingAgentConfigBuilder(
         aux=replace(
             _default_aux(),
-            tool_result_fresh_diagnostic_policy_enabled=False,
-            tool_result_diagnostic_retrieval_gate_enabled=False,
-            tool_result_fresh_diagnostic_inline_max_chars=64_000,
         )
     )
     stage = _make_stage(aux=aux_builder)
 
     out = await stage.run(_make_input())
 
-    assert out.output.agent_config.tool_result_fresh_diagnostic_policy_enabled is True
-    assert out.output.agent_config.tool_result_diagnostic_retrieval_gate_enabled is True
-    assert out.output.agent_config.tool_result_fresh_diagnostic_inline_max_chars == 2048
+    assert out.output.agent_config.tool_result_fresh_diagnostic_policy_enabled is False
+    assert out.output.agent_config.tool_result_diagnostic_retrieval_gate_enabled is False
+    assert out.output.agent_config.tool_result_fresh_diagnostic_inline_max_chars == 64_000
 
 
 @pytest.mark.asyncio

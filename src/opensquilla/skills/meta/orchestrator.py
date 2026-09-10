@@ -678,9 +678,6 @@ _META_SUBAGENT_COMPACTION_FIELDS = (
 )
 _META_SUBAGENT_RECOVERY_FIELDS = (
     "tool_result_projection_max_inline_chars",
-    "tool_result_fresh_diagnostic_policy_enabled",
-    "tool_result_diagnostic_retrieval_gate_enabled",
-    "tool_result_fresh_diagnostic_inline_max_chars",
     "tool_result_dispatch_max_chars",
     "tool_result_dispatch_turn_max_chars",
     "tool_result_provider_request_max_chars",

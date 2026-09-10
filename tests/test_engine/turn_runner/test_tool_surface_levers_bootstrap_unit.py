@@ -22,7 +22,7 @@ def test_agent_config_defaults_keep_tool_surface_levers_off() -> None:
 
 
 @pytest.mark.asyncio
-async def test_projection_signal_hints_env_threads_to_agent_config(
+async def test_retired_projection_signal_hints_env_is_inert(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     stage = _make_stage()
@@ -32,7 +32,7 @@ async def test_projection_signal_hints_env_threads_to_agent_config(
 
     monkeypatch.setenv(_ENV, "on")
     enabled_out = await stage.run(_make_input())
-    assert enabled_out.output.agent_config.projection_signal_hints is True
+    assert enabled_out.output.agent_config.projection_signal_hints is False
 
     monkeypatch.setenv(_ENV, "off")
     disabled_out = await stage.run(_make_input())
@@ -40,14 +40,20 @@ async def test_projection_signal_hints_env_threads_to_agent_config(
 
 
 @pytest.mark.asyncio
-async def test_projection_signal_hints_unrecognized_value_raises_at_bootstrap(
+async def test_retired_projection_options_cannot_fail_bootstrap(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # Same vocabulary as the runtime gate: "enabled" is recognized by the
-    # generic _bool_from_env truthy set but NOT by the projection gate, so
-    # accepting it here would arm the manifest while the runtime raises
-    # mid-turn. It must fail at bootstrap instead.
     stage = _make_stage()
     monkeypatch.setenv(_ENV, "enabled")
-    with pytest.raises(ValueError, match=_ENV):
-        await stage.run(_make_input())
+    monkeypatch.setenv("OPENSQUILLA_PROJECTION_SIGNAL_PATTERNS", "[")
+    monkeypatch.setenv("OPENSQUILLA_PROVIDER_HISTORY_DEDUP", "on")
+    monkeypatch.setenv("OPENSQUILLA_PROVIDER_HISTORY_DEDUP_MIN_REPEATS", "invalid")
+    monkeypatch.setenv("OPENSQUILLA_TOOL_RESULT_FRESH_DIAGNOSTIC_POLICY_ENABLED", "on")
+    monkeypatch.setenv("OPENSQUILLA_TOOL_RESULT_DIAGNOSTIC_RETRIEVAL_GATE_ENABLED", "on")
+    monkeypatch.setenv("OPENSQUILLA_TOOL_RESULT_FRESH_DIAGNOSTIC_INLINE_MAX_CHARS", "invalid")
+    out = await stage.run(_make_input())
+    assert out.output.agent_config.projection_signal_hints is False
+    assert out.output.agent_config.provider_history_dedup_enabled is False
+    assert out.output.agent_config.provider_history_dedup_min_repeats == 2
+    assert out.output.agent_config.tool_result_fresh_diagnostic_policy_enabled is False
+    assert out.output.agent_config.tool_result_diagnostic_retrieval_gate_enabled is False
