@@ -85,12 +85,28 @@ def _filter_sessions(
         if status and str(row.get("status") or "").lower() != status.lower():
             continue
         if channel:
+            # `list_sessions` projects the channel under the canonical source
+            # fields built by chat.source.chat_source_metadata — `channel_kind`,
+            # `source_kind` and `surface`. On cron and webchat rows the plain
+            # `channel` key is null, so matching only the legacy names filtered
+            # every one of those rows out and `--channel cron` returned nothing.
+            # Falsy values are skipped so a null field cannot contribute "" to
+            # the comparison set.
             channel_values = {
-                str(row.get("channel") or ""),
-                str(row.get("last_channel") or ""),
-                str(row.get("lastChannel") or ""),
-                str(row.get("source_channel") or ""),
-                str(row.get("sourceChannel") or ""),
+                str(row.get(key))
+                for key in (
+                    "channel",
+                    "last_channel",
+                    "lastChannel",
+                    "source_channel",
+                    "sourceChannel",
+                    "channel_kind",
+                    "channelKind",
+                    "source_kind",
+                    "sourceKind",
+                    "surface",
+                )
+                if row.get(key)
             }
             if channel not in channel_values:
                 continue
