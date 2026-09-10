@@ -24,6 +24,7 @@ export type SkillInstallQueueStatus =
   | 'deferred'
   | 'unknown'
   | 'failed'
+  | 'selection_required'
 
 export interface SkillInstallQueueItem {
   id: string
@@ -48,6 +49,34 @@ export function skillInstallRiskConfirmation(
     candidate.code === 'SCAN_CONFIRMATION_REQUIRED')
   const token = diagnostic?.details?.confirmationToken
   return typeof token === 'string' ? token.trim() : ''
+}
+
+export interface SkillDirectoryCandidate {
+  name: string
+  path: string
+  identifier: string
+}
+
+export function skillInstallCandidates(result: InstallResult | undefined): SkillDirectoryCandidate[] {
+  const details = result?.diagnostics?.find(item =>
+    item.code === 'SOURCE_TREE_AMBIGUOUS' && item.details?.selectionRequired === true)?.details
+  if (!details || typeof details.repository !== 'string'
+    || !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(details.repository)
+    || typeof details.immutableRevision !== 'string'
+    || !/^[0-9a-f]{40}$/.test(details.immutableRevision)
+    || !Array.isArray(details.candidates) || details.candidates.length > 100) return []
+  const candidates: SkillDirectoryCandidate[] = []
+  for (const candidate of details.candidates) {
+    if (!candidate || typeof candidate !== 'object') return []
+    const { name, path, identifier } = candidate as Record<string, unknown>
+    if (typeof name !== 'string' || !name || name.length > 256
+      || typeof path !== 'string' || path.length > 1024
+      || (path && path.split('/').some(part => !part || part === '.' || part === '..'))
+      || /[\\\x00-\x1f]/.test(path)
+      || identifier !== `${details.repository}@${details.immutableRevision}:${path ? `${path}/` : ''}SKILL.md`) return []
+    candidates.push({ name, path, identifier: identifier as string })
+  }
+  return candidates
 }
 
 export type SkillInstallSource = 'clawhub' | 'github'
@@ -198,7 +227,7 @@ export interface SkillRegistry {
   searchRegistry: () => Promise<void>
   installGithub: () => Promise<void>
   installSkill: (identifier: string, source: string, displayName?: string) => Promise<void>
-  retryQueueItem: (id: string, acknowledgeRisk?: boolean) => Promise<void>
+  retryQueueItem: (id: string, acknowledgeRisk?: boolean, candidateIdentifier?: string) => Promise<void>
   cancelInstall: (source: SkillInstallSource) => Promise<void>
   clearInstallActivity: (source: SkillInstallSource) => void
   installDeps: (
@@ -375,7 +404,7 @@ export function useSkillRegistry(
           ? 'cancelled'
           : res.success
             ? (res.unchanged ? 'unchanged' : 'installed')
-            : 'failed'
+            : skillInstallCandidates(res).length ? 'selection_required' : 'failed'
         item.error = res.success || res.cancelled
           ? ''
           : (res.message || t('cronSkills.registry.installFailed'))
@@ -479,17 +508,30 @@ export function useSkillRegistry(
     await runNewBatch([{ identifier, source, displayName }])
   }
 
-  async function retryQueueItem(id: string, acknowledgeRisk = false) {
+  async function retryQueueItem(id: string, acknowledgeRisk = false, candidateIdentifier = '') {
     const source = (['clawhub', 'github'] as const).find(candidate =>
       installActivities.value[candidate].items.some(item => item.id === id))
     if (!source) return
     const item = installActivities.value[source].items.find(candidate => candidate.id === id)
-    if (!item || (item.status !== 'failed' && item.status !== 'cancelled')) return
-    const riskConfirmation = acknowledgeRisk
+    if (!item) return
+    const candidate = candidateIdentifier && item.source === 'github'
+      ? skillInstallCandidates(item.result).find(row => row.identifier === candidateIdentifier)
+      : undefined
+    if (candidateIdentifier && (!candidate || item.status !== 'selection_required')) return
+    if (!candidate && item.status !== 'failed' && item.status !== 'cancelled') return
+    const riskConfirmation = acknowledgeRisk && !candidate
       ? skillInstallRiskConfirmation(item.result)
       : ''
-    if (acknowledgeRisk && !riskConfirmation) return
+    if (acknowledgeRisk && !candidate && !riskConfirmation) return
     if (!mutationGate.acquire('install_queue')) return
+    if (candidate) {
+      githubUrl.value = githubUrl.value.split(/\r?\n/).map(line =>
+        line.trim() === item.identifier ? candidate.identifier : line).join('\n')
+      item.identifier = candidate.identifier
+      item.displayName = candidate.name
+      item.result = undefined
+      item.error = ''
+    }
     installActivities.value[source].refreshWarning = ''
     installActivities.value[source].phase = 'installing'
     runningSource.value = source

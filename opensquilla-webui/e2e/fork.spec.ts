@@ -1,4 +1,5 @@
 import { test, expect, type Page } from '@playwright/test'
+import { helloOkResponse } from './support/gateway-fixture'
 
 const CONTROL_URL = '/control/'
 const LIVE = process.env.OPENSQUILLA_E2E_LIVE === '1'
@@ -110,7 +111,7 @@ async function seedHistoryWithTwoTurns(
         if (frame?.type !== 'req') return
         const method = String(frame.method || '')
         if (method === 'connect') {
-          ws.send(JSON.stringify({ protocol: 3, policy: { tick_interval_ms: 30000 } }))
+          ws.send(helloOkResponse())
           return
         }
         if (method === 'sessions.forkThroughTurn') {
@@ -217,6 +218,8 @@ async function seedHistoryWithTwoTurns(
                   sessionRow(SESSION_KEY, SESSION_TITLE, 100),
                 ]
               : [sessionRow(SESSION_KEY, SESSION_TITLE, 100)],
+            count: forkCreated ? 2 : 1,
+            ts: 1_800_000_000,
             has_more: false,
           },
           'usage.status': { sessions: [] },
@@ -296,7 +299,7 @@ async function mockBranchingEditRpc(
         if (frame?.type !== 'req') return
         const method = String(frame.method || '')
         if (method === 'connect') {
-          ws.send(JSON.stringify({ protocol: 3, policy: { tick_interval_ms: 30000 } }))
+          ws.send(helloOkResponse())
           return
         }
         if (method === 'chat.send') {
@@ -337,7 +340,7 @@ async function mockBranchingEditRpc(
             permissions: {},
             skills: {},
           },
-          'sessions.list': { sessions: [], has_more: false },
+          'sessions.list': { sessions: [], count: 0, ts: 1_800_000_000, has_more: false },
           'sessions.messages.subscribe': {
             subscribed: true,
             replay_complete: true,

@@ -1185,6 +1185,27 @@ def test_gateway_contract_hashes_are_compared_between_linux_and_windows() -> Non
     assert "--compare-hash-manifests" in compare["run"]
 
 
+def test_contract_generation_reuses_two_fresh_parallel_renders_for_production() -> None:
+    jobs = _workflow("ci.yml")["jobs"]
+    for job_id, step_name in (
+        ("frontend-check", "Verify deterministic Contract generation"),
+        (
+            "gateway-contract-windows",
+            "Verify Windows Contract generation and real toolchain",
+        ),
+    ):
+        verification = next(step for step in jobs[job_id]["steps"] if step.get("name") == step_name)
+        generation_commands = [
+            line.strip()
+            for line in verification["run"].splitlines()
+            if "generate_gateway_contracts.py" in line
+        ]
+        assert generation_commands == [
+            "uv run --no-sync python scripts/contracts/generate_gateway_contracts.py "
+            "--check-determinism --jobs 4"
+        ]
+
+
 def test_ci_result_gate_covers_every_conditional_job_without_legacy_flags() -> None:
     jobs = _workflow("ci.yml")["jobs"]
     gate = jobs["ci-result"]

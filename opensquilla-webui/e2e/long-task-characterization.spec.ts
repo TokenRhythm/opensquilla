@@ -3,6 +3,7 @@ import { tmpdir } from 'node:os'
 import { basename, dirname, isAbsolute, relative, resolve } from 'node:path'
 
 import { expect, test, type Page, type WebSocketRoute } from '@playwright/test'
+import { helloOkResponse } from './support/gateway-fixture'
 
 const MODE = process.env.LONG_TASK_CHARACTERIZATION_MODE
 const REPORT_PATH = process.env.LONG_TASK_CHARACTERIZATION_REPORT_PATH
@@ -142,9 +143,8 @@ test.describe('f7 long-task performance characterization', () => {
         if (frame.type !== 'req') return
         const method = String(frame.method || '')
         if (method === 'connect') {
-          ws.send(JSON.stringify({
-            protocol: 3,
-            policy: { tick_interval_ms: 30_000, webui_stream_idle_grace_ms: 1_260_000 },
+          ws.send(helloOkResponse({
+            policy: { webui_stream_idle_grace_ms: 1_260_000 },
             features: {
               methods: [
                 'sessions.messages.subscribe',
@@ -204,7 +204,7 @@ test.describe('f7 long-task performance characterization', () => {
           },
           'models.routing.get': { mode: 'direct' },
           'onboarding.status': { audioConfigured: false },
-          'sessions.list': { sessions: [], has_more: false },
+          'sessions.list': { sessions: [], count: 0, ts: 1_800_000_000, has_more: false },
           'usage.status': { sessions: [] },
         }
         ws.send(response(frame.id, defaults[method] ?? {}))

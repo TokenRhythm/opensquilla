@@ -4,6 +4,7 @@ import {
   type Page,
   type WebSocketRoute,
 } from '@playwright/test'
+import { helloOkResponse } from './support/gateway-fixture'
 
 import {
   chatHistoryPayload,
@@ -204,10 +205,8 @@ test('workspace navigation keeps one transport while the target subscription rec
       wire.push({ key, method, socketIndex })
 
       if (method === 'connect') {
-        socket.send(JSON.stringify({
-          protocol: 3,
+        socket.send(helloOkResponse({
           server: { version: 'e2e', conn_id: 'workspace-switch-conn' },
-          policy: { tick_interval_ms: 30_000 },
           features: {
             methods: [
               'sessions.messages.subscribe',
@@ -236,6 +235,8 @@ test('workspace navigation keeps one transport while the target subscription rec
             session(SESSION_B, 'Workspace B task', WORKSPACE_B, '/fixtures/workspace-b', 200),
             session(SESSION_A, 'Workspace A task', WORKSPACE_A, '/fixtures/workspace-a', 100),
           ],
+          count: 2,
+          ts: 1_800_000_000,
           has_more: false,
         }))
         return

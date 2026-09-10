@@ -594,7 +594,7 @@ def create_skill_tools(
     @tool(
         name="skill_install_community",
         description=(
-            "Install a Community skill from ClawHub or another configured source. "
+            "Install a Community skill from a GitHub URL, ClawHub, or another configured source. "
             "Use only when the user clearly asked to install a specific skill identifier "
             "or chose one exact result from skill_search_community. Do not use skill_create "
             "for Community installs."
@@ -603,13 +603,12 @@ def create_skill_tools(
             "identifier": {
                 "type": "string",
                 "description": (
-                    "Exact source identifier or slug returned by skill_search_community."
+                    "GitHub repository or Skill directory URL, or an exact registry identifier."
                 ),
             },
             "source": {
                 "type": "string",
-                "description": "Source id, usually 'clawhub'.",
-                "default": "clawhub",
+                "description": "Optional source id. GitHub URLs infer github; slugs infer clawhub.",
             },
             "force": {
                 "type": "boolean",
@@ -641,7 +640,7 @@ def create_skill_tools(
     )
     async def skill_install_community(
         identifier: str,
-        source: str = "clawhub",
+        source: str | None = None,
         force: bool = False,
         risk_confirmation: str = "",
         replace_source: bool = False,
@@ -658,7 +657,9 @@ def create_skill_tools(
         clean_risk_confirmation = risk_confirmation.strip()
         if clean_risk_confirmation and not force:
             raise ToolError("risk_confirmation requires force=true")
-        source_id = str(source or "clawhub").strip() or "clawhub"
+        from opensquilla.skills.install_source import resolve_install_source
+
+        source_id = resolve_install_source(clean_identifier, source)
 
         installer: Any = management_service
         if installer is None:

@@ -1,4 +1,5 @@
 import { expect, test, type Page } from '@playwright/test'
+import { helloOkResponse } from './support/gateway-fixture'
 
 const CONTROL_URL = '/control/'
 const IMPORT_METHODS = [
@@ -91,9 +92,7 @@ async function installImportGateway(page: Page): Promise<ImportGateway> {
       }
 
       if (frame.type === 'req' && frame.method === 'connect') {
-        ws.send(JSON.stringify({
-          type: 'hello-ok',
-          protocol: 3,
+        ws.send(helloOkResponse({
           server: { version: 'e2e', conn_id: 'memory-import-e2e' },
           features: { methods: [...IMPORT_METHODS], events: [] },
           snapshot: {},

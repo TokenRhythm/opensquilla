@@ -12,7 +12,7 @@ test('temporary verification keeps request and response validators absent from p
   assert.equal(validators.validateSessionsResolveRequestFrame({ type: 'req', method: 'wrong' }), false)
 })
 
-test('sessions.list supplemental roles are real validators, not claimed old exports', async () => {
+test('sessions.list verification still exposes all four real validators', async () => {
   const validators = await loadContractValidators('sessions.list')
   assert.deepEqual(Object.keys(validators).sort(), [
     'validateSessionsListParams', 'validateSessionsListRequestFrame',
