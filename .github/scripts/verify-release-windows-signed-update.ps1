@@ -14,6 +14,8 @@ param(
   [string]$ProcessObservationMode = 'cim-trace',
   [ValidateSet('download', 'verified-cache')]
   [string]$HandoffInputMode = 'download',
+  [ValidateSet('oss', 'github-to-oss')]
+  [string]$DownloadSourceMode = 'oss',
   [ValidateRange(30, 1800)][int]$InstallTimeoutSeconds = 600
 )
 
@@ -238,9 +240,14 @@ function Invoke-SignedWindowsUpdateAudit {
     [ValidateSet('cim-trace', 'standard-user-polling')]
     [string]$ProcessObservationMode = 'cim-trace',
     [ValidateSet('download', 'verified-cache')]
-    [string]$HandoffInputMode = 'download'
+    [string]$HandoffInputMode = 'download',
+    [ValidateSet('oss', 'github-to-oss')]
+    [string]$DownloadSourceMode = 'oss'
   )
   if ([Environment]::OSVersion.Platform -ne [PlatformID]::Win32NT) { throw 'This audit requires Windows.' }
+  if ($HandoffInputMode -eq 'verified-cache' -and $DownloadSourceMode -ne 'oss') {
+    throw 'Source fallback requires download input; cached input cannot verify network fallback.'
+  }
   $repo = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '../..'))
   $roamingRoot = Get-SignedAuditRoamingRoot
   $nativeUserData = Get-SignedAuditNativeUserData $roamingRoot
@@ -254,6 +261,7 @@ function Invoke-SignedWindowsUpdateAudit {
   $null = $planArguments.Remove('InstallTimeoutSeconds')
   $null = $planArguments.Remove('ProcessObservationMode')
   $null = $planArguments.Remove('HandoffInputMode')
+  $null = $planArguments.Remove('DownloadSourceMode')
   $planArguments.NativeUserDataDir = $nativeUserData
   $planArguments.TemporaryRoot = $temporary
   $plan = Get-SignedAuditPlan @planArguments
@@ -299,6 +307,9 @@ function Invoke-SignedWindowsUpdateAudit {
   $result.handoffInputMode = $HandoffInputMode
   $result.downloadVerified = $false
   $result.remotePublicationVerified = $false
+  $result.downloadSourceMode = $DownloadSourceMode
+  $result.sourceFallbackVerified = $false
+  $result.networkIsolationVerified = $false
   $sourceId = 'OpenSquilla.SignedUpdate.' + [guid]::NewGuid().ToString('N')
   $subscription = $null
   $automaticPid = $null
@@ -341,6 +352,9 @@ function Invoke-SignedWindowsUpdateAudit {
     if ($LASTEXITCODE -ne 0) { throw 'Could not seed the isolated synthetic profile.' }
     $handoffMode = 'signed-handoff'
     $cachedArguments = @()
+    if ($DownloadSourceMode -eq 'github-to-oss') {
+      $cachedArguments = @('--download-source-mode', 'github-to-oss')
+    }
     if ($HandoffInputMode -eq 'verified-cache') {
       $handoffMode = 'signed-cached-handoff'
       $cacheMarkerPath = Join-Path $plan.UserDataDir 'cached-handoff-audit.json'
@@ -408,6 +422,17 @@ function Invoke-SignedWindowsUpdateAudit {
         throw 'The download audit requires its real download proof and cannot certify remote publication.'
       }
       $result.downloadVerified = $true
+      if ($DownloadSourceMode -eq 'github-to-oss') {
+        if ($handoff.downloadSourceMode -cne 'github-to-oss' -or $handoff.source -cne 'oss' -or
+            $handoff.sourceFallbackVerified -isnot [bool] -or $handoff.sourceFallbackVerified -ne $true -or
+            $handoff.networkIsolationVerified -isnot [bool] -or $handoff.networkIsolationVerified -ne $false -or
+            $handoff.discoveryScope -cne 'controlled loopback channel; production asset sources') {
+          throw 'Source fallback evidence must identify OSS and retain the controlled-discovery/network-isolation limits.'
+        }
+        $result.sourceFallbackVerified = $true
+        $result.discoveryScope = $handoff.discoveryScope
+        $result.gaps += 'Source fallback is observed; OS-level GitHub blocking and default remote channel discovery require separate evidence.'
+      }
     }
     $result.handoffObserved = $true
     $result.stage = 'waiting-for-operator-installer-and-automatic-restart'

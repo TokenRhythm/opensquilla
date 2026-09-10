@@ -122,8 +122,8 @@ async function launchCase(name, { installEnabled = true } = {}) {
   const childEnv = { ...environmentWithoutProviderSecrets(process.env), HOME: home, USERPROFILE: home,
     OPENSQUILLA_TEST_FIXTURE_CONFIG: configPath,
     ELECTRON_DISABLE_SECURITY_WARNINGS: 'true', NO_PROXY: '127.0.0.1,localhost' }
-  if (installEnabled) childEnv.OPENSQUILLA_DESKTOP_ENABLE_WIN_INSTALL = '1'
-  else delete childEnv.OPENSQUILLA_DESKTOP_ENABLE_WIN_INSTALL
+  if (installEnabled) delete childEnv.OPENSQUILLA_DESKTOP_ENABLE_WIN_INSTALL
+  else childEnv.OPENSQUILLA_DESKTOP_ENABLE_WIN_INSTALL = '0'
   runningApp = await electron.launch({
     ...(executablePath ? { executablePath: resolve(executablePath) } : {}),
     args: [`--user-data-dir=${userData}`, fixtureRoot],
@@ -139,7 +139,7 @@ async function launchCase(name, { installEnabled = true } = {}) {
   assert.equal(resolve(initial.home), resolve(home))
   assert.equal(initial.state.status, 'downloaded')
   assert.equal(initial.state.canInstall, installEnabled)
-  assert.equal(initial.installFlagPresent, installEnabled)
+  assert.equal(initial.installFlagPresent, !installEnabled)
   assert.equal(initial.gatewayPids.length, 1)
   await page.locator('[data-testid="settings-update-download"]').waitFor({ state: 'visible' })
   await page.locator('[data-testid="settings-update-relaunch"]').waitFor({ state: installEnabled ? 'visible' : 'hidden' })
@@ -150,7 +150,7 @@ async function launchCase(name, { installEnabled = true } = {}) {
 }
 
   {
-    const f = await launchCase('cache-refresh-default-off', { installEnabled: false })
+    const f = await launchCase('cache-refresh-explicitly-disabled', { installEnabled: false })
     assert.ok(await loadWindowsUpdateCache(f.directory))
     await f.screenshot('cached-b')
     await f.page.getByRole('button', { name: 'Check', exact: true }).click()
