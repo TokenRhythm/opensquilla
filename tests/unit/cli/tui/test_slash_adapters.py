@@ -77,6 +77,7 @@ class _StubGatewayClient:
     def __init__(self) -> None:
         self.calls: list[tuple[str, Any]] = []
         self.created: list[dict[str, Any]] = []
+        self.forked: list[dict[str, Any]] = []
         self.resolve_payloads: dict[str, dict[str, Any]] = {}
         self.bootstrap_payloads: dict[str, dict[str, Any]] = {}
         self.history: list[dict[str, Any]] = []
@@ -111,6 +112,26 @@ class _StubGatewayClient:
         if method == "meta.list":
             return {"skills": []}
         return {"ok": True}
+
+    async def fork_session(
+        self,
+        parent_key: str,
+        before_message_id: str | None = None,
+        title: str | None = None,
+    ) -> str:
+        self._maybe_raise("fork_session")
+        self._counter += 1
+        child_key = f"agent:main:fork:{self._counter}"
+        self.calls.append(("fork_session", (parent_key, before_message_id, title)))
+        self.forked.append(
+            {
+                "child_key": child_key,
+                "parent_key": parent_key,
+                "before_message_id": before_message_id,
+                "title": title,
+            }
+        )
+        return child_key
 
     async def create_session(
         self,
@@ -905,6 +926,215 @@ async def test_gateway_reset_replaces_transcript_with_empty_snapshot(
     assert context.state.transcript.turns == []
     assert output.messages[1][0] == "history.replace"
     assert output.messages[1][1]["messages"] == ()
+
+
+# --------------------------------------------------------------------------- #
+# /rewind rewinds a conversation from an earlier user message                  #
+# --------------------------------------------------------------------------- #
+
+
+def _rewind_history() -> list[dict[str, Any]]:
+    return [
+        {"message_id": "m1", "role": "user", "text": "first question"},
+        {"message_id": "m2", "role": "assistant", "text": "first answer"},
+        {"message_id": "m3", "role": "user", "text": "second question"},
+        {"message_id": "m4", "role": "assistant", "text": "second answer"},
+    ]
+
+
+async def test_gateway_rewind_without_target_opens_host_picker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_gateway_io(monkeypatch)
+    client = _StubGatewayClient()
+    client.history = _rewind_history()
+    output = _StructuredOutput()
+    context = _gateway_context(client, tui_output=output)
+
+    handled = await handle_gateway_slash_command("/rewind", context)
+
+    assert handled is True
+    assert client.forked == []
+    pick = next(
+        payload for mtype, payload in output.messages if mtype == "rewind.pick"
+    )
+    assert pick["current_key"] == "agent:main:test:0"
+    # Only user messages are rewind points, in transcript order. Picker rows
+    # carry just the id (for the fork) and the message text — no timestamps.
+    assert [point["id"] for point in pick["points"]] == ["m1", "m3"]
+    assert pick["points"][0] == {
+        "id": "m1",
+        "ordinal": 1,
+        "preview": "first question",
+    }
+
+
+async def test_gateway_rewind_plain_table_formats_time_and_strips_header(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Plain-mode table renders epoch-millisecond timestamps as local times
+    and strips the leading ``[2026-...]`` message header from previews."""
+    client = _StubGatewayClient()
+    client.history = [
+        {
+            "message_id": "m1",
+            "role": "user",
+            "text": (
+                "[2026-08-04T09:39+08:00 Tue Asia/Shanghai]\n"
+                "帮我看看，opensquilla tui是否支持回退对话？"
+            ),
+            "timestamp": 1785807584731,
+        },
+    ]
+    recorder = _patch_gateway_io(monkeypatch)
+    context = _gateway_context(client)
+
+    handled = await handle_gateway_slash_command("/rewind", context)
+
+    assert handled is True
+    table = next(entry for entry in recorder.entries if hasattr(entry, "columns"))
+    cells = "\n".join(str(cell) for column in table.columns for cell in column.cells)
+    # Epoch milliseconds render as a compact local time (timezone-agnostic
+    # assertion: recompute the expectation through the same conversion).
+    from datetime import datetime
+
+    expected_ts = datetime.fromtimestamp(1785807584.731).strftime("%Y-%m-%d %H:%M")
+    assert expected_ts in cells
+    assert "帮我看看，opensquilla tui是否支持回退对话？" in cells
+    assert "[2026-08-04T09:39+08:00 Tue Asia/Shanghai]" not in cells
+
+
+async def test_gateway_rewind_without_target_plain_mode_lists_table(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    recorder = _patch_gateway_io(monkeypatch)
+    client = _StubGatewayClient()
+    client.history = _rewind_history()
+    context = _gateway_context(client)
+
+    handled = await handle_gateway_slash_command("/rewind", context)
+
+    assert handled is True
+    assert client.forked == []
+    table = next(entry for entry in recorder.entries if hasattr(entry, "columns"))
+    cells = "\n".join(str(cell) for column in table.columns for cell in column.cells)
+    assert "1" in cells
+    assert "2" in cells
+    assert "first question" in cells
+    assert "second question" in cells
+    # Assistant rows are not rewind points.
+    assert "first answer" not in cells
+    assert "/rewind" in recorder.text()
+
+
+async def test_gateway_rewind_by_ordinal_forks_activates_and_prefills_composer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_gateway_io(monkeypatch)
+    client = _StubGatewayClient()
+    client.history = _rewind_history()
+    output = _StructuredOutput()
+    context = _gateway_context(client, tui_output=output)
+
+    handled = await handle_gateway_slash_command("/rewind 2", context)
+
+    assert handled is True
+    assert client.forked == [
+        {
+            "child_key": "agent:main:fork:1",
+            "parent_key": "agent:main:test:0",
+            "before_message_id": "m3",
+            "title": None,
+        }
+    ]
+    assert context.state.session_key == "agent:main:fork:1"
+    assert [message_type for message_type, _payload in output.messages] == [
+        "composer.set",
+        "history.replace",
+        "context.update",
+        "composer.set",
+        "composer.set",
+    ]
+    prefill = output.messages[-1][1]
+    assert prefill == {
+        "placeholder": "send a message",
+        "text": "second question",
+        "disabled": False,
+    }
+
+
+async def test_gateway_rewind_by_message_id_forks_activates_and_prefills_composer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_gateway_io(monkeypatch)
+    client = _StubGatewayClient()
+    client.history = _rewind_history()
+    output = _StructuredOutput()
+    context = _gateway_context(client, tui_output=output)
+
+    handled = await handle_gateway_slash_command("/rewind m1", context)
+
+    assert handled is True
+    assert client.forked[0]["before_message_id"] == "m1"
+    assert context.state.session_key == "agent:main:fork:1"
+    assert output.messages[-1][1]["text"] == "first question"
+
+
+async def test_gateway_rewind_unknown_target_prints_usage(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    recorder = _patch_gateway_io(monkeypatch)
+    client = _StubGatewayClient()
+    client.history = _rewind_history()
+    context = _gateway_context(client)
+
+    handled = await handle_gateway_slash_command("/rewind 99", context)
+
+    assert handled is True
+    assert client.forked == []
+    assert "No user message matches '99'" in recorder.text()
+
+    recorder.entries.clear()
+    handled = await handle_gateway_slash_command("/rewind nope", context)
+    assert handled is True
+    assert client.forked == []
+    assert "No user message matches 'nope'" in recorder.text()
+
+
+async def test_gateway_rewind_empty_session_prints_hint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    recorder = _patch_gateway_io(monkeypatch)
+    client = _StubGatewayClient()
+    context = _gateway_context(client)
+
+    handled = await handle_gateway_slash_command("/rewind", context)
+
+    assert handled is True
+    assert client.forked == []
+    assert "No user messages to rewind to yet" in recorder.text()
+
+
+async def test_gateway_rewind_rpc_error_renders_error_panel(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    recorder = _patch_gateway_io(monkeypatch)
+    client = _StubGatewayClient()
+    client.history = _rewind_history()
+    client.raise_map["fork_session"] = GatewayRPCError(
+        method="sessions.fork",
+        code="ERROR",
+        message="fork exploded",
+    )
+    context = _gateway_context(client)
+
+    handled = await handle_gateway_slash_command("/rewind 1", context)
+
+    assert handled is True
+    assert "Rewind failed" in recorder.text()
+    assert "fork exploded" in recorder.text()
+    assert context.state.session_key == "agent:main:test:0"
+
 
 
 async def test_gateway_file_attachment_reports_upload_progress_and_clears_ready(

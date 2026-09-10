@@ -479,6 +479,7 @@ async function main() {
     themeSet: (m) => composer.applyHostTheme(m.name),
     themePick: () => composer.openThemePicker(),
     sessionPick: (m) => composer.openSessionPicker(m),
+    rewindPick: (m) => composer.openRewindPicker(m),
     // Tool-approval prompt from the Python side: the composer mounts a modal
     // overlay and answers with one approval.response frame when the user
     // decides (Python treats no answer as a deny after its own timeout).

@@ -163,6 +163,7 @@ export function createDispatcher(h) {
       case "theme.set": return h.themeSet?.(m);
       case "theme.pick": return h.themePick?.(m);
       case "session.pick": return h.sessionPick?.(m);
+      case "rewind.pick": return h.rewindPick?.(m);
       case "approval.request": return h.approvalRequest?.(m);
       case "approval.dismiss": return h.approvalDismiss?.(m);
       case "shutdown": return h.shutdown(m);

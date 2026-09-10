@@ -11,7 +11,8 @@ import asyncio
 import shlex
 import uuid
 from collections.abc import AsyncIterator
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -56,6 +57,7 @@ from opensquilla.cli.tui.opentui.history import (
     replace_tui_history,
     set_tui_history_loading,
 )
+from opensquilla.cli.tui.opentui.messages import ComposerState, HistoryMessage, HistoryReplace
 from opensquilla.cli.ui import ACCENT, ACCENT_HEADER, console, error_panel
 from opensquilla.engine.commands import Surface
 
@@ -90,6 +92,13 @@ class GatewayClientLike(Protocol):
     ) -> dict[str, Any]: ...
 
     async def delete_sessions(self, keys: list[str]) -> dict[str, Any]: ...
+
+    async def fork_session(
+        self,
+        parent_key: str,
+        before_message_id: str | None = None,
+        title: str | None = None,
+    ) -> str: ...
 
     async def reset_session(self, key: str) -> dict[str, Any]: ...
 
@@ -981,6 +990,9 @@ async def _dispatch_gateway_slash_command(
         console.print(f"[green]Resumed session:[/green] {state.session_key}")
         return True
 
+    if parts := _slash_parts(cmd, "/rewind"):
+        return await _handle_rewind_command(context, parts)
+
     if parts := _slash_parts(cmd, "/delete"):
         if len(parts) == 1 or not parts[1].strip():
             console.print("[red]Usage: /delete <id>[/red]")
@@ -1311,6 +1323,185 @@ async def _dispatch_gateway_slash_command(
         return True
 
     return False
+
+
+async def _handle_rewind_command(
+    context: GatewaySlashContext,
+    parts: list[str],
+) -> bool:
+    """Rewind the active conversation from an earlier user message.
+
+    ``/rewind`` with no argument opens an interactive picker (host UI) or a
+    numbered table (plain mode) of the session's rewind points — the user
+    messages. ``/rewind <#|message-id>`` creates a child session containing
+    everything before that message, activates it, and preloads the composer
+    with the message text so the user can edit and resend — the terminal
+    equivalent of the WebUI's edit/regenerate actions.
+    """
+    state = context.state
+    client = context.client
+    snapshot = await client.bootstrap_session(
+        state.session_key,
+        limit=HISTORY_BOOTSTRAP_LIMIT,
+    )
+    history = history_replace_from_bootstrap(
+        snapshot,
+        fallback_session_key=state.session_key,
+    )
+    candidates = _rewind_candidates(history.messages)
+
+    if len(parts) == 1 or not parts[1].strip():
+        if not candidates:
+            console.print("[dim]No user messages to rewind to yet.[/dim]")
+            return True
+        if output_supports_host_ui(context.tui_output):
+            await _send_rewind_picker(context.tui_output, candidates, state.session_key)
+        else:
+            _print_rewind_points(candidates, history)
+        return True
+
+    target = parts[1].strip()
+    candidate = _resolve_rewind_candidate(candidates, target)
+    if candidate is None:
+        console.print(
+            f"[red]No user message matches {target!r}.[/red] "
+            "[dim]Run /rewind to list the rewind points.[/dim]"
+        )
+        return True
+
+    try:
+        child_key = await client.fork_session(
+            state.session_key,
+            before_message_id=candidate.id,
+        )
+    except GatewayRPCError as exc:
+        console.print(error_panel(str(exc), title="Rewind failed"))
+        return True
+
+    await _activate_session_from_bootstrap(context, child_key)
+    await _prefill_composer(context.tui_output, candidate.text)
+    console.print(
+        f"[green]Rewound — new session:[/green] {child_key}\n"
+        "[dim]The message was preloaded into the composer — edit it and press "
+        "Enter to continue from the rewind point, or /sessions to browse.[/dim]"
+    )
+    return True
+
+
+def _rewind_candidates(messages: tuple[HistoryMessage, ...]) -> list[HistoryMessage]:
+    """User messages that are valid rewind points, in transcript order."""
+
+    return [
+        message
+        for message in messages
+        if message.role == "user" and message.text.strip()
+    ]
+
+
+def _resolve_rewind_candidate(
+    candidates: list[HistoryMessage],
+    target: str,
+) -> HistoryMessage | None:
+    """Match a ``#`` ordinal or an exact durable message id."""
+
+    if target.isdigit():
+        index = int(target) - 1
+        if 0 <= index < len(candidates):
+            return candidates[index]
+        return None
+    return next((message for message in candidates if message.id == target), None)
+
+
+async def _send_rewind_picker(
+    output: object | None,
+    candidates: list[HistoryMessage],
+    session_key: str,
+) -> None:
+    """Send the host one ``rewind.pick`` frame with selectable rewind points."""
+
+    send = getattr(output, "send_message", None)
+    if not callable(send):
+        return
+    points = [
+        {
+            "id": message.id,
+            "ordinal": index,
+            "preview": _single_line_preview(message.text),
+        }
+        for index, message in enumerate(candidates, start=1)
+    ]
+    await send("rewind.pick", {"current_key": session_key, "points": points})
+
+
+def _print_rewind_points(
+    candidates: list[HistoryMessage],
+    history: HistoryReplace,
+) -> None:
+    if not candidates:
+        console.print("[dim]No user messages to rewind to yet.[/dim]")
+        return
+    table = Table(title="Rewind points", show_header=True, header_style=ACCENT_HEADER)
+    table.add_column("#", justify="right")
+    table.add_column("Time")
+    table.add_column("Message")
+    for index, message in enumerate(candidates, start=1):
+        table.add_row(
+            str(index),
+            _friendly_message_time(message.timestamp),
+            _single_line_preview(message.text),
+        )
+    console.print(table)
+    if history.has_more:
+        console.print(
+            f"[dim]Showing {len(candidates)} user message(s) from the first "
+            f"{history.loaded_count} rows; older history is not listed.[/dim]"
+        )
+    console.print(
+        "[dim]Usage:[/dim] [bold]/rewind <#|message-id>[/bold] — rewind from "
+        "that message into a new session."
+    )
+
+
+def _single_line_preview(text: str, *, limit: int = 64) -> str:
+    single = " ".join(text.split())
+    # TUI user messages carry a leading "[2026-08-04T09:39+08:00 Tue
+    # Asia/Shanghai]" style header. Drop it so the preview shows the actual
+    # content instead of a timestamp that eats the whole line.
+    if single.startswith("["):
+        end = single.find("]")
+        if end != -1 and end < limit:
+            single = single[end + 1 :].strip()
+    return single[:limit] + ("…" if len(single) > limit else "")
+
+
+def _friendly_message_time(timestamp: str | int | float | None) -> str:
+    """Render a message timestamp as a compact local time.
+
+    Gateway rows commonly carry epoch milliseconds, which are meaningless as
+    raw digits; accept ISO-8601 strings as well as epoch seconds/milliseconds
+    (int, float, or numeric strings) and normalize them to "YYYY-MM-DD HH:MM".
+    """
+    if timestamp is None:
+        return ""
+    if isinstance(timestamp, str) and not timestamp.strip().isdigit():
+        raw = timestamp.strip()
+        return raw[:16].replace("T", " ")
+    try:
+        numeric = float(timestamp)
+    except (TypeError, ValueError):
+        return str(timestamp)[:19]
+    seconds = numeric / 1000.0 if numeric > 10**12 else numeric
+    try:
+        return datetime.fromtimestamp(seconds).strftime("%Y-%m-%d %H:%M")
+    except (OverflowError, OSError, ValueError):
+        return ""
+
+
+async def _prefill_composer(output: object | None, text: str) -> None:
+    send = getattr(output, "send_message", None)
+    if not callable(send):
+        return
+    await send("composer.set", asdict(ComposerState(text=text)))
 
 
 def _session_picker_rows(rows: Any) -> list[dict[str, Any]]:
