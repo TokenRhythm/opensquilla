@@ -9,6 +9,7 @@ from types import SimpleNamespace
 import pytest
 from starlette.websockets import WebSocketState
 
+from opensquilla.gateway.protocol import ResFrame
 from opensquilla.gateway.transport_flow import (
     FLOW_WINDOW_FRAMES,
     MAX_WIRE_BYTES,
@@ -16,7 +17,7 @@ from opensquilla.gateway.transport_flow import (
     TransportBudget,
     get_transport_budget,
 )
-from opensquilla.gateway.websocket import SubscriptionManager, WsConnection
+from opensquilla.gateway.websocket import SubscriptionManager, WsConnection, _OutboundFrame
 
 
 def test_only_sent_current_epoch_ack_releases_credit() -> None:
@@ -71,6 +72,38 @@ def test_snapshot_bootstrap_is_bounded_even_with_zero_ordinary_credit() -> None:
     assert flow.admit(300_000, recovery=True) is None
     flow.close()
     assert budget.used == 0
+
+
+@pytest.mark.parametrize("delivery_id", [None, True, False, 1.0, "1", [], {}])
+def test_snapshot_reply_rejects_non_integer_delivery_without_using_reserved_credit(
+    delivery_id,
+) -> None:
+    before = get_transport_budget().used
+    conn = WsConnection("invalid-snapshot-delivery", _FastSocket())  # type: ignore[arg-type]
+    conn._enable_flow()
+    try:
+        receipt = conn.reserve_snapshot_delivery(1000, "s", "snapshot", "revision")
+        assert receipt["delivery_id"] == 1
+        frame = _OutboundFrame(
+            kind="res",
+            classification="control",
+            payload=None,
+            event_name=None,
+            res_frame=ResFrame(
+                id="snapshot",
+                ok=True,
+                payload={"delivery": {**receipt, "delivery_id": delivery_id}},
+            ),
+        )
+        with pytest.raises(ValueError, match="Snapshot delivery reservation is not current"):
+            conn._prepare_flow_frame(frame)
+        assert conn._flow.deliveries[1].size == 1000
+        assert conn._transport_bytes == 1000
+        assert frame.delivery_id is None
+        assert not conn._closing
+    finally:
+        conn._cleanup_transport()
+    assert get_transport_budget().used == before
 
 
 def test_snapshot_staging_passes_ordinary_ack_hole_without_unbounded_tombstones() -> None:

@@ -695,7 +695,18 @@ try {
               ? error.code : 'OTHER',
           }
         } finally {
-          await handle?.close().catch(() => {})
+          try {
+            await handle?.close()
+          } catch (error) {
+            // A diagnostic file-close failure must be visible, but must not
+            // replace the original Electron shutdown outcome or expose paths.
+            shutdownDiagnostics = {
+              ...shutdownDiagnostics,
+              logCloseFailed: true,
+              closeErrorCode: ['ENOENT', 'EACCES', 'EPERM', 'EBUSY', 'EIO'].includes(error?.code)
+                ? error.code : 'OTHER',
+            }
+          }
         }
         return shutdownDiagnostics
       },

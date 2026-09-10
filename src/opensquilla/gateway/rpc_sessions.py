@@ -4478,7 +4478,7 @@ async def _handle_sessions_messages_snapshot_read(params: dict | None, ctx: RpcC
     connection = registry.get(ctx.conn_id)
     if connection is None or connection.principal != ctx.principal:
         raise RpcHandlerError("UNAUTHORIZED", "Connection identity is no longer current")
-    transfer = getattr(connection, "_snapshot_transfer", None)
+    transfer = connection._snapshot_transfer
     if transfer is None:
         transfer = SnapshotTransfer(
             connection.reserve_transport_bytes, connection.release_transport_bytes

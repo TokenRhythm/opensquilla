@@ -460,7 +460,9 @@ test('recovers initial history failure automatically without stealing draft focu
   expect(socketCount).toBe(1)
 })
 
-test('recovers stalled history and live hydration in place despite ongoing ticks', async ({ page }) => {
+test('recovers stalled history and live hydration in place despite ongoing ticks', {
+  tag: '@session-hang-recovery',
+}, async ({ page }) => {
   test.setTimeout(30_000)
 
   const retainedTail = 'History recovered on the existing connection.'

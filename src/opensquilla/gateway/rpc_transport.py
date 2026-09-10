@@ -19,6 +19,7 @@ async def _handle_transport_flow_update(params: dict | None, ctx: RpcContext) ->
         validate_recovery_params("transport.flow.update", params)
     except ValueError as exc:
         raise RpcHandlerError("INVALID_REQUEST", str(exc), accepted=False) from exc
+    assert isinstance(params, dict)
     connection = get_registry().get(ctx.conn_id)
     if connection is None or connection.principal != ctx.principal:
         raise RpcHandlerError("UNAUTHORIZED", "Connection identity is no longer current")

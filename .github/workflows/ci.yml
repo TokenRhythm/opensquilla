@@ -1476,7 +1476,8 @@ jobs:
             history-hydration.spec.ts \
             --project=chromium \
             --workers=1 \
-            --grep "terminates stalled" \
+            --grep "@session-hang-recovery" \
+            --retries=0 \
             2>&1 | tee "${CI_REPORT_DIR}/session-hang-recovery.log"
 
       - name: Seed Playwright browser cache from nightly main

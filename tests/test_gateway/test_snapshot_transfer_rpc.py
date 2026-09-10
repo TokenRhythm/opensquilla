@@ -140,7 +140,9 @@ async def test_guest_snapshot_and_control_do_not_grant_session_access(connection
     assert not control.ok and control.error.code == "FLOW_DISABLED"
 
 
-@pytest.mark.parametrize("invalid", ["old_epoch", "future_ack", "future_staged"])
+@pytest.mark.parametrize(
+    "invalid", ["old_epoch", "future_ack", "future_staged", "missing_params", "empty_params"]
+)
 async def test_invalid_flow_update_is_local_and_cannot_release_valid_credit(connection, invalid):
     connection._enable_flow()
     delivery_id = connection._flow.admit(100)
@@ -150,6 +152,10 @@ async def test_invalid_flow_update_is_local_and_cannot_release_valid_credit(conn
         params["delivery_epoch"] = "not-current"
     elif invalid == "future_ack":
         params["ack_delivery_id"] = delivery_id + 1
+    elif invalid == "missing_params":
+        params = None
+    elif invalid == "empty_params":
+        params = {}
     else:
         params["staged_delivery_ids"] = [delivery_id + 1]
     response = await request(connection, params, method="transport.flow.update")

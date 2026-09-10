@@ -10,7 +10,7 @@ import uuid
 from collections import OrderedDict
 from collections.abc import Callable, Coroutine
 from dataclasses import dataclass, field
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import structlog
 from starlette.websockets import WebSocket, WebSocketDisconnect, WebSocketState
@@ -57,7 +57,14 @@ from opensquilla.gateway.transport_flow import (
 )
 from opensquilla.sandbox.legacy_codec import encode_payload_for_protocol
 
+if TYPE_CHECKING:
+    from opensquilla.gateway.snapshot_transfer import SnapshotTransfer
+
 log = structlog.get_logger(__name__)
+
+_SnapshotIdentity = tuple[str | None, int | None]
+_FlowInstallReceipt = tuple[Any, Any, Any, Any, Any]
+_InstalledFlowReceipt = tuple[Any, Any, Any, Any, Any, _SnapshotIdentity]
 
 
 # ---------------------------------------------------------------------------
@@ -222,7 +229,8 @@ class WsConnection:
     _flow_dirty_notice_pending: bool = field(default=False, init=False, repr=False)
     _flow_snapshot_delivery: int | None = field(default=None, init=False, repr=False)
     _subscriptions: Any = field(default=None, init=False, repr=False)
-    _flow_installed: OrderedDict[str, tuple[Any, ...]] = field(
+    _snapshot_transfer: SnapshotTransfer | None = field(default=None, init=False, repr=False)
+    _flow_installed: OrderedDict[str, _InstalledFlowReceipt] = field(
         default_factory=OrderedDict, init=False, repr=False
     )
 
@@ -351,15 +359,15 @@ class WsConnection:
             )
         )
 
-    def _flow_install_receipt(self, resume: dict[str, Any]) -> tuple[Any, ...]:
+    def _flow_install_receipt(self, resume: dict[str, Any]) -> _FlowInstallReceipt:
         if self._subscriptions is None:
             raise ValueError("Session is not subscribed on this connection")
         return (
             self._subscriptions.get_message_subscription_token(self.conn_id, resume["key"]),
-            *(
-                resume.get(name)
-                for name in ("snapshot_id", "sync_revision", "stream_generation", "stream_seq")
-            ),
+            resume.get("snapshot_id"),
+            resume.get("sync_revision"),
+            resume.get("stream_generation"),
+            resume.get("stream_seq"),
         )
 
     def snapshot_install_identity(self, resume: dict[str, Any]) -> tuple[str | None, int | None]:
@@ -370,7 +378,7 @@ class WsConnection:
         installed = self._flow_installed.get(resume["key"])
         if installed is not None and installed[:-1] == receipt:
             return installed[-1]
-        transfer = getattr(self, "_snapshot_transfer", None)
+        transfer = self._snapshot_transfer
         if transfer is None or not transfer.matches_install(resume):
             raise ValueError("Snapshot installation is not current")
         return transfer.identity
@@ -386,7 +394,7 @@ class WsConnection:
                 or self.conn_id not in self._subscriptions.get_message_subscribers(key)
             ):
                 raise ValueError("Session is not subscribed on this connection")
-        transfer = getattr(self, "_snapshot_transfer", None)
+        transfer = self._snapshot_transfer
         from opensquilla.gateway.session_streams import get_session_streams
 
         streams = get_session_streams()
@@ -1087,6 +1095,8 @@ class WsConnection:
             receipt = _payload_field(frame.res_frame.payload, "delivery")
             if isinstance(receipt, dict) and receipt.get("delivery_epoch") == self._flow.epoch:
                 delivery_id = receipt.get("delivery_id")
+                if not isinstance(delivery_id, int) or isinstance(delivery_id, bool):
+                    raise ValueError("Snapshot delivery reservation is not current")
                 delivery = self._flow.deliveries.get(delivery_id)
                 if delivery is None or not delivery.recovery:
                     raise ValueError("Snapshot delivery reservation is not current")

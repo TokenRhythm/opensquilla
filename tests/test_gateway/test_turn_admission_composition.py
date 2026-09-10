@@ -155,7 +155,8 @@ methods = (
 )
 assert rpc_chat._turn_admission_adapter_factory is rpc_sessions.build_gateway_turn_admission_adapter
 registry = get_dispatcher()
-assert len(registry.list_methods()) == 307
+# The existing surface plus snapshot.read and transport.flow.update.
+assert len(registry.list_methods()) == 309
 for method in methods:
     entry = registry.get_entry(method)
     assert entry is not None
