@@ -258,18 +258,19 @@ try {
   assert.equal(reloadedHidden.focused,foregroundBeforeOpen.focused)
   assert.equal(reloadedHidden.viewport.count,0)
   await assertOpenedScreenshot(reloadedHidden.viewport)
-  for(const size of [{width:650,height:500},{width:420,height:600}]) {
+  for(const size of [{width:650,height:500},{width:420,height:600},{width:1200,height:900}]) {
     const adopted = await app.evaluate(async ({}, {id,size}) => {
-      const { manager } = globalThis.browserFixture
+      const { manager, owner } = globalThis.browserFixture
       const record=manager.surfaces.get(id)
       const result=manager.setSurfaceRect({surfaceId:id,x:100,y:80,...size,visible:true})
       if(!result.ok) throw new Error(result.message)
       const end=Date.now()+3000
       while(Date.now()<end) {
         const viewport=await record.view.webContents.executeJavaScript('({width:innerWidth,height:innerHeight,dpr:devicePixelRatio})')
-        if(viewport.width===size.width && viewport.height===size.height) return {viewport,
+        const bounds=record.view.getBounds()
+        if(viewport.width===bounds.width && viewport.height===bounds.height) return {viewport,
           webContentsId:record.view.webContents.id,targetRef:record.targetRef,visible:record.view.getVisible(),
-          active:manager.activeSurfaceId,bounds:record.view.getBounds()}
+          active:manager.activeSurfaceId,bounds,ownerBounds:owner.getContentBounds()}
         await new Promise(resolve=>setTimeout(resolve,20))
       }
       throw new Error('Adopted browser did not follow the real native layout size')
@@ -278,7 +279,10 @@ try {
     assert.equal(adopted.targetRef,opened.targetRef)
     assert.equal(adopted.active,hiddenState.id)
     assert.equal(adopted.visible,true)
-    assert.deepEqual(adopted.bounds,{x:100,y:80,...size})
+    assert.deepEqual(adopted.bounds,{x:100,y:80,
+      width:Math.min(size.width,adopted.ownerBounds.width-100),
+      height:Math.min(size.height,adopted.ownerBounds.height-80)})
+    assert.ok(adopted.bounds.width>0 && adopted.bounds.height>0)
     await assertOpenedScreenshot(adopted.viewport)
   }
   const openedShot = await invoke({operation:'screenshot',targetRef:opened.targetRef})
