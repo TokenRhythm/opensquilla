@@ -154,11 +154,50 @@ describe('desktop update platform bridge', () => {
       status: 'available',
       canCheck: true,
       canNativeInstall: false,
+      canInstall: false,
       installMode: 'manual',
       source: 'oss',
       fallbackUsed: true,
     })
   })
+
+  it.each([
+    { mode: 'manual', permission: true, expected: true },
+    { mode: 'manual', permission: false, expected: false },
+    { mode: 'manual', permission: undefined, expected: false },
+    { mode: 'manual', permission: 'true', expected: false },
+    { mode: 'native', permission: undefined, expected: true },
+    { mode: 'native', permission: false, expected: false },
+    { mode: 'unsupported', permission: true, expected: false },
+  ])('normalizes installation permission for $mode with $permission', async ({ mode, permission, expected }) => {
+    setDesktopApi({
+      isAutoUpdateEnabled: async () => mode === 'native',
+      isDesktopUpdateManaged: async () => true,
+      getUpdateState: async () => ({
+        status: 'downloaded',
+        installMode: mode,
+        canInstall: permission,
+      }),
+    })
+
+    expect(await createDesktopPlatform().updates.getState()).toMatchObject({
+      installMode: mode,
+      canInstall: expected,
+    })
+  })
+
+  it.each(['signature_invalid', 'signature_unavailable'])(
+    'preserves %s and does not infer installation permission', async errorCode => {
+      setDesktopApi({
+        isAutoUpdateEnabled: async () => false,
+        isDesktopUpdateManaged: async () => true,
+        getUpdateState: async () => ({ status: 'error', installMode: 'manual', errorCode }),
+      })
+      expect(await createDesktopPlatform().updates.getState()).toMatchObject({
+        status: 'error', errorCode, canInstall: false,
+      })
+    },
+  )
 
   it('preserves structured checksum and integrity failures from the shell', async () => {
     setDesktopApi({

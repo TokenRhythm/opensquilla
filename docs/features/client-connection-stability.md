@@ -11,8 +11,10 @@ handshake/directory validation, #1595 parallel contract generation, #1598 Router
 replay isolation, and the upstream skill-source and retired-experiment changes.
 The PR preparation additionally integrates `9486415af7188335d9f18f45143bfe33ce97e890`
 (#1597 questionnaire waiting and task-terminal recovery).
-The final upstream refresh is `d44e7936be0f60c82a854cbeb8a66b491f395fec`
-(#1602 entering a new draft before optional project hydration).
+Further upstream refreshes incorporate `d44e7936be0f60c82a854cbeb8a66b491f395fec`
+(#1602 entering a new draft before optional project hydration), then freeze the
+final validation baseline at `54a787bce563fa494ea0b99e8e92c0f1f7c94c71`
+(#1584 opt-in signed Windows installer handoff and cache recovery).
 Retired-experiment file removals are unchanged from that upstream pin and remain
 recoverable from Git history; this adaptation does not introduce engine cleanup.
 Upstream functionality is retained. Most existing generated-contract diffs are generator
@@ -363,6 +365,111 @@ cover the same runtime/contract code. The added browser fixture uses canonical
 `session.event.thinking` and the questionnaire fixture uses `task.timeout`,
 matching actual Gateway events; no production validator was broadened to admit
 the mistyped fixture aliases.
+
+### Final PR validation baseline and Windows updater compatibility
+
+The final validation baseline is upstream `54a787bce563fa494ea0b99e8e92c0f1f7c94c71`.
+Its Windows installer handoff remains opt-in and user-initiated. OS resume still
+only notifies the transport owner to inspect health and refresh the descriptor;
+connection recovery cannot install an update, quit, restart or reload the client.
+No installer was executed as part of these connection-stability checks.
+
+- Full WebUI unit suite: 442 files / 5,873 tests passed. Production WebUI build,
+  architecture/security/RPC/role-policy/i18n/type checks, verification and staging
+  of 397 assets, and Electron TypeScript build passed on this baseline.
+- Seven Windows updater CLI regression scripts passed: security, cache, handoff,
+  coordinator, integration, refresh and network. Their OS boundaries are injected;
+  they do not establish signed-installer or packaged-upgrade acceptance.
+- Gateway, engine, contract source and generated artifacts are byte-unchanged
+  by the #1602 and #1584 upstream updates. The 601 backend regressions and the
+  complete 405-pass contract/tooling validation above cover the same source.
+- Six new Gateway test files are explicitly registered in the existing
+  `gateway-sqlite` shard. Their 0.01-second weights are the existing policy's
+  provisional floor, not measured durations. Historical run evidence, shard
+  limits and movement guards are unchanged; a future three-run Windows refresh
+  must replace provisional weights with comparable measurements.
+- The release consistency guard now requires automatic page/composer/focus
+  preservation and rejects manual click/reload/navigation/focus actions during
+  the measured recovery interval. It no longer requires the removed manual
+  recovery button. All existing release assertions remain in force.
+- Final combined CI workflow, Windows shard/duration governance and release
+  consistency regression: 185 passed, three conditional skips, no warnings.
+  One skip requires an actual xdist worker; two Bash upload checks run in the
+  required Ubuntu packaging job instead of Windows.
+- Complete ten-spec Chromium recovery matrix: flow OFF 65/65 and flow ON 65/65
+  passed, each in 58.2 seconds, with two workers, zero retries and native Desktop
+  mode explicitly disabled. The real Goal cases verify actual policy negotiation
+  and continuation/lifecycle consumption feedback when enabled; legacy mock peers
+  remain compatibility coverage. The frozen fixtures use canonical timeout events
+  and locate a resolved questionnaire's owning disclosure even when its terminal
+  summary reads "Timed out" instead of "Activity". Receipt visibility, inability
+  to replay, input readiness and state/identity checks are retained. The separate
+  OFF silent-reply diagnostic also passed with a trace and no worker crash.
+
+During final native validation, remote main advanced to
+`829e11a4a72623fadf4e3f1f8f67d3b02b6e878e` (#1603 CI queue reuse/feedback only).
+Those eleven files have no overlap with this feature's working-tree delta
+against the frozen baseline. They are not part of the local runtime validation
+claim. Because this feature updates the Windows shard assignment, the new queue
+trust policy requires the full queue matrix instead of reduced reused coverage;
+remote PR and merge-queue checks remain separate from the local results above.
+
+Earlier diagnostic runs on the #1597 build also encountered an unexplained
+Windows browser worker exit (`0xC0000409`) and one combined native composer/focus
+assertion failure after a two-minute flow-OFF outage. The latter did not record
+enough detail to distinguish DOM replacement from focus loss. Neither event is
+presented as a proven product defect or a resolved environmental issue. Native
+checks now retain bounded, metadata-only DOM/focus and window transition rings,
+with separate strict identity/focus assertions and no forced focus during the
+measurement. The isolated follow-up on the same older build passed without
+recorded detach/disable/blur transitions; this does not establish the old failure's
+root cause. Final-build results must be read separately from those diagnostics.
+
+The first four-case native run on the final build passed all recovery assertions
+in each case, but only the first three cases exited successfully. The final
+flow-OFF/two-minute case then hit the existing 15-second Electron shutdown
+deadline; Windows process-tree cleanup returned exit 255 and could not prove the
+tree reaped. The suite therefore exited with failure, despite its earlier
+recovery-success output. A subsequent read-only PID check found that Electron
+process absent, which does not retrospectively prove graceful exit or child
+cleanup. This teardown outcome must not be reported as a green four-case gate.
+The native fixture now supplies filesystem-only shutdown diagnostics (a 256KiB
+log tail, at most 64 allowlisted lifecycle metadata records under the existing
+three-second diagnostic deadline), emits the post-shutdown outcome and retains
+the exact synthetic profile when a test or shutdown fails. It does not change
+the 15-second close limit, assertions, process-tree proof or fallback acceptance.
+Its syntax check and existing cleanup/telemetry contract script, including eight
+recovery transport contracts, passed. Raw retained profiles/logs are local
+diagnostic evidence and must never be published with the PR.
+
+The first instrumented OFF/two-minute follow-up passed recovery and logged a
+clean Gateway exit followed by the committed Desktop exit phase in about 1.56s.
+It nevertheless exited with a new test-diagnostic error: calling Playwright's
+`process()` accessor after `app.close()` accessed a disposed dispatcher. The
+fixture now captures the owned child handle before closing and reads that saved
+handle afterward. This diagnostic correction is separate from the earlier
+15-second shutdown failure and does not establish that failure's root cause.
+
+After that diagnostic correction, the focused OFF/two-minute run completed with
+exit code zero. Its composer/page/draft/focus and resume/minimize/tray/deep-link
+assertions passed; Electron closed normally in 2.131s, the owned child exited,
+and neither forced exit nor the strict Windows fallback was used. Successful
+case samples on the same frozen final production build are:
+
+| Negotiated flow | Injected unavailable interval | Backoff attempts | Signal-to-operation available |
+| --- | --- | --- | --- |
+| On | 5 seconds | 4 | 214ms |
+| Off | 5 seconds | 4 | 217ms |
+| On | 2 minutes | 15 | 215ms |
+| Off | 2 minutes | 14 | 204ms |
+
+The first three rows are successful exits from the original final-build matrix;
+the last row is the successful focused run after the diagnostic correction.
+All use identical production artifacts and strict continuity assertions, with
+isolated keyless profiles and routed WebSocket faults. This is not a claim that
+the original four-case invocation exited successfully or that its intermittent
+shutdown failure has been explained. These samples are not P95, physical
+network/sleep, packaged-client or long-duration acceptance evidence.
 
 ## Release gates still required
 

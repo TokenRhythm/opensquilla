@@ -789,6 +789,204 @@ def test_windows_specific_platform_change_stays_on_windows(
     assert "windows_specific_changed" in plan["reason_codes"]
 
 
+@pytest.mark.parametrize(
+    "path",
+    [
+        "desktop/electron/src/windows-update-security.ts",
+        "desktop/electron/src/windows-update-cache.ts",
+        "desktop/electron/src/windows-update-handoff.ts",
+        "desktop/electron/src/windows-update-coordinator.ts",
+        "desktop/electron/scripts/test-windows-update-security.mjs",
+        "desktop/electron/scripts/test-windows-update-cache.mjs",
+        "desktop/electron/scripts/test-windows-update-handoff.mjs",
+        "desktop/electron/scripts/test-windows-update-coordinator.mjs",
+        "desktop/electron/scripts/test-windows-update-integration.mjs",
+        "desktop/electron/scripts/test-windows-update-refresh.mjs",
+        "desktop/electron/scripts/test-windows-update-network.mjs",
+        "desktop/electron/scripts/test-windows-update-electron.mjs",
+        "desktop/electron/scripts/fixtures/windows-update-electron/main.template.mjs",
+    ],
+)
+def test_windows_update_changes_select_static_and_windows_ownership(
+    tmp_path: Path, suite_config: dict[str, Any], path: str
+) -> None:
+    plan = _plan(tmp_path, suite_config, path)
+
+    assert plan["full_fallback"] is False
+    assert _matrix(plan) == {("windows-latest", "ownership")}
+    assert {"desktop-static", "desktop-recovery-e2e", "windows-high-risk"}.issubset(
+        plan["required_suites"]
+    )
+    assert "macos-recovery" not in plan["required_suites"]
+
+
+def test_desktop_static_executes_windows_update_contracts() -> None:
+    import yaml
+
+    workflow = yaml.safe_load(Path(".github/workflows/ci.yml").read_text(encoding="utf-8"))
+    job = workflow["jobs"]["desktop-check"]
+    step = next(step for step in job["steps"] if step["name"] == "Run desktop unit tests")
+    package = json.loads(Path("desktop/electron/package.json").read_text(encoding="utf-8"))
+    commands = package["scripts"]["test:windows-update"].split(" && ")
+    for name in (
+        "security", "cache", "handoff", "coordinator", "integration", "refresh", "network"
+    ):
+        assert f"node scripts/test-windows-update-{name}.mjs" in step["run"].splitlines()
+        assert f"node scripts/test-windows-update-{name}.mjs" in commands
+
+
+_RETAINED_INTERACTION_INPUTS = [
+    "desktop/electron/scripts/test-packaged-retained-interaction.mjs",
+    "desktop/electron/scripts/test-packaged-retained-interaction-contract.mjs",
+    "desktop/electron/scripts/fixtures/packaged-retained-interaction/contract.mjs",
+    "desktop/electron/scripts/fixtures/packaged-retained-interaction/provider.mjs",
+    "desktop/electron/scripts/fixtures/packaged-retained-interaction/browser-probe.mjs",
+]
+_CACHED_HANDOFF_INPUTS = [
+    "desktop/electron/scripts/test-packaged-cached-handoff-contract.mjs",
+    "desktop/electron/scripts/fixtures/packaged-cached-handoff/contract.mjs",
+    "desktop/electron/scripts/fixtures/packaged-cached-handoff/runtime.mjs",
+    "desktop/electron/scripts/fixtures/packaged-cached-handoff/signed-exit-observer.mjs",
+]
+
+
+@pytest.mark.parametrize("path", _RETAINED_INTERACTION_INPUTS + _CACHED_HANDOFF_INPUTS)
+def test_retained_interaction_inputs_select_static_and_windows_ownership(
+    tmp_path: Path, suite_config: dict[str, Any], path: str
+) -> None:
+    plan = _plan(tmp_path, suite_config, path)
+
+    assert plan["full_fallback"] is False
+    assert _matrix(plan) == {("windows-latest", "ownership")}
+    assert {
+        "desktop-static", "desktop-recovery-e2e", "windows-high-risk",
+        "python-targeted", "release-packaging",
+    }.issubset(plan["required_suites"])
+    assert "macos-recovery" not in plan["required_suites"]
+    assert plan["python_targets"] == ["tests/test_ci/test_windows_signed_update_audit.py"]
+
+
+def test_retained_interaction_ci_executes_only_the_pure_contract() -> None:
+    import yaml
+
+    workflow_text = Path(".github/workflows/ci.yml").read_text(encoding="utf-8")
+    workflow = yaml.safe_load(workflow_text)
+    step = next(
+        step for step in workflow["jobs"]["desktop-check"]["steps"]
+        if step["name"] == "Run desktop unit tests"
+    )
+    command = "node scripts/test-packaged-retained-interaction-contract.mjs"
+    assert step["run"].splitlines().count(command) == 1
+    contract_script = Path(
+        "desktop/electron/scripts/test-packaged-retained-interaction-contract.mjs"
+    )
+    assert contract_script.is_file()
+    assert "scripts/test-packaged-retained-interaction.mjs" not in workflow_text
+    cached_command = "node scripts/test-packaged-cached-handoff-contract.mjs"
+    assert step["run"].splitlines().count(cached_command) == 1
+    assert Path("desktop/electron/scripts/test-packaged-cached-handoff-contract.mjs").is_file()
+    assert "--mode signed-cached-handoff" not in workflow_text
+
+
+@pytest.mark.parametrize("path", _RETAINED_INTERACTION_INPUTS + _CACHED_HANDOFF_INPUTS)
+def test_retained_interaction_inputs_change_all_consuming_suite_digests(
+    tmp_path: Path, suite_config: dict[str, Any], path: str
+) -> None:
+    dependency = tmp_path / path
+    dependency.parent.mkdir(parents=True)
+    dependency.write_text("first\n", encoding="utf-8")
+    first = _plan(tmp_path, suite_config, path)
+    dependency.write_text("second\n", encoding="utf-8")
+    second = _plan(tmp_path, suite_config, path)
+
+    for suite in (
+        "desktop-static", "desktop-recovery-e2e", "python-targeted", "release-packaging"
+    ):
+        assert first["suite_execution_digests"][suite] != second["suite_execution_digests"][suite]
+
+
+@pytest.mark.parametrize(
+    ("runner_os", "shard", "expected"),
+    [
+        ("Windows", "ownership", True),
+        ("Windows", "ownership-workbench", True),
+        ("Windows", "all", True),
+        ("Windows", "profiles", False),
+        ("Windows", "workbench", False),
+        ("Linux", "ownership", False),
+        ("macOS", "ownership", False),
+    ],
+)
+def test_windows_update_native_checks_stay_in_ownership_cells(
+    runner_os: str, shard: str, expected: bool
+) -> None:
+    import shutil
+
+    import yaml
+
+    bash = shutil.which("bash")
+    if not bash:
+        pytest.skip("Bash is required to verify the workflow case selection")
+    workflow = yaml.safe_load(Path(".github/workflows/ci.yml").read_text(encoding="utf-8"))
+    job = workflow["jobs"]["desktop-recovery-e2e"]
+    step = next(
+        step for step in job["steps"] if step["name"] == "Run compiled Desktop recovery flows"
+    )
+    dispatch = (
+        step["run"]
+        .split("# The Linux static lane covers", 1)[1]
+        .split('for entry in "${entries[@]}"', 1)[0]
+    )
+    # Execute only the shell's selection block, never the workflow tests.
+    dispatch = dispatch[dispatch.index('if [[ "${RUNNER_OS}"') :].replace(
+        "${{ matrix.shard }}", shard
+    )
+    selection = (
+        f"RUNNER_OS='{runner_os}'\nentries=()\n{dispatch}\nprintf '%s\\n' \"${{entries[@]}}\"\n"
+    )
+    result = subprocess.run(
+        [bash, "-s"],
+        # Binary stdin preserves LF when the Python host is Windows.
+        input=selection.encode("utf-8"),
+        capture_output=True,
+        check=True,
+        timeout=15,
+    )
+    entries = result.stdout.decode("utf-8").strip().splitlines()
+    assert entries == (
+        [
+            "windows-update-security:scripts/test-windows-update-security.mjs",
+            "windows-update-handoff:scripts/test-windows-update-handoff.mjs",
+            "windows-update-network:scripts/test-windows-update-network.mjs",
+            "packaged-retained-interaction-contract:scripts/test-packaged-retained-interaction-contract.mjs",
+            "packaged-cached-handoff-contract:scripts/test-packaged-cached-handoff-contract.mjs",
+            "windows-update-electron:scripts/test-windows-update-electron.mjs",
+        ]
+        if expected
+        else []
+    )
+
+
+def test_windows_update_electron_has_frontend_dependencies_and_evidence_upload() -> None:
+    import yaml
+
+    workflow = yaml.safe_load(Path(".github/workflows/ci.yml").read_text(encoding="utf-8"))
+    steps = workflow["jobs"]["desktop-recovery-e2e"]["steps"]
+    dependencies = next(
+        step for step in steps if step["name"] == "Install WebUI recovery dependencies"
+    )
+    assert dependencies["working-directory"] == "opensquilla-webui"
+    assert dependencies["run"] == "npm ci"
+    for shard in ("ownership", "ownership-workbench", "all"):
+        assert f"matrix.shard == '{shard}'" in dependencies["if"]
+    summary = next(step for step in steps if step["name"] == "Upload Desktop recovery summary")
+    assert "desktop-recovery-e2e/windows-update-electron" in summary["with"]["path"]
+    package = json.loads(Path("desktop/electron/package.json").read_text(encoding="utf-8"))
+    assert package["scripts"]["test:windows-update-electron"] == (
+        "npm run build && node scripts/test-windows-update-electron.mjs"
+    )
+
+
 def test_toolchain_and_packaging_changes_select_dedicated_suites(
     tmp_path: Path, suite_config: dict[str, Any]
 ) -> None:
@@ -1266,6 +1464,8 @@ def test_upgrade_source_only_changes_select_baseline_contract(
     expected = [existing_target, "tests/test_ci/test_upgrade_baselines.py"]
     if path == ".github/workflows/wheelhouse-release.yml":
         expected.append("tests/test_ci/test_release_signing_preflight.py")
+    if path == ".github/scripts/verify-release-windows-upgrade.ps1":
+        expected.append("tests/test_ci/test_windows_signed_update_audit.py")
     assert plan["python_targets"] == sorted(expected)
     assert "python-targeted" in plan["required_suites"]
     assert plan["full_fallback"] is False
@@ -1279,6 +1479,10 @@ def test_upgrade_source_only_changes_select_baseline_contract(
         ".github/workflows/wheelhouse-release.yml",
         "desktop/electron/scripts/test-packaged-real-update-flow.mjs",
         "tests/test_ci/test_upgrade_baselines.py",
+        "tests/test_ci/test_windows_signed_update_audit.py",
+        ".github/scripts/verify-release-windows-signed-update.ps1",
+        ".github/scripts/verify-windows-native-write-view.mjs",
+        ".github/scripts/native-audit-write-view.py",
     ],
 )
 def test_upgrade_contract_inputs_change_release_packaging_digest(
@@ -1311,8 +1515,69 @@ def test_release_packaging_executes_upgrade_baseline_contract() -> None:
     assert "command -v node" in step["run"]
     assert "command -v pwsh" in step["run"]
     assert "tests/test_ci/test_upgrade_baselines.py" in step["run"].split()
+    assert "tests/test_ci/test_windows_signed_update_audit.py" in step["run"].split()
     assert "tests/test_ci/test_release_signing_preflight.py" in step["run"].split()
     assert "tests/test_ci/test_windows_signatures.py" in step["run"].split()
+
+
+_NATIVE_WRITE_VIEW_INPUTS = [
+    ".github/scripts/verify-windows-native-write-view.mjs",
+    ".github/scripts/native-audit-write-view.py",
+    "tests/test_ci/test_windows_signed_update_audit.py",
+]
+
+
+@pytest.mark.parametrize("path", _NATIVE_WRITE_VIEW_INPUTS)
+def test_native_write_view_inputs_select_linux_and_windows_contracts(
+    tmp_path: Path, suite_config: dict[str, Any], path: str
+) -> None:
+    plan = _plan(tmp_path, suite_config, path)
+    assert plan["full_fallback"] is False
+    assert plan["python_targets"] == ["tests/test_ci/test_windows_signed_update_audit.py"]
+    assert _matrix(plan) == {("windows-latest", "ownership")}
+    assert {"python-targeted", "release-packaging", "frontend-artifact"} <= set(
+        plan["required_suites"]
+    )
+    assert _platform_cells(plan, "release-packaging") == {("ubuntu-latest", "default")}
+    assert plan["python_matrix"] == {"ubuntu": [], "windows": []}
+    assert "macos-recovery" not in plan["required_suites"]
+
+
+@pytest.mark.parametrize("path", _NATIVE_WRITE_VIEW_INPUTS)
+def test_native_write_view_inputs_change_all_consuming_digests(
+    tmp_path: Path, suite_config: dict[str, Any], path: str
+) -> None:
+    dependency = tmp_path / path
+    dependency.parent.mkdir(parents=True)
+    dependency.write_text("first\n", encoding="utf-8")
+    first = _plan(tmp_path, suite_config, path)
+    dependency.write_text("second\n", encoding="utf-8")
+    second = _plan(tmp_path, suite_config, path)
+    for suite in ("python-targeted", "release-packaging", "desktop-recovery-e2e"):
+        assert first["suite_execution_digests"][suite] != second["suite_execution_digests"][suite]
+
+
+def test_native_write_view_ci_executes_only_contracts_in_windows_ownership() -> None:
+    import yaml
+
+    workflow = yaml.safe_load(Path(".github/workflows/ci.yml").read_text(encoding="utf-8"))
+    job = workflow["jobs"]["desktop-recovery-e2e"]
+    matches = [
+        step for step in job["steps"]
+        if step["name"] == "Test native Windows audit write-view contracts"
+    ]
+    assert len(matches) == 1
+    step = matches[0]
+    assert step["if"] == "${{ runner.os == 'Windows' && matrix.shard == 'ownership' }}"
+    assert "uv run pytest tests/test_ci/test_windows_signed_update_audit.py -q" in step["run"]
+    assert "command -v node" in step["run"] and "command -v pwsh" in step["run"]
+    assert "--junitxml=" in step["run"]
+    assert "verify-windows-native-write-view.mjs" not in step["run"]
+    assert "native-audit-write-view.py" not in step["run"]
+    upload = next(
+        step for step in job["steps"] if step["name"] == "Upload Desktop recovery summary"
+    )
+    assert "native-write-view-contracts.xml" in upload["with"]["path"]
 
 
 @pytest.mark.parametrize(
@@ -1325,6 +1590,18 @@ def test_release_packaging_executes_upgrade_baseline_contract() -> None:
         (
             ".github/scripts/verify-windows-signatures.ps1",
             "tests/test_ci/test_windows_signatures.py",
+        ),
+        (
+            ".github/scripts/verify-release-windows-signed-update.ps1",
+            "tests/test_ci/test_windows_signed_update_audit.py",
+        ),
+        (
+            ".github/scripts/verify-windows-native-write-view.mjs",
+            "tests/test_ci/test_windows_signed_update_audit.py",
+        ),
+        (
+            ".github/scripts/native-audit-write-view.py",
+            "tests/test_ci/test_windows_signed_update_audit.py",
         ),
     ],
 )

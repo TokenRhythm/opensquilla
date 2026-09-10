@@ -1,5 +1,5 @@
 import { strict as assert } from 'node:assert'
-import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, open, readFile, realpath, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { setTimeout as delay } from 'node:timers/promises'
@@ -617,18 +617,95 @@ try {
   throw error
 } finally {
   let shutdownError = null
+  let preserveEvidence = !flowSucceeded
   if (desktopApp) {
+    // Capture ownership while Playwright's dispatcher still exists. The public
+    // process() accessor is no longer usable after a successful app.close().
+    const ownedChild = desktopApp.process()
     const desktopLogPath = join(userDataDir, 'logs', 'desktop.log')
     const desktopLogCheckpoint = await readFile(desktopLogPath, 'utf8').catch(() => null)
+    const shutdownStartedAt = Date.now()
+    let shutdownDiagnostics = null
     const shutdown = await closeElectronWithDeadline({
       app: desktopApp,
       phase: 'window-background-final-shutdown',
       timeoutMs: ELECTRON_SHUTDOWN_TIMEOUT_MS,
+      // The helper bounds this callback to 3 seconds. Do not use Electron IPC
+      // here: the very process being diagnosed may no longer answer it.
+      diagnostics: async () => {
+        let handle
+        try {
+          handle = await open(desktopLogPath, 'r')
+          const { size } = await handle.stat()
+          const tailStart = Math.max(0, size - 256 * 1024)
+          const buffer = Buffer.alloc(size - tailStart)
+          const { bytesRead } = await handle.read(buffer, 0, buffer.length, tailStart)
+          let tail = buffer.subarray(0, bytesRead).toString('utf8')
+          if (tailStart > 0) tail = tail.slice(tail.indexOf('\n') + 1)
+          const events = new Set([
+            'before_quit', 'desktop_exit_phase', 'quit_gateway_shutdown_requested',
+            'quit_gateway_exit', 'quit_gateway_drain_failed', 'quit_gateway_still_running',
+            'quit_deferred_for_profile_writer', 'quit_deferred_for_update_drain',
+          ])
+          const phases = new Set(['running', 'deferred', 'draining', 'committed'])
+          const reasons = new Set([
+            'Windows session ending', 'desktop updater owns exit',
+            'waiting for desktop update handoff', 'Gateway quit drain already in progress',
+            'waiting for desktop writers', 'stopping lifecycle-owned Gateway',
+            'all lifecycle-owned Gateways exited', 'Gateway quit drain failed safely',
+            'no lifecycle-owned Gateway remains',
+          ])
+          const records = []
+          let dropped = 0
+          for (const line of tail.split('\n')) {
+            let record
+            try { record = JSON.parse(line) } catch { continue }
+            if (!record || !events.has(record.event)) continue
+            // Strict field/value allowlists: no log bodies, error messages,
+            // credentials, ownership nonces, URLs, paths or arbitrary strings.
+            const safe = { event: record.event }
+            const at = typeof record.at === 'string' ? Date.parse(record.at) : NaN
+            if (Number.isFinite(at)) safe.relativeToShutdownMs = at - shutdownStartedAt
+            for (const key of ['exited', 'hardTerminated', 'accepted', 'alreadyStopping', 'gatewayDrainInFlight']) {
+              if (typeof record[key] === 'boolean' || record[key] === null) safe[key] = record[key]
+            }
+            for (const key of ['from', 'to']) {
+              if (phases.has(record[key])) safe[key] = record[key]
+            }
+            if (reasons.has(record.reason)) safe.reason = record.reason
+            if (Number.isSafeInteger(record.activeWriters) && record.activeWriters >= 0) safe.activeWriters = record.activeWriters
+            if (Array.isArray(record.pids)) safe.ownedProcessCount = record.pids.length
+            if (records.length === 64) { records.shift(); dropped++ }
+            records.push(safe)
+          }
+          shutdownDiagnostics = {
+            logBytes: size,
+            checkpointBytes: desktopLogCheckpoint === null ? null : Buffer.byteLength(desktopLogCheckpoint, 'utf8'),
+            inspectedTailBytes: bytesRead,
+            tailTruncated: tailStart > 0,
+            checkpointPrefixMatches: desktopLogCheckpoint === null || tailStart > 0
+              ? null : tail.startsWith(desktopLogCheckpoint),
+            records,
+            dropped,
+          }
+        } catch (error) {
+          shutdownDiagnostics = {
+            logReadFailed: true,
+            errorCode: ['ENOENT', 'EACCES', 'EPERM', 'EBUSY', 'EIO'].includes(error?.code)
+              ? error.code : 'OTHER',
+          }
+        } finally {
+          await handle?.close().catch(() => {})
+        }
+        return shutdownDiagnostics
+      },
     })
     shutdownError = shutdown.error
+    preserveEvidence ||= Boolean(shutdown.error)
+    let shutdownEvidence = null
     if (shutdown.error) {
       const desktopLog = await readFile(desktopLogPath, 'utf8').catch(() => null)
-      const shutdownEvidence = desktopShutdownEvidenceSince(desktopLogCheckpoint, desktopLog)
+      shutdownEvidence = desktopShutdownEvidenceSince(desktopLogCheckpoint, desktopLog)
       if (canAcceptWindowsElectronShutdownFallback({
         shutdown,
         ...shutdownEvidence,
@@ -640,7 +717,32 @@ try {
         }))
       }
     }
+    console.error(JSON.stringify({
+      event: 'desktop_e2e_shutdown_outcome',
+      phase: 'window-background-final-shutdown',
+      flowSucceeded,
+      elapsedMs: Date.now() - shutdownStartedAt,
+      closed: shutdown.closed,
+      forcedExitSucceeded: shutdown.forcedExitSucceeded,
+      processTreeReaped: shutdown.processTreeReaped,
+      strictFallbackAccepted: Boolean(shutdown.error) && shutdownError === null,
+      childExited: ownedChild ? ownedChild.exitCode !== null || ownedChild.signalCode !== null : null,
+      shutdownEvidence,
+      shutdownDiagnostics,
+    }))
   }
-  await rm(isolationRoot, { recursive: true, force: true }).catch(() => {})
+  if (preserveEvidence) {
+    // Keep only this synthetic test profile for local diagnosis; never publish
+    // its raw logs or profile contents. A failed teardown must not erase proof.
+    console.error(JSON.stringify({
+      event: 'desktop_e2e_evidence_preserved',
+      phase: 'window-background-final-shutdown',
+      isolationRoot,
+      flowSucceeded,
+      shutdownFailed: shutdownError !== null,
+    }))
+  } else {
+    await rm(isolationRoot, { recursive: true, force: true }).catch(() => {})
+  }
   if (flowSucceeded && shutdownError) throw shutdownError
 }

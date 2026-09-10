@@ -297,6 +297,52 @@ def test_release_profile_config_diagnostics_omit_values(
     assert parsed["actual_text_sha256"] != parsed["expected_text_sha256"]
 
 
+@pytest.mark.parametrize("signed_seed", [False, True])
+@pytest.mark.parametrize(
+    "variant", ["seed", "migrated", "partial-migration", "comment", "identity", "external"]
+)
+def test_signed_retained_preservation_accepts_only_exact_seed_or_migration(
+    tmp_path: Path, variant: str, signed_seed: bool
+) -> None:
+    probe_path = Path(".github/scripts/verify-release-profile-preservation.py")
+    probe = runpy.run_path(str(probe_path))
+    home = tmp_path / "profile"
+    external = tmp_path / "external"
+    label = "signed-retained-contract"
+    probe["seed_profile"](home, label, external_root=external, signed_retained=signed_seed)
+    config = home / "config.toml"
+    if variant == "migrated":
+        config.write_text(
+            probe["_runtime_config_text"](home, signed_retained=signed_seed), encoding="utf-8"
+        )
+    elif variant == "partial-migration":
+        config.write_text("config_version = 1\n" + config.read_text(), encoding="utf-8")
+    elif variant == "comment":
+        config.write_text(config.read_text() + "\n# unexpected edit\n", encoding="utf-8")
+    elif variant == "identity":
+        (home / "workspace" / "IDENTITY.md").write_text("changed", encoding="utf-8")
+    elif variant == "external":
+        (external / "git" / "git-sentinel.bin").write_bytes(b"changed")
+    argv = [
+        sys.executable,
+        str(probe_path),
+        "verify-signed-retained",
+        "--home",
+        str(home),
+        "--label",
+        label,
+        "--external-root",
+        str(external),
+    ]
+    result = subprocess.run(argv, capture_output=True, text=True, check=False)
+    assert result.returncode == (0 if variant in {"seed", "migrated"} else 1), result.stderr
+    if variant in {"seed", "migrated"}:
+        # The new operation must not broaden either original installer check.
+        argv[2] = "verify-runtime" if variant == "seed" else "verify"
+        legacy = subprocess.run(argv, capture_output=True, text=True, check=False)
+        assert legacy.returncode == 1
+
+
 def test_release_profile_preservation_probe_covers_identity_config_and_chat_db(
     tmp_path: Path,
 ) -> None:
@@ -694,7 +740,9 @@ def test_release_workflow_gates_built_and_downloaded_installers_on_profile_reten
         "chat-session-load-state",
         'data-recovery-state=\"history-error\"',
         'data-recovery-state=\"live-degraded\"',
-        "chat-session-recovery-retry",
+        "automatic recovery must not navigate the page",
+        "automatic recovery must preserve the original composer instance",
+        "automatic recovery must not move focus away from the draft",
         "composer.isEditable()",
         "sendButton.isDisabled()",
         "expectedLastMessage",
@@ -711,6 +759,15 @@ def test_release_workflow_gates_built_and_downloaded_installers_on_profile_reten
         "runError ??= error",
     ):
         assert contract in session_recovery_smoke
+    # Recovery must be observed through product-owned retries, not initiated
+    # by clicking the legacy manual control in the acceptance fixture.
+    assert "chat-session-recovery-retry" not in session_recovery_smoke
+    automatic_recovery = session_recovery_smoke[
+        session_recovery_smoke.index("  injectHang = false") :
+        session_recovery_smoke.index("  const recoveredTransport = recoveryTransportSample()")
+    ]
+    for manual_action in (".click(", ".reload(", ".goto(", ".focus("):
+        assert manual_action not in automatic_recovery
     assert "page.clock" not in session_recovery_smoke
     assert "app?.close().catch" not in session_recovery_smoke
     assert "unrouteBeforeQuit:" not in session_recovery_smoke

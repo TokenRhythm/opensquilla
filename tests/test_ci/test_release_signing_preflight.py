@@ -41,6 +41,7 @@ def preflight(monkeypatch: pytest.MonkeyPatch) -> ModuleType:
     monkeypatch.setattr(module, "urlopen", no_network)
     monkeypatch.setenv("GH_TOKEN", "synthetic-test-token")
     monkeypatch.setenv("GITHUB_API_URL", "https://github.example.invalid/api/v3")
+    monkeypatch.delenv("INTERNAL_WINDOWS_ONLY", raising=False)
     return module
 
 
@@ -86,6 +87,64 @@ def test_invalid_source_context_fails_before_fetch(
 ) -> None:
     with pytest.raises(ValueError):
         preflight.source_ref(event, ref, tag, sha)
+
+
+@pytest.mark.parametrize("ref", ["refs/heads/main", "refs/heads/integration/native-audit"])
+def test_windows_only_internal_dispatch_keeps_immutable_source(
+    preflight: ModuleType, ref: str
+) -> None:
+    assert (
+        preflight.source_ref("workflow_dispatch", ref, "", SHA, internal_windows_only=True) == SHA
+    )
+
+
+@pytest.mark.parametrize(
+    ("event", "ref", "tag"),
+    [
+        ("push", "refs/tags/v0.5.5", "v0.5.5"),
+        ("push", "refs/heads/main", ""),
+        ("workflow_dispatch", "refs/heads/main", "v0.5.5"),
+        ("workflow_dispatch", "refs/heads/integration/native-audit", "v0.5.5"),
+        ("workflow_dispatch", "refs/tags/v0.5.5", ""),
+        ("pull_request", "refs/pull/1584/merge", ""),
+    ],
+)
+def test_windows_only_invalid_dispatch_fails_before_fetch_or_release_query(
+    preflight: ModuleType,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    event: str,
+    ref: str,
+    tag: str,
+) -> None:
+    output = tmp_path / "outputs"
+    for name, value in {
+        "INTERNAL_WINDOWS_ONLY": "true",
+        "GITHUB_EVENT_NAME": event,
+        "GITHUB_REF": ref,
+        "RELEASE_TAG": tag,
+        "GITHUB_SHA": SHA,
+        "GITHUB_OUTPUT": str(output),
+    }.items():
+        monkeypatch.setenv(name, value)
+
+    def unexpected_side_effect(*_args: object) -> None:
+        pytest.fail("Invalid Windows-only invocation must fail before Git/API access")
+
+    monkeypatch.setattr(preflight, "resolve_source", unexpected_side_effect)
+    monkeypatch.setattr(preflight, "validate_release", unexpected_side_effect)
+    with pytest.raises(ValueError, match="branch dispatch with an empty release tag"):
+        preflight.main()
+    assert not output.exists()
+
+
+@pytest.mark.parametrize("value", ["", "1", "0", "TRUE", "true\n"])
+def test_windows_only_malformed_boolean_is_not_silently_ignored(
+    preflight: ModuleType, monkeypatch: pytest.MonkeyPatch, value: str
+) -> None:
+    monkeypatch.setenv("INTERNAL_WINDOWS_ONLY", value)
+    with pytest.raises(ValueError, match="INTERNAL_WINDOWS_ONLY must be true or false"):
+        preflight.main()
 
 
 def _git(repo: Path, *args: str) -> str:
@@ -264,9 +323,15 @@ def test_transport_failure_does_not_mean_release_absent(
         preflight.validate_release("TokenRhythm/opensquilla", "v0.5.5")
 
 
-@pytest.mark.parametrize("tag", ["", "v0.5.5"])
+@pytest.mark.parametrize(
+    ("tag", "windows_only"), [("", None), ("", "false"), ("", "true"), ("v0.5.5", "false")]
+)
 def test_main_exports_only_validated_sha_and_records_workflow_provenance(
-    preflight: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, tag: str
+    preflight: ModuleType,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tag: str,
+    windows_only: str | None,
 ) -> None:
     events = []
     output = tmp_path / "outputs"
@@ -282,6 +347,8 @@ def test_main_exports_only_validated_sha_and_records_workflow_provenance(
         "GITHUB_STEP_SUMMARY": str(summary),
     }.items():
         monkeypatch.setenv(name, value)
+    if windows_only is not None:
+        monkeypatch.setenv("INTERNAL_WINDOWS_ONLY", windows_only)
 
     def resolve(ref: str) -> str:
         events.append(("resolve", ref))
@@ -300,6 +367,8 @@ def test_main_exports_only_validated_sha_and_records_workflow_provenance(
     assert output.read_text(encoding="utf-8") == f"source_sha={'c' * 40}\n"
     assert "c" * 40 in summary.read_text(encoding="utf-8")
     assert "b" * 40 in summary.read_text(encoding="utf-8")
+    scope = "internal Windows only" if windows_only == "true" else "all release platforms"
+    assert f"Build scope: {scope}" in summary.read_text(encoding="utf-8")
 
 
 def test_workflow_checkouts_use_preflight_sha_through_declared_job_outputs() -> None:
@@ -403,6 +472,54 @@ def test_empty_tag_runs_independent_windows_artifact_audit_matrix() -> None:
     assert "-BaselineVersion $env:BASELINE_VERSION" in verify["run"]
     assert "-InstallMode $env:INSTALL_MODE" in verify["run"]
     assert "secrets." not in json.dumps(audit)
+
+
+def test_windows_only_input_skips_unrelated_jobs_and_keeps_signed_windows_audits() -> None:
+    workflow = yaml.safe_load((ROOT / ".github/workflows/wheelhouse-release.yml").read_text())
+    triggers = workflow.get("on", workflow.get(True))
+    option = triggers["workflow_dispatch"]["inputs"]["internal_windows_only"]
+    assert option["type"] == "boolean"
+    assert option["default"] is False
+    assert option["required"] is False
+    jobs = workflow["jobs"]
+    preflight_step = next(
+        step for step in jobs["release-preflight"]["steps"] if step.get("id") == "source"
+    )
+    assert preflight_step["env"]["INTERNAL_WINDOWS_ONLY"] == (
+        "${{ inputs.internal_windows_only || false }}"
+    )
+    assert preflight_step["run"] == "python .github/scripts/release_signing_preflight.py"
+    skipped = {"build-release-assets", "build-desktop-macos", "publish-release"}
+    for name in skipped:
+        assert jobs[name]["if"] == "${{ inputs.internal_windows_only != true }}"
+    assert {
+        name for name, job in jobs.items() if "internal_windows_only" in job.get("if", "")
+    } == skipped
+    for name in ("release-preflight", "build-control-ui", "build-desktop-windows"):
+        assert "if" not in jobs[name]
+    assert jobs["build-control-ui"]["needs"] == "release-preflight"
+    windows = jobs["build-desktop-windows"]
+    assert windows["needs"] == "build-control-ui"
+    assert windows["environment"] == {"name": "windows-code-signing"}
+    steps = {step.get("name"): step for step in windows["steps"]}
+    assert "node scripts/build-signed-windows.cjs" in steps["Build signed Windows installer"]["run"]
+    assert steps["Verify Windows Authenticode signatures and timestamps"]["run"] == (
+        ".github/scripts/verify-windows-signatures.ps1"
+    )
+    assert "if" not in steps["Gate packaged first-send renderer"]
+    assert jobs["audit-internal-windows-artifact"]["needs"] == [
+        "build-control-ui",
+        "build-desktop-windows",
+    ]
+    assert workflow["permissions"] == {"contents": "read"}
+    for name in (
+        "prestage-draft-updater-assets",
+        "audit-downloaded-macos-release",
+        "audit-downloaded-windows-release",
+    ):
+        assert jobs[name]["if"] == (
+            "${{ github.event_name == 'push' || github.event.inputs.tag != '' }}"
+        )
 
 
 def test_internal_diagnostics_preserve_signed_bytes_without_feeding_publication() -> None:

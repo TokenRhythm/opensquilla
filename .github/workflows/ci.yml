@@ -842,6 +842,15 @@ jobs:
           node scripts/test-secret-storage-policy.mjs
           node scripts/test-update-resolver.mjs
           node scripts/test-update-check-scheduler.mjs
+          node scripts/test-windows-update-security.mjs
+          node scripts/test-windows-update-cache.mjs
+          node scripts/test-windows-update-handoff.mjs
+          node scripts/test-windows-update-coordinator.mjs
+          node scripts/test-windows-update-integration.mjs
+          node scripts/test-windows-update-refresh.mjs
+          node scripts/test-windows-update-network.mjs
+          node scripts/test-packaged-retained-interaction-contract.mjs
+          node scripts/test-packaged-cached-handoff-contract.mjs
           node scripts/test-desktop-locale.mjs
           node scripts/test-desktop-zoom-shortcuts.mjs --contracts-only
           node scripts/test-desktop-profile-substrate.mjs
@@ -1422,7 +1431,7 @@ jobs:
           key: electron-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('desktop/electron/package-lock.json') }}
 
       - name: Install WebUI recovery dependencies
-        if: ${{ (runner.os == 'Windows' || runner.os == 'macOS') && matrix.shard == 'profiles' }}
+        if: ${{ ((runner.os == 'Windows' || runner.os == 'macOS') && matrix.shard == 'profiles') || (runner.os == 'Windows' && (matrix.shard == 'ownership' || matrix.shard == 'ownership-workbench' || matrix.shard == 'all')) }}
         working-directory: opensquilla-webui
         shell: bash
         run: npm ci
@@ -1797,6 +1806,25 @@ jobs:
               ;;
           esac
 
+          # The Linux static lane covers the deterministic update contracts.
+          # Windows also exercises native verification/registry boundaries and
+          # the production IPC, update UI and lifecycle in isolated Electron.
+          # The retained-interaction contract is pure Node/loopback; the actual
+          # packaged native audit requires explicit artifacts and stays manual.
+          if [[ "${RUNNER_OS}" == "Windows" &&
+                ( "${{ matrix.shard }}" == 'ownership' ||
+                  "${{ matrix.shard }}" == 'ownership-workbench' ||
+                  "${{ matrix.shard }}" == 'all' ) ]]; then
+            entries+=(
+              'windows-update-security:scripts/test-windows-update-security.mjs'
+              'windows-update-handoff:scripts/test-windows-update-handoff.mjs'
+              'windows-update-network:scripts/test-windows-update-network.mjs'
+              'packaged-retained-interaction-contract:scripts/test-packaged-retained-interaction-contract.mjs'
+              'packaged-cached-handoff-contract:scripts/test-packaged-cached-handoff-contract.mjs'
+              'windows-update-electron:scripts/test-windows-update-electron.mjs'
+            )
+          fi
+
           for entry in "${entries[@]}"
           do
             name="${entry%%:*}"
@@ -1819,6 +1847,17 @@ jobs:
           done
           printf 'e2e_status=passed\n' >> "${CI_REPORT_DIR}/first-failure.txt"
 
+      - name: Test native Windows audit write-view contracts
+        if: ${{ runner.os == 'Windows' && matrix.shard == 'ownership' }}
+        shell: bash
+        run: |
+          # Pure contracts create their own temporary roots; never run the
+          # native helper against the runner's real Roaming profile.
+          command -v node
+          command -v pwsh
+          uv run pytest tests/test_ci/test_windows_signed_update_audit.py -q \
+            --junitxml="${CI_REPORT_DIR}/native-write-view-contracts.xml"
+
       - name: Upload Desktop recovery summary
         if: ${{ success() }}
         uses: actions/upload-artifact@v4
@@ -1828,8 +1867,10 @@ jobs:
             ${{ runner.temp }}/desktop-recovery-e2e/environment.txt
             ${{ runner.temp }}/desktop-recovery-e2e/first-failure.txt
             ${{ runner.temp }}/desktop-recovery-e2e/desktop-e2e-cases.jsonl
+            ${{ runner.temp }}/desktop-recovery-e2e/native-write-view-contracts.xml
             ${{ runner.temp }}/desktop-recovery-e2e/retry-classifications.jsonl
             ${{ runner.temp }}/desktop-recovery-e2e/retry-evidence
+            ${{ runner.temp }}/desktop-recovery-e2e/windows-update-electron
           if-no-files-found: error
           retention-days: 14
 
@@ -1959,6 +2000,7 @@ jobs:
           command -v pwsh
           uv run pytest \
             tests/test_ci/test_upgrade_baselines.py \
+            tests/test_ci/test_windows_signed_update_audit.py \
             tests/test_ci/test_release_signing_preflight.py \
             tests/test_ci/test_windows_signatures.py \
             tests/test_scripts/test_build_wheelhouse_zip.py \

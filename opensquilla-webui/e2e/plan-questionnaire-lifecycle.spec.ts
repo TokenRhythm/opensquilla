@@ -150,9 +150,15 @@ async function openQuestionnaire(page: Page) {
 async function expectReceipt(page: Page, label: string) {
   const receipt = page.getByText(label, { exact: true })
   await expect(receipt).toBeAttached()
-  // Resolved timeline interrupts move into the collapsed Activity disclosure.
+  // Resolved timeline interrupts move into their activity disclosure. A
+  // terminal outcome may label its summary "Timed out", not "Activity".
   if (!await receipt.isVisible()) {
-    await page.getByRole('button', { name: /^Activity/ }).click()
+    const activity = page.getByTestId('assistant-activity').filter({ has: receipt })
+    await expect(activity).toHaveCount(1)
+    const summary = activity.locator(':scope > button[aria-controls]')
+    await expect(summary).toHaveAttribute('aria-expanded', 'false')
+    await summary.click()
+    await expect(summary).toHaveAttribute('aria-expanded', 'true')
   }
   await expect(receipt).toBeVisible()
 }

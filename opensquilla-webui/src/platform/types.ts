@@ -54,6 +54,8 @@ export type DesktopUpdateErrorCode =
   | 'manifest_invalid'
   | 'checksum_unavailable'
   | 'integrity_failed'
+  | 'signature_invalid'
+  | 'signature_unavailable'
   | 'download_failed'
   | 'install_failed'
 
@@ -68,6 +70,8 @@ export interface DesktopUpdateState {
   snoozedUntil: string | null
   canCheck: boolean
   canNativeInstall: boolean
+  /** Explicit shell permission to launch installation; older manual shells omit it. */
+  canInstall?: boolean
   installMode: DesktopUpdateInstallMode
   releaseUrl: string | null
   source: DesktopUpdateSource | null

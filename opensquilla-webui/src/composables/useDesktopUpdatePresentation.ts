@@ -14,7 +14,9 @@ export interface DesktopUpdatePresentation {
   status: ComputedRef<DesktopUpdateStatus>
   latestVersion: ComputedRef<string>
   manualInstall: ComputedRef<boolean>
+  canDownload: ComputedRef<boolean>
   canInstall: ComputedRef<boolean>
+  retryError: ComputedRef<boolean>
   busy: ComputedRef<boolean>
   summary: ComputedRef<string>
   indicatorLabel: ComputedRef<string>
@@ -53,7 +55,12 @@ export function useDesktopUpdatePresentation(
   const status = computed(() => update.state.value.status)
   const latestVersion = computed(() => update.latestVersion.value)
   const manualInstall = computed(() => update.state.value.installMode === 'manual')
-  const canInstall = computed(() => update.state.value.installMode !== 'unsupported')
+  const canDownload = computed(() => update.state.value.installMode !== 'unsupported')
+  const canInstall = computed(() => canDownload.value && (
+    update.state.value.canInstall ?? update.state.value.installMode === 'native'
+  ))
+  const retryError = computed(() => manualInstall.value && status.value === 'downloaded'
+    && Boolean(update.state.value.errorCode || update.state.value.error))
   const busy = computed(() => (
     update.actionBusy.value
     || status.value === 'downloading'
@@ -65,6 +72,8 @@ export function useDesktopUpdatePresentation(
   })
 
   const summary = computed(() => {
+    if (retryError.value) return t('updates.desktop.indicatorError')
+    if (status.value === 'applying') return t(manualInstall.value ? 'updates.desktop.manualApplyingStatus' : 'updates.desktop.applyingStatus')
     if (status.value === 'downloaded') {
       return manualInstall.value
         ? t('updates.desktop.indicatorInstallerReady')
@@ -80,6 +89,12 @@ export function useDesktopUpdatePresentation(
   })
 
   const title = computed(() => {
+    if (retryError.value) {
+      const checkFailed = update.state.value.errorCode === 'source_unreachable'
+        || update.state.value.errorCode === 'manifest_invalid'
+      return t(checkFailed ? 'updates.desktop.errorTitle' : 'updates.desktop.installErrorTitle')
+    }
+    if (status.value === 'applying') return t(manualInstall.value ? 'updates.desktop.manualApplyingStatus' : 'updates.desktop.applyingStatus')
     if (status.value === 'downloaded') {
       return manualInstall.value
         ? t('updates.desktop.manualDownloadedTitle')
@@ -91,9 +106,13 @@ export function useDesktopUpdatePresentation(
   })
 
   const description = computed(() => {
+    if (retryError.value) return update.localizedError.value
+    if (status.value === 'applying') {
+      return t(manualInstall.value ? 'updates.desktop.manualApplyingDesc' : 'updates.desktop.applyingDesc')
+    }
     if (status.value === 'downloaded') {
       return manualInstall.value
-        ? t('updates.desktop.manualDownloadedDesc', { version: latestVersion.value })
+        ? t(canInstall.value ? 'updates.desktop.signedDownloadedDesc' : 'updates.desktop.manualDownloadedDesc', { version: latestVersion.value })
         : t('updates.desktop.downloadedDesc', { version: latestVersion.value })
     }
     if (status.value === 'downloading') return t('updates.desktop.downloadingDesc')
@@ -103,18 +122,21 @@ export function useDesktopUpdatePresentation(
   })
 
   const iconName = computed<IconName>(() => {
+    if (retryError.value) return 'info'
     if (status.value === 'downloaded') return 'check'
-    if (status.value === 'downloading') return 'refresh'
+    if (status.value === 'downloading' || status.value === 'applying') return 'refresh'
     if (status.value === 'error') return 'info'
     return 'download'
   })
-  const severity = computed(() => desktopUpdateSeverity(status.value))
+  const severity = computed(() => retryError.value ? 'danger' : desktopUpdateSeverity(status.value))
 
   return {
     status,
     latestVersion,
     manualInstall,
+    canDownload,
     canInstall,
+    retryError,
     busy,
     summary,
     indicatorLabel: summary,
