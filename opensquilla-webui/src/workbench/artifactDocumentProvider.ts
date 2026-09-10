@@ -7,7 +7,6 @@ import type {
   ArtifactDocumentKind,
   ArtifactDocumentWorkspace,
   ArtifactEditCapabilities,
-  ArtifactEditSession,
   ArtifactRevision,
   ArtifactRevisionSource,
 } from '@/types/artifactDocuments'
@@ -489,29 +488,6 @@ export function normalizeArtifactChangeSet(value: unknown): ArtifactChangeSet | 
     createdAt: timestampAt(raw, 'createdAt', 'created_at'),
     updatedAt: timestampAt(raw, 'updatedAt', 'updated_at'),
     schemaVersion: Math.max(1, numberAt(raw, 1, 'schemaVersion', 'schema_version')),
-  }
-}
-
-export function normalizeArtifactEditSession(value: unknown): ArtifactEditSession | null {
-  const raw = objectValue(value)
-  if (!raw) return null
-  const editSessionId = stringAt(raw, 'id', 'editSessionId', 'edit_session_id').trim()
-  const documentId = stringAt(raw, 'documentId', 'document_id').trim()
-  if (!editSessionId || !documentId) return null
-  const mode = stringAt(raw, 'mode') === 'edit' ? 'edit' : 'view'
-  const statusValue = stringAt(raw, 'status')
-  const status = ['active', 'closed', 'expired', 'stale'].includes(statusValue)
-    ? statusValue as ArtifactEditSession['status']
-    : 'active'
-  return {
-    editSessionId,
-    documentId,
-    baseRevisionId: stringAt(raw, 'baseRevisionId', 'base_revision_id'),
-    lastSavedRevisionId: stringAt(raw, 'lastSavedRevisionId', 'last_saved_revision_id'),
-    mode,
-    status,
-    stateRevision: Math.max(1, numberAt(raw, 1, 'stateRevision', 'state_revision')),
-    expiresAt: timestampAt(raw, 'expiresAt', 'expires_at'),
   }
 }
 

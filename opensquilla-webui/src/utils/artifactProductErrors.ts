@@ -1,6 +1,6 @@
 export const ARTIFACT_PRODUCT_ERROR_CODES = [
   'DOCUMENT_CHANGED',
-  'EDIT_SESSION_RENEWAL_REQUIRED',
+  'DOCUMENT_EDITING_RETIRED',
   'WRITE_BUSY',
   'MUTATION_NOT_APPLIED',
   'MUTATION_OUTCOME_PENDING',
@@ -21,7 +21,6 @@ export type ArtifactProductRecoveryAction =
   | 'none'
   | 'retry-same-request'
   | 'retry-new-request'
-  | 'reacquire-edit-session'
   | 'refresh-document'
   | 'reopen-preview'
   | 'ask-user'
@@ -55,7 +54,7 @@ export class ArtifactProductFailure extends Error {
 
 const ARTIFACT_SCOPED_CURRENT_CODES = new Set<string>([
   'DOCUMENT_CHANGED',
-  'EDIT_SESSION_RENEWAL_REQUIRED',
+  'DOCUMENT_EDITING_RETIRED',
   'WRITE_BUSY',
   'MUTATION_NOT_APPLIED',
   'MUTATION_OUTCOME_PENDING',
@@ -77,10 +76,10 @@ const PRESENTATION: Readonly<Record<ArtifactProductErrorCode, {
     fallback: 'The page changed. Refresh it before trying again.',
     recovery: 'refresh-document',
   },
-  EDIT_SESSION_RENEWAL_REQUIRED: {
-    key: 'workbench.artifactErrors.editSessionRenewalRequired',
-    fallback: 'Editing is reconnecting. Your unsaved changes are still available.',
-    recovery: 'reacquire-edit-session',
+  DOCUMENT_EDITING_RETIRED: {
+    key: 'workbench.artifactErrors.documentEditingRetired',
+    fallback: 'Update the client and reopen the page to send annotations as chat input.',
+    recovery: 'ask-user',
   },
   WRITE_BUSY: {
     key: 'workbench.artifactErrors.writeBusy',

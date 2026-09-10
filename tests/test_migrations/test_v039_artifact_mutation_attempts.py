@@ -18,7 +18,7 @@ def _apply_through_v038(db_path: Path) -> None:
     backend = get_backend("sqlite:///" + str(db_path))
     try:
         migrations = read_migrations(str(MIGRATIONS_DIR)).filter(
-            lambda item: item.id != MIGRATION_ID
+            lambda item: item.id not in {MIGRATION_ID, "V041__retire_html_editor"}
         )
         with backend.lock():
             backend.apply_migrations(backend.to_apply(migrations))
@@ -67,14 +67,11 @@ def test_v039_upgrades_v038_profile_and_enforces_receipt_constraints(tmp_path: P
         _seed_document(conn, "2")
         conn.commit()
 
-    assert apply_pending(str(db_path), MIGRATIONS_DIR) == [MIGRATION_ID]
+    assert apply_pending(str(db_path), MIGRATIONS_DIR) == [MIGRATION_ID, "V041__retire_html_editor"]
 
     with sqlite3.connect(db_path) as conn:
         column_rows = tuple(conn.execute("PRAGMA table_info(artifact_mutation_attempts)"))
-        columns = {
-            str(row[1])
-            for row in column_rows
-        }
+        columns = {str(row[1]) for row in column_rows}
         assert columns == {
             "mutation_attempt_id",
             "document_id",
@@ -178,9 +175,7 @@ def test_v039_rolls_back_only_mutation_attempt_receipts(tmp_path: Path) -> None:
     with sqlite3.connect(db_path) as conn:
         tables = {
             str(row[0])
-            for row in conn.execute(
-                "SELECT name FROM sqlite_master WHERE type = 'table'"
-            )
+            for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
         }
     assert "artifact_mutation_attempts" not in tables
     assert "artifact_prompt_annotations" in tables

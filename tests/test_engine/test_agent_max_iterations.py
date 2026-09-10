@@ -468,7 +468,7 @@ async def test_agent_emits_artifact_event_independent_of_tool_result_text() -> N
 
 
 @pytest.mark.asyncio
-async def test_agent_synthesizes_final_artifact_response_without_provider_call() -> None:
+async def test_agent_preserves_artifact_when_followup_provider_call_fails() -> None:
     provider = _ArtifactThenProviderErrorProvider()
     agent = Agent(
         provider=provider,
@@ -479,19 +479,18 @@ async def test_agent_synthesizes_final_artifact_response_without_provider_call()
 
     events = [event async for event in agent.run_turn("publish a report")]
 
-    assert len(provider.calls) == 1
+    assert len(provider.calls) == 2
     assert any(isinstance(event, ArtifactEvent) for event in events)
-    assert not any(isinstance(event, ErrorEvent) for event in events)
-    assert not any(event.kind == "warning" for event in events)
-    assert any(
-        event.kind == "done"
-        and event.text == "The generated file is ready: report.txt."
+    assert any(isinstance(event, ErrorEvent) for event in events)
+    assert all(
+        event.text != "The generated file is ready: report.txt."
         for event in events
+        if event.kind == "done"
     )
 
 
 @pytest.mark.asyncio
-async def test_agent_synthesizes_final_artifact_response_before_extra_llm_call() -> None:
+async def test_agent_preserves_artifact_when_normal_call_budget_is_exhausted() -> None:
     provider = _ArtifactThenProviderErrorProvider()
     agent = Agent(
         provider=provider,
@@ -504,12 +503,14 @@ async def test_agent_synthesizes_final_artifact_response_before_extra_llm_call()
 
     assert len(provider.calls) == 1
     assert any(isinstance(event, ArtifactEvent) for event in events)
-    assert not any(isinstance(event, ErrorEvent) for event in events)
-    assert not any(event.kind == "warning" for event in events)
     assert any(
-        event.kind == "done"
-        and event.text == "The generated file is ready: report.txt."
+        isinstance(event, ErrorEvent) and event.code == "turn_llm_call_budget_exceeded"
         for event in events
+    )
+    assert all(
+        event.text != "The generated file is ready: report.txt."
+        for event in events
+        if event.kind == "done"
     )
 
 

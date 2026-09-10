@@ -1,4 +1,5 @@
 import type { ChatToolCallRenderItem, ToolResultContext } from '@/types/chat'
+import { isLegacyDocumentTool } from './legacyDocumentTool'
 
 export type ActivityToolDetailLine =
   | { kind: 'target' | 'code' | 'error'; text: string }
@@ -515,7 +516,7 @@ export function projectActivityToolTargets(
   call: ChatToolCallRenderItem,
   operationKey: string,
 ): ActivityToolTarget[] {
-  if (operationKey === 'document.read' || operationKey === 'document.update') return []
+  if (isLegacyDocumentTool(call.name) || isLegacyDocumentTool(operationKey)) return []
   const input = parseRecord(call.inputRaw || call.inputPreview)
   const targets: ActivityToolTarget[] = []
   const seen = new Set<string>()
@@ -569,10 +570,9 @@ export function projectActivityToolDetail(
   call: ChatToolCallRenderItem,
   operationKey: string,
 ): ActivityToolDetailProjection {
-  // Page editing tools carry source excerpts, revision hashes, cursors and
-  // one-time grants. Those belong in diagnostics, not in the ordinary chat
-  // activity disclosure.
-  if (operationKey === 'document.read' || operationKey === 'document.update') {
+  // Persisted results from retired tools can contain source and old grants.
+  // Keep their read-only projection safe after removing active tool routing.
+  if (isLegacyDocumentTool(call.name) || isLegacyDocumentTool(operationKey)) {
     const resultRecord = parseRecord(call.result || call.resultPreview)
     const nestedError = asRecord(resultRecord?.error)
     const category = recordString(resultRecord, ['category', 'error_category', 'errorCategory', 'code'])
@@ -644,7 +644,13 @@ export function projectActivityToolDetail(
     call.presentation?.argumentDisplay === 'primary'
     || NON_EXPANDABLE_READ_OPERATIONS.has(operationKey)
   ) {
-    return { lines: [], rawContent: '' }
+    const error = call.isError || call.status === 'error'
+      ? safeError(call.result || call.resultPreview)
+      : ''
+    return {
+      lines: error ? [{ kind: 'error', text: error }] : [],
+      rawContent: '',
+    }
   }
   const inputRecord = parseRecord(call.inputRaw || call.inputPreview)
   const resultRecord = parseRecord(call.result || call.resultPreview)

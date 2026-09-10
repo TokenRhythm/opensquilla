@@ -6,9 +6,6 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 
 from opensquilla.application.admission_failures import (
-    AdmissionAnnotationConflictError,
-    AdmissionAnnotationNotFoundError,
-    AdmissionAnnotationValidationError,
     AdmissionIngressConflictError,
     AdmissionMetaControlConflictError,
     AdmissionPendingInputConflictError,
@@ -17,11 +14,6 @@ from opensquilla.application.admission_failures import (
     AdmissionStaleEpochError,
     AdmissionStorageBusyError,
     AdmissionTaskCollectionUnavailableError,
-)
-from opensquilla.artifact_session import (
-    ArtifactConflictError,
-    ArtifactNotFoundError,
-    ArtifactValidationError,
 )
 from opensquilla.session.plans import PlanConflictError, PlanRunConflictError
 from opensquilla.session.storage import (
@@ -61,12 +53,6 @@ def admission_failure(error: Exception) -> Exception | None:
         return AdmissionTaskCollectionUnavailableError(str(error))
     if isinstance(error, (PlanConflictError, PlanRunConflictError)):
         return AdmissionPlanConflictError(str(error))
-    if isinstance(error, ArtifactConflictError):
-        return AdmissionAnnotationConflictError(str(error))
-    if isinstance(error, ArtifactNotFoundError):
-        return AdmissionAnnotationNotFoundError(str(error))
-    if isinstance(error, ArtifactValidationError):
-        return AdmissionAnnotationValidationError(str(error))
     return None
 
 

@@ -17,8 +17,6 @@ from typing import TYPE_CHECKING, Any, Literal, Protocol, TypedDict
 from opensquilla.application.admission_views import (
     ActivationTask,
     AdmissionAcceptance,
-    AdmissionAnnotation,
-    AdmissionAnnotationTarget,
     AdmissionCommit,
     AdmissionGuestCleanup,
     AdmissionMetaControl,
@@ -85,18 +83,12 @@ class AdmissionRouteEnvelope(Protocol):
     def metadata(self) -> dict[str, Any]: ...
 
 
-class AdmissionArtifactBinding(Protocol):
-    @property
-    def annotations(self) -> tuple[AdmissionAnnotation, ...]: ...
-
-    @property
-    def targets(self) -> tuple[AdmissionAnnotationTarget, ...]: ...
-
-    @property
-    def snapshots(self) -> tuple[dict[str, Any], ...]: ...
 
 
 class PreparedAdmissionRoute(Protocol):
+    @property
+    def page_context_text(self) -> str | None: ...
+
     @property
     def agent_id(self) -> str: ...
 
@@ -207,10 +199,6 @@ class AdmissionRuntime(Protocol):
     def collect_admission(self, session_key: str) -> AbstractAsyncContextManager[None]: ...
 
 
-class AdmissionAuthority(Protocol):
-    async def aclose(self) -> None: ...
-
-    def handoff(self) -> None: ...
 
 
 class DirectAdmissionRegistry(Protocol):
@@ -447,21 +435,11 @@ class AdmissionPrimitives(Protocol):
 
     def explicit_ingress_intent(self, session_key: str) -> AbstractAsyncContextManager[None]: ...
 
-    def authority_scope(self) -> AbstractAsyncContextManager[None]: ...
 
     def clear_compaction_marker(self, session_key: str) -> None: ...
 
     def normalize_input(self, command: AdmitTurn) -> NormalizedAdmissionInput: ...
 
-    def artifact_error(
-        self,
-        kind: str,
-        error: Exception | None = None,
-        *,
-        retryable: bool,
-        operation: str | None = None,
-        session_key: str | None = None,
-    ) -> Exception: ...
 
     def validate_initial_routing(self, mode: str) -> None: ...
 
@@ -472,7 +450,6 @@ class AdmissionPrimitives(Protocol):
         client_request_id: str,
         storage: AdmissionStorage,
         turn_context: dict[str, Any] | None = None,
-        accepted_prompt_annotation_ids: Sequence[str] = (),
     ) -> AdmitTurnResult: ...
 
     def collaboration_snapshot(
@@ -505,14 +482,6 @@ class AdmissionPrimitives(Protocol):
 
     async def publish_forked(self, session_key: str) -> None: ...
 
-    async def bind_artifact(
-        self,
-        command: AdmitTurn,
-        *,
-        key: str,
-        session_id: str,
-        session: SessionIdentity,
-    ) -> AdmissionArtifactBinding: ...
 
     async def should_auto_title(
         self, storage: AdmissionStorage, session: SessionIdentity, key: str, session_id: str
@@ -549,7 +518,6 @@ class AdmissionPrimitives(Protocol):
         key: str,
         session_id: str,
         atomic_intent_plan: PreparedAdmissionIntent | None,
-        binding: AdmissionArtifactBinding,
         workspace_guard: ProjectWorkspaceGuard | None,
     ) -> PreparedAdmissionRoute: ...
 
@@ -590,7 +558,7 @@ class AdmissionPrimitives(Protocol):
         media_root: str | Path | None,
         persist_enabled: bool,
         disk_budget_bytes: int | None,
-        prompt_annotations: tuple[dict[str, Any], ...] = (),
+        page_context: dict[str, Any] | None = None,
     ) -> tuple[str, Sequence[object]]: ...
 
     def fork_title_allocation(
@@ -644,7 +612,6 @@ class AdmissionPrimitives(Protocol):
         session_node: SessionIdentity | None = None,
     ) -> None: ...
 
-    async def release_untransferred_authorities(self) -> None: ...
 
     def schedule_auto_title(
         self,
@@ -660,7 +627,6 @@ class AdmissionPrimitives(Protocol):
         self, session_key: str, collaboration: AcceptedCollaboration
     ) -> None: ...
 
-    def turn_authority(self, route: AdmissionRouteEnvelope) -> AdmissionAuthority | None: ...
 
     async def publish_disposition(self, session_key: str, turn_context: dict[str, Any]) -> None: ...
 

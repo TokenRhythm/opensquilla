@@ -6,6 +6,8 @@ import asyncio
 import hashlib
 import json
 import os
+import secrets
+from dataclasses import replace
 from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any
@@ -22,6 +24,7 @@ from opensquilla.artifacts import (
     ArtifactBundleManifest,
     ArtifactIntegrityError,
     ArtifactPathError,
+    ArtifactSource,
     ArtifactStore,
     artifact_bundle_manifest,
     artifact_mime_for_name,
@@ -29,6 +32,7 @@ from opensquilla.artifacts import (
     artifact_publish_max_bytes_for_name,
     collect_artifact_bundle,
 )
+from opensquilla.html_format import is_html
 from opensquilla.sandbox.operation_runtime import SandboxToolDescriptor
 from opensquilla.session.plans import (
     PLAN_STEP_TERMINAL_STATUSES,
@@ -149,11 +153,7 @@ def _publish_note(ctx: ToolContext, *, already_published: bool = False) -> str:
             "tools and give one concise final summary."
         )
     else:
-        final_response = (
-            "Do not run more tools for this deliverable unless the user explicitly "
-            "asked for another file or a specific verification step. Send the final "
-            "response now."
-        )
+        final_response = "An unchanged file does not need to be published again."
     if _should_expose_local_path(ctx):
         prefix = (
             "This file is already registered for the current surface in this turn. "
@@ -174,7 +174,6 @@ def _publish_note(ctx: ToolContext, *, already_published: bool = False) -> str:
             )
         return (
             "This file is already registered for the current surface in this turn. "
-            "Do not call publish_artifact again for the same file; just confirm it is ready. "
             + final_response
         )
     return (
@@ -353,6 +352,19 @@ async def _require_plan_run_ready_for_publish(ctx: ToolContext) -> Any | None:
     )
 
 
+def _record_publication_source(
+    ctx: ToolContext, payload: dict[str, Any], source: ArtifactSource, *, source_is_html: bool,
+) -> None:
+    publication_id = secrets.token_hex(24)
+    ctx.artifact_source_paths[publication_id] = replace(source, artifact_id=payload["id"])
+    if (
+        not source_is_html
+        and any(item.get("id") == payload["id"] for item in ctx.published_artifacts)
+    ):
+        return
+    ctx.published_artifacts.append({**payload, "publication_id": publication_id})
+
+
 @tool(
     name="publish_artifact",
     description=(
@@ -518,6 +530,11 @@ async def publish_artifact(
         if bundle_snapshot is not None
         else None
     )
+    source = ArtifactSource(
+        path=str(target),
+        bundle_mode=bundle,
+        bundle_root=str(bundle_root_candidate.resolve()) if bundle_root_candidate else None,
+    )
     if bundle_manifest is not None:
         target_sha256 = next(
             item.sha256
@@ -536,11 +553,24 @@ async def publish_artifact(
                 "current final step."
             )
     store = ArtifactStore(ctx.artifact_media_root)
+    with target.open("rb") as stream:
+        source_is_html = is_html(artifact_name, artifact_mime, stream.read(4096))
+    source_artifact_ids: set[str] | None = None
+    if source_is_html:
+        source_artifact_ids = {
+            item.artifact_id for item in ctx.artifact_source_paths.values()
+            if item.path == source.path
+        }
+        lookup = getattr(ctx.generated_artifact_adopter, "artifact_ids_for_source", None)
+        if callable(lookup):
+            source_artifact_ids.update(await lookup(source))
     for published in reversed(ctx.published_artifacts):
         if published.get("sha256") != target_sha256:
             continue
         artifact_id = published.get("id")
         if not isinstance(artifact_id, str):
+            continue
+        if source_artifact_ids is not None and artifact_id not in source_artifact_ids:
             continue
         try:
             published_manifest = store.describe_preview_bundle(
@@ -557,6 +587,9 @@ async def publish_artifact(
             or published_manifest.bundle_digest != bundle_manifest.bundle_digest
         ):
             continue
+        _record_publication_source(
+            ctx, artifact_payload(published), source, source_is_html=source_is_html,
+        )
         llm_artifact = _llm_artifact_payload(
             published,
             ctx=ctx,
@@ -582,11 +615,30 @@ async def publish_artifact(
             bundle_manifest.bundle_digest if bundle_manifest is not None else None
         ),
         require_single_file=bundle_manifest is None,
-    )
+    ) if source_artifact_ids is None else None
+    if source_artifact_ids is not None:
+        for source_artifact_id in sorted(source_artifact_ids):
+            try:
+                candidate = store.get_ref(
+                    session_id=ctx.artifact_session_id, artifact_id=source_artifact_id,
+                )
+                candidate_manifest = store.describe_preview_bundle(
+                    source_artifact_id, session_id=ctx.artifact_session_id,
+                )
+            except (ArtifactIntegrityError, ArtifactPathError, ValueError):
+                continue
+            if (
+                candidate.session_key == ctx.session_key
+                and (candidate.sha256, candidate.name, candidate.mime)
+                == (target_sha256, artifact_name, artifact_mime)
+                and (candidate_manifest.bundle_digest if candidate_manifest else None)
+                == (bundle_manifest.bundle_digest if bundle_manifest else None)
+            ):
+                existing = candidate
+                break
     if existing is not None:
         payload = artifact_payload(existing)
-        if not any(item.get("id") == payload.get("id") for item in ctx.published_artifacts):
-            ctx.published_artifacts.append(payload)
+        _record_publication_source(ctx, payload, source, source_is_html=source_is_html)
         llm_artifact = _llm_artifact_payload(
             payload,
             ctx=ctx,
@@ -649,7 +701,7 @@ async def publish_artifact(
         raise ToolError(f"artifact storage path is unavailable: {exc}") from exc
 
     payload = artifact_payload(ref)
-    ctx.published_artifacts.append(payload)
+    _record_publication_source(ctx, payload, source, source_is_html=source_is_html)
     llm_artifact = _llm_artifact_payload(
         payload,
         ctx=ctx,

@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import type { ChatToolCallRenderItem } from '@/types/chat'
+import { toolSecondaryText } from './toolDisplay'
 import {
   activityDisplayPath,
   hasActivityToolDetail,
@@ -112,6 +113,35 @@ describe('activity tool detail projection', () => {
       rawContent: '',
     })
     expect(hasActivityToolDetail(toolCall, 'web.search')).toBe(false)
+  })
+
+  it.each([
+    'document_inspect', 'document_read', 'document_locate', 'document_apply',
+    'document_patch', 'document_browser_inspect', 'document_browser_act',
+    'document_browser_screenshot', 'document_browser_reload', 'document_finish',
+    'legacy.document_patch', 'legacy/document_patch', 'legacy:document_patch',
+    'mcp__legacy__document_patch',
+  ])('protects persisted %s content after active operation routing is removed', (name) => {
+    const raw = JSON.stringify({ source: '<html>private source</html>', selector: '#private' })
+    const entry = call({ name, inputRaw: raw, inputPreview: raw, result: raw })
+    expect(projectActivityToolDetail(entry, 'tool.unknown')).toEqual({ lines: [], rawContent: '' })
+    expect(projectActivityToolTargets({
+      ...entry, inputRaw: JSON.stringify({ path: '/private/legacy.html' }),
+      presentation: { category: 'file_read', primaryArguments: ['path'], argumentDisplay: 'primary', lifecycleDisplay: 'boundary' },
+    }, 'file.inspect')).toEqual([])
+    expect(toolSecondaryText(entry)).toBe('')
+    const failure = projectActivityToolDetail({ ...entry, isError: true }, 'tool.unknown')
+    expect(failure.rawContent).toBe('')
+    expect(failure.lines.some(line => line.kind === 'document-category')).toBe(true)
+    expect(JSON.stringify(failure)).not.toMatch(/private|selector|<html>/)
+  })
+
+  it('keeps ordinary file and browser tool results available', () => {
+    for (const name of ['read_file', 'edit_file', 'browser', 'document_patch_preview']) {
+      const entry = call({ name, result: 'ordinary result', resultPreview: 'ordinary result' })
+      expect(projectActivityToolDetail(entry, 'tool.unknown').rawContent).toContain('ordinary result')
+      expect(toolSecondaryText({ ...entry, inputPreview: '' })).toBe('ordinary result')
+    }
   })
 
   it.each(['document.read', 'document.update'])(
@@ -447,7 +477,7 @@ describe('activity tool detail projection', () => {
     ])
   })
 
-  it('does not reopen hidden read details for an error result', () => {
+  it('shows a safe read failure without reopening hidden raw details', () => {
     const projection = projectActivityToolDetail(call({
       status: 'error',
       isError: true,
@@ -455,7 +485,27 @@ describe('activity tool detail projection', () => {
       resultPreview: 'Unable to open /Users/example/private/project/file.txt: permission denied',
     }), 'file.inspect')
 
-    expect(projection).toEqual({ lines: [], rawContent: '' })
+    expect(projection).toEqual({
+      lines: [{ kind: 'error', text: 'Unable to open …/file.txt: permission denied' }],
+      rawContent: '',
+    })
+    expect(JSON.stringify(projection)).not.toContain('/Users/example/private/project')
+  })
+
+  it('keeps a failed search explanation without provider diagnostics or raw details', () => {
+    const projection = projectActivityToolDetail(call({
+      name: 'web_search', status: 'error', isError: true,
+      inputRaw: JSON.stringify({ query: 'private search input' }),
+      result: JSON.stringify({
+        user_message: 'Network unavailable; token=private-token',
+        diagnostics: { response: 'private provider response' },
+      }),
+    }), 'web.search')
+    expect(projection).toEqual({
+      lines: [{ kind: 'error', text: 'Network unavailable; token=[redacted]' }],
+      rawContent: '',
+    })
+    expect(JSON.stringify(projection)).not.toContain('private')
   })
 
   it('prefers a safe structured user message while retaining redacted error details', () => {

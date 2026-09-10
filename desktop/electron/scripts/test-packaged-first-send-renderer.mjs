@@ -20,6 +20,7 @@ import {
   captureFirstSendDiagnostic,
   cleanupPackagedFirstSend,
   electronProcessSnapshot,
+  expectedShutdownCancellationIndices,
 } from './packaged-first-send-cleanup.mjs'
 import { DESKTOP_GATEWAY_STARTUP_TIMEOUT_MS } from '../dist/gateway-lifecycle.js'
 
@@ -182,6 +183,7 @@ async function readDesktopLogSummary(userDataDir) {
     if (error?.code !== 'ENOENT') throw error
   }
   const eventCounts = {}
+  const records = []
   const rendererErrors = []
   const quitSteps = []
   let malformedRecords = 0
@@ -193,6 +195,7 @@ async function readDesktopLogSummary(userDataDir) {
     if (FORBIDDEN_RENDERER_ERROR.test(line)) forbiddenErrorCount += 1
     try {
       const record = JSON.parse(line)
+      records.push(record)
       const event = typeof record?.event === 'string' ? record.event : 'unknown'
       eventCounts[event] = (eventCounts[event] || 0) + 1
       if (event === 'quit_commit_step' && quitSteps.length < 10) {
@@ -215,8 +218,11 @@ async function readDesktopLogSummary(userDataDir) {
       }
     } catch {
       malformedRecords += 1
+      records.push(null)
     }
   }
+  const expectedShutdownCancellationCount = expectedShutdownCancellationIndices(records).size
+  unexpectedRendererErrorCount -= expectedShutdownCancellationCount
   return {
     bytes: Buffer.byteLength(source, 'utf8'),
     eventCounts,
@@ -225,6 +231,7 @@ async function readDesktopLogSummary(userDataDir) {
     forbiddenErrorCount,
     playwrightSandboxErrorCount,
     unexpectedRendererErrorCount,
+    expectedShutdownCancellationCount,
     malformedRecords,
   }
 }

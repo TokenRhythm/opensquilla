@@ -390,3 +390,26 @@ function formatMiB(bytes: number): string {
   const mib = bytes / 1024 / 1024
   return `${Number.isInteger(mib) ? mib : Math.floor(mib * 10) / 10} MiB`
 }
+
+
+let nextCapturedAttachmentId = -Date.now()
+
+/** Stage an existing UI capture using the same file upload contract as ordinary attachments. */
+export async function stageCapturedImage(file: File, artifactContent: Pick<ArtifactContentAccess, 'uploadAttachment'>): Promise<Attachment> {
+  const mime = resolveAttachmentMime(file)
+  if (!isImageAttachmentMime(mime) || file.size > ATTACHMENT_IMAGE_HARD_CAP_BYTES) {
+    throw new Error('Captured image exceeds the attachment limit.')
+  }
+  const meta = await artifactContent.uploadAttachment(file, mime)
+  return {
+    kind: 'staged',
+    local_id: nextCapturedAttachmentId--,
+    name: file.name,
+    mime,
+    size: file.size,
+    file_uuid: meta.fileUuid,
+    expires_at: meta.expiresAt,
+    ttl_seconds: meta.ttlSeconds,
+    file,
+  }
+}

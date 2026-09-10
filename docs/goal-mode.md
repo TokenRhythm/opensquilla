@@ -217,10 +217,10 @@ from the old session generation from controlling a new or copied conversation.
 
 ## Artifact delivery
 
-Successful `publish_artifact` delivery remains terminal for ordinary turns. In
-a Goal-owned turn, however, delivery is an ordinary tool result: the artifact
-is immediately available while the agent continues through the normal tool
-loop with the same route, safety policy, approvals, and provider fallback.
+Successful `publish_artifact` delivery is an ordinary tool result in both
+ordinary and Goal-owned turns. The artifact is immediately available, and the
+agent decides whether more work or a final response is needed through the normal
+tool loop with the same route, safety policy, approvals, and provider fallback.
 The agent may update structured progress and calls `update_goal` only when the
 whole objective is complete or truly blocked. Structured progress remains
 optional; an artifact or a completed-looking checklist alone never implies Goal

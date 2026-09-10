@@ -1,19 +1,12 @@
-"""Artifact IDE RPC surface layered beside the immutable artifact API.
+"""Document resources, version history, restoration, and read-only source.
 
-Existing ``artifacts.list/get`` payloads stay untouched.  These handlers adopt
-one immutable ArtifactRef into a stable logical document, then expose revision,
-change-set, comment, context, and HTML-source operations using ArtifactSession's
-CAS guarantees.
+Legacy editor writes return a stable upgrade error at the wire boundary.
 """
 
 from __future__ import annotations
 
 import asyncio
 import hashlib
-import json
-import re
-import secrets
-from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
@@ -25,25 +18,16 @@ from opensquilla.application.artifact_workbench import (
     DocumentIdentity,
     DocumentOpen,
     DocumentRename,
-    EditSessionMutation,
-    EditSessionStart,
-    PromptAnnotationCreate,
-    PromptAnnotationIdentity,
-    PromptAnnotationMutation,
     PromptAnnotationQuery,
     RevisionListQuery,
     RevisionRestore,
     SessionDocumentsQuery,
-    SourceEdit,
-    SourcePatch,
     SourceRead,
 )
 from opensquilla.artifact_session import (
     Actor,
     ActorKind,
     Anchor,
-    AnchorKind,
-    AnchorState,
     ArtifactBlobRef,
     ArtifactConflictError,
     ArtifactKind,
@@ -52,33 +36,18 @@ from opensquilla.artifact_session import (
     ChangeSetStatus,
     CommitResult,
     Document,
-    EditSession,
-    MutationAttempt,
     PromptAnnotation,
     PromptAnnotationStatus,
     Revision,
     RevisionSource,
-    WriterLease,
 )
 from opensquilla.artifact_session import (
     ArtifactNotFoundError as ArtifactSessionNotFoundError,
 )
-from opensquilla.artifact_session.html_anchors import (
-    ElementProofV2,
-    HtmlAnchorChangedError,
-    canonical_selection_proof_v2,
-    remap_html_anchor,
-    target_projection,
-)
-from opensquilla.artifact_session.html_anchors import (
-    canonical_opening_anchor as shared_canonical_opening_anchor,
-)
-from opensquilla.artifact_session.html_anchors import (
-    parse_element_path as shared_parse_element_path,
-)
+from opensquilla.artifact_session.models import head_restore_receipt_state_revision
+from opensquilla.artifact_session.working_files import get_working_files, restore_working_revision
 from opensquilla.artifacts import (
     DEFAULT_ARTIFACT_MAX_BYTES,
-    ArtifactError,
     ArtifactIntegrityError,
     ArtifactNotFoundError,
     ArtifactRef,
@@ -95,10 +64,6 @@ from opensquilla.gateway.artifact_product_errors import (
     artifact_product_error,
     logged_artifact_product_error,
 )
-from opensquilla.gateway.desktop_artifact_bridge import (
-    DesktopArtifactBridgeError,
-    get_desktop_artifact_bridge_client,
-)
 from opensquilla.gateway.event_bridge import EventBridge
 from opensquilla.gateway.guest_rpc_policy import is_guest_rpc_method_allowed
 from opensquilla.gateway.rpc import (
@@ -113,71 +78,16 @@ from opensquilla.gateway.session_services import (
     session_id_for_key,
 )
 from opensquilla.gateway.websocket import get_registry
+from opensquilla.html_format import is_html
 from opensquilla.paths import media_root_from_config
 from opensquilla.session.keys import canonicalize_session_key
-from opensquilla.tools.builtin.document_format_adapters import (
-    DocumentAdapterError,
-    get_document_format_adapter,
-    probe_document_format_adapter,
-    validate_editable_html_source,
-)
 
 _d = get_dispatcher()
 
 _DOCX_MIME = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
 _XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 _PPTX_MIME = "application/vnd.openxmlformats-officedocument.presentationml.presentation"
-_HTML_MIMES = frozenset({"text/html", "application/xhtml+xml"})
-_HTML_SUFFIXES = frozenset({".html", ".htm", ".xhtml"})
-_MAX_SOURCE_PATCHES = 100
-_MAX_PROMPT_ANNOTATION_BYTES = 16_384
-_EDIT_SESSION_TTL_MS = 60_000
-_HTML_TAG_NAME_RE = re.compile(r"^[a-zA-Z][a-zA-Z0-9:-]{0,127}$")
-_OPAQUE_ANNOTATION_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
-_SHA256_RE = re.compile(r"^[a-f0-9]{64}$")
 _SOURCE_OFFSET_ENCODING = "unicode-code-point"
-
-
-def _parse_element_path(value: str) -> tuple[tuple[str, str, int], ...]:
-    return shared_parse_element_path(value)
-
-
-def _canonical_opening_anchor(
-    source: str,
-    *,
-    element_path: str,
-    expected_element_proof_sha256: str,
-    expected_tag_name: str,
-    expected_element_proof_v2: ElementProofV2 | None = None,
-) -> tuple[dict[str, Any], str, dict[str, Any]]:
-    try:
-        return shared_canonical_opening_anchor(
-            source,
-            element_path=element_path,
-            expected_element_proof_sha256=expected_element_proof_sha256,
-            expected_tag_name=expected_tag_name,
-            expected_element_proof_v2=expected_element_proof_v2,
-        )
-    except HtmlAnchorChangedError as exc:
-        raise logged_artifact_product_error(
-            ArtifactProductErrorCode.DOCUMENT_CHANGED,
-            exc,
-            operation="prompt_annotations.verify_source_selection",
-            retryable=False,
-            reason_code="selection_proof_changed",
-            verification_stage="source-anchor",
-            proof_mode="v2" if expected_element_proof_v2 is not None else "v1",
-        ) from exc
-
-
-def _validate_source_offset_encoding(value: str | None) -> str:
-    # Omission remains compatible with the first ArtifactSession clients,
-    # whose offsets were already Python/Unicode-code-point indexes.
-    if value is None:
-        return _SOURCE_OFFSET_ENCODING
-    if value != _SOURCE_OFFSET_ENCODING:
-        raise ValueError(f"offsetEncoding must be {_SOURCE_OFFSET_ENCODING}")
-    return _SOURCE_OFFSET_ENCODING
 
 
 def _actor(ctx: RpcContext) -> Actor:
@@ -225,13 +135,6 @@ async def _session_epoch(ctx: RpcContext, session_key: str) -> int:
             reason_code="service_unavailable",
         )
     return int(await storage.get_epoch(session_key))
-
-
-def _prompt_annotation_body(value: str | None) -> str:
-    value = "" if value is None else value
-    if not isinstance(value, str) or len(value.encode("utf-8")) > _MAX_PROMPT_ANNOTATION_BYTES:
-        raise ValueError("annotation body must be no larger than 16 KiB")
-    return value
 
 
 def _not_found(kind: str, identifier: str) -> RpcHandlerError:
@@ -287,42 +190,16 @@ async def _scoped_revision(
     return revision
 
 
-async def _scoped_edit_session(
-    service: ArtifactSessionService,
-    *,
-    edit_session_id: str,
-    session_key: str,
-    session_id: str,
-    actor: Actor,
-) -> tuple[EditSession, Document]:
-    try:
-        edit_session = await service.get_edit_session(edit_session_id)
-    except ArtifactSessionNotFoundError:
-        raise _not_found("EditSession", edit_session_id) from None
-    document = await _scoped_document(
-        service,
-        document_id=edit_session.document_id,
-        session_key=session_key,
-        session_id=session_id,
-    )
-    if edit_session.user_id != actor.actor_id:
-        raise _not_found("EditSession", edit_session_id)
-    return edit_session, document
-
-
 def _format_for(name: str, media_type: str, kind: ArtifactKind | None = None) -> str:
     suffix = Path(name).suffix.lower()
     mime = media_type.split(";", 1)[0].strip().lower()
-    adapter = probe_document_format_adapter(name=name, media_type=mime)
-    if adapter is not None:
-        return adapter.format_id
     if suffix == ".docx" or mime == _DOCX_MIME:
         return "docx"
     if suffix == ".xlsx" or mime == _XLSX_MIME:
         return "xlsx"
     if suffix == ".pptx" or mime == _PPTX_MIME:
         return "pptx"
-    if suffix in _HTML_SUFFIXES or mime in _HTML_MIMES or kind is ArtifactKind.HTML:
+    if is_html(name, mime) or kind is ArtifactKind.HTML:
         return "html"
     return "other"
 
@@ -342,122 +219,37 @@ def _kind_for(ref: ArtifactRef) -> ArtifactKind:
 
 
 def _capabilities(artifact_format: str) -> dict[str, Any]:
-    # Every value here describes a Document. Immutable attachments and
-    # deliverables advertise publish=false in the Workbench resource RPC.
-    common = {
+    html = artifact_format == "html"
+    capabilities: dict[str, Any] = {
         "download": True,
         "versionHistory": True,
-        "publish": True,
-        "promptAnnotations": False,
-    }
-    if artifact_format == "html":
-        adapter = get_document_format_adapter(artifact_format)
-        adapter_capabilities = adapter.capabilities()
-        selection_context = (
-            adapter_capabilities.get("selectionContext") is True
-            or adapter_capabilities.get("selection") is True
-        ) and adapter_capabilities.get("promptAnnotations") is True
-        return {
-            **common,
-            "preview": adapter_capabilities["preview"],
-            "selectionContext": selection_context,
-            "manualEdit": adapter_capabilities["manualEdit"],
-            "agentEdit": adapter_capabilities["agentEdit"],
-            "sourceEdit": adapter_capabilities["sourceEdit"],
-            # Enabled only after the Desktop bridge is attached to Gateway.
-            "browserUse": False,
-            "selection": adapter_capabilities["selection"],
-            "promptAnnotations": adapter_capabilities["promptAnnotations"],
-            "engine": "html-source",
-            "adapterId": adapter.format_id,
-            "adapterVersion": adapter.adapter_version,
-            "semanticOperations": adapter_capabilities["semanticOperations"],
-        }
-    if artifact_format in {"docx", "xlsx", "pptx"}:
-        return {
-            **common,
-            "publish": False,
-            "preview": False,
-            "manualEdit": False,
-            "agentEdit": False,
-            "sourceEdit": False,
-            "browserUse": False,
-            "selectionContext": False,
-            "selection": False,
-            "engine": None,
-            "unavailableReason": "office_adapter_not_available",
-        }
-    return {
-        **common,
-        "preview": False,
+        "publish": html,
+        "preview": html,
+        "source": html,
         "manualEdit": False,
         "agentEdit": False,
         "sourceEdit": False,
         "browserUse": False,
         "selectionContext": False,
         "selection": False,
-        "engine": None,
-        "unavailableReason": "unsupported_format",
-    }
-
-
-def _html_bundle_capabilities() -> dict[str, Any]:
-    """Advertise only the bundle behavior implemented by the current workbench."""
-
-    return {
-        "download": True,
-        "versionHistory": True,
-        "publish": True,
         "promptAnnotations": False,
-        "preview": True,
-        "selectionContext": False,
-        "manualEdit": False,
-        "agentEdit": False,
-        "sourceEdit": False,
-        "browserUse": False,
-        "selection": False,
         "engine": None,
-        "unavailableReason": "html_bundle_edit_not_supported",
     }
+    if not html:
+        capabilities["unavailableReason"] = (
+            "office_adapter_not_available"
+            if artifact_format in {"docx", "xlsx", "pptx"}
+            else "unsupported_format"
+        )
+    return capabilities
 
 
 def _html_integrity_failure_capabilities() -> dict[str, Any]:
-    """Fail closed when the immutable HTML material cannot be classified safely."""
-
     return {
-        "download": True,
-        "versionHistory": True,
-        "publish": True,
-        "promptAnnotations": False,
+        **_capabilities("html"),
         "preview": False,
-        "selectionContext": False,
-        "manualEdit": False,
-        "agentEdit": False,
-        "sourceEdit": False,
-        "browserUse": False,
-        "selection": False,
-        "engine": None,
+        "source": False,
         "unavailableReason": "artifact_integrity_error",
-    }
-
-
-def _html_source_unavailable_capabilities(reason: str) -> dict[str, Any]:
-    """Keep preview/download available while disabling canonical-source mutations."""
-
-    return {
-        "download": True,
-        "versionHistory": True,
-        "publish": True,
-        "promptAnnotations": False,
-        "preview": True,
-        "selectionContext": False,
-        "manualEdit": False,
-        "agentEdit": False,
-        "sourceEdit": False,
-        "browserUse": False,
-        "selection": False,
-        "engine": None,
-        "unavailableReason": reason,
     }
 
 
@@ -472,52 +264,20 @@ async def _revision_capabilities(
         return capabilities
     if document.session_id is None:
         return _html_integrity_failure_capabilities()
-
     store = ArtifactStore(media_root_from_config(ctx.config))
     try:
-        supports_editing = await asyncio.to_thread(
-            store.supports_single_file_editing,
+        await asyncio.to_thread(
+            store.validate_preview_bundle,
+            revision.artifact_id,
+            session_id=document.session_id,
+        )
+        await asyncio.to_thread(
+            store.resolve_preview_resource,
             revision.artifact_id,
             session_id=document.session_id,
         )
     except (ArtifactNotFoundError, ArtifactIntegrityError, OSError, ValueError):
         return _html_integrity_failure_capabilities()
-    if not supports_editing:
-        return _html_bundle_capabilities()
-    try:
-        ref, path = await asyncio.to_thread(
-            store.resolve_for_download,
-            revision.artifact_id,
-            session_id=document.session_id,
-        )
-        source = await asyncio.to_thread(_html_source, ref, path)
-        validate_editable_html_source(source)
-    except RpcHandlerError as exc:
-        details = exc.details if isinstance(exc.details, dict) else {}
-        reason = (
-            "html_source_encoding_unsupported"
-            if exc.code == "ARTIFACT_SOURCE_ENCODING"
-            or details.get("reasonCode") == "encoding_unsupported"
-            else "html_source_unavailable"
-        )
-        return _html_source_unavailable_capabilities(reason)
-    except (
-        ArtifactNotFoundError,
-        ArtifactIntegrityError,
-        DocumentAdapterError,
-        OSError,
-        ValueError,
-    ):
-        return _html_integrity_failure_capabilities()
-    if get_desktop_artifact_bridge_client() is None:
-        # Preview annotations rely on a trusted Electron-owned CDP selection.
-        # The ordinary Web UI keeps source editing, but must not expose a
-        # button that can only fail after the user has entered an instruction.
-        return {
-            **capabilities,
-            "selectionContext": False,
-            "promptAnnotations": False,
-        }
     return capabilities
 
 
@@ -611,32 +371,16 @@ def _change_set_payload(change_set: ChangeSet) -> dict[str, Any]:
     }
 
 
-def _edit_session_payload(edit_session: EditSession) -> dict[str, Any]:
-    """Return editor state without exposing lease ids or fencing tokens."""
-
-    return {
-        "id": edit_session.edit_session_id,
-        "documentId": edit_session.document_id,
-        "baseRevisionId": edit_session.base_revision_id,
-        "lastSavedRevisionId": edit_session.last_saved_revision_id,
-        "mode": edit_session.mode.value,
-        "status": edit_session.status.value,
-        "stateRevision": edit_session.state_revision,
-        "expiresAt": edit_session.expires_at,
-        "lastAccessAt": edit_session.last_access_at,
-        "createdAt": edit_session.created_at,
-        "updatedAt": edit_session.updated_at,
-        "schemaVersion": edit_session.schema_version,
-    }
-
-
 def _prompt_annotation_payload(
     annotation: PromptAnnotation,
     *,
     anchor: Anchor,
     current_head_revision_id: str,
 ) -> dict[str, Any]:
-    target_status, target_reason, target_kind, target_text = target_projection(anchor)
+    target_status = "contextual"
+    target_reason = "no_match"
+    target_kind = str(anchor.locator.get("tag_name") or "element")
+    target_text = anchor.quote
     return {
         "id": annotation.annotation_id,
         "documentId": annotation.document_id,
@@ -815,23 +559,9 @@ async def _commit_revision_copy_mutation(
         replay_result, replay_change = replay
         return replay_result, replay_change, True
 
-    lease: WriterLease | None = None
     result: CommitResult | None = None
     committed_change: ChangeSet | None = None
     try:
-        holder_digest = hashlib.sha256(turn_id.encode("utf-8")).hexdigest()[:24]
-        lease = await service.acquire_writer_lease(
-            document_id=document.document_id,
-            holder_id=f"artifact-user:{actor.actor_id[:128]}:{holder_digest}",
-            ttl_ms=60_000,
-            actor=actor,
-        )
-        locked_document = await service.get_document(document.document_id)
-        if (
-            locked_document.head_revision_id != expected_head_revision_id
-            or locked_document.state_revision != expected_state_revision
-        ):
-            raise ArtifactConflictError("document changed before the revision-copy lease")
         result, committed_change = await service.commit_change_set_atomically(
             document_id=document.document_id,
             base_revision_id=expected_head_revision_id,
@@ -849,8 +579,6 @@ async def _commit_revision_copy_mutation(
             source=source,
             copied_from_revision_id=target_revision.revision_id,
             revision_event_type=revision_event_type,
-            lease=lease,
-            require_lease=True,
         )
     except BaseException as exc:
         try:
@@ -873,12 +601,6 @@ async def _commit_revision_copy_mutation(
             raise
         if not isinstance(exc, Exception):
             raise
-    finally:
-        if lease is not None:
-            try:
-                await service.release_writer_lease(lease=lease, actor=actor)
-            except Exception:  # noqa: BLE001 - the bounded lease expires if release fails
-                pass
     assert result is not None and committed_change is not None
     return result, committed_change, False
 
@@ -1040,126 +762,6 @@ async def _document_close(
     }
 
 
-def _new_edit_session_id(
-    *,
-    session_id: str,
-    actor: Actor,
-    client_request_id: str | None,
-) -> str:
-    if client_request_id is None:
-        return f"edit_{secrets.token_urlsafe(24)}"
-    if len(client_request_id) > 256:
-        raise ValueError("params.clientRequestId is too long")
-    digest = hashlib.sha256(
-        "\0".join(
-            (
-                "documents.editSessions.start.v1",
-                session_id,
-                actor.kind.value,
-                actor.actor_id,
-                client_request_id,
-            )
-        ).encode("utf-8")
-    ).hexdigest()
-    return f"edit_{digest}"
-
-
-async def _edit_session_start(
-    command: EditSessionStart,
-    ctx: RpcContext,
-) -> dict[str, Any]:
-    session_key, session_id, service = await _scope(command.session_key, ctx)
-    document_id = command.document_id
-    await _scoped_document(
-        service,
-        document_id=document_id,
-        session_key=session_key,
-        session_id=session_id,
-    )
-    actor = _actor(ctx)
-    edit_session_id = _new_edit_session_id(
-        session_id=session_id,
-        actor=actor,
-        client_request_id=command.client_request_id,
-    )
-    try:
-        edit_session = await service.start_edit_session(
-            document_id=document_id,
-            user_id=actor.actor_id,
-            ttl_ms=_EDIT_SESSION_TTL_MS,
-            actor=actor,
-            edit_session_id=edit_session_id,
-        )
-    except ArtifactConflictError as exc:
-        raise _conflict(
-            exc,
-            code=ArtifactProductErrorCode.WRITE_BUSY,
-            operation="edit_session.start",
-        ) from exc
-    return {"editSession": _edit_session_payload(edit_session)}
-
-
-async def _edit_session_heartbeat(
-    command: EditSessionMutation,
-    ctx: RpcContext,
-) -> dict[str, Any]:
-    session_key, session_id, service = await _scope(command.session_key, ctx)
-    edit_session_id = command.edit_session_id
-    actor = _actor(ctx)
-    await _scoped_edit_session(
-        service,
-        edit_session_id=edit_session_id,
-        session_key=session_key,
-        session_id=session_id,
-        actor=actor,
-    )
-    try:
-        edit_session = await service.heartbeat_edit_session(
-            edit_session_id=edit_session_id,
-            user_id=actor.actor_id,
-            expected_state_revision=command.expected_state_revision,
-            ttl_ms=_EDIT_SESSION_TTL_MS,
-            actor=actor,
-        )
-    except ArtifactConflictError as exc:
-        raise _conflict(
-            exc,
-            code=ArtifactProductErrorCode.EDIT_SESSION_RENEWAL_REQUIRED,
-            operation="edit_session.heartbeat",
-        ) from exc
-    return {"editSession": _edit_session_payload(edit_session)}
-
-
-async def _edit_session_close(
-    command: EditSessionMutation,
-    ctx: RpcContext,
-) -> dict[str, Any]:
-    session_key, session_id, service = await _scope(command.session_key, ctx)
-    edit_session_id = command.edit_session_id
-    actor = _actor(ctx)
-    await _scoped_edit_session(
-        service,
-        edit_session_id=edit_session_id,
-        session_key=session_key,
-        session_id=session_id,
-        actor=actor,
-    )
-    try:
-        edit_session = await service.close_edit_session(
-            edit_session_id=edit_session_id,
-            user_id=actor.actor_id,
-            expected_state_revision=command.expected_state_revision,
-            actor=actor,
-        )
-    except ArtifactConflictError as exc:
-        raise _conflict(
-            exc,
-            code=ArtifactProductErrorCode.EDIT_SESSION_RENEWAL_REQUIRED,
-            operation="edit_session.close",
-        ) from exc
-    return {"editSession": _edit_session_payload(edit_session)}
-
-
 async def _revisions_list(
     query: RevisionListQuery,
     ctx: RpcContext,
@@ -1175,6 +777,8 @@ async def _revisions_list(
         document.document_id,
         limit=query.limit,
     )
+    if all(item.revision_id != document.head_revision_id for item in revisions):
+        revisions = (*revisions, await service.get_revision(document.head_revision_id))
     return {"revisions": [_revision_payload(item) for item in revisions]}
 
 
@@ -1200,27 +804,17 @@ async def _revision_restore(
     expected_state_revision = command.expected_state_revision
     request_id = command.request_id
     turn_id = f"revision-restore:{request_id}"
-    operations: tuple[dict[str, Any], ...] = (
-        {
-            "op": "restore_revision",
-            "target_revision_id": target_id,
-            "target_sha256": target_revision.artifact_sha256,
-            "expected_document_state_revision": expected_state_revision,
-        },
-    )
     try:
-        result, mutation_change, replayed = await _commit_revision_copy_mutation(
-            service,
-            document=document,
-            target_revision=target_revision,
+        result, mutation_change, replayed = await restore_working_revision(
+            service, ArtifactStore(media_root_from_config(ctx.config)),
+            document_id=document_id,
+            session_key=session_key,
+            session_id=session_id,
+            target_revision_id=target_revision.revision_id,
             expected_head_revision_id=expected_head,
             expected_state_revision=expected_state_revision,
             actor=_actor(ctx),
             turn_id=turn_id,
-            operations=operations,
-            summary="Restore document revision",
-            source=RevisionSource.RESTORE,
-            revision_event_type="document.restored",
         )
     except ArtifactConflictError as exc:
         raise _conflict(
@@ -1228,7 +822,7 @@ async def _revision_restore(
             code=ArtifactProductErrorCode.DOCUMENT_CHANGED,
             operation="revision.restore",
         ) from exc
-    if not replayed:
+    if not replayed and not (mutation_change.validation or {}).get("no_op", False):
         await _emit_artifact_state(
             ctx,
             session_key=session_key,
@@ -1266,7 +860,11 @@ async def _changes_list(
         document.document_id,
         limit=query.limit,
     )
-    return {"changeSets": [_change_set_payload(item) for item in changes]}
+    return {"changeSets": [
+        _change_set_payload(item) for item in changes
+        if not ((item.validation or {}).get("restore_mode") == "head_pointer"
+                and (item.validation or {}).get("no_op") is True)
+    ]}
 
 
 async def _change_get(
@@ -1309,7 +907,10 @@ async def _change_revert(
         raise _not_found("ChangeSet", change_id) from None
     if change_set.document_id != document.document_id:
         raise _not_found("ChangeSet", change_id)
-    if change_set.applied_revision_id is None:
+    if change_set.applied_revision_id is None or (
+        (change_set.validation or {}).get("restore_mode") == "head_pointer"
+        and (change_set.validation or {}).get("no_op") is True
+    ):
         raise artifact_product_error(
             ArtifactProductErrorCode.MUTATION_NOT_APPLIED,
             reason_code="change_not_applied",
@@ -1373,6 +974,7 @@ async def _change_revert(
             )
         except ArtifactConflictError as exc:
             raise _conflict(exc) from exc
+    await _sync_restored_working_files(ctx, service, result.document)
     if not replayed:
         await _emit_artifact_state(
             ctx,
@@ -1396,162 +998,6 @@ async def _change_revert(
             change_set=mutation_change,
         ),
     }
-
-
-async def _trusted_annotation_selection(
-    *,
-    session_key: str,
-    active_preview_artifact_id: str,
-    selection_id: str,
-    tag_name: str,
-    element_path: str,
-    dom_sha256: str | None,
-    element_proof_sha256: str,
-) -> ElementProofV2 | None:
-    bridge = get_desktop_artifact_bridge_client()
-    if bridge is None or not hasattr(bridge, "resolve_annotation_selection"):
-        raise artifact_product_error(
-            ArtifactProductErrorCode.ANNOTATION_UNAVAILABLE,
-            reason_code="preview_unavailable",
-        )
-    annotation_proof_v2_capable = False
-    capabilities = getattr(bridge, "capabilities", None)
-    if callable(capabilities):
-        try:
-            advertised = await capabilities(deadline_ms=2_000)
-            annotation_proof_v2_capable = getattr(advertised, "annotation_proof_v2", False) is True
-        except (DesktopArtifactBridgeError, TypeError, ValueError):
-            # Capability probing is additive. Its absence/failure keeps the
-            # established strict-v1 path available but can never enable v2.
-            annotation_proof_v2_capable = False
-    try:
-        resolved = await bridge.resolve_annotation_selection(
-            active_preview_artifact_id=active_preview_artifact_id,
-            selection_id=selection_id,
-            tag_name=tag_name,
-            element_path=element_path,
-            dom_sha256=dom_sha256,
-            element_proof_sha256=element_proof_sha256,
-            deadline_ms=2_000,
-        )
-    except (DesktopArtifactBridgeError, ValueError) as exc:
-        raise logged_artifact_product_error(
-            ArtifactProductErrorCode.ANNOTATION_UNAVAILABLE,
-            exc,
-            operation="prompt_annotations.resolve_native_selection",
-            reason_code="selection_changed",
-        ) from exc
-    if (
-        getattr(resolved, "selection_id", None) != selection_id
-        or getattr(resolved, "tag_name", None) != tag_name
-        or getattr(resolved, "element_path", None) != element_path
-        or getattr(resolved, "dom_sha256", None) != dom_sha256
-        or getattr(resolved, "element_proof_sha256", None) != element_proof_sha256
-        or getattr(resolved, "scope_id", None) != session_key
-        or getattr(resolved, "active_preview_artifact_id", None) != active_preview_artifact_id
-    ):
-        raise artifact_product_error(
-            ArtifactProductErrorCode.ANNOTATION_UNAVAILABLE,
-            reason_code="preview_changed",
-        )
-    if not annotation_proof_v2_capable:
-        return None
-    resolved_v2 = getattr(resolved, "annotation_proof_v2", None)
-    if resolved_v2 is None:
-        return None
-    if (
-        not isinstance(resolved_v2, ElementProofV2)
-        or not _SHA256_RE.fullmatch(resolved_v2.stable_element_proof_sha256)
-        or len(resolved_v2.ancestor_class_commitments) > 256
-        or any(
-            not _SHA256_RE.fullmatch(commitment)
-            for commitment in resolved_v2.ancestor_class_commitments
-        )
-        or list(resolved_v2.ancestor_class_commitments)
-        != sorted(set(resolved_v2.ancestor_class_commitments))
-    ):
-        raise artifact_product_error(
-            ArtifactProductErrorCode.ANNOTATION_UNAVAILABLE,
-            reason_code="preview_changed",
-        )
-    return resolved_v2
-
-
-async def _scoped_prompt_annotation(
-    service: ArtifactSessionService,
-    *,
-    annotation_id: str,
-    session_key: str,
-    session_id: str,
-    session_epoch: int,
-) -> PromptAnnotation:
-    try:
-        annotation = await service.get_prompt_annotation(annotation_id)
-    except ArtifactSessionNotFoundError:
-        raise _not_found("PromptAnnotation", annotation_id) from None
-    if (
-        annotation.session_key != session_key
-        or annotation.session_id != session_id
-        or annotation.session_epoch != session_epoch
-    ):
-        raise _not_found("PromptAnnotation", annotation_id)
-    return annotation
-
-
-async def _idempotent_prompt_annotation_create(
-    service: ArtifactSessionService,
-    *,
-    annotation_id: str,
-    session_key: str,
-    session_id: str,
-    session_epoch: int,
-    document_id: str,
-    revision_id: str,
-    body: str,
-    tag_name: str,
-    element_path: str,
-    element_proof_sha256: str,
-) -> tuple[PromptAnnotation, Anchor] | None:
-    """Recover a committed create without consuming another native selection.
-
-    A create response can be lost after SQLite commits. The renderer retries
-    with the same client-owned annotation ID, but the one-shot native candidate
-    has already been consumed. Only an exact match to the already validated
-    persisted anchor is eligible for this response-only replay path.
-    """
-
-    try:
-        annotation = await service.get_prompt_annotation(annotation_id)
-    except ArtifactSessionNotFoundError:
-        return None
-    if (
-        annotation.session_key != session_key
-        or annotation.session_id != session_id
-        or annotation.session_epoch != session_epoch
-    ):
-        raise _not_found("PromptAnnotation", annotation_id)
-    anchor = await _prompt_annotation_anchor(service, annotation)
-    context = anchor.context or {}
-    locator_tag_name = anchor.locator.get("tag_name")
-    if (
-        annotation.status is not PromptAnnotationStatus.DRAFT
-        or annotation.document_id != document_id
-        or annotation.revision_id != revision_id
-        or annotation.body != body
-        or anchor.kind is not AnchorKind.DOM_SOURCE
-        or anchor.state is not AnchorState.RESOLVED
-        or anchor.document_id != document_id
-        or anchor.revision_id != revision_id
-        or locator_tag_name != tag_name
-        or context.get("element_path") != element_path
-        or context.get(
-            "selection_element_proof_sha256",
-            context.get("element_proof_sha256"),
-        )
-        != element_proof_sha256
-    ):
-        raise artifact_product_error(ArtifactProductErrorCode.ANNOTATION_BUSY)
-    return annotation, anchor
 
 
 async def _prompt_annotations_list(
@@ -1602,374 +1048,6 @@ async def _prompt_annotations_list(
     return {"annotations": payloads}
 
 
-async def _prompt_annotation_create(
-    command: PromptAnnotationCreate,
-    ctx: RpcContext,
-) -> dict[str, Any]:
-    session_key, session_id, service = await _scope(command.session_key, ctx)
-    session_epoch = await _session_epoch(ctx, session_key)
-    annotation_id = command.annotation_id
-    if not _OPAQUE_ANNOTATION_ID_RE.fullmatch(annotation_id):
-        raise ValueError("annotation id is invalid")
-    document = await _scoped_document(
-        service,
-        document_id=command.document_id,
-        session_key=session_key,
-        session_id=session_id,
-    )
-    revision_id = command.revision_id or document.head_revision_id
-    if revision_id != document.head_revision_id:
-        raise artifact_product_error(ArtifactProductErrorCode.DOCUMENT_CHANGED)
-    revision = await _scoped_revision(service, document=document, revision_id=revision_id)
-    selection_id = command.selection.selection_id
-    tag_name = command.selection.tag_name
-    element_path = command.selection.element_path
-    dom_sha256 = command.selection.dom_sha256
-    element_proof_sha256 = command.selection.element_proof_sha256
-    _parse_element_path(element_path)
-    body = _prompt_annotation_body(command.body)
-    replayed = await _idempotent_prompt_annotation_create(
-        service,
-        annotation_id=annotation_id,
-        session_key=session_key,
-        session_id=session_id,
-        session_epoch=session_epoch,
-        document_id=document.document_id,
-        revision_id=revision_id,
-        body=body,
-        tag_name=tag_name,
-        element_path=element_path,
-        element_proof_sha256=element_proof_sha256,
-    )
-    if replayed is not None:
-        annotation, anchor = replayed
-        return {
-            "annotation": _prompt_annotation_payload(
-                annotation,
-                anchor=anchor,
-                current_head_revision_id=document.head_revision_id,
-            )
-        }
-    capabilities = await _revision_capabilities(ctx, document, revision)
-    if not capabilities.get("promptAnnotations"):
-        raise artifact_product_error(
-            ArtifactProductErrorCode.RESOURCE_UNSUPPORTED,
-            reason_code="annotation_unsupported",
-        )
-    trusted_element_proof_v2 = await _trusted_annotation_selection(
-        session_key=session_key,
-        active_preview_artifact_id=revision.artifact_id,
-        selection_id=selection_id,
-        tag_name=tag_name,
-        element_path=element_path,
-        dom_sha256=dom_sha256,
-        element_proof_sha256=element_proof_sha256,
-    )
-    _resolved, _ref, _path, source = await _resolve_source_revision(
-        ctx=ctx,
-        service=service,
-        session_id=session_id,
-        document=document,
-        revision_id=revision_id,
-    )
-    locator, opening_tag, anchor_context = _canonical_opening_anchor(
-        source,
-        element_path=element_path,
-        expected_element_proof_sha256=element_proof_sha256,
-        expected_tag_name=tag_name,
-        expected_element_proof_v2=trusted_element_proof_v2,
-    )
-    # The canonical element proof remains in ``element_proof_sha256``. Keep
-    # the exact renderer-selected v1 proof separately so an accepted v2 create
-    # can replay a lost response without consuming another native candidate.
-    # V2 commitments are deliberately never persisted.
-    anchor_context["selection_element_proof_sha256"] = element_proof_sha256
-
-    try:
-        anchor, annotation = await service.create_prompt_annotation_with_anchor(
-            annotation_id=annotation_id,
-            session_key=session_key,
-            session_id=session_id,
-            session_epoch=session_epoch,
-            document_id=document.document_id,
-            revision_id=revision_id,
-            kind=AnchorKind.DOM_SOURCE,
-            locator=locator,
-            quote=opening_tag[:2048],
-            context=anchor_context,
-            actor=_actor(ctx),
-            body=body,
-        )
-    except ArtifactConflictError as exc:
-        raise _conflict(
-            exc,
-            code=ArtifactProductErrorCode.ANNOTATION_BUSY,
-            operation="prompt_annotations.create",
-        ) from exc
-    except ArtifactSessionNotFoundError:
-        raise _not_found("PromptAnnotation", annotation_id) from None
-    return {
-        "annotation": _prompt_annotation_payload(
-            annotation,
-            anchor=anchor,
-            current_head_revision_id=document.head_revision_id,
-        )
-    }
-
-
-async def _prompt_annotation_focus(
-    identity: PromptAnnotationIdentity,
-    ctx: RpcContext,
-) -> dict[str, Any]:
-    session_key, session_id, service = await _scope(identity.session_key, ctx)
-    session_epoch = await _session_epoch(ctx, session_key)
-    annotation_id = identity.annotation_id
-    if not _OPAQUE_ANNOTATION_ID_RE.fullmatch(annotation_id):
-        raise ValueError("annotation id is invalid")
-    annotation = await _scoped_prompt_annotation(
-        service,
-        annotation_id=annotation_id,
-        session_key=session_key,
-        session_id=session_id,
-        session_epoch=session_epoch,
-    )
-    if annotation.status is not PromptAnnotationStatus.DRAFT:
-        raise artifact_product_error(
-            ArtifactProductErrorCode.ANNOTATION_UNAVAILABLE,
-            reason_code="not_draft",
-        )
-    document = await _scoped_document(
-        service,
-        document_id=annotation.document_id,
-        session_key=session_key,
-        session_id=session_id,
-    )
-    revision = await _scoped_revision(
-        service,
-        document=document,
-        revision_id=document.head_revision_id,
-    )
-    bridge = get_desktop_artifact_bridge_client()
-    if bridge is None or not hasattr(bridge, "focus_annotation"):
-        raise artifact_product_error(
-            ArtifactProductErrorCode.ANNOTATION_UNAVAILABLE,
-            reason_code="preview_unavailable",
-        )
-    if not (await _revision_capabilities(ctx, document, revision)).get("promptAnnotations"):
-        raise artifact_product_error(
-            ArtifactProductErrorCode.RESOURCE_UNSUPPORTED,
-            reason_code="annotation_unsupported",
-        )
-    anchor = await _prompt_annotation_anchor(service, annotation)
-    if anchor.kind is not AnchorKind.DOM_SOURCE:
-        raise artifact_product_error(ArtifactProductErrorCode.ANNOTATION_UNAVAILABLE)
-    try:
-        old_revision = await _scoped_revision(
-            service,
-            document=document,
-            revision_id=annotation.revision_id,
-        )
-        _old_resolved, _old_ref, _old_path, old_source = await _resolve_source_revision(
-            ctx=ctx,
-            service=service,
-            session_id=session_id,
-            document=document,
-            revision_id=old_revision.revision_id,
-        )
-        (
-            _current_resolved,
-            _current_ref,
-            _current_path,
-            current_source,
-        ) = await _resolve_source_revision(
-            ctx=ctx,
-            service=service,
-            session_id=session_id,
-            document=document,
-            revision_id=revision.revision_id,
-        )
-        resolution = remap_html_anchor(
-            old_source=old_source,
-            current_source=current_source,
-            anchor=anchor,
-        )
-    except ValueError as exc:
-        raise logged_artifact_product_error(
-            ArtifactProductErrorCode.ANNOTATION_UNAVAILABLE,
-            exc,
-            operation="prompt_annotations.focus_remap",
-            retryable=False,
-            annotation_id=annotation.annotation_id,
-        ) from exc
-    if resolution.status != "ready":
-        raise artifact_product_error(
-            ArtifactProductErrorCode.ANNOTATION_UNAVAILABLE,
-            reason_code=resolution.reason,
-        )
-    verified_context = resolution.context
-    verified_locator = resolution.locator
-    element_path = verified_context.get("element_path")
-    element_proof_sha256 = verified_context.get("element_proof_sha256")
-    tag_name = verified_locator.get("tag_name")
-    if (
-        not isinstance(element_path, str)
-        or not isinstance(element_proof_sha256, str)
-        or not _SHA256_RE.fullmatch(element_proof_sha256)
-        or not isinstance(tag_name, str)
-        or not _HTML_TAG_NAME_RE.fullmatch(tag_name)
-    ):
-        raise artifact_product_error(ArtifactProductErrorCode.ANNOTATION_UNAVAILABLE)
-    annotation_proof_v2: ElementProofV2 | None = None
-    capabilities = getattr(bridge, "capabilities", None)
-    if callable(capabilities):
-        try:
-            advertised = await capabilities(deadline_ms=2_000)
-            if getattr(advertised, "annotation_proof_v2", False) is True:
-                annotation_proof_v2 = canonical_selection_proof_v2(
-                    current_source,
-                    element_path=element_path,
-                )
-        except (DesktopArtifactBridgeError, TypeError, ValueError):
-            # Keep old Desktop shells on the strict-v1 focus request. A v2
-            # proof is never sent without an affirmative current capability.
-            annotation_proof_v2 = None
-    try:
-        focused = await bridge.focus_annotation(
-            annotation_id=annotation.annotation_id,
-            scope_id=session_key,
-            active_preview_artifact_id=revision.artifact_id,
-            tag_name=tag_name.lower(),
-            element_path=element_path,
-            element_proof_sha256=element_proof_sha256,
-            **(
-                {"annotation_proof_v2": annotation_proof_v2}
-                if annotation_proof_v2 is not None
-                else {}
-            ),
-            deadline_ms=2_000,
-        )
-    except (DesktopArtifactBridgeError, ValueError) as exc:
-        raise logged_artifact_product_error(
-            ArtifactProductErrorCode.ANNOTATION_UNAVAILABLE,
-            exc,
-            operation="prompt_annotations.focus_native",
-            retryable=True,
-            reason_code="preview_unavailable",
-            annotation_id=annotation.annotation_id,
-        ) from exc
-    if focused is not True:
-        raise artifact_product_error(
-            ArtifactProductErrorCode.ANNOTATION_UNAVAILABLE,
-            retryable=True,
-            reason_code="preview_unavailable",
-        )
-    return {
-        "focused": True,
-        "annotationId": annotation.annotation_id,
-        "documentId": annotation.document_id,
-    }
-
-
-async def _prompt_annotation_update(
-    command: PromptAnnotationMutation,
-    ctx: RpcContext,
-) -> dict[str, Any]:
-    session_key, session_id, service = await _scope(command.session_key, ctx)
-    session_epoch = await _session_epoch(ctx, session_key)
-    annotation = await _scoped_prompt_annotation(
-        service,
-        annotation_id=command.annotation_id,
-        session_key=session_key,
-        session_id=session_id,
-        session_epoch=session_epoch,
-    )
-    document = await _scoped_document(
-        service,
-        document_id=annotation.document_id,
-        session_key=session_key,
-        session_id=session_id,
-    )
-    try:
-        annotation = await service.update_prompt_annotation(
-            annotation_id=annotation.annotation_id,
-            expected_state_revision=command.expected_state_revision,
-            body=_prompt_annotation_body(command.body),
-        )
-    except ArtifactConflictError as exc:
-        raise _conflict(
-            exc,
-            code=ArtifactProductErrorCode.ANNOTATION_BUSY,
-            operation="prompt_annotations.update",
-        ) from exc
-    return {
-        "annotation": _prompt_annotation_payload(
-            annotation,
-            anchor=await _prompt_annotation_anchor(service, annotation),
-            current_head_revision_id=document.head_revision_id,
-        )
-    }
-
-
-async def _prompt_annotation_discard(
-    command: PromptAnnotationMutation,
-    ctx: RpcContext,
-) -> dict[str, Any]:
-    session_key, session_id, service = await _scope(command.session_key, ctx)
-    session_epoch = await _session_epoch(ctx, session_key)
-    annotation = await _scoped_prompt_annotation(
-        service,
-        annotation_id=command.annotation_id,
-        session_key=session_key,
-        session_id=session_id,
-        session_epoch=session_epoch,
-    )
-    document = await _scoped_document(
-        service,
-        document_id=annotation.document_id,
-        session_key=session_key,
-        session_id=session_id,
-    )
-    try:
-        annotation = await service.discard_prompt_annotation(
-            annotation_id=annotation.annotation_id,
-            expected_state_revision=command.expected_state_revision,
-        )
-    except ArtifactConflictError as exc:
-        raise _conflict(
-            exc,
-            code=ArtifactProductErrorCode.ANNOTATION_BUSY,
-            operation="prompt_annotations.discard",
-        ) from exc
-    return {
-        "annotation": _prompt_annotation_payload(
-            annotation,
-            anchor=await _prompt_annotation_anchor(service, annotation),
-            current_head_revision_id=document.head_revision_id,
-        )
-    }
-
-
-def _html_source(ref: ArtifactRef, path: Path) -> str:
-    if _format_for(ref.name, ref.mime) != "html":
-        raise artifact_product_error(
-            ArtifactProductErrorCode.RESOURCE_UNSUPPORTED,
-            reason_code="format_unsupported",
-        )
-    payload = path.read_bytes()
-    if len(payload) > DEFAULT_ARTIFACT_MAX_BYTES:
-        raise artifact_product_error(
-            ArtifactProductErrorCode.RESOURCE_UNSUPPORTED,
-            reason_code="size_unsupported",
-        )
-    try:
-        return payload.decode("utf-8")
-    except UnicodeDecodeError as exc:
-        raise artifact_product_error(
-            ArtifactProductErrorCode.RESOURCE_UNSUPPORTED,
-            reason_code="encoding_unsupported",
-        ) from exc
-
-
 async def _resolve_source_revision(
     *,
     ctx: RpcContext,
@@ -1977,50 +1055,33 @@ async def _resolve_source_revision(
     session_id: str,
     document: Document,
     revision_id: str,
-) -> tuple[Revision, ArtifactRef, Path, str]:
-    revision = await _scoped_revision(
-        service,
-        document=document,
-        revision_id=revision_id,
-    )
-    store = ArtifactStore(media_root_from_config(ctx.config))
-    try:
-        supports_editing = await asyncio.to_thread(
-            store.supports_single_file_editing,
-            revision.artifact_id,
-            session_id=session_id,
+) -> tuple[Revision, str]:
+    revision = await _scoped_revision(service, document=document, revision_id=revision_id)
+    if _format_for(revision.filename, revision.media_type, document.kind) != "html":
+        raise artifact_product_error(
+            ArtifactProductErrorCode.RESOURCE_UNSUPPORTED, reason_code="format_unsupported"
         )
+    binding = await get_working_files(service, document.document_id)
+    try:
+        if binding is not None and revision_id == document.head_revision_id:
+            path = binding.entry
+        else:
+            store = ArtifactStore(media_root_from_config(ctx.config))
+            resource = await asyncio.to_thread(
+                store.resolve_preview_resource, revision.artifact_id, session_id=session_id
+            )
+            path = resource.path
+        source = await asyncio.to_thread(_read_source_text, path)
     except ArtifactNotFoundError:
         raise _not_found("Revision", revision_id) from None
     except (ArtifactIntegrityError, OSError, ValueError) as exc:
         raise logged_artifact_product_error(
             ArtifactProductErrorCode.DOCUMENT_UNAVAILABLE,
             exc,
-            operation="artifact.source.supports_editing",
+            operation="artifact.source.read",
             retryable=True,
         ) from exc
-    if not supports_editing:
-        raise artifact_product_error(
-            ArtifactProductErrorCode.RESOURCE_UNSUPPORTED,
-            reason_code="bundle_unsupported",
-        )
-    try:
-        ref, path = await asyncio.to_thread(
-            store.resolve_for_download,
-            revision.artifact_id,
-            session_id=session_id,
-        )
-    except ArtifactNotFoundError:
-        raise _not_found("Revision", revision_id) from None
-    except ArtifactIntegrityError as exc:
-        raise logged_artifact_product_error(
-            ArtifactProductErrorCode.DOCUMENT_UNAVAILABLE,
-            exc,
-            operation="artifact.source.resolve",
-            retryable=True,
-        ) from exc
-    source = await asyncio.to_thread(_html_source, ref, path)
-    return revision, ref, path, source
+    return revision, source
 
 
 async def _source_read(
@@ -2035,68 +1096,24 @@ async def _source_read(
         session_id=session_id,
     )
     revision_id = query.revision_id or document.head_revision_id
-    revision, _ref, _path, source = await _resolve_source_revision(
+    revision, source = await _resolve_source_revision(
         ctx=ctx,
         service=service,
         session_id=session_id,
         document=document,
         revision_id=revision_id,
     )
-    canonical = get_document_format_adapter("html").read(source, view="source")
-    if not isinstance(canonical, str):
-        raise artifact_product_error(
-            ArtifactProductErrorCode.RESOURCE_UNSUPPORTED,
-            reason_code="source_view_unavailable",
-        )
     return {
         "source": {
             "documentId": document.document_id,
             "revisionId": revision.revision_id,
-            "sha256": hashlib.sha256(canonical.encode("utf-8")).hexdigest(),
-            "text": canonical,
+            "sha256": hashlib.sha256(source.encode("utf-8")).hexdigest(),
+            "text": source,
             "language": "html",
             "offsetEncoding": _SOURCE_OFFSET_ENCODING,
             "stateRevision": document.state_revision,
         }
     }
-
-
-def _apply_source_patches(
-    source: str,
-    edits: Sequence[SourceEdit],
-) -> tuple[str, tuple[dict[str, object], ...], dict[str, object]]:
-    if not edits:
-        raise ValueError("at least one source edit is required")
-    if len(edits) > _MAX_SOURCE_PATCHES:
-        raise ValueError("too many source edits")
-    patches: list[tuple[int, int, str]] = []
-    for item in edits:
-        start = item.start_offset
-        end = item.end_offset
-        replacement = item.replacement
-        if start < 0 or end < start or end > len(source):
-            raise ValueError("source patch range is out of bounds")
-        patches.append((start, end, replacement))
-    patches.sort(key=lambda item: (item[0], item[1]))
-    for previous, current in zip(patches, patches[1:], strict=False):
-        if current[0] < previous[1] or current[0] == previous[0]:
-            raise ValueError("source patches must not overlap or share a start offset")
-    result = source
-    for start, end, replacement in reversed(patches):
-        result = result[:start] + replacement + result[end:]
-    adapter_validation = validate_editable_html_source(result)
-    audit_patches = tuple(
-        {
-            "start_offset": start,
-            "end_offset": end,
-            "expected_chars": end - start,
-            "expected_sha256": hashlib.sha256(source[start:end].encode("utf-8")).hexdigest(),
-            "replacement_chars": len(replacement),
-            "replacement_sha256": hashlib.sha256(replacement.encode("utf-8")).hexdigest(),
-        }
-        for start, end, replacement in patches
-    )
-    return result, audit_patches, adapter_validation
 
 
 def _mutation_receipt_payload(
@@ -2122,6 +1139,9 @@ def _mutation_result_state_revision(
     result: CommitResult,
     change_set: ChangeSet,
 ) -> int:
+    restored_state = head_restore_receipt_state_revision(change_set, result.revision)
+    if restored_state is not None:
+        return restored_state
     expected = {
         operation.get("expected_document_state_revision")
         for operation in change_set.operations
@@ -2168,6 +1188,9 @@ async def _applied_mutation_replay(
         raise ArtifactConflictError("document mutation receipt is not applied")
     document = await service.get_document(document_id)
     revision = await service.get_revision(change_set.applied_revision_id)
+    restored_state = head_restore_receipt_state_revision(change_set, revision)
+    if restored_state is not None:
+        return CommitResult(document=document, revision=revision), change_set
     if (
         revision.change_set_id != change_set.change_set_id
         or revision.artifact_sha256 != candidate_sha256
@@ -2177,434 +1200,50 @@ async def _applied_mutation_replay(
     return CommitResult(document=document, revision=revision), change_set
 
 
-async def _source_patch_response(
-    *,
-    ctx: RpcContext,
-    service: ArtifactSessionService,
-    request_id: str,
-    base_revision_id: str,
-    result: CommitResult,
-    change_set: ChangeSet,
-    patch_count: int,
-    edit_session: EditSession | None = None,
-) -> dict[str, Any]:
-    payload = {
-        "document": await _mutation_document_payload(ctx, service, result),
-        "revision": _revision_payload(result.revision),
-        "changeSet": _change_set_payload(change_set),
-        "receipt": _mutation_receipt_payload(
-            request_id=request_id,
-            base_revision_id=base_revision_id,
-            result=result,
-            change_set=change_set,
-        ),
-        "source": {
-            "documentId": result.document.document_id,
-            "revisionId": result.revision.revision_id,
-            "sha256": result.revision.artifact_sha256,
-            "offsetEncoding": _SOURCE_OFFSET_ENCODING,
-            "patchCount": patch_count,
-            "stateRevision": _mutation_result_state_revision(result, change_set),
-        },
-    }
-    if edit_session is not None:
-        payload["editSession"] = _edit_session_payload(edit_session)
-    return payload
-
-
-async def _source_patch(
-    command: SourcePatch,
-    ctx: RpcContext,
-) -> dict[str, Any]:
-    session_key, session_id, service = await _scope(command.session_key, ctx)
-    document_id = command.document_id
-    document = await _scoped_document(
-        service,
-        document_id=document_id,
-        session_key=session_key,
-        session_id=session_id,
-    )
-    actor = _actor(ctx)
-    edit_session_id = command.edit_session_id
-    edit_session_state_revision = command.expected_edit_session_state_revision
-    edit_session_last_saved_revision_id = command.expected_last_saved_revision_id
-    edit_session: EditSession | None = None
-    if edit_session_id is not None:
-        assert edit_session_state_revision is not None
-        assert edit_session_last_saved_revision_id is not None
-        edit_session, edit_document = await _scoped_edit_session(
-            service,
-            edit_session_id=edit_session_id,
-            session_key=session_key,
-            session_id=session_id,
-            actor=actor,
-        )
-        if edit_document.document_id != document_id:
-            raise _conflict(
-                ArtifactConflictError("edit session belongs to another document"),
-                code=ArtifactProductErrorCode.EDIT_SESSION_RENEWAL_REQUIRED,
-                operation="edit_session.validate_save",
-            )
-    expected_head = command.expected_head_revision_id
-    revision, ref, _path, source = await _resolve_source_revision(
-        ctx=ctx,
-        service=service,
-        session_id=session_id,
-        document=document,
-        revision_id=expected_head,
-    )
-    expected_sha = command.expected_source_sha256.lower()
-    expected_state_revision = command.expected_state_revision
-    try:
-        _validate_source_offset_encoding(command.offset_encoding)
-    except ValueError:
+def _read_source_text(path: Path) -> str:
+    with path.open("rb") as stream:
+        payload = stream.read(DEFAULT_ARTIFACT_MAX_BYTES + 1)
+    if len(payload) > DEFAULT_ARTIFACT_MAX_BYTES:
         raise artifact_product_error(
-            ArtifactProductErrorCode.INVALID_REQUEST,
-            reason_code="invalid_source_edit",
-        ) from None
-    actual_sha = hashlib.sha256(source.encode("utf-8")).hexdigest()
-    if expected_sha != actual_sha:
-        raise _conflict(ArtifactConflictError("source sha256 changed"))
-    try:
-        updated, audit_patches, adapter_validation = _apply_source_patches(
-            source,
-            command.edits,
+            ArtifactProductErrorCode.RESOURCE_UNSUPPORTED, reason_code="size_unsupported"
         )
-    except (DocumentAdapterError, ValueError):
+    try:
+        return payload.decode("utf-8")
+    except UnicodeDecodeError as exc:
         raise artifact_product_error(
-            ArtifactProductErrorCode.INVALID_REQUEST,
-            reason_code="invalid_source_edit",
-        ) from None
-    patch_count = len(audit_patches)
-    request_id = command.request_id
-    turn_id = f"manual-source-patch:{request_id}"
-    updated_bytes = updated.encode("utf-8")
-    updated_sha256 = hashlib.sha256(updated_bytes).hexdigest()
-    operation: dict[str, Any] = {
-        "op": "html_source_patch",
-        "origin": "manual",
-        "expected_document_state_revision": expected_state_revision,
-        "expected_source_sha256": actual_sha,
-        "result_source_sha256": updated_sha256,
-        "offset_encoding": _SOURCE_OFFSET_ENCODING,
-        "patches": list(audit_patches),
-    }
-    if edit_session_id is not None:
-        operation["edit_session"] = {
-            "id": edit_session_id,
-            "expected_state_revision": edit_session_state_revision,
-            "expected_last_saved_revision_id": edit_session_last_saved_revision_id,
-        }
-    operations: tuple[dict[str, Any], ...] = (operation,)
-    proposal_sha256 = hashlib.sha256(
-        json.dumps(
-            {
-                "document_id": document_id,
-                "base_revision_id": expected_head,
-                "request_id": request_id,
-                "candidate_sha256": updated_sha256,
-                "operations": operations,
-            },
-            ensure_ascii=False,
-            separators=(",", ":"),
-            sort_keys=True,
-        ).encode("utf-8")
-    ).hexdigest()
-    try:
-        replay = await _applied_mutation_replay(
-            service,
-            document_id=document_id,
-            turn_id=turn_id,
-            base_revision_id=expected_head,
-            operations=operations,
-            candidate_sha256=updated_sha256,
-        )
-    except ArtifactConflictError as exc:
-        raise _conflict(exc) from exc
-    if replay is not None:
-        replay_result, replay_change = replay
-        if edit_session_id is not None:
-            edit_session, _ = await _scoped_edit_session(
-                service,
-                edit_session_id=edit_session_id,
-                session_key=session_key,
-                session_id=session_id,
-                actor=actor,
-            )
-        return await _source_patch_response(
-            ctx=ctx,
-            service=service,
-            request_id=request_id,
-            base_revision_id=expected_head,
-            result=replay_result,
-            change_set=replay_change,
-            patch_count=patch_count,
-            edit_session=edit_session,
-        )
-    if (
-        document.head_revision_id != expected_head
-        or document.state_revision != expected_state_revision
-    ):
-        raise _conflict(ArtifactConflictError("document head or state revision changed"))
-    if edit_session_id is not None:
-        assert edit_session_state_revision is not None
-        assert edit_session_last_saved_revision_id is not None
-        try:
-            edit_session = await service.validate_edit_session_for_save(
-                edit_session_id=edit_session_id,
-                document_id=document_id,
-                user_id=actor.actor_id,
-                expected_state_revision=edit_session_state_revision,
-                expected_last_saved_revision_id=edit_session_last_saved_revision_id,
-            )
-        except ArtifactConflictError as exc:
-            raise _conflict(
-                exc,
-                code=ArtifactProductErrorCode.EDIT_SESSION_RENEWAL_REQUIRED,
-                operation="edit_session.validate_save",
-            ) from exc
-    store = ArtifactStore(media_root_from_config(ctx.config))
-    candidate: ArtifactRef | None = None
-    candidate_id: str | None = None
-    candidate_publish: asyncio.Task[ArtifactRef] | None = None
-    result: CommitResult | None = None
-    committed_change: ChangeSet | None = None
-    lease: WriterLease | None = None
-    release_lease = False
-    updated_edit_session: EditSession | None = None
-    attempt: MutationAttempt | None = None
-    tool_use_id = f"rpc-source-patch:{hashlib.sha256(turn_id.encode()).hexdigest()[:32]}"
-    try:
-        attempt, created = await service.reserve_mutation_attempt_with_status(
-            document_id=document_id,
-            turn_id=turn_id,
-            tool_use_id=tool_use_id,
-            base_revision_id=expected_head,
-            proposal_sha256=proposal_sha256,
-        )
-        if not created:
-            raise ArtifactConflictError(
-                f"document mutation request is already {attempt.status.value}"
-            )
-        holder_digest = hashlib.sha256(turn_id.encode("utf-8")).hexdigest()[:24]
-        lease = await service.acquire_writer_lease(
-            document_id=document_id,
-            holder_id=f"artifact-user:{actor.actor_id[:128]}:{holder_digest}",
-            ttl_ms=_EDIT_SESSION_TTL_MS,
-            actor=actor,
-        )
-        release_lease = True
-        locked_document = await service.get_document(document_id)
-        if (
-            locked_document.head_revision_id != expected_head
-            or locked_document.state_revision != expected_state_revision
-        ):
-            raise ArtifactConflictError("document changed before the manual write lease")
-        candidate_id = store.allocate_artifact_id()
-        await service.register_mutation_candidate(
-            document_id=document_id,
-            turn_id=turn_id,
-            candidate_session_id=session_id,
-            candidate_artifact_id=candidate_id,
-            candidate_artifact_sha256=updated_sha256,
-        )
-        candidate_publish = asyncio.create_task(
-            asyncio.to_thread(
-                store.publish_bytes,
-                updated_bytes,
-                session_id=session_id,
-                session_key=session_key,
-                name=ref.name,
-                mime=ref.mime,
-                source="artifact_source_patch",
-                visibility="internal",
-                artifact_id=candidate_id,
-            )
-        )
-        candidate = await asyncio.shield(candidate_publish)
-        result, committed_change = await service.commit_change_set_atomically(
-            document_id=document_id,
-            base_revision_id=expected_head,
-            expected_document_state_revision=expected_state_revision,
-            operations=operations,
-            candidate_artifact=ArtifactBlobRef(
-                artifact_id=candidate.id,
-                sha256=candidate.sha256,
-                filename=candidate.name,
-                media_type=candidate.mime,
-                byte_size=candidate.size,
-            ),
-            validation={
-                "format": "html",
-                "encoding": "utf-8",
-                "source_sha256": candidate.sha256,
-                "patch_count": patch_count,
-                "adapter_validation": adapter_validation,
-                "status": "passed",
-            },
-            actor=actor,
-            turn_id=turn_id,
-            summary="Manual HTML source edit",
-            source=RevisionSource.MANUAL,
-            lease=lease,
-            require_lease=True,
-            edit_session_id=edit_session_id,
-            expected_edit_session_state_revision=edit_session_state_revision,
-            expected_last_saved_revision_id=edit_session_last_saved_revision_id,
-        )
-        if edit_session_id is not None:
-            updated_edit_session = await service.get_edit_session(edit_session_id)
-        await service.mark_mutation_attempt_applied(
-            document_id=document_id,
-            turn_id=turn_id,
-            tool_use_id=tool_use_id,
-            change_set_id=committed_change.change_set_id,
-            revision_id=result.revision.revision_id,
-        )
-    except BaseException as exc:
-        if candidate is None and candidate_publish is not None:
-            try:
-                candidate = await asyncio.shield(candidate_publish)
-            except Exception:  # noqa: BLE001 - publication failed before an artifact existed
-                pass
-        durable_change: ChangeSet | None = None
-        durable_state_known = False
-        try:
-            durable_change = await service.get_change_set_by_turn(
-                document_id=document_id,
-                turn_id=turn_id,
-            )
-            durable_state_known = True
-        except Exception:  # noqa: BLE001 - ambiguous durable state must retain bytes
-            pass
+            ArtifactProductErrorCode.RESOURCE_UNSUPPORTED, reason_code="encoding_unsupported"
+        ) from exc
 
-        if (
-            result is None
-            and candidate is not None
-            and durable_change is not None
-            and durable_change.status is ChangeSetStatus.APPLIED
-            and durable_change.applied_revision_id is not None
-            and durable_change.candidate_artifact_id == candidate.id
-            and durable_change.candidate_artifact_sha256 == candidate.sha256
-        ):
-            try:
-                durable_document = await service.get_document(document_id)
-                durable_revision = await service.get_revision(durable_change.applied_revision_id)
-            except Exception:  # noqa: BLE001 - preserve bytes on ambiguous commit state
-                pass
-            else:
-                if (
-                    durable_document.head_revision_id == durable_revision.revision_id
-                    and durable_revision.change_set_id == durable_change.change_set_id
-                    and durable_revision.artifact_id == candidate.id
-                    and durable_revision.artifact_sha256 == candidate.sha256
-                ):
-                    result = CommitResult(
-                        document=durable_document,
-                        revision=durable_revision,
-                    )
-                    committed_change = durable_change
 
-        candidate_can_be_deleted = (
-            result is None
-            and durable_state_known
-            and (
-                durable_change is None
-                or (
-                    candidate_id is not None
-                    and durable_change.candidate_artifact_id != candidate_id
-                )
-            )
-        )
-        cleanup_ambiguous = candidate_id is not None and not durable_state_known
-        if candidate_can_be_deleted and candidate_id is not None:
-            try:
-                await asyncio.to_thread(
-                    store.delete_reserved_bucket,
-                    session_id=session_id,
-                    artifact_id=candidate_id,
-                )
-            except (ArtifactError, OSError, ValueError):
-                cleanup_ambiguous = True
-        if result is None and attempt is not None:
-            if cleanup_ambiguous:
-                try:
-                    await service.mark_mutation_attempt_ambiguous(
-                        document_id=document_id,
-                        turn_id=turn_id,
-                        tool_use_id=tool_use_id,
-                        failure_code="manual_candidate_cleanup_failed",
-                    )
-                except Exception:  # noqa: BLE001 - leave the reserved journal recoverable
-                    pass
-            else:
-                try:
-                    await service.mark_mutation_attempt_failed(
-                        document_id=document_id,
-                        turn_id=turn_id,
-                        tool_use_id=tool_use_id,
-                        failure_code="manual_mutation_failed",
-                    )
-                except Exception:  # noqa: BLE001 - restart recovery owns unresolved attempts
-                    pass
-        elif result is not None and committed_change is not None and attempt is not None:
-            try:
-                await service.mark_mutation_attempt_applied(
-                    document_id=document_id,
-                    turn_id=turn_id,
-                    tool_use_id=tool_use_id,
-                    change_set_id=committed_change.change_set_id,
-                    revision_id=result.revision.revision_id,
-                )
-            except Exception:  # noqa: BLE001 - restart recovery can reconcile the receipt
-                pass
-        if result is None:
-            if cleanup_ambiguous:
-                raise artifact_product_error(
-                    ArtifactProductErrorCode.MUTATION_OUTCOME_PENDING,
-                    retryable=True,
-                    reason_code="cleanup_pending",
-                ) from None
-            if isinstance(exc, ArtifactConflictError):
-                raise _conflict(exc) from exc
-            raise
-        if not isinstance(exc, Exception):
-            raise
-    finally:
-        if release_lease and lease is not None:
-            try:
-                await service.release_writer_lease(lease=lease, actor=actor)
-            except Exception:  # noqa: BLE001 - the bounded lease expires if release fails
-                pass
-    assert result is not None
-    assert committed_change is not None
-    assert candidate is not None
-    if edit_session_id is not None and updated_edit_session is None:
-        updated_edit_session, _ = await _scoped_edit_session(
-            service,
-            edit_session_id=edit_session_id,
-            session_key=session_key,
-            session_id=session_id,
-            actor=actor,
-        )
-    await _emit_artifact_state(
+async def _sync_restored_working_files(
+    ctx: RpcContext, service: ArtifactSessionService, document: Document
+) -> None:
+    if document.kind is not ArtifactKind.HTML:
+        return
+    if document.session_id is None:
+        # Historical unscoped documents cannot authorize a session workspace copy.
+        return
+    if await get_working_files(service, document.document_id) is None:
+        return
+    from opensquilla.gateway.workbench_resource_runtime import ensure_document_working_files
+
+    await ensure_document_working_files(
         ctx,
-        session_key=session_key,
         service=service,
-        document_id=document_id,
-        revision_id=result.revision.revision_id,
-        change_set_id=committed_change.change_set_id,
-        action="source.patched",
+        session_key=document.session_key,
+        session_id=document.session_id,
+        document_id=document.document_id,
     )
-    return await _source_patch_response(
-        ctx=ctx,
-        service=service,
-        request_id=request_id,
-        base_revision_id=expected_head,
-        result=result,
-        change_set=committed_change,
-        patch_count=patch_count,
-        edit_session=updated_edit_session,
+
+
+async def _handle_retired_document_editing(
+    params: dict[str, Any] | None, ctx: RpcContext
+) -> dict[str, Any]:
+    raise RpcHandlerError(
+        "DOCUMENT_EDITING_RETIRED",
+        "This HTML editor API has been retired. Update the client, reopen the page, "
+        "and send annotations as ordinary chat input. Existing versions remain available.",
+        details={"action": "update_client_and_reopen_page"},
     )
 
 
@@ -2632,15 +1271,6 @@ class _ArtifactEditingRuntimePort:
     async def close_document(self, identity: DocumentIdentity) -> dict[str, Any]:
         return await _document_close(identity, self._ctx)
 
-    async def start_edit_session(self, command: EditSessionStart) -> dict[str, Any]:
-        return await _edit_session_start(command, self._ctx)
-
-    async def heartbeat_edit_session(self, command: EditSessionMutation) -> dict[str, Any]:
-        return await _edit_session_heartbeat(command, self._ctx)
-
-    async def close_edit_session(self, command: EditSessionMutation) -> dict[str, Any]:
-        return await _edit_session_close(command, self._ctx)
-
     async def list_revisions(self, query: RevisionListQuery) -> dict[str, Any]:
         return await _revisions_list(query, self._ctx)
 
@@ -2659,23 +1289,22 @@ class _ArtifactEditingRuntimePort:
     async def list_annotations(self, query: PromptAnnotationQuery) -> dict[str, Any]:
         return await _prompt_annotations_list(query, self._ctx)
 
-    async def create_annotation(self, command: PromptAnnotationCreate) -> dict[str, Any]:
-        return await _prompt_annotation_create(command, self._ctx)
-
-    async def focus_annotation(self, identity: PromptAnnotationIdentity) -> dict[str, Any]:
-        return await _prompt_annotation_focus(identity, self._ctx)
-
-    async def update_annotation(self, command: PromptAnnotationMutation) -> dict[str, Any]:
-        return await _prompt_annotation_update(command, self._ctx)
-
-    async def discard_annotation(self, command: PromptAnnotationMutation) -> dict[str, Any]:
-        return await _prompt_annotation_discard(command, self._ctx)
-
     async def read_source(self, query: SourceRead) -> dict[str, Any]:
         return await _source_read(query, self._ctx)
 
-    async def patch_source(self, command: SourcePatch) -> dict[str, Any]:
-        return await _source_patch(command, self._ctx)
+
+_RETIRED_EDITOR_METHODS = frozenset(
+    (
+        "documents.editSessions.start",
+        "documents.editSessions.heartbeat",
+        "documents.editSessions.close",
+        "artifacts.prompt_annotations.create",
+        "artifacts.prompt_annotations.focus",
+        "artifacts.prompt_annotations.update",
+        "artifacts.prompt_annotations.discard",
+        "artifacts.source.patch",
+    )
+)
 
 _ARTIFACT_EDITING_METHODS = (
     "artifacts.edit.capabilities",
@@ -2724,7 +1353,11 @@ _ARTIFACT_EDITING_METHODS = (
     _handle_source_read,
     _handle_source_patch,
 ) = tuple(
-    GatewayArtifactWorkbenchAdapter.bind(method, _ArtifactEditingRuntimePort)
+    (
+        _handle_retired_document_editing
+        if method in _RETIRED_EDITOR_METHODS
+        else GatewayArtifactWorkbenchAdapter.bind(method, _ArtifactEditingRuntimePort)
+    )
     for method in _ARTIFACT_EDITING_METHODS
 )
 
@@ -2755,13 +1388,16 @@ for _artifact_method, _artifact_implementation in zip(
     ),
     strict=True,
 ):
-    register_artifact_workbench_contract(
-        _d,
-        _artifact_method,
-        _artifact_implementation,
-        internal_error=RpcHandlerError,
-        guest_allowed_checker=is_guest_rpc_method_allowed,
-    )
+    if _artifact_method in _RETIRED_EDITOR_METHODS:
+        _d.method(_artifact_method, scope="operator.write")(_artifact_implementation)
+    else:
+        register_artifact_workbench_contract(
+            _d,
+            _artifact_method,
+            _artifact_implementation,
+            internal_error=RpcHandlerError,
+            guest_allowed_checker=is_guest_rpc_method_allowed,
+        )
 
 
 __all__ = [

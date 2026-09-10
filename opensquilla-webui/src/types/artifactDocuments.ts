@@ -147,36 +147,6 @@ export interface ArtifactAnchor {
   schemaVersion: number
 }
 
-export interface ArtifactEditSession {
-  editSessionId: string
-  documentId: string
-  baseRevisionId: string
-  lastSavedRevisionId: string
-  mode: 'view' | 'edit'
-  status: 'active' | 'closed' | 'expired' | 'stale'
-  stateRevision: number
-  expiresAt: number | string | null
-}
-
-export interface ArtifactEditSessionStartRequest {
-  sessionKey: string
-  documentId: string
-  mode: 'edit'
-  clientRequestId?: string
-}
-
-export interface ArtifactEditSessionHeartbeatRequest {
-  sessionKey: string
-  editSessionId: string
-  expectedStateRevision: number
-}
-
-export interface ArtifactEditSessionCloseRequest {
-  sessionKey: string
-  editSessionId: string
-  expectedStateRevision: number
-}
-
 export interface ArtifactSourceSnapshot {
   documentId: string
   revisionId: string
@@ -189,13 +159,7 @@ export interface ArtifactSourceSnapshot {
   stateRevision: number
 }
 
-export interface ArtifactSourcePatchResult extends ArtifactSourceSnapshot {
-  /** Present when the patch was committed through a durable EditSession. */
-  editSession: ArtifactEditSession | null
-}
-
 export type ArtifactMutationOperation =
-  | 'source.patch'
   | 'revision.restore'
   | 'change.revert'
   | 'document.import'

@@ -1,3 +1,4 @@
+import type { ChatPageContext } from '@/types/pageContext'
 import type { InjectionKey } from 'vue'
 import type { Attachment } from '@/types/chat'
 
@@ -12,7 +13,7 @@ export interface PendingInputServerItem {
   readonly position?: number
   readonly revision?: number
   readonly requestFingerprint?: string
-  readonly promptAnnotationIds?: readonly string[]
+  readonly pageContext?: ChatPageContext
   readonly intent?: string | null
   readonly confirmedPlainText?: boolean
 }
@@ -30,7 +31,7 @@ export interface PendingInputEnqueueRequest {
   clientMessageId?: string
   message: string
   attachments: readonly unknown[]
-  promptAnnotationIds?: readonly string[]
+  pageContext?: ChatPageContext
   confirmedPlainText?: boolean
   displayText?: string
   intent?: string | null

@@ -18,8 +18,6 @@ from opensquilla.application.artifact_workbench import (
     ChangeListQuery,
     ChangeRevert,
     DocumentCapabilitiesQuery,
-    DocumentEditSession,
-    DocumentEditSessionPort,
     DocumentIdentity,
     DocumentImport,
     DocumentOpen,
@@ -31,18 +29,12 @@ from opensquilla.application.artifact_workbench import (
     DocumentTransferPort,
     DocumentWorkspace,
     DocumentWorkspacePort,
-    EditSessionMutation,
-    EditSessionStart,
     MutationOutcomeApplication,
     MutationOutcomePort,
     MutationResolution,
     PromptAnnotationApplication,
-    PromptAnnotationCreate,
-    PromptAnnotationIdentity,
-    PromptAnnotationMutation,
     PromptAnnotationPort,
     PromptAnnotationQuery,
-    PromptAnnotationSelection,
     ResourcePreviewApplication,
     ResourcePreviewPort,
     RevisionHistory,
@@ -50,8 +42,6 @@ from opensquilla.application.artifact_workbench import (
     RevisionListQuery,
     RevisionRestore,
     SessionDocumentsQuery,
-    SourceEdit,
-    SourcePatch,
     SourceRead,
     WorkbenchPreviewCreate,
     WorkbenchResourceApplication,
@@ -138,32 +128,6 @@ class GatewayArtifactWorkbenchAdapter:
             result = await DocumentWorkspace(cast(DocumentWorkspacePort, port)).close(
                 self._document_identity()
             )
-        elif method == "documents.editSessions.start":
-            mode = p.get("mode", "edit")
-            if mode != "edit":
-                raise ValueError("mode must be edit")
-            result = await DocumentEditSession(cast(DocumentEditSessionPort, port)).start(
-                EditSessionStart(
-                    self._text("sessionKey"),
-                    self._text("documentId"),
-                    self._optional_text("clientRequestId"),
-                )
-            )
-        elif method in {
-            "documents.editSessions.heartbeat",
-            "documents.editSessions.close",
-        }:
-            command = EditSessionMutation(
-                self._text("sessionKey"),
-                self._text("editSessionId"),
-                self._positive("expectedStateRevision"),
-            )
-            application = DocumentEditSession(cast(DocumentEditSessionPort, port))
-            result = (
-                await application.heartbeat(command)
-                if method.endswith("heartbeat")
-                else await application.close(command)
-            )
         elif method == "artifacts.revisions.list":
             result = await RevisionHistory(cast(RevisionHistoryPort, port)).list(
                 RevisionListQuery(
@@ -219,87 +183,12 @@ class GatewayArtifactWorkbenchAdapter:
                     self._strict_limit("limit", default=500),
                 )
             )
-        elif method == "artifacts.prompt_annotations.create":
-            selection = self._mapping("selection")
-            result = await PromptAnnotationApplication(cast(PromptAnnotationPort, port)).create(
-                PromptAnnotationCreate(
-                    self._text("sessionKey"),
-                    self._text("annotationId"),
-                    self._text("documentId"),
-                    PromptAnnotationSelection(
-                        self._mapping_text(selection, "selectionId", strip=False),
-                        self._mapping_text(selection, "tagName", strip=False),
-                        self._mapping_text(selection, "elementPath", strip=False),
-                        self._mapping_text(selection, "elementProofSha256", strip=False),
-                        self._mapping_optional_raw_text(selection, "domSha256"),
-                    ),
-                    self._optional_text("revisionId"),
-                    self._optional_body(),
-                )
-            )
-        elif method == "artifacts.prompt_annotations.focus":
-            result = await PromptAnnotationApplication(cast(PromptAnnotationPort, port)).focus(
-                PromptAnnotationIdentity(self._text("sessionKey"), self._text("annotationId"))
-            )
-        elif method in {
-            "artifacts.prompt_annotations.update",
-            "artifacts.prompt_annotations.discard",
-        }:
-            annotation_command = PromptAnnotationMutation(
-                self._text("sessionKey"),
-                self._text("annotationId"),
-                self._positive("expectedStateRevision"),
-                self._optional_body() if method.endswith("update") else None,
-            )
-            annotation_application = PromptAnnotationApplication(cast(PromptAnnotationPort, port))
-            result = (
-                await annotation_application.update(annotation_command)
-                if method.endswith("update")
-                else await annotation_application.discard(annotation_command)
-            )
         elif method == "artifacts.source.read":
             result = await DocumentSource(cast(DocumentSourcePort, port)).read(
                 SourceRead(
                     self._text("sessionKey"),
                     self._text("documentId"),
                     self._optional_text("revisionId"),
-                )
-            )
-        elif method == "artifacts.source.patch":
-            raw_edits = p.get("patches")
-            if not isinstance(raw_edits, list):
-                raise ValueError("patches must be a list")
-            edit_session_fields = (
-                "editSessionId",
-                "expectedEditSessionStateRevision",
-                "expectedLastSavedRevisionId",
-            )
-            if any(name in p for name in edit_session_fields) and not all(
-                name in p and p[name] is not None for name in edit_session_fields
-            ):
-                raise ValueError("edit session fencing fields must be supplied together")
-            offset_encoding = self._optional_raw_text("offsetEncoding")
-            edits = tuple(
-                SourceEdit(
-                    self._mapping_int(self._as_mapping(item, "patch"), "startOffset"),
-                    self._mapping_int(self._as_mapping(item, "patch"), "endOffset"),
-                    self._mapping_text(self._as_mapping(item, "patch"), "replacement", strip=False),
-                )
-                for item in raw_edits
-            )
-            result = await DocumentSource(cast(DocumentSourcePort, port)).patch(
-                SourcePatch(
-                    self._text("sessionKey"),
-                    self._text("documentId"),
-                    self._text("expectedHeadRevisionId"),
-                    self._text("expectedSourceSha256"),
-                    self._positive("expectedStateRevision"),
-                    edits,
-                    self._manual_request_id(),
-                    offset_encoding if offset_encoding is not None else "unicode-code-point",
-                    self._optional_text("editSessionId"),
-                    self._optional_positive("expectedEditSessionStateRevision"),
-                    self._optional_text("expectedLastSavedRevisionId"),
                 )
             )
         elif method == "workbench.resources.list":
@@ -466,19 +355,7 @@ class GatewayArtifactWorkbenchAdapter:
     def _optional_text(self, name: str) -> str | None:
         return self._mapping_optional_text(self._params, name)
 
-    def _optional_raw_text(self, name: str) -> str | None:
-        return self._mapping_optional_raw_text(self._params, name)
 
-    def _optional_body(self) -> str | None:
-        if "body" not in self._params:
-            return None
-        value = self._params["body"]
-        if not isinstance(value, str):
-            raise ValueError("body must be a string")
-        return value
-
-    def _mapping(self, name: str) -> Mapping[str, Any]:
-        return self._as_mapping(self._params.get(name), name)
 
     @staticmethod
     def _as_mapping(value: object, name: str) -> Mapping[str, Any]:
@@ -499,14 +376,6 @@ class GatewayArtifactWorkbenchAdapter:
             return None
         return cls._mapping_text(values, name)
 
-    @staticmethod
-    def _mapping_optional_raw_text(values: Mapping[str, Any], name: str) -> str | None:
-        if name not in values or values[name] is None:
-            return None
-        value = values[name]
-        if not isinstance(value, str):
-            raise ValueError(f"{name} must be a string")
-        return value
 
     @staticmethod
     def _mapping_int(values: Mapping[str, Any], name: str) -> int:
@@ -521,10 +390,6 @@ class GatewayArtifactWorkbenchAdapter:
             raise ValueError(f"{name} must be positive")
         return value
 
-    def _optional_positive(self, name: str) -> int | None:
-        if name not in self._params or self._params[name] is None:
-            return None
-        return self._positive(name)
 
     def _limit(self, name: str, default: int, *, maximum: int | None = None) -> int:
         value = self._params.get(name)

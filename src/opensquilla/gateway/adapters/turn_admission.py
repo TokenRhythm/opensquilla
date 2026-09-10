@@ -138,14 +138,6 @@ class GatewayTurnAdmissionAdapter:
     def _webchat_command(self, params: dict[str, Any], key: str) -> AdmitTurn:
         collaboration = self._initial_collaboration_mode(params)
         routing = self._initial_routing_mode(params)
-        raw_ids = params.get("promptAnnotationIds", params.get("prompt_annotation_ids"))
-        ids: list[str] | None = None
-        if raw_ids is not None:
-            if not isinstance(raw_ids, list):
-                raise ValueError("params.promptAnnotationIds must be an array")
-            if any(not isinstance(item, str) or not item.strip() for item in raw_ids):
-                raise ValueError("params.promptAnnotationIds must contain non-empty strings")
-            ids = [item.strip() for item in raw_ids]
         incoming_source = params.get("_source")
         incoming_source = incoming_source if isinstance(incoming_source, dict) else {}
         elevated = incoming_source.get("elevated")
@@ -173,19 +165,16 @@ class GatewayTurnAdmissionAdapter:
             "surface_id",
             "workspaceId",
             "workspace_id",
-            "promptAnnotationIds",
-            "prompt_annotation_ids",
+            "pageContext",
             "documentContext",
             "document_context",
+            "promptAnnotationIds",
+            "prompt_annotation_ids",
             "initialRoutingMode",
             "initial_routing_mode",
         ):
             if name in params:
-                target = {
-                    "prompt_annotation_ids": "promptAnnotationIds",
-                    "document_context": "documentContext",
-                }.get(name, name)
-                extra[target] = params[name]
+                extra[name] = params[name]
         attachments = params.get("attachments")
         projected = sessions_send_params(
             ChatSendRequest(
@@ -214,9 +203,6 @@ class GatewayTurnAdmissionAdapter:
             fingerprint["initialCollaborationMode"] = collaboration
         if routing is not None:
             fingerprint["initialRoutingMode"] = routing
-        if ids is not None:
-            projected["promptAnnotationIds"] = ids
-            fingerprint["promptAnnotationIds"] = ids
         return replace(
             decode_admit_turn(
                 projected,
@@ -224,6 +210,7 @@ class GatewayTurnAdmissionAdapter:
                 principal_role=self._principal_role,
                 connection_id=self._connection_id,
                 fingerprint_params=fingerprint,
+                allow_receipt_replay=True,
             ),
             initial_collaboration_mode=collaboration,
             initial_routing_mode=routing,
@@ -247,6 +234,7 @@ class GatewayTurnAdmissionAdapter:
                 surface="session",
                 principal_role=self._principal_role,
                 connection_id=self._connection_id,
+                allow_receipt_replay=True,
             )
         )
         try:

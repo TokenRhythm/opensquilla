@@ -31,6 +31,7 @@ from opensquilla.artifact_session import (
     ArtifactKind,
     ArtifactSessionService,
     ArtifactValidationError,
+    ChangeSetStatus,
     Document,
     DocumentImportAttempt,
     DocumentImportMode,
@@ -45,6 +46,7 @@ from opensquilla.artifact_session import (
 from opensquilla.artifact_session import (
     ArtifactNotFoundError as ArtifactSessionNotFoundError,
 )
+from opensquilla.artifact_session.models import head_restore_receipt_state_revision
 from opensquilla.artifacts import (
     ArtifactError,
     ArtifactIntegrityError,
@@ -71,15 +73,10 @@ from opensquilla.gateway.session_services import (
     session_id_for_key,
 )
 from opensquilla.gateway.websocket import get_registry
+from opensquilla.html_format import is_html, validate_html
 from opensquilla.paths import media_root_from_config, native_io_path
 from opensquilla.session.attachment_manifest import legacy_attachment_id
 from opensquilla.session.keys import canonicalize_session_key
-from opensquilla.tools.builtin.document_format_adapters import (
-    DocumentAdapterError,
-    DocumentFormatAdapter,
-    probe_document_format_adapter,
-    validate_editable_html_source,
-)
 
 _ATTACHMENT_ID_RE = re.compile(r"^att_[A-Za-z0-9_-]{8,160}$")
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -135,7 +132,6 @@ class _ImportSource:
 @dataclass(frozen=True, slots=True)
 class _FormatProfile:
     kind: ArtifactKind
-    adapter: DocumentFormatAdapter | None
     preview: bool
     editable: bool
     agent_editable: bool
@@ -434,52 +430,24 @@ def _format_profile(
     *,
     payload: bytes | None = None,
 ) -> _FormatProfile:
-    adapter = probe_document_format_adapter(
-        name=name,
-        media_type=mime,
-        source=payload,
-    )
-    if adapter is not None:
-        capabilities = adapter.capabilities()
+    if is_html(name, mime, payload):
+        reason = None
         if payload is not None:
             try:
-                source = payload.decode("utf-8", errors="strict")
+                validate_html(payload.decode("utf-8"))
             except UnicodeDecodeError:
-                return _FormatProfile(
-                    kind=ArtifactKind.HTML,
-                    adapter=adapter,
-                    preview=False,
-                    editable=False,
-                    agent_editable=False,
-                    selection_context=False,
-                    publishable=True,
-                    reason_code="html_encoding_unsupported",
-                )
-            try:
-                adapter.validate(source)
-            except DocumentAdapterError:
-                return _FormatProfile(
-                    kind=ArtifactKind.HTML,
-                    adapter=adapter,
-                    preview=False,
-                    editable=False,
-                    agent_editable=False,
-                    selection_context=False,
-                    publishable=True,
-                    reason_code="html_validation_failed",
-                )
+                reason = "html_encoding_unsupported"
+            except ValueError:
+                reason = "html_validation_failed"
+        supported = reason is None
         return _FormatProfile(
             kind=ArtifactKind.HTML,
-            adapter=adapter,
-            preview=capabilities.get("preview") is True,
-            editable=capabilities.get("manualEdit") is True,
-            agent_editable=capabilities.get("agentEdit") is True,
-            selection_context=(
-                capabilities.get("selectionContext") is True
-                or capabilities.get("selection") is True
-            ),
+            preview=supported,
+            editable=supported,
+            agent_editable=supported,
+            selection_context=supported,
             publishable=True,
-            reason_code=None,
+            reason_code=reason,
         )
     suffix = Path(name).suffix.lower()
     if suffix == ".docx":
@@ -495,7 +463,6 @@ def _format_profile(
         # preview nor edit is advertised until a real renderer+adapter exists.
         return _FormatProfile(
             kind=kind,
-            adapter=None,
             preview=False,
             editable=False,
             agent_editable=False,
@@ -507,7 +474,6 @@ def _format_profile(
     preview = normalized_mime.startswith("image/") or normalized_mime == "application/pdf"
     return _FormatProfile(
         kind=kind,
-        adapter=None,
         preview=preview,
         editable=False,
         agent_editable=False,
@@ -529,7 +495,7 @@ def _effective_edit_reason(profile: _FormatProfile, *, editable: bool) -> str | 
     return profile.reason_code
 
 
-def _validated_import_source(source: _ImportSource) -> tuple[_ImportSource, DocumentFormatAdapter]:
+def _validated_import_source(source: _ImportSource) -> tuple[_ImportSource, None]:
     if not source.payload or len(source.payload) > _MAX_EDITABLE_HTML_BYTES:
         raise artifact_product_error(
             ArtifactProductErrorCode.RESOURCE_UNSUPPORTED,
@@ -551,20 +517,20 @@ def _validated_import_source(source: _ImportSource) -> tuple[_ImportSource, Docu
             ArtifactProductErrorCode.RESOURCE_UNSUPPORTED,
             reason_code="html_validation_failed",
         )
-    if profile.adapter is None or profile.adapter.format_id != "html" or not profile.editable:
+    if profile.kind is not ArtifactKind.HTML or not profile.editable:
         raise artifact_product_error(
             ArtifactProductErrorCode.RESOURCE_UNSUPPORTED,
             reason_code=profile.reason_code or "format_edit_not_supported",
         )
     try:
         text = source.payload.decode("utf-8")
-        validate_editable_html_source(text)
+        validate_html(text, max_bytes=_MAX_EDITABLE_HTML_BYTES)
     except UnicodeDecodeError:
         raise artifact_product_error(
             ArtifactProductErrorCode.RESOURCE_UNSUPPORTED,
             reason_code="html_encoding_unsupported",
         ) from None
-    except DocumentAdapterError:
+    except ValueError:
         raise artifact_product_error(
             ArtifactProductErrorCode.RESOURCE_UNSUPPORTED,
             reason_code="html_validation_failed",
@@ -579,7 +545,7 @@ def _validated_import_source(source: _ImportSource) -> tuple[_ImportSource, Docu
             sha256=source.sha256,
             payload=source.payload,
         )
-    return source, profile.adapter
+    return source, None
 
 
 async def adopt_generated_deliverable_if_editable(
@@ -590,8 +556,9 @@ async def adopt_generated_deliverable_if_editable(
     session_id: str,
     ref: ArtifactRef,
     actor: Actor | None = None,
+    working_source: dict[str, str] | None = None,
 ) -> tuple[Document, Revision, DocumentSourceBinding, bool] | None:
-    """Materialize one generated single-file HTML deliverable as a Document.
+    """Associate a generated HTML deliverable and its complete resource bundle with a document.
 
     Unsupported material returns ``None`` so publication remains successful
     and read-only. Storage or integrity failures still raise so the turn
@@ -599,7 +566,8 @@ async def adopt_generated_deliverable_if_editable(
     """
 
     editable = await asyncio.to_thread(
-        store.supports_single_file_editing,
+        _bundle_available,
+        store,
         ref.id,
         session_id=session_id,
     )
@@ -646,6 +614,7 @@ async def adopt_generated_deliverable_if_editable(
             byte_size=resolved.size,
         ),
         actor=actor or Actor(kind=ActorKind.SYSTEM, actor_id="generated-deliverable"),
+        working_source=working_source,
     )
     return commit.document, commit.revision, binding, created
 
@@ -658,7 +627,7 @@ def _attachment_payload(
     include_inline_url: bool,
 ) -> dict[str, Any]:
     base_profile = _format_profile(occurrence.name, occurrence.mime)
-    html_resource = base_profile.adapter is not None and base_profile.adapter.format_id == "html"
+    html_resource = base_profile.kind is ArtifactKind.HTML
     preview_reason_code: str | None
     edit_reason_code: str | None
     if html_resource and occurrence.size > _MAX_PREVIEWABLE_HTML_BYTES:
@@ -695,7 +664,7 @@ def _attachment_payload(
             # Immutable sources must be copied into a Document before any
             # selection-scoped or Agent mutation capability can exist.
             "selectionContext": False,
-            "manualEdit": editable,
+            "manualEdit": False,
             "agentEdit": False,
             # Compatibility summary retained for clients predating the
             # independent Workbench capability axes.
@@ -768,7 +737,7 @@ def _document_payload(
             "preview": profile.preview,
             "download": True,
             "selectionContext": effective_selection_context,
-            "manualEdit": effective_editable,
+            "manualEdit": False,
             "agentEdit": effective_agent_editable,
             # Compatibility summary retained for clients predating the
             # independent Workbench capability axes.
@@ -817,7 +786,7 @@ def _deliverable_payload(
             # Published artifacts remain immutable until copied into a
             # Document; preview never grants selection or mutation authority.
             "selectionContext": False,
-            "manualEdit": effective_importable,
+            "manualEdit": False,
             "agentEdit": False,
             # Compatibility summary retained for clients predating the
             # independent Workbench capability axes.
@@ -899,7 +868,8 @@ async def _resource_inventory(
             continue
         try:
             importable = await asyncio.to_thread(
-                store.supports_single_file_editing,
+                _bundle_available,
+                store,
                 deliverable.id,
                 session_id=session_id,
             )
@@ -927,7 +897,8 @@ async def _resource_inventory(
         if trusted_capabilities:
             try:
                 trusted_capabilities = await asyncio.to_thread(
-                    store.supports_single_file_editing,
+                    _bundle_available,
+                    store,
                     head.artifact_id,
                     session_id=session_id,
                 )
@@ -1080,21 +1051,11 @@ def _preview_payload(resource: dict[str, Any], payload: bytes, *, mode: str) -> 
         str(resource.get("mime") or ""),
         payload=payload,
     )
-    adapter_payload: dict[str, object] | None = None
-    if profile.adapter is not None:
-        try:
-            source = payload.decode("utf-8")
-            adapter_payload = profile.adapter.preview(source)
-        except UnicodeDecodeError:
-            raise artifact_product_error(
-                ArtifactProductErrorCode.RESOURCE_UNSUPPORTED,
-                reason_code="html_encoding_unsupported",
-            ) from None
-        except DocumentAdapterError:
-            raise artifact_product_error(
-                ArtifactProductErrorCode.RESOURCE_UNSUPPORTED,
-                reason_code="html_validation_failed",
-            ) from None
+    if not profile.preview:
+        raise artifact_product_error(
+            ArtifactProductErrorCode.RESOURCE_UNSUPPORTED,
+            reason_code=profile.reason_code or "format_preview_not_supported",
+        )
     return {
         "protocolVersion": 1,
         "mode": mode,
@@ -1102,7 +1063,7 @@ def _preview_payload(resource: dict[str, Any], payload: bytes, *, mode: str) -> 
         "launchUrl": resource.get("downloadUrl"),
         "sandboxProfile": "opaque-offline",
         "network": False,
-        "adapter": adapter_payload,
+        "format": profile.kind.value,
     }
 
 
@@ -1143,7 +1104,8 @@ async def _resolve_import_source(
     store = ArtifactStore(media_root_from_config(ctx.config))
     try:
         importable = await asyncio.to_thread(
-            store.supports_single_file_editing,
+            _bundle_available,
+            store,
             ref.id,
             session_id=session_id,
         )
@@ -1227,6 +1189,7 @@ async def _ensure_internal_candidate(
     artifact: ArtifactBlobRef,
     payload: bytes | None,
     source: str,
+    bundle_artifact_id: str | None = None,
 ) -> ArtifactRef:
     store = ArtifactStore(media_root_from_config(ctx.config))
     deadline = asyncio.get_running_loop().time() + _CANDIDATE_PUBLICATION_WAIT_SECONDS
@@ -1245,17 +1208,38 @@ async def _ensure_internal_candidate(
                     operation="documents.candidate.restore",
                 ) from None
             try:
-                existing = await asyncio.to_thread(
-                    store.publish_bytes,
-                    payload,
-                    session_id=session_id,
-                    session_key=session_key,
-                    name=artifact.filename,
-                    mime=artifact.media_type,
-                    source=source,
-                    visibility="internal",
-                    artifact_id=artifact.artifact_id,
-                )
+                if bundle_artifact_id is not None:
+                    from opensquilla.artifact_session.working_files import load_version_bundle
+
+                    bundle = await asyncio.to_thread(
+                        load_version_bundle,
+                        store,
+                        bundle_artifact_id,
+                        session_id,
+                    )
+                    existing = await asyncio.to_thread(
+                        store.publish_bundle,
+                        bundle,
+                        session_id=session_id,
+                        session_key=session_key,
+                        name=artifact.filename,
+                        mime=artifact.media_type,
+                        source=source,
+                        visibility="internal",
+                        artifact_id=artifact.artifact_id,
+                    )
+                else:
+                    existing = await asyncio.to_thread(
+                        store.publish_bytes,
+                        payload,
+                        session_id=session_id,
+                        session_key=session_key,
+                        name=artifact.filename,
+                        mime=artifact.media_type,
+                        source=source,
+                        visibility="internal",
+                        artifact_id=artifact.artifact_id,
+                    )
             except FileExistsError:
                 # Another request owns this candidate bucket but may not have
                 # made meta.json visible yet. Never delete or rewrite that
@@ -1557,6 +1541,7 @@ async def _document_import(
                 artifact=candidate,
                 payload=None,
                 source="document_import",
+                bundle_artifact_id=resource_id if source_type == "deliverable" else None,
             )
         except RpcHandlerError as exc:
             if exc.code not in {
@@ -1588,6 +1573,7 @@ async def _document_import(
             artifact=candidate,
             payload=payload,
             source="document_import",
+            bundle_artifact_id=resource_id if source_type == "deliverable" else None,
         )
         result = await service.apply_document_import_attempt(
             session_id=session_id,
@@ -1801,6 +1787,16 @@ async def _current_document_open_response(
         response["binding"] = _binding_payload(binding)
     if receipt is not None:
         response["receipt"] = receipt
+    if _format_profile(document.name, head.media_type).kind is ArtifactKind.HTML:
+        working = await ensure_document_working_files(
+            ctx,
+            service=service,
+            session_key=session_key,
+            session_id=session_id,
+            document_id=document_id,
+        )
+        response["workingFile"] = str(working.entry)
+        response["pageContext"] = {"resourceId": f"document:{document_id}"}
     return response
 
 
@@ -1876,6 +1872,43 @@ async def _mutation_resolve(
             document_id=document_id,
         )
         turn_id = f"{_MUTATION_OPERATION_TURN_PREFIX[operation]}:{request_id}"
+        change = await service.get_change_set_by_turn(
+            document_id=document_id,
+            turn_id=turn_id,
+        )
+        if change is not None:
+            applied_revision_id = change.applied_revision_id
+            applied = change.status is ChangeSetStatus.APPLIED and applied_revision_id is not None
+            restored_state = None
+            if applied:
+                assert applied_revision_id is not None
+                revision = await service.get_revision(applied_revision_id)
+                try:
+                    restored_state = head_restore_receipt_state_revision(change, revision)
+                except ArtifactConflictError as receipt_error:
+                    raise _conflict(receipt_error) from receipt_error
+                if (
+                    revision.document_id != document_id
+                    or (restored_state is None and revision.change_set_id != change.change_set_id)
+                    or revision.artifact_id != change.candidate_artifact_id
+                    or revision.artifact_sha256 != change.candidate_artifact_sha256
+                ):
+                    raise _conflict(ArtifactConflictError("Version receipt is inconsistent"))
+            response = await _mutation_resolution_payload(
+                service,
+                session_key=session_key,
+                session_id=session_id,
+                status=MutationAttemptStatus.APPLIED
+                if applied
+                else MutationAttemptStatus.AMBIGUOUS,
+                document_id=document_id,
+                revision_id=change.applied_revision_id,
+            )
+            if restored_state is not None:
+                response["result"]["stateRevision"] = restored_state
+            return response
+        # Older clients stored version-restoration receipts in the retired
+        # mutation journal. Reading them does not admit a new writer.
         try:
             mutation_attempt = await service.get_mutation_attempt_for_resolution(
                 document_id=document_id,
@@ -2056,7 +2089,7 @@ async def _resources_open(
         )
 
     capabilities = resource.get("capabilities")
-    if not isinstance(capabilities, dict) or capabilities.get("manualEdit") is not True:
+    if not isinstance(capabilities, dict) or capabilities.get("edit") is not True:
         return _readonly_open_response(resource)
     sha256 = resource.get("sha256")
     if not isinstance(sha256, str) or _SHA256_RE.fullmatch(sha256) is None:
@@ -2239,6 +2272,7 @@ async def _document_publish(
                 artifact=candidate,
                 payload=source_payload,
                 source="document_publish",
+                bundle_artifact_id=source_revision.artifact_id,
             )
             result = await service.apply_document_publish_attempt(
                 session_id=session_id,
@@ -2346,3 +2380,60 @@ __all__ = [
     "adopt_generated_deliverable_if_editable",
     "resolve_recovery_import_source",
 ]
+
+
+def _bundle_available(store: ArtifactStore, artifact_id: str, *, session_id: str) -> bool:
+    store.validate_preview_bundle(artifact_id, session_id=session_id)
+    return True
+
+
+async def ensure_document_working_files(
+    ctx: RpcContext,
+    *,
+    service: ArtifactSessionService,
+    session_key: str,
+    session_id: str,
+    document_id: str,
+) -> Any:
+    from opensquilla.agents.scope import resolve_agent_workspace_dir
+    from opensquilla.artifact_session.working_files import ensure_working_files
+    from opensquilla.gateway.project_workspace_runtime import authoritative_project_run_context
+    from opensquilla.session.keys import parse_agent_id
+
+    storage = get_session_storage(ctx.session_manager)
+    if storage is None:
+        raise artifact_product_error(
+            ArtifactProductErrorCode.DOCUMENT_UNAVAILABLE,
+            reason_code="service_unavailable",
+        )
+    session = await storage.get_session(session_key)
+    default = resolve_agent_workspace_dir(parse_agent_id(session_key), ctx.config)
+    run_context, _guard = await authoritative_project_run_context(
+        storage=storage,
+        session_manager=ctx.session_manager,
+        session=session,
+        config=ctx.config,
+        default_workspace=str(default) if default is not None else None,
+    )
+    if not run_context.workspace:
+        raise artifact_product_error(
+            ArtifactProductErrorCode.DOCUMENT_UNAVAILABLE,
+            reason_code="workspace_unavailable",
+        )
+    binding = await ensure_working_files(
+        service,
+        ArtifactStore(media_root_from_config(ctx.config)),
+        document_id=document_id,
+        session_key=session_key,
+        session_id=session_id,
+        workspace=run_context.workspace,
+    )
+    preview = getattr(ctx, "artifact_preview_service", None)
+    if preview is not None:
+        head = await service.get_document_head(document_id)
+        preview.register_working_files(
+            session_id=session_id,
+            artifact_id=head.revision.artifact_id,
+            binding=binding,
+        )
+    return binding

@@ -163,7 +163,7 @@ function lifecycleFixture(options = {}) {
     desktopUpdateCheckScheduler: { stop: () => { calls.schedulerStops += 1 } },
     artifactPreviewLeaseBroker: { clear: () => {}, revokeAll: async () => {} },
     nativeWorkbenchSurfaces: { destroyAll: async () => {} },
-    desktopArtifactBridgeLoopback: { close: async () => {} },
+    desktopBrowser: { close: async () => {} },
     destroyWindowsTray: () => { f.context.windowsTray = null },
     stopGateway: () => {},
     quitGatewayDrainPromise: null,

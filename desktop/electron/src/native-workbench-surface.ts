@@ -40,6 +40,7 @@ import {
   nativeWorkbenchDownloadAllowed,
   nativeWorkbenchMissingResourceIsLocal,
   nativeWorkbenchNetworkUrlAllowed,
+  parseNativeWorkbenchNavigationUrl,
   nativeWorkbenchV2NetworkUrlAllowed,
   type NativeWorkbenchCreateRequest,
   type NativeWorkbenchNavigationRequest,
@@ -49,18 +50,7 @@ import {
   type NativeWorkbenchSurfaceRect,
   type NativeWorkbenchSurfaceRectRequest,
 } from './native-workbench-surface-contract.js'
-import type {
-  DesktopArtifactAnnotationProofV2,
-  DesktopArtifactBrowserActRequest,
-  DesktopArtifactBrowserActResult,
-  DesktopArtifactBrowserInspectRequest,
-  DesktopArtifactBrowserSnapshot,
-  DesktopArtifactFocusAnnotationRequest,
-} from './desktop-artifact-bridge-contract.js'
-import type {
-  DesktopArtifactBridgeTarget,
-  DesktopArtifactBridgeTargetBinding,
-} from './desktop-artifact-bridge.js'
+import { DesktopBrowserError, type DesktopBrowserRequest } from './desktop-browser.js'
 import { installDesktopZoomShortcuts } from './desktop-zoom-shortcuts.js'
 
 function artifactHtmlCsp(allowRemoteResources: boolean): string {
@@ -89,20 +79,13 @@ interface NativeWorkbenchSurfaceRecord {
   version: NativeWorkbenchCreateRequest['version']
   kind: NativeWorkbenchCreateRequest['kind']
   mode: NativeWorkbenchPreviewMode
-  canonicalMode: NativeWorkbenchPreviewMode
   scopeId: string
-  activePreviewArtifactId: string | null
   handle: string | null
   documentUrl: string
   expectedOrigin: string | null
-  canonicalDocumentUrl: string
-  canonicalExpectedOrigin: string | null
-  canonicalPreviewArtifactId: string | null
-  candidatePreview: {
-    handle: string
-    leaseId: string
-    artifactId: string
-  } | null
+  targetRef: string
+  revisionTimer: NodeJS.Timeout | null
+  revisionRequest: AbortController | null
   owner: BrowserWindow
   previewSession: Session
   view: WebContentsView
@@ -113,8 +96,6 @@ interface NativeWorkbenchSurfaceRecord {
   disposed: boolean
   crashed: boolean
   cleanupPromise: Promise<void> | null
-  artifactBridgePins: number
-  uiReleaseRequested: boolean
   missingResourceReported: boolean
   blockedNetworkReported: boolean
   privilegedOriginReported: boolean
@@ -131,23 +112,15 @@ interface NativeWorkbenchSurfaceRecord {
   annotationFocusTimer: NodeJS.Timeout | null
   annotationPickerActive: boolean
   annotationPickerEpoch: number
-  /** True only after the current v4 preview navigation reaches did-finish-load. */
+  /** True only after the current preview navigation reaches did-finish-load. */
   browserDocumentReady: boolean
   /** Set by CDP Runtime.exceptionThrown until the next successful navigation. */
   browserRuntimeException: boolean
-  /** Legacy WebRTC-only guard for an offline canonical preview. */
+  /** WebRTC guard for an offline preview. */
   offlineRealmGuardInstalled: boolean
-  /** CDP id for the legacy WebRTC-only guard. */
+  /** CDP id for the offline WebRTC guard. */
   offlineRealmGuardScriptId: string | null
-  /** Candidate-only network side-effect guard layered over the WebRTC guard. */
-  candidateOfflineRealmGuardInstalled: boolean
-  /** CDP id for the candidate-only network side-effect guard. */
-  candidateOfflineRealmGuardScriptId: string | null
-  /**
-   * Anchors issued by the last browserInspect call.  They are intentionally
-   * held in the main process and are invalidated on every top-level or
-   * in-page navigation and whenever a fresh snapshot is requested.
-   */
+  browserObjectGroup: string | null
   browserAnchors: Map<string, NativeWorkbenchBrowserAnchor>
   browserAnchorGeneration: number
   cdpQueue: Promise<void>
@@ -155,50 +128,13 @@ interface NativeWorkbenchSurfaceRecord {
   debuggerExpectedDetach: boolean
 }
 
-interface NativeWorkbenchArtifactBridgeBindingState {
-  record: NativeWorkbenchSurfaceRecord
-  target: DesktopArtifactBridgeTarget
-  previewPin: NativeWorkbenchArtifactPreviewPin
-  generation: number
-  recoveryAttempted: boolean
-  terminal: boolean
-  released: boolean
-  candidateHandle: string | null
-}
-
-interface NativeWorkbenchArtifactPreviewGrant {
-  launchUrl: string
-  expectedOrigin: string
-  scopeId: string
-  mode: NativeWorkbenchPreviewMode
-}
-
-interface NativeWorkbenchArtifactPreviewPin {
-  currentGrant(): NativeWorkbenchArtifactPreviewGrant
-  ensureCurrent(): Promise<NativeWorkbenchArtifactPreviewGrant | null>
-  release(): Promise<void>
-}
-
 interface NativeWorkbenchBrowserAnchor {
-  elementPath: string
+  objectId: string
   documentGeneration: number
-  anchorGeneration: number
-  surfaceId: string
-  scopeId: string
-  activePreviewArtifactId: string | null
-  /**
-   * The opaque Gateway handle transitively binds this anchor to the
-   * candidate SHA/epoch.  The native process deliberately does not receive
-   * those source-level values, but it must still compare the handle when an
-   * anchor is consumed.
-   */
-  candidateHandle: string | null
-  expiresAt: number
 }
 
 interface NativeWorkbenchAnnotationCandidate {
   selection: NativeWorkbenchAnnotationSelection
-  annotationProofV2?: DesktopArtifactAnnotationProofV2
   viewportWidth: number
   viewportHeight: number
   documentGeneration: number
@@ -206,25 +142,6 @@ interface NativeWorkbenchAnnotationCandidate {
   objectId: string
   geometryTimer: NodeJS.Timeout | null
   geometryRefreshPending: boolean
-}
-
-type AnnotationProofV2MismatchReason =
-  | 'proof-v2-unavailable'
-  | 'stable-proof-mismatch'
-  | 'ancestor-class-token-removed'
-
-function annotationProofV2MismatchReason(
-  expected: DesktopArtifactAnnotationProofV2 | undefined,
-  runtime: DesktopArtifactAnnotationProofV2 | undefined,
-): AnnotationProofV2MismatchReason | null {
-  if (!expected || !runtime) return 'proof-v2-unavailable'
-  if (expected.stableElementProofSha256 !== runtime.stableElementProofSha256) {
-    return 'stable-proof-mismatch'
-  }
-  const runtimeCommitments = new Set(runtime.ancestorClassCommitments)
-  return expected.ancestorClassCommitments.every(commitment => (
-    runtimeCommitments.has(commitment)
-  )) ? null : 'ancestor-class-token-removed'
 }
 
 interface NativeWorkbenchAnnotationOverlayBinding {
@@ -289,50 +206,11 @@ const NATIVE_WORKBENCH_ANNOTATION_OVERLAY_PRELOAD = fileURLToPath(new URL(
 ))
 const NATIVE_WORKBENCH_EXTERNAL_PROTOCOLS = new Set(['mailto:', 'sms:', 'tel:'])
 const NATIVE_WORKBENCH_OFFLINE_WEBRTC_CSP = "webrtc 'block'"
-const nativeWorkbenchOfflineRealmGuardSource = (blockNetworkSideEffects: boolean): string => `(() => {
-  const blockedConstructors = [
-    'RTCPeerConnection',
-    'webkitRTCPeerConnection',
-    'mozRTCPeerConnection',
-    'RTCIceGatherer',
-    'RTCIceTransport',
-    'RTCDtlsTransport',
-    'RTCSctpTransport',
-    'RTCQuicTransport',
-  ]
-  for (const name of blockedConstructors) {
-    try {
-      Object.defineProperty(globalThis, name, {
-        configurable: false,
-        enumerable: false,
-        value: undefined,
-        writable: false,
-      })
-    } catch {}
+const NATIVE_WORKBENCH_OFFLINE_REALM_GUARD = `(() => {
+  for (const name of ['RTCPeerConnection', 'webkitRTCPeerConnection', 'mozRTCPeerConnection', 'RTCIceGatherer', 'RTCIceTransport', 'RTCDtlsTransport', 'RTCSctpTransport', 'RTCQuicTransport']) {
+    try { Object.defineProperty(globalThis, name, { configurable: false, value: undefined, writable: false }) } catch {}
   }
-  ${blockNetworkSideEffects ? `
-  const deny = () => { throw new Error('offline preview side effect denied') }
-  for (const name of ['fetch', 'WebSocket', 'EventSource', 'XMLHttpRequest']) {
-    try {
-      Object.defineProperty(globalThis, name, {
-        configurable: false,
-        enumerable: false,
-        value: deny,
-        writable: false,
-      })
-    } catch {}
-  }
-  try { Object.defineProperty(navigator, 'sendBeacon', { value: deny, configurable: false }) } catch {}
-  try {
-    Object.defineProperty(globalThis, 'open', { value: deny, configurable: false })
-    Object.defineProperty(HTMLFormElement.prototype, 'submit', { value: deny, configurable: false })
-    Object.defineProperty(HTMLFormElement.prototype, 'requestSubmit', { value: deny, configurable: false })
-  } catch {}
-  ` : ''}
 })()`
-const NATIVE_WORKBENCH_OFFLINE_REALM_GUARD = nativeWorkbenchOfflineRealmGuardSource(false)
-const NATIVE_WORKBENCH_CANDIDATE_OFFLINE_REALM_GUARD =
-  nativeWorkbenchOfflineRealmGuardSource(true)
 const NATIVE_WORKBENCH_PROMPTABLE_PERMISSIONS = new Set([
   'clipboard-read',
   'clipboard-sanitized-write',
@@ -352,145 +230,27 @@ const NATIVE_WORKBENCH_ANNOTATION_HIGHLIGHT_CONFIG = Object.freeze({
   marginColor: { r: 25, g: 118, b: 255, a: 0.08 },
 })
 
-// This is the only JavaScript the annotation picker may execute. No caller
-// value is interpolated into it. It runs in a main-frame isolated world and
-// returns only a bounded structural fingerprint and geometry candidate.
+// Inspect the selected node in an isolated world; page content remains untrusted context.
 const NATIVE_WORKBENCH_ANNOTATION_INSPECT_FUNCTION = `function () {
   const selected = this
-  if (
-    window.top !== window
-    || !(selected instanceof Element)
-    || !selected.isConnected
-    || selected.ownerDocument !== document
-    || selected.getRootNode() !== document
-  ) return { ok: false, reason: 'unsupported-node' }
-
-  const htmlNamespace = 'http://www.w3.org/1999/xhtml'
-  const normalizedNamespace = node => node.namespaceURI === htmlNamespace
-    ? ''
-    : (node.namespaceURI || '')
-  const compareJsonKeysByCodePoint = (left, right) => {
-    const leftPoints = Array.from(JSON.stringify(left), value => value.codePointAt(0))
-    const rightPoints = Array.from(JSON.stringify(right), value => value.codePointAt(0))
-    const length = Math.min(leftPoints.length, rightPoints.length)
-    for (let index = 0; index < length; index += 1) {
-      if (leftPoints[index] !== rightPoints[index]) return leftPoints[index] - rightPoints[index]
-    }
-    return leftPoints.length - rightPoints.length
-  }
+  if (window.top !== window || !(selected instanceof Element) || !selected.isConnected || selected.ownerDocument !== document || selected.getRootNode() !== document) return { ok: false }
   const segments = []
-  const proofTokens = []
-  const stableProofTokens = []
-  const ancestorClassTokens = []
-  let current = selected
-  while (current) {
-    if (segments.length >= 128) return { ok: false, reason: 'path-too-deep' }
-    const namespace = normalizedNamespace(current)
-    const tagName = (current.localName || current.tagName || '').toLowerCase()
+  for (let node = selected; node; node = node.parentElement) {
+    if (segments.length >= 128) return { ok: false }
     let index = 1
-    for (let sibling = current.previousElementSibling; sibling; sibling = sibling.previousElementSibling) {
-      if (
-        normalizedNamespace(sibling) === namespace
-        && (sibling.localName || sibling.tagName || '').toLowerCase() === tagName
-      ) index += 1
-    }
-    segments.unshift([namespace, tagName, index])
-    const attributes = Array.from(current.attributes, attribute => [
-      attribute.namespaceURI || '',
-      attribute.localName || attribute.name,
-      attribute.value,
-    ]).sort(compareJsonKeysByCodePoint)
-    proofTokens.unshift([namespace, tagName, index, attributes])
-    stableProofTokens.unshift([
-      namespace,
-      tagName,
-      index,
-      attributes.filter(attribute => !(attribute[0] === '' && attribute[1] === 'class')),
-    ])
-    const tokens = attributes
-      .filter(attribute => attribute[0] === '' && attribute[1] === 'class')
-      .flatMap(attribute => attribute[2].split(/[\\t\\n\\f\\r ]+/).filter(Boolean))
-    ancestorClassTokens.unshift(Array.from(new Set(tokens)))
-    current = current.parentElement
+    for (let sibling=node.previousElementSibling; sibling; sibling=sibling.previousElementSibling) if (sibling.localName === node.localName) index++
+    segments.unshift(CSS.escape(node.localName) + ':nth-of-type(' + index + ')')
   }
-  const elementPath = JSON.stringify(segments)
-  if (!elementPath || elementPath.length > 4096) {
-    return { ok: false, reason: 'path-too-large' }
-  }
-  const proofEncoded = new TextEncoder().encode(
-    proofTokens.map(token => JSON.stringify(token)).join('\\n'),
-  )
-  if (proofEncoded.byteLength > 4194304) {
-    return { ok: false, reason: 'element-proof-too-large' }
-  }
-  const stableProofEncoded = new TextEncoder().encode(
-    stableProofTokens.map(token => JSON.stringify(token)).join('\\n'),
-  )
-  let proofV2Available = true
-  let ancestorClassTokenBytes = 0
-  let ancestorClassTokenCount = 0
-  const ancestorClassCommitmentInputs = []
-  for (let depth = 0; depth < ancestorClassTokens.length; depth += 1) {
-    for (const token of ancestorClassTokens[depth]) {
-      ancestorClassTokenCount += 1
-      ancestorClassTokenBytes += new TextEncoder().encode(token).byteLength
-      ancestorClassCommitmentInputs.push([depth, token])
-    }
-  }
-  if (ancestorClassTokenCount > 256 || ancestorClassTokenBytes > 65536) {
-    proofV2Available = false
-  }
-
+  const locatorHint = segments.join(' > ')
   const rect = selected.getBoundingClientRect()
   const viewport = window.visualViewport
-  const toHex = buffer => Array.from(
-    new Uint8Array(buffer),
-    byte => byte.toString(16).padStart(2, '0'),
-  ).join('')
-  return Promise.all([
-    crypto.subtle.digest('SHA-256', proofEncoded),
-    crypto.subtle.digest('SHA-256', stableProofEncoded),
-  ]).then(async ([elementProofBuffer, stableElementProofBuffer]) => {
-    const stableElementProofSha256 = toHex(stableElementProofBuffer)
-    let annotationProofV2
-    if (proofV2Available) {
-      const commitmentBuffers = await Promise.all(
-        ancestorClassCommitmentInputs.map(([depth, token]) => crypto.subtle.digest(
-          'SHA-256',
-          new TextEncoder().encode(JSON.stringify([
-            'opensquilla.annotation.ancestor-class.v2',
-            stableElementProofSha256,
-            depth,
-            token,
-          ])),
-        )),
-      )
-      annotationProofV2 = {
-        stableElementProofSha256,
-        ancestorClassCommitments: Array.from(new Set(commitmentBuffers.map(toHex))).sort(),
-      }
-    }
-    return {
-      ok: true,
-      tagName: (selected.localName || selected.tagName || '').toLowerCase(),
-      elementPath,
-      elementProofSha256: toHex(elementProofBuffer),
-      ...(annotationProofV2 ? { annotationProofV2 } : {}),
-      rect: {
-        x: rect.x,
-        y: rect.y,
-        width: rect.width,
-        height: rect.height,
-      },
-      viewportWidth: viewport ? viewport.width : window.innerWidth,
-      viewportHeight: viewport ? viewport.height : window.innerHeight,
-    }
-  })
+  return { ok: true, tagName: selected.localName, elementPath: locatorHint, locatorHint,
+    selectionText: (selected.innerText || selected.textContent || '').slice(0,4096),
+    rect: {x:rect.x,y:rect.y,width:rect.width,height:rect.height},
+    viewportWidth: viewport ? viewport.width : window.innerWidth,
+    viewportHeight: viewport ? viewport.height : window.innerHeight }
 }`
 
-// Geometry refresh deliberately avoids re-running the element proof. The full
-// fixed inspector is re-run before opening the editor and again when Gateway
-// resolves the opaque selection.
 const NATIVE_WORKBENCH_ANNOTATION_GEOMETRY_FUNCTION = `function () {
   const selected = this
   if (
@@ -515,46 +275,6 @@ const NATIVE_WORKBENCH_ANNOTATION_GEOMETRY_FUNCTION = `function () {
   }
 }`
 
-// The authenticated Gateway supplies a server-revalidated canonical element
-// path. This fixed function has no selector or JavaScript input surface: it
-// walks element children by namespace, local name and 1-based sibling index.
-const NATIVE_WORKBENCH_ANNOTATION_FIND_BY_PATH_FUNCTION = `function (elementPath) {
-  if (window.top !== window || this !== document.documentElement) return null
-  let segments
-  try { segments = JSON.parse(elementPath) } catch { return null }
-  if (!Array.isArray(segments) || segments.length < 1 || segments.length > 128) return null
-  const htmlNamespace = 'http://www.w3.org/1999/xhtml'
-  const normalizedNamespace = node => node.namespaceURI === htmlNamespace
-    ? ''
-    : (node.namespaceURI || '')
-  const matches = (node, segment) => Array.isArray(segment)
-    && segment.length === 3
-    && typeof segment[0] === 'string'
-    && typeof segment[1] === 'string'
-    && Number.isSafeInteger(segment[2])
-    && segment[2] >= 1
-    && normalizedNamespace(node) === segment[0]
-    && (node.localName || node.tagName || '').toLowerCase() === segment[1]
-  let current = this
-  if (!matches(current, segments[0]) || segments[0][2] !== 1) return null
-  for (let depth = 1; depth < segments.length; depth += 1) {
-    const segment = segments[depth]
-    let index = 0
-    let matched = null
-    for (const child of current.children) {
-      if (!matches(child, segment)) continue
-      index += 1
-      if (index === segment[2]) {
-        matched = child
-        break
-      }
-    }
-    if (!matched) return null
-    current = matched
-  }
-  return current
-}`
-
 const NATIVE_WORKBENCH_ANNOTATION_SCROLL_FUNCTION = `function () {
   const selected = this
   if (
@@ -574,214 +294,6 @@ const NATIVE_WORKBENCH_ANNOTATION_SCROLL_FUNCTION = `function () {
     viewportHeight: viewport ? viewport.height : window.innerHeight,
   }
 }`
-
-// Browser-agent inspection/actions deliberately use fixed function bodies.
-// The model may supply only an opaque anchor and bounded scalar arguments;
-// there is no selector, URL, JavaScript expression or CDP method surface.
-const NATIVE_WORKBENCH_BROWSER_SNAPSHOT_FUNCTION = `function (scope, maxNodes) {
-  if (window.top !== window || !document.documentElement) {
-    return { ok: false, reason: 'unsupported-preview' }
-  }
-  const htmlNamespace = 'http://www.w3.org/1999/xhtml'
-  const normalizedNamespace = node => node.namespaceURI === htmlNamespace
-    ? ''
-    : (node.namespaceURI || '')
-  const pathFor = selected => {
-    const segments = []
-    let current = selected
-    while (current) {
-      if (segments.length >= 128) return null
-      const namespace = normalizedNamespace(current)
-      const tagName = (current.localName || current.tagName || '').toLowerCase()
-      let index = 1
-      for (let sibling = current.previousElementSibling; sibling; sibling = sibling.previousElementSibling) {
-        if (
-          normalizedNamespace(sibling) === namespace
-          && (sibling.localName || sibling.tagName || '').toLowerCase() === tagName
-        ) index += 1
-      }
-      segments.unshift([namespace, tagName, index])
-      current = current.parentElement
-    }
-    return JSON.stringify(segments)
-  }
-  const textFor = node => {
-    const text = (node.innerText || node.textContent || '').replace(/\\s+/g, ' ').trim()
-    return text ? text.slice(0, 512) : undefined
-  }
-  const nameFor = node => {
-    const aria = node.getAttribute('aria-label')
-    if (aria) return aria.slice(0, 256)
-    const title = node.getAttribute('title')
-    if (title) return title.slice(0, 256)
-    return textFor(node)
-  }
-  const interactiveFor = node => {
-    const tag = (node.localName || '').toLowerCase()
-    return ['a', 'button', 'input', 'select', 'textarea', 'option', 'summary'].includes(tag)
-      || node.hasAttribute('contenteditable')
-      || node.hasAttribute('tabindex')
-      || node.getAttribute('role') === 'button'
-  }
-  const visible = node => {
-    const style = getComputedStyle(node)
-    if (style.display === 'none' || style.visibility === 'hidden') return false
-    const rect = node.getBoundingClientRect()
-    return rect.width > 0 && rect.height > 0
-  }
-  const viewport = window.visualViewport
-  const viewportWidth = viewport ? viewport.width : window.innerWidth
-  const viewportHeight = viewport ? viewport.height : window.innerHeight
-  const active = document.activeElement instanceof Element ? document.activeElement : null
-  const elements = scope === 'selection' && active
-    ? [active]
-    : document.querySelectorAll('*')
-  // Do not allocate/inspect an unbounded DOM just because a generated page
-  // contains a large hidden tree.  The snapshot is intentionally a bounded
-  // diagnostic surface; callers can request another viewport/selection slice
-  // when the first bounded result is truncated.
-  const scanLimit = scope === 'selection'
-    ? elements.length
-    : Math.min(elements.length, Math.max(maxNodes * 20, 1_000))
-  const nodes = []
-  let truncated = false
-  for (let index = 0; index < scanLimit; index += 1) {
-    const node = elements[index]
-    if (!(node instanceof Element) || !visible(node)) continue
-    const rect = node.getBoundingClientRect()
-    if (scope === 'viewport' && (
-      rect.bottom <= 0 || rect.right <= 0
-      || rect.top >= viewportHeight || rect.left >= viewportWidth
-    )) continue
-    const elementPath = pathFor(node)
-    if (!elementPath || elementPath.length > 4096) continue
-    const anchor = 'a' + String(nodes.length + 1)
-    const roleValue = node.getAttribute('role')
-    const role = roleValue
-      ? roleValue.slice(0, 256)
-      : ((node.localName || '').toLowerCase() === 'button' ? 'button' : undefined)
-    nodes.push({
-      anchor,
-      elementPath,
-      role,
-      name: nameFor(node),
-      text: textFor(node),
-      interactive: interactiveFor(node),
-      disabled: node.hasAttribute('disabled') || node.getAttribute('aria-disabled') === 'true',
-      selected: node.getAttribute('aria-selected') === 'true' || node.matches(':checked'),
-    })
-    if (nodes.length >= maxNodes) {
-      truncated = true
-      break
-    }
-  }
-  if (elements.length > scanLimit) truncated = true
-  return { ok: true, scope, nodes, truncated }
-}`
-
-const NATIVE_WORKBENCH_BROWSER_CLICK_FUNCTION = `function (focusOnly) {
-  if (
-    window.top !== window
-    || !(this instanceof Element)
-    || !this.isConnected
-    || this.ownerDocument !== document
-    || this.getRootNode() !== document
-  ) return { ok: false, reason: 'unsupported-node' }
-  if (this.matches(':disabled,[aria-disabled="true"]')) return { ok: false, reason: 'disabled-node' }
-  const tag = (this.localName || '').toLowerCase()
-  const inputType = (this.getAttribute('type') || '').toLowerCase()
-  // Do not let an agent click a navigation link or submit a form.  The
-  // browser surface is for local preview verification; network/form side
-  // effects must remain user-driven.
-  if (!focusOnly && (
-      this.closest('form')
-      || this.hasAttribute('formaction')
-      || this.hasAttribute('download')
-      || tag === 'a'
-      || (tag === 'button' && inputType !== 'button')
-      || (tag === 'input' && ['submit', 'image', 'file'].includes(inputType))
-      || Array.from(this.attributes).some(attribute => attribute.name.toLowerCase().startsWith('on'))
-  )) return { ok: false, reason: 'side-effect-node' }
-  this.focus({ preventScroll: true })
-  if (!focusOnly) this.click()
-  return { ok: true, changed: !focusOnly }
-}`
-
-const NATIVE_WORKBENCH_BROWSER_TYPE_FUNCTION = `function (text, replace) {
-  if (
-    window.top !== window
-    || !(this instanceof Element)
-    || !this.isConnected
-    || this.ownerDocument !== document
-    || this.getRootNode() !== document
-  ) return { ok: false, reason: 'unsupported-node' }
-  if (this.matches(':disabled,[aria-disabled="true"]')) return { ok: false, reason: 'disabled-node' }
-  if (Array.from(this.attributes).some(attribute => attribute.name.toLowerCase().startsWith('on'))) {
-    return { ok: false, reason: 'side-effect-node' }
-  }
-  this.focus({ preventScroll: true })
-  const tag = (this.localName || '').toLowerCase()
-  if (tag === 'input' || tag === 'textarea') {
-    const control = this
-    const inputType = (control.getAttribute('type') || 'text').toLowerCase()
-    if (tag === 'input' && ['file', 'button', 'submit', 'image', 'reset', 'checkbox', 'radio', 'hidden'].includes(inputType)) {
-      return { ok: false, reason: 'not-text-input' }
-    }
-    const before = String(control.value || '')
-    if (replace) control.select()
-    const start = replace ? 0 : (control.selectionStart ?? before.length)
-    const end = replace ? before.length : (control.selectionEnd ?? start)
-    control.setRangeText(text, start, end, 'end')
-    control.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: text }))
-    control.dispatchEvent(new Event('change', { bubbles: true }))
-    return { ok: true, changed: before !== String(control.value || '') }
-  }
-  if (this.isContentEditable) {
-    const selection = window.getSelection()
-    if (replace && selection) {
-      const range = document.createRange()
-      range.selectNodeContents(this)
-      selection.removeAllRanges()
-      selection.addRange(range)
-    }
-    if (document.execCommand) document.execCommand('insertText', false, text)
-    else this.textContent = replace ? text : String(this.textContent || '') + text
-    this.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: text }))
-    return { ok: true, changed: true }
-  }
-  return { ok: false, reason: 'not-text-input' }
-}`
-
-const NATIVE_WORKBENCH_BROWSER_PRESS_FUNCTION = `function (key) {
-  if (window.top !== window || !document) return { ok: false, reason: 'unsupported-preview' }
-  const target = document.activeElement || document.body
-  const allowed = ['Enter','Tab','Escape','Backspace','Delete','Space','ArrowUp','ArrowDown','ArrowLeft','ArrowRight','Home','End','PageUp','PageDown']
-  if (!allowed.includes(key)) return { ok: false, reason: 'unsupported-key' }
-  if (key === 'Enter' && target instanceof Element && (
-    target.closest('form')
-      || target.matches('button,a,[role="button"],input[type="submit"],input[type="image"]')
-      || Array.from(target.attributes).some(attribute => attribute.name.toLowerCase().startsWith('on'))
-  )) {
-    return { ok: false, reason: 'side-effect-node' }
-  }
-  const normalized = key === 'Space' ? ' ' : key
-  const eventInit = { key: normalized, code: normalized === ' ' ? 'Space' : normalized, bubbles: true, cancelable: true }
-  const down = target.dispatchEvent(new KeyboardEvent('keydown', eventInit))
-  target.dispatchEvent(new KeyboardEvent('keypress', eventInit))
-  target.dispatchEvent(new KeyboardEvent('keyup', eventInit))
-  return { ok: true, changed: down }
-}`
-
-const NATIVE_WORKBENCH_BROWSER_SCROLL_FUNCTION = `function (direction, amount) {
-  if (window.top !== window || !document.scrollingElement) return { ok: false, reason: 'unsupported-preview' }
-  const distance = amount === 'page' ? Math.max(1, window.innerHeight * 0.8) : 160
-  const dx = direction === 'left' ? -distance : direction === 'right' ? distance : 0
-  const dy = direction === 'up' ? -distance : direction === 'down' ? distance : 0
-  document.scrollingElement.scrollBy({ left: dx, top: dy, behavior: 'auto' })
-  return { ok: true, changed: dx !== 0 || dy !== 0 }
-}`
-
-const NATIVE_WORKBENCH_BROWSER_ANCHOR_TTL_MS = 60_000
 
 const NATIVE_WORKBENCH_ANNOTATION_OVERLAY_HTML = `<!doctype html>
 <html lang="zh-CN">
@@ -1029,8 +541,6 @@ type NativeWorkbenchAnnotationLifecycleReason =
   | 'activate-failed'
   | 'preview-hide-failed'
   | 'picker-cancelled'
-  | 'candidate-preview-bound'
-  | 'candidate-preview-restored'
   | 'selection-stale'
   | 'selection-rejected'
   | 'debugger-detached'
@@ -1050,8 +560,6 @@ const NATIVE_WORKBENCH_ANNOTATION_LIFECYCLE_REASONS = new Set<string>([
   'activate-failed',
   'preview-hide-failed',
   'picker-cancelled',
-  'candidate-preview-bound',
-  'candidate-preview-restored',
   'selection-stale',
   'selection-rejected',
   'debugger-detached',
@@ -1080,38 +588,10 @@ export interface NativeWorkbenchSurfaceManagerOptions {
   emit(event: NativeWorkbenchSurfaceEvent): void
   forceArtifactPreviewsOffline?: boolean
   permissionTimeoutMs?: number
-  resolveCandidatePreview?: (
-    candidateHandle: string,
-    signal: AbortSignal,
-  ) => Promise<NativeWorkbenchCandidatePreviewBinding>
-  releaseCandidatePreview?: (
-    candidateHandle: string,
-    signal: AbortSignal,
-  ) => Promise<void>
-  pinArtifactPreview?: (
-    grant: NativeWorkbenchArtifactPreviewGrant,
-  ) => NativeWorkbenchArtifactPreviewPin | null
-}
-
-export interface NativeWorkbenchCandidatePreviewBinding {
-  candidateHandle: string
-  candidateArtifactId: string
-  leaseId: string
-  launchUrl: string
-  expectedOrigin: string
-  scopeId: string
-  mode: NativeWorkbenchPreviewMode
 }
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
-}
-
-function isArtifactBridgeProtocolVersion(
-  version: NativeWorkbenchSurfaceRecord['version'],
-): boolean {
-  return version === NATIVE_WORKBENCH_PROTOCOL_VERSION_V3
-    || version === NATIVE_WORKBENCH_PROTOCOL_VERSION_V4
 }
 
 function boundedAnnotationCdpError(error: unknown): string {
@@ -1255,17 +735,12 @@ export class NativeWorkbenchSurfaceManager {
   private readonly annotationOverlays = new Map<BrowserWindow, NativeWorkbenchAnnotationOverlayRecord>()
   private readonly hookedWindows = new WeakSet<BrowserWindow>()
   private readonly unresponsiveWindows = new WeakSet<BrowserWindow>()
-  private readonly artifactBridgeBindings = new Map<
-    string,
-    NativeWorkbenchArtifactBridgeBindingState
-  >()
   private activeSurfaceId: string | null = null
 
   constructor(private readonly options: NativeWorkbenchSurfaceManagerOptions) {}
 
   async createSurface(
     request: NativeWorkbenchCreateRequest,
-    activePreviewArtifactId: string | null = null,
   ): Promise<NativeWorkbenchSurfaceResult> {
     const pending = this.surfaces.get(request.surfaceId)
     if (pending) {
@@ -1278,23 +753,14 @@ export class NativeWorkbenchSurfaceManager {
     }
     return await this.queueSurfaceOperation(
       request.surfaceId,
-      () => this.createSurfaceNow(request, activePreviewArtifactId),
+      () => this.createSurfaceNow(request),
     )
   }
 
   private async createSurfaceNow(
     request: NativeWorkbenchCreateRequest,
-    activePreviewArtifactId: string | null,
   ): Promise<NativeWorkbenchSurfaceResult> {
     const previous = this.surfaces.get(request.surfaceId)
-    if (previous?.artifactBridgePins) {
-      return {
-        ok: false,
-        retryable: true,
-        code: 'AGENT_EDIT_IN_PROGRESS',
-        message: 'Agent editing is continuing in the background.',
-      }
-    }
     if (previous) await this.destroyRecord(previous)
     if (this.surfaces.size >= NATIVE_WORKBENCH_MAX_SURFACES) {
       return {
@@ -1335,22 +801,13 @@ export class NativeWorkbenchSurfaceManager {
       version: request.version,
       kind: request.kind,
       mode,
-      canonicalMode: mode,
       scopeId: request.payload.scopeId,
-      activePreviewArtifactId: (
-        request.kind === 'artifact-preview'
-        && /^art-[A-Za-z0-9_-]{1,200}$/.test(activePreviewArtifactId || '')
-      ) ? activePreviewArtifactId : null,
       handle,
       documentUrl,
       expectedOrigin,
-      canonicalDocumentUrl: documentUrl,
-      canonicalExpectedOrigin: expectedOrigin,
-      canonicalPreviewArtifactId: (
-        request.kind === 'artifact-preview'
-        && /^art-[A-Za-z0-9_-]{1,200}$/.test(activePreviewArtifactId || '')
-      ) ? activePreviewArtifactId : null,
-      candidatePreview: null,
+      targetRef: `page-${randomUUID()}`,
+      revisionTimer: null,
+      revisionRequest: null,
       owner,
       previewSession,
       view: new WebContentsView({
@@ -1381,8 +838,6 @@ export class NativeWorkbenchSurfaceManager {
       disposed: false,
       crashed: false,
       cleanupPromise: null,
-      artifactBridgePins: 0,
-      uiReleaseRequested: false,
       missingResourceReported: false,
       blockedNetworkReported: false,
       privilegedOriginReported: false,
@@ -1403,14 +858,14 @@ export class NativeWorkbenchSurfaceManager {
       browserRuntimeException: false,
       offlineRealmGuardInstalled: false,
       offlineRealmGuardScriptId: null,
-      candidateOfflineRealmGuardInstalled: false,
-      candidateOfflineRealmGuardScriptId: null,
+      browserObjectGroup: null,
       browserAnchors: new Map(),
       browserAnchorGeneration: 0,
       cdpQueue: Promise.resolve(),
       cdpReady: false,
       debuggerExpectedDetach: false,
     }
+    record.view.setBounds({ x: 0, y: 0, width: 960, height: 720 })
     record.removeZoomShortcuts = installDesktopZoomShortcuts(
       record.view.webContents,
       owner.webContents,
@@ -1428,10 +883,7 @@ export class NativeWorkbenchSurfaceManager {
       } else {
         await this.configureV2Session(record)
       }
-      if (
-        isArtifactBridgeProtocolVersion(request.version)
-        && request.kind === 'artifact-preview'
-      ) {
+      if (request.version !== NATIVE_WORKBENCH_PROTOCOL_VERSION) {
         try {
           await this.initializeAnnotationCdp(record)
         } catch (error) {
@@ -1457,6 +909,8 @@ export class NativeWorkbenchSurfaceManager {
       if (record.crashed) {
         return { ok: false, message: 'The native Workbench surface renderer failed.' }
       }
+      if (record.kind === 'artifact-preview') await this.watchWorkingPreview(record)
+      if (this.surfaces.get(record.id) !== record) return { ok: false, message: 'The browser page was closed.' }
       return { ok: true, surfaceInstanceId: record.surfaceInstanceId }
     } catch (error) {
       this.failRecord(record, 'error', { message: errorMessage(error) })
@@ -1519,7 +973,7 @@ export class NativeWorkbenchSurfaceManager {
         trustedOverlay: false,
         overlayCopyVersion: 1,
         atomicCloseRearm: true,
-        reason: 'No active protocol-v4 HTML artifact preview is available.',
+        reason: 'No active browser page is available.',
       }
     }
     if (!record.cdpReady || !record.view.webContents.debugger.isAttached()) {
@@ -1573,8 +1027,7 @@ export class NativeWorkbenchSurfaceManager {
       || record.annotationDocumentGeneration !== documentGeneration
       || this.surfaces.get(record.id) !== record
       || this.activeSurfaceId !== record.id
-      || record.kind !== 'artifact-preview'
-      || record.activePreviewArtifactId === null
+      || record.kind === 'artifact-html'
       || record.disposed
       || record.crashed
       || !record.visibleRequested
@@ -1717,7 +1170,7 @@ export class NativeWorkbenchSurfaceManager {
         // it can rebuild the preview once instead of surfacing IPC details.
         code: 'PREVIEW_CAPABILITY_EXPIRED',
         retryable: true,
-        message: 'Only the active protocol-v4 HTML artifact preview supports annotations.',
+        message: 'Open the browser page before annotating it.',
       }
     }
     if (!request.enabled) {
@@ -1977,7 +1430,7 @@ export class NativeWorkbenchSurfaceManager {
     if (
       this.activeSurfaceId === record.id
       && this.surfaces.get(record.id) === record
-      && isArtifactBridgeProtocolVersion(record.version)
+      && (record.version !== NATIVE_WORKBENCH_PROTOCOL_VERSION)
       && record.kind === 'artifact-preview'
       && !record.disposed
       && !record.crashed
@@ -1988,862 +1441,354 @@ export class NativeWorkbenchSurfaceManager {
     return { ok: true }
   }
 
-  /**
-   * Returns a capability-scoped binding to the UI-selected active surface.
-   * The binding intentionally carries no public surface identifier. Protocol
-   * v1/v2 surfaces cannot be upgraded into agent-control surfaces implicitly.
-   */
-  getActiveArtifactBridgeTarget(): DesktopArtifactBridgeTarget | null {
-    if (!this.activeSurfaceId) return null
-    const record = this.surfaces.get(this.activeSurfaceId)
-    if (
-      !record
-      || !isArtifactBridgeProtocolVersion(record.version)
-      || record.disposed
-      || record.crashed
-      || !record.visibleRequested
-      || !record.view.getVisible()
-      || record.view.webContents.isDestroyed()
-    ) return null
-    return this.artifactBridgeTargetForRecord(record)
-  }
-
-  private artifactBridgeTargetForRecord(
-    record: NativeWorkbenchSurfaceRecord,
-  ): DesktopArtifactBridgeTarget {
-    return {
-      protocolVersion: record.version === NATIVE_WORKBENCH_PROTOCOL_VERSION_V3
-        ? NATIVE_WORKBENCH_PROTOCOL_VERSION_V3
-        : NATIVE_WORKBENCH_PROTOCOL_VERSION_V4,
-      isCurrent: () => this.isActiveArtifactBridgeRecord(record),
-      capabilities: {
-        annotationProofV2: true,
-        captureSelection: false,
-        resolveAnnotationSelection: (
-          record.kind === 'artifact-preview'
-          && record.activePreviewArtifactId !== null
-          && record.cdpReady
-          && record.view.webContents.debugger.isAttached()
-        ),
-        focusAnnotation: (
-          record.kind === 'artifact-preview'
-          && record.activePreviewArtifactId !== null
-          && record.cdpReady
-          && record.view.webContents.debugger.isAttached()
-        ),
-        browserInspect: (
-          record.kind === 'artifact-preview'
-          && record.version === NATIVE_WORKBENCH_PROTOCOL_VERSION_V4
-          && record.activePreviewArtifactId !== null
-          && record.browserDocumentReady
-          && record.cdpReady
-          && record.view.webContents.debugger.isAttached()
-        ),
-        browserAct: (
-          record.kind === 'artifact-preview'
-          && record.version === NATIVE_WORKBENCH_PROTOCOL_VERSION_V4
-          // Agent actions are only safe against an opaque, turn-local
-          // candidate rendered in the forced-offline realm.  A canonical
-          // preview may be user-selected full mode and its event handlers can
-          // carry application side effects; exposing click/type/press there
-          // would bypass the candidate-loop safety boundary.
-          && record.candidatePreview !== null
-          && record.activePreviewArtifactId === record.candidatePreview.artifactId
-          && record.mode === 'offline'
-          && record.activePreviewArtifactId !== null
-          && record.browserDocumentReady
-          && record.cdpReady
-          && record.view.webContents.debugger.isAttached()
-        ),
-        // Screenshot/reload remain available to the v3 annotation path for
-        // compatibility.  The autonomous browser inspection/action surface
-        // above is still v4-only.
-        screenshot: (
-          record.kind === 'artifact-preview'
-          && record.activePreviewArtifactId !== null
-          && (
-            record.version === NATIVE_WORKBENCH_PROTOCOL_VERSION_V3
-            || (
-              record.version === NATIVE_WORKBENCH_PROTOCOL_VERSION_V4
-              && record.browserDocumentReady
-              && record.cdpReady
-              && record.view.webContents.debugger.isAttached()
-            )
-          )
-        ),
-        officeFlush: false,
-        reloadSurface: (
-          record.kind === 'artifact-preview'
-          && record.activePreviewArtifactId !== null
-          && (
-            record.version === NATIVE_WORKBENCH_PROTOCOL_VERSION_V3
-            || (
-              record.version === NATIVE_WORKBENCH_PROTOCOL_VERSION_V4
-              && record.browserDocumentReady
-              && record.cdpReady
-              && record.view.webContents.debugger.isAttached()
-            )
-          )
-        ),
-        bindCandidatePreview: (
-          record.kind === 'artifact-preview'
-          && record.version === NATIVE_WORKBENCH_PROTOCOL_VERSION_V4
-          && record.canonicalPreviewArtifactId !== null
-          && record.browserDocumentReady
-          && Boolean(this.options.resolveCandidatePreview)
-          && record.cdpReady
-          && record.view.webContents.debugger.isAttached()
-        ),
-        restoreCanonicalPreview: (
-          record.kind === 'artifact-preview'
-          && record.version === NATIVE_WORKBENCH_PROTOCOL_VERSION_V4
-          && record.canonicalPreviewArtifactId !== null
-          && Boolean(this.options.releaseCandidatePreview)
-          && record.cdpReady
-          && record.view.webContents.debugger.isAttached()
-        ),
-      },
-      resolveAnnotationSelection: async (request, signal) => {
-        this.assertActiveArtifactBridgeRecord(record, signal)
-        const candidate = record.annotationCandidate
-        if (
-          record.kind !== 'artifact-preview'
-          || !record.activePreviewArtifactId
-          || request.activePreviewArtifactId !== record.activePreviewArtifactId
-          || !record.cdpReady
-          || !candidate
-          || candidate.documentGeneration !== record.annotationDocumentGeneration
-          || candidate.selection.selectionId !== request.selectionId
-          || candidate.selection.tagName !== request.tagName
-          || candidate.selection.elementPath !== request.elementPath
-          || candidate.selection.elementProofSha256 !== request.elementProofSha256
-        ) throw new Error('The Desktop artifact annotation selection is stale or mismatched.')
-        await this.refreshAnnotationCandidateIntegrity(record, candidate)
-        this.assertActiveArtifactBridgeRecord(record, signal)
-        if (record.annotationCandidate !== candidate) {
-          throw new Error('The Desktop artifact annotation selection changed.')
-        }
-        return {
-          activePreviewArtifactId: record.activePreviewArtifactId,
-          selectionId: candidate.selection.selectionId,
-          tagName: candidate.selection.tagName,
-          elementPath: candidate.selection.elementPath,
-          ...(request.domSha256 === undefined ? {} : { domSha256: request.domSha256 }),
-          elementProofSha256: candidate.selection.elementProofSha256,
-          ...(candidate.annotationProofV2 === undefined
-            ? {}
-            : { annotationProofV2: candidate.annotationProofV2 }),
-          scopeId: record.scopeId,
-          rect: { ...candidate.selection.rect },
-        }
-      },
-      focusAnnotation: (request, signal) => (
-        this.focusTrustedAnnotation(record, request, signal)
-      ),
-      browserInspect: (request, signal) => (
-        this.inspectBrowser(record, request, signal)
-      ),
-      browserAct: (request, signal) => (
-        this.actBrowser(record, request, signal)
-      ),
-      bindCandidatePreview: (request, signal) => (
-        this.bindCandidatePreview(record, request.candidateHandle, signal)
-      ),
-      restoreCanonicalPreview: (request, signal) => (
-        this.restoreCanonicalPreview(record, request.candidateHandle, signal)
-      ),
-      screenshot: async (request, signal) => {
-        this.assertActiveArtifactBridgeRecord(record, signal)
-        this.assertCandidateRequestBinding(record, request.candidateHandle)
-        const image = await record.view.webContents.capturePage()
-        this.assertActiveArtifactBridgeRecord(record, signal)
-        this.assertCandidateRequestBinding(record, request.candidateHandle)
-        const size = image.getSize()
-        const bytes = image.toPNG()
-        if (
-          size.width <= 0
-          || size.height <= 0
-          || bytes.byteLength === 0
-          || bytes.byteLength > NATIVE_WORKBENCH_MAX_SCREENSHOT_BYTES
-        ) throw new Error('The active Desktop artifact screenshot is unavailable.')
-        return {
-          mime: 'image/png',
-          data: Uint8Array.from(bytes),
-          width: size.width,
-          height: size.height,
-        }
-      },
-      reloadSurface: (request, signal) => {
-        this.assertActiveArtifactBridgeRecord(record, signal)
-        this.assertCandidateRequestBinding(record, request.candidateHandle)
-        record.browserDocumentReady = false
-        this.invalidateBrowserAnchors(record)
-        void this.cancelAnnotationInteraction(record, 'surface-reloaded', true)
-        this.rejectPendingPermissions(record)
-        this.cancelPendingAuthentication(record)
-        record.authenticationAttempts.clear()
-        record.view.webContents.reload()
-        this.assertCandidateRequestBinding(record, request.candidateHandle)
-        return { reloaded: true }
-      },
-    }
-  }
-
-  private async bindCandidatePreview(
-    record: NativeWorkbenchSurfaceRecord,
-    candidateHandle: string,
-    signal: AbortSignal,
-  ): Promise<{ bound: true; candidateHandle: string }> {
-    this.assertActiveArtifactBridgeRecord(record, signal)
-    if (
-      record.kind !== 'artifact-preview'
-      || record.version !== NATIVE_WORKBENCH_PROTOCOL_VERSION_V4
-      || record.canonicalPreviewArtifactId === null
-      || !record.browserDocumentReady
-      || !this.options.resolveCandidatePreview
-      || !record.cdpReady
-      || !record.view.webContents.debugger.isAttached()
-    ) throw new Error('The active Desktop artifact preview cannot bind a candidate.')
-    let binding: NativeWorkbenchCandidatePreviewBinding | null = null
-    const previousCandidate = record.candidatePreview
-    const previousState = {
-      activePreviewArtifactId: record.activePreviewArtifactId,
-      documentUrl: record.documentUrl,
-      expectedOrigin: record.expectedOrigin,
-      mode: record.mode,
-      browserDocumentReady: record.browserDocumentReady,
-    }
-    const previousCandidateOfflineRealmGuardInstalled =
-      record.candidateOfflineRealmGuardInstalled
-    const previousCandidateOfflineRealmGuardScriptId =
-      record.candidateOfflineRealmGuardScriptId
-    const previousWebRtcPolicy = record.view.webContents.getWebRTCIPHandlingPolicy()
-    let candidateOfflineRealmGuardAttempted = false
-    let rollbackLoaded = false
-    let candidateGuardCleanupFailed = false
-    let previousCandidateReplaced = false
-    try {
-      binding = await this.options.resolveCandidatePreview(candidateHandle, signal)
-      // Resolving a handle materializes a fresh Gateway lease.  For a
-      // repeated turn-local handle this supersedes the previous lease even
-      // before the new URL is loaded; the old surface must not be restored if
-      // that load later fails.
-      previousCandidateReplaced = (
-        previousCandidate !== null
-        && previousCandidate.handle === candidateHandle
-      )
-      this.assertActiveArtifactBridgeRecord(record, signal)
-      if (
-        binding.candidateHandle !== candidateHandle
-        || binding.scopeId !== record.scopeId
-        // Candidate previews are deliberately an offline-only realm.  Do not
-        // trust a Gateway response that attempts to widen this to the
-        // canonical/full-network mode, even when the process-level override
-        // is disabled (the override is only a defence-in-depth ceiling).
-        || binding.mode !== 'offline'
-        || !/^art-[A-Za-z0-9_-]{1,200}$/.test(binding.candidateArtifactId)
-        || !/^apl-[A-Za-z0-9_-]{1,240}$/.test(binding.leaseId)
-        || !this.trustedCandidatePreviewUrl(binding.launchUrl, binding.expectedOrigin)
-        || !this.samePreviewListener(record, binding.expectedOrigin)
-      ) throw new Error('The candidate preview binding is invalid.')
-      // The process-level offline switch is a hard ceiling, not merely the
-      // default used while creating the canonical surface.  A compromised or
-      // stale Gateway response must not escalate a candidate bind back to the
-      // full-network preview realm.
-      const effectiveCandidateMode = 'offline'
-      // A turn normally reuses one opaque handle, in which case the Gateway
-      // atomically rotates its lease.  If a new turn arrives before the old
-      // one was cleaned up, release the old handle before replacing the
-      // surface record so its lease cannot be orphaned indefinitely.  Keep
-      // the old state intact if cleanup is rejected; the caller can retry
-      // without losing the currently visible candidate.
-      if (
-        previousCandidate
-        && previousCandidate.handle !== candidateHandle
-      ) {
-        if (!this.options.releaseCandidatePreview) {
-          throw new Error('The previous candidate preview cannot be released safely.')
-        }
-        await this.options.releaseCandidatePreview(previousCandidate.handle, signal)
-        previousCandidateReplaced = true
-      }
-      await this.cancelAnnotationInteraction(record, 'candidate-preview-bound', true)
-      this.rejectPendingPermissions(record)
-      this.cancelPendingAuthentication(record)
-      record.authenticationAttempts.clear()
-      record.browserDocumentReady = false
-      this.invalidateBrowserAnchors(record)
-      record.annotationDocumentGeneration += 1
-      record.candidatePreview = {
-        handle: candidateHandle,
-        leaseId: binding.leaseId,
-        artifactId: binding.candidateArtifactId,
-      }
-      record.activePreviewArtifactId = binding.candidateArtifactId
-      record.documentUrl = binding.launchUrl
-      record.expectedOrigin = binding.expectedOrigin
-      record.mode = effectiveCandidateMode
-      if (effectiveCandidateMode === 'offline') {
-        // Apply the restrictive ICE policy before loading any candidate bytes.
-        // If the bind rolls back, the exact policy from the canonical surface
-        // is restored below.
-        record.view.webContents.setWebRTCIPHandlingPolicy('disable_non_proxied_udp')
-        candidateOfflineRealmGuardAttempted = !previousCandidateOfflineRealmGuardInstalled
-        await this.installOfflineRealmGuard(record, true)
-      }
-      await record.view.webContents.loadURL(binding.launchUrl)
-      this.assertActiveArtifactBridgeRecord(record, signal)
-    } catch (error) {
-      if (previousCandidate && !previousCandidateReplaced) {
-        // The old candidate is still owned by the Gateway and remains the
-        // authoritative visible state.  Restore only the fields changed by
-        // an in-progress bind attempt; no new candidate was committed.
-        record.candidatePreview = previousCandidate
-        record.activePreviewArtifactId = previousState.activePreviewArtifactId
-        record.documentUrl = previousState.documentUrl
-        record.expectedOrigin = previousState.expectedOrigin
-        record.mode = previousState.mode
-        record.browserDocumentReady = previousState.browserDocumentReady
-      } else {
-        record.candidatePreview = null
-        record.activePreviewArtifactId = record.canonicalPreviewArtifactId
-        record.documentUrl = record.canonicalDocumentUrl
-        record.expectedOrigin = record.canonicalExpectedOrigin
-        record.mode = record.canonicalMode
-        record.browserDocumentReady = false
-      }
-      this.invalidateBrowserAnchors(record)
-      // `runImmediately` applies the offline guard to the currently loaded
-      // realm as soon as it is installed.  If the candidate navigation fails
-      // before replacing that realm, restoring only the record fields would
-      // leave a canonical/full preview with WebRTC and network globals
-      // permanently disabled.  Remove the newly-installed guard and reload
-      // the exact previous trusted destination before exposing the surface
-      // again.  A guard that pre-dated this bind belongs to the previous
-      // surface and is intentionally preserved.
-      if (
-        candidateOfflineRealmGuardAttempted
-        || previousCandidateReplaced
-        || (
-          !previousCandidateOfflineRealmGuardInstalled
-          && (
-            record.candidateOfflineRealmGuardInstalled
-            || record.candidateOfflineRealmGuardScriptId
-              !== previousCandidateOfflineRealmGuardScriptId
-          )
-        )
-      ) {
-        try {
-          await this.removeOfflineRealmGuard(record, true)
-        } catch {
-          // Loading a canonical page while the candidate-only document-start
-          // guard is still registered would leave a full preview with its
-          // network APIs permanently disabled.  Fail closed instead of
-          // exposing a misleadingly restored surface; destroyRecord will
-          // retry the normal debugger/session cleanup.
-          candidateGuardCleanupFailed = true
-        }
-        if (!candidateGuardCleanupFailed) {
-          const rollbackUrl = previousCandidate && !previousCandidateReplaced
-            ? previousState.documentUrl
-            : record.canonicalDocumentUrl
-          if (!record.disposed && !record.view.webContents.isDestroyed()) {
-            rollbackLoaded = true
-            await record.view.webContents.loadURL(rollbackUrl).catch(() => undefined)
-          }
-        }
-      }
-      if (
-        !candidateGuardCleanupFailed
-        &&
-        (!previousCandidate || previousCandidateReplaced)
-        && !rollbackLoaded
-      ) {
-        // The old candidate was released (or there was none), so do not leave
-        // its bytes visible after a failed replacement.  This is best effort;
-        // browserDocumentReady remains false until a successful load event.
-        if (!record.disposed && !record.view.webContents.isDestroyed()) {
-          await record.view.webContents.loadURL(record.canonicalDocumentUrl).catch(() => undefined)
-        }
-      }
-      // Never leave a failed candidate bind with the candidate's restrictive
-      // policy applied to a canonical/full surface.
-      record.view.webContents.setWebRTCIPHandlingPolicy(previousWebRtcPolicy as
-        'default'
-        | 'default_public_interface_only'
-        | 'default_public_and_private_interfaces'
-        | 'disable_non_proxied_udp')
-      if (candidateGuardCleanupFailed && !record.disposed) {
-        this.failRecord(record, 'error', {
-          message: 'The candidate preview isolation guard could not be removed safely.',
-          reason: 'candidate-guard-cleanup-failed',
-        })
-      }
-      if (this.options.releaseCandidatePreview) {
-        await this.options.releaseCandidatePreview(
-          candidateHandle,
-          new AbortController().signal,
-        ).catch(() => undefined)
-      }
-      throw error
-    }
-    return { bound: true, candidateHandle }
-  }
-
-  private async restoreCanonicalPreview(
-    record: NativeWorkbenchSurfaceRecord,
-    candidateHandle: string,
-    signal: AbortSignal,
-  ): Promise<{ restored: true }> {
-    this.assertActiveArtifactBridgeRecord(record, signal)
-    if (
-      record.kind !== 'artifact-preview'
-      || record.version !== NATIVE_WORKBENCH_PROTOCOL_VERSION_V4
-      || !this.options.releaseCandidatePreview
-    ) throw new Error('The active Desktop artifact preview cannot restore a candidate.')
-    const candidate = record.candidatePreview
-    if (!candidate) return { restored: true }
-    // A stale turn must never restore the canonical page underneath a newer
-    // candidate that has replaced the active surface.  The bridge request is
-    // scoped to the opaque handle that performed the bind; mismatches are a
-    // harmless no-op/error and leave the current candidate untouched.
-    if (candidate.handle !== candidateHandle) {
-      throw new Error('The active candidate preview belongs to another turn.')
-    }
-    // A candidate may be rendered in an offline realm even when the
-    // canonical preview was created in full mode.  Remove the temporary
-    // candidate-only network guard before loading the canonical page,
-    // otherwise the guard would silently persist for the rest of this
-    // preview session.
-    await this.removeOfflineRealmGuard(record, true)
-    if (record.canonicalMode !== 'offline') {
-      await this.removeOfflineRealmGuard(record)
-      record.view.webContents.setWebRTCIPHandlingPolicy('default')
-    }
-    await this.cancelAnnotationInteraction(record, 'candidate-preview-restored', true)
-    this.rejectPendingPermissions(record)
-    this.cancelPendingAuthentication(record)
-    record.authenticationAttempts.clear()
-    record.browserDocumentReady = false
-    this.invalidateBrowserAnchors(record)
-    record.annotationDocumentGeneration += 1
-    // Publish the trusted destination before starting the programmatic load.
-    // v4 navigation policy admits only this exact URL, so a redirect or
-    // renderer-initiated navigation away from the canonical preview remains
-    // blocked while the candidate lease is being released.
-    record.activePreviewArtifactId = record.canonicalPreviewArtifactId
-    record.documentUrl = record.canonicalDocumentUrl
-    record.expectedOrigin = record.canonicalExpectedOrigin
-    record.mode = record.canonicalMode
-    await record.view.webContents.loadURL(record.canonicalDocumentUrl)
-    this.assertActiveArtifactBridgeRecord(record, signal)
-    try {
-      await this.options.releaseCandidatePreview(candidate.handle, signal)
-    } catch (error) {
-      // Keep the opaque handle for a retry, but do not expose the canonical
-      // page as verified until cleanup has been acknowledged by the Gateway.
-      record.browserDocumentReady = false
-      throw error
-    }
-    record.candidatePreview = null
-    return { restored: true }
-  }
-
-  private artifactBridgeBindingError(code: string, message: string): Error {
-    const error = new Error(message) as Error & { code?: string }
-    error.code = code
-    return error
-  }
-
-  private bindingRecordNeedsRecovery(
-    state: NativeWorkbenchArtifactBridgeBindingState,
-  ): boolean {
-    const record = state.record
-    try {
-      return record.disposed
-        || record.crashed
-        || record.view.webContents.isDestroyed()
-        || !record.cdpReady
-        || !record.view.webContents.debugger.isAttached()
-        || this.surfaces.get(record.id) !== record
-    } catch {
-      return true
-    }
-  }
-
-  private async refreshArtifactBridgeCanonicalGrant(
-    state: NativeWorkbenchArtifactBridgeBindingState,
-  ): Promise<boolean> {
-    const grant = await state.previewPin.ensureCurrent()
-    if (!grant || grant.scopeId !== state.record.scopeId) {
-      state.terminal = true
-      throw this.artifactBridgeBindingError(
-        'binding-terminal-unavailable',
-        'The bound Desktop artifact preview lease is unavailable.',
-      )
-    }
-    const record = state.record
-    const changed = record.canonicalDocumentUrl !== grant.launchUrl
-      || record.canonicalExpectedOrigin !== grant.expectedOrigin
-      || record.canonicalMode !== grant.mode
-    if (!changed) return false
-    record.canonicalDocumentUrl = grant.launchUrl
-    record.canonicalExpectedOrigin = grant.expectedOrigin
-    record.canonicalMode = grant.mode
-    state.generation += 1
-    return true
-  }
-
-  private async recoverArtifactBridgeBinding(
-    state: NativeWorkbenchArtifactBridgeBindingState,
-    signal: AbortSignal,
-  ): Promise<void> {
-    if (state.released || state.terminal || state.recoveryAttempted || signal.aborted) {
-      state.terminal = true
-      throw this.artifactBridgeBindingError(
-        'binding-terminal-unavailable',
-        'The bound Desktop artifact surface is unavailable.',
-      )
-    }
-    state.recoveryAttempted = true
-    const failed = state.record
-    await this.refreshArtifactBridgeCanonicalGrant(state)
-    const candidateHandle = state.candidateHandle ?? failed.candidatePreview?.handle ?? null
-    const canonicalArtifactId = failed.canonicalPreviewArtifactId
-    const uiReleaseRequested = failed.uiReleaseRequested
-    const request: NativeWorkbenchCreateRequest = {
-      version: NATIVE_WORKBENCH_PROTOCOL_VERSION_V4,
-      surfaceId: failed.id,
-      kind: 'artifact-preview',
-      payload: {
-        launchUrl: failed.canonicalDocumentUrl,
-        expectedOrigin: failed.canonicalExpectedOrigin || '',
-        scopeId: failed.scopeId,
-        mode: failed.canonicalMode,
-      },
-    }
-    failed.artifactBridgePins = 0
-    try {
-      await this.destroyRecord(failed, { preserveCandidatePreview: true })
-      const created = await this.createSurfaceNow(request, canonicalArtifactId)
-      if (!created.ok) throw new Error(created.message || 'Surface recovery failed.')
-      const replacement = this.surfaces.get(failed.id)
-      if (!replacement || replacement.disposed || replacement.crashed) {
-        throw new Error('The replacement surface is unavailable.')
-      }
-      replacement.artifactBridgePins = 1
-      replacement.uiReleaseRequested = uiReleaseRequested
-      replacement.visibleRequested = false
-      this.setPhysicalVisibility(replacement, false)
-      state.record = replacement
-      state.target = this.artifactBridgeTargetForRecord(replacement)
-      state.generation += 1
-      if (candidateHandle) {
-        await this.bindCandidatePreview(replacement, candidateHandle, signal)
-        state.candidateHandle = candidateHandle
-      }
-    } catch (error) {
-      state.terminal = true
-      const replacement = this.surfaces.get(failed.id)
-      if (replacement && replacement !== failed) {
-        replacement.artifactBridgePins = 0
-        await this.destroyRecord(replacement).catch(() => undefined)
-      }
-      if (candidateHandle && this.options.releaseCandidatePreview) {
-        await this.options.releaseCandidatePreview(
-          candidateHandle,
-          new AbortController().signal,
-        ).catch(() => undefined)
-      }
-      throw this.artifactBridgeBindingError(
-        'binding-terminal-unavailable',
-        'The bound Desktop artifact surface could not be recovered.',
-      )
-    }
-  }
-
-  private async invokeArtifactBridgeBinding<T>(
-    state: NativeWorkbenchArtifactBridgeBindingState,
-    method: keyof DesktopArtifactBridgeTarget,
-    request: unknown,
-    signal: AbortSignal,
-    recoverable: boolean,
-  ): Promise<T> {
-    if (state.released || state.terminal) {
-      throw this.artifactBridgeBindingError(
-        'binding-terminal-unavailable',
-        'The bound Desktop artifact surface is unavailable.',
-      )
-    }
-    const canonicalGrantChanged = await this.refreshArtifactBridgeCanonicalGrant(state)
-    if (canonicalGrantChanged || this.bindingRecordNeedsRecovery(state)) {
-      await this.recoverArtifactBridgeBinding(state, signal)
-    }
-
-    const run = async (): Promise<T> => {
-      const handler = state.target[method]
-      if (typeof handler !== 'function') {
-        throw new Error(`The Desktop artifact surface does not support ${String(method)}.`)
-      }
-      return await (handler as (
-        value: unknown,
-        operationSignal: AbortSignal,
-      ) => T | Promise<T>)(request, signal)
-    }
-
-    const recordSuccess = (value: T): T => {
-      if (method === 'bindCandidatePreview') {
-        state.candidateHandle = (request as { candidateHandle?: string }).candidateHandle || null
-      } else if (method === 'restoreCanonicalPreview') {
-        state.candidateHandle = null
-      }
-      return value
-    }
-
-    try {
-      return recordSuccess(await run())
-    } catch (error) {
-      const needsRecovery = this.bindingRecordNeedsRecovery(state)
-      if (method === 'browserAct' && needsRecovery) {
-        throw this.artifactBridgeBindingError(
-          'action-result-unknown',
-          'The Desktop artifact action result is unknown; inspect again.',
-        )
-      }
-      if (!recoverable || !needsRecovery) throw error
-      await this.recoverArtifactBridgeBinding(state, signal)
+  private async watchWorkingPreview(record: NativeWorkbenchSurfaceRecord): Promise<void> {
+    let lastRevision: string | null = null
+    const check = async (): Promise<void> => {
+      if (record.disposed || record.crashed || record.view.webContents.isDestroyed()) return
+      let keepWatching = true
       try {
-        return recordSuccess(await run())
-      } catch {
-        state.terminal = true
-        throw this.artifactBridgeBindingError(
-          'binding-terminal-unavailable',
-          'The bound Desktop artifact surface is unavailable after recovery.',
-        )
-      }
-    }
-  }
-
-  private artifactBridgeBindingTarget(
-    state: NativeWorkbenchArtifactBridgeBindingState,
-  ): DesktopArtifactBridgeTarget {
-    const initial = state.target
-    return {
-      ...initial,
-      isCurrent: () => !state.released && !state.terminal,
-      capabilities: {
-        ...initial.capabilities,
-        browserAct: initial.capabilities.bindCandidatePreview === true,
-      },
-      resolveAnnotationSelection: initial.resolveAnnotationSelection
-        ? (request, signal) => this.invokeArtifactBridgeBinding(
-            state, 'resolveAnnotationSelection', request, signal, true,
-          )
-        : undefined,
-      focusAnnotation: initial.focusAnnotation
-        ? (request, signal) => this.invokeArtifactBridgeBinding(
-            state, 'focusAnnotation', request, signal, true,
-          )
-        : undefined,
-      browserInspect: initial.browserInspect
-        ? (request, signal) => this.invokeArtifactBridgeBinding(
-            state, 'browserInspect', request, signal, true,
-          )
-        : undefined,
-      browserAct: initial.browserAct
-        ? (request, signal) => this.invokeArtifactBridgeBinding(
-            state, 'browserAct', request, signal, false,
-          )
-        : undefined,
-      bindCandidatePreview: initial.bindCandidatePreview
-        ? (request, signal) => this.invokeArtifactBridgeBinding(
-            state, 'bindCandidatePreview', request, signal, true,
-          )
-        : undefined,
-      restoreCanonicalPreview: initial.restoreCanonicalPreview
-        ? (request, signal) => this.invokeArtifactBridgeBinding(
-            state, 'restoreCanonicalPreview', request, signal, true,
-          )
-        : undefined,
-      screenshot: initial.screenshot
-        ? (request, signal) => this.invokeArtifactBridgeBinding(
-            state, 'screenshot', request, signal, true,
-          )
-        : undefined,
-      reloadSurface: initial.reloadSurface
-        ? (request, signal) => this.invokeArtifactBridgeBinding(
-            state, 'reloadSurface', request, signal, true,
-          )
-        : undefined,
-    }
-  }
-
-  async acquireArtifactBridgeTargetBinding(): Promise<DesktopArtifactBridgeTargetBinding | null> {
-    if (!this.activeSurfaceId) return null
-    const record = this.surfaces.get(this.activeSurfaceId)
-    if (
-      !record
-      || record.artifactBridgePins > 0
-      || this.artifactBridgeBindings.has(record.id)
-    ) return null
-    const target = this.getActiveArtifactBridgeTarget()
-    if (!target || record.version !== NATIVE_WORKBENCH_PROTOCOL_VERSION_V4) return null
-    const previewPin = record.kind === 'artifact-preview'
-      && record.canonicalExpectedOrigin
-      && this.options.pinArtifactPreview
-      ? this.options.pinArtifactPreview({
-          launchUrl: record.canonicalDocumentUrl,
-          expectedOrigin: record.canonicalExpectedOrigin,
-          scopeId: record.scopeId,
-          mode: record.canonicalMode,
-        })
-      : null
-    if (record.kind === 'artifact-preview' && !previewPin) return null
-    if (!previewPin) return null
-    record.artifactBridgePins += 1
-    let state: NativeWorkbenchArtifactBridgeBindingState | null = null
-    try {
-      state = {
-        record,
-        target,
-        previewPin,
-        generation: 1,
-        recoveryAttempted: false,
-        terminal: false,
-        released: false,
-        candidateHandle: record.candidatePreview?.handle ?? null,
-      }
-      this.artifactBridgeBindings.set(record.id, state)
-      const bindingState = state
-      const bindingTarget = this.artifactBridgeBindingTarget(bindingState)
-      let released = false
-      return {
-        target: bindingTarget,
-        release: async () => {
-          if (released) return
-          released = true
-          bindingState.released = true
-          if (this.artifactBridgeBindings.get(record.id) === bindingState) {
-            this.artifactBridgeBindings.delete(record.id)
+        if (record.view.webContents.isLoading() && lastRevision !== null) return
+        const controller = new AbortController()
+        record.revisionRequest = controller
+        const timeout = setTimeout(() => controller.abort(), 2000)
+        timeout.unref()
+        try {
+          const response = await record.previewSession.fetch(record.documentUrl, {
+            method: 'HEAD', cache: 'no-store', redirect: 'error', signal: controller.signal,
+          })
+          if (record.disposed || record.crashed) return
+          if (!response.ok) return
+          if (response.headers.get('x-opensquilla-working-preview') !== '1') {
+            keepWatching = false
+            return
           }
-          const current = bindingState.record
-          if (
-            bindingState.candidateHandle
-            && current.candidatePreview?.handle === bindingState.candidateHandle
-            && !current.disposed
-            && !current.crashed
-          ) {
+          const revision = response.headers.get('etag')
+          if (revision && lastRevision && revision !== lastRevision && !record.view.webContents.isLoading()) {
+            record.view.webContents.reload()
+          }
+          if (revision) lastRevision = revision
+        } finally {
+          clearTimeout(timeout)
+          if (record.revisionRequest === controller) record.revisionRequest = null
+        }
+      } catch {
+        // A lease may be renewing; the normal preview lifecycle reports its own errors.
+      } finally {
+        if (keepWatching && !record.disposed && !record.crashed) {
+          record.revisionTimer = setTimeout(() => { void check() }, 1000)
+          record.revisionTimer.unref()
+        }
+      }
+    }
+    await check()
+  }
+
+  private browserRecord(sessionKey: string, targetRef: string | undefined): NativeWorkbenchSurfaceRecord {
+    const record = [...this.surfaces.values()].find(value => value.targetRef === targetRef)
+    if (!record || record.scopeId !== sessionKey || record.disposed || record.crashed
+      || record.owner.isDestroyed() || record.view.webContents.isDestroyed()) {
+      throw new DesktopBrowserError('TARGET_NOT_FOUND', 'The browser target no longer exists in this session.', 404)
+    }
+    return record
+  }
+
+  private describeBrowserRecord(record: NativeWorkbenchSurfaceRecord) {
+    return {
+      targetRef: record.targetRef, surfaceId: record.id, sessionKey: record.scopeId,
+      url: record.view.webContents.getURL(), title: record.view.webContents.getTitle(), kind: record.kind,
+      active: this.activeSurfaceId === record.id,
+    }
+  }
+
+  getBrowserTarget(surfaceId: string) {
+    const record = this.surfaces.get(surfaceId)
+    if (!record) throw new DesktopBrowserError('TARGET_NOT_FOUND', 'The browser target no longer exists.', 404)
+    return this.describeBrowserRecord(this.browserRecord(record.scopeId, record.targetRef))
+  }
+
+  async focusAnnotation(surfaceId: string, targetRef: string, locatorHint: string) {
+    const target = this.getBrowserTarget(surfaceId)
+    if (target.targetRef !== targetRef) throw new DesktopBrowserError('TARGET_NOT_FOUND', 'The annotation page was replaced.', 404)
+    const record = this.browserRecord(target.sessionKey, targetRef)
+    if (!this.isActiveAnnotationRecord(record)) throw new DesktopBrowserError('TARGET_NOT_ACTIVE', 'Open the annotation page before focusing it.')
+    const group = `opensquilla-focus-${randomUUID()}`
+    try {
+      const { rootObjectId } = await this.browserRoot(record, group)
+      const found = await this.cdpCommand(record, 'Runtime.callFunctionOn', {
+        objectId: rootObjectId, objectGroup: group,
+        functionDeclaration: 'function (selector) { const nodes = document.querySelectorAll(selector); return nodes.length === 1 ? nodes[0] : null }',
+        arguments: [{ value: locatorHint }], returnByValue: false, silent: true,
+      }) as { result?: { objectId?: string } }
+      if (!found.result?.objectId) throw new DesktopBrowserError('ELEMENT_NOT_FOUND', 'The annotated element is unavailable or ambiguous.')
+      const node = await this.cdpCommand(record, 'DOM.describeNode', { objectId: found.result.objectId }) as { node?: { backendNodeId?: number } }
+      await this.cdpCommand(record, 'Runtime.callFunctionOn', {
+        objectId: found.result.objectId, functionDeclaration: NATIVE_WORKBENCH_ANNOTATION_SCROLL_FUNCTION,
+        returnByValue: true, silent: true,
+      })
+      this.browserRecord(target.sessionKey, targetRef)
+      await this.clearAnnotationFocusHighlight(record)
+      await this.cdpCommand(record, 'Overlay.highlightNode', {
+        backendNodeId: node.node?.backendNodeId, highlightConfig: NATIVE_WORKBENCH_ANNOTATION_HIGHLIGHT_CONFIG,
+      })
+      record.annotationFocusTimer = setTimeout(() => { void this.clearAnnotationFocusHighlight(record) }, 2500)
+      record.annotationFocusTimer.unref()
+      return { ok: true, targetRef }
+    } finally {
+      await this.cdpCommand(record, 'Runtime.releaseObjectGroup', { objectGroup: group }).catch(() => undefined)
+    }
+  }
+
+  async executeBrowser(request: DesktopBrowserRequest, signal: AbortSignal): Promise<unknown> {
+    const check = () => {
+      if (signal.aborted) throw new DesktopBrowserError('TIMEOUT', 'The browser request ended.', 504)
+    }
+    check()
+    if (request.operation === 'list') {
+      return { targets: [...this.surfaces.values()].filter(record => record.scopeId === request.sessionKey
+        && !record.disposed && !record.crashed && !record.view.webContents.isDestroyed()
+        && record.kind !== 'artifact-html').map(record => this.describeBrowserRecord(record)) }
+    }
+    if (request.operation === 'open' && !request.targetRef) {
+      const url = parseNativeWorkbenchNavigationUrl(request.url)
+      if (this.isPrivilegedGatewayTarget(url)) throw new DesktopBrowserError('NAVIGATION_BLOCKED', 'This URL is unavailable inside isolated previews.')
+      const surfaceId = `browser-${randomUUID()}`
+      const result = await this.createSurface({ version: NATIVE_WORKBENCH_PROTOCOL_VERSION_V4,
+        surfaceId, kind: 'url-preview', payload: { url, scopeId: request.sessionKey } })
+      if (!result.ok) throw new DesktopBrowserError('OPEN_FAILED', result.message || 'The browser page could not open.')
+      const record = this.surfaces.get(surfaceId)
+      if (!record) throw new DesktopBrowserError('TARGET_NOT_FOUND', 'The browser page was closed.', 404)
+      const assertOpeningRecord = () => {
+        if (this.surfaces.get(surfaceId) !== record || record.disposed || record.crashed || record.owner.isDestroyed()
+          || record.view.webContents.isDestroyed()) {
+          throw new DesktopBrowserError('TARGET_NOT_FOUND', 'The browser page was closed.', 404)
+        }
+      }
+      const assertOpening = () => { check(); assertOpeningRecord() }
+      try {
+        await this.queueSurfaceOperation(`operation:${record.targetRef}`, async () => {
+          assertOpening()
+          // A never-shown child view can have a zero-sized renderer despite native
+          // bounds. Initialize that same renderer, then immediately remove emulation
+          // so later UI layout and device scale remain native.
+          let initializationFailed = false
+          try {
+            await this.cdpCommand(record, 'Emulation.setDeviceMetricsOverride', {
+              width: 960, height: 720, deviceScaleFactor: 0, mobile: false,
+            }, assertOpening)
+          } catch (error) {
+            initializationFailed = true
+            throw error
+          } finally {
             try {
-              await this.restoreCanonicalPreview(
-                current,
-                bindingState.candidateHandle,
-                new AbortController().signal,
-              )
-              bindingState.candidateHandle = null
-            } catch {
-              bindingState.terminal = true
+              await this.cdpCommand(record, 'Emulation.clearDeviceMetricsOverride', undefined, assertOpeningRecord)
+            } catch (error) {
+              if (!initializationFailed) throw error
             }
           }
-          current.artifactBridgePins = Math.max(0, current.artifactBridgePins - 1)
-          if (
-            current.artifactBridgePins === 0
-            && (current.uiReleaseRequested || current.crashed || bindingState.terminal)
-          ) {
-            await this.destroyRecord(current)
-          } else if (
-            bindingState.candidateHandle
-            && this.options.releaseCandidatePreview
-          ) {
-            await this.options.releaseCandidatePreview(
-              bindingState.candidateHandle,
-              new AbortController().signal,
-            ).catch(() => undefined)
+          assertOpening()
+        })
+        assertOpening()
+        // The current session's UI adopts the hidden page and supplies its visible layout.
+        const target = this.getBrowserTarget(surfaceId)
+        this.emit(record, 'browser-opened', { url: target.url, title: target.title,
+          sessionKey: request.sessionKey, targetRef: target.targetRef })
+        return target
+      } catch (error) {
+        if (this.surfaces.get(surfaceId) === record) await this.destroyRecord(record)
+        throw error
+      }
+    }
+    const record = this.browserRecord(request.sessionKey, request.targetRef)
+    if (record.kind === 'artifact-html') throw new DesktopBrowserError('BROWSER_UNAVAILABLE', 'Reopen this legacy preview to enable browser control.')
+    const assertCurrent = () => { check(); this.browserRecord(request.sessionKey, request.targetRef) }
+    if (request.operation === 'open' || request.operation === 'reload') {
+      const navigation = await this.navigateSurface({ version: record.version as 2 | 3 | 4,
+        surfaceId: record.id, action: request.operation === 'open' ? 'navigate' : 'reload',
+        ...(request.operation === 'open' ? { url: parseNativeWorkbenchNavigationUrl(request.url) } : {}) })
+      assertCurrent()
+      if (!navigation.ok) throw new DesktopBrowserError('NAVIGATION_BLOCKED', navigation.message || 'Browser navigation failed.')
+      return { ...this.describeBrowserRecord(record), loading: record.view.webContents.isLoading() }
+    }
+    if (!record.browserDocumentReady || !record.cdpReady) {
+      throw new DesktopBrowserError('PAGE_NOT_READY', 'The browser page is still loading or unavailable.')
+    }
+    if (request.operation === 'screenshot') {
+      const generation = record.annotationDocumentGeneration
+      const image = await record.view.webContents.capturePage(undefined, { stayHidden: true, stayAwake: true })
+      let png = image.toPNG()
+      let { width, height } = image.getSize()
+      if (!png.length) {
+        // Hidden child views may have no compositor surface. CDP captures the same
+        // WebContents renderer without activating another tab or opening a new page.
+        const captured = await this.cdpCommand(record, 'Page.captureScreenshot', {
+          format: 'png', captureBeyondViewport: false,
+        }, assertCurrent) as { data?: string }
+        if (typeof captured.data === 'string' && captured.data.length <= 12 * 1024 * 1024) {
+          png = Buffer.from(captured.data, 'base64')
+          if (png.length >= 24 && png.subarray(1, 4).toString() === 'PNG') {
+            width = png.readUInt32BE(16)
+            height = png.readUInt32BE(20)
           }
-          await previewPin.release()
-          this.options.emit({
-            version: NATIVE_WORKBENCH_PROTOCOL_VERSION_V4,
-            surfaceId: record.id,
-            type: 'agent-edit-released',
-          })
-        },
+        }
       }
-    } catch (error) {
-      if (state && this.artifactBridgeBindings.get(record.id) === state) {
-        this.artifactBridgeBindings.delete(record.id)
+      assertCurrent()
+      if (generation !== record.annotationDocumentGeneration) throw new DesktopBrowserError('PAGE_CHANGED', 'The page navigated during capture.')
+      if (!png.length || png.length > 8 * 1024 * 1024 || width < 1 || height < 1) throw new DesktopBrowserError('SCREENSHOT_UNAVAILABLE', 'The screenshot is empty or exceeds 8 MiB.')
+      return { targetRef: record.targetRef, mimeType: 'image/png', dataBase64: png.toString('base64'), width, height }
+    }
+    // Serialize short browser operations only. No turn lease prevents the user from closing or replacing a page.
+    return await this.queueSurfaceOperation(`operation:${record.targetRef}`, async () => {
+      assertCurrent()
+      const result = request.operation === 'snapshot'
+        ? await this.snapshotBrowser(record, assertCurrent)
+        : await this.performBrowserAction(record, request, assertCurrent)
+      assertCurrent()
+      return result
+    })
+  }
+
+  private async snapshotBrowser(record: NativeWorkbenchSurfaceRecord, assertCurrent: () => void) {
+    this.invalidateBrowserAnchors(record)
+    const generation = record.annotationDocumentGeneration
+    const group = `opensquilla-browser-${randomUUID()}`
+    record.browserObjectGroup = group
+    const { rootObjectId } = await this.browserRoot(record, group)
+    const snapshot = await this.cdpCommand(record, 'Runtime.callFunctionOn', {
+      objectId: rootObjectId, objectGroup: group,
+      functionDeclaration: `function () {
+        return Array.from(document.querySelectorAll('a,button,input,textarea,select,summary,[role],[contenteditable],h1,h2,h3,p,label')).slice(0,2400).filter(node => {
+          const rect = node.getBoundingClientRect(); const style = getComputedStyle(node);
+          return rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
+        }).slice(0,160)
+      }`, returnByValue: false, silent: true,
+    }) as { result?: { objectId?: string } }
+    if (!snapshot.result?.objectId) throw new DesktopBrowserError('SNAPSHOT_FAILED', 'The browser snapshot is unavailable.')
+    const objects = await this.cdpCommand(record, 'Runtime.getProperties', {
+      objectId: snapshot.result.objectId, ownProperties: true,
+    }) as { result?: { name: string; value?: { objectId?: string } }[] }
+    const description = await this.cdpCommand(record, 'Runtime.callFunctionOn', {
+      objectId: snapshot.result.objectId,
+      functionDeclaration: `function () { return {
+        text: (document.body?.innerText || '').slice(0,24000),
+        nodes: this.map(node => ({tagName: node.localName, role: node.getAttribute('role') || node.localName,
+          name: (node.getAttribute('aria-label') || node.innerText || node.getAttribute('placeholder') || '').slice(0,256),
+          disabled: node.matches(':disabled,[aria-disabled="true"]')}))
+      } }`, returnByValue: true, silent: true,
+    }) as { result?: { value?: { text: string; nodes: Record<string, unknown>[] } } }
+    assertCurrent()
+    if (generation !== record.annotationDocumentGeneration) throw new DesktopBrowserError('PAGE_CHANGED', 'The page navigated during inspection.')
+    const refs: Record<string, unknown>[] = []
+    for (const property of objects.result ?? []) {
+      if (!/^\d+$/.test(property.name) || !property.value?.objectId) continue
+      const ref = `e-${randomUUID()}`
+      record.browserAnchors.set(ref, { objectId: property.value.objectId, documentGeneration: generation })
+      refs.push({ ref, ...description.result?.value?.nodes[Number(property.name)] })
+    }
+    return { ...this.describeBrowserRecord(record), text: description.result?.value?.text || '', refs,
+      truncated: refs.length === 160, diagnostics: { runtimeError: record.browserRuntimeException,
+        missingResource: record.missingResourceReported, blockedNetwork: record.blockedNetworkReported } }
+  }
+
+  private async performBrowserAction(record: NativeWorkbenchSurfaceRecord, request: DesktopBrowserRequest, assertCurrent: () => void) {
+    const generation = record.annotationDocumentGeneration
+    const anchor = request.ref ? record.browserAnchors.get(request.ref) : undefined
+    if (request.ref && (!anchor || anchor.documentGeneration !== generation)) {
+      throw new DesktopBrowserError('STALE_ELEMENT', 'The element reference expired. Request a new snapshot.')
+    }
+    const send = async (method: string, params: Record<string, unknown>) => {
+      assertCurrent()
+      if (generation !== record.annotationDocumentGeneration) throw new DesktopBrowserError('PAGE_CHANGED', 'The page navigated before the action completed.')
+      return await this.cdpCommand(record, method, params, () => {
+        assertCurrent()
+        if (generation !== record.annotationDocumentGeneration) throw new DesktopBrowserError('PAGE_CHANGED', 'The page navigated before the action was sent.')
+      })
+    }
+    if (anchor) {
+      const geometry = await send('Runtime.callFunctionOn', {
+        objectId: anchor.objectId,
+        functionDeclaration: `async function () {
+          if (!this.isConnected || this.ownerDocument !== document) return null;
+          if (this.matches(':disabled,[aria-disabled="true"]')) return {unavailable:true};
+          this.scrollIntoView({block:'center',inline:'center',behavior:'instant'});
+          let previous=this.getBoundingClientRect();
+          for (let attempt=0;attempt<8;attempt++) {
+            await new Promise(resolve=>setTimeout(resolve,16));
+            if (!this.isConnected || this.ownerDocument !== document) return null;
+            const r=this.getBoundingClientRect();
+            if (['x','y','width','height'].some(key=>Math.abs(r[key]-previous[key])>0.5)) { previous=r; continue; }
+            for (let node=this;node instanceof Element;node=node.parentElement) {
+              const style=getComputedStyle(node);
+              if (style.display==='none'||style.visibility==='hidden'||style.visibility==='collapse'||Number(style.opacity)<=0) return {unavailable:true};
+            }
+            const left=Math.max(0,r.left),right=Math.min(innerWidth,r.right),top=Math.max(0,r.top),bottom=Math.min(innerHeight,r.bottom);
+            if (right<=left||bottom<=top) return {unavailable:true};
+            const x=(left+right)/2,y=(top+bottom)/2,hit=document.elementFromPoint(x,y);
+            if (!hit || (hit!==this && !this.contains(hit))) return {unavailable:true};
+            return {x,y,width:r.width,height:r.height};
+          }
+          return {unavailable:true};
+        }`, returnByValue: true, awaitPromise: true, silent: true,
+      }) as { result?: { value?: { x: number; y: number; width: number; height: number; unavailable?: boolean } } }
+      const rect = geometry.result?.value
+      if (!rect) throw new DesktopBrowserError('STALE_ELEMENT', 'The selected element is no longer available.')
+      if (rect.unavailable || rect.width <= 0 || rect.height <= 0) throw new DesktopBrowserError('ACTION_UNAVAILABLE', 'The element is hidden, disabled, moving or covered.')
+      if (request.action === 'click' || request.action === 'hover') {
+        await send('Input.dispatchMouseEvent', { type: 'mouseMoved', x: rect.x, y: rect.y })
+        if (request.action === 'click') {
+          const hit = await send('Runtime.callFunctionOn', {
+            objectId: anchor.objectId,
+            functionDeclaration: `function (x,y) {
+              if (!this.isConnected || this.matches(':disabled,[aria-disabled="true"]')) return false;
+              const node=document.elementFromPoint(x,y);
+              return node===this || Boolean(node && this.contains(node));
+            }`, arguments: [{value:rect.x},{value:rect.y}], returnByValue: true, silent: true,
+          }) as { result?: { value?: boolean } }
+          if (hit.result?.value !== true) throw new DesktopBrowserError('ACTION_UNAVAILABLE', 'The element moved or became covered before the click.')
+          await send('Input.dispatchMouseEvent', { type: 'mousePressed', x: rect.x, y: rect.y, button: 'left', clickCount: 1 })
+          await send('Input.dispatchMouseEvent', { type: 'mouseReleased', x: rect.x, y: rect.y, button: 'left', clickCount: 1 })
+        }
+      } else {
+        const prepared = await send('Runtime.callFunctionOn', {
+          objectId: anchor.objectId,
+          functionDeclaration: `function (action, text) {
+            if (!this.isConnected || this.matches(':disabled,[aria-disabled="true"]')) return false;
+            this.focus();
+            if (action === 'fill') {
+              if (this instanceof HTMLInputElement || this instanceof HTMLTextAreaElement) {
+                if (this.readOnly || (this instanceof HTMLInputElement && ['file','hidden','checkbox','radio','submit','button'].includes(this.type))) return false;
+                this.select();
+              } else if (this.isContentEditable) { const range=document.createRange(); range.selectNodeContents(this); const selection=getSelection(); selection.removeAllRanges(); selection.addRange(range); }
+              else return false;
+            }
+            if (action === 'select') {
+              if (!(this instanceof HTMLSelectElement) || !Array.from(this.options).some(option=>option.value===text)) return false;
+              this.value=text; this.dispatchEvent(new Event('input',{bubbles:true})); this.dispatchEvent(new Event('change',{bubbles:true}));
+            }
+            return true;
+          }`, arguments: [{ value: request.action }, { value: request.text ?? '' }], returnByValue: true, silent: true,
+        }) as { result?: { value?: boolean } }
+        if (prepared.result?.value !== true) throw new DesktopBrowserError('ACTION_UNAVAILABLE', 'The element does not support this action.')
+        if (request.action === 'fill') await send('Input.insertText', { text: request.text ?? '' })
       }
-      record.artifactBridgePins = Math.max(0, record.artifactBridgePins - 1)
-      await previewPin.release()
-      throw error
     }
-  }
-
-  private trustedCandidatePreviewUrl(launchUrl: string, expectedOrigin: string): boolean {
-    try {
-      const parsed = new URL(launchUrl)
-      const origin = new URL(expectedOrigin)
-      return (
-        parsed.protocol === 'http:'
-        && origin.protocol === 'http:'
-        && isLoopbackUrlHostname(parsed.hostname)
-        && /^p-[a-f0-9]{32}\.localhost$/i.test(parsed.hostname)
-        && parsed.port.length > 0
-        && !parsed.username
-        && !parsed.password
-        && !parsed.search
-        && !parsed.hash
-        && parsed.origin === origin.origin
-      )
-    } catch {
-      return false
+    if (request.action === 'press') {
+      const key = request.key!
+      const codes: Record<string, number> = { Enter: 13, Tab: 9, Escape: 27, Backspace: 8, Delete: 46,
+        ArrowLeft: 37, ArrowUp: 38, ArrowRight: 39, ArrowDown: 40, Home: 36, End: 35, PageUp: 33, PageDown: 34, Space: 32 }
+      if (!(key in codes) && [...key].length !== 1) throw new DesktopBrowserError('INVALID_REQUEST', 'Unsupported browser key.', 400)
+      const text = key === 'Enter' ? '\r' : key === 'Space' ? ' ' : key.length === 1 ? key : undefined
+      const params = { key: key === 'Space' ? ' ' : key, windowsVirtualKeyCode: codes[key] ?? key.toUpperCase().charCodeAt(0), ...(text ? { text, unmodifiedText: text } : {}) }
+      await send('Input.dispatchKeyEvent', { type: 'keyDown', ...params })
+      await send('Input.dispatchKeyEvent', { type: 'keyUp', ...params })
     }
-  }
-
-  private samePreviewListener(
-    record: NativeWorkbenchSurfaceRecord,
-    candidateOrigin: string,
-  ): boolean {
-    if (!record.canonicalExpectedOrigin) return false
-    try {
-      const canonical = new URL(record.canonicalExpectedOrigin)
-      const candidate = new URL(candidateOrigin)
-      return (
-        canonical.protocol === 'http:'
-        && candidate.protocol === 'http:'
-        && canonical.port.length > 0
-        && candidate.port === canonical.port
-      )
-    } catch {
-      return false
+    if (request.action === 'scroll') {
+      const bounds = record.view.getBounds()
+      const amount = request.amount ?? 600
+      await send('Input.dispatchMouseEvent', { type: 'mouseWheel', x: Math.max(1, bounds.width / 2), y: Math.max(1, bounds.height / 2),
+        deltaX: request.direction === 'left' ? -amount : request.direction === 'right' ? amount : 0,
+        deltaY: request.direction === 'up' ? -amount : request.direction === 'down' ? amount : 0 })
     }
-  }
-
-  private assertActiveArtifactBridgeRecord(
-    record: NativeWorkbenchSurfaceRecord,
-    signal: AbortSignal,
-  ): void {
-    if (signal.aborted || !this.isActiveArtifactBridgeRecord(record)) {
-      throw new Error('The active Desktop artifact surface changed.')
-    }
-  }
-
-  private isActiveArtifactBridgeRecord(record: NativeWorkbenchSurfaceRecord): boolean {
-    try {
-      const live = this.surfaces.get(record.id) === record
-        && isArtifactBridgeProtocolVersion(record.version)
-        && !record.disposed
-        && !record.crashed
-        && !record.view.webContents.isDestroyed()
-      return live && (
-        record.artifactBridgePins > 0
-        || (
-          this.activeSurfaceId === record.id
-          && record.visibleRequested
-          && record.view.getVisible()
-        )
-      )
-    } catch {
-      return false
-    }
+    return { targetRef: record.targetRef, action: request.action, performed: true }
   }
 
   private activeAnnotationRecord(): NativeWorkbenchSurfaceRecord | null {
@@ -2864,17 +1809,17 @@ export class NativeWorkbenchSurfaceManager {
   ): NativeWorkbenchSurfaceRecord | null {
     const record = this.surfaces.get(surfaceId)
     return record
-      && record.kind === 'artifact-preview'
-      && isArtifactBridgeProtocolVersion(record.version)
+      && record.kind !== 'artifact-html'
+      && (record.version !== NATIVE_WORKBENCH_PROTOCOL_VERSION)
       && !record.disposed
       ? record
       : null
   }
 
   private isActiveAnnotationRecord(record: NativeWorkbenchSurfaceRecord): boolean {
-    return record.kind === 'artifact-preview'
-      && record.activePreviewArtifactId !== null
-      && this.isActiveArtifactBridgeRecord(record)
+    return record.kind !== 'artifact-html' && this.surfaces.get(record.id) === record
+      && !record.disposed && !record.crashed && !record.view.webContents.isDestroyed()
+      && this.activeSurfaceId === record.id && record.visibleRequested
   }
 
   private activeAnnotationOverlayBinding(
@@ -2966,25 +1911,10 @@ export class NativeWorkbenchSurfaceManager {
         throw new Error('The selected preview element is no longer editable.')
       }
       const current = parseNativeWorkbenchAnnotationSelection(raw)
-      const strictProofMatches = (
-        current.elementProofSha256 === candidate.selection.elementProofSha256
-      )
-      if (current.tagName !== candidate.selection.tagName) {
-        throw new Error('The preview DOM changed after selection (tag-mismatch).')
-      }
-      if (current.elementPath !== candidate.selection.elementPath) {
-        throw new Error('The preview DOM changed after selection (path-mismatch).')
-      }
-      if (!strictProofMatches) {
-        const mismatchReason = annotationProofV2MismatchReason(
-          candidate.annotationProofV2,
-          current.annotationProofV2,
-        )
-        if (mismatchReason) {
-          throw new Error(`The preview DOM changed after selection (${mismatchReason}).`)
-        }
-      }
-      candidate.annotationProofV2 = current.annotationProofV2
+      if (
+        current.tagName !== candidate.selection.tagName
+        || current.elementPath !== candidate.selection.elementPath
+      ) throw new Error('The preview DOM changed after the element was selected.')
       this.applyAnnotationGeometry(record, candidate, current)
     } catch (error) {
       if (record.annotationCandidate === candidate) this.clearAnnotationCandidate(record)
@@ -3065,81 +1995,12 @@ export class NativeWorkbenchSurfaceManager {
     }
   }
 
-  private assertBrowserRecord(
-    record: NativeWorkbenchSurfaceRecord,
-    signal: AbortSignal,
-  ): void {
-    this.assertActiveArtifactBridgeRecord(record, signal)
-    if (
-      record.kind !== 'artifact-preview'
-      || record.version !== NATIVE_WORKBENCH_PROTOCOL_VERSION_V4
-      || record.activePreviewArtifactId === null
-      || !record.browserDocumentReady
-      || !record.cdpReady
-      || !record.view.webContents.debugger.isAttached()
-    ) throw new Error('The active Desktop artifact preview does not support browser control.')
-  }
-
-  private assertBrowserVerificationHealthy(record: NativeWorkbenchSurfaceRecord): void {
-    if (record.browserRuntimeException) {
-      throw new Error(
-        'The active Desktop artifact preview reported an uncaught runtime exception.',
-      )
-    }
-    if (
-      record.missingResourceReported
-      || record.blockedNetworkReported
-      || record.privilegedOriginReported
-    ) {
-      throw new Error(
-        'The active Desktop artifact preview has a blocked or missing local resource.',
-      )
-    }
-  }
-
-  /**
-   * Fence every browser-side operation to the candidate that the Gateway
-   * observed immediately before issuing it.  The identity probe and the
-   * actual bridge request are separate messages, so checking the opaque
-   * handle here closes that small TOCTOU window for actions without anchors
-   * (press/scroll) as well as screenshots and reloads.
-   */
-  private assertCandidateRequestBinding(
-    record: NativeWorkbenchSurfaceRecord,
-    candidateHandle: string | undefined,
-  ): void {
-    const candidate = record.candidatePreview
-    if (candidate !== null) {
-      if (candidateHandle !== candidate.handle) {
-        throw new Error('The active candidate preview belongs to another turn.')
-      }
-      return
-    }
-    if (candidateHandle !== undefined) {
-      throw new Error('The candidate preview is no longer active.')
-    }
-  }
-
   private invalidateBrowserAnchors(record: NativeWorkbenchSurfaceRecord): void {
+    const objectGroup = record.browserObjectGroup
+    record.browserObjectGroup = null
+    if (objectGroup) void this.cdpCommand(record, 'Runtime.releaseObjectGroup', { objectGroup }).catch(() => undefined)
     record.browserAnchors.clear()
     record.browserAnchorGeneration += 1
-  }
-
-  private artifactBridgeBindingGeneration(
-    record: NativeWorkbenchSurfaceRecord,
-  ): number | undefined {
-    const state = this.artifactBridgeBindings.get(record.id)
-    return state?.record === record && !state.released
-      ? state.generation
-      : undefined
-  }
-
-  private bumpArtifactBridgeBindingGeneration(
-    record: NativeWorkbenchSurfaceRecord,
-  ): void {
-    const state = this.artifactBridgeBindings.get(record.id)
-    if (state?.record !== record || state.released) return
-    state.generation += 1
   }
 
   private async browserRoot(
@@ -3176,395 +2037,10 @@ export class NativeWorkbenchSurfaceManager {
       root.exceptionDetails
       || typeof rootObjectId !== 'string'
       || !rootObjectId
-    ) throw new Error('The canonical preview root is unavailable.')
+    ) throw new Error('The browser page root is unavailable.')
     return {
       rootObjectId,
       executionContextId: world.executionContextId as number,
-    }
-  }
-
-  private async inspectBrowser(
-    record: NativeWorkbenchSurfaceRecord,
-    request: DesktopArtifactBrowserInspectRequest,
-    signal: AbortSignal,
-  ): Promise<DesktopArtifactBrowserSnapshot> {
-    this.assertBrowserRecord(record, signal)
-    this.assertCandidateRequestBinding(record, request.candidateHandle)
-    this.assertBrowserVerificationHealthy(record)
-    // The Gateway uses an identity-only probe immediately before a browser
-    // action to fence the active candidate surface.  A normal inspection
-    // deliberately replaces the bounded anchor table, but doing that here
-    // would invalidate an anchor returned by the model's preceding inspect
-    // (for example, an anchor outside the first node).  Keep the existing
-    // table and return only the authenticated surface identity for this
-    // internal probe.
-    if (request.identityOnly === true) {
-      return {
-        scope: request.scope,
-        nodes: [],
-        truncated: false,
-        activePreviewArtifactId: record.activePreviewArtifactId,
-        scopeId: record.scopeId,
-        candidateHandle: record.candidatePreview?.handle ?? null,
-        bindingGeneration: this.artifactBridgeBindingGeneration(record),
-      }
-    }
-    const objectGroup = `opensquilla-browser-${randomUUID()}`
-    try {
-      const { rootObjectId } = await this.browserRoot(record, objectGroup)
-      const inspected = await this.cdpCommand(record, 'Runtime.callFunctionOn', {
-        objectId: rootObjectId,
-        objectGroup,
-        functionDeclaration: NATIVE_WORKBENCH_BROWSER_SNAPSHOT_FUNCTION,
-        arguments: [{ value: request.scope }, { value: request.maxNodes }],
-        awaitPromise: true,
-        returnByValue: true,
-        silent: true,
-      }) as {
-        exceptionDetails?: unknown
-        result?: { value?: unknown }
-      }
-      if (inspected.exceptionDetails) throw new Error('The browser snapshot failed.')
-      const raw = inspected.result?.value
-      if (!raw || typeof raw !== 'object' || (raw as Record<string, unknown>).ok !== true) {
-        const reason = raw && typeof raw === 'object'
-          ? (raw as Record<string, unknown>).reason
-          : null
-        throw new Error(typeof reason === 'string' ? reason : 'The browser snapshot failed.')
-      }
-      const payload = raw as Record<string, unknown>
-      const rawNodes = payload.nodes
-      if (!Array.isArray(rawNodes)) throw new Error('The browser snapshot was malformed.')
-      const anchors = new Map<string, NativeWorkbenchBrowserAnchor>()
-      const nodes: DesktopArtifactBrowserSnapshot['nodes'] = []
-      const issuedAt = Date.now()
-      const anchorGeneration = record.browserAnchorGeneration + 1
-      for (const rawNode of rawNodes) {
-        if (!rawNode || typeof rawNode !== 'object') continue
-        const node = rawNode as Record<string, unknown>
-        const anchor = node.anchor
-        const elementPath = node.elementPath
-        if (
-          typeof anchor !== 'string'
-          || !/^[A-Za-z0-9_-]{1,128}$/.test(anchor)
-          || typeof elementPath !== 'string'
-          || elementPath.length === 0
-          || elementPath.length > 4096
-        ) continue
-        anchors.set(anchor, {
-          elementPath,
-          documentGeneration: record.annotationDocumentGeneration,
-          anchorGeneration,
-          surfaceId: record.id,
-          scopeId: record.scopeId,
-          activePreviewArtifactId: record.activePreviewArtifactId,
-          candidateHandle: record.candidatePreview?.handle ?? null,
-          expiresAt: issuedAt + NATIVE_WORKBENCH_BROWSER_ANCHOR_TTL_MS,
-        })
-        const bounded = (value: unknown, max: number): string | undefined => (
-          typeof value === 'string' && value.length > 0
-            ? value.slice(0, max)
-            : undefined
-        )
-        nodes.push({
-          anchor,
-          role: bounded(node.role, 256),
-          name: bounded(node.name, 256),
-          text: bounded(node.text, 512),
-          interactive: node.interactive === true,
-          disabled: node.disabled === true,
-          selected: node.selected === true,
-        })
-      }
-      if (nodes.length > request.maxNodes) nodes.splice(request.maxNodes)
-      // Candidate replacement may have occurred while CDP was collecting the
-      // snapshot.  Do not let an old turn publish its anchors into the new
-      // candidate's table.
-      this.assertBrowserRecord(record, signal)
-      this.assertCandidateRequestBinding(record, request.candidateHandle)
-      record.browserAnchors = anchors
-      record.browserAnchorGeneration = anchorGeneration
-      return {
-        scope: request.scope,
-        nodes,
-        truncated: payload.truncated === true || rawNodes.length > nodes.length,
-        activePreviewArtifactId: record.activePreviewArtifactId,
-        scopeId: record.scopeId,
-        candidateHandle: record.candidatePreview?.handle ?? null,
-        bindingGeneration: this.artifactBridgeBindingGeneration(record),
-      }
-    } finally {
-      await this.cdpCommand(record, 'Runtime.releaseObjectGroup', { objectGroup })
-        .catch(() => undefined)
-    }
-  }
-
-  private async actBrowser(
-    record: NativeWorkbenchSurfaceRecord,
-    request: DesktopArtifactBrowserActRequest,
-    signal: AbortSignal,
-  ): Promise<DesktopArtifactBrowserActResult> {
-    this.assertBrowserRecord(record, signal)
-    this.assertCandidateRequestBinding(record, request.candidateHandle)
-    if (
-      record.candidatePreview === null
-      || record.activePreviewArtifactId !== record.candidatePreview.artifactId
-      || record.mode !== 'offline'
-    ) {
-      throw new Error(
-        'The active Desktop browser action requires an offline candidate preview.',
-      )
-    }
-    this.assertBrowserVerificationHealthy(record)
-    const anchor = request.action === 'press' || request.action === 'scroll'
-      ? null
-      : record.browserAnchors.get(request.anchor)
-    if (request.action !== 'press' && request.action !== 'scroll') {
-      if (
-        !anchor
-        || anchor.documentGeneration !== record.annotationDocumentGeneration
-        || anchor.anchorGeneration !== record.browserAnchorGeneration
-        || anchor.surfaceId !== record.id
-        || anchor.scopeId !== record.scopeId
-        || anchor.activePreviewArtifactId !== record.activePreviewArtifactId
-        || anchor.candidateHandle !== (record.candidatePreview?.handle ?? null)
-        || anchor.expiresAt <= Date.now()
-      ) {
-        throw new Error('The browser anchor is stale; inspect the preview again.')
-      }
-    }
-    const objectGroup = `opensquilla-browser-act-${randomUUID()}`
-    try {
-      const { rootObjectId } = await this.browserRoot(record, objectGroup)
-      let foundObjectId = rootObjectId
-      if (anchor) {
-        const found = await this.cdpCommand(record, 'Runtime.callFunctionOn', {
-          objectId: rootObjectId,
-          objectGroup,
-          functionDeclaration: NATIVE_WORKBENCH_ANNOTATION_FIND_BY_PATH_FUNCTION,
-          arguments: [{ value: anchor.elementPath }],
-          returnByValue: false,
-          silent: true,
-        }) as { exceptionDetails?: unknown; result?: { objectId?: unknown; subtype?: unknown } }
-        if (
-          found.exceptionDetails
-          || found.result?.subtype === 'null'
-          || typeof found.result?.objectId !== 'string'
-          || !found.result.objectId
-        ) throw new Error('The browser anchor no longer exists in the preview.')
-        foundObjectId = found.result.objectId
-      }
-      let functionDeclaration: string
-      let argumentsList: Array<{ value: unknown }> = []
-      if (request.action === 'click' || request.action === 'focus') {
-        functionDeclaration = NATIVE_WORKBENCH_BROWSER_CLICK_FUNCTION
-        argumentsList = [{ value: request.action === 'focus' }]
-      } else if (request.action === 'type') {
-        functionDeclaration = NATIVE_WORKBENCH_BROWSER_TYPE_FUNCTION
-        argumentsList = [{ value: request.text }, { value: request.replace }]
-      } else if (request.action === 'press') {
-        functionDeclaration = NATIVE_WORKBENCH_BROWSER_PRESS_FUNCTION
-        argumentsList = [{ value: request.key }]
-      } else if (request.action === 'scroll') {
-        functionDeclaration = NATIVE_WORKBENCH_BROWSER_SCROLL_FUNCTION
-        argumentsList = [{ value: request.direction }, { value: request.amount }]
-      } else {
-        throw new Error('The browser action is unsupported.')
-      }
-      try {
-        const acted = await this.cdpCommand(record, 'Runtime.callFunctionOn', {
-          objectId: foundObjectId,
-          objectGroup,
-          functionDeclaration,
-          arguments: argumentsList,
-          awaitPromise: true,
-          returnByValue: true,
-          silent: true,
-        }) as { exceptionDetails?: unknown; result?: { value?: unknown } }
-        if (acted.exceptionDetails) throw new Error('The browser action failed.')
-        const raw = acted.result?.value
-        if (!raw || typeof raw !== 'object' || (raw as Record<string, unknown>).ok !== true) {
-          const reason = raw && typeof raw === 'object'
-            ? (raw as Record<string, unknown>).reason
-            : null
-          throw new Error(typeof reason === 'string' ? reason : 'The browser action failed.')
-        }
-        this.assertBrowserRecord(record, signal)
-        this.assertCandidateRequestBinding(record, request.candidateHandle)
-        // Actions can change the DOM without navigation. Never let an anchor
-        // survive an action; the model must inspect again before acting again.
-        this.invalidateBrowserAnchors(record)
-        return {
-          performed: true,
-          changed: (raw as Record<string, unknown>).changed === true,
-        }
-      } catch {
-        // Runtime.callFunctionOn may have reached the page even when CDP lost
-        // the reply. Clear every anchor and force a fresh inspection instead
-        // of allowing a blind replay of a potentially completed side effect.
-        this.invalidateBrowserAnchors(record)
-        throw this.artifactBridgeBindingError(
-          'action-result-unknown',
-          'The Desktop artifact action result is unknown; inspect again.',
-        )
-      }
-    } finally {
-      await this.cdpCommand(record, 'Runtime.releaseObjectGroup', { objectGroup })
-        .catch(() => undefined)
-    }
-  }
-
-  private async focusTrustedAnnotation(
-    record: NativeWorkbenchSurfaceRecord,
-    request: DesktopArtifactFocusAnnotationRequest,
-    signal: AbortSignal,
-  ): Promise<{ focused: true; activePreviewArtifactId: string }> {
-    this.assertActiveArtifactBridgeRecord(record, signal)
-    if (
-      record.kind !== 'artifact-preview'
-      || !record.activePreviewArtifactId
-      || request.activePreviewArtifactId !== record.activePreviewArtifactId
-      || request.scopeId !== record.scopeId
-    ) {
-      throw new Error('The active Desktop artifact preview does not match this annotation.')
-    }
-    if (this.activeAnnotationOverlayBinding(record)) {
-      throw new Error('Finish the current annotation before focusing another element.')
-    }
-    await this.clearAnnotationFocusHighlight(record)
-    const generation = record.annotationDocumentGeneration
-    const objectGroup = `opensquilla-annotation-focus-${randomUUID()}`
-    try {
-      const frameTree = await this.cdpCommand(record, 'Page.getFrameTree') as {
-        frameTree?: { frame?: { id?: unknown } }
-      }
-      const frameId = frameTree.frameTree?.frame?.id
-      if (typeof frameId !== 'string' || frameId.length === 0) {
-        throw new Error('The top-level preview frame is unavailable.')
-      }
-      const world = await this.cdpCommand(record, 'Page.createIsolatedWorld', {
-        frameId,
-        worldName: 'opensquilla-artifact-annotation',
-        grantUniveralAccess: false,
-      }) as { executionContextId?: unknown }
-      if (!Number.isSafeInteger(world.executionContextId)) {
-        throw new Error('The isolated DOM inspector context is unavailable.')
-      }
-      const root = await this.cdpCommand(record, 'Runtime.evaluate', {
-        expression: 'document.documentElement',
-        contextId: world.executionContextId,
-        objectGroup,
-        returnByValue: false,
-        silent: true,
-      }) as {
-        exceptionDetails?: unknown
-        result?: { objectId?: unknown }
-      }
-      const rootObjectId = root.result?.objectId
-      if (root.exceptionDetails || typeof rootObjectId !== 'string' || !rootObjectId) {
-        throw new Error('The canonical preview root is unavailable.')
-      }
-      const found = await this.cdpCommand(record, 'Runtime.callFunctionOn', {
-        objectId: rootObjectId,
-        objectGroup,
-        functionDeclaration: NATIVE_WORKBENCH_ANNOTATION_FIND_BY_PATH_FUNCTION,
-        arguments: [{ value: request.elementPath }],
-        returnByValue: false,
-        silent: true,
-      }) as {
-        exceptionDetails?: unknown
-        result?: { objectId?: unknown; subtype?: unknown }
-      }
-      const selectedObjectId = found.result?.objectId
-      if (
-        found.exceptionDetails
-        || found.result?.subtype === 'null'
-        || typeof selectedObjectId !== 'string'
-        || !selectedObjectId
-      ) throw new Error('The annotation element path no longer exists in the preview.')
-      const inspected = await this.cdpCommand(record, 'Runtime.callFunctionOn', {
-        objectId: selectedObjectId,
-        objectGroup,
-        functionDeclaration: NATIVE_WORKBENCH_ANNOTATION_INSPECT_FUNCTION,
-        awaitPromise: true,
-        returnByValue: true,
-        silent: true,
-      }) as {
-        exceptionDetails?: unknown
-        result?: { value?: unknown }
-      }
-      if (inspected.exceptionDetails) {
-        throw new Error('The annotation element could not be inspected safely.')
-      }
-      const selection = parseNativeWorkbenchAnnotationSelection(inspected.result?.value)
-      const strictProofMatches = (
-        selection.elementProofSha256 === request.elementProofSha256
-      )
-      if (selection.tagName !== request.tagName) {
-        throw new Error('The preview DOM no longer matches the annotation anchor (tag-mismatch).')
-      }
-      if (selection.elementPath !== request.elementPath) {
-        throw new Error('The preview DOM no longer matches the annotation anchor (path-mismatch).')
-      }
-      if (!strictProofMatches) {
-        const mismatchReason = annotationProofV2MismatchReason(
-          request.annotationProofV2,
-          selection.annotationProofV2,
-        )
-        if (mismatchReason) {
-          throw new Error(
-            `The preview DOM no longer matches the annotation anchor (${mismatchReason}).`,
-          )
-        }
-      }
-      const described = await this.cdpCommand(record, 'DOM.describeNode', {
-        objectId: selectedObjectId,
-      }) as { node?: { backendNodeId?: unknown } }
-      const backendNodeId = described.node?.backendNodeId
-      if (!Number.isSafeInteger(backendNodeId) || (backendNodeId as number) < 1) {
-        throw new Error('The annotation element cannot be highlighted.')
-      }
-      const scrolled = await this.cdpCommand(record, 'Runtime.callFunctionOn', {
-        objectId: selectedObjectId,
-        objectGroup,
-        functionDeclaration: NATIVE_WORKBENCH_ANNOTATION_SCROLL_FUNCTION,
-        returnByValue: true,
-        silent: true,
-      }) as {
-        exceptionDetails?: unknown
-        result?: { value?: unknown }
-      }
-      if (scrolled.exceptionDetails) {
-        throw new Error('The annotation element could not be focused safely.')
-      }
-      parseNativeWorkbenchAnnotationGeometry(scrolled.result?.value)
-      this.assertActiveArtifactBridgeRecord(record, signal)
-      if (generation !== record.annotationDocumentGeneration) {
-        throw new Error('The preview navigated while the annotation was being focused.')
-      }
-      await this.cdpCommand(record, 'Overlay.highlightNode', {
-        backendNodeId,
-        highlightConfig: NATIVE_WORKBENCH_ANNOTATION_HIGHLIGHT_CONFIG,
-      })
-      record.annotationFocusTimer = setTimeout(() => {
-        record.annotationFocusTimer = null
-        if (
-          record.cdpReady
-          && !record.view.webContents.isDestroyed()
-          && record.view.webContents.debugger.isAttached()
-        ) void this.cdpCommand(record, 'Overlay.hideHighlight').catch(() => undefined)
-      }, 2_500)
-      record.annotationFocusTimer.unref()
-      return {
-        focused: true,
-        activePreviewArtifactId: record.activePreviewArtifactId,
-      }
-    } catch (error) {
-      await this.clearAnnotationFocusHighlight(record)
-      throw error
-    } finally {
-      await this.cdpCommand(record, 'Runtime.releaseObjectGroup', { objectGroup })
-        .catch(() => undefined)
     }
   }
 
@@ -3584,9 +2060,7 @@ export class NativeWorkbenchSurfaceManager {
     contents.debugger.attach('1.3')
     contents.debugger.on('message', (_event, method, params) => {
       if (
-        record.kind === 'artifact-preview'
-        && record.version === NATIVE_WORKBENCH_PROTOCOL_VERSION_V4
-        && (method === 'Runtime.exceptionThrown' || method === 'Runtime.consoleAPICalled')
+        (method === 'Runtime.exceptionThrown' || method === 'Runtime.consoleAPICalled')
       ) {
         const payload = params && typeof params === 'object'
           ? params as Record<string, unknown>
@@ -3633,8 +2107,10 @@ export class NativeWorkbenchSurfaceManager {
     record: NativeWorkbenchSurfaceRecord,
     method: string,
     params?: Record<string, unknown>,
+    beforeSend?: () => void,
   ): Promise<unknown> {
     const operation = record.cdpQueue.then(async () => {
+      beforeSend?.()
       if (
         record.disposed
         || record.crashed
@@ -3732,15 +2208,13 @@ export class NativeWorkbenchSurfaceManager {
         selectionId: randomUUID(),
         tagName: candidate.tagName,
         elementPath: candidate.elementPath,
-        ...(candidate.domSha256 === undefined ? {} : { domSha256: candidate.domSha256 }),
-        elementProofSha256: candidate.elementProofSha256,
+        targetRef: record.targetRef,
+        locatorHint: candidate.locatorHint,
+        selectionText: candidate.selectionText,
         rect: candidate.rect,
       }
       record.annotationCandidate = {
         selection,
-        ...(candidate.annotationProofV2 === undefined
-          ? {}
-          : { annotationProofV2: candidate.annotationProofV2 }),
         viewportWidth: candidate.viewportWidth,
         viewportHeight: candidate.viewportHeight,
         documentGeneration: generation,
@@ -4206,34 +2680,9 @@ export class NativeWorkbenchSurfaceManager {
     if (record.crashed || record.view.webContents.isDestroyed()) {
       return { ok: false, message: 'The native Workbench surface renderer crashed.' }
     }
-    if (
-      record.kind === 'artifact-preview'
-      && record.version === NATIVE_WORKBENCH_PROTOCOL_VERSION_V4
-      && (
-        request.action === 'back'
-        || request.action === 'forward'
-        || request.action === 'open-external'
-        || (
-          request.action === 'navigate'
-          && request.url !== record.documentUrl
-        )
-      )
-    ) {
-      // Programmatic WebContents navigation does not reliably emit
-      // ``will-navigate``.  Enforce the v4 exact-URL fence at this entry point
-      // as well, so trusted UI IPC cannot bypass the candidate/canonical
-      // preview boundary through history or an external address.
-      return {
-        ok: false,
-        code: 'NAVIGATION_BLOCKED',
-        retryable: false,
-        message: 'Agent HTML previews cannot navigate outside the bound document.',
-      }
-    }
     const contents = record.view.webContents
     if (
-      isArtifactBridgeProtocolVersion(record.version)
-      && record.kind === 'artifact-preview'
+      record.kind === 'artifact-preview'
       && request.action !== 'stop'
       && request.action !== 'open-external'
     ) {
@@ -4332,24 +2781,12 @@ export class NativeWorkbenchSurfaceManager {
   private async destroySurfaceNow(surfaceId: string): Promise<NativeWorkbenchSurfaceResult> {
     const record = this.surfaces.get(surfaceId)
     if (!record) return { ok: true }
-    if (record.artifactBridgePins > 0) {
-      record.uiReleaseRequested = true
-      record.visibleRequested = false
-      this.setPhysicalVisibility(record, false)
-      void this.cancelAnnotationInteraction(record, 'surface-hidden', true)
-      return {
-        ok: true,
-        code: 'AGENT_EDIT_IN_PROGRESS',
-        message: 'Agent editing is continuing in the background.',
-      }
-    }
     await this.destroyRecord(record)
     return { ok: true }
   }
 
   private destroyRecord(
     record: NativeWorkbenchSurfaceRecord,
-    options: { preserveCandidatePreview?: boolean } = {},
   ): Promise<void> {
     if (record.cleanupPromise) return record.cleanupPromise
     const isCurrent = this.surfaces.get(record.id) === record
@@ -4357,6 +2794,10 @@ export class NativeWorkbenchSurfaceManager {
     if (isCurrent && this.activeSurfaceId === record.id) this.activeSurfaceId = null
     void this.cancelAnnotationInteraction(record, 'surface-closed', true)
     record.disposed = true
+    if (record.revisionTimer) clearTimeout(record.revisionTimer)
+    record.revisionTimer = null
+    record.revisionRequest?.abort()
+    record.revisionRequest = null
     record.visibleRequested = false
     this.rejectPendingPermissions(record)
     this.cancelPendingAuthentication(record)
@@ -4378,10 +2819,7 @@ export class NativeWorkbenchSurfaceManager {
       }
     } catch {}
 
-    const cleanupPromise = this.cleanupDisposedRecord(
-      record,
-      options.preserveCandidatePreview === true,
-    )
+    const cleanupPromise = this.cleanupDisposedRecord(record)
     record.cleanupPromise = cleanupPromise
     this.recordCleanups.add(cleanupPromise)
     void cleanupPromise.then(
@@ -4393,19 +2831,7 @@ export class NativeWorkbenchSurfaceManager {
 
   private async cleanupDisposedRecord(
     record: NativeWorkbenchSurfaceRecord,
-    preserveCandidatePreview: boolean,
   ): Promise<void> {
-    if (
-      !preserveCandidatePreview
-      && record.candidatePreview
-      && this.options.releaseCandidatePreview
-    ) {
-      await this.options.releaseCandidatePreview(
-        record.candidatePreview.handle,
-        new AbortController().signal,
-      ).catch(() => undefined)
-      record.candidatePreview = null
-    }
     if (record.kind === 'artifact-html') {
       try {
         await record.previewSession.protocol.unhandle(NATIVE_WORKBENCH_ARTIFACT_SCHEME)
@@ -4527,9 +2953,6 @@ export class NativeWorkbenchSurfaceManager {
       await this.installOfflineRealmGuard(record)
       record.view.webContents.setWebRTCIPHandlingPolicy('disable_non_proxied_udp')
     }
-    // Candidate previews can temporarily switch a surface created in full
-    // mode into the offline realm. Register this once for every v2 surface
-    // and consult the live mode instead of capturing the creation mode.
     previewSession.webRequest.onHeadersReceived(
       { urls: ['<all_urls>'] },
       (details, callback) => {
@@ -4658,22 +3081,16 @@ export class NativeWorkbenchSurfaceManager {
       })
     }, { useSystemPicker: false })
     previewSession.on('will-download', (event, item, webContents) => {
-      const activeCandidatePreview = (
-        record.candidatePreview !== null
-        && record.activePreviewArtifactId === record.candidatePreview.artifactId
-      )
       if (
         webContents !== record.view.webContents
         || record.disposed
-        || !nativeWorkbenchDownloadAllowed(item.hasUserGesture(), activeCandidatePreview)
+        || !nativeWorkbenchDownloadAllowed(item.hasUserGesture())
       ) {
         event.preventDefault()
         this.emit(record, 'blocked-action', {
           action: 'download',
           targetUrl: item.getURL(),
-          reason: activeCandidatePreview
-            ? 'candidate-preview-download-denied'
-            : 'user-gesture-required',
+          reason: 'user-gesture-required',
         })
         return
       }
@@ -4738,20 +3155,11 @@ export class NativeWorkbenchSurfaceManager {
 
   private async installOfflineRealmGuard(
     record: NativeWorkbenchSurfaceRecord,
-    candidateOnly = false,
   ): Promise<void> {
-    const isInstalled = candidateOnly
-      ? record.candidateOfflineRealmGuardInstalled
-      : record.offlineRealmGuardInstalled
-    if (isInstalled) return
+    if (record.offlineRealmGuardInstalled) return
     const setState = (installed: boolean, scriptId: string | null): void => {
-      if (candidateOnly) {
-        record.candidateOfflineRealmGuardInstalled = installed
-        record.candidateOfflineRealmGuardScriptId = scriptId
-      } else {
-        record.offlineRealmGuardInstalled = installed
-        record.offlineRealmGuardScriptId = scriptId
-      }
+      record.offlineRealmGuardInstalled = installed
+      record.offlineRealmGuardScriptId = scriptId
     }
     const contents = record.view.webContents
     // A newly-created WebContentsView has no renderer target until its first
@@ -4763,9 +3171,7 @@ export class NativeWorkbenchSurfaceManager {
     let scriptId: string | null = null
     try {
       const installed = await this.cdpCommand(record, 'Page.addScriptToEvaluateOnNewDocument', {
-        source: candidateOnly
-          ? NATIVE_WORKBENCH_CANDIDATE_OFFLINE_REALM_GUARD
-          : NATIVE_WORKBENCH_OFFLINE_REALM_GUARD,
+        source: NATIVE_WORKBENCH_OFFLINE_REALM_GUARD,
         runImmediately: true,
       }) as { identifier?: unknown }
       scriptId = (
@@ -4793,7 +3199,7 @@ export class NativeWorkbenchSurfaceManager {
       setState(true, scriptId)
     } catch (error) {
       // The script is installed before the verification query runs.  Remove
-      // it on a failed setup so a later canonical/full bind cannot inherit a
+      // it on a failed setup so a later preview cannot inherit a
       // half-installed guard.  Keep the record marker if removal itself
       // fails; the caller's bind rollback and the normal surface teardown can
       // retry the cleanup.
@@ -4809,32 +3215,6 @@ export class NativeWorkbenchSurfaceManager {
         }
       }
       throw error
-    }
-  }
-
-  private async removeOfflineRealmGuard(
-    record: NativeWorkbenchSurfaceRecord,
-    candidateOnly = false,
-  ): Promise<void> {
-    const isInstalled = candidateOnly
-      ? record.candidateOfflineRealmGuardInstalled
-      : record.offlineRealmGuardInstalled
-    const scriptId = candidateOnly
-      ? record.candidateOfflineRealmGuardScriptId
-      : record.offlineRealmGuardScriptId
-    if (!isInstalled && !scriptId) return
-    await this.ensureDebuggerAttached(record)
-    if (scriptId) {
-      await this.cdpCommand(record, 'Page.removeScriptToEvaluateOnNewDocument', {
-        identifier: scriptId,
-      })
-    }
-    if (candidateOnly) {
-      record.candidateOfflineRealmGuardInstalled = false
-      record.candidateOfflineRealmGuardScriptId = null
-    } else {
-      record.offlineRealmGuardInstalled = false
-      record.offlineRealmGuardScriptId = null
     }
   }
 
@@ -5150,7 +3530,7 @@ export class NativeWorkbenchSurfaceManager {
       return { action: 'deny' }
     })
     contents.on('will-navigate', (event, targetUrl) => {
-      if (isArtifactBridgeProtocolVersion(record.version)) {
+      if ((record.version !== NATIVE_WORKBENCH_PROTOCOL_VERSION)) {
         void this.cancelAnnotationInteraction(record, 'surface-navigation', true)
       }
       if (record.version === NATIVE_WORKBENCH_PROTOCOL_VERSION) {
@@ -5160,25 +3540,6 @@ export class NativeWorkbenchSurfaceManager {
         // denied.
         if (!record.initialDocumentCommitted && targetUrl === record.documentUrl) return
         event.preventDefault()
-        return
-      }
-      if (
-        record.kind === 'artifact-preview'
-        && record.version === NATIVE_WORKBENCH_PROTOCOL_VERSION_V4
-      ) {
-        // Autonomous browser control is fenced to the exact Gateway-issued
-        // candidate/canonical URL currently recorded on this surface.  A
-        // renderer link, script, or stale user gesture must never turn the
-        // agent preview into an arbitrary top-level browser.
-        if (targetUrl !== record.documentUrl) {
-          event.preventDefault()
-          this.reportPrivilegedGatewayBlock(record, targetUrl)
-          this.emit(record, 'blocked-action', {
-            action: 'navigation',
-            targetUrl,
-            reason: 'agent-preview-navigation-denied',
-          })
-        }
         return
       }
       if (!this.v2TopLevelNavigationAllowed(record, targetUrl)) {
@@ -5202,16 +3563,11 @@ export class NativeWorkbenchSurfaceManager {
       }
     })
     contents.on('will-redirect', (event, targetUrl) => {
-      if (isArtifactBridgeProtocolVersion(record.version)) {
+      if ((record.version !== NATIVE_WORKBENCH_PROTOCOL_VERSION)) {
         void this.cancelAnnotationInteraction(record, 'surface-redirect', true)
       }
       if (
         record.version === NATIVE_WORKBENCH_PROTOCOL_VERSION
-        || (
-          record.kind === 'artifact-preview'
-          && record.version === NATIVE_WORKBENCH_PROTOCOL_VERSION_V4
-          && targetUrl !== record.documentUrl
-        )
         || !this.v2TopLevelNavigationAllowed(record, targetUrl)
       ) {
         event.preventDefault()
@@ -5220,10 +3576,7 @@ export class NativeWorkbenchSurfaceManager {
           this.emit(record, 'blocked-action', {
             action: 'redirect',
             targetUrl,
-            reason: record.kind === 'artifact-preview'
-              && record.version === NATIVE_WORKBENCH_PROTOCOL_VERSION_V4
-              ? 'agent-preview-navigation-denied'
-              : 'scheme-or-offline-policy',
+            reason: 'scheme-or-offline-policy',
           })
         }
       } else {
@@ -5291,10 +3644,9 @@ export class NativeWorkbenchSurfaceManager {
     contents.on(
       'did-start-navigation',
       (_event, _targetUrl, _isInPlace, isMainFrame) => {
-        if (!isMainFrame || !isArtifactBridgeProtocolVersion(record.version)) return
+        if (!isMainFrame || !(record.version !== NATIVE_WORKBENCH_PROTOCOL_VERSION)) return
         if (
-          record.kind === 'artifact-preview'
-          && record.version === NATIVE_WORKBENCH_PROTOCOL_VERSION_V4
+          record.kind !== 'artifact-html'
         ) {
           record.browserDocumentReady = false
           record.browserRuntimeException = false
@@ -5303,7 +3655,6 @@ export class NativeWorkbenchSurfaceManager {
           record.privilegedOriginReported = false
         }
         record.annotationDocumentGeneration += 1
-        this.bumpArtifactBridgeBindingGeneration(record)
         this.invalidateBrowserAnchors(record)
         void this.cancelAnnotationInteraction(record, 'surface-navigation', true)
       },
@@ -5365,8 +3716,7 @@ export class NativeWorkbenchSurfaceManager {
     })
     contents.on('did-start-loading', () => {
       if (
-        record.kind === 'artifact-preview'
-        && record.version === NATIVE_WORKBENCH_PROTOCOL_VERSION_V4
+        record.kind !== 'artifact-html'
       ) {
         record.browserDocumentReady = false
         record.browserRuntimeException = false
@@ -5381,9 +3731,8 @@ export class NativeWorkbenchSurfaceManager {
     contents.on('did-stop-loading', () => this.emitNavigationState(record))
     contents.on('page-title-updated', () => this.emitNavigationState(record))
     contents.on('did-navigate-in-page', () => {
-      if (isArtifactBridgeProtocolVersion(record.version)) {
+      if ((record.version !== NATIVE_WORKBENCH_PROTOCOL_VERSION)) {
         record.annotationDocumentGeneration += 1
-        this.bumpArtifactBridgeBindingGeneration(record)
         this.invalidateBrowserAnchors(record)
         void this.cancelAnnotationInteraction(record, 'surface-navigation', true)
       }
@@ -5391,8 +3740,7 @@ export class NativeWorkbenchSurfaceManager {
     })
     contents.on('did-finish-load', () => {
       if (
-        record.kind === 'artifact-preview'
-        && record.version === NATIVE_WORKBENCH_PROTOCOL_VERSION_V4
+        record.kind !== 'artifact-html'
       ) {
         record.browserDocumentReady = true
       }
@@ -5404,8 +3752,7 @@ export class NativeWorkbenchSurfaceManager {
     contents.on('did-fail-load', (_event, errorCode, errorDescription, _url, isMainFrame) => {
       if (!isMainFrame || record.disposed || errorCode === -3) return
       if (
-        record.kind === 'artifact-preview'
-        && record.version === NATIVE_WORKBENCH_PROTOCOL_VERSION_V4
+        record.kind !== 'artifact-html'
       ) {
         record.browserDocumentReady = false
         record.browserRuntimeException = true
@@ -5707,14 +4054,6 @@ export class NativeWorkbenchSurfaceManager {
     record.visibleRequested = false
     this.setPhysicalVisibility(record, false)
     this.invalidateBrowserAnchors(record)
-    if (record.artifactBridgePins > 0) {
-      // A turn binding owns one deterministic recovery attempt. Preserve the
-      // exact record and candidate mapping until its next operation decides
-      // whether recovery is safe; UI lifecycle events must not pre-empt it.
-      void this.cancelAnnotationInteraction(record, 'surface-failed', true)
-      this.dispatchEvent(record, type, detail)
-      return true
-    }
     // Begin the complete teardown before calling renderer-owned event code.
     // destroyRecord removes the slot and marks the record disposed
     // synchronously, so callback re-entry cannot revive or replace a surface

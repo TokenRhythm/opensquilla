@@ -26,8 +26,6 @@ from opensquilla.engine.capacity_admission import (
 from opensquilla.engine.pipeline import TurnContext
 from opensquilla.engine.pricing import lookup_price
 from opensquilla.engine.routing import (
-    ArtifactRoutingFacts,
-    ArtifactRoutingUnavailableError,
     BudgetGateInput,
     CalibrationState,
     PolicyInputs,
@@ -35,7 +33,6 @@ from opensquilla.engine.routing import (
     RoutingPolicyEngine,
     TierCapability,
     calibration_path,
-    effective_artifact_floor,
     large_context_min_tier,
     load_calibration,
     provider_mismatch,
@@ -99,21 +96,6 @@ _MAX_ROUTING_HISTORY = 5
 _ROUTING_HISTORY_WINDOW = 1800
 
 
-def _artifact_routing_facts_for_turn(ctx: TurnContext) -> ArtifactRoutingFacts | None:
-    """Parse only the bounded artifact enums seeded by the turn runner."""
-
-    artifact_format = ctx.metadata.get("artifact_format")
-    operation_class = ctx.metadata.get("artifact_operation_class")
-    if not isinstance(artifact_format, str) or not isinstance(operation_class, str):
-        return None
-    try:
-        return ArtifactRoutingFacts.from_values(artifact_format, operation_class)
-    except ValueError:
-        # Invalid runtime metadata must not smuggle arbitrary values into router
-        # telemetry or accidentally create a capability floor.
-        return None
-
-
 def _router_text_fallback_chain(
     selected_tier: object,
     tiers: dict,
@@ -136,10 +118,8 @@ def _router_text_fallback_chain(
             minimum_index = TEXT_TIERS.index(minimum)
         except ValueError:
             return []
-        # Artifact capability floors are hard execution constraints, including
-        # provider fallback. Prefer the nearest lower capable tier first, then
-        # progressively stronger tiers. This preserves normal router behavior
-        # while ensuring c2/c3 mutations can never fall through to c1/c0.
+        # Capacity requirements also constrain provider fallback. Prefer
+        # the nearest lower capable tier, then eligible stronger tiers.
         candidate_tiers = [
             *reversed(TEXT_TIERS[minimum_index:selected_index]),
         ]
@@ -1381,23 +1361,8 @@ async def finalize_squilla_router_capacity(ctx: TurnContext) -> TurnContext:
     request_input_tokens = _complete_request_estimated_tokens(ctx, semantic_message)
     ctx.metadata["large_context_capacity_required"] = True
 
-    minimum_context_tier = normalize_text_tier(
+    minimum_tier = normalize_text_tier(
         ctx.metadata.get("large_context_floor_min_tier")
-    )
-    configured_text_tiers = _configured_text_tiers(tiers)
-    artifact_facts = _artifact_routing_facts_for_turn(ctx)
-    artifact_floor = effective_artifact_floor(artifact_facts, configured_text_tiers)
-    if artifact_facts is not None and artifact_floor is None:
-        raise ArtifactRoutingUnavailableError(artifact_facts, configured_text_tiers)
-    execution_floor_candidates = [
-        tier
-        for tier in (artifact_floor, minimum_context_tier)
-        if tier is not None
-    ]
-    minimum_tier = (
-        max(execution_floor_candidates, key=tier_index)
-        if execution_floor_candidates
-        else None
     )
     selected_raw = str(ctx.metadata.get("routed_tier") or "").strip()
     selected_tier = selected_raw if selected_raw in tiers else None
@@ -1410,7 +1375,7 @@ async def finalize_squilla_router_capacity(ctx: TurnContext) -> TurnContext:
     # declarations (which would incorrectly fail when all four are text-only).
     projection_required = ctx.metadata.get("image_input_projection_required") is True
     if requires_image and projection_required and minimum_tier is None:
-        # Without an Artifact or large-context floor, a marker-only request
+        # Without a large-context floor, a marker-only request
         # needs no special attachment-capacity revalidation; the ordinary
         # provider admission path still checks its exact text payload.
         return ctx
@@ -2012,22 +1977,14 @@ async def apply_squilla_router(ctx: TurnContext) -> TurnContext:
         return ctx
 
     rollout_phase: str = getattr(router_cfg, "rollout_phase", "observe")
-    artifact_facts = _artifact_routing_facts_for_turn(ctx)
     if not tiers:
-        if artifact_facts is not None:
-            raise ArtifactRoutingUnavailableError(artifact_facts, [])
         return ctx
 
-    # Resolve the hard Artifact floor before every router shortcut. This keeps
-    # hold, classify, and empty-text turns on the same fail-closed contract.
     valid_tiers = [name for name, tier in tiers.items() if not tier.get("image_only", False)]
     valid_tiers = sorted(
         valid_tiers,
         key=lambda name: (0, tier_index(name)) if tier_index(name) >= 0 else (1, 0),
     )
-    artifact_floor = effective_artifact_floor(artifact_facts, valid_tiers)
-    if artifact_facts is not None and artifact_floor is None:
-        raise ArtifactRoutingUnavailableError(artifact_facts, valid_tiers)
 
     # This sequence is independent of the bounded sticky-routing history. It is
     # reserved before any shortcut or classifier path so every persisted router
@@ -2045,16 +2002,7 @@ async def apply_squilla_router(ctx: TurnContext) -> TurnContext:
         resolve_large_context_floor_tier(required_context_tier, valid_tiers)
         or required_context_tier
     )
-    execution_floor_candidates = [
-        tier
-        for tier in (artifact_floor, minimum_context_tier)
-        if tier is not None
-    ]
-    minimum_execution_tier = (
-        max(execution_floor_candidates, key=tier_index)
-        if execution_floor_candidates
-        else None
-    )
+    minimum_execution_tier = minimum_context_tier
     attachment_capacity_required = _attachment_capacity_required(ctx)
     if attachment_capacity_required:
         ctx.metadata["large_context_capacity_required"] = True
@@ -2280,7 +2228,7 @@ async def apply_squilla_router(ctx: TurnContext) -> TurnContext:
         # Image shortcuts bypass the ordinary policy engine, but they still
         # obey the same provider-mismatch veto. Restrict the rebind candidates
         # to tiers that can execute this image mode and satisfy the effective
-        # Artifact/context floor.
+        # context-capacity floor.
         image_veto_candidates = (
             ordered_image_tiers
             if image_input_mode == "native"
@@ -2357,9 +2305,8 @@ async def apply_squilla_router(ctx: TurnContext) -> TurnContext:
         stage_router_decision(ctx, decision=decision)
         return ctx
 
-    # Empty routing text cannot be classified, but a validated Artifact mutation
-    # still has a deterministic capability floor and must route to it. This is
-    # only reached for non-image turns; the vision bypass handles empty captions.
+    # Empty routing text still needs enough context capacity for attachments.
+    # The vision bypass above handles image turns without captions.
     if not routing_message.strip():
         if minimum_execution_tier is None and not attachment_capacity_required:
             return ctx
@@ -2389,15 +2336,8 @@ async def apply_squilla_router(ctx: TurnContext) -> TurnContext:
             tier=selected_tier,
             model=tier_cfg.get("model", ctx.model),
             confidence=1.0,
-            source=(
-                "artifact_floor"
-                if artifact_facts is not None and minimum_context_tier is None
-                else "large_context_attachment_route"
-            ),
+            source=("large_context_attachment_route"),
         )
-        if artifact_facts is not None:
-            ctx.metadata.update(artifact_facts.to_telemetry())
-            ctx.metadata["artifact_floor_applied"] = True
         ctx.metadata["baseline_model"] = ctx.model
         ctx.model = decision.model
         ctx.metadata["routed_tier"] = decision.tier
@@ -2411,10 +2351,8 @@ async def apply_squilla_router(ctx: TurnContext) -> TurnContext:
             decision.tier,
             tiers,
             minimum_tier=minimum_execution_tier,
-            allow_stronger_fallbacks=artifact_facts is not None,
+            allow_stronger_fallbacks=(False),
         )
-        if artifact_facts is not None:
-            ctx.metadata["router_fallback_strict"] = True
         ctx.metadata.update(_compute_savings(decision.model, tiers))
         _flag_tier_provider_mismatch(ctx, tiers, decision.tier, routing_applied=True)
         _record_thinking_metadata(ctx, router_cfg, tier_cfg)
@@ -2484,23 +2422,6 @@ async def apply_squilla_router(ctx: TurnContext) -> TurnContext:
                     else "large_context_floor"
                 ),
             )
-            if (
-                artifact_facts is not None
-                and artifact_floor is not None
-                and tier_index(decision.tier) < tier_index(artifact_floor)
-            ):
-                decision = RoutingDecision(
-                    tier=artifact_floor,
-                    model=tiers[artifact_floor].get("model", decision.model),
-                    confidence=decision.confidence,
-                    source="artifact_floor",
-                )
-                ctx.metadata.update(artifact_facts.to_telemetry())
-                ctx.metadata["artifact_floor_applied"] = True
-                ctx.metadata["artifact_floor_from_tier"] = hold.tier
-            elif artifact_facts is not None:
-                ctx.metadata.update(artifact_facts.to_telemetry())
-                ctx.metadata["artifact_floor_applied"] = False
             ctx.metadata["baseline_model"] = ctx.model
             ctx.model = decision.model
             ctx.metadata["routed_tier"] = decision.tier
@@ -2513,10 +2434,8 @@ async def apply_squilla_router(ctx: TurnContext) -> TurnContext:
                 decision.tier,
                 tiers,
                 minimum_tier=minimum_execution_tier,
-                allow_stronger_fallbacks=artifact_facts is not None,
+                allow_stronger_fallbacks=(False),
             )
-            if artifact_facts is not None:
-                ctx.metadata["router_fallback_strict"] = True
             ctx.metadata["router_control_hold_applied"] = True
             if applied_hold_tier != hold.tier:
                 ctx.metadata["router_control_hold_capacity_clamped"] = True
@@ -2700,7 +2619,6 @@ async def apply_squilla_router(ctx: TurnContext) -> TurnContext:
             ),
             calibration=_calibration_for_turn(router_cfg),
             budget=budget_input,
-            artifact=artifact_facts,
         )
     )
     decision = policy_result.decision
@@ -2709,20 +2627,13 @@ async def apply_squilla_router(ctx: TurnContext) -> TurnContext:
     ctx.metadata.update(policy_result.metadata_updates)
     _log_budget_outcome(ctx)
 
-    # Artifact floors are execution constraints, not observe-only telemetry.
+    # Context capacity must be respected even when classifier routing is observed.
     routing_applied = (
         rollout_phase != "observe"
-        or artifact_facts is not None
         or minimum_context_tier is not None
         or attachment_capacity_required
     )
     provider_valid_tiers = valid_tiers
-    if artifact_floor is not None:
-        provider_valid_tiers = [
-            tier
-            for tier in valid_tiers
-            if tier_index(tier) >= tier_index(artifact_floor)
-        ]
     decision, thinking_mode, prompt_policy = _apply_provider_mismatch_veto(
         ctx,
         router_cfg,
@@ -2784,10 +2695,8 @@ async def apply_squilla_router(ctx: TurnContext) -> TurnContext:
         decision.tier,
         tiers,
         minimum_tier=minimum_execution_tier,
-        allow_stronger_fallbacks=artifact_facts is not None,
+        allow_stronger_fallbacks=(False),
     )
-    if artifact_facts is not None:
-        ctx.metadata["router_fallback_strict"] = True
     ctx.metadata.update(_compute_savings(decision.model, tiers))
     _flag_tier_provider_mismatch(ctx, tiers, decision.tier, routing_applied=routing_applied)
 
