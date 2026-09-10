@@ -392,8 +392,9 @@ test('workspace navigation keeps one transport while the target subscription rec
     '[data-testid="chat-session-recovery-status"][data-recovery-state="live-connecting"]',
   )
   await expect(liveRecovery).toContainText(
-    'Gateway connected. Restoring live updates for this session',
+    'Recovering automatically. You can keep editing; unsent text and attachments stay here.',
   )
+  await expect(liveRecovery).toHaveAttribute('role', 'status')
 
   const composer = page.locator('.chat-textarea')
   const sendButton = page.locator('.chat-send-btn.btn--primary')

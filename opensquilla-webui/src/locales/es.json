@@ -3432,6 +3432,7 @@
     "liveConnecting": "Restaurando las actualizaciones en tiempo real…",
     "liveConnectingConnected": "Gateway conectado. Restaurando las actualizaciones en tiempo real de esta sesión…",
     "gatewayReconnecting": "Reconectando con el Gateway…",
+    "automaticRecoveryDescription": "La recuperación es automática. Puedes seguir editando; el texto y los archivos sin enviar se conservan aquí.",
     "liveUnavailable": "Las actualizaciones en tiempo real no están disponibles temporalmente",
     "liveUnavailableDescription": "El historial sigue disponible. Vuelve a conectarte antes de enviar.",
     "liveUnavailableConnectedDescription": "El Gateway está conectado y el historial sigue disponible. El envío se reanudará cuando se recuperen las actualizaciones en tiempo real.",

@@ -167,7 +167,7 @@ test('New Task owns the view before delayed project hydration and old events', a
   emit('session.event.ensemble_progress', { event_type: 'proposer_finish', proposer_label: 'late', proposer_model: 'old-late' })
   emit('session.event.router_decision', { tier: 'c1', model: 'synthetic/late', routing_applied: true })
   emit('session.event.text_delta', { text: 'OLD LATE TEXT' })
-  emit('session.event.thinking_delta', { text: 'OLD LATE THINKING' })
+  emit('session.event.thinking', { text: 'OLD LATE THINKING' })
   if (inspectRawState) await testInfo.attach('draft-state', { body: JSON.stringify(await readChat(page)), contentType: 'application/json' })
   await page.screenshot({ path: testInfo.outputPath('draft.png') })
   try {
@@ -231,7 +231,7 @@ test('New Task owns the view before delayed project hydration and old events', a
   const beforeReconnect = subscriptions.length
   socket!.close()
   await expect.poll(() => subscriptions.length, { timeout: 15_000 }).toBeGreaterThan(beforeReconnect)
-  expect(subscriptions.at(-1)).not.toBe(OLD)
+  expect(subscriptions[subscriptions.length - 1]).not.toBe(OLD)
   await expect(page.locator('.chat--new-landing')).toBeVisible()
   await page.locator('.chat-textarea').fill('A fresh synthetic ensemble task.')
   pauseCompletion = true

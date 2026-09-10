@@ -492,14 +492,14 @@ def test_compatibility_manifest_is_schema_derived_and_deterministic() -> None:
     assert manifest["protocol"] == runner.GATEWAY_PROTOCOL
     assert manifest["wireVersion"] == 4
     assert manifest["source"] == {
-        "schemaCount": 218,
-        "methodCount": 209,
-        "eventFamilyCount": 9,
+        "schemaCount": 221,
+        "methodCount": 211,
+        "eventFamilyCount": 10,
         "schemaTreeSha256": runner._schema_tree_digest(specs),
         "generatorSha256": runner._generator_digest(),
     }
     assert Counter(entry["lifecycle"] for entry in manifest["methods"]) == {
-        "stable": 204,
+        "stable": 206,
         "legacy": 5,
     }
     assert {
@@ -518,8 +518,9 @@ def test_compatibility_manifest_is_schema_derived_and_deterministic() -> None:
         for entry in [*manifest["methods"], *manifest["events"]]
     )
     event_families = {entry["family"]: entry for entry in manifest["events"]}
-    assert len(event_families) == 9
+    assert len(event_families) == 10
     assert event_families["models.routing.changed"]["wireNames"] == ["models.routing.changed"]
+    assert event_families["transport.flow.dirty"]["wireNames"] == ["transport.flow.dirty"]
     assert "session.event.artifact_state" in event_families["conversation.events"]["wireNames"]
     assert "session.event.artifact_state" in event_families["document.state_changed"]["wireNames"]
     assert "private" not in first.lower()

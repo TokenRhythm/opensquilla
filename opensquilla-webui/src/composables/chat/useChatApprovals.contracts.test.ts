@@ -111,6 +111,7 @@ async function harness(statusResult: unknown = { found: true, pending: true, res
     approvals,
     handlers,
     rpcCall,
+    approvalCenter,
     appendInterruptFrame,
     interruptState,
     emitToolResult: conversationEvents.emitToolResult,
@@ -130,6 +131,48 @@ function installSnapshot(pending: unknown[] = []) {
 }
 
 describe('approval safe display contracts', () => {
+  it.each([
+    { found: true, pending: false, resolved: true, approved: false, resolution: 'denied' },
+    { found: false, pending: false, resolved: false, approved: false, resolution: 'unavailable' },
+  ])('recovers a missed terminal push without guessing from pending absence: $resolution', async status => {
+    installSnapshot([{ id: 'lost-terminal', sessionKey: 'agent:main:web', namespace: 'exec', command: 'echo test' }])
+    const runtime = await harness(status)
+    try {
+      installSnapshot([])
+      await runtime.approvals.reconcile()
+      expect(runtime.interruptState.value.get('lost-terminal')?.resolution).toBe(status.resolution)
+      expect(runtime.rpcCall).toHaveBeenCalledWith('exec.approval.status', { id: 'lost-terminal' })
+    } finally { runtime.unsubscribe(); runtime.scope.stop() }
+  })
+
+  it('does not claim approval reconciliation success when a missing-card status cannot be read', async () => {
+    installSnapshot([{ id: 'unavailable', sessionKey: 'agent:main:web', namespace: 'exec', command: 'echo test' }])
+    const runtime = await harness()
+    try {
+      installSnapshot([])
+      runtime.approvalCenter.status.mockRejectedValueOnce(new Error('network unavailable'))
+      await expect(runtime.approvals.reconcile()).rejects.toThrow('network unavailable')
+      expect(runtime.interruptState.value.get('unavailable')?.resolution).toBeFalsy()
+    } finally { runtime.unsubscribe(); runtime.scope.stop() }
+  })
+
+  it('does not let an older same-connection reconciliation replace a newer approval outcome', async () => {
+    installSnapshot([{ id: 'superseded', sessionKey: 'agent:main:web', namespace: 'exec', command: 'echo test' }])
+    const runtime = await harness({ found: true, pending: false, resolved: true, resolution: 'denied' })
+    try {
+      installSnapshot([])
+      const late = deferred<any>()
+      runtime.approvalCenter.status.mockImplementationOnce(() => late.promise)
+      const first = runtime.approvals.reconcile()
+      const rejected = expect(first).rejects.toThrow('superseded')
+      await vi.waitFor(() => expect(runtime.approvalCenter.status).toHaveBeenCalledOnce())
+      await runtime.approvals.reconcile()
+      late.resolve({ found: true, pending: false, resolved: true, approved: true, resolution: 'approved', deadline: null })
+      await rejected
+      expect(runtime.interruptState.value.get('superseded')?.resolution).toBe('denied')
+    } finally { runtime.unsubscribe(); runtime.scope.stop() }
+  })
+
   it('whitelists sandbox context and drops sensitive internals recursively', () => {
     expect(safeApprovalDisplayArgs('sandbox_path', {
       path: '/workspace/report.md',

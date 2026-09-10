@@ -1,5 +1,24 @@
 export type TransportTerminationAction = 'reject' | 'reconnect'
 
+export interface TransportDeliveryReceipt {
+  delivery_epoch: string
+  delivery_id: number
+}
+
+export interface TransportInstalledReceipt {
+  key: string
+  snapshot_id: string
+  sync_revision: string
+  stream_generation: string
+  stream_seq: number
+}
+
+export type TransportConsumptionHandler = (
+  payload: unknown, meta: Record<string, unknown>,
+) => 'applied' | 'dirty' | Promise<'applied' | 'dirty'>
+
+export type TransportGapHandler = (detail: unknown) => Promise<boolean>
+
 /** Request lifecycle policy shared only between the private transport and its Adapters. */
 export interface TransportCallOptions {
   timeoutMs?: number

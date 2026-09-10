@@ -159,7 +159,8 @@ PRODUCTION_HANDLER_NAMES = {
 def test_production_registry_uses_contract_wrappers_without_surface_drift() -> None:
     registry = get_dispatcher()
 
-    assert len(registry.list_methods()) == 307
+    # The existing surface plus snapshot.read and transport.flow.update.
+    assert len(registry.list_methods()) == 309
     assert tuple(PRODUCTION_HANDLER_NAMES) == SANDBOX_RUNTIME_CONTRACT_METHODS
     for method, implementation_name in PRODUCTION_HANDLER_NAMES.items():
         entry = registry.get_entry(method)

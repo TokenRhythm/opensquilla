@@ -40,6 +40,20 @@ def get_session_storage(session_manager: object | None) -> Any | None:
     return getattr(session_manager, "_storage", None)
 
 
+async def read_session_identity(
+    session_manager: object | None, session_key: str,
+) -> tuple[str | None, int | None]:
+    """Read the durable owner pair used to fence snapshot capture/installation."""
+    from opensquilla.session.storage import bounded_interactive_storage_reads
+
+    storage = get_session_storage(session_manager)
+    if storage is None:
+        return None, None
+    with bounded_interactive_storage_reads():
+        session = await storage.get_session(session_key)
+    return (session.session_id, session.epoch) if session is not None else (None, None)
+
+
 async def session_id_for_key(
     session_manager: object | None,
     session_key: str,

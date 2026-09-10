@@ -80,6 +80,7 @@ import opensquilla.gateway.rpc_sessions as _rpc_sessions  # noqa: E402
 import opensquilla.gateway.rpc_skills  # noqa: E402, F401
 import opensquilla.gateway.rpc_system  # noqa: E402, F401
 import opensquilla.gateway.rpc_tools  # noqa: E402, F401
+import opensquilla.gateway.rpc_transport  # noqa: E402, F401
 import opensquilla.gateway.rpc_usage  # noqa: E402, F401
 import opensquilla.gateway.rpc_wizard  # noqa: E402, F401
 import opensquilla.gateway.rpc_workbench_resources  # noqa: E402, F401

@@ -3408,6 +3408,23 @@ def test_desktop_e2e_shutdown_helpers_bound_windows_cleanup_without_masking_fail
         assert ".close().catch(() => {})" not in flow
 
 
+def test_desktop_shutdown_diagnostics_report_file_cleanup_errors_without_masking_exit() -> None:
+    source = _read("desktop/electron/scripts/test-desktop-window-background-flow.mjs")
+    diagnostics = _section(source, "diagnostics: async () => {", "shutdownError = shutdown.error")
+
+    assert "await handle?.close()" in diagnostics
+    assert "logCloseFailed: true" in diagnostics
+    assert (
+        "closeErrorCode: ['ENOENT', 'EACCES', 'EPERM', 'EBUSY', 'EIO'].includes(error?.code)"
+        in diagnostics
+    )
+    assert "...shutdownDiagnostics," in diagnostics
+    assert "? error.code : 'OTHER'" in diagnostics
+    assert "error.message" not in diagnostics
+    assert "return shutdownDiagnostics" in diagnostics
+    assert "flowSucceeded && shutdownError" in source
+
+
 def test_desktop_dual_source_update_resolver_wires_static_channels() -> None:
     # Stable and same-base preview discovery uses a rate-limit-free static OSS
     # manifest. Versioned assets then use a strict OSS/GitHub generic feed with

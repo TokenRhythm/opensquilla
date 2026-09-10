@@ -3516,6 +3516,7 @@
     "liveConnecting": "Restoring live updates…",
     "liveConnectingConnected": "Gateway connected. Restoring live updates for this session…",
     "gatewayReconnecting": "Reconnecting to the Gateway…",
+    "automaticRecoveryDescription": "Recovering automatically. You can keep editing; unsent text and attachments stay here.",
     "liveUnavailable": "Live updates are temporarily unavailable",
     "liveUnavailableDescription": "History remains available. Reconnect before sending.",
     "liveUnavailableConnectedDescription": "The Gateway is connected and history remains available. Sending resumes when this session's live updates recover.",

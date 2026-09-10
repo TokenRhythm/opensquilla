@@ -1,7 +1,7 @@
 // @vitest-environment happy-dom
 
 import { createPinia, setActivePinia } from 'pinia'
-import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { useRpcStore } from './rpc'
 
 const connectCalls: Array<{ url: string; token?: string }> = []
@@ -10,12 +10,15 @@ const clients: Array<{
   disconnect: ReturnType<typeof vi.fn>
   ready: ReturnType<typeof vi.fn>
   recoverConnectionGeneration: ReturnType<typeof vi.fn>
+  ensureConnected: ReturnType<typeof vi.fn>
+  notifyResume: ReturnType<typeof vi.fn>
   connectionGeneration: number
 }> = []
 
 vi.mock('@/lib/rpc', () => ({
   RpcClient: class {
     state = 'disconnected'
+    get lifecycle() { return this.state === 'disconnected' ? 'stopped' : this.state }
     connectionGeneration = 0
     private listeners = new Map<string, Array<(...args: unknown[]) => void>>()
 
@@ -48,12 +51,18 @@ vi.mock('@/lib/rpc', () => ({
       this.emit('_state', 'disconnected')
     })
     ready = vi.fn()
+    ensureConnected = vi.fn()
+    notifyResume = vi.fn()
     recoverConnectionGeneration = vi.fn(() => true)
     call = vi.fn()
   },
 }))
 
 describe('rpc link-token bootstrap', () => {
+  afterEach(() => {
+    vi.useRealTimers()
+    vi.restoreAllMocks()
+  })
   beforeEach(() => {
     setActivePinia(createPinia())
     connectCalls.length = 0
@@ -290,5 +299,83 @@ describe('rpc link-token bootstrap', () => {
     expect(clients[0].disconnect).toHaveBeenCalledOnce()
     expect(store.error).toBe('runtime stopped')
     expect(sessionStorage.getItem('opensquilla.wsToken')).toBeNull()
+  })
+  it('applies same-address token rotation and never revives an old token for an empty descriptor', async () => {
+    let publish!: (payload: unknown) => void
+    const base = {
+      schemaVersion: 1, revision: 1, status: 'ready', instanceId: 'runtime-a',
+      profileFingerprint: 'profile-a', httpUrl: 'http://127.0.0.1:18791',
+      wsUrl: 'ws://127.0.0.1:18791/ws', authToken: 'token-a', error: null,
+    }
+    window.opensquillaDesktop = {
+      getGatewayConnection: vi.fn(async () => base),
+      onGatewayConnectionChanged: vi.fn(callback => { publish = callback; return () => {} }),
+    } as unknown as OpenSquillaDesktopApi
+    const store = useRpcStore()
+    store.init()
+    await vi.waitFor(() => expect(connectCalls).toHaveLength(1))
+    publish({ ...base, revision: 2 })
+    expect(clients[0].ensureConnected).toHaveBeenCalledOnce()
+    expect(connectCalls).toHaveLength(1)
+    publish({ ...base, revision: 3, authToken: 'token-b' })
+    expect(connectCalls[connectCalls.length - 1]?.token).toBe('token-b')
+    publish({ ...base, revision: 4, authToken: null })
+    expect(connectCalls[connectCalls.length - 1]?.token).toBeUndefined()
+    expect(sessionStorage.getItem('opensquilla.wsToken')).toBeNull()
+    store.disconnect()
+    publish({ ...base, revision: 5, authToken: 'token-c' })
+    expect(connectCalls).toHaveLength(3)
+    store.$dispose()
+  })
+
+  it('refreshes authoritative credentials at most once for the same failed intent', async () => {
+    const base = {
+      schemaVersion: 1, revision: 1, status: 'ready', instanceId: 'runtime-a',
+      profileFingerprint: 'profile-a', httpUrl: 'http://127.0.0.1:18791',
+      wsUrl: 'ws://127.0.0.1:18791/ws', authToken: 'bad-token', error: null,
+    }
+    const getConnection = vi.fn(async () => base)
+    window.opensquillaDesktop = {
+      getGatewayConnection: getConnection,
+      onGatewayConnectionChanged: vi.fn(() => () => {}),
+    } as unknown as OpenSquillaDesktopApi
+    const store = useRpcStore()
+    store.init()
+    await vi.waitFor(() => expect(connectCalls).toHaveLength(1))
+    clients[0].emit('_blocked', { reason: 'authentication_mismatch' })
+    await vi.waitFor(() => expect(getConnection).toHaveBeenCalledTimes(2))
+    clients[0].emit('_blocked', { reason: 'authentication_mismatch' })
+    await Promise.resolve()
+    expect(getConnection).toHaveBeenCalledTimes(2)
+    store.$dispose()
+  })
+
+  it('recovers a failed descriptor read without manual retry and ignores late results after stop', async () => {
+    vi.useFakeTimers()
+    vi.spyOn(Math, 'random').mockReturnValue(1)
+    const base = {
+      schemaVersion: 1, revision: 1, status: 'ready', instanceId: 'runtime-a',
+      profileFingerprint: 'profile-a', httpUrl: 'http://127.0.0.1:18791',
+      wsUrl: 'ws://127.0.0.1:18791/ws', authToken: 'token-a', error: null,
+    }
+    const getConnection = vi.fn().mockRejectedValueOnce(new Error('temporary')).mockResolvedValue(base)
+    window.opensquillaDesktop = {
+      getGatewayConnection: getConnection,
+      onGatewayConnectionChanged: vi.fn(() => () => {}),
+    } as unknown as OpenSquillaDesktopApi
+    const store = useRpcStore()
+    store.init()
+    await vi.advanceTimersByTimeAsync(500)
+    expect(getConnection).toHaveBeenCalledTimes(2)
+    expect(connectCalls).toHaveLength(1)
+    let resolve!: (value: unknown) => void
+    getConnection.mockImplementationOnce(() => new Promise(done => { resolve = done }))
+    store.notifyResume()
+    await Promise.resolve()
+    store.disconnect()
+    resolve({ ...base, revision: 2 })
+    await vi.advanceTimersByTimeAsync(8_000)
+    expect(connectCalls).toHaveLength(1)
+    store.$dispose()
   })
 })

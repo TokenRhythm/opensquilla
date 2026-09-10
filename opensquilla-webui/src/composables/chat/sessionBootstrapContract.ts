@@ -1,4 +1,5 @@
 import { SessionReadFailure } from '@/modules/sessionReadLifecycle'
+import { ApprovalCenterError } from '@/modules/approvalCenter'
 
 export const SESSION_BOOTSTRAP_BUDGET_MS = 15_000
 export const SESSION_PHASE_ATTEMPT_BUDGET_MS = 7_000
@@ -43,6 +44,7 @@ export function shouldRetrySessionPhase(error: unknown): boolean {
   if (isRpcAbort(error)) return false
   if (isRpcTimeout(error) || isStorageBusy(error)) return true
   if (error instanceof SessionReadFailure) return error.retryable
+  if (error instanceof ApprovalCenterError) return error.kind === 'unavailable'
   // A socket recycle rejects sibling requests with a generic connection error.
   // One bounded retry is safe and lets both orthogonal phases join the new
   // generation without teaching every caller about transport wording.
