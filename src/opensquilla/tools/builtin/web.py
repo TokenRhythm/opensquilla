@@ -12,8 +12,6 @@ from pathlib import Path
 from typing import Any, cast
 from urllib.parse import parse_qsl, urlparse
 
-import httpx
-
 from opensquilla.sandbox.integration import (
     current_managed_network_proxy_url,
     managed_network_httpx_kwargs,
@@ -30,7 +28,6 @@ from opensquilla.search.types import (
     Recency,
     SearchMode,
     SearchOptions,
-    SearchProviderError,
     SearchResult,
 )
 from opensquilla.tools.path_policy import reject_foreign_host_path
@@ -615,22 +612,6 @@ def get_search_diagnostics() -> bool:
     return _active_search_diagnostics
 
 
-def _format_search_error(provider_name: str, exc: Exception) -> tuple[str, str]:
-    error_class = type(exc).__name__
-    raw = str(exc).strip()
-    if raw:
-        return error_class, raw
-    if error_class == "ConnectTimeout":
-        return (
-            error_class,
-            (
-                f"{provider_name} search request timed out. Configure search_proxy "
-                "or switch search_provider to duckduckgo."
-            ),
-        )
-    return error_class, f"{provider_name} search failed with {error_class}."
-
-
 def _search_provider_kwargs(provider_name: str) -> dict[str, object]:
     from opensquilla.search.runtime_config import get_resolved_search_runtime
 
@@ -1021,26 +1002,6 @@ async def _web_search_fetcher(url: str, max_chars: int) -> dict[str, object]:
     return await run_web_fetch_payload(url, max_chars=max_chars)
 
 
-def _classify_search_error(provider_name: str, exc: Exception) -> SearchProviderError | None:
-    if isinstance(exc, SearchProviderError):
-        return exc
-    if isinstance(exc, httpx.TimeoutException):
-        return SearchProviderError(
-            provider=provider_name,
-            kind="timeout",
-            message=str(exc) or "Search request timed out.",
-            retryable=True,
-        )
-    if isinstance(exc, httpx.NetworkError):
-        return SearchProviderError(
-            provider=provider_name,
-            kind="network",
-            message=str(exc) or "Search network request failed.",
-            retryable=True,
-        )
-    return None
-
-
 def _search_payload(
     query: str,
     provider_name: str,
@@ -1081,29 +1042,6 @@ def _search_result_payload(provider_name: str, result: SearchResult) -> dict[str
             payload["domain"] = domain
         if canonical_url:
             payload["canonical_url"] = canonical_url
-    return payload
-
-
-def _search_error_payload(
-    query: str,
-    provider_name: str,
-    exc: Exception,
-    *,
-    attempts: list[dict[str, str]] | None = None,
-) -> dict:
-    error_class, error_message = _format_search_error(provider_name, exc)
-    payload: dict[str, Any] = {
-        "query": query,
-        "provider": provider_name,
-        "results": [],
-        "error_class": error_class,
-        "error": error_message,
-    }
-    classified = _classify_search_error(provider_name, exc)
-    if classified is not None:
-        payload["error_kind"] = classified.kind
-    if attempts is not None:
-        payload["attempts"] = attempts
     return payload
 
 

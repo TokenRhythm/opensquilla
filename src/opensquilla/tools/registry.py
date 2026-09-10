@@ -125,9 +125,6 @@ class ToolRegistry:
     ) -> list[RegisteredTool]:
         return visibility_policy.visible_registered_tools(self._tools.values(), ctx, sort=sort)
 
-    def _is_visible(self, rt: RegisteredTool, ctx: ToolContext | None = None) -> bool:
-        return visibility_policy.is_tool_visible(rt, ctx)
-
     def _default_context(self) -> ToolContext:
         return visibility_policy.default_tool_context()
 
@@ -151,18 +148,6 @@ class ToolRegistry:
             tool_surface_capabilities=tool_surface_capabilities,
             is_owner=is_owner,
         )
-
-    @staticmethod
-    def _schema_for(rt: RegisteredTool) -> dict[str, Any]:
-        return {
-            "type": "object",
-            "properties": {
-                name: value
-                for name, value in rt.spec.parameters.items()
-                if name not in rt.spec.runtime_only_arguments
-            },
-            "required": ToolRegistry._required_for(rt),
-        }
 
     @staticmethod
     def _required_for(rt: RegisteredTool) -> list[str]:
@@ -531,35 +516,6 @@ _default_registry = ToolRegistry()
 
 def get_default_registry() -> ToolRegistry:
     return _default_registry
-
-
-def _tool_rpc_params(params: Mapping[str, Any] | None) -> Mapping[str, Any]:
-    from opensquilla.tools.rpc_payload import tool_rpc_params
-
-    return tool_rpc_params(params)
-
-
-def _tool_surface_capabilities_for_runtime(
-    *,
-    tool_surface_capabilities: ToolSurfaceCapabilities | None = None,
-    session_manager: object | None = None,
-    task_runtime: object | None = None,
-    scheduler: object | None = None,
-    gateway_config: object | None = None,
-    channel_manager: object | None = None,
-    originating_envelope: object | None = None,
-) -> ToolSurfaceCapabilities:
-    from opensquilla.tools.rpc_payload import tool_surface_capabilities_for_runtime
-
-    return tool_surface_capabilities_for_runtime(
-        tool_surface_capabilities=tool_surface_capabilities,
-        session_manager=session_manager,
-        task_runtime=task_runtime,
-        scheduler=scheduler,
-        gateway_config=gateway_config,
-        channel_manager=channel_manager,
-        originating_envelope=originating_envelope,
-    )
 
 
 async def tools_catalog_payload(

@@ -23,7 +23,6 @@ import time
 import tomllib
 import urllib.parse
 import urllib.request
-import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 from zipfile import ZIP_DEFLATED, ZipFile, ZipInfo
@@ -543,42 +542,6 @@ def prune_portable_runtime(runtime_root: Path) -> None:
     for pyc in runtime_root.rglob("*.pyc"):
         if pyc.is_file():
             pyc.unlink()
-
-
-def install_portable_wheelhouse(release_root: Path) -> None:
-    """Preinstall wheelhouse contents into the bundled Python runtime.
-
-    Portable zips should start like an app, not like a package manager. Avoid
-    runtime venv/ensurepip/pip work on user machines; Windows PowerShell and
-    antivirus hooks can make that path look hung even when the wheels are local.
-    """
-
-    package_dir = release_root / "packages"
-    site_packages = release_root / "runtime" / "python" / "Lib" / "site-packages"
-    if not package_dir.is_dir() or not site_packages.is_dir():
-        raise SystemExit("Portable wheelhouse preinstall requires packages and site-packages.")
-
-    for wheel_path in sorted(package_dir.glob("*.whl")):
-        with zipfile.ZipFile(wheel_path) as wheel:
-            for info in wheel.infolist():
-                name = info.filename
-                if not name or name.endswith("/"):
-                    continue
-                target_rel: Path | None
-                if ".data/" in name:
-                    prefix, data_rel = name.split(".data/", 1)
-                    _ = prefix
-                    kind, _, remainder = data_rel.partition("/")
-                    if kind in {"purelib", "platlib"} and remainder:
-                        target_rel = Path(remainder)
-                    else:
-                        continue
-                else:
-                    target_rel = Path(name)
-                target = site_packages / target_rel
-                target.parent.mkdir(parents=True, exist_ok=True)
-                with wheel.open(info) as src, target.open("wb") as dst:
-                    shutil.copyfileobj(src, dst)
 
 
 def render_install_sh(

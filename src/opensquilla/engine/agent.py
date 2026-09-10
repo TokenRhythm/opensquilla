@@ -6217,14 +6217,6 @@ class Agent:
             terminal_response_text=result.terminal_response_text,
         )
 
-    async def _canonicalize_tool_result(
-        self,
-        result: ToolResult,
-        *,
-        tool_call: ToolCall | None = None,
-    ) -> ToolResult:
-        return await self._project_tool_result_for_llm(result, tool_call=tool_call)
-
     def _record_provider_tool_result_projection(
         self,
         result: ToolResult,
@@ -20864,20 +20856,6 @@ class Agent:
             *request_messages,
             Message(role="user", content=_IDENTICAL_REQUEST_LOOP_NUDGE),
         ]
-
-    @staticmethod
-    def _parse_tool_argument_projection(value: str) -> dict[str, str] | None:
-        if not value.startswith(_TOOL_ARGUMENT_PROJECTION_PREFIX):
-            return None
-        metadata: dict[str, str] = {}
-        for line in value.splitlines()[1:]:
-            if line in {"head:", "tail:"}:
-                break
-            key, separator, raw_value = line.partition(":")
-            if not separator:
-                continue
-            metadata[key.strip()] = raw_value.strip()
-        return metadata
 
     @staticmethod
     def _provider_projection_placeholder(tool_name: str, field: str) -> str:
