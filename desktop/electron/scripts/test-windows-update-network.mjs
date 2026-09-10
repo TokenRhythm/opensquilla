@@ -93,7 +93,7 @@ function fixture(options = {}) {
   const network = { offline: Boolean(options.offline) }
   const signature = { error: options.signatureError ?? null }
   const globals = {
-    process: { platform: 'win32', arch: 'x64', env: options.enableInstall ? { OPENSQUILLA_DESKTOP_ENABLE_WIN_INSTALL: '1' } : {} },
+    process: { platform: 'win32', arch: 'x64', env: options.disableInstall ? { OPENSQUILLA_DESKTOP_ENABLE_WIN_INSTALL: '0' } : {} },
     join, stat, setTimeout, AbortSignal,
     UpdateCheckScheduler, isUpdateCheckAllowed, UpdateChannelError, WindowsUpdateSecurityError, WindowsUpdateHandoffError,
     candidateFromUpdateChannel, orderedUpdateSources, updateAssetUrl, updateChannelManifestFromReleaseInventory,
@@ -167,12 +167,12 @@ function fixture(options = {}) {
     state: () => context.subject.desktopUpdateSnapshot() }
 }
 
-async function discover(f, canInstall = false) {
+async function discover(f, canInstall = true) {
   await f.subject.checkForUpdates(true)
   assert.equal(f.state().status, 'available', JSON.stringify(f.state()))
   assert.equal(f.state().latestVersion, candidate.version)
   assert.equal(f.state().source, 'oss')
-  assert.equal(f.state().canInstall, canInstall, 'the installation experiment requires an explicit opt-in')
+  assert.equal(f.state().canInstall, canInstall, 'handoff is enabled by default and respects the emergency opt-out')
 }
 
 async function check(name, test) {
@@ -191,7 +191,7 @@ try {
     assert.equal(state.source, 'oss')
     assert.equal(state.progress, 100)
     assert.equal(state.errorCode, null)
-    assert.equal(state.canInstall, false)
+    assert.equal(state.canInstall, true)
     assert.equal(f.calls.signatures, 1)
     assert.deepEqual(f.calls.requests, [
       { url: channelUrl, range: null, rejected: false },
@@ -224,8 +224,8 @@ try {
     assert.deepEqual(await readFile(f.path), bytes)
   })
 
-  await check('an explicitly enabled OSS-only handoff remains ready after local revalidation without a network request', async () => {
-    const f = fixture({ enableInstall: true })
+  await check('default OSS-only handoff remains ready after local revalidation without a network request', async () => {
+    const f = fixture()
     await discover(f, true)
     const state = await f.subject.downloadDesktopUpdate()
     assert.equal(state.status, 'downloaded', JSON.stringify(state))
@@ -242,6 +242,17 @@ try {
     assert.equal(f.state().status, 'downloaded')
     assert.equal(f.state().canInstall, true)
     assert.deepEqual(f.calls.reveals, [])
+  })
+
+  await check('emergency opt-out preserves verified OSS downloads and the manual installer entry', async () => {
+    const f = fixture({ disableInstall: true })
+    await discover(f, false)
+    const state = await f.subject.downloadDesktopUpdate()
+    assert.equal(state.status, 'downloaded')
+    assert.equal(state.canInstall, false)
+    assert.equal(f.calls.signatures, 1)
+    assert.deepEqual(await readFile(f.path), bytes)
+    assert.equal(f.context.verifiedManualInstallerPath, await realpath(f.path))
   })
 
   await check('temporary signature unavailability retains verified bytes and recovers on Download without any new fetch', async () => {

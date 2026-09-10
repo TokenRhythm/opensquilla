@@ -78,7 +78,7 @@ async function fixture(options = {}) {
   const signature = { error: null, hold: null, entered: null }
   const download = { hold: null, entered: null }
   const globals = {
-    process: { platform: options.platform ?? 'win32', arch: 'x64', env: {} },
+    process: { platform: options.platform ?? 'win32', arch: 'x64', env: { OPENSQUILLA_DESKTOP_ENABLE_WIN_INSTALL: '0' } },
     join, stat, setTimeout, setImmediate, AbortController,
     UpdateCheckScheduler, isUpdateCheckAllowed, WindowsUpdateSecurityError, WindowsUpdateHandoffError,
     WindowsUpdatePreparationError, UpdateChannelError, updateAssetUrl, createWindowsUpdateCacheDescriptor,
@@ -156,7 +156,7 @@ async function restored(options) {
   await f.subject.restoreWindowsUpdateCache()
   assert.equal(f.state().status, 'downloaded')
   assert.equal(f.context.verifiedManualInstallerPath, f.cachedPath)
-  assert.equal(f.state().canInstall, false, 'refresh is required with the installer experiment off')
+  assert.equal(f.state().canInstall, false, 'cache refresh remains available with the handoff explicitly disabled')
   return f
 }
 
@@ -183,7 +183,7 @@ async function check(name, fn) {
 }
 
 try {
-  await check('default-off explicit check replaces cached B with available C', async () => {
+  await check('explicitly disabled handoff still replaces cached B with available C on Check', async () => {
     const f = await restored()
     await f.subject.checkForUpdates(true)
     assert.equal(f.calls.channel, 1)

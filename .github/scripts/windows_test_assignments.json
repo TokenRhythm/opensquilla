@@ -1277,7 +1277,6 @@
       "tests/test_engine/test_meta_command_launch.py",
       "tests/test_engine/test_meta_invoke_paused_surfacing.py",
       "tests/test_engine/test_mid_budget_no_diff_nudge_lever.py",
-      "tests/test_engine/test_patch_evidence_ledger.py",
       "tests/test_engine/test_placeholder_escalation_and_wrapup.py",
       "tests/test_engine/test_plan_run_reconciliation.py",
       "tests/test_engine/test_provider_mismatch_veto.py",

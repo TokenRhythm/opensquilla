@@ -72,7 +72,6 @@ from opensquilla.engine.history import (
     repair_tool_pairing,
     strip_historical_tool_pairs,
 )
-from opensquilla.engine.patch_evidence_ledger import PatchEvidenceLedger
 from opensquilla.engine.progress_watchdog import ProgressObservation, ProgressWatchdog
 from opensquilla.engine.prompt_cache_keepalive import PromptCacheKeepaliveCandidate
 from opensquilla.engine.repetition_guard import (
@@ -2684,16 +2683,8 @@ class Agent:
         self._tool_result_snapshot_cache: dict[
             tuple[str, str, str, str, str, str], ToolResultRecord
         ] = {}
-        self._patch_evidence_ledger: PatchEvidenceLedger | None = None
         self._runtime_git_state = GitRunState.OK
         self._runtime_git_skip_states_recorded: set[GitRunState] = set()
-        if self.config.patch_evidence_ledger_path:
-            self._patch_evidence_ledger = PatchEvidenceLedger(
-                path=self.config.patch_evidence_ledger_path,
-                workspace_dir=self.config.workspace_dir,
-                session_key=session_key,
-                agent_id=getattr(tool_context, "agent_id", None) if tool_context else None,
-            )
 
     def tool_presentation_payload(self, tool_name: str) -> dict[str, Any]:
         """Resolve public display metadata from the active tool surface."""
@@ -13511,12 +13502,6 @@ class Agent:
                         )
                         if workspace_edit_gate_recovery_reads_remaining <= 0:
                             workspace_edit_gate_recovery_read_paths.clear()
-                    self._record_patch_evidence_tool_result(
-                        iteration=iterations,
-                        tool_call=execution_tc,
-                        result=res,
-                        duration_ms=duration_ms,
-                    )
                     self._write_turn_call_log(
                         "tool_response",
                         iteration=iterations,
@@ -15103,13 +15088,6 @@ class Agent:
             status="failed",
             reason="rebuilt_request_not_admitted",
         )
-        await self._write_patch_evidence_ledger(
-            final_status=(
-                "ok" if terminal_error is None else (terminal_error.code or "agent_error")
-            ),
-            iterations=iterations,
-            provider_call_count=turn_llm_calls,
-        )
         if runtime_diagnostics is not None and terminal_error is not None:
             self._runtime_git_state = GitRunState.OK
             runtime_diff_paths = self._workspace_diff_paths_for_runtime_event()
@@ -15727,55 +15705,6 @@ class Agent:
             or self.config.metadata.get("agent_id"),
         }
         append_runtime_event(self.config.runtime_events_path, event)
-
-    def _record_patch_evidence_tool_result(
-        self,
-        *,
-        iteration: int,
-        tool_call: ToolCall,
-        result: ToolResult,
-        duration_ms: int,
-    ) -> None:
-        if self._patch_evidence_ledger is None:
-            return
-        result_text = self._tool_result_text_for_anchor(result.content)
-        command = self._execution_command_for_progress(tool_call) or ""
-        self._patch_evidence_ledger.record_tool_result(
-            iteration=iteration,
-            tool_name=tool_call.tool_name,
-            arguments=tool_call.arguments,
-            result_text=result_text,
-            is_error=result.is_error,
-            duration_ms=duration_ms,
-            failure_anchors=self._failure_anchor_lines(result_text)
-            if result.is_error or self._tool_result_has_failure_signal(result_text)
-            else [],
-            focused_verification=bool(
-                command and self._command_looks_like_focused_verification(command)
-            ),
-        )
-
-    async def _write_patch_evidence_ledger(
-        self,
-        *,
-        final_status: str,
-        iterations: int,
-        provider_call_count: int,
-    ) -> None:
-        if self._patch_evidence_ledger is None:
-            return
-        try:
-            await asyncio.to_thread(
-                self._patch_evidence_ledger.write_final,
-                read_records=self._workspace_read_records(),
-                write_records=self._workspace_write_records(),
-                scratch_records=self._scratch_write_records(),
-                final_status=final_status,
-                iterations=iterations,
-                provider_call_count=provider_call_count,
-            )
-        except Exception as exc:  # noqa: BLE001
-            self.config.metadata["patch_evidence_ledger_write_error"] = str(exc)[:300]
 
     def _workspace_dir_for_status(self) -> Path | None:
         ctx = self._tool_context or current_tool_context.get()
@@ -16764,7 +16693,7 @@ class Agent:
             "diff_paths": runtime_diff_paths or [],
             "git_state": self._runtime_git_state.value,
             "diff_observed": runtime_diff_paths is not None,
-            "verification_commands": self._verification_commands_for_runtime_event(),
+            "verification_commands": [],
             "hint_text_sha256": hint_text_sha256,
             "trigger_confidence": "runtime_recovery_gate",
             "details": evidence,
@@ -16909,13 +16838,6 @@ class Agent:
         if not payload.strip():
             return None
         return hashlib.sha256(payload.encode("utf-8", "replace")).hexdigest()[:16]
-
-    def _verification_commands_for_runtime_event(self) -> list[dict[str, Any]]:
-        ledger = self._patch_evidence_ledger
-        if ledger is None:
-            return []
-        commands = getattr(ledger, "verification_commands", []) or []
-        return [dict(command) for command in commands if isinstance(command, dict)]
 
     @staticmethod
     def _failure_anchor_summary_from_tool_results(

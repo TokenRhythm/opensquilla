@@ -311,6 +311,23 @@ function node {
       mode = $handoffMode; inputMode = $(if ($cached) { 'verified-cache' } else { 'download' })
       downloadVerified = -not $cached; remotePublicationVerified = $false
     }
+    if ($options.DownloadSourceMode -eq 'github-to-oss') {
+      if ((Get-ArgumentValue $values '--download-source-mode') -cne 'github-to-oss') {
+        throw 'The requested source fallback must reach the actual driver.'
+      }
+      $handoff.downloadSourceMode = 'github-to-oss'
+      $handoff.source = 'oss'
+      $handoff.sourceFallbackVerified = $true
+      $handoff.networkIsolationVerified = $false
+      $handoff.discoveryScope = 'controlled loopback channel; production asset sources'
+      switch ($env:AUDIT_FAIL) {
+        'fallback-missing' { $handoff.Remove('sourceFallbackVerified') }
+        'fallback-string' { $handoff.sourceFallbackVerified = 'true' }
+        'fallback-source' { $handoff.source = 'github' }
+        'fallback-isolation' { $handoff.networkIsolationVerified = $true }
+        'fallback-discovery' { $handoff.discoveryScope = 'default remote channel' }
+      }
+    }
     if ($cached) {
       if ((Get-ArgumentValue $values '--cached-installer') -cne $options.CandidateInstaller -or
           (Get-ArgumentValue $values '--baseline-source-sha') -cne $options.BaselineSourceSha) {
@@ -591,18 +608,57 @@ def _run_audit_case(
     mode: str = "cim-trace",
     proof: str = "",
     input_mode: str = "download",
+    download_source_mode: str = "oss",
 ) -> tuple[dict, dict]:
     runner, environment, evidence = harness
     path = Path(environment["AUDIT_INPUT"])
     options = json.loads(path.read_text(encoding="utf-8"))
     options["ProcessObservationMode"] = mode
     options["HandoffInputMode"] = input_mode
+    options["DownloadSourceMode"] = download_source_mode
     path.write_text(json.dumps(options), encoding="utf-8")
     run = _powershell(runner, **environment, AUDIT_FAIL=failure, AUDIT_PROOF=proof)
     assert run.returncode == 0, run.stdout + run.stderr
     execution = json.loads(Path(environment["AUDIT_OUTPUT"]).read_text(encoding="utf-8-sig"))
     result = json.loads((evidence / "result.json").read_text(encoding="utf-8-sig"))
     return execution, result
+
+
+@pytest.mark.parametrize("failure", [
+    "", "fallback-missing", "fallback-string", "fallback-source",
+    "fallback-isolation", "fallback-discovery",
+])
+def test_download_fallback_rejects_missing_proof_and_overclaims(
+    audit_harness: tuple[Path, dict[str, str], Path], failure: str
+) -> None:
+    execution, result = _run_audit_case(
+        audit_harness, failure=failure, download_source_mode="github-to-oss",
+    )
+    assert execution["code"] == (1 if failure else 2), execution
+    assert result["sourceFallbackVerified"] is (not failure)
+    assert result["networkIsolationVerified"] is False
+    assert result["releaseGatePassed"] is False
+    if failure:
+        assert "fallback evidence" in result["error"]
+        assert "finish-attestation" not in execution["calls"]
+
+
+def test_cached_input_rejects_network_fallback_before_native_writes(
+    audit_harness: tuple[Path, dict[str, str], Path],
+) -> None:
+    runner, environment, evidence = audit_harness
+    config_path = Path(environment["AUDIT_INPUT"])
+    options = json.loads(config_path.read_text(encoding="utf-8"))
+    options.update(HandoffInputMode="verified-cache", DownloadSourceMode="github-to-oss")
+    config_path.write_text(json.dumps(options), encoding="utf-8")
+    run = _powershell(runner, **environment)
+    assert run.returncode == 0, run.stdout + run.stderr
+    execution = json.loads(Path(environment["AUDIT_OUTPUT"]).read_text(encoding="utf-8-sig"))
+    assert execution["code"] == 1
+    assert "cached input cannot verify network fallback" in execution["failure"]
+    assert not execution["calls"]
+    assert not evidence.exists()
+    assert not Path(environment["AUDIT_NATIVE_PROFILE"]).exists()
 
 
 @pytest.mark.parametrize("timezone", ["Asia/Shanghai", "America/New_York", "UTC"])
@@ -1020,6 +1076,7 @@ def test_existing_upgrade_entry_dispatches_signed_config_without_changing_manual
         ),
         "synthetic-pinned-value",
     )
+    config["DownloadSourceMode"] = "github-to-oss"
     if invalid == "unknown-field":
         config["SkipSignatureCheck"] = "true"
     elif invalid == "missing-field":
@@ -1051,6 +1108,8 @@ def test_existing_upgrade_entry_dispatches_signed_config_without_changing_manual
         args = json.loads(dispatched.read_text(encoding="utf-8-sig"))["args"]
         assert "-BaselineSourceSha:" in args
         assert "-CandidateInstallerSha256:" in args
+        assert "-DownloadSourceMode:" in args
+        assert "github-to-oss" in args
 
 
 @pytest.fixture

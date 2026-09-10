@@ -175,21 +175,33 @@ def _ctx(repo: Path, candidates: list[dict[str, Any]] | None = None) -> ToolCont
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("legacy_ledger", [False, True])
 async def test_final_diff_salvage_reapplies_lost_candidate_at_finalize(
     tmp_path: Path,
+    legacy_ledger: bool,
 ) -> None:
     repo, target = _init_repo(tmp_path)
     candidate = _candidate(repo, target, "value = 2\n", candidate_id="srcdiff-1")
     assert target.read_text(encoding="utf-8") == "value = 1\n"
     events_path = tmp_path / "events.jsonl"
+    ledger_path = repo / "legacy-ledger.json"
+    if legacy_ledger:
+        ledger_path.write_text('{"historical": true}\n', encoding="utf-8")
     agent = Agent(
         provider=_SequenceProvider([_final_text()]),
         config=AgentConfig(
             final_diff_salvage=True,
             runtime_events_path=str(events_path),
+            patch_evidence_ledger_path=str(ledger_path) if legacy_ledger else None,
         ),
         tool_context=_ctx(repo, [candidate]),
     )
+
+    assert agent._workspace_diff_paths_for_final_diff_contract() == []
+    # Only final-diff contracts exclude diagnostic files. Keep the existing
+    # generic observer behavior rather than changing its path policy here.
+    observed_paths = [ledger_path.name] if legacy_ledger else []
+    assert agent._workspace_diff_paths_for_runtime_event() == observed_paths
 
     events = [event async for event in agent.run_turn("fix the bug")]
 
@@ -197,6 +209,12 @@ async def test_final_diff_salvage_reapplies_lost_candidate_at_finalize(
     assert target.read_text(encoding="utf-8") == "value = 2\n"
     assert candidate["restored"] is True
     assert _run_git(repo, "diff", "--name-only").split() == ["pkg.py"]
+    assert agent._workspace_diff_paths_for_final_diff_contract() == ["pkg.py"]
+    assert agent._workspace_diff_paths_for_runtime_event() == sorted(
+        ["pkg.py", *observed_paths]
+    )
+    if legacy_ledger:
+        assert ledger_path.read_text(encoding="utf-8") == '{"historical": true}\n'
     recorded = [
         json.loads(line)
         for line in events_path.read_text(encoding="utf-8").splitlines()
