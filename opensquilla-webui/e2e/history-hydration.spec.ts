@@ -85,8 +85,9 @@ async function stubApprovals(page: Page) {
   }))
 }
 
-test('keeps the conversation usable while startup and long history are delayed', async ({ page }) => {
+async function checkDelayedStartup(page: Page, detachedMetadata: boolean) {
   let historyReleased = false
+  let releaseHello: (() => void) | undefined
   const pendingHistoryResponses: Array<() => void> = []
   let chatSendRequests = 0
   let usageRequests = 0
@@ -112,7 +113,13 @@ test('keeps the conversation usable while startup and long history are delayed',
         if (replyToPing(ws, frame)) return
         if (frame?.type !== 'req') return
         if (frame.method === 'connect') {
-          ws.send(helloResponse(30000))
+          releaseHello = () => ws.send(helloOkResponse({
+            policy: {
+              tick_interval_ms: 30000,
+              concurrent_history_reads: true,
+              concurrent_optional_read_methods: detachedMetadata ? ['config.get'] : [],
+            },
+          }))
           return
         }
         const method = String(frame.method || '')
@@ -206,6 +213,11 @@ test('keeps the conversation usable while startup and long history are delayed',
   const thread = page.locator('.chat-thread')
   const composer = page.getByRole('textbox', { name: 'Message to send' })
 
+  // Release Hello only after ChatView has mounted and registered its availability
+  // watcher. An immediate mock Hello can otherwise skip that cold-start race.
+  await expect(composer).toBeAttached()
+  await expect.poll(() => Boolean(releaseHello)).toBe(true)
+  releaseHello?.()
   await expect.poll(() => pendingHistoryResponses.length).toBeGreaterThan(0)
   const criticalStartupOrder = [
     'sessions.messages.subscribe',
@@ -268,7 +280,14 @@ test('keeps the conversation usable while startup and long history are delayed',
   await expect.poll(() => page.evaluate(() => (
     document.documentElement.scrollWidth <= document.documentElement.clientWidth
   ))).toBe(true)
-})
+  expect(receivedMethods.filter(method => method === 'config.get')).toHaveLength(1)
+}
+
+for (const detachedMetadata of [false, true]) {
+  test(`keeps the conversation usable while startup and long history are delayed (${detachedMetadata ? 'detached' : 'legacy'} metadata)`, async ({ page }) => {
+    await checkDelayedStartup(page, detachedMetadata)
+  })
+}
 
 test('keeps timed-out optional metadata request-local and sends on the same socket', async ({ page }) => {
   let socketCount = 0
@@ -479,11 +498,14 @@ test('recovers stalled history and live hydration in place despite ongoing ticks
   let disconnectSeedSocket: (() => Promise<void>) | undefined
   const recoveredHistoryWindows: Array<{ requested: number, returned: number }> = []
   const tickSenders: Array<() => void> = []
+  const socketMethods = new Map<number, string[]>()
 
   await page.clock.install({ time: new Date('2026-07-28T00:00:00Z') })
   await stubApprovals(page)
   await page.routeWebSocket(/\/ws$/, ws => {
     const socketId = ++socketCount
+    const methods: string[] = []
+    socketMethods.set(socketId, methods)
     if (socketId === 1) {
       disconnectSeedSocket = () => ws.close({ code: 1012, reason: 'inject recovery' })
     }
@@ -518,6 +540,7 @@ test('recovers stalled history and live hydration in place despite ongoing ticks
           sendTick()
           return
         }
+        methods.push(String(frame.method))
         if (frame.method === 'sessions.messages.snapshot') {
           ws.send(successResponse(String(frame.id), {
             key: SESSION_KEY,
@@ -672,6 +695,16 @@ test('recovers stalled history and live hydration in place despite ongoing ticks
   await disconnectSeedSocket?.()
   await expect.poll(() => heldHistoryRequests).toBeGreaterThan(0)
   await expect.poll(() => heldSubscribeRequests).toBeGreaterThan(0)
+  const reconnectMethods = socketMethods.get(2) ?? []
+  // Directory/cron control leases may rebind first; optional configuration
+  // must still follow the current conversation's ordered critical reads.
+  expect(reconnectMethods.filter(method => (
+    method.startsWith('sessions.messages.') || method === 'chat.history'
+  )).slice(0, 3)).toEqual([
+    'sessions.messages.subscribe',
+    'sessions.messages.snapshot',
+    'chat.history',
+  ])
 
   // Advance past the 15-second aggregate bootstrap budget one second at a
   // time, delivering a server tick after each increment. This models a socket
@@ -721,6 +754,8 @@ test('recovers stalled history and live hydration in place despite ongoing ticks
   await expect(page.getByText(retainedTail)).toBeVisible()
   await expect(composer).toHaveValue('Keep this draft through timeout and reconnect.')
   await expect(composer).toBeFocused()
+  expect(reconnectMethods.filter(method => method === 'config.get')).toHaveLength(1)
+  expect(reconnectMethods.indexOf('config.get')).toBeGreaterThan(reconnectMethods.indexOf('chat.history'))
 })
 
 test('preserves a Sessions Hub draft through automatic live recovery without delayed auto-send', async ({ page }) => {

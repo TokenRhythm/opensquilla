@@ -479,6 +479,57 @@ the original four-case invocation exited successfully or that its intermittent
 shutdown failure has been explained. These samples are not P95, physical
 network/sleep, packaged-client or long-duration acceptance evidence.
 
+### PR #1609 CI repair (2026-09-10)
+
+The repair integrates upstream `f6a07b0baa796e1ccb3709d24578f3878f284e22`
+without textual conflicts. It addresses the failed checks on PR head
+`4728e45343ee0bde440c3aaf528fbd4abb9dfbb0`; that failed run is not a successful
+validation baseline.
+
+- Connection snapshot state and installation receipts now have explicit types.
+  Malformed snapshot delivery IDs cannot alias an integer reservation or consume
+  its credit. No validator schema, public RPC shape or generated contract changed.
+- Strict dispatcher-count fixtures include the two added recovery RPCs. Goal
+  subscription tests use the real connection lifecycle with a fail-on-I/O socket
+  fixture rather than an incomplete connection substitute.
+- The Desktop diagnostic file handle reports bounded close-error metadata.
+  Electron shutdown deadlines, process ownership proof and the existing guard
+  against swallowed close failures remain unchanged.
+- The cross-platform browser CI lane selects a unique stable
+  `@session-hang-recovery` tag with zero retries, instead of an obsolete title.
+- A deterministic delayed-Hello browser regression exposed a feature-toggle
+  read bypassing session startup admission. Optional configuration refresh now
+  uses the existing admission gate and is coalesced with the initial metadata
+  owner. Reconnect still refreshes configuration after critical session reads.
+  The regression checks both legacy serialized and modern detached metadata
+  peers; it does not relax the original startup ordering or continuity checks.
+
+The complete Python type check passed for 1,560 source files, full `src/tests`
+Ruff passed, and all 16 contract-tooling tests passed after integration.
+With real Python/TypeScript/Ajv integration enabled, the full Contract suite
+passed 405 tests; 17 filesystem-link privilege cases and one result-less fixture
+were skipped by their existing platform/fixture guards.
+The combined workflow, shard/duration governance, result/attestation, CI planning
+and release-consistency regression passed 554 tests with three conditional skips.
+The repaired frontend passed all 442 unit-test files / 5,874 tests, the complete
+architecture/security/type-check pipeline, and production asset generation,
+verification and staging of 397 files. Its rebuilt
+production artifact passed all 12 history-hydration browser cases and the
+separately selected session-hang case with zero retries, including the delayed
+first Hello and reconnect configuration-admission regressions.
+Windows local-test limits are recorded separately from product failures: an
+attachment test's ordinary `Path.read_bytes()` failed on a 308-character path
+although the production native-path write succeeded. All 98 tests in that file
+passed with an isolated short pytest root. The Desktop shard recorded 4,006
+passes, 48 skips and three failures before its strict parallel fail-fast limit:
+two unavailable symlink privileges and one protected `.codex` checkout path.
+Those tests and their implementations are unchanged from the pinned upstream.
+Its serial phase passed six tests; the entire shard is **not** a local green
+result. Fresh hosted CI must verify the complete platform matrix.
+
+These repairs do not establish the cause of the earlier intermittent native
+shutdown failure or replace the packaged and long-duration release gates below.
+
 ## Release gates still required
 
 - Windows packaged candidate installation and 72-hour soak; 24-hour development

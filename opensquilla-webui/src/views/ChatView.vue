@@ -2708,6 +2708,17 @@ function trackSessionBootstrapAdmission<T extends {
 }
 
 let postBootstrapMetadataStarted = false
+function startPostBootstrapMetadata() {
+  if (postBootstrapMetadataStarted) return
+  postBootstrapMetadataStarted = true
+  pendingFeatureToggleRefresh = false
+  void refreshPostBootstrapMetadata()
+  void loadFeatureToggles().then(() => {
+    if (!chatViewDisposed) unsubs.push(bindFeatureRefresh(scheduleHistorySync))
+  })
+  loadSlashCommands()
+}
+
 function schedulePostBootstrapMetadata(
   run: {
     generation: number
@@ -2724,12 +2735,7 @@ function schedulePostBootstrapMetadata(
         || sessionKey.value !== key
         || !isSessionBootstrapCurrent(run.generation, key)
       ) return
-      postBootstrapMetadataStarted = true
-      void refreshPostBootstrapMetadata()
-      void loadFeatureToggles().then(() => {
-        if (!chatViewDisposed) unsubs.push(bindFeatureRefresh(scheduleHistorySync))
-      })
-      loadSlashCommands()
+      startPostBootstrapMetadata()
     },
     () => {},
   )
@@ -6814,6 +6820,7 @@ onUnmounted(() => {
   cancelSessionBootstrap()
   conversationSessionRuntime.dispose()
   pendingSessionOptionalReads = null
+  pendingFeatureToggleRefresh = false
   releaseOptionalRpcAdmission?.()
   releaseOptionalRpcAdmission = null
   cancelActiveProjectValidation()
@@ -7025,9 +7032,19 @@ type SessionOptionalReadRequest = {
 }
 
 let pendingSessionOptionalReads: SessionOptionalReadRequest | null = null
+let pendingFeatureToggleRefresh = false
 
 function flushSessionOptionalReads() {
   if (!optionalSessionRpcAllowed.value) return
+  if (chatViewDisposed || !gatewayAccess.isAvailable) return
+  if (pendingFeatureToggleRefresh) {
+    pendingFeatureToggleRefresh = false
+    // A late first Hello can replace the pre-connection bootstrap generation.
+    // Its retired callback must not strand metadata: the same open gate can
+    // initialize it once, then later Hellos only refresh it (including drafts).
+    if (postBootstrapMetadataStarted) void loadFeatureToggles()
+    else startPostBootstrapMetadata()
+  }
   const pending = pendingSessionOptionalReads
   pendingSessionOptionalReads = null
   if (
@@ -7087,7 +7104,7 @@ watch(sessionKey, () => {
 // for the current Session then; older gateways simply remain on history/live.
 watch(() => gatewayAccess.availability, (state, previous) => {
   if (state !== 'available' || previous === 'available') return
-  void loadFeatureToggles()
+  pendingFeatureToggleRefresh = true
   if (
     sessionKey.value
     && pendingSessionIntent.value !== 'new_chat'
@@ -7097,6 +7114,8 @@ watch(() => gatewayAccess.availability, (state, previous) => {
       artifactMode: 'reconnect',
       forceAnnotations: true,
     })
+  } else {
+    flushSessionOptionalReads()
   }
 })
 
