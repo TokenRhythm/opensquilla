@@ -1408,9 +1408,18 @@ def test_desktop_local_packaging_builds_slim_package_without_runtime_fetch() -> 
     scripts = package_json["scripts"]
 
     for local_script in ("dist:local", "pack:local"):
-        commands = scripts[local_script].split(" && ")
+        public_script = local_script.removesuffix(":local")
+        assert scripts[local_script] == f"npm run {public_script}"
+        commands = scripts[public_script].split(" && ")
         assert "npm run fetch:runtimes" not in commands
         assert commands.index("npm run build:web") < commands.index("npm run build:gateway")
+        assert commands.index("npm run build:gateway") < commands.index(
+            f"npm run {public_script}:prepared"
+        )
+        prepared = scripts[f"{public_script}:prepared"].split(" && ")
+        builder = "electron-builder --dir" if public_script == "pack" else "electron-builder"
+        assert prepared.index("npm run verify:prepared") < prepared.index(builder)
+        assert "npm run build:gateway" not in prepared
 
     runtime_resources = {
         (entry["from"], entry["to"])
@@ -1423,8 +1432,8 @@ def test_desktop_local_packaging_builds_slim_package_without_runtime_fetch() -> 
         ("runtime/runtime-pack-catalog.json", "runtime/runtime-pack-catalog.json"),
     }
 
-    assert scripts["dist"].endswith(" && npm run verify:package")
-    assert scripts["pack"].endswith(" && npm run verify:package")
+    assert scripts["dist:prepared"].endswith(" && npm run verify:package")
+    assert scripts["pack:prepared"].endswith(" && npm run verify:package")
 
 
 def test_desktop_onboarding_is_owned_modal_child_of_main_window() -> None:

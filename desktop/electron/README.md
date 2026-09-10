@@ -68,13 +68,22 @@ This builds the shared Vue browser/Desktop artifact, bundles the gateway with
 PyInstaller, removes its staged duplicate UI copy, and emits desktop artifacts
 for the current platform under `dist/desktop-electron/`.
 
-For a faster rebuild after the runtime already exists:
+`npm run pack` (unpacked directory) and `npm run dist` (installer) both build
+the WebUI and Gateway before packaging. The `:local` names are compatibility aliases.
+For a faster Electron-only rebuild after a successful Gateway build:
 
 ```bash
 cd desktop/electron
-npm run build:web
-npm run dist
+npm run dist:prepared
 ```
+
+The internal `pack:prepared` / `dist:prepared` entries reject missing or stale
+Gateway build records and changed runtime files before electron-builder runs.
+Changes to Python sources, migrations, Router resources, the built WebUI, dependency
+locks, or the Gateway build recipe require a new full build. Final package verification
+also checks every migration ID/content and the Router manifest's SHA256 values.
+Release CI builds the Gateway once, verifies prepared outputs, then signs and packages
+them; final signature checks remain separate from resource checks.
 
 ## Windows Release Signing
 

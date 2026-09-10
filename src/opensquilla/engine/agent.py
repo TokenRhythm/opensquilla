@@ -83,7 +83,6 @@ from opensquilla.engine.repetition_guard import (
 from opensquilla.engine.runtime_diagnostics import RuntimeDiagnosticsObserver
 from opensquilla.engine.runtime_events import append_runtime_event
 from opensquilla.engine.runtime_recovery import (
-    RuntimeRecoveryDecision,
     RuntimeRecoveryMode,
     post_tool_empty_decision,
     reasoning_continuation_decision,
@@ -437,7 +436,6 @@ _CLEAN_PASSED_FAILED_SUMMARY_RE = re.compile(
     r"\b\d+\s+passed\b[^\n\r;]*(?:;|,)?[^\n\r]*\b0\s+failed\b",
     re.IGNORECASE,
 )
-_PLAIN_PASSED_SUMMARY_RE = re.compile(r"\b\d+\s+passed\b", re.IGNORECASE)
 _CLEAN_ERROR_COUNT_RE = re.compile(r"\b0\s+error\(s\)(?:\W|$)", re.IGNORECASE)
 _FAILED_FINALIZATION_RECOVERY_LIMIT = 3
 
@@ -6304,7 +6302,6 @@ class Agent:
             else None
         )
         finalize_evidence_gate_keys: set[str] = set()
-        recent_failure_anchor_summaries: list[str] = []
         progress_watchdog_mode = getattr(self.config, "progress_watchdog_mode", "log")
         progress_watchdog = ProgressWatchdog(
             repeated_tool_error_threshold=max(
@@ -9425,49 +9422,43 @@ class Agent:
                             reasoning_chars=len(iter_reasoning_content or ""),
                             reasoning_tokens=iter_reasoning_tokens,
                         )
-                        if reasoning_prefill is not None:
-                            self._record_runtime_recovery_event(
-                                reasoning_prefill,
-                                iteration=iterations,
-                                provider_call_count=turn_llm_calls,
-                                call_attempt=_call_attempt,
-                                stop_reason=stop_reason,
-                                input_tokens=iter_input_tokens,
-                                output_tokens=iter_output_tokens,
+                        if (
+                            reasoning_prefill is not None
+                            and reasoning_prefill.action == "prefill"
+                            and iter_reasoning_content
+                        ):
+                            turn_messages.append(
+                                _build_reasoning_prefill_message(
+                                    reasoning_content=iter_reasoning_content,
+                                    thinking_signature=iter_thinking_signature,
+                                )
                             )
-                            if reasoning_prefill.action == "prefill" and iter_reasoning_content:
-                                turn_messages.append(
-                                    _build_reasoning_prefill_message(
-                                        reasoning_content=iter_reasoning_content,
-                                        thinking_signature=iter_thinking_signature,
-                                    )
+                            runtime_recovery_scaffolding_pending = True
+                            reasoning_prefill_recovery_attempted = True
+                            self.config.metadata["reasoning_prefill_recoveries"] = (
+                                self.config.metadata.get(
+                                    "reasoning_prefill_recoveries",
+                                    0,
                                 )
-                                runtime_recovery_scaffolding_pending = True
-                                reasoning_prefill_recovery_attempted = True
-                                self.config.metadata["reasoning_prefill_recoveries"] = (
-                                    self.config.metadata.get(
-                                        "reasoning_prefill_recoveries",
-                                        0,
-                                    )
-                                    + 1
-                                )
-                                self._write_turn_call_log(
-                                    "runtime_recovery",
-                                    action="prefill",
-                                    mode=reasoning_prefill.mode,
-                                    reason=reasoning_prefill.reason,
-                                    details=reasoning_prefill.details,
-                                )
-                                yield WarningEvent(
-                                    code="provider_reasoning_prefill_continue",
-                                    message=(
-                                        "The provider returned reasoning without visible "
-                                        "content; continuing once with the reasoning "
-                                        "prefilled."
-                                    ),
-                                )
-                                _call_attempt += 1
-                                continue
+                                + 1
+                            )
+                            self._write_turn_call_log(
+                                "runtime_recovery",
+                                action="prefill",
+                                mode=reasoning_prefill.mode,
+                                reason=reasoning_prefill.reason,
+                                details=reasoning_prefill.details,
+                            )
+                            yield WarningEvent(
+                                code="provider_reasoning_prefill_continue",
+                                message=(
+                                    "The provider returned reasoning without visible "
+                                    "content; continuing once with the reasoning "
+                                    "prefilled."
+                                ),
+                            )
+                            _call_attempt += 1
+                            continue
 
                         reasoning_continuation = reasoning_continuation_decision(
                             global_mode=getattr(
@@ -9491,58 +9482,49 @@ class Agent:
                             reasoning_chars=len(iter_reasoning_content or ""),
                             reasoning_tokens=iter_reasoning_tokens,
                         )
-                        if reasoning_continuation is not None:
-                            self._record_runtime_recovery_event(
-                                reasoning_continuation,
-                                iteration=iterations,
-                                provider_call_count=turn_llm_calls,
-                                call_attempt=_call_attempt,
-                                stop_reason=stop_reason,
-                                input_tokens=iter_input_tokens,
-                                output_tokens=iter_output_tokens,
+                        if (
+                            reasoning_continuation is not None
+                            and reasoning_continuation.action == "nudge"
+                            and reasoning_continuation.message
+                        ):
+                            turn_messages.append(
+                                Message(
+                                    role="assistant",
+                                    content=[ContentBlockText(text="")],
+                                )
                             )
-                            if (
-                                reasoning_continuation.action == "nudge"
-                                and reasoning_continuation.message
-                            ):
-                                turn_messages.append(
-                                    Message(
-                                        role="assistant",
-                                        content=[ContentBlockText(text="")],
-                                    )
+                            turn_messages.append(
+                                Message(
+                                    role="user",
+                                    content=reasoning_continuation.message,
                                 )
-                                turn_messages.append(
-                                    Message(
-                                        role="user",
-                                        content=reasoning_continuation.message,
-                                    )
+                            )
+                            runtime_recovery_scaffolding_pending = True
+                            reasoning_prefill_recovery_attempted = True
+                            self.config.metadata["reasoning_continuation_recoveries"] = (
+                                self.config.metadata.get(
+                                    "reasoning_continuation_recoveries",
+                                    0,
                                 )
-                                runtime_recovery_scaffolding_pending = True
-                                reasoning_prefill_recovery_attempted = True
-                                self.config.metadata["reasoning_continuation_recoveries"] = (
-                                    self.config.metadata.get(
-                                        "reasoning_continuation_recoveries",
-                                        0,
-                                    )
-                                    + 1
-                                )
-                                self._write_turn_call_log(
-                                    "runtime_recovery",
-                                    action="nudge",
-                                    mode=reasoning_continuation.mode,
-                                    reason=reasoning_continuation.reason,
-                                    details=reasoning_continuation.details,
-                                )
-                                yield WarningEvent(
-                                    code="provider_reasoning_continuation",
-                                    message=(
-                                        "The provider returned reasoning without visible "
-                                        "content; asking it to continue once without "
-                                        "replaying hidden reasoning."
-                                    ),
-                                )
-                                _call_attempt += 1
-                                continue
+                                + 1
+                            )
+                            self._write_turn_call_log(
+                                "runtime_recovery",
+                                action="nudge",
+                                mode=reasoning_continuation.mode,
+                                reason=reasoning_continuation.reason,
+                                details=reasoning_continuation.details,
+                            )
+                            yield WarningEvent(
+                                code="provider_reasoning_continuation",
+                                message=(
+                                    "The provider returned reasoning without visible "
+                                    "content; asking it to continue once without "
+                                    "replaying hidden reasoning."
+                                ),
+                            )
+                            _call_attempt += 1
+                            continue
 
                         post_tool_empty = post_tool_empty_decision(
                             global_mode=getattr(
@@ -9563,47 +9545,41 @@ class Agent:
                                 or iter_reasoning_tokens > 0
                             ),
                         )
-                        if post_tool_empty is not None:
-                            self._record_runtime_recovery_event(
-                                post_tool_empty,
-                                iteration=iterations,
-                                provider_call_count=turn_llm_calls,
-                                call_attempt=_call_attempt,
-                                stop_reason=stop_reason,
-                                input_tokens=iter_input_tokens,
-                                output_tokens=iter_output_tokens,
+                        if (
+                            post_tool_empty is not None
+                            and post_tool_empty.action == "nudge"
+                            and post_tool_empty.message
+                        ):
+                            turn_messages.append(
+                                Message(
+                                    role="assistant",
+                                    content=[ContentBlockText(text="")],
+                                )
                             )
-                            if post_tool_empty.action == "nudge" and post_tool_empty.message:
-                                turn_messages.append(
-                                    Message(
-                                        role="assistant",
-                                        content=[ContentBlockText(text="")],
-                                    )
-                                )
-                                turn_messages.append(
-                                    Message(role="user", content=post_tool_empty.message)
-                                )
-                                runtime_recovery_scaffolding_pending = True
-                                post_tool_empty_recovery_attempted = True
-                                self.config.metadata["post_tool_empty_recoveries"] = (
-                                    self.config.metadata.get("post_tool_empty_recoveries", 0) + 1
-                                )
-                                self._write_turn_call_log(
-                                    "runtime_recovery",
-                                    action="nudge",
-                                    mode=post_tool_empty.mode,
-                                    reason=post_tool_empty.reason,
-                                    details=post_tool_empty.details,
-                                )
-                                yield WarningEvent(
-                                    code="post_tool_empty_recovery",
-                                    message=(
-                                        "The provider returned an empty response after "
-                                        "tool results; asking it to continue once."
-                                    ),
-                                )
-                                _call_attempt += 1
-                                continue
+                            turn_messages.append(
+                                Message(role="user", content=post_tool_empty.message)
+                            )
+                            runtime_recovery_scaffolding_pending = True
+                            post_tool_empty_recovery_attempted = True
+                            self.config.metadata["post_tool_empty_recoveries"] = (
+                                self.config.metadata.get("post_tool_empty_recoveries", 0) + 1
+                            )
+                            self._write_turn_call_log(
+                                "runtime_recovery",
+                                action="nudge",
+                                mode=post_tool_empty.mode,
+                                reason=post_tool_empty.reason,
+                                details=post_tool_empty.details,
+                            )
+                            yield WarningEvent(
+                                code="post_tool_empty_recovery",
+                                message=(
+                                    "The provider returned an empty response after "
+                                    "tool results; asking it to continue once."
+                                ),
+                            )
+                            _call_attempt += 1
+                            continue
 
                         if large_context_invalid:
                             if (
@@ -11604,20 +11580,6 @@ class Agent:
                     self.config.metadata["repeated_tool_call_recoveries"] = (
                         self.config.metadata.get("repeated_tool_call_recoveries", 0) + 1
                     )
-                    recovery_decision = RuntimeRecoveryDecision(
-                        action="nudge",
-                        mechanism="repeated_tool_call_recovery",
-                        reason="repeated_identical_tool_call",
-                        mode="warn_model",
-                        injected_to_model=True,
-                        message=repeated_tool_call_recovery_message,
-                        details=repeated_tool_call_recovery_details or {},
-                    )
-                    self._record_runtime_recovery_event(
-                        recovery_decision,
-                        iteration=iterations,
-                        provider_call_count=turn_llm_calls,
-                    )
                     self._write_turn_call_log(
                         "runtime_recovery",
                         action="nudge",
@@ -11920,30 +11882,18 @@ class Agent:
                         "final_diff_contract_mode",
                         "log",
                     )
-                    if final_diff_contract_mode != "off" and (
-                        not max_iterations_finalization_pending
+                    if (
+                        final_diff_contract_mode == "warn_model"
+                        and not max_iterations_finalization_pending
+                        and not final_diff_contract_recovery_attempted
                     ):
                         final_diff_observation = self._final_diff_contract_observation()
-                        if final_diff_observation is not None and (
-                            final_diff_observation.diff_paths or final_diff_observation.suspicious
+                        if (
+                            final_diff_observation is not None
+                            and final_diff_observation.suspicious
                         ):
-                            should_warn_model = (
-                                final_diff_contract_mode == "warn_model"
-                                and final_diff_observation.suspicious
-                                and not final_diff_contract_recovery_attempted
-                            )
-                            recovery_message = (
-                                final_diff_contract_recovery_message(final_diff_observation)
-                                if should_warn_model
-                                else None
-                            )
-                            self._record_final_diff_contract_event(
-                                final_diff_observation,
-                                iteration=iterations,
-                                provider_call_count=turn_llm_calls,
-                                mode=str(final_diff_contract_mode),
-                                injected_to_model=bool(recovery_message),
-                                hint_text=recovery_message,
+                            recovery_message = final_diff_contract_recovery_message(
+                                final_diff_observation
                             )
                             if recovery_message:
                                 final_diff_contract_recovery_attempted = True
@@ -12972,15 +12922,6 @@ class Agent:
                         if command and self._command_looks_like_focused_verification(command):
                             post_write_focused_verification_observed = True
                             result_text = self._tool_result_text_for_anchor(result.content)
-                            verification_state = self._classify_focused_verification_result(result)
-                            self._record_runtime_event(
-                                "focused_verification.classified",
-                                feature="verification",
-                                tool_name=result.tool_name,
-                                command=command[:500],
-                                state=verification_state,
-                                is_error=bool(result.is_error),
-                            )
                             clean_validation_success = (
                                 self._tool_result_has_validation_success_signal(result_text)
                                 and not self._tool_result_has_failure_signal(result_text)
@@ -13016,12 +12957,6 @@ class Agent:
                     tool_calls,
                     executed_results,
                 )
-                if (
-                    failure_anchor_summary
-                    and failure_anchor_summary not in recent_failure_anchor_summaries
-                ):
-                    recent_failure_anchor_summaries.append(failure_anchor_summary)
-                    recent_failure_anchor_summaries[:] = recent_failure_anchor_summaries[-3:]
                 runtime_diff_paths: list[str] | None = None
                 runtime_diff_fingerprint: str | None = None
                 if runtime_diagnostics is not None:
@@ -13174,13 +13109,6 @@ class Agent:
                         max_nudges=runtime_recovery_source_loop_max_nudges,
                     )
                     if source_loop_recovery is not None:
-                        self._record_runtime_recovery_event(
-                            source_loop_recovery,
-                            iteration=iterations,
-                            provider_call_count=turn_llm_calls,
-                            workspace_write_count=workspace_write_count,
-                            source_context_signature=source_context_signature,
-                        )
                         recovery_event_key = source_loop_recovery.details.get("recovery_event_key")
                         if isinstance(recovery_event_key, str) and recovery_event_key:
                             source_loop_recovery_attempted_keys.add(recovery_event_key)
@@ -13565,31 +13493,11 @@ class Agent:
             # Last engine-controlled moment before the runner collects the
             # patch from the worktree: if prior source writes ended in an
             # empty workspace diff, re-apply the newest captured candidate per
-            # path. Runs for normal finalization and terminal errors alike;
-            # the contract observation below then reflects the salvaged state.
+            # path. Runs for normal finalization and terminal errors alike.
             self._attempt_final_diff_salvage(
                 trigger="terminal_error" if terminal_error is not None else "finalize",
                 iteration=iterations,
             )
-        if terminal_error is not None:
-            final_diff_contract_mode = getattr(
-                self.config,
-                "final_diff_contract_mode",
-                "log",
-            )
-            if final_diff_contract_mode != "off":
-                final_diff_observation = self._final_diff_contract_observation()
-                if final_diff_observation is not None and (
-                    final_diff_observation.diff_paths or final_diff_observation.suspicious
-                ):
-                    self._record_final_diff_contract_event(
-                        final_diff_observation,
-                        iteration=iterations,
-                        provider_call_count=turn_llm_calls,
-                        mode=str(final_diff_contract_mode),
-                        injected_to_model=False,
-                        hint_text=None,
-                    )
         if terminal_error is None:
             # This is the final suspension point before child usage is
             # consumed. Cancellation while the DONE state event is being
@@ -13900,14 +13808,6 @@ class Agent:
             return changed_receipts
         return max(0, int(workspace_write_count or 0))
 
-    def _workspace_mutation_receipt_summary(self) -> dict[str, int]:
-        receipts = self._workspace_mutation_receipts()
-        counts = self._workspace_mutation_receipt_counts()
-        return {
-            "workspace_mutation_receipt_count": len(receipts),
-            **counts,
-        }
-
     def _final_diff_contract_observation(self) -> FinalDiffContractObservation | None:
         diff_paths = self._workspace_diff_paths_for_final_diff_contract()
         if diff_paths is None:
@@ -13933,43 +13833,6 @@ class Agent:
             source_diff_candidates=source_diff_candidates,
             known_scratch_paths=known_scratch_paths,
         )
-
-    def _record_final_diff_contract_event(
-        self,
-        observation: FinalDiffContractObservation,
-        *,
-        iteration: int,
-        provider_call_count: int,
-        mode: str,
-        injected_to_model: bool,
-        hint_text: str | None = None,
-    ) -> None:
-        details = observation.to_event_details()
-        details.update(self._workspace_mutation_receipt_summary())
-        event = {
-            "feature": "final_diff_contract",
-            "name": "final_diff_contract.observed",
-            "mode": mode,
-            "reason": observation.primary_reason,
-            "action": "nudge" if injected_to_model else "observe",
-            "iteration": iteration,
-            "provider_call_count": provider_call_count,
-            "session_key": self._session_key,
-            "agent_id": self.config.tool_result_store_agent_id
-            or self.config.metadata.get("agent_id"),
-            "injected_to_model": injected_to_model,
-            "evidence": details,
-            "details": details,
-            "diff_paths": observation.diff_paths,
-            "read_files": self._relative_paths_from_records(self._workspace_read_records()),
-            "changed_files": self._relative_paths_from_records(self._workspace_write_records()),
-            "mutation_records": self._workspace_mutation_records(),
-            "hint_text_sha256": (
-                hashlib.sha256(hint_text.encode("utf-8")).hexdigest() if hint_text else None
-            ),
-            "trigger_confidence": "final_diff_contract_gate",
-        }
-        append_runtime_event(self.config.runtime_events_path, event)
 
     # Cap on blocking `git apply` churn per salvage pass: the calls run on the
     # event loop thread, so a pathological candidate list must not be able to
@@ -14054,45 +13917,18 @@ class Agent:
                 if candidate.get("lost") is True:
                     # The agent explicitly reverted this patch; resurrecting
                     # it would score edits the agent chose to abandon.
-                    self._record_final_diff_salvage_event(
-                        candidate,
-                        trigger=trigger,
-                        iteration=iteration,
-                        action="vetoed_lost",
-                    )
                     continue
                 if is_instrumentation_only_patch(patch):
-                    self._record_final_diff_salvage_event(
-                        candidate,
-                        trigger=trigger,
-                        iteration=iteration,
-                        action="vetoed_instrumentation",
-                    )
                     continue
             if time.monotonic() >= deadline:
-                self._record_final_diff_salvage_event(
-                    candidate,
-                    trigger=trigger,
-                    iteration=iteration,
-                    action="time_budget_exhausted",
-                )
                 break
             if not self._apply_final_diff_salvage_patch(workspace, patch, check_only=True):
-                self._record_final_diff_salvage_event(
-                    candidate, trigger=trigger, iteration=iteration, action="check_failed"
-                )
                 continue
             if not self._apply_final_diff_salvage_patch(workspace, patch, check_only=False):
-                self._record_final_diff_salvage_event(
-                    candidate, trigger=trigger, iteration=iteration, action="apply_failed"
-                )
                 continue
             candidate["restored"] = True
             handled_paths.add(path)
             applied.append(candidate)
-            self._record_final_diff_salvage_event(
-                candidate, trigger=trigger, iteration=iteration, action="applied"
-            )
         if applied:
             self._write_turn_call_log(
                 "turn_policy_decision",
@@ -14123,30 +13959,6 @@ class Agent:
             input_bytes=patch.encode("utf-8"),
         )
         return result.ok
-
-    def _record_final_diff_salvage_event(
-        self,
-        candidate: dict[str, Any],
-        *,
-        trigger: str,
-        iteration: int,
-        action: str,
-    ) -> None:
-        event = {
-            "feature": "final_diff_salvage",
-            "name": f"final_diff_salvage.{action}",
-            "action": action,
-            "trigger": trigger,
-            "iteration": iteration,
-            "candidate_id": candidate.get("candidate_id"),
-            "paths": list(candidate.get("paths", []) or []),
-            "patch_sha256": candidate.get("patch_sha256"),
-            "patch_chars": len(candidate.get("patch") or ""),
-            "session_key": self._session_key,
-            "agent_id": self.config.tool_result_store_agent_id
-            or self.config.metadata.get("agent_id"),
-        }
-        append_runtime_event(self.config.runtime_events_path, event)
 
     def _workspace_dir_for_status(self) -> Path | None:
         ctx = self._tool_context or current_tool_context.get()
@@ -15097,51 +14909,6 @@ class Agent:
             injected_to_model=False,
         )
 
-    def _record_runtime_recovery_event(
-        self,
-        decision: RuntimeRecoveryDecision,
-        *,
-        iteration: int,
-        provider_call_count: int,
-        call_attempt: int | None = None,
-        **details: Any,
-    ) -> None:
-        hint_text_sha256 = (
-            hashlib.sha256(decision.message.encode("utf-8")).hexdigest()
-            if decision.message
-            else None
-        )
-        evidence = {
-            **decision.details,
-            **details,
-        }
-        runtime_diff_paths = self._workspace_diff_paths_for_runtime_event()
-        event = {
-            "feature": "runtime_recovery",
-            "mechanism": decision.mechanism,
-            "mode": decision.mode,
-            "reason": decision.reason,
-            "action": decision.action,
-            "iteration": iteration,
-            "provider_call_count": provider_call_count,
-            "call_attempt": call_attempt,
-            "session_key": self._session_key,
-            "agent_id": self.config.tool_result_store_agent_id
-            or self.config.metadata.get("agent_id"),
-            "injected_to_model": decision.injected_to_model,
-            "evidence": evidence,
-            "read_files": self._relative_paths_from_records(self._workspace_read_records()),
-            "changed_files": self._relative_paths_from_records(self._workspace_write_records()),
-            "diff_paths": runtime_diff_paths or [],
-            "git_state": self._runtime_git_state.value,
-            "diff_observed": runtime_diff_paths is not None,
-            "verification_commands": [],
-            "hint_text_sha256": hint_text_sha256,
-            "trigger_confidence": "runtime_recovery_gate",
-            "details": evidence,
-        }
-        append_runtime_event(self.config.runtime_events_path, event)
-
     @staticmethod
     def _relative_paths_from_records(records: list[dict[str, Any]]) -> list[str]:
         paths: list[str] = []
@@ -15336,17 +15103,6 @@ class Agent:
             or bool(_CLEAN_TEST_SUMMARY_RE.search(text))
             or bool(_CLEAN_PASSED_FAILED_SUMMARY_RE.search(text))
         )
-
-    @staticmethod
-    def _classify_focused_verification_result(result: ToolResult) -> str:
-        text = Agent._tool_result_text_for_anchor(result.content)
-        if result.is_error or Agent._tool_result_has_failure_signal(text):
-            return "failure"
-        if Agent._tool_result_has_validation_success_signal(
-            text
-        ) or _PLAIN_PASSED_SUMMARY_RE.search(text):
-            return "success"
-        return "unknown"
 
     @staticmethod
     def _failure_anchor_lines(text: str) -> list[str]:
