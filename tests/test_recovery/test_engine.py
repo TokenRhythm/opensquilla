@@ -848,6 +848,38 @@ def test_unsafe_session_database_blocks_before_gateway_migrations(
 
     assert report.outcome == "attention"
     assert report.stable_code == stable_code
+    if stable_code == "state_database_invalid":
+        assert report.detail is not None
+        assert "sessions.db" in report.detail
+
+
+def test_locked_session_database_reports_unreadable_with_os_detail(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "opensquilla"
+    _workspace(home / "workspace")
+    _desktop_config(home)
+    database = home / "state" / "sessions.db"
+    with sqlite3.connect(database) as connection:
+        connection.execute("CREATE TABLE user_data (id INTEGER PRIMARY KEY)")
+
+    real_open = os.open
+
+    def _denied_open(path: object, flags: int, *args: object, **kwargs: object) -> int:
+        if str(path).endswith("sessions.db"):
+            raise PermissionError(13, "Permission denied", str(path))
+        return real_open(path, flags, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(os, "open", _denied_open)
+
+    report = inspect_profile(home, profile_kind="desktop-primary")
+
+    assert report.outcome == "attention"
+    assert report.stable_code == "state_database_unreadable"
+    assert report.detail is not None
+    assert "sessions.db" in report.detail
+    assert "errno 13" in report.detail
 
 
 def test_wal_database_without_shm_is_validated_from_private_read_only_source_snapshot(
