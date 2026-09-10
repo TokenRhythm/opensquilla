@@ -430,6 +430,11 @@ class LlmProviderConfig(BaseSettings):
     api_key_env: str = ""
     base_url: str = "https://tokenrhythm.studio/v1"
     proxy: str = ""  # explicit HTTP proxy URL (e.g. http://127.0.0.1:7890)
+    # Operator-defined extra HTTP headers for upstream model requests
+    # (e.g. routing gateways that require a session header). Never store
+    # secrets here; Authorization is always managed separately and cannot
+    # be overridden through this field.
+    extra_headers: dict[str, str] = Field(default_factory=dict)
     max_tokens: int = 0  # 0 = auto-resolve from model catalog; >0 = explicit override
     # 0 = auto-resolve from model catalog; >0 = explicit context-window override
     # in tokens. Drives the provider-context budget ladder and context usage

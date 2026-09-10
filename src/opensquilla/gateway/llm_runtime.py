@@ -42,6 +42,7 @@ class LlmRuntimeConfig:
     base_url: str
     proxy: str
     provider_routing: dict[str, str]
+    extra_headers: dict[str, str] = field(default_factory=dict)
     api_key_from_env: bool = False
     api_key_env_name: str = ""
     base_url_from_env: bool = False
@@ -340,6 +341,7 @@ def resolve_llm_runtime_config(config: Any) -> LlmRuntimeConfig:
             provider,
             getattr(llm, "provider_routing", {}),
         ),
+        extra_headers=dict(getattr(llm, "extra_headers", None) or {}),
         api_key_from_env=credential.source == "env",
         api_key_env_name=credential.env_name,
         base_url_from_env=base_url_from_env,

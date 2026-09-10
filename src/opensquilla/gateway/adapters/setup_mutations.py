@@ -249,6 +249,7 @@ class GatewaySetupRuntimePort(SetupRuntimePort):
                 base_url=runtime.base_url,
                 proxy=runtime.proxy,
                 provider_routing=runtime.provider_routing,
+                extra_headers=dict(getattr(runtime, "extra_headers", None) or {}),
             )
         )
 

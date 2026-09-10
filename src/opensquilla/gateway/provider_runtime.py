@@ -24,6 +24,7 @@ def resolve_provider_selector_config(config: Any) -> ProviderConfig | None:
         base_url=runtime.base_url,
         proxy=runtime.proxy,
         provider_routing=runtime.provider_routing,
+        extra_headers=dict(getattr(runtime, "extra_headers", None) or {}),
     )
 
 

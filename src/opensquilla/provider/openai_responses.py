@@ -29,7 +29,12 @@ from .error_redaction import (
     redacted_httpx_error,
 )
 from .failures import retry_after_from_headers
-from .openai import _http_error_body_text, _resolve_llm_proxy, _versioned_api_url
+from .openai import (
+    _http_error_body_text,
+    _resolve_llm_proxy,
+    _versioned_api_url,
+    merge_extra_headers,
+)
 from .protocol import ProviderConnectionConfig, ProviderMetadata
 from .request_proof import (
     RESPONSES_REQUEST_ENVELOPE,
@@ -209,6 +214,7 @@ class OpenAIResponsesProvider:
         org_id: str | None = None,
         proxy: str | None = None,
         provider_id: str | None = None,
+        extra_headers: dict[str, str] | None = None,
     ) -> None:
         self._api_key = clean_header_secret(api_key, label="LLM API key")
         self._model = model
@@ -216,6 +222,7 @@ class OpenAIResponsesProvider:
         self._org_id = org_id
         self._proxy = _resolve_llm_proxy(proxy)
         self.provider_id = (provider_id or self.provider_name).strip()
+        self._extra_headers = dict(extra_headers or {})
 
     @property
     def model(self) -> str:
@@ -362,6 +369,7 @@ class OpenAIResponsesProvider:
             "Content-Type": "application/json",
             "Accept": "application/json",
         }
+        merge_extra_headers(headers, self._extra_headers)
         if self._org_id:
             headers["OpenAI-Organization"] = self._org_id
 
@@ -934,6 +942,7 @@ class OpenAIResponsesProvider:
         (e.g. onboarding discovery) can classify it.
         """
         headers = {"Authorization": f"Bearer {self._api_key}"}
+        merge_extra_headers(headers, self._extra_headers)
         try:
             async with httpx.AsyncClient(
                 timeout=30,
@@ -993,6 +1002,7 @@ class OpenAIResponsesProvider:
             "Content-Type": "application/json",
             "Accept": "application/json",
         }
+        merge_extra_headers(headers, self._extra_headers)
         if self._org_id:
             headers["OpenAI-Organization"] = self._org_id
         endpoint = self._api_url("/v1/responses/compact")
