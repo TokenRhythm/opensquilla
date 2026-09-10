@@ -39,10 +39,16 @@ from opensquilla.sandbox.integration import (
     run_under_backend,
 )
 from opensquilla.sandbox.operation_runtime import SandboxToolDescriptor
+from opensquilla.sandbox.permissions import (
+    FileSystemAccess,
+    FileSystemPermissionEntry,
+    FileSystemPermissionProfile,
+)
 from opensquilla.sandbox.policy import LevelHints
 from opensquilla.sandbox.types import (
     ApprovedHostExecution,
     DenialResult,
+    MountSpec,
     NetworkMode,
     SandboxBackendError,
     SandboxPolicy,
@@ -866,16 +872,16 @@ def _resolve_python_bin(*, sandbox_enabled: bool) -> str:
         backend = getattr(runtime, "backend", None) if runtime is not None else None
         backend_name = str(getattr(backend, "name", "") or "")
 
+    current_python = Path(sys.executable)
     if sandbox_enabled and backend_name == "bubblewrap":
-        # The bubblewrap backend exposes host /usr and /bin inside the sandbox,
-        # but not the caller's project venv. `uv run` commonly puts
-        # .venv/bin/python3 first on PATH, which is invisible after isolation.
-        for candidate in _SANDBOX_PYTHON_CANDIDATES:
-            if candidate.is_file() and os.access(candidate, os.X_OK):
-                return str(candidate)
+        if current_python.is_file() and os.access(current_python, os.X_OK):
+            return str(current_python)
+        system_python = _visible_bubblewrap_system_python()
+        if system_python is not None:
+            return system_python
+        raise ToolError("Python interpreter not found in the Bubblewrap runtime")
 
     if not sandbox_enabled or backend_name != "bubblewrap":
-        current_python = Path(sys.executable)
         if current_python.is_file():
             return str(current_python)
 
@@ -883,6 +889,162 @@ def _resolve_python_bin(*, sandbox_enabled: bool) -> str:
     if python_bin is None:
         raise ToolError("Python interpreter not found on PATH")
     return python_bin
+
+
+def _absolute_runtime_path(path: Path) -> Path:
+    expanded = path.expanduser()
+    return expanded if expanded.is_absolute() else Path.cwd() / expanded
+
+
+def _runtime_path_variants(path: Path) -> tuple[Path, ...]:
+    lexical = _absolute_runtime_path(path)
+    try:
+        canonical = lexical.resolve(strict=False)
+    except (OSError, RuntimeError):
+        canonical = lexical
+    return tuple(dict.fromkeys((lexical, canonical)))
+
+
+def _current_python_runtime_roots() -> tuple[Path, ...]:
+    """Return the current interpreter roots needed by an isolated Python run."""
+    roots: list[Path] = []
+    candidates: list[Path] = []
+    for prefix in (Path(sys.prefix), Path(sys.base_prefix)):
+        candidates.extend(_runtime_path_variants(prefix))
+
+    for executable_path in _runtime_path_variants(Path(sys.executable)):
+        if len(executable_path.parents) > 1:
+            candidates.append(executable_path.parents[1])
+
+    for candidate in candidates:
+        if candidate == Path(candidate.anchor) or candidate in roots or not candidate.exists():
+            continue
+        roots.append(candidate)
+    return tuple(roots)
+
+
+def _policy_deny_profile(policy: SandboxPolicy) -> FileSystemPermissionProfile:
+    file_system = policy.file_system or FileSystemPermissionProfile(entries=())
+    denied_globs = tuple(dict.fromkeys((*file_system.denied_read_globs, *policy.unreadable_globs)))
+    if denied_globs == file_system.denied_read_globs:
+        return file_system
+    return dataclasses.replace(file_system, denied_read_globs=denied_globs)
+
+
+def _path_or_ancestor_is_explicitly_denied(
+    profile: FileSystemPermissionProfile,
+    path: Path,
+) -> bool:
+    return any(profile.is_explicitly_denied(candidate) for candidate in (path, *path.parents))
+
+
+def _policy_denies_current_python_runtime(
+    policy: SandboxPolicy,
+    runtime_roots: tuple[Path, ...],
+) -> bool:
+    profile = _policy_deny_profile(policy)
+    for root in runtime_roots:
+        if _path_or_ancestor_is_explicitly_denied(profile, root):
+            return True
+        # A trailing subtree glob (for example ``runtime/**``) may not match
+        # the directory spelling itself, but it still prohibits reopening it.
+        if profile.is_explicitly_denied(root / ".opensquilla-runtime-policy-probe"):
+            return True
+    return any(
+        _path_or_ancestor_is_explicitly_denied(profile, executable)
+        for executable in _runtime_path_variants(Path(sys.executable))
+    )
+
+
+def _visible_bubblewrap_system_python(policy: SandboxPolicy | None = None) -> str | None:
+    profile = _policy_deny_profile(policy) if policy is not None else None
+    for candidate in _SANDBOX_PYTHON_CANDIDATES:
+        if not candidate.is_file() or not os.access(candidate, os.X_OK):
+            continue
+        variants = _runtime_path_variants(candidate)
+        if profile is not None and any(
+            _path_or_ancestor_is_explicitly_denied(profile, variant) for variant in variants
+        ):
+            continue
+        return str(candidate)
+    return None
+
+
+def _is_current_python(python_bin: str) -> bool:
+    selected = _absolute_runtime_path(Path(python_bin))
+    current = _absolute_runtime_path(Path(sys.executable))
+    try:
+        return selected.samefile(current)
+    except OSError:
+        return selected == current
+
+
+def _policy_with_bubblewrap_python_runtime(
+    policy: SandboxPolicy,
+    *,
+    python_bin: str,
+    runtime: object | None,
+) -> tuple[str, SandboxPolicy]:
+    """Select and expose a policy-compatible Python for this Bubblewrap request."""
+    backend = getattr(runtime, "backend", None) if runtime is not None else None
+    if str(getattr(backend, "name", "") or "") != "bubblewrap":
+        return python_bin, policy
+    if not _is_current_python(python_bin):
+        system_python = _visible_bubblewrap_system_python(policy)
+        if system_python is None:
+            raise ToolError(
+                "System Python interpreters available to Bubblewrap are denied by sandbox policy"
+            )
+        return system_python, policy
+
+    runtime_roots = _current_python_runtime_roots()
+    if _policy_denies_current_python_runtime(policy, runtime_roots):
+        system_python = _visible_bubblewrap_system_python(policy)
+        if system_python is None:
+            raise ToolError(
+                "Managed Python runtime is denied by sandbox policy "
+                "and no system Python is available"
+            )
+        return system_python, policy
+
+    runtime_root_variants = {
+        variant for root in runtime_roots for variant in _runtime_path_variants(root)
+    }
+    mounts: list[MountSpec] = []
+    for mount in policy.mounts:
+        host_variants = set(_runtime_path_variants(mount.host_path))
+        host_is_runtime = bool(host_variants.intersection(runtime_root_variants))
+        sandbox_path = _absolute_runtime_path(Path(mount.sandbox_path))
+        exact_runtime_mount = host_is_runtime and sandbox_path in runtime_root_variants
+        if exact_runtime_mount:
+            continue
+        if host_is_runtime and mount.mode == "rw":
+            mount = mount.with_mode("ro")
+        mounts.append(mount)
+
+    for root in runtime_roots:
+        mounts.append(
+            MountSpec(
+                host_path=root,
+                sandbox_path=root,
+                mode="ro",
+                required=True,
+            )
+        )
+
+    runtime_entries = tuple(
+        FileSystemPermissionEntry(path=root, access=FileSystemAccess.READ) for root in runtime_roots
+    )
+    file_system = policy.file_system or FileSystemPermissionProfile(entries=())
+    file_system = dataclasses.replace(
+        file_system,
+        entries=(*file_system.entries, *runtime_entries),
+    )
+    return python_bin, dataclasses.replace(
+        policy,
+        mounts=tuple(mounts),
+        file_system=file_system,
+    )
 
 
 @tool(
@@ -1128,11 +1290,17 @@ async def execute_code(
                 sandbox_enabled = False
                 elevated_code_execution = True
             else:
+                python_bin, backend_policy = _policy_with_bubblewrap_python_runtime(
+                    request.policy,
+                    python_bin=python_bin,
+                    runtime=runtime,
+                )
+                backend_policy = _trusted_managed_network_policy(backend_policy, runtime)
                 backend_request = SandboxRequest(
                     argv=(python_bin, "-c", code),
                     cwd=request.cwd,
                     action_kind=request.action_kind,
-                    policy=_trusted_managed_network_policy(request.policy, runtime),
+                    policy=backend_policy,
                     env=dict(getattr(request, "env", None) or safe_env),
                     reason=getattr(request, "reason", ""),
                     session_id=getattr(request, "session_id", ""),
