@@ -59,10 +59,6 @@ from opensquilla.session.compaction_deployment import (
     CompactionExecutionTarget,
 )
 from opensquilla.tools.dispatch import build_tool_handler
-from opensquilla.tools.mutation_receipts import (
-    fingerprint_path,
-    record_semantic_mutation_receipt,
-)
 from opensquilla.tools.registry import get_default_registry
 from opensquilla.tools.types import CallerKind, InteractionMode, ToolContext
 
@@ -678,61 +674,6 @@ class _PostWriteFailedVerificationThenSourceProvider:
             yield ProviderDone(stop_reason="tool_calls", input_tokens=1, output_tokens=1)
             return
         yield ProviderText(text="done")
-        yield ProviderDone(stop_reason="stop", input_tokens=1, output_tokens=1)
-
-    async def list_models(self) -> list[Any]:
-        return []
-
-
-class _StableVerifiedDiffThenSourceProvider:
-    provider_name = "fake"
-
-    def __init__(self) -> None:
-        self.calls: list[list[Message]] = []
-        self.tool_lists: list[list[Any] | None] = []
-
-    def chat(
-        self,
-        messages: list[Message],
-        tools: list[Any] | None = None,
-        config: ChatConfig | None = None,
-    ) -> AsyncIterator[Any]:
-        self.calls.append(messages)
-        self.tool_lists.append(tools)
-        return self._stream(len(self.calls))
-
-    async def _stream(self, call_number: int) -> AsyncIterator[Any]:
-        if call_number == 1:
-            tool_use_id = "edit-1"
-            yield ProviderToolUseStart(tool_use_id=tool_use_id, tool_name="edit_file")
-            yield ProviderToolUseEnd(
-                tool_use_id=tool_use_id,
-                tool_name="edit_file",
-                arguments={"path": "src.py", "old_text": "old", "new_text": "new"},
-            )
-            yield ProviderDone(stop_reason="tool_calls", input_tokens=1, output_tokens=1)
-            return
-        if call_number == 2:
-            tool_use_id = "cmd-1"
-            yield ProviderToolUseStart(tool_use_id=tool_use_id, tool_name="exec_command")
-            yield ProviderToolUseEnd(
-                tool_use_id=tool_use_id,
-                tool_name="exec_command",
-                arguments={"command": "pytest tests/test_src.py"},
-            )
-            yield ProviderDone(stop_reason="tool_calls", input_tokens=1, output_tokens=1)
-            return
-        if 3 <= call_number <= 8:
-            tool_use_id = f"read-{call_number}"
-            yield ProviderToolUseStart(tool_use_id=tool_use_id, tool_name="read_file")
-            yield ProviderToolUseEnd(
-                tool_use_id=tool_use_id,
-                tool_name="read_file",
-                arguments={"path": "src.py"},
-            )
-            yield ProviderDone(stop_reason="tool_calls", input_tokens=1, output_tokens=1)
-            return
-        yield ProviderText(text=f"final after convergence {call_number}")
         yield ProviderDone(stop_reason="stop", input_tokens=1, output_tokens=1)
 
     async def list_models(self) -> list[Any]:
@@ -2879,8 +2820,6 @@ def test_configured_hidden_scratch_diff_is_not_source_progress(tmp_path) -> None
         ),
     )
 
-    assert agent._workspace_tracked_diff_paths_for_nudge() == []
-    assert agent._workspace_has_source_change_evidence() is False
     observation = agent._final_diff_contract_observation()
     assert observation is not None
     assert observation.source_paths == []
@@ -3174,7 +3113,6 @@ def test_workspace_edit_gate_rejects_configured_scratch_inside_workspace(
         "noop_receipt_count": 0,
         "partial_receipt_count": 0,
     }
-    assert agent._workspace_has_source_change_evidence() is False
 
 
 @pytest.mark.parametrize("escape_destination", ["outside", "workspace"])
@@ -4177,106 +4115,6 @@ async def test_agent_failed_focused_verification_counts_after_workspace_write(tm
         and "Stop broad source exploration" in message.content
         for message in provider.calls[5]
     )
-
-
-@pytest.mark.asyncio
-async def test_agent_converges_after_stable_verified_workspace_diff(tmp_path) -> None:
-    subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True)
-    source = tmp_path / "src.py"
-    source.write_text("old\n", encoding="utf-8")
-    subprocess.run(["git", "add", "src.py"], cwd=tmp_path, check=True, capture_output=True)
-    subprocess.run(
-        ["git", "commit", "-m", "init"],
-        cwd=tmp_path,
-        check=True,
-        capture_output=True,
-        env={
-            **dict(os.environ),
-            "GIT_AUTHOR_NAME": "Test",
-            "GIT_AUTHOR_EMAIL": "test@example.com",
-            "GIT_COMMITTER_NAME": "Test",
-            "GIT_COMMITTER_EMAIL": "test@example.com",
-        },
-    )
-    runtime_events_path = tmp_path / "runtime_events.jsonl"
-    tool_context = ToolContext(workspace_dir=str(tmp_path))
-    handler_calls: list[str] = []
-
-    async def _tool(call: Any) -> ToolResult:
-        handler_calls.append(call.tool_name)
-        if call.tool_name == "edit_file":
-            before = fingerprint_path(source)
-            source.write_text("new\n", encoding="utf-8")
-            after = fingerprint_path(source)
-            record_semantic_mutation_receipt(
-                tool_name="edit_file",
-                path=source,
-                operation="edit_file",
-                before=before,
-                after=after,
-                partial=False,
-                ctx=tool_context,
-            )
-            return ToolResult(
-                tool_use_id=call.tool_use_id,
-                tool_name=call.tool_name,
-                content="edited",
-            )
-        if call.tool_name == "exec_command":
-            return ToolResult(
-                tool_use_id=call.tool_use_id,
-                tool_name=call.tool_name,
-                content="test result: ok. 4 passed; 0 failed\n",
-            )
-        if call.tool_name == "read_file":
-            return ToolResult(
-                tool_use_id=call.tool_use_id,
-                tool_name=call.tool_name,
-                content=source.read_text(encoding="utf-8"),
-            )
-        raise AssertionError(f"unexpected tool: {call.tool_name}")
-
-    provider = _StableVerifiedDiffThenSourceProvider()
-    agent = Agent(
-        provider=provider,
-        config=AgentConfig(
-            max_iterations=12,
-            flush_enabled=False,
-            progress_watchdog_mode="warn_model",
-            post_write_convergence_enabled=True,
-            runtime_events_path=str(runtime_events_path),
-        ),
-        tool_handler=_tool,
-        tool_context=tool_context,
-    )
-
-    events = [event async for event in agent.run_turn("Fix the failing parser test")]
-
-    assert any(isinstance(event, DoneEvent) for event in events)
-    assert handler_calls == ["edit_file", "exec_command", *["read_file"] * 6]
-    assert any(
-        isinstance(message.content, str)
-        and "[Runtime post-write convergence]" in message.content
-        and "current diff has stayed unchanged" in message.content
-        for call in provider.calls
-        for message in call
-    )
-    assert any(
-        isinstance(message.content, str)
-        and "[Runtime post-write convergence]" in message.content
-        and "Do not call tools" in message.content
-        for call in provider.calls
-        for message in call
-    )
-    assert provider.tool_lists[-1] is None
-    done_events = [event for event in events if isinstance(event, DoneEvent)]
-    assert done_events[-1].text == "final after convergence 9"
-    runtime_events = [
-        json.loads(line)
-        for line in runtime_events_path.read_text(encoding="utf-8").splitlines()
-    ]
-    assert any(row.get("name") == "post_write_convergence.warned" for row in runtime_events)
-    assert any(row.get("name") == "post_write_convergence.finalized" for row in runtime_events)
 
 
 @pytest.mark.asyncio

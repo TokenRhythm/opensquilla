@@ -71,9 +71,8 @@ class AgentProfile:
     # loop-side finalize-time red-evidence gate (see engine.runtime
     # _resolve_finalize_evidence_gate). Composes with any prompt_mode.
     finalize_evidence_gate: bool = False
-    # Opt-in switch restoring the earlier compact "Tool Call Style" and
-    # "Reply Guidelines" prompt directives (see engine.runtime
-    # _resolve_legacy_prompt_style). Off keeps the current wording unchanged.
+    # Deprecated, unused compatibility slot. Keep its position and default
+    # so older positional callers still bind inject_time_prefix correctly.
     legacy_prompt_style: bool = False
     # Per-turn time-prefix on user messages (see engine.steps.inject_time_prefix).
     inject_time_prefix: bool = True

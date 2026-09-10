@@ -2988,7 +2988,9 @@
       "clearActivity": "Borrar actividad",
       "expandActivity": "Expandir actividad de instalación",
       "collapseActivity": "Contraer actividad de instalación",
+      "selectSkillDirectory": "Selecciona un directorio de habilidades",
       "queueStatus": {
+        "selection_required": "Elegir directorio",
         "queued": "En cola",
         "installing": "Instalando",
         "cancelling": "Cancelando",

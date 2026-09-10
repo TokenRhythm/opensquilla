@@ -1,4 +1,5 @@
 import { expect, test, type Page } from '@playwright/test'
+import { helloOkResponse } from './support/gateway-fixture'
 
 import {
   chatHistoryPayload,
@@ -116,9 +117,8 @@ async function installMockGateway(
       const method = String(frame.method || '')
 
       if (method === 'connect') {
-        ws.send(JSON.stringify({
-          protocol: 3,
-          policy: { tick_interval_ms: 30000, concurrent_history_reads: true },
+        ws.send(helloOkResponse({
+          policy: { concurrent_history_reads: true },
           features: { methods: ['sessions.steer.v2'] },
           auth: {
             principal: { isOwner: true },
@@ -203,6 +203,8 @@ async function installMockGateway(
             status: 'ok',
             runStatus: 'running',
           }],
+          count: 1,
+          ts: 1_800_000_000,
           has_more: false,
         },
         'sessions.messages.unsubscribe': { subscribed: false },

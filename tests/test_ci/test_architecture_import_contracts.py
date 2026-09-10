@@ -8,6 +8,9 @@ from pathlib import Path
 PACKAGE_ROOT = Path(__file__).resolve().parents[2] / "src" / "opensquilla"
 
 APPROVED_PACKAGE_IMPORTS: frozenset[tuple[str, str]] = frozenset({
+    # Source adapters consume the transport-neutral install command's pure
+    # identifier parser; application never imports the Skill implementation.
+    ("skills", "application"),
     ("agents", "gateway"),
     ("agents", "identity"),
     ("agents", "onboarding"),

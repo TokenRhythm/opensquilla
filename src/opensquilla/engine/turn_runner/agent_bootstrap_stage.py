@@ -206,30 +206,6 @@ def _finalize_evidence_strict_from_env(config_value: bool = False) -> bool:
     )
 
 
-_SCRATCH_VERIFY_MIRROR_ENV = "OPENSQUILLA_SCRATCH_VERIFY_MIRROR"
-
-
-def _scratch_verify_mirror_from_env(config_value: bool = False) -> bool:
-    """Resolve the opt-in scratch verify-mirror flag.
-
-    Default off. A non-blank ``OPENSQUILLA_SCRATCH_VERIFY_MIRROR`` overrides
-    ``config_value``. Unrecognized env values raise instead of being silently
-    ignored so a run manifest cannot record an override the run did not
-    actually apply.
-    """
-    raw = os.environ.get(_SCRATCH_VERIFY_MIRROR_ENV, "").strip().lower()
-    if not raw:
-        return bool(config_value)
-    if raw in _FINALIZE_EVIDENCE_GATE_ON:
-        return True
-    if raw in _FINALIZE_EVIDENCE_GATE_OFF:
-        return False
-    raise ValueError(
-        f"{_SCRATCH_VERIFY_MIRROR_ENV} must be one of: "
-        + ", ".join(sorted(_FINALIZE_EVIDENCE_GATE_ON | _FINALIZE_EVIDENCE_GATE_OFF))
-    )
-
-
 _FINALIZE_VARIANT_CHALLENGE_ENV = "OPENSQUILLA_FINALIZE_VARIANT_CHALLENGE"
 
 
@@ -279,31 +255,6 @@ def _submit_review_from_env(config_value: bool = False) -> bool:
     raise ValueError(
         f"{_SUBMIT_REVIEW_ENV} must be one of: "
         + ", ".join(sorted(_SUBMIT_REVIEW_ON | _SUBMIT_REVIEW_OFF))
-    )
-
-
-_PATCH_HYGIENE_BLOCK_ENV = "OPENSQUILLA_PATCH_HYGIENE_BLOCK"
-_PATCH_HYGIENE_BLOCK_MODES = ("off", "test_paths", "protected_paths")
-
-
-def _patch_hygiene_block_from_env(
-    config_value: Literal["off", "test_paths", "protected_paths"] = "off",
-) -> Literal["off", "test_paths", "protected_paths"]:
-    """Resolve the finalize-time patch hygiene hard-block mode.
-
-    Default off. A non-blank ``OPENSQUILLA_PATCH_HYGIENE_BLOCK`` overrides
-    ``config_value``. Unrecognized env values raise instead of being silently
-    ignored so a run manifest cannot record an override the run did not
-    actually apply.
-    """
-    raw = os.environ.get(_PATCH_HYGIENE_BLOCK_ENV, "").strip().lower()
-    if not raw:
-        return config_value
-    if raw in _PATCH_HYGIENE_BLOCK_MODES:
-        return raw  # type: ignore[return-value]
-    raise ValueError(
-        f"{_PATCH_HYGIENE_BLOCK_ENV} must be one of: "
-        + ", ".join(_PATCH_HYGIENE_BLOCK_MODES)
     )
 
 
@@ -1191,18 +1142,6 @@ class AgentBootstrapStage:
                 "OPENSQUILLA_PROGRESS_WATCHDOG_FAILURE_ANCHOR_THRESHOLD",
                 AgentConfig().progress_watchdog_repeated_failure_anchor_threshold,
             ),
-            post_write_convergence_enabled=_bool_from_env(
-                "OPENSQUILLA_POST_WRITE_CONVERGENCE",
-                AgentConfig().post_write_convergence_enabled,
-            ),
-            post_write_convergence_warn_threshold=_positive_int_from_env(
-                "OPENSQUILLA_POST_WRITE_CONVERGENCE_WARN_THRESHOLD",
-                AgentConfig().post_write_convergence_warn_threshold,
-            ),
-            post_write_convergence_finalize_after_warning=_positive_int_from_env(
-                "OPENSQUILLA_POST_WRITE_CONVERGENCE_FINALIZE_AFTER_WARNING",
-                AgentConfig().post_write_convergence_finalize_after_warning,
-            ),
             patch_evidence_ledger_path=(
                 os.environ.get("OPENSQUILLA_PATCH_EVIDENCE_LEDGER_PATH") or None
             ),
@@ -1217,12 +1156,6 @@ class AgentBootstrapStage:
                 "OPENSQUILLA_SUBMIT_REVIEW_DIFF_MAX_CHARS",
                 AgentConfig().submit_review_diff_max_chars,
             ),
-            patch_hygiene_block_mode=_patch_hygiene_block_from_env(
-                AgentConfig().patch_hygiene_block_mode
-            ),
-            scratch_verify_mirror=_scratch_verify_mirror_from_env(
-                AgentConfig().scratch_verify_mirror
-            ),
             finalize_variant_challenge=_finalize_variant_challenge_from_env(
                 AgentConfig().finalize_variant_challenge
             ),
@@ -1233,10 +1166,6 @@ class AgentBootstrapStage:
             identical_request_loop_break_threshold=_nonnegative_int_from_env(
                 "OPENSQUILLA_IDENTICAL_REQUEST_LOOP_BREAK",
                 AgentConfig().identical_request_loop_break_threshold,
-            ),
-            placeholder_escalation_threshold=_nonnegative_int_from_env(
-                "OPENSQUILLA_PLACEHOLDER_ESCALATION_THRESHOLD",
-                AgentConfig().placeholder_escalation_threshold,
             ),
             deadline_wrapup_margin_seconds=_nonnegative_int_from_env(
                 "OPENSQUILLA_DEADLINE_WRAPUP_MARGIN_SECONDS",
@@ -1254,17 +1183,9 @@ class AgentBootstrapStage:
                 "OPENSQUILLA_DEADLINE_THINKING_OFF_MARGIN_SECONDS",
                 AgentConfig().deadline_thinking_off_margin_seconds,
             ),
-            reasoning_stream_char_cap=_nonnegative_int_from_env(
-                "OPENSQUILLA_REASONING_STREAM_CHAR_CAP",
-                AgentConfig().reasoning_stream_char_cap,
-            ),
             final_diff_salvage=_bool_from_env(
                 "OPENSQUILLA_FINAL_DIFF_SALVAGE",
                 AgentConfig().final_diff_salvage,
-            ),
-            endgame_git_freeze_margin_seconds=_nonnegative_int_from_env(
-                "OPENSQUILLA_ENDGAME_GIT_FREEZE_MARGIN_SECONDS",
-                AgentConfig().endgame_git_freeze_margin_seconds,
             ),
             max_iterations_deadline_extend_seconds=_nonnegative_int_from_env(
                 "OPENSQUILLA_MAX_ITERATIONS_DEADLINE_EXTEND_SECONDS",
@@ -1274,25 +1195,13 @@ class AgentBootstrapStage:
                 "OPENSQUILLA_FINAL_DIFF_SALVAGE_VETO",
                 AgentConfig().final_diff_salvage_veto,
             ),
-            endgame_git_freeze_instrumentation_exempt=_bool_from_env(
-                "OPENSQUILLA_ENDGAME_GIT_FREEZE_INSTRUMENTATION_EXEMPT",
-                AgentConfig().endgame_git_freeze_instrumentation_exempt,
-            ),
             deadline_wrapup_sticky_thinking_off=_bool_from_env(
                 "OPENSQUILLA_DEADLINE_WRAPUP_STICKY_THINKING_OFF",
                 AgentConfig().deadline_wrapup_sticky_thinking_off,
             ),
-            endgame_fix_directive_margin_seconds=_nonnegative_int_from_env(
-                "OPENSQUILLA_ENDGAME_FIX_DIRECTIVE_MARGIN_SECONDS",
-                AgentConfig().endgame_fix_directive_margin_seconds,
-            ),
             reasoning_only_act_now=_bool_from_env(
                 "OPENSQUILLA_REASONING_ONLY_ACT_NOW",
                 AgentConfig().reasoning_only_act_now,
-            ),
-            mid_budget_no_diff_nudge=_bool_from_env(
-                "OPENSQUILLA_MID_BUDGET_NO_DIFF_NUDGE",
-                AgentConfig().mid_budget_no_diff_nudge,
             ),
             repeated_tool_call_recovery_threshold=_nonnegative_int_from_env(
                 "OPENSQUILLA_TOOL_REPEAT_NUDGE_THRESHOLD",

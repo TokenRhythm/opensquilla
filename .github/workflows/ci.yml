@@ -423,8 +423,7 @@ jobs:
         if: ${{ contains(fromJSON(needs.plan-ci.outputs.required_suites), 'frontend-validation') }}
         shell: bash
         run: |
-          uv run --no-sync python scripts/contracts/generate_gateway_contracts.py --check
-          uv run --no-sync python scripts/contracts/generate_gateway_contracts.py --verify-determinism
+          uv run --no-sync python scripts/contracts/generate_gateway_contracts.py --check-determinism --jobs 4
 
       - name: Run real Gateway Contract toolchain integration
         if: ${{ contains(fromJSON(needs.plan-ci.outputs.required_suites), 'frontend-validation') }}
@@ -550,8 +549,7 @@ jobs:
         run: |
           npm --prefix opensquilla-webui run test:contract-tooling
           verification_root="$(mktemp -d "${RUNNER_TEMP}/gateway-verification.XXXXXX")"
-          uv run --no-sync python scripts/contracts/generate_gateway_contracts.py --write --profile verification --output-root "${verification_root}"
-          uv run --no-sync python scripts/contracts/generate_gateway_contracts.py --verify-determinism --profile verification --output-root "${verification_root}"
+          uv run --no-sync python scripts/contracts/generate_gateway_contracts.py --write-determinism --jobs 4 --profile verification --output-root "${verification_root}"
           node scripts/contracts/verify_gateway_validator_profiles.mjs --verification-root "${verification_root}"
           uv run --no-sync python scripts/contracts/generate_gateway_contracts.py --hash-manifest "${RUNNER_TEMP}/gateway-contract-verification-hashes.json" --profile verification --output-root "${verification_root}"
 
@@ -611,9 +609,7 @@ jobs:
           OPENSQUILLA_RUN_CONTRACT_TOOLCHAIN_INTEGRATION: "1"
           PYTHONPATH: "${{ github.workspace }};${{ github.workspace }}/src"
         run: |
-          uv run --no-sync python scripts/contracts/generate_gateway_contracts.py --check
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          uv run --no-sync python scripts/contracts/generate_gateway_contracts.py --verify-determinism
+          uv run --no-sync python scripts/contracts/generate_gateway_contracts.py --check-determinism --jobs 4
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           uv run --no-sync pytest -q --confcutdir=tests/contracts tests/contracts
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
@@ -626,9 +622,7 @@ jobs:
           npm --prefix opensquilla-webui run test:contract-tooling
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           $verificationRoot = Join-Path $env:RUNNER_TEMP ("gateway-verification-" + [guid]::NewGuid())
-          uv run --no-sync python scripts/contracts/generate_gateway_contracts.py --write --profile verification --output-root $verificationRoot
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          uv run --no-sync python scripts/contracts/generate_gateway_contracts.py --verify-determinism --profile verification --output-root $verificationRoot
+          uv run --no-sync python scripts/contracts/generate_gateway_contracts.py --write-determinism --jobs 4 --profile verification --output-root $verificationRoot
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           node scripts/contracts/verify_gateway_validator_profiles.mjs --verification-root $verificationRoot
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

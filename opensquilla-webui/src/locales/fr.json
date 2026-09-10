@@ -2988,7 +2988,9 @@
       "clearActivity": "Effacer l’activité",
       "expandActivity": "Développer l’activité d’installation",
       "collapseActivity": "Réduire l’activité d’installation",
+      "selectSkillDirectory": "Sélectionnez un dossier de compétence",
       "queueStatus": {
+        "selection_required": "Choisir un dossier",
         "queued": "En attente",
         "installing": "Installation",
         "cancelling": "Annulation",

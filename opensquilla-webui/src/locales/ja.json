@@ -2988,7 +2988,9 @@
       "clearActivity": "履歴を消去",
       "expandActivity": "インストール状況を展開",
       "collapseActivity": "インストール状況を折りたたむ",
+      "selectSkillDirectory": "スキルのディレクトリを選択",
       "queueStatus": {
+        "selection_required": "ディレクトリの選択待ち",
         "queued": "待機中",
         "installing": "インストール中",
         "cancelling": "キャンセル中",

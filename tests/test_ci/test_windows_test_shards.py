@@ -250,7 +250,6 @@ RECENTLY_ADDED_ACTIVE_TESTS = {
     "tests/test_toolcomp_matcher_levers.py",
     "tests/test_toolcomp_matcher_safety.py",
     "tests/test_toolcomp_reducer_semantics.py",
-    "tests/test_engine/test_agent_patch_hygiene_block.py",
     "tests/test_engine/test_agent_submit_review.py",
     "tests/test_engine/test_agent_verify_mirror_and_variant_challenge.py",
     "tests/test_engine/test_endgame_directive_and_cap_levers.py",
@@ -787,6 +786,7 @@ def test_affinity_overflow_moves_only_environment_independent_tests() -> None:
     # These reviewed files need no shard-specific setup. Releasing them keeps
     # environment-dependent tests pinned while restoring an even critical path.
     assert moved == {
+        "tests/contracts/test_gateway_contract_parallel.py": "core",
         "tests/test_ci/test_migrations_packaged.py": "core",
         "tests/test_gateway/test_goal_rpc.py": "desktop-installer-contracts",
         "tests/test_gateway/test_project_workspace_execution.py": (

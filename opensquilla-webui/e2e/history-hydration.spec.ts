@@ -1,4 +1,5 @@
 import { expect, test, type Page } from '@playwright/test'
+import { helloOkResponse } from './support/gateway-fixture'
 import {
   chatHistoryPayload,
   sessionMessagesHydratePayload,
@@ -25,8 +26,7 @@ function replyToPing(
 }
 
 function helloResponse(tickIntervalMs: number) {
-  return JSON.stringify({
-    protocol: 3,
+  return helloOkResponse({
     policy: {
       tick_interval_ms: tickIntervalMs,
       concurrent_history_reads: true,
@@ -51,7 +51,7 @@ function basePayload(method: string, sessionKey = SESSION_KEY): unknown {
       skills: {},
     },
     'models.routing.get': { mode: 'direct' },
-    'sessions.list': { sessions: [], has_more: false },
+    'sessions.list': { sessions: [], count: 0, ts: 1_800_000_000, has_more: false },
     'sessions.messages.snapshot': sessionMessagesSnapshotPayload(sessionKey),
     'sessions.messages.subscribe': sessionMessagesSubscribePayload(sessionKey),
     'sessions.messages.hydrate': sessionMessagesHydratePayload(sessionKey),
@@ -172,6 +172,8 @@ test('keeps the conversation usable while startup and long history are delayed',
               status: 'ok',
               runStatus: 'idle',
             }],
+            count: 1,
+            ts: 1_800_000_000,
             has_more: false,
           }))
           return
@@ -477,8 +479,10 @@ test('terminates stalled history and live hydration despite ongoing ticks, then 
     if (socketId === 1) {
       disconnectSeedSocket = () => ws.close({ code: 1012, reason: 'inject recovery' })
     }
+    let authenticated = false
     let tickSeq = 0
     const sendTick = () => {
+      if (!authenticated) return
       try {
         ws.send(JSON.stringify({
           type: 'event',
@@ -492,7 +496,6 @@ test('terminates stalled history and live hydration despite ongoing ticks, then 
         // continues the same fault-injection scenario.
       }
     }
-    sendTick()
     tickSenders.push(sendTick)
 
     ws.send(JSON.stringify({ type: 'event', event: 'connect.challenge', payload: {} }))
@@ -503,6 +506,8 @@ test('terminates stalled history and live hydration despite ongoing ticks, then 
         if (frame?.type !== 'req') return
         if (frame.method === 'connect') {
           ws.send(helloResponse(1000))
+          authenticated = true
+          sendTick()
           return
         }
         if (frame.method === 'sessions.messages.snapshot') {
@@ -737,8 +742,10 @@ test('preserves a Sessions Hub auto-send draft when live recovery terminates', a
   await page.clock.install({ time: new Date('2026-07-28T00:00:00Z') })
   await stubApprovals(page)
   await page.routeWebSocket(/\/ws$/, ws => {
+    let authenticated = false
     let tickSeq = 0
     const sendTick = () => {
+      if (!authenticated) return
       try {
         ws.send(JSON.stringify({
           type: 'event',
@@ -748,7 +755,6 @@ test('preserves a Sessions Hub auto-send draft when live recovery terminates', a
         }))
       } catch {}
     }
-    sendTick()
     tickSenders.push(sendTick)
     ws.send(JSON.stringify({ type: 'event', event: 'connect.challenge', payload: {} }))
     ws.onMessage(message => {
@@ -758,6 +764,8 @@ test('preserves a Sessions Hub auto-send draft when live recovery terminates', a
         if (frame?.type !== 'req') return
         if (frame.method === 'connect') {
           ws.send(helloResponse(1000))
+          authenticated = true
+          sendTick()
           return
         }
         if (frame.method === 'sessions.messages.snapshot') {
@@ -1047,6 +1055,8 @@ test('ignores a late history response after navigating to another session', asyn
                 runStatus: 'idle',
               },
             ],
+            count: 2,
+            ts: 1_800_000_000,
             has_more: false,
           }))
           return
@@ -1168,9 +1178,7 @@ test.describe('Automation conversation continuation', () => {
         const params = frame.params || {}
         requests.push({ method, params })
         if (method === 'connect') {
-          ws.send(JSON.stringify({
-            protocol: 3,
-            policy: { tick_interval_ms: 30_000 },
+          ws.send(helloOkResponse({
             auth: { principal: { isOwner: true } },
           }))
           return
@@ -1211,6 +1219,8 @@ test.describe('Automation conversation continuation', () => {
               interactive: true, conversationKind: 'direct', effectiveAgentId: 'main',
               updatedAt: 100, messageCount: history.length, status: 'ok', runStatus: 'idle',
             }],
+            count: 1,
+            ts: 1_800_000_000,
             has_more: false,
           },
           'sessions.messages.subscribe': sessionMessagesSubscribePayload(sessionKey),

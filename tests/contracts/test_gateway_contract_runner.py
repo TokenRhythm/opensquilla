@@ -949,15 +949,9 @@ def test_sessions_list_legacy_artifacts_remain_byte_exact() -> None:
             "62dce72764117870a9055bfcfbe90fc02a6ec32be405896f5eba8888f5d4fe4a"
         ),
         "sessionsList.ts": "6dff702e0480fca29be404bfcfe28c3231ccc07ede1289e4b79f5a0170c06819",
-        "sessionsListValidators.cjs": (
-            "617ed876b51b73858f87bdfce69282ca7ca0d70ebd7a360ab02d7fd02e494712"
-        ),
-        "sessionsListValidators.d.cts": (
-            "dae25ccdadf944a91e8545406bb4d8898aed8ce54351ccc0504dfbc2c6c06482"
-        ),
     }
-    # Freeze every baseline byte except the separately verified generator
-    # provenance line: changing CLI publication must not change type/validator bodies.
+    # Freeze every type artifact byte except the separately verified generator
+    # provenance line: validator publication must not change the legacy types.
     generator_digest = hashlib.sha256(
         runner.LEGACY_GENERATORS[sessions_list.schema].read_bytes()
         + b"\0"
@@ -976,8 +970,10 @@ def test_sessions_list_legacy_artifacts_remain_byte_exact() -> None:
         path.name: body_digest(path.read_text(encoding="utf-8"))
         for path in sessions_list.outputs[:3]
     } == {path.name: expected[path.name] for path in sessions_list.outputs[:3]}
-    # Frozen CJS bodies remain byte-oracles in the pinned toolchain job;
-    # they are no longer persisted in the production package.
+    assert tuple(path.name for path in sessions_list.outputs[3:]) == (
+        "sessionsListValidators.mjs",
+        "sessionsListValidators.d.mts",
+    )
     import os
 
     if os.environ.get("OPENSQUILLA_RUN_CONTRACT_TOOLCHAIN_INTEGRATION") == "1":

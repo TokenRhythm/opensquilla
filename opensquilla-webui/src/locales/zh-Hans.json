@@ -3076,7 +3076,9 @@
       "clearActivity": "清除活动",
       "expandActivity": "展开安装活动",
       "collapseActivity": "收起安装活动",
+      "selectSkillDirectory": "请选择技能目录",
       "queueStatus": {
+        "selection_required": "待选择目录",
         "queued": "等待中",
         "installing": "安装中",
         "cancelling": "正在取消",

@@ -73,11 +73,6 @@ from opensquilla.engine.history import (
     strip_historical_tool_pairs,
 )
 from opensquilla.engine.patch_evidence_ledger import PatchEvidenceLedger
-from opensquilla.engine.post_write_convergence import (
-    PostWriteConvergenceDecision,
-    PostWriteConvergenceObservation,
-    PostWriteConvergenceTracker,
-)
 from opensquilla.engine.progress_watchdog import ProgressObservation, ProgressWatchdog
 from opensquilla.engine.prompt_cache_keepalive import PromptCacheKeepaliveCandidate
 from opensquilla.engine.repetition_guard import (
@@ -286,8 +281,6 @@ from opensquilla.tools.types import (
     current_tool_context,
     is_goal_owned_main_default_turn,
 )
-from opensquilla.tools.write_policy import match_workspace_write_deny
-from opensquilla.tools.write_tracking import classify_workspace_path
 from opensquilla.usage_reasons import (
     normalize_usage_unknown_reason,
     provider_error_usage_reason,
@@ -545,56 +538,6 @@ _CLEAN_PASSED_FAILED_SUMMARY_RE = re.compile(
 _PLAIN_PASSED_SUMMARY_RE = re.compile(r"\b\d+\s+passed\b", re.IGNORECASE)
 _CLEAN_ERROR_COUNT_RE = re.compile(r"\b0\s+error\(s\)(?:\W|$)", re.IGNORECASE)
 _FAILED_FINALIZATION_RECOVERY_LIMIT = 3
-_PATCH_HYGIENE_BLOCK_CHALLENGE_LIMIT = 2
-# Scratch verify-mirror (OPENSQUILLA_SCRATCH_VERIFY_MIRROR): directory name
-# under the scratch dir, and the fail-closed cap on mirror files the hash
-# guard will inspect per execution.
-_VERIFY_MIRROR_DIR_NAME = "verify-mirror"
-_VERIFY_MIRROR_MAX_FILES = 200
-
-
-def _patch_hygiene_block_key(offending_paths: list[str]) -> str:
-    """Dedup key: the same set of offending paths never re-fires."""
-
-    encoded = json.dumps(sorted(offending_paths), ensure_ascii=False)
-    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()[:16]
-
-
-def _patch_hygiene_block_message(test_paths: list[str]) -> str:
-    rendered = ", ".join(test_paths[:5])
-    if len(test_paths) > 5:
-        rendered += f" (and {len(test_paths) - 5} more)"
-    return (
-        "[Patch hygiene check]\n"
-        "You are about to finish, but the workspace diff still changes test "
-        f"files: {rendered}. The final change must live in the project source; "
-        "the repository's test suite is managed separately and modifications "
-        "to it do not count as part of the fix. Do not finalize yet. Revert "
-        "the listed test-file changes (restore modified or deleted test files "
-        "to their original content and remove newly added ones) so the diff "
-        "contains only non-test changes. If editing a test was your only "
-        "change, implement the actual fix in the source code instead. Keeping "
-        "a copy of any reproduction script under the scratch directory is "
-        "fine; test directories are not."
-    )
-
-
-def _patch_hygiene_block_protected_message(protected_paths: list[str]) -> str:
-    rendered = ", ".join(protected_paths[:5])
-    if len(protected_paths) > 5:
-        rendered += f" (and {len(protected_paths) - 5} more)"
-    return (
-        "[Patch hygiene check]\n"
-        "You are about to finish, but the workspace diff still changes files "
-        f"that this deployment's write policy protects: {rendered}. Protected "
-        "paths must stay unchanged in the final diff; edits to them do not "
-        "count as part of the fix. Do not finalize yet. Revert the listed "
-        "changes (restore modified or deleted files to their original content "
-        "and remove newly added ones) so the diff no longer touches protected "
-        "paths. If a protected file was the only thing you changed, implement "
-        "the actual fix in unprotected project source instead. Keeping copies "
-        "or new files under the scratch directory is fine."
-    )
 
 
 def _finalize_variant_challenge_message() -> str:
@@ -808,43 +751,6 @@ def _progress_watchdog_guidance_message(reason: str, details: Mapping[str, Any])
         "[Runtime progress warning]\n"
         f"The runtime observed {signal}.{count_text}{failure_text} "
         f"{next_step_text}"
-    )
-
-
-def _post_write_convergence_message(
-    decision: PostWriteConvergenceDecision,
-) -> str:
-    details = decision.details
-    stable_count = details.get("stable_count")
-    count_text = (
-        f" for {stable_count} post-verification tool turn(s)"
-        if isinstance(stable_count, int) and stable_count > 0
-        else ""
-    )
-    paths = details.get("diff_paths")
-    if isinstance(paths, list) and paths:
-        path_text = ", ".join(str(path) for path in paths[:5])
-        if len(paths) > 5:
-            path_text += ", ..."
-        path_text = f" Current diff paths: {path_text}."
-    else:
-        path_text = ""
-    if decision.action == "finalize":
-        next_step = (
-            "Do not call tools. Provide the final answer from the current patch and "
-            "latest clean validation result. Only mention a blocker if the current "
-            "diff is known to be incomplete."
-        )
-    else:
-        next_step = (
-            "Stop broad source exploration. Use the current diff and latest clean "
-            "validation result: finalize if the patch is ready, or make one small "
-            "source edit only if the validation evidence requires it."
-        )
-    return (
-        "[Runtime post-write convergence]\n"
-        f"The current diff has stayed unchanged{count_text} after a successful "
-        f"focused validation.{path_text} {next_step}"
     )
 
 
@@ -1380,13 +1286,6 @@ _IDENTICAL_REQUEST_LOOP_NUDGE = (
     "command to rebuild tool arguments from real content, try a different tool "
     "or target, or finalize with your best current answer."
 )
-_PLACEHOLDER_ESCALATION_DIRECTIVE = (
-    "STOP: multiple tool calls this turn reused compacted placeholder text and "
-    "were rejected without running. Reissuing that call will never work. Before "
-    "your next tool call, re-open the target file or re-run the underlying "
-    "command to get its real current content, then rebuild the tool arguments "
-    "from that fresh output. Never retype or paraphrase placeholder text."
-)
 _DEADLINE_WRAPUP_DIRECTIVE_TEMPLATE = (
     "Time check: roughly {minutes} minute(s) of wall-clock budget remain for "
     "this task. Stop exploring and converge now: apply your best current "
@@ -1394,34 +1293,32 @@ _DEADLINE_WRAPUP_DIRECTIVE_TEMPLATE = (
     "final answer. Finishing your best-supported work now is better than "
     "further investigation that the clock will cut off."
 )
-_MID_BUDGET_NO_DIFF_NUDGE_FRACTIONS: tuple[float, ...] = (0.5, 0.75)
-_MID_BUDGET_NO_DIFF_NUDGE_TEMPLATE = (
-    "Progress check: about {percent}% of the wall-clock budget for this task "
-    "is spent and the workspace has no source change yet. If you already "
-    "know the fix, start implementing it now and verify it against the "
-    "existing tests. If you are still investigating, pick the most likely "
-    "file and make the smallest reasonable edit now, then refine it with the "
-    "remaining time instead of leaving the whole budget to analysis."
+# Read-only recognition of complete retired directives in existing histories.
+# Prefixes alone can also occur in real user messages and must not hide them.
+_RETIRED_RUNTIME_NUDGE_PATTERNS = (
+    re.compile(
+        r"Progress check: about [0-9]+% of the wall-clock budget for this task "
+        r"is spent and the workspace has no source change yet\. If you already "
+        r"know the fix, start implementing it now and verify it against the "
+        r"existing tests\. If you are still investigating, pick the most likely "
+        r"file and make the smallest reasonable edit now, then refine it with the "
+        r"remaining time instead of leaving the whole budget to analysis\."
+    ),
+    re.compile(
+        r"Time check: about [0-9]+ minute\(s\) remain and the workspace contains "
+        r"no source fix yet beyond diagnostic instrumentation\. Stop investigating "
+        r"now\. Decide on the most likely root cause from the evidence you already "
+        r"have, remove leftover debug output, apply your best-supported fix to "
+        r"the source code, and verify it directly\. An imperfect fix you can "
+        r"defend beats no fix\."
+    ),
 )
-_MID_BUDGET_NO_DIFF_NUDGE_PREFIX = _MID_BUDGET_NO_DIFF_NUDGE_TEMPLATE.split("{percent}", 1)[0]
 _REASONING_ONLY_ACT_NOW_DIRECTIVE = (
     "Your previous response was internal reasoning only, so nothing was "
     "delivered or executed. Act now: issue the tool call that carries out "
     "your current best next step, or state your final answer directly. "
     "Decide with the analysis you already have instead of reasoning further."
 )
-# One-shot endgame fix directive (OPENSQUILLA_ENDGAME_FIX_DIRECTIVE_MARGIN_
-# SECONDS). The prefix is distinct from the wrap-up's "Time check: roughly "
-# so the nudge-identity predicates can tell them apart.
-_ENDGAME_FIX_DIRECTIVE_TEMPLATE = (
-    "Time check: about {minutes} minute(s) remain and the workspace contains "
-    "no source fix yet beyond diagnostic instrumentation. Stop investigating "
-    "now. Decide on the most likely root cause from the evidence you already "
-    "have, remove leftover debug output, apply your best-supported fix to "
-    "the source code, and verify it directly. An imperfect fix you can "
-    "defend beats no fix."
-)
-_ENDGAME_FIX_DIRECTIVE_PREFIX = "Time check: about "
 _LARGE_CONTEXT_INVALID_RESPONSE_INPUT_TOKENS = 30_000
 _COMPACTED_TOOL_ARGUMENT_MARKERS = frozenset(
     {
@@ -2150,18 +2047,11 @@ def _active_user_message_index_for_request(
 
 
 def _is_runtime_nudge_message(message: Message) -> bool:
-    """Whether a message is a runtime-injected nudge, not conversation history.
-
-    Covers the mid-budget progress nudge and the endgame fix directive —
-    everything the engine appends after tool results that the post-tool shape
-    predicates must see through.
-    """
+    """Recognize complete historical nudges without hiding same-prefix user text."""
 
     if message.role != "user" or not isinstance(message.content, str):
         return False
-    return message.content.startswith(
-        _MID_BUDGET_NO_DIFF_NUDGE_PREFIX
-    ) or message.content.startswith(_ENDGAME_FIX_DIRECTIVE_PREFIX)
+    return any(pattern.fullmatch(message.content) for pattern in _RETIRED_RUNTIME_NUDGE_PATTERNS)
 
 
 def _tail_has_tool_result_ignoring_nudges(messages: list[Message]) -> bool:
@@ -7153,9 +7043,6 @@ class Agent:
         )
         _thinking_fallback_done = False
         _disable_thinking_for_next_provider_call = False
-        _reasoning_stream_char_cap = max(
-            0, int(getattr(self.config, "reasoning_stream_char_cap", 0) or 0)
-        )
 
         _log = structlog.get_logger("opensquilla.engine.agent")
 
@@ -7300,8 +7187,6 @@ class Agent:
         max_iterations_finalization_pending = False
         max_iterations_finalization_message: Message | None = None
         max_iterations_deadline_extension_logged = False
-        post_write_convergence_finalization_pending = False
-        post_write_convergence_finalization_message: Message | None = None
         document_mutation_finalization_pending = False
         document_mutation_finalization_attempted = False
         document_mutation_finalization_message: Message | None = None
@@ -7436,14 +7321,10 @@ class Agent:
             messages = translations.get(language, translations["en"])
             return messages.get(status, messages["not_attempted"])
 
-        placeholder_offense_iterations = 0
         deadline_wrapup_armed = False
         deadline_wrapup_message: Message | None = None
         deadline_thinking_off_armed = False
-        endgame_git_freeze_armed = False
-        endgame_fix_directive_fired = False
         reasoning_only_act_now_message: Message | None = None
-        mid_budget_nudge_fired_fractions: set[float] = set()
         workspace_diff_recovery_attempted = False
         failed_tool_finalization_recovery_keys: set[str] = set()
         post_tool_empty_recovery_attempted = False
@@ -7487,16 +7368,6 @@ class Agent:
         submit_review_diff_max_chars = int(
             getattr(self.config, "submit_review_diff_max_chars", 20000)
         )
-        patch_hygiene_block_mode = str(
-            getattr(self.config, "patch_hygiene_block_mode", "off") or "off"
-        )
-        patch_hygiene_block_keys: set[str] = set()
-        scratch_verify_mirror_enabled = bool(getattr(self.config, "scratch_verify_mirror", False))
-        if self._tool_context is not None:
-            # Rides the ToolContext in place (endgame_git_freeze precedent):
-            # deny messages append the verify-mirror guidance only while on,
-            # and the flag is reset each turn because the context outlives it.
-            self._tool_context.scratch_verify_mirror_active = scratch_verify_mirror_enabled
         finalize_variant_challenge_enabled = bool(
             getattr(self.config, "finalize_variant_challenge", False)
         )
@@ -7539,34 +7410,6 @@ class Agent:
             ),
             observe_only=progress_watchdog_mode != "block",
         )
-        post_write_convergence_tracker = (
-            PostWriteConvergenceTracker(
-                warn_threshold=max(
-                    1,
-                    int(
-                        getattr(
-                            self.config,
-                            "post_write_convergence_warn_threshold",
-                            3,
-                        )
-                        or 3
-                    ),
-                ),
-                finalize_after_warning=max(
-                    1,
-                    int(
-                        getattr(
-                            self.config,
-                            "post_write_convergence_finalize_after_warning",
-                            3,
-                        )
-                        or 3
-                    ),
-                ),
-            )
-            if bool(getattr(self.config, "post_write_convergence_enabled", False))
-            else None
-        )
         runtime_recovery_mode: RuntimeRecoveryMode = getattr(
             self.config, "runtime_recovery_mode", "log"
         )
@@ -7602,43 +7445,6 @@ class Agent:
                 max(1.0, float(self.config.timeout) * 0.1),
             )
             document_mutation_summary_deadline_candidate = _total_deadline - summary_reserve_seconds
-
-        # Endgame git freeze: once remaining wall clock drops below the margin,
-        # the shell tools block workspace-reverting git commands outright so
-        # the current diff survives runner-side collection. The armed flag
-        # rides the ToolContext in place (router_control precedent); it is
-        # reset here because the context outlives the turn.
-        endgame_git_freeze_margin_seconds = max(
-            0,
-            int(getattr(self.config, "endgame_git_freeze_margin_seconds", 0) or 0),
-        )
-        if endgame_git_freeze_margin_seconds > 0 and self._tool_context is not None:
-            self._tool_context.endgame_git_freeze_active = False
-            self._tool_context.endgame_git_freeze_instrumentation_exempt = bool(
-                getattr(self.config, "endgame_git_freeze_instrumentation_exempt", False)
-            )
-
-        def _arm_endgame_git_freeze_if_due() -> None:
-            nonlocal endgame_git_freeze_armed
-            if (
-                endgame_git_freeze_armed
-                or endgame_git_freeze_margin_seconds <= 0
-                or _total_deadline is None
-                or _loop.time() <= _total_deadline - endgame_git_freeze_margin_seconds
-            ):
-                return
-            endgame_git_freeze_armed = True
-            if self._tool_context is not None:
-                self._tool_context.endgame_git_freeze_active = True
-            self._write_turn_call_log(
-                "turn_policy_decision",
-                action="endgame_git_freeze",
-                reason="deadline_margin",
-                code="endgame_git_freeze",
-                iteration=iterations,
-                remaining_seconds=int(max(0.0, _total_deadline - _loop.time())),
-                margin_seconds=endgame_git_freeze_margin_seconds,
-            )
 
         def _defer_max_iterations_cap() -> bool:
             """Whether the iteration cap yields to remaining wall-clock time.
@@ -8541,11 +8347,6 @@ class Agent:
                         },
                     )
 
-                # Endgame git freeze arming; re-checked before tool execution
-                # because a long provider stream can cross the margin
-                # mid-iteration.
-                _arm_endgame_git_freeze_if_due()
-
                 iterations += 1
                 # The act-now message answers one reasoning-only failure; a
                 # fresh iteration starts from a clean request.
@@ -8574,8 +8375,6 @@ class Agent:
 
                 _retry_attempt = 0
                 _call_attempt = 0
-                _reasoning_cap_preempt_done = False
-                attempt_reasoning_stream_chars = 0
                 _retry_policy = _ProviderRetryPolicy.from_provider_budget(
                     _fallback.max_retries,
                     length_capped_continuations=self.config.length_capped_continuations,
@@ -8622,7 +8421,6 @@ class Agent:
                     iter_thinking_signature = None
                     _got_error = False
                     _stream_policy_preempt = False
-                    attempt_reasoning_stream_chars = 0
                     provider_done_for_log: ProviderDoneEvent | None = None
                     provider_error_for_log: ProviderErrorEvent | None = None
                     cost_receipt_counted = False
@@ -8686,7 +8484,6 @@ class Agent:
                             artifact_delivery_final_response_pending
                             or goal_terminal_final_response_pending
                             or max_iterations_finalization_pending
-                            or post_write_convergence_finalization_pending
                             or document_mutation_finalization_pending
                         )
                         else provider_tool_definitions
@@ -8706,7 +8503,6 @@ class Agent:
                         and not artifact_delivery_final_response_pending
                         and not goal_terminal_final_response_pending
                         and not max_iterations_finalization_pending
-                        and not post_write_convergence_finalization_pending
                         and not document_mutation_finalization_pending
                     )
                     ignored_post_delivery_tool_use = False
@@ -8741,11 +8537,6 @@ class Agent:
                         and document_mutation_finalization_message is not None
                     ):
                         request_suffix_messages = [document_mutation_finalization_message]
-                    elif (
-                        post_write_convergence_finalization_pending
-                        and post_write_convergence_finalization_message is not None
-                    ):
-                        request_suffix_messages = [post_write_convergence_finalization_message]
                     elif (
                         max_iterations_finalization_pending
                         and max_iterations_finalization_message is not None
@@ -9929,7 +9720,6 @@ class Agent:
                                     and not artifact_delivery_final_response_pending
                                     and not goal_terminal_final_response_pending
                                     and not max_iterations_finalization_pending
-                                    and not post_write_convergence_finalization_pending
                                     and (not turn_messages or turn_messages[-1].role != "assistant")
                                     and _loop.time() > _total_deadline - wrapup_margin_seconds
                                 ):
@@ -10003,71 +9793,6 @@ class Agent:
                                     _got_error = True
                                     _stream_policy_preempt = True
                                     break  # break stream, retry with directive
-                                if (
-                                    _reasoning_stream_char_cap > 0
-                                    and not _reasoning_cap_preempt_done
-                                    and not goal_terminal_final_response_pending
-                                ):
-                                    attempt_reasoning_stream_chars += len(raw_ev.text or "")
-                                    if (
-                                        attempt_reasoning_stream_chars > _reasoning_stream_char_cap
-                                        and not attempt_user_visible_emitted
-                                        and not pending_tools
-                                        and not tool_calls
-                                        # Thinking already off for this call:
-                                        # a retry sans thinking changes
-                                        # nothing, so let the stream run.
-                                        and not _attempt_thinking_disabled
-                                    ):
-                                        # Runaway reasoning-only stream: discard
-                                        # the partial reasoning and retry the
-                                        # call with thinking disabled for that
-                                        # retry only, so the budget goes to
-                                        # tool calls instead of one unbounded
-                                        # reasoning stream. One preempt per
-                                        # iteration: if the provider keeps
-                                        # streaming reasoning on the retry, it
-                                        # runs to completion.
-                                        _reasoning_cap_preempt_done = True
-                                        _disable_thinking_for_next_provider_call = True
-                                        self._write_turn_call_log(
-                                            "turn_policy_decision",
-                                            action="reasoning_cap",
-                                            reason="reasoning_stream_char_cap",
-                                            code="reasoning_cap_preempt",
-                                            iteration=iterations,
-                                            attempt=_call_attempt,
-                                            reasoning_chars=(attempt_reasoning_stream_chars),
-                                            cap_chars=_reasoning_stream_char_cap,
-                                        )
-                                        # The turn-call log is a raw debug
-                                        # stream that run harnesses do not
-                                        # collect; the runtime event is what
-                                        # lets delivery gates tell a designed
-                                        # cap preempt (whose retry runs
-                                        # thinking-disabled) apart from a
-                                        # treatment delivery failure.
-                                        append_runtime_event(
-                                            self.config.runtime_events_path,
-                                            {
-                                                "feature": "reasoning_cap",
-                                                "name": "reasoning_cap.preempt",
-                                                "action": "retry_without_thinking",
-                                                "reason": ("reasoning_stream_char_cap"),
-                                                "iteration": iterations,
-                                                "attempt": _call_attempt,
-                                                "reasoning_chars": (attempt_reasoning_stream_chars),
-                                                "cap_chars": (_reasoning_stream_char_cap),
-                                                "session_key": self._session_key,
-                                                "agent_id": (
-                                                    self.config.tool_result_store_agent_id
-                                                    or self.config.metadata.get("agent_id")
-                                                ),
-                                            },
-                                        )
-                                        _got_error = True
-                                        _stream_policy_preempt = True
-                                        break  # break stream, retry sans thinking
 
                             elif isinstance(raw_ev, ProviderToolUseStart):
                                 reasoning_end = _finish_reasoning_block("completed")
@@ -10078,7 +9803,6 @@ class Agent:
                                         artifact_delivery_final_response_pending
                                         or goal_terminal_final_response_pending
                                         or max_iterations_finalization_pending
-                                        or post_write_convergence_finalization_pending
                                         or document_mutation_finalization_pending
                                     ):
                                         ignored_post_delivery_tool_use = True
@@ -10224,7 +9948,6 @@ class Agent:
                                         artifact_delivery_final_response_pending
                                         or goal_terminal_final_response_pending
                                         or max_iterations_finalization_pending
-                                        or post_write_convergence_finalization_pending
                                         or document_mutation_finalization_pending
                                     ):
                                         ignored_post_delivery_tool_use = True
@@ -11320,11 +11043,6 @@ class Agent:
                                 "I reached the configured iteration limit after completing "
                                 "the available tool step. Here is the best partial result so far."
                             )
-                        elif post_write_convergence_finalization_pending:
-                            response_text = (
-                                "The workspace diff stayed stable after clean validation. "
-                                "Here is the current validated patch state."
-                            )
                         if response_text:
                             assistant_text_parts.append(response_text)
                             attempt_user_visible_emitted = True
@@ -11363,24 +11081,11 @@ class Agent:
                         post_tool_turn = tail_index >= 0 and _message_has_tool_result(
                             turn_messages[tail_index]
                         )
-                    if not post_tool_turn and (
-                        bool(getattr(self.config, "mid_budget_no_diff_nudge", False))
-                        or int(
-                            getattr(
-                                self.config,
-                                "endgame_fix_directive_margin_seconds",
-                                0,
-                            )
-                            or 0
-                        )
-                        > 0
+                    if not post_tool_turn and any(
+                        _is_runtime_nudge_message(item) for item in turn_messages[-4:]
                     ):
-                        # A nudge stacked after watchdog or recovery guidance
-                        # pushes the tool results out of the lookback window,
-                        # which would disable empty-response retry/recovery on
-                        # exactly the stalled turns the lever targets. The
-                        # nudge is runtime-injected, not conversation history:
-                        # recompute the turn shape as if it were absent.
+                        # Retired directives can remain in existing histories.
+                        # They must not hide the post-tool shape from recovery.
                         post_tool_turn = _tail_has_tool_result_ignoring_nudges(turn_messages)
                     stop_reason = (
                         getattr(provider_done_for_log, "stop_reason", None)
@@ -12710,29 +12415,6 @@ class Agent:
                                 action="partial_after_finalization_provider_error",
                                 reason="max_iterations",
                                 code="max_iterations",
-                                provider_error_code=safe_provider_error_code,
-                            )
-                            yield TextDeltaEvent(
-                                text=response_text,
-                                generation_epoch=generation_epoch,
-                            )
-                            break
-                        if post_write_convergence_finalization_pending:
-                            response_text = (
-                                "The workspace diff was stable after clean validation, "
-                                "and the provider could not generate an additional wrap-up. "
-                                "Returning the current validated patch state."
-                            )
-                            assistant_text_parts.append(response_text)
-                            provider_done_for_log = ProviderDoneEvent(stop_reason="stop")
-                            _got_done_event = True
-                            _got_error = False
-                            post_write_convergence_finalization_pending = False
-                            self._write_turn_call_log(
-                                "turn_policy_decision",
-                                action="partial_after_finalization_provider_error",
-                                reason="post_write_convergence",
-                                code="post_write_convergence",
                                 provider_error_code=safe_provider_error_code,
                             )
                             yield TextDeltaEvent(
@@ -14338,7 +14020,6 @@ class Agent:
                         and not last_executed_results
                         and not max_iterations_finalization_pending
                         and not artifact_delivery_final_response_pending
-                        and not post_write_convergence_finalization_pending
                     )
                     if text_only_candidate:
                         self.config.metadata["text_only_tool_recovery_detections"] = (
@@ -14485,7 +14166,6 @@ class Agent:
                         finalize_evidence_tracker is not None
                         and not max_iterations_finalization_pending
                         and not artifact_delivery_final_response_pending
-                        and not post_write_convergence_finalization_pending
                     ):
                         gate_status = await self._workspace_git_status_porcelain()
                         gate_observation = (
@@ -14565,114 +14245,10 @@ class Agent:
                                 )
                                 continue
                     if (
-                        patch_hygiene_block_mode in ("test_paths", "protected_paths")
-                        and not max_iterations_finalization_pending
-                        and not artifact_delivery_final_response_pending
-                        and not post_write_convergence_finalization_pending
-                    ):
-                        hygiene_status = await self._workspace_git_status_porcelain()
-                        if patch_hygiene_block_mode == "protected_paths":
-                            hygiene_offending_paths = self._porcelain_status_protected_paths(
-                                hygiene_status
-                            )
-                            hygiene_reason = "protected_paths_in_final_diff"
-                        else:
-                            hygiene_offending_paths = self._porcelain_status_test_paths(
-                                hygiene_status
-                            )
-                            hygiene_reason = "test_paths_in_final_diff"
-                        if hygiene_offending_paths:
-                            hygiene_key = _patch_hygiene_block_key(hygiene_offending_paths)
-                            # Same headroom rule as the evidence gate: never
-                            # spend the run's last LLM call or deadline slack
-                            # on a challenge.
-                            hygiene_headroom = _turn_llm_call_budget_error(
-                                turn_llm_calls + 1
-                            ) is None and (
-                                _total_deadline is None or _loop.time() < _total_deadline
-                            )
-                            hygiene_suppressed = (
-                                hygiene_key in patch_hygiene_block_keys
-                                or len(patch_hygiene_block_keys)
-                                >= _PATCH_HYGIENE_BLOCK_CHALLENGE_LIMIT
-                                or not hygiene_headroom
-                            )
-                            self.config.metadata["patch_hygiene_block_detections"] = (
-                                self.config.metadata.get(
-                                    "patch_hygiene_block_detections",
-                                    0,
-                                )
-                                + 1
-                            )
-                            if hygiene_suppressed:
-                                hygiene_message = None
-                            elif patch_hygiene_block_mode == "protected_paths":
-                                hygiene_message = _patch_hygiene_block_protected_message(
-                                    hygiene_offending_paths
-                                )
-                            else:
-                                hygiene_message = _patch_hygiene_block_message(
-                                    hygiene_offending_paths
-                                )
-                            self._record_runtime_event(
-                                "patch_hygiene_block.challenge",
-                                feature="patch_hygiene_block",
-                                reason=hygiene_reason,
-                                iteration=iterations,
-                                provider_call_count=turn_llm_calls,
-                                injected_to_model=bool(hygiene_message),
-                                recovery_key=hygiene_key,
-                                details={
-                                    "offending_paths": hygiene_offending_paths[:20],
-                                    "offending_path_count": len(hygiene_offending_paths),
-                                },
-                            )
-                            if hygiene_message is not None:
-                                patch_hygiene_block_keys.add(hygiene_key)
-                                if visible_text and final_text_parts:
-                                    final_text_parts.pop()
-                                turn_messages.append(Message(role="user", content=hygiene_message))
-                                self.config.metadata["patch_hygiene_block_recoveries"] = (
-                                    self.config.metadata.get(
-                                        "patch_hygiene_block_recoveries",
-                                        0,
-                                    )
-                                    + 1
-                                )
-                                self._write_turn_call_log(
-                                    "patch_hygiene_block",
-                                    action="warn",
-                                    mode=patch_hygiene_block_mode,
-                                    reason=hygiene_reason,
-                                    details={
-                                        "offending_paths": hygiene_offending_paths[:20],
-                                        "offending_path_count": len(hygiene_offending_paths),
-                                    },
-                                )
-                                if patch_hygiene_block_mode == "protected_paths":
-                                    hygiene_warning = (
-                                        "The model attempted to finish with "
-                                        "write-policy-protected files still "
-                                        "changed in the workspace diff; asking "
-                                        "it to revert them once."
-                                    )
-                                else:
-                                    hygiene_warning = (
-                                        "The model attempted to finish with test "
-                                        "files still changed in the workspace "
-                                        "diff; asking it to revert them once."
-                                    )
-                                yield WarningEvent(
-                                    code="patch_hygiene_block_recovery",
-                                    message=hygiene_warning,
-                                )
-                                continue
-                    if (
                         finalize_variant_challenge_enabled
                         and not finalize_variant_challenge_fired
                         and not max_iterations_finalization_pending
                         and not artifact_delivery_final_response_pending
-                        and not post_write_convergence_finalization_pending
                     ):
                         variant_status = await self._workspace_git_status_porcelain()
                         if variant_status and variant_status.strip():
@@ -14796,7 +14372,6 @@ class Agent:
                         and not submit_review_red_detected
                         and not max_iterations_finalization_pending
                         and not artifact_delivery_final_response_pending
-                        and not post_write_convergence_finalization_pending
                     ):
                         submit_implicit_headroom_ok = _turn_llm_call_budget_error(
                             turn_llm_calls + 1
@@ -14934,13 +14509,11 @@ class Agent:
                                 )
                                 continue
                     max_iterations_finalization_pending = False
-                    post_write_convergence_finalization_pending = False
                     break
                 tool_calls = [self._coerce_meta_tool_call(tc) for tc in tool_calls]
                 tool_calls = self._force_matched_meta_invoke_tool_calls(tool_calls)
 
                 tool_deadline = _loop.time() + self.config.iteration_timeout
-                _arm_endgame_git_freeze_if_due()
 
                 # ------ STREAMING → TOOL_CALLING ------
                 yield self._transition(AgentState.TOOL_CALLING)
@@ -16079,19 +15652,6 @@ class Agent:
                                 is_error=bool(result.is_error),
                             )
                         )
-                        gate_evidence_credit = True
-                        if scratch_verify_mirror_enabled:
-                            gate_evidence_credit = self._scratch_verify_mirror_evidence_credit(
-                                gate_command
-                            )
-                            if not gate_evidence_credit:
-                                self._record_runtime_event(
-                                    "scratch_verify_mirror.credit_withheld",
-                                    feature="scratch_verify_mirror",
-                                    reason="mirror_diverged_from_workspace",
-                                    iteration=iterations,
-                                    command=gate_command[:500],
-                                )
                         finalize_evidence_tracker.observe_execution(
                             gate_command,
                             red=gate_red,
@@ -16102,11 +15662,7 @@ class Agent:
                                 self._failure_anchor_lines(gate_result_text) if gate_red else []
                             ),
                             iteration=iterations,
-                            evidence_credit=gate_evidence_credit,
                         )
-                focused_verification_success_before_results = (
-                    post_write_focused_verification_success_observed
-                )
                 source_context_signature = self._source_context_signature(
                     tool_calls,
                     executed_results,
@@ -16116,14 +15672,12 @@ class Agent:
                     not result.is_error and result.tool_name in _EXECUTION_TOOL_NAMES
                     for result in executed_results
                 )
-                current_focused_verification_observed = False
                 if post_write_progress_count > 0:
                     for tc, result in zip(tool_calls, executed_results, strict=False):
                         if result.tool_name not in _EXECUTION_TOOL_NAMES:
                             continue
                         command = self._execution_command_for_progress(tc)
                         if command and self._command_looks_like_focused_verification(command):
-                            current_focused_verification_observed = True
                             post_write_focused_verification_observed = True
                             result_text = self._tool_result_text_for_anchor(result.content)
                             verification_state = self._classify_focused_verification_result(result)
@@ -16178,7 +15732,7 @@ class Agent:
                     recent_failure_anchor_summaries[:] = recent_failure_anchor_summaries[-3:]
                 runtime_diff_paths: list[str] | None = None
                 runtime_diff_fingerprint: str | None = None
-                if runtime_diagnostics is not None or post_write_convergence_tracker is not None:
+                if runtime_diagnostics is not None:
                     self._runtime_git_state = GitRunState.OK
                     runtime_diff_paths = self._workspace_diff_paths_for_runtime_event()
                     if runtime_diff_paths is not None:
@@ -16189,12 +15743,11 @@ class Agent:
                     runtime_diff_paths is not None and self._runtime_git_state is GitRunState.OK
                 )
                 if (
-                    runtime_diagnostics is not None or post_write_convergence_tracker is not None
+                    runtime_diagnostics is not None
                 ) and not runtime_git_observed:
                     self._record_runtime_git_observation_skip(
                         consumers=(
                             "runtime_diagnostics",
-                            "post_write_convergence",
                         )
                     )
                 runtime_diagnostic_events: list[dict[str, Any]] = []
@@ -16217,109 +15770,11 @@ class Agent:
                     ):
                         runtime_diagnostic_events.append(runtime_event)
                         append_runtime_event(self.config.runtime_events_path, runtime_event)
-                post_write_convergence_guidance: str | None = None
-                if (
-                    accepted_goal_terminal_status is None
-                    and post_write_convergence_tracker is not None
-                    and runtime_git_observed
-                    and runtime_diff_paths is not None
-                ):
-                    continued_activity_after_verification = bool(
-                        (
-                            focused_verification_success_before_results
-                            or (
-                                post_write_focused_verification_success_observed
-                                and not current_focused_verification_observed
-                            )
-                        )
-                        and (
-                            successful_execution_tool_result
-                            or successful_source_context_tool_result
-                        )
-                    )
-                    post_write_convergence_decision = post_write_convergence_tracker.observe(
-                        PostWriteConvergenceObservation(
-                            iteration=iterations,
-                            provider_call_count=turn_llm_calls,
-                            workspace_write_count=workspace_write_count,
-                            changed_receipt_count=mutation_receipt_counts["changed_receipt_count"],
-                            diff_fingerprint=runtime_diff_fingerprint,
-                            diff_paths=runtime_diff_paths,
-                            focused_verification_success_observed=(
-                                post_write_focused_verification_success_observed
-                            ),
-                            continued_activity_after_verification=(
-                                continued_activity_after_verification
-                            ),
-                        )
-                    )
-                    if (
-                        post_write_convergence_decision.action == "finalize"
-                        and progress_watchdog_mode == "warn_model"
-                    ):
-                        post_write_convergence_finalization_pending = True
-                        post_write_convergence_finalization_message = Message(
-                            role="user",
-                            content=_post_write_convergence_message(
-                                post_write_convergence_decision
-                            ),
-                        )
-                        post_write_convergence_guidance = (
-                            post_write_convergence_finalization_message.content
-                            if isinstance(
-                                post_write_convergence_finalization_message.content,
-                                str,
-                            )
-                            else None
-                        )
-                    elif (
-                        post_write_convergence_decision.action == "warn"
-                        and progress_watchdog_mode == "warn_model"
-                    ):
-                        post_write_convergence_guidance = _post_write_convergence_message(
-                            post_write_convergence_decision
-                        )
-                    if post_write_convergence_decision.action != "observe":
-                        self._record_post_write_convergence_event(
-                            post_write_convergence_decision,
-                            mode=progress_watchdog_mode,
-                            injected_to_model=bool(post_write_convergence_guidance),
-                            hint_text=post_write_convergence_guidance,
-                        )
-                        metadata_key = {
-                            "warn": "post_write_convergence_warnings",
-                            "finalize": "post_write_convergence_finalizations",
-                            "reset": "post_write_convergence_resets",
-                        }.get(post_write_convergence_decision.action)
-                        if metadata_key:
-                            self.config.metadata[metadata_key] = (
-                                self.config.metadata.get(metadata_key, 0) + 1
-                            )
-                        self._write_turn_call_log(
-                            "post_write_convergence",
-                            action=post_write_convergence_decision.action,
-                            mode=progress_watchdog_mode,
-                            reason=post_write_convergence_decision.reason,
-                            details=post_write_convergence_decision.details,
-                        )
-                        if post_write_convergence_guidance:
-                            yield WarningEvent(
-                                code=(
-                                    "post_write_convergence_finalization"
-                                    if post_write_convergence_decision.action == "finalize"
-                                    else "post_write_convergence_warning"
-                                ),
-                                message=(
-                                    "Runtime detected stable post-verification diff "
-                                    "activity and asked the model to converge."
-                                ),
-                            )
                 progress_watchdog_guidance: str | None = None
                 watchdog_decision = None
                 if (
                     accepted_goal_terminal_status is None
                     and progress_watchdog_mode != "off"
-                    and post_write_convergence_guidance is None
                 ):
                     watchdog_decision = progress_watchdog.observe(
                         ProgressObservation(
@@ -16597,171 +16052,6 @@ class Agent:
                 await _claim_pending_inputs_for_next_call()
                 if progress_watchdog_guidance is not None:
                     turn_messages.append(Message(role="user", content=progress_watchdog_guidance))
-                if (
-                    post_write_convergence_guidance is not None
-                    and not post_write_convergence_finalization_pending
-                ):
-                    turn_messages.append(
-                        Message(role="user", content=post_write_convergence_guidance)
-                    )
-                if (
-                    bool(getattr(self.config, "mid_budget_no_diff_nudge", False))
-                    and _total_deadline is not None
-                    and self.config.timeout > 0
-                ):
-                    elapsed_fraction = 1.0 - (
-                        max(0.0, _total_deadline - _loop.time()) / self.config.timeout
-                    )
-                    due_fractions = [
-                        fraction
-                        for fraction in _MID_BUDGET_NO_DIFF_NUDGE_FRACTIONS
-                        if fraction not in mid_budget_nudge_fired_fractions
-                        and elapsed_fraction >= fraction
-                    ]
-                    if due_fractions:
-                        # Checkpoints are consumed when crossed whether or not
-                        # a nudge fires: one crossed while a diff existed must
-                        # not fire late if that diff is reverted, and crossing
-                        # several at once yields a single nudge.
-                        mid_budget_nudge_fired_fractions.update(due_fractions)
-                        nudge_fraction = max(due_fractions)
-                        # The evidence probe shells out to git; keep it off
-                        # the event loop.
-                        has_change_evidence = await asyncio.to_thread(
-                            self._workspace_has_source_change_evidence
-                        )
-                        if not has_change_evidence:
-                            turn_messages.append(
-                                Message(
-                                    role="user",
-                                    # Report real elapsed time, not the
-                                    # checkpoint constant: one long stream can
-                                    # carry the turn far past the checkpoint
-                                    # before it is noticed.
-                                    content=_MID_BUDGET_NO_DIFF_NUDGE_TEMPLATE.format(
-                                        percent=int(elapsed_fraction * 100),
-                                    ),
-                                )
-                            )
-                            self._write_turn_call_log(
-                                "turn_policy_decision",
-                                action="mid_budget_no_diff_nudge",
-                                reason="budget_fraction",
-                                code="mid_budget_no_diff_nudge",
-                                iteration=iterations,
-                                budget_fraction=nudge_fraction,
-                                elapsed_fraction=round(elapsed_fraction, 3),
-                            )
-                # One-shot endgame fix directive: inside the margin with no
-                # source fix beyond diagnostic instrumentation, direct the
-                # model to commit to its best-supported fix now. The margin
-                # crossing is consumed whether or not the directive fires —
-                # a fix present at crossing time that is reverted later must
-                # not trigger a late directive.
-                endgame_fix_margin_seconds = max(
-                    0,
-                    int(getattr(self.config, "endgame_fix_directive_margin_seconds", 0) or 0),
-                )
-                if (
-                    endgame_fix_margin_seconds > 0
-                    and _total_deadline is not None
-                    and not endgame_fix_directive_fired
-                    and _loop.time() > _total_deadline - endgame_fix_margin_seconds
-                ):
-                    endgame_fix_directive_fired = True
-                    # The probe shells out to git; keep it off the event loop.
-                    has_source_fix = await asyncio.to_thread(
-                        self._workspace_source_fix_beyond_instrumentation
-                    )
-                    if not has_source_fix:
-                        remaining_seconds = max(0.0, _total_deadline - _loop.time())
-                        turn_messages.append(
-                            Message(
-                                role="user",
-                                content=_ENDGAME_FIX_DIRECTIVE_TEMPLATE.format(
-                                    minutes=max(1, int(remaining_seconds // 60)),
-                                ),
-                            )
-                        )
-                        self._write_turn_call_log(
-                            "turn_policy_decision",
-                            action="endgame_fix_directive",
-                            reason="deadline_margin_no_fix",
-                            code="endgame_fix_directive",
-                            iteration=iterations,
-                            remaining_seconds=int(remaining_seconds),
-                            margin_seconds=endgame_fix_margin_seconds,
-                        )
-                        append_runtime_event(
-                            self.config.runtime_events_path,
-                            {
-                                "feature": "endgame_fix_directive",
-                                "name": "endgame_fix_directive.injected",
-                                "action": "append_fix_directive",
-                                "reason": "deadline_margin_no_fix",
-                                "iteration": iterations,
-                                "remaining_seconds": int(remaining_seconds),
-                                "margin_seconds": endgame_fix_margin_seconds,
-                                "session_key": self._session_key,
-                                "agent_id": (
-                                    self.config.tool_result_store_agent_id
-                                    or self.config.metadata.get("agent_id")
-                                ),
-                            },
-                        )
-                # Count iterations that blocked a compacted-placeholder reuse
-                # (preflight or dispatch path) and escalate the recovery
-                # directive once the configured threshold is reached. This
-                # runs before the source-loop recovery guidance append below:
-                # that guidance must stay the final runtime-injected message
-                # of the turn so _drop_runtime_recovery_scaffolding can pop it
-                # from the end.
-                if terminal_projection_preflight_error or any(
-                    self._is_provider_context_projection_reuse_result(result)
-                    for result in executed_results
-                ):
-                    placeholder_offense_iterations += 1
-                    placeholder_escalation_threshold = max(
-                        0,
-                        int(getattr(self.config, "placeholder_escalation_threshold", 0) or 0),
-                    )
-                    if (
-                        placeholder_escalation_threshold > 0
-                        and placeholder_offense_iterations >= placeholder_escalation_threshold
-                    ):
-                        turn_messages.append(
-                            Message(
-                                role="user",
-                                content=_PLACEHOLDER_ESCALATION_DIRECTIVE,
-                            )
-                        )
-                        self._write_turn_call_log(
-                            "placeholder_offense_escalation",
-                            iteration=iterations,
-                            offense_iterations=placeholder_offense_iterations,
-                            threshold=placeholder_escalation_threshold,
-                        )
-                        # The turn-call log is a raw debug stream that run
-                        # harnesses do not collect; the runtime event is what
-                        # lets delivery gates tell this designed escalation
-                        # apart from a treatment delivery failure.
-                        append_runtime_event(
-                            self.config.runtime_events_path,
-                            {
-                                "feature": "placeholder_escalation",
-                                "name": "placeholder_escalation.injected",
-                                "action": "append_escalation_directive",
-                                "reason": "placeholder_offense_threshold",
-                                "iteration": iterations,
-                                "offense_iterations": placeholder_offense_iterations,
-                                "threshold": placeholder_escalation_threshold,
-                                "session_key": self._session_key,
-                                "agent_id": (
-                                    self.config.tool_result_store_agent_id
-                                    or self.config.metadata.get("agent_id")
-                                ),
-                            },
-                        )
                 if source_loop_recovery_guidance is not None:
                     # Appended last: _drop_runtime_recovery_scaffolding pops
                     # the one-shot directive from the end of the turn, so no
@@ -17461,103 +16751,6 @@ class Agent:
         records = getattr(ctx, "workspace_file_writes", []) or []
         return [record for record in records if isinstance(record, dict)]
 
-    def _workspace_has_source_change_evidence(self) -> bool:
-        """Best-effort check that this agent's run produced a source change.
-
-        Used by the mid-budget nudge: write receipts and captured diff
-        candidates cover tool-mediated edits, and the live tracked diff
-        covers shell-made edits that leave no receipts. Only this agent's
-        own ToolContext counts — the contextvar fallback inside a child
-        agent resolves to the parent's context — and untracked files do
-        not: scratch artifacts from merely running the code (caches,
-        coverage files, logs) are not source progress.
-        """
-
-        ctx = self._tool_context
-        if ctx is not None:
-            records = getattr(ctx, "workspace_file_writes", []) or []
-            if any(
-                isinstance(record, dict)
-                and not self._workspace_write_record_looks_synthetic(record)
-                and not self._workspace_write_record_targets_configured_scratch(record)
-                for record in records
-            ):
-                return True
-            if getattr(ctx, "source_diff_candidates", []) or []:
-                return True
-        paths = self._workspace_tracked_diff_paths_for_nudge()
-        # Unknown Git state must not manufacture a "no progress" nudge. Treat
-        # it conservatively as possible source evidence and let the turn keep
-        # its normal course without spending another model call.
-        return True if paths is None else bool(paths)
-
-    def _workspace_source_fix_beyond_instrumentation(self) -> bool:
-        """Whether the tracked diff contains more than diagnostic output.
-
-        Used by the endgame fix directive: an instrumentation-only diff
-        (added print/log lines, nothing removed) means the model has been
-        investigating, not fixing. Probe failures count as a fix existing —
-        the conservative direction, since the directive tells the model to
-        stop investigating and a misfire on a real fix wastes the message.
-        """
-
-        paths = self._workspace_tracked_diff_paths_for_nudge()
-        if paths is None:
-            return True
-        if not paths:
-            return False
-        ctx = self._tool_context
-        raw_workspace = getattr(ctx, "workspace_dir", None) if ctx is not None else None
-        if not raw_workspace:
-            raw_workspace = self.config.workspace_dir
-        if not raw_workspace:
-            return True
-        workspace_dir = Path(raw_workspace).expanduser().resolve(strict=False)
-        result = run_git(
-            ["diff", "HEAD", "--", *paths],
-            cwd=workspace_dir,
-            timeout=5.0,
-        )
-        if not result.ok:
-            return True
-        patch = result.stdout_text
-        if not patch.strip():
-            return False
-        return not is_instrumentation_only_patch(patch)
-
-    def _workspace_tracked_diff_paths_for_nudge(self) -> list[str] | None:
-        ctx = self._tool_context
-        raw_workspace = getattr(ctx, "workspace_dir", None) if ctx is not None else None
-        if not raw_workspace:
-            raw_workspace = self.config.workspace_dir
-        if not raw_workspace:
-            return []
-        workspace_dir = Path(raw_workspace).expanduser().resolve(strict=False)
-        if not workspace_dir.exists():
-            return []
-        self._runtime_git_state = GitRunState.OK
-        ignored_state, ignored_paths = self._workspace_ignored_diff_paths_observed(workspace_dir)
-        if ignored_state is not GitRunState.OK:
-            self._runtime_git_state = ignored_state
-            return None
-        ignored_paths |= self._workspace_internal_diagnostic_paths(workspace_dir)
-        paths: set[str] = set()
-        for args in (("diff", "--name-only"), ("diff", "--cached", "--name-only")):
-            result = run_git(args, cwd=workspace_dir, timeout=2.0)
-            if not result.ok:
-                self._runtime_git_state = result.state
-                return None
-            for line in result.stdout_text.splitlines():
-                text = line.strip()
-                if text:
-                    normalized = _normalize_workspace_relative_path(text)
-                    if normalized in ignored_paths:
-                        continue
-                    if self._workspace_relative_path_targets_scratch(normalized):
-                        continue
-                    paths.add(normalized)
-        return sorted(paths)
-
     def _effective_workspace_write_records(self) -> list[dict[str, Any]]:
         return [
             record
@@ -17973,105 +17166,6 @@ class Agent:
             return None
         return workspace
 
-    def _scratch_verify_mirror_root(self) -> Path | None:
-        ctx = self._tool_context or current_tool_context.get()
-        scratch_dir = getattr(ctx, "scratch_dir", None) if ctx is not None else None
-        if not scratch_dir:
-            return None
-        return Path(scratch_dir).expanduser().resolve(strict=False) / _VERIFY_MIRROR_DIR_NAME
-
-    @staticmethod
-    def _command_references_verify_mirror(command: str, mirror_root: Path) -> bool:
-        if not command:
-            return False
-        if f"{_VERIFY_MIRROR_DIR_NAME}/" in command:
-            return True
-        return mirror_root.as_posix() in command
-
-    @staticmethod
-    def _git_head_blob(workspace: Path, relative_path: str) -> tuple[bool, bytes | None]:
-        result = run_git(
-            ["show", "--end-of-options", f"HEAD:{relative_path}"],
-            cwd=workspace,
-            timeout=2.0,
-        )
-        if result.ok:
-            return True, result.stdout
-        error_text = result.stderr_text.casefold()
-        if result.state is GitRunState.FAILED and (
-            "does not exist in 'head'" in error_text
-            or "exists on disk, but not in 'head'" in error_text
-        ):
-            return True, None
-        return False, None
-
-    def _scratch_verify_mirror_evidence_credit(self, command: str) -> bool:
-        """Anti-weakening hash guard for scratch verify-mirror runs.
-
-        A command that references the verify-mirror tree earns verification
-        credit ONLY while every mirror file that shadows a workspace path is
-        byte-identical to that workspace file (or to its HEAD blob when the
-        workspace copy is gone). Mirror files with no counterpart in either
-        place are the model's own new checks and stay allowed — they shadow
-        nothing. Any unreadable or unverifiable state withholds credit: the
-        guard must fail closed, not open.
-        """
-
-        mirror_root = self._scratch_verify_mirror_root()
-        if mirror_root is None or not self._command_references_verify_mirror(command, mirror_root):
-            return True
-        if not mirror_root.is_dir():
-            return True
-        workspace = self._workspace_dir_for_status()
-        if workspace is None:
-            return False
-        repository_verified = False
-        checked = 0
-        for mirror_file in sorted(mirror_root.rglob("*")):
-            if not mirror_file.is_file():
-                continue
-            checked += 1
-            if checked > _VERIFY_MIRROR_MAX_FILES:
-                return False
-            try:
-                relative = mirror_file.relative_to(mirror_root)
-            except ValueError:
-                continue
-            try:
-                mirror_digest = hashlib.sha256(mirror_file.read_bytes()).digest()
-            except OSError:
-                return False
-            original = workspace / relative
-            if original.is_file():
-                try:
-                    original_digest = hashlib.sha256(original.read_bytes()).digest()
-                except OSError:
-                    return False
-                if mirror_digest != original_digest:
-                    return False
-                continue
-            if not repository_verified:
-                repository_check = run_git(
-                    ["rev-parse", "--is-inside-work-tree"],
-                    cwd=workspace,
-                    timeout=2.0,
-                )
-                if not repository_check.ok:
-                    return False
-                repository_verified = True
-            head_observed, head_blob = self._git_head_blob(
-                workspace,
-                relative.as_posix(),
-            )
-            if not head_observed:
-                return False
-            if head_blob is None:
-                # Tracked nowhere: a new check file, not a shadowed original.
-                continue
-            if mirror_digest != hashlib.sha256(head_blob).digest():
-                return False
-        return True
-
     async def _workspace_git_status_porcelain(self) -> str | None:
         workspace = self._workspace_dir_for_status()
         if workspace is None:
@@ -18216,77 +17310,6 @@ class Agent:
         code = Agent._porcelain_status_code(line)
         return code == "??" or "A" in code
 
-    @staticmethod
-    def _porcelain_status_test_paths(status: str | None) -> list[str]:
-        """Test-classified paths with a live diff, per porcelain-v1 status.
-
-        Renames count both sides: moving a test file away still mutates the
-        test tree. Scratch-classified paths never count even when their name
-        looks test-like (classify_workspace_path puts the scratch check first
-        only for the scratch directory; root scratch artifacts are already
-        filtered out of the status upstream).
-        """
-
-        if not status:
-            return []
-        test_paths: list[str] = []
-        for line in status.splitlines():
-            if not line.strip():
-                continue
-            raw = line.rstrip()
-            text = raw[3:].strip() if len(raw) > 3 else raw.strip()
-            sides = [side.strip() for side in text.split(" -> ", 1)] if " -> " in text else [text]
-            for side in sides:
-                path = _normalize_workspace_relative_path(side)
-                if not path:
-                    continue
-                if classify_workspace_path(path) != "test-like":
-                    continue
-                if path not in test_paths:
-                    test_paths.append(path)
-        return test_paths
-
-    def _porcelain_status_protected_paths(self, status: str | None) -> list[str]:
-        """Deny-glob-protected paths with a live diff, per porcelain-v1 status.
-
-        The ``protected_paths`` hygiene mode reuses the deployment's
-        workspace write-deny globs verbatim — the engine carries no path
-        taxonomy of its own here, so whatever the configuration protects
-        from writes is also what the final diff must leave untouched.
-        Renames count both sides: moving a protected file away still
-        mutates the protected tree.
-        """
-
-        if not status:
-            return []
-        workspace = self._workspace_dir_for_status()
-        if workspace is None:
-            return []
-        ctx = self._tool_context or current_tool_context.get()
-        if ctx is None or not getattr(ctx, "workspace_write_deny_globs", None):
-            return []
-        protected: list[str] = []
-        for line in status.splitlines():
-            if not line.strip():
-                continue
-            raw = line.rstrip()
-            text = raw[3:].strip() if len(raw) > 3 else raw.strip()
-            sides = [side.strip() for side in text.split(" -> ", 1)] if " -> " in text else [text]
-            for side in sides:
-                path = _normalize_workspace_relative_path(side)
-                if not path:
-                    continue
-                match = match_workspace_write_deny(
-                    workspace / path,
-                    original_path=path,
-                    workspace=workspace,
-                    ctx=ctx,
-                )
-                if match is None:
-                    continue
-                if path not in protected:
-                    protected.append(path)
-        return protected
 
     @staticmethod
     def _is_root_scratch_artifact_path(path: str | None) -> bool:
@@ -19253,50 +18276,6 @@ class Agent:
         }
         append_runtime_event(self.config.runtime_events_path, event)
 
-    def _record_post_write_convergence_event(
-        self,
-        decision: PostWriteConvergenceDecision,
-        *,
-        mode: str,
-        injected_to_model: bool,
-        hint_text: str | None = None,
-    ) -> None:
-        event_name = {
-            "warn": "post_write_convergence.warned",
-            "finalize": "post_write_convergence.finalized",
-            "reset": "post_write_convergence.reset_on_diff_change",
-        }.get(decision.action)
-        if event_name is None:
-            return
-        evidence = dict(decision.details)
-        runtime_diff_paths = self._workspace_diff_paths_for_runtime_event()
-        event = {
-            "feature": "post_write_convergence",
-            "mechanism": "stable_verified_workspace_diff",
-            "name": event_name,
-            "mode": mode,
-            "reason": decision.reason,
-            "action": decision.action,
-            "iteration": evidence.get("iteration"),
-            "provider_call_count": evidence.get("provider_call_count"),
-            "session_key": self._session_key,
-            "agent_id": self.config.tool_result_store_agent_id
-            or self.config.metadata.get("agent_id"),
-            "injected_to_model": injected_to_model,
-            "evidence": evidence,
-            "read_files": self._relative_paths_from_records(self._workspace_read_records()),
-            "changed_files": self._relative_paths_from_records(self._workspace_write_records()),
-            "diff_paths": runtime_diff_paths or [],
-            "git_state": self._runtime_git_state.value,
-            "diff_observed": runtime_diff_paths is not None,
-            "verification_commands": self._verification_commands_for_runtime_event(),
-            "hint_text_sha256": (
-                hashlib.sha256(hint_text.encode("utf-8")).hexdigest() if hint_text else None
-            ),
-            "trigger_confidence": "post_write_convergence_gate",
-            "details": evidence,
-        }
-        append_runtime_event(self.config.runtime_events_path, event)
 
     @staticmethod
     def _relative_paths_from_records(records: list[dict[str, Any]]) -> list[str]:
@@ -24734,26 +23713,17 @@ class Agent:
             identical_request_loop_break_threshold=(
                 self.config.identical_request_loop_break_threshold
             ),
-            placeholder_escalation_threshold=self.config.placeholder_escalation_threshold,
             deadline_wrapup_margin_seconds=self.config.deadline_wrapup_margin_seconds,
             reasoning_only_thinking_fallback=self.config.reasoning_only_thinking_fallback,
             provider_error_thinking_fallback=(self.config.provider_error_thinking_fallback),
             deadline_thinking_off_margin_seconds=(self.config.deadline_thinking_off_margin_seconds),
-            reasoning_stream_char_cap=self.config.reasoning_stream_char_cap,
-            patch_hygiene_block_mode=self.config.patch_hygiene_block_mode,
             final_diff_salvage=self.config.final_diff_salvage,
-            endgame_git_freeze_margin_seconds=(self.config.endgame_git_freeze_margin_seconds),
             max_iterations_deadline_extend_seconds=(
                 self.config.max_iterations_deadline_extend_seconds
             ),
             final_diff_salvage_veto=self.config.final_diff_salvage_veto,
-            endgame_git_freeze_instrumentation_exempt=(
-                self.config.endgame_git_freeze_instrumentation_exempt
-            ),
             deadline_wrapup_sticky_thinking_off=(self.config.deadline_wrapup_sticky_thinking_off),
-            endgame_fix_directive_margin_seconds=(self.config.endgame_fix_directive_margin_seconds),
             reasoning_only_act_now=self.config.reasoning_only_act_now,
-            mid_budget_no_diff_nudge=self.config.mid_budget_no_diff_nudge,
             repeated_tool_call_recovery_threshold=(
                 self.config.repeated_tool_call_recovery_threshold
             ),
@@ -24772,13 +23742,6 @@ class Agent:
             ),
             progress_watchdog_repeated_failure_anchor_threshold=(
                 self.config.progress_watchdog_repeated_failure_anchor_threshold
-            ),
-            post_write_convergence_enabled=self.config.post_write_convergence_enabled,
-            post_write_convergence_warn_threshold=(
-                self.config.post_write_convergence_warn_threshold
-            ),
-            post_write_convergence_finalize_after_warning=(
-                self.config.post_write_convergence_finalize_after_warning
             ),
             tool_loop_observer_mode=self.config.tool_loop_observer_mode,
             runtime_recovery_mode=self.config.runtime_recovery_mode,
