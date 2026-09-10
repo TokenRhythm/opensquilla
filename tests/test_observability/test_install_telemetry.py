@@ -18,6 +18,37 @@ from opensquilla.observability import network_policy
 TEST_ENDPOINT = "https://telemetry.example.test/v1/install"
 PRODUCTION_ENDPOINT = "https://telemetry.opensquilla.ai/v1/install"
 
+# Every bound below is a failure deadline, not a delay. The waits return the
+# moment their condition holds, so a healthy run never spends this budget and a
+# broken one still fails — only later, and on the assertion that actually
+# describes the defect.
+#
+# The previous one- and ten-second bounds were tight enough to lose that
+# property on a loaded Windows runner, where starting a daemon thread, creating
+# two interpreters and importing this package in each of them are all far
+# slower than on Linux. Which of them expired first is not recorded here; the
+# point of the change is that none of these bounds should be close enough to a
+# healthy run's cost to decide the outcome.
+_BARRIER_TIMEOUT_S = 60.0
+
+# Not a barrier: the deadlock-breaker for the property the concurrent-reader
+# test is named after. `_state_transaction` takes `_STATE_LOCK` with no timeout,
+# and the test's `release_post.set()` sits downstream of the call that would
+# block, so if the product ever held that lock across `_post_payload` this
+# expiry in the worker is the only thing that ends the run. It has to stay well
+# above the product's own transaction budgets — 1.0s and 5.0s — or a genuinely
+# slow run reads as a deadlock, and well below `_BARRIER_TIMEOUT_S`, or a
+# regression that blocks for tens of seconds and then completes stops failing
+# at all.
+_RELEASE_TIMEOUT_S = 10.0
+
+# Reaping a worker after ``terminate()`` is not a barrier: nothing is waiting on
+# the test any more, the signal has already been delivered, and a process that
+# has not gone away in a few seconds is not going to. Keeping this short means a
+# genuinely wedged worker still surfaces quickly instead of holding the shard
+# for a minute per process.
+_REAP_TIMEOUT_S = 5.0
+
 
 def _load(path: Path) -> dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8"))
@@ -609,7 +640,7 @@ def test_background_collection_does_not_wait_for_blocked_post_and_preserves_stat
     ) -> tuple[bool, str | None]:
         payloads.append(payload)
         post_started.set()
-        if not release_post.wait(timeout=2):
+        if not release_post.wait(timeout=_RELEASE_TIMEOUT_S):
             return False, "test_release_timeout"
         return True, None
 
@@ -622,7 +653,7 @@ def test_background_collection_does_not_wait_for_blocked_post_and_preserves_stat
     try:
         assert thread is not None
         assert thread.daemon is True
-        assert post_started.wait(timeout=1)
+        assert post_started.wait(timeout=_BARRIER_TIMEOUT_S)
         assert thread.is_alive()
 
         # The worker persisted its install id before entering network I/O, so a
@@ -633,7 +664,7 @@ def test_background_collection_does_not_wait_for_blocked_post_and_preserves_stat
     finally:
         release_post.set()
         if thread is not None:
-            thread.join(timeout=2)
+            thread.join(timeout=_BARRIER_TIMEOUT_S)
 
     assert thread is not None and not thread.is_alive()
     assert len(results) == 1
@@ -723,10 +754,11 @@ state_path = Path(sys.argv[1])
 ready_path = Path(sys.argv[2])
 go_path = Path(sys.argv[3])
 version = sys.argv[4]
+barrier_timeout = float(sys.argv[5])
 
 def blocked_post(endpoint, payload, *, timeout):
     ready_path.write_text("ready", encoding="utf-8")
-    deadline = time.monotonic() + 10
+    deadline = time.monotonic() + barrier_timeout
     while not go_path.exists():
         if time.monotonic() >= deadline:
             return False, "barrier_timeout"
@@ -757,6 +789,7 @@ print(json.dumps({
                 str(ready_path),
                 str(go_path),
                 version,
+                str(_BARRIER_TIMEOUT_S),
             ],
             cwd=str(Path(__file__).resolve().parents[2]),
             env=env,
@@ -772,7 +805,7 @@ print(json.dumps({
     ]
     outputs: list[tuple[str, str]] = []
     try:
-        deadline = time.monotonic() + 10
+        deadline = time.monotonic() + _BARRIER_TIMEOUT_S
         while not all(path.exists() for path in ready_paths):
             for worker in workers:
                 if worker.poll() is not None:
@@ -787,12 +820,22 @@ print(json.dumps({
         # Both workers reaching this barrier proves the process lock is not held
         # across the simulated network operation.
         go_path.write_text("go", encoding="utf-8")
-        outputs = [worker.communicate(timeout=10) for worker in workers]
+        outputs = [
+            worker.communicate(timeout=_BARRIER_TIMEOUT_S) for worker in workers
+        ]
     finally:
         for worker in workers:
             if worker.poll() is None:
                 worker.terminate()
-                worker.wait(timeout=5)
+                try:
+                    worker.wait(timeout=_REAP_TIMEOUT_S)
+                except subprocess.TimeoutExpired:
+                    # Without this the loop aborts on the first stuck worker and
+                    # the second is never signalled at all, leaving it to spin
+                    # inside `tmp_path` for its own barrier while pytest tries
+                    # to tear that directory down.
+                    worker.kill()
+                    worker.wait(timeout=_REAP_TIMEOUT_S)
 
     for worker, (stdout, stderr) in zip(workers, outputs, strict=True):
         assert worker.returncode == 0, stderr
