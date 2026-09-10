@@ -662,9 +662,22 @@ test('recovers stalled history and live hydration in place despite ongoing ticks
   // history pages. The Gateway caps history responses, so the fault-recovery
   // response below must never manufacture all 320 rows for one request.
   await expect(page.getByText(retainedTail)).toBeVisible()
-  for (let pageIndex = 0; seedOffset > 0 && pageIndex < 7; pageIndex += 1) {
+  const historySentinel = page.getByTestId('history-load-sentinel')
+  for (let pageIndex = 0; pageIndex < 7; pageIndex += 1) {
+    // The sentinel can intersect again after a prepend and consume the final
+    // cursor between loop turns. Accept that terminal state instead of waiting
+    // for an idle node that has already been removed by has_more=false.
+    await expect.poll(async () => {
+      const sentinelState = await historySentinel.evaluateAll(elements => {
+        const element = elements[0]
+        if (!element) return 'absent'
+        return element.classList.contains('history-load-sentinel--idle') ? 'idle' : 'busy'
+      })
+      return (seedOffset > 0 && sentinelState === 'idle')
+        || (seedOffset === 0 && sentinelState === 'absent')
+    }).toBe(true)
+    if (seedOffset === 0) break
     const previousOffset = seedOffset
-    await expect(page.getByTestId('history-load-sentinel')).toHaveClass(/history-load-sentinel--idle/)
     // Use reader input so an earlier page's anchor stabilizer relinquishes
     // ownership. A raw scrollTo can be restored by that still-active guard,
     // and the server counter alone does not prove the prepend has committed.
@@ -673,6 +686,7 @@ test('recovers stalled history and live hydration in place despite ongoing ticks
     await expect.poll(() => seedOffset).toBeLessThan(previousOffset)
   }
   expect(seedOffset).toBe(0)
+  await expect(historySentinel).toHaveCount(0)
   await expect(page.locator('.chat-message-list')).toHaveAttribute('data-virtualized', 'true')
   // Pagination is deliberate reader navigation and leaves live following
   // paused. Reclaim it through the product control so the recovery assertion
