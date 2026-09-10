@@ -6304,7 +6304,6 @@ class Agent:
             else None
         )
         finalize_evidence_gate_keys: set[str] = set()
-        recent_failure_anchor_summaries: list[str] = []
         progress_watchdog_mode = getattr(self.config, "progress_watchdog_mode", "log")
         progress_watchdog = None if progress_watchdog_mode == "off" else ProgressWatchdog(
             repeated_tool_error_threshold=max(
@@ -13014,12 +13013,6 @@ class Agent:
                     if runtime_diagnostics is not None or progress_watchdog is not None
                     else ""
                 )
-                if (
-                    failure_anchor_summary
-                    and failure_anchor_summary not in recent_failure_anchor_summaries
-                ):
-                    recent_failure_anchor_summaries.append(failure_anchor_summary)
-                    recent_failure_anchor_summaries[:] = recent_failure_anchor_summaries[-3:]
                 runtime_diff_paths: list[str] | None = None
                 runtime_diff_fingerprint: str | None = None
                 if runtime_diagnostics is not None:

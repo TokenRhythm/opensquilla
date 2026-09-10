@@ -16,6 +16,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Changed
 
+- Skip unconsumed runtime diagnostic payloads and final-diff log observations,
+  avoid disabled watchdog/repeat-call preparation, and remove an unused failure
+  summary cache. Enabled recovery, salvage, model warnings and runtime event
+  output remain available; public settings and model-visible defaults are unchanged.
 - Retired the opt-in patch evidence ledger collector and JSON export. Legacy
   path configuration remains accepted and excludes old diagnostic files from
   final-diff checks, but no longer creates or overwrites a ledger. Recovery events
