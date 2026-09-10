@@ -1,7 +1,9 @@
 import { app, BrowserWindow, protocol } from 'electron'
+import { DesktopBrowserServer } from '../../../dist/desktop-browser.js'
 import { NativeWorkbenchSurfaceManager } from '../../../dist/native-workbench-surface.js'
 
 globalThis.__opensquillaNativeWorkbenchSurfaceManager = NativeWorkbenchSurfaceManager
+globalThis.__opensquillaDesktopBrowserServer = DesktopBrowserServer
 
 protocol.registerSchemesAsPrivileged([{
   scheme: 'opensquilla-artifact',

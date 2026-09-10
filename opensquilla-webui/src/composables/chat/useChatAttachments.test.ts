@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
-import { useChatAttachments } from './useChatAttachments'
+import { stageCapturedImage, useChatAttachments } from './useChatAttachments'
 import type { Attachment } from '@/types/chat'
 import type { ArtifactContentAccess } from '@/modules/artifactWorkbench'
 
@@ -105,6 +105,16 @@ describe('useChatAttachments', () => {
 
   afterEach(() => {
     vi.unstubAllGlobals()
+  })
+
+  it('stages a small UI capture through the standard content upload port', async () => {
+    const uploadAttachment = vi.fn(async () => ({ fileUuid: 'capture-file' }))
+    const file = new File(['png'], 'page-selection.png', { type: 'image/png' })
+    const attachment = await stageCapturedImage(file, { uploadAttachment })
+    expect(attachment).toMatchObject({ kind: 'staged', file_uuid: 'capture-file', file })
+    expect(attachment).not.toHaveProperty('data')
+    expect(attachment).not.toHaveProperty('dataUrl')
+    expect(uploadAttachment).toHaveBeenCalledExactlyOnceWith(file, 'image/png')
   })
 
   it('accepts every file type in a mixed batch (opaque binaries included)', async () => {

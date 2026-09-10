@@ -17,7 +17,6 @@ from opensquilla.application.turn_acceptance_ports import (
     AdmissionRoutingSnapshot,
 )
 from opensquilla.application.turn_input import (
-    DocumentTurnContext,
     IncomingTurnSource,
     MemoryCapturePolicy,
     PlanAdmissionContext,
@@ -153,8 +152,8 @@ class AdmitTurn:
     intent_was_provided: bool = False
     fork_before_message_id: str | None = None
     workspace_id: str | None = None
-    prompt_annotation_ids: tuple[str, ...] = ()
-    document_context: DocumentTurnContext | None = None
+    page_context: dict[str, Any] | None = None
+    receipt_replay_only: bool = False
     display_text: str | None = None
     queue_mode: str | None = None
     initial_collaboration_mode: InitialCollaborationMode | None = None

@@ -120,9 +120,8 @@ async function preparePage(page: Page) {
   await page.addInitScript(() => {
     window.localStorage.setItem('opensquilla-locale', 'en')
     const surfaceOk = async () => ({ ok: true })
-    // Exercise the release-default prompt-annotation path, not a browser-only
-    // feature override. The complete native v3 bridge enables the same eager
-    // per-session annotations.list read used by packaged Desktop.
+    // Keep the Desktop bridge available while session-scoped annotation drafts
+    // stay local and the ordinary chat transport changes subscriptions.
     window.opensquillaDesktop = {
       getOsLocale: async () => 'en',
       isAutoUpdateEnabled: async () => false,
@@ -217,7 +216,6 @@ test('workspace navigation keeps one transport while the target subscription rec
               'sessions.routing.set',
               'workspaces.list',
               'artifacts.list',
-              'artifacts.prompt_annotations.list',
               'config.patch.safe',
             ],
             events: ['session.event.text_delta'],
@@ -252,10 +250,6 @@ test('workspace navigation keeps one transport while the target subscription rec
       }
       if (method === 'artifacts.list') {
         socket.send(response(frame.id, { artifacts: [], has_more: false }))
-        return
-      }
-      if (method === 'artifacts.prompt_annotations.list') {
-        socket.send(response(frame.id, { annotations: [] }))
         return
       }
       if (method === 'chat.history') {
@@ -356,9 +350,6 @@ test('workspace navigation keeps one transport while the target subscription rec
     entry.method === 'artifacts.list' && entry.key === SESSION_B
   ))).toBe(true)
   await expect.poll(() => wire.some(entry => (
-    entry.method === 'artifacts.prompt_annotations.list' && entry.key === SESSION_B
-  ))).toBe(true)
-  await expect.poll(() => wire.some(entry => (
     entry.method === 'sessions.routing.get' && entry.key === SESSION_B
   ))).toBe(true)
   expect(sockets).toHaveLength(1)
@@ -372,7 +363,6 @@ test('workspace navigation keeps one transport while the target subscription rec
   for (const optionalMethod of [
     'sessions.routing.get',
     'artifacts.list',
-    'artifacts.prompt_annotations.list',
   ]) {
     const optionalIndex = wire.findIndex(entry => (
       entry.method === optionalMethod && entry.key === SESSION_B

@@ -203,13 +203,10 @@ class GatewayPendingInputQueueAdapter:
             value = self._value_string(raw, *aliases)
             if value is not None:
                 params[name] = value
-        annotations = raw.get("promptAnnotationIds", raw.get("prompt_annotation_ids"))
-        if annotations is not None:
-            if not isinstance(annotations, list):
-                raise ValueError("params.promptAnnotationIds must be an array")
-            if any(not isinstance(item, str) or not item.strip() for item in annotations):
-                raise ValueError("params.promptAnnotationIds must contain non-empty strings")
-            params["promptAnnotationIds"] = [item.strip() for item in annotations]
+        for field in ("pageContext", "promptAnnotationIds", "prompt_annotation_ids",
+                      "documentContext", "document_context"):
+            if field in raw:
+                params[field] = raw[field]
         confirmed = raw.get("confirmedPlainText", raw.get("confirmed_plain_text", False))
         if not isinstance(confirmed, bool):
             raise ValueError("params.confirmedPlainText must be a boolean")

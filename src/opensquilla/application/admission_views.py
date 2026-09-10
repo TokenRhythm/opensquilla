@@ -155,14 +155,8 @@ class AdmissionMetaControl(Protocol):
     def replay_mode(self) -> str | None: ...
 
 
-class AdmissionAnnotation(Protocol):
-    @property
-    def annotation_id(self) -> str: ...
 
 
-class AdmissionAnnotationTarget(Protocol):
-    @property
-    def expected_annotation(self) -> AdmissionAnnotation: ...
 
 
 class AdmissionGuestCleanup(Protocol):
@@ -260,8 +254,6 @@ class AdmissionCommit:
     expected_active_plan_revision_id: str | None = None
     require_idle_for_current_plan_implementation: bool = False
     claim_current_goal: bool = False
-    prepared_prompt_annotation_targets: Sequence[AdmissionAnnotationTarget] = ()
-    prompt_annotation_turn_id: str | None = None
     pending_input_id: str | None = None
     pending_input_fingerprint: str | None = None
     pending_input_revision: int | None = None

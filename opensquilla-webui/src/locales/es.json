@@ -173,11 +173,33 @@
       "failedDetail": "Vuelve a cargar el navegador aislado para continuar."
     },
     "artifactAnnotation": {
-      "start": "Anotar vista previa", "stop": "Dejar de anotar", "selectElement": "Selecciona un elemento de la página para anotar", "selectElementShort": "Selecciona elemento", "unavailable": "La anotación de vista previa no está disponible.", "desktopEditingOnly": "Selecciona y edita elementos de la página con IA en la aplicación de escritorio.",
-      "createFailed": "No se pudo adjuntar el elemento seleccionado.", "elementChanged": "El elemento seleccionado cambió antes de adjuntarse. Vuelva a seleccionarlo en la vista previa actual.", "rearmFailed": "El modo de anotación se detuvo porque no se pudo reiniciar el selector. Vuelva a activarlo para intentarlo de nuevo.", "updateFailed": "No se pudo guardar el borrador de anotación.", "discardFailed": "No se pudo descartar la anotación. Seguirá abierta para volver a intentarlo.", "closeFailed": "No se pudo cerrar el editor de anotaciones. Inténtelo de nuevo.", "replacementCleanupFailed": "Se conservó la anotación nueva, pero no se pudo eliminar el borrador anterior.",
+      "start": "Anotar vista previa",
+      "stop": "Dejar de anotar",
+      "selectElement": "Selecciona un elemento de la página para anotar",
+      "selectElementShort": "Selecciona elemento",
+      "unavailable": "La anotación de vista previa no está disponible.",
+      "desktopEditingOnly": "Selecciona y edita elementos de la página con IA en la aplicación de escritorio.",
+      "createFailed": "No se pudo adjuntar el elemento seleccionado.",
+      "elementChanged": "El elemento seleccionado cambió antes de adjuntarse. Vuelva a seleccionarlo en la vista previa actual.",
+      "rearmFailed": "El modo de anotación se detuvo porque no se pudo reiniciar el selector. Vuelva a activarlo para intentarlo de nuevo.",
+      "updateFailed": "No se pudo guardar el borrador de anotación.",
+      "discardFailed": "No se pudo descartar la anotación. Seguirá abierta para volver a intentarlo.",
+      "closeFailed": "No se pudo cerrar el editor de anotaciones. Inténtelo de nuevo.",
+      "replacementCleanupFailed": "Se conservó la anotación nueva, pero no se pudo eliminar el borrador anterior.",
       "overlayFallback": "Continúa la anotación a continuación.",
-      "fallbackTitle": "Continuar anotación", "fallbackDetail": "La vista previa está oculta temporalmente. Tu anotación sigue aquí.", "frozenPreview": "Vista previa de la zona seleccionada",
-      "placeholder": "Describe el cambio para esta zona…", "newlineHint": "{shortcut} para una línea nueva", "keepDraft": "Conservar anotación", "submit": "Añadir anotación", "contextLabel": "Selección actual", "bodyLabel": "Anotación de página", "emptyBody": "Describe el cambio solicitado.", "reselectHint": "Selecciona la zona correspondiente de la página.", "reuseHint": "Se copió la solicitud de cambio. Selecciona la zona correspondiente de la página."
+      "fallbackTitle": "Continuar anotación",
+      "fallbackDetail": "La vista previa está oculta temporalmente. Tu anotación sigue aquí.",
+      "frozenPreview": "Vista previa de la zona seleccionada",
+      "placeholder": "Describe el cambio para esta zona…",
+      "newlineHint": "{shortcut} para una línea nueva",
+      "keepDraft": "Conservar anotación",
+      "submit": "Añadir anotación",
+      "contextLabel": "Selección actual",
+      "bodyLabel": "Anotación de página",
+      "emptyBody": "Describe el cambio solicitado.",
+      "reselectHint": "Selecciona la zona correspondiente de la página.",
+      "reuseHint": "Se copió la solicitud de cambio. Selecciona la zona correspondiente de la página.",
+      "screenshotUploadFailed": "No se pudo adjuntar la captura. La anotación se conserva; puedes añadir una imagen manualmente."
     },
     "artifactPreview": {
       "refresh": "Actualizar vista previa",
@@ -187,7 +209,6 @@
       "readyWithWarnings": "La vista previa se está ejecutando con advertencias.",
       "warningsShort": "Advertencias",
       "suspended": "Vista previa en pausa",
-      "agentEditInProgress": "La edición continúa en segundo plano.",
       "nativePreview": "Vista previa interactiva",
       "allowRemoteResources": "Permitir imágenes, estilos y contenido multimedia en línea",
       "blockRemoteResources": "Bloquear imágenes, estilos y contenido multimedia en línea",
@@ -229,7 +250,6 @@
     },
     "artifactErrors": {
       "documentChanged": "La página cambió. Actualízala antes de volver a intentarlo.",
-      "editSessionRenewalRequired": "La edición se está reconectando. Tus cambios sin guardar siguen disponibles.",
       "writeBusy": "La página se está actualizando. Espera un momento y vuelve a intentarlo.",
       "mutationNotApplied": "La página no se actualizó. Puedes volver a intentarlo.",
       "mutationOutcomePending": "No se puede confirmar el resultado de la actualización. Abre la página para comprobarlo.",
@@ -241,7 +261,8 @@
       "annotationUnavailable": "Esta anotación no está disponible temporalmente.",
       "annotationBusy": "Las anotaciones se están actualizando. Espera un momento y vuelve a intentarlo.",
       "invalidRequest": "No se pudo completar la solicitud. Revisa la entrada y vuelve a intentarlo.",
-      "internalError": "No se pudo completar la operación. Vuelve a intentarlo."
+      "internalError": "No se pudo completar la operación. Vuelve a intentarlo.",
+      "documentEditingRetired": "Actualiza el cliente y vuelve a abrir la página para enviar anotaciones como mensajes."
     },
     "artifactDocument": {
       "sections": "Secciones del documento del artefacto",
@@ -290,16 +311,7 @@
       "revertFailed": "No se pudo revertir este cambio. Revisa la versión más reciente y vuelve a intentarlo.",
       "commentCreateFailed": "No se pudo añadir el comentario. Revisa el estado actual del documento y vuelve a intentarlo.",
       "commentResolveFailed": "No se pudo resolver el comentario. Revisa su estado actual y vuelve a intentarlo.",
-      "noElementSelected": "Coloca el cursor dentro de un elemento HTML",
-      "saving": "Guardando…",
-      "saveSource": "Guardar",
-      "sourceUnavailable": "El código HTML no está disponible.",
-      "sourceConflict": "El documento cambió en otro lugar. Revísalo o recárgalo antes de guardar.",
-      "copyUnsavedSource": "Copiar código sin guardar",
-      "unsavedSourceCopied": "Código sin guardar copiado",
-      "copyUnsavedSourceFailed": "No se pudo copiar el código sin guardar.",
-      "discardAndLoadLatest": "Descartar y cargar la última versión",
-      "sourceStatus": {"ready":"Listo","saving":"Guardando…","dirty":"Sin guardar","saved":"Guardado","error":"Requiere atención"}
+      "sourceUnavailable": "El código HTML no está disponible."
     }
   },
   "nav": {
@@ -3468,7 +3480,7 @@
     "audioUnsupported": "Este navegador no puede reproducir este formato de audio. Descarga el archivo en su lugar.",
     "playVideo": "Reproducir vídeo",
     "videoLoadFailed": "No se pudo cargar el vídeo.",
-    "videoUnsupported": "Este navegador no puede reproducir este formato de vídeo. Descarga el archivo en su lugar.",
+    "videoUnsupported": "Este navegador no puede reproducir este vídeo. Descárgalo en su lugar.",
     "previewOf": "Vista previa: {title}",
     "closePreview": "Cerrar vista previa",
     "previousImage": "Imagen anterior",
@@ -3477,7 +3489,6 @@
     "previewDownload": "Descargar vista previa",
     "previewTimedOut": "Se agotó el tiempo de la vista previa.",
     "previewFailed": "No se pudo cargar la vista previa.",
-    "videoUnsupported": "Este navegador no puede reproducir este vídeo. Descárgalo en su lugar.",
     "loadVideoPreview": "Cargar vista previa del vídeo",
     "loadVideoPreviewFor": "Cargar vista previa del vídeo {title}",
     "videoPreviewLoading": "Cargando la vista previa del vídeo. Puedes cancelar la descarga.",
@@ -3967,7 +3978,8 @@
         "generic": "La redirección no está disponible para la tarea actual. El mensaje permanece en cola."
       },
       "clearQueue": "Vaciar cola",
-      "removeMessage": "Quitar el mensaje pendiente {index}"
+      "removeMessage": "Quitar el mensaje pendiente {index}",
+      "annotationUpgradeRequired": "Esta anotación pendiente usa el editor anterior. Edita el mensaje y vuelve a seleccionar la página antes de enviarlo."
     },
     "metaRuns": {
       "draft": "Borrador",

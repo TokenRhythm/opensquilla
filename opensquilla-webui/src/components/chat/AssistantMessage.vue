@@ -458,8 +458,6 @@ import { useCopyFeedback } from '@/composables/chat/useCopyFeedback'
 import { useRelativeNow } from '@/composables/useRelativeNow'
 import { createdSessionsFromMessage } from '@/utils/chat/createdSessions'
 import {
-  isDocumentAgentToolName,
-  isDocumentWriterToolName,
 } from '@/utils/chat/toolDisplay'
 import {
   hasIncompleteUsageCoverage,
@@ -846,9 +844,9 @@ const activityLifecycle = computed<AssistantActivityLifecycle>(() => {
 
 const activityProjection = computed(() =>
   projectAssistantActivity(
-    props.message,
+    { ...props.message, timelineItems: withoutFailedActivity(props.message.timelineItems || []) },
     props.renderMarkdown,
-    legacyTimelineItems.value,
+    withoutFailedActivity(legacyTimelineItems.value),
     {
       lifecycle: activityLifecycle.value,
       statusHistory: statusHistory.value,
@@ -859,60 +857,16 @@ const activityProjection = computed(() =>
   ),
 )
 
-function withoutFailedActivity(
-  items: ChatStreamTimelineItem[],
-): ChatStreamTimelineItem[] {
+function withoutFailedActivity(items: ChatStreamTimelineItem[]): ChatStreamTimelineItem[] {
   return items.flatMap((item): ChatStreamTimelineItem[] => {
     if (item.type !== 'tool-group') return [item]
-    const documentAgentGroup = item.group.operationKey.startsWith('document.')
-      || isDocumentAgentToolName(item.group.operationKey)
-    const failedCalls = item.group.calls.filter(
-      call => call.isError || call.status === 'error',
-    )
-    // Some restored histories only carry the failure marker on the group.
-    // Treat that group-level state as authoritative when no call-level marker
-    // survived serialization.
-    if (
-      (item.group.isError || item.group.status === 'error')
-      && failedCalls.length === 0
-      && !documentAgentGroup
-    ) {
-      return []
-    }
-    const groupLevelWriterError = documentAgentGroup
-      && (item.group.isError || item.group.status === 'error')
-      && failedCalls.length === 0
-    const calls = item.group.calls.filter(
-      call => (
-        (
-          (!call.isError && call.status !== 'error')
-          || isDocumentAgentToolName(call.name)
-        )
-        && !createdSessionCallIds.value.has(call.toolId)
-      ),
-    ).map(call => groupLevelWriterError
-      ? { ...call, isError: true, status: 'error' as const }
-      : call)
-    if (calls.length === 0) return []
-    const isRunning = calls.some(call => call.isRunning)
-    const isError = calls.some(call => call.isError || call.status === 'error')
-      || (documentAgentGroup && (item.group.isError || item.group.status === 'error'))
-    return [{
-      ...item,
-      group: {
-        ...item.group,
-        calls,
-        isRunning,
-        isError,
-        status: isError
-          ? 'error'
-          : isRunning
-          ? ''
-          : calls.every(call => call.status === 'success')
-            ? 'success'
-            : '',
-      },
-    }]
+    const groupFailure = (item.group.isError || item.group.status === 'error')
+      && !item.group.calls.some(call => call.isError || call.status === 'error')
+    const calls = item.group.calls
+      .filter(call => !createdSessionCallIds.value.has(call.toolId))
+      .map(call => groupFailure ? { ...call, isError: true, status: 'error' as const } : call)
+    if (!calls.length) return []
+    return [{ ...item, group: { ...item.group, calls } }]
   })
 }
 
@@ -931,8 +885,7 @@ const visibleActivityCallKeys = computed(() => new Set(
 ))
 const visibleActivityClusters = computed(() =>
   activityProjection.value.activityClusters.filter(cluster =>
-    (!cluster.isFailure || cluster.calls.some(call => isDocumentAgentToolName(call.name)))
-    && cluster.calls.some(call => visibleActivityCallKeys.value.has(call.renderKey)),
+    cluster.calls.some(call => visibleActivityCallKeys.value.has(call.renderKey)),
   ),
 )
 const visibleActivityStatusSteps = computed(() =>
@@ -979,8 +932,7 @@ const documentWriterFailureCount = computed(() =>
   visibleActivityItems.value.reduce((count, item) => {
     if (item.type !== 'tool-group') return count
     return count + item.group.calls.filter(call =>
-      isDocumentWriterToolName(call.name)
-      && (call.isError || call.status === 'error'),
+      call.isError || call.status === 'error',
     ).length
   }, 0),
 )

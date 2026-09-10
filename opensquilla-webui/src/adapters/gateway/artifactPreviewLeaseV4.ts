@@ -138,6 +138,16 @@ export function parseArtifactPreviewLease(
   if (!launch.ok) {
     throw new ArtifactPreviewLeaseError('Artifact preview returned an invalid origin.', 502)
   }
+  const workingDocumentId = raw.workingDocumentId
+  if (Object.prototype.hasOwnProperty.call(raw, 'workingDocumentId') && (
+    typeof workingDocumentId !== 'string'
+    || !workingDocumentId
+    || workingDocumentId.length > 512
+    || workingDocumentId !== workingDocumentId.trim()
+    || /[\u0000-\u001f\u007f]/.test(workingDocumentId)
+  )) {
+    throw new ArtifactPreviewLeaseError('Artifact preview returned an invalid working document.', 502)
+  }
   return {
     version: 1,
     lease_id: leaseId,
@@ -151,6 +161,7 @@ export function parseArtifactPreviewLease(
       ? Math.max(1, Math.floor(raw.idle_timeout_seconds))
       : 28_800,
     source: parseSource(raw.source),
+    ...(typeof workingDocumentId === 'string' ? { workingDocumentId } : {}),
   }
 }
 

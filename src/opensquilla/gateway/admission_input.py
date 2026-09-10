@@ -6,7 +6,6 @@ from typing import Any, cast
 
 from opensquilla.application.turn_admission import AdmitTurn, InitialRoutingMode, PendingInputGuard
 from opensquilla.application.turn_input import (
-    DocumentTurnContext,
     IncomingTurnSource,
     MemoryCapturePolicy,
 )
@@ -174,33 +173,6 @@ def _capture(params: dict[str, Any]) -> MemoryCapturePolicy:
     return MemoryCapturePolicy(bool(no_capture), provenance)
 
 
-def _document_context(params: dict[str, Any]) -> DocumentTurnContext | None:
-    if (
-        "documentContext" in params
-        and "document_context" in params
-        and params["documentContext"] != params["document_context"]
-    ):
-        raise ValueError("Conflicting documentContext aliases")
-    value = params.get("documentContext", params.get("document_context"))
-    if value is None:
-        return None
-    if not isinstance(value, dict):
-        raise ValueError("params.documentContext must be an object")
-    if not set(value) <= {"documentId", "document_id", "headRevisionId", "head_revision_id"}:
-        raise ValueError("params.documentContext accepts only documentId and headRevisionId")
-    for camel, snake in (("documentId", "document_id"), ("headRevisionId", "head_revision_id")):
-        if camel in value and snake in value and value[camel] != value[snake]:
-            raise ValueError(f"Conflicting {camel} aliases")
-    document = value.get("documentId", value.get("document_id"))
-    head = value.get("headRevisionId", value.get("head_revision_id"))
-    if (
-        not isinstance(document, str)
-        or not document.strip()
-        or not isinstance(head, str)
-        or not head.strip()
-    ):
-        raise ValueError("params.documentContext requires non-empty documentId and headRevisionId")
-    return DocumentTurnContext(document.strip(), head.strip())
 
 
 def decode_admit_turn(
@@ -211,6 +183,7 @@ def decode_admit_turn(
     connection_id: str = "",
     pending_input: PendingInputGuard | None = None,
     fingerprint_params: dict[str, Any] | None = None,
+    allow_receipt_replay: bool = False,
 ) -> AdmitTurn:
     if "message" not in params:
         raise ValueError("params.message is required")
@@ -219,33 +192,47 @@ def decode_admit_turn(
         raise ValueError("message must be a string")
     key = canonicalize_session_key(params["key"])
     source = normalized_source_hint(params)
-    raw_ids = params.get("promptAnnotationIds", params.get("prompt_annotation_ids"))
-    ids: tuple[str, ...] = ()
-    if raw_ids is not None:
-        if not isinstance(raw_ids, list):
-            raise ValueError("params.promptAnnotationIds must be an array")
-        if len(raw_ids) > 16:
-            raise ValueError("params.promptAnnotationIds supports at most 16 items")
-        if any(not isinstance(item, str) or not item.strip() for item in raw_ids):
-            raise ValueError("params.promptAnnotationIds must contain non-empty strings")
-        ids = tuple(item.strip() for item in raw_ids)
-        if len(set(ids)) != len(ids):
-            raise ValueError("params.promptAnnotationIds must contain unique ids")
-    document = _document_context(params)
+    from opensquilla.gateway.page_context import normalize_page_context
+
+    retired_input = any(
+        name in params
+        for name in (
+            "promptAnnotationIds", "prompt_annotation_ids", "documentContext", "document_context"
+        )
+    )
+    if retired_input and not allow_receipt_replay:
+        from opensquilla.gateway.rpc import RpcHandlerError
+
+        raise RpcHandlerError(
+            "DOCUMENT_EDITING_RETIRED",
+            "Update the client and send page annotations as ordinary chat input.",
+            details={"action": "update_client_and_reopen_page"},
+        )
+    page_context = normalize_page_context(params.get("pageContext"))
     attachments = params.get("attachments", [])
     attachments = attachments if isinstance(attachments, list) else []
     # The durable receipt identifies original material, not the shared guarded
     # text shown for every large paste. Application normalization runs later.
     fingerprint = dict(fingerprint_params or params)
-    if raw_ids is not None:
-        fingerprint.pop("prompt_annotation_ids", None)
-        fingerprint["promptAnnotationIds"] = list(ids)
-    if document is not None:
-        fingerprint.pop("document_context", None)
-        fingerprint["documentContext"] = {
-            "documentId": document.document_id,
-            "headRevisionId": document.head_revision_id,
-        }
+    if page_context is not None:
+        fingerprint["pageContext"] = page_context
+    if retired_input:
+        # Keep the identity of receipts accepted before retirement. These
+        # values are hashed only; no editor context enters the turn command.
+        raw_ids = params.get("promptAnnotationIds", params.get("prompt_annotation_ids"))
+        if isinstance(raw_ids, list) and all(isinstance(item, str) for item in raw_ids):
+            fingerprint.pop("prompt_annotation_ids", None)
+            fingerprint["promptAnnotationIds"] = [item.strip() for item in raw_ids]
+        raw_document = params.get("documentContext", params.get("document_context"))
+        if isinstance(raw_document, dict):
+            document_id = raw_document.get("documentId", raw_document.get("document_id"))
+            revision_id = raw_document.get("headRevisionId", raw_document.get("head_revision_id"))
+            if isinstance(document_id, str) and isinstance(revision_id, str):
+                fingerprint.pop("document_context", None)
+                fingerprint["documentContext"] = {
+                    "documentId": document_id.strip(),
+                    "headRevisionId": revision_id.strip(),
+                }
     identity = request_identity(
         params,
         request_session_key=key,
@@ -281,8 +268,8 @@ def decode_admit_turn(
             params, "forkBeforeMessageId", "fork_before_message_id"
         ),
         workspace_id=params.get("workspaceId", params.get("workspace_id")),
-        prompt_annotation_ids=ids,
-        document_context=document,
+        page_context=page_context,
+        receipt_replay_only=retired_input,
         display_text=display if isinstance(display, str) else None,
         queue_mode=params.get("queueMode") or params.get("queue_mode"),
         initial_collaboration_mode=params.get(

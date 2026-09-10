@@ -1,0 +1,158 @@
+{
+  "cases": [
+    {
+      "id": "references-and-annotations",
+      "valid": true,
+      "context": {
+        "targetRef": "surface-synthetic-1",
+        "resourceId": "document:doc-1",
+        "annotations": [
+          {
+            "text": "让标题更醒目。",
+            "selectionText": "示例标题",
+            "locatorHint": "heading"
+          }
+        ]
+      }
+    },
+    {
+      "id": "no-selection",
+      "valid": true,
+      "context": {}
+    },
+    {
+      "id": "nullable-optional-hints",
+      "valid": true,
+      "context": {
+        "targetRef": null,
+        "annotations": [
+          {
+            "text": "  Preserve spacing.  ",
+            "selectionText": null
+          }
+        ]
+      }
+    },
+    {
+      "id": "unknown-source-authority",
+      "valid": false,
+      "context": {
+        "workingFile": "synthetic.html"
+      }
+    },
+    {
+      "id": "old-proof-authority",
+      "valid": false,
+      "context": {
+        "elementProofSha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      }
+    },
+    {
+      "id": "old-screenshot-authority",
+      "valid": false,
+      "context": {
+        "screenshotRef": "shot-1"
+      }
+    },
+    {
+      "id": "blank-reference",
+      "valid": false,
+      "context": {
+        "targetRef": "  "
+      }
+    },
+    {
+      "id": "missing-annotation-text",
+      "valid": false,
+      "context": {
+        "annotations": [
+          {
+            "selectionText": "heading"
+          }
+        ]
+      }
+    },
+    {
+      "id": "blank-annotation-text",
+      "valid": false,
+      "context": {
+        "annotations": [
+          {
+            "text": " \n\t"
+          }
+        ]
+      }
+    },
+    {
+      "id": "unknown-annotation-field",
+      "valid": false,
+      "context": {
+        "annotations": [
+          {
+            "text": "Edit heading",
+            "sourceStart": 0
+          }
+        ]
+      }
+    },
+    {
+      "id": "too-many-annotations",
+      "valid": false,
+      "context": {
+        "annotations": [
+          {
+            "text": "Edit heading"
+          },
+          {
+            "text": "Edit heading"
+          },
+          {
+            "text": "Edit heading"
+          },
+          {
+            "text": "Edit heading"
+          },
+          {
+            "text": "Edit heading"
+          },
+          {
+            "text": "Edit heading"
+          },
+          {
+            "text": "Edit heading"
+          },
+          {
+            "text": "Edit heading"
+          },
+          {
+            "text": "Edit heading"
+          },
+          {
+            "text": "Edit heading"
+          },
+          {
+            "text": "Edit heading"
+          },
+          {
+            "text": "Edit heading"
+          },
+          {
+            "text": "Edit heading"
+          },
+          {
+            "text": "Edit heading"
+          },
+          {
+            "text": "Edit heading"
+          },
+          {
+            "text": "Edit heading"
+          },
+          {
+            "text": "Edit heading"
+          }
+        ]
+      }
+    }
+  ]
+}

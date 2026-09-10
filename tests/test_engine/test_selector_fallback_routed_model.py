@@ -1659,16 +1659,16 @@ async def test_unknown_primary_capability_defers_to_provider_image_validation() 
 def _fallback_tool_definitions() -> list[ToolDefinition]:
     return [
         ToolDefinition(
-            name="document_apply",
-            description="Apply a document mutation.",
+            name="write_file",
+            description="Write a file.",
             input_schema=ToolInputSchema(
                 properties={"html": {"type": "string"}},
                 required=["html"],
             ),
         ),
         ToolDefinition(
-            name="document_patch",
-            description="Patch a document mutation.",
+            name="apply_patch",
+            description="Apply a file patch.",
             input_schema=ToolInputSchema(
                 properties={"patch": {"type": "string"}},
                 required=["patch"],

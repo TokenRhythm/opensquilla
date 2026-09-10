@@ -61,7 +61,6 @@ if TYPE_CHECKING:
 # to preflight; keeping a local copy avoids a runtime → stage import.
 _T3_NOT_APPLICABLE: str = "not_applicable"
 _T3_FLUSH_FAILED: str = "flush_failed"
-_RESTRICTED_TURN_SKIPPED: str = "restricted_turn_skipped"
 
 # ---------------------------------------------------------------------------
 # Ports — four narrow Protocols
@@ -170,7 +169,6 @@ class HistoryLoaderPort(Protocol):
         session_key: str,
         trim_last_user: bool,
         bound_user_message_id: str | None = None,
-        restricted_turn: bool = False,
         transcript_snapshot: TurnTranscriptSnapshot[Any] | None = None,
         expected_session_id: str | None = None,
         expected_session_epoch: int | None = None,
@@ -247,7 +245,6 @@ class CompactionAndHistoryStageInput:
     # load canonical history for the primary provider projection, but may not
     # invoke T3/preflight compaction or replay durable summaries because those
     # paths can make auxiliary provider calls over unprojected history.
-    restricted_turn: bool = False
     # An upstream terminal preflight may suppress auxiliary compaction while
     # retaining the ordinary history-loading path.
     skip_compaction: bool = False
@@ -261,7 +258,6 @@ class CompactionAndHistoryStageOutput:
     """The pieces of state subsequent stages and the harness consume.
 
     - ``t3_upgrade_status``: one of the ``_T3_*`` sentinels,
-      ``"restricted_turn_skipped"`` at the restricted authority boundary, or
       ``"skipped"`` when an upstream terminal preflight suppresses compaction.
       Surfaced for observability + the equivalence harness snapshot;
       NOT consumed by downstream stages. It is used only
@@ -302,10 +298,6 @@ class CompactionAndHistoryStage:
        ``_T3_NOT_APPLICABLE`` or ``_T3_FLUSH_FAILED``).
     3. ``history_loader.load`` (always called).
     4. ``request_context_prepender.prepend`` (always called; pure).
-
-    Restricted turns skip steps 1 and 2 and suppress any previously durable
-    summary/context-state replay while still loading raw transcript history
-    for the Agent's restricted provider projection.
 
     The stage fires ``CompactionHook.before_compact`` and
     ``CompactionHook.after_compact`` around BOTH t3 and preflight calls.
@@ -352,13 +344,8 @@ class CompactionAndHistoryStage:
         )
         compaction_model = inp.compaction_model or inp.resolved_model
 
-        # Restricted PromptAnnotation turns cannot expose canonical transcript
-        # bytes to any auxiliary compactor. The main Agent still loads the
-        # transcript below and applies its provider-only history projection.
         preflight_invoked = False
-        if inp.restricted_turn:
-            t3_status = _RESTRICTED_TURN_SKIPPED
-        elif inp.skip_compaction:
+        if inp.skip_compaction:
             t3_status = "skipped"
         else:
             # 1. T3-upgrade compaction. Hook fires around the call so even a
@@ -436,21 +423,12 @@ class CompactionAndHistoryStage:
         if inp.expected_session_id is not None or inp.expected_session_epoch is not None:
             history_kwargs["expected_session_id"] = inp.expected_session_id
             history_kwargs["expected_session_epoch"] = inp.expected_session_epoch
-        loaded_compaction_summary_context = await self._history_loader.load(
+        compaction_summary_context = await self._history_loader.load(
             agent=inp.agent,
             session_key=inp.session_key,
             trim_last_user=inp.history_has_persisted_user,
             bound_user_message_id=inp.bound_user_message_id,
-            restricted_turn=inp.restricted_turn,
             **history_kwargs,
-        )
-        # A durable summary predates the restricted request projection and may
-        # contain historical tool arguments or workspace paths. Keep it out of
-        # this provider view without mutating persisted summary/transcript rows.
-        compaction_summary_context = (
-            None
-            if inp.restricted_turn
-            else loaded_compaction_summary_context
         )
 
         # 4. Prepend compaction summary context to request_context_prompt (pure).

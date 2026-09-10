@@ -475,7 +475,7 @@ def test_stream_malformed_tool_arguments_emit_start_before_terminal_error(
                     {
                         "id": "call_edit",
                         "function": {
-                            "name": "document_apply",
+                            "name": "write_file",
                             "arguments": [],
                         },
                     }
@@ -500,7 +500,7 @@ def test_stream_malformed_tool_arguments_emit_start_before_terminal_error(
     ]
     assert isinstance(lifecycle[0], ToolUseStartEvent)
     assert lifecycle[0].tool_use_id == "call_edit"
-    assert lifecycle[0].tool_name == "document_apply"
+    assert lifecycle[0].tool_name == "write_file"
     assert isinstance(lifecycle[1], ErrorEvent)
     assert lifecycle[1].code == "incomplete_tool_call"
     assert not any(isinstance(event, ToolUseDeltaEvent | ToolUseEndEvent) for event in events)

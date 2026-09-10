@@ -7,11 +7,6 @@ import asyncio
 import pytest
 
 from opensquilla.application import admission_failures as domain
-from opensquilla.artifact_session import (
-    ArtifactConflictError,
-    ArtifactNotFoundError,
-    ArtifactValidationError,
-)
 from opensquilla.gateway.adapters.turn_admission import map_admission_error
 from opensquilla.gateway.admission_failures import admission_failure, translate_admission_failure
 from opensquilla.gateway.rpc import RpcHandlerError
@@ -37,9 +32,6 @@ from opensquilla.session.storage import (
         (TaskCollectionUnavailableError("started"), domain.AdmissionTaskCollectionUnavailableError),
         (PlanConflictError("plan"), domain.AdmissionPlanConflictError),
         (PlanRunConflictError("run"), domain.AdmissionPlanConflictError),
-        (ArtifactConflictError("revision"), domain.AdmissionAnnotationConflictError),
-        (ArtifactNotFoundError("annotation"), domain.AdmissionAnnotationNotFoundError),
-        (ArtifactValidationError("invalid"), domain.AdmissionAnnotationValidationError),
     ],
 )
 async def test_native_failure_is_projected_before_application_compensation(native, projected_type):

@@ -105,7 +105,7 @@ _TOOLS_BY_CATEGORY: dict[ToolPresentationCategory, frozenset[str]] = {
         }
     ),
     "generic": frozenset(
-        {"cron", "document_browser_reload", "retrieve_tool_result"}
+        {"browser", "cron", "document_browser_reload", "retrieve_tool_result"}
     ),
 }
 
@@ -117,6 +117,7 @@ _TOOL_CATEGORY: dict[str, ToolPresentationCategory] = {
 
 _PRIMARY_ARGUMENT_EXCEPTIONS: dict[str, tuple[str, ...]] = {
     "apply_patch": ("path", "patch"),
+    "browser": ("operation", "targetRef", "action", "ref"),
     "canvas": ("action", "node_id"),
     "create_csv": ("name",),
     "create_pdf_report": ("name", "title"),

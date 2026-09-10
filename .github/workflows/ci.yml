@@ -874,6 +874,7 @@ jobs:
           node scripts/test-desktop-renderer-log.mjs
           node scripts/test-artifact-preview-lease-broker.mjs
           node scripts/test-native-workbench-surface.mjs
+          npm run test:live-html-harness
           node scripts/test-onboarding-flow-coordinator.mjs
           node scripts/test-onboarding-save-telemetry.mjs
           node scripts/test-ci-case-telemetry.mjs
@@ -1490,6 +1491,17 @@ jobs:
             --grep "terminates stalled" \
             2>&1 | tee "${CI_REPORT_DIR}/session-hang-recovery.log"
 
+      - name: Install Desktop workbench browser
+        if: ${{ matrix.shard == 'all' || matrix.shard == 'ownership-workbench' || matrix.shard == 'workbench' }}
+        working-directory: desktop/electron
+        shell: bash
+        run: |
+          if [[ "${RUNNER_OS}" == "Linux" ]]; then
+            npx playwright install --with-deps chromium
+          else
+            npx playwright install chromium
+          fi
+
       - name: Seed Playwright browser cache from nightly main
         if: ${{ github.event_name == 'schedule' && (runner.os == 'Windows' || runner.os == 'macOS') && matrix.shard == 'profiles' && steps.playwright-cache.outputs.cache-hit != 'true' }}
         uses: actions/cache/save@v4
@@ -1537,6 +1549,11 @@ jobs:
               --output "${telemetry_path}"
               --
             )
+            if [[ "${name}" == "native-workbench-v2" ]]; then
+              export OPENSQUILLA_REQUIRE_ELECTRON_FOREGROUND=1
+            else
+              unset OPENSQUILLA_REQUIRE_ELECTRON_FOREGROUND
+            fi
             if [[ "${RUNNER_OS}" == "Linux" ]]; then
               "${telemetry[@]}" xvfb-run -a node "${script}" 2>&1 | tee "${log_path}"
             else
@@ -1587,7 +1604,7 @@ jobs:
               {
                   "id": "windows-isolated-acl-worker-timeout-v1",
                   "os": "Windows",
-                  "cases": {"offline-document-workbench-e2e"},
+                  "cases": {"native-workbench-v2"},
                   "pattern": re.compile(
                       r"^(?:(?:E\s+)|(?:FAILED\s+\S+\s+-\s+))?"
                       r"AssertionError: isolated Windows ACL hardening timed out: .+$",
@@ -1608,7 +1625,7 @@ jobs:
               {
                   "id": "windows-loopback-no-buffer-space-v1",
                   "os": "Windows",
-                  "cases": {"offline-document-workbench-e2e"},
+                  "cases": {"native-workbench-v2"},
                   "pattern": re.compile(
                       r"^electronApplication\.evaluate: Error: "
                       r"ERR_NO_BUFFER_SPACE \(-176\) loading "
@@ -1630,13 +1647,13 @@ jobs:
               {
                   "id": "macos-electron-foreground-prerequisite-v1",
                   "os": "macOS",
-                  "cases": {"offline-document-workbench-e2e"},
+                  "cases": {"native-workbench-v2"},
                   "pattern": re.compile(
                       r"^(?:(?:Error: )?electronApplication\.evaluate: Error: |Error: )"
                       r"ELECTRON_FOREGROUND_PREREQUISITE_MISSING: .+$",
                       re.MULTILINE,
                   ),
-                  # The outer offline-workbench runner reports the native
+                  # Historical runner logs can include the native
                   # subprocess exit after streaming the structured inner
                   # exception.  It is part of that same exception stack, not
                   # a second failure, and is bound to the exact child script.
@@ -1765,7 +1782,10 @@ jobs:
                 'theme-flow:scripts/test-desktop-theme-flow.mjs'
                 'native-workbench-surface:scripts/test-native-workbench-surface-electron.mjs'
                 'desktop-zoom-shortcuts:scripts/test-desktop-zoom-shortcuts.mjs'
-                'offline-document-workbench-e2e:scripts/test-offline-document-workbench-e2e.mjs'
+                'native-workbench-v2:scripts/test-native-workbench-v2-electron.mjs'
+                'desktop-browser:scripts/test-desktop-browser.mjs'
+                'desktop-browser-electron:scripts/test-desktop-browser-electron.mjs'
+                'live-html-business:scripts/test-live-html-business.mjs'
                 'unsafe-legacy-recovery-no-write:scripts/test-unsafe-legacy-recovery-no-write.mjs'
               )
               if [[ "${RUNNER_OS}" == "macOS" ]]; then
@@ -1799,7 +1819,10 @@ jobs:
                 'theme-flow:scripts/test-desktop-theme-flow.mjs'
                 'native-workbench-surface:scripts/test-native-workbench-surface-electron.mjs'
                 'desktop-zoom-shortcuts:scripts/test-desktop-zoom-shortcuts.mjs'
-                'offline-document-workbench-e2e:scripts/test-offline-document-workbench-e2e.mjs'
+                'native-workbench-v2:scripts/test-native-workbench-v2-electron.mjs'
+                'desktop-browser:scripts/test-desktop-browser.mjs'
+                'desktop-browser-electron:scripts/test-desktop-browser-electron.mjs'
+                'live-html-business:scripts/test-live-html-business.mjs'
                 'unsafe-legacy-recovery-no-write:scripts/test-unsafe-legacy-recovery-no-write.mjs'
               )
               ;;
@@ -1807,7 +1830,10 @@ jobs:
               entries=(
                 'native-workbench-surface:scripts/test-native-workbench-surface-electron.mjs'
                 'desktop-zoom-shortcuts:scripts/test-desktop-zoom-shortcuts.mjs'
-                'offline-document-workbench-e2e:scripts/test-offline-document-workbench-e2e.mjs'
+                'native-workbench-v2:scripts/test-native-workbench-v2-electron.mjs'
+                'desktop-browser:scripts/test-desktop-browser.mjs'
+                'desktop-browser-electron:scripts/test-desktop-browser-electron.mjs'
+                'live-html-business:scripts/test-live-html-business.mjs'
                 'unsafe-legacy-recovery-no-write:scripts/test-unsafe-legacy-recovery-no-write.mjs'
               )
               ;;

@@ -52,7 +52,7 @@ const C = candidate('0.5.6')
 const bytes = Buffer.from('Synthetic cached Windows installer, never executed.')
 const digest = createHash('sha256').update(bytes).digest('hex')
 const descriptorB = createWindowsUpdateCacheDescriptor(B, digest, bytes.length)
-const root = await mkdtemp(join(tmpdir(), 'opensquilla-update-refresh-'))
+const root = await realpath(await mkdtemp(join(tmpdir(), 'opensquilla-update-refresh-')))
 let sequence = 0
 let passed = 0
 

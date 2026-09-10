@@ -23,7 +23,6 @@ import type {
   ArtifactDocumentWorkspace,
   ArtifactEditCapabilities,
   ArtifactEditCapabilitiesResponse,
-  ArtifactEditSession,
   ArtifactRevision,
   ArtifactRevisionsListResponse,
   ArtifactSourceSnapshot,
@@ -50,11 +49,7 @@ export const ARTIFACT_DOCUMENT_RPC_METHODS = {
   changesGet: artifactDocumentContracts.changesGet.method,
   changesRevert: artifactDocumentContracts.changesRevert.method,
   sourceRead: artifactDocumentContracts.sourceRead.method,
-  sourcePatch: artifactDocumentContracts.sourcePatch.method,
   mutationResolve: artifactDocumentContracts.mutationResolve.method,
-  editSessionStart: artifactDocumentContracts.editSessionStart.method,
-  editSessionHeartbeat: artifactDocumentContracts.editSessionHeartbeat.method,
-  editSessionClose: artifactDocumentContracts.editSessionClose.method,
   legacyGet: artifactDocumentContracts.legacyGet.method,
 } as const
 
@@ -82,7 +77,6 @@ import {
   normalizeArtifactChangeSet,
   normalizeArtifactDocument,
   normalizeArtifactEditCapabilities,
-  normalizeArtifactEditSession,
   normalizeArtifactRevision,
   numberAt,
   objectValue,
@@ -372,7 +366,6 @@ export function createRpcArtifactDocumentProvider(
           await capabilities(signal),
           typeof request.sessionKey === 'string' ? request.sessionKey : '',
         ),
-        editSession: normalizeArtifactEditSession(response?.editSession),
       }
     },
     closeDocument: (request, signal) => responseDocument(
@@ -397,19 +390,6 @@ export function createRpcArtifactDocumentProvider(
     ),
     async readSource(request, signal) {
       return sourceResponse(ARTIFACT_DOCUMENT_RPC_METHODS.sourceRead, request, signal)
-    },
-    async patchSource(request, signal) {
-      const response = await optionalCall<Record<string, unknown>>(
-        ARTIFACT_DOCUMENT_RPC_METHODS.sourcePatch,
-        { ...request },
-        signal,
-      )
-      const source = normalizeSourceSnapshot(response?.source)
-      if (!source) return null
-      return {
-        ...source,
-        editSession: normalizeArtifactEditSession(response?.editSession),
-      }
     },
     async resolveMutation(request, signal) {
       const response = await optionalCall<Record<string, unknown>>(
@@ -447,43 +427,6 @@ export function createRpcArtifactDocumentProvider(
         ...(revision ? { revision } : {}),
       }
     },
-    async startEditSession(request, signal) {
-      return editSessionResponse(
-        ARTIFACT_DOCUMENT_RPC_METHODS.editSessionStart,
-        { ...request },
-        signal,
-      )
-    },
-    async heartbeatEditSession(request, signal) {
-      return editSessionResponse(
-        ARTIFACT_DOCUMENT_RPC_METHODS.editSessionHeartbeat,
-        { ...request },
-        signal,
-      )
-    },
-    async closeEditSession(request, signal) {
-      return editSessionResponse(
-        ARTIFACT_DOCUMENT_RPC_METHODS.editSessionClose,
-        { ...request },
-        signal,
-      )
-    },
-  }
-
-  async function editSessionResponse(
-    method: string,
-    request: Readonly<Record<string, unknown>>,
-    signal?: AbortSignal,
-  ): Promise<ArtifactEditSession | null> {
-    const response = await optionalCall<Record<string, unknown>>(
-      method,
-      { ...request },
-      signal,
-    )
-    if (!response) return null
-    const editSession = normalizeArtifactEditSession(response.editSession)
-    if (!editSession) throw new Error('Invalid artifact EditSession response')
-    return editSession
   }
 
   async function sourceResponse(

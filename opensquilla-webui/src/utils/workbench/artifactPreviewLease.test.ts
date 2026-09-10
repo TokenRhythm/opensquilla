@@ -301,3 +301,18 @@ describe('artifact preview lease client', () => {
     }, 'https://control.example')).toThrow(ArtifactPreviewLeaseError)
   })
 })
+
+
+describe('working document lease identity', () => {
+  it('preserves the server identity and accepts older leases without it', () => {
+    expect(parseArtifactPreviewLease({ ...lease, workingDocumentId: 'document-fixture' }).workingDocumentId)
+      .toBe('document-fixture')
+    expect(parseArtifactPreviewLease(lease)).not.toHaveProperty('workingDocumentId')
+  })
+  it.each([null, 4, '', ' document-fixture', 'document-fixture\n', 'x'.repeat(513)])(
+    'rejects a malformed working document marker: %j', value => {
+      expect(() => parseArtifactPreviewLease({ ...lease, workingDocumentId: value }))
+        .toThrow('invalid working document')
+    },
+  )
+})
