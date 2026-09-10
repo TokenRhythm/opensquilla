@@ -46,7 +46,7 @@ async function stage(name) {
 }
 async function preserved(stageName) {
   await assertPreservedInputs(plan)
-  const args = [join(repository, '.github/scripts/verify-release-profile-preservation.py'), 'verify-runtime', '--home', plan.profile, '--label', plan.seedLabel]
+  const args = [join(repository, '.github/scripts/verify-release-profile-preservation.py'), 'verify-signed-retained', '--home', plan.profile, '--label', plan.seedLabel]
   if (plan.externalSentinelsDir) args.push('--external-root', plan.externalSentinelsDir)
   const pythonIndex = process.argv.indexOf('--python')
   const python = pythonIndex < 0 ? 'python' : process.argv[pythonIndex + 1]

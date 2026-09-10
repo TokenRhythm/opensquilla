@@ -508,7 +508,9 @@ def verify_profile(
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
-    parser.add_argument("operation", choices=("seed", "verify", "verify-runtime"))
+    parser.add_argument(
+        "operation", choices=("seed", "verify", "verify-runtime", "verify-signed-retained")
+    )
     parser.add_argument("--home", type=Path, required=True)
     parser.add_argument("--label", type=_validated_label, required=True)
     parser.add_argument("--external-root", type=Path)
@@ -523,6 +525,15 @@ def main() -> int:
             print(f"profile preservation fixture seeded: {args.home}")
         else:
             runtime_migrated = args.operation == "verify-runtime"
+            if args.operation == "verify-signed-retained":
+                # A signed current-runtime upgrade may leave the original
+                # config untouched. Accept only that exact seed or the exact
+                # known migration; every other preservation assertion remains
+                # identical. Legacy verify/verify-runtime keep their semantics.
+                home = args.home.resolve()
+                runtime_migrated = (home / "config.toml").read_text(encoding="utf-8") != (
+                    _config_text(home, args.label)
+                )
             verify_profile(
                 args.home,
                 args.label,

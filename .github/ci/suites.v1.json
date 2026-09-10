@@ -115,6 +115,8 @@
         "desktop/electron/scripts/fixtures/windows-update-electron/**",
         "desktop/electron/scripts/test-packaged-retained-interaction*.mjs",
         "desktop/electron/scripts/fixtures/packaged-retained-interaction/**",
+        "desktop/electron/scripts/test-packaged-cached-handoff-contract.mjs",
+        "desktop/electron/scripts/fixtures/packaged-cached-handoff/**",
         "desktop/electron/src/windows-update-*.ts"
       ]
     },
@@ -216,6 +218,9 @@
     },
     "desktop-recovery-e2e": {
       "execution_inputs": [
+        ".github/scripts/verify-windows-native-write-view.mjs",
+        ".github/scripts/native-audit-write-view.py",
+        "tests/test_ci/test_windows_signed_update_audit.py",
         "desktop/electron/**",
         "opensquilla-webui/**",
         "src/opensquilla/gateway/**",
@@ -247,6 +252,8 @@
         "desktop/electron/scripts/test-packaged-real-update-flow.mjs",
         "desktop/electron/scripts/test-packaged-retained-interaction*.mjs",
         "desktop/electron/scripts/fixtures/packaged-retained-interaction/**",
+        "desktop/electron/scripts/test-packaged-cached-handoff-contract.mjs",
+        "desktop/electron/scripts/fixtures/packaged-cached-handoff/**",
         "migrations/**",
         "pyproject.toml",
         "scripts/**",
@@ -286,6 +293,8 @@
         ".github/scripts/release_signing_preflight.py",
         ".github/scripts/verify-release-*",
         ".github/scripts/verify-windows-signatures.ps1",
+        ".github/scripts/verify-windows-native-write-view.mjs",
+        ".github/scripts/native-audit-write-view.py",
         ".github/scripts/verify_desktop_slim_size.py",
         ".github/signing/**",
         ".github/workflows/desktop-fault-injection.yml",
@@ -304,6 +313,8 @@
         "desktop/electron/scripts/test-packaged-real-update-flow.mjs",
         "desktop/electron/scripts/test-packaged-retained-interaction*.mjs",
         "desktop/electron/scripts/fixtures/packaged-retained-interaction/**",
+        "desktop/electron/scripts/test-packaged-cached-handoff-contract.mjs",
+        "desktop/electron/scripts/fixtures/packaged-cached-handoff/**",
         "install.*",
         "pyproject.toml",
         "scripts/build_wheelhouse_zip.py",

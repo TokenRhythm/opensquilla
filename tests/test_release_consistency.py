@@ -297,6 +297,42 @@ def test_release_profile_config_diagnostics_omit_values(
     assert parsed["actual_text_sha256"] != parsed["expected_text_sha256"]
 
 
+@pytest.mark.parametrize(
+    "variant", ["seed", "migrated", "partial-migration", "comment", "identity", "external"]
+)
+def test_signed_retained_preservation_accepts_only_exact_seed_or_migration(
+    tmp_path: Path, variant: str
+) -> None:
+    probe_path = Path(".github/scripts/verify-release-profile-preservation.py")
+    probe = runpy.run_path(str(probe_path))
+    home = tmp_path / "profile"
+    external = tmp_path / "external"
+    label = "signed-retained-contract"
+    probe["seed_profile"](home, label, external_root=external)
+    config = home / "config.toml"
+    if variant == "migrated":
+        config.write_text(probe["_runtime_config_text"](home), encoding="utf-8")
+    elif variant == "partial-migration":
+        config.write_text("config_version = 1\n" + config.read_text(), encoding="utf-8")
+    elif variant == "comment":
+        config.write_text(config.read_text() + "\n# unexpected edit\n", encoding="utf-8")
+    elif variant == "identity":
+        (home / "workspace" / "IDENTITY.md").write_text("changed", encoding="utf-8")
+    elif variant == "external":
+        (external / "git" / "git-sentinel.bin").write_bytes(b"changed")
+    argv = [
+        sys.executable, str(probe_path), "verify-signed-retained",
+        "--home", str(home), "--label", label, "--external-root", str(external),
+    ]
+    result = subprocess.run(argv, capture_output=True, text=True, check=False)
+    assert result.returncode == (0 if variant in {"seed", "migrated"} else 1), result.stderr
+    if variant in {"seed", "migrated"}:
+        # The new operation must not broaden either original installer check.
+        argv[2] = "verify-runtime" if variant == "seed" else "verify"
+        legacy = subprocess.run(argv, capture_output=True, text=True, check=False)
+        assert legacy.returncode == 1
+
+
 def test_release_profile_preservation_probe_covers_identity_config_and_chat_db(
     tmp_path: Path,
 ) -> None:

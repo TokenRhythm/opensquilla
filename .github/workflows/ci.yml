@@ -854,6 +854,7 @@ jobs:
           node scripts/test-windows-update-refresh.mjs
           node scripts/test-windows-update-network.mjs
           node scripts/test-packaged-retained-interaction-contract.mjs
+          node scripts/test-packaged-cached-handoff-contract.mjs
           node scripts/test-desktop-locale.mjs
           node scripts/test-desktop-zoom-shortcuts.mjs --contracts-only
           node scripts/test-desktop-profile-substrate.mjs
@@ -1823,6 +1824,7 @@ jobs:
               'windows-update-handoff:scripts/test-windows-update-handoff.mjs'
               'windows-update-network:scripts/test-windows-update-network.mjs'
               'packaged-retained-interaction-contract:scripts/test-packaged-retained-interaction-contract.mjs'
+              'packaged-cached-handoff-contract:scripts/test-packaged-cached-handoff-contract.mjs'
               'windows-update-electron:scripts/test-windows-update-electron.mjs'
             )
           fi
@@ -1849,6 +1851,17 @@ jobs:
           done
           printf 'e2e_status=passed\n' >> "${CI_REPORT_DIR}/first-failure.txt"
 
+      - name: Test native Windows audit write-view contracts
+        if: ${{ runner.os == 'Windows' && matrix.shard == 'ownership' }}
+        shell: bash
+        run: |
+          # Pure contracts create their own temporary roots; never run the
+          # native helper against the runner's real Roaming profile.
+          command -v node
+          command -v pwsh
+          uv run pytest tests/test_ci/test_windows_signed_update_audit.py -q \
+            --junitxml="${CI_REPORT_DIR}/native-write-view-contracts.xml"
+
       - name: Upload Desktop recovery summary
         if: ${{ success() }}
         uses: actions/upload-artifact@v4
@@ -1858,6 +1871,7 @@ jobs:
             ${{ runner.temp }}/desktop-recovery-e2e/environment.txt
             ${{ runner.temp }}/desktop-recovery-e2e/first-failure.txt
             ${{ runner.temp }}/desktop-recovery-e2e/desktop-e2e-cases.jsonl
+            ${{ runner.temp }}/desktop-recovery-e2e/native-write-view-contracts.xml
             ${{ runner.temp }}/desktop-recovery-e2e/retry-classifications.jsonl
             ${{ runner.temp }}/desktop-recovery-e2e/retry-evidence
             ${{ runner.temp }}/desktop-recovery-e2e/windows-update-electron

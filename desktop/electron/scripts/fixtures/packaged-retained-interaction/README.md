@@ -30,10 +30,13 @@ fails the run. Evidence must use a new directory separate from both the install
 and profile directories. Redirected input paths and any running OpenSquilla
 instance are rejected.
 
-The probe invokes the unchanged Python `verify-runtime` preservation checker
-before launch, between restarts, and after the final Quit, including
-`--external-root` when supplied. Its exact 320-message old-session assertions
-remain in force. Real rendered UI navigation also visits the two seeded
+The probe invokes Python `verify-signed-retained` before launch, between
+restarts, and after the final Quit, including `--external-root` when supplied.
+It accepts only the exact original seed config or the exact known migrated
+config; the independent credential/config hashes must remain unchanged during
+the interaction probe. Legacy `verify` and `verify-runtime` keep their existing
+semantics. All exact 320-message old-session assertions remain in force.
+Real rendered UI navigation also visits the two seeded
 sessions, then creates an independent new session for these actions:
 
 1. A first message receives an answer from the loopback synthetic provider.

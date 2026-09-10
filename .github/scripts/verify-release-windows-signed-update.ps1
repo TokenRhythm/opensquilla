@@ -12,6 +12,8 @@ param(
   [string]$ChannelManifest,
   [ValidateSet('cim-trace', 'standard-user-polling')]
   [string]$ProcessObservationMode = 'cim-trace',
+  [ValidateSet('download', 'verified-cache')]
+  [string]$HandoffInputMode = 'download',
   [ValidateRange(30, 1800)][int]$InstallTimeoutSeconds = 600
 )
 
@@ -19,6 +21,98 @@ $ErrorActionPreference = 'Stop'
 
 function Test-SignedAuditVersion([string]$Actual, [string]$Expected) {
   return $Actual -ceq $Expected -or $Actual -ceq "$Expected.0"
+}
+
+function Get-SignedAuditLauncherPackageStatus {
+  if (-not ('OpenSquillaSignedAudit.PackageIdentity' -as [type])) {
+    Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+namespace OpenSquillaSignedAudit {
+  public static class PackageIdentity {
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, ExactSpelling = true)]
+    public static extern int GetCurrentPackageFullName(ref uint length, IntPtr name);
+  }
+}
+'@
+  }
+  [uint32]$length = 0
+  return [OpenSquillaSignedAudit.PackageIdentity]::GetCurrentPackageFullName([ref]$length, [IntPtr]::Zero)
+}
+
+function Get-SignedAuditNodeExecutable {
+  return (Get-Command node -CommandType Application -ErrorAction Stop | Select-Object -First 1).Source
+}
+
+function Get-SignedAuditPythonExecutable {
+  return (Get-Command python -CommandType Application -ErrorAction Stop | Select-Object -First 1).Source
+}
+
+function Get-SignedAuditRoamingRoot {
+  return [Environment]::GetFolderPath('ApplicationData')
+}
+
+function Get-SignedAuditNativeUserData([string]$RoamingRoot) {
+  if (-not $RoamingRoot -or -not [IO.Path]::IsPathRooted($RoamingRoot)) {
+    throw 'The native Roaming root must be absolute.'
+  }
+  # Electron uses the packaged package.json name, not NSIS productName.
+  # Keep this identity bound to desktop/electron/package.json by a contract test.
+  return [IO.Path]::GetFullPath((Join-Path $RoamingRoot '@opensquilla/desktop-electron'))
+}
+
+function Invoke-SignedAuditWriteViewPreflight {
+  param([string]$RoamingRoot, [string]$NodeExecutable, [string]$PythonExecutable)
+  $roamingParent = $RoamingRoot
+  $probe = Join-Path $PSScriptRoot 'verify-windows-native-write-view.mjs'
+  $output = & $NodeExecutable $probe $roamingParent $PythonExecutable
+  $exitCode = $LASTEXITCODE
+  $result = ($output -join "`n") | ConvertFrom-Json
+  if ($exitCode -ne 0 -or $result.nativeWriteViewVerified -isnot [bool] -or
+      $result.nativeWriteViewVerified -ne $true -or @($result.cleanup).Count -ne 2 -or
+      @($result.cleanup | Where-Object { $_.removed -isnot [bool] -or $_.removed -ne $true }).Count -ne 0 -or
+      @($result.retainedPaths).Count -ne 0) {
+    $details = $result | ConvertTo-Json -Depth 8 -Compress
+    throw "Native Node/Python write-view preflight failed before profile creation. Use an ordinary desktop shell. Retained probe paths, if any, need review: $details"
+  }
+  return $result
+}
+
+function Assert-SignedAuditNativeLauncher {
+  param([string]$NativeUserDataDir, [string]$NodeExecutable)
+  $packageStatus = Get-SignedAuditLauncherPackageStatus
+  # Only APPMODEL_ERROR_NO_PACKAGE admits an unpackaged launcher. In particular,
+  # ERROR_INSUFFICIENT_BUFFER (122) means this process has a package identity.
+  if ($packageStatus -ne 15700) {
+    throw "Use an unpackaged ordinary desktop PowerShell shell, outside Codex/MSIX. GetCurrentPackageFullName returned $packageStatus; expected APPMODEL_ERROR_NO_PACKAGE (15700). No audit profile was created."
+  }
+  $probe = @'
+const { lstatSync, realpathSync } = require('node:fs');
+const { dirname, isAbsolute, resolve } = require('node:path');
+const input = process.argv[1];
+if (!input || !isAbsolute(input)) throw new Error('Native profile path must be absolute.');
+const nativeUserDataDir = resolve(input);
+const roamingParent = dirname(nativeUserDataDir);
+const info = lstatSync(roamingParent);
+const canonicalRoamingParent = realpathSync(roamingParent);
+const samePath = (a, b) => process.platform === 'win32' ? a.toLowerCase() === b.toLowerCase() : a === b;
+if (!info.isDirectory() || info.isSymbolicLink() || !samePath(canonicalRoamingParent, roamingParent)) {
+  throw new Error('Native Roaming parent is redirected. Use an unpackaged ordinary desktop shell; no audit profile was created.');
+}
+try {
+  lstatSync(nativeUserDataDir);
+  throw new Error('The native OpenSquilla profile already exists; use a fresh disposable account.');
+} catch (error) {
+  if (error.code !== 'ENOENT') throw error;
+}
+process.stdout.write(JSON.stringify({ nativeUserDataDir, roamingParent, canonicalRoamingParent, profileAbsent: true }));
+'@
+  $output = & $NodeExecutable -e $probe $NativeUserDataDir
+  if ($LASTEXITCODE -ne 0) {
+    throw "Native Roaming path preflight failed in the audit Node executable (exit $LASTEXITCODE). Use an unpackaged ordinary desktop shell; no audit profile was created."
+  }
+  $paths = ($output -join "`n") | ConvertFrom-Json
+  return [ordered]@{ packageIdentityStatus = $packageStatus; nodeExecutable = $NodeExecutable; paths = $paths }
 }
 
 function Get-SignedAuditPlan {
@@ -54,7 +148,7 @@ function Get-SignedAuditPlan {
   $userData = [IO.Path]::GetFullPath($UserDataDir).TrimEnd([IO.Path]::DirectorySeparatorChar)
   $nativeUserData = [IO.Path]::GetFullPath($NativeUserDataDir).TrimEnd([IO.Path]::DirectorySeparatorChar)
   if (-not $userData.Equals($nativeUserData, [StringComparison]::OrdinalIgnoreCase)) {
-    throw 'Use the disposable account native AppData/OpenSquilla directory; NSIS does not inherit --user-data-dir.'
+    throw 'Use the disposable account native AppData/Roaming/@opensquilla/desktop-electron directory; NSIS does not inherit --user-data-dir.'
   }
   if (Test-Path -LiteralPath $userData) { throw 'The native OpenSquilla profile already exists; use a fresh disposable account.' }
   $evidence = [IO.Path]::GetFullPath($EvidenceRoot)
@@ -142,15 +236,24 @@ function Invoke-SignedWindowsUpdateAudit {
     [string]$CandidateInstaller, [string]$CandidateInstallerSha256, [string]$CandidateSourceSha,
     [string]$ChannelManifest, [int]$InstallTimeoutSeconds = 600,
     [ValidateSet('cim-trace', 'standard-user-polling')]
-    [string]$ProcessObservationMode = 'cim-trace'
+    [string]$ProcessObservationMode = 'cim-trace',
+    [ValidateSet('download', 'verified-cache')]
+    [string]$HandoffInputMode = 'download'
   )
   if ([Environment]::OSVersion.Platform -ne [PlatformID]::Win32NT) { throw 'This audit requires Windows.' }
   $repo = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '../..'))
-  $nativeUserData = Join-Path ([Environment]::GetFolderPath('ApplicationData')) 'OpenSquilla'
+  $roamingRoot = Get-SignedAuditRoamingRoot
+  $nativeUserData = Get-SignedAuditNativeUserData $roamingRoot
+  # Check package identity and the same Node runtime's actual filesystem view
+  # before plan creation, evidence writes, signature cache warming, or seeding.
+  $nodeExecutable = Get-SignedAuditNodeExecutable
+  $pythonExecutable = Get-SignedAuditPythonExecutable
+  $launcherPreflight = Assert-SignedAuditNativeLauncher $nativeUserData $nodeExecutable
   $temporary = if ($env:RUNNER_TEMP) { $env:RUNNER_TEMP } else { [IO.Path]::GetTempPath() }
   $planArguments = @{} + $PSBoundParameters
   $null = $planArguments.Remove('InstallTimeoutSeconds')
   $null = $planArguments.Remove('ProcessObservationMode')
+  $null = $planArguments.Remove('HandoffInputMode')
   $planArguments.NativeUserDataDir = $nativeUserData
   $planArguments.TemporaryRoot = $temporary
   $plan = Get-SignedAuditPlan @planArguments
@@ -176,6 +279,11 @@ function Invoke-SignedWindowsUpdateAudit {
       $manifest.tag -cne "v$($plan.CandidateVersion)" -or $manifest.prerelease -ne $false) {
     throw 'The controlled manifest does not identify candidate B.'
   }
+  # Real writes to new UUID siblings are necessary: MSIX virtualization can
+  # redirect new children even when package identity and parent realpath pass.
+  # The probe never creates OpenSquilla and removes only its own verified
+  # marker files and empty directories; uncertain cleanup fails and keeps them.
+  $writeViewPreflight = Invoke-SignedAuditWriteViewPreflight $roamingRoot $nodeExecutable $pythonExecutable
   New-Item -ItemType Directory -Path $plan.EvidenceRoot | Out-Null
   $signatureCheck = Join-Path $repo '.github/scripts/verify-windows-signatures.ps1'
   $probe = Join-Path $repo '.github/scripts/verify-release-profile-preservation.py'
@@ -185,6 +293,12 @@ function Invoke-SignedWindowsUpdateAudit {
   $result.provenance.channelManifestSha256 = (Get-FileHash -LiteralPath $plan.ChannelManifest -Algorithm SHA256).Hash.ToLowerInvariant()
   $result.processObservationMode = $ProcessObservationMode
   $result.clientLauncherElevated = $launcherElevated
+  $result.launcherPreflight = $launcherPreflight
+  $result.writeViewPreflight = $writeViewPreflight
+  $result.pythonExecutable = $pythonExecutable
+  $result.handoffInputMode = $HandoffInputMode
+  $result.downloadVerified = $false
+  $result.remotePublicationVerified = $false
   $sourceId = 'OpenSquilla.SignedUpdate.' + [guid]::NewGuid().ToString('N')
   $subscription = $null
   $automaticPid = $null
@@ -222,32 +336,88 @@ function Invoke-SignedWindowsUpdateAudit {
         }
       }
     }
-    & python $probe seed --home $plan.Profile --label signed-update-audit --external-root (Join-Path $plan.EvidenceRoot 'external-sentinels') |
+    & $pythonExecutable $probe seed --home $plan.Profile --label signed-update-audit --external-root (Join-Path $plan.EvidenceRoot 'external-sentinels') |
       Out-File -LiteralPath (Join-Path $plan.EvidenceRoot 'profile-seed.log')
     if ($LASTEXITCODE -ne 0) { throw 'Could not seed the isolated synthetic profile.' }
+    $handoffMode = 'signed-handoff'
+    $cachedArguments = @()
+    if ($HandoffInputMode -eq 'verified-cache') {
+      $handoffMode = 'signed-cached-handoff'
+      $cacheMarkerPath = Join-Path $plan.UserDataDir 'cached-handoff-audit.json'
+      if (Test-Path -LiteralPath $cacheMarkerPath) { throw 'The cached-handoff ownership marker already exists.' }
+      $cacheMarker = [ordered]@{
+        schemaVersion = 1; purpose = 'opensquilla-synthetic-cached-handoff-audit'
+        auditId = [guid]::NewGuid().ToString('N'); seedLabel = 'signed-update-audit'
+        userDataDir = $plan.UserDataDir; baselineVersion = $BaselineVersion
+        expectedVersion = $plan.CandidateVersion; expectedSha256 = $CandidateInstallerSha256
+        sourceSha = $CandidateSourceSha; baselineSourceSha = $BaselineSourceSha
+        configSha256 = (Get-FileHash -LiteralPath (Join-Path $plan.Profile 'config.toml') -Algorithm SHA256).Hash.ToLowerInvariant()
+      }
+      $cacheMarker | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $cacheMarkerPath -Encoding utf8
+      $cachedArguments = @('--cached-installer', $plan.CandidateInstaller, '--baseline-source-sha', $BaselineSourceSha)
+    }
     $result.stage = 'waiting-for-installer-handoff'
     $result | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $resultPath -Encoding utf8
     $handoffPath = Join-Path $plan.EvidenceRoot 'handoff.json'
-    & node (Join-Path $repo 'desktop/electron/scripts/test-packaged-real-update-flow.mjs') `
-      --mode signed-handoff --executable $plan.Executable --user-data-dir $plan.UserDataDir `
+    & $nodeExecutable (Join-Path $repo 'desktop/electron/scripts/test-packaged-real-update-flow.mjs') `
+      --mode $handoffMode --executable $plan.Executable --user-data-dir $plan.UserDataDir `
       --baseline-version $BaselineVersion --expected-version $plan.CandidateVersion `
       --channel-manifest $plan.ChannelManifest --expected-sha256 $CandidateInstallerSha256 `
-      --source-sha $CandidateSourceSha --ready-output $handoffPath 2>&1 |
+      --source-sha $CandidateSourceSha --ready-output $handoffPath @cachedArguments 2>&1 |
       Out-File -LiteralPath (Join-Path $plan.EvidenceRoot 'handoff-driver.log')
     if ($LASTEXITCODE -ne 0) { throw 'The packaged client did not complete a verified installer handoff.' }
     $handoff = Get-Content -LiteralPath $handoffPath -Raw | ConvertFrom-Json
     if ($handoff.credentialSha256 -cnotmatch '^[0-9a-f]{64}$' -or
         $handoff.stage -ne 'installer-handoff' -or $handoff.handoffObserved -ne $true -or
         $handoff.requiresPostInstallVerification -ne $true -or $handoff.ok -ne $false -or
+        $handoff.mode -cne $handoffMode -or
         $handoff.fromVersion -cne $BaselineVersion -or $handoff.toVersion -cne $plan.CandidateVersion -or
         $handoff.sha256 -cne $CandidateInstallerSha256 -or $handoff.sourceSha -cne $CandidateSourceSha) {
       throw 'The handoff result does not match the pinned A-to-B audit.'
+    }
+    if ($HandoffInputMode -eq 'verified-cache') {
+      $markerSha = (Get-FileHash -LiteralPath $cacheMarkerPath -Algorithm SHA256).Hash.ToLowerInvariant()
+      if ($handoff.mode -cne 'signed-cached-handoff' -or
+          $handoff.inputMode -cne 'verified-cache' -or
+          $handoff.fixtureSource -cne 'local Actions artifact and local channel fixture' -or
+          $handoff.candidateValidation -cne 'production-parser-on-local-fixture' -or
+          $handoff.baselineSourceSha -cne $BaselineSourceSha -or
+          $handoff.auditId -cne $cacheMarker.auditId -or $handoff.markerSha256 -cne $markerSha -or
+          $handoff.installerSha256 -cne $CandidateInstallerSha256 -or
+          $handoff.manifestSha256 -cne $result.provenance.channelManifestSha256) {
+        throw 'Cached handoff provenance does not match this audit and its local fixture.'
+      }
+      foreach ($proof in @('cacheStagedAndVerified', 'cacheRestoreVerified', 'cacheRestartVerified')) {
+        if ($handoff.$proof -isnot [bool] -or $handoff.$proof -ne $true) {
+          throw "The cached handoff lacks actual proof: $proof"
+        }
+      }
+      foreach ($excluded in @('downloadVerified', 'remotePublicationVerified')) {
+        if ($handoff.$excluded -isnot [bool] -or $handoff.$excluded -ne $false) {
+          throw "The cached handoff must not claim $excluded."
+        }
+      }
+      $result.cacheRestoreVerified = $true
+      $result.cacheRestartVerified = $true
+      $result.candidateValidation = $handoff.candidateValidation
+      $result.gaps += 'This cached-input cell does not verify remote publication, installer download, checksum fetch, or source fallback.'
+    } else {
+      if ($handoff.inputMode -cne 'download' -or $handoff.downloadVerified -isnot [bool] -or
+          $handoff.downloadVerified -ne $true -or $handoff.remotePublicationVerified -isnot [bool] -or
+          $handoff.remotePublicationVerified -ne $false) {
+        throw 'The download audit requires its real download proof and cannot certify remote publication.'
+      }
+      $result.downloadVerified = $true
     }
     $result.handoffObserved = $true
     $result.stage = 'waiting-for-operator-installer-and-automatic-restart'
     $result | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $resultPath -Encoding utf8
     Write-Host 'Complete the NSIS wizard and leave Run OpenSquilla selected. Do not launch B manually.'
-    $notBefore = [datetime]::Parse($handoff.handoffStartedAt).ToUniversalTime()
+    # PowerShell 7 can deserialize ISO JSON timestamps as DateTime. Parsing
+    # that object again stringifies it without its UTC kind and shifts the
+    # handoff boundary in non-UTC zones. Cast preserves both typed and string
+    # timestamps before normalizing to UTC.
+    $notBefore = ([datetime]$handoff.handoffStartedAt).ToUniversalTime()
     $starts = [Collections.Generic.List[object]]::new()
     $deadline = [datetime]::UtcNow.AddSeconds($InstallTimeoutSeconds)
     $restart = $null
@@ -320,7 +490,7 @@ function Invoke-SignedWindowsUpdateAudit {
     $automaticPid = $null
     $result.normalQuitObserved = $true
     $result.quitScope = 'operator tray Quit attestation plus exit of B and captured descendants; later children are not proven'
-    & node (Join-Path $repo 'desktop/electron/scripts/test-packaged-first-send-renderer.mjs') `
+    & $nodeExecutable (Join-Path $repo 'desktop/electron/scripts/test-packaged-first-send-renderer.mjs') `
       --executable $plan.Executable --user-data-dir (Join-Path $plan.EvidenceRoot 'first-send-new-profile') --iterations 1 2>&1 |
       Out-File -LiteralPath (Join-Path $plan.EvidenceRoot 'first-send.log')
     if ($LASTEXITCODE -ne 0) { throw 'Installed B first-send/owned Gateway probe failed.' }
@@ -344,7 +514,7 @@ function Invoke-SignedWindowsUpdateAudit {
     if (Test-Path -LiteralPath $interactionManifest) { throw 'The retained-interaction ownership marker already exists.' }
     $interaction | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $interactionManifest -Encoding utf8
     $interactionOutput = Join-Path $plan.EvidenceRoot 'retained-interaction'
-    & node (Join-Path $repo 'desktop/electron/scripts/test-packaged-retained-interaction.mjs') `
+    & $nodeExecutable (Join-Path $repo 'desktop/electron/scripts/test-packaged-retained-interaction.mjs') `
       --audit-manifest $interactionManifest --output-dir $interactionOutput 2>&1 |
       Out-File -LiteralPath (Join-Path $plan.EvidenceRoot 'retained-interaction.log')
     if ($LASTEXITCODE -ne 0) { throw 'Installed B retained-profile interaction probe failed.' }
@@ -370,7 +540,7 @@ function Invoke-SignedWindowsUpdateAudit {
     $result.credentialPreserved = $true
     $result.retainedInteractionReport = Join-Path $interactionOutput 'report.json'
     $result.gaps = @($result.gaps | Where-Object { $_ -ne 'Retained-profile interaction requires the independently bound packaged probe.' })
-    & python $probe verify-runtime --home $plan.Profile --label signed-update-audit `
+    & $pythonExecutable $probe verify-signed-retained --home $plan.Profile --label signed-update-audit `
       --external-root (Join-Path $plan.EvidenceRoot 'external-sentinels') |
       Out-File -LiteralPath (Join-Path $plan.EvidenceRoot 'profile-preservation.log')
     if ($LASTEXITCODE -ne 0) { throw 'Postinstall probes changed retained profile data.' }

@@ -842,9 +842,15 @@ _RETAINED_INTERACTION_INPUTS = [
     "desktop/electron/scripts/fixtures/packaged-retained-interaction/provider.mjs",
     "desktop/electron/scripts/fixtures/packaged-retained-interaction/browser-probe.mjs",
 ]
+_CACHED_HANDOFF_INPUTS = [
+    "desktop/electron/scripts/test-packaged-cached-handoff-contract.mjs",
+    "desktop/electron/scripts/fixtures/packaged-cached-handoff/contract.mjs",
+    "desktop/electron/scripts/fixtures/packaged-cached-handoff/runtime.mjs",
+    "desktop/electron/scripts/fixtures/packaged-cached-handoff/signed-exit-observer.mjs",
+]
 
 
-@pytest.mark.parametrize("path", _RETAINED_INTERACTION_INPUTS)
+@pytest.mark.parametrize("path", _RETAINED_INTERACTION_INPUTS + _CACHED_HANDOFF_INPUTS)
 def test_retained_interaction_inputs_select_static_and_windows_ownership(
     tmp_path: Path, suite_config: dict[str, Any], path: str
 ) -> None:
@@ -876,9 +882,13 @@ def test_retained_interaction_ci_executes_only_the_pure_contract() -> None:
     )
     assert contract_script.is_file()
     assert "scripts/test-packaged-retained-interaction.mjs" not in workflow_text
+    cached_command = "node scripts/test-packaged-cached-handoff-contract.mjs"
+    assert step["run"].splitlines().count(cached_command) == 1
+    assert Path("desktop/electron/scripts/test-packaged-cached-handoff-contract.mjs").is_file()
+    assert "--mode signed-cached-handoff" not in workflow_text
 
 
-@pytest.mark.parametrize("path", _RETAINED_INTERACTION_INPUTS)
+@pytest.mark.parametrize("path", _RETAINED_INTERACTION_INPUTS + _CACHED_HANDOFF_INPUTS)
 def test_retained_interaction_inputs_change_all_consuming_suite_digests(
     tmp_path: Path, suite_config: dict[str, Any], path: str
 ) -> None:
@@ -949,6 +959,7 @@ def test_windows_update_native_checks_stay_in_ownership_cells(
             "windows-update-handoff:scripts/test-windows-update-handoff.mjs",
             "windows-update-network:scripts/test-windows-update-network.mjs",
             "packaged-retained-interaction-contract:scripts/test-packaged-retained-interaction-contract.mjs",
+            "packaged-cached-handoff-contract:scripts/test-packaged-cached-handoff-contract.mjs",
             "windows-update-electron:scripts/test-windows-update-electron.mjs",
         ]
         if expected
@@ -1470,6 +1481,8 @@ def test_upgrade_source_only_changes_select_baseline_contract(
         "tests/test_ci/test_upgrade_baselines.py",
         "tests/test_ci/test_windows_signed_update_audit.py",
         ".github/scripts/verify-release-windows-signed-update.ps1",
+        ".github/scripts/verify-windows-native-write-view.mjs",
+        ".github/scripts/native-audit-write-view.py",
     ],
 )
 def test_upgrade_contract_inputs_change_release_packaging_digest(
@@ -1507,6 +1520,66 @@ def test_release_packaging_executes_upgrade_baseline_contract() -> None:
     assert "tests/test_ci/test_windows_signatures.py" in step["run"].split()
 
 
+_NATIVE_WRITE_VIEW_INPUTS = [
+    ".github/scripts/verify-windows-native-write-view.mjs",
+    ".github/scripts/native-audit-write-view.py",
+    "tests/test_ci/test_windows_signed_update_audit.py",
+]
+
+
+@pytest.mark.parametrize("path", _NATIVE_WRITE_VIEW_INPUTS)
+def test_native_write_view_inputs_select_linux_and_windows_contracts(
+    tmp_path: Path, suite_config: dict[str, Any], path: str
+) -> None:
+    plan = _plan(tmp_path, suite_config, path)
+    assert plan["full_fallback"] is False
+    assert plan["python_targets"] == ["tests/test_ci/test_windows_signed_update_audit.py"]
+    assert _matrix(plan) == {("windows-latest", "ownership")}
+    assert {"python-targeted", "release-packaging", "frontend-artifact"} <= set(
+        plan["required_suites"]
+    )
+    assert _platform_cells(plan, "release-packaging") == {("ubuntu-latest", "default")}
+    assert plan["python_matrix"] == {"ubuntu": [], "windows": []}
+    assert "macos-recovery" not in plan["required_suites"]
+
+
+@pytest.mark.parametrize("path", _NATIVE_WRITE_VIEW_INPUTS)
+def test_native_write_view_inputs_change_all_consuming_digests(
+    tmp_path: Path, suite_config: dict[str, Any], path: str
+) -> None:
+    dependency = tmp_path / path
+    dependency.parent.mkdir(parents=True)
+    dependency.write_text("first\n", encoding="utf-8")
+    first = _plan(tmp_path, suite_config, path)
+    dependency.write_text("second\n", encoding="utf-8")
+    second = _plan(tmp_path, suite_config, path)
+    for suite in ("python-targeted", "release-packaging", "desktop-recovery-e2e"):
+        assert first["suite_execution_digests"][suite] != second["suite_execution_digests"][suite]
+
+
+def test_native_write_view_ci_executes_only_contracts_in_windows_ownership() -> None:
+    import yaml
+
+    workflow = yaml.safe_load(Path(".github/workflows/ci.yml").read_text(encoding="utf-8"))
+    job = workflow["jobs"]["desktop-recovery-e2e"]
+    matches = [
+        step for step in job["steps"]
+        if step["name"] == "Test native Windows audit write-view contracts"
+    ]
+    assert len(matches) == 1
+    step = matches[0]
+    assert step["if"] == "${{ runner.os == 'Windows' && matrix.shard == 'ownership' }}"
+    assert "uv run pytest tests/test_ci/test_windows_signed_update_audit.py -q" in step["run"]
+    assert "command -v node" in step["run"] and "command -v pwsh" in step["run"]
+    assert "--junitxml=" in step["run"]
+    assert "verify-windows-native-write-view.mjs" not in step["run"]
+    assert "native-audit-write-view.py" not in step["run"]
+    upload = next(
+        step for step in job["steps"] if step["name"] == "Upload Desktop recovery summary"
+    )
+    assert "native-write-view-contracts.xml" in upload["with"]["path"]
+
+
 @pytest.mark.parametrize(
     ("path", "target"),
     [
@@ -1520,6 +1593,14 @@ def test_release_packaging_executes_upgrade_baseline_contract() -> None:
         ),
         (
             ".github/scripts/verify-release-windows-signed-update.ps1",
+            "tests/test_ci/test_windows_signed_update_audit.py",
+        ),
+        (
+            ".github/scripts/verify-windows-native-write-view.mjs",
+            "tests/test_ci/test_windows_signed_update_audit.py",
+        ),
+        (
+            ".github/scripts/native-audit-write-view.py",
             "tests/test_ci/test_windows_signed_update_audit.py",
         ),
     ],

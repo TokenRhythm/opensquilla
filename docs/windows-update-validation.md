@@ -138,7 +138,27 @@ Keep other source checkouts and CLI/portable profiles outside the audit.
 Preinstall a
 previously verified signed baseline A that contains both the new shell and the
 new update UI; stop A before this audit and leave the account's native
-`AppData\Roaming\OpenSquilla` directory absent.
+`AppData\Roaming\@opensquilla\desktop-electron` directory absent. This is
+Electron's packaged application name, not the NSIS display name `OpenSquilla`.
+The empty namespace parent `AppData\Roaming\@opensquilla` must already exist
+in the disposable account; the audit does not create or move an existing profile.
+Launch the audit from an ordinary desktop PowerShell shell opened outside
+Codex or another MSIX app. Before plan creation, evidence writes, signature
+cache warming, or profile seeding, the audit requires the launcher package API
+to return `APPMODEL_ERROR_NO_PACKAGE` (15700). It then uses the same resolved
+Node executable as the driver to check that the existing Roaming parent is
+not redirected and the native OpenSquilla directory is absent. A detected
+package identity or unexpected API/path failure is refused before seeding.
+Those read-only checks alone cannot establish the write view. A second preflight
+creates two new UUID siblings under Roaming through Node and the same frozen
+Python executable used for seeding. They exchange nonce markers and must see
+native paths. The probe checks actual paths, identities and marker contents
+before deleting only its own markers and empty directories. Unexpected files
+or uncertain cleanup preserve those paths and fail before evidence creation,
+signature warming or seeding. It never creates or reuses `OpenSquilla`.
+Passing establishes only those fresh writes in that launch context; future
+redirection remains possible. The final cache guard still refuses redirected
+paths. Launching outside the packaged app remains a prerequisite.
 For ordinary-user/UAC cells, select `ProcessObservationMode:
 standard-user-polling` and run the audit without elevation. This mode queries
 the observed B process's path, command line and creation time; it refuses an
@@ -150,6 +170,16 @@ Prepare a newer signed stable candidate B and a rehearsal channel manifest
 from its immutable release assets. Both must satisfy the production Windows
 signing policy. No test certificate or verification bypass is accepted by the
 client.
+
+`HandoffInputMode` defaults to `download`, which retains the real candidate
+download assertions below. The optional `verified-cache` mode instead stages
+the pinned, locally available signed B artifact through the production cache
+verifier, then checks two actual A cache restores, normal Quit/restart and the
+visible installer handoff. See the [cached handoff fixture instructions](../desktop/electron/scripts/fixtures/packaged-cached-handoff/README.md)
+for its prerequisites and evidence fields. It records `downloadVerified: false`
+and `remotePublicationVerified: false`; it does not prove remote checksum
+fetching, automatic refresh completion, GitHub/OSS fallback or cold-certificate
+behavior. Both modes keep the aggregate native release gate closed.
 
 Record build source SHAs, A's installed main EXE SHA256, B's installer SHA256,
 and the baseline installation directory from the original signed artifacts.
@@ -204,7 +234,7 @@ only synthetic state there. It does not assume environment redirection or
 `--user-data-dir` survives the NSIS shell-broker restart. Existing profiles are
 refused; it does not delete them or clean up the installation afterward.
 
-The outer helper first verifies A's version/hash and A/B production signatures,
+After the launcher checks, the outer helper verifies A's version/hash and A/B production signatures,
 then launches the driver and observes process events or polls for B according
 to the selected mode. This preflight warms certificate caches; a cold-cache
 network cell requires a separate clean environment before any such verification.
@@ -222,7 +252,7 @@ or a failed process query fails and preserves the scene; it never force-kills
 them. `normalQuitObserved`
 is scoped to that operator action and captured-process exit observation.
 
-The driver serves only the selected channel manifest on loopback. Installer
+In the default `download` mode, the driver serves the selected channel manifest on loopback. Installer
 downloads still use the manifest's versioned release source and the real
 client's checks. The first discovery receives a controlled 503; the same
 client must remain running and successfully retry. The driver then requires
@@ -247,8 +277,10 @@ handoff diagnostics. The outer audit adds separately scoped postinstall evidence
   session for first send, a required `read_file` with an unpredictable sentinel,
   real UI Stop, a follow-up send, normal Quit and same-profile restart. It never
   rewrites the credential/config to make preservation pass. Three calls to the
-  original `verify-runtime` checker retain the exact old-history and external
-  sentinel assertions. Its independent report is bound to this audit ID,
+  `verify-signed-retained` checker retain the exact old-history and external
+  sentinel assertions. This signed-audit operation accepts only the exact seed
+  config or the exact known migration; legacy manual checks are unchanged.
+  Its independent report is bound to this audit ID,
   source SHA and installed B hash; every required proof must be JSON `true`.
   See the [probe contract](../desktop/electron/scripts/fixtures/packaged-retained-interaction/README.md).
 
@@ -268,6 +300,40 @@ Desktop Fault Injection workflow when an approved packaged audit is needed;
 do not rebuild or re-sign solely to rerun verification.
 
 ## Release proof still required
+
+### Native observations on September 10, 2026
+
+Signed A `0.5.9001` (`d7a73311713a06ebd0c2b3f4de901e6ed0d34d0f`)
+and B `0.5.9002` (`22e36dc491f35c16d7c4152c549a6e9fb81fbc2a`)
+were exercised on Windows 11 in an existing per-user, non-default installation.
+The production cache restored across two A launches. The rendered Quit and
+install action stopped A and its owned Gateway and launched visible NSIS with
+only `--updated`. NSIS detected the original installation; Finish/Run launched
+B with the correct default profile, retained synthetic history and a connected
+Gateway. Installed signatures and ordinary tray Quit were verified. A separate
+fresh-profile first-send probe passed on the installed B.
+
+This is **not a completed native acceptance cell**. Preserve these boundaries:
+
+- The outer run blocked in a lab stdin relay: redirected PowerShell suppressed
+  the `Read-Host` prompt the relay expected. Subsequent checks were independently
+  bound continuations, not a rewritten successful outer result.
+- A deeply nested fresh test profile generated a 281-character ownership-file
+  path and failed to start its packaged Gateway. The same first-send probe
+  passed using a shorter evidence root. Long-profile-path support is unproven.
+- The retained profile kept its exact seed config. Requiring a migrated config
+  falsely rejected preservation; the signed-only checker now allows either
+  exact fixture form while retaining all byte/hash/history checks.
+- Retained first send then failed before reaching the synthetic Ollama service:
+  its default 8K context budget could not accommodate the agent/tool request.
+  Prepare adequate model capacity in the **next A baseline**, then rerun A-to-B;
+  do not rewrite an upgraded profile or bypass request budgets to claim success.
+  Retained tool use, Stop and restart remain unverified.
+
+The user's original profile was kept separately with a hash-verified backup.
+Local evidence and private profile data are not repository artifacts. This
+cached-input run does not verify download, public channels, blocked GitHub,
+cold certificate-chain networking, UAC/cancellation, or the full OS/scope matrix.
 
 The following native matrix remains required; deterministic CI or the synthetic
 PowerShell harness does not mark any row complete. Retain evidence per cell,
