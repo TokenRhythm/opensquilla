@@ -751,6 +751,7 @@ jobs:
           session-created-card.spec.ts
           session-switch-transport.spec.ts
           new-task-ensemble-race.spec.ts
+          ensemble-new-task-legacy-turn.spec.ts
           goal-mode.spec.ts
           plan-questionnaire-lifecycle.spec.ts
           queue-steer.spec.ts
