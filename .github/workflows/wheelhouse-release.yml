@@ -10,6 +10,11 @@ on:
         description: Tag containing signing support for a new/Draft release; leave empty for an internal signed test artifact
         required: false
         default: ""
+      internal_windows_only:
+        description: Build only internal Windows signed artifacts and legacy upgrade audits; requires an empty tag
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -47,6 +52,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           GITHUB_WORKFLOW_SHA: ${{ github.workflow_sha }}
+          INTERNAL_WINDOWS_ONLY: ${{ inputs.internal_windows_only || false }}
         run: python .github/scripts/release_signing_preflight.py
 
   build-control-ui:
@@ -165,6 +171,7 @@ jobs:
 
   build-release-assets:
     name: Build Python release assets
+    if: ${{ inputs.internal_windows_only != true }}
     outputs:
       source_sha: ${{ needs.build-control-ui.outputs.source_sha }}
     needs: build-control-ui
@@ -375,6 +382,7 @@ jobs:
 
   build-desktop-macos:
     name: Build macOS Electron installer
+    if: ${{ inputs.internal_windows_only != true }}
     needs: build-control-ui
     runs-on: macos-latest
     timeout-minutes: 150
@@ -766,6 +774,7 @@ jobs:
 
   publish-release:
     name: Publish release assets
+    if: ${{ inputs.internal_windows_only != true }}
     outputs:
       source_sha: ${{ needs.build-release-assets.outputs.source_sha }}
     needs:

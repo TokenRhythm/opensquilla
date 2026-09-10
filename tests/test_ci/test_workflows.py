@@ -37,6 +37,70 @@ def _workflow_texts() -> list[str]:
     return [path.read_text(encoding="utf-8") for path in WORKFLOW_DIR.glob("*.yml")]
 
 
+def test_partial_queue_wiring_preserves_canary_gate_and_does_not_mint_root_evidence() -> None:
+    jobs = _workflow("ci.yml")["jobs"]
+    assert "outputs.partial == 'true'" in jobs["main-canary"]["if"]
+    plan = next(s for s in jobs["plan-ci"]["steps"] if s.get("id") == "plan")
+    assert "needs.queue-attestation.result == 'success'" in plan["env"]["QUEUE_PARTIAL"]
+    assert "CI_OPTIMIZATION_MODE == 'enforce'" in plan["env"]["QUEUE_PARTIAL"]
+    steps = jobs["ci-result"]["steps"]
+    gate = next(s for s in steps if s.get("name") == "Check required CI results")
+    assert gate["env"]["QUEUE_CANARY_RESULT"] == "${{ needs.main-canary.result }}"
+    assert gate["env"]["QUEUE_EVIDENCE_RESULT"] == "${{ needs.queue-attestation.result }}"
+    evidence_step = next(s for s in steps if s.get("id") == "attestation")
+    assert "outputs.partial != 'true'" in evidence_step["if"]
+    assert "outputs.partial" not in next(
+        s for s in steps if s.get("name") == "Accept verified queue or main fast path"
+    )["if"]
+
+
+@pytest.mark.parametrize("scenario", ["failure", "duplicate", "foreign", "bad-branch"])
+def test_queue_feedback_reports_metadata_without_executing_candidate_code(
+    tmp_path: Path, scenario: str,
+) -> None:
+    workflow = _workflow("queue-feedback.yml")
+    assert workflow["on"]["workflow_run"]["types"] == ["completed"]
+    job = workflow["jobs"]["report"]
+    assert "merge_group" in job["if"]
+    assert len(job["steps"]) == 1
+    assert job["permissions"] == {"actions": "read", "pull-requests": "write"}
+    script = job["steps"][0]["with"]["script"]
+    wrapper = r'''
+const scenario = process.argv[2];
+const run = {id: 123, run_attempt: 1, repository: {full_name: 'owner/repo'},
+  head_repository: {full_name: 'owner/repo'}, path: '.github/workflows/ci.yml',
+  status: 'completed', conclusion: 'failure', head_sha: 'b'.repeat(40),
+  head_branch: 'gh-readonly-queue/main/pr-42-' + 'a'.repeat(40), html_url: 'https://example/run'};
+if (scenario === 'foreign') run.head_repository.full_name = 'attacker/repo';
+if (scenario === 'bad-branch') run.head_branch = 'feature/pr-42';
+const context = {repo: {owner: 'owner', repo: 'repo'}, payload: {workflow_run: run}};
+const sent = [];
+const github = {rest: {
+  pulls: {get: async () => ({data: {base: {ref: 'main'}}})},
+  actions: {listJobsForWorkflowRun: 'jobs'}, issues: {listComments: 'comments',
+    createComment: async value => sent.push(value)}},
+  paginate: async api => api === 'jobs'
+    ? [{name: 'Windows tests', conclusion: 'failure', html_url: 'https://example/job'}]
+    : scenario === 'duplicate'
+      ? [{user: {type: 'Bot'}, body: '<!-- opensquilla-queue-result:123:1 -->'}] : []};
+'''
+    program = tmp_path / "feedback.cjs"
+    program.write_text(
+        wrapper + "\n(async () => {\n" + script
+        + "\n})().then(() => console.log(JSON.stringify(sent)));\n", encoding="utf-8",
+    )
+    result = subprocess.run(
+        ["node", str(program), scenario], capture_output=True, text=True, check=True,
+    )
+    sent = json.loads(result.stdout)
+    if scenario == "failure":
+        assert len(sent) == 1 and sent[0]["issue_number"] == 42
+        assert "Windows tests" in sent[0]["body"] and "https://example/job" in sent[0]["body"]
+        assert "not necessarily the PR's current head" in sent[0]["body"]
+    else:
+        assert sent == []
+
+
 def _is_windows_wsl_bash(path: str) -> bool:
     normalized = path.replace("\\", "/").lower()
     return normalized.endswith("/windows/system32/bash.exe")
@@ -1259,6 +1323,11 @@ def test_ci_result_gate_covers_every_conditional_job_without_legacy_flags() -> N
     assert gate_step["env"]["RESULT_SKILL_HUB"] == "${{ needs.skill-hub.result }}"
     assert not any(key.startswith("FLAG_") for key in gate_step["env"])
     assert set(gate_step["env"]) == {
+        "QUEUE_PARTIAL",
+        "QUEUE_EVIDENCE_RESULT",
+        "QUEUE_REUSED_SUITES",
+        "QUEUE_SOURCE_RUN_ID",
+        "QUEUE_CANARY_RESULT",
         "RESULT_PLANNER",
         "RESULT_WORKFLOW_LINT",
         "RESULT_README_LOCALE",
@@ -1777,6 +1846,7 @@ def test_webui_chat_recovery_runs_the_verified_dist_through_gateway() -> None:
         "composer-paste.spec.ts",
         "goal-mode.spec.ts",
         "history-hydration.spec.ts",
+        "new-task-ensemble-race.spec.ts",
         "plan-questionnaire-lifecycle.spec.ts",
         "queue-steer.spec.ts",
         "session-created-card.spec.ts",

@@ -23,9 +23,15 @@ SIGNING_FILES = (
 )
 
 
-def source_ref(event: str, ref: str, tag: str, sha: str) -> str:
+def source_ref(
+    event: str, ref: str, tag: str, sha: str, *, internal_windows_only: bool = False
+) -> str:
     if not re.fullmatch(r"[0-9a-f]{40}", sha):
         raise ValueError("The workflow source must be a full commit SHA.")
+    if internal_windows_only and (
+        event != "workflow_dispatch" or not ref.startswith("refs/heads/") or tag
+    ):
+        raise ValueError("Windows-only builds require a branch dispatch with an empty release tag.")
     if tag and not TAG_PATTERN.fullmatch(tag):
         raise ValueError("Release tag must be a canonical vMAJOR.MINOR.PATCH release tag.")
     if event == "push":
@@ -109,21 +115,35 @@ def validate_release(repository: str, tag: str) -> None:
 
 def main() -> None:
     tag = os.environ.get("RELEASE_TAG", "")
+    windows_only = os.environ.get("INTERNAL_WINDOWS_ONLY", "false")
+    if windows_only not in {"true", "false"}:
+        raise ValueError("INTERNAL_WINDOWS_ONLY must be true or false.")
     ref = source_ref(
-        os.environ["GITHUB_EVENT_NAME"], os.environ["GITHUB_REF"], tag, os.environ["GITHUB_SHA"]
+        os.environ["GITHUB_EVENT_NAME"],
+        os.environ["GITHUB_REF"],
+        tag,
+        os.environ["GITHUB_SHA"],
+        internal_windows_only=windows_only == "true",
     )
     sha = resolve_source(ref)
     validate_signing_contract(sha)
     if tag:
         validate_release(os.environ["GITHUB_REPOSITORY"], tag)
     workflow_sha = os.environ["GITHUB_WORKFLOW_SHA"]
-    print(f"Validated release source: {sha}; workflow: {workflow_sha}; tag: {tag or '(internal)'}")
+    scope = "internal Windows only" if windows_only == "true" else "all release platforms"
+    print(
+        f"Validated release source: {sha}; workflow: {workflow_sha}; "
+        f"tag: {tag or '(internal)'}; scope: {scope}"
+    )
     with Path(os.environ["GITHUB_OUTPUT"]).open("a", encoding="utf-8") as output:
         output.write(f"source_sha={sha}\n")
     summary = os.environ.get("GITHUB_STEP_SUMMARY")
     if summary:
         with Path(summary).open("a", encoding="utf-8") as output:
-            output.write(f"Release source: `{sha}`\n\nWorkflow source: `{workflow_sha}`\n")
+            output.write(
+                f"Release source: `{sha}`\n\nWorkflow source: `{workflow_sha}`\n\n"
+                f"Build scope: {scope}\n"
+            )
 
 
 if __name__ == "__main__":

@@ -31,6 +31,9 @@ jobs:
     timeout-minutes: 5
     outputs:
       reusable: ${{ steps.verify.outputs.reusable || 'false' }}
+      partial: ${{ steps.verify.outputs.partial || 'false' }}
+      partial_plan: ${{ steps.verify.outputs.partial_plan }}
+      reused_suites: ${{ steps.verify.outputs.reused_suites || '[]' }}
       reason: ${{ steps.verify.outputs.reason || steps.mode.outputs.reason }}
       reason_code: ${{ steps.verify.outputs.reason_code || steps.mode.outputs.reason_code }}
       source_run_id: ${{ steps.verify.outputs.source_run_id }}
@@ -96,6 +99,7 @@ jobs:
           QUEUE_HEAD_SHA: ${{ steps.verify.outputs.queue_head_sha }}
           QUEUE_TREE_SHA: ${{ steps.verify.outputs.queue_tree_sha }}
           COMBINED_SMOKE_SUITES: ${{ steps.verify.outputs.combined_smoke_suites || '[]' }}
+          REUSED_SUITES: ${{ steps.verify.outputs.reused_suites || '[]' }}
         shell: bash
         run: |
           {
@@ -108,6 +112,7 @@ jobs:
             echo "- Artifact: \`${ARTIFACT_NAME}\`"
             echo "- Queue base/head/tree: \`${QUEUE_BASE_SHA}\` / \`${QUEUE_HEAD_SHA}\` / \`${QUEUE_TREE_SHA}\`"
             echo "- Combined-tree domain smokes: \`${COMBINED_SMOKE_SUITES}\`"
+            echo "- Reused suites: \`${REUSED_SUITES}\` (all other full-matrix suites must run)"
             if [[ "${REASON_CODE}" == "tree_mismatch" ]]; then
               echo "- Fast-path note: the PR evidence does not match this queue tree, so this entry runs the full fail-closed matrix. If main advanced, refresh the PR against the latest main and wait for a new green PR CI run before requeueing. Reuse is always decided against the future entry's exact base and tree."
             fi
@@ -208,15 +213,21 @@ jobs:
 
       - name: Build canonical suite plan
         id: plan
+        env:
+          QUEUE_PARTIAL: ${{ github.event_name == 'merge_group' && env.CI_OPTIMIZATION_MODE == 'enforce' && needs.queue-attestation.result == 'success' && needs.queue-attestation.outputs.partial == 'true' }}
+          QUEUE_PARTIAL_PLAN: ${{ needs.queue-attestation.outputs.partial_plan }}
         shell: bash
         run: |
           set -euo pipefail
           plan_json="$(python3 .github/scripts/plan_ci.py "${CHANGED_FILES}" --repo .)"
           python3 - "${plan_json}" "${GITHUB_OUTPUT}" <<'PY'
           import json
+          import os
           import sys
 
           plan = json.loads(sys.argv[1])
+          if os.environ.get("QUEUE_PARTIAL") == "true":
+              plan = json.loads(os.environ["QUEUE_PARTIAL_PLAN"])
           output = sys.argv[2]
           with open(output, "a", encoding="utf-8") as handle:
               for key in (
@@ -742,6 +753,7 @@ jobs:
           history-hydration.spec.ts
           session-created-card.spec.ts
           session-switch-transport.spec.ts
+          new-task-ensemble-race.spec.ts
           goal-mode.spec.ts
           plan-questionnaire-lifecycle.spec.ts
           queue-steer.spec.ts
@@ -841,6 +853,15 @@ jobs:
           node scripts/test-secret-storage-policy.mjs
           node scripts/test-update-resolver.mjs
           node scripts/test-update-check-scheduler.mjs
+          node scripts/test-windows-update-security.mjs
+          node scripts/test-windows-update-cache.mjs
+          node scripts/test-windows-update-handoff.mjs
+          node scripts/test-windows-update-coordinator.mjs
+          node scripts/test-windows-update-integration.mjs
+          node scripts/test-windows-update-refresh.mjs
+          node scripts/test-windows-update-network.mjs
+          node scripts/test-packaged-retained-interaction-contract.mjs
+          node scripts/test-packaged-cached-handoff-contract.mjs
           node scripts/test-desktop-locale.mjs
           node scripts/test-desktop-zoom-shortcuts.mjs --contracts-only
           node scripts/test-desktop-profile-substrate.mjs
@@ -1421,7 +1442,7 @@ jobs:
           key: electron-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('desktop/electron/package-lock.json') }}
 
       - name: Install WebUI recovery dependencies
-        if: ${{ (runner.os == 'Windows' || runner.os == 'macOS') && matrix.shard == 'profiles' }}
+        if: ${{ ((runner.os == 'Windows' || runner.os == 'macOS') && matrix.shard == 'profiles') || (runner.os == 'Windows' && (matrix.shard == 'ownership' || matrix.shard == 'ownership-workbench' || matrix.shard == 'all')) }}
         working-directory: opensquilla-webui
         shell: bash
         run: npm ci
@@ -1796,6 +1817,25 @@ jobs:
               ;;
           esac
 
+          # The Linux static lane covers the deterministic update contracts.
+          # Windows also exercises native verification/registry boundaries and
+          # the production IPC, update UI and lifecycle in isolated Electron.
+          # The retained-interaction contract is pure Node/loopback; the actual
+          # packaged native audit requires explicit artifacts and stays manual.
+          if [[ "${RUNNER_OS}" == "Windows" &&
+                ( "${{ matrix.shard }}" == 'ownership' ||
+                  "${{ matrix.shard }}" == 'ownership-workbench' ||
+                  "${{ matrix.shard }}" == 'all' ) ]]; then
+            entries+=(
+              'windows-update-security:scripts/test-windows-update-security.mjs'
+              'windows-update-handoff:scripts/test-windows-update-handoff.mjs'
+              'windows-update-network:scripts/test-windows-update-network.mjs'
+              'packaged-retained-interaction-contract:scripts/test-packaged-retained-interaction-contract.mjs'
+              'packaged-cached-handoff-contract:scripts/test-packaged-cached-handoff-contract.mjs'
+              'windows-update-electron:scripts/test-windows-update-electron.mjs'
+            )
+          fi
+
           for entry in "${entries[@]}"
           do
             name="${entry%%:*}"
@@ -1818,6 +1858,17 @@ jobs:
           done
           printf 'e2e_status=passed\n' >> "${CI_REPORT_DIR}/first-failure.txt"
 
+      - name: Test native Windows audit write-view contracts
+        if: ${{ runner.os == 'Windows' && matrix.shard == 'ownership' }}
+        shell: bash
+        run: |
+          # Pure contracts create their own temporary roots; never run the
+          # native helper against the runner's real Roaming profile.
+          command -v node
+          command -v pwsh
+          uv run pytest tests/test_ci/test_windows_signed_update_audit.py -q \
+            --junitxml="${CI_REPORT_DIR}/native-write-view-contracts.xml"
+
       - name: Upload Desktop recovery summary
         if: ${{ success() }}
         uses: actions/upload-artifact@v4
@@ -1827,8 +1878,10 @@ jobs:
             ${{ runner.temp }}/desktop-recovery-e2e/environment.txt
             ${{ runner.temp }}/desktop-recovery-e2e/first-failure.txt
             ${{ runner.temp }}/desktop-recovery-e2e/desktop-e2e-cases.jsonl
+            ${{ runner.temp }}/desktop-recovery-e2e/native-write-view-contracts.xml
             ${{ runner.temp }}/desktop-recovery-e2e/retry-classifications.jsonl
             ${{ runner.temp }}/desktop-recovery-e2e/retry-evidence
+            ${{ runner.temp }}/desktop-recovery-e2e/windows-update-electron
           if-no-files-found: error
           retention-days: 14
 
@@ -1958,6 +2011,7 @@ jobs:
           command -v pwsh
           uv run pytest \
             tests/test_ci/test_upgrade_baselines.py \
+            tests/test_ci/test_windows_signed_update_audit.py \
             tests/test_ci/test_release_signing_preflight.py \
             tests/test_ci/test_windows_signatures.py \
             tests/test_scripts/test_build_wheelhouse_zip.py \
@@ -2003,7 +2057,8 @@ jobs:
               || (github.event_name == 'merge_group'
                   && (vars.CI_OPTIMIZATION_MODE || 'enforce') == 'enforce'
                   && needs.queue-attestation.result == 'success'
-                  && needs.queue-attestation.outputs.reusable == 'true')) }}
+                  && (needs.queue-attestation.outputs.reusable == 'true'
+                      || needs.queue-attestation.outputs.partial == 'true'))) }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     env:
@@ -2184,6 +2239,11 @@ jobs:
           RESULT_RELEASE: ${{ needs.release-packaging.result }}
           RESULT_MANAGED_TOOLCHAIN_ARTIFACTS: ${{ needs.managed-toolchain-artifacts.result }}
           REQUIRED_SUITES: ${{ needs.plan-ci.outputs.required_suites }}
+          QUEUE_PARTIAL: ${{ github.event_name == 'merge_group' && env.CI_OPTIMIZATION_MODE == 'enforce' && needs.queue-attestation.outputs.partial == 'true' }}
+          QUEUE_EVIDENCE_RESULT: ${{ needs.queue-attestation.result }}
+          QUEUE_REUSED_SUITES: ${{ needs.queue-attestation.outputs.reused_suites || '[]' }}
+          QUEUE_SOURCE_RUN_ID: ${{ needs.queue-attestation.outputs.source_run_id }}
+          QUEUE_CANARY_RESULT: ${{ needs.main-canary.result }}
         run: python .github/scripts/check_ci_results.py
 
       - name: Create trusted CI evidence v2
@@ -2192,6 +2252,7 @@ jobs:
           ${{ env.CI_OPTIMIZATION_MODE != 'legacy'
               && (github.event_name == 'pull_request'
                   || (github.event_name == 'merge_group'
+                      && needs.queue-attestation.outputs.partial != 'true'
                       && !(env.CI_OPTIMIZATION_MODE == 'enforce'
                            && needs.queue-attestation.result == 'success'
                            && needs.queue-attestation.outputs.reusable == 'true'))) }}
