@@ -820,6 +820,7 @@ class AgentConfig:
     post_write_convergence_warn_threshold: int = 3
     # Deprecated, unused compatibility slot; preserve positional/keyword construction.
     post_write_convergence_finalize_after_warning: int = 3
+    # Deprecated export; retain the slot and path for legacy final-diff exclusion.
     patch_evidence_ledger_path: str | None = None
     # Finalize-time red-evidence gate (see engine.finalize_evidence_gate).
     # Off by default; enabled per run via OPENSQUILLA_FINALIZE_EVIDENCE_GATE.

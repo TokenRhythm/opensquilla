@@ -9757,10 +9757,9 @@ function stopGateway(): void {
 // ── Desktop updates ──────────────────────────────────────────────────────────
 // macOS release builds are Developer-ID signed + notarized and ship the zip +
 // latest-mac.yml feed that Squirrel.Mac consumes, so in-place auto-update is
-// safe. Windows keeps explicit manual installation even when an installer has
-// an Authenticode signature: the shell discovers and reveals the exact
-// versioned NSIS installer. OPENSQUILLA_DESKTOP_ENABLE_WIN_INSTALL=1 enables the
-// signed full-installer handoff while its release gates are being rehearsed.
+// safe. Windows hands off a verified full installer to the visible NSIS wizard.
+// OPENSQUILLA_DESKTOP_ENABLE_WIN_INSTALL=0 disables this handoff and retains the
+// manual Show installer action; signature and checksum checks still apply.
 // OPENSQUILLA_DESKTOP_ENABLE_WIN_UPDATE=1 opts in to native
 // Windows updating for local tests only; OPENSQUILLA_DESKTOP_DISABLE_AUTO_UPDATE
 // disables all shell-managed discovery.
@@ -9984,10 +9983,10 @@ function desktopUpdateInstallMode(): DesktopUpdateInstallMode {
 }
 
 function windowsInstallerActionsSupported(): boolean {
-  // Default stays off until the signed A-to-B native installation matrix passes.
+  // Keep the existing opt-in value compatible and allow an explicit emergency opt-out.
   return process.platform === 'win32' && process.arch === 'x64'
     && desktopUpdateManaged() && desktopUpdateInstallMode() === 'manual'
-    && process.env.OPENSQUILLA_DESKTOP_ENABLE_WIN_INSTALL === '1'
+    && process.env.OPENSQUILLA_DESKTOP_ENABLE_WIN_INSTALL !== '0'
 }
 
 function windowsUpdateDownloadDirectory(): string {

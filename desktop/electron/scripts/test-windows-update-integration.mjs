@@ -76,7 +76,7 @@ function fixture(options = {}) {
   const events = []
   const state = { status: 'downloaded' }
   const globals = {
-    process: { platform: 'win32', arch: 'x64', env: options.gateOff ? {} : { OPENSQUILLA_DESKTOP_ENABLE_WIN_INSTALL: '1' } },
+    process: { platform: 'win32', arch: 'x64', env: options.gateOff ? { OPENSQUILLA_DESKTOP_ENABLE_WIN_INSTALL: '0' } : {} },
     join, setImmediate,
     WindowsUpdateSecurityError, WindowsUpdateHandoffError, WindowsUpdatePreparationError, UpdateChannelError,
     updateAssetUrl,
@@ -251,6 +251,22 @@ function downloadFixture(userData, options = {}) {
   })
   f.context.setDesktopUpdateState({ status: 'available' })
   return { ...f, downloadCalls: calls, directory, lexicalPath }
+}
+
+for (const value of [undefined, '1']) {
+  const f = fixture()
+  if (value !== undefined) f.context.process.env.OPENSQUILLA_DESKTOP_ENABLE_WIN_INSTALL = value
+  assert.equal(f.subject.windowsInstallerActionsSupported(), true)
+  for (const [platform, arch] of [['darwin', 'x64'], ['linux', 'x64'], ['win32', 'arm64']]) {
+    Object.assign(f.context.process, { platform, arch })
+    assert.equal(f.subject.windowsInstallerActionsSupported(), false)
+  }
+  Object.assign(f.context.process, { platform: 'win32', arch: 'x64' })
+  f.context.desktopUpdateManaged = () => false
+  assert.equal(f.subject.windowsInstallerActionsSupported(), false)
+  f.context.desktopUpdateManaged = () => true
+  f.context.desktopUpdateInstallMode = () => 'native'
+  assert.equal(f.subject.windowsInstallerActionsSupported(), false)
 }
 
 {
