@@ -7,6 +7,15 @@ from opensquilla.tools import ToolContext, ToolRegistry, tool
 from opensquilla.tools.builtin.shell import background_process, exec_command
 
 
+def test_builtin_registration_names_resolve_to_packaged_modules() -> None:
+    from importlib.util import find_spec
+
+    from opensquilla.tools import builtin
+
+    assert "submit_tool" not in builtin.__all__
+    assert all(find_spec(f"{builtin.__name__}.{name}") is not None for name in builtin.__all__)
+
+
 def test_tool_decorator_preserves_legacy_owner_only_position() -> None:
     registry = ToolRegistry()
 

@@ -4211,7 +4211,8 @@ def test_agent_child_config_inherits_tool_failure_loop_thresholds() -> None:
     assert child.config.progress_watchdog_repeated_tool_error_threshold == 5
     assert child.config.progress_watchdog_repeated_provider_failure_threshold == 4
     assert child.config.progress_watchdog_repeated_failure_anchor_threshold == 6
-    assert child.config.tool_loop_observer_mode == "log"
+    # The retired observer slot is accepted but no longer propagated.
+    assert child.config.tool_loop_observer_mode == "off"
     assert child.config.runtime_recovery_mode == "warn_model"
     assert child.config.runtime_recovery_source_loop_max_nudges == 3
     assert child.config.post_tool_empty_recovery_mode == "warn_model"
