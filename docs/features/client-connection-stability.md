@@ -11,6 +11,8 @@ handshake/directory validation, #1595 parallel contract generation, #1598 Router
 replay isolation, and the upstream skill-source and retired-experiment changes.
 The PR preparation additionally integrates `9486415af7188335d9f18f45143bfe33ce97e890`
 (#1597 questionnaire waiting and task-terminal recovery).
+The final upstream refresh is `d44e7936be0f60c82a854cbeb8a66b491f395fec`
+(#1602 entering a new draft before optional project hydration).
 Retired-experiment file removals are unchanged from that upstream pin and remain
 recoverable from Git history; this adaptation does not introduce engine cleanup.
 Upstream functionality is retained. Most existing generated-contract diffs are generator
@@ -164,7 +166,7 @@ The browser recovery matrix runs from `opensquilla-webui`, once for each
 explicit `OPENSQUILLA_GATEWAY_WS_TRANSPORT_FLOW_ENABLED=false/true` value:
 
 ```powershell
-npx playwright test assistant-activity.spec.ts composer-paste.spec.ts history-hydration.spec.ts session-created-card.spec.ts session-switch-transport.spec.ts goal-mode.spec.ts plan-questionnaire-lifecycle.spec.ts queue-steer.spec.ts share.spec.ts --project=chromium --workers=2 --retries=0
+npx playwright test assistant-activity.spec.ts composer-paste.spec.ts history-hydration.spec.ts session-created-card.spec.ts session-switch-transport.spec.ts new-task-ensemble-race.spec.ts goal-mode.spec.ts plan-questionnaire-lifecycle.spec.ts queue-steer.spec.ts share.spec.ts --project=chromium --workers=2 --retries=0
 ```
 
 Run its managed production Gateway with isolated state/config, HOME,
@@ -344,6 +346,23 @@ Validation on this merged implementation:
   roles compared over 115,837 inputs, with no role missing a positive seed.
 - WebUI production build, artifact verification/staging, Electron TypeScript
   build, focused Ruff and whitespace/conflict checks passed.
+
+### Draft-navigation update from #1602
+
+Upstream `d44e7936be0f60c82a854cbeb8a66b491f395fec` was incorporated during
+final PR preparation. Its draft transition retires the previous session before
+optional project hydration, while retaining the existing recovery-generation
+and draft-hydration fences. It changes no transport schemas or Gateway runtime
+code. The final browser matrix also includes its New Task/Ensemble race case.
+
+The full frontend suite passed again on this source (442 files / 5,841 tests),
+and the updated CI workflow tests passed 79 cases. Byte comparison confirms
+the Gateway/engine and all contract source/generated trees are unchanged from
+the #1597 validation above; its 601 backend and 405 contract results therefore
+cover the same runtime/contract code. The added browser fixture uses canonical
+`session.event.thinking` and the questionnaire fixture uses `task.timeout`,
+matching actual Gateway events; no production validator was broadened to admit
+the mistyped fixture aliases.
 
 ## Release gates still required
 

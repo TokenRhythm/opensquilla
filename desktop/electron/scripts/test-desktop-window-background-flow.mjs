@@ -51,6 +51,7 @@ async function mainWindowSnapshot(app) {
       url: window.webContents.getURL(),
       visible: window.isVisible(),
       minimized: window.isMinimized(),
+      focused: window.isFocused(),
       destroyed: window.isDestroyed(),
     }
   })
@@ -68,8 +69,101 @@ let reconnectAttempts = 0
 let acceptedSockets = 0
 let negotiatedFlow = false
 let warmRecoveryMs = null
+let continuityPage
+let continuityDiagnostics = null
 const routedClients = new Set()
 const routedServers = new WeakMap()
+
+// Observe only lifecycle/element categories, never text, values, URLs or keys.
+// The ring is bounded and records transitions, not every DOM mutation/poll.
+async function installContinuityObservation(page, app) {
+  await page.evaluate(() => {
+    const startedAt = Date.now()
+    const original = window.__stabilityComposer
+    const records = []
+    let dropped = 0
+    let lastState = ''
+    const category = element => {
+      if (!element) return 'none'
+      if (element === original) return 'original-composer'
+      if (element === document.querySelector('.chat-textarea')) return 'replacement-composer'
+      if (element === document.body) return 'body'
+      if (element === document.documentElement) return 'document'
+      if (element === window) return 'window'
+      const tag = String(element.tagName || '').toLowerCase()
+      return ['button', 'input', 'textarea', 'a', 'div', 'iframe'].includes(tag) ? tag : 'other'
+    }
+    const state = () => {
+      const current = document.querySelector('.chat-textarea')
+      return {
+        composerPresent: Boolean(current),
+        sameComposer: current === original,
+        originalConnected: Boolean(original?.isConnected),
+        focusedComposer: document.activeElement === original,
+        activeElement: category(document.activeElement),
+        documentFocused: document.hasFocus(),
+        visibility: document.visibilityState,
+        composerDisabled: current?.disabled ?? null,
+        composerReadOnly: current?.readOnly ?? null,
+      }
+    }
+    const record = (event, target, force = false) => {
+      const current = state()
+      const serialized = JSON.stringify(current)
+      if (!force && serialized === lastState) return
+      lastState = serialized
+      if (records.length >= 96) { records.shift(); dropped++ }
+      records.push({ atMs: Date.now() - startedAt, event, target: category(target), ...current })
+    }
+    const onLifecycle = event => record(event.type, event.target, true)
+    const lifecycleEvents = ['focus', 'blur', 'focusin', 'focusout', 'visibilitychange', 'pagehide', 'pageshow']
+    for (const event of lifecycleEvents) window.addEventListener(event, onLifecycle, true)
+    const observer = new MutationObserver(() => record('dom-change'))
+    observer.observe(document.body, { childList: true, subtree: true, attributes: true, attributeFilter: ['disabled', 'readonly'] })
+    const timer = setInterval(() => record('sample'), 500)
+    record('start', original, true)
+    window.__stabilityContinuityObservation = {
+      read: () => ({ state: state(), records: [...records], dropped }),
+      stop: () => {
+        clearInterval(timer)
+        observer.disconnect()
+        for (const event of lifecycleEvents) window.removeEventListener(event, onLifecycle, true)
+      },
+    }
+  })
+  await app.evaluate(({ BrowserWindow }) => {
+    const main = BrowserWindow.getAllWindows().find(candidate => (
+      candidate.webContents.getURL().startsWith('opensquilla-app://desktop/')
+    ))
+    if (!main) return
+    const startedAt = Date.now()
+    const records = []
+    let dropped = 0
+    const record = event => {
+      if (records.length >= 64) { records.shift(); dropped++ }
+      records.push({ atMs: Date.now() - startedAt, event, focused: main.isFocused(),
+        visible: main.isVisible(), minimized: main.isMinimized() })
+    }
+    const listeners = []
+    for (const event of ['focus', 'blur', 'show', 'hide', 'minimize', 'restore']) {
+      const listener = () => record(event)
+      main.on(event, listener)
+      listeners.push([event, listener])
+    }
+    record('start')
+    globalThis.__stabilityWindowObservation = {
+      read: () => ({ records: [...records], dropped }),
+      stop: () => { for (const [event, listener] of listeners) main.removeListener(event, listener) },
+    }
+  })
+}
+
+async function readContinuityObservation(page, app) {
+  return {
+    renderer: await page?.evaluate(() => window.__stabilityContinuityObservation?.read()).catch(() => null),
+    window: await app?.evaluate(() => globalThis.__stabilityWindowObservation?.read()).catch(() => null),
+  }
+}
 
 try {
   await mkdir(userDataDir, { recursive: true })
@@ -158,6 +252,7 @@ try {
   }
 
   const page = await desktopApp.firstWindow({ timeout: 60_000 })
+  continuityPage = page
   await page.waitForLoadState('domcontentloaded', { timeout: 60_000 }).catch(() => {})
   await waitFor(
     async () => page.url().startsWith('opensquilla-app://desktop/chat'),
@@ -206,6 +301,7 @@ try {
       window.__stabilityResumeSignals++
     })
   })
+  await installContinuityObservation(page, desktopApp)
   const cdp = await page.context().newCDPSession(page)
   await cdp.send('Network.enable')
   let socketsClosed = 0
@@ -219,10 +315,9 @@ try {
   await delay(6_000)
   assert.equal(page.url(), resumeUrl, 'resume must not navigate or reload')
   assert.equal(await composer.inputValue(), draft, 'resume must preserve the unsent draft')
-  assert.equal(await page.evaluate(() => (
-    document.querySelector('.chat-textarea') === window.__stabilityComposer
-    && document.activeElement === window.__stabilityComposer
-  )), true, 'resume must preserve composer identity and focus')
+  continuityDiagnostics = await readContinuityObservation(page, desktopApp)
+  assert.equal(continuityDiagnostics.renderer?.state.sameComposer, true, 'resume must preserve composer identity')
+  assert.equal(continuityDiagnostics.renderer?.state.focusedComposer, true, 'resume must preserve composer focus')
   assert.equal(socketsClosed, 0, 'healthy resume must not close a shared WebSocket')
   await page.evaluate(() => window.__stabilityDetachResume())
   await cdp.detach()
@@ -247,12 +342,14 @@ try {
     warmRecoveryMs = Date.now() - recoverStarted
     assert.equal(page.url(), resumeUrl)
     assert.equal(await composer.inputValue(), draft)
-    assert.equal(await page.evaluate(() => (
-      document.querySelector('.chat-textarea') === window.__stabilityComposer
-      && document.activeElement === window.__stabilityComposer
-    )), true, 'actual reconnect must preserve composer identity and focus')
+    continuityDiagnostics = await readContinuityObservation(page, desktopApp)
+    assert.equal(continuityDiagnostics.renderer?.state.sameComposer, true, 'actual reconnect must preserve composer identity')
+    assert.equal(continuityDiagnostics.renderer?.state.focusedComposer, true, 'actual reconnect must preserve composer focus')
     assert.ok(reconnectAttempts <= 8 + Math.ceil(outageMs / 5_000), 'interruption must not cause a reconnect storm')
   }
+
+  await page.evaluate(() => window.__stabilityContinuityObservation?.stop())
+  await desktopApp.evaluate(() => globalThis.__stabilityWindowObservation?.stop())
 
   const preferences = await page.evaluate(
     () => window.opensquillaDesktop.getDesktopPreferences?.(),
@@ -488,10 +585,12 @@ try {
       negotiatedFlow,
       reconnectAttempts,
       warmRecoveryMs,
+      continuityDiagnostics,
     }, null, 2))
   }
   flowSucceeded = true
 } catch (error) {
+  continuityDiagnostics = await readContinuityObservation(continuityPage, desktopApp)
   const windows = desktopApp
     ? await desktopApp.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows().map(
         (window) => ({
@@ -511,6 +610,7 @@ try {
     routedConnectionCount: routedClients.size,
     acceptedSockets,
     negotiatedFlow,
+    continuityDiagnostics,
     windows,
     desktopLog,
   }, null, 2))
