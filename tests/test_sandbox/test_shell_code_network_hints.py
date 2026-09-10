@@ -987,9 +987,12 @@ def test_trusted_windows_tools_collapse_host_network_to_managed_proxy(
     assert code_policy.network is NetworkMode.PROXY_ALLOWLIST
 
 
-def test_windows_direct_powershell_argv_injects_proxy_defaults() -> None:
+def test_windows_direct_powershell_argv_injects_proxy_defaults(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     from opensquilla.tools.builtin import shell
 
+    monkeypatch.setenv("HTTPS_PROXY", "http://127.0.0.1:8080")
     argv = shell._windows_direct_powershell_argv(
         "Invoke-WebRequest -UseBasicParsing https://example.com"
     )
@@ -1002,6 +1005,25 @@ def test_windows_direct_powershell_argv_injects_proxy_defaults() -> None:
     assert "System.Net.Sockets.TcpClient" not in command
     assert "Invoke-OpenSquillaProxyNetworkFallback" not in command
     assert ";;" not in command
+
+
+def test_windows_direct_powershell_argv_omits_proxy_prelude_without_proxy() -> None:
+    from opensquilla.tools.builtin import shell
+
+    # No HTTP(S)_PROXY in the environment: the wrapper must not emit the proxy
+    # preamble. Always emitting Invoke-WebRequest / WebProxy text — even as an
+    # inert no-op — trips AV heuristics such as 360 风险进程防护's
+    # "PowerShell 下载攻击" signature on every command, breaking unattended use.
+    argv = shell._windows_direct_powershell_argv(
+        "Invoke-WebRequest -UseBasicParsing https://example.com"
+    )
+    command = argv[-1]
+
+    assert "$PSDefaultParameterValues['Invoke-WebRequest:Proxy']" not in command
+    assert "$PSDefaultParameterValues['Invoke-RestMethod:Proxy']" not in command
+    assert "[System.Net.WebRequest]::DefaultWebProxy" not in command
+    assert "[System.Net.WebProxy]" not in command
+    assert "Invoke-WebRequest -UseBasicParsing https://example.com" in command
 
 
 def test_windows_shell_host_handles_invoke_webrequest_status_via_managed_proxy(
