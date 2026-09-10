@@ -1,0 +1,12 @@
+[package]
+name = "ospp_core"
+version = "0.1.0"
+edition = "2021"
+description = "Optional Rust hot-path kernel for OpenSquilla (turn state machine)."
+
+[lib]
+name = "ospp_core"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = { version = "0.23", features = ["abi3-py312", "extension-module"] }
