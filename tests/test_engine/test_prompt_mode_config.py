@@ -5,9 +5,9 @@ from types import SimpleNamespace
 import pytest
 
 from opensquilla.engine.runtime import (
+    TurnRunner,
     _resolve_finalize_evidence_gate,
     _resolve_identity_prompt_mode,
-    _resolve_legacy_prompt_style,
     _resolve_patch_evidence_protocol,
     _resolve_submit_review,
 )
@@ -246,44 +246,23 @@ def test_bootstrap_finalize_evidence_strict_env_off_overrides_config_on(
     assert _finalize_evidence_strict_from_env(True) is False
 
 
-def test_legacy_prompt_style_defaults_off(monkeypatch) -> None:
+@pytest.mark.parametrize("env_value", [None, "0", "1", "on", "garbage"])
+@pytest.mark.parametrize("legacy_style", [False, True])
+def test_retired_legacy_prompt_inputs_do_not_change_runtime_prompt(
+    monkeypatch, tmp_path, env_value, legacy_style
+) -> None:
     monkeypatch.delenv("OPENSQUILLA_LEGACY_PROMPT_STYLE", raising=False)
+    runner = TurnRunner(provider_selector=None, config=GatewayConfig())
+    monkeypatch.setattr(runner, "_resolve_bootstrap_workspace_dir", lambda _: tmp_path)
+    monkeypatch.setattr(runner, "_resolve_memory_source_dir", lambda _: tmp_path)
+    tool_defs = [SimpleNamespace(name="exec_command")]
+    expected = runner._assemble_prompt("main", tool_defs)
 
-    assert _resolve_legacy_prompt_style(GatewayConfig()) is False
+    if env_value is not None:
+        monkeypatch.setenv("OPENSQUILLA_LEGACY_PROMPT_STYLE", env_value)
+    runner._config = GatewayConfig(prompt={"legacy_prompt_style": legacy_style})
 
-
-def test_legacy_prompt_style_config_opt_in(monkeypatch) -> None:
-    monkeypatch.delenv("OPENSQUILLA_LEGACY_PROMPT_STYLE", raising=False)
-    cfg = GatewayConfig(prompt={"legacy_prompt_style": True})
-
-    assert _resolve_legacy_prompt_style(cfg) is True
-
-
-def test_legacy_prompt_style_env_on_overrides_config_off(monkeypatch) -> None:
-    monkeypatch.setenv("OPENSQUILLA_LEGACY_PROMPT_STYLE", "on")
-
-    assert _resolve_legacy_prompt_style(GatewayConfig()) is True
-
-
-def test_legacy_prompt_style_env_off_overrides_config_on(monkeypatch) -> None:
-    monkeypatch.setenv("OPENSQUILLA_LEGACY_PROMPT_STYLE", "off")
-    cfg = GatewayConfig(prompt={"legacy_prompt_style": True})
-
-    assert _resolve_legacy_prompt_style(cfg) is False
-
-
-def test_legacy_prompt_style_env_blank_falls_through_to_config(monkeypatch) -> None:
-    monkeypatch.setenv("OPENSQUILLA_LEGACY_PROMPT_STYLE", "  ")
-    cfg = GatewayConfig(prompt={"legacy_prompt_style": True})
-
-    assert _resolve_legacy_prompt_style(cfg) is True
-
-
-def test_legacy_prompt_style_env_rejects_unrecognized_value(monkeypatch) -> None:
-    monkeypatch.setenv("OPENSQUILLA_LEGACY_PROMPT_STYLE", "enabled")
-
-    with pytest.raises(ValueError, match="OPENSQUILLA_LEGACY_PROMPT_STYLE"):
-        _resolve_legacy_prompt_style(GatewayConfig())
+    assert runner._assemble_prompt("main", tool_defs) == expected
 
 
 # ---------------------------------------------------------------------------

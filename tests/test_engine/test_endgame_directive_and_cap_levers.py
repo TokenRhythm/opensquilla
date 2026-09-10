@@ -1,34 +1,19 @@
-"""Opt-in endgame levers: cap extension, act-now directives, sticky thinking-off.
-
-Covers OPENSQUILLA_MAX_ITERATIONS_DEADLINE_EXTEND_SECONDS,
-OPENSQUILLA_REASONING_ONLY_ACT_NOW,
-OPENSQUILLA_ENDGAME_FIX_DIRECTIVE_MARGIN_SECONDS, and
-OPENSQUILLA_DEADLINE_WRAPUP_STICKY_THINKING_OFF (all off by default).
-Motivation: runs that hit the iteration cap with wall clock to spare finalize
-early for no reason; reasoning-only responses retried verbatim usually repeat;
-a deadline crossed with only diagnostic instrumentation in the workspace needs
-an explicit commit-to-a-fix push; and a wrap-up preempt that re-enables thinking
-next iteration can spend the whole remaining margin on another reasoning stream.
-"""
+"""Iteration-cap extension, reasoning-only act-now, and sticky wrap-up thinking-off."""
 
 from __future__ import annotations
 
 import asyncio
 import json
-import subprocess
 from collections.abc import AsyncIterator
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Any
 
 import pytest
 
 from opensquilla.engine import Agent, AgentConfig, ThinkingLevel, ToolResult
 from opensquilla.engine.agent import (
-    _ENDGAME_FIX_DIRECTIVE_PREFIX,
     _REASONING_ONLY_ACT_NOW_DIRECTIVE,
 )
-from opensquilla.git_runtime import GitRunState
 from opensquilla.provider import (
     ChatConfig,
     Message,
@@ -40,7 +25,7 @@ from opensquilla.provider import ReasoningDeltaEvent as ProviderReasoning
 from opensquilla.provider import TextDeltaEvent as ProviderText
 from opensquilla.provider import ToolUseEndEvent as ProviderToolUseEnd
 from opensquilla.provider import ToolUseStartEvent as ProviderToolUseStart
-from opensquilla.tools.types import CallerKind, ToolContext
+from opensquilla.tools.types import ToolContext
 
 
 class _SequenceProvider:
@@ -156,38 +141,6 @@ def _runtime_events(events_path: Path, feature: str) -> list[dict[str, Any]]:
         if line.strip()
     ]
     return [event for event in events if event.get("feature") == feature]
-
-
-def _run_git(repo: Path, *args: str) -> str:
-    result = subprocess.run(
-        ["git", "-C", str(repo), *args],
-        capture_output=True,
-        text=True,
-        check=True,
-    )
-    return result.stdout
-
-
-def _init_repo(tmp_path: Path) -> tuple[Path, Path]:
-    repo = tmp_path / "workspace"
-    repo.mkdir()
-    _run_git(repo, "init", "-q")
-    _run_git(repo, "config", "user.email", "agent@test.invalid")
-    _run_git(repo, "config", "user.name", "agent")
-    target = repo / "pkg.py"
-    target.write_text("value = 1\n", encoding="utf-8")
-    _run_git(repo, "add", "-A")
-    _run_git(repo, "commit", "-q", "-m", "init")
-    return repo, target
-
-
-def _workspace_ctx(repo: Path) -> ToolContext:
-    return ToolContext(
-        is_owner=True,
-        caller_kind=CallerKind.CLI,
-        session_key="agent:main:test",
-        workspace_dir=str(repo),
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -536,189 +489,6 @@ async def test_deadline_wrapup_preempt_default_reenables_thinking(
 
 
 # ---------------------------------------------------------------------------
-# Endgame fix directive
-# ---------------------------------------------------------------------------
-
-
-def _fix_directive_texts(messages: list[Message]) -> list[str]:
-    return [
-        text
-        for text in _user_texts(messages)
-        if text.startswith(_ENDGAME_FIX_DIRECTIVE_PREFIX)
-    ]
-
-
-@pytest.mark.asyncio
-async def test_endgame_fix_directive_fires_when_no_source_fix_exists(
-    tmp_path: Path,
-) -> None:
-    events_path = tmp_path / "events.jsonl"
-    provider = _SequenceProvider([_echo_tool_call("use-1"), _final_text()])
-    # margin > timeout: the margin is already crossed at the first
-    # post-tool-results check; no workspace diff means no fix yet.
-    agent = _echo_agent(
-        provider,
-        AgentConfig(
-            timeout=30.0,
-            endgame_fix_directive_margin_seconds=60,
-            max_iterations=5,
-            retry_base_backoff_ms=0,
-            retry_max_backoff_ms=0,
-            runtime_events_path=str(events_path),
-        ),
-    )
-
-    events = [event async for event in agent.run_turn("fix the bug")]
-
-    assert any(event.kind == "done" for event in events)
-    assert not _fix_directive_texts(provider.calls[0]["messages"])
-    assert len(_fix_directive_texts(provider.calls[1]["messages"])) == 1
-    recorded = _runtime_events(events_path, "endgame_fix_directive")
-    assert [event["name"] for event in recorded] == ["endgame_fix_directive.injected"]
-    assert recorded[0]["action"] == "append_fix_directive"
-    assert recorded[0]["reason"] == "deadline_margin_no_fix"
-
-
-@pytest.mark.asyncio
-async def test_endgame_fix_directive_fires_once(tmp_path: Path) -> None:
-    provider = _SequenceProvider(
-        [_echo_tool_call("use-1"), _echo_tool_call("use-2"), _final_text()]
-    )
-    agent = _echo_agent(
-        provider,
-        AgentConfig(
-            timeout=30.0,
-            endgame_fix_directive_margin_seconds=60,
-            max_iterations=5,
-            retry_base_backoff_ms=0,
-            retry_max_backoff_ms=0,
-        ),
-    )
-
-    events = [event async for event in agent.run_turn("fix the bug")]
-
-    assert any(event.kind == "done" for event in events)
-    assert len(provider.calls) == 3
-    # The directive appended after iteration 1 persists in history but is
-    # never appended again.
-    assert len(_fix_directive_texts(provider.calls[2]["messages"])) == 1
-
-
-@pytest.mark.asyncio
-async def test_endgame_fix_directive_suppressed_by_substantive_diff(
-    tmp_path: Path,
-) -> None:
-    repo, target = _init_repo(tmp_path)
-    target.write_text("value = 2\n", encoding="utf-8")
-    events_path = tmp_path / "events.jsonl"
-    provider = _SequenceProvider([_echo_tool_call("use-1"), _final_text()])
-    agent = _echo_agent(
-        provider,
-        AgentConfig(
-            timeout=30.0,
-            endgame_fix_directive_margin_seconds=60,
-            max_iterations=5,
-            retry_base_backoff_ms=0,
-            retry_max_backoff_ms=0,
-            runtime_events_path=str(events_path),
-        ),
-        tool_context=_workspace_ctx(repo),
-    )
-
-    events = [event async for event in agent.run_turn("fix the bug")]
-
-    assert any(event.kind == "done" for event in events)
-    assert not _fix_directive_texts(provider.calls[1]["messages"])
-    assert _runtime_events(events_path, "endgame_fix_directive") == []
-
-
-@pytest.mark.asyncio
-async def test_endgame_fix_directive_skips_when_git_is_unavailable(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    repo, _target = _init_repo(tmp_path)
-    events_path = tmp_path / "events.jsonl"
-    monkeypatch.setattr(
-        "opensquilla.engine.agent.run_git",
-        lambda *_args, **_kwargs: SimpleNamespace(
-            ok=False,
-            state=GitRunState.UNAVAILABLE,
-        ),
-    )
-    provider = _SequenceProvider([_echo_tool_call("use-1"), _final_text()])
-    agent = _echo_agent(
-        provider,
-        AgentConfig(
-            timeout=30.0,
-            endgame_fix_directive_margin_seconds=60,
-            max_iterations=5,
-            retry_base_backoff_ms=0,
-            retry_max_backoff_ms=0,
-            runtime_events_path=str(events_path),
-        ),
-        tool_context=_workspace_ctx(repo),
-    )
-
-    events = [event async for event in agent.run_turn("fix the bug")]
-
-    assert any(event.kind == "done" for event in events)
-    assert len(provider.calls) == 2
-    assert not _fix_directive_texts(provider.calls[1]["messages"])
-    assert _runtime_events(events_path, "endgame_fix_directive") == []
-
-
-@pytest.mark.asyncio
-async def test_endgame_fix_directive_fires_on_instrumentation_only_diff(
-    tmp_path: Path,
-) -> None:
-    # Added debug prints are investigation, not a fix: the directive fires.
-    repo, target = _init_repo(tmp_path)
-    target.write_text('value = 1\nprint("debug")\n', encoding="utf-8")
-    provider = _SequenceProvider([_echo_tool_call("use-1"), _final_text()])
-    agent = _echo_agent(
-        provider,
-        AgentConfig(
-            timeout=30.0,
-            endgame_fix_directive_margin_seconds=60,
-            max_iterations=5,
-            retry_base_backoff_ms=0,
-            retry_max_backoff_ms=0,
-        ),
-        tool_context=_workspace_ctx(repo),
-    )
-
-    events = [event async for event in agent.run_turn("fix the bug")]
-
-    assert any(event.kind == "done" for event in events)
-    assert len(_fix_directive_texts(provider.calls[1]["messages"])) == 1
-
-
-@pytest.mark.asyncio
-async def test_endgame_fix_directive_waits_for_margin(tmp_path: Path) -> None:
-    events_path = tmp_path / "events.jsonl"
-    provider = _SequenceProvider([_echo_tool_call("use-1"), _final_text()])
-    # Large timeout, small margin: the crossing stays far in the future.
-    agent = _echo_agent(
-        provider,
-        AgentConfig(
-            timeout=3600.0,
-            endgame_fix_directive_margin_seconds=60,
-            max_iterations=5,
-            retry_base_backoff_ms=0,
-            retry_max_backoff_ms=0,
-            runtime_events_path=str(events_path),
-        ),
-    )
-
-    events = [event async for event in agent.run_turn("fix the bug")]
-
-    assert any(event.kind == "done" for event in events)
-    assert not _fix_directive_texts(provider.calls[1]["messages"])
-    assert _runtime_events(events_path, "endgame_fix_directive") == []
-
-
-# ---------------------------------------------------------------------------
 # Env plumbing and defaults
 # ---------------------------------------------------------------------------
 
@@ -735,11 +505,9 @@ def test_env_plumbing_for_endgame_package_levers(
 
     int_envs = [
         "OPENSQUILLA_MAX_ITERATIONS_DEADLINE_EXTEND_SECONDS",
-        "OPENSQUILLA_ENDGAME_FIX_DIRECTIVE_MARGIN_SECONDS",
     ]
     bool_envs = [
         "OPENSQUILLA_FINAL_DIFF_SALVAGE_VETO",
-        "OPENSQUILLA_ENDGAME_GIT_FREEZE_INSTRUMENTATION_EXEMPT",
         "OPENSQUILLA_DEADLINE_WRAPUP_STICKY_THINKING_OFF",
         "OPENSQUILLA_REASONING_ONLY_ACT_NOW",
     ]
@@ -760,7 +528,5 @@ def test_agent_config_defaults_keep_endgame_package_off() -> None:
 
     assert config.max_iterations_deadline_extend_seconds == 0
     assert config.final_diff_salvage_veto is False
-    assert config.endgame_git_freeze_instrumentation_exempt is False
     assert config.deadline_wrapup_sticky_thinking_off is False
-    assert config.endgame_fix_directive_margin_seconds == 0
     assert config.reasoning_only_act_now is False

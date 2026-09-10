@@ -2221,6 +2221,7 @@ const chatRouterDecisionRuntime = useChatRouterDecisionRuntime({
 const {
   pendingDecision,
   handleRouterControlReplay,
+  resetRouterReplayCursor,
   queueRouterDecision,
   appendEnsembleProgress,
   markEnsembleHandoff,
@@ -3869,6 +3870,7 @@ const rpcEventHandlers = useChatRpcEventHandlers({
   flushPendingRouterDecision,
   clearPendingRouterDecision,
   handleRouterControlReplay,
+  resetRouterReplayCursor,
   showCompactionToast,
   getCompactionPlacement: id => getCompactionPlacement(id) || undefined,
   showWarningToast: message => pushToast(message || t('chat.warning.default'), { tone: 'warn', duration: 5000 }),

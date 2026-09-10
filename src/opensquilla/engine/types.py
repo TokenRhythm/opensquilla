@@ -818,8 +818,11 @@ class AgentConfig:
     progress_watchdog_repeated_tool_error_threshold: int = 3
     progress_watchdog_repeated_provider_failure_threshold: int = 2
     progress_watchdog_repeated_failure_anchor_threshold: int = 3
+    # Deprecated, unused compatibility slot; preserve positional/keyword construction.
     post_write_convergence_enabled: bool = False
+    # Deprecated, unused compatibility slot; preserve positional/keyword construction.
     post_write_convergence_warn_threshold: int = 3
+    # Deprecated, unused compatibility slot; preserve positional/keyword construction.
     post_write_convergence_finalize_after_warning: int = 3
     patch_evidence_ledger_path: str | None = None
     # Finalize-time red-evidence gate (see engine.finalize_evidence_gate).
@@ -840,23 +843,9 @@ class AgentConfig:
     # body echoed into context (the per-file summary is always shown in full).
     submit_review_enabled: bool = False
     submit_review_diff_max_chars: int = 20000
-    # Finalize-time patch hygiene hard block. "off" (default) leaves patch
-    # hygiene as warn-only text; "test_paths" challenges a finalizing response
-    # while the live workspace diff still touches test-classified paths, so
-    # test edits are reverted before the patch is collected;
-    # "protected_paths" instead challenges while the diff touches paths
-    # matching the deployment's workspace write-deny globs — the same
-    # configured policy the write gates enforce, with no built-in path
-    # taxonomy. Set via OPENSQUILLA_PATCH_HYGIENE_BLOCK.
+    # Deprecated, unused compatibility slot; preserve positional/keyword construction.
     patch_hygiene_block_mode: Literal["off", "test_paths", "protected_paths"] = "off"
-    # Scratch verify-mirror for deny-blocked in-package test edits. When on,
-    # workspace write-deny rejections point the model at a writable mirror
-    # under <scratch>/verify-mirror/<workspace-relative-path>, and the
-    # finalize-time evidence gate credits executions that reference mirror
-    # files ONLY while every mirror copy hash-matches its workspace original
-    # (a diverged mirror would otherwise let weakened tests count as
-    # verification). Off by default; set via
-    # OPENSQUILLA_SCRATCH_VERIFY_MIRROR.
+    # Deprecated, unused compatibility slot; preserve positional/keyword construction.
     scratch_verify_mirror: bool = False
     # Finalize-time variant-sweep challenge. When on, the first finalizing
     # response after source edits receives ONE uniform challenge turn asking
@@ -874,12 +863,7 @@ class AgentConfig:
     # identical projected payloads the request is perturbed with a loop nudge;
     # at 2N the turn aborts. Set via OPENSQUILLA_IDENTICAL_REQUEST_LOOP_BREAK.
     identical_request_loop_break_threshold: int = 0
-    # Escalating recovery directive for repeated compacted-placeholder tool-call
-    # offenses within one turn. 0 = off. From the Nth iteration that blocks a
-    # placeholder reuse onward, a stronger directive is appended after the tool
-    # results so the model rebuilds arguments from fresh file/command output
-    # instead of re-offending until the wall clock expires. Set via
-    # OPENSQUILLA_PLACEHOLDER_ESCALATION_THRESHOLD.
+    # Deprecated, unused compatibility slot; preserve positional/keyword construction.
     placeholder_escalation_threshold: int = 0
     # Pre-deadline wrap-up nudge. 0 = off. When positive and a total turn
     # timeout is configured, the wrap-up directive arms once when remaining
@@ -906,14 +890,7 @@ class AgentConfig:
     # still spend the entire margin inside a single reasoning stream. Set via
     # OPENSQUILLA_DEADLINE_THINKING_OFF_MARGIN_SECONDS.
     deadline_thinking_off_margin_seconds: int = 0
-    # Preempt a runaway reasoning-only stream once its streamed reasoning text
-    # exceeds this many characters. 0 = off. The partial reasoning is
-    # discarded and the call retries immediately with thinking disabled for
-    # that retry only (the next iteration re-enables thinking), so the budget
-    # goes to tool calls instead of one unbounded reasoning stream. One
-    # preempt per iteration; attempts that already emitted user-visible text
-    # or tool calls are never preempted. Set via
-    # OPENSQUILLA_REASONING_STREAM_CHAR_CAP.
+    # Deprecated, unused compatibility slot; preserve positional/keyword construction.
     reasoning_stream_char_cap: int = 0
     # Re-apply captured source-diff candidates whose paths end the turn with
     # no live workspace diff (that path's earlier work would otherwise be
@@ -922,13 +899,7 @@ class AgentConfig:
     # newest candidate per path, each guarded by `git apply --check`. Set via
     # OPENSQUILLA_FINAL_DIFF_SALVAGE.
     final_diff_salvage: bool = False
-    # Freeze workspace-reverting git commands (restore, checkout paths or
-    # branches, reset --hard, clean -fd, stash) in the shell tools once
-    # remaining wall-clock time drops below this many seconds. 0 = off.
-    # Unlike source_diff_preservation_mode="block", the freeze blocks the
-    # operations outright — no protected-path intersection — so a last-minute
-    # revert cannot empty the collected diff. Set via
-    # OPENSQUILLA_ENDGAME_GIT_FREEZE_MARGIN_SECONDS.
+    # Deprecated, unused compatibility slot; preserve positional/keyword construction.
     endgame_git_freeze_margin_seconds: int = 0
     # Let the iteration cap yield to remaining wall-clock time. 0 = off. When
     # positive and a total turn timeout is configured, hitting max_iterations
@@ -943,35 +914,21 @@ class AgentConfig:
     # scored patch. Off by default; only meaningful with final_diff_salvage.
     # Set via OPENSQUILLA_FINAL_DIFF_SALVAGE_VETO.
     final_diff_salvage_veto: bool = False
-    # Endgame git freeze exemption: a frozen revert whose targeted diff is
-    # instrumentation-only (added print/log lines, nothing removed) is allowed
-    # through — cleaning up diagnostic output is what the wrap-up window is
-    # for. Off by default; only meaningful with the freeze margin. Set via
-    # OPENSQUILLA_ENDGAME_GIT_FREEZE_INSTRUMENTATION_EXEMPT.
+    # Deprecated, unused compatibility slot; preserve positional/keyword construction.
     endgame_git_freeze_instrumentation_exempt: bool = False
     # Make the wrap-up preempt's thinking-off sticky: when the wrap-up
     # directive preempts a reasoning stream, disable thinking for every
     # remaining provider call this turn instead of the next call only. Off by
     # default. Set via OPENSQUILLA_DEADLINE_WRAPUP_STICKY_THINKING_OFF.
     deadline_wrapup_sticky_thinking_off: bool = False
-    # One-shot endgame fix directive. 0 = off. When positive, a total turn
-    # timeout is configured, and remaining wall-clock time drops below this
-    # many seconds while the workspace still shows no source change beyond
-    # diagnostic instrumentation, a single user message directs the model to
-    # commit to its best-supported fix now. Set via
-    # OPENSQUILLA_ENDGAME_FIX_DIRECTIVE_MARGIN_SECONDS.
+    # Deprecated, unused compatibility slot; preserve positional/keyword construction.
     endgame_fix_directive_margin_seconds: int = 0
     # Inject an act-now user message when a provider response is reasoning
     # only (no visible text, no tool calls) and grant one extra retry for that
     # failure kind. Off by default (the bare retry re-requests with nothing
     # added). Set via OPENSQUILLA_REASONING_ONLY_ACT_NOW.
     reasoning_only_act_now: bool = False
-    # Mid-budget progress nudges. Off by default. When enabled and the turn
-    # has a wall-clock budget (timeout > 0), a one-shot user message is
-    # appended after tool results the first time elapsed time crosses 50% and
-    # again at 75% of the budget while the workspace shows no change yet (no
-    # write receipts, no captured diff candidates, empty live workspace
-    # diff). Set via OPENSQUILLA_MID_BUDGET_NO_DIFF_NUDGE.
+    # Deprecated, unused compatibility slot; preserve positional/keyword construction.
     mid_budget_no_diff_nudge: bool = False
     # Provider-view dedup of byte-identical repeated tool results. Off by
     # default. When enabled, older duplicate tool_result payloads (same content
