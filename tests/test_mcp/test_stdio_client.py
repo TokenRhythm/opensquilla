@@ -95,9 +95,25 @@ class _RecordingStdin:
 class _QueuedStdout:
     def __init__(self) -> None:
         self.lines: asyncio.Queue[bytes] = asyncio.Queue()
+        self._readahead = b""
 
     async def readline(self) -> bytes:
         return await self.lines.get()
+
+    async def read(self, n: int) -> bytes:
+        """Read up to n bytes, compatible with _readline_safe chunked reads."""
+        if self._readahead:
+            chunk = self._readahead[:n]
+            self._readahead = self._readahead[n:]
+            return chunk
+        try:
+            data = await asyncio.wait_for(self.lines.get(), timeout=10.0)
+        except TimeoutError:
+            return b""
+        if len(data) > n:
+            self._readahead = data[n:]
+            return data[:n]
+        return data
 
     def respond(self, request_id: int) -> None:
         self.lines.put_nowait(
@@ -228,3 +244,57 @@ async def test_call_tool_honors_result_level_is_error_flag() -> None:
 
     assert "upstream API rejected" in result.content
     assert result.is_error is True
+
+
+class _ChunkedStdout:
+    """Mock stdout that delivers data via ``read(chunk_size)`` instead of ``readline()``.
+
+    Used to test ``_readline_safe()`` which avoids the 64 KB StreamReader limit
+    by reading in chunks and splitting on newlines itself.
+    """
+
+    def __init__(self, data: bytes) -> None:
+        self._buffer = data
+        self._pos = 0
+
+    async def read(self, n: int) -> bytes:
+        chunk = self._buffer[self._pos : self._pos + n]
+        self._pos += len(chunk)
+        return chunk
+
+
+@pytest.mark.asyncio
+async def test_readline_safe_handles_line_larger_than_64kb() -> None:
+    """_readline_safe must read a single line > 64 KB without error."""
+    payload = {"jsonrpc": "2.0", "id": 1, "result": {"data": "x" * 70_000}}
+    line = (json.dumps(payload) + "\n").encode()
+    assert len(line) > 65536, "test line must exceed 64 KB"
+
+    # Simulate the first chunk containing the full line.
+    process = _FakeProcess()
+    process.stdout = _ChunkedStdout(line)  # type: ignore[attr-defined]
+    client = _client_with_process(process)
+
+    result = await client._readline_safe()
+    assert result == line.rstrip(b"\n")
+    assert len(result) == len(line) - 1
+
+
+@pytest.mark.asyncio
+async def test_readline_safe_reassembles_lines_across_chunks() -> None:
+    """_readline_safe must reassemble a line split across multiple read calls."""
+    payload = {"jsonrpc": "2.0", "id": 1, "result": {"data": "hello"}}
+    line = (json.dumps(payload) + "\n").encode()
+    # Pad the line with a long key so it spans multiple 8KB reads.
+    long_key = "x" * 20_000
+    long_payload = {"jsonrpc": "2.0", "id": 1, "result": {"data": long_key}}
+    long_line = (json.dumps(long_payload) + "\n").encode()
+    assert len(long_line) > 16384, "line must span at least two 8192-byte reads"
+
+    process = _FakeProcess()
+    process.stdout = _ChunkedStdout(long_line)  # type: ignore[attr-defined]
+    client = _client_with_process(process)
+
+    result = await client._readline_safe()
+    assert result == long_line.rstrip(b"\n")
+    assert len(result) == len(long_line) - 1
