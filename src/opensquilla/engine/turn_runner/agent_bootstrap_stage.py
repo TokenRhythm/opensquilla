@@ -198,20 +198,6 @@ def _name_tuple_from_env(name: str) -> tuple[str, ...]:
     return tuple(item.strip() for item in raw.split(",") if item.strip())
 
 
-def _projection_signal_hints_from_env() -> bool:
-    """Parse OPENSQUILLA_PROJECTION_SIGNAL_HINTS through the runtime gate.
-
-    Delegating keeps bootstrap and per-request resolution on one on/off
-    vocabulary: an unrecognized value raises here, at bootstrap, instead of
-    surviving as False and then raising mid-turn when the agent re-reads the
-    env. Local import; the engine.agent module is import-cycle-safe from
-    this stage only at call time.
-    """
-    from opensquilla.engine.agent import _projection_signal_hints_enabled
-
-    return _projection_signal_hints_enabled(False)
-
-
 # ---------------------------------------------------------------------------
 # Value objects returned by the ports — typed frozen tuples that collapse
 # the multi-call slice into declarative single-call shapes.
@@ -290,9 +276,6 @@ class _AgentConfigAuxiliaries:
     compaction_heartbeat_interval_seconds: float
     # Agent-token-cfg-derived
     tool_result_projection_max_inline_chars: int
-    tool_result_fresh_diagnostic_policy_enabled: bool
-    tool_result_diagnostic_retrieval_gate_enabled: bool
-    tool_result_fresh_diagnostic_inline_max_chars: int
     tool_result_dispatch_max_chars: int
     tool_result_dispatch_turn_max_chars: int
     tool_result_store_full_trace: bool
@@ -994,24 +977,6 @@ class AgentBootstrapStage:
             model_vision_support=effective_model_vision_support,
             thinking=aux.thinking,
             tool_result_projection_max_inline_chars=(aux.tool_result_projection_max_inline_chars),
-            tool_result_fresh_diagnostic_policy_enabled=(
-                _bool_from_env(
-                    "OPENSQUILLA_TOOL_RESULT_FRESH_DIAGNOSTIC_POLICY_ENABLED",
-                    aux.tool_result_fresh_diagnostic_policy_enabled,
-                )
-            ),
-            tool_result_diagnostic_retrieval_gate_enabled=(
-                _bool_from_env(
-                    "OPENSQUILLA_TOOL_RESULT_DIAGNOSTIC_RETRIEVAL_GATE_ENABLED",
-                    aux.tool_result_diagnostic_retrieval_gate_enabled,
-                )
-            ),
-            tool_result_fresh_diagnostic_inline_max_chars=(
-                _nonnegative_int_from_env(
-                    "OPENSQUILLA_TOOL_RESULT_FRESH_DIAGNOSTIC_INLINE_MAX_CHARS",
-                    aux.tool_result_fresh_diagnostic_inline_max_chars,
-                )
-            ),
             tool_result_dispatch_max_chars=aux.tool_result_dispatch_max_chars,
             tool_result_dispatch_turn_max_chars=(aux.tool_result_dispatch_turn_max_chars),
             tool_result_store_dir=aux.tool_result_store_dir,
@@ -1088,15 +1053,6 @@ class AgentBootstrapStage:
             repeated_tool_call_recovery_extra_tools=_name_tuple_from_env(
                 "OPENSQUILLA_TOOL_REPEAT_NUDGE_TOOLS",
             ),
-            provider_history_dedup_enabled=_bool_from_env(
-                "OPENSQUILLA_PROVIDER_HISTORY_DEDUP",
-                AgentConfig().provider_history_dedup_enabled,
-            ),
-            provider_history_dedup_min_repeats=_positive_int_from_env(
-                "OPENSQUILLA_PROVIDER_HISTORY_DEDUP_MIN_REPEATS",
-                AgentConfig().provider_history_dedup_min_repeats,
-            ),
-            projection_signal_hints=_projection_signal_hints_from_env(),
             runtime_recovery_mode=_runtime_recovery_mode_from_env(),
             runtime_recovery_source_loop_max_nudges=_positive_int_from_env(
                 "OPENSQUILLA_RUNTIME_RECOVERY_SOURCE_LOOP_MAX_NUDGES",
