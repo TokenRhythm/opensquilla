@@ -196,7 +196,6 @@ export function useChatSessionBootstrap(options: UseChatSessionBootstrapOptions)
           return { ...lastResult, ok: false, cancelled: true }
         }
         if (lastResult.ok) {
-          historyPhase.value = 'ready'
           return lastResult
         }
         if (
@@ -207,10 +206,15 @@ export function useChatSessionBootstrap(options: UseChatSessionBootstrapOptions)
           break
         }
       }
-      if (isCurrent(run)) historyPhase.value = 'error'
       return lastResult
     })().then(result => {
+      // Publish the failure evidence before the reactive phase. Vue can flush
+      // the recovery watcher before a later Promise continuation; exposing
+      // `error` while result is still null permanently misses its retry.
       phase.result = result
+      if (isCurrent(run) && !result.cancelled) {
+        historyPhase.value = result.ok ? 'ready' : 'error'
+      }
       return result
     }).finally(() => {
       phase.running = false

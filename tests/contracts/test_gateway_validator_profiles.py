@@ -22,17 +22,52 @@ def test_production_targets_preserve_every_approved_validator_role() -> None:
     specs = runner.discover_contracts()
     targets = runner.load_production_targets(specs)
 
-    assert len(targets) == 197
+    assert len(targets) == 201
     assert Counter(role for roles in targets.values() for role in roles) == {
-        "result": 188,
-        "params": 15,
-        "payload": 8,
+        "result": 191,
+        "params": 17,
+        "payload": 9,
         "frame": 1,
     }
-    assert sum(len(spec.targets) for spec in specs) == 877
-    assert ("method", "sessions.list") not in targets
+    assert sum(len(spec.targets) for spec in specs) == 886
+    assert targets[("method", "sessions.list")] == ("result",)
     assert targets[("method", "meta.list")] == ("result",)
     assert targets[("method", "meta.inspect")] == ("result",)
+    assert targets[("method", "sessions.messages.snapshot.read")] == ("params", "result")
+    assert targets[("method", "transport.flow.update")] == ("params", "result")
+    assert targets[("event", "transport.flow.dirty")] == ("payload",)
+
+
+def test_sessions_list_uses_browser_safe_esm_for_its_selected_validator(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sessions_list = next(
+        spec for spec in runner.discover_contracts() if spec.wire_name == "sessions.list"
+    )
+    commands: list[list[str]] = []
+
+    def capture(command: list[str], **_: object) -> str:
+        commands.append(command)
+        return "export const validateSessionsListResult = () => true\n"
+
+    monkeypatch.setattr(runner, "_capture", capture)
+    rendered = runner._render_validators(sessions_list, ("result",))
+
+    assert set(rendered) == set(sessions_list.outputs[3:])
+    assert sessions_list.outputs[3].name == "sessionsListValidators.mjs"
+    assert sessions_list.outputs[4].name == "sessionsListValidators.d.mts"
+    assert commands == [
+        [
+            "node",
+            str(AJV_GENERATOR),
+            str(sessions_list.schema),
+            "--esm",
+            "--roles",
+            "result",
+        ]
+    ]
+    assert "validateSessionsListResult" in rendered[sessions_list.outputs[4]]
+    assert "validateSessionsListRequestFrame" not in rendered[sessions_list.outputs[4]]
 
 
 @pytest.mark.parametrize(
@@ -151,7 +186,9 @@ def test_validator_cli_selects_result_without_removing_full_verification() -> No
     }
 
 
-@pytest.mark.parametrize("operation", ["write", "check", "hash"])
+@pytest.mark.parametrize(
+    "operation", ["write", "check", "hash", "write-determinism", "check-determinism"]
+)
 @pytest.mark.parametrize("link_kind", ["directory", "artifact", "orphan"])
 def test_output_links_cannot_read_overwrite_or_remove_external_artifacts(
     tmp_path: Path,
@@ -191,3 +228,38 @@ def test_output_links_cannot_read_overwrite_or_remove_external_artifacts(
     assert target.read_text() == original
     if link_kind == "orphan":
         assert (target.parent / "stale.py").is_symlink()
+
+
+@pytest.mark.parametrize("operation", ["write-determinism", "check-determinism"])
+def test_second_render_cannot_redirect_composed_output_to_an_external_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    operation: str,
+) -> None:
+    destination = tmp_path / "verification"
+    source = runner.PYTHON_OUTPUT_ROOT / "review_probe.py"
+    target = destination / source.relative_to(ROOT)
+    target.parent.mkdir(parents=True)
+    target.write_text("previous\n", encoding="utf-8")
+    victim = tmp_path / "protected.py"
+    victim.write_text("preserved\n", encoding="utf-8")
+    probe = tmp_path / "link-probe"
+    try:
+        probe.symlink_to(victim)
+    except OSError as exc:
+        pytest.skip(f"filesystem link creation is unavailable: {exc}")
+    probe.unlink()
+    calls = 0
+
+    def render(*args: object, **kwargs: object) -> dict[Path, str]:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            target.unlink()
+            target.symlink_to(victim)
+        return {source: "replacement\n"}
+
+    monkeypatch.setattr(runner, "render_tree", render)
+    with pytest.raises(runner.ContractConfigurationError, match="link|outside"):
+        runner.run(operation, (), profile="verification", output_root=destination)
+    assert victim.read_text(encoding="utf-8") == "preserved\n"

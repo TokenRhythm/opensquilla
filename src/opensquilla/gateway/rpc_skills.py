@@ -1363,7 +1363,7 @@ async def _run_skill_install(
         return {"success": False, "message": "No skill installer configured"}
 
     identifier = command.identifier
-    source_id = command.source
+    source_id = command.source or "clawhub"
     force = command.force
     replace_source = command.replace_source
     risk_confirmation = command.risk_confirmation

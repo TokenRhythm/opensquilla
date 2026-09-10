@@ -273,8 +273,8 @@ export function useChatRenderedMessages(options: UseChatRenderedMessagesOptions)
 
   function stableRouterStripRenderKey(
     turnIdentity: string,
-    message: Pick<ChatMessage, 'routerModelCallId' | 'messageId'>
-      | Pick<ChatRenderedMessage, 'routerModelCallId' | 'messageId' | 'sourceIndex' | 'id'>,
+    message: Pick<ChatMessage, 'routerModelCallId' | 'messageId' | 'clientId'>
+      | Pick<ChatRenderedMessage, 'routerModelCallId' | 'messageId' | 'sourceIndex' | 'id' | 'clientId'>,
     messageId?: string,
     index = 0,
   ): string {
@@ -284,10 +284,15 @@ export function useChatRenderedMessages(options: UseChatRenderedMessagesOptions)
     const eventId = routerStripEventId(message, messageId, index)
     const eventIdentity = `${identityPrefix}event:${eventId}`
     const callIdentity = callId ? `${identityPrefix}call:${callId}` : ''
+    // A provisional card acquires its real event id in place. Keep the same
+    // row mounted, then teach the event/call aliases to reuse its original key.
+    const localIdentity = message.clientId ? `${identityPrefix}local:${message.clientId}` : ''
     const key = (callIdentity ? stableRouterKeys.get(callIdentity) : undefined)
+      || (localIdentity ? stableRouterKeys.get(localIdentity) : undefined)
       || stableRouterKeys.get(eventIdentity)
       || routerStripRenderKey(turnIdentity, message, messageId, index)
     stableRouterKeys.set(eventIdentity, key)
+    if (localIdentity) stableRouterKeys.set(localIdentity, key)
     if (callIdentity) stableRouterKeys.set(callIdentity, key)
     return key
   }
@@ -709,6 +714,7 @@ export function useChatRenderedMessages(options: UseChatRenderedMessagesOptions)
     ) return null
     return {
       id: `router-turn-${turnIdx}`,
+      clientId: msg.clientId,
       role: 'router',
       displayRole: 'router',
       roleLabel: 'Router',
@@ -720,7 +726,7 @@ export function useChatRenderedMessages(options: UseChatRenderedMessagesOptions)
       isRouterStrip: true,
       routerTurnKey: stableRouterStripRenderKey(
         turnIdentity,
-        { routerModelCallId: routerModelCallIdFromMessage(msg), messageId },
+        { routerModelCallId: routerModelCallIdFromMessage(msg), messageId, clientId: msg.clientId },
         messageId,
         index,
       ),
@@ -824,6 +830,7 @@ export function useChatRenderedMessages(options: UseChatRenderedMessagesOptions)
     if (!options.routerVisualEffectsEnabled.value) return null
     return {
       id: `router-turn-${turnIdx}`,
+      clientId: msg.clientId,
       role: 'router',
       displayRole: 'router',
       roleLabel: 'Router',
@@ -835,7 +842,7 @@ export function useChatRenderedMessages(options: UseChatRenderedMessagesOptions)
       isRouterStrip: true,
       routerTurnKey: stableRouterStripRenderKey(
         turnIdentity,
-        { routerModelCallId: routerModelCallIdFromMessage(msg), messageId },
+        { routerModelCallId: routerModelCallIdFromMessage(msg), messageId, clientId: msg.clientId },
         messageId,
         index,
       ),

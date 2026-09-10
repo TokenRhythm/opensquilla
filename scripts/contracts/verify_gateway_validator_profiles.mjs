@@ -74,7 +74,7 @@ export async function verifyProfiles({ baselineRoot, verificationRoot } = {}) {
     assert.deepEqual(Object.keys(validators).sort(), contract.targets.map(target => target.exportName).sort())
     const stored = await storedValidators(baselineRoot ?? repositoryRoot, contract)
     const expectedExports = contract.targets.filter(target => baselineRoot
-      ? !(contract.wireName === 'sessions.list' && ['params', 'result'].includes(target.role))
+      ? !(contract.wireName === 'sessions.list' && target.role === 'params')
       : selected.has(targetIdentity(contract.kind, contract.wireName, target.role)))
     assert.deepEqual(Object.keys(stored).sort(), expectedExports.map(target => target.exportName).sort(),
       `${contract.wireName}: unexpected persistent exports`)
@@ -107,11 +107,11 @@ export async function verifyProfiles({ baselineRoot, verificationRoot } = {}) {
       result.roles++
     }
   }
-  assert.equal(result.roles, 877)
-  assert.equal(result.comparedRoles, baselineRoot ? 875 : selected.size)
+  assert.equal(result.roles, 886)
+  assert.equal(result.comparedRoles, baselineRoot ? 885 : selected.size)
   assert.deepEqual(result.rolesWithoutPositiveSeed, [], 'each role requires a positive seed')
   if (baselineRoot) assert.deepEqual(result.supplementalRoles, [
-    'method:sessions.list:params', 'method:sessions.list:result',
+    'method:sessions.list:params',
   ])
   return result
 }

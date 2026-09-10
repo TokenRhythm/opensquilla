@@ -5,6 +5,7 @@ import {
   type Page,
   type WebSocketRoute,
 } from '@playwright/test'
+import { helloOkResponse } from './support/gateway-fixture'
 
 const CONTROL_URL = '/control/'
 const SESSION_KEY = 'agent:main:webchat:e2e-task-ownership'
@@ -81,9 +82,7 @@ async function installOwnershipGateway(page: Page) {
       const method = String(frame.method || '')
 
       if (method === 'connect') {
-        ws.send(JSON.stringify({
-          protocol: 3,
-          policy: { tick_interval_ms: 30_000 },
+        ws.send(helloOkResponse({
           features: {
             methods: [
               'sessions.messages.subscribe',
@@ -157,6 +156,8 @@ async function installOwnershipGateway(page: Page) {
             status: 'ok',
             runStatus: 'running',
           }],
+          count: 1,
+          ts: 1_800_000_000,
           has_more: false,
         },
         'sessions.messages.unsubscribe': { subscribed: false },

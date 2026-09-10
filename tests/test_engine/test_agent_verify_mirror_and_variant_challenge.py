@@ -1,10 +1,6 @@
-"""Tests for the scratch verify-mirror and finalize variant-challenge levers.
+"""Tests for finalize variant challenges and verification credit.
 
-Covers OPENSQUILLA_SCRATCH_VERIFY_MIRROR and
-OPENSQUILLA_FINALIZE_VARIANT_CHALLENGE (both off by default): bootstrap env
-parsing, deny-message mirror guidance, the anti-weakening hash guard that
-withholds evidence credit when mirror copies diverge from their workspace
-originals, and the one-shot variant-sweep challenge injection.
+The retired scratch mirror fields remain inert compatibility slots.
 """
 
 from __future__ import annotations
@@ -12,7 +8,6 @@ from __future__ import annotations
 import os
 import subprocess
 from collections.abc import AsyncIterator
-from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -27,9 +22,7 @@ from opensquilla.engine import (
 from opensquilla.engine.finalize_evidence_gate import FinalizeEvidenceTracker
 from opensquilla.engine.turn_runner.agent_bootstrap_stage import (
     _finalize_variant_challenge_from_env,
-    _scratch_verify_mirror_from_env,
 )
-from opensquilla.git_runtime import GitRunState
 from opensquilla.provider import ChatConfig, Message
 from opensquilla.provider import DoneEvent as ProviderDone
 from opensquilla.provider import TextDeltaEvent as ProviderText
@@ -38,61 +31,12 @@ from opensquilla.provider import ToolUseStartEvent as ProviderToolUseStart
 from opensquilla.tools import write_policy
 from opensquilla.tools.types import ToolContext
 
-_MIRROR_ENV = "OPENSQUILLA_SCRATCH_VERIFY_MIRROR"
 _VARIANT_ENV = "OPENSQUILLA_FINALIZE_VARIANT_CHALLENGE"
 
 
 # ---------------------------------------------------------------------------
 # Bootstrap env parsing (house ON/OFF pattern)
 # ---------------------------------------------------------------------------
-
-
-def test_bootstrap_scratch_verify_mirror_env_defaults_off(monkeypatch) -> None:
-    monkeypatch.delenv(_MIRROR_ENV, raising=False)
-
-    assert _scratch_verify_mirror_from_env() is False
-
-
-@pytest.mark.parametrize("value", ["on", "1", "true", "YES"])
-def test_bootstrap_scratch_verify_mirror_env_on(monkeypatch, value: str) -> None:
-    monkeypatch.setenv(_MIRROR_ENV, value)
-
-    assert _scratch_verify_mirror_from_env() is True
-
-
-@pytest.mark.parametrize("value", ["off", "0", "false", "NO", "  "])
-def test_bootstrap_scratch_verify_mirror_env_off_or_blank(
-    monkeypatch, value: str
-) -> None:
-    monkeypatch.setenv(_MIRROR_ENV, value)
-
-    assert _scratch_verify_mirror_from_env() is False
-
-
-def test_bootstrap_scratch_verify_mirror_env_rejects_unrecognized_value(
-    monkeypatch,
-) -> None:
-    monkeypatch.setenv(_MIRROR_ENV, "enabled")
-
-    with pytest.raises(ValueError, match=_MIRROR_ENV):
-        _scratch_verify_mirror_from_env()
-
-
-def test_bootstrap_scratch_verify_mirror_uses_config_value_when_env_absent(
-    monkeypatch,
-) -> None:
-    monkeypatch.delenv(_MIRROR_ENV, raising=False)
-
-    assert _scratch_verify_mirror_from_env(True) is True
-    assert _scratch_verify_mirror_from_env(False) is False
-
-
-def test_bootstrap_scratch_verify_mirror_env_off_overrides_config_on(
-    monkeypatch,
-) -> None:
-    monkeypatch.setenv(_MIRROR_ENV, "off")
-
-    assert _scratch_verify_mirror_from_env(True) is False
 
 
 def test_bootstrap_finalize_variant_challenge_env_defaults_off(monkeypatch) -> None:
@@ -134,45 +78,27 @@ def test_bootstrap_finalize_variant_challenge_env_off_overrides_config_on(
     assert _finalize_variant_challenge_from_env(True) is False
 
 
-def test_agent_config_defaults_keep_both_levers_off() -> None:
+def test_agent_config_defaults_keep_variant_challenge_off() -> None:
     config = AgentConfig()
 
-    assert config.scratch_verify_mirror is False
     assert config.finalize_variant_challenge is False
 
 
-# ---------------------------------------------------------------------------
-# Deny-message mirror guidance (write_policy seam)
-# ---------------------------------------------------------------------------
-
-
-def _deny_match(workspace, target) -> write_policy.WorkspaceWriteDenyMatch:
-    match = write_policy.match_workspace_write_deny(
-        target,
-        workspace=workspace,
-        ctx=None,
-    )
-    assert match is not None
-    return match
-
-
-def _mirror_ctx(tmp_path, *, active: bool) -> ToolContext:
+@pytest.mark.parametrize("retired_mirror_active", [False, True])
+def test_retired_mirror_slot_does_not_change_write_denial(
+    tmp_path, monkeypatch, retired_mirror_active
+) -> None:
+    monkeypatch.delenv("OPENSQUILLA_WORKSPACE_WRITE_DENY_GUIDANCE", raising=False)
     workspace = tmp_path / "workspace"
     scratch = tmp_path / "scratch"
-    (workspace / "tests").mkdir(parents=True, exist_ok=True)
-    scratch.mkdir(exist_ok=True)
+    workspace.mkdir()
+    scratch.mkdir()
     ctx = ToolContext(
         workspace_dir=str(workspace),
         scratch_dir=str(scratch),
         workspace_write_deny_globs=["tests/**"],
+        scratch_verify_mirror_active=retired_mirror_active,
     )
-    ctx.scratch_verify_mirror_active = active
-    return ctx
-
-
-def test_deny_message_appends_mirror_guidance_when_lever_active(tmp_path) -> None:
-    ctx = _mirror_ctx(tmp_path, active=True)
-    workspace = tmp_path / "workspace"
     token = write_policy.current_tool_context.set(ctx)
     try:
         match = write_policy.match_workspace_write_deny(
@@ -183,36 +109,10 @@ def test_deny_message_appends_mirror_guidance_when_lever_active(tmp_path) -> Non
     finally:
         write_policy.current_tool_context.reset(token)
 
-    message = str(block["message"])
-    expected_mirror = (tmp_path / "scratch" / "verify-mirror" / "tests" / "test_a.py").as_posix()
-    assert expected_mirror in message
-    assert "keep the mirror copy identical to the workspace original" in message
-
-
-def test_deny_message_has_no_mirror_guidance_by_default(tmp_path) -> None:
-    ctx = _mirror_ctx(tmp_path, active=False)
-    workspace = tmp_path / "workspace"
-    token = write_policy.current_tool_context.set(ctx)
-    try:
-        match = write_policy.match_workspace_write_deny(
-            workspace / "tests" / "test_a.py", workspace=workspace, ctx=ctx
-        )
-        assert match is not None
-        block = write_policy.workspace_write_deny_block("write_file", match)
-    finally:
-        write_policy.current_tool_context.reset(token)
-
+    assert block["reason"] == "workspace_write_deny"
+    assert block["retryable"] is False
+    assert str(scratch) in str(block["message"])
     assert "verify-mirror" not in str(block["message"])
-
-
-def test_verify_mirror_path_requires_workspace_membership(tmp_path) -> None:
-    ctx = _mirror_ctx(tmp_path, active=True)
-
-    outside = write_policy.verify_mirror_path(
-        "/etc/passwd", "/etc/passwd", ctx
-    )
-
-    assert outside is None
 
 
 # ---------------------------------------------------------------------------
@@ -300,182 +200,6 @@ def test_tracker_evidence_credit_defaults_true() -> None:
 
     assert observation.should_challenge is False
     assert observation.verification_command_count == 1
-
-
-# ---------------------------------------------------------------------------
-# Agent-side hash guard
-# ---------------------------------------------------------------------------
-
-
-def _guard_agent(tmp_path, *, scratch: bool = True) -> Agent:
-    workspace = tmp_path / "workspace"
-    workspace.mkdir(exist_ok=True)
-    scratch_dir = tmp_path / "scratch"
-    scratch_dir.mkdir(exist_ok=True)
-    tool_context = ToolContext(
-        workspace_dir=str(workspace),
-        scratch_dir=str(scratch_dir) if scratch else None,
-    )
-    return Agent(
-        provider=None,
-        config=AgentConfig(scratch_verify_mirror=True),
-        tool_context=tool_context,
-    )
-
-
-def test_hash_guard_credits_command_not_referencing_mirror(tmp_path) -> None:
-    agent = _guard_agent(tmp_path)
-
-    assert agent._scratch_verify_mirror_evidence_credit("pytest tests/") is True
-
-
-def test_hash_guard_credits_matching_mirror_copy(tmp_path) -> None:
-    agent = _guard_agent(tmp_path)
-    original = tmp_path / "workspace" / "tests" / "test_a.py"
-    original.parent.mkdir(parents=True)
-    original.write_text("assert a\n", encoding="utf-8")
-    mirror = tmp_path / "scratch" / "verify-mirror" / "tests" / "test_a.py"
-    mirror.parent.mkdir(parents=True)
-    mirror.write_text("assert a\n", encoding="utf-8")
-
-    command = f"pytest {mirror.as_posix()}"
-
-    assert agent._scratch_verify_mirror_evidence_credit(command) is True
-
-
-def test_hash_guard_withholds_credit_for_diverged_mirror_copy(tmp_path) -> None:
-    agent = _guard_agent(tmp_path)
-    original = tmp_path / "workspace" / "tests" / "test_a.py"
-    original.parent.mkdir(parents=True)
-    original.write_text("assert a\n", encoding="utf-8")
-    mirror = tmp_path / "scratch" / "verify-mirror" / "tests" / "test_a.py"
-    mirror.parent.mkdir(parents=True)
-    mirror.write_text("assert True  # weakened\n", encoding="utf-8")
-
-    command = f"pytest {mirror.as_posix()}"
-
-    assert agent._scratch_verify_mirror_evidence_credit(command) is False
-
-
-def test_hash_guard_withholds_credit_for_missing_original_outside_repository(
-    tmp_path,
-) -> None:
-    agent = _guard_agent(tmp_path)
-    mirror = tmp_path / "scratch" / "verify-mirror" / "tests" / "test_extra.py"
-    mirror.parent.mkdir(parents=True)
-    mirror.write_text("assert extra_case()\n", encoding="utf-8")
-
-    command = f"pytest {mirror.as_posix()}"
-
-    assert agent._scratch_verify_mirror_evidence_credit(command) is False
-
-
-def test_hash_guard_allows_new_check_files_shadowing_nothing(tmp_path) -> None:
-    # The workspace is a git repo with no tests/test_extra.py anywhere: the
-    # mirror file is the model's own new check, not a weakened copy.
-    workspace = tmp_path / "workspace"
-    workspace.mkdir()
-    subprocess.run(["git", "init"], cwd=workspace, check=True, capture_output=True)
-    (workspace / "src.py").write_text("x = 1\n", encoding="utf-8")
-    subprocess.run(
-        ["git", "add", "src.py"], cwd=workspace, check=True, capture_output=True
-    )
-    subprocess.run(
-        ["git", "commit", "-m", "init"],
-        cwd=workspace,
-        check=True,
-        capture_output=True,
-        env={
-            **dict(os.environ),
-            "GIT_AUTHOR_NAME": "Test",
-            "GIT_AUTHOR_EMAIL": "test@example.com",
-            "GIT_COMMITTER_NAME": "Test",
-            "GIT_COMMITTER_EMAIL": "test@example.com",
-        },
-    )
-    agent = _guard_agent(tmp_path)
-    mirror = tmp_path / "scratch" / "verify-mirror" / "tests" / "test_extra.py"
-    mirror.parent.mkdir(parents=True)
-    mirror.write_text("assert extra_case()\n", encoding="utf-8")
-
-    command = f"pytest {mirror.as_posix()}"
-
-    assert agent._scratch_verify_mirror_evidence_credit(command) is True
-
-
-def test_hash_guard_withholds_credit_when_head_blob_probe_becomes_unavailable(
-    tmp_path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    agent = _guard_agent(tmp_path)
-    mirror = tmp_path / "scratch" / "verify-mirror" / "tests" / "test_extra.py"
-    mirror.parent.mkdir(parents=True)
-    mirror.write_text("assert extra_case()\n", encoding="utf-8")
-
-    def fake_run(args, **_kwargs):
-        if args[0] == "rev-parse":
-            return SimpleNamespace(ok=True, state=GitRunState.OK, stdout=b"true\n")
-        assert args[0] == "show"
-        return SimpleNamespace(
-            ok=False,
-            state=GitRunState.UNAVAILABLE,
-            stdout=b"",
-            stderr_text="git_not_found",
-        )
-
-    monkeypatch.setattr("opensquilla.engine.agent.run_git", fake_run)
-
-    command = f"pytest {mirror.as_posix()}"
-
-    assert agent._scratch_verify_mirror_evidence_credit(command) is False
-
-
-def test_hash_guard_withholds_credit_for_deleted_original_with_diverged_head(
-    tmp_path,
-) -> None:
-    # Original committed then deleted from the worktree: the HEAD blob is
-    # still the reference and the diverged mirror must not earn credit.
-    workspace = tmp_path / "workspace"
-    tests_dir = workspace / "tests"
-    tests_dir.mkdir(parents=True)
-    (tests_dir / "test_a.py").write_text("assert a\n", encoding="utf-8")
-    subprocess.run(["git", "init"], cwd=workspace, check=True, capture_output=True)
-    subprocess.run(
-        ["git", "add", "tests/test_a.py"],
-        cwd=workspace,
-        check=True,
-        capture_output=True,
-    )
-    subprocess.run(
-        ["git", "commit", "-m", "init"],
-        cwd=workspace,
-        check=True,
-        capture_output=True,
-        env={
-            **dict(os.environ),
-            "GIT_AUTHOR_NAME": "Test",
-            "GIT_AUTHOR_EMAIL": "test@example.com",
-            "GIT_COMMITTER_NAME": "Test",
-            "GIT_COMMITTER_EMAIL": "test@example.com",
-        },
-    )
-    (tests_dir / "test_a.py").unlink()
-    agent = _guard_agent(tmp_path)
-    mirror = tmp_path / "scratch" / "verify-mirror" / "tests" / "test_a.py"
-    mirror.parent.mkdir(parents=True)
-    mirror.write_text("assert True  # weakened\n", encoding="utf-8")
-
-    command = f"pytest {mirror.as_posix()}"
-
-    assert agent._scratch_verify_mirror_evidence_credit(command) is False
-
-
-def test_hash_guard_credits_when_no_scratch_dir_configured(tmp_path) -> None:
-    agent = _guard_agent(tmp_path, scratch=False)
-
-    command = "pytest /tmp/squilla-scratch/verify-mirror/tests/test_a.py"
-
-    assert agent._scratch_verify_mirror_evidence_credit(command) is True
 
 
 # ---------------------------------------------------------------------------
@@ -746,13 +470,10 @@ async def test_variant_challenge_suppressed_without_llm_call_headroom(tmp_path) 
 
 
 @pytest.mark.asyncio
-async def test_variant_challenge_arms_mirror_guidance_flag(tmp_path) -> None:
-    # The scratch_verify_mirror lever arms the ToolContext flag at turn
-    # start so deny messages carry the mirror guidance for the whole turn.
+async def test_retired_mirror_config_does_not_arm_tool_context(tmp_path) -> None:
     _init_git_workspace(tmp_path)
     provider = _ScriptedProvider([("final",)])
     tool_context = ToolContext(workspace_dir=str(tmp_path))
-    assert tool_context.scratch_verify_mirror_active is False
     agent = Agent(
         provider=provider,
         config=_variant_config(scratch_verify_mirror=True),
@@ -760,7 +481,7 @@ async def test_variant_challenge_arms_mirror_guidance_flag(tmp_path) -> None:
         tool_context=tool_context,
     )
 
-    [event async for event in agent.run_turn("Fix the bug")]
+    events = [event async for event in agent.run_turn("Inspect the workspace")]
 
-    assert agent._tool_context is not None
-    assert agent._tool_context.scratch_verify_mirror_active is True
+    assert any(isinstance(event, DoneEvent) for event in events)
+    assert tool_context.scratch_verify_mirror_active is False

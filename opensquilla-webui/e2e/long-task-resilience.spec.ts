@@ -7,6 +7,7 @@ import {
   type Page,
   type WebSocketRoute,
 } from '@playwright/test'
+import { helloOkResponse } from './support/gateway-fixture'
 
 const CONTROL_URL = '/control/'
 const SESSION_KEY = 'agent:main:webchat:e2e-long-task-resilience'
@@ -90,10 +91,8 @@ function eventFrame(event: string, payload: Record<string, unknown>) {
 }
 
 function hello(methods: string[] = [], events: string[] = []) {
-  return JSON.stringify({
-    protocol: 3,
+  return helloOkResponse({
     policy: {
-      tick_interval_ms: 30_000,
       concurrent_history_reads: true,
       webui_stream_idle_grace_ms: 1_260_000,
     },
@@ -133,7 +132,7 @@ function basePayload(method: string): unknown {
     },
     'models.routing.get': { mode: 'direct' },
     'onboarding.status': { audioConfigured: false },
-    'sessions.list': { sessions: [], has_more: false },
+    'sessions.list': { sessions: [], count: 0, ts: 1_800_000_000, has_more: false },
     'sessions.messages.hydrate': {
       hydration_complete: true,
       workspaceId: null,

@@ -128,6 +128,37 @@ describe('useChatSessionBootstrap', () => {
     api.cancelSessionBootstrap()
   })
 
+  it('publishes a history-only failure before notifying the automatic recovery watcher', async () => {
+    vi.useFakeTimers()
+    let available = false
+    const { api, loadHistory, subscribeSession, openSessionRead, closeLease } = createBootstrap({
+      connectionState: ref('connected'),
+      loadHistory: async () => available
+        ? { ok: true }
+        : { ok: false, error: new SessionReadFailure('unavailable', 'history offline', true) },
+    })
+    try {
+      const run = api.startSessionBootstrap()
+      await run.live
+      await vi.advanceTimersByTimeAsync(100)
+      await run.history
+      expect(api.historyPhase.value).toBe('error')
+      expect(api.livePhase.value).toBe('ready')
+      const failedAttempts = loadHistory.mock.calls.length
+
+      available = true
+      // No connection transition or unrelated live update wakes the watcher.
+      await vi.advanceTimersByTimeAsync(500)
+      expect(loadHistory).toHaveBeenCalledTimes(failedAttempts + 1)
+      expect(api.historyPhase.value).toBe('ready')
+      expect(subscribeSession).toHaveBeenCalledOnce()
+      expect(openSessionRead).toHaveBeenCalledOnce()
+      expect(closeLease).not.toHaveBeenCalled()
+    } finally {
+      api.cancelSessionBootstrap()
+    }
+  })
+
   it('releases optional traffic after the lease queues critical frames, not responses', async () => {
     let releaseHistory!: (result: SessionPhaseResult) => void
     let releaseLive!: (result: SessionSubscriptionOutcome) => void

@@ -1,6 +1,7 @@
 // @vitest-environment happy-dom
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { createPrivateGatewayTransports } from '@/adapters/gateway/privateTransports'
+import { createV4SessionDirectory } from '@/adapters/gateway/sessionDirectoryV4'
 import { RpcClient } from './rpc'
 
 class Socket {
@@ -39,7 +40,12 @@ const clients: RpcClient[] = []
 function client() { const rpc = new RpcClient(); clients.push(rpc); return rpc }
 function hello(socket: Socket, principal = localOwner, policy: Record<string, unknown> = {}) {
   socket.receive({ type: 'event', event: 'connect.challenge' })
-  socket.receive({ protocol: 3, auth: { principal }, policy })
+  socket.receive({
+    type: 'hello-ok', protocol: 3,
+    server: { version: 'test', conn_id: `conn-${Socket.instances.indexOf(socket)}` },
+    features: { methods: [], events: [] }, snapshot: {},
+    auth: { principal }, policy,
+  })
 }
 function transports(rpc: RpcClient) {
   const source = {
@@ -97,6 +103,49 @@ afterEach(() => {
 })
 
 describe('production connection integration boundaries', () => {
+  it.each([false, true])('keeps malformed directory results request-local with flow enabled=%s', async flowEnabled => {
+    const rpc = client()
+    const { transport } = transports(rpc)
+    const directory = createV4SessionDirectory(transport.rpc)
+    rpc.connect('ws://127.0.0.1:18790/ws', 'desktop-owned-nonce', { authentication: 'owner' })
+    const socket = Socket.instances[0]
+    hello(socket, localOwner, flowEnabled ? flowPolicy : {})
+    const generation = rpc.connectionGeneration
+    const page = directory.listPage({ limit: 10 })
+    await vi.advanceTimersByTimeAsync(0)
+    const listRequest = JSON.parse(socket.sent[socket.sent.length - 1])
+    expect(listRequest.method).toBe('sessions.list')
+    socket.receive({ type: 'res', id: listRequest.id, ok: true, payload: {
+      sessions: [{ key: 'alpha', title: 'Current conversation' }], count: 1, ts: 1,
+    } })
+    const firstPage = await page
+    expect(firstPage.items[0]).toMatchObject({ key: 'alpha', title: 'Current conversation' })
+
+    const malformed = directory.listPage({ limit: 10 }).catch(error => error)
+    await vi.advanceTimersByTimeAsync(0)
+    const malformedRequest = JSON.parse(socket.sent[socket.sent.length - 1])
+    socket.receive({ type: 'res', id: malformedRequest.id, ok: true, payload: {
+      sessions: [{ key: 'alpha', title: 'must not replace valid state' }], count: 'invalid', ts: 2,
+    } })
+    expect(await malformed).toMatchObject({
+      name: 'SessionDirectoryError', code: 'unavailable',
+      message: 'sessions.list returned an invalid response',
+    })
+    expect(firstPage.items[0]).toMatchObject({ key: 'alpha', title: 'Current conversation' })
+    expect(rpc.state).toBe('connected')
+    expect(rpc.connectionGeneration).toBe(generation)
+    expect(socket.readyState).toBe(Socket.OPEN)
+
+    const independent = transport.rpc.request('diagnostic.noop')
+    const independentRequest = JSON.parse(socket.sent[socket.sent.length - 1])
+    socket.receive({ type: 'res', id: independentRequest.id, ok: true, payload: { available: true } })
+    await expect(independent).resolves.toEqual({ available: true })
+    await vi.advanceTimersByTimeAsync(1_000)
+    expect(Socket.instances).toHaveLength(1)
+    expect(rpc.connectionGeneration).toBe(generation)
+    expect(flowUpdates(socket)).toHaveLength(0)
+  })
+
   it('reports the complete confirmed-failure recovery duration without connection secrets or message bodies', async () => {
     vi.spyOn(Math, 'random').mockReturnValue(1)
     const rpc = client()

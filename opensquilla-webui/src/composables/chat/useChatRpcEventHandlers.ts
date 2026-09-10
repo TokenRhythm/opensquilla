@@ -160,10 +160,11 @@ export interface UseChatRpcEventHandlersOptions {
     turnId?: string,
   ) => void
   appendEnsembleProgress: (payload: ConversationEnsembleProgress) => void
-  markEnsembleHandoff: () => void
+  markEnsembleHandoff: (turnId?: string) => void
   flushPendingRouterDecision: () => void
   clearPendingRouterDecision: () => void
-  handleRouterControlReplay: () => void
+  handleRouterControlReplay: (payload: ConversationEventIdentity, identityStreamSeq?: number) => void
+  resetRouterReplayCursor?: () => void
   showCompactionToast: (
     payload: ConversationCompactionContent,
     meta?: Record<string, unknown>,
@@ -886,6 +887,7 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
     activeStreamTaskId.value = typeof snapshot.taskId === 'string'
       ? snapshot.taskId
       : ''
+    options.resetRouterReplayCursor?.()
 
     const replayEntries: BufferedPendingReplayEntry[] = (snapshot.events || [])
       .flatMap((entry, order): BufferedPendingReplayEntry[] => {
@@ -1500,9 +1502,9 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
     options.bindRouterDecisionToModelCall?.(
       modelCallId,
       iteration,
-      String(payload.turn_id || ''),
+      String(payload.turn_id || payload.task_id || ''),
     )
-    options.markEnsembleHandoff()
+    options.markEnsembleHandoff(String(payload.turn_id || payload.task_id || '') || undefined)
     const identity: ChatStreamModelCallIdentity | undefined = modelCallId || iteration > 0
       ? { modelCallId, iteration }
       : undefined
@@ -1528,7 +1530,7 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
     if (!isCurrentTaskPayload(payload)) return
     if (!acceptStreamSeq(payload)) return
     stream.resetStreamIdleTimer()
-    options.markEnsembleHandoff()
+    options.markEnsembleHandoff(String(payload.turn_id || payload.task_id || '') || undefined)
     stream.appendToolCall(payload)
   }
 
@@ -1540,7 +1542,7 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
     if (!isCurrentTaskPayload(payload)) return
     if (!acceptStreamSeq(payload)) return
     stream.resetStreamIdleTimer()
-    options.markEnsembleHandoff()
+    options.markEnsembleHandoff(String(payload.turn_id || payload.task_id || '') || undefined)
     stream.appendToolDelta(payload)
   }
 
@@ -1552,7 +1554,7 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
     if (!isCurrentTaskPayload(payload)) return
     if (!acceptStreamSeq(payload)) return
     stream.resetStreamIdleTimer()
-    options.markEnsembleHandoff()
+    options.markEnsembleHandoff(String(payload.turn_id || payload.task_id || '') || undefined)
     stream.appendToolEnd?.(payload)
   }
 
@@ -1590,7 +1592,7 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
     const activeState = ['thinking', 'streaming', 'tool_calling', 'tool_use', 'running'].includes(String(to))
     if (!stream.isStreaming.value && activeState) stream.startStreaming()
     if (!stream.isStreaming.value) return
-    if (activeState) options.markEnsembleHandoff()
+    if (activeState) options.markEnsembleHandoff(String(payload.turn_id || payload.task_id || '') || undefined)
     if (to === 'thinking') {
       if (stream.streamBubble.value && !stream.streamHasVisibleOutput.value) {
         recordActivityPhase('Planning next step')
@@ -1646,7 +1648,7 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
 
     if (!stream.isStreaming.value) stream.startStreaming()
     stream.resetStreamIdleTimer()
-    options.markEnsembleHandoff()
+    options.markEnsembleHandoff(String(payload.turn_id || payload.task_id || '') || undefined)
 
     if (phase === 'requesting') {
       recordActivityPhase('Waiting for model', 'provider:requesting')
@@ -2038,7 +2040,7 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
     if (!isCurrentGenerationPayload(payload)) return
     if (!isCurrentTaskPayload(payload)) return
     if (!acceptStreamSeq(payload)) return
-    options.handleRouterControlReplay()
+    options.handleRouterControlReplay(payload, replayActivityOrder)
   }
 
   function handleSemanticEvent(
@@ -2200,7 +2202,7 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
       options.bindRouterDecisionToModelCall?.(
         String(thinkingPayload.model_call_id || ''),
         Number(thinkingPayload.iteration || 0),
-        String(thinkingPayload.turn_id || ''),
+        String(thinkingPayload.turn_id || thinkingPayload.task_id || ''),
       )
       appendThinkingDelta(thinkingText, payload)
       return

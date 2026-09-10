@@ -222,13 +222,18 @@ def _specs_by_wire_name():
 def test_contract_inventory_freezes_all_webui_reachable_wire_names() -> None:
     specs = discover_contracts()
 
-    assert len(specs) == 226
+    assert len(specs) == 229
     assert Counter(spec.contract_type for spec in specs) == {
-        "method": 217,
-        "event": 9,
+        "method": 219,
+        "event": 10,
     }
     assert EXPECTED_METHOD_METADATA.keys() <= {spec.wire_name for spec in specs}
     assert "models.routing.changed" in {spec.wire_name for spec in specs}
+    assert {
+        "sessions.messages.snapshot.read",
+        "transport.flow.update",
+        "transport.flow.dirty",
+    } <= {spec.wire_name for spec in specs}
 
 
 def test_remaining_method_metadata_matches_existing_gateway_policy() -> None:

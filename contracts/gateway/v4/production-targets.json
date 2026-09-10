@@ -1113,6 +1113,13 @@
     },
     {
       "kind": "method",
+      "wireName": "sessions.list",
+      "roles": [
+        "result"
+      ]
+    },
+    {
+      "kind": "method",
       "wireName": "sessions.messages.hydrate",
       "roles": [
         "params",

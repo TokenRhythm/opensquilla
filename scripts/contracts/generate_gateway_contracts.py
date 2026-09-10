@@ -2,9 +2,9 @@
 """Discover and generate every language-neutral Gateway v4 Contract.
 
 ``sessions.list`` predates this aggregate runner.  It deliberately keeps its
-original entry point so that adopting the runner does not rewrite its already
-reviewed generated artifacts.  New Contracts use the generic JSON Schema
-2020-12 path below.
+original entry point for its already-reviewed Python and TypeScript types.  Its
+runtime validators use the aggregate runner's browser-safe ESM path, as do new
+Contracts generated from the generic JSON Schema 2020-12 path below.
 """
 
 from __future__ import annotations
@@ -21,6 +21,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any, Literal
@@ -30,6 +31,9 @@ CONTRACT_ROOT = ROOT / "contracts/gateway/v4"
 PYTHON_OUTPUT_ROOT = ROOT / "src/opensquilla/contracts/generated/v4"
 TYPESCRIPT_OUTPUT_ROOT = ROOT / "opensquilla-webui/src/contracts/generated/v4"
 AJV_GENERATOR = ROOT / "scripts/contracts/generate_gateway_contract_ajv.mjs"
+TYPESCRIPT_GENERATOR = (
+    ROOT / "opensquilla-webui/node_modules/json-schema-to-typescript/dist/src/cli.js"
+)
 JSON_SCHEMA_2020_12 = "https://json-schema.org/draft/2020-12/schema"
 GATEWAY_PROTOCOL = "opensquilla-websocket-json"
 REGISTRATION_OUTPUT = PYTHON_OUTPUT_ROOT / "gateway_contract_registry.py"
@@ -84,9 +88,10 @@ TIMEOUT_POLICIES = frozenset({"caller", "server", "transport"})
 CAPABILITY_KINDS = frozenset({"method-availability"})
 METHOD_LIFECYCLES = frozenset({"stable", "legacy"})
 
-Mode = Literal["write", "check", "verify-determinism"]
+Mode = Literal["write", "check", "verify-determinism", "write-determinism", "check-determinism"]
 Profile = Literal["production", "verification"]
 ValidatorTargets = dict[tuple[str, str], tuple[str, ...]]
+MAX_GENERATOR_JOBS = 32
 
 
 class ContractConfigurationError(RuntimeError):
@@ -124,19 +129,16 @@ class ContractSpec:
 
     @property
     def outputs(self) -> tuple[Path, ...]:
-        # Generic validators are imported by the browser-side Vite adapter.
-        # They must be native ESM: Vite intentionally does not transform
-        # source-tree .cjs files during dev, so a named import would leave the
-        # browser with a CommonJS module that has no exports.  The legacy
-        # sessions.list generator remains byte-for-byte CJS compatible.
-        validator_suffix = "Validators.cjs" if self.uses_legacy_generator else "Validators.mjs"
-        declaration_suffix = ".d.cts" if self.uses_legacy_generator else ".d.mts"
+        # Validators are imported by browser-side Vite adapters. They must be
+        # native ESM: Vite intentionally does not transform source-tree .cjs
+        # files during dev, so a named import would leave the browser with a
+        # CommonJS module that has no exports.
         return (
             PYTHON_OUTPUT_ROOT / f"{self.python_stem}.py",
             PYTHON_OUTPUT_ROOT / f"{self.python_stem}_metadata.py",
             TYPESCRIPT_OUTPUT_ROOT / f"{self.typescript_stem}.ts",
-            TYPESCRIPT_OUTPUT_ROOT / f"{self.typescript_stem}{validator_suffix}",
-            TYPESCRIPT_OUTPUT_ROOT / f"{self.typescript_stem}Validators{declaration_suffix}",
+            TYPESCRIPT_OUTPUT_ROOT / f"{self.typescript_stem}Validators.mjs",
+            TYPESCRIPT_OUTPUT_ROOT / f"{self.typescript_stem}Validators.d.mts",
         )
 
     @property
@@ -1314,9 +1316,7 @@ def _render_validators(
     available = {role for role, _ in spec.targets}
     if roles is not None and (not set(roles) <= available or len(set(roles)) != len(roles)):
         raise ContractConfigurationError(f"invalid validator roles for {spec.wire_name}")
-    command = ["node", str(AJV_GENERATOR), str(spec.schema)]
-    if not spec.uses_legacy_generator:
-        command.append("--esm")
+    command = ["node", str(AJV_GENERATOR), str(spec.schema), "--esm"]
     if roles is not None:
         command.extend(["--roles", ",".join(roles)])
     validator = _capture(
@@ -1428,14 +1428,12 @@ def render_generic(
             env=env,
             purpose=f"Python generation for {spec.wire_name}",
         )
+        # Invoke the pinned package's json2ts entry point directly; npm exec
+        # would start another npm process for every Schema in every render.
         _run(
             [
-                "npm",
-                "--prefix",
-                "opensquilla-webui",
-                "exec",
-                "--",
-                "json2ts",
+                "node",
+                str(TYPESCRIPT_GENERATOR),
                 "--input",
                 str(typescript_input),
                 "--cwd",
@@ -1492,7 +1490,11 @@ def _load_legacy_generator(generator: Path) -> Any:
 
 
 def render_legacy(spec: ContractSpec) -> dict[Path, str]:
-    """Render frozen legacy bytes for type generation and compatibility tests."""
+    """Render the three frozen legacy type artifacts.
+
+    Runtime validators intentionally use ``_render_validators`` so production
+    adapters receive the same browser-safe ESM format as every other Contract.
+    """
     generator = next(
         generator
         for schema, generator in LEGACY_GENERATORS.items()
@@ -1510,14 +1512,8 @@ def render_legacy(spec: ContractSpec) -> dict[Path, str]:
     rendered = legacy.render()
     return dict(
         zip(
-            spec.outputs,
-            (
-                rendered.python,
-                rendered.python_metadata,
-                rendered.typescript,
-                rendered.validator_javascript,
-                rendered.validator_declarations,
-            ),
+            spec.outputs[:3],
+            (rendered.python, rendered.python_metadata, rendered.typescript),
             strict=True,
         )
     )
@@ -1840,26 +1836,41 @@ def render_tree(
     specs: tuple[ContractSpec, ...],
     *,
     profile: Profile = "production",
+    jobs: int = 1,
 ) -> dict[Path, str]:
     """Compile the entire tree before publishing artifacts or deleting orphans."""
+    _validate_jobs(jobs)
     targets = load_production_targets(discover_contracts()) if profile == "production" else None
     ordered = tuple(sorted(specs, key=lambda spec: spec.relative_schema.as_posix()))
-    rendered: dict[Path, str] = {}
-    for spec in ordered:
+
+    def render_contract(spec: ContractSpec) -> dict[Path, str]:
         roles = None if targets is None else targets.get((spec.contract_type, spec.wire_name), ())
         if spec.uses_legacy_generator:
-            frozen = render_legacy(spec)
-            artifacts = {path: frozen[path] for path in spec.outputs[:3]}
-            # Verification also materializes the two sessions.list roles
-            # absent from the frozen generator. Old bytes have a separate
-            # exact-output fixture, not a fabricated differential baseline.
+            artifacts = render_legacy(spec)
+            # Production now publishes the selected sessions.list result role;
+            # verification materializes all four roles. The legacy generator
+            # remains authoritative only for the three frozen type artifacts.
             artifacts.update(_render_validators(spec, roles))
-        else:
-            artifacts = render_generic(spec, validator_roles=roles)
+            return artifacts
+        return render_generic(spec, validator_roles=roles)
+
+    rendered: dict[Path, str] = {}
+
+    def merge_artifacts(artifacts: dict[Path, str]) -> None:
         duplicate = rendered.keys() & artifacts.keys()
         if duplicate:
             raise ContractConfigurationError(f"duplicate generated artifact: {sorted(duplicate)}")
         rendered.update(artifacts)
+
+    if jobs == 1:
+        for spec in ordered:
+            merge_artifacts(render_contract(spec))
+    else:
+        # Workers only render into private temporary directories. map yields
+        # results in Schema order, independently of worker completion order.
+        with ThreadPoolExecutor(max_workers=jobs) as executor:
+            for artifacts in executor.map(render_contract, ordered):
+                merge_artifacts(artifacts)
     rendered[REGISTRATION_OUTPUT] = render_registration_descriptor(ordered)
     rendered[COMPATIBILITY_MANIFEST_OUTPUT] = render_compatibility_manifest(ordered)
     return rendered
@@ -1871,20 +1882,26 @@ def run(
     *,
     profile: Profile = "production",
     output_root: Path | None = None,
+    jobs: int = 1,
 ) -> int:
     """Generate, check, or independently regenerate a complete profile tree."""
+    _validate_jobs(jobs)
     destination = _destination_root(profile, output_root)
     selected = specs if specs is not None else discover_contracts()
-    rendered = render_tree(selected, profile=profile)
+    rendered = render_tree(selected, profile=profile, jobs=jobs)
     expected = frozenset(destination / path.relative_to(ROOT) for path in rendered)
     _validate_output_tree(destination, expected)
-    if mode == "verify-determinism":
+    if mode in ("verify-determinism", "write-determinism", "check-determinism"):
         # Each render invokes the pinned tools in independent temporary dirs.
-        second = render_tree(tuple(reversed(selected)), profile=profile)
+        second = render_tree(tuple(reversed(selected)), profile=profile, jobs=jobs)
         if rendered != second:
             print("non-deterministic Gateway Contract artifact tree", file=sys.stderr)
             return 1
-        return 0
+        if mode == "verify-determinism":
+            return 0
+        mode = "write" if mode == "write-determinism" else "check"
+        # Recheck the publication surface after the independent second render.
+        _validate_output_tree(destination, expected)
     failed = False
     for path, content in rendered.items():
         target = destination / path.relative_to(ROOT)
@@ -1906,16 +1923,42 @@ def run(
     return int(bool(reconcile_orphans(expected, mode=mode, roots=roots)) or failed)
 
 
+def _validate_jobs(jobs: int) -> None:
+    if type(jobs) is not int or not 1 <= jobs <= MAX_GENERATOR_JOBS:
+        raise ContractConfigurationError(
+            f"generator jobs must be between 1 and {MAX_GENERATOR_JOBS}"
+        )
+
+
+def _parse_jobs(value: str) -> int:
+    try:
+        jobs = int(value)
+        _validate_jobs(jobs)
+    except (ValueError, ContractConfigurationError) as exc:
+        raise argparse.ArgumentTypeError(
+            f"generator jobs must be between 1 and {MAX_GENERATOR_JOBS}"
+        ) from exc
+    return jobs
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--write", action="store_true")
     mode.add_argument("--check", action="store_true")
     mode.add_argument("--verify-determinism", action="store_true")
+    mode.add_argument("--check-determinism", action="store_true")
+    mode.add_argument("--write-determinism", action="store_true")
     mode.add_argument("--hash-manifest", type=Path)
     mode.add_argument("--compare-hash-manifests", nargs=2, type=Path)
     parser.add_argument("--profile", choices=("production", "verification"), default="production")
     parser.add_argument("--output-root", type=Path)
+    parser.add_argument(
+        "--jobs",
+        type=_parse_jobs,
+        default=1,
+        help=f"parallel Schema compilers (1-{MAX_GENERATOR_JOBS})",
+    )
     args = parser.parse_args()
     try:
         if args.compare_hash_manifests:
@@ -1935,9 +1978,15 @@ def main() -> int:
             selected_mode = "write"
         elif args.verify_determinism:
             selected_mode = "verify-determinism"
+        elif args.check_determinism:
+            selected_mode = "check-determinism"
+        elif args.write_determinism:
+            selected_mode = "write-determinism"
         else:
             selected_mode = "check"
-        return run(selected_mode, specs, profile=args.profile, output_root=args.output_root)
+        return run(
+            selected_mode, specs, profile=args.profile, output_root=args.output_root, jobs=args.jobs
+        )
     except (ContractConfigurationError, RuntimeError) as exc:
         print(str(exc), file=sys.stderr)
         return 1

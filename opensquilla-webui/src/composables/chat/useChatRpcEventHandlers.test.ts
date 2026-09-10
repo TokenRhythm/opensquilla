@@ -1,6 +1,8 @@
 import { describe, expect, it, vi } from 'vitest'
 import { effectScope, nextTick, ref } from 'vue'
 import { useChatRpcEventHandlers, type ChatRpcStreamApi } from './useChatRpcEventHandlers'
+import { useChatRouterDecisionRuntime } from './useChatRouterDecisionRuntime'
+import { useChatRenderedMessages } from './useChatRenderedMessages'
 import type { SessionBootstrapRun } from './useChatSessionBootstrap'
 import type {
   ChatMessage,
@@ -38,6 +40,8 @@ function createHarness(options: {
   observeStreamGeneration?: (signal: ConversationCursorSignal) => boolean
   supportsTurnCommitted?: boolean
   onRecoveryRequired?: () => void
+  withRouterRuntime?: boolean
+  withRecoveryFence?: boolean
 } = {}) {
   const messages = ref<ChatMessage[]>(options.messages ?? [])
   const sessionKey = ref('agent:main:test')
@@ -75,9 +79,19 @@ function createHarness(options: {
     hideThinkingIndicator: vi.fn(),
     appendFrame: vi.fn(),
   }
-  const markEnsembleHandoff = vi.fn()
-  const bindRouterDecisionToModelCall = vi.fn()
-  const queueRouterDecision = vi.fn()
+  const routerRuntime = options.withRouterRuntime ? useChatRouterDecisionRuntime({
+    messages, sessionKey, isStreaming: stream.isStreaming,
+    autoScroll: ref(false), activeTurnUsesEnsemble: ref(true), activeTurnId: ref('turn-live'),
+    streamBubble: stream.streamBubble, streamHasVisibleOutput: stream.streamHasVisibleOutput,
+    startStreaming: stream.startStreaming,
+    resetStreamForRouterReplay: () => { stream.streamHasVisibleOutput.value = false },
+    resetStreamIdleTimer: stream.resetStreamIdleTimer,
+    setStreamActivity: stream.setStreamActivity,
+    scrollToBottom: vi.fn(),
+  }) : undefined
+  const markEnsembleHandoff = vi.fn(routerRuntime?.markEnsembleHandoff)
+  const bindRouterDecisionToModelCall = vi.fn(routerRuntime?.bindRouterDecisionToModelCall)
+  const queueRouterDecision = vi.fn(routerRuntime?.queueRouterDecision)
   const schedulePendingDrainAfterTerminal = vi.fn()
   const scheduleHistorySync = vi.fn()
   const showCompactionToast = vi.fn()
@@ -118,11 +132,12 @@ function createHarness(options: {
     applySessionRunState,
     queueRouterDecision,
     bindRouterDecisionToModelCall,
-    appendEnsembleProgress: vi.fn(),
+    appendEnsembleProgress: vi.fn(routerRuntime?.appendEnsembleProgress),
     markEnsembleHandoff,
-    flushPendingRouterDecision: vi.fn(),
-    clearPendingRouterDecision: vi.fn(),
-    handleRouterControlReplay: vi.fn(),
+    flushPendingRouterDecision: vi.fn(routerRuntime?.flushPendingRouterDecision),
+    clearPendingRouterDecision: vi.fn(routerRuntime?.clearPendingRouterDecision),
+    handleRouterControlReplay: vi.fn(routerRuntime?.handleRouterControlReplay),
+    resetRouterReplayCursor: vi.fn(routerRuntime?.resetRouterReplayCursor),
     showCompactionToast,
     getCompactionPlacement: options.getCompactionPlacement,
     showWarningToast,
@@ -146,7 +161,11 @@ function createHarness(options: {
       return { close() {} }
     },
   })
-  const detach = transport.subscribe({ onEvent: rawApi.onConversationEvent })
+  const detach = transport.subscribe({
+    onEvent: options.withRecoveryFence
+      ? rawApi.consumeConversationEvent
+      : rawApi.onConversationEvent,
+  })
   const api = {
     ...rawApi,
     restoreLiveTurnSnapshot: (snapshot: SessionReadSnapshot) =>
@@ -184,6 +203,196 @@ function createHarness(options: {
     stop: () => { detach(); scope.stop() },
   }
 }
+
+describe('router card recovery projection', () => {
+  const key = 'agent:main:test'
+  const turnId = 'turn-live'
+  const envelope = (seq: number) => ({ key, task_id: turnId, turn_id: turnId, stream_seq: seq })
+  const decision = (seq: number) => ({
+    ...envelope(seq), tier: 'c1', model: 'provider/selected', source: 'squilla_router',
+  })
+  const progress = (seq: number, model = 'candidate') => ({
+    ...envelope(seq), event_type: 'proposer_finish' as const,
+    proposer_provider: 'provider', proposer_model: model,
+  })
+  function setup(withRecoveryFence = false) {
+    const h = createHarness({
+      withRouterRuntime: true,
+      withRecoveryFence,
+      messages: [{ role: 'user', text: 'hello', ts: 0, turnId }],
+    })
+    h.activeStreamTaskId.value = turnId
+    return h
+  }
+  function renderedCards(h: ReturnType<typeof setup>) {
+    return useChatRenderedMessages({
+      messages: h.messages, sessionKey: h.sessionKey,
+      routerSlots: ref([]), routerModels: ref({}), routerTierConfigs: ref({}),
+      routerVisualEffectsEnabled: ref(true), routerVisualMode: ref('real_candidates'),
+      modelRoutingMode: ref('llm_ensemble'), renderMarkdown: text => text,
+      stripGeneratedArtifactMarkers: text => text, stripTimePrefix: text => text,
+      isSubagentCompletionMessage: () => false,
+    }).renderedMessages
+  }
+
+  it('keeps the provisional row mounted when it acquires real event and call identities', () => {
+    const h = setup()
+    const emit = h.api.handlers.onWireEventFixture
+    const rendered = renderedCards(h)
+    try {
+      emit('session.event.ensemble_progress', progress(10))
+      const originalKey = rendered.value.find(message => message.isRouterStrip)?.routerTurnKey
+      expect(originalKey).toBeTruthy()
+      emit('session.event.router_decision', decision(11))
+      expect(rendered.value.filter(message => message.isRouterStrip)).toHaveLength(1)
+      expect(rendered.value.find(message => message.isRouterStrip)?.routerTurnKey).toBe(originalKey)
+      emit('session.event.text_delta', { ...envelope(12), text: 'answer', model_call_id: '1.0' })
+      expect(rendered.value.find(message => message.isRouterStrip)?.routerTurnKey).toBe(originalKey)
+    } finally { h.stop() }
+  })
+
+  it('keeps the next attempt\'s early progress and physical call off the previous card', () => {
+    const h = setup()
+    const emit = h.api.handlers.onWireEventFixture
+    try {
+      emit('session.event.router_decision', decision(10))
+      emit('session.event.ensemble_progress', progress(11, 'first'))
+      emit('session.event.text_delta', { ...envelope(12), text: 'first', model_call_id: '1.0', iteration: 1 })
+      emit('session.event.router_control_replay', envelope(20))
+      emit('session.event.ensemble_progress', progress(21, 'second'))
+      emit('session.event.text_delta', { ...envelope(22), text: 'second', model_call_id: '2.0', iteration: 2 })
+      emit('session.event.router_decision', decision(23))
+
+      const cards = h.messages.value.filter(message => message.role === 'router')
+      expect(cards).toHaveLength(2)
+      expect(cards.map(card => card.ensemble?.models.map(model => model.model))).toEqual([['first'], ['second']])
+      expect(cards.map(card => card.routerModelCallId)).toEqual(['1.0', '2.0'])
+      expect(renderedCards(h).value.filter(message => message.isRouterStrip)).toHaveLength(2)
+    } finally { h.stop() }
+  })
+
+  it.each(['text_delta', 'thinking'] as const)('binds %s before a replay decision even without progress', (event) => {
+    const h = setup()
+    const emit = h.api.handlers.onWireEventFixture
+    try {
+      emit('session.event.router_decision', decision(10))
+      emit('session.event.text_delta', { ...envelope(11), text: 'first', model_call_id: '1.0' })
+      emit('session.event.router_control_replay', envelope(20))
+      emit(`session.event.${event}`, { ...envelope(21), text: 'second', model_call_id: '2.0', iteration: 2 })
+      emit('session.event.router_decision', decision(22))
+
+      const cards = h.messages.value.filter(message => message.role === 'router')
+      expect(cards).toHaveLength(2)
+      expect(cards.map(card => card.routerModelCallId)).toEqual(['1.0', '2.0'])
+      expect(cards[1]).toMatchObject({ messageId: `router-${key}-22`, routerIteration: 2 })
+    } finally { h.stop() }
+  })
+
+  it('preserves task-only call identity when legacy events omit turn_id', () => {
+    const h = setup()
+    const emit = h.api.handlers.onWireEventFixture
+    try {
+      emit('session.event.text_delta', {
+        key, task_id: turnId, stream_seq: 10, text: 'answer', model_call_id: '1.0',
+      })
+      emit('session.event.router_decision', {
+        key, task_id: turnId, stream_seq: 11, tier: 'c1', model: 'provider/selected', source: 'squilla_router',
+      })
+      const cards = h.messages.value.filter(message => message.role === 'router')
+      expect(cards).toHaveLength(1)
+      expect(cards[0]).toMatchObject({ turnId, messageId: `router-${key}-11`, routerModelCallId: '1.0' })
+    } finally { h.stop() }
+  })
+
+  it('replays a full snapshot repeatedly without duplicating or mixing attempts', () => {
+    const h = setup()
+    const emit = h.api.handlers.onWireEventFixture
+    const events = [
+      { semanticKind: 'router-decision' as const, payload: decision(10) },
+      { semanticKind: 'ensemble-progress' as const, payload: progress(11, 'first') },
+      { semanticKind: 'router-control-replay' as const, payload: envelope(20) },
+      { semanticKind: 'ensemble-progress' as const, payload: progress(21, 'second') },
+    ]
+    try {
+      emit('session.event.router_decision', decision(10))
+      emit('session.event.ensemble_progress', progress(11, 'first'))
+      emit('session.event.router_control_replay', envelope(20))
+      emit('session.event.ensemble_progress', progress(21, 'second'))
+      for (let replay = 0; replay < 2; replay++) {
+        h.api.restoreLiveTurnSnapshot({ sessionKey: key, taskId: turnId, events })
+      }
+      emit('session.event.router_decision', decision(22))
+      h.api.restoreLiveTurnSnapshot({
+        sessionKey: key, taskId: turnId,
+        events: [...events, { semanticKind: 'router-decision', payload: decision(22) }],
+      })
+
+      const cards = h.messages.value.filter(message => message.role === 'router')
+      expect(cards).toHaveLength(2)
+      expect(cards.map(card => card.messageId)).toEqual([`router-${key}-10`, `router-${key}-22`])
+      expect(cards.map(card => card.ensemble?.models.map(model => model.model))).toEqual([['first'], ['second']])
+      expect(renderedCards(h).value.filter(message => message.isRouterStrip)).toHaveLength(2)
+    } finally { h.stop() }
+  })
+
+  it('does not populate a new session from an old session\'s late events or snapshot', () => {
+    const h = setup()
+    const emit = h.api.handlers.onWireEventFixture
+    try {
+      emit('session.event.ensemble_progress', progress(10))
+      h.messages.value = []
+      h.sessionKey.value = 'agent:main:new'
+      h.activeStreamTaskId.value = ''
+      emit('session.event.ensemble_progress', progress(11))
+      emit('session.event.router_decision', decision(12))
+      emit('session.event.router_control_replay', envelope(13))
+      h.api.restoreLiveTurnSnapshot({
+        sessionKey: key, taskId: turnId,
+        events: [{ semanticKind: 'ensemble-progress', payload: progress(11) }],
+      })
+      expect(h.messages.value).toEqual([])
+      expect(renderedCards(h).value).toEqual([])
+    } finally { h.stop() }
+  })
+
+  it('keeps buffered replay attempts isolated while an in-place recovery installs its snapshot', () => {
+    const h = setup(true)
+    const emit = h.api.handlers.onWireEventFixture
+    const firstText = { ...envelope(12), text: 'first', model_call_id: '1.0', iteration: 1 }
+    const events = [
+      { semanticKind: 'router-decision' as const, payload: decision(10) },
+      { semanticKind: 'ensemble-progress' as const, payload: progress(11, 'first') },
+      { semanticKind: 'text-delta' as const, payload: firstText },
+    ]
+    const rendered = renderedCards(h)
+    try {
+      emit('session.event.router_decision', decision(10))
+      emit('session.event.ensemble_progress', progress(11, 'first'))
+      emit('session.event.text_delta', firstText)
+      const originalKey = rendered.value.find(message => message.isRouterStrip)?.routerTurnKey
+
+      h.api.beginRecovery()
+      emit('session.event.router_control_replay', envelope(20))
+      emit('session.event.ensemble_progress', progress(21, 'second'))
+      emit('session.event.text_delta', { ...envelope(22), text: 'second', model_call_id: '2.0', iteration: 2 })
+      emit('session.event.router_decision', decision(23))
+
+      expect(h.messages.value.filter(message => message.role === 'router')).toHaveLength(1)
+      expect(h.lastStreamSeq.value).toBe(12)
+      h.api.restoreLiveTurnSnapshot({ sessionKey: key, taskId: turnId, currentStreamSeq: 12, events })
+      expect(h.api.finishRecovery()).toBe(true)
+
+      const cards = h.messages.value.filter(message => message.role === 'router')
+      expect(cards).toHaveLength(2)
+      expect(cards.map(card => card.messageId)).toEqual([`router-${key}-10`, `router-${key}-23`])
+      expect(cards.map(card => card.ensemble?.models.map(model => model.model))).toEqual([['first'], ['second']])
+      expect(cards.map(card => card.routerModelCallId)).toEqual(['1.0', '2.0'])
+      expect(h.lastStreamSeq.value).toBe(23)
+      expect(rendered.value.filter(message => message.isRouterStrip)).toHaveLength(2)
+      expect(rendered.value.find(message => message.isRouterStrip)?.routerTurnKey).toBe(originalKey)
+    } finally { h.stop() }
+  })
+})
 
 describe('live task steer capability', () => {
   const capability = {
@@ -2922,6 +3131,22 @@ describe('useChatRpcEventHandlers ensemble activity', () => {
     } finally {
       stop()
     }
+  })
+
+  it('does not restore durable setup work from a reconnect superseded by in-place recovery', async () => {
+    let resolveSubscription!: (subscribed: boolean) => void
+    const subscription = new Promise<boolean>(resolve => { resolveSubscription = resolve })
+    const { api, onSessionSubscribed, stop } = createHarness({
+      subscribeSession: () => subscription,
+    })
+    try {
+      api.handlers.onConnectionState('connected')
+      api.beginRecovery()
+      resolveSubscription(true)
+      await subscription
+      await Promise.resolve()
+      expect(onSessionSubscribed).not.toHaveBeenCalled()
+    } finally { stop() }
   })
 
   it('does not restore durable setup work from a non-authoritative outcome object', async () => {
