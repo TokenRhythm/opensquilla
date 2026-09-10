@@ -3552,6 +3552,7 @@
     "deliverablesCount": "产物（{count}）",
     "contextPressure": "上下文 {pct}%",
     "contextPressureTitle": "上下文窗口 {used}k / {window}k tokens — 接近压缩阈值",
+    "contextUsageTitle": "上下文窗口 {used}k / {window}k tokens",
     "sessionDeliverables": "会话产物",
     "noDeliverables": "暂无产物。",
     "openArtifact": "打开 {title}，{subtitle}",

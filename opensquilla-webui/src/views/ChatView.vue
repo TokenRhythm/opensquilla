@@ -2075,6 +2075,7 @@ const chatUsageWidget = useChatUsageWidget({
 const {
   usageAccum,
   usageModel,
+  contextUsage,
   resetSavingsPopupCooldown,
   saveWidgetState,
   restoreWidgetState,
@@ -5544,6 +5545,7 @@ const chatRouteHeaderRegistration = chatRouteHeader.register({
   copyIcon: sessionCopyIcon,
   copyLiveText: sessionCopyLiveText,
   deliverableCount: headerDeliverableCount,
+  contextUsage,
   hasNewDeliverable,
   shareMode,
   shareableMessageCount,

@@ -29,11 +29,16 @@ interface PersistedUsageWidget {
   model?: string
 }
 
-export interface ContextWarning {
+export interface ContextUsage {
   pct: number
   usedK: number
   windowK: number
+  /** True once pressure reaches the gateway's own warning ratio. */
+  warning: boolean
 }
+
+/** The above-threshold subset, under the name it had before the reading existed. */
+export type ContextWarning = ContextUsage
 
 export function createEmptyUsageAccumulator(): ChatUsageAccumulator {
   return {
@@ -55,23 +60,43 @@ export function useChatUsageWidget(options: UseChatUsageWidgetOptions) {
   const lastSavingsPopupIdentity = ref('')
   const contextStatus = ref<UsageContextStatus | null>(null)
 
-  // Surfaced as a topbar chip only once the session's context window crosses the
-  // gateway's warning ratio (0.85) — a proactive heads-up before compaction,
-  // independent of any compaction event. Null when below threshold or unknown.
-  const contextWarning = computed<ContextWarning | null>(() => {
+  // The reading itself, present whenever the gateway resolved a context window.
+  // A number that only appears once it is nearly too late is a warning, not a
+  // gauge: by the time the chip shows up at 85% the user has already spent the
+  // room they would have wanted to spend differently. `warning` carries the
+  // threshold so the styling can still change without the number vanishing
+  // below it.
+  const contextUsage = computed<ContextUsage | null>(() => {
     const cs = contextStatus.value
     if (!cs) return null
-    const pressure = Number(cs.pressure ?? 0)
-    const ratio = cs.warningRatio
     const windowTokens = cs.contextWindowTokens
-    if (!(ratio > 0) || !(windowTokens > 0) || pressure < ratio) return null
+    if (!(windowTokens > 0)) return null
     const used = cs.contextTokens
+    if (!(used >= 0)) return null
+    const ratio = cs.warningRatio
+    // `pressure` is the gateway's own ratio, but the adapter substitutes 0 for
+    // a payload that omits it (`finiteNumber` in usageReportingV4), so a
+    // missing ratio is indistinguishable from a genuinely empty window at this
+    // layer. Falling back to the quotient whenever the counts disagree with a
+    // zero keeps that case from rendering a confident "0%" beside a tooltip
+    // reading 115k / 128k.
+    const reported = cs.pressure > 0 ? cs.pressure : used / windowTokens
+    const pressure = Number.isFinite(reported)
+      ? Math.min(1, Math.max(0, reported))
+      : Math.min(1, used / windowTokens)
     return {
-      pct: Math.round(Math.min(1, pressure) * 100),
+      // Floor, not round: 99.5% must not present itself as a full window.
+      pct: Math.floor(pressure * 100),
       usedK: Math.round(used / 1000),
       windowK: Math.round(windowTokens / 1000),
+      warning: ratio > 0 && pressure >= ratio,
     }
   })
+
+  // The above-threshold half, unchanged for callers that only want the warning.
+  const contextWarning = computed<ContextWarning | null>(() => (
+    contextUsage.value?.warning ? contextUsage.value : null
+  ))
 
   function resetSavingsPopupCooldown() {
     savingsPopupLastTs.value = 0
@@ -140,6 +165,7 @@ export function useChatUsageWidget(options: UseChatUsageWidgetOptions) {
   return {
     usageAccum,
     usageModel,
+    contextUsage,
     contextWarning,
     resetSavingsPopupCooldown,
     saveWidgetState,
