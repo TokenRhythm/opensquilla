@@ -307,6 +307,36 @@ def rehearsal_driver(tmp_path: Path) -> tuple[str, Path]:
     # manifest is real; no application, release download, or installer is run.
     driver = tmp_path / "driver.mjs"
     shutil.copyfile(DRIVER, driver)
+    # Only exercise driver orchestration here. Native process identities and
+    # inherited handles have independent signed-exit-observer contract tests.
+    observer = tmp_path / "fixtures/packaged-cached-handoff/signed-exit-observer.mjs"
+    observer.parent.mkdir(parents=True)
+    observer.write_text(
+        """
+import assert from 'node:assert/strict'
+export function trackSignedChildClose(child) { assert.equal(child.pid, 12345) }
+export async function captureSignedHandoffProcesses({ app }) {
+  return { child: app.process(), electronPid: 12345 }
+}
+export async function observeSignedHandoff({ child, clickPromise }) {
+  assert.equal(child.pid, 12345)
+  await clickPromise
+  return { syntheticOrchestrationOnly: true }
+}
+export async function releaseExitedHandoffTransport(child, evidence) {
+  assert.equal(child.pid, 12345)
+  assert.equal(evidence.syntheticOrchestrationOnly, true)
+}
+export async function preserveFailedDriverUntilExit({ originalError }) {
+  assert.ok(originalError instanceof Error)
+}
+""",
+        encoding="utf-8",
+    )
+    (tmp_path / "packaged-first-send-cleanup.mjs").write_text(
+        "export async function closeElectronAndObserveExit(app) { await app.close() }\n",
+        encoding="utf-8",
+    )
     (tmp_path / "packaged-smoke-helpers.mjs").write_text(
         """
 import { EventEmitter } from 'node:events'
@@ -552,6 +582,8 @@ def test_signed_handoff_rejects_unverified_or_changed_candidate(
     )
     assert result.returncode != 0
     assert "SYNTHETIC_RELAUNCH_REQUESTED" not in result.stdout
+    assert "AssertionError" in result.stderr
+    assert "ERR_MODULE_NOT_FOUND" not in result.stderr
     assert not (rehearsal_driver[1].parent / "handoff.json").exists()
 
 

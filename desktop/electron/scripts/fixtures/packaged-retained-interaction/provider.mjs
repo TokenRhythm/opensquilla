@@ -2,6 +2,12 @@ import assert from 'node:assert/strict'
 import { createServer } from 'node:http'
 import { sha256 } from './contract.mjs'
 
+// Match the production inject_time_prefix format, stripping exactly one stamp
+// from the current user message. History/substrings must never select a turn.
+const timePrefix = /^\[\d{4}-\d{2}-\d{2}T\d{2}:\d{2}[+\-]\d{2}:\d{2} (?:Mon|Tue|Wed|Thu|Fri|Sat|Sun) [A-Za-z0-9_+\-/]+\]\n/
+// Agent._runtime_context_block appends the OS-localized timezone to a turn.
+const runtimeSuffix = /\n\n\[Runtime context for this turn\]\nCurrent local date\/time: \d{4}-\d{2}-\d{2}T\d{2}:\d{2}[+\-]\d{2}:\d{2} \((?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)\)\nTime zone \/ location hint: [^\r\n]{1,128}\nUse this runtime context for questions about the current date, time, or local time zone\. Do not treat it as a user request\.$/
+
 // The provider is not given the sentinel's contents. It can complete the tool
 // turn only after read_file returns the nonce whose hash the driver supplied.
 export async function startRetainedProvider({ baseUrl, model, messages, sentinelPath, sentinelTokenSha256 }) {
@@ -38,7 +44,8 @@ export async function startRetainedProvider({ baseUrl, model, messages, sentinel
       assert.equal(payload.model, model, 'Unexpected provider model')
       assert.ok(Array.isArray(payload.messages), 'Missing provider messages')
       const userIndex = payload.messages.findLastIndex(message => message.role === 'user')
-      const prompt = payload.messages[userIndex]?.content
+      const content = payload.messages[userIndex]?.content
+      const prompt = typeof content === 'string' ? content.replace(timePrefix, '').replace(runtimeSuffix, '') : content
       if (prompt === messages.first) {
         assert.equal(++state.first, 1, 'Duplicate first send')
         send(response, messages.firstAnswer)

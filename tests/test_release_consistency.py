@@ -297,21 +297,24 @@ def test_release_profile_config_diagnostics_omit_values(
     assert parsed["actual_text_sha256"] != parsed["expected_text_sha256"]
 
 
+@pytest.mark.parametrize("signed_seed", [False, True])
 @pytest.mark.parametrize(
     "variant", ["seed", "migrated", "partial-migration", "comment", "identity", "external"]
 )
 def test_signed_retained_preservation_accepts_only_exact_seed_or_migration(
-    tmp_path: Path, variant: str
+    tmp_path: Path, variant: str, signed_seed: bool
 ) -> None:
     probe_path = Path(".github/scripts/verify-release-profile-preservation.py")
     probe = runpy.run_path(str(probe_path))
     home = tmp_path / "profile"
     external = tmp_path / "external"
     label = "signed-retained-contract"
-    probe["seed_profile"](home, label, external_root=external)
+    probe["seed_profile"](home, label, external_root=external, signed_retained=signed_seed)
     config = home / "config.toml"
     if variant == "migrated":
-        config.write_text(probe["_runtime_config_text"](home), encoding="utf-8")
+        config.write_text(
+            probe["_runtime_config_text"](home, signed_retained=signed_seed), encoding="utf-8"
+        )
     elif variant == "partial-migration":
         config.write_text("config_version = 1\n" + config.read_text(), encoding="utf-8")
     elif variant == "comment":
@@ -321,8 +324,15 @@ def test_signed_retained_preservation_accepts_only_exact_seed_or_migration(
     elif variant == "external":
         (external / "git" / "git-sentinel.bin").write_bytes(b"changed")
     argv = [
-        sys.executable, str(probe_path), "verify-signed-retained",
-        "--home", str(home), "--label", label, "--external-root", str(external),
+        sys.executable,
+        str(probe_path),
+        "verify-signed-retained",
+        "--home",
+        str(home),
+        "--label",
+        label,
+        "--external-root",
+        str(external),
     ]
     result = subprocess.run(argv, capture_output=True, text=True, check=False)
     assert result.returncode == (0 if variant in {"seed", "migrated"} else 1), result.stderr

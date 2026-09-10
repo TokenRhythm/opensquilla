@@ -35,7 +35,14 @@ restarts, and after the final Quit, including `--external-root` when supplied.
 It accepts only the exact original seed config or the exact known migrated
 config; the independent credential/config hashes must remain unchanged during
 the interaction probe. Legacy `verify` and `verify-runtime` keep their existing
-semantics. All exact 320-message old-session assertions remain in force.
+semantics. `seed-signed-retained` declares a 131072-token synthetic model context
+and 4096 output tokens before A starts; the signed checker recognizes its exact
+seed/migrated forms too. This does not modify an upgraded config or bypass the
+Gateway request budget. The loopback fixture accepts the production time prefix
+and runtime-context suffix on the current user message, with exact audit text
+matching after removing those fixed formats. It never selects a turn from
+history or an arbitrary substring.
+All exact 320-message old-session assertions remain in force.
 Real rendered UI navigation also visits the two seeded
 sessions, then creates an independent new session for these actions:
 

@@ -336,7 +336,7 @@ function Invoke-SignedWindowsUpdateAudit {
         }
       }
     }
-    & $pythonExecutable $probe seed --home $plan.Profile --label signed-update-audit --external-root (Join-Path $plan.EvidenceRoot 'external-sentinels') |
+    & $pythonExecutable $probe seed-signed-retained --home $plan.Profile --label signed-update-audit --external-root (Join-Path $plan.EvidenceRoot 'external-sentinels') |
       Out-File -LiteralPath (Join-Path $plan.EvidenceRoot 'profile-seed.log')
     if ($LASTEXITCODE -ne 0) { throw 'Could not seed the isolated synthetic profile.' }
     $handoffMode = 'signed-handoff'
@@ -446,7 +446,8 @@ function Invoke-SignedWindowsUpdateAudit {
     if (-not $restart) { throw 'B installation and a new process after handoff were not both observed.' }
     $automaticPid = $restart.Pid
     $result.restartObservation = $restart
-    $attestation = Read-Host 'If B started from NSIS Finish with Run OpenSquilla selected and you did not launch it manually, type FINISH-AUTOLAUNCH'
+    Write-Host 'If B started from NSIS Finish with Run OpenSquilla selected and you did not launch it manually, type FINISH-AUTOLAUNCH'
+    $attestation = Read-Host 'Finish/Run observation'
     if ($attestation -cne 'FINISH-AUTOLAUNCH') { throw 'Finish-page restart was not confirmed; a manual launch does not count.' }
     $result.restartAttestation = 'operator confirmed NSIS Finish/Run; shell-broker causality not machine-proven'
     $result.installedVersionVerified = $true
@@ -475,7 +476,8 @@ function Invoke-SignedWindowsUpdateAudit {
       }
     } while ($added)
     $result.quitProcessSnapshot = $owned.ToArray()
-    $quit = Read-Host 'Use the running B tray Quit command, then type QUIT (do not end it in Task Manager)'
+    Write-Host 'Use the running B tray Quit command, then type QUIT (do not end it in Task Manager)'
+    $quit = Read-Host 'Normal Quit observation'
     if ($quit -cne 'QUIT') { throw 'Normal Quit was not confirmed; processes and profile are retained for diagnosis.' }
     $deadline = [datetime]::UtcNow.AddSeconds([Math]::Min(90, $InstallTimeoutSeconds))
     do {

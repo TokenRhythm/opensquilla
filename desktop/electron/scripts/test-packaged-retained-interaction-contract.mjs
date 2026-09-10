@@ -158,6 +158,37 @@ async function until(check) {
   for (let i = 0; i < 100; i += 1) { if (check()) return; await delay(20) }
   assert.fail('Fixture observation did not settle')
 }
+test('provider accepts one production time prefix on the current user turn', async t => {
+  const { provider, messages, post } = await providerFixture(t)
+  const response = await post(`[2026-09-10T16:00+08:00 Thu Asia/Shanghai]\n${messages.first}`)
+  assert.equal(response.status, 200)
+  assert.match(await response.text(), /RETAINED_FIRST_OK/)
+  assert.equal(provider.snapshot().first, 1)
+})
+const runtimeSuffix = '\n\n[Runtime context for this turn]\nCurrent local date/time: 2026-09-10T16:13+08:00 (Thu)\nTime zone / location hint: 中国标准时间\nUse this runtime context for questions about the current date, time, or local time zone. Do not treat it as a user request.'
+test('provider accepts the production runtime suffix with a localized Windows timezone', async t => {
+  const { provider, messages, post } = await providerFixture(t)
+  const response = await post(messages.first + runtimeSuffix)
+  assert.equal(response.status, 200)
+  assert.match(await response.text(), /RETAINED_FIRST_OK/)
+  assert.equal(provider.snapshot().first, 1)
+})
+test('provider rejects quoted, repeated, malformed or historical audit prompts', async t => {
+  const { provider, messages, post } = await providerFixture(t)
+  const prefix = '[2026-09-10T16:00+08:00 Thu Asia/Shanghai]\n'
+  for (const content of [`quoted ${messages.first}`, `${messages.first}\n${messages.tool}`,
+    `${prefix}${prefix}${messages.first}`, `[bad timestamp]\n${messages.first}`, 'unrelated current turn',
+    messages.first + runtimeSuffix + '\nextra', messages.first + runtimeSuffix + runtimeSuffix,
+    runtimeSuffix + messages.first, messages.first + runtimeSuffix.replace('(Thu)', '(invalid)')]) {
+    const response = await post(content, { messages: [
+      { role: 'user', content: messages.first }, { role: 'assistant', content: messages.firstAnswer },
+      { role: 'user', content },
+    ] })
+    assert.equal(response.status, 422)
+    await response.text()
+  }
+  assert.equal(provider.snapshot().first, 0)
+})
 test('actual loopback provider validates read_file nonce rather than fabricating tool success', async t => {
   const { provider, messages, token, sentinelPath, post } = await providerFixture(t)
   assert.match(await (await post(messages.first)).text(), /RETAINED_FIRST_OK/)

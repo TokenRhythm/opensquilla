@@ -26,11 +26,19 @@ def _powershell(script: Path, **environment: str) -> subprocess.CompletedProcess
     executable = shutil.which("pwsh") or shutil.which("powershell")
     if not executable:
         pytest.skip("PowerShell is required for the signed audit contracts")
+    # Keep -File exit semantics (including explicitly handled native failures).
+    # These are generated test scripts, never the checked-in audit entry point.
+    assert script.resolve() != AUDIT.resolve()
+    script.write_text(
+        "[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)\n"
+        + script.read_text(encoding="utf-8-sig"),
+        encoding="utf-8-sig",
+    )
     return subprocess.run(
         [executable, "-NoProfile", "-NonInteractive", "-File", str(script)],
         env={**os.environ, **environment},
         capture_output=True,
-        text=True,
+        encoding="utf-8",
         timeout=30,
     )
 
@@ -46,6 +54,38 @@ def test_signed_audit_powershell_parses_without_executing(tmp_path: Path) -> Non
     )
     result = _powershell(parser, AUDIT_SCRIPT=str(AUDIT))
     assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_operator_prompts_remain_visible_with_redirected_stdin(tmp_path: Path) -> None:
+    executable = shutil.which("pwsh") or shutil.which("powershell")
+    if not executable:
+        pytest.skip("PowerShell is required")
+    source = AUDIT.read_text(encoding="utf-8")
+    blocks = []
+    for variable in ("attestation", "quit"):
+        lines = source.splitlines()
+        index = next(i for i, line in enumerate(lines) if f"${variable} = Read-Host" in line)
+        assert lines[index - 1].strip().startswith("Write-Host ")
+        blocks.extend(lines[index - 1 : index + 1])
+    script = tmp_path / "redirected-prompts.ps1"
+    script.write_text(
+        "\n".join(blocks) + "\n@{finish=$attestation;quit=$quit}|ConvertTo-Json -Compress\n",
+        encoding="utf-8",
+    )
+    result = subprocess.run(
+        [executable, "-NoLogo", "-NoProfile", "-File", str(script)],
+        input="FINISH-AUTOLAUNCH\nQUIT\n",
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "type FINISH-AUTOLAUNCH" in result.stdout
+    assert "then type QUIT" in result.stdout
+    assert json.loads(result.stdout.splitlines()[-1]) == {
+        "finish": "FINISH-AUTOLAUNCH",
+        "quit": "QUIT",
+    }
 
 
 def test_native_profile_matches_the_packaged_electron_name(tmp_path: Path) -> None:
@@ -205,7 +245,7 @@ function Unregister-Event { param($SourceIdentifier, $ErrorAction) }
 function Get-Event { param($SourceIdentifier, $ErrorAction) }
 function Remove-Job { param($Job, [switch]$Force, $ErrorAction) }
 function Read-Host { param($Prompt)
-  if ($Prompt -like 'Use the running B tray Quit*') {
+  if ($Prompt -eq 'Normal Quit observation') {
     $global:Calls.Add('normal-quit')
     if ($env:AUDIT_FAIL -eq 'quit') { return 'Task Manager' }
     $global:QuitObserved = $true
@@ -403,7 +443,7 @@ function python {
   $values = @($args)
   $global:Calls.Add("profile-$($values[1])")
   $global:LASTEXITCODE = 0
-  if ($values[1] -eq 'seed') {
+  if ($values[1] -eq 'seed-signed-retained') {
     $profile = Get-ArgumentValue $values '--home'
     New-Item -ItemType Directory -Path $profile | Out-Null
     $userData = Split-Path $profile -Parent
@@ -462,7 +502,7 @@ def test_signed_audit_orchestration_stays_incomplete_and_stops_on_failure(
     assert execution["code"] == (1 if failure else 2), execution
     assert execution["calls"][-1] == last_call
     if failure == "subscription":
-        assert "profile-seed" not in execution["calls"]
+        assert "profile-seed-signed-retained" not in execution["calls"]
         assert "handoff" not in execution["calls"]
         assert not Path(environment["AUDIT_NATIVE_PROFILE"]).exists()
     result = json.loads((evidence / "result.json").read_text(encoding="utf-8-sig"))
@@ -526,7 +566,7 @@ def test_standard_user_observation_does_not_require_elevating_the_client(
     assert execution["code"] == (1 if failure else 2), execution
     assert "observe-before-click" not in execution["calls"]
     if failure:
-        assert "profile-seed" not in execution["calls"]
+        assert "profile-seed-signed-retained" not in execution["calls"]
         assert "handoff" not in execution["calls"]
         assert not Path(environment["AUDIT_NATIVE_PROFILE"]).exists()
     else:

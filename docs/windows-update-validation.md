@@ -330,7 +330,19 @@ This is **not a completed native acceptance cell**. Preserve these boundaries:
   do not rewrite an upgraded profile or bypass request budgets to claim success.
   Retained tool use, Stop and restart remain unverified.
 
-The user's original profile was kept separately with a hash-verified backup.
+The follow-up harness now seeds adequate synthetic model capacity before A,
+emits explicit operator prompts even with redirected stdin, and recognizes the
+production per-turn time context. An independent installed-B preflight then
+passed first send, real sentinel `read_file`, actual Stop/stream cancellation,
+follow-up and normal Quit. One attempt's restart was blocked by another
+workspace's same-named CLI process; that process was preserved. A fresh retry
+with no process conflict completed both launches, restored old and new history,
+sent a message after restart, quit normally twice, and passed final config,
+credential and profile checks (`os1584-cap-b720e1df`). This fresh synthetic
+preflight is not upgraded-profile or integrated A-to-B evidence.
+
+The user's original profile has been restored with all 4913 files hash-verified;
+the separate backup remains preserved.
 Local evidence and private profile data are not repository artifacts. This
 cached-input run does not verify download, public channels, blocked GitHub,
 cold certificate-chain networking, UAC/cancellation, or the full OS/scope matrix.
