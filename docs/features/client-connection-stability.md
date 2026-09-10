@@ -517,6 +517,29 @@ verification and staging of 397 files. Its rebuilt
 production artifact passed all 12 history-hydration browser cases and the
 separately selected session-hang case with zero retries, including the delayed
 first Hello and reconnect configuration-admission regressions.
+The complete ten-spec production browser recovery matrix subsequently passed
+66/66 with flow disabled and 66/66 with flow enabled, zero retries, including
+real Goal negotiation/consumption and silent-reply recovery checks.
+
+Fresh hosted CI checks out merge `1c4a9edfa3b6737c411c15cc745b1b2604480dc1`,
+combining repaired head `6464d4f326eab14130d85421d739a406bd2394b9` with main
+`ee26be13792405aebef0c80111b6c308b6e1b094` (#1605). The checkout log and merge
+parents establish that baseline; a stale PR base field alone does not. Upstream
+does not change connection/recovery code; its only overlapping file adds a
+deprecation comment in a separate configuration section. The engine experiment
+removals still require their own hosted runtime checks.
+
+That hosted run also exposed a pre-existing Windows Workbench retry-classifier
+bug: Chromium's loopback `/one` load reported `ERR_NO_BUFFER_SPACE (-176)`, then
+Node printed the outer runner's literal `throw new Error(...)` source line.
+The generic crash detector mistook its `${command}` template and failure text
+for an independent process crash. The existing single-retry rule now recognizes
+only that exact owned script-location/source/caret display block, after its
+case/OS/error/URL-specific match. Separate errors, assertions, crashes, other
+scripts and incomplete display context still prevent a retry. The original
+failure artifact is retained. This classification correction does not establish
+or repair the underlying Chromium resource-allocation cause.
+
 Windows local-test limits are recorded separately from product failures: an
 attachment test's ordinary `Path.read_bytes()` failed on a 308-character path
 although the production native-path write succeeded. All 98 tests in that file

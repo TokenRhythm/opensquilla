@@ -1623,6 +1623,17 @@ jobs:
                           r"failed with exit code 1$",
                           re.MULTILINE,
                       ),
+                      # Node also prints the exact outer throw site. Its
+                      # template variable named `command` is source text,
+                      # not a second process-failure report. Require this
+                      # owned file location, literal source and caret together.
+                      re.compile(
+                          r"^file:///[^\r\n]*/test-offline-document-workbench-e2e\.mjs:[1-9]\d*\n"
+                          r"[ \t]+throw new Error\(`\$\{command\} \$\{args\.join\(' '\)\} "
+                          r"failed with exit code \$\{result\.exitCode\}`\)\n"
+                          r"[ \t]+\^[ \t]*(?=\n|$)",
+                          re.MULTILINE,
+                      ),
                   ),
               },
               {
