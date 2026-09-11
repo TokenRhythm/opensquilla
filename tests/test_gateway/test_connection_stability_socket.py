@@ -76,7 +76,6 @@ async def gateway_socket(tmp_path, monkeypatch):
         auth=AuthConfig(mode="none", token=None),
         state_dir=str(tmp_path / "state"),
         config_path=str(tmp_path / "config.toml"),
-        ws_transport_flow_enabled=True,
         ws_writer_queue_enabled=True,
         client_ws_keepalive_timeout_s=0,
     )
