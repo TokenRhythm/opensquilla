@@ -825,6 +825,7 @@ CREATE TABLE IF NOT EXISTS transcript_entries (
     tool_calls TEXT,
     tool_call_id TEXT,
     reasoning_content TEXT,
+    assistant_replay TEXT,
     turn_usage TEXT,
     turn_context TEXT,
     created_at INTEGER NOT NULL,
@@ -863,6 +864,7 @@ CREATE TABLE IF NOT EXISTS compacted_transcript_entries (
     tool_calls TEXT,
     tool_call_id TEXT,
     reasoning_content TEXT,
+    assistant_replay TEXT,
     turn_usage TEXT,
     turn_context TEXT,
     created_at INTEGER NOT NULL,
@@ -1495,6 +1497,7 @@ def _transcript_preimage(
             entry.provenance_source_tool,
             entry.schema_version,
             _stable_json(entry.tool_calls),
+            _stable_json(entry.assistant_replay),
             _stable_json(entry.turn_usage),
             _stable_json(entry.turn_context),
         )
@@ -1602,6 +1605,7 @@ def _deserialize_row(row: dict[str, Any]) -> dict[str, Any]:
     json_fields = {
         "delivery_context",
         "tool_calls",
+        "assistant_replay",
         "turn_usage",
         "turn_context",
         "origin",
@@ -1630,7 +1634,11 @@ def _deserialize_row(row: dict[str, Any]) -> dict[str, Any]:
             try:
                 result[k] = json.loads(v)
             except (json.JSONDecodeError, TypeError):
+                if k == "assistant_replay":
+                    raise ValueError("invalid assistant replay JSON") from None
                 result[k] = None
+            if k == "assistant_replay" and not isinstance(result[k], dict):
+                raise ValueError("assistant replay JSON must be an object")
         elif k in bool_fields:
             result[k] = bool(v)
         else:
@@ -2343,6 +2351,7 @@ class SessionStorage:
         await self._migrate_model_routing_columns()
         await self._migrate_derived_title_column()
         await self._migrate_transcript_reasoning_content_column()
+        await self._migrate_assistant_replay_column()
         await self._migrate_transcript_turn_usage_column()
         await self._migrate_transcript_turn_context_column()
         await self._migrate_summary_metadata_columns()
@@ -2618,6 +2627,21 @@ class SessionStorage:
             await self._conn.execute(
                 "ALTER TABLE transcript_entries ADD COLUMN reasoning_content TEXT"
             )
+            await self._conn.commit()
+
+    async def _migrate_assistant_replay_column(self) -> None:
+        """Add optional accepted-message storage without rewriting old rows."""
+        assert self._conn is not None
+        changed = False
+        for table in ("transcript_entries", "compacted_transcript_entries"):
+            async with self._conn.execute(f"PRAGMA table_info({table})") as cur:
+                columns = {row[1] for row in await cur.fetchall()}
+            if "assistant_replay" not in columns:
+                await self._conn.execute(
+                    f"ALTER TABLE {table} ADD COLUMN assistant_replay TEXT"
+                )
+                changed = True
+        if changed:
             await self._conn.commit()
 
     async def _migrate_transcript_turn_usage_column(self) -> None:
@@ -10389,6 +10413,9 @@ class SessionStorage:
 
         entry.id = int(existing[0])
         entry.created_at = int(existing[1])
+        # Replacement is authoritative, including replay state. Keeping an old
+        # envelope when the caller supplies None could revive an abandoned
+        # generation; accepted-message callers supply their complete envelope.
         data = entry.model_dump(exclude={"id", "created_at"})
         assignments = [f"{column} = ?" for column in data]
         values = [_serialize(data[column]) for column in data]
@@ -10516,6 +10543,7 @@ class SessionStorage:
                 tool_calls,
                 tool_call_id,
                 reasoning_content,
+                assistant_replay,
                 turn_usage,
                 turn_context,
                 created_at,
@@ -10539,6 +10567,7 @@ class SessionStorage:
                 tool_calls,
                 tool_call_id,
                 reasoning_content,
+                assistant_replay,
                 turn_usage,
                 turn_context,
                 created_at,
@@ -13913,6 +13942,7 @@ class SessionStorage:
                 tool_calls,
                 tool_call_id,
                 reasoning_content,
+                assistant_replay,
                 turn_usage,
                 turn_context,
                 created_at,
@@ -13936,6 +13966,7 @@ class SessionStorage:
                 tool_calls,
                 tool_call_id,
                 reasoning_content,
+                assistant_replay,
                 turn_usage,
                 turn_context,
                 created_at,
@@ -14003,6 +14034,7 @@ class SessionStorage:
                 tool_calls,
                 tool_call_id,
                 reasoning_content,
+                assistant_replay,
                 turn_usage,
                 turn_context,
                 created_at,
@@ -14026,6 +14058,7 @@ class SessionStorage:
                 tool_calls,
                 tool_call_id,
                 reasoning_content,
+                assistant_replay,
                 turn_usage,
                 turn_context,
                 created_at,
@@ -14561,6 +14594,7 @@ class SessionStorage:
                     tool_calls,
                     tool_call_id,
                     reasoning_content,
+                    assistant_replay,
                     turn_usage,
                     turn_context,
                     created_at,
@@ -14588,6 +14622,7 @@ class SessionStorage:
                     tool_calls,
                     tool_call_id,
                     reasoning_content,
+                    assistant_replay,
                     turn_usage,
                     turn_context,
                     created_at,
@@ -14743,6 +14778,7 @@ class SessionStorage:
                 tool_calls,
                 tool_call_id,
                 reasoning_content,
+                assistant_replay,
                 turn_usage,
                 turn_context,
                 created_at,
@@ -14767,6 +14803,7 @@ class SessionStorage:
                 tool_calls,
                 tool_call_id,
                 reasoning_content,
+                assistant_replay,
                 turn_usage,
                 turn_context,
                 created_at,
@@ -15402,6 +15439,7 @@ class SessionStorage:
                 tool_calls,
                 tool_call_id,
                 reasoning_content,
+                assistant_replay,
                 turn_usage,
                 turn_context,
                 created_at,

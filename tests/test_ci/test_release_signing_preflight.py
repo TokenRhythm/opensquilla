@@ -630,7 +630,11 @@ def _run_signing_material_step(
             + "\n} finally { $locked.Dispose() }\n"
         )
     script = tmp_path / "signing-material-step.ps1"
-    script.write_text(source, encoding="utf-8")
+    started_marker = "opensquilla-signing-material-step-started"
+    script.write_text(
+        f"[Console]::Error.WriteLine('{started_marker}')\n" + source,
+        encoding="utf-8",
+    )
     # No signing credentials or real user profile are inherited by these scripts.
     env = {
         key: value
@@ -644,16 +648,61 @@ def _run_signing_material_step(
         }
     )
     env.update(environment)
-    return subprocess.run(
-        [powershell, "-NoProfile", "-NonInteractive", "-File", str(script)],
-        cwd=tmp_path,
-        env=env,
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        timeout=15,
+    # These offline tests need neither startup telemetry nor update checks.
+    env.update(
+        POWERSHELL_TELEMETRY_OPTOUT="1",
+        POWERSHELL_UPDATECHECK="Off",
     )
+    try:
+        return subprocess.run(
+            [powershell, "-NoProfile", "-NonInteractive", "-File", str(script)],
+            cwd=tmp_path,
+            env=env,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=15,
+        )
+    except subprocess.TimeoutExpired as exc:
+        stderr = exc.stderr or b""
+        if isinstance(stderr, bytes):
+            stderr = stderr.decode("utf-8", errors="replace")
+        phase = "workflow script" if started_marker in stderr else "PowerShell startup"
+        raise AssertionError(f"Signing material test timed out during {phase}: {name}") from exc
+
+
+@pytest.mark.parametrize(
+    ("stderr", "phase"),
+    [
+        (b"", "PowerShell startup"),
+        (b"opensquilla-signing-material-step-started\n", "workflow script"),
+    ],
+)
+def test_signing_material_timeout_is_offline_and_diagnoses_phase(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stderr: bytes, phase: str,
+) -> None:
+    monkeypatch.setattr(shutil, "which", lambda _name: "synthetic-pwsh")
+    monkeypatch.setenv("SM_API_KEY", "synthetic-parent-secret")
+    monkeypatch.setenv("POWERSHELL_TELEMETRY_OPTOUT", "0")
+    monkeypatch.setenv("POWERSHELL_UPDATECHECK", "Default")
+    calls = []
+
+    def timeout(command: list[str], **kwargs: object) -> None:
+        calls.append(command)
+        env = kwargs["env"]
+        assert isinstance(env, dict)
+        assert "SM_API_KEY" not in env
+        assert env["POWERSHELL_TELEMETRY_OPTOUT"] == "1"
+        assert env["POWERSHELL_UPDATECHECK"] == "Off"
+        assert kwargs["timeout"] == 15
+        assert Path(command[-1]).read_text().startswith("[Console]::Error.WriteLine(")
+        raise subprocess.TimeoutExpired(command, timeout=15, stderr=stderr)
+
+    monkeypatch.setattr(subprocess, "run", timeout)
+    with pytest.raises(AssertionError, match=f"timed out during {phase}"):
+        _run_signing_material_step("Remove DigiCert client authentication material", tmp_path, {})
+    assert len(calls) == 1
 
 
 def test_signing_cleanup_removes_certificate_after_environment_export_fails(tmp_path: Path) -> None:

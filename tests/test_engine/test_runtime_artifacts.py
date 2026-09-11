@@ -63,15 +63,27 @@ from opensquilla.tools.types import (
 class _ArtifactProvider:
     provider_name = "test"
 
-    def __init__(self) -> None:
+    def __init__(self, *, native_replay: bool = False) -> None:
         self.calls = 0
         self.model = "test/model"
+        self.native_replay = native_replay
 
     def chat(self, messages: list[Message], tools=None, config=None) -> AsyncIterator[Any]:
         self.calls += 1
         return self._stream(self.calls)
 
     async def _stream(self, call_number: int) -> AsyncIterator[Any]:
+        from opensquilla.provider.types import ProviderReplayState
+
+        native_state = (
+            ProviderReplayState(
+                protocol="openai_chat_completions", source="synthetic-artifact-origin",
+                model="test/model", reasoning_details=[
+                    {"type": "reasoning.encrypted", "data": f"dummy-state-{call_number}"}
+                ],
+            )
+            if self.native_replay else None
+        )
         if call_number == 1:
             yield ProviderToolUseStart(tool_use_id="tool-1", tool_name="make_file")
             yield ProviderToolUseEnd(
@@ -79,10 +91,18 @@ class _ArtifactProvider:
                 tool_name="make_file",
                 arguments={},
             )
-            yield ProviderDone(stop_reason="tool_use", input_tokens=1, output_tokens=1)
+            yield ProviderDone(
+                stop_reason="tool_use", input_tokens=1, output_tokens=1,
+                reasoning_content="tool reasoning" if self.native_replay else None,
+                provider_replay=native_state,
+            )
             return
         yield ProviderText(text="done")
-        yield ProviderDone(stop_reason="stop", input_tokens=1, output_tokens=1)
+        yield ProviderDone(
+            stop_reason="stop", input_tokens=1, output_tokens=1,
+            reasoning_content="answer reasoning" if self.native_replay else None,
+            provider_replay=native_state,
+        )
 
     async def list_models(self) -> list[ModelInfo]:
         return []
@@ -1186,14 +1206,17 @@ def _goal_publish_loop_registry(
 
 
 @pytest.mark.asyncio
-async def test_turn_runner_streams_artifact_event_and_persists_history(tmp_path) -> None:
+@pytest.mark.parametrize("native_replay", [False, True])
+async def test_turn_runner_streams_artifact_event_and_persists_history(
+    tmp_path, native_replay: bool,
+) -> None:
     storage = SessionStorage(":memory:")
     await storage.connect()
     manager = SessionManager(storage)
     session_key = "agent:main:webchat:artifact-runtime"
     session = await manager.create(session_key)
     runner = TurnRunner(
-        provider_selector=_ProviderSelector(_ArtifactProvider()),
+        provider_selector=_ProviderSelector(_ArtifactProvider(native_replay=native_replay)),
         tool_registry=_registry(),
         session_manager=manager,
         config=GatewayConfig(
@@ -1249,6 +1272,20 @@ async def test_turn_runner_streams_artifact_event_and_persists_history(tmp_path)
         assert "[generated artifact omitted: runtime.txt (text/plain)]" in str(
             history_capture.history[-1].content
         )
+        from opensquilla.engine.history import decode_assistant_replay
+
+        captured = decode_assistant_replay(assistant.assistant_replay)
+        assert history_capture.history[:-1] == captured
+        assert history_capture.history[-1].role == "user"
+        if native_replay:
+            native_assistants = [message for message in captured if message.role == "assistant"]
+            assert [message.reasoning_content for message in native_assistants] == [
+                "tool reasoning", "answer reasoning",
+            ]
+            assert [message.provider_replay.reasoning_details for message in native_assistants] == [
+                [{"type": "reasoning.encrypted", "data": "dummy-state-1"}],
+                [{"type": "reasoning.encrypted", "data": "dummy-state-2"}],
+            ]
     finally:
         await storage.close()
 

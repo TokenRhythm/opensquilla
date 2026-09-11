@@ -20,6 +20,8 @@ decoded event sequence):
 Goldens are JSON lists of `{"type": "<EventClassName>", ...all fields...}`,
 rendered with `json.dumps(..., indent=2, sort_keys=True)`. The `kind`
 discriminator is dropped in favor of the class name.
+`provider_replay` is serialized as its full JSON object, including native
+reasoning details; adapters without captured replay state keep the field `null`.
 
 ## Regenerating
 

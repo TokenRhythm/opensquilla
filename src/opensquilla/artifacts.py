@@ -446,6 +446,41 @@ def artifact_marker(ref: dict[str, Any] | ArtifactRef) -> str:
     return f"[generated artifact omitted: {name} ({mime})]"
 
 
+GENERATED_ARTIFACT_CONTEXT_PREFIX = "[Recorded generated artifacts]"
+
+
+def artifact_history_context(content: Any) -> str:
+    """Read application-owned artifact facts without duplicating assistant text."""
+    if not isinstance(content, str):
+        return ""
+    markers: list[str] = []
+    if content.lstrip().startswith("{"):
+        try:
+            payload = json.loads(content)
+        except (ValueError, TypeError):
+            payload = None
+        if (
+            isinstance(payload, dict)
+            and isinstance(payload.get("text"), str)
+            and isinstance(payload.get("artifacts"), list)
+        ):
+            markers = [
+                artifact_marker(artifact)
+                for artifact in payload["artifacts"]
+                if isinstance(artifact, dict)
+            ]
+    if not markers:
+        # TurnRunner's established artifact projector has already unpacked
+        # the envelope for ordinary history admission.
+        markers = [
+            line.strip() for line in content.splitlines()
+            if line.strip().startswith("[generated artifact omitted:")
+        ]
+    if not markers:
+        return ""
+    return "\n".join([GENERATED_ARTIFACT_CONTEXT_PREFIX, *dict.fromkeys(markers)])
+
+
 def strip_artifact_markers_from_text(text: str) -> str:
     if "[generated artifact omitted:" not in text:
         return text

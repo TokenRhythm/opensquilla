@@ -40,7 +40,27 @@ from opensquilla.provider import (
 from opensquilla.provider import (
     ToolUseStartEvent as ProviderToolUseStart,
 )
-from opensquilla.provider.types import ContentBlockImage
+from opensquilla.provider.types import (
+    ContentBlockImage,
+    ContentBlockRedactedThinking,
+    ProviderReplayState,
+)
+
+
+def test_sanitizing_native_replay_keeps_opaque_block_and_carrier_unchanged():
+    native = [{"type": "redacted_thinking", "data": "synthetic-opaque"}]
+    message = Message(
+        role="assistant",
+        content=[ContentBlockRedactedThinking(data="synthetic-opaque")],
+        provider_replay=ProviderReplayState(
+            protocol="anthropic_messages", source="synthetic-route", model="synthetic-model",
+            native_content=native,
+        ),
+    )
+    before = message.model_dump(mode="json")
+    sanitized, _ = sanitize_session_messages([message])
+    assert sanitized[0].model_dump(mode="json") == before
+    assert message.model_dump(mode="json") == before
 
 
 def _tool_definition(name: str) -> ToolDefinition:
@@ -1851,6 +1871,8 @@ async def test_agent_uses_sanitized_request_view_and_records_context_stages() ->
 
 @pytest.mark.asyncio
 async def test_agent_provider_view_omits_loaded_history_tool_arguments() -> None:
+    from opensquilla.provider.openai import OpenAIProvider
+
     provider = CapturingProvider()
     large_argument = "STALE_HISTORY_ARGUMENT\n" + ("x" * 20_000)
     agent = Agent(
@@ -1893,9 +1915,24 @@ async def test_agent_provider_view_omits_loaded_history_tool_arguments() -> None
     )
     assert large_argument not in payload
     assert "x" * 1000 not in payload
-    assert "old reasoning" not in payload
+    # Engine history retains canonical reasoning; the concrete target adapter
+    # decides whether its wire protocol accepts it.
+    assert "old reasoning" in payload
     assert "historical_tool_argument_omitted" not in payload
     assert "invalid_provider_context_projection:write_file.content" in payload
+    adapter = OpenAIProvider(
+        api_key="synthetic-key", model="gpt-4.1", provider_kind="openai",
+        base_url="https://api.openai.com/v1",
+    )
+    wire, *_ = adapter._build_payload(
+        provider.calls[0]["messages"], provider.calls[0]["tools"], provider.calls[0]["config"],
+    )
+    wire_json = json.dumps(wire, ensure_ascii=False)
+    assert "old reasoning" not in wire_json
+    assert large_argument not in wire_json
+    assert "x" * 1000 not in wire_json
+    assert "invalid_provider_context_projection:write_file.content" in wire_json
+    assert all("reasoning_content" not in message for message in wire["messages"])
 
 
 @pytest.mark.asyncio
@@ -3332,7 +3369,9 @@ async def test_agent_preserves_reasoning_content_for_dashscope_qwen_replay() -> 
 
 
 @pytest.mark.asyncio
-async def test_agent_drops_reasoning_content_when_model_is_not_deepseek() -> None:
+async def test_agent_keeps_reasoning_until_unsupported_provider_wire_projection() -> None:
+    from opensquilla.provider.openai import OpenAIProvider
+
     provider = CapturingProvider()
     agent = Agent(
         provider=provider,
@@ -3363,4 +3402,15 @@ async def test_agent_drops_reasoning_content_when_model_is_not_deepseek() -> Non
     assert any(event.kind == "done" for event in events)
     assert provider.calls
     sent_assistant = provider.calls[0]["messages"][1]
-    assert sent_assistant.reasoning_content is None
+    assert sent_assistant.reasoning_content == "I reasoned before answering."
+    adapter = OpenAIProvider(
+        api_key="synthetic-key", model="custom-reasoning-model", provider_kind="openai",
+        base_url="https://api.openai.com/v1",
+    )
+    wire, *_ = adapter._build_payload(
+        provider.calls[0]["messages"], provider.calls[0]["tools"], provider.calls[0]["config"],
+    )
+    assert all("reasoning_content" not in message for message in wire["messages"])
+    assert "I reasoned before answering." not in json.dumps(wire)
+    # Request projection must not erase state kept for a future compatible target.
+    assert sent_assistant.reasoning_content == "I reasoned before answering."

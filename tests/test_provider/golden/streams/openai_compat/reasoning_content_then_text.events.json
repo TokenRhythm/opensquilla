@@ -26,6 +26,14 @@
     "model_usage_breakdown": [],
     "output_tokens": 11,
     "provider": "openai",
+    "provider_replay": {
+      "model": "gpt-test",
+      "native_content": null,
+      "native_reasoning_content": "Weigh the options.",
+      "protocol": "openai_chat_completions",
+      "reasoning_details": null,
+      "source": "openai_compat:89ed697549efac2ada97829f96f401db22726a687602f2f8718732a8db40c924"
+    },
     "reasoning_content": "Weigh the options.",
     "reasoning_tokens": 6,
     "stop_reason": "stop",

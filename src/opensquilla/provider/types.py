@@ -35,8 +35,9 @@ class ReasoningDeltaEvent:
     not the final answer. Emitting it as its own event lets every layer keep
     the two apart from the source, so the renderer never has to guess a block's
     identity after the fact. The concatenation of these deltas equals
-    DoneEvent.reasoning_content, which remains the source of truth for non-TUI
-    consumers (signature replay, persistence, compaction, cost).
+    DoneEvent.reasoning_content for display and text consumers. Exact signed
+    continuation uses DoneEvent.provider_replay; concatenated text cannot
+    preserve individual thinking blocks or their signatures.
     """
 
     kind: Literal["reasoning_delta"] = field(default="reasoning_delta", init=False)
@@ -126,6 +127,7 @@ class DoneEvent:
     # not carry a synthetic receipt; their physical breakdown rows do.
     billing_receipt: ProviderBillingReceipt | None = None
     generation_epoch: int | None = None
+    provider_replay: ProviderReplayState | None = None
 
     @property
     def upstream_cost_usd(self) -> float:
@@ -698,6 +700,13 @@ class ContentBlockThinking(BaseModel):
     signature: str | None = None
 
 
+class ContentBlockRedactedThinking(BaseModel):
+    """Opaque Anthropic continuation data; never display or summarize it."""
+
+    type: Literal["redacted_thinking"] = "redacted_thinking"
+    data: str = Field(repr=False)
+
+
 class ContentBlockCompaction(BaseModel):
     type: Literal["compaction"] = "compaction"
     content: str | None = None
@@ -713,9 +722,32 @@ MessageContent = (
         | ContentBlockImage
         | ContentBlockDocument
         | ContentBlockThinking
+        | ContentBlockRedactedThinking
         | ContentBlockCompaction
     ]
 )
+
+
+class ProviderReplayState(BaseModel):
+    """Continuation state returned by one accepted provider response.
+
+    ``source`` is an opaque, credential-free endpoint identity, not a URL or
+    request dump. Native blocks retain their original ordering and values;
+    adapters decide whether a target can consume them without changing this
+    canonical record. ``native_reasoning_content`` retains the actual response
+    field, distinct from the display text in ``Message.reasoning_content``
+    which can also be derived from aliases, native details, or thinking tags.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    protocol: str
+    source: str
+    model: str
+    reasoning_details: list[dict[str, Any]] | None = Field(default=None, repr=False)
+    native_reasoning_content: str | None = Field(default=None, repr=False)
+    # Ordered complete Anthropic blocks, including opaque continuation data.
+    native_content: list[dict[str, Any]] | None = Field(default=None, repr=False)
 
 
 class Message(BaseModel):
@@ -724,6 +756,7 @@ class Message(BaseModel):
     role: Literal["user", "assistant"]
     content: MessageContent
     reasoning_content: str | None = None
+    provider_replay: ProviderReplayState | None = None
 
 
 # ---------------------------------------------------------------------------

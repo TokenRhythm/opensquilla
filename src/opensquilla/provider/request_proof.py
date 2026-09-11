@@ -820,6 +820,16 @@ def _hard_compact_content_for_provider(content: Any, *, label: str) -> Any:
             compacted.append(block)
             continue
         next_block = dict(block)
+        block_type = next_block.get("type")
+        if isinstance(block_type, str) and (
+            block_type in {"thinking", "redacted_thinking"}
+            or block_type.startswith("reasoning.")
+        ):
+            # Native continuation blocks can carry signatures or encrypted
+            # state. They remain byte-for-byte intact and count in admission;
+            # an oversized history must be compacted at a context boundary.
+            compacted.append(next_block)
+            continue
         if isinstance(next_block.get("text"), str):
             next_block["text"] = _hard_compact_string(
                 next_block["text"],
@@ -829,11 +839,6 @@ def _hard_compact_content_for_provider(content: Any, *, label: str) -> Any:
             next_block["content"] = _hard_compact_string(
                 next_block["content"],
                 label=f"{label}_content",
-            )
-        if isinstance(next_block.get("thinking"), str):
-            next_block["thinking"] = _hard_compact_string(
-                next_block["thinking"],
-                label=f"{label}_thinking",
             )
         compacted.append(next_block)
     return compacted
@@ -1187,12 +1192,8 @@ def _compact_recent_tail_payload_once(
         if index == protected_index:
             continue
         if message.get("role") == "assistant":
-            reasoning_content = message.get("reasoning_content")
-            if isinstance(reasoning_content, str):
-                message["reasoning_content"] = _compact_tail_string(
-                    reasoning_content,
-                    label="reasoning_content",
-                )
+            # reasoning_content and reasoning_details are protocol replay
+            # state, not text that may be replaced with a request-view stub.
             tool_calls = message.get("tool_calls")
             if isinstance(tool_calls, list):
                 for tool_call in tool_calls:
@@ -1220,11 +1221,6 @@ def _compact_recent_tail_payload_once(
                 continue
             if block.get("type") == "tool_use":
                 block["input"] = _compact_tool_input(block.get("input"))
-            elif block.get("type") == "thinking" and isinstance(block.get("thinking"), str):
-                block["thinking"] = _compact_tail_string(
-                    block["thinking"],
-                    label="thinking_block",
-                )
             elif message.get("role") == "assistant" and block.get("type") == "text":
                 _compact_text_block(block)
     compacted = _compact_tool_payload_once(
@@ -1305,12 +1301,6 @@ def _emergency_compact_current_turn_payload_once(
                 label=f"{role}_content",
             )
         if role == "assistant":
-            reasoning_content = message.get("reasoning_content")
-            if isinstance(reasoning_content, str):
-                message["reasoning_content"] = _emergency_compact_string(
-                    reasoning_content,
-                    label="reasoning_content",
-                )
             tool_calls = message.get("tool_calls")
             if isinstance(tool_calls, list):
                 for tool_call in tool_calls:
@@ -1351,11 +1341,6 @@ def _emergency_compact_current_turn_payload_once(
                                 item["text"],
                                 label="tool_result_text",
                             )
-            elif block.get("type") == "thinking" and isinstance(block.get("thinking"), str):
-                block["thinking"] = _emergency_compact_string(
-                    block["thinking"],
-                    label="thinking_block",
-                )
             elif role == "assistant" and block.get("type") == "text":
                 _compact_text_block(block, emergency=True)
     return compacted
@@ -1423,12 +1408,6 @@ def _final_hard_cap_payload_once(
             content,
             label="assistant_content",
         )
-        reasoning_content = message.get("reasoning_content")
-        if isinstance(reasoning_content, str):
-            message["reasoning_content"] = _hard_compact_string(
-                reasoning_content,
-                label="reasoning_content",
-            )
         tool_calls = message.get("tool_calls")
         if not isinstance(tool_calls, list):
             continue

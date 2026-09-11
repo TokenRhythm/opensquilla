@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+from copy import deepcopy
+from typing import Any
 
 import pytest
 
@@ -936,31 +938,87 @@ def test_provider_request_proof_compacts_leaked_tool_input_projections() -> None
     assert payload["messages"][1]["content"][0]["input"]["content"] == projection
 
 
-def test_provider_request_proof_compacts_assistant_reasoning_content() -> None:
+@pytest.mark.parametrize("native_state", [
+    {"reasoning_content": "thinking\n" + ("details\n" * 400)},
+    {"reasoning_details": [
+        {"type": "reasoning.text", "text": "details\n" * 400, "signature": "synthetic"},
+        {"type": "reasoning.encrypted", "data": "synthetic-opaque", "index": 0},
+    ]},
+    {"content": [
+        {"type": "thinking", "thinking": "details\n" * 400, "signature": "synthetic"},
+        {"type": "redacted_thinking", "data": "synthetic-opaque"},
+    ]},
+])
+def test_provider_request_proof_rejects_oversized_native_reasoning(
+    native_state: dict[str, Any],
+) -> None:
     payload = {
         "messages": [
             {"role": "user", "content": "continue"},
             {
                 "role": "assistant",
                 "content": "I will call a tool.",
-                "reasoning_content": "thinking\n" + ("details\n" * 400),
+                **native_state,
             },
         ]
     }
+    original = deepcopy(payload)
 
-    compacted, proof = prove_or_compact_provider_payload(
-        payload,
-        projection_adapter="openrouter",
-        proof_budget=2200,
-        status_projection_mode="content_envelope",
-    )
+    with pytest.raises(ProviderRequestBudgetExceeded) as exc_info:
+        prove_or_compact_provider_payload(
+            payload,
+            projection_adapter="synthetic_adapter",
+            proof_budget=2200,
+            status_projection_mode="content_envelope",
+        )
 
-    assert proof is not None
-    assert proof["fits"] is True
-    assert proof["retry_count"] == 2
-    reasoning = compacted["messages"][1]["reasoning_content"]
-    assert "[provider_request_reasoning_content_compacted:" in reasoning
-    assert reasoning != payload["messages"][1]["reasoning_content"]
+    proof = exc_info.value.proof
+    assert proof["fits"] is False
+    assert proof["fits_char_budget"] is False
+    assert proof["fits_token_budget"] is False
+    assert proof["compaction_tier"] == 4
+    assert proof["estimated_chars"] > proof["effective_proof_budget"]
+    assert payload == original
+
+
+@pytest.mark.parametrize("tier", ["tail", "emergency", "hard_cap"])
+def test_all_request_compaction_tiers_preserve_native_reasoning(tier: str) -> None:
+    native = "synthetic reasoning " * 600
+    state = {
+        "reasoning_content": native,
+        "reasoning_details": [
+            {"type": "reasoning.text", "text": native, "signature": "synthetic", "index": 0},
+            {"type": "reasoning.encrypted", "data": "opaque-one", "index": 0},
+            {"type": "reasoning.summary", "summary": native, "index": 0},
+            {"type": "reasoning.encrypted", "data": "opaque-two", "index": 0},
+        ],
+    }
+    thinking_blocks = [
+        {"type": "thinking", "thinking": native, "signature": "synthetic"},
+        {"type": "redacted_thinking", "data": "synthetic-opaque"},
+        {"type": "reasoning.text", "text": native, "signature": "synthetic"},
+    ]
+    payload = {"messages": [
+        {"role": "user", "content": "Synthetic task."},
+        {"role": "assistant", **state, "content": [
+            *thinking_blocks, {"type": "text", "text": "visible output " * 1000},
+        ]},
+        {"role": "user", "content": "Continue."},
+        {"role": "assistant", "content": "A recent assistant must not hide the earlier one."},
+    ]}
+    original = deepcopy(payload)
+    if tier == "tail":
+        compacted, _ = request_proof._compact_recent_tail_payload_once(payload)
+    elif tier == "emergency":
+        compacted = request_proof._emergency_compact_current_turn_payload_once(payload)
+    else:
+        compacted = request_proof._final_hard_cap_payload_once(payload)
+    assistant = compacted["messages"][1]
+    assert assistant["reasoning_content"] == state["reasoning_content"]
+    assert assistant["reasoning_details"] == state["reasoning_details"]
+    assert assistant["content"][:-1] == thinking_blocks
+    assert assistant["content"][-1] != original["messages"][1]["content"][-1]
+    assert payload == original
 
 
 def test_provider_request_proof_compacts_segmented_assistant_text_tail() -> None:

@@ -23,7 +23,7 @@ from urllib.parse import urlsplit
 
 from opensquilla.endpoint_identity import base_url_matches_official_api
 
-from .model_identity import DEEPSEEK_V4_MODEL_IDS
+from .model_identity import DEEPSEEK_DIRECT_REASONING_MODEL_IDS, DEEPSEEK_V4_MODEL_IDS
 from .qwen_token_plan import (
     QWEN_TOKEN_PLAN_DEEPSEEK_V4_MODEL_IDS,
     QWEN_TOKEN_PLAN_FORCE_THINKING_MODEL_IDS,
@@ -509,10 +509,10 @@ _POLICIES_BY_KIND: dict[str, OpenAICompatPolicy] = {
                 ),
             ),
         ),
-        # Reasoning replay is gated on the exact V4 ids (below), not on the
-        # capability format: non-V4 DeepSeek models must not get replay.
-        thinking_toggle_model_ids=DEEPSEEK_V4_MODEL_IDS,
-        require_reasoning_content_model_ids=DEEPSEEK_V4_MODEL_IDS,
+        # Replay follows confirmed direct-API model ids and aliases, rather
+        # than every model with the generic DeepSeek capability format.
+        thinking_toggle_model_ids=DEEPSEEK_DIRECT_REASONING_MODEL_IDS,
+        require_reasoning_content_model_ids=DEEPSEEK_DIRECT_REASONING_MODEL_IDS,
     ),
     "gemini": OpenAICompatPolicy(
         display_name="Gemini",

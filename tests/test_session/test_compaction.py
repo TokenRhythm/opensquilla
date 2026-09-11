@@ -3,6 +3,7 @@
 import asyncio
 import base64
 import json
+from copy import deepcopy
 
 import pytest
 
@@ -32,6 +33,166 @@ from opensquilla.session.compaction_lifecycle import (
     compaction_effect_payload,
     compaction_result_payload,
 )
+
+
+def _native_replay_budget_message():
+    from opensquilla.provider.types import Message
+
+    thinking = "Synthetic reasoning step. " * 500
+    native = [
+        {"type": "thinking", "thinking": thinking, "signature": "synthetic-signature"},
+        {"type": "redacted_thinking", "data": "synthetic-opaque-data"},
+        {"type": "text", "text": "Synthetic answer", "citations": [{"title": "Synthetic source"}]},
+        {"type": "tool_use", "id": "call-1", "name": "lookup", "input": {"count": 1}},
+    ]
+    return Message.model_validate({
+        "role": "assistant", "content": native, "reasoning_content": thinking,
+        "provider_replay": {
+            "protocol": "anthropic_messages", "source": "synthetic-route", "model": "synthetic",
+            "native_content": deepcopy(native),
+        },
+    })
+
+
+@pytest.mark.parametrize("opaque_kind", ["signature", "redacted"])
+def test_replay_budget_counts_one_native_copy_across_all_estimators(opaque_kind):
+    from opensquilla.engine.history import HistoryReplayProjection, project_history_replay_capacity
+    from opensquilla.provider.anthropic import _build_message_payload
+    from opensquilla.provider.replay_budget import project_message_replay_budget
+    from opensquilla.session.tokenizer import estimate_tokens
+
+    message = _native_replay_budget_message()
+    # This estimate covers the final assistant message without a pending tool.
+    message.content.pop()
+    message.provider_replay.native_content.pop()
+    small_entry = {
+        "assistant_replay": {"version": 1, "messages": [message.model_dump(mode="json")]},
+    }
+    small_tokens = estimate_entry_model_replay_tokens(small_entry)
+    small_chars = estimate_entries_model_replay_chars([small_entry])
+    index, field = (0, "signature") if opaque_kind == "signature" else (1, "data")
+    opaque = "synthetic opaque state " * 1_000
+    setattr(message.content[index], field, opaque)
+    message.provider_replay.native_content[index][field] = opaque
+    before = message.model_dump(mode="json")
+    entry = {"role": "assistant", "assistant_replay": {"version": 1, "messages": [before]}}
+    expected_wire = _build_message_payload(message, model="synthetic")
+    wire_json = json.dumps(expected_wire, ensure_ascii=False, sort_keys=True)
+    wire_tokens = estimate_tokens(wire_json)
+    budget = project_message_replay_budget(message)
+
+    assert budget == project_message_replay_budget(before)
+    assert budget["content"] == expected_wire["content"]  # Includes citations and opaque blocks.
+    assert "reasoning_content" not in budget
+    assert "native_content" not in budget["provider_replay"]
+    capacity = project_history_replay_capacity(HistoryReplayProjection(messages=(message,)))
+    for measured in (capacity.estimated_tokens, estimate_entry_model_replay_tokens(entry)):
+        assert wire_tokens <= measured < wire_tokens + 200
+    assert len(wire_json) <= estimate_entries_model_replay_chars([entry]) < len(wire_json) + 500
+    assert estimate_entry_model_replay_tokens(entry) > small_tokens + 1_000
+    assert estimate_entries_model_replay_chars([entry]) > small_chars + 10_000
+    assert message.model_dump(mode="json") == before
+    assert entry["assistant_replay"]["messages"] == [before]
+
+
+def test_anthropic_budget_preserves_reasoning_that_differs_from_native_thinking():
+    from opensquilla.provider.replay_budget import project_message_replay_budget
+
+    message = _native_replay_budget_message()
+    message.reasoning_content = "Different display reasoning " * 1_000
+    before = message.model_dump(mode="json")
+    budget = project_message_replay_budget(before)
+    assert budget["reasoning_content"] == message.reasoning_content
+    assert budget["content"] == message.provider_replay.native_content
+    entry = {"assistant_replay": {"version": 1, "messages": [before]}}
+    without_display = deepcopy(entry)
+    without_display["assistant_replay"]["messages"][0].pop("reasoning_content")
+    assert estimate_entry_model_replay_tokens(entry) > (
+        estimate_entry_model_replay_tokens(without_display) + 1_000
+    )
+    assert message.model_dump(mode="json") == before
+
+
+@pytest.mark.parametrize(
+    "change", ["text", "bool_input", "float_input", "protocol", "unknown_block"],
+)
+def test_replay_budget_keeps_both_representations_when_native_equivalence_is_unproven(change):
+    from opensquilla.provider.replay_budget import project_message_replay_budget
+
+    message = _native_replay_budget_message()
+    # A changed endpoint cannot justify discarding either current content or captured data.
+    message.provider_replay.source = "different-synthetic-route"
+    if change == "text":
+        message.content[2].text = "Changed accepted answer"
+    elif change in {"bool_input", "float_input"}:
+        message.content[3].input["count"] = True if change == "bool_input" else 1.0
+    elif change == "protocol":
+        message.provider_replay.protocol = "future-protocol"
+    else:
+        message.provider_replay.native_content.append({"type": "future-block", "data": "opaque"})
+    before = message.model_dump(mode="json")
+    budget = project_message_replay_budget(before)
+    assert budget["content"] == before["content"]
+    assert budget["provider_replay"]["native_content"] == (
+        before["provider_replay"]["native_content"]
+    )
+    assert budget["reasoning_content"] == before["reasoning_content"]
+    assert message.model_dump(mode="json") == before
+
+
+@pytest.mark.parametrize("display_matches", [True, False])
+def test_openai_budget_deduplicates_only_display_alias_not_distinct_native_fields(display_matches):
+    from opensquilla.provider.replay_budget import project_message_replay_budget
+
+    message = {
+        "role": "assistant", "content": "answer",
+        "reasoning_content": "native text" if display_matches else "different display text",
+        "provider_replay": {
+            "protocol": "openai_chat_completions", "source": "synthetic-route",
+            "model": "synthetic",
+            "native_reasoning_content": "native text",
+            "reasoning_details": [
+                {"type": "reasoning.text", "text": "native text"},
+                {"type": "reasoning.encrypted", "data": "opaque " * 200},
+            ],
+        },
+    }
+    before = deepcopy(message)
+    budget = project_message_replay_budget(message)
+    assert ("reasoning_content" in budget) is not display_matches
+    assert budget["provider_replay"] == message["provider_replay"]
+    assert message == before
+
+
+def test_replay_budget_preserves_typed_media_reserves_and_counts_raw_tool_json_as_text():
+    from opensquilla.engine.history import HistoryReplayProjection, project_history_replay_capacity
+    from opensquilla.provider.request_proof import estimate_provider_media_tokens
+    from opensquilla.provider.types import ContentBlockDocument, ContentBlockImage, Message
+
+    data = base64.b64encode(b"synthetic media" * 20).decode("ascii")
+    message = Message(role="user", content=[
+        ContentBlockImage(media_type="image/png", data=data),
+        ContentBlockDocument(media_type="application/pdf", data=data),
+    ])
+    capacity = project_history_replay_capacity(HistoryReplayProjection(messages=(message,)))
+    decoded_bytes = len(base64.b64decode(data))
+    assert capacity.media_block_count == 2
+    assert capacity.media_reserve_tokens == (
+        estimate_provider_media_tokens("image", decoded_bytes)
+        + estimate_provider_media_tokens("pdf", decoded_bytes)
+    )
+    assert capacity.estimate_complete
+    raw = Message.model_validate({"role": "assistant", "content": [{
+        "type": "tool_use", "id": "raw", "name": "lookup",
+        "input": {"type": "image", "data": data * 100},
+    }]})
+    result = Message.model_validate({"role": "user", "content": [{
+        "type": "tool_result", "tool_use_id": "raw", "content": "done",
+    }]})
+    raw_capacity = project_history_replay_capacity(HistoryReplayProjection(messages=(raw, result)))
+    assert raw_capacity.media_block_count == 0
+    assert raw_capacity.media_reserve_tokens == 0
+    assert raw_capacity.estimated_tokens > capacity.estimated_tokens
 
 
 def _make_entries(n: int, tokens_each: int = 100) -> list[dict]:
