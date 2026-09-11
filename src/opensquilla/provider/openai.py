@@ -51,6 +51,7 @@ from .error_redaction import (
     redact_upstream_error_text,
     redacted_httpx_error,
 )
+from .extra_body import merge_extra_body, normalize_extra_body
 from .failures import retry_after_from_headers
 from .fx import TOKENRHYTHM_CNY_PER_USD, TOKENRHYTHM_CNY_PER_USD_NANOS
 from .model_catalog import shared_catalog
@@ -3123,6 +3124,7 @@ class OpenAIProvider:
         compat: OpenAICompatPolicy | None = None,
         replay_provider_state: bool = True,
         provider_id: str | None = None,
+        extra_body: Mapping[str, Any] | None = None,
     ) -> None:
         self._api_key = clean_header_secret(api_key, label="LLM API key")
         self._model = model
@@ -3148,6 +3150,9 @@ class OpenAIProvider:
         # DashScope or OpenRouter instance to OpenAI, which is exactly what
         # this field exists to prevent.
         self.provider_id = (provider_id or self._provider_kind).strip()
+        if extra_body and self.provider_id.lower() != "custom":
+            raise ValueError("extra_body is supported only for provider 'custom'")
+        self._extra_body = normalize_extra_body(extra_body)
         compat_policy = compat or compat_policy_for_kind(self._provider_kind)
         if self.provider_id.lower() == "custom":
             compat_policy = replace(
@@ -3564,6 +3569,7 @@ class OpenAIProvider:
             cfg=cfg,
             has_tools=bool(tools),
         )
+        merge_extra_body(payload, self._extra_body)
         fallback_reason = (
             "native_is_error_unavailable"
             if any(message.get("role") == "tool" for message in openai_messages)
