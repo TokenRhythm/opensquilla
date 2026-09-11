@@ -280,6 +280,18 @@ describe('SetupModelCombobox', () => {
     ])
   })
 
+  it('marks models that accept image input as multimodal', async () => {
+    const { el } = await mountCombobox()
+    await openList(el)
+
+    const rows = optionRows()
+    expect(rows[0].textContent).not.toContain('Multimodal')
+    expect(rows[1].querySelector('.setup-model-combobox__badge--multimodal')?.textContent)
+      .toContain('Multimodal')
+    expect(rows[1].querySelector<HTMLElement>('.setup-model-combobox__badge--multimodal')?.title)
+      .toBe('Supports image input')
+  })
+
   it('prefers published limits, suppresses normal status, and labels accessible sources', async () => {
     const { el } = await mountCombobox({
       models: [

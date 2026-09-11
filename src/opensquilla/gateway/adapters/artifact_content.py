@@ -30,6 +30,7 @@ from opensquilla.attachment_refs import transcript_material_path
 from opensquilla.contracts.attachment_sniff import sniff_mime_from_bytes
 from opensquilla.contracts.attachments import (
     ALLOWED_MEDIA_TYPES,
+    IMAGE_ATTACHMENT_MIMES,
     MSG_MIME,
     OPAQUE_MIME,
     attachment_category,
@@ -156,6 +157,9 @@ class GatewayAttachmentMimePolicy(AttachmentMimePolicyPort):
 
     def resolve_mime(self, claimed_mime: str, payload: bytes, *, accept_opaque: bool) -> str:
         normalized = self.validate_claim(claimed_mime, accept_opaque=accept_opaque)
+        if normalized in IMAGE_ATTACHMENT_MIMES:
+            sniffed = sniff_mime_from_bytes(payload)
+            return sniffed if sniffed in IMAGE_ATTACHMENT_MIMES else normalized
         if not accept_opaque:
             assert normalized is not None
             return normalized

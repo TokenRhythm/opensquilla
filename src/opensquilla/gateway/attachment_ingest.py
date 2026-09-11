@@ -48,6 +48,7 @@ from opensquilla.contracts.attachments import (
     can_stage_attachment_mime,
     normalize_attachment_mime,
 )
+from opensquilla.contracts.image_validation import validate_image_bytes
 
 log = structlog.get_logger(__name__)
 
@@ -356,6 +357,16 @@ def validate_attachments(
                     ),
                 )
                 continue
+            if media_type in IMAGE_ATTACHMENT_MIMES:
+                try:
+                    validate_image_bytes(payload, media_type)
+                except ValueError as exc:
+                    _raise_or_mark(
+                        failure_mode=failure_mode,
+                        failures=failures,
+                        failure=_failure(index, attachment, "invalid_image", str(exc)),
+                    )
+                    continue
             item = dict(attachment)
             item["type"] = media_type
             item["mime"] = media_type
@@ -610,6 +621,17 @@ def validate_attachments(
                 ),
             )
             continue
+
+        if claimed in IMAGE_ATTACHMENT_MIMES or resolved in IMAGE_ATTACHMENT_MIMES:
+            try:
+                validate_image_bytes(raw_bytes, resolved)
+            except ValueError as exc:
+                _raise_or_mark(
+                    failure_mode=failure_mode,
+                    failures=failures,
+                    failure=_failure(index, attachment, "invalid_image", str(exc)),
+                )
+                continue
 
         item = dict(attachment)
         item["type"] = resolved

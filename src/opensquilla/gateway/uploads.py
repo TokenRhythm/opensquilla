@@ -44,12 +44,14 @@ from opensquilla.application.artifact_workbench import (
 )
 from opensquilla.contracts.attachments import (
     ALLOWED_MEDIA_TYPES,
+    IMAGE_ATTACHMENT_MIMES,
     OPAQUE_ATTACHMENT_BYTES,
     attachment_category,
     attachment_size_limit_for_mime,
     can_stage_attachment_mime,
     normalize_attachment_mime,
 )
+from opensquilla.contracts.image_validation import validate_image_bytes
 from opensquilla.gateway.adapters.artifact_content import (
     GatewayAttachmentMimePolicy,
     GatewayAttachmentStagingPort,
@@ -239,6 +241,12 @@ class UploadStore:
                 f"upload of {len(payload)} bytes exceeds the "
                 f"{self.max_total_bytes} byte staged-upload store cap"
             )
+
+        if normalized_mime in IMAGE_ATTACHMENT_MIMES:
+            try:
+                validate_image_bytes(payload, normalized_mime)
+            except ValueError as exc:
+                raise UploadUnsupportedMimeError(str(exc)) from exc
 
         file_uuid = f"u-{_uuid.uuid4().hex}"
         sha = hashlib.sha256(payload).hexdigest()

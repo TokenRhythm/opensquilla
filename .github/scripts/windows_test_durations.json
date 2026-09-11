@@ -278,6 +278,7 @@
     "tests/test_contracts/test_config_public_dict.py": 0.127,
     "tests/test_contracts/test_ensemble_fallback_event_wire.py": 0.018,
     "tests/test_contracts/test_error_event_wire.py": 0.012,
+    "tests/test_contracts/test_image_validation.py": 0.01,
     "tests/test_contracts/test_llm_ensemble_preservation.py": 0.447,
     "tests/test_contracts/test_migration_report_wire.py": 0.111,
     "tests/test_contracts/test_models_discover_wire.py": 0.157,

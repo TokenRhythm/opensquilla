@@ -227,7 +227,6 @@
       "setDefaultMode": "このモードを既定にする",
       "restoreDefaultMode": "既定のプレビューモードに戻す",
       "defaultModeSaved": "既定のプレビューモードを保存しました。",
-      "fullModeNotice": "インタラクティブプレビューはオンラインコンテンツを読み込めますが、OpenSquilla の権限、ローカルファイル、システムブラウザーのログインは共有しません。",
       "offlineWebLimits": "制限付きプレビューでは、一部の外部コンテンツや高度な Web 機能を利用できない場合があります。",
       "compatibilityFallback": "この Desktop バージョンでは従来の単一ファイルプレビューのみ利用できます。",
       "upgradeDesktopShort": "Desktop を更新",
@@ -1058,7 +1057,9 @@
       "modelNoMatches": "一致するモデルがありません — 入力した値をそのまま使えます。",
       "modelListTruncated": "{total} 件中 {shown} 件を表示 — 入力を続けると絞り込めます。",
       "modelProvenance": "プロバイダーのライブ一覧 · 機能情報の出典：{sources}",
-      "modelMetadataProvenance": "プロバイダーのライブ一覧 · 公式値を優先し、ない場合はカタログ値を使用"
+      "modelMetadataProvenance": "プロバイダーのライブ一覧 · 公式値を優先し、ない場合はカタログ値を使用",
+      "modelMultimodal": "マルチモーダル",
+      "modelMultimodalTitle": "画像入力に対応"
     },
     "preset": {
       "modeCustom": "カスタム"
@@ -1128,6 +1129,7 @@
       "removeCandidateAria": "{model} を削除",
       "ensembleEmpty": "候補モデルがまだありません。モデルサービスの設定を保存してルーティング階層を生成するか、候補を手動で追加してください。",
       "ensemblePipeline": "仕組み:候補モデルが並行してドラフトを作成し、集約モデルがドラフトを集約して最終回答を生成します。ツールを呼び出せるのは集約モデルのみです。",
+      "candidateModelHint": "「マルチモーダル」バッジは画像入力に対応するモデルを示します。画像リクエストは設定済みの画像対応ルートを使用します。",
       "ensembleFlowDesc": "複数モデルが並行して下書きし、アグリゲーターが 1 つの回答に統合します。呼び出しは増えます。",
       "legacyDynamicNotice": "この従来の融合プランは保存済みのモデル階層に従います。メンバーを編集するにはカスタム編成に変換してください。",
       "legacyDynamicMigrate": "カスタム編成に変換",

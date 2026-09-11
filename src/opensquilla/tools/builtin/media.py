@@ -20,6 +20,7 @@ from opensquilla.artifacts import (
     ArtifactStore,
     artifact_payload,
 )
+from opensquilla.contracts.image_validation import validate_image_bytes
 from opensquilla.engine.usage_accounting import (
     account_provider_stream,
     current_usage_accounting_scope,
@@ -176,15 +177,9 @@ async def image(path: str, prompt: str = "Describe this image") -> str:
             return json.dumps(path_block)
         image_bytes, media_type = await _read_image_file(path)
 
-    # Validate not corrupt using Pillow
     try:
-        import io
-
-        from PIL import Image
-
-        img = Image.open(io.BytesIO(image_bytes))
-        img.verify()
-    except Exception as exc:
+        validate_image_bytes(image_bytes, media_type)
+    except ValueError as exc:
         raise SafeToolError(f"Image appears corrupt or unreadable: {exc}") from exc
 
     # Try provider vision call; graceful fallback if unavailable
@@ -367,7 +362,11 @@ async def _fetch_image_url(url: str) -> tuple[bytes, str]:
             current_url = urljoin(current_url, location)
         else:
             raise ToolError(f"Too many redirects (>{_MAX_REDIRECTS})")
-        resp.raise_for_status()
+        if resp.is_error:
+            raise ToolError(
+                f"Failed to fetch image from URL: HTTP {resp.status_code} "
+                f"({resp.reason_phrase or 'request failed'})"
+            )
         image_bytes = resp.content
     except ToolError:
         raise
@@ -409,6 +408,10 @@ def _mime_to_ext(content_type: str) -> str:
         "image/webp": "webp",
     }
     return mapping.get(ct, "")
+
+
+class _EmptyMediaResponseError(RuntimeError):
+    """A media request completed without a visible answer."""
 
 
 async def _complete_from_stream(provider: Any, messages: list, config: Any = None) -> str:
@@ -482,11 +485,12 @@ async def _complete_from_stream(provider: Any, messages: list, config: Any = Non
     text_parts: list[str] = []
     try:
         async for event in stream:
-            if hasattr(event, "text"):
+            kind = getattr(event, "kind", None)
+            if kind == "text_delta":
                 text_parts.append(event.text)
-            elif hasattr(event, "delta") and isinstance(event.delta, str):
-                text_parts.append(event.delta)
-            elif getattr(event, "kind", None) == "error":
+            elif kind == "provider_generation_reset":
+                text_parts.clear()
+            elif kind == "error":
                 code = getattr(event, "code", "") or "provider_error"
                 message = getattr(event, "message", "") or "Provider stream failed"
                 raise RuntimeError(f"Provider stream error ({code}): {message}")
@@ -494,7 +498,10 @@ async def _complete_from_stream(provider: Any, messages: list, config: Any = Non
         aclose = getattr(close_stream, "aclose", None)
         if callable(aclose):
             await aclose()
-    return "".join(text_parts)
+    text = "".join(text_parts)
+    if not text.strip():
+        raise _EmptyMediaResponseError("The provider returned no visible media analysis")
+    return text
 
 
 class _ImageAnalysisUnavailableError(RuntimeError):
@@ -502,7 +509,7 @@ class _ImageAnalysisUnavailableError(RuntimeError):
 
 
 async def _call_vision_provider(b64_data: str, media_type: str, prompt: str) -> str:
-    """Analyze once on the turn's current physical deployment, without fallback."""
+    """Analyze on the current deployment, retrying an empty answer at most once."""
     from opensquilla.provider.image_projection import ImageProjectionMode, project_messages
     from opensquilla.provider.protocol import validate_provider_chat_admission
     from opensquilla.provider.types import ContentBlockImage, ContentBlockText, Message
@@ -525,13 +532,19 @@ async def _call_vision_provider(b64_data: str, media_type: str, prompt: str) -> 
     admission_error = validate_provider_chat_admission(provider, messages, config)
     if admission_error is not None:
         raise RuntimeError(admission_error.code)
-    correlation = derive_provider_request_correlation(
-        current_provider_request_correlation(),
-        execution_id=uuid.uuid4().hex,
-        call_kind="auxiliary.media",
-    )
-    with bind_provider_request_correlation(correlation):
-        return await _complete_from_stream(provider, messages, config)
+    for attempt in range(2):
+        correlation = derive_provider_request_correlation(
+            current_provider_request_correlation(),
+            execution_id=uuid.uuid4().hex,
+            call_kind="auxiliary.media",
+        )
+        with bind_provider_request_correlation(correlation):
+            try:
+                return await _complete_from_stream(provider, messages, config)
+            except _EmptyMediaResponseError:
+                if attempt:
+                    raise
+    raise AssertionError("image analysis attempts exhausted")
 
 
 # ---------------------------------------------------------------------------
