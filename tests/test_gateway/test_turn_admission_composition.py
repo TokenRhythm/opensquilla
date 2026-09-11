@@ -24,7 +24,6 @@ TURN_METHODS = (
     "sessions.send",
     "sessions.abort",
     "sessions.steer.v2",
-    "sessions.steer",
 )
 COMPOSED_CONVERSATION_METHODS = (*TURN_METHODS, "chat.clarify_submit")
 
@@ -98,13 +97,7 @@ async def test_wire_surfaces_execute_one_shared_turn_application_once(
                 "client_message_id": "client-1",
             },
             SteerTurn,
-            "durable",
-        ),
-        (
-            "sessions.steer",
-            {"key": "agent:main:webchat:shared", "message": "guide"},
-            SteerTurn,
-            "legacy",
+            "turn-1",
         ),
     )
 
@@ -118,7 +111,7 @@ async def test_wire_surfaces_execute_one_shared_turn_application_once(
         if isinstance(command, (AdmitTurn, CancelTurn)):
             assert command.surface == semantic
         else:
-            assert command.mode == semantic
+            assert command.expected_turn_id == semantic
 
 
 def test_rpc_loader_is_the_only_fixed_turn_composition_boundary() -> None:
@@ -150,13 +143,12 @@ methods = (
     "sessions.send",
     "sessions.abort",
     "sessions.steer.v2",
-    "sessions.steer",
     "chat.clarify_submit",
 )
 assert rpc_chat._turn_admission_adapter_factory is rpc_sessions.build_gateway_turn_admission_adapter
 registry = get_dispatcher()
 # The existing surface plus snapshot.read and transport.flow.update.
-assert len(registry.list_methods()) == 309
+assert len(registry.list_methods()) == 289
 for method in methods:
     entry = registry.get_entry(method)
     assert entry is not None

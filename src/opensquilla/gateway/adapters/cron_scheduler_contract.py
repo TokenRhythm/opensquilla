@@ -16,7 +16,7 @@ from opensquilla.gateway.adapters.contract_method import (
 )
 
 CRON_SCHEDULER_CONTRACT_METHODS: Final = (
-    "cron.list", "cron.status", "cron.add", "cron.create", "cron.update",
+    "cron.list", "cron.status", "cron.create", "cron.update",
     "cron.remove", "cron.run", "cron.runs", "cron.subscribe", "cron.unsubscribe",
 )
 

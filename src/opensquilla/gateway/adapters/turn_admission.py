@@ -279,8 +279,6 @@ class GatewayTurnAdmissionAdapter:
     async def steer(
         self,
         params: dict[str, Any] | None,
-        *,
-        durable: bool,
     ) -> dict[str, Any]:
         if not isinstance(params, dict) or "message" not in params:
             raise ValueError("params.message is required")
@@ -288,9 +286,7 @@ class GatewayTurnAdmissionAdapter:
         command = decode_steering_command(
             params,
             key=key,
-            durable=durable,
             principal_role=self._principal_role,
-            connection_id=self._connection_id,
         )
         try:
             result = await self._application.steer(command)

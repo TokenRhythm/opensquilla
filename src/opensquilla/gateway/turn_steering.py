@@ -3,14 +3,11 @@
 from __future__ import annotations
 
 import time
-import uuid
 from collections.abc import Awaitable, Callable, Mapping
-from contextlib import AbstractAsyncContextManager, nullcontext
 from typing import Any, cast
 
 from opensquilla.application.turn_admission import PendingInputGuard, SteerTurn
 from opensquilla.application.turn_steering import (
-    AppendedSteeringInput,
     NormalizedSteeringText,
     PreparedSteeringInput,
     RuntimeSteeringDecision,
@@ -23,7 +20,6 @@ from opensquilla.application.turn_steering import (
     SteeringIdentityConflictError,
     SteeringNotice,
     SteeringPersistenceUnavailableError,
-    SteeringRollbackError,
     SteeringSession,
     SteeringTranscript,
 )
@@ -35,7 +31,7 @@ from opensquilla.gateway.admission_input import (
 from opensquilla.gateway.input_normalization import normalize_incoming_text
 from opensquilla.gateway.project_workspace_runtime import map_project_workspace_error
 from opensquilla.gateway.rpc import RpcHandlerError, RpcUnavailableError
-from opensquilla.gateway.session_services import get_session_lock, get_session_storage
+from opensquilla.gateway.session_services import get_session_storage
 from opensquilla.gateway.turn_ingress import request_identity
 from opensquilla.project_workspaces import (
     ProjectWorkspaceGuard,
@@ -52,7 +48,6 @@ from opensquilla.session.storage import (
     TurnAcceptanceResult,
     TurnIngressConflictError,
 )
-from opensquilla.session.turn_context import turn_context_scope
 
 
 def _optional_text(params: Mapping[str, Any], *names: str) -> str | None:
@@ -72,38 +67,31 @@ def decode_steering_command(
     params: dict[str, Any],
     *,
     key: str,
-    durable: bool,
     principal_role: str,
-    connection_id: str,
     pending: PendingInputGuard | None = None,
 ) -> SteerTurn:
     """Resolve v4 aliases and authenticated identity before the Application seam."""
     source = normalized_source_hint(params)
     web_source = is_web_source_hint(source)
-    target = _optional_text(params, "expected_turn_id", "expectedTurnId") if durable else None
-    request_id = _optional_text(params, "client_request_id", "clientRequestId") if durable else None
+    target = _optional_text(params, "expected_turn_id", "expectedTurnId")
+    request_id = _optional_text(params, "client_request_id", "clientRequestId")
     message_id = _optional_text(params, "client_message_id", "clientMessageId")
-    if durable:
-        for field, value in (
-            ("expected_turn_id", target),
-            ("client_request_id", request_id),
-            ("client_message_id", message_id),
-        ):
-            if value is None:
-                raise ValueError(f"params.{field} is required")
-            if len(value) > 256:
-                raise ValueError(f"params.{field} must not exceed 256 characters")
+    for field, value in (
+        ("expected_turn_id", target),
+        ("client_request_id", request_id),
+        ("client_message_id", message_id),
+    ):
+        if value is None:
+            raise ValueError(f"params.{field} is required")
+        if len(value) > 256:
+            raise ValueError(f"params.{field} must not exceed 256 characters")
     default_surface = str(
         source.get("channel_id")
-        or (
-            f"{source.get('caller_kind', 'rpc')}:{source.get('channel_kind', 'rpc')}"
-            if durable
-            else f"web:{connection_id}"
-        )
+        or f"{source.get('caller_kind', 'rpc')}:{source.get('channel_kind', 'rpc')}"
     )
     surface = _optional_text(params, "surface_id", "surfaceId") or default_surface
     scope = fingerprint = ""
-    if durable and pending is None:
+    if pending is None:
         source_scope = source_scope_from_hint(source, principal_role)
         identity = request_identity(
             params,
@@ -127,10 +115,9 @@ def decode_steering_command(
     return SteerTurn(
         session_key=key,
         message=params["message"],
-        mode="durable" if durable else "legacy",
         expected_turn_id=target,
         client_request_id=request_id,
-        client_message_id=message_id or (uuid.uuid4().hex if not durable else None),
+        client_message_id=message_id,
         surface_id=surface,
         source_scope=scope,
         request_fingerprint=fingerprint,
@@ -160,21 +147,6 @@ def map_steering_error(error: Exception, *, is_owner: bool = False) -> Exception
         return RpcUnavailableError(str(error))
     if isinstance(error, SteeringIdentityConflictError):
         return RpcHandlerError("IDEMPOTENCY_CONFLICT", str(error), retryable=False, accepted=False)
-    if isinstance(error, SteeringRollbackError):
-        return RpcHandlerError(
-            "STEER_RACE_DIRTY",
-            "The active turn ended and the just-appended steer input could not be rolled back. "
-            "The transcript contains a rejected orphan; automatic queue fallback is disabled "
-            "to prevent duplication.",
-            details={
-                "session_key": error.session_key,
-                "orphan_message_id": error.message_id,
-                "target_turn_id": error.target_turn_id,
-                "fallback_safe": False,
-                "remediation": "dedup by orphan_message_id before resending",
-            },
-            retryable=False,
-        )
     if isinstance(error, ProjectWorkspaceStateError):
         mapped = map_project_workspace_error(error, owner=is_owner)
         details = dict(mapped.details) if isinstance(mapped.details, dict) else {}
@@ -266,13 +238,11 @@ class GatewaySteeringPrimitives:
         *,
         session_manager: Any,
         task_runtime: Any,
-        turn_runner: object | None,
         emit_steer: Callable[[str, dict[str, Any]], Awaitable[None]],
         emit_disposition: Callable[[str, dict[str, Any]], Awaitable[None]],
     ) -> None:
         self._manager = session_manager
         self._runtime = task_runtime
-        self._runner = turn_runner
         self._emit_steer = emit_steer
         self._emit_disposition = emit_disposition
 
@@ -293,12 +263,6 @@ class GatewaySteeringPrimitives:
     @property
     def durable_available(self) -> bool:
         return callable(getattr(self._runtime, "admit_steer", None))
-
-    @property
-    def legacy_available(self) -> bool:
-        return callable(getattr(self._runtime, "active_task_id", None)) and callable(
-            getattr(self._runtime, "steer", None)
-        )
 
     def normalize(self, message: str, *, is_web_source: bool) -> NormalizedSteeringText:
         normalized = normalize_incoming_text(
@@ -470,77 +434,8 @@ class GatewaySteeringPrimitives:
             recovery=context.get("recovery"),
         )
 
-    async def active_turn(self, key: str) -> str | None:
-        return cast(str | None, await self._runtime.active_task_id(key))
-
-    def session_lock(self, key: str) -> AbstractAsyncContextManager[object]:
-        return get_session_lock(self._runner, key) or nullcontext()
-
-    async def append(
-        self,
-        key: str,
-        message: str,
-        context: SteeringContext,
-    ) -> AppendedSteeringInput:
-        with turn_context_scope(_context_payload(context)):
-            entry = await self._manager.append_message(
-                key,
-                role="user",
-                content=message,
-            )
-        content = getattr(entry, "content", None)
-        return AppendedSteeringInput(
-            content if isinstance(content, str) else None,
-            getattr(entry, "message_id", None),
-        )
-
-    async def steer_runtime(
-        self,
-        key: str,
-        message: str,
-        *,
-        semantic_message: str,
-        message_id: str | None,
-        client_message_id: str,
-        surface_id: str,
-    ) -> str | None:
-        return cast(
-            str | None,
-            await self._runtime.steer(
-                key,
-                message,
-                semantic_message=semantic_message,
-                persisted_user_message_id=message_id,
-                client_message_id=client_message_id,
-                surface_id=surface_id,
-            ),
-        )
-
-    async def remove(self, key: str, message_id: str) -> bool:
-        remove = getattr(self._manager, "remove_message", None)
-        return bool(await remove(key, message_id)) if callable(remove) else False
-
-    async def update_context(self, key: str, message_id: str, context: SteeringContext) -> bool:
-        update = getattr(self._manager, "update_message_turn_context", None)
-        return (
-            bool(await update(key, message_id, _context_payload(context)))
-            if callable(update)
-            else False
-        )
-
     async def publish_steer(self, notice: SteeringNotice) -> None:
-        if notice.durable:
-            payload = self._disposition_payload(notice)
-        else:
-            payload = {
-                "session_key": notice.session_key,
-                "turn_id": notice.context.turn_id,
-                "client_message_id": notice.context.client_message_id,
-                "user_message_id": notice.message_id,
-                "surface_id": notice.context.surface_id,
-                "disposition": "next_safe_boundary",
-            }
-        await self._emit_steer(notice.session_key, payload)
+        await self._emit_steer(notice.session_key, self._disposition_payload(notice))
 
     async def publish_disposition(self, notice: SteeringNotice) -> None:
         await self._emit_disposition(notice.session_key, self._disposition_payload(notice))
@@ -550,10 +445,8 @@ class GatewaySteeringPrimitives:
         payload = {
             "session_key": notice.session_key,
             "user_message_id": notice.message_id,
+            "key": notice.session_key,
+            "task_id": notice.context.turn_id,
             **_context_payload(notice.context),
         }
-        if notice.durable:
-            payload.update(key=notice.session_key, task_id=notice.context.turn_id)
-        if notice.rejected_orphan:
-            payload.update(failure_code="STEER_RACE_DIRTY", retryable=False, fallback_safe=False)
         return payload

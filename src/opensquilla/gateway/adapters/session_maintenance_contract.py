@@ -18,7 +18,6 @@ from opensquilla.gateway.adapters.contract_method import (
 SESSION_MAINTENANCE_CONTRACT_METHODS: Final = (
     "sessions.reset",
     "sessions.contextCompact",
-    "sessions.compact",
 )
 
 

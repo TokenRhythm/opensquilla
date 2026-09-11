@@ -1236,17 +1236,6 @@ async def _sync_restored_working_files(
     )
 
 
-async def _handle_retired_document_editing(
-    params: dict[str, Any] | None, ctx: RpcContext
-) -> dict[str, Any]:
-    raise RpcHandlerError(
-        "DOCUMENT_EDITING_RETIRED",
-        "This HTML editor API has been retired. Update the client, reopen the page, "
-        "and send annotations as ordinary chat input. Existing versions remain available.",
-        details={"action": "update_client_and_reopen_page"},
-    )
-
-
 class _ArtifactEditingRuntimePort:
     """Bind typed Workbench commands to the existing artifact-session implementation."""
 
@@ -1293,19 +1282,6 @@ class _ArtifactEditingRuntimePort:
         return await _source_read(query, self._ctx)
 
 
-_RETIRED_EDITOR_METHODS = frozenset(
-    (
-        "documents.editSessions.start",
-        "documents.editSessions.heartbeat",
-        "documents.editSessions.close",
-        "artifacts.prompt_annotations.create",
-        "artifacts.prompt_annotations.focus",
-        "artifacts.prompt_annotations.update",
-        "artifacts.prompt_annotations.discard",
-        "artifacts.source.patch",
-    )
-)
-
 _ARTIFACT_EDITING_METHODS = (
     "artifacts.edit.capabilities",
     "artifacts.documents.open",
@@ -1313,21 +1289,13 @@ _ARTIFACT_EDITING_METHODS = (
     "artifacts.documents.get",
     "artifacts.documents.rename",
     "artifacts.documents.close",
-    "documents.editSessions.start",
-    "documents.editSessions.heartbeat",
-    "documents.editSessions.close",
     "artifacts.revisions.list",
     "artifacts.revisions.restore",
     "artifacts.changes.list",
     "artifacts.changes.get",
     "artifacts.changes.revert",
     "artifacts.prompt_annotations.list",
-    "artifacts.prompt_annotations.create",
-    "artifacts.prompt_annotations.focus",
-    "artifacts.prompt_annotations.update",
-    "artifacts.prompt_annotations.discard",
     "artifacts.source.read",
-    "artifacts.source.patch",
 )
 
 (
@@ -1337,27 +1305,15 @@ _ARTIFACT_EDITING_METHODS = (
     _handle_document_get,
     _handle_document_rename,
     _handle_document_close,
-    _handle_edit_session_start,
-    _handle_edit_session_heartbeat,
-    _handle_edit_session_close,
     _handle_revisions_list,
     _handle_revision_restore,
     _handle_changes_list,
     _handle_change_get,
     _handle_change_revert,
     _handle_prompt_annotations_list,
-    _handle_prompt_annotation_create,
-    _handle_prompt_annotation_focus,
-    _handle_prompt_annotation_update,
-    _handle_prompt_annotation_discard,
     _handle_source_read,
-    _handle_source_patch,
 ) = tuple(
-    (
-        _handle_retired_document_editing
-        if method in _RETIRED_EDITOR_METHODS
-        else GatewayArtifactWorkbenchAdapter.bind(method, _ArtifactEditingRuntimePort)
-    )
+    GatewayArtifactWorkbenchAdapter.bind(method, _ArtifactEditingRuntimePort)
     for method in _ARTIFACT_EDITING_METHODS
 )
 
@@ -1370,34 +1326,23 @@ for _artifact_method, _artifact_implementation in zip(
         _handle_document_get,
         _handle_document_rename,
         _handle_document_close,
-        _handle_edit_session_start,
-        _handle_edit_session_heartbeat,
-        _handle_edit_session_close,
         _handle_revisions_list,
         _handle_revision_restore,
         _handle_changes_list,
         _handle_change_get,
         _handle_change_revert,
         _handle_prompt_annotations_list,
-        _handle_prompt_annotation_create,
-        _handle_prompt_annotation_focus,
-        _handle_prompt_annotation_update,
-        _handle_prompt_annotation_discard,
         _handle_source_read,
-        _handle_source_patch,
     ),
     strict=True,
 ):
-    if _artifact_method in _RETIRED_EDITOR_METHODS:
-        _d.method(_artifact_method, scope="operator.write")(_artifact_implementation)
-    else:
-        register_artifact_workbench_contract(
-            _d,
-            _artifact_method,
-            _artifact_implementation,
-            internal_error=RpcHandlerError,
-            guest_allowed_checker=is_guest_rpc_method_allowed,
-        )
+    register_artifact_workbench_contract(
+        _d,
+        _artifact_method,
+        _artifact_implementation,
+        internal_error=RpcHandlerError,
+        guest_allowed_checker=is_guest_rpc_method_allowed,
+    )
 
 
 __all__ = [
@@ -1410,16 +1355,8 @@ __all__ = [
     "_handle_document_open",
     "_handle_document_rename",
     "_handle_documents_list",
-    "_handle_edit_session_close",
-    "_handle_edit_session_heartbeat",
-    "_handle_edit_session_start",
-    "_handle_prompt_annotation_create",
-    "_handle_prompt_annotation_discard",
-    "_handle_prompt_annotation_focus",
-    "_handle_prompt_annotation_update",
     "_handle_prompt_annotations_list",
     "_handle_revision_restore",
     "_handle_revisions_list",
-    "_handle_source_patch",
     "_handle_source_read",
 ]

@@ -686,6 +686,7 @@
     "tests/test_gateway/test_rpc_product_cli_gaps.py": 6.113,
     "tests/test_gateway/test_rpc_proposals.py": 0.183,
     "tests/test_gateway/test_rpc_provider_credential_clear.py": 4.877,
+    "tests/test_gateway/test_rpc_retired_surface.py": 0.01,
     "tests/test_gateway/test_rpc_router_decisions.py": 43.2,
     "tests/test_gateway/test_rpc_routing_hold.py": 0.383,
     "tests/test_gateway/test_rpc_run_mode_preference.py": 0.168,
