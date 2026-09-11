@@ -176,23 +176,6 @@ def _bool_from_env(name: str, default: bool = False) -> bool:
     return raw.strip().lower() in _TRUE_ENV_VALUES
 
 
-def _strict_bool_from_env(name: str, default: bool = False) -> bool:
-    raw = os.environ.get(name)
-    if raw is None or not raw.strip():
-        return default
-    normalized = raw.strip().lower()
-    if normalized in _FINALIZE_EVIDENCE_GATE_ON:
-        return True
-    if normalized in _FINALIZE_EVIDENCE_GATE_OFF:
-        return False
-    raise ValueError(
-        f"{name} must be one of: "
-        + ", ".join(
-            sorted(_FINALIZE_EVIDENCE_GATE_ON | _FINALIZE_EVIDENCE_GATE_OFF)
-        )
-    )
-
-
 def _name_tuple_from_env(name: str) -> tuple[str, ...]:
     raw = os.environ.get(name, "")
     return tuple(item.strip() for item in raw.split(",") if item.strip())
@@ -991,14 +974,6 @@ class AgentBootstrapStage:
                 "OPENSQUILLA_DEADLINE_WRAPUP_MARGIN_SECONDS",
                 AgentConfig().deadline_wrapup_margin_seconds,
             ),
-            reasoning_only_thinking_fallback=_bool_from_env(
-                "OPENSQUILLA_REASONING_ONLY_THINKING_FALLBACK",
-                AgentConfig().reasoning_only_thinking_fallback,
-            ),
-            provider_error_thinking_fallback=_strict_bool_from_env(
-                "OPENSQUILLA_PROVIDER_ERROR_THINKING_FALLBACK",
-                AgentConfig().provider_error_thinking_fallback,
-            ),
             final_diff_salvage=_bool_from_env(
                 "OPENSQUILLA_FINAL_DIFF_SALVAGE",
                 AgentConfig().final_diff_salvage,
@@ -1010,10 +985,6 @@ class AgentBootstrapStage:
             final_diff_salvage_veto=_bool_from_env(
                 "OPENSQUILLA_FINAL_DIFF_SALVAGE_VETO",
                 AgentConfig().final_diff_salvage_veto,
-            ),
-            deadline_wrapup_sticky_thinking_off=_bool_from_env(
-                "OPENSQUILLA_DEADLINE_WRAPUP_STICKY_THINKING_OFF",
-                AgentConfig().deadline_wrapup_sticky_thinking_off,
             ),
             reasoning_only_act_now=_bool_from_env(
                 "OPENSQUILLA_REASONING_ONLY_ACT_NOW",

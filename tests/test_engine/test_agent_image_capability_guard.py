@@ -527,7 +527,7 @@ async def test_image_marker_retry_is_suppressed_after_visible_output() -> None:
 
 
 @pytest.mark.asyncio
-async def test_thinking_fallback_cannot_bypass_image_retry_barrier() -> None:
+async def test_provider_error_cannot_bypass_image_retry_barrier() -> None:
     provider = _ThinkingTextThenRejectProvider()
     agent = Agent(
         provider=provider,

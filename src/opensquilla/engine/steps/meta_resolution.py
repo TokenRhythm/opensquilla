@@ -145,21 +145,6 @@ def evict_meta_sticky(session_id: str) -> None:
     _sticky_drop(session_id)
 
 
-def _clamp_thinking_for_meta(ctx: TurnContext) -> None:
-    """Force ``thinking_level=low`` on a meta-matched turn.
-
-    Even with ``meta_match_tool_choice`` forcing ``meta_invoke``, some
-    models (notably deepseek-v4-flash) burn the entire output budget on
-    reasoning before producing the tool call. The structured argument
-    list for ``meta_invoke`` does not need deep reasoning, so we clamp
-    to low here. Recorded in ``thinking_source`` so the next pipeline
-    step can see who set it last.
-    """
-    ctx.metadata["thinking_level"] = "low"
-    ctx.metadata["thinking_requested"] = True
-    ctx.metadata["thinking_source"] = "meta_resolution"
-
-
 def _input_provenance_kind(ctx: TurnContext) -> str:
     """Return normalized input provenance kind from pipeline metadata."""
 
@@ -1274,12 +1259,6 @@ async def meta_resolution(ctx: TurnContext) -> TurnContext:
             "type": "function",
             "function": {"name": "meta_invoke"},
         }
-
-    # Clamp reasoning budget so the LLM cannot length-cap on thinking
-    # before producing the forced ``meta_invoke`` call. Applies to both
-    # fresh matches and sticky replays — the meta-invoke argument shape
-    # never needs deep reasoning.
-    _clamp_thinking_for_meta(ctx)
 
     if getattr(chosen_plan, "name", "") == "meta-skill-creator":
         highest = _highest_text_tier(ctx)
