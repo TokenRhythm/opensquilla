@@ -292,6 +292,12 @@ class OpenAICompatPolicy:
     # validates their location but never treats them as response content.
     post_terminal_metadata_keys: frozenset[str] = frozenset()
 
+    # Some self-hosted OpenAI-compatible servers (notably llama.cpp) emit an
+    # empty ``choices`` frame after the terminal choice and before ``[DONE]``
+    # without a usage trailer.  It carries no response state, so custom local
+    # endpoints may opt into accepting that exact inert frame.
+    allow_post_terminal_empty_choices: bool = False
+
     # Gateway proxies with their own routing (LiteLLM): pin the requested
     # model by disabling the gateway's cross-model fallbacks per request, so
     # SquillaRouter stays the single routing authority.
