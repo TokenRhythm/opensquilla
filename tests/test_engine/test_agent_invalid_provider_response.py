@@ -26,6 +26,7 @@ from opensquilla.provider import TextDeltaEvent as ProviderText
 from opensquilla.provider import ToolUseDeltaEvent as ProviderToolUseDelta
 from opensquilla.provider import ToolUseEndEvent as ProviderToolUseEnd
 from opensquilla.provider import ToolUseStartEvent as ProviderToolUseStart
+from opensquilla.provider.types import ContentBlockImage
 from opensquilla.session.manager import SessionManager
 from opensquilla.session.storage import SessionStorage
 from opensquilla.tools.dispatch import build_tool_handler
@@ -229,6 +230,58 @@ async def test_reasoning_only_first_turn_retries_without_disabling_thinking() ->
     assert len(assistant_messages) == 1
     assert assistant_messages[0].content[0].text == "ok"
     assert assistant_messages[0].reasoning_content is None
+
+
+@pytest.mark.asyncio
+async def test_reasoning_only_image_turn_preserves_thinking_on_retry() -> None:
+    provider = _SequenceProvider(
+        [
+            [
+                ProviderDone(
+                    stop_reason="stop",
+                    input_tokens=10,
+                    output_tokens=5,
+                    reasoning_tokens=5,
+                    reasoning_content="internal reasoning",
+                )
+            ],
+            [
+                ProviderText(text="image analyzed"),
+                ProviderDone(stop_reason="stop", input_tokens=11, output_tokens=2),
+            ],
+        ]
+    )
+    agent = Agent(
+        provider=provider,
+        config=AgentConfig(
+            thinking=ThinkingLevel.MEDIUM,
+            retry_base_backoff_ms=0,
+            retry_max_backoff_ms=0,
+        ),
+    )
+
+    events = [
+        event
+        async for event in agent.run_turn(
+            "describe the image",
+            extra_messages=[
+                Message(
+                    role="user",
+                    content=[ContentBlockImage(media_type="image/png", data="c3ludGhldGlj")],
+                )
+            ],
+        )
+    ]
+
+    assert any(event.kind == "done" and event.text == "image analyzed" for event in events)
+    warning = next(
+        event
+        for event in events
+        if event.kind == "warning" and event.code == "provider_reasoning_only_retry"
+    )
+    assert "thinking disabled" not in warning.message
+    assert provider.calls[0]["config"].thinking is True
+    assert provider.calls[1]["config"].thinking is True
 
 
 @pytest.mark.asyncio

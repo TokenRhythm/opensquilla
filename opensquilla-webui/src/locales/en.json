@@ -227,7 +227,6 @@
       "setDefaultMode": "Use this mode by default",
       "restoreDefaultMode": "Restore the default preview mode",
       "defaultModeSaved": "Default preview mode saved.",
-      "fullModeNotice": "Interactive preview can load online content, but it does not share OpenSquilla identity, local files, or your system browser login.",
       "offlineWebLimits": "Some external content and advanced web features may be unavailable in restricted preview.",
       "compatibilityFallback": "This Desktop version supports only the legacy single-file preview.",
       "upgradeDesktopShort": "Update Desktop",
@@ -1140,7 +1139,9 @@
       "modelNoMatches": "No matching models — you can keep what you typed.",
       "modelListTruncated": "Showing {shown} of {total} models — keep typing to narrow the list.",
       "modelProvenance": "Live provider list · capability source: {sources}",
-      "modelMetadataProvenance": "Live provider list · official values when available, catalog fallback otherwise"
+      "modelMetadataProvenance": "Live provider list · official values when available, catalog fallback otherwise",
+      "modelMultimodal": "Multimodal",
+      "modelMultimodalTitle": "Supports image input"
     },
     "preset": {
       "modeCustom": "custom tiers"
@@ -1210,6 +1211,7 @@
       "removeCandidateAria": "Remove {model}",
       "ensembleEmpty": "No candidate models yet. Save your Model Service settings to seed model tiers, or add candidates manually.",
       "ensemblePipeline": "How it works: proposer models draft in parallel, then the aggregator fuses the drafts into the final reply. Only the aggregator can call tools.",
+      "candidateModelHint": "The Multimodal badge means a model accepts image input. Image turns follow the configured image-capable route.",
       "ensembleFlowDesc": "Models draft in parallel; an aggregator merges them into one answer. Uses more calls.",
       "legacyDynamicNotice": "This legacy fusion plan follows the saved model tiers. Convert it to a custom lineup to edit its members here.",
       "legacyDynamicMigrate": "Convert to custom lineup",

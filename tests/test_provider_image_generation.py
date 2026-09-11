@@ -3,7 +3,6 @@ from __future__ import annotations
 import base64
 import io
 import json
-from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -22,7 +21,7 @@ from opensquilla.provider.qwen_token_plan import (
     QWEN_TOKEN_PLAN_IMAGE_BASE_URL,
     QWEN_TOKEN_PLAN_OPENAI_BASE_URL,
 )
-from opensquilla.provider.types import ChatConfig
+from opensquilla.provider.types import ChatConfig, TextDeltaEvent
 from opensquilla.tools.types import ToolContext, current_tool_context
 
 
@@ -1743,7 +1742,7 @@ async def test_image_tool_uses_active_deployment_instead_of_legacy_image_route(
         async def chat(self, *, messages, config=None):
             captured["messages"] = messages
             captured["model"] = self.model
-            yield SimpleNamespace(text="a generated image")
+            yield TextDeltaEvent(text="a generated image")
 
     class FakeSelector:
         def __init__(self, selector_config):
@@ -1796,7 +1795,7 @@ async def test_vision_provider_sends_provider_native_multimodal_message(monkeypa
         async def chat(self, *, messages, config=None):
             captured["messages"] = messages
             captured["config"] = config
-            yield SimpleNamespace(text="described")
+            yield TextDeltaEvent(text="described")
 
     root = ProviderRequestCorrelation(
         session_id="session-1",
@@ -1880,7 +1879,7 @@ async def test_text_media_llm_uses_provider_native_message(monkeypatch) -> None:
         async def chat(self, *, messages, config=None):
             captured["messages"] = messages
             captured["config"] = config
-            yield SimpleNamespace(text="analyzed")
+            yield TextDeltaEvent(text="analyzed")
 
     class FakeSelector:
         def __init__(self, selector_config):

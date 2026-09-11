@@ -227,7 +227,6 @@
       "setDefaultMode": "将当前模式设为默认",
       "restoreDefaultMode": "恢复默认预览模式",
       "defaultModeSaved": "已保存默认预览模式。",
-      "fullModeNotice": "互动预览可以加载在线内容，但不会共享 OpenSquilla 身份、本机文件或系统浏览器登录状态。",
       "offlineWebLimits": "受限预览中，部分外部内容和高级网页功能可能不可用。",
       "compatibilityFallback": "当前 Desktop 版本仅支持旧版单文件预览。",
       "upgradeDesktopShort": "请升级 Desktop",
@@ -1140,7 +1139,9 @@
       "modelNoMatches": "没有匹配的模型 — 可以直接使用输入的内容。",
       "modelListTruncated": "显示 {total} 个模型中的 {shown} 个 — 继续输入以缩小范围。",
       "modelProvenance": "服务商实时列表 · 能力来源：{sources}",
-      "modelMetadataProvenance": "服务商实时列表 · 官网参数优先，缺失时使用目录值"
+      "modelMetadataProvenance": "服务商实时列表 · 官网参数优先，缺失时使用目录值",
+      "modelMultimodal": "多模态",
+      "modelMultimodalTitle": "支持图片输入"
     },
     "preset": {
       "modeCustom": "自定义分层"
@@ -1210,6 +1211,7 @@
       "removeCandidateAria": "移除 {model}",
       "ensembleEmpty": "暂无候选模型。请保存模型服务设置以生成模型分层，或手动添加候选模型。",
       "ensemblePipeline": "工作方式：提案模型并行起草，融合模型汇总草稿并产出最终回答；只有融合模型可以调用工具。",
+      "candidateModelHint": "“多模态”标签表示模型支持图片输入；图片请求会使用已配置的图片能力路由。",
       "ensembleFlowDesc": "多个模型并行起草,融合模型合成最终回答;调用次数更多。",
       "legacyDynamicNotice": "当前为跟随已保存模型分层的旧融合方案；转换为自定义阵容后可在此编辑成员。",
       "legacyDynamicMigrate": "转换为自定义阵容",

@@ -119,8 +119,11 @@ def model_info_to_projection(model: dict[str, Any]) -> dict[str, Any]:
             capabilities.append("reasoning")
         if supports_vision:
             capabilities.append("vision")
-    elif model.get("supports_tools"):
-        capabilities.append("tools")
+    else:
+        if model.get("supports_tools"):
+            capabilities.append("tools")
+        if model.get("supports_vision"):
+            capabilities.append("vision")
 
     return {
         "id": model_id,

@@ -867,6 +867,9 @@ function credentialLabel(candidate: EnsembleCandidateView): string {
         class="control-section setup-model-strategy__detail setup-model-strategy__ensemble"
         data-testid="ensemble-panel"
       >
+        <p class="setup-model-strategy__notice" data-testid="ensemble-candidate-image-hint">
+          {{ t('setup.modelStrategy.candidateModelHint') }}
+        </p>
         <div
           v-if="panel.ensemble.schemeCardsAvailable && ensembleScheme !== 'legacy'"
           class="setup-model-strategy__schemes"

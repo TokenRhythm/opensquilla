@@ -1763,19 +1763,15 @@ describe('artifact Workbench provider', () => {
     expect(renderState.previewMode).toBe('full')
     expect(createSurface).toHaveBeenLastCalledWith(expect.objectContaining({ version: 3 }))
     expect(renderState.previewDefaultMode).toBe('offline')
+    expect(savePreviewPreferences).not.toHaveBeenCalled()
+
+    await runtime.performAction?.('set-default-preview-mode', item)
+    await runtime.performAction?.('set-default-preview-mode', item)
+
     expect(savePreviewPreferences).toHaveBeenCalledOnce()
     expect(savePreviewPreferences).toHaveBeenLastCalledWith({
-      mode: 'offline',
-      noticeShown: true,
-    })
-
-    await runtime.performAction?.('set-default-preview-mode', item)
-    await runtime.performAction?.('set-default-preview-mode', item)
-
-    expect(savePreviewPreferences).toHaveBeenCalledTimes(2)
-    expect(savePreviewPreferences).toHaveBeenLastCalledWith({
       mode: 'full',
-      noticeShown: true,
+      noticeShown: false,
     })
     expect(pushToast).toHaveBeenCalledOnce()
     expect(renderState.previewDefaultMode).toBe('full')

@@ -102,6 +102,7 @@ from opensquilla.contracts.attachments import (
 from opensquilla.contracts.attachments import (
     normalize_attachment_mime as _normalize_attachment_mime,
 )
+from opensquilla.contracts.image_validation import validate_image_bytes
 from opensquilla.contracts.turn_execution import TurnExecutionContext
 from opensquilla.engine.agent import Agent, ToolHandler
 from opensquilla.engine.agent_injection import PendingInputProvider
@@ -557,6 +558,16 @@ def _is_materializable_attachment_mime(mime: Any) -> bool:
     # are opaque, so their only representation is the workspace copy.
     normalized = _normalize_attachment_mime(mime)
     return normalized is not None and normalized not in _IMAGE_ATTACHMENT_MIMES
+
+
+def _historical_image_bytes_match_claim(media_type: str, raw: bytes) -> bool:
+    """Turn unreadable legacy image material into an unavailable marker."""
+
+    try:
+        validate_image_bytes(raw, media_type)
+    except ValueError:
+        return False
+    return True
 
 
 def collect_invoked_skills(
@@ -9843,15 +9854,43 @@ class TurnRunner:
                     "missing_fixed_fallback: configure a non-empty fixed/direct "
                     "provider and model before enabling multi-model fusion"
                 )
-            turn.metadata["ensemble_fallback_provider"] = fixed_provider
-            turn.metadata["ensemble_fallback_model"] = fixed_model
+
+            # Attachment admission proves the routed logical deployment before
+            # Ensemble replaces it with the configured fixed baseline. If that
+            # baseline cannot carry the same request, keep the proven routed
+            # single-model path and its capacity-filtered selector fallback.
+            if turn.metadata.get("large_context_capacity_required") is True:
+                from opensquilla.engine.selector_override import (
+                    provider_config_has_request_capacity,
+                )
+
+                if not provider_config_has_request_capacity(
+                    initial_provider_config,
+                    turn.metadata,
+                ):
+                    fixed_baseline_ensemble = False
+                    turn.metadata["ensemble_wrap_skipped_reason"] = (
+                        "fixed_fallback_request_capacity"
+                    )
+                    turn.metadata["ensemble_capacity_bypassed"] = True
+                    log.warning(
+                        "llm_ensemble.wrap_skipped",
+                        reason="fixed_fallback_request_capacity",
+                        provider=fixed_provider,
+                        model=fixed_model,
+                    )
+
+            if fixed_baseline_ensemble:
+                turn.metadata["ensemble_fallback_provider"] = fixed_provider
+                turn.metadata["ensemble_fallback_model"] = fixed_model
 
             # Static/custom plans own their members' reasoning policy.  The
             # tier value remains stored as the reversible single-model draft,
             # but must not leak into the shared plan.  Legacy router_dynamic
             # continues to derive per-member thinking from its tier rows.
             if (
-                selection_mode != ROUTER_DYNAMIC_SELECTION_MODE
+                fixed_baseline_ensemble
+                and selection_mode != ROUTER_DYNAMIC_SELECTION_MODE
                 and turn.metadata.get("thinking_source") == "squilla_router_tier"
             ):
                 turn.metadata.pop("thinking_requested", None)
@@ -10023,7 +10062,7 @@ class TurnRunner:
             turn.metadata["ensemble_wrap_skipped_reason"] = reason
             _record_fixed_ensemble_execution(reason)
 
-        if provider is not None and (ensemble_globally_enabled or tier_ensemble_mode):
+        if provider is not None and fixed_baseline_ensemble:
             from opensquilla.engine.selector_override import (
                 acquire_profile_credential,
                 report_profile_credential_failure,
@@ -14861,7 +14900,7 @@ class TurnRunner:
 
                 if isinstance(data, str) and data:
                     try:
-                        base64.b64decode(data, validate=True)
+                        raw_bytes = base64.b64decode(data, validate=True)
                     except (binascii.Error, ValueError):
                         omitted.append(
                             image_marker(
@@ -14870,6 +14909,14 @@ class TurnRunner:
                             )
                         )
                     else:
+                        if not _historical_image_bytes_match_claim(media_type, raw_bytes):
+                            omitted.append(
+                                image_marker(
+                                    ImageMarkerState.UNAVAILABLE,
+                                    attachment_id=attachment_id,
+                                )
+                            )
+                            continue
                         if (
                             allowed_image_attachment_ids is not None
                             and attachment_id is not None
@@ -14915,6 +14962,14 @@ class TurnRunner:
                             )
                         )
                     else:
+                        if not _historical_image_bytes_match_claim(media_type, raw_bytes):
+                            omitted.append(
+                                image_marker(
+                                    ImageMarkerState.UNAVAILABLE,
+                                    attachment_id=attachment_id,
+                                )
+                            )
+                            continue
                         if (
                             allowed_image_attachment_ids is not None
                             and attachment_id is not None
