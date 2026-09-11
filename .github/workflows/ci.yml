@@ -773,6 +773,7 @@ jobs:
           node scripts/test-telemetry-build-identity.mjs
           node scripts/test-telemetry-reliability.mjs
           node scripts/test-telemetry-growth.mjs
+          node scripts/test-telemetry-growth-lifecycle.mjs
           node scripts/test-telemetry-protocol.mjs
           node ../../.github/scripts/verify-sandbox-package.mjs --source
 
