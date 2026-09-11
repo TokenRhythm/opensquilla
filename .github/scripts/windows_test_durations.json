@@ -595,6 +595,7 @@
     "tests/test_gateway/test_cron_result_payload.py": 0.01,
     "tests/test_gateway/test_cron_scheduler_adapter.py": 0.01,
     "tests/test_gateway/test_cron_scheduler_application.py": 0.01,
+    "tests/test_gateway/test_custom_extra_body.py": 0.01,
     "tests/test_gateway/test_debug_file_logging.py": 0.278,
     "tests/test_gateway/test_desktop_browser.py": 0.01,
     "tests/test_gateway/test_desktop_ownership.py": 0.404,

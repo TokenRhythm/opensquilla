@@ -79,6 +79,9 @@ RECENTLY_ADDED_ACTIVE_TESTS = {
     "tests/test_gateway/test_transport_diagnostics.py",
     "tests/test_gateway/test_transport_flow.py",
     "tests/test_gateway/test_websocket_connection_stability.py",
+    # Custom-provider request extensions use the provisional floor until the
+    # next comparable three-run Windows duration refresh.
+    "tests/test_gateway/test_custom_extra_body.py",
     "tests/test_ci/test_windows_signed_update_audit.py",
     # New replay files use the documented provisional floor until a Windows refresh.
     "tests/functional/test_reasoning_replay_persistence_e2e.py",
