@@ -1058,7 +1058,9 @@
       "modelNoMatches": "Aucun modèle correspondant — vous pouvez garder votre saisie.",
       "modelListTruncated": "{shown} modèles sur {total} — continuez à taper pour affiner.",
       "modelProvenance": "Liste fournisseur en direct · source des capacités : {sources}",
-      "modelMetadataProvenance": "Liste fournisseur en direct · valeurs officielles prioritaires, sinon valeurs catalogue"
+      "modelMetadataProvenance": "Liste fournisseur en direct · valeurs officielles prioritaires, sinon valeurs catalogue",
+      "modelMultimodal": "Multimodal",
+      "modelMultimodalTitle": "Accepte les entrées d’image"
     },
     "preset": {
       "modeCustom": "personnalisé"
@@ -1128,6 +1130,7 @@
       "removeCandidateAria": "Retirer {model}",
       "ensembleEmpty": "Aucun modèle candidat pour le moment. Enregistrez les paramètres du service de modèles pour générer les niveaux de routage, ou ajoutez des candidats manuellement.",
       "ensemblePipeline": "Fonctionnement : les modèles proposants rédigent en parallèle, puis l'agrégateur fusionne les brouillons en réponse finale. Seul l'agrégateur peut appeler des outils.",
+      "candidateModelHint": "Le badge Multimodal indique qu’un modèle accepte les images. Les requêtes avec image suivent la route configurée compatible avec les images.",
       "ensembleFlowDesc": "Plusieurs modèles rédigent en parallèle ; un agrégateur les fusionne en une réponse. Plus d'appels.",
       "legacyDynamicNotice": "Cet ancien plan de fusion suit les niveaux de modèle enregistrés. Convertissez-le en composition personnalisée pour modifier ses membres.",
       "legacyDynamicMigrate": "Convertir en composition personnalisée",

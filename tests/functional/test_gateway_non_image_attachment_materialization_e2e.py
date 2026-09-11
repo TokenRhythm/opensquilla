@@ -40,6 +40,7 @@ from opensquilla.provider.types import (
 )
 from opensquilla.session.manager import SessionManager
 from opensquilla.session.storage import SessionStorage
+from tests.helpers.image_bytes import image_bytes
 
 _TEXT_MODEL = "test/text"
 _GATE_MODEL = "test/gate"
@@ -47,12 +48,7 @@ _VISION_MODEL = "test/vision"
 _TURN_TERMINAL_EVENT_TIMEOUT_SECONDS = 30.0
 _TURN_TASK_DRAIN_TIMEOUT_SECONDS = 10.0
 
-_PNG_BYTES = (
-    b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01"
-    b"\x00\x00\x00\x01\x08\x06\x00\x00\x00\x1f\x15\xc4"
-    b"\x89\x00\x00\x00\nIDATx\x9cc\xf8\x0f\x00\x01\x01"
-    b"\x01\x00\x18\xdd\x8d\xb0\x00\x00\x00\x00IEND\xaeB`\x82"
-)
+_PNG_BYTES = image_bytes()
 
 
 def _sample_pdf_bytes(text: str = "Machine Learning") -> bytes:

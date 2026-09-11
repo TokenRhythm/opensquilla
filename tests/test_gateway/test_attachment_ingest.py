@@ -7,11 +7,13 @@ import pytest
 
 from opensquilla.attachment_refs import (
     is_attachment_ref,
+    make_attachment_ref,
     promote_pending_chat_input_attachments,
     read_attachment_ref_bytes,
     read_pending_chat_input_manifest,
     read_pending_chat_input_promotions,
     transcript_material_path,
+    write_transcript_material,
 )
 from opensquilla.contracts.attachments import SNIFF_PEEK_BYTES
 from opensquilla.gateway.attachment_ingest import (
@@ -19,6 +21,7 @@ from opensquilla.gateway.attachment_ingest import (
     stage_pending_chat_input_attachments,
 )
 from opensquilla.gateway.uploads import UploadStore
+from tests.helpers.image_bytes import image_bytes
 
 
 @pytest.mark.asyncio
@@ -233,7 +236,7 @@ async def test_zip_upload_accepted_as_opaque_not_ooxml() -> None:
 async def test_unknown_claim_adopts_sniffed_rendered_type() -> None:
     # An image uploaded with a generic claim is routed to the image family by
     # its magic bytes instead of degrading to an opaque blob.
-    png = b"\x89PNG\r\n\x1a\n" + b"fake image body"
+    png = image_bytes()
     result = await ingest_attachments(
         "read it",
         [{"name": "shot", "mime_type": "application/octet-stream", "data": png}],
@@ -242,6 +245,59 @@ async def test_unknown_claim_adopts_sniffed_rendered_type() -> None:
 
     assert result.failures == []
     assert result.attachments[0]["type"] == "image/png"
+
+
+@pytest.mark.parametrize(
+    ("payload", "mime"),
+    [
+        (b"\x89PNG\r\n\x1a\ninvalid image body", "image/png"),
+        (b"plain text renamed to a photograph", "image/jpeg"),
+        (b"%PDF-1.4\nnot a photograph", "image/jpeg"),
+        (b"\x89PNG\r\n\x1a\ninvalid image body", "application/octet-stream"),
+    ],
+)
+@pytest.mark.parametrize("failure_mode", ["mark", "raise"])
+async def test_invalid_image_rejected_before_dispatch(payload, mime, failure_mode) -> None:
+    attachments = [{"name": "sample.jpg", "mime_type": mime, "data": payload}]
+    if failure_mode == "raise":
+        with pytest.raises(ValueError, match="upload a valid image"):
+            await ingest_attachments("inspect", attachments, failure_mode=failure_mode)
+        return
+    result = await ingest_attachments("inspect", attachments, failure_mode=failure_mode)
+    assert result.attachments == []
+    assert result.failures[0].reason == "invalid_image"
+    assert "[attachment unavailable: sample.jpg: invalid_image]" in result.text
+
+
+async def test_valid_image_mime_mismatch_still_uses_detected_format() -> None:
+    result = await ingest_attachments(
+        "inspect", [{"name": "sample.jpg", "type": "image/jpeg", "data": image_bytes()}],
+    )
+    assert result.failures == []
+    assert result.attachments[0]["type"] == "image/png"
+
+
+@pytest.mark.parametrize("valid_image", [False, True])
+async def test_durable_image_reference_revalidates_content(tmp_path, valid_image) -> None:
+    payload = image_bytes() if valid_image else b"\x89PNG\r\n\x1a\ninvalid image body"
+    sha, path, _ = write_transcript_material(
+        media_root=tmp_path, session_id="sample-session", payload=payload,
+    )
+    ref = make_attachment_ref(
+        sha256=sha, name="sample.png", mime="image/png", size=len(payload),
+        session_id="sample-session", source="upload",
+    )
+    result = await ingest_attachments(
+        "inspect", [ref], failure_mode="mark", allow_material_refs=True,
+        material_root=tmp_path, expected_material_scope="sample-session",
+    )
+    if valid_image:
+        assert result.attachments == [ref]
+        assert result.failures == []
+    else:
+        assert result.attachments == []
+        assert result.failures[0].reason == "invalid_image"
+    assert path.read_bytes() == payload
 
 
 @pytest.mark.asyncio
@@ -511,7 +567,7 @@ async def test_windows_jpeg_alias_admitted_in_strict_mode() -> None:
     # a deliberate strict-mode improvement over the legacy 415.
     result = await ingest_attachments(
         "read it",
-        [{"name": "photo.jpg", "mime_type": "image/jpg", "data": b"\xff\xd8\xff" + b"j" * 32}],
+        [{"name": "photo.jpg", "mime_type": "image/jpg", "data": image_bytes("JPEG")}],
         failure_mode="mark",
         accept_opaque=False,
     )
@@ -525,7 +581,7 @@ async def test_windows_jpeg_alias_admitted_in_strict_mode() -> None:
 async def test_uuid_ingress_respects_persistence_without_consuming_upload(
     tmp_path: Path, persist_enabled: bool,
 ) -> None:
-    payload = b"\x89PNG\r\n\x1a\n" + b"synthetic image material"
+    payload = image_bytes()
     store = UploadStore(marker_dir=tmp_path / "upload-markers")
     file_uuid = await store.put("sample.png", "image/png", payload)
     original_upload = await store.get(file_uuid)
@@ -562,7 +618,7 @@ async def test_uuid_ingress_respects_persistence_without_consuming_upload(
 async def test_queue_promotion_respects_persistence_and_retains_queue_material(
     tmp_path: Path, persist_enabled: bool,
 ) -> None:
-    payload = b"\x89PNG\r\n\x1a\n" + b"synthetic queued image material"
+    payload = image_bytes()
     store = UploadStore(marker_dir=tmp_path / "upload-markers")
     file_uuid = await store.put("queued.png", "image/png", payload)
     original_upload = await store.get(file_uuid)
