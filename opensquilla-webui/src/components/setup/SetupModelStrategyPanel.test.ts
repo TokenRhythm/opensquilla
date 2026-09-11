@@ -280,6 +280,32 @@ describe('SetupModelStrategyPanel', () => {
     app.unmount()
   })
 
+  it('keeps the legacy image tier out of the model strategy table', async () => {
+    const { app, el } = await mountPanel({
+      activeStrategy: 'router',
+      router: {
+        tierRows: [
+          ...panel().router.tierRows,
+          {
+            name: 'image_model',
+            provider: 'openrouter',
+            model: 'legacy/vision-model',
+            thinkingLevel: '',
+            supportsImage: true,
+          },
+        ],
+      },
+    })
+
+    expect(el.querySelector('[aria-label="image_model model"]')).toBeNull()
+    expect(el.querySelector('[aria-label="image_model thinking level"]')).toBeNull()
+    expect(el.querySelector('[aria-label$="supports image"]')).toBeNull()
+    expect(el.textContent).not.toContain('legacy/vision-model')
+    expect(el.textContent).not.toContain('Image model')
+
+    app.unmount()
+  })
+
   it('offers a compact provider shortcut when only one provider is available', async () => {
     const onGoToSection = vi.fn()
     const { app, el } = await mountPanel({

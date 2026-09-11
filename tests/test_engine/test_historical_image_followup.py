@@ -36,6 +36,7 @@ from opensquilla.session.attachment_manifest import (
 )
 from opensquilla.session.manager import SessionManager
 from opensquilla.session.storage import SessionStorage
+from tests.helpers.image_bytes import image_bytes
 
 
 @dataclass
@@ -151,7 +152,7 @@ def _b64(payload: bytes) -> str:
     return base64.b64encode(payload).decode("ascii")
 
 
-def _inline_image_envelope(text: str, payload: bytes = b"\x89PNG\r\n\x1a\n") -> str:
+def _inline_image_envelope(text: str, payload: bytes = image_bytes()) -> str:
     return json.dumps(
         {
             "text": text,
@@ -203,7 +204,9 @@ async def test_text_primary_fallback_recovers_selected_historical_original(
     key = "agent:main:historical-selector-fallback"
     await manager.create(key)
     image_entry = _TranscriptEntry(
-        "user", _inline_image_envelope("Describe this image.", b"original"), "image-source"
+        "user",
+        _inline_image_envelope("Describe this image.", image_bytes(color="#000001")),
+        "image-source",
     )
     current = _TranscriptEntry("user", "Use the previous image.", "current")
     manager._canonical[key] = [image_entry, current]
@@ -245,7 +248,7 @@ async def test_text_primary_fallback_recovers_selected_historical_original(
     if image_source == "agent_history":
         agent.set_history([
             Message(role="user", content=[
-                ContentBlockImage(media_type="image/png", data=_b64(b"original"))
+                ContentBlockImage(media_type="image/png", data=_b64(image_bytes(color="#000001")))
             ])
         ])
     else:
@@ -269,7 +272,7 @@ async def test_text_primary_fallback_recovers_selected_historical_original(
         if isinstance(message.content, list)
         for block in message.content
         if isinstance(block, ContentBlockImage)
-    ] == [_b64(b"original")]
+    ] == [_b64(image_bytes(color="#000001"))]
 
 
 @pytest.mark.parametrize("archived", [False, True])
@@ -283,14 +286,14 @@ async def test_current_upload_and_previous_image_selection_are_independent(
     key = "agent:main:compare-current-and-previous"
     await manager.create(key)
     previous = _TranscriptEntry(
-        "user", _inline_image_envelope("Previous upload.", b"previous-original"), "previous"
+        "user", _inline_image_envelope("Previous upload.", image_bytes(color="#000002")), "previous"
     )
     text = (
         "Ignore the previous image; describe the new upload."
         if opt_out else "Compare the new upload with the previous image."
     )
     current = _TranscriptEntry(
-        "user", _inline_image_envelope(text, b"current-original"), "current"
+        "user", _inline_image_envelope(text, image_bytes(color="#000003")), "current"
     )
     manager._canonical[key] = [previous, current]
     manager._transcripts[key] = [current] if archived else [previous, current]
@@ -307,7 +310,7 @@ async def test_current_upload_and_previous_image_selection_are_independent(
     ctx = TurnContext(
         message=text, raw_message=text, session_key=key,
         model="configured-vision", config=config,
-        attachments=[{"mime": "image/png", "data": _b64(b"current-original")}],
+        attachments=[{"mime": "image/png", "data": _b64(image_bytes(color="#000003"))}],
         provider=_CapturingProvider(), tool_defs=[], system_prompt="", metadata=metadata,
     )
     await apply_vision_followup_gate(ctx)
@@ -325,7 +328,8 @@ async def test_current_upload_and_previous_image_selection_are_independent(
     await runner._load_history(agent, key, bound_user_message_id="current")
     current_message = Message(role="user", content=[
         ContentBlockImage(
-            media_type="image/png", data=_b64(b"current-original"), attachment_id="att_current"
+            media_type="image/png", data=_b64(image_bytes(color="#000003")),
+            attachment_id="att_current",
         ),
     ])
     events = [event async for event in agent.run_turn(text, extra_messages=[current_message])]
@@ -337,8 +341,8 @@ async def test_current_upload_and_previous_image_selection_are_independent(
         if isinstance(block, ContentBlockImage)
     ]
     assert payloads == (
-        [_b64(b"current-original")]
-        if opt_out else [_b64(b"previous-original"), _b64(b"current-original")]
+        [_b64(image_bytes(color="#000003"))]
+        if opt_out else [_b64(image_bytes(color="#000002")), _b64(image_bytes(color="#000003"))]
     )
 
 
@@ -353,7 +357,7 @@ async def test_current_text_image_opt_out_reaches_provider_when_gate_disabled(
     key = "agent:main:image-reference-opt-out"
     node = await manager.create(key)
     previous = _TranscriptEntry(
-        "user", _inline_image_envelope("Previous upload.", b"previous-original"), "previous"
+        "user", _inline_image_envelope("Previous upload.", image_bytes(color="#000002")), "previous"
     )
     previous_id = build_attachment_manifest(
         [previous], session_id=node.session_id, session_key=key,
@@ -361,7 +365,7 @@ async def test_current_text_image_opt_out_reaches_provider_when_gate_disabled(
     text = f"Ignore the previous image {previous_id}; answer only the text question."
     current = _TranscriptEntry(
         "user",
-        _inline_image_envelope(text, b"current-original") if current_upload else text,
+        _inline_image_envelope(text, image_bytes(color="#000003")) if current_upload else text,
         "current",
     )
     manager._canonical[key] = [previous, current]
@@ -375,7 +379,7 @@ async def test_current_text_image_opt_out_reaches_provider_when_gate_disabled(
         "router_vision_followup_gate_source": "explicit_attachment_id",
     }
     attachments = (
-        [{"mime": "image/png", "data": _b64(b"current-original")}]
+        [{"mime": "image/png", "data": _b64(image_bytes(color="#000003"))}]
         if current_upload else []
     )
     provider = _CapturingProvider()
@@ -396,7 +400,7 @@ async def test_current_text_image_opt_out_reaches_provider_when_gate_disabled(
     await runner._load_history(agent, key, bound_user_message_id="current")
     extra_messages = (
         [Message(role="user", content=[
-            ContentBlockImage(media_type="image/png", data=_b64(b"current-original"))
+            ContentBlockImage(media_type="image/png", data=_b64(image_bytes(color="#000003")))
         ])]
         if current_upload else None
     )
@@ -408,7 +412,7 @@ async def test_current_text_image_opt_out_reaches_provider_when_gate_disabled(
         if isinstance(message.content, list) for block in message.content
         if isinstance(block, ContentBlockImage)
     ]
-    assert payloads == ([_b64(b"current-original")] if current_upload else [])
+    assert payloads == ([_b64(image_bytes(color="#000003"))] if current_upload else [])
     assert ctx.metadata["router_vision_followup_gate_source"] == "explicit_opt_out"
     assert ctx.metadata["router_vision_followup_needs_image"] is False
 
@@ -535,7 +539,9 @@ async def test_explicit_images_survive_a_full_history_window(
     image_entries = [
         _TranscriptEntry(
             role="user",
-            content=_inline_image_envelope(f"Old instruction {index}.", bytes([index])),
+            content=_inline_image_envelope(
+                f"Old instruction {index}.", image_bytes(color=f"#{index:06x}"),
+            ),
             message_id=f"historical-image-{index}",
         )
         for index in range(3)
@@ -591,7 +597,9 @@ async def test_explicit_images_survive_a_full_history_window(
         if isinstance(block, ContentBlockImage)
     ]
     assert [block.data for block in image_blocks] == (
-        [] if vision_support == "unsupported" else [_b64(bytes([0])), _b64(bytes([1]))]
+        [] if vision_support == "unsupported" else [
+            _b64(image_bytes(color="#000000")), _b64(image_bytes(color="#000001")),
+        ]
     )
     assert all(attachment_id in str(sent) for attachment_id in requested_ids)
     assert manifest.occurrences[2].attachment_id not in str(sent)
@@ -670,9 +678,9 @@ async def test_current_image_and_one_archived_image_id_are_merged_and_exact() ->
     config.squilla_router.vision_history_lookback_turns = 0
     runner = TurnRunner(provider_selector=MagicMock(), session_manager=manager, config=config)
     node = await manager.create(key)
-    archived_first = b"archived-first"
-    archived_second = b"archived-second"
-    current_payload = b"current-image"
+    archived_first = image_bytes(color="#000004")
+    archived_second = image_bytes(color="#000005")
+    current_payload = image_bytes(color="#000006")
     archived_image = _TranscriptEntry(
         role="user",
         content=_inline_image_envelope_many(
@@ -762,7 +770,7 @@ async def test_persisted_compacted_archive_rehydrates_explicit_attachment_id() -
         manager = SessionManager(storage, inject_time_prefix=False)
         key = "agent:main:persisted-compacted-image-id-replay"
         node = await manager.create(key)
-        payload = b"\x89PNG\r\n\x1a\npersisted-archive"
+        payload = image_bytes()
         image_entry = await manager.append_message(
             key,
             "user",
@@ -860,7 +868,7 @@ async def test_full_fork_rehydrates_parent_legacy_attachment_id() -> None:
         manager = SessionManager(storage, inject_time_prefix=False)
         parent_key = "agent:main:legacy-image-parent"
         parent = await manager.create(parent_key)
-        payload = b"\x89PNG\r\n\x1a\nlegacy-full-fork"
+        payload = image_bytes()
         await manager.append_message(
             parent_key,
             "user",
@@ -967,13 +975,13 @@ async def test_lazy_manifest_backfill_monotonically_merges_active_subset() -> No
         archived = await manager.append_message(
             key,
             "user",
-            _inline_image_envelope("Archived A.", b"image-a"),
+            _inline_image_envelope("Archived A.", image_bytes(color="#000007")),
             message_id="manifest-image-a",
         )
         active = await manager.append_message(
             key,
             "user",
-            _inline_image_envelope("Active B.", b"image-b"),
+            _inline_image_envelope("Active B.", image_bytes(color="#000008")),
             message_id="manifest-image-b",
         )
         archived_manifest = build_attachment_manifest(
@@ -1256,7 +1264,7 @@ async def test_historical_image_ref_replays_from_real_material_store(tmp_path: P
     config.attachments.media_root = str(tmp_path / "media")
     runner = TurnRunner(provider_selector=MagicMock(), session_manager=manager, config=config)
     node = await manager.create(key)
-    payload = b"\x89PNG\r\n\x1a\nreal-material"
+    payload = image_bytes()
     sha, _, _ = write_transcript_material(
         media_root=Path(config.attachments.media_root),
         session_id=node.session_id,
@@ -1404,7 +1412,7 @@ async def test_queued_prompts_do_not_consume_image_replay_window() -> None:
         await manager.append_message(
             key,
             "user",
-            _inline_image_envelope(f"Image {index}.", b"\x89PNG\r\n\x1a\n" + bytes([index])),
+            _inline_image_envelope(f"Image {index}.", image_bytes(color=f"#{index:06x}")),
             message_id=f"m{index}",
         )
         await manager.append_message(key, "assistant", f"Answer {index}.")

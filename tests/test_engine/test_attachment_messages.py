@@ -31,6 +31,7 @@ from opensquilla.session.attachment_manifest import (
     legacy_attachment_id,
     preserve_attachment_occurrence_ids,
 )
+from tests.helpers.image_bytes import image_bytes
 
 
 def _b64(payload: bytes) -> str:
@@ -124,7 +125,7 @@ def _ref(tmp_path: Path, payload: bytes, *, name: str, mime: str) -> dict[str, A
 def test_image_emits_image_block() -> None:
     out = _build(
         "describe",
-        [{"type": "image/png", "data": _b64(b"\x89PNG\r\n\x1a\n"), "name": "p.png"}],
+        [{"type": "image/png", "data": _b64(image_bytes()), "name": "p.png"}],
     )
     assert out is not None
     msg = out[0]
@@ -138,7 +139,7 @@ def test_image_emits_image_block() -> None:
 def test_inline_image_materializes_to_workspace_without_losing_vision_block(
     tmp_path: Path,
 ) -> None:
-    payload = b"\x89PNG\r\n\x1a\n"
+    payload = image_bytes()
     workspace = tmp_path / "workspace"
 
     out = TurnRunner._build_attachment_messages(
@@ -166,7 +167,7 @@ def test_inline_image_materializes_to_workspace_without_losing_vision_block(
 
 
 def test_image_workspace_budget_failure_preserves_vision_block(tmp_path: Path) -> None:
-    payload = b"\x89PNG\r\n\x1a\n" + b"x" * 64
+    payload = image_bytes()
     workspace = tmp_path / "workspace"
 
     out = TurnRunner._build_attachment_messages(
@@ -191,7 +192,7 @@ def test_image_workspace_budget_failure_preserves_vision_block(tmp_path: Path) -
 
 
 def test_image_ref_hydrates_for_current_provider_call(tmp_path: Path) -> None:
-    payload = b"\x89PNG\r\n\x1a\n"
+    payload = image_bytes()
     workspace = tmp_path / "workspace"
     out = TurnRunner._build_attachment_messages(
         "describe",
@@ -223,7 +224,7 @@ def test_historical_inline_image_envelope_can_replay_for_vision() -> None:
             "attachments": [
                 {
                     "type": "image/png",
-                    "data": _b64(b"\x89PNG\r\n\x1a\n"),
+                    "data": _b64(image_bytes()),
                     "name": "p.png",
                 }
             ],
@@ -241,11 +242,11 @@ def test_historical_inline_image_envelope_can_replay_for_vision() -> None:
     image_blocks = [b for b in out if isinstance(b, ContentBlockImage)]
     assert len(image_blocks) == 1
     assert image_blocks[0].media_type == "image/png"
-    assert image_blocks[0].data == _b64(b"\x89PNG\r\n\x1a\n")
+    assert image_blocks[0].data == _b64(image_bytes())
 
 
 def test_forked_legacy_historical_image_keeps_allowed_attachment_id() -> None:
-    payload = b"legacy-fork-image"
+    payload = image_bytes()
     message_id = "message-legacy-fork-image"
     content = json.dumps(
         {
@@ -294,8 +295,8 @@ def test_forked_legacy_historical_image_keeps_allowed_attachment_id() -> None:
 def test_explicit_multi_image_replay_exposes_stable_id_to_image_mapping() -> None:
     first_id = "att_abcdefgh"
     second_id = "att_ijklmnop"
-    first_payload = b"first-image"
-    second_payload = b"second-image"
+    first_payload = image_bytes(color="red")
+    second_payload = image_bytes(color="green")
     content = json.dumps(
         {
             "text": "Compare the referenced images.",
@@ -339,7 +340,7 @@ def test_explicit_multi_image_replay_exposes_stable_id_to_image_mapping() -> Non
 
 
 def test_historical_image_ref_envelope_can_replay_for_vision(tmp_path: Path) -> None:
-    payload = b"\x89PNG\r\n\x1a\n"
+    payload = image_bytes()
     sha = hashlib.sha256(payload).hexdigest()
     material_dir = tmp_path / "transcripts" / "s1"
     material_dir.mkdir(parents=True)
@@ -369,6 +370,39 @@ def test_historical_image_ref_envelope_can_replay_for_vision(tmp_path: Path) -> 
     image_blocks = [b for b in out if isinstance(b, ContentBlockImage)]
     assert len(image_blocks) == 1
     assert image_blocks[0].data == _b64(payload)
+
+
+@pytest.mark.parametrize("payload", [
+    image_bytes("JPEG"),
+    b"\x89PNG\r\n\x1a\ncorrupt-pixels",
+    b"plain text disguised as an image",
+], ids=["mismatched-format", "corrupt-png", "fake-image"])
+@pytest.mark.parametrize("stored_ref", [False, True])
+def test_historical_image_rejects_unreadable_or_mismatched_bytes(
+    payload: bytes, stored_ref: bool, tmp_path: Path,
+) -> None:
+    content = json.dumps(
+        {
+            "text": "inspect the old image",
+            "attachments": [
+                {**_ref(tmp_path, payload, name="old.png", mime="image/png"),
+                 "sha256_ref": hashlib.sha256(payload).hexdigest()}
+                if stored_ref else {"mime": "image/png", "data": _b64(payload)}
+            ],
+        }
+    )
+
+    out = TurnRunner._maybe_unpack_attachments(
+        content,
+        preserve_image_attachments=True,
+        media_root=tmp_path,
+        session_id="s1",
+    )
+
+    if isinstance(out, list):
+        assert not any(isinstance(block, ContentBlockImage) for block in out)
+    else:
+        assert "历史图片不可用" in out
 
 
 # ---------------------------------------------------------------------------
@@ -1160,10 +1194,10 @@ def test_disabling_persistence_does_not_copy_or_remove_existing_history_images(
     media_root = tmp_path / "media"
     workspace = tmp_path / "workspace"
     sha, material_path, _ = write_transcript_material(
-        media_root=media_root, session_id="session-a", payload=b"old image",
+        media_root=media_root, session_id="session-a", payload=image_bytes(),
     )
     envelope = json.dumps({"text": "old message", "attachments": [
-        {"type": "image/png", "name": "old.png", "size": 9, "sha256_ref": sha},
+        {"type": "image/png", "name": "old.png", "size": len(image_bytes()), "sha256_ref": sha},
         {"type": "text/plain", "name": "note.txt", "data": _b64(b"old text")},
     ]})
     out = TurnRunner._maybe_unpack_attachments(
@@ -1172,7 +1206,7 @@ def test_disabling_persistence_does_not_copy_or_remove_existing_history_images(
         workspace_dir=workspace, session_id="session-a", persist_image_material=False,
     )
     assert not list(workspace.rglob("*.png"))
-    assert material_path.read_bytes() == b"old image"
+    assert material_path.read_bytes() == image_bytes()
     assert next(workspace.rglob("*.txt")).read_bytes() == b"old text"
     if preserve_image:
         assert any(isinstance(block, ContentBlockImage) for block in out)

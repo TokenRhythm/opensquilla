@@ -378,6 +378,17 @@ def _model_listing_max_output(row: Mapping[str, Any]) -> int:
     return _positive_model_listing_int(top_provider.get("max_completion_tokens"))
 
 
+def _model_listing_supports_vision(row: Mapping[str, Any]) -> bool:
+    """Read the standard OpenRouter modality declaration when present."""
+    architecture = row.get("architecture")
+    if not isinstance(architecture, Mapping):
+        return False
+    modalities = architecture.get("input_modalities")
+    if not isinstance(modalities, list):
+        return False
+    return any(str(modality).strip().lower() == "image" for modality in modalities)
+
+
 def _dashscope_endpoint_family(base_url: str) -> str:
     url = base_url.strip().lower()
     if "coding-intl.dashscope.aliyuncs.com" in url:
@@ -6449,6 +6460,7 @@ class OpenAIProvider:
                             display_name=m.get("name", m.get("id", "")),
                             context_window=m.get("context_length", 0),
                             max_output_tokens=_model_listing_max_output(m),
+                            supports_vision=_model_listing_supports_vision(m),
                         )
                         for m in rows
                         if m.get("id")

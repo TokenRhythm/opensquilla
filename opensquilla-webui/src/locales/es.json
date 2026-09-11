@@ -1058,7 +1058,9 @@
       "modelNoMatches": "No hay modelos coincidentes — puedes usar lo que escribiste.",
       "modelListTruncated": "Mostrando {shown} de {total} modelos — sigue escribiendo para acotar.",
       "modelProvenance": "Lista del proveedor en vivo · fuente de capacidades: {sources}",
-      "modelMetadataProvenance": "Lista del proveedor en vivo · valores oficiales si están disponibles; si no, valores del catálogo"
+      "modelMetadataProvenance": "Lista del proveedor en vivo · valores oficiales si están disponibles; si no, valores del catálogo",
+      "modelMultimodal": "Multimodal",
+      "modelMultimodalTitle": "Admite entradas de imagen"
     },
     "preset": {
       "modeCustom": "personalizado"
@@ -1128,6 +1130,7 @@
       "removeCandidateAria": "Quitar {model}",
       "ensembleEmpty": "Aún no hay modelos candidatos. Guarda la configuración del servicio de modelos para generar niveles de enrutamiento, o agrega candidatos manualmente.",
       "ensemblePipeline": "Cómo funciona: los modelos proponentes redactan en paralelo y el agregador fusiona los borradores en la respuesta final. Solo el agregador puede invocar herramientas.",
+      "candidateModelHint": "La etiqueta Multimodal indica que el modelo acepta imágenes. Las solicitudes con imágenes siguen la ruta configurada compatible con imágenes.",
       "ensembleFlowDesc": "Varios modelos redactan en paralelo y un agregador las combina en una respuesta. Usa más llamadas.",
       "legacyDynamicNotice": "Este plan de fusión heredado sigue los niveles de modelo guardados. Conviértelo en una alineación personalizada para editar sus miembros.",
       "legacyDynamicMigrate": "Convertir en alineación personalizada",

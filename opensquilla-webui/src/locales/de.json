@@ -1058,7 +1058,9 @@
       "modelNoMatches": "Keine passenden Modelle — die Eingabe kann trotzdem verwendet werden.",
       "modelListTruncated": "{shown} von {total} Modellen — weitertippen zum Eingrenzen.",
       "modelProvenance": "Live-Anbieterliste · Funktionsquelle: {sources}",
-      "modelMetadataProvenance": "Live-Anbieterliste · offizielle Werte bevorzugt, sonst Katalogwerte"
+      "modelMetadataProvenance": "Live-Anbieterliste · offizielle Werte bevorzugt, sonst Katalogwerte",
+      "modelMultimodal": "Multimodal",
+      "modelMultimodalTitle": "Unterstützt Bildeingaben"
     },
     "preset": {
       "modeCustom": "benutzerdefiniert"
@@ -1128,6 +1130,7 @@
       "removeCandidateAria": "{model} entfernen",
       "ensembleEmpty": "Noch keine Kandidatenmodelle. Speichere zuerst die Modelldienst-Einstellungen, um Routing-Stufen zu erzeugen, oder füge Kandidaten manuell hinzu.",
       "ensemblePipeline": "So funktioniert es: Die Entwurfsmodelle schreiben parallel, dann verschmilzt der Aggregator die Entwürfe zur endgültigen Antwort. Nur der Aggregator kann Tools aufrufen.",
+      "candidateModelHint": "Das Multimodal-Label bedeutet, dass ein Modell Bildeingaben unterstützt. Bildanfragen verwenden die konfigurierte bildfähige Route.",
       "ensembleFlowDesc": "Modelle entwerfen parallel; ein Aggregator führt sie zu einer Antwort zusammen. Mehr Aufrufe.",
       "legacyDynamicNotice": "Dieser ältere Fusionsplan folgt den gespeicherten Modellstufen. Zum Bearbeiten der Mitglieder in eine eigene Aufstellung umwandeln.",
       "legacyDynamicMigrate": "In eigene Aufstellung umwandeln",
