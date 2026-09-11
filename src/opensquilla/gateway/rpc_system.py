@@ -2,116 +2,14 @@
 
 from __future__ import annotations
 
-from typing import Any, NoReturn
+from typing import Any
 
-from opensquilla.contracts.generated.v4.sessions_list_metadata import (
-    SESSIONS_LIST_METHOD,
-)
 from opensquilla.gateway.config import GatewayConfig
 from opensquilla.gateway.config_persistence import persist_gateway_config
 from opensquilla.gateway.memory_status_runtime import read_memory_status
-from opensquilla.gateway.rpc import RpcContext, RpcHandlerError, RpcUnavailableError, get_dispatcher
-from opensquilla.session.keys import normalize_agent_id
+from opensquilla.gateway.rpc import RpcContext, get_dispatcher
 
 _d = get_dispatcher()
-
-_AGENT_WAIT_SUPPORTED_PARAMS = [
-    "agentId",
-    "agent_id",
-    "sessionKey",
-    "session_key",
-    "timeoutMs",
-    "timeout_ms",
-]
-_AGENT_WAIT_AVAILABLE_METHODS = [
-    "agents.list",
-    "agents.files.list",
-    SESSIONS_LIST_METHOD,
-    "sessions.get",
-    "tools.catalog",
-]
-
-
-def _raise_unavailable(method: str) -> NoReturn:
-    raise RpcUnavailableError(f"{method} is not available in this build")
-
-
-@_d.method("wake", scope="operator.write")
-async def _handle_wake(params: dict | None, ctx: RpcContext) -> None:
-    if not isinstance(params, dict) or "text" not in params:
-        raise ValueError("params.text is required")
-    _raise_unavailable("wake")
-
-
-@_d.method("send", scope="operator.write")
-async def _handle_send(params: dict | None, ctx: RpcContext) -> None:
-    if not isinstance(params, dict):
-        raise ValueError("params required: text, sessionKey")
-    if "text" not in params:
-        raise ValueError("params.text is required")
-    if "sessionKey" not in params:
-        raise ValueError("params.sessionKey is required")
-    _raise_unavailable("send")
-
-
-@_d.method("agent", scope="operator.write")
-async def _handle_agent(params: dict | None, ctx: RpcContext) -> None:
-    if not isinstance(params, dict) or "message" not in params:
-        raise ValueError("params.message is required")
-    _raise_unavailable("agent")
-
-
-@_d.method("agent.wait", scope="operator.write")
-async def _handle_agent_wait(params: dict | None, ctx: RpcContext) -> dict[str, Any]:
-    if not isinstance(params, dict):
-        raise ValueError("params must be an object")
-
-    agent_id = params.get("agentId", params.get("agent_id"))
-    session_key = params.get("sessionKey", params.get("session_key"))
-    timeout_ms = params.get("timeoutMs", params.get("timeout_ms"))
-    if agent_id is None and session_key is None:
-        raise ValueError("params.agentId or params.sessionKey is required")
-
-    accepted_params: dict[str, Any] = {}
-    if agent_id is not None:
-        if not isinstance(agent_id, str) or not agent_id.strip():
-            raise ValueError("params.agentId must be a non-empty string")
-        accepted_params["agentId"] = normalize_agent_id(agent_id)
-    if session_key is not None:
-        if not isinstance(session_key, str) or not session_key.strip():
-            raise ValueError("params.sessionKey must be a non-empty string")
-        accepted_params["sessionKey"] = session_key.strip()
-    if timeout_ms is not None:
-        if isinstance(timeout_ms, bool) or not isinstance(timeout_ms, int) or timeout_ms < 0:
-            raise ValueError("params.timeoutMs must be a non-negative integer")
-        accepted_params["timeoutMs"] = timeout_ms
-
-    raise RpcHandlerError(
-        "agent.unavailable",
-        "agent.wait parameters are accepted, but no agent runtime bridge is available.",
-        details={
-            "reason": "runtime_bridge_unavailable",
-            "acceptedParams": accepted_params,
-            "supportedParams": _AGENT_WAIT_SUPPORTED_PARAMS,
-            "availableRpcMethods": _AGENT_WAIT_AVAILABLE_METHODS,
-        },
-        retryable=False,
-    )
-
-
-@_d.method("system-presence", scope="operator.read")
-async def _handle_system_presence(params: dict | None, ctx: RpcContext) -> None:
-    if not isinstance(params, dict) or "status" not in params:
-        raise ValueError("params.status is required")
-    _raise_unavailable("system-presence")
-
-
-@_d.method("system-event", scope="operator.admin")
-async def _handle_system_event(params: dict | None, ctx: RpcContext) -> None:
-    if not isinstance(params, dict) or "text" not in params:
-        raise ValueError("params.text is required")
-    _raise_unavailable("system-event")
-
 
 @_d.method("set-heartbeats", scope="operator.admin")
 async def _handle_set_heartbeats(params: dict | None, ctx: RpcContext) -> dict[str, Any]:

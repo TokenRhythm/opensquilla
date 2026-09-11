@@ -383,7 +383,7 @@ def test_cron_add_with_announce_and_channel(stub_gateway) -> None:
     )
     assert stub_gateway.calls, "no RPC call was issued"
     method, params = stub_gateway.calls[-1]
-    assert method == "cron.add"
+    assert method == "cron.create"
     assert params["delivery"] == {
         "mode": "announce",
         "channelName": "slack",
@@ -462,7 +462,7 @@ def test_cron_add_with_webhook(stub_gateway, monkeypatch) -> None:
         json_output=False,
     )
     method, params = stub_gateway.calls[-1]
-    assert method == "cron.add"
+    assert method == "cron.create"
     assert params["delivery"] == {
         "mode": "webhook",
         "webhookUrl": "https://hooks.example/cron",
@@ -503,7 +503,7 @@ def test_cron_add_with_failure_destination(stub_gateway) -> None:
         json_output=False,
     )
     method, params = stub_gateway.calls[-1]
-    assert method == "cron.add"
+    assert method == "cron.create"
     assert params["delivery"] == {
         "mode": "announce",
         "channelName": "slack",
@@ -590,7 +590,7 @@ def test_cron_add_with_every_builds_canonical_schedule(stub_gateway) -> None:
     )
 
     method, params = stub_gateway.calls[-1]
-    assert method == "cron.add"
+    assert method == "cron.create"
     assert params["schedule"] == {"kind": "every", "every_seconds": 300}
     assert params["payloadKind"] == "reminder"
     assert "expression" not in params

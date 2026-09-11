@@ -2,14 +2,12 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Awaitable, Callable
-from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from dataclasses import dataclass, field, replace
 
 import pytest
 
 from opensquilla.application.turn_admission import PendingInputGuard, SteerTurn
 from opensquilla.application.turn_steering import (
-    AppendedSteeringInput,
     NormalizedSteeringText,
     PreparedSteeringInput,
     RuntimeSteeringDecision,
@@ -19,7 +17,6 @@ from opensquilla.application.turn_steering import (
     SteeringIdentity,
     SteeringIdentityConflictError,
     SteeringNotice,
-    SteeringRollbackError,
     TurnSteering,
 )
 from opensquilla.project_workspaces import ProjectWorkspaceGuard
@@ -34,7 +31,6 @@ def _command(**changes: object) -> SteerTurn:
         SteerTurn(
             session_key=KEY,
             message="change direction",
-            mode="durable",
             expected_turn_id="turn-active",
             client_request_id="request-one",
             client_message_id="client-one",
@@ -51,14 +47,10 @@ class _Ports:
     calls: list[str] = field(default_factory=list)
     accepted: TurnAcceptanceResult | None = None
     durable_available: bool = True
-    legacy_available: bool = True
-    current_turn: str | None = "turn-active"
     runtime_target: str = "turn-active"
     runtime_accepts: bool = True
-    removed: bool = True
     persistence_error: Exception | None = None
     notify_error: Exception | None = None
-    update_error: Exception | None = None
     disposition_error: Exception | None = None
     persisted_guard: PendingInputGuard | None = None
     persisted_epoch: int | None = None
@@ -169,51 +161,6 @@ class _Ports:
             raise self.disposition_error
         return SteeringDisposition()
 
-    async def active_turn(self, key: str) -> str | None:
-        self.calls.append("active")
-        return self.current_turn
-
-    def session_lock(self, key: str) -> AbstractAsyncContextManager[object]:
-        @asynccontextmanager
-        async def lock():
-            self.calls.append("lock")
-            yield
-            self.calls.append("unlock")
-
-        return lock()
-
-    async def append(
-        self,
-        key: str,
-        message: str,
-        context: SteeringContext,
-    ) -> AppendedSteeringInput:
-        self.calls.append("append")
-        return AppendedSteeringInput(message, "stored-message")
-
-    async def steer_runtime(
-        self,
-        key: str,
-        message: str,
-        *,
-        semantic_message: str,
-        message_id: str | None,
-        client_message_id: str,
-        surface_id: str,
-    ) -> str | None:
-        self.calls.append("legacy-attach")
-        return self.runtime_target if self.runtime_accepts else None
-
-    async def remove(self, key: str, message_id: str) -> bool:
-        self.calls.append("remove")
-        return self.removed
-
-    async def update_context(self, key: str, message_id: str, context: SteeringContext) -> bool:
-        self.calls.append(f"context-{context.disposition}")
-        if self.update_error:
-            raise self.update_error
-        return True
-
     async def publish_steer(self, notice: SteeringNotice) -> None:
         self.calls.append("event-steer")
         self.notices.append(notice)
@@ -320,43 +267,3 @@ async def test_unsupported_input_is_rejected_before_any_persistence(message, non
     assert result["failure_code"] == "STEER_UNSUPPORTED_INPUT"
     assert result["fallback_safe"] is True
     assert ports.calls == []
-
-
-async def test_legacy_rejected_append_rolls_back_before_safe_fallback() -> None:
-    ports = _Ports(runtime_accepts=False)
-    result = await TurnSteering(ports).steer(_command(mode="legacy"))
-    assert result == {"status": "idle", "accepted": False, "key": KEY}
-    assert ports.calls == [
-        "session",
-        "active",
-        "normalize",
-        "lock",
-        "append",
-        "unlock",
-        "legacy-attach",
-        "remove",
-    ]
-    assert ports.notices == []
-
-
-async def test_dirty_legacy_rollback_never_reports_safe_fallback_even_if_context_fails() -> None:
-    ports = _Ports(
-        runtime_accepts=False, removed=False, update_error=OSError("context unavailable")
-    )
-    with pytest.raises(SteeringRollbackError) as caught:
-        await TurnSteering(ports).steer(_command(mode="legacy"))
-    assert caught.value.message_id == "stored-message"
-    assert caught.value.target_turn_id == "turn-active"
-    assert ports.calls[-3:] == ["remove", "context-rejected", "event-disposition"]
-    assert ports.notices[0].rejected_orphan is True
-    assert ports.notices[0].context.disposition == "rejected"
-    assert ports.notices[0].context.revision == 2
-
-
-async def test_legacy_acceptance_preserves_context_and_event_order() -> None:
-    ports = _Ports()
-    result = await TurnSteering(ports).steer(_command(mode="legacy"))
-    assert result["accepted"] is True
-    assert result["disposition"] == "next_safe_boundary"
-    assert ports.calls[-3:] == ["context-steering", "event-steer", "event-disposition"]
-    assert all(notice.context.disposition == "steering" for notice in ports.notices)

@@ -59,7 +59,6 @@ CHAT_COMPAT_EXPORTS = {
     "_path_prompt_and_attachments": "path_prompt_and_attachments",
     "_file_prompt_and_attachments": "file_prompt_and_attachments",
     "_async_file_prompt_and_attachments": "async_file_prompt_and_attachments",
-    "_forget_server_approvals": "forget_server_approvals",
     "_handle_approvals_command": "handle_approvals_command",
     "_handle_forget_command": "handle_forget_command",
     "_handle_elevated_command": "handle_elevated_command",

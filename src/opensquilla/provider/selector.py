@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import inspect
 from collections.abc import Callable, Mapping, Sequence
+from copy import deepcopy
 from dataclasses import dataclass, field, replace
+from typing import Any
 
 from opensquilla.redaction import redact_error_text
 
@@ -41,6 +43,7 @@ class ProviderConfig:
     # state minted elsewhere (thinking blocks / thought signatures) must not
     # be replayed to a provider that did not produce it.
     replay_provider_state: bool = True
+    extra_body: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -136,14 +139,16 @@ def _exception_status_code(exc: Exception) -> int | None:
 
 
 _ProviderConfigIdentity = tuple[
-    str, str, str, str, str, str, bool, tuple[tuple[str, str], ...]
+    str, str, str, str, str, str, bool, tuple[tuple[str, str], ...], str
 ]
 _CapacityConfigIdentity = tuple[
-    str, str, str, str, str, str, tuple[tuple[str, str], ...]
+    str, str, str, str, str, str, tuple[tuple[str, str], ...], str
 ]
 
 
 def _provider_config_identity(cfg: ProviderConfig) -> _ProviderConfigIdentity:
+    from .extra_body import extra_body_identity
+
     provider_routing = tuple(sorted((str(k), str(v)) for k, v in cfg.provider_routing.items()))
     return (
         cfg.provider,
@@ -154,11 +159,14 @@ def _provider_config_identity(cfg: ProviderConfig) -> _ProviderConfigIdentity:
         cfg.proxy,
         cfg.replay_provider_state,
         provider_routing,
+        extra_body_identity(cfg.extra_body),
     )
 
 
 def _capacity_config_identity(cfg: ProviderConfig) -> _CapacityConfigIdentity:
     """Identity of one physical deployment for capacity-bound failover."""
+
+    from .extra_body import extra_body_identity
 
     provider_routing = tuple(sorted((str(k), str(v)) for k, v in cfg.provider_routing.items()))
     return (
@@ -169,15 +177,26 @@ def _capacity_config_identity(cfg: ProviderConfig) -> _CapacityConfigIdentity:
         cfg.org_id,
         cfg.proxy,
         provider_routing,
+        extra_body_identity(cfg.extra_body),
     )
+
+
+def _copy_provider_config(cfg: ProviderConfig, **changes: Any) -> ProviderConfig:
+    """Copy mutable deployment fields before sharing a config across turns."""
+
+    updates: dict[str, Any] = {
+        "provider_routing": dict(cfg.provider_routing),
+        "extra_body": deepcopy(cfg.extra_body),
+    }
+    updates.update(changes)
+    return replace(cfg, **updates)
 
 
 def _without_provider_state_replay(cfg: ProviderConfig) -> ProviderConfig:
     """Return an isolated config that cannot replay provider-private state."""
 
-    return replace(
+    return _copy_provider_config(
         cfg,
-        provider_routing=dict(cfg.provider_routing),
         replay_provider_state=False,
     )
 
@@ -197,6 +216,8 @@ def _build_provider(cfg: ProviderConfig) -> LLMProvider:
             f"Credential format belongs to provider '{credential_hint}', "
             f"but the configured endpoint belongs to provider '{endpoint_hint}'"
         )
+    if cfg.extra_body and provider_id != "custom":
+        raise ProviderBuildError("extra_body is supported only for provider 'custom'")
     try:
         spec = get_provider_spec(cfg.provider)
     except UnknownProviderError as exc:
@@ -238,6 +259,7 @@ class ProviderBuildContext:
     proxy: str = ""
     provider_routing: Mapping[str, str] = field(default_factory=dict)
     replay_provider_state: bool = True
+    extra_body: Mapping[str, Any] = field(default_factory=dict)
     # OllamaProvider knob; never populated today because ProviderConfig has
     # no num_ctx field — kept visible so the gap is explicit.
     num_ctx: int | None = None
@@ -258,6 +280,7 @@ def _build_context(cfg: ProviderConfig, spec: ProviderSpec) -> ProviderBuildCont
         org_id=cfg.org_id,
         proxy=cfg.proxy,
         provider_routing=dict(cfg.provider_routing),
+        extra_body=deepcopy(cfg.extra_body),
         replay_provider_state=cfg.replay_provider_state,
         auth_header_style=spec.auth_header_style,
         compat=spec.compat,
@@ -307,6 +330,8 @@ def _build_openai_compat(ctx: ProviderBuildContext) -> LLMProvider:
         kwargs["proxy"] = ctx.proxy
     if ctx.provider_routing:
         kwargs["provider_routing"] = ctx.provider_routing
+    if ctx.extra_body:
+        kwargs["extra_body"] = ctx.extra_body
     return OpenAIProvider(**kwargs)
 
 
@@ -585,6 +610,7 @@ class ModelSelector:
         turn's primary. The previous primary is kept as the first fallback so
         pre-content failover still has somewhere to go.
         """
+        cfg = _copy_provider_config(cfg)
         if self._provider_state_replay_disabled:
             cfg = _without_provider_state_replay(cfg)
         original_primary = self._chain[0]
@@ -620,6 +646,7 @@ class ModelSelector:
         first, so this boundary never guesses credentials.
         """
 
+        cfg = _copy_provider_config(cfg)
         if self._provider_state_replay_disabled:
             cfg = _without_provider_state_replay(cfg)
         original_primary = self._chain[0]
@@ -657,10 +684,9 @@ class ModelSelector:
                     elif candidate_provider == original_primary.provider:
                         credential_source = original_primary
                     if credential_source is not None:
-                        candidate = replace(
+                        candidate = _copy_provider_config(
                             credential_source,
                             model=candidate_model,
-                            provider_routing=dict(credential_source.provider_routing),
                         )
             if candidate is None:
                 continue
@@ -709,6 +735,7 @@ class ModelSelector:
                 org_id=self._chain[0].org_id,
                 proxy=self._chain[0].proxy,
                 provider_routing=self._chain[0].provider_routing,
+                extra_body=deepcopy(self._chain[0].extra_body),
                 replay_provider_state=self._chain[0].replay_provider_state,
             )
             fallback_chain = [original_primary, *self._chain[1:]]
@@ -736,10 +763,9 @@ class ModelSelector:
         being sent to the routed provider.
         """
         original = self._config.primary
-        restored = replace(
+        restored = _copy_provider_config(
             original,
             model=model or original.model,
-            provider_routing=dict(original.provider_routing),
         )
         candidates = [*self._config.fallbacks, *self._chain]
         deduped_fallbacks: list[ProviderConfig] = []
@@ -794,10 +820,7 @@ class ModelSelector:
         router_fallbacks: list[ProviderConfig] = []
         for entry in fallback_chain:
             if isinstance(entry, ProviderConfig):
-                candidate = replace(
-                    entry,
-                    provider_routing=dict(entry.provider_routing),
-                )
+                candidate = _copy_provider_config(entry)
                 if not candidate.provider.strip() or not candidate.model.strip():
                     continue
                 if candidate.provider.lower() != current.provider.lower():
@@ -827,6 +850,7 @@ class ModelSelector:
                     org_id=current.org_id,
                     proxy=current.proxy,
                     provider_routing=current.provider_routing,
+                    extra_body=deepcopy(current.extra_body),
                     replay_provider_state=current.replay_provider_state,
                 )
             )
@@ -883,6 +907,7 @@ class ModelSelector:
 
     def sync_primary(self, cfg: ProviderConfig) -> None:
         """Replace the primary provider config for future resolves and clones."""
+        cfg = _copy_provider_config(cfg)
         if self._provider_state_replay_disabled:
             cfg = _without_provider_state_replay(cfg)
         self._config.primary = cfg
@@ -904,13 +929,9 @@ class ModelSelector:
         shared ProviderConfig's provider_routing.
         """
         config_copy = SelectorConfig(
-            primary=replace(
-                self._config.primary,
-                provider_routing=dict(self._config.primary.provider_routing),
-            ),
+            primary=_copy_provider_config(self._config.primary),
             fallbacks=[
-                replace(cfg, provider_routing=dict(cfg.provider_routing))
-                for cfg in self._config.fallbacks
+                _copy_provider_config(cfg) for cfg in self._config.fallbacks
             ],
         )
         cloned = ModelSelector(config_copy, plugin=self._plugin)
@@ -1007,8 +1028,5 @@ def build_provider_from_config(config: ProviderConfig) -> LLMProvider:
     adapter cannot mutate selector-owned configuration through a shared dict.
     """
 
-    isolated = replace(
-        config,
-        provider_routing=dict(config.provider_routing),
-    )
+    isolated = _copy_provider_config(config)
     return _build_provider(isolated)

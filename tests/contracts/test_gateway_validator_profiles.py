@@ -29,7 +29,7 @@ def test_production_targets_preserve_every_approved_validator_role() -> None:
         "payload": 9,
         "frame": 1,
     }
-    assert sum(len(spec.targets) for spec in specs) == 854
+    assert sum(len(spec.targets) for spec in specs) == 842
     assert targets[("method", "sessions.list")] == ("result",)
     assert targets[("method", "meta.list")] == ("result",)
     assert targets[("method", "meta.inspect")] == ("result",)

@@ -1108,7 +1108,6 @@ async def _cron_unsubscribe_contract(
 for _cron_method, _cron_implementation in (
     ("cron.list", _cron_list_contract),
     ("cron.status", _cron_status_contract),
-    ("cron.add", _cron_create_contract),
     ("cron.create", _cron_create_contract),
     ("cron.update", _cron_update_contract),
     ("cron.remove", _cron_remove_contract),

@@ -60,7 +60,7 @@ class _FakeScheduler:
         return None
 
 
-# --- RPC: cron.add accepts tz --------------------------------------------
+# --- RPC: cron.create accepts tz -----------------------------------------
 
 
 async def test_rpc_cron_add_forwards_tz_to_scheduler() -> None:
