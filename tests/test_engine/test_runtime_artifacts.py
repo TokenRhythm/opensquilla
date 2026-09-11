@@ -49,6 +49,7 @@ from opensquilla.session.manager import SessionManager
 from opensquilla.session.storage import SessionStorage
 from opensquilla.tools.builtin import filesystem
 from opensquilla.tools.builtin import patch as patch_tools
+from opensquilla.tools.builtin.artifacts import publish_artifact
 from opensquilla.tools.registry import ToolRegistry, ToolSpec
 from opensquilla.tools.types import (
     CallerKind,
@@ -558,6 +559,31 @@ class _OmittedPublishProvider:
 
     async def list_models(self) -> list[ModelInfo]:
         return []
+
+
+class _NamedPublishProvider(_OmittedPublishProvider):
+    def __init__(self, name: str, mention_source: bool) -> None:
+        super().__init__()
+        self.name = name
+        self.mention_source = mention_source
+
+    async def _stream(self, call_number: int) -> AsyncIterator[Any]:
+        if call_number == 1:
+            async for event in super()._stream(call_number):
+                yield event
+            return
+        if call_number == 2:
+            yield ProviderToolUseStart(tool_use_id="publish-2", tool_name="publish_artifact")
+            yield ProviderToolUseEnd(
+                tool_use_id="publish-2", tool_name="publish_artifact",
+                arguments={"path": "manual-big-write.html", "name": self.name},
+            )
+            yield ProviderDone(stop_reason="tool_use", input_tokens=1, output_tokens=1)
+            return
+        yield ProviderText(
+            text="Created manual-big-write.html for you." if self.mention_source else "File ready."
+        )
+        yield ProviderDone(stop_reason="stop", input_tokens=1, output_tokens=1)
 
 
 class _OmittedInvalidPptxProvider:
@@ -2156,6 +2182,71 @@ async def test_turn_runner_auto_publishes_deliverable_file_when_model_omits_publ
         assert payload["text"] == "Created manual-big-write.html for you."
         assert payload["artifacts"][0]["name"] == "manual-big-write.html"
         assert payload["artifacts"][0]["source"] == "auto_publish_omitted"
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("name", "mention_source"),
+    [("Friendly report.html", True), ("manual-big-write.html", True),
+     ("Friendly report.html", False)],
+)
+async def test_custom_named_publication_is_not_duplicated_in_events_or_transcript(
+    tmp_path, name: str, mention_source: bool,
+) -> None:
+    # #1164: the real write/publish/Done chain must deliver only the explicit artifact.
+    storage = SessionStorage(":memory:")
+    await storage.connect()
+    manager = SessionManager(storage)
+    session_key = "agent:main:webchat:custom-name-delivery"
+    session = await manager.create(session_key)
+    registry = _write_file_registry()
+    registry.register(
+        ToolSpec(
+            name="publish_artifact", description="Publish a generated file",
+            parameters={
+                "type": "object", "required": ["path", "name"],
+                "properties": {"path": {"type": "string"}, "name": {"type": "string"}},
+            },
+        ),
+        publish_artifact.__wrapped__,
+    )
+    provider = _NamedPublishProvider(name, mention_source)
+    runner = TurnRunner(
+        provider_selector=_ProviderSelector(provider),
+        tool_registry=registry,
+        session_manager=manager,
+        config=GatewayConfig(
+            attachments=AttachmentsConfig(media_root=str(tmp_path / "media")),
+            squilla_router=SquillaRouterConfig(enabled=False),
+        ),
+    )
+    try:
+        events = [event async for event in runner.run(
+            "Make an HTML report", session_key,
+            tool_context=ToolContext(
+                is_owner=True, caller_kind=CallerKind.WEB,
+                workspace_dir=str(tmp_path / "workspace"), elevated="full",
+                allowed_tools={"write_file", "publish_artifact"},
+            ),
+            history_has_persisted_user=False, no_memory_capture=True,
+        )]
+        assert not any(isinstance(event, ErrorEvent) for event in events)
+        assert provider.calls == 3
+        tool_results = [event for event in events if isinstance(event, ToolResultEvent)]
+        assert [(event.tool_name, event.is_error) for event in tool_results] == [
+            ("write_file", False), ("publish_artifact", False),
+        ]
+        artifacts = [event for event in events if isinstance(event, ArtifactEvent)]
+        assert [event.name for event in artifacts] == [name]
+        transcript = await manager.get_transcript(session_key)
+        assistant = [entry for entry in transcript if entry.role == "assistant"][-1]
+        persisted = json.loads(assistant.content)["artifacts"]
+        assert [item["id"] for item in persisted] == [artifacts[0].id]
+        assert persisted[0]["source"] == "publish_artifact"
+        store = ArtifactStore(tmp_path / "media")
+        assert store.list_refs(session_id=session.session_id, limit=10).total_count == 1
     finally:
         await storage.close()
 

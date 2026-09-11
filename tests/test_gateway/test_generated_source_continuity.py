@@ -21,6 +21,7 @@ from opensquilla.artifact_session.working_files import (
     save_working_version,
 )
 from opensquilla.artifacts import ArtifactNotFoundError, ArtifactStore
+from opensquilla.engine.runtime import TurnRunner
 from opensquilla.engine.types import ArtifactEvent
 from opensquilla.gateway.artifact_preview import ArtifactPreviewLeaseService
 from opensquilla.gateway.config import AttachmentsConfig, GatewayConfig
@@ -66,6 +67,51 @@ async def _publish(context, adopter, **arguments):
     )
     await adopter(ArtifactEvent(**payload))
     return result
+
+
+async def test_runtime_turn_context_keeps_adopter_bound_to_its_publication_sources(tmp_path: Path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    source = workspace / "index.html"
+    source.write_text("<!doctype html><h1>First</h1>")
+    media_root = tmp_path / "media"
+    store = ArtifactStore(media_root)
+    service = await ArtifactSessionService.open(tmp_path / "state.db")
+    try:
+        base, base_adopter = _turn(service, store, workspace, media_root, None)
+        runner = TurnRunner(
+            provider_selector=None,
+            config=GatewayConfig(attachments=AttachmentsConfig(media_root=str(media_root))),
+        )
+        first = await runner._with_artifact_context(base, SESSION_KEY)
+        first_adopter = first.generated_artifact_adopter
+        assert isinstance(first_adopter, GeneratedArtifactAdopter)
+        assert first_adopter is not base_adopter
+        assert first_adopter.source_paths is first.artifact_source_paths
+        first_result = await _publish(first, first_adopter, name="Friendly report.html")
+
+        source.write_text("<!doctype html><h1>Updated</h1>")
+        second = await runner._with_artifact_context(base, SESSION_KEY)
+        second_adopter = second.generated_artifact_adopter
+        assert isinstance(second_adopter, GeneratedArtifactAdopter)
+        assert second_adopter.source_paths is second.artifact_source_paths
+        assert second_adopter.source_paths is not first_adopter.source_paths
+        second_result = await _publish(second, second_adopter, name="Updated report.html")
+
+        documents = await service.list_documents(session_key=SESSION_KEY, session_id=SESSION_ID)
+        assert len(documents) == 1
+        binding = await get_working_files(service, documents[0].document_id)
+        assert binding is not None and binding.entry == source
+        head = await service.get_document_head(documents[0].document_id)
+        assert head.revision.artifact_id == second_result["artifact"]["id"]
+        assert head.revision.artifact_id != first_result["artifact"]["id"]
+        assert len(await service.list_revisions(documents[0].document_id)) == 2
+        assert len(first.published_artifacts) == len(second.published_artifacts) == 1
+        assert base.published_artifacts == []
+        assert base.artifact_source_paths == {}
+        assert base_adopter.source_paths is base.artifact_source_paths
+    finally:
+        await service.close()
 
 
 @pytest.mark.parametrize("stage", ["initial-source", "live-preview", "same-turn", "next-turn"])

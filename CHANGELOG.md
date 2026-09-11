@@ -16,11 +16,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Changed
 
+- Retired four experiment-only diagnostic outputs: runtime-recovery events,
+  final-diff observations, salvage events and focused-verification classification.
+  These events are no longer produced even when runtime event output is configured;
+  final-diff `log` remains accepted but no longer observes. Actual recovery,
+  warnings, salvage, observer events and independent turn-call logs remain.
+  An unused failure-summary cache is removed; public settings/defaults are unchanged.
+  See [the event retirement notice](docs/experimental-diagnostic-retirement.md)
+  before using new main runs with historical experiment delivery checks.
 - Retired the opt-in patch evidence ledger collector and JSON export. Legacy
   path configuration remains accepted and excludes old diagnostic files from
-  final-diff checks, but no longer creates or overwrites a ledger. Recovery events
-  retain an empty `verification_commands` list; recovery decisions, source-diff
-  salvage, generic runtime events and model-visible defaults are unchanged.
+  final-diff checks, but no longer creates or overwrites a ledger. Recovery
+  decisions, source-diff salvage and model-visible defaults are unchanged.
 - Retired optional runtime experiments: strict/variant finalize challenges,
   submit review, patch-evidence prompts, tool-description overrides, tool-loop
   observation, runtime capsules, text-only tool nudges, and independent deadline

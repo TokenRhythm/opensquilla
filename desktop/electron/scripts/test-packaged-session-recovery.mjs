@@ -281,6 +281,11 @@ try {
   assert.equal(await composer.isEditable(), true, 'composer must stay editable during recovery')
   await composer.fill(preservedDraft)
   assert.equal(await composer.inputValue(), preservedDraft)
+  const recoveryUrl = page.url()
+  const retainedComposer = await composer.elementHandle()
+  assert.ok(retainedComposer, 'the existing composer must be mounted before recovery')
+  assert.equal(await composer.evaluate(node => document.activeElement === node), true,
+    'the editable draft owns focus before recovery')
   assert.equal(
     await page.getByText(expectedLastMessage, { exact: true }).count(),
     0,
@@ -295,7 +300,7 @@ try {
   )
   const terminalStartedAt = Date.now()
   await waitFor(
-    async () => await historyFailure.isVisible() && await liveFailure.isVisible(),
+    async () => await historyFailure.isVisible() || await liveFailure.isVisible(),
     'packaged session bootstrap to terminate',
     TERMINAL_RECOVERY_TIMEOUT_MS,
   )
@@ -313,14 +318,11 @@ try {
   assert.equal(await composer.isEditable(), true)
   assert.equal(await composer.inputValue(), preservedDraft)
   assert.equal(await sendButton.isDisabled(), true, 'live degraded state must fail closed')
+  assert.equal(await page.locator('[data-testid="chat-session-recovery-status"]').count(), 1,
+    'concurrent domain failures must share one non-blocking recovery notice')
 
   injectHang = false
-  // These controls sit above the long transcript. A Playwright locator click
-  // would scroll an off-screen retry into view and manufacture reader-owned
-  // navigation to the top before activating it. Trigger the product action
-  // in-page so this gate measures recovery of the existing live-edge lease.
-  await historyFailure.locator('[data-testid="chat-session-recovery-retry"]')
-    .evaluate((button) => button.click())
+  // No click, reload, route change or focus movement may be needed to recover.
   await waitFor(
     () => recoveredMessage.isVisible(),
     'the retained long-session history to recover from the packaged Gateway',
@@ -328,10 +330,6 @@ try {
   )
   assert.equal(await historyFailure.count(), 0)
 
-  if (await liveFailure.count()) {
-    await liveFailure.locator('[data-testid="chat-session-recovery-retry"]')
-      .evaluate((button) => button.click())
-  }
   await waitFor(
     async () => await liveFailure.count() === 0 && !await sendButton.isDisabled(),
     'packaged live subscription to recover',
@@ -340,6 +338,11 @@ try {
 
   assert.equal(await composer.inputValue(), preservedDraft)
   assert.equal(await recoveredMessage.isVisible(), true)
+  assert.equal(page.url(), recoveryUrl, 'automatic recovery must not navigate the page')
+  assert.equal(await composer.evaluate((node, original) => node === original, retainedComposer), true,
+    'automatic recovery must preserve the original composer instance')
+  assert.equal(await composer.evaluate(node => document.activeElement === node), true,
+    'automatic recovery must not move focus away from the draft')
   assert.equal(await thread.getAttribute('aria-busy'), 'false')
   const recoveredTransport = recoveryTransportSample()
   const recoveredViewportSample = await recoveredMessage.evaluate((message) => {

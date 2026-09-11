@@ -41,7 +41,9 @@ function createHarness(options: {
   getCompactionPlacement?: (compactionId: string) => 'activity' | 'standalone' | undefined
   observeStreamGeneration?: (signal: ConversationCursorSignal) => boolean
   supportsTurnCommitted?: boolean
+  onRecoveryRequired?: () => void
   withRouterRuntime?: boolean
+  withRecoveryFence?: boolean
   taskOwnership?: ChatTaskOwnershipApi
 } = {}) {
   const messages = ref<ChatMessage[]>(options.messages ?? [])
@@ -109,6 +111,7 @@ function createHarness(options: {
   const restoreSteerIntoComposer = vi.fn(options.restoreSteerIntoComposer ?? (() => {}))
   const scope = effectScope()
   const rawApi = scope.run(() => useChatRpcEventHandlers({
+    onRecoveryRequired: options.onRecoveryRequired,
     sessionKey,
     currentEpoch,
     lastStreamSeq,
@@ -165,7 +168,11 @@ function createHarness(options: {
       return { close() {} }
     },
   })
-  const detach = transport.subscribe({ onEvent: rawApi.onConversationEvent })
+  const detach = transport.subscribe({
+    onEvent: options.withRecoveryFence
+      ? rawApi.consumeConversationEvent
+      : rawApi.onConversationEvent,
+  })
   const api = {
     ...rawApi,
     restoreLiveTurnSnapshot: (snapshot: SessionReadSnapshot) =>
@@ -217,9 +224,10 @@ describe('router card recovery projection', () => {
     ...envelope(seq), event_type: 'proposer_finish' as const,
     proposer_provider: 'provider', proposer_model: model,
   })
-  function setup() {
+  function setup(withRecoveryFence = false) {
     const h = createHarness({
       withRouterRuntime: true,
+      withRecoveryFence,
       messages: [{ role: 'user', text: 'hello', ts: 0, turnId }],
     })
     h.activeStreamTaskId.value = turnId
@@ -355,9 +363,116 @@ describe('router card recovery projection', () => {
       expect(renderedCards(h).value).toEqual([])
     } finally { h.stop() }
   })
+
+  it('keeps buffered replay attempts isolated while an in-place recovery installs its snapshot', () => {
+    const h = setup(true)
+    const emit = h.api.handlers.onWireEventFixture
+    const firstText = { ...envelope(12), text: 'first', model_call_id: '1.0', iteration: 1 }
+    const events = [
+      { semanticKind: 'router-decision' as const, payload: decision(10) },
+      { semanticKind: 'ensemble-progress' as const, payload: progress(11, 'first') },
+      { semanticKind: 'text-delta' as const, payload: firstText },
+    ]
+    const rendered = renderedCards(h)
+    try {
+      emit('session.event.router_decision', decision(10))
+      emit('session.event.ensemble_progress', progress(11, 'first'))
+      emit('session.event.text_delta', firstText)
+      const originalKey = rendered.value.find(message => message.isRouterStrip)?.routerTurnKey
+
+      h.api.beginRecovery()
+      emit('session.event.router_control_replay', envelope(20))
+      emit('session.event.ensemble_progress', progress(21, 'second'))
+      emit('session.event.text_delta', { ...envelope(22), text: 'second', model_call_id: '2.0', iteration: 2 })
+      emit('session.event.router_decision', decision(23))
+
+      expect(h.messages.value.filter(message => message.role === 'router')).toHaveLength(1)
+      expect(h.lastStreamSeq.value).toBe(12)
+      h.api.restoreLiveTurnSnapshot({ sessionKey: key, taskId: turnId, currentStreamSeq: 12, events })
+      expect(h.api.finishRecovery()).toBe(true)
+
+      const cards = h.messages.value.filter(message => message.role === 'router')
+      expect(cards).toHaveLength(2)
+      expect(cards.map(card => card.messageId)).toEqual([`router-${key}-10`, `router-${key}-23`])
+      expect(cards.map(card => card.ensemble?.models.map(model => model.model))).toEqual([['first'], ['second']])
+      expect(cards.map(card => card.routerModelCallId)).toEqual(['1.0', '2.0'])
+      expect(h.lastStreamSeq.value).toBe(23)
+      expect(rendered.value.filter(message => message.isRouterStrip)).toHaveLength(2)
+      expect(rendered.value.find(message => message.isRouterStrip)?.routerTurnKey).toBe(originalKey)
+    } finally { h.stop() }
+  })
 })
 
 describe('Plan task settlement notification', () => {
+  it.each(['task.cancelled', 'sessions.changed'])(
+    'settles the Plan only after buffered %s is applied by in-place recovery', event => {
+      const taskOwnership = useChatTaskOwnership()
+      taskOwnership.noteRunning('task-foreground')
+      taskOwnership.noteQueued('task-plan')
+      const h = createHarness({ taskOwnership, withRecoveryFence: true })
+      const scope = effectScope()
+      try {
+        h.currentEpoch.value = 4
+        h.activeStreamTaskId.value = 'task-foreground'
+        const plans = scope.run(() => useChatPlans({
+          planCenter: { available: () => true } as never,
+          sessionKey: h.sessionKey, currentEpoch: h.currentEpoch,
+          isStreaming: h.stream.isStreaming, inputText: ref('Keep my draft'),
+          createSessionKey: () => 'agent:main:new', agentId: () => 'main',
+          switchToSession: vi.fn(), focusComposer: vi.fn(), notifyError: vi.fn(),
+        }))!
+        h.onTaskSettled.mockImplementation((taskId: string, epoch?: number) => plans.noteTaskSettled(taskId, epoch))
+        h.api.beginRecovery()
+        const terminal = { task_id: 'task-plan', status: 'cancelled' }
+        h.api.handlers.onWireEventFixture(event, {
+          key: h.sessionKey.value, epoch: 4,
+          ...(event === 'sessions.changed'
+            ? { reason: 'task_terminal', changed_task: terminal }
+            : terminal),
+        })
+        expect(h.onTaskSettled).not.toHaveBeenCalled()
+        plans.applyBootstrap({
+          key: h.sessionKey.value, epoch: 4,
+          currentPlan: { revisionId: 'revision-1', planId: 'plan-1', title: 'Plan', markdown: 'Plan',
+            steps: [{ stepId: 'inspect', title: 'Inspect' }] },
+          activePlanRun: { runId: 'run-plan', planRevisionId: 'revision-1', status: 'running',
+            activeTaskId: 'task-plan', stateRevision: 1,
+            currentStepId: 'inspect', steps: [{ stepId: 'inspect', title: 'Inspect', status: 'in_progress' }] },
+        })
+        expect(plans.activePlanRun.value).toMatchObject({ status: 'running', activeTaskId: 'task-plan' })
+
+        expect(h.api.finishRecovery()).toBe(true)
+        expect(h.onTaskSettled).toHaveBeenCalledWith('task-plan', 4)
+        expect(plans.activePlanRun.value).toMatchObject({ status: 'paused', activeTaskId: undefined })
+        expect(plans.activePlanRun.value?.steps[0].status).toBe('in_progress')
+        expect(h.activeStreamTaskId.value).toBe('task-foreground')
+        expect(h.stream.endStreaming).not.toHaveBeenCalled()
+      } finally { scope.stop(); h.stop() }
+    },
+  )
+
+  it('does not settle a task from a superseded recovery or an old epoch', () => {
+    const h = createHarness({ withRecoveryFence: true })
+    try {
+      h.currentEpoch.value = 3
+      h.activeStreamTaskId.value = 'task-current'
+      h.api.beginRecovery()
+      h.api.handlers.onWireEventFixture('task.cancelled', {
+        key: h.sessionKey.value, task_id: 'task-current', epoch: 3,
+      })
+      h.currentEpoch.value = 4
+      h.api.beginRecovery()
+      expect(h.api.finishRecovery()).toBe(true)
+      h.api.handlers.onWireEventFixture('task.cancelled', {
+        key: h.sessionKey.value, task_id: 'task-current', epoch: 3,
+      })
+
+      expect(h.onTaskSettled).not.toHaveBeenCalled()
+      expect(h.stream.endStreaming).not.toHaveBeenCalled()
+      expect(h.activeStreamTaskId.value).toBe('task-current')
+    } finally { h.stop() }
+  })
+
   it.each(['task.cancelled', 'task.timeout', 'task.failed', 'task.abandoned', 'task.succeeded', 'session.event.done', 'session.event.error'])(
     'reports the owning task after %s', event => {
       const h = createHarness()
@@ -2961,17 +3076,26 @@ describe('useChatRpcEventHandlers ensemble handoff', () => {
 })
 
 describe('useChatRpcEventHandlers ensemble activity', () => {
-  it('removes the transient connection-loss row after reconnect', () => {
+  it('marks a 65-event pending-acceptance overflow dirty instead of replaying a truncated tail', () => {
+    const onRecoveryRequired = vi.fn()
+    const { api, activeStreamTaskId, stream, stop } = createHarness({ onRecoveryRequired })
+    try {
+      activeStreamTaskId.value = PENDING_STREAM_TASK_ID
+      for (let seq = 1; seq <= 65; seq++) api.handlers.onTextDelta({
+        key: 'agent:main:test', task_id: 'task-overflow', stream_seq: seq, text: String(seq),
+      })
+      expect(onRecoveryRequired).toHaveBeenCalledOnce()
+      api.bindActiveStreamTask('task-overflow')
+      expect(stream.appendDelta).not.toHaveBeenCalled()
+    } finally { stop() }
+  })
+
+  it('does not inject a transcript row for an automatically recovered connection', () => {
     const { api, messages, stop } = createHarness()
 
     try {
       api.handlers.onConnectionState('disconnected')
-      expect(messages.value).toEqual([
-        expect.objectContaining({
-          role: 'system',
-          text: 'Connection lost — trying to reconnect…',
-        }),
-      ])
+      expect(messages.value).toEqual([])
 
       api.handlers.onConnectionState('connected')
       expect(messages.value).toEqual([])
@@ -2980,13 +3104,13 @@ describe('useChatRpcEventHandlers ensemble activity', () => {
     }
   })
 
-  it('does not duplicate the transient row while disconnected', () => {
+  it('keeps repeated disconnect notifications out of the transcript', () => {
     const { api, messages, stop } = createHarness()
 
     try {
       api.handlers.onConnectionState('disconnected')
       api.handlers.onConnectionState('disconnected')
-      expect(messages.value).toHaveLength(1)
+      expect(messages.value).toHaveLength(0)
     } finally {
       stop()
     }
@@ -3193,6 +3317,22 @@ describe('useChatRpcEventHandlers ensemble activity', () => {
     } finally {
       stop()
     }
+  })
+
+  it('does not restore durable setup work from a reconnect superseded by in-place recovery', async () => {
+    let resolveSubscription!: (subscribed: boolean) => void
+    const subscription = new Promise<boolean>(resolve => { resolveSubscription = resolve })
+    const { api, onSessionSubscribed, stop } = createHarness({
+      subscribeSession: () => subscription,
+    })
+    try {
+      api.handlers.onConnectionState('connected')
+      api.beginRecovery()
+      resolveSubscription(true)
+      await subscription
+      await Promise.resolve()
+      expect(onSessionSubscribed).not.toHaveBeenCalled()
+    } finally { stop() }
   })
 
   it('does not restore durable setup work from a non-authoritative outcome object', async () => {

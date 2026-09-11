@@ -101,9 +101,11 @@ const github = {rest: {
         assert sent == []
 
 
-def _is_windows_wsl_bash(path: str) -> bool:
+def _is_windows_bash_alias(path: str) -> bool:
     normalized = path.replace("\\", "/").lower()
-    return normalized.endswith("/windows/system32/bash.exe")
+    return normalized.endswith(
+        ("/windows/system32/bash.exe", "/microsoft/windowsapps/bash.exe")
+    )
 
 
 def _bash_executable(
@@ -117,20 +119,14 @@ def _bash_executable(
     if os_name != "nt":
         return found or "bash"
 
-    candidates: list[Path] = []
-    if found and not _is_windows_wsl_bash(found):
+    git_root = Path(program_files or os.environ.get("ProgramFiles", r"C:\Program Files")) / "Git"
+    # PATH can resolve a Windows launcher even when Git Bash is installed.
+    candidates = [git_root / "bin" / "bash.exe", git_root / "usr" / "bin" / "bash.exe"]
+    if found:
         candidates.append(Path(found))
 
-    git_root = Path(program_files or os.environ.get("ProgramFiles", r"C:\Program Files")) / "Git"
-    candidates.extend(
-        [
-            git_root / "bin" / "bash.exe",
-            git_root / "usr" / "bin" / "bash.exe",
-        ]
-    )
-
     for candidate in candidates:
-        if exists(candidate):
+        if not _is_windows_bash_alias(str(candidate)) and exists(candidate):
             return str(candidate)
 
     raise AssertionError("Git Bash is required to run CI shell contracts on Windows")
@@ -1147,17 +1143,83 @@ def test_issue_link_sync_tracks_open_and_closed_final_prs_from_trusted_base() ->
     assert ".github/scripts/issue_link_sync.py" in text
 
 
-def test_bash_helper_prefers_git_bash_over_windows_wsl_bash(tmp_path: Path) -> None:
-    git_bash = tmp_path / "Git" / "bin" / "bash.exe"
+@pytest.mark.parametrize(
+    "alias_relative",
+    [
+        "Windows/System32/bash.exe",
+        "Microsoft/WindowsApps/bash.exe",
+        "MICROSOFT/WINDOWSAPPS/BASH.EXE",
+    ],
+)
+@pytest.mark.parametrize("posix_path", [False, True], ids=["native-path", "forward-slashes"])
+def test_bash_helper_prefers_git_bash_over_windows_aliases(
+    tmp_path: Path, alias_relative: str, posix_path: bool,
+) -> None:
+    alias = tmp_path / alias_relative
+    git_bash = tmp_path / "Program Files" / "Git" / "bin" / "bash.exe"
+    for path in (alias, git_bash):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.touch()
 
     result = _bash_executable(
         os_name="nt",
-        path_lookup=lambda _name: r"C:\Windows\System32\bash.exe",
-        exists=lambda path: path == git_bash,
-        program_files=str(tmp_path),
+        path_lookup=lambda _name: alias.as_posix() if posix_path else str(alias),
+        program_files=str(tmp_path / "Program Files"),
     )
 
     assert result == str(git_bash)
+
+
+@pytest.mark.parametrize(
+    "git_locations",
+    [("bin/bash.exe",), ("usr/bin/bash.exe",), ("bin/bash.exe", "usr/bin/bash.exe")],
+)
+def test_bash_helper_prefers_installed_git_bash_over_path(
+    tmp_path: Path, git_locations: tuple[str, ...],
+) -> None:
+    path_bash = tmp_path / "custom" / "bash.exe"
+    path_bash.parent.mkdir()
+    path_bash.touch()
+    for relative in git_locations:
+        git_bash = tmp_path / "Git" / relative
+        git_bash.parent.mkdir(parents=True, exist_ok=True)
+        git_bash.touch()
+
+    assert _bash_executable(
+        os_name="nt", path_lookup=lambda _name: str(path_bash), program_files=str(tmp_path),
+    ) == str(tmp_path / "Git" / git_locations[0])
+
+
+def test_bash_helper_keeps_custom_path_fallback(tmp_path: Path) -> None:
+    path_bash = tmp_path / "custom" / "bash.exe"
+    path_bash.parent.mkdir()
+    path_bash.touch()
+
+    assert _bash_executable(
+        os_name="nt", path_lookup=lambda _name: str(path_bash), program_files=str(tmp_path),
+    ) == str(path_bash)
+
+
+@pytest.mark.parametrize(
+    "alias_relative", [None, "Windows/System32/bash.exe", "Microsoft/WindowsApps/bash.exe"],
+)
+def test_bash_helper_requires_non_alias_bash(tmp_path: Path, alias_relative: str | None) -> None:
+    alias = tmp_path / alias_relative if alias_relative else None
+    if alias is not None:
+        alias.parent.mkdir(parents=True)
+        alias.touch()
+
+    with pytest.raises(AssertionError, match="Git Bash is required"):
+        _bash_executable(
+            os_name="nt",
+            path_lookup=lambda _name: str(alias) if alias is not None else None,
+            program_files=str(tmp_path),
+        )
+
+
+@pytest.mark.parametrize("found", [None, "/opt/custom/bash"])
+def test_bash_helper_preserves_posix_lookup(found: str | None) -> None:
+    assert _bash_executable(os_name="posix", path_lookup=lambda _name: found) == (found or "bash")
 
 
 def test_default_ci_uses_layered_job_conditions() -> None:
@@ -1422,7 +1484,19 @@ def test_desktop_recovery_e2e_runs_compiled_flows_on_all_release_platforms() -> 
         "matrix.shard == 'profiles' }}"
     )
     assert "history-hydration.spec.ts" in session_recovery["run"]
-    assert '--grep "terminates stalled"' in session_recovery["run"]
+    # Select by a stable contract tag, not the scenario's human-readable title.
+    # Renaming the test must not silently leave this release-platform gate empty.
+    assert '--grep "@session-hang-recovery"' in session_recovery["run"]
+    assert "--retries=0" in session_recovery["run"]
+    recovery_spec = Path("opensquilla-webui/e2e/history-hydration.spec.ts").read_text(
+        encoding="utf-8"
+    )
+    assert len(
+        re.findall(
+            r"test\('[^']+',\s*\{\s*tag: '@session-hang-recovery',?\s*\},\s*async",
+            recovery_spec,
+        )
+    ) == 1
     assert playwright_cache["uses"] == "actions/cache/restore@v4"
     assert playwright_cache["with"]["path"] == "${{ env.PLAYWRIGHT_BROWSERS_PATH }}"
     assert job["env"]["PLAYWRIGHT_BROWSERS_PATH"] == (

@@ -1,4 +1,4 @@
-import { ref } from 'vue'
+import { ref, type Ref } from 'vue'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import type {
@@ -30,6 +30,8 @@ function createBootstrap(overrides: {
     context: SessionBootstrapPhaseContext,
   ) => Promise<SessionSubscriptionOutcome>
   criticalRequestsQueued?: () => Promise<void>
+  reconcileSession?: (context: SessionBootstrapPhaseContext) => Promise<SessionSubscriptionOutcome>
+  connectionState?: Ref<string>
 } = {}) {
   const loadHistoryImplementation = overrides.loadHistory || (async () => ({ ok: true }))
   const loadHistory = vi.fn(async (
@@ -67,6 +69,8 @@ function createBootstrap(overrides: {
     sessionReadLifecycle,
     loadHistory,
     subscribeSession,
+    reconcileSession: overrides.reconcileSession,
+    connectionState: overrides.connectionState,
     cancelHistory,
     cancelSubscription,
   })
@@ -87,6 +91,74 @@ afterEach(() => {
 })
 
 describe('useChatSessionBootstrap', () => {
+  it('merges gaps during an initial live read into a fresh reconciliation on the same lease', async () => {
+    let release!: (value: SessionSubscriptionOutcome) => void
+    const initial = new Promise<SessionSubscriptionOutcome>(resolve => { release = resolve })
+    const reconcileSession = vi.fn(async () => LIVE_READY)
+    const { api, openSessionRead, closeLease } = createBootstrap({ subscribeSession: () => initial, reconcileSession })
+    const run = api.startSessionBootstrap()
+    const recovery = api.retryLive()
+    expect(api.retryLive()).toBe(recovery)
+    expect(reconcileSession).not.toHaveBeenCalled()
+    release(LIVE_READY)
+    await run.live
+    await recovery
+    expect(reconcileSession).toHaveBeenCalledOnce()
+    expect(openSessionRead).toHaveBeenCalledOnce()
+    expect(closeLease).not.toHaveBeenCalled()
+    api.cancelSessionBootstrap()
+  })
+
+  it('automatically retries a failed live read on the original lease without a retry click', async () => {
+    vi.useFakeTimers()
+    const reconcileSession = vi.fn(async () => LIVE_READY)
+    const { api, openSessionRead, closeLease } = createBootstrap({
+      connectionState: ref('connected'),
+      subscribeSession: async () => ({ ...LIVE_READY, authoritative: false,
+        error: new SessionReadFailure('timeout', 'held subscribe', true) }),
+      reconcileSession,
+    })
+    const run = api.startSessionBootstrap()
+    await Promise.all([run.history, run.live])
+    await vi.advanceTimersByTimeAsync(500)
+    expect(reconcileSession).toHaveBeenCalledOnce()
+    expect(openSessionRead).toHaveBeenCalledOnce()
+    expect(closeLease).not.toHaveBeenCalled()
+    expect(api.livePhase.value).toBe('ready')
+    api.cancelSessionBootstrap()
+  })
+
+  it('publishes a history-only failure before notifying the automatic recovery watcher', async () => {
+    vi.useFakeTimers()
+    let available = false
+    const { api, loadHistory, subscribeSession, openSessionRead, closeLease } = createBootstrap({
+      connectionState: ref('connected'),
+      loadHistory: async () => available
+        ? { ok: true }
+        : { ok: false, error: new SessionReadFailure('unavailable', 'history offline', true) },
+    })
+    try {
+      const run = api.startSessionBootstrap()
+      await run.live
+      await vi.advanceTimersByTimeAsync(100)
+      await run.history
+      expect(api.historyPhase.value).toBe('error')
+      expect(api.livePhase.value).toBe('ready')
+      const failedAttempts = loadHistory.mock.calls.length
+
+      available = true
+      // No connection transition or unrelated live update wakes the watcher.
+      await vi.advanceTimersByTimeAsync(500)
+      expect(loadHistory).toHaveBeenCalledTimes(failedAttempts + 1)
+      expect(api.historyPhase.value).toBe('ready')
+      expect(subscribeSession).toHaveBeenCalledOnce()
+      expect(openSessionRead).toHaveBeenCalledOnce()
+      expect(closeLease).not.toHaveBeenCalled()
+    } finally {
+      api.cancelSessionBootstrap()
+    }
+  })
+
   it('releases optional traffic after the lease queues critical frames, not responses', async () => {
     let releaseHistory!: (result: SessionPhaseResult) => void
     let releaseLive!: (result: SessionSubscriptionOutcome) => void

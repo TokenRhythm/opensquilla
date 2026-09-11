@@ -194,7 +194,7 @@ async function mockUnifiedTurnReceiptHistory(page: Page) {
   await page.route('**/api/approvals', route => route.fulfill({
     status: 200,
     contentType: 'application/json',
-    body: JSON.stringify({ pending: [] }),
+    body: JSON.stringify({ mode: 'prompt', pending: [] }),
   }))
   await page.routeWebSocket(/\/ws$/, ws => {
     ws.send(wsEvent('connect.challenge', {}))
@@ -274,7 +274,7 @@ async function mockControlledActivityLifecycle(
   await page.route('**/api/approvals', route => route.fulfill({
     status: 200,
     contentType: 'application/json',
-    body: JSON.stringify({ pending: [] }),
+    body: JSON.stringify({ mode: 'prompt', pending: [] }),
   }))
   await page.routeWebSocket(/\/ws$/, ws => {
     sendFrame = frame => ws.send(frame)

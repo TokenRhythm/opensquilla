@@ -5383,6 +5383,13 @@ async def start_gateway_server(
 
         uvicorn_kwargs: dict[str, Any] = {
             "app": app,
+            # Keep the installed backend and wire limits deterministic in the
+            # packaged client. Native keepalive tolerates renderer suspension;
+            # the application probe owns interactive recovery decisions.
+            "ws": "websockets",
+            "ws_max_size": 26_214_400,
+            "ws_ping_interval": 20.0,
+            "ws_ping_timeout": 120.0,
             "host": config.host,
             "port": config.port,
             "log_level": "info" if not config.debug else "debug",

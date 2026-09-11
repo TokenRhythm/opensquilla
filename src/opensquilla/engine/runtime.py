@@ -43,7 +43,7 @@ from urllib.parse import urlsplit
 
 import structlog
 
-from opensquilla.artifacts import artifact_marker
+from opensquilla.artifacts import ArtifactSource, artifact_marker
 from opensquilla.attachment_refs import (
     is_attachment_ref,
     make_attachment_ref,
@@ -5042,6 +5042,14 @@ class TurnRunner:
         )
         if not session_id:
             session_id = session_key.split(":")[-1] or session_key
+        # A caller may reuse its base context for sequential or concurrent
+        # turns. Publications and their private source identities belong only
+        # to this turn; never clear the caller's shared containers in place.
+        source_paths: dict[str, ArtifactSource] = {}
+        adopter = tool_context.generated_artifact_adopter
+        with_source_paths = getattr(adopter, "with_source_paths", None)
+        if callable(with_source_paths):
+            adopter = with_source_paths(source_paths)
         return replace(
             tool_context,
             session_key=session_key,
@@ -5053,6 +5061,9 @@ class TurnRunner:
             workspace_id=workspace_id,
             sandbox_session_manager=self._session_manager,
             sandbox_gateway_config=self._config,
+            published_artifacts=[],
+            artifact_source_paths=source_paths,
+            generated_artifact_adopter=adopter,
             workspace_file_writes=[],
             artifact_max_bytes=getattr(attachments_cfg, "artifact_max_bytes", None),
             artifact_disk_budget_bytes=getattr(

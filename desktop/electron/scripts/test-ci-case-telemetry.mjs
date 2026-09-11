@@ -229,6 +229,31 @@ try {
     error: 'taskkill exceeded 25ms',
   })
 
+  // ElectronApplication.process() depends on a live Playwright dispatcher.
+  // Successful close disposes it, so even diagnostics must retain the owned
+  // ChildProcess beforehand instead of accessing the application afterward.
+  const nativeFixtureSource = await readFile(
+    join(scriptDir, 'test-desktop-window-background-flow.mjs'), 'utf8',
+  )
+  const assertNativeShutdownProcessOwnership = source => {
+    const closeIndex = source.indexOf('const shutdown = await closeElectronWithDeadline(')
+    const capture = /const\s+ownedChild\s*=\s*desktopApp\s*\.\s*process\s*\(\s*\)/.exec(source)
+    assert.ok(closeIndex >= 0, 'native fixture must retain bounded Electron shutdown')
+    assert.ok(capture && capture.index < closeIndex,
+      'capture the owned ChildProcess before closing Electron')
+    assert.doesNotMatch(source.slice(closeIndex), /desktopApp\s*\.\s*process\s*\(/,
+      'never call the disposed Playwright process accessor after close begins')
+    assert.match(source.slice(closeIndex), /childExited:\s*ownedChild\s*\?/,
+      'post-close diagnostics must inspect the retained owned handle')
+  }
+  assertNativeShutdownProcessOwnership(nativeFixtureSource)
+  assert.throws(() => assertNativeShutdownProcessOwnership(
+    nativeFixtureSource.replace('childExited: ownedChild ?', 'childExited: desktopApp.process() ?'),
+  ), /never call the disposed Playwright process accessor/)
+  assert.throws(() => assertNativeShutdownProcessOwnership(
+    nativeFixtureSource.replace(/const\s+ownedChild\s*=\s*desktopApp\s*\.\s*process\s*\(\s*\)/, ''),
+  ), /capture the owned ChildProcess before closing Electron/)
+
   const shutdownLogs = []
   // The production helper invokes real taskkill on Windows, so this fixture
   // must own its PID rather than supplying a synthetic EventEmitter PID.

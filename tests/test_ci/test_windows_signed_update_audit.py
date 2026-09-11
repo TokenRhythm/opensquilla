@@ -22,7 +22,9 @@ WRITE_VIEW = importlib.util.module_from_spec(WRITE_VIEW_SPEC)
 WRITE_VIEW_SPEC.loader.exec_module(WRITE_VIEW)
 
 
-def _powershell(script: Path, **environment: str) -> subprocess.CompletedProcess[str]:
+def _powershell(
+    script: Path, *, timeout_seconds: int = 30, **environment: str,
+) -> subprocess.CompletedProcess[str]:
     executable = shutil.which("pwsh") or shutil.which("powershell")
     if not executable:
         pytest.skip("PowerShell is required for the signed audit contracts")
@@ -34,13 +36,17 @@ def _powershell(script: Path, **environment: str) -> subprocess.CompletedProcess
         + script.read_text(encoding="utf-8-sig"),
         encoding="utf-8-sig",
     )
-    return subprocess.run(
-        [executable, "-NoProfile", "-NonInteractive", "-File", str(script)],
-        env={**os.environ, **environment},
-        capture_output=True,
-        encoding="utf-8",
-        timeout=30,
-    )
+    try:
+        return subprocess.run(
+            [executable, "-NoProfile", "-NonInteractive", "-File", str(script)],
+            env={**os.environ, **environment},
+            capture_output=True,
+            encoding="utf-8",
+            timeout=timeout_seconds,
+        )
+    except subprocess.TimeoutExpired as exc:
+        exc.add_note(f"Signed audit harness stdout: {exc.stdout!r}\nstderr: {exc.stderr!r}")
+        raise
 
 
 def test_signed_audit_powershell_parses_without_executing(tmp_path: Path) -> None:
@@ -513,7 +519,14 @@ def test_signed_audit_orchestration_stays_incomplete_and_stops_on_failure(
     audit_harness: tuple[Path, dict[str, str], Path], failure: str, last_call: str
 ) -> None:
     runner, environment, evidence = audit_harness
-    run = _powershell(runner, **environment, AUDIT_FAIL=failure)
+    # The full synthetic orchestration also starts PowerShell and real Node.
+    # Windows queue workers exceeded the old 30s host-process budget under load.
+    # This is not an audit latency assertion: keep its 1s observation deadlines
+    # and all fail-closed result assertions, with no retry of failed operations.
+    run = _powershell(
+        runner, timeout_seconds=90 if os.name == "nt" else 30,
+        **environment, AUDIT_FAIL=failure,
+    )
     assert run.returncode == 0, run.stdout + run.stderr
     execution = json.loads(Path(environment["AUDIT_OUTPUT"]).read_text(encoding="utf-8-sig"))
     assert execution["code"] == (1 if failure else 2), execution

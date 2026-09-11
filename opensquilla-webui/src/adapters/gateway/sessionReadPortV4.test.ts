@@ -3,6 +3,7 @@ import { createSessionReadLifecycle, type SessionReadPortLease } from '@/modules
 import { createConversationRuntime } from '@/modules/conversationRuntime'
 import { createConversationSubscriptionLifecycle } from '@/modules/conversationSubscriptionLifecycle'
 import { afterEach, describe, expect, it, vi } from 'vitest'
+import { effectScope, ref } from 'vue'
 import type { RpcCallOptions } from '@/lib/rpc'
 import { CHAT_HISTORY_METHOD, type ChatHistoryResult } from '@/contracts/generated/v4/chatHistory'
 import {
@@ -22,7 +23,12 @@ import {
   SessionReadContractError,
   SessionReadFailure,
   SessionReadSessionMissingError,
+  type SessionReadMetadata,
 } from '@/modules/sessionReadLifecycle'
+import type { ConversationEvent } from '@/modules/conversationEvents'
+import type { InterruptViewState } from '@/types/parts'
+import { useChatApprovals } from '@/composables/chat/useChatApprovals'
+import { createConversationEventsTestHarness } from '@/testing/conversationEvents.test-helper'
 import { createV4SessionReadPort } from './sessionReadPortV4'
 import { mapSessionReadError } from './sessionReadErrorMapping'
 
@@ -264,6 +270,143 @@ async function flushAsyncWork() {
 }
 
 describe('v4 SessionReadPort Adapter', () => {
+  it('refreshes a live subscription in place and coalesces concurrent reconciliation', async () => {
+    const harness = makeHarness()
+    const lease = createV4SessionReadPort(harness.rpc).open(openRequest())
+    await lease.live
+    harness.calls.length = 0
+    const fresh = deferred<SessionsMessagesSnapshotResult>()
+    harness.results.set(SESSIONS_MESSAGES_SNAPSHOT_METHOD, fresh.promise)
+    const first = lease.reconcile()
+    const second = lease.reconcile()
+    await flushAsyncWork()
+    expect(harness.calls.map(call => call.method)).toEqual([SESSIONS_MESSAGES_SNAPSHOT_METHOD])
+    fresh.resolve(snapshotResult({ current_stream_seq: 42 }))
+    const [a, b] = await Promise.all([first, second])
+    expect(a).toBe(b)
+    expect(a.snapshotCursor?.currentStreamSeq).toBe(42)
+    expect(a.initialMetadata.pendingUserInputsCursor).toEqual({
+      streamGeneration: 'stream-1', currentStreamSeq: 42,
+    })
+    expect(a.initialMetadata.goalSnapshotStreamSeq).toBe(6)
+    expect(harness.calls.map(call => call.method)).toEqual([
+      SESSIONS_MESSAGES_SNAPSHOT_METHOD, SESSIONS_MESSAGES_HYDRATE_METHOD,
+    ])
+    await lease.close()
+  })
+
+  it('retains a newer live questionnaire across late empty in-place hydration, then expires it at a newer snapshot', async () => {
+    const harness = makeHarness()
+    const lease = createV4SessionReadPort(harness.rpc).open(openRequest())
+    await lease.live
+    const scope = effectScope()
+    const events = createConversationEventsTestHarness()
+    const interruptState = ref<ReadonlyMap<string, InterruptViewState>>(new Map())
+    const approvals = scope.run(() => useChatApprovals({
+      approvalCenter: {
+        snapshot: vi.fn(async () => ({ pending: [], mode: 'prompt' as const })),
+        subscribe: vi.fn(() => ({ close: vi.fn() })),
+        subscribeAvailability: vi.fn(() => ({ close: vi.fn() })),
+      } as never,
+      conversationEvents: events.events,
+      clarificationSubmission: { submit: vi.fn() } as never,
+      sessionKey: ref('alpha'), interruptState,
+      runStatus: ref({ status: 'running', label: '', task: { task_id: 'task-1' } }),
+      stream: { isStreaming: ref(true), appendInterruptFrame: vi.fn(), ensureInterruptBubble: vi.fn() },
+    }))!
+    const unsubscribe = approvals.subscribe()
+    const applyMetadata = (metadata: SessionReadMetadata) => approvals.applyUserInputBootstrap({
+      sessionKey: metadata.sessionKey,
+      epoch: metadata.epoch,
+      streamSeq: metadata.pendingUserInputsCursor?.currentStreamSeq,
+      streamGeneration: metadata.pendingUserInputsCursor?.streamGeneration,
+      pendingUserInputs: [...metadata.pendingUserInputs],
+    })
+    const ask = (requestId: string, streamSeq: number) => events.emit({
+      kind: 'conversation', event: {
+        kind: 'known', semanticKind: 'tool-result',
+        payload: {
+          key: 'alpha', task_id: 'task-1', epoch: 3,
+          stream_generation: 'stream-1', stream_seq: streamSeq,
+          id: `call-${requestId}`, name: 'request_user_input',
+          approvalResult: {
+            kind: 'user_input', paused: true, request_id: requestId,
+            run_id: 'task-1', step: 'clarify',
+            clarify_schema: {
+              presentation: 'plan_questionnaire_v1',
+              fields: [{ name: 'scope', type: 'string', required: true, prompt: 'Which scope?' }],
+            },
+          },
+        },
+        meta: {}, sessionKey: 'alpha', taskId: 'task-1', turnId: null,
+        streamGeneration: 'stream-1', streamSeq, connectionSeq: null, generationEpoch: null,
+      },
+    } as ConversationEvent)
+    try {
+      ask('older-question', 10)
+      harness.results.set(SESSIONS_MESSAGES_SNAPSHOT_METHOD, snapshotResult({ current_stream_seq: 40 }))
+      const lateMetadata = deferred<SessionsMessagesHydrateResult>()
+      harness.results.set(SESSIONS_MESSAGES_HYDRATE_METHOD, lateMetadata.promise)
+      const recovery = lease.reconcile()
+      await flushAsyncWork()
+      expect(harness.calls[harness.calls.length - 1]?.method).toBe(SESSIONS_MESSAGES_HYDRATE_METHOD)
+
+      ask('newer-question', 41)
+      lateMetadata.resolve(hydrateResult({ pendingUserInputs: [], goalSnapshotStreamSeq: 77 }))
+      const recovered = await recovery
+      expect(recovered.initialMetadata.pendingUserInputsCursor).toEqual({
+        streamGeneration: 'stream-1', currentStreamSeq: 40,
+      })
+      expect(recovered.initialMetadata.goalSnapshotStreamSeq).toBe(77)
+      applyMetadata(recovered.initialMetadata)
+      expect(approvals.pendingClarify.value?.requestId).toBe('newer-question')
+      expect(interruptState.value.get('older-question')?.resolution).toBe('expired')
+      expect(interruptState.value.get('newer-question')?.resolution).not.toBe('expired')
+
+      harness.results.set(SESSIONS_MESSAGES_SNAPSHOT_METHOD, snapshotResult({ current_stream_seq: 42 }))
+      harness.results.set(SESSIONS_MESSAGES_HYDRATE_METHOD, hydrateResult({ pendingUserInputs: [] }))
+      applyMetadata((await lease.reconcile()).initialMetadata)
+      expect(approvals.pendingClarify.value).toBeNull()
+      expect(interruptState.value.get('newer-question')?.resolution).toBe('expired')
+      expect(harness.calls.filter(call => call.method === SESSIONS_MESSAGES_SUBSCRIBE_METHOD)).toHaveLength(1)
+      expect(harness.calls.filter(call => call.method === SESSIONS_MESSAGES_UNSUBSCRIBE_METHOD)).toHaveLength(0)
+    } finally {
+      unsubscribe()
+      scope.stop()
+      await lease.close()
+    }
+  })
+
+  it('retains the confirmed subscription lower bound when an older Gateway has no snapshot capability', async () => {
+    const harness = makeHarness()
+    harness.results.set(SESSIONS_MESSAGES_SNAPSHOT_METHOD, Object.assign(new Error('legacy Gateway'), {
+      code: 'METHOD_NOT_FOUND',
+    }))
+    const lease = createV4SessionReadPort(harness.rpc).open(openRequest())
+    await lease.live
+    try {
+      const recovered = await lease.reconcile()
+      expect(recovered.snapshot).toBeNull()
+      expect(recovered.initialMetadata.pendingUserInputsCursor).toEqual({
+        streamGeneration: 'stream-1', currentStreamSeq: 9,
+      })
+      expect(recovered.initialMetadata.goalSnapshotStreamSeq).toBe(6)
+      expect(harness.calls.filter(call => call.method === SESSIONS_MESSAGES_SUBSCRIBE_METHOD)).toHaveLength(1)
+    } finally {
+      await lease.close()
+    }
+  })
+
+  it('rejects original-lease reconciliation after a real connection generation change', async () => {
+    const harness = makeHarness()
+    const lease = createV4SessionReadPort(harness.rpc).open(openRequest())
+    await lease.live
+    harness.calls.length = 0
+    harness.setGeneration(8)
+    await expect(lease.reconcile()).rejects.toMatchObject({ kind: 'aborted' })
+    expect(harness.calls).toHaveLength(0)
+  })
+
   it.each([
     {
       name: 'an empty canonical key',

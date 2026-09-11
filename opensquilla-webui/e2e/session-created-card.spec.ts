@@ -37,7 +37,7 @@ async function mockSessionCreatedHistory(
   await page.route('**/api/approvals', route => route.fulfill({
     status: 200,
     contentType: 'application/json',
-    body: JSON.stringify({ pending: [] }),
+    body: JSON.stringify({ mode: 'prompt', pending: [] }),
   }))
   await page.routeWebSocket(/\/ws$/, ws => {
     ws.send(JSON.stringify({ type: 'event', event: 'connect.challenge', payload: {} }))

@@ -143,6 +143,16 @@
       "wireNames": [
         "sessions.routing.changed"
       ]
+    },
+    {
+      "delivery": "live-only-best-effort",
+      "family": "transport.flow.dirty",
+      "schema": "transport/transport-flow-dirty.schema.json",
+      "schemaSha256": "5afafa2c3baca401b00b0cf666b1c1435fc8e5e18838e2c96873421368513d43",
+      "schemaVersion": 1,
+      "wireNames": [
+        "transport.flow.dirty"
+      ]
     }
   ],
   "format": 1,
@@ -1149,6 +1159,12 @@
     },
     {
       "lifecycle": "stable",
+      "name": "sessions.messages.snapshot.read",
+      "schema": "sessions/sessions-messages-snapshot-read.schema.json",
+      "schemaSha256": "526f7c0939799eb8b595897cd987b3f298d49f841affe159147ef1bafa3e5e94"
+    },
+    {
+      "lifecycle": "stable",
       "name": "sessions.messages.subscribe",
       "schema": "sessions/sessions-messages-subscribe.schema.json",
       "schemaSha256": "3cd9dc014552f9f959d1e4f6aac8bc9621b994c645b7d43030651e4e8b28cedb"
@@ -1345,6 +1361,12 @@
     },
     {
       "lifecycle": "stable",
+      "name": "transport.flow.update",
+      "schema": "transport/transport-flow-update.schema.json",
+      "schemaSha256": "c637cfebaf5aa6c70fa29c6349d36f091a6de2fe445fe125e49a332b2dd7f5e6"
+    },
+    {
+      "lifecycle": "stable",
       "name": "usage.cost",
       "schema": "conversation/usage-cost.schema.json",
       "schemaSha256": "9b2cc19bcf92c659bd92ce18d4ddf58ade65a0ae6ba8e78a0c4c2f3f0cbca206"
@@ -1424,11 +1446,11 @@
   ],
   "protocol": "opensquilla-websocket-json",
   "source": {
-    "eventFamilyCount": 9,
-    "generatorSha256": "a9676c5719adc1b588e35e5cd8ea65ba57897e8dad7f1ee212158e9432ede577",
-    "methodCount": 209,
-    "schemaCount": 218,
-    "schemaTreeSha256": "99c95ea9cd4cf331e80902686c88365c452437340d135fe95fdb4dc592aedd56"
+    "eventFamilyCount": 10,
+    "generatorSha256": "db063b7bff2dcb9d089926dc9f1d3c99c61c2e4dd42ba12f442701b03fff2df1",
+    "methodCount": 211,
+    "schemaCount": 221,
+    "schemaTreeSha256": "f14629d1a596305b9a402cb27f76522b2b92a916ae25c758529cef40f7738535"
   },
   "wireVersion": 4
 }

@@ -3432,6 +3432,7 @@
     "liveConnecting": "Live-Aktualisierungen werden wiederhergestellt…",
     "liveConnectingConnected": "Gateway verbunden. Live-Aktualisierungen dieser Sitzung werden wiederhergestellt…",
     "gatewayReconnecting": "Verbindung zum Gateway wird wiederhergestellt…",
+    "automaticRecoveryDescription": "Die Verbindung wird automatisch wiederhergestellt. Sie können weiter schreiben; ungesendeter Text und Anhänge bleiben erhalten.",
     "liveUnavailable": "Live-Aktualisierungen sind vorübergehend nicht verfügbar",
     "liveUnavailableDescription": "Der Verlauf bleibt verfügbar. Stellen Sie vor dem Senden die Verbindung wieder her.",
     "liveUnavailableConnectedDescription": "Das Gateway ist verbunden und der Verlauf bleibt verfügbar. Das Senden wird nach Wiederherstellung der Live-Aktualisierungen fortgesetzt.",

@@ -14,6 +14,7 @@ import subprocess
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
+from unittest.mock import Mock
 
 import pytest
 
@@ -179,6 +180,7 @@ def _ctx(repo: Path, candidates: list[dict[str, Any]] | None = None) -> ToolCont
 async def test_final_diff_salvage_reapplies_lost_candidate_at_finalize(
     tmp_path: Path,
     legacy_ledger: bool,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     repo, target = _init_repo(tmp_path)
     candidate = _candidate(repo, target, "value = 2\n", candidate_id="srcdiff-1")
@@ -196,6 +198,8 @@ async def test_final_diff_salvage_reapplies_lost_candidate_at_finalize(
         ),
         tool_context=_ctx(repo, [candidate]),
     )
+    turn_call_log = Mock(wraps=agent._write_turn_call_log)
+    monkeypatch.setattr(agent, "_write_turn_call_log", turn_call_log)
 
     assert agent._workspace_diff_paths_for_final_diff_contract() == []
     # Only final-diff contracts exclude diagnostic files. Keep the existing
@@ -215,15 +219,19 @@ async def test_final_diff_salvage_reapplies_lost_candidate_at_finalize(
     )
     if legacy_ledger:
         assert ledger_path.read_text(encoding="utf-8") == '{"historical": true}\n'
-    recorded = [
-        json.loads(line)
-        for line in events_path.read_text(encoding="utf-8").splitlines()
-        if '"final_diff_salvage' in line
-    ]
-    applied = [event for event in recorded if event["name"] == "final_diff_salvage.applied"]
-    assert len(applied) == 1
-    assert applied[0]["candidate_id"] == "srcdiff-1"
-    assert applied[0]["trigger"] == "finalize"
+    recorded = [json.loads(line) for line in events_path.read_text().splitlines()]
+    assert not any(
+        event.get("name", "").startswith("final_diff_salvage.") for event in recorded
+    )
+    turn_call_log.assert_any_call(
+        "turn_policy_decision",
+        action="final_diff_salvage",
+        reason="finalize",
+        code="final_diff_salvage",
+        iteration=1,
+        candidate_ids=["srcdiff-1"],
+        paths=["pkg.py"],
+    )
 
 
 @pytest.mark.asyncio
@@ -459,14 +467,6 @@ async def test_final_diff_salvage_falls_back_when_apply_fails_after_check(
     assert target.read_text(encoding="utf-8") == "value = 2\n"
     assert newer["restored"] is False
     assert older["restored"] is True
-    recorded = [
-        json.loads(line)
-        for line in events_path.read_text(encoding="utf-8").splitlines()
-        if '"final_diff_salvage' in line
-    ]
-    names = [event["name"] for event in recorded]
-    assert "final_diff_salvage.apply_failed" in names
-    assert "final_diff_salvage.applied" in names
 
 
 @pytest.mark.asyncio
@@ -491,14 +491,6 @@ async def test_final_diff_salvage_stops_when_time_budget_exhausted(
     assert any(event.kind == "done" for event in events)
     assert target.read_text(encoding="utf-8") == "value = 1\n"
     assert candidate["restored"] is False
-    recorded = [
-        json.loads(line)
-        for line in events_path.read_text(encoding="utf-8").splitlines()
-        if '"final_diff_salvage' in line
-    ]
-    assert [event["name"] for event in recorded] == [
-        "final_diff_salvage.time_budget_exhausted"
-    ]
 
 
 def _unlost(candidate: dict[str, Any]) -> dict[str, Any]:
@@ -508,14 +500,6 @@ def _unlost(candidate: dict[str, Any]) -> dict[str, Any]:
     candidate["lost_reason"] = None
     candidate["lost_command"] = None
     return candidate
-
-
-def _salvage_events(events_path: Path) -> list[dict[str, Any]]:
-    return [
-        json.loads(line)
-        for line in events_path.read_text(encoding="utf-8").splitlines()
-        if '"final_diff_salvage' in line
-    ]
 
 
 @pytest.mark.asyncio
@@ -540,7 +524,6 @@ async def test_final_diff_salvage_veto_skips_lost_candidate(tmp_path: Path) -> N
     assert any(event.kind == "done" for event in events)
     assert target.read_text(encoding="utf-8") == "value = 1\n"
     assert candidate["restored"] is False
-    assert [event["action"] for event in _salvage_events(events_path)] == ["vetoed_lost"]
 
 
 @pytest.mark.asyncio
@@ -574,9 +557,6 @@ async def test_final_diff_salvage_veto_skips_instrumentation_only_candidate(
     assert any(event.kind == "done" for event in events)
     assert target.read_text(encoding="utf-8") == "value = 1\n"
     assert candidate["restored"] is False
-    assert [event["action"] for event in _salvage_events(events_path)] == [
-        "vetoed_instrumentation"
-    ]
 
 
 @pytest.mark.asyncio
@@ -605,10 +585,6 @@ async def test_final_diff_salvage_veto_falls_back_to_older_clean_candidate(
     assert target.read_text(encoding="utf-8") == "value = 2\n"
     assert newer["restored"] is False
     assert older["restored"] is True
-    assert [event["action"] for event in _salvage_events(events_path)] == [
-        "vetoed_lost",
-        "applied",
-    ]
 
 
 @pytest.mark.asyncio

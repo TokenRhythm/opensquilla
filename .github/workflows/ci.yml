@@ -848,6 +848,7 @@ jobs:
         working-directory: desktop/electron
         run: |
           node scripts/test-installer-progress-contract.mjs
+          node --test scripts/test-gateway-integrity.mjs
           node scripts/test-secret-storage-policy.mjs
           node scripts/test-update-resolver.mjs
           node scripts/test-update-check-scheduler.mjs
@@ -1486,7 +1487,8 @@ jobs:
             history-hydration.spec.ts \
             --project=chromium \
             --workers=1 \
-            --grep "terminates stalled" \
+            --grep "@session-hang-recovery" \
+            --retries=0 \
             2>&1 | tee "${CI_REPORT_DIR}/session-hang-recovery.log"
 
       - name: Install Desktop workbench browser

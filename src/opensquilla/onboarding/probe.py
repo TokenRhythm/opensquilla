@@ -590,11 +590,23 @@ async def discover_selectable_provider_models(
     ):
         return ProviderModelsDiscoverResult(ok=True, provider_id=provider_id)
 
-    # TokenRhythm has two authoritative sources: its public website catalog
-    # and the authenticated account entitlement list.  The gateway-owned
-    # coordinator supplies TTL/backoff/singleflight/persistence while keeping
-    # this selector policy boundary responsible for the official-host gate.
+    # TokenRhythm's production API has two authoritative sources: its public
+    # website catalog and the authenticated account entitlement list. Keep
+    # that merged, persistent projection scoped to the canonical production
+    # origin. Verified HTTPS subdomains (for example the provider's UAT
+    # service) continue through the generic live-listing path below so their
+    # credentials and model metadata never enter the production coordinator.
+    tokenrhythm_production_catalog = False
     if spec.live_catalog_shape == "tokenrhythm":
+        from opensquilla.provider.tokenrhythm_catalog import (
+            is_official_tokenrhythm_endpoint,
+        )
+
+        tokenrhythm_production_catalog = is_official_tokenrhythm_endpoint(
+            effective_base_url
+        )
+
+    if tokenrhythm_production_catalog:
         default_env_key = spec.env_key if allow_default_api_key_env else ""
         resolved_key, key_source = _resolve_probe_api_key(
             api_key,
@@ -623,6 +635,10 @@ async def discover_selectable_provider_models(
             persist_entitlement=persist_catalog,
             config=catalog_config,
         )
+
+    # The selector-facing host gate above already rejected plain HTTP,
+    # foreign hosts, and lookalike suffixes. Treat an admitted TokenRhythm
+    # non-production origin as its own declared catalog authority.
 
     discovery_provider_id = (
         spec.selectable_model_discovery_provider_id or provider_id
