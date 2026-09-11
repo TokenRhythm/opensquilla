@@ -21,7 +21,7 @@ import re
 import time
 import uuid
 from collections.abc import AsyncIterator, Callable
-from dataclasses import asdict, dataclass, replace
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
@@ -84,6 +84,7 @@ from opensquilla.engine.types import (
     ToolUseEndEvent,
     ToolUseStartEvent,
     done_text_snapshot,
+    public_agent_event_payload,
 )
 from opensquilla.execution_status import normalize_execution_status
 from opensquilla.gateway.attachment_ingest import AttachmentIngestResult, ingest_attachments
@@ -2746,7 +2747,7 @@ def _text_delta_from_event(event: Any) -> str:
 def _text_delta_event_payload(event: TextDeltaEvent) -> dict[str, Any]:
     """Serialize a channel-origin text delta through the full public contract."""
 
-    payload = asdict(event)
+    payload = public_agent_event_payload(event)
     payload.pop("kind", None)
     return payload
 

@@ -18,7 +18,7 @@ def _apply_through_v039(db_path: Path) -> None:
     backend = get_backend("sqlite:///" + str(db_path))
     try:
         migrations = read_migrations(str(MIGRATIONS_DIR)).filter(
-            lambda item: item.id not in {MIGRATION_ID, "V041__retire_html_editor"}
+            lambda item: item.id < MIGRATION_ID
         )
         with backend.lock():
             backend.apply_migrations(backend.to_apply(migrations))
@@ -58,7 +58,9 @@ def test_v040_upgrades_v039_and_enforces_resource_occurrence_constraints(
         _seed_document(conn)
         conn.commit()
 
-    assert apply_pending(str(db_path), MIGRATIONS_DIR) == [MIGRATION_ID, "V041__retire_html_editor"]
+    assert apply_pending(str(db_path), MIGRATIONS_DIR) == sorted(
+        path.stem for path in MIGRATIONS_DIR.glob("V*.py") if path.stem >= MIGRATION_ID
+    )
 
     with sqlite3.connect(db_path) as conn:
         tables = {

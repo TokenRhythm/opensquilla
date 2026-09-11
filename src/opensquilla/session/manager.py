@@ -13,6 +13,7 @@ import threading
 import time
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
+from copy import deepcopy
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -498,6 +499,7 @@ def _compaction_entry_payloads(entries: list[TranscriptEntry]) -> list[dict[str,
                 "tool_calls": silent_reply.segments,
                 "tool_call_id": entry.tool_call_id,
                 "reasoning_content": entry.reasoning_content,
+                "assistant_replay": deepcopy(entry.assistant_replay),
                 "turn_usage": entry.turn_usage,
                 "turn_context": entry.turn_context,
             }
@@ -525,6 +527,7 @@ def _transcript_preimage(entries: list[TranscriptEntry]) -> tuple[tuple[Any, ...
             entry.provenance_source_tool,
             entry.schema_version,
             _stable_json(entry.tool_calls),
+            _stable_json(entry.assistant_replay),
             _stable_json(entry.turn_usage),
             _stable_json(entry.turn_context),
         )
@@ -1071,7 +1074,9 @@ class SessionManager:
             expected_session_id=expected_session_id,
             expected_session_epoch=expected_session_epoch,
         )
-        return [entry.model_dump(mode="json") for entry in entries]
+        return [
+            entry.model_dump(mode="json", exclude={"assistant_replay"}) for entry in entries
+        ]
 
     async def inject_message(
         self,
@@ -1927,6 +1932,7 @@ class SessionManager:
                         tool_calls=entry.tool_calls,
                         tool_call_id=entry.tool_call_id,
                         reasoning_content=entry.reasoning_content,
+                        assistant_replay=deepcopy(entry.assistant_replay),
                         turn_usage=entry.turn_usage,
                         turn_context=attach_fork_terminal_outcome_projection(
                             entry.turn_context,
@@ -2088,6 +2094,7 @@ class SessionManager:
                 tool_calls=entry.tool_calls,
                 tool_call_id=entry.tool_call_id,
                 reasoning_content=entry.reasoning_content,
+                assistant_replay=deepcopy(entry.assistant_replay),
                 turn_usage=entry.turn_usage,
                 turn_context=attach_fork_terminal_outcome_projection(
                     entry.turn_context,
@@ -2233,6 +2240,7 @@ class SessionManager:
         tool_calls: list[dict[str, Any]] | None = None,
         tool_call_id: str | None = None,
         reasoning_content: str | None = None,
+        assistant_replay: dict[str, Any] | None = None,
         turn_usage: dict[str, Any] | None = None,
         turn_context: dict[str, Any] | None = None,
         token_count: int | None = None,
@@ -2275,6 +2283,7 @@ class SessionManager:
             tool_calls=tool_calls,
             tool_call_id=tool_call_id,
             reasoning_content=reasoning_content if role == "assistant" else None,
+            assistant_replay=deepcopy(assistant_replay) if role == "assistant" else None,
             turn_usage=turn_usage if role == "assistant" else None,
             turn_context=dict(turn_context) if turn_context is not None else None,
             token_count=token_count,
@@ -2313,6 +2322,7 @@ class SessionManager:
         tool_calls: list[dict[str, Any]] | None = None,
         tool_call_id: str | None = None,
         reasoning_content: str | None = None,
+        assistant_replay: dict[str, Any] | None = None,
         turn_usage: dict[str, Any] | None = None,
         token_count: int | None = None,
         provenance: dict[str, Any] | None = None,
@@ -2377,6 +2387,7 @@ class SessionManager:
             tool_calls=tool_calls,
             tool_call_id=tool_call_id,
             reasoning_content=reasoning_content,
+            assistant_replay=assistant_replay,
             turn_usage=turn_usage,
             token_count=token_count,
             provenance=provenance,
@@ -3710,6 +3721,8 @@ class SessionManager:
                     content=raw.get("content", ""),
                     tool_calls=raw.get("tool_calls"),
                     tool_call_id=raw.get("tool_call_id"),
+                    reasoning_content=raw.get("reasoning_content"),
+                    assistant_replay=deepcopy(raw.get("assistant_replay")),
                     turn_usage=raw.get("turn_usage"),
                     turn_context=raw.get("turn_context"),
                 )

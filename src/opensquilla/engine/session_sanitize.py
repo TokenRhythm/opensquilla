@@ -23,7 +23,11 @@ from opensquilla.provider import (
     ContentBlockToolUse,
     Message,
 )
-from opensquilla.provider.types import ContentBlockDocument, ContentBlockImage
+from opensquilla.provider.types import (
+    ContentBlockDocument,
+    ContentBlockImage,
+    ContentBlockRedactedThinking,
+)
 
 _BLOCK_FIELDS: dict[str, set[str]] = {
     "text": {"type", "text"},
@@ -32,6 +36,7 @@ _BLOCK_FIELDS: dict[str, set[str]] = {
     "image": {"type", "source_type", "media_type", "data"},
     "document": {"type", "source_type", "media_type", "data", "title"},
     "thinking": {"type", "thinking", "signature"},
+    "redacted_thinking": {"type", "data"},
 }
 
 _BLOCK_MODELS: dict[str, type[BaseModel]] = {
@@ -41,6 +46,7 @@ _BLOCK_MODELS: dict[str, type[BaseModel]] = {
     "image": ContentBlockImage,
     "document": ContentBlockDocument,
     "thinking": ContentBlockThinking,
+    "redacted_thinking": ContentBlockRedactedThinking,
 }
 
 _HISTORICAL_TOOL_ARGUMENT_PROJECTION_PREFIX = "[historical_tool_argument_omitted]\n"
@@ -173,10 +179,8 @@ def project_historical_tool_payloads(
         if content_changed or next_reasoning != message.reasoning_content:
             touched = True
             projected.append(
-                Message(
-                    role=message.role,
-                    content=next_content,
-                    reasoning_content=next_reasoning,
+                message.model_copy(
+                    update={"content": next_content, "reasoning_content": next_reasoning}
                 )
             )
         else:
@@ -216,13 +220,7 @@ def sanitize_session_messages(
         metadata_keys_removed += removed
         if content_changed:
             touched = True
-            sanitized.append(
-                Message(
-                    role=message.role,
-                    content=content,
-                    reasoning_content=message.reasoning_content,
-                )
-            )
+            sanitized.append(message.model_copy(update={"content": content}))
         else:
             sanitized.append(message)
 
@@ -379,11 +377,7 @@ def recoverable_tool_result_reference(content: str) -> tuple[str, str] | None:
         object_start += 1
     while object_end > object_start and content[object_end - 1] in " \t\r\n":
         object_end -= 1
-    if (
-        object_start == object_end
-        or content[object_start] != "{"
-        or content[object_end - 1] != "}"
-    ):
+    if object_start == object_end or content[object_start] != "{" or content[object_end - 1] != "}":
         return None
     if any(
         marker not in content
@@ -576,6 +570,8 @@ def _to_jsonable(value: Any) -> Any:
         }
         if value.reasoning_content is not None:
             payload["reasoning_content"] = value.reasoning_content
+        if value.provider_replay is not None:
+            payload["provider_replay"] = value.provider_replay.model_dump(mode="json")
         return payload
     if isinstance(value, BaseModel):
         return value.model_dump(mode="json")

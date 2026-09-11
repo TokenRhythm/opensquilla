@@ -6,14 +6,13 @@ import asyncio
 import contextlib
 import inspect
 from collections.abc import Awaitable, Callable
-from dataclasses import asdict
 from typing import TYPE_CHECKING, Any
 
 import structlog
 
 from opensquilla.artifacts import enrich_artifact_event_dict
 from opensquilla.engine.stream_wrappers import is_context_bound_owner, wrap_stream
-from opensquilla.engine.types import AnswerGenerationResetEvent
+from opensquilla.engine.types import AnswerGenerationResetEvent, public_agent_event_payload
 from opensquilla.gateway.config import GatewayConfig, effective_agent_stream_idle_timeout_seconds
 from opensquilla.gateway.project_workspace_runtime import (
     AcceptedRunModeOverride,
@@ -287,7 +286,7 @@ async def run_direct_turn(
             if isinstance(event, AnswerGenerationResetEvent):
                 event_dict = serialize_public_event(event)
             else:
-                event_dict = asdict(event)
+                event_dict = public_agent_event_payload(event)
             event_kind = event_dict.pop("kind", event.__class__.__name__)
             if event_kind == "thinking" and not event_dict.get("block_id"):
                 event_dict.pop("block_id", None)
