@@ -228,11 +228,21 @@ def main():
             stages[f'{label}LaunchAndRetainedData'] = True
         uninstaller = next(root.glob('Uninstall*.exe'))
         run([uninstaller, '/S'])
-        deadline = time.monotonic() + 60
-        while (root / 'OpenSquilla.exe').exists() and time.monotonic() < deadline:
+        # NSIS starts a temporary uninstaller process and returns before it
+        # finishes. Its section removes files before deleting registry keys.
+        # Wait for both existing postconditions, not merely the first file.
+        uninstall_started = time.monotonic()
+        deadline = uninstall_started + 60
+        while time.monotonic() < deadline:
+            app_present = (root / 'OpenSquilla.exe').exists()
+            entries = registry(root)
+            if not app_present and not entries:
+                break
             time.sleep(0.2)
-        assert not (root / 'OpenSquilla.exe').exists(), 'Uninstaller did not remove executable'
-        assert not registry(root), 'Uninstall registry still exists'
+        stages['uninstallCompletion'] = {'waitSeconds': time.monotonic() - uninstall_started,
+                                         'appPresent': app_present, 'registry': entries}
+        assert not app_present, 'Uninstaller did not remove executable'
+        assert not entries, 'Uninstall registry still exists'
         run([sys.executable, probe, 'verify', *profile_args])
         stages['uninstallAndProfilePreservation'] = True
         report['ok'] = True
