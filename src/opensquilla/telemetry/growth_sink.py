@@ -176,6 +176,7 @@ class GrowthEventSink:
             return
         if self._first_turn_started_at is None:
             self._first_turn_started_at = occurred_at
+        self._schedule(self.replay_pending())
         self._schedule(self.record_turn_started(occurred_at))
 
     def observe_turn_succeeded(self) -> None:
@@ -186,6 +187,7 @@ class GrowthEventSink:
         occurred_at = self._safe_now()
         if occurred_at is None:
             return
+        self._schedule(self.replay_pending())
         self._schedule(self.record_turn_succeeded(occurred_at))
 
     def observe_metaskill_usage(self, run_id: str) -> None:
@@ -229,6 +231,25 @@ class GrowthEventSink:
                 event_name="coding_mode_usage",
             )
         )
+
+    async def replay_pending(self) -> None:
+        """Retry durable first-turn events before creating a new one.
+
+        The marker is written before enqueue, so a transient enqueue failure
+        must be replayed on the next runtime boundary even when the user does
+        not submit another successful turn.
+        """
+
+        if self._closed:
+            return
+        try:
+            state = read_gateway_growth_milestone_state(self._marker_path)
+            for name in ("first_turn_started", "first_turn_result"):
+                record = state.record_for(name)
+                if record is not None and record.status is GrowthMilestoneStatus.PENDING:
+                    await self._record_milestone(name, record.event.occurred_at_utc)
+        except (GrowthStateError, IdentityStateError, OSError, ValueError, TypeError):
+            log.debug("growth milestone replay rejected", exc_info=True)
 
     async def record_turn_started(self, occurred_at: datetime) -> None:
         await self._record_milestone("first_turn_started", occurred_at)
