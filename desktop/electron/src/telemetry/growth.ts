@@ -15,7 +15,7 @@ import {
 } from 'node:fs'
 import { join } from 'node:path'
 
-import { resolveMirroredConsent } from './consent-mirror.js'
+import { environmentForcesOff, resolveMirroredConsent } from './consent-mirror.js'
 import {
   CURRENT_NOTICE_VERSION_BY_SCOPE,
   validateDesktopEarlyTelemetryEvent,
@@ -28,6 +28,7 @@ import {
   DesktopTelemetryRuntimeGate,
   spoolEarlyTelemetryEvent,
 } from './early-spool.js'
+import type { DesktopScopeConsent } from './onboarding-consent.js'
 
 export const GROWTH_COHORT_STATE_NAME = 'growth_cohort.json'
 export const GROWTH_IDENTITY_STATE_NAME = 'growth_identity.json'
@@ -47,6 +48,13 @@ interface DesktopGrowthPaths {
   telemetryDirectory: string
   spoolRoot: string
   consentMirrorPath: string
+}
+
+export interface DesktopOnboardingReceipt {
+  schema_version: 1
+  notice_version: string
+  consented_at_utc: string
+  completed_at_utc: string
 }
 
 interface GrowthIdentity {
@@ -98,7 +106,8 @@ export interface GrowthProfileInspection {
  * Electron-owned new-user eligibility and first desktop milestones.
  *
  * Missing files never prove freshness. Only the recovery engine's exact
- * `fresh_profile` result can arm this process, and activation occurs only
+ * `fresh_profile` result can authorize onboarding, including its consent-bound
+ * settings receipt recovered after a process stop. Activation occurs only
  * after the current Growth-consent mirror is effective.
  */
 export class DesktopGrowthTelemetry {
@@ -110,6 +119,7 @@ export class DesktopGrowthTelemetry {
   private readonly randomId: () => string
   private inspectedProfileKey: string | null = null
   private freshCandidate = false
+  private importedOrMigrated = false
   private paths: DesktopGrowthPaths | null = null
   private identity: GrowthIdentity | null = null
 
@@ -124,6 +134,7 @@ export class DesktopGrowthTelemetry {
 
   observeProfileInspection(inspection: GrowthProfileInspection): void {
     this.inspectedProfileKey = inspection.profileKey
+    this.importedOrMigrated = inspection.importedOrMigrated === true
     this.freshCandidate = inspection.stableCode === 'fresh_profile'
       && inspection.importedOrMigrated !== true
     if (this.paths?.profileKey !== inspection.profileKey) {
@@ -132,11 +143,37 @@ export class DesktopGrowthTelemetry {
     }
   }
 
-  synchronize(paths: DesktopGrowthPaths): void {
+  prepareOnboardingReceipt(
+    profileKey: string,
+    consent: DesktopScopeConsent,
+  ): DesktopOnboardingReceipt | null {
+    if (
+      !this.freshCandidate || this.inspectedProfileKey !== profileKey
+      || !consent.enabled || consent.noticeVersion !== CURRENT_NOTICE_VERSION_BY_SCOPE.growth
+      || !isUtcTimestamp(consent.consentedAtUtc)
+      || environmentForcesOff('growth', this.env)
+    ) return null
+    const completedAt = canonicalNow(this.nowDate)
+    if (completedAt === null) return null
+    return {
+      schema_version: 1,
+      notice_version: consent.noticeVersion,
+      consented_at_utc: consent.consentedAtUtc,
+      completed_at_utc: completedAt,
+    }
+  }
+
+  synchronize(paths: DesktopGrowthPaths, onboardingReceipt: unknown = null): void {
     this.paths = paths
     this.identity = null
     const consent = resolveMirroredConsent(paths.consentMirrorPath, 'growth', this.env)
     if (!consent.enabled) return
+    const receipt = parseDesktopOnboardingReceipt(onboardingReceipt)
+    const completedOnboarding = !this.importedOrMigrated
+      && this.inspectedProfileKey === paths.profileKey
+      && receipt?.notice_version === consent.noticeVersion
+      && receipt?.consented_at_utc === consent.consentedAtUtc
+      ? receipt : null
 
     const cohortPath = join(paths.telemetryDirectory, GROWTH_COHORT_STATE_NAME)
     const identityPath = join(paths.telemetryDirectory, GROWTH_IDENTITY_STATE_NAME)
@@ -148,14 +185,20 @@ export class DesktopGrowthTelemetry {
       this.identity = identity.status === 'valid'
         ? identity.value
         : createIdentity(identityPath, this.nowDate, this.randomId)
-      if (this.identity !== null) this.retryPendingMilestones()
+      if (this.identity !== null) {
+        this.retryPendingMilestones()
+        if (completedOnboarding !== null) {
+          this.recordMilestone('onboarding_result', completedOnboarding.completed_at_utc)
+        }
+      }
       this.freshCandidate = false
       return
     }
 
-    const canActivate = this.freshCandidate
-      && this.inspectedProfileKey === paths.profileKey
-      && identity.status === 'absent'
+    const canActivate = (
+      (this.freshCandidate && this.inspectedProfileKey === paths.profileKey)
+      || completedOnboarding !== null
+    ) && identity.status === 'absent'
     if (!canActivate) return
 
     // Cohort first: if the process dies before identity creation, this
@@ -169,7 +212,12 @@ export class DesktopGrowthTelemetry {
     } satisfies ActiveGrowthCohort)) return
     this.identity = createIdentity(identityPath, this.nowDate, this.randomId)
     this.freshCandidate = false
-    if (this.identity !== null) this.retryPendingMilestones()
+    if (this.identity !== null) {
+      this.retryPendingMilestones()
+      if (completedOnboarding !== null) {
+        this.recordMilestone('onboarding_result', completedOnboarding.completed_at_utc)
+      }
+    }
   }
 
   recordOnboardingCompleted(): void {
@@ -197,7 +245,7 @@ export class DesktopGrowthTelemetry {
     }
   }
 
-  private recordMilestone(name: MilestoneName): void {
+  private recordMilestone(name: MilestoneName, occurredAt?: string): void {
     const paths = this.paths
     const identity = this.identity
     if (paths === null || identity === null || !this.runtimeGate.isOpen()) return
@@ -217,7 +265,7 @@ export class DesktopGrowthTelemetry {
       && existing.event.analytics_user_id !== identity.value
     ) return
 
-    const event = existing?.event ?? this.buildEvent(name, identity.value)
+    const event = existing?.event ?? this.buildEvent(name, identity.value, occurredAt)
     if (event === null) return
     if (existing === null) {
       state[name] = { status: 'pending', event }
@@ -245,8 +293,9 @@ export class DesktopGrowthTelemetry {
   private buildEvent(
     name: MilestoneName,
     analyticsUserId: string,
+    completedAt?: string,
   ): OnboardingCompletedEvent | FirstAppReadyEvent | null {
-    const occurredAt = canonicalNow(this.nowDate)
+    const occurredAt = completedAt ?? canonicalNow(this.nowDate)
     const eventId = this.randomId()
     if (occurredAt === null || !UUID4_RE.test(eventId)) return null
     const common = {
@@ -282,6 +331,20 @@ export class DesktopGrowthTelemetry {
       return null
     }
   }
+}
+
+export function parseDesktopOnboardingReceipt(value: unknown): DesktopOnboardingReceipt | null {
+  if (
+    !isRecord(value)
+    || !hasExactKeys(value, [
+      'schema_version', 'notice_version', 'consented_at_utc', 'completed_at_utc',
+    ])
+    || value.schema_version !== 1
+    || typeof value.notice_version !== 'string'
+    || !isUtcTimestamp(value.consented_at_utc)
+    || !isUtcTimestamp(value.completed_at_utc)
+  ) return null
+  return value as unknown as DesktopOnboardingReceipt
 }
 
 export function clearDesktopGrowthTelemetryState(telemetryDirectory: string): void {

@@ -3901,8 +3901,14 @@ async def build_services(
         growth_event_sink = GrowthEventSink(telemetry_runtime, config=config)
         if any(resolve_scope_consent(scope, config=config).enabled for scope in TelemetryScope):
             await telemetry_runtime.start()
+        await growth_event_sink.start()
     except Exception:
         log.debug("build_services.telemetry_runtime_unavailable", exc_info=True)
+        if growth_event_sink is not None:
+            try:
+                await growth_event_sink.close()
+            except Exception:
+                pass
         if telemetry_runtime is not None:
             try:
                 await telemetry_runtime.close()

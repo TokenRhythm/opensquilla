@@ -103,6 +103,7 @@ class _FunnelStage:
     event_name: str
     outcome: str | None = None
     window_hours_from_previous: int | None = None
+    may_precede_previous: bool = False
 
 
 _ACQUISITION_STAGES: Final = (
@@ -121,7 +122,10 @@ _ACQUISITION_STAGES: Final = (
 
 _ACTIVATION_STAGES: Final = (
     _FunnelStage("first_app_ready", "first_app_ready"),
-    _FunnelStage("onboarding_completed", "onboarding_result", "completed", 7 * 24),
+    # Desktop saves onboarding before starting the gateway. Keep the ready
+    # cohort anchor while accepting that already-completed prerequisite, and
+    # retain support for older producers that reported readiness first.
+    _FunnelStage("onboarding_completed", "onboarding_result", "completed", 7 * 24, True),
     _FunnelStage("first_turn_started", "first_turn_started", window_hours_from_previous=7 * 24),
     _FunnelStage("first_turn_succeeded", "first_turn_result", "success", 7 * 24),
 )
@@ -1113,19 +1117,30 @@ class DashboardQueries:
         for index, stage in enumerate(stages[1:], start=1):
             previous = index - 1
             outcome_clause = "AND candidate.outcome = ?" if stage.outcome is not None else ""
+            lower_bound = (
+                "julianday(candidate.occurred_at_utc) "
+                ">= julianday(prior.reached_at) - (? / 24.0)"
+                if stage.may_precede_previous
+                else "candidate.occurred_at_utc >= prior.reached_at"
+            )
+            reached_at = (
+                "MAX(candidate.occurred_at_utc, prior.reached_at)"
+                if stage.may_precede_previous
+                else "candidate.occurred_at_utc"
+            )
             ctes.append(
                 f"""
                 stage_{index} AS (
                     SELECT
                         prior.journey_key,
-                        MIN(candidate.occurred_at_utc) AS reached_at
+                        MIN({reached_at}) AS reached_at
                     FROM stage_{previous} AS prior
                     LEFT JOIN events AS candidate
                       ON candidate.{id_column} = prior.journey_key
                      AND prior.reached_at IS NOT NULL
                      AND candidate.event_name = ?
                      {outcome_clause}
-                     AND candidate.occurred_at_utc >= prior.reached_at
+                     AND {lower_bound}
                      AND julianday(candidate.occurred_at_utc)
                          <= julianday(prior.reached_at) + (? / 24.0)
                     GROUP BY prior.journey_key
@@ -1135,6 +1150,8 @@ class DashboardQueries:
             params.append(stage.event_name)
             if stage.outcome is not None:
                 params.append(stage.outcome)
+            if stage.may_precede_previous:
+                params.append(stage.window_hours_from_previous)
             params.append(stage.window_hours_from_previous)
 
         count_expressions = [
