@@ -53,6 +53,7 @@ class _RecordingTranscriptAppend:
         reasoning_content: str | None,
         turn_usage: dict[str, Any] | None,
         token_count: int | None,
+        assistant_replay: dict[str, Any] | None = None,
     ) -> TranscriptAppendResult | bool:
         self.calls.append(
             {
@@ -63,6 +64,7 @@ class _RecordingTranscriptAppend:
                 "reasoning_content": reasoning_content,
                 "turn_usage": turn_usage,
                 "token_count": token_count,
+                "assistant_replay": assistant_replay,
             }
         )
         if self.raises is not None:
@@ -831,7 +833,12 @@ async def test_goal_mixed_sentinel_is_removed_from_text_segments_and_done_event(
 @pytest.mark.asyncio
 async def test_goal_exact_sentinel_done_event_is_suppressed_without_persistence() -> None:
     stage, recs = _make_stage()
-    done = DoneEvent(text="**NO_REPLY**", text_snapshot="**NO_REPLY**")
+    done = DoneEvent(
+        text="**NO_REPLY**", text_snapshot="**NO_REPLY**",
+        assistant_replay={
+            "version": 1, "messages": [{"role": "assistant", "content": "**NO_REPLY**"}],
+        },
+    )
     inp = _make_input(
         final_text_parts=["**NO_REPLY**"],
         turn_segments=[{"type": "text", "text": "**NO_REPLY**"}],
@@ -1030,7 +1037,7 @@ async def test_reasoning_content_included_for_deepseek_model() -> None:
 
 
 @pytest.mark.asyncio
-async def test_reasoning_content_excluded_for_non_deepseek_model() -> None:
+async def test_reasoning_content_included_for_non_deepseek_model() -> None:
     stage, recs = _make_stage()
     done = DoneEvent(
         text="hi",
@@ -1045,7 +1052,43 @@ async def test_reasoning_content_excluded_for_non_deepseek_model() -> None:
         resolved_model="synthetic-long-model-4",
     )
     await stage.run(inp)
-    assert recs["transcript_append"].calls[0]["reasoning_content"] is None
+    assert recs["transcript_append"].calls[0]["reasoning_content"] == "thinking..."
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("display", ["visible answer", ""])
+async def test_accepted_replay_persists_independently_of_display(display: str) -> None:
+    stage, recs = _make_stage()
+    replay = {"version": 1, "messages": [{"role": "assistant", "content": "accepted"}]}
+    done = DoneEvent(text=display, assistant_replay=replay)
+    await stage.run(_make_input(final_text_parts=[display], done_event=done))
+    assert recs["transcript_append"].calls[0]["assistant_replay"] == replay
+    assert len(recs["turn_memory_capture"].calls) == bool(display)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("content", ["", "accepted content", [{
+    "type": "tool_use", "id": "call-1", "name": "lookup", "input": {},
+}]])
+async def test_suppressed_display_preserves_substantive_native_replay_without_ui_segments(content):
+    stage, recs = _make_stage()
+    replay = {"version": 1, "messages": [{
+        "role": "assistant", "content": content,
+        "provider_replay": {
+            "protocol": "openai_chat_completions", "source": "synthetic-silent-origin",
+            "model": "test/model", "reasoning_details": [
+                {"type": "reasoning.encrypted", "data": "synthetic-native-state"}
+            ],
+        },
+    }]}
+    done = DoneEvent(
+        text="", delivery="suppressed", suppression_reason="no_reply", assistant_replay=replay,
+    )
+    await stage.run(_make_input(
+        final_text_parts=[], done_event=done, input_mode="system_event", run_kind="goal",
+    ))
+    assert recs["transcript_append"].calls[0]["assistant_replay"] == replay
+    assert recs["turn_memory_capture"].calls == []
 
 
 @pytest.mark.asyncio

@@ -294,7 +294,9 @@ def test_v041_upgrades_existing_profile_and_keeps_forward_only_history(tmp_path:
         backend.connection.close()
     with sqlite3.connect(path) as conn:
         seed_change(conn, "upgrade")
-    assert apply_pending(str(path), MIGRATIONS) == [MIGRATION_ID]
+    assert apply_pending(str(path), MIGRATIONS) == sorted(
+        migration.stem for migration in MIGRATIONS.glob("V*.py") if migration.stem >= MIGRATION_ID
+    )
     assert apply_pending(str(path), MIGRATIONS) == []
     with sqlite3.connect(path) as conn:
         assert conn.execute("SELECT status FROM artifact_change_sets").fetchone() == ("failed",)

@@ -17,6 +17,7 @@ from opensquilla.provider import ErrorEvent as ProviderError
 from opensquilla.provider import TextDeltaEvent as ProviderText
 from opensquilla.provider import ToolUseEndEvent as ProviderToolUseEnd
 from opensquilla.provider import ToolUseStartEvent as ProviderToolUseStart
+from opensquilla.provider.types import ProviderReplayState
 from opensquilla.session.manager import SessionManager
 from opensquilla.session.storage import SessionStorage
 from opensquilla.silent_reply import (
@@ -30,10 +31,11 @@ from opensquilla.tools.types import CallerKind, ToolContext, ToolSpec
 class _ScriptedProvider:
     provider_name = "test"
 
-    def __init__(self, scripts: list[list[str]]) -> None:
+    def __init__(self, scripts: list[list[str]], *, native_replay: bool = False) -> None:
         self.model = "test/model"
         self.scripts = scripts
         self.calls: list[list[Message]] = []
+        self.native_replay = native_replay
 
     def chat(self, messages: list[Message], tools=None, config=None) -> AsyncIterator[Any]:
         call_index = len(self.calls)
@@ -43,7 +45,10 @@ class _ScriptedProvider:
     async def _stream(self, chunks: list[str]) -> AsyncIterator[Any]:
         for chunk in chunks:
             yield ProviderText(text=chunk)
-        yield ProviderDone(stop_reason="end_turn", input_tokens=3, output_tokens=2)
+        yield ProviderDone(
+            stop_reason="end_turn", input_tokens=3, output_tokens=2,
+            provider_replay=_native_state() if self.native_replay else None,
+        )
 
     async def list_models(self) -> list[ModelInfo]:
         return []
@@ -70,7 +75,10 @@ class _ToolBoundaryProvider(_ScriptedProvider):
 
     async def _tool_stream(self, call_index: int) -> AsyncIterator[Any]:
         if call_index == 0:
-            first_text = "NO_REPLY" if self.marker_position == "before" else "Visible body."
+            first_text = (
+                "" if self.marker_position == "only" else
+                "NO_REPLY" if self.marker_position == "before" else "Visible body."
+            )
             yield ProviderText(text=first_text)
             yield ProviderToolUseStart(tool_use_id="tool-1", tool_name="lookup")
             yield ProviderToolUseEnd(
@@ -78,7 +86,10 @@ class _ToolBoundaryProvider(_ScriptedProvider):
                 tool_name="lookup",
                 arguments={},
             )
-            yield ProviderDone(stop_reason="tool_use", input_tokens=3, output_tokens=2)
+            yield ProviderDone(
+                stop_reason="tool_use", input_tokens=3, output_tokens=2,
+                provider_replay=_native_state() if self.marker_position == "only" else None,
+            )
             return
 
         final_text = "Visible body." if self.marker_position == "before" else "NO_REPLY"
@@ -108,13 +119,20 @@ class _ProviderSelector:
         return _SelectorClone(self.provider)
 
 
-async def _runtime_stack(tmp_path, scripts: list[list[str]]):
+def _native_state() -> ProviderReplayState:
+    return ProviderReplayState(
+        protocol="openai_chat_completions", source="synthetic-silent-origin", model="test/model",
+        reasoning_details=[{"type": "reasoning.encrypted", "data": "synthetic-native-state"}],
+    )
+
+
+async def _runtime_stack(tmp_path, scripts: list[list[str]], *, native_replay: bool = False):
     storage = SessionStorage(":memory:")
     await storage.connect()
     manager = SessionManager(storage)
     session_key = "agent:main:webchat:silent-reply-runtime"
     await manager.create(session_key)
-    provider = _ScriptedProvider(scripts)
+    provider = _ScriptedProvider(scripts, native_replay=native_replay)
     runner = TurnRunner(
         provider_selector=_ProviderSelector(provider),
         tool_registry=ToolRegistry(),
@@ -166,6 +184,7 @@ async def _tool_boundary_runtime_stack(tmp_path, marker_position: str):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("native_replay", [False, True])
 @pytest.mark.parametrize(
     ("chunks", "run_kind", "expected_text", "expected_reason"),
     [
@@ -186,10 +205,12 @@ async def test_system_event_runtime_emits_only_canonical_terminal_text(
     run_kind: str,
     expected_text: str,
     expected_reason: str | None,
+    native_replay: bool,
 ) -> None:
     storage, manager, _provider, runner, context, session_key = await _runtime_stack(
         tmp_path,
         [chunks],
+        native_replay=native_replay,
     )
     try:
         events = [
@@ -311,6 +332,7 @@ async def test_human_mixed_sentinel_runtime_remains_visible(tmp_path) -> None:
     [
         ("before", ["tool_use", "tool_result", "text"]),
         ("after", ["text", "tool_use", "tool_result"]),
+        ("only", ["tool_use", "tool_result"]),
     ],
 )
 async def test_tool_boundary_marker_live_done_and_transcript_are_identical(
@@ -336,14 +358,14 @@ async def test_tool_boundary_marker_live_done_and_transcript_are_identical(
             )
         ]
 
-        visible_text = "Visible body."
+        visible_text = "" if marker_position == "only" else "Visible body."
         assert [
             event.text for event in events if isinstance(event, TextDeltaEvent)
-        ] == [visible_text]
+        ] == ([visible_text] if visible_text else [])
         done = next(event for event in events if isinstance(event, DoneEvent))
         assert done.text == visible_text
         assert done.text_snapshot == visible_text
-        assert done.delivery == "visible"
+        assert done.delivery == ("visible" if visible_text else "suppressed")
 
         transcript = await manager.get_transcript(session_key)
         assistants = [entry for entry in transcript if entry.role == "assistant"]
@@ -354,6 +376,12 @@ async def test_tool_boundary_marker_live_done_and_transcript_are_identical(
             expected_segment_types
         )
         assert "NO_REPLY" not in str(assistant.tool_calls)
+        if marker_position == "only":
+            from opensquilla.engine.history import decode_assistant_replay
+
+            replay = decode_assistant_replay(assistant.assistant_replay)
+            assert replay[0].provider_replay == _native_state()
+            assert any("tool_result" in str(message.content) for message in replay)
     finally:
         await storage.close()
 

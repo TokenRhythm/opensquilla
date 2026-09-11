@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from enum import StrEnum
 from typing import TYPE_CHECKING, Any, Literal
 
@@ -385,10 +385,24 @@ class DoneEvent:
     router_model_call_id: str = ""
     router_iteration: int = 0
 
+    # Internal continuation state; never part of public event payloads.
+    assistant_replay: dict[str, Any] | None = field(
+        default=None, repr=False, metadata={"private": True}
+    )
+
     @property
     def upstream_cost_usd(self) -> float:
         """Backward-compatible alias for earlier OpenRouter cost consumers."""
         return self.billed_cost
+
+
+def public_agent_event_payload(event: Any) -> dict[str, Any]:
+    """Serialize an event without copying private provider continuation state."""
+    if isinstance(event, DoneEvent):
+        payload = asdict(replace(event, assistant_replay=None))
+        payload.pop("assistant_replay", None)
+        return payload
+    return asdict(event)
 
 
 def done_text_snapshot(event_or_mapping: object) -> tuple[bool, str]:

@@ -68,6 +68,7 @@ from opensquilla.engine.finalize_evidence_gate import (
 )
 from opensquilla.engine.history import (
     limit_turns,
+    project_incomplete_tool_history,
     reconstruct_messages_from_entry,
     repair_tool_pairing,
 )
@@ -80,6 +81,7 @@ from opensquilla.engine.repetition_guard import (
     close_async_iterator_bounded,
     guard_provider_text_stream,
 )
+from opensquilla.engine.replay_compat import rebase_incomplete_reasoning_history
 from opensquilla.engine.runtime_diagnostics import RuntimeDiagnosticsObserver
 from opensquilla.engine.runtime_events import append_runtime_event
 from opensquilla.engine.runtime_recovery import (
@@ -175,7 +177,6 @@ from opensquilla.provider.image_projection import (
 from opensquilla.provider.image_projection import (
     count_image_blocks as count_projected_image_blocks,
 )
-from opensquilla.provider.model_identity import is_deepseek_v4_model_id
 from opensquilla.provider.protocol import (
     count_provider_image_blocks,
     project_provider_final_request,
@@ -194,6 +195,7 @@ from opensquilla.provider.types import (
     ProviderFinalRequestProjection,
     ProviderMessageCountProjection,
     ProviderMessageLimitProof,
+    ProviderReplayState,
     ProviderRequestCorrelation,
     derive_provider_request_correlation,
 )
@@ -1796,13 +1798,67 @@ def _message_has_tool_use(message: Message) -> bool:
     return any(isinstance(block, ContentBlockToolUse) for block in message.content)
 
 
+def _assistant_replay_tail(messages: list[Message], start: int) -> list[Message]:
+    """Return accepted assistant messages and their subsequent current-turn results."""
+    tail = messages[start:]
+    first = next((i for i, item in enumerate(tail) if item.role == "assistant"), len(tail))
+    return tail[first:]
+
+
+def _native_assistant_content(
+    provider_replay: ProviderReplayState | None,
+    *,
+    response_text: str,
+    tool_calls: list[ToolCall],
+) -> list[Any] | None:
+    """Retain captured block order only for the response the engine accepted."""
+    if (
+        provider_replay is None
+        or provider_replay.protocol != "anthropic_messages"
+        or provider_replay.native_content is None
+    ):
+        return None
+    try:
+        content = Message.model_validate(
+            {"role": "assistant", "content": provider_replay.native_content},
+        ).content
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(content, list):
+        return None
+    # Recovery can replace visible text or remove unexecuted tools. Raw state
+    # must not restore either; the adapter also checks the eventual request view.
+    if "".join(block.text for block in content if isinstance(block, ContentBlockText)) != (
+        response_text
+    ):
+        return None
+    captured_tools = [block for block in content if isinstance(block, ContentBlockToolUse)]
+    accepted_tools = [
+        ContentBlockToolUse(id=tc.tool_use_id, name=tc.tool_name, input=tc.arguments)
+        for tc in tool_calls
+    ]
+    captured_json = json.dumps(
+        [block.model_dump(mode="json") for block in captured_tools], sort_keys=True,
+    )
+    accepted_json = json.dumps(
+        [block.model_dump(mode="json") for block in accepted_tools], sort_keys=True,
+    )
+    return content if captured_json == accepted_json else None
+
+
 def _build_reasoning_prefill_message(
     *,
     reasoning_content: str,
     thinking_signature: str | None,
+    provider_replay: ProviderReplayState | None = None,
 ) -> Message:
+    native_content = _native_assistant_content(
+        provider_replay, response_text="", tool_calls=[],
+    )
     content: list[Any] = []
-    if thinking_signature:
+    if native_content is not None:
+        content = native_content
+    elif thinking_signature:
         content.append(
             ContentBlockThinking(
                 thinking=reasoning_content,
@@ -1815,6 +1871,7 @@ def _build_reasoning_prefill_message(
         role="assistant",
         content=content,
         reasoning_content=reasoning_content,
+        provider_replay=provider_replay,
     )
 
 
@@ -1854,11 +1911,23 @@ def _append_length_capped_continuation(
     *,
     response_text: str,
     tool_calls: list[ToolCall],
+    reasoning_content: str | None = None,
+    provider_replay: ProviderReplayState | None = None,
 ) -> str:
     visible_text = response_text
     if visible_text:
+        native_content = _native_assistant_content(
+            provider_replay, response_text=visible_text, tool_calls=[],
+        )
         turn_messages.append(
-            Message(role="assistant", content=[ContentBlockText(text=visible_text)])
+            Message(
+                role="assistant",
+                content=(
+                    native_content if native_content is not None
+                    else [ContentBlockText(text=visible_text)]
+                ),
+                reasoning_content=reasoning_content, provider_replay=provider_replay,
+            )
         )
     turn_messages.append(Message(role="user", content=_PROVIDER_OUTPUT_CONTINUE_PROMPT))
     return visible_text
@@ -2569,6 +2638,7 @@ class Agent:
 
         self._state: AgentState = AgentState.IDLE
         self._history: list[Message] = []
+        self._active_replay_view: Callable[[], tuple[list[Message], int]] | None = None
         self._request_image_context: list[Message] = []
         self._context: ContextAssembly | None = None
         # Typed dependency surface. Either constructor injection or legacy
@@ -3052,8 +3122,6 @@ class Agent:
         active_user_in_history: bool,
         bound_user_message_id: str | None,
         active_user_message: str,
-        consumer_model_id: str | None = None,
-        consumer_model_capabilities: ModelCapabilities | None = None,
     ) -> list[Message] | None:
         """Rebuild the candidate's provider-visible durable history."""
 
@@ -3092,6 +3160,7 @@ class Agent:
                     entry.get("content") or "",
                     entry.get("tool_calls"),
                     entry.get("reasoning_content"),
+                    assistant_replay=entry.get("assistant_replay"),
                     turn_context=(
                         entry.get("turn_context")
                         if isinstance(entry.get("turn_context"), dict)
@@ -3101,26 +3170,7 @@ class Agent:
             )
 
         thinking_enabled, _thinking_budget = self.config.resolve_thinking(active_user_message)
-        effective_capabilities = (
-            consumer_model_capabilities
-            if consumer_model_capabilities is not None
-            else self.config.model_capabilities
-        )
-        effective_model_id = consumer_model_id or self.config.model_id
-        caps_reasoning_format = (
-            getattr(effective_capabilities, "reasoning_format", "")
-            if effective_capabilities is not None
-            else ""
-        )
-        preserve_reasoning_content = bool(
-            is_deepseek_v4_model_id(effective_model_id)
-            or (
-                thinking_enabled
-                and caps_reasoning_format == "deepseek"
-                and _is_deepseek_model_id(effective_model_id)
-            )
-            or (thinking_enabled and caps_reasoning_format == "dashscope")
-        )
+        preserve_reasoning_content = True
         history, _sanitize_result = sanitize_session_messages(history)
         history, _projection_result = project_historical_tool_payloads(
             history,
@@ -3152,16 +3202,12 @@ class Agent:
         bound_user_message_id: str | None,
         attachment_messages: list[Message] | None,
         runtime_context_message: Message,
-        consumer_model_id: str | None = None,
-        consumer_model_capabilities: ModelCapabilities | None = None,
     ) -> list[Message] | None:
         history = self._history_messages_for_compaction_admission(
             kept_entries,
             active_user_in_history=active_user_in_history,
             bound_user_message_id=bound_user_message_id,
             active_user_message=active_user_message,
-            consumer_model_id=consumer_model_id,
-            consumer_model_capabilities=consumer_model_capabilities,
         )
         if history is None:
             return None
@@ -3229,8 +3275,6 @@ class Agent:
             bound_user_message_id=bound_user_message_id,
             attachment_messages=attachment_messages,
             runtime_context_message=runtime_context_message,
-            consumer_model_id=consumer_model_id,
-            consumer_model_capabilities=consumer_model_capabilities,
         )
         if request_messages is None:
             return None
@@ -4184,11 +4228,7 @@ class Agent:
                 message_changed = True
                 changed = True
             restored.append(
-                Message(
-                    role=message.role,
-                    content=next_content,
-                    reasoning_content=getattr(message, "reasoning_content", None),
-                )
+                message.model_copy(update={"content": next_content})
                 if message_changed
                 else message
             )
@@ -4500,11 +4540,7 @@ class Agent:
                 compacted_messages.append(message)
                 continue
             compacted_messages.append(
-                Message(
-                    role=message.role,
-                    content=next_content,
-                    reasoning_content=getattr(message, "reasoning_content", None),
-                )
+                message.model_copy(update={"content": next_content})
             )
 
         before_tokens = sum(
@@ -4700,11 +4736,7 @@ class Agent:
                 compacted_messages.append(message)
                 continue
             compacted_messages.append(
-                Message(
-                    role=message.role,
-                    content=next_content,
-                    reasoning_content=getattr(message, "reasoning_content", None),
-                )
+                message.model_copy(update={"content": next_content})
             )
 
         self.config.metadata["tool_provider_guard_projection_applied"] = True
@@ -4893,11 +4925,7 @@ class Agent:
             if not next_content:
                 continue
             sanitized_messages.append(
-                Message(
-                    role=message.role,
-                    content=next_content,
-                    reasoning_content=getattr(message, "reasoning_content", None),
-                )
+                message.model_copy(update={"content": next_content})
             )
 
         if record:
@@ -5615,6 +5643,30 @@ class Agent:
 
         return list(self._history)
 
+    def current_assistant_replay(self) -> dict[str, Any] | None:
+        """Snapshot accepted current-turn messages for cancellation persistence."""
+        view: Callable[[], tuple[list[Message], int]] | None = getattr(
+            self, "_active_replay_view", None
+        )
+        if view is None:
+            return None
+        messages, start = view()
+        tail = _assistant_replay_tail(messages, start)
+        if not tail:
+            return None
+        return {"version": 1, "messages": [item.model_dump(mode="json") for item in tail]}
+
+    def _freeze_current_replay_view(self) -> None:
+        """Release the live turn's history cells while keeping its accepted tail."""
+        view: Callable[[], tuple[list[Message], int]] | None = getattr(
+            self, "_active_replay_view", None
+        )
+        if view is None:
+            return
+        messages, start = view()
+        tail = _assistant_replay_tail(messages, start)
+        self._active_replay_view = (lambda: (tail, 0)) if tail else None
+
     def prompt_cache_keepalive_candidate(self) -> PromptCacheKeepaliveCandidate | None:
         """Return the last successful call's stable-prefix candidate, if any."""
 
@@ -5771,6 +5823,7 @@ class Agent:
                 ):
                     yield event
         finally:
+            self._freeze_current_replay_view()
             self._image_analysis_provider_wrapper = None
             for image_context, previous in image_context_bindings:
                 image_context.image_analysis_target = previous
@@ -5833,6 +5886,8 @@ class Agent:
         pending_input_provider: PendingInputProvider | None = None,
     ) -> AsyncIterator[AgentEvent]:
         """Async generator that drives the state machine."""
+        self._active_replay_view = None
+        self.config.metadata.pop("reasoning_replay_context_rebuilt", None)
         self._provider_tool_result_overrides = {}
         self._current_turn_message = message
         _meta_invoke_turn_count.set(0)
@@ -5979,23 +6034,9 @@ class Agent:
 
         # Preprocess history for the provider request view. This does not
         # mutate persisted transcript rows or tool result content.
-        # Some reasoning tool-call providers require the prior assistant
-        # tool-call message to carry its reasoning_content while reasoning is
-        # enabled, so keep that narrow field only for tool-call history.
-        caps_reasoning_format = (
-            getattr(self.config.model_capabilities, "reasoning_format", "")
-            if self.config.model_capabilities is not None
-            else ""
-        )
-        preserve_reasoning_content = bool(
-            is_deepseek_v4_model_id(self.config.model_id)
-            or (
-                thinking_enabled
-                and caps_reasoning_format == "deepseek"
-                and _is_deepseek_model_id(self.config.model_id)
-            )
-            or (thinking_enabled and caps_reasoning_format == "dashscope")
-        )
+        # Preserve source reasoning and opaque continuation state in canonical
+        # history. The target provider owns request-specific replay projection.
+        preserve_reasoning_content = True
         loaded_history = list(self._history)
         self._write_context_stage("session:loaded", loaded_history)
         sanitized_history, sanitize_result = sanitize_session_messages(loaded_history)
@@ -6059,6 +6100,9 @@ class Agent:
         # Skills context, multimodal inputs, and the active user request all
         # belong to the protected current turn.
         current_turn_start_index = len(turn_messages)
+        # Capture the cells, not a particular list: compaction can replace the
+        # canonical list and its protected boundary inside a provider retry.
+        self._active_replay_view = lambda: (turn_messages, current_turn_start_index)
         # A one-turn-lag prefix is intentional: every message in this slice was
         # already provider input before this turn.  The newly generated
         # assistant response was not, so including it would claim a cache
@@ -6262,6 +6306,7 @@ class Agent:
         router_model_call_id = ""
         router_iteration = 0
         final_reasoning_parts: list[str] = []
+        replay_boundary_notified = False
         goal_terminal_final_response_pending = False
         goal_terminal_final_status: str | None = None
         max_iterations_finalization_attempted = False
@@ -7091,6 +7136,7 @@ class Agent:
                 iter_reasoning_tokens = 0
                 iter_reasoning_content: str | None = None
                 iter_thinking_signature: str | None = None
+                iter_provider_replay = None
                 provider_error: ProviderErrorEvent | None = None
 
                 _retry_attempt = 0
@@ -7136,6 +7182,7 @@ class Agent:
                     iter_reasoning_tokens = 0
                     iter_reasoning_content = None
                     iter_thinking_signature = None
+                    iter_provider_replay = None
                     _got_error = False
                     _stream_policy_preempt = False
                     provider_done_for_log: ProviderDoneEvent | None = None
@@ -7628,6 +7675,32 @@ class Agent:
                                 "provider_request_correlation": (self._provider_request_correlation)
                             }
                         )
+                    requires_replay = getattr(
+                        self.provider, "requires_complete_reasoning_history", None
+                    )
+                    replay_compatible = getattr(self.provider, "can_replay_reasoning", None)
+                    if (
+                        callable(requires_replay)
+                        and callable(replay_compatible)
+                        and requires_replay(
+                            tools=provider_tools_for_call, thinking=call_chat_cfg.thinking
+                        ) is True
+                    ):
+                        request_messages, replay_rebased = rebase_incomplete_reasoning_history(
+                            request_messages, compatible=replay_compatible
+                        )
+                        # Preserve canonical replay for selector fallbacks: each physical
+                        # provider leg projects its own compatible request view.
+                        if replay_rebased and not replay_boundary_notified:
+                            replay_boundary_notified = True
+                            yield WarningEvent(
+                                code="reasoning_replay_context_rebuilt",
+                                message=(
+                                    "Historical reasoning is unavailable for this interface. "
+                                    "Continuing with recorded conversation and tool results "
+                                    "in a new model context."
+                                ),
+                            )
                     active_user_message_index = _active_user_message_index_for_request(
                         request_messages,
                         current_user_text=self._current_turn_message or "",
@@ -7959,6 +8032,7 @@ class Agent:
                                 iter_reasoning_content = None
                                 iter_reasoning_tokens = 0
                                 iter_thinking_signature = None
+                                iter_provider_replay = None
                                 reasoning_started_at_ms = 0
                                 attempt_user_visible_emitted = False
                                 text_presentation_decided = False
@@ -8639,6 +8713,21 @@ class Agent:
                                 iter_reasoning_tokens = raw_ev.reasoning_tokens
                                 iter_reasoning_content = raw_ev.reasoning_content
                                 iter_thinking_signature = raw_ev.thinking_signature
+                                iter_provider_replay = raw_ev.provider_replay
+                                if (
+                                    self.config.metadata.get("reasoning_replay_context_rebuilt")
+                                    and not replay_boundary_notified
+                                ):
+                                    replay_boundary_notified = True
+                                    yield WarningEvent(
+                                        code="reasoning_replay_context_rebuilt",
+                                        message=(
+                                            "Historical reasoning is unavailable for this "
+                                            "interface. Continuing with recorded conversation "
+                                            "and tool results "
+                                            "in a new model context."
+                                        ),
+                                    )
                                 total_billed_cost += raw_ev.billed_cost
                                 total_input_tokens += raw_ev.input_tokens
                                 total_output_tokens += raw_ev.output_tokens
@@ -9431,6 +9520,7 @@ class Agent:
                                 _build_reasoning_prefill_message(
                                     reasoning_content=iter_reasoning_content,
                                     thinking_signature=iter_thinking_signature,
+                                    provider_replay=iter_provider_replay,
                                 )
                             )
                             runtime_recovery_scaffolding_pending = True
@@ -9979,6 +10069,8 @@ class Agent:
                                 turn_messages,
                                 response_text=response_text,
                                 tool_calls=tool_calls,
+                                reasoning_content=iter_reasoning_content,
+                                provider_replay=iter_provider_replay,
                             )
                             if visible_text:
                                 final_text_parts.append(visible_text)
@@ -11571,6 +11663,7 @@ class Agent:
                                 role="assistant",
                                 content=assistant_content,
                                 reasoning_content=iter_reasoning_content,
+                                provider_replay=iter_provider_replay,
                             )
                         )
                     turn_messages.append(
@@ -11615,12 +11708,18 @@ class Agent:
                             input=tc.arguments,
                         )
                     )
+                native_content = _native_assistant_content(
+                    iter_provider_replay, response_text=visible_text, tool_calls=tool_calls,
+                )
+                if native_content is not None:
+                    assistant_content = native_content
                 if assistant_content:
                     turn_messages.append(
                         Message(
                             role="assistant",
                             content=assistant_content,
                             reasoning_content=iter_reasoning_content,
+                            provider_replay=iter_provider_replay,
                         )
                     )
 
@@ -11940,7 +12039,12 @@ class Agent:
                     _get_tool_concurrency_policy,
                 )
 
-                tool_result_blocks: list[Any] = []
+                # Attach a live result container before dispatch. A completed
+                # tool must survive cancellation or a budget exit before the
+                # whole batch reaches its public delivery loop.
+                replay_result_message = Message(role="user", content=[])
+                turn_messages.append(replay_result_message)
+                recorded_result_blocks: dict[str, list[Any]] = {}
                 executed_results: list[ToolResult] = []
                 turn_yielded = False
 
@@ -11950,6 +12054,47 @@ class Agent:
                 path_patch_snapshots_by_id: dict[str, ToolCall] = {}
                 tool_effect_observations_by_id: dict[str, tuple[int, int, int]] = {}
                 tool_cancellation_grace_by_id: dict[str, float] = {}
+
+                def _tool_result_images(
+                    tool_use_id: str, *, consume: bool = False
+                ) -> list[ContentBlockImage]:
+                    media_context = self._tool_context or current_tool_context.get()
+                    media_by_call = getattr(media_context, "tool_result_media", None)
+                    if not isinstance(media_by_call, dict):
+                        return []
+                    raw_media = (
+                        media_by_call.pop(tool_use_id, []) if consume
+                        else media_by_call.get(tool_use_id, [])
+                    )
+                    images: list[ContentBlockImage] = []
+                    if isinstance(raw_media, list):
+                        for item in raw_media[:1]:
+                            if not isinstance(item, dict):
+                                continue
+                            data = item.get("data")
+                            if (
+                                item.get("mime") == "image/png" and isinstance(data, str)
+                                and 1 <= len(data) <= 16 * 1024 * 1024
+                            ):
+                                images.append(ContentBlockImage(media_type="image/png", data=data))
+                    return images
+
+                def _record_completed_tool_result(
+                    result: ToolResult, *, images: list[ContentBlockImage] | None = None
+                ) -> None:
+                    recorded_result_blocks[result.tool_use_id] = [
+                        ContentBlockToolResult(
+                            tool_use_id=result.tool_use_id, content=result.content,
+                            is_error=result.is_error, execution_status=result.execution_status,
+                        ),
+                        *(_tool_result_images(result.tool_use_id) if images is None else images),
+                    ]
+                    # Completion order may differ from provider call order.
+                    # Only recorded results appear; missing outcomes stay absent.
+                    replay_result_message.content = [
+                        block for call in tool_calls
+                        for block in recorded_result_blocks.get(call.tool_use_id, ())
+                    ]
 
                 def _cap_timeout_by_deadlines(timeout: float) -> float:
                     remaining = min(timeout, max(0.0, tool_deadline - _loop.time()))
@@ -12096,6 +12241,13 @@ class Agent:
                                         STOP_CANCEL_GRACE_SECONDS,
                                     ),
                                 )
+                            if execution_task is not None and execution_task.done():
+                                try:
+                                    settled_result = execution_task.result()
+                                except (asyncio.CancelledError, Exception):
+                                    pass
+                                else:
+                                    _record_completed_tool_result(settled_result)
                             raise
                         except TimeoutError:
                             # A TimeoutError raised by the tool itself remains a
@@ -12155,6 +12307,7 @@ class Agent:
                         is_error=res.is_error,
                         duration_ms=duration_ms,
                     )
+                    _record_completed_tool_result(res)
                     return res
 
                 async def _collect_tool_tasks(
@@ -12265,6 +12418,7 @@ class Agent:
                                         ),
                                     )
                                 results_by_id[tc.tool_use_id] = outcome
+                                _record_completed_tool_result(outcome)
                     except (asyncio.CancelledError, GeneratorExit):
                         cleanup_grace_seconds = STOP_CANCEL_GRACE_SECONDS
                         raise
@@ -12305,6 +12459,8 @@ class Agent:
                                             "ended."
                                         ),
                                     )
+                            for result in results_by_id.values():
+                                _record_completed_tool_result(result)
 
                 # Dispatch preserving original order: accumulate consecutive
                 # concurrent/keyed tools into a batch and flush before each
@@ -12418,9 +12574,11 @@ class Agent:
                             tc,
                             dispatch_boundary,
                         )
+                        _record_completed_tool_result(results_by_id[tc.tool_use_id])
                         continue
                     if plan_run_delivery_only and tc.tool_name != "publish_artifact":
                         results_by_id[tc.tool_use_id] = _not_executed_during_plan_delivery(tc)
+                        _record_completed_tool_result(results_by_id[tc.tool_use_id])
                         continue
                     if attached_plan_run_id and tc.tool_name == "submit":
                         results_by_id[tc.tool_use_id] = ToolResult(
@@ -12439,6 +12597,7 @@ class Agent:
                                 reason="plan_run_checkpoint_required",
                             ),
                         )
+                        _record_completed_tool_result(results_by_id[tc.tool_use_id])
                         continue
                     if tc.tool_name == "meta_invoke":
                         async for event in _flush_parallel_batch(parallel_batch):
@@ -12450,6 +12609,7 @@ class Agent:
                         async for ev in self._run_one_streaming(tc, active_ctx):
                             if isinstance(ev, ToolResult):
                                 results_by_id[tc.tool_use_id] = ev
+                                _record_completed_tool_result(ev)
                             else:
                                 yield ev
                         meta_result = results_by_id.get(tc.tool_use_id)
@@ -12510,6 +12670,7 @@ class Agent:
                 # Emit results in original tool_calls order.
                 for tc in tool_calls:
                     result = results_by_id[tc.tool_use_id]
+                    _record_completed_tool_result(result)
                     result_tool_call = tc
                     for artifact in result.artifacts:
                         yield ArtifactEvent(**_artifact_event_kwargs(artifact))
@@ -12517,6 +12678,7 @@ class Agent:
                         result,
                         tool_call=result_tool_call,
                     )
+                    _record_completed_tool_result(projected_result)
                     deferred_user_input_handled = False
                     pending_user_input = (
                         _pending_user_input_payload(result.content)
@@ -12593,10 +12755,12 @@ class Agent:
                             ),
                             is_error=False,
                         )
+                        _record_completed_tool_result(result)
                         projected_result = await self._project_tool_result_for_delivery(
                             result,
                             tool_call=tc,
                         )
+                        _record_completed_tool_result(projected_result)
                         yield ToolResultEvent(
                             tool_use_id=projected_result.tool_use_id,
                             tool_name=projected_result.tool_name,
@@ -12706,10 +12870,12 @@ class Agent:
                                     is_error=False,
                                     terminates_turn=explicit_human_denial,
                                 )
+                                _record_completed_tool_result(result)
                                 projected_result = await self._project_tool_result_for_delivery(
                                     result,
                                     tool_call=tc,
                                 )
+                                _record_completed_tool_result(projected_result)
                                 yield ToolResultEvent(
                                     tool_use_id=projected_result.tool_use_id,
                                     tool_name=projected_result.tool_name,
@@ -12733,10 +12899,12 @@ class Agent:
                             result_tool_call = resumed_call
                             for artifact in result.artifacts:
                                 yield ArtifactEvent(**_artifact_event_kwargs(artifact))
+                            _record_completed_tool_result(result)
                             projected_result = await self._project_tool_result_for_delivery(
                                 result,
                                 tool_call=result_tool_call,
                             )
+                            _record_completed_tool_result(projected_result)
                             pending_approval = _pending_approval_payload(result.content)
                             if pending_approval is None:
                                 yield ToolResultEvent(
@@ -12780,55 +12948,11 @@ class Agent:
                         or result.terminates_turn
                     ):
                         turn_yielded = True
-                    # Promote only the turn-local image produced for this
-                    # exact tool call. Keep capture metadata distinct from
-                    # whether this provider request can receive image input.
-                    media_context = self._tool_context or current_tool_context.get()
-                    media_by_call = (
-                        getattr(media_context, "tool_result_media", None)
-                        if media_context is not None
-                        else None
+                    # Preserve authenticated media as typed blocks. Physical
+                    # provider projection decides whether to send bytes or markers.
+                    _record_completed_tool_result(
+                        projected_result, images=_tool_result_images(tc.tool_use_id, consume=True)
                     )
-                    raw_media = (
-                        media_by_call.pop(tc.tool_use_id, [])
-                        if isinstance(media_by_call, dict)
-                        else []
-                    )
-                    image_blocks: list[ContentBlockImage] = []
-                    # Keep authenticated tool media in the logical turn for a
-                    # possible later vision-capable request.  The shared
-                    # physical-call projection, not tool execution, decides
-                    # whether this exact deployment receives image bytes or a
-                    # truthful marker.
-                    if isinstance(raw_media, list):
-                        for item in raw_media[:1]:
-                            if not isinstance(item, dict):
-                                continue
-                            mime = item.get("mime")
-                            data = item.get("data")
-                            if mime != "image/png" or not isinstance(data, str):
-                                continue
-                            # The bridge already enforces the byte limit; keep
-                            # a second encoded-size guard at this boundary so
-                            # a compromised test double cannot inflate context.
-                            if not 1 <= len(data) <= 16 * 1024 * 1024:
-                                continue
-                            image_blocks.append(
-                                ContentBlockImage(
-                                    media_type="image/png",
-                                    data=data,
-                                )
-                            )
-                    provider_result_content = projected_result.content
-                    tool_result_blocks.append(
-                        ContentBlockToolResult(
-                            tool_use_id=projected_result.tool_use_id,
-                            content=provider_result_content,
-                            is_error=projected_result.is_error,
-                            execution_status=projected_result.execution_status,
-                        )
-                    )
-                    tool_result_blocks.extend(image_blocks)
 
                 accepted_goal_terminal_status = (
                     self._accepted_goal_terminal_status(tool_calls, executed_results)
@@ -13173,10 +13297,7 @@ class Agent:
                     yield terminal_error
                     break
 
-                # Feed tool results back as user message
-                turn_messages.append(
-                    Message(role="user", content=tool_result_blocks)  # type: ignore[arg-type]
-                )
+                # Completed results are already in the canonical user message.
                 if accepted_goal_terminal_status is not None:
                     last_executed_results = list(executed_results)
                     if turn_yielded:
@@ -13240,7 +13361,10 @@ class Agent:
                 for index, projected_message in enumerate(initial_provider_history)
             ):
                 turn_messages[: len(history)] = canonical_history
-            self._history = list(turn_messages)
+            self._history = [
+                *turn_messages[:current_turn_start_index],
+                *project_incomplete_tool_history(turn_messages[current_turn_start_index:]),
+            ]
             self._write_context_stage("session:after", self._history)
 
         # ------ → DONE ------
@@ -13574,10 +13698,6 @@ class Agent:
                 *turn_model_usage_breakdown,
             ]
         )
-        # ``run_turn`` rejects an uncommitted candidate in its outer finally,
-        # which runs after this generator has emitted DoneEvent.  Normalize the
-        # public outcome first so a candidate that the model abandoned or that
-        # hit a global guard cannot be rendered as a successful/staged update.
         has_usage = bool(
             done_input_tokens
             or done_output_tokens
@@ -13589,7 +13709,8 @@ class Agent:
             or missing_cost_entries
             or total_provider_billed_entries
         )
-        if terminal_error is None or has_usage:
+        replay_messages = _assistant_replay_tail(turn_messages, current_turn_start_index)
+        if terminal_error is None or has_usage or replay_messages:
             final_text = "".join(final_text_parts)
             total_codepoints = len(final_text)
             model_call_segments = [
@@ -13605,6 +13726,13 @@ class Agent:
             ]
             done_event = DoneEvent(
                 text=final_text,
+                assistant_replay=(
+                    {
+                        "version": 1,
+                        "messages": [item.model_dump(mode="json") for item in replay_messages],
+                    }
+                    if replay_messages else None
+                ),
                 input_tokens=done_input_tokens,
                 output_tokens=done_output_tokens,
                 reasoning_tokens=done_reasoning_tokens,
@@ -16101,11 +16229,7 @@ class Agent:
                 blocks.append(block)
             if message_changed:
                 projected.append(
-                    Message(
-                        role=message.role,
-                        content=blocks,
-                        reasoning_content=message.reasoning_content,
-                    )
+                    message.model_copy(update={"content": blocks})
                 )
                 changed = True
             else:
@@ -16247,19 +16371,13 @@ class Agent:
         if not isinstance(runtime_content, str):
             return runtime_context_message
         if isinstance(message.content, str):
-            return Message(
-                role=message.role,
-                content=f"{message.content}\n\n{runtime_content}",
-                reasoning_content=message.reasoning_content,
-            )
+            return message.model_copy(update={"content": f"{message.content}\n\n{runtime_content}"})
         if isinstance(message.content, list):
-            return Message(
-                role=message.role,
-                content=[
+            return message.model_copy(
+                update={"content": [
                     *message.content,
                     ContentBlockText(text=f"\n\n{runtime_content}"),
-                ],
-                reasoning_content=message.reasoning_content,
+                ]},
             )
         return runtime_context_message
 
@@ -17347,11 +17465,7 @@ class Agent:
             if not next_content:
                 continue
             stripped_messages.append(
-                Message(
-                    role=message.role,
-                    content=next_content,
-                    reasoning_content=getattr(message, "reasoning_content", None),
-                )
+                message.model_copy(update={"content": next_content})
             )
 
         if stripped_blocks and stripped_messages and stripped_messages[-1].role == "assistant":
@@ -17419,11 +17533,7 @@ class Agent:
                 next_content.append(block)
             if changed:
                 projected_messages.append(
-                    Message(
-                        role=message.role,
-                        content=next_content,
-                        reasoning_content=getattr(message, "reasoning_content", None),
-                    )
+                    message.model_copy(update={"content": next_content})
                 )
             else:
                 projected_messages.append(message)

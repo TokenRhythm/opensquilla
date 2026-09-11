@@ -207,6 +207,7 @@ class TranscriptAppendPort(Protocol):
         reasoning_content: str | None,
         turn_usage: dict[str, Any] | None,
         token_count: int | None,
+        assistant_replay: dict[str, Any] | None = None,
         assistant_message_id: str | None = None,
         expected_session_id: str | None = None,
         expected_session_epoch: int | None = None,
@@ -718,7 +719,6 @@ class TurnFinalizerStage:
         # Late imports keep the module import-cycle-free.
         import json as _json
 
-        from opensquilla.engine.runtime import _is_deepseek_model_id
         from opensquilla.engine.silent_reply import (
             normalize_silent_reply,
             sanitize_silent_reply_segments,
@@ -804,7 +804,53 @@ class TurnFinalizerStage:
 
         # 2. Transcript append + 3. memory capture (paired -- memory
         # only fires if transcript persisted).
-        if final_text or turn_segments or inp.turn_artifacts:
+        has_visible_payload = bool(final_text or turn_segments or inp.turn_artifacts)
+        assistant_replay = getattr(done_event, "assistant_replay", None)
+        preserve_replay = assistant_replay is not None
+        if assistant_replay is not None and not has_visible_payload and (
+            normalization.suppressed or getattr(done_event, "delivery", None) == "suppressed"
+        ):
+            from opensquilla.engine.history import decode_assistant_replay
+            from opensquilla.provider.types import (
+                ContentBlockRedactedThinking,
+                ContentBlockText,
+                ContentBlockThinking,
+            )
+
+            # A pure control-token reply historically creates no assistant
+            # row. Native metadata alone does not turn that silent response
+            # into conversation history. Keep all other accepted chains,
+            # including tool outcomes and reasoning-only continuation calls.
+            preserve_replay = False
+            for message in decode_assistant_replay(assistant_replay):
+                replay_content = message.content
+                if message.role != "assistant" or (
+                    isinstance(replay_content, list)
+                    and any(
+                        not isinstance(
+                            block,
+                            ContentBlockText | ContentBlockThinking | ContentBlockRedactedThinking,
+                        )
+                        for block in replay_content
+                    )
+                ):
+                    preserve_replay = True
+                    break
+                replay_text = (
+                    replay_content if isinstance(replay_content, str) else "".join(
+                        block.text for block in replay_content
+                        if isinstance(block, ContentBlockText)
+                    )
+                )
+                if not normalize_silent_reply(
+                    replay_text,
+                    run_kind=inp.run_kind,
+                    input_mode=inp.input_mode,
+                    heartbeat_ack_max_chars=inp.heartbeat_ack_max_chars,
+                ).suppressed:
+                    preserve_replay = True
+                    break
+        if has_visible_payload or preserve_replay:
             persisted_content = (
                 _json.dumps(
                     {"text": final_text, "artifacts": inp.turn_artifacts},
@@ -814,13 +860,7 @@ class TurnFinalizerStage:
                 else final_text
             )
             reasoning_content: str | None = None
-            if (
-                done_event is not None
-                and done_event.reasoning_content
-                and _is_deepseek_model_id(
-                    done_event.model or inp.resolved_model or ""
-                )
-            ):
+            if done_event is not None and done_event.reasoning_content:
                 reasoning_content = done_event.reasoning_content
             token_count = None
             if done_event is not None:
@@ -846,6 +886,8 @@ class TurnFinalizerStage:
                 ),
                 "token_count": token_count,
             }
+            if assistant_replay is not None:
+                append_kwargs["assistant_replay"] = assistant_replay
             if inp.run_kind == "cron_turn":
                 provenance = {"kind": "cron", "source_session_key": inp.session_key}
                 if isinstance(inp.input_provenance, dict):
@@ -873,19 +915,19 @@ class TurnFinalizerStage:
                 transcript_appended = bool(append_result)
             if transcript_appended:
                 assistant_message_content = persisted_content
-                if inp.execution_context is not None:
+                if inp.execution_context is not None and has_visible_payload:
                     inp.execution_context.publish_visible(
                         text=persisted_content,
                         generation_epoch=inp.execution_context.generation_epoch,
                     )
-                elif inp.publication_ledger is not None:
+                elif inp.publication_ledger is not None and has_visible_payload:
                     next_sequence = inp.publication_ledger.last_sequence + 1
                     inp.publication_ledger.accept(
                         generation_epoch=inp.publication_ledger.generation_epoch,
                         sequence=next_sequence,
                         text=persisted_content,
                     )
-            if transcript_appended and not inp.no_memory_capture:
+            if transcript_appended and has_visible_payload and not inp.no_memory_capture:
                 try:
                     capture_kwargs: dict[str, Any] = {}
                     if (
