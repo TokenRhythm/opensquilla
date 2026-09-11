@@ -79,6 +79,7 @@ from opensquilla.session.models import (
 )
 from opensquilla.session.storage import SessionStorage
 from opensquilla.tools.visibility import guest_safe_tool_allowlist
+from tests.helpers.image_bytes import image_bytes
 
 _DEFAULT_PRINCIPAL = Principal(
     role="operator", scopes=frozenset(["operator.admin"]), is_owner=True, authenticated=True
@@ -4010,7 +4011,11 @@ class TestSessionsSend:
         self,
         dispatcher,
     ):
-        attachment = {"type": "image/png", "data": "aW1hZ2U=", "name": "image.png"}
+        attachment = {
+            "type": "image/png",
+            "data": base64.b64encode(image_bytes()).decode("ascii"),
+            "name": "image.png",
+        }
 
         web_session = FakeSession(
             session_key="agent:main:webchat:web-display",
