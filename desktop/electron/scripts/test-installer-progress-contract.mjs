@@ -24,7 +24,7 @@ const recoveryIncludeSource = await readFile(resolve(packageRoot, INSTALLER_RECO
 const recoveryHelperSource = await readFile(resolve(packageRoot, INSTALLER_RECOVERY_HELPER), 'utf8')
 const appBuilderLib = join(packageRoot, 'node_modules', 'app-builder-lib')
 const assistedInstallerSource = await readFile(join(appBuilderLib, 'templates', 'nsis', 'assistedInstaller.nsh'), 'utf8')
-const installSectionSource = await readFile(join(packageRoot, 'scripts', 'nsis', 'installSection-rollback.nsh'), 'utf8')
+const installSectionSource = await readFile(join(packageRoot, 'scripts', 'nsis', 'installSection.nsh'), 'utf8')
 
 assert.deepEqual(await verifyInstallerProgressPolicy(packageRoot, packageJson), [])
 assert.ok(customScriptSource.includes('installer-recovery.nsh'))
