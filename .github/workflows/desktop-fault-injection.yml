@@ -144,6 +144,7 @@ jobs:
             signed-sources.json
             ${{ runner.temp }}/reinstall-${{ matrix.install-mode }}/result.json
             ${{ runner.temp }}/reinstall-${{ matrix.install-mode }}/interruption.json
+            ${{ runner.temp }}/reinstall-${{ matrix.install-mode }}/*-launch.json*
             ${{ runner.temp }}/reinstall-${{ matrix.install-mode }}/appdata/OpenSquilla/logs/*.log
           retention-days: 14
 

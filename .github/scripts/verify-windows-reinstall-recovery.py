@@ -209,11 +209,9 @@ def main():
                 run([sys.executable, probe, 'verify', *profile_args])
             # Retained-session rendering and isolation are checked through the
             # installed Electron executable, alongside database contents.
-            run(['node', repo / 'desktop/electron/scripts/test-packaged-session-recovery.mjs',
+            run(['node', repo / 'desktop/electron/scripts/test-packaged-reinstall-retained.mjs',
                  '--executable', root / 'OpenSquilla.exe', '--user-data-dir', user_data,
-                 '--session-key', 'agent:main:webchat:release-recovery-long-session',
-                 '--switch-session-key', 'agent:main:webchat:release-recovery-switch-session',
-                 '--label', 'reinstall-retained'], timeout=600)
+                 '--output', evidence / f'{label}-launch.json'], timeout=600)
             run([sys.executable, probe, 'verify', *profile_args])
             stages[f'{label}LaunchAndRetainedData'] = True
         uninstaller = next(root.glob('Uninstall*.exe'))
