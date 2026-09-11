@@ -12,7 +12,7 @@ import sys
 from collections import Counter
 from collections.abc import AsyncIterator, Iterator, Mapping
 from copy import deepcopy
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from typing import Any, cast
 from urllib.parse import urlparse
@@ -251,7 +251,7 @@ def _is_inert_post_terminal_stream_frame(
         return False
 
     if not raw_choices:
-        return has_usage
+        return has_usage or policy.allow_post_terminal_empty_choices
     if not policy.allow_post_terminal_noop_choice or len(raw_choices) != 1:
         return False
 
@@ -3166,7 +3166,13 @@ class OpenAIProvider:
         # DashScope or OpenRouter instance to OpenAI, which is exactly what
         # this field exists to prevent.
         self.provider_id = (provider_id or self._provider_kind).strip()
-        self._compat = compat or compat_policy_for_kind(self._provider_kind)
+        compat_policy = compat or compat_policy_for_kind(self._provider_kind)
+        if self.provider_id.lower() == "custom":
+            compat_policy = replace(
+                compat_policy,
+                allow_post_terminal_empty_choices=True,
+            )
+        self._compat = compat_policy
         self._replay_provider_state = replay_provider_state
         self._replay_source = _openai_replay_source(self._provider_kind, self._base_url)
         self._replay_captured_reasoning_content = (
