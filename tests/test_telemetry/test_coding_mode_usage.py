@@ -11,40 +11,30 @@ from opensquilla.telemetry import coding_mode_usage
 
 @pytest.mark.asyncio
 async def test_current_profile_observer_requires_coding_mode_enabled(monkeypatch) -> None:
-    from opensquilla.gateway.config import GatewayConfig
     from opensquilla.telemetry import runtime as runtime_module
 
-    monkeypatch.setattr(
-        GatewayConfig,
-        "load",
-        lambda *args, **kwargs: SimpleNamespace(
-            skills=SimpleNamespace(coding_mode=False),
-        ),
-    )
     monkeypatch.setattr(
         runtime_module,
         "ScopedTelemetryRuntime",
         lambda **kwargs: pytest.fail("runtime must stay unopened while Coding Mode is off"),
     )
 
-    assert await coding_mode_usage.record_current_profile_coding_mode_usage("run-1") is False
+    config = SimpleNamespace(skills=SimpleNamespace(coding_mode=False))
+    assert (
+        await coding_mode_usage.record_current_profile_coding_mode_usage(
+            "run-1",
+            config=config,
+        )
+        is False
+    )
 
 
 @pytest.mark.asyncio
 async def test_explicit_disabled_snapshot_stays_disabled(monkeypatch) -> None:
-    from opensquilla.gateway.config import GatewayConfig
-
-    monkeypatch.setattr(
-        GatewayConfig,
-        "load",
-        lambda *args, **kwargs: pytest.fail(
-            "an explicit disabled snapshot must not rediscover a later config value"
-        ),
-    )
-
     assert (
         await coding_mode_usage.record_current_profile_coding_mode_usage(
             "run-disabled",
+            config=SimpleNamespace(skills=SimpleNamespace(coding_mode=True)),
             coding_mode_active=False,
         )
         is False
@@ -53,7 +43,6 @@ async def test_explicit_disabled_snapshot_stays_disabled(monkeypatch) -> None:
 
 @pytest.mark.asyncio
 async def test_current_profile_observer_enqueues_and_closes_local_runtime(monkeypatch) -> None:
-    from opensquilla.gateway.config import GatewayConfig
     from opensquilla.telemetry import growth_sink as growth_sink_module
     from opensquilla.telemetry import runtime as runtime_module
 
@@ -73,7 +62,6 @@ async def test_current_profile_observer_enqueues_and_closes_local_runtime(monkey
             observed.append(("sink_closed", None))
 
     runtime = FakeRuntime()
-    monkeypatch.setattr(GatewayConfig, "load", lambda *args, **kwargs: config)
     monkeypatch.setattr(runtime_module, "ScopedTelemetryRuntime", lambda **kwargs: runtime)
     monkeypatch.setattr(
         growth_sink_module,
@@ -81,7 +69,10 @@ async def test_current_profile_observer_enqueues_and_closes_local_runtime(monkey
         lambda supplied_runtime, **kwargs: FakeSink(),
     )
 
-    result = await coding_mode_usage.record_current_profile_coding_mode_usage("run-actual")
+    result = await coding_mode_usage.record_current_profile_coding_mode_usage(
+        "run-actual",
+        config=config,
+    )
 
     assert result is True
     assert observed[0][0] == "run-actual"
@@ -89,17 +80,13 @@ async def test_current_profile_observer_enqueues_and_closes_local_runtime(monkey
 
 
 @pytest.mark.asyncio
-async def test_current_profile_observer_uses_explicit_gate_and_config_path(
+async def test_current_profile_observer_uses_explicit_gate(
     monkeypatch,
-    tmp_path,
 ) -> None:
-    from opensquilla.gateway.config import GatewayConfig
     from opensquilla.telemetry import growth_sink as growth_sink_module
     from opensquilla.telemetry import runtime as runtime_module
 
-    config_path = tmp_path / "selected-config.toml"
     config = SimpleNamespace(skills=SimpleNamespace(coding_mode=False))
-    load_calls: list[tuple[object, object]] = []
     observed: list[tuple[str, datetime]] = []
     occurred_at = datetime(2026, 9, 11, 15, 30, tzinfo=UTC)
 
@@ -119,11 +106,6 @@ async def test_current_profile_observer_uses_explicit_gate_and_config_path(
         async def close(self) -> None:
             return None
 
-    def load_config(path, *, read_only):
-        load_calls.append((path, read_only))
-        return config
-
-    monkeypatch.setattr(GatewayConfig, "load", load_config)
     monkeypatch.setattr(runtime_module, "ScopedTelemetryRuntime", lambda **kwargs: FakeRuntime())
     monkeypatch.setattr(
         growth_sink_module,
@@ -133,13 +115,12 @@ async def test_current_profile_observer_uses_explicit_gate_and_config_path(
 
     result = await coding_mode_usage.record_current_profile_coding_mode_usage(
         "run-explicit",
+        config=config,
         occurred_at=occurred_at,
         coding_mode_active=True,
-        config_path=str(config_path),
     )
 
     assert result is True
-    assert load_calls == [(str(config_path), True)]
     assert observed == [("run-explicit", occurred_at)]
 
 
@@ -155,7 +136,8 @@ def test_observer_persists_before_return_and_captures_runtime_snapshot(
 ) -> None:
     fixed_time = datetime(2026, 9, 11, 23, 59, 58, tzinfo=UTC)
     config_path = tmp_path / "active-profile.toml"
-    calls: list[tuple[str, datetime, bool | None, str | None]] = []
+    calls: list[tuple[str, object, datetime, bool | None]] = []
+    load_calls: list[str | None] = []
 
     class FrozenDateTime:
         @classmethod
@@ -166,25 +148,39 @@ def test_observer_persists_before_return_and_captures_runtime_snapshot(
     async def record(
         run_id: str,
         *,
+        config: object,
         occurred_at: datetime | None = None,
         coding_mode_active: bool | None = None,
-        config_path: str | None = None,
     ) -> bool:
         # Yield once so this assertion proves observe() drains the coroutine
         # instead of handing persistence to a disposable background task.
         await asyncio.sleep(0)
         assert occurred_at is not None
-        calls.append((run_id, occurred_at, coding_mode_active, config_path))
+        calls.append((run_id, config, occurred_at, coding_mode_active))
         return True
+
+    config = SimpleNamespace(skills=SimpleNamespace(coding_mode=expected_active))
+
+    def load_config(path: str | None) -> object:
+        load_calls.append(path)
+        return config
 
     monkeypatch.setattr(coding_mode_usage, "datetime", FrozenDateTime)
     monkeypatch.setattr(coding_mode_usage, "record_current_profile_coding_mode_usage", record)
     monkeypatch.setenv(coding_mode_usage.CODING_MODE_ACTIVE_ENV, active_value)
     monkeypatch.setenv(coding_mode_usage.CODING_MODE_CONFIG_PATH_ENV, str(config_path))
 
-    coding_mode_usage.observe_current_profile_coding_mode_usage("run-safe")
+    coding_mode_usage.observe_current_profile_coding_mode_usage(
+        "run-safe",
+        config_loader=load_config,
+    )
 
-    assert calls == [("run-safe", fixed_time, expected_active, str(config_path))]
+    if expected_active:
+        assert load_calls == [str(config_path)]
+        assert calls == [("run-safe", config, fixed_time, True)]
+    else:
+        assert load_calls == []
+        assert calls == []
 
 
 def test_observer_swallows_enqueue_failure(monkeypatch) -> None:
@@ -194,4 +190,9 @@ def test_observer_swallows_enqueue_failure(monkeypatch) -> None:
 
     monkeypatch.setattr(coding_mode_usage, "record_current_profile_coding_mode_usage", fail_record)
 
-    coding_mode_usage.observe_current_profile_coding_mode_usage("run-safe")
+    coding_mode_usage.observe_current_profile_coding_mode_usage(
+        "run-safe",
+        config_loader=lambda path: SimpleNamespace(
+            skills=SimpleNamespace(coding_mode=True)
+        ),
+    )

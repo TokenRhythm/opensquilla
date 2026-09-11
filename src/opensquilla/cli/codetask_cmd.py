@@ -272,6 +272,7 @@ def solve(
     # stdout, so a consumer reading stdout alone still gets clean JSON.
     from opensquilla.contrib.codetask import config as ct_config
     from opensquilla.contrib.codetask.runner import _default_run_id
+    from opensquilla.gateway.config import GatewayConfig
     from opensquilla.recovery.errors import ProfileLockBusyError
 
     rid = run_id or _default_run_id("task")
@@ -282,6 +283,12 @@ def solve(
         "(work happens in the run dir, NOT in the --repo source)",
         err=True,
     )
+
+    def record_coding_mode_usage(actual_run_id: str) -> None:
+        observe_current_profile_coding_mode_usage(
+            actual_run_id,
+            config_loader=lambda path: GatewayConfig.load(path, read_only=True),
+        )
 
     try:
         result = run_solve(
@@ -296,7 +303,7 @@ def solve(
             timeout=timeout,
             verification_mode=verification_mode,
             run_id=rid,
-            coding_mode_usage_recorder=observe_current_profile_coding_mode_usage,
+            coding_mode_usage_recorder=record_coding_mode_usage,
         )
     except InputError as exc:
         typer.secho(str(exc), err=True, fg=typer.colors.RED)
