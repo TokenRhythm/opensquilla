@@ -227,7 +227,6 @@
       "setDefaultMode": "Diesen Modus als Standard verwenden",
       "restoreDefaultMode": "Standard-Vorschaumodus wiederherstellen",
       "defaultModeSaved": "Standard-Vorschaumodus gespeichert.",
-      "fullModeNotice": "Die interaktive Vorschau kann Online-Inhalte laden, teilt aber weder OpenSquilla-Identität noch lokale Dateien oder Browser-Anmeldungen.",
       "offlineWebLimits": "Einige externe Inhalte und erweiterte Webfunktionen sind in der eingeschränkten Vorschau möglicherweise nicht verfügbar.",
       "compatibilityFallback": "Diese Desktop-Version unterstützt nur die ältere Einzeldateivorschau.",
       "upgradeDesktopShort": "Desktop aktualisieren",

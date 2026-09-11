@@ -409,10 +409,6 @@ for (const definition of createArtifactWorkbenchDefinitions({
   previewLeasesEnabled: true,
   pushToast: (message, options) => pushToast(message, options),
   savePreviewPreferences: preferences => savePreviewPreferences(platform, preferences),
-  showFullPreviewNotice: () => pushToast(
-    t('workbench.artifactPreview.fullModeNotice'),
-    { tone: 'info', duration: 9000 },
-  ),
   t: (key, params) => String(t(key, params || {})),
 })) {
   workbenchPanelRegistry.register(definition, { replace: true })

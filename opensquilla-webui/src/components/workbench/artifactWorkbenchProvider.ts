@@ -107,7 +107,6 @@ export interface ArtifactWorkbenchProviderOptions {
     mode: WorkbenchPreviewMode
     noticeShown: boolean
   }): Promise<void>
-  showFullPreviewNotice?(): void
   publishDocument?(request: {
     sessionKey: string
     documentId: string
@@ -2178,17 +2177,6 @@ class ArtifactPreviewRuntime implements WorkbenchPanelRuntime {
       previewWarnings: lease.source.warning_codes,
     })
     this.startLeaseRenewal()
-
-    if (lease.effective_mode === 'full' && !this.noticeShown) {
-      this.noticeShown = true
-      this.options.showFullPreviewNotice?.()
-      try {
-        await this.options.savePreviewPreferences?.({
-          mode: this.defaultMode,
-          noticeShown: true,
-        })
-      } catch {}
-    }
 
     if (this.item.hostKind !== 'native-webcontents' || !nativeApi) return true
     this.nativeProtocolVersion = capabilities.protocolVersions.includes(4)

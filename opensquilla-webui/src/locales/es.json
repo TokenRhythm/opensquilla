@@ -227,7 +227,6 @@
       "setDefaultMode": "Usar este modo de forma predeterminada",
       "restoreDefaultMode": "Restaurar el modo de vista previa predeterminado",
       "defaultModeSaved": "Modo de vista previa predeterminado guardado.",
-      "fullModeNotice": "La vista previa interactiva puede cargar contenido en línea, pero no comparte la identidad de OpenSquilla, archivos locales ni sesiones del navegador.",
       "offlineWebLimits": "Es posible que algunos contenidos externos y funciones web avanzadas no estén disponibles en la vista previa restringida.",
       "compatibilityFallback": "Esta versión de Desktop solo admite la vista previa antigua de un solo archivo.",
       "upgradeDesktopShort": "Actualizar Desktop",

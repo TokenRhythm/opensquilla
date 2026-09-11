@@ -227,7 +227,6 @@
       "setDefaultMode": "将当前模式设为默认",
       "restoreDefaultMode": "恢复默认预览模式",
       "defaultModeSaved": "已保存默认预览模式。",
-      "fullModeNotice": "互动预览可以加载在线内容，但不会共享 OpenSquilla 身份、本机文件或系统浏览器登录状态。",
       "offlineWebLimits": "受限预览中，部分外部内容和高级网页功能可能不可用。",
       "compatibilityFallback": "当前 Desktop 版本仅支持旧版单文件预览。",
       "upgradeDesktopShort": "请升级 Desktop",
