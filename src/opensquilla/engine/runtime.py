@@ -314,6 +314,7 @@ from opensquilla.runtime_packs import runtime_pack_state_scope
 from opensquilla.safety import injection_guard, permission_matrix, sandbox, tool_tiers
 from opensquilla.sandbox.integration import sandbox_policy_scope
 from opensquilla.sandbox.policy_models import SandboxPolicy as StoredSandboxPolicy
+from opensquilla.secrets import clean_header_secret
 from opensquilla.session.compaction_lifecycle import (
     COMPACTION_CHUNK_SUMMARIZED_EVENT,
     COMPACTION_PERSISTED_EVENT,
@@ -2189,7 +2190,25 @@ def _provider_authority_identity(config: Any) -> _ProviderAuthorityIdentity | No
         spec = get_provider_spec(provider_id)
     except UnknownProviderError:
         spec = None
+    api_key = str(getattr(config, "api_key", "") or "")
+    org_id = str(getattr(config, "org_id", "") or "").strip()
+    auth_header_style = spec.auth_header_style if spec is not None else ""
     if spec is not None:
+        if spec.backend in {"openai_compat", "openai_responses", "ollama"}:
+            try:
+                # Use the same paste-boundary cleanup as these adapters. Raw
+                # config differences cannot establish another HTTP authority.
+                api_key = clean_header_secret(api_key)
+            except ValueError:
+                return None
+        elif spec.backend == "openai_codex":
+            # Selector-built Codex legs all use the same OAuth source; the
+            # parity-only api_key constructor/config field is never sent.
+            api_key = ""
+        if spec.backend not in {"openai_compat", "openai_responses"}:
+            org_id = ""
+        if spec.backend in {"anthropic", "ollama"} and not api_key:
+            auth_header_style = ""
         # Match selector construction, including an omitted default and roots
         # that the OpenAI adapters expand to the same versioned endpoint.
         base_url = base_url or spec.default_base_url
@@ -2220,10 +2239,10 @@ def _provider_authority_identity(config: Any) -> _ProviderAuthorityIdentity | No
         return None
     return _ProviderAuthorityIdentity(
         provider=spec.backend if spec is not None else provider_id,
-        api_key=str(getattr(config, "api_key", "") or ""),
+        api_key=api_key,
         base_url=base_url.strip().rstrip("/"),
-        org_id=str(getattr(config, "org_id", "") or "").strip(),
-        auth_header_style=spec.auth_header_style if spec is not None else "",
+        org_id=org_id,
+        auth_header_style=auth_header_style,
     )
 
 

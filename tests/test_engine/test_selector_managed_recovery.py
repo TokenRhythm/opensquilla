@@ -3,12 +3,14 @@ from __future__ import annotations
 import httpx
 import pytest
 
+from opensquilla.engine import Agent, AgentConfig
 from opensquilla.engine.routing.health import ProviderHealthLedger
 from opensquilla.engine.runtime import (
     _provider_authority_identity,
     _same_provider_authority,
     _SelectorFallbackProvider,
 )
+from opensquilla.provider.codex_auth import CodexCredentials
 from opensquilla.provider.selector import ModelSelector, ProviderConfig, SelectorConfig
 from opensquilla.provider.types import (
     ChatConfig,
@@ -218,3 +220,88 @@ def test_same_endpoint_with_different_auth_headers_keeps_independent_authority()
     assert native_identity.auth_header_style == "x-api-key"
     assert bearer_identity.auth_header_style == "bearer"
     assert not _same_provider_authority(native, bearer)
+
+
+@pytest.mark.parametrize(
+    "provider,key,org_id,base_url,expected_calls",
+    [
+        ("openai", " dummy-key ", "", "https://provider.test/v1", 1),
+        ("openai_responses", "，dummy-key。\n", "", "https://provider.test/v1", 1),
+        ("ollama", " dummy-key ", "unused-org", "https://provider.test/v1", 1),
+        ("anthropic", "dummy-key", "unused-org", "https://provider.test/v1", 1),
+        ("openai_codex", "ignored-api-key", "unused-org", "https://provider.test/v1", 1),
+        ("openai", "another-key", "", "https://provider.test/v1", 2),
+        ("openai", "dummy-key", "other-org", "https://provider.test/v1", 2),
+        ("openai", "dummy-key", "", "https://other.test/v1", 2),
+    ],
+)
+async def test_retry_after_uses_actual_adapter_authority(
+    monkeypatch, provider, key, org_id, base_url, expected_calls
+):
+    """Equivalent configs cannot send a second HTTP request during Retry-After."""
+    requests = []
+    original_client = httpx.AsyncClient
+
+    def request(req):
+        requests.append(req)
+        return httpx.Response(
+            429,
+            headers={"Retry-After": "60"},
+            json={"error": {"message": "synthetic rate limit", "type": "rate_limit_error"}},
+        )
+
+    def client(*args, **kwargs):
+        kwargs.pop("proxy", None)
+        kwargs["transport"] = httpx.MockTransport(request)
+        return original_client(*args, **kwargs)
+
+    monkeypatch.setattr(httpx, "AsyncClient", client)
+    monkeypatch.setattr(
+        "opensquilla.provider.openai_codex.load_codex_credentials",
+        lambda *_args: CodexCredentials(access_token="dummy-oauth"),
+    )
+    primary = ProviderConfig(
+        provider, "primary", api_key="dummy-key", base_url="https://provider.test/v1"
+    )
+    fallback = ProviderConfig(
+        provider, "fallback", api_key=key, base_url=base_url, org_id=org_id
+    )
+    selector = ModelSelector(SelectorConfig(primary=primary, fallbacks=[fallback]))
+    wrapper = _SelectorFallbackProvider(selector.resolve(), selector)
+    agent = Agent(provider=wrapper, config=AgentConfig(timeout=2, max_provider_retries=0))
+    events = [event async for event in agent.run_turn("Complete the synthetic task.")]
+
+    assert len(requests) == expected_calls
+    assert any(event.kind == "error" for event in events)
+    assert _same_provider_authority(primary, fallback) is (expected_calls == 1)
+    if expected_calls == 2:
+        assert (
+            requests[0].url,
+            requests[0].headers.get("authorization"),
+            requests[0].headers.get("openai-organization"),
+        ) != (
+            requests[1].url,
+            requests[1].headers.get("authorization"),
+            requests[1].headers.get("openai-organization"),
+        )
+
+
+def test_authority_keeps_anthropic_raw_header_key_semantics():
+    # Anthropic does not apply the paste-boundary cleanup used by OpenAI.
+    assert not _same_provider_authority(
+        ProviderConfig("anthropic", "primary", api_key="dummy-key"),
+        ProviderConfig("anthropic", "fallback", api_key=" dummy-key "),
+    )
+
+
+def test_authority_does_not_distinguish_absent_anthropic_auth_headers():
+    assert _same_provider_authority(
+        ProviderConfig("anthropic", "primary", base_url="https://gateway.test"),
+        ProviderConfig("minimax_cn", "fallback", base_url="https://gateway.test"),
+    )
+
+
+def test_invalid_cleaned_key_cannot_establish_independent_authority():
+    assert _provider_authority_identity(
+        ProviderConfig("openai", "fallback", api_key="dummy-invalid-字")
+    ) is None
