@@ -180,6 +180,8 @@ def test_json_stdout_is_clean_with_marker_on_stderr(monkeypatch):
 
     import opensquilla.contrib.codetask.runner as ct_runner
     from opensquilla.contrib.codetask.types import TaskResult, TaskState
+    from opensquilla.gateway.config import GatewayConfig
+    from opensquilla.telemetry import coding_mode_usage
 
     fake = TaskResult(
         task_slug="x",
@@ -193,12 +195,29 @@ def test_json_stdout_is_clean_with_marker_on_stderr(monkeypatch):
     )
     fake.verified = True
     captured: dict[str, object] = {}
+    observed: list[str] = []
+    loaded: list[tuple[str | None, bool]] = []
+    config = object()
 
     def fake_solve(**kwargs):
         captured.update(kwargs)
         return fake
 
+    def fake_load(path: str | None, *, read_only: bool) -> object:
+        loaded.append((path, read_only))
+        return config
+
+    def fake_observe(run_id: str, *, config_loader) -> None:
+        observed.append(run_id)
+        assert config_loader("/tmp/coding-mode-config.toml") is config
+
     monkeypatch.setattr(ct_runner, "solve", fake_solve)
+    monkeypatch.setattr(GatewayConfig, "load", fake_load)
+    monkeypatch.setattr(
+        coding_mode_usage,
+        "observe_current_profile_coding_mode_usage",
+        fake_observe,
+    )
 
     result = runner.invoke(
         codetask_app,
@@ -212,6 +231,12 @@ def test_json_stdout_is_clean_with_marker_on_stderr(monkeypatch):
     # the run-dir announcement is on stderr.
     assert "[code-task] run started" in result.stderr
     assert callable(captured["coding_mode_usage_recorder"])
+    assert loaded == []
+
+    captured["coding_mode_usage_recorder"]("coding-use-safe")
+
+    assert observed == ["coding-use-safe"]
+    assert loaded == [("/tmp/coding-mode-config.toml", True)]
 
 
 # ─── (c) Non-TTY stdin must refuse the confirm prompt ─────────────────────

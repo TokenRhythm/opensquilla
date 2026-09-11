@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+from collections.abc import Callable
 from datetime import UTC, datetime
 
 log = logging.getLogger(__name__)
@@ -25,9 +26,9 @@ def _coding_mode_snapshot_from_env() -> bool | None:
 async def record_current_profile_coding_mode_usage(
     run_id: str,
     *,
+    config: object,
     occurred_at: datetime | None = None,
     coding_mode_active: bool | None = None,
-    config_path: str | None = None,
 ) -> bool:
     """Enqueue one Coding Mode use against the operator's primary profile.
 
@@ -37,18 +38,11 @@ async def record_current_profile_coding_mode_usage(
     sends the event later through the normal batched Growth endpoint.
     """
 
-    from opensquilla.gateway.config import GatewayConfig
     from opensquilla.telemetry.growth_sink import GrowthEventSink
     from opensquilla.telemetry.runtime import ScopedTelemetryRuntime
 
     if coding_mode_active is False:
         return False
-    config = GatewayConfig.load(
-        config_path
-        or os.environ.get(CODING_MODE_CONFIG_PATH_ENV)
-        or os.environ.get("OPENSQUILLA_GATEWAY_CONFIG_PATH"),
-        read_only=True,
-    )
     if coding_mode_active is None:
         skills_config = getattr(config, "skills", None)
         if not bool(getattr(skills_config, "coding_mode", False)):
@@ -65,7 +59,11 @@ async def record_current_profile_coding_mode_usage(
         await runtime.close()
 
 
-def observe_current_profile_coding_mode_usage(run_id: str) -> None:
+def observe_current_profile_coding_mode_usage(
+    run_id: str,
+    *,
+    config_loader: Callable[[str | None], object],
+) -> None:
     """Durably enqueue one actual use without performing network I/O.
 
     The callback runs only after the coding Agent process exists. Capturing the
@@ -79,12 +77,19 @@ def observe_current_profile_coding_mode_usage(run_id: str) -> None:
 
     try:
         occurred_at = datetime.now(UTC)
+        coding_mode_active = _coding_mode_snapshot_from_env()
+        if coding_mode_active is False:
+            return
+        config_path = os.environ.get(CODING_MODE_CONFIG_PATH_ENV) or os.environ.get(
+            "OPENSQUILLA_GATEWAY_CONFIG_PATH"
+        )
+        config = config_loader(config_path)
         asyncio.run(
             record_current_profile_coding_mode_usage(
                 run_id,
+                config=config,
                 occurred_at=occurred_at,
-                coding_mode_active=_coding_mode_snapshot_from_env(),
-                config_path=os.environ.get(CODING_MODE_CONFIG_PATH_ENV),
+                coding_mode_active=coding_mode_active,
             )
         )
     except Exception:
