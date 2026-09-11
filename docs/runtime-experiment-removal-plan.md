@@ -23,7 +23,7 @@
 - Tokenjuice strict matcher、`FAILURE_PRESERVE`、既有规则及失败窗口。
 - ToolResult projection、Store、动态 `retrieve_tool_result`、读取原文的权限和会话边界；保留 fresh-diagnostic／retrieval 等混合通路，避免本期顺带改错误展示策略。
 - Provider request-proof、recent assistant/tool/error/unresolved 保护、never-worse、历史 projection marker 识别与执行阻断。
-- Provider retry/fallback、reasoning-only thinking fallback、prefill/continuation、context-block feedback；不开启此前关闭的默认开关。
+- Provider retry/fallback、reasoning-only prefill/continuation、context-block feedback；恢复过程保持当前请求的 thinking 设置不变。
 - Identical-request breaker。本期不默认化 context feedback，先前设想的替代前提没有发生，因此暂留。
 - `reasoning_only_act_now` 及其自动恢复路径。本期整项暂留：当前代码在 `not thinking_enabled` 时即使开关关闭也会执行一次恢复，不能按实验名字整删。
 - Final-diff salvage、candidate 捕获、`lost/restored` 状态、`final_diff_salvage_veto`、patch instrumentation classifier。所有默认值不变。

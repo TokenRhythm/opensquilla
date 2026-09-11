@@ -532,8 +532,6 @@ def test_meta_sub_agent_inherits_physical_request_contract_without_outer_state(
         length_capped_continuations=8,
         retry_base_backoff_ms=1_234,
         retry_max_backoff_ms=56_789,
-        reasoning_only_thinking_fallback=True,
-        provider_error_thinking_fallback=False,
         reasoning_prefill_recovery_mode="recover",
         stop_sequences=["STOP-A", "STOP-B"],
         flush_enabled=True,
@@ -606,8 +604,6 @@ def test_meta_sub_agent_inherits_physical_request_contract_without_outer_state(
     assert child.length_capped_continuations == 8
     assert child.retry_base_backoff_ms == 1_234
     assert child.retry_max_backoff_ms == 56_789
-    assert child.reasoning_only_thinking_fallback is True
-    assert child.provider_error_thinking_fallback is False
     assert child.reasoning_prefill_recovery_mode == "recover"
     # Memory flush is an outer lifecycle concern, not part of the one-shot
     # sub-Agent's physical request/compaction contract.

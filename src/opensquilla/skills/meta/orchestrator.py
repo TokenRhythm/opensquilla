@@ -662,8 +662,6 @@ _META_SUBAGENT_REQUEST_FIELDS = (
     "length_capped_continuations",
     "retry_base_backoff_ms",
     "retry_max_backoff_ms",
-    "reasoning_only_thinking_fallback",
-    "provider_error_thinking_fallback",
     "reasoning_prefill_recovery_mode",
     "cache_mode",
     "model_capabilities",

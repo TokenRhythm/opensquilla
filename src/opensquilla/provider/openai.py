@@ -1008,13 +1008,6 @@ def _apply_compat_request_constraints(
     tool_choice_auto_only = policy.thinking_tool_choice_auto_only or bool(
         reasoning_rule and reasoning_rule.thinking_tool_choice_auto_only
     )
-    prefer_pinned_over_thinking = (
-        policy.prefer_pinned_tool_choice_over_thinking
-        or bool(
-            reasoning_rule
-            and reasoning_rule.prefer_pinned_tool_choice_over_thinking
-        )
-    )
     if (
         tool_choice_auto_only
         and (
@@ -1025,34 +1018,12 @@ def _apply_compat_request_constraints(
         and "tool_choice" in payload
     ):
         tool_choice = payload["tool_choice"]
-        pinned_tool_choice = False
         if isinstance(tool_choice, Mapping):
             tool_choice_type = tool_choice.get("type")
-            pinned_tool_choice = tool_choice_type in {"tool", "function"}
         else:
             tool_choice_type = tool_choice
         if tool_choice_type in {"auto", "none"}:
             payload["tool_choice"] = tool_choice_type
-        elif (
-            prefer_pinned_over_thinking
-            and pinned_tool_choice
-            and not force_thinking
-        ):
-            if reasoning_rule and reasoning_rule.reasoning_format:
-                apply_reasoning_disable(
-                    payload,
-                    reasoning_rule.reasoning_format,
-                    ReasoningDisableArgs(model=model),
-                )
-            else:
-                payload["enable_thinking"] = False
-            payload.pop("thinking_budget", None)
-            payload.pop("reasoning_effort", None)
-            payload.pop("preserve_thinking", None)
-            if reasoning_rule is None:
-                for message in payload.get("messages", ()):
-                    if isinstance(message, dict):
-                        message.pop("reasoning_content", None)
         else:
             # The endpoint rejects required/pinned choices while thinking.
             # Preserve the requested reasoning mode and degrade the selector
