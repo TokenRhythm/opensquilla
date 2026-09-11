@@ -925,23 +925,8 @@ class _TurnRunnerAgentConfigBuilderAdapter(AgentConfigBuilderPort):
                 "tool_result_store_retention_seconds",
                 7 * 24 * 60 * 60,
             ),
-            source_diff_preservation_mode=getattr(
-                runner._config,
-                "source_diff_preservation_mode",
-                "log",
-            ),
-            source_diff_candidate_mode=getattr(
-                runner._config,
-                "source_diff_candidate_mode",
-                "log",
-            ),
-            finalize_evidence_gate=bool(
-                getattr(
-                    getattr(runner._config, "prompt", None),
-                    "finalize_evidence_gate",
-                    False,
-                )
-            ),
+            source_diff_preservation_mode=None,
+            source_diff_candidate_mode=None,
         )
 
 class _TurnRunnerMemorySnapshotAdapter(MemorySnapshotPort):

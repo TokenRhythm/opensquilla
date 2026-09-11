@@ -69,6 +69,7 @@ OFFLINE_MARKER_EXCLUSIONS = {
 }
 RECENTLY_ADDED_ACTIVE_TESTS = {
     "tests/test_engine/test_agent_autonomous_tool_recovery.py",
+
     # Artifact source/version regressions use the declared provisional floor.
     "tests/test_engine/test_artifact_delivery_sources.py",
     "tests/test_engine/test_runtime_artifact_context.py",
@@ -292,7 +293,6 @@ RECENTLY_ADDED_ACTIVE_TESTS = {
     "tests/test_tools/test_edit_file_closest_hint.py",
     "tests/test_tools/test_patch_classification.py",
     "tests/test_tools/test_plan_access.py",
-    "tests/test_tools/test_repeated_call_notice.py",
     "tests/test_tools/test_admin_audio_config.py",
     "tests/test_tools/test_admin_gateway_contract.py",
     "tests/test_tools/test_shell_self_kill_policy.py",

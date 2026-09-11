@@ -162,9 +162,6 @@ from opensquilla.tools.run_mode import (
     full_host_access_active,
     trusted_sandbox_active,
 )
-from opensquilla.tools.source_diff_preservation import (
-    source_diff_preservation_block_json,
-)
 from opensquilla.tools.types import (
     CallerKind,
     ToolError,
@@ -5586,30 +5583,6 @@ def _workspace_scratch_artifact_shell_block(
     return None
 
 
-def _source_diff_preservation_shell_block(
-    command: str,
-    workdir: str | None,
-    *,
-    stdin: str | None = None,
-) -> str | None:
-    source_diff_block = source_diff_preservation_block_json(
-        command=command,
-        workdir=workdir,
-    )
-    if source_diff_block is not None:
-        return source_diff_block
-    if stdin is None:
-        return None
-    for stdin_chunk in _iter_stdin_guard_chunks(stdin):
-        source_diff_block = source_diff_preservation_block_json(
-            command=stdin_chunk,
-            workdir=workdir,
-        )
-        if source_diff_block is not None:
-            return source_diff_block
-    return None
-
-
 def _resolve_exec_timeout(timeout: float | int | None) -> float:
     if timeout is None:
         return _DEFAULT_EXEC_TIMEOUT
@@ -6641,9 +6614,6 @@ async def exec_command(
     scratch_block = _workspace_scratch_artifact_shell_block("exec_command", command, cwd)
     if scratch_block is not None:
         return json.dumps(scratch_block, ensure_ascii=False)
-    source_diff_block = _source_diff_preservation_shell_block(command, cwd, stdin=stdin)
-    if source_diff_block is not None:
-        return source_diff_block
     if not host_execution:
         hard_block = _shell_elevation_hard_block(
             "exec_command",
@@ -7157,9 +7127,6 @@ async def background_process(
     )
     if scratch_block is not None:
         return json.dumps(scratch_block, ensure_ascii=False)
-    source_diff_block = _source_diff_preservation_shell_block(command, cwd)
-    if source_diff_block is not None:
-        return source_diff_block
     if not host_execution:
         hard_block = _shell_elevation_hard_block(
             "background_process",

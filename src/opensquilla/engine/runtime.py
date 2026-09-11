@@ -4749,36 +4749,6 @@ def _resolve_identity_prompt_mode(config: object) -> str:
     return "full"
 
 
-_FINALIZE_EVIDENCE_GATE_ENV = "OPENSQUILLA_FINALIZE_EVIDENCE_GATE"
-_FINALIZE_EVIDENCE_GATE_ON = {"on", "1", "true", "yes"}
-_FINALIZE_EVIDENCE_GATE_OFF = {"off", "0", "false", "no"}
-
-
-def _resolve_finalize_evidence_gate(config: object) -> bool:
-    """Resolve the opt-in finalize-time red-evidence gate prompt flag.
-
-    ``OPENSQUILLA_FINALIZE_EVIDENCE_GATE`` ("on"/"off") overrides
-    ``prompt.finalize_evidence_gate`` from gateway config; default is off.
-    The same env var also enables the loop-side gate (see
-    engine.turn_runner.agent_bootstrap_stage). Unrecognized env values raise
-    instead of being silently ignored so a run manifest cannot record an
-    override the run did not actually apply.
-    """
-    env_value = os.environ.get(_FINALIZE_EVIDENCE_GATE_ENV, "").strip().lower()
-    if env_value:
-        if env_value in _FINALIZE_EVIDENCE_GATE_ON:
-            return True
-        if env_value in _FINALIZE_EVIDENCE_GATE_OFF:
-            return False
-        raise ValueError(
-            f"{_FINALIZE_EVIDENCE_GATE_ENV} must be one of: "
-            + ", ".join(sorted(_FINALIZE_EVIDENCE_GATE_ON | _FINALIZE_EVIDENCE_GATE_OFF))
-        )
-
-    prompt_cfg = getattr(config, "prompt", None)
-    return bool(getattr(prompt_cfg, "finalize_evidence_gate", False))
-
-
 class _TaskOwnedSessionAppend:
     """Bind legacy input-stage appends to one admitted session incarnation."""
 
@@ -9404,7 +9374,6 @@ class TurnRunner:
         if agent_name is None and identity_fields is not None:
             agent_name = identity_fields.name
         prompt_mode = _resolve_identity_prompt_mode(self._config)
-        finalize_evidence_gate = _resolve_finalize_evidence_gate(self._config)
 
         agent_profile = AgentProfile(
             agent_id=agent_id,
@@ -9419,7 +9388,6 @@ class TurnRunner:
             agents_doc=agents_doc,
             workspace_files=workspace_files,
             prompt_mode=prompt_mode,
-            finalize_evidence_gate=finalize_evidence_gate,
         )
         os_name = os.uname().sysname if hasattr(os, "uname") else platform.system()
         runtime_info = {

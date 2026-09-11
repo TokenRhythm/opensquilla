@@ -811,15 +811,17 @@ class AgentConfig:
     tool_result_external_keep_recent: int = 2
     # Deprecated, unused compatibility slot; preserve constructor position.
     tool_failure_loop_block_threshold: int = 3
+    # Deprecated, unused compatibility slot; preserve constructor position.
     repeated_tool_call_recovery_threshold: int = 0
-    # Extra tool names covered by repeated-identical-call recovery, on top of
-    # the built-in read-only set. Set via OPENSQUILLA_TOOL_REPEAT_NUDGE_TOOLS
-    # (comma-separated); the threshold is tunable via
-    # OPENSQUILLA_TOOL_REPEAT_NUDGE_THRESHOLD.
+    # Deprecated, unused compatibility slot; preserve constructor position.
     repeated_tool_call_recovery_extra_tools: tuple[str, ...] = ()
+    # Deprecated, unused compatibility slot; preserve constructor position.
     progress_watchdog_mode: Literal["off", "log", "warn_model", "block"] = "off"
+    # Deprecated, unused compatibility slot; preserve constructor position.
     progress_watchdog_repeated_tool_error_threshold: int = 3
+    # Deprecated, unused compatibility slot; preserve constructor position.
     progress_watchdog_repeated_provider_failure_threshold: int = 2
+    # Deprecated, unused compatibility slot; preserve constructor position.
     progress_watchdog_repeated_failure_anchor_threshold: int = 3
     # Deprecated, unused compatibility slot; preserve positional/keyword construction.
     post_write_convergence_enabled: bool = False
@@ -827,10 +829,9 @@ class AgentConfig:
     post_write_convergence_warn_threshold: int = 3
     # Deprecated, unused compatibility slot; preserve positional/keyword construction.
     post_write_convergence_finalize_after_warning: int = 3
-    # Deprecated export; retain the slot and path for legacy final-diff exclusion.
+    # Deprecated, unused compatibility slot; preserve constructor position.
     patch_evidence_ledger_path: str | None = None
-    # Finalize-time red-evidence gate (see engine.finalize_evidence_gate).
-    # Off by default; enabled per run via OPENSQUILLA_FINALIZE_EVIDENCE_GATE.
+    # Deprecated, unused compatibility slot; preserve constructor position.
     finalize_evidence_gate_enabled: bool = False
     # Deprecated, unused compatibility slot; preserve construction and saved configs.
     finalize_evidence_strict: bool = False
@@ -846,44 +847,21 @@ class AgentConfig:
     finalize_variant_challenge: bool = False
     # Deprecated, unused compatibility slot; preserve constructor position.
     provider_context_block_feedback: bool = False
-    # Byte-identical provider-request loop breaker. 0 = off. At N consecutive
-    # identical projected payloads the request is perturbed with a loop nudge;
-    # at 2N the turn aborts. Set via OPENSQUILLA_IDENTICAL_REQUEST_LOOP_BREAK.
+    # Deprecated, unused compatibility slot; preserve constructor position.
     identical_request_loop_break_threshold: int = 0
     # Deprecated, unused compatibility slot; preserve positional/keyword construction.
     placeholder_escalation_threshold: int = 0
-    # Pre-deadline wrap-up nudge. 0 = off. When positive and a total turn
-    # timeout is configured, the wrap-up directive arms once when remaining
-    # wall-clock time drops below this many seconds, then is rebuilt each
-    # iteration (so the remaining-minutes figure stays current) and spliced
-    # into every subsequent provider request; only the arming log event is
-    # one-shot. Unlike the max_iterations finalization, tools stay available
-    # so the model can still apply and verify its final changes. Set via
-    # OPENSQUILLA_DEADLINE_WRAPUP_MARGIN_SECONDS.
+    # Deprecated, unused compatibility slot; preserve constructor position.
     deadline_wrapup_margin_seconds: int = 0
     # Deprecated, unused compatibility slot; preserve positional/keyword construction.
     reasoning_stream_char_cap: int = 0
-    # Re-apply captured source-diff candidates whose paths end the turn with
-    # no live workspace diff (that path's earlier work would otherwise be
-    # missing from the collected patch). Off by default. Runs once per turn
-    # end — normal finalization and terminal errors alike — applying the
-    # newest candidate per path, each guarded by `git apply --check`. Set via
-    # OPENSQUILLA_FINAL_DIFF_SALVAGE.
+    # Deprecated, unused compatibility slot; preserve constructor position.
     final_diff_salvage: bool = False
     # Deprecated, unused compatibility slot; preserve positional/keyword construction.
     endgame_git_freeze_margin_seconds: int = 0
-    # Let the iteration cap yield to remaining wall-clock time. 0 = off. When
-    # positive and a total turn timeout is configured, hitting max_iterations
-    # does NOT enter finalization while more than this many seconds remain;
-    # the loop keeps running normal iterations until the deadline margin is
-    # reached, then the cap applies as usual. Set via
-    # OPENSQUILLA_MAX_ITERATIONS_DEADLINE_EXTEND_SECONDS.
+    # Deprecated, unused compatibility slot; preserve constructor position.
     max_iterations_deadline_extend_seconds: int = 0
-    # Veto for final-diff salvage: skip candidates the agent explicitly
-    # reverted (marked lost) and candidates whose patch only adds diagnostic
-    # print/log lines — both re-apply abandoned or throwaway edits into the
-    # scored patch. Off by default; only meaningful with final_diff_salvage.
-    # Set via OPENSQUILLA_FINAL_DIFF_SALVAGE_VETO.
+    # Deprecated, unused compatibility slot; preserve constructor position.
     final_diff_salvage_veto: bool = False
     # Deprecated, unused compatibility slot; preserve positional/keyword construction.
     endgame_git_freeze_instrumentation_exempt: bool = False
@@ -903,9 +881,13 @@ class AgentConfig:
     # Deprecated, unused compatibility slot; preserve construction and saved configs.
     tool_loop_observer_mode: Literal["off", "log"] = "off"
     runtime_recovery_mode: Literal["off", "log", "warn_model"] = "log"
+    # Deprecated, unused compatibility slot; preserve constructor position.
     runtime_recovery_source_loop_max_nudges: int = 1
+    # Deprecated, unused compatibility slot; preserve constructor position.
     final_diff_contract_mode: Literal["off", "log", "warn_model"] = "log"
+    # Deprecated, unused compatibility slot; preserve constructor position.
     source_diff_preservation_mode: Literal["off", "log", "block"] = "log"
+    # Deprecated, unused compatibility slot; preserve constructor position.
     source_diff_candidate_mode: Literal["off", "log", "warn_model"] = "log"
     # Deprecated, unused compatibility slot; preserve construction and saved configs.
     runtime_state_capsule_mode: Literal["off", "log", "inject"] = "off"

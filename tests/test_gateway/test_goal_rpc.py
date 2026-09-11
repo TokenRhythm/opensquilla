@@ -4694,18 +4694,23 @@ class _RunningGoalEditProvider:
             assert self.edited_objective in request_text
         elif call == 3:
             assert goal_tools <= set(tool_names)
-            tail_text = _goal_edit_request_text([messages[-1]])
-            assert "[Current Goal objective reminder]" in tail_text
-            assert self.edited_objective in tail_text
-            assert self.initial_objective not in tail_text
         elif call == 4:
             assert tool_names == []
-            tail_text = _goal_edit_request_text([messages[-1]])
-            assert "[Current Goal objective reminder]" in tail_text
-            assert self.edited_objective in tail_text
-            assert self.initial_objective not in tail_text
         else:
             raise AssertionError("Running Goal edit made an extra provider call")
+        if call >= 2:
+            # The accepted edit remains visible after its one-time steering
+            # boundary. It does not need a synthetic reminder on every call.
+            update_messages = [
+                _goal_edit_request_text([message])
+                for message in messages
+                if "[Persisted Goal objective update]" in _goal_edit_request_text([message])
+            ]
+            assert len(update_messages) == 1
+            assert '<goal_objective revision="2">' in update_messages[0]
+            assert self.edited_objective in update_messages[0]
+            assert self.initial_objective not in update_messages[0]
+            assert "[Current Goal objective reminder]" not in request_text
         return self._stream(call)
 
     async def _stream(self, call: int) -> AsyncIterator[Any]:
@@ -4781,7 +4786,6 @@ async def test_running_goal_edit_adopts_revision_in_same_task_without_transcript
     """A running Goal edit is internal control for the next real model call."""
 
     monkeypatch.setenv("OPENSQUILLA_OPENROUTER_LIVE_PRICING", "0")
-    monkeypatch.setenv("OPENSQUILLA_TURN_OBJECTIVE_REMINDER", "on")
     state: dict[str, Any] = {}
     runs: list[TaskRun] = []
 

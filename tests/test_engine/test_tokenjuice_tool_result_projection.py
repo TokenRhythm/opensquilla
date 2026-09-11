@@ -1583,27 +1583,6 @@ async def test_custom_provider_gate_counts_tool_schema_in_full_envelope(
         tool_handler=handler,
         session_key="agent:main:session-1",
     )
-    surface_builds = 0
-
-    def hide_retrieval_after_first_call(
-        tools,
-        gate_details,
-        *,
-        recovery_read_paths,
-        recovery_reads_remaining,
-    ):
-        nonlocal surface_builds
-        del gate_details, recovery_read_paths, recovery_reads_remaining
-        surface_builds += 1
-        if surface_builds == 1 or not tools:
-            return tools
-        return [tool for tool in tools if tool.name != "retrieve_tool_result"]
-
-    monkeypatch.setattr(
-        agent,
-        "_workspace_edit_gate_tool_definitions",
-        hide_retrieval_after_first_call,
-    )
     original_estimate_chars = agent._estimate_live_request_chars
     estimate_observations: list[tuple[int, int, int]] = []
 
@@ -1620,7 +1599,18 @@ async def test_custom_provider_gate_counts_tool_schema_in_full_envelope(
 
     monkeypatch.setattr(agent, "_estimate_live_request_chars", capture_estimate_chars)
 
-    events = [event async for event in agent.run_turn("run diagnostics")]
+    events = []
+    async for event in agent.run_turn("run diagnostics"):
+        events.append(event)
+        if isinstance(event, ToolResultEvent):
+            # Withdraw retrieval from the actual next-call tool schema only
+            # after a recoverable projection exists. The large tool remains,
+            # so admission must count its schema along with the restored raw result.
+            assert agent.config.metadata["tool_projection_applied"] is True
+            assert any(tool.name == "retrieve_tool_result" for tool in agent.tool_definitions)
+            agent.tool_definitions[:] = [
+                tool for tool in agent.tool_definitions if tool.name != "retrieve_tool_result"
+            ]
 
     assert len(provider.calls) == 1
     assert estimate_observations
