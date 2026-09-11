@@ -227,7 +227,6 @@
       "setDefaultMode": "このモードを既定にする",
       "restoreDefaultMode": "既定のプレビューモードに戻す",
       "defaultModeSaved": "既定のプレビューモードを保存しました。",
-      "fullModeNotice": "インタラクティブプレビューはオンラインコンテンツを読み込めますが、OpenSquilla の権限、ローカルファイル、システムブラウザーのログインは共有しません。",
       "offlineWebLimits": "制限付きプレビューでは、一部の外部コンテンツや高度な Web 機能を利用できない場合があります。",
       "compatibilityFallback": "この Desktop バージョンでは従来の単一ファイルプレビューのみ利用できます。",
       "upgradeDesktopShort": "Desktop を更新",

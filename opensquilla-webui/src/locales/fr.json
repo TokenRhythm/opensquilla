@@ -227,7 +227,6 @@
       "setDefaultMode": "Utiliser ce mode par défaut",
       "restoreDefaultMode": "Rétablir le mode d’aperçu par défaut",
       "defaultModeSaved": "Mode d’aperçu par défaut enregistré.",
-      "fullModeNotice": "L’aperçu interactif peut charger du contenu en ligne, sans partager l’identité OpenSquilla, les fichiers locaux ni les connexions du navigateur système.",
       "offlineWebLimits": "Certains contenus externes et certaines fonctions web avancées peuvent être indisponibles dans l’aperçu restreint.",
       "compatibilityFallback": "Cette version Desktop ne prend en charge que l’ancien aperçu à fichier unique.",
       "upgradeDesktopShort": "Mettre Desktop à jour",

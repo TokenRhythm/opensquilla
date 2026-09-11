@@ -227,7 +227,6 @@
       "setDefaultMode": "Use this mode by default",
       "restoreDefaultMode": "Restore the default preview mode",
       "defaultModeSaved": "Default preview mode saved.",
-      "fullModeNotice": "Interactive preview can load online content, but it does not share OpenSquilla identity, local files, or your system browser login.",
       "offlineWebLimits": "Some external content and advanced web features may be unavailable in restricted preview.",
       "compatibilityFallback": "This Desktop version supports only the legacy single-file preview.",
       "upgradeDesktopShort": "Update Desktop",
