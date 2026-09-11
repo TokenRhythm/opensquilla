@@ -1,4 +1,4 @@
-"""Iteration-cap extension, reasoning-only act-now, and sticky wrap-up thinking-off."""
+"""Iteration-cap extension, reasoning-only act-now, and deadline wrap-up."""
 
 from __future__ import annotations
 
@@ -393,7 +393,7 @@ async def test_reasoning_only_act_now_directive_not_carried_into_next_iteration(
 
 
 # ---------------------------------------------------------------------------
-# Sticky wrap-up thinking-off
+# Deadline wrap-up thinking contract
 # ---------------------------------------------------------------------------
 
 
@@ -410,53 +410,9 @@ def _preempted_reasoning_stream() -> list[Any]:
 
 
 @pytest.mark.asyncio
-async def test_deadline_wrapup_sticky_thinking_off_covers_later_calls(
+async def test_deadline_wrapup_preempt_preserves_thinking(
     tmp_path: Path,
 ) -> None:
-    events_path = tmp_path / "events.jsonl"
-    provider = _SequenceProvider(
-        [_preempted_reasoning_stream(), _echo_tool_call("use-1"), _final_text()]
-    )
-    agent = _echo_agent(
-        provider,
-        AgentConfig(
-            thinking=ThinkingLevel.MEDIUM,
-            timeout=8.0,
-            deadline_wrapup_margin_seconds=6,
-            deadline_wrapup_sticky_thinking_off=True,
-            max_iterations=5,
-            retry_base_backoff_ms=0,
-            retry_max_backoff_ms=0,
-            runtime_events_path=str(events_path),
-        ),
-    )
-
-    events = [event async for event in agent.run_turn("fix the bug")]
-
-    assert any(event.kind == "done" for event in events)
-    assert len(provider.calls) == 3
-    assert provider.calls[0]["config"].thinking is True
-    assert provider.calls[1]["config"].thinking is False
-    # Sticky: the next iteration stays thinking-disabled instead of burning
-    # the remaining margin on another reasoning stream.
-    assert provider.calls[2]["config"].thinking is False
-    recorded = _runtime_events(events_path, "deadline_wrapup")
-    sticky = [
-        event
-        for event in recorded
-        if event["name"] == "deadline_wrapup.sticky_thinking_off"
-    ]
-    assert len(sticky) == 1
-    assert sticky[0]["action"] == "disable_thinking_until_deadline"
-    assert sticky[0]["reason"] == "reasoning_stream_preempt"
-
-
-@pytest.mark.asyncio
-async def test_deadline_wrapup_preempt_default_reenables_thinking(
-    tmp_path: Path,
-) -> None:
-    # Documents the gap the sticky lever closes: the one-shot preempt covers
-    # only the retry, and the next iteration thinks again.
     events_path = tmp_path / "events.jsonl"
     provider = _SequenceProvider(
         [_preempted_reasoning_stream(), _echo_tool_call("use-1"), _final_text()]
@@ -478,14 +434,7 @@ async def test_deadline_wrapup_preempt_default_reenables_thinking(
 
     assert any(event.kind == "done" for event in events)
     assert len(provider.calls) == 3
-    assert provider.calls[1]["config"].thinking is False
-    assert provider.calls[2]["config"].thinking is True
-    recorded = _runtime_events(events_path, "deadline_wrapup")
-    assert not [
-        event
-        for event in recorded
-        if event["name"] == "deadline_wrapup.sticky_thinking_off"
-    ]
+    assert all(call["config"].thinking is True for call in provider.calls)
 
 
 # ---------------------------------------------------------------------------
@@ -508,7 +457,6 @@ def test_env_plumbing_for_endgame_package_levers(
     ]
     bool_envs = [
         "OPENSQUILLA_FINAL_DIFF_SALVAGE_VETO",
-        "OPENSQUILLA_DEADLINE_WRAPUP_STICKY_THINKING_OFF",
         "OPENSQUILLA_REASONING_ONLY_ACT_NOW",
     ]
     for name in [*int_envs, *bool_envs]:
@@ -528,5 +476,4 @@ def test_agent_config_defaults_keep_endgame_package_off() -> None:
 
     assert config.max_iterations_deadline_extend_seconds == 0
     assert config.final_diff_salvage_veto is False
-    assert config.deadline_wrapup_sticky_thinking_off is False
     assert config.reasoning_only_act_now is False

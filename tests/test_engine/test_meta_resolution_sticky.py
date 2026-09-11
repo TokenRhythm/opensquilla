@@ -249,17 +249,32 @@ async def test_followup_without_trigger_replays_from_sticky():
 
 
 @pytest.mark.asyncio
-async def test_sticky_replay_clamps_thinking_to_low():
+async def test_sticky_replay_preserves_thinking_metadata():
     skills = [_meta_spec(name="meta-paper-write", triggers=("帮我写篇论文",))]
-    ctx_fresh = _ctx(message="帮我写篇论文", session_id="S-C", skills=skills)
+    thinking = {
+        "thinking_level": "high",
+        "thinking_requested": True,
+        "thinking_source": "squilla_router_tier",
+    }
+    ctx_fresh = _ctx(
+        message="帮我写篇论文",
+        session_id="S-C",
+        skills=skills,
+        metadata=thinking,
+    )
     out_fresh = await meta_resolution(ctx_fresh)
-    assert out_fresh.metadata.get("thinking_level") == "low"
-    assert out_fresh.metadata.get("thinking_source") == "meta_resolution"
+    assert out_fresh.metadata.get("thinking_level") == "high"
+    assert out_fresh.metadata.get("thinking_source") == "squilla_router_tier"
 
-    ctx_followup = _ctx(message="补充细节", session_id="S-C", skills=skills)
+    ctx_followup = _ctx(
+        message="补充细节",
+        session_id="S-C",
+        skills=skills,
+        metadata=thinking,
+    )
     out_followup = await meta_resolution(ctx_followup)
     assert out_followup.metadata.get("meta_match_sticky") is True
-    assert out_followup.metadata.get("thinking_level") == "low"
+    assert out_followup.metadata.get("thinking_level") == "high"
 
 
 @pytest.mark.asyncio

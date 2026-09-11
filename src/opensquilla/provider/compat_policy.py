@@ -193,7 +193,6 @@ class ReasoningModelRule:
     reasoning_format: str = ""
     low_effort_model_ids: frozenset[str] = frozenset()
     thinking_tool_choice_auto_only: bool = False
-    prefer_pinned_tool_choice_over_thinking: bool = False
 
     def matches(self, model: str, base_url: str) -> bool:
         """Match only a trusted raw model id and an exact HTTPS API root."""
@@ -336,7 +335,8 @@ class OpenAICompatPolicy:
     # endpoints). When a disable-thinking payload would be emitted for a model
     # matching one of these prefixes, the off-payload is omitted entirely so
     # the request still succeeds. Checked at the single wire emitter in
-    # openai.py, covering all five agent-loop disable sites at once.
+    # openai.py so every explicit thinking-off request follows the same model
+    # constraint.
     thinking_required_model_prefixes: tuple[str, ...] = ()
 
     # Exact forced-thinking ids for multi-family endpoints where a prefix
@@ -362,11 +362,6 @@ class OpenAICompatPolicy:
     # accept or emit an explicit enable_thinking toggle.  Their tool selector
     # follows the same auto/none restriction as an explicitly enabled request.
     implicit_thinking_tool_choice_model_ids: frozenset[str] = frozenset()
-    # When a non-forced model receives an explicit pinned tool selector,
-    # preserve the selector by disabling thinking instead of silently changing
-    # the selected function. Forced-thinking models still normalize to auto.
-    prefer_pinned_tool_choice_over_thinking: bool = False
-
     # Models that require tool_stream=True whenever tools are present.
     tool_stream_model_ids: frozenset[str] = frozenset()
 
@@ -560,7 +555,6 @@ _POLICIES_BY_KIND: dict[str, OpenAICompatPolicy] = {
             QWEN_TOKEN_PLAN_KIMI_MODEL_IDS
         ),
         thinking_tool_choice_auto_only=True,
-        prefer_pinned_tool_choice_over_thinking=True,
         tool_stream_model_ids=QWEN_TOKEN_PLAN_GLM_MODEL_IDS,
         temperature_floor_model_ids=frozenset({"qwen3.8-max-preview"}),
         temperature_floor=0.6,
@@ -646,7 +640,6 @@ _POLICIES_BY_KIND: dict[str, OpenAICompatPolicy] = {
                 reasoning_format="deepseek",
                 low_effort_model_ids=_TOKENRHYTHM_V4_LOW_EFFORT_MODEL_IDS,
                 thinking_tool_choice_auto_only=True,
-                prefer_pinned_tool_choice_over_thinking=True,
             ),
             # Custom endpoints keep the previous exact-id replay behavior but
             # do not inherit TokenRhythm's official controls or field limit.

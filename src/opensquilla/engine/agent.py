@@ -2329,31 +2329,6 @@ def _classify_provider_attempt(
     )
 
 
-def _chat_config_with_thinking_disabled(chat_cfg: ChatConfig) -> ChatConfig:
-    return ChatConfig(
-        max_tokens=chat_cfg.max_tokens,
-        temperature=chat_cfg.temperature,
-        top_p=chat_cfg.top_p,
-        system=chat_cfg.system,
-        thinking=False,
-        thinking_budget_tokens=0,
-        thinking_budget_explicit=False,
-        timeout=chat_cfg.timeout,
-        stop_sequences=chat_cfg.stop_sequences,
-        cache_breakpoints=chat_cfg.cache_breakpoints,
-        cache_mode=chat_cfg.cache_mode,
-        output_json_schema=chat_cfg.output_json_schema,
-        output_json_schema_strict=chat_cfg.output_json_schema_strict,
-        model_capabilities=chat_cfg.model_capabilities,
-        model_vision_support=chat_cfg.model_vision_support,
-        thinking_level=ThinkingLevel.OFF,
-        provider_request_max_chars=chat_cfg.provider_request_max_chars,
-        context_window_tokens_global_override=(chat_cfg.context_window_tokens_global_override),
-        provider_request_max_chars_explicit_cap=(chat_cfg.provider_request_max_chars_explicit_cap),
-        tool_choice=chat_cfg.tool_choice,
-    )
-
-
 def _strip_historical_image_blocks(
     messages: list[Message],
     *,
@@ -6169,9 +6144,6 @@ class Agent:
             context_window_tokens=self.config.context_window_tokens,
             max_output_tokens=self.config.max_tokens,
         )
-        _thinking_fallback_done = False
-        _disable_thinking_for_next_provider_call = False
-
         _log = structlog.get_logger("opensquilla.engine.agent")
 
         def _positive_float(value: Any) -> float | None:
@@ -6315,7 +6287,6 @@ class Agent:
         max_iterations_deadline_extension_logged = False
         deadline_wrapup_armed = False
         deadline_wrapup_message: Message | None = None
-        deadline_thinking_off_armed = False
         reasoning_only_act_now_message: Message | None = None
         workspace_diff_recovery_attempted = False
         failed_tool_finalization_recovery_keys: set[str] = set()
@@ -7655,14 +7626,6 @@ class Agent:
                         call_chat_cfg = call_chat_cfg.model_copy(
                             update={"tool_choice": forced_tool_choice}
                         )
-                    _attempt_thinking_disabled = False
-                    if _disable_thinking_for_next_provider_call:
-                        call_chat_cfg = _chat_config_with_thinking_disabled(call_chat_cfg)
-                        _disable_thinking_for_next_provider_call = False
-                        _attempt_thinking_disabled = True
-                    if deadline_thinking_off_armed:
-                        call_chat_cfg = _chat_config_with_thinking_disabled(call_chat_cfg)
-                        _attempt_thinking_disabled = True
                     if _total_deadline is not None:
                         call_chat_cfg = call_chat_cfg.model_copy(
                             update={
@@ -8365,45 +8328,6 @@ class Agent:
                                         ),
                                     )
                                     deadline_wrapup_armed = True
-                                    # The retry runs thinking-disabled: the
-                                    # margin exists to spend the last stretch
-                                    # answering, and a thinking-on retry can
-                                    # burn the entire remainder on another
-                                    # reasoning mega-stream that the hard
-                                    # deadline then kills with nothing
-                                    # delivered.
-                                    _disable_thinking_for_next_provider_call = True
-                                    if bool(
-                                        getattr(
-                                            self.config,
-                                            "deadline_wrapup_sticky_thinking_off",
-                                            False,
-                                        )
-                                    ):
-                                        # Sticky variant: the one-shot above
-                                        # covers only the retry; the next
-                                        # iteration re-enables thinking and can
-                                        # spend the rest of the margin on
-                                        # another mega-stream. Arming the
-                                        # deadline cutoff keeps every remaining
-                                        # call thinking-disabled.
-                                        deadline_thinking_off_armed = True
-                                        append_runtime_event(
-                                            self.config.runtime_events_path,
-                                            {
-                                                "feature": "deadline_wrapup",
-                                                "name": ("deadline_wrapup.sticky_thinking_off"),
-                                                "action": ("disable_thinking_until_deadline"),
-                                                "reason": ("reasoning_stream_preempt"),
-                                                "iteration": iterations,
-                                                "attempt": _call_attempt,
-                                                "session_key": self._session_key,
-                                                "agent_id": (
-                                                    self.config.tool_result_store_agent_id
-                                                    or self.config.metadata.get("agent_id")
-                                                ),
-                                            },
-                                        )
                                     self._write_turn_call_log(
                                         "turn_policy_decision",
                                         action="deadline_wrapup",
@@ -9012,31 +8936,6 @@ class Agent:
                                         last_actual_provider = usage_default_provider
                                     cost_receipt_counted = True
                                     turn_has_error_usage_receipt = True
-                                # One-shot thinking/reasoning fallback
-                                _err_lower = raw_ev.message.lower()
-                                _stream_image_failure = classify_image_failure(
-                                    raw_ev,
-                                    provider_name=getattr(
-                                        self.provider,
-                                        "provider_name",
-                                        "",
-                                    ),
-                                )
-                                if (
-                                    thinking_enabled
-                                    and not _thinking_fallback_done
-                                    and self.config.provider_error_thinking_fallback
-                                    and not goal_terminal_final_response_pending
-                                    and not _stream_image_failure.is_unsupported
-                                    and not attempt_irreversible_output_emitted
-                                    and not turn_image_retry_barrier_crossed
-                                    and ("thinking" in _err_lower or "reasoning" in _err_lower)
-                                ):
-                                    _thinking_fallback_done = True
-                                    _disable_thinking_for_next_provider_call = True
-                                    _got_error = True
-                                    break  # break stream, retry
-
                                 provider_error = raw_ev
                                 _got_error = True
                                 break  # break stream loop
@@ -9482,13 +9381,6 @@ class Agent:
                             attempt_classification.kind,
                             input_tokens=iter_input_tokens,
                         )
-                        if (
-                            large_context_invalid
-                            and attempt_classification.kind == _ProviderAttemptKind.REASONING_ONLY
-                            and (attempt_classification.stop_reason or "").lower() == "length"
-                        ):
-                            _thinking_fallback_done = True
-                            _disable_thinking_for_next_provider_call = True
                         supports_reasoning_replay = supports_reasoning_prefill_replay(
                             model_capabilities=self.config.model_capabilities,
                             reasoning_content=iter_reasoning_content,
@@ -9732,18 +9624,6 @@ class Agent:
                                             provider_default_reasoning=not thinking_enabled,
                                         )
                                     )
-                                disable_thinking = (
-                                    attempt_classification.stop_reason or ""
-                                ).lower() == "length" or bool(
-                                    getattr(
-                                        self.config,
-                                        "reasoning_only_thinking_fallback",
-                                        False,
-                                    )
-                                )
-                                if disable_thinking:
-                                    _thinking_fallback_done = True
-                                    _disable_thinking_for_next_provider_call = True
                                 logger.warning(
                                     "provider.large_context_visible_retry",
                                     session_key=self._session_key,
@@ -9762,7 +9642,6 @@ class Agent:
                                     iter_output_tokens=iter_output_tokens,
                                     iter_reasoning_tokens=iter_reasoning_tokens,
                                     reasoning_chars=len(iter_reasoning_content or ""),
-                                    thinking_disabled=disable_thinking,
                                     configured_max_tokens=max(
                                         0,
                                         int(getattr(call_chat_cfg, "max_tokens", 0) or 0),
@@ -9803,12 +9682,8 @@ class Agent:
                                         code="provider_large_context_visible_retry",
                                         message=(
                                             "The provider returned reasoning without visible "
-                                            "content for a large input; "
-                                            + (
-                                                "retrying once with thinking disabled."
-                                                if disable_thinking
-                                                else ("retrying once to request visible content.")
-                                            )
+                                            "content for a large input; retrying once to "
+                                            "request visible content."
                                         ),
                                     )
                                 next_provider_activity_reason = "reasoning_only"
@@ -9891,14 +9766,6 @@ class Agent:
                                         provider_default_reasoning=not thinking_enabled,
                                     )
                                 )
-                            disable_thinking = bool(
-                                thinking_enabled
-                                and getattr(
-                                    self.config,
-                                    "reasoning_only_thinking_fallback",
-                                    False,
-                                )
-                            )
                             reasoning_output_budget_exhausted = (
                                 attempt_classification.stop_reason or ""
                             ).lower() == "length"
@@ -9915,17 +9782,7 @@ class Agent:
                                     reasoning_tokens=iter_reasoning_tokens,
                                     reasoning_content=iter_reasoning_content,
                                 )
-                            if disable_thinking:
-                                _thinking_fallback_done = True
-                                _disable_thinking_for_next_provider_call = True
-                                yield WarningEvent(
-                                    code="provider_reasoning_only_retry",
-                                    message=(
-                                        "The provider returned reasoning without visible "
-                                        "content; retrying once with thinking disabled."
-                                    ),
-                                )
-                            elif reasoning_output_budget_exhausted:
+                            if reasoning_output_budget_exhausted:
                                 yield WarningEvent(
                                     code="provider_reasoning_only_retry",
                                     message=(
@@ -19632,14 +19489,11 @@ class Agent:
                 self.config.identical_request_loop_break_threshold
             ),
             deadline_wrapup_margin_seconds=self.config.deadline_wrapup_margin_seconds,
-            reasoning_only_thinking_fallback=self.config.reasoning_only_thinking_fallback,
-            provider_error_thinking_fallback=(self.config.provider_error_thinking_fallback),
             final_diff_salvage=self.config.final_diff_salvage,
             max_iterations_deadline_extend_seconds=(
                 self.config.max_iterations_deadline_extend_seconds
             ),
             final_diff_salvage_veto=self.config.final_diff_salvage_veto,
-            deadline_wrapup_sticky_thinking_off=(self.config.deadline_wrapup_sticky_thinking_off),
             reasoning_only_act_now=self.config.reasoning_only_act_now,
             repeated_tool_call_recovery_threshold=(
                 self.config.repeated_tool_call_recovery_threshold
