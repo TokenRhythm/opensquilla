@@ -318,12 +318,19 @@ async def test_capture_respects_operator_budget_overrides(tmp_path: Path) -> Non
         denied = await BoundedOutputCapture.create("exec")
         assert denied.spool is None
         assert denied.storage_error == "ToolResultStoreBudgetError"
-        capture.feed(b"x" * 1024 + b"latest diagnostic")
+        capture.feed(b"FIRST_OUTPUT_835\n" + b"x" * 1024 + b"\nFINAL_EIO_927")
         await capture.finish_async()
         assert capture.handle is not None
         record = ToolResultStore(tmp_path).read(capture.handle, session_id="test-session")
         assert record.size_bytes <= 128
-        assert "latest diagnostic" in record.content
+        assert "FIRST_OUTPUT_835" in record.content
+        assert "FINAL_EIO_927" in record.content
+        assert capture.describe()["retained_output_complete"] is False
+        # Completed background jobs release their large preview and query the
+        # retained record. The actual error must survive that transition too.
+        capture.release_preview()
+        restored = await capture.preview_async()
+        assert "FIRST_OUTPUT_835" in restored and "FINAL_EIO_927" in restored
     finally:
         current_tool_context.reset(token)
 
@@ -463,7 +470,164 @@ def test_multistream_spool_keeps_split_utf8_intact(tmp_path: Path) -> None:
     assert capture.handle
     retained = ToolResultStore(tmp_path).read(capture.handle, session_id="test-session").content
     assert "�" not in retained
-    assert "你" in retained and "好" in retained and "diagnostic" in retained
+    assert "你好" in retained and "diagnostic" in retained
+
+
+@pytest.mark.parametrize(
+    ("fallback_encoding", "legacy_text"),
+    [
+        ("cp936", "中文错误：文件不存在"),
+        ("cp932", "日本語エラー：ファイルがありません"),
+    ],
+)
+@pytest.mark.parametrize("legacy_stream", ["stdout", "stderr"])
+def test_multistream_retention_preserves_independent_legacy_and_utf8_encoding(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    fallback_encoding: str, legacy_text: str, legacy_stream: str,
+) -> None:
+    from functools import partial
+
+    from opensquilla.subprocess_encoding import decode_subprocess_output
+    from opensquilla.tools import output_capture
+
+    # Exercise the Windows code-page decision on every host. A Python process
+    # can forward a native child's legacy output while its own stream is UTF-8.
+    monkeypatch.setattr(output_capture, "decode_subprocess_output", partial(
+        decode_subprocess_output, fallback_encoding=fallback_encoding,
+    ))
+    capture = BoundedOutputCapture(streams=("stdout", "stderr"))
+    capture.spool = _spool(ToolResultStore(tmp_path))
+    utf8_text = "UTF8_MESSAGE_184：你好、日本語、🙂"
+    utf8_stream = "stderr" if legacy_stream == "stdout" else "stdout"
+    expected = {legacy_stream: legacy_text, utf8_stream: utf8_text}
+    encoded = {
+        legacy_stream: legacy_text.encode(fallback_encoding),
+        utf8_stream: utf8_text.encode(),
+    }
+    # Interleaving single-byte fragments cuts every multibyte character. The
+    # retained content must not depend on which stream supplies the next read.
+    for offset in range(max(map(len, encoded.values()))):
+        for stream, raw in encoded.items():
+            if offset < len(raw):
+                capture.feed(raw[offset:offset + 1], stream)
+    capture.finish()
+    assert capture.handle is not None
+    record = ToolResultStore(tmp_path).read(capture.handle, session_id="test-session")
+    for stream, text in expected.items():
+        assert capture.preview(stream) == text
+        assert f"[{stream}]\n{text}" in record.content
+    assert "�" not in record.content
+    assert record.size_bytes <= capture.spool.max_bytes
+    assert capture.describe()["retained_output_complete"] is True
+
+
+@pytest.mark.parametrize(
+    ("fallback_encoding", "legacy_text"),
+    [("cp936", "中文诊断：文件不存在"), ("cp932", "日本語診断：ファイルがありません")],
+)
+async def test_execute_code_retains_native_child_bytes_alongside_utf8(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    fallback_encoding: str, legacy_text: str,
+) -> None:
+    from functools import partial
+
+    from opensquilla.sandbox.config import SandboxSettings
+    from opensquilla.sandbox.integration import configure_runtime, reset_runtime
+    from opensquilla.subprocess_encoding import decode_subprocess_output
+    from opensquilla.tools import output_capture
+    from opensquilla.tools.builtin import code_exec
+
+    monkeypatch.setattr(output_capture, "decode_subprocess_output", partial(
+        decode_subprocess_output, fallback_encoding=fallback_encoding,
+    ))
+    configure_runtime(SandboxSettings(sandbox=False, security_grading=False), workspace=tmp_path)
+    token = current_tool_context.set(ToolContext(
+        session_key="test-session", workspace_dir=str(tmp_path),
+        tool_result_store_dir=str(tmp_path / "store"), is_owner=True,
+    ))
+    utf8_text = "UTF8_PROCESS_289：你好、日本語、🙂"
+    code = (
+        "import os; "
+        f"os.write(1, bytes.fromhex({utf8_text.encode().hex()!r})); "
+        f"os.write(2, bytes.fromhex({legacy_text.encode(fallback_encoding).hex()!r}))"
+    )
+    try:
+        payload = json.loads(await code_exec.execute_code(code, timeout=10))
+        assert payload["exit_code"] == 0
+        assert payload["stdout"] == utf8_text
+        assert payload["stderr"] == legacy_text
+        retained = ToolResultStore(tmp_path / "store").read(
+            payload["output_capture"]["tool_result_handle"], session_id="test-session",
+        ).content
+        assert f"[stdout]\n{utf8_text}" in retained
+        assert f"[stderr]\n{legacy_text}" in retained
+        assert "�" not in retained
+        assert payload["output_capture"]["retained_output_complete"] is True
+    finally:
+        current_tool_context.reset(token)
+        reset_runtime()
+
+
+def test_small_output_after_spool_write_failure_retains_real_tail(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    capture = BoundedOutputCapture()
+    capture.spool = _spool(ToolResultStore(tmp_path))
+    capture.feed(b"SAVED_PREFIX_649\n")
+
+    def fail_write(_chunk: bytes) -> None:
+        raise OSError(28, "synthetic output write failure")
+
+    monkeypatch.setattr(capture.spool, "append", fail_write)
+    capture.feed(b"FINAL_WRITE_ERROR_396\n")
+    capture.finish()
+    assert capture.handle is not None
+    retained = ToolResultStore(tmp_path).read(capture.handle, session_id="test-session").content
+    assert "SAVED_PREFIX_649" in retained
+    assert "FINAL_WRITE_ERROR_396" in retained
+    assert capture.describe()["retained_output_complete"] is False
+
+
+def test_decoding_expansion_preserves_latest_diagnostic_within_spool_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from functools import partial
+
+    from opensquilla.subprocess_encoding import decode_subprocess_output
+    from opensquilla.tools import output_capture
+
+    monkeypatch.setattr(output_capture, "decode_subprocess_output", partial(
+        decode_subprocess_output, fallback_encoding="cp936",
+    ))
+    capture = BoundedOutputCapture()
+    capture.spool = _spool(ToolResultStore(tmp_path), size=128)
+    raw = ("中" * 48 + "FINAL_EIO_748").encode("cp936")
+    assert len(raw) < capture.spool.max_bytes < len(raw.decode("cp936").encode())
+    capture.feed(raw)
+    capture.finish()
+    assert capture.handle is not None
+    record = ToolResultStore(tmp_path).read(capture.handle, session_id="test-session")
+    assert "FINAL_EIO_748" in record.content
+    assert record.size_bytes <= capture.spool.max_bytes
+    assert capture.describe()["retained_output_complete"] is False
+
+
+@pytest.mark.parametrize("spool_bytes", [1, 4, 5, 6, 127, 128])
+def test_capped_multistream_frames_never_expand_disk_budget(
+    tmp_path: Path, spool_bytes: int,
+) -> None:
+    capture = BoundedOutputCapture(streams=("stdout", "stderr"))
+    capture.spool = _spool(ToolResultStore(tmp_path), size=spool_bytes)
+    capture.feed("prefix你好".encode(), "stdout")
+    capture.feed(b"x" * 256 + b"FINAL_FRAME_684", "stderr")
+    capture.finish()
+    assert capture.handle is not None
+    record = ToolResultStore(tmp_path).read(capture.handle, session_id="test-session")
+    assert record.size_bytes <= spool_bytes
+    assert capture.spool.size <= spool_bytes
+    assert capture.describe()["retained_output_complete"] is False
+    if spool_bytes >= 127:
+        assert "FINAL_FRAME_684" in record.content
 
 
 

@@ -7,7 +7,7 @@ neither reaching the output budget nor a storage failure stops draining pipes.
 from __future__ import annotations
 
 import asyncio
-import codecs
+import struct
 import threading
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -28,6 +28,7 @@ OUTPUT_SETUP_WAIT_SECONDS = 5.0
 OUTPUT_FINALIZE_WAIT_SECONDS = 5.0
 OUTPUT_CANCEL_FINALIZE_WAIT_SECONDS = 0.25
 OUTPUT_CAPTURE_TIMEOUT_PADDING = OUTPUT_SETUP_WAIT_SECONDS + OUTPUT_FINALIZE_WAIT_SECONDS
+_OUTPUT_FRAME_HEADER = struct.Struct(">BI")
 
 
 def _close_late_spool(opening: asyncio.Task[ToolOutputSpool]) -> None:
@@ -78,6 +79,13 @@ class _Preview:
             + decode_subprocess_output(bytes(self.tail))
         )
 
+    def latest(self, limit: int) -> bytes:
+        if limit <= 0:
+            return b""
+        # Until head fills, the newest bytes still live there rather than in
+        # tail. A small disk budget can be exhausted well before that happens.
+        return bytes(self.head[-limit:] + self.tail)[-limit:]
+
 
 class BoundedOutputCapture:
     def __init__(
@@ -87,9 +95,9 @@ class BoundedOutputCapture:
         preview_bytes: int = OUTPUT_PREVIEW_BYTES,
     ) -> None:
         self.previews = {name: _Preview(max(2, preview_bytes // len(streams))) for name in streams}
-        self._decoders = {
-            name: codecs.getincrementaldecoder("utf-8")(errors="replace") for name in streams
-        } if len(streams) > 1 else {}
+        self._stream_names = tuple(self.previews)
+        self._stream_indexes = {name: index for index, name in enumerate(self._stream_names)}
+        self._framed_output = len(streams) > 1
         self.spool: ToolOutputSpool | None = None
         self.handle: str | None = None
         self.retrieval_available = False
@@ -162,10 +170,17 @@ class BoundedOutputCapture:
             # gateway event loop. Only reader workers wait for this write.
             if self.spool is not None and self.storage_error is None:
                 try:
-                    if self._decoders:
-                        text = self._decoders[stream].decode(chunk)
-                        if text:
-                            self.spool.append(f"\n[{stream}]\n{text}".encode())
+                    if self._framed_output:
+                        # Retain original bytes until each stream's encoding
+                        # can be selected independently. Python subprocesses
+                        # can mix UTF-8 with a native child's Windows code page.
+                        # Framing shares the existing spool cap, including a
+                        # final partial frame when that cap is reached.
+                        for offset in range(0, len(chunk), OUTPUT_READ_BYTES):
+                            fragment = chunk[offset:offset + OUTPUT_READ_BYTES]
+                            self.spool.append(_OUTPUT_FRAME_HEADER.pack(
+                                self._stream_indexes[stream], len(fragment),
+                            ) + fragment)
                     else:
                         self.spool.append(chunk)
                 except OSError as exc:
@@ -199,7 +214,7 @@ class BoundedOutputCapture:
                 return
             self._released_omitted = sum(view.omitted for view in self.previews.values())
             for name, view in self.previews.items():
-                recent = bytes(view.head[-4096:] + view.tail)[-4096:]
+                recent = view.latest(4096)
                 self._fallback_previews[name] = decode_subprocess_output(recent)
                 view.head.clear()
                 view.tail.clear()
@@ -279,20 +294,19 @@ class BoundedOutputCapture:
             if self.spool is None:
                 return
             try:
-                if not self.storage_error:
-                    for name, decoder in self._decoders.items():
-                        trailing = decoder.decode(b"", final=True)
-                        if trailing:
-                            self.spool.append(f"\n[{name}]\n{trailing}".encode())
                 raw = self.spool.prefix()
-                text = decode_subprocess_output(raw)
+                text = self._decode_retained_prefix(raw)
+                if len(text.encode("utf-8")) > self.spool.max_bytes:
+                    self.incomplete_reason = (
+                        self.incomplete_reason or "retained output exceeded its text budget"
+                    )
                 if (
                     self.spool.size >= self.spool.max_bytes
                     or self.storage_error or self.incomplete_reason
                 ):
                     tail = "\n".join(
                         f"[{name} latest diagnostics]\n"
-                        + decode_subprocess_output(bytes(view.tail))
+                        + decode_subprocess_output(view.latest(OUTPUT_PREVIEW_BYTES))
                         for name, view in self.previews.items()
                     )
                     marker = "\n[output omitted between retained prefix and latest diagnostics]\n"
@@ -322,6 +336,28 @@ class BoundedOutputCapture:
                 self.storage_error = type(exc).__name__
             finally:
                 self.spool.close()
+
+    def _decode_retained_prefix(self, raw: bytes) -> str:
+        if not self._framed_output:
+            return decode_subprocess_output(raw)
+        # These buffers together cannot exceed the one bounded spool prefix.
+        # Grouping by stream preserves multibyte characters split across reads
+        # and avoids decoding already-transcoded UTF-8 as a legacy code page.
+        streams = [bytearray() for _ in self._stream_names]
+        offset = 0
+        while offset + _OUTPUT_FRAME_HEADER.size <= len(raw):
+            stream_index, size = _OUTPUT_FRAME_HEADER.unpack_from(raw, offset)
+            offset += _OUTPUT_FRAME_HEADER.size
+            if stream_index >= len(streams) or size > OUTPUT_READ_BYTES:
+                raise ValueError("invalid retained output frame")
+            end = min(len(raw), offset + size)
+            streams[stream_index].extend(raw[offset:end])
+            offset = end
+        return "".join(
+            f"\n[{name}]\n{decode_subprocess_output(bytes(content))}"
+            for name, content in zip(self._stream_names, streams, strict=True)
+            if content
+        )
 
     def _finish_settled(self, task: asyncio.Task[None]) -> None:
         self._finalization_pending = False
