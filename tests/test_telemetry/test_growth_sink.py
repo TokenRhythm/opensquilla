@@ -148,6 +148,30 @@ async def test_started_and_success_are_enqueued_once_in_funnel_order(tmp_path) -
     assert state.first_turn_result.status is GrowthMilestoneStatus.ENQUEUED
 
 
+async def test_pending_first_turn_is_replayed_on_next_boundary(tmp_path) -> None:
+    config = _config(tmp_path)
+    _activate(config)
+    runtime = CapturingRuntime([RecordStatus.EVICTED, RecordStatus.RECORDED])
+    sink = _sink(runtime, config)
+
+    await sink.record_turn_started(STARTED_AT)
+    pending = read_gateway_growth_milestone_state(sink.marker_path)
+    assert pending.first_turn_started is not None
+    assert pending.first_turn_started.status is GrowthMilestoneStatus.PENDING
+    pending_id = pending.first_turn_started.event.event_id
+
+    await sink.replay_pending()
+
+    assert [event.event_name for event in runtime.events] == [
+        "first_turn_started",
+        "first_turn_started",
+    ]
+    assert runtime.events[1].event_id == pending_id
+    replayed = read_gateway_growth_milestone_state(sink.marker_path)
+    assert replayed.first_turn_started is not None
+    assert replayed.first_turn_started.status is GrowthMilestoneStatus.ENQUEUED
+
+
 async def test_evicted_event_keeps_stable_pending_payload_for_retry(tmp_path) -> None:
     config = _config(tmp_path)
     _activate(config)

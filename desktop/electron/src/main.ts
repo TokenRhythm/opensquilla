@@ -14181,6 +14181,10 @@ async function performOnboardingSave(
         applyDesktopLocaleChoice(payload.locale)
         await clearPendingMigrationProviderSetup()
       })
+      // Persist the growth milestone before the flow handoff can be
+      // interrupted by quit/update. The durable marker is replayed on the
+      // next launch if the spool write cannot finish here.
+      desktopGrowthTelemetry.recordOnboardingCompleted()
     } catch (error) {
       if (flow.state === 'saving') flow.state = 'editing'
       throw error
@@ -14214,7 +14218,6 @@ async function performOnboardingSave(
           'OpenSquilla setup is no longer active.',
         ))
       }
-      desktopGrowthTelemetry.recordOnboardingCompleted()
       return telemetry.recordReturned({ ok: true })
     })
   } finally {
