@@ -10062,7 +10062,7 @@ class TurnRunner:
             turn.metadata["ensemble_wrap_skipped_reason"] = reason
             _record_fixed_ensemble_execution(reason)
 
-        if provider is not None and (ensemble_globally_enabled or tier_ensemble_mode):
+        if provider is not None and fixed_baseline_ensemble:
             from opensquilla.engine.selector_override import (
                 acquire_profile_credential,
                 report_profile_credential_failure,

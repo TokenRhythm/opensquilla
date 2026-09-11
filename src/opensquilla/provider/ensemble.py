@@ -1667,12 +1667,12 @@ class EnsembleProvider:
             ),
             thinking_budget_tokens=thinking_budget_tokens,
             context_overflow_threshold=binding.context_overflow_threshold,
-            provider_request_proof_max_chars=max(
-                0,
-                int(binding.top_level_explicit_cap or 0),
-            ),
         ).snapshot()
-        safe_input_tokens = budget.provider_request_max_chars // CHARS_PER_TOKEN
+        request_max_chars = budget.provider_request_max_chars
+        explicit_cap = max(0, int(binding.top_level_explicit_cap or 0))
+        if explicit_cap > 0:
+            request_max_chars = min(request_max_chars, explicit_cap)
+        safe_input_tokens = request_max_chars // CHARS_PER_TOKEN
         if self._attachment_request_input_tokens > safe_input_tokens:
             return (
                 f"{role} attachment request exceeds its proven capacity; "
@@ -1704,6 +1704,12 @@ class EnsembleProvider:
                 member,
                 chat_config=chat_config,
             )
+            if unavailable is None:
+                unavailable = self._attachment_request_unavailability(
+                    member=member,
+                    chat_config=chat_config,
+                    role="Ensemble proposer",
+                )
             eligible = unavailable is None
             k = max(1, int(member.k or 1))
             if eligible:

@@ -3172,18 +3172,78 @@ async def test_tokenrhythm_ensemble_rebinds_request_cap_per_member_context(
     assert aggregator_trace["provider_request_max_chars_source"] == "member_context"
 
 
+@pytest.mark.parametrize(
+    ("attachment_input_tokens", "explicit_cap"),
+    [(10_000_000, 0), (10_000_000, 100_000_000), (1_000, 2_000)],
+)
 @pytest.mark.asyncio
 async def test_ensemble_skips_all_members_when_frozen_request_exceeds_capacity(
     monkeypatch: pytest.MonkeyPatch,
+    attachment_input_tokens: int,
+    explicit_cap: int,
 ) -> None:
     registry = _tokenrhythm_budget_registry()
     monkeypatch.setattr("opensquilla.provider.ensemble._build_provider", registry.provider_for)
-    provider = _build_tokenrhythm_budget_provider(attachment_input_tokens=10_000_000)
+    provider = _build_tokenrhythm_budget_provider(
+        attachment_input_tokens=attachment_input_tokens,
+        explicit_cap=explicit_cap,
+    )
 
     events = [event async for event in provider.chat([Message(role="user", content="x")])]
 
     assert registry.calls == []
     assert events
+
+
+@pytest.mark.asyncio
+async def test_attachment_capacity_quorum_failure_skips_otherwise_eligible_proposer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    small, large, aggregator, fallback_member = [
+        replace(_member(model, thinking="off"), max_tokens=1_000)
+        for model in ("small", "large", "aggregator", "fallback")
+    ]
+    registry = _FakeRegistry({
+        model: _FakePlan([TextDeltaEvent(text=model), DoneEvent(model=model)])
+        for model in ("small", "large", "aggregator", "fallback")
+    })
+    monkeypatch.setattr("opensquilla.provider.ensemble._build_provider", registry.provider_for)
+    reliable = _MemberRequestBudgetBinding(
+        context_window_tokens=128_000,
+        context_window_source="catalog",
+        context_overflow_threshold=0.85,
+        cap_source="member_context",
+        rederive=True,
+        inherit_top_level_cap=True,
+    )
+    provider = EnsembleProvider(
+        profile_name="attachment-quorum",
+        proposers=[small, large],
+        aggregator=aggregator,
+        fallback_provider=registry.provider_for(fallback_member.provider_config),
+        fallback_provider_name="fake",
+        fallback_model="fallback",
+        min_successful_proposers=2,
+        all_failed_policy="fallback_single",
+        _attachment_request_input_tokens=20_000,
+        _fallback_request_budget_member=fallback_member,
+        _member_request_budget_bindings={
+            ("fake", "small", ""): replace(reliable, context_window_tokens=16_000),
+            ("fake", "large", ""): reliable,
+            ("fake", "aggregator", ""): reliable,
+            ("fake", "fallback", ""): reliable,
+        },
+    )
+
+    events = [event async for event in provider.chat([Message(role="user", content="x")])]
+
+    assert [call["model"] for call in registry.calls] == ["fallback"]
+    done = next(event for event in events if isinstance(event, DoneEvent))
+    assert done.ensemble_trace is not None
+    candidates = {candidate["model"]: candidate for candidate in done.ensemble_trace["candidates"]}
+    assert candidates["small"]["error_code"] == "provider_request_budget_exhausted"
+    assert candidates["large"]["error_code"] == "quorum_unreachable"
+    assert not any(candidate["request_started"] for candidate in candidates.values())
 
 
 @pytest.mark.asyncio
