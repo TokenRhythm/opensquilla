@@ -127,7 +127,7 @@ function panel(overrides: Record<string, unknown> = {}) {
         perTurnCalls: 5,
         proposerCount: 4,
         proposerMaxRetries: 0,
-        proposerTimeoutSeconds: 120,
+        proposerTimeoutSeconds: 300,
         configuredAggregatorTimeoutSeconds: 3600,
         aggregatorTimeoutSeconds: 180,
       },

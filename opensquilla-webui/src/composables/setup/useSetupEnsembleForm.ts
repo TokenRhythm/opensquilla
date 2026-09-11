@@ -63,7 +63,7 @@ const DEFAULT_PROPOSER_MAX_RETRIES = 0
 // Runtime default replacements applied by the ensemble builder when the
 // stored value still equals the legacy default. The panel surfaces EFFECTIVE
 // values so what the user reads matches what actually runs.
-const STATIC_B5_PROPOSER_TIMEOUT_SECONDS = 120
+const STATIC_B5_PROPOSER_TIMEOUT_SECONDS = 300
 const STATIC_B5_AGGREGATOR_TIMEOUT_SECONDS = 180
 const CUSTOM_B5_PROPOSER_TIMEOUT_SECONDS = 300
 const CUSTOM_B5_AGGREGATOR_TIMEOUT_SECONDS = 480

@@ -3129,7 +3129,15 @@ class EnsembleProvider:
                 if self.proposer_timeout_seconds > 0
                 else None
             ),
-            reset_deadline_on_event=True,
+            # Proposers own an absolute per-attempt budget, not an idle budget.
+            # A renewable deadline lets one slow member hold the whole turn: the
+            # aggregator cannot start until every proposer reaches a terminal
+            # state, so a member that keeps emitting reasoning renews itself
+            # indefinitely while the user sees only "waiting for model". That
+            # reasoning is discarded below, so the renewals are not even
+            # user-visible progress. The aggregator keeps idle semantics because
+            # it streams its output straight to the user.
+            reset_deadline_on_event=False,
             on_request_start=mark_request_started,
         )
         async for event in provider_stream:
@@ -5163,11 +5171,16 @@ _LEGACY_ENSEMBLE_TIMEOUT_SECONDS = 3600.0
 _LEGACY_ENSEMBLE_SHUFFLE_CANDIDATES = True
 # Shared defaults for every static B5 profile (openrouter and tokenrhythm
 # lineups run the same aggregation logic).
-_STATIC_B5_DEFAULT_PROPOSER_TIMEOUT_SECONDS = 120.0
+# The proposer budget is absolute and is never refreshed by streaming activity,
+# so it has to cover a slow reasoning model's entire run rather than just the
+# gaps between its events. 120s cut off members that were still working, and
+# because aggregation drops a timed-out member, that silently removed them from
+# every lineup. 300s matches the custom-B5 budget.
+_STATIC_B5_DEFAULT_PROPOSER_TIMEOUT_SECONDS = 300.0
 _STATIC_B5_DEFAULT_AGGREGATOR_TIMEOUT_SECONDS = 180.0
 # Preserve the established fixed-lineup defaults for operator-authored custom
-# B5 profiles. Only packaged static profiles receive the tighter per-call
-# timeout policy.
+# B5 profiles. Packaged static profiles keep the tighter aggregator idle budget;
+# that one bounds silence, not total work, so it does not need the same room.
 _CUSTOM_B5_DEFAULT_PROPOSER_TIMEOUT_SECONDS = 300.0
 _CUSTOM_B5_DEFAULT_AGGREGATOR_TIMEOUT_SECONDS = 480.0
 _STATIC_B5_DEFAULT_SHUFFLE_CANDIDATES = False

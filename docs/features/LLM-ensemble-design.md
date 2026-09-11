@@ -197,7 +197,7 @@ Timeout defaults depend on the lineup family rather than the C3 policy source:
 
 | Lineup family | Proposer total timeout | Aggregator idle timeout |
 |---------------|------------------------|-------------------------|
-| Packaged static B5 | 120 seconds | 180 seconds |
+| Packaged static B5 | 300 seconds | 180 seconds |
 | Operator-authored `custom_b5` | 300 seconds | 480 seconds |
 | Legacy `router_dynamic` | 3600 seconds | 3600 seconds |
 
@@ -207,7 +207,13 @@ overrides are recorded alongside their effective values in the selection plan
 for diagnostics.
 
 The two timeout fields have intentionally different streaming semantics.
-`proposer_timeout_seconds` bounds each proposer's total execution time.
+`proposer_timeout_seconds` bounds each proposer's total execution time. Upstream
+activity never refreshes that budget: a proposer that keeps streaming text or
+reasoning is still cut off when it expires. This asymmetry is deliberate —
+aggregation cannot begin until every proposer is terminal, and proposer
+reasoning is discarded rather than surfaced, so a renewable proposer deadline
+would let one slow member hold the turn open indefinitely behind an idle
+progress indicator.
 `aggregator_timeout_seconds` is an idle/stall budget between upstream stream
 events, so an active aggregation may run longer than that value while a silent
 provider is still bounded. Host-generated keep-alive heartbeats do not reset
@@ -304,7 +310,7 @@ role = "aggregator"
 Static presets expose no lineup tuning — the models are fixed in code. Custom
 lineups are tuned entirely through the `candidates` list (subject to the bounds
 above). They share the same runtime mechanism, while packaged static profiles
-use 120/180-second proposer/aggregator defaults and custom lineups use 300/480
+use 300/180-second proposer/aggregator defaults and custom lineups use 300/480
 seconds. Operators may explicitly configure `min_successful_proposers`,
 `target_successful_proposers`, `proposer_max_retries`, `all_failed_policy`,
 `proposer_timeout_seconds`, `aggregator_timeout_seconds`, and

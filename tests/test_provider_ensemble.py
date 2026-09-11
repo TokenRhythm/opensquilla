@@ -6210,6 +6210,92 @@ async def test_all_started_proposers_reach_terminal_before_aggregation(
 
 
 @pytest.mark.asyncio
+async def test_steady_reasoning_proposer_still_hits_absolute_attempt_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Regression: `proposer_timeout_seconds` is a TOTAL per-attempt budget, not an
+    # idle budget. Aggregation cannot start until every proposer is terminal, so a
+    # member that keeps emitting reasoning must not be able to renew its deadline
+    # forever — that pins the whole turn on "waiting for model" with nothing shown
+    # to the user, because proposer reasoning is discarded rather than rendered.
+    reasoning_chunks = 0
+
+    class _EndlessReasoningProvider(_ExactProjectionMixin):
+        provider_name = "fake"
+
+        def __init__(self, cfg: ProviderConfig) -> None:
+            self._cfg = cfg
+            self._projection_model = cfg.model
+
+        def chat(
+            self,
+            messages: list[Message],
+            tools: list[ToolDefinition] | None = None,
+            config: ChatConfig | None = None,
+        ) -> AsyncIterator[StreamEvent]:
+            return self._chat()
+
+        async def _chat(self) -> AsyncIterator[StreamEvent]:
+            nonlocal reasoning_chunks
+            while True:
+                await asyncio.sleep(0.005)
+                reasoning_chunks += 1
+                yield ReasoningDeltaEvent(text="still thinking")
+
+        async def list_models(self) -> list[Any]:
+            return []
+
+    fast = _FakeRegistry(
+        {
+            "fast": _FakePlan([TextDeltaEvent(text="draft"), DoneEvent(model="fast")]),
+            "agg": _FakePlan([TextDeltaEvent(text="final"), DoneEvent(model="agg")]),
+        }
+    )
+
+    def _provider_for(cfg: ProviderConfig) -> Any:
+        if cfg.model == "slow":
+            return _EndlessReasoningProvider(cfg)
+        return fast.provider_for(cfg)
+
+    monkeypatch.setattr("opensquilla.provider.ensemble._build_provider", _provider_for)
+    monkeypatch.setattr(
+        "opensquilla.provider.ensemble._ENSEMBLE_HEARTBEAT_INTERVAL_SECONDS",
+        0.005,
+    )
+    provider = EnsembleProvider(
+        profile_name="absolute-budget",
+        proposers=[_member("fast"), _member("slow")],
+        aggregator=_member("agg"),
+        min_successful_proposers=1,
+        proposer_timeout_seconds=0.15,
+        aggregator_timeout_seconds=2,
+        shuffle_candidates=False,
+    )
+
+    # Before the fix this hangs: every reasoning chunk bought another full budget.
+    events = await asyncio.wait_for(_collect(provider), timeout=5.0)
+
+    slow_finish = next(
+        event
+        for event in events
+        if isinstance(event, EnsembleProgressEvent)
+        and event.event_type == "proposer_finish"
+        and event.proposer_model == "slow"
+    )
+    assert "timed out" in (slow_finish.error or "")
+    # The budget is absolute, so it cannot scale with how much reasoning arrived.
+    assert reasoning_chunks > 1, "provider must have streamed before the deadline"
+    assert slow_finish.elapsed_ms is not None
+    assert slow_finish.elapsed_ms < 1000
+
+    # The surviving draft still aggregates: a timed-out member degrades the lineup
+    # rather than failing the turn.
+    done = next(event for event in events if isinstance(event, DoneEvent))
+    assert done.ensemble_trace is not None
+    assert done.ensemble_trace["successful_proposers"] == 1
+
+
+@pytest.mark.asyncio
 async def test_transient_partial_504_honors_configured_retries_then_uses_other_drafts(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

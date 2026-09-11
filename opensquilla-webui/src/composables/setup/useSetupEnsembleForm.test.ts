@@ -1018,7 +1018,7 @@ describe('useSetupEnsembleForm — panel contract', () => {
       perTurnCalls: 5,
       proposerCount: 4,
       proposerMaxRetries: 0,
-      proposerTimeoutSeconds: 120,
+      proposerTimeoutSeconds: 300,
       configuredAggregatorTimeoutSeconds: 3600,
       aggregatorTimeoutSeconds: 180,
     })
@@ -1093,7 +1093,7 @@ describe('useSetupEnsembleForm — effective timeout facts', () => {
       aggregator_timeout_seconds: 3600,
     })
     const legacyFacts = makePanel(explicitLegacy, 'openrouter').value.presetFacts
-    expect(legacyFacts.proposerTimeoutSeconds).toBe(120)
+    expect(legacyFacts.proposerTimeoutSeconds).toBe(300)
     expect(legacyFacts.configuredAggregatorTimeoutSeconds).toBe(3600)
     expect(legacyFacts.aggregatorTimeoutSeconds).toBe(180)
 
@@ -1101,7 +1101,7 @@ describe('useSetupEnsembleForm — effective timeout facts', () => {
     const absent = useSetupEnsembleForm()
     absent.initFromConfig({ enabled: true, selection_mode: 'static_openrouter_b5' })
     const absentFacts = makePanel(absent, 'openrouter').value.presetFacts
-    expect(absentFacts.proposerTimeoutSeconds).toBe(120)
+    expect(absentFacts.proposerTimeoutSeconds).toBe(300)
     expect(absentFacts.configuredAggregatorTimeoutSeconds).toBe(3600)
     expect(absentFacts.aggregatorTimeoutSeconds).toBe(180)
   })
