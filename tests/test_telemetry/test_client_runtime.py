@@ -187,15 +187,24 @@ async def test_background_record_from_worker_returns_to_owner_loop(
         config=_config(state_dir, reliability=True, growth=False),
         upload_interval_seconds=60,
     )
+    owner_loop = asyncio.get_running_loop()
+    recorded = asyncio.Event()
+    record_loops = []
+    record = runtime.record
+
+    async def capture_record(event, **kwargs):
+        record_loops.append(asyncio.get_running_loop())
+        result = await record(event, **kwargs)
+        recorded.set()
+        return result
+
+    monkeypatch.setattr(runtime, "record", capture_record)
     await runtime.start()
     try:
         await asyncio.to_thread(runtime.record_background, _turn_event())
-        for _ in range(20):
-            scoped = runtime._scopes.get(TelemetryScope.RELIABILITY)
-            if scoped is not None and (await scoped.outbox.stats()).pending_events == 1:
-                break
-            await asyncio.sleep(0.01)
-        assert scoped is not None
+        await asyncio.wait_for(recorded.wait(), timeout=10)
+        assert record_loops == [owner_loop]
+        scoped = runtime._scopes[TelemetryScope.RELIABILITY]
         assert (await scoped.outbox.stats()).pending_events == 1
     finally:
         await runtime.close()
