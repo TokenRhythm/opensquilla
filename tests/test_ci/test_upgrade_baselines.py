@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import hashlib
+import importlib.util
 import json
 import os
 import shutil
+import sqlite3
 import subprocess
+from contextlib import closing
 from pathlib import Path
 
 import pytest
@@ -13,6 +16,121 @@ import yaml
 ROOT = Path(__file__).resolve().parents[2]
 SCRIPTS = ROOT / ".github" / "scripts"
 DRIVER = ROOT / "desktop/electron/scripts/test-packaged-real-update-flow.mjs"
+
+
+@pytest.fixture
+def complete_v054_profile(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.syspath_prepend(str(SCRIPTS))
+    import upgrade_baseline
+
+    spec = importlib.util.spec_from_file_location(
+        "v054_preservation", SCRIPTS / "verify-release-profile-preservation.py"
+    )
+    assert spec and spec.loader
+    probe = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(probe)
+    home = tmp_path / "legacy-profile"
+    probe.seed_profile(home, "v054", baseline_version="0.5.4")
+    probe.verify_profile(home, "v054")
+    return home, probe, upgrade_baseline
+
+
+def test_complete_v054_fixture_retains_original_files_and_both_v010_ids(complete_v054_profile):
+    home, _, baseline = complete_v054_profile
+    manifest = baseline.manifest()
+    assert len(manifest["migration_files"]) == 41
+    for name, digest in manifest["migration_files"].items():
+        # The baseline hashes Git blobs; Windows checkouts may use CRLF.
+        payload = (ROOT / "migrations" / name).read_text(encoding="utf-8").encode("utf-8")
+        assert hashlib.sha256(payload).hexdigest() == digest
+    ledger = baseline.verify_ledger(home / "state/sessions.db", exact=True)
+    assert {key for key in ledger if key.startswith("V010__")} == {
+        "V010__meta_skill_runs", "V010__transcript_turn_usage",
+    }
+
+
+def test_complete_v054_upgrade_preserves_history_and_is_idempotent(complete_v054_profile):
+    from opensquilla.persistence.migrator import apply_pending
+
+    home, probe, baseline = complete_v054_profile
+    database = home / "state/sessions.db"
+    original = baseline.read_ledger(database)
+    candidate_ids = {path.stem for path in (ROOT / "migrations").glob("V*.py")}
+    assert set(apply_pending(str(database), ROOT / "migrations")) == candidate_ids - original.keys()
+    assert set(baseline.verify_ledger(database)) == candidate_ids
+    probe.verify_profile(home, "v054")
+    assert apply_pending(str(database), ROOT / "migrations") == []
+    probe.verify_profile(home, "v054")
+    with closing(sqlite3.connect(database)) as connection:
+        assert connection.execute("PRAGMA integrity_check").fetchone() == ("ok",)
+
+
+@pytest.mark.parametrize("missing", [
+    "V010__meta_skill_runs.py", "V010__transcript_turn_usage.py", "V040__document_resources.py",
+])
+def test_complete_v054_missing_migration_refuses_without_writes_then_recovers(
+    complete_v054_profile, tmp_path: Path, missing: str,
+):
+    from opensquilla.persistence.migrator import SchemaAheadError, apply_pending
+
+    home, probe, baseline = complete_v054_profile
+    database = home / "state/sessions.db"
+    incomplete = tmp_path / "incomplete"
+    shutil.copytree(ROOT / "migrations", incomplete)
+    (incomplete / missing).unlink()
+    before = database.read_bytes()
+    with pytest.raises(SchemaAheadError, match=Path(missing).stem):
+        apply_pending(str(database), incomplete)
+    assert database.read_bytes() == before
+    baseline.verify_ledger(database, exact=True)
+    probe.verify_profile(home, "v054")
+    apply_pending(str(database), ROOT / "migrations")
+    probe.verify_profile(home, "v054")
+    assert apply_pending(str(database), ROOT / "migrations") == []
+
+
+def test_complete_v054_seed_refuses_overwrite(complete_v054_profile):
+    home, probe, _ = complete_v054_profile
+    before = (home / "state/sessions.db").read_bytes()
+    with pytest.raises(FileExistsError):
+        probe.seed_profile(home, "v054", baseline_version="0.5.4")
+    assert (home / "state/sessions.db").read_bytes() == before
+
+
+def test_complete_v054_seed_rejects_tampered_sql(complete_v054_profile, tmp_path, monkeypatch):
+    _, probe, baseline = complete_v054_profile
+    fixture = tmp_path / "tampered"
+    shutil.copytree(baseline.FIXTURE, fixture)
+    with (fixture / "sessions.sql").open("ab") as stream:
+        stream.write(b"\n-- changed\n")
+    monkeypatch.setattr(baseline, "FIXTURE", fixture)
+    with pytest.raises(ValueError, match="SQL digest mismatch"):
+        probe.seed_profile(tmp_path / "new-profile", "v054", baseline_version="0.5.4")
+
+
+def test_complete_v054_ledger_verification_rejects_missing_old_id(complete_v054_profile):
+    home, _, baseline = complete_v054_profile
+    database = home / "state/sessions.db"
+    with closing(sqlite3.connect(database)) as connection, connection:
+        connection.execute("DELETE FROM _yoyo_migration WHERE migration_id = ?", (
+            "V040__document_resources",
+        ))
+    with pytest.raises(AssertionError, match="V040__document_resources"):
+        baseline.verify_ledger(database)
+
+
+def test_windows_upgrade_gates_complete_old_ledger_before_install_and_after_restart():
+    source = (SCRIPTS / "verify-release-windows-upgrade.ps1").read_text(encoding="utf-8")
+    seed = source.index("python $probe seed --home $migrationProfile")
+    candidate_install = source.index("$installed = Start-Process")
+    native_gate = source.index("python $migrationProbe --gateway $gateway.FullName")
+    uninstall = source.index("$uninstall = Start-Process")
+    assert seed < candidate_install < native_gate < uninstall
+    assert "--baseline-version '0.5.4'" in source[seed:candidate_install]
+    assert "if ($LASTEXITCODE -ne 0) { throw" in source[native_gate:native_gate + 330]
+    for line in source.splitlines():
+        if "python $probe verify --home $profile" in line:
+            assert "--baseline-version $BaselineVersion" in line
 
 
 @pytest.mark.parametrize(

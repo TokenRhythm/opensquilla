@@ -268,7 +268,13 @@ _NONCRITICAL_CI_SCRIPT_TARGETS: Final[dict[str, tuple[str, ...]]] = {
     ),
     ".github/scripts/verify-release-profile-preservation.py": (
         "tests/test_release_consistency.py",
+        "tests/test_ci/test_upgrade_baselines.py",
     ),
+    ".github/scripts/upgrade_baseline.py": ("tests/test_ci/test_upgrade_baselines.py",),
+    ".github/scripts/verify-packaged-v054-upgrade.py": ("tests/test_ci/test_upgrade_baselines.py",),
+    "scripts/build_v054_upgrade_fixture.py": ("tests/test_ci/test_upgrade_baselines.py",),
+    "tests/fixtures/upgrade-v054/sessions.sql": ("tests/test_ci/test_upgrade_baselines.py",),
+    "tests/fixtures/upgrade-v054/manifest.json": ("tests/test_ci/test_upgrade_baselines.py",),
     ".github/scripts/verify-release-windows-upgrade.ps1": (
         "tests/test_ci/test_upgrade_baselines.py",
         "tests/test_ci/test_windows_signed_update_audit.py",
