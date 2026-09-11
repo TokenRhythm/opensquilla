@@ -233,9 +233,10 @@ def _verify_exact_bytes(path: Path, expected: bytes, label: str) -> None:
 
 
 def seed_profile(
-    home: Path, label: str, *, external_root: Path | None = None, signed_retained: bool = False
+    home: Path, label: str, *, external_root: Path | None = None, signed_retained: bool = False,
+    baseline_version: str | None = None,
 ) -> None:
-    """Create a synthetic RC3-shaped profile without replacing any file."""
+    """Create a synthetic historical profile without replacing any file."""
 
     home = home.resolve()
     workspace = home / "workspace"
@@ -260,7 +261,12 @@ def seed_profile(
             _write_new_bytes(path, _SYSTEM_TOOL_SENTINELS[component])
 
     with sqlite3.connect(state / "sessions.db") as connection:
-        connection.executescript(_RC3_SESSION_SCHEMA)
+        if baseline_version == "0.5.4":
+            from upgrade_baseline import schema_sql
+
+            connection.executescript(schema_sql())
+        else:
+            connection.executescript(_RC3_SESSION_SCHEMA)
         connection.execute(
             "CREATE TABLE release_preservation_chat (id TEXT PRIMARY KEY, body TEXT NOT NULL)"
         )
@@ -348,6 +354,10 @@ def seed_profile(
         result = connection.execute("PRAGMA quick_check").fetchone()
         if result != ("ok",):
             raise RuntimeError(f"seeded sessions.db failed PRAGMA quick_check: {result!r}")
+    if baseline_version == "0.5.4":
+        from upgrade_baseline import verify_ledger
+
+        verify_ledger(state / "sessions.db", exact=True)
 
 
 def _config_change_summary(expected: str, actual: str) -> str:
@@ -524,6 +534,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--home", type=Path, required=True)
     parser.add_argument("--label", type=_validated_label, required=True)
     parser.add_argument("--external-root", type=Path)
+    parser.add_argument("--baseline-version", choices=("0.5.3", "0.5.4"))
     return parser
 
 
@@ -536,6 +547,7 @@ def main() -> int:
                 args.label,
                 external_root=args.external_root,
                 signed_retained=args.operation == "seed-signed-retained",
+                baseline_version=args.baseline_version,
             )
             print(f"profile preservation fixture seeded: {args.home}")
         else:
@@ -562,6 +574,10 @@ def main() -> int:
                 signed_retained=signed_retained,
                 external_root=args.external_root,
             )
+            if args.baseline_version == "0.5.4":
+                from upgrade_baseline import verify_ledger
+
+                verify_ledger(args.home / "state/sessions.db")
             suffix = " after runtime migration" if runtime_migrated else ""
             print(f"profile preservation verified{suffix}: {args.home}")
     except (

@@ -121,6 +121,8 @@ $localAppData = Join-Path $sandbox 'localappdata'
 $userData = Join-Path $appData 'OpenSquilla'
 $profile = Join-Path $userData 'opensquilla'
 $probe = Join-Path $PWD '.github\scripts\verify-release-profile-preservation.py'
+$migrationProbe = Join-Path $PWD '.github\scripts\verify-packaged-v054-upgrade.py'
+$migrationProfile = Join-Path $sandbox 'complete-v054-profile'
 $updateBannerSmoke = Join-Path $PWD 'desktop\electron\scripts\test-packaged-update-banner.mjs'
 $sessionRecoverySmoke = Join-Path $PWD 'desktop\electron\scripts\test-packaged-session-recovery.mjs'
 $realUpdateDriver = Join-Path $PWD 'desktop\electron\scripts\test-packaged-real-update-flow.mjs'
@@ -213,8 +215,14 @@ try {
     }
   }
 
-  python $probe seed --home $profile --label $Label --external-root $externalSentinels
+  python $probe seed --home $profile --label $Label --external-root $externalSentinels --baseline-version $BaselineVersion
   if ($LASTEXITCODE -ne 0) { throw "Failed to seed the synthetic $oldTag profile." }
+  if ($BaselineVersion -eq '0.5.4') {
+    # Prepare complete old data before installing the candidate. Keep this
+    # native restart gate independent of Desktop config/keychain assertions.
+    python $probe seed --home $migrationProfile --label $Label --baseline-version '0.5.4'
+    if ($LASTEXITCODE -ne 0) { throw 'Failed to seed the complete v0.5.4 migration profile.' }
+  }
 
   if ($RealUpdateChannelManifest) {
     # Gate boundary: this proves updater discovery/download integrity, behavior while
@@ -269,7 +277,7 @@ try {
       throw "Candidate installer failed with exit code $($installed.ExitCode)."
     }
   }
-  python $probe verify --home $profile --label $Label --external-root $externalSentinels
+  python $probe verify --home $profile --label $Label --external-root $externalSentinels --baseline-version $BaselineVersion
   if ($LASTEXITCODE -ne 0) { throw "Candidate installation changed $oldTag profile data." }
 
   $candidateRuntime = Join-Path $installDir 'resources\runtime'
@@ -338,6 +346,11 @@ try {
   $gateway = Get-ChildItem -Path (Join-Path $installDir 'resources\runtime\gateway') `
     -Filter 'opensquilla-gateway.exe' -File -Recurse | Select-Object -First 1
   if (-not $gateway) { throw 'Packaged recovery CLI was not found.' }
+  if ($BaselineVersion -eq '0.5.4') {
+    python $migrationProbe --gateway $gateway.FullName --home $migrationProfile `
+      --output (Join-Path $sandbox 'complete-v054-upgrade.json')
+    if ($LASTEXITCODE -ne 0) { throw 'Complete v0.5.4 upgrade and graceful restart gate failed.' }
+  }
   $inspectionRaw = & $gateway.FullName recovery inspect --home $profile --json
   if ($LASTEXITCODE -ne 0) { throw 'Packaged recovery inspection failed.' }
   $inspection = $inspectionRaw | ConvertFrom-Json
@@ -363,7 +376,7 @@ try {
   ) {
     throw 'Candidate selected a different state directory after upgrade.'
   }
-  python $probe verify --home $profile --label $Label --external-root $externalSentinels
+  python $probe verify --home $profile --label $Label --external-root $externalSentinels --baseline-version $BaselineVersion
   if ($LASTEXITCODE -ne 0) { throw "Candidate launch changed $oldTag profile data." }
 
   $uninstaller = Get-ChildItem -LiteralPath $installDir -Filter 'Uninstall*.exe' -File |
@@ -384,7 +397,7 @@ try {
   if (Test-Path -LiteralPath $app -PathType Leaf) {
     throw 'Candidate uninstaller did not remove OpenSquilla.exe.'
   }
-  python $probe verify --home $profile --label $Label --external-root $externalSentinels
+  python $probe verify --home $profile --label $Label --external-root $externalSentinels --baseline-version $BaselineVersion
   if ($LASTEXITCODE -ne 0) { throw "Candidate uninstaller changed $oldTag profile data." }
 } finally {
   Stop-InstalledProcesses

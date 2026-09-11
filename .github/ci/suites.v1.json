@@ -326,6 +326,8 @@
         "scripts/install_source.*",
         "start.*",
         "tests/test_ci/test_upgrade_baselines.py",
+        "tests/fixtures/upgrade-v054/**",
+        "scripts/build_v054_upgrade_fixture.py",
         "tests/test_ci/test_windows_signed_update_audit.py",
         "tests/test_ci/test_release_signing_preflight.py",
         "tests/test_ci/test_windows_signatures.py",
