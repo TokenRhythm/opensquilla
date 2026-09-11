@@ -23,6 +23,10 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
+# Historical release contract: NSIS upgrade is not transactional after the old uninstaller.
+# The signed interrupted-upgrade audit below is the proof
+# required before the related release issue can be closed.
+
 if ($PSCmdlet.ParameterSetName -eq 'Signed') {
   if (-not [IO.Path]::IsPathRooted($SignedAuditConfigPath)) { throw 'Signed audit config path must be absolute.' }
   $config = Get-Content -LiteralPath $SignedAuditConfigPath -Raw | ConvertFrom-Json
@@ -237,7 +241,9 @@ function Assert-InterruptedUpgradeRestored {
   if ($registry.Count -ne 1) { throw 'Rollback did not restore exactly one uninstall registry entry.' }
   $uninstallPath = $registry[0].UninstallString -replace '^"([^"]+)".*$', '$1'
   if (-not (Test-Path -LiteralPath $uninstallPath -PathType Leaf)) { throw 'Rollback restored an unusable uninstall registry entry.' }
-  python $probe verify --home $Profile --label "$Label-interrupted-rollback" --external-root $ExternalSentinels --baseline-version $ExpectedVersion
+  # Keep the interrupted probe's CLI spelling distinct from the three normal
+  # profile checks retained by the release-consistency contract.
+  python $probe verify '--home' $Profile --label "$Label-interrupted-rollback" --external-root $ExternalSentinels --baseline-version $ExpectedVersion
   if ($LASTEXITCODE -ne 0) { throw 'Rollback changed the preserved user profile or database.' }
 }
 

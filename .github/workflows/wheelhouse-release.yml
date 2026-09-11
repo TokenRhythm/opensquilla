@@ -1559,7 +1559,7 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           # This gate covers pre-handoff failure isolation, an interrupted NSIS rollback,
-          # and a successful normal NSIS handoff.
+          # and a successful normal NSIS handoff. The historical preview path does not claim transactional rollback.
           $candidates = @(Get-ChildItem 'release-audit/OpenSquilla-*-win-x64.exe' -File)
           if ($candidates.Count -ne 1) {
             throw "Expected exactly one downloaded Windows installer; got $($candidates.Count)."
