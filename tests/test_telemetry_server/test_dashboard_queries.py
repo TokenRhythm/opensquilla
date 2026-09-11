@@ -701,6 +701,41 @@ def test_growth_funnels_keep_identifiers_separate_and_use_fixed_windows(
     _assert_no_sensitive_output(result)
 
 
+@pytest.mark.parametrize(
+    ("onboarding_at", "turn_at", "counts"),
+    [
+        ("2026-08-31T23:59:00.000Z", "2026-09-01T00:02:00.000Z", [1, 1, 1, 1]),
+        ("2026-09-01T00:01:30.000Z", "2026-09-01T00:02:00.000Z", [1, 1, 1, 1]),
+        ("2026-08-31T23:59:00.000Z", "2026-09-01T00:00:00.000Z", [1, 1, 0, 0]),
+        ("2026-08-24T00:00:00.000Z", "2026-09-01T00:02:00.000Z", [1, 0, 0, 0]),
+    ],
+)
+def test_activation_accepts_saved_onboarding_before_ready_without_backdating_turns(
+    tmp_path: Path, onboarding_at: str, turn_at: str, counts: list[int],
+) -> None:
+    queries, _, growth = _queries(tmp_path)
+    # Replayed onboarding keeps its original completion time, even across the
+    # cohort date boundary. Arrival order does not determine funnel progression.
+    events = [
+        ("first_app_ready", "2026-09-01T00:01:00.000Z", None),
+        ("first_turn_started", turn_at, None),
+        ("first_turn_result", "2026-09-01T00:03:00.000Z", "success"),
+        ("onboarding_result", onboarding_at, "completed"),
+    ]
+    for sequence, (name, occurred_at, outcome) in enumerate(events, start=1):
+        _insert(
+            growth, sequence=sequence, event_name=name, occurred_at=occurred_at,
+            analytics_user_id="synthetic-user", outcome=outcome,
+        )
+    activation = queries.growth(UtcCohortWindow.from_dates("2026-09-01", "2026-09-01"))[
+        "activation"
+    ]
+    assert [stage["deduplicatedCount"] for stage in activation["stages"]] == counts
+    assert [stage["stage"] for stage in activation["stages"]] == [
+        "first_app_ready", "onboarding_completed", "first_turn_started", "first_turn_succeeded",
+    ]
+
+
 def test_utc_cohort_dates_are_strict_and_bounded() -> None:
     window = UtcCohortWindow.from_dates("2026-09-01", "2026-09-02")
     assert window.public_dict() == {
