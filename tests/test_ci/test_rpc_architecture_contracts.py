@@ -52,7 +52,6 @@ GENERATED_METADATA_IMPORT_ALLOWLIST = frozenset(
         "src/opensquilla/engine/commands.py",
         "src/opensquilla/gateway/app.py",
         "src/opensquilla/gateway/guest_rpc_policy.py",
-        "src/opensquilla/gateway/rpc_system.py",
         "src/opensquilla/gateway/scopes.py",
     }
 )
@@ -119,11 +118,11 @@ SESSIONS_LIST_LITERAL_ALLOWLIST: Counter[str] = Counter(
     }
 )
 SESSIONS_LIST_GATEWAY_ADAPTER = PACKAGE_ROOT / "gateway" / "adapters" / "sessions_list_contract.py"
-# Existing 307 methods plus snapshot.read and transport.flow.update; exact
-# inventory remains pinned so this does not authorize unrelated wire growth.
-RUNTIME_RPC_METHOD_BASELINE = 309
-RUNTIME_RPC_METHOD_DIGEST = "9aa8200dba6e741c53dc443c0b455ae34f23388bc172fc90942da4c589cc2bea"
-STATIC_RPC_DECORATOR_BASELINE = 86
+# The retired 20-method RPC surface is absent; exact inventory remains pinned
+# so this does not authorize unrelated wire growth.
+RUNTIME_RPC_METHOD_BASELINE = 289
+RUNTIME_RPC_METHOD_DIGEST = "c1e13af6f2be093b6100986cc89b51900d6970733b3a775e3e0dd9bed84e0cc2"
+STATIC_RPC_DECORATOR_BASELINE = 77
 
 # Physical lines in the sessions/runtime slice remain tracked for the final
 # closure measurement below.  The temporary S2a cumulative growth budget was
@@ -1238,13 +1237,11 @@ def test_static_rpc_decorator_sites_are_exact_and_contract_methods_are_adapter_r
             "sessions.delete",
             "sessions.reset",
             "sessions.contextCompact",
-            "sessions.compact",
             "chat.send",
             "chat.abort",
             "sessions.send",
             "sessions.abort",
             "sessions.steer.v2",
-            "sessions.steer",
             "sessions.pending_inputs.enqueue",
             "sessions.pending_inputs.list",
             "sessions.pending_inputs.update",
@@ -1275,7 +1272,6 @@ def test_static_rpc_decorator_sites_are_exact_and_contract_methods_are_adapter_r
             "channels.pairing.revoke",
             "cron.list",
             "cron.status",
-            "cron.add",
             "cron.create",
             "cron.update",
             "cron.remove",

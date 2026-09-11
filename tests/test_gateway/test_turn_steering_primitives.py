@@ -10,7 +10,6 @@ from opensquilla.application.turn_steering import (
     PreparedSteeringInput,
     SteeringAcceptanceError,
     SteeringIdentity,
-    SteeringRollbackError,
 )
 from opensquilla.gateway.rpc import RpcHandlerError
 from opensquilla.gateway.turn_steering import (
@@ -48,9 +47,7 @@ def test_steering_decoder_preserves_request_id_alias_priority_and_source_authori
             "_source": {"callerKind": "cli", "channelKind": "cli", "role": "owner"},
         },
         key="agent:main:webchat:steering-wire",
-        durable=True,
         principal_role="operator",
-        connection_id="connection-one",
     )
     assert command.client_request_id == "request-camel"
     assert command.client_message_id == "client-snake"
@@ -65,33 +62,20 @@ def test_steering_decoder_does_not_fall_through_a_present_null_identity_alias() 
         decode_steering_command(
             {**_params(), "expected_turn_id": None, "expectedTurnId": "other-turn"},
             key="agent:main:webchat:steering-wire",
-            durable=True,
             principal_role="operator",
-            connection_id="connection-one",
         )
 
 
-def test_pending_steering_keeps_staged_identity_and_legacy_surface_default() -> None:
+def test_pending_steering_keeps_staged_identity() -> None:
     guard = PendingInputGuard("pending-one", "staged-fingerprint", 2, "cli:cli:operator")
     command = decode_steering_command(
         _params(),
         key="agent:main:webchat:steering-wire",
-        durable=True,
         principal_role="operator",
-        connection_id="connection-one",
         pending=guard,
     )
     assert command.pending_input == guard
     assert command.request_fingerprint == ""
-    legacy = decode_steering_command(
-        {"message": "guide"},
-        key="agent:main:webchat:steering-wire",
-        durable=False,
-        principal_role="operator",
-        connection_id="connection-one",
-    )
-    assert legacy.surface_id == "web:connection-one"
-    assert legacy.client_message_id
 
 
 @pytest.mark.parametrize(
@@ -153,7 +137,6 @@ def _native_ports(storage):
     return GatewaySteeringPrimitives(
         session_manager=SimpleNamespace(storage=storage),
         task_runtime=None,
-        turn_runner=None,
         emit_steer=AsyncMock(),
         emit_disposition=AsyncMock(),
     )
@@ -200,17 +183,3 @@ async def test_invalid_native_transcript_is_rejected_before_persistence() -> Non
             pending=None,
         )
     storage.accept_turn.assert_not_awaited()
-
-
-def test_dirty_legacy_error_preserves_orphan_identity_and_disables_fallback() -> None:
-    mapped = map_steering_error(SteeringRollbackError("key-one", "orphan-one", "target-one"))
-    assert isinstance(mapped, RpcHandlerError)
-    assert mapped.code == "STEER_RACE_DIRTY"
-    assert mapped.retryable is False
-    assert mapped.details == {
-        "session_key": "key-one",
-        "orphan_message_id": "orphan-one",
-        "target_turn_id": "target-one",
-        "fallback_safe": False,
-        "remediation": "dedup by orphan_message_id before resending",
-    }

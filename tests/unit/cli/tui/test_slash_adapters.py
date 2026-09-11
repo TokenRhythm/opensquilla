@@ -249,10 +249,6 @@ class _StubGatewayClient:
             return dict(self.history_pages[before])
         return {"messages": list(self.history), "has_more": False}
 
-    async def forget_approvals(self, target: str | None = None) -> dict[str, Any]:
-        self.calls.append(("forget_approvals", target))
-        return {"ok": True}
-
     async def approvals_snapshot(self) -> dict[str, Any]:
         return {"mode": "prompt"}
 
@@ -2155,7 +2151,6 @@ async def test_gateway_approval_commands_accept_protocol_double(
     assert await handle_gateway_slash_command("/approvals", context) is True
     assert await handle_gateway_slash_command("/forget some-target", context) is True
     assert await handle_gateway_slash_command("/permissions off", context) is True
-    assert ("forget_approvals", "some-target") in client.calls
     assert ("set_approval_mode", "prompt") in client.calls
     assert context.state.elevated is None
 

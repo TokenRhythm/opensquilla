@@ -5,7 +5,6 @@ import pytest
 from opensquilla.application.approval_queue import ApprovalQueue
 from opensquilla.application.approval_rpc import (
     approval_extend_rpc_payload,
-    approval_forget_rpc_payload,
     approval_request_rpc_payload,
     approval_resolve_rpc_payload,
     approval_settings_rpc_payload,
@@ -107,16 +106,11 @@ def test_approval_extend_rpc_payload_pushes_deadline() -> None:
         queue.close()
 
 
-def test_approval_snapshot_and_forget_payloads_own_wire_shapes() -> None:
+def test_approval_snapshot_payload_owns_wire_shape() -> None:
     queue = ApprovalQueue(db_path=":memory:")
     try:
         queue.set_settings("prompt")
 
         assert approval_snapshot_rpc_payload(queue) == {"mode": "prompt"}
-        assert approval_forget_rpc_payload(" /tmp/approval-demo ") == {
-            "scope": "noop",
-            "target": "/tmp/approval-demo",
-        }
-        assert approval_forget_rpc_payload() == {"scope": "noop"}
     finally:
         queue.close()

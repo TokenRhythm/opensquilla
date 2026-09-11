@@ -624,6 +624,7 @@
       "tests/test_gateway/test_rpc_product_cli_gaps.py",
       "tests/test_gateway/test_rpc_proposals.py",
       "tests/test_gateway/test_rpc_provider_credential_clear.py",
+      "tests/test_gateway/test_rpc_retired_surface.py",
       "tests/test_gateway/test_rpc_router_decisions.py",
       "tests/test_gateway/test_rpc_routing_hold.py",
       "tests/test_gateway/test_rpc_run_mode_preference.py",

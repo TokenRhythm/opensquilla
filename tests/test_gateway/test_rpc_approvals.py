@@ -324,10 +324,7 @@ def test_gateway_rpc_approvals_keeps_payload_logic_out_of_gateway_boundary() -> 
     top_level_functions = {
         node.name for node in tree.body if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
     }
-    helper_names = {
-        "approval_forget_rpc_payload",
-        "approval_snapshot_rpc_payload",
-    }
+    helper_names = {"approval_snapshot_rpc_payload"}
     imported_helpers = {
         alias.name
         for node in imports
@@ -338,7 +335,7 @@ def test_gateway_rpc_approvals_keeps_payload_logic_out_of_gateway_boundary() -> 
         node.name: node
         for node in tree.body
         if isinstance(node, ast.AsyncFunctionDef)
-        and node.name in {"_handle_exec_approval_snapshot", "_handle_exec_approval_forget"}
+        and node.name == "_handle_exec_approval_snapshot"
     }
     handler_names = {
         node.id

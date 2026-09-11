@@ -3707,10 +3707,6 @@ async def _handle_sessions_context_compact(params: dict | None, ctx: RpcContext)
     return await _session_maintenance_adapter(ctx).compact(params)
 
 
-async def _handle_sessions_compact(params: dict | None, ctx: RpcContext) -> dict:
-    return await _session_maintenance_adapter(ctx).compact(params)
-
-
 _handle_sessions_reset_contract = register_session_maintenance_contract(
     _d,
     "sessions.reset",
@@ -3726,15 +3722,6 @@ _handle_sessions_context_compact_contract = register_session_maintenance_contrac
     internal_error=RpcHandlerError,
     guest_allowed_checker=is_guest_rpc_method_allowed,
 )
-
-_handle_sessions_compact_contract = register_session_maintenance_contract(
-    _d,
-    "sessions.compact",
-    _handle_sessions_compact,
-    internal_error=RpcHandlerError,
-    guest_allowed_checker=is_guest_rpc_method_allowed,
-)
-
 
 @_d.method("sessions.truncate", scope="operator.write")
 async def _handle_sessions_truncate(params: dict | None, ctx: RpcContext) -> dict:
@@ -5763,7 +5750,6 @@ def build_turn_admission_application(ctx: RpcContext) -> TurnAdmission:
             GatewaySteeringPrimitives(
                 session_manager=ctx.session_manager,
                 task_runtime=ctx.task_runtime,
-                turn_runner=ctx.turn_runner,
                 emit_steer=partial(_publish_admission_steer, ctx),
                 emit_disposition=partial(_publish_admission_disposition, ctx),
             )
@@ -5807,14 +5793,7 @@ async def _handle_sessions_steer_v2_contract(
     params: dict[str, Any] | None,
     ctx: RpcContext,
 ) -> dict[str, Any]:
-    return await _session_turn_admission_adapter(ctx).steer(params, durable=True)
-
-
-async def _handle_sessions_steer_contract(
-    params: dict[str, Any] | None,
-    ctx: RpcContext,
-) -> dict[str, Any]:
-    return await _session_turn_admission_adapter(ctx).steer(params, durable=False)
+    return await _session_turn_admission_adapter(ctx).steer(params)
 
 
 _handle_sessions_send_generated_contract = register_turn_admission_contract(
@@ -5838,15 +5817,6 @@ _handle_sessions_steer_v2_generated_contract = register_turn_admission_contract(
     internal_error=RpcHandlerError,
     guest_allowed_checker=is_guest_rpc_method_allowed,
 )
-_handle_sessions_steer_generated_contract = register_turn_admission_contract(
-    _d,
-    "sessions.steer",
-    _handle_sessions_steer_contract,
-    internal_error=RpcHandlerError,
-    guest_allowed_checker=is_guest_rpc_method_allowed,
-)
-
-
 class _GatewayPendingInputQueuePort(GatewayPendingInputPrimitives, PendingInputQueuePort):
     """Concrete queue Port backed by the single durable SessionStorage path."""
 

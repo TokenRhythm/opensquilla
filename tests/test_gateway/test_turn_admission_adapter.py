@@ -77,8 +77,7 @@ async def test_adapter_projects_semantic_commands_to_existing_runtime() -> None:
             "expectedTurnId": "turn-1",
             "clientRequestId": "request-1",
             "clientMessageId": "client-1",
-        },
-        durable=True,
+        }
     )
 
     admitted = ports.admit_call.await_args.args[0]
@@ -95,7 +94,6 @@ async def test_adapter_projects_semantic_commands_to_existing_runtime() -> None:
     steered = ports.steer_call.await_args.args[0]
     assert steered.session_key == "canonical"
     assert steered.message == "guide"
-    assert steered.mode == "durable"
     assert steered.expected_turn_id == "turn-1"
     assert steered.client_request_id == "request-1"
     assert steered.client_message_id == "client-1"

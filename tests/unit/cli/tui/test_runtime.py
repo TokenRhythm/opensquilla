@@ -915,7 +915,7 @@ async def test_runtime_ambiguous_steer_retries_with_same_identity() -> None:
 
 
 @pytest.mark.asyncio
-async def test_runtime_legacy_method_missing_steer_uses_visible_queue() -> None:
+async def test_runtime_method_missing_steer_uses_visible_queue() -> None:
     inputs: asyncio.Queue[Any] = asyncio.Queue()
     surface = _FakeSurface(inputs)
     state = TuiRuntimeState()
@@ -932,7 +932,7 @@ async def test_runtime_legacy_method_missing_steer_uses_visible_queue() -> None:
         return True
 
     async def _missing(_text: str) -> bool:
-        raise MethodMissingError("sessions.steer is unavailable")
+        raise MethodMissingError("sessions.steer.v2 is unavailable")
 
     task = asyncio.create_task(
         run_tui_runtime(
