@@ -1882,10 +1882,6 @@ def _provider_retry_delay_seconds(
     return min(max(local, hint), _MAX_PROVIDER_RETRY_WAIT_SECONDS)
 
 
-class _IterationStreamTimeoutError(TimeoutError):
-    """Raised when provider streaming exceeds the active Agent iteration budget."""
-
-
 class _RaisedProviderBoundaryError(RuntimeError):
     """Content-free marker for an exception raised by provider call/iteration."""
 
@@ -3531,35 +3527,34 @@ class Agent:
             self._context_budget_class(budget_class)
         )
 
-    def _tool_execution_timeout(self, tool_call: ToolCall) -> float:
-        timeout = float(self.config.tool_timeout)
-        tool_def = self._tool_definition_by_name.get(tool_call.tool_name)
-        if tool_def is None:
-            return timeout
-        static_timeout = getattr(tool_def, "execution_timeout_seconds", None)
-        if static_timeout is not None:
+    def _tool_execution_timeout(self, tool_call: ToolCall) -> float | None:
+        """Resolve a declared execution budget, or the generic fallback budget."""
+        budgets: list[float] = []
+
+        def add_budget(value: Any) -> None:
             try:
-                timeout = max(timeout, float(static_timeout))
+                seconds = float(value)
             except (TypeError, ValueError):
-                pass
-        argument_name = getattr(tool_def, "execution_timeout_argument", None)
-        if not argument_name:
-            return timeout
-        raw_value = tool_call.arguments.get(str(argument_name))
-        if raw_value is None:
-            return timeout
-        try:
-            argument_timeout = float(raw_value)
-        except (TypeError, ValueError):
-            return timeout
-        if argument_timeout < 0:
-            return timeout
-        padding = getattr(tool_def, "execution_timeout_padding", 0.0) or 0.0
-        try:
-            timeout = max(timeout, argument_timeout + float(padding))
-        except (TypeError, ValueError):
-            timeout = max(timeout, argument_timeout)
-        return timeout
+                return
+            if math.isfinite(seconds) and seconds > 0:
+                budgets.append(seconds)
+
+        add_budget(self.config.tool_timeout)
+        tool_def = self._tool_definition_by_name.get(tool_call.tool_name)
+        if tool_def is not None:
+            add_budget(tool_def.execution_timeout_seconds)
+            argument_name = tool_def.execution_timeout_argument
+            if argument_name:
+                raw = tool_call.arguments.get(argument_name)
+                try:
+                    seconds = float(raw) if raw is not None else -1.0
+                    padding = float(tool_def.execution_timeout_padding or 0)
+                except (TypeError, ValueError):
+                    pass
+                else:
+                    if math.isfinite(seconds) and seconds >= 0:
+                        add_budget(seconds + max(0.0, padding))
+        return max(budgets) if budgets else None
 
     def _tool_cancellation_policy(self, tool_call: ToolCall) -> CancellationPolicy:
         tool_def = self._tool_definition_by_name.get(tool_call.tool_name)
@@ -6255,8 +6250,8 @@ class Agent:
             max_backoff_ms=self.config.retry_max_backoff_ms,
         )
 
-        # Timeout budgets: optional total turn budget, idle LLM stream budget,
-        # and per-tool execution budget.
+        # The loop owns the total task deadline and per-tool deadlines.
+        # Provider adapters own transport inactivity limits.
         _loop = asyncio.get_running_loop()
         _total_deadline = _loop.time() + self.config.timeout if self.config.timeout > 0 else None
 
@@ -8613,36 +8608,6 @@ class Agent:
                         )
                         if reasoning_end is not None:
                             yield reasoning_end
-                    except _IterationStreamTimeoutError:
-                        reasoning_end = _finish_reasoning_block("error")
-                        if reasoning_end is not None:
-                            yield reasoning_end
-                        usage_unknown_reason = "iteration_timeout"
-                        _notify_call_outcome(ok=False, failure_kind="iteration_timeout")
-                        if goal_terminal_final_response_pending:
-                            response_text = _goal_terminal_final_response_text()
-                            assistant_text_parts.append(response_text)
-                            provider_done_for_log = ProviderDoneEvent(stop_reason="stop")
-                            _got_done_event = True
-                            _got_error = False
-                            self._write_turn_call_log(
-                                "turn_policy_decision",
-                                action="terminal_after_summary_timeout",
-                                reason="goal_terminal",
-                                code="iteration_timeout",
-                            )
-                            yield TextDeltaEvent(text=response_text)
-                            break
-                        yield self._transition(AgentState.ERROR)
-                        terminal_error = ErrorEvent(
-                            message=(
-                                f"Iteration {iterations} exceeded iteration_timeout"
-                                f" ({self.config.iteration_timeout}s) during LLM streaming"
-                            ),
-                            code="iteration_timeout",
-                        )
-                        yield terminal_error
-                        break
                     except asyncio.CancelledError:
                         usage_unknown_reason = "cancelled"
                         raise
@@ -11181,7 +11146,6 @@ class Agent:
                 tool_calls = [self._coerce_meta_tool_call(tc) for tc in tool_calls]
                 tool_calls = self._force_matched_meta_invoke_tool_calls(tool_calls)
 
-                tool_deadline = _loop.time() + self.config.iteration_timeout
 
                 # ------ STREAMING → TOOL_CALLING ------
                 yield self._transition(AgentState.TOOL_CALLING)
@@ -11251,11 +11215,11 @@ class Agent:
                         for block in recorded_result_blocks.get(call.tool_use_id, ())
                     ]
 
-                def _cap_timeout_by_deadlines(timeout: float) -> float:
-                    remaining = min(timeout, max(0.0, tool_deadline - _loop.time()))
-                    if _total_deadline is not None:
-                        remaining = min(remaining, max(0.0, _total_deadline - _loop.time()))
-                    return max(0.001, remaining)
+                def _cap_timeout_by_deadlines(timeout: float | None) -> float | None:
+                    if _total_deadline is None:
+                        return timeout
+                    remaining = max(0.0, _total_deadline - _loop.time())
+                    return min(timeout, remaining) if timeout is not None else remaining
 
                 async def _run_one(tc: ToolCall) -> ToolResult:
                     nonlocal turn_irreversible_effect_started
@@ -11320,6 +11284,16 @@ class Agent:
                     preflight_result = (
                         preflight_tool_results.get(tc.tool_use_id) or snapshot_failure
                     )
+                    if tool_timeout is not None and tool_timeout <= 0:
+                        preflight_result = ToolResult(
+                            tool_use_id=tc.tool_use_id,
+                            tool_name=tc.tool_name,
+                            content="The task deadline expired before this tool could start.",
+                            is_error=True,
+                            execution_status=runtime_execution_status(
+                                "timeout", reason="runtime_timeout", timed_out=True,
+                            ),
+                        )
                     if preflight_result is not None:
                         res = preflight_result
                     else:
@@ -11339,13 +11313,17 @@ class Agent:
                                 res = execution_task.result()
                             else:
                                 cancellation_started = True
-                                await cancel_task(
+                                settled = await cancel_task(
                                     execution_task,
                                     policy=cancellation_policy,
                                     operation=f"tool:{tc.tool_name}",
                                     grace_seconds=TIMEOUT_CANCEL_GRACE_SECONDS,
                                 )
-                                settlement_note = ""
+                                settlement_note = (
+                                    " Cancellation has not finished; execution effects are unknown."
+                                    if not settled else
+                                    " The local call ended; this does not confirm remote effects."
+                                )
                                 if (
                                     cancellation_policy == "must_settle"
                                     and self._tool_effect_observation()
@@ -11442,73 +11420,13 @@ class Agent:
                     cleanup_grace_seconds = TIMEOUT_CANCEL_GRACE_SECONDS
                     try:
                         while pending:
-                            remaining = max(0.0, tool_deadline - _loop.time())
-                            if _total_deadline is not None:
-                                remaining = min(
-                                    remaining,
-                                    max(0.0, _total_deadline - _loop.time()),
-                                )
-                            if remaining <= 0:
-                                for task, tc in list(task_to_tool_call.items()):
-                                    if task in pending:
-                                        tool_cancellation_grace_by_id[tc.tool_use_id] = (
-                                            TIMEOUT_CANCEL_GRACE_SECONDS
-                                        )
-                                        results_by_id[tc.tool_use_id] = ToolResult(
-                                            tool_use_id=tc.tool_use_id,
-                                            tool_name=tc.tool_name,
-                                            content=(
-                                                f"Tool '{tc.tool_name}' timed out after "
-                                                f"{self.config.iteration_timeout}s"
-                                            ),
-                                            is_error=True,
-                                            execution_status=runtime_execution_status(
-                                                "timeout",
-                                                reason="runtime_timeout",
-                                                timed_out=True,
-                                            ),
-                                        )
-                                        self._set_tool_reliability_terminal(
-                                            tool_use_id=tc.tool_use_id,
-                                            outcome=ToolOutcome.TIMEOUT,
-                                            error_code=ToolErrorCode.TOOL_TIMEOUT,
-                                        )
-                                return
-                            wait_timeout = remaining if interval <= 0 else min(interval, remaining)
+                            wait_timeout = interval if interval > 0 else None
                             done, pending = await asyncio.wait(
                                 pending,
-                                timeout=max(0.001, wait_timeout),
+                                timeout=wait_timeout,
                                 return_when=asyncio.FIRST_COMPLETED,
                             )
                             if not done:
-                                if _loop.time() >= tool_deadline or (
-                                    _total_deadline is not None and _loop.time() >= _total_deadline
-                                ):
-                                    for task, tc in list(task_to_tool_call.items()):
-                                        if task in pending:
-                                            tool_cancellation_grace_by_id[tc.tool_use_id] = (
-                                                TIMEOUT_CANCEL_GRACE_SECONDS
-                                            )
-                                            results_by_id[tc.tool_use_id] = ToolResult(
-                                                tool_use_id=tc.tool_use_id,
-                                                tool_name=tc.tool_name,
-                                                content=(
-                                                    f"Tool '{tc.tool_name}' timed out after "
-                                                    f"{self.config.iteration_timeout}s"
-                                                ),
-                                                is_error=True,
-                                                execution_status=runtime_execution_status(
-                                                    "timeout",
-                                                    reason="runtime_timeout",
-                                                    timed_out=True,
-                                                ),
-                                            )
-                                            self._set_tool_reliability_terminal(
-                                                tool_use_id=tc.tool_use_id,
-                                                outcome=ToolOutcome.TIMEOUT,
-                                                error_code=ToolErrorCode.TOOL_TIMEOUT,
-                                            )
-                                    return
                                 now = time.monotonic()
                                 yield RunHeartbeatEvent(
                                     phase="tool",
@@ -11882,7 +11800,6 @@ class Agent:
                                 0.0,
                                 _loop.time() - user_input_wait_started,
                             )
-                            tool_deadline += user_input_wait_duration
                             if _total_deadline is not None:
                                 _total_deadline += user_input_wait_duration
                             # Also close requests when projection, waiting, or
@@ -11963,7 +11880,6 @@ class Agent:
                                 _loop.time() - approval_wait_started,
                             )
                             # Human review is suspended state, not execution time.
-                            tool_deadline += approval_wait_duration
                             if _total_deadline is not None:
                                 _total_deadline += approval_wait_duration
                             approval_entry = None
@@ -12215,19 +12131,6 @@ class Agent:
                             "Human intervention is required before continuing."
                         ),
                         code="sandbox_threshold_exceeded",
-                    )
-                    yield terminal_error
-                    break
-
-                # Per-iteration deadline check after tool execution
-                if accepted_goal_terminal_status is None and _loop.time() > tool_deadline:
-                    yield self._transition(AgentState.ERROR)
-                    terminal_error = ErrorEvent(
-                        message=(
-                            f"Iteration {iterations} exceeded iteration_timeout"
-                            f" ({self.config.iteration_timeout}s) during tool execution"
-                        ),
-                        code="iteration_timeout",
                     )
                     yield terminal_error
                     break
@@ -13276,29 +13179,16 @@ class Agent:
                     if active_deadline is not None
                     else dynamic_deadline
                 )
-            # Execution-context-aware composite providers (currently Ensemble)
-            # own streaming inactivity through TurnExecutionContext. Applying
-            # the legacy per-iteration read timeout here would create a second,
-            # earlier timeout owner and could kill a healthy long fusion run.
-            wait_budget: float | None = (
-                None
-                if (
-                    getattr(self, "_execution_context", None) is not None
-                    and getattr(self.provider, "execution_context_aware", False)
-                )
-                else max(0.001, self.config.iteration_timeout)
-            )
-            total_deadline_limits_wait = False
+            # Adapters own provider inactivity. This wrapper only enforces the
+            # effective task deadline and closes/cancels outstanding stream pulls.
+            wait_budget: float | None = None
             if active_deadline is not None:
-                remaining_total = active_deadline - loop.time()
-                if remaining_total <= 0:
+                wait_budget = active_deadline - loop.time()
+                if wait_budget <= 0:
                     raise _provider_stream_deadline_timeout(
                         timeout_seconds=self.config.timeout,
                         deadline_at_monotonic=active_deadline,
                     )
-                if wait_budget is None or remaining_total <= wait_budget:
-                    wait_budget = remaining_total
-                    total_deadline_limits_wait = True
 
             next_event: asyncio.Future[Any] = asyncio.ensure_future(stream_iter.__anext__())
 
@@ -13332,15 +13222,11 @@ class Agent:
                 raise
             if not done:
                 await _cancel_provider_pull(grace_seconds=TIMEOUT_CANCEL_GRACE_SECONDS)
-                if total_deadline_limits_wait or (
-                    active_deadline is not None and loop.time() >= active_deadline
-                ):
-                    assert active_deadline is not None
-                    raise _provider_stream_deadline_timeout(
-                        timeout_seconds=self.config.timeout,
-                        deadline_at_monotonic=active_deadline,
-                    )
-                raise _IterationStreamTimeoutError
+                assert active_deadline is not None
+                raise _provider_stream_deadline_timeout(
+                    timeout_seconds=self.config.timeout,
+                    deadline_at_monotonic=active_deadline,
+                )
             try:
                 event = next_event.result()
             except StopAsyncIteration:

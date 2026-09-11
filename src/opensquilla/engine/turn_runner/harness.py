@@ -514,9 +514,7 @@ class _TurnRunnerTimeoutBudgetAdapter(TimeoutBudgetPort):
             runtime_timeout=runtime_timeout,
             max_iterations=resolved_max_iterations,
             max_iterations_source=max_iterations_source,
-            iteration_timeout=self._runner._resolve_agent_iteration_timeout(
-                session_key, iteration_timeout
-            ),
+            iteration_timeout=0.0,
             tool_timeout=self._runner._resolve_agent_tool_timeout(
                 session_key, tool_timeout
             ),

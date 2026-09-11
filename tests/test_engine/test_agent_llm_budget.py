@@ -1674,34 +1674,6 @@ class _ProviderHeartbeatThenText:
         return []
 
 
-class _ToolUseProvider:
-    provider_name = "fake"
-
-    def __init__(self) -> None:
-        self.calls: list[list[Message]] = []
-
-    def chat(
-        self,
-        messages: list[Message],
-        tools: list[Any] | None = None,
-        config: ChatConfig | None = None,
-    ) -> AsyncIterator[Any]:
-        self.calls.append(messages)
-        return self._stream()
-
-    async def _stream(self) -> AsyncIterator[Any]:
-        yield ProviderToolUseStart(tool_use_id="tool-1", tool_name="slow")
-        yield ProviderToolUseEnd(
-            tool_use_id="tool-1",
-            tool_name="slow",
-            arguments={},
-        )
-        yield ProviderDone(stop_reason="tool_use", input_tokens=1, output_tokens=1)
-
-    async def list_models(self) -> list[Any]:
-        return []
-
-
 @pytest.mark.asyncio
 async def test_provider_heartbeat_reaches_agent_stream() -> None:
     agent = Agent(
@@ -1729,11 +1701,11 @@ async def test_provider_heartbeat_reaches_agent_stream() -> None:
 
 
 @pytest.mark.asyncio
-async def test_iteration_timeout_interrupts_stalled_provider_stream() -> None:
+async def test_task_deadline_interrupts_stalled_provider_stream() -> None:
     provider = _StallingProvider()
     agent = Agent(
         provider=provider,
-        config=AgentConfig(iteration_timeout=0.01, max_provider_retries=0),
+        config=AgentConfig(timeout=0.01, iteration_timeout=0, max_provider_retries=0),
     )
 
     events = await asyncio.wait_for(
@@ -1743,7 +1715,7 @@ async def test_iteration_timeout_interrupts_stalled_provider_stream() -> None:
 
     error_index = _event_index(
         events,
-        lambda event: isinstance(event, ErrorEvent) and event.code == "iteration_timeout",
+        lambda event: isinstance(event, ErrorEvent) and event.code == "agent_runtime_timeout",
     )
     state_index = _event_index(
         events,
@@ -1759,7 +1731,7 @@ async def test_iteration_timeout_interrupts_stalled_provider_stream() -> None:
 
 
 @pytest.mark.asyncio
-async def test_iteration_timeout_does_not_interrupt_active_tool_argument_stream() -> None:
+async def test_retired_iteration_timeout_does_not_interrupt_tool_argument_stream() -> None:
     async def write_file_tool(call: object) -> ToolResult:
         return ToolResult(
             tool_use_id=getattr(call, "tool_use_id"),
@@ -1767,15 +1739,12 @@ async def test_iteration_timeout_does_not_interrupt_active_tool_argument_stream(
             content="written",
         )
 
-    # Each provider event stays comfortably inside the per-event watchdog
-    # window, while the complete argument stream lasts longer than that
-    # window.  This proves that active tool-argument streaming resets the
-    # watchdog without depending on sub-10ms event-loop scheduling slack.
+    # Legacy iteration settings cannot interrupt a healthy provider stream.
     provider = _ActiveLongToolArgumentProvider(fragment_delay=0.06)
     agent = Agent(
         provider=provider,
         config=AgentConfig(
-            iteration_timeout=0.15,
+            iteration_timeout=0.001,
             timeout=1.0,
             max_provider_retries=0,
         ),
@@ -1844,52 +1813,6 @@ async def test_large_tool_argument_stream_emits_progress_heartbeat() -> None:
     )
     done_index = _event_index(events, lambda event: isinstance(event, DoneEvent))
     assert heartbeat_index < done_index
-
-
-@pytest.mark.asyncio
-async def test_iteration_timeout_caps_tool_execution() -> None:
-    tool_started = asyncio.Event()
-    tool_cancelled = asyncio.Event()
-    never_complete = asyncio.Event()
-
-    async def slow_tool(call: object) -> ToolResult:
-        tool_started.set()
-        try:
-            await never_complete.wait()
-        except asyncio.CancelledError:
-            tool_cancelled.set()
-            raise
-        return ToolResult(
-            tool_use_id=getattr(call, "tool_use_id"),
-            tool_name=getattr(call, "tool_name"),
-            content="late",
-        )
-
-    agent = Agent(
-        provider=_ToolUseProvider(),
-        config=AgentConfig(
-            iteration_timeout=0.1,
-            timeout=5.0,
-            tool_timeout=5.0,
-            max_provider_retries=0,
-        ),
-        tool_definitions=[
-            ToolDefinition(
-                name="slow",
-                description="Slow tool.",
-                input_schema=ToolInputSchema(),
-            )
-        ],
-        tool_handler=slow_tool,
-    )
-
-    events = await asyncio.wait_for(_collect_events(agent.run_turn("hello")), timeout=2.0)
-
-    assert tool_started.is_set()
-    assert tool_cancelled.is_set()
-    assert any(
-        isinstance(event, ErrorEvent) and event.code == "iteration_timeout" for event in events
-    )
 
 
 @pytest.mark.asyncio

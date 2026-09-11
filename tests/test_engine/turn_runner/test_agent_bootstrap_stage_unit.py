@@ -323,7 +323,7 @@ async def test_case01_success_all_defaults() -> None:
     assert o.effective_runtime_timeout == 60.0
     assert o.effective_max_iterations == 10
     assert o.effective_max_iterations_source == "test budget"
-    assert o.effective_iteration_timeout == 30.0
+    assert o.effective_iteration_timeout == 0.0
     assert o.effective_tool_timeout == 20.0
     assert o.effective_request_timeout == 120.0
     assert o.effective_max_provider_retries == 3
@@ -369,6 +369,7 @@ _RETIRED_EXPERIMENT_ENV_FIELDS = {
     "OPENSQUILLA_FINAL_DIFF_CONTRACT_MODE": "final_diff_contract_mode",
     "OPENSQUILLA_SOURCE_DIFF_PRESERVATION_MODE": "source_diff_preservation_mode",
     "OPENSQUILLA_SOURCE_DIFF_CANDIDATE_MODE": "source_diff_candidate_mode",
+    "OPENSQUILLA_AGENT_ITERATION_TIMEOUT": "iteration_timeout",
     "OPENSQUILLA_FINALIZE_EVIDENCE_STRICT": "finalize_evidence_strict",
     "OPENSQUILLA_FINALIZE_VARIANT_CHALLENGE": "finalize_variant_challenge",
     "OPENSQUILLA_SUBMIT_REVIEW": "submit_review_enabled",
@@ -770,12 +771,12 @@ async def test_case02_per_call_timeout_threaded() -> None:
 
 
 @pytest.mark.asyncio
-async def test_case03_per_call_iteration_timeout_threaded() -> None:
+async def test_legacy_iteration_timeout_is_inert() -> None:
     budgets = _RecordingTimeoutBudget()
     stage = _make_stage(budgets=budgets)
     inp = _make_input(iteration_timeout=15.0)
     await stage.run(inp)
-    assert budgets.calls[0]["iteration_timeout"] == 15.0
+    assert budgets.calls[0]["iteration_timeout"] == 0.0
 
 
 @pytest.mark.asyncio

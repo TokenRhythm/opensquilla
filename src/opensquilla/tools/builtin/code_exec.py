@@ -778,6 +778,7 @@ def _unsupported_windows_environment_subprocess_payload(reason: str) -> str:
 
 _MAX_TIMEOUT = 120
 _DEFAULT_TIMEOUT = 30
+_EXECUTION_TIMEOUT_PADDING = 5.0
 _MAX_OUTPUT_CHARS = 50_000
 _SANDBOX_PYTHON_CANDIDATES: tuple[Path, ...] = (
     Path("/usr/bin/python3"),
@@ -925,6 +926,9 @@ def _resolve_python_bin(*, sandbox_enabled: bool) -> str:
         },
     },
     required=["code"],
+    execution_timeout_seconds=_DEFAULT_TIMEOUT + _EXECUTION_TIMEOUT_PADDING,
+    execution_timeout_argument="timeout",
+    execution_timeout_padding=_EXECUTION_TIMEOUT_PADDING,
     runtime_only_arguments=("approval_id",),
     sandbox=SandboxToolDescriptor.process(
         kind="code.exec",

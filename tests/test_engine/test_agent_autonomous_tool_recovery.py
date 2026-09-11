@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator
 from typing import Any
 
@@ -107,3 +108,98 @@ async def test_identical_calls_execute_and_each_real_result_reaches_next_request
         assert expected in str(result.content)
     assert sum(isinstance(event, DoneEvent) for event in events) == 1
     assert not any(isinstance(event, ErrorEvent) for event in events)
+
+
+@pytest.mark.parametrize("legacy_iteration_timeout", [0.0, 0.001])
+async def test_zero_generic_tool_budget_and_retired_iteration_budget_do_not_cancel_tools(
+    legacy_iteration_timeout: float,
+) -> None:
+    provider = RepeatedCallProvider(2)
+    calls = 0
+
+    async def handler(call: ToolCall) -> ToolResult:
+        nonlocal calls
+        await asyncio.sleep(0.02)
+        calls += 1
+        return ToolResult(tool_use_id=call.tool_use_id, tool_name=call.tool_name, content="ready")
+
+    agent = Agent(
+        provider=provider,
+        config=AgentConfig(
+            timeout=2,
+            tool_timeout=0,
+            iteration_timeout=legacy_iteration_timeout,
+        ),
+        tool_definitions=[_probe_definition()],
+        tool_handler=handler,
+    )
+    assert agent._tool_execution_timeout(ToolCall("probe", "probe", {})) is None
+    events = [event async for event in agent.run_turn("Check the service twice.")]
+    assert calls == 2
+    assert any(isinstance(event, DoneEvent) for event in events)
+    assert not any(isinstance(event, ErrorEvent) for event in events)
+
+
+async def test_declared_tool_timeout_still_applies_when_generic_budget_is_disabled() -> None:
+    provider = RepeatedCallProvider(2)
+    cancelled = asyncio.Event()
+    calls = 0
+
+    async def handler(call: ToolCall) -> ToolResult:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            try:
+                await asyncio.Event().wait()
+            finally:
+                cancelled.set()
+        return ToolResult(tool_use_id=call.tool_use_id, tool_name=call.tool_name, content="ready")
+
+    agent = Agent(
+        provider=provider,
+        config=AgentConfig(timeout=2, tool_timeout=0),
+        tool_definitions=[_probe_definition(execution_timeout_seconds=0.01)],
+        tool_handler=handler,
+    )
+    events = [event async for event in agent.run_turn("Inspect and recover the service.")]
+    assert cancelled.is_set()
+    assert calls == 2
+    assert _result(provider.requests[1], "probe-0").is_error
+    assert not _result(provider.requests[2], "probe-1").is_error
+    assert not any(isinstance(event, ErrorEvent) for event in events)
+    assert any(isinstance(event, DoneEvent) for event in events)
+
+
+
+
+@pytest.mark.parametrize("generic_timeout", [0.0, 60.0])
+def test_registered_long_tool_budgets_survive_agent_dispatch(generic_timeout: float) -> None:
+    from typing import cast
+
+    from opensquilla.mcp.client import MCPClient
+    from opensquilla.mcp.discovery import _make_tool_handler
+    from opensquilla.mcp.types import MCPToolDef
+    from opensquilla.tools.builtin import code_exec  # noqa: F401
+    from opensquilla.tools.registry import ToolRegistry, get_default_registry
+
+    registry = ToolRegistry()
+    _make_tool_handler(
+        cast(MCPClient, object()), "test", "slow", MCPToolDef("slow", "slow", {}),
+        registry, timeout_seconds=120,
+    )
+    mcp = registry.to_tool_definitions()[0]
+    execute_code = next(
+        tool for tool in get_default_registry().to_tool_definitions()
+        if tool.name == "execute_code"
+    )
+    agent = Agent(
+        provider=RepeatedCallProvider(0),
+        config=AgentConfig(tool_timeout=generic_timeout),
+        tool_definitions=[mcp, execute_code],
+    )
+    for name in (mcp.name, "execute_code"):
+        budget = agent._tool_execution_timeout(
+            ToolCall(tool_use_id="long-call", tool_name=name, arguments={"timeout": 120}),
+        )
+        required = 125 if name == mcp.name else 120 + code_exec._EXECUTION_TIMEOUT_PADDING
+        assert budget is not None and budget >= required

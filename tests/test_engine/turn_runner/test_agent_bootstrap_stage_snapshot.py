@@ -523,6 +523,7 @@ async def _drive(runner, case, monkeypatch):
         semantic_message=None,
         timeout=case["per_call_timeout"],
         max_iterations=case["per_call_max_iterations"],
+        iteration_timeout=case["iteration_timeout"],
     )
     try:
         async for event in gen:
@@ -617,7 +618,7 @@ async def test_agent_bootstrap_stage_snapshot(
         "agent_config_context_window_tokens": case["catalog_context_window"],
         "agent_config_max_iterations": expected_max_iterations,
         "agent_config_timeout": expected_runtime_timeout,
-        "agent_config_iteration_timeout": case["iteration_timeout"],
+        "agent_config_iteration_timeout": 0.0,
         "agent_config_tool_timeout": case["tool_timeout"],
         "agent_config_request_timeout": case["request_timeout"],
         "agent_config_max_provider_retries": case["max_provider_retries"],
@@ -636,7 +637,7 @@ async def test_agent_bootstrap_stage_snapshot(
         "agent_config_flush_enabled": False,
         "effective_runtime_timeout": expected_runtime_timeout,
         "effective_max_iterations": expected_max_iterations,
-        "effective_iteration_timeout": case["iteration_timeout"],
+        "effective_iteration_timeout": 0.0,
         "effective_tool_timeout": case["tool_timeout"],
         "effective_agent_request_timeout": case["request_timeout"],
         "effective_max_provider_retries": case["max_provider_retries"],

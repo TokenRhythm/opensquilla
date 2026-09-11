@@ -639,7 +639,6 @@ def _metadata_for_meta_subagent(base_config: AgentConfig) -> dict[str, Any]:
 # defaults.
 _META_SUBAGENT_REQUEST_FIELDS = (
     "timeout",
-    "iteration_timeout",
     "request_timeout",
     "tool_timeout",
     "max_safe_tool_concurrency",

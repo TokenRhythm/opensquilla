@@ -670,13 +670,11 @@ class AgentConfig:
     # bounded operator budgets for CI, benchmarks, and constrained runs.
     max_iterations: int = 0
     # Total turn wall-clock budget (seconds; 0 = disabled)
-    # 30 min — see iteration_timeout note below; outer turn budget for
+    # Default outer turn budget (30 minutes) for
     # meta-skill DAGs (paper-write / arxiv-deck run 5-7 min commonly).
     timeout: float = 1800.0
-    # Per-iteration timeout: one LLM call + its tool executions
-    # 30 min — single iteration may be the whole meta DAG when the soft
-    # path treats meta_invoke as a single tool call.
-    iteration_timeout: float = 1800.0
+    # Deprecated, unused compatibility slot; preserve constructor position.
+    iteration_timeout: float = 0.0
     # HTTP-level timeout for a single LLM API request
     request_timeout: float = 120.0
     # Per-tool execution timeout

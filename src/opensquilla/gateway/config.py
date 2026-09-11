@@ -2839,8 +2839,7 @@ class GatewayConfig(BaseSettings):
     # meta turns retain the regular agent runtime budget. Disabled by default;
     # an explicit TurnRunner timeout still has priority when the cap is enabled.
     web_chat_runtime_timeout_seconds: float = Field(default=0.0, ge=0.0)
-    # Per-iteration timeout: one LLM call + its tool executions. ``None``
-    # means use the AgentConfig default.
+    # Deprecated, unused: provider inactivity and tool deadlines are separate.
     agent_iteration_timeout_seconds: float | None = None
     # Per-tool execution timeout. ``None`` means use the AgentConfig default.
     agent_tool_timeout_seconds: float | None = None
