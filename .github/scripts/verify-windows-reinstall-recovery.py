@@ -6,7 +6,6 @@ or repairs the directory/registry on its behalf. Evidence remains on failure.
 from __future__ import annotations
 
 import argparse
-import ctypes
 import hashlib
 import json
 import os
@@ -41,9 +40,20 @@ def registry(root):
                         name = winreg.EnumKey(keys, i)
                         with winreg.OpenKey(keys, name) as key:
                             values = dict((n, v) for n, v, _ in (winreg.EnumValue(key, j) for j in range(winreg.QueryInfoKey(key)[1])))
-                        location = values.get('InstallLocation', '')
-                        if location and Path(location).resolve() == root.resolve():
-                            found.append({'hive': hive_name, 'view': view, 'key': parent + '\\' + name, 'values': values})
+                        command = values.get('UninstallString', '')
+                        quoted = re.match(r'^"([^"]+)"', command)
+                        if not quoted or Path(quoted[1]).parent.resolve() != root.resolve():
+                            continue
+                        # electron-builder stores InstallLocation separately
+                        # under Software/<app GUID>, not in the Apps uninstall key.
+                        install_key = 'Software\\' + name
+                        try:
+                            with winreg.OpenKey(hive, install_key, 0, winreg.KEY_READ | view) as key:
+                                location = winreg.QueryValueEx(key, 'InstallLocation')[0]
+                        except FileNotFoundError:
+                            location = None
+                        found.append({'hive': hive_name, 'view': view, 'key': parent + '\\' + name,
+                                      'values': values, 'installKey': install_key, 'installLocation': location})
             except FileNotFoundError:
                 pass
     return found
@@ -141,6 +151,8 @@ def installed(root, version, installer, repo):
         raise AssertionError('Windows Apps uninstall registry entry missing')
     for entry in entries:
         values = entry['values']
+        if not entry['installLocation'] or Path(entry['installLocation']).resolve() != root.resolve():
+            raise AssertionError(f'InstallLocation registry mapping is missing or wrong: {entry}')
         if values.get('DisplayVersion') not in (version, version + '.0'):
             raise AssertionError(f'Wrong registry version: {values}')
         command = values['UninstallString']
