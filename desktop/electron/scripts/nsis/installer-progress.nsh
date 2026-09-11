@@ -1,4 +1,5 @@
 !ifndef BUILD_UNINSTALLER
+  !addincludedir "${PROJECT_DIR}\scripts\nsis"
   !include "LogicLib.nsh"
   !include "nsDialogs.nsh"
   !include "WinMessages.nsh"
