@@ -104,6 +104,125 @@ def test_explicit_provider_and_model_are_first_and_do_not_leak_secrets(
     assert repr(plan.primary.provider) not in rendered
 
 
+def test_active_only_reuses_parent_physical_deployment_and_one_call(
+    monkeypatch: pytest.MonkeyPatch,
+    built_configs: list[ProviderConfig],
+) -> None:
+    active = _config("anthropic", "current-model", api_key="current-secret")
+    fallback = _config("ollama", "fallback-model")
+
+    parent = _config("openai", "previous-model", api_key="parent-secret")
+    resolutions: list[tuple[str, str, bool]] = []
+
+    def resolve_parent(
+        _app_config: object,
+        provider: str,
+        model: str,
+        **kwargs: Any,
+    ) -> Any:
+        resolutions.append(
+            (provider, model, bool(kwargs.get("replay_provider_state")))
+        )
+        return SimpleNamespace(ready=True, provider_config=parent)
+
+    monkeypatch.setattr(
+        "opensquilla.session.compaction_deployment.resolve_provider_deployment",
+        resolve_parent,
+    )
+
+    plan = resolve_compaction_execution_plan(
+        app_config=object(),
+        active_provider=None,
+        active_provider_config=active,
+        previous_deployment_identities=(
+            CompactionDeploymentIdentity(
+                provider_id="openai",
+                model="previous-model",
+                source="previous_turn_deployment",
+            ),
+        ),
+        fallback_provider_configs=(fallback,),
+        compaction_config=SimpleNamespace(provider="openai", model="summary-model"),
+        context_window_tokens=32_000,
+        session_key="session-1",
+        active_only=True,
+        replay_provider_state=True,
+    )
+
+    assert isinstance(plan, CompactionExecutionPlan)
+    assert [(target.provider_id, target.model, target.source) for target in plan.candidates] == [
+        ("openai", "previous-model", "previous_turn_deployment"),
+    ]
+    assert resolutions == [("openai", "previous-model", True)]
+    assert plan.max_calls == 1
+    assert len(built_configs) == 1
+    assert built_configs[0].provider == parent.provider
+    assert built_configs[0].model == parent.model
+    assert built_configs[0].api_key == parent.api_key
+    assert built_configs[0].replay_provider_state is True
+
+
+def test_active_only_uses_current_when_parent_deployment_is_unchanged(
+    monkeypatch: pytest.MonkeyPatch,
+    built_configs: list[ProviderConfig],
+) -> None:
+    active = _config("anthropic", "current-model", api_key="current-secret")
+
+    def identity_resolution_forbidden(*_args: Any, **_kwargs: Any) -> Any:
+        raise AssertionError("unchanged parent must reuse the active config directly")
+
+    monkeypatch.setattr(
+        "opensquilla.session.compaction_deployment.resolve_provider_deployment",
+        identity_resolution_forbidden,
+    )
+
+    plan = resolve_compaction_execution_plan(
+        app_config=object(),
+        active_provider=None,
+        active_provider_config=active,
+        active_only=True,
+        replay_provider_state=True,
+    )
+
+    assert plan is not None
+    assert [(target.provider_id, target.model) for target in plan.candidates] == [
+        ("anthropic", "current-model")
+    ]
+    assert plan.max_calls == 1
+    assert built_configs[0].replay_provider_state is True
+
+
+def test_active_only_fails_closed_when_parent_deployment_is_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+    built_configs: list[ProviderConfig],
+) -> None:
+    monkeypatch.setattr(
+        "opensquilla.session.compaction_deployment.resolve_provider_deployment",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            ready=False,
+            provider_config=None,
+        ),
+    )
+
+    plan = resolve_compaction_execution_plan(
+        app_config=object(),
+        active_provider=None,
+        active_provider_config=_config("anthropic", "new-model"),
+        previous_deployment_identities=(
+            CompactionDeploymentIdentity(
+                provider_id="openai",
+                model="parent-model",
+                source="previous_session_deployment",
+            ),
+        ),
+        active_only=True,
+        replay_provider_state=True,
+    )
+
+    assert plan is None
+    assert built_configs == []
+
+
 def test_explicit_target_uses_runtime_credential_pool_acquirer(
     monkeypatch: pytest.MonkeyPatch,
     built_configs: list[ProviderConfig],

@@ -33,6 +33,7 @@ from opensquilla.session.attachment_manifest import (
 )
 from opensquilla.session.compaction import (
     CompactionConfig,
+    CompactionParentRequest,
     CompactionRequest,
     CompactionResult,
     _attachment_safe_obligation_entries,
@@ -757,6 +758,9 @@ class SessionManager:
         # read the current epoch without a DB round-trip on every event.
         # Invalidated (updated) whenever increment_epoch commits a new value.
         self._epoch_cache: dict[str, int] = {}
+        # Runtime-only snapshots of the last successful physical provider
+        # request. They are never persisted and are evicted with the session.
+        self._compaction_parent_requests: dict[str, CompactionParentRequest] = {}
 
     @property
     def storage(self) -> SessionStorage:
@@ -770,6 +774,30 @@ class SessionManager:
     def set_cached_epoch(self, session_key: str, epoch: int) -> None:
         """Update the in-process epoch cache after durable epoch changes."""
         self._epoch_cache[session_key] = epoch
+
+    def remember_compaction_parent_request(
+        self,
+        session_key: str,
+        parent_request: CompactionParentRequest,
+    ) -> None:
+        """Keep the last successful physical request for exact suffix replay."""
+
+        self._compaction_parent_requests[canonicalize_session_key(session_key)] = (
+            parent_request
+        )
+
+    def compaction_parent_request(
+        self,
+        session_key: str,
+    ) -> CompactionParentRequest | None:
+        """Return the runtime-only exact suffix parent for one live session."""
+
+        return self._compaction_parent_requests.get(canonicalize_session_key(session_key))
+
+    def clear_compaction_parent_request(self, session_key: str) -> None:
+        """Discard the exact suffix parent without touching durable history."""
+
+        self._compaction_parent_requests.pop(canonicalize_session_key(session_key), None)
 
     def attach_task_runtime(self, task_runtime: Any) -> None:
         """Attach the TaskRuntime so kill_session can cancel running children."""
@@ -1413,6 +1441,7 @@ class SessionManager:
         """
         session_key = canonicalize_session_key(session_key)
         self._epoch_cache.pop(session_key, None)
+        self._compaction_parent_requests.pop(session_key, None)
         goal_service = getattr(self._task_runtime, "goal_service", None)
         revoke_goal_lease = getattr(goal_service, "revoke_session", None)
         if callable(revoke_goal_lease):
@@ -3020,6 +3049,7 @@ class SessionManager:
         provider_request_correlation: ProviderRequestCorrelation | None = None,
         consumer_admission: Callable[[str, list[dict[str, Any]]], Any] | None = None,
         consumer_admission_fingerprint: str = "",
+        parent_request: CompactionParentRequest | None = None,
     ) -> str:
         """
         Compact the session transcript when context is filling up.
@@ -3040,6 +3070,7 @@ class SessionManager:
             mutation_context=mutation_context,
             consumer_admission=consumer_admission,
             consumer_admission_fingerprint=consumer_admission_fingerprint,
+            parent_request=parent_request,
             **correlation_kwargs,
         )
         return (
@@ -3066,6 +3097,7 @@ class SessionManager:
         protected_boundary_message_id: str | None = None,
         expected_session_id: str | None = None,
         expected_session_epoch: int | None = None,
+        parent_request: CompactionParentRequest | None = None,
     ) -> CompactionResult:
         """Compact the session transcript and return full compaction metadata."""
 
@@ -3200,6 +3232,7 @@ class SessionManager:
                 consumer_admission=consumer_admission,
                 expected_session_id=expected_session_id,
                 expected_session_epoch=expected_session_epoch,
+                parent_request=parent_request,
             ),
         )
         if is_owner:
@@ -3244,6 +3277,7 @@ class SessionManager:
         consumer_admission: Callable[[str, list[dict[str, Any]]], Any] | None,
         expected_session_id: str | None,
         expected_session_epoch: int | None,
+        parent_request: CompactionParentRequest | None,
     ) -> CompactionResult:
         """Generate and atomically install one frozen compaction candidate."""
 
@@ -3261,6 +3295,7 @@ class SessionManager:
                 summary_replay_renderer=_durable_summary_replay,
                 consumer_admission=consumer_admission,
                 provider_request_correlation=provider_request_correlation,
+                parent_request=parent_request,
             )
         )
 
@@ -3494,6 +3529,9 @@ class SessionManager:
                 cancellation_reconciled=cancellation_reconciled,
                 duration_ms=max(0, int((time.monotonic() - commit_started) * 1000)),
             )
+        # Any installed summary changes the durable prompt prefix, so a
+        # previously captured physical request can no longer be replayed.
+        self.clear_compaction_parent_request(session_key)
         return result
 
     async def persist_compaction_result(
@@ -3785,6 +3823,7 @@ class SessionManager:
             summary_len=len(summary),
             kept=persisted_kept_count,
         )
+        self.clear_compaction_parent_request(session_key)
         return True
 
     async def truncate(self, session_key: str, max_messages: int = 20) -> dict:
@@ -3813,6 +3852,7 @@ class SessionManager:
 
         node.updated_at = _now_ms()
         await self._storage.upsert_session(node)
+        self.clear_compaction_parent_request(session_key)
 
         return {"truncated": True, "before_count": before_count, "after_count": len(recent)}
 

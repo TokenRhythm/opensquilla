@@ -260,6 +260,7 @@ def build_compaction_llm_plan_from_provider_config(
     deployment_fingerprint: str = "",
     portable: bool = True,
     source: str = "provider_config",
+    replay_provider_state: bool = False,
 ) -> CompactionExecutionPlan:
     """Build an isolated auxiliary provider from a complete deployment config."""
 
@@ -280,9 +281,9 @@ def build_compaction_llm_plan_from_provider_config(
         config,
         model=model,
         provider_routing=dict(config.provider_routing),
-        # A summary request contains freshly serialized portable messages.
-        # Provider-private state from the consumer turn must never be replayed.
-        replay_provider_state=False,
+        # Prefix compaction keeps the portable default. Exact suffix
+        # compaction opts in so the copied parent request serializes identically.
+        replay_provider_state=replay_provider_state,
     )
     provider = build_provider_from_config(isolated)
     return CompactionExecutionPlan(
@@ -394,6 +395,8 @@ def resolve_compaction_execution_plan(
     session_key: str = "",
     credential_pool_acquirer: CredentialPoolAcquirer | None = None,
     credential_pool_failure_reporter: Callable[[str, str, Any], None] | None = None,
+    active_only: bool = False,
+    replay_provider_state: bool = False,
 ) -> CompactionExecutionPlan | None:
     """Freeze the ordered physical targets for one compaction operation.
 
@@ -423,6 +426,7 @@ def resolve_compaction_execution_plan(
                     else 0
                 ),
                 source=source,
+                replay_provider_state=replay_provider_state,
             )
         except Exception:
             return
@@ -453,7 +457,7 @@ def resolve_compaction_execution_plan(
             inherited_provider_config=active_provider_config,
             session_key=session_key,
             turn_metadata=resolution_metadata,
-            replay_provider_state=False,
+            replay_provider_state=replay_provider_state,
             credential_pool_acquirer=credential_pool_acquirer,
         )
         if resolution.ready:
@@ -462,6 +466,33 @@ def resolve_compaction_execution_plan(
                 source=identity.source,
                 credential_pool=resolution_metadata.get("credential_pool"),
             )
+
+    if active_only:
+        # When the last successful request used a different deployment than
+        # the provider selected for the new turn, resolve that recorded parent
+        # first. Falling through to the new deployment would change the wire
+        # prefix, so an unavailable parent deployment must fail closed.
+        parent_identity = next(iter(previous_deployment_identities), None)
+        if parent_identity is not None:
+            try:
+                add_identity(parent_identity)
+            except Exception:
+                return None
+            if not candidates:
+                return None
+        else:
+            add_config(active_provider_config, source="active_deployment")
+            if not candidates:
+                return build_compaction_execution_plan_from_provider(
+                    active_provider,
+                    context_window_tokens=context_window_tokens,
+                    max_calls=1,
+                    source="active_deployment",
+                )
+        return CompactionExecutionPlan(
+            candidates=(candidates[0],),
+            max_calls=1,
+        )
 
     explicit_provider = str(
         getattr(compaction_config, "provider", "") or ""

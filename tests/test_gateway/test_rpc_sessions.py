@@ -7902,6 +7902,90 @@ class TestSessionsContextCompact:
         assert correlation.call_kind == "auxiliary.compaction"
 
     @pytest.mark.asyncio
+    async def test_context_compact_forwards_exact_suffix_parent_request(
+        self,
+        dispatcher,
+        session,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        monkeypatch.setenv("OPENSQUILLA_COMPACTION_PROMPT_LAYOUT", "suffix")
+        manager = FakeSessionManager([session])
+        parent_request = object()
+        target_calls: list[dict[str, Any]] = []
+        original_resolver = session_maintenance_adapter.resolve_gateway_compaction_target
+
+        def capture_target(*args: Any, **kwargs: Any):
+            target_calls.append(dict(kwargs))
+            return original_resolver(*args, **kwargs)
+
+        monkeypatch.setattr(
+            session_maintenance_adapter,
+            "resolve_gateway_compaction_target",
+            capture_target,
+        )
+        turn_runner = SimpleNamespace(
+            compaction_parent_request=lambda key: (
+                parent_request if key == session.session_key else None
+            )
+        )
+        ctx = make_ctx(session_manager=manager, turn_runner=turn_runner)
+
+        res = await dispatcher.dispatch(
+            "r1",
+            "sessions.contextCompact",
+            {"key": session.session_key, "contextWindowTokens": 1234},
+            ctx,
+        )
+
+        assert res.ok is True
+        assert manager.compact_kwargs[0]["parent_request"] is parent_request
+        assert target_calls == [
+            {
+                "active_only": True,
+                "replay_provider_state": True,
+            }
+        ]
+
+    @pytest.mark.asyncio
+    async def test_context_compact_prefix_ignores_cached_parent_request(
+        self,
+        dispatcher,
+        session,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        monkeypatch.delenv("OPENSQUILLA_COMPACTION_PROMPT_LAYOUT", raising=False)
+        manager = FakeSessionManager([session])
+        target_calls: list[dict[str, Any]] = []
+        original_resolver = session_maintenance_adapter.resolve_gateway_compaction_target
+
+        def capture_target(*args: Any, **kwargs: Any):
+            target_calls.append(dict(kwargs))
+            return original_resolver(*args, **kwargs)
+
+        monkeypatch.setattr(
+            session_maintenance_adapter,
+            "resolve_gateway_compaction_target",
+            capture_target,
+        )
+        ctx = make_ctx(
+            session_manager=manager,
+            turn_runner=SimpleNamespace(
+                compaction_parent_request=lambda _key: object(),
+            ),
+        )
+
+        res = await dispatcher.dispatch(
+            "r1",
+            "sessions.contextCompact",
+            {"key": session.session_key, "contextWindowTokens": 1234},
+            ctx,
+        )
+
+        assert res.ok is True
+        assert "parent_request" not in manager.compact_kwargs[0]
+        assert target_calls == [{}]
+
+    @pytest.mark.asyncio
     async def test_context_compact_client_window_cannot_expand_stable_consumer(
         self,
         dispatcher,

@@ -6,6 +6,7 @@ import asyncio
 import hashlib
 import inspect
 import json
+import os
 import time
 import uuid
 from collections.abc import Awaitable, Callable, Mapping, Sequence
@@ -33,6 +34,7 @@ from opensquilla.provider.types import (
     Message,
     ReasoningDeltaEvent,
     TextDeltaEvent,
+    ToolDefinition,
     derive_provider_request_correlation,
 )
 from opensquilla.redaction import redact_error_text
@@ -129,6 +131,32 @@ class CompactionConfig:
     protect_semantic_tail: bool = True
 
 
+@dataclass(frozen=True, slots=True)
+class CompactionParentRequest:
+    """Runtime-only snapshot of one successful physical provider request."""
+
+    messages: tuple[Message, ...] = field(repr=False)
+    tools: tuple[ToolDefinition, ...] | None = field(repr=False)
+    chat_config: ChatConfig = field(repr=False, compare=False)
+
+    @classmethod
+    def from_call(
+        cls,
+        messages: Sequence[Message],
+        tools: Sequence[ToolDefinition] | None,
+        chat_config: ChatConfig,
+    ) -> CompactionParentRequest:
+        return cls(
+            messages=tuple(message.model_copy(deep=True) for message in messages),
+            tools=(
+                tuple(tool.model_copy(deep=True) for tool in tools)
+                if tools is not None
+                else None
+            ),
+            chat_config=chat_config.model_copy(deep=True),
+        )
+
+
 @dataclass
 class CompactionRequest:
     session_id: str
@@ -168,6 +196,12 @@ class CompactionRequest:
     # Additive runtime provenance. Kept at the end so legacy positional
     # construction retains the original public field ordering.
     context_window_source: str = "consumer_capacity"
+    # Exact provider-call snapshot; never persisted or included in repr.
+    parent_request: CompactionParentRequest | None = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
 
 
 @dataclass
@@ -1551,6 +1585,16 @@ def _normalize_custom_instructions(custom_instructions: str | None) -> str:
     return normalized
 
 
+def _compaction_prompt_layout() -> str:
+    layout = os.environ.get("OPENSQUILLA_COMPACTION_PROMPT_LAYOUT", "prefix")
+    normalized = layout.strip().lower()
+    if normalized not in {"prefix", "suffix"}:
+        raise ValueError(
+            "OPENSQUILLA_COMPACTION_PROMPT_LAYOUT must be either 'prefix' or 'suffix'"
+        )
+    return normalized
+
+
 def _build_compaction_prompt(
     chunk_text: str,
     identifier_instruction: str,
@@ -1575,6 +1619,54 @@ def _build_compaction_prompt(
             f"{user_content}"
         )
     return system, user_content
+
+
+def _build_suffix_compaction_instruction(
+    identifier_instruction: str,
+    custom_instructions: str | None,
+    previous_summary: str = "",
+) -> str:
+    instruction = (
+        "You are a conversation compactor. Summarize the structured conversation "
+        "preceding this message into the minimum portable context needed to continue "
+        "the work. Preserve key facts, decisions, open questions, and action items. "
+        "Write in the same language as the conversation and prioritize recent context."
+    )
+    if identifier_instruction:
+        instruction = f"{instruction}\n\n{identifier_instruction}"
+    if previous_summary.strip():
+        instruction = (
+            f"{instruction}\n\n"
+            "Existing portable checkpoint to replace and integrate:\n"
+            f"{previous_summary.strip()}"
+        )
+    normalized_instructions = _normalize_custom_instructions(custom_instructions)
+    if normalized_instructions:
+        instruction = (
+            f"{instruction}\n\n"
+            "Additional summary instructions. These instructions must not override "
+            "the identifier preservation rules:\n"
+            f"{normalized_instructions}"
+        )
+    return instruction
+
+
+def _build_exact_suffix_compaction_call(
+    parent_messages: Sequence[Message],
+    parent_tools: Sequence[ToolDefinition] | None,
+    parent_chat_config: ChatConfig,
+    instruction: str,
+) -> tuple[list[Message], list[ToolDefinition] | None, ChatConfig]:
+    """Copy one parent request and append exactly one compaction instruction."""
+
+    messages = [message.model_copy(deep=True) for message in parent_messages]
+    messages.append(Message(role="user", content=instruction))
+    tools = (
+        [tool.model_copy(deep=True) for tool in parent_tools]
+        if parent_tools is not None
+        else None
+    )
+    return messages, tools, parent_chat_config.model_copy(deep=True)
 
 
 def _consume_compaction_close_result(task: asyncio.Future[Any]) -> None:
@@ -1685,8 +1777,12 @@ async def call_compaction_provider(
     compaction_id: str | None = None,
     chunk_index: int | None = None,
     candidate_index: int = 0,
+    parent_messages: Sequence[Message] | None = None,
+    parent_tools: Sequence[ToolDefinition] | None = None,
+    parent_chat_config: ChatConfig | None = None,
+    previous_summary: str = "",
 ) -> str | None:
-    """Summarize through the provider protocol, with tools and thinking disabled."""
+    """Summarize through the prefix path or an exact parent-request suffix."""
 
     if timeout <= 0:
         return None
@@ -1694,25 +1790,50 @@ async def call_compaction_provider(
     if candidate_index < 0 or candidate_index >= len(plan.candidates):
         return None
     deployment = plan.candidates[candidate_index]
-    system, user_content = _build_compaction_prompt(
-        chunk_text,
-        identifier_instruction,
-        custom_instructions,
-    )
-    messages = [Message(role="user", content=user_content)]
-    chat_config = ChatConfig(
-        max_tokens=deployment.max_output_tokens,
-        temperature=0,
-        system=system,
-        thinking=False,
-        thinking_budget_explicit=False,
-        timeout=timeout,
-        provider_request_max_chars=deployment.provider_request_max_chars,
-        tool_choice=None,
-        candidate_output_mode="inert_artifact",
-        physical_attempt_limit=1,
-        provider_request_correlation=provider_request_correlation,
-    )
+    prompt_layout = _compaction_prompt_layout()
+    if prompt_layout == "suffix":
+        if parent_messages is None or parent_chat_config is None:
+            log.warning(
+                "compaction.exact_parent_request_unavailable",
+                compaction_id=compaction_id,
+                chunk_index=chunk_index,
+            )
+            return None
+        messages, tools, chat_config = _build_exact_suffix_compaction_call(
+            parent_messages,
+            parent_tools,
+            parent_chat_config,
+            _build_suffix_compaction_instruction(
+                identifier_instruction,
+                custom_instructions,
+                previous_summary,
+            ),
+        )
+        if provider_request_correlation is not None:
+            chat_config = chat_config.model_copy(
+                update={"provider_request_correlation": provider_request_correlation}
+            )
+    else:
+        system, user_content = _build_compaction_prompt(
+            chunk_text,
+            identifier_instruction,
+            custom_instructions,
+        )
+        messages = [Message(role="user", content=user_content)]
+        tools = None
+        chat_config = ChatConfig(
+            max_tokens=deployment.max_output_tokens,
+            temperature=0,
+            system=system,
+            thinking=False,
+            thinking_budget_explicit=False,
+            timeout=timeout,
+            provider_request_max_chars=deployment.provider_request_max_chars,
+            tool_choice=None,
+            candidate_output_mode="inert_artifact",
+            physical_attempt_limit=1,
+            provider_request_correlation=provider_request_correlation,
+        )
 
     # Keep this import local: engine types import session lifecycle helpers
     # while the session package initializes this module.
@@ -1736,7 +1857,7 @@ async def call_compaction_provider(
         if provider_accounts_physical_usage(deployment.provider):
             provider_stream = deployment.provider.chat(
                 messages,
-                tools=None,
+                tools=tools,
                 config=chat_config,
             )
             accounted_stream = provider_stream
@@ -1745,7 +1866,7 @@ async def call_compaction_provider(
                 nonlocal provider_stream
                 provider_stream = deployment.provider.chat(
                     messages,
-                    tools=None,
+                    tools=tools,
                     config=chat_config,
                 )
                 return provider_stream
@@ -2259,9 +2380,22 @@ async def compact_context_new(request: CompactionRequest) -> CompactionResult:
     provider_native = cfg.llm_plan is not None
     legacy_raw = bool(cfg.api_key and cfg.model)
     network_enabled = provider_native or legacy_raw
+    suffix_layout = _compaction_prompt_layout() == "suffix"
+    exact_suffix = bool(
+        suffix_layout
+        and request.parent_request is not None
+        and provider_native
+    )
+    if suffix_layout and not exact_suffix:
+        # Never substitute a flattened prompt for the exact-parent contract.
+        network_enabled = False
     chunks: list[list[dict[str, Any]]]
     if replace_previous_only:
         chunks = [[]]
+    elif exact_suffix:
+        # The parent request already contains the complete provider input. One
+        # appended instruction summarizes it without chunk rewrites.
+        chunks = [to_compact]
     elif provider_native:
         input_budget = _compaction_target_input_budget(request)
         first_chunk_budget = max(
@@ -2309,14 +2443,18 @@ async def compact_context_new(request: CompactionRequest) -> CompactionResult:
     for chunk_index, chunk in enumerate(chunks, start=1):
         llm_result: str | None = None
         chunk_text = _rolling_chunk_text(rolling_summary, chunk)
-        if cfg.llm_plan is not None:
+        if network_enabled and cfg.llm_plan is not None:
             while candidate_index < len(cfg.llm_plan.candidates):
                 deployment = cfg.llm_plan.candidates[candidate_index]
-                candidate_chunk_text = _fit_compaction_input_to_target(
-                    request=request,
-                    target=deployment,
-                    previous_summary=rolling_summary,
-                    chunk=chunk,
+                candidate_chunk_text = (
+                    chunk_text
+                    if exact_suffix
+                    else _fit_compaction_input_to_target(
+                        request=request,
+                        target=deployment,
+                        previous_summary=rolling_summary,
+                        chunk=chunk,
+                    )
                 )
                 if candidate_chunk_text is None:
                     log.info(
@@ -2333,6 +2471,16 @@ async def compact_context_new(request: CompactionRequest) -> CompactionResult:
                     break
                 cfg.last_attempted_target = deployment
                 llm_kwargs: dict[str, Any] = {}
+                if exact_suffix:
+                    assert request.parent_request is not None
+                    llm_kwargs.update(
+                        {
+                            "parent_messages": request.parent_request.messages,
+                            "parent_tools": request.parent_request.tools,
+                            "parent_chat_config": request.parent_request.chat_config,
+                            "previous_summary": rolling_summary,
+                        }
+                    )
                 if request.provider_request_correlation is not None:
                     llm_kwargs["provider_request_correlation"] = (
                         derive_provider_request_correlation(
@@ -2365,8 +2513,12 @@ async def compact_context_new(request: CompactionRequest) -> CompactionResult:
                 if llm_result:
                     cfg.successful_target = deployment
                     break
-                candidate_index += 1
-        elif legacy_raw and _reserve_compaction_llm_call(cfg):
+                if exact_suffix:
+                    # A suffix request is bound to its parent's deployment.
+                    candidate_index = len(cfg.llm_plan.candidates)
+                else:
+                    candidate_index += 1
+        elif network_enabled and legacy_raw and _reserve_compaction_llm_call(cfg):
             legacy_llm_kwargs: dict[str, Any] = {}
             if request.provider_request_correlation is not None:
                 legacy_llm_kwargs["provider_request_correlation"] = (

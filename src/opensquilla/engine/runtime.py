@@ -4771,6 +4771,7 @@ class TurnRunner:
         self._usage_event_sink = usage_event_sink
         self._prompt_cache_keepalive_recorder = prompt_cache_keepalive_recorder
         self._prompt_cache_keepalive_armed = prompt_cache_keepalive_armed
+        self._compaction_parent_requests: dict[str, Any] = {}
         # Populated alongside the existing session-id lookup so live usage
         # events retain reset fencing without a second storage round trip.
         self._usage_session_epoch_by_key: dict[str, int] = {}
@@ -5239,6 +5240,43 @@ class TurnRunner:
 
         self._prompt_cache_keepalive_recorder = recorder
         self._prompt_cache_keepalive_armed = armed
+
+    def compaction_parent_request(self, session_key: str) -> Any | None:
+        """Return the latest successful request snapshot for one session."""
+
+        getter = getattr(self._session_manager, "compaction_parent_request", None)
+        if callable(getter):
+            return getter(session_key)
+        return self._compaction_parent_requests.get(session_key)
+
+    def clear_compaction_parent_request(self, session_key: str) -> None:
+        """Discard a snapshot after its transcript has been compacted."""
+
+        clearer = getattr(self._session_manager, "clear_compaction_parent_request", None)
+        if callable(clearer):
+            clearer(session_key)
+        self._compaction_parent_requests.pop(session_key, None)
+
+    def _remember_compaction_parent_request(
+        self,
+        session_key: str,
+        parent_request: Any,
+    ) -> None:
+        remember = getattr(
+            self._session_manager,
+            "remember_compaction_parent_request",
+            None,
+        )
+        if callable(remember):
+            remember(session_key, parent_request)
+            return
+        self._compaction_parent_requests[session_key] = parent_request
+
+    def _suffix_compaction_parent_request(self, session_key: str) -> Any | None:
+        layout = os.environ.get("OPENSQUILLA_COMPACTION_PROMPT_LAYOUT", "prefix")
+        if layout.strip().lower() != "suffix":
+            return None
+        return self.compaction_parent_request(session_key)
 
     @contextlib.asynccontextmanager
     async def _session_write_context(self, session_key: str) -> AsyncIterator[None]:
@@ -6126,6 +6164,26 @@ class TurnRunner:
                     "turn_runner.prompt_cache_keepalive_capture_unavailable",
                     session_key=session_key,
                 )
+            parent_capture_setter = getattr(
+                agent,
+                "set_compaction_parent_request_capture_enabled",
+                None,
+            )
+            if callable(parent_capture_setter):
+                try:
+                    parent_capture_setter(
+                        os.environ.get(
+                            "OPENSQUILLA_COMPACTION_PROMPT_LAYOUT",
+                            "prefix",
+                        ).strip().lower()
+                        == "suffix"
+                    )
+                except Exception:  # noqa: BLE001 - capture cannot fail a turn
+                    log.warning(
+                        "turn_runner.compaction_parent_capture_setup_failed",
+                        session_key=session_key,
+                        exc_info=True,
+                    )
             agent_config = ab_out.agent_config
             # These locals are read by the test_agent_bootstrap_stage_snapshot
             # frame-walking probe. Do not remove.
@@ -6304,6 +6362,12 @@ class TurnRunner:
                                 source=previous_source,
                             )
                         )
+            suffix_compaction_enabled = (
+                os.environ.get("OPENSQUILLA_COMPACTION_PROMPT_LAYOUT", "prefix")
+                .strip()
+                .lower()
+                == "suffix"
+            )
             compaction_plan = resolve_compaction_execution_plan(
                 app_config=self._turn_config(),
                 active_provider=provider,
@@ -6315,6 +6379,8 @@ class TurnRunner:
                 session_key=session_key,
                 credential_pool_acquirer=acquire_profile_credential,
                 credential_pool_failure_reporter=report_profile_credential_failure,
+                active_only=suffix_compaction_enabled,
+                replay_provider_state=suffix_compaction_enabled,
             )
 
             def _refresh_compaction_plan_for_operation() -> Any | None:
@@ -6351,6 +6417,8 @@ class TurnRunner:
                     session_key=session_key,
                     credential_pool_acquirer=acquire_profile_credential,
                     credential_pool_failure_reporter=(report_profile_credential_failure),
+                    active_only=suffix_compaction_enabled,
+                    replay_provider_state=suffix_compaction_enabled,
                 )
 
             stable_consumer_window_tokens = compaction_context_window_tokens
@@ -6779,6 +6847,30 @@ class TurnRunner:
             fin_out = fin_outcome.require_output()
             final_text = fin_out.final_text
             turn_segments = fin_out.turn_segments
+            if fin_out.transcript_appended and not error_message:
+                parent_request_getter = getattr(
+                    agent,
+                    "compaction_parent_request",
+                    None,
+                )
+                try:
+                    parent_request = (
+                        parent_request_getter()
+                        if callable(parent_request_getter)
+                        else None
+                    )
+                except Exception:  # noqa: BLE001 - capture cannot fail a turn
+                    parent_request = None
+                    log.warning(
+                        "turn_runner.compaction_parent_request_failed",
+                        session_key=session_key,
+                        exc_info=True,
+                    )
+                if parent_request is not None:
+                    self._remember_compaction_parent_request(
+                        session_key,
+                        parent_request,
+                    )
             if (
                 fin_out.transcript_appended
                 and not error_message
@@ -12097,6 +12189,12 @@ class TurnRunner:
             if callable(compact_with_result):
                 compact_method = self._session_manager.compact_with_result
                 compact_kwargs: dict[str, Any] = {}
+                parent_request = self._suffix_compaction_parent_request(session_key)
+                if parent_request is not None and _accepts_keyword_arg(
+                    compact_method,
+                    "parent_request",
+                ):
+                    compact_kwargs["parent_request"] = parent_request
                 if _accepts_keyword_arg(compact_method, "compaction_id"):
                     compact_kwargs["compaction_id"] = compaction_id
                 if _accepts_keyword_arg(compact_method, "trigger_reason"):
@@ -12157,6 +12255,12 @@ class TurnRunner:
                 result = getattr(compaction_result, "summary", "") or ""
             else:
                 compact_call_kwargs: dict[str, Any] = {}
+                parent_request = self._suffix_compaction_parent_request(session_key)
+                if parent_request is not None and _accepts_keyword_arg(
+                    self._session_manager.compact,
+                    "parent_request",
+                ):
+                    compact_call_kwargs["parent_request"] = parent_request
                 if (
                     expected_session_id is not None
                     or expected_session_epoch is not None
@@ -12770,6 +12874,12 @@ class TurnRunner:
             if callable(compact_with_result):
                 compact_method = self._session_manager.compact_with_result
                 compact_kwargs: dict[str, Any] = {}
+                parent_request = self._suffix_compaction_parent_request(session_key)
+                if parent_request is not None and _accepts_keyword_arg(
+                    compact_method,
+                    "parent_request",
+                ):
+                    compact_kwargs["parent_request"] = parent_request
                 if _accepts_keyword_arg(compact_method, "compaction_id"):
                     compact_kwargs["compaction_id"] = compaction_id
                 if _accepts_keyword_arg(compact_method, "trigger_reason"):
@@ -12830,6 +12940,12 @@ class TurnRunner:
                 result = getattr(compaction_result, "summary", "") or ""
             else:
                 compact_call_kwargs: dict[str, Any] = {}
+                parent_request = self._suffix_compaction_parent_request(session_key)
+                if parent_request is not None and _accepts_keyword_arg(
+                    self._session_manager.compact,
+                    "parent_request",
+                ):
+                    compact_call_kwargs["parent_request"] = parent_request
                 if (
                     expected_session_id is not None
                     or expected_session_epoch is not None

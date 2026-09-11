@@ -219,6 +219,7 @@ from opensquilla.sandbox.elevation import (
 )
 from opensquilla.session.compaction import (
     CompactionConfig,
+    CompactionParentRequest,
     CompactionRequest,
     arm_compaction_deadline,
     build_compaction_config_from_provider,
@@ -2599,6 +2600,8 @@ class Agent:
         # can never arm a gateway keepalive probe.
         self._prompt_cache_keepalive_candidate: PromptCacheKeepaliveCandidate | None = None
         self._prompt_cache_keepalive_capture_enabled = False
+        self._compaction_parent_request: CompactionParentRequest | None = None
+        self._compaction_parent_request_capture_enabled = False
         if self.tool_handler is not None and self._tool_context is not None:
             self.tool_handler = self._bind_tool_handler_context(
                 self.tool_handler,
@@ -5652,6 +5655,16 @@ class Agent:
 
         self._prompt_cache_keepalive_capture_enabled = bool(enabled)
 
+    def compaction_parent_request(self) -> CompactionParentRequest | None:
+        """Return the latest successful physical request captured this turn."""
+
+        return self._compaction_parent_request
+
+    def set_compaction_parent_request_capture_enabled(self, enabled: bool) -> None:
+        """Arm exact request capture only for explicit suffix compaction."""
+
+        self._compaction_parent_request_capture_enabled = bool(enabled)
+
     def _usage_context_for_turn(self) -> UsageExecutionContext:
         """Return the injected execution identity or a safe direct-Agent fallback."""
 
@@ -5760,6 +5773,7 @@ class Agent:
         )
 
         self._prompt_cache_keepalive_candidate = None
+        self._compaction_parent_request = None
 
         image_context_bindings: list[
             tuple[ToolContext, Callable[[], tuple[Any, Any] | None] | None]
@@ -8565,6 +8579,22 @@ class Agent:
                                     continue
                                 provider_done_for_log = raw_ev
                                 _got_done_event = True
+                                if self._compaction_parent_request_capture_enabled:
+                                    try:
+                                        self._compaction_parent_request = (
+                                            CompactionParentRequest.from_call(
+                                                (
+                                                    canonical_request_messages
+                                                    if selector_projects_images
+                                                    else request_messages
+                                                ),
+                                                provider_tools_for_call,
+                                                call_chat_cfg,
+                                            )
+                                        )
+                                    except Exception:
+                                        # Optional capture must never fail a user turn.
+                                        self._compaction_parent_request = None
                                 if keepalive_stable_history and self._session_key:
                                     try:
                                         self._prompt_cache_keepalive_candidate = (
@@ -15700,6 +15730,7 @@ class Agent:
                             call_kind="auxiliary.compaction",
                         )
                     ),
+                    parent_request=self._compaction_parent_request,
                 )
             )
         finally:
@@ -15773,6 +15804,7 @@ class Agent:
                     COMPACTION_TRIGGERED_EVENT,
                 ),
             )
+        self._compaction_parent_request = None
         return CompactionOutcome(
             messages=projected,
             compacted=True,
@@ -15992,6 +16024,7 @@ class Agent:
                 execution_id=uuid.uuid4().hex,
                 call_kind="auxiliary.compaction",
             ),
+            parent_request=self._compaction_parent_request,
         )
         try:
             result = await compact_context(request)
@@ -16045,6 +16078,7 @@ class Agent:
         if verified.actual_wire_messages > target:
             return None, "projection_above_target_after_summary"
 
+        self._compaction_parent_request = None
         return (
             _MessageCountRecoveryOutcome(
                 messages=compacted,
@@ -16815,6 +16849,7 @@ class Agent:
                 execution_id=uuid.uuid4().hex,
                 call_kind="auxiliary.compaction",
             ),
+            parent_request=self._compaction_parent_request,
         )
 
         try:
@@ -17093,6 +17128,7 @@ class Agent:
             kept_start_index,
             summary_present=bool(replay_summary),
         )
+        self._compaction_parent_request = None
         return CompactionOutcome(
             messages=compacted,
             compacted=True,

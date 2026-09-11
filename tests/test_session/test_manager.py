@@ -945,6 +945,7 @@ def test_get_transcript_query_uses_id_tiebreaker() -> None:
 @pytest.mark.asyncio
 async def test_truncate_zero_removes_all_entries(manager):
     await manager.create("agent:main:main")
+    manager.remember_compaction_parent_request("agent:main:main", object())
     await manager.append_message("agent:main:main", "user", "msg1")
     await manager.append_message("agent:main:main", "assistant", "resp1")
 
@@ -952,6 +953,7 @@ async def test_truncate_zero_removes_all_entries(manager):
 
     assert result == {"truncated": True, "before_count": 2, "after_count": 0}
     assert await manager.get_transcript("agent:main:main") == []
+    assert manager.compaction_parent_request("agent:main:main") is None
 
 
 @pytest.mark.asyncio
@@ -2986,6 +2988,7 @@ async def test_compact_reduces_transcript(manager):
 @pytest.mark.asyncio
 async def test_compact_with_result_returns_source_and_persists(manager):
     await manager.create("agent:main:main")
+    manager.remember_compaction_parent_request("agent:main:main", object())
     for i in range(20):
         await manager.append_message(
             "agent:main:main",
@@ -3022,6 +3025,7 @@ async def test_compact_with_result_returns_source_and_persists(manager):
     ]
     assert canonical_contents == original_contents
     assert [entry.content for entry in transcript] == original_contents[-len(transcript) :]
+    assert manager.compaction_parent_request("agent:main:main") is None
 
 
 @pytest.mark.asyncio
@@ -4058,6 +4062,7 @@ async def test_close_waits_for_an_active_connection_transaction(
 @pytest.mark.asyncio
 async def test_persist_compaction_result_stores_summary_out_of_band(manager):
     node = await manager.create("agent:main:main")
+    manager.remember_compaction_parent_request("agent:main:main", object())
     for index in range(4):
         await manager.append_message("agent:main:main", "user", f"msg {index}", token_count=5)
 
@@ -4102,6 +4107,7 @@ async def test_persist_compaction_result_stores_summary_out_of_band(manager):
     assert states[0].state_kind == "structured_summary_v1"
     assert states[0].payload is not None
     assert states[0].payload["compaction_id"] == "cmp_inline_1"
+    assert manager.compaction_parent_request("agent:main:main") is None
 
 
 @pytest.mark.asyncio

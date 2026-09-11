@@ -415,6 +415,47 @@ async def test_preflight_protects_active_and_queued_prompts_from_durable_compact
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("layout", "expects_parent"),
+    [("suffix", True), ("prefix", False)],
+)
+async def test_preflight_forwards_exact_parent_only_for_suffix_layout(
+    monkeypatch: pytest.MonkeyPatch,
+    layout: str,
+    expects_parent: bool,
+) -> None:
+    monkeypatch.setenv("OPENSQUILLA_COMPACTION_PROMPT_LAYOUT", layout)
+    transcript = [
+        TranscriptEntry(
+            session_id="test-session-id",
+            session_key="user:session",
+            role="user",
+            content="old history",
+            token_count=900,
+        ),
+        TranscriptEntry(
+            session_id="test-session-id",
+            session_key="user:session",
+            role="assistant",
+            content="recent answer",
+            token_count=20,
+        ),
+    ]
+    sm = _ResultCompactionSessionManager(transcript)
+    runner = TurnRunner(provider_selector=MagicMock(), session_manager=sm)
+    parent_request = object()
+    runner._remember_compaction_parent_request("user:session", parent_request)
+
+    await runner._maybe_preflight_compact("user:session", 1000)
+
+    kwargs = sm.compact_with_result_kwargs[0]
+    if expects_parent:
+        assert kwargs["parent_request"] is parent_request
+    else:
+        assert "parent_request" not in kwargs
+
+
+@pytest.mark.asyncio
 async def test_preflight_compacts_to_final_envelope_history_capacity() -> None:
     context_window = 1000
     history_capacity = 600

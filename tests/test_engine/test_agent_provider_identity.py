@@ -101,6 +101,43 @@ def test_fallback_branch_records_configured_provider_id() -> None:
     assert mu.cost == 0.0
 
 
+def test_agent_captures_last_successful_physical_request_for_compaction() -> None:
+    class _RecordingProvider(_LocalCompatProvider):
+        def __init__(self) -> None:
+            self.calls: list[tuple[list[Message], list[Any] | None, ChatConfig | None]] = []
+
+        def chat(
+            self,
+            messages: list[Message],
+            tools: list[Any] | None = None,
+            config: ChatConfig | None = None,
+        ) -> AsyncIterator[Any]:
+            self.calls.append((messages, tools, config))
+            return self._stream()
+
+    provider = _RecordingProvider()
+
+    async def run() -> Any:
+        agent = Agent(
+            provider=provider,
+            config=AgentConfig(max_iterations=2, provider_id="openrouter"),
+            tool_definitions=[],
+            tool_handler=None,
+            session_key="agent:test:webchat:compaction-parent",
+        )
+        agent.set_compaction_parent_request_capture_enabled(True)
+        async for _ in agent.run_turn("hi"):
+            pass
+        return agent.compaction_parent_request()
+
+    parent_request = asyncio.run(run())
+
+    assert parent_request is not None
+    assert tuple(provider.calls[-1][0]) == parent_request.messages
+    assert parent_request.tools is None
+    assert provider.calls[-1][2] == parent_request.chat_config
+
+
 def test_fallback_branch_without_provider_id_uses_adapter_name() -> None:
     """Backward-compatible default: with no configured provider id the
     adapter class name still flows through (and prices as cloud), so the

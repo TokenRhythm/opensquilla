@@ -104,6 +104,8 @@ def test_explicit_runtime_eviction_drops_all_session_identity_caches() -> None:
     session_id = "history-eviction-generation"
     manager = SessionManager(_MemoryStorage())  # type: ignore[arg-type]
     manager.set_cached_epoch(session_key, 7)
+    parent_request = object()
+    manager.remember_compaction_parent_request(session_key, parent_request)
     _tracker.mark_closed(session_key, "child-task")
     _history_store.set(session_key, [{"turn_index": 3}])
     sessions_tool._get_spawn_lock(session_key)
@@ -115,6 +117,7 @@ def test_explicit_runtime_eviction_drops_all_session_identity_caches() -> None:
     )
 
     assert manager.get_cached_epoch(session_key) is None
+    assert manager.compaction_parent_request(session_key) is None
     assert not _tracker.is_closed(session_key, "child-task")
     assert _history_store.get(session_key) is None
     assert session_key not in sessions_tool._spawn_locks

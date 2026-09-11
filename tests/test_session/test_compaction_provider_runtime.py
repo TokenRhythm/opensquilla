@@ -12,17 +12,27 @@ from opensquilla.engine.usage_accounting import (
     bind_usage_accounting_scope,
 )
 from opensquilla.provider.failures import ProviderFailureKind
+from opensquilla.provider.openai import OpenAIProvider
 from opensquilla.provider.protocol import ProviderConnectionConfig, ProviderMetadata
 from opensquilla.provider.selector import ProviderConfig, build_provider_from_config
 from opensquilla.provider.types import (
     ChatConfig,
+    ContentBlockText,
+    ContentBlockToolResult,
+    ContentBlockToolUse,
     DoneEvent,
     ErrorEvent,
+    Message,
+    ProviderReplayState,
     ProviderRequestCorrelation,
     ReasoningDeltaEvent,
     TextDeltaEvent,
+    ToolDefinition,
+    ToolInputSchema,
 )
 from opensquilla.session.compaction import (
+    CompactionConfig,
+    CompactionParentRequest,
     CompactionRequest,
     arm_compaction_deadline,
     build_compaction_config_from_provider,
@@ -277,6 +287,33 @@ def test_full_config_plan_has_candidate_shape_and_no_secret_repr(
     assert runtime_config.api_key == ""
 
 
+def test_suffix_plan_preserves_provider_state_for_parent_replay(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: list[ProviderConfig] = []
+
+    def fake_factory(config: ProviderConfig) -> _Provider:
+        captured.append(config)
+        return _Provider(_successful_stream)
+
+    monkeypatch.setattr(
+        "opensquilla.session.compaction_deployment.build_provider_from_config",
+        fake_factory,
+    )
+
+    build_compaction_llm_plan_from_provider_config(
+        ProviderConfig(
+            provider="openrouter",
+            model="synthetic/model",
+            api_key="super-secret",
+            replay_provider_state=False,
+        ),
+        replay_provider_state=True,
+    )
+
+    assert captured[0].replay_provider_state is True
+
+
 def test_builder_uses_provider_plan_only_when_bound_model_matches() -> None:
     provider = _Provider(_successful_stream)
 
@@ -352,6 +389,397 @@ async def test_provider_compaction_disables_tools_and_thinking_and_accounts_usag
     assert sink.starts[0].model == "provider/model"
     assert len(sink.finalized) == 1
     assert sink.unknown == []
+
+
+@pytest.mark.asyncio
+async def test_suffix_reuses_complete_parent_request_and_appends_one_instruction(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("OPENSQUILLA_COMPACTION_PROMPT_LAYOUT", "suffix")
+    provider = _Provider(_successful_stream)
+    plan = CompactionExecutionPlan(
+        candidates=(
+            CompactionExecutionTarget(
+                provider=provider,
+                provider_id="openrouter",
+                model="provider/model",
+                max_output_tokens=768,
+                provider_request_max_chars=120_000,
+            ),
+        )
+    )
+    parent_messages = (
+        Message(role="user", content="Inspect the repository."),
+        Message(
+            role="assistant",
+            content=[
+                ContentBlockText(text="I will inspect it."),
+                ContentBlockToolUse(
+                    id="call-1",
+                    name="file_read",
+                    input={"path": "README.md"},
+                ),
+            ],
+        ),
+        Message(
+            role="user",
+            content=[
+                ContentBlockToolResult(
+                    tool_use_id="call-1",
+                    content="repository contents",
+                )
+            ],
+        ),
+    )
+    parent_tools = (
+        ToolDefinition(
+            name="file_read",
+            description="Read one file.",
+            input_schema=ToolInputSchema(
+                properties={"path": {"type": "string"}},
+                required=["path"],
+            ),
+        ),
+    )
+    parent_correlation = ProviderRequestCorrelation(
+        session_id="session-1",
+        turn_id="parent-turn",
+        execution_id="parent-execution",
+        call_kind="agent.chat",
+    )
+    compaction_correlation = ProviderRequestCorrelation(
+        session_id="session-1",
+        turn_id="compaction-turn",
+        execution_id="compaction-execution",
+        call_kind="auxiliary.compaction",
+    )
+    parent_config = ChatConfig(
+        system="exact parent system",
+        cache_mode="on",
+        cache_breakpoints=[{"type": "ephemeral"}],
+        max_tokens=4096,
+        temperature=0.35,
+        top_p=0.9,
+        thinking=True,
+        thinking_budget_tokens=8192,
+        thinking_budget_explicit=True,
+        tool_choice="auto",
+        output_json_schema={"type": "object"},
+        output_json_schema_strict=False,
+        candidate_output_mode="normal",
+        physical_attempt_limit=2,
+        provider_request_correlation=parent_correlation,
+    )
+    parent_request = CompactionParentRequest.from_call(
+        parent_messages,
+        parent_tools,
+        parent_config,
+    )
+    assert "Inspect the repository" not in repr(parent_request)
+    assert "file_read" not in repr(parent_request)
+
+    result = await call_compaction_provider(
+        "flattened content must not be sent",
+        "Preserve exact IDs.",
+        plan,
+        custom_instructions="Keep only task-relevant state.",
+        provider_request_correlation=compaction_correlation,
+        parent_messages=parent_messages,
+        parent_tools=parent_tools,
+        parent_chat_config=parent_config,
+    )
+
+    assert result == "portable summary"
+    messages, tools, config = provider.calls[0]
+    assert tuple(messages[:-1]) == parent_messages
+    assert len(messages) == len(parent_messages) + 1
+    assert messages[-1].role == "user"
+    assert "You are a conversation compactor" in str(messages[-1].content)
+    assert "Preserve exact IDs." in str(messages[-1].content)
+    assert "Keep only task-relevant state." in str(messages[-1].content)
+    assert "flattened content must not be sent" not in str(messages[-1].content)
+    assert tuple(tools or ()) == parent_tools
+    assert config is not None
+    assert config.model_copy(update={"provider_request_correlation": None}) == (
+        parent_config.model_copy(update={"provider_request_correlation": None})
+    )
+    assert config.provider_request_correlation is compaction_correlation
+
+
+@pytest.mark.asyncio
+async def test_suffix_preserves_exact_openrouter_wire_prefix(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("OPENSQUILLA_COMPACTION_PROMPT_LAYOUT", "suffix")
+    projector = OpenAIProvider(
+        api_key="synthetic-key",
+        model="synthetic/model",
+        base_url="https://openrouter.ai/api/v1",
+        provider_kind="openrouter",
+        replay_provider_state=True,
+    )
+
+    class ProjectingProvider:
+        provider_name = "openai"
+
+        def __init__(self) -> None:
+            self.payloads: list[dict[str, Any]] = []
+
+        def provider_metadata(self) -> ProviderMetadata:
+            return projector.provider_metadata()
+
+        def provider_connection_config(self) -> ProviderConnectionConfig:
+            return projector.provider_connection_config()
+
+        def chat(self, messages, tools=None, config=None):
+            self.payloads.append(
+                projector.project_final_request(messages, tools, config).payload
+            )
+            return _successful_stream()
+
+    provider = ProjectingProvider()
+    parent_messages = (
+        Message(role="user", content="Use the lookup tool."),
+        Message(
+            role="assistant",
+            content=[
+                ContentBlockText(text="Checking."),
+                ContentBlockToolUse(id="call-1", name="lookup", input={"id": 7}),
+            ],
+            reasoning_content="synthetic display reasoning",
+            provider_replay=ProviderReplayState(
+                protocol="openai_chat_completions",
+                source=projector._replay_source,
+                model="synthetic/model",
+                reasoning_details=[
+                    {"type": "reasoning.text", "text": "synthetic native reasoning"}
+                ],
+            ),
+        ),
+        Message(
+            role="user",
+            content=[ContentBlockToolResult(tool_use_id="call-1", content="value=7")],
+        ),
+    )
+    parent_tools = (
+        ToolDefinition(
+            name="lookup",
+            description="Look up one synthetic value.",
+            input_schema=ToolInputSchema(
+                properties={"id": {"type": "integer"}},
+                required=["id"],
+            ),
+        ),
+    )
+    parent_config = ChatConfig(
+        system="stable synthetic system",
+        cache_mode="on",
+        max_tokens=2048,
+        temperature=0.25,
+        top_p=0.8,
+        thinking=True,
+        thinking_budget_tokens=4096,
+        thinking_budget_explicit=True,
+        tool_choice="auto",
+    )
+    parent_payload = projector.project_final_request(
+        list(parent_messages),
+        list(parent_tools),
+        parent_config,
+    ).payload
+    plan = CompactionExecutionPlan(
+        candidates=(
+            CompactionExecutionTarget(
+                provider=provider,
+                provider_id="openrouter",
+                model="synthetic/model",
+                max_output_tokens=768,
+                provider_request_max_chars=120_000,
+            ),
+        )
+    )
+
+    result = await call_compaction_provider(
+        "flattened content must not be sent",
+        "Preserve exact IDs.",
+        plan,
+        parent_messages=parent_messages,
+        parent_tools=parent_tools,
+        parent_chat_config=parent_config,
+    )
+
+    assert result == "portable summary"
+    assert len(provider.payloads) == 1
+    compact_payload = provider.payloads[0]
+    assert compact_payload["messages"][:-1] == parent_payload["messages"]
+    assert compact_payload["messages"][-1]["role"] == "user"
+    assert "conversation compactor" in compact_payload["messages"][-1]["content"]
+    assert {
+        key: value for key, value in compact_payload.items() if key != "messages"
+    } == {key: value for key, value in parent_payload.items() if key != "messages"}
+
+
+@pytest.mark.asyncio
+async def test_suffix_compact_context_reuses_complete_parent_request(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("OPENSQUILLA_COMPACTION_PROMPT_LAYOUT", "suffix")
+    provider = _Provider(_successful_stream)
+    config = build_compaction_config_from_provider(
+        provider,
+        context_window_tokens=8_000,
+    )
+    config.safety_margin = 1.0
+    entries = _entries(20)
+    transcript_messages = tuple(
+        Message(role=entry["role"], content=entry["content"])
+        for entry in entries
+    )
+    parent_messages = (
+        Message(role="user", content="runtime context outside the durable transcript"),
+        *transcript_messages,
+        Message(role="user", content="current provider-only request suffix"),
+    )
+    parent_config = ChatConfig(
+        system="exact active system",
+        cache_mode="on",
+        tool_choice="auto",
+    )
+
+    result = await compact_context(
+        CompactionRequest(
+            session_id="structured-parent-prefix",
+            entries=entries,
+            context_window_tokens=500,
+            config=config,
+            parent_request=CompactionParentRequest.from_call(
+                parent_messages,
+                (),
+                parent_config,
+            ),
+        )
+    )
+
+    assert result.summary_source == "llm"
+    assert result.removed_count > 0
+    messages, tools, sent_config = provider.calls[0]
+    assert tuple(messages[:-1]) == parent_messages
+    assert len(messages) == len(parent_messages) + 1
+    assert tools == []
+    assert sent_config is not None
+    assert sent_config.system == "exact active system"
+
+
+@pytest.mark.asyncio
+async def test_suffix_without_exact_parent_fails_closed_before_provider_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("OPENSQUILLA_COMPACTION_PROMPT_LAYOUT", "suffix")
+    provider = _Provider(_successful_stream)
+    config = build_compaction_config_from_provider(provider)
+    config.safety_margin = 1.0
+
+    result = await compact_context(
+        CompactionRequest(
+            session_id="missing-exact-parent",
+            entries=_entries(20),
+            context_window_tokens=500,
+            config=config,
+        )
+    )
+
+    assert result.summary_source == "fallback"
+    assert provider.calls == []
+    assert config.llm_calls_started == 0
+
+
+@pytest.mark.asyncio
+async def test_suffix_never_uses_legacy_flattened_http_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("OPENSQUILLA_COMPACTION_PROMPT_LAYOUT", "suffix")
+    legacy_calls: list[str] = []
+
+    async def forbidden_legacy_call(**kwargs: Any) -> str:
+        legacy_calls.append(str(kwargs.get("chunk_text") or ""))
+        return "must not be used"
+
+    monkeypatch.setattr(
+        "opensquilla.session.compaction.call_compaction_llm",
+        forbidden_legacy_call,
+    )
+    config = CompactionConfig(
+        model="legacy-model",
+        api_key="synthetic-key",
+        safety_margin=1.0,
+    )
+
+    result = await compact_context(
+        CompactionRequest(
+            session_id="suffix-no-legacy-flattening",
+            entries=_entries(20),
+            context_window_tokens=500,
+            config=config,
+            parent_request=CompactionParentRequest.from_call(
+                [Message(role="user", content="exact parent")],
+                None,
+                ChatConfig(),
+            ),
+        )
+    )
+
+    assert result.summary_source == "fallback"
+    assert legacy_calls == []
+    assert config.llm_calls_started == 0
+
+
+@pytest.mark.asyncio
+async def test_suffix_provider_failure_does_not_switch_deployment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("OPENSQUILLA_COMPACTION_PROMPT_LAYOUT", "suffix")
+    primary = _Provider(
+        lambda: _Stream([ErrorEvent(message="primary unavailable", code="unavailable")])
+    )
+    fallback = _Provider(_successful_stream)
+    config = build_compaction_config_from_provider(primary)
+    config.llm_plan = CompactionExecutionPlan(
+        candidates=(
+            CompactionExecutionTarget(
+                provider=primary,
+                provider_id="openrouter",
+                model="parent/model",
+                source="active",
+            ),
+            CompactionExecutionTarget(
+                provider=fallback,
+                provider_id="openrouter",
+                model="different/model",
+                source="fallback",
+            ),
+        ),
+        max_calls=2,
+    )
+    config.safety_margin = 1.0
+
+    result = await compact_context(
+        CompactionRequest(
+            session_id="exact-parent-no-switch",
+            entries=_entries(20),
+            context_window_tokens=500,
+            config=config,
+            parent_request=CompactionParentRequest.from_call(
+                [Message(role="user", content="exact parent")],
+                None,
+                ChatConfig(system="stable system"),
+            ),
+        )
+    )
+
+    assert result.summary_source == "fallback"
+    assert len(primary.calls) == 1
+    assert fallback.calls == []
+    assert config.llm_calls_started == 1
 
 
 @pytest.mark.asyncio

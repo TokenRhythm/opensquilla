@@ -137,6 +137,44 @@ def test_model_only_compaction_ignores_stale_session_provider_provenance() -> No
     assert ctx.provider_selector.clone_calls == 0
 
 
+def test_exact_suffix_uses_only_recorded_parent_deployment() -> None:
+    config = GatewayConfig()
+    config.compaction.provider = "anthropic"
+    config.compaction.model = "summary-model"
+    config.llm_profiles["openai"] = LlmProviderProfile(
+        api_key="recorded-provider-secret",
+        base_url="https://api.openai.com/v1",
+    )
+    current = ProviderConfig(
+        provider="ollama",
+        model="selector-fallback-model",
+        base_url="http://127.0.0.1:11434",
+    )
+    session = SimpleNamespace(
+        session_key="agent:main:webchat:exact-suffix",
+        provider_override=None,
+        model_provider="openai",
+        model_override=None,
+        model="parent-model",
+        auth_profile_override=None,
+    )
+
+    target = resolve_gateway_compaction_target(
+        _ctx(config, current),
+        session,
+        active_only=True,
+        replay_provider_state=True,
+    )
+
+    assert target.provider_id == "openai"
+    assert target.model == "parent-model"
+    assert target.source == "session_model_provider"
+    assert target.plan is not None
+    assert len(target.plan.candidates) == 1
+    assert target.plan.max_calls == 1
+    assert provider_connection_config(target.provider).api_key == "recorded-provider-secret"
+
+
 def test_manual_consumer_budget_uses_stable_base_not_last_routed_model() -> None:
     config = GatewayConfig(
         llm={
