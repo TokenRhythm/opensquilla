@@ -3714,6 +3714,7 @@
         "rateLimited": "受到限流 · {seconds} 秒后重试",
         "retryWait": "{seconds} 秒后重试",
         "retrying": "正在重试 {attempt}/{limit}",
+        "retryingWithoutLimit": "正在重试 · 第 {attempt} 次",
         "fallback": "正在切换备用模型"
       },
       "purpose": {

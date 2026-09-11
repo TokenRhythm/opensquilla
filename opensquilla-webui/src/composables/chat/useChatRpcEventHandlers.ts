@@ -1688,7 +1688,7 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
       )
     } else if (phase === 'retrying') {
       recordActivityPhase(
-        `Retrying ${attempt}/${limit}`,
+        limit > 0 ? `Retrying ${attempt}/${limit}` : `Retrying · attempt ${attempt}`,
         `provider:retrying:${attempt}:${limit}`,
       )
     } else if (phase === 'fallback') {

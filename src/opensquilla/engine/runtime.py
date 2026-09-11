@@ -263,6 +263,8 @@ from opensquilla.provider import (
 from opensquilla.provider import (
     ToolUseStartEvent as ProviderToolUseStartEvent,
 )
+from opensquilla.provider._openai_compat_url import _versioned_api_url
+from opensquilla.provider.failures import CONNECTION_FAILED_CODE, is_connection_failure
 from opensquilla.provider.image_projection import (
     ImageProjectionMode,
     assert_text_only_messages,
@@ -274,6 +276,7 @@ from opensquilla.provider.model_catalog import (
     resolve_effective_context_window,
     shared_catalog,
 )
+from opensquilla.provider.openai_codex import OpenAICodexProvider
 from opensquilla.provider.protocol import (
     count_provider_image_blocks,
     project_provider_final_request,
@@ -281,6 +284,7 @@ from opensquilla.provider.protocol import (
     provider_metadata,
     validate_provider_chat_admission,
 )
+from opensquilla.provider.registry import UnknownProviderError, get_provider_spec
 from opensquilla.provider.types import (
     ChatConfig,
     ProviderGenerationResetEvent,
@@ -1666,6 +1670,23 @@ def _should_use_selector_fallback(provider_name: str, event: ProviderErrorEvent)
     }
 
 
+def _agent_manages_provider_error(
+    config: Any,
+    provider_name: str,
+    event: ProviderErrorEvent,
+) -> bool:
+    if not getattr(config, "agent_managed_recovery", False):
+        return False
+    if event.code == CONNECTION_FAILED_CODE:
+        return True
+    return classify_provider_error(
+        provider_name,
+        int(event.code) if str(event.code).isdigit() else None,
+        raw_code=event.code,
+        message=event.message,
+    ) is ProviderFailureKind.RATE_LIMITED
+
+
 def _report_credential_pool_failure(
     provider_name: str,
     turn_metadata: dict[str, Any] | None,
@@ -2086,7 +2107,11 @@ def _selector_invalid_stream_order_error() -> ProviderErrorEvent:
     )
 
 
-def _selector_stream_exception_error(*, content_started: bool = False) -> ProviderErrorEvent:
+def _selector_stream_exception_error(
+    *,
+    content_started: bool = False,
+    error: BaseException | None = None,
+) -> ProviderErrorEvent:
     """Stable, provider-prose-free projection for an exception-raised stream."""
 
     return ProviderErrorEvent(
@@ -2095,7 +2120,13 @@ def _selector_stream_exception_error(*, content_started: bool = False) -> Provid
             if content_started
             else "The connection to the model provider was interrupted."
         ),
-        code="response_incomplete" if content_started else "request_error",
+        code=(
+            "response_incomplete"
+            if content_started
+            else CONNECTION_FAILED_CODE
+            if error is not None and is_connection_failure(error)
+            else "request_error"
+        ),
     )
 
 
@@ -2113,8 +2144,8 @@ async def _selector_safe_stream(
             yield event
     except (asyncio.CancelledError, UsageAccountingUnavailableError):
         raise
-    except Exception:  # noqa: BLE001 - raw provider prose must stop here
-        yield _selector_stream_exception_error(content_started=content_started())
+    except Exception as exc:  # noqa: BLE001 - raw provider prose must stop here
+        yield _selector_stream_exception_error(content_started=content_started(), error=exc)
     finally:
         # ``aclose`` on this wrapper must deterministically unwind the usage
         # accounting generator beneath it. Relying on async-generator GC left
@@ -2138,6 +2169,7 @@ class _ProviderAuthorityIdentity:
     api_key: str = field(repr=False)
     base_url: str = ""
     org_id: str = ""
+    auth_header_style: str = ""
 
 
 def _provider_authority_identity(config: Any) -> _ProviderAuthorityIdentity | None:
@@ -2151,11 +2183,47 @@ def _provider_authority_identity(config: Any) -> _ProviderAuthorityIdentity | No
 
     if not all(hasattr(config, name) for name in ("api_key", "base_url", "org_id")):
         return None
+    provider_id = str(getattr(config, "provider", "") or "").strip().lower()
+    base_url = str(getattr(config, "base_url", "") or "")
+    try:
+        spec = get_provider_spec(provider_id)
+    except UnknownProviderError:
+        spec = None
+    if spec is not None:
+        # Match selector construction, including an omitted default and roots
+        # that the OpenAI adapters expand to the same versioned endpoint.
+        base_url = base_url or spec.default_base_url
+        if spec.backend == "openai_compat":
+            base_url = _versioned_api_url(base_url, "/v1/chat/completions")
+        elif spec.backend == "openai_responses":
+            base_url = _versioned_api_url(base_url, "/v1/responses")
+        elif spec.backend == "anthropic":
+            base_url = base_url.rstrip("/")
+            base_url += "/messages" if base_url.endswith("/v1") else "/v1/messages"
+        elif spec.backend == "openai_codex":
+            base_url = OpenAICodexProvider._normalize_base_url(base_url)
+    try:
+        parsed = urlsplit(base_url.strip())
+        if parsed.scheme in {"http", "https"} and parsed.hostname:
+            hostname = parsed.hostname.encode("idna").decode("ascii").lower()
+            host = f"[{hostname}]" if ":" in hostname else hostname
+            port = parsed.port
+            if port is not None and port != (443 if parsed.scheme == "https" else 80):
+                host = f"{host}:{port}"
+            userinfo, separator, _ = parsed.netloc.rpartition("@")
+            netloc = f"{userinfo}@{host}" if separator else host
+            base_url = parsed._replace(
+                netloc=netloc, path=parsed.path.rstrip("/"), fragment=""
+            ).geturl()
+    except (UnicodeError, ValueError):
+        # Malformed endpoints cannot establish an independent authority.
+        return None
     return _ProviderAuthorityIdentity(
-        provider=str(getattr(config, "provider", "") or "").strip().lower(),
+        provider=spec.backend if spec is not None else provider_id,
         api_key=str(getattr(config, "api_key", "") or ""),
-        base_url=str(getattr(config, "base_url", "") or "").strip().rstrip("/"),
+        base_url=base_url.strip().rstrip("/"),
         org_id=str(getattr(config, "org_id", "") or "").strip(),
+        auth_header_style=spec.auth_header_style if spec is not None else "",
     )
 
 
@@ -2284,6 +2352,7 @@ class _SelectorFallbackProvider:
         self._pending_fallback_hops = 0
         self._last_executed_model = ""
         self._last_request_had_tools = False
+        self._retry_after_until: dict[_ProviderAuthorityIdentity, float] = {}
         self._image_marker_deployment: _FallbackDeploymentIdentity | None = None
         self._image_marker_state = ImageMarkerState.NOT_ANALYZED
         self._image_marker_reason: str | None = None
@@ -2470,6 +2539,48 @@ class _SelectorFallbackProvider:
             capabilities is None or getattr(capabilities, "supports_tools", None) is not False
         )
 
+    def _remember_retry_after(self, event: ProviderErrorEvent, config: Any) -> None:
+        """Retain an actual managed HTTP 429 across this turn's fallback hops."""
+        if not getattr(config, "agent_managed_recovery", False) or event.code != "429":
+            return
+        provider_id, _ = self._active_deployment()
+        if classify_provider_error(
+            provider_id or self.provider_name, 429, event.code, event.message
+        ) is not ProviderFailureKind.RATE_LIMITED:
+            return
+        authority = _provider_authority_identity(getattr(self._selector, "current_config", None))
+        try:
+            delay = float(event.retry_after_s or 0.0)
+        except (TypeError, ValueError, OverflowError):
+            return
+        if authority is not None and delay > 0:
+            self._retry_after_until[authority] = max(
+                self._retry_after_until.get(authority, 0.0), time.monotonic() + delay
+            )
+
+    def _retry_after_remaining(self, candidate: Any) -> float:
+        now = time.monotonic()
+        for expired_authority, deadline in tuple(self._retry_after_until.items()):
+            if deadline <= now:
+                del self._retry_after_until[expired_authority]
+        authority = _provider_authority_identity(candidate)
+        deadline = (
+            self._retry_after_until.get(authority, 0.0)
+            if authority is not None
+            else max(self._retry_after_until.values(), default=0.0)
+        )
+        return max(0.0, deadline - now)
+
+    def _retry_after_admission_error(self) -> ProviderErrorEvent | None:
+        remaining = self._retry_after_remaining(getattr(self._selector, "current_config", None))
+        if remaining <= 0:
+            return None
+        return ProviderErrorEvent(
+            message="The model provider's Retry-After delay has not elapsed for this account.",
+            code="429",
+            retry_after_s=remaining,
+        )
+
     @staticmethod
     def _image_attachment_ids_from_metadata(config: Any) -> tuple[str, ...]:
         """Read stable attachment ids without making a provider call.
@@ -2647,6 +2758,7 @@ class _SelectorFallbackProvider:
         while current_config is not None:
             candidate_compatible = bool(
                 self._fallback_candidate_accepts_tools(current_config)
+                and self._retry_after_remaining(current_config) <= 0
                 and (candidate_predicate is None or candidate_predicate(current_config))
             )
             health_eligible = True
@@ -2662,6 +2774,7 @@ class _SelectorFallbackProvider:
                     )
                     for candidate in remaining_chain()
                     if self._fallback_candidate_accepts_tools(candidate)
+                    and self._retry_after_remaining(candidate) <= 0
                     and (candidate_predicate is None or candidate_predicate(candidate))
                 ]
                 if candidates:
@@ -3165,6 +3278,89 @@ class _SelectorFallbackProvider:
             requires_tools=self._last_request_had_tools,
         )
 
+    def fallback_after_managed_recovery(
+        self,
+        event: ProviderErrorEvent,
+        *,
+        requires_vision: bool = False,
+        requires_tools: bool = False,
+    ) -> bool:
+        """Select one configured fallback after Agent exhausts its recovery.
+
+        The caller invokes this once without resetting its retry counter.
+        A positive Retry-After still applies to the failed authority, so only
+        a different authority is eligible here; this hook never sleeps or
+        silently starts another request.
+        """
+
+        provider_id, _ = self._active_deployment()
+        kind = classify_provider_error(
+            provider_id or self.provider_name,
+            int(event.code) if str(event.code).isdigit() else None,
+            raw_code=event.code,
+            message=event.message,
+        )
+        if event.code != CONNECTION_FAILED_CODE and kind is not ProviderFailureKind.RATE_LIMITED:
+            return False
+        if event.code != CONNECTION_FAILED_CODE and kind is ProviderFailureKind.RATE_LIMITED:
+            self._record_health_failure(event)
+            _report_credential_pool_failure(self.provider_name, self._turn_metadata, event)
+
+        matching_fallback = getattr(self._selector, "next_fallback_after_failure_matching", None)
+        if not callable(matching_fallback):
+            return False
+        failed_config = getattr(self._selector, "current_config", None)
+        failed_authority = _provider_authority_identity(failed_config)
+        exclude_failed_authority = _provider_retry_after_hint(event) > 0
+
+        def compatible(candidate: Any) -> bool:
+            if self._retry_after_remaining(candidate) > 0:
+                return False
+            if exclude_failed_authority:
+                candidate_authority = _provider_authority_identity(candidate)
+                if (
+                    failed_authority is None
+                    or candidate_authority is None
+                    or failed_authority == candidate_authority
+                ):
+                    return False
+            if requires_tools and not self._fallback_candidate_accepts_tools(candidate):
+                return False
+            return not requires_vision or self._fallback_deployment_vision_support.get(
+                _fallback_deployment_identity(candidate), "unknown"
+            ) == "supported"
+
+        remaining_chain = getattr(self._selector, "remaining_chain", None)
+        try:
+            remaining_candidates = tuple(remaining_chain()) if callable(remaining_chain) else ()
+        except Exception:  # noqa: BLE001 - optional selector inspection must not break recovery
+            return False
+        candidates = [candidate for candidate in remaining_candidates[1:] if compatible(candidate)]
+        candidate_keys = [
+            (str(getattr(candidate, "provider", "")), str(getattr(candidate, "model", "")))
+            for candidate in candidates
+        ]
+
+        def eligible(candidate: Any) -> bool:
+            return compatible(candidate) and (
+                self._health_ledger is None
+                or self._health_ledger.eligible(
+                    str(getattr(candidate, "provider", "")),
+                    str(getattr(candidate, "model", "")),
+                    candidate_keys,
+                )
+            )
+
+        try:
+            self._provider = matching_fallback(
+                _selector_failure_for_hook(provider_id or self.provider_name, event),
+                predicate=eligible,
+            )
+        except Exception:  # noqa: BLE001 - selection failure preserves the current leg
+            return False
+        self._note_fallback_hop()
+        return True
+
     def fallback_after_image_rejection(self, reason: str) -> bool:
         """Advance to the next configured Router image probe, if any.
 
@@ -3196,7 +3392,8 @@ class _SelectorFallbackProvider:
 
         def _probeable(candidate: Any) -> bool:
             return (
-                self._fallback_deployment_vision_support.get(
+                self._retry_after_remaining(candidate) <= 0
+                and self._fallback_deployment_vision_support.get(
                     _fallback_deployment_identity(candidate),
                     "unknown",
                 )
@@ -3246,7 +3443,7 @@ class _SelectorFallbackProvider:
             None,
         )
         try:
-            if requires_vision or requires_tools:
+            if requires_vision or requires_tools or self._retry_after_until:
                 if not callable(matching_fallback):
                     # Legacy selector seams cannot prove vision support, but
                     # tool capability defaults to allowed-until-denied. The
@@ -3268,7 +3465,8 @@ class _SelectorFallbackProvider:
                     self._provider = matching_fallback(
                         RuntimeError(reason),
                         predicate=lambda candidate: bool(
-                            (
+                            self._retry_after_remaining(candidate) <= 0
+                            and (
                                 not requires_vision
                                 or self._fallback_deployment_vision_support.get(
                                     _fallback_deployment_identity(candidate),
@@ -3428,6 +3626,10 @@ class _SelectorFallbackProvider:
         active_provider = self._provider
         active_provider_id, active_model = self._active_deployment()
         active_config = self._config_for_active_leg(config)
+        retry_after_error = self._retry_after_admission_error()
+        if retry_after_error is not None:
+            yield retry_after_error
+            return
         physical_messages = self._project_image_messages_for_active_leg(
             messages,
             active_config,
@@ -3513,6 +3715,13 @@ class _SelectorFallbackProvider:
                     yield event
                     continue
                 if isinstance(event, ProviderErrorEvent):
+                    self._remember_retry_after(event, active_config)
+                    if not emitted_user_visible_content and _agent_manages_provider_error(
+                        active_config, active_provider_id or self.provider_name, event
+                    ):
+                        pre_text_buffer.drain(successful_leg=False)
+                        yield event
+                        return
                     _report_credential_pool_failure(
                         self.provider_name,
                         self._turn_metadata,
@@ -3646,11 +3855,13 @@ class _SelectorFallbackProvider:
                         if local_admission_escalation:
 
                             def _local_candidate_predicate(candidate: Any) -> bool:
-                                return self._local_admission_candidate_is_compatible(
-                                    failed_authority_config,
-                                    candidate,
-                                    active_config,
-                                    requires_tools=bool(tools),
+                                return self._retry_after_remaining(candidate) <= 0 and (
+                                    self._local_admission_candidate_is_compatible(
+                                        failed_authority_config,
+                                        candidate,
+                                        active_config,
+                                        requires_tools=bool(tools),
+                                    )
                                 )
 
                             local_candidate_predicate = _local_candidate_predicate
@@ -3682,7 +3893,7 @@ class _SelectorFallbackProvider:
                                     # failure cannot expose this leg using the
                                     # primary model's config.
                                     self._used_fallback = True
-                        elif tools:
+                        elif tools or self._retry_after_until:
                             matching_fallback = getattr(
                                 self._selector,
                                 "next_fallback_after_failure_matching",
@@ -3695,7 +3906,13 @@ class _SelectorFallbackProvider:
                             if callable(matching_fallback):
                                 self._provider = matching_fallback(
                                     selector_failure,
-                                    predicate=self._fallback_candidate_accepts_tools,
+                                    predicate=lambda candidate: bool(
+                                        self._retry_after_remaining(candidate) <= 0
+                                        and (
+                                            not tools
+                                            or self._fallback_candidate_accepts_tools(candidate)
+                                        )
+                                    ),
                                 )
                             else:
                                 self._provider = self._selector.next_fallback_after_failure(
@@ -3810,6 +4027,10 @@ class _SelectorFallbackProvider:
                             )
                             return
                         await asyncio.sleep(retry_after_hint)
+                    retry_after_error = self._retry_after_admission_error()
+                    if retry_after_error is not None:
+                        yield retry_after_error
+                        return
                     self._commit_fallback_hops()
                     if local_admission_escalation and self._turn_metadata is not None:
                         self._turn_metadata["router_fallback_reason"] = "local_admission_escalation"
@@ -3890,6 +4111,15 @@ class _SelectorFallbackProvider:
                                 yield fallback_event
                                 continue
                             if isinstance(fallback_event, ProviderErrorEvent):
+                                self._remember_retry_after(fallback_event, fallback_config)
+                                if not fallback_committed and _agent_manages_provider_error(
+                                    fallback_config,
+                                    fallback_provider_id or self.provider_name,
+                                    fallback_event,
+                                ):
+                                    fallback_buffer.drain(successful_leg=False)
+                                    yield fallback_event
+                                    return
                                 _report_credential_pool_failure(
                                     self.provider_name,
                                     self._turn_metadata,
@@ -6418,6 +6648,7 @@ class TurnRunner:
                     timeout=runtime_timeout_override,
                     max_iterations=max_iterations,
                     iteration_timeout=None,
+                    input_mode=input_mode,
                     tool_timeout=tool_timeout,
                     request_timeout=request_timeout,
                     max_provider_retries=max_provider_retries,

@@ -3630,6 +3630,7 @@
         "rateLimited": "Limite atteinte · nouvel essai dans {seconds}s",
         "retryWait": "Nouvel essai dans {seconds}s",
         "retrying": "Nouvel essai {attempt}/{limit}",
+        "retryingWithoutLimit": "Nouvel essai · tentative {attempt}",
         "fallback": "Passage au modèle de secours"
       },
       "purpose": {

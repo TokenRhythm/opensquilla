@@ -77,10 +77,11 @@ def test_provider_retry_delay_uses_larger_provider_hint() -> None:
     ) == 12.0
 
 
-def test_provider_retry_delay_does_not_clamp_an_excessive_hint_and_retry_early() -> None:
+@pytest.mark.parametrize("hint", [901.0, float("inf")])
+def test_provider_retry_delay_does_not_clamp_an_excessive_hint_and_retry_early(hint: float) -> None:
     assert _provider_retry_delay_seconds(
         local_delay_s=1.0,
-        provider_retry_after_s=901.0,
+        provider_retry_after_s=hint,
     ) is None
 
 
@@ -173,7 +174,7 @@ def test_selector_buffer_coalesces_tool_deltas_and_rejects_oversized_content() -
 
 
 @pytest.mark.asyncio
-async def test_agent_surfaces_rate_limit_without_same_deployment_retry_or_sleep(
+async def test_agent_retries_rate_limit_on_same_deployment_after_provider_wait(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     provider = _SequenceProvider(
@@ -200,12 +201,18 @@ async def test_agent_surfaces_rate_limit_without_same_deployment_retry_or_sleep(
     events = [event async for event in agent.run_turn("hello")]
     activity = [event for event in events if isinstance(event, ProviderActivityEvent)]
 
-    terminal = next(event for event in events if isinstance(event, EngineErrorEvent))
-    assert provider.calls == 1
-    assert sleeps == []
-    assert not any(event.phase in {"retry_wait", "retrying"} for event in activity)
-    assert terminal.code == "429"
-    assert terminal.failure_kind == ProviderFailureKind.RATE_LIMITED.value
+    assert provider.calls == 2
+    assert sleeps == [8.0]
+    assert [event.phase for event in activity] == [
+        "requesting",
+        "retry_wait",
+        "retrying",
+        "requesting",
+    ]
+    assert activity[1].reason == ProviderFailureKind.RATE_LIMITED.value
+    assert activity[1].retry_after_ms == 8_000
+    assert activity[1].retry_attempt == activity[1].retry_limit == 1
+    assert not any(isinstance(event, EngineErrorEvent) for event in events)
     assert not any("synthetic rate limit" in repr(event) for event in activity)
 
 

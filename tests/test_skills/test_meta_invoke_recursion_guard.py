@@ -526,6 +526,7 @@ def test_meta_sub_agent_inherits_physical_request_contract_without_outer_state(
         cache_breakpoints=[{"text": "outer prompt", "cache": "true"}],
         timeout=901.0,
         iteration_timeout=902.0,
+        provider_connection_recovery_enabled=True,
         request_timeout=903.0,
         tool_timeout=904.0,
         max_provider_retries=7,
@@ -600,6 +601,7 @@ def test_meta_sub_agent_inherits_physical_request_contract_without_outer_state(
     # Timeout/retry, compaction, recovery and observability contracts.
     assert child.timeout == 901.0
     assert child.iteration_timeout == 0.0
+    assert child.provider_connection_recovery_enabled is False
     assert (child.request_timeout, child.tool_timeout) == (903.0, 904.0)
     assert child.max_provider_retries == 7
     assert child.length_capped_continuations == 8

@@ -145,7 +145,12 @@ from opensquilla.provider import (
     ToolUseStartEvent as ProviderToolUseStart,
 )
 from opensquilla.provider.correlation_context import bind_provider_request_correlation
-from opensquilla.provider.failures import ProviderFailureKind, classify_provider_error
+from opensquilla.provider.failures import (
+    CONNECTION_FAILED_CODE,
+    ProviderFailureKind,
+    classify_provider_error,
+    is_connection_failure,
+)
 from opensquilla.provider.image_projection import (
     ImageMarkerState,
     ImageProjectionMode,
@@ -1875,6 +1880,8 @@ def _provider_retry_delay_seconds(
             parsed_hint = float(provider_retry_after_s)
         except (TypeError, ValueError):
             parsed_hint = 0.0
+        if parsed_hint == math.inf:
+            return None
         if math.isfinite(parsed_hint) and parsed_hint > 0:
             hint = parsed_hint
     if hint > _MAX_PROVIDER_RETRY_WAIT_SECONDS:
@@ -1885,9 +1892,10 @@ def _provider_retry_delay_seconds(
 class _RaisedProviderBoundaryError(RuntimeError):
     """Content-free marker for an exception raised by provider call/iteration."""
 
-    def __init__(self, *, timeout: bool) -> None:
+    def __init__(self, *, timeout: bool, connection_failed: bool = False) -> None:
         super().__init__("provider boundary failed")
         self.timeout = timeout
+        self.connection_failed = connection_failed
 
 
 _STREAM_DEADLINE_ATTRIBUTE = "_opensquilla_stream_deadline_at_monotonic"
@@ -3683,6 +3691,7 @@ class Agent:
             model_capabilities=self.config.model_capabilities,
             model_vision_support=self.config.model_vision_support,
             physical_attempt_limit=1,
+            agent_managed_recovery=False,
             provider_request_max_chars=self._provider_request_proof_max_chars(),
             context_window_tokens_global_override=(
                 self.config.context_window_tokens_global_override
@@ -3863,6 +3872,31 @@ class Agent:
                 session_key=self._session_key,
                 reason=reason,
                 error=str(exc),
+            )
+            return False
+
+    def _switch_after_managed_provider_recovery(
+        self,
+        error: ProviderErrorEvent,
+        *,
+        requires_vision: bool,
+        requires_tools: bool,
+    ) -> bool:
+        fallback = getattr(self.provider, "fallback_after_managed_recovery", None)
+        if not callable(fallback):
+            return False
+        try:
+            return bool(
+                fallback(
+                    error,
+                    requires_vision=requires_vision,
+                    requires_tools=requires_tools,
+                )
+            )
+        except Exception as exc:  # noqa: BLE001 - optional provider fallback hook
+            logger.warning(
+                "provider.managed_recovery_fallback_failed",
+                exception_type=type(exc).__name__,
             )
             return False
 
@@ -6255,6 +6289,16 @@ class Agent:
         _loop = asyncio.get_running_loop()
         _total_deadline = _loop.time() + self.config.timeout if self.config.timeout > 0 else None
 
+        async def _wait_before_provider_retry(delay: float) -> None:
+            if _total_deadline is None:
+                await asyncio.sleep(delay)
+                return
+            remaining = _total_deadline - _loop.time()
+            if remaining <= 0:
+                raise TimeoutError
+            await asyncio.sleep(min(delay, remaining))
+            if delay >= remaining or _loop.time() >= _total_deadline:
+                raise TimeoutError
 
         configured_capabilities = self.config.model_capabilities
         tools_supported = bool(
@@ -6887,6 +6931,8 @@ class Agent:
                 provider_error: ProviderErrorEvent | None = None
 
                 _retry_attempt = 0
+                _connection_wait_attempt = 0
+                _managed_recovery_fallback_done = False
                 _call_attempt = 0
                 _retry_policy = _ProviderRetryPolicy.from_provider_budget(
                     _fallback.max_retries,
@@ -7305,7 +7351,11 @@ class Agent:
                             yield terminal_error
                         break
 
-                    call_chat_cfg = chat_cfg
+                    call_chat_cfg = chat_cfg.model_copy(update={
+                        "agent_managed_recovery": (
+                            getattr(self.provider, "retry_failed_call_safe", True) is not False
+                        ),
+                    })
                     if goal_terminal_final_response_pending:
                         call_chat_cfg = call_chat_cfg.model_copy(update={"tool_choice": None})
                     forced_tool_choice = self.config.metadata.get("meta_match_tool_choice")
@@ -7534,8 +7584,8 @@ class Agent:
                         activity_id=provider_activity_id,
                         phase="requesting",
                         reason=next_provider_activity_reason,
-                        retry_attempt=_retry_attempt,
-                        retry_limit=_fallback.max_retries,
+                        retry_attempt=_connection_wait_attempt or _retry_attempt,
+                        retry_limit=0 if _connection_wait_attempt else _fallback.max_retries,
                         started_at=time.time_ns() // 1_000_000,
                     )
 
@@ -7582,7 +7632,8 @@ class Agent:
                             # exception is deliberately not chained because SDK
                             # messages may contain response bodies or secrets.
                             raise _RaisedProviderBoundaryError(
-                                timeout=isinstance(exc, TimeoutError)
+                                timeout=isinstance(exc, TimeoutError),
+                                connection_failed=is_connection_failure(exc),
                             ) from None
                         raw_stream = guard_provider_text_stream(raw_stream)
                         pending_install_deadline: float | None = (
@@ -8711,7 +8762,7 @@ class Agent:
                             )
                         )
                         raise
-                    except _RaisedProviderBoundaryError:
+                    except _RaisedProviderBoundaryError as exc:
                         # Some SDKs raise from call creation or async iteration
                         # instead of yielding a ProviderErrorEvent.  Only those
                         # two provider-boundary operations are wrapped in this
@@ -8750,6 +8801,8 @@ class Agent:
                             code=(
                                 "response_incomplete"
                                 if attempt_irreversible_output_emitted
+                                else CONNECTION_FAILED_CODE
+                                if exc.connection_failed
                                 else "request_error"
                             ),
                         )
@@ -10788,6 +10841,43 @@ class Agent:
                                 message_count_request_view = None
                             _call_attempt += 1
                             continue
+                        retry_failed_call_safe = (
+                            getattr(self.provider, "retry_failed_call_safe", True) is not False
+                        )
+                        connection_failed = provider_error.code == CONNECTION_FAILED_CODE
+                        managed_failure = (
+                            connection_failed or failure_kind is ProviderFailureKind.RATE_LIMITED
+                        )
+                        if (
+                            connection_failed
+                            and retry_failed_call_safe
+                            and self.config.provider_connection_recovery_enabled
+                        ):
+                            delay = min(60.0, 5.0 * 2 ** min(_connection_wait_attempt, 4))
+                            _connection_wait_attempt += 1
+                            yield ProviderActivityEvent(
+                                activity_id=provider_activity_id,
+                                phase="retry_wait",
+                                reason="transport_transient",
+                                retry_attempt=_connection_wait_attempt,
+                                retry_limit=0,
+                                retry_after_ms=math.ceil(delay * 1000),
+                                started_at=time.time_ns() // 1_000_000,
+                            )
+                            await _wait_before_provider_retry(delay)
+                            next_provider_activity_reason = "transport_transient"
+                            yield ProviderActivityEvent(
+                                activity_id=provider_activity_id,
+                                phase="retrying",
+                                reason="transport_transient",
+                                retry_attempt=_connection_wait_attempt,
+                                retry_limit=0,
+                                started_at=time.time_ns() // 1_000_000,
+                            )
+                            _call_attempt += 1
+                            continue
+                        _connection_wait_attempt = 0
+
                         # The selector has already proved that honoring this
                         # authority's Retry-After would cross the absolute turn
                         # deadline (or the bounded 15-minute wait ceiling).
@@ -10797,15 +10887,11 @@ class Agent:
                         # terminal for the current turn.
                         should_retry = (
                             provider_error.code != "provider_retry_after_deadline"
-                            and _fallback.should_retry(kind, _retry_attempt)
-                        )
-                        retry_failed_call_safe = (
-                            getattr(
-                                self.provider,
-                                "retry_failed_call_safe",
-                                True,
+                            and (
+                                _fallback.should_retry(kind, _retry_attempt)
+                                or failure_kind is ProviderFailureKind.RATE_LIMITED
+                                and _retry_attempt < _fallback.max_retries
                             )
-                            is not False
                         )
                         if should_retry and not retry_failed_call_safe:
                             _log.warning(
@@ -10816,6 +10902,32 @@ class Agent:
                             )
                             should_retry = False
                         if not should_retry:
+                            if (
+                                managed_failure
+                                and retry_failed_call_safe
+                                and not _managed_recovery_fallback_done
+                            ):
+                                _managed_recovery_fallback_done = True
+                                if _total_deadline is not None and _loop.time() >= _total_deadline:
+                                    raise TimeoutError
+                                if self._switch_after_managed_provider_recovery(
+                                    provider_error,
+                                    requires_vision=self._count_image_blocks(request_messages) > 0,
+                                    requires_tools=bool(provider_tools_for_call),
+                                ):
+                                    next_provider_activity_reason = (
+                                        _provider_activity_reason_for_failure(failure_kind)
+                                    )
+                                    yield ProviderActivityEvent(
+                                        activity_id=provider_activity_id,
+                                        phase="fallback",
+                                        reason=next_provider_activity_reason,
+                                        retry_attempt=_retry_attempt,
+                                        retry_limit=_fallback.max_retries,
+                                        started_at=time.time_ns() // 1_000_000,
+                                    )
+                                    _call_attempt += 1
+                                    continue
                             yield self._transition(AgentState.ERROR)
                             terminal_error = ErrorEvent(
                                 message=_safe_provider_terminal_message(
@@ -10847,10 +10959,27 @@ class Agent:
                             and _loop.time() + resolved_retry_delay >= _total_deadline
                         )
                         if resolved_retry_delay is None or retry_exceeds_deadline:
-                            if self._switch_to_invalid_response_fallback(
-                                failure_kind.value,
-                                requires_tools=bool(provider_tools_for_call),
-                            ):
+                            if _total_deadline is not None and _loop.time() >= _total_deadline:
+                                raise TimeoutError
+                            fallback_selected = False
+                            if managed_failure:
+                                if not _managed_recovery_fallback_done:
+                                    _managed_recovery_fallback_done = True
+                                    fallback_selected = (
+                                        self._switch_after_managed_provider_recovery(
+                                            provider_error,
+                                            requires_vision=(
+                                                self._count_image_blocks(request_messages) > 0
+                                            ),
+                                            requires_tools=bool(provider_tools_for_call),
+                                        )
+                                    )
+                            else:
+                                fallback_selected = self._switch_to_invalid_response_fallback(
+                                    failure_kind.value,
+                                    requires_tools=bool(provider_tools_for_call),
+                                )
+                            if fallback_selected:
                                 next_provider_activity_reason = reason
                                 yield ProviderActivityEvent(
                                     activity_id=provider_activity_id,
@@ -10858,15 +10987,7 @@ class Agent:
                                     reason=reason,
                                     retry_attempt=_retry_attempt + 1,
                                     retry_limit=_fallback.max_retries,
-                                    retry_after_ms=(
-                                        math.ceil(
-                                            max(
-                                                0.0,
-                                                float(provider_error.retry_after_s or 0.0),
-                                            )
-                                            * 1000
-                                        )
-                                    ),
+                                    retry_after_ms=0,
                                     started_at=time.time_ns() // 1_000_000,
                                 )
                                 _call_attempt += 1
@@ -10900,7 +11021,7 @@ class Agent:
                             retry_after_ms=math.ceil(resolved_retry_delay * 1000),
                             started_at=time.time_ns() // 1_000_000,
                         )
-                        await asyncio.sleep(resolved_retry_delay)
+                        await _wait_before_provider_retry(resolved_retry_delay)
                         _retry_attempt += 1
                         next_provider_activity_reason = reason
                         yield ProviderActivityEvent(
@@ -13146,7 +13267,10 @@ class Agent:
         except (asyncio.CancelledError, UsageAccountingUnavailableError):
             raise
         except Exception as exc:  # noqa: BLE001 - provider boundary
-            raise _RaisedProviderBoundaryError(timeout=isinstance(exc, TimeoutError)) from None
+            raise _RaisedProviderBoundaryError(
+                timeout=isinstance(exc, TimeoutError),
+                connection_failed=is_connection_failure(exc),
+            ) from None
         close_state = {"deferred": False}
         try:
             async for event in self._stream_provider_events_with_deadline_unclosed(
@@ -13240,7 +13364,10 @@ class Agent:
             except Exception as exc:  # noqa: BLE001 - provider boundary
                 # TimeoutError raised *by the provider* is different from
                 # the deadline timeouts raised above by this wrapper.
-                raise _RaisedProviderBoundaryError(timeout=isinstance(exc, TimeoutError)) from None
+                raise _RaisedProviderBoundaryError(
+                    timeout=isinstance(exc, TimeoutError),
+                    connection_failed=is_connection_failure(exc),
+                ) from None
             yield event
 
     @staticmethod

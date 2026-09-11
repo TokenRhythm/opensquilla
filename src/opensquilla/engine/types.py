@@ -714,7 +714,7 @@ class AgentConfig:
     # its own physical deployment. Zero preserves catalog-derived rebinding.
     context_window_tokens_global_override: int = 0
     context_overflow_threshold: float = 0.85  # trigger at 85%
-    max_overflow_retries: int = 2
+    max_overflow_retries: int = 1
     max_history_turns: int = 0  # 0 = unlimited; compaction handles oversized history
     preserve_historical_images: bool = False
     materialize_historical_attachments: bool = True
@@ -908,6 +908,9 @@ class AgentConfig:
     # stays gateway-agnostic and a broken observer can never affect a turn.
     provider_call_observer: Callable[..., None] | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
+
+    # Runtime-only eligibility; not inherited by child agents.
+    provider_connection_recovery_enabled: bool = field(default=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         self.flush_triggers = list(normalize_flush_triggers_strict(self.flush_triggers))

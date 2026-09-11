@@ -3630,6 +3630,7 @@
         "rateLimited": "Límite de solicitudes · reintento en {seconds}s",
         "retryWait": "Reintento en {seconds}s",
         "retrying": "Reintentando {attempt}/{limit}",
+        "retryingWithoutLimit": "Reintentando · intento {attempt}",
         "fallback": "Cambiando al modelo alternativo"
       },
       "purpose": {

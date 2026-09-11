@@ -28,6 +28,7 @@ from opensquilla.engine.runtime_recovery import (
     normalize_reasoning_prefill_recovery_mode,
     normalize_runtime_recovery_mode,
 )
+from opensquilla.tools.types import CallerKind, InteractionMode
 from opensquilla.tools.write_policy import validate_workspace_write_deny_env
 
 if TYPE_CHECKING:
@@ -378,6 +379,7 @@ class AgentBootstrapStageInput:
         default=None,
         repr=False,
     )
+    input_mode: str = "user"
 
 
 @dataclass(frozen=True)
@@ -421,6 +423,21 @@ class AgentBootstrapStageOutput:
 # ---------------------------------------------------------------------------
 # Stage
 # ---------------------------------------------------------------------------
+
+
+def _allows_connection_recovery(inp: AgentBootstrapStageInput) -> bool:
+    """Only foreground user tasks may wait indefinitely for connectivity."""
+    ctx = inp.tool_context
+    return bool(
+        ctx is not None
+        and inp.input_mode == "user"
+        and inp.run_kind in {"default", "session_turn", "web_turn"}
+        and ctx.caller_kind in {CallerKind.WEB, CallerKind.CLI}
+        and ctx.interaction_mode is InteractionMode.INTERACTIVE
+        and ctx.subagent_depth == 0
+        and not ctx.parent_task_id
+        and not ctx.parent_session_key
+    )
 
 
 class AgentBootstrapStage:
@@ -838,6 +855,7 @@ class AgentBootstrapStage:
             runtime_events_path=(os.environ.get("OPENSQUILLA_RUNTIME_EVENTS_PATH") or None),
             provider_call_observer=self._provider_call_observer,
             metadata=agent_metadata,
+            provider_connection_recovery_enabled=_allows_connection_recovery(inp),
         )
 
         # 5. Warm session and capture memory snapshot (async, dict-mutating)

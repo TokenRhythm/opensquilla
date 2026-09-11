@@ -3630,6 +3630,7 @@
         "rateLimited": "レート制限 · {seconds}秒後に再試行",
         "retryWait": "{seconds}秒後に再試行",
         "retrying": "再試行中 {attempt}/{limit}",
+        "retryingWithoutLimit": "再試行中 · {attempt}回目",
         "fallback": "予備モデルに切り替え中"
       },
       "purpose": {

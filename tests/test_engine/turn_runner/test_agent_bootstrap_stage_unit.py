@@ -30,6 +30,7 @@ from opensquilla.engine.turn_runner.agent_bootstrap_stage import (
 from opensquilla.engine.turn_runner.outcome import StageOutcome
 from opensquilla.engine.types import AgentConfig, ThinkingLevel
 from opensquilla.provider.types import ModelCapabilities
+from opensquilla.tools.types import CallerKind, InteractionMode, ToolContext
 
 # ---------------------------------------------------------------------------
 # Recording fakes (one per port)
@@ -1072,3 +1073,34 @@ def test_value_objects_frozen() -> None:
 
 # replace lint suppress
 _ = replace
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "caller,mode,depth,parent,input_mode,run_kind,expected",
+    [
+        (CallerKind.WEB, InteractionMode.INTERACTIVE, 0, None, "user", "web_turn", True),
+        (CallerKind.CLI, InteractionMode.INTERACTIVE, 0, None, "user", "session_turn", True),
+        (CallerKind.WEB, InteractionMode.INTERACTIVE, 1, None, "user", "web_turn", False),
+        (CallerKind.WEB, InteractionMode.INTERACTIVE, 0, "parent", "user", "web_turn", False),
+        (CallerKind.WEB, InteractionMode.UNATTENDED, 0, None, "user", "web_turn", False),
+        (CallerKind.CRON, InteractionMode.INTERACTIVE, 0, None, "user", "default", False),
+        (CallerKind.WEB, InteractionMode.INTERACTIVE, 0, None, "goal", "web_turn", False),
+        (CallerKind.WEB, InteractionMode.INTERACTIVE, 0, None, "user", "goal", False),
+    ],
+)
+async def test_connection_recovery_requires_foreground_user_main(
+    caller, mode, depth, parent, input_mode, run_kind, expected,
+) -> None:
+    context = ToolContext(
+        caller_kind=caller,
+        interaction_mode=mode,
+        subagent_depth=depth,
+        parent_task_id=parent,
+    )
+    inp = replace(
+        _make_input(tool_context=context), input_mode=input_mode, run_kind=run_kind,
+    )
+    # No usage ledger is required to choose the recovery policy.
+    out = await _make_stage().run(inp)
+    assert out.output.agent_config.provider_connection_recovery_enabled is expected

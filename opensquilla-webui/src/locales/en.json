@@ -3714,6 +3714,7 @@
         "rateLimited": "Rate limited · retrying in {seconds}s",
         "retryWait": "Retrying in {seconds}s",
         "retrying": "Retrying {attempt}/{limit}",
+        "retryingWithoutLimit": "Retrying · attempt {attempt}",
         "fallback": "Switching to backup model"
       },
       "purpose": {

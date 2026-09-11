@@ -3630,6 +3630,7 @@
         "rateLimited": "Ratenlimit · neuer Versuch in {seconds}s",
         "retryWait": "Neuer Versuch in {seconds}s",
         "retrying": "Neuer Versuch {attempt}/{limit}",
+        "retryingWithoutLimit": "Neuer Versuch · Versuch {attempt}",
         "fallback": "Wechsel zum Ersatzmodell"
       },
       "purpose": {
