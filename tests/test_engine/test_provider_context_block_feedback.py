@@ -1,16 +1,11 @@
-"""Opt-in levers: blocked-call rejection feedback + identical-request breaker.
-
-Covers OPENSQUILLA_PROVIDER_CONTEXT_BLOCK_FEEDBACK and
-OPENSQUILLA_IDENTICAL_REQUEST_LOOP_BREAK (both off by default). Motivation:
-when blocked compacted-placeholder tool calls are stripped from the provider
-projection together with their error tool_results, the model never sees the
-rejection and can re-emit byte-identical requests until the iteration cap.
-"""
+"""Provider projection keeps rejected-call feedback available for self-recovery."""
 
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
 from typing import Any
+
+import pytest
 
 from opensquilla.engine import Agent, AgentConfig
 from opensquilla.engine.agent import (
@@ -118,29 +113,11 @@ def _tool_use_ids(messages: list[Message]) -> list[str]:
     return ids
 
 
-def test_default_off_strips_blocked_pair_and_rejection() -> None:
-    agent = Agent(provider=CapturingProvider(), config=AgentConfig())
-    projected = agent._strip_provider_context_marker_replay_for_provider(
-        _blocked_history(blocked_last=True)
-    )
-    assert "blocked-1" not in _tool_use_ids(projected)
-    flattened = " ".join(
-        block.content
-        for message in projected
-        if isinstance(message.content, list)
-        for block in message.content
-        if isinstance(block, ContentBlockToolResult) and isinstance(block.content, str)
-    )
-    assert REJECTION_TEXT not in flattened
-    # The historical defect: last surviving message is the user task, so the
-    # repair prompt is not appended either - the model gets zero feedback.
-    assert projected[-1].content == "fix the bug"
-
-
-def test_feedback_keeps_pair_and_appends_repair_prompt() -> None:
+@pytest.mark.parametrize("legacy_feedback", [False, True])
+def test_feedback_keeps_pair_and_appends_repair_prompt(legacy_feedback: bool) -> None:
     agent = Agent(
         provider=CapturingProvider(),
-        config=AgentConfig(provider_context_block_feedback=True),
+        config=AgentConfig(provider_context_block_feedback=legacy_feedback),
     )
     projected = agent._strip_provider_context_marker_replay_for_provider(
         _blocked_history(blocked_last=True)

@@ -1085,9 +1085,10 @@ _TOOL_RESULT_HINT_PATH_PATTERN = re.compile(
 
 
 _PROVIDER_CONTEXT_REPAIR_PROMPT = (
-    "A previous tool call was rejected because it reused provider-only compacted "
+    "A previous tool call contains provider-only compacted "
     "tool arguments. Regenerate the complete tool arguments from the available "
-    "source context and retry the tool call. Do not copy compacted placeholders."
+    "source context. Do not copy compacted placeholders. If no result was recorded, "
+    "verify current state before repeating any action with side effects."
 )
 _IDENTICAL_REQUEST_LOOP_NUDGE = (
     "The last several requests were identical: the conversation is stuck "
@@ -17568,57 +17569,11 @@ class Agent:
         if not blocked_tool_ids:
             return messages
 
-        if getattr(self.config, "provider_context_block_feedback", False):
-            return self._project_blocked_context_replay_with_feedback(
-                messages,
-                blocked_tool_ids,
-                record=record,
-            )
-
-        stripped_messages: list[Message] = []
-        stripped_blocks = 0
-        for message in messages:
-            if not isinstance(message.content, list):
-                stripped_messages.append(message)
-                continue
-            next_content: list[Any] = []
-            changed = False
-            for block in message.content:
-                if isinstance(block, ContentBlockToolUse) and block.id in blocked_tool_ids:
-                    stripped_blocks += 1
-                    changed = True
-                    continue
-                if (
-                    isinstance(block, ContentBlockToolResult)
-                    and block.tool_use_id in blocked_tool_ids
-                ):
-                    stripped_blocks += 1
-                    changed = True
-                    continue
-                next_content.append(block)
-            if not changed:
-                stripped_messages.append(message)
-                continue
-            if not next_content:
-                continue
-            stripped_messages.append(
-                message.model_copy(update={"content": next_content})
-            )
-
-        if stripped_blocks and stripped_messages and stripped_messages[-1].role == "assistant":
-            stripped_messages.append(Message(role="user", content=_PROVIDER_CONTEXT_REPAIR_PROMPT))
-
-        if record:
-            self.config.metadata["tool_argument_projection_replay_stripped"] = (
-                self.config.metadata.get("tool_argument_projection_replay_stripped", 0)
-                + stripped_blocks
-            )
-            self._write_turn_call_log(
-                "tool_argument_projection_replay_stripped",
-                tool_use_ids=sorted(blocked_tool_ids),
-                stripped_blocks=stripped_blocks,
-            )
-        return stripped_messages
+        return self._project_blocked_context_replay_with_feedback(
+            messages,
+            blocked_tool_ids,
+            record=record,
+        )
 
     def _project_blocked_context_replay_with_feedback(
         self,
@@ -17640,6 +17595,11 @@ class Agent:
         projected_messages: list[Message] = []
         projected_blocks = 0
         last_blocked_result_index: int | None = None
+        recorded_result_ids = {
+            block.tool_use_id
+            for message in messages if isinstance(message.content, list)
+            for block in message.content if isinstance(block, ContentBlockToolResult)
+        }
         for message in messages:
             if not isinstance(message.content, list):
                 projected_messages.append(message)
@@ -17669,9 +17629,19 @@ class Agent:
                     has_blocked_result = True
                 next_content.append(block)
             if changed:
-                projected_messages.append(
-                    message.model_copy(update={"content": next_content})
+                projected_message = message.model_copy(update={"content": next_content})
+                missing_batch_results = message.role == "assistant" and not any(
+                    isinstance(block, ContentBlockToolUse) and block.id in recorded_result_ids
+                    for block in next_content
                 )
+                if missing_batch_results:
+                    # Missing results do not prove execution or rejection.
+                    # Preserve facts even with trailing runtime/user context,
+                    # rather than letting pairing repair discard the call.
+                    projected_messages.extend(project_incomplete_tool_history([projected_message]))
+                    has_blocked_result = True
+                else:
+                    projected_messages.append(projected_message)
             else:
                 projected_messages.append(message)
             if has_blocked_result:
@@ -17940,34 +17910,6 @@ class Agent:
 
     async def _execute_tool(self, tc: ToolCall) -> ToolResult:
         """Dispatch a tool call to the registered handler."""
-        args_hash = hashlib.sha256(
-            json.dumps(tc.arguments, ensure_ascii=False, sort_keys=True, default=str).encode(
-                "utf-8"
-            )
-        ).hexdigest()
-        failure_signature = (tc.tool_name, args_hash)
-        block_threshold = max(
-            0,
-            int(getattr(self.config, "tool_failure_loop_block_threshold", 0) or 0),
-        )
-        if (
-            block_threshold > 0
-            and self._tool_failure_loop_counts.get(failure_signature, 0) >= block_threshold - 1
-        ):
-            return ToolResult(
-                tool_use_id=tc.tool_use_id,
-                tool_name=tc.tool_name,
-                content=(
-                    f"The exact same {tc.tool_name} call has already failed repeatedly. "
-                    "Do not retry this exact call unchanged. Use a different approach, "
-                    "change the arguments, or explain the blocker to the user."
-                ),
-                is_error=True,
-                execution_status=runtime_execution_status(
-                    "error",
-                    reason="tool_failure_loop_exhausted",
-                ),
-            )
         if self.tool_handler is None:
             result = ToolResult(
                 tool_use_id=tc.tool_use_id,
@@ -17998,25 +17940,8 @@ class Agent:
                         reason="runtime_error",
                     ),
                 )
-        if result.is_error:
-            self._tool_failure_loop_counts[failure_signature] = (
-                self._tool_failure_loop_counts.get(failure_signature, 0) + 1
-            )
-        else:
-            self._tool_failure_loop_counts.pop(failure_signature, None)
-            if tc.tool_name == "tool_search":
-                self._sync_progressive_tool_definitions()
-            if tc.tool_name in {
-                "apply_patch",
-                "background_process",
-                "edit_file",
-                "execute_code",
-                "exec_command",
-                "git_commit",
-                "install_skill_deps",
-                "write_file",
-            }:
-                self._tool_failure_loop_counts.clear()
+        if not result.is_error and tc.tool_name == "tool_search":
+            self._sync_progressive_tool_definitions()
         return result
 
     def _sync_progressive_tool_definitions(self) -> None:

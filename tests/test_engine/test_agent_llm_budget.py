@@ -1336,139 +1336,10 @@ async def test_turn_error_persist_skips_error_time_compaction_for_exhaustion() -
     assert session_manager.calls == [("append", "agent:main:webchat:test")]
 
 
-@pytest.mark.asyncio
-async def test_agent_blocks_repeated_identical_tool_failures_before_tail_growth() -> None:
-    calls = 0
-
-    async def _failing_tool(call: Any) -> ToolResult:
-        nonlocal calls
-        calls += 1
-        return ToolResult(
-            tool_use_id=call.tool_use_id,
-            tool_name=call.tool_name,
-            content="write failed: " + ("permission denied " * 200),
-            is_error=True,
-        )
-
-    agent = Agent(
-        provider=_ContextOverflowProvider(success_after=1),
-        config=AgentConfig(
-            tool_failure_loop_block_threshold=3,
-        ),
-        tool_handler=_failing_tool,
-    )
-    tool_call = ToolCall(
-        tool_use_id="write-1",
-        tool_name="write_file",
-        arguments={"path": "index.html", "content": "<html>bad</html>"},
-    )
-
-    first = await agent._execute_tool(tool_call)
-    second = await agent._execute_tool(tool_call)
-    third = await agent._execute_tool(tool_call)
-
-    assert first.is_error is True
-    assert second.is_error is True
-    assert third.is_error is True
-    assert calls == 2
-    assert "tool_failure_loop_exhausted" not in third.content
-    assert "Do not retry this exact call unchanged" in third.content
-    assert len(third.content) < len(second.content)
-    assert third.execution_status is not None
-    assert third.execution_status.get("reason") == "tool_failure_loop_exhausted"
 
 
-@pytest.mark.asyncio
-async def test_agent_tool_failure_loop_allows_changed_arguments() -> None:
-    calls = 0
-
-    async def _failing_tool(call: Any) -> ToolResult:
-        nonlocal calls
-        calls += 1
-        return ToolResult(
-            tool_use_id=call.tool_use_id,
-            tool_name=call.tool_name,
-            content="write failed",
-            is_error=True,
-        )
-
-    agent = Agent(
-        provider=_ContextOverflowProvider(success_after=1),
-        config=AgentConfig(tool_failure_loop_block_threshold=3),
-        tool_handler=_failing_tool,
-    )
-
-    await agent._execute_tool(
-        ToolCall(
-            tool_use_id="write-1",
-            tool_name="write_file",
-            arguments={"path": "index.html", "content": "first"},
-        )
-    )
-    await agent._execute_tool(
-        ToolCall(
-            tool_use_id="write-2",
-            tool_name="write_file",
-            arguments={"path": "index.html", "content": "first"},
-        )
-    )
-    changed = await agent._execute_tool(
-        ToolCall(
-            tool_use_id="write-3",
-            tool_name="write_file",
-            arguments={"path": "index.html", "content": "changed"},
-        )
-    )
-
-    assert calls == 3
-    assert changed.content == "write failed"
 
 
-@pytest.mark.asyncio
-async def test_agent_tool_failure_loop_result_returns_to_model_instead_of_terminal_error() -> None:
-    provider = _RepeatedToolFailureThenDoneProvider(tool_retries=3)
-    handler_calls = 0
-
-    async def _failing_tool(call: Any) -> ToolResult:
-        nonlocal handler_calls
-        handler_calls += 1
-        return ToolResult(
-            tool_use_id=call.tool_use_id,
-            tool_name=call.tool_name,
-            content="syntax error",
-            is_error=True,
-        )
-
-    agent = Agent(
-        provider=provider,
-        config=AgentConfig(
-            tool_failure_loop_block_threshold=3,
-            max_iterations=5,
-            flush_enabled=False,
-        ),
-        tool_handler=_failing_tool,
-    )
-
-    events = [event async for event in agent.run_turn("build the deck")]
-
-    assert handler_calls == 2
-    assert len(provider.calls) == 4
-    assert any(isinstance(event, DoneEvent) for event in events)
-    assert not any(
-        isinstance(event, ErrorEvent)
-        and getattr(event, "code", None) == "tool_failure_loop_exhausted"
-        for event in events
-    )
-    assert any(
-        getattr(event, "kind", None) == "tool_result"
-        and (getattr(event, "execution_status", None) or {}).get("reason")
-        == "tool_failure_loop_exhausted"
-        for event in events
-    )
-    assert not any(
-        isinstance(event, WarningEvent) and event.code == "repeated_tool_call_recovery"
-        for event in events
-    )
 
 
 @pytest.mark.asyncio
@@ -1677,56 +1548,6 @@ async def test_agent_repeated_extra_tool_recovery_covers_git_diff() -> None:
     )
 
 
-@pytest.mark.asyncio
-async def test_agent_tool_failure_loop_resets_after_successful_state_change() -> None:
-    calls: list[str] = []
-
-    async def _tool(call: Any) -> ToolResult:
-        calls.append(call.tool_name)
-        return ToolResult(
-            tool_use_id=call.tool_use_id,
-            tool_name=call.tool_name,
-            content="ok" if call.tool_name == "edit_file" else "syntax error",
-            is_error=call.tool_name != "edit_file",
-        )
-
-    agent = Agent(
-        provider=_ContextOverflowProvider(success_after=1),
-        config=AgentConfig(tool_failure_loop_block_threshold=3),
-        tool_handler=_tool,
-    )
-    command_call = ToolCall(
-        tool_use_id="cmd-1",
-        tool_name="exec_command",
-        arguments={"command": "python build_pptx.py", "timeout": 30},
-    )
-
-    await agent._execute_tool(command_call)
-    await agent._execute_tool(
-        ToolCall(
-            tool_use_id="cmd-2",
-            tool_name="exec_command",
-            arguments=command_call.arguments,
-        )
-    )
-    await agent._execute_tool(
-        ToolCall(
-            tool_use_id="edit-1",
-            tool_name="edit_file",
-            arguments={"path": "build_pptx.py", "old_text": "bad", "new_text": "good"},
-        )
-    )
-    retry_after_edit = await agent._execute_tool(
-        ToolCall(
-            tool_use_id="cmd-3",
-            tool_name="exec_command",
-            arguments=command_call.arguments,
-        )
-    )
-
-    assert calls == ["exec_command", "exec_command", "edit_file", "exec_command"]
-    assert retry_after_edit.content == "syntax error"
-    assert retry_after_edit.execution_status is None
 
 
 @pytest.mark.asyncio
@@ -4195,26 +4016,6 @@ async def test_agent_failed_focused_verification_counts_after_workspace_write(tm
     )
 
 
-@pytest.mark.asyncio
-async def test_agent_blocks_repeated_missing_tool_handler_failures() -> None:
-    agent = Agent(
-        provider=_ContextOverflowProvider(success_after=1),
-        config=AgentConfig(tool_failure_loop_block_threshold=3),
-    )
-    tool_call = ToolCall(
-        tool_use_id="missing-1",
-        tool_name="missing_tool",
-        arguments={"value": "same"},
-    )
-
-    await agent._execute_tool(tool_call)
-    await agent._execute_tool(tool_call)
-    third = await agent._execute_tool(tool_call)
-
-    assert "tool_failure_loop_exhausted" not in third.content
-    assert "Do not retry this exact call unchanged" in third.content
-    assert third.execution_status is not None
-    assert third.execution_status.get("reason") == "tool_failure_loop_exhausted"
 
 
 @pytest.mark.asyncio

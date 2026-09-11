@@ -809,6 +809,7 @@ class AgentConfig:
     tool_use_argument_provider_request_max_chars: int = 0
     tool_use_argument_projection_enabled: bool = False
     tool_result_external_keep_recent: int = 2
+    # Deprecated, unused compatibility slot; preserve constructor position.
     tool_failure_loop_block_threshold: int = 3
     repeated_tool_call_recovery_threshold: int = 0
     # Extra tool names covered by repeated-identical-call recovery, on top of
@@ -843,10 +844,7 @@ class AgentConfig:
     scratch_verify_mirror: bool = False
     # Deprecated, unused compatibility slot; preserve construction and saved configs.
     finalize_variant_challenge: bool = False
-    # Keep rejection feedback visible when blocked compacted-placeholder tool
-    # calls are projected out of provider requests: the blocked tool_use keeps
-    # a placeholder input and its error tool_result stays in the projection.
-    # Off by default; enabled via OPENSQUILLA_PROVIDER_CONTEXT_BLOCK_FEEDBACK.
+    # Deprecated, unused compatibility slot; preserve constructor position.
     provider_context_block_feedback: bool = False
     # Byte-identical provider-request loop breaker. 0 = off. At N consecutive
     # identical projected payloads the request is perturbed with a loop nudge;

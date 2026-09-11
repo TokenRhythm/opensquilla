@@ -1053,6 +1053,7 @@
       "tests/test_contrib/test_codetask/test_codetask_verification.py",
       "tests/test_contrib/test_codetask/test_persist_to_source.py",
       "tests/test_core_lightweight_contracts.py",
+      "tests/test_engine/test_agent_autonomous_tool_recovery.py",
       "tests/test_engine/test_agent_injection_provider.py",
       "tests/test_engine/test_agent_max_iterations.py",
       "tests/test_engine/test_agent_message_count_recovery.py",

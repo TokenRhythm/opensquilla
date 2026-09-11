@@ -68,6 +68,7 @@ OFFLINE_MARKER_EXCLUSIONS = {
     "tests/test_skills/test_meta_skill_creator_smoke_live.py",
 }
 RECENTLY_ADDED_ACTIVE_TESTS = {
+    "tests/test_engine/test_agent_autonomous_tool_recovery.py",
     # Artifact source/version regressions use the declared provisional floor.
     "tests/test_engine/test_artifact_delivery_sources.py",
     "tests/test_engine/test_runtime_artifact_context.py",
