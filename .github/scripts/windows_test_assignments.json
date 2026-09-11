@@ -534,6 +534,7 @@
       "tests/test_gateway/test_cron_result_payload.py",
       "tests/test_gateway/test_cron_scheduler_adapter.py",
       "tests/test_gateway/test_cron_scheduler_application.py",
+      "tests/test_gateway/test_custom_extra_body.py",
       "tests/test_gateway/test_debug_file_logging.py",
       "tests/test_gateway/test_desktop_browser.py",
       "tests/test_gateway/test_desktop_ownership.py",
