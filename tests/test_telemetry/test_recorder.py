@@ -234,6 +234,32 @@ async def test_record_waiting_behind_revoke_observes_decline_and_never_enqueues(
         await outbox.close()
 
 
+async def test_record_rejects_event_prepared_under_an_older_consent_revision(
+    tmp_path: Path,
+) -> None:
+    outbox = await TelemetryOutbox.open(tmp_path, TelemetryScope.RELIABILITY)
+    config = _shared_config(lambda _scope: _state())
+    coordinator = scope_consent_coordinator_for(config)
+    recorder = TelemetryRecorder(outbox, config=config)
+    prepared_revision = coordinator.revision(TelemetryScope.RELIABILITY)
+
+    try:
+        # A disable/re-enable cycle can end with consent granted again, but data
+        # prepared before that cycle must not be authorized by the new grant.
+        async with coordinator.transition(TelemetryScope.RELIABILITY):
+            pass
+
+        result = await recorder.record(
+            _event(),
+            expected_consent_revision=prepared_revision,
+        )
+
+        assert result.status is RecordStatus.CONSENT_BLOCKED
+        assert (await outbox.stats()).pending_events == 0
+    finally:
+        await outbox.close()
+
+
 async def test_global_veto_waits_for_inflight_enqueue_without_clearing_queue(
     tmp_path: Path,
 ) -> None:

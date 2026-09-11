@@ -1669,7 +1669,7 @@
       "reliabilityDiagnosticsLabel": "Diagnósticos de estabilidad",
       "reliabilityDiagnosticsDesc": "Comparte resultados de operaciones, duraciones y huellas de error que preservan la privacidad para diagnosticar cierres y fallos. Nunca se incluye el contenido de conversaciones o archivos.",
       "productAnalyticsLabel": "Análisis de producto y crecimiento",
-      "productAnalyticsDesc": "Comparte hitos de activación únicos para medir el abandono durante la configuración y la primera conversación. Nunca se incluyen el contenido de las conversaciones ni los ID de cuenta sin transformar; se utiliza un identificador analítico aleatorio y específico.",
+      "productAnalyticsDesc": "Comparte hitos de activación y el número de ejecuciones de MetaSkill y del modo de programación una vez iniciadas realmente, para medir la conversión y el uso de funciones. Nunca se incluyen el contenido de las conversaciones, los parámetros de tareas, los archivos ni los ID de cuenta sin transformar; se utiliza un identificador analítico aleatorio y específico.",
       "networkReportingLabel": "Interruptor principal de diagnósticos de red",
       "networkReportingDesc": "Control principal de los diagnósticos de red, los análisis y la búsqueda de actualizaciones. Al desactivarlo se anulan las dos opciones siguientes."
     },

@@ -12,13 +12,19 @@ from pathlib import Path
 from typing import Any, Final
 
 from opensquilla.telemetry.consent import TelemetryScope
-from opensquilla.telemetry.contracts import TELEMETRY_PROTOCOL_FINGERPRINT_SHA256
+from opensquilla.telemetry.contracts import (
+    CURRENT_NOTICE_VERSION_BY_SCOPE,
+    TELEMETRY_PROTOCOL_FINGERPRINT_SHA256,
+)
 from opensquilla.telemetry.contracts.reliability import (
     FileType,
     ToolCategory,
     TurnErrorCode,
     TurnFailureStage,
     UpdateStage,
+)
+from opensquilla.telemetry.server.storage import (
+    _COMPATIBLE_PREVIOUS_PROTOCOL_FINGERPRINTS,
 )
 
 _SCHEMA_VERSION: Final = 1
@@ -142,6 +148,11 @@ class DashboardQueries:
         ):
             raise ValueError("telemetry protocol fingerprint is invalid")
         self._protocol_fingerprint = protocol_fingerprint
+        self._compatible_protocol_fingerprints = {protocol_fingerprint}
+        if protocol_fingerprint == TELEMETRY_PROTOCOL_FINGERPRINT_SHA256:
+            self._compatible_protocol_fingerprints.update(
+                _COMPATIBLE_PREVIOUS_PROTOCOL_FINGERPRINTS
+            )
 
     def summary(self, window: UtcCohortWindow) -> dict[str, Any]:
         return {
@@ -474,7 +485,91 @@ class DashboardQueries:
                 "activation": activation,
                 "linkedInstallToReady": self._linked_install_to_ready(connection, window),
                 "clientUsage": self._client_usage(connection, window),
+                "metaskillUsage": self._feature_usage(
+                    connection,
+                    window,
+                    event_name="metaskill_usage",
+                    note="首个实际执行步骤开始后计 1 次；不按技能名称拆分。",
+                ),
+                "codingModeUsage": self._feature_usage(
+                    connection,
+                    window,
+                    event_name="coding_mode_usage",
+                    note="编程 Agent 进程实际启动后计 1 次；仅开启模式不计数。",
+                ),
             }
+
+    def _feature_usage(
+        self,
+        connection: sqlite3.Connection,
+        window: UtcCohortWindow,
+        *,
+        event_name: str,
+        note: str,
+    ) -> dict[str, Any]:
+        """Count demonstrated feature runs and expose a zero-filled daily trend.
+
+        Feature usage events are deliberately one-per-execution and are not
+        sampled, so the dashboard reports event counts directly without
+        exposing local run identifiers.
+        """
+
+        row = connection.execute(
+            """
+            SELECT COUNT(*) AS usage_count
+            FROM events
+            WHERE event_name = ?
+              AND event_version = 1
+              AND source = 'runtime'
+              AND notice_version = ?
+              AND analytics_user_id IS NOT NULL
+              AND occurred_at_utc >= ?
+              AND occurred_at_utc < ?
+            """,
+            (
+                event_name,
+                CURRENT_NOTICE_VERSION_BY_SCOPE[TelemetryScope.GROWTH.value],
+                *window.sql_params,
+            ),
+        ).fetchone()
+        daily_rows = connection.execute(
+            """
+            SELECT substr(occurred_at_utc, 1, 10) AS period,
+                   COUNT(*) AS uses
+            FROM events
+            WHERE event_name = ?
+              AND event_version = 1
+              AND source = 'runtime'
+              AND notice_version = ?
+              AND analytics_user_id IS NOT NULL
+              AND occurred_at_utc >= ?
+              AND occurred_at_utc < ?
+            GROUP BY substr(occurred_at_utc, 1, 10)
+            ORDER BY period
+            """,
+            (
+                event_name,
+                CURRENT_NOTICE_VERSION_BY_SCOPE[TelemetryScope.GROWTH.value],
+                *window.sql_params,
+            ),
+        ).fetchall()
+        by_day = {str(item["period"]): int(item["uses"]) for item in daily_rows}
+        day_count = (window.end_exclusive.date() - window.start.date()).days
+        daily = [
+            {
+                "period": (window.start + timedelta(days=offset)).date().isoformat(),
+                "uses": by_day.get(
+                    (window.start + timedelta(days=offset)).date().isoformat(),
+                    0,
+                ),
+            }
+            for offset in range(day_count)
+        ]
+        return {
+            "totalUses": int(row["usage_count"] if row is not None else 0),
+            "dailyTrend": daily,
+            "note": note,
+        }
 
     def _client_usage(
         self,
@@ -674,7 +769,7 @@ class DashboardQueries:
             len(rows) != 1
             or rows[0]["schema_version"] != _SCHEMA_VERSION
             or rows[0]["scope"] != scope.value
-            or rows[0]["protocol_fingerprint"] != self._protocol_fingerprint
+            or rows[0]["protocol_fingerprint"] not in self._compatible_protocol_fingerprints
             or not _REQUIRED_EVENT_COLUMNS.issubset(columns)
         ):
             raise DashboardDataError("telemetry preview schema is incompatible")

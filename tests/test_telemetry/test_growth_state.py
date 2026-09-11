@@ -8,9 +8,11 @@ from types import SimpleNamespace
 import pytest
 
 from opensquilla.telemetry.growth.state import (
+    CODING_MODE_USAGE_STATE_NAME,
     DESKTOP_GROWTH_MILESTONE_STATE_NAME,
     GATEWAY_GROWTH_MILESTONE_STATE_NAME,
     GROWTH_COHORT_STATE_NAME,
+    METASKILL_USAGE_STATE_NAME,
     GrowthStateError,
     delete_growth_cohort_state,
     gateway_growth_milestone_state_path,
@@ -87,19 +89,25 @@ def test_cleanup_targets_only_growth_cohort_and_gateway_marker(tmp_path) -> None
     config = SimpleNamespace(state_dir=str(tmp_path))
     cohort = growth_cohort_state_path(config=config)
     gateway = gateway_growth_milestone_state_path(config=config)
+    metaskill = cohort.parent / METASKILL_USAGE_STATE_NAME
+    coding_mode = cohort.parent / CODING_MODE_USAGE_STATE_NAME
     desktop = cohort.parent / DESKTOP_GROWTH_MILESTONE_STATE_NAME
     cohort.parent.mkdir(parents=True)
     cohort.write_text("{}", encoding="utf-8")
     gateway.write_text("{}", encoding="utf-8")
+    metaskill.write_text("{}", encoding="utf-8")
+    coding_mode.write_text("{}", encoding="utf-8")
     desktop.write_text("{}", encoding="utf-8")
     keep = cohort.parent / "reliability-outbox.sqlite3"
     keep.write_text("keep", encoding="utf-8")
 
     removed = delete_growth_cohort_state(config=config)
 
-    assert set(removed) == {cohort, gateway, desktop}
+    assert set(removed) == {cohort, gateway, metaskill, coding_mode, desktop}
     assert not cohort.exists()
     assert not gateway.exists()
+    assert not metaskill.exists()
+    assert not coding_mode.exists()
     assert not desktop.exists()
     assert keep.read_text(encoding="utf-8") == "keep"
     assert delete_growth_cohort_state(config=config) == ()

@@ -166,7 +166,7 @@ function mockConfigSequence(configs: Array<Record<string, unknown>>) {
       return {
         scope,
         enabled,
-        noticeVersion: enabled ? (scope === 'reliability' ? 'reliability-v1' : 'growth-v1') : null,
+        noticeVersion: enabled ? (scope === 'reliability' ? 'reliability-v1' : 'growth-v2') : null,
         consentedAtUtc: enabled ? new Date().toISOString() : null,
       }
     }
@@ -214,7 +214,7 @@ describe('useSetupCatalog privacy settings', () => {
           reliability_notice_version: 'reliability-v1',
           reliability_consented_at_utc: '2026-09-01T08:30:00.000Z',
           product_analytics_enabled: true,
-          product_analytics_notice_version: 'growth-v1',
+          product_analytics_notice_version: 'growth-v2',
           product_analytics_consented_at_utc: '2026-09-01T08:30:00.000Z',
         },
       },
@@ -288,7 +288,7 @@ describe('useSetupCatalog privacy settings', () => {
           reliability_consented_at_utc: '2026-09-01T08:30:00.000Z',
           reliability_diagnostics_forced_off: true,
           product_analytics_enabled: true,
-          product_analytics_notice_version: 'growth-v1',
+          product_analytics_notice_version: 'growth-v2',
           product_analytics_consented_at_utc: '2026-09-01T08:30:00.000Z',
           product_analytics_forced_off: false,
         },
@@ -299,7 +299,7 @@ describe('useSetupCatalog privacy settings', () => {
           reliability_diagnostics_enabled: false,
           reliability_diagnostics_forced_off: true,
           product_analytics_enabled: true,
-          product_analytics_notice_version: 'growth-v1',
+          product_analytics_notice_version: 'growth-v2',
           product_analytics_consented_at_utc: '2026-09-01T08:30:00.000Z',
           product_analytics_forced_off: false,
         },

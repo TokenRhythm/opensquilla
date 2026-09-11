@@ -31,8 +31,25 @@ SCHEMA_VERSION = 1
 _LEGACY_PROTOCOL_FINGERPRINT_SHA256 = (
     "1980ad6ba1a5db2f4b620e019e32b45e398a90699b708364f4713e411324f099"
 )
+_EARLIER_COMPATIBLE_PROTOCOL_FINGERPRINT_SHA256 = (
+    "3b7f83ea9113e77f4ee6349bb74038d2587f74e151321834e4e0810f3b5a492b"
+)
 _PREVIOUS_PROTOCOL_FINGERPRINT_SHA256 = (
+    "fe91d1abadf0e145c57545c4090e4d45b942956b6420ba71f99ddb6a322b9488"
+)
+_OLDER_COMPATIBLE_PROTOCOL_FINGERPRINT_SHA256 = (
+    "74d821c7d6ea2f3f08b5e27280da24ff17a51a913a165d5314d413d6204c1b7b"
+)
+_OLDEST_COMPATIBLE_PROTOCOL_FINGERPRINT_SHA256 = (
     "0e7769f58ef3d9824c30fcc3a7dd0681afa3553fa8dac1eba453172e5dbe3cb5"
+)
+_COMPATIBLE_PREVIOUS_PROTOCOL_FINGERPRINTS = frozenset(
+    {
+        _EARLIER_COMPATIBLE_PROTOCOL_FINGERPRINT_SHA256,
+        _OLDER_COMPATIBLE_PROTOCOL_FINGERPRINT_SHA256,
+        _OLDEST_COMPATIBLE_PROTOCOL_FINGERPRINT_SHA256,
+        _PREVIOUS_PROTOCOL_FINGERPRINT_SHA256,
+    }
 )
 
 _EXPECTED_TABLES = frozenset({"events", "ingest_batches", "meta"})
@@ -474,14 +491,13 @@ class TelemetryIngestStorage:
         if indexes != _EXPECTED_INDEXES:
             raise StorageCompatibilityError
 
-        previous_metadata = (
-            SCHEMA_VERSION,
-            scope.value,
-            _PREVIOUS_PROTOCOL_FINGERPRINT_SHA256,
-        )
+        compatible_previous_metadata = {
+            (SCHEMA_VERSION, scope.value, fingerprint)
+            for fingerprint in _COMPATIBLE_PREVIOUS_PROTOCOL_FINGERPRINTS
+        }
         if (
             protocol_fingerprint == TELEMETRY_PROTOCOL_FINGERPRINT_SHA256
-            and metadata == previous_metadata
+            and metadata in compatible_previous_metadata
         ):
             await cls._migrate_compatible_protocol_fingerprint(connection)
             metadata = (SCHEMA_VERSION, scope.value, protocol_fingerprint)

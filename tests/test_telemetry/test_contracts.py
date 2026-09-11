@@ -28,6 +28,7 @@ from opensquilla.telemetry.contracts import (
     AppCrashDetected,
     AppStartResult,
     ClientLaunch,
+    CodingModeUsage,
     DownloadClick,
     DownloadServed,
     FileParseResult,
@@ -38,6 +39,7 @@ from opensquilla.telemetry.contracts import (
     InstallResult,
     InstallStarted,
     LandingView,
+    MetaSkillUsage,
     OnboardingCompleted,
     PerformanceSummary,
     RegistrationResult,
@@ -114,7 +116,7 @@ def _growth_base(event_name: str) -> dict[str, object]:
         "error_code": None,
         "duration_ms": None,
         "consent_scope": "growth",
-        "notice_version": "growth-v1",
+        "notice_version": "growth-v2",
         "sample_rate": 1,
         "analytics_user_id": ANALYTICS_USER_ID,
     }
@@ -138,7 +140,7 @@ def _acquisition_base(
         "error_code": None,
         "duration_ms": None,
         "consent_scope": "growth",
-        "notice_version": "growth-v1",
+        "notice_version": "growth-v2",
         "sample_rate": 1,
         "acquisition_id": ACQUISITION_ID,
     }
@@ -295,6 +297,12 @@ def _valid_growth_payloads() -> list[tuple[type[object], dict[str, object]]]:
         execution_mode="gateway",
     )
 
+    metaskill_usage = _growth_base("metaskill_usage")
+    metaskill_usage.update(source="runtime")
+
+    coding_mode_usage = _growth_base("coding_mode_usage")
+    coding_mode_usage.update(source="runtime")
+
     return [
         (OnboardingCompleted, onboarding),
         (FirstAppReady, app_ready),
@@ -308,6 +316,8 @@ def _valid_growth_payloads() -> list[tuple[type[object], dict[str, object]]]:
         (RegistrationStarted, registration_started),
         (RegistrationResult, registration_result),
         (ClientLaunch, client_launch),
+        (MetaSkillUsage, metaskill_usage),
+        (CodingModeUsage, coding_mode_usage),
     ]
 
 
@@ -791,6 +801,15 @@ def test_growth_batch_accepts_closed_growth_event() -> None:
     assert isinstance(batch.events[0], FirstAppReady)
 
 
+@pytest.mark.parametrize("event_index", [12, 13])
+def test_feature_usage_events_reject_pre_disclosure_notice(event_index: int) -> None:
+    payload = dict(_valid_growth_payloads()[event_index][1])
+    payload["notice_version"] = "growth-v1"
+
+    with pytest.raises(ValidationError):
+        TELEMETRY_EVENT_ADAPTER.validate_json(_wire_json(payload), strict=True)
+
+
 def test_reliability_batch_enforces_event_limit() -> None:
     template = _valid_reliability_payloads()[3][1]
     events: list[dict[str, object]] = []
@@ -1032,7 +1051,7 @@ def test_protocol_manifest_and_fingerprint_are_stable_cross_language_golden() ->
 
     assert fingerprint == TELEMETRY_PROTOCOL_FINGERPRINT_SHA256
     assert TELEMETRY_PROTOCOL_FINGERPRINT_SHA256 == (
-        "74d821c7d6ea2f3f08b5e27280da24ff17a51a913a165d5314d413d6204c1b7b"
+        "37eef99b9de090a2032669d3caa9cd10f4357061658b2458326595361582732f"
     )
     assert manifest_events == set(EVENT_MODELS)
     assert manifest["notice_versions"] == dict(CURRENT_NOTICE_VERSION_BY_SCOPE)

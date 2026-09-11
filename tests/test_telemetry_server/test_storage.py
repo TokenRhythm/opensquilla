@@ -68,7 +68,7 @@ def _growth_event(*, event_id: str = _EVENT_ID) -> dict[str, object]:
         "error_code": None,
         "duration_ms": None,
         "consent_scope": "growth",
-        "notice_version": "growth-v1",
+        "notice_version": "growth-v2",
         "sample_rate": 1,
         "acquisition_id": _ACQUISITION_ID,
     }
@@ -89,7 +89,7 @@ def _client_launch(
         "error_code": None,
         "duration_ms": None,
         "consent_scope": "growth",
-        "notice_version": "growth-v1",
+        "notice_version": "growth-v2",
         "sample_rate": 1,
         "analytics_user_id": _ANALYTICS_ID,
         "surface": "tui",
@@ -483,14 +483,21 @@ async def test_exact_previous_protocol_database_is_migrated_in_place(tmp_path: P
 
 
 @pytest.mark.asyncio
-async def test_compatible_previous_fingerprint_is_advanced_in_place(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "previous_fingerprint",
+    sorted(storage_module._COMPATIBLE_PREVIOUS_PROTOCOL_FINGERPRINTS),
+)
+async def test_compatible_previous_fingerprint_is_advanced_in_place(
+    tmp_path: Path,
+    previous_fingerprint: str,
+) -> None:
     database = tmp_path / "previous-growth.sqlite3"
     storage = await TelemetryIngestStorage.open(database, ConsentScope.GROWTH)
     await storage.close()
     with sqlite3.connect(database) as connection:
         connection.execute(
             "UPDATE meta SET protocol_fingerprint = ? WHERE singleton = 1",
-            (storage_module._PREVIOUS_PROTOCOL_FINGERPRINT_SHA256,),
+            (previous_fingerprint,),
         )
 
     reopened = await TelemetryIngestStorage.open(database, ConsentScope.GROWTH)

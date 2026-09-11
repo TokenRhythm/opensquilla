@@ -188,6 +188,9 @@ def solve(
     from opensquilla.contrib.codetask.runner import solve as run_solve
     from opensquilla.contrib.codetask.types import PRODUCTIVE_STATES, TaskState
     from opensquilla.contrib.codetask.workspace import WorkspaceError
+    from opensquilla.telemetry.coding_mode_usage import (
+        observe_current_profile_coding_mode_usage,
+    )
 
     given = [x for x in (issue, task, task_file) if x not in (None, "")]
     if len(given) != 1:
@@ -293,6 +296,7 @@ def solve(
             timeout=timeout,
             verification_mode=verification_mode,
             run_id=rid,
+            coding_mode_usage_recorder=observe_current_profile_coding_mode_usage,
         )
     except InputError as exc:
         typer.secho(str(exc), err=True, fg=typer.colors.RED)

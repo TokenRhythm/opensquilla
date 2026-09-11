@@ -150,12 +150,13 @@ def test_complete_consent_enables_only_its_own_scope() -> None:
     assert not scope_collection_enabled(TelemetryScope.GROWTH, config=config, env={})
 
 
-def test_stale_notice_fails_closed_without_erasing_granted_decision() -> None:
+def test_growth_v1_grant_is_stale_after_feature_usage_notice_expansion() -> None:
+    assert CURRENT_PRODUCT_ANALYTICS_NOTICE_VERSION == "growth-v2"
     state = resolve_scope_consent(
         TelemetryScope.GROWTH,
         config=_config(
             product_analytics_enabled=True,
-            product_analytics_notice_version="2026-08-01",
+            product_analytics_notice_version="growth-v1",
             product_analytics_consented_at_utc=VALID_CONSENT_TIME,
         ),
         env={},

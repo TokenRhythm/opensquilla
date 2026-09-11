@@ -103,6 +103,7 @@ class ScopedTelemetryRuntime:
         event: StrictTelemetryModel,
         *,
         priority: OutboxPriority | int | None = None,
+        expected_consent_revision: int | None = None,
     ) -> RecordResult:
         """Record one event after a lazy, fail-closed scope initialization."""
 
@@ -115,7 +116,11 @@ class ScopedTelemetryRuntime:
         scoped = await self._scope_runtime(scope)
         if scoped is None:
             return RecordResult(RecordStatus.CONSENT_BLOCKED)
-        return await scoped.recorder.record(event, priority=priority)
+        return await scoped.recorder.record(
+            event,
+            priority=priority,
+            expected_consent_revision=expected_consent_revision,
+        )
 
     def record_background(
         self,

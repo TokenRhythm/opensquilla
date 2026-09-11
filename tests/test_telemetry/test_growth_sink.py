@@ -24,7 +24,9 @@ from opensquilla.telemetry.growth_sink import (
     GrowthEventSink,
     GrowthMilestoneStatus,
     read_client_launch_state,
+    read_coding_mode_usage_state,
     read_gateway_growth_milestone_state,
+    read_metaskill_usage_state,
 )
 from opensquilla.telemetry.identity import (
     TelemetryIdentityKind,
@@ -42,9 +44,17 @@ class CapturingRuntime:
     def __init__(self, statuses: list[RecordStatus] | None = None) -> None:
         self.events = []
         self.statuses = list(statuses or [])
+        self.consent_revisions: list[int | None] = []
 
-    async def record(self, event, *, priority=None) -> RecordResult:
+    async def record(
+        self,
+        event,
+        *,
+        priority=None,
+        expected_consent_revision: int | None = None,
+    ) -> RecordResult:
         self.events.append(event)
+        self.consent_revisions.append(expected_consent_revision)
         status = self.statuses.pop(0) if self.statuses else RecordStatus.RECORDED
         return RecordResult(status)
 
@@ -241,3 +251,229 @@ async def test_client_launch_retry_reuses_event_id(tmp_path) -> None:
     assert first is False
     assert second is True
     assert runtime.events[0].event_id == runtime.events[1].event_id
+
+
+async def test_metaskill_usage_counts_new_runs_once_without_payload_details(tmp_path) -> None:
+    config = _config(tmp_path)
+    _activate(config)
+    runtime = CapturingRuntime()
+    sink = _sink(runtime, config)
+
+    first = await sink.record_metaskill_usage("run-001", STARTED_AT)
+    duplicate = await sink.record_metaskill_usage("run-001", SUCCEEDED_AT)
+    second = await sink.record_metaskill_usage("run-002", SUCCEEDED_AT)
+
+    assert first is True
+    assert duplicate is False
+    assert second is True
+    assert [event.event_name for event in runtime.events] == [
+        "metaskill_usage",
+        "metaskill_usage",
+    ]
+    assert all(
+        set(event.model_dump(mode="json"))
+        == {
+            "occurred_at_utc",
+            "event_name",
+            "event_version",
+            "event_id",
+            "source",
+            "app_version",
+            "platform",
+            "outcome",
+            "error_code",
+            "duration_ms",
+            "consent_scope",
+            "notice_version",
+            "sample_rate",
+            "analytics_user_id",
+        }
+        for event in runtime.events
+    )
+    records = read_metaskill_usage_state(sink.metaskill_usage_path)
+    assert set(records) == {"run-001", "run-002"}
+    assert all(record.status is GrowthMilestoneStatus.ENQUEUED for record in records.values())
+
+
+async def test_metaskill_usage_retry_reuses_event_id_after_eviction(tmp_path) -> None:
+    config = _config(tmp_path)
+    _activate(config)
+    runtime = CapturingRuntime([RecordStatus.EVICTED, RecordStatus.RECORDED])
+    sink = _sink(runtime, config)
+
+    first = await sink.record_metaskill_usage("run-retry", STARTED_AT)
+    second = await sink.record_metaskill_usage("run-retry", SUCCEEDED_AT)
+
+    assert first is False
+    assert second is True
+    assert runtime.events[0] == runtime.events[1]
+
+
+async def test_accepted_metaskill_observation_is_drained_during_close(tmp_path) -> None:
+    config = _config(tmp_path)
+    _activate(config)
+    runtime = CapturingRuntime()
+    sink = _sink(runtime, config)
+
+    sink.observe_metaskill_usage("run-before-close")
+    await sink.close()
+
+    assert [event.event_name for event in runtime.events] == ["metaskill_usage"]
+    records = read_metaskill_usage_state(sink.metaskill_usage_path)
+    assert records["run-before-close"].status is GrowthMilestoneStatus.ENQUEUED
+
+
+async def test_coding_mode_usage_counts_started_runs_once_without_payload_details(
+    tmp_path,
+) -> None:
+    config = _config(tmp_path)
+    _activate(config)
+    runtime = CapturingRuntime()
+    sink = _sink(runtime, config)
+
+    first = await sink.record_coding_mode_usage("codetask-001", STARTED_AT)
+    duplicate = await sink.record_coding_mode_usage("codetask-001", SUCCEEDED_AT)
+    second = await sink.record_coding_mode_usage("codetask-002", SUCCEEDED_AT)
+
+    assert first is True
+    assert duplicate is False
+    assert second is True
+    assert [event.event_name for event in runtime.events] == [
+        "coding_mode_usage",
+        "coding_mode_usage",
+    ]
+    assert all(
+        set(event.model_dump(mode="json"))
+        == {
+            "occurred_at_utc",
+            "event_name",
+            "event_version",
+            "event_id",
+            "source",
+            "app_version",
+            "platform",
+            "outcome",
+            "error_code",
+            "duration_ms",
+            "consent_scope",
+            "notice_version",
+            "sample_rate",
+            "analytics_user_id",
+        }
+        for event in runtime.events
+    )
+    records = read_coding_mode_usage_state(sink.coding_mode_usage_path)
+    assert set(records) == {"codetask-001", "codetask-002"}
+    assert all(record.status is GrowthMilestoneStatus.ENQUEUED for record in records.values())
+
+
+async def test_later_turn_retries_pending_feature_usage_with_same_event_id(tmp_path) -> None:
+    config = _config(tmp_path)
+    _activate(config)
+    runtime = CapturingRuntime([RecordStatus.EVICTED, RecordStatus.RECORDED])
+    sink = _sink(runtime, config)
+
+    assert await sink.record_metaskill_usage("run-pending", STARTED_AT) is False
+    pending_event = runtime.events[0]
+
+    await sink.record_turn_started(SUCCEEDED_AT)
+
+    assert runtime.events[1] == pending_event
+    records = read_metaskill_usage_state(sink.metaskill_usage_path)
+    assert records["run-pending"].status is GrowthMilestoneStatus.ENQUEUED
+
+
+async def test_client_launch_retries_feature_usage_left_pending_before_restart(
+    tmp_path,
+) -> None:
+    config = _config(tmp_path)
+    _activate(config)
+    first_runtime = CapturingRuntime([RecordStatus.EVICTED])
+    first_sink = _sink(first_runtime, config)
+
+    assert await first_sink.record_metaskill_usage("run-before-restart", STARTED_AT) is False
+    pending_event = first_runtime.events[0]
+    await first_sink.close()
+
+    config = _config(tmp_path)
+    resumed_runtime = CapturingRuntime()
+    resumed_sink = _sink(resumed_runtime, config)
+    recorded = await resumed_sink.record_client_launch(
+        surface=ClientSurface.CLI,
+        entrypoint=ClientEntrypoint.CHAT,
+        execution_mode=ExecutionMode.STANDALONE,
+    )
+
+    assert recorded is True
+    assert resumed_runtime.events[0] == pending_event
+    assert resumed_runtime.events[1].event_name == "client_launch"
+    records = read_metaskill_usage_state(resumed_sink.metaskill_usage_path)
+    assert records["run-before-restart"].status is GrowthMilestoneStatus.ENQUEUED
+
+
+async def test_corrupt_coding_ledger_does_not_block_other_growth_events(tmp_path) -> None:
+    config = _config(tmp_path)
+    _activate(config)
+    runtime = CapturingRuntime()
+    sink = _sink(runtime, config)
+    sink.coding_mode_usage_path.parent.mkdir(parents=True, exist_ok=True)
+    sink.coding_mode_usage_path.write_text("{not-json", encoding="utf-8")
+
+    assert await sink.record_metaskill_usage("run-valid", STARTED_AT) is True
+    await sink.record_turn_started(SUCCEEDED_AT)
+
+    assert [event.event_name for event in runtime.events] == [
+        "metaskill_usage",
+        "first_turn_started",
+    ]
+    assert sink.coding_mode_usage_path.read_text(encoding="utf-8") == "{not-json"
+
+
+async def test_pending_feature_usage_is_never_removed_by_dedupe_history_limit(
+    tmp_path,
+) -> None:
+    config = _config(tmp_path)
+    _activate(config)
+    # Every new observation retries every earlier pending record. Keep every
+    # attempt evicted so all 25 records remain pending at once.
+    runtime = CapturingRuntime([RecordStatus.EVICTED] * 400)
+    sink = _sink(runtime, config)
+
+    for index in range(25):
+        recorded = await sink.record_metaskill_usage(
+            f"run-pending-{index:02d}",
+            STARTED_AT,
+        )
+        assert recorded is False
+
+    records = read_metaskill_usage_state(sink.metaskill_usage_path)
+    assert len(records) == 25
+    assert "run-pending-00" in records
+    assert all(record.status is GrowthMilestoneStatus.PENDING for record in records.values())
+    assert all(revision == 0 for revision in runtime.consent_revisions)
+
+
+async def test_pre_disclosure_feature_ledger_is_not_retried_or_allowed_to_block(
+    tmp_path,
+) -> None:
+    config = _config(tmp_path)
+    _activate(config)
+    old_runtime = CapturingRuntime()
+    old_sink = _sink(old_runtime, config)
+    assert await old_sink.record_metaskill_usage("old-run", STARTED_AT) is True
+    await old_sink.close()
+
+    payload = json.loads(old_sink.metaskill_usage_path.read_text(encoding="utf-8"))
+    payload["records"][0]["event"]["notice_version"] = "growth-v1"
+    old_sink.metaskill_usage_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    # Simulate a later process loading the profile after the updated disclosure.
+    config = _config(tmp_path)
+    runtime = CapturingRuntime()
+    sink = _sink(runtime, config)
+    assert await sink.record_metaskill_usage("new-run", SUCCEEDED_AT) is True
+
+    assert [event.event_name for event in runtime.events] == ["metaskill_usage"]
+    assert runtime.events[0].notice_version == "growth-v2"
+    records = read_metaskill_usage_state(sink.metaskill_usage_path)
+    assert set(records) == {"new-run"}

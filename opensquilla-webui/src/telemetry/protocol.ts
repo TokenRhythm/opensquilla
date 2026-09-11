@@ -1,7 +1,7 @@
 export const TELEMETRY_PROTOCOL_FINGERPRINT_SHA256 =
-  '74d821c7d6ea2f3f08b5e27280da24ff17a51a913a165d5314d413d6204c1b7b'
+  '37eef99b9de090a2032669d3caa9cd10f4357061658b2458326595361582732f'
 
 export const TELEMETRY_NOTICE_VERSION_BY_SCOPE = Object.freeze({
-  growth: 'growth-v1',
+  growth: 'growth-v2',
   reliability: 'reliability-v1',
 })

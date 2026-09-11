@@ -9512,6 +9512,14 @@ class TurnRunner:
             # roots while keeping every catalog read free of filesystem probes.
             "skill_loader": agent_skill_loader,
             "meta_run_writer": getattr(self, "_meta_run_writer", None),
+            # A content-free callback for the authoritative MetaSkill run
+            # boundary. It is copied to sub-Agent configs by the orchestrator
+            # and never enters persisted run inputs or telemetry payloads.
+            "metaskill_usage_recorder": getattr(
+                getattr(self, "growth_event_sink", None),
+                "observe_metaskill_usage",
+                None,
+            ),
             # PR9+: meta_resolution's awaiting branch calls this first when
             # the SKILL.md has ``nl_extract: true``. None keeps clarify reply
             # parsing on the deterministic compatibility path.

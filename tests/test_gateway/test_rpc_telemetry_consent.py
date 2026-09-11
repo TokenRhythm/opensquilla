@@ -106,7 +106,7 @@ def _config(
         )
     if growth is True:
         privacy.update(
-            product_analytics_notice_version="growth-v1",
+            product_analytics_notice_version="growth-v2",
             product_analytics_consented_at_utc=_NOW,
         )
     return GatewayConfig(
@@ -703,7 +703,7 @@ async def test_config_reload_preserves_live_server_owned_consent(
                 "[privacy]",
                 "reliability_diagnostics_enabled = false",
                 "product_analytics_enabled = true",
-                'product_analytics_notice_version = "growth-v1"',
+                'product_analytics_notice_version = "growth-v2"',
                 f'product_analytics_consented_at_utc = "{_NOW}"',
                 "",
             )

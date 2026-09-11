@@ -38,7 +38,11 @@ from typing import TYPE_CHECKING, Any, Literal, cast
 import structlog
 
 from opensquilla.artifacts import artifact_payload
-from opensquilla.engine.types import AgentConfig, AgentEvent, ArtifactEvent
+from opensquilla.engine.types import (
+    AgentConfig,
+    AgentEvent,
+    ArtifactEvent,
+)
 from opensquilla.engine.usage_accounting import (
     UsageAccountingScope,
     UsageEventSink,
@@ -763,6 +767,7 @@ class MetaOrchestrator:
         turn_id: str | None = None,
         memory_persist_enabled: bool = True,
         usage_tracker: Any | None = None,
+        metaskill_usage_recorder: Callable[[str], Any] | None = None,
         skill_runtime_env: Mapping[str, Mapping[str, str]] | None = None,
         # PR3: ``dao`` is the preferred alias for ``run_writer`` when the
         # caller only needs the DAO surface (try_claim_resume /
@@ -808,6 +813,9 @@ class MetaOrchestrator:
         self._session_key = session_key
         self._turn_id = turn_id
         self._usage_tracker = usage_tracker
+        # Receives only the newly created persistence run key. The callback
+        # must not inspect plan, inputs, prompts, or step output.
+        self._metaskill_usage_recorder = metaskill_usage_recorder
         # Volatile, parent-resolved credentials keyed by the exact bundled
         # skill that needs them. They are applied directly to subprocess env,
         # never rendered through Jinja or written to run persistence.
@@ -1106,6 +1114,7 @@ class MetaOrchestrator:
         if trusted_preflight_replay and trusted_replay_meta_run_id:
             replay_meta_run_id = _safe_meta_run_id(trusted_replay_meta_run_id)
 
+        confirmed_preflight_run = False
         if self._run_writer is not None:
             existing_run: Any = None
             if run_id is not None:
@@ -1122,6 +1131,7 @@ class MetaOrchestrator:
                     run_id = None
                 else:
                     existing_run = existing
+                    confirmed_preflight_run = True
             if run_id is None:
                 confirmed_run_id = _preflight_confirmation_run_id(match.inputs)
                 if confirmed_run_id:
@@ -1140,6 +1150,7 @@ class MetaOrchestrator:
                     ):
                         run_id = confirmed_run_id
                         existing_run = existing
+                        confirmed_preflight_run = True
             if run_id is None:
                 # This reserved input must exist in the exact snapshot written
                 # by begin_run_sync. Downstream manifests may use it as a
@@ -1149,6 +1160,10 @@ class MetaOrchestrator:
                     match.inputs[_META_RUN_INPUT_KEY] = replay_meta_run_id
                 else:
                     _seed_fresh_meta_run_id(match.inputs)
+                # This is a newly admitted execution even if the optional
+                # audit writer is unavailable; the generated input id gives
+                # the usage observer a bounded deduplication key.
+                created_new_run = True
                 try:
                     run_id = await _to_thread(
                         self._run_writer.begin_run_sync,
@@ -1159,13 +1174,13 @@ class MetaOrchestrator:
                         session_key=self._session_key,
                         turn_id=self._turn_id,
                     )
-                    created_new_run = bool(run_id)
                 except Exception as exc:  # noqa: BLE001
                     log.warning("orchestrator.begin_run_failed: %s", exc)
             else:
                 # A confirmed preflight reuses its original persistence row.
                 # Restore the runtime-owned value from that snapshot instead
                 # of accepting a caller-provided reserved input.
+                confirmed_preflight_run = existing_run is not None
                 persisted_id = _persisted_meta_run_id(existing_run)
                 match.inputs[_META_RUN_INPUT_KEY] = _safe_meta_run_id(
                     persisted_id or run_id,
@@ -1177,6 +1192,43 @@ class MetaOrchestrator:
                 match.inputs[_META_RUN_INPUT_KEY] = replay_meta_run_id
             else:
                 _seed_fresh_meta_run_id(match.inputs)
+            if run_id is None:
+                created_new_run = True
+
+        usage_observation_pending = (
+            created_new_run or confirmed_preflight_run or self._run_writer is None
+        )
+        # The usage key is deliberately independent from the artifact namespace.
+        # In particular, a trusted replay may reuse the source run's artifact id
+        # while still being a distinct demonstrated execution.
+        if run_id is not None and self._run_writer is not None:
+            usage_observation_key = _safe_meta_run_id(run_id)
+        elif replay_meta_run_id:
+            # A trusted replay is a new demonstrated use even though artifact
+            # routing deliberately keeps the source run's meta_run_id.
+            usage_observation_key = f"meta-use-{secrets.token_hex(12)}"
+        else:
+            usage_observation_key = _safe_meta_run_id(
+                match.inputs.get(_META_RUN_INPUT_KEY),
+            )
+        usage_observation_sent = False
+
+        def _notify_metaskill_usage() -> None:
+            """Notify once immediately before the first executable step."""
+
+            nonlocal usage_observation_sent
+            if usage_observation_sent or not usage_observation_pending:
+                return
+            usage_observation_sent = True
+            if self._metaskill_usage_recorder is None:
+                return
+            try:
+                self._metaskill_usage_recorder(usage_observation_key)
+            except Exception as exc:  # noqa: BLE001 - telemetry never kills a run
+                log.warning(
+                    "orchestrator.metaskill_usage_record_failed",
+                    error_type=type(exc).__name__,
+                )
 
         if (
             created_new_run
@@ -1192,7 +1244,7 @@ class MetaOrchestrator:
                 replay_failover_aliases=replay_failover_aliases,
             )
 
-        on_step_begin, on_step_finish, on_step_failover = (
+        persist_on_step_begin, on_step_finish, on_step_failover = (
             self._step_persistence_hooks(
                 run_id=run_id,
                 plan=match.plan,
@@ -1200,6 +1252,29 @@ class MetaOrchestrator:
                 usage_scope_prefix=run_id or f"meta:{match.plan.name}:{id(match)}",
             )
         )
+
+        async def on_step_begin(
+            step_id: str,
+            effective_skill: str,
+            rendered_inputs: dict[str, Any],
+        ) -> None:
+            if persist_on_step_begin is not None:
+                await persist_on_step_begin(step_id, effective_skill, rendered_inputs)
+
+        async def dispatch_step_stream(
+            step: MetaStep,
+            effective_skill: str,
+            inputs: dict[str, Any],
+            outputs: dict[str, str],
+        ) -> AsyncIterator[AgentEvent | _StepDone]:
+            async for event in self._dispatch_step_stream(
+                step,
+                effective_skill,
+                inputs,
+                outputs,
+                on_execution_started=_notify_metaskill_usage,
+            ):
+                yield event
 
         final_result: MetaResult | None = None
         cancelled = False
@@ -1213,7 +1288,7 @@ class MetaOrchestrator:
             )
             async for item in run_dag(
                 scheduler_match,
-                dispatch_step_stream=self._dispatch_step_stream,
+                dispatch_step_stream=dispatch_step_stream,
                 yield_skill_view_preface=self._yield_skill_view_preface,
                 max_parallelism=self._max_parallelism,
                 on_step_begin=on_step_begin,
@@ -1359,6 +1434,8 @@ class MetaOrchestrator:
         effective_skill: str,
         inputs: dict[str, Any],
         outputs: dict[str, str],
+        *,
+        on_execution_started: Callable[[], None] | None = None,
     ) -> AsyncIterator[AgentEvent | _StepDone]:
         """Streaming dispatch — yields nested events then a final :class:`_StepDone`.
 
@@ -1388,6 +1465,8 @@ class MetaOrchestrator:
             return
 
         if step.kind == "llm_classify":
+            if on_execution_started is not None:
+                on_execution_started()
             text = await run_llm_classify_step(
                 step,
                 inputs,
@@ -1398,6 +1477,8 @@ class MetaOrchestrator:
             yield _StepDone(text=text)
             return
         if step.kind == "llm_chat":
+            if on_execution_started is not None:
+                on_execution_started()
             text = await run_llm_chat_step(
                 step,
                 inputs,
@@ -1408,6 +1489,8 @@ class MetaOrchestrator:
             yield _StepDone(text=text)
             return
         if step.kind == "tool_call":
+            if on_execution_started is not None:
+                on_execution_started()
             result = await run_tool_call_step(
                 step,
                 inputs,
@@ -1427,6 +1510,8 @@ class MetaOrchestrator:
             yield _StepDone(text=result.text)
             return
         if step.kind == "skill_exec":
+            if on_execution_started is not None:
+                on_execution_started()
             text = await run_skill_exec_step(
                 step,
                 effective_skill,
@@ -1500,6 +1585,8 @@ class MetaOrchestrator:
                 if ctx_payload:
                     prefill_context = ctx_payload
                     llm_chat_for_prefill = self._llm_chat
+            if on_execution_started is not None:
+                on_execution_started()
             text = await run_user_input_step(
                 step,
                 inputs=inputs,
@@ -1516,6 +1603,8 @@ class MetaOrchestrator:
             yield _StepDone(text=text)
             return
         if effective_skill == "paper-section-author" and self._llm_chat is not None:
+            if on_execution_started is not None:
+                on_execution_started()
             text = await run_step_with_skill_text_only(
                 step,
                 effective_skill,
@@ -1527,6 +1616,8 @@ class MetaOrchestrator:
             yield _StepDone(text=text)
             return
         # agent kind: forward sub-Agent events as they arrive.
+        if on_execution_started is not None:
+            on_execution_started()
         async for item in run_step_with_skill_stream(
             step,
             effective_skill,

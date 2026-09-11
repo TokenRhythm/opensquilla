@@ -111,7 +111,7 @@ def _growth_batch() -> dict[str, object]:
                 "error_code": None,
                 "duration_ms": None,
                 "consent_scope": "growth",
-                "notice_version": "growth-v1",
+                "notice_version": "growth-v2",
                 "sample_rate": 1,
                 "acquisition_id": _ACQUISITION_ID,
             }
@@ -137,7 +137,7 @@ def _client_growth_batch() -> dict[str, object]:
                 "error_code": None,
                 "duration_ms": None,
                 "consent_scope": "growth",
-                "notice_version": "growth-v1",
+                "notice_version": "growth-v2",
                 "sample_rate": 1,
                 "analytics_user_id": _ANALYTICS_USER_ID,
             }

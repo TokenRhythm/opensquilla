@@ -64,6 +64,15 @@ is accepted.
 | Website backend | `download_click` | a consented, valid download action is accepted by the backend |
 | CDN/download service | `download_served` | the complete installer object is successfully delivered, not merely requested |
 | Account service | `registration_result` | the registration transaction reaches success, fail, or cancel |
+| Runtime | `metaskill_usage` | the first executable MetaSkill step starts; one event counts one run |
+| Runtime | `coding_mode_usage` | a Coding Mode task starts its coding Agent process; one event counts one run |
+
+`metaskill_usage` and `coding_mode_usage` intentionally carry no MetaSkill name,
+prompt, plan, step, command, repository, tool argument, or run identifier. The
+runtime-only events are emitted at their first demonstrated execution boundary,
+are gated by the Growth consent and active cohort receipt, and are counted by
+the dashboard as usage totals plus UTC daily trends. Enabling Coding Mode or
+injecting its turn directive without starting the coding Agent is not counted.
 
 `analytics_user_id` is a random analytics-only UUID. It is not a hash of the
 account ID. On successful registration, the account service stores the mapping

@@ -16,7 +16,10 @@ from opensquilla.telemetry.server.dashboard_queries import (
     DashboardQueries,
     UtcCohortWindow,
 )
-from opensquilla.telemetry.server.storage import TelemetryIngestStorage
+from opensquilla.telemetry.server.storage import (
+    _COMPATIBLE_PREVIOUS_PROTOCOL_FINGERPRINTS,
+    TelemetryIngestStorage,
+)
 
 _EVENT_COLUMNS = (
     "event_id",
@@ -105,6 +108,7 @@ def _insert(
     event_name: str,
     occurred_at: str,
     event_version: int = 1,
+    source: str = "desktop",
     app_version: str | None = "1.0.0",
     outcome: str | None = None,
     error_code: str | None = None,
@@ -113,6 +117,7 @@ def _insert(
     app_session_id: str | None = None,
     acquisition_id: str | None = None,
     analytics_user_id: str | None = None,
+    notice_version: str = "test-v1",
     payload: dict[str, Any] | None = None,
 ) -> None:
     values: dict[str, object] = {
@@ -121,14 +126,14 @@ def _insert(
         "event_name": event_name,
         "event_version": event_version,
         "occurred_at_utc": occurred_at,
-        "source": "desktop",
+        "source": source,
         "app_version": app_version,
         "platform": "macos",
         "outcome": outcome,
         "error_code": error_code,
         "duration_ms": duration_ms,
         "sample_rate": sample_rate,
-        "notice_version": "test-v1",
+        "notice_version": notice_version,
         "app_session_id": app_session_id,
         "acquisition_id": acquisition_id,
         "analytics_user_id": analytics_user_id,
@@ -251,6 +256,28 @@ def test_database_scope_fingerprint_and_schema_are_fail_closed(
 
     with pytest.raises(DashboardDataError, match="incompatible"):
         queries.reliability(_window())
+
+
+@pytest.mark.parametrize(
+    "compatible_fingerprint",
+    sorted(_COMPATIBLE_PREVIOUS_PROTOCOL_FINGERPRINTS),
+)
+def test_compatible_previous_fingerprint_remains_readable_without_migration(
+    tmp_path: Path,
+    compatible_fingerprint: str,
+) -> None:
+    queries, reliability, _ = _queries(tmp_path)
+    with sqlite3.connect(reliability) as connection:
+        connection.execute(
+            "UPDATE meta SET protocol_fingerprint = ? WHERE singleton = 1",
+            (compatible_fingerprint,),
+        )
+    before = reliability.read_bytes()
+
+    result = queries.reliability(_window())
+
+    assert result["appStart"]["estimatedEvents"] == 0
+    assert reliability.read_bytes() == before
 
 
 def test_reliability_queries_return_weighted_aggregates_only(tmp_path: Path) -> None:
@@ -742,4 +769,115 @@ def test_client_usage_counts_distinct_users_and_terminal_overlap(tmp_path: Path)
         {"entrypoint": "gateway_run", "users": 1},
     ]
     assert "不代表全部实际" in result["observablePopulationNote"]
+    _assert_no_sensitive_output(result)
+
+
+def test_metaskill_usage_counts_runs_and_zero_fills_daily_trend(tmp_path: Path) -> None:
+    queries, _, growth = _queries(tmp_path)
+    _insert(
+        growth,
+        sequence=301,
+        event_name="metaskill_usage",
+        occurred_at="2026-09-01T01:00:00.000Z",
+        source="runtime",
+        analytics_user_id="analytics-a",
+        notice_version="growth-v2",
+    )
+    _insert(
+        growth,
+        sequence=302,
+        event_name="metaskill_usage",
+        occurred_at="2026-09-01T02:00:00.000Z",
+        source="runtime",
+        analytics_user_id="analytics-a",
+        notice_version="growth-v2",
+    )
+    _insert(
+        growth,
+        sequence=303,
+        event_name="metaskill_usage",
+        occurred_at="2026-09-03T02:00:00.000Z",
+        source="runtime",
+        analytics_user_id="analytics-b",
+        notice_version="growth-v2",
+    )
+    # Malformed/other-source rows are not part of the v1 usage contract.
+    _insert(
+        growth,
+        sequence=304,
+        event_name="metaskill_usage",
+        occurred_at="2026-09-03T03:00:00.000Z",
+        source="gateway",
+        analytics_user_id="analytics-b",
+        notice_version="growth-v2",
+    )
+    # Feature-use events require the notice that disclosed ongoing usage counts.
+    _insert(
+        growth,
+        sequence=305,
+        event_name="metaskill_usage",
+        occurred_at="2026-09-03T04:00:00.000Z",
+        source="runtime",
+        analytics_user_id="analytics-b",
+        notice_version="growth-v1",
+    )
+
+    result = queries.growth(_window())["metaskillUsage"]
+
+    assert result["totalUses"] == 3
+    assert result["dailyTrend"][0] == {"period": "2026-09-01", "uses": 2}
+    assert result["dailyTrend"][1] == {"period": "2026-09-02", "uses": 0}
+    assert result["dailyTrend"][2] == {"period": "2026-09-03", "uses": 1}
+    _assert_no_sensitive_output(result)
+
+
+def test_coding_mode_usage_counts_started_runs_and_zero_fills_daily_trend(
+    tmp_path: Path,
+) -> None:
+    queries, _, growth = _queries(tmp_path)
+    _insert(
+        growth,
+        sequence=311,
+        event_name="coding_mode_usage",
+        occurred_at="2026-09-01T01:00:00.000Z",
+        source="runtime",
+        analytics_user_id="analytics-a",
+        notice_version="growth-v2",
+    )
+    _insert(
+        growth,
+        sequence=312,
+        event_name="coding_mode_usage",
+        occurred_at="2026-09-03T02:00:00.000Z",
+        source="runtime",
+        analytics_user_id="analytics-b",
+        notice_version="growth-v2",
+    )
+    # Other sources do not satisfy the runtime event contract.
+    _insert(
+        growth,
+        sequence=313,
+        event_name="coding_mode_usage",
+        occurred_at="2026-09-03T03:00:00.000Z",
+        source="gateway",
+        analytics_user_id="analytics-b",
+        notice_version="growth-v2",
+    )
+    _insert(
+        growth,
+        sequence=314,
+        event_name="coding_mode_usage",
+        occurred_at="2026-09-03T04:00:00.000Z",
+        source="runtime",
+        analytics_user_id="analytics-b",
+        notice_version="growth-v1",
+    )
+
+    result = queries.growth(_window())["codingModeUsage"]
+
+    assert result["totalUses"] == 2
+    assert result["dailyTrend"][0] == {"period": "2026-09-01", "uses": 1}
+    assert result["dailyTrend"][1] == {"period": "2026-09-02", "uses": 0}
+    assert result["dailyTrend"][2] == {"period": "2026-09-03", "uses": 1}
+    assert "仅开启模式不计数" in result["note"]
     _assert_no_sensitive_output(result)

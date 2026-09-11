@@ -37,7 +37,7 @@ def _event() -> LandingView:
           "error_code": null,
           "duration_ms": null,
           "consent_scope": "growth",
-          "notice_version": "growth-v1",
+          "notice_version": "growth-v2",
           "sample_rate": 1,
           "acquisition_id": "00000000-0000-4000-8000-000000000012"
         }

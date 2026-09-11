@@ -398,6 +398,11 @@ def test_authenticated_page_and_api_contain_aggregates_but_no_telemetry_ids(
     assert 'id="reliability-hourly-trend"' in page.text
     assert page.text.count('data-hour-utc="') == 24
     assert 'data-hour-utc="0" data-events="2" data-issues="1"' in page.text
+    assert "每日 MetaSkill 使用次数" in page.text
+    assert 'id="metaskill-trend"' in page.text
+    assert "每日编程模式使用次数" in page.text
+    assert "仅开启模式不计数" in page.text
+    assert 'id="coding-mode-trend"' in page.text
     assert "版本稳定性" in page.text
     assert "按客户端版本和源码基准提交分别统计" in page.text
     assert "源码基准 cccccccc" in page.text
@@ -408,6 +413,8 @@ def test_authenticated_page_and_api_contain_aggregates_but_no_telemetry_ids(
     assert api.status_code == 200
     assert api.json()["reliability"]["appStart"]["estimatedEvents"] == 1
     assert len(api.json()["reliability"]["hourlyTrend"]) == 24
+    assert api.json()["growth"]["metaskillUsage"]["totalUses"] == 0
+    assert api.json()["growth"]["codingModeUsage"]["totalUses"] == 0
     assert api.json()["reliability"]["byVersion"] == [
         {
             "appVersion": "1.2.3",

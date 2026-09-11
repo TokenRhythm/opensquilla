@@ -23,6 +23,8 @@ GROWTH_COHORT_SCHEMA_VERSION = 1
 GROWTH_COHORT_STATE_NAME = "growth_cohort.json"
 GATEWAY_GROWTH_MILESTONE_STATE_NAME = "growth_gateway_milestones.json"
 CLIENT_LAUNCH_STATE_NAME = "growth_client_launches.json"
+METASKILL_USAGE_STATE_NAME = "growth_metaskill_usage.json"
+CODING_MODE_USAGE_STATE_NAME = "growth_coding_mode_usage.json"
 DESKTOP_GROWTH_MILESTONE_STATE_NAME = "growth_desktop_milestones.json"
 _MAX_GROWTH_STATE_BYTES = 16 * 1024
 _GROWTH_STATE_LOCK_TIMEOUT_SECONDS = 5.0
@@ -68,6 +70,14 @@ def gateway_growth_milestone_state_path(*, config: Any | None = None) -> Path:
 
 def client_launch_state_path(*, config: Any | None = None) -> Path:
     return growth_telemetry_directory(config=config) / CLIENT_LAUNCH_STATE_NAME
+
+
+def metaskill_usage_state_path(*, config: Any | None = None) -> Path:
+    return growth_telemetry_directory(config=config) / METASKILL_USAGE_STATE_NAME
+
+
+def coding_mode_usage_state_path(*, config: Any | None = None) -> Path:
+    return growth_telemetry_directory(config=config) / CODING_MODE_USAGE_STATE_NAME
 
 
 def read_active_growth_cohort(path: str | Path) -> ActiveGrowthCohort | None:
@@ -130,6 +140,8 @@ def delete_growth_cohort_state(*, config: Any | None = None) -> tuple[Path, ...]
         growth_cohort_state_path(config=config),
         gateway_growth_milestone_state_path(config=config),
         client_launch_state_path(config=config),
+        metaskill_usage_state_path(config=config),
+        coding_mode_usage_state_path(config=config),
         growth_telemetry_directory(config=config) / DESKTOP_GROWTH_MILESTONE_STATE_NAME,
     ):
         with ProfileOperationLock(target, timeout=_GROWTH_STATE_LOCK_TIMEOUT_SECONDS):
@@ -232,8 +244,10 @@ def _is_utc_timestamp(value: str) -> bool:
 
 
 __all__ = [
+    "CODING_MODE_USAGE_STATE_NAME",
     "ActiveGrowthCohort",
     "CLIENT_LAUNCH_STATE_NAME",
+    "METASKILL_USAGE_STATE_NAME",
     "GATEWAY_GROWTH_MILESTONE_STATE_NAME",
     "DESKTOP_GROWTH_MILESTONE_STATE_NAME",
     "GROWTH_COHORT_SCHEMA_VERSION",
@@ -241,7 +255,9 @@ __all__ = [
     "GrowthStateError",
     "delete_growth_cohort_state",
     "client_launch_state_path",
+    "coding_mode_usage_state_path",
     "gateway_growth_milestone_state_path",
+    "metaskill_usage_state_path",
     "growth_cohort_state_path",
     "growth_telemetry_directory",
     "read_active_growth_cohort",

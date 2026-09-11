@@ -61,16 +61,22 @@
       #reliability-trend { display: block; width: 100%; min-height: 285px; overflow: visible; }
       #reliability-hourly-trend { display: block; width: 100%; min-height: 285px; overflow: visible; }
       #terminal-trend { display: block; width: 100%; min-height: 285px; overflow: visible; }
+      #metaskill-trend,
+      #coding-mode-trend { display: block; width: 100%; min-height: 285px; overflow: visible; }
       .chart-empty-note { margin: -9px 0 9px; color: var(--muted); font-size: 11px; text-align: center; }
       .chart-grid { stroke: #e2ecee; stroke-width: 1; }
       .chart-axis { fill: var(--muted); font: 10px "SFMono-Regular",Consolas,monospace; }
       .chart-area { fill: url(#trend-area-fill); }
       .hourly-chart-area { fill: url(#hourly-area-fill); }
       .terminal-chart-area { fill: url(#terminal-area-fill); }
+      .metaskill-chart-area { fill: url(#metaskill-area-fill); }
+      .coding-mode-chart-area { fill: url(#coding-mode-area-fill); }
       .chart-events { fill: none; stroke: var(--teal); stroke-width: 3; stroke-linecap: round; stroke-linejoin: round; }
       .chart-issues { fill: none; stroke: var(--rose); stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; stroke-dasharray: 7 5; }
       .chart-tui { fill: none; stroke: var(--teal); stroke-width: 3; stroke-linecap: round; stroke-linejoin: round; }
       .chart-cli { fill: none; stroke: var(--blue); stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; stroke-dasharray: 7 5; }
+      .chart-metaskill { fill: none; stroke: var(--blue); stroke-width: 3; stroke-linecap: round; stroke-linejoin: round; }
+      .chart-coding-mode { fill: none; stroke: var(--teal); stroke-width: 3; stroke-linecap: round; stroke-linejoin: round; }
       .chart-point { fill: #fff; stroke: var(--teal); stroke-width: 2; }
       .install-chart-area { fill: url(#install-area-fill); }
       .chart-installs { fill: none; stroke: var(--blue); stroke-width: 3; stroke-linecap: round; stroke-linejoin: round; }
@@ -255,6 +261,16 @@
         <div class="trend-summary"><div><span class="badge">终端并集</span><div class="trend-number">{{ client_usage.totals.terminalUsers }}</div><p class="summary-note">TUI {{ client_usage.totals.tuiUsers }} · CLI {{ client_usage.totals.cliUsers }}</p></div><div class="trend-legend"><div class="legend-item"><span class="legend-label"><i class="legend-swatch"></i>TUI 用户</span><span class="legend-value">{{ client_usage.totals.tuiUsers }}</span></div><div class="legend-item"><span class="legend-label"><i class="legend-swatch" style="background:var(--blue)"></i>CLI 用户</span><span class="legend-value">{{ client_usage.totals.cliUsers }}</span></div></div></div>
         <div class="trend-side"><div class="panel-head"><div><h2>每日去重用户趋势</h2><p>{{ client_usage.observablePopulationNote }}</p></div><p>{{ start_date }} → {{ end_date }}</p></div><svg id="terminal-trend" viewBox="0 0 960 285" role="img" aria-label="每日 TUI 与 CLI 去重用户趋势图"></svg>{% if client_usage.totals.terminalUsers == 0 %}<p class="chart-empty-note" role="status">当前时间范围暂无已同意且可观测的终端用户。</p>{% endif %}<div id="terminal-trend-data" hidden>{% for point in client_usage.dailyTrend %}<span data-date="{{ point.period }}" data-tui="{{ point.tuiUsers }}" data-cli="{{ point.cliUsers }}"></span>{% endfor %}</div></div>
       </section>
+      {% set metaskill_usage = summary.growth.metaskillUsage %}
+      <section class="panel trend-panel" id="metaskill-usage">
+        <div class="trend-summary"><div><span class="badge">MetaSkill</span><div class="trend-number">{{ metaskill_usage.totalUses }}</div><p class="summary-note">所选时间段内的使用次数</p></div><div class="trend-legend"><div class="legend-item"><span class="legend-label"><i class="legend-swatch" style="background:var(--blue)"></i>运行次数</span><span class="legend-value">{{ metaskill_usage.totalUses }}</span></div></div></div>
+        <div class="trend-side"><div class="panel-head"><div><h2>每日 MetaSkill 使用次数</h2><p>{{ metaskill_usage.note }}</p></div><p>{{ start_date }} → {{ end_date }}</p></div><svg id="metaskill-trend" viewBox="0 0 960 285" role="img" aria-label="每日 MetaSkill 使用次数趋势图"></svg>{% if metaskill_usage.totalUses == 0 %}<p class="chart-empty-note" role="status">当前时间范围暂无 MetaSkill 使用记录。</p>{% endif %}<div id="metaskill-trend-data" hidden>{% for point in metaskill_usage.dailyTrend %}<span data-date="{{ point.period }}" data-uses="{{ point.uses }}"></span>{% endfor %}</div></div>
+      </section>
+      {% set coding_mode_usage = summary.growth.codingModeUsage %}
+      <section class="panel trend-panel" id="coding-mode-usage">
+        <div class="trend-summary"><div><span class="badge">编程模式</span><div class="trend-number">{{ coding_mode_usage.totalUses }}</div><p class="summary-note">所选时间段内实际执行次数</p></div><div class="trend-legend"><div class="legend-item"><span class="legend-label"><i class="legend-swatch"></i>运行次数</span><span class="legend-value">{{ coding_mode_usage.totalUses }}</span></div></div></div>
+        <div class="trend-side"><div class="panel-head"><div><h2>每日编程模式使用次数</h2><p>{{ coding_mode_usage.note }}</p></div><p>{{ start_date }} → {{ end_date }}</p></div><svg id="coding-mode-trend" viewBox="0 0 960 285" role="img" aria-label="每日编程模式使用次数趋势图"></svg>{% if coding_mode_usage.totalUses == 0 %}<p class="chart-empty-note" role="status">当前时间范围暂无编程模式使用记录。</p>{% endif %}<div id="coding-mode-trend-data" hidden>{% for point in coding_mode_usage.dailyTrend %}<span data-date="{{ point.period }}" data-uses="{{ point.uses }}"></span>{% endfor %}</div></div>
+      </section>
       <section class="breakdown-grid">
         <article class="panel breakdown"><div class="panel-head"><div><h2>终端使用交集</h2><p>同一用户在所选时间范围内的界面覆盖</p></div></div>{% set overlap_max = client_usage.totals.terminalUsers if client_usage.totals.terminalUsers else 1 %}<div class="bar-list">{% for label, value in [('仅 TUI',client_usage.totals.tuiOnly),('仅 CLI',client_usage.totals.cliOnly),('两者都用',client_usage.totals.both)] %}<div class="bar-row"><span class="bar-name">{{ label }}</span><progress max="{{ overlap_max }}" value="{{ value }}"></progress><span class="bar-value">{{ value }}</span></div>{% endfor %}</div></article>
         <article class="panel breakdown"><div class="panel-head"><div><h2>入口分布</h2><p>每个入口按分析用户去重</p></div></div>{% set entry_max = client_usage.totals.terminalUsers if client_usage.totals.terminalUsers else 1 %}<div class="bar-list">{% for item in client_usage.entrypoints %}<div class="bar-row"><span class="bar-name">{{ entrypoint_labels.get(item.entrypoint, '其他入口') }}</span><progress max="{{ entry_max }}" value="{{ item.users }}"></progress><span class="bar-value">{{ item.users }}</span></div>{% else %}<div class="empty">暂无入口数据</div>{% endfor %}</div></article>
@@ -332,6 +348,10 @@
         drawTrend({svgSelector: '#reliability-hourly-trend', data: hourlyData, series: [{key: 'events', lineClass: 'chart-events', pointClass: 'chart-point'}, {key: 'issues', lineClass: 'chart-issues', pointClass: 'chart-point'}], areaId: 'hourly-area-fill', areaClass: 'hourly-chart-area', colors: ['#43a99d'], title: '稳定性事件', axisLabel: hourlyLabel, tooltipText: point => `${hourlyLabel(point)} UTC · 事件量 ${point.events} · 问题量 ${point.issues}`});
         const terminalData = Array.from(document.querySelectorAll('#terminal-trend-data [data-date]')).map(node => ({date: node.dataset.date, tui: Number(node.dataset.tui) || 0, cli: Number(node.dataset.cli) || 0}));
         drawTrend({svgSelector: '#terminal-trend', data: terminalData, series: [{key: 'tui', lineClass: 'chart-tui', pointClass: 'chart-point'}, {key: 'cli', lineClass: 'chart-cli', pointClass: 'install-point'}], areaId: 'terminal-area-fill', areaClass: 'terminal-chart-area', colors: ['#43a99d'], title: 'TUI 用户'});
+        const metaskillData = Array.from(document.querySelectorAll('#metaskill-trend-data [data-date]')).map(node => ({date: node.dataset.date, uses: Number(node.dataset.uses) || 0}));
+        drawTrend({svgSelector: '#metaskill-trend', data: metaskillData, series: [{key: 'uses', lineClass: 'chart-metaskill', pointClass: 'install-point'}], areaId: 'metaskill-area-fill', areaClass: 'metaskill-chart-area', colors: ['#356f9f'], title: 'MetaSkill 使用次数', tooltipText: point => `${point.date} · MetaSkill 使用 ${point.uses} 次`});
+        const codingModeData = Array.from(document.querySelectorAll('#coding-mode-trend-data [data-date]')).map(node => ({date: node.dataset.date, uses: Number(node.dataset.uses) || 0}));
+        drawTrend({svgSelector: '#coding-mode-trend', data: codingModeData, series: [{key: 'uses', lineClass: 'chart-coding-mode', pointClass: 'chart-point'}], areaId: 'coding-mode-area-fill', areaClass: 'coding-mode-chart-area', colors: ['#43a99d'], title: '编程模式使用次数', tooltipText: point => `${point.date} · 编程模式使用 ${point.uses} 次`});
       })();
     </script>
   </body>

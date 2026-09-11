@@ -192,7 +192,13 @@ def test_json_stdout_is_clean_with_marker_on_stderr(monkeypatch):
         artifact_dir="/tmp/x",
     )
     fake.verified = True
-    monkeypatch.setattr(ct_runner, "solve", lambda **kw: fake)
+    captured: dict[str, object] = {}
+
+    def fake_solve(**kwargs):
+        captured.update(kwargs)
+        return fake
+
+    monkeypatch.setattr(ct_runner, "solve", fake_solve)
 
     result = runner.invoke(
         codetask_app,
@@ -205,6 +211,7 @@ def test_json_stdout_is_clean_with_marker_on_stderr(monkeypatch):
     assert "[code-task]" not in result.stdout
     # the run-dir announcement is on stderr.
     assert "[code-task] run started" in result.stderr
+    assert callable(captured["coding_mode_usage_recorder"])
 
 
 # ─── (c) Non-TTY stdin must refuse the confirm prompt ─────────────────────

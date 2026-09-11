@@ -4,11 +4,11 @@ export type DesktopPlatform = 'macos' | 'windows' | 'linux'
 export const CURRENT_NOTICE_VERSION_BY_SCOPE: Readonly<Record<TelemetryScope, string>> =
   Object.freeze({
     reliability: 'reliability-v1',
-    growth: 'growth-v1',
+    growth: 'growth-v2',
   })
 
 export const TELEMETRY_PROTOCOL_FINGERPRINT_SHA256 =
-  '74d821c7d6ea2f3f08b5e27280da24ff17a51a913a165d5314d413d6204c1b7b'
+  '37eef99b9de090a2032669d3caa9cd10f4357061658b2458326595361582732f'
 
 type ResultOutcome = 'success' | 'fail' | 'timeout' | 'cancel'
 

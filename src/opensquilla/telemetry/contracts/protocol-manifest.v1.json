@@ -28,9 +28,11 @@
     { "event_name": "first_app_ready", "event_version": 1, "scope": "growth" },
     { "event_name": "first_turn_started", "event_version": 1, "scope": "growth" },
     { "event_name": "first_turn_result", "event_version": 1, "scope": "growth" },
-    { "event_name": "client_launch", "event_version": 1, "scope": "growth" }
+    { "event_name": "client_launch", "event_version": 1, "scope": "growth" },
+    { "event_name": "metaskill_usage", "event_version": 1, "scope": "growth" },
+    { "event_name": "coding_mode_usage", "event_version": 1, "scope": "growth" }
   ],
   "manifest_version": 1,
-  "notice_versions": { "growth": "growth-v1", "reliability": "reliability-v1" },
+  "notice_versions": { "growth": "growth-v2", "reliability": "reliability-v1" },
   "wire_limits": { "max_event_bytes": 16384, "max_nesting_depth": 16 }
 }

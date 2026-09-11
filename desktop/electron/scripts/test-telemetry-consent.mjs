@@ -79,7 +79,7 @@ assert.deepEqual(changed, {
   reliability: { enabled: false, noticeVersion: null, consentedAtUtc: null },
   growth: {
     enabled: true,
-    noticeVersion: 'growth-v1',
+    noticeVersion: 'growth-v2',
     consentedAtUtc: NOW,
   },
 })
@@ -91,7 +91,7 @@ assert.match(patched, /reliability_diagnostics_enabled = false/)
 assert.doesNotMatch(patched, /reliability_notice_version/)
 assert.doesNotMatch(patched, /reliability_consented_at_utc/)
 assert.match(patched, /product_analytics_enabled = true/)
-assert.match(patched, /product_analytics_notice_version = "growth-v1"/)
+assert.match(patched, /product_analytics_notice_version = "growth-v2"/)
 assert.match(patched, new RegExp(`product_analytics_consented_at_utc = "${NOW.replaceAll('.', '\\.')}`))
 assert.equal((patched.match(/\[privacy\]/g) || []).length, 1)
 assert.match(patched, /\[control_ui\]\r\nenabled = true/)
@@ -109,7 +109,7 @@ try {
     },
     growth: {
       enabled: true,
-      notice_version: 'growth-v1',
+      notice_version: 'growth-v2',
       consented_at_utc: NOW,
       forced_off: false,
     },

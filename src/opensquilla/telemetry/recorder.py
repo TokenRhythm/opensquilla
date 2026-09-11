@@ -63,6 +63,7 @@ class TelemetryRecorder:
         event: StrictTelemetryModel,
         *,
         priority: OutboxPriority | int | None = None,
+        expected_consent_revision: int | None = None,
     ) -> RecordResult:
         """Persist one validated event only under its current saved notice."""
 
@@ -82,6 +83,14 @@ class TelemetryRecorder:
             notice_version=event_notice,
         ) as permit:
             if permit is None:
+                return RecordResult(RecordStatus.CONSENT_BLOCKED)
+            if (
+                expected_consent_revision is not None
+                and permit.revision != expected_consent_revision
+            ):
+                # A disable/re-enable transition between producer preparation
+                # and this irreversible queue commit must not let a new grant
+                # authorize data captured under the old grant.
                 return RecordResult(RecordStatus.CONSENT_BLOCKED)
             result = await self._outbox.enqueue(event, priority=priority)
             return RecordResult(_RECORD_STATUS_BY_ENQUEUE_RESULT[result])

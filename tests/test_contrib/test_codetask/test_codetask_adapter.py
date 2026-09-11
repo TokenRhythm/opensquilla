@@ -83,6 +83,73 @@ def test_sandbox_off_uses_full_host_access_without_workspace_containment(
     assert captured["cwd"] == str(repo)
 
 
+def test_coding_usage_callback_runs_after_agent_process_starts(monkeypatch, tmp_path):
+    captured = {}
+    observed: list[str] = []
+    _install_popen(monkeypatch, captured, stdout='{"status": "ok", "text": "done"}')
+    _isolate_operator_config(monkeypatch, tmp_path)
+    repo = tmp_path / "repo"
+    repo.mkdir()
+
+    out = LocalAdapter().run(
+        "fix it",
+        repo=repo,
+        scratch_dir=tmp_path / "s",
+        artifact_dir=tmp_path / "a",
+        on_agent_started=lambda: observed.append("started"),
+    )
+
+    assert out.success is True
+    assert observed == ["started"]
+
+
+def test_coding_usage_callback_failure_never_changes_agent_result(monkeypatch, tmp_path):
+    captured = {}
+    _install_popen(monkeypatch, captured, stdout='{"status": "ok", "text": "done"}')
+    _isolate_operator_config(monkeypatch, tmp_path)
+    repo = tmp_path / "repo"
+    repo.mkdir()
+
+    def fail_observation() -> None:
+        raise RuntimeError("telemetry unavailable")
+
+    out = LocalAdapter().run(
+        "fix it",
+        repo=repo,
+        scratch_dir=tmp_path / "s",
+        artifact_dir=tmp_path / "a",
+        on_agent_started=fail_observation,
+    )
+
+    assert out.success is True
+
+
+def test_coding_usage_callback_is_not_called_when_agent_does_not_start(
+    monkeypatch,
+    tmp_path,
+):
+    _isolate_operator_config(monkeypatch, tmp_path)
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    observed: list[str] = []
+
+    def fail_popen(*args, **kwargs):
+        raise FileNotFoundError("missing runtime")
+
+    monkeypatch.setattr(adapter.subprocess, "Popen", fail_popen)
+
+    with pytest.raises(RuntimeError, match="could not launch agent interpreter"):
+        LocalAdapter().run(
+            "fix it",
+            repo=repo,
+            scratch_dir=tmp_path / "s",
+            artifact_dir=tmp_path / "a",
+            on_agent_started=lambda: observed.append("started"),
+        )
+
+    assert observed == []
+
+
 def test_legacy_trusted_mode_keeps_restricted_workspace_containment(monkeypatch, tmp_path):
     captured = {}
     _install_popen(monkeypatch, captured, stdout='{"status": "ok", "text": "done", "usage": {}}')
@@ -345,6 +412,8 @@ def test_run_points_agent_at_codetask_config(monkeypatch, tmp_path):
         "OPENSQUILLA_SCHEDULER_DB": str(tmp_path / "scheduler.db"),
         "OPENSQUILLA_META_RUNS_DB": str(tmp_path / "meta-runs.db"),
         "OPENSQUILLA_ROUTER_DECISIONS_DB": str(tmp_path / "router.db"),
+        "OPENSQUILLA_CODING_MODE_ACTIVE": "1",
+        "OPENSQUILLA_CODING_MODE_CONFIG_PATH": str(tmp_path / "parent-config.toml"),
     }
     for name, value in profile_scoped.items():
         monkeypatch.setenv(name, value)
@@ -374,6 +443,8 @@ def test_run_points_agent_at_codetask_config(monkeypatch, tmp_path):
     for name in profile_scoped:
         if name != "OPENSQUILLA_STATE_DIR":
             assert name not in env
+    assert "OPENSQUILLA_CODING_MODE_ACTIVE" not in env
+    assert "OPENSQUILLA_CODING_MODE_CONFIG_PATH" not in env
     for name, value in inherited.items():
         assert env[name] == value
     import tomllib

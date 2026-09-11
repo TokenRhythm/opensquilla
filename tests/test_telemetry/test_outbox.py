@@ -80,7 +80,7 @@ def _growth_event(number: int = 1):
         "error_code": None,
         "duration_ms": None,
         "consent_scope": "growth",
-        "notice_version": "growth-v1",
+        "notice_version": "growth-v2",
         "sample_rate": 1,
         "analytics_user_id": _uuid(901),
     }

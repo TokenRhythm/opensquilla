@@ -3046,6 +3046,12 @@ class Agent:
                 self._tool_context,
             )
         self._meta_run_writer = (self.config.metadata or {}).get("meta_run_writer")
+        # The runtime injects this narrow callback into metadata so nested
+        # MetaSkill agents inherit the same growth sink without carrying the
+        # sink object or any user content through persistence.
+        self._metaskill_usage_recorder = (self.config.metadata or {}).get(
+            "metaskill_usage_recorder"
+        )
         self._pending_warnings: list[WarningEvent] = []
         (
             self._turn_objective_reminder_enabled,
@@ -23711,6 +23717,9 @@ class Agent:
             turn_id=getattr(self, "_turn_id", None),
             memory_persist_enabled=True,
             usage_tracker=self._usage_tracker,
+            metaskill_usage_recorder=self._metaskill_usage_recorder
+            if callable(self._metaskill_usage_recorder)
+            else None,
             skill_runtime_env=skill_runtime_env,
         )
         return orch, llm_chat, tool_invoker

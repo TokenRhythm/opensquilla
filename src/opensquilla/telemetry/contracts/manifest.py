@@ -20,7 +20,7 @@ MAX_TELEMETRY_NESTING_DEPTH: Final = 16
 
 CURRENT_NOTICE_VERSION_BY_SCOPE = MappingProxyType(
     {
-        "growth": "growth-v1",
+        "growth": "growth-v2",
         "reliability": "reliability-v1",
     }
 )
@@ -52,6 +52,8 @@ _EVENT_SPECS: Final = (
     ("first_turn_started", 1, "growth"),
     ("first_turn_result", 1, "growth"),
     ("client_launch", 1, "growth"),
+    ("metaskill_usage", 1, "growth"),
+    ("coding_mode_usage", 1, "growth"),
 )
 
 
