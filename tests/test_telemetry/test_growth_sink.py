@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import json
 import uuid
 from datetime import UTC, datetime
@@ -8,7 +7,6 @@ from types import SimpleNamespace
 
 from opensquilla.telemetry.consent import (
     CURRENT_PRODUCT_ANALYTICS_NOTICE_VERSION,
-    TelemetryScope,
     resolve_scope_consent,
 )
 from opensquilla.telemetry.contracts.common import (
@@ -19,7 +17,6 @@ from opensquilla.telemetry.contracts.common import (
 )
 from opensquilla.telemetry.coordination import scope_consent_coordinator_for
 from opensquilla.telemetry.growth.state import (
-    delete_growth_cohort_state,
     growth_cohort_state_path,
     write_active_growth_cohort,
 )
@@ -110,10 +107,7 @@ async def test_no_consent_creates_no_growth_files_or_event(tmp_path) -> None:
     runtime = CapturingRuntime()
     sink = _sink(runtime, config)
 
-    await sink.start()
     await sink.record_turn_started(STARTED_AT)
-    await asyncio.sleep(0)
-    await sink.close()
 
     assert runtime.events == []
     assert not (tmp_path / "telemetry").exists()
@@ -136,9 +130,8 @@ async def test_started_and_success_are_enqueued_once_in_funnel_order(tmp_path) -
     runtime = CapturingRuntime()
     sink = _sink(runtime, config)
 
-    await sink.record_turn_started(STARTED_AT)
     await sink.record_turn_succeeded(SUCCEEDED_AT)
-    await sink.record_turn_started(SUCCEEDED_AT)
+    await sink.record_turn_started(STARTED_AT)
     await sink.record_turn_succeeded(SUCCEEDED_AT)
 
     assert [event.event_name for event in runtime.events] == [
@@ -147,7 +140,7 @@ async def test_started_and_success_are_enqueued_once_in_funnel_order(tmp_path) -
     ]
     assert [event.source.value for event in runtime.events] == ["gateway", "runtime"]
     assert all(str(event.analytics_user_id) == str(ANALYTICS_ID) for event in runtime.events)
-    assert runtime.events[0].occurred_at_utc == STARTED_AT
+    assert runtime.events[0].occurred_at_utc == SUCCEEDED_AT
     state = read_gateway_growth_milestone_state(sink.marker_path)
     assert state.first_turn_started is not None
     assert state.first_turn_started.status is GrowthMilestoneStatus.ENQUEUED
@@ -155,171 +148,28 @@ async def test_started_and_success_are_enqueued_once_in_funnel_order(tmp_path) -
     assert state.first_turn_result.status is GrowthMilestoneStatus.ENQUEUED
 
 
-async def test_pending_first_turn_retries_without_another_turn(tmp_path, monkeypatch) -> None:
-    monkeypatch.setattr("opensquilla.telemetry.growth_sink._RETRY_INITIAL_SECONDS", 0.01)
+async def test_pending_first_turn_is_replayed_on_next_boundary(tmp_path) -> None:
     config = _config(tmp_path)
     _activate(config)
-    runtime = CapturingRuntime([RecordStatus.EVICTED, RecordStatus.EVICTED])
+    runtime = CapturingRuntime([RecordStatus.EVICTED, RecordStatus.RECORDED])
     sink = _sink(runtime, config)
 
-    await sink.start()
     await sink.record_turn_started(STARTED_AT)
     pending = read_gateway_growth_milestone_state(sink.marker_path)
     assert pending.first_turn_started is not None
     assert pending.first_turn_started.status is GrowthMilestoneStatus.PENDING
     pending_id = pending.first_turn_started.event.event_id
 
-    async with asyncio.timeout(1):
-        while len(runtime.events) < 3:
-            await asyncio.sleep(0.001)
-    await sink.close()
+    await sink.replay_pending()
 
     assert [event.event_name for event in runtime.events] == [
         "first_turn_started",
         "first_turn_started",
-        "first_turn_started",
     ]
-    assert all(event.event_id == pending_id for event in runtime.events)
-    assert all(event.occurred_at_utc == STARTED_AT for event in runtime.events)
+    assert runtime.events[1].event_id == pending_id
     replayed = read_gateway_growth_milestone_state(sink.marker_path)
     assert replayed.first_turn_started is not None
     assert replayed.first_turn_started.status is GrowthMilestoneStatus.ENQUEUED
-
-
-async def test_pending_start_blocks_success_until_startup_recovery(tmp_path) -> None:
-    config = _config(tmp_path)
-    _activate(config)
-    runtime = CapturingRuntime([RecordStatus.EVICTED])
-    sink = _sink(runtime, config)
-
-    await sink.record_turn_started(STARTED_AT)
-    await sink.record_turn_succeeded(SUCCEEDED_AT)
-    await sink.close()
-
-    pending = read_gateway_growth_milestone_state(sink.marker_path)
-    assert pending.first_turn_started is not None
-    assert pending.first_turn_result is not None
-    assert pending.first_turn_started.status is GrowthMilestoneStatus.PENDING
-    assert pending.first_turn_result.status is GrowthMilestoneStatus.PENDING
-    assert [event.event_name for event in runtime.events] == ["first_turn_started"]
-
-    recovered_runtime = CapturingRuntime()
-    recovered = _sink(recovered_runtime, _config(tmp_path))
-    await recovered.start()
-    await recovered.start()
-    async with asyncio.timeout(1):
-        while len(recovered_runtime.events) < 2:
-            await asyncio.sleep(0.001)
-    await recovered.close()
-
-    assert recovered_runtime.events == [
-        pending.first_turn_started.event,
-        pending.first_turn_result.event,
-    ]
-    complete = read_gateway_growth_milestone_state(recovered.marker_path)
-    assert complete.first_turn_started is not None
-    assert complete.first_turn_result is not None
-    assert complete.first_turn_started.status is GrowthMilestoneStatus.ENQUEUED
-    assert complete.first_turn_result.status is GrowthMilestoneStatus.ENQUEUED
-
-
-async def test_success_does_not_invent_a_missing_start(tmp_path) -> None:
-    config = _config(tmp_path)
-    _activate(config)
-    runtime = CapturingRuntime()
-    sink = _sink(runtime, config)
-
-    await sink.record_turn_succeeded(SUCCEEDED_AT)
-
-    assert runtime.events == []
-    assert not sink.marker_path.exists()
-
-
-async def test_retry_stops_after_revocation_without_backfill(tmp_path, monkeypatch) -> None:
-    monkeypatch.setattr("opensquilla.telemetry.growth_sink._RETRY_INITIAL_SECONDS", 0.01)
-    config = _config(tmp_path)
-    _activate(config)
-    runtime = CapturingRuntime([RecordStatus.EVICTED, RecordStatus.EVICTED])
-    sink = _sink(runtime, config)
-    await sink.start()
-    await sink.record_turn_started(STARTED_AT)
-    await sink.record_turn_succeeded(SUCCEEDED_AT)
-    async with asyncio.timeout(1):
-        while len(runtime.events) < 2:
-            await asyncio.sleep(0.001)
-
-    coordinator = scope_consent_coordinator_for(config)
-    async with coordinator.transition(TelemetryScope.GROWTH):
-        config.privacy.product_analytics_enabled = False
-        delete_growth_cohort_state(config=config)
-    await asyncio.sleep(0.03)
-    assert len(runtime.events) == 2
-
-    config.privacy.product_analytics_enabled = True
-    sink.observe_turn_started()
-    sink.observe_turn_succeeded()
-    await sink.close()
-
-    assert len(runtime.events) == 2
-    assert not sink.marker_path.exists()
-
-
-async def test_startup_replay_requires_current_consent(tmp_path) -> None:
-    config = _config(tmp_path)
-    _activate(config)
-    runtime = CapturingRuntime([RecordStatus.EVICTED])
-    sink = _sink(runtime, config)
-    await sink.record_turn_started(STARTED_AT)
-    await sink.close()
-
-    disabled_runtime = CapturingRuntime()
-    disabled = _sink(disabled_runtime, _config(tmp_path, enabled=False))
-    await disabled.start()
-    await asyncio.sleep(0)
-    await disabled.close()
-
-    assert disabled_runtime.events == []
-
-
-async def test_replay_does_not_recreate_a_marker_deleted_after_read(tmp_path, monkeypatch) -> None:
-    config = _config(tmp_path)
-    _activate(config)
-    runtime = CapturingRuntime([RecordStatus.EVICTED])
-    sink = _sink(runtime, config)
-    await sink.record_turn_started(STARTED_AT)
-
-    def read_then_remove(path):
-        state = read_gateway_growth_milestone_state(path)
-        path.unlink(missing_ok=True)
-        return state
-
-    monkeypatch.setattr(
-        "opensquilla.telemetry.growth_sink.read_gateway_growth_milestone_state",
-        read_then_remove,
-    )
-    await sink.replay_pending()
-
-    assert len(runtime.events) == 1
-    assert not sink.marker_path.exists()
-
-
-async def test_close_cancels_retry_backoff(tmp_path, monkeypatch) -> None:
-    monkeypatch.setattr("opensquilla.telemetry.growth_sink._RETRY_INITIAL_SECONDS", 60)
-    config = _config(tmp_path)
-    _activate(config)
-    runtime = CapturingRuntime([RecordStatus.EVICTED, RecordStatus.EVICTED])
-    sink = _sink(runtime, config)
-    await sink.start()
-    await sink.record_turn_started(STARTED_AT)
-    async with asyncio.timeout(1):
-        while len(runtime.events) < 2:
-            await asyncio.sleep(0.001)
-        await sink.close()
-
-    assert len(runtime.events) == 2
-    pending = read_gateway_growth_milestone_state(sink.marker_path)
-    assert pending.first_turn_started is not None
-    assert pending.first_turn_started.status is GrowthMilestoneStatus.PENDING
 
 
 async def test_evicted_event_keeps_stable_pending_payload_for_retry(tmp_path) -> None:

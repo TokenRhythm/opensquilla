@@ -312,15 +312,8 @@ try {
     runtime.synchronize(factPaths)
     fakeClock.advance(500)
     runtime.recordMonitoredRequest(30_001)
-    writeFileSync(join(factPaths.spoolRoot, 'reliability',
-      `.desktop-reliability-turns-${uuid(100)}.tmp`), JSON.stringify({
-      schema_version: 1,
-      app_session_id: uuid(100),
-      turn_count: 2,
-      stalled_turn_count: 1,
-      stall_count: 2,
-      last_observed_at_ms: fakeClock.nowMs(),
-    }))
+    runtime.recordTurn(false)
+    runtime.recordTurn(true)
     runtime.recordAppStartResult({
       outcome: 'success',
       durationMs: 500,
@@ -359,7 +352,6 @@ try {
     assert.equal(summary.slow_request_count, 1)
     assert.equal(summary.turn_count, 2)
     assert.equal(summary.stalled_turn_count, 1)
-    assert.equal(summary.stall_count, 2)
     assert.equal(summary.foreground_duration_ms, 1_000)
     assert.equal(summary.background_duration_ms, 0)
     assert.equal(
@@ -372,59 +364,6 @@ try {
     ]) {
       assert.equal(serialized.includes(forbidden), false, `forbidden telemetry field: ${forbidden}`)
     }
-  }
-
-  // A failed summary enqueue freezes Gateway totals for a byte-stable retry.
-  {
-    const retryRoot = join(root, 'turn-count-retry')
-    const retryPaths = paths(retryRoot)
-    await writeReliabilityConsent(retryPaths.consentMirrorPath, true)
-    const fakeClock = clock()
-    const first = telemetry({ clock: fakeClock, appSessionId: uuid(150) })
-    first.synchronize(retryPaths)
-    const counterPath = join(retryPaths.spoolRoot, 'reliability',
-      `.desktop-reliability-turns-${uuid(150)}.tmp`)
-    const counters = { schema_version: 1, app_session_id: uuid(150), turn_count: 2,
-      stalled_turn_count: 1, stall_count: 2, last_observed_at_ms: fakeClock.nowMs() }
-    writeFileSync(counterPath, JSON.stringify(counters))
-    first.emitPerformanceSummary = () => ({ status: 'dropped', reason: 'io_error' })
-    first.finishSession()
-    const frozen = JSON.parse(readFileSync(join(retryPaths.spoolRoot, 'reliability',
-      '.desktop-reliability-session.tmp'), 'utf8'))
-    assert.equal(frozen.gateway_turn_counts_applied, true)
-    assert.equal(frozen.performance.turn_count, 2)
-    writeFileSync(counterPath, JSON.stringify({ ...counters, turn_count: 100 }))
-    const second = telemetry({ clock: fakeClock, appSessionId: uuid(151) })
-    second.synchronize(retryPaths)
-    const summary = readyEvents(retryRoot).find((event) => event.event_name === 'performance_summary')
-    assert.equal(summary.event_id, frozen.recovered_performance_event_id)
-    assert.equal(summary.turn_count, 2)
-    assert.equal(summary.stalled_turn_count, 1)
-    assert.equal(summary.stall_count, 2)
-    assert.equal(existsSync(counterPath), false)
-    second.finishSession()
-  }
-
-  // The prior schema-2 session remains recoverable without a Gateway checkpoint.
-  {
-    const previousRoot = join(root, 'schema-two')
-    const previousPaths = paths(previousRoot)
-    await writeReliabilityConsent(previousPaths.consentMirrorPath, true)
-    const fakeClock = clock()
-    telemetry({ clock: fakeClock, appSessionId: uuid(160) }).synchronize(previousPaths)
-    const markerPath = join(previousPaths.spoolRoot, 'reliability', '.desktop-reliability-session.tmp')
-    const marker = JSON.parse(readFileSync(markerPath, 'utf8'))
-    marker.schema_version = 2
-    delete marker.consent_generation
-    delete marker.gateway_turn_counts_applied
-    writeFileSync(markerPath, JSON.stringify(marker))
-    const second = telemetry({ clock: fakeClock, appSessionId: uuid(161) })
-    second.synchronize(previousPaths)
-    const summary = readyEvents(previousRoot).find((event) => event.event_name === 'performance_summary')
-    assert.equal(summary.app_session_id, uuid(160))
-    assert.equal(summary.summary_kind, 'recovered_abnormal')
-    assert.equal(summary.turn_count, 0)
-    second.finishSession()
   }
 
   // A renderer crash is persisted as closed facts and reported once on the next launch.
@@ -541,8 +480,6 @@ try {
       'app_start_stage',
       'app_start_result',
       'app_start_result_emitted',
-      'consent_generation',
-      'gateway_turn_counts_applied',
     ]) delete marker[field]
     marker.schema_version = 1
     writeFileSync(sessionPath, `${JSON.stringify(marker)}\n`)
@@ -720,8 +657,6 @@ try {
       'app_start_stage',
       'app_start_result',
       'app_start_result_emitted',
-      'consent_generation',
-      'gateway_turn_counts_applied',
     ]) delete template[field]
     template.schema_version = 1
     template.clean_exit = false

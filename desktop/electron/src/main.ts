@@ -83,8 +83,6 @@ import { runTelemetrySideEffectFailOpen } from './telemetry/fail-open.js'
 import {
   clearDesktopGrowthTelemetryState,
   DesktopGrowthTelemetry,
-  parseDesktopOnboardingReceipt,
-  type DesktopOnboardingReceipt,
 } from './telemetry/growth.js'
 import { buildCliInvocation } from './cli-invocation.js'
 import {
@@ -286,7 +284,6 @@ interface DesktopConnection {
   importTransactionId: string
   createdAt: string
   updatedAt: string
-  growthOnboardingReceipt?: DesktopOnboardingReceipt
 }
 
 interface OnboardingPayload {
@@ -1751,9 +1748,6 @@ function classifyAppStartFailure(error: unknown): {
 }
 
 function finishAppStartSuccess(): void {
-  // Growth owns its durable milestone dedupe; an earlier failed startup result
-  // must not suppress the first successful ready transition in this process.
-  desktopGrowthTelemetry.recordFirstAppReady()
   if (appStartResultRecorded) return
   appStartResultRecorded = true
   desktopReliabilityTelemetry.recordAppStartResult({
@@ -1762,6 +1756,7 @@ function finishAppStartSuccess(): void {
     failureStage: null,
     errorCode: null,
   })
+  desktopGrowthTelemetry.recordFirstAppReady()
 }
 
 function finishAppStartFailure(
@@ -2628,10 +2623,6 @@ async function syncDesktopConsentMirror(profile = activeDesktopProfile()): Promi
   if (consent.growth.enabled === false) {
     clearDesktopGrowthTelemetryState(desktopTelemetryDirectory(profile, configRaw))
   }
-  const credentialRaw = await readOptionalDesktopText(profile.credentialPath)
-  const credential = credentialRaw === null
-    ? null
-    : normalizeDesktopCredential(JSON.parse(credentialRaw) as Partial<DesktopConnection>)
   desktopTelemetryRuntimeGate.openAfterConsentSync()
   desktopReliabilityTelemetry.synchronize({
     spoolRoot: desktopEarlyTelemetrySpoolPath(profile, configRaw),
@@ -2642,7 +2633,7 @@ async function syncDesktopConsentMirror(profile = activeDesktopProfile()): Promi
     telemetryDirectory: desktopTelemetryDirectory(profile, configRaw),
     spoolRoot: desktopEarlyTelemetrySpoolPath(profile, configRaw),
     consentMirrorPath: desktopConsentMirrorPath(profile, configRaw),
-  }, credential?.configAuthority === 'generated' ? credential.growthOnboardingReceipt : null)
+  })
   refreshDesktopReliabilityForegroundState()
 }
 
@@ -2809,7 +2800,6 @@ function normalizeDesktopCredential(parsed: Partial<DesktopConnection>): Desktop
     throw new Error('Desktop credential config authority does not match its import transaction.')
   }
   const now = new Date().toISOString()
-  const onboardingReceipt = parseDesktopOnboardingReceipt(parsed.growthOnboardingReceipt)
   return {
     provider,
     model: parsed.model || routerDefaultModel(routerTiers, routerDefaultTier) || defaults.model,
@@ -2829,7 +2819,6 @@ function normalizeDesktopCredential(parsed: Partial<DesktopConnection>): Desktop
     importTransactionId,
     createdAt: parsed.createdAt || now,
     updatedAt: parsed.updatedAt || now,
-    ...(onboardingReceipt ? { growthOnboardingReceipt: onboardingReceipt } : {}),
   }
 }
 
@@ -3052,7 +3041,6 @@ async function loadDesktopCredential(): Promise<DesktopConnection | null> {
 async function saveDesktopCredential(
   payload: OnboardingPayload,
   writerReserved = false,
-  completingOnboarding = false,
 ): Promise<DesktopConnection> {
   const targetProfile = activeDesktopProfile()
   const expectedCredential = await readOptionalDesktopText(targetProfile.credentialPath)
@@ -3126,12 +3114,6 @@ async function saveDesktopCredential(
   }
 
   const now = new Date().toISOString()
-  // Publish the receipt with the same recoverable settings transaction. It is
-  // valid only for the explicit consent grant made by a verified fresh profile.
-  const onboardingReceipt = completingOnboarding && !disableNetworkObservability && consentOverride !== null
-    ? desktopGrowthTelemetry.prepareOnboardingReceipt(targetProfile.home, consentOverride.growth)
-    : null
-  const persistedOnboardingReceipt = onboardingReceipt ?? existing?.growthOnboardingReceipt
   const credential: DesktopConnection = {
     provider,
     model,
@@ -3151,7 +3133,6 @@ async function saveDesktopCredential(
     importTransactionId: '',
     createdAt: existing?.createdAt || now,
     updatedAt: now,
-    ...(persistedOnboardingReceipt ? { growthOnboardingReceipt: persistedOnboardingReceipt } : {}),
   }
 
   const finishWriter = writerReserved
@@ -14193,7 +14174,7 @@ async function performOnboardingSave(
             payload,
           )
         }
-        return await saveDesktopCredential(payload, true, true)
+        return await saveDesktopCredential(payload, true)
       })
       telemetry.markSettingsPersistedConfirmed()
       await telemetry.stage('local_finalize', async () => {

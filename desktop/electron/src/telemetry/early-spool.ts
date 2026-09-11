@@ -31,19 +31,15 @@ export const EARLY_SPOOL_DURABLE_MARKER_RESERVATION_BYTES = 32 * 1024
 export const DESKTOP_RELIABILITY_SESSION_MARKER_NAME = '.desktop-reliability-session.tmp'
 export const DESKTOP_UPDATE_TRANSITION_MARKER_NAME = '.desktop-update-transition.tmp'
 export const DESKTOP_RELIABILITY_RECOVERY_MARKER_PREFIX = '.desktop-reliability-recovery-'
-export const DESKTOP_RELIABILITY_TURN_MARKER_PREFIX = '.desktop-reliability-turns-'
 
 function isDurableTelemetryMarker(name: string): boolean {
   return name === DESKTOP_RELIABILITY_SESSION_MARKER_NAME
     || name === DESKTOP_UPDATE_TRANSITION_MARKER_NAME
     || (
-      (name.startsWith(DESKTOP_RELIABILITY_RECOVERY_MARKER_PREFIX)
-        || name.startsWith(DESKTOP_RELIABILITY_TURN_MARKER_PREFIX))
+      name.startsWith(DESKTOP_RELIABILITY_RECOVERY_MARKER_PREFIX)
       && name.endsWith('.tmp')
       && /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(name.slice(
-        name.startsWith(DESKTOP_RELIABILITY_RECOVERY_MARKER_PREFIX)
-          ? DESKTOP_RELIABILITY_RECOVERY_MARKER_PREFIX.length
-          : DESKTOP_RELIABILITY_TURN_MARKER_PREFIX.length,
+        DESKTOP_RELIABILITY_RECOVERY_MARKER_PREFIX.length,
         -'.tmp'.length,
       ))
     )

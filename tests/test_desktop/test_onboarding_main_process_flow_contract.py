@@ -110,7 +110,7 @@ def test_onboarding_save_preserves_recovery_and_writer_ordering() -> None:
     marker = save.index("() => readPendingMigrationProviderSetup()")
     settings_stage = save.index("telemetry.stage('settings_persist'")
     imported = save.index("await saveImportedDesktopCredential(")
-    ordinary = save.index("await saveDesktopCredential(payload, true, true)")
+    ordinary = save.index("await saveDesktopCredential(payload, true)")
     refresh_keychain = save.index("invalidateSecretStorageBackendCache()")
     settings_persisted = save.index("telemetry.markSettingsPersistedConfirmed()")
     finalize_stage = save.index("telemetry.stage('local_finalize'")

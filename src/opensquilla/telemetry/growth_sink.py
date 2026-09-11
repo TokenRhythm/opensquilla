@@ -70,8 +70,6 @@ CODING_MODE_USAGE_SCHEMA_VERSION = 1
 _CODING_MODE_USAGE_MARKER_KIND = "growth_coding_mode_usage"
 _MAX_ENQUEUED_FEATURE_USAGE_RECORDS = 24
 _FEATURE_USAGE_RUN_KEY_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")
-_RETRY_INITIAL_SECONDS = 1.0
-_RETRY_MAX_SECONDS = 60.0
 
 FeatureUsageEvent = MetaSkillUsage | CodingModeUsage
 GrowthMilestoneEvent = FirstTurnStarted | FirstTurnSucceeded | ClientLaunch | FeatureUsageEvent
@@ -149,8 +147,7 @@ class GrowthEventSink:
         )
         self._lock = asyncio.Lock()
         self._tasks: set[asyncio.Task[Any]] = set()
-        self._retry_requested = asyncio.Event()
-        self._retry_task: asyncio.Task[None] | None = None
+        self._first_turn_started_at: datetime | None = None
         self._closed = False
 
     @property
@@ -169,16 +166,6 @@ class GrowthEventSink:
 
         return self._coding_mode_usage_path
 
-    async def start(self) -> None:
-        """Recover pending milestones and keep retrying without another turn."""
-
-        if self._closed or self._retry_task is not None:
-            return
-        self._retry_task = asyncio.create_task(
-            self._retry_loop(), name="telemetry-growth-replay"
-        )
-        self._retry_requested.set()
-
     def observe_turn_started(self) -> None:
         """Capture the public-user turn boundary without receiving its content."""
 
@@ -187,6 +174,9 @@ class GrowthEventSink:
         occurred_at = self._safe_now()
         if occurred_at is None:
             return
+        if self._first_turn_started_at is None:
+            self._first_turn_started_at = occurred_at
+        self._schedule(self.replay_pending())
         self._schedule(self.record_turn_started(occurred_at))
 
     def observe_turn_succeeded(self) -> None:
@@ -197,6 +187,7 @@ class GrowthEventSink:
         occurred_at = self._safe_now()
         if occurred_at is None:
             return
+        self._schedule(self.replay_pending())
         self._schedule(self.record_turn_succeeded(occurred_at))
 
     def observe_metaskill_usage(self, run_id: str) -> None:
@@ -242,7 +233,12 @@ class GrowthEventSink:
         )
 
     async def replay_pending(self) -> None:
-        """Retry only existing payloads, preserving their IDs and timestamps."""
+        """Retry durable first-turn events before creating a new one.
+
+        The marker is written before enqueue, so a transient enqueue failure
+        must be replayed on the next runtime boundary even when the user does
+        not submit another successful turn.
+        """
 
         if self._closed:
             return
@@ -251,9 +247,7 @@ class GrowthEventSink:
             for name in ("first_turn_started", "first_turn_result"):
                 record = state.record_for(name)
                 if record is not None and record.status is GrowthMilestoneStatus.PENDING:
-                    await self._record_milestone(
-                        name, record.event.occurred_at_utc, replay_only=True
-                    )
+                    await self._record_milestone(name, record.event.occurred_at_utc)
         except (GrowthStateError, IdentityStateError, OSError, ValueError, TypeError):
             log.debug("growth milestone replay rejected", exc_info=True)
 
@@ -261,6 +255,11 @@ class GrowthEventSink:
         await self._record_milestone("first_turn_started", occurred_at)
 
     async def record_turn_succeeded(self, occurred_at: datetime) -> None:
+        # A crash or scheduling race must never produce a success with no
+        # started predecessor. Reusing the captured start time also preserves
+        # event order when both callbacks settle concurrently.
+        started_at = self._first_turn_started_at or occurred_at
+        await self._record_milestone("first_turn_started", started_at)
         await self._record_milestone("first_turn_result", occurred_at)
 
     async def record_metaskill_usage(
@@ -297,42 +296,6 @@ class GrowthEventSink:
             occurred_at=occurred_at,
             event_name="coding_mode_usage",
         )
-
-    async def _retry_loop(self) -> None:
-        while True:
-            await self._retry_requested.wait()
-            self._retry_requested.clear()
-            delay = _RETRY_INITIAL_SECONDS
-            while await self._has_pending():
-                await self.replay_pending()
-                if not await self._has_pending():
-                    break
-                await asyncio.sleep(delay)
-                delay = min(delay * 2, _RETRY_MAX_SECONDS)
-
-    async def _has_pending(self) -> bool:
-        notice_version = CURRENT_NOTICE_VERSION_BY_SCOPE[TelemetryScope.GROWTH.value]
-        try:
-            async with self._coordinator.authorized(
-                TelemetryScope.GROWTH,
-                checkpoint=ConsentCheckpoint.ENQUEUE,
-                notice_version=notice_version,
-            ) as permit:
-                if permit is None or self._closed:
-                    return False
-                identity_value = self._active_identity_value()
-                if identity_value is None:
-                    return False
-                state = read_gateway_growth_milestone_state(self._marker_path)
-                return any(
-                    record is not None
-                    and record.status is GrowthMilestoneStatus.PENDING
-                    and str(record.event.analytics_user_id) == identity_value
-                    for record in (state.first_turn_started, state.first_turn_result)
-                )
-        except (GrowthStateError, IdentityStateError, OSError, ValueError, TypeError):
-            log.debug("growth milestone retry state rejected", exc_info=True)
-            return False
 
     async def record_client_launch(
         self,
@@ -704,11 +667,6 @@ class GrowthEventSink:
         if self._closed:
             return
         self._closed = True
-        retry_task = self._retry_task
-        self._retry_task = None
-        if retry_task is not None:
-            retry_task.cancel()
-            await asyncio.gather(retry_task, return_exceptions=True)
         pending = tuple(self._tasks)
         if pending:
             await asyncio.gather(*pending, return_exceptions=True)
@@ -737,15 +695,13 @@ class GrowthEventSink:
         self,
         name: GrowthMilestoneName,
         occurred_at: datetime,
-        *,
-        replay_only: bool = False,
     ) -> None:
         if not _valid_utc_datetime(occurred_at):
             return
         async with self._lock:
             try:
                 await self._retry_pending_feature_usage_locked()
-                prepared = await self._prepare_event(name, occurred_at, replay_only=replay_only)
+                prepared = await self._prepare_event(name, occurred_at)
                 if prepared is None:
                     return
                 event, consent_revision = prepared
@@ -762,16 +718,11 @@ class GrowthEventSink:
                 log.debug("growth milestone state rejected", exc_info=True)
             except Exception:
                 log.debug("growth milestone persistence failed", exc_info=True)
-            finally:
-                if not self._closed and asyncio.current_task() is not self._retry_task:
-                    self._retry_requested.set()
 
     async def _prepare_event(
         self,
         name: GrowthMilestoneName,
         occurred_at: datetime,
-        *,
-        replay_only: bool,
     ) -> tuple[GrowthMilestoneEvent, int] | None:
         notice_version = CURRENT_NOTICE_VERSION_BY_SCOPE[TelemetryScope.GROWTH.value]
         async with self._coordinator.authorized(
@@ -790,11 +741,6 @@ class GrowthEventSink:
             ):
                 state = read_gateway_growth_milestone_state(self._marker_path)
                 existing = state.record_for(name)
-                predecessor = state.first_turn_started
-                if name == "first_turn_result" and predecessor is None:
-                    # A success cannot reconstruct a start that was never
-                    # captured under consent, including after revocation.
-                    return None
                 if existing is not None:
                     if str(existing.event.analytics_user_id) != identity_value:
                         raise GrowthStateError(
@@ -802,25 +748,16 @@ class GrowthEventSink:
                         )
                     if existing.status is GrowthMilestoneStatus.ENQUEUED:
                         return None
-                    event = existing.event
-                else:
-                    if replay_only:
-                        return None
-                    event = self._build_event(name, occurred_at, identity_value)
-                    pending = state.with_record(
-                        name,
-                        GrowthMilestoneRecord(
-                            status=GrowthMilestoneStatus.PENDING,
-                            event=event,
-                        ),
-                    )
-                    write_gateway_growth_milestone_state(self._marker_path, pending)
-                if name == "first_turn_result" and (
-                    predecessor is None
-                    or predecessor.status is not GrowthMilestoneStatus.ENQUEUED
-                    or str(predecessor.event.analytics_user_id) != identity_value
-                ):
-                    return None
+                    return existing.event, permit.revision
+                event = self._build_event(name, occurred_at, identity_value)
+                pending = state.with_record(
+                    name,
+                    GrowthMilestoneRecord(
+                        status=GrowthMilestoneStatus.PENDING,
+                        event=event,
+                    ),
+                )
+                write_gateway_growth_milestone_state(self._marker_path, pending)
                 return event, permit.revision
 
     async def _acknowledge_event(

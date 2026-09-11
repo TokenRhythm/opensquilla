@@ -32,7 +32,6 @@ import {
   EARLY_SPOOL_DURABLE_MARKER_RESERVATION_BYTES,
   DESKTOP_RELIABILITY_RECOVERY_MARKER_PREFIX,
   DESKTOP_RELIABILITY_SESSION_MARKER_NAME,
-  DESKTOP_RELIABILITY_TURN_MARKER_PREFIX,
   DESKTOP_UPDATE_TRANSITION_MARKER_NAME,
   DesktopTelemetryRuntimeGate,
   spoolEarlyTelemetryEvent,
@@ -166,7 +165,7 @@ interface PersistedAppStartResult {
 }
 
 interface SessionMarker {
-  schema_version: 3
+  schema_version: 2
   marker_kind: 'desktop_reliability_session'
   app_session_id: string
   app_version: string
@@ -183,8 +182,6 @@ interface SessionMarker {
   crash_detected_emitted: boolean
   clean_exit: boolean
   performance_summary_emitted: boolean
-  consent_generation: string | null
-  gateway_turn_counts_applied: boolean
   performance: PerformanceSnapshot
 }
 
@@ -224,6 +221,8 @@ class PerformanceAccumulator {
   private foreground = false
   private foregroundMs = 0
   private backgroundMs = 0
+  private turnCount = 0
+  private stalledTurnCount = 0
   private stallCount = 0
   private monitoredRequestCount = 0
   private slowRequestCount = 0
@@ -242,6 +241,8 @@ class PerformanceAccumulator {
     this.foreground = foreground
     this.foregroundMs = 0
     this.backgroundMs = 0
+    this.turnCount = 0
+    this.stalledTurnCount = 0
     this.stallCount = 0
     this.monitoredRequestCount = 0
     this.slowRequestCount = 0
@@ -276,6 +277,11 @@ class PerformanceAccumulator {
     return true
   }
 
+  recordTurn(stalled: boolean): void {
+    this.turnCount = boundedCount(this.turnCount + 1)
+    if (stalled) this.stalledTurnCount = boundedCount(this.stalledTurnCount + 1)
+  }
+
   snapshot(): { durationMs: number; performance: PerformanceSnapshot } {
     const now = this.nowMs()
     const elapsedInState = boundedDuration(now - this.stateStartedAtMs)
@@ -296,8 +302,8 @@ class PerformanceAccumulator {
     return {
       durationMs,
       performance: {
-        turn_count: 0,
-        stalled_turn_count: 0,
+        turn_count: this.turnCount,
+        stalled_turn_count: this.stalledTurnCount,
         stall_count: boundedCount(this.stallCount + activeStall),
         monitored_request_count: this.monitoredRequestCount,
         slow_request_count: this.slowRequestCount,
@@ -473,6 +479,21 @@ export class DesktopReliabilityTelemetry {
       }
     } catch {
       // Request counters cannot affect the observed request.
+    }
+  }
+
+  /** Record one terminal dialogue turn in the session aggregate. */
+  recordTurn(stalled = false): void {
+    if (!this.prepareActivity()) return
+    try {
+      this.performance.recordTurn(stalled)
+      this.requestCheckpointCounter += 1
+      if (this.requestCheckpointCounter >= 32) {
+        this.requestCheckpointCounter = 0
+        this.checkpointSession()
+      }
+    } catch {
+      // Performance counters cannot affect the observed turn.
     }
   }
 
@@ -691,7 +712,7 @@ export class DesktopReliabilityTelemetry {
     this.performance.reset(this.desiredForeground)
     const nowMs = Math.floor(this.nowMs())
     const marker: SessionMarker = {
-      schema_version: 3,
+      schema_version: 2,
       marker_kind: 'desktop_reliability_session',
       app_session_id: this.appSessionId,
       app_version: this.telemetryAppVersion(),
@@ -708,8 +729,6 @@ export class DesktopReliabilityTelemetry {
       crash_detected_emitted: false,
       clean_exit: false,
       performance_summary_emitted: false,
-      consent_generation: this.consentGrantGeneration,
-      gateway_turn_counts_applied: false,
       performance: emptyPerformanceSnapshot(),
     }
     if (!this.writeSessionMarker(marker)) return
@@ -739,7 +758,6 @@ export class DesktopReliabilityTelemetry {
     // the same cap before creating another marker.
     for (const entry of recovered.slice(0, overflow)) {
       this.removeManagedMarker(entry.name)
-      this.removeManagedMarker(turnMarkerName(entry.marker.app_session_id))
     }
     for (const { name, marker } of recovered.slice(overflow)) {
       this.flushSessionMarker(name, marker)
@@ -776,12 +794,6 @@ export class DesktopReliabilityTelemetry {
     allowCrashFact = true,
   ): void {
     let marker = initial
-    if (!marker.gateway_turn_counts_applied) {
-      marker = this.applyGatewayTurnCounts(marker)
-      // Freeze the merged totals before emitting a stable event ID so a
-      // dropped spool write retries the same summary after restart.
-      if (!this.writeSessionMarker(marker, name)) return
-    }
     const durationMs = boundedDuration(marker.last_observed_at_ms - marker.started_at_ms)
     const appStartDurationMs = boundedDuration(
       marker.last_observed_at_ms - marker.app_start_started_at_ms,
@@ -865,7 +877,6 @@ export class DesktopReliabilityTelemetry {
 
     if ((!needsCrashFact || marker.crash_detected_emitted) && marker.performance_summary_emitted) {
       this.removeManagedMarker(name)
-      this.removeManagedMarker(turnMarkerName(marker.app_session_id))
       if (name === SESSION_MARKER_NAME) this.currentMarker = marker
     }
   }
@@ -995,40 +1006,6 @@ export class DesktopReliabilityTelemetry {
       this.removeManagedMarker(UPDATE_MARKER_NAME)
     } else if (marker.status === 'installed') {
       this.pendingInstalledUpdate = marker
-    }
-  }
-
-  private applyGatewayTurnCounts(marker: SessionMarker): SessionMarker {
-    const counts = this.readManagedMarker(turnMarkerName(marker.app_session_id))
-    const frozen = { ...marker, gateway_turn_counts_applied: true }
-    if (
-      !isRecord(counts)
-      || !hasExactKeys(counts, [
-        'schema_version', 'app_session_id', 'turn_count', 'stalled_turn_count',
-        'stall_count', 'last_observed_at_ms',
-      ])
-      || counts.schema_version !== 1
-      || counts.app_session_id !== marker.app_session_id
-      || !isBoundedInteger(counts.turn_count, MAX_COUNTER)
-      || !isBoundedInteger(counts.stalled_turn_count, MAX_COUNTER)
-      || !isBoundedInteger(counts.stall_count, MAX_COUNTER)
-      || counts.stalled_turn_count > counts.turn_count
-      || counts.stalled_turn_count > counts.stall_count
-      || !isBoundedInteger(counts.last_observed_at_ms, Number.MAX_SAFE_INTEGER)
-      || !Number.isFinite(new Date(counts.last_observed_at_ms).valueOf())
-      || counts.last_observed_at_ms < marker.started_at_ms
-    ) return frozen
-    return {
-      ...frozen,
-      last_observed_at_ms: Math.max(marker.last_observed_at_ms, counts.last_observed_at_ms),
-      performance: {
-        ...marker.performance,
-        turn_count: boundedCount(marker.performance.turn_count + counts.turn_count),
-        stalled_turn_count: boundedCount(
-          marker.performance.stalled_turn_count + counts.stalled_turn_count,
-        ),
-        stall_count: boundedCount(marker.performance.stall_count + counts.stall_count),
-      },
     }
   }
 
@@ -1391,13 +1368,6 @@ function isManagedMarkerName(name: string): boolean {
   return name === SESSION_MARKER_NAME
     || name === UPDATE_MARKER_NAME
     || isRecoveryMarkerName(name)
-    || (name.startsWith(DESKTOP_RELIABILITY_TURN_MARKER_PREFIX)
-      && name.endsWith('.tmp')
-      && isUuid(name.slice(DESKTOP_RELIABILITY_TURN_MARKER_PREFIX.length, -4)))
-}
-
-function turnMarkerName(appSessionId: string): string {
-  return `${DESKTOP_RELIABILITY_TURN_MARKER_PREFIX}${appSessionId}.tmp`
 }
 
 function spoolResultAcknowledged(result: EarlySpoolResult | null): boolean {
@@ -1545,18 +1515,11 @@ function parseSessionMarker(value: unknown): SessionMarker | null {
     'app_start_result_emitted',
   ] as const
   const legacy = value.schema_version === 1 && hasExactKeys(value, legacyKeys)
-  const previous = value.schema_version === 2 && hasExactKeys(value, currentKeys)
-  const current = value.schema_version === 3 && hasExactKeys(value, [
-    ...currentKeys, 'consent_generation', 'gateway_turn_counts_applied',
-  ])
-  if (!legacy && !previous && !current) return null
-  if (current && (
-    (value.consent_generation !== null && typeof value.consent_generation !== 'string')
-    || typeof value.gateway_turn_counts_applied !== 'boolean'
-  )) return null
+  const current = value.schema_version === 2 && hasExactKeys(value, currentKeys)
+  if (!legacy && !current) return null
   const performance = parsePerformanceSnapshot(value.performance)
   const crash = value.crash === null ? null : parseCrashFact(value.crash)
-  const appStart = !legacy && value.app_start_result !== null
+  const appStart = current && value.app_start_result !== null
     ? parsePersistedAppStartResult(value.app_start_result)
     : null
   if (
@@ -1575,7 +1538,7 @@ function parseSessionMarker(value: unknown): SessionMarker | null {
     || typeof value.performance_summary_emitted !== 'boolean'
     || performance === null
   ) return null
-  if (!legacy && (
+  if (current && (
     !isUuid(value.app_start_event_id)
     || !isBoundedInteger(value.app_start_started_at_ms, Number.MAX_SAFE_INTEGER)
     || Number(value.app_start_started_at_ms) > Number(value.last_observed_at_ms)
@@ -1588,9 +1551,7 @@ function parseSessionMarker(value: unknown): SessionMarker | null {
   if (legacy) {
     return {
       ...value,
-      schema_version: 3,
-      consent_generation: null,
-      gateway_turn_counts_applied: false,
+      schema_version: 2,
       app_start_event_id: value.crash_event_id,
       app_start_started_at_ms: value.started_at_ms,
       app_start_stage: 'ready',
@@ -1602,15 +1563,7 @@ function parseSessionMarker(value: unknown): SessionMarker | null {
       performance,
     } as unknown as SessionMarker
   }
-  return {
-    ...value,
-    schema_version: 3,
-    consent_generation: current ? value.consent_generation : null,
-    gateway_turn_counts_applied: current ? value.gateway_turn_counts_applied : false,
-    app_start_result: appStart,
-    crash,
-    performance,
-  } as unknown as SessionMarker
+  return { ...value, app_start_result: appStart, crash, performance } as unknown as SessionMarker
 }
 
 const UPDATE_ERROR_CODES = new Set<UpdateErrorCode>([

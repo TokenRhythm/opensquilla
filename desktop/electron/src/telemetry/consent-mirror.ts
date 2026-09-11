@@ -213,7 +213,7 @@ function isTruthy(value: string | undefined): boolean {
   return typeof value === 'string' && TRUE_VALUES.has(value.trim().toLowerCase())
 }
 
-export function environmentForcesOff(scope: TelemetryScope, env: Environment): boolean {
+function environmentForcesOff(scope: TelemetryScope, env: Environment): boolean {
   const scopeVariable =
     scope === 'reliability'
       ? 'OPENSQUILLA_PRIVACY_DISABLE_RELIABILITY_DIAGNOSTICS'

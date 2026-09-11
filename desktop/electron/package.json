@@ -61,7 +61,7 @@
     "test:telemetry-protocol": "npm run build && node scripts/test-telemetry-protocol.mjs",
     "test:telemetry-build-identity": "npm run build && node scripts/test-telemetry-build-identity.mjs",
     "test:telemetry-reliability": "npm run build && node scripts/test-telemetry-reliability.mjs",
-    "test:telemetry-growth": "npm run build && node scripts/test-telemetry-growth.mjs && node scripts/test-telemetry-growth-lifecycle.mjs",
+    "test:telemetry-growth": "npm run build && node scripts/test-telemetry-growth.mjs",
     "test:router-tier-normalization": "npm run build && node scripts/test-router-tier-normalization.mjs",
     "test:onboarding-flow": "npm run build && node scripts/test-onboarding-flow.mjs",
     "start": "electron .",

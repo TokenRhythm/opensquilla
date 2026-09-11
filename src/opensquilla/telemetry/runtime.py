@@ -28,7 +28,6 @@ from opensquilla.telemetry.contracts.common import StrictTelemetryModel
 from opensquilla.telemetry.coordination import scope_consent_coordinator_for
 from opensquilla.telemetry.desktop_ingress import drain_desktop_early_spool
 from opensquilla.telemetry.desktop_state import desktop_early_spool_root
-from opensquilla.telemetry.desktop_turn_counts import record_desktop_turn
 from opensquilla.telemetry.outbox import OutboxPriority, TelemetryOutbox
 from opensquilla.telemetry.recorder import RecordResult, RecordStatus, TelemetryRecorder
 from opensquilla.telemetry.uploader import TelemetryUploader
@@ -77,7 +76,6 @@ class ScopedTelemetryRuntime:
         self._record_tasks: set[asyncio.Task[object]] = set()
         self._upload_task: asyncio.Task[None] | None = None
         self._owner_loop: asyncio.AbstractEventLoop | None = None
-        self._closing = False
         self._closed = False
 
     @property
@@ -92,15 +90,9 @@ class ScopedTelemetryRuntime:
         """Start the wake-up loop without creating files or making requests."""
 
         self._ensure_open()
-        if self._closing:
-            return
         self._bind_owner_loop()
         await self._drain_desktop_spool()
-        if self._closing or self._closed:
-            return
-        if self._upload_task is None or self._upload_task.done():
-            if self._upload_task is not None and not self._upload_task.cancelled():
-                self._upload_task.exception()
+        if self._upload_task is None:
             self._upload_task = asyncio.create_task(
                 self._upload_loop(),
                 name="opensquilla-telemetry-v2-uploader",
@@ -124,26 +116,11 @@ class ScopedTelemetryRuntime:
         scoped = await self._scope_runtime(scope)
         if scoped is None:
             return RecordResult(RecordStatus.CONSENT_BLOCKED)
-        result = await scoped.recorder.record(
+        return await scoped.recorder.record(
             event,
             priority=priority,
             expected_consent_revision=expected_consent_revision,
         )
-        if (
-            result.status is RecordStatus.RECORDED
-            and getattr(event, "event_name", "") == "turn_result"
-        ):
-            try:
-                async with self._coordinator.authorized(
-                    scope,
-                    checkpoint=ConsentCheckpoint.ENQUEUE,
-                    notice_version=CURRENT_NOTICE_VERSION_BY_SCOPE[scope.value],
-                ) as permit:
-                    if permit is not None:
-                        record_desktop_turn(self._state_dir, event)
-            except Exception:
-                log.debug("desktop turn counter checkpoint failed", exc_info=True)
-        return result
 
     def record_background(
         self,
@@ -153,7 +130,7 @@ class ScopedTelemetryRuntime:
     ) -> None:
         """Schedule a best-effort record without exposing failures to callers."""
 
-        if self._closed or self._closing:
+        if self._closed:
             return
         try:
             running_loop = asyncio.get_running_loop()
@@ -186,10 +163,10 @@ class ScopedTelemetryRuntime:
 
         self._ensure_open()
         normalized = TelemetryScope(scope)
+        scoped = await self._scope_runtime(normalized)
+        if scoped is None:
+            return
         try:
-            scoped = await self._scope_runtime(normalized)
-            if scoped is None:
-                return
             await scoped.uploader.upload_once()
         except asyncio.CancelledError:
             raise
@@ -199,9 +176,9 @@ class ScopedTelemetryRuntime:
     async def close(self) -> None:
         """Stop producers and close queues without forcing shutdown network I/O."""
 
-        if self._closed or self._closing:
+        if self._closed:
             return
-        self._closing = True
+        self._closed = True
 
         upload_task = self._upload_task
         self._upload_task = None
@@ -216,9 +193,10 @@ class ScopedTelemetryRuntime:
 
         pending = tuple(self._record_tasks)
         if pending:
+            for task in pending:
+                task.cancel()
             await asyncio.gather(*pending, return_exceptions=True)
         self._record_tasks.clear()
-        self._closed = True
 
         scoped_runtimes = tuple(self._scopes.values())
         self._scopes.clear()
@@ -280,7 +258,7 @@ class ScopedTelemetryRuntime:
     ) -> None:
         try:
             result = await self.record(event, priority=priority)
-            if not self._closing and result.status in {
+            if result.status in {
                 RecordStatus.RECORDED,
                 RecordStatus.DUPLICATE,
                 RecordStatus.EVICTED,
@@ -318,20 +296,15 @@ class ScopedTelemetryRuntime:
                 continue
             if stat.S_ISLNK(scope_metadata.st_mode) or not stat.S_ISDIR(scope_metadata.st_mode):
                 continue
-            try:
-                if not resolve_scope_consent(
-                    scope,
-                    config=self._config,
-                    env=self._env,
-                ).enabled:
-                    continue
-                scoped = await self._scope_runtime(scope)
-                if scoped is not None:
-                    recorders[scope] = scoped.recorder
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                log.debug("desktop telemetry scope initialization failed", exc_info=True)
+            if not resolve_scope_consent(
+                scope,
+                config=self._config,
+                env=self._env,
+            ).enabled:
+                continue
+            scoped = await self._scope_runtime(scope)
+            if scoped is not None:
+                recorders[scope] = scoped.recorder
         if not recorders:
             return
         try:
