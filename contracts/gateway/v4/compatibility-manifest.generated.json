@@ -387,12 +387,6 @@
     },
     {
       "lifecycle": "stable",
-      "name": "cron.add",
-      "schema": "cron/cron-add.schema.json",
-      "schemaSha256": "423cfc15f92aae668792c87c924343a0845737cb19e0eedca42ac3f2ead066c6"
-    },
-    {
-      "lifecycle": "stable",
       "name": "cron.create",
       "schema": "cron/cron-create.schema.json",
       "schemaSha256": "0083741c9f6b18c9596847431afa6ef9fa39b41ef64f4f603eb5223c6a6b9eea"
@@ -1100,20 +1094,10 @@
       "schemaSha256": "61016f834fc17da15718f70abf40bd2fa5428a4f93237ab682a919e4c97a44b7"
     },
     {
-      "canonicalName": "sessions.contextCompact",
-      "lifecycle": "legacy",
-      "name": "sessions.compact",
-      "schema": "sessions/sessions-compact.schema.json",
-      "schemaSha256": "a035ca2d92acc1ea3fcff706c084b243e23b204f26cd2157319f161a87cdc085"
-    },
-    {
-      "compatibilityAliases": [
-        "sessions.compact"
-      ],
       "lifecycle": "stable",
       "name": "sessions.contextCompact",
       "schema": "sessions/sessions-context-compact.schema.json",
-      "schemaSha256": "87974f8351a1db92724c35dc5d57a2191b08b199c538b288e23c8be9d53b58bb"
+      "schemaSha256": "a9bcba2772be22bf06c9cfe11b7162afe60d77a1d7bfb2df39656bc83dc637f0"
     },
     {
       "lifecycle": "stable",
@@ -1278,20 +1262,10 @@
       "schemaSha256": "bf4930ee8417643d96571e79945fe08831494eac596191e9d364c10898e72313"
     },
     {
-      "canonicalName": "sessions.steer.v2",
-      "lifecycle": "legacy",
-      "name": "sessions.steer",
-      "schema": "conversation/sessions-steer.schema.json",
-      "schemaSha256": "e2a30e5b774165eef3924cbc029eb26b916a39638ff3ece7087f6bd2d02875e3"
-    },
-    {
-      "compatibilityAliases": [
-        "sessions.steer"
-      ],
       "lifecycle": "stable",
       "name": "sessions.steer.v2",
       "schema": "conversation/sessions-steer-v2.schema.json",
-      "schemaSha256": "664be659078f5b9a3bbcbbb51a40f2821fb28e87c686fb94b8eddc82ff2d309d"
+      "schemaSha256": "dc2c0486fac9807fe7aab1a0967ba0f02eb9255f71ea3a5e26a674800b92b700"
     },
     {
       "lifecycle": "stable",
@@ -1448,9 +1422,9 @@
   "source": {
     "eventFamilyCount": 10,
     "generatorSha256": "db063b7bff2dcb9d089926dc9f1d3c99c61c2e4dd42ba12f442701b03fff2df1",
-    "methodCount": 211,
-    "schemaCount": 221,
-    "schemaTreeSha256": "f14629d1a596305b9a402cb27f76522b2b92a916ae25c758529cef40f7738535"
+    "methodCount": 208,
+    "schemaCount": 218,
+    "schemaTreeSha256": "1740083196c669c89c139f37d4adec549b82eca8534b05a6f83ba942fc554dc0"
   },
   "wireVersion": 4
 }

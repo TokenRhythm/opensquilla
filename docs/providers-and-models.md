@@ -199,6 +199,40 @@ api_key_env = "CUSTOM_ANTHROPIC_API_KEY"
 `custom` appends `/chat/completions` to versioned base URLs and reads
 `CUSTOM_LLM_API_KEY`.
 
+Advanced local deployments may add endpoint-specific JSON fields to every
+OpenAI-compatible chat request by editing `config.toml` directly:
+
+```toml
+[llm]
+provider = "custom"
+model = "local-model"
+base_url = "http://127.0.0.1:8000/v1"
+temperature = 0.7
+top_p = 0.9
+thinking = "high"
+
+[llm.extra_body]
+top_k = 40
+min_p = 0.05
+repetition_penalty = 1.1
+
+[llm.extra_body.chat_template_kwargs]
+enable_thinking = true
+```
+
+`extra_body` is available only on the primary `custom` provider. It is a
+local-file-only advanced setting: the Web UI, environment variables,
+`llm_profiles`, and configuration RPCs neither expose nor modify it. Reload
+the configuration or restart OpenSquilla after editing the file. Standard
+fields such as `temperature`, `top_p`, token limits, tools, streaming, and
+reasoning controls remain owned by their first-class settings and cannot be
+overridden through `extra_body`. Nested objects are sent unchanged, while the
+top-level merge is shallow.
+
+Do not store credentials or other secrets in `extra_body`. Older OpenSquilla
+versions that do not recognize this field may reject the configuration, so
+remove the table before downgrading to such a version.
+
 Unknown custom models keep the conservative 8k context default for upgrade
 compatibility. Declare the endpoint's real window under
 `[models.custom."<model>"]` or
@@ -230,7 +264,8 @@ The current custom-provider boundary is intentionally explicit:
 - custom Anthropic auth is currently optional bearer only (`x-api-key` and
   custom auth modes are not configurable), and custom protocol choices do not
   yet include OpenAI Responses or native Gemini;
-- endpoint-wide `extra_body` / request-transform configuration is not exposed;
+- `custom` supports a guarded local-TOML `extra_body`; arbitrary request
+  transforms and custom headers are not exposed;
 - reasoning dialects are never inferred from an untrusted custom host—set
   provider-scoped model metadata only when the endpoint contract is known.
 

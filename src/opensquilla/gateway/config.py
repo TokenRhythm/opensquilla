@@ -93,6 +93,28 @@ _LEGACY_CONTROL_UI_FRONTEND_WARNING = (
 )
 
 
+class _SettingsSourceWithoutFields(PydanticBaseSettingsSource):
+    """Filter local-TOML-only fields from any external settings source."""
+
+    def __init__(
+        self,
+        inner: PydanticBaseSettingsSource,
+        fields: frozenset[str],
+    ) -> None:
+        super().__init__(inner.settings_cls)
+        self._inner = inner
+        self._fields = fields
+
+    def get_field_value(self, field: FieldInfo, field_name: str) -> tuple[Any, str, bool]:
+        return self._inner.get_field_value(field, field_name)
+
+    def __call__(self) -> dict[str, Any]:
+        values = dict(self._inner())
+        for field_name in self._fields:
+            values.pop(field_name, None)
+        return values
+
+
 class ContextOverflowPolicy(StrEnum):
     """What to do when a turn's effective input size exceeds the budget.
 
@@ -458,6 +480,37 @@ class LlmProviderConfig(BaseSettings):
     # send provider.order=[name] so the provider is preferred without disabling
     # OpenRouter fallback.
     provider_routing: dict[str, str] = Field(default_factory=dict)
+    # Advanced local-only extensions for a custom OpenAI-compatible endpoint.
+    # Public configuration surfaces deliberately omit this field.
+    extra_body: dict[str, Any] = Field(default_factory=dict)
+
+    @classmethod
+    def settings_customise_sources(
+        cls,
+        settings_cls: type[BaseSettings],
+        init_settings: PydanticBaseSettingsSource,
+        env_settings: PydanticBaseSettingsSource,
+        dotenv_settings: PydanticBaseSettingsSource,
+        file_secret_settings: PydanticBaseSettingsSource,
+    ) -> tuple[PydanticBaseSettingsSource, ...]:
+        local_only = frozenset({"extra_body"})
+        return (
+            init_settings,
+            _SettingsSourceWithoutFields(env_settings, local_only),
+            _SettingsSourceWithoutFields(dotenv_settings, local_only),
+            _SettingsSourceWithoutFields(file_secret_settings, local_only),
+        )
+
+    @field_validator("extra_body", mode="before")
+    @classmethod
+    def _validate_extra_body(cls, value: Any) -> dict[str, Any]:
+        from opensquilla.provider.extra_body import normalize_extra_body
+
+        if value is None:
+            return {}
+        if not isinstance(value, dict):
+            raise ValueError("extra_body must be a TOML table / JSON object")
+        return normalize_extra_body(value)
 
     @model_validator(mode="after")
     def _normalize_direct_deepseek_model(self) -> LlmProviderConfig:
@@ -470,6 +523,12 @@ class LlmProviderConfig(BaseSettings):
         model = str(self.model or "").strip()
         if model in aliases:
             self.model = aliases[model]
+        return self
+
+    @model_validator(mode="after")
+    def _validate_custom_extra_body(self) -> LlmProviderConfig:
+        if self.extra_body and str(self.provider or "").strip().lower() != "custom":
+            raise ValueError("llm.extra_body is supported only when provider='custom'")
         return self
 
 
@@ -2295,7 +2354,8 @@ class _EnvWithoutConfigVersion(PydanticBaseSettingsSource):
     ``OPENSQUILLA_GATEWAY_CONFIG_VERSION`` can never gate or skip migrations.
     The transport-flow kill switch is also applied explicitly below so invalid
     values can fall back to the validated default with a warning instead of
-    failing Gateway construction during Pydantic coercion.
+    failing Gateway construction during Pydantic coercion. ``llm.extra_body``
+    is filtered here because its only supported source is local TOML.
     """
 
     def __init__(self, inner: PydanticBaseSettingsSource) -> None:
@@ -2309,6 +2369,9 @@ class _EnvWithoutConfigVersion(PydanticBaseSettingsSource):
         values = dict(self._inner())
         values.pop("config_version", None)
         values.pop("ws_transport_flow_enabled", None)
+        llm = values.get("llm")
+        if isinstance(llm, dict):
+            llm.pop("extra_body", None)
         return values
 
 
@@ -2804,14 +2867,14 @@ class GatewayConfig(BaseSettings):
         dotenv_settings: PydanticBaseSettingsSource,
         file_secret_settings: PydanticBaseSettingsSource,
     ) -> tuple[PydanticBaseSettingsSource, ...]:
-        # Default source order, with env-backed sources filtered so
+        # Default source order, with external sources filtered so
         # OPENSQUILLA_GATEWAY_CONFIG_VERSION can never populate the migration
         # stamp — see _EnvWithoutConfigVersion for the full rationale.
         return (
             init_settings,
             _EnvWithoutConfigVersion(env_settings),
             _EnvWithoutConfigVersion(dotenv_settings),
-            file_secret_settings,
+            _EnvWithoutConfigVersion(file_secret_settings),
         )
 
     def model_post_init(self, __context: Any) -> None:
@@ -2986,6 +3049,8 @@ class GatewayConfig(BaseSettings):
                 llm.pop("api_key_env", None)
             if not llm.get("api_key"):
                 llm.pop("api_key", None)
+            if not llm.get("extra_body"):
+                llm.pop("extra_body", None)
         llm_profiles = data.get("llm_profiles")
         if isinstance(llm_profiles, dict):
             # Empty credential fields are absence, not a stored credential.
@@ -3050,6 +3115,9 @@ class GatewayConfig(BaseSettings):
     def to_public_dict(self) -> dict[str, Any]:
         """Return a redacted config view safe for public control surfaces."""
         data = cast(dict[str, Any], redact_public_config(self.model_dump()))
+        llm = data.get("llm")
+        if isinstance(llm, dict):
+            llm.pop("extra_body", None)
         ensemble = data.get("llm_ensemble")
         if isinstance(ensemble, dict):
             from opensquilla.gateway.model_routing import (

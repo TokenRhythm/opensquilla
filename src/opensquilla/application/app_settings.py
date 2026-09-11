@@ -61,6 +61,11 @@ _PUBLIC_DERIVED_CONFIG_PATHS = frozenset(
 
 _READONLY_PATHS = frozenset({"auth.token", "auth.password", "config_version"})
 
+# Configuration that belongs exclusively to the local TOML file.  Unlike
+# secrets, these fields are omitted entirely from public reads and must survive
+# a public get/apply round trip without becoming writable through RPC.
+_LOCAL_FILE_ONLY_PATHS = frozenset({"llm.extra_body"})
+
 _READONLY_PATH_SEGMENTS = frozenset(tuple(path.split(".")) for path in _READONLY_PATHS)
 
 _SAFE_WRITE_PATCH_PATHS = frozenset(
@@ -173,6 +178,8 @@ class AppSettings[Config: SettingsConfig, PreparedProvider]:
             raise ValueError("No config available")
         fields: dict[str, EffectiveSetting] = {}
         for path, field in self._runtime.read_effective_fields().items():
+            if _is_local_file_only_path(path):
+                continue
             if any(is_sensitive_config_key(segment) for segment in path.split(".")):
                 continue
             fields[path] = {
@@ -265,6 +272,7 @@ class AppSettings[Config: SettingsConfig, PreparedProvider]:
     async def set(self, path: str, value: SettingsValue) -> SettingsMutation:
         if _path_is_or_contains_readonly(path):
             raise ValueError(f"Path is read-only: {path}")
+        _reject_local_file_only_write({path} | _collect_paths(value, path))
         before = self._before()
         payload = copy.deepcopy(before.payload)
         source = _resolve_path(payload, path)
@@ -276,6 +284,7 @@ class AppSettings[Config: SettingsConfig, PreparedProvider]:
         restored, redacted = _restore_redacted_values(value, source, path)
         _set_path(payload, path, restored)
         payload = _strip_public_derived_config_fields(payload)
+        _reconcile_local_file_only_llm(before.payload, payload)
         explicit = {
             item
             for item in ({path} | _collect_paths(value, path))
@@ -317,6 +326,11 @@ class AppSettings[Config: SettingsConfig, PreparedProvider]:
     async def _mutate(self, patch: SettingsObject, changes: SettingsObject) -> SettingsMutation:
         if not patch and not changes:
             raise ValueError("params.patch or params.patches is required")
+        requested_paths = _collect_paths(patch)
+        for path, value in changes.items():
+            requested_paths.add(path)
+            requested_paths.update(_collect_paths(value, path))
+        _reject_local_file_only_write(requested_paths)
         before = self._before()
         payload = copy.deepcopy(before.payload)
         redacted: set[str] = set()
@@ -348,6 +362,7 @@ class AppSettings[Config: SettingsConfig, PreparedProvider]:
             payload = _deep_merge(payload, patch)
             force.update(_collect_explicit_leaf_paths(patch))
         payload = _strip_public_derived_config_fields(payload)
+        _reconcile_local_file_only_llm(before.payload, payload)
         explicit = set(changes) | _collect_paths(patch)
         for path, value in changes.items():
             explicit.update(_collect_paths(value, path))
@@ -375,10 +390,12 @@ class AppSettings[Config: SettingsConfig, PreparedProvider]:
     async def apply(self, payload: Mapping[str, SettingsValue]) -> SettingsMutation:
         before = self._before(required=False)
         replacement = dict(payload)
+        _reject_changed_local_file_only_apply(before.payload, replacement)
         if before.config is not None and not replacement.get("config_path"):
             replacement["config_path"] = before.config.config_path
         replacement, redacted = _restore_redacted_values(replacement, before.payload)
         replacement = _strip_public_derived_config_fields(replacement)
+        _reconcile_local_file_only_llm(before.payload, replacement)
         candidate = self._candidate(before, replacement, _collect_paths(replacement), redacted)
         return await self._write(before, candidate)
 
@@ -626,6 +643,58 @@ def _path_is_or_contains_readonly(path: str) -> bool:
     """Return whether setting ``path`` could replace a read-only descendant."""
 
     return any(readonly == path or readonly.startswith(f"{path}.") for readonly in _READONLY_PATHS)
+
+
+def _is_local_file_only_path(path: str) -> bool:
+    return any(path == hidden or path.startswith(f"{hidden}.") for hidden in _LOCAL_FILE_ONLY_PATHS)
+
+
+def _reject_local_file_only_write(paths: set[str]) -> None:
+    blocked = sorted(path for path in paths if _is_local_file_only_path(path))
+    if blocked:
+        raise ValueError(f"Path is local-file-only: {blocked[0]}")
+
+
+def _reject_changed_local_file_only_apply(
+    before: Mapping[str, Any],
+    replacement: Mapping[str, Any],
+) -> None:
+    """Allow legacy full dumps only when their hidden value is unchanged."""
+
+    replacement_llm = replacement.get("llm")
+    if not isinstance(replacement_llm, Mapping) or "extra_body" not in replacement_llm:
+        return
+    previous_llm = before.get("llm")
+    previous_value = (
+        previous_llm.get("extra_body", {})
+        if isinstance(previous_llm, Mapping)
+        else {}
+    )
+    if replacement_llm.get("extra_body") != previous_value:
+        raise ValueError("Path is local-file-only: llm.extra_body")
+
+
+def _reconcile_local_file_only_llm(
+    before: Mapping[str, Any],
+    candidate: dict[str, Any],
+) -> None:
+    """Preserve hidden custom settings or clear them on provider switches."""
+
+    previous_llm = before.get("llm")
+    next_llm = candidate.get("llm")
+    if not isinstance(next_llm, dict):
+        return
+    next_provider = str(next_llm.get("provider") or "").strip().lower()
+    previous_provider = (
+        str(previous_llm.get("provider") or "").strip().lower()
+        if isinstance(previous_llm, Mapping)
+        else ""
+    )
+    if next_provider == "custom" and previous_provider == "custom":
+        if isinstance(previous_llm, Mapping) and "extra_body" in previous_llm:
+            next_llm.setdefault("extra_body", copy.deepcopy(previous_llm["extra_body"]))
+        return
+    next_llm.pop("extra_body", None)
 
 
 def _path_segments_is_or_contains_readonly(path: tuple[str, ...]) -> bool:

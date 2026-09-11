@@ -3261,6 +3261,7 @@ async def build_services(
                     base_url=resolved_base,
                     proxy=proxy,
                     provider_routing=llm_runtime.provider_routing,
+                    extra_body=llm_runtime.extra_body,
                 )
             )
         )

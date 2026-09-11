@@ -1,7 +1,7 @@
 """RPC layer must let users set webhook delivery on a cron job.
 
 Webhook delivery is plumbed through ``scheduler.delivery``, but the RPC
-``cron.add`` payload originally only parsed channel-mode overrides. These
+The cron creation payload originally only parsed channel-mode overrides. These
 tests assert the wire payload can carry webhook mode end-to-end.
 """
 
