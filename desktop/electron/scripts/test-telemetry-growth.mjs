@@ -272,8 +272,8 @@ const onboardingSave = mainSource.slice(
   mainSource.indexOf('async function withRecoveryOperation'),
 )
 assert.ok(
-  onboardingSave.indexOf('desktopGrowthTelemetry.recordOnboardingCompleted()')
-    < onboardingSave.indexOf('completeOnboardingFlow(flow, credential)'),
+  onboardingSave.indexOf('completeOnboardingFlow(flow, credential)')
+    < onboardingSave.indexOf('desktopGrowthTelemetry.recordOnboardingCompleted()'),
 )
 const profileInspection = mainSource.slice(
   mainSource.indexOf('async function inspectActiveProfileBeforeStartup'),

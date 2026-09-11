@@ -277,11 +277,6 @@ class PerformanceAccumulator {
     return true
   }
 
-  recordTurn(stalled: boolean): void {
-    this.turnCount = boundedCount(this.turnCount + 1)
-    if (stalled) this.stalledTurnCount = boundedCount(this.stalledTurnCount + 1)
-  }
-
   snapshot(): { durationMs: number; performance: PerformanceSnapshot } {
     const now = this.nowMs()
     const elapsedInState = boundedDuration(now - this.stateStartedAtMs)
@@ -479,21 +474,6 @@ export class DesktopReliabilityTelemetry {
       }
     } catch {
       // Request counters cannot affect the observed request.
-    }
-  }
-
-  /** Record one terminal dialogue turn in the session aggregate. */
-  recordTurn(stalled = false): void {
-    if (!this.prepareActivity()) return
-    try {
-      this.performance.recordTurn(stalled)
-      this.requestCheckpointCounter += 1
-      if (this.requestCheckpointCounter >= 32) {
-        this.requestCheckpointCounter = 0
-        this.checkpointSession()
-      }
-    } catch {
-      // Performance counters cannot affect the observed turn.
     }
   }
 

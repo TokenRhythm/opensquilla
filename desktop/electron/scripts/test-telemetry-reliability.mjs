@@ -312,8 +312,6 @@ try {
     runtime.synchronize(factPaths)
     fakeClock.advance(500)
     runtime.recordMonitoredRequest(30_001)
-    runtime.recordTurn(false)
-    runtime.recordTurn(true)
     runtime.recordAppStartResult({
       outcome: 'success',
       durationMs: 500,
@@ -350,8 +348,6 @@ try {
     assert.equal(summary.coverage, 'complete')
     assert.equal(summary.monitored_request_count, 1)
     assert.equal(summary.slow_request_count, 1)
-    assert.equal(summary.turn_count, 2)
-    assert.equal(summary.stalled_turn_count, 1)
     assert.equal(summary.foreground_duration_ms, 1_000)
     assert.equal(summary.background_duration_ms, 0)
     assert.equal(
