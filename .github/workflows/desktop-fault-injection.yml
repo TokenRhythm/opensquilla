@@ -12,6 +12,10 @@ name: Desktop Fault Injection
 on:
   workflow_dispatch:
     inputs:
+      run_windows_reinstall_recovery:
+        description: Verify interruption and manual reinstall using retained signed A/B/C artifacts
+        type: boolean
+        default: false
       source_run_id:
         description: Completed Release Assets run holding opensquilla-electron-macos
         required: false
@@ -55,6 +59,94 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  windows-reinstall-recovery:
+    name: Signed interruption and reinstall (${{ matrix.install-mode }})
+    if: ${{ github.repository == 'TokenRhythm/opensquilla' && github.actor == 'Open-Squilla' && inputs.run_windows_reinstall_recovery }}
+    runs-on: windows-2022
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        install-mode: [default, custom]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22.12.0'
+      - name: Prepare observation and renderer harness
+        shell: pwsh
+        run: |
+          python -m pip install psutil==7.0.0
+          if ($LASTEXITCODE -ne 0) { throw 'Process observation dependency failed.' }
+          npm --prefix desktop/electron ci
+          if ($LASTEXITCODE -ne 0) { throw 'Renderer dependencies failed.' }
+          npm --prefix desktop/electron run build
+          if ($LASTEXITCODE -ne 0) { throw 'Renderer harness build failed.' }
+      - name: Record signed source provenance
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $sources = @()
+          foreach ($runId in @(34147299596, 34354767055, 34354773157)) {
+            $source = gh api "repos/$env:GITHUB_REPOSITORY/actions/runs/$runId" | ConvertFrom-Json
+            if ($LASTEXITCODE -ne 0 -or $source.path -ne '.github/workflows/wheelhouse-release.yml') { throw 'Invalid signed source.' }
+            $sources += @{ runId=$runId; sha=$source.head_sha; workflow=$source.path }
+          }
+          $sources | ConvertTo-Json | Set-Content signed-sources.json
+      - name: Download signed baseline A
+        uses: actions/download-artifact@v4
+        with:
+          name: opensquilla-electron-windows
+          path: reinstall-packages/A
+          github-token: ${{ github.token }}
+          run-id: '34147299596'
+      - name: Download signed candidate B
+        uses: actions/download-artifact@v4
+        with:
+          name: opensquilla-electron-windows
+          path: reinstall-packages/B
+          github-token: ${{ github.token }}
+          run-id: '34354767055'
+      - name: Download signed follow-up C
+        uses: actions/download-artifact@v4
+        with:
+          name: opensquilla-electron-windows
+          path: reinstall-packages/C
+          github-token: ${{ github.token }}
+          run-id: '34354773157'
+      - name: Interrupt extraction, rerun B, then upgrade to C
+        shell: pwsh
+        env:
+          INSTALL_MODE: ${{ matrix.install-mode }}
+        run: |
+          $packages = @{}
+          foreach ($label in @('A', 'B', 'C')) {
+            $files = @(Get-ChildItem "reinstall-packages/$label" -Filter '*.exe' -File)
+            if ($files.Count -ne 1) { throw "Expected one signed installer for $label" }
+            $packages[$label] = $files[0].FullName
+          }
+          python .github/scripts/verify-windows-reinstall-recovery.py `
+            --baseline $packages.A --candidate $packages.B --next-installer $packages.C `
+            --install-mode $env:INSTALL_MODE --evidence "$env:RUNNER_TEMP/reinstall-$env:INSTALL_MODE"
+          if ($LASTEXITCODE -ne 0) { throw 'Interrupted reinstall acceptance failed.' }
+      - name: Upload acceptance evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: signed-reinstall-recovery-${{ matrix.install-mode }}-${{ github.run_attempt }}
+          path: |
+            signed-sources.json
+            ${{ runner.temp }}/reinstall-${{ matrix.install-mode }}/result.json
+            ${{ runner.temp }}/reinstall-${{ matrix.install-mode }}/interruption.json
+            ${{ runner.temp }}/reinstall-${{ matrix.install-mode }}/appdata/OpenSquilla/logs/*.log
+          retention-days: 14
+
   macos-fault-injection:
     name: macOS packaged fault injection
     if: github.repository == 'TokenRhythm/opensquilla' && github.actor == 'Open-Squilla' && inputs.source_run_id != ''
