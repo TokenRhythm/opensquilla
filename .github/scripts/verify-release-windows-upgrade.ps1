@@ -181,6 +181,8 @@ function Stop-InstalledProcesses {
   }
 }
 
+}
+
 function Get-InstallRegistrySnapshot {
   param([string]$Root)
   $normalized = [IO.Path]::GetFullPath($Root).TrimEnd([IO.Path]::DirectorySeparatorChar)
@@ -285,7 +287,6 @@ function Invoke-InterruptedUpgrade {
     Remove-Item Env:OPENSQUILLA_NSIS_RECOVERY_PAUSE_MS -ErrorAction SilentlyContinue
     Stop-InstalledProcesses
   }
-}
 }
 
 try {
