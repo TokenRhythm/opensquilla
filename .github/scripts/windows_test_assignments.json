@@ -317,6 +317,7 @@
       "tests/test_toolcomp_matcher_levers.py",
       "tests/test_toolcomp_matcher_safety.py",
       "tests/test_toolcomp_reducer_semantics.py",
+      "tests/test_tools/test_bounded_output_capture.py",
       "tests/test_tools/test_dispatch_corpus_snapshots.py",
       "tests/test_tools/test_dispatch_envelope.py",
       "tests/test_tools/test_dispatch_properties.py",

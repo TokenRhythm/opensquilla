@@ -240,6 +240,10 @@ class ToolContext:
 
     desktop_browser: Any | None = field(default=None, repr=False)
     artifact_source_paths: dict[str, ArtifactSource] = field(default_factory=dict, repr=False)
+    # Output spools share the runtime's configured result-store budgets.
+    tool_result_store_max_bytes: int | None = 8 * 1024 * 1024
+    tool_result_store_disk_budget_bytes: int | None = 256 * 1024 * 1024
+    tool_result_store_retention_seconds: int | None = 7 * 24 * 60 * 60
 
     def __post_init__(self) -> None:
         self.validate_path_roots()

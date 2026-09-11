@@ -2349,17 +2349,24 @@ class Agent:
             # before Agent construction. Preserve object identity so tool
             # internals that read current_tool_context can emit events.
             tool_context.on_runtime_event = self._record_tool_context_runtime_event
-        if tool_context is not None and self.config.tool_result_store_dir:
-            tool_context = replace(
-                tool_context,
-                tool_result_store_dir=self.config.tool_result_store_dir,
-                tool_result_store_session_id=(
+        if tool_context is not None:
+            # Dispatch handlers can retain the ingress object. Share output
+            # storage limits before any later request-local context copies.
+            tool_context.tool_result_store_max_bytes = self.config.tool_result_store_max_bytes
+            tool_context.tool_result_store_disk_budget_bytes = (
+                self.config.tool_result_store_disk_budget_bytes
+            )
+            tool_context.tool_result_store_retention_seconds = (
+                self.config.tool_result_store_retention_seconds
+            )
+            if self.config.tool_result_store_dir:
+                tool_context.tool_result_store_dir = self.config.tool_result_store_dir
+                tool_context.tool_result_store_session_id = (
                     self.config.tool_result_store_session_id
                     or tool_context.tool_result_store_session_id
                     or tool_context.artifact_session_id
                     or self._session_key
-                ),
-            )
+                )
         if tool_context is not None:
             tool_context = self._apply_configured_tool_result_budget(tool_context)
             tool_context.tool_result_retrieval_available = bool(
@@ -4914,6 +4921,15 @@ class Agent:
                 )
                 return cached
             self._tool_result_snapshot_cache.pop(cache_key, None)
+        # Synchronous projection and child-handoff callers may run on the
+        # gateway loop. They must not wait for a concurrent output-spool writer;
+        # a busy store keeps the original content through the existing no-op.
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            lock_timeout_seconds = 5.0
+        else:
+            lock_timeout_seconds = 0.0
         try:
             record = store.write(
                 content,
@@ -4925,6 +4941,7 @@ class Agent:
                 max_bytes=self.config.tool_result_store_max_bytes,
                 disk_budget_bytes=self.config.tool_result_store_disk_budget_bytes,
                 retention_seconds=self.config.tool_result_store_retention_seconds,
+                lock_timeout_seconds=lock_timeout_seconds,
             )
         except ToolResultStoreBudgetError as exc:
             self.config.metadata["tool_result_store_skips"] = (
@@ -17219,6 +17236,9 @@ class Agent:
             tool_result_store_session_id=(
                 self.config.tool_result_store_session_id or parent_session_key
             ),
+            tool_result_store_max_bytes=self.config.tool_result_store_max_bytes,
+            tool_result_store_disk_budget_bytes=self.config.tool_result_store_disk_budget_bytes,
+            tool_result_store_retention_seconds=self.config.tool_result_store_retention_seconds,
             tool_run_budget_key=(
                 f"subagent:{parent_session_key}:{subagent_label}:{depth}:{uuid.uuid4().hex}"
             ),

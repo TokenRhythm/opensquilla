@@ -73,6 +73,7 @@ RECENTLY_ADDED_ACTIVE_TESTS = {
     "tests/test_engine/test_selector_managed_recovery.py",
     "tests/test_engine/test_selector_retry_after_lifetime.py",
     "tests/test_provider_connection_failure.py",
+    "tests/test_tools/test_bounded_output_capture.py",
 
     # Artifact source/version regressions use the declared provisional floor.
     "tests/test_engine/test_artifact_delivery_sources.py",

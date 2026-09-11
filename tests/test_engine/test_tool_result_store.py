@@ -474,3 +474,67 @@ def test_stale_projection_reference_is_not_restored(tmp_path: Path) -> None:
     restored = agent._restore_tool_results_without_retrieval_schema(messages)
 
     assert restored[0].content[0].content == projection
+
+
+
+def test_zero_lock_timeout_skips_thread_contention_without_trying_file_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from opensquilla import managed_artifacts
+
+    store = ToolResultStore(tmp_path)
+    with store._budget_lock():
+        attempts = []
+
+        def file_lock(_handle):
+            attempts.append("file")
+            return False
+
+        monkeypatch.setattr(managed_artifacts, "_try_file_lock", file_lock)
+        with pytest.raises(managed_artifacts.ManagedArtifactError):
+            _write(store, "contended result", lock_timeout_seconds=0)
+        assert attempts == []
+    assert not list(tmp_path.rglob("content.txt"))
+
+
+def test_zero_lock_timeout_tries_file_lock_once_without_sleeping(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from opensquilla import managed_artifacts
+
+    attempts = []
+
+    def file_lock(_handle):
+        attempts.append("file")
+        return False
+
+    def unexpected_sleep(_seconds):
+        pytest.fail("nonblocking budget lock must not sleep")
+
+    monkeypatch.setattr(managed_artifacts, "_try_file_lock", file_lock)
+    monkeypatch.setattr(managed_artifacts.time, "sleep", unexpected_sleep)
+    with pytest.raises(managed_artifacts.ManagedArtifactError):
+        _write(ToolResultStore(tmp_path), "contended result", lock_timeout_seconds=0)
+    assert attempts == ["file"]
+    assert not list(tmp_path.rglob("content.txt"))
+
+
+def test_write_lock_default_remains_five_seconds(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from contextlib import contextmanager
+
+    store = ToolResultStore(tmp_path)
+    observed = []
+    original = store._budget_lock
+
+    @contextmanager
+    def observe_lock(*, timeout=5.0):
+        observed.append(timeout)
+        with original(timeout=timeout):
+            yield
+
+    monkeypatch.setattr(store, "_budget_lock", observe_lock)
+    record = _write(store, "ordinary worker result")
+    assert store.read(record.handle, session_id=_SESSION_ID).content == "ordinary worker result"
+    assert observed == [5.0]

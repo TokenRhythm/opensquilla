@@ -8,12 +8,19 @@ import json
 import os
 import re
 import secrets
+from collections.abc import Iterator
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, BinaryIO
 
 from opensquilla.attachment_refs import _atomic_write_bytes
+from opensquilla.managed_artifacts import (
+    ManagedArtifactInstallLock,
+    _release_file_lock,
+    _try_file_lock,
+)
 
 DEFAULT_TOOL_RESULT_MAX_BYTES = 8 * 1024 * 1024
 DEFAULT_TOOL_RESULT_DISK_BUDGET_BYTES = 256 * 1024 * 1024
@@ -22,6 +29,8 @@ TOOL_RESULT_STORE_SESSION_BUCKET = "s"
 TOOL_RESULT_CONTENT_NAME = "content.txt"
 TOOL_RESULT_COMPRESSED_CONTENT_NAME = "content.txt.gz"
 TOOL_RESULT_META_NAME = "meta.json"
+_TOOL_OUTPUT_SPOOL_NAME = "output.spool"
+_TOOL_OUTPUT_LEASE_NAME = "output.lease"
 # Hex chars of the content sha256 used to derive a deterministic (content-addressed)
 # handle. 32 hex chars = 128 bits, which both satisfies the ``tr-<32 hex>`` handle
 # format and makes truncated-digest collisions between distinct payloads negligible.
@@ -56,6 +65,7 @@ class _StoredMeta:
     created_at: datetime
     size_bytes: int
     record_dir: Path
+    active: bool = False
 
 
 class ToolResultStore:
@@ -65,6 +75,28 @@ class ToolResultStore:
         self.root = Path(root)
 
     def write(
+        self,
+        content: str,
+        *,
+        tool_use_id: str,
+        tool_name: str,
+        session_id: str,
+        session_key: str,
+        agent_id: str,
+        max_bytes: int | None = DEFAULT_TOOL_RESULT_MAX_BYTES,
+        disk_budget_bytes: int | None = DEFAULT_TOOL_RESULT_DISK_BUDGET_BYTES,
+        retention_seconds: int | None = DEFAULT_TOOL_RESULT_RETENTION_SECONDS,
+        lock_timeout_seconds: float = 5.0,
+    ) -> ToolResultRecord:
+        with self._budget_lock(timeout=lock_timeout_seconds):
+            return self._write(
+                content, tool_use_id=tool_use_id, tool_name=tool_name,
+                session_id=session_id, session_key=session_key, agent_id=agent_id,
+                max_bytes=max_bytes, disk_budget_bytes=disk_budget_bytes,
+                retention_seconds=retention_seconds,
+            )
+
+    def _write(
         self,
         content: str,
         *,
@@ -216,6 +248,61 @@ class ToolResultStore:
             return record
         raise FileExistsError("could not allocate unique tool result handle")
 
+    @contextmanager
+    def _budget_lock(self, *, timeout: float = 5.0) -> Iterator[None]:
+        # Reuse the package-neutral cross-process/thread lock. At timeout=0
+        # its thread acquire is nonblocking and the file lock is tried exactly
+        # once, without sleeping. Synchronous projection can therefore skip a
+        # contended write; worker-side writes keep the default five-second wait.
+        # This bounds lock contention, not filesystem IO or result encoding.
+        (self.root / "locks").mkdir(parents=True, exist_ok=True)
+        with ManagedArtifactInstallLock(self.root, "tool-results", timeout=timeout):
+            yield
+
+    def open_output_spool(
+        self,
+        *,
+        tool_name: str,
+        session_id: str,
+        session_key: str,
+        agent_id: str,
+        max_bytes: int = DEFAULT_TOOL_RESULT_MAX_BYTES,
+        disk_budget_bytes: int | None = DEFAULT_TOOL_RESULT_DISK_BUDGET_BYTES,
+        retention_seconds: int | None = DEFAULT_TOOL_RESULT_RETENTION_SECONDS,
+    ) -> ToolOutputSpool:
+        """Reserve bounded output space in the existing result-store budget.
+
+        The lease is held for the complete job lifetime. Cleanup in another
+        process can reclaim abandoned spools, but cannot evict an active writer.
+        """
+        session_id = _validate_non_empty("session_id", session_id)
+        session_key = _validate_non_empty("session_key", session_key)
+        agent_id = _validate_non_empty("agent_id", agent_id)
+        if max_bytes <= 0:
+            raise ToolResultStoreBudgetError("output spool budget must be positive")
+        with self._budget_lock():
+            records = self._remove_expired(self._iter_record_stats(), retention_seconds)
+            if disk_budget_bytes is not None:
+                self._prune_to_fit(records, max_bytes, disk_budget_bytes)
+            handle = f"tr-{secrets.token_hex(16)}"
+            record_dir = self._record_dir(handle, session_id=session_id)
+            record_dir.mkdir(parents=True, exist_ok=False)
+            lease = (record_dir / _TOOL_OUTPUT_LEASE_NAME).open("w+b")
+            try:
+                lease.write(b"0" + str(max_bytes).encode("ascii"))
+                lease.flush()
+                if not _try_file_lock(lease):
+                    raise ToolResultStoreBudgetError("could not acquire output spool lease")
+                output = (record_dir / _TOOL_OUTPUT_SPOOL_NAME).open("w+b", buffering=0)
+                return ToolOutputSpool(
+                    self, handle, record_dir, lease, output, max_bytes,
+                    tool_name, session_id, session_key, agent_id,
+                )
+            except BaseException:
+                lease.close()
+                _remove_record_dir(record_dir)
+                raise
+
     def read(self, handle: str, *, session_id: str) -> ToolResultRecord:
         session_id = _validate_non_empty("session_id", session_id)
         normalized = _validate_handle(handle)
@@ -253,6 +340,50 @@ class ToolResultStore:
             content=content,
             stored_size_bytes=stored_size_bytes,
             storage_encoding=storage_encoding,
+        )
+
+    def read_output_preview(
+        self, handle: str, *, session_id: str, max_bytes: int,
+    ) -> str:
+        """Verify a retained output record while reading only bounded chunks.
+
+        Completed background sessions can release their in-memory preview;
+        queries reconstruct a head/tail view without loading the whole record.
+        """
+        session_id = _validate_non_empty("session_id", session_id)
+        record_dir = self._record_dir(handle, session_id=session_id)
+        meta = self._read_meta(record_dir)
+        if meta is None or meta.get("session_id") != session_id:
+            raise ValueError("tool output session mismatch or missing record")
+        name = str(meta.get("content_file") or TOOL_RESULT_CONTENT_NAME)
+        if name not in {TOOL_RESULT_CONTENT_NAME, TOOL_RESULT_COMPRESSED_CONTENT_NAME}:
+            raise ValueError("unsupported tool output content file")
+        content_path = record_dir / name
+        opener = gzip.open if meta.get("storage_encoding") == "gzip+utf-8" else open
+        head, tail = bytearray(), bytearray()
+        head_limit = max(1, max_bytes // 2)
+        tail_limit = max(1, max_bytes - head_limit)
+        digest = hashlib.sha256()
+        observed = 0
+        with opener(content_path, "rb") as stream:
+            while chunk := stream.read(64 * 1024):
+                digest.update(chunk)
+                observed += len(chunk)
+                take = min(len(chunk), head_limit - len(head))
+                head.extend(chunk[:take])
+                remaining = chunk[take:]
+                tail.extend(remaining)
+                if len(tail) > tail_limit:
+                    del tail[:-tail_limit]
+        if digest.hexdigest() != meta.get("sha256") or observed != meta.get("size_bytes"):
+            raise ValueError("retained output integrity mismatch")
+        omitted = observed - len(head) - len(tail)
+        if omitted <= 0:
+            return (head + tail).decode("utf-8", errors="replace")
+        return (
+            head.decode("utf-8", errors="replace")
+            + f"\n[preview omitted {omitted} retained output bytes]\n"
+            + tail.decode("utf-8", errors="replace")
         )
 
     def _existing_record(
@@ -341,7 +472,9 @@ class ToolResultStore:
         if not root.exists():
             return []
         records: list[_StoredMeta] = []
-        for pattern in (TOOL_RESULT_CONTENT_NAME, TOOL_RESULT_COMPRESSED_CONTENT_NAME):
+        for pattern in (
+            TOOL_RESULT_CONTENT_NAME, TOOL_RESULT_COMPRESSED_CONTENT_NAME, _TOOL_OUTPUT_SPOOL_NAME
+        ):
             for content_path in root.rglob(pattern):
                 record_dir = content_path.parent
                 try:
@@ -352,11 +485,13 @@ class ToolResultStore:
                     stat = content_path.stat()
                 except (OSError, ValueError):
                     continue
+                active, reservation = _output_spool_reservation(record_dir)
                 records.append(
                     _StoredMeta(
                         created_at=datetime.fromtimestamp(stat.st_mtime, tz=UTC),
-                        size_bytes=max(0, stat.st_size),
+                        size_bytes=max(0, stat.st_size, reservation if active else 0),
                         record_dir=record_dir,
+                        active=active,
                     )
                 )
         return records
@@ -372,8 +507,10 @@ class ToolResultStore:
         cutoff = datetime.now(UTC) - timedelta(seconds=max(0, int(retention_seconds)))
         survivors: list[_StoredMeta] = []
         for record in records:
-            if record.created_at < cutoff:
+            if not record.active and record.created_at < cutoff:
                 _remove_record_dir(record.record_dir)
+                if _record_payload_exists(record.record_dir):
+                    survivors.append(record)
             else:
                 survivors.append(record)
         return survivors
@@ -390,14 +527,20 @@ class ToolResultStore:
         if current + incoming_bytes <= budget:
             return
         for record in records:
+            if record.active:
+                continue
             _remove_record_dir(record.record_dir)
+            # Windows readers or filesystem errors can prevent deletion. Do
+            # not spend bytes which are still physically retained on disk.
+            if _record_payload_exists(record.record_dir):
+                continue
             current = max(0, current - record.size_bytes)
             if current + incoming_bytes <= budget:
                 return
-        if incoming_bytes > budget:
+        if current + incoming_bytes > budget:
             raise ToolResultStoreBudgetError(
                 "tool result snapshot exceeds disk budget "
-                f"({incoming_bytes} > {budget})"
+                f"({current} + {incoming_bytes} > {budget})"
             )
 
 
@@ -431,3 +574,99 @@ def _remove_record_dir(record_dir: Path) -> None:
         record_dir.rmdir()
     except OSError:
         pass
+
+
+@dataclass
+class ToolOutputSpool:
+    """One bounded raw prefix; completed retained text uses ordinary tr handles."""
+
+    store: ToolResultStore
+    handle: str
+    record_dir: Path
+    lease: BinaryIO
+    output: BinaryIO
+    max_bytes: int
+    tool_name: str
+    session_id: str
+    session_key: str
+    agent_id: str
+    size: int = 0
+
+    def append(self, chunk: bytes) -> None:
+        remaining = self.max_bytes - self.size
+        if remaining > 0:
+            retained = chunk[:remaining]
+            written = self.output.write(retained)
+            self.size += written or 0
+            if written != len(retained):
+                raise OSError("short output spool write")
+
+    def prefix(self) -> bytes:
+        self.output.seek(0)
+        return self.output.read(self.size)
+
+    def finish(self, content: str) -> str:
+        # Serialize rename with budget scans, so a scan cannot miss the spool
+        # while it changes from output.spool to content.txt between glob passes.
+        with self.store._budget_lock():
+            return self._finish_locked(content)
+
+    def _finish_locked(self, content: str) -> str:
+        payload = content.encode("utf-8")
+        if len(payload) > self.max_bytes:
+            raise ToolResultStoreBudgetError("retained output exceeds spool budget")
+        # Replace the spool in place: no second multi-MiB copy on disk. The
+        # lease keeps the reservation live until metadata and content settle.
+        self.output.seek(0)
+        if self.output.write(payload) != len(payload):
+            raise OSError("short retained output write")
+        self.output.truncate()
+        self.output.close()
+        meta = {
+            "handle": self.handle, "tool_use_id": self.handle,
+            "tool_name": self.tool_name, "session_id": self.session_id,
+            "session_key": self.session_key, "agent_id": self.agent_id,
+            "sha256": hashlib.sha256(payload).hexdigest(), "chars": len(content),
+            "size_bytes": len(payload), "stored_size_bytes": len(payload),
+            "storage_encoding": "utf-8", "content_file": TOOL_RESULT_CONTENT_NAME,
+            "created_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+        }
+        _atomic_write_bytes(
+            self.record_dir / TOOL_RESULT_META_NAME,
+            json.dumps(meta, ensure_ascii=False, sort_keys=True).encode("utf-8"),
+        )
+        (self.record_dir / _TOOL_OUTPUT_SPOOL_NAME).replace(
+            self.record_dir / TOOL_RESULT_CONTENT_NAME
+        )
+        self.close()
+        return self.handle
+
+    def close(self) -> None:
+        with suppress(OSError):
+            self.output.close()
+        if not self.lease.closed:
+            with suppress(OSError):
+                _release_file_lock(self.lease)
+            self.lease.close()
+        # Keep abandoned bounded data for ordinary retention/budget cleanup.
+
+
+def _output_spool_reservation(record_dir: Path) -> tuple[bool, int]:
+    lease_path = record_dir / _TOOL_OUTPUT_LEASE_NAME
+    try:
+        with lease_path.open("r+b") as lease:
+            if _try_file_lock(lease):
+                _release_file_lock(lease)
+                return False, 0
+            # Windows locks byte zero; read the reservation after that byte.
+            lease.seek(1)
+            reserved = int(lease.read(32))
+            return True, max(0, reserved)
+    except (OSError, ValueError):
+        return False, 0
+
+
+def _record_payload_exists(record_dir: Path) -> bool:
+    return any((record_dir / name).exists() for name in (
+        TOOL_RESULT_CONTENT_NAME, TOOL_RESULT_COMPRESSED_CONTENT_NAME, _TOOL_OUTPUT_SPOOL_NAME,
+    ))

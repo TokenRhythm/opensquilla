@@ -154,4 +154,24 @@ def test_tool_context_appends_new_runtime_fields_after_legacy_fields() -> None:
         "image_analysis_target",
         "desktop_browser",
         "artifact_source_paths",
+        "tool_result_store_max_bytes",
+        "tool_result_store_disk_budget_bytes",
+        "tool_result_store_retention_seconds",
     ]
+
+
+def test_tool_context_preserves_complete_legacy_positional_constructor() -> None:
+    defaults = ToolContext()
+    # The complete pre-output-spool constructor had 103 positional fields.
+    legacy_fields = fields(ToolContext)[:103]
+    assert legacy_fields[-1].name == "artifact_source_paths"
+    legacy_values = [getattr(defaults, item.name) for item in legacy_fields]
+    source_paths = {}
+    legacy_values[-1] = source_paths
+
+    context = ToolContext(*legacy_values)
+
+    assert context.artifact_source_paths is source_paths
+    assert context.tool_result_store_max_bytes == 8 * 1024 * 1024
+    assert context.tool_result_store_disk_budget_bytes == 256 * 1024 * 1024
+    assert context.tool_result_store_retention_seconds == 7 * 24 * 60 * 60

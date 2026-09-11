@@ -170,6 +170,27 @@ async def test_declared_tool_timeout_still_applies_when_generic_budget_is_disabl
     assert any(isinstance(event, DoneEvent) for event in events)
 
 
+def test_output_store_operator_limits_reach_ingress_context(tmp_path) -> None:
+    from opensquilla.tools.types import ToolContext
+
+    context = ToolContext(workspace_dir=str(tmp_path))
+    agent = Agent(
+        provider=RepeatedCallProvider(0),
+        tool_context=context,
+        config=AgentConfig(
+            tool_result_store_dir=str(tmp_path / "results"),
+            tool_result_store_session_id="synthetic-session",
+            tool_result_store_max_bytes=1024,
+            tool_result_store_disk_budget_bytes=4096,
+            tool_result_store_retention_seconds=60,
+        ),
+    )
+    for actual in (context, agent._tool_context):
+        assert actual is not None
+        assert actual.tool_result_store_max_bytes == 1024
+        assert actual.tool_result_store_disk_budget_bytes == 4096
+        assert actual.tool_result_store_retention_seconds == 60
+        assert actual.tool_result_store_dir == str(tmp_path / "results")
 
 
 @pytest.mark.parametrize("generic_timeout", [0.0, 60.0])

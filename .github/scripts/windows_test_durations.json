@@ -1416,6 +1416,7 @@
     "tests/test_tools/test_apply_patch_gates.py": 0.722,
     "tests/test_tools/test_approval_unification.py": 0.13,
     "tests/test_tools/test_bootstrap_write_notifications.py": 1.13,
+    "tests/test_tools/test_bounded_output_capture.py": 0.01,
     "tests/test_tools/test_code_exec_python_resolution.py": 0.085,
     "tests/test_tools/test_code_exec_sandbox_off_gate.py": 0.233,
     "tests/test_tools/test_coding_wait_timeout.py": 0.01,

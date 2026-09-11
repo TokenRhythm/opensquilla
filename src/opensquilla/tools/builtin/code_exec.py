@@ -48,7 +48,12 @@ from opensquilla.sandbox.types import (
     SandboxPolicy,
     SandboxRequest,
 )
-from opensquilla.subprocess_encoding import apply_utf8_child_env, decode_subprocess_output
+from opensquilla.subprocess_encoding import apply_utf8_child_env
+from opensquilla.tools.output_capture import (
+    OUTPUT_CAPTURE_TIMEOUT_PADDING,
+    OUTPUT_PREVIEW_BYTES,
+    BoundedOutputCapture,
+)
 from opensquilla.tools.registry import tool
 from opensquilla.tools.run_mode import full_host_access_active, trusted_sandbox_active
 from opensquilla.tools.types import ToolError, current_tool_context
@@ -778,8 +783,8 @@ def _unsupported_windows_environment_subprocess_payload(reason: str) -> str:
 
 _MAX_TIMEOUT = 120
 _DEFAULT_TIMEOUT = 30
-_EXECUTION_TIMEOUT_PADDING = 5.0
-_MAX_OUTPUT_CHARS = 50_000
+_EXECUTION_TIMEOUT_PADDING = 5.0 + OUTPUT_CAPTURE_TIMEOUT_PADDING
+_MAX_OUTPUT_CHARS = OUTPUT_PREVIEW_BYTES // 2
 _SANDBOX_PYTHON_CANDIDATES: tuple[Path, ...] = (
     Path("/usr/bin/python3"),
     Path("/bin/python3"),
@@ -833,11 +838,17 @@ def _execution_result_json(
     timed_out: bool,
     elapsed_ms: int,
 ) -> str:
+    def preview(text: str) -> str:
+        if len(text) <= _MAX_OUTPUT_CHARS:
+            return text
+        half = _MAX_OUTPUT_CHARS // 2
+        return text[:half] + "\n[output preview omitted characters]\n" + text[-half:]
+
     return json.dumps(
         {
             "exit_code": returncode,
-            "stdout": stdout[:_MAX_OUTPUT_CHARS],
-            "stderr": stderr[:_MAX_OUTPUT_CHARS],
+            "stdout": preview(stdout),
+            "stderr": preview(stderr),
             "timed_out": timed_out,
             "elapsed_ms": elapsed_ms,
         },
@@ -1234,67 +1245,53 @@ async def execute_code(
                 )
 
     process_started = False
+    capture = BoundedOutputCapture(streams=("stdout", "stderr"))
     try:
+        capture = await BoundedOutputCapture.create("execute_code", streams=("stdout", "stderr"))
         proc = await create_owned_subprocess_exec(
-            python_bin,
-            "-c",
-            code,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            cwd=str(workdir_path),
-            env=safe_env,
+            python_bin, "-c", code, stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE, cwd=str(workdir_path), env=safe_env,
         )
         process_started = True
         process_tree = capture_process_tree_owner(proc, isolated=True)
+        stdout_task = asyncio.create_task(capture.drain(proc.stdout, "stdout"))
+        stderr_task = asyncio.create_task(capture.drain(proc.stderr, "stderr"))
+        timed_out = False
+        from opensquilla.tools.builtin.shell import (
+            _await_bg_output_task,
+            _terminate_exec_process_tree,
+            _wait_exec_process,
+        )
+
         try:
-            stdout_bytes, stderr_bytes = await asyncio.wait_for(proc.communicate(), timeout=timeout)
-        except asyncio.CancelledError:
-            from opensquilla.tools.builtin.shell import _terminate_exec_process_tree
-
+            timed_out = not await _wait_exec_process(proc, timeout)
+        finally:
             await asyncio.shield(_terminate_exec_process_tree(proc, process_tree))
-            raise
-        except TimeoutError:
-            from opensquilla.tools.builtin.shell import _terminate_exec_process_tree
-
-            await _terminate_exec_process_tree(proc, process_tree)
-            elapsed_ms = (time.monotonic_ns() - start_ns) // 1_000_000
-            return finish(
-                _execution_result_json(
-                    returncode=-1,
-                    stdout="",
-                    stderr=f"Execution timed out after {timeout}s",
-                    timed_out=True,
-                    elapsed_ms=elapsed_ms,
-                )
+            await asyncio.gather(
+                _await_bg_output_task(stdout_task), _await_bg_output_task(stderr_task),
             )
-
-        from opensquilla.tools.builtin.shell import _terminate_exec_process_tree
-
-        await _terminate_exec_process_tree(proc, process_tree)
+            await capture.finish_async()
         elapsed_ms = (time.monotonic_ns() - start_ns) // 1_000_000
-        stdout = decode_subprocess_output(stdout_bytes)
-        stderr = decode_subprocess_output(stderr_bytes)
-
-        return finish(
-            _execution_result_json(
-                returncode=proc.returncode if proc.returncode is not None else -1,
-                stdout=stdout,
-                stderr=stderr,
-                timed_out=False,
-                elapsed_ms=elapsed_ms,
-            )
-        )
+        stderr = capture.preview("stderr")
+        if timed_out:
+            stderr += f"\nExecution timed out after {timeout}s"
+        payload = json.loads(_execution_result_json(
+            returncode=-1 if timed_out else (proc.returncode or 0),
+            stdout=capture.preview("stdout"), stderr=stderr,
+            timed_out=timed_out, elapsed_ms=elapsed_ms,
+        ))
+        payload["output_capture"] = capture.describe()
+        return finish(json.dumps(payload, ensure_ascii=False))
     except Exception as exc:
-        return finish(
-            _execution_result_json(
-                returncode=-1,
-                stdout="",
-                stderr=f"Execution error: {exc}",
-                timed_out=False,
-                elapsed_ms=0,
-            ),
-            executed=process_started,
-        )
+        await capture.finish_async()
+        payload = json.loads(_execution_result_json(
+            returncode=-1, stdout=capture.preview("stdout"),
+            stderr=capture.preview("stderr") + f"\nExecution error: {exc}",
+            timed_out=False, elapsed_ms=0,
+        ))
+        payload["output_capture"] = capture.describe()
+        return finish(json.dumps(payload, ensure_ascii=False), executed=process_started)
     finally:
+        await capture.finish_async()
         if cleanup_dir:
             shutil.rmtree(cleanup_dir, ignore_errors=True)
