@@ -53,7 +53,7 @@ must not be represented as a successful operation.
    cannot prove the later gap repaired. Session identity, stream generation and
    read/consumer revisions fence old work. A bounded overflow becomes explicit
    dirty state, not a truncated replay declared complete.
-4. **Bounded consumption flow (candidate-only).** A slow client pauses its own
+4. **Bounded consumption flow (default-on).** A slow client pauses its own
    replayable session events. Other connections progress. Dirty intent replaces
    unlimited pending deltas. No consumer, parsing success or elapsed 100ms alone
    can ACK an event. The 100ms observation requests a version-fenced recovery;
@@ -72,19 +72,20 @@ explicit: ping 20s, timeout 120s, inbound frame maximum 25MiB. Authenticated
 application idle eviction defaults to disabled. Foreground/system-resume signals
 grant grace and inspect the existing socket; they do not themselves retire it.
 
-The server switch is **off by default**:
+The server switch is **on by default** for the matched client/Gateway release.
+It remains an operator-controlled emergency kill switch:
 
 ```text
 OPENSQUILLA_GATEWAY_WS_TRANSPORT_FLOW_ENABLED=true
 ```
 
-Enable it only in an isolated candidate environment until compatibility and
-long-duration gates pass. Both peers must negotiate `transport.flow.v1` and
-support the new methods. Existing clients receive the existing event format.
-Turning the switch off affects newly established connections and does not
-remove request isolation or sustained reconnect. With flow disabled, the legacy
-512-frame resource protection can still close an overloaded client; the
-candidate flow improvement must not be claimed as the default release behavior.
+Set it to `false` only for emergency rollback or controlled diagnosis. Both
+peers must negotiate `transport.flow.v1` and support the new methods. Existing
+clients receive the existing event format. Turning the switch off affects newly
+established connections and does not remove request isolation or sustained
+reconnect. With flow disabled, the legacy 512-frame resource protection can
+still close an overloaded client. Long-duration and packaged-client gates remain
+required after enabling the default.
 
 ## Wire and memory contract
 

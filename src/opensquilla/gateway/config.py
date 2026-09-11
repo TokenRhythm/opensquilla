@@ -2284,7 +2284,7 @@ class ModelOverrideConfig(BaseModel):
 
 
 class _EnvWithoutConfigVersion(PydanticBaseSettingsSource):
-    """Env-backed settings source that never yields ``config_version``.
+    """Filter env fields owned by explicit runtime resolution.
 
     ``config_version`` is the migration stamp owned by the config payload:
     ``migrate_config_payload`` injects it at every disk-load boundary, and
@@ -2293,7 +2293,9 @@ class _EnvWithoutConfigVersion(PydanticBaseSettingsSource):
     payload at all (e.g. the no-file default branch of ``GatewayConfig.load``
     and ``config_store.load_config``) — so
     ``OPENSQUILLA_GATEWAY_CONFIG_VERSION`` can never gate or skip migrations.
-    Only this one key is filtered; every other env override is untouched.
+    The transport-flow kill switch is also applied explicitly below so invalid
+    values can fall back to the validated default with a warning instead of
+    failing Gateway construction during Pydantic coercion.
     """
 
     def __init__(self, inner: PydanticBaseSettingsSource) -> None:
@@ -2306,6 +2308,7 @@ class _EnvWithoutConfigVersion(PydanticBaseSettingsSource):
     def __call__(self) -> dict[str, Any]:
         values = dict(self._inner())
         values.pop("config_version", None)
+        values.pop("ws_transport_flow_enabled", None)
         return values
 
 
@@ -2747,9 +2750,10 @@ class GatewayConfig(BaseSettings):
     # Disabled by default: sleeping renderers stop application pings without
     # implying a dead transport. Native WebSocket keepalive remains enabled.
     client_ws_keepalive_timeout_s: float = 0.0
-    # New consumption feedback is opt-in until every client data domain can
-    # acknowledge application or safely reconcile an explicitly dirty stream.
-    ws_transport_flow_enabled: bool = False
+    # Consumption feedback is enabled for the matched client/Gateway release.
+    # The environment override remains an emergency kill switch while
+    # capability negotiation preserves safe fallback for other peers.
+    ws_transport_flow_enabled: bool = True
     # WebSocket per-connection outbound writer queue. When enabled, every connection gets a
     # bounded asyncio.Queue + dedicated writer task; producers enqueue and
     # return immediately. Legacy peers retain overflow-close protection;
@@ -2880,6 +2884,21 @@ class GatewayConfig(BaseSettings):
                     "falling back to default ws_writer_queue_enabled=%s",
                     ws_enabled_env,
                     self.ws_writer_queue_enabled,
+                )
+
+        flow_enabled_env = os.environ.get("OPENSQUILLA_GATEWAY_WS_TRANSPORT_FLOW_ENABLED")
+        if flow_enabled_env is not None:
+            normalized = flow_enabled_env.strip().lower()
+            if normalized in ("true", "1", "yes"):
+                self.ws_transport_flow_enabled = True
+            elif normalized in ("false", "0", "no"):
+                self.ws_transport_flow_enabled = False
+            else:
+                _log.warning(
+                    "OPENSQUILLA_GATEWAY_WS_TRANSPORT_FLOW_ENABLED=%r is not a valid bool; "
+                    "falling back to default ws_transport_flow_enabled=%s",
+                    flow_enabled_env,
+                    self.ws_transport_flow_enabled,
                 )
 
         ws_maxsize_env = os.environ.get("OPENSQUILLA_WS_WRITER_QUEUE_MAXSIZE")
