@@ -27,6 +27,7 @@ from opensquilla.engine.usage_accounting import (
 )
 from opensquilla.env import trust_env as _trust_env
 from opensquilla.provider.audio import (
+    AtlasCloudAudioProductionProvider,
     AudioGenerationResult,
     DubbingDownloadRequest,
     DubbingRequest,
@@ -41,6 +42,7 @@ from opensquilla.provider.audio import (
     VoiceCloneRequest,
     VoiceConversionRequest,
     VoiceConversionResult,
+    resolve_atlascloud_api_key_env,
     resolve_elevenlabs_api_key_env,
 )
 from opensquilla.provider.auxiliary_budget import (
@@ -1151,24 +1153,33 @@ def _resolve_audio_config() -> Any:
     return AudioConfig()
 
 
-def _audio_provider_config(config: Any) -> Any:
+def _audio_provider_id(config: Any) -> str:
+    return str(getattr(config, "provider", "elevenlabs") or "elevenlabs")
+
+
+def _audio_provider_config(config: Any, provider_id: str | None = None) -> Any:
     providers = getattr(config, "providers", None)
-    return getattr(providers, "elevenlabs", None)
+    return getattr(providers, provider_id or _audio_provider_id(config), None)
 
 
-def _audio_configured(config: Any) -> bool:
+def _audio_configured(config: Any, provider_id: str | None = None) -> bool:
     if not getattr(config, "enabled", False):
         return False
-    provider_config = _audio_provider_config(config)
+    resolved_provider_id = provider_id or _audio_provider_id(config)
+    provider_config = _audio_provider_config(config, resolved_provider_id)
     if provider_config is None:
         return False
     api_key = str(getattr(provider_config, "api_key", "") or "")
-    api_key_env = resolve_elevenlabs_api_key_env(provider_config)
+    api_key_env = (
+        resolve_atlascloud_api_key_env(provider_config)
+        if resolved_provider_id == "atlascloud"
+        else resolve_elevenlabs_api_key_env(provider_config)
+    )
     return bool(api_key or os.environ.get(api_key_env))
 
 
 def _elevenlabs_provider(config: Any) -> ElevenLabsAudioProductionProvider:
-    provider_config = _audio_provider_config(config)
+    provider_config = _audio_provider_config(config, "elevenlabs")
     api_key_env = resolve_elevenlabs_api_key_env(provider_config)
     return ElevenLabsAudioProductionProvider(
         api_key=str(getattr(provider_config, "api_key", "") or "") or None,
@@ -1177,17 +1188,32 @@ def _elevenlabs_provider(config: Any) -> ElevenLabsAudioProductionProvider:
     )
 
 
+def _audio_production_provider(
+    config: Any,
+) -> ElevenLabsAudioProductionProvider | AtlasCloudAudioProductionProvider:
+    if _audio_provider_id(config) != "atlascloud":
+        return _elevenlabs_provider(config)
+    provider_config = _audio_provider_config(config, "atlascloud")
+    api_key_env = resolve_atlascloud_api_key_env(provider_config)
+    return AtlasCloudAudioProductionProvider(
+        api_key=str(getattr(provider_config, "api_key", "") or "") or None,
+        api_key_env=api_key_env,
+        base_url=str(getattr(provider_config, "base_url", "") or "https://api.atlascloud.ai"),
+    )
+
+
 def _audio_not_available_payload(
     *,
     tool_name: str,
     missing_capability: str,
     note: str,
+    provider: str = "elevenlabs",
 ) -> str:
     return json.dumps(
         {
             "status": "not_available",
             "tool": tool_name,
-            "provider": "elevenlabs",
+            "provider": provider,
             "missing_capability": missing_capability,
             "note": note,
         }
@@ -1513,7 +1539,7 @@ async def voice_clone(
             note="Voice cloning requires explicit consent metadata for the target voice.",
         )
     config = _resolve_audio_config()
-    if not _audio_configured(config):
+    if not _audio_configured(config, "elevenlabs"):
         return _audio_not_available_payload(
             tool_name="voice_clone",
             missing_capability="voice_cloning",
@@ -1584,13 +1610,13 @@ async def voice_convert(
             note="Voice conversion requires explicit consent metadata for the source voice.",
         )
     config = _resolve_audio_config()
-    if not _audio_configured(config):
+    if not _audio_configured(config, "elevenlabs"):
         return _audio_not_available_payload(
             tool_name="voice_convert",
             missing_capability="voice_conversion",
             note="ElevenLabs voice-conversion provider is disabled or not configured.",
         )
-    provider_config = _audio_provider_config(config)
+    provider_config = _audio_provider_config(config, "elevenlabs")
     model_id = str(
         getattr(provider_config, "voice_conversion_model", "")
         or "eleven_multilingual_sts_v2"
@@ -1651,7 +1677,7 @@ async def dubbing_generate(
     if not target_language or not target_language.strip():
         raise ToolError("Target language must not be empty")
     config = _resolve_audio_config()
-    if not _audio_configured(config):
+    if not _audio_configured(config, "elevenlabs"):
         return _audio_not_available_payload(
             tool_name="dubbing_generate",
             missing_capability="advanced_dubbing",
@@ -1708,7 +1734,7 @@ async def dubbing_status(dubbing_id: str) -> str:
     if not dubbing_id or not dubbing_id.strip():
         raise ToolError("Dubbing id must not be empty")
     config = _resolve_audio_config()
-    if not _audio_configured(config):
+    if not _audio_configured(config, "elevenlabs"):
         return _audio_not_available_payload(
             tool_name="dubbing_status",
             missing_capability="advanced_dubbing",
@@ -1766,7 +1792,7 @@ async def dubbing_download(
     if not language_code or not language_code.strip():
         raise ToolError("Language code must not be empty")
     config = _resolve_audio_config()
-    if not _audio_configured(config):
+    if not _audio_configured(config, "elevenlabs"):
         return _audio_not_available_payload(
             tool_name="dubbing_download",
             missing_capability="advanced_dubbing",
@@ -1828,7 +1854,7 @@ async def dubbing_download(
 
 @tool(
     name="music_generate",
-    description="Generate instrumental music through ElevenLabs.",
+    description="Generate instrumental music through the configured audio provider.",
     params={
         "prompt": {"type": "string", "description": "Music prompt."},
         "style": {"type": "string", "description": "Optional style hint."},
@@ -1848,17 +1874,19 @@ async def music_generate(
         raise ToolError("Prompt must not be empty")
     config = _resolve_audio_config()
     if not _audio_configured(config):
+        provider_id = _audio_provider_id(config)
         return _audio_not_available_payload(
             tool_name="music_generate",
             missing_capability="music_generation",
-            note="ElevenLabs music provider is disabled or not configured.",
+            note=f"{provider_id} music provider is disabled or not configured.",
+            provider=provider_id,
         )
     provider_config = _audio_provider_config(config)
     final_prompt = prompt.strip()
     if style and style.strip():
         final_prompt = f"{final_prompt}\nStyle: {style.strip()}"
     try:
-        result = await _elevenlabs_provider(config).generate_music(
+        result = await _audio_production_provider(config).generate_music(
             MusicGenerationRequest(
                 prompt=final_prompt,
                 model_id=str(getattr(provider_config, "music_model", "") or "music_v1"),
@@ -1875,6 +1903,7 @@ async def music_generate(
             tool_name="music_generate",
             missing_capability="music_generation",
             note=str(exc),
+            provider=_audio_provider_id(config),
         )
     return _write_generated_audio_payload(
         result,
@@ -1886,7 +1915,7 @@ async def music_generate(
 
 @tool(
     name="song_generate",
-    description="Generate a song with sung vocals through ElevenLabs music generation.",
+    description="Generate a song with sung vocals through the configured audio provider.",
     params={
         "lyrics": {"type": "string", "description": "Original lyrics to sing."},
         "vocal_style": {"type": "string", "description": "Optional vocal style."},
@@ -1908,10 +1937,12 @@ async def song_generate(
         raise ToolError("Lyrics must not be empty")
     config = _resolve_audio_config()
     if not _audio_configured(config):
+        provider_id = _audio_provider_id(config)
         return _audio_not_available_payload(
             tool_name="song_generate",
             missing_capability="singing_generation",
-            note="ElevenLabs music provider is disabled or not configured.",
+            note=f"{provider_id} music provider is disabled or not configured.",
+            provider=provider_id,
         )
     provider_config = _audio_provider_config(config)
     prompt_parts = ["Generate a complete song with sung vocals."]
@@ -1919,7 +1950,7 @@ async def song_generate(
         prompt_parts.append(f"Vocal style: {vocal_style.strip()}")
     if backing_style and backing_style.strip():
         prompt_parts.append(f"Backing style: {backing_style.strip()}")
-    provider = _elevenlabs_provider(config)
+    provider = _audio_production_provider(config)
     lyrics_text = lyrics.strip()
     model_id = str(getattr(provider_config, "music_model", "") or "music_v1")
     output_format = str(
@@ -1956,6 +1987,7 @@ async def song_generate(
                     tool_name="song_generate",
                     missing_capability="singing_generation",
                     note=str(retry_exc),
+                    provider=_audio_provider_id(config),
                 )
             return _write_generated_audio_payload(
                 result,
@@ -1975,6 +2007,7 @@ async def song_generate(
             tool_name="song_generate",
             missing_capability="singing_generation",
             note=str(exc),
+            provider=_audio_provider_id(config),
         )
     return _write_generated_audio_payload(
         result,
@@ -1986,7 +2019,7 @@ async def song_generate(
 
 @tool(
     name="audio_provider_capabilities",
-    description="Report configured ElevenLabs audio provider capabilities.",
+    description="Report configured audio provider capabilities.",
     params={
         "probe_live": {
             "type": "boolean",
@@ -1998,7 +2031,27 @@ async def song_generate(
 )
 async def audio_provider_capabilities(probe_live: bool = False) -> str:
     config = _resolve_audio_config()
+    provider_id = _audio_provider_id(config)
     configured = _audio_configured(config)
+    if provider_id == "atlascloud":
+        status = "available" if configured else "unavailable"
+        return json.dumps(
+            {
+                "status": "ok",
+                "provider": provider_id,
+                "configured": configured,
+                "capabilities": {
+                    "text_to_speech": {"status": status},
+                    "music_generation": {"status": status},
+                    "singing_generation": {"status": status},
+                    "voice_search": {"status": "unavailable"},
+                    "voice_conversion": {"status": "unavailable"},
+                    "advanced_dubbing": {"status": "unavailable"},
+                    "dubbing_download": {"status": "unavailable"},
+                    "voice_cloning": {"status": "unavailable"},
+                },
+            }
+        )
     payload: dict[str, Any] = {
         "status": "ok",
         "provider": "elevenlabs",
@@ -2086,7 +2139,7 @@ async def voice_search(
     page_size: int = 10,
 ) -> str:
     config = _resolve_audio_config()
-    if not _audio_configured(config):
+    if not _audio_configured(config, "elevenlabs"):
         return _audio_not_available_payload(
             tool_name="voice_search",
             missing_capability="voice_search",
@@ -2206,14 +2259,26 @@ async def tts(
 
     config = _resolve_audio_config()
     if not _audio_configured(config):
+        provider_id = _audio_provider_id(config)
         return _audio_not_available_payload(
             tool_name="tts",
             missing_capability="text_to_speech",
-            note="ElevenLabs audio provider is disabled or not configured.",
+            note=f"{provider_id} audio provider is disabled or not configured.",
+            provider=provider_id,
         )
     tts_config = getattr(config, "tts", None)
-    model_id = str(getattr(tts_config, "model", "") or "eleven_multilingual_v2")
-    resolved_voice = str(voice or getattr(tts_config, "voice", "") or "").strip()
+    provider_config = _audio_provider_config(config)
+    default_model = str(getattr(provider_config, "tts_model", "") or "eleven_multilingual_v2")
+    default_voice = str(getattr(provider_config, "tts_voice", "") or "")
+    model_id = str(getattr(tts_config, "model", "") or default_model)
+    if _audio_provider_id(config) == "atlascloud":
+        model_id = default_model
+    resolved_voice = str(
+        voice
+        or (default_voice if _audio_provider_id(config) == "atlascloud" else "")
+        or getattr(tts_config, "voice", "")
+        or ""
+    ).strip()
     if not resolved_voice:
         raise ToolError("Voice must not be empty")
     resolved_language_code = str(
@@ -2229,7 +2294,7 @@ async def tts(
     )
     output_format = str(getattr(tts_config, "output_format", "") or "mp3_44100_128")
     timeout_seconds = float(getattr(tts_config, "timeout_seconds", 120.0) or 120.0)
-    provider = _elevenlabs_provider(config)
+    provider = _audio_production_provider(config)
     try:
         result = await provider.text_to_speech(
             ElevenLabsTextToSpeechRequest(
@@ -2247,6 +2312,7 @@ async def tts(
             tool_name="tts",
             missing_capability="text_to_speech",
             note=str(exc),
+            provider=_audio_provider_id(config),
         )
     return _write_generated_audio_payload(
         result,
