@@ -132,9 +132,7 @@ async def test_cron_creator_authority_survives_persistence_without_widening_owne
         creator_is_owner or expected_persisted_host_execute
     )
     assert bool(envelope.metadata.get("cron_trusted_owner")) is creator_is_owner
-    assert bool(envelope.metadata.get("cron_trusted_host")) is (
-        expected_persisted_host_execute
-    )
+    assert bool(envelope.metadata.get("cron_trusted_host")) is (expected_persisted_host_execute)
     assert bool(envelope.metadata.get(PRINCIPAL_HOST_EXECUTE_METADATA_KEY)) is (
         expected_persisted_host_execute
     )
@@ -321,6 +319,51 @@ async def test_ops_add_at_rejects_naive_iso(tmp_path: Path) -> None:
                 session_target=SessionTarget.ISOLATED,
                 schedule_kind=ScheduleKind.AT,
                 schedule_value="2026-05-15T09:00:00",
+            )
+    finally:
+        await store.close()
+
+
+async def test_ops_add_at_rejects_past_timestamp(tmp_path: Path) -> None:
+    """A one-time ``at`` in the past would fire immediately then delete itself;
+    reject it at creation time instead (issue #1516)."""
+    store, ops = await _open_ops(tmp_path)
+    try:
+        past = (datetime.now(UTC) - timedelta(hours=1)).isoformat()
+        with pytest.raises(ValueError, match="in the past"):
+            await ops.add(
+                name="stale",
+                handler_key="agent_run",
+                payload=make_agent_turn_payload("ping"),
+                session_target=SessionTarget.ISOLATED,
+                schedule_kind=ScheduleKind.AT,
+                schedule_value=past,
+            )
+        # Nothing should have been persisted.
+        assert await store.list_active() == []
+    finally:
+        await store.close()
+
+
+async def test_ops_update_at_rejects_past_timestamp(tmp_path: Path) -> None:
+    """Repointing a job to a past one-time ``at`` is rejected as well."""
+    store, ops = await _open_ops(tmp_path)
+    try:
+        future = (datetime.now(UTC) + timedelta(hours=1)).isoformat()
+        job = await ops.add(
+            name="once",
+            handler_key="agent_run",
+            payload=make_agent_turn_payload("ping"),
+            session_target=SessionTarget.ISOLATED,
+            schedule_kind=ScheduleKind.AT,
+            schedule_value=future,
+        )
+        past = (datetime.now(UTC) - timedelta(hours=1)).isoformat()
+        with pytest.raises(ValueError, match="in the past"):
+            await ops.update(
+                job.id,
+                schedule_kind=ScheduleKind.AT,
+                schedule_value=past,
             )
     finally:
         await store.close()
