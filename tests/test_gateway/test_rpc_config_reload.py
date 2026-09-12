@@ -93,6 +93,30 @@ async def test_reload_invalid_field_value_leaves_config_untouched(tmp_path) -> N
     assert ctx.config.model_dump(mode="python") == before_dump
 
 
+async def test_reload_hot_applies_context_compaction_settings(tmp_path) -> None:
+    path = tmp_path / "config.toml"
+    path.write_text(
+        "\n".join(
+            (
+                "context_budget_tokens = 75000",
+                'context_overflow_policy = "refuse"',
+                "preflight_compact_ratio = 0.7",
+            )
+        ),
+        encoding="utf-8",
+    )
+    cfg = GatewayConfig(config_path=str(path))
+    ctx = SimpleNamespace(config=cfg)
+
+    res = await _handle_config_reload(None, ctx)
+
+    assert res["ok"] is True
+    assert ctx.config is cfg
+    assert ctx.config.context_budget_tokens == 75_000
+    assert ctx.config.context_overflow_policy.value == "refuse"
+    assert ctx.config.preflight_compact_ratio == 0.7
+
+
 # ---------------------------------------------------------------------------
 # 2. Boot-generated auth token survives by value AND marker
 # ---------------------------------------------------------------------------

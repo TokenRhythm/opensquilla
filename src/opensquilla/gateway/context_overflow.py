@@ -1,8 +1,9 @@
-"""Context-overflow policy enforcement.
+"""Legacy context-overflow policy helper.
 
-Helpers consulted by the gateway's chat entry-point before the turn is
-handed off to the engine. The policy layer is deliberately small and
-synchronous where possible — it either:
+The built-in chat entry point intentionally accepts turns without calling this
+helper; automatic context shaping lives in the shared turn runner. This module
+remains for compatibility callers and focused policy tests. When called, it
+either:
 
 * returns :data:`PROCEED_NORMALLY` → the caller continues as today, or
 * returns :class:`OverflowOutcome` carrying an error envelope (for REFUSE)
