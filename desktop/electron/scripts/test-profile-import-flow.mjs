@@ -298,6 +298,11 @@ async function onboardingPage(app) {
   }, 'Desktop onboarding')
 }
 
+async function chooseTelemetryConsent(page, reliability = false, growth = false) {
+  await page.locator(`input[name="reliabilityDiagnosticsEnabled"][value="${reliability}"]`).check()
+  await page.locator(`input[name="productAnalyticsEnabled"][value="${growth}"]`).check()
+}
+
 async function captureOnboarding(app, path) {
   const base64 = await app.evaluate(async ({ BrowserWindow }) => {
     const window = BrowserWindow.getAllWindows().find((candidate) => (
@@ -351,6 +356,7 @@ async function selectOllamaAndCompleteOnboarding(page) {
   if (!(await page.locator('#model').inputValue()).trim()) {
     await page.locator('#model').fill('synthetic-local-model')
   }
+  await chooseTelemetryConsent(page, false, false)
   await page.locator('#finish').click()
 }
 
@@ -584,6 +590,7 @@ try {
     join(settingsUserData, 'migration-provider-setup.json'),
   )
   await requiredKeyOnboarding.locator('#apiKey').fill('synthetic-new-imported-key')
+  await chooseTelemetryConsent(requiredKeyOnboarding, false, false)
   await requiredKeyOnboarding.locator('#finish').click()
 
   const rejectedProbeError = await waitFor(async () => {
@@ -643,10 +650,18 @@ try {
     'Bearer synthetic-new-imported-key',
   )
   assert.equal(JSON.parse(fakeProvider.requests[1].body).model, 'gpt-5.4-mini')
-  assert.deepEqual(
-    await readFile(join(settingsTarget, 'config.toml')),
-    importedConfigBeforeCredential,
-    'provider adoption rewrote imported config.toml',
+  const adoptedConfig = await readFile(join(settingsTarget, 'config.toml'), 'utf8')
+  assert.match(adoptedConfig, /reliability_diagnostics_enabled = false/)
+  assert.match(adoptedConfig, /product_analytics_enabled = false/)
+  assert.doesNotMatch(adoptedConfig, /(?:reliability|product_analytics)_notice_version/)
+  assert.doesNotMatch(adoptedConfig, /(?:reliability|product_analytics)_consented_at_utc/)
+  assert.equal(
+    adoptedConfig.replace(
+      /^reliability_diagnostics_enabled = false\r?\nproduct_analytics_enabled = false\r?\n/m,
+      '',
+    ),
+    importedConfigBeforeCredential.toString('utf8'),
+    'provider adoption changed imported config beyond explicit telemetry decisions',
   )
   assert.deepEqual(
     await readFile(join(settingsTarget, '.env')),

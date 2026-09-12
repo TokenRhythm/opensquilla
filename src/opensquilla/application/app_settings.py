@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 from collections.abc import Callable, Mapping, Sequence
+from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal, NotRequired, Protocol, Self, TypedDict, cast
@@ -56,10 +57,25 @@ _PUBLIC_DERIVED_CONFIG_PATHS = frozenset(
         "llm_ensemble.selection_configured",
         "llm_ensemble.activation_preview",
         "privacy.network_observability_disabled_effective",
+        "privacy.reliability_diagnostics_forced_off",
+        "privacy.product_analytics_forced_off",
     }
 )
 
-_READONLY_PATHS = frozenset({"auth.token", "auth.password", "config_version"})
+# Scoped consent is authored only by its notice/cleanup transaction.
+_SCOPED_TELEMETRY_CONSENT_PATHS = frozenset(
+    {
+        "privacy.reliability_diagnostics_enabled",
+        "privacy.reliability_notice_version",
+        "privacy.reliability_consented_at_utc",
+        "privacy.product_analytics_enabled",
+        "privacy.product_analytics_notice_version",
+        "privacy.product_analytics_consented_at_utc",
+    }
+)
+_READONLY_PATHS = (
+    frozenset({"auth.token", "auth.password", "config_version"}) | _SCOPED_TELEMETRY_CONSENT_PATHS
+)
 
 # Configuration that belongs exclusively to the local TOML file.  Unlike
 # secrets, these fields are omitted entirely from public reads and must survive
@@ -124,6 +140,7 @@ class SettingsRuntime[Config: SettingsConfig, PreparedProvider](Protocol):
     def resolve_path(self) -> Path: ...
     def load(self, path: Path) -> Config: ...
     def replace(self, old: Config, new: Config) -> None: ...
+    def mutation_scope(self, candidate: Config) -> AbstractAsyncContextManager[None]: ...
     def reconcile_routing(
         self, candidate: Config, paths: set[str], *, previous: Config
     ) -> Mapping[str, object]: ...
@@ -247,9 +264,11 @@ class AppSettings[Config: SettingsConfig, PreparedProvider]:
         runtime = self._runtime
         provider = runtime.resolve_provider(candidate)
         # Persistence is the commit point. Later runtime failures do not undo it.
-        runtime.persist(candidate)
+        async with runtime.mutation_scope(candidate):
+            runtime.persist(candidate)
+            if before.config is not None:
+                runtime.replace(before.config, candidate)
         if before.config is not None:
-            runtime.replace(before.config, candidate)
             await runtime.notify_goal(before.previous)
         runtime.sync_provider(provider)
         await runtime.sync_runtime(before.previous, candidate)
@@ -394,9 +413,12 @@ class AppSettings[Config: SettingsConfig, PreparedProvider]:
         if before.config is not None and not replacement.get("config_path"):
             replacement["config_path"] = before.config.config_path
         replacement, redacted = _restore_redacted_values(replacement, before.payload)
+        replacement = _preserve_readonly_config_values(replacement, before.payload)
         replacement = _strip_public_derived_config_fields(replacement)
         _reconcile_local_file_only_llm(before.payload, replacement)
-        candidate = self._candidate(before, replacement, _collect_paths(replacement), redacted)
+        candidate = self._candidate(
+            before, replacement, _collect_paths(replacement) - _READONLY_PATHS, redacted,
+        )
         return await self._write(before, candidate)
 
     async def reload(self) -> SettingsObject:
@@ -406,6 +428,8 @@ class AppSettings[Config: SettingsConfig, PreparedProvider]:
         target = runtime.resolve_path()
         try:
             candidate = runtime.load(target)
+            for path in sorted(_SCOPED_TELEMETRY_CONSENT_PATHS):
+                _set_config_attr(candidate, path, _get_config_attr(before.config, path))
             runtime.validate_embedding(candidate)
         except Exception as exc:
             return {"ok": False, "path": str(target), "error": str(exc)}
@@ -421,7 +445,8 @@ class AppSettings[Config: SettingsConfig, PreparedProvider]:
         # Reload synchronizes the candidate before replacing live state and never persists.
         runtime.sync_provider(runtime.resolve_provider(candidate))
         result = _change_meta(before.payload, _config_dump(candidate))
-        runtime.replace(before.config, candidate)
+        async with runtime.mutation_scope(candidate):
+            runtime.replace(before.config, candidate)
         await runtime.notify_goal(before.previous)
         await runtime.sync_runtime(before.previous, candidate)
         await runtime.refresh_catalog(before.catalog, candidate, force=True)
@@ -509,10 +534,16 @@ def _strip_public_derived_config_fields(payload: dict[str, Any]) -> dict[str, An
         ensemble.pop("activation_preview", None)
         payload["llm_ensemble"] = ensemble
     privacy = payload.get("privacy")
-    if isinstance(privacy, dict) and "network_observability_disabled_effective" in privacy:
+    derived_privacy_fields = (
+        "network_observability_disabled_effective",
+        "reliability_diagnostics_forced_off",
+        "product_analytics_forced_off",
+    )
+    if isinstance(privacy, dict) and any(key in privacy for key in derived_privacy_fields):
         payload = dict(payload)
         privacy = dict(privacy)
-        privacy.pop("network_observability_disabled_effective", None)
+        for key in derived_privacy_fields:
+            privacy.pop(key, None)
         payload["privacy"] = privacy
     return payload
 
@@ -703,11 +734,24 @@ def _path_segments_is_or_contains_readonly(path: tuple[str, ...]) -> bool:
     )
 
 
+def _preserve_readonly_config_values(
+    payload: SettingsObject, current_payload: SettingsObject,
+) -> SettingsObject:
+    cleaned = _prune_readonly_paths(payload)
+    for path in sorted(_READONLY_PATHS):
+        try:
+            value = _resolve_path(current_payload, path)
+        except KeyError:
+            continue
+        _set_path(cleaned, path, copy.deepcopy(value))
+    return cleaned
+
+
 def _prune_readonly_paths(patch: dict[str, Any]) -> dict[str, Any]:
     """Return a copy of ``patch`` with every read-only path protected.
 
     Mirrors the ``continue`` guard the dot-path form applies to
-    ``_READONLY_PATHS`` (auth.token, auth.password, config_version), so the
+    ``_READONLY_PATHS``, so the
     dict-merge form cannot smuggle a write to those paths past the guard. A
     non-mapping replacement of a read-only ancestor is dropped because it
     would otherwise replace or delete the protected descendants wholesale.

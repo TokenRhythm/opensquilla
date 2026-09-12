@@ -164,12 +164,15 @@ def prewarm_tokenrhythm_install_id(
     config: Any | None = None,
     state_path: str | Path | None = None,
 ) -> threading.Thread | None:
-    """Best-effort wrapper that never lets install-id prewarming affect startup."""
+    """Retired compatibility API; never resolve a provider installation ID.
 
-    try:
-        return _prewarm_tokenrhythm_install_id(config=config, state_path=state_path)
-    except Exception:
-        return None
+    Telemetry v2 deliberately separates consent-scoped analytics identifiers
+    from provider requests.  Keep the callable so older integrations do not
+    fail at import time, but make every production invocation side-effect free.
+    """
+
+    del config, state_path
+    return None
 
 
 def _prewarm_tokenrhythm_install_id(
@@ -266,18 +269,10 @@ def tokenrhythm_install_id_headers(
     state_path: str | Path | None = None,
     proxy: str | None = None,
 ) -> dict[str, str]:
-    """Best-effort install-id headers that can never fail a provider request."""
+    """Retired compatibility API; never attach an installation identifier."""
 
-    try:
-        return _tokenrhythm_install_id_headers(
-            provider_kind,
-            base_url,
-            config=config,
-            state_path=state_path,
-            proxy=proxy,
-        )
-    except Exception:
-        return {}
+    del provider_kind, base_url, config, state_path, proxy
+    return {}
 
 
 def _tokenrhythm_install_id_headers(
@@ -320,7 +315,7 @@ def _tokenrhythm_install_id_headers(
     if install_id:
         return {TOKENRHYTHM_INSTALL_ID_HEADER: install_id}
 
-    prewarm_tokenrhythm_install_id(
+    _prewarm_tokenrhythm_install_id(
         config=context.config,
         state_path=context.state_path,
     )

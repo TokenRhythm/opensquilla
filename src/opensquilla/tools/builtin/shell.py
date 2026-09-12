@@ -1048,11 +1048,29 @@ def _gate_safe_command_approval(
 def _base_shell_environment() -> dict[str, str]:
     ctx = current_tool_context.get()
     if ctx is not None and ctx.guest_safe:
-        return _runtime_shell_environment(
+        environment = _runtime_shell_environment(
             dict(ctx.environment or {}),
             require_bundled=True,
         )
-    return _runtime_shell_environment(dict(os.environ))
+    else:
+        environment = _runtime_shell_environment(dict(os.environ))
+
+    # Carry the live turn's gate and authoritative config path into a code-task
+    # CLI child. ``gateway run --config`` does not mutate the parent process
+    # environment, so rediscovery in the child can otherwise select the wrong
+    # profile. These runtime-only values are removed before the nested coding
+    # Agent starts and are never serialized into telemetry.
+    if ctx is not None:
+        environment["OPENSQUILLA_CODING_MODE_ACTIVE"] = (
+            "1" if bool(getattr(ctx, "coding_mode", False)) else "0"
+        )
+        config = getattr(ctx, "sandbox_gateway_config", None)
+        config_path = str(getattr(config, "config_path", "") or "").strip()
+        if config_path:
+            environment["OPENSQUILLA_CODING_MODE_CONFIG_PATH"] = config_path
+        else:
+            environment.pop("OPENSQUILLA_CODING_MODE_CONFIG_PATH", None)
+    return environment
 
 
 def _guest_requires_managed_runtime() -> bool:

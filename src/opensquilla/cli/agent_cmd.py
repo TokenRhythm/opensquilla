@@ -228,11 +228,7 @@ async def run_agent_once(
             AcceptedRunModeOverride,
         )
 
-        run_mode = (
-            "full"
-            if permissions_profile in {"bypass", "full"}
-            else "safe"
-        )
+        run_mode = "full" if permissions_profile in {"bypass", "full"} else "safe"
         accepted_run_mode_override = AcceptedRunModeOverride(
             run_mode=normalize_run_mode(run_mode),
             run_mode_source="user",
@@ -458,6 +454,21 @@ async def run_agent_once(
             stateless_keep_project_rules=stateless_keep_project_rules,
         )
 
+        from opensquilla.telemetry.contracts.common import (
+            ClientEntrypoint,
+            ClientSurface,
+            ExecutionMode,
+        )
+
+        growth_sink = getattr(svc, "growth_event_sink", None)
+        record_launch = getattr(growth_sink, "record_client_launch", None)
+        if callable(record_launch):
+            await record_launch(
+                surface=ClientSurface.CLI,
+                entrypoint=ClientEntrypoint.AGENT,
+                execution_mode=ExecutionMode.ONE_SHOT,
+            )
+
         async for event in runner.run(
             message,
             session_key,
@@ -475,6 +486,8 @@ async def run_agent_once(
             no_memory_capture=no_memory_capture,
             attachments=run_attachments,
             bootstrap_context_mode=bootstrap_context_mode,
+            telemetry_surface=ClientSurface.CLI,
+            telemetry_execution_mode=ExecutionMode.ONE_SHOT,
             **owner_kwargs,
         ):
             if event_sink is not None:
@@ -495,13 +508,9 @@ async def run_agent_once(
                     errors.append(
                         {
                             "message": (
-                                event.terminal_error_message
-                                or "The model provider request failed."
+                                event.terminal_error_message or "The model provider request failed."
                             ),
-                            "code": (
-                                event.terminal_error_code
-                                or "ensemble_fixed_error"
-                            ),
+                            "code": (event.terminal_error_code or "ensemble_fixed_error"),
                         }
                     )
             elif isinstance(event, ErrorEvent):

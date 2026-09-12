@@ -23,6 +23,28 @@ def test_source_install_scripts_force_refresh_local_uv_tool_package() -> None:
     assert "--force --reinstall-package opensquilla" in sh
 
 
+def test_source_installers_freeze_full_commit_in_install_receipt() -> None:
+    ps1 = SOURCE_PS1.read_text(encoding="utf-8")
+    sh = SOURCE_SH.read_text(encoding="utf-8")
+
+    assert "source_commit_id" in ps1
+    assert "source_commit_id" in sh
+    assert "rev-parse --verify HEAD" in ps1
+    assert "rev-parse --verify HEAD" in sh
+    assert "^[0-9a-f]{40}$" in ps1
+    assert "^[0-9a-f]{40}$" in sh
+    assert sh.index('if [[ "${dry_run}" = "1" ]]') < sh.index(
+        'git -C "${source_root}" rev-parse --verify HEAD'
+    )
+    assert ps1.index("if ($dryRun) {") < ps1.index(
+        "$gitCommand.Source -C $sourceRoot rev-parse --verify HEAD"
+    )
+    assert 'install_target="${source_root}' in sh
+    assert 'local model_root="${source_root}/src/' in sh
+    assert '"${sourceRoot}[$($targetExtras' in ps1
+    assert "$modelRoot = Join-Path $sourceRoot" in ps1
+
+
 def test_install_scripts_do_not_run_onboarding_or_gateway() -> None:
     scripts = [
         RELEASE_PS1.read_text(encoding="utf-8"),
@@ -225,7 +247,7 @@ def test_source_shell_dry_run_does_not_execute_node_npm_or_installer(
     )
     result = subprocess.run(
         ["bash", str(SOURCE_SH)],
-        cwd=ROOT,
+        cwd=tmp_path,
         env=env,
         capture_output=True,
         check=False,

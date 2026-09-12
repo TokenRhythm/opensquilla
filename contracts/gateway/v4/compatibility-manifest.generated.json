@@ -1335,6 +1335,18 @@
     },
     {
       "lifecycle": "stable",
+      "name": "telemetry.client_launch.record",
+      "schema": "telemetry/telemetry-client-launch-record.schema.json",
+      "schemaSha256": "71c5a1c528d0b219e203642b14a9c127130be838b7625af0ced7063a6e5a7ad3"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "telemetry.consent.set",
+      "schema": "telemetry/telemetry-consent-set.schema.json",
+      "schemaSha256": "4e92546e99a7643b4aec81f077dd1ae8270e54dd92e475223d1994d7a4c80210"
+    },
+    {
+      "lifecycle": "stable",
       "name": "transport.flow.update",
       "schema": "transport/transport-flow-update.schema.json",
       "schemaSha256": "c637cfebaf5aa6c70fa29c6349d36f091a6de2fe445fe125e49a332b2dd7f5e6"
@@ -1422,9 +1434,9 @@
   "source": {
     "eventFamilyCount": 10,
     "generatorSha256": "db063b7bff2dcb9d089926dc9f1d3c99c61c2e4dd42ba12f442701b03fff2df1",
-    "methodCount": 208,
-    "schemaCount": 218,
-    "schemaTreeSha256": "1740083196c669c89c139f37d4adec549b82eca8534b05a6f83ba942fc554dc0"
+    "methodCount": 210,
+    "schemaCount": 220,
+    "schemaTreeSha256": "bd4f9854cf75508a253dc92182b05db08eb8af323ed5ab12af1c209d0ff43ccc"
   },
   "wireVersion": 4
 }

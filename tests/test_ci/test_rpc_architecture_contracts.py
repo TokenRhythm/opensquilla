@@ -44,6 +44,8 @@ GENERATED_WIRE_IMPORT_ALLOWLIST = frozenset(
         # Gateway Adapter helper; domain registrars retain explicit ownership
         # of their method inventories and public signatures.
         "src/opensquilla/gateway/adapters/_generated_contract_bindings.py",
+        # Scoped telemetry wire models terminate at the registration Adapter.
+        "src/opensquilla/gateway/adapters/telemetry_contract.py",
     }
 )
 GENERATED_METADATA_IMPORT_ALLOWLIST = frozenset(
@@ -120,8 +122,8 @@ SESSIONS_LIST_LITERAL_ALLOWLIST: Counter[str] = Counter(
 SESSIONS_LIST_GATEWAY_ADAPTER = PACKAGE_ROOT / "gateway" / "adapters" / "sessions_list_contract.py"
 # The retired 20-method RPC surface is absent; exact inventory remains pinned
 # so this does not authorize unrelated wire growth.
-RUNTIME_RPC_METHOD_BASELINE = 289
-RUNTIME_RPC_METHOD_DIGEST = "c1e13af6f2be093b6100986cc89b51900d6970733b3a775e3e0dd9bed84e0cc2"
+RUNTIME_RPC_METHOD_BASELINE = 291
+RUNTIME_RPC_METHOD_DIGEST = "950d9d6735c071e6110c4dbceb68c89d5054a466fa3045d0ab9a6d582555f724"
 STATIC_RPC_DECORATOR_BASELINE = 77
 
 # Physical lines in the sessions/runtime slice remain tracked for the final
@@ -1284,6 +1286,8 @@ def test_static_rpc_decorator_sites_are_exact_and_contract_methods_are_adapter_r
             "doctor.status",
             "logs.status",
             "logs.tail",
+            "telemetry.consent.set",
+            "telemetry.client_launch.record",
             "plugin.approval.status",
             "plugin.approval.resolve",
             "plugin.approval.extend",

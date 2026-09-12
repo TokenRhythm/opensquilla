@@ -221,6 +221,7 @@ from opensquilla.gateway.session_view import build_session_view_item, derive_tra
 from opensquilla.gateway.subagent_announce import (
     quiesce_background_completion_sessions,
 )
+from opensquilla.gateway.telemetry_connections import is_registered_tui_connection
 from opensquilla.gateway.turn_ingress import (
     accepted_turn_payload,
 )
@@ -4957,7 +4958,6 @@ async def _handle_plans_implement(
         decode_admit_turn(
             send_params,
             principal_role=str(ctx.principal.role),
-            connection_id=ctx.conn_id,
             fingerprint_params={
                 "action": "plans.implement",
                 "sessionKey": key,
@@ -5501,6 +5501,7 @@ class _GatewayAdmissionPrimitives(GatewayAdmissionRuntime):
             publish=partial(_emit_to_subscribers, ctx),
             normalize_terminal=_normalize_terminal_event_payload,
             session_model=partial(_session_turn_model, ctx),
+            tui_connection=is_registered_tui_connection(ctx.conn_id),
         )
         self._native_sessions = ctx.session_manager
         self.sessions = (

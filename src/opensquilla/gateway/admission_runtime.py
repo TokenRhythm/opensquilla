@@ -75,6 +75,7 @@ class GatewayAdmissionRuntime:
         publish: Callable[[str, str, dict[str, Any]], Awaitable[None]],
         normalize_terminal: Callable[[str, dict[str, Any]], dict[str, Any]],
         session_model: Callable[[SessionNode, str], str | None],
+        tui_connection: bool = False,
     ) -> None:
         self._runtime_config = config
         self._runtime_manager = manager
@@ -85,6 +86,7 @@ class GatewayAdmissionRuntime:
         self._runtime_publish = publish
         self._runtime_normalize_terminal = normalize_terminal
         self._runtime_session_model = session_model
+        self._runtime_tui_connection = tui_connection
 
     def normalize_input(self, command: AdmitTurn) -> NormalizedInput:
         # Source aliases are decoded once; reconstructing them here would lose
@@ -359,4 +361,5 @@ class GatewayAdmissionRuntime:
             publish=self._runtime_publish,
             normalize_terminal=self._runtime_normalize_terminal,
             session_model=self._runtime_session_model,
+            tui_connection=self._runtime_tui_connection,
         )
