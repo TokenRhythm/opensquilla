@@ -157,8 +157,8 @@ Onboarding-verified providers include:
 - Volcengine Ark
 
 OpenSquilla also carries provider registry entries for additional
-OpenAI-compatible or self-hosted backends. Use `opensquilla providers list` on
-your install to see the current catalog.
+OpenAI-compatible or self-hosted backends, such as Requesty (`requesty`). Use
+`opensquilla providers list` on your install to see the current catalog.
 
 Read: [`providers-and-models.md`](providers-and-models.md)
 

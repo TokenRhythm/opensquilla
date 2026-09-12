@@ -78,6 +78,7 @@ EXPECTED_VERIFIED = {
 EXPECTED_EXPERIMENTAL = {
     "azure", "bailian_coding", "bailian_coding_cn", "kimi_coding_openai",
     "kimi_coding_anthropic", "minimax", "minimax_openai", "minimax_coding_openai",
+    "requesty",
     "minimax_coding_anthropic", "minimax_cn", "minimax_global", "mimo_openai",
     "mimo_anthropic", "mistral", "groq", "aihubmix", "vllm", "custom",
     "custom_anthropic",
