@@ -19,6 +19,12 @@ const appSettings = {
     patches: Object.fromEntries(changes.map(change => [change.path, change.value])),
   }),
   merge: () => Promise.resolve({}),
+  setTelemetryConsent: (scope: 'reliability' | 'growth', enabled: boolean) => Promise.resolve({
+    scope,
+    enabled,
+    noticeVersion: enabled ? `${scope}-v1` : null,
+    consentedAtUtc: enabled ? '2026-09-03T00:00:00Z' : null,
+  }),
 } satisfies AppSettings
 
 const observability = {

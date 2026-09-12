@@ -10,6 +10,12 @@ function rpc() {
     if (method === 'config.effective') return { fields: { theme: { value: 'dark', source: 'config' } } } as T
     if (method === 'config.patch.safe') return { patched: ['theme'], restartRequired: true } as T
     if (method === 'config.patch') return { patched: ['llm.model'], restartRequired: false } as T
+    if (method === 'telemetry.consent.set') return {
+      scope: params?.scope,
+      enabled: params?.enabled,
+      noticeVersion: params?.enabled ? `${params?.scope}-v1` : null,
+      consentedAtUtc: params?.enabled ? '2026-09-03T00:00:00Z' : null,
+    } as T
     if (method === 'models.list') return { models: [], errors: [] } as T
     if (method === 'onboarding.catalog') return { providers: [{ providerId: 'openai', label: 'OpenAI' }] } as T
     if (method === 'models.routing.get') return { mode: 'direct', provider: 'openai' } as T
@@ -84,6 +90,17 @@ describe('Platform configuration adapters', () => {
     )
     await settings.merge({ llm: { model: 'gpt-4' } })
     expect(source.request).toHaveBeenCalledWith('config.patch', { patch: { llm: { model: 'gpt-4' } } }, expect.any(Object))
+    await expect(settings.setTelemetryConsent('reliability', true)).resolves.toEqual({
+      scope: 'reliability',
+      enabled: true,
+      noticeVersion: 'reliability-v1',
+      consentedAtUtc: '2026-09-03T00:00:00Z',
+    })
+    expect(source.request).toHaveBeenCalledWith(
+      'telemetry.consent.set',
+      { scope: 'reliability', enabled: true },
+      expect.objectContaining({ timeoutAction: 'reject', abortAction: 'reject' }),
+    )
   })
 
   it('normalizes provider and setup snapshots without exposing transport details', async () => {

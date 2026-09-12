@@ -201,9 +201,7 @@ def run_gateway(
         raise typer.Exit(code=1)
     # Load config FIRST so its ``host`` field can act as the final
     # fallback below ``OPENSQUILLA_GATEWAY_HOST``.
-    config = _load_gateway_config(
-        config_path or os.environ.get("OPENSQUILLA_GATEWAY_CONFIG_PATH")
-    )
+    config = _load_gateway_config(config_path or os.environ.get("OPENSQUILLA_GATEWAY_CONFIG_PATH"))
     if config_path and not config.config_path:
         config.config_path = str(config_path)
     # Treat the CLI ``--bind`` default as "not explicitly supplied" so the
@@ -285,6 +283,21 @@ def run_gateway(
         )
         assert server._task is not None
 
+        from opensquilla.telemetry.contracts.common import (
+            ClientEntrypoint,
+            ClientSurface,
+            ExecutionMode,
+        )
+
+        growth_sink = getattr(getattr(server, "_services", None), "growth_event_sink", None)
+        record_launch = getattr(growth_sink, "record_client_launch", None)
+        if callable(record_launch):
+            await record_launch(
+                surface=ClientSurface.CLI,
+                entrypoint=ClientEntrypoint.GATEWAY_RUN,
+                execution_mode=ExecutionMode.GATEWAY,
+            )
+
         # Trigger OpenSquilla's graceful drain on SIGINT/SIGTERM. uvicorn's own
         # handlers are suppressed in start_gateway_server, so server.close() —
         # the only path that drains in-flight agent turns and background
@@ -306,9 +319,7 @@ def run_gateway(
         # Windows, where SIGTERM maps to an immediate TerminateProcess.
         app = getattr(server, "app", None)
         if app is not None and hasattr(app, "state"):
-            install_shutdown_handler = getattr(
-                app.state, "install_shutdown_handler", None
-            )
+            install_shutdown_handler = getattr(app.state, "install_shutdown_handler", None)
             if callable(install_shutdown_handler):
                 install_shutdown_handler(_request_shutdown)
             else:
@@ -317,9 +328,7 @@ def run_gateway(
         waiter = asyncio.ensure_future(shutdown.wait())
         explicit_shutdown = False
         try:
-            await asyncio.wait(
-                {server_task, waiter}, return_when=asyncio.FIRST_COMPLETED
-            )
+            await asyncio.wait({server_task, waiter}, return_when=asyncio.FIRST_COMPLETED)
             close_reason = shutdown_reason
             explicit_shutdown = shutdown.is_set()
         except (KeyboardInterrupt, asyncio.CancelledError):
@@ -557,9 +566,7 @@ def restart_gateway(
 
 def reload_gateway(
     config_path: str | None = typer.Option(None, "--config", help="Override config path"),
-    gateway_url: str | None = typer.Option(
-        None, "--gateway", help="Gateway WebSocket URL to call"
-    ),
+    gateway_url: str | None = typer.Option(None, "--gateway", help="Gateway WebSocket URL to call"),
     json_output: bool = typer.Option(False, "--json", help="Emit machine-readable JSON"),
 ) -> None:
     """Re-read the on-disk config into the running gateway (hot-apply).
@@ -600,9 +607,7 @@ def reload_gateway(
     if payload.get("path"):
         typer.echo(f"Reloaded config from {payload['path']}")
     live_applied = payload.get("liveApplied") or []
-    typer.echo(
-        "Applied live: " + (", ".join(live_applied) if live_applied else "(no changes)")
-    )
+    typer.echo("Applied live: " + (", ".join(live_applied) if live_applied else "(no changes)"))
     if payload.get("restartRequired"):
         sections = payload.get("restartSections") or []
         suffix = f" ({', '.join(sections)})" if sections else ""

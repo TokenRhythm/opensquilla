@@ -41,7 +41,7 @@ const names = [
   'windowsInstallerActionsSupported', 'windowsUpdateDownloadDirectory', 'clearWindowsUpdateCache',
   'publishVerifiedWindowsInstaller', 'restoreWindowsUpdateCache', 'revalidateReadyWindowsInstaller',
   'desktopUpdateSnapshot', 'publishDesktopUpdateState', 'setDesktopUpdateState',
-  'restoreDownloadedUpdateRetryState', 'classifyDesktopUpdateError', 'desktopUpdateErrorMessage',
+  'restoreDownloadedUpdateRetryState', 'classifyDesktopUpdateError', 'classifyDesktopUpdateTelemetryError', 'desktopUpdateErrorMessage',
   'applyWindowsInstaller', 'applyDownloadedUpdate', 'handleMainWindowClose', 'trustedMainWindowControlIpc',
   'desktopUpdateCheckAllowed', 'runDesktopUpdateCheck', 'checkForUpdates', 'showUpdateError',
   'desktopUpdatePlatform', 'resolveDesktopUpdate',
