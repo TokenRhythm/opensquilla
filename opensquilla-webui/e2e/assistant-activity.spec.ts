@@ -1,6 +1,7 @@
 import fs from 'node:fs'
 import path from 'node:path'
 import { expect, test, type Page } from '@playwright/test'
+import { helloOkResponse } from './support/gateway-fixture'
 
 import {
   chatHistoryPayload,
@@ -57,7 +58,7 @@ async function mockActivityHistory(page: Page, fixture: ActivityFixture = {}) {
       }
       if (frame.type !== 'req' || frame.id === undefined) return
       if (frame.method === 'connect') {
-        ws.send(JSON.stringify({ protocol: 3, policy: {} }))
+        ws.send(helloOkResponse())
         return
       }
       if (frame.method === 'chat.history') {
@@ -193,7 +194,7 @@ async function mockUnifiedTurnReceiptHistory(page: Page) {
   await page.route('**/api/approvals', route => route.fulfill({
     status: 200,
     contentType: 'application/json',
-    body: JSON.stringify({ pending: [] }),
+    body: JSON.stringify({ mode: 'prompt', pending: [] }),
   }))
   await page.routeWebSocket(/\/ws$/, ws => {
     ws.send(wsEvent('connect.challenge', {}))
@@ -206,7 +207,7 @@ async function mockUnifiedTurnReceiptHistory(page: Page) {
       }
       if (frame.type !== 'req' || frame.id === undefined) return
       if (frame.method === 'connect') {
-        ws.send(JSON.stringify({ protocol: 3, policy: {} }))
+        ws.send(helloOkResponse())
         return
       }
       if (frame.method === 'chat.history') {
@@ -228,7 +229,7 @@ async function mockUnifiedTurnReceiptHistory(page: Page) {
           skills: {},
         },
         'onboarding.status': { audioConfigured: false },
-        'sessions.list': { sessions: [], has_more: false },
+        'sessions.list': { sessions: [], count: 0, ts: 1_800_000_000, has_more: false },
         'sessions.messages.subscribe': sessionMessagesSubscribePayload(
           sessionKey,
         ),
@@ -273,7 +274,7 @@ async function mockControlledActivityLifecycle(
   await page.route('**/api/approvals', route => route.fulfill({
     status: 200,
     contentType: 'application/json',
-    body: JSON.stringify({ pending: [] }),
+    body: JSON.stringify({ mode: 'prompt', pending: [] }),
   }))
   await page.routeWebSocket(/\/ws$/, ws => {
     sendFrame = frame => ws.send(frame)
@@ -288,9 +289,8 @@ async function mockControlledActivityLifecycle(
       if (frame.type !== 'req') return
       const method = String(frame.method || '')
       if (method === 'connect') {
-        ws.send(JSON.stringify({
-          protocol: 3,
-          policy: { tick_interval_ms: 30_000, webui_stream_idle_grace_ms: 1_260_000 },
+        ws.send(helloOkResponse({
+          policy: { webui_stream_idle_grace_ms: 1_260_000 },
         }))
         return
       }
@@ -378,7 +378,7 @@ async function mockControlledActivityLifecycle(
           skills: {},
         },
         'onboarding.status': { audioConfigured: false },
-        'sessions.list': { sessions: [], has_more: false },
+        'sessions.list': { sessions: [], count: 0, ts: 1_800_000_000, has_more: false },
         'sessions.messages.subscribe': sessionMessagesSubscribePayload(
           LIFECYCLE_SESSION_KEY,
         ),
@@ -627,7 +627,7 @@ test.describe('Completed assistant activity disclosure', () => {
     await expect(targets).toHaveCount(0)
   })
 
-  test('omits failed work from the activity disclosure', async ({ page }) => {
+  test('keeps failed work inspectable apart from the final answer', async ({ page }) => {
     await mockActivityHistory(page, { failed: true })
     await page.setViewportSize({ width: 320, height: 844 })
     await page.goto(CONTROL_URL + 'chat?session=' + encodeURIComponent(`${SESSION_KEY}-failed`))
@@ -639,12 +639,21 @@ test.describe('Completed assistant activity disclosure', () => {
     await expect(activity).not.toContainText('failure recovered')
 
     const errorRow = activity.locator('.tool-row--error')
-    await expect(errorRow).toHaveCount(0)
+    await expect(errorRow).toHaveCount(1)
     const summary = activity.locator('.assistant-activity__summary')
     await summary.press('Enter')
     await expect(activity).toHaveAttribute('data-share-expanded', 'true')
-    await expect(errorRow).toHaveCount(0)
-    await expect(activity).not.toContainText('Tool unavailable')
+    await expect(errorRow).toHaveCount(1)
+    await expect(errorRow).toBeVisible()
+    await expect(errorRow).toHaveAttribute('aria-expanded', 'true')
+    const failureDetail = activity.getByText('Tool unavailable', { exact: true })
+    await expect(failureDetail).toBeVisible()
+    await errorRow.press('Enter')
+    await expect(errorRow).toHaveAttribute('aria-expanded', 'false')
+    await expect(failureDetail).not.toBeVisible()
+    await errorRow.press('Space')
+    await expect(errorRow).toHaveAttribute('aria-expanded', 'true')
+    await expect(failureDetail).toBeVisible()
     await expect(activity.locator('.tool-row-section--error')).toHaveCount(0)
     await expect(
       page.getByText('The canonical answer is complete.', { exact: true }),
@@ -661,6 +670,7 @@ test.describe('Completed assistant activity disclosure', () => {
       document.documentElement.scrollWidth - document.documentElement.clientWidth,
     )
     expect(pageOverflow).toBeLessThanOrEqual(1)
+    await captureActivityScreenshot(page, 'failed-work-details')
   })
 
   for (const width of [1440, 390] as const) {
@@ -734,8 +744,8 @@ test.describe('Live assistant activity lifecycle', () => {
     await expect(liveStatus).toHaveAttribute('aria-live', 'polite')
     await expect(liveStatus).toHaveAttribute('aria-atomic', 'true')
     await expect(liveActivity.getByText('Working', { exact: true })).toHaveCount(1)
-    // The phase label is the only polite live region. Failed work is omitted
-    // from the disclosure, so it must not mount a second announcement region.
+    // The phase label is the only polite live region; tool details must not
+    // add duplicate announcements.
     await expect(liveActivity.locator('[role="status"]')).toHaveCount(1)
     await expect(liveActivity.locator('.assistant-activity__live-failure')).toHaveCount(0)
     await expect(liveActivity.locator('.assistant-activity-status__row')).toHaveCount(0)

@@ -1,4 +1,4 @@
-import type { RpcCallOptions } from '@/lib/rpc'
+import type { TransportCallOptions as RpcCallOptions } from './transportTypes'
 import {
   SANDBOX_SETUP_STATUS_METHOD,
   type Result as SetupStatusResult,

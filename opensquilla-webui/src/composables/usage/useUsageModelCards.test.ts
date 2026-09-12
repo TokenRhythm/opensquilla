@@ -2,26 +2,19 @@ import { computed } from 'vue'
 import { describe, expect, it } from 'vitest'
 
 import { useUsageModelCards } from './useUsageModelCards'
-import type { SessionRow } from '@/types/usage'
+import type { UsageSession } from '@/types/usage'
+import { usageSession } from '@/testing/usage.test-helper'
 
-function rowVal(row: Record<string, unknown>, ...keys: string[]): unknown {
-  for (const key of keys) {
-    if (row[key] != null) return row[key]
-  }
-  return null
-}
-
-function cardsFor(sessions: SessionRow[]) {
+function cardsFor(sessions: Partial<UsageSession>[]) {
   const { modelCards } = useUsageModelCards({
-    visibleSessions: computed(() => sessions),
-    rowVal,
+    visibleSessions: computed(() => sessions.map(usageSession)),
   })
   return modelCards.value
 }
 
 describe('useUsageModelCards', () => {
   it('aggregates a mixed cost source and flags cache-blind estimates from breakdown items', () => {
-    const sessions: SessionRow[] = [
+    const sessions: Partial<UsageSession>[] = [
       {
         session: 's1',
         modelBreakdown: [
@@ -52,7 +45,7 @@ describe('useUsageModelCards', () => {
   })
 
   it('reports a single shared cost source (not mixed) when every item agrees', () => {
-    const sessions: SessionRow[] = [
+    const sessions: Partial<UsageSession>[] = [
       {
         session: 's1',
         modelBreakdown: [{ model: 'm1', costUsd: 1, costSource: 'provider_billed' }],
@@ -69,20 +62,20 @@ describe('useUsageModelCards', () => {
     expect(card.anyCacheBlind).toBe(false)
   })
 
-  it('carries the row cost_source/estimate_basis into the synthetic fallback item when a session has no breakdown', () => {
-    const sessions: SessionRow[] = [
+  it('carries the row costSource/estimateBasis into the synthetic fallback item when a session has no breakdown', () => {
+    const sessions: Partial<UsageSession>[] = [
       {
         session: 'fallback-1',
         model: 'm2',
-        cost_usd: 5,
-        cost_source: 'provider_billed',
+        costUsd: 5,
+        costSource: 'provider_billed',
       },
       {
         session: 'fallback-2',
         model: 'm2',
-        cost_usd: 4,
-        cost_source: 'opensquilla_estimate',
-        estimate_basis: 'cache_blind',
+        costUsd: 4,
+        costSource: 'opensquilla_estimate',
+        estimateBasis: 'cache_blind',
       },
     ]
 
@@ -94,13 +87,13 @@ describe('useUsageModelCards', () => {
     expect(card.anyCacheBlind).toBe(true)
   })
 
-  it('keeps a single cost_source for an all-billed fallback session with no cache-blind estimate', () => {
-    const sessions: SessionRow[] = [
+  it('keeps a single costSource for an all-billed fallback session with no cache-blind estimate', () => {
+    const sessions: Partial<UsageSession>[] = [
       {
         session: 'fallback-1',
         model: 'm3',
-        cost_usd: 5,
-        cost_source: 'provider_billed',
+        costUsd: 5,
+        costSource: 'provider_billed',
       },
     ]
 

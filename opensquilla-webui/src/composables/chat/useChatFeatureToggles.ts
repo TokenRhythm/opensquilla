@@ -16,16 +16,16 @@ import {
   normalizeRouterVisualMode,
 } from '@/utils/chat/routerVisualMode'
 import { useRouterVisualEffectsPreference } from '@/composables/useRouterVisualEffectsPreference'
-import type { RpcCallOptions } from '@/lib/rpc'
 import type { AppSettings } from '@/modules/appSettings'
-import type { ModelRouting } from '@/modules/providerConfiguration'
-import type { SessionConversation } from '@/modules/sessionConversation'
+import {
+  ProviderConfigurationError,
+  type ModelRouting,
+} from '@/modules/providerConfiguration'
 
 export interface UseChatFeatureTogglesOptions {
-  sessionConversation?: SessionConversation
   appSettings: AppSettings
   modelRouting: ModelRouting
-  readCallOptions?: RpcCallOptions
+  readOptions?: { readonly signal?: AbortSignal }
   setGlobalElevatedMode: (mode: string) => void
   loadCurrentSessionUsage: () => void | Promise<void>
 }
@@ -84,7 +84,7 @@ function parseCapabilitiesByMode(value: unknown): ModelRoutingCapabilitiesByMode
     ) return null
     parsed[mode] = {
       image_input: {
-        admission,
+        admission: effectiveImageAdmission(admission, reason),
         reason,
       },
     }
@@ -93,11 +93,25 @@ function parseCapabilitiesByMode(value: unknown): ModelRoutingCapabilitiesByMode
 }
 
 function isMethodNotFound(error: unknown): boolean {
-  const candidate = record(error)
-  const message = error instanceof Error
-    ? error.message
-    : String(candidate?.message || error || '')
-  return candidate?.code === 'METHOD_NOT_FOUND' || /method not found/i.test(message)
+  return error instanceof ProviderConfigurationError && error.code === 'unsupported'
+}
+
+const IMAGE_DEGRADATION_REASONS = new Set([
+  'ensemble_mode_unsupported',
+  'model_vision_unsupported',
+  'router_image_route_unavailable',
+])
+
+function effectiveImageAdmission(
+  admission: ImageInputAdmission,
+  reason: string,
+): ImageInputAdmission {
+  // Older Gateways reported route/model limitations as a client-side hard
+  // block. They are now safe degradation signals: the Gateway preserves the
+  // turn and projects image blocks to truthful markers for text-only routes.
+  return admission === 'blocked' && IMAGE_DEGRADATION_REASONS.has(reason)
+    ? 'allowed'
+    : admission
 }
 
 export function useChatFeatureToggles(options: UseChatFeatureTogglesOptions) {
@@ -150,13 +164,14 @@ export function useChatFeatureToggles(options: UseChatFeatureTogglesOptions) {
     const admission = snapshot.image_input?.admission
     if (admission === 'allowed' || admission === 'blocked' || admission === 'unknown') {
       hasCanonicalImageAdmission = true
-      globalImageInputAdmission.value = admission
-      globalImageInputAdmissionReason.value = String(
+      const reason = String(
         snapshot.image_input?.reason || 'capability_unknown',
       )
+      globalImageInputAdmission.value = effectiveImageAdmission(admission, reason)
+      globalImageInputAdmissionReason.value = reason
     } else if (mode === 'ensemble') {
       hasCanonicalImageAdmission = false
-      globalImageInputAdmission.value = 'blocked'
+      globalImageInputAdmission.value = 'allowed'
       globalImageInputAdmissionReason.value = 'ensemble_mode_unsupported'
     } else {
       hasCanonicalImageAdmission = false
@@ -179,7 +194,7 @@ export function useChatFeatureToggles(options: UseChatFeatureTogglesOptions) {
     llmEnsembleEnabled.value = ensembleEnabled
     llmEnsembleSelectionMode.value = String(cfg?.llm_ensemble?.selection_mode || '')
     if (!hasCanonicalImageAdmission) {
-      globalImageInputAdmission.value = ensembleEnabled ? 'blocked' : 'unknown'
+      globalImageInputAdmission.value = ensembleEnabled ? 'allowed' : 'unknown'
       globalImageInputAdmissionReason.value = ensembleEnabled
         ? 'ensemble_mode_unsupported'
         : 'capability_unknown'
@@ -213,7 +228,6 @@ export function useChatFeatureToggles(options: UseChatFeatureTogglesOptions) {
         ).trim()
         tierConfigs[lower] = {
           model: typeof model === 'string' ? model.trim() : '',
-          supportsImage: rawTierRecord.supports_image === true || rawTierRecord.supportsImage === true,
           imageOnly: rawTierRecord.image_only === true || rawTierRecord.imageOnly === true,
           // New Gateways expose the explicit execution switch. Older PR
           // snapshots only expose the legacy selection mode, which still
@@ -245,7 +259,7 @@ export function useChatFeatureToggles(options: UseChatFeatureTogglesOptions) {
     const eventGeneration = modelRoutingEventGeneration
     let cfg: ChatFeatureConfig | undefined
     try {
-      cfg = await options.appSettings.readAll({ signal: options.readCallOptions?.signal }) as ChatFeatureConfig
+      cfg = await options.appSettings.readAll({ signal: options.readOptions?.signal }) as ChatFeatureConfig
       if (requestGeneration !== modelRoutingRequestGeneration) return
       await applyFeatureConfig(cfg, { refreshUsage: true })
       if (requestGeneration !== modelRoutingRequestGeneration) return
@@ -259,7 +273,7 @@ export function useChatFeatureToggles(options: UseChatFeatureTogglesOptions) {
         return
       }
       try {
-        const routing = await options.modelRouting.get({ signal: options.readCallOptions?.signal })
+        const routing = await options.modelRouting.get({ signal: options.readOptions?.signal })
         if (
           requestGeneration === modelRoutingRequestGeneration
           && eventGeneration === modelRoutingEventGeneration
@@ -390,9 +404,9 @@ export function useChatFeatureToggles(options: UseChatFeatureTogglesOptions) {
       if (document.visibilityState === 'visible') schedule()
     }
     const onFocus = () => schedule()
-    const unbindRouting = options.sessionConversation?.subscribeRoutingChanged((payload) => {
+    const unbindRouting = options.modelRouting.subscribeChanged((payload) => {
       modelRoutingEventGeneration += 1
-      applyModelRoutingSnapshot(payload as ModelRoutingSnapshot)
+      applyModelRoutingSnapshot(payload)
       scheduleHistorySync?.()
     })
     document.addEventListener('visibilitychange', onVisibility)

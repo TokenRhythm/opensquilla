@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from enum import StrEnum
 from typing import TYPE_CHECKING, Any, Literal
 
@@ -247,6 +247,7 @@ class ArtifactEvent:
     store: str = "artifacts"
     has_thumbnail: bool = False
     generation_epoch: int = 0
+    publication_id: str = ""
 
 
 @dataclass
@@ -378,19 +379,30 @@ class DoneEvent:
     # positional DoneEvent construction keeps its historical field order.
     delivery: Literal["visible", "suppressed"] = "visible"
     suppression_reason: Literal["no_reply", "heartbeat_ack"] | None = None
-    # Authoritative document side-effect fact for restricted annotation turns.
-    # Presentation text may be model-generated; this receipt is runtime-owned.
-    document_mutation_outcome: dict[str, Any] | None = None
     generation_epoch: int = 0
     # First physical provider call that emitted visible output for the route
     # plan. Clients use this to keep its route card on the same answer segment.
     router_model_call_id: str = ""
     router_iteration: int = 0
 
+    # Internal continuation state; never part of public event payloads.
+    assistant_replay: dict[str, Any] | None = field(
+        default=None, repr=False, metadata={"private": True}
+    )
+
     @property
     def upstream_cost_usd(self) -> float:
         """Backward-compatible alias for earlier OpenRouter cost consumers."""
         return self.billed_cost
+
+
+def public_agent_event_payload(event: Any) -> dict[str, Any]:
+    """Serialize an event without copying private provider continuation state."""
+    if isinstance(event, DoneEvent):
+        payload = asdict(replace(event, assistant_replay=None))
+        payload.pop("assistant_replay", None)
+        return payload
+    return asdict(event)
 
 
 def done_text_snapshot(event_or_mapping: object) -> tuple[bool, str]:
@@ -741,12 +753,6 @@ class AgentConfig:
     compaction_protected_recent_messages: int = 0
     compaction_total_timeout_seconds: float = 120.0
     compaction_heartbeat_interval_seconds: float = 15.0
-    # Explicit per-turn authority boundary. Restricted turns (currently
-    # PromptAnnotation edits) must never send persisted history to an
-    # auxiliary compaction/flush model before or during the primary request.
-    # The runtime derives this from ToolContext.exclusive_tools; it is not a
-    # user-configurable inference from individual tool names.
-    restricted_turn: bool = False
     # Frozen runtime-only single-deployment chain for auxiliary compaction.
     # Kept opaque here to avoid coupling engine types to session internals.
     compaction_execution_plan: Any | None = field(
@@ -785,13 +791,9 @@ class AgentConfig:
     tool_result_compression_summary_timeout_seconds: float = 20.0
     tool_result_compression_summary_input_max_chars: int = 60_000
     tool_result_projection_max_inline_chars: int = 60_000
-    # Fresh diagnostic delivery is experimental; unattended profiles should opt
-    # in only after model-specific validation.
+    # Deprecated, unused compatibility slots; preserve positional/keyword construction.
     tool_result_fresh_diagnostic_policy_enabled: bool = False
     tool_result_diagnostic_retrieval_gate_enabled: bool = False
-    # When the fresh diagnostic policy is enabled, keep bounded failures intact
-    # for the immediate handoff, then let older history/replay compaction handle
-    # long-term context pressure.
     tool_result_fresh_diagnostic_inline_max_chars: int = 64_000
     # Dispatch-layer tool result caps. 0 disables the cap. These run before
     # provider-request projection and are intended for unattended automation
@@ -818,52 +820,28 @@ class AgentConfig:
     progress_watchdog_repeated_tool_error_threshold: int = 3
     progress_watchdog_repeated_provider_failure_threshold: int = 2
     progress_watchdog_repeated_failure_anchor_threshold: int = 3
+    # Deprecated, unused compatibility slot; preserve positional/keyword construction.
     post_write_convergence_enabled: bool = False
+    # Deprecated, unused compatibility slot; preserve positional/keyword construction.
     post_write_convergence_warn_threshold: int = 3
+    # Deprecated, unused compatibility slot; preserve positional/keyword construction.
     post_write_convergence_finalize_after_warning: int = 3
+    # Deprecated export; retain the slot and path for legacy final-diff exclusion.
     patch_evidence_ledger_path: str | None = None
     # Finalize-time red-evidence gate (see engine.finalize_evidence_gate).
     # Off by default; enabled per run via OPENSQUILLA_FINALIZE_EVIDENCE_GATE.
     finalize_evidence_gate_enabled: bool = False
-    # Strict mode for the finalize-time evidence gate: adds the
-    # zero_verification trigger (a change shipped without ever running a
-    # verification-level command draws one bounded challenge). Red-first
-    # state stays report-only. Implies the gate itself (strict on activates
-    # the tracker even when the base flag is off). Off by default; enabled
-    # per run via OPENSQUILLA_FINALIZE_EVIDENCE_STRICT.
+    # Deprecated, unused compatibility slot; preserve construction and saved configs.
     finalize_evidence_strict: bool = False
-    # Review-on-submit checkpoint (see engine.submit_review). Surfaces a
-    # ``submit`` tool and, when the model finishes with a non-empty diff, shows
-    # it a general hygiene checklist plus its own diff exactly once before the
-    # turn finalizes. Off by default; enabled per run via
-    # OPENSQUILLA_SUBMIT_REVIEW. ``submit_review_diff_max_chars`` bounds the diff
-    # body echoed into context (the per-file summary is always shown in full).
+    # Deprecated, unused compatibility slot; preserve construction and saved configs.
     submit_review_enabled: bool = False
+    # Deprecated, unused compatibility slot; preserve construction and saved configs.
     submit_review_diff_max_chars: int = 20000
-    # Finalize-time patch hygiene hard block. "off" (default) leaves patch
-    # hygiene as warn-only text; "test_paths" challenges a finalizing response
-    # while the live workspace diff still touches test-classified paths, so
-    # test edits are reverted before the patch is collected;
-    # "protected_paths" instead challenges while the diff touches paths
-    # matching the deployment's workspace write-deny globs — the same
-    # configured policy the write gates enforce, with no built-in path
-    # taxonomy. Set via OPENSQUILLA_PATCH_HYGIENE_BLOCK.
+    # Deprecated, unused compatibility slot; preserve positional/keyword construction.
     patch_hygiene_block_mode: Literal["off", "test_paths", "protected_paths"] = "off"
-    # Scratch verify-mirror for deny-blocked in-package test edits. When on,
-    # workspace write-deny rejections point the model at a writable mirror
-    # under <scratch>/verify-mirror/<workspace-relative-path>, and the
-    # finalize-time evidence gate credits executions that reference mirror
-    # files ONLY while every mirror copy hash-matches its workspace original
-    # (a diverged mirror would otherwise let weakened tests count as
-    # verification). Off by default; set via
-    # OPENSQUILLA_SCRATCH_VERIFY_MIRROR.
+    # Deprecated, unused compatibility slot; preserve positional/keyword construction.
     scratch_verify_mirror: bool = False
-    # Finalize-time variant-sweep challenge. When on, the first finalizing
-    # response after source edits receives ONE uniform challenge turn asking
-    # the model to enumerate the distinct input/construct classes reachable
-    # by its changed code paths and run its verification against each. Fires
-    # at most once per turn and never spends the last LLM call or deadline
-    # slack. Off by default; set via OPENSQUILLA_FINALIZE_VARIANT_CHALLENGE.
+    # Deprecated, unused compatibility slot; preserve construction and saved configs.
     finalize_variant_challenge: bool = False
     # Keep rejection feedback visible when blocked compacted-placeholder tool
     # calls are projected out of provider requests: the blocked tool_use keeps
@@ -874,12 +852,7 @@ class AgentConfig:
     # identical projected payloads the request is perturbed with a loop nudge;
     # at 2N the turn aborts. Set via OPENSQUILLA_IDENTICAL_REQUEST_LOOP_BREAK.
     identical_request_loop_break_threshold: int = 0
-    # Escalating recovery directive for repeated compacted-placeholder tool-call
-    # offenses within one turn. 0 = off. From the Nth iteration that blocks a
-    # placeholder reuse onward, a stronger directive is appended after the tool
-    # results so the model rebuilds arguments from fresh file/command output
-    # instead of re-offending until the wall clock expires. Set via
-    # OPENSQUILLA_PLACEHOLDER_ESCALATION_THRESHOLD.
+    # Deprecated, unused compatibility slot; preserve positional/keyword construction.
     placeholder_escalation_threshold: int = 0
     # Pre-deadline wrap-up nudge. 0 = off. When positive and a total turn
     # timeout is configured, the wrap-up directive arms once when remaining
@@ -890,30 +863,7 @@ class AgentConfig:
     # so the model can still apply and verify its final changes. Set via
     # OPENSQUILLA_DEADLINE_WRAPUP_MARGIN_SECONDS.
     deadline_wrapup_margin_seconds: int = 0
-    # Retry the reasoning-only provider failure with thinking disabled instead
-    # of re-requesting visible content with thinking still enabled. Off by
-    # default (the retry keeps thinking on). Set via
-    # OPENSQUILLA_REASONING_ONLY_THINKING_FALLBACK.
-    reasoning_only_thinking_fallback: bool = False
-    # Retry provider errors mentioning thinking/reasoning with thinking
-    # disabled. Historical default on; strict benchmark arms can turn it off
-    # with OPENSQUILLA_PROVIDER_ERROR_THINKING_FALLBACK so every request keeps
-    # the frozen thinking contract.
-    provider_error_thinking_fallback: bool = True
-    # Force thinking off for every provider call once remaining wall-clock
-    # time drops below this many seconds. 0 = off. Complements the wrap-up
-    # directive: the nudge alone leaves thinking enabled, so the model can
-    # still spend the entire margin inside a single reasoning stream. Set via
-    # OPENSQUILLA_DEADLINE_THINKING_OFF_MARGIN_SECONDS.
-    deadline_thinking_off_margin_seconds: int = 0
-    # Preempt a runaway reasoning-only stream once its streamed reasoning text
-    # exceeds this many characters. 0 = off. The partial reasoning is
-    # discarded and the call retries immediately with thinking disabled for
-    # that retry only (the next iteration re-enables thinking), so the budget
-    # goes to tool calls instead of one unbounded reasoning stream. One
-    # preempt per iteration; attempts that already emitted user-visible text
-    # or tool calls are never preempted. Set via
-    # OPENSQUILLA_REASONING_STREAM_CHAR_CAP.
+    # Deprecated, unused compatibility slot; preserve positional/keyword construction.
     reasoning_stream_char_cap: int = 0
     # Re-apply captured source-diff candidates whose paths end the turn with
     # no live workspace diff (that path's earlier work would otherwise be
@@ -922,13 +872,7 @@ class AgentConfig:
     # newest candidate per path, each guarded by `git apply --check`. Set via
     # OPENSQUILLA_FINAL_DIFF_SALVAGE.
     final_diff_salvage: bool = False
-    # Freeze workspace-reverting git commands (restore, checkout paths or
-    # branches, reset --hard, clean -fd, stash) in the shell tools once
-    # remaining wall-clock time drops below this many seconds. 0 = off.
-    # Unlike source_diff_preservation_mode="block", the freeze blocks the
-    # operations outright — no protected-path intersection — so a last-minute
-    # revert cannot empty the collected diff. Set via
-    # OPENSQUILLA_ENDGAME_GIT_FREEZE_MARGIN_SECONDS.
+    # Deprecated, unused compatibility slot; preserve positional/keyword construction.
     endgame_git_freeze_margin_seconds: int = 0
     # Let the iteration cap yield to remaining wall-clock time. 0 = off. When
     # positive and a total turn timeout is configured, hitting max_iterations
@@ -943,61 +887,32 @@ class AgentConfig:
     # scored patch. Off by default; only meaningful with final_diff_salvage.
     # Set via OPENSQUILLA_FINAL_DIFF_SALVAGE_VETO.
     final_diff_salvage_veto: bool = False
-    # Endgame git freeze exemption: a frozen revert whose targeted diff is
-    # instrumentation-only (added print/log lines, nothing removed) is allowed
-    # through — cleaning up diagnostic output is what the wrap-up window is
-    # for. Off by default; only meaningful with the freeze margin. Set via
-    # OPENSQUILLA_ENDGAME_GIT_FREEZE_INSTRUMENTATION_EXEMPT.
+    # Deprecated, unused compatibility slot; preserve positional/keyword construction.
     endgame_git_freeze_instrumentation_exempt: bool = False
-    # Make the wrap-up preempt's thinking-off sticky: when the wrap-up
-    # directive preempts a reasoning stream, disable thinking for every
-    # remaining provider call this turn instead of the next call only. Off by
-    # default. Set via OPENSQUILLA_DEADLINE_WRAPUP_STICKY_THINKING_OFF.
-    deadline_wrapup_sticky_thinking_off: bool = False
-    # One-shot endgame fix directive. 0 = off. When positive, a total turn
-    # timeout is configured, and remaining wall-clock time drops below this
-    # many seconds while the workspace still shows no source change beyond
-    # diagnostic instrumentation, a single user message directs the model to
-    # commit to its best-supported fix now. Set via
-    # OPENSQUILLA_ENDGAME_FIX_DIRECTIVE_MARGIN_SECONDS.
+    # Deprecated, unused compatibility slot; preserve positional/keyword construction.
     endgame_fix_directive_margin_seconds: int = 0
     # Inject an act-now user message when a provider response is reasoning
     # only (no visible text, no tool calls) and grant one extra retry for that
     # failure kind. Off by default (the bare retry re-requests with nothing
     # added). Set via OPENSQUILLA_REASONING_ONLY_ACT_NOW.
     reasoning_only_act_now: bool = False
-    # Mid-budget progress nudges. Off by default. When enabled and the turn
-    # has a wall-clock budget (timeout > 0), a one-shot user message is
-    # appended after tool results the first time elapsed time crosses 50% and
-    # again at 75% of the budget while the workspace shows no change yet (no
-    # write receipts, no captured diff candidates, empty live workspace
-    # diff). Set via OPENSQUILLA_MID_BUDGET_NO_DIFF_NUDGE.
+    # Deprecated, unused compatibility slot; preserve positional/keyword construction.
     mid_budget_no_diff_nudge: bool = False
-    # Provider-view dedup of byte-identical repeated tool results. Off by
-    # default. When enabled, older duplicate tool_result payloads (same content
-    # emitted N+ times across iterations) are replaced in the provider request
-    # projection with a compact back-reference to the surviving newest copy;
-    # persisted history is never mutated. Set via
-    # OPENSQUILLA_PROVIDER_HISTORY_DEDUP.
+    # Deprecated, unused compatibility slots; preserve positional/keyword construction.
     provider_history_dedup_enabled: bool = False
-    # Minimum number of byte-identical copies of a tool result before dedup
-    # elides the older ones (keeps the newest copy full). Set via
-    # OPENSQUILLA_PROVIDER_HISTORY_DEDUP_MIN_REPEATS.
     provider_history_dedup_min_repeats: int = 2
-    # Append a failure-signal scan header to tool-result projection notices:
-    # the omitted region of the original output is scanned for failure-pattern
-    # lines and the notice gains a signal_scan summary plus a ready-to-copy
-    # retrieve_tool_result call for the first match. Off by default; enabled
-    # via OPENSQUILLA_PROJECTION_SIGNAL_HINTS.
     projection_signal_hints: bool = False
+    # Deprecated, unused compatibility slot; preserve construction and saved configs.
     tool_loop_observer_mode: Literal["off", "log"] = "off"
     runtime_recovery_mode: Literal["off", "log", "warn_model"] = "log"
     runtime_recovery_source_loop_max_nudges: int = 1
     final_diff_contract_mode: Literal["off", "log", "warn_model"] = "log"
     source_diff_preservation_mode: Literal["off", "log", "block"] = "log"
     source_diff_candidate_mode: Literal["off", "log", "warn_model"] = "log"
+    # Deprecated, unused compatibility slot; preserve construction and saved configs.
     runtime_state_capsule_mode: Literal["off", "log", "inject"] = "off"
     post_tool_empty_recovery_mode: Literal["off", "log", "warn_model"] = "log"
+    # Deprecated, unused compatibility slot; preserve construction and saved configs.
     text_only_tool_recovery_mode: Literal["off", "log", "warn_model"] = "off"
     reasoning_prefill_recovery_mode: Literal["off", "log", "recover"] = "log"
     runtime_events_path: str | None = None

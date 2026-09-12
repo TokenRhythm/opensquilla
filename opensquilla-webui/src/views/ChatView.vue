@@ -139,23 +139,11 @@
           </div>
         </template>
         <ChatSessionRecoveryStatus
-          v-if="!forkTransition && historyState.sessionMissing"
-          :key="`${sessionKey}:missing`"
-          state="session-missing"
-        />
-        <ChatSessionRecoveryStatus
-          v-else-if="!forkTransition && visibleHistoryRecoveryState"
-          :key="`${sessionKey}:history`"
-          :state="visibleHistoryRecoveryState"
+          v-if="!forkTransition && recoveryNoticeVisible && recoveryNoticeState"
+          :state="recoveryNoticeState"
           :transport-state="gatewayConnectionState"
-          @retry="retryHistory"
-        />
-        <ChatSessionRecoveryStatus
-          v-if="!forkTransition && liveRecoveryState"
-          :key="`${sessionKey}:live`"
-          :state="liveRecoveryState"
-          :transport-state="gatewayConnectionState"
-          @retry="retryLive"
+          automatic
+          @retry="recoveryNoticeState.startsWith('live-') ? retryLive() : retryHistory()"
         />
         <div
           v-if="!forkTransition && showConfirmedEmptySession"
@@ -226,6 +214,7 @@
           @edit-message="editMessage"
           @edit-attachment="editAttachmentResource"
           @preview-attachment="previewAttachmentResource"
+          @preview-image="previewImageAttachment"
           @reuse-prompt-annotation="reusePromptAnnotation"
           @regenerate-message="handleRegenerateMessage"
           @toggle-share-message="toggleShareMessage"
@@ -479,37 +468,6 @@
           </div>
         </div>
 
-        <!-- Legacy standalone approval / clarify block. The interrupt parts now
-             carry these through the fold (InterruptPart over the same cards), so
-             this side-list only renders on the foldLiveTurn=0 rollback branch —
-             the one-flag kill switch — to avoid a double-render. Kept for one
-             release as the rollback lever, mirroring the foldLiveTurn discipline. -->
-        <template v-if="foldLiveTurnMode === false">
-          <!-- In-thread approval cards: blocked runs ask for a decision here -->
-          <ApprovalCard
-            v-for="entry in approvalEntries"
-            :key="entry.approval.id"
-            :approval="entry.approval"
-            :resolution="entry.resolution"
-            :busy="approvalBusyIds.has(entry.approval.id)"
-            :error="entry.error"
-            @allow-once="resolveApproval(entry, 'allow-once')"
-            @allow-always="resolveApproval(entry, 'allow-always')"
-            @deny="resolveApproval(entry, 'deny')"
-            @extend="extendInterrupt(entry.approval.id)"
-          />
-
-          <!-- In-thread clarify card: pending agent questions render as a form -->
-          <ClarifyCard
-            v-if="pendingClarify"
-            :request="pendingClarify"
-            :submitted="clarifySubmitted"
-            :busy="clarifyBusy"
-            :error="clarifyError"
-            @submit="submitClarify"
-            @dismiss="dismissClarify"
-          />
-        </template>
         <div ref="bottomSentinelRef" class="chat-bottom-sentinel" aria-hidden="true" />
         </div>
         <ConversationMinimap
@@ -707,6 +665,7 @@
       @keydown="onTextareaKeydown"
       @remove-attachment="removeAttachment"
       @retry-attachment="retryAttachment"
+      @preview-image="previewPendingImage"
       @set-busy-send-mode="busySendMode = $event"
       @set-run-mode="setComposerRunMode"
       @set-session-routing-mode="setComposerSessionRoutingMode"
@@ -794,7 +753,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed, inject, onMounted, onUnmounted, nextTick, watch, watchEffect } from 'vue'
+import { ref, computed, inject, onMounted, onUnmounted, nextTick, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { useRouter } from 'vue-router'
 import { storeToRefs } from 'pinia'
@@ -817,16 +776,14 @@ import { useSetupStatus } from '@/composables/setup/useSetupStatus'
 import { useAppStore } from '@/stores/app'
 import { useSandboxSetupStore } from '@/stores/sandboxSetup'
 import { useArtifactPromptAnnotationsStore } from '@/stores/artifactPromptAnnotations'
-import { useWorkbenchDocumentContextStore } from '@/stores/workbenchDocumentContext'
 import { useWorkbenchResourcesStore } from '@/stores/workbenchResources'
 import { useWorkbenchStore } from '@/workbench/store'
 import { usePlatform } from '@/platform'
 import {
   focusArtifactPromptAnnotation,
-  notifyArtifactPromptAnnotationsAccepted,
+  notifyPageAnnotationsSent,
   reuseArtifactPromptAnnotation,
 } from '@/workbench/promptAnnotations'
-import ApprovalCard from '@/components/chat/ApprovalCard.vue'
 import ActivityDisclosure from '@/components/chat/ActivityDisclosure.vue'
 import AssistantActivityTimeline from '@/components/chat/AssistantActivityTimeline.vue'
 import UnifiedAssistantActivityTimeline from '@/components/chat/UnifiedAssistantActivityTimeline.vue'
@@ -837,6 +794,7 @@ import ChatComposer from '@/components/chat/ChatComposer.vue'
 import ProjectWorkspacePickerDialog from '@/components/ProjectWorkspacePickerDialog.vue'
 import ChatMessageList from '@/components/chat/ChatMessageList.vue'
 import ChatSessionRecoveryStatus from '@/components/chat/ChatSessionRecoveryStatus.vue'
+import { useChatRecoveryNotice } from '@/composables/chat/useChatRecoveryNotice'
 import ChatStallNotice from '@/components/chat/ChatStallNotice.vue'
 import ClarifyCard from '@/components/chat/ClarifyCard.vue'
 import ConversationMinimap from '@/components/chat/ConversationMinimap.vue'
@@ -876,7 +834,6 @@ import { useChatElevatedMode } from '@/composables/chat/useChatElevatedMode'
 import { useChatFeatureToggles } from '@/composables/chat/useChatFeatureToggles'
 import { useChatSessionRouting } from '@/composables/chat/useChatSessionRouting'
 import { SESSION_ROUTING_KEY, type SessionRouting } from '@/modules/sessionRouting'
-import { SESSION_CONVERSATION_KEY, type SessionConversation } from '@/modules/sessionConversation'
 import { USAGE_REPORTING_KEY, type UsageReporting } from '@/modules/usageReporting'
 import { COMMAND_CATALOG_KEY, type CommandCatalog } from '@/modules/commandCatalog'
 import { PROMPT_CACHE_LEASE_KEY, type PromptCacheLease } from '@/modules/promptCacheLease'
@@ -950,7 +907,7 @@ import {
   acquireSessionBootstrapAdmission,
   claimSessionBootstrapAdmission,
   optionalSessionRpcAllowed,
-  optionalSessionRpcCallOptions,
+  optionalSessionReadOptions,
 } from '@/composables/chat/sessionBootstrapAdmission'
 import { useChatSessionRuntime } from '@/composables/chat/useChatSessionRuntime'
 import {
@@ -961,6 +918,7 @@ import {
 } from '@/modules/conversationSessionRuntime'
 import {
   SESSION_READ_LIFECYCLE_FACTORY_KEY,
+  SessionReadFailure,
   type SessionReadMetadata,
   type SessionReadPortLease,
   type SessionReadSnapshot,
@@ -1075,7 +1033,9 @@ import {
   artifactWorkbenchPreviewKind,
 } from '@/utils/workbench/artifactPreview'
 import { findArtifactCard, focusArtifactInTranscript } from '@/utils/chat/artifactFocus'
-import { classifyArtifactProductError } from '@/utils/artifactProductErrors'
+import {
+  classifyArtifactProductError,
+} from '@/utils/artifactProductErrors'
 import {
   persistDeferredMetaDraft,
   takeDeferredMetaDrafts,
@@ -1115,6 +1075,7 @@ import {
 import {
   collectClipboardFiles,
   hasModelInputImageAttachment,
+  normalizeDisplayAttachment,
   isSendableAttachment,
   shouldCaptureFilePaste,
 } from '@/utils/chat/attachments'
@@ -1214,9 +1175,6 @@ if (!injectedMetaRunCenter) throw new Error('MetaRunCenter was not provided')
 const metaRunCenter: MetaRunCenter = injectedMetaRunCenter
 const injectedAppSettings = inject(APP_SETTINGS_KEY)
 if (!injectedAppSettings) throw new Error('AppSettings was not provided')
-const injectedSessionConversation = inject(SESSION_CONVERSATION_KEY)
-if (!injectedSessionConversation) throw new Error('SessionConversation was not provided')
-const sessionConversation: SessionConversation = injectedSessionConversation
 const injectedUsageReporting = inject(USAGE_REPORTING_KEY)
 if (!injectedUsageReporting) throw new Error('UsageReporting was not provided')
 const usageReporting: UsageReporting = injectedUsageReporting
@@ -1286,10 +1244,7 @@ function artifactPreviewItemForExplicitOpen(
 }
 
 const artifactPromptAnnotationsStore = useArtifactPromptAnnotationsStore()
-const workbenchDocumentContextStore = useWorkbenchDocumentContextStore()
 const workbenchResourcesStore = useWorkbenchResourcesStore()
-const artifactPromptAnnotationProvider = artifactWorkbench.promptAnnotations
-artifactPromptAnnotationsStore.setProvider(artifactPromptAnnotationProvider)
 const artifactImageLightbox = useArtifactImageLightbox()
 const platform = usePlatform()
 const router = useRouter()
@@ -1408,7 +1363,7 @@ const activePromptAnnotations = computed(() =>
   promptAnnotationsEnabled.value
     ? artifactPromptAnnotationsStore.activeDraftsForSession(sessionKey.value)
     : [])
-const sendablePromptAnnotationIds = computed(() =>
+const sendableAnnotationDraftIds = computed(() =>
   promptAnnotationsEnabled.value
     ? artifactPromptAnnotationsStore.sendableDraftsForSession(sessionKey.value)
       .map(annotation => annotation.annotationId)
@@ -1439,12 +1394,6 @@ async function discardPromptAnnotation(annotationId: string) {
   }
 }
 
-function promptAnnotationRpcErrorCode(error: unknown): string {
-  if (!error || typeof error !== 'object') return ''
-  const code = (error as { code?: unknown }).code
-  return typeof code === 'string' ? code : ''
-}
-
 async function jumpPromptAnnotation(annotationId: string) {
   const annotation = artifactPromptAnnotationsStore.annotations[annotationId]
   if (!annotation) return
@@ -1457,18 +1406,7 @@ async function jumpPromptAnnotation(annotationId: string) {
     pushToast(t('chat.promptAnnotations.focusUnavailable'), { tone: 'warn' })
     return
   }
-  try {
-    await artifactPromptAnnotationsStore.focus(annotationId)
-  } catch (error) {
-    if (promptAnnotationRpcErrorCode(error) === 'ARTIFACT_REVISION_CHANGED') {
-      pushToast(t('chat.promptAnnotations.focusUnavailable'), { tone: 'warn' })
-      return
-    }
-    if (promptAnnotationRpcErrorCode(error) === 'ARTIFACT_ANNOTATION_NOT_DRAFT') {
-      await artifactPromptAnnotationsStore.load(annotation.sessionKey, { force: true })
-    }
-    pushToast(t('chat.promptAnnotations.focusUnavailable'), { tone: 'warn' })
-  }
+
 }
 
 async function reusePromptAnnotation(annotation: PromptAnnotationSnapshot) {
@@ -1701,12 +1639,16 @@ const conversationSessionRuntime = createConversationSessionRuntime<
   SessionReadPortLease
 >({
   source: conversationEvents,
-  events: { sessionKey: conversationEventSessionKey },
+  events: {
+    sessionKey: conversationEventSessionKey,
+    invalidatesSession: event => event.kind === 'conversation' && event.event.semanticKind === 'session-epoch-changed',
+  },
 })
 const conversationRuntime = conversationSessionRuntime.cursor
 const sessionReadLifecycle = sessionReadLifecycleFactory.create({
   cursor: conversationRuntime,
   subscriptions: conversationSessionRuntime.subscriptions,
+  prepareReadRetirement: key => conversationSessionRuntime.events.prepareReadRetirement(key),
 })
 const activeTaskGroups = ref<Set<string>>(new Set())
 // Task id whose output the live stream renders; binds late events to the
@@ -1831,7 +1773,6 @@ const {
   streamArtifacts,
   streamBubble,
   streamHasVisibleOutput,
-  streamTimelineItems,
   streamActivityStale,
   streamPhaseElapsed,
   streamTurnElapsed,
@@ -1851,8 +1792,6 @@ const {
   isToolItemOpen,
   toggleToolItem,
   cleanup: cleanupStream,
-  assertLiveParity,
-  useReducer: foldLiveTurnMode,
   foldedTurn,
   appendInterruptFrame,
   ensureInterruptBubble,
@@ -1870,6 +1809,7 @@ const {
   onFileInputChange,
   addAttachments,
   removeAttachment,
+  retireAttachments,
   retryAttachment,
   hasPendingAttachmentWork,
   prepareAttachmentsForSend,
@@ -2123,7 +2063,7 @@ watch(compactStatus, (status) => {
 
 const chatUsageWidget = useChatUsageWidget({
   usageReporting,
-  readCallOptions: optionalSessionRpcCallOptions,
+  readOptions: optionalSessionReadOptions,
   sessionKey,
   tokenVizEnabled: () => appStore.features.tokenViz,
 })
@@ -2152,10 +2092,9 @@ const {
 } = chatSessionRoute
 
 const chatFeatureToggles = useChatFeatureToggles({
-  sessionConversation,
   appSettings: injectedAppSettings,
   modelRouting: injectedProviderConfiguration,
-  readCallOptions: optionalSessionRpcCallOptions,
+  readOptions: optionalSessionReadOptions,
   setGlobalElevatedMode,
   loadCurrentSessionUsage,
 })
@@ -2256,6 +2195,7 @@ const chatRouterDecisionRuntime = useChatRouterDecisionRuntime({
 const {
   pendingDecision,
   handleRouterControlReplay,
+  resetRouterReplayCursor,
   queueRouterDecision,
   appendEnsembleProgress,
   markEnsembleHandoff,
@@ -2626,6 +2566,19 @@ const chatSessionSubscription = useChatSessionSubscription({
   resetStreamIdleTimer,
   resetStreamLiveTurnState,
   onLiveSnapshot: snapshot => restoreLiveTurnSnapshot(snapshot),
+  onReadStarted: () => {
+    conversationSessionRuntime.events.invalidateConsumption(sessionKey.value)
+    rpcEventHandlers.beginRecovery()
+  },
+  reconcileHistory: () => chatHistory.reconcileHistory(),
+  onReconciliationInstalled: async () => {
+    await chatApprovals.reconcile()
+  },
+  onSnapshotInstalled: () => {
+    if (!rpcEventHandlers.finishRecovery()) {
+      throw new SessionReadFailure('busy', 'Session recovery buffer overflow; retrying the latest snapshot.', true)
+    }
+  },
   onAuthoritativeIdle: () => {
     if (pendingQueueOwnerContext.value?.sessionKey !== sessionKey.value) {
       activeRunModeLock.value = null
@@ -2672,6 +2625,7 @@ const chatSessionSubscription = useChatSessionSubscription({
 })
 const {
   subscribeSession,
+  reconcileSession,
   retrySessionMetadata,
   cancelActiveSubscription,
   streamGeneration,
@@ -2688,6 +2642,8 @@ const chatSessionBootstrap = useChatSessionBootstrap({
       : await loadHistory({}, context)
   ),
   subscribeSession,
+  reconcileSession,
+  connectionState: gatewayConnectionState,
   cancelHistory: cancelActiveHistory,
   cancelSubscription: cancelActiveSubscription,
 })
@@ -2732,6 +2688,17 @@ function trackSessionBootstrapAdmission<T extends {
 }
 
 let postBootstrapMetadataStarted = false
+function startPostBootstrapMetadata() {
+  if (postBootstrapMetadataStarted) return
+  postBootstrapMetadataStarted = true
+  pendingFeatureToggleRefresh = false
+  void refreshPostBootstrapMetadata()
+  void loadFeatureToggles().then(() => {
+    if (!chatViewDisposed) unsubs.push(bindFeatureRefresh(scheduleHistorySync))
+  })
+  loadSlashCommands()
+}
+
 function schedulePostBootstrapMetadata(
   run: {
     generation: number
@@ -2748,12 +2715,7 @@ function schedulePostBootstrapMetadata(
         || sessionKey.value !== key
         || !isSessionBootstrapCurrent(run.generation, key)
       ) return
-      postBootstrapMetadataStarted = true
-      void refreshPostBootstrapMetadata()
-      void loadFeatureToggles().then(() => {
-        if (!chatViewDisposed) unsubs.push(bindFeatureRefresh(scheduleHistorySync))
-      })
-      loadSlashCommands()
+      startPostBootstrapMetadata()
     },
     () => {},
   )
@@ -2977,9 +2939,10 @@ const chatSessionRuntime = useChatSessionRuntime({
   resetSavingsPopupCooldown,
   restoreWidgetState,
   resetStreamLiveTurnState,
+  retireAttachments,
   resetDraftComposer: () => {
+    artifactImageLightbox.close()
     inputText.value = ''
-    pendingAttachments.value = []
     resetComposerInputHistory()
     autoResizeTextarea()
   },
@@ -3104,6 +3067,8 @@ function projectAcceptedGoalMessage({
 }
 
 const chatGoals = useChatGoals({
+  connectionEpoch: computed(() => gatewayAccess.subscriptionEpoch),
+  connectionAvailable: () => gatewayAccess.isAvailable && gatewayAccess.isAuthenticated,
   goalCenter,
   goalContinuity,
   sessionKey,
@@ -3244,7 +3209,7 @@ const chatSlashCommands = useChatSlashCommands({
   usageReporting,
   sessionMaintenance,
   metaRunCenter,
-  catalogCallOptions: optionalSessionRpcCallOptions,
+  catalogCallOptions: optionalSessionReadOptions,
   inputText,
   sessionKey,
   autoResizeTextarea,
@@ -3372,39 +3337,24 @@ const chatSend = useChatSend({
   acceptPendingWorkspaceBinding: activeProjectWorkspace.acceptPendingBinding,
   initialCollaborationMode,
   pendingForkBeforeMessageId,
-  promptAnnotationIds: sendablePromptAnnotationIds,
+  draftIds: sendableAnnotationDraftIds,
   idempotentReplayBlockedReason: liveSendBlockedReason,
-  currentDocumentContext: key => (
-    workbenchDocumentContextStore.currentDocumentContext(key)
-  ),
-  prepareDocumentContextForSend: (key, prepareOptions) => (
-    workbenchDocumentContextStore.prepareDocumentContextForSend(key, prepareOptions)
-  ),
   preparePromptAnnotationsForSend: async (ids, prepareOptions) => {
-    const targetDocuments = new Set(
-      artifactPromptAnnotationsStore.snapshotsForIds(ids).map(item => item.documentId),
-    )
-    for (const documentId of targetDocuments) {
-      const flushed = await workbenchDocumentContextStore.prepareDocumentForSend(
-        sessionKey.value,
-        documentId,
-        prepareOptions,
-      )
-      if (flushed === false) return false
-    }
     const prepared = await artifactPromptAnnotationsStore.prepareForSend(ids)
     return prepared && (prepareOptions?.isCurrent?.() ?? true)
   },
   promptAnnotationSnapshots: ids => artifactPromptAnnotationsStore.snapshotsForIds(ids),
-  acknowledgePromptAnnotations: (
-    requestedIds,
-    acceptedIds,
-    acceptedSessionKey,
-    requestSessionKey,
-  ) => {
-    artifactPromptAnnotationsStore.acknowledgeAccepted(requestedIds, acceptedIds)
-    notifyArtifactPromptAnnotationsAccepted({
-      acceptedIds: [...acceptedIds],
+  annotationAttachments: ids => artifactPromptAnnotationsStore.attachmentsForIds(ids),
+  acknowledgePromptAnnotations: (snapshots, acceptedSessionKey, requestSessionKey) => {
+    let removedIds: string[]
+    try {
+      removedIds = artifactPromptAnnotationsStore.acknowledgeSent(snapshots)
+    } catch {
+      pushToast(t('chat.promptAnnotations.discardFailed'), { tone: 'warn' })
+      return
+    }
+    notifyPageAnnotationsSent({
+      draftIds: removedIds,
       sessionKey: acceptedSessionKey,
       requestSessionKey,
     })
@@ -3771,7 +3721,7 @@ async function steerPendingMessage(pendingUiId: string) {
 }
 
 const chatApprovals = useChatApprovals({
-  sessionConversation,
+  conversationEvents: conversationSessionRuntime.events,
   clarificationSubmission,
   approvalCenter,
   sessionKey,
@@ -3781,22 +3731,26 @@ const chatApprovals = useChatApprovals({
   onSnapshotCount: count => appStore.setApprovalCount(count),
 })
 const {
-  approvalEntries,
-  approvalBusyIds,
   pendingClarify,
   clarifySubmitted,
   clarifyBusy,
   clarifyError,
-  resolveApproval,
   resolveInterrupt,
   extendInterrupt,
   submitClarify,
   dismissClarify,
   applyUserInputBootstrap,
 } = chatApprovals
-applyPendingUserInputSnapshot = snapshot => applyUserInputBootstrap({
-  pendingUserInputs: [...snapshot.pendingUserInputs],
-})
+applyPendingUserInputSnapshot = snapshot => {
+  if (snapshot.deferredFields.includes('pendingUserInputs')) return
+  applyUserInputBootstrap({
+    sessionKey: snapshot.sessionKey,
+    epoch: snapshot.epoch,
+    streamSeq: snapshot.pendingUserInputsCursor?.currentStreamSeq,
+    streamGeneration: snapshot.pendingUserInputsCursor?.streamGeneration,
+    pendingUserInputs: [...snapshot.pendingUserInputs],
+  })
+}
 
 const dockedPlanQuestionnaire = computed(() => (
   pendingClarify.value?.presentation === 'plan_questionnaire_v1'
@@ -3880,6 +3834,8 @@ function onPlanQuestionnaireTouchEnd() {
 }
 
 const rpcEventHandlers = useChatRpcEventHandlers({
+  onRecoveryRequired: () => { void recoverCurrentSession() },
+  onTaskSettled: (taskId, epoch) => chatPlans.noteTaskSettled(taskId, epoch),
   conversationRuntime,
   sessionKey,
   currentEpoch,
@@ -3906,10 +3862,11 @@ const rpcEventHandlers = useChatRpcEventHandlers({
   flushPendingRouterDecision,
   clearPendingRouterDecision,
   handleRouterControlReplay,
+  resetRouterReplayCursor,
   showCompactionToast,
   getCompactionPlacement: id => getCompactionPlacement(id) || undefined,
   showWarningToast: message => pushToast(message || t('chat.warning.default'), { tone: 'warn', duration: 5000 }),
-  supportsTurnCommitted: () => sessionConversation.supports('turn-committed'),
+  supportsTurnCommitted: () => gatewayAccess.turnCommittedEvents,
   scheduleHistorySync,
   schedulePendingDrainAfterTerminal,
   popAllPendingIntoComposer,
@@ -3926,26 +3883,11 @@ const rpcEventHandlers = useChatRpcEventHandlers({
 })
 bindActiveStreamTask = rpcEventHandlers.bindActiveStreamTask
 restoreLiveTurnSnapshot = rpcEventHandlers.restoreLiveTurnSnapshot
-const {
-  streamThinkingText,
-  streamThinkingElapsedText,
-  attachTurnReasoning,
-} = rpcEventHandlers
+const { attachTurnReasoning } = rpcEventHandlers
 
-// live-turn shadow parity: in DEV/SHADOW, re-check the fold against the legacy
-// live surface whenever a frame lands (the fold and legacy refs are tracked by
-// assertLiveParity). Injects the thinking text owned by the event handlers.
-// In production ON mode this is a no-op; DEV/SHADOW performs the parity check,
-// while explicit OFF keeps the compatibility renderer without fold assertions.
-watchEffect(() => assertLiveParity(streamThinkingText))
-
-// Flag-selected live render source. In production the fold is authoritative by
-// default; only opensquilla.chat.foldLiveTurn=0 restores legacy. SHADOW and OFF
-// return the IDENTICAL legacy refs, so with the flag off the render is byte-identical.
-// The activity head (phase/elapsed) stays on the legacy activity refs.
-const liveTimelineItems = computed(() =>
-  foldLiveTurnMode.value === true ? foldedTurn.value.timelineItems : streamTimelineItems.value,
-)
+// The append-only turn log is the single live content projection. The activity
+// head (phase/elapsed) remains presentation state outside the transcript fold.
+const liveTimelineItems = computed(() => foldedTurn.value.timelineItems)
 const liveTimelineSplit = computed(() => splitLiveAssistantTimeline(liveTimelineItems.value, {
   keepToolTurnTextInActivity: true,
 }))
@@ -3962,9 +3904,7 @@ const liveAnswerPart = computed<Extract<ChatPart, { type: 'text' }> | null>(() =
 const liveActivityTimelineItems = computed<ChatStreamTimelineItem[]>(() =>
   liveTimelineSplit.value.activityItems,
 )
-const liveActivityStatusHistory = computed(() =>
-  foldLiveTurnMode.value === false ? [] : foldedTurn.value.statusHistory,
-)
+const liveActivityStatusHistory = computed(() => foldedTurn.value.statusHistory)
 const liveActivityProjection = computed(() =>
   {
     // The shared activity tick advances both the current phase duration and
@@ -3989,7 +3929,7 @@ const liveReasoningCollapseActive = computed(() =>
 )
 const liveToolStateScope = computed(() => JSON.stringify([sessionKey.value || '', 'stream']))
 // Elapsed readouts in the live turn round to whole seconds ("4s"), matching
-// streamPhaseElapsed and streamThinkingElapsedText. The shared tool formatter
+// streamPhaseElapsed. The shared tool formatter
 // (streamToolElapsedText, useChatStream.ts) emits tenths, so normalise its
 // output here at the call site instead of changing the shared formatter —
 // except sub-second finished tools, which keep their tenths so they never
@@ -3997,28 +3937,10 @@ const liveToolStateScope = computed(() => JSON.stringify([sessionKey.value || ''
 function liveToolElapsedText(call: Pick<ChatToolCall, 'toolId'>): string {
   return streamToolElapsedText(call).replace(/^([1-9]\d*)\.\d+s$/, '$1s')
 }
-const liveArtifacts = computed(() =>
-  foldLiveTurnMode.value === true ? foldedTurn.value.artifacts : streamArtifacts.value,
+const liveArtifacts = computed(() => foldedTurn.value.artifacts)
+const liveReasoningBlocks = computed<ReasoningBlock[]>(() =>
+  foldedTurn.value.reasoningBlocks.filter(block => block.text),
 )
-const liveThinkingText = computed(() =>
-  foldLiveTurnMode.value === true ? foldedTurn.value.thinkingText : streamThinkingText.value,
-)
-const liveReasoningBlocks = computed<ReasoningBlock[]>(() => {
-  if (foldLiveTurnMode.value === true) {
-    return foldedTurn.value.reasoningBlocks.filter(block => block.text)
-  }
-  if (!liveThinkingText.value) return []
-  const seconds = Number.parseInt(streamThinkingElapsedText.value, 10)
-  const elapsed = Number.isFinite(seconds) ? seconds : 0
-  return [{
-    id: 'legacy-live-reasoning',
-    index: 0,
-    text: liveThinkingText.value,
-    status: 'streaming',
-    startedAt: Date.now() - elapsed * 1000,
-    contentKind: 'reasoning',
-  }]
-})
 function validLiveActivityOrder(value: unknown): value is number {
   return typeof value === 'number' && Number.isSafeInteger(value) && value > 0
 }
@@ -4047,19 +3969,9 @@ const liveActivityStepCount = computed(() =>
 const liveActivityFailureCount = computed(() =>
   liveActivityProjection.value.activityClusters.filter(cluster => cluster.isFailure).length,
 )
-// Inline interrupt parts for the live turn come from the fold whenever it is
-// active (ON or SHADOW — frames are appended in both). Only the foldLiveTurn=0
-// OFF rollback renders the legacy standalone ApprovalCard/ClarifyCard block, so
-// the two never both show. Unlike the activity body (which has a legacy ref to
-// fall back to in SHADOW), interrupts have no legacy live ref, so SHADOW must
-// also render them from the fold.
-const liveInterruptParts = computed(() =>
-  foldLiveTurnMode.value === false
-    ? []
-    : foldedTurn.value.parts.filter(
-        (part): part is Extract<typeof part, { type: 'interrupt' }> => part.type === 'interrupt',
-      ),
-)
+const liveInterruptParts = computed(() => foldedTurn.value.parts.filter(
+  (part): part is Extract<typeof part, { type: 'interrupt' }> => part.type === 'interrupt',
+))
 const livePendingInterruptParts = computed(() =>
   liveInterruptParts.value.filter(part => !part.resolution),
 )
@@ -4184,22 +4096,47 @@ const { stallActive, stallSeconds } = stallWatchdog
 const chatRpcSubscriptions = useChatRpcSubscriptions({
   // The private v4 adapter emits one semantic message. Feed that projection to
   // both business consumers without exposing protocol names in the view.
-  onEvent: (message) => {
-    if (message.kind === 'conversation') {
-      stallWatchdog.noteEvent(message.event.semanticKind, message.payload)
+  onEvent: (message, consumption) => {
+    if (consumption && !consumption.isCurrent()) throw new Error('Conversation consumer was superseded.')
+    if (message.kind === 'conversation' && message.event.kind === 'known' && message.event.semanticKind !== 'cron-result') {
+      stallWatchdog.noteEvent(message.event.semanticKind, message.event.payload)
     } else if (message.kind === 'approval') {
       stallWatchdog.noteEvent(
         message.action === 'requested' ? 'approval-requested' : 'approval-resolved',
         message.payload,
       )
     }
-    rpcEventHandlers.onConversationEvent(message)
+    return rpcEventHandlers.consumeConversationEvent(message)
   },
+  onRecoveryRequired: recoverCurrentSession,
   onConnectionState: rpcEventHandlers.handlers.onConnectionState,
 }, {
   getSessionKey: () => sessionKey.value,
   runtime: conversationSessionRuntime,
 })
+
+let currentSessionRecovery: Promise<boolean> | null = null
+function recoverCurrentSession(scope?: { readonly keys: readonly string[], readonly global: boolean }): Promise<boolean> {
+  if (scope && (scope.global || scope.keys.length === 0 || scope.keys.some(key => key !== sessionKey.value))) {
+    return Promise.resolve(false)
+  }
+  if (currentSessionRecovery) return currentSessionRecovery
+  const key = sessionKey.value
+  const lease = sessionReadLifecycle.current()
+  const pending = retryLive().then(result => key === sessionKey.value && (
+    result.authoritative
+    // The current owner remains fenced and owns bounded automatic retries (or
+    // a truthful local stale state for an oversized snapshot). A read failure
+    // is not evidence that the shared transport must be recycled.
+    || (lease !== null && sessionReadLifecycle.current() === lease && !result.sessionMissing)
+  ))
+    .catch(() => false)
+  const observed = pending.finally(() => {
+    if (currentSessionRecovery === observed) currentSessionRecovery = null
+  })
+  currentSessionRecovery = observed
+  return observed
+}
 
 // Session switches drop the previous session's stall tracking entirely.
 watch(sessionKey, () => {
@@ -4451,14 +4388,16 @@ const visibleHistoryRecoveryState = computed(() => (
 const liveRecoveryState = computed(() => {
   if (historyState.value.sessionMissing) return null
   if (livePhase.value === 'degraded') return 'live-degraded' as const
-  if (
-    livePhase.value === 'connecting'
-    && historyRecoveryState.value === null
-  ) {
+  if (livePhase.value === 'connecting') {
     return 'live-connecting' as const
   }
   return null
 })
+
+const recoveryNoticeState = computed(() => historyState.value.sessionMissing
+  ? 'session-missing' as const
+  : liveRecoveryState.value ?? visibleHistoryRecoveryState.value)
+const recoveryNoticeVisible = useChatRecoveryNotice(recoveryNoticeState)
 
 const showConfirmedEmptySession = computed(() => shouldShowConfirmedEmptySession({
   isDraftLanding: isNewChatLanding.value,
@@ -4583,7 +4522,10 @@ const queuedImageSendBlockedMessage = computed(() => {
 })
 
 const modelImageSendBlockedMessage = computed(() => {
-  return hasModelInputImageAttachment(pendingAttachments.value)
+  return hasModelInputImageAttachment([
+    ...pendingAttachments.value,
+    ...artifactPromptAnnotationsStore.attachmentsForIds(sendableAnnotationDraftIds.value),
+  ])
     ? queuedImageSendBlockedMessage.value
     : ''
 })
@@ -4924,6 +4866,24 @@ function subagentBody(text: string): string {
 
 /* ── Artifacts ─────────────────────────────────────────────────────── */
 
+function previewImageAttachment(attachment: DisplayAttachment, attachments: readonly DisplayAttachment[]) {
+  artifactImageLightbox.openAttachments({
+    attachment,
+    navigationAttachments: attachments,
+    sessionKey: sessionKey.value,
+  })
+}
+
+function previewPendingImage(attachment: Attachment) {
+  artifactImageLightbox.openAttachments({
+    attachment: normalizeDisplayAttachment(attachment),
+    navigationAttachments: pendingAttachments.value.map(attachment => normalizeDisplayAttachment(attachment)),
+    // Drafts have a provisional runtime key before a session exists in the URL.
+    // Keep local previews owned by the visible route used by App's dialog guard.
+    sessionKey: readSessionFromUrl(),
+  })
+}
+
 async function downloadAttachment(attachment: DisplayAttachment): Promise<boolean> {
   const result = await artifactWorkbench.content.fetchAttachment(attachment, {
     sessionKey: sessionKey.value,
@@ -5009,7 +4969,7 @@ async function previewAttachmentResource(attachment: DisplayAttachment) {
     if (
       !current
       && resource.resource.type !== 'document'
-      && resource.capabilities.manualEdit
+      && resource.capabilities.edit
       && resource.sha256
     ) {
       const imported = await workbenchResourcesStore.importDocument(
@@ -5303,7 +5263,7 @@ async function openDeliverableWorkbenchResource(artifact: ArtifactPayload) {
     if (
       !current
       && resource.resource.type !== 'document'
-      && resource.capabilities.manualEdit
+      && resource.capabilities.edit
       && resource.sha256
     ) {
       const imported = await workbenchResourcesStore.importDocument(
@@ -6466,8 +6426,6 @@ async function validateActiveProjectBeforeSend(): Promise<string | null> {
     const workspaces = await projectWorkspaces.loadWorkspaces({
       timeoutMs: Math.max(1, deadlineAt - Date.now()),
       signal: controller.signal,
-      timeoutAction: 'reconnect',
-      abortAction: 'reject',
     })
     if (sessionKey.value !== key || boundWorkspaceId.value !== workspaceId) {
       return activeWorkspaceSendBlockedReason.value || 'resolving'
@@ -6532,8 +6490,6 @@ async function syncDraftProjectFromRoute(generation: number): Promise<boolean> {
     await projectWorkspaces.loadWorkspaces({
       timeoutMs: Math.max(1, deadlineAt - Date.now()),
       signal: controller.signal,
-      timeoutAction: 'reconnect',
-      abortAction: 'reject',
     })
     if (!draftProjectHydrationIsCurrent(generation, workspaceId)) return false
     const workspace = projectWorkspaces.byId.value.get(workspaceId)
@@ -6832,6 +6788,7 @@ onUnmounted(() => {
   cancelSessionBootstrap()
   conversationSessionRuntime.dispose()
   pendingSessionOptionalReads = null
+  pendingFeatureToggleRefresh = false
   releaseOptionalRpcAdmission?.()
   releaseOptionalRpcAdmission = null
   cancelActiveProjectValidation()
@@ -6843,7 +6800,6 @@ onUnmounted(() => {
   cleanupSessionArtifacts()
   cleanupStream()
   cleanupCompaction()
-  artifactPromptAnnotationsStore.setProvider(null)
   cleanupVoiceInput()
   chatApprovals.cleanup()
   metaRuns.cleanup()
@@ -6956,10 +6912,16 @@ watch(
 watch(() => [route.path, route.query.agent, route.query.project], async () => {
   durableRecoveryGeneration += 1
   metaDraftRecovery.invalidate()
-  const generation = draftProjectHydration.begin()
+  draftProjectHydration.invalidate()
   if (!isDraftRoute()) return
-  if (!await syncDraftProjectFromRoute(generation)) return
+  artifactImageLightbox.close()
+  // Retire the previous session before optional project I/O. The shared view
+  // already renders /chat/new here; retaining its old key would also admit
+  // that session's delayed live events, history, and subscription snapshots.
   enterDraft()
+  const generation = draftProjectHydration.begin()
+  if (!await syncDraftProjectFromRoute(generation)) return
+  if (!draftProjectHydration.isCurrent(generation) || !isDraftRoute()) return
   metaDraftRecovery.start(draftAgentId())
 })
 
@@ -7037,9 +6999,19 @@ type SessionOptionalReadRequest = {
 }
 
 let pendingSessionOptionalReads: SessionOptionalReadRequest | null = null
+let pendingFeatureToggleRefresh = false
 
 function flushSessionOptionalReads() {
   if (!optionalSessionRpcAllowed.value) return
+  if (chatViewDisposed || !gatewayAccess.isAvailable) return
+  if (pendingFeatureToggleRefresh) {
+    pendingFeatureToggleRefresh = false
+    // A late first Hello can replace the pre-connection bootstrap generation.
+    // Its retired callback must not strand metadata: the same open gate can
+    // initialize it once, then later Hellos only refresh it (including drafts).
+    if (postBootstrapMetadataStarted) void loadFeatureToggles()
+    else startPostBootstrapMetadata()
+  }
   const pending = pendingSessionOptionalReads
   pendingSessionOptionalReads = null
   if (
@@ -7099,7 +7071,7 @@ watch(sessionKey, () => {
 // for the current Session then; older gateways simply remain on history/live.
 watch(() => gatewayAccess.availability, (state, previous) => {
   if (state !== 'available' || previous === 'available') return
-  void loadFeatureToggles()
+  pendingFeatureToggleRefresh = true
   if (
     sessionKey.value
     && pendingSessionIntent.value !== 'new_chat'
@@ -7109,6 +7081,8 @@ watch(() => gatewayAccess.availability, (state, previous) => {
       artifactMode: 'reconnect',
       forceAnnotations: true,
     })
+  } else {
+    flushSessionOptionalReads()
   }
 })
 

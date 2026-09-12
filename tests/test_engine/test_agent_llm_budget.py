@@ -8,6 +8,7 @@ from collections.abc import AsyncIterator
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
+from unittest.mock import Mock
 
 import pytest
 
@@ -24,6 +25,7 @@ from opensquilla.engine import (
     WarningEvent,
 )
 from opensquilla.engine.agent import _progress_watchdog_guidance_message
+from opensquilla.engine.progress_watchdog import ProgressObservation, ProgressWatchdog
 from opensquilla.engine.runtime import TurnRunner
 from opensquilla.engine.session_sanitize import session_payload_chars
 from opensquilla.engine.types import CompactionEvent
@@ -59,10 +61,6 @@ from opensquilla.session.compaction_deployment import (
     CompactionExecutionTarget,
 )
 from opensquilla.tools.dispatch import build_tool_handler
-from opensquilla.tools.mutation_receipts import (
-    fingerprint_path,
-    record_semantic_mutation_receipt,
-)
 from opensquilla.tools.registry import get_default_registry
 from opensquilla.tools.types import CallerKind, InteractionMode, ToolContext
 
@@ -678,61 +676,6 @@ class _PostWriteFailedVerificationThenSourceProvider:
             yield ProviderDone(stop_reason="tool_calls", input_tokens=1, output_tokens=1)
             return
         yield ProviderText(text="done")
-        yield ProviderDone(stop_reason="stop", input_tokens=1, output_tokens=1)
-
-    async def list_models(self) -> list[Any]:
-        return []
-
-
-class _StableVerifiedDiffThenSourceProvider:
-    provider_name = "fake"
-
-    def __init__(self) -> None:
-        self.calls: list[list[Message]] = []
-        self.tool_lists: list[list[Any] | None] = []
-
-    def chat(
-        self,
-        messages: list[Message],
-        tools: list[Any] | None = None,
-        config: ChatConfig | None = None,
-    ) -> AsyncIterator[Any]:
-        self.calls.append(messages)
-        self.tool_lists.append(tools)
-        return self._stream(len(self.calls))
-
-    async def _stream(self, call_number: int) -> AsyncIterator[Any]:
-        if call_number == 1:
-            tool_use_id = "edit-1"
-            yield ProviderToolUseStart(tool_use_id=tool_use_id, tool_name="edit_file")
-            yield ProviderToolUseEnd(
-                tool_use_id=tool_use_id,
-                tool_name="edit_file",
-                arguments={"path": "src.py", "old_text": "old", "new_text": "new"},
-            )
-            yield ProviderDone(stop_reason="tool_calls", input_tokens=1, output_tokens=1)
-            return
-        if call_number == 2:
-            tool_use_id = "cmd-1"
-            yield ProviderToolUseStart(tool_use_id=tool_use_id, tool_name="exec_command")
-            yield ProviderToolUseEnd(
-                tool_use_id=tool_use_id,
-                tool_name="exec_command",
-                arguments={"command": "pytest tests/test_src.py"},
-            )
-            yield ProviderDone(stop_reason="tool_calls", input_tokens=1, output_tokens=1)
-            return
-        if 3 <= call_number <= 8:
-            tool_use_id = f"read-{call_number}"
-            yield ProviderToolUseStart(tool_use_id=tool_use_id, tool_name="read_file")
-            yield ProviderToolUseEnd(
-                tool_use_id=tool_use_id,
-                tool_name="read_file",
-                arguments={"path": "src.py"},
-            )
-            yield ProviderDone(stop_reason="tool_calls", input_tokens=1, output_tokens=1)
-            return
-        yield ProviderText(text=f"final after convergence {call_number}")
         yield ProviderDone(stop_reason="stop", input_tokens=1, output_tokens=1)
 
     async def list_models(self) -> list[Any]:
@@ -1531,6 +1474,7 @@ async def test_agent_tool_failure_loop_result_returns_to_model_instead_of_termin
 @pytest.mark.asyncio
 async def test_agent_recovers_repeated_successful_identical_tool_calls(
     tmp_path,
+    monkeypatch,
 ) -> None:
     provider = _RepeatedSuccessfulToolThenDoneProvider(tool_retries=4)
     runtime_events_path = tmp_path / "runtime_events.jsonl"
@@ -1570,6 +1514,8 @@ async def test_agent_recovers_repeated_successful_identical_tool_calls(
         ),
         tool_handler=_tool,
     )
+    turn_log = Mock(wraps=agent._write_turn_call_log)
+    monkeypatch.setattr(agent, "_write_turn_call_log", turn_log)
 
     events = [event async for event in agent.run_turn("find the matcher impl")]
 
@@ -1582,15 +1528,14 @@ async def test_agent_recovers_repeated_successful_identical_tool_calls(
         and event.code == "repeated_tool_call_recovery"
         for event in events
     )
-    logged = [json.loads(line) for line in runtime_events_path.read_text().splitlines()]
-    recovery_events = [
-        event
-        for event in logged
-        if event.get("mechanism") == "repeated_tool_call_recovery"
+    assert agent.config.metadata["repeated_tool_call_recoveries"] == 2
+    recoveries = [
+        call.kwargs for call in turn_log.call_args_list if call.args[0] == "runtime_recovery"
     ]
-    assert len(recovery_events) == 2
-    assert recovery_events[0]["evidence"]["repeat_count"] == 3
-    assert recovery_events[1]["evidence"]["repeat_count"] == 4
+    assert [call["details"]["repeat_count"] for call in recoveries] == [3, 4]
+    logged = [json.loads(line) for line in runtime_events_path.read_text().splitlines()]
+    assert any(event.get("feature") == "provider_tool_schema" for event in logged)
+    assert not any(event.get("feature") == "runtime_recovery" for event in logged)
 
 
 @pytest.mark.asyncio
@@ -1855,6 +1800,132 @@ async def test_agent_progress_watchdog_can_warn_model_after_repeated_tool_errors
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("initial_narration", [False, True], ids=["silent", "narrated"])
+@pytest.mark.parametrize(
+    (
+        "publication_content",
+        "publication_is_error",
+        "has_artifacts",
+        "expected_completed",
+        "followup_is_error",
+    ),
+    [
+        pytest.param('{"status":"published"}', False, True, True, True, id="published"),
+        pytest.param(
+            '{"status":"already_published"}', False, True, False, True,
+            id="duplicate-with-occurrence",
+        ),
+        pytest.param('{"status":"approval_pending"}', False, False, False, True, id="pending"),
+        pytest.param('{"status":"published"}', True, True, False, True, id="failed"),
+        pytest.param("invalid json", False, True, False, True, id="invalid-json"),
+        pytest.param("[]", False, True, False, True, id="non-object-json"),
+        pytest.param('{"status":"published"}', False, False, False, True, id="no-artifact"),
+        pytest.param(
+            '{"status":"published"}', False, True, True, False,
+            id="normal-tools-after-publication",
+        ),
+    ],
+)
+async def test_agent_progress_watchdog_tracks_only_current_completed_publications(
+    monkeypatch: pytest.MonkeyPatch,
+    initial_narration: bool,
+    publication_content: str,
+    publication_is_error: bool,
+    has_artifacts: bool,
+    expected_completed: bool,
+    followup_is_error: bool,
+) -> None:
+    class PublishThenToolsProvider(_RepeatedToolFailureThenDoneProvider):
+        async def _stream(self, call_number: int) -> AsyncIterator[Any]:
+            if call_number == 1:
+                if initial_narration:
+                    yield ProviderText(text="Publishing the report.")
+                yield ProviderToolUseStart(
+                    tool_use_id="publish-1", tool_name="publish_artifact",
+                )
+                yield ProviderToolUseEnd(
+                    tool_use_id="publish-1",
+                    tool_name="publish_artifact",
+                    arguments={"path": "report.txt"},
+                )
+                yield ProviderDone(stop_reason="tool_calls", input_tokens=1, output_tokens=1)
+                return
+            async for event in super()._stream(call_number - 1):
+                yield event
+
+    provider = PublishThenToolsProvider(tool_retries=2)
+    context = ToolContext()
+    calls: list[str] = []
+    observations: list[ProgressObservation] = []
+    observe = ProgressWatchdog.observe
+
+    def record_observation(self: ProgressWatchdog, observation: ProgressObservation):
+        observations.append(observation)
+        return observe(self, observation)
+
+    monkeypatch.setattr(ProgressWatchdog, "observe", record_observation)
+
+    async def tool_handler(call: ToolCall) -> ToolResult:
+        calls.append(call.tool_name)
+        if call.tool_name == "publish_artifact":
+            artifacts = [{
+                "id": "art-published",
+                "name": "report.txt",
+                "mime": "text/plain",
+                "publication_id": "publication-occurrence",
+            }] if has_artifacts else []
+            context.published_artifacts.extend(artifacts)
+            return ToolResult(
+                tool_use_id=call.tool_use_id,
+                tool_name=call.tool_name,
+                content=publication_content,
+                is_error=publication_is_error,
+                artifacts=artifacts,
+            )
+        return ToolResult(
+            tool_use_id=call.tool_use_id,
+            tool_name=call.tool_name,
+            content="syntax error" if followup_is_error else "verification passed",
+            is_error=followup_is_error,
+        )
+
+    agent = Agent(
+        provider=provider,
+        config=AgentConfig(
+            max_iterations=5,
+            flush_enabled=False,
+            progress_watchdog_mode="warn_model",
+            progress_watchdog_repeated_tool_error_threshold=2,
+            tool_failure_loop_block_threshold=0,
+        ),
+        tool_handler=tool_handler,
+        tool_context=context,
+    )
+
+    events = [event async for event in agent.run_turn("Publish the report and verify it")]
+
+    expected_text = ("Publishing the report." if initial_narration else "") + "handled"
+    assert any(isinstance(event, DoneEvent) and event.text == expected_text for event in events)
+    assert calls == ["publish_artifact", "exec_command", "exec_command"]
+    assert len(provider.calls) == 4
+    assert len(context.published_artifacts) == int(has_artifacts)
+    warnings = [
+        message.content
+        for message in provider.calls[-1]
+        if isinstance(message.content, str) and "[Runtime progress warning]" in message.content
+    ]
+    assert bool(warnings) is followup_is_error
+    if followup_is_error:
+        assert "Do not repeat the same action unchanged" in warnings[-1]
+    assert [observation.artifact_completed for observation in observations] == [
+        expected_completed, False, False,
+    ]
+    assert [observation.user_visible_output for observation in observations] == [
+        initial_narration, False, False,
+    ]
+
+
+@pytest.mark.asyncio
 async def test_agent_warn_model_recovers_once_before_empty_workspace_diff_final(
     tmp_path,
 ) -> None:
@@ -1907,7 +1978,10 @@ def _init_git_repo_with_source(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_agent_warns_once_for_suspicious_final_diff_contract(tmp_path) -> None:
+@pytest.mark.parametrize("event_output", [False, True])
+async def test_agent_warns_once_for_suspicious_final_diff_contract(
+    tmp_path, monkeypatch, event_output
+) -> None:
     _init_git_repo_with_source(tmp_path)
     (tmp_path / "debug_case.py").write_text("print('repro')\n", encoding="utf-8")
     runtime_events_path = tmp_path / "runtime_events.jsonl"
@@ -1919,7 +1993,7 @@ async def test_agent_warns_once_for_suspicious_final_diff_contract(tmp_path) -> 
             flush_enabled=False,
             progress_watchdog_mode="log",
             final_diff_contract_mode="warn_model",
-            runtime_events_path=str(runtime_events_path),
+            runtime_events_path=str(runtime_events_path) if event_output else None,
         ),
         tool_context=ToolContext(
             workspace_dir=str(tmp_path),
@@ -1940,6 +2014,10 @@ async def test_agent_warns_once_for_suspicious_final_diff_contract(tmp_path) -> 
         ),
     )
 
+    observation = Mock(wraps=agent._final_diff_contract_observation)
+    monkeypatch.setattr(agent, "_final_diff_contract_observation", observation)
+    turn_log = Mock(wraps=agent._write_turn_call_log)
+    monkeypatch.setattr(agent, "_write_turn_call_log", turn_log)
     events = [event async for event in agent.run_turn("Fix the failing parser test")]
 
     assert any(isinstance(event, DoneEvent) for event in events)
@@ -1955,38 +2033,30 @@ async def test_agent_warns_once_for_suspicious_final_diff_contract(tmp_path) -> 
         and event.code == "final_diff_contract_recovery"
         for event in events
     )
+    assert observation.call_count == 1
+    assert agent.config.metadata["final_diff_contract_recoveries"] == 1
+    final_diff_logs = [
+        call.kwargs for call in turn_log.call_args_list if call.args[0] == "final_diff_contract"
+    ]
+    assert len(final_diff_logs) == 1
+    assert final_diff_logs[0]["reason"] == "scratch_artifact_in_final_diff"
+    assert "runtime_events.jsonl" not in final_diff_logs[0]["details"]["diff_paths"]
+    if not event_output:
+        return
     logged = [
         json.loads(line)
         for line in runtime_events_path.read_text(encoding="utf-8").splitlines()
     ]
-    assert any(
-        event.get("feature") == "final_diff_contract"
-        and event.get("injected_to_model") is True
-        and event.get("reason") == "scratch_artifact_in_final_diff"
-        for event in logged
-    )
-    final_diff_events = [
-        event for event in logged if event.get("feature") == "final_diff_contract"
-    ]
-    assert final_diff_events
-    assert all(
-        "runtime_events.jsonl" not in (event.get("diff_paths") or [])
-        for event in final_diff_events
-    )
-    final_diff_event = final_diff_events[0]
-    expected_receipt_summary = {
-        "workspace_mutation_receipt_count": 3,
-        "changed_receipt_count": 2,
-        "noop_receipt_count": 1,
-        "partial_receipt_count": 1,
-    }
-    for key, value in expected_receipt_summary.items():
-        assert final_diff_event["details"][key] == value
-        assert final_diff_event["evidence"][key] == value
+    assert any(event.get("feature") == "provider_tool_schema" for event in logged)
+    assert not any(event.get("name") == "final_diff_contract.observed" for event in logged)
 
 
 @pytest.mark.asyncio
-async def test_agent_final_diff_contract_log_mode_does_not_prompt_model(tmp_path) -> None:
+@pytest.mark.parametrize("event_output", [False, True])
+@pytest.mark.parametrize("mode", ["off", "log"])
+async def test_agent_final_diff_contract_off_and_log_modes_do_not_observe_or_prompt_model(
+    tmp_path, monkeypatch, event_output, mode
+) -> None:
     _init_git_repo_with_source(tmp_path)
     (tmp_path / "debug_case.py").write_text("print('repro')\n", encoding="utf-8")
     runtime_events_path = tmp_path.parent / f"{tmp_path.name}-runtime_events.jsonl"
@@ -1997,12 +2067,14 @@ async def test_agent_final_diff_contract_log_mode_does_not_prompt_model(tmp_path
             max_iterations=3,
             flush_enabled=False,
             progress_watchdog_mode="log",
-            final_diff_contract_mode="log",
-            runtime_events_path=str(runtime_events_path),
+            final_diff_contract_mode=mode,
+            runtime_events_path=str(runtime_events_path) if event_output else None,
         ),
         tool_context=ToolContext(workspace_dir=str(tmp_path)),
     )
 
+    observation = Mock(wraps=agent._final_diff_contract_observation)
+    monkeypatch.setattr(agent, "_final_diff_contract_observation", observation)
     events = [event async for event in agent.run_turn("Fix the failing parser test")]
 
     assert any(isinstance(event, DoneEvent) for event in events)
@@ -2012,27 +2084,15 @@ async def test_agent_final_diff_contract_log_mode_does_not_prompt_model(tmp_path
         for event in events
         if isinstance(event, WarningEvent) and event.code == "final_diff_contract_recovery"
     ]
+    observation.assert_not_called()
+    if not event_output:
+        return
     logged = [
         json.loads(line)
         for line in runtime_events_path.read_text(encoding="utf-8").splitlines()
     ]
-    assert any(
-        event.get("feature") == "final_diff_contract"
-        and event.get("injected_to_model") is False
-        for event in logged
-    )
-    final_diff_event = next(
-        event for event in logged if event.get("feature") == "final_diff_contract"
-    )
-    expected_receipt_summary = {
-        "workspace_mutation_receipt_count": 0,
-        "changed_receipt_count": 0,
-        "noop_receipt_count": 0,
-        "partial_receipt_count": 0,
-    }
-    for key, value in expected_receipt_summary.items():
-        assert final_diff_event["details"][key] == value
-        assert final_diff_event["evidence"][key] == value
+    assert any(event.get("feature") == "provider_tool_schema" for event in logged)
+    assert not any(event.get("name") == "final_diff_contract.observed" for event in logged)
 
 
 @pytest.mark.asyncio
@@ -2076,21 +2136,19 @@ async def test_agent_final_diff_contract_warns_for_empty_diff_after_workspace_wr
         and event.code == "final_diff_contract_recovery"
         for event in events
     )
+    assert agent.config.metadata["final_diff_contract_recoveries"] == 1
     logged = [
         json.loads(line)
         for line in runtime_events_path.read_text(encoding="utf-8").splitlines()
     ]
-    assert any(
-        event.get("feature") == "final_diff_contract"
-        and event.get("injected_to_model") is True
-        and event.get("reason") == "workspace_writes_without_final_diff"
-        and event.get("diff_paths") == []
-        for event in logged
-    )
+    assert not any(event.get("name") == "final_diff_contract.observed" for event in logged)
 
 
 @pytest.mark.asyncio
-async def test_agent_records_final_diff_contract_on_finish_error_with_diff(tmp_path) -> None:
+@pytest.mark.parametrize("event_output", [False, True])
+async def test_agent_does_not_observe_final_diff_contract_on_finish_error_with_diff(
+    tmp_path, monkeypatch, event_output
+) -> None:
     _init_git_repo_with_source(tmp_path)
     (tmp_path / "debug_case.py").write_text("print('repro')\n", encoding="utf-8")
     runtime_events_path = tmp_path.parent / f"{tmp_path.name}-error-runtime_events.jsonl"
@@ -2104,11 +2162,13 @@ async def test_agent_records_final_diff_contract_on_finish_error_with_diff(tmp_p
             flush_enabled=False,
             progress_watchdog_mode="log",
             final_diff_contract_mode="warn_model",
-            runtime_events_path=str(runtime_events_path),
+            runtime_events_path=str(runtime_events_path) if event_output else None,
         ),
         tool_context=ToolContext(workspace_dir=str(tmp_path)),
     )
 
+    observation = Mock(wraps=agent._final_diff_contract_observation)
+    monkeypatch.setattr(agent, "_final_diff_contract_observation", observation)
     events = [event async for event in agent.run_turn("Fix the failing parser test")]
 
     assert len(provider.calls) == 1
@@ -2128,23 +2188,15 @@ async def test_agent_records_final_diff_contract_on_finish_error_with_diff(tmp_p
         for event in events
         if isinstance(event, WarningEvent) and event.code == "final_diff_contract_recovery"
     ]
+    observation.assert_not_called()
+    if not event_output:
+        return
     logged = [
         json.loads(line)
         for line in runtime_events_path.read_text(encoding="utf-8").splitlines()
     ]
     assert any(event.get("reason") == "finish_error_with_non_empty_diff" for event in logged)
-    final_diff_events = [
-        event for event in logged if event.get("feature") == "final_diff_contract"
-    ]
-    assert final_diff_events
-    final_diff_event = final_diff_events[0]
-    assert final_diff_event["mode"] == "warn_model"
-    assert final_diff_event["action"] == "observe"
-    assert final_diff_event["injected_to_model"] is False
-    assert final_diff_event["reason"] == "scratch_artifact_in_final_diff"
-    assert final_diff_event["diff_paths"] == ["debug_case.py", "src/parser.py"]
-    assert final_diff_event["evidence"]["scratch_paths"] == ["debug_case.py"]
-    assert final_diff_event["evidence"]["source_paths"] == ["src/parser.py"]
+    assert not any(event.get("name") == "final_diff_contract.observed" for event in logged)
 
 
 @pytest.mark.asyncio
@@ -2476,39 +2528,6 @@ def test_agent_focused_verification_recognizes_build_and_linter_checks() -> None
         "./run-tests.py -i basics/try_finally_return.py"
     )
     assert agent._command_looks_like_focused_verification("tests/jqtest")
-
-
-def test_focused_verification_classifier_success() -> None:
-    result = ToolResult(
-        tool_use_id="tool-1",
-        tool_name="exec_command",
-        content="exit_code=0\n3 passed\n",
-        is_error=False,
-    )
-
-    assert Agent._classify_focused_verification_result(result) == "success"
-
-
-def test_focused_verification_classifier_failure() -> None:
-    result = ToolResult(
-        tool_use_id="tool-1",
-        tool_name="exec_command",
-        content="exit_code=1\nFAILED tests/test_demo.py::test_demo\n",
-        is_error=True,
-    )
-
-    assert Agent._classify_focused_verification_result(result) == "failure"
-
-
-def test_focused_verification_classifier_unknown_without_success_signal() -> None:
-    result = ToolResult(
-        tool_use_id="tool-1",
-        tool_name="exec_command",
-        content="exit_code=0\nran command and wrote logs\n",
-        is_error=False,
-    )
-
-    assert Agent._classify_focused_verification_result(result) == "unknown"
 
 
 def test_agent_source_context_signature_includes_exec_source_reads() -> None:
@@ -2879,8 +2898,6 @@ def test_configured_hidden_scratch_diff_is_not_source_progress(tmp_path) -> None
         ),
     )
 
-    assert agent._workspace_tracked_diff_paths_for_nudge() == []
-    assert agent._workspace_has_source_change_evidence() is False
     observation = agent._final_diff_contract_observation()
     assert observation is not None
     assert observation.source_paths == []
@@ -3174,7 +3191,6 @@ def test_workspace_edit_gate_rejects_configured_scratch_inside_workspace(
         "noop_receipt_count": 0,
         "partial_receipt_count": 0,
     }
-    assert agent._workspace_has_source_change_evidence() is False
 
 
 @pytest.mark.parametrize("escape_destination", ["outside", "workspace"])
@@ -4180,106 +4196,6 @@ async def test_agent_failed_focused_verification_counts_after_workspace_write(tm
 
 
 @pytest.mark.asyncio
-async def test_agent_converges_after_stable_verified_workspace_diff(tmp_path) -> None:
-    subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True)
-    source = tmp_path / "src.py"
-    source.write_text("old\n", encoding="utf-8")
-    subprocess.run(["git", "add", "src.py"], cwd=tmp_path, check=True, capture_output=True)
-    subprocess.run(
-        ["git", "commit", "-m", "init"],
-        cwd=tmp_path,
-        check=True,
-        capture_output=True,
-        env={
-            **dict(os.environ),
-            "GIT_AUTHOR_NAME": "Test",
-            "GIT_AUTHOR_EMAIL": "test@example.com",
-            "GIT_COMMITTER_NAME": "Test",
-            "GIT_COMMITTER_EMAIL": "test@example.com",
-        },
-    )
-    runtime_events_path = tmp_path / "runtime_events.jsonl"
-    tool_context = ToolContext(workspace_dir=str(tmp_path))
-    handler_calls: list[str] = []
-
-    async def _tool(call: Any) -> ToolResult:
-        handler_calls.append(call.tool_name)
-        if call.tool_name == "edit_file":
-            before = fingerprint_path(source)
-            source.write_text("new\n", encoding="utf-8")
-            after = fingerprint_path(source)
-            record_semantic_mutation_receipt(
-                tool_name="edit_file",
-                path=source,
-                operation="edit_file",
-                before=before,
-                after=after,
-                partial=False,
-                ctx=tool_context,
-            )
-            return ToolResult(
-                tool_use_id=call.tool_use_id,
-                tool_name=call.tool_name,
-                content="edited",
-            )
-        if call.tool_name == "exec_command":
-            return ToolResult(
-                tool_use_id=call.tool_use_id,
-                tool_name=call.tool_name,
-                content="test result: ok. 4 passed; 0 failed\n",
-            )
-        if call.tool_name == "read_file":
-            return ToolResult(
-                tool_use_id=call.tool_use_id,
-                tool_name=call.tool_name,
-                content=source.read_text(encoding="utf-8"),
-            )
-        raise AssertionError(f"unexpected tool: {call.tool_name}")
-
-    provider = _StableVerifiedDiffThenSourceProvider()
-    agent = Agent(
-        provider=provider,
-        config=AgentConfig(
-            max_iterations=12,
-            flush_enabled=False,
-            progress_watchdog_mode="warn_model",
-            post_write_convergence_enabled=True,
-            runtime_events_path=str(runtime_events_path),
-        ),
-        tool_handler=_tool,
-        tool_context=tool_context,
-    )
-
-    events = [event async for event in agent.run_turn("Fix the failing parser test")]
-
-    assert any(isinstance(event, DoneEvent) for event in events)
-    assert handler_calls == ["edit_file", "exec_command", *["read_file"] * 6]
-    assert any(
-        isinstance(message.content, str)
-        and "[Runtime post-write convergence]" in message.content
-        and "current diff has stayed unchanged" in message.content
-        for call in provider.calls
-        for message in call
-    )
-    assert any(
-        isinstance(message.content, str)
-        and "[Runtime post-write convergence]" in message.content
-        and "Do not call tools" in message.content
-        for call in provider.calls
-        for message in call
-    )
-    assert provider.tool_lists[-1] is None
-    done_events = [event for event in events if isinstance(event, DoneEvent)]
-    assert done_events[-1].text == "final after convergence 9"
-    runtime_events = [
-        json.loads(line)
-        for line in runtime_events_path.read_text(encoding="utf-8").splitlines()
-    ]
-    assert any(row.get("name") == "post_write_convergence.warned" for row in runtime_events)
-    assert any(row.get("name") == "post_write_convergence.finalized" for row in runtime_events)
-
-
-@pytest.mark.asyncio
 async def test_agent_blocks_repeated_missing_tool_handler_failures() -> None:
     agent = Agent(
         provider=_ContextOverflowProvider(success_after=1),
@@ -4373,7 +4289,8 @@ def test_agent_child_config_inherits_tool_failure_loop_thresholds() -> None:
     assert child.config.progress_watchdog_repeated_tool_error_threshold == 5
     assert child.config.progress_watchdog_repeated_provider_failure_threshold == 4
     assert child.config.progress_watchdog_repeated_failure_anchor_threshold == 6
-    assert child.config.tool_loop_observer_mode == "log"
+    # The retired observer slot is accepted but no longer propagated.
+    assert child.config.tool_loop_observer_mode == "off"
     assert child.config.runtime_recovery_mode == "warn_model"
     assert child.config.runtime_recovery_source_loop_max_nudges == 3
     assert child.config.post_tool_empty_recovery_mode == "warn_model"

@@ -6,14 +6,23 @@ import pytest
 
 from opensquilla.gateway.compaction_target import (
     GatewayConsumerBudget,
+    _manual_consumer_messages,
     build_gateway_consumer_admission,
     resolve_gateway_compaction_target,
     resolve_gateway_consumer_budget,
 )
 from opensquilla.gateway.config import GatewayConfig, LlmProviderProfile
 from opensquilla.provider.ollama import OllamaProvider
+from opensquilla.provider.openai import OpenAIProvider
 from opensquilla.provider.protocol import provider_connection_config
 from opensquilla.provider.selector import ProviderConfig
+from opensquilla.provider.types import (
+    ChatConfig,
+    ContentBlockToolResult,
+    ContentBlockToolUse,
+    Message,
+    ProviderReplayState,
+)
 from opensquilla.session.compaction import build_compaction_config_from_provider
 
 
@@ -243,6 +252,81 @@ def test_manual_consumer_admission_fails_closed_without_projector() -> None:
     )
 
     assert admission("checkpoint", []) is False
+
+
+def _native_consumer_fixture(opaque: str = "synthetic-native-data"):
+    provider = OpenAIProvider(
+        api_key="synthetic-key", provider_kind="openrouter", model="anthropic/claude-sonnet-4.6",
+        base_url="https://openrouter.ai/api/v1",
+    )
+    state = ProviderReplayState(
+        protocol="openai_chat_completions", source=provider._replay_source, model=provider.model,
+        reasoning_details=[{"type": "reasoning.encrypted", "data": opaque, "index": 0}],
+    )
+    messages = []
+    for index in range(2):
+        messages.extend([
+            Message(role="assistant", content=[ContentBlockToolUse(
+                id=f"call-{index}", name="lookup", input={"value": index},
+            )], provider_replay=state),
+            Message(role="user", content=[ContentBlockToolResult(
+                tool_use_id=f"call-{index}", content=f"result-{index}",
+            )]),
+        ])
+    messages.append(Message(role="assistant", content="final answer", provider_replay=state))
+    entry = {
+        "role": "assistant", "content": "combined display answer", "tool_calls": None,
+        "assistant_replay": {"version": 1, "messages": [message.model_dump(mode="json")
+                                                          for message in messages]},
+    }
+    budget = GatewayConsumerBudget(
+        provider=provider, provider_id="openrouter", model=provider.model,
+        context_window_tokens=32_768, max_output_tokens=1024,
+        provider_request_max_chars=65_536, next_request_reserve_tokens=1024,
+        next_request_reserve_chars=4096,
+    )
+    return budget, entry
+
+
+def test_manual_consumer_proof_uses_native_call_boundaries_and_tool_results():
+    budget, entry = _native_consumer_fixture()
+    messages = _manual_consumer_messages("portable checkpoint", [entry])
+    assert messages is not None
+    projection = budget.provider.project_final_request(
+        messages, [], ChatConfig(provider_request_max_chars=budget.provider_request_max_chars),
+    )
+    assert projection.wire_message_count == 6
+    wire = projection.payload["messages"]
+    assert [message["role"] for message in wire] == [
+        "assistant", "tool", "assistant", "tool", "assistant", "user",
+    ]
+    assert [message["tool_call_id"] for message in wire if message["role"] == "tool"] == [
+        "call-0", "call-1",
+    ]
+    assert all(message["reasoning_details"][0]["data"] == "synthetic-native-data"
+               for message in wire if message["role"] == "assistant")
+    assert all(message.get("content") != "combined display answer" for message in wire)
+
+
+def test_manual_consumer_admission_rejects_oversized_native_state_with_small_display():
+    budget, short_entry = _native_consumer_fixture()
+    _, large_entry = _native_consumer_fixture(opaque="synthetic-native-data-" * 20_000)
+    admission, _fingerprint = build_gateway_consumer_admission(budget)
+    assert short_entry["content"] == large_entry["content"]
+    assert admission("portable checkpoint", [short_entry]) is True
+    assert admission("portable checkpoint", [large_entry]) is False
+    # An actual legacy display row still has its established smaller proof;
+    # it cannot stand in for a new row that has native replay state.
+    legacy = {key: value for key, value in large_entry.items() if key != "assistant_replay"}
+    assert admission("portable checkpoint", [legacy]) is True
+
+
+@pytest.mark.parametrize("invalid", [{"version": 2, "messages": []}, "private-invalid-data"])
+def test_manual_consumer_invalid_native_state_fails_closed(invalid):
+    budget, entry = _native_consumer_fixture()
+    entry["assistant_replay"] = invalid
+    admission, _fingerprint = build_gateway_consumer_admission(budget)
+    assert admission("portable checkpoint", [entry]) is False
 
 
 def test_unavailable_explicit_target_falls_through_to_current_deployment() -> None:

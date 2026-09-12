@@ -111,7 +111,7 @@ async function mountOverview(options: MountOptions = {}) {
         return options.sessionsListHandler(sessionsListCallIndex++, callOptions)
       }
       if (options.sessionsList === null) throw new Error('sessions unavailable')
-      return options.sessionsList ?? { sessions: [], count: 0 }
+      return options.sessionsList ?? { sessions: [], count: 0, ts: 1 }
     }
     throw new Error(`unexpected rpc method: ${method}`)
   })
@@ -307,6 +307,7 @@ describe('OverviewView status lifecycle', () => {
           { key: 'unknown', title: 'ignored' },
         ],
         count: 2,
+        ts: 1,
       },
     })
     await flush()
@@ -322,6 +323,7 @@ describe('OverviewView status lifecycle', () => {
           title: `Session ${index}`,
         })),
         count: 200,
+        ts: 1,
         totalCount: 201,
       },
     })
@@ -335,6 +337,7 @@ describe('OverviewView status lifecycle', () => {
       sessionsListHandler: (callIndex) => ({
         sessions: [{ key: 'agent:main:webchat:remaining', title: 'Remaining' }],
         count: callIndex === 0 ? 200 : 1,
+        ts: callIndex + 1,
         totalCount: callIndex === 0 ? 201 : 1,
       }),
     })
@@ -351,11 +354,11 @@ describe('OverviewView status lifecycle', () => {
     expect(card?.querySelector('.control-stat__value')?.textContent).toBe('1')
   })
 
-  it('treats a legacy bounded page as a lower bound, not an exact decrease', async () => {
+  it('keeps the prior exact total when a later legacy keys-only result is rejected', async () => {
     const { el, flush } = await mountOverview({
       sessionsListHandler: (callIndex) => (
         callIndex === 0
-          ? { sessions: [], count: 200, totalCount: 201 }
+          ? { sessions: [], count: 200, totalCount: 201, ts: 1 }
           : { keys: ['agent:main:webchat:remaining'], count: 1 }
       ),
     })
@@ -369,7 +372,7 @@ describe('OverviewView status lifecycle', () => {
     expect(card?.querySelector('.control-stat__value')?.textContent).toBe('201')
   })
 
-  it('accepts the legacy keys-only sessions.list response', async () => {
+  it('rejects a legacy keys-only sessions.list response', async () => {
     const { el, flush } = await mountOverview({
       sessionsList: {
         keys: ['agent:main:webchat:legacy-without-usage'],
@@ -378,7 +381,7 @@ describe('OverviewView status lifecycle', () => {
     })
     await flush()
     const card = el.querySelector('[title="Total sessions across all statuses"]')
-    expect(card?.querySelector('.control-stat__value')?.textContent).toBe('1')
+    expect(card?.querySelector('.control-stat__value')?.textContent).toBe('0')
   })
 
   it('keeps the last exact total across a transient sessions.list failure', async () => {
@@ -388,6 +391,7 @@ describe('OverviewView status lifecycle', () => {
           return {
             sessions: [{ key: 'agent:main:webchat:persisted', title: 'Persisted' }],
             count: 1,
+            ts: 1,
             totalCount: 1,
           }
         }
@@ -462,7 +466,7 @@ describe('OverviewView status lifecycle', () => {
         if (callOptions?.signal) countSignals.push(callOptions.signal)
         return callIndex === 0
           ? firstCount
-          : { sessions: [], totalCount: 2 }
+          : { sessions: [], count: 0, totalCount: 2, ts: 2 }
       },
     })
 
@@ -477,7 +481,7 @@ describe('OverviewView status lifecycle', () => {
     const card = el.querySelector('[title="Total sessions across all statuses"]')
     expect(card?.querySelector('.control-stat__value')?.textContent).toBe('2')
 
-    resolveFirst({ sessions: [], totalCount: 99 })
+    resolveFirst({ sessions: [], count: 0, totalCount: 99, ts: 1 })
     await flush()
     expect(card?.querySelector('.control-stat__value')?.textContent).toBe('2')
   })
@@ -498,7 +502,7 @@ describe('OverviewView status lifecycle', () => {
     expect(countSignal?.aborted).toBe(false)
     await unmount()
     expect(countSignal?.aborted).toBe(true)
-    resolveCount({ sessions: [], totalCount: 1 })
+    resolveCount({ sessions: [], count: 0, totalCount: 1, ts: 1 })
   })
 })
 

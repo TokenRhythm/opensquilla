@@ -9,11 +9,144 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
-from typing import Any, Literal, Protocol
+from typing import Any, Literal, Protocol, TypedDict
 
 from opensquilla.session_key import canonicalize_session_key
 
 type RouteFeedbackRating = Literal["up", "down", "neutral"]
+
+
+class UsageSessionProjection(TypedDict, total=False):
+    sessionKey: str
+    session: str
+    key: str
+    model: str | None
+    inputTokens: int
+    outputTokens: int
+    costUsd: float
+    billedCostUsd: float
+    estimatedCostUsd: float
+    costSource: str
+    missingCostEntries: int
+    cacheReadTokens: int
+    cacheWriteTokens: int
+    contextStatus: Mapping[str, object] | None
+    modelBreakdown: list[Mapping[str, object]]
+    deploymentBreakdown: list[Mapping[str, object]]
+
+
+class UsageStatusResult(TypedDict, total=False):
+    totalSessions: int
+    activeSessions: int
+    totalInputTokens: int
+    totalOutputTokens: int
+    totalTokens: int | float
+    totalCostUsd: float
+    totalCacheReadTokens: int
+    totalCacheWriteTokens: int
+    sessions: list[UsageSessionProjection]
+
+
+class UsageQueryResult(TypedDict, total=False):
+    schemaVersion: int
+    source: str
+    asOfMs: int
+    range: Mapping[str, object]
+    fxRatesNativePerUsd: Mapping[str, object]
+    totals: Mapping[str, object]
+    attributedTotals: Mapping[str, object]
+    coverage: Mapping[str, object]
+    legacyUnattributed: Mapping[str, object]
+    missingCostEntries: int
+    eventCount: int
+    sessionCount: int
+    days: list[Mapping[str, object]]
+    models: list[Mapping[str, object]]
+    sessions: list[Mapping[str, object]]
+
+
+class UsageCostResult(TypedDict, total=False):
+    breakdown: list[UsageSessionProjection]
+    totalCostUsd: float
+
+
+class CommandChoiceProjection(TypedDict, total=False):
+    value: str
+    description: str
+    status: str
+    missing_bins: list[str]
+    missing_env: list[str]
+    missing_env_any: list[list[str]]
+    missing_skills: list[str]
+    missing_capabilities: list[str]
+
+
+class CommandExecutionProjection(TypedDict, total=False):
+    kind: str
+    action: str
+    rpc_method: str
+
+
+class CommandProjection(TypedDict, total=False):
+    name: str
+    usage: str
+    description: str
+    aliases: list[str]
+    argument_choices: list[CommandChoiceProjection]
+    execution: CommandExecutionProjection
+    rpc_method: str
+    category: str
+    busy_policy: str
+    presentation: str
+    order: int
+    visible_by_default: bool
+    deprecated: bool
+
+
+class CommandCatalogResult(TypedDict, total=False):
+    surface: str
+    commands: list[CommandProjection]
+
+
+class RouteFeedbackResult(TypedDict, total=False):
+    accepted: bool
+    reason: str | None
+    recorded: str | None
+
+
+class PromptCacheLeaseResult(TypedDict, total=False):
+    enabled: bool
+    ttlSeconds: int
+    intervalSeconds: int
+    idleTimeoutSeconds: int
+    idleExpiresAt: int | None
+    state: str
+    reason: str | None
+    hasSnapshot: bool
+    nextProbeAt: int | None
+    lastProbeAt: int | None
+    lastCacheHitTokens: int
+    provider: str | None
+    model: str | None
+
+
+class ClarificationSubmissionResult(TypedDict, total=False):
+    resolved: bool
+    replayed: bool | None
+    request_id: str
+    ok: bool | None
+    status: str | None
+    accepted: bool | None
+    sessionKey: str | None
+    session_key: str | None
+    key: str | None
+    session_id: str | None
+    user_message_id: str | None
+    client_message_id: str | None
+    task_id: str | None
+    turn_id: str | None
+    instant_accept: bool | None
+    reason: str | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -23,24 +156,24 @@ class UsageQuery:
 
 
 class UsageReportingPort(Protocol):
-    async def status(self, query: UsageQuery) -> Mapping[str, Any]: ...
+    async def status(self, query: UsageQuery) -> UsageStatusResult: ...
 
-    async def query(self, query: UsageQuery) -> Mapping[str, Any]: ...
+    async def query(self, query: UsageQuery) -> UsageQueryResult: ...
 
-    async def cost_breakdown(self, query: UsageQuery) -> Mapping[str, Any]: ...
+    async def cost_breakdown(self, query: UsageQuery) -> UsageCostResult: ...
 
 
 class UsageReporting:
     def __init__(self, port: UsageReportingPort) -> None:
         self._port = port
 
-    async def status(self, query: UsageQuery = UsageQuery()) -> Mapping[str, Any]:
+    async def status(self, query: UsageQuery = UsageQuery()) -> UsageStatusResult:
         return await self._port.status(self._normalize(query))
 
-    async def query(self, query: UsageQuery) -> Mapping[str, Any]:
+    async def query(self, query: UsageQuery) -> UsageQueryResult:
         return await self._port.query(self._normalize(query))
 
-    async def cost_breakdown(self, query: UsageQuery = UsageQuery()) -> Mapping[str, Any]:
+    async def cost_breakdown(self, query: UsageQuery = UsageQuery()) -> UsageCostResult:
         return await self._port.cost_breakdown(self._normalize(query))
 
     @staticmethod
@@ -59,14 +192,14 @@ class CommandCatalogQuery:
 
 
 class CommandCatalogPort(Protocol):
-    async def list(self, query: CommandCatalogQuery) -> Mapping[str, Any]: ...
+    async def list(self, query: CommandCatalogQuery) -> CommandCatalogResult: ...
 
 
 class CommandCatalog:
     def __init__(self, port: CommandCatalogPort) -> None:
         self._port = port
 
-    async def list(self, query: CommandCatalogQuery) -> Mapping[str, Any]:
+    async def list(self, query: CommandCatalogQuery) -> CommandCatalogResult:
         surface = query.surface.strip()
         if not surface:
             raise ValueError("surface must be non-empty")
@@ -80,14 +213,14 @@ class SubmitRouteFeedback:
 
 
 class RouteFeedbackPort(Protocol):
-    async def submit(self, command: SubmitRouteFeedback) -> Mapping[str, Any]: ...
+    async def submit(self, command: SubmitRouteFeedback) -> RouteFeedbackResult: ...
 
 
 class RouteFeedback:
     def __init__(self, port: RouteFeedbackPort) -> None:
         self._port = port
 
-    async def submit(self, command: SubmitRouteFeedback) -> Mapping[str, Any]:
+    async def submit(self, command: SubmitRouteFeedback) -> RouteFeedbackResult:
         decision_id = command.decision_id.strip()
         if not decision_id:
             raise ValueError("decision_id must be non-empty")
@@ -115,9 +248,9 @@ class SetPromptCacheLease:
 
 
 class PromptCacheLeasePort(Protocol):
-    async def status(self, session_key: str) -> Mapping[str, Any]: ...
+    async def status(self, session_key: str) -> PromptCacheLeaseResult: ...
 
-    async def set_policy(self, command: SetPromptCacheLease) -> Mapping[str, Any]: ...
+    async def set_policy(self, command: SetPromptCacheLease) -> PromptCacheLeaseResult: ...
 
 
 class PromptCacheLease:
@@ -125,10 +258,10 @@ class PromptCacheLease:
         self._port = port
         self._policy = policy
 
-    async def status(self, session_key: str) -> Mapping[str, Any]:
+    async def status(self, session_key: str) -> PromptCacheLeaseResult:
         return await self._port.status(self._key(session_key))
 
-    async def set_policy(self, command: SetPromptCacheLease) -> Mapping[str, Any]:
+    async def set_policy(self, command: SetPromptCacheLease) -> PromptCacheLeaseResult:
         key = self._key(command.session_key)
         ttl = command.ttl_seconds
         if ttl is None:
@@ -175,14 +308,14 @@ class SubmitClarification:
 
 
 class ClarificationSubmissionPort(Protocol):
-    async def submit(self, command: SubmitClarification) -> Mapping[str, Any]: ...
+    async def submit(self, command: SubmitClarification) -> ClarificationSubmissionResult: ...
 
 
 class ClarificationSubmission:
     def __init__(self, port: ClarificationSubmissionPort) -> None:
         self._port = port
 
-    async def submit(self, command: SubmitClarification) -> Mapping[str, Any]:
+    async def submit(self, command: SubmitClarification) -> ClarificationSubmissionResult:
         key = canonicalize_session_key(command.session_key)
         if not key:
             raise ValueError("session_key must be non-empty")
@@ -198,21 +331,32 @@ class ClarificationSubmission:
 
 
 __all__ = [
+    "ClarificationSubmissionResult",
     "ClarificationSubmission",
     "ClarificationSubmissionPort",
+    "CommandCatalogResult",
     "CommandCatalog",
     "CommandCatalogPort",
     "CommandCatalogQuery",
+    "CommandChoiceProjection",
+    "CommandExecutionProjection",
+    "CommandProjection",
     "PromptCacheLease",
     "PromptCacheLeasePort",
     "PromptCachePolicy",
+    "PromptCacheLeaseResult",
     "RouteFeedback",
     "RouteFeedbackPort",
     "RouteFeedbackRating",
+    "RouteFeedbackResult",
     "SetPromptCacheLease",
     "SubmitClarification",
     "SubmitRouteFeedback",
     "UsageQuery",
+    "UsageQueryResult",
     "UsageReporting",
     "UsageReportingPort",
+    "UsageSessionProjection",
+    "UsageStatusResult",
+    "UsageCostResult",
 ]

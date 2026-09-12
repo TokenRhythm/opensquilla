@@ -66,6 +66,8 @@ class RouterHistoryReplayRequest:
         default=None,
         repr=False,
     )
+    expected_session_id: str | None = field(default=None, repr=False)
+    expected_session_epoch: int | None = field(default=None, repr=False)
 
 
 @dataclass(frozen=True)
@@ -116,6 +118,13 @@ class RunPipelineRequest:
         repr=False,
     )
     router_history_replay_request: RouterHistoryReplayRequest | None = field(
+        default=None,
+        repr=False,
+    )
+    bound_user_message_id: str | None = field(default=None, repr=False)
+    expected_session_id: str | None = field(default=None, repr=False)
+    expected_session_epoch: int | None = field(default=None, repr=False)
+    transcript_snapshot: TurnTranscriptSnapshot[Any] | None = field(
         default=None,
         repr=False,
     )
@@ -185,6 +194,8 @@ class RouterContextPort(Protocol):
         bound_user_message_id: str | None = None,
         include_capacity: bool = False,
         transcript_snapshot: TurnTranscriptSnapshot[Any] | None = None,
+        expected_session_id: str | None = None,
+        expected_session_epoch: int | None = None,
     ) -> dict[str, Any]: ...
 
 @runtime_checkable
@@ -299,6 +310,8 @@ class PromptAssemblerStageInput:
         default=None,
         repr=False,
     )
+    expected_session_id: str | None = field(default=None, repr=False)
+    expected_session_epoch: int | None = field(default=None, repr=False)
 
 @dataclass(frozen=True)
 class PromptAssemblerStageOutput:
@@ -411,32 +424,17 @@ class PromptAssemblerStage:
         # Local imports keep the module import-cycle-free.
         from opensquilla.engine.turn_runner.outcome import StageOutcome
 
-        # 1. Assemble identity prompt. A PromptAnnotation turn carries an
-        # explicit tool ceiling and must not inherit workspace bootstrap text
-        # or its absolute path into any provider strategy.
         prompt_metadata: dict[str, Any] = {}
-        restricted_tool_boundary = bool(
-            inp.effective_tool_context is not None
-            and getattr(inp.effective_tool_context, "exclusive_tools", None) is not None
-        )
         base_prompt = self._prompt_assembler.assemble_prompt(
             inp.agent_id,
             inp.tool_defs,
             session_key=inp.session_key,
             semantic_message=inp.semantic_input,
-            extra_context=(None if restricted_tool_boundary else inp.extra_prompt_context),
+            extra_context=(inp.extra_prompt_context),
             prompt_metadata=prompt_metadata,
-            bootstrap_context_mode=(
-                "restricted_tool_boundary"
-                if restricted_tool_boundary
-                else inp.bootstrap_context_mode
-            ),
+            bootstrap_context_mode=(inp.bootstrap_context_mode),
             fresh_user_session=inp.fresh_user_session,
-            workspace_dir=(
-                None
-                if restricted_tool_boundary
-                else getattr(inp.effective_tool_context, "workspace_dir", None)
-            ),
+            workspace_dir=(getattr(inp.effective_tool_context, "workspace_dir", None)),
         )
 
         # 2. Fetch router context (transcript-driven)
@@ -453,6 +451,14 @@ class PromptAssemblerStage:
         }
         if inp.transcript_snapshot is not None:
             router_context_kwargs["transcript_snapshot"] = inp.transcript_snapshot
+        if (
+            inp.expected_session_id is not None
+            or inp.expected_session_epoch is not None
+        ):
+            router_context_kwargs["expected_session_id"] = inp.expected_session_id
+            router_context_kwargs["expected_session_epoch"] = (
+                inp.expected_session_epoch
+            )
         router_context = await self._router_context.fetch_router_context(
             inp.session_key,
             **router_context_kwargs,
@@ -542,12 +548,7 @@ class PromptAssemblerStage:
             tool_context=inp.effective_tool_context,
             normalization_metadata=inp.normalization_metadata,
             input_provenance=inp.input_provenance,
-            # PromptAnnotation turns are projected independently from the
-            # ordinary workspace/skill environment.  Passing ``None`` here
-            # is only half of that boundary; ``TurnRunner._run_pipeline``
-            # also suppresses its legacy global-loader fallback whenever the
-            # same exclusive ToolContext is present.
-            skill_catalog=(None if restricted_tool_boundary else inp.skill_catalog),
+            skill_catalog=(inp.skill_catalog),
             usage_execution_context=inp.usage_execution_context,
             provider_request_correlation=inp.provider_request_correlation,
             router_history_replay_request=(
@@ -557,10 +558,16 @@ class PromptAssemblerStage:
                     ),
                     bound_user_message_id=inp.bound_user_message_id,
                     transcript_snapshot=inp.transcript_snapshot,
+                    expected_session_id=inp.expected_session_id,
+                    expected_session_epoch=inp.expected_session_epoch,
                 )
                 if inp.attachments
                 else None
             ),
+            bound_user_message_id=inp.bound_user_message_id,
+            transcript_snapshot=inp.transcript_snapshot,
+            expected_session_id=inp.expected_session_id,
+            expected_session_epoch=inp.expected_session_epoch,
         )
         turn, provider = await self._pipeline_executor.run_pipeline(request)
 

@@ -1,12 +1,10 @@
 import { createV4ClarificationSubmission } from '@/adapters/gateway/clarificationSubmissionV4'
 import { createV4CommandCatalog } from '@/adapters/gateway/commandCatalogV4'
-import { createV4UsageReporting } from '@/adapters/gateway/usageReportingV4'
 import type { RpcCallOptions } from '@/lib/rpc'
 import type { ClarificationSubmission } from '@/modules/clarificationSubmission'
 import type { CommandCatalog } from '@/modules/commandCatalog'
 import type { PromptCacheLease } from '@/modules/promptCacheLease'
 import type { RouteFeedback } from '@/modules/routeFeedback'
-import type { UsageReporting } from '@/modules/usageReporting'
 
 export interface AncillaryTestRpc {
   call(
@@ -26,10 +24,6 @@ function transport(rpc: AncillaryTestRpc) {
       ? rpc.call(method, params)
       : rpc.call(method, params, options)) as Promise<T>,
   }
-}
-
-export function usageReportingFromTestRpc(rpc: AncillaryTestRpc): UsageReporting {
-  return createV4UsageReporting(transport(rpc))
 }
 
 export function commandCatalogFromTestRpc(rpc: AncillaryTestRpc): CommandCatalog {

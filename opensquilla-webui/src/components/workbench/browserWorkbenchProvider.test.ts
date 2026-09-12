@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type {
   NativeWorkbenchApi,
   NativeWorkbenchCapabilities,
@@ -6,8 +6,10 @@ import type {
   Platform,
 } from '@/platform/types'
 import { createBrowserWorkbenchItem } from '@/workbench/browserItems'
+import { WorkbenchPanelRegistry, WorkbenchRuntimeManager } from '@/workbench/runtime'
 import type {
   NativeSurfaceRect,
+  WorkbenchItem,
   WorkbenchRuntimeContext,
 } from '@/workbench/types'
 import { createBrowserWorkbenchDefinition } from './browserWorkbenchProvider'
@@ -74,6 +76,220 @@ const visibleRect: NativeSurfaceRect = {
   height: 520,
   visible: true,
 }
+
+it('adopts an agent-opened surface without opening another page at the same URL', async () => {
+  const api = nativeApi()
+  const item = createBrowserWorkbenchItem({ scopeId: 'session-a', url: 'https://example.test/' })!
+  item.id = 'browser-target-2'
+  item.payload = { ...item.payload, adoptedNativeSurface: true }
+  const state: Record<string, unknown> = {}
+  const definition = createBrowserWorkbenchDefinition({
+    confirmPermission: vi.fn(async () => false), openExternal: vi.fn(),
+    platform: {} as Platform, t: key => key,
+  })
+  const runtime = await definition.createRuntime!(item, {
+    nativeWorkbenchApi: api, getRenderState: () => state,
+    updateRenderState: patch => Object.assign(state, patch),
+    isItemOpen: () => true, setExpanded: vi.fn(), reportError: vi.fn(),
+  })
+  expect(api.activateSurface).not.toHaveBeenCalled()
+  expect(api.createSurface).not.toHaveBeenCalled()
+  expect(api.setSurfaceRect).not.toHaveBeenCalled()
+  await runtime.handleSurfaceRect?.(visibleRect, item)
+  expect(api.activateSurface).toHaveBeenCalledWith('browser-target-2')
+  expect(api.setSurfaceRect).toHaveBeenCalledWith({
+    surfaceId: 'browser-target-2', x: 320, y: 40, width: 640, height: 520, visible: true,
+  })
+  expect(api.createSurface).not.toHaveBeenCalled()
+  await runtime.dispose?.('closed')
+  expect(api.destroySurface).toHaveBeenCalledWith('browser-target-2')
+})
+
+describe('browser adoption through the Workbench runtime manager', () => {
+  let api: NativeWorkbenchApi
+  let manager: WorkbenchRuntimeManager
+  let items: WorkbenchItem[]
+  let onError = vi.fn()
+  let instances: Map<string, { identity: number; note: string; visible: boolean }>
+
+  beforeEach(() => {
+    items = ['first', 'second'].map((name) => {
+      const item = createBrowserWorkbenchItem({
+        scopeId: 'session-a', url: 'https://example.test/shared',
+      })!
+      item.id = `browser-${name}`
+      item.payload = { ...item.payload, adoptedNativeSurface: true }
+      return item
+    })
+    instances = new Map(items.map((item, index) => [item.id, {
+      identity: index + 1, note: `${item.id} memory`, visible: false,
+    }]))
+    let nextIdentity = 3
+    api = nativeApi({
+      createSurface: vi.fn(async (request) => {
+        instances.set(request.surfaceId, {
+          identity: nextIdentity++, note: '', visible: false,
+        })
+        return { ok: true }
+      }),
+      setSurfaceRect: vi.fn(async (request) => {
+        const instance = instances.get(request.surfaceId)
+        if (!instance) return { ok: false, message: 'native surface missing' }
+        instance.visible = request.visible
+        return { ok: true }
+      }),
+      activateSurface: vi.fn(async (id) => (
+        instances.has(id) ? { ok: true } : { ok: false, message: 'native surface missing' }
+      )),
+      destroySurface: vi.fn(async (id) => {
+        instances.delete(id)
+        return { ok: true }
+      }),
+    })
+    const registry = new WorkbenchPanelRegistry()
+    registry.register(createBrowserWorkbenchDefinition({
+      confirmPermission: vi.fn(async () => false), openExternal: vi.fn(),
+      platform: {} as Platform, t: key => key,
+    }))
+    onError = vi.fn()
+    manager = new WorkbenchRuntimeManager(registry, { nativeWorkbenchApi: api, onError })
+  })
+
+  afterEach(async () => {
+    await manager.disposeAll()
+  })
+
+  it('retains an adopted page while the host has no visible rect', async () => {
+    const item = items[0]!
+    const original = instances.get(item.id)
+    manager.handle({ type: 'open', item })
+    manager.handle({ type: 'resume', item })
+    await manager.flush()
+
+    expect(instances.get(item.id)).toBe(original)
+    expect(api.createSurface).not.toHaveBeenCalled()
+    expect(api.activateSurface).not.toHaveBeenCalled()
+    expect(api.destroySurface).not.toHaveBeenCalled()
+    expect(onError).not.toHaveBeenCalled()
+  })
+
+  it('shows the original adopted instance when its visible rect arrives', async () => {
+    const item = items[0]!
+    const original = instances.get(item.id)
+    manager.handle({ type: 'open', item })
+    manager.handle({ type: 'resume', item })
+    await manager.flush()
+    manager.handleSurfaceRect({ ...visibleRect, itemId: item.id })
+    await manager.flush()
+
+    expect(instances.get(item.id)).toBe(original)
+    expect(original?.visible).toBe(true)
+    expect(api.activateSurface).toHaveBeenCalledWith(item.id)
+    expect(api.createSurface).not.toHaveBeenCalled()
+    expect(api.destroySurface).not.toHaveBeenCalled()
+    expect(onError).not.toHaveBeenCalled()
+  })
+
+  it('keeps both instances and their memory while switching pages at the same URL', async () => {
+    const first = items[0]!
+    const second = items[1]!
+    const originals = items.map(item => instances.get(item.id))
+    expect(first.payload.initialUrl).toBe(second.payload.initialUrl)
+    expect(first.id).not.toBe(second.id)
+    manager.handle({ type: 'open', item: first })
+    manager.handle({ type: 'resume', item: first })
+    await manager.flush()
+    manager.handleSurfaceRect({ ...visibleRect, itemId: first.id })
+    await manager.flush()
+    manager.handle({ type: 'suspend', item: first })
+    manager.handle({ type: 'open', item: second })
+    manager.handle({ type: 'resume', item: second })
+    await manager.flush()
+    manager.handleSurfaceRect({ ...visibleRect, itemId: second.id })
+    await manager.flush()
+    expect(instances.get(first.id)?.visible).toBe(false)
+    expect(instances.get(second.id)?.visible).toBe(true)
+    manager.handle({ type: 'suspend', item: second })
+    manager.handle({ type: 'resume', item: first })
+    await manager.flush()
+
+    for (const [index, item] of items.entries()) {
+      expect(instances.get(item.id)).toBe(originals[index])
+      expect(instances.get(item.id)?.note).toBe(`${item.id} memory`)
+    }
+    expect(instances.get(first.id)?.visible).toBe(true)
+    expect(instances.get(second.id)?.visible).toBe(false)
+    expect(api.createSurface).not.toHaveBeenCalled()
+    expect(api.destroySurface).not.toHaveBeenCalled()
+    expect(onError).not.toHaveBeenCalled()
+  })
+
+  it('creates a fresh page on retry after an adopted page crashes', async () => {
+    const item = items[0]!
+    const original = instances.get(item.id)
+    // Supply layout before opening so this case isolates crash recovery.
+    manager.handleSurfaceRect({ ...visibleRect, itemId: item.id })
+    manager.handle({ type: 'open', item })
+    manager.handle({ type: 'resume', item })
+    await manager.flush()
+    expect(instances.get(item.id)).toBe(original)
+    manager.handleNativeSurfaceEvent({
+      version: 2, surfaceId: item.id, type: 'crashed', detail: { reason: 'synthetic crash' },
+    })
+    await manager.flush()
+    expect(instances.has(item.id)).toBe(false)
+    expect(manager.getRenderState(item.id).errorMessage).toBe('synthetic crash')
+    expect(onError).toHaveBeenCalledOnce()
+    vi.mocked(api.activateSurface).mockClear()
+
+    manager.handleComponentEvent(item, { type: 'browser-action', payload: { action: 'reload' } })
+    await manager.flush()
+    expect(api.createSurface).toHaveBeenCalledOnce()
+    expect(instances.get(item.id)).toMatchObject({ visible: true, note: '' })
+    expect(instances.get(item.id)?.identity).not.toBe(original?.identity)
+    expect(api.activateSurface).toHaveBeenCalledWith(item.id)
+    expect(manager.getRenderState(item.id).errorMessage).toBe('')
+    expect(onError).toHaveBeenCalledOnce()
+  })
+
+  it('retains the page when suspension rejects activation after positioning awaits', async () => {
+    const item = items[0]!
+    item.payload = { ...item.payload, adoptedNativeSurface: false }
+    instances.delete(item.id)
+    manager.handle({ type: 'open', item })
+    manager.handle({ type: 'resume', item })
+    await manager.flush()
+    const original = instances.get(item.id)
+    expect(original).toBeDefined()
+    const position = vi.mocked(api.setSurfaceRect).getMockImplementation()!
+    let releasePosition!: () => void
+    let positionEntered!: () => void
+    const entered = new Promise<void>(resolve => { positionEntered = resolve })
+    const released = new Promise<void>(resolve => { releasePosition = resolve })
+    vi.mocked(api.setSurfaceRect).mockImplementationOnce(async (request) => {
+      positionEntered()
+      await released
+      return position(request)
+    })
+    manager.handleSurfaceRect({ ...visibleRect, itemId: item.id })
+    await entered
+    manager.handle({ type: 'suspend', item })
+    releasePosition()
+    await manager.flush()
+
+    expect(instances.get(item.id)).toBe(original)
+    expect(original?.visible).toBe(false)
+    expect(api.activateSurface).not.toHaveBeenCalled()
+    expect(api.destroySurface).not.toHaveBeenCalled()
+    expect(onError).not.toHaveBeenCalled()
+    manager.handle({ type: 'resume', item })
+    await manager.flush()
+    expect(instances.get(item.id)).toBe(original)
+    expect(original?.visible).toBe(true)
+    expect(api.activateSurface).toHaveBeenCalledWith(item.id)
+    expect(api.createSurface).toHaveBeenCalledOnce()
+  })
+})
 
 describe('browser Workbench provider', () => {
   it('shows an upgrade error instead of leaving an old Desktop shell loading', async () => {

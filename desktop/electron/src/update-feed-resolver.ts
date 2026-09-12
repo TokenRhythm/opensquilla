@@ -6,7 +6,7 @@
 // (0.5.0-rc2). The parser normalizes both spellings so mirrored manifests and
 // the GitHub release-inventory fallback use the same update-channel path.
 
-export const GITHUB_UPDATE_OWNER = 'opensquilla'
+export const GITHUB_UPDATE_OWNER = 'TokenRhythm'
 export const GITHUB_UPDATE_REPO = 'opensquilla'
 
 export interface ParsedReleaseTag {

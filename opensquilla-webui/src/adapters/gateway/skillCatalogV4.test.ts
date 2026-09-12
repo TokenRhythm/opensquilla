@@ -5,11 +5,29 @@ function adapter(call: ReturnType<typeof vi.fn>, supports = true) {
   return createV4SkillCatalog({
     request: call,
     ready: vi.fn(async () => {}),
-    supports: vi.fn(() => supports),
+    supports: vi.fn((method: string) => supports && !method.startsWith('meta.')),
+    markUnsupported: vi.fn(),
   } as Parameters<typeof createV4SkillCatalog>[0])
 }
 
 describe('v4 SkillCatalog Adapter', () => {
+  it.each([
+    [{}, {}],
+    [{ name: '', installId: '' }, {}],
+    [{ name: 'synthetic-skill' }, { name: 'synthetic-skill' }],
+    [{ installId: 'synthetic-install' }, { installId: 'synthetic-install' }],
+    [
+      { name: 'synthetic-skill', installId: 'synthetic-install' },
+      { name: 'synthetic-skill', installId: 'synthetic-install' },
+    ],
+  ])('preserves uninstall parameters and Gateway rejection (%#)', async (request, expected) => {
+    const rejection = new Error('synthetic Gateway rejection')
+    const call = vi.fn().mockRejectedValue(rejection)
+
+    await expect(adapter(call).uninstall(request)).rejects.toBe(rejection)
+    expect(call).toHaveBeenCalledExactlyOnceWith('skills.uninstall', expected, expect.any(Object))
+  })
+
   it('maps catalog reads and exact lifecycle identity', async () => {
     const call = vi.fn(async (method: string) => (
       method === 'skills.list'

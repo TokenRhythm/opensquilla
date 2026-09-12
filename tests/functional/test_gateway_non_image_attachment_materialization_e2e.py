@@ -40,6 +40,7 @@ from opensquilla.provider.types import (
 )
 from opensquilla.session.manager import SessionManager
 from opensquilla.session.storage import SessionStorage
+from tests.helpers.image_bytes import image_bytes
 
 _TEXT_MODEL = "test/text"
 _GATE_MODEL = "test/gate"
@@ -47,12 +48,7 @@ _VISION_MODEL = "test/vision"
 _TURN_TERMINAL_EVENT_TIMEOUT_SECONDS = 30.0
 _TURN_TASK_DRAIN_TIMEOUT_SECONDS = 10.0
 
-_PNG_BYTES = (
-    b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01"
-    b"\x00\x00\x00\x01\x08\x06\x00\x00\x00\x1f\x15\xc4"
-    b"\x89\x00\x00\x00\nIDATx\x9cc\xf8\x0f\x00\x01\x01"
-    b"\x01\x00\x18\xdd\x8d\xb0\x00\x00\x00\x00IEND\xaeB`\x82"
-)
+_PNG_BYTES = image_bytes()
 
 
 def _sample_pdf_bytes(text: str = "Machine Learning") -> bytes:
@@ -133,6 +129,8 @@ class _RecordingSelector:
         self,
         model: str,
         fallback_chain: list[object],  # noqa: ARG002
+        *,
+        preserve_existing_tail: bool = True,  # noqa: ARG002
     ) -> None:
         self.override_model(model)
 
@@ -168,6 +166,9 @@ class _FakeModelCatalog:
         base_url: str = "",  # noqa: ARG002
     ) -> ModelCapabilities:
         return ModelCapabilities(supports_vision=model_id == _VISION_MODEL)
+
+    def resolve_deployment_vision_support(self, model_id: str, **_kwargs: Any) -> str:
+        return "supported" if model_id == _VISION_MODEL else "unsupported"
 
 
 class _EventSink:
@@ -230,11 +231,10 @@ def _configure_gateway(tmp_path: Path) -> GatewayConfig:
             "model": _TEXT_MODEL,
             "supports_image": False,
         },
-        "image_model": {
+        "c2": {
             "provider": "openrouter",
             "model": _VISION_MODEL,
             "supports_image": True,
-            "image_only": True,
         },
     }
     config.squilla_router.default_tier = "c1"
@@ -361,6 +361,10 @@ def _message_has_image(message: Message) -> bool:
 @pytest.fixture
 async def _e2e_stack(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setenv("OPENSQUILLA_OPENROUTER_LIVE_PRICING", "0")
+    monkeypatch.setattr(
+        "opensquilla.provider.model_catalog.ModelCatalog.resolve_deployment_vision_support",
+        _FakeModelCatalog.resolve_deployment_vision_support,
+    )
     monkeypatch.setattr(squilla_router_step, "_get_strategy", lambda _cfg: _TextTierStrategy())
     config = _configure_gateway(tmp_path)
     store = UploadStore(marker_dir=tmp_path / "upload-markers")
@@ -665,7 +669,7 @@ async def test_pdf_materialization_does_not_require_image_tier(
     _e2e_stack: dict[str, Any],
 ) -> None:
     config: GatewayConfig = _e2e_stack["config"]
-    config.squilla_router.tiers.pop("image_model", None)
+    config.squilla_router.tiers.pop("c2", None)
     manager: SessionManager = _e2e_stack["manager"]
     subscription_manager: SubscriptionManager = _e2e_stack["subscription_manager"]
     sink: _EventSink = _e2e_stack["sink"]

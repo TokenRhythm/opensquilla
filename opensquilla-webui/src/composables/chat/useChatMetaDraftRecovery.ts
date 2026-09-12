@@ -1,5 +1,9 @@
 import type { DurableMetaDraft } from '@/composables/chat/useChatSlashCommands'
-import type { MetaDraftQuery, MetaRunCenter } from '@/modules/metaRunCenter'
+import {
+  MetaRunCenterError,
+  type MetaDraftQuery,
+  type MetaRunCenter,
+} from '@/modules/metaRunCenter'
 import {
   isAuthoritativeSessionSubscription,
   type SessionSubscriptionResult,
@@ -11,9 +15,7 @@ export interface MetaDraftListResult {
 }
 
 function isMethodNotFound(error: unknown): boolean {
-  const candidate = error as { code?: unknown, message?: unknown } | null
-  return candidate?.code === 'METHOD_NOT_FOUND'
-    || /method not found/i.test(error instanceof Error ? error.message : String(candidate?.message || error))
+  return error instanceof MetaRunCenterError && error.code === 'unsupported'
 }
 
 export async function queryServerMetaDrafts(

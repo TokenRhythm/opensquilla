@@ -11,6 +11,7 @@ from opensquilla.application.agent_catalog import (
     AgentCatalog,
     AgentExistsError,
     AgentNotFoundError,
+    AgentProjection,
     AgentRegistryPort,
     AgentRegistryUnavailableError,
     CreateAgent,
@@ -25,17 +26,17 @@ class GatewayAgentRegistryPort(AgentRegistryPort):
     def __init__(self, registry: Any) -> None:
         self._registry = registry
 
-    async def list(self, *, include_builtin: bool) -> Sequence[Mapping[str, Any]]:
+    async def list(self, *, include_builtin: bool) -> Sequence[AgentProjection]:
         return cast(
-            Sequence[Mapping[str, Any]],
+            Sequence[AgentProjection],
             await self._registry.list_agents(include_builtin=include_builtin),
         )
 
-    async def create(self, command: CreateAgent) -> Mapping[str, Any]:
+    async def create(self, command: CreateAgent) -> AgentProjection:
         assert command.agent_id is not None
         try:
             return cast(
-                Mapping[str, Any],
+                AgentProjection,
                 await self._registry.create_agent(
                     agent_id=command.agent_id,
                     name=command.name,
@@ -56,10 +57,10 @@ class GatewayAgentRegistryPort(AgentRegistryPort):
                 raise AgentBuiltinImmutableError(command.agent_id) from exc
             raise
 
-    async def update(self, command: UpdateAgent) -> Mapping[str, Any]:
+    async def update(self, command: UpdateAgent) -> AgentProjection:
         try:
             return cast(
-                Mapping[str, Any],
+                AgentProjection,
                 await self._registry.update_agent(
                     command.agent_id,
                     **command.changed_fields(),

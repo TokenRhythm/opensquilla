@@ -38,7 +38,10 @@ async function mountPanel(options: MountOptions = {}) {
   const i18n = (await import('@/i18n')).default
   i18n.global.locale.value = 'en'
   const Component = (await import('./DataMigrationPanel.vue')).default
-  const { MIGRATION_OPERATIONS_KEY } = await import('@/modules/migrationOperations')
+  const {
+    MIGRATION_OPERATIONS_KEY,
+    MigrationOperationsError,
+  } = await import('@/modules/migrationOperations')
   const el = document.createElement('div')
   document.body.appendChild(el)
   const app = createApp(Component)
@@ -47,7 +50,7 @@ async function mountPanel(options: MountOptions = {}) {
     listSources: async () => {
       const hasRpcMethod = (rpc as { hasRpcMethod?: (method: string) => boolean }).hasRpcMethod
       if (hasRpcMethod && !hasRpcMethod('migration.sources.list')) {
-        throw Object.assign(new Error('method not found'), { code: 'METHOD_NOT_FOUND' })
+        throw new MigrationOperationsError('unsupported', 'Migration discovery is unsupported.')
       }
       const result = await rpc.call('migration.sources.list', {}) as {
         schemaVersion: 1
@@ -71,7 +74,7 @@ async function mountPanel(options: MountOptions = {}) {
     preview: async (candidateId: string) => {
       const hasRpcMethod = (rpc as { hasRpcMethod?: (method: string) => boolean }).hasRpcMethod
       if (hasRpcMethod && !hasRpcMethod('migration.sources.preview')) {
-        throw Object.assign(new Error('method not found'), { code: 'METHOD_NOT_FOUND' })
+        throw new MigrationOperationsError('unsupported', 'Migration preview is unsupported.')
       }
       const result = await rpc.call('migration.sources.preview', { candidateId }) as Record<string, unknown>
       const summary = result.summary as Record<string, unknown> | undefined

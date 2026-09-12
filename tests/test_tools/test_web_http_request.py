@@ -34,7 +34,7 @@ def _patch_response(monkeypatch: pytest.MonkeyPatch, response: httpx.Response) -
         async def request(self, **kwargs: object) -> httpx.Response:
             return response
 
-    monkeypatch.setattr(web.httpx, "AsyncClient", FakeAsyncClient)
+    monkeypatch.setattr(httpx, "AsyncClient", FakeAsyncClient)
 
 
 @pytest.mark.asyncio

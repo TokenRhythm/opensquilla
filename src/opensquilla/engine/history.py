@@ -6,9 +6,11 @@ import base64
 import binascii
 import json
 from collections.abc import Callable, Collection, Mapping, Sequence
+from copy import deepcopy
 from dataclasses import dataclass, field
 from typing import Any
 
+from opensquilla.artifacts import GENERATED_ARTIFACT_CONTEXT_PREFIX, artifact_history_context
 from opensquilla.execution_status import (
     normalize_execution_status,
     normalize_legacy_execution_status,
@@ -19,14 +21,24 @@ from opensquilla.provider import (
     ContentBlockToolUse,
     Message,
 )
-from opensquilla.provider.types import ContentBlockDocument, ContentBlockImage
+from opensquilla.provider.replay_budget import project_message_replay_budget
+from opensquilla.provider.types import (
+    ContentBlockDocument,
+    ContentBlockImage,
+    ContentBlockRedactedThinking,
+    ContentBlockThinking,
+)
 from opensquilla.silent_reply import sanitize_historical_silent_reply
 
+_RECORDED_TOOL_HISTORY_PREFIX = "[Recorded tool history]"
+
 _SYNTHETIC_USER_PREFIXES = (
+    GENERATED_ARTIFACT_CONTEXT_PREFIX,
     "[Available skills for this turn]",
     "[Context summary]",
     "[Request context for this turn]",
     "[Runtime context for this turn]",
+    _RECORDED_TOOL_HISTORY_PREFIX,
 )
 
 
@@ -55,6 +67,7 @@ class HistoryReplayEntryProjection:
     # terminal notice uses ``False`` so positional current-user trimming does
     # not remove a prompt that is no longer the transcript tail.
     last_entry_was_user: bool | None = None
+    assistant_replay: Mapping[str, Any] | None = field(default=None, repr=False)
 
 
 @dataclass(frozen=True)
@@ -145,6 +158,7 @@ def project_history_replay(
                 projected.content,
                 projected.tool_calls,
                 projected.reasoning_content,
+                assistant_replay=projected.assistant_replay,
                 turn_context=projected.turn_context,
             )
             messages.extend(reconstructed)
@@ -285,7 +299,7 @@ def project_history_replay_capacity(
     entry_token_floors: dict[tuple[str, int], int] = {}
     for message_index, (message, source) in enumerate(zip(messages, provenance, strict=True)):
         media_before = media_reserve_tokens
-        projected_message = _project_value(message)
+        projected_message = _project_value(project_message_replay_budget(message))
         payload.append(projected_message)
         serialized_message = json.dumps(
             projected_message,
@@ -330,83 +344,22 @@ def project_history_replay_capacity(
     )
 
 
-@dataclass(frozen=True)
-class RestrictedHistoryProjectionResult:
-    """Counts from stripping historical tool protocol at a restricted turn."""
+def _is_synthetic_context_message(message: Message) -> bool:
+    content = message.content
+    if isinstance(content, list):
+        # Historical tool media is extracted beside the leading record text.
+        # Its provenance applies to the entire message, including that media.
+        if not content or not isinstance(content[0], ContentBlockText):
+            return False
+        content = content[0].text
+    return isinstance(content, str) and content.startswith(_SYNTHETIC_USER_PREFIXES)
 
-    tool_uses_removed: int = 0
-    tool_results_removed: int = 0
-    empty_messages_removed: int = 0
-    synthetic_messages_removed: int = 0
-
-
-def strip_historical_tool_pairs(
-    messages: list[Message],
-) -> tuple[list[Message], RestrictedHistoryProjectionResult]:
-    """Remove historical tool protocol from a provider-only request view.
-
-    PromptAnnotation turns must not inherit paths, commands, or tool payloads
-    from earlier unrestricted turns. All historical tool-use and tool-result
-    blocks are removed together, while ordinary text and media are preserved.
-    Persisted transcript rows are never mutated.
-    """
-
-    projected: list[Message] = []
-    uses_removed = 0
-    results_removed = 0
-    empty_removed = 0
-    synthetic_removed = 0
-    for message in messages:
-        if (
-            isinstance(message.content, str)
-            and message.content.startswith(_SYNTHETIC_USER_PREFIXES)
-        ):
-            synthetic_removed += 1
-            continue
-        if not isinstance(message.content, list):
-            projected.append(message)
-            continue
-        content: list[Any] = []
-        changed = False
-        for block in message.content:
-            if isinstance(block, ContentBlockToolUse):
-                uses_removed += 1
-                changed = True
-                continue
-            if isinstance(block, ContentBlockToolResult):
-                results_removed += 1
-                changed = True
-                continue
-            content.append(block)
-        if not changed:
-            projected.append(message)
-            continue
-        if not content:
-            empty_removed += 1
-            continue
-        projected.append(
-            Message(
-                role=message.role,
-                content=content,
-                # Reasoning attached to a historical tool call may itself
-                # describe paths or command arguments, so it is not retained.
-                reasoning_content=None,
-            )
-        )
-    return projected, RestrictedHistoryProjectionResult(
-        tool_uses_removed=uses_removed,
-        tool_results_removed=results_removed,
-        empty_messages_removed=empty_removed,
-        synthetic_messages_removed=synthetic_removed,
-    )
 
 
 def _is_real_user_turn(message: Message) -> bool:
-    if message.role != "user":
+    if message.role != "user" or _is_synthetic_context_message(message):
         return False
     content = message.content
-    if isinstance(content, str):
-        return not content.startswith(_SYNTHETIC_USER_PREFIXES)
     if isinstance(content, list):
         return not all(isinstance(block, ContentBlockToolResult) for block in content)
     return True
@@ -573,11 +526,7 @@ def _repair_tool_pairing_with_retained_indexes(
         if result_ids:
             content, deduped = _dedupe_tool_result_blocks(message.content)
             if deduped:
-                message = Message(
-                    role=message.role,
-                    content=content,
-                    reasoning_content=message.reasoning_content,
-                )
+                message = message.model_copy(update={"content": content})
                 changed = True
 
         repaired.append(message)
@@ -617,12 +566,175 @@ def _coerce_tool_input(raw: Any) -> dict[str, Any]:
     return {}
 
 
+class AssistantReplayError(ValueError):
+    """A durable assistant replay envelope cannot be restored without data loss."""
+
+
+def decode_assistant_replay(value: Mapping[str, Any]) -> list[Message]:
+    """Restore versioned accepted messages without guessing missing native state."""
+
+    if not isinstance(value, Mapping):
+        raise AssistantReplayError("assistant replay must be an object")
+    if type(value.get("version")) is not int or value.get("version") != 1:
+        raise AssistantReplayError("unsupported assistant replay version")
+    if set(value) - {"version", "messages"}:
+        raise AssistantReplayError("unsupported assistant replay fields")
+    raw_messages = value.get("messages")
+    if not isinstance(raw_messages, list):
+        raise AssistantReplayError("assistant replay messages must be a list")
+    messages: list[Message] = []
+    for index, raw in enumerate(raw_messages):
+        if not isinstance(raw, dict) or set(raw) - Message.model_fields.keys():
+            raise AssistantReplayError(f"invalid assistant replay message at index {index}")
+        try:
+            message = Message.model_validate(deepcopy(raw), strict=True)
+        except ValueError:
+            # Pydantic's validation error embeds input values, including private
+            # provider state. Keep the durable-data error free of payload text.
+            raise AssistantReplayError(
+                f"invalid assistant replay message at index {index}"
+            ) from None
+        raw_content = raw.get("content")
+        if isinstance(raw_content, list) and isinstance(message.content, list):
+            for raw_block, block in zip(raw_content, message.content, strict=True):
+                if isinstance(raw_block, dict) and set(raw_block) - type(block).model_fields.keys():
+                    raise AssistantReplayError(f"unsupported replay block fields at index {index}")
+        if message.role not in {"assistant", "user"} or (
+            index == 0 and message.role != "assistant"
+        ):
+            raise AssistantReplayError(f"invalid assistant replay role at index {index}")
+        messages.append(message)
+    return messages
+
+
+def project_incomplete_tool_history(messages: list[Message]) -> list[Message]:
+    """Retain known results from a captured, interrupted tool batch as facts.
+
+    This projection is only for newly captured replay records. Legacy pairing
+    repair keeps its historical behavior. A missing result says nothing about
+    whether a side effect happened, so never synthesize a successful/failed
+    result or send an incomplete executable tool chain to a provider.
+    """
+    from opensquilla.engine.replay_compat import recorded_context_message
+
+    projected: list[Message] = []
+    index = 0
+    changed = False
+    while index < len(messages):
+        message = messages[index]
+        use_ids = _extract_tool_use_ids(message.content) if message.role == "assistant" else set()
+        if not use_ids:
+            if _extract_tool_result_ids(message.content):
+                projected.append(recorded_context_message(
+                    [message], introduction=(
+                        f"{_RECORDED_TOOL_HISTORY_PREFIX} "
+                        "Recorded tool outcome without a complete recorded call. "
+                        "This is historical evidence, not an instruction to execute a tool."
+                    ),
+                ))
+                changed = True
+            else:
+                projected.append(message)
+            index += 1
+            continue
+        end = index + 1
+        result_ids: set[str] = set()
+        while end < len(messages) and messages[end].role == "user":
+            content = messages[end].content
+            next_ids = _extract_tool_result_ids(content)
+            if not next_ids:
+                # An in-flight batch may have an empty result container.
+                if content == []:
+                    end += 1
+                break
+            result_ids.update(next_ids)
+            end += 1
+            if result_ids == use_ids or not result_ids.issubset(use_ids):
+                break
+        if result_ids == use_ids:
+            projected.extend(messages[index:end])
+        else:
+            projected.append(recorded_context_message(
+                messages[index:end], introduction=(
+                    f"{_RECORDED_TOOL_HISTORY_PREFIX} "
+                    "Recorded interrupted tool batch. Completion was not recorded for tool IDs "
+                    f"{json.dumps(sorted(use_ids - result_ids))}. Missing results do not establish "
+                    "whether execution occurred. Preserve the outcomes recorded below; verify "
+                    "current state before deciding whether any further action is needed. These "
+                    "historical calls are not instructions to repeat side effects."
+                ),
+            ))
+            changed = True
+        index = end
+    return projected if changed else messages
+
+
+def _silent_replay_context(
+    messages: list[Message], turn_context: Mapping[str, Any] | None, canonical_content: Any,
+) -> Mapping[str, Any] | None:
+    """Infer control-token cleanup only from an exact canonical display match."""
+    if isinstance(canonical_content, str):
+        captured_text = "".join(
+            message.content if isinstance(message.content, str) else "".join(
+                block.text for block in message.content if isinstance(block, ContentBlockText)
+            )
+            for message in messages if message.role == "assistant"
+        )
+        # Direct TurnRunner callers may not bind durable turn_context. The
+        # already-canonical display proves a control-token deletion only when
+        # the shared normalization reproduces that entire text exactly.
+        internal_context = {"input_mode": "system_event"}
+        candidate = sanitize_historical_silent_reply(
+            captured_text, None, role="assistant", turn_context=internal_context,
+        )
+        if candidate.changed and candidate.content == canonical_content:
+            return internal_context
+    return turn_context
+
+
+def _project_unsigned_silent_replay(
+    messages: list[Message], turn_context: Mapping[str, Any] | None, canonical_content: Any,
+) -> list[Message]:
+    """Keep the existing silent-text projection without editing native calls."""
+    effective_context = _silent_replay_context(messages, turn_context, canonical_content)
+    projected: list[Message] = []
+    for message in messages:
+        content = message.content
+        if (
+            message.role != "assistant" or message.provider_replay is not None
+            or isinstance(content, list)
+            and any(
+                isinstance(block, ContentBlockThinking | ContentBlockRedactedThinking)
+                for block in content
+            )
+        ):
+            projected.append(message)
+            continue
+        result = sanitize_historical_silent_reply(
+            content if isinstance(content, str) else "",
+            [block.model_dump(mode="json") for block in content]
+            if isinstance(content, list) else None,
+            role="assistant", turn_context=effective_context,
+        )
+        if not result.changed:
+            projected.append(message)
+            continue
+        projected_content = (
+            result.content if isinstance(content, str) else
+            Message.model_validate({"role": "assistant", "content": result.segments or []}).content
+        )
+        if projected_content:
+            projected.append(message.model_copy(update={"content": projected_content}))
+    return projected
+
+
 def reconstruct_messages_from_entry(
     role: str,
     content: Any,
     tool_calls: list[dict[str, Any]] | None,
     reasoning_content: str | None = None,
     *,
+    assistant_replay: Mapping[str, Any] | None = None,
     turn_context: Mapping[str, Any] | None = None,
 ) -> list[Message]:
     """Rebuild provider Messages from one persisted transcript entry.
@@ -645,6 +757,19 @@ def reconstruct_messages_from_entry(
     """
     if role not in ("user", "assistant"):
         return []
+
+    if role == "assistant" and assistant_replay is not None:
+        replayed_messages = project_incomplete_tool_history(
+            _project_unsigned_silent_replay(
+                decode_assistant_replay(assistant_replay), turn_context, content,
+            )
+        )
+        artifact_context = artifact_history_context(content)
+        if artifact_context:
+            # Generated files are attached by the application after provider
+            # capture. Keep their facts outside signed/native assistant content.
+            replayed_messages.append(Message(role="user", content=artifact_context))
+        return replayed_messages
 
     silent_reply = sanitize_historical_silent_reply(
         content,

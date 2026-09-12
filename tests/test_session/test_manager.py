@@ -15,6 +15,12 @@ import pytest
 import pytest_asyncio
 
 from opensquilla.session import manager as session_manager_module
+from opensquilla.session.attachment_manifest import (
+    ATTACHMENT_MANIFEST_STATE_KIND,
+    attachment_manifest_from_context_state,
+    build_attachment_manifest,
+    manifest_context_state,
+)
 from opensquilla.session.compaction import CompactionConfig, CompactionResult
 from opensquilla.session.context_view import (
     build_compaction_context_records,
@@ -695,6 +701,35 @@ async def test_update_fields(manager):
     updated = await manager.update("agent:main:main", model="claude-opus-4-6", channel="telegram")
     assert updated.model == "claude-opus-4-6"
     assert updated.channel == "telegram"
+
+
+@pytest.mark.asyncio
+async def test_update_expected_owner_rejects_epoch_change_before_write(
+    manager,
+    monkeypatch,
+):
+    key = "agent:main:update-owner-race"
+    admitted = await manager.create(key)
+    original_upsert = manager._storage.upsert_session
+
+    async def advance_epoch_before_upsert(node, **kwargs):
+        await manager._storage.increment_epoch(key)
+        return await original_upsert(node, **kwargs)
+
+    monkeypatch.setattr(manager._storage, "upsert_session", advance_epoch_before_upsert)
+
+    with pytest.raises(KeyError, match="Session generation changed"):
+        await manager.update(
+            key,
+            expected_session_id=admitted.session_id,
+            expected_session_epoch=int(admitted.epoch or 0),
+            display_name="Late title",
+        )
+
+    persisted = await manager.get_session(key)
+    assert persisted is not None
+    assert persisted.epoch == 1
+    assert persisted.display_name != "Late title"
 
 
 @pytest.mark.asyncio
@@ -1887,6 +1922,341 @@ async def test_branch_fork_transcript_copies_compacted_archive(manager):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("fork_mode", ["before_message", "through_turn", "prepared"])
+@pytest.mark.parametrize("archived", [False, True])
+async def test_prefix_forks_preserve_legacy_attachment_ids_with_new_message_identity(
+    manager,
+    fork_mode: str,
+    archived: bool,
+) -> None:
+    parent = await manager.create("agent:main:prefix-attachment-parent")
+    image_content = json.dumps(
+        {
+            "text": "inspect the attachments",
+            "attachments": [
+                {"type": "image/png", "name": "first.png", "data": "cG5n"},
+                {"type": "image/png", "name": "duplicate.png", "data": "cG5n"},
+                {
+                    "attachment_id": "att_existing_prefix_123",
+                    "type": "image/png",
+                    "sha256_ref": "a" * 64,
+                    "name": "stored.png",
+                },
+            ],
+        }
+    )
+    image_entry = TranscriptEntry(
+        session_id=parent.session_id,
+        session_key=parent.session_key,
+        role="user",
+        content=image_content,
+        turn_context={"turn_id": "prefix-attachment-turn"},
+    )
+    await manager._storage.append_transcript_entry(image_entry)
+    parent_manifest = build_attachment_manifest(
+        [image_entry],
+        session_id=parent.session_id,
+        session_key=parent.session_key,
+    )
+    attachment_ids = [item.attachment_id for item in parent_manifest.occurrences]
+    assert len(set(attachment_ids)) == 3
+    reference_text = "Attachment references: " + ", ".join(attachment_ids)
+    answer_entry = TranscriptEntry(
+        session_id=parent.session_id,
+        session_key=parent.session_key,
+        role="assistant",
+        content=reference_text,
+        turn_context={"turn_id": "prefix-attachment-turn"},
+    )
+    await manager._storage.append_transcript_entry(answer_entry)
+    future = await manager.append_message(parent.session_key, "user", "later request")
+    await manager._storage.create_agent_task(
+        AgentTaskRecord(
+            task_id="prefix-attachment-turn",
+            session_key=parent.session_key,
+            status=AgentTaskStatus.SUCCEEDED,
+        )
+    )
+    if archived:
+        assert await manager.persist_compaction_result(
+            parent.session_key,
+            reference_text,
+            [{"role": "user", "content": future.content}],
+            compaction_id="cmp-prefix-attachment-parent",
+        )
+
+    child_key = "agent:main:prefix-attachment-child"
+    if fork_mode == "prepared":
+        plan = await manager.prepare_prefix_branch(
+            parent.session_key,
+            child_key,
+            fork_before_message_id=future.message_id,
+        )
+        child = plan.node
+        await manager._storage.upsert_session(child)
+        for entry in plan.initial_transcript_entries:
+            await manager._storage.append_transcript_entry(entry)
+    else:
+        options = (
+            {"fork_before_message_id": future.message_id}
+            if fork_mode == "before_message"
+            else {"fork_through_turn_id": "prefix-attachment-turn"}
+        )
+        child = await manager.branch(
+            parent.session_key,
+            child_key,
+            fork_transcript=True,
+            **options,
+        )
+
+    child_entries = await manager.get_canonical_transcript(child.session_key)
+    assert len(child_entries) == 2
+    assert {entry.message_id for entry in child_entries}.isdisjoint(
+        {image_entry.message_id, answer_entry.message_id, future.message_id}
+    )
+    assert child_entries[1].content == reference_text
+    copied_envelope = json.loads(child_entries[0].content)
+    original_envelope = json.loads(image_content)
+    for original, copied, attachment_id in zip(
+        original_envelope["attachments"],
+        copied_envelope["attachments"],
+        attachment_ids,
+        strict=True,
+    ):
+        assert copied == {**original, "attachment_id": attachment_id}
+    parent_entries = await manager.get_canonical_transcript(parent.session_key)
+    assert next(
+        entry.content for entry in parent_entries if entry.message_id == image_entry.message_id
+    ) == image_content
+    child_manifest = build_attachment_manifest(
+        child_entries,
+        session_id=child.session_id,
+        session_key=child.session_key,
+    )
+    assert [item.attachment_id for item in child_manifest.occurrences] == attachment_ids
+    assert all(
+        item.source_message_id == child_entries[0].message_id
+        for item in child_manifest.occurrences
+    )
+
+    child_tail = await manager.append_message(child.session_key, "user", "child continuation")
+    assert await manager.persist_compaction_result(
+        child.session_key,
+        reference_text,
+        [{"role": "user", "content": child_tail.content}],
+        compaction_id="cmp-prefix-attachment-child",
+    )
+    states = await manager.get_context_states(
+        child.session_key,
+        provider="portable",
+        state_kind=ATTACHMENT_MANIFEST_STATE_KIND,
+    )
+    compacted_manifest = attachment_manifest_from_context_state(
+        max(states, key=lambda state: (state.created_at, state.id or 0))
+    )
+    assert [item.attachment_id for item in compacted_manifest.occurrences] == attachment_ids
+    nested = await manager.branch(
+        child.session_key,
+        "agent:main:prefix-attachment-nested",
+        fork_transcript=True,
+        fork_before_message_id=child_tail.message_id,
+    )
+    nested_entries = await manager.get_canonical_transcript(nested.session_key)
+    nested_manifest = build_attachment_manifest(
+        nested_entries,
+        session_id=nested.session_id,
+        session_key=nested.session_key,
+    )
+    assert [item.attachment_id for item in nested_manifest.occurrences] == attachment_ids
+    assert nested_entries[0].message_id != child_entries[0].message_id
+
+
+@pytest.mark.asyncio
+async def test_full_fork_preserves_attachment_message_id_for_manifest_rebuild(
+    manager,
+) -> None:
+    parent = await manager.create("agent:main:attachment-fork-parent")
+    await manager.append_message(parent.session_key, "user", "old request")
+    await manager.append_message(parent.session_key, "assistant", "old answer")
+    image_content = json.dumps(
+        {
+            "text": "inspect this image",
+            "attachments": [
+                {
+                    "attachment_id": "att_full_fork_image_123",
+                    "type": "image/png",
+                    "name": "fork.png",
+                    "data": "Zm9yay1pbWFnZQ==",
+                }
+            ],
+        }
+    )
+    parent_image = await manager.append_message(
+        parent.session_key,
+        "user",
+        image_content,
+        message_id="message-full-fork-image",
+    )
+    assert await manager.persist_compaction_result(
+        parent.session_key,
+        "older parent context",
+        [{"role": "user", "content": image_content}],
+        compaction_id="cmp-parent-attachment-fork",
+    )
+    parent_states = await manager.get_context_states(parent.session_key)
+    parent_manifest_state = next(
+        state
+        for state in parent_states
+        if state.state_kind == ATTACHMENT_MANIFEST_STATE_KIND
+    )
+    [parent_occurrence] = attachment_manifest_from_context_state(
+        parent_manifest_state
+    ).occurrences
+    assert parent_occurrence.source_message_id == parent_image.message_id
+
+    child = await manager.branch(
+        parent.session_key,
+        "agent:main:attachment-fork-child",
+        fork_transcript=True,
+    )
+    [child_image] = await manager.get_transcript(child.session_key)
+    assert child_image.message_id == parent_image.message_id
+    await manager.append_message(child.session_key, "assistant", "child latest")
+
+    assert await manager.persist_compaction_result(
+        child.session_key,
+        "child image context",
+        [{"role": "assistant", "content": "child latest"}],
+        compaction_id="cmp-child-attachment-fork",
+    )
+    child_states = await manager.get_context_states(child.session_key)
+    child_manifest_state = next(
+        state
+        for state in child_states
+        if state.state_kind == ATTACHMENT_MANIFEST_STATE_KIND
+    )
+    [child_occurrence] = attachment_manifest_from_context_state(
+        child_manifest_state
+    ).occurrences
+    assert child_occurrence.attachment_id == "att_full_fork_image_123"
+    assert child_occurrence.source_message_id == parent_image.message_id
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("archived", [False, True])
+async def test_full_fork_preserves_legacy_attachment_id_from_compacted_archive(
+    manager,
+    archived: bool,
+) -> None:
+    parent = await manager.create("agent:main:legacy-attachment-fork-parent")
+    image_content = json.dumps(
+        {
+            "text": "inspect this legacy image",
+            "attachments": [
+                {
+                    "type": "image/png",
+                    "name": "legacy-fork.png",
+                    "data": "bGVnYWN5LWZvcms=",
+                }
+            ],
+        }
+    )
+    parent_image = await manager.append_message(
+        parent.session_key,
+        "user",
+        image_content,
+        message_id="message-legacy-full-fork-image",
+    )
+    await manager.append_message(parent.session_key, "assistant", "old answer")
+    await manager.append_message(parent.session_key, "user", "active tail")
+    parent_manifest = build_attachment_manifest(
+        await manager.get_canonical_transcript(parent.session_key),
+        session_id=parent.session_id,
+        session_key=parent.session_key,
+    )
+    [parent_occurrence] = parent_manifest.occurrences
+
+    await manager.save_context_state(manifest_context_state(parent_manifest))
+    if archived:
+        assert await manager.persist_compaction_result(
+            parent.session_key,
+            f"legacy image attachment_id={parent_occurrence.attachment_id}",
+            [{"role": "user", "content": "active tail"}],
+            compaction_id="cmp-parent-legacy-attachment-fork",
+        )
+    child = await manager.branch(
+        parent.session_key,
+        "agent:main:legacy-attachment-fork-child",
+        fork_transcript=True,
+    )
+
+    child_canonical = await manager.get_canonical_transcript(child.session_key)
+    child_image = next(
+        entry for entry in child_canonical if entry.message_id == parent_image.message_id
+    )
+    assert child_image.message_id == parent_image.message_id
+    assert json.loads(child_image.content)["attachments"][0]["attachment_id"] == (
+        parent_occurrence.attachment_id
+    )
+    parent_canonical = await manager.get_canonical_transcript(parent.session_key)
+    unchanged_parent_image = next(
+        entry for entry in parent_canonical if entry.message_id == parent_image.message_id
+    )
+    assert unchanged_parent_image.content == image_content
+    child_manifest = build_attachment_manifest(
+        child_canonical,
+        session_id=child.session_id,
+        session_key=child.session_key,
+    )
+
+    assert [item.attachment_id for item in child_manifest.occurrences] == [
+        parent_occurrence.attachment_id
+    ]
+    child_states = await manager.get_context_states(
+        child.session_key,
+        provider="portable",
+        state_kind=ATTACHMENT_MANIFEST_STATE_KIND,
+    )
+    copied_manifest = attachment_manifest_from_context_state(
+        max(child_states, key=lambda state: (state.created_at, state.id or 0))
+    )
+    assert copied_manifest.by_id(parent_occurrence.attachment_id) is not None
+
+    await manager.append_message(child.session_key, "assistant", "child answer")
+    assert await manager.persist_compaction_result(
+        child.session_key,
+        f"legacy image attachment_id={parent_occurrence.attachment_id}",
+        [{"role": "assistant", "content": "child answer"}],
+        compaction_id="cmp-child-legacy-attachment-fork",
+    )
+    compacted_child_states = await manager.get_context_states(
+        child.session_key,
+        provider="portable",
+        state_kind=ATTACHMENT_MANIFEST_STATE_KIND,
+    )
+    compacted_child_manifest = attachment_manifest_from_context_state(
+        max(
+            compacted_child_states,
+            key=lambda state: (state.created_at, state.id or 0),
+        )
+    )
+    assert [
+        (
+            item.attachment_id,
+            item.source_message_id,
+            item.ordinal,
+        )
+        for item in compacted_child_manifest.occurrences
+    ] == [
+        (
+            parent_occurrence.attachment_id,
+            parent_image.message_id,
+            0,
+        )
+    ]
+
+
+@pytest.mark.asyncio
 async def test_full_branch_preserves_incomplete_parent_compaction_evidence(manager):
     parent = await manager.create("agent:main:main")
     for index in range(4):
@@ -2955,6 +3325,61 @@ async def test_compact_with_result_skips_rewrite_when_transcript_changes(manager
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("rotate_on_entry", "operation"),
+    [(1, "compaction snapshot"), (2, "compaction commit")],
+)
+async def test_compact_with_result_rejects_owner_rotated_at_exact_boundaries(
+    manager,
+    tmp_path,
+    monkeypatch,
+    rotate_on_entry,
+    operation,
+):
+    key = "agent:main:main"
+    monkeypatch.setenv("OPENSQUILLA_SESSION_ARCHIVE_DIR", str(tmp_path / "archives"))
+    admitted = await manager.create(key)
+    for i in range(20):
+        await manager.append_message(
+            key,
+            "user",
+            f"msg {i} " + ("x" * 500),
+            token_count=200,
+        )
+    context_entries = 0
+    replacement = None
+
+    @contextlib.asynccontextmanager
+    async def mutation_context():
+        nonlocal context_entries, replacement
+        context_entries += 1
+        if context_entries == rotate_on_entry:
+            replacement, rotated = await manager.apply_intent(
+                key,
+                SessionIntent.RESET_SAME_KEY,
+            )
+            assert rotated is True
+        yield
+
+    with pytest.raises(StaleEpochError, match=operation):
+        await manager.compact_with_result(
+            key,
+            context_window_tokens=1000,
+            mutation_context=mutation_context,
+            expected_session_id=admitted.session_id,
+            expected_session_epoch=int(admitted.epoch or 0),
+        )
+
+    assert replacement is not None
+    current = await manager.get_session(key)
+    assert current is not None
+    assert current.session_id == replacement.session_id
+    assert current.compaction_count == 0
+    assert await manager.get_transcript(key) == []
+    assert await manager.get_summaries(key) == []
+
+
+@pytest.mark.asyncio
 async def test_compact_with_result_marks_unsafe_receipt_as_degraded_forensic(manager):
     await manager.create("agent:main:main")
     for i in range(20):
@@ -3427,7 +3852,26 @@ async def test_persist_compaction_result_rewrite_failure_keeps_session_state_ato
     monkeypatch: pytest.MonkeyPatch,
 ):
     node = await manager.create("agent:main:main")
-    for index in range(4):
+    await manager.append_message(
+        node.session_key,
+        "user",
+        json.dumps(
+            {
+                "text": "image before failed rewrite",
+                "attachments": [
+                    {
+                        "attachment_id": "att_atomic_rollback_123",
+                        "type": "image/png",
+                        "name": "rollback.png",
+                        "data": "aW1hZ2U=",
+                    }
+                ],
+            }
+        ),
+        message_id="message-atomic-image",
+        token_count=5,
+    )
+    for index in range(1, 4):
         await manager.append_message("agent:main:main", "user", f"msg {index}", token_count=5)
     original_transcript = await manager.get_transcript("agent:main:main")
     original_canonical_transcript = await manager.get_canonical_transcript("agent:main:main")
@@ -3658,6 +4102,120 @@ async def test_persist_compaction_result_stores_summary_out_of_band(manager):
     assert states[0].state_kind == "structured_summary_v1"
     assert states[0].payload is not None
     assert states[0].payload["compaction_id"] == "cmp_inline_1"
+
+
+@pytest.mark.asyncio
+async def test_compaction_atomically_persists_attachment_manifest_with_summary(
+    manager,
+) -> None:
+    node = await manager.create("agent:main:attachment-compaction")
+    image_data = "aW1hZ2UtYnl0ZXM="
+    await manager.append_message(
+        node.session_key,
+        "user",
+        json.dumps(
+            {
+                "text": "inspect this image",
+                "attachments": [
+                    {
+                        "attachment_id": "att_compaction_image_123",
+                        "path": "/private/tmp/material/image.png",
+                        "type": "image/png",
+                        "name": "diagram.png",
+                        "data": image_data,
+                    }
+                ],
+            }
+        ),
+        message_id="message-image",
+    )
+    await manager.append_message(node.session_key, "assistant", "old answer")
+    await manager.append_message(node.session_key, "user", "follow up")
+    await manager.append_message(node.session_key, "assistant", "latest reply")
+
+    await manager.persist_compaction_result(
+        node.session_key,
+        "image discussion summary",
+        [{"role": "assistant", "content": "latest reply"}],
+        compaction_id="cmp-image",
+    )
+
+    active = await manager.get_transcript(node.session_key)
+    canonical = await manager.get_canonical_transcript(node.session_key)
+    states = await manager.get_context_states(node.session_key)
+    states_by_kind = {state.state_kind: state for state in states}
+
+    assert [entry.content for entry in active] == ["latest reply"]
+    assert any(image_data in entry.content for entry in canonical)
+    assert "structured_summary_v1" in states_by_kind
+    assert ATTACHMENT_MANIFEST_STATE_KIND in states_by_kind
+    manifest = attachment_manifest_from_context_state(
+        states_by_kind[ATTACHMENT_MANIFEST_STATE_KIND]
+    )
+    [occurrence] = manifest.occurrences
+    assert occurrence.attachment_id == "att_compaction_image_123"
+    assert occurrence.source_message_id == "message-image"
+    summaries = await manager.get_summaries(node.session_key)
+    assert len(summaries) == 1
+    assert summaries[0].summary_payload is not None
+    assert summaries[0].summary_payload["files_and_artifacts"] == []
+    assert occurrence.attachment_id in summaries[0].summary_payload[
+        "important_identifiers"
+    ]
+    serialized_summary = json.dumps(summaries[0].summary_payload, sort_keys=True)
+    assert "/private/tmp" not in serialized_summary
+    assert image_data not in serialized_summary
+    serialized_manifest = json.dumps(
+        states_by_kind[ATTACHMENT_MANIFEST_STATE_KIND].payload,
+        sort_keys=True,
+    )
+    assert image_data not in serialized_manifest
+    assert '"data"' not in serialized_manifest
+    assert '"path"' not in serialized_manifest
+
+
+@pytest.mark.asyncio
+async def test_attachment_manifest_build_failure_aborts_compaction_atomically(
+    manager,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    node = await manager.create("agent:main:attachment-compaction-failure")
+    for index in range(4):
+        await manager.append_message(
+            node.session_key,
+            "user" if index % 2 == 0 else "assistant",
+            f"message {index}",
+        )
+    original_transcript = await manager.get_transcript(node.session_key)
+    original_canonical = await manager.get_canonical_transcript(node.session_key)
+    original_node = await manager.get_session(node.session_key)
+
+    def fail_manifest(*args, **kwargs):  # noqa: ANN002, ANN003
+        del args, kwargs
+        raise ValueError("manifest collision")
+
+    monkeypatch.setattr(
+        session_manager_module,
+        "_merge_attachment_manifest_state",
+        fail_manifest,
+    )
+
+    with pytest.raises(ValueError, match="manifest collision"):
+        await manager.persist_compaction_result(
+            node.session_key,
+            "summary must not commit",
+            [{"role": "assistant", "content": "message 3"}],
+            compaction_id="cmp-manifest-failure",
+        )
+
+    assert await manager.get_transcript(node.session_key) == original_transcript
+    assert await manager.get_canonical_transcript(node.session_key) == original_canonical
+    assert await manager.get_summaries(node.session_key) == []
+    assert await manager.get_context_states(node.session_key) == []
+    current_node = await manager.get_session(node.session_key)
+    assert current_node is not None
+    assert original_node is not None
+    assert current_node.compaction_count == original_node.compaction_count
 
 
 @pytest.mark.asyncio
@@ -3926,6 +4484,295 @@ async def test_inline_compaction_rejects_stale_source_without_partial_install(ma
         (node.session_id,),
     ) as cur:
         assert (await cur.fetchone())[0] == 0
+
+
+@pytest.mark.asyncio
+async def test_exact_transcript_read_rejects_reset_during_storage_read(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db_path = tmp_path / "exact-transcript-reset.db"
+    reader_storage = SessionStorage(str(db_path))
+    reset_storage = SessionStorage(str(db_path))
+    await reader_storage.connect()
+    await reset_storage.connect()
+    reader = SessionManager(reader_storage, inject_time_prefix=False)
+    resetter = SessionManager(reset_storage, inject_time_prefix=False)
+    key = "agent:main:exact-transcript-reset"
+    monkeypatch.setenv("OPENSQUILLA_SESSION_ARCHIVE_DIR", str(tmp_path / "archives"))
+    admitted = await reader.create(key)
+    await reader.append_message(key, "user", "retired owner input")
+    read_started = asyncio.Event()
+    release_read = asyncio.Event()
+    original_get_transcript = reader_storage.get_transcript
+
+    async def paused_get_transcript(*args: Any, **kwargs: Any):
+        rows = await original_get_transcript(*args, **kwargs)
+        read_started.set()
+        await release_read.wait()
+        return rows
+
+    monkeypatch.setattr(reader_storage, "get_transcript", paused_get_transcript)
+    read_task = asyncio.create_task(
+        reader.get_transcript(
+            key,
+            expected_session_id=admitted.session_id,
+            expected_session_epoch=int(admitted.epoch or 0),
+        )
+    )
+    try:
+        await asyncio.wait_for(read_started.wait(), timeout=5)
+        replacement, rotated = await resetter.apply_intent(
+            key,
+            SessionIntent.RESET_SAME_KEY,
+        )
+        assert rotated is True
+        await resetter.append_message(key, "user", "replacement input")
+        release_read.set()
+
+        with pytest.raises(StaleEpochError, match="transcript read"):
+            await read_task
+
+        current = await resetter.get_session(key)
+        assert current is not None
+        assert current.session_id == replacement.session_id
+        assert [entry.content for entry in await resetter.get_transcript(key)] == [
+            "replacement input"
+        ]
+    finally:
+        release_read.set()
+        if not read_task.done():
+            read_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await read_task
+        await reset_storage.close()
+        await reader_storage.close()
+
+
+@pytest.mark.asyncio
+async def test_exact_summary_read_rejects_reset_during_storage_read(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db_path = tmp_path / "exact-summary-reset.db"
+    reader_storage = SessionStorage(str(db_path))
+    reset_storage = SessionStorage(str(db_path))
+    await reader_storage.connect()
+    await reset_storage.connect()
+    reader = SessionManager(reader_storage, inject_time_prefix=False)
+    resetter = SessionManager(reset_storage, inject_time_prefix=False)
+    key = "agent:main:exact-summary-reset"
+    monkeypatch.setenv("OPENSQUILLA_SESSION_ARCHIVE_DIR", str(tmp_path / "archives"))
+    admitted = await reader.create(key)
+    await reader_storage.save_summary(
+        SessionSummary(
+            session_id=admitted.session_id,
+            session_key=key,
+            summary_text="retired owner summary",
+        )
+    )
+    read_started = asyncio.Event()
+    release_read = asyncio.Event()
+    original_get_all_summaries = reader_storage.get_all_summaries
+
+    async def paused_get_all_summaries(*args: Any, **kwargs: Any):
+        rows = await original_get_all_summaries(*args, **kwargs)
+        read_started.set()
+        await release_read.wait()
+        return rows
+
+    monkeypatch.setattr(
+        reader_storage,
+        "get_all_summaries",
+        paused_get_all_summaries,
+    )
+    read_task = asyncio.create_task(
+        reader.get_summaries(
+            key,
+            expected_session_id=admitted.session_id,
+            expected_session_epoch=int(admitted.epoch or 0),
+        )
+    )
+    try:
+        await asyncio.wait_for(read_started.wait(), timeout=5)
+        replacement, rotated = await resetter.apply_intent(
+            key,
+            SessionIntent.RESET_SAME_KEY,
+        )
+        assert rotated is True
+        await reset_storage.save_summary(
+            SessionSummary(
+                session_id=replacement.session_id,
+                session_key=key,
+                summary_text="replacement owner summary",
+            )
+        )
+        release_read.set()
+
+        with pytest.raises(StaleEpochError, match="summary read"):
+            await read_task
+    finally:
+        release_read.set()
+        if not read_task.done():
+            read_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await read_task
+        await reset_storage.close()
+        await reader_storage.close()
+
+
+@pytest.mark.asyncio
+async def test_exact_context_state_read_rejects_reset_during_storage_read(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db_path = tmp_path / "exact-context-reset.db"
+    reader_storage = SessionStorage(str(db_path))
+    reset_storage = SessionStorage(str(db_path))
+    await reader_storage.connect()
+    await reset_storage.connect()
+    reader = SessionManager(reader_storage, inject_time_prefix=False)
+    resetter = SessionManager(reset_storage, inject_time_prefix=False)
+    key = "agent:main:exact-context-reset"
+    monkeypatch.setenv("OPENSQUILLA_SESSION_ARCHIVE_DIR", str(tmp_path / "archives"))
+    admitted = await reader.create(key)
+    await reader_storage.save_context_state(
+        SessionContextState(
+            session_id=admitted.session_id,
+            session_key=key,
+            state_kind="structured_summary_v1",
+            payload={"owner": "retired"},
+            portable=True,
+        )
+    )
+    read_started = asyncio.Event()
+    release_read = asyncio.Event()
+    original_get_context_states = reader_storage.get_context_states
+
+    async def paused_get_context_states(*args: Any, **kwargs: Any):
+        rows = await original_get_context_states(*args, **kwargs)
+        read_started.set()
+        await release_read.wait()
+        return rows
+
+    monkeypatch.setattr(
+        reader_storage,
+        "get_context_states",
+        paused_get_context_states,
+    )
+    read_task = asyncio.create_task(
+        reader.get_context_states(
+            key,
+            expected_session_id=admitted.session_id,
+            expected_session_epoch=int(admitted.epoch or 0),
+        )
+    )
+    try:
+        await asyncio.wait_for(read_started.wait(), timeout=5)
+        replacement, rotated = await resetter.apply_intent(
+            key,
+            SessionIntent.RESET_SAME_KEY,
+        )
+        assert rotated is True
+        await reset_storage.save_context_state(
+            SessionContextState(
+                session_id=replacement.session_id,
+                session_key=key,
+                state_kind="structured_summary_v1",
+                payload={"owner": "replacement"},
+                portable=True,
+            )
+        )
+        release_read.set()
+
+        with pytest.raises(StaleEpochError, match="context-state read"):
+            await read_task
+    finally:
+        release_read.set()
+        if not read_task.done():
+            read_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await read_task
+        await reset_storage.close()
+        await reader_storage.close()
+
+
+@pytest.mark.asyncio
+async def test_inline_compaction_exact_owner_rejects_reset_before_commit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db_path = tmp_path / "inline-compaction-owner-reset.db"
+    writer_storage = SessionStorage(str(db_path))
+    reset_storage = SessionStorage(str(db_path))
+    await writer_storage.connect()
+    await reset_storage.connect()
+    writer = SessionManager(writer_storage, inject_time_prefix=False)
+    resetter = SessionManager(reset_storage, inject_time_prefix=False)
+    key = "agent:main:inline-owner-reset"
+    monkeypatch.setenv("OPENSQUILLA_SESSION_ARCHIVE_DIR", str(tmp_path / "archives"))
+    admitted = await writer.create(key)
+    await writer.append_message(key, "user", "old question")
+    active = await writer.append_message(key, "user", "active request")
+    source = await writer.capture_compaction_source(
+        key,
+        boundary_message_id=active.message_id,
+        expected_session_id=admitted.session_id,
+        expected_session_epoch=int(admitted.epoch or 0),
+    )
+    commit_started = asyncio.Event()
+    release_commit = asyncio.Event()
+    original_rewrite = writer_storage.rewrite_compacted_session
+
+    async def paused_rewrite(**kwargs: Any):
+        commit_started.set()
+        await release_commit.wait()
+        return await original_rewrite(**kwargs)
+
+    monkeypatch.setattr(writer_storage, "rewrite_compacted_session", paused_rewrite)
+    persist_task = asyncio.create_task(
+        writer.persist_compaction_result(
+            key,
+            "retired owner summary",
+            [{"role": "user", "content": "active request"}],
+            removed_count=1,
+            source_entries=source.entries,
+            source_preimage=source.preimage,
+            source_boundary_message_id=source.boundary_message_id,
+            source_boundary_entry_id=source.boundary_entry_id,
+            expected_session_id=admitted.session_id,
+            expected_session_epoch=int(admitted.epoch or 0),
+        )
+    )
+    try:
+        await asyncio.wait_for(commit_started.wait(), timeout=5)
+        replacement, rotated = await resetter.apply_intent(
+            key,
+            SessionIntent.RESET_SAME_KEY,
+        )
+        assert rotated is True
+        await resetter.append_message(key, "user", "replacement input")
+        release_commit.set()
+
+        with pytest.raises(StaleEpochError, match="owner mismatch"):
+            await persist_task
+
+        current = await resetter.get_session(key)
+        assert current is not None
+        assert current.session_id == replacement.session_id
+        assert current.compaction_count == 0
+        assert [entry.content for entry in await resetter.get_transcript(key)] == [
+            "replacement input"
+        ]
+        assert await reset_storage.get_all_summaries(replacement.session_id) == []
+    finally:
+        release_commit.set()
+        if not persist_task.done():
+            persist_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await persist_task
+        await reset_storage.close()
+        await writer_storage.close()
 
 
 @pytest.mark.asyncio

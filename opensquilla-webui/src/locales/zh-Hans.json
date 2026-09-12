@@ -67,6 +67,13 @@
     "viewRelease": "查看发布说明",
     "dismiss": "忽略",
     "desktop": {
+      "installErrorTitle": "未能开始安装",
+      "quitAndInstall": "退出并安装",
+      "signedDownloadedDesc": "OpenSquilla {version} 安装包已通过校验。点击“退出并安装”以关闭后台服务并打开安装程序。",
+      "manualApplyingStatus": "正在关闭后台服务",
+      "manualApplyingDesc": "OpenSquilla 正在关闭后台服务，完成后将打开安装程序。",
+      "errorSignatureInvalid": "安装包签名无效，或发布者与 OpenSquilla 不符，已阻止安装。请重新下载更新。",
+      "errorSignatureUnavailable": "暂时无法验证安装包签名，已阻止安装。请稍后重试。",
       "indicatorAvailable": "更新 {version}",
       "indicatorDownloaded": "更新已就绪",
       "indicatorInstallerReady": "安装包已验证",
@@ -77,7 +84,7 @@
       "availableDesc": "你准备好时再下载。OpenSquilla 只会在你重新启动后安装更新。",
       "manualAvailableDesc": "下载此版本对应的 Windows 安装程序。Windows 将提示你完成安装。",
       "manualDownloadedTitle": "已验证的安装包已就绪",
-      "manualDownloadedDesc": "OpenSquilla {version} 已通过 GitHub 官方校验和验证，并已在文件夹中显示。准备好后请手动运行安装程序。",
+      "manualDownloadedDesc": "OpenSquilla {version} 安装包已通过校验。点击“显示安装程序”定位文件，准备好后手动运行。",
       "downloadedTitle": "可以安装了",
       "downloadedDesc": "重新启动 OpenSquilla 以完成更新到 {version}。",
       "downloadingTitle": "正在下载更新",
@@ -88,8 +95,8 @@
       "errorFallback": "请在设置中重新检查。",
       "errorSourceUnreachable": "更新源暂时都无法访问，请稍后重试。",
       "errorManifestInvalid": "版本通道数据无效，OpenSquilla 暂时无法安全确认更新。",
-      "errorChecksumUnavailable": "无法获取 GitHub 官方校验和，因此不能验证安装包；未打开任何安装包。",
-      "errorIntegrityFailed": "下载的安装包未通过完整性校验，已将其删除。",
+      "errorChecksumUnavailable": "无法获取官方更新校验和，因此不能验证安装包；未打开任何安装包。",
+      "errorIntegrityFailed": "安装包未通过完整性校验。请重新下载更新。",
       "errorDownloadFailed": "OpenSquilla 无法下载更新。请检查网络后重试。",
       "errorInstallFailed": "OpenSquilla 无法准备或打开安装程序。请重试或使用发布页面。",
       "idleDesc": "检查新的桌面版本。",
@@ -166,11 +173,33 @@
       "failedDetail": "重新加载隔离浏览器以继续。"
     },
     "artifactAnnotation": {
-      "start": "批注预览", "stop": "退出批注模式", "selectElement": "选择页面元素进行批注", "selectElementShort": "选择元素", "unavailable": "当前无法使用预览批注。", "desktopEditingOnly": "请在桌面客户端中选择页面元素并让 AI 编辑。",
-      "createFailed": "无法附加所选页面元素。", "elementChanged": "所选元素在附加前发生了变化，请在当前预览中重新选择。", "rearmFailed": "元素选择器无法重新启动，批注模式已退出。请重新开启批注模式后再试。", "updateFailed": "无法保存批注草稿。", "discardFailed": "无法丢弃该批注。编辑框将保持打开，请重试。", "closeFailed": "无法关闭批注编辑框。请重试后再选择其他元素。", "replacementCleanupFailed": "新批注已保留，但无法删除之前的草稿。",
+      "start": "批注预览",
+      "stop": "退出批注模式",
+      "selectElement": "选择页面元素进行批注",
+      "selectElementShort": "选择元素",
+      "unavailable": "当前无法使用预览批注。",
+      "desktopEditingOnly": "请在桌面客户端中选择页面元素并让 AI 编辑。",
+      "createFailed": "无法附加所选页面元素。",
+      "elementChanged": "所选元素在附加前发生了变化，请在当前预览中重新选择。",
+      "rearmFailed": "元素选择器无法重新启动，批注模式已退出。请重新开启批注模式后再试。",
+      "updateFailed": "无法保存批注草稿。",
+      "discardFailed": "无法丢弃该批注。编辑框将保持打开，请重试。",
+      "closeFailed": "无法关闭批注编辑框。请重试后再选择其他元素。",
+      "replacementCleanupFailed": "新批注已保留，但无法删除之前的草稿。",
       "overlayFallback": "请在下方继续编辑批注。",
-      "fallbackTitle": "继续编辑批注", "fallbackDetail": "预览暂时隐藏，你的批注仍在。", "frozenPreview": "所选页面区域的预览",
-      "placeholder": "描述希望对这个区域进行的修改…", "newlineHint": "{shortcut} 换行", "keepDraft": "保留批注", "submit": "添加批注", "contextLabel": "当前选区", "bodyLabel": "页面批注", "emptyBody": "请描述希望的修改。", "reselectHint": "请在页面中选择对应区域。", "reuseHint": "已复制修改要求，请在页面中选择对应区域。"
+      "fallbackTitle": "继续编辑批注",
+      "fallbackDetail": "预览暂时隐藏，你的批注仍在。",
+      "frozenPreview": "所选页面区域的预览",
+      "placeholder": "描述希望对这个区域进行的修改…",
+      "newlineHint": "{shortcut} 换行",
+      "keepDraft": "保留批注",
+      "submit": "添加批注",
+      "contextLabel": "当前选区",
+      "bodyLabel": "页面批注",
+      "emptyBody": "请描述希望的修改。",
+      "reselectHint": "请在页面中选择对应区域。",
+      "reuseHint": "已复制修改要求，请在页面中选择对应区域。",
+      "screenshotUploadFailed": "页面截图未能附加。批注仍已保留，你可以手动添加图片。"
     },
     "artifactPreview": {
       "refresh": "刷新预览",
@@ -180,7 +209,6 @@
       "readyWithWarnings": "预览已运行，但存在警告。",
       "warningsShort": "存在警告",
       "suspended": "预览已暂停",
-      "agentEditInProgress": "编辑正在后台继续。",
       "nativePreview": "互动预览",
       "allowRemoteResources": "允许加载在线图片、样式和媒体",
       "blockRemoteResources": "禁止加载在线图片、样式和媒体",
@@ -199,7 +227,6 @@
       "setDefaultMode": "将当前模式设为默认",
       "restoreDefaultMode": "恢复默认预览模式",
       "defaultModeSaved": "已保存默认预览模式。",
-      "fullModeNotice": "互动预览可以加载在线内容，但不会共享 OpenSquilla 身份、本机文件或系统浏览器登录状态。",
       "offlineWebLimits": "受限预览中，部分外部内容和高级网页功能可能不可用。",
       "compatibilityFallback": "当前 Desktop 版本仅支持旧版单文件预览。",
       "upgradeDesktopShort": "请升级 Desktop",
@@ -222,7 +249,6 @@
     },
     "artifactErrors": {
       "documentChanged": "页面已更新。请刷新后再试。",
-      "editSessionRenewalRequired": "正在重新连接编辑功能。未保存的更改仍会保留。",
       "writeBusy": "页面正在更新，请稍后重试。",
       "mutationNotApplied": "页面未更新，可以重试。",
       "mutationOutcomePending": "无法确认更新结果，请打开页面检查。",
@@ -234,7 +260,8 @@
       "annotationUnavailable": "该批注暂时不可用。",
       "annotationBusy": "正在更新批注，请稍后重试。",
       "invalidRequest": "无法完成请求，请检查输入后重试。",
-      "internalError": "无法完成操作，请重试。"
+      "internalError": "无法完成操作，请重试。",
+      "documentEditingRetired": "请更新客户端并重新打开页面，将批注作为聊天输入发送。"
     },
     "artifactDocument": {
       "sections": "交付件文档区域",
@@ -283,22 +310,7 @@
       "revertFailed": "无法撤销此轮变更。文档可能已经变化，请检查最新版本后重试。",
       "commentCreateFailed": "无法添加批注，请检查文档最新状态后重试。",
       "commentResolveFailed": "无法解决批注，请检查批注最新状态后重试。",
-      "noElementSelected": "将光标放在一个 HTML 元素内",
-      "saving": "保存中…",
-      "saveSource": "保存",
-      "sourceUnavailable": "暂时无法读取 HTML 源码。",
-      "sourceConflict": "文档已在其他位置发生变化，请检查或重新加载后再保存。",
-      "copyUnsavedSource": "复制未保存源码",
-      "unsavedSourceCopied": "已复制未保存源码",
-      "copyUnsavedSourceFailed": "无法复制未保存源码。",
-      "discardAndLoadLatest": "丢弃并加载最新版本",
-      "sourceStatus": {
-        "ready": "就绪",
-        "saving": "保存中…",
-        "dirty": "未保存",
-        "saved": "已保存",
-        "error": "需要处理"
-      }
+      "sourceUnavailable": "暂时无法读取 HTML 源码。"
     }
   },
   "nav": {
@@ -1127,7 +1139,9 @@
       "modelNoMatches": "没有匹配的模型 — 可以直接使用输入的内容。",
       "modelListTruncated": "显示 {total} 个模型中的 {shown} 个 — 继续输入以缩小范围。",
       "modelProvenance": "服务商实时列表 · 能力来源：{sources}",
-      "modelMetadataProvenance": "服务商实时列表 · 官网参数优先，缺失时使用目录值"
+      "modelMetadataProvenance": "服务商实时列表 · 官网参数优先，缺失时使用目录值",
+      "modelMultimodal": "多模态",
+      "modelMultimodalTitle": "支持图片输入"
     },
     "preset": {
       "modeCustom": "自定义分层"
@@ -1197,6 +1211,7 @@
       "removeCandidateAria": "移除 {model}",
       "ensembleEmpty": "暂无候选模型。请保存模型服务设置以生成模型分层，或手动添加候选模型。",
       "ensemblePipeline": "工作方式：提案模型并行起草，融合模型汇总草稿并产出最终回答；只有融合模型可以调用工具。",
+      "candidateModelHint": "“多模态”标签表示模型支持图片输入；图片请求会使用已配置的图片能力路由。",
       "ensembleFlowDesc": "多个模型并行起草,融合模型合成最终回答;调用次数更多。",
       "legacyDynamicNotice": "当前为跟随已保存模型分层的旧融合方案；转换为自定义阵容后可在此编辑成员。",
       "legacyDynamicMigrate": "转换为自定义阵容",
@@ -1279,6 +1294,7 @@
       "colModel": "模型",
       "colThinking": "思考",
       "colImage": "图像",
+      "imageCapabilityAutomatic": "图片能力根据服务商元数据和实际请求结果自动判断，无需手动设置。",
       "tierProviderAria": "{tier} 请求入口",
       "tierProviderManagedByEnsemble": "由多模型融合决定",
       "tierProviderManagedByEnsembleAria": "{tier} 请求入口由多模型融合方案决定",
@@ -1309,7 +1325,8 @@
       "tierLegacyDynamicEnsembleSummaryGeneric": "使用之前保存的“跟随模型分层”融合方案；失败时使用“固定与回退模型”。",
       "tierLegacyDynamicEnsembleFallbackMissingSummary": "使用之前保存的“跟随模型分层”融合方案；尚未配置可用的“固定与回退模型”。",
       "tierSingleModelAnnouncement": "C3 使用单模型：{model}。",
-      "tierEnsembleImageRouting": "C3 融合不处理图像；图像请求仍按图像模型配置处理。",
+      "tierEnsembleImageRouting": "C3 融合接收图片的文字标记。Router 仅使用已配置的 C0–C3 模型处理图片。",
+      "tierLegacyImageRouting": "旧版兼容配置：保留此模型，但不用于图片输入。请在 C0–C3 中配置支持图片的模型。",
       "tierThinkingManagedByEnsemble": "由融合方案决定",
       "tierThinkingManagedByEnsembleAria": "{tier} 的思考级别由多模型融合方案决定",
       "tierThinkingAria": "{tier} 思考级别",
@@ -1726,9 +1743,6 @@
       "descReloadSuffix": "的项目会在刷新页面后生效。",
       "experimentsGroup": "实验功能",
       "managementGroup": "管理",
-      "foldLabel": "新版实时回合渲染",
-      "foldDesc": "根据有序事件日志渲染流式工作卡片；仅在需要临时回退兼容渲染时关闭。",
-      "foldAria": "新版实时回合渲染（重新加载后生效）",
       "revealLabel": "答案显示窗口（毫秒）",
       "revealDesc": "将实时答案的显示保持在 [最小值, 最大值] 窗口内，以便路由先行决策。最小值 ≤ 最大值。",
       "revealMinAria": "答案显示最小毫秒数",
@@ -3075,7 +3089,9 @@
       "clearActivity": "清除活动",
       "expandActivity": "展开安装活动",
       "collapseActivity": "收起安装活动",
+      "selectSkillDirectory": "请选择技能目录",
       "queueStatus": {
+        "selection_required": "待选择目录",
         "queued": "等待中",
         "installing": "安装中",
         "cancelling": "正在取消",
@@ -3507,6 +3523,7 @@
     "liveConnecting": "正在恢复实时更新…",
     "liveConnectingConnected": "Gateway 已连接，正在恢复当前会话实时更新…",
     "gatewayReconnecting": "正在重新连接 Gateway…",
+    "automaticRecoveryDescription": "正在自动恢复，可继续编辑；未发送的文字和附件会保留在这里。",
     "liveUnavailable": "实时更新暂不可用",
     "liveUnavailableDescription": "历史消息仍可查看。请重新连接后再发送。",
     "liveUnavailableConnectedDescription": "Gateway 已连接，历史消息仍可查看；当前会话实时更新恢复后即可发送。",
@@ -3555,7 +3572,7 @@
     "audioUnsupported": "此浏览器无法播放这种音频格式，请改为下载文件。",
     "playVideo": "播放视频",
     "videoLoadFailed": "无法加载视频。",
-    "videoUnsupported": "此浏览器无法播放这种视频格式，请改为下载文件。",
+    "videoUnsupported": "此浏览器无法播放该视频。请改为下载。",
     "previewOf": "预览：{title}",
     "closePreview": "关闭预览",
     "previousImage": "上一张图片",
@@ -3564,7 +3581,6 @@
     "previewDownload": "预览下载",
     "previewTimedOut": "预览超时。",
     "previewFailed": "预览加载失败。",
-    "videoUnsupported": "此浏览器无法播放该视频。请改为下载。",
     "loadVideoPreview": "加载视频预览",
     "loadVideoPreviewFor": "加载视频预览 {title}",
     "videoPreviewLoading": "正在加载视频预览。下载过程中可以取消。",
@@ -3610,6 +3626,7 @@
     "provenance": {
       "cron": "定时",
       "scheduled": "定时任务",
+      "scheduledTrigger": "定时触发",
       "cronSource": "由 {tool} 定时触发"
     },
     "sandboxSetup": {
@@ -3880,11 +3897,13 @@
       "answerPlanQuestionnaire": "请先回答上方的规划问题",
       "previousQuestion": "上一个",
       "nextQuestion": "下一个",
-      "outcomeDoneTitle": "回复已发送 · 已恢复运行",
+      "outcomeDoneTitle": "已收到回复",
       "outcomeBusyDetail": "正在处理你的回复。",
-      "outcomeDoneDetail": "智能体已接受此回复并继续。",
+      "outcomeDoneDetail": "智能体已收到你的回复。",
       "replyReceived": "已收到回复 · 继续运行…",
       "sendingReply": "正在发送回复…",
+      "expiredTitle": "问题已失效",
+      "expiredDetail": "此问题已不再等待回答。你可以发送新消息。",
       "sendReply": "发送回复",
       "sendingContinuing": "正在发送回复 · 继续运行…"
     },
@@ -4051,7 +4070,8 @@
         "generic": "当前任务暂不支持同轮引导。消息仍在排队。"
       },
       "clearQueue": "清空队列",
-      "removeMessage": "移除待发送消息 {index}"
+      "removeMessage": "移除待发送消息 {index}",
+      "annotationUpgradeRequired": "这条待发批注使用旧编辑器。请编辑消息，并重新选择页面后发送。"
     },
     "metaRuns": {
       "draft": "草稿",

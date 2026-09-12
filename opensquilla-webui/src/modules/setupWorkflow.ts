@@ -29,6 +29,32 @@ export interface SetupDiscoveryResult extends SetupStatus {
 
 export interface SetupRequestOptions { signal?: AbortSignal }
 
+export type SetupWorkflowErrorCode =
+  | 'not-found'
+  | 'unsupported'
+  | 'forbidden'
+  | 'conflict'
+  | 'unavailable'
+  | 'invalid'
+
+export type SetupWorkflowFailureReason =
+  | 'provider-invalid'
+  | 'router-invalid'
+  | 'search-invalid'
+  | 'image-generation-invalid'
+
+export class SetupWorkflowError extends Error {
+  constructor(
+    readonly code: SetupWorkflowErrorCode,
+    message: string,
+    readonly reason?: SetupWorkflowFailureReason,
+    readonly cause?: unknown,
+  ) {
+    super(message)
+    this.name = 'SetupWorkflowError'
+  }
+}
+
 export interface ConfigurePrimaryProvider {
   providerId: string
   model?: string | null

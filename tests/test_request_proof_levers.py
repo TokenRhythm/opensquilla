@@ -4,7 +4,6 @@ Covers OPENSQUILLA_PROVIDER_COMPACTION_PROTECT_RECENT_RESULTS,
 OPENSQUILLA_PROVIDER_COMPACTION_PROTECT_ERROR_RESULTS,
 OPENSQUILLA_PROVIDER_COMPACTION_PROTECT_UNRESOLVED_RESULTS,
 OPENSQUILLA_PROVIDER_COMPACTION_SKIP_PROJECTED,
-OPENSQUILLA_PROVIDER_COMPACTION_STUB_PREVIEW_CHARS, and
 OPENSQUILLA_PROVIDER_COMPACTION_NEVER_WORSE.
 """
 
@@ -154,7 +153,7 @@ def _golden_payload() -> dict[str, Any]:
 
 
 # --- begin baseline goldens ---
-_GOLDEN_TIER_BUDGETS: dict[int, int] = {0: 10300, 1: 8800, 2: 8300, 3: 4900, 4: 2600}
+_GOLDEN_TIER_BUDGETS: dict[int, int] = {0: 10300, 1: 8800, 2: 8500, 3: 5500, 4: 3600}
 _GOLDEN_PAYLOAD_JSON: dict[int, str] = {
     10300: (
         '{"model":"synthetic-model","temperature":0,"messages":[{"role":"system","content":"You a'
@@ -356,171 +355,193 @@ _GOLDEN_PAYLOAD_JSON: dict[int, str] = {
         '789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcde'
         'f0123456789abcdef0123456789abcdef0123456789abcdef"}]}'
     ),
-    8300: (
-        '{"model":"synthetic-model","temperature":0,"messages":[{"role":"system","content":"You a'
-        're a synthetic conversation fixture."},{"role":"user","content":"Summarise the build res'
-        'ults. 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef01'
-        '23456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789'
-        'abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef01'
-        '23456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"},{"role":"assistant","co'
-        'ntent":"Starting with the build.","reasoning_content":"weighing tradeoffs before acting '
-        '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef01234567'
-        '89abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef'
-        '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef01234567'
-        '89abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef'
-        '0123456789abcdef0123456789abcdef012\\n\\n[provider_request_reasoning_content_compacted'
-        ': omitted 373 chars; original_chars=913; sha256=3bb00fdffc68cafeaab4d2325da556f5cda15f44'
-        '0193c7418123e8478e8a4fa8]\\n\\n89abcdef0123456789abcdef0123456789abcdef0123456789abcde'
-        'f0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","tool_calls":[{"id":"'
-        'call-1","type":"function","function":{"name":"run_command","arguments":"{\\"command\\"'
-        ':\\"run build step && inspect artifacts run build step && inspect artifacts run build ste'
-        'p && inspect artifacts run build step && inspect artifacts run build step && inspect art'
-        'ifacts run build step && inspect artifacts run build step && inspect artifacts run build'
-        ' step && inspect artifacts run build step && inspect artifacts run build step && inspect'
-        ' artifacts run build step && inspect artifacts run build step && inspec\\\\n\\\\n[provid'
-        'er_request_tool_input_compacted: omitted 396 chars; original_chars=936; sha256=03fe833d8'
-        'd0ffb378d437a3e2a5f2341df51d5e8db67fdeddce81126a20ccd3e]\\\\n\\\\nt artifacts run build '
-        'step && inspect artifacts run build step && inspect artifacts run build step && inspect '
-        'artifacts \\",\\"workdir\\":\\"/srv/project\\"}"}}]},{"role":"tool","tool_call_id":"call-'
-        '1","content":"alpha result line 0123456789abcdef0123456789abcdef0123456789abcdef01234567'
-        '89abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef'
-        '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef01234567'
-        '89abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef'
-        '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef01234567'
-        '89abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef'
-        '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef01234567'
-        '89abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef'
-        '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef01234567'
-        '89abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef'
-        '0123456789abcdef0123456789abcdef01\\n\\n[provider_request_compacted: omitted 518 chars'
-        ']\\n\\n89abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456'
-        '789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcde'
-        'f0123456789abcdef0123456789abcdef"},{"role":"assistant","content":[{"type":"text","text"'
-        ':"Reviewing the output. 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef'
-        '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef01234567'
-        '89abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef'
-        '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef01234567'
-        '89abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef'
-        '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"},{"type":"tool_use","i'
-        'd":"call-2","name":"read_file","input":{"path":"/srv/project/main.py","note":"context no'
-        'te 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef01234'
-        '56789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abc'
-        'def0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef01234'
-        '56789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abc'
-        'def0123456789abcdef0123456789abcdef0123456789abcdef0123456\\n\\n[provider_request_tool'
-        '_input_compacted: omitted 155 chars; original_chars=695; sha256=2733247a9bc6e597f6630ddc'
-        'ddb84eba87be620c047ba001f7238d4af8477d85]\\n\\n89abcdef0123456789abcdef0123456789abcde'
-        'f0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"}}]},{'
-        '"role":"user","content":[{"type":"tool_result","tool_use_id":"call-2","content":"bravo r'
-        'esult line 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abc'
-        'def0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef01234'
-        '56789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abc'
-        'def0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef01234'
-        '56789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abc'
-        'def0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef01234'
-        '56789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abc'
-        'def0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef01234'
-        '56789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abc'
-        'def0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef01234'
-        '56789abcdef01\\n\\n[provider_request_compacted: omitted 678 chars]\\n\\n89abcdef01234567'
-        '89abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef'
-        '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef01234567'
-        '89abcdef"}]},{"role":"tool","tool_call_id":"call-3","content":"charlie result line 01234'
-        '56789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abc'
-        'def0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef01234'
-        '56789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abc'
-        'def0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef01234'
-        '56789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abc'
-        'def0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef01234'
-        '56789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abc'
-        'def0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef01234'
-        '56789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abc'
-        'def0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\\'
-        'n\\n[provider_request_compacted: omitted 360 chars]\\n\\n89abcdef0123456789abcdef012345'
-        '6789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcd'
-        'ef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"},{"r'
-        'ole":"user","content":"Now write the summary. 0123456789abcdef0123456789abcdef0123456789'
-        'abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef01'
-        '23456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"}]}'
+    8500: (
+        '{"model":"synthetic-model","temperature":0,"messages":[{"role":"system","content":"You'
+        ' are a synthetic conversation fixture."},{"role":"user","content":"Summarise the build'
+        ' results. 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789ab'
+        'cdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef01'
+        '23456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef01234567'
+        '89abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"},{"role":"as'
+        'sistant","content":"Starting with the build.","reasoning_content":"weighing tradeoffs '
+        'before acting 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef01234567'
+        '89abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcd'
+        'ef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123'
+        '456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789'
+        'abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef'
+        '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef012345'
+        '6789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789ab'
+        'cdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef01'
+        '23456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef01234567'
+        '89abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcd'
+        'ef0123456789abcdef0123456789abcdef","tool_calls":[{"id":"call-1","type":"function","fu'
+        'nction":{"name":"run_command","arguments":"{\\"command\\":\\"run build step && inspect ar'
+        'tifacts run build step && inspect artifacts run build step && inspect artifacts run bu'
+        'ild step && inspect artifacts run build step && inspect artifacts run build step && in'
+        'spect artifacts run build step && inspect artifacts run build step && inspect artifact'
+        's run build step && inspect artifacts run build step && inspect artifacts run build st'
+        'ep && inspect artifacts run build step && inspec\\\\n\\\\n[provider_request_tool_input_com'
+        'pacted: omitted 396 chars; original_chars=936; sha256=03fe833d8d0ffb378d437a3e2a5f2341'
+        'df51d5e8db67fdeddce81126a20ccd3e]\\\\n\\\\nt artifacts run build step && inspect artifacts'
+        ' run build step && inspect artifacts run build step && inspect artifacts \\",\\"workdir\\'
+        '":\\"/srv/project\\"}"}}]},{"role":"tool","tool_call_id":"call-1","content":"alpha resul'
+        't line 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcde'
+        'f0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef01234'
+        '56789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789a'
+        'bcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0'
+        '123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456'
+        '789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abc'
+        'def0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef012'
+        '3456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef012345678'
+        '9abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcde'
+        'f0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef01234'
+        '56789abcdef0123456789abcdef01\\n\\n[provider_request_compacted: omitted 518 chars]\\n\\n89'
+        'abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef'
+        '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef012345'
+        '6789abcdef0123456789abcdef"},{"role":"assistant","content":[{"type":"text","text":"Rev'
+        'iewing the output. 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef012'
+        '3456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef012345678'
+        '9abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcde'
+        'f0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef01234'
+        '56789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789a'
+        'bcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"},{"type":"tool_'
+        'use","id":"call-2","name":"read_file","input":{"path":"/srv/project/main.py","note":"c'
+        'ontext note 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789'
+        'abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef'
+        '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef012345'
+        '6789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789ab'
+        'cdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456\\n\\n[provid'
+        'er_request_tool_input_compacted: omitted 155 chars; original_chars=695; sha256=2733247'
+        'a9bc6e597f6630ddcddb84eba87be620c047ba001f7238d4af8477d85]\\n\\n89abcdef0123456789abcdef'
+        '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef012345'
+        '6789abcdef"}}]},{"role":"user","content":[{"type":"tool_result","tool_use_id":"call-2"'
+        ',"content":"bravo result line 0123456789abcdef0123456789abcdef0123456789abcdef01234567'
+        '89abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcd'
+        'ef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123'
+        '456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789'
+        'abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef'
+        '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef012345'
+        '6789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789ab'
+        'cdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef01'
+        '23456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef01234567'
+        '89abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcd'
+        'ef0123456789abcdef0123456789abcdef0123456789abcdef01\\n\\n[provider_request_compacted: o'
+        'mitted 678 chars]\\n\\n89abcdef0123456789abcdef0123456789abcdef0123456789abcdef012345678'
+        '9abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcde'
+        'f0123456789abcdef0123456789abcdef0123456789abcdef"}]},{"role":"tool","tool_call_id":"c'
+        'all-3","content":"charlie result line 0123456789abcdef0123456789abcdef0123456789abcdef'
+        '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef012345'
+        '6789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789ab'
+        'cdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef01'
+        '23456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef01234567'
+        '89abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcd'
+        'ef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123'
+        '456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789'
+        'abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef'
+        '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef012345'
+        '6789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\\n\\n[provider_request_compac'
+        'ted: omitted 360 chars]\\n\\n89abcdef0123456789abcdef0123456789abcdef0123456789abcdef012'
+        '3456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef012345678'
+        '9abcdef0123456789abcdef0123456789abcdef0123456789abcdef"},{"role":"user","content":"No'
+        'w write the summary. 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0'
+        '123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456'
+        '789abcdef0123456789abcdef0123456789abcdef"}]}'
     ),
-    4900: (
-        '{"model":"synthetic-model","temperature":0,"messages":[{"role":"system","content":"You a'
-        're a synthetic conversation fixture."},{"role":"user","content":"Summarise the build res'
-        'ults. 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef01'
-        '23456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456\\n\\n[provider_r'
-        'equest_user_context_emergency_compacted: omitted 129 chars; original_chars=349; sha256=1'
-        'b95b386d19eac8884426943ac35590ace8b2e23a6034abe983121b27e6913da]\\n\\n89abcdef01234567'
-        '89abcdef0123456789abcdef"},{"role":"assistant","content":"Starting with the build.","rea'
-        'soning_content":"weighing tradeoffs before acting 0123456789abcdef0123456789abcdef012345'
-        '6789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcd'
-        'ef0123456789abcdef012\\n\\n[provider_request_reasoning_content_emergency_compacted: om'
-        'itted 482 chars; original_chars=702; sha256=0a38cf6b74383e1ffd068b1c3c83b54238655b36e881'
-        '6a3bd629410b35ee0c8b]\\n\\n89abcdef0123456789abcdef0123456789abcdef","tool_calls":[{"i'
-        'd":"call-1","type":"function","function":{"name":"run_command","arguments":"{\\"comma'
-        'nd\\":\\"run build step && inspect artifacts run build step && inspect artifacts run b'
-        'uild step && inspect artifacts run build step && inspect artifacts run build step && ins'
-        'pec\\n\\n[provider_request_tool_arguments_emergency_compacted: omitted 518 chars; orig'
-        'inal_chars=738; sha256=d5a4e74e6f2d1d7dd0bd4b91fe5365393822c7fd638fc84fc1e2e465b51aee7e]'
-        '\\n\\nct artifacts \\",\\"workdir\\":\\"/srv/project\\"}"}}]},{"role":"tool","tool_call'
-        '_id":"call-1","content":"alpha result line 0123456789abcdef0123456789abcdef0123456789abc'
-        'def0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef01234'
-        '56789abcdef0123456789abcdef01\\n\\n[provider_request_tool_content_emergency_compacted:'
-        ' omitted 931 chars; original_chars=1151; sha256=7883df0b8b724e54d021df559dd8d888503065a3'
-        '26d6aed48a41801aaf32b7d5]\\n\\n89abcdef0123456789abcdef0123456789abcdef"},{"role":"ass'
-        'istant","content":[{"type":"text","text":"Reviewing the output. 0123456789abcdef01234567'
-        '89abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef'
-        '0123456789abcdef0123456789abcdef0123456789abcd\\n\\n[provider_request_text_block_emerg'
-        'ency_compacted: omitted 282 chars; original_chars=502; sha256=376f702641d0b312ad08bf169e'
-        '28cabcfbc48f1f2f21bd3fbb004def27505f6a]\\n\\n89abcdef0123456789abcdef0123456789abcdef"'
-        '},{"type":"tool_use","id":"call-2","name":"read_file","input":{"path":"/srv/project/main'
-        '.py","note":"context note 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcd'
-        'ef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef012345'
-        '6789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcd'
-        'ef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef012345'
-        '6789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456\\n\\'
-        'n[provider_request_tool_input_compacted: omitted 155 chars; original_chars=695; sha256=2'
-        '733247a9bc6e597f6630ddcddb84eba87be620c047ba001f7238d4af8477d85]\\n\\n89abcdef01234567'
-        '89abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef'
-        '0123456789abcdef"}}]},{"role":"user","content":[{"type":"tool_result","tool_use_id":"cal'
-        'l-2","content":"bravo result line 0123456789abcdef0123456789abcdef0123456789abcdef012345'
-        '6789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcd'
-        'ef0123456789abcdef01\\n\\n[provider_request_tool_result_emergency_compacted: omitted 9'
-        '31 chars; original_chars=1151; sha256=ebd1bb15e93761c5f48ae723bbdefd10062608a036da688acc'
-        'bd42ddd4b26a4c]\\n\\n89abcdef0123456789abcdef0123456789abcdef"}]},{"role":"tool","tool'
-        '_call_id":"call-3","content":"charlie result line 0123456789abcdef0123456789abcdef012345'
-        '6789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcd'
-        'ef0123456789abcdef0123456789abcdef\\n\\n[provider_request_tool_content_emergency_compa'
-        'cted: omitted 931 chars; original_chars=1151; sha256=9320226914fadb3009965ea28902e8b5f4b'
-        '175ebccc33282452a3d062038ddce]\\n\\n89abcdef0123456789abcdef0123456789abcdef"},{"role"'
-        ':"user","content":"Now write the summary. 0123456789abcdef0123456789abcdef0123456789abcd'
-        'ef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef012345'
-        '6789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"}]}'
+    5500: (
+        '{"model":"synthetic-model","temperature":0,"messages":[{"role":"system","content":"You'
+        ' are a synthetic conversation fixture."},{"role":"user","content":"Summarise the build'
+        ' results. 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789ab'
+        'cdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456\\n\\n[provid'
+        'er_request_user_context_emergency_compacted: omitted 129 chars; original_chars=349; sh'
+        'a256=1b95b386d19eac8884426943ac35590ace8b2e23a6034abe983121b27e6913da]\\n\\n89abcdef0123'
+        '456789abcdef0123456789abcdef"},{"role":"assistant","content":"Starting with the build.'
+        '","reasoning_content":"weighing tradeoffs before acting 0123456789abcdef0123456789abcd'
+        'ef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123'
+        '456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789'
+        'abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef'
+        '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef012345'
+        '6789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789ab'
+        'cdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef01'
+        '23456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef01234567'
+        '89abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcd'
+        'ef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123'
+        '456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","tool_ca'
+        'lls":[{"id":"call-1","type":"function","function":{"name":"run_command","arguments":"{'
+        '\\"command\\":\\"run build step && inspect artifacts run build step && inspect artifacts '
+        'run build step && inspect artifacts run build step && inspect artifacts run build step'
+        ' && inspec\\n\\n[provider_request_tool_arguments_emergency_compacted: omitted 518 chars;'
+        ' original_chars=738; sha256=d5a4e74e6f2d1d7dd0bd4b91fe5365393822c7fd638fc84fc1e2e465b5'
+        '1aee7e]\\n\\nct artifacts \\",\\"workdir\\":\\"/s'
+        'rv/project\\"}"}}]},{"role":"tool","tool_cal'
+        'l_id":"call-1","content":"alpha result line 0123456789abcdef0123456789abcdef0123456789'
+        'abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef'
+        '0123456789abcdef0123456789abcdef01\\n\\n[provider_request_tool_content_emergency_compact'
+        'ed: omitted 931 chars; original_chars=1151; sha256=7883df0b8b724e54d021df559dd8d888503'
+        '065a326d6aed48a41801aaf32b7d5]\\n\\n89abcdef0123456789abcdef0123456789abcdef"},{"role":"'
+        'assistant","content":[{"type":"text","text":"Reviewing the output. 0123456789abcdef012'
+        '3456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef012345678'
+        '9abcdef0123456789abcdef0123456789abcdef0123456789abcd\\n\\n[provider_request_text_block_'
+        'emergency_compacted: omitted 282 chars; original_chars=502; sha256=376f702641d0b312ad0'
+        '8bf169e28cabcfbc48f1f2f21bd3fbb004def27505f6a]\\n\\n89abcdef0123456789abcdef0123456789ab'
+        'cdef"},{"type":"tool_use","id":"call-2","name":"read_file","input":{"path":"/srv/proje'
+        'ct/main.py","note":"context note 0123456789abcdef0123456789abcdef0123456789abcdef01234'
+        '56789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789a'
+        'bcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0'
+        '123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456'
+        '789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abc'
+        'def0123456\\n\\n[provider_request_tool_input_compacted: omitted 155 chars; original_char'
+        's=695; sha256=2733247a9bc6e597f6630ddcddb84eba87be620c047ba001f7238d4af8477d85]\\n\\n89a'
+        'bcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0'
+        '123456789abcdef0123456789abcdef"}}]},{"role":"user","content":[{"type":"tool_result","'
+        'tool_use_id":"call-2","content":"bravo result line 0123456789abcdef0123456789abcdef012'
+        '3456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef012345678'
+        '9abcdef0123456789abcdef0123456789abcdef01\\n\\n[provider_request_tool_result_emergency_c'
+        'ompacted: omitted 931 chars; original_chars=1151; sha256=ebd1bb15e93761c5f48ae723bbdef'
+        'd10062608a036da688accbd42ddd4b26a4c]\\n\\n89abcdef0123456789abcdef0123456789abcdef"}]},{'
+        '"role":"tool","tool_call_id":"call-3","content":"charlie result line 0123456789abcdef0'
+        '123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456'
+        '789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\\n\\n[provider_request_tool_co'
+        'ntent_emergency_compacted: omitted 931 chars; original_chars=1151; sha256=9320226914fa'
+        'db3009965ea28902e8b5f4b175ebccc33282452a3d062038ddce]\\n\\n89abcdef0123456789abcdef01234'
+        '56789abcdef"},{"role":"user","content":"Now write the summary. 0123456789abcdef0123456'
+        '789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abc'
+        'def0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"}]'
+        '}'
     ),
-    2600: (
-        '{"model":"synthetic-model","temperature":0,"messages":[{"role":"system","content":"You a'
-        're a synthetic conversation fixture."},{"role":"user","content":"[opensquilla_compacted:'
-        'user_context:387:4ff918646ea190e7]"},{"role":"assistant","content":"Starting with the bu'
-        'ild.","reasoning_content":"[opensquilla_compacted:reasoning_content:392:8712361ef75ec240'
-        ']","tool_calls":[{"id":"call-1","type":"function","function":{"name":"run_command","argu'
-        'ments":"{\\"_invalid_provider_context_arguments\\":true}"}}]},{"role":"tool","tool_cal'
-        'l_id":"call-1","content":"[opensquilla_compacted:tool_result:388:3469a086a9891767]"},{"r'
-        'ole":"assistant","content":[{"type":"text","text":"[opensquilla_compacted:assistant_cont'
-        'ent_text:385:52ac6665cc08c154]"},{"type":"tool_use","id":"call-2","name":"read_file","in'
-        'put":{"path":"/srv/project/main.py","note":"context note 0123456789abcdef0123456789abcde'
-        'f0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456'
-        '789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcde'
-        'f0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456'
-        '789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcde'
-        'f0123456789abcdef0123456\\n\\n[provider_request_tool_input_compacted: omitted 155 char'
-        's; original_chars=695; sha256=2733247a9bc6e597f6630ddcddb84eba87be620c047ba001f7238d4af8'
-        '477d85]\\n\\n89abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0'
-        '123456789abcdef0123456789abcdef0123456789abcdef"}}]},{"role":"user","content":[{"type":"'
-        'tool_result","tool_use_id":"call-2","content":"[opensquilla_compacted:user_context_conte'
-        'nt:387:8d46a9cf6db53c83]"}]},{"role":"tool","tool_call_id":"call-3","content":"[opensqui'
-        'lla_compacted:tool_result:388:85514ec80c03d75f]"},{"role":"user","content":"Now write th'
-        'e summary. 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abc'
-        'def0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef01234'
-        '56789abcdef0123456789abcdef"}]}'
+    3600: (
+        '{"model":"synthetic-model","temperature":0,"messages":[{"role":"system","content":"You'
+        ' are a synthetic conversation fixture."},{"role":"user","content":"[opensquilla_compac'
+        'ted:user_context:387:4ff918646ea190e7]"},{"role":"assistant","content":"Starting with '
+        'the build.","reasoning_content":"weighing tradeoffs before acting 0123456789abcdef0123'
+        '456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789'
+        'abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef'
+        '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef012345'
+        '6789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789ab'
+        'cdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef01'
+        '23456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef01234567'
+        '89abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcd'
+        'ef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123'
+        '456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789'
+        'abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef'
+        '","tool_calls":[{"id":"call-1","type":"function","function":{"name":"run_command","arg'
+        'uments":"{\\"_invalid_provider_context_arguments\\":true}"}}]},{"role":"tool","tool_call'
+        '_id":"call-1","content":"[opensquilla_compacted:tool_result:388:3469a086a9891767]"},{"'
+        'role":"assistant","content":[{"type":"text","text":"[opensquilla_compacted:assistant_c'
+        'ontent_text:385:52ac6665cc08c154]"},{"type":"tool_use","id":"call-2","name":"read_file'
+        '","input":{"path":"/srv/project/main.py","note":"context note 0123456789abcdef01234567'
+        '89abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcd'
+        'ef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123'
+        '456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789'
+        'abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef'
+        '0123456789abcdef0123456789abcdef0123456\\n\\n[provider_request_tool_input_compacted: omi'
+        'tted 155 chars; original_chars=695; sha256=2733247a9bc6e597f6630ddcddb84eba87be620c047'
+        'ba001f7238d4af8477d85]\\n\\n89abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123'
+        '456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"}}]},{"role":"user","cont'
+        'ent":[{"type":"tool_result","tool_use_id":"call-2","content":"[opensquilla_compacted:u'
+        'ser_context_content:387:8d46a9cf6db53c83]"}]},{"role":"tool","tool_call_id":"call-3","'
+        'content":"[opensquilla_compacted:tool_result:388:85514ec80c03d75f]"},{"role":"user","c'
+        'ontent":"Now write the summary. 0123456789abcdef0123456789abcdef0123456789abcdef012345'
+        '6789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789ab'
+        'cdef0123456789abcdef0123456789abcdef0123456789abcdef"}]}'
     ),
 }
 _GOLDEN_PROOF_JSON: dict[int, str] = {
@@ -528,7 +549,7 @@ _GOLDEN_PROOF_JSON: dict[int, str] = {
         '{"projection_adapter":"synthetic_adapter","execution_status_version":1,"status_projectio'
         'n_mode":"native_or_none","estimated_chars":9240,"estimated_tokens":2310,"proof_budget":1'
         '0300,"raw_proof_budget":10300,"effective_proof_budget":9270,"proof_headroom_chars":1030,'
-        '"fits":true,"compact_needed":true,"compaction_tier":0,"compaction_tiny_guard_chars":0,"c'
+        '"fits":true,"compact_needed":true,"compaction_tier":0,"c'
         'ompaction_protect_recent_assistant":false,"recent_tail_too_large":false,"compaction_not_'
         'smaller":false,"provider_window_mismatch":false,"fallback_reason":null,"top_contributors'
         '":[{"path":"$.messages[5].content[0].content","chars":1778},{"path":"$.messages[3].conte'
@@ -542,7 +563,7 @@ _GOLDEN_PROOF_JSON: dict[int, str] = {
         '{"projection_adapter":"synthetic_adapter","execution_status_version":1,"status_projectio'
         'n_mode":"native_or_none","estimated_chars":7849,"estimated_tokens":1962,"proof_budget":8'
         '800,"raw_proof_budget":8800,"effective_proof_budget":7920,"proof_headroom_chars":880,"fi'
-        'ts":true,"compact_needed":true,"compaction_tier":1,"compaction_tiny_guard_chars":0,"comp'
+        'ts":true,"compact_needed":true,"compaction_tier":1,"comp'
         'action_protect_recent_assistant":false,"recent_tail_too_large":false,"compaction_not_sma'
         'ller":false,"provider_window_mismatch":false,"fallback_reason":null,"top_contributors":['
         '{"path":"$.messages[3].content","chars":1151},{"path":"$.messages[5].content[0].content"'
@@ -551,70 +572,71 @@ _GOLDEN_PROOF_JSON: dict[int, str] = {
         'ars":913}],"retry_count":1,"messages_chars":7794,"tools_chars":0,"system_chars":73,"top_'
         'level_chars":43,"tool_schema_too_large":false}'
     ),
-    8300: (
-        '{"projection_adapter":"synthetic_adapter","execution_status_version":1,"status_projectio'
-        'n_mode":"native_or_none","estimated_chars":7406,"estimated_tokens":1851,"proof_budget":8'
-        '300,"raw_proof_budget":8300,"effective_proof_budget":7470,"proof_headroom_chars":830,"fi'
-        'ts":true,"compact_needed":true,"compaction_tier":2,"compaction_tiny_guard_chars":0,"comp'
-        'action_protect_recent_assistant":false,"recent_tail_too_large":false,"compaction_not_sma'
-        'ller":false,"provider_window_mismatch":false,"fallback_reason":null,"top_contributors":['
-        '{"path":"$.messages[3].content","chars":1151},{"path":"$.messages[5].content[0].content"'
-        ',"chars":1151},{"path":"$.messages[6].content","chars":1151},{"path":"$.messages[2].tool'
-        '_calls[0].function.arguments","chars":738},{"path":"$.messages[2].reasoning_content","ch'
-        'ars":702}],"retry_count":2,"messages_chars":7351,"tools_chars":0,"system_chars":73,"top_'
-        'level_chars":43,"tool_schema_too_large":false,"tool_payload_compaction_not_smaller":fals'
-        'e,"tail_compaction_not_smaller":false,"aggregate_tool_arguments_compacted":false,"tool_c'
-        'all_arguments_summarized":false}'
+    8500: (
+        '{"projection_adapter":"synthetic_adapter","execution_status_version":1,"status_proje'
+        'ction_mode":"native_or_none","estimated_chars":7613,"estimated_tokens":1903,"proof_b'
+        'udget":8500,"raw_proof_budget":8500,"effective_proof_budget":7650,"proof_headroom_ch'
+        'ars":850,"fits":true,"compact_needed":true,"compaction_tier":2,"compaction_protect_r'
+        'ecent_assistant":false,"recent_tail_too_large":false,"compaction_not_smaller":false,'
+        '"provider_window_mismatch":false,"fallback_reason":null,"top_contributors":[{"path":'
+        '"$.messages[3].content","chars":1151},{"path":"$.messages[5].content[0].content","ch'
+        'ars":1151},{"path":"$.messages[6].content","chars":1151},{"path":"$.messages[2].reas'
+        'oning_content","chars":913},{"path":"$.messages[2].tool_calls[0].function.arguments"'
+        ',"chars":738}],"retry_count":2,"messages_chars":7558,"tools_chars":0,"system_chars":'
+        '73,"top_level_chars":43,"tool_schema_too_large":false,"tool_payload_compaction_not_s'
+        'maller":false,"tail_compaction_not_smaller":false,"aggregate_tool_arguments_compacte'
+        'd":false,"tool_call_arguments_summarized":false}'
     ),
-    4900: (
-        '{"projection_adapter":"synthetic_adapter","execution_status_version":1,"status_projectio'
-        'n_mode":"native_or_none","estimated_chars":4386,"estimated_tokens":1096,"proof_budget":4'
-        '900,"raw_proof_budget":4900,"effective_proof_budget":4388,"proof_headroom_chars":512,"fi'
-        'ts":true,"compact_needed":true,"compaction_tier":3,"compaction_tiny_guard_chars":0,"comp'
-        'action_protect_recent_assistant":false,"recent_tail_too_large":false,"compaction_not_sma'
-        'ller":false,"provider_window_mismatch":false,"fallback_reason":null,"top_contributors":['
-        '{"path":"$.messages[4].content[1].input.note","chars":695},{"path":"$.messages[2].reason'
-        'ing_content","chars":392},{"path":"$.messages[2].tool_calls[0].function.arguments","char'
-        's":389},{"path":"$.messages[3].content","chars":388},{"path":"$.messages[6].content","ch'
-        'ars":388}],"retry_count":3,"messages_chars":4331,"tools_chars":0,"system_chars":73,"top_'
-        'level_chars":43,"tool_schema_too_large":false,"tool_payload_compaction_not_smaller":fals'
-        'e,"tail_compaction_not_smaller":false,"emergency_current_turn_compacted":true,"emergency'
-        '_compaction_not_smaller":false,"aggregate_tool_arguments_compacted":false,"tool_call_arg'
-        'uments_summarized":false}'
+    5500: (
+        '{"projection_adapter":"synthetic_adapter","execution_status_version":1,"status_proje'
+        'ction_mode":"native_or_none","estimated_chars":4903,"estimated_tokens":1225,"proof_b'
+        'udget":5500,"raw_proof_budget":5500,"effective_proof_budget":4950,"proof_headroom_ch'
+        'ars":550,"fits":true,"compact_needed":true,"compaction_tier":3,"compaction_protect_r'
+        'ecent_assistant":false,"recent_tail_too_large":false,"compaction_not_smaller":false,'
+        '"provider_window_mismatch":false,"fallback_reason":null,"top_contributors":[{"path":'
+        '"$.messages[2].reasoning_content","chars":913},{"path":"$.messages[4].content[1].inp'
+        'ut.note","chars":695},{"path":"$.messages[2].tool_calls[0].function.arguments","char'
+        's":389},{"path":"$.messages[3].content","chars":388},{"path":"$.messages[6].content"'
+        ',"chars":388}],"retry_count":3,"messages_chars":4848,"tools_chars":0,"system_chars":'
+        '73,"top_level_chars":43,"tool_schema_too_large":false,"tool_payload_compaction_not_s'
+        'maller":false,"tail_compaction_not_smaller":false,"emergency_current_turn_compacted"'
+        ':true,"emergency_compaction_not_smaller":false,"aggregate_tool_arguments_compacted":'
+        'false,"tool_call_arguments_summarized":false}'
     ),
-    2600: (
-        '{"projection_adapter":"synthetic_adapter","execution_status_version":1,"status_projectio'
-        'n_mode":"native_or_none","estimated_chars":2043,"estimated_tokens":510,"proof_budget":26'
-        '00,"raw_proof_budget":2600,"effective_proof_budget":2088,"proof_headroom_chars":512,"fit'
-        's":true,"compact_needed":true,"compaction_tier":4,"compaction_tiny_guard_chars":0,"compa'
-        'ction_protect_recent_assistant":false,"recent_tail_too_large":false,"compaction_not_smal'
-        'ler":false,"provider_window_mismatch":false,"fallback_reason":null,"top_contributors":[{'
-        '"path":"$.messages[4].content[1].input.note","chars":695},{"path":"$.messages[7].content'
-        '","chars":215},{"path":"$.messages[4].content[0].text","chars":67},{"path":"$.messages[5'
-        '].content[0].content","chars":65},{"path":"$.messages[2].reasoning_content","chars":62}]'
-        ',"retry_count":4,"messages_chars":1988,"tools_chars":0,"system_chars":73,"top_level_char'
-        's":43,"tool_schema_too_large":false,"tool_payload_compaction_not_smaller":false,"tail_co'
-        'mpaction_not_smaller":false,"emergency_current_turn_compacted":true,"emergency_compactio'
-        'n_not_smaller":false,"final_hard_cap_compacted":true,"final_hard_cap_not_smaller":false,'
-        '"aggregate_tool_arguments_compacted":false,"tool_call_arguments_summarized":false}'
+    3600: (
+        '{"projection_adapter":"synthetic_adapter","execution_status_version":1,"status_proje'
+        'ction_mode":"native_or_none","estimated_chars":2894,"estimated_tokens":723,"proof_bu'
+        'dget":3600,"raw_proof_budget":3600,"effective_proof_budget":3088,"proof_headroom_cha'
+        'rs":512,"fits":true,"compact_needed":true,"compaction_tier":4,"compaction_protect_re'
+        'cent_assistant":false,"recent_tail_too_large":false,"compaction_not_smaller":false,"'
+        'provider_window_mismatch":false,"fallback_reason":null,"top_contributors":[{"path":"'
+        '$.messages[2].reasoning_content","chars":913},{"path":"$.messages[4].content[1].inpu'
+        't.note","chars":695},{"path":"$.messages[7].content","chars":215},{"path":"$.message'
+        's[4].content[0].text","chars":67},{"path":"$.messages[5].content[0].content","chars"'
+        ':65}],"retry_count":4,"messages_chars":2839,"tools_chars":0,"system_chars":73,"top_l'
+        'evel_chars":43,"tool_schema_too_large":false,"tool_payload_compaction_not_smaller":f'
+        'alse,"tail_compaction_not_smaller":false,"emergency_current_turn_compacted":true,"em'
+        'ergency_compaction_not_smaller":false,"final_hard_cap_compacted":true,"final_hard_ca'
+        'p_not_smaller":false,"aggregate_tool_arguments_compacted":false,"tool_call_arguments'
+        '_summarized":false}'
     ),
 }
 _GOLDEN_RAISE_BUDGET = 400
 _GOLDEN_RAISE_PROOF_JSON = (
-    '{"projection_adapter":"synthetic_adapter","execution_status_version":1,"status_projectio'
-    'n_mode":"native_or_none","estimated_chars":4386,"estimated_tokens":1096,"proof_budget":4'
-    '00,"raw_proof_budget":400,"effective_proof_budget":300,"proof_headroom_chars":100,"fits"'
-    ':false,"compact_needed":true,"compaction_tier":4,"compaction_tiny_guard_chars":0,"compac'
-    'tion_protect_recent_assistant":false,"recent_tail_too_large":true,"compaction_not_smalle'
-    'r":false,"provider_window_mismatch":false,"fallback_reason":"provider_request_budget_exh'
-    'austed","top_contributors":[{"path":"$.messages[4].content[1].input.note","chars":695},{'
-    '"path":"$.messages[2].reasoning_content","chars":392},{"path":"$.messages[2].tool_calls['
-    '0].function.arguments","chars":389},{"path":"$.messages[3].content","chars":388},{"path"'
-    ':"$.messages[6].content","chars":388}],"retry_count":4,"messages_chars":4331,"tools_char'
-    's":0,"system_chars":73,"top_level_chars":43,"tool_schema_too_large":false,"tool_payload_'
-    'compaction_not_smaller":false,"tail_compaction_not_smaller":false,"emergency_current_tur'
-    'n_compacted":true,"emergency_compaction_not_smaller":false,"final_hard_cap_compacted":tr'
-    'ue,"final_hard_cap_not_smaller":false}'
+    '{"projection_adapter":"synthetic_adapter","execution_status_version":1,"status_proje'
+    'ction_mode":"native_or_none","estimated_chars":4903,"estimated_tokens":1225,"proof_b'
+    'udget":400,"raw_proof_budget":400,"effective_proof_budget":300,"proof_headroom_chars'
+    '":100,"fits":false,"compact_needed":true,"compaction_tier":4,"compaction_protect_rec'
+    'ent_assistant":false,"recent_tail_too_large":true,"compaction_not_smaller":false,"pr'
+    'ovider_window_mismatch":false,"fallback_reason":"provider_request_budget_exhausted",'
+    '"top_contributors":[{"path":"$.messages[2].reasoning_content","chars":913},{"path":"'
+    '$.messages[4].content[1].input.note","chars":695},{"path":"$.messages[2].tool_calls['
+    '0].function.arguments","chars":389},{"path":"$.messages[3].content","chars":388},{"p'
+    'ath":"$.messages[6].content","chars":388}],"retry_count":4,"messages_chars":4848,"to'
+    'ols_chars":0,"system_chars":73,"top_level_chars":43,"tool_schema_too_large":false,"t'
+    'ool_payload_compaction_not_smaller":false,"tail_compaction_not_smaller":false,"emerg'
+    'ency_current_turn_compacted":true,"emergency_compaction_not_smaller":false,"final_ha'
+    'rd_cap_compacted":true,"final_hard_cap_not_smaller":false}'
 )
 # --- end baseline goldens ---
 
@@ -874,60 +896,6 @@ def test_skip_projected_can_be_rolled_back() -> None:
     assert "[provider_request_compacted:" in compacted["messages"][0]["content"]
 
 
-def test_stub_preview_on_argument_string_stub(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv(STUB_PREVIEW_CHARS_ENV, "11")
-    value = "abcdefghijklmnopqrstuvwxyz" * 12
-    compacted = _compact_argument_string(value, preview=False)
-    head, marker, tail = compacted.split("\n\n")
-    assert head == value[:11]
-    assert tail == value[-11:]
-    assert marker.startswith("[provider_request_tool_input_compacted:")
-
-
-def test_stub_preview_on_tool_arguments_fallback_stub(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setenv(STUB_PREVIEW_CHARS_ENV, "11")
-    value = "plain text arguments that are not json " * 40
-    stub = json.loads(_compact_tool_arguments(value, preview=False))
-    assert stub["preview_head"] == value[:11]
-    assert stub["preview_tail"] == value[-11:]
-    assert stub["original_chars"] == len(value)
-
-
-def test_stub_preview_on_tool_input_stub_extends_head_and_tail(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    value = {f"key_{index:02d}": "v" * 400 for index in range(20)}
-    raw = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-    baseline = _compact_tool_input(value)
-    monkeypatch.setenv(STUB_PREVIEW_CHARS_ENV, "500")
-    stub = _compact_tool_input(value)
-    assert stub["_opensquilla_compacted_tool_input"] is True
-    assert stub["head"] == raw[:500]
-    assert stub["tail"] == raw[-500:]
-    assert "preview_head" not in stub
-    assert len(stub["head"]) > len(baseline["head"])
-
-
-def test_stub_preview_on_tool_input_stub_subsumed_by_builtin_previews(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    value = {f"key_{index:02d}": "v" * 40 for index in range(20)}
-    baseline = _compact_tool_input(value)
-    monkeypatch.setenv(STUB_PREVIEW_CHARS_ENV, "11")
-    assert _compact_tool_input(value) == baseline
-
-
-def test_stub_preview_on_final_cap_stub(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv(STUB_PREVIEW_CHARS_ENV, "11")
-    arguments = json.dumps({"command": "inspect the build artifacts carefully " * 20})
-    stub = json.loads(_compact_tool_arguments_for_final_cap(arguments))
-    assert stub["_invalid_provider_context_arguments"] is True
-    assert stub["preview_head"] == arguments[:11]
-    assert stub["preview_tail"] == arguments[-11:]
-
-
 def test_stub_preview_never_leaks_scrubbed_arguments(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -937,56 +905,24 @@ def test_stub_preview_never_leaks_scrubbed_arguments(
     assert stub == {"_invalid_provider_context_arguments": True}
 
 
-def test_stub_preview_off_values(monkeypatch: pytest.MonkeyPatch) -> None:
-    value = "abcdefghijklmnopqrstuvwxyz" * 12
-    expected = _compact_argument_string(value, preview=False)
-    for off_value in ("", "0", "garbage", "false"):
-        monkeypatch.setenv(STUB_PREVIEW_CHARS_ENV, off_value)
-        assert _compact_argument_string(value, preview=False) == expected
-        assert "preview_head" not in expected
-
-
-def test_oversized_stub_preview_skipped_on_argument_string_stub(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    value = "abcdefghijklmnopqrstuvwxyz" * 12
-    baseline = _compact_argument_string(value, preview=False)
-    monkeypatch.setenv(STUB_PREVIEW_CHARS_ENV, str(len(value)))
-    assert _compact_argument_string(value, preview=False) == baseline
-    monkeypatch.setenv(STUB_PREVIEW_CHARS_ENV, str(len(value) // 2))
-    assert _compact_argument_string(value, preview=False) == baseline
-
-
-def test_oversized_stub_preview_skipped_on_tool_arguments_fallback_stub(
-    monkeypatch: pytest.MonkeyPatch,
+@pytest.mark.parametrize("legacy_value", ["0", "11", "500", "5000", "invalid"])
+def test_retired_stub_preview_cannot_change_default_stub_payloads(
+    monkeypatch: pytest.MonkeyPatch, legacy_value: str
 ) -> None:
     value = "plain text arguments that are not json " * 40
-    baseline = _compact_tool_arguments(value, preview=False)
-    monkeypatch.setenv(STUB_PREVIEW_CHARS_ENV, "5000")
-    compacted = _compact_tool_arguments(value, preview=False)
-    assert compacted == baseline
-    assert "preview_head" not in json.loads(compacted)
-    assert len(compacted) < len(value)
-
-
-def test_oversized_stub_preview_skipped_on_tool_input_stub(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    value = {f"key_{index:02d}": "v" * 40 for index in range(20)}
-    baseline = _compact_tool_input(value)
-    monkeypatch.setenv(STUB_PREVIEW_CHARS_ENV, "5000")
-    stub = _compact_tool_input(value)
-    assert stub == baseline
-    assert "preview_head" not in stub
-
-
-def test_oversized_stub_preview_skipped_on_final_cap_stub(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    arguments = json.dumps({"command": "inspect the build artifacts carefully"})
-    monkeypatch.setenv(STUB_PREVIEW_CHARS_ENV, "5000")
-    stub = json.loads(_compact_tool_arguments_for_final_cap(arguments))
-    assert stub == {"_invalid_provider_context_arguments": True}
+    tool_input = {f"key_{index:02d}": "v" * 400 for index in range(20)}
+    sites = (
+        lambda: _compact_argument_string(value, preview=False),
+        lambda: _compact_tool_arguments(value, preview=False),
+        lambda: _compact_tool_arguments_for_final_cap(value),
+        lambda: _compact_tool_input(tool_input),
+    )
+    baseline = [site() for site in sites]
+    raw = json.dumps(tool_input, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    assert baseline[-1]["head"] == raw[:360]
+    assert baseline[-1]["tail"] == raw[-120:]
+    monkeypatch.setenv(STUB_PREVIEW_CHARS_ENV, legacy_value)
+    assert [site() for site in sites] == baseline
 
 
 def test_never_worse_keeps_tiny_argument_value(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1062,41 +998,6 @@ def test_protect_recent_results_explicit_off_values_roll_back(
         compacted = _compact_tool_payload_once(_tier1_entries_payload())
         for content in _entry_contents(compacted):
             assert "[provider_request_compacted:" in content
-
-
-def test_stub_preview_alone_never_grows_scrub_path_stub(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    # The tool_use-input scrub runs on every request before tier 0; previews
-    # must never grow a fitting payload (regression: duplicated head/tail).
-    monkeypatch.setenv(STUB_PREVIEW_CHARS_ENV, "330")
-    value = {f"k{index:02d}": "v" * 55 for index in range(11)}
-    baseline = _compact_tool_input(value)
-    stub = _compact_tool_input(value)
-    assert _payload_chars(stub) <= _payload_chars(value)
-    assert stub == baseline
-
-
-def test_stub_preview_alone_never_grows_any_stub_site(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    # Previews either leave the site's output identical to lever-off or
-    # produce a replacement strictly smaller than the original value.
-    text = "sample argument text under compaction pressure " * 90
-    sites = (
-        lambda value: _compact_argument_string(value, preview=False),
-        lambda value: _compact_tool_arguments(value, preview=False),
-        _compact_tool_arguments_for_final_cap,
-    )
-    for preview_chars in ("47", "330"):
-        for size in (95, 700, 705, 720, 1393, 4000):
-            value = text[:size]
-            for site in sites:
-                monkeypatch.delenv(STUB_PREVIEW_CHARS_ENV, raising=False)
-                off_output = site(value)
-                monkeypatch.setenv(STUB_PREVIEW_CHARS_ENV, preview_chars)
-                on_output = site(value)
-                assert on_output == off_output or len(on_output) < len(value)
 
 
 def test_protect_error_results_ignores_quoted_error_fragments(

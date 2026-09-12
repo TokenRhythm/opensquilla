@@ -68,11 +68,41 @@ OFFLINE_MARKER_EXCLUSIONS = {
     "tests/test_skills/test_meta_skill_creator_smoke_live.py",
 }
 RECENTLY_ADDED_ACTIVE_TESTS = {
+    # Artifact source/version regressions use the declared provisional floor.
+    "tests/test_engine/test_artifact_delivery_sources.py",
+    "tests/test_engine/test_runtime_artifact_context.py",
+    # New connection-stability suites use the declared 0.01s provisional floor
+    # until a comparable three-run Windows refresh supplies measured timings.
+    "tests/test_gateway/test_connection_stability_socket.py",
+    "tests/test_gateway/test_snapshot_transfer.py",
+    "tests/test_gateway/test_snapshot_transfer_rpc.py",
+    "tests/test_gateway/test_transport_diagnostics.py",
+    "tests/test_gateway/test_transport_flow.py",
+    "tests/test_gateway/test_websocket_connection_stability.py",
+    # Custom-provider request extensions use the provisional floor until the
+    # next comparable three-run Windows duration refresh.
+    "tests/test_gateway/test_custom_extra_body.py",
+    "tests/test_ci/test_windows_signed_update_audit.py",
+    # New replay files use the documented provisional floor until a Windows refresh.
+    "tests/functional/test_reasoning_replay_persistence_e2e.py",
+    "tests/test_engine/test_assistant_replay.py",
+    "tests/test_engine/test_assistant_replay_lifecycle.py",
+    "tests/test_engine/test_assistant_replay_tool_boundaries.py",
+    "tests/test_engine/test_reasoning_replay_compat.py",
+    "tests/test_live_reasoning_replay_e2e.py",
+    "tests/test_migrations/test_v042_assistant_replay.py",
+    "tests/test_provider_replay_state.py",
+    "tests/test_session/test_session_assistant_replay.py",
+    "tests/test_engine/test_attachment_replay_ownership.py",
+    "tests/test_engine/test_router_configured_image_policy.py",
+    "tests/test_provider/test_image_projection.py",
+    "tests/test_session/test_attachment_manifest.py",
     "tests/contracts/test_approval_center_contract.py",
     "tests/test_gateway/test_chat_history_characterization.py",
     "tests/contracts/test_conversation_events_contract.py",
     "tests/contracts/test_gateway_contract_runner.py",
     "tests/contracts/test_gateway_contract_toolchain_integration.py",
+    "tests/test_gateway/test_rpc_retired_surface.py",
     "tests/contracts/test_goals_contract.py",
     "tests/contracts/test_sandbox_runtime_contract.py",
     "tests/contracts/test_sessions_changed_contract.py",
@@ -90,7 +120,11 @@ RECENTLY_ADDED_ACTIVE_TESTS = {
     "tests/test_application/test_session_history.py",
     "tests/test_application/test_session_read.py",
     "tests/test_application/test_session_transcript.py",
-    "tests/test_artifact_session/test_html_anchors.py",
+    "tests/test_artifact_session/test_retirement.py",
+    "tests/test_artifact_session/test_working_files.py",
+    "tests/test_engine/test_agent_file_context.py",
+    "tests/test_gateway/test_desktop_browser.py",
+    "tests/test_live_tokenrhythm_budget.py",
     "tests/test_ci/test_plan_ci.py",
     "tests/test_git_runtime.py",
     "tests/test_tools/test_gitless_write_tracking.py",
@@ -245,19 +279,15 @@ RECENTLY_ADDED_ACTIVE_TESTS = {
     "tests/test_toolcomp_matcher_levers.py",
     "tests/test_toolcomp_matcher_safety.py",
     "tests/test_toolcomp_reducer_semantics.py",
-    "tests/test_engine/test_agent_patch_hygiene_block.py",
-    "tests/test_engine/test_agent_submit_review.py",
     "tests/test_engine/test_agent_verify_mirror_and_variant_challenge.py",
     "tests/test_engine/test_endgame_directive_and_cap_levers.py",
     "tests/test_engine/test_plan_run_reconciliation.py",
     "tests/test_engine/test_runtime_submit_surfacing.py",
-    "tests/test_engine/test_submit_review.py",
     "tests/test_engine/test_tool_surface_levers.py",
     "tests/test_engine/turn_runner/test_tool_surface_levers_bootstrap_unit.py",
     "tests/test_gateway/test_plan_rpc.py",
     "tests/test_gateway/test_user_input_broker.py",
     "tests/test_session/test_plan_storage.py",
-    "tests/test_tools/test_description_overrides.py",
     "tests/test_tools/test_edit_file_closest_hint.py",
     "tests/test_tools/test_patch_classification.py",
     "tests/test_tools/test_plan_access.py",
@@ -268,7 +298,6 @@ RECENTLY_ADDED_ACTIVE_TESTS = {
     "tests/test_tools/test_run_mode_full_host_fallback.py",
     "tests/test_tools/test_workspace_write_deny_effects.py",
     "tests/test_engine/test_goal_context_prompt.py",
-    "tests/test_engine/test_goal_routing_hint.py",
     "tests/test_gateway/test_goal_rpc.py",
     "tests/test_migrations/test_v033_goal_runs.py",
     "tests/test_migrations/test_v034_goal_message_anchor.py",
@@ -277,8 +306,6 @@ RECENTLY_ADDED_ACTIVE_TESTS = {
     "tests/test_contracts/test_ensemble_fallback_event_wire.py",
     "tests/test_contracts/test_turn_execution.py",
     "tests/test_engine/test_turn_control_terminal.py",
-    "tests/test_artifact_session/test_candidate_loop.py",
-    "tests/test_tools/test_document_browser_identity.py",
 }
 
 
@@ -410,6 +437,14 @@ def test_runner_saturated_subprocess_contracts_are_marked_ci_serial() -> None:
     assert "pytest.mark.ci_serial" in _function_decorators(
         Path("tests/test_live_long_task_case_driver.py"),
         "test_fault_429_case_proves_retry_after_was_not_violated",
+    )
+    assert "pytest.mark.ci_serial" in _function_decorators(
+        Path("tests/test_recovery/test_atomic_and_locking.py"),
+        "test_moved_legacy_lock_can_be_rebound_without_dropping_exclusion",
+    )
+    assert "pytest.mark.ci_serial" in _function_decorators(
+        Path("tests/test_recovery/test_transaction.py"),
+        "test_transaction_recovery_locks_parked_backup_before_restoring_target",
     )
 
 
@@ -775,6 +810,7 @@ def test_affinity_overflow_moves_only_environment_independent_tests() -> None:
     # These reviewed files need no shard-specific setup. Releasing them keeps
     # environment-dependent tests pinned while restoring an even critical path.
     assert moved == {
+        "tests/contracts/test_gateway_contract_parallel.py": "core",
         "tests/test_ci/test_migrations_packaged.py": "core",
         "tests/test_gateway/test_goal_rpc.py": "desktop-installer-contracts",
         "tests/test_gateway/test_project_workspace_execution.py": (

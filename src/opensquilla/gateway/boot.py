@@ -17,6 +17,8 @@ from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol, cast
 
+from opensquilla.engine.types import public_agent_event_payload
+
 if TYPE_CHECKING:
     from opensquilla.engine.usage import UsageTracker
     from opensquilla.memory.manager import MemoryManager
@@ -230,22 +232,6 @@ def _desktop_router_preload_enabled() -> bool:
     if override is not None:
         return override.strip().lower() in _ENABLED_VALUES
     return not _desktop_fast_start_enabled()
-
-
-def _make_auto_propose_tool_invoker(
-    registry: ToolRegistry,
-    *,
-    allowed_tools: frozenset[str] = _AUTO_PROPOSE_TOOL_ALLOWLIST,
-) -> Callable[[str, dict[str, Any]], Any]:
-    """Build the unattended auto-propose tool invoker through dispatch policy."""
-
-    from opensquilla.skills.meta.orchestrator import make_tool_invoker_from_handler
-    from opensquilla.tools.dispatch import build_tool_handler
-
-    ctx = _make_auto_propose_tool_context(allowed_tools=allowed_tools)
-    return make_tool_invoker_from_handler(
-        tool_handler=build_tool_handler(registry, ctx),
-    )
 
 
 def _make_auto_propose_tool_context(
@@ -1251,6 +1237,40 @@ def _task_runtime_envelope_host_execute(envelope: Any) -> bool:
     return _task_runtime_envelope_owner(envelope)
 
 
+def _task_runtime_wire_owner(run: Any) -> dict[str, Any]:
+    """Return the admitted owner using public session-event field names."""
+
+    payload: dict[str, Any] = {}
+    session_id = getattr(run, "session_id", None)
+    if isinstance(session_id, str) and session_id:
+        payload["session_id"] = session_id
+    session_epoch = getattr(run, "session_epoch", None)
+    if (
+        isinstance(session_epoch, int)
+        and not isinstance(session_epoch, bool)
+        and session_epoch >= 0
+    ):
+        payload["epoch"] = session_epoch
+    return payload
+
+
+def _validate_task_runtime_session_owner(run: Any, session: Any) -> None:
+    """Reject an admitted task whose session generation is no longer current."""
+
+    expected_session_id = getattr(run, "session_id", None)
+    expected_session_epoch = getattr(run, "session_epoch", None)
+    if (
+        expected_session_id is not None
+        and getattr(session, "session_id", None) != expected_session_id
+    ) or (
+        expected_session_epoch is not None
+        and getattr(session, "epoch", None) != expected_session_epoch
+    ):
+        from opensquilla.session.storage import StaleEpochError
+
+        raise StaleEpochError("Task session owner changed before provider dispatch")
+
+
 async def dispatch_task_runtime_turn(
     run: Any,
     *,
@@ -1283,6 +1303,7 @@ async def dispatch_task_runtime_turn(
         session = await storage.get_session(run.session_key)
         if session is None:
             raise KeyError(f"Session not found: {run.session_key}")
+        _validate_task_runtime_session_owner(run, session)
         try:
             run_context, _workspace_guard = await authoritative_project_run_context(
                 storage=storage,
@@ -1304,6 +1325,7 @@ async def dispatch_task_runtime_turn(
                     "code": mapped.code,
                     "details": mapped.details,
                     "task_id": getattr(run, "task_id", None),
+                    **_task_runtime_wire_owner(run),
                 },
             )
             raise
@@ -1350,6 +1372,8 @@ async def dispatch_task_runtime_turn(
         )
     ):
         session = await session_manager.get_session(run.session_key)
+        if session is not None:
+            _validate_task_runtime_session_owner(run, session)
     run_kwargs = build_task_runtime_run_kwargs(
         run,
         tool_context=tool_context,
@@ -1373,6 +1397,23 @@ async def dispatch_task_runtime_turn(
     try:
         with accepted_turn_config_scope(getattr(run, "accepted_config", None)):
             raw_stream = turn_runner.run(run.message, run.session_key, **run_kwargs)
+            adopter = run.envelope.runtime_services.get("generated_artifact_adopter")
+            from opensquilla.gateway.working_versions import with_working_versions
+
+            async def emit_working_version(payload: dict[str, Any]) -> None:
+                await event_emitter(run.session_key, "session.event.artifact_state", payload)
+
+            raw_stream = with_working_versions(
+                raw_stream,
+                config=config,
+                session_manager=session_manager,
+                session_key=run.session_key,
+                session_id=run.envelope.session_id or getattr(session, "session_id", None),
+                workspace=tool_context.workspace_dir,
+                actor_id=run.task_id,
+                event_emitter=getattr(adopter, "event_emitter", None) or emit_working_version,
+                preview_service=getattr(adopter, "preview_service", None),
+            )
             await _emit_task_runtime_stream_events(
                 raw_stream,
                 run.session_key,
@@ -1382,7 +1423,8 @@ async def dispatch_task_runtime_turn(
                 context_bound=is_context_bound_owner(turn_runner),
                 stream_event_sink=getattr(run, "stream_event_sink", None),
                 task_id=getattr(run, "task_id", None),
-                session_id=getattr(run.envelope, "session_id", None),
+                session_id=getattr(run, "session_id", None),
+                session_epoch=getattr(run, "session_epoch", None),
                 client_message_id=getattr(run.envelope, "metadata", {}).get("client_message_id"),
                 user_message_id=getattr(run, "persisted_user_message_id", None),
                 surface_id=getattr(run.envelope, "metadata", {}).get("surface_id"),
@@ -1552,6 +1594,17 @@ def build_task_runtime_run_kwargs(
         # Only forward when set so web/CLI legacy paths keep
         # ``TurnRunner.run`` falling back to ``message`` as semantic input.
         kwargs["semantic_message"] = run.semantic_message
+    expected_session_id = getattr(run, "session_id", None)
+    expected_session_epoch = getattr(run, "session_epoch", None)
+    if (
+        isinstance(expected_session_id, str)
+        and expected_session_id
+        and isinstance(expected_session_epoch, int)
+        and not isinstance(expected_session_epoch, bool)
+        and expected_session_epoch >= 0
+    ):
+        kwargs["expected_session_id"] = expected_session_id
+        kwargs["expected_session_epoch"] = expected_session_epoch
     provider_request_correlation = getattr(
         run,
         "provider_request_correlation",
@@ -1571,13 +1624,6 @@ def build_task_runtime_run_kwargs(
         # Internal-only callback: the finalizer supplies the exact assistant
         # row/content to TaskRuntime for durable channel delivery.
         kwargs["assistant_message_sink"] = assistant_message_sink
-    document_mutation_outcome_sink = getattr(
-        run,
-        "document_mutation_outcome_sink",
-        None,
-    )
-    if document_mutation_outcome_sink is not None:
-        kwargs["document_mutation_outcome_sink"] = document_mutation_outcome_sink
     return kwargs
 
 
@@ -1684,6 +1730,8 @@ def _make_task_session_lifecycle_listener(
                         if event.phase == "running"
                         else "task_terminal"
                     ),
+                    session_id=event.session_id,
+                    epoch=event.session_epoch,
                     changed_task=task_state,
                 ),
             )
@@ -1734,6 +1782,8 @@ def _make_task_session_lifecycle_listener(
             build_sessions_changed_payload(
                 event.session_key,
                 reason,
+                session_id=event.session_id,
+                epoch=event.session_epoch,
                 status=getattr(session_status, "value", session_status),
                 run_status=(
                     active_task["status"]
@@ -1791,6 +1841,7 @@ async def _emit_task_runtime_stream_events(
     stream_event_sink: Any = None,
     task_id: str | None = None,
     session_id: str | None = None,
+    session_epoch: int | None = None,
     client_message_id: str | None = None,
     user_message_id: str | None = None,
     surface_id: str | None = None,
@@ -1804,7 +1855,7 @@ async def _emit_task_runtime_stream_events(
     task's late ``tool_use_start`` / ``error`` / ``done`` events are
     indistinguishable from the current turn's and leak into it (issue #344).
     """
-    from dataclasses import asdict, is_dataclass
+    from dataclasses import is_dataclass
 
     from opensquilla.engine.stream_wrappers import wrap_stream
 
@@ -1828,7 +1879,7 @@ async def _emit_task_runtime_stream_events(
         context_bound=context_bound,
     ):
         if is_dataclass(event):
-            event_dict = asdict(event)
+            event_dict = public_agent_event_payload(event)
         else:
             event_dict = {
                 key: value
@@ -2021,6 +2072,12 @@ async def _emit_task_runtime_stream_events(
                 event_dict["turn_id"] = task_id
         if session_id:
             event_dict["session_id"] = session_id
+        if (
+            isinstance(session_epoch, int)
+            and not isinstance(session_epoch, bool)
+            and session_epoch >= 0
+        ):
+            event_dict["epoch"] = session_epoch
         if client_message_id:
             event_dict["client_message_id"] = client_message_id
         if primary_user_message_id is not None:
@@ -2682,57 +2739,6 @@ def build_flush_service(
     )
 
 
-def emit_skill_filter_banner(skills_cfg: Any) -> None:
-    """One-line startup warning when the ONNX embedding backend is
-    unreachable but a non-lexical filter strategy is configured.
-
-    Required runtime: ``onnxruntime`` + ``tokenizers`` +
-    the bundled v4 BGE ONNX dir (or a configured override). All three
-    ship via ``uv sync --extra recommended``. The previous non-ONNX
-    fallback was removed — there is now exactly one backend.
-
-    The banner fires only when filter_enabled=true, strategy ≠ lexical,
-    AND the ONNX path is incomplete. Uses stdlib :mod:`logging` so
-    operators see it on the standard ``WARNING`` logger and so tests
-    can assert on it via ``caplog``.
-    """
-    import importlib.util
-    import logging
-
-    log_std = logging.getLogger("opensquilla.gateway.boot")
-
-    if not getattr(skills_cfg, "filter_enabled", False):
-        return
-    if getattr(skills_cfg, "filter_strategy", "lexical") == "lexical":
-        return
-
-    onnx_ok = False
-    try:
-        if (
-            importlib.util.find_spec("onnxruntime") is not None
-            and importlib.util.find_spec("tokenizers") is not None
-        ):
-            from opensquilla.memory.embedding import LocalEmbeddingProvider
-
-            model_name = getattr(
-                skills_cfg, "filter_embedding_model", LocalEmbeddingProvider.DEFAULT_MODEL
-            )
-            onnx_ok = LocalEmbeddingProvider._bundled_onnx_dir(model_name) is not None
-    except ImportError:
-        onnx_ok = False
-
-    if onnx_ok:
-        return
-
-    log_std.warning(
-        "ONNX embedding backend not available; filter_strategy=%r will run "
-        "lexical-only. Install via `uv sync --extra recommended` to get "
-        "onnxruntime + tokenizers, and verify the bundled BGE ONNX dir "
-        "is present.",
-        getattr(skills_cfg, "filter_strategy", "lexical"),
-    )
-
-
 def _squilla_router_bundle_dir(router_cfg: Any) -> Path:
     configured = getattr(router_cfg, "v4_bundle_dir", None)
     if configured:
@@ -2915,13 +2921,13 @@ async def build_services(
     # subprocesses. This prevents a profile file from manufacturing bridge
     # authority and leaves only the fixed-method runtime client in memory.
     try:
-        from opensquilla.gateway.desktop_artifact_bridge import (
-            initialize_desktop_artifact_bridge_client,
+        from opensquilla.browser import (
+            initialize_desktop_browser,
         )
 
-        initialize_desktop_artifact_bridge_client()
+        initialize_desktop_browser()
     except ValueError:
-        log.warning("artifact.desktop_bridge_environment_rejected")
+        log.warning("browser.desktop_environment_rejected")
 
     # ── Load .env files (cwd/.env > ~/.opensquilla/.env, never override existing) ──
     from opensquilla.env import load_env
@@ -3103,7 +3109,7 @@ async def build_services(
             GatewayArtifactRecoveryPort,
         )
         from opensquilla.gateway.rpc import RpcContext
-        from opensquilla.gateway.rpc_workbench_resources import (
+        from opensquilla.gateway.workbench_resource_runtime import (
             resolve_recovery_import_source,
         )
         from opensquilla.paths import media_root_from_config
@@ -3131,26 +3137,7 @@ async def build_services(
             recovery_report = await artifact_recovery.reconcile()
         finally:
             await artifact_recovery_service.close()
-        recovery_summary = recovery_report.mutations
-        draft_recovery_summary = recovery_report.drafts
         resource_recovery_summary = recovery_report.resources
-        if recovery_summary.get("examined", 0):
-            log.info(
-                "build_services.artifact_mutations_reconciled",
-                examined=recovery_summary.get("examined", 0),
-                applied=recovery_summary.get("applied", 0),
-                failed=recovery_summary.get("failed", 0),
-                ambiguous=recovery_summary.get("ambiguous", 0),
-                deleted_candidates=recovery_summary.get("deleted_candidates", 0),
-            )
-        if draft_recovery_summary.get("examined", 0):
-            log.info(
-                "build_services.artifact_drafts_reconciled",
-                examined=draft_recovery_summary.get("examined", 0),
-                rejected=draft_recovery_summary.get("rejected", 0),
-                ambiguous=draft_recovery_summary.get("ambiguous", 0),
-                deleted_candidates=draft_recovery_summary.get("deleted_candidates", 0),
-            )
         if (
             resource_recovery_summary.get("imports_examined", 0)
             + resource_recovery_summary.get("publishes_examined", 0)
@@ -3234,6 +3221,7 @@ async def build_services(
                     base_url=resolved_base,
                     proxy=proxy,
                     provider_routing=llm_runtime.provider_routing,
+                    extra_body=llm_runtime.extra_body,
                 )
             )
         )
@@ -3647,6 +3635,7 @@ async def build_services(
             try:
                 mcp_cfg = MCPServerConfig(
                     name=entry.name,
+                    description=entry.description,
                     transport=entry.transport,
                     command=entry.command,
                     args=entry.args,
@@ -4172,9 +4161,6 @@ async def start_gateway_server(
     else:
         log.info("gateway.control_ui.disabled")
 
-    # Surface lexical degradation when the operator enabled filter_enabled=true
-    # with a strategy that needs the local ONNX embedding backend.
-    emit_skill_filter_banner(config.skills)
     startup_phase_started_at = _log_gateway_startup_phase(
         "config",
         startup_started_at=startup_started_at,
@@ -4276,7 +4262,7 @@ async def start_gateway_server(
     # HTTP server can observe a half-published batch. Recovery is deliberately
     # serial because every agent shares the same profile operation lock.
     try:
-        from opensquilla.gateway.rpc_memory_import import (
+        from opensquilla.gateway.profile_import_startup import (
             run_profile_import_startup_recovery,
         )
 
@@ -4336,7 +4322,7 @@ async def start_gateway_server(
     # refresh are best-effort and may continue after readiness.
     async def maintain_profile_imports() -> None:
         try:
-            from opensquilla.gateway.rpc_memory_import import (
+            from opensquilla.gateway.profile_import_startup import (
                 run_profile_import_startup_maintenance,
             )
 
@@ -4905,7 +4891,11 @@ async def start_gateway_server(
                 workspace_dir=workspace_str,
                 metadata=auto_metadata,
             )
-            tool_definitions = svc.tool_registry.to_tool_definitions(ctx)
+            authorized_tool_definitions = svc.tool_registry.to_tool_definitions(ctx)
+            tool_definitions = svc.tool_registry.to_model_tool_definitions(
+                authorized_tool_definitions,
+                ctx,
+            )
             auto_usage_context = _auto_propose_usage_execution_context(
                 agent_id,
                 usage_event_sink,
@@ -5317,20 +5307,14 @@ async def start_gateway_server(
 
     if run:
         preview_service = server_handle._preview_service
-        # The isolated preview listener is also required by the Electron
-        # candidate loop.  Desktop-owned profiles intentionally disable the
-        # Control UI during startup, but browser verification still needs a
-        # loopback resource origin for the opaque candidate handle.  The
-        # process-local bridge client is the authority for this exception;
-        # ordinary headless gateways do not open a listener merely because
-        # the preview service was registered.
+        # Native preview resources use the isolated listener owned by this Gateway.
         desktop_bridge_available = False
         try:
-            from opensquilla.gateway.desktop_artifact_bridge import (
-                get_desktop_artifact_bridge_client,
+            from opensquilla.browser import (
+                get_desktop_browser,
             )
 
-            desktop_bridge_available = get_desktop_artifact_bridge_client() is not None
+            desktop_bridge_available = get_desktop_browser() is not None
         except Exception:  # noqa: BLE001 - listener startup remains fail-closed
             desktop_bridge_available = False
         if preview_service is not None and (config.control_ui.enabled or desktop_bridge_available):
@@ -5397,6 +5381,13 @@ async def start_gateway_server(
 
         uvicorn_kwargs: dict[str, Any] = {
             "app": app,
+            # Keep the installed backend and wire limits deterministic in the
+            # packaged client. Native keepalive tolerates renderer suspension;
+            # the application probe owns interactive recovery decisions.
+            "ws": "websockets",
+            "ws_max_size": 26_214_400,
+            "ws_ping_interval": 20.0,
+            "ws_ping_timeout": 120.0,
             "host": config.host,
             "port": config.port,
             "log_level": "info" if not config.debug else "debug",

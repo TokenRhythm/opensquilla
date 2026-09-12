@@ -22,13 +22,6 @@ jobs:
           ref: ${{ github.event.repository.default_branch }}
           persist-credentials: false
 
-      - name: Check out bootstrap validator before first merge
-        if: ${{ github.event_name == 'pull_request' && hashFiles('.github/scripts/validate-pr-target-branch.sh') == '' }}
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ github.event.pull_request.head.sha }}
-          persist-credentials: false
-
       - name: Validate target branch
         env:
           PR_BASE_REF: ${{ github.event_name == 'merge_group' && github.event.merge_group.base_ref || github.event.pull_request.base.ref }}

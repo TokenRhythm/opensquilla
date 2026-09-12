@@ -1,4 +1,4 @@
-import type { RpcCallOptions } from '@/lib/rpc'
+import type { TransportCallOptions as RpcCallOptions } from './transportTypes'
 import { CHANNELS_STATUS_METHOD, type Result as ChannelsStatusResult } from '@/contracts/generated/v4/channelsStatus'
 import { validateResult as validateChannelsStatusResult } from '@/contracts/generated/v4/channelsStatusValidators.mjs'
 import { CHANNELS_GET_METHOD, type Params as ChannelsGetParams, type Result as ChannelsGetResult } from '@/contracts/generated/v4/channelsGet'

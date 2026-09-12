@@ -3,13 +3,57 @@
 from __future__ import annotations
 
 import re
-from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Any, Protocol
+from typing import NotRequired, Protocol, TypedDict
 
 _PROPOSAL_ID = re.compile(r"[0-9a-f]{8}")
 _SKILL_NAME = re.compile(r"[\w\-]+")
 _RISK_LEVELS = frozenset({"low", "medium", "high"})
+
+
+class ProposalSettingsResult(TypedDict):
+    available: bool
+    enabled: bool
+    on_dream_complete: bool
+    auto_enable: bool
+    auto_enable_max_risk: str
+    cron: str
+    window_days: int
+    min_freq: int
+    top_k: int
+
+
+class ProposalProjection(TypedDict):
+    proposal_id: str
+    name: NotRequired[str]
+    status: NotRequired[str]
+    risk: NotRequired[str]
+
+
+class ProposalListResult(TypedDict):
+    proposals: list[ProposalProjection]
+
+
+class ProposalOperationResult(TypedDict):
+    status: str
+    reason: NotRequired[str]
+    name: NotRequired[str]
+    proposal_id: NotRequired[str]
+
+
+class AutoEnabledSkillProjection(TypedDict):
+    name: str
+    proposal_id: NotRequired[str]
+
+
+class AutoEnabledSkillListResult(TypedDict):
+    skills: list[AutoEnabledSkillProjection]
+
+
+class ProposalSettingsUpdateResult(TypedDict):
+    status: str
+    reason: NotRequired[str]
+    settings: NotRequired[ProposalSettingsResult]
 
 
 @dataclass(frozen=True, slots=True)
@@ -27,7 +71,7 @@ class ProposalSettings:
         if self.auto_enable_max_risk not in _RISK_LEVELS:
             raise ValueError("auto_enable_max_risk must be one of low, medium, high")
 
-    def to_public_dict(self, *, available: bool) -> dict[str, Any]:
+    def to_public_dict(self, *, available: bool) -> ProposalSettingsResult:
         return {
             "available": available,
             "enabled": self.enabled,
@@ -79,19 +123,19 @@ class ProposalSettingsPatch:
 
 
 class SkillProposalStorePort(Protocol):
-    async def list_proposals(self) -> Mapping[str, Any]: ...
+    async def list_proposals(self) -> ProposalListResult: ...
 
-    async def show_proposal(self, proposal_id: str) -> Mapping[str, Any]: ...
+    async def show_proposal(self, proposal_id: str) -> ProposalOperationResult: ...
 
     async def accept_proposal(
         self, proposal_id: str, *, force: bool
-    ) -> Mapping[str, Any]: ...
+    ) -> ProposalOperationResult: ...
 
-    async def reject_proposal(self, proposal_id: str) -> Mapping[str, Any]: ...
+    async def reject_proposal(self, proposal_id: str) -> ProposalOperationResult: ...
 
-    async def list_auto_enabled(self) -> Mapping[str, Any]: ...
+    async def list_auto_enabled(self) -> AutoEnabledSkillListResult: ...
 
-    async def disable_auto_enabled(self, name: str) -> Mapping[str, Any]: ...
+    async def disable_auto_enabled(self, name: str) -> ProposalOperationResult: ...
 
     def invalidate_catalog(self) -> None: ...
 
@@ -117,15 +161,15 @@ class SkillProposalReview:
         self._proposals = proposals
         self._runtime = runtime
 
-    async def list_proposals(self) -> Mapping[str, Any]:
+    async def list_proposals(self) -> ProposalListResult:
         return await self._proposals.list_proposals()
 
-    async def show_proposal(self, proposal_id: str) -> Mapping[str, Any]:
+    async def show_proposal(self, proposal_id: str) -> ProposalOperationResult:
         return await self._proposals.show_proposal(self._proposal_id(proposal_id))
 
     async def accept_proposal(
         self, proposal_id: str, *, force: bool = False
-    ) -> Mapping[str, Any]:
+    ) -> ProposalOperationResult:
         result = await self._proposals.accept_proposal(
             self._proposal_id(proposal_id), force=force
         )
@@ -133,25 +177,27 @@ class SkillProposalReview:
             self._proposals.invalidate_catalog()
         return result
 
-    async def reject_proposal(self, proposal_id: str) -> Mapping[str, Any]:
+    async def reject_proposal(self, proposal_id: str) -> ProposalOperationResult:
         return await self._proposals.reject_proposal(self._proposal_id(proposal_id))
 
-    async def list_auto_enabled(self) -> Mapping[str, Any]:
+    async def list_auto_enabled(self) -> AutoEnabledSkillListResult:
         return await self._proposals.list_auto_enabled()
 
-    async def disable_auto_enabled(self, name: str) -> Mapping[str, Any]:
+    async def disable_auto_enabled(self, name: str) -> ProposalOperationResult:
         result = await self._proposals.disable_auto_enabled(self._skill_name(name))
         if result.get("status") == "ok":
             self._proposals.invalidate_catalog()
         return result
 
-    def settings(self) -> Mapping[str, Any]:
+    def settings(self) -> ProposalSettingsResult:
         current = self._runtime.snapshot()
         if current is None:
             return ProposalSettings().to_public_dict(available=False)
         return current.to_public_dict(available=True)
 
-    async def update_settings(self, patch: ProposalSettingsPatch) -> Mapping[str, Any]:
+    async def update_settings(
+        self, patch: ProposalSettingsPatch
+    ) -> ProposalSettingsUpdateResult:
         previous = self._runtime.snapshot()
         if previous is None:
             return {"status": "error", "reason": "auto_propose runtime not available"}

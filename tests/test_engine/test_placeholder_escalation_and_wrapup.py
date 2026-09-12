@@ -1,11 +1,4 @@
-"""Opt-in levers: placeholder-offense escalation + pre-deadline wrap-up.
-
-Covers OPENSQUILLA_PLACEHOLDER_ESCALATION_THRESHOLD and
-OPENSQUILLA_DEADLINE_WRAPUP_MARGIN_SECONDS (both off by default). Motivation:
-in long unattended runs, models can keep re-issuing tool calls that reference
-compacted placeholders despite delivered per-call feedback, and deadline-capped
-runs can be cut off mid-exploration with no wrap-up attempt.
-"""
+"""Opt-in pre-deadline wrap-up and its Provider recovery boundaries."""
 
 from __future__ import annotations
 
@@ -19,8 +12,6 @@ import pytest
 from opensquilla.engine import Agent, AgentConfig, ThinkingLevel, ToolResult
 from opensquilla.engine.agent import (
     _DEADLINE_WRAPUP_DIRECTIVE_TEMPLATE,
-    _INVALID_PROVIDER_CONTEXT_ARGUMENTS_KEY,
-    _PLACEHOLDER_ESCALATION_DIRECTIVE,
 )
 from opensquilla.provider import (
     ChatConfig,
@@ -71,18 +62,6 @@ class _SequenceProvider:
 
 class _NonRetrySafeSequenceProvider(_SequenceProvider):
     retry_failed_call_safe = False
-
-
-def _placeholder_tool_call(tool_use_id: str) -> list[Any]:
-    return [
-        ProviderToolUseStart(tool_use_id=tool_use_id, tool_name="echo"),
-        ProviderToolUseEnd(
-            tool_use_id=tool_use_id,
-            tool_name="echo",
-            arguments={_INVALID_PROVIDER_CONTEXT_ARGUMENTS_KEY: True},
-        ),
-        ProviderDone(stop_reason="tool_use", input_tokens=3, output_tokens=1),
-    ]
 
 
 def _echo_tool_call(tool_use_id: str) -> list[Any]:
@@ -139,60 +118,6 @@ def _user_texts(messages: list[Message]) -> list[str]:
         for message in messages
         if message.role == "user" and isinstance(message.content, str)
     ]
-
-
-@pytest.mark.asyncio
-async def test_placeholder_escalation_fires_at_threshold() -> None:
-    provider = _SequenceProvider(
-        [
-            _placeholder_tool_call("blocked-1"),
-            _placeholder_tool_call("blocked-2"),
-            _final_text(),
-        ]
-    )
-    agent = _echo_agent(
-        provider,
-        AgentConfig(
-            max_iterations=5,
-            placeholder_escalation_threshold=2,
-            retry_base_backoff_ms=0,
-            retry_max_backoff_ms=0,
-        ),
-    )
-
-    events = [event async for event in agent.run_turn("fix the bug")]
-
-    assert any(event.kind == "done" for event in events)
-    assert len(provider.calls) == 3
-    # Below threshold after offense 1: no escalation in call 2.
-    assert _PLACEHOLDER_ESCALATION_DIRECTIVE not in _user_texts(provider.calls[1]["messages"])
-    # At threshold after offense 2: escalation delivered in call 3.
-    assert _PLACEHOLDER_ESCALATION_DIRECTIVE in _user_texts(provider.calls[2]["messages"])
-
-
-@pytest.mark.asyncio
-async def test_placeholder_escalation_default_off() -> None:
-    provider = _SequenceProvider(
-        [
-            _placeholder_tool_call("blocked-1"),
-            _placeholder_tool_call("blocked-2"),
-            _final_text(),
-        ]
-    )
-    agent = _echo_agent(
-        provider,
-        AgentConfig(
-            max_iterations=5,
-            retry_base_backoff_ms=0,
-            retry_max_backoff_ms=0,
-        ),
-    )
-
-    events = [event async for event in agent.run_turn("fix the bug")]
-
-    assert any(event.kind == "done" for event in events)
-    for call in provider.calls:
-        assert _PLACEHOLDER_ESCALATION_DIRECTIVE not in _user_texts(call["messages"])
 
 
 @pytest.mark.asyncio
@@ -758,25 +683,20 @@ async def test_deadline_wrapup_preempt_records_no_tool_loop_event(tmp_path) -> N
     assert observer_events == []
 
 
-def test_env_plumbing_for_both_levers(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_env_plumbing_for_deadline_wrapup(monkeypatch: pytest.MonkeyPatch) -> None:
     # Helper-level check only; the full env -> bootstrap-stage -> AgentConfig
     # threading is covered in turn_runner/test_agent_bootstrap_stage_unit.py.
     from opensquilla.engine.turn_runner.agent_bootstrap_stage import (
         _nonnegative_int_from_env,
     )
 
-    monkeypatch.delenv("OPENSQUILLA_PLACEHOLDER_ESCALATION_THRESHOLD", raising=False)
     monkeypatch.delenv("OPENSQUILLA_DEADLINE_WRAPUP_MARGIN_SECONDS", raising=False)
-    assert _nonnegative_int_from_env("OPENSQUILLA_PLACEHOLDER_ESCALATION_THRESHOLD", 0) == 0
     assert _nonnegative_int_from_env("OPENSQUILLA_DEADLINE_WRAPUP_MARGIN_SECONDS", 0) == 0
-    monkeypatch.setenv("OPENSQUILLA_PLACEHOLDER_ESCALATION_THRESHOLD", "3")
     monkeypatch.setenv("OPENSQUILLA_DEADLINE_WRAPUP_MARGIN_SECONDS", "360")
-    assert _nonnegative_int_from_env("OPENSQUILLA_PLACEHOLDER_ESCALATION_THRESHOLD", 0) == 3
     assert _nonnegative_int_from_env("OPENSQUILLA_DEADLINE_WRAPUP_MARGIN_SECONDS", 0) == 360
 
 
-def test_agent_config_defaults_keep_both_levers_off() -> None:
+def test_agent_config_default_keeps_deadline_wrapup_off() -> None:
     config = AgentConfig()
 
-    assert config.placeholder_escalation_threshold == 0
     assert config.deadline_wrapup_margin_seconds == 0

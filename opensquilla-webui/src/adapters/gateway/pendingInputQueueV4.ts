@@ -1,9 +1,14 @@
-import type { RpcCallOptions } from '@/lib/rpc'
+import { normalizePageContext } from '@/types/pageContext'
+import {
+  readTransportFailure,
+} from './transportTypes'
+import type { TransportCallOptions as RpcCallOptions } from './transportTypes'
 import {
   type PendingInputCancelRequest,
   type PendingInputEnqueueRequest,
   type PendingInputEnqueueResult,
   type PendingInputQueuePort,
+  PendingInputQueueError,
   type PendingInputReorderRequest,
   type PendingInputReorderResult,
   type PendingInputServerAttachment,
@@ -68,14 +73,6 @@ function numberValue(value: unknown): number | undefined {
   return typeof value === 'number' && Number.isFinite(value) ? value : undefined
 }
 
-function stringListValue(value: unknown): string[] | undefined {
-  if (!Array.isArray(value)) return undefined
-  const values = value
-    .map(entry => String(entry ?? '').trim())
-    .filter(Boolean)
-  return values.length ? [...new Set(values)] : []
-}
-
 function projectServerAttachment(value: unknown): PendingInputServerAttachment | null {
   if (!isRecord(value)) return null
   const name = stringValue(value.name) || 'attachment'
@@ -102,9 +99,7 @@ function projectPendingInputItem(value: unknown): PendingInputServerItem | null 
         return projected ? [projected] : []
       })
     : undefined
-  const promptAnnotationIds = stringListValue(
-    firstValue(value, 'promptAnnotationIds', 'prompt_annotation_ids'),
-  )
+  const pageContext = normalizePageContext(firstValue(value, 'pageContext', 'page_context'))
   const message = typeof value.message === 'string' ? value.message : undefined
   const displayValue = firstValue(value, 'displayText', 'display_text')
   const displayText = typeof displayValue === 'string' ? displayValue : undefined
@@ -128,7 +123,7 @@ function projectPendingInputItem(value: unknown): PendingInputServerItem | null 
     ...(position !== undefined ? { position } : {}),
     ...(revision !== undefined ? { revision } : {}),
     ...(requestFingerprint !== undefined ? { requestFingerprint } : {}),
-    ...(promptAnnotationIds !== undefined ? { promptAnnotationIds } : {}),
+    ...(pageContext ? { pageContext } : {}),
     ...(intent !== undefined ? { intent } : {}),
     ...(value.confirmedPlainText === true ? { confirmedPlainText: true } : {}),
   }
@@ -160,7 +155,46 @@ function projectEnqueueResult(value: unknown): PendingInputEnqueueResult {
 }
 
 function invalidResponse(operation: string): Error {
-  return new Error(`Invalid pending ${operation} response`)
+  return new PendingInputQueueError('invalid', `Invalid pending ${operation} response`)
+}
+
+function mapPendingInputQueueError(error: unknown): PendingInputQueueError {
+  if (error instanceof PendingInputQueueError) return error
+  const failure = readTransportFailure(error)
+  const code = failure.code?.toUpperCase()
+  const kind = code === 'METHOD_NOT_FOUND' || code === 'UNSUPPORTED'
+    ? 'unsupported'
+    : code === 'PENDING_INPUT_CANCELLED'
+      ? 'cancelled'
+      : code === 'PENDING_INPUT_ALREADY_DISPATCHED'
+        ? 'already-dispatched'
+        : code === 'ATTACHMENT_EXPIRED'
+          ? 'attachment-expired'
+          : code === 'ATTACHMENT_LOST_IN_RESTART'
+            ? 'attachment-lost'
+            : failure.accepted === false
+              ? 'rejected'
+              : 'unavailable'
+  return new PendingInputQueueError(
+    kind,
+    failure.message,
+    failure.accepted ?? null,
+    failure.retryable === true,
+    failure.retryAfterMs ?? 0,
+    error,
+  )
+}
+
+async function requestPending<T>(
+  source: PendingInputRequestSource,
+  method: string,
+  params: Record<string, unknown>,
+): Promise<T> {
+  try {
+    return await source.request<T>(method, params)
+  } catch (error) {
+    throw mapPendingInputQueueError(error)
+  }
 }
 
 function createRawPendingInputQueuePort(
@@ -171,13 +205,13 @@ function createRawPendingInputQueuePort(
   return {
     supportsQueue: () => supports(methods.enqueue),
     supportsReorder: () => supports(methods.reorder),
-    enqueue: request => source.request(methods.enqueue, {
+    enqueue: request => requestPending(source, methods.enqueue, {
       ...request,
       attachments: [...request.attachments],
     }),
-    list: sessionKey => source.request(methods.list, { key: sessionKey }),
-    cancel: request => source.request(methods.cancel, { ...request }),
-    reorder: request => source.request(methods.reorder, {
+    list: sessionKey => requestPending(source, methods.list, { key: sessionKey }),
+    cancel: request => requestPending(source, methods.cancel, { ...request }),
+    reorder: request => requestPending(source, methods.reorder, {
       key: request.key,
       items: request.items.map(item => ({ ...item })),
     }),

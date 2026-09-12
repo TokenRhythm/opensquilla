@@ -6,7 +6,8 @@ import {
   nativeBillingDisplay,
   serializeNativeBilling,
 } from './nativeBilling'
-import type { UsageSnapshot, UsageTotals } from '@/types/usage'
+import type { UsageSnapshot } from '@/types/usage'
+import { usageSnapshot, usageTotals } from '@/testing/usage.test-helper'
 
 function receipt(
   currency: string,
@@ -147,7 +148,7 @@ function snapshot(overrides: {
   fxRatesNativePerUsd?: Record<string, string>
   cnyReceiptRates?: string[]
 }): UsageSnapshot {
-  const totals = {
+  const totals = usageTotals({
     nativeBilledByCurrency: overrides.cnyReceiptRates
       ? {
         CNY: {
@@ -159,13 +160,13 @@ function snapshot(overrides: {
         },
       }
       : {},
-  } as unknown as UsageTotals
-  return {
+  })
+  return usageSnapshot({
     totals,
     ...(overrides.fxRatesNativePerUsd
       ? { fxRatesNativePerUsd: overrides.fxRatesNativePerUsd }
       : {}),
-  } as UsageSnapshot
+  })
 }
 
 describe('effective CNY-per-USD rate', () => {

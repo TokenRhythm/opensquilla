@@ -63,10 +63,8 @@ const stalePlatformPatterns = [
   'desktop:rpc-connection',
 ]
 
-// live-turn fold fence: the append-only turn log and its pure reducer are an internal
-// live-turn detail. Keep their imports inside the chat composables (where the
-// legacy live refs live) plus ChatView, so the new path cannot leak into other
-// layers before it is ever authoritative.
+// Live-turn fold fence: the append-only turn log and its reducer are internal
+// chat details. Keep their imports inside chat composables plus ChatView.
 function isUnderChatComposables(rel) {
   const normalized = rel.split('\\').join('/')
   return normalized.startsWith('src/composables/chat/')
@@ -76,7 +74,6 @@ function isChatView(rel) {
 }
 const turnLogModulePatterns = [
   '@/composables/chat/useChatTurnLog',
-  '@/composables/chat/turnParity',
   '@/utils/chat/foldTurn',
 ]
 

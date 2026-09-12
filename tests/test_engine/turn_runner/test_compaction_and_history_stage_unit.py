@@ -129,9 +129,10 @@ def _make_input(
     history_has_persisted_user: bool = True,
     bound_user_message_id: str | None = None,
     context_window_tokens: int = 200_000,
-    restricted_turn: bool = False,
     skip_compaction: bool = False,
     transcript_snapshot: Any | None = None,
+    expected_session_id: str | None = None,
+    expected_session_epoch: int | None = None,
 ) -> CompactionAndHistoryStageInput:
     if agent is None:
         agent = _make_agent_stub(request_context_prompt=request_context_prompt)
@@ -144,8 +145,9 @@ def _make_input(
         session_key=session_key,
         agent_id=agent_id,
         history_has_persisted_user=history_has_persisted_user,
+        expected_session_id=expected_session_id,
+        expected_session_epoch=expected_session_epoch,
         bound_user_message_id=bound_user_message_id,
-        restricted_turn=restricted_turn,
         skip_compaction=skip_compaction,
         transcript_snapshot=transcript_snapshot,
     )
@@ -207,40 +209,21 @@ async def test_t3_not_applicable_falls_through_to_preflight() -> None:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("skip_compaction", [False, True])
-async def test_restricted_turn_skips_t3_preflight_and_durable_summary_replay(
-    skip_compaction: bool,
-) -> None:
-    hook = _RecordingCompactionHook()
-    stage, t3, preflight, history, prepender = _make_stage(
-        history=_RecordingHistoryLoader(
-            return_value="durable /private/workspace/tool-arguments"
-        ),
-        hooks=(hook,),
-    )
+async def test_admitted_owner_is_forwarded_to_compaction_and_history() -> None:
+    stage, t3, preflight, history, _ = _make_stage()
 
-    outcome = await stage.run(
+    await stage.run(
         _make_input(
-            request_context_prompt="ACTIVE ANNOTATIONS",
-            restricted_turn=True,
-            skip_compaction=skip_compaction,
+            expected_session_id="session-admitted",
+            expected_session_epoch=7,
         )
     )
 
-    assert outcome.output.t3_upgrade_status == "restricted_turn_skipped"
-    assert outcome.output.preflight_invoked is False
-    assert outcome.output.compaction_summary_context is None
-    assert outcome.output.final_request_context_prompt == "ACTIVE ANNOTATIONS"
-    assert t3.calls == []
-    assert preflight.calls == []
-    assert hook.events == []
-    assert len(history.calls) == 1
-    assert history.calls[0]["session_key"] == "agent:main:s1"
-    assert history.calls[0]["trim_last_user"] is True
-    assert history.calls[0]["restricted_turn"] is True
-    assert prepender.calls == [
-        {"existing": "ACTIVE ANNOTATIONS", "prepended": None}
-    ]
+    for call in (t3.calls[0], preflight.calls[0], history.calls[0]):
+        assert call["expected_session_id"] == "session-admitted"
+        assert call["expected_session_epoch"] == 7
+
+
 
 
 @pytest.mark.asyncio

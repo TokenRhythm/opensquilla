@@ -27,10 +27,6 @@ from opensquilla.provider import DoneEvent as ProviderDone
 from opensquilla.provider import TextDeltaEvent as ProviderText
 from opensquilla.provider import ToolUseEndEvent as ProviderToolUseEnd
 from opensquilla.provider import ToolUseStartEvent as ProviderToolUseStart
-from opensquilla.tools.mutation_receipts import (
-    fingerprint_path,
-    record_semantic_mutation_receipt,
-)
 from opensquilla.tools.types import ToolContext
 
 _RED_MARKER = "fail-run"
@@ -452,112 +448,6 @@ async def test_gate_suppressed_without_llm_call_budget_headroom(tmp_path) -> Non
     assert challenges[0]["injected_to_model"] is False
 
 
-@pytest.mark.asyncio
-async def test_gate_defers_to_post_write_convergence_finalization(tmp_path) -> None:
-    """When post-write convergence has already forced a tools-disabled
-    wrap-up, the gate must not challenge that wrap-up: it would contradict
-    the convergence instruction ("do not call tools") with its own ("re-run
-    the command"), and the model cannot satisfy both."""
-
-    source = _init_git_workspace(tmp_path)
-    tool_context = ToolContext(workspace_dir=str(tmp_path))
-    provider = _ScriptedProvider(
-        [
-            ("edit", "src.py"),
-            # Self-written repro stays red: the gate would normally hold the
-            # run open as red_repro_outstanding_after_final_edit.
-            ("edit", "/tmp/squilla-scratch/fail-run-repro.py"),
-            ("exec", "python /tmp/squilla-scratch/fail-run-repro.py"),
-            # Green focused verification: convergence-eligible from here on.
-            ("exec", "pytest tests/test_src.py"),
-            *[("read", "src.py")] * 6,
-        ]
-    )
-
-    async def _tool(call: Any) -> ToolResult:
-        if call.tool_name == "edit_file":
-            path = str(call.arguments.get("path") or "")
-            if path == "src.py":
-                before = fingerprint_path(source)
-                source.write_text("new\n", encoding="utf-8")
-                after = fingerprint_path(source)
-                record_semantic_mutation_receipt(
-                    tool_name="edit_file",
-                    path=source,
-                    operation="edit_file",
-                    before=before,
-                    after=after,
-                    partial=False,
-                    ctx=tool_context,
-                )
-            return ToolResult(
-                tool_use_id=call.tool_use_id,
-                tool_name=call.tool_name,
-                content="edited",
-            )
-        if call.tool_name == "read_file":
-            return ToolResult(
-                tool_use_id=call.tool_use_id,
-                tool_name=call.tool_name,
-                content=source.read_text(encoding="utf-8"),
-            )
-        if call.tool_name == "exec_command":
-            command = str(call.arguments.get("command") or "")
-            red = _RED_MARKER in command
-            return ToolResult(
-                tool_use_id=call.tool_use_id,
-                tool_name=call.tool_name,
-                content=(
-                    "exit_code=1\nFAILED: assertion did not hold"
-                    if red
-                    else "test result: ok. 4 passed; 0 failed\n"
-                ),
-                is_error=red,
-                execution_status={
-                    "version": 1,
-                    "status": "error" if red else "success",
-                    "exit_code": 1 if red else 0,
-                    "timed_out": False,
-                    "truncated": False,
-                    "reason": "nonzero_exit" if red else None,
-                    "source": "adapter",
-                    "preservation_class": "diagnostic" if red else "normal",
-                },
-            )
-        raise AssertionError(f"unexpected tool: {call.tool_name}")
-
-    agent = Agent(
-        provider=provider,
-        config=AgentConfig(
-            max_iterations=15,
-            flush_enabled=False,
-            progress_watchdog_mode="warn_model",
-            post_write_convergence_enabled=True,
-            finalize_evidence_gate_enabled=True,
-            tool_failure_loop_block_threshold=0,
-        ),
-        tool_handler=_tool,
-        tool_context=tool_context,
-    )
-
-    events = [event async for event in agent.run_turn("Fix the bug")]
-
-    # The convergence wrap-up finished the run in one final call.
-    assert agent.config.metadata["post_write_convergence_finalizations"] == 1
-    assert len(provider.calls) == 11
-    done_events = [event for event in events if isinstance(event, DoneEvent)]
-    assert done_events[-1].text == "final attempt 11"
-    # The gate never evaluated the wrap-up, despite the outstanding red repro.
-    assert _gate_warnings(events) == []
-    assert "finalize_evidence_gate_detections" not in agent.config.metadata
-    assert not any(
-        isinstance(message.content, str)
-        and message.content.startswith("[Finalize evidence check]")
-        for call in provider.calls
-        for message in call
-    )
-
-
 _DENIED_MARKER = "blocked-run"
 
 
@@ -618,120 +508,17 @@ async def test_gate_quiet_when_trailing_execution_was_denied(tmp_path) -> None:
     assert done_events[-1].text == "final attempt 4"
 
 
-# ---------------------------------------------------------------------------
-# Strict mode (OPENSQUILLA_FINALIZE_EVIDENCE_STRICT)
-# ---------------------------------------------------------------------------
-
-
 @pytest.mark.asyncio
-async def test_strict_gate_accepts_green_only_run(tmp_path) -> None:
-    """A green-only run (edit, suite passes, finalize) must sail through
-    strict mode unchallenged: red-first state is report-only because
-    never-red is a routine signature of legitimately solved runs."""
+async def test_retired_strict_flag_does_not_activate_tracker_without_base_gate(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def unexpected_tracker(*args: Any, **kwargs: Any) -> None:
+        raise AssertionError("retired strict configuration must not create an evidence tracker")
 
+    monkeypatch.setattr("opensquilla.engine.agent.FinalizeEvidenceTracker", unexpected_tracker)
+    monkeypatch.setenv("OPENSQUILLA_FINALIZE_EVIDENCE_STRICT", "on")
     _init_git_workspace(tmp_path)
-    runtime_events_path = tmp_path / "runtime_events.jsonl"
-    provider = _ScriptedProvider(
-        [
-            ("edit", "src.py"),
-            ("exec", "pytest tests/test_src.py"),
-            ("final",),
-        ]
-    )
-    tool_context = ToolContext(workspace_dir=str(tmp_path))
-    agent = Agent(
-        provider=provider,
-        config=_gate_config(
-            tmp_path,
-            finalize_evidence_strict=True,
-            runtime_events_path=str(runtime_events_path),
-        ),
-        tool_handler=_make_tool_handler(tmp_path, tool_context),
-        tool_context=tool_context,
-    )
-
-    events = [event async for event in agent.run_turn("Fix the bug")]
-
-    assert len(provider.calls) == 3
-    assert _gate_warnings(events) == []
-    assert "finalize_evidence_gate_detections" not in agent.config.metadata
-    done_events = [event for event in events if isinstance(event, DoneEvent)]
-    assert done_events[-1].text == "final attempt 3"
-
-    if runtime_events_path.exists():
-        logged = [
-            json.loads(line) for line in runtime_events_path.read_text().splitlines()
-        ]
-        assert not [
-            event
-            for event in logged
-            if event.get("name") == "finalize_evidence_gate.challenge"
-        ]
-
-
-@pytest.mark.asyncio
-async def test_strict_gate_zero_verification_challenge_never_blocks(tmp_path) -> None:
-    _init_git_workspace(tmp_path)
-    runtime_events_path = tmp_path / "runtime_events.jsonl"
-    provider = _ScriptedProvider(
-        [
-            ("edit", "src.py"),
-            ("final",),
-            # The model finalizes again without running anything: same
-            # observation key, so the gate stays quiet and the run finishes.
-            ("final",),
-        ]
-    )
-    tool_context = ToolContext(workspace_dir=str(tmp_path))
-    agent = Agent(
-        provider=provider,
-        config=_gate_config(
-            tmp_path,
-            finalize_evidence_strict=True,
-            runtime_events_path=str(runtime_events_path),
-        ),
-        tool_handler=_make_tool_handler(tmp_path, tool_context),
-        tool_context=tool_context,
-    )
-
-    events = [event async for event in agent.run_turn("Fix the bug")]
-
-    assert len(provider.calls) == 3
-    challenge_messages = [
-        message.content
-        for message in provider.calls[2]
-        if isinstance(message.content, str)
-        and message.content.startswith("[Finalize evidence check]")
-    ]
-    assert len(challenge_messages) == 1
-    assert "no execution-level command ran at any point" in challenge_messages[0]
-    assert len(_gate_warnings(events)) == 1
-    done_events = [event for event in events if isinstance(event, DoneEvent)]
-    assert done_events[-1].text == "final attempt 3"
-
-    logged = [
-        json.loads(line) for line in runtime_events_path.read_text().splitlines()
-    ]
-    challenges = [
-        event for event in logged if event.get("name") == "finalize_evidence_gate.challenge"
-    ]
-    assert [event["injected_to_model"] for event in challenges] == [True, False]
-    assert "zero_verification" in challenges[0]["details"]["triggers"]
-
-
-@pytest.mark.asyncio
-async def test_strict_flag_activates_tracker_without_base_gate(tmp_path) -> None:
-    # zero_verification is the only strict trigger; an edit-then-finalize run
-    # with no execution at all must draw the challenge even when the base
-    # gate flag is off.
-    _init_git_workspace(tmp_path)
-    provider = _ScriptedProvider(
-        [
-            ("edit", "src.py"),
-            ("final",),
-            ("final",),
-        ]
-    )
+    provider = _ScriptedProvider([("edit", "src.py"), ("final",)])
     tool_context = ToolContext(workspace_dir=str(tmp_path))
     agent = Agent(
         provider=provider,
@@ -742,11 +529,11 @@ async def test_strict_flag_activates_tracker_without_base_gate(tmp_path) -> None
 
     events = [event async for event in agent.run_turn("Fix the bug")]
 
-    assert len(provider.calls) == 3
-    assert len(_gate_warnings(events)) == 1
-    assert agent.config.metadata["finalize_evidence_gate_detections"] == 2
+    assert len(provider.calls) == 2
+    assert _gate_warnings(events) == []
+    assert "finalize_evidence_gate_detections" not in agent.config.metadata
     done_events = [event for event in events if isinstance(event, DoneEvent)]
-    assert done_events[-1].text == "final attempt 3"
+    assert done_events[-1].text == "final attempt 2"
 
 
 @pytest.mark.asyncio

@@ -3,7 +3,6 @@ from __future__ import annotations
 import base64
 import io
 import json
-from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -22,6 +21,8 @@ from opensquilla.provider.qwen_token_plan import (
     QWEN_TOKEN_PLAN_IMAGE_BASE_URL,
     QWEN_TOKEN_PLAN_OPENAI_BASE_URL,
 )
+from opensquilla.provider.types import ChatConfig, TextDeltaEvent
+from opensquilla.tools.types import ToolContext, current_tool_context
 
 
 def _test_png_bytes() -> bytes:
@@ -1692,7 +1693,7 @@ def test_image_analysis_tool_timeout_exceeds_provider_request_timeout() -> None:
 
 
 @pytest.mark.asyncio
-async def test_image_tool_uses_configured_router_vision_provider_for_local_file(
+async def test_image_tool_uses_active_deployment_instead_of_legacy_image_route(
     monkeypatch,
     tmp_path,
 ) -> None:
@@ -1735,28 +1736,35 @@ async def test_image_tool_uses_configured_router_vision_provider_for_local_file(
     captured: dict[str, object] = {}
 
     class FakeProvider:
+        provider_name = "openai"
+        model = "configured-active-vision"
+
         async def chat(self, *, messages, config=None):
             captured["messages"] = messages
-            yield SimpleNamespace(text="a generated image")
+            captured["model"] = self.model
+            yield TextDeltaEvent(text="a generated image")
 
     class FakeSelector:
         def __init__(self, selector_config):
-            captured["primary"] = selector_config.primary
-
-        def resolve(self):
-            return FakeProvider()
+            pytest.fail("image analysis must not create a separate model selector")
 
     monkeypatch.setattr("opensquilla.provider.selector.ModelSelector", FakeSelector)
-
+    active_provider = FakeProvider()
+    token = current_tool_context.set(ToolContext(
+        image_analysis_target=lambda: (
+            active_provider, ChatConfig(model_vision_support="supported"),
+        ),
+    ))
     try:
         result = await media.image(str(png_path), prompt="Describe this image")
     finally:
+        current_tool_context.reset(token)
         media.configure_image_generation(None)
 
     payload = json.loads(result)
     assert payload["description"] == "a generated image"
     assert payload["model"] == "provider"
-    assert captured["primary"].model == "moonshotai/kimi-k2.6"
+    assert captured["model"] == "configured-active-vision"
     messages = captured["messages"]
     assert isinstance(messages, list)
     message = messages[0]
@@ -1787,16 +1795,7 @@ async def test_vision_provider_sends_provider_native_multimodal_message(monkeypa
         async def chat(self, *, messages, config=None):
             captured["messages"] = messages
             captured["config"] = config
-            yield SimpleNamespace(text="described")
-
-    class FakeSelector:
-        def __init__(self, selector_config):
-            captured["primary"] = selector_config.primary
-
-        def resolve(self):
-            return FakeProvider()
-
-    monkeypatch.setattr("opensquilla.provider.selector.ModelSelector", FakeSelector)
+            yield TextDeltaEvent(text="described")
 
     root = ProviderRequestCorrelation(
         session_id="session-1",
@@ -1804,12 +1803,20 @@ async def test_vision_provider_sends_provider_native_multimodal_message(monkeypa
         execution_id="root-execution",
         call_kind="agent.chat",
     )
-    with bind_provider_request_correlation(root):
-        result = await media._call_vision_provider(
-            b64_data="aW1hZ2UtYnl0ZXM=",
-            media_type="image/png",
-            prompt="What is in this image?",
-        )
+    token = current_tool_context.set(ToolContext(
+        image_analysis_target=lambda: (
+            FakeProvider(), ChatConfig(model_vision_support="supported"),
+        ),
+    ))
+    try:
+        with bind_provider_request_correlation(root):
+            result = await media._call_vision_provider(
+                b64_data="aW1hZ2UtYnl0ZXM=",
+                media_type="image/png",
+                prompt="What is in this image?",
+            )
+    finally:
+        current_tool_context.reset(token)
 
     assert result == "described"
     correlation = captured["config"].provider_request_correlation
@@ -1843,21 +1850,20 @@ async def test_vision_provider_error_event_is_not_empty_success(monkeypatch) -> 
         async def chat(self, *, messages, config=None):
             yield ErrorEvent(message="Request timed out", code="timeout")
 
-    class FakeSelector:
-        def __init__(self, selector_config):
-            return None
-
-        def resolve(self):
-            return FakeProvider()
-
-    monkeypatch.setattr("opensquilla.provider.selector.ModelSelector", FakeSelector)
-
-    with pytest.raises(RuntimeError, match="Provider stream error.*timeout"):
-        await media._call_vision_provider(
-            b64_data="aW1hZ2UtYnl0ZXM=",
-            media_type="image/png",
-            prompt="What is in this image?",
-        )
+    token = current_tool_context.set(ToolContext(
+        image_analysis_target=lambda: (
+            FakeProvider(), ChatConfig(model_vision_support="supported"),
+        ),
+    ))
+    try:
+        with pytest.raises(RuntimeError, match="Provider stream error.*timeout"):
+            await media._call_vision_provider(
+                b64_data="aW1hZ2UtYnl0ZXM=",
+                media_type="image/png",
+                prompt="What is in this image?",
+            )
+    finally:
+        current_tool_context.reset(token)
 
 
 @pytest.mark.asyncio
@@ -1873,7 +1879,7 @@ async def test_text_media_llm_uses_provider_native_message(monkeypatch) -> None:
         async def chat(self, *, messages, config=None):
             captured["messages"] = messages
             captured["config"] = config
-            yield SimpleNamespace(text="analyzed")
+            yield TextDeltaEvent(text="analyzed")
 
     class FakeSelector:
         def __init__(self, selector_config):
@@ -1986,7 +1992,6 @@ def test_image_generation_capability_exposes_agent_tool_when_configured(monkeypa
     ctx = ToolContext(is_owner=True, caller_kind=CallerKind.WEB, agent_id="main")
     ctx = TurnRunner._apply_runtime_capability_denies(runner, ctx)
     tool_defs = runner._tool_registry.to_tool_definitions(ctx)
-    tool_defs = TurnRunner._filter_tool_defs_by_capability(runner, tool_defs)
     names = {tool.name for tool in tool_defs}
 
     assert "image_generate" in names
@@ -2014,7 +2019,6 @@ def test_image_generation_capability_does_not_expose_agent_tool_when_disabled(
     ctx = ToolContext(is_owner=True, caller_kind=CallerKind.WEB, agent_id="main")
     ctx = TurnRunner._apply_runtime_capability_denies(runner, ctx)
     tool_defs = runner._tool_registry.to_tool_definitions(ctx)
-    tool_defs = TurnRunner._filter_tool_defs_by_capability(runner, tool_defs)
     names = {tool.name for tool in tool_defs}
 
     assert "image_generate" not in names

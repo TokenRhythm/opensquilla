@@ -792,11 +792,11 @@ async def audio_config(
 
     from types import SimpleNamespace
 
-    from opensquilla.gateway.rpc_onboarding import apply_agent_audio_provider_configuration
+    from opensquilla.gateway.audio_configuration import configure_agent_audio_provider
 
     holder = SimpleNamespace(config=_gateway_config)
     try:
-        result = await apply_agent_audio_provider_configuration(
+        result = await configure_agent_audio_provider(
             holder,
             provider_id=provider,
             api_key=api_key,

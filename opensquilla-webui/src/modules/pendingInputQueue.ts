@@ -1,3 +1,4 @@
+import type { ChatPageContext } from '@/types/pageContext'
 import type { InjectionKey } from 'vue'
 import type { Attachment } from '@/types/chat'
 
@@ -12,7 +13,7 @@ export interface PendingInputServerItem {
   readonly position?: number
   readonly revision?: number
   readonly requestFingerprint?: string
-  readonly promptAnnotationIds?: readonly string[]
+  readonly pageContext?: ChatPageContext
   readonly intent?: string | null
   readonly confirmedPlainText?: boolean
 }
@@ -30,7 +31,7 @@ export interface PendingInputEnqueueRequest {
   clientMessageId?: string
   message: string
   attachments: readonly unknown[]
-  promptAnnotationIds?: readonly string[]
+  pageContext?: ChatPageContext
   confirmedPlainText?: boolean
   displayText?: string
   intent?: string | null
@@ -59,6 +60,31 @@ export interface PendingInputReorderRequest {
 
 export interface PendingInputReorderResult {
   items: PendingInputServerItem[]
+}
+
+export type PendingInputQueueErrorKind =
+  | 'unsupported'
+  | 'cancelled'
+  | 'already-dispatched'
+  | 'attachment-expired'
+  | 'attachment-lost'
+  | 'rejected'
+  | 'unavailable'
+  | 'invalid'
+
+/** Durable-queue failure projected by the Gateway Adapter. */
+export class PendingInputQueueError extends Error {
+  constructor(
+    readonly kind: PendingInputQueueErrorKind,
+    message: string,
+    readonly accepted: boolean | null = null,
+    readonly retryable = false,
+    readonly retryAfterMs = 0,
+    readonly cause?: unknown,
+  ) {
+    super(message)
+    this.name = 'PendingInputQueueError'
+  }
 }
 
 /**

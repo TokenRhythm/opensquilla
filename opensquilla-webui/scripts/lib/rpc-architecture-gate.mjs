@@ -3,7 +3,6 @@ import { readFileSync } from 'node:fs'
 import { join, relative, resolve } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 
-import { exactTransportDebtFailures } from './exact-transport-debt.mjs'
 import { walkFiles } from './fs-walk.mjs'
 import {
   collectHttpBoundaryOperations,
@@ -16,13 +15,13 @@ import {
   generatedContractImportViolation,
   moduleReferenceSpecifier,
   privateGatewayTransportImportViolation,
+  resolveSourceImport,
 } from './rpc-architecture-imports.mjs'
 import {
   collectRpcTransportOperations,
   TRACKED_RPC_MEMBERS,
 } from './rpc-symbol-provenance.mjs'
 import { createRpcAnalysisProgram } from './rpc-typescript-program.mjs'
-import { transportDebtLanes } from '../rpc-debt/index.mjs'
 
 const defaultRoot = fileURLToPath(new URL('../..', import.meta.url))
 const require = createRequire(import.meta.url)
@@ -35,8 +34,12 @@ const trackedKinds = new Set([...trackedRpcKinds, ...trackedHttpKinds])
 
 const normalized = path => path.replace(/\\/g, '/')
 const isTestFile = rel => /\.(test|spec)\.(?:[cm]?[jt]sx?)$/.test(rel)
+const isTestingSupport = rel => rel.startsWith('src/testing/')
 const isGatewayAdapter = rel => rel.startsWith('src/adapters/gateway/')
 const isGeneratedContract = rel => rel.startsWith('src/contracts/generated/')
+const isPrivateHttpTransportImplementation = rel => (
+  rel === 'src/adapters/gateway/privateHttpTransport.ts'
+)
 const isStaticAssetTransportImplementation = rel => rel === 'src/platform/staticAssets.ts'
 const isRawConversationWireName = value => (
   value.startsWith('session.event.') || /^task\.[a-z0-9_.-]+$/i.test(value)
@@ -45,12 +48,6 @@ const isRpcTransportImplementation = rel => (
   rel === 'src/stores/rpc.ts'
   || rel === 'src/lib/rpc.ts'
   || rel === 'src/adapters/gateway/privateTransports.ts'
-  // This adapter is the private wildcard listener for the v4 event stream;
-  // exposing its raw `on` calls to a composable would defeat the seam.
-  || rel === 'src/adapters/gateway/conversationEventTransport.ts'
-  // Compatibility bridge used by legacy/test embeddings; production callers
-  // receive the typed SessionConversation from the composition root.
-  || rel === 'src/adapters/gateway/sessionConversationV4.ts'
 )
 
 function scriptBody(rel, body) {
@@ -116,40 +113,12 @@ function hasEsmNamedValueExport(source, name) {
   return false
 }
 
-/** Evaluate RPC and HTTP migration debt from one source scan and one ledger. */
-export function evaluateRpcArchitectureGate({
-  root = defaultRoot,
-  debtLanes = transportDebtLanes,
-} = {}) {
+/** Evaluate forbidden RPC and HTTP operations outside their private boundaries. */
+export function evaluateRpcArchitectureGate({ root = defaultRoot } = {}) {
   const failures = []
-  const laneByFile = new Map()
-  const expectedByKind = new Map([...trackedKinds].map(kind => [kind, new Map()]))
-  for (const { lane, debt } of debtLanes) {
-    if (!lane || typeof lane !== 'string') {
-      failures.push('Transport debt lane has no stable name.')
-      continue
-    }
-    for (const [rel, record] of Object.entries(debt)) {
-      const previous = laneByFile.get(rel)
-      if (previous) {
-        failures.push(`${rel}: transport debt is owned by both ${previous} and ${lane}.`)
-        continue
-      }
-      laneByFile.set(rel, lane)
-      for (const [kind, count] of Object.entries(record)) {
-        if (!trackedKinds.has(kind)) {
-          failures.push(`${rel}: ${lane} contains unknown transport debt kind ${kind}.`)
-        } else if (!Number.isInteger(count) || count <= 0) {
-          failures.push(`${rel}: ${lane} ${kind} debt must be a positive integer.`)
-        } else {
-          expectedByKind.get(kind).set(rel, count)
-        }
-      }
-    }
-  }
 
   const sources = []
-  for (const file of walkFiles(join(root, 'src'), /\.(?:vue|[cm]?[jt]sx?)$/)) {
+  for (const file of walkFiles(join(root, 'src'), /\.(?:vue|[cm]?[jt]sx?)$/).sort()) {
     const rel = normalized(relative(root, file))
     sources.push({ rel, source: sourceFile(rel, readFileSync(file, 'utf8')) })
   }
@@ -158,6 +127,26 @@ export function evaluateRpcArchitectureGate({
     function visit(node) {
       const specifier = moduleReferenceSpecifier(ts, node)
       if (specifier) {
+        const target = resolveSourceImport(root, rel, specifier)
+        const targetRel = target ? normalized(relative(root, target)).replace(/\.(?:vue|[cm]?[jt]sx?)$/, '') : ''
+        if (
+          targetRel === 'src/lib/rpc'
+          && rel !== 'src/stores/rpc.ts'
+          && rel !== 'src/adapters/gateway/privateTransports.ts'
+          && !isTestFile(rel)
+          && !isTestingSupport(rel)
+        ) {
+          failures.push(`${rel}: lib/rpc may be imported only by the RPC store or private Gateway transport.`)
+        }
+        if (
+          targetRel.startsWith('src/adapters/gateway/')
+          && !isGatewayAdapter(rel)
+          && rel !== 'src/main.ts'
+          && !isTestFile(rel)
+          && !isTestingSupport(rel)
+        ) {
+          failures.push(`${rel}: Gateway Adapters may be imported only by the composition root or tests.`)
+        }
         const generatedFailure = generatedContractImportViolation({
           root, importer: rel, specifier,
         })
@@ -250,26 +239,17 @@ export function evaluateRpcArchitectureGate({
     analysis: sourceAnalysis,
   })) {
     if (
-      isGatewayAdapter(operation.rel)
-      || isRpcTransportImplementation(operation.rel)
+      isPrivateHttpTransportImplementation(operation.rel)
       || isStaticAssetTransportImplementation(operation.rel)
     ) continue
     increment(actualByKind.get(operation.kind), operation.rel)
   }
 
-  for (const kind of trackedKinds) {
-    failures.push(...exactTransportDebtFailures(
-      kind,
-      expectedByKind.get(kind),
-      actualByKind.get(kind),
-    ))
-  }
-
-  const debtByLane = new Map(debtLanes.map(({ lane }) => [lane, 0]))
-  for (const ledger of actualByKind.values()) {
-    for (const [rel, count] of ledger) {
-      const lane = laneByFile.get(rel)
-      if (lane) increment(debtByLane, lane, count)
+  for (const kind of [...trackedKinds].sort()) {
+    for (const [rel, count] of [...actualByKind.get(kind)].sort()) {
+      failures.push(
+        `${rel}: unexpected raw transport ${kind} (${count}); add a domain Adapter instead.`,
+      )
     }
   }
 
@@ -280,27 +260,24 @@ export function evaluateRpcArchitectureGate({
     .flatMap(kind => [...actualByKind.get(kind).values()])
     .reduce((sum, count) => sum + count, 0)
   return {
-    failures,
+    failures: [...new Set(failures)].sort(),
     total: rpcTotal + httpTotal,
     rpcTotal,
     httpTotal,
-    debtByLane,
   }
 }
 
 function runCli() {
-  const { failures, total, rpcTotal, httpTotal, debtByLane } = evaluateRpcArchitectureGate()
+  const { failures, rpcTotal, httpTotal } = evaluateRpcArchitectureGate()
   if (failures.length > 0) {
     console.error(failures.join('\n'))
     process.exitCode = 1
     return
   }
-  const laneSummary = [...debtByLane]
-    .map(([lane, count]) => `${lane}=${count}`)
-    .join(', ')
   console.log(
-    `Transport architecture guard passed (${total} exact debt operations; `
-    + `RPC=${rpcTotal}, HTTP=${httpTotal}; ${laneSummary}).`,
+    'Transport boundary guard passed '
+    + `(outside allowed boundaries: RPC=${rpcTotal}, HTTP=${httpTotal}; `
+    + 'raw HTTP is confined to the private transport and static assets).',
   )
 }
 

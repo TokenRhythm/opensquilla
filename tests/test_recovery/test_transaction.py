@@ -5,12 +5,17 @@ import multiprocessing
 import os
 import sys
 import uuid
+from multiprocessing.connection import Connection
 from pathlib import Path
 
 import pytest
 
 from opensquilla.recovery import inspect_profile
 from opensquilla.recovery.errors import RecoveryError, StaleRecoveryTransactionError
+from opensquilla.recovery.locking import (
+    acquire_gateway_legacy_lease,
+    release_gateway_legacy_lease,
+)
 from opensquilla.recovery.restore import _identity_payload
 from opensquilla.recovery.transaction import recover_profile_transaction
 
@@ -21,18 +26,49 @@ def _normalized_path(path: Path) -> str:
 
 def _contend_for_transaction_gateway(
     state_dir: str,
-    queue: multiprocessing.Queue,
+    result_connection: Connection,
 ) -> None:
-    from opensquilla.gateway.pidlock import GatewayPidLock
-
-    lock = GatewayPidLock(state_dir)
+    lease = None
     try:
-        lock.acquire()
-    except SystemExit:
-        queue.put("busy")
-    else:
-        queue.put("acquired")
-        lock.release()
+        lease = acquire_gateway_legacy_lease(state_dir)
+        result_connection.send("busy" if lease is None else "acquired")
+    finally:
+        try:
+            release_gateway_legacy_lease(lease)
+        finally:
+            result_connection.close()
+
+
+def _transaction_gateway_contention_result(state_dir: Path) -> str:
+    context = multiprocessing.get_context("spawn" if sys.platform == "win32" else "fork")
+    result_connection, child_connection = context.Pipe(duplex=False)
+    process = context.Process(
+        target=_contend_for_transaction_gateway,
+        args=(str(state_dir), child_connection),
+    )
+    result_timeout = 15 if sys.platform == "win32" else 10
+    started = False
+    try:
+        process.start()
+        started = True
+        child_connection.close()
+        assert result_connection.poll(result_timeout), (
+            "gateway contender did not report within "
+            f"{result_timeout}s (exitcode={process.exitcode})"
+        )
+        result = result_connection.recv()
+        process.join(timeout=5)
+    finally:
+        child_connection.close()
+        result_connection.close()
+        if started and process.is_alive():
+            process.terminate()
+            process.join(timeout=5)
+        if started and process.is_alive():
+            process.kill()
+            process.join(timeout=5)
+    assert process.exitcode == 0
+    return result
 
 
 def _profile(home: Path, marker: str) -> Path:
@@ -222,6 +258,7 @@ def test_import_recovery_is_idempotent_after_paths_were_already_rolled_back(
     assert (home / "workspace" / "SOUL.md").read_text(encoding="utf-8") == "original\n"
 
 
+@pytest.mark.ci_serial
 def test_transaction_recovery_locks_parked_backup_before_restoring_target(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -263,16 +300,7 @@ def test_transaction_recovery_locks_parked_backup_before_restoring_target(
     observations: list[str] = []
 
     def recover_while_old_gateway_contends(candidate_home: Path, journal: dict) -> None:
-        context = multiprocessing.get_context("spawn" if sys.platform == "win32" else "fork")
-        queue = context.Queue()
-        process = context.Process(
-            target=_contend_for_transaction_gateway,
-            args=(str(backup / "state"), queue),
-        )
-        process.start()
-        process.join(timeout=10)
-        assert process.exitcode == 0
-        observations.append(queue.get(timeout=1))
+        observations.append(_transaction_gateway_contention_result(backup / "state"))
         original_recover(candidate_home, journal)
 
     monkeypatch.setattr(

@@ -1,13 +1,8 @@
-"""Opt-in levers: final-diff salvage and endgame git freeze.
+"""Tests for opt-in final-diff salvage and its veto.
 
-Covers OPENSQUILLA_FINAL_DIFF_SALVAGE and
-OPENSQUILLA_ENDGAME_GIT_FREEZE_MARGIN_SECONDS (both off by default).
-Motivation: a run that reverts or loses its own source edits shortly before
-the deadline ends with an empty collected patch even though a working diff
-existed earlier — salvage re-applies the newest captured per-path diff
-candidate when the turn finishes with prior source writes but an empty
-worktree, and the freeze arms a ToolContext flag near the deadline so shell
-tools block workspace-reverting git commands outright.
+Salvage re-applies captured per-path source diffs when the turn finishes
+with prior source writes but an empty worktree. Retired endgame freeze
+fields remain accepted without activating a deadline-based Git guard.
 """
 
 from __future__ import annotations
@@ -19,6 +14,7 @@ import subprocess
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
+from unittest.mock import Mock
 
 import pytest
 
@@ -180,21 +176,36 @@ def _ctx(repo: Path, candidates: list[dict[str, Any]] | None = None) -> ToolCont
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("legacy_ledger", [False, True])
 async def test_final_diff_salvage_reapplies_lost_candidate_at_finalize(
     tmp_path: Path,
+    legacy_ledger: bool,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     repo, target = _init_repo(tmp_path)
     candidate = _candidate(repo, target, "value = 2\n", candidate_id="srcdiff-1")
     assert target.read_text(encoding="utf-8") == "value = 1\n"
     events_path = tmp_path / "events.jsonl"
+    ledger_path = repo / "legacy-ledger.json"
+    if legacy_ledger:
+        ledger_path.write_text('{"historical": true}\n', encoding="utf-8")
     agent = Agent(
         provider=_SequenceProvider([_final_text()]),
         config=AgentConfig(
             final_diff_salvage=True,
             runtime_events_path=str(events_path),
+            patch_evidence_ledger_path=str(ledger_path) if legacy_ledger else None,
         ),
         tool_context=_ctx(repo, [candidate]),
     )
+    turn_call_log = Mock(wraps=agent._write_turn_call_log)
+    monkeypatch.setattr(agent, "_write_turn_call_log", turn_call_log)
+
+    assert agent._workspace_diff_paths_for_final_diff_contract() == []
+    # Only final-diff contracts exclude diagnostic files. Keep the existing
+    # generic observer behavior rather than changing its path policy here.
+    observed_paths = [ledger_path.name] if legacy_ledger else []
+    assert agent._workspace_diff_paths_for_runtime_event() == observed_paths
 
     events = [event async for event in agent.run_turn("fix the bug")]
 
@@ -202,15 +213,25 @@ async def test_final_diff_salvage_reapplies_lost_candidate_at_finalize(
     assert target.read_text(encoding="utf-8") == "value = 2\n"
     assert candidate["restored"] is True
     assert _run_git(repo, "diff", "--name-only").split() == ["pkg.py"]
-    recorded = [
-        json.loads(line)
-        for line in events_path.read_text(encoding="utf-8").splitlines()
-        if '"final_diff_salvage' in line
-    ]
-    applied = [event for event in recorded if event["name"] == "final_diff_salvage.applied"]
-    assert len(applied) == 1
-    assert applied[0]["candidate_id"] == "srcdiff-1"
-    assert applied[0]["trigger"] == "finalize"
+    assert agent._workspace_diff_paths_for_final_diff_contract() == ["pkg.py"]
+    assert agent._workspace_diff_paths_for_runtime_event() == sorted(
+        ["pkg.py", *observed_paths]
+    )
+    if legacy_ledger:
+        assert ledger_path.read_text(encoding="utf-8") == '{"historical": true}\n'
+    recorded = [json.loads(line) for line in events_path.read_text().splitlines()]
+    assert not any(
+        event.get("name", "").startswith("final_diff_salvage.") for event in recorded
+    )
+    turn_call_log.assert_any_call(
+        "turn_policy_decision",
+        action="final_diff_salvage",
+        reason="finalize",
+        code="final_diff_salvage",
+        iteration=1,
+        candidate_ids=["srcdiff-1"],
+        paths=["pkg.py"],
+    )
 
 
 @pytest.mark.asyncio
@@ -446,14 +467,6 @@ async def test_final_diff_salvage_falls_back_when_apply_fails_after_check(
     assert target.read_text(encoding="utf-8") == "value = 2\n"
     assert newer["restored"] is False
     assert older["restored"] is True
-    recorded = [
-        json.loads(line)
-        for line in events_path.read_text(encoding="utf-8").splitlines()
-        if '"final_diff_salvage' in line
-    ]
-    names = [event["name"] for event in recorded]
-    assert "final_diff_salvage.apply_failed" in names
-    assert "final_diff_salvage.applied" in names
 
 
 @pytest.mark.asyncio
@@ -478,14 +491,6 @@ async def test_final_diff_salvage_stops_when_time_budget_exhausted(
     assert any(event.kind == "done" for event in events)
     assert target.read_text(encoding="utf-8") == "value = 1\n"
     assert candidate["restored"] is False
-    recorded = [
-        json.loads(line)
-        for line in events_path.read_text(encoding="utf-8").splitlines()
-        if '"final_diff_salvage' in line
-    ]
-    assert [event["name"] for event in recorded] == [
-        "final_diff_salvage.time_budget_exhausted"
-    ]
 
 
 def _unlost(candidate: dict[str, Any]) -> dict[str, Any]:
@@ -495,14 +500,6 @@ def _unlost(candidate: dict[str, Any]) -> dict[str, Any]:
     candidate["lost_reason"] = None
     candidate["lost_command"] = None
     return candidate
-
-
-def _salvage_events(events_path: Path) -> list[dict[str, Any]]:
-    return [
-        json.loads(line)
-        for line in events_path.read_text(encoding="utf-8").splitlines()
-        if '"final_diff_salvage' in line
-    ]
 
 
 @pytest.mark.asyncio
@@ -527,7 +524,6 @@ async def test_final_diff_salvage_veto_skips_lost_candidate(tmp_path: Path) -> N
     assert any(event.kind == "done" for event in events)
     assert target.read_text(encoding="utf-8") == "value = 1\n"
     assert candidate["restored"] is False
-    assert [event["action"] for event in _salvage_events(events_path)] == ["vetoed_lost"]
 
 
 @pytest.mark.asyncio
@@ -561,9 +557,6 @@ async def test_final_diff_salvage_veto_skips_instrumentation_only_candidate(
     assert any(event.kind == "done" for event in events)
     assert target.read_text(encoding="utf-8") == "value = 1\n"
     assert candidate["restored"] is False
-    assert [event["action"] for event in _salvage_events(events_path)] == [
-        "vetoed_instrumentation"
-    ]
 
 
 @pytest.mark.asyncio
@@ -592,10 +585,6 @@ async def test_final_diff_salvage_veto_falls_back_to_older_clean_candidate(
     assert target.read_text(encoding="utf-8") == "value = 2\n"
     assert newer["restored"] is False
     assert older["restored"] is True
-    assert [event["action"] for event in _salvage_events(events_path)] == [
-        "vetoed_lost",
-        "applied",
-    ]
 
 
 @pytest.mark.asyncio
@@ -620,15 +609,12 @@ async def test_final_diff_salvage_veto_still_applies_substantive_clean_candidate
 
 
 @pytest.mark.asyncio
-async def test_endgame_git_freeze_arms_instrumentation_exempt_flag() -> None:
-    # The exempt flag rides the freeze reset: with both levers on, the tools
-    # see the exemption as soon as the turn starts.
+async def test_retired_freeze_config_does_not_arm_tool_context() -> None:
     ctx = ToolContext(
         is_owner=True, caller_kind=CallerKind.CLI, session_key="agent:main:test"
     )
-    provider = _SequenceProvider([_final_text()])
     agent = _echo_agent(
-        provider,
+        _SequenceProvider([_final_text()]),
         AgentConfig(
             timeout=30.0,
             endgame_git_freeze_margin_seconds=60,
@@ -637,141 +623,23 @@ async def test_endgame_git_freeze_arms_instrumentation_exempt_flag() -> None:
         tool_context=ctx,
     )
 
-    events = [event async for event in agent.run_turn("fix the bug")]
+    events = [event async for event in agent.run_turn("Inspect the workspace")]
 
     assert any(event.kind == "done" for event in events)
-    assert ctx.endgame_git_freeze_instrumentation_exempt is True
-
-
-@pytest.mark.asyncio
-async def test_endgame_git_freeze_resets_stale_exempt_flag() -> None:
-    # Same lifetime rule as the freeze flag itself: the context outlives the
-    # turn, so a stale exemption must be cleared when the config says off.
-    ctx = ToolContext(
-        is_owner=True, caller_kind=CallerKind.CLI, session_key="agent:main:test"
-    )
-    ctx.endgame_git_freeze_instrumentation_exempt = True
-    provider = _SequenceProvider([_final_text()])
-    agent = _echo_agent(
-        provider,
-        AgentConfig(timeout=3600.0, endgame_git_freeze_margin_seconds=60),
-        tool_context=ctx,
-    )
-
-    events = [event async for event in agent.run_turn("fix the bug")]
-
-    assert any(event.kind == "done" for event in events)
+    assert ctx.endgame_git_freeze_active is False
     assert ctx.endgame_git_freeze_instrumentation_exempt is False
 
 
-@pytest.mark.asyncio
-async def test_endgame_git_freeze_arms_tool_context_flag() -> None:
-    ctx = ToolContext(
-        is_owner=True, caller_kind=CallerKind.CLI, session_key="agent:main:test"
-    )
-    provider = _SequenceProvider([_echo_tool_call("use-1"), _final_text()])
-    # margin > timeout: the freeze arms at the first loop-top check.
-    agent = _echo_agent(
-        provider,
-        AgentConfig(
-            timeout=30.0,
-            endgame_git_freeze_margin_seconds=60,
-            max_iterations=5,
-            retry_base_backoff_ms=0,
-            retry_max_backoff_ms=0,
-        ),
-        tool_context=ctx,
-    )
-
-    events = [event async for event in agent.run_turn("fix the bug")]
-
-    assert any(event.kind == "done" for event in events)
-    assert ctx.endgame_git_freeze_active is True
-
-
-@pytest.mark.asyncio
-async def test_endgame_git_freeze_not_armed_when_margin_not_reached() -> None:
-    ctx = ToolContext(
-        is_owner=True, caller_kind=CallerKind.CLI, session_key="agent:main:test"
-    )
-    provider = _SequenceProvider([_final_text()])
-    # Large timeout, small margin: the trigger stays far in the future.
-    agent = _echo_agent(
-        provider,
-        AgentConfig(timeout=3600.0, endgame_git_freeze_margin_seconds=60),
-        tool_context=ctx,
-    )
-
-    events = [event async for event in agent.run_turn("fix the bug")]
-
-    assert any(event.kind == "done" for event in events)
-    assert ctx.endgame_git_freeze_active is False
-
-
-@pytest.mark.asyncio
-async def test_endgame_git_freeze_default_off_never_touches_flag() -> None:
-    # Margin unset: the engine neither arms nor resets the flag, keeping
-    # unset behavior byte-identical even for a context someone pre-armed.
-    ctx = ToolContext(
-        is_owner=True, caller_kind=CallerKind.CLI, session_key="agent:main:test"
-    )
-    ctx.endgame_git_freeze_active = True
-    provider = _SequenceProvider([_final_text()])
-    agent = _echo_agent(provider, AgentConfig(timeout=30.0), tool_context=ctx)
-
-    events = [event async for event in agent.run_turn("fix the bug")]
-
-    assert any(event.kind == "done" for event in events)
-    assert ctx.endgame_git_freeze_active is True
-
-
-@pytest.mark.asyncio
-async def test_endgame_git_freeze_resets_stale_flag_at_turn_start() -> None:
-    # The ToolContext outlives the turn; with the lever on, a flag armed by a
-    # previous turn must not freeze a fresh turn that is far from its deadline.
-    ctx = ToolContext(
-        is_owner=True, caller_kind=CallerKind.CLI, session_key="agent:main:test"
-    )
-    ctx.endgame_git_freeze_active = True
-    provider = _SequenceProvider([_final_text()])
-    agent = _echo_agent(
-        provider,
-        AgentConfig(timeout=3600.0, endgame_git_freeze_margin_seconds=60),
-        tool_context=ctx,
-    )
-
-    events = [event async for event in agent.run_turn("fix the bug")]
-
-    assert any(event.kind == "done" for event in events)
-    assert ctx.endgame_git_freeze_active is False
-
-
-def test_env_plumbing_for_both_levers(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_env_plumbing_for_final_diff_salvage(monkeypatch: pytest.MonkeyPatch) -> None:
     # Helper-level check only; the full env -> bootstrap-stage -> AgentConfig
     # threading is covered in turn_runner/test_agent_bootstrap_stage_unit.py.
-    from opensquilla.engine.turn_runner.agent_bootstrap_stage import (
-        _bool_from_env,
-        _nonnegative_int_from_env,
-    )
+    from opensquilla.engine.turn_runner.agent_bootstrap_stage import _bool_from_env
 
     monkeypatch.delenv("OPENSQUILLA_FINAL_DIFF_SALVAGE", raising=False)
-    monkeypatch.delenv("OPENSQUILLA_ENDGAME_GIT_FREEZE_MARGIN_SECONDS", raising=False)
     assert _bool_from_env("OPENSQUILLA_FINAL_DIFF_SALVAGE", False) is False
-    assert (
-        _nonnegative_int_from_env("OPENSQUILLA_ENDGAME_GIT_FREEZE_MARGIN_SECONDS", 0)
-        == 0
-    )
     monkeypatch.setenv("OPENSQUILLA_FINAL_DIFF_SALVAGE", "1")
-    monkeypatch.setenv("OPENSQUILLA_ENDGAME_GIT_FREEZE_MARGIN_SECONDS", "300")
     assert _bool_from_env("OPENSQUILLA_FINAL_DIFF_SALVAGE", False) is True
-    assert (
-        _nonnegative_int_from_env("OPENSQUILLA_ENDGAME_GIT_FREEZE_MARGIN_SECONDS", 0)
-        == 300
-    )
 
 
-def test_agent_config_defaults_keep_both_levers_off() -> None:
-    config = AgentConfig()
-
-    assert config.final_diff_salvage is False
-    assert config.endgame_git_freeze_margin_seconds == 0
+def test_agent_config_defaults_keep_final_diff_salvage_off() -> None:
+    assert AgentConfig().final_diff_salvage is False

@@ -7,6 +7,7 @@ import { useToasts } from '@/composables/useToasts'
 import { usePlatform } from '@/platform'
 import {
   MIGRATION_OPERATIONS_KEY,
+  MigrationOperationsError,
   type GatewayMigrationCandidate,
   type GatewayMigrationPreview,
   type MigrationOperations,
@@ -506,7 +507,7 @@ async function refreshSources(): Promise<void> {
     if (hasDesktopMigrationBridge.value) await scanDesktopSources()
     else await scanGatewaySources()
   } catch (error) {
-    if ((error as { code?: unknown } | null)?.code === 'METHOD_NOT_FOUND') {
+    if (error instanceof MigrationOperationsError && error.kind === 'unsupported') {
       panelState.value = 'unsupported'
       return
     }
@@ -548,7 +549,7 @@ async function previewCandidate(candidate: MigrationCandidate): Promise<void> {
     else await previewGatewayCandidate(candidate)
     await focusHeading()
   } catch (error) {
-    if ((error as { code?: unknown } | null)?.code === 'METHOD_NOT_FOUND') {
+    if (error instanceof MigrationOperationsError && error.kind === 'unsupported') {
       panelState.value = 'unsupported'
       return
     }

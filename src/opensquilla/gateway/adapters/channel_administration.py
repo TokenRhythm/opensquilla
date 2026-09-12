@@ -2,8 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Awaitable, Callable, Mapping, Sequence
-from dataclasses import dataclass
+from collections.abc import Mapping
 from typing import Any, cast
 
 from opensquilla.application.channel_administration import (
@@ -12,118 +11,21 @@ from opensquilla.application.channel_administration import (
     ChannelAdministrationPort,
     ChannelPairingAdministration,
     ChannelPairingPort,
-    ChannelTarget,
     PairingQuery,
     PairingTarget,
     ProbeChannel,
     SetChannelAdmin,
 )
-from opensquilla.gateway.rpc import RpcContext
-
-type ChannelExecutor = Callable[
-    [dict[str, Any] | None, RpcContext], Awaitable[dict[str, Any]]
-]
-
-
-@dataclass(frozen=True, slots=True)
-class GatewayChannelAdministrationCallbacks:
-    status: ChannelExecutor
-    get: ChannelExecutor
-    probe: ChannelExecutor
-    restart: ChannelExecutor
-    logout: ChannelExecutor
-    pairings: ChannelExecutor
-    approve_pairing: ChannelExecutor
-    revoke_pairing: ChannelExecutor
-    set_admin: ChannelExecutor
-
-
-class GatewayChannelAdministrationRuntime(ChannelAdministrationPort):
-    def __init__(
-        self, context: RpcContext, callbacks: GatewayChannelAdministrationCallbacks
-    ) -> None:
-        self._context = context
-        self._callbacks = callbacks
-
-    async def status(self) -> Mapping[str, Any]:
-        return await self._callbacks.status(None, self._context)
-
-    async def get(self, target: ChannelTarget) -> Mapping[str, Any]:
-        return await self._callbacks.get({"name": target.name}, self._context)
-
-    async def probe(self, command: ProbeChannel) -> Mapping[str, Any]:
-        params = (
-            {"entry": dict(command.entry)}
-            if command.entry is not None
-            else {"name": command.name}
-        )
-        return await self._callbacks.probe(params, self._context)
-
-    async def restart(self, target: ChannelTarget) -> Mapping[str, Any]:
-        return await self._callbacks.restart({"name": target.name}, self._context)
-
-    async def logout(self, target: ChannelTarget) -> Mapping[str, Any]:
-        return await self._callbacks.logout({"name": target.name}, self._context)
-
-
-class GatewayChannelPairingRuntime(ChannelPairingPort):
-    def __init__(
-        self, context: RpcContext, callbacks: GatewayChannelAdministrationCallbacks
-    ) -> None:
-        self._context = context
-        self._callbacks = callbacks
-
-    @staticmethod
-    def _target(target: PairingTarget) -> dict[str, Any]:
-        return {
-            "channelName": target.channel_name,
-            **({"pairingId": target.pairing_id} if target.pairing_id else {}),
-            **({"pairingCode": target.pairing_code} if target.pairing_code else {}),
-        }
-
-    async def list(self, query: PairingQuery) -> Sequence[Mapping[str, Any]]:
-        result = await self._callbacks.pairings(
-            {
-                "channelName": query.channel_name,
-                **({"status": query.status} if query.status else {}),
-                **({"limit": query.limit} if query.limit is not None else {}),
-                "offset": query.offset,
-            },
-            self._context,
-        )
-        pairings = result.get("pairings")
-        return pairings if isinstance(pairings, list) else ()
-
-    async def approve(self, command: ApprovePairing) -> Mapping[str, Any]:
-        return await self._callbacks.approve_pairing(
-            {**self._target(command.target), **({"asAdmin": True} if command.as_admin else {})},
-            self._context,
-        )
-
-    async def revoke(self, target: PairingTarget) -> Mapping[str, Any]:
-        return await self._callbacks.revoke_pairing(self._target(target), self._context)
-
-    async def set_admin(self, command: SetChannelAdmin) -> Mapping[str, Any]:
-        return await self._callbacks.set_admin(
-            {
-                "channelName": command.channel_name,
-                "senderId": command.sender_id,
-                "admin": command.admin,
-            },
-            self._context,
-        )
 
 
 class GatewayChannelAdministrationAdapter:
     def __init__(
-        self, context: RpcContext, callbacks: GatewayChannelAdministrationCallbacks
+        self,
+        administration: ChannelAdministrationPort,
+        pairings: ChannelPairingPort,
     ) -> None:
-        self._administration = ChannelAdministration(
-            GatewayChannelAdministrationRuntime(context, callbacks)
-        )
-        self._pairings = ChannelPairingAdministration(
-            GatewayChannelPairingRuntime(context, callbacks)
-        )
+        self._administration = ChannelAdministration(administration)
+        self._pairings = ChannelPairingAdministration(pairings)
 
     async def status(self, _params: dict[str, Any] | None) -> dict[str, Any]:
         return dict(await self._administration.status())
@@ -200,7 +102,4 @@ class GatewayChannelAdministrationAdapter:
 
 __all__ = [
     "GatewayChannelAdministrationAdapter",
-    "GatewayChannelAdministrationCallbacks",
-    "GatewayChannelAdministrationRuntime",
-    "GatewayChannelPairingRuntime",
 ]

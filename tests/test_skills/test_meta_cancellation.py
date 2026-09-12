@@ -2,7 +2,7 @@
 
 These tests pin down the "user pressed Abort halfway through a long DAG"
 contract. They use a sub-Agent stub that simulates a long-running step
-(via ``asyncio.sleep``) so we can cancel mid-flight and observe the
+(via an event barrier) so we can cancel mid-flight and observe the
 cleanup path.
 
 Invariants asserted:
@@ -90,15 +90,19 @@ async def test_orchestrator_cancelled_mid_step_cleans_up_running_tasks() -> None
     assert plan is not None
     loader = _FakeLoader([_make_skill_spec("summarize")])
 
-    # Track which runners started + which got cancelled mid-sleep.
+    # Cancel only after both workers have entered the operation under test.
     started: list[str] = []
     cancelled: list[str] = []
+    all_started = asyncio.Event()
+    release = asyncio.Event()
 
     async def slow_runner(system_prompt: str, user_message: str) -> AsyncIterator[AgentEvent]:
         token = user_message[:30]
         started.append(token)
+        if len(started) == 2:
+            all_started.set()
         try:
-            await asyncio.sleep(5.0)  # plenty of room for the outer cancel
+            await release.wait()
             yield TextDeltaEvent(text="never reached")
             yield DoneEvent(text="")
         except asyncio.CancelledError:
@@ -114,14 +118,17 @@ async def test_orchestrator_cancelled_mid_step_cleans_up_running_tasks() -> None
             pass  # consume everything
 
     task = asyncio.create_task(consume())
-    # Wait long enough for both sub-Agent stubs to enter their sleeps.
-    await asyncio.sleep(0.2)
-    assert len(started) == 2, f"expected both steps to start, got {started!r}"
-
-    # User pressed Abort.
-    task.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await task
+    try:
+        await asyncio.wait_for(all_started.wait(), timeout=5.0)
+        assert len(started) == 2, f"expected both steps to start, got {started!r}"
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, timeout=5.0)
+    finally:
+        release.set()
+        if not task.done():
+            task.cancel()
+        await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), timeout=5.0)
 
     # All in-flight runners must have observed the cancellation. Otherwise
     # the scheduler is leaking tasks that keep running after the user
@@ -150,13 +157,13 @@ async def test_orchestrator_cancelled_writes_cancelled_status_to_db(tmp_path) ->
         plan = parse_meta_plan(spec)
         assert plan is not None
         loader = _FakeLoader([_make_skill_spec("summarize")])
+        started = asyncio.Event()
+        release = asyncio.Event()
 
         async def slow_runner(_s: str, _u: str) -> AsyncIterator[AgentEvent]:
-            try:
-                await asyncio.sleep(5.0)
-                yield TextDeltaEvent(text="never")
-            except asyncio.CancelledError:
-                raise
+            started.set()
+            await release.wait()
+            yield TextDeltaEvent(text="never")
 
         orch = MetaOrchestrator(
             agent_runner=slow_runner,
@@ -172,10 +179,16 @@ async def test_orchestrator_cancelled_writes_cancelled_status_to_db(tmp_path) ->
                 pass
 
         task = asyncio.create_task(consume())
-        await asyncio.sleep(0.2)
-        task.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await task
+        try:
+            await asyncio.wait_for(started.wait(), timeout=5.0)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(task, timeout=5.0)
+        finally:
+            release.set()
+            if not task.done():
+                task.cancel()
+            await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), timeout=5.0)
 
         # Inspect the DB: the run should be marked cancelled, not still running.
         runs = writer.list_runs(name="meta-cancellation-test", limit=5)
@@ -206,9 +219,12 @@ async def test_orchestrator_cancellation_yields_no_partial_meta_result() -> None
     plan = parse_meta_plan(spec)
     assert plan is not None
     loader = _FakeLoader([_make_skill_spec("summarize")])
+    started = asyncio.Event()
+    release = asyncio.Event()
 
     async def slow_runner(_s: str, _u: str) -> AsyncIterator[AgentEvent]:
-        await asyncio.sleep(5.0)
+        started.set()
+        await release.wait()
         yield TextDeltaEvent(text="never")
 
     orch = MetaOrchestrator(agent_runner=slow_runner, skill_loader=loader)
@@ -222,10 +238,16 @@ async def test_orchestrator_cancellation_yields_no_partial_meta_result() -> None
             items.append(item)
 
     task = asyncio.create_task(consume())
-    await asyncio.sleep(0.2)
-    task.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await task
+    try:
+        await asyncio.wait_for(started.wait(), timeout=5.0)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, timeout=5.0)
+    finally:
+        release.set()
+        if not task.done():
+            task.cancel()
+        await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), timeout=5.0)
 
     assert not any(isinstance(it, MetaResult) for it in items), (
         f"no MetaResult should reach the consumer on cancel; items={items!r}"

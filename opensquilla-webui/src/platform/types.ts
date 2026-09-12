@@ -54,6 +54,8 @@ export type DesktopUpdateErrorCode =
   | 'manifest_invalid'
   | 'checksum_unavailable'
   | 'integrity_failed'
+  | 'signature_invalid'
+  | 'signature_unavailable'
   | 'download_failed'
   | 'install_failed'
 
@@ -68,6 +70,8 @@ export interface DesktopUpdateState {
   snoozedUntil: string | null
   canCheck: boolean
   canNativeInstall: boolean
+  /** Explicit shell permission to launch installation; older manual shells omit it. */
+  canInstall?: boolean
   installMode: DesktopUpdateInstallMode
   releaseUrl: string | null
   source: DesktopUpdateSource | null
@@ -137,7 +141,6 @@ export interface PlatformCapabilities {
   canManageLocalApiKeys: boolean
   canRevealGatewayLog: boolean
   canRestartGateway: boolean
-  hasDesktopOnboarding: boolean
   hasWebConfig: boolean
   /**
    * The operator likely has a terminal where `opensquilla` resolves (web
@@ -274,35 +277,31 @@ export interface NativeArtifactAnnotationOverlayCloseRequest {
   rearm?: true
 }
 
-export interface NativeArtifactScreenshotRequest {
-  version: 3 | 4
+export interface NativeWorkbenchBrowserTarget {
+  targetRef: string
+  surfaceId: string
+  url: string
+  title: string
+  resourceId?: string
+  sessionKey: string
 }
 
-export interface NativeArtifactScreenshotValue {
-  mime: 'image/png'
-  data: Uint8Array
+export interface NativeWorkbenchScreenshot {
+  targetRef: string
+  mimeType: 'image/png'
+  dataBase64: string
   width: number
   height: number
 }
 
-export type NativeArtifactScreenshotResult = {
-  ok: true
-  method: 'screenshot'
-  value: NativeArtifactScreenshotValue
-} | {
-  ok: false
-  method: 'screenshot'
-  code: string
-  message: string
-}
-
 export interface NativeArtifactAnnotationSelection {
   selectionId: string
+  targetRef: string
+  resourceId?: string
   tagName: string
   elementPath: string
-  elementProofSha256: string
-  /** Compatibility diagnostic emitted by current Desktop shells. */
-  domSha256?: string
+  selectionText?: string
+  locatorHint?: string
   rect: { x: number; y: number; width: number; height: number }
 }
 
@@ -336,12 +335,12 @@ export type NativeWorkbenchSurfaceEventType =
   | 'error'
   | 'crashed'
   | 'escape'
+  | 'browser-opened'
   | 'annotation-selected'
   | 'annotation-draft-change'
   | 'annotation-submit'
   | 'annotation-cancel'
   | 'annotation-overlay-fallback'
-  | 'agent-edit-released'
 
 export interface NativeWorkbenchSurfaceEvent {
   version: NativeWorkbenchProtocolVersion
@@ -363,6 +362,8 @@ export interface NativeWorkbenchSurfaceEvent {
     path?: string
     reason?: string
     annotationId?: string
+    sessionKey?: string
+    targetRef?: string
     selection?: NativeArtifactAnnotationSelection
     body?: string
   }
@@ -420,9 +421,13 @@ export interface NativeWorkbenchApi {
   closeArtifactAnnotationOverlay?(
     request: NativeArtifactAnnotationOverlayCloseRequest,
   ): Promise<NativeWorkbenchSurfaceResult>
-  screenshot?(
-    request: NativeArtifactScreenshotRequest,
-  ): Promise<NativeArtifactScreenshotResult>
+  getWorkbenchBrowserTarget?(request: { surfaceId: string }): Promise<NativeWorkbenchBrowserTarget>
+  focusWorkbenchAnnotation?(request: {
+    surfaceId: string; targetRef: string; locatorHint: string
+  }): Promise<NativeWorkbenchSurfaceResult>
+  captureWorkbenchScreenshot?(request: {
+    surfaceId: string; targetRef: string
+  }): Promise<NativeWorkbenchScreenshot>
   createArtifactPreviewLease?(
     request: NativeArtifactPreviewLeaseCreateRequest,
   ): Promise<NativeArtifactPreviewLeaseBrokerResult>
@@ -464,6 +469,8 @@ export interface CliInvocation {
 }
 
 export interface PlatformGatewayApi {
+  /** Observation only: never restart the Gateway or reload the renderer. */
+  onResume?: (callback: () => void) => () => void
   getStatus(): Promise<GatewayStatus>
   getConnection?: () => Promise<DesktopGatewayConnection>
   onConnection?: (
@@ -553,13 +560,13 @@ export interface Platform {
    * returns false; desktop returns the shell's live native-update capability,
    * including runtime guards such as macOS requiring /Applications.
    * Presentation ownership is intentionally reported separately by
-   * desktopUpdateManaged(), since unsigned Windows can discover an update and
+   * desktopUpdateManaged(), since Windows can discover an update and
    * open a manual installer without applying it natively.
    */
   nativeAutoUpdateEnabled: () => Promise<boolean>
   /**
    * Whether the desktop shell owns update discovery and presentation, including
-   * manual versioned installers on unsigned Windows builds. This is deliberately
+   * manual versioned installers on Windows builds. This is deliberately
    * separate from nativeAutoUpdateEnabled so the passive gateway banner does not
    * duplicate the shell-managed Windows notice.
    */

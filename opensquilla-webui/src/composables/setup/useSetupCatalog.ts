@@ -45,7 +45,10 @@ import { GATEWAY_ACCESS_KEY } from '@/modules/gatewayAccess'
 import { useToasts } from '@/composables/useToasts'
 import { TELEMETRY_NOTICE_VERSION_BY_SCOPE } from '@/telemetry/protocol'
 import { useConfirm } from '@/composables/useConfirm'
-import { saveFailedMessage } from '@/lib/rpcErrors'
+import {
+  isSetupCapabilityUnsupported,
+  setupSaveFailedMessage as saveFailedMessage,
+} from '@/utils/setupErrorPresentation'
 import { copyTextWithFallback } from '@/utils/browser'
 import { TEXT_TIERS, normalizeRouterTier, routerTierLabelKey } from '@/utils/chat/routerTiers'
 import {
@@ -1816,7 +1819,6 @@ function routerConflictsWithTarget(value: string): boolean {
       provider: tier.provider || '',
       model: tier.model || '',
       thinkingLevel: tier.thinkingLevel || tier.thinking_level || '',
-      supportsImage: tier.supportsImage || tier.supports_image || false,
       ensembleEnabled: typeof tier.ensembleEnabled === 'boolean'
         ? tier.ensembleEnabled
         : tier.ensemble_enabled,
@@ -2542,7 +2544,7 @@ function providerRpcErrorMessage(err: unknown): string {
 }
 
 function isRpcMethodUnavailableError(err: unknown): boolean {
-  return /method.*not found|unknown method|not registered/i.test(saveFailedMessage(err))
+  return isSetupCapabilityUnsupported(err)
 }
 
 function representativeProviderModel(providerId: string): string {
@@ -3099,7 +3101,7 @@ function setRouterVisualMode(value: string) {
 
 function updateTierField(
   name: string,
-  key: 'provider' | 'model' | 'thinkingLevel' | 'supportsImage' | 'ensembleEnabled' | 'ensembleSelectionMode',
+  key: 'provider' | 'model' | 'thinkingLevel' | 'ensembleEnabled' | 'ensembleSelectionMode',
   value: string | boolean,
 ) {
   routerForm.updateTierField(name, key, value)

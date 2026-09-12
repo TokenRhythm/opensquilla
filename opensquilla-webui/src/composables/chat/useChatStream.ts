@@ -1,3 +1,7 @@
+import type {
+  ConversationCompactionContent,
+  ConversationToolContent,
+} from '@/modules/conversationEventContent'
 import { computed, ref, type Ref } from 'vue'
 import i18n from '@/i18n'
 import type {
@@ -5,19 +9,12 @@ import type {
   ChatModelCallSegment,
   ChatRunStatus,
   ChatRunStatusSource,
-  ChatStreamSegment,
   ChatStreamTimelineItem,
   ChatToolCall,
   ChatTimelineSegment,
   RawToolCallPayload,
 } from '@/types/chat'
-import type {
-  CompactionPayload,
-  ToolDeltaPayload,
-  ToolEndPayload,
-  ToolResultPayload,
-  ToolUsePayload,
-} from '@/types/chat'
+
 import type { ArtifactPayload } from '@/types/artifacts'
 import type {
   InterruptApprovalData,
@@ -37,8 +34,6 @@ import {
   toolResultIsError,
   truncateToolPreview,
 } from '@/utils/chat/toolDisplay'
-import { segmentsToTimelineItems } from '@/utils/chat/segmentsToTimelineItems'
-import { reconcileTextSnapshot } from '@/utils/chat/foldTurn'
 import {
   normalizeModelCallSegments,
   splitTextByModelCallSegments,
@@ -148,13 +143,8 @@ export function resolvedStreamIdleTimeoutMs(value: number | null | undefined): n
 
 export function useChatStream(options: UseChatStreamOptions) {
   const isStreaming = ref(false)
-  const streamRaw = ref('')
-  const streamSegments = ref<ChatStreamSegment[]>([])
-  const streamArtifacts = ref<ArtifactPayload[]>([])
-  const streamToolCalls = ref<ChatToolCall[]>([])
   const openToolGroups = ref<Set<string>>(new Set())
   const openToolItems = ref<Set<string>>(new Set())
-  let streamToolGroupSeq = 0
   let checkpointedRaw = ''
   let checkpointedAcrossToolBoundary = false
   let activeStreamTurnId = ''
@@ -179,19 +169,14 @@ export function useChatStream(options: UseChatStreamOptions) {
   const streamShowHeader = ref(false)
 
   const streamHasVisibleOutput = computed(() => {
-    if (useReducer.value === true) {
-      const folded = foldedTurn.value
-      return Boolean(
-        folded.rawText
-        || folded.reasoningBlocks.some(block => block.text)
-        || folded.toolCalls.length
-        || folded.artifacts.length
-        || folded.parts.some(part => part.type === 'interrupt'),
-      )
-    }
-    return streamSegments.value.length > 0 ||
-      streamToolCalls.value.length > 0 ||
-      streamArtifacts.value.length > 0
+    const folded = foldedTurn.value
+    return Boolean(
+      folded.rawText
+      || folded.reasoningBlocks.some(block => block.text)
+      || folded.toolCalls.length
+      || folded.artifacts.length
+      || folded.parts.some(part => part.type === 'interrupt'),
+    )
   })
 
   const streamActivity = ref({ label: 'Sending', key: 'Sending', startedAt: 0 })
@@ -208,8 +193,6 @@ export function useChatStream(options: UseChatStreamOptions) {
   // reactive invalidated the activity ribbon (and style) once per delta even
   // though no visible label changed.
   let lastSignalAt = 0
-  const toolTimes = ref(new Map<string, { startedAt: number; endedAt?: number }>())
-
   // The ribbon stays up for the whole run, including while tool rows render.
   const streamActivityVisible = computed(() => {
     return isStreaming.value && streamBubble.value
@@ -260,14 +243,9 @@ export function useChatStream(options: UseChatStreamOptions) {
   // A step in progress, not a bare round counter.
   const streamStepLabel = computed(() => `Step ${streamRound.value}`)
 
-  const streamTimelineItems = computed<ChatStreamTimelineItem[]>(() => {
-    return segmentsToTimelineItems(streamSegments.value, streamToolCalls.value, 'stream')
-  })
-
-  // Append-only turn log. ON is the production default and drives the live
-  // activity surface; SHADOW is the development default and parity-checks the fold
-  // while legacy refs render; only the explicit OFF kill switch skips frames
-  // and restores the legacy render path.
+  // Append-only turn log is the sole live content source. Local activity and
+  // disclosure state remain separate because they are presentation state, not
+  // a duplicate transcript.
   const turnLog = useChatTurnLog({
     renderMarkdown: options.renderMarkdown,
     toolCallGroups,
@@ -278,13 +256,23 @@ export function useChatStream(options: UseChatStreamOptions) {
     setAcceptedActivityOrder,
     checkpointText,
     finalizeToolInputs,
+    hasToolBoundary,
     peekRawText,
+    peekRunningToolCall,
+    peekToolCall,
+    peekToolTiming,
     publish: publishTurnLog,
     resetGeneration,
     resetLog,
-    useReducer,
     foldedTurn,
   } = turnLog
+
+  const streamTimelineItems = computed<ChatStreamTimelineItem[]>(
+    () => foldedTurn.value.timelineItems,
+  )
+  const streamArtifacts = computed<ArtifactPayload[]>(
+    () => foldedTurn.value.artifacts,
+  )
 
   const streamTurnElapsed = computed(() => {
     streamActivityTick.value
@@ -305,21 +293,7 @@ export function useChatStream(options: UseChatStreamOptions) {
   })
 
   function currentStreamRaw(): string {
-    return useReducer.value === true ? peekRawText() : streamRaw.value
-  }
-
-  // Bound shadow-parity check: assembles this composable's legacy live surface,
-  // injecting the live thinking text (owned by the event handlers) so the fold's
-  // thinkingText can be compared. Reactive over events + the legacy refs when
-  // run inside a watchEffect (ChatView). DEV/SHADOW-only; never throws.
-  function assertLiveParity(thinkingText: Ref<string>) {
-    turnLog.assertParity({
-      timelineItems: streamTimelineItems,
-      rawText: streamRaw,
-      toolCalls: streamToolCalls,
-      artifacts: streamArtifacts,
-      thinkingText,
-    })
+    return peekRawText()
   }
 
   const thinkingVisible = ref(false)
@@ -357,21 +331,15 @@ export function useChatStream(options: UseChatStreamOptions) {
 
   function resetStreamState() {
     acceptedActivityStartedAt = 0
-    streamRaw.value = ''
-    streamSegments.value = []
-    streamToolCalls.value = []
-    streamArtifacts.value = []
-    toolTimes.value = new Map()
     reasoningCharsSinceFlush = 0
     reasoningPresentationPending.value = false
     activeModelCallId = ''
     activeModelCallIteration = 0
     streamCheckpointSeq = 0
     streamCheckpoints.length = 0
-    // Clear the live-turn log alongside the legacy refs so the next turn's fold
-    // starts empty. A steer checkpoint deliberately resets only the current
-    // visible segment; checkpointedRaw remains available to de-duplicate an
-    // authoritative whole-turn final snapshot.
+    // A steer checkpoint deliberately resets only the current visible segment;
+    // checkpointedRaw remains available to de-duplicate an authoritative
+    // whole-turn final snapshot.
     resetLog()
   }
 
@@ -413,10 +381,9 @@ export function useChatStream(options: UseChatStreamOptions) {
       isNewPhase = true
     }
     // Record each accepted phase transition into the append-only log so the
-    // finished turn can show the activity timeline. Gated on the reducer like
-    // every other frame; OFF mode appends nothing and the history stays empty.
+    // finished turn can show the activity timeline.
     // Label-only refinements (same key) emit nothing — only a real phase change.
-    if (isNewPhase && recordActivity && useReducer.value) {
+    if (isNewPhase && recordActivity) {
       const committed = streamActivity.value
       appendFrame({ kind: 'status', action: committed.key, label: committed.label, at: committed.startedAt })
       // TurnAccumulator is intentionally non-reactive. A provider phase can be
@@ -435,9 +402,8 @@ export function useChatStream(options: UseChatStreamOptions) {
     setStreamActivity(label, key, true)
   }
 
-  function recordCompactionActivity(payload: CompactionPayload) {
+  function recordCompactionActivity(payload: ConversationCompactionContent) {
     noteStreamSignal()
-    if (!useReducer.value) return
     const rawStatus = String(payload.status || '').toLowerCase()
     const state = rawStatus === 'skipped'
       ? 'skipped'
@@ -450,7 +416,7 @@ export function useChatStream(options: UseChatStreamOptions) {
             : ['failed', 'error', 'timed_out'].includes(rawStatus)
               ? 'failed'
               : 'running'
-    const id = String(payload.compaction_id || payload.compactionId || 'current')
+    const id = String(payload.compaction_id || 'current')
     appendFrame({
       kind: 'status',
       action: 'context_compaction',
@@ -511,7 +477,6 @@ export function useChatStream(options: UseChatStreamOptions) {
     setAcceptedActivityStartedAt(restoredStartedAt || undefined)
     openToolGroups.value = new Set()
     openToolItems.value = new Set()
-    streamToolGroupSeq = 0
     streamRound.value = 1
     streamTaskClockIdentity = ''
     streamTurnStartedAt.value = restoredStartedAt || Date.now()
@@ -551,14 +516,11 @@ export function useChatStream(options: UseChatStreamOptions) {
   function endStreaming(opts?: { reason?: string, suppressed?: boolean }) {
     // Running calls keep fragment chunks during the live phase. Materialize
     // them once before the canonical history row is detached.
-    if (useReducer.value === true) {
-      finalizeToolInputs()
-      // Done can arrive before the frame-clock publish that would expose the
-      // final reasoning delta/end. Materialize the canonical accumulator now
-      // so the settled row receives the complete structured blocks even when
-      // the live component never mounted for that batch.
-      publishTurnLog()
-    }
+    finalizeToolInputs()
+    // Done can arrive before the frame-clock publish that would expose the
+    // final reasoning delta/end. Materialize the canonical accumulator now so
+    // the settled row receives the complete structured blocks.
+    publishTurnLog()
     const wasAborted = opts?.reason === 'aborted'
     const preReconcileText = options.stripDirectiveTags(
       options.stripGeneratedArtifactMarkers(currentStreamRaw()),
@@ -579,7 +541,6 @@ export function useChatStream(options: UseChatStreamOptions) {
       suppressText
       && (
         currentStreamRaw() !== ''
-        || streamSegments.value.some(segment => segment.type === 'text')
       )
     ) {
       reconcileFinalText('')
@@ -593,7 +554,7 @@ export function useChatStream(options: UseChatStreamOptions) {
     streamIdlePausedForApproval.value = false
 
     if (streamBubble.value) {
-      // `streamRaw` is the canonical backend answer. Do not guess that visible
+      // The accumulator's raw text is the canonical backend answer. Do not guess that visible
       // Markdown/XML is a leaked tool protocol: doing so mutates local history,
       // copy/export/share, and can disagree with the durable server transcript.
       const cleanedText = options.stripDirectiveTags(
@@ -607,9 +568,7 @@ export function useChatStream(options: UseChatStreamOptions) {
         (part): part is Extract<import('@/types/parts').ChatPart, { type: 'interrupt' }> =>
           part.type === 'interrupt',
       )
-      const terminalToolCalls = useReducer.value === true
-        ? terminalFold.toolCalls
-        : streamToolCalls.value
+      const terminalToolCalls = terminalFold.toolCalls
       const terminalAt = Date.now()
       const terminalReasoningBlocks: ReasoningBlock[] = terminalFold.reasoningBlocks.map(block => ({
         ...block,
@@ -620,7 +579,7 @@ export function useChatStream(options: UseChatStreamOptions) {
       }))
       const emptyStream = !cleanedText
         && terminalReasoningBlocks.every(block => !block.text)
-        && streamArtifacts.value.length === 0
+        && terminalFold.artifacts.length === 0
         && terminalToolCalls.length === 0
         && foldedInterrupts.length === 0
         && (suppressText || terminalFold.statusHistory.length === 0)
@@ -643,15 +602,13 @@ export function useChatStream(options: UseChatStreamOptions) {
         ts: new Date().toISOString(),
         messageId: activeAssistantMessageId || undefined,
         turnId: activeStreamTurnId || undefined,
-        artifacts: streamArtifacts.value.slice(),
+        artifacts: terminalFold.artifacts.slice(),
         tool_calls: terminalToolCalls.map(streamToolCallToHistoryCall),
-        timeline: useReducer.value
-          ? terminalFold.timelineSegments.slice()
-          : streamTimelineSnapshot(cleanedText),
+        timeline: terminalFold.timelineSegments.slice(),
         interrupts: foldedInterrupts.map(part => ({ ...part })),
-        // Detach the fold's activity history from the about-to-be-reset log. In
-        // OFF mode this is [], so the field is harmless. A status-only terminal
-        // turn remains visible because its activity is the useful result.
+        // Detach the fold's activity history from the about-to-be-reset log. A
+        // status-only terminal turn remains visible because its activity is the
+        // useful result.
         statusHistory: terminalFold.statusHistory.slice(),
         reasoningBlocks: terminalReasoningBlocks,
         reasoningPresentationPending: reasoningPresentationPending.value || undefined,
@@ -675,7 +632,7 @@ export function useChatStream(options: UseChatStreamOptions) {
   }
 
   function restoreStatusHistory(entries: readonly StatusPart[]) {
-    if (!entries.length || useReducer.value === false) return
+    if (!entries.length) return
     if (!isStreaming.value) startStreaming()
     // Consume matching live occurrences one-for-one. A Set would erase valid
     // repeated retry_wait/retrying phases from the durable terminal trace.
@@ -742,18 +699,13 @@ export function useChatStream(options: UseChatStreamOptions) {
     setCheckpointText(checkpoint, rawText)
 
     checkpointedAcrossToolBoundary = checkpointedAcrossToolBoundary || Boolean(
-      streamToolCalls.value.length
-      || streamSegments.value.some(segment => segment.type === 'tool-group'),
+      hasToolBoundary(),
     )
     checkpointedRaw += currentStreamRaw()
     // A steer is another user message inside the same turn. Split only the
     // answer text so it stays chronologically above that message; the running
     // tools, artifacts, interrupts, reasoning and status history continue to
     // belong to the one live activity disclosure below it.
-    if (useReducer.value !== true) streamRaw.value = ''
-    streamSegments.value = streamSegments.value.filter(
-      segment => segment.type !== 'text',
-    )
     checkpointText()
     resetStreamIdleTimer()
   }
@@ -905,7 +857,6 @@ export function useChatStream(options: UseChatStreamOptions) {
 
   function resetStreamForRouterReplay() {
     resetStreamState()
-    streamToolGroupSeq = 0
     streamBubble.value = true
     streamShowHeader.value = options.lastHeaderRole.value !== 'assistant'
     setStreamActivity('Switching model')
@@ -947,11 +898,12 @@ export function useChatStream(options: UseChatStreamOptions) {
     preserveCompletedTools?: boolean
   } = {}) {
     const preserveCompletedTools = optionsArg.preserveCompletedTools !== false
+    const currentToolCalls = foldedTurn.value.toolCalls
     const completedToolIds = new Set(
-      streamToolCalls.value.filter(call => !call.isRunning).map(call => call.toolId),
+      currentToolCalls.filter(call => !call.isRunning).map(call => call.toolId),
     )
     const keptToolCalls = preserveCompletedTools
-      ? streamToolCalls.value.filter(call => completedToolIds.has(call.toolId))
+      ? currentToolCalls.filter(call => completedToolIds.has(call.toolId))
       : []
     const keptToolIds = new Set(keptToolCalls.map(call => call.toolId))
     const keptGroupIds = new Set(
@@ -959,18 +911,9 @@ export function useChatStream(options: UseChatStreamOptions) {
     )
 
     clearRenderTimer()
-    streamRaw.value = typeof optionsArg.textSnapshot === 'string'
+    const textSnapshot = typeof optionsArg.textSnapshot === 'string'
       ? optionsArg.textSnapshot
       : ''
-    streamSegments.value = streamSegments.value.filter((segment) => {
-      if (segment.type === 'text') return false
-      if (segment.type === 'tool-group') return keptGroupIds.has(segment.groupId || '')
-      return true
-    })
-    streamToolCalls.value = keptToolCalls
-    toolTimes.value = new Map(
-      [...toolTimes.value.entries()].filter(([toolId]) => keptToolIds.has(toolId)),
-    )
     openToolGroups.value = new Set(
       [...openToolGroups.value].filter(groupId => keptGroupIds.has(groupId)),
     )
@@ -986,17 +929,8 @@ export function useChatStream(options: UseChatStreamOptions) {
     streamBubble.value = true
     noteStreamSignal()
 
-    if (streamRaw.value) {
-      streamSegments.value.push({
-        type: 'text',
-        raw: streamRaw.value,
-        html: '',
-        dirty: true,
-        presentation: 'answer',
-      })
-    }
     resetGeneration({
-      textSnapshot: streamRaw.value,
+      textSnapshot,
       preserveCompletedTools,
     })
     scheduleRender()
@@ -1014,10 +948,7 @@ export function useChatStream(options: UseChatStreamOptions) {
     const currentRaw = currentStreamRaw()
     if (!raw || !currentRaw) return raw
 
-    const sawToolBoundary =
-      streamToolCalls.value.length > 0 ||
-      streamSegments.value.some(seg => seg.type === 'tool-group')
-    if (!sawToolBoundary) return raw
+    if (!hasToolBoundary()) return raw
 
     if (raw === currentRaw) return ''
     if (raw.startsWith(currentRaw)) return raw.slice(currentRaw.length)
@@ -1043,29 +974,7 @@ export function useChatStream(options: UseChatStreamOptions) {
       activeModelCallIteration = iteration
     }
     recordActivityPhase('Writing reply', `write:${streamRound.value}`)
-    if (useReducer.value !== true) streamRaw.value += deltaText
-
-    if (useReducer.value !== true) {
-      const lastSegment = streamSegments.value[streamSegments.value.length - 1]
-      if (
-        !lastSegment
-        || lastSegment.type !== 'text'
-        || lastSegment.presentation !== presentation
-      ) {
-        streamSegments.value.push({
-          type: 'text',
-          raw: deltaText,
-          html: '',
-          dirty: true,
-          presentation,
-        })
-      } else {
-        lastSegment.raw = (lastSegment.raw || '') + deltaText
-        lastSegment.dirty = true
-      }
-    }
-
-    if (useReducer.value) appendFrame({ kind: 'text', text: deltaText, presentation })
+    appendFrame({ kind: 'text', text: deltaText, presentation })
     scheduleRender()
   }
 
@@ -1121,39 +1030,8 @@ export function useChatStream(options: UseChatStreamOptions) {
   function flushRender() {
     if (!renderDirty) return
 
-    // The reducer is the production render source. Do not also parse the
-    // invisible legacy segment: that used to double the Markdown work on every
-    // flush. DEV shadow and the explicit kill switch keep the legacy renderer
-    // for parity/rollback.
-    if (useReducer.value === false) {
-      for (const seg of streamSegments.value) {
-        if (seg.type === 'text' && seg.dirty) {
-          seg.html = options.renderMarkdown(stabilizeStreamingMarkdown(seg.raw || ''), {
-            highlight: false,
-            cache: 'none',
-            math: 'defer',
-          })
-          seg.dirty = false
-        }
-      }
-    }
-
     publishTurnLog()
     reasoningCharsSinceFlush = 0
-    if (useReducer.value === 'shadow') {
-      // Shadow mode still compares the legacy shape, but reuses the one
-      // accumulator render instead of parsing identical Markdown twice.
-      const foldedText = foldedTurn.value.timelineItems.filter(
-        item => item.type === 'text',
-      )
-      let textIndex = 0
-      for (const segment of streamSegments.value) {
-        if (segment.type !== 'text') continue
-        const rendered = foldedText[textIndex++]
-        if (rendered?.type === 'text') segment.html = rendered.html
-        segment.dirty = false
-      }
-    }
     renderDirty = false
     if (options.autoScroll.value) options.scrollToBottom()
   }
@@ -1163,16 +1041,6 @@ export function useChatStream(options: UseChatStreamOptions) {
     if (size >= LARGE_STREAM_CHARS) return LARGE_FLUSH_INTERVAL_MS
     if (size >= MEDIUM_STREAM_CHARS) return MEDIUM_FLUSH_INTERVAL_MS
     return MIN_FLUSH_INTERVAL_MS
-  }
-
-  // Render-only stabilization of incomplete markdown during streaming: an
-  // unterminated fenced code block (odd number of ``` fences) is temporarily
-  // closed so it renders as a single <pre> across flushes rather than collapsing
-  // back to a paragraph until the closing fence arrives. Operates on a copy; the
-  // committed message still re-renders the true raw text on turn end.
-  function stabilizeStreamingMarkdown(raw: string): string {
-    const fenceCount = (raw.match(/^[ \t]*```/gm) || []).length
-    return fenceCount % 2 === 1 ? `${raw}\n\`\`\`` : raw
   }
 
   function showThinkingIndicator() {
@@ -1292,8 +1160,8 @@ export function useChatStream(options: UseChatStreamOptions) {
   // trusted and we fall back to the local clock — capping any residual error rather
   // than letting a skewed clock render a wildly wrong duration. On synced clocks
   // (e.g. the gateway serving its own UI) this is exact.
-  function serverToolStartedAt(payload: ToolUsePayload | ToolResultPayload): number | null {
-    const raw = (payload as ToolUsePayload).started_at
+  function serverToolStartedAt(payload: ConversationToolContent): number | null {
+    const raw = payload.started_at
     if (typeof raw !== 'number' || !Number.isFinite(raw) || raw <= 0) return null
     const now = Date.now()
     if (raw > now + SERVER_CLOCK_TOLERANCE_MS) return null
@@ -1301,62 +1169,64 @@ export function useChatStream(options: UseChatStreamOptions) {
     return raw
   }
 
-  function ensureStreamToolCall(payload: ToolUsePayload | ToolResultPayload, optionsArg: { running: boolean }): ChatToolCall | null {
+  function ensureStreamToolCall(payload: ConversationToolContent, optionsArg: { running: boolean }): ChatToolCall | null {
     if (!payload) return null
-    const name = normalizeToolName(payload)
+    const name = normalizeToolName({ name: payload.name })
     if (!name) return null
     if (isInternalToolName(name)) return null
     if (!isStreaming.value) startStreaming()
     const presentation = normalizeToolPresentation(payload)
     const input = toolDisplayInputText(payload, presentation)
-    const toolId = payload.tool_use_id || payload.toolUseId || payload.id || `${name}:${payload.stream_seq || Date.now()}`
+    const toolId = payload.id || `${name}:${payload.stream_seq || Date.now()}`
 
-    const existing = streamToolCalls.value.find(tc => tc.toolId === toolId)
+    const existing = peekToolCall(toolId)
     if (existing) {
-      if (presentation) existing.presentation = presentation
-      if (input || presentation?.argumentDisplay === 'primary') {
-        existing.inputRaw = input
-        existing.inputPreview = truncateToolPreview(input, 200)
-        existing.displayName = toolDisplayName(existing.name, input)
+      if (optionsArg.running) {
+        appendFrame({
+          kind: 'tool-start',
+          toolId,
+          name: existing.name,
+          input: input || existing.inputRaw || '',
+          at: serverToolStartedAt(payload) ?? Date.now(),
+          presentation: presentation || existing.presentation,
+        })
+        return peekToolCall(toolId)
       }
-      // A running ensure on an existing call mirrors to the fold so an input
-      // refinement (re-narration) stays in sync; result-only ensures emit no
-      // tool-start (the tool-result frame finalizes the call there).
-      if (useReducer.value && optionsArg.running) {
-        appendFrame({ kind: 'tool-start', toolId, name: existing.name, input: existing.inputRaw || '', at: Date.now(), presentation: existing.presentation })
+      return {
+        ...existing,
+        ...(presentation ? { presentation } : {}),
+        ...((input || presentation?.argumentDisplay === 'primary')
+          ? {
+              inputRaw: input,
+              inputPreview: truncateToolPreview(input, 200),
+              displayName: toolDisplayName(existing.name, input),
+            }
+          : {}),
       }
-      return existing
     }
 
-    // Only calls observed from their start get a wall clock; result-only
-    // calls (and replayed history) never show a fabricated elapsed time.
-    // Prefer the server-stamped start time (epoch ms) so the elapsed timer is
-    // stable across page switches / stream replay, where the component remounts
-    // and would otherwise restart the clock from now (issue #329). Fall back to
-    // the local clock when the server did not stamp one.
-    if (optionsArg.running && !toolTimes.value.has(toolId)) {
-      const serverStartedAt = serverToolStartedAt(payload)
-      toolTimes.value.set(toolId, { startedAt: serverStartedAt ?? Date.now() })
+    // A result-only call is materialized by its tool-result frame so no elapsed
+    // clock is fabricated. Running calls enter through the accumulator first,
+    // which owns grouping, input and timing from this point onward.
+    if (optionsArg.running) {
+      appendFrame({
+        kind: 'tool-start',
+        toolId,
+        name,
+        input,
+        at: serverToolStartedAt(payload) ?? Date.now(),
+        presentation,
+      })
+      return peekToolCall(toolId)
     }
-
-    const operationKey = toolOperationKey(name)
-    const lastSegment = streamSegments.value[streamSegments.value.length - 1]
-    const groupId = lastSegment?.type === 'tool-group' && lastSegment.operationKey === operationKey && lastSegment.groupId
-      ? lastSegment.groupId
-      : `stream:tool-group:${operationKey}:${streamToolGroupSeq++}`
-
-    if (lastSegment?.type !== 'tool-group' || lastSegment.groupId !== groupId) {
-      streamSegments.value.push({ type: 'tool-group', groupId, operationKey })
-    }
-
-    const call: ChatToolCall = {
+    return {
       toolId,
       name,
       displayName: toolDisplayName(name, input),
-      groupId,
+      groupId: '',
       inputRaw: input,
       inputPreview: truncateToolPreview(input, 200),
-      isRunning: optionsArg.running,
+      isRunning: false,
       status: '',
       isError: false,
       result: '',
@@ -1364,138 +1234,85 @@ export function useChatStream(options: UseChatStreamOptions) {
       isOpen: false,
       presentation,
     }
-    streamToolCalls.value.push(call)
-    // Running creates emit a tool-start (fold stamps the clock here, matching the
-    // toolTimes seed above). Result-only creates emit nothing: the tool-result
-    // frame creates the call in the fold without a clock.
-    if (useReducer.value && optionsArg.running) {
-      appendFrame({ kind: 'tool-start', toolId, name, input, at: Date.now(), presentation })
-    }
-    return call
   }
 
-  function appendToolCall(payload: ToolUsePayload) {
+  function appendToolCall(payload: ConversationToolContent) {
     const tc = ensureStreamToolCall(payload, { running: true })
     if (!tc) return
     narrateToolCall(tc)
     scheduleRender()
   }
 
-  function appendToolDelta(payload: ToolDeltaPayload) {
+  function appendToolDelta(payload: ConversationToolContent) {
     if (!payload || options.aborted.value) return
-    const toolId = payload.tool_use_id || payload.toolUseId || payload.id || ''
-    const fragment = payload.json_fragment ?? payload.jsonFragment ?? payload.fragment ?? ''
-    const fragmentText = typeof fragment === 'string' ? fragment : String(fragment || '')
+    const toolId = payload.id || ''
+    const fragmentText = payload.input_delta || ''
     if (!toolId || !fragmentText) return
 
-    const existing = streamToolCalls.value.find(t => t.toolId === toolId)
+    const existing = peekToolCall(toolId)
     const tc = existing || ensureStreamToolCall(payload, { running: true })
     if (!tc) return
     if (tc.presentation?.lifecycleDisplay === 'boundary') return
 
-    // The accumulator owns the complete production input. The legacy call is
-    // retained only as bounded narration metadata; concatenating the same 10k
-    // fragment prefix here doubled both allocation churn and retained state.
-    const previousInput = tc.inputRaw || ''
-    const nextInput = useReducer.value === true
-      ? previousInput.length >= 200
-        ? previousInput
-        : `${previousInput}${fragmentText}`.slice(0, 200)
-      : `${previousInput}${fragmentText}`
-    if (nextInput !== previousInput) {
-      tc.inputRaw = nextInput
-      if (!isEmptyToolPreview(nextInput)) {
-        tc.inputPreview = truncateToolPreview(nextInput, 200)
-        tc.displayName = toolDisplayName(tc.name, nextInput)
-      }
-    }
-    if (tc.isRunning && (useReducer.value !== true || nextInput !== previousInput)) {
-      narrateToolCall(tc)
-    }
-    // The fold concats the same fragment onto the same call's inputRaw. When
-    // this delta created the call, ensureStreamToolCall already emitted the
-    // seeding tool-start above, so the call exists in the fold before this.
-    if (useReducer.value) appendFrame({ kind: 'tool-delta', toolId, fragment: fragmentText })
+    appendFrame({ kind: 'tool-delta', toolId, fragment: fragmentText })
+    const updated = peekToolCall(toolId)
+    if (updated?.isRunning) narrateToolCall(updated)
     scheduleRender()
   }
 
-  function appendToolEnd(payload: ToolEndPayload) {
+  function appendToolEnd(payload: ConversationToolContent) {
     if (!payload || options.aborted.value) return
-    const toolId = payload.tool_use_id || payload.toolUseId || payload.id || ''
+    const toolId = payload.id || ''
     if (!toolId) return
-    const tc = streamToolCalls.value.find(t => t.toolId === toolId)
+    const tc = peekToolCall(toolId)
       || ensureStreamToolCall(payload, { running: true })
     if (!tc) return
     const presentation = normalizeToolPresentation(payload)
-    if (presentation) tc.presentation = presentation
     if (payload.arguments && typeof payload.arguments === 'object') {
-      const input = toolDisplayInputText(payload, tc.presentation)
-      tc.inputRaw = input
-      tc.inputPreview = truncateToolPreview(input, 200)
-      tc.displayName = toolDisplayName(tc.name, input)
-      if (useReducer.value) {
-        appendFrame({
-          kind: 'tool-start',
-          toolId,
-          name: tc.name,
-          input,
-          at: Date.now(),
-          authoritativeInput: true,
-          presentation: tc.presentation,
-        })
-      }
+      const input = toolDisplayInputText(payload, presentation || tc.presentation)
+      appendFrame({
+        kind: 'tool-start',
+        toolId,
+        name: tc.name,
+        input,
+        at: Date.now(),
+        authoritativeInput: true,
+        presentation: presentation || tc.presentation,
+      })
     }
     scheduleRender()
   }
 
-  function appendToolResult(payload: ToolResultPayload) {
+  function appendToolResult(payload: ConversationToolContent) {
     if (!payload) return
-    const name = normalizeToolName(payload)
+    const name = normalizeToolName({ name: payload.name })
     if (name && isInternalToolName(name)) return
     if (!isStreaming.value) startStreaming()
-    const raw = payload.result || payload.content || payload.output || ''
+    const raw = payload.result || ''
     const content = typeof raw === 'string' ? raw : JSON.stringify(raw, null, 2)
-    const toolId = payload.tool_use_id || payload.toolUseId || payload.id || ''
+    const toolId = payload.id || ''
 
-    const tc = streamToolCalls.value.find(t => t.toolId === toolId) || ensureStreamToolCall(payload, { running: false })
+    const tc = peekToolCall(toolId) || ensureStreamToolCall(payload, { running: false })
     if (tc) {
       const presentation = normalizeToolPresentation(payload)
-      if (presentation) tc.presentation = presentation
-      const input = toolDisplayInputText(payload, tc.presentation)
-      if (input || tc.presentation?.argumentDisplay === 'primary') {
-        tc.inputRaw = input
-        tc.inputPreview = truncateToolPreview(input, 200)
-        tc.displayName = toolDisplayName(tc.name, input)
-      }
-      tc.isRunning = false
-      tc.status = toolResultIsError(payload) ? 'error' : 'success'
-      tc.isError = toolResultIsError(payload)
-      tc.result = content
-      tc.resultPreview = truncateToolPreview(content, 200)
+      const effectivePresentation = presentation || tc.presentation
+      const input = toolDisplayInputText(payload, effectivePresentation)
+      const isError = toolResultIsError(payload)
+      appendFrame({
+        kind: 'tool-result',
+        toolId: tc.toolId,
+        name: tc.name,
+        result: content,
+        isError,
+        input,
+        at: Date.now(),
+        authoritativeInput: payload.input !== undefined
+          || payload.arguments !== undefined
+          || effectivePresentation?.argumentDisplay === 'primary',
+        presentation: effectivePresentation,
+      })
 
-      const timing = toolTimes.value.get(tc.toolId)
-      if (timing && !timing.endedAt) timing.endedAt = Date.now()
-
-      // Mirror the finalized call. A result-only call (no prior tool-start) is
-      // created by the fold here without a clock; the result frame carries the
-      // same payload input legacy used so a result-only fold call seeds it.
-      if (useReducer.value) {
-        appendFrame({
-          kind: 'tool-result',
-          toolId: tc.toolId,
-          name: tc.name,
-          result: content,
-          isError: tc.isError,
-          input,
-          at: Date.now(),
-          authoritativeInput: payload.input !== undefined
-            || payload.arguments !== undefined
-            || tc.presentation?.argumentDisplay === 'primary',
-          presentation: tc.presentation,
-        })
-      }
-
-      const stillRunning = streamToolCalls.value.find(t => t.isRunning)
+      const stillRunning = peekRunningToolCall()
       if (stillRunning) {
         narrateToolCall(stillRunning)
       } else {
@@ -1510,7 +1327,7 @@ export function useChatStream(options: UseChatStreamOptions) {
 
   function streamToolElapsedText(call: Pick<ChatToolCall, 'toolId'>): string {
     streamActivityTick.value
-    const timing = toolTimes.value.get(call.toolId)
+    const timing = peekToolTiming(call.toolId)
     if (!timing) return ''
     const end = timing.endedAt ?? Date.now()
     const seconds = Math.max(0, end - timing.startedAt) / 1000
@@ -1537,33 +1354,10 @@ export function useChatStream(options: UseChatStreamOptions) {
     }
   }
 
-  function streamTimelineSnapshot(fallbackText = ''): ChatTimelineSegment[] {
-    const segments = streamSegments.value
-      .flatMap((seg): ChatTimelineSegment[] => {
-        if (seg.type === 'text') {
-          const raw = String(seg.raw || '')
-          return raw ? [{ type: 'text', raw, presentation: seg.presentation }] : []
-        }
-        if (seg.type === 'tool-group') {
-          return [{
-            type: 'tool-group',
-            groupId: seg.groupId,
-            operationKey: seg.operationKey,
-          }]
-        }
-        return []
-      })
-    if (segments.length === 0 && fallbackText) {
-      return [{ type: 'text', raw: fallbackText, presentation: 'answer' }]
-    }
-    return segments
-  }
-
   function appendArtifact(payload: ArtifactPayload) {
     if (!payload) return
     noteStreamSignal()
-    streamArtifacts.value.push(payload)
-    if (useReducer.value) appendFrame({ kind: 'artifact', artifact: payload })
+    appendFrame({ kind: 'artifact', artifact: payload })
     scheduleRender()
   }
 
@@ -1580,7 +1374,7 @@ export function useChatStream(options: UseChatStreamOptions) {
     activityOrder?: number
   }) {
     noteStreamSignal()
-    if (useReducer.value) appendFrame({ kind: 'interrupt', ...input })
+    appendFrame({ kind: 'interrupt', ...input })
     scheduleRender()
   }
 
@@ -1658,23 +1452,9 @@ export function useChatStream(options: UseChatStreamOptions) {
       : checkpointedRaw && finalText.startsWith(checkpointedRaw)
         ? finalText.slice(checkpointedRaw.length)
         : finalText
-    if (useReducer.value === true) {
-      const changed = currentStreamRaw() !== segmentFinalText
-      appendFrame({ kind: 'final-text', text: segmentFinalText })
-      if (changed) scheduleRender()
-      return
-    }
-    const reconciled = reconcileTextSnapshot(
-      streamSegments.value,
-      streamRaw.value,
-      segmentFinalText,
-    )
-    if (reconciled.changed) {
-      streamRaw.value = reconciled.rawText
-      streamSegments.value = reconciled.segments
-      scheduleRender()
-    }
-    if (useReducer.value) appendFrame({ kind: 'final-text', text: segmentFinalText })
+    const changed = currentStreamRaw() !== segmentFinalText
+    appendFrame({ kind: 'final-text', text: segmentFinalText })
+    if (changed) scheduleRender()
   }
 
   function isToolGroupOpen(groupId: string): boolean {
@@ -1769,16 +1549,13 @@ export function useChatStream(options: UseChatStreamOptions) {
     isToolItemOpen,
     toggleToolItem,
     cleanup,
-    // live-turn shadow log surface: appendFrame/useReducer let the event handlers
-    // (which own the thinking ref) append their frame; assertLiveParity is run
-    // from a DEV watchEffect; foldedTurn is the fold output (not rendered yet).
+    // Event handlers append accepted frames; foldedTurn is the sole live
+    // content projection.
     appendFrame,
     setAcceptedActivityOrder,
     noteReasoningPresentationDelta,
     completeReasoningPresentation,
-    useReducer,
     foldedTurn,
     getThinkingText: () => foldedTurn.value.thinkingText,
-    assertLiveParity,
   }
 }

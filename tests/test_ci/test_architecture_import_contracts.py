@@ -8,6 +8,9 @@ from pathlib import Path
 PACKAGE_ROOT = Path(__file__).resolve().parents[2] / "src" / "opensquilla"
 
 APPROVED_PACKAGE_IMPORTS: frozenset[tuple[str, str]] = frozenset({
+    # Source adapters consume the transport-neutral install command's pure
+    # identifier parser; application never imports the Skill implementation.
+    ("skills", "application"),
     ("agents", "gateway"),
     ("agents", "identity"),
     ("agents", "onboarding"),
@@ -181,6 +184,9 @@ APPROVED_PACKAGE_IMPORTS: frozenset[tuple[str, str]] = frozenset({
     # transaction layer; recovery does not import migration back.
     ("migration", "recovery"),
     ("migration", "onboarding"),
+    # Setup mutations reuse the settings owner's secret-provenance rules.
+    # Application has no dependency back on onboarding or runtime packages.
+    ("onboarding", "application"),
     ("onboarding", "channels"),
     ("onboarding", "gateway"),
     ("onboarding", "provider"),

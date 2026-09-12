@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import json
 import secrets
 import time
@@ -19,8 +18,6 @@ from .errors import (
     ArtifactConflictError,
     ArtifactNotFoundError,
     ArtifactValidationError,
-    WriterLeaseConflictError,
-    WriterLeaseExpiredError,
 )
 from .models import (
     Actor,
@@ -48,21 +45,20 @@ from .models import (
     EditSessionStatus,
     MutationAttempt,
     MutationAttemptStatus,
-    PreparedPromptAnnotationTarget,
     PromptAnnotation,
     PromptAnnotationStatus,
     Revision,
     RevisionSource,
     WriterLease,
+    head_restore_receipt_state_revision,
 )
+from .retirement import RETIREMENT_STATEMENTS
 from .schema import SCHEMA_STATEMENTS
 
 TransactionFactory = Callable[[str], AbstractAsyncContextManager[Any]]
 Clock = Callable[[], int]
 IdFactory = Callable[[str], str]
 
-MAX_PROMPT_ANNOTATIONS_PER_BATCH = 16
-MAX_PROMPT_ANNOTATION_BODY_BYTES = 16_384
 _MUTATION_ATTEMPT_TURN_QUERY_CHUNK_SIZE = 400
 # Audit rows that identify a durable revision-producing mutation.  Metadata
 # events such as ``document.renamed`` can carry the current head revision id,
@@ -251,347 +247,6 @@ async def get_prompt_annotation_on_conn(conn: Any, annotation_id: str) -> Prompt
     return _prompt_annotation_from_row(row)
 
 
-async def preflight_prompt_annotations_on_conn(
-    conn: Any,
-    *,
-    annotation_ids: Sequence[str],
-    session_key: str,
-    session_id: str,
-    session_epoch: int,
-    require_current_head: bool = True,
-) -> tuple[PromptAnnotation, ...]:
-    """Validate an ordered annotation batch without opening or committing a transaction."""
-
-    ids = tuple(annotation_ids)
-    if len(ids) > MAX_PROMPT_ANNOTATIONS_PER_BATCH:
-        raise ArtifactValidationError("a prompt annotation batch may contain at most 16 items")
-    if len(set(ids)) != len(ids):
-        raise ArtifactValidationError("prompt annotation ids must be unique")
-    if not ids:
-        return ()
-
-    annotations: list[PromptAnnotation] = []
-    for annotation_id in ids:
-        annotation = await get_prompt_annotation_on_conn(conn, annotation_id)
-        if (
-            annotation.session_key != session_key
-            or annotation.session_id != session_id
-            or annotation.session_epoch != session_epoch
-        ):
-            raise ArtifactNotFoundError(f"prompt annotation not found: {annotation_id}")
-        if annotation.status is not PromptAnnotationStatus.DRAFT:
-            raise ArtifactConflictError("prompt annotation is no longer a draft")
-        if not annotation.body.strip():
-            raise ArtifactValidationError("prompt annotation body must not be empty when sent")
-        if len(annotation.body.encode("utf-8")) > MAX_PROMPT_ANNOTATION_BODY_BYTES:
-            raise ArtifactValidationError("prompt annotation body exceeds 16 KiB")
-        annotations.append(annotation)
-
-    document_ids = {annotation.document_id for annotation in annotations}
-    revision_ids = {annotation.revision_id for annotation in annotations}
-    if len(document_ids) != 1 or (require_current_head and len(revision_ids) != 1):
-        raise ArtifactValidationError(
-            "a prompt annotation batch must target one document"
-            + (" revision" if require_current_head else "")
-        )
-    document_id = annotations[0].document_id
-    row = await _fetchone(
-        conn,
-        """
-        SELECT session_key, session_id, head_revision_id
-        FROM artifact_documents
-        WHERE document_id = ?
-        """,
-        (document_id,),
-    )
-    if (
-        row is None
-        or str(row["session_key"]) != session_key
-        or str(row["session_id"]) != session_id
-    ):
-        raise ArtifactNotFoundError(f"document not found: {document_id}")
-    if require_current_head and str(row["head_revision_id"]) != annotations[0].revision_id:
-        raise ArtifactConflictError("prompt annotation revision is no longer current")
-
-    for annotation in annotations:
-        anchor_row = await _fetchone(
-            conn,
-            """
-            SELECT document_id, revision_id, state
-            FROM artifact_anchors
-            WHERE anchor_id = ?
-            """,
-            (annotation.anchor_id,),
-        )
-        if (
-            anchor_row is None
-            or str(anchor_row["document_id"]) != document_id
-            or str(anchor_row["revision_id"]) != annotation.revision_id
-            or (
-                require_current_head
-                and str(anchor_row["state"]) != AnchorState.RESOLVED.value
-            )
-        ):
-            raise ArtifactConflictError("prompt annotation anchor is no longer valid")
-    return tuple(annotations)
-
-
-async def consume_prepared_prompt_annotations_on_conn(
-    conn: Any,
-    *,
-    prepared_targets: Sequence[PreparedPromptAnnotationTarget],
-    session_key: str,
-    session_id: str,
-    session_epoch: int,
-    message_id: str,
-    turn_id: str,
-    updated_at: int,
-) -> tuple[PromptAnnotation, ...]:
-    """Atomically rebind a normalized batch and mark it sent.
-
-    Source parsing is intentionally completed before this transaction.  The
-    immutable draft snapshots, previous anchors, and current document head are
-    fenced again here so a concurrent save rolls the entire turn acceptance
-    back before the task can run.
-    """
-
-    prepared = tuple(prepared_targets)
-    if not prepared:
-        return ()
-    if len(prepared) > MAX_PROMPT_ANNOTATIONS_PER_BATCH:
-        raise ArtifactValidationError("a prompt annotation batch may contain at most 16 items")
-    if len({item.expected_annotation.annotation_id for item in prepared}) != len(prepared):
-        raise ArtifactValidationError("prompt annotation ids must be unique")
-    if len({item.anchor_id for item in prepared}) != len(prepared):
-        raise ArtifactValidationError("prepared prompt annotation anchor ids must be unique")
-    if not message_id.strip() or not turn_id.strip():
-        raise ArtifactValidationError("message_id and turn_id must not be empty")
-    if isinstance(updated_at, bool) or updated_at < 0:
-        raise ArtifactValidationError("updated_at must be a non-negative integer")
-
-    expected = tuple(item.expected_annotation for item in prepared)
-    current = await preflight_prompt_annotations_on_conn(
-        conn,
-        annotation_ids=tuple(item.annotation_id for item in expected),
-        session_key=session_key,
-        session_id=session_id,
-        session_epoch=session_epoch,
-        require_current_head=False,
-    )
-    document_ids = {item.document_id for item in expected}
-    revision_ids = {item.revision_id for item in prepared}
-    if len(document_ids) != 1 or len(revision_ids) != 1:
-        raise ArtifactValidationError("prepared prompt annotations must target one current head")
-    document_id = next(iter(document_ids))
-    current_revision_id = next(iter(revision_ids))
-    document_row = await _fetchone(
-        conn,
-        """
-        SELECT session_key, session_id, head_revision_id
-        FROM artifact_documents
-        WHERE document_id = ?
-        """,
-        (document_id,),
-    )
-    if (
-        document_row is None
-        or str(document_row["session_key"]) != session_key
-        or str(document_row["session_id"]) != session_id
-    ):
-        raise ArtifactNotFoundError(f"document not found: {document_id}")
-    if str(document_row["head_revision_id"]) != current_revision_id:
-        raise ArtifactConflictError("document changed while prompt annotations were prepared")
-    revision_row = await _fetchone(
-        conn,
-        "SELECT document_id FROM artifact_revisions WHERE revision_id = ?",
-        (current_revision_id,),
-    )
-    if revision_row is None or str(revision_row["document_id"]) != document_id:
-        raise ArtifactConflictError("prepared prompt annotation revision is unavailable")
-
-    for prepared_item, expected_item, current_item in zip(
-        prepared,
-        expected,
-        current,
-        strict=True,
-    ):
-        expected_hash = hashlib.sha256(expected_item.body.encode("utf-8")).digest()
-        current_hash = hashlib.sha256(current_item.body.encode("utf-8")).digest()
-        if (
-            expected_item.annotation_id != current_item.annotation_id
-            or expected_item.state_revision != current_item.state_revision
-            or expected_item.document_id != current_item.document_id
-            or expected_item.revision_id != current_item.revision_id
-            or expected_item.anchor_id != current_item.anchor_id
-            or prepared_item.previous_anchor_id != current_item.anchor_id
-            or expected_hash != current_hash
-        ):
-            raise ArtifactConflictError("prompt annotation changed after normalization")
-        previous_anchor = await _fetchone(
-            conn,
-            """
-            SELECT document_id, revision_id
-            FROM artifact_anchors
-            WHERE anchor_id = ?
-            """,
-            (prepared_item.previous_anchor_id,),
-        )
-        if (
-            previous_anchor is None
-            or str(previous_anchor["document_id"]) != document_id
-            or str(previous_anchor["revision_id"]) != current_item.revision_id
-        ):
-            raise ArtifactConflictError("prompt annotation source anchor changed")
-        await conn.execute(
-            """
-            INSERT INTO artifact_anchors (
-                anchor_id, document_id, revision_id, kind, locator_json,
-                quote, context_json, state, remapped_from_anchor_id, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                prepared_item.anchor_id,
-                document_id,
-                current_revision_id,
-                prepared_item.kind.value,
-                _json_dumps(prepared_item.locator),
-                prepared_item.quote,
-                _json_dumps(prepared_item.context),
-                prepared_item.state.value,
-                prepared_item.previous_anchor_id,
-                updated_at,
-            ),
-        )
-        await conn.execute(
-            """
-            INSERT INTO artifact_audit_events (
-                event_id, document_id, event_type, actor_kind, actor_id,
-                revision_id, anchor_id, payload_json, created_at
-            ) VALUES (?, ?, 'anchor.remapped', ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                prepared_item.audit_event_id,
-                document_id,
-                prepared_item.actor_kind.value,
-                prepared_item.actor_id,
-                current_revision_id,
-                prepared_item.anchor_id,
-                _json_dumps(
-                    {
-                        "kind": prepared_item.kind.value,
-                        "remapped_from_anchor_id": prepared_item.previous_anchor_id,
-                        "state": prepared_item.state.value,
-                    }
-                ),
-                updated_at,
-            ),
-        )
-
-    consumed: list[PromptAnnotation] = []
-    for sent_order, (prepared_item, annotation) in enumerate(zip(prepared, current, strict=True)):
-        cursor = await conn.execute(
-            """
-            UPDATE artifact_prompt_annotations
-            SET revision_id = ?, anchor_id = ?, status = ?,
-                state_revision = state_revision + 1,
-                sent_message_id = ?, sent_turn_id = ?, sent_order = ?, updated_at = ?
-            WHERE annotation_id = ? AND status = ? AND state_revision = ?
-              AND revision_id = ? AND anchor_id = ? AND body = ?
-            """,
-            (
-                current_revision_id,
-                prepared_item.anchor_id,
-                PromptAnnotationStatus.SENT.value,
-                message_id,
-                turn_id,
-                sent_order,
-                updated_at,
-                annotation.annotation_id,
-                PromptAnnotationStatus.DRAFT.value,
-                annotation.state_revision,
-                annotation.revision_id,
-                annotation.anchor_id,
-                annotation.body,
-            ),
-        )
-        try:
-            if cursor.rowcount != 1:
-                raise ArtifactConflictError("prompt annotation compare-and-swap failed")
-        finally:
-            await cursor.close()
-        consumed.append(await get_prompt_annotation_on_conn(conn, annotation.annotation_id))
-    return tuple(consumed)
-
-
-async def consume_prompt_annotations_on_conn(
-    conn: Any,
-    *,
-    expected_annotations: Sequence[PromptAnnotation],
-    session_key: str,
-    session_id: str,
-    session_epoch: int,
-    message_id: str,
-    turn_id: str,
-    updated_at: int,
-) -> tuple[PromptAnnotation, ...]:
-    """Atomically fence and mark a preflighted batch sent on a caller-owned connection."""
-
-    expected = tuple(expected_annotations)
-    current = await preflight_prompt_annotations_on_conn(
-        conn,
-        annotation_ids=tuple(item.annotation_id for item in expected),
-        session_key=session_key,
-        session_id=session_id,
-        session_epoch=session_epoch,
-    )
-    if not message_id.strip() or not turn_id.strip():
-        raise ArtifactValidationError("message_id and turn_id must not be empty")
-    if isinstance(updated_at, bool) or updated_at < 0:
-        raise ArtifactValidationError("updated_at must be a non-negative integer")
-
-    for expected_item, current_item in zip(expected, current, strict=True):
-        expected_hash = hashlib.sha256(expected_item.body.encode("utf-8")).digest()
-        current_hash = hashlib.sha256(current_item.body.encode("utf-8")).digest()
-        if (
-            expected_item.annotation_id != current_item.annotation_id
-            or expected_item.state_revision != current_item.state_revision
-            or expected_item.document_id != current_item.document_id
-            or expected_item.revision_id != current_item.revision_id
-            or expected_item.anchor_id != current_item.anchor_id
-            or expected_hash != current_hash
-        ):
-            raise ArtifactConflictError("prompt annotation changed after preflight")
-
-    consumed: list[PromptAnnotation] = []
-    for sent_order, annotation in enumerate(current):
-        cursor = await conn.execute(
-            """
-            UPDATE artifact_prompt_annotations
-            SET status = ?, state_revision = state_revision + 1,
-                sent_message_id = ?, sent_turn_id = ?, sent_order = ?, updated_at = ?
-            WHERE annotation_id = ? AND status = ? AND state_revision = ? AND body = ?
-            """,
-            (
-                PromptAnnotationStatus.SENT.value,
-                message_id,
-                turn_id,
-                sent_order,
-                updated_at,
-                annotation.annotation_id,
-                PromptAnnotationStatus.DRAFT.value,
-                annotation.state_revision,
-                annotation.body,
-            ),
-        )
-        try:
-            if cursor.rowcount != 1:
-                raise ArtifactConflictError("prompt annotation compare-and-swap failed")
-        finally:
-            await cursor.close()
-        consumed.append(await get_prompt_annotation_on_conn(conn, annotation.annotation_id))
-    return tuple(consumed)
-
-
 def _edit_session_from_row(row: Any) -> EditSession:
     data = dict(row)
     data["mode"] = EditSessionMode(data["mode"])
@@ -742,6 +397,14 @@ class ArtifactSessionRepository:
         async with self._transaction("initialize") as conn:
             for statement in SCHEMA_STATEMENTS:
                 await conn.execute(statement)
+            await conn.execute("""
+                INSERT OR IGNORE INTO artifact_working_source_versions
+                SELECT working.base_revision_id, working.document_id,
+                       working.relative_root, working.entrypoint,
+                       source.bundle_mode, source.bundle_root
+                FROM artifact_working_files AS working
+                JOIN artifact_working_sources AS source USING(document_id)
+            """)
 
     async def _get_document_on_conn(self, conn: Any, document_id: str) -> Document:
         row = await _fetchone(
@@ -1096,6 +759,7 @@ class ArtifactSessionRepository:
         kind: ArtifactKind,
         deliverable: ArtifactBlobRef,
         actor: Actor,
+        working_source: dict[str, str] | None = None,
     ) -> tuple[CommitResult, DocumentSourceBinding, bool]:
         """Atomically adopt and bind one public generated deliverable.
 
@@ -1105,6 +769,23 @@ class ArtifactSessionRepository:
         """
 
         async with self._transaction("adopt_generated_deliverable") as conn:
+            if working_source is not None:
+                source_row = await _fetchone(conn, """
+                    SELECT document_id FROM artifact_working_sources
+                    WHERE session_key=? AND session_id=? AND workspace=? AND source_path=?
+                """, (session_key, session_id, working_source["workspace"],
+                       working_source["source_path"]))
+                if source_row is not None:
+                    document = await self._get_document_on_conn(conn, source_row["document_id"])
+                    revision = await self._get_revision_on_conn(conn, document.head_revision_id)
+                    bound = await _fetchone(conn,
+                        "SELECT * FROM document_source_bindings WHERE document_id=?",
+                        (document.document_id,))
+                    if bound is None:
+                        raise ArtifactConflictError("Working source has no document origin")
+                    return CommitResult(document=document, revision=revision), (
+                        _document_source_binding_from_row(bound)
+                    ), False
             binding_row = await _fetchone(
                 conn,
                 """
@@ -1227,7 +908,33 @@ class ArtifactSessionRepository:
                 ),
             )
             binding = await self._get_document_source_binding_on_conn(conn, binding_id)
+            if working_source is not None:
+                await conn.execute(
+                    "INSERT INTO artifact_working_files VALUES (?, ?, ?, ?, ?)",
+                    (commit.document.document_id, working_source["workspace"],
+                     working_source["relative_root"], working_source["entrypoint"],
+                     commit.revision.revision_id),
+                )
+                await conn.execute("""
+                    INSERT INTO artifact_working_sources (
+                        document_id, session_key, session_id, workspace, source_path,
+                        bundle_mode, bundle_root
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """, (commit.document.document_id, session_key, session_id,
+                       working_source["workspace"], working_source["source_path"],
+                       working_source["bundle_mode"], working_source["bundle_root"] or None))
+                await conn.execute("""
+                    INSERT INTO artifact_working_source_versions VALUES (?, ?, ?, ?, ?, ?)
+                """, (commit.revision.revision_id, commit.document.document_id,
+                       working_source["relative_root"], working_source["entrypoint"],
+                       working_source["bundle_mode"], working_source["bundle_root"] or None))
             return commit, binding, True
+
+    async def retire_legacy_html_state(self) -> None:
+        """Apply the same idempotent retirement as migration V041 in one transaction."""
+        async with self._transaction("retire_legacy_html_state") as conn:
+            for statement in RETIREMENT_STATEMENTS:
+                await conn.execute(statement)
 
     async def get_document(self, document_id: str) -> Document:
         async with self._read_transaction("get_document") as conn:
@@ -2241,29 +1948,6 @@ class ArtifactSessionRepository:
             )
             return tuple(_revision_from_row(row) for row in rows)
 
-    async def _validate_writer_lease(
-        self,
-        conn: Any,
-        *,
-        document_id: str,
-        lease_id: str,
-        fencing_token: int,
-        now: int,
-    ) -> WriterLease:
-        row = await _fetchone(
-            conn,
-            "SELECT * FROM artifact_writer_leases WHERE document_id = ?",
-            (document_id,),
-        )
-        if row is None:
-            raise WriterLeaseExpiredError("document has no active writer lease")
-        lease = _writer_lease_from_row(row)
-        if lease.lease_id != lease_id or lease.fencing_token != fencing_token:
-            raise WriterLeaseExpiredError("writer lease fencing token is stale")
-        if lease.expires_at <= now:
-            raise WriterLeaseExpiredError("writer lease has expired")
-        return lease
-
     async def _commit_revision_on_conn(
         self,
         conn: Any,
@@ -2276,9 +1960,6 @@ class ArtifactSessionRepository:
         source: RevisionSource,
         change_set_id: str | None = None,
         copied_from_revision_id: str | None = None,
-        lease_id: str | None = None,
-        fencing_token: int | None = None,
-        require_lease: bool = False,
         event_type: str = "revision.committed",
         revision_id: str | None = None,
     ) -> CommitResult:
@@ -2290,20 +1971,6 @@ class ArtifactSessionRepository:
         ):
             raise ArtifactConflictError(
                 "document head changed; refresh head_revision_id and state_revision"
-            )
-        if require_lease and (lease_id is None or fencing_token is None):
-            raise WriterLeaseExpiredError("a live writer lease is required")
-        if lease_id is not None or fencing_token is not None:
-            if lease_id is None or fencing_token is None:
-                raise ArtifactValidationError(
-                    "lease_id and fencing_token must be supplied together"
-                )
-            await self._validate_writer_lease(
-                conn,
-                document_id=document_id,
-                lease_id=lease_id,
-                fencing_token=fencing_token,
-                now=now,
             )
         if copied_from_revision_id is not None:
             copied = await self._get_revision_on_conn(conn, copied_from_revision_id)
@@ -2369,13 +2036,11 @@ class ArtifactSessionRepository:
             actor=actor,
             revision_id=revision_id,
             change_set_id=change_set_id,
-            lease_id=lease_id,
             payload={
                 "generation": generation,
                 "parent_revision_id": document.head_revision_id,
                 "copied_from_revision_id": copied_from_revision_id,
                 "source": source.value,
-                "fencing_token": fencing_token,
             },
             created_at=now,
         )
@@ -2392,9 +2057,6 @@ class ArtifactSessionRepository:
         artifact: ArtifactBlobRef,
         actor: Actor,
         source: RevisionSource = RevisionSource.MANUAL,
-        lease_id: str | None = None,
-        fencing_token: int | None = None,
-        require_lease: bool = False,
     ) -> CommitResult:
         """Advance head only when both caller head expectations still match."""
 
@@ -2409,9 +2071,6 @@ class ArtifactSessionRepository:
                 artifact=artifact,
                 actor=actor,
                 source=source,
-                lease_id=lease_id,
-                fencing_token=fencing_token,
-                require_lease=require_lease,
             )
 
     async def _copy_revision_as_new_head(
@@ -2425,9 +2084,6 @@ class ArtifactSessionRepository:
         expected_head_revision_id: str,
         expected_state_revision: int,
         actor: Actor,
-        lease_id: str | None,
-        fencing_token: int | None,
-        require_lease: bool,
     ) -> CommitResult:
         async with self._transaction(operation) as conn:
             target = await self._get_revision_on_conn(conn, target_revision_id)
@@ -2442,9 +2098,6 @@ class ArtifactSessionRepository:
                 actor=actor,
                 source=source,
                 copied_from_revision_id=target_revision_id,
-                lease_id=lease_id,
-                fencing_token=fencing_token,
-                require_lease=require_lease,
                 event_type=event_type,
             )
 
@@ -2456,25 +2109,144 @@ class ArtifactSessionRepository:
         expected_head_revision_id: str,
         expected_state_revision: int,
         actor: Actor,
-        lease_id: str | None = None,
-        fencing_token: int | None = None,
-        require_lease: bool = False,
+        turn_id: str | None = None,
+        no_op: bool | None = None,
     ) -> CommitResult:
-        """Restore bytes by appending a new revision; never move head backwards."""
+        """Select an existing revision without allocating another content version."""
 
-        return await self._copy_revision_as_new_head(
-            operation="restore_revision",
-            event_type="document.restored",
-            source=RevisionSource.RESTORE,
-            document_id=document_id,
-            target_revision_id=target_revision_id,
-            expected_head_revision_id=expected_head_revision_id,
-            expected_state_revision=expected_state_revision,
-            actor=actor,
-            lease_id=lease_id,
-            fencing_token=fencing_token,
-            require_lease=require_lease,
-        )
+        async with self._transaction("restore_revision") as conn:
+            result, _, _ = await self._restore_revision_on_conn(
+                conn,
+                document_id=document_id,
+                target_revision_id=target_revision_id,
+                expected_head_revision_id=expected_head_revision_id,
+                expected_state_revision=expected_state_revision,
+                actor=actor,
+                turn_id=turn_id,
+                no_op=no_op,
+            )
+            return result
+
+    async def _restore_revision_on_conn(
+        self,
+        conn: Any,
+        *,
+        document_id: str,
+        target_revision_id: str,
+        expected_head_revision_id: str,
+        expected_state_revision: int,
+        actor: Actor,
+        turn_id: str | None = None,
+        no_op: bool | None = None,
+    ) -> tuple[CommitResult, ChangeSet | None, bool]:
+        """Restore head within the caller's working-file transaction.
+
+        A replay returns the original result and the current document without
+        mutating either. Callers must skip filesystem restoration on replay.
+        Pass no_op=False when the head is already selected but working files
+        need restoration; the state epoch must fence that real change too.
+        """
+
+        if no_op is not None and type(no_op) is not bool:
+            raise ArtifactValidationError("no_op must be a boolean")
+        document = await self._get_document_on_conn(conn, document_id)
+        target = await self._get_revision_on_conn(conn, target_revision_id)
+        if target.document_id != document_id:
+            raise ArtifactValidationError("target revision belongs to another document")
+        operations = ({
+            "op": "restore_revision",
+            "target_revision_id": target_revision_id,
+            "target_sha256": target.artifact_sha256,
+            "expected_document_state_revision": expected_state_revision,
+        },)
+        change: ChangeSet | None = None
+        if turn_id is not None:
+            row = await _fetchone(
+                conn, "SELECT * FROM artifact_change_sets WHERE turn_id = ?", (turn_id,),
+            )
+            if row is not None:
+                change = _change_set_from_row(row)
+                if (
+                    change.document_id != document_id
+                    or change.base_revision_id != expected_head_revision_id
+                    or change.operations != operations
+                    or change.candidate_artifact_id != target.artifact_id
+                    or change.candidate_artifact_sha256 != target.artifact_sha256
+                ):
+                    raise ArtifactConflictError("request was used for a different document restore")
+                if change.status is not ChangeSetStatus.APPLIED or not change.applied_revision_id:
+                    raise ArtifactConflictError("document restoration receipt is not applied")
+                applied = await self._get_revision_on_conn(conn, change.applied_revision_id)
+                state = head_restore_receipt_state_revision(change, applied)
+                if state is None and (
+                    applied.document_id != document_id
+                    or applied.change_set_id != change.change_set_id
+                    or applied.artifact != target.artifact
+                    or applied.source is not RevisionSource.RESTORE
+                    or applied.copied_from_revision_id != target_revision_id
+                ):
+                    raise ArtifactConflictError("document restoration receipt is inconsistent")
+                return CommitResult(document=document, revision=applied), change, True
+        if (
+            document.head_revision_id != expected_head_revision_id
+            or document.state_revision != expected_state_revision
+        ):
+            raise ArtifactConflictError("document head changed; refresh head and state revision")
+        same_head = document.head_revision_id == target_revision_id
+        if no_op is True and not same_head:
+            raise ArtifactValidationError("a head change cannot be a no-op")
+        unchanged = same_head if no_op is None else no_op
+        result_state = document.state_revision + (0 if unchanged else 1)
+        now = self._clock()
+        if not unchanged:
+            cursor = await conn.execute(
+                "UPDATE artifact_documents SET head_revision_id=?, state_revision=?, updated_at=? "
+                "WHERE document_id=? AND head_revision_id=? AND state_revision=?",
+                (target_revision_id, result_state, now, document_id,
+                 expected_head_revision_id, expected_state_revision),
+            )
+            try:
+                if cursor.rowcount != 1:
+                    raise ArtifactConflictError("document head compare-and-swap failed")
+            finally:
+                await cursor.close()
+        change = None
+        if turn_id is not None:
+            change_id = self._id_factory("change")
+            await conn.execute(
+                """
+                INSERT INTO artifact_change_sets (
+                    change_set_id, document_id, base_revision_id, turn_id,
+                    summary, status, operations_json, candidate_artifact_id,
+                    candidate_artifact_sha256, candidate_filename, candidate_media_type,
+                    candidate_byte_size, validation_json, state_revision,
+                    created_by_kind, created_by_id, applied_revision_id, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 3, ?, ?, ?, ?, ?)
+                """,
+                (change_id, document_id, expected_head_revision_id, turn_id,
+                 "Restore document revision", ChangeSetStatus.APPLIED.value,
+                 _json_dumps(list(operations)), target.artifact_id, target.artifact_sha256,
+                 target.filename, target.media_type, target.byte_size,
+                 _json_dumps({"restore_mode": "head_pointer",
+                              "result_state_revision": result_state, "no_op": unchanged}),
+                 actor.kind.value, actor.actor_id, target_revision_id, now, now),
+            )
+            change = await self._get_change_set_on_conn(conn, change_id)
+        if not unchanged:
+            await self._append_audit(
+                conn,
+                document_id=document_id,
+                event_type="document.restored",
+                actor=actor,
+                revision_id=target_revision_id,
+                change_set_id=change.change_set_id if change else None,
+                payload={"previous_head_revision_id": expected_head_revision_id,
+                         "target_revision_id": target_revision_id,
+                         "result_state_revision": result_state},
+                created_at=now,
+            )
+        updated = await self._get_document_on_conn(conn, document_id)
+        return CommitResult(document=updated, revision=target), change, False
 
     async def revert_revision(
         self,
@@ -2484,9 +2256,6 @@ class ArtifactSessionRepository:
         expected_head_revision_id: str,
         expected_state_revision: int,
         actor: Actor,
-        lease_id: str | None = None,
-        fencing_token: int | None = None,
-        require_lease: bool = False,
     ) -> CommitResult:
         """Revert to a snapshot by appending a new revision with explicit provenance."""
 
@@ -2499,84 +2268,7 @@ class ArtifactSessionRepository:
             expected_head_revision_id=expected_head_revision_id,
             expected_state_revision=expected_state_revision,
             actor=actor,
-            lease_id=lease_id,
-            fencing_token=fencing_token,
-            require_lease=require_lease,
         )
-
-    async def acquire_writer_lease(
-        self,
-        *,
-        document_id: str,
-        holder_id: str,
-        ttl_ms: int,
-        actor: Actor,
-    ) -> WriterLease:
-        """Acquire exclusive ownership and allocate the next monotonic fence."""
-
-        now = self._clock()
-        async with self._transaction("acquire_writer_lease") as conn:
-            document = await self._get_document_on_conn(conn, document_id)
-            row = await _fetchone(
-                conn,
-                "SELECT * FROM artifact_writer_leases WHERE document_id = ?",
-                (document_id,),
-            )
-            if row is not None:
-                current = _writer_lease_from_row(row)
-                if current.expires_at > now:
-                    if current.holder_id == holder_id:
-                        return current
-                    raise WriterLeaseConflictError("another writer owns the document lease")
-                await conn.execute(
-                    "DELETE FROM artifact_writer_leases WHERE document_id = ?",
-                    (document_id,),
-                )
-            token = document.writer_fencing_token + 1
-            lease_id = self._id_factory("lease")
-            expires_at = now + ttl_ms
-            cursor = await conn.execute(
-                """
-                UPDATE artifact_documents
-                SET writer_fencing_token = ?
-                WHERE document_id = ? AND writer_fencing_token = ?
-                """,
-                (token, document_id, document.writer_fencing_token),
-            )
-            try:
-                if cursor.rowcount != 1:
-                    raise ArtifactConflictError("writer fencing token compare-and-swap failed")
-            finally:
-                await cursor.close()
-            await conn.execute(
-                """
-                INSERT INTO artifact_writer_leases (
-                    document_id, lease_id, holder_id, fencing_token,
-                    expires_at, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
-                """,
-                (document_id, lease_id, holder_id, token, expires_at, now, now),
-            )
-            await self._append_audit(
-                conn,
-                document_id=document_id,
-                event_type="writer_lease.acquired",
-                actor=actor,
-                lease_id=lease_id,
-                payload={
-                    "holder_id": holder_id,
-                    "fencing_token": token,
-                    "expires_at": expires_at,
-                },
-                created_at=now,
-            )
-            row = await _fetchone(
-                conn,
-                "SELECT * FROM artifact_writer_leases WHERE document_id = ?",
-                (document_id,),
-            )
-            assert row is not None
-            return _writer_lease_from_row(row)
 
     async def get_writer_lease(self, document_id: str) -> WriterLease | None:
         async with self._transaction("get_writer_lease") as conn:
@@ -2591,87 +2283,6 @@ class ArtifactSessionRepository:
             lease = _writer_lease_from_row(row)
             return lease if lease.expires_at > self._clock() else None
 
-    async def renew_writer_lease(
-        self,
-        *,
-        document_id: str,
-        lease_id: str,
-        fencing_token: int,
-        ttl_ms: int,
-        actor: Actor,
-    ) -> WriterLease:
-        now = self._clock()
-        async with self._transaction("renew_writer_lease") as conn:
-            lease = await self._validate_writer_lease(
-                conn,
-                document_id=document_id,
-                lease_id=lease_id,
-                fencing_token=fencing_token,
-                now=now,
-            )
-            expires_at = now + ttl_ms
-            await conn.execute(
-                """
-                UPDATE artifact_writer_leases
-                SET expires_at = ?, updated_at = ?
-                WHERE document_id = ? AND lease_id = ? AND fencing_token = ?
-                """,
-                (expires_at, now, document_id, lease_id, fencing_token),
-            )
-            await self._append_audit(
-                conn,
-                document_id=document_id,
-                event_type="writer_lease.renewed",
-                actor=actor,
-                lease_id=lease_id,
-                payload={"fencing_token": fencing_token, "expires_at": expires_at},
-                created_at=now,
-            )
-            return WriterLease(
-                lease_id=lease.lease_id,
-                document_id=lease.document_id,
-                holder_id=lease.holder_id,
-                fencing_token=lease.fencing_token,
-                expires_at=expires_at,
-                created_at=lease.created_at,
-                updated_at=now,
-                schema_version=lease.schema_version,
-            )
-
-    async def release_writer_lease(
-        self,
-        *,
-        document_id: str,
-        lease_id: str,
-        fencing_token: int,
-        actor: Actor,
-    ) -> None:
-        now = self._clock()
-        async with self._transaction("release_writer_lease") as conn:
-            await self._validate_writer_lease(
-                conn,
-                document_id=document_id,
-                lease_id=lease_id,
-                fencing_token=fencing_token,
-                now=now,
-            )
-            await conn.execute(
-                """
-                DELETE FROM artifact_writer_leases
-                WHERE document_id = ? AND lease_id = ? AND fencing_token = ?
-                """,
-                (document_id, lease_id, fencing_token),
-            )
-            await self._append_audit(
-                conn,
-                document_id=document_id,
-                event_type="writer_lease.released",
-                actor=actor,
-                lease_id=lease_id,
-                payload={"fencing_token": fencing_token},
-                created_at=now,
-            )
-
     async def create_change_set(
         self,
         *,
@@ -2682,7 +2293,6 @@ class ArtifactSessionRepository:
         turn_id: str | None = None,
         summary: str = "",
         change_set_id: str | None = None,
-        candidate_loop: bool = False,
     ) -> ChangeSet:
         """Persist an agent or user change set against an immutable base revision."""
 
@@ -2733,7 +2343,6 @@ class ArtifactSessionRepository:
                     "base_revision_id": base_revision_id,
                     "operation_count": len(operations),
                     "turn_id": turn_id,
-                    "candidate_loop": candidate_loop,
                 },
                 created_at=now,
             )
@@ -2763,51 +2372,6 @@ class ArtifactSessionRepository:
             )
             return None if row is None else _change_set_from_row(row)
 
-    async def _is_candidate_loop_change_set_on_conn(
-        self,
-        conn: Any,
-        change_set_id: str,
-    ) -> bool:
-        row = await _fetchone(
-            conn,
-            """
-            SELECT 1
-            FROM artifact_change_sets AS change_set
-            JOIN artifact_audit_events AS candidate_audit
-              ON candidate_audit.change_set_id = change_set.change_set_id
-            WHERE change_set.change_set_id = ?
-              AND change_set.turn_id IS NOT NULL
-              AND candidate_audit.event_type = 'change_set.created'
-              AND json_extract(
-                  CASE
-                      WHEN json_valid(candidate_audit.payload_json)
-                      THEN candidate_audit.payload_json
-                      ELSE '{}'
-                  END,
-                  '$.candidate_loop'
-              ) = 1
-            LIMIT 1
-            """,
-            (change_set_id,),
-        )
-        return row is not None
-
-    async def is_candidate_loop_change_set(self, change_set_id: str) -> bool:
-        """Return whether an immutable creation audit marks a candidate loop.
-
-        ``created_by_kind`` and ``turn_id`` are intentionally insufficient
-        ownership signals: ordinary collaboration/review proposals may also
-        be agent-authored and turn-scoped.  The candidate controller writes a
-        dedicated flag in the creation audit payload, which is the only
-        signal used by restart cleanup and mutation reconciliation.
-        """
-
-        async with self._read_transaction("is_candidate_loop_change_set") as conn:
-            return await self._is_candidate_loop_change_set_on_conn(
-                conn,
-                change_set_id,
-            )
-
     async def list_change_sets(
         self,
         document_id: str,
@@ -2823,6 +2387,11 @@ class ArtifactSessionRepository:
                     """
                     SELECT * FROM artifact_change_sets
                     WHERE document_id = ?
+                      AND NOT (
+                        COALESCE(json_extract(validation_json, '$.restore_mode'), '')
+                            = 'head_pointer'
+                        AND COALESCE(json_type(validation_json, '$.no_op'), '') = 'true'
+                      )
                     ORDER BY updated_at DESC, change_set_id
                     LIMIT ?
                     """,
@@ -2834,6 +2403,11 @@ class ArtifactSessionRepository:
                     """
                     SELECT * FROM artifact_change_sets
                     WHERE document_id = ? AND status = ?
+                      AND NOT (
+                        COALESCE(json_extract(validation_json, '$.restore_mode'), '')
+                            = 'head_pointer'
+                        AND COALESCE(json_type(validation_json, '$.no_op'), '') = 'true'
+                      )
                     ORDER BY updated_at DESC, change_set_id
                     LIMIT ?
                     """,
@@ -2841,412 +2415,15 @@ class ArtifactSessionRepository:
                 )
             return tuple(_change_set_from_row(row) for row in rows)
 
-    async def list_draft_change_sets(
-        self,
-        *,
-        limit: int = 100,
-        candidate_only: bool = False,
-    ) -> tuple[ChangeSet, ...]:
-        """Return durable drafts, optionally narrowed to agent turn candidates.
-
-        Candidate-loop controllers and opaque preview handles are turn-local;
-        after a Gateway restart no live owner can safely resume those rows.
-        ``candidate_only`` keeps restart cleanup from rejecting ordinary
-        user-authored drafts that do not carry a turn-scoped agent owner.
-        """
-
-        if isinstance(limit, bool) or not 1 <= limit <= 1000:
-            raise ArtifactValidationError("limit must be between 1 and 1000")
-        if not isinstance(candidate_only, bool):
-            raise ArtifactValidationError("candidate_only must be a boolean")
-        candidate_clause = ""
-        params: list[Any] = [ChangeSetStatus.DRAFT.value]
-        if candidate_only:
-            # ``turn_id`` alone is not a candidate-loop marker: collaboration
-            # and review flows may also key an agent proposal by turn.  The
-            # controller opts into restart cleanup through an immutable
-            # ``change_set.created`` audit payload flag, leaving ordinary
-            # agent-owned DRAFTs untouched.
-            candidate_clause = """
-                AND turn_id IS NOT NULL
-                AND EXISTS (
-                    SELECT 1
-                    FROM artifact_audit_events AS candidate_audit
-                    WHERE candidate_audit.change_set_id = artifact_change_sets.change_set_id
-                      AND candidate_audit.event_type = 'change_set.created'
-                      AND json_extract(
-                          CASE
-                              WHEN json_valid(candidate_audit.payload_json)
-                              THEN candidate_audit.payload_json
-                              ELSE '{}'
-                          END,
-                          '$.candidate_loop'
-                      ) = 1
-                )
-            """
-        params.append(limit)
-        async with self._transaction("list_draft_change_sets") as conn:
+    async def list_draft_change_sets(self, *, limit: int = 100) -> tuple[ChangeSet, ...]:
+        async with self._read_transaction("list_draft_change_sets") as conn:
             rows = await _fetchall(
                 conn,
-                f"""
-                SELECT * FROM artifact_change_sets
-                WHERE status = ?{candidate_clause}
-                ORDER BY updated_at ASC, change_set_id
-                LIMIT ?
-                """,
-                tuple(params),
+                """SELECT * FROM artifact_change_sets WHERE status = 'draft'
+                   ORDER BY updated_at ASC, change_set_id LIMIT ?""",
+                (limit,),
             )
             return tuple(_change_set_from_row(row) for row in rows)
-
-    async def list_applied_candidate_change_sets(
-        self,
-        *,
-        limit: int = 100,
-    ) -> tuple[tuple[str, str, str, str], ...]:
-        """Return applied agent turns whose candidate blobs need boot cleanup.
-
-        The result is ``(document_id, session_id, turn_id, current_artifact_id)``.
-        Candidate blobs are internal and turn-marked; recovery uses this durable
-        ownership tuple to remove superseded blobs after a final commit while
-        preserving the artifact referenced by the applied revision.
-        """
-
-        if isinstance(limit, bool) or not 1 <= limit <= 1000:
-            raise ArtifactValidationError("limit must be between 1 and 1000")
-        async with self._read_transaction("list_applied_candidate_change_sets") as conn:
-            rows = await _fetchall(
-                conn,
-                """
-                SELECT change_set.document_id, document.session_id,
-                       change_set.turn_id,
-                       revision.artifact_id AS current_artifact_id
-                FROM artifact_change_sets AS change_set
-                JOIN artifact_documents AS document
-                  ON document.document_id = change_set.document_id
-                JOIN artifact_revisions AS revision
-                  ON revision.revision_id = change_set.applied_revision_id
-                WHERE change_set.status = ?
-                  AND change_set.turn_id IS NOT NULL
-                  AND document.session_id IS NOT NULL
-                  AND revision.artifact_id IS NOT NULL
-                  AND EXISTS (
-                      SELECT 1
-                      FROM artifact_audit_events AS candidate_audit
-                      WHERE candidate_audit.change_set_id = change_set.change_set_id
-                        AND candidate_audit.event_type = 'change_set.created'
-                        AND json_extract(
-                            CASE
-                                WHEN json_valid(candidate_audit.payload_json)
-                                THEN candidate_audit.payload_json
-                                ELSE '{}'
-                            END,
-                            '$.candidate_loop'
-                        ) = 1
-                  )
-                ORDER BY change_set.updated_at ASC, change_set.change_set_id
-                LIMIT ?
-                """,
-                (ChangeSetStatus.APPLIED.value, limit),
-            )
-            records: list[tuple[str, str, str, str]] = []
-            for row in rows:
-                document_id = row["document_id"]
-                session_id = row["session_id"]
-                turn_id = row["turn_id"]
-                artifact_id = row["current_artifact_id"]
-                if not all(
-                    isinstance(value, str) and value
-                    for value in (document_id, session_id, turn_id, artifact_id)
-                ):
-                    continue
-                records.append(
-                    (
-                        cast(str, document_id),
-                        cast(str, session_id),
-                        cast(str, turn_id),
-                        cast(str, artifact_id),
-                    )
-                )
-            return tuple(records)
-
-    async def list_rejected_candidate_artifacts(
-        self,
-        *,
-        limit: int = 500,
-    ) -> tuple[tuple[str, str, str, str], ...]:
-        """Return detached candidate blobs journaled by rejected change sets.
-
-        Rejecting a draft clears the candidate columns in the same SQLite
-        transaction, while the physical ``ArtifactStore`` bucket is removed
-        outside that transaction.  The rejection audit payload is therefore a
-        small, durable cleanup journal: a process crash between those two
-        operations must not strand an otherwise unreachable blob forever.
-
-        The result is ``(document_id, session_id, artifact_id, sha256)``.  Both
-        the rejected change-set join and the revision exclusion are performed
-        here so callers can safely retry this bounded sweep on every boot.
-        Historical ``candidate_updated`` events are included to cover a
-        replacement candidate whose best-effort deletion lost its response.
-        """
-
-        if isinstance(limit, bool) or not 1 <= limit <= 5000:
-            raise ArtifactValidationError("limit must be between 1 and 5000")
-        async with self._read_transaction("list_rejected_candidate_artifacts") as conn:
-            rows = await _fetchall(
-                conn,
-                """
-                SELECT audit.document_id, document.session_id,
-                       audit.payload_json, audit.change_set_id
-                FROM artifact_audit_events AS audit
-                JOIN artifact_documents AS document
-                  ON document.document_id = audit.document_id
-                JOIN artifact_change_sets AS change_set
-                  ON change_set.change_set_id = audit.change_set_id
-                WHERE audit.event_type IN (?, ?)
-                  AND change_set.status = ?
-                  AND change_set.candidate_artifact_id IS NULL
-                  AND document.session_id IS NOT NULL
-                  AND EXISTS (
-                      SELECT 1
-                      FROM artifact_audit_events AS candidate_created
-                      WHERE candidate_created.change_set_id = change_set.change_set_id
-                        AND candidate_created.event_type = 'change_set.created'
-                        AND json_extract(
-                            CASE
-                                WHEN json_valid(candidate_created.payload_json)
-                                THEN candidate_created.payload_json
-                                ELSE '{}'
-                            END,
-                            '$.candidate_loop'
-                        ) = 1
-                  )
-                  AND (
-                      audit.event_type = 'change_set.candidate_updated'
-                      OR json_extract(
-                          CASE
-                              WHEN json_valid(audit.payload_json)
-                              THEN audit.payload_json
-                              ELSE '{}'
-                          END,
-                          '$.candidate_cleanup'
-                      ) = 1
-                  )
-                  AND NOT EXISTS (
-                    SELECT 1 FROM artifact_revisions AS revision
-                    WHERE revision.document_id = audit.document_id
-                      AND revision.artifact_id = json_extract(
-                          audit.payload_json, '$.candidate_artifact_id'
-                      )
-                  )
-                  AND NOT EXISTS (
-                    SELECT 1 FROM artifact_audit_events AS cleanup
-                    WHERE cleanup.document_id = audit.document_id
-                      AND cleanup.event_type = 'candidate.artifact_cleaned'
-                      AND json_extract(
-                          CASE
-                              WHEN json_valid(cleanup.payload_json)
-                              THEN cleanup.payload_json
-                              ELSE '{}'
-                          END,
-                          '$.candidate_artifact_id'
-                      ) = json_extract(
-                          CASE
-                              WHEN json_valid(audit.payload_json)
-                              THEN audit.payload_json
-                              ELSE '{}'
-                          END,
-                          '$.candidate_artifact_id'
-                      )
-                  )
-                ORDER BY audit.sequence
-                LIMIT ?
-                """,
-                (
-                    "change_set.rejected",
-                    "change_set.candidate_updated",
-                    ChangeSetStatus.REJECTED.value,
-                    limit,
-                ),
-            )
-            candidates: list[tuple[str, str, str, str]] = []
-            seen: set[tuple[str, str]] = set()
-            for row in rows:
-                payload = _json_object(row["payload_json"])
-                artifact_id = payload.get("candidate_artifact_id")
-                sha256 = payload.get("candidate_artifact_sha256")
-                session_id = row["session_id"]
-                document_id = row["document_id"]
-                if not all(
-                    isinstance(value, str) and value
-                    for value in (document_id, session_id, artifact_id, sha256)
-                ):
-                    continue
-                # The runtime checks above deliberately validate values at
-                # the boundary where SQLite's dynamically typed rows enter
-                # the typed repository result.  Keep concrete locals so
-                # static type checkers (and future callers) cannot observe
-                # the row's ``Any``/nullable shape.
-                document_id_value = cast(str, document_id)
-                session_id_value = cast(str, session_id)
-                artifact_id_value = cast(str, artifact_id)
-                sha256_value = cast(str, sha256)
-                key = (session_id_value, artifact_id_value)
-                if key in seen:
-                    continue
-                seen.add(key)
-                candidates.append(
-                    (document_id_value, session_id_value, artifact_id_value, sha256_value)
-                )
-            return tuple(candidates)
-
-    async def list_applied_candidate_artifacts(
-        self,
-        *,
-        limit: int = 500,
-    ) -> tuple[tuple[str, str, str, str, str], ...]:
-        """Return superseded candidate blobs from applied candidate loops."""
-
-        if isinstance(limit, bool) or not 1 <= limit <= 5000:
-            raise ArtifactValidationError("limit must be between 1 and 5000")
-        async with self._read_transaction("list_applied_candidate_artifacts") as conn:
-            rows = await _fetchall(
-                conn,
-                """
-                SELECT audit.document_id, document.session_id, audit.payload_json,
-                       revision.artifact_id AS current_artifact_id
-                FROM artifact_audit_events AS audit
-                JOIN artifact_documents AS document
-                  ON document.document_id = audit.document_id
-                JOIN artifact_change_sets AS change_set
-                  ON change_set.change_set_id = audit.change_set_id
-                JOIN artifact_revisions AS revision
-                  ON revision.revision_id = change_set.applied_revision_id
-                WHERE audit.event_type = 'change_set.candidate_updated'
-                  AND change_set.status = ?
-                  AND document.session_id IS NOT NULL
-                  AND EXISTS (
-                      SELECT 1
-                      FROM artifact_audit_events AS candidate_created
-                      WHERE candidate_created.change_set_id = change_set.change_set_id
-                        AND candidate_created.event_type = 'change_set.created'
-                        AND json_extract(
-                            CASE
-                                WHEN json_valid(candidate_created.payload_json)
-                                THEN candidate_created.payload_json
-                                ELSE '{}'
-                            END,
-                            '$.candidate_loop'
-                        ) = 1
-                  )
-                  AND NOT EXISTS (
-                      SELECT 1 FROM artifact_revisions AS revision
-                      WHERE revision.document_id = audit.document_id
-                        AND revision.artifact_id = json_extract(
-                            audit.payload_json, '$.candidate_artifact_id'
-                        )
-                  )
-                  AND NOT EXISTS (
-                      SELECT 1 FROM artifact_audit_events AS cleanup
-                      WHERE cleanup.document_id = audit.document_id
-                        AND cleanup.event_type = 'candidate.artifact_cleaned'
-                        AND json_extract(
-                            CASE
-                                WHEN json_valid(cleanup.payload_json)
-                                THEN cleanup.payload_json
-                                ELSE '{}'
-                            END,
-                            '$.candidate_artifact_id'
-                        ) = json_extract(
-                            CASE
-                                WHEN json_valid(audit.payload_json)
-                                THEN audit.payload_json
-                                ELSE '{}'
-                            END,
-                            '$.candidate_artifact_id'
-                        )
-                  )
-                ORDER BY audit.sequence
-                LIMIT ?
-                """,
-                (ChangeSetStatus.APPLIED.value, limit),
-            )
-            candidates: list[tuple[str, str, str, str, str]] = []
-            seen: set[tuple[str, str]] = set()
-            for row in rows:
-                payload = _json_object(row["payload_json"])
-                artifact_id = payload.get("candidate_artifact_id")
-                sha256 = payload.get("candidate_artifact_sha256")
-                session_id = row["session_id"]
-                document_id = row["document_id"]
-                current_artifact_id = row["current_artifact_id"]
-                if not all(
-                    isinstance(value, str) and value
-                    for value in (
-                        document_id,
-                        session_id,
-                        artifact_id,
-                        sha256,
-                        current_artifact_id,
-                    )
-                ):
-                    continue
-                values = (
-                    cast(str, document_id),
-                    cast(str, session_id),
-                    cast(str, artifact_id),
-                    cast(str, sha256),
-                    cast(str, current_artifact_id),
-                )
-                key = (values[1], values[2])
-                if key in seen:
-                    continue
-                seen.add(key)
-                candidates.append(values)
-            return tuple(candidates)
-
-    async def mark_candidate_artifact_cleaned(
-        self,
-        *,
-        document_id: str,
-        artifact_id: str,
-        sha256: str,
-        actor: Actor,
-    ) -> None:
-        """Durably retire one physical candidate cleanup journal entry."""
-
-        now = self._clock()
-        async with self._transaction("mark_candidate_artifact_cleaned") as conn:
-            await self._get_document_on_conn(conn, document_id)
-            existing = await _fetchone(
-                conn,
-                """
-                SELECT 1 FROM artifact_audit_events
-                WHERE document_id = ?
-                  AND event_type = 'candidate.artifact_cleaned'
-                  AND json_extract(
-                      CASE
-                          WHEN json_valid(payload_json) THEN payload_json
-                          ELSE '{}'
-                      END,
-                      '$.candidate_artifact_id'
-                  ) = ?
-                LIMIT 1
-                """,
-                (document_id, artifact_id),
-            )
-            if existing is not None:
-                return
-            await self._append_audit(
-                conn,
-                document_id=document_id,
-                event_type="candidate.artifact_cleaned",
-                actor=actor,
-                payload={
-                    "candidate_artifact_id": artifact_id,
-                    "candidate_artifact_sha256": sha256,
-                },
-                created_at=now,
-            )
 
     async def ready_change_set(
         self,
@@ -3306,83 +2483,6 @@ class ArtifactSessionRepository:
             )
             return await self._get_change_set_on_conn(conn, change_set_id)
 
-    async def update_draft_change_set_candidate(
-        self,
-        *,
-        change_set_id: str,
-        expected_state_revision: int,
-        candidate_artifact: ArtifactBlobRef,
-        operations: Sequence[dict[str, Any]],
-        validation: dict[str, Any] | None,
-        actor: Actor,
-    ) -> ChangeSet:
-        """CAS-update a turn-local candidate without publishing a revision.
-
-        A candidate loop may replace its proposed bytes many times while the
-        document head remains unchanged.  ``operations`` is the complete
-        aggregate for the candidate (rather than a delta); callers can safely
-        retry after a lost response by supplying the same payload and state
-        revision.  The change set stays ``DRAFT`` until the explicit final
-        commit boundary is crossed.
-        """
-
-        now = self._clock()
-        async with self._transaction("update_draft_change_set_candidate") as conn:
-            change_set = await self._get_change_set_on_conn(conn, change_set_id)
-            if change_set.state_revision != expected_state_revision:
-                raise ArtifactConflictError("change set state_revision changed")
-            if change_set.status is not ChangeSetStatus.DRAFT:
-                raise ArtifactConflictError("only a draft change set can stage a candidate")
-            document = await self._get_document_on_conn(conn, change_set.document_id)
-            if document.head_revision_id != change_set.base_revision_id:
-                raise ArtifactConflictError("change set base is no longer document head")
-            if not operations:
-                raise ArtifactValidationError("operations must not be empty")
-            cursor = await conn.execute(
-                """
-                UPDATE artifact_change_sets
-                SET operations_json = ?, candidate_artifact_id = ?,
-                    candidate_artifact_sha256 = ?, candidate_filename = ?,
-                    candidate_media_type = ?, candidate_byte_size = ?,
-                    validation_json = ?, state_revision = state_revision + 1,
-                    updated_at = ?
-                WHERE change_set_id = ? AND state_revision = ? AND status = ?
-                """,
-                (
-                    _json_dumps(list(operations)),
-                    candidate_artifact.artifact_id,
-                    candidate_artifact.sha256,
-                    candidate_artifact.filename,
-                    candidate_artifact.media_type,
-                    candidate_artifact.byte_size,
-                    None if validation is None else _json_dumps(validation),
-                    now,
-                    change_set_id,
-                    expected_state_revision,
-                    ChangeSetStatus.DRAFT.value,
-                ),
-            )
-            try:
-                if cursor.rowcount != 1:
-                    raise ArtifactConflictError("change set candidate compare-and-swap failed")
-            finally:
-                await cursor.close()
-            await self._append_audit(
-                conn,
-                document_id=change_set.document_id,
-                event_type="change_set.candidate_updated",
-                actor=actor,
-                change_set_id=change_set_id,
-                payload={
-                    "base_revision_id": change_set.base_revision_id,
-                    "candidate_artifact_id": candidate_artifact.artifact_id,
-                    "candidate_artifact_sha256": candidate_artifact.sha256,
-                    "operation_count": len(operations),
-                },
-                created_at=now,
-            )
-            return await self._get_change_set_on_conn(conn, change_set_id)
-
     async def reject_change_set(
         self,
         *,
@@ -3432,180 +2532,6 @@ class ArtifactSessionRepository:
             )
             return await self._get_change_set_on_conn(conn, change_set_id)
 
-    async def _reject_draft_change_set_and_cleanup_on_conn(
-        self,
-        conn: Any,
-        *,
-        change_set_id: str,
-        expected_state_revision: int,
-        actor: Actor,
-        reason: str | None,
-        require_no_active_mutation_attempt: bool,
-        recovery_failure_code: str | None,
-    ) -> tuple[ChangeSet, MutationAttempt | None]:
-        """Reject one DRAFT under an optional mutation-receipt fence."""
-
-        now = self._clock()
-        change_set = await self._get_change_set_on_conn(conn, change_set_id)
-        if change_set.state_revision != expected_state_revision:
-            raise ArtifactConflictError("change set state_revision changed")
-        if change_set.status is not ChangeSetStatus.DRAFT:
-            raise ArtifactConflictError("only a draft change set can be rejected")
-
-        terminal_attempt: MutationAttempt | None = None
-        inspect_attempt = require_no_active_mutation_attempt or recovery_failure_code is not None
-        if inspect_attempt:
-            if change_set.turn_id is None:
-                raise ArtifactValidationError("candidate draft has no mutation-attempt turn")
-            if not await self._is_candidate_loop_change_set_on_conn(
-                conn,
-                change_set.change_set_id,
-            ):
-                raise ArtifactConflictError(
-                    "change set is not owned by the candidate loop"
-                )
-            attempt_row = await _fetchone(
-                conn,
-                """
-                SELECT * FROM artifact_mutation_attempts
-                WHERE turn_id = ?
-                """,
-                (change_set.turn_id,),
-            )
-            if attempt_row is not None:
-                attempt = _mutation_attempt_from_row(attempt_row)
-                if (
-                    attempt.document_id != change_set.document_id
-                    or attempt.base_revision_id != change_set.base_revision_id
-                ):
-                    raise ArtifactConflictError(
-                        "mutation attempt belongs to another candidate"
-                    )
-                if attempt.status is MutationAttemptStatus.APPLIED:
-                    raise ArtifactConflictError("document finish has already committed")
-                if attempt.status in {
-                    MutationAttemptStatus.RESERVED,
-                    MutationAttemptStatus.AMBIGUOUS,
-                }:
-                    if recovery_failure_code is None:
-                        # Once finish has a durable receipt, normal turn
-                        # cleanup may no longer decide that no commit occurred.
-                        # Leave the DRAFT and receipt for explicit/restart
-                        # reconciliation instead of downgrading the outcome.
-                        raise ArtifactConflictError(
-                            "document finish outcome requires reconciliation"
-                        )
-                    terminal_attempt = await self._mark_mutation_attempt_failed_on_conn(
-                        conn,
-                        attempt=attempt,
-                        failure_code=recovery_failure_code,
-                        change_set_id=change_set.change_set_id,
-                    )
-                else:
-                    terminal_attempt = attempt
-
-        cursor = await conn.execute(
-            """
-            UPDATE artifact_change_sets
-            SET status = ?, candidate_artifact_id = NULL,
-                candidate_artifact_sha256 = NULL, candidate_filename = NULL,
-                candidate_media_type = NULL, candidate_byte_size = NULL,
-                validation_json = NULL, state_revision = state_revision + 1,
-                updated_at = ?
-            WHERE change_set_id = ? AND state_revision = ? AND status = ?
-            """,
-            (
-                ChangeSetStatus.REJECTED.value,
-                now,
-                change_set_id,
-                expected_state_revision,
-                ChangeSetStatus.DRAFT.value,
-            ),
-        )
-        try:
-            if cursor.rowcount != 1:
-                raise ArtifactConflictError("draft reject compare-and-swap failed")
-        finally:
-            await cursor.close()
-        await self._append_audit(
-            conn,
-            document_id=change_set.document_id,
-            event_type="change_set.rejected",
-            actor=actor,
-            change_set_id=change_set_id,
-            payload={
-                "reason": reason,
-                "candidate_artifact_id": change_set.candidate_artifact_id,
-                "candidate_artifact_sha256": change_set.candidate_artifact_sha256,
-                "candidate_cleanup": True,
-            },
-            created_at=now,
-        )
-        return await self._get_change_set_on_conn(conn, change_set_id), terminal_attempt
-
-    async def reject_draft_change_set_and_cleanup(
-        self,
-        *,
-        change_set_id: str,
-        expected_state_revision: int,
-        actor: Actor,
-        reason: str | None = None,
-        require_no_active_mutation_attempt: bool = False,
-    ) -> ChangeSet:
-        """Reject a staged candidate and detach its transient artifact refs.
-
-        Artifact bytes are owned by ``ArtifactStore`` and cannot be deleted
-        inside this SQLite transaction.  Clearing the candidate references is
-        the durable cleanup boundary; the store's normal orphan/session GC can
-        safely remove the detached blob after this transaction commits.
-        """
-
-        async with self._transaction("reject_draft_change_set_and_cleanup") as conn:
-            rejected, _attempt = await self._reject_draft_change_set_and_cleanup_on_conn(
-                conn,
-                change_set_id=change_set_id,
-                expected_state_revision=expected_state_revision,
-                actor=actor,
-                reason=reason,
-                require_no_active_mutation_attempt=require_no_active_mutation_attempt,
-                recovery_failure_code=None,
-            )
-            return rejected
-
-    async def reject_candidate_draft_and_fail_attempt_for_recovery(
-        self,
-        *,
-        change_set_id: str,
-        expected_state_revision: int,
-        actor: Actor,
-        reason: str,
-        failure_code: str,
-    ) -> tuple[ChangeSet, MutationAttempt | None]:
-        """Atomically reject a restart-orphaned candidate and close its receipt.
-
-        This repository operation is intentionally separate from ordinary
-        turn cleanup.  Only startup recovery may convert an unresolved
-        RESERVED/AMBIGUOUS receipt to FAILED, and it must do so in the same
-        transaction that proves the candidate DRAFT was rejected.
-        """
-
-        if actor.kind is not ActorKind.SYSTEM or actor.actor_id != "restart-recovery":
-            raise ArtifactValidationError(
-                "candidate recovery rejection requires the restart-recovery actor"
-            )
-        async with self._transaction(
-            "reject_candidate_draft_and_fail_attempt_for_recovery"
-        ) as conn:
-            return await self._reject_draft_change_set_and_cleanup_on_conn(
-                conn,
-                change_set_id=change_set_id,
-                expected_state_revision=expected_state_revision,
-                actor=actor,
-                reason=reason,
-                require_no_active_mutation_attempt=True,
-                recovery_failure_code=failure_code,
-            )
-
     async def apply_change_set(
         self,
         *,
@@ -3614,9 +2540,6 @@ class ArtifactSessionRepository:
         expected_head_revision_id: str,
         expected_document_state_revision: int,
         actor: Actor,
-        lease_id: str | None = None,
-        fencing_token: int | None = None,
-        require_lease: bool = False,
     ) -> CommitResult:
         """Atomically apply ready candidate bytes and mark the change set applied."""
 
@@ -3640,9 +2563,6 @@ class ArtifactSessionRepository:
                 actor=actor,
                 source=RevisionSource.AGENT,
                 change_set_id=change_set_id,
-                lease_id=lease_id,
-                fencing_token=fencing_token,
-                require_lease=require_lease,
                 event_type="revision.change_set_applied",
             )
             now = self._clock()
@@ -3679,122 +2599,6 @@ class ArtifactSessionRepository:
             )
             return result
 
-    async def commit_draft_change_set_atomically(
-        self,
-        *,
-        change_set_id: str,
-        expected_change_set_state_revision: int,
-        expected_head_revision_id: str,
-        expected_document_state_revision: int,
-        actor: Actor,
-        expected_candidate_sha256: str | None = None,
-        source: RevisionSource = RevisionSource.AGENT,
-        revision_event_type: str = "revision.change_set_applied",
-        lease_id: str | None = None,
-        fencing_token: int | None = None,
-        require_lease: bool = False,
-        mutation_attempt_id: str | None = None,
-        mutation_attempt_tool_use_id: str | None = None,
-    ) -> tuple[CommitResult, ChangeSet]:
-        """Publish a staged draft and its revision in one transaction.
-
-        Unlike :meth:`apply_change_set`, this method deliberately accepts only
-        ``DRAFT`` rows.  The caller must explicitly cross this boundary after
-        its candidate preview/verification loop has completed.  The candidate
-        digest is optionally rechecked to make a stale verification receipt
-        fail closed before the document head can change.
-        """
-
-        async with self._transaction("commit_draft_change_set_atomically") as conn:
-            change_set = await self._get_change_set_on_conn(conn, change_set_id)
-            if change_set.state_revision != expected_change_set_state_revision:
-                raise ArtifactConflictError("change set state_revision changed")
-            if change_set.status is not ChangeSetStatus.DRAFT:
-                raise ArtifactConflictError("change set is not a staged draft")
-            if change_set.base_revision_id != expected_head_revision_id:
-                raise ArtifactConflictError("change set base is no longer document head")
-            candidate = change_set.candidate_artifact
-            if candidate is None:
-                raise ArtifactValidationError("draft change set has no candidate artifact")
-            base = await self._get_revision_on_conn(conn, change_set.base_revision_id)
-            if (
-                base.artifact_sha256 == candidate.sha256
-                and base.byte_size == candidate.byte_size
-                and base.filename == candidate.filename
-                and base.media_type == candidate.media_type
-            ):
-                raise ArtifactValidationError("candidate does not change the document")
-            if (
-                expected_candidate_sha256 is not None
-                and candidate.sha256 != expected_candidate_sha256.lower()
-            ):
-                raise ArtifactConflictError("candidate digest no longer matches verification")
-
-            result = await self._commit_revision_on_conn(
-                conn,
-                document_id=change_set.document_id,
-                expected_head_revision_id=expected_head_revision_id,
-                expected_state_revision=expected_document_state_revision,
-                artifact=candidate,
-                actor=actor,
-                source=source,
-                change_set_id=change_set_id,
-                lease_id=lease_id,
-                fencing_token=fencing_token,
-                require_lease=require_lease,
-                event_type=revision_event_type,
-            )
-            now = self._clock()
-            cursor = await conn.execute(
-                """
-                UPDATE artifact_change_sets
-                SET status = ?, applied_revision_id = ?,
-                    state_revision = state_revision + 1, updated_at = ?
-                WHERE change_set_id = ? AND state_revision = ? AND status = ?
-                """,
-                (
-                    ChangeSetStatus.APPLIED.value,
-                    result.revision.revision_id,
-                    now,
-                    change_set_id,
-                    expected_change_set_state_revision,
-                    ChangeSetStatus.DRAFT.value,
-                ),
-            )
-            try:
-                if cursor.rowcount != 1:
-                    raise ArtifactConflictError("draft commit compare-and-swap failed")
-            finally:
-                await cursor.close()
-            if mutation_attempt_id is not None or mutation_attempt_tool_use_id is not None:
-                if not mutation_attempt_id or not mutation_attempt_tool_use_id:
-                    raise ArtifactValidationError(
-                        "mutation attempt identity must be provided together"
-                    )
-                await self._mark_mutation_attempt_applied_on_conn(
-                    conn,
-                    document_id=change_set.document_id,
-                    turn_id=change_set.turn_id or "",
-                    tool_use_id=mutation_attempt_tool_use_id,
-                    mutation_attempt_id=mutation_attempt_id,
-                    change_set_id=change_set.change_set_id,
-                    revision_id=result.revision.revision_id,
-                )
-            await self._append_audit(
-                conn,
-                document_id=change_set.document_id,
-                event_type="change_set.applied",
-                actor=actor,
-                revision_id=result.revision.revision_id,
-                change_set_id=change_set_id,
-                payload={
-                    "base_revision_id": change_set.base_revision_id,
-                    "candidate_artifact_sha256": candidate.sha256,
-                },
-                created_at=now,
-            )
-            return result, await self._get_change_set_on_conn(conn, change_set_id)
-
     async def commit_change_set_atomically(
         self,
         *,
@@ -3811,12 +2615,6 @@ class ArtifactSessionRepository:
         source: RevisionSource = RevisionSource.AGENT,
         copied_from_revision_id: str | None = None,
         revision_event_type: str = "revision.change_set_applied",
-        lease_id: str | None = None,
-        fencing_token: int | None = None,
-        require_lease: bool = False,
-        edit_session_id: str | None = None,
-        expected_edit_session_state_revision: int | None = None,
-        expected_last_saved_revision_id: str | None = None,
     ) -> tuple[CommitResult, ChangeSet]:
         """Create and apply one change set in a single SQLite transaction.
 
@@ -3836,39 +2634,6 @@ class ArtifactSessionRepository:
                 raise ArtifactConflictError("change set base is no longer document head")
             if document.state_revision != expected_document_state_revision:
                 raise ArtifactConflictError("document state_revision changed")
-            edit_session_fields = (
-                edit_session_id,
-                expected_edit_session_state_revision,
-                expected_last_saved_revision_id,
-            )
-            if any(value is not None for value in edit_session_fields) and not all(
-                value is not None for value in edit_session_fields
-            ):
-                raise ArtifactValidationError(
-                    "edit session id, state revision, and saved revision must be supplied together"
-                )
-            edit_session: EditSession | None = None
-            if edit_session_id is not None:
-                assert expected_edit_session_state_revision is not None
-                assert expected_last_saved_revision_id is not None
-                edit_session = await self._get_edit_session_on_conn(conn, edit_session_id)
-                if edit_session.document_id != document_id:
-                    raise ArtifactValidationError("edit session belongs to another document")
-                if edit_session.user_id != actor.actor_id:
-                    raise ArtifactConflictError("edit session belongs to another user")
-                if edit_session.mode is not EditSessionMode.EDIT:
-                    raise ArtifactConflictError("edit session is read-only")
-                if edit_session.status is not EditSessionStatus.ACTIVE:
-                    raise ArtifactConflictError("edit session is not active")
-                if edit_session.expires_at <= now:
-                    raise ArtifactConflictError("edit session has expired")
-                if (
-                    edit_session.state_revision != expected_edit_session_state_revision
-                    or edit_session.last_saved_revision_id != expected_last_saved_revision_id
-                ):
-                    raise ArtifactConflictError("edit session save position changed")
-                if expected_last_saved_revision_id != base_revision_id:
-                    raise ArtifactConflictError("edit session is not based on the document head")
             try:
                 await conn.execute(
                     """
@@ -3937,9 +2702,6 @@ class ArtifactSessionRepository:
                 source=source,
                 change_set_id=change_set_id,
                 copied_from_revision_id=copied_from_revision_id,
-                lease_id=lease_id,
-                fencing_token=fencing_token,
-                require_lease=require_lease,
                 event_type=revision_event_type,
             )
             applied_at = self._clock()
@@ -3973,329 +2735,7 @@ class ArtifactSessionRepository:
                 payload={"base_revision_id": base_revision_id},
                 created_at=applied_at,
             )
-            if edit_session is not None:
-                assert expected_edit_session_state_revision is not None
-                assert expected_last_saved_revision_id is not None
-                cursor = await conn.execute(
-                    """
-                    UPDATE artifact_edit_sessions
-                    SET last_saved_revision_id = ?, state_revision = state_revision + 1,
-                        last_access_at = ?, updated_at = ?
-                    WHERE edit_session_id = ? AND state_revision = ?
-                      AND last_saved_revision_id = ? AND status = ?
-                    """,
-                    (
-                        result.revision.revision_id,
-                        applied_at,
-                        applied_at,
-                        edit_session.edit_session_id,
-                        expected_edit_session_state_revision,
-                        expected_last_saved_revision_id,
-                        EditSessionStatus.ACTIVE.value,
-                    ),
-                )
-                try:
-                    if cursor.rowcount != 1:
-                        raise ArtifactConflictError("edit session compare-and-swap failed")
-                finally:
-                    await cursor.close()
-                await self._append_audit(
-                    conn,
-                    document_id=document_id,
-                    event_type="edit_session.saved",
-                    actor=actor,
-                    revision_id=result.revision.revision_id,
-                    edit_session_id=edit_session.edit_session_id,
-                    lease_id=lease_id,
-                    payload={"previous_revision_id": expected_last_saved_revision_id},
-                    created_at=applied_at,
-                )
             return result, await self._get_change_set_on_conn(conn, change_set_id)
-
-    async def reserve_mutation_attempt_with_status(
-        self,
-        *,
-        document_id: str,
-        turn_id: str,
-        tool_use_id: str,
-        base_revision_id: str,
-        proposal_sha256: str | None,
-        mutation_attempt_id: str | None = None,
-        candidate_change_set_id: str | None = None,
-        expected_candidate_state_revision: int | None = None,
-    ) -> tuple[MutationAttempt, bool]:
-        """Reserve the sole artifact-writing slot for a turn.
-
-        Replaying the same ``tool_use_id``, base revision, and non-null proposal
-        digest returns the original receipt in any state. A different or missing
-        digest fails closed before it can create a second persistent mutation.
-        """
-
-        if (candidate_change_set_id is None) != (
-            expected_candidate_state_revision is None
-        ):
-            raise ArtifactValidationError(
-                "candidate change set id and state revision must be provided together"
-            )
-        mutation_attempt_id = mutation_attempt_id or self._id_factory("mutation")
-        now = self._clock()
-        async with self._transaction("reserve_mutation_attempt") as conn:
-            row = await _fetchone(
-                conn,
-                """
-                SELECT * FROM artifact_mutation_attempts
-                WHERE turn_id = ?
-                """,
-                (turn_id,),
-            )
-            if row is not None:
-                existing = _mutation_attempt_from_row(row)
-                if (
-                    existing.document_id == document_id
-                    and existing.tool_use_id == tool_use_id
-                    and existing.base_revision_id == base_revision_id
-                    and existing.proposal_sha256 is not None
-                    and proposal_sha256 is not None
-                    and existing.proposal_sha256 == proposal_sha256
-                ):
-                    return existing, False
-                raise ArtifactConflictError(
-                    "this turn is reserved by a different mutation tool call or document"
-                )
-
-            # Candidate-loop finish calls already own a durable DRAFT.  Bind
-            # reservation to that exact row in the same write transaction so
-            # a concurrent discard cannot win between a preflight read and
-            # this INSERT.  Exact receipt replays above remain valid after the
-            # ChangeSet becomes APPLIED/REJECTED.
-            if candidate_change_set_id is not None:
-                if expected_candidate_state_revision is None:
-                    raise ArtifactValidationError(
-                        "candidate state revision is required with change set id"
-                    )
-                candidate_change_set = await self._get_change_set_on_conn(
-                    conn,
-                    candidate_change_set_id,
-                )
-                if candidate_change_set.document_id != document_id:
-                    raise ArtifactValidationError(
-                        "candidate change set belongs to another document"
-                    )
-                if candidate_change_set.turn_id != turn_id:
-                    raise ArtifactValidationError(
-                        "candidate change set belongs to another turn"
-                    )
-                if candidate_change_set.base_revision_id != base_revision_id:
-                    raise ArtifactValidationError(
-                        "candidate change set uses another base revision"
-                    )
-                if candidate_change_set.status is not ChangeSetStatus.DRAFT:
-                    raise ArtifactConflictError("candidate change set is no longer a draft")
-                if candidate_change_set.state_revision != expected_candidate_state_revision:
-                    raise ArtifactConflictError("candidate change set state_revision changed")
-                if not await self._is_candidate_loop_change_set_on_conn(
-                    conn,
-                    candidate_change_set.change_set_id,
-                ):
-                    raise ArtifactConflictError(
-                        "change set is not owned by the candidate loop"
-                    )
-                if proposal_sha256 is None:
-                    raise ArtifactValidationError(
-                        "candidate reservation requires proposal_sha256"
-                    )
-                if candidate_change_set.candidate_artifact is None:
-                    raise ArtifactValidationError(
-                        "candidate change set has no complete artifact"
-                    )
-                if candidate_change_set.candidate_artifact_sha256 != proposal_sha256:
-                    raise ArtifactConflictError("candidate digest changed before reservation")
-
-            document = await self._get_document_on_conn(conn, document_id)
-            base = await self._get_revision_on_conn(conn, base_revision_id)
-            if base.document_id != document_id:
-                raise ArtifactValidationError("base revision belongs to another document")
-            if document.head_revision_id != base_revision_id:
-                raise ArtifactConflictError("mutation base is no longer document head")
-            try:
-                await conn.execute(
-                    """
-                    INSERT INTO artifact_mutation_attempts (
-                        mutation_attempt_id, document_id, turn_id, tool_use_id,
-                        base_revision_id, proposal_sha256, status,
-                        state_revision, created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
-                    """,
-                    (
-                        mutation_attempt_id,
-                        document_id,
-                        turn_id,
-                        tool_use_id,
-                        base_revision_id,
-                        proposal_sha256,
-                        MutationAttemptStatus.RESERVED.value,
-                        now,
-                        now,
-                    ),
-                )
-            except aiosqlite.IntegrityError as exc:
-                # BEGIN IMMEDIATE serializes normal repository writers, but keep
-                # the unique constraint authoritative for foreign/manual callers.
-                row = await _fetchone(
-                    conn,
-                    """
-                    SELECT * FROM artifact_mutation_attempts
-                    WHERE turn_id = ?
-                    """,
-                    (turn_id,),
-                )
-                if row is not None:
-                    existing = _mutation_attempt_from_row(row)
-                    if (
-                        existing.document_id == document_id
-                        and existing.tool_use_id == tool_use_id
-                        and existing.base_revision_id == base_revision_id
-                        and existing.proposal_sha256 is not None
-                        and proposal_sha256 is not None
-                        and existing.proposal_sha256 == proposal_sha256
-                    ):
-                        return existing, False
-                    raise ArtifactConflictError(
-                        "this turn is reserved by a different mutation tool call or document"
-                    ) from exc
-                raise ArtifactConflictError("mutation_attempt_id is already in use") from exc
-            return (
-                await self._get_mutation_attempt_on_conn(
-                    conn,
-                    document_id=document_id,
-                    turn_id=turn_id,
-                ),
-                True,
-            )
-
-    async def reserve_mutation_attempt(
-        self,
-        *,
-        document_id: str,
-        turn_id: str,
-        tool_use_id: str,
-        base_revision_id: str,
-        proposal_sha256: str | None,
-        mutation_attempt_id: str | None = None,
-        candidate_change_set_id: str | None = None,
-        expected_candidate_state_revision: int | None = None,
-    ) -> MutationAttempt:
-        attempt, _created = await self.reserve_mutation_attempt_with_status(
-            document_id=document_id,
-            turn_id=turn_id,
-            tool_use_id=tool_use_id,
-            base_revision_id=base_revision_id,
-            proposal_sha256=proposal_sha256,
-            mutation_attempt_id=mutation_attempt_id,
-            candidate_change_set_id=candidate_change_set_id,
-            expected_candidate_state_revision=expected_candidate_state_revision,
-        )
-        return attempt
-
-    async def register_mutation_candidate(
-        self,
-        *,
-        document_id: str,
-        turn_id: str,
-        candidate_session_id: str,
-        candidate_artifact_id: str,
-        candidate_artifact_sha256: str,
-    ) -> MutationAttempt:
-        """Journal a preallocated candidate before any bytes are published."""
-
-        now = self._clock()
-        async with self._transaction("register_mutation_candidate") as conn:
-            attempt = await self._get_mutation_attempt_on_conn(
-                conn,
-                document_id=document_id,
-                turn_id=turn_id,
-            )
-            if attempt.status is not MutationAttemptStatus.RESERVED:
-                raise ArtifactConflictError("mutation attempt is no longer reserved")
-            document = await self._get_document_on_conn(conn, document_id)
-            if document.session_id != candidate_session_id:
-                raise ArtifactValidationError(
-                    "candidate session does not match the artifact document"
-                )
-            requested = (
-                candidate_session_id,
-                candidate_artifact_id,
-                candidate_artifact_sha256,
-            )
-            existing = (
-                attempt.candidate_session_id,
-                attempt.candidate_artifact_id,
-                attempt.candidate_artifact_sha256,
-            )
-            if existing == requested:
-                return attempt
-            if any(value is not None for value in existing):
-                raise ArtifactConflictError("mutation candidate is already registered")
-            try:
-                cursor = await conn.execute(
-                    """
-                    UPDATE artifact_mutation_attempts
-                    SET candidate_session_id = ?, candidate_artifact_id = ?,
-                        candidate_artifact_sha256 = ?, candidate_registered_at = ?,
-                        state_revision = state_revision + 1, updated_at = ?
-                    WHERE mutation_attempt_id = ? AND state_revision = ?
-                      AND status = 'reserved' AND candidate_artifact_id IS NULL
-                    """,
-                    (
-                        candidate_session_id,
-                        candidate_artifact_id,
-                        candidate_artifact_sha256,
-                        now,
-                        now,
-                        attempt.mutation_attempt_id,
-                        attempt.state_revision,
-                    ),
-                )
-            except aiosqlite.IntegrityError as exc:
-                raise ArtifactConflictError("mutation candidate id is already journaled") from exc
-            try:
-                if cursor.rowcount != 1:
-                    raise ArtifactConflictError("mutation candidate compare-and-swap failed")
-            finally:
-                await cursor.close()
-            return await self._get_mutation_attempt_on_conn(
-                conn,
-                document_id=document_id,
-                turn_id=turn_id,
-            )
-
-    async def list_unresolved_mutation_attempts(
-        self,
-        *,
-        limit: int = 100,
-        after_mutation_attempt_id: str | None = None,
-    ) -> tuple[MutationAttempt, ...]:
-        """List restart-recoverable mutation receipts in deterministic order."""
-
-        async with self._transaction("list_unresolved_mutation_attempts") as conn:
-            where_after = "" if after_mutation_attempt_id is None else "AND mutation_attempt_id > ?"
-            params: tuple[Any, ...] = (
-                (limit,)
-                if after_mutation_attempt_id is None
-                else (after_mutation_attempt_id, limit)
-            )
-            rows = await _fetchall(
-                conn,
-                f"""
-                SELECT * FROM artifact_mutation_attempts
-                WHERE status IN ('reserved', 'ambiguous')
-                {where_after}
-                ORDER BY mutation_attempt_id
-                LIMIT ?
-                """,
-                params,
-            )
-            return tuple(_mutation_attempt_from_row(row) for row in rows)
 
     async def list_mutation_attempts_by_turn_ids(
         self,
@@ -4338,25 +2778,6 @@ class ArtifactSessionRepository:
             rows_by_turn_id[turn_id] for turn_id in ordered_ids if turn_id in rows_by_turn_id
         )
 
-    async def reconcile_mutation_attempt(
-        self,
-        *,
-        document_id: str,
-        turn_id: str,
-        tool_use_id: str,
-    ) -> MutationAttempt:
-        """Return a mutation receipt only when it belongs to the same tool call."""
-
-        async with self._transaction("reconcile_mutation_attempt") as conn:
-            attempt = await self._get_mutation_attempt_on_conn(
-                conn,
-                document_id=document_id,
-                turn_id=turn_id,
-            )
-            if attempt.tool_use_id != tool_use_id:
-                raise ArtifactConflictError("mutation attempt belongs to a different tool_use_id")
-            return attempt
-
     async def get_mutation_attempt_for_resolution(
         self,
         *,
@@ -4365,10 +2786,8 @@ class ArtifactSessionRepository:
     ) -> MutationAttempt:
         """Load a receipt for a session-scoped product outcome query.
 
-        Tool execution reconciliation continues to require ``tool_use_id`` via
-        :meth:`reconcile_mutation_attempt`.  This narrower read exists for the
-        Gateway's authenticated mutation-resolution RPC, which verifies the
-        owning Document and never returns the receipt itself.
+        The authenticated resolution RPC checks the owning document before
+        reading a historical receipt. This method never resumes execution.
         """
 
         async with self._read_transaction("get_mutation_attempt_for_resolution") as conn:
@@ -4377,318 +2796,6 @@ class ArtifactSessionRepository:
                 document_id=document_id,
                 turn_id=turn_id,
             )
-
-    async def _mutation_result_refs_on_conn(
-        self,
-        conn: Any,
-        *,
-        attempt: MutationAttempt,
-        change_set_id: str | None,
-        revision_id: str | None,
-        require_applied: bool,
-    ) -> None:
-        change_set: ChangeSet | None = None
-        revision: Revision | None = None
-        if change_set_id is not None:
-            change_set = await self._get_change_set_on_conn(conn, change_set_id)
-            if change_set.document_id != attempt.document_id:
-                raise ArtifactValidationError("change set belongs to another document")
-            if change_set.turn_id != attempt.turn_id:
-                raise ArtifactValidationError("change set belongs to another turn")
-            if change_set.base_revision_id != attempt.base_revision_id:
-                raise ArtifactValidationError("change set uses another base revision")
-        if revision_id is not None:
-            revision = await self._get_revision_on_conn(conn, revision_id)
-            if revision.document_id != attempt.document_id:
-                raise ArtifactValidationError("revision belongs to another document")
-        if change_set is not None and revision is not None:
-            if revision.change_set_id != change_set.change_set_id:
-                raise ArtifactValidationError("revision was not produced by the change set")
-        if require_applied:
-            if change_set is None or revision is None:
-                raise ArtifactValidationError(
-                    "applied mutation requires change_set_id and revision_id"
-                )
-            if (
-                change_set.status is not ChangeSetStatus.APPLIED
-                or change_set.applied_revision_id != revision.revision_id
-            ):
-                raise ArtifactConflictError("change set has not applied the requested revision")
-            if attempt.candidate_artifact_id is None:
-                return
-            assert change_set is not None and revision is not None
-            if (
-                change_set.candidate_artifact_id != attempt.candidate_artifact_id
-                or change_set.candidate_artifact_sha256 != attempt.candidate_artifact_sha256
-                or revision.artifact_id != attempt.candidate_artifact_id
-                or revision.artifact_sha256 != attempt.candidate_artifact_sha256
-            ):
-                raise ArtifactConflictError(
-                    "applied result does not match the journaled mutation candidate"
-                )
-
-    async def _mark_mutation_attempt_applied_on_conn(
-        self,
-        conn: Any,
-        *,
-        document_id: str,
-        turn_id: str,
-        tool_use_id: str,
-        mutation_attempt_id: str,
-        change_set_id: str,
-        revision_id: str,
-    ) -> MutationAttempt:
-        """Mark the final candidate commit receipt inside its commit transaction."""
-
-        attempt = await self._get_mutation_attempt_on_conn(
-            conn,
-            document_id=document_id,
-            turn_id=turn_id,
-        )
-        if attempt.mutation_attempt_id != mutation_attempt_id:
-            raise ArtifactConflictError("mutation attempt identity changed")
-        if attempt.tool_use_id != tool_use_id:
-            raise ArtifactConflictError("mutation attempt belongs to a different tool_use_id")
-        if attempt.status is MutationAttemptStatus.APPLIED:
-            if attempt.change_set_id == change_set_id and attempt.revision_id == revision_id:
-                return attempt
-            raise ArtifactConflictError("mutation attempt is already applied differently")
-        if attempt.status not in {
-            MutationAttemptStatus.RESERVED,
-            MutationAttemptStatus.AMBIGUOUS,
-        }:
-            raise ArtifactConflictError("mutation attempt is already terminal")
-        await self._mutation_result_refs_on_conn(
-            conn,
-            attempt=attempt,
-            change_set_id=change_set_id,
-            revision_id=revision_id,
-            require_applied=True,
-        )
-        now = self._clock()
-        cursor = await conn.execute(
-            """
-            UPDATE artifact_mutation_attempts
-            SET status = ?, change_set_id = ?, revision_id = ?, failure_code = NULL,
-                state_revision = state_revision + 1, updated_at = ?
-            WHERE mutation_attempt_id = ? AND document_id = ? AND turn_id = ?
-              AND tool_use_id = ? AND state_revision = ?
-              AND status IN ('reserved', 'ambiguous')
-            """,
-            (
-                MutationAttemptStatus.APPLIED.value,
-                change_set_id,
-                revision_id,
-                now,
-                mutation_attempt_id,
-                document_id,
-                turn_id,
-                tool_use_id,
-                attempt.state_revision,
-            ),
-        )
-        try:
-            if cursor.rowcount != 1:
-                raise ArtifactConflictError("mutation attempt compare-and-swap failed")
-        finally:
-            await cursor.close()
-        return await self._get_mutation_attempt_on_conn(
-            conn,
-            document_id=document_id,
-            turn_id=turn_id,
-        )
-
-    async def _mark_mutation_attempt_failed_on_conn(
-        self,
-        conn: Any,
-        *,
-        attempt: MutationAttempt,
-        failure_code: str,
-        change_set_id: str,
-    ) -> MutationAttempt:
-        """Close one unresolved receipt inside a proven DRAFT reject transaction."""
-
-        if attempt.status is MutationAttemptStatus.FAILED:
-            return attempt
-        if attempt.status not in {
-            MutationAttemptStatus.RESERVED,
-            MutationAttemptStatus.AMBIGUOUS,
-        }:
-            raise ArtifactConflictError("mutation attempt is already terminal")
-        await self._mutation_result_refs_on_conn(
-            conn,
-            attempt=attempt,
-            change_set_id=change_set_id,
-            revision_id=None,
-            require_applied=False,
-        )
-        now = self._clock()
-        cursor = await conn.execute(
-            """
-            UPDATE artifact_mutation_attempts
-            SET status = ?, change_set_id = ?, revision_id = NULL,
-                failure_code = ?, state_revision = state_revision + 1,
-                updated_at = ?
-            WHERE mutation_attempt_id = ? AND document_id = ? AND turn_id = ?
-              AND tool_use_id = ? AND state_revision = ?
-              AND status IN ('reserved', 'ambiguous')
-            """,
-            (
-                MutationAttemptStatus.FAILED.value,
-                change_set_id,
-                failure_code,
-                now,
-                attempt.mutation_attempt_id,
-                attempt.document_id,
-                attempt.turn_id,
-                attempt.tool_use_id,
-                attempt.state_revision,
-            ),
-        )
-        try:
-            if cursor.rowcount != 1:
-                raise ArtifactConflictError("mutation attempt compare-and-swap failed")
-        finally:
-            await cursor.close()
-        return await self._get_mutation_attempt_on_conn(
-            conn,
-            document_id=attempt.document_id,
-            turn_id=attempt.turn_id,
-        )
-
-    async def _mark_mutation_attempt(
-        self,
-        *,
-        document_id: str,
-        turn_id: str,
-        tool_use_id: str,
-        status: MutationAttemptStatus,
-        change_set_id: str | None,
-        revision_id: str | None,
-        failure_code: str | None,
-    ) -> MutationAttempt:
-        now = self._clock()
-        async with self._transaction(f"mark_mutation_attempt_{status.value}") as conn:
-            attempt = await self._get_mutation_attempt_on_conn(
-                conn,
-                document_id=document_id,
-                turn_id=turn_id,
-            )
-            if attempt.tool_use_id != tool_use_id:
-                raise ArtifactConflictError("mutation attempt belongs to a different tool_use_id")
-            requested = (status, change_set_id, revision_id, failure_code)
-            existing = (
-                attempt.status,
-                attempt.change_set_id,
-                attempt.revision_id,
-                attempt.failure_code,
-            )
-            if existing == requested:
-                return attempt
-            if attempt.status not in {
-                MutationAttemptStatus.RESERVED,
-                MutationAttemptStatus.AMBIGUOUS,
-            }:
-                raise ArtifactConflictError("mutation attempt is already terminal")
-            if (
-                attempt.status is MutationAttemptStatus.AMBIGUOUS
-                and status is MutationAttemptStatus.AMBIGUOUS
-            ):
-                raise ArtifactConflictError("ambiguous mutation receipt already differs")
-            await self._mutation_result_refs_on_conn(
-                conn,
-                attempt=attempt,
-                change_set_id=change_set_id,
-                revision_id=revision_id,
-                require_applied=status is MutationAttemptStatus.APPLIED,
-            )
-            cursor = await conn.execute(
-                """
-                UPDATE artifact_mutation_attempts
-                SET status = ?, change_set_id = ?, revision_id = ?, failure_code = ?,
-                    state_revision = state_revision + 1, updated_at = ?
-                WHERE mutation_attempt_id = ? AND tool_use_id = ?
-                  AND state_revision = ? AND status IN ('reserved', 'ambiguous')
-                """,
-                (
-                    status.value,
-                    change_set_id,
-                    revision_id,
-                    failure_code,
-                    now,
-                    attempt.mutation_attempt_id,
-                    tool_use_id,
-                    attempt.state_revision,
-                ),
-            )
-            try:
-                if cursor.rowcount != 1:
-                    raise ArtifactConflictError("mutation attempt compare-and-swap failed")
-            finally:
-                await cursor.close()
-            return await self._get_mutation_attempt_on_conn(
-                conn,
-                document_id=document_id,
-                turn_id=turn_id,
-            )
-
-    async def mark_mutation_attempt_applied(
-        self,
-        *,
-        document_id: str,
-        turn_id: str,
-        tool_use_id: str,
-        change_set_id: str,
-        revision_id: str,
-    ) -> MutationAttempt:
-        return await self._mark_mutation_attempt(
-            document_id=document_id,
-            turn_id=turn_id,
-            tool_use_id=tool_use_id,
-            status=MutationAttemptStatus.APPLIED,
-            change_set_id=change_set_id,
-            revision_id=revision_id,
-            failure_code=None,
-        )
-
-    async def mark_mutation_attempt_failed(
-        self,
-        *,
-        document_id: str,
-        turn_id: str,
-        tool_use_id: str,
-        failure_code: str,
-        change_set_id: str | None = None,
-    ) -> MutationAttempt:
-        return await self._mark_mutation_attempt(
-            document_id=document_id,
-            turn_id=turn_id,
-            tool_use_id=tool_use_id,
-            status=MutationAttemptStatus.FAILED,
-            change_set_id=change_set_id,
-            revision_id=None,
-            failure_code=failure_code,
-        )
-
-    async def mark_mutation_attempt_ambiguous(
-        self,
-        *,
-        document_id: str,
-        turn_id: str,
-        tool_use_id: str,
-        failure_code: str,
-        change_set_id: str | None = None,
-        revision_id: str | None = None,
-    ) -> MutationAttempt:
-        return await self._mark_mutation_attempt(
-            document_id=document_id,
-            turn_id=turn_id,
-            tool_use_id=tool_use_id,
-            status=MutationAttemptStatus.AMBIGUOUS,
-            change_set_id=change_set_id,
-            revision_id=revision_id,
-            failure_code=failure_code,
-        )
 
     async def create_anchor(
         self,
@@ -4756,267 +2863,6 @@ class ArtifactSessionRepository:
         async with self._transaction("get_anchor") as conn:
             return await self._get_anchor_on_conn(conn, anchor_id)
 
-    async def _insert_prompt_annotation_on_conn(
-        self,
-        conn: Any,
-        *,
-        annotation_id: str,
-        session_key: str,
-        session_id: str,
-        session_epoch: int,
-        document_id: str,
-        revision_id: str,
-        anchor_id: str,
-        body: str,
-        now: int,
-    ) -> None:
-        """Insert one draft on a caller-owned transaction connection."""
-
-        await conn.execute(
-            """
-            INSERT INTO artifact_prompt_annotations (
-                annotation_id, session_key, session_id, session_epoch,
-                document_id, revision_id, anchor_id, body, status,
-                state_revision, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
-            """,
-            (
-                annotation_id,
-                session_key,
-                session_id,
-                session_epoch,
-                document_id,
-                revision_id,
-                anchor_id,
-                body,
-                PromptAnnotationStatus.DRAFT.value,
-                now,
-                now,
-            ),
-        )
-
-    async def create_prompt_annotation_with_anchor(
-        self,
-        *,
-        annotation_id: str,
-        session_key: str,
-        session_id: str,
-        session_epoch: int,
-        document_id: str,
-        revision_id: str,
-        kind: AnchorKind,
-        locator: dict[str, Any],
-        actor: Actor,
-        quote: str | None,
-        context: dict[str, Any] | None,
-        body: str,
-    ) -> tuple[Anchor, PromptAnnotation]:
-        """Atomically create one immutable anchor and its idempotent draft."""
-
-        now = self._clock()
-        async with self._transaction("create_prompt_annotation_with_anchor") as conn:
-            document = await self._get_document_on_conn(conn, document_id)
-            if document.session_key != session_key or document.session_id != session_id:
-                raise ArtifactNotFoundError(f"document not found: {document_id}")
-            if document.head_revision_id != revision_id:
-                raise ArtifactConflictError("prompt annotation revision is no longer current")
-            revision = await self._get_revision_on_conn(conn, revision_id)
-            if revision.document_id != document_id:
-                raise ArtifactValidationError(
-                    "prompt annotation revision belongs to another document"
-                )
-
-            existing_row = await _fetchone(
-                conn,
-                "SELECT * FROM artifact_prompt_annotations WHERE annotation_id = ?",
-                (annotation_id,),
-            )
-            if existing_row is not None:
-                existing = _prompt_annotation_from_row(existing_row)
-                if (
-                    existing.session_key != session_key
-                    or existing.session_id != session_id
-                    or existing.session_epoch != session_epoch
-                ):
-                    raise ArtifactNotFoundError(f"prompt annotation not found: {annotation_id}")
-                anchor = await self._get_anchor_on_conn(conn, existing.anchor_id)
-                if (
-                    existing.status is PromptAnnotationStatus.DRAFT
-                    and existing.document_id == document_id
-                    and existing.revision_id == revision_id
-                    and existing.body == body
-                    and anchor.document_id == document_id
-                    and anchor.revision_id == revision_id
-                    and anchor.kind is kind
-                    and anchor.locator == locator
-                    and anchor.quote == quote
-                    and anchor.context == context
-                    and anchor.state is AnchorState.RESOLVED
-                    and anchor.remapped_from_anchor_id is None
-                ):
-                    return anchor, existing
-                raise ArtifactConflictError("prompt annotation id is already in use")
-
-            count_row = await _fetchone(
-                conn,
-                """
-                SELECT COUNT(*) AS draft_count
-                FROM artifact_prompt_annotations
-                WHERE session_key = ? AND session_id = ? AND session_epoch = ?
-                  AND status = ?
-                """,
-                (
-                    session_key,
-                    session_id,
-                    session_epoch,
-                    PromptAnnotationStatus.DRAFT.value,
-                ),
-            )
-            if count_row is not None and int(count_row["draft_count"]) >= 16:
-                raise ArtifactValidationError("a session may contain at most 16 draft annotations")
-
-            anchor_id = self._id_factory("anchor")
-            await conn.execute(
-                """
-                INSERT INTO artifact_anchors (
-                    anchor_id, document_id, revision_id, kind, locator_json,
-                    quote, context_json, state, remapped_from_anchor_id, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)
-                """,
-                (
-                    anchor_id,
-                    document_id,
-                    revision_id,
-                    kind.value,
-                    _json_dumps(locator),
-                    quote,
-                    None if context is None else _json_dumps(context),
-                    AnchorState.RESOLVED.value,
-                    now,
-                ),
-            )
-            await self._append_audit(
-                conn,
-                document_id=document_id,
-                event_type="anchor.created",
-                actor=actor,
-                revision_id=revision_id,
-                anchor_id=anchor_id,
-                payload={"kind": kind.value, "remapped_from_anchor_id": None},
-                created_at=now,
-            )
-            await self._insert_prompt_annotation_on_conn(
-                conn,
-                annotation_id=annotation_id,
-                session_key=session_key,
-                session_id=session_id,
-                session_epoch=session_epoch,
-                document_id=document_id,
-                revision_id=revision_id,
-                anchor_id=anchor_id,
-                body=body,
-                now=now,
-            )
-            return (
-                await self._get_anchor_on_conn(conn, anchor_id),
-                await self._get_prompt_annotation_on_conn(conn, annotation_id),
-            )
-
-    async def create_prompt_annotation(
-        self,
-        *,
-        annotation_id: str,
-        session_key: str,
-        session_id: str,
-        session_epoch: int,
-        document_id: str,
-        revision_id: str,
-        anchor_id: str,
-        body: str,
-    ) -> PromptAnnotation:
-        """Create an idempotent draft bound to the exact current head and anchor."""
-
-        now = self._clock()
-        async with self._transaction("create_prompt_annotation") as conn:
-            existing_row = await _fetchone(
-                conn,
-                "SELECT * FROM artifact_prompt_annotations WHERE annotation_id = ?",
-                (annotation_id,),
-            )
-            if existing_row is not None:
-                existing = _prompt_annotation_from_row(existing_row)
-                expected = (
-                    session_key,
-                    session_id,
-                    session_epoch,
-                    document_id,
-                    revision_id,
-                    anchor_id,
-                    body,
-                )
-                actual = (
-                    existing.session_key,
-                    existing.session_id,
-                    existing.session_epoch,
-                    existing.document_id,
-                    existing.revision_id,
-                    existing.anchor_id,
-                    existing.body,
-                )
-                if existing.status is PromptAnnotationStatus.DRAFT and actual == expected:
-                    return existing
-                raise ArtifactConflictError("prompt annotation id is already in use")
-
-            document = await self._get_document_on_conn(conn, document_id)
-            if document.session_key != session_key or document.session_id != session_id:
-                raise ArtifactNotFoundError(f"document not found: {document_id}")
-            if document.head_revision_id != revision_id:
-                raise ArtifactConflictError("prompt annotation revision is no longer current")
-            revision = await self._get_revision_on_conn(conn, revision_id)
-            if revision.document_id != document_id:
-                raise ArtifactValidationError(
-                    "prompt annotation revision belongs to another document"
-                )
-            anchor = await self._get_anchor_on_conn(conn, anchor_id)
-            if (
-                anchor.document_id != document_id
-                or anchor.revision_id != revision_id
-                or anchor.state is not AnchorState.RESOLVED
-            ):
-                raise ArtifactValidationError(
-                    "prompt annotation anchor does not match its revision"
-                )
-            count_row = await _fetchone(
-                conn,
-                """
-                SELECT COUNT(*) AS draft_count
-                FROM artifact_prompt_annotations
-                WHERE session_key = ? AND session_id = ? AND session_epoch = ?
-                  AND status = ?
-                """,
-                (
-                    session_key,
-                    session_id,
-                    session_epoch,
-                    PromptAnnotationStatus.DRAFT.value,
-                ),
-            )
-            if count_row is not None and int(count_row["draft_count"]) >= 16:
-                raise ArtifactValidationError("a session may contain at most 16 draft annotations")
-            await self._insert_prompt_annotation_on_conn(
-                conn,
-                annotation_id=annotation_id,
-                session_key=session_key,
-                session_id=session_id,
-                session_epoch=session_epoch,
-                document_id=document_id,
-                revision_id=revision_id,
-                anchor_id=anchor_id,
-                body=body,
-                now=now,
-            )
-            return await self._get_prompt_annotation_on_conn(conn, annotation_id)
-
     async def get_prompt_annotation(self, annotation_id: str) -> PromptAnnotation:
         async with self._transaction("get_prompt_annotation") as conn:
             return await self._get_prompt_annotation_on_conn(conn, annotation_id)
@@ -5053,317 +2899,8 @@ class ArtifactSessionRepository:
             )
             return tuple(_prompt_annotation_from_row(row) for row in rows)
 
-    async def update_prompt_annotation(
-        self,
-        *,
-        annotation_id: str,
-        expected_state_revision: int,
-        body: str,
-    ) -> PromptAnnotation:
-        now = self._clock()
-        async with self._transaction("update_prompt_annotation") as conn:
-            annotation = await self._get_prompt_annotation_on_conn(conn, annotation_id)
-            if annotation.status is not PromptAnnotationStatus.DRAFT:
-                raise ArtifactConflictError("only draft prompt annotations may be updated")
-            if annotation.state_revision != expected_state_revision:
-                raise ArtifactConflictError("prompt annotation state_revision changed")
-            cursor = await conn.execute(
-                """
-                UPDATE artifact_prompt_annotations
-                SET body = ?, state_revision = state_revision + 1, updated_at = ?
-                WHERE annotation_id = ? AND state_revision = ? AND status = ?
-                """,
-                (
-                    body,
-                    now,
-                    annotation_id,
-                    expected_state_revision,
-                    PromptAnnotationStatus.DRAFT.value,
-                ),
-            )
-            try:
-                if cursor.rowcount != 1:
-                    raise ArtifactConflictError("prompt annotation compare-and-swap failed")
-            finally:
-                await cursor.close()
-            return await self._get_prompt_annotation_on_conn(conn, annotation_id)
-
-    async def discard_prompt_annotation(
-        self,
-        *,
-        annotation_id: str,
-        expected_state_revision: int,
-    ) -> PromptAnnotation:
-        now = self._clock()
-        async with self._transaction("discard_prompt_annotation") as conn:
-            annotation = await self._get_prompt_annotation_on_conn(conn, annotation_id)
-            if annotation.status is not PromptAnnotationStatus.DRAFT:
-                raise ArtifactConflictError("only draft prompt annotations may be discarded")
-            if annotation.state_revision != expected_state_revision:
-                raise ArtifactConflictError("prompt annotation state_revision changed")
-            cursor = await conn.execute(
-                """
-                UPDATE artifact_prompt_annotations
-                SET status = ?, state_revision = state_revision + 1, updated_at = ?
-                WHERE annotation_id = ? AND state_revision = ? AND status = ?
-                """,
-                (
-                    PromptAnnotationStatus.DISCARDED.value,
-                    now,
-                    annotation_id,
-                    expected_state_revision,
-                    PromptAnnotationStatus.DRAFT.value,
-                ),
-            )
-            try:
-                if cursor.rowcount != 1:
-                    raise ArtifactConflictError("prompt annotation compare-and-swap failed")
-            finally:
-                await cursor.close()
-            return await self._get_prompt_annotation_on_conn(conn, annotation_id)
-
-    async def preflight_prompt_annotations(
-        self,
-        *,
-        annotation_ids: Sequence[str],
-        session_key: str,
-        session_id: str,
-        session_epoch: int,
-        require_current_head: bool = True,
-    ) -> tuple[PromptAnnotation, ...]:
-        async with self._transaction("preflight_prompt_annotations") as conn:
-            return await preflight_prompt_annotations_on_conn(
-                conn,
-                annotation_ids=annotation_ids,
-                session_key=session_key,
-                session_id=session_id,
-                session_epoch=session_epoch,
-                require_current_head=require_current_head,
-            )
-
-    async def start_edit_session(
-        self,
-        *,
-        document_id: str,
-        user_id: str,
-        ttl_ms: int,
-        actor: Actor,
-        edit_session_id: str,
-    ) -> EditSession:
-        """Open an editor lifecycle session without acquiring write authority.
-
-        A caller-derived opaque ``edit_session_id`` is an idempotency key. An
-        exact replay returns the original live session; reusing it for another
-        request fails closed. Writer leases are acquired only for an individual
-        save and are never retained by the editor heartbeat.
-        """
-
-        now = self._clock()
-        async with self._transaction("start_edit_session") as conn:
-            document = await self._get_document_on_conn(conn, document_id)
-            existing_row = await _fetchone(
-                conn,
-                "SELECT * FROM artifact_edit_sessions WHERE edit_session_id = ?",
-                (edit_session_id,),
-            )
-            if existing_row is not None:
-                existing = _edit_session_from_row(existing_row)
-                if (
-                    existing.document_id != document_id
-                    or existing.user_id != user_id
-                    or existing.mode is not EditSessionMode.EDIT
-                ):
-                    raise ArtifactConflictError(
-                        "edit session request was already used for another editor"
-                    )
-                if existing.status is not EditSessionStatus.ACTIVE:
-                    raise ArtifactConflictError("edit session is not active")
-                if existing.expires_at <= now:
-                    raise ArtifactConflictError("edit session has expired")
-                return existing
-
-            await conn.execute(
-                """
-                INSERT INTO artifact_edit_sessions (
-                    edit_session_id, document_id, base_revision_id,
-                    last_saved_revision_id, mode, status, user_id,
-                    state_revision,
-                    expires_at, last_access_at, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?)
-                """,
-                (
-                    edit_session_id,
-                    document_id,
-                    document.head_revision_id,
-                    document.head_revision_id,
-                    EditSessionMode.EDIT.value,
-                    EditSessionStatus.ACTIVE.value,
-                    user_id,
-                    now + ttl_ms,
-                    now,
-                    now,
-                    now,
-                ),
-            )
-            await self._append_audit(
-                conn,
-                document_id=document_id,
-                event_type="edit_session.opened",
-                actor=actor,
-                revision_id=document.head_revision_id,
-                edit_session_id=edit_session_id,
-                payload={"mode": EditSessionMode.EDIT.value, "expires_at": now + ttl_ms},
-                created_at=now,
-            )
-            return await self._get_edit_session_on_conn(conn, edit_session_id)
-
     async def get_edit_session(self, edit_session_id: str) -> EditSession:
         async with self._transaction("get_edit_session") as conn:
-            return await self._get_edit_session_on_conn(conn, edit_session_id)
-
-    async def validate_edit_session_for_save(
-        self,
-        *,
-        edit_session_id: str,
-        document_id: str,
-        user_id: str,
-        expected_state_revision: int,
-        expected_last_saved_revision_id: str,
-    ) -> EditSession:
-        """Resolve a live scoped edit session before acquiring a short save lease."""
-
-        now = self._clock()
-        async with self._transaction("validate_edit_session_for_save") as conn:
-            edit_session = await self._get_edit_session_on_conn(conn, edit_session_id)
-            if edit_session.document_id != document_id:
-                raise ArtifactConflictError("edit session belongs to another document")
-            if edit_session.user_id != user_id:
-                raise ArtifactConflictError("edit session belongs to another user")
-            if edit_session.mode is not EditSessionMode.EDIT:
-                raise ArtifactConflictError("edit session is read-only")
-            if edit_session.status is not EditSessionStatus.ACTIVE:
-                raise ArtifactConflictError("edit session is not active")
-            if edit_session.expires_at <= now:
-                raise ArtifactConflictError("edit session has expired")
-            if (
-                edit_session.state_revision != expected_state_revision
-                or edit_session.last_saved_revision_id != expected_last_saved_revision_id
-            ):
-                raise ArtifactConflictError("edit session save position changed")
-            return edit_session
-
-    async def heartbeat_edit_session(
-        self,
-        *,
-        edit_session_id: str,
-        user_id: str,
-        expected_state_revision: int,
-        ttl_ms: int,
-        actor: Actor,
-    ) -> EditSession:
-        """Touch the editor lifecycle without acquiring or renewing a writer lease."""
-
-        now = self._clock()
-        expires_at = now + ttl_ms
-        async with self._transaction("heartbeat_edit_session") as conn:
-            edit_session = await self._get_edit_session_on_conn(conn, edit_session_id)
-            if edit_session.user_id != user_id:
-                raise ArtifactConflictError("edit session belongs to another user")
-            if edit_session.state_revision != expected_state_revision:
-                raise ArtifactConflictError("edit session state_revision changed")
-            if edit_session.mode is not EditSessionMode.EDIT:
-                raise ArtifactConflictError("edit session is read-only")
-            if edit_session.status is not EditSessionStatus.ACTIVE:
-                raise ArtifactConflictError("edit session is not active")
-            if edit_session.expires_at <= now:
-                raise ArtifactConflictError("edit session has expired")
-            cursor = await conn.execute(
-                """
-                UPDATE artifact_edit_sessions
-                SET state_revision = state_revision + 1, expires_at = ?,
-                    last_access_at = ?, updated_at = ?
-                WHERE edit_session_id = ? AND state_revision = ? AND status = ?
-                """,
-                (
-                    expires_at,
-                    now,
-                    now,
-                    edit_session_id,
-                    expected_state_revision,
-                    EditSessionStatus.ACTIVE.value,
-                ),
-            )
-            try:
-                if cursor.rowcount != 1:
-                    raise ArtifactConflictError("edit session compare-and-swap failed")
-            finally:
-                await cursor.close()
-            await self._append_audit(
-                conn,
-                document_id=edit_session.document_id,
-                event_type="edit_session.touched",
-                actor=actor,
-                edit_session_id=edit_session_id,
-                payload={"expires_at": expires_at},
-                created_at=now,
-            )
-            return await self._get_edit_session_on_conn(conn, edit_session_id)
-
-    async def close_edit_session(
-        self,
-        *,
-        edit_session_id: str,
-        user_id: str,
-        expected_state_revision: int,
-        actor: Actor,
-    ) -> EditSession:
-        """Close a lifecycle-only edit session without touching writer leases."""
-
-        now = self._clock()
-        async with self._transaction("close_edit_session") as conn:
-            edit_session = await self._get_edit_session_on_conn(conn, edit_session_id)
-            if edit_session.user_id != user_id:
-                raise ArtifactConflictError("edit session belongs to another user")
-            # CLOSED is terminal, so a response-loss retry can safely return it
-            # even though the request carries the pre-close state revision.
-            if edit_session.status is EditSessionStatus.CLOSED:
-                return edit_session
-            if edit_session.state_revision != expected_state_revision:
-                raise ArtifactConflictError("edit session state_revision changed")
-            if edit_session.status is not EditSessionStatus.ACTIVE:
-                raise ArtifactConflictError("edit session is not active")
-
-            cursor = await conn.execute(
-                """
-                UPDATE artifact_edit_sessions
-                SET status = ?, state_revision = state_revision + 1,
-                    last_access_at = ?, updated_at = ?
-                WHERE edit_session_id = ? AND state_revision = ? AND status = ?
-                """,
-                (
-                    EditSessionStatus.CLOSED.value,
-                    now,
-                    now,
-                    edit_session_id,
-                    expected_state_revision,
-                    EditSessionStatus.ACTIVE.value,
-                ),
-            )
-            try:
-                if cursor.rowcount != 1:
-                    raise ArtifactConflictError("edit session compare-and-swap failed")
-            finally:
-                await cursor.close()
-
-            await self._append_audit(
-                conn,
-                document_id=edit_session.document_id,
-                event_type="edit_session.closed",
-                actor=actor,
-                revision_id=edit_session.last_saved_revision_id,
-                edit_session_id=edit_session_id,
-                created_at=now,
-            )
             return await self._get_edit_session_on_conn(conn, edit_session_id)
 
     async def list_audit_events(

@@ -28,9 +28,8 @@ from opensquilla.engine.turn_runner.agent_bootstrap_stage import (
     _ResolvedCatalog,
 )
 from opensquilla.engine.turn_runner.outcome import StageOutcome
-from opensquilla.engine.types import ThinkingLevel
+from opensquilla.engine.types import AgentConfig, ThinkingLevel
 from opensquilla.provider.types import ModelCapabilities
-from opensquilla.tools.types import ToolContext
 
 # ---------------------------------------------------------------------------
 # Recording fakes (one per port)
@@ -63,7 +62,6 @@ def _default_aux(
     flush_compaction_requires_safe_receipt: bool = False,
     source_diff_preservation_mode: str | None = "log",
     source_diff_candidate_mode: str | None = "log",
-    text_only_tool_recovery_mode: str | None = "off",
 ) -> _AgentConfigAuxiliaries:
     return _AgentConfigAuxiliaries(
         thinking=thinking,
@@ -85,9 +83,6 @@ def _default_aux(
         compaction_total_timeout_seconds=120.0,
         compaction_heartbeat_interval_seconds=15.0,
         tool_result_projection_max_inline_chars=60_000,
-        tool_result_fresh_diagnostic_policy_enabled=False,
-        tool_result_diagnostic_retrieval_gate_enabled=False,
-        tool_result_fresh_diagnostic_inline_max_chars=64_000,
         tool_result_dispatch_max_chars=0,
         tool_result_dispatch_turn_max_chars=0,
         tool_result_store_full_trace=False,
@@ -96,8 +91,6 @@ def _default_aux(
         tool_result_store_retention_seconds=3600,
         source_diff_preservation_mode=source_diff_preservation_mode,
         source_diff_candidate_mode=source_diff_candidate_mode,
-        runtime_state_capsule_mode="off",
-        text_only_tool_recovery_mode=text_only_tool_recovery_mode,
     )
 
 
@@ -350,21 +343,6 @@ async def test_case01_success_all_defaults() -> None:
     assert o.agent_config.metadata["agent_max_iterations_source"] == "test budget"
 
 
-@pytest.mark.asyncio
-async def test_exclusive_tool_context_marks_agent_as_restricted_turn() -> None:
-    stage = _make_stage()
-
-    restricted = await stage.run(
-        _make_input(
-            tool_context=ToolContext(
-                exclusive_tools={"document_inspect"}
-            )
-        )
-    )
-    ordinary = await stage.run(_make_input(tool_context=ToolContext()))
-
-    assert restricted.output.agent_config.restricted_turn is True
-    assert ordinary.output.agent_config.restricted_turn is False
 
 
 @pytest.mark.asyncio
@@ -376,23 +354,74 @@ async def test_length_capped_continuations_threads_to_agent_config() -> None:
     assert out.output.agent_config.length_capped_continuations == 3
 
 
+_RETIRED_EXPERIMENT_ENV_FIELDS = {
+    "OPENSQUILLA_FINALIZE_EVIDENCE_STRICT": "finalize_evidence_strict",
+    "OPENSQUILLA_FINALIZE_VARIANT_CHALLENGE": "finalize_variant_challenge",
+    "OPENSQUILLA_SUBMIT_REVIEW": "submit_review_enabled",
+    "OPENSQUILLA_TOOL_LOOP_OBSERVER_MODE": "tool_loop_observer_mode",
+    "OPENSQUILLA_RUNTIME_STATE_CAPSULE_MODE": "runtime_state_capsule_mode",
+    "OPENSQUILLA_TEXT_ONLY_TOOL_RECOVERY_MODE": "text_only_tool_recovery_mode",
+    "OPENSQUILLA_REASONING_STREAM_CHAR_CAP": "reasoning_stream_char_cap",
+    "OPENSQUILLA_PLACEHOLDER_ESCALATION_THRESHOLD": "placeholder_escalation_threshold",
+    "OPENSQUILLA_MID_BUDGET_NO_DIFF_NUDGE": "mid_budget_no_diff_nudge",
+    "OPENSQUILLA_ENDGAME_FIX_DIRECTIVE_MARGIN_SECONDS": "endgame_fix_directive_margin_seconds",
+    "OPENSQUILLA_POST_WRITE_CONVERGENCE": "post_write_convergence_enabled",
+    "OPENSQUILLA_POST_WRITE_CONVERGENCE_WARN_THRESHOLD": "post_write_convergence_warn_threshold",
+    "OPENSQUILLA_POST_WRITE_CONVERGENCE_FINALIZE_AFTER_WARNING": (
+        "post_write_convergence_finalize_after_warning"
+    ),
+    "OPENSQUILLA_PATCH_HYGIENE_BLOCK": "patch_hygiene_block_mode",
+    "OPENSQUILLA_SCRATCH_VERIFY_MIRROR": "scratch_verify_mirror",
+    "OPENSQUILLA_ENDGAME_GIT_FREEZE_MARGIN_SECONDS": "endgame_git_freeze_margin_seconds",
+    "OPENSQUILLA_ENDGAME_GIT_FREEZE_INSTRUMENTATION_EXEMPT": (
+        "endgame_git_freeze_instrumentation_exempt"
+    ),
+}
+
+
 @pytest.mark.asyncio
-async def test_post_write_convergence_env_threads_to_agent_config(monkeypatch) -> None:
+@pytest.mark.parametrize("value", [None, "0", "1", "unexpected-old-value"])
+async def test_retired_experiment_env_does_not_activate_agent_config(monkeypatch, value) -> None:
+    for name in _RETIRED_EXPERIMENT_ENV_FIELDS:
+        if value is None:
+            monkeypatch.delenv(name, raising=False)
+        else:
+            monkeypatch.setenv(name, value)
+
     stage = _make_stage()
-    default_out = await stage.run(_make_input())
-    assert default_out.output.agent_config.post_write_convergence_enabled is False
+    out = await stage.run(_make_input())
+    defaults = AgentConfig()
 
-    monkeypatch.setenv("OPENSQUILLA_POST_WRITE_CONVERGENCE", "1")
-    monkeypatch.setenv("OPENSQUILLA_POST_WRITE_CONVERGENCE_WARN_THRESHOLD", "4")
-    monkeypatch.setenv("OPENSQUILLA_POST_WRITE_CONVERGENCE_FINALIZE_AFTER_WARNING", "2")
-    enabled_out = await stage.run(_make_input())
+    for field_name in _RETIRED_EXPERIMENT_ENV_FIELDS.values():
+        assert getattr(out.output.agent_config, field_name) == getattr(defaults, field_name)
 
-    assert enabled_out.output.agent_config.post_write_convergence_enabled is True
-    assert enabled_out.output.agent_config.post_write_convergence_warn_threshold == 4
-    assert (
-        enabled_out.output.agent_config.post_write_convergence_finalize_after_warning
-        == 2
-    )
+
+def test_retired_experiment_agent_config_keywords_remain_constructible() -> None:
+    legacy_values = {
+        "finalize_evidence_strict": True,
+        "finalize_variant_challenge": True,
+        "submit_review_enabled": True,
+        "submit_review_diff_max_chars": 10,
+        "tool_loop_observer_mode": "log",
+        "runtime_state_capsule_mode": "inject",
+        "text_only_tool_recovery_mode": "warn_model",
+        "reasoning_stream_char_cap": 500,
+        "placeholder_escalation_threshold": 2,
+        "mid_budget_no_diff_nudge": True,
+        "endgame_fix_directive_margin_seconds": 120,
+        "post_write_convergence_enabled": True,
+        "post_write_convergence_warn_threshold": 4,
+        "post_write_convergence_finalize_after_warning": 2,
+        "patch_hygiene_block_mode": "protected_paths",
+        "scratch_verify_mirror": True,
+        "endgame_git_freeze_margin_seconds": 120,
+        "endgame_git_freeze_instrumentation_exempt": True,
+    }
+    config = AgentConfig(**legacy_values)
+
+    # These values remain constructor-compatible, not active runtime settings.
+    for field_name, value in legacy_values.items():
+        assert getattr(config, field_name) == value
 
 
 @pytest.mark.asyncio
@@ -405,66 +434,33 @@ async def test_tool_repeat_nudge_threshold_env_zero_disables_recovery(monkeypatc
 
 
 @pytest.mark.asyncio
-async def test_placeholder_escalation_and_wrapup_env_thread_to_agent_config(
+async def test_deadline_wrapup_env_threads_to_agent_config(
     monkeypatch,
 ) -> None:
     stage = _make_stage()
-    monkeypatch.delenv("OPENSQUILLA_PLACEHOLDER_ESCALATION_THRESHOLD", raising=False)
     monkeypatch.delenv("OPENSQUILLA_DEADLINE_WRAPUP_MARGIN_SECONDS", raising=False)
     default_out = await stage.run(_make_input())
-    assert default_out.output.agent_config.placeholder_escalation_threshold == 0
     assert default_out.output.agent_config.deadline_wrapup_margin_seconds == 0
 
-    monkeypatch.setenv("OPENSQUILLA_PLACEHOLDER_ESCALATION_THRESHOLD", "2")
     monkeypatch.setenv("OPENSQUILLA_DEADLINE_WRAPUP_MARGIN_SECONDS", "360")
     enabled_out = await stage.run(_make_input())
 
-    assert enabled_out.output.agent_config.placeholder_escalation_threshold == 2
     assert enabled_out.output.agent_config.deadline_wrapup_margin_seconds == 360
 
 
 @pytest.mark.asyncio
-async def test_final_diff_salvage_and_endgame_freeze_env_thread_to_agent_config(
+async def test_final_diff_salvage_env_threads_to_agent_config(
     monkeypatch,
 ) -> None:
     stage = _make_stage()
     monkeypatch.delenv("OPENSQUILLA_FINAL_DIFF_SALVAGE", raising=False)
-    monkeypatch.delenv("OPENSQUILLA_ENDGAME_GIT_FREEZE_MARGIN_SECONDS", raising=False)
     default_out = await stage.run(_make_input())
     assert default_out.output.agent_config.final_diff_salvage is False
-    assert default_out.output.agent_config.endgame_git_freeze_margin_seconds == 0
 
     monkeypatch.setenv("OPENSQUILLA_FINAL_DIFF_SALVAGE", "1")
-    monkeypatch.setenv("OPENSQUILLA_ENDGAME_GIT_FREEZE_MARGIN_SECONDS", "300")
     enabled_out = await stage.run(_make_input())
 
     assert enabled_out.output.agent_config.final_diff_salvage is True
-    assert enabled_out.output.agent_config.endgame_git_freeze_margin_seconds == 300
-
-
-@pytest.mark.asyncio
-async def test_reasoning_cap_and_mid_budget_nudge_env_thread_to_agent_config(
-    monkeypatch,
-) -> None:
-    stage = _make_stage()
-    monkeypatch.delenv("OPENSQUILLA_REASONING_STREAM_CHAR_CAP", raising=False)
-    monkeypatch.delenv("OPENSQUILLA_MID_BUDGET_NO_DIFF_NUDGE", raising=False)
-    default_out = await stage.run(_make_input())
-    assert default_out.output.agent_config.reasoning_stream_char_cap == 0
-    assert default_out.output.agent_config.mid_budget_no_diff_nudge is False
-
-    monkeypatch.setenv("OPENSQUILLA_REASONING_STREAM_CHAR_CAP", "20000")
-    monkeypatch.setenv("OPENSQUILLA_MID_BUDGET_NO_DIFF_NUDGE", "1")
-    enabled_out = await stage.run(_make_input())
-    assert enabled_out.output.agent_config.reasoning_stream_char_cap == 20000
-    assert enabled_out.output.agent_config.mid_budget_no_diff_nudge is True
-
-    # Garbage values fall back to the defaults instead of raising.
-    monkeypatch.setenv("OPENSQUILLA_REASONING_STREAM_CHAR_CAP", "banana")
-    monkeypatch.setenv("OPENSQUILLA_MID_BUDGET_NO_DIFF_NUDGE", "banana")
-    garbage_out = await stage.run(_make_input())
-    assert garbage_out.output.agent_config.reasoning_stream_char_cap == 0
-    assert garbage_out.output.agent_config.mid_budget_no_diff_nudge is False
 
 
 @pytest.mark.asyncio
@@ -627,6 +623,80 @@ async def test_bootstrap_installs_known_fallback_limits_on_provider_wrapper() ->
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("declared_fallback_provider", ["provider-b", "foreign-provider"])
+async def test_router_vision_declarations_override_stale_catalog_for_each_leg(
+    declared_fallback_provider: str,
+) -> None:
+    primary = _ResolvedCatalog(
+        max_tokens=16_384,
+        context_window=128_000,
+        capabilities=ModelCapabilities(supports_vision=False),
+        vision_support="unsupported",
+    )
+    fallback = SimpleNamespace(
+        provider="provider-b",
+        model="fallback/model",
+        api_key="fallback-key",
+        base_url="",
+        proxy="",
+    )
+
+    class _Catalog:
+        def lookup(self, model_id: str, provider: str = "") -> _ResolvedCatalog:
+            if (provider, model_id) == ("provider-a", "primary/model"):
+                return primary
+            assert model_id == "fallback/model"
+            assert provider in {"provider-b", "foreign-provider"}
+            return replace(primary, max_tokens=8_192, context_window=64_000)
+
+    class _Provider:
+        vision_entries: list[tuple[Any, str]] = []
+
+        def fallback_deployment_configs(self) -> tuple[Any, ...]:
+            return (fallback,)
+
+        def configure_fallback_deployment_limits(self, _limits: Any) -> None:
+            return None
+
+        def configure_fallback_deployment_vision_support(
+            self,
+            entries: list[tuple[Any, str]],
+        ) -> None:
+            self.vision_entries = entries
+
+        def configure_fallback_limits(self, _limits: Any) -> None:
+            return None
+
+    provider = _Provider()
+    turn = _make_turn(
+        metadata={
+            "routed_provider": "provider-a",
+            "routed_model": "primary/model",
+            "routed_model_vision_support": "supported",
+            "router_fallback_chain": [
+                {
+                    "provider": declared_fallback_provider,
+                    "model": "fallback/model",
+                    "vision_support": "supported",
+                }
+            ],
+        }
+    )
+
+    out = await _make_stage(catalog=_Catalog()).run(
+        _make_input(
+            provider=provider,
+            turn=turn,
+            resolved_model="primary/model",
+            active_provider_id="provider-a",
+        )
+    )
+
+    assert out.output.agent_config.model_vision_support == "supported"
+    assert provider.vision_entries == [(fallback, "supported")]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("fallback_supports_tools", [True, False])
 async def test_fallback_capability_does_not_downgrade_active_model_verification(
     fallback_supports_tools: bool,
@@ -753,34 +823,6 @@ async def test_private_fallback_does_not_downgrade_fixed_glm_5_2_verification() 
     assert provider.private_limits[0][3] == ModelCapabilities(supports_tools=False)
 
 
-@pytest.mark.asyncio
-async def test_unverified_ensemble_aggregator_overrides_inherited_tool_denial() -> None:
-    inherited_catalog = _RecordingModelCatalog(
-        catalog=_ResolvedCatalog(
-            max_tokens=16_384,
-            context_window=200_000,
-            capabilities=ModelCapabilities(supports_tools=False),
-            tools_capability_verified=True,
-        )
-    )
-    provider = SimpleNamespace(
-        artifact_tool_executor_capabilities=ModelCapabilities(supports_tools=True),
-        artifact_tools_capability_verified=False,
-    )
-
-    out = await _make_stage(catalog=inherited_catalog).run(
-        _make_input(
-            provider=provider,
-            resolved_model="inherited-no-tools",
-            active_provider_id="tokenrhythm",
-        )
-    )
-
-    assert out.output.model_capabilities == ModelCapabilities(supports_tools=True)
-    assert out.output.agent_config.model_capabilities == ModelCapabilities(
-        supports_tools=True
-    )
-    assert out.output.agent_config.model_tools_capability_verified is False
 
 
 @pytest.mark.asyncio
@@ -880,9 +922,6 @@ async def test_case06_model_with_capabilities_and_projection_limit() -> None:
         aux=replace(
             _default_aux(thinking=True),
             tool_result_projection_max_inline_chars=1234,
-            tool_result_fresh_diagnostic_policy_enabled=True,
-            tool_result_diagnostic_retrieval_gate_enabled=True,
-            tool_result_fresh_diagnostic_inline_max_chars=12_345,
         )
     )
     factory = _RecordingAgentFactory()
@@ -892,45 +931,50 @@ async def test_case06_model_with_capabilities_and_projection_limit() -> None:
     assert out.output.model_capabilities is caps
     assert out.output.agent_config.thinking is True
     assert out.output.agent_config.tool_result_projection_max_inline_chars == 1234
-    assert out.output.agent_config.tool_result_fresh_diagnostic_policy_enabled is True
-    assert out.output.agent_config.tool_result_diagnostic_retrieval_gate_enabled is True
-    assert out.output.agent_config.tool_result_fresh_diagnostic_inline_max_chars == 12_345
+    assert out.output.agent_config.tool_result_fresh_diagnostic_policy_enabled is False
+    assert out.output.agent_config.tool_result_diagnostic_retrieval_gate_enabled is False
+    assert out.output.agent_config.tool_result_fresh_diagnostic_inline_max_chars == 64_000
 
 
 @pytest.mark.asyncio
-async def test_fresh_diagnostic_env_overrides_agent_token_config(monkeypatch) -> None:
+async def test_retired_fresh_diagnostic_env_does_not_change_agent_config(monkeypatch) -> None:
     monkeypatch.setenv("OPENSQUILLA_TOOL_RESULT_FRESH_DIAGNOSTIC_POLICY_ENABLED", "true")
     monkeypatch.setenv("OPENSQUILLA_TOOL_RESULT_DIAGNOSTIC_RETRIEVAL_GATE_ENABLED", "1")
     monkeypatch.setenv("OPENSQUILLA_TOOL_RESULT_FRESH_DIAGNOSTIC_INLINE_MAX_CHARS", "2048")
     aux_builder = _RecordingAgentConfigBuilder(
         aux=replace(
             _default_aux(),
-            tool_result_fresh_diagnostic_policy_enabled=False,
-            tool_result_diagnostic_retrieval_gate_enabled=False,
-            tool_result_fresh_diagnostic_inline_max_chars=64_000,
         )
     )
     stage = _make_stage(aux=aux_builder)
 
     out = await stage.run(_make_input())
 
-    assert out.output.agent_config.tool_result_fresh_diagnostic_policy_enabled is True
-    assert out.output.agent_config.tool_result_diagnostic_retrieval_gate_enabled is True
-    assert out.output.agent_config.tool_result_fresh_diagnostic_inline_max_chars == 2048
+    assert out.output.agent_config.tool_result_fresh_diagnostic_policy_enabled is False
+    assert out.output.agent_config.tool_result_diagnostic_retrieval_gate_enabled is False
+    assert out.output.agent_config.tool_result_fresh_diagnostic_inline_max_chars == 64_000
 
 
 @pytest.mark.asyncio
-async def test_text_only_tool_recovery_env_overrides_config(monkeypatch) -> None:
+async def test_retired_text_only_tool_recovery_env_is_ignored(monkeypatch) -> None:
     monkeypatch.setenv("OPENSQUILLA_TEXT_ONLY_TOOL_RECOVERY_MODE", "warn_model")
-    stage = _make_stage(
-        aux=_RecordingAgentConfigBuilder(
-            aux=_default_aux(text_only_tool_recovery_mode="off")
-        )
-    )
+    stage = _make_stage()
 
     out = await stage.run(_make_input())
 
-    assert out.output.agent_config.text_only_tool_recovery_mode == "warn_model"
+    assert out.output.agent_config.text_only_tool_recovery_mode == "off"
+
+
+@pytest.mark.asyncio
+async def test_retired_patch_ledger_env_preserves_legacy_diff_exclusion(
+    monkeypatch, tmp_path
+) -> None:
+    ledger_path = str(tmp_path / "legacy-ledger.json")
+    monkeypatch.setenv("OPENSQUILLA_PATCH_EVIDENCE_LEDGER_PATH", ledger_path)
+
+    out = await _make_stage().run(_make_input())
+
+    assert out.output.agent_config.patch_evidence_ledger_path == ledger_path
 
 
 @pytest.mark.asyncio

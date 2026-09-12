@@ -1,5 +1,9 @@
 ---
 name: paper-delivery-summary
+visibility: internal
+invocation: meta_only
+owner_meta_skills:
+  - meta-paper-write
 description: "Deterministic final delivery summary for meta-paper-write. Reports only verified PDF compilation fields and the exact citation-map SUMMARY statistics."
 user-invocable: false
 disable-model-invocation: true

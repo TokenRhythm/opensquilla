@@ -142,9 +142,9 @@ def test_unknown_historical_skills_are_skipped_before_creator_run(
     proposals_dir = tmp_path / "proposals"
     _seed_decision_log(
         log_dir,
-        ["removed-old-skill", "summarize"],
+        ["removed-old-skill", "docx"],
         count=5,
-        intent="summarize old workflow output",
+        intent="docx old workflow output",
     )
     loader = _stub_loader_with_creator(monkeypatch)
     orch = _make_proposer_orchestrator(proposals_dir, proposal_ids=["aaaaaaaa"])
@@ -161,7 +161,7 @@ def test_unknown_historical_skills_are_skipped_before_creator_run(
     assert result.errors == []
     assert result.skipped == [
         {
-            "skills": ["removed-old-skill", "summarize"],
+            "skills": ["removed-old-skill", "docx"],
             "freq": 5,
             "reason": "unknown_skill",
         }
@@ -200,7 +200,7 @@ async def test_pattern_below_min_freq_is_skipped(
 ) -> None:
     log_dir = tmp_path / "logs"
     proposals_dir = tmp_path / "proposals"
-    _seed_decision_log(log_dir, ["pdf-toolkit", "summarize"], count=2)
+    _seed_decision_log(log_dir, ["pdf-toolkit", "docx"], count=2)
     loader = _stub_loader_with_creator(monkeypatch)
     orch = _make_proposer_orchestrator(proposals_dir, proposal_ids=["aaaaaaaa"])
 
@@ -225,9 +225,9 @@ async def test_pattern_at_threshold_creates_proposal_with_provenance(
     proposals_dir = tmp_path / "proposals"
     _seed_decision_log(
         log_dir,
-        ["nano-pdf", "memory"],
+        ["pdf-toolkit", "docx"],
         count=5,
-        intent="summarize a PDF and save the digest",
+        intent="docx a PDF and save the digest",
     )
     loader = _stub_loader_with_creator(monkeypatch)
     orch = _make_proposer_orchestrator(proposals_dir, proposal_ids=["cafe1234"])
@@ -247,7 +247,7 @@ async def test_pattern_at_threshold_creates_proposal_with_provenance(
     # Provenance was patched onto gates.json
     gates = json.loads((proposals_dir / "cafe1234" / "gates.json").read_text())
     assert gates["provenance"]["triggered_by"] == "auto_cron"
-    assert gates["provenance"]["auto_propose_meta"]["skills"] == ["nano-pdf", "memory"]
+    assert gates["provenance"]["auto_propose_meta"]["skills"] == ["pdf-toolkit", "docx"]
     assert gates["provenance"]["auto_propose_meta"]["freq"] == 5
     assert isinstance(gates["provenance"]["chain_hash"], str)
     assert gates["provenance"]["auto_propose_meta"]["intent_digest"]
@@ -259,18 +259,18 @@ async def test_pattern_at_threshold_creates_proposal_with_provenance(
     assert match.inputs["user_message"].startswith("auto-proposal:")
     assert "FULL_GATED validation" in match.inputs["user_message"]
     assert "runtime E2E comparison" in match.inputs["user_message"]
-    assert "summarize a PDF and save the digest" in match.inputs["system_prompt"]
+    assert "docx a PDF and save the digest" in match.inputs["system_prompt"]
     assert match.inputs["system_prompt"].startswith("Unattended meta-skill auto-propose run.")
 
 
 @pytest.mark.asyncio
-async def test_auto_enable_accepts_low_risk_eligible_proposal(
+async def test_auto_enable_accepts_medium_risk_eligible_proposal(
     tmp_path: Path,
 ) -> None:
     home = tmp_path / "home"
     log_dir = home / "logs"
     proposals_dir = home / "proposals"
-    _seed_decision_log(log_dir, ["history-explorer", "summarize"], count=5)
+    _seed_decision_log(log_dir, ["history-explorer", "docx"], count=5)
     loader = _loader_with_managed_dir(home)
     skill_md = """---
 name: synth-history-summary
@@ -283,8 +283,8 @@ composition:
       skill: history-explorer
       with:
         query: "{{ inputs.user_message | xml_escape | truncate(512) }}"
-    - id: summarize
-      skill: summarize
+    - id: docx
+      skill: docx
       depends_on: [explore]
       with:
         text: "{{ outputs.explore | truncate(2000) }}"
@@ -304,7 +304,7 @@ composition:
         triggered_by="cron",
         proposals_dir=proposals_dir,
         auto_enable=True,
-        auto_enable_max_risk="low",
+        auto_enable_max_risk="medium",
     )
 
     assert result.proposals_created == ["cafe1234"]
@@ -316,7 +316,7 @@ composition:
     assert (accepted_dir / "SKILL.md").read_text(encoding="utf-8") == skill_md
     gates = json.loads((accepted_dir / "gates.json").read_text(encoding="utf-8"))
     assert gates["auto_enable"]["status"] == "enabled"
-    assert gates["auto_enable"]["risk_level"] == "low"
+    assert gates["auto_enable"]["risk_level"] == "medium"
     assert gates["provenance"]["triggered_by"] == "auto_cron"
     assert loader.get_by_name("synth-history-summary") is not None
 
@@ -328,7 +328,7 @@ async def test_auto_enable_keeps_unescaped_user_input_proposal_pending(
     home = tmp_path / "home"
     log_dir = home / "logs"
     proposals_dir = home / "proposals"
-    _seed_decision_log(log_dir, ["history-explorer", "summarize"], count=5)
+    _seed_decision_log(log_dir, ["history-explorer", "docx"], count=5)
     loader = _loader_with_managed_dir(home)
     skill_md = """---
 name: synth-unsafe-input
@@ -341,8 +341,8 @@ composition:
       skill: history-explorer
       with:
         query: "{{ inputs.user_message }}"
-    - id: summarize
-      skill: summarize
+    - id: docx
+      skill: docx
       depends_on: [explore]
       with:
         text: "{{ outputs.explore | truncate(2000) }}"
@@ -378,7 +378,7 @@ async def test_auto_enable_keeps_unbounded_output_proposal_pending(
     home = tmp_path / "home"
     log_dir = home / "logs"
     proposals_dir = home / "proposals"
-    _seed_decision_log(log_dir, ["history-explorer", "summarize"], count=5)
+    _seed_decision_log(log_dir, ["history-explorer", "docx"], count=5)
     loader = _loader_with_managed_dir(home)
     skill_md = """---
 name: synth-raw-output
@@ -391,8 +391,8 @@ composition:
       skill: history-explorer
       with:
         query: "{{ inputs.user_message | xml_escape | truncate(512) }}"
-    - id: summarize
-      skill: summarize
+    - id: docx
+      skill: docx
       depends_on: [explore]
       with:
         text: "{{ outputs.explore }}"
@@ -420,7 +420,7 @@ composition:
     assert result.auto_enable[0]["reason"] == "risk_too_high"
     assert result.auto_enable[0]["risk_level"] == "high"
     details = result.auto_enable[0]["details"]
-    assert "unbounded_output_template:summarize.with.text" in details["reasons"]
+    assert "unbounded_output_template:docx.with.text" in details["reasons"]
     assert (proposals_dir / "face1234" / "SKILL.md").is_file()
     gates = json.loads((proposals_dir / "face1234" / "gates.json").read_text())
     assert gates["auto_enable"]["details"]["validation_profile"] == "static-safety-v2"
@@ -433,24 +433,24 @@ async def test_auto_enable_keeps_high_risk_proposal_pending(
     home = tmp_path / "home"
     log_dir = home / "logs"
     proposals_dir = home / "proposals"
-    _seed_decision_log(log_dir, ["weather", "tmux"], count=5)
+    _seed_decision_log(log_dir, ["docx", "github"], count=5)
     loader = _loader_with_managed_dir(home)
     skill_md = """---
-name: synth-weather-tmux
+name: synth-docx-github
 kind: meta
 triggers:
-  - synth weather tmux
+  - synth docx github
 composition:
   steps:
-    - id: weather
-      skill: weather
+    - id: document
+      skill: docx
       with:
-        location: "{{ inputs.user_message }}"
-    - id: tmux
-      skill: tmux
-      depends_on: [weather]
+        task: "{{ inputs.user_message | xml_escape | truncate(512) }}"
+    - id: repository
+      skill: github
+      depends_on: [document]
       with:
-        command: "{{ outputs.weather }}"
+        task: "{{ outputs.document | truncate(2000) }}"
 ---
 """
     orch = _make_proposer_orchestrator(
@@ -475,7 +475,7 @@ composition:
     assert result.auto_enable[0]["reason"] == "risk_too_high"
     assert result.auto_enable[0]["risk_level"] == "high"
     assert (proposals_dir / "feed1234" / "SKILL.md").is_file()
-    assert not (home / "skills" / "synth-weather-tmux").exists()
+    assert not (home / "skills" / "synth-docx-github").exists()
     gates = json.loads((proposals_dir / "feed1234" / "gates.json").read_text())
     assert gates["auto_enable"]["status"] == "skipped"
     assert gates["auto_enable"]["reason"] == "risk_too_high"
@@ -488,7 +488,7 @@ async def test_auto_enable_uses_manifest_capability_risk(
     home = tmp_path / "home"
     log_dir = home / "logs"
     proposals_dir = home / "proposals"
-    _seed_decision_log(log_dir, ["artifact-writer", "summarize"], count=5)
+    _seed_decision_log(log_dir, ["artifact-writer", "docx"], count=5)
     _write_managed_skill(
         home,
         "artifact-writer",
@@ -547,7 +547,7 @@ async def test_auto_enable_uses_manifest_explicit_high_risk(
     home = tmp_path / "home"
     log_dir = home / "logs"
     proposals_dir = home / "proposals"
-    _seed_decision_log(log_dir, ["external-admin", "summarize"], count=5)
+    _seed_decision_log(log_dir, ["external-admin", "docx"], count=5)
     _write_managed_skill(
         home,
         "external-admin",
@@ -606,7 +606,7 @@ async def test_auto_enable_requires_risk_metadata_for_unclassified_skill(
     home = tmp_path / "home"
     log_dir = home / "logs"
     proposals_dir = home / "proposals"
-    _seed_decision_log(log_dir, ["unclassified-helper", "summarize"], count=5)
+    _seed_decision_log(log_dir, ["unclassified-helper", "docx"], count=5)
     _write_managed_skill(
         home,
         "unclassified-helper",
@@ -693,7 +693,7 @@ async def test_duplicate_pending_proposal_is_skipped_by_chain_hash(
     proposals_dir = tmp_path / "proposals"
     # Pick a chain that no bundled meta-skill composes — otherwise the
     # already_covered branch fires first.
-    chain = ["weather", "tmux"]
+    chain = ["docx", "github"]
     _seed_decision_log(log_dir, chain, count=5)
     loader = _stub_loader_with_creator(monkeypatch)
 
@@ -725,7 +725,7 @@ async def test_orchestrator_exception_is_collected_not_raised(
 ) -> None:
     log_dir = tmp_path / "logs"
     proposals_dir = tmp_path / "proposals"
-    _seed_decision_log(log_dir, ["nano-pdf", "memory"], count=5)
+    _seed_decision_log(log_dir, ["pdf-toolkit", "docx"], count=5)
     loader = _stub_loader_with_creator(monkeypatch)
     orch = _make_proposer_orchestrator(
         proposals_dir, raises=RuntimeError("provider blew up"),
@@ -749,7 +749,7 @@ async def test_asyncio_cancelled_propagates(
 ) -> None:
     log_dir = tmp_path / "logs"
     proposals_dir = tmp_path / "proposals"
-    _seed_decision_log(log_dir, ["nano-pdf", "memory"], count=5)
+    _seed_decision_log(log_dir, ["pdf-toolkit", "docx"], count=5)
     loader = _stub_loader_with_creator(monkeypatch)
     orch = _make_proposer_orchestrator(
         proposals_dir, raises=asyncio.CancelledError(),
@@ -772,7 +772,7 @@ async def test_dag_produced_no_proposal_is_skipped_not_errored(
     fail mid-DAG (no proposal lands), classify as 'skipped', not error."""
     log_dir = tmp_path / "logs"
     proposals_dir = tmp_path / "proposals"
-    _seed_decision_log(log_dir, ["nano-pdf", "memory"], count=5)
+    _seed_decision_log(log_dir, ["pdf-toolkit", "docx"], count=5)
     loader = _stub_loader_with_creator(monkeypatch)
     # Empty proposal_ids list — DAG "runs" but writes nothing.
     orch = _make_proposer_orchestrator(proposals_dir, proposal_ids=[])
@@ -824,8 +824,8 @@ async def test_chain_with_mixed_members_keeps_only_non_meta(
     as the seed pattern."""
     log_dir = tmp_path / "logs"
     proposals_dir = tmp_path / "proposals"
-    # meta-skill-creator is meta; weather + tmux are normal skills.
-    _seed_decision_log(log_dir, ["meta-skill-creator", "weather", "tmux"], count=5)
+    # meta-skill-creator is meta; docx + github are normal skills.
+    _seed_decision_log(log_dir, ["meta-skill-creator", "docx", "github"], count=5)
     loader = _stub_loader_with_creator(monkeypatch)
     orch = _make_proposer_orchestrator(proposals_dir, proposal_ids=["abcd1234"])
 
@@ -841,14 +841,14 @@ async def test_chain_with_mixed_members_keeps_only_non_meta(
     orch.run.assert_called_once()
     # And the provenance records the FILTERED chain (not the raw one).
     gates = json.loads((proposals_dir / "abcd1234" / "gates.json").read_text())
-    assert gates["provenance"]["auto_propose_meta"]["skills"] == ["weather", "tmux"]
+    assert gates["provenance"]["auto_propose_meta"]["skills"] == ["docx", "github"]
 
 
 def test_synthesised_user_message_avoids_meta_skill_creator_triggers() -> None:
     """The synth message must NOT contain any meta-skill-creator trigger
     phrase — otherwise auto_propose could recursively trigger itself
     if the synth message were ever fed back into the resolver."""
-    msg = _synthesise_user_message(["pdf-toolkit", "summarize"], 5, 30)
+    msg = _synthesise_user_message(["pdf-toolkit", "docx"], 5, 30)
     lower = msg.lower()
     for trig in _META_SKILL_CREATOR_TRIGGERS:
         assert trig.lower() not in lower, (
@@ -872,7 +872,7 @@ def test_synthesise_user_message_raises_on_trigger_substring() -> None:
     # check active in every build.
     trigger_phrase = _META_SKILL_CREATOR_TRIGGERS[0]
     with pytest.raises(RuntimeError, match="recursively trigger"):
-        _synthesise_user_message([trigger_phrase, "summarize"], 5, 30)
+        _synthesise_user_message([trigger_phrase, "docx"], 5, 30)
 
 
 def test_summary_string_shape() -> None:

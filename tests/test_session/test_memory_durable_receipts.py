@@ -1,5 +1,6 @@
 import asyncio
 import threading
+from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from typing import Any
 
@@ -11,8 +12,8 @@ from opensquilla.provider import Message
 from opensquilla.session.compaction import CompactionConfig, compaction_remaining_seconds
 from opensquilla.session.compaction_lifecycle import CompactionTimeoutError
 from opensquilla.session.manager import SessionManager
-from opensquilla.session.models import MemoryDurableReceipt, SessionNode
-from opensquilla.session.storage import SessionStorage
+from opensquilla.session.models import MemoryDurableReceipt, SessionIntent, SessionNode
+from opensquilla.session.storage import SessionStorage, StaleEpochError
 from opensquilla.tool_boundary import ToolCall, ToolResult
 
 
@@ -364,6 +365,48 @@ async def test_record_memory_checkpoint_does_not_restore_deleted_session_receipt
         await storage.close()
 
 
+async def test_record_memory_checkpoint_rejects_rotated_owner_before_write(
+    tmp_path,
+    monkeypatch,
+):
+    storage = await SessionStorage.open(tmp_path / "sessions.db")
+    manager = SessionManager(storage, checkpoint_workspace_dir=tmp_path / "workspace")
+    try:
+        key = "agent:main:webchat:checkpoint-owner"
+        monkeypatch.setenv("OPENSQUILLA_SESSION_ARCHIVE_DIR", str(tmp_path / "archives"))
+        admitted = await manager.create(key)
+        await manager.append_message(key, role="user", content="retired checkpoint body")
+        entries = await manager.get_transcript(key)
+        wrote_checkpoint = False
+
+        def record_checkpoint_write(*args, **kwargs):
+            nonlocal wrote_checkpoint
+            wrote_checkpoint = True
+            raise AssertionError("stale owner reached checkpoint writer")
+
+        monkeypatch.setattr(
+            "opensquilla.memory.checkpoint.append_checkpoint_events",
+            record_checkpoint_write,
+        )
+        replacement, rotated = await manager.apply_intent(key, SessionIntent.RESET_SAME_KEY)
+        assert rotated is True
+
+        with pytest.raises(StaleEpochError, match="memory checkpoint"):
+            await manager.record_memory_checkpoint(
+                key,
+                entries,
+                turn_id="turn-stale-owner",
+                expected_session_id=admitted.session_id,
+                expected_session_epoch=int(admitted.epoch or 0),
+            )
+
+        assert wrote_checkpoint is False
+        assert replacement.session_id != admitted.session_id
+        assert await storage.list_memory_durable_receipts(session_key=key) == []
+    finally:
+        await storage.close()
+
+
 async def test_memory_durable_receipt_coverage_lookup_is_targeted(tmp_path):
     storage = await SessionStorage.open(tmp_path / "sessions.db")
     try:
@@ -555,6 +598,7 @@ async def test_record_memory_checkpoint_receipt_db_uses_remaining_deadline(
     tmp_path, monkeypatch
 ):
     import opensquilla.memory.checkpoint as checkpoint
+    import opensquilla.session.compaction as compaction
 
     class Clock:
         now = 100.0
@@ -564,6 +608,23 @@ async def test_record_memory_checkpoint_receipt_db_uses_remaining_deadline(
 
     clock = Clock()
     monkeypatch.setattr("opensquilla.session.compaction.time", clock)
+    timeout_arguments: list[float] = []
+    active_timeout: asyncio.Timeout | None = None
+
+    @asynccontextmanager
+    async def _controlled_timeout(delay: float):
+        nonlocal active_timeout
+        timeout_arguments.append(delay)
+        # The fake clock owns this test's budget. Let real filesystem work
+        # finish, then trigger the real asyncio cancellation at DB admission.
+        async with asyncio.timeout(None) as timeout:
+            active_timeout = timeout
+            try:
+                yield timeout
+            finally:
+                active_timeout = None
+
+    monkeypatch.setattr(compaction, "asyncio", SimpleNamespace(timeout=_controlled_timeout))
     storage = await SessionStorage.open(tmp_path / "sessions.db")
     manager = SessionManager(storage, checkpoint_workspace_dir=tmp_path / "workspace")
     original_append = checkpoint.append_checkpoint_events
@@ -580,11 +641,21 @@ async def test_record_memory_checkpoint_receipt_db_uses_remaining_deadline(
             clock.now += 0.15
             return result
 
-        async def _blocking_upsert(_receipt, *, expected_session_id=None):
+        async def _blocking_upsert(
+            _receipt,
+            *,
+            expected_session_id=None,
+            expected_session_epoch=None,
+        ):
+            assert _receipt.status == "checkpoint_saved"
             assert expected_session_id == node.session_id
+            assert expected_session_epoch == int(node.epoch or 0)
             remaining = compaction_remaining_seconds(config)
             assert remaining is not None
             remaining_at_upsert.append(remaining)
+            assert timeout_arguments[-1] == pytest.approx(0.05)
+            assert active_timeout is not None
+            active_timeout.reschedule(asyncio.get_running_loop().time())
             await never_release.wait()
             raise AssertionError("cancelled receipt upsert must not resume")
 
@@ -599,6 +670,7 @@ async def test_record_memory_checkpoint_receipt_db_uses_remaining_deadline(
             )
 
         assert exc_info.value.phase == "checkpointing"
+        assert isinstance(exc_info.value.__cause__, TimeoutError)
         assert remaining_at_upsert == pytest.approx([0.05])
         assert config.deadline_at_monotonic == pytest.approx(100.2)
         rows = await storage.list_memory_durable_receipts(session_key=key)

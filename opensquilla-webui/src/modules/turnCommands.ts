@@ -1,17 +1,40 @@
+import type { ChatPageContext } from '@/types/pageContext'
 import type { InjectionKey } from 'vue'
 import type { GatewayModelRoutingMode } from '@/types/modelRouting'
 import type { CollaborationMode } from '@/types/plans'
 import type { SandboxRunMode } from '@/types/sandbox'
+import type { ArtifactProductFailure } from '@/utils/artifactProductErrors'
 
 /** Options shared by turn commands without exposing transport details. */
 export interface TurnCommandRequestOptions {
   signal?: AbortSignal
 }
 
-/** Exact editable document head bound to one turn admission. */
-export interface TurnDocumentContext {
-  documentId: string
-  headRevisionId: string
+export type TurnCommandFailureKind =
+  | 'aborted'
+  | 'timeout'
+  | 'transport'
+  | 'queue-capacity'
+  | 'session-changed'
+  | 'conflict'
+  | 'unavailable'
+  | 'rejected'
+
+/** Semantic failure projected by the Gateway Adapter for turn recovery. */
+export class TurnCommandError extends Error {
+  constructor(
+    readonly kind: TurnCommandFailureKind,
+    message: string,
+    readonly failureCode?: string,
+    readonly accepted?: boolean | null,
+    readonly retryable?: boolean,
+    readonly retryAfterMs?: number,
+    readonly details?: unknown,
+    readonly artifactFailure?: ArtifactProductFailure,
+  ) {
+    super(message)
+    this.name = 'TurnCommandError'
+  }
 }
 
 /** Source policy attached to a turn without exposing the v4 `_source` alias. */
@@ -46,10 +69,8 @@ export interface TurnSendParams {
   clientRequestId?: string
   /** Stable client identity for reconciling the optimistic user row. */
   clientMessageId?: string
-  /** Ordered durable drafts consumed atomically with this chat ingress. */
-  promptAnnotationIds?: string[]
-  /** Current editable document head made available only to this turn. */
-  documentContext?: TurnDocumentContext
+  /** User-supplied page references and annotations for this turn. */
+  pageContext?: ChatPageContext
   /** Source policy; the v4 Adapter maps this to `_source`. */
   source?: TurnSendSource
   intent?: string
@@ -87,7 +108,6 @@ export interface TurnSendResponse {
   terminalReason?: string
   terminalMessage?: string
   reason?: string
-  acceptedPromptAnnotationIds?: string[]
   metadata?: Readonly<Record<string, unknown>>
 }
 

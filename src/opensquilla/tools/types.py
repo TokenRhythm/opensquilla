@@ -9,9 +9,17 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any, Literal
 
+from opensquilla.artifacts import ArtifactSource
 from opensquilla.contracts.tool_presentation import ToolPresentationCategory
 from opensquilla.contracts.turn_execution import SurfaceCapabilities
 from opensquilla.sandbox.operation_runtime import SandboxToolDescriptor
+
+# Set only by the trusted Meta scheduler around its internal skill_view
+# preface. It is intentionally separate from model-supplied tool arguments.
+current_meta_skill_owner: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "current_meta_skill_owner",
+    default="",
+)
 
 
 class CallerKind(StrEnum):
@@ -102,7 +110,7 @@ class ToolContext:
     # host execution; Safe mode stays sandboxed.
     elevated: str | None = None
     # Additive per-call tool surface overrides (surfaced tools are made visible even
-    # when exposed_by_default=False). Does NOT relax allowed_tools strict denylist.
+    # when default_access="deny"). Does NOT relax allowed_tools strict denylist.
     surfaced_tools: set[str] | None = None
     tool_policy: dict[str, Any] | None = None
     tool_result_budget_policy: Any | None = None
@@ -118,9 +126,7 @@ class ToolContext:
     # tools consult it so a concurrent catalog publish cannot change the
     # definitions visible halfway through a tool loop.
     skill_catalog: Any | None = None
-    # Armed by the engine (mutated in place, same pattern as
-    # router_control_turn_hold_applied) once the endgame git freeze margin is
-    # reached; shell tools then block workspace-reverting git commands.
+    # Deprecated, unused compatibility slot; preserve positional arguments.
     endgame_git_freeze_active: bool = False
     # New runtime-only fields stay at the end to preserve the public dataclass's
     # historical positional constructor contract for embedded callers.
@@ -131,19 +137,13 @@ class ToolContext:
     execution_id: str | None = None
     sandbox_session_manager: Any | None = None
     sandbox_gateway_config: Any | None = None
-    # Resolved per turn by the engine (see tools.description_overrides).
-    # Keys name a tool or a "tool.param" parameter; values replace the
-    # matching model-facing description verbatim. None = mechanism off.
+    # Deprecated, unused compatibility slot; preserve construction and saved configs.
     tool_description_overrides: dict[str, str] | None = None
+    # Deprecated, unused compatibility slot; preserve construction and saved configs.
     tool_description_overrides_source: str | None = None  # "config" | "env_file"
-    # Set by the engine alongside the freeze margin reset: when True, a frozen
-    # git revert whose targeted diff is instrumentation-only (added print/log
-    # lines, nothing removed) is allowed through — cleaning up diagnostic
-    # output is exactly what the wrap-up window is for.
+    # Deprecated, unused compatibility slot; preserve positional arguments.
     endgame_git_freeze_instrumentation_exempt: bool = False
-    # Armed by the engine (mutated in place, pattern above) when the scratch
-    # verify-mirror lever is on: workspace write-deny messages then append
-    # guidance pointing at <scratch_dir>/verify-mirror/<workspace-relative-path>.
+    # Deprecated, unused compatibility slot; preserve positional arguments.
     scratch_verify_mirror_active: bool = False
 
     # Immutable Safe policy snapshot pinned at the start of this turn. New
@@ -167,9 +167,9 @@ class ToolContext:
     # Runtime-only services are injected after durable turn acceptance. They
     # must never be serialized into task details or route metadata.
     plan_storage: Any | None = field(default=None, repr=False)
-    plan_event_emitter: (
-        Callable[[str, str, dict[str, Any]], Awaitable[None]] | None
-    ) = field(default=None, repr=False)
+    plan_event_emitter: Callable[[str, str, dict[str, Any]], Awaitable[None]] | None = field(
+        default=None, repr=False
+    )
     # Runtime-owned deferred interaction service. It returns structured answers
     # to the exact tool call instead of injecting a new user turn.
     user_input_provider: Any | None = field(default=None, repr=False)
@@ -190,15 +190,6 @@ class ToolContext:
     # Process-local Goal coordinator used only by Goal-owned main-agent turns.
     # The service is never serialized into task details or route metadata.
     goal_service: Any | None = field(default=None, repr=False)
-    # Validated editor state injected only by the Web/Desktop ingress after
-    # durable turn acceptance.  These handles are process-local authority and
-    # must never be copied into route metadata, transcripts, or decision logs.
-    artifact_context: Any | None = field(default=None, repr=False)
-    artifact_session: Any | None = field(default=None, repr=False)
-    desktop_artifact_bridge: Any | None = field(default=None, repr=False)
-    artifact_event_emitter: (
-        Callable[[dict[str, Any]], Awaitable[None]] | None
-    ) = field(default=None, repr=False)
     # Narrow, runtime-only hook that turns a freshly published editable
     # deliverable into the session's canonical Document before the artifact
     # event crosses the public stream boundary. The engine never receives the
@@ -207,22 +198,6 @@ class ToolContext:
     generated_artifact_adopter: (
         Callable[[Any], Awaitable[None]] | None
     ) = field(default=None, repr=False)
-    # Hard upper bound on the tools that may be exposed or dispatched during
-    # this turn. Unlike ``allowed_tools``, declarative policy layers may never
-    # widen this set. It is used only for narrowly scoped runtime authorities
-    # such as a PromptAnnotation turn; ordinary contexts leave it unset.
-    #
-    # Runtime-only fields must remain appended here to preserve the historical
-    # positional constructor contract for embedded callers.
-    exclusive_tools: frozenset[str] | None = field(default=None, repr=False)
-    # Durable single-writer receipt controller for a PromptAnnotation turn.
-    # The Gateway constructs this only after TaskRuntime has attached the
-    # accepted task id. Dispatch consumes it before validating the first
-    # writer call; it must never be serialized or copied to another turn.
-    artifact_mutation_attempt_controller: Any | None = field(
-        default=None,
-        repr=False,
-    )
     # Process-local authority cleanup registered by ingress/runtime adapters.
     # The shared Agent turn boundary invokes these callbacks on every terminal
     # path without importing feature-specific tool implementations.
@@ -238,22 +213,6 @@ class ToolContext:
     # ownership. Raw values are never written to the owner registry.
     parent_session_key: str | None = field(default=None, repr=False)
     parent_task_id: str | None = field(default=None, repr=False)
-    # Process-local candidate-loop authority for PromptAnnotation turns.  It
-    # stages repeated edits in one draft ChangeSet and crosses the durable
-    # revision boundary only when the model invokes document_finish(commit).
-    # This field is intentionally at the end to preserve every historical
-    # positional ToolContext constructor contract.
-    artifact_candidate_loop_controller: Any | None = field(
-        default=None,
-        repr=False,
-    )
-    # Process-local preview materialization service used by the protocol-v4
-    # Electron candidate bridge.  It is never serialized or exposed to the
-    # model; the bridge receives only the controller's opaque handle.
-    artifact_preview_service: Any | None = field(
-        default=None,
-        repr=False,
-    )
     # Ephemeral binary evidence produced by a tool for the current provider
     # request. The map is keyed by tool_use_id and consumed by the Agent
     # before the next provider call; it is never persisted or exposed as a
@@ -262,14 +221,26 @@ class ToolContext:
         default_factory=dict,
         repr=False,
     )
+    # Immutable durable session id admitted with this turn. Kept at the
+    # positional tail; ``session_epoch`` above is its legacy-added companion.
+    session_id: str | None = field(default=None, repr=False)
+    # Complete post-policy catalog for this turn.  The model sees only the
+    # progressive disclosure surface; dispatch still enforces this authority.
+    # Appended to preserve ToolContext's positional compatibility contract.
+    authorized_tool_names: frozenset[str] | None = field(default=None, repr=False)
+    disclosed_tool_names: set[str] = field(default_factory=set, repr=False)
+    tool_search_index: Any | None = field(default=None, repr=False)
+    tool_search_namespaces: dict[str, str] = field(default_factory=dict, repr=False)
+    # Resolve at invocation time: a selector may have changed deployment since
+    # the turn started. No independent model selection is authorized by a tool.
+    image_analysis_target: Callable[[], tuple[Any, Any] | None] | None = field(
+        default=None, repr=False
+    )
+
+    desktop_browser: Any | None = field(default=None, repr=False)
+    artifact_source_paths: dict[str, ArtifactSource] = field(default_factory=dict, repr=False)
 
     def __post_init__(self) -> None:
-        # A restricted turn's ceiling is an authority boundary, not a policy
-        # preference.  Normalize every caller (including embedded callers
-        # that still pass a mutable set) so no later hook can widen the live
-        # schema/dispatch ceiling in place.
-        if self.exclusive_tools is not None:
-            self.exclusive_tools = frozenset(self.exclusive_tools)
         self.validate_path_roots()
 
     def validate_path_roots(self) -> None:
@@ -364,16 +335,6 @@ SUBAGENT_TOOL_DENY: frozenset[str] = frozenset(
         "session_search",
         "message",
         "publish_artifact",
-        "document_apply",
-        "document_browser_act",
-        "document_browser_inspect",
-        "document_browser_reload",
-        "document_browser_screenshot",
-        "document_finish",
-        "document_patch",
-        "document_inspect",
-        "document_locate",
-        "document_read",
     }
 )
 
@@ -421,7 +382,10 @@ class ToolSpec:
     parameters: dict[str, Any]  # JSON Schema properties dict
     required: list[str] = field(default_factory=list)
     owner_only: bool = False
-    exposed_by_default: bool = True
+    # Registration-time policy used when no turn-specific rule has selected the
+    # tool.  An explicit deny always wins; "deny" tools must be deliberately
+    # added to ToolContext.surfaced_tools by the owning workflow.
+    default_access: Literal["allow", "deny"] | bool = "allow"
     execution_timeout_seconds: float | None = None
     execution_timeout_argument: str | None = None
     execution_timeout_padding: float = 0.0
@@ -453,6 +417,29 @@ class ToolSpec:
     # It never changes provider schemas, validation, authorization, or execution.
     # Appended for positional compatibility with embedded ToolSpec callers.
     presentation_category: ToolPresentationCategory | None = None
+    # Deprecated compatibility alias.  Older plugins used this keyword, while
+    # the sixth positional argument now lands in ``default_access`` as a bool.
+    # Both forms are normalized here so an old ``False`` cannot fail open.
+    exposed_by_default: bool | None = field(default=None, repr=False)
+
+    def __post_init__(self) -> None:
+        raw_access = self.default_access
+        legacy_access = self.exposed_by_default
+        if isinstance(raw_access, bool):
+            if legacy_access is not None and legacy_access is not raw_access:
+                raise ValueError("conflicting default_access and exposed_by_default values")
+            normalized: Literal["allow", "deny"] = "allow" if raw_access else "deny"
+        else:
+            if raw_access not in {"allow", "deny"}:
+                raise ValueError("default_access must be 'allow' or 'deny'")
+            normalized = raw_access
+            if legacy_access is not None:
+                legacy_normalized: Literal["allow", "deny"] = "allow" if legacy_access else "deny"
+                if raw_access == "deny" and legacy_normalized != raw_access:
+                    raise ValueError("conflicting default_access and exposed_by_default values")
+                normalized = legacy_normalized
+        self.default_access = normalized
+        self.exposed_by_default = normalized == "allow"
 
 
 # Registered tool implementation: async fn that accepts keyword args and returns str.
@@ -523,9 +510,7 @@ class ProjectedToolArgumentsError(SafeToolUserMessage, ValueError):
 class UnsupportedSurfaceError(SafeToolError):
     """Raised when a tool needs an interactive surface that is unavailable."""
 
-    user_message = (
-        "This tool requires a live approval surface, but the current run is unattended."
-    )
+    user_message = "This tool requires a live approval surface, but the current run is unattended."
 
 
 class UnsupportedURLSchemeError(SafeToolUserMessage, ValueError):

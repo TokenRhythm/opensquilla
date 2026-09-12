@@ -28,7 +28,7 @@ assert.ok(
   'display-only policy must reject file-system mutation',
 )
 assert.ok(
-  validateInstallerProgressSource(includeSource.replace('!ifndef BUILD_UNINSTALLER\n', '')).some((failure) =>
+  validateInstallerProgressSource(includeSource.replace(/!ifndef BUILD_UNINSTALLER\r?\n/, '')).some((failure) =>
     failure.includes('fully guarded by BUILD_UNINSTALLER'),
   ),
   'display-only policy must reject an unguarded installer include',

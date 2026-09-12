@@ -1,3 +1,4 @@
+import { pageAnnotationSnapshots } from '@/types/pageContext'
 import { nextTick, ref, type Ref } from 'vue'
 import type {
   ChatMessage,
@@ -49,7 +50,7 @@ import {
 import { isImageInputUnsupported, localizedChatErrorMessage } from '@/utils/chat/errors'
 import { isUsageAccountingBarrier } from '@/utils/chat/usageAccountingFailure'
 import { interleaveHistoryModelCallSegments } from '@/utils/chat/historyModelCallSegments'
-import { normalizePromptAnnotationSnapshot } from '@/workbench/artifactPromptAnnotationProvider'
+import { normalizePromptAnnotationSnapshot } from '@/utils/chat/promptAnnotationHistory'
 
 function recordArray<T extends Record<string, unknown>>(value: unknown): T[] {
   return Array.isArray(value)
@@ -565,9 +566,7 @@ type AcceptedEnsembleMode = 'ensemble' | 'llm_ensemble'
 function acceptedEnsembleMode(message: ChatMessage): AcceptedEnsembleMode | null {
   if (message.role !== 'router' || !message.routerDecision) return null
   const raw = String(
-    message.routerDecision.accepted_routing_mode
-    || message.routerDecision.acceptedRoutingMode
-    || '',
+    message.routerDecision.accepted_routing_mode || '',
   ).trim().toLowerCase()
   return raw === 'ensemble' || raw === 'llm_ensemble' ? raw : null
 }
@@ -841,10 +840,12 @@ export function useChatHistory(options: UseChatHistoryOptions) {
       planRevisions: planRevisionsFromToolSegments(msg.toolCalls),
       timeline: recordArray<ChatTimelineSegment>(msg.timeline),
       attachments: normalizeDisplayAttachments([...msg.attachments], { messageId }),
-      promptAnnotations: msg.promptAnnotations
-        .map(normalizePromptAnnotationSnapshot)
-        .filter((item): item is PromptAnnotationSnapshot => item !== null)
-        .sort((left, right) => left.sentOrder - right.sentOrder),
+      promptAnnotations: msg.pageContext
+        ? pageAnnotationSnapshots(msg.pageContext)
+        : msg.promptAnnotations
+            .map(normalizePromptAnnotationSnapshot)
+            .filter((item): item is PromptAnnotationSnapshot => item !== null)
+            .sort((left, right) => (left.sentOrder || 0) - (right.sentOrder || 0)),
       provenanceKind: msg.provenance.kind || '',
       provenanceSourceSessionKey: msg.provenance.sourceSessionKey || '',
       provenanceSourceTool: msg.provenance.sourceTool || '',
@@ -1575,6 +1576,15 @@ export function useChatHistory(options: UseChatHistoryOptions) {
     }
   }
 
+  async function reconcileHistory(): Promise<SessionPhaseResult | void> {
+    const key = options.sessionKey.value
+    // A read admitted before the snapshot cannot prove a terminal transition
+    // after its watermark. Join it, then admit one fresh current-window read.
+    await activeHistory?.promise.catch(() => {})
+    if (options.sessionKey.value !== key) return { ok: false, cancelled: true }
+    return loadHistory({ nonReconnecting: true })
+  }
+
   function cleanup() {
     cancelActiveHistory()
     historySyncPending = false
@@ -1586,6 +1596,7 @@ export function useChatHistory(options: UseChatHistoryOptions) {
     historySessionKey,
     historyState,
     loadHistory,
+    reconcileHistory,
     loadEarlierHistory,
     retryHistory,
     markSessionMissing,

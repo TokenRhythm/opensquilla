@@ -1,5 +1,9 @@
 ---
 name: paper-latex-sanitizer
+visibility: internal
+invocation: meta_only
+owner_meta_skills:
+  - meta-paper-write
 description: "Deterministically normalize safe LaTeX punctuation and replace unsupported forecast magnitudes with explicit placeholders before meta-paper-write publication gates run."
 user-invocable: false
 disable-model-invocation: true

@@ -2134,7 +2134,7 @@ def test_invalid_native_arguments_fail_closed_in_stream_and_non_stream(
         finish_reason="tool_calls",
         compat=_plain_profile(),
         native_arguments=raw_arguments,
-        native_tool_name="document_apply",
+        native_tool_name="write_file",
     )
 
     assert any(isinstance(event, ToolUseStartEvent) for event in stream_events)
@@ -2142,7 +2142,7 @@ def test_invalid_native_arguments_fail_closed_in_stream_and_non_stream(
         event for event in non_stream_events if isinstance(event, ToolUseStartEvent)
     ]
     assert len(non_stream_starts) == 1
-    assert non_stream_starts[0].tool_name == "document_apply"
+    assert non_stream_starts[0].tool_name == "write_file"
     for events in (stream_events, non_stream_events):
         assert _tool_ends(events) == []
         assert not any(isinstance(event, DoneEvent) for event in events)

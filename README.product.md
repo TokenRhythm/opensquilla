@@ -14,7 +14,7 @@ This guide is the product and usage entry point. The existing
 1. Install OpenSquilla:
 
    ```sh
-   uv tool install --python 3.12 "opensquilla[recommended] @ https://github.com/opensquilla/opensquilla/releases/download/v0.5.4/opensquilla-0.5.4-py3-none-any.whl"
+   uv tool install --python 3.12 "opensquilla[recommended] @ https://github.com/TokenRhythm/opensquilla/releases/download/v0.5.4/opensquilla-0.5.4-py3-none-any.whl"
    ```
 
 2. Configure your provider:
@@ -228,4 +228,4 @@ guidance.
 
 ---
 
-[Docs index](docs/README.md) · [Improve these docs](docs/contributing-docs.md) · [Report a docs issue](https://github.com/opensquilla/opensquilla/issues/new?template=docs_report.yml) · [Contributing](CONTRIBUTING.md)
+[Docs index](docs/README.md) · [Improve these docs](docs/contributing-docs.md) · [Report a docs issue](https://github.com/TokenRhythm/opensquilla/issues/new?template=docs_report.yml) · [Contributing](CONTRIBUTING.md)

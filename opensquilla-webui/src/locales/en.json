@@ -67,6 +67,13 @@
     "viewRelease": "View release",
     "dismiss": "Dismiss",
     "desktop": {
+      "installErrorTitle": "Could not start installation",
+      "quitAndInstall": "Quit and install",
+      "signedDownloadedDesc": "OpenSquilla {version} is verified and ready. Quit and install to close background services and open the installer.",
+      "manualApplyingStatus": "Closing background services",
+      "manualApplyingDesc": "OpenSquilla is closing its background services. The installer will open when they have stopped.",
+      "errorSignatureInvalid": "The installer signature is invalid or its publisher does not match OpenSquilla. Installation was blocked. Download the update again.",
+      "errorSignatureUnavailable": "OpenSquilla could not verify the installer signature. Installation was blocked. Try again later.",
       "indicatorAvailable": "Update {version}",
       "indicatorDownloaded": "Update ready",
       "indicatorInstallerReady": "Installer verified",
@@ -77,7 +84,7 @@
       "availableDesc": "Download it when you're ready. OpenSquilla will install it only after you relaunch.",
       "manualAvailableDesc": "Download the versioned Windows installer. Windows will ask you to complete the installation.",
       "manualDownloadedTitle": "Verified installer ready",
-      "manualDownloadedDesc": "OpenSquilla {version} was verified against the canonical GitHub checksum and shown in its folder. Run the installer when ready.",
+      "manualDownloadedDesc": "The OpenSquilla {version} installer has been verified. Choose Show installer to find the file, then run it manually when ready.",
       "downloadedTitle": "Ready to install",
       "downloadedDesc": "Relaunch OpenSquilla to finish updating to {version}.",
       "downloadingTitle": "Downloading update",
@@ -88,8 +95,8 @@
       "errorFallback": "Try checking again from Settings.",
       "errorSourceUnreachable": "The update sources are temporarily unreachable. Try again later.",
       "errorManifestInvalid": "The release-channel data is invalid, so OpenSquilla cannot safely confirm an update.",
-      "errorChecksumUnavailable": "The installer cannot be verified because the canonical GitHub checksum is unavailable. No installer was opened.",
-      "errorIntegrityFailed": "The downloaded installer failed integrity verification and was deleted.",
+      "errorChecksumUnavailable": "The installer cannot be verified because the official update checksum is unavailable. No installer was opened.",
+      "errorIntegrityFailed": "The installer failed integrity verification. Download the update again.",
       "errorDownloadFailed": "OpenSquilla could not download the update. Check your connection and try again.",
       "errorInstallFailed": "OpenSquilla could not prepare or open the installer. Try again or use the release page.",
       "idleDesc": "Check for a new desktop release.",
@@ -166,11 +173,33 @@
       "failedDetail": "Reload the isolated browser to continue."
     },
     "artifactAnnotation": {
-      "start": "Annotate preview", "stop": "Stop annotating", "selectElement": "Select a page element to annotate", "selectElementShort": "Select element", "unavailable": "Preview annotation is unavailable.", "desktopEditingOnly": "Select and edit page elements with AI in the desktop app.",
-      "createFailed": "The selected element could not be attached.", "elementChanged": "The selected element changed before it could be attached. Select it again in the current preview.", "rearmFailed": "Annotation mode stopped because the element picker could not be restarted. Turn annotation mode on to try again.", "updateFailed": "The annotation draft could not be saved.", "discardFailed": "The annotation could not be discarded. It remains open so you can try again.", "closeFailed": "The annotation editor could not be closed. Try again before selecting another element.", "replacementCleanupFailed": "The new annotation was kept, but the previous draft could not be removed.",
+      "start": "Annotate preview",
+      "stop": "Stop annotating",
+      "selectElement": "Select a page element to annotate",
+      "selectElementShort": "Select element",
+      "unavailable": "Preview annotation is unavailable.",
+      "desktopEditingOnly": "Select and edit page elements with AI in the desktop app.",
+      "createFailed": "The selected element could not be attached.",
+      "elementChanged": "The selected element changed before it could be attached. Select it again in the current preview.",
+      "rearmFailed": "Annotation mode stopped because the element picker could not be restarted. Turn annotation mode on to try again.",
+      "updateFailed": "The annotation draft could not be saved.",
+      "discardFailed": "The annotation could not be discarded. It remains open so you can try again.",
+      "closeFailed": "The annotation editor could not be closed. Try again before selecting another element.",
+      "replacementCleanupFailed": "The new annotation was kept, but the previous draft could not be removed.",
       "overlayFallback": "Continue the annotation below.",
-      "fallbackTitle": "Continue annotation", "fallbackDetail": "The preview is temporarily hidden. Your annotation is still here.", "frozenPreview": "Preview of the selected page area",
-      "placeholder": "Describe the change for this area…", "newlineHint": "{shortcut} for a new line", "keepDraft": "Keep annotation", "submit": "Add annotation", "contextLabel": "Current selection", "bodyLabel": "Page annotation", "emptyBody": "Describe the requested change.", "reselectHint": "Select the matching area on the page.", "reuseHint": "The modification request was copied. Select the matching area on the page."
+      "fallbackTitle": "Continue annotation",
+      "fallbackDetail": "The preview is temporarily hidden. Your annotation is still here.",
+      "frozenPreview": "Preview of the selected page area",
+      "placeholder": "Describe the change for this area…",
+      "newlineHint": "{shortcut} for a new line",
+      "keepDraft": "Keep annotation",
+      "submit": "Add annotation",
+      "contextLabel": "Current selection",
+      "bodyLabel": "Page annotation",
+      "emptyBody": "Describe the requested change.",
+      "reselectHint": "Select the matching area on the page.",
+      "reuseHint": "The modification request was copied. Select the matching area on the page.",
+      "screenshotUploadFailed": "The page capture could not be attached. Your annotation is still available; you can add an image manually."
     },
     "artifactPreview": {
       "refresh": "Refresh preview",
@@ -180,7 +209,6 @@
       "readyWithWarnings": "The preview is running with warnings.",
       "warningsShort": "Warnings",
       "suspended": "Preview paused",
-      "agentEditInProgress": "Editing is continuing in the background.",
       "nativePreview": "Interactive preview",
       "allowRemoteResources": "Allow online images, styles, and media",
       "blockRemoteResources": "Block online images, styles, and media",
@@ -199,7 +227,6 @@
       "setDefaultMode": "Use this mode by default",
       "restoreDefaultMode": "Restore the default preview mode",
       "defaultModeSaved": "Default preview mode saved.",
-      "fullModeNotice": "Interactive preview can load online content, but it does not share OpenSquilla identity, local files, or your system browser login.",
       "offlineWebLimits": "Some external content and advanced web features may be unavailable in restricted preview.",
       "compatibilityFallback": "This Desktop version supports only the legacy single-file preview.",
       "upgradeDesktopShort": "Update Desktop",
@@ -222,7 +249,6 @@
     },
     "artifactErrors": {
       "documentChanged": "The page changed. Refresh it before trying again.",
-      "editSessionRenewalRequired": "Editing is reconnecting. Your unsaved changes are still available.",
       "writeBusy": "The page is being updated. Wait a moment and try again.",
       "mutationNotApplied": "The page was not updated. You can try again.",
       "mutationOutcomePending": "The update result cannot be confirmed. Open the page to check.",
@@ -234,7 +260,8 @@
       "annotationUnavailable": "This annotation is temporarily unavailable.",
       "annotationBusy": "Annotations are being updated. Wait a moment and try again.",
       "invalidRequest": "The request could not be completed. Check the input and try again.",
-      "internalError": "The operation could not be completed. Try again."
+      "internalError": "The operation could not be completed. Try again.",
+      "documentEditingRetired": "Update the client and reopen the page to send annotations as chat input."
     },
     "artifactDocument": {
       "sections": "Artifact document sections",
@@ -283,22 +310,7 @@
       "revertFailed": "This change could not be reverted. The document may have changed; review the latest version and retry.",
       "commentCreateFailed": "The comment could not be added. Review the latest document state and retry.",
       "commentResolveFailed": "The comment could not be resolved. Review the latest comment state and retry.",
-      "noElementSelected": "Place the cursor inside an HTML element",
-      "saving": "Saving…",
-      "saveSource": "Save",
-      "sourceUnavailable": "HTML source is unavailable.",
-      "sourceConflict": "The document changed elsewhere. Review or reload before saving.",
-      "copyUnsavedSource": "Copy unsaved source",
-      "unsavedSourceCopied": "Unsaved source copied",
-      "copyUnsavedSourceFailed": "The unsaved source could not be copied.",
-      "discardAndLoadLatest": "Discard and load latest",
-      "sourceStatus": {
-        "ready": "Ready",
-        "saving": "Saving…",
-        "dirty": "Unsaved",
-        "saved": "Saved",
-        "error": "Needs attention"
-      }
+      "sourceUnavailable": "HTML source is unavailable."
     }
   },
   "nav": {
@@ -1127,7 +1139,9 @@
       "modelNoMatches": "No matching models — you can keep what you typed.",
       "modelListTruncated": "Showing {shown} of {total} models — keep typing to narrow the list.",
       "modelProvenance": "Live provider list · capability source: {sources}",
-      "modelMetadataProvenance": "Live provider list · official values when available, catalog fallback otherwise"
+      "modelMetadataProvenance": "Live provider list · official values when available, catalog fallback otherwise",
+      "modelMultimodal": "Multimodal",
+      "modelMultimodalTitle": "Supports image input"
     },
     "preset": {
       "modeCustom": "custom tiers"
@@ -1197,6 +1211,7 @@
       "removeCandidateAria": "Remove {model}",
       "ensembleEmpty": "No candidate models yet. Save your Model Service settings to seed model tiers, or add candidates manually.",
       "ensemblePipeline": "How it works: proposer models draft in parallel, then the aggregator fuses the drafts into the final reply. Only the aggregator can call tools.",
+      "candidateModelHint": "The Multimodal badge means a model accepts image input. Image turns follow the configured image-capable route.",
       "ensembleFlowDesc": "Models draft in parallel; an aggregator merges them into one answer. Uses more calls.",
       "legacyDynamicNotice": "This legacy fusion plan follows the saved model tiers. Convert it to a custom lineup to edit its members here.",
       "legacyDynamicMigrate": "Convert to custom lineup",
@@ -1280,6 +1295,7 @@
       "colModel": "Model",
       "colThinking": "Thinking",
       "colImage": "Image",
+      "imageCapabilityAutomatic": "Image capability is detected automatically from provider metadata and request results; no manual setting is needed.",
       "tierProviderAria": "{tier} request entry",
       "tierProviderManagedByEnsemble": "Determined by Multi-model fusion",
       "tierProviderManagedByEnsembleAria": "{tier} request entry is determined by the Multi-model fusion plan",
@@ -1310,7 +1326,8 @@
       "tierLegacyDynamicEnsembleSummaryGeneric": "Uses the previously saved tier-following fusion plan; if it fails, uses the Fixed and fallback model.",
       "tierLegacyDynamicEnsembleFallbackMissingSummary": "Uses the previously saved tier-following fusion plan; no usable Fixed and fallback model is configured yet.",
       "tierSingleModelAnnouncement": "C3 uses one model: {model}.",
-      "tierEnsembleImageRouting": "C3 fusion does not process images; image requests still use the Image model configuration.",
+      "tierEnsembleImageRouting": "C3 fusion receives text markers for images. Router image processing uses only configured C0–C3 models.",
+      "tierLegacyImageRouting": "Legacy compatibility setting: this model is preserved but not used for image input. Configure an image-capable model in C0–C3.",
       "tierThinkingManagedByEnsemble": "Determined by fusion plan",
       "tierThinkingManagedByEnsembleAria": "{tier} thinking is determined by the Multi-model fusion plan",
       "tierThinkingAria": "{tier} thinking level",
@@ -1726,9 +1743,6 @@
       "descReloadSuffix": "take effect after a page refresh.",
       "experimentsGroup": "Experiments",
       "managementGroup": "Management",
-      "foldLabel": "New live turn renderer",
-      "foldDesc": "Build the streaming work card from an ordered event log. Turn off only to temporarily restore the compatibility renderer.",
-      "foldAria": "New live turn renderer (takes effect after reload)",
       "revealLabel": "Answer reveal window (ms)",
       "revealDesc": "Hold the live answer's reveal in a [min, max] window so the router can decide first. min ≤ max.",
       "revealMinAria": "Answer reveal minimum milliseconds",
@@ -3075,7 +3089,9 @@
       "clearActivity": "Clear activity",
       "expandActivity": "Expand install activity",
       "collapseActivity": "Collapse install activity",
+      "selectSkillDirectory": "Select a Skill directory",
       "queueStatus": {
+        "selection_required": "Choose directory",
         "queued": "Queued",
         "installing": "Installing",
         "cancelling": "Cancelling",
@@ -3507,6 +3523,7 @@
     "liveConnecting": "Restoring live updates…",
     "liveConnectingConnected": "Gateway connected. Restoring live updates for this session…",
     "gatewayReconnecting": "Reconnecting to the Gateway…",
+    "automaticRecoveryDescription": "Recovering automatically. You can keep editing; unsent text and attachments stay here.",
     "liveUnavailable": "Live updates are temporarily unavailable",
     "liveUnavailableDescription": "History remains available. Reconnect before sending.",
     "liveUnavailableConnectedDescription": "The Gateway is connected and history remains available. Sending resumes when this session's live updates recover.",
@@ -3555,7 +3572,7 @@
     "audioUnsupported": "This browser cannot play this audio format. Download the file instead.",
     "playVideo": "Play video",
     "videoLoadFailed": "Video could not be loaded.",
-    "videoUnsupported": "This browser cannot play this video format. Download the file instead.",
+    "videoUnsupported": "This browser cannot play this video. Download it instead.",
     "previewOf": "Preview: {title}",
     "closePreview": "Close preview",
     "previousImage": "Previous image",
@@ -3564,7 +3581,6 @@
     "previewDownload": "Preview download",
     "previewTimedOut": "Preview timed out.",
     "previewFailed": "Preview failed to load.",
-    "videoUnsupported": "This browser cannot play this video. Download it instead.",
     "loadVideoPreview": "Load video preview",
     "loadVideoPreviewFor": "Load video preview for {title}",
     "videoPreviewLoading": "Loading the video preview. You can cancel while it downloads.",
@@ -3610,6 +3626,7 @@
     "provenance": {
       "cron": "Cron",
       "scheduled": "Scheduled",
+      "scheduledTrigger": "Scheduled trigger",
       "cronSource": "Scheduled by {tool}"
     },
     "sandboxSetup": {
@@ -3880,11 +3897,13 @@
       "answerPlanQuestionnaire": "Answer the plan question above",
       "previousQuestion": "Previous",
       "nextQuestion": "Next",
-      "outcomeDoneTitle": "Reply sent · run resumed",
+      "outcomeDoneTitle": "Reply received",
       "outcomeBusyDetail": "Your reply is being processed now.",
-      "outcomeDoneDetail": "The agent has accepted this reply and moved on.",
+      "outcomeDoneDetail": "The agent has received your reply.",
       "replyReceived": "Reply received · continuing run…",
       "sendingReply": "Sending reply…",
+      "expiredTitle": "Question expired",
+      "expiredDetail": "This question is no longer active. You can send a new message.",
       "sendReply": "Send reply",
       "sendingContinuing": "Sending reply · continuing run…"
     },
@@ -4051,7 +4070,8 @@
         "generic": "Steer unavailable for the current task. The message remains queued."
       },
       "clearQueue": "Clear queue",
-      "removeMessage": "Remove pending message {index}"
+      "removeMessage": "Remove pending message {index}",
+      "annotationUpgradeRequired": "This queued annotation uses the retired editor. Edit the message and select the page again before sending."
     },
     "metaRuns": {
       "draft": "Draft",

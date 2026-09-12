@@ -115,6 +115,27 @@ async def test_create_csv_publishes_channel_artifact(tmp_path: Path) -> None:
     ]
 
 
+async def test_generated_file_reuse_leaves_remaining_work_to_the_model(tmp_path: Path) -> None:
+    first_ctx = _channel_artifact_context(tmp_path)
+    next_ctx = _channel_artifact_context(tmp_path)
+    next_ctx.artifact_session_id = first_ctx.artifact_session_id
+    next_ctx.session_key = first_ctx.session_key
+    results = []
+    for ctx in (first_ctx, first_ctx, next_ctx):
+        token = current_tool_context.set(ctx)
+        try:
+            results.append(json.loads(await create_csv(rows=[["synthetic", 1]], name="same.csv")))
+        finally:
+            current_tool_context.reset(token)
+    assert [result["status"] for result in results] == [
+        "published", "already_published", "already_published",
+    ]
+    assert len({result["artifact"]["id"] for result in results}) == 1
+    for result in results[1:]:
+        assert "just confirm" not in result["note"]
+        assert "Unchanged content" in result["note"]
+
+
 @pytest.mark.asyncio
 async def test_create_xlsx_publishes_channel_artifact(tmp_path: Path) -> None:
     ctx = _channel_artifact_context(tmp_path)

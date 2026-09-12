@@ -38,12 +38,11 @@ _COMPACTED_TOOL_ARGUMENT_MARKERS = frozenset(
         "_opensquilla_compacted_tool_input",
     }
 )
-# Compaction safety defaults. The tiny guard and optional stub previews remain
-# opt-in. Fresh assistant work, two recent tool results, error or unresolved
-# results, and already-projected results are protected by default. Never-worse
+# Compaction safety defaults. Fresh assistant work, two recent tool results,
+# error or unresolved results, and already-projected results are protected by
+# default. Never-worse
 # also defaults on so request-only compaction cannot increase an envelope.
 # Every safety default retains an explicit env rollback value.
-_TINY_COMPACTION_GUARD_ENV = "OPENSQUILLA_PROVIDER_COMPACTION_TINY_GUARD_CHARS"
 _PROTECT_RECENT_ASSISTANT_ENV = "OPENSQUILLA_PROVIDER_COMPACTION_PROTECT_RECENT_ASSISTANT"
 _PROTECT_RECENT_RESULTS_ENV = "OPENSQUILLA_PROVIDER_COMPACTION_PROTECT_RECENT_RESULTS"
 _PROTECT_ERROR_RESULTS_ENV = "OPENSQUILLA_PROVIDER_COMPACTION_PROTECT_ERROR_RESULTS"
@@ -51,7 +50,6 @@ _PROTECT_UNRESOLVED_RESULTS_ENV = (
     "OPENSQUILLA_PROVIDER_COMPACTION_PROTECT_UNRESOLVED_RESULTS"
 )
 _SKIP_PROJECTED_ENV = "OPENSQUILLA_PROVIDER_COMPACTION_SKIP_PROJECTED"
-_STUB_PREVIEW_CHARS_ENV = "OPENSQUILLA_PROVIDER_COMPACTION_STUB_PREVIEW_CHARS"
 _NEVER_WORSE_ENV = "OPENSQUILLA_PROVIDER_COMPACTION_NEVER_WORSE"
 _TRUE_ENV_VALUES = frozenset({"1", "true", "yes", "on", "enabled"})
 _FALSE_ENV_VALUES = frozenset({"0", "false", "no", "off", "disabled"})
@@ -72,16 +70,6 @@ _SYNTHETIC_USER_PREFIXES = (
     "Runtime state capsule:",
     "You are the aggregator in a multi-model B5 fusion experiment.",
 )
-
-
-def _tiny_compaction_guard_chars() -> int:
-    raw = os.environ.get(_TINY_COMPACTION_GUARD_ENV, "").strip()
-    if not raw:
-        return 0
-    try:
-        return max(0, int(raw))
-    except ValueError:
-        return 0
 
 
 def _safety_default_enabled(env_name: str) -> bool:
@@ -130,16 +118,6 @@ def _protect_unresolved_results_enabled() -> bool:
 
 def _skip_projected_results_enabled() -> bool:
     return _safety_default_enabled(_SKIP_PROJECTED_ENV)
-
-
-def _stub_preview_chars() -> int:
-    raw = os.environ.get(_STUB_PREVIEW_CHARS_ENV, "").strip()
-    if not raw:
-        return 0
-    try:
-        return max(0, int(raw))
-    except ValueError:
-        return 0
 
 
 def _never_worse_enabled() -> bool:
@@ -479,8 +457,6 @@ def _compact_string(value: str) -> str:
 def _compact_tail_string(value: str, *, label: str) -> str:
     if len(value) <= _COMPACTED_TAIL_STRING_MAX_CHARS:
         return value
-    if len(value) <= _tiny_compaction_guard_chars():
-        return value
     head = value[:420]
     tail = value[-120:]
     omitted = len(value) - len(head) - len(tail)
@@ -498,8 +474,6 @@ def _compact_tail_string(value: str, *, label: str) -> str:
 
 def _emergency_compact_string(value: str, *, label: str) -> str:
     if len(value) <= 320:
-        return value
-    if len(value) <= _tiny_compaction_guard_chars():
         return value
     head = value[:180]
     tail = value[-40:]
@@ -519,8 +493,6 @@ def _emergency_compact_string(value: str, *, label: str) -> str:
 def _hard_compact_string(value: str, *, label: str) -> str:
     if len(value) <= 96:
         return value
-    if len(value) <= _tiny_compaction_guard_chars():
-        return value
     digest = hashlib.sha256(value.encode("utf-8")).hexdigest()[:16]
     compacted = f"[opensquilla_compacted:{label}:{len(value)}:{digest}]"
     if _keep_original_for_never_worse(value, compacted):
@@ -531,20 +503,13 @@ def _hard_compact_string(value: str, *, label: str) -> str:
 def _compact_argument_string(value: str, *, preview: bool = True) -> str:
     if preview:
         return _compact_tail_string(value, label="tool_input")
-    if len(value) <= _tiny_compaction_guard_chars():
+    if not value:
         return value
     digest = hashlib.sha256(value.encode("utf-8")).hexdigest()
     compacted = (
         "[provider_request_tool_input_compacted: "
         f"original_chars={len(value)}; sha256={digest}]"
     )
-    preview_chars = _stub_preview_chars()
-    if preview_chars and len(value) > preview_chars * 2:
-        with_previews = f"{value[:preview_chars]}\n\n{compacted}\n\n{value[-preview_chars:]}"
-        # Previews may never turn compaction into growth: attach them only
-        # while the preview-carrying stub stays smaller than the original.
-        if _payload_chars(with_previews) < _payload_chars(value):
-            compacted = with_previews
     if _keep_original_for_never_worse(value, compacted):
         return value
     return compacted
@@ -583,7 +548,7 @@ def _compact_tool_arguments(value: str, *, preview: bool = True) -> str:
                 if _keep_original_for_never_worse(value, compacted_json):
                     return value
                 return compacted_json
-    if len(value) <= _tiny_compaction_guard_chars():
+    if not value:
         return value
     digest = hashlib.sha256(value.encode("utf-8")).hexdigest()
     stub: dict[str, Any] = {
@@ -592,14 +557,6 @@ def _compact_tool_arguments(value: str, *, preview: bool = True) -> str:
         "sha256": digest,
     }
     stub_json = json.dumps(stub, ensure_ascii=False, separators=(",", ":"))
-    preview_chars = _stub_preview_chars()
-    if preview_chars and len(value) > preview_chars * 2:
-        stub["preview_head"] = value[:preview_chars]
-        stub["preview_tail"] = value[-preview_chars:]
-        with_previews_json = json.dumps(stub, ensure_ascii=False, separators=(",", ":"))
-        # Previews may never turn compaction into growth.
-        if _payload_chars(with_previews_json) < _payload_chars(value):
-            stub_json = with_previews_json
     if _keep_original_for_never_worse(value, stub_json):
         return value
     return stub_json
@@ -672,8 +629,6 @@ def _compact_tool_input(value: Any) -> Any:
         return _invalid_provider_context_arguments(value)
     if len(raw) <= _COMPACTED_TAIL_STRING_MAX_CHARS:
         return value
-    if len(raw) <= _tiny_compaction_guard_chars():
-        return value
     compacted = dict(value)
     changed = False
     for key, item in value.items():
@@ -692,17 +647,6 @@ def _compact_tool_input(value: Any) -> Any:
         "head": raw[:_COMPACTED_ARGUMENT_PREVIEW_CHARS],
         "tail": raw[-_COMPACTED_ARGUMENT_TAIL_CHARS:],
     }
-    preview_chars = _stub_preview_chars()
-    if preview_chars > _COMPACTED_ARGUMENT_TAIL_CHARS:
-        # The stub's head/tail fields already carry fixed-size previews;
-        # separate preview keys would duplicate those bytes, so the lever
-        # extends the fields in place — and only while the stub stays
-        # smaller than the original.
-        extended = dict(stub)
-        extended["head"] = raw[: max(preview_chars, _COMPACTED_ARGUMENT_PREVIEW_CHARS)]
-        extended["tail"] = raw[-preview_chars:]
-        if _payload_chars(extended) < _payload_chars(value):
-            stub = extended
     if _keep_original_for_never_worse(value, stub):
         return value
     return stub
@@ -876,6 +820,16 @@ def _hard_compact_content_for_provider(content: Any, *, label: str) -> Any:
             compacted.append(block)
             continue
         next_block = dict(block)
+        block_type = next_block.get("type")
+        if isinstance(block_type, str) and (
+            block_type in {"thinking", "redacted_thinking"}
+            or block_type.startswith("reasoning.")
+        ):
+            # Native continuation blocks can carry signatures or encrypted
+            # state. They remain byte-for-byte intact and count in admission;
+            # an oversized history must be compacted at a context boundary.
+            compacted.append(next_block)
+            continue
         if isinstance(next_block.get("text"), str):
             next_block["text"] = _hard_compact_string(
                 next_block["text"],
@@ -885,11 +839,6 @@ def _hard_compact_content_for_provider(content: Any, *, label: str) -> Any:
             next_block["content"] = _hard_compact_string(
                 next_block["content"],
                 label=f"{label}_content",
-            )
-        if isinstance(next_block.get("thinking"), str):
-            next_block["thinking"] = _hard_compact_string(
-                next_block["thinking"],
-                label=f"{label}_thinking",
             )
         compacted.append(next_block)
     return compacted
@@ -1045,20 +994,6 @@ def _critical_tool_content_for_provider(content: Any) -> Any:
 def _compact_tool_arguments_for_final_cap(arguments: str) -> str:
     stub: dict[str, Any] = {_INVALID_PROVIDER_CONTEXT_ARGUMENTS_KEY: True}
     stub_json = json.dumps(stub, ensure_ascii=False, separators=(",", ":"))
-    preview_chars = _stub_preview_chars()
-    if preview_chars and len(arguments) > preview_chars * 2:
-        # Never preview argument text the projection scrubber would redact.
-        sanitized = _provider_context_arguments_json(
-            arguments,
-            include_compacted_markers=True,
-        )
-        if sanitized is None:
-            stub["preview_head"] = arguments[:preview_chars]
-            stub["preview_tail"] = arguments[-preview_chars:]
-            with_previews_json = json.dumps(stub, ensure_ascii=False, separators=(",", ":"))
-            # Previews may never turn compaction into growth.
-            if _payload_chars(with_previews_json) < _payload_chars(arguments):
-                stub_json = with_previews_json
     if _keep_original_for_never_worse(arguments, stub_json):
         return arguments
     return stub_json
@@ -1257,12 +1192,8 @@ def _compact_recent_tail_payload_once(
         if index == protected_index:
             continue
         if message.get("role") == "assistant":
-            reasoning_content = message.get("reasoning_content")
-            if isinstance(reasoning_content, str):
-                message["reasoning_content"] = _compact_tail_string(
-                    reasoning_content,
-                    label="reasoning_content",
-                )
+            # reasoning_content and reasoning_details are protocol replay
+            # state, not text that may be replaced with a request-view stub.
             tool_calls = message.get("tool_calls")
             if isinstance(tool_calls, list):
                 for tool_call in tool_calls:
@@ -1290,11 +1221,6 @@ def _compact_recent_tail_payload_once(
                 continue
             if block.get("type") == "tool_use":
                 block["input"] = _compact_tool_input(block.get("input"))
-            elif block.get("type") == "thinking" and isinstance(block.get("thinking"), str):
-                block["thinking"] = _compact_tail_string(
-                    block["thinking"],
-                    label="thinking_block",
-                )
             elif message.get("role") == "assistant" and block.get("type") == "text":
                 _compact_text_block(block)
     compacted = _compact_tool_payload_once(
@@ -1375,12 +1301,6 @@ def _emergency_compact_current_turn_payload_once(
                 label=f"{role}_content",
             )
         if role == "assistant":
-            reasoning_content = message.get("reasoning_content")
-            if isinstance(reasoning_content, str):
-                message["reasoning_content"] = _emergency_compact_string(
-                    reasoning_content,
-                    label="reasoning_content",
-                )
             tool_calls = message.get("tool_calls")
             if isinstance(tool_calls, list):
                 for tool_call in tool_calls:
@@ -1421,11 +1341,6 @@ def _emergency_compact_current_turn_payload_once(
                                 item["text"],
                                 label="tool_result_text",
                             )
-            elif block.get("type") == "thinking" and isinstance(block.get("thinking"), str):
-                block["thinking"] = _emergency_compact_string(
-                    block["thinking"],
-                    label="thinking_block",
-                )
             elif role == "assistant" and block.get("type") == "text":
                 _compact_text_block(block, emergency=True)
     return compacted
@@ -1493,12 +1408,6 @@ def _final_hard_cap_payload_once(
             content,
             label="assistant_content",
         )
-        reasoning_content = message.get("reasoning_content")
-        if isinstance(reasoning_content, str):
-            message["reasoning_content"] = _hard_compact_string(
-                reasoning_content,
-                label="reasoning_content",
-            )
         tool_calls = message.get("tool_calls")
         if not isinstance(tool_calls, list):
             continue
@@ -1662,7 +1571,6 @@ def project_provider_payload(
         "fits": fits,
         "compact_needed": not fits,
         "compaction_tier": 0,
-        "compaction_tiny_guard_chars": _tiny_compaction_guard_chars(),
         "compaction_protect_recent_assistant": _protect_recent_assistant_enabled(),
         "recent_tail_too_large": False,
         "compaction_not_smaller": False,
@@ -1709,9 +1617,6 @@ def project_provider_payload(
         proof["protected_tool_result_count"] = len(logical_protected_indexes)
     if _skip_projected_results_enabled():
         proof["compaction_skip_projected"] = True
-    stub_preview_chars = _stub_preview_chars()
-    if stub_preview_chars:
-        proof["compaction_stub_preview_chars"] = stub_preview_chars
     if _never_worse_enabled():
         proof["compaction_never_worse"] = True
     active_user_index, active_user_anchor_source = _active_user_anchor(

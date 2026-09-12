@@ -120,6 +120,7 @@ function leaseFixture(options: {
       after: async () => EMPTY_HISTORY,
     },
     retryMetadata,
+    reconcile: async () => options.live ?? live(),
     close,
   }
   return { lease, retryMetadata, close }
@@ -245,6 +246,20 @@ function harness(
 }
 
 describe('useChatSessionSubscription domain lease', () => {
+  it('does not declare installation when history reconciliation returns an explicit failed result', async () => {
+    const confirmInstalled = vi.fn(async () => {})
+    const fixture = leaseFixture({ live: live({ confirmInstalled }) })
+    const subject = harness(fixture.lease, {
+      loadHistory: async () => ({ ok: false, error: new Error('history unavailable') }),
+    })
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    try {
+      await expect(subject.api.reconcileSession()).resolves.toMatchObject({ authoritative: false })
+      expect(confirmInstalled).not.toHaveBeenCalled()
+      expect(fixture.close).not.toHaveBeenCalled()
+    } finally { warn.mockRestore() }
+  })
+
   it('fences only this consumer and leaves the shared lease open', async () => {
     const pendingLive = deferred<SessionReadLive>()
     const fixture = leaseFixture({ live: pendingLive.promise })
@@ -318,6 +333,7 @@ describe('useChatSessionSubscription domain lease', () => {
       open: request => ({
         criticalRequestsQueued: Promise.resolve(),
         live: missingLive.promise,
+        reconcile: () => missingLive.promise,
         metadata: Promise.resolve(metadata({ sessionKey: request.sessionKey })),
         readHistory: async () => EMPTY_HISTORY,
         retryMetadata: async () => metadata({ sessionKey: request.sessionKey }),

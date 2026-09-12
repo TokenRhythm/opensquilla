@@ -128,7 +128,6 @@ _WEBUI_ARCHITECTURE_TEST_TARGETS: Final = frozenset(
 )
 _WEBUI_BOUNDARY_PREFIXES: Final = (
     "opensquilla-webui/scripts/lib/",
-    "opensquilla-webui/scripts/rpc-debt/",
     "opensquilla-webui/src/adapters/gateway/",
     "opensquilla-webui/src/contracts/",
     "opensquilla-webui/src/modules/",
@@ -151,7 +150,13 @@ _SKILL_HUB_TESTS: Final = frozenset(
         "tests/test_skills_manifest.py",
         "tests/test_skills_bundled_baseline.py",
         "tests/test_skills_hot_reload.py",
-        "tests/test_skills_default_prompt_contract.py",
+        "tests/test_skill_catalog_projection.py",
+        "tests/test_gateway/test_meta_catalog_compatibility.py",
+        "tests/test_gateway/test_rpc_commands.py",
+        "tests/test_migration/test_legacy_config_fixtures.py",
+        "tests/test_skills/test_catalog_upgrade_retirement.py",
+        "tests/test_skills/test_sop_compiler.py",
+        "tests/unit/cli/tui/test_opentui_completion_catalog.py",
         "tests/test_skills_loader_namespaces.py",
         "tests/test_skills_tree.py",
         "tests/test_skills_hub_archive.py",
@@ -229,6 +234,13 @@ _SKILL_HUB_TEST_PREFIXES: Final = (
     "tests/test_skills_hub_",
     "tests/test_skills_loader_",
 )
+_WINDOWS_NATIVE_WRITE_VIEW_INPUTS: Final = frozenset(
+    {
+        ".github/scripts/verify-windows-native-write-view.mjs",
+        ".github/scripts/native-audit-write-view.py",
+        "tests/test_ci/test_windows_signed_update_audit.py",
+    }
+)
 _NONCRITICAL_CI_SCRIPT_TARGETS: Final[dict[str, tuple[str, ...]]] = {
     ".github/scripts/build_windows_test_durations.py": (
         "tests/test_ci/test_windows_duration_governance.py",
@@ -240,17 +252,42 @@ _NONCRITICAL_CI_SCRIPT_TARGETS: Final[dict[str, tuple[str, ...]]] = {
     ".github/scripts/prestage-release-to-oss.sh": (
         "tests/test_scripts/test_prestage_release_to_oss.py",
     ),
+    ".github/scripts/release_signing_preflight.py": (
+        "tests/test_ci/test_release_signing_preflight.py",
+    ),
+    ".github/scripts/verify-windows-signatures.ps1": (
+        "tests/test_ci/test_windows_signatures.py",
+    ),
     ".github/scripts/verify-release-macos-real-update.sh": (
+        "tests/test_ci/test_upgrade_baselines.py",
         "tests/test_release_consistency.py",
     ),
     ".github/scripts/verify-release-macos-upgrade.sh": (
+        "tests/test_ci/test_upgrade_baselines.py",
         "tests/test_release_consistency.py",
     ),
     ".github/scripts/verify-release-profile-preservation.py": (
         "tests/test_release_consistency.py",
+        "tests/test_ci/test_upgrade_baselines.py",
     ),
+    ".github/scripts/upgrade_baseline.py": ("tests/test_ci/test_upgrade_baselines.py",),
+    ".github/scripts/verify-packaged-v054-upgrade.py": ("tests/test_ci/test_upgrade_baselines.py",),
+    "scripts/build_v054_upgrade_fixture.py": ("tests/test_ci/test_upgrade_baselines.py",),
+    "tests/fixtures/upgrade-v054/sessions.sql": ("tests/test_ci/test_upgrade_baselines.py",),
+    "tests/fixtures/upgrade-v054/manifest.json": ("tests/test_ci/test_upgrade_baselines.py",),
     ".github/scripts/verify-release-windows-upgrade.ps1": (
+        "tests/test_ci/test_upgrade_baselines.py",
+        "tests/test_ci/test_windows_signed_update_audit.py",
         "tests/test_release_consistency.py",
+    ),
+    ".github/scripts/verify-release-windows-signed-update.ps1": (
+        "tests/test_ci/test_windows_signed_update_audit.py",
+    ),
+    ".github/scripts/verify-windows-native-write-view.mjs": (
+        "tests/test_ci/test_windows_signed_update_audit.py",
+    ),
+    ".github/scripts/native-audit-write-view.py": (
+        "tests/test_ci/test_windows_signed_update_audit.py",
     ),
     ".github/scripts/verify_desktop_slim_size.py": (
         "tests/test_scripts/test_verify_desktop_slim_size.py",
@@ -357,7 +394,11 @@ _FIXED_PLATFORM_MATRIX: Final[dict[str, tuple[tuple[str, str], ...]]] = {
     "workflow-lint": (("ubuntu-latest", "default"),),
     "readme-locale": (("ubuntu-latest", "default"),),
     "frontend-artifact": (("ubuntu-latest", "artifact"),),
-    "frontend-validation": (("ubuntu-latest", "validation"),),
+    "frontend-validation": (
+        ("ubuntu-latest", "validation"),
+        ("ubuntu-latest", "contract-verification"),
+        ("windows-latest", "contract-determinism"),
+    ),
     "wheel-webui-roundtrip": (("ubuntu-latest", "package"),),
     "webui-chat-recovery": (("ubuntu-latest", "chromium"),),
     "tui": (("ubuntu-latest", "default"),),
@@ -733,12 +774,31 @@ def _is_skill_hub_input(path: str) -> bool:
     )
 
 
+def _is_windows_retained_interaction_input(path: str) -> bool:
+    return path in {
+        "desktop/electron/scripts/test-packaged-retained-interaction.mjs",
+        "desktop/electron/scripts/test-packaged-retained-interaction-contract.mjs",
+    } or path.startswith("desktop/electron/scripts/fixtures/packaged-retained-interaction/")
+
+
+def _is_windows_cached_handoff_input(path: str) -> bool:
+    return path == "desktop/electron/scripts/test-packaged-cached-handoff-contract.mjs" or (
+        path.startswith("desktop/electron/scripts/fixtures/packaged-cached-handoff/")
+    )
+
+
 def _os_scope(path: str) -> set[str]:
+    # These neutral-named helpers belong to the signed Windows native audit.
+    # Their portable Node contract also runs in the Linux desktop-static lane.
+    if _is_windows_retained_interaction_input(path) or _is_windows_cached_handoff_input(path):
+        return {"windows-latest"}
     lowered = f"/{path.casefold()}"
     scopes: set[str] = set()
     if path.endswith(".ps1") or any(
         token in lowered
-        for token in ("/windows/", "_windows", "windows_", "/win32/", "-windows")
+        for token in (
+            "/windows/", "/windows-", "_windows", "windows_", "/win32/", "-windows"
+        )
     ):
         scopes.add("windows-latest")
     if any(
@@ -1323,11 +1383,16 @@ def _repository_files_for_validation(repo: Path) -> list[str]:
             if (path.is_file() or path.is_symlink())
             and ".git" not in path.relative_to(repo).parts
         )
-    return sorted(
+    paths = [
         item.decode("utf-8", errors="strict")
         for item in completed.stdout.split(b"\0")
         if item
-    )
+    ]
+    # ``git ls-files --cached`` retains paths deleted in an uncommitted
+    # worktree. They are useful to change classification but cannot be parsed
+    # as current test-module sources, so exclude only physically absent paths
+    # from repository-content validation.
+    return sorted(path for path in paths if (repo / path).exists())
 
 
 def _validate_execution_input_patterns(
@@ -1486,6 +1551,9 @@ def _add_noncritical_ci_path(
     if path.startswith(".github/workflows/"):
         suites.add("python-targeted")
         targets.add("tests/test_ci/test_workflows.py")
+        if path == ".github/workflows/wheelhouse-release.yml":
+            targets.add("tests/test_ci/test_upgrade_baselines.py")
+            targets.add("tests/test_ci/test_release_signing_preflight.py")
         reasons.add("workflow_contract_changed")
         return True
     script_targets = _NONCRITICAL_CI_SCRIPT_TARGETS.get(path)
@@ -1497,7 +1565,9 @@ def _add_noncritical_ci_path(
     if path.startswith(
         (
             ".github/scripts/prestage-release-to-oss",
+            ".github/scripts/release_signing_preflight",
             ".github/scripts/verify-release-",
+            ".github/scripts/verify-windows-signatures",
             ".github/scripts/verify_desktop_slim_size",
         )
     ):
@@ -1640,6 +1710,14 @@ def plan_changes(
             reasons.add("windows_shard_layout_changed")
             continue
 
+        if path in _WINDOWS_NATIVE_WRITE_VIEW_INPUTS:
+            # These contracts exercise only newly allocated temporary roots.
+            # Run their portable checks on Linux and native path semantics in
+            # the existing Windows ownership cell; never invoke a real profile.
+            suites.update({"frontend-artifact", "desktop-recovery-e2e", "release-packaging"})
+            desktop_cells.add(("windows-latest", "ownership"))
+            reasons.add("windows_native_write_view_contract_changed")
+
         if path.startswith("tests/test_ci/"):
             execution_target = _safe_test_execution_target(
                 path, repo=repo, ref=ref
@@ -1759,6 +1837,17 @@ def plan_changes(
             continue
 
         if path.startswith("desktop/"):
+            if (
+                _is_windows_retained_interaction_input(path)
+                or _is_windows_cached_handoff_input(path)
+            ):
+                suites.update({"python-targeted", "release-packaging"})
+                targets.add("tests/test_ci/test_windows_signed_update_audit.py")
+                reasons.add(
+                    "windows_cached_handoff_contract_changed"
+                    if _is_windows_cached_handoff_input(path)
+                    else "windows_retained_interaction_contract_changed"
+                )
             os_scope = _os_scope(path)
             _add_os_reason_codes(os_scope, reasons)
             suites.update(

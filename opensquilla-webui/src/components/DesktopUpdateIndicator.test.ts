@@ -133,6 +133,7 @@ describe('DesktopUpdateIndicator', () => {
     const api = desktopUpdateApi({
       status: 'available',
       canNativeInstall: false,
+      canInstall: false,
       installMode: 'manual',
       source: 'oss',
     }, {
@@ -151,12 +152,15 @@ describe('DesktopUpdateIndicator', () => {
     app.unmount()
   })
 
-  it('reveals a verified Windows installer without offering native relaunch', async () => {
+  it.each([
+    ['oss', false], ['github', false], ['oss', undefined], ['github', undefined],
+  ] as const)('keeps manual reveal primary for %s with canInstall=%s', async (source, canInstall) => {
     const api = desktopUpdateApi({
       status: 'downloaded',
       canNativeInstall: false,
+      ...(canInstall === undefined ? {} : { canInstall }),
       installMode: 'manual',
-      source: 'oss',
+      source,
     }, {
       isAutoUpdateEnabled: async () => false,
     })
@@ -165,11 +169,101 @@ describe('DesktopUpdateIndicator', () => {
     ;(el.querySelector('[data-testid="desktop-update-indicator"]') as HTMLButtonElement).click()
     await settle()
     expect(document.body.textContent).toContain('Verified installer ready')
+    const description = document.querySelector('.desktop-update__desc') as HTMLElement
+    expect(description.textContent).toContain('installer has been verified')
+    expect(description.textContent).toContain('run it manually when ready')
+    expect(description.textContent).not.toContain('GitHub')
     expect(document.querySelector('[data-testid="desktop-update-relaunch"]')).toBeNull()
-    ;(document.querySelector('[data-testid="desktop-update-show-installer"]') as HTMLButtonElement).click()
+    const reveal = document.querySelector('[data-testid="desktop-update-show-installer"]') as HTMLButtonElement
+    expect(reveal.classList.contains('btn--primary')).toBe(true)
+    expect(reveal.disabled).toBe(false)
+    expect(api.downloadUpdate).not.toHaveBeenCalled()
+    reveal.click()
     await settle()
 
     expect(api.downloadUpdate).toHaveBeenCalledTimes(1)
+    expect(api.relaunchToUpdate).not.toHaveBeenCalled()
+    app.unmount()
+  })
+
+  it('installs only an explicitly allowed Windows update and keeps shutdown progress visible', async () => {
+    const api = desktopUpdateApi({
+      status: 'downloaded',
+      canNativeInstall: false,
+      canInstall: true,
+      installMode: 'manual',
+    }, {
+      isAutoUpdateEnabled: async () => false,
+      downloadUpdate: vi.fn(async () => ({
+        status: 'downloaded', canCheck: true, canNativeInstall: false, canInstall: true, installMode: 'manual',
+      })),
+      relaunchToUpdate: vi.fn(async () => ({
+        status: 'applying', canCheck: true, canNativeInstall: false, canInstall: false, installMode: 'manual',
+      })),
+    })
+    const { app, el } = await mountIndicator(api)
+    ;(el.querySelector('[data-testid="desktop-update-indicator"]') as HTMLButtonElement).click()
+    await settle()
+
+    const install = document.querySelector('[data-testid="desktop-update-relaunch"]') as HTMLButtonElement
+    const reveal = document.querySelector('[data-testid="desktop-update-show-installer"]') as HTMLButtonElement
+    expect(install.textContent).toContain('Quit and install')
+    expect(install.classList.contains('btn--primary')).toBe(true)
+    expect(reveal.classList.contains('btn--ghost')).toBe(true)
+    reveal.click()
+    await settle()
+    expect(api.downloadUpdate).toHaveBeenCalledTimes(1)
+    expect(api.relaunchToUpdate).not.toHaveBeenCalled()
+    expect(install.disabled).toBe(false)
+    install.click()
+    await settle()
+
+    expect(api.relaunchToUpdate).toHaveBeenCalledTimes(1)
+    expect(api.downloadUpdate).toHaveBeenCalledTimes(1)
+    expect(el.textContent).toContain('Closing background services')
+    expect(document.body.textContent).toContain('installer will open when they have stopped')
+    expect(document.querySelector('[data-testid="desktop-update-relaunch"]')).toBeNull()
+    expect(document.querySelector('[data-testid="desktop-update-show-installer"]')).toBeNull()
+    app.unmount()
+  })
+
+  it('shows a retryable signature failure even when the installer remains downloaded', async () => {
+    const api = desktopUpdateApi({
+      status: 'downloaded', canNativeInstall: false, canInstall: true, installMode: 'manual',
+      errorCode: 'signature_unavailable', error: 'raw verifier detail',
+    }, { isAutoUpdateEnabled: async () => false })
+    const { app, el } = await mountIndicator(api)
+    const trigger = el.querySelector('[data-testid="desktop-update-indicator"]') as HTMLButtonElement
+    expect(trigger.dataset.state).toBe('danger')
+    expect(trigger.textContent).toContain('Update issue')
+    trigger.click()
+    await settle()
+    expect(document.body.textContent).toContain('Could not start installation')
+    expect(document.body.textContent).toContain('could not verify the installer signature')
+    expect(document.body.textContent).not.toContain('raw verifier detail')
+    expect(document.querySelector('[data-testid="desktop-update-relaunch"]')).not.toBeNull()
+    expect(document.querySelector('[data-testid="desktop-update-show-installer"]')).not.toBeNull()
+    app.unmount()
+  })
+
+  it.each([
+    ['signature_invalid', 'signature is invalid'],
+    ['signature_unavailable', 'could not verify the installer signature'],
+    ['checksum_unavailable', 'official update checksum is unavailable. No installer was opened.'],
+  ])('localizes %s without offering installation', async (errorCode, expected) => {
+    const api = desktopUpdateApi({
+      status: 'error', canNativeInstall: false, canInstall: false, installMode: 'manual',
+      errorCode, error: 'raw signature verification command detail',
+    }, { isAutoUpdateEnabled: async () => false })
+    const { app, el } = await mountIndicator(api)
+    ;(el.querySelector('[data-testid="desktop-update-indicator"]') as HTMLButtonElement).click()
+    await settle()
+    expect(document.body.textContent).toContain(expected)
+    expect(document.body.textContent).not.toContain('raw signature verification command detail')
+    expect(document.querySelector('[data-testid="desktop-update-relaunch"]')).toBeNull()
+    expect(document.querySelector('[data-testid="desktop-update-show-installer"]')).toBeNull()
+    expect(api.relaunchToUpdate).not.toHaveBeenCalled()
+    expect(api.downloadUpdate).not.toHaveBeenCalled()
     app.unmount()
   })
 
@@ -211,8 +305,92 @@ describe('DesktopUpdateIndicator', () => {
 
     ;(el.querySelector('[data-testid="desktop-update-indicator"]') as HTMLButtonElement).click()
     await settle()
-    expect(document.body.textContent).toContain('failed integrity verification and was deleted')
+    expect(document.body.textContent).toContain('failed integrity verification. Download the update again.')
     expect(document.body.textContent).not.toContain('deadbeef')
+    app.unmount()
+  })
+
+  it('repositions an open popover across viewport breakpoints and removes its resize listener', async () => {
+    const originalWidth = window.innerWidth
+    const resize = (width: number) => {
+      Object.defineProperty(window, 'innerWidth', { configurable: true, value: width })
+      window.dispatchEvent(new Event('resize'))
+    }
+    resize(1440)
+    const removeListener = vi.spyOn(window, 'removeEventListener')
+    const { app, el } = await mountIndicator(desktopUpdateApi({ status: 'downloaded' }))
+    let unmounted = false
+    try {
+      const trigger = el.querySelector('[data-testid="desktop-update-indicator"]') as HTMLButtonElement
+      vi.spyOn(trigger, 'getBoundingClientRect').mockImplementation(() => ({
+        right: window.innerWidth > 768 ? 1150 : window.innerWidth - 20,
+        bottom: window.innerWidth > 768 ? 114 : 124,
+      } as DOMRect))
+      trigger.click()
+      await settle()
+      const dialog = document.querySelector('[data-chat-topbar-popover="desktop-update"]') as HTMLElement
+      expect(dialog.style.right).toBe('290px')
+      expect(dialog.style.left).toBe('')
+      resize(390)
+      await settle()
+      expect(dialog.style.left).toBe('var(--sp-3)')
+      expect(dialog.style.right).toBe('var(--sp-3)')
+      expect(dialog.style.top).toBe('132px')
+      resize(1440)
+      await settle()
+      expect(dialog.style.right).toBe('290px')
+      expect(dialog.style.left).toBe('')
+      expect(dialog.style.top).toBe('122px')
+      trigger.click()
+      await settle()
+      expect(removeListener.mock.calls.filter(([name]) => name === 'resize')).toHaveLength(1)
+      trigger.click()
+      await settle()
+      app.unmount()
+      unmounted = true
+      expect(removeListener.mock.calls.filter(([name]) => name === 'resize')).toHaveLength(2)
+    } finally {
+      if (!unmounted) app.unmount()
+      removeListener.mockRestore()
+      resize(originalWidth)
+    }
+  })
+
+  it('focuses the dialog without selecting installation and keeps Tab within its actions', async () => {
+    const api = desktopUpdateApi({ status: 'downloaded', canNativeInstall: false, canInstall: true, installMode: 'manual' })
+    const { app, el } = await mountIndicator(api)
+    ;(el.querySelector('[data-testid="desktop-update-indicator"]') as HTMLButtonElement).click()
+    await settle()
+    const dialog = document.querySelector('[data-chat-topbar-popover="desktop-update"]') as HTMLElement
+    const install = document.querySelector('[data-testid="desktop-update-relaunch"]') as HTMLButtonElement
+    const later = document.querySelector('[data-testid="desktop-update-later"]') as HTMLButtonElement
+    expect(document.activeElement).toBe(dialog)
+    expect(api.relaunchToUpdate).not.toHaveBeenCalled()
+
+    const tab = (shiftKey = false) => {
+      const event = new KeyboardEvent('keydown', { key: 'Tab', shiftKey, bubbles: true, cancelable: true })
+      document.dispatchEvent(event)
+      expect(event.defaultPrevented).toBe(true)
+    }
+    tab()
+    expect(document.activeElement).toBe(install)
+    tab(true)
+    expect(document.activeElement).toBe(later)
+    tab()
+    expect(document.activeElement).toBe(install)
+    app.unmount()
+  })
+
+  it('retains keyboard focus in progress dialogs with no enabled actions', async () => {
+    const api = desktopUpdateApi({ status: 'downloading', progress: 42 })
+    const { app, el } = await mountIndicator(api)
+    ;(el.querySelector('[data-testid="desktop-update-indicator"]') as HTMLButtonElement).click()
+    await settle()
+    const dialog = document.querySelector('[data-chat-topbar-popover="desktop-update"]') as HTMLElement
+    const tab = new KeyboardEvent('keydown', { key: 'Tab', bubbles: true, cancelable: true })
+    document.dispatchEvent(tab)
+    expect(tab.defaultPrevented).toBe(true)
+    expect(document.activeElement).toBe(dialog)
     app.unmount()
   })
 
@@ -259,6 +437,14 @@ describe('DesktopUpdateIndicator', () => {
       },
     }))
     blocker.mount(blockerRoot)
+
+    const blockedTab = new KeyboardEvent('keydown', {
+      key: 'Tab',
+      bubbles: true,
+      cancelable: true,
+    })
+    document.dispatchEvent(blockedTab)
+    expect(blockedTab.defaultPrevented).toBe(false)
 
     const blockedEscape = new KeyboardEvent('keydown', {
       key: 'Escape',

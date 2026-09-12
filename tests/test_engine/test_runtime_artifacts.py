@@ -49,6 +49,7 @@ from opensquilla.session.manager import SessionManager
 from opensquilla.session.storage import SessionStorage
 from opensquilla.tools.builtin import filesystem
 from opensquilla.tools.builtin import patch as patch_tools
+from opensquilla.tools.builtin.artifacts import publish_artifact
 from opensquilla.tools.registry import ToolRegistry, ToolSpec
 from opensquilla.tools.types import (
     CallerKind,
@@ -62,15 +63,27 @@ from opensquilla.tools.types import (
 class _ArtifactProvider:
     provider_name = "test"
 
-    def __init__(self) -> None:
+    def __init__(self, *, native_replay: bool = False) -> None:
         self.calls = 0
         self.model = "test/model"
+        self.native_replay = native_replay
 
     def chat(self, messages: list[Message], tools=None, config=None) -> AsyncIterator[Any]:
         self.calls += 1
         return self._stream(self.calls)
 
     async def _stream(self, call_number: int) -> AsyncIterator[Any]:
+        from opensquilla.provider.types import ProviderReplayState
+
+        native_state = (
+            ProviderReplayState(
+                protocol="openai_chat_completions", source="synthetic-artifact-origin",
+                model="test/model", reasoning_details=[
+                    {"type": "reasoning.encrypted", "data": f"dummy-state-{call_number}"}
+                ],
+            )
+            if self.native_replay else None
+        )
         if call_number == 1:
             yield ProviderToolUseStart(tool_use_id="tool-1", tool_name="make_file")
             yield ProviderToolUseEnd(
@@ -78,10 +91,18 @@ class _ArtifactProvider:
                 tool_name="make_file",
                 arguments={},
             )
-            yield ProviderDone(stop_reason="tool_use", input_tokens=1, output_tokens=1)
+            yield ProviderDone(
+                stop_reason="tool_use", input_tokens=1, output_tokens=1,
+                reasoning_content="tool reasoning" if self.native_replay else None,
+                provider_replay=native_state,
+            )
             return
         yield ProviderText(text="done")
-        yield ProviderDone(stop_reason="stop", input_tokens=1, output_tokens=1)
+        yield ProviderDone(
+            stop_reason="stop", input_tokens=1, output_tokens=1,
+            reasoning_content="answer reasoning" if self.native_replay else None,
+            provider_replay=native_state,
+        )
 
     async def list_models(self) -> list[ModelInfo]:
         return []
@@ -122,6 +143,10 @@ class _PostPublishToolLoopProvider:
                 arguments={"path": "report.pptx"},
             )
             yield ProviderDone(stop_reason="tool_use", input_tokens=1, output_tokens=1)
+            return
+        if call_number > 2:
+            yield ProviderText(text="The presentation passed the quality check.")
+            yield ProviderDone(stop_reason="stop", input_tokens=1, output_tokens=1)
             return
         yield ProviderToolUseStart(tool_use_id="qa-1", tool_name="qa_check")
         yield ProviderToolUseEnd(
@@ -470,6 +495,10 @@ class _FailedPublishProvider:
 
 class _RetryPublishProvider(_FailedPublishProvider):
     async def _stream(self, call_number: int) -> AsyncIterator[Any]:
+        if call_number > 2:
+            yield ProviderText(text="The regenerated presentation is ready.")
+            yield ProviderDone(stop_reason="stop", input_tokens=1, output_tokens=1)
+            return
         yield ProviderText(text="Regenerating the presentation. ")
         yield ProviderToolUseStart(
             tool_use_id=f"publish-{call_number}",
@@ -530,6 +559,31 @@ class _OmittedPublishProvider:
 
     async def list_models(self) -> list[ModelInfo]:
         return []
+
+
+class _NamedPublishProvider(_OmittedPublishProvider):
+    def __init__(self, name: str, mention_source: bool) -> None:
+        super().__init__()
+        self.name = name
+        self.mention_source = mention_source
+
+    async def _stream(self, call_number: int) -> AsyncIterator[Any]:
+        if call_number == 1:
+            async for event in super()._stream(call_number):
+                yield event
+            return
+        if call_number == 2:
+            yield ProviderToolUseStart(tool_use_id="publish-2", tool_name="publish_artifact")
+            yield ProviderToolUseEnd(
+                tool_use_id="publish-2", tool_name="publish_artifact",
+                arguments={"path": "manual-big-write.html", "name": self.name},
+            )
+            yield ProviderDone(stop_reason="tool_use", input_tokens=1, output_tokens=1)
+            return
+        yield ProviderText(
+            text="Created manual-big-write.html for you." if self.mention_source else "File ready."
+        )
+        yield ProviderDone(stop_reason="stop", input_tokens=1, output_tokens=1)
 
 
 class _OmittedInvalidPptxProvider:
@@ -1116,7 +1170,7 @@ def _goal_publish_loop_registry(
                 "properties": {"steps": {"type": "array"}},
                 "required": ["steps"],
             },
-            exposed_by_default=False,
+            default_access="deny",
         ),
         update_goal_progress,
     )
@@ -1132,7 +1186,7 @@ def _goal_publish_loop_registry(
                 },
                 "required": ["status"],
             },
-            exposed_by_default=False,
+            default_access="deny",
         ),
         update_goal,
     )
@@ -1152,14 +1206,17 @@ def _goal_publish_loop_registry(
 
 
 @pytest.mark.asyncio
-async def test_turn_runner_streams_artifact_event_and_persists_history(tmp_path) -> None:
+@pytest.mark.parametrize("native_replay", [False, True])
+async def test_turn_runner_streams_artifact_event_and_persists_history(
+    tmp_path, native_replay: bool,
+) -> None:
     storage = SessionStorage(":memory:")
     await storage.connect()
     manager = SessionManager(storage)
     session_key = "agent:main:webchat:artifact-runtime"
     session = await manager.create(session_key)
     runner = TurnRunner(
-        provider_selector=_ProviderSelector(_ArtifactProvider()),
+        provider_selector=_ProviderSelector(_ArtifactProvider(native_replay=native_replay)),
         tool_registry=_registry(),
         session_manager=manager,
         config=GatewayConfig(
@@ -1207,11 +1264,28 @@ async def test_turn_runner_streams_artifact_event_and_persists_history(tmp_path)
             def set_history(self, history) -> None:
                 self.history = history
 
+            def set_request_image_context(self, messages) -> None:
+                assert messages == []
+
         history_capture = _HistoryCapture()
         await runner._load_history(agent=history_capture, session_key=session_key)
         assert "[generated artifact omitted: runtime.txt (text/plain)]" in str(
             history_capture.history[-1].content
         )
+        from opensquilla.engine.history import decode_assistant_replay
+
+        captured = decode_assistant_replay(assistant.assistant_replay)
+        assert history_capture.history[:-1] == captured
+        assert history_capture.history[-1].role == "user"
+        if native_replay:
+            native_assistants = [message for message in captured if message.role == "assistant"]
+            assert [message.reasoning_content for message in native_assistants] == [
+                "tool reasoning", "answer reasoning",
+            ]
+            assert [message.provider_replay.reasoning_details for message in native_assistants] == [
+                [{"type": "reasoning.encrypted", "data": "dummy-state-1"}],
+                [{"type": "reasoning.encrypted", "data": "dummy-state-2"}],
+            ]
     finally:
         await storage.close()
 
@@ -1276,7 +1350,7 @@ async def test_turn_runner_cancel_after_artifact_persists_recoverable_delivery_t
 
 
 @pytest.mark.asyncio
-async def test_turn_runner_suppresses_tools_after_successful_publish_artifact(
+async def test_turn_runner_keeps_tools_available_after_successful_publish_artifact(
     tmp_path,
 ) -> None:
     storage = SessionStorage(":memory:")
@@ -1317,22 +1391,24 @@ async def test_turn_runner_suppresses_tools_after_successful_publish_artifact(
         artifact_events = [event for event in events if isinstance(event, ArtifactEvent)]
         tool_starts = [event for event in events if isinstance(event, ToolUseStartEvent)]
 
-        assert provider.calls == 1
-        assert provider.tools_seen == [True]
-        assert forbidden_calls == []
-        assert [event.tool_name for event in tool_starts] == ["publish_artifact"]
+        assert provider.calls == 3
+        assert provider.tools_seen == [True, True, True]
+        assert forbidden_calls == ["report.pptx"]
+        assert [event.tool_name for event in tool_starts] == [
+            "publish_artifact", "qa_check"
+        ]
         assert artifact_events[0].id == "art-published"
         assert artifact_events[0].session_id == session.session_id
         text_deltas = [event.text for event in events if isinstance(event, TextDeltaEvent)]
         assert "".join(text_deltas) == done.text
         assert done.text.startswith("Preparing your presentation.")
-        assert "The generated file is ready" in done.text
+        assert done.text.endswith("The presentation passed the quality check.")
 
         transcript = await manager.get_transcript(session_key)
         assistant = [entry for entry in transcript if entry.role == "assistant"][-1]
         payload = json.loads(assistant.content)
         assert payload["artifacts"][0]["id"] == "art-published"
-        assert "The generated file is ready" in payload["text"]
+        assert payload["text"].endswith("The presentation passed the quality check.")
     finally:
         await storage.close()
 
@@ -1911,7 +1987,6 @@ async def test_goal_terminal_result_is_an_immediate_tool_dispatch_boundary(
             max_provider_retries=0,
             max_turn_llm_calls=max_turn_llm_calls,
             max_turn_tool_errors=1 if terminal_accepted else 0,
-            reasoning_stream_char_cap=5,
             thinking=summary_mode in {"reasoning_stream", "thinking_error"},
         ),
         tool_definitions=[
@@ -2107,6 +2182,71 @@ async def test_turn_runner_auto_publishes_deliverable_file_when_model_omits_publ
         assert payload["text"] == "Created manual-big-write.html for you."
         assert payload["artifacts"][0]["name"] == "manual-big-write.html"
         assert payload["artifacts"][0]["source"] == "auto_publish_omitted"
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("name", "mention_source"),
+    [("Friendly report.html", True), ("manual-big-write.html", True),
+     ("Friendly report.html", False)],
+)
+async def test_custom_named_publication_is_not_duplicated_in_events_or_transcript(
+    tmp_path, name: str, mention_source: bool,
+) -> None:
+    # #1164: the real write/publish/Done chain must deliver only the explicit artifact.
+    storage = SessionStorage(":memory:")
+    await storage.connect()
+    manager = SessionManager(storage)
+    session_key = "agent:main:webchat:custom-name-delivery"
+    session = await manager.create(session_key)
+    registry = _write_file_registry()
+    registry.register(
+        ToolSpec(
+            name="publish_artifact", description="Publish a generated file",
+            parameters={
+                "type": "object", "required": ["path", "name"],
+                "properties": {"path": {"type": "string"}, "name": {"type": "string"}},
+            },
+        ),
+        publish_artifact.__wrapped__,
+    )
+    provider = _NamedPublishProvider(name, mention_source)
+    runner = TurnRunner(
+        provider_selector=_ProviderSelector(provider),
+        tool_registry=registry,
+        session_manager=manager,
+        config=GatewayConfig(
+            attachments=AttachmentsConfig(media_root=str(tmp_path / "media")),
+            squilla_router=SquillaRouterConfig(enabled=False),
+        ),
+    )
+    try:
+        events = [event async for event in runner.run(
+            "Make an HTML report", session_key,
+            tool_context=ToolContext(
+                is_owner=True, caller_kind=CallerKind.WEB,
+                workspace_dir=str(tmp_path / "workspace"), elevated="full",
+                allowed_tools={"write_file", "publish_artifact"},
+            ),
+            history_has_persisted_user=False, no_memory_capture=True,
+        )]
+        assert not any(isinstance(event, ErrorEvent) for event in events)
+        assert provider.calls == 3
+        tool_results = [event for event in events if isinstance(event, ToolResultEvent)]
+        assert [(event.tool_name, event.is_error) for event in tool_results] == [
+            ("write_file", False), ("publish_artifact", False),
+        ]
+        artifacts = [event for event in events if isinstance(event, ArtifactEvent)]
+        assert [event.name for event in artifacts] == [name]
+        transcript = await manager.get_transcript(session_key)
+        assistant = [entry for entry in transcript if entry.role == "assistant"][-1]
+        persisted = json.loads(assistant.content)["artifacts"]
+        assert [item["id"] for item in persisted] == [artifacts[0].id]
+        assert persisted[0]["source"] == "publish_artifact"
+        store = ArtifactStore(tmp_path / "media")
+        assert store.list_refs(session_id=session.session_id, limit=10).total_count == 1
     finally:
         await storage.close()
 
@@ -3059,7 +3199,7 @@ async def test_turn_runner_clears_delivery_failure_after_same_target_retry_succe
 
         done = next(event for event in events if isinstance(event, DoneEvent))
         artifacts = [event for event in events if isinstance(event, ArtifactEvent)]
-        assert provider.calls == 2
+        assert provider.calls == 3
         assert [artifact.id for artifact in artifacts] == ["art-retried"]
         assert "File delivery failed:" not in done.text
 

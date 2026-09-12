@@ -5,6 +5,7 @@ import type {
 } from '@/types/chat'
 import {
   SessionReadSessionMissingError,
+  SessionReadFailure,
   type SessionReadActivity,
   type SessionReadLease,
   type SessionReadLeaseReader,
@@ -12,14 +13,14 @@ import {
   type SessionReadRunModeLock,
   type SessionReadSnapshot,
 } from '@/modules/sessionReadLifecycle'
-import type { ConversationRuntime } from '@/modules/conversationRuntime'
-import { conversationCursorSignal } from '@/utils/chat/streamEvents'
+import type { ConversationCursorSignal, ConversationRuntime } from '@/modules/conversationRuntime'
 import type { ChatTaskOwnershipApi } from '@/composables/chat/useChatTaskOwnership'
 import { chatTaskId } from '@/composables/chat/useChatTaskOwnership'
 import {
   SESSION_PHASE_ATTEMPT_BUDGET_MS,
   isRpcAbort,
   type SessionBootstrapPhaseContext,
+  type SessionPhaseResult,
 } from '@/composables/chat/sessionBootstrapContract'
 
 export interface UseChatSessionSubscriptionOptions {
@@ -48,10 +49,14 @@ export interface UseChatSessionSubscriptionOptions {
     taskId: string
     startedAt?: number | string | null
   }) => boolean | void
-  loadHistory: () => void | Promise<unknown>
+  loadHistory: () => void | Promise<SessionPhaseResult | void>
+  reconcileHistory?: () => Promise<SessionPhaseResult | void>
   resetStreamIdleTimer: () => void
   resetStreamLiveTurnState: () => void
   onLiveSnapshot?: (snapshot: SessionReadSnapshot) => void
+  onReadStarted?: () => void
+  onSnapshotInstalled?: () => void
+  onReconciliationInstalled?: () => Promise<void>
   onAuthoritativeIdle?: () => void
   onRunModeLock?: (lock: SessionReadRunModeLock) => void
   beginSessionMetadataResolution?: (key: string) => number
@@ -156,6 +161,7 @@ export function useChatSessionSubscription(options: UseChatSessionSubscriptionOp
 
   function subscribeSession(
     bootstrap?: SessionBootstrapPhaseContext,
+    reconciliation = false,
   ): Promise<SessionSubscriptionOutcome> {
     if (!options.sessionKey.value) return Promise.resolve(UNAVAILABLE_SUBSCRIPTION)
     if (options.ownershipHydrationRequired?.() !== false) {
@@ -171,7 +177,7 @@ export function useChatSessionSubscription(options: UseChatSessionSubscriptionOp
     const relayAbort = () => controller.abort()
     if (bootstrap?.signal.aborted) controller.abort()
     else bootstrap?.signal.addEventListener('abort', relayAbort, { once: true })
-    return runSubscription(lease, key, sequence, controller.signal, bootstrap)
+    return runSubscription(lease, key, sequence, controller.signal, bootstrap, reconciliation)
       .finally(() => {
         bootstrap?.signal.removeEventListener('abort', relayAbort)
         if (activeSubscriptionController === controller) {
@@ -185,10 +191,10 @@ export function useChatSessionSubscription(options: UseChatSessionSubscriptionOp
    * The event-handler integration calls this first so a restarted Gateway's low
    * sequence numbers are accepted instead of compared with the retired stream.
    */
-  function observeStreamGeneration(source: unknown): boolean {
+  function observeStreamGeneration(signal: ConversationCursorSignal): boolean {
     const transition = conversationRuntime.observeGeneration(
       cursor(),
-      conversationCursorSignal(source),
+      signal,
     )
     if (!transition.changed) return false
     syncCursor(transition.cursor)
@@ -356,6 +362,7 @@ export function useChatSessionSubscription(options: UseChatSessionSubscriptionOp
     sequence: number,
     signal: AbortSignal,
     bootstrap?: SessionBootstrapPhaseContext,
+    reconciliation = false,
   ): Promise<SessionSubscriptionOutcome> {
     const metadataHydration = ++metadataHydrationSequence
     const metadataGeneration = options.beginSessionMetadataResolution?.(key)
@@ -364,7 +371,8 @@ export function useChatSessionSubscription(options: UseChatSessionSubscriptionOp
       if (signal.aborted || !isCurrentSubscription(lease, key, sequence, signal)) {
         return { ...UNAVAILABLE_SUBSCRIPTION, cancelled: true }
       }
-      const live = await lease.live
+      options.onReadStarted?.()
+      const live = await (reconciliation ? lease.reconcile() : lease.live)
       if (!isCurrentSubscription(lease, key, sequence, signal)) {
         return { ...UNAVAILABLE_SUBSCRIPTION, cancelled: true }
       }
@@ -383,15 +391,32 @@ export function useChatSessionSubscription(options: UseChatSessionSubscriptionOp
           syncCursor(conversationRuntime.reset(cursor()))
           options.resetStreamLiveTurnState()
         }
-        void options.loadHistory()
+        if (!reconciliation) void options.loadHistory()
+      }
+      // A live snapshot cannot recover a terminal answer whose streaming
+      // projection has already been cleared. Refresh durable history on every
+      // explicit reconciliation, retaining the displayed window while it loads.
+      if (reconciliation) {
+        const history = await (options.reconcileHistory?.() ?? options.loadHistory())
+        if (history && !history.ok) {
+          throw history.error ?? new SessionReadFailure('unavailable', 'History reconciliation is incomplete.', true)
+        }
+      }
+      if (!isCurrentSubscription(lease, key, sequence, signal)) {
+        return { ...UNAVAILABLE_SUBSCRIPTION, cancelled: true }
       }
       if (live.initialMetadata.hydrationComplete) {
-        return applyHydratedSubscriptionState(
+        const outcome = applyHydratedSubscriptionState(
           key,
           metadataGeneration,
           live.initialMetadata,
           live.activity,
         )
+        if (reconciliation) await options.onReconciliationInstalled?.()
+        if (!isCurrentSubscription(lease, key, sequence, signal)) return { ...UNAVAILABLE_SUBSCRIPTION, cancelled: true }
+        options.onSnapshotInstalled?.()
+        await live.confirmInstalled?.()
+        return outcome
       }
       if (options.ownershipHydrationRequired?.() !== false) {
         options.taskOwnership?.applySnapshot(
@@ -417,6 +442,8 @@ export function useChatSessionSubscription(options: UseChatSessionSubscriptionOp
         || options.hasActiveInterrupt.value
         || live.activity === 'foreground'
       )
+      options.onSnapshotInstalled?.()
+      await live.confirmInstalled?.()
       return {
         authoritative: true,
         live: taskOrInterruptLive || live.activity === 'background',
@@ -583,6 +610,7 @@ export function useChatSessionSubscription(options: UseChatSessionSubscriptionOp
     streamGeneration,
     observeStreamGeneration,
     subscribeSession,
+    reconcileSession: (bootstrap?: SessionBootstrapPhaseContext) => subscribeSession(bootstrap, true),
     retrySessionMetadata,
     unsubscribeSession,
     cancelActiveSubscription,

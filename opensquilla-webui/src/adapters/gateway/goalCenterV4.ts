@@ -1,4 +1,4 @@
-import type { RpcCallOptions } from '@/lib/rpc'
+import type { TransportCallOptions as RpcCallOptions } from './transportTypes'
 import { GOALS_CAPABILITIES_METHOD, type Result as GoalCapabilitiesWireResult } from '@/contracts/generated/v4/goalsCapabilities'
 import { validateResult as validateGoalCapabilitiesResult } from '@/contracts/generated/v4/goalsCapabilitiesValidators.mjs'
 import { GOALS_SET_METHOD, type Params as GoalSetParams, type Result as GoalSetWireResult } from '@/contracts/generated/v4/goalsSet'

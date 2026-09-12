@@ -67,6 +67,13 @@
     "viewRelease": "Version anzeigen",
     "dismiss": "Schließen",
     "desktop": {
+      "installErrorTitle": "Installation konnte nicht gestartet werden",
+      "quitAndInstall": "Beenden und installieren",
+      "signedDownloadedDesc": "OpenSquilla {version} wurde überprüft und ist bereit. „Beenden und installieren“ beendet die Hintergrunddienste und öffnet das Installationsprogramm.",
+      "manualApplyingStatus": "Hintergrunddienste werden beendet",
+      "manualApplyingDesc": "OpenSquilla beendet seine Hintergrunddienste. Danach wird das Installationsprogramm geöffnet.",
+      "errorSignatureInvalid": "Die Signatur des Installationsprogramms ist ungültig oder der Herausgeber stimmt nicht mit OpenSquilla überein. Die Installation wurde blockiert. Laden Sie das Update erneut herunter.",
+      "errorSignatureUnavailable": "OpenSquilla konnte die Signatur des Installationsprogramms nicht überprüfen. Die Installation wurde blockiert. Versuchen Sie es später erneut.",
       "indicatorAvailable": "Update {version}",
       "indicatorDownloaded": "Update bereit",
       "indicatorInstallerReady": "Installer geprüft",
@@ -77,7 +84,7 @@
       "availableDesc": "Lade es herunter, wenn du bereit bist. OpenSquilla installiert es erst nach dem Neustart.",
       "manualAvailableDesc": "Lade das versionsgebundene Windows-Installationsprogramm herunter. Windows führt dich durch die Installation.",
       "manualDownloadedTitle": "Geprüfter Installer bereit",
-      "manualDownloadedDesc": "OpenSquilla {version} wurde mit der offiziellen GitHub-Prüfsumme verifiziert und im Ordner angezeigt. Starte das Installationsprogramm, wenn du bereit bist.",
+      "manualDownloadedDesc": "Das Installationsprogramm für OpenSquilla {version} wurde überprüft. Wähle „Installationsprogramm anzeigen“, um die Datei zu finden, und starte sie manuell, wenn du bereit bist.",
       "downloadedTitle": "Bereit zur Installation",
       "downloadedDesc": "Starte OpenSquilla neu, um das Update auf {version} abzuschließen.",
       "downloadingTitle": "Update wird heruntergeladen",
@@ -88,8 +95,8 @@
       "errorFallback": "Versuche es in den Einstellungen erneut.",
       "errorSourceUnreachable": "Die Update-Quellen sind vorübergehend nicht erreichbar. Versuche es später erneut.",
       "errorManifestInvalid": "Die Daten des Release-Kanals sind ungültig. OpenSquilla kann das Update daher nicht sicher bestätigen.",
-      "errorChecksumUnavailable": "Das Installationsprogramm kann nicht geprüft werden, weil die offizielle GitHub-Prüfsumme nicht verfügbar ist. Es wurde nichts geöffnet.",
-      "errorIntegrityFailed": "Das heruntergeladene Installationsprogramm hat die Integritätsprüfung nicht bestanden und wurde gelöscht.",
+      "errorChecksumUnavailable": "Das Installationsprogramm kann nicht geprüft werden, weil die offizielle Update-Prüfsumme nicht verfügbar ist. Es wurde kein Installationsprogramm geöffnet.",
+      "errorIntegrityFailed": "Das Installationsprogramm hat die Integritätsprüfung nicht bestanden. Lade das Update erneut herunter.",
       "errorDownloadFailed": "OpenSquilla konnte das Update nicht herunterladen. Prüfe die Verbindung und versuche es erneut.",
       "errorInstallFailed": "OpenSquilla konnte das Installationsprogramm nicht vorbereiten oder öffnen. Versuche es erneut oder verwende die Release-Seite.",
       "idleDesc": "Nach einer neuen Desktop-Version suchen.",
@@ -166,11 +173,33 @@
       "failedDetail": "Lade den isolierten Browser neu, um fortzufahren."
     },
     "artifactAnnotation": {
-      "start": "Vorschau annotieren", "stop": "Annotieren beenden", "selectElement": "Seitenelement zum Annotieren auswählen", "selectElementShort": "Element wählen", "unavailable": "Vorschauannotation ist nicht verfügbar.", "desktopEditingOnly": "Seitenelemente können Sie in der Desktop-App auswählen und mit KI bearbeiten.",
-      "createFailed": "Das ausgewählte Element konnte nicht angehängt werden.", "elementChanged": "Das ausgewählte Element wurde vor dem Anhängen geändert. Wählen Sie es in der aktuellen Vorschau erneut aus.", "rearmFailed": "Der Annotationsmodus wurde beendet, weil die Elementauswahl nicht neu gestartet werden konnte. Aktivieren Sie ihn erneut.", "updateFailed": "Der Annotationsentwurf konnte nicht gespeichert werden.", "discardFailed": "Die Annotation konnte nicht verworfen werden und bleibt für einen erneuten Versuch geöffnet.", "closeFailed": "Der Annotationseditor konnte nicht geschlossen werden. Versuchen Sie es erneut.", "replacementCleanupFailed": "Die neue Annotation wurde beibehalten, aber der vorherige Entwurf konnte nicht entfernt werden.",
+      "start": "Vorschau annotieren",
+      "stop": "Annotieren beenden",
+      "selectElement": "Seitenelement zum Annotieren auswählen",
+      "selectElementShort": "Element wählen",
+      "unavailable": "Vorschauannotation ist nicht verfügbar.",
+      "desktopEditingOnly": "Seitenelemente können Sie in der Desktop-App auswählen und mit KI bearbeiten.",
+      "createFailed": "Das ausgewählte Element konnte nicht angehängt werden.",
+      "elementChanged": "Das ausgewählte Element wurde vor dem Anhängen geändert. Wählen Sie es in der aktuellen Vorschau erneut aus.",
+      "rearmFailed": "Der Annotationsmodus wurde beendet, weil die Elementauswahl nicht neu gestartet werden konnte. Aktivieren Sie ihn erneut.",
+      "updateFailed": "Der Annotationsentwurf konnte nicht gespeichert werden.",
+      "discardFailed": "Die Annotation konnte nicht verworfen werden und bleibt für einen erneuten Versuch geöffnet.",
+      "closeFailed": "Der Annotationseditor konnte nicht geschlossen werden. Versuchen Sie es erneut.",
+      "replacementCleanupFailed": "Die neue Annotation wurde beibehalten, aber der vorherige Entwurf konnte nicht entfernt werden.",
       "overlayFallback": "Setzen Sie die Anmerkung unten fort.",
-      "fallbackTitle": "Annotation fortsetzen", "fallbackDetail": "Die Vorschau ist vorübergehend ausgeblendet. Ihre Anmerkung bleibt erhalten.", "frozenPreview": "Vorschau des ausgewählten Seitenbereichs",
-      "placeholder": "Beschreiben Sie die Änderung für diesen Bereich…", "newlineHint": "{shortcut} für eine neue Zeile", "keepDraft": "Annotation behalten", "submit": "Annotation hinzufügen", "contextLabel": "Aktuelle Auswahl", "bodyLabel": "Seitenanmerkung", "emptyBody": "Beschreiben Sie die gewünschte Änderung.", "reselectHint": "Wählen Sie den passenden Bereich auf der Seite.", "reuseHint": "Die Änderungsanforderung wurde kopiert. Wählen Sie den passenden Bereich auf der Seite."
+      "fallbackTitle": "Annotation fortsetzen",
+      "fallbackDetail": "Die Vorschau ist vorübergehend ausgeblendet. Ihre Anmerkung bleibt erhalten.",
+      "frozenPreview": "Vorschau des ausgewählten Seitenbereichs",
+      "placeholder": "Beschreiben Sie die Änderung für diesen Bereich…",
+      "newlineHint": "{shortcut} für eine neue Zeile",
+      "keepDraft": "Annotation behalten",
+      "submit": "Annotation hinzufügen",
+      "contextLabel": "Aktuelle Auswahl",
+      "bodyLabel": "Seitenanmerkung",
+      "emptyBody": "Beschreiben Sie die gewünschte Änderung.",
+      "reselectHint": "Wählen Sie den passenden Bereich auf der Seite.",
+      "reuseHint": "Die Änderungsanforderung wurde kopiert. Wählen Sie den passenden Bereich auf der Seite.",
+      "screenshotUploadFailed": "Das Bildschirmfoto konnte nicht angehängt werden. Ihre Anmerkung bleibt erhalten; Sie können ein Bild manuell hinzufügen."
     },
     "artifactPreview": {
       "refresh": "Vorschau aktualisieren",
@@ -180,7 +209,6 @@
       "readyWithWarnings": "Die Vorschau wird mit Warnungen ausgeführt.",
       "warningsShort": "Warnungen",
       "suspended": "Vorschau pausiert",
-      "agentEditInProgress": "Die Bearbeitung wird im Hintergrund fortgesetzt.",
       "nativePreview": "Interaktive Vorschau",
       "allowRemoteResources": "Online-Bilder, -Stile und -Medien zulassen",
       "blockRemoteResources": "Online-Bilder, -Stile und -Medien blockieren",
@@ -199,7 +227,6 @@
       "setDefaultMode": "Diesen Modus als Standard verwenden",
       "restoreDefaultMode": "Standard-Vorschaumodus wiederherstellen",
       "defaultModeSaved": "Standard-Vorschaumodus gespeichert.",
-      "fullModeNotice": "Die interaktive Vorschau kann Online-Inhalte laden, teilt aber weder OpenSquilla-Identität noch lokale Dateien oder Browser-Anmeldungen.",
       "offlineWebLimits": "Einige externe Inhalte und erweiterte Webfunktionen sind in der eingeschränkten Vorschau möglicherweise nicht verfügbar.",
       "compatibilityFallback": "Diese Desktop-Version unterstützt nur die ältere Einzeldateivorschau.",
       "upgradeDesktopShort": "Desktop aktualisieren",
@@ -222,7 +249,6 @@
     },
     "artifactErrors": {
       "documentChanged": "Die Seite wurde geändert. Aktualisiere sie, bevor du es erneut versuchst.",
-      "editSessionRenewalRequired": "Die Bearbeitung wird neu verbunden. Deine ungespeicherten Änderungen bleiben erhalten.",
       "writeBusy": "Die Seite wird gerade aktualisiert. Warte einen Moment und versuche es erneut.",
       "mutationNotApplied": "Die Seite wurde nicht aktualisiert. Du kannst es erneut versuchen.",
       "mutationOutcomePending": "Das Ergebnis der Aktualisierung kann nicht bestätigt werden. Öffne die Seite, um es zu prüfen.",
@@ -234,7 +260,8 @@
       "annotationUnavailable": "Diese Anmerkung ist vorübergehend nicht verfügbar.",
       "annotationBusy": "Die Anmerkungen werden gerade aktualisiert. Warte einen Moment und versuche es erneut.",
       "invalidRequest": "Die Anfrage konnte nicht abgeschlossen werden. Prüfe die Eingabe und versuche es erneut.",
-      "internalError": "Der Vorgang konnte nicht abgeschlossen werden. Versuche es erneut."
+      "internalError": "Der Vorgang konnte nicht abgeschlossen werden. Versuche es erneut.",
+      "documentEditingRetired": "Aktualisieren Sie die App und öffnen Sie die Seite erneut, um Anmerkungen als Chatnachricht zu senden."
     },
     "artifactDocument": {
       "sections": "Bereiche des Artefaktdokuments",
@@ -283,16 +310,7 @@
       "revertFailed": "Diese Änderung konnte nicht rückgängig gemacht werden. Prüfen Sie die neueste Version und versuchen Sie es erneut.",
       "commentCreateFailed": "Der Kommentar konnte nicht hinzugefügt werden. Prüfen Sie den neuesten Dokumentstand und versuchen Sie es erneut.",
       "commentResolveFailed": "Der Kommentar konnte nicht erledigt werden. Prüfen Sie den neuesten Kommentarstand und versuchen Sie es erneut.",
-      "noElementSelected": "Setzen Sie den Cursor in ein HTML-Element",
-      "saving": "Wird gespeichert…",
-      "saveSource": "Speichern",
-      "sourceUnavailable": "Der HTML-Quelltext ist nicht verfügbar.",
-      "sourceConflict": "Das Dokument wurde an anderer Stelle geändert. Bitte vor dem Speichern prüfen oder neu laden.",
-      "copyUnsavedSource": "Nicht gespeicherten Quelltext kopieren",
-      "unsavedSourceCopied": "Nicht gespeicherten Quelltext kopiert",
-      "copyUnsavedSourceFailed": "Der nicht gespeicherte Quelltext konnte nicht kopiert werden.",
-      "discardAndLoadLatest": "Verwerfen und neuesten Stand laden",
-      "sourceStatus": {"ready":"Bereit","saving":"Wird gespeichert…","dirty":"Nicht gespeichert","saved":"Gespeichert","error":"Aktion erforderlich"}
+      "sourceUnavailable": "Der HTML-Quelltext ist nicht verfügbar."
     }
   },
   "nav": {
@@ -1039,7 +1057,9 @@
       "modelNoMatches": "Keine passenden Modelle — die Eingabe kann trotzdem verwendet werden.",
       "modelListTruncated": "{shown} von {total} Modellen — weitertippen zum Eingrenzen.",
       "modelProvenance": "Live-Anbieterliste · Funktionsquelle: {sources}",
-      "modelMetadataProvenance": "Live-Anbieterliste · offizielle Werte bevorzugt, sonst Katalogwerte"
+      "modelMetadataProvenance": "Live-Anbieterliste · offizielle Werte bevorzugt, sonst Katalogwerte",
+      "modelMultimodal": "Multimodal",
+      "modelMultimodalTitle": "Unterstützt Bildeingaben"
     },
     "preset": {
       "modeCustom": "benutzerdefiniert"
@@ -1109,6 +1129,7 @@
       "removeCandidateAria": "{model} entfernen",
       "ensembleEmpty": "Noch keine Kandidatenmodelle. Speichere zuerst die Modelldienst-Einstellungen, um Routing-Stufen zu erzeugen, oder füge Kandidaten manuell hinzu.",
       "ensemblePipeline": "So funktioniert es: Die Entwurfsmodelle schreiben parallel, dann verschmilzt der Aggregator die Entwürfe zur endgültigen Antwort. Nur der Aggregator kann Tools aufrufen.",
+      "candidateModelHint": "Das Multimodal-Label bedeutet, dass ein Modell Bildeingaben unterstützt. Bildanfragen verwenden die konfigurierte bildfähige Route.",
       "ensembleFlowDesc": "Modelle entwerfen parallel; ein Aggregator führt sie zu einer Antwort zusammen. Mehr Aufrufe.",
       "legacyDynamicNotice": "Dieser ältere Fusionsplan folgt den gespeicherten Modellstufen. Zum Bearbeiten der Mitglieder in eine eigene Aufstellung umwandeln.",
       "legacyDynamicMigrate": "In eigene Aufstellung umwandeln",
@@ -1191,6 +1212,7 @@
       "colModel": "Modell",
       "colThinking": "Denken",
       "colImage": "Bild",
+      "imageCapabilityAutomatic": "Die Bildfähigkeit wird automatisch anhand von Anbieter-Metadaten und Anfrageergebnissen erkannt; eine manuelle Einstellung ist nicht erforderlich.",
       "tierProviderAria": "{tier}-Anfrageeingang",
       "tierProviderManagedByEnsemble": "Durch Mehrmodell-Fusion bestimmt",
       "tierProviderManagedByEnsembleAria": "Der {tier}-Anfrageeingang wird durch den Plan der Mehrmodell-Fusion bestimmt",
@@ -1221,7 +1243,8 @@
       "tierLegacyDynamicEnsembleSummaryGeneric": "Verwendet den zuvor gespeicherten, den Modellstufen folgenden Fusionsplan; bei Fehlern wird das feste und Fallback-Modell verwendet.",
       "tierLegacyDynamicEnsembleFallbackMissingSummary": "Verwendet den zuvor gespeicherten, den Modellstufen folgenden Fusionsplan; ein nutzbares festes und Fallback-Modell ist noch nicht konfiguriert.",
       "tierSingleModelAnnouncement": "C3 verwendet ein einzelnes Modell: {model}.",
-      "tierEnsembleImageRouting": "Die C3-Fusion verarbeitet keine Bilder; Bildanfragen verwenden weiterhin die Bildmodell-Konfiguration.",
+      "tierEnsembleImageRouting": "Die C3-Fusion erhält Texthinweise für Bilder. Router verwendet zur Bildverarbeitung nur konfigurierte C0–C3-Modelle.",
+      "tierLegacyImageRouting": "Alte Kompatibilitätseinstellung: Dieses Modell bleibt gespeichert, wird aber nicht für Bildeingaben verwendet. Konfigurieren Sie ein bildfähiges Modell in C0–C3.",
       "tierThinkingManagedByEnsemble": "Durch Fusionsplan bestimmt",
       "tierThinkingManagedByEnsembleAria": "Die Denkstufe für {tier} wird durch den Plan der Mehrmodell-Fusion bestimmt",
       "tierThinkingAria": "{tier}-Denkstufe",
@@ -1638,9 +1661,6 @@
       "descReloadSuffix": "werden nach einer Seitenaktualisierung wirksam.",
       "experimentsGroup": "Experimente",
       "managementGroup": "Verwaltung",
-      "foldLabel": "Neue Live-Turn-Darstellung",
-      "foldDesc": "Erstellt die gestreamte Arbeitskarte aus einem geordneten Ereignisprotokoll. Nur zur vorübergehenden Rückkehr zur kompatiblen Darstellung ausschalten.",
-      "foldAria": "Neue Live-Turn-Darstellung (wird nach dem Neuladen wirksam)",
       "revealLabel": "Antwort-Anzeigefenster (ms)",
       "revealDesc": "Halten Sie die Anzeige der Live-Antwort in einem [min, max]-Fenster, damit der Router zuerst entscheiden kann. min ≤ max.",
       "revealMinAria": "Mindestmillisekunden für die Antwortanzeige",
@@ -2987,7 +3007,9 @@
       "clearActivity": "Aktivität löschen",
       "expandActivity": "Installationsaktivität erweitern",
       "collapseActivity": "Installationsaktivität einklappen",
+      "selectSkillDirectory": "Skill-Verzeichnis auswählen",
       "queueStatus": {
+        "selection_required": "Verzeichnis auswählen",
         "queued": "Wartend",
         "installing": "Wird installiert",
         "cancelling": "Wird abgebrochen",
@@ -3417,6 +3439,7 @@
     "liveConnecting": "Live-Aktualisierungen werden wiederhergestellt…",
     "liveConnectingConnected": "Gateway verbunden. Live-Aktualisierungen dieser Sitzung werden wiederhergestellt…",
     "gatewayReconnecting": "Verbindung zum Gateway wird wiederhergestellt…",
+    "automaticRecoveryDescription": "Die Verbindung wird automatisch wiederhergestellt. Sie können weiter schreiben; ungesendeter Text und Anhänge bleiben erhalten.",
     "liveUnavailable": "Live-Aktualisierungen sind vorübergehend nicht verfügbar",
     "liveUnavailableDescription": "Der Verlauf bleibt verfügbar. Stellen Sie vor dem Senden die Verbindung wieder her.",
     "liveUnavailableConnectedDescription": "Das Gateway ist verbunden und der Verlauf bleibt verfügbar. Das Senden wird nach Wiederherstellung der Live-Aktualisierungen fortgesetzt.",
@@ -3465,7 +3488,7 @@
     "audioUnsupported": "Dieser Browser kann dieses Audioformat nicht abspielen. Laden Sie die Datei stattdessen herunter.",
     "playVideo": "Video abspielen",
     "videoLoadFailed": "Video konnte nicht geladen werden.",
-    "videoUnsupported": "Dieser Browser kann dieses Videoformat nicht abspielen. Laden Sie die Datei stattdessen herunter.",
+    "videoUnsupported": "Dieser Browser kann dieses Video nicht wiedergeben. Laden Sie es stattdessen herunter.",
     "previewOf": "Vorschau: {title}",
     "closePreview": "Vorschau schließen",
     "previousImage": "Vorheriges Bild",
@@ -3474,7 +3497,6 @@
     "previewDownload": "Vorschau herunterladen",
     "previewTimedOut": "Zeitüberschreitung bei der Vorschau.",
     "previewFailed": "Vorschau konnte nicht geladen werden.",
-    "videoUnsupported": "Dieser Browser kann dieses Video nicht wiedergeben. Laden Sie es stattdessen herunter.",
     "loadVideoPreview": "Videovorschau laden",
     "loadVideoPreviewFor": "Videovorschau für {title} laden",
     "videoPreviewLoading": "Die Videovorschau wird geladen. Sie können den Download abbrechen.",
@@ -3520,6 +3542,7 @@
     "provenance": {
       "cron": "Cron",
       "scheduled": "Geplant",
+      "scheduledTrigger": "Geplante Auslösung",
       "cronSource": "Geplant von {tool}"
     },
     "sandboxSetup": {
@@ -3790,11 +3813,13 @@
       "answerPlanQuestionnaire": "Beantworten Sie die Planfrage oben",
       "previousQuestion": "Zurück",
       "nextQuestion": "Weiter",
-      "outcomeDoneTitle": "Antwort gesendet · Lauf fortgesetzt",
+      "outcomeDoneTitle": "Antwort erhalten",
       "outcomeBusyDetail": "Ihre Antwort wird gerade verarbeitet.",
-      "outcomeDoneDetail": "Der Agent hat diese Antwort angenommen und ist weitergegangen.",
+      "outcomeDoneDetail": "Der Agent hat Ihre Antwort erhalten.",
       "replyReceived": "Antwort erhalten · Ausführung wird fortgesetzt…",
       "sendingReply": "Antwort wird gesendet…",
+      "expiredTitle": "Frage abgelaufen",
+      "expiredDetail": "Diese Frage ist nicht mehr aktiv. Sie können eine neue Nachricht senden.",
       "sendReply": "Antwort senden",
       "sendingContinuing": "Antwort wird gesendet · Ausführung wird fortgesetzt…"
     },
@@ -3961,7 +3986,8 @@
         "generic": "Lenken ist für die aktuelle Aufgabe nicht verfügbar. Die Nachricht bleibt in der Warteschlange."
       },
       "clearQueue": "Warteschlange leeren",
-      "removeMessage": "Ausstehende Nachricht {index} entfernen"
+      "removeMessage": "Ausstehende Nachricht {index} entfernen",
+      "annotationUpgradeRequired": "Diese Anmerkung verwendet den alten Editor. Bearbeiten Sie die Nachricht und wählen Sie die Seite vor dem Senden erneut aus."
     },
     "metaRuns": {
       "draft": "Entwurf",

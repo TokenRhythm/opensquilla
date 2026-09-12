@@ -1,5 +1,9 @@
 ---
 name: short-drama-delivery-audit
+visibility: internal
+invocation: meta_only
+owner_meta_skills:
+  - meta-short-drama
 description: "Internal deterministic delivery gate for meta-short-drama. Verifies real-provider image/video receipts, parent-owned paid-submission dispositions, runtime fallback evidence, decodability, and content-versus-final duration with ffprobe."
 user-invocable: false
 disable-model-invocation: true

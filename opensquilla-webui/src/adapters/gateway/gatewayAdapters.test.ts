@@ -8,7 +8,7 @@ describe('Gateway Adapter composition', () => {
     const call = vi.fn(async (method: string) => (
       method === 'sessions.pending_inputs.list'
         ? { items: [] }
-        : { sessions: [] }
+        : { sessions: [], count: 0, ts: 1 }
     )) as <T = unknown>(
       method: string,
       params?: Record<string, unknown>,
@@ -56,7 +56,6 @@ describe('Gateway Adapter composition', () => {
       'migrationOperations',
       'workspaceCatalog',
       'sandboxRuntime',
-      'sessionConversation',
       'usageReporting',
       'commandCatalog',
       'routeFeedback',

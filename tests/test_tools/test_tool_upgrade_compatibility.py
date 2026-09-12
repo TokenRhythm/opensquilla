@@ -7,6 +7,15 @@ from opensquilla.tools import ToolContext, ToolRegistry, tool
 from opensquilla.tools.builtin.shell import background_process, exec_command
 
 
+def test_builtin_registration_names_resolve_to_packaged_modules() -> None:
+    from importlib.util import find_spec
+
+    from opensquilla.tools import builtin
+
+    assert "submit_tool" not in builtin.__all__
+    assert all(find_spec(f"{builtin.__name__}.{name}") is not None for name in builtin.__all__)
+
+
 def test_tool_decorator_preserves_legacy_owner_only_position() -> None:
     registry = ToolRegistry()
 
@@ -18,6 +27,43 @@ def test_tool_decorator_preserves_legacy_owner_only_position() -> None:
     assert registered is not None
     assert registered.spec.owner_only is True
     assert registered.spec.runtime_only_arguments == frozenset()
+
+
+def test_tool_decorator_preserves_legacy_exposure_position_and_keyword() -> None:
+    registry = ToolRegistry()
+
+    @tool("legacy_positional", "Legacy positional access.", {}, [], False, False, registry=registry)
+    async def legacy_positional() -> str:
+        return "ok"
+
+    @tool(
+        "legacy_keyword",
+        "Legacy keyword access.",
+        registry=registry,
+        exposed_by_default=False,
+    )
+    async def legacy_keyword() -> str:
+        return "ok"
+
+    for name in ("legacy_positional", "legacy_keyword"):
+        registered = registry.get(name)
+        assert registered is not None
+        assert registered.spec.default_access == "deny"
+        assert registered.spec.exposed_by_default is False
+
+
+def test_tool_spec_preserves_legacy_exposure_keyword() -> None:
+    from opensquilla.tools.types import ToolSpec
+
+    spec = ToolSpec(
+        name="legacy_spec",
+        description="Legacy direct ToolSpec construction.",
+        parameters={},
+        exposed_by_default=False,
+    )
+
+    assert spec.default_access == "deny"
+    assert spec.exposed_by_default is False
 
 
 def test_tool_runtime_only_arguments_is_keyword_only() -> None:
@@ -94,18 +140,18 @@ def test_tool_context_appends_new_runtime_fields_after_legacy_fields() -> None:
         "goal_run",
         "goal_context",
         "goal_service",
-        "artifact_context",
-        "artifact_session",
-        "desktop_artifact_bridge",
-        "artifact_event_emitter",
         "generated_artifact_adopter",
-        "exclusive_tools",
-        "artifact_mutation_attempt_controller",
         "turn_cleanup_callbacks",
         "tool_result_retrieval_available",
         "parent_session_key",
         "parent_task_id",
-        "artifact_candidate_loop_controller",
-        "artifact_preview_service",
         "tool_result_media",
+        "session_id",
+        "authorized_tool_names",
+        "disclosed_tool_names",
+        "tool_search_index",
+        "tool_search_namespaces",
+        "image_analysis_target",
+        "desktop_browser",
+        "artifact_source_paths",
     ]

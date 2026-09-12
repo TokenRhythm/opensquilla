@@ -66,7 +66,7 @@
   border-bottom: 1px solid var(--hairline);
   display: grid;
   gap: var(--sp-2);
-  grid-template-columns: 140px 1fr 1fr 120px 60px;
+  grid-template-columns: 140px 1fr 1fr 120px;
   padding: var(--sp-2) var(--sp-1);
 }
 
@@ -266,8 +266,8 @@
 
 /* Responsive */
 @media (max-width: 760px) {
-  /* Don't clip the tier table: shrinking the fixed columns cut MODEL / THINKING /
-     IMAGE off the right edge with no way to reach them. Keep desktop column sizes
+  /* Don't clip the tier table: shrinking the fixed columns cut MODEL / THINKING
+     off the right edge with no way to reach them. Keep desktop column sizes
      and let the table scroll horizontally instead. */
   .setup-tier-table {
     overflow-x: auto;

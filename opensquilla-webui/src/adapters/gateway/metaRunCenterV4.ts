@@ -1,4 +1,8 @@
-import type { RpcCallOptions, RpcEventHandler } from '@/lib/rpc'
+import type {
+  TransportCallOptions as RpcCallOptions,
+  TransportEventHandler as RpcEventHandler,
+} from './transportTypes'
+import { readTransportFailure } from './transportTypes'
 import type {
   MetaDraft,
   MetaDraftDiscardResult,
@@ -17,11 +21,15 @@ import type {
   MetaRunRecovery,
   MetaRunRequestOptions,
   MetaRunStepSpec,
+  MetaSetupInstallation,
+  MetaSetupPlan,
+  MetaSetupStatus,
   MetaStepRescue,
   MetaStepRescueAction,
   MetaStepStatePayload,
 } from '@/modules/metaRunCenter'
-import type { MetaSetupReadiness } from '@/types/metaSetup'
+import { MetaRunCenterError } from '@/modules/metaRunCenter'
+import type { MetaSetupJob, MetaSetupReadiness } from '@/types/metaSetup'
 import { META_RUN_METHOD } from '@/contracts/generated/v4/metaRun'
 import { validateResult as validateMetaRunResult } from '@/contracts/generated/v4/metaRunValidators.mjs'
 import { META_DRAFTS_LIST_METHOD } from '@/contracts/generated/v4/metaDraftsList'
@@ -147,6 +155,89 @@ function objectList(value: unknown): JsonObject[] {
   return Array.isArray(value) ? value.filter(isObject) : []
 }
 
+function setupFailure(value: unknown, fallback: string): MetaRunCenterError {
+  if (value instanceof MetaRunCenterError && value.code !== 'unavailable') return value
+  const message = value instanceof Error ? value.message : text(value) || fallback
+  if (/(?:not found|404|unknown (?:meta )?setup job|setup job (?:is )?unknown)/i.test(message)) {
+    return new MetaRunCenterError('not-found', message, value)
+  }
+  return value instanceof MetaRunCenterError ? value : new MetaRunCenterError('unavailable', message, value)
+}
+
+function setupResult(value: unknown, validator: (candidate: unknown) => boolean): JsonObject {
+  if (!validator(value) || !isObject(value)) {
+    throw new MetaRunCenterError('invalid', 'MetaSkill setup returned an invalid result')
+  }
+  if (value.ok === false || (typeof value.error === 'string' && !value.job && !value.readiness)) {
+    throw setupFailure(value.error, 'MetaSkill setup is unavailable')
+  }
+  return value
+}
+
+function setupReadiness(value: unknown): MetaSetupReadiness {
+  if (!isObject(value)) throw new MetaRunCenterError('invalid', 'MetaSkill readiness is unavailable')
+  const missingEnvAny = value.missing_env_any ?? value.missingEnvAny
+  // These names also belong to durable setup checkpoints; only the Adapter reads wire aliases.
+  const result: MetaSetupReadiness = {
+    ready: booleanValue(value.ready), status: optionalText(value.status),
+    missing_bins: stringList(value.missing_bins, value.missingBins),
+    missing_env: stringList(value.missing_env, value.missingEnv),
+    missing_env_any: Array.isArray(missingEnvAny)
+      ? missingEnvAny.filter(Array.isArray).map(values => stringList(values) || []) : undefined,
+    missing_skills: stringList(value.missing_skills, value.missingSkills),
+    missing_capabilities: stringList(value.missing_capabilities, value.missingCapabilities),
+    missing_provider_capabilities: stringList(value.missing_provider_capabilities, value.missingProviderCapabilities),
+    reasons: stringList(value.reasons),
+  }
+  const actions = value.setup_actions ?? value.setupActions
+  if (Array.isArray(actions)) result.setup_actions = objectList(actions).flatMap(action => {
+    const id = text(action.id)
+    return id ? [{
+      id, skill: optionalText(action.skill), install_id: optionalText(action.install_id, action.installId),
+      kind: optionalText(action.kind), label: optionalText(action.label), bins: stringList(action.bins),
+      available: booleanValue(action.available), reason: optionalText(action.reason),
+      version: optionalText(action.version),
+      download_size_bytes: action.download_size_bytes === null || action.downloadSizeBytes === null
+        ? null : numberValue(action.download_size_bytes, action.downloadSizeBytes),
+      download_size_is_minimum: booleanValue(action.download_size_is_minimum, action.downloadSizeIsMinimum),
+      source: optionalText(action.source), license: optionalText(action.license),
+      requires_admin: booleanValue(action.requires_admin, action.requiresAdmin),
+    }] : []
+  })
+  const manual = value.manual_setup_actions ?? value.manualSetupActions
+  if (Array.isArray(manual)) result.manual_setup_actions = objectList(manual).flatMap(action => {
+    const id = text(action.id), kind = text(action.kind)
+    return id && kind ? [{
+      id, kind, provider_id: optionalText(action.provider_id, action.providerId),
+      label: optionalText(action.label), capability_ids: stringList(action.capability_ids, action.capabilityIds),
+      reason_code: optionalText(action.reason_code, action.reasonCode), recommended: booleanValue(action.recommended),
+      available: booleanValue(action.available), reason: optionalText(action.reason),
+    }] : []
+  })
+  return result
+}
+
+function setupJob(value: unknown): MetaSetupJob {
+  const source = object(value)
+  const id = text(source.job_id, source.jobId), name = text(source.name)
+  const sessionKey = text(source.sessionKey, source.session_key)
+  const status = text(source.status), phase = text(source.phase)
+  if (!id || !name || !sessionKey || !status || !phase) {
+    throw new MetaRunCenterError('invalid', 'MetaSkill setup job is unavailable')
+  }
+  return {
+    job_id: id, name, sessionKey, status, phase,
+    action_ids: stringList(source.action_ids, source.actionIds) || [],
+    message: optionalText(source.message), current_action: optionalText(source.current_action, source.currentAction),
+    downloaded_bytes: numberValue(source.downloaded_bytes, source.downloadedBytes),
+    download_total_bytes: numberValue(source.download_total_bytes, source.downloadTotalBytes),
+    completed_actions: stringList(source.completed_actions, source.completedActions),
+    error: optionalText(source.error), started_at_ms: numberValue(source.started_at_ms, source.startedAtMs),
+    finished_at_ms: numberValue(source.finished_at_ms, source.finishedAtMs),
+    readiness: source.readiness == null ? source.readiness : setupReadiness(source.readiness),
+  }
+}
+
 function mapPreflightField(value: unknown): MetaPreflightFieldSpec {
   const source = object(value)
   return {
@@ -254,6 +345,53 @@ function callOptions(options?: MetaRunRequestOptions): RpcCallOptions | undefine
     : undefined
 }
 
+function mapMetaRunError(error: unknown): MetaRunCenterError {
+  if (error instanceof MetaRunCenterError) return error
+  const failure = readTransportFailure(error)
+  const code = failure.code
+  const domainCode = code === 'META_DRAFT_DISCARDED'
+    ? 'draft-discarded'
+    : code === 'METHOD_NOT_FOUND'
+      ? 'unsupported'
+      : code === 'NOT_FOUND'
+        ? 'not-found'
+        : code === 'UNAUTHORIZED' || code === 'FORBIDDEN'
+          ? 'forbidden'
+          : code?.includes('CONFLICT')
+            ? 'conflict'
+            : code?.startsWith('INVALID_')
+              ? 'invalid'
+              : 'unavailable'
+  return new MetaRunCenterError(domainCode, failure.message, error)
+}
+
+function guardedMetaRunTransport(transport: MetaRunTransport): MetaRunTransport {
+  return {
+    request: async (method, params, options) => {
+      try {
+        return await transport.request(method, params, options)
+      } catch (error) {
+        throw mapMetaRunError(error)
+      }
+    },
+    ...(transport.ready
+      ? {
+          ready: async options => {
+            try {
+              await transport.ready?.(options)
+            } catch (error) {
+              throw mapMetaRunError(error)
+            }
+          },
+        }
+      : {}),
+    ...(transport.supports ? { supports: method => transport.supports?.(method) === true } : {}),
+    ...(transport.markUnsupported
+      ? { markUnsupported: method => transport.markUnsupported?.(method) }
+      : {}),
+  }
+}
+
 function validated<T>(value: unknown, method: string, validator: (candidate: unknown) => boolean): T {
   if (!validator(value)) throw new Error(`${method} returned an invalid response`)
   return value as T
@@ -344,10 +482,11 @@ export function createV4MetaRunCenter(
   transport: MetaRunTransport,
   events: MetaEventTransport,
 ): MetaRunCenter {
+  const rpc = guardedMetaRunTransport(transport)
   return {
     async launch(input, options): Promise<MetaLaunchResult> {
-      await ready(transport, options?.signal)
-      const result = validated<JsonObject>(await transport.request(METHODS.launch, {
+      await ready(rpc, options?.signal)
+      const result = validated<JsonObject>(await rpc.request(METHODS.launch, {
         name: input.name,
         sessionKey: input.sessionKey,
         ...(input.clientRequestId ? { clientRequestId: input.clientRequestId } : {}),
@@ -368,12 +507,12 @@ export function createV4MetaRunCenter(
     },
 
     async listDrafts(query, options): Promise<MetaDraftListResult> {
-      await ready(transport, options?.signal)
-      if (transport.supports && !transport.supports(METHODS.drafts)) {
-        transport.markUnsupported?.(METHODS.drafts)
+      await ready(rpc, options?.signal)
+      if (rpc.supports && !rpc.supports(METHODS.drafts)) {
+        rpc.markUnsupported?.(METHODS.drafts)
         return { drafts: [], durable: false }
       }
-      const result = validated<JsonObject>(await transport.request(METHODS.drafts, query as JsonObject, callOptions(options)), METHODS.drafts, validateMetaDraftsListResult)
+      const result = validated<JsonObject>(await rpc.request(METHODS.drafts, query as JsonObject, callOptions(options)), METHODS.drafts, validateMetaDraftsListResult)
       const drafts = Array.isArray(result?.drafts)
         ? result.drafts.map(mapDraft).filter((item): item is MetaDraft => Boolean(item))
         : []
@@ -381,19 +520,19 @@ export function createV4MetaRunCenter(
     },
 
     async discardDraft(input, options): Promise<MetaDraftDiscardResult> {
-      await ready(transport, options?.signal)
-      const result = object(validated(await transport.request(METHODS.discard, input, callOptions(options)), METHODS.discard, validateMetaDraftsDiscardResult))
+      await ready(rpc, options?.signal)
+      const result = object(validated(await rpc.request(METHODS.discard, input, callOptions(options)), METHODS.discard, validateMetaDraftsDiscardResult))
       return { discarded: result.discarded === true, accepted: result.accepted === true }
     },
 
     async recover(sessionKey, options): Promise<MetaRunRecovery | null> {
-      await ready(transport, options?.signal)
-      return mapRecovery(validated(await transport.request(METHODS.recovery, { sessionKey }, callOptions(options)), METHODS.recovery, validateMetaRunsRecoveryResult))
+      await ready(rpc, options?.signal)
+      return mapRecovery(validated(await rpc.request(METHODS.recovery, { sessionKey }, callOptions(options)), METHODS.recovery, validateMetaRunsRecoveryResult))
     },
 
     async confirmPreflight(input: MetaPreflightInput, options): Promise<MetaPreflightConfirmation> {
-      await ready(transport, options?.signal)
-      const result = object(validated(await transport.request(METHODS.confirm, {
+      await ready(rpc, options?.signal)
+      const result = object(validated(await rpc.request(METHODS.confirm, {
         sessionKey: input.sessionKey,
         runId: input.runId,
         run_id: input.runId,
@@ -405,8 +544,8 @@ export function createV4MetaRunCenter(
     },
 
     async replay(input: MetaReplayInput, options): Promise<MetaReplay> {
-      await ready(transport, options?.signal)
-      const result = validated(await transport.request(METHODS.replay, {
+      await ready(rpc, options?.signal)
+      const result = validated(await rpc.request(METHODS.replay, {
         sessionKey: input.sessionKey,
         runId: input.runId,
         run_id: input.runId,
@@ -419,24 +558,33 @@ export function createV4MetaRunCenter(
       return mapReplay(result)
     },
 
-    async setupPlan(name: string, options?: MetaRunRequestOptions): Promise<JsonObject> {
-      await ready(transport, options?.signal)
-      return object(validated(await transport.request(METHODS.setupPlan, { name }, callOptions(options)), METHODS.setupPlan, validateMetaSetupPlanResult))
+    async setupPlan(name: string, options?: MetaRunRequestOptions): Promise<MetaSetupPlan> {
+      await ready(rpc, options?.signal)
+      const result = setupResult(await rpc.request(METHODS.setupPlan, { name }, callOptions(options)), validateMetaSetupPlanResult)
+      return { readiness: setupReadiness(result.readiness) }
     },
 
-    async setupStatus(input: { jobId: string; sessionKey: string }, options?: MetaRunRequestOptions): Promise<JsonObject> {
-      await ready(transport, options?.signal)
-      return object(validated(await transport.request(METHODS.setupStatus, input, callOptions(options)), METHODS.setupStatus, validateMetaSetupStatusResult))
+    async setupStatus(input: { jobId: string; sessionKey: string }, options?: MetaRunRequestOptions): Promise<MetaSetupStatus> {
+      await ready(rpc, options?.signal)
+      try {
+        const result = setupResult(await rpc.request(METHODS.setupStatus, input, callOptions(options)), validateMetaSetupStatusResult)
+        return { job: setupJob(result.job) }
+      } catch (error) {
+        throw setupFailure(error, 'Setup status is unavailable')
+      }
     },
 
-    async setupInstall(input: { name: string; sessionKey: string; confirmed: boolean; actionIds: readonly string[] }, options?: MetaRunRequestOptions): Promise<JsonObject> {
-      await ready(transport, options?.signal)
-      return object(validated(await transport.request(METHODS.setupInstall, {
+    async setupInstall(input: { name: string; sessionKey: string; confirmed: boolean; actionIds: readonly string[] }, options?: MetaRunRequestOptions): Promise<MetaSetupInstallation> {
+      await ready(rpc, options?.signal)
+      const result = setupResult(await rpc.request(METHODS.setupInstall, {
         name: input.name,
         sessionKey: input.sessionKey,
         confirmed: input.confirmed,
         action_ids: input.actionIds,
-      }, callOptions(options)), METHODS.setupInstall, validateMetaSetupInstallResult))
+      }, callOptions(options)), validateMetaSetupInstallResult)
+      return result.already_ready === true || result.alreadyReady === true
+        ? { alreadyReady: true, readiness: result.readiness == null ? undefined : setupReadiness(result.readiness) }
+        : { job: setupJob(result.job) }
     },
 
     subscribe(listener): { close(): void } {

@@ -420,7 +420,7 @@ async def run_tui_runtime(
                 ):
                     assert client_message_id is not None
                     try:
-                        # The optimistic prompt, sessions.steer, a safe queue
+                        # The optimistic prompt, sessions.steer.v2, a safe queue
                         # fallback, and any later sessions.send promotion must
                         # all retain the composer-allocated identity.
                         with tui_input_identity_scope(client_message_id):

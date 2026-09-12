@@ -17,7 +17,6 @@ const ARTIFACT_EXTENSION_CATEGORIES: Record<string, string> = {
   ndjson: 'data', pdf: 'document', sql: 'code', tsv: 'data', txt: 'document',
 }
 
-const VIDEO_EXTENSIONS = new Set(['m4v', 'mov', 'mp4', 'ogv', 'webm'])
 const OFFICE_EXTENSIONS = new Set([
   'doc', 'docm', 'docx', 'dot', 'dotm', 'dotx', 'odt', 'ott', 'rtf',
   'csv', 'fods', 'ods', 'ots', 'xls', 'xlsb', 'xlsm', 'xlsx', 'xlt', 'xltm', 'xltx',
@@ -43,13 +42,6 @@ export function artifactExtension(name: string): string {
 
 export function isOfficeArtifact(artifact: ArtifactPayload): boolean {
   return OFFICE_EXTENSIONS.has(artifactExtension(artifactName(artifact)))
-}
-
-export function isVideoArtifact(artifact: ArtifactPayload): boolean {
-  const mime = artifactMime(artifact)
-  if (mime.startsWith('video/')) return true
-  if (mime && mime !== 'application/octet-stream') return false
-  return VIDEO_EXTENSIONS.has(artifactExtension(artifactName(artifact)))
 }
 
 export function artifactCategory(artifact: ArtifactPayload): string {
@@ -128,10 +120,6 @@ export function artifactFileSubtitle(artifact: ArtifactPayload): string {
 export function canPreview(artifact: ArtifactPayload): boolean {
   const cat = artifactCategory(artifact)
   return cat === 'visual' || cat === 'document'
-}
-
-export function artifactActionLabel(artifact: ArtifactPayload): string {
-  return canPreview(artifact) ? 'Open' : 'Download'
 }
 
 export function artifactMeta(artifact: ArtifactPayload): string {

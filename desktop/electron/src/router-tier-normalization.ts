@@ -2,6 +2,7 @@ export interface RouterTier {
   provider: string
   model: string
   description?: string
+  /** Read compatibility only; the gateway resolves model capability. */
   supportsImage?: boolean
   imageOnly?: boolean
   thinkingLevel?: string
@@ -20,7 +21,11 @@ function canonicalTierKey(name: string): string {
 }
 
 function cloneRouterTiers(tiers: Record<string, RouterTier>): Record<string, RouterTier> {
-  return Object.fromEntries(Object.entries(tiers).map(([name, tier]) => [name, { ...tier }]))
+  return Object.fromEntries(Object.entries(tiers).map(([name, tier]) => {
+    const copy = { ...tier }
+    delete copy.supportsImage
+    return [name, copy]
+  }))
 }
 
 function normalizeBooleanSetting(raw: unknown, fallback: boolean): boolean {
@@ -58,18 +63,18 @@ export function normalizeRouterTiers(
     const hasEnsembleEnabled = Object.prototype.hasOwnProperty.call(tier, 'ensembleEnabled')
       || Object.prototype.hasOwnProperty.call(tier, 'ensemble_enabled')
     const ensembleEnabled = tier.ensembleEnabled ?? tier.ensemble_enabled
-    out[name] = {
+    const normalizedTier: RouterTier = {
       ...out[name],
       provider,
       model,
       description: String(tier.description || out[name]?.description || ''),
-      supportsImage: Boolean(tier.supportsImage ?? tier.supports_image ?? out[name]?.supportsImage),
       imageOnly: Boolean(tier.imageOnly ?? tier.image_only ?? out[name]?.imageOnly),
       thinkingLevel: String(tier.thinkingLevel ?? tier.thinking_level ?? out[name]?.thinkingLevel ?? ''),
       ...(hasEnsembleEnabled
         ? { ensembleEnabled: normalizeBooleanSetting(ensembleEnabled, false) }
         : {}),
     }
+    out[name] = normalizedTier
   }
   return out
 }

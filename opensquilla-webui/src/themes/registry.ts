@@ -27,11 +27,6 @@ export const selectableValueThemes: ThemeManifest[] = all
       (THEME_RANK[a.id] ?? 2) - (THEME_RANK[b.id] ?? 2) || a.id.localeCompare(b.id),
   )
 
-/** Registered expressive skins (Axis B). Empty until P2. */
-export const registeredSkins: ThemeManifest[] = all.filter(
-  (m) => m.kind === 'expressive',
-)
-
 export const getManifest = (id: string): ThemeManifest | undefined => THEMES[id]
 
 /** Is `id` a registered value theme? (used to validate a persisted choice) */

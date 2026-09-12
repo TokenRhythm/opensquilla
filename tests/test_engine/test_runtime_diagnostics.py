@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import json
 from typing import Any
+from unittest.mock import Mock
 
 import pytest
 
-from opensquilla.engine import Agent, AgentConfig, ToolCall, ToolResult
+from opensquilla.engine import Agent, AgentConfig, DoneEvent, ErrorEvent, ToolCall, ToolResult
 from opensquilla.engine.runtime_diagnostics import (
     RuntimeDiagnosticsObserver,
     classify_path,
@@ -471,8 +472,9 @@ async def test_agent_skips_git_diff_diagnostics_when_no_observer_needs_them(
 
     events = [event async for event in agent.run_turn("run one command")]
 
-    assert events
-    assert unavailable_git_runtime.resolution_calls
+    assert any(isinstance(event, DoneEvent) for event in events)
+    assert not any(isinstance(event, ErrorEvent) for event in events)
+    assert not unavailable_git_runtime.resolution_calls
 
 
 @pytest.mark.asyncio
@@ -493,7 +495,60 @@ async def test_plain_chat_finishes_when_git_is_unavailable(
 
     assert events
     assert provider.calls == 1
-    assert unavailable_git_runtime.resolution_calls
+    assert not unavailable_git_runtime.resolution_calls
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("existing_ledger", [False, True])
+@pytest.mark.parametrize("tool_error", [False, True])
+async def test_retired_patch_ledger_does_not_write_on_turn_completion(
+    tmp_path, existing_ledger: bool, tool_error: bool
+) -> None:
+    ledger_path = tmp_path / "legacy-ledger.json"
+    original = b'{"historical": true}\n'
+    if existing_ledger:
+        ledger_path.write_bytes(original)
+
+    async def handler(call: ToolCall) -> ToolResult:
+        return ToolResult(
+            tool_use_id=call.tool_use_id,
+            tool_name=call.tool_name,
+            content="verification failed" if tool_error else "verification passed",
+            is_error=tool_error,
+        )
+
+    provider = _ThreeToolProvider(tool_turns=1)
+    agent = Agent(
+        provider=provider,
+        config=AgentConfig(
+            max_iterations=3,
+            max_turn_tool_errors=1 if tool_error else 0,
+            flush_enabled=False,
+            workspace_dir=str(tmp_path),
+            patch_evidence_ledger_path=str(ledger_path),
+        ),
+        tool_definitions=[_tool_def("exec_command")],
+        tool_handler=handler,
+        tool_context=ToolContext(workspace_dir=str(tmp_path)),
+    )
+
+    events = [event async for event in agent.run_turn("verify")]
+
+    assert any(event.kind == "tool_result" for event in events)
+    if tool_error:
+        assert provider.calls == 1
+        assert any(
+            event.kind == "error" and event.code == "turn_tool_error_budget_exceeded"
+            for event in events
+        )
+    else:
+        assert provider.calls == 2
+        assert any(event.kind == "done" for event in events)
+        assert not any(event.kind == "error" for event in events)
+    if existing_ledger:
+        assert ledger_path.read_bytes() == original
+    else:
+        assert not ledger_path.exists()
 
 
 @pytest.mark.asyncio
@@ -554,14 +609,18 @@ async def test_agent_runtime_diagnostics_write_jsonl_without_model_hint(
     assert diagnostic["mode"] == "log"
     assert diagnostic["injected_to_model"] is False
     assert diagnostic["changed_files"] == ["src/lib.rs"]
+    assert not any(event.get("name") == "focused_verification.classified" for event in logged)
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("event_output", [False, True])
 async def test_agent_source_loop_recovery_warns_model_once(
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,
+    event_output: bool,
 ) -> None:
     runtime_events_path = tmp_path / "runtime_events.jsonl"
+    ledger_path = tmp_path / "retired-ledger.json"
     workspace = tmp_path / "repo"
     workspace.mkdir()
     monkeypatch.setattr(
@@ -590,7 +649,8 @@ async def test_agent_source_loop_recovery_warns_model_once(
         provider=provider,
         config=AgentConfig(
             max_iterations=5,
-            runtime_events_path=str(runtime_events_path),
+            runtime_events_path=str(runtime_events_path) if event_output else None,
+            patch_evidence_ledger_path=str(ledger_path),
             runtime_recovery_mode="warn_model",
             progress_watchdog_mode="log",
             tool_result_projection_max_inline_chars=10_000,
@@ -601,6 +661,8 @@ async def test_agent_source_loop_recovery_warns_model_once(
         tool_context=tool_context,
         session_key="session-1",
     )
+    turn_log = Mock(wraps=agent._write_turn_call_log)
+    monkeypatch.setattr(agent, "_write_turn_call_log", turn_log)
 
     events = [event async for event in agent.run_turn("fix the bug")]
 
@@ -608,19 +670,18 @@ async def test_agent_source_loop_recovery_warns_model_once(
     assert provider.calls == 4
     assert "[Runtime recovery]" in _message_text(provider.messages_by_call[3])
     assert "[Runtime recovery]" not in _message_text(agent._history)
+    assert any(call.args[0] == "runtime_recovery" for call in turn_log.call_args_list)
+    assert agent.config.metadata["source_loop_recoveries"] == 1
+    assert not ledger_path.exists()
+    if not event_output:
+        return
 
     logged = [
         json.loads(line)
         for line in runtime_events_path.read_text(encoding="utf-8").splitlines()
     ]
-    recovery = next(
-        event for event in logged if event.get("mechanism") == "source_loop_recovery"
-    )
-    assert recovery["feature"] == "runtime_recovery"
-    assert recovery["action"] == "nudge"
-    assert recovery["mode"] == "warn_model"
-    assert recovery["injected_to_model"] is True
-    assert recovery["evidence"]["diff_paths"] == ["src/lib.rs"]
+    assert any(event.get("feature") == "runtime_observer" for event in logged)
+    assert not any(event.get("feature") == "runtime_recovery" for event in logged)
 
 
 @pytest.mark.asyncio
@@ -667,7 +728,6 @@ async def test_git_unavailable_skips_runtime_recovery_without_extra_model_retry(
             progress_watchdog_mode="log",
             tool_result_projection_max_inline_chars=10_000,
             tool_failure_loop_block_threshold=0,
-            post_write_convergence_enabled=True,
         ),
         tool_definitions=[_tool_def("exec_command")],
         tool_handler=handler,
@@ -753,15 +813,12 @@ async def test_agent_source_loop_recovery_can_warn_for_second_source_loop_key(
     assert provider.calls == 7
     assert "[Runtime recovery]" in _message_text(provider.messages_by_call[3])
     assert "[Runtime recovery]" in _message_text(provider.messages_by_call[6])
+    assert agent.config.metadata["source_loop_recoveries"] == 2
+    assert "[Runtime recovery]" not in _message_text(agent._history)
 
     logged = [
         json.loads(line)
         for line in runtime_events_path.read_text(encoding="utf-8").splitlines()
     ]
-    recoveries = [
-        event for event in logged if event.get("mechanism") == "source_loop_recovery"
-    ]
-    assert [event["action"] for event in recoveries] == ["nudge", "nudge"]
-    assert [
-        event["evidence"]["source_loop_recovery_count"] for event in recoveries
-    ] == [1, 2]
+    assert any(event.get("feature") == "runtime_observer" for event in logged)
+    assert not any(event.get("feature") == "runtime_recovery" for event in logged)

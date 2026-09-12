@@ -7,12 +7,12 @@ import pytest
 
 from opensquilla.gateway.config import GatewayConfig
 from opensquilla.gateway.llm_runtime import resolve_llm_runtime_config
+from opensquilla.gateway.provider_runtime import sync_provider_selector as _sync_provider_selector
 from opensquilla.gateway.rpc_config import (
     _handle_config_apply,
     _handle_config_patch,
     _handle_config_patch_safe,
     _handle_config_set,
-    _sync_provider_selector,
 )
 from opensquilla.onboarding.config_store import load_config
 

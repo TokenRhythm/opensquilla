@@ -229,11 +229,11 @@ async def test_provider_terminal_arguments_override_provisional_delta_bytes(
 
 
 @pytest.mark.asyncio
-async def test_recovery_failure_emits_authoritative_empty_terminal_snapshot() -> None:
+async def test_retired_text_only_recovery_preserves_authoritative_terminal_snapshot() -> None:
     provider = _SequenceProvider(
         [
             [
-                ProviderText(text="superseded answer"),
+                ProviderText(text="Completed answer."),
                 ProviderDone(stop_reason="stop", input_tokens=1, output_tokens=1),
             ],
             [ProviderError(message="fatal retry failure", code="400")],
@@ -268,9 +268,11 @@ async def test_recovery_failure_emits_authoritative_empty_terminal_snapshot() ->
     events = [event async for event in agent.run_turn("test")]
     done = next(event for event in events if event.kind == "done")
 
-    assert done.text == ""
-    assert done.text_snapshot == ""
-    assert any(
+    assert len(provider.calls) == 1
+    assert done.text == "Completed answer."
+    assert done.text_snapshot == done.text
+    assert not any(
         event.kind == "warning" and event.code == "text_only_tool_recovery"
         for event in events
     )
+    assert not any(event.kind == "error" for event in events)

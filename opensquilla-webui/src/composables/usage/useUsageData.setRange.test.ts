@@ -7,6 +7,7 @@ import i18n, { loadLocaleMessages, type LocaleCode } from '@/i18n'
 import { useUsageData } from './useUsageData'
 import { requestUsageSnapshot } from './useUsageQuery'
 import type { UsageSnapshot } from '@/types/usage'
+import { usageSession } from '@/testing/usage.test-helper'
 import type { SessionDirectory } from '@/modules/sessionDirectory'
 import type { Observability } from '@/modules/observability'
 
@@ -210,12 +211,12 @@ describe('useUsageData model labels', () => {
       const { api, scope } = mountUsageData()
       scopes.push(scope)
 
-      const label = api.modelDisplayLabel({
+      const label = api.modelDisplayLabel(usageSession({
         modelBreakdown: [
           { model: 'provider/primary-model' },
           { model: 'provider/helper-model' },
         ],
-      })
+      }))
 
       expect(label).toBe(expected)
       expect(label).not.toMatch(/auto|自动|自動/i)
@@ -226,8 +227,8 @@ describe('useUsageData model labels', () => {
     const { api, scope } = mountUsageData()
     scopes.push(scope)
 
-    expect(api.modelDisplayLabel({
+    expect(api.modelDisplayLabel(usageSession({
       modelBreakdown: [{ model: 'provider/only-model' }],
-    })).toBe('provider/only-model')
+    }))).toBe('provider/only-model')
   })
 })

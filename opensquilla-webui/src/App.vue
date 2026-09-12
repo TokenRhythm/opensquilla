@@ -401,7 +401,9 @@
     </button>
   </nav>
 
-  <ToastHost />
+  <Teleport to="body">
+    <ToastHost />
+  </Teleport>
 
   <ConfirmModal />
 
@@ -525,7 +527,7 @@ import { activeTaskWasDeletedWithProjectHistory } from './utils/projectHistory'
 import { createCoalescedRefresh } from './utils/coalescedRefresh'
 import {
   optionalSessionRpcAllowed,
-  optionalSessionRpcCallOptions,
+  optionalSessionReadOptions,
 } from './composables/chat/sessionBootstrapAdmission'
 import { markCronFinishNotified } from './utils/cron/notifications'
 import { AGENT_CATALOG_KEY } from './modules/agentCatalog'
@@ -740,7 +742,7 @@ function handleCronRunFinished(event: CronRunFinished) {
 installSessionNavigationDiagConsole()
 
 // Shared agents.list state + fetch (singleton) for sidebar session metadata.
-const { agents, loadAgents } = useAgentOptions(agentCatalog, optionalSessionRpcCallOptions)
+const { agents, loadAgents } = useAgentOptions(agentCatalog, optionalSessionReadOptions)
 const mobileKeyboardOpen = ref(false)
 const commandPaletteOpen = ref(false)
 const localChatSessions = ref<Record<string, { effectiveAgentId: string; title: string; updatedAt: number }>>({})
@@ -1701,7 +1703,7 @@ async function performSidebarLoad(): Promise<void> {
     && optionalSessionRpcAllowed.value
   ) {
     requests.push(
-      projectWorkspaces.loadWorkspaces(optionalSessionRpcCallOptions),
+      projectWorkspaces.loadWorkspaces(optionalSessionReadOptions),
     )
   }
   await Promise.allSettled(requests)

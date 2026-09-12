@@ -85,8 +85,10 @@ def test_desktop_search_surfaces_use_shared_runtime_provider_catalog() -> None:
     web_routes = _read("opensquilla-webui/src/router/webRoutes.ts")
     assert "platforms: ['web', 'desktop']" in web_routes
 
-    desktop_routes = _read("opensquilla-webui/src/router/desktopRoutes.ts")
-    assert "DesktopSettingsView" not in desktop_routes
+    settings_view = _read("opensquilla-webui/src/views/web/SettingsView.vue")
+    assert "@/views/web/SettingsView.vue" in web_routes
+    assert "@/components/settings/SettingsDialog.vue" in settings_view
+    assert "<SettingsDialog />" in settings_view
 
     settings_dialog = _read(
         "opensquilla-webui/src/components/settings/SettingsDialog.vue"

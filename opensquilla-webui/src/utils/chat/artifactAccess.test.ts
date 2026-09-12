@@ -1,16 +1,48 @@
 import { describe, expect, it, vi } from 'vitest'
 import type { ArtifactPayload } from '@/types/artifacts'
 import {
-  artifactAccessHeaders,
+  HttpTransportError,
+} from '@/adapters/gateway/privateHttpTransport'
+import {
+  httpTransportTestDouble,
+  type TestHttpBinaryResponse,
+  type TestHttpTransport,
+} from '@/testing/httpTransport.test-helper'
+import {
   artifactAccessUrl,
   artifactGatewayOpenUrl,
   artifactOpenFailureMessage,
+  createV4ArtifactContentAccess,
   fetchArtifactBlob,
   isActiveDocumentArtifact,
   isActiveDocumentArtifactCandidate,
   openArtifactBlobUrl,
   openArtifactViaGateway,
 } from '@/adapters/gateway/artifactAccessV4'
+
+function binaryResponse(
+  body: BlobPart = '',
+  options: { status?: number; type?: string } = {},
+): TestHttpBinaryResponse {
+  const blob = new Blob([body], options.type ? { type: options.type } : undefined)
+  return {
+    metadata: {
+      status: options.status ?? 200,
+      contentLength: blob.size,
+      ...(options.type ? { contentType: options.type } : {}),
+    },
+    blob: async () => blob,
+    stream: () => blob.stream(),
+  }
+}
+
+function httpTransport(requestBinary: TestHttpTransport['requestBinary']): TestHttpTransport {
+  return httpTransportTestDouble({ requestBinary })
+}
+
+function successfulHttp(body: BlobPart = 'hello', type = ''): TestHttpTransport {
+  return httpTransport(vi.fn(async () => binaryResponse(body, { type })))
+}
 
 function artifact(overrides: Partial<ArtifactPayload> = {}): ArtifactPayload {
   return {
@@ -53,43 +85,6 @@ describe('artifactAccessUrl', () => {
   })
 })
 
-describe('artifactAccessHeaders', () => {
-  it('adds WebUI auth and session headers for same-origin artifact fetches', () => {
-    expect(artifactAccessHeaders('/api/v1/artifacts/art-report', {
-      baseOrigin: 'http://127.0.0.1:18793',
-      sessionKey: 'agent:main:webchat:ok',
-      authToken: 'secret',
-    })).toEqual({
-      'x-opensquilla-session-key': 'agent:main:webchat:ok',
-      Authorization: 'Bearer secret',
-    })
-  })
-
-  it('does not attach local credentials to cross-origin artifact URLs', () => {
-    expect(artifactAccessHeaders('https://files.example.test/artifacts/art-report', {
-      baseOrigin: 'http://127.0.0.1:18793',
-      sessionKey: 'agent:main:webchat:ok',
-      authToken: 'secret',
-    })).toEqual({})
-  })
-
-  it('attaches credentials to the exact Desktop artifact proxy only', () => {
-    const context = {
-      baseOrigin: 'opensquilla-app://desktop',
-      sessionKey: 'agent:main:webchat:ok',
-      authToken: 'secret',
-    }
-    expect(artifactAccessHeaders('/api/v1/artifacts/art-report', context)).toEqual({
-      'x-opensquilla-session-key': 'agent:main:webchat:ok',
-      Authorization: 'Bearer secret',
-    })
-    expect(artifactAccessHeaders(
-      'other-app://desktop/api/v1/artifacts/art-report',
-      context,
-    )).toEqual({})
-  })
-})
-
 describe('artifactGatewayOpenUrl', () => {
   it('builds the same-origin native-open endpoint from artifact id', () => {
     expect(artifactGatewayOpenUrl(artifact(), 'http://127.0.0.1:18793')).toBe(
@@ -120,39 +115,32 @@ describe('artifactGatewayOpenUrl', () => {
 })
 
 describe('openArtifactViaGateway', () => {
-  it('posts to the owner-only native-open endpoint with WebUI auth headers', async () => {
-    const fetchImpl = vi.fn(async () => new Response('{"ok":true}', {
-      status: 202,
-      headers: { 'content-type': 'application/json' },
-    }))
+  it('posts to the owner-only native-open endpoint through the private transport', async () => {
+    const requestBinary = vi.fn(async () => binaryResponse('', { status: 202 }))
+    const http = httpTransport(requestBinary)
 
-    const result = await openArtifactViaGateway(artifact({ name: 'page.html', mime: 'text/html' }), {
+    const result = await openArtifactViaGateway(http, artifact({ name: 'page.html', mime: 'text/html' }), {
       baseOrigin: 'http://127.0.0.1:18793',
       sessionKey: 'agent:main:webchat:ok',
-      authToken: 'secret',
-      fetchImpl,
     })
 
     expect(result.ok).toBe(true)
-    expect(fetchImpl).toHaveBeenCalledWith('/api/v1/artifacts/art-report/open', {
+    expect(requestBinary).toHaveBeenCalledWith('/api/v1/artifacts/art-report/open', {
       method: 'POST',
-      headers: {
-        'x-opensquilla-session-key': 'agent:main:webchat:ok',
-        Authorization: 'Bearer secret',
-      },
-      credentials: 'same-origin',
+      sessionKey: 'agent:main:webchat:ok',
+      timeoutMs: 0,
     })
   })
 
   it('returns a failure message when native open is not authorized', async () => {
-    const fetchImpl = vi.fn(async () => new Response('{"code":"OWNER_REQUIRED"}', {
-      status: 403,
-      headers: { 'content-type': 'application/json' },
+    const http = httpTransport(vi.fn(async () => {
+      throw new HttpTransportError('http-status', 'Forbidden', 403, {
+        code: 'OWNER_REQUIRED',
+      })
     }))
 
-    const result = await openArtifactViaGateway(artifact({ name: 'page.html', mime: 'text/html' }), {
+    const result = await openArtifactViaGateway(http, artifact({ name: 'page.html', mime: 'text/html' }), {
       baseOrigin: 'http://127.0.0.1:18793',
-      fetchImpl,
     })
 
     expect(result.ok).toBe(false)
@@ -165,63 +153,64 @@ describe('openArtifactViaGateway', () => {
 
 describe('fetchArtifactBlob', () => {
   it('allows authenticated same-origin fetches through the Desktop proxy', async () => {
-    const fetchImpl = vi.fn(async () => new Response('desktop preview', {
-      status: 200,
-      headers: { 'content-type': 'text/markdown' },
+    const requestBinary = vi.fn(async () => binaryResponse('desktop preview', {
+      type: 'text/markdown',
     }))
+    const http = httpTransport(requestBinary)
 
-    const result = await fetchArtifactBlob(artifact(), {
+    const result = await fetchArtifactBlob(http, artifact(), {
       baseOrigin: 'opensquilla-app://desktop',
       sessionKey: 'agent:main:webchat:ok',
-      authToken: 'secret',
-      fetchImpl,
       requireSameOrigin: true,
     })
 
     expect(result.ok).toBe(true)
-    expect(fetchImpl).toHaveBeenCalledWith('/api/v1/artifacts/art-report', expect.objectContaining({
-      credentials: 'same-origin',
-      redirect: 'error',
+    expect(requestBinary).toHaveBeenCalledWith('/api/v1/artifacts/art-report', expect.objectContaining({
+      sessionKey: 'agent:main:webchat:ok',
     }))
   })
 
-  it('forwards an AbortSignal to the authenticated fetch', async () => {
+  it('forwards an AbortSignal to the private transport', async () => {
     const controller = new AbortController()
-    const fetchImpl = vi.fn(async () => new Response('hello', { status: 200 }))
+    const requestBinary = vi.fn(async () => binaryResponse('hello'))
+    const http = httpTransport(requestBinary)
 
-    await fetchArtifactBlob(artifact(), {
+    await fetchArtifactBlob(http, artifact(), {
       baseOrigin: 'http://127.0.0.1:18793',
       signal: controller.signal,
-      fetchImpl,
     })
 
-    expect(fetchImpl).toHaveBeenCalledWith('/api/v1/artifacts/art-report', expect.objectContaining({
+    expect(requestBinary).toHaveBeenCalledWith('/api/v1/artifacts/art-report', expect.objectContaining({
       signal: controller.signal,
     }))
   })
 
-  it('fetches the sanitized artifact URL with WebUI headers', async () => {
-    const fetchImpl = vi.fn(async () => new Response('hello', {
-      status: 200,
-      headers: { 'content-type': 'text/markdown' },
+  it('preserves the DOM AbortError contract when the transport aborts', async () => {
+    const http = httpTransport(vi.fn(async () => {
+      throw new HttpTransportError('aborted', 'request aborted')
     }))
 
-    const result = await fetchArtifactBlob(artifact(), {
+    await expect(fetchArtifactBlob(http, artifact(), {
+      baseOrigin: 'http://127.0.0.1:18793',
+    })).rejects.toMatchObject({ name: 'AbortError' })
+  })
+
+  it('fetches the sanitized artifact URL with session scope', async () => {
+    const requestBinary = vi.fn(async () => binaryResponse('hello', {
+      type: 'text/markdown',
+    }))
+    const http = httpTransport(requestBinary)
+
+    const result = await fetchArtifactBlob(http, artifact(), {
       baseOrigin: 'http://127.0.0.1:18793',
       sessionKey: 'agent:main:webchat:ok',
-      authToken: 'secret',
-      fetchImpl,
     })
 
     expect(result.ok).toBe(true)
-    expect(fetchImpl).toHaveBeenCalledWith('/api/v1/artifacts/art-report', {
-      method: 'GET',
-      headers: {
-        'x-opensquilla-session-key': 'agent:main:webchat:ok',
-        Authorization: 'Bearer secret',
-      },
-      credentials: 'same-origin',
+    expect(requestBinary).toHaveBeenCalledWith('/api/v1/artifacts/art-report', {
+      sessionKey: 'agent:main:webchat:ok',
       signal: undefined,
+      timeoutMs: 0,
     })
     if (result.ok) {
       expect(await result.blob.text()).toBe('hello')
@@ -229,42 +218,36 @@ describe('fetchArtifactBlob', () => {
     }
   })
 
-  it('omits WebUI credentials for cross-origin artifact fetches', async () => {
-    const fetchImpl = vi.fn(async () => new Response('hello', {
-      status: 200,
-      headers: { 'content-type': 'text/markdown' },
+  it('fetches cross-origin artifacts through the credential-free private capability', async () => {
+    const requestBinary = vi.fn(async () => binaryResponse('unexpected'))
+    const fetchExternalArtifact = vi.fn(async () => binaryResponse('hello', {
+      type: 'text/markdown',
     }))
+    const http = httpTransportTestDouble({ fetchExternalArtifact, requestBinary })
+    const endpoint = 'https://files.example.test/artifacts/art-report?token=share-token'
 
     const result = await fetchArtifactBlob(
-      artifact({ download_url: 'https://files.example.test/artifacts/art-report?token=share-token' }),
+      http,
+      artifact({ download_url: endpoint }),
       {
         baseOrigin: 'http://127.0.0.1:18793',
         sessionKey: 'agent:main:webchat:ok',
-        authToken: 'secret',
-        fetchImpl,
       },
     )
 
     expect(result.ok).toBe(true)
-    expect(fetchImpl).toHaveBeenCalledWith('https://files.example.test/artifacts/art-report?token=share-token', {
-      method: 'GET',
-      headers: {},
-      credentials: 'omit',
-      signal: undefined,
-    })
+    expect(fetchExternalArtifact).toHaveBeenCalledWith(endpoint, undefined)
+    expect(requestBinary).not.toHaveBeenCalled()
   })
 
   it('returns a user-facing failure result when the server rejects the request', async () => {
-    const fetchImpl = vi.fn(async () => new Response('{"code":"NOT_FOUND"}', {
-      status: 404,
-      headers: { 'content-type': 'application/json' },
+    const http = httpTransport(vi.fn(async () => {
+      throw new HttpTransportError('http-status', 'Not found', 404, { code: 'NOT_FOUND' })
     }))
 
-    const result = await fetchArtifactBlob(artifact(), {
+    const result = await fetchArtifactBlob(http, artifact(), {
       baseOrigin: 'http://127.0.0.1:18793',
       sessionKey: 'agent:main:webchat:missing',
-      authToken: 'secret',
-      fetchImpl,
     })
 
     expect(result.ok).toBe(false)
@@ -277,21 +260,16 @@ describe('fetchArtifactBlob', () => {
 
 describe('openArtifactBlobUrl', () => {
   it('opens a blob URL created from the authenticated artifact response', async () => {
-    const fetchImpl = vi.fn(async () => new Response('hello', {
-      status: 200,
-      headers: { 'content-type': 'text/markdown' },
-    }))
+    const http = successfulHttp('hello', 'text/markdown')
     const createObjectUrl = vi.fn(() => 'blob:artifact-report')
     const revokeObjectUrl = vi.fn()
     const opened = { opener: {}, location: { href: '' }, close: vi.fn() }
     const openWindow = vi.fn(() => opened)
     const scheduleRevoke = vi.fn((_url: string, revoke: () => void) => revoke())
 
-    const result = await openArtifactBlobUrl(artifact(), {
+    const result = await openArtifactBlobUrl(http, artifact(), {
       baseOrigin: 'http://127.0.0.1:18793',
       sessionKey: 'agent:main:webchat:ok',
-      authToken: 'secret',
-      fetchImpl,
       createObjectUrl,
       revokeObjectUrl,
       openWindow,
@@ -310,20 +288,16 @@ describe('openArtifactBlobUrl', () => {
   })
 
   it('returns failure and revokes immediately when the browser blocks the new tab', async () => {
-    const fetchImpl = vi.fn(async () => new Response('hello', {
-      status: 200,
-      headers: { 'content-type': 'text/markdown' },
-    }))
+    const requestBinary = vi.fn(async () => binaryResponse('hello', { type: 'text/markdown' }))
+    const http = httpTransport(requestBinary)
     const createObjectUrl = vi.fn(() => 'blob:artifact-report')
     const revokeObjectUrl = vi.fn()
     const openWindow = vi.fn(() => null)
     const scheduleRevoke = vi.fn()
 
-    const result = await openArtifactBlobUrl(artifact(), {
+    const result = await openArtifactBlobUrl(http, artifact(), {
       baseOrigin: 'http://127.0.0.1:18793',
       sessionKey: 'agent:main:webchat:ok',
-      authToken: 'secret',
-      fetchImpl,
       createObjectUrl,
       revokeObjectUrl,
       openWindow,
@@ -335,7 +309,7 @@ describe('openArtifactBlobUrl', () => {
       expect(result.status).toBe(0)
       expect(result.message).toBe('Artifact open failed. Use Download instead: report.md')
     }
-    expect(fetchImpl).not.toHaveBeenCalled()
+    expect(requestBinary).not.toHaveBeenCalled()
     expect(createObjectUrl).not.toHaveBeenCalled()
     expect(revokeObjectUrl).not.toHaveBeenCalled()
     expect(scheduleRevoke).not.toHaveBeenCalled()
@@ -348,20 +322,19 @@ describe('openArtifactBlobUrl', () => {
       location: { href: '' },
       close: vi.fn(),
     }
-    const fetchImpl = vi.fn(async () => new Response('hello'))
+    const requestBinary = vi.fn(async () => binaryResponse('hello'))
+    const http = httpTransport(requestBinary)
     const openWindow = vi.fn(() => opened)
 
-    const result = await openArtifactBlobUrl(artifact(), {
+    const result = await openArtifactBlobUrl(http, artifact(), {
       baseOrigin: 'http://127.0.0.1:18793',
       sessionKey: 'agent:main:webchat:ok',
-      authToken: 'secret',
-      fetchImpl,
       openWindow,
     })
 
     expect(result.ok).toBe(false)
     expect(opened.close).toHaveBeenCalledOnce()
-    expect(fetchImpl).not.toHaveBeenCalled()
+    expect(requestBinary).not.toHaveBeenCalled()
   })
 
   it('fails closed when opener isolation cannot be verified', async () => {
@@ -371,32 +344,31 @@ describe('openArtifactBlobUrl', () => {
       get: () => ({}),
       set: () => {},
     })
-    const fetchImpl = vi.fn(async () => new Response('hello'))
+    const requestBinary = vi.fn(async () => binaryResponse('hello'))
+    const http = httpTransport(requestBinary)
     const openWindow = vi.fn(() => opened)
 
-    const result = await openArtifactBlobUrl(artifact(), {
+    const result = await openArtifactBlobUrl(http, artifact(), {
       baseOrigin: 'http://127.0.0.1:18793',
       sessionKey: 'agent:main:webchat:ok',
-      authToken: 'secret',
-      fetchImpl,
       openWindow,
     })
 
     expect(result.ok).toBe(false)
     expect(opened.close).toHaveBeenCalledOnce()
-    expect(fetchImpl).not.toHaveBeenCalled()
+    expect(requestBinary).not.toHaveBeenCalled()
   })
 
   it('closes the pre-opened tab when the authenticated fetch fails', async () => {
     const opened = { opener: {}, location: { href: '' }, close: vi.fn() }
-    const fetchImpl = vi.fn(async () => new Response('missing', { status: 404 }))
+    const http = httpTransport(vi.fn(async () => {
+      throw new HttpTransportError('http-status', 'Not found', 404)
+    }))
     const openWindow = vi.fn(() => opened)
 
-    const result = await openArtifactBlobUrl(artifact(), {
+    const result = await openArtifactBlobUrl(http, artifact(), {
       baseOrigin: 'http://127.0.0.1:18793',
       sessionKey: 'agent:main:webchat:missing',
-      authToken: 'secret',
-      fetchImpl,
       openWindow,
     })
 
@@ -411,20 +383,15 @@ describe('openArtifactBlobUrl', () => {
       set href(_value: string) { throw new Error('navigation blocked') },
     }
     const opened = { opener: {}, location, close: vi.fn() }
-    const fetchImpl = vi.fn(async () => new Response('hello', {
-      status: 200,
-      headers: { 'content-type': 'text/markdown' },
-    }))
+    const http = successfulHttp('hello', 'text/markdown')
     const createObjectUrl = vi.fn(() => 'blob:artifact-report')
     const revokeObjectUrl = vi.fn()
     const openWindow = vi.fn(() => opened)
     const scheduleRevoke = vi.fn()
 
-    const result = await openArtifactBlobUrl(artifact(), {
+    const result = await openArtifactBlobUrl(http, artifact(), {
       baseOrigin: 'http://127.0.0.1:18793',
       sessionKey: 'agent:main:webchat:ok',
-      authToken: 'secret',
-      fetchImpl,
       createObjectUrl,
       revokeObjectUrl,
       openWindow,
@@ -439,19 +406,14 @@ describe('openArtifactBlobUrl', () => {
 
   it('does not open active HTML artifacts as same-origin blob documents', async () => {
     const opened = { opener: {}, location: { href: '' }, close: vi.fn() }
-    const fetchImpl = vi.fn(async () => new Response('<script>window.__x = 1</script>', {
-      status: 200,
-      headers: { 'content-type': 'text/html' },
-    }))
+    const http = successfulHttp('<script>window.__x = 1</script>', 'text/html')
     const createObjectUrl = vi.fn(() => 'blob:artifact-html')
     const openWindow = vi.fn(() => opened)
     const scheduleRevoke = vi.fn()
 
-    const result = await openArtifactBlobUrl(artifact({ name: 'page.html', mime: 'text/html' }), {
+    const result = await openArtifactBlobUrl(http, artifact({ name: 'page.html', mime: 'text/html' }), {
       baseOrigin: 'http://127.0.0.1:18793',
       sessionKey: 'agent:main:webchat:ok',
-      authToken: 'secret',
-      fetchImpl,
       createObjectUrl,
       openWindow,
       scheduleRevoke,
@@ -466,15 +428,13 @@ describe('openArtifactBlobUrl', () => {
 
   it('blocks active HTML artifacts even when the response content type is missing', async () => {
     const opened = { opener: {}, location: { href: '' }, close: vi.fn() }
-    const fetchImpl = vi.fn(async () => new Response('<html></html>', { status: 200 }))
+    const http = successfulHttp('<html></html>')
     const createObjectUrl = vi.fn(() => 'blob:artifact-html')
     const openWindow = vi.fn(() => opened)
 
-    const result = await openArtifactBlobUrl(artifact({ name: 'page.html', mime: '' }), {
+    const result = await openArtifactBlobUrl(http, artifact({ name: 'page.html', mime: '' }), {
       baseOrigin: 'http://127.0.0.1:18793',
       sessionKey: 'agent:main:webchat:ok',
-      authToken: 'secret',
-      fetchImpl,
       createObjectUrl,
       openWindow,
     })
@@ -490,19 +450,14 @@ describe('openArtifactBlobUrl', () => {
     ['report.pdf', 'application/pdf'],
   ])('opens passive document artifacts: %s', async (name, mime) => {
     const opened = { opener: {}, location: { href: '' }, close: vi.fn() }
-    const fetchImpl = vi.fn(async () => new Response('hello', {
-      status: 200,
-      headers: { 'content-type': mime },
-    }))
+    const http = successfulHttp('hello', mime)
     const createObjectUrl = vi.fn(() => `blob:${name}`)
     const openWindow = vi.fn(() => opened)
     const scheduleRevoke = vi.fn()
 
-    const result = await openArtifactBlobUrl(artifact({ name, mime }), {
+    const result = await openArtifactBlobUrl(http, artifact({ name, mime }), {
       baseOrigin: 'http://127.0.0.1:18793',
       sessionKey: 'agent:main:webchat:ok',
-      authToken: 'secret',
-      fetchImpl,
       createObjectUrl,
       openWindow,
       scheduleRevoke,
@@ -549,5 +504,36 @@ describe('artifactOpenFailureMessage', () => {
     expect(artifactOpenFailureMessage(403, 'report.md')).toBe('Artifact open is not authorized. Refresh the page and try again.')
     expect(artifactOpenFailureMessage(404, 'report.md')).toBe('Artifact is unavailable in this session: report.md')
     expect(artifactOpenFailureMessage(0, 'report.md')).toBe('Artifact open failed. Use Download instead: report.md')
+  })
+})
+
+describe('createV4ArtifactContentAccess', () => {
+  it('delegates preview storage cleanup to the named private capability', async () => {
+    const clearPreviewOrigin = vi.fn(async () => undefined)
+    const http = {
+      ...successfulHttp(),
+      clearPreviewOrigin,
+    }
+    const access = createV4ArtifactContentAccess(http)
+    const previewOrigin =
+      'http://p-0123456789abcdef0123456789abcdef.localhost:48721'
+
+    await access.clearPreviewStorage(previewOrigin)
+
+    expect(clearPreviewOrigin).toHaveBeenCalledWith(previewOrigin)
+  })
+
+  it('keeps preview storage cleanup best-effort', async () => {
+    const clearPreviewOrigin = vi.fn(async () => {
+      throw new HttpTransportError('network', 'offline')
+    })
+    const access = createV4ArtifactContentAccess({
+      ...successfulHttp(),
+      clearPreviewOrigin,
+    })
+
+    await expect(access.clearPreviewStorage(
+      'http://p-0123456789abcdef0123456789abcdef.localhost:48721',
+    )).resolves.toBeUndefined()
   })
 })

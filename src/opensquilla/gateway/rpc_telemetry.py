@@ -3,21 +3,22 @@
 from __future__ import annotations
 
 import inspect
-from collections import deque
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 
 import structlog
 
+from opensquilla.gateway.adapters.app_settings import update_gateway_config_in_place
 from opensquilla.gateway.adapters.telemetry_contract import register_telemetry_contract
 from opensquilla.gateway.config import GatewayConfig
+from opensquilla.gateway.config_persistence import persist_gateway_config
 from opensquilla.gateway.config_secrets import inherit_then_clear_explicit
 from opensquilla.gateway.guest_rpc_policy import is_guest_rpc_method_allowed
 from opensquilla.gateway.rpc import RpcContext, RpcHandlerError, get_dispatcher
-from opensquilla.gateway.rpc_config import (
-    persist_gateway_config,
-    update_gateway_config_in_place,
+from opensquilla.gateway.telemetry_connections import (
+    is_registered_tui_connection,
+    register_tui_connection,
 )
 from opensquilla.observability.network_policy import telemetry_scope_forced_off_reasons
 from opensquilla.telemetry.consent import (
@@ -54,23 +55,6 @@ log = structlog.get_logger(__name__)
 
 _d = get_dispatcher()
 _EXPECTED_PARAMS = frozenset({"scope", "enabled"})
-_TUI_CONNECTION_LIMIT = 1024
-_tui_connection_order: deque[str] = deque()
-_tui_connection_ids: set[str] = set()
-
-
-def is_registered_tui_connection(conn_id: str) -> bool:
-    return conn_id in _tui_connection_ids
-
-
-def _register_tui_connection(conn_id: str) -> None:
-    if conn_id in _tui_connection_ids:
-        return
-    _tui_connection_ids.add(conn_id)
-    _tui_connection_order.append(conn_id)
-    while len(_tui_connection_order) > _TUI_CONNECTION_LIMIT:
-        _tui_connection_ids.discard(_tui_connection_order.popleft())
-
 
 @dataclass(frozen=True)
 class _ScopeFields:
@@ -499,7 +483,7 @@ async def _handle_client_launch_record(
             "An authenticated owner connection is required.",
             accepted=False,
         )
-    _register_tui_connection(ctx.conn_id)
+    register_tui_connection(ctx.conn_id)
     sink = getattr(ctx.turn_runner, "growth_event_sink", None)
     record = getattr(sink, "record_client_launch", None)
     if not callable(record):

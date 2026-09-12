@@ -1,4 +1,9 @@
-import { describe, expect, it, vi } from 'vitest'
+import { RpcTimeoutError } from '@/lib/rpc'
+import { createSessionReadLifecycle, type SessionReadPortLease } from '@/modules/sessionReadLifecycle'
+import { createConversationRuntime } from '@/modules/conversationRuntime'
+import { createConversationSubscriptionLifecycle } from '@/modules/conversationSubscriptionLifecycle'
+import { afterEach, describe, expect, it, vi } from 'vitest'
+import { effectScope, ref } from 'vue'
 import type { RpcCallOptions } from '@/lib/rpc'
 import { CHAT_HISTORY_METHOD, type ChatHistoryResult } from '@/contracts/generated/v4/chatHistory'
 import {
@@ -16,9 +21,16 @@ import {
 import { SESSIONS_MESSAGES_UNSUBSCRIBE_METHOD } from '@/contracts/generated/v4/sessionsMessagesUnsubscribe'
 import {
   SessionReadContractError,
+  SessionReadFailure,
   SessionReadSessionMissingError,
+  type SessionReadMetadata,
 } from '@/modules/sessionReadLifecycle'
+import type { ConversationEvent } from '@/modules/conversationEvents'
+import type { InterruptViewState } from '@/types/parts'
+import { useChatApprovals } from '@/composables/chat/useChatApprovals'
+import { createConversationEventsTestHarness } from '@/testing/conversationEvents.test-helper'
 import { createV4SessionReadPort } from './sessionReadPortV4'
+import { mapSessionReadError } from './sessionReadErrorMapping'
 
 type Call = {
   method: string
@@ -112,7 +124,7 @@ function snapshotResult(
       payload: {
         task_id: 'task-snapshot',
         text_delta: 'hello',
-        opaque_payload: { snake_value: true },
+        input: { snake_value: true },
       },
     }],
     ...patch,
@@ -131,7 +143,7 @@ function historyResult(
       text: 'hello',
       timestamp: 1_725_199_200,
       reasoning_content: '  thinking exactly  ',
-      router_decision: { selected_tier: 'c1' },
+      router_decision: { tier: 'c1' },
       artifacts: [{ artifact_id: 'artifact-1' }],
       tool_calls: [{ tool_name: 'read' }],
       timeline: [{ segment_kind: 'thinking' }],
@@ -258,6 +270,244 @@ async function flushAsyncWork() {
 }
 
 describe('v4 SessionReadPort Adapter', () => {
+  it('refreshes a live subscription in place and coalesces concurrent reconciliation', async () => {
+    const harness = makeHarness()
+    const lease = createV4SessionReadPort(harness.rpc).open(openRequest())
+    await lease.live
+    harness.calls.length = 0
+    const fresh = deferred<SessionsMessagesSnapshotResult>()
+    harness.results.set(SESSIONS_MESSAGES_SNAPSHOT_METHOD, fresh.promise)
+    const first = lease.reconcile()
+    const second = lease.reconcile()
+    await flushAsyncWork()
+    expect(harness.calls.map(call => call.method)).toEqual([SESSIONS_MESSAGES_SNAPSHOT_METHOD])
+    fresh.resolve(snapshotResult({ current_stream_seq: 42 }))
+    const [a, b] = await Promise.all([first, second])
+    expect(a).toBe(b)
+    expect(a.snapshotCursor?.currentStreamSeq).toBe(42)
+    expect(a.initialMetadata.pendingUserInputsCursor).toEqual({
+      streamGeneration: 'stream-1', currentStreamSeq: 42,
+    })
+    expect(a.initialMetadata.goalSnapshotStreamSeq).toBe(6)
+    expect(harness.calls.map(call => call.method)).toEqual([
+      SESSIONS_MESSAGES_SNAPSHOT_METHOD, SESSIONS_MESSAGES_HYDRATE_METHOD,
+    ])
+    await lease.close()
+  })
+
+  it('retains a newer live questionnaire across late empty in-place hydration, then expires it at a newer snapshot', async () => {
+    const harness = makeHarness()
+    const lease = createV4SessionReadPort(harness.rpc).open(openRequest())
+    await lease.live
+    const scope = effectScope()
+    const events = createConversationEventsTestHarness()
+    const interruptState = ref<ReadonlyMap<string, InterruptViewState>>(new Map())
+    const approvals = scope.run(() => useChatApprovals({
+      approvalCenter: {
+        snapshot: vi.fn(async () => ({ pending: [], mode: 'prompt' as const })),
+        subscribe: vi.fn(() => ({ close: vi.fn() })),
+        subscribeAvailability: vi.fn(() => ({ close: vi.fn() })),
+      } as never,
+      conversationEvents: events.events,
+      clarificationSubmission: { submit: vi.fn() } as never,
+      sessionKey: ref('alpha'), interruptState,
+      runStatus: ref({ status: 'running', label: '', task: { task_id: 'task-1' } }),
+      stream: { isStreaming: ref(true), appendInterruptFrame: vi.fn(), ensureInterruptBubble: vi.fn() },
+    }))!
+    const unsubscribe = approvals.subscribe()
+    const applyMetadata = (metadata: SessionReadMetadata) => approvals.applyUserInputBootstrap({
+      sessionKey: metadata.sessionKey,
+      epoch: metadata.epoch,
+      streamSeq: metadata.pendingUserInputsCursor?.currentStreamSeq,
+      streamGeneration: metadata.pendingUserInputsCursor?.streamGeneration,
+      pendingUserInputs: [...metadata.pendingUserInputs],
+    })
+    const ask = (requestId: string, streamSeq: number) => events.emit({
+      kind: 'conversation', event: {
+        kind: 'known', semanticKind: 'tool-result',
+        payload: {
+          key: 'alpha', task_id: 'task-1', epoch: 3,
+          stream_generation: 'stream-1', stream_seq: streamSeq,
+          id: `call-${requestId}`, name: 'request_user_input',
+          approvalResult: {
+            kind: 'user_input', paused: true, request_id: requestId,
+            run_id: 'task-1', step: 'clarify',
+            clarify_schema: {
+              presentation: 'plan_questionnaire_v1',
+              fields: [{ name: 'scope', type: 'string', required: true, prompt: 'Which scope?' }],
+            },
+          },
+        },
+        meta: {}, sessionKey: 'alpha', taskId: 'task-1', turnId: null,
+        streamGeneration: 'stream-1', streamSeq, connectionSeq: null, generationEpoch: null,
+      },
+    } as ConversationEvent)
+    try {
+      ask('older-question', 10)
+      harness.results.set(SESSIONS_MESSAGES_SNAPSHOT_METHOD, snapshotResult({ current_stream_seq: 40 }))
+      const lateMetadata = deferred<SessionsMessagesHydrateResult>()
+      harness.results.set(SESSIONS_MESSAGES_HYDRATE_METHOD, lateMetadata.promise)
+      const recovery = lease.reconcile()
+      await flushAsyncWork()
+      expect(harness.calls[harness.calls.length - 1]?.method).toBe(SESSIONS_MESSAGES_HYDRATE_METHOD)
+
+      ask('newer-question', 41)
+      lateMetadata.resolve(hydrateResult({ pendingUserInputs: [], goalSnapshotStreamSeq: 77 }))
+      const recovered = await recovery
+      expect(recovered.initialMetadata.pendingUserInputsCursor).toEqual({
+        streamGeneration: 'stream-1', currentStreamSeq: 40,
+      })
+      expect(recovered.initialMetadata.goalSnapshotStreamSeq).toBe(77)
+      applyMetadata(recovered.initialMetadata)
+      expect(approvals.pendingClarify.value?.requestId).toBe('newer-question')
+      expect(interruptState.value.get('older-question')?.resolution).toBe('expired')
+      expect(interruptState.value.get('newer-question')?.resolution).not.toBe('expired')
+
+      harness.results.set(SESSIONS_MESSAGES_SNAPSHOT_METHOD, snapshotResult({ current_stream_seq: 42 }))
+      harness.results.set(SESSIONS_MESSAGES_HYDRATE_METHOD, hydrateResult({ pendingUserInputs: [] }))
+      applyMetadata((await lease.reconcile()).initialMetadata)
+      expect(approvals.pendingClarify.value).toBeNull()
+      expect(interruptState.value.get('newer-question')?.resolution).toBe('expired')
+      expect(harness.calls.filter(call => call.method === SESSIONS_MESSAGES_SUBSCRIBE_METHOD)).toHaveLength(1)
+      expect(harness.calls.filter(call => call.method === SESSIONS_MESSAGES_UNSUBSCRIBE_METHOD)).toHaveLength(0)
+    } finally {
+      unsubscribe()
+      scope.stop()
+      await lease.close()
+    }
+  })
+
+  it('retains the confirmed subscription lower bound when an older Gateway has no snapshot capability', async () => {
+    const harness = makeHarness()
+    harness.results.set(SESSIONS_MESSAGES_SNAPSHOT_METHOD, Object.assign(new Error('legacy Gateway'), {
+      code: 'METHOD_NOT_FOUND',
+    }))
+    const lease = createV4SessionReadPort(harness.rpc).open(openRequest())
+    await lease.live
+    try {
+      const recovered = await lease.reconcile()
+      expect(recovered.snapshot).toBeNull()
+      expect(recovered.initialMetadata.pendingUserInputsCursor).toEqual({
+        streamGeneration: 'stream-1', currentStreamSeq: 9,
+      })
+      expect(recovered.initialMetadata.goalSnapshotStreamSeq).toBe(6)
+      expect(harness.calls.filter(call => call.method === SESSIONS_MESSAGES_SUBSCRIBE_METHOD)).toHaveLength(1)
+    } finally {
+      await lease.close()
+    }
+  })
+
+  it('rejects original-lease reconciliation after a real connection generation change', async () => {
+    const harness = makeHarness()
+    const lease = createV4SessionReadPort(harness.rpc).open(openRequest())
+    await lease.live
+    harness.calls.length = 0
+    harness.setGeneration(8)
+    await expect(lease.reconcile()).rejects.toMatchObject({ kind: 'aborted' })
+    expect(harness.calls).toHaveLength(0)
+  })
+
+  it.each([
+    {
+      name: 'an empty canonical key',
+      wire: { key: '', sessionKey: 'alpha', stream_seq: 1 },
+      expected: { key: 'alpha', stream_seq: 1 },
+    },
+    {
+      name: 'conflicting legacy spellings',
+      wire: { key: 'alpha', sessionKey: 'other', stream_seq: 1, streamSeq: 2 },
+      expected: { key: 'alpha', stream_seq: 1 },
+    },
+    {
+      name: 'finite fractional cursors',
+      wire: { key: 'alpha', epoch: 1.5, stream_seq: 1.5 },
+      expected: { key: 'alpha', epoch: 1.5, stream_seq: 1.5 },
+    },
+    {
+      name: 'finite negative cursors',
+      wire: { key: 'alpha', epoch: -1, stream_seq: -1 },
+      expected: { key: 'alpha', epoch: -1, stream_seq: -1 },
+    },
+    {
+      name: 'a correctly typed legacy fallback',
+      wire: { key: 7, sessionKey: 'alpha', stream_seq: 'bad', streamSeq: 1 },
+      expected: { key: 'alpha', stream_seq: 1 },
+    },
+  ])('preserves snapshot compatibility for $name', async ({ wire, expected }) => {
+    const harness = makeHarness()
+    harness.results.set(SESSIONS_MESSAGES_SNAPSHOT_METHOD, snapshotResult({ events: [{
+      event: 'session.event.text_delta',
+      payload: { ...wire, text: 'visible content' },
+    }] }))
+    const lease = createV4SessionReadPort(harness.rpc).open(openRequest())
+    try {
+      const live = await lease.live
+      expect(live.snapshot?.events).toEqual([{
+        semanticKind: 'text-delta',
+        payload: { ...expected, text: 'visible content' },
+      }])
+    } finally {
+      await lease.close()
+    }
+  })
+
+  it.each([
+    { event: 'session.event.turn_committed', invalid: { schema_version: 2 } },
+    { event: 'session.event.turn_committed', invalid: { stream_seq: -1 } },
+    { event: 'session.event.turn_committed', invalid: { stream_seq: 1.5 } },
+    { event: 'session.event.turn_committed', invalid: { client_message_id: null } },
+    { event: 'session.event.turn_committed', invalid: { taskId: 'conflicting-task' } },
+  ])('rejects invalid external snapshot receipts through the event boundary: $invalid', async ({ event, invalid }) => {
+    const harness = makeHarness()
+    harness.results.set(SESSIONS_MESSAGES_SNAPSHOT_METHOD, snapshotResult({ events: [{ event, payload: {
+      schema_version: 1, session_key: 'alpha', task_id: 'task-1', turn_id: 'turn-1',
+      status: 'succeeded', terminal_reason: 'completed', finished_at: 123, stream_seq: 2,
+      ...invalid,
+    } }] }))
+    const lease = createV4SessionReadPort(harness.rpc).open(openRequest())
+    await expect(lease.live).rejects.toThrow()
+    await lease.close()
+  })
+
+  it('projects snapshot identity, terminal proof and authoritative empty resets once', async () => {
+    const harness = makeHarness()
+    harness.results.set(SESSIONS_MESSAGES_SNAPSHOT_METHOD, snapshotResult({ events: [
+      { event: 'session.event.error', payload: {
+        key: 'alpha', activeTask: { taskId: 'task-1', status: 'failed' },
+        streamGeneration: 'stream-1', streamSeq: 2, code: 'usage_accounting_busy',
+        usage_call_index: 1, no_prior_provider_dispatch: true, replay_safe: true,
+        user_message_id: 'user-1', turn_outcome: { kind: 'blocked', reason: 'usage_accounting_busy' },
+      } },
+      { event: 'session.event.answer_generation_reset', payload: {
+        key: 'alpha', task_id: 'task-1', old_generation_epoch: 1, new_generation_epoch: 2,
+        authoritative_text_snapshot: '', authoritativeTextSnapshot: 'stale',
+      } },
+      { event: 'session.event.future_snapshot_event', payload: { key: 'alpha', status: 'failed' } },
+    ] }))
+    const lease = createV4SessionReadPort(harness.rpc).open(openRequest())
+    const live = await lease.live
+    expect(live.snapshot?.events).toHaveLength(2)
+    expect(live.snapshot?.events[0]).toMatchObject({ semanticKind: 'turn-failed', payload: {
+      key: 'alpha', task_id: 'task-1', stream_generation: 'stream-1', stream_seq: 2,
+      terminalOutcome: { turnId: 'task-1', replaySafe: true, noPriorProviderDispatch: true, userMessageId: 'user-1' },
+    } })
+    expect(live.snapshot?.events[1]).toMatchObject({ semanticKind: 'answer-generation-reset', payload: { authoritative_text_snapshot: '' } })
+    await lease.close()
+  })
+
+  it('preserves the established retryability of coded and uncoded failures', () => {
+    expect(mapSessionReadError(Object.assign(new Error('invalid'), {
+      code: 'INVALID_REQUEST',
+    }))).toMatchObject({
+      kind: 'unavailable',
+      retryable: false,
+    } satisfies Partial<SessionReadFailure>)
+    expect(mapSessionReadError(new Error('connection recycled'))).toMatchObject({
+      kind: 'unavailable',
+      retryable: true,
+    } satisfies Partial<SessionReadFailure>)
+  })
+
   it('queues critical frames in order while live, metadata and history settle independently', async () => {
     const harness = makeHarness()
     const subscribe = deferred<SessionsMessagesSubscribeResult>()
@@ -293,13 +543,14 @@ describe('v4 SessionReadPort Adapter', () => {
       activeTaskId: 'task-snapshot',
       initialMetadata: {
         hydrationComplete: false,
+        pendingUserInputsCursor: { streamGeneration: 'stream-1', currentStreamSeq: 9 },
         projectWorkspace: { display_name: 'Workspace One' },
       },
       snapshot: {
         sessionKey: 'alpha',
         events: [{
           semanticKind: 'text-delta',
-          payload: { task_id: 'task-snapshot', text_delta: 'hello' },
+          payload: { task_id: 'task-snapshot', text: 'hello' },
         }],
       },
       cursor: {
@@ -313,10 +564,10 @@ describe('v4 SessionReadPort Adapter', () => {
     })
     const snapshotPayload = live.snapshot?.events[0]?.payload
     expect(snapshotPayload).toMatchObject({
-      opaque_payload: { snake_value: true },
+      input: { snake_value: true },
     })
     expect(Object.isFrozen(snapshotPayload)).toBe(true)
-    expect(Object.isFrozen(snapshotPayload?.opaque_payload)).toBe(true)
+    expect(Object.isFrozen(snapshotPayload?.input)).toBe(true)
     let metadataSettled = false
     let historySettled = false
     void lease.metadata.finally(() => { metadataSettled = true })
@@ -331,7 +582,10 @@ describe('v4 SessionReadPort Adapter', () => {
 
     hydrated.resolve(hydrateResult())
     history.resolve(historyResult())
-    await expect(lease.metadata).resolves.toMatchObject({ hydrationComplete: true })
+    await expect(lease.metadata).resolves.toMatchObject({
+      hydrationComplete: true,
+      pendingUserInputsCursor: { streamGeneration: 'stream-1', currentStreamSeq: 9 },
+    })
     await expect(firstHistory).resolves.toMatchObject({ loadedCount: 1 })
 
     await lease.close()
@@ -367,6 +621,7 @@ describe('v4 SessionReadPort Adapter', () => {
       lastTask: { task_id: 'task-0' },
       queuedTaskIds: ['task-2'],
       epoch: 3,
+      pendingUserInputsCursor: { streamGeneration: 'stream-1', currentStreamSeq: 9 },
       hydrationComplete: true,
       additional: { future_metadata: { snake_value: true } },
     })
@@ -388,7 +643,7 @@ describe('v4 SessionReadPort Adapter', () => {
         text: 'hello',
         createdAt: 1_725_199_200,
         reasoningContent: '  thinking exactly  ',
-        routerDecision: { selected_tier: 'c1' },
+        routerDecision: { tier: 'c1' },
         artifacts: [{ artifact_id: 'artifact-1' }],
         toolCalls: [{ tool_name: 'read' }],
         timeline: [{ segment_kind: 'thinking' }],
@@ -482,8 +737,14 @@ describe('v4 SessionReadPort Adapter', () => {
     }))
     const firstRetry = lease.retryMetadata()
     const secondRetry = lease.retryMetadata()
-    await expect(firstRetry).resolves.toMatchObject({ routing: { mode: 'manual' } })
-    await expect(secondRetry).resolves.toMatchObject({ routing: { mode: 'manual' } })
+    // Hydration has no stream cursor of its own. Retain the subscription's
+    // lower bound so an empty pending list cannot erase newer live questions.
+    const expectedMetadata = {
+      routing: { mode: 'manual' },
+      pendingUserInputsCursor: { streamGeneration: 'stream-1', currentStreamSeq: 9 },
+    }
+    await expect(firstRetry).resolves.toMatchObject(expectedMetadata)
+    await expect(secondRetry).resolves.toMatchObject(expectedMetadata)
     expect(harness.calls.filter(call => call.method === SESSIONS_MESSAGES_HYDRATE_METHOD))
       .toHaveLength(2)
     expect(harness.calls.filter(call => call.method === SESSIONS_MESSAGES_SUBSCRIBE_METHOD))
@@ -680,7 +941,10 @@ describe('v4 SessionReadPort Adapter', () => {
     ready.resolve(undefined)
 
     await expect(closing).resolves.toBeUndefined()
-    await expect(lease.live).rejects.toMatchObject({ name: 'AbortError' })
+    await expect(lease.live).rejects.toMatchObject({
+      name: 'SessionReadFailure',
+      kind: 'aborted',
+    })
     expect(harness.calls).toHaveLength(0)
   })
 
@@ -754,5 +1018,144 @@ describe('v4 SessionReadPort Adapter', () => {
     await replacedLease.close()
     expect(replaced.calls.some(call => call.method === SESSIONS_MESSAGES_UNSUBSCRIBE_METHOD))
       .toBe(false)
+  })
+})
+
+function deadlineHarness(options: {
+  delayedAck?: boolean
+  preSend?: boolean
+  abortOwner?: boolean
+  changeGeneration?: boolean
+  snapshotError?: string
+  rejectSubscribe?: boolean
+  replayGap?: boolean
+} = {}) {
+  const base = makeHarness()
+  const ack = deferred<SessionsMessagesSubscribeResult>()
+  const lateSnapshot = deferred<SessionsMessagesSnapshotResult>()
+  const controller = new AbortController()
+  let subscribed = false
+  const delivered: string[] = []
+  base.results.set(SESSIONS_MESSAGES_SUBSCRIBE_METHOD, subscribeResult({
+    ...(options.replayGap ? { replay_complete: false, replay_gap_reason: 'trimmed' } : {}),
+  }))
+  base.requestMock.mockImplementation((method, params, callOptions) => {
+    base.calls.push({ method, params, options: callOptions })
+    if (method === SESSIONS_MESSAGES_SNAPSHOT_METHOD && options.preSend) {
+      return Promise.reject(new RpcTimeoutError(method, callOptions!.timeoutMs!))
+    }
+    callOptions?.onSent?.(base.rpc.generation)
+    if (method === SESSIONS_MESSAGES_SUBSCRIBE_METHOD) {
+      if (options.rejectSubscribe) return Promise.reject(new Error('subscribe rejected'))
+      subscribed = true
+      return options.delayedAck ? ack.promise : Promise.resolve(base.results.get(method))
+    }
+    if (method === SESSIONS_MESSAGES_UNSUBSCRIBE_METHOD) {
+      subscribed = false
+      return Promise.resolve(null)
+    }
+    if (method === SESSIONS_MESSAGES_SNAPSHOT_METHOD) {
+      return new Promise((resolve, reject) => {
+        const timer = setTimeout(() => {
+          if (options.abortOwner) controller.abort()
+          if (options.changeGeneration) base.setGeneration(8)
+          reject(options.snapshotError
+            ? Object.assign(new Error('snapshot rejected'), { code: options.snapshotError })
+            : new RpcTimeoutError(method, callOptions!.timeoutMs!))
+        }, callOptions!.timeoutMs)
+        lateSnapshot.promise.then(value => { clearTimeout(timer); resolve(value) }, reject)
+      })
+    }
+    return Promise.resolve(base.results.get(method))
+  })
+  return {
+    ...base, ack, lateSnapshot, controller,
+    isSubscribed: () => subscribed,
+    emit(name: string) { if (subscribed) delivered.push(name) },
+    delivered,
+  }
+}
+
+afterEach(() => { vi.useRealTimers() })
+
+describe('sent snapshot deadline regression', () => {
+  it.each([false, true])('retains actual subscription after 3s snapshot deadline (ACK delayed=%s)', async delayedAck => {
+    vi.useFakeTimers()
+    const harness = deadlineHarness({ delayedAck })
+    const lifecycle = createSessionReadLifecycle({
+      port: createV4SessionReadPort(harness.rpc),
+      runtime: createConversationRuntime(),
+      subscriptions: createConversationSubscriptionLifecycle<SessionReadPortLease>(),
+    })
+    const lease = lifecycle.open({ sessionKey: 'alpha', includeInitialHistory: false })
+    const outcome = lease.live.then(value => ({ value }), error => ({ error }))
+    try {
+      await lease.criticalRequestsQueued
+      const request = harness.calls.find(call => call.method === SESSIONS_MESSAGES_SNAPSHOT_METHOD)
+      expect(request?.options).toMatchObject({ timeoutMs: 3000, timeoutAction: 'reject', abortAction: 'reject', expectedGeneration: 7 })
+      await vi.advanceTimersByTimeAsync(2999)
+      expect(harness.isSubscribed()).toBe(true)
+      await vi.advanceTimersByTimeAsync(1)
+      expect(harness.isSubscribed(), 'a request-local snapshot deadline must not unregister the acknowledged stream').toBe(true)
+      await vi.advanceTimersByTimeAsync(4630)
+      harness.ack.resolve(subscribeResult())
+      await vi.advanceTimersByTimeAsync(0)
+      const result = await outcome
+      expect(result).toMatchObject({ value: { snapshot: null, sessionKey: 'alpha', activeTaskId: 'task-1' } })
+      expect(lifecycle.current()).toBe(lease)
+      harness.lateSnapshot.resolve(snapshotResult({ current_stream_seq: 900 }))
+      await vi.advanceTimersByTimeAsync(0)
+      expect(await lease.live).toMatchObject({ snapshot: null })
+      // Only server-delivered tick/terminal names are synthetic; the actual
+      // Port and lifecycle own the live registration and close decision.
+      harness.emit('tick')
+      await vi.advanceTimersByTimeAsync(600_000)
+      harness.emit('session.event.done')
+      harness.emit('session.event.turn_committed')
+      expect(harness.delivered).toEqual(['tick', 'session.event.done', 'session.event.turn_committed'])
+      expect(harness.calls.filter(call => call.method === SESSIONS_MESSAGES_SUBSCRIBE_METHOD)).toHaveLength(1)
+      expect(harness.calls.filter(call => call.method === SESSIONS_MESSAGES_UNSUBSCRIBE_METHOD)).toHaveLength(0)
+    } finally { await lease.close() }
+    expect(harness.isSubscribed()).toBe(false)
+  })
+
+  it('retains incomplete replay as a required history recovery without inventing a snapshot watermark', async () => {
+    vi.useFakeTimers()
+    const harness = deadlineHarness({ replayGap: true })
+    const lifecycle = createSessionReadLifecycle({
+      port: createV4SessionReadPort(harness.rpc),
+      runtime: createConversationRuntime(),
+      subscriptions: createConversationSubscriptionLifecycle<SessionReadPortLease>(),
+    })
+    const lease = lifecycle.open({ sessionKey: 'alpha', includeInitialHistory: false })
+    const outcome = lease.live.then(value => ({ value }), error => ({ error }))
+    try {
+      await lease.criticalRequestsQueued
+      await vi.advanceTimersByTimeAsync(3000)
+      expect(await outcome).toMatchObject({ value: { snapshot: null, reloadRequired: 'replayGap' } })
+      expect(harness.isSubscribed()).toBe(true)
+      expect(await lease.history.latest()).toMatchObject({ messages: [{ id: '41', messageId: 'message-1' }] })
+    } finally { await lease.close() }
+  })
+
+  it.each<{ name: string; options: NonNullable<Parameters<typeof deadlineHarness>[0]> }>([
+    { name: 'not actually sent', options: { preSend: true } },
+    { name: 'owner aborted', options: { abortOwner: true } },
+    { name: 'generation changed', options: { changeGeneration: true } },
+    { name: 'session missing', options: { snapshotError: 'SESSION_NOT_FOUND' } },
+    { name: 'subscribe rejected', options: { rejectSubscribe: true } },
+  ])('fails closed when $name', async ({ options }) => {
+    vi.useFakeTimers()
+    const harness = deadlineHarness(options)
+    const lease = createV4SessionReadPort(harness.rpc).open(openRequest(harness.controller.signal, false))
+    const outcome = lease.live.then(value => ({ value }), error => ({ error }))
+    const admitted = lease.criticalRequestsQueued.then(() => ({ ready: true }), error => ({ error }))
+    const metadata = lease.metadata.then(value => ({ value }), error => ({ error }))
+    try {
+      await vi.advanceTimersByTimeAsync(3000)
+      expect(await outcome).toHaveProperty('error')
+      if (options.preSend) expect(await admitted).toHaveProperty('error')
+      if (options.rejectSubscribe) expect(await metadata).toHaveProperty('error')
+    } finally { await lease.close() }
   })
 })

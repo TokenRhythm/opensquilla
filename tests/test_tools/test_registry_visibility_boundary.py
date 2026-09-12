@@ -33,7 +33,7 @@ async def _handler() -> str:
 def _registered_tool(
     name: str,
     *,
-    exposed_by_default: bool = True,
+    default_access: str = "allow",
     owner_only: bool = False,
 ) -> RegisteredTool:
     return RegisteredTool(
@@ -41,7 +41,7 @@ def _registered_tool(
             name=name,
             description=f"{name} tool",
             parameters={},
-            exposed_by_default=exposed_by_default,
+            default_access=default_access,
             owner_only=owner_only,
         ),
         handler=_handler,
@@ -149,7 +149,7 @@ def test_visibility_boundary_preserves_context_visibility_rules() -> None:
     tools = [
         _registered_tool("visible"),
         _registered_tool("owner_only", owner_only=True),
-        _registered_tool("hidden", exposed_by_default=False),
+        _registered_tool("hidden", default_access="deny"),
     ]
     ctx = ToolContext(
         is_owner=False,

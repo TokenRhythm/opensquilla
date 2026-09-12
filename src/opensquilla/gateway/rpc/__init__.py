@@ -45,17 +45,14 @@ __all__ = [
 ]
 
 # Import sibling submodules to trigger handler registration against the
-# module-level singleton. The import surface intentionally omits the deprecated
-# product RPC methods listed in ``REMOVED_PRODUCT_METHODS`` in
-# tests/test_gateway/test_rpc_extended.py. These methods MUST NOT register
-# handlers at boot — the release surface is contracted to reject them with
-# METHOD_NOT_FOUND.
+# module-level singleton. Retired methods are intentionally absent from these
+# modules, so the release surface rejects them with METHOD_NOT_FOUND.
 import opensquilla.gateway.rpc_agents  # noqa: E402, F401
 import opensquilla.gateway.rpc_approvals  # noqa: E402, F401
 import opensquilla.gateway.rpc_artifact_editing  # noqa: E402, F401
 import opensquilla.gateway.rpc_artifacts  # noqa: E402, F401
 import opensquilla.gateway.rpc_channels  # noqa: E402, F401
-import opensquilla.gateway.rpc_chat  # noqa: E402, F401
+import opensquilla.gateway.rpc_chat as _rpc_chat  # noqa: E402
 import opensquilla.gateway.rpc_commands  # noqa: E402, F401
 import opensquilla.gateway.rpc_config  # noqa: E402, F401
 import opensquilla.gateway.rpc_cron  # noqa: E402, F401
@@ -75,16 +72,23 @@ import opensquilla.gateway.rpc_proposals  # noqa: E402, F401
 import opensquilla.gateway.rpc_router  # noqa: E402, F401
 import opensquilla.gateway.rpc_routing  # noqa: E402, F401
 import opensquilla.gateway.rpc_sandbox  # noqa: E402, F401
-import opensquilla.gateway.rpc_secrets  # noqa: E402, F401
-import opensquilla.gateway.rpc_sessions  # noqa: E402, F401
+import opensquilla.gateway.rpc_sessions as _rpc_sessions  # noqa: E402
 import opensquilla.gateway.rpc_skills  # noqa: E402, F401
 import opensquilla.gateway.rpc_system  # noqa: E402, F401
 import opensquilla.gateway.rpc_telemetry  # noqa: E402, F401
 import opensquilla.gateway.rpc_tools  # noqa: E402, F401
+import opensquilla.gateway.rpc_transport  # noqa: E402, F401
 import opensquilla.gateway.rpc_usage  # noqa: E402, F401
 import opensquilla.gateway.rpc_wizard  # noqa: E402, F401
 import opensquilla.gateway.rpc_workbench_resources  # noqa: E402, F401
 import opensquilla.gateway.rpc_workspaces  # noqa: E402, F401
+
+# The TurnAdmission Application is composed once, after both transport modules
+# are loaded.  This fixed-semantic binding avoids either RPC module importing
+# or invoking the other's handler while preserving their public wire names.
+_rpc_chat.bind_turn_admission_adapter_factory(
+    _rpc_sessions.build_gateway_turn_admission_adapter
+)
 
 # Fail fast if any registered handler disagrees with ``gateway.scopes``.
 validate_classification()

@@ -1,4 +1,5 @@
 import { expect, test, type Page } from '@playwright/test'
+import { helloOkResponse } from './support/gateway-fixture'
 
 const CONTROL_URL = '/control/chat?session='
 const SESSION_KEY = 'agent:main:webchat:e2e-session-routing-image'
@@ -65,9 +66,7 @@ async function installGateway(page: Page) {
       const method = String(frame.method || '')
       methods.push(method)
       if (method === 'connect') {
-        ws.send(JSON.stringify({
-          type: 'hello-ok',
-          protocol: 3,
+        ws.send(helloOkResponse({
           server: { version: 'e2e', conn_id: 'session-routing-image-gateway' },
           features: {
             methods: [
@@ -139,7 +138,7 @@ async function installGateway(page: Page) {
           capabilities_by_mode: CAPABILITIES_BY_MODE,
         },
         'onboarding.status': { audioConfigured: false },
-        'sessions.list': { sessions: [], has_more: false },
+        'sessions.list': { sessions: [], count: 0, ts: 1_800_000_000, has_more: false },
         'sessions.messages.snapshot': {
           key: SESSION_KEY,
           events: [],

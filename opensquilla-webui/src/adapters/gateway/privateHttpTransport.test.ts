@@ -95,6 +95,24 @@ describe('private Gateway HTTP transport', () => {
     expect(await blob.text()).toBe('archive-bytes')
   })
 
+  it('forwards the typed keepalive policy for lease cleanup', async () => {
+    const fetchMock = vi.fn(async (
+      _input: RequestInfo | URL,
+      _init?: RequestInit,
+    ) => new Response(null, { status: 204 }))
+    const transport = createPrivateHttpTransport({
+      baseUrl: 'https://control.example/',
+      fetch: fetchMock,
+    })
+
+    await transport.requestBlob('/api/v1/artifact-preview-leases/lease-1', {
+      method: 'DELETE',
+      keepalive: true,
+    })
+
+    expect(requestInit(fetchMock).keepalive).toBe(true)
+  })
+
   it('exposes sanitized binary metadata and a one-shot body', async () => {
     const transport = createPrivateHttpTransport({
       baseUrl: 'https://control.example/',
@@ -122,6 +140,23 @@ describe('private Gateway HTTP transport', () => {
     expect(stream).toBeInstanceOf(ReadableStream)
     expect(await new Response(stream).text()).toBe('streamed-bytes')
     await expect(binary.blob()).rejects.toMatchObject({ kind: 'decode' })
+  })
+
+  it('allows the blob fallback after a binary response reports no stream', async () => {
+    const transport = createPrivateHttpTransport({
+      baseUrl: 'https://control.example/',
+      fetch: vi.fn(async () => new Response(null, {
+        headers: { 'content-type': 'application/octet-stream' },
+      })),
+    })
+
+    const binary = await transport.requestBinary('/api/empty')
+
+    expect(binary.stream()).toBeNull()
+    await expect(binary.blob()).resolves.toMatchObject({
+      size: 0,
+      type: 'application/octet-stream',
+    })
   })
 
   it('parses RFC5987 filenames and neutralizes Windows path hazards', async () => {
@@ -746,6 +781,137 @@ describe('private Gateway HTTP transport', () => {
       })
     }
     expect(fetchMock).not.toHaveBeenCalled()
+  })
+
+  it('clears only the fixed preview-origin storage endpoint without credentials', async () => {
+    const fetchMock = vi.fn(async (
+      _input: RequestInfo | URL,
+      _init?: RequestInit,
+    ) => new Response(null, { status: 204 }))
+    const transport = createPrivateHttpTransport({
+      baseUrl: 'http://127.0.0.1:18791/',
+      authToken: () => 'must-not-be-sent',
+      fetch: fetchMock,
+    })
+    const previewOrigin =
+      'http://p-0123456789abcdef0123456789abcdef.localhost:48721'
+
+    await transport.clearPreviewOrigin(previewOrigin)
+
+    expect(String(fetchMock.mock.calls[0]?.[0])).toBe(
+      `${previewOrigin}/.opensquilla/clear-site-data`,
+    )
+    const init = requestInit(fetchMock)
+    expect(init).toMatchObject({
+      method: 'GET',
+      cache: 'no-store',
+      credentials: 'omit',
+      keepalive: true,
+      mode: 'no-cors',
+      redirect: 'error',
+      referrerPolicy: 'no-referrer',
+    })
+    expect(init.headers).toBeUndefined()
+    expect(init.body).toBeUndefined()
+    expect(init.signal).toBeInstanceOf(AbortSignal)
+  })
+
+  it.each([
+    'https://p-0123456789abcdef0123456789abcdef.localhost:48721',
+    'http://p-0123456789abcdef0123456789abcdef.localhost',
+    'http://p-0123456789abcdef0123456789abcdef.localhost:48721/',
+    'http://P-0123456789ABCDEF0123456789ABCDEF.localhost:48721',
+    'http://p-short.localhost:48721',
+    'http://localhost:48721',
+    'http://p-0123456789abcdef0123456789abcdef.localhost:48721/path',
+    'http://p-0123456789abcdef0123456789abcdef.localhost:48721?query=1',
+    'http://p-0123456789abcdef0123456789abcdef.localhost:48721#fragment',
+    'http://user:pass@p-0123456789abcdef0123456789abcdef.localhost:48721',
+    'http://p-0123456789abcdef0123456789abcdef.localhost:48721.evil.test',
+  ])('rejects a non-canonical preview cleanup origin before fetch: %s', async (origin) => {
+    const fetchMock = vi.fn()
+    const transport = createPrivateHttpTransport({
+      baseUrl: 'http://127.0.0.1:18791/',
+      fetch: fetchMock,
+    })
+
+    await expect(transport.clearPreviewOrigin(origin)).rejects.toMatchObject({
+      kind: 'invalid-endpoint',
+    })
+    expect(fetchMock).not.toHaveBeenCalled()
+  })
+
+  it('fetches an external artifact as credential-free binary data', async () => {
+    const fetchMock = vi.fn(async (
+      _input: RequestInfo | URL,
+      _init?: RequestInit,
+    ) => new Response('external-bytes', {
+      headers: { 'content-type': 'application/octet-stream' },
+    }))
+    const authToken = vi.fn(() => 'must-not-be-sent')
+    const transport = createPrivateHttpTransport({
+      baseUrl: 'http://127.0.0.1:18791/',
+      authToken,
+      fetch: fetchMock,
+    })
+    const endpoint = 'https://files.example.test/artifacts/report.bin?signature=fixture'
+
+    const response = await transport.fetchExternalArtifact(endpoint)
+
+    expect(String(fetchMock.mock.calls[0]?.[0])).toBe(endpoint)
+    const init = requestInit(fetchMock)
+    expect(init.method).toBe('GET')
+    expect(init.credentials).toBe('omit')
+    expect(init.redirect).toBe('error')
+    expect(init.body).toBeUndefined()
+    expect(init.headers).toBeUndefined()
+    expect(authToken).not.toHaveBeenCalled()
+    expect(await response.blob().then(blob => blob.text())).toBe('external-bytes')
+  })
+
+  it.each([
+    '/api/v1/artifacts/report',
+    'http://127.0.0.1:18791/api/v1/artifacts/report',
+    'https://user:pass@files.example.test/report',
+    'file:///etc/passwd',
+    'data:text/plain,secret',
+    'blob:https://files.example.test/id',
+    'javascript:alert(1)',
+  ])('holds the external artifact SSRF boundary before fetch: %s', async (endpoint) => {
+    const fetchMock = vi.fn()
+    const transport = createPrivateHttpTransport({
+      baseUrl: 'http://127.0.0.1:18791/',
+      fetch: fetchMock,
+    })
+
+    await expect(transport.fetchExternalArtifact(endpoint)).rejects.toMatchObject({
+      kind: 'invalid-endpoint',
+    })
+    expect(fetchMock).not.toHaveBeenCalled()
+  })
+
+  it('maps caller cancellation of an external artifact fetch to the stable abort error', async () => {
+    const fetchMock = vi.fn((_input: RequestInfo | URL, init?: RequestInit) => (
+      new Promise<Response>((_resolve, reject) => {
+        init?.signal?.addEventListener('abort', () => {
+          reject(new DOMException('aborted', 'AbortError'))
+        }, { once: true })
+      })
+    ))
+    const transport = createPrivateHttpTransport({
+      baseUrl: 'http://127.0.0.1:18791/',
+      fetch: fetchMock,
+    })
+    const controller = new AbortController()
+
+    const pending = transport.fetchExternalArtifact(
+      'https://files.example.test/report.bin',
+      controller.signal,
+    )
+    await Promise.resolve()
+    controller.abort('route-left')
+
+    await expect(pending).rejects.toMatchObject({ kind: 'aborted' })
   })
 
   it('maps an ordinary fetch rejection to a network error', async () => {

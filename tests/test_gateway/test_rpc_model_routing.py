@@ -377,7 +377,7 @@ def test_model_routing_snapshot_exposes_direct_image_admission(
     snapshot = model_routing_snapshot(config)
 
     assert snapshot["image_input"] == {
-        "admission": "blocked",
+        "admission": "allowed",
         "reason": "model_vision_unsupported",
     }
     assert "api_key" not in str(snapshot)
@@ -448,7 +448,7 @@ def test_model_routing_public_snapshot_exposes_complete_capability_matrix(
         },
         "ensemble": {
             "image_input": {
-                "admission": "blocked",
+                "admission": "allowed",
                 "reason": "ensemble_mode_unsupported",
             }
         },
@@ -523,7 +523,7 @@ def test_model_routing_capability_projection_isolates_one_mode_failure(
         "unknown",
     }
     assert capabilities["ensemble"]["image_input"] == {
-        "admission": "blocked",
+        "admission": "allowed",
         "reason": "ensemble_mode_unsupported",
     }
 
@@ -536,19 +536,19 @@ def test_model_routing_capability_projection_isolates_one_mode_failure(
             "supported",
             {
                 "admission": "allowed",
-                "reason": "router_image_route_available",
+                "reason": "router_image_route_unavailable",
             },
         ),
         (
-            {"image_model": {"model": "text-only-model", "supports_image": True}},
+            {"c0": {"model": "text-only-model"}},
             "unsupported",
             {
-                "admission": "blocked",
-                "reason": "model_vision_unsupported",
+                "admission": "allowed",
+                "reason": "router_image_route_unavailable",
             },
         ),
         (
-            {"image_model": {"model": "unlisted-model", "supports_image": True}},
+            {"c0": {"model": "unlisted-model"}},
             "unknown",
             {
                 "admission": "unknown",
@@ -556,11 +556,30 @@ def test_model_routing_capability_projection_isolates_one_mode_failure(
             },
         ),
         (
-            {"image_model": {"model": "", "supports_image": True}},
+            {"c0": {"model": "declared-vision", "supports_image": True}},
+            "unsupported",
+            {
+                "admission": "allowed",
+                "reason": "router_image_route_unavailable",
+            },
+        ),
+        (
+            {"c0": {"model": "text-only-model", "supports_image": False}},
             "supported",
             {
-                "admission": "blocked",
-                "reason": "router_image_route_unavailable",
+                "admission": "allowed",
+                "reason": "router_image_route_available",
+            },
+        ),
+        (
+            {
+                "c0": {"model": "unknown-model"},
+                "c1": {"model": "declared-vision", "supports_image": True},
+            },
+            "unknown",
+            {
+                "admission": "unknown",
+                "reason": "capability_unknown",
             },
         ),
     ],
@@ -593,6 +612,56 @@ def test_model_routing_snapshot_applies_image_route_in_observe(
 
     assert snapshot["mode"] == "direct"
     assert snapshot["image_input"] == expected
+
+
+def test_model_routing_snapshot_preserves_unknown_direct_image_admission(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _Catalog:
+        def resolve_deployment_vision_support(self, *args: Any, **kwargs: Any) -> str:
+            del args, kwargs
+            return "unknown"
+
+    monkeypatch.setattr(
+        "opensquilla.provider.model_catalog.shared_catalog",
+        lambda: _Catalog(),
+    )
+    config = GatewayConfig(
+        llm={"provider": "custom", "model": "unlisted"},
+        squilla_router={"enabled": False, "rollout_phase": "observe"},
+        llm_ensemble={"enabled": False},
+    )
+
+    assert model_routing_snapshot(config)["image_input"] == {
+        "admission": "unknown",
+        "reason": "capability_unknown",
+    }
+
+
+@pytest.mark.parametrize(
+    ("selection_mode", "router_enabled"),
+    [
+        ("static_openrouter_b5", False),
+        ("static_tokenrhythm_b5", False),
+        ("router_dynamic", True),
+    ],
+)
+def test_model_routing_snapshot_allows_ensemble_images_for_marker_degradation(
+    selection_mode: str,
+    router_enabled: bool,
+) -> None:
+    config = GatewayConfig(
+        squilla_router={"enabled": router_enabled, "rollout_phase": "full"},
+        llm_ensemble={"enabled": True, "selection_mode": selection_mode},
+    )
+
+    snapshot = model_routing_snapshot(config)
+
+    assert snapshot["mode"] == "ensemble"
+    assert snapshot["image_input"] == {
+        "admission": "allowed",
+        "reason": "ensemble_mode_unsupported",
+    }
 
 
 @pytest.mark.parametrize(
@@ -634,6 +703,44 @@ async def test_models_routing_set_persists_and_returns_canonical_snapshot(tmp_pa
     assert model_routing_snapshot(reloaded)["mode"] == "direct"
     persisted = tomllib.loads(path.read_text())
     assert persisted["squilla_router"]["enabled"] is False
+
+
+async def test_models_routing_set_persist_failure_never_reconciles_live_runtime(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = GatewayConfig(
+        config_path=str(tmp_path / "routing-failure.toml"),
+        llm_ensemble={"enabled": False},
+        squilla_router={"enabled": False, "rollout_phase": "observe"},
+    )
+    selector_calls: list[Any] = []
+    media_calls: list[Any] = []
+    selector = SimpleNamespace(sync_primary=lambda value: selector_calls.append(value))
+    ctx = RpcContext(
+        conn_id="routing-persist-failure",
+        config=config,
+        provider_selector=selector,
+    )
+
+    def fail_persist(*_args: Any, **_kwargs: Any) -> None:
+        raise OSError("synthetic disk failure")
+
+    monkeypatch.setattr(
+        "opensquilla.onboarding.config_store.persist_config",
+        fail_persist,
+    )
+    monkeypatch.setattr(
+        "opensquilla.gateway.adapters.provider_configuration.sync_media_runtime",
+        lambda value: media_calls.append(value),
+    )
+
+    with pytest.raises(OSError, match="synthetic disk failure"):
+        await _handle_models_routing_set({"mode": "router"}, ctx)
+
+    assert model_routing_snapshot(config)["mode"] == "direct"
+    assert selector_calls == []
+    assert media_calls == []
 
 
 async def test_models_routing_set_first_tokenrhythm_activation_persists_plan(
@@ -934,16 +1041,17 @@ async def test_inactive_router_capability_change_broadcasts_public_snapshot(
             "enabled": False,
             "rollout_phase": "observe",
             "tiers": {
-                "c1": {"model": "router-text", "supports_image": True},
+                "c1": {"model": "router-text"},
             },
         },
     )
     ctx, events = _routing_event_ctx(config, monkeypatch)
     before = model_routing_public_snapshot(config)
     assert before["mode"] == "ensemble"
-    assert before["capabilities_by_mode"]["router"]["image_input"][
-        "admission"
-    ] == "blocked"
+    assert before["capabilities_by_mode"]["router"]["image_input"] == {
+        "admission": "allowed",
+        "reason": "router_image_route_unavailable",
+    }
 
     response = await _handle_config_patch(
         {"patches": {"squilla_router.tiers.c1.model": "router-vision"}},

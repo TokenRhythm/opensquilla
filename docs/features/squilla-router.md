@@ -78,10 +78,22 @@ Packaged static B5 lineups use a 120-second total budget per proposer and a
 180-second aggregator idle budget. Operator-authored `custom_b5` lineups use
 300 and 480 seconds respectively unless explicitly configured otherwise.
 
-C3 fusion itself is excluded from image routing, but the dedicated
-`image_model` tier remains eligible and is preferred for image requests. If it
-is unavailable, another non-C3 tier with `supports_image = true` may handle the
-request.
+Image routing considers only the configured C0–C3 single-model deployments;
+C3 fusion is excluded. Image input capability is resolved automatically from
+the shared provider model catalog, including API-provided deployment metadata
+and offline catalog fallback. The web and desktop clients do not expose a
+manual image-capability switch. Legacy tier `supports_image` values remain
+readable but do not override the deployment's capability, and `image_model`
+is retained for compatibility without creating an executable fifth route.
+
+When capability is unknown, the configured model may receive a native image
+request. A recognized image-input rejection can advance through the remaining
+configured tiers before falling back to explicit not-analyzed/analysis-failed
+text markers. Direct retries only its configured model with markers; Ensemble
+uses text markers for all members. These retries stop after visible output or
+tool effects. Projection never deletes the canonical attachment, so switching
+back to a vision-capable model can recover earlier images after history
+compression.
 
 Disable routing and use the configured provider/model directly:
 
@@ -213,4 +225,4 @@ If routing does not appear to work:
 
 ---
 
-[Docs index](../README.md) · [Product guide](../../README.product.md) · [Improve this page](../contributing-docs.md) · [Report a docs issue](https://github.com/opensquilla/opensquilla/issues/new?template=docs_report.yml)
+[Docs index](../README.md) · [Product guide](../../README.product.md) · [Improve this page](../contributing-docs.md) · [Report a docs issue](https://github.com/TokenRhythm/opensquilla/issues/new?template=docs_report.yml)

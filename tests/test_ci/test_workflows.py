@@ -37,9 +37,75 @@ def _workflow_texts() -> list[str]:
     return [path.read_text(encoding="utf-8") for path in WORKFLOW_DIR.glob("*.yml")]
 
 
-def _is_windows_wsl_bash(path: str) -> bool:
+def test_partial_queue_wiring_preserves_canary_gate_and_does_not_mint_root_evidence() -> None:
+    jobs = _workflow("ci.yml")["jobs"]
+    assert "outputs.partial == 'true'" in jobs["main-canary"]["if"]
+    plan = next(s for s in jobs["plan-ci"]["steps"] if s.get("id") == "plan")
+    assert "needs.queue-attestation.result == 'success'" in plan["env"]["QUEUE_PARTIAL"]
+    assert "CI_OPTIMIZATION_MODE == 'enforce'" in plan["env"]["QUEUE_PARTIAL"]
+    steps = jobs["ci-result"]["steps"]
+    gate = next(s for s in steps if s.get("name") == "Check required CI results")
+    assert gate["env"]["QUEUE_CANARY_RESULT"] == "${{ needs.main-canary.result }}"
+    assert gate["env"]["QUEUE_EVIDENCE_RESULT"] == "${{ needs.queue-attestation.result }}"
+    evidence_step = next(s for s in steps if s.get("id") == "attestation")
+    assert "outputs.partial != 'true'" in evidence_step["if"]
+    assert "outputs.partial" not in next(
+        s for s in steps if s.get("name") == "Accept verified queue or main fast path"
+    )["if"]
+
+
+@pytest.mark.parametrize("scenario", ["failure", "duplicate", "foreign", "bad-branch"])
+def test_queue_feedback_reports_metadata_without_executing_candidate_code(
+    tmp_path: Path, scenario: str,
+) -> None:
+    workflow = _workflow("queue-feedback.yml")
+    assert workflow["on"]["workflow_run"]["types"] == ["completed"]
+    job = workflow["jobs"]["report"]
+    assert "merge_group" in job["if"]
+    assert len(job["steps"]) == 1
+    assert job["permissions"] == {"actions": "read", "pull-requests": "write"}
+    script = job["steps"][0]["with"]["script"]
+    wrapper = r'''
+const scenario = process.argv[2];
+const run = {id: 123, run_attempt: 1, repository: {full_name: 'owner/repo'},
+  head_repository: {full_name: 'owner/repo'}, path: '.github/workflows/ci.yml',
+  status: 'completed', conclusion: 'failure', head_sha: 'b'.repeat(40),
+  head_branch: 'gh-readonly-queue/main/pr-42-' + 'a'.repeat(40), html_url: 'https://example/run'};
+if (scenario === 'foreign') run.head_repository.full_name = 'attacker/repo';
+if (scenario === 'bad-branch') run.head_branch = 'feature/pr-42';
+const context = {repo: {owner: 'owner', repo: 'repo'}, payload: {workflow_run: run}};
+const sent = [];
+const github = {rest: {
+  pulls: {get: async () => ({data: {base: {ref: 'main'}}})},
+  actions: {listJobsForWorkflowRun: 'jobs'}, issues: {listComments: 'comments',
+    createComment: async value => sent.push(value)}},
+  paginate: async api => api === 'jobs'
+    ? [{name: 'Windows tests', conclusion: 'failure', html_url: 'https://example/job'}]
+    : scenario === 'duplicate'
+      ? [{user: {type: 'Bot'}, body: '<!-- opensquilla-queue-result:123:1 -->'}] : []};
+'''
+    program = tmp_path / "feedback.cjs"
+    program.write_text(
+        wrapper + "\n(async () => {\n" + script
+        + "\n})().then(() => console.log(JSON.stringify(sent)));\n", encoding="utf-8",
+    )
+    result = subprocess.run(
+        ["node", str(program), scenario], capture_output=True, text=True, check=True,
+    )
+    sent = json.loads(result.stdout)
+    if scenario == "failure":
+        assert len(sent) == 1 and sent[0]["issue_number"] == 42
+        assert "Windows tests" in sent[0]["body"] and "https://example/job" in sent[0]["body"]
+        assert "not necessarily the PR's current head" in sent[0]["body"]
+    else:
+        assert sent == []
+
+
+def _is_windows_bash_alias(path: str) -> bool:
     normalized = path.replace("\\", "/").lower()
-    return normalized.endswith("/windows/system32/bash.exe")
+    return normalized.endswith(
+        ("/windows/system32/bash.exe", "/microsoft/windowsapps/bash.exe")
+    )
 
 
 def _bash_executable(
@@ -53,20 +119,14 @@ def _bash_executable(
     if os_name != "nt":
         return found or "bash"
 
-    candidates: list[Path] = []
-    if found and not _is_windows_wsl_bash(found):
+    git_root = Path(program_files or os.environ.get("ProgramFiles", r"C:\Program Files")) / "Git"
+    # PATH can resolve a Windows launcher even when Git Bash is installed.
+    candidates = [git_root / "bin" / "bash.exe", git_root / "usr" / "bin" / "bash.exe"]
+    if found:
         candidates.append(Path(found))
 
-    git_root = Path(program_files or os.environ.get("ProgramFiles", r"C:\Program Files")) / "Git"
-    candidates.extend(
-        [
-            git_root / "bin" / "bash.exe",
-            git_root / "usr" / "bin" / "bash.exe",
-        ]
-    )
-
     for candidate in candidates:
-        if exists(candidate):
+        if not _is_windows_bash_alias(str(candidate)) and exists(candidate):
             return str(candidate)
 
     raise AssertionError("Git Bash is required to run CI shell contracts on Windows")
@@ -342,9 +402,7 @@ def test_ci_fast_paths_keep_the_required_check_and_fail_closed() -> None:
     assert "fetch-depth" in str(jobs["queue-attestation"])
     assert "verify-queue" in str(jobs["queue-attestation"])
     assert "reason_code" in str(jobs["queue-attestation"])
-    assert jobs["queue-attestation"]["outputs"]["combined_smoke_suites"] == (
-        "${{ steps.verify.outputs.combined_smoke_suites || '[]' }}"
-    )
+    assert "combined_smoke_suites" not in jobs["queue-attestation"]["outputs"]
     assert not any(
         name.startswith("nightly_") for name in jobs["queue-attestation"]["outputs"]
     )
@@ -541,7 +599,13 @@ def test_skill_hub_contract_is_integrated_into_canonical_ci() -> None:
         "tests/test_skills_manifest.py",
         "tests/test_skills_bundled_baseline.py",
         "tests/test_skills_hot_reload.py",
-        "tests/test_skills_default_prompt_contract.py",
+        "tests/test_skill_catalog_projection.py",
+        "tests/test_gateway/test_meta_catalog_compatibility.py",
+        "tests/test_gateway/test_rpc_commands.py",
+        "tests/test_migration/test_legacy_config_fixtures.py",
+        "tests/test_skills/test_catalog_upgrade_retirement.py",
+        "tests/test_skills/test_sop_compiler.py",
+        "tests/unit/cli/tui/test_opentui_completion_catalog.py",
         "tests/test_skills_loader_namespaces.py",
         "tests/test_skills_tree.py",
         "tests/test_skills_hub_archive.py",
@@ -1015,9 +1079,15 @@ def test_pr_target_branch_workflow_runs_trusted_base_validator() -> None:
     assert "Validate target branch" in text
     assert job["name"] == "Validate target branch"
     assert job["timeout-minutes"] == 5
-    assert "github.event.repository.default_branch" in text
-    assert "hashFiles('.github/scripts/validate-pr-target-branch.sh') == ''" in text
-    assert "github.event.pull_request.head.sha" in text
+    checkouts = [
+        step for step in job["steps"] if step.get("uses") == "actions/checkout@v4"
+    ]
+    assert len(checkouts) == 1
+    assert "if" not in checkouts[0]
+    assert checkouts[0]["with"] == {
+        "ref": "${{ github.event.repository.default_branch }}",
+        "persist-credentials": False,
+    }
     assert "github.event.merge_group.base_ref" in text
     assert "github.event.merge_group.head_ref" in text
     assert "pull-requests: read" in text
@@ -1041,13 +1111,20 @@ def test_pr_target_validator_accepts_merge_group_base_ref(tmp_path: Path) -> Non
 def test_pr_body_lint_workflow_warns_from_trusted_base() -> None:
     data = _workflow("pr-body-lint.yml")
     text = (WORKFLOW_DIR / "pr-body-lint.yml").read_text(encoding="utf-8")
+    job = data["jobs"]["validate-body"]
 
     assert _trigger_keys(data) == {"pull_request"}
     assert "pull_request_target" not in text
     assert "Validate PR body fields" in text
-    assert "github.event.repository.default_branch" in text
-    assert "hashFiles('.github/scripts/validate_pr_body.py') == ''" in text
-    assert "github.event.pull_request.head.sha" in text
+    checkouts = [
+        step for step in job["steps"] if step.get("uses") == "actions/checkout@v4"
+    ]
+    assert len(checkouts) == 1
+    assert "if" not in checkouts[0]
+    assert checkouts[0]["with"] == {
+        "ref": "${{ github.event.repository.default_branch }}",
+        "persist-credentials": False,
+    }
     assert "pull-requests: read" in text
     assert PR_BODY_LINT.as_posix() in text
     assert "PR_BODY_LINT_STRICT: \"0\"" in text
@@ -1066,17 +1143,83 @@ def test_issue_link_sync_tracks_open_and_closed_final_prs_from_trusted_base() ->
     assert ".github/scripts/issue_link_sync.py" in text
 
 
-def test_bash_helper_prefers_git_bash_over_windows_wsl_bash(tmp_path: Path) -> None:
-    git_bash = tmp_path / "Git" / "bin" / "bash.exe"
+@pytest.mark.parametrize(
+    "alias_relative",
+    [
+        "Windows/System32/bash.exe",
+        "Microsoft/WindowsApps/bash.exe",
+        "MICROSOFT/WINDOWSAPPS/BASH.EXE",
+    ],
+)
+@pytest.mark.parametrize("posix_path", [False, True], ids=["native-path", "forward-slashes"])
+def test_bash_helper_prefers_git_bash_over_windows_aliases(
+    tmp_path: Path, alias_relative: str, posix_path: bool,
+) -> None:
+    alias = tmp_path / alias_relative
+    git_bash = tmp_path / "Program Files" / "Git" / "bin" / "bash.exe"
+    for path in (alias, git_bash):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.touch()
 
     result = _bash_executable(
         os_name="nt",
-        path_lookup=lambda _name: r"C:\Windows\System32\bash.exe",
-        exists=lambda path: path == git_bash,
-        program_files=str(tmp_path),
+        path_lookup=lambda _name: alias.as_posix() if posix_path else str(alias),
+        program_files=str(tmp_path / "Program Files"),
     )
 
     assert result == str(git_bash)
+
+
+@pytest.mark.parametrize(
+    "git_locations",
+    [("bin/bash.exe",), ("usr/bin/bash.exe",), ("bin/bash.exe", "usr/bin/bash.exe")],
+)
+def test_bash_helper_prefers_installed_git_bash_over_path(
+    tmp_path: Path, git_locations: tuple[str, ...],
+) -> None:
+    path_bash = tmp_path / "custom" / "bash.exe"
+    path_bash.parent.mkdir()
+    path_bash.touch()
+    for relative in git_locations:
+        git_bash = tmp_path / "Git" / relative
+        git_bash.parent.mkdir(parents=True, exist_ok=True)
+        git_bash.touch()
+
+    assert _bash_executable(
+        os_name="nt", path_lookup=lambda _name: str(path_bash), program_files=str(tmp_path),
+    ) == str(tmp_path / "Git" / git_locations[0])
+
+
+def test_bash_helper_keeps_custom_path_fallback(tmp_path: Path) -> None:
+    path_bash = tmp_path / "custom" / "bash.exe"
+    path_bash.parent.mkdir()
+    path_bash.touch()
+
+    assert _bash_executable(
+        os_name="nt", path_lookup=lambda _name: str(path_bash), program_files=str(tmp_path),
+    ) == str(path_bash)
+
+
+@pytest.mark.parametrize(
+    "alias_relative", [None, "Windows/System32/bash.exe", "Microsoft/WindowsApps/bash.exe"],
+)
+def test_bash_helper_requires_non_alias_bash(tmp_path: Path, alias_relative: str | None) -> None:
+    alias = tmp_path / alias_relative if alias_relative else None
+    if alias is not None:
+        alias.parent.mkdir(parents=True)
+        alias.touch()
+
+    with pytest.raises(AssertionError, match="Git Bash is required"):
+        _bash_executable(
+            os_name="nt",
+            path_lookup=lambda _name: str(alias) if alias is not None else None,
+            program_files=str(tmp_path),
+        )
+
+
+@pytest.mark.parametrize("found", [None, "/opt/custom/bash"])
+def test_bash_helper_preserves_posix_lookup(found: str | None) -> None:
+    assert _bash_executable(os_name="posix", path_lookup=lambda _name: found) == (found or "bash")
 
 
 def test_default_ci_uses_layered_job_conditions() -> None:
@@ -1095,6 +1238,7 @@ def test_default_ci_uses_layered_job_conditions() -> None:
     assert jobs["gateway-contract-windows"]["needs"] == [
         "plan-ci",
         "frontend-check",
+        "gateway-contract-verification-linux",
     ]
     assert "'frontend-validation'" in jobs["gateway-contract-windows"]["if"]
     assert "'tui'" in jobs["tui-check"]["if"]
@@ -1178,6 +1322,27 @@ def test_gateway_contract_hashes_are_compared_between_linux_and_windows() -> Non
     assert "--compare-hash-manifests" in compare["run"]
 
 
+def test_contract_generation_reuses_two_fresh_parallel_renders_for_production() -> None:
+    jobs = _workflow("ci.yml")["jobs"]
+    for job_id, step_name in (
+        ("frontend-check", "Verify deterministic Contract generation"),
+        (
+            "gateway-contract-windows",
+            "Verify Windows Contract generation and real toolchain",
+        ),
+    ):
+        verification = next(step for step in jobs[job_id]["steps"] if step.get("name") == step_name)
+        generation_commands = [
+            line.strip()
+            for line in verification["run"].splitlines()
+            if "generate_gateway_contracts.py" in line
+        ]
+        assert generation_commands == [
+            "uv run --no-sync python scripts/contracts/generate_gateway_contracts.py "
+            "--check-determinism --jobs 4"
+        ]
+
+
 def test_ci_result_gate_covers_every_conditional_job_without_legacy_flags() -> None:
     jobs = _workflow("ci.yml")["jobs"]
     gate = jobs["ci-result"]
@@ -1194,6 +1359,7 @@ def test_ci_result_gate_covers_every_conditional_job_without_legacy_flags() -> N
         "readme-locale-check",
         "frontend-artifact",
         "frontend-check",
+        "gateway-contract-verification-linux",
         "gateway-contract-windows",
         "webui-chat-recovery",
         "tui-check",
@@ -1230,12 +1396,18 @@ def test_ci_result_gate_covers_every_conditional_job_without_legacy_flags() -> N
     assert gate_step["env"]["RESULT_SKILL_HUB"] == "${{ needs.skill-hub.result }}"
     assert not any(key.startswith("FLAG_") for key in gate_step["env"])
     assert set(gate_step["env"]) == {
+        "QUEUE_PARTIAL",
+        "QUEUE_EVIDENCE_RESULT",
+        "QUEUE_REUSED_SUITES",
+        "QUEUE_SOURCE_RUN_ID",
+        "QUEUE_CANARY_RESULT",
         "RESULT_PLANNER",
         "RESULT_WORKFLOW_LINT",
         "RESULT_README_LOCALE",
         "RESULT_FRONTEND_ARTIFACT",
         "RESULT_FRONTEND",
         "RESULT_CONTRACT_WINDOWS",
+        "RESULT_CONTRACT_VERIFICATION_LINUX",
         "RESULT_TUI",
         "RESULT_DESKTOP",
         "RESULT_UBUNTU",
@@ -1312,7 +1484,19 @@ def test_desktop_recovery_e2e_runs_compiled_flows_on_all_release_platforms() -> 
         "matrix.shard == 'profiles' }}"
     )
     assert "history-hydration.spec.ts" in session_recovery["run"]
-    assert '--grep "terminates stalled"' in session_recovery["run"]
+    # Select by a stable contract tag, not the scenario's human-readable title.
+    # Renaming the test must not silently leave this release-platform gate empty.
+    assert '--grep "@session-hang-recovery"' in session_recovery["run"]
+    assert "--retries=0" in session_recovery["run"]
+    recovery_spec = Path("opensquilla-webui/e2e/history-hydration.spec.ts").read_text(
+        encoding="utf-8"
+    )
+    assert len(
+        re.findall(
+            r"test\('[^']+',\s*\{\s*tag: '@session-hang-recovery',?\s*\},\s*async",
+            recovery_spec,
+        )
+    ) == 1
     assert playwright_cache["uses"] == "actions/cache/restore@v4"
     assert playwright_cache["with"]["path"] == "${{ env.PLAYWRIGHT_BROWSERS_PATH }}"
     assert job["env"]["PLAYWRIGHT_BROWSERS_PATH"] == (
@@ -1359,7 +1543,7 @@ def test_desktop_recovery_e2e_runs_compiled_flows_on_all_release_platforms() -> 
     assert '"windows-loopback-no-buffer-space-v1"' in run["run"]
     assert '"macos-electron-foreground-prerequisite-v1"' in run["run"]
     assert '"cases": {"desktop-cleanup-flow"}' in run["run"]
-    assert '"cases": {"offline-document-workbench-e2e"}' in run["run"]
+    assert '"cases": {"native-workbench-v2"}' in run["run"]
     assert '"classification": matches[0] if retryable else "non_retryable"' in (
         run["run"]
     )
@@ -1403,7 +1587,7 @@ def test_desktop_recovery_e2e_runs_compiled_flows_on_all_release_platforms() -> 
             "windows-delete-helper-handoff-timeout-v1",
         ),
         (
-            "offline-document-workbench-e2e",
+            "native-workbench-v2",
             "Windows",
             "Traceback (most recent call last):\n"
             "    at synthetic_allowed_stack\n"
@@ -1414,7 +1598,7 @@ def test_desktop_recovery_e2e_runs_compiled_flows_on_all_release_platforms() -> 
             "windows-isolated-acl-worker-timeout-v1",
         ),
         (
-            "offline-document-workbench-e2e",
+            "native-workbench-v2",
             "Windows",
             "electronApplication.evaluate: Error: "
             "ERR_NO_BUFFER_SPACE (-176) loading 'http://127.0.0.1:54108/one'\n"
@@ -1426,7 +1610,7 @@ def test_desktop_recovery_e2e_runs_compiled_flows_on_all_release_platforms() -> 
             "windows-loopback-no-buffer-space-v1",
         ),
         (
-            "offline-document-workbench-e2e",
+            "native-workbench-v2",
             "macOS",
             "electronApplication.evaluate: Error: "
             "ELECTRON_FOREGROUND_PREREQUISITE_MISSING: owner is not foreground\n"
@@ -1524,7 +1708,7 @@ def test_desktop_retry_classifier_rejects_similar_windows_loopback_failures(
         [
             sys.executable,
             "-",
-            "offline-document-workbench-e2e",
+            "native-workbench-v2",
             "Windows",
             str(log),
             str(output),
@@ -1563,7 +1747,7 @@ def test_desktop_retry_classifier_rejects_generic_product_failures(tmp_path: Pat
         [
             sys.executable,
             "-",
-            "offline-document-workbench-e2e",
+            "native-workbench-v2",
             "Windows",
             str(log),
             str(output),
@@ -1591,7 +1775,7 @@ def test_desktop_retry_classifier_rejects_generic_product_failures(tmp_path: Pat
         [
             sys.executable,
             "-",
-            "offline-document-workbench-e2e",
+            "native-workbench-v2",
             "macOS",
             str(log),
             str(output),
@@ -1650,7 +1834,7 @@ def test_desktop_retry_classifier_rejects_allowed_signature_with_another_termina
         [
             sys.executable,
             "-",
-            "offline-document-workbench-e2e",
+            "native-workbench-v2",
             "macOS",
             str(log),
             str(output),
@@ -1668,28 +1852,6 @@ def test_desktop_retry_classifier_rejects_allowed_signature_with_another_termina
     assert record["blocked_markers"] == [expected_marker]
     assert all("submitted document content" not in marker for marker in record["blocked_markers"])
     assert list(evidence.iterdir()) == []
-
-
-def test_v1_editor_failure_evidence_is_captured_before_desktop_shutdown() -> None:
-    script = Path(
-        "desktop/electron/scripts/test-v1-html-agent-edit-e2e.mjs"
-    ).read_text(encoding="utf-8")
-    finally_block = script.index("} finally {")
-    durable_check = script.index(
-        "evidence.durableMutation = await readDurableMutationEvidence", finally_block
-    )
-    failure_capture = script.index(
-        "failureEvidence = await captureFailureEvidence", finally_block
-    )
-    app_close = script.index(
-        "await closeDesktopApp(app, 'final-electron-shutdown')", finally_block
-    )
-
-    assert durable_check < failure_capture < app_close
-    assert "async function diagnosticCall" in script
-    assert "const gateway = await gatewayHealthSnapshot" in script
-    assert "renderer shell snapshot" in script
-    assert "failure-attempt-${attempt}-${Date.now()}" in script
 
 
 def test_ci_evidence_artifacts_are_replaceable_across_rerun_attempts() -> None:
@@ -1745,8 +1907,11 @@ def test_webui_chat_recovery_runs_the_verified_dist_through_gateway() -> None:
     required_specs = {
         "assistant-activity.spec.ts",
         "composer-paste.spec.ts",
+        "ensemble-new-task-legacy-turn.spec.ts",
         "goal-mode.spec.ts",
         "history-hydration.spec.ts",
+        "new-task-ensemble-race.spec.ts",
+        "plan-questionnaire-lifecycle.spec.ts",
         "queue-steer.spec.ts",
         "session-created-card.spec.ts",
         "session-switch-transport.spec.ts",
@@ -2198,6 +2363,60 @@ def test_container_release_smoke_serves_control_ui_entry_assets() -> None:
     assert 'docker exec "${container_id}" curl --fail --silent --show-error' in script
     build = next(step for step in steps if step.get("name") == "Build multi-arch image")
     assert build["with"]["build-args"] == "OPENSQUILLA_FORBID_PERSONAL_BGM=1\n"
+
+
+@pytest.mark.parametrize("event,tag", [("push", "v0.5.5"), ("workflow_dispatch", "edge")])
+def test_container_repository_is_lowercase_through_verification_and_promotion(
+    tmp_path: Path, event: str, tag: str
+) -> None:
+    steps = _workflow("docker-image.yml")["jobs"]["build-and-publish"]["steps"]
+    by_id = {step["id"]: step for step in steps if "id" in step}
+    output = tmp_path / "output.txt"
+    env = {
+        **os.environ,
+        "GITHUB_REPOSITORY": "TokenRhythm/opensquilla",
+        "GITHUB_EVENT_NAME": event,
+        "GITHUB_REF_NAME": "v0.5.5",
+        "GITHUB_OUTPUT": str(output),
+    }
+    subprocess.run(
+        [_bash_executable(), "-e", "-c", by_id["image_repo"]["run"]], env=env, check=True
+    )
+    repository = output.read_text(encoding="utf-8").strip().removeprefix("repository=")
+    assert repository == "ghcr.io/tokenrhythm/opensquilla"
+    expression = "${{ steps.image_repo.outputs.repository }}"
+    assert by_id["meta"]["with"]["images"] == expression
+    assert by_id["pushed_image"]["env"]["IMAGE_REPOSITORY"] == expression
+    output.write_text("", encoding="utf-8")
+    subprocess.run(
+        [_bash_executable(), "-e", "-c", by_id["pushed_image"]["run"]],
+        env={**env, "IMAGE_REPOSITORY": repository},
+        check=True,
+    )
+    assert output.read_text(encoding="utf-8").strip() == f"ref={repository}:{tag}"
+    for name in (
+        "Verify pushed manifest platforms",
+        "Smoke pushed image HEALTHCHECK",
+        "Promote verified release image to latest",
+    ):
+        step = next(step for step in steps if step.get("name") == name)
+        assert step["env"]["IMAGE_REF"] == "${{ steps.pushed_image.outputs.ref }}"
+    assert step["env"]["LATEST_REF"] == f"{expression}:latest"
+
+
+def test_organization_guards_keep_the_maintainer_restriction() -> None:
+    jobs = _workflow("desktop-fault-injection.yml")["jobs"]
+    guards = [job["if"] for job in jobs.values() if "github.repository" in job.get("if", "")]
+    assert len(guards) == 4
+    for guard in guards:
+        assert "github.repository == 'TokenRhythm/opensquilla'" in guard
+        assert "github.actor == 'Open-Squilla'" in guard
+        assert "'opensquilla/opensquilla'" not in guard
+    canary = _workflow("live-skill-hub-canary.yml")["jobs"]
+    assert any(
+        job.get("if") == "github.repository == 'TokenRhythm/opensquilla'"
+        for job in canary.values()
+    )
 
 
 def test_wheelhouse_release_hydrates_current_router_bundle() -> None:

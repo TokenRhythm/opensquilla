@@ -2,10 +2,7 @@ import { ref, computed, onUnmounted, onActivated, onDeactivated } from 'vue'
 import { useRouter } from 'vue-router'
 import { useDocumentEvent } from '@/composables/useDocumentEvent'
 import { useUsagePreferences } from '@/composables/usage/useUsagePreferences'
-import {
-  naturalRangeStartMs,
-  requestUsageSnapshot,
-} from '@/composables/usage/useUsageQuery'
+import { requestUsageSnapshot } from '@/composables/usage/useUsageQuery'
 import { useUsageTotals } from '@/composables/usage/useUsageTotals'
 import { useUsageChartRows } from '@/composables/usage/useUsageChartRows'
 import { useUsageModelCards } from '@/composables/usage/useUsageModelCards'
@@ -24,11 +21,11 @@ import type {
   BreakdownRow,
   ModelBreakdownItem,
   ModelCard,
-  SessionRow,
   TableColumn,
   UsageRangeSelection,
+  UsageSession,
   UsageSnapshot,
-  UsageStatusData,
+  UsageTotals,
 } from '@/types/usage'
 
 const t = i18n.global.t
@@ -43,7 +40,7 @@ const FALLBACK_CNY_RATE = 7.25
 
 type CostFormatOptions = {
   decimals?: number
-  source?: object
+  source?: UsageTotals | UsageSession | ModelBreakdownItem | ModelCard | BreakdownRow
 }
 
 // Column labels are resolved through i18n in the `tableColumns` computed so they
@@ -90,17 +87,7 @@ const usageSnapshot = ref<UsageSnapshot | null>(null)
 const taskTitles = ref<Map<string, string>>(new Map())
 const usageLoading = ref(false)
 const usageError = ref<string | null>(null)
-const sessions = computed<SessionRow[]>(() => usageSnapshot.value?.sessions || [])
-const lastStatus = computed<UsageStatusData | null>(() => {
-  const snapshot = usageSnapshot.value
-  if (!snapshot) return null
-  return {
-    sessions: snapshot.sessions,
-    totalSessions: snapshot.totals.sessions,
-    totalTokens: snapshot.totals.totalTokens,
-    totalCostUsd: snapshot.totals.cost,
-  }
-})
+const sessions = computed<UsageSession[]>(() => usageSnapshot.value?.sessions || [])
 
 let autoRefreshId: ReturnType<typeof setInterval> | null = null
 let loadGeneration = 0
@@ -171,7 +158,7 @@ const serverModels = computed(() =>
   usageSnapshot.value?.source === 'usage_ledger' ? usageSnapshot.value.models : null)
 const serverDays = computed(() =>
   usageSnapshot.value?.source === 'usage_ledger' ? usageSnapshot.value.days : null)
-const taskName = (row: SessionRow) => usageTaskDisplayName(
+const taskName = (row: UsageSession) => usageTaskDisplayName(
   row,
   taskTitles.value,
   t('usageLogs.tasks.unnamed'),
@@ -191,7 +178,6 @@ const {
   serverTotals,
   currency,
   cnyRate,
-  rowVal,
   fmtCost,
   sourceCompositionHint,
 })
@@ -200,7 +186,6 @@ const { chartCaption, chartRows } = useUsageChartRows({
   visibleSessions,
   serverDays,
   chartMode,
-  rowVal,
   fmtCost,
   fmtNum,
   taskName,
@@ -209,7 +194,6 @@ const { chartCaption, chartRows } = useUsageChartRows({
 const { modelCards, modelsMeta } = useUsageModelCards({
   visibleSessions,
   serverModels,
-  rowVal,
 })
 
 const { sortedRows, sessionsMeta } = useUsageSessionRows({
@@ -217,8 +201,6 @@ const { sortedRows, sessionsMeta } = useUsageSessionRows({
   rangeHiddenHint,
   sortCol,
   sortAsc,
-  rowVal,
-  numericRowVal,
   sessionTimestamp,
   relTime,
   sortVal,
@@ -278,7 +260,7 @@ function openSession(key: string) {
   }
 }
 
-function toggleModelExpand(row: { raw: SessionRow; rowIdentity: string }) {
+function toggleModelExpand(row: { raw: UsageSession; rowIdentity: string }) {
   const key = row.rowIdentity
   if (expandedSessions.value.has(key)) {
     expandedSessions.value.delete(key)
@@ -362,10 +344,6 @@ function exportCsv() {
 // Helpers
 // ---------------------------------------------------------------------------
 
-function rangeCutoffMs(r: string): number | null {
-  return naturalRangeStartMs(r as UsageRangeSelection)
-}
-
 function fmtCost(usd: number | null | undefined, opts?: CostFormatOptions): string {
   const decimals = (opts && opts.decimals != null) ? opts.decimals : 4
   return formatUsageCost(
@@ -373,7 +351,7 @@ function fmtCost(usd: number | null | undefined, opts?: CostFormatOptions): stri
     currency.value,
     cnyRate.value,
     decimals,
-    opts?.source as Record<string, unknown> | undefined,
+    opts?.source,
   )
 }
 
@@ -385,46 +363,35 @@ function fmtNum(n: number | null | undefined): string {
   return String(v)
 }
 
-function rowVal(row: Record<string, unknown>, ...keys: string[]): unknown {
-  for (const key of keys) {
-    if (row[key] != null) return row[key]
+function sessionTimestamp(row: UsageSession): number | null {
+  for (const value of [row.endedAt, row.updatedAt, row.startedAt, row.createdAt]) {
+    if (value == null || value === '') continue
+    const timestamp = Number(value)
+    if (Number.isFinite(timestamp)) return timestamp
   }
   return null
 }
 
-function numericRowVal(row: Record<string, unknown>, ...keys: string[]): number | null {
-  const value = rowVal(row, ...keys)
-  if (value == null || value === '') return null
-  const n = Number(value)
-  return Number.isFinite(n) ? n : null
-}
-
-function sessionTimestamp(row: SessionRow): number | null {
-  for (const key of ['endedAt', 'ended_at', 'updatedAt', 'updated_at', 'startedAt', 'started_at', 'createdAt', 'created_at']) {
-    const value = numericRowVal(row, key)
-    if (value != null) return value
-  }
-  return null
-}
-
-function sortVal(row: SessionRow, key: string): string | number {
+function sortVal(row: UsageSession, key: string): string | number {
   switch (key) {
     case 'session':
       return taskName(row)
     case 'updated_at':
       return sessionTimestamp(row) || 0
     case 'input_tokens':
-      return Number(rowVal(row, 'input_tokens', 'inputTokens') || 0)
+      return row.inputTokens ?? 0
     case 'output_tokens':
-      return Number(rowVal(row, 'output_tokens', 'outputTokens') || 0)
+      return row.outputTokens ?? 0
     case 'cache_read_tokens':
-      return Number(rowVal(row, 'cache_read_tokens', 'cacheReadTokens') || 0)
+      return row.cacheReadTokens ?? 0
     case 'cache_write_tokens':
-      return Number(rowVal(row, 'cache_write_tokens', 'cacheWriteTokens') || 0)
+      return row.cacheWriteTokens ?? 0
     case 'cost_usd':
-      return Number(rowVal(row, 'cost_usd', 'costUsd') || 0)
+      return row.costUsd ?? 0
+    case 'model':
+      return row.model
     default:
-      return (rowVal(row, key) || '') as string
+      return ''
   }
 }
 
@@ -443,8 +410,10 @@ async function requestTaskTitles(): Promise<Map<string, string>> {
   }
 }
 
-function costSource(row: SessionRow | ModelBreakdownItem): string {
-  return String(rowVal(row as Record<string, unknown>, 'cost_source', 'costSource') || 'none')
+type CostSourceRow = UsageSession | ModelBreakdownItem | ModelCard | BreakdownRow
+
+function costSource(row: CostSourceRow): string {
+  return String(row.costSource || 'none')
 }
 
 function costSourceClass(source: string): string {
@@ -455,9 +424,9 @@ function costSourceClass(source: string): string {
 
 // A stable source key (independent of locale) used both for labels and for the
 // composition-hint tally; the user-facing strings are looked up from it.
-function costSourceKey(row: SessionRow | ModelBreakdownItem): string {
+function costSourceKey(row: CostSourceRow): string {
   const source = costSource(row)
-  const ephemeral = Boolean(rowVal(row as Record<string, unknown>, 'cost_ephemeral', 'costEphemeral'))
+  const ephemeral = 'costEphemeral' in row && Boolean(row.costEphemeral)
   if (ephemeral) return 'ephemeral'
   switch (source) {
     case 'provider_billed': return 'actual'
@@ -469,17 +438,17 @@ function costSourceKey(row: SessionRow | ModelBreakdownItem): string {
   }
 }
 
-function costSourceLabel(row: SessionRow | ModelBreakdownItem): string {
+function costSourceLabel(row: CostSourceRow): string {
   return t(`usageLogs.costSource.${costSourceKey(row)}.label`)
 }
 
-function costSourceTooltip(row: SessionRow | ModelBreakdownItem): string {
+function costSourceTooltip(row: CostSourceRow): string {
   return t(`usageLogs.costSource.${costSourceKey(row)}.tooltip`)
 }
 
-function costSourceClasses(row: SessionRow | ModelBreakdownItem): Record<string, boolean> {
+function costSourceClasses(row: CostSourceRow): Record<string, boolean> {
   const source = costSource(row)
-  const ephemeral = Boolean(rowVal(row as Record<string, unknown>, 'cost_ephemeral', 'costEphemeral'))
+  const ephemeral = 'costEphemeral' in row && Boolean(row.costEphemeral)
   return {
     [`usage-source--${costSourceClass(source)}`]: true,
     'usage-source--ephemeral': ephemeral,
@@ -487,34 +456,34 @@ function costSourceClasses(row: SessionRow | ModelBreakdownItem): Record<string,
 }
 
 function costSourceClassesForBreakdown(m: BreakdownRow): Record<string, boolean> {
-  return costSourceClasses(m as unknown as ModelBreakdownItem)
+  return costSourceClasses(m)
 }
 
 function costSourceLabelForBreakdown(m: BreakdownRow): string {
-  return costSourceLabel(m as unknown as ModelBreakdownItem)
+  return costSourceLabel(m)
 }
 
 function costSourceTooltipForBreakdown(m: BreakdownRow): string {
-  return costSourceTooltip(m as unknown as ModelBreakdownItem)
+  return costSourceTooltip(m)
 }
 
 function costSourceClassesForModelCard(m: ModelCard): Record<string, boolean> {
-  return costSourceClasses(m as unknown as ModelBreakdownItem)
+  return costSourceClasses(m)
 }
 
 function costSourceLabelForModelCard(m: ModelCard): string {
-  return costSourceLabel(m as unknown as ModelBreakdownItem)
+  return costSourceLabel(m)
 }
 
 function costSourceTooltipForModelCard(m: ModelCard): string {
-  const base = costSourceTooltip(m as unknown as ModelBreakdownItem)
+  const base = costSourceTooltip(m)
   if (m.anyCacheBlind) {
     return `${base} ${t('usageLogs.costSource.cacheBlindHint')}`
   }
   return base
 }
 
-function sourceCompositionHint(rows: SessionRow[]): string {
+function sourceCompositionHint(rows: UsageSession[]): string {
   const order = ['actual', 'estimated', 'mixed', 'unpriced', 'ephemeral']
   const counts: Record<string, number> = { actual: 0, estimated: 0, mixed: 0, unpriced: 0, ephemeral: 0 }
   rows.forEach(row => {
@@ -527,7 +496,7 @@ function sourceCompositionHint(rows: SessionRow[]): string {
     .join(' · ')
 }
 
-function modelDisplayLabel(row: SessionRow): string {
+function modelDisplayLabel(row: UsageSession): string {
   const bd = row.modelBreakdown
   if (Array.isArray(bd) && bd.length > 0) {
     return bd.length > 1
@@ -537,11 +506,11 @@ function modelDisplayLabel(row: SessionRow): string {
   return row.model || '—'
 }
 
-function rowKey(row: SessionRow): string {
-  return (rowVal(row, 'session', 'sessionKey', 'key') || '') as string
+function rowKey(row: UsageSession): string {
+  return row.sessionKey || row.session
 }
 
-function rowBreakdown(row: SessionRow): BreakdownRow[] {
+function rowBreakdown(row: UsageSession): BreakdownRow[] {
   const bd = row.modelBreakdown || []
   const totalCost = bd.reduce((acc, m) => acc + (Number(m.costUsd) || 0), 0)
   return bd.map(m => {
@@ -558,7 +527,6 @@ function rowBreakdown(row: SessionRow): BreakdownRow[] {
       cost,
       share,
       costSource: m.costSource,
-      cost_source: m.cost_source,
       costSourceCounts: m.costSourceCounts,
       nativeBilledByCurrency: m.nativeBilledByCurrency,
       pendingBillingReceiptCount: m.pendingBillingReceiptCount,
@@ -569,20 +537,20 @@ function rowBreakdown(row: SessionRow): BreakdownRow[] {
   })
 }
 
-function rowBreakdownTotalTokens(row: SessionRow): number {
+function rowBreakdownTotalTokens(row: UsageSession): number {
   const bd = row.modelBreakdown || []
   return bd.reduce((acc, m) => acc + (Number(m.inputTokens) || 0) + (Number(m.outputTokens) || 0), 0)
 }
 
-function rowBreakdownTotalCost(row: SessionRow): number {
+function rowBreakdownTotalCost(row: UsageSession): number {
   const bd = row.modelBreakdown || []
   return bd.reduce((acc, m) => acc + (Number(m.costUsd) || 0), 0)
 }
 
-function rowBreakdownAnyProrated(row: SessionRow): boolean {
+function rowBreakdownAnyProrated(row: UsageSession): boolean {
   const bd = row.modelBreakdown || []
   return bd.some(m => {
-    const src = String(m.costSource || m.cost_source || '')
+    const src = String(m.costSource || '')
     return src === 'provider_billed_prorated'
   })
 }
@@ -618,7 +586,6 @@ function download(filename: string, mime: string, content: string) {
     sortAsc,
     chartMode,
     range,
-    lastStatus,
     usageLoading,
     usageError,
     expandedSessions,
@@ -648,11 +615,8 @@ function download(filename: string, mime: string, content: string) {
     toggleModelExpand,
     loadData,
     exportCsv,
-    rangeCutoffMs,
     fmtCost,
     fmtNum,
-    rowVal,
-    numericRowVal,
     sessionTimestamp,
     sortVal,
     costSource,

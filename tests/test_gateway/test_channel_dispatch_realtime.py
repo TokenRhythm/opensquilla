@@ -377,6 +377,34 @@ async def test_direct_channel_batch_uses_authoritative_done_snapshot() -> None:
 
 
 @pytest.mark.asyncio
+async def test_direct_channel_rejects_dropping_runner_for_modern_owner() -> None:
+    class DroppingTurnRunner:
+        called = False
+
+        async def run(self, *_args: Any, **_kwargs: Any):
+            self.called = True
+            yield DoneEvent(text="must not run")
+
+    runner = DroppingTurnRunner()
+
+    with pytest.raises(RuntimeError, match="exact turn-runner owner contract"):
+        await _run_turn_batch_path(
+            _FakeChannel(),
+            runner,
+            _message(),
+            "agent:main:modern-owner",
+            _tool_ctx(),
+            None,
+            None,
+            SimpleNamespace(agent_stream_idle_timeout_seconds=1.0),
+            expected_session_id="modern-session",
+            expected_session_epoch=2,
+        )
+
+    assert runner.called is False
+
+
+@pytest.mark.asyncio
 async def test_direct_channel_batch_terminal_reset_replaces_partial_with_failure() -> None:
     drained = False
 
@@ -2791,8 +2819,22 @@ async def test_direct_channel_turn_uses_authoritative_project_workspace(
         def __init__(self) -> None:
             self.calls: list[dict[str, Any]] = []
 
-        async def run(self, message: str, session_key: str, **kwargs: Any):
-            self.calls.append(kwargs)
+        async def run(
+            self,
+            message: str,
+            session_key: str,
+            *,
+            expected_session_id: str | None = None,
+            expected_session_epoch: int | None = None,
+            **kwargs: Any,
+        ):
+            self.calls.append(
+                {
+                    **kwargs,
+                    "expected_session_id": expected_session_id,
+                    "expected_session_epoch": expected_session_epoch,
+                }
+            )
             yield DoneEvent()
 
     runner = RecordingTurnRunner()
@@ -2823,9 +2865,9 @@ async def test_direct_channel_unbound_turn_refreshes_durable_context(
     tmp_path: Path,
 ) -> None:
     from opensquilla.gateway.project_workspace_runtime import (
+        apply_run_context_route_metadata,
         authoritative_project_run_context,
     )
-    from opensquilla.gateway.rpc_sessions import _apply_run_context_route_metadata
 
     storage = await SessionStorage.open(str(tmp_path / "channel-unbound.db"))
     manager = SessionManager(storage, inject_time_prefix=False)
@@ -2873,7 +2915,7 @@ async def test_direct_channel_unbound_turn_refreshes_durable_context(
         default_workspace=str(default_workspace),
     )
     assert workspace_guard is None
-    _apply_run_context_route_metadata(
+    apply_run_context_route_metadata(
         envelope,
         stale_context,
         principal_is_owner=True,
@@ -2900,8 +2942,22 @@ async def test_direct_channel_unbound_turn_refreshes_durable_context(
         def __init__(self) -> None:
             self.calls: list[dict[str, Any]] = []
 
-        async def run(self, message: str, session_key: str, **kwargs: Any):
-            self.calls.append(kwargs)
+        async def run(
+            self,
+            message: str,
+            session_key: str,
+            *,
+            expected_session_id: str | None = None,
+            expected_session_epoch: int | None = None,
+            **kwargs: Any,
+        ):
+            self.calls.append(
+                {
+                    **kwargs,
+                    "expected_session_id": expected_session_id,
+                    "expected_session_epoch": expected_session_epoch,
+                }
+            )
             yield DoneEvent(text="ok")
 
     channel = _FakeChannel()

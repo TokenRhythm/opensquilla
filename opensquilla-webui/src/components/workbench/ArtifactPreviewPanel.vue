@@ -65,17 +65,7 @@
 
     <div class="artifact-preview__viewport">
       <div
-        v-if="agentEditInProgress"
-        class="artifact-preview__status"
-        data-testid="artifact-preview-agent-edit-in-progress"
-        role="status"
-      >
-        <Icon name="info" :size="18" />
-        <strong>{{ t('workbench.artifactPreview.agentEditInProgress') }}</strong>
-      </div>
-
-      <div
-        v-else-if="preview.state.value === 'loading'"
+        v-if="preview.state.value === 'loading'"
         class="artifact-preview__status"
         role="status"
         :aria-label="t('chat.loadingPreview')"
@@ -194,14 +184,14 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { computed, inject, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import Icon from '@/components/Icon.vue'
 import {
-  useArtifactPreviewResource,
+  ARTIFACT_WORKBENCH_KEY,
   type ArtifactPreviewResourceState,
   type NativeHtmlArtifactResource,
-} from '@/composables/workbench/useArtifactPreviewResource'
+} from '@/modules/artifactWorkbench'
 import type { ArtifactPayload } from '@/types/artifacts'
 import type { WorkbenchComponentEvent } from '@/workbench/types'
 import {
@@ -212,7 +202,6 @@ import {
 import { ARTIFACT_PREVIEW_ESCAPE_MESSAGE } from '@/utils/workbench/artifactPreview'
 
 const props = withDefaults(defineProps<{
-  agentEditInProgress?: boolean
   artifact: ArtifactPayload
   baseOrigin?: string
   nativeHtml?: boolean
@@ -228,7 +217,6 @@ const props = withDefaults(defineProps<{
   showHeader?: boolean
   suspended?: boolean
 }>(), {
-  agentEditInProgress: false,
   baseOrigin: '',
   nativeHtml: false,
   nativeSurfaceState: 'loading',
@@ -253,12 +241,13 @@ const emit = defineEmits<{
 }>()
 
 const { t } = useI18n()
+const artifactWorkbench = inject(ARTIFACT_WORKBENCH_KEY)
+if (!artifactWorkbench) throw new Error('ArtifactWorkbench was not provided')
 const previewFrameRef = ref<HTMLIFrameElement | null>(null)
 const htmlFrameGeneration = ref(0)
 
-const preview = useArtifactPreviewResource({
+const preview = artifactWorkbench.previews.createResource({
   artifact: () => props.artifact,
-  baseOrigin: () => props.baseOrigin,
   htmlCollectionStatus: () => props.previewCollectionStatus,
   htmlLaunchUrl: () => props.previewLaunchUrl,
   htmlLeaseState: () => props.previewBlocked
@@ -422,7 +411,10 @@ async function reloadPreview() {
 }
 
 onMounted(() => window.addEventListener('message', onPreviewFrameMessage))
-onBeforeUnmount(() => window.removeEventListener('message', onPreviewFrameMessage))
+onBeforeUnmount(() => {
+  window.removeEventListener('message', onPreviewFrameMessage)
+  preview.dispose()
+})
 
 const isFailureState = computed(() =>
   preview.state.value === 'crashed'

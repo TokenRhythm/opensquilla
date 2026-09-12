@@ -104,7 +104,7 @@ class PipelineStepRecord:
     step_name: str
     applied: bool
     routed_tier: str | None = None
-    filtered_skill_ids: list[str] | None = None
+    skill_catalog_ids: list[str] | None = None
     routing_source: RoutingSource = "none"
     confidence: float | None = None
     fallback_reason: str | None = None

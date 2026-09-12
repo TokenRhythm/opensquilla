@@ -5,18 +5,19 @@
   "description": "Electron desktop shell for the OpenSquilla Control UI.",
   "repository": {
     "type": "git",
-    "url": "https://github.com/opensquilla/opensquilla.git"
+    "url": "https://github.com/TokenRhythm/opensquilla.git"
   },
   "type": "module",
   "main": "dist/main.js",
   "scripts": {
-    "build": "tsc -p tsconfig.json",
+    "build": "node scripts/build.mjs",
     "build:gateway": "node scripts/build-gateway.mjs",
     "fetch:runtimes": "node scripts/fetch-bundled-runtimes.mjs",
     "build:web": "cd ../../opensquilla-webui && npm ci && npm run build",
     "dev": "npm run build && electron .",
-    "dist:local": "npm run build:web && npm run build:gateway && npm run dist",
-    "pack:local": "npm run build:web && npm run build:gateway && npm run pack",
+    "dist:local": "npm run dist",
+    "pack:local": "npm run pack",
+    "verify:prepared": "node scripts/verify-prepared-gateway.mjs",
     "verify:icons": "node scripts/verify-icon-config.mjs",
     "verify:package": "npm run verify:icons && node scripts/verify-package.mjs",
     "verify:gateway-smoke": "node scripts/smoke-gateway.mjs",
@@ -29,6 +30,8 @@
     "test:sandbox-default": "npm run build && node scripts/test-desktop-sandbox-default.mjs",
     "test:update-resolver": "npm run build && node scripts/test-update-resolver.mjs",
     "test:update-scheduler": "npm run build && node scripts/test-update-check-scheduler.mjs",
+    "test:windows-update": "npm run build && node scripts/test-windows-update-security.mjs && node scripts/test-windows-update-cache.mjs && node scripts/test-windows-update-handoff.mjs && node scripts/test-windows-update-coordinator.mjs && node scripts/test-windows-update-integration.mjs && node scripts/test-windows-update-refresh.mjs && node scripts/test-windows-update-network.mjs",
+    "test:windows-update-electron": "npm run build && node scripts/test-windows-update-electron.mjs",
     "test:desktop-locale": "npm run build && node scripts/test-desktop-locale.mjs",
     "test:desktop-renderer-protocol": "npm run build && node scripts/test-desktop-renderer-protocol.mjs",
     "test:desktop-zoom": "npm run build && node scripts/test-desktop-zoom-shortcuts.mjs",
@@ -50,9 +53,7 @@
     "test:desktop-cleanup-flow": "npm run build && node scripts/test-desktop-cleanup-flow.mjs",
     "test:renderer-log": "npm run build && node scripts/test-desktop-renderer-log.mjs",
     "test:preview-lease-broker": "npm run build && node scripts/test-artifact-preview-lease-broker.mjs",
-    "test:desktop-workbench": "npm run build && node scripts/test-artifact-preview-lease-broker.mjs && node scripts/test-native-workbench-surface.mjs && node scripts/test-desktop-artifact-bridge-loopback.mjs && node scripts/test-native-workbench-surface-electron.mjs && node scripts/test-native-workbench-v2-electron.mjs",
-    "test:offline-document-workbench-e2e": "npm run build && node scripts/test-offline-document-workbench-e2e.mjs",
-    "test:v1-html-agent-edit-e2e": "npm run build && node scripts/test-v1-html-agent-edit-e2e.mjs",
+    "test:desktop-workbench": "npm run build && node scripts/test-artifact-preview-lease-broker.mjs && node scripts/test-native-workbench-surface.mjs && node scripts/test-desktop-browser.mjs && node scripts/test-native-workbench-surface-electron.mjs && node scripts/test-desktop-browser-electron.mjs && node scripts/test-native-workbench-v2-electron.mjs",
     "test:mock-update-flow": "npm run build && node scripts/test-mock-update-flow.mjs",
     "test:onboarding-coordinator": "npm run build && node scripts/test-onboarding-flow-coordinator.mjs",
     "test:onboarding-telemetry": "npm run build && node scripts/test-onboarding-save-telemetry.mjs",
@@ -65,8 +66,13 @@
     "test:router-tier-normalization": "npm run build && node scripts/test-router-tier-normalization.mjs",
     "test:onboarding-flow": "npm run build && node scripts/test-onboarding-flow.mjs",
     "start": "electron .",
-    "pack": "npm run build && electron-builder --dir && npm run verify:package",
-    "dist": "npm run build && electron-builder && npm run verify:package"
+    "pack": "npm run build:web && npm run build:gateway && npm run pack:prepared",
+    "dist": "npm run build:web && npm run build:gateway && npm run dist:prepared",
+    "pack:prepared": "npm run build && npm run verify:prepared && electron-builder --dir && npm run verify:package",
+    "dist:prepared": "npm run build && npm run verify:prepared && electron-builder && npm run verify:package",
+    "test:desktop-browser": "npm run build && node scripts/test-desktop-browser.mjs && node scripts/test-desktop-browser-electron.mjs",
+    "test:live-html-harness": "node --test scripts/test-live-html-foreground.mjs scripts/test-live-html-diagnostics.mjs scripts/test-live-html-supplemental-scenarios.mjs",
+    "test:live-html-browser": "node --test scripts/test-live-html-business.mjs"
   },
   "dependencies": {
     "electron-updater": "^6.6.2"
@@ -96,7 +102,7 @@
     "publish": [
       {
         "provider": "github",
-        "owner": "opensquilla",
+        "owner": "TokenRhythm",
         "repo": "opensquilla"
       }
     ],

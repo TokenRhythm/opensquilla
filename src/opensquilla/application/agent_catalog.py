@@ -5,7 +5,7 @@ from __future__ import annotations
 import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, fields, replace
-from typing import Any, Protocol
+from typing import Any, NotRequired, Protocol, TypedDict
 
 from opensquilla.agent_ids import normalize_agent_id
 
@@ -78,12 +78,28 @@ class UpdateAgent:
         }
 
 
+class AgentProjection(TypedDict):
+    id: str
+    name: str
+    enabled: bool
+    isBuiltin: bool
+    type: str
+    description: NotRequired[str | None]
+    model: NotRequired[str | None]
+    workspace: NotRequired[str | None]
+    agentDir: NotRequired[str | None]
+    systemPrompt: NotRequired[str | None]
+    tools: NotRequired[object]
+    skills: NotRequired[object]
+    subagents: NotRequired[object]
+
+
 class AgentRegistryPort(Protocol):
-    async def list(self, *, include_builtin: bool) -> Sequence[Mapping[str, Any]]: ...
+    async def list(self, *, include_builtin: bool) -> Sequence[AgentProjection]: ...
 
-    async def create(self, command: CreateAgent) -> Mapping[str, Any]: ...
+    async def create(self, command: CreateAgent) -> AgentProjection: ...
 
-    async def update(self, command: UpdateAgent) -> Mapping[str, Any]: ...
+    async def update(self, command: UpdateAgent) -> AgentProjection: ...
 
     async def remove(self, agent_id: str) -> None: ...
 
@@ -94,12 +110,12 @@ class AgentCatalog:
     def __init__(self, registry: AgentRegistryPort | None) -> None:
         self._registry = registry
 
-    async def list(self, *, include_builtin: bool = True) -> Sequence[Mapping[str, Any]]:
+    async def list(self, *, include_builtin: bool = True) -> Sequence[AgentProjection]:
         if self._registry is None:
             return ()
         return await self._registry.list(include_builtin=include_builtin)
 
-    async def create(self, command: CreateAgent) -> Mapping[str, Any]:
+    async def create(self, command: CreateAgent) -> AgentProjection:
         registry = self._required_registry()
         raw_id = command.agent_id
         if raw_id is None and command.name:
@@ -112,7 +128,7 @@ class AgentCatalog:
             replace(command, agent_id=agent_id, name=name or agent_id)
         )
 
-    async def update(self, command: UpdateAgent) -> Mapping[str, Any]:
+    async def update(self, command: UpdateAgent) -> AgentProjection:
         registry = self._required_registry()
         agent_id = self._agent_id(command.agent_id)
         if agent_id == "main":
@@ -150,6 +166,7 @@ __all__ = [
     "AgentCatalog",
     "AgentExistsError",
     "AgentNotFoundError",
+    "AgentProjection",
     "AgentRegistryPort",
     "AgentRegistryUnavailableError",
     "AgentTools",

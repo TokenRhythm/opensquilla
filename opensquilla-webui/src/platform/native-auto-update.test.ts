@@ -4,7 +4,7 @@ import { createWebPlatform } from './web'
 import { createDesktopPlatform } from './desktop'
 
 // Native installation and shell-owned update presentation are separate
-// capabilities: unsigned Windows uses a managed manual-installer flow, while an
+// capabilities: Windows uses a managed manual-installer flow, while an
 // older Windows shell still falls back to the passive gateway banner.
 
 function setDesktopApi(api: unknown): void {
@@ -25,7 +25,7 @@ describe('nativeAutoUpdateEnabled', () => {
     expect(await createDesktopPlatform().nativeAutoUpdateEnabled()).toBe(true)
   })
 
-  it('mirrors the shell when native update is OFF (unsigned Windows) → banner shown', async () => {
+  it('mirrors the shell when native update is OFF (managed Windows) → banner shown', async () => {
     setDesktopApi({ isAutoUpdateEnabled: async () => false })
     expect(await createDesktopPlatform().nativeAutoUpdateEnabled()).toBe(false)
   })
@@ -50,7 +50,7 @@ describe('desktopUpdateManaged', () => {
     expect(await createWebPlatform().desktopUpdateManaged()).toBe(false)
   })
 
-  it('is true for a managed unsigned Windows shell without native installation', async () => {
+  it('is true for a managed Windows shell without native installation', async () => {
     setDesktopApi({
       isAutoUpdateEnabled: async () => false,
       isDesktopUpdateManaged: async () => true,
@@ -154,11 +154,50 @@ describe('desktop update platform bridge', () => {
       status: 'available',
       canCheck: true,
       canNativeInstall: false,
+      canInstall: false,
       installMode: 'manual',
       source: 'oss',
       fallbackUsed: true,
     })
   })
+
+  it.each([
+    { mode: 'manual', permission: true, expected: true },
+    { mode: 'manual', permission: false, expected: false },
+    { mode: 'manual', permission: undefined, expected: false },
+    { mode: 'manual', permission: 'true', expected: false },
+    { mode: 'native', permission: undefined, expected: true },
+    { mode: 'native', permission: false, expected: false },
+    { mode: 'unsupported', permission: true, expected: false },
+  ])('normalizes installation permission for $mode with $permission', async ({ mode, permission, expected }) => {
+    setDesktopApi({
+      isAutoUpdateEnabled: async () => mode === 'native',
+      isDesktopUpdateManaged: async () => true,
+      getUpdateState: async () => ({
+        status: 'downloaded',
+        installMode: mode,
+        canInstall: permission,
+      }),
+    })
+
+    expect(await createDesktopPlatform().updates.getState()).toMatchObject({
+      installMode: mode,
+      canInstall: expected,
+    })
+  })
+
+  it.each(['signature_invalid', 'signature_unavailable'])(
+    'preserves %s and does not infer installation permission', async errorCode => {
+      setDesktopApi({
+        isAutoUpdateEnabled: async () => false,
+        isDesktopUpdateManaged: async () => true,
+        getUpdateState: async () => ({ status: 'error', installMode: 'manual', errorCode }),
+      })
+      expect(await createDesktopPlatform().updates.getState()).toMatchObject({
+        status: 'error', errorCode, canInstall: false,
+      })
+    },
+  )
 
   it('preserves structured checksum and integrity failures from the shell', async () => {
     setDesktopApi({

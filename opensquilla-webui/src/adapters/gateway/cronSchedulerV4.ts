@@ -1,4 +1,4 @@
-import type { RpcCallOptions } from '@/lib/rpc'
+import type { TransportCallOptions as RpcCallOptions } from './transportTypes'
 import { CRON_LIST_METHOD, type Result as CronListResult } from '@/contracts/generated/v4/cronList'
 import { validateResult as validateCronListResult } from '@/contracts/generated/v4/cronListValidators.mjs'
 import { CRON_CREATE_METHOD, type Result as CronCreateResult } from '@/contracts/generated/v4/cronCreate'

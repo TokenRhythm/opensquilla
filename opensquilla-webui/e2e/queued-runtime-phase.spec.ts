@@ -1,4 +1,5 @@
 import { expect, test, type Page } from '@playwright/test'
+import { helloOkResponse } from './support/gateway-fixture'
 
 const CONTROL_URL = '/control/'
 const SESSION_KEY = 'agent:main:webchat:e2e-queued-runtime-phase'
@@ -49,7 +50,7 @@ async function mockQueuedRouterLifecycle(page: Page) {
       if (frame.type !== 'req') return
       const method = String(frame.method || '')
       if (method === 'connect') {
-        ws.send(JSON.stringify({ protocol: 3, policy: { tick_interval_ms: 30_000 } }))
+        ws.send(helloOkResponse())
         return
       }
       if (method === 'chat.send') {
@@ -91,7 +92,7 @@ async function mockQueuedRouterLifecycle(page: Page) {
           skills: {},
         },
         'onboarding.status': { audioConfigured: false },
-        'sessions.list': { sessions: [], has_more: false },
+        'sessions.list': { sessions: [], count: 0, ts: 1_800_000_000, has_more: false },
         'sessions.messages.subscribe': {
           subscribed: true,
           replay_complete: true,

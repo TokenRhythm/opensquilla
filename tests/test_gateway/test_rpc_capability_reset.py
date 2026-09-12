@@ -63,11 +63,11 @@ def _isolate_capability_runtime(monkeypatch: pytest.MonkeyPatch) -> None:
     ):
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setattr(
-        "opensquilla.gateway.rpc_onboarding._sync_search_provider",
-        lambda config: None,
+        "opensquilla.tools.builtin.web.configure_search",
+        lambda **_kwargs: None,
     )
     monkeypatch.setattr(
-        "opensquilla.gateway.rpc_onboarding._sync_image_generation",
+        "opensquilla.gateway.setup_config_runtime.sync_media_runtime",
         lambda config: None,
     )
 
@@ -829,7 +829,10 @@ async def test_reset_persistence_failure_keeps_runtime_and_disk_unchanged(
     def fail_persist(*args, **kwargs):
         raise OSError("synthetic capability reset write failure")
 
-    monkeypatch.setattr("opensquilla.gateway.rpc_onboarding._persist", fail_persist)
+    monkeypatch.setattr(
+        "opensquilla.gateway.adapters.setup_config.persist_setup_candidate",
+        fail_persist,
+    )
 
     response = await _reset(cfg, "search")
 
@@ -853,11 +856,11 @@ async def test_live_sync_failure_reports_restart_without_undoing_saved_reset(
     )
     persist_config(cfg, path=config_path, backup=False)
 
-    def fail_live_sync(config):
+    def fail_live_sync(**_kwargs):
         raise RuntimeError("synthetic live sync failure")
 
     monkeypatch.setattr(
-        "opensquilla.gateway.rpc_onboarding._sync_search_provider",
+        "opensquilla.tools.builtin.web.configure_search",
         fail_live_sync,
     )
 

@@ -21,6 +21,8 @@ from dataclasses import dataclass as _dataclass
 from typing import Any
 
 from opensquilla.engine.types import AgentEvent, ToolResultEvent, ToolUseStartEvent
+from opensquilla.skills.catalog_policy import owners_for_meta_dependency
+from opensquilla.tools.types import current_meta_skill_owner
 
 
 @_dataclass(frozen=True)
@@ -87,10 +89,15 @@ async def yield_skill_view_preface(
         tool_name=sv_tool_name,
     )
     try:
-        result_text = await tool_invoker(
-            sv_tool_name,
-            {"name": effective_skill},
-        )
+        owners = owners_for_meta_dependency(effective_skill)
+        token = current_meta_skill_owner.set(owners[0] if len(owners) == 1 else "")
+        try:
+            result_text = await tool_invoker(
+                sv_tool_name,
+                {"name": effective_skill},
+            )
+        finally:
+            current_meta_skill_owner.reset(token)
     except Exception as exc:  # noqa: BLE001 — surface as an error card.
         yield ToolResultEvent(
             tool_use_id=sv_use_id,

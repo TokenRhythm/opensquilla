@@ -644,7 +644,6 @@ import type {
 import type { NodeStep, RunTraceStatus, RunTraceSummary } from '@/types/runTrace'
 import {
   toolGroupStatusText as defaultToolGroupStatusText,
-  isDocumentAgentToolName,
   toolSecondaryText as defaultToolSecondaryText,
   toolStatusText as defaultToolStatusText,
   toolIconName,
@@ -660,6 +659,7 @@ import {
   projectActivityToolTargets,
   type ActivityToolTarget,
 } from '@/utils/chat/activityToolDetails'
+import { isLegacyDocumentTool } from '@/utils/chat/legacyDocumentTool'
 import { requestBrowserWorkbenchOpen } from '@/workbench/browserItems'
 
 const { t } = useI18n()
@@ -824,63 +824,6 @@ function decorateCodeBlocks() {
 // Chat passes `items` (proven group data); non-chat surfaces pass flat steps,
 // which compose into the same tool-group timeline shape so the markup never
 // branches on input source.
-function withoutFailedActivityRows(
-  items: ChatStreamTimelineItem[],
-): ChatStreamTimelineItem[] {
-  if (props.presentation !== 'activity') return items
-
-  return items.flatMap((item): ChatStreamTimelineItem[] => {
-    if (item.type !== 'tool-group') return [item]
-    const documentAgentGroup = item.group.operationKey.startsWith('document.')
-      || isDocumentAgentToolName(item.group.operationKey)
-
-    const failedCalls = item.group.calls.filter(
-      call => call.isError || call.status === 'error',
-    )
-    // Restored histories can retain only the group-level failure marker. In
-    // that case none of the calls is safe to present as completed activity.
-    if (
-      (item.group.isError || item.group.status === 'error')
-      && failedCalls.length === 0
-      && !documentAgentGroup
-    ) {
-      return []
-    }
-
-    const groupLevelWriterError = documentAgentGroup
-      && (item.group.isError || item.group.status === 'error')
-      && failedCalls.length === 0
-    const calls = item.group.calls.filter(
-      call => (
-        (!call.isError && call.status !== 'error')
-        || isDocumentAgentToolName(call.name)
-      ),
-    ).map(call => groupLevelWriterError
-      ? { ...call, isError: true, status: 'error' as const }
-      : call)
-    if (calls.length === 0) return []
-
-    const isRunning = calls.some(call => call.isRunning)
-    const isError = calls.some(call => call.isError || call.status === 'error')
-      || (documentAgentGroup && (item.group.isError || item.group.status === 'error'))
-    return [{
-      ...item,
-      group: {
-        ...item.group,
-        calls,
-        isRunning,
-        isError,
-        status: isError
-          ? 'error'
-          : isRunning
-          ? ''
-          : calls.every(call => call.status === 'success')
-            ? 'success'
-            : '',
-      },
-    }]
-  })
-}
 
 const resolvedItems = computed<ChatStreamTimelineItem[]>(() => {
   const items = props.items ?? composeTree(props.steps ?? []).map((node): ChatStreamTimelineItem => {
@@ -904,7 +847,26 @@ const resolvedItems = computed<ChatStreamTimelineItem[]>(() => {
     }
     return { type: 'tool-group', key: node.step.id, group }
   })
-  return withoutFailedActivityRows(items)
+  return items.map((item): ChatStreamTimelineItem => {
+    if (item.type !== 'tool-group') return item
+    const group = item.group
+    const singleCall = group.calls.length === 1 ? group.calls[0] : undefined
+    const restoredFailure = singleCall && !group.isRunning && !singleCall.isRunning
+      && (group.isError || group.status === 'error')
+      && !singleCall.isError && singleCall.status !== 'error'
+    const hasLegacyDetails = group.calls.some(isDocumentCall)
+    if (!restoredFailure && !hasLegacyDetails) return item
+    return {
+      ...item,
+      group: {
+        ...group,
+        secondary: hasLegacyDetails ? '' : group.secondary,
+        calls: restoredFailure
+          ? [{ ...singleCall, isError: true, status: 'error' }]
+          : group.calls,
+      },
+    }
+  })
 })
 
 function stepToRenderItem(step: NodeStep): ChatToolCallRenderItem {
@@ -1121,8 +1083,7 @@ function operationKey(call: ChatToolCallRenderItem): string {
 }
 
 function isDocumentCall(call: ChatToolCallRenderItem): boolean {
-  const key = operationKey(call)
-  return key === 'document.read' || key === 'document.update'
+  return isLegacyDocumentTool(call.name)
 }
 
 function callDefaultOpen(call: ChatToolCallRenderItem): boolean {
@@ -1340,7 +1301,7 @@ function resolvedGroupStatusText(group: ChatToolCallGroup): string {
 }
 
 function resolvedSecondaryText(call: ChatToolCallRenderItem): string {
-  if (isResourceActivityCall(call)) return ''
+  if (isResourceActivityCall(call) || isDocumentCall(call)) return ''
   return (props.toolSecondaryText ?? defaultToolSecondaryText)(call)
 }
 
@@ -1357,8 +1318,7 @@ function activityTerminalStatusText(call: ChatToolCallRenderItem): string {
 }
 
 function forwardShowResult(content: string, title: string, context?: ToolResultContext) {
-  const key = toolOperationKey(context?.toolName || '')
-  if (key === 'document.read' || key === 'document.update') return
+  if (isLegacyDocumentTool(context?.toolName)) return
   emit('showResult', content, title, context)
 }
 

@@ -1,4 +1,7 @@
-import type { RpcCallOptions, RpcEventHandler } from '@/lib/rpc'
+import type {
+  TransportCallOptions as RpcCallOptions,
+  TransportEventHandler as RpcEventHandler,
+} from './transportTypes'
 import type { PlanCardActionTarget, PlanRevisionRequest } from '@/types/plans'
 import type { PlanCenter, PlanEvent, PlanMutationResult } from '@/modules/planCenter'
 import { PLANS_SET_MODE_METHOD } from '@/contracts/generated/v4/plansSetMode'

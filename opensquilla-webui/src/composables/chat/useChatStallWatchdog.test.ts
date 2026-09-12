@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
 import { ref, nextTick, effectScope, type EffectScope } from 'vue'
 import { conversationSemanticEventKind } from '@/adapters/gateway/conversationEventsV4'
+import type { ConversationEventData } from '@/modules/conversationEventContent'
 import {
   useChatStallWatchdog,
   SOFT_STALL_THRESHOLD_MS as THRESHOLD,
@@ -11,13 +12,13 @@ function harness(streamIdleGraceMs = 0) {
   const negotiatedGrace = ref(streamIdleGraceMs)
   const scope: EffectScope = effectScope()
   let api!: Omit<ReturnType<typeof useChatStallWatchdog>, 'noteEvent'> & {
-    noteEvent(eventName: string, payload?: unknown): void
+    noteEvent(eventName: string, payload?: ConversationEventData): void
   }
   scope.run(() => {
     const semanticApi = useChatStallWatchdog({ isStreaming, streamIdleGraceMs: negotiatedGrace })
     api = {
       ...semanticApi,
-      noteEvent: (eventName: string, payload?: unknown) => (
+      noteEvent: (eventName: string, payload?: ConversationEventData) => (
         semanticApi.noteEvent(conversationSemanticEventKind(eventName), payload)
       ),
     }
@@ -120,9 +121,11 @@ describe('useChatStallWatchdog', () => {
 
     h.api.noteEvent('session.event.ensemble_progress', {
       event_type: 'proposer_start', proposer_index: 0, proposer_label: 'anchor', proposer_model: 'model-a',
+      watchdogMemberId: 'proposer:0::anchor::model-a',
     })
     h.api.noteEvent('session.event.ensemble_progress', {
       event_type: 'proposer_start', proposer_index: 1, proposer_label: 'critic', proposer_model: 'model-b',
+      watchdogMemberId: 'proposer:1::critic::model-b',
     })
     expect(h.api.suspendReason.value).toBe('ensemble-running')
     vi.advanceTimersByTime(THRESHOLD * 2)
@@ -130,15 +133,18 @@ describe('useChatStallWatchdog', () => {
 
     h.api.noteEvent('session.event.ensemble_progress', {
       event_type: 'proposer_finish', proposer_index: 0, proposer_label: 'anchor', proposer_model: 'model-a',
+      watchdogMemberId: 'proposer:0::anchor::model-a',
     })
     expect(h.api.suspendReason.value).toBe('ensemble-running')
     h.api.noteEvent('session.event.ensemble_progress', {
       event_type: 'proposer_finish', proposer_index: 1, proposer_label: 'critic', proposer_model: 'model-b',
+      watchdogMemberId: 'proposer:1::critic::model-b',
     })
     expect(h.api.suspendReason.value).toBe(null)
 
     h.api.noteEvent('session.event.ensemble_progress', {
       event_type: 'aggregator_start', proposer_index: -1, proposer_label: 'aggregator', proposer_model: 'model-z',
+      watchdogMemberId: 'aggregator:-1::aggregator::model-z',
     })
     expect(h.api.suspendReason.value).toBe('ensemble-running')
     vi.advanceTimersByTime(THRESHOLD * 2)
@@ -146,6 +152,7 @@ describe('useChatStallWatchdog', () => {
 
     h.api.noteEvent('session.event.ensemble_progress', {
       event_type: 'aggregator_finish', proposer_index: -1, proposer_label: 'aggregator', proposer_model: 'model-z',
+      watchdogMemberId: 'aggregator:-1::aggregator::model-z',
     })
     expect(h.api.suspendReason.value).toBe(null)
     vi.advanceTimersByTime(THRESHOLD)
@@ -192,14 +199,14 @@ describe('useChatStallWatchdog', () => {
     const h = harness()
     await startStreaming(h)
 
-    h.api.noteEvent('session.event.tool_use_start', { tool_use_id: 't1' })
+    h.api.noteEvent('session.event.tool_use_start', { watchdogToolId: 't1' })
     expect(h.api.suspendReason.value).toBe('tool-running')
 
     // A long tool run emits nothing — the banner must never fire.
     vi.advanceTimersByTime(THRESHOLD * 4)
     expect(h.api.stallActive.value).toBe(false)
 
-    h.api.noteEvent('session.event.tool_result', { tool_use_id: 't1' })
+    h.api.noteEvent('session.event.tool_result', { watchdogToolId: 't1' })
     expect(h.api.suspendReason.value).toBe(null)
 
     // The tool_result is itself content: silence restarts from it.
@@ -214,12 +221,12 @@ describe('useChatStallWatchdog', () => {
     const h = harness()
     await startStreaming(h)
 
-    h.api.noteEvent('session.event.tool_use_start', { tool_use_id: 't1' })
-    h.api.noteEvent('session.event.tool_use_start', { toolUseId: 't2' })
-    h.api.noteEvent('session.event.tool_result', { tool_use_id: 't1' })
+    h.api.noteEvent('session.event.tool_use_start', { watchdogToolId: 't1' })
+    h.api.noteEvent('session.event.tool_use_start', { watchdogToolId: 't2' })
+    h.api.noteEvent('session.event.tool_result', { watchdogToolId: 't1' })
     expect(h.api.suspendReason.value).toBe('tool-running')
 
-    h.api.noteEvent('session.event.tool_result', { toolUseId: 't2' })
+    h.api.noteEvent('session.event.tool_result', { watchdogToolId: 't2' })
     expect(h.api.suspendReason.value).toBe(null)
     h.scope.stop()
   })
@@ -228,7 +235,7 @@ describe('useChatStallWatchdog', () => {
     const h = harness()
     await startStreaming(h)
 
-    h.api.noteEvent('exec.approval.requested', { approval_id: 'a1', session_key: 's1' })
+    h.api.noteEvent('exec.approval.requested', { approval_id: 'a1', key: 's1' })
     expect(h.api.suspendReason.value).toBe('approval-pending')
 
     vi.advanceTimersByTime(THRESHOLD * 6)
@@ -236,7 +243,7 @@ describe('useChatStallWatchdog', () => {
 
     // Resolving unblocks the run; the banner must not fire instantly off the
     // pre-approval silence.
-    h.api.noteEvent('exec.approval.resolved', { approval_id: 'a1', approved: true })
+    h.api.noteEvent('exec.approval.resolved', { approval_id: 'a1' })
     expect(h.api.suspendReason.value).toBe(null)
     expect(h.api.stallActive.value).toBe(false)
 
@@ -251,9 +258,9 @@ describe('useChatStallWatchdog', () => {
     const h = harness()
     await startStreaming(h)
 
-    h.api.noteEvent('plugin.approval.requested', { approvalId: 'p1' })
+    h.api.noteEvent('plugin.approval.requested', { approval_id: 'p1' })
     expect(h.api.suspendReason.value).toBe('approval-pending')
-    h.api.noteEvent('plugin.approval.resolved', { approvalId: 'p1' })
+    h.api.noteEvent('plugin.approval.resolved', { approval_id: 'p1' })
     expect(h.api.suspendReason.value).toBe(null)
     h.scope.stop()
   })
@@ -262,7 +269,7 @@ describe('useChatStallWatchdog', () => {
     const h = harness()
     await startStreaming(h)
 
-    h.api.noteEvent('session.event.tool_use_start', { tool_use_id: 't1' })
+    h.api.noteEvent('session.event.tool_use_start', { watchdogToolId: 't1' })
     h.api.noteEvent('exec.approval.requested', { approval_id: 'a1' })
     expect(h.api.suspendReason.value).toBe('approval-pending')
 
@@ -307,7 +314,7 @@ describe('useChatStallWatchdog', () => {
       const h = harness()
       await startStreaming(h)
 
-      h.api.noteEvent('session.event.tool_use_start', { tool_use_id: 't1' })
+      h.api.noteEvent('session.event.tool_use_start', { watchdogToolId: 't1' })
       h.api.noteEvent(terminal, {})
       expect(h.api.stallActive.value).toBe(false)
       // The orphaned tool from the ended turn no longer suspends anything.
@@ -336,7 +343,7 @@ describe('useChatStallWatchdog', () => {
     const h = harness()
     await startStreaming(h)
 
-    h.api.noteEvent('session.event.tool_use_start', { tool_use_id: 'orphan' })
+    h.api.noteEvent('session.event.tool_use_start', { watchdogToolId: 'orphan' })
     vi.advanceTimersByTime(THRESHOLD * 2)
     expect(h.api.stallActive.value).toBe(false) // suspended by the tool
 

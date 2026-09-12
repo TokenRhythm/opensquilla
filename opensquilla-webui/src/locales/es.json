@@ -67,6 +67,13 @@
     "viewRelease": "Ver versión",
     "dismiss": "Descartar",
     "desktop": {
+      "installErrorTitle": "No se pudo iniciar la instalación",
+      "quitAndInstall": "Salir e instalar",
+      "signedDownloadedDesc": "OpenSquilla {version} está verificado y listo. «Salir e instalar» cierra los servicios en segundo plano y abre el instalador.",
+      "manualApplyingStatus": "Cerrando servicios en segundo plano",
+      "manualApplyingDesc": "OpenSquilla está cerrando sus servicios en segundo plano. El instalador se abrirá cuando se hayan detenido.",
+      "errorSignatureInvalid": "La firma del instalador no es válida o su editor no coincide con OpenSquilla. Se bloqueó la instalación. Descarga la actualización de nuevo.",
+      "errorSignatureUnavailable": "OpenSquilla no pudo verificar la firma del instalador. Se bloqueó la instalación. Inténtalo más tarde.",
       "indicatorAvailable": "Actualizar {version}",
       "indicatorDownloaded": "Actualización lista",
       "indicatorInstallerReady": "Instalador verificado",
@@ -77,7 +84,7 @@
       "availableDesc": "Descárgala cuando estés listo. OpenSquilla la instalará solo después de reiniciar.",
       "manualAvailableDesc": "Descarga el instalador de Windows correspondiente a esta versión. Windows te guiará para completar la instalación.",
       "manualDownloadedTitle": "Instalador verificado listo",
-      "manualDownloadedDesc": "OpenSquilla {version} se verificó con la suma de comprobación oficial de GitHub y se mostró en su carpeta. Ejecuta el instalador cuando estés listo.",
+      "manualDownloadedDesc": "El instalador de OpenSquilla {version} se ha verificado. Selecciona Mostrar instalador para localizar el archivo y ejecútalo manualmente cuando estés listo.",
       "downloadedTitle": "Lista para instalar",
       "downloadedDesc": "Reinicia OpenSquilla para terminar la actualización a {version}.",
       "downloadingTitle": "Descargando actualización",
@@ -88,8 +95,8 @@
       "errorFallback": "Vuelve a intentarlo desde Ajustes.",
       "errorSourceUnreachable": "Las fuentes de actualización no están disponibles temporalmente. Inténtalo de nuevo más tarde.",
       "errorManifestInvalid": "Los datos del canal de versiones no son válidos, por lo que OpenSquilla no puede confirmar la actualización de forma segura.",
-      "errorChecksumUnavailable": "No se puede verificar el instalador porque la suma de comprobación oficial de GitHub no está disponible. No se abrió ningún instalador.",
-      "errorIntegrityFailed": "El instalador descargado no superó la verificación de integridad y se eliminó.",
+      "errorChecksumUnavailable": "No se puede verificar el instalador porque la suma de comprobación oficial de la actualización no está disponible. No se abrió ningún instalador.",
+      "errorIntegrityFailed": "El instalador no superó la verificación de integridad. Descarga la actualización de nuevo.",
       "errorDownloadFailed": "OpenSquilla no pudo descargar la actualización. Comprueba la conexión e inténtalo de nuevo.",
       "errorInstallFailed": "OpenSquilla no pudo preparar o abrir el instalador. Inténtalo de nuevo o usa la página de la versión.",
       "idleDesc": "Busca una nueva versión de escritorio.",
@@ -166,11 +173,33 @@
       "failedDetail": "Vuelve a cargar el navegador aislado para continuar."
     },
     "artifactAnnotation": {
-      "start": "Anotar vista previa", "stop": "Dejar de anotar", "selectElement": "Selecciona un elemento de la página para anotar", "selectElementShort": "Selecciona elemento", "unavailable": "La anotación de vista previa no está disponible.", "desktopEditingOnly": "Selecciona y edita elementos de la página con IA en la aplicación de escritorio.",
-      "createFailed": "No se pudo adjuntar el elemento seleccionado.", "elementChanged": "El elemento seleccionado cambió antes de adjuntarse. Vuelva a seleccionarlo en la vista previa actual.", "rearmFailed": "El modo de anotación se detuvo porque no se pudo reiniciar el selector. Vuelva a activarlo para intentarlo de nuevo.", "updateFailed": "No se pudo guardar el borrador de anotación.", "discardFailed": "No se pudo descartar la anotación. Seguirá abierta para volver a intentarlo.", "closeFailed": "No se pudo cerrar el editor de anotaciones. Inténtelo de nuevo.", "replacementCleanupFailed": "Se conservó la anotación nueva, pero no se pudo eliminar el borrador anterior.",
+      "start": "Anotar vista previa",
+      "stop": "Dejar de anotar",
+      "selectElement": "Selecciona un elemento de la página para anotar",
+      "selectElementShort": "Selecciona elemento",
+      "unavailable": "La anotación de vista previa no está disponible.",
+      "desktopEditingOnly": "Selecciona y edita elementos de la página con IA en la aplicación de escritorio.",
+      "createFailed": "No se pudo adjuntar el elemento seleccionado.",
+      "elementChanged": "El elemento seleccionado cambió antes de adjuntarse. Vuelva a seleccionarlo en la vista previa actual.",
+      "rearmFailed": "El modo de anotación se detuvo porque no se pudo reiniciar el selector. Vuelva a activarlo para intentarlo de nuevo.",
+      "updateFailed": "No se pudo guardar el borrador de anotación.",
+      "discardFailed": "No se pudo descartar la anotación. Seguirá abierta para volver a intentarlo.",
+      "closeFailed": "No se pudo cerrar el editor de anotaciones. Inténtelo de nuevo.",
+      "replacementCleanupFailed": "Se conservó la anotación nueva, pero no se pudo eliminar el borrador anterior.",
       "overlayFallback": "Continúa la anotación a continuación.",
-      "fallbackTitle": "Continuar anotación", "fallbackDetail": "La vista previa está oculta temporalmente. Tu anotación sigue aquí.", "frozenPreview": "Vista previa de la zona seleccionada",
-      "placeholder": "Describe el cambio para esta zona…", "newlineHint": "{shortcut} para una línea nueva", "keepDraft": "Conservar anotación", "submit": "Añadir anotación", "contextLabel": "Selección actual", "bodyLabel": "Anotación de página", "emptyBody": "Describe el cambio solicitado.", "reselectHint": "Selecciona la zona correspondiente de la página.", "reuseHint": "Se copió la solicitud de cambio. Selecciona la zona correspondiente de la página."
+      "fallbackTitle": "Continuar anotación",
+      "fallbackDetail": "La vista previa está oculta temporalmente. Tu anotación sigue aquí.",
+      "frozenPreview": "Vista previa de la zona seleccionada",
+      "placeholder": "Describe el cambio para esta zona…",
+      "newlineHint": "{shortcut} para una línea nueva",
+      "keepDraft": "Conservar anotación",
+      "submit": "Añadir anotación",
+      "contextLabel": "Selección actual",
+      "bodyLabel": "Anotación de página",
+      "emptyBody": "Describe el cambio solicitado.",
+      "reselectHint": "Selecciona la zona correspondiente de la página.",
+      "reuseHint": "Se copió la solicitud de cambio. Selecciona la zona correspondiente de la página.",
+      "screenshotUploadFailed": "No se pudo adjuntar la captura. La anotación se conserva; puedes añadir una imagen manualmente."
     },
     "artifactPreview": {
       "refresh": "Actualizar vista previa",
@@ -180,7 +209,6 @@
       "readyWithWarnings": "La vista previa se está ejecutando con advertencias.",
       "warningsShort": "Advertencias",
       "suspended": "Vista previa en pausa",
-      "agentEditInProgress": "La edición continúa en segundo plano.",
       "nativePreview": "Vista previa interactiva",
       "allowRemoteResources": "Permitir imágenes, estilos y contenido multimedia en línea",
       "blockRemoteResources": "Bloquear imágenes, estilos y contenido multimedia en línea",
@@ -199,7 +227,6 @@
       "setDefaultMode": "Usar este modo de forma predeterminada",
       "restoreDefaultMode": "Restaurar el modo de vista previa predeterminado",
       "defaultModeSaved": "Modo de vista previa predeterminado guardado.",
-      "fullModeNotice": "La vista previa interactiva puede cargar contenido en línea, pero no comparte la identidad de OpenSquilla, archivos locales ni sesiones del navegador.",
       "offlineWebLimits": "Es posible que algunos contenidos externos y funciones web avanzadas no estén disponibles en la vista previa restringida.",
       "compatibilityFallback": "Esta versión de Desktop solo admite la vista previa antigua de un solo archivo.",
       "upgradeDesktopShort": "Actualizar Desktop",
@@ -222,7 +249,6 @@
     },
     "artifactErrors": {
       "documentChanged": "La página cambió. Actualízala antes de volver a intentarlo.",
-      "editSessionRenewalRequired": "La edición se está reconectando. Tus cambios sin guardar siguen disponibles.",
       "writeBusy": "La página se está actualizando. Espera un momento y vuelve a intentarlo.",
       "mutationNotApplied": "La página no se actualizó. Puedes volver a intentarlo.",
       "mutationOutcomePending": "No se puede confirmar el resultado de la actualización. Abre la página para comprobarlo.",
@@ -234,7 +260,8 @@
       "annotationUnavailable": "Esta anotación no está disponible temporalmente.",
       "annotationBusy": "Las anotaciones se están actualizando. Espera un momento y vuelve a intentarlo.",
       "invalidRequest": "No se pudo completar la solicitud. Revisa la entrada y vuelve a intentarlo.",
-      "internalError": "No se pudo completar la operación. Vuelve a intentarlo."
+      "internalError": "No se pudo completar la operación. Vuelve a intentarlo.",
+      "documentEditingRetired": "Actualiza el cliente y vuelve a abrir la página para enviar anotaciones como mensajes."
     },
     "artifactDocument": {
       "sections": "Secciones del documento del artefacto",
@@ -283,16 +310,7 @@
       "revertFailed": "No se pudo revertir este cambio. Revisa la versión más reciente y vuelve a intentarlo.",
       "commentCreateFailed": "No se pudo añadir el comentario. Revisa el estado actual del documento y vuelve a intentarlo.",
       "commentResolveFailed": "No se pudo resolver el comentario. Revisa su estado actual y vuelve a intentarlo.",
-      "noElementSelected": "Coloca el cursor dentro de un elemento HTML",
-      "saving": "Guardando…",
-      "saveSource": "Guardar",
-      "sourceUnavailable": "El código HTML no está disponible.",
-      "sourceConflict": "El documento cambió en otro lugar. Revísalo o recárgalo antes de guardar.",
-      "copyUnsavedSource": "Copiar código sin guardar",
-      "unsavedSourceCopied": "Código sin guardar copiado",
-      "copyUnsavedSourceFailed": "No se pudo copiar el código sin guardar.",
-      "discardAndLoadLatest": "Descartar y cargar la última versión",
-      "sourceStatus": {"ready":"Listo","saving":"Guardando…","dirty":"Sin guardar","saved":"Guardado","error":"Requiere atención"}
+      "sourceUnavailable": "El código HTML no está disponible."
     }
   },
   "nav": {
@@ -1039,7 +1057,9 @@
       "modelNoMatches": "No hay modelos coincidentes — puedes usar lo que escribiste.",
       "modelListTruncated": "Mostrando {shown} de {total} modelos — sigue escribiendo para acotar.",
       "modelProvenance": "Lista del proveedor en vivo · fuente de capacidades: {sources}",
-      "modelMetadataProvenance": "Lista del proveedor en vivo · valores oficiales si están disponibles; si no, valores del catálogo"
+      "modelMetadataProvenance": "Lista del proveedor en vivo · valores oficiales si están disponibles; si no, valores del catálogo",
+      "modelMultimodal": "Multimodal",
+      "modelMultimodalTitle": "Admite entradas de imagen"
     },
     "preset": {
       "modeCustom": "personalizado"
@@ -1109,6 +1129,7 @@
       "removeCandidateAria": "Quitar {model}",
       "ensembleEmpty": "Aún no hay modelos candidatos. Guarda la configuración del servicio de modelos para generar niveles de enrutamiento, o agrega candidatos manualmente.",
       "ensemblePipeline": "Cómo funciona: los modelos proponentes redactan en paralelo y el agregador fusiona los borradores en la respuesta final. Solo el agregador puede invocar herramientas.",
+      "candidateModelHint": "La etiqueta Multimodal indica que el modelo acepta imágenes. Las solicitudes con imágenes siguen la ruta configurada compatible con imágenes.",
       "ensembleFlowDesc": "Varios modelos redactan en paralelo y un agregador las combina en una respuesta. Usa más llamadas.",
       "legacyDynamicNotice": "Este plan de fusión heredado sigue los niveles de modelo guardados. Conviértelo en una alineación personalizada para editar sus miembros.",
       "legacyDynamicMigrate": "Convertir en alineación personalizada",
@@ -1191,6 +1212,7 @@
       "colModel": "Modelo",
       "colThinking": "Razonamiento",
       "colImage": "Imagen",
+      "imageCapabilityAutomatic": "La capacidad de imagen se detecta automáticamente a partir de los metadatos del proveedor y los resultados de las solicitudes; no requiere ajustes manuales.",
       "tierProviderAria": "Entrada de solicitud de {tier}",
       "tierProviderManagedByEnsemble": "Determinada por la fusión multimodelo",
       "tierProviderManagedByEnsembleAria": "La entrada de solicitud de {tier} la determina el plan de fusión multimodelo",
@@ -1221,7 +1243,8 @@
       "tierLegacyDynamicEnsembleSummaryGeneric": "Usa el plan de fusión guardado que sigue los niveles de modelo; si falla, usa el modelo fijo y de respaldo.",
       "tierLegacyDynamicEnsembleFallbackMissingSummary": "Usa el plan de fusión guardado que sigue los niveles de modelo; todavía no hay un modelo fijo y de respaldo utilizable configurado.",
       "tierSingleModelAnnouncement": "C3 usa un solo modelo: {model}.",
-      "tierEnsembleImageRouting": "La fusión C3 no procesa imágenes; las solicitudes de imagen siguen usando la configuración del modelo de imagen.",
+      "tierEnsembleImageRouting": "La fusión C3 recibe indicaciones de texto para las imágenes. Router solo utiliza los modelos C0–C3 configurados para procesar imágenes.",
+      "tierLegacyImageRouting": "Configuración antigua de compatibilidad: este modelo se conserva, pero no se utiliza para las imágenes de entrada. Configure un modelo compatible con imágenes en C0–C3.",
       "tierThinkingManagedByEnsemble": "Determinada por el plan de fusión",
       "tierThinkingManagedByEnsembleAria": "El razonamiento de {tier} lo determina el plan de fusión multimodelo",
       "tierThinkingAria": "Nivel de razonamiento de {tier}",
@@ -1638,9 +1661,6 @@
       "descReloadSuffix": "surten efecto tras actualizar la página.",
       "experimentsGroup": "Experimentos",
       "managementGroup": "Gestión",
-      "foldLabel": "Nuevo renderizado de turnos en vivo",
-      "foldDesc": "Construye la tarjeta de trabajo en streaming desde un registro ordenado de eventos. Desactívalo solo para restaurar temporalmente el renderizado compatible.",
-      "foldAria": "Nuevo renderizado de turnos en vivo (surte efecto tras recargar)",
       "revealLabel": "Ventana de revelado de la respuesta (ms)",
       "revealDesc": "Mantén el revelado de la respuesta en vivo en una ventana [mín., máx.] para que el enrutador pueda decidir primero. mín. ≤ máx.",
       "revealMinAria": "Milisegundos mínimos de revelado de la respuesta",
@@ -2987,7 +3007,9 @@
       "clearActivity": "Borrar actividad",
       "expandActivity": "Expandir actividad de instalación",
       "collapseActivity": "Contraer actividad de instalación",
+      "selectSkillDirectory": "Selecciona un directorio de habilidades",
       "queueStatus": {
+        "selection_required": "Elegir directorio",
         "queued": "En cola",
         "installing": "Instalando",
         "cancelling": "Cancelando",
@@ -3417,6 +3439,7 @@
     "liveConnecting": "Restaurando las actualizaciones en tiempo real…",
     "liveConnectingConnected": "Gateway conectado. Restaurando las actualizaciones en tiempo real de esta sesión…",
     "gatewayReconnecting": "Reconectando con el Gateway…",
+    "automaticRecoveryDescription": "La recuperación es automática. Puedes seguir editando; el texto y los archivos sin enviar se conservan aquí.",
     "liveUnavailable": "Las actualizaciones en tiempo real no están disponibles temporalmente",
     "liveUnavailableDescription": "El historial sigue disponible. Vuelve a conectarte antes de enviar.",
     "liveUnavailableConnectedDescription": "El Gateway está conectado y el historial sigue disponible. El envío se reanudará cuando se recuperen las actualizaciones en tiempo real.",
@@ -3465,7 +3488,7 @@
     "audioUnsupported": "Este navegador no puede reproducir este formato de audio. Descarga el archivo en su lugar.",
     "playVideo": "Reproducir vídeo",
     "videoLoadFailed": "No se pudo cargar el vídeo.",
-    "videoUnsupported": "Este navegador no puede reproducir este formato de vídeo. Descarga el archivo en su lugar.",
+    "videoUnsupported": "Este navegador no puede reproducir este vídeo. Descárgalo en su lugar.",
     "previewOf": "Vista previa: {title}",
     "closePreview": "Cerrar vista previa",
     "previousImage": "Imagen anterior",
@@ -3474,7 +3497,6 @@
     "previewDownload": "Descargar vista previa",
     "previewTimedOut": "Se agotó el tiempo de la vista previa.",
     "previewFailed": "No se pudo cargar la vista previa.",
-    "videoUnsupported": "Este navegador no puede reproducir este vídeo. Descárgalo en su lugar.",
     "loadVideoPreview": "Cargar vista previa del vídeo",
     "loadVideoPreviewFor": "Cargar vista previa del vídeo {title}",
     "videoPreviewLoading": "Cargando la vista previa del vídeo. Puedes cancelar la descarga.",
@@ -3520,6 +3542,7 @@
     "provenance": {
       "cron": "Cron",
       "scheduled": "Programado",
+      "scheduledTrigger": "Activación programada",
       "cronSource": "Programado por {tool}"
     },
     "sandboxSetup": {
@@ -3790,11 +3813,13 @@
       "answerPlanQuestionnaire": "Responde la pregunta del plan de arriba",
       "previousQuestion": "Anterior",
       "nextQuestion": "Siguiente",
-      "outcomeDoneTitle": "Respuesta enviada · ejecución reanudada",
+      "outcomeDoneTitle": "Respuesta recibida",
       "outcomeBusyDetail": "Tu respuesta se está procesando ahora.",
-      "outcomeDoneDetail": "El agente ha aceptado esta respuesta y ha continuado.",
+      "outcomeDoneDetail": "El agente ha recibido tu respuesta.",
       "replyReceived": "Respuesta recibida · continuando la ejecución…",
       "sendingReply": "Enviando respuesta…",
+      "expiredTitle": "Pregunta caducada",
+      "expiredDetail": "Esta pregunta ya no está activa. Puedes enviar un nuevo mensaje.",
       "sendReply": "Enviar respuesta",
       "sendingContinuing": "Enviando respuesta · continuando la ejecución…"
     },
@@ -3961,7 +3986,8 @@
         "generic": "La redirección no está disponible para la tarea actual. El mensaje permanece en cola."
       },
       "clearQueue": "Vaciar cola",
-      "removeMessage": "Quitar el mensaje pendiente {index}"
+      "removeMessage": "Quitar el mensaje pendiente {index}",
+      "annotationUpgradeRequired": "Esta anotación pendiente usa el editor anterior. Edita el mensaje y vuelve a seleccionar la página antes de enviarlo."
     },
     "metaRuns": {
       "draft": "Borrador",

@@ -1,5 +1,6 @@
 import { computed, onScopeDispose, ref, watch, type Ref } from 'vue'
 import type { ConversationSemanticEventKind } from '@/modules/conversationEvents'
+import type { ConversationEventData } from '@/modules/conversationEventContent'
 import { taskTerminalStatus } from '@/utils/chat/streamEvents'
 
 // Soft content-silence watchdog for the live chat stream.
@@ -48,27 +49,16 @@ export interface UseChatStallWatchdogOptions {
   now?: () => number
 }
 
-function payloadToolId(payload: Record<string, unknown>): string {
-  const id = payload.tool_use_id ?? payload.toolUseId ?? payload.id
-  return typeof id === 'string' ? id : ''
+function payloadToolId(payload: ConversationEventData): string {
+  return payload.watchdogToolId ?? ''
 }
 
-function payloadApprovalId(payload: Record<string, unknown>): string {
-  const id = payload.approval_id ?? payload.approvalId
-  return typeof id === 'string' ? id : ''
+function payloadApprovalId(payload: ConversationEventData): string {
+  return payload.approval_id ?? ''
 }
 
-function ensembleMemberId(payload: Record<string, unknown>): string {
-  const eventType = String(payload.event_type || '')
-  const role = eventType.startsWith('aggregator_') ? 'aggregator' : 'proposer'
-  return [
-    role,
-    String(payload.proposer_index ?? ''),
-    String(payload.sample_index ?? ''),
-    String(payload.proposer_label ?? ''),
-    String(payload.proposer_provider ?? ''),
-    String(payload.proposer_model ?? ''),
-  ].join(':')
+function ensembleMemberId(payload: ConversationEventData): string {
+  return payload.watchdogMemberId ?? ''
 }
 
 function ensemblePhase(phase: unknown): 'proposers' | 'aggregator' | '' {
@@ -190,7 +180,7 @@ export function useChatStallWatchdog(options: UseChatStallWatchdogOptions) {
     ensemblePhaseActive.value = true
   }
 
-  function noteEnsembleProgress(record: Record<string, unknown>) {
+  function noteEnsembleProgress(record: ConversationEventData) {
     const eventType = String(record.event_type || '')
     const id = ensembleMemberId(record)
     if (eventType === 'proposer_start' || eventType === 'aggregator_start') {
@@ -235,8 +225,8 @@ export function useChatStallWatchdog(options: UseChatStallWatchdogOptions) {
    * generic run_heartbeat remains liveness-only; ensemble phase heartbeats
    * suspend the soft warning while the backend deadline owns the phase.
    */
-  function noteEvent(eventKind: ConversationSemanticEventKind, payload?: unknown) {
-    const record = (payload && typeof payload === 'object' ? payload : {}) as Record<string, unknown>
+  function noteEvent(eventKind: ConversationSemanticEventKind, record: ConversationEventData = {}) {
+    if (eventKind === 'unknown') return
 
     if (eventKind === 'approval-requested') {
       addApproval(payloadApprovalId(record))

@@ -3,10 +3,15 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import threading
 import time
 import uuid
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager, nullcontext
 from dataclasses import dataclass, field
+from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, cast
 
 from opensquilla.engine.steps.meta_command import (
@@ -14,6 +19,10 @@ from opensquilla.engine.steps.meta_command import (
     pending_meta_launch_put,
     pending_meta_replay_put,
 )
+from opensquilla.gateway.adapters.meta_run_center_contract import (
+    register_meta_run_center_contract,
+)
+from opensquilla.gateway.guest_rpc_policy import is_guest_rpc_method_allowed
 from opensquilla.gateway.protocol import (
     ERROR_INVALID_REQUEST,
     ERROR_NOT_FOUND,
@@ -26,8 +35,9 @@ from opensquilla.gateway.rpc import (
     RpcUnavailableError,
     get_dispatcher,
 )
-from opensquilla.gateway.scopes import ADMIN_SCOPE, WRITE_SCOPE
+from opensquilla.gateway.scopes import ADMIN_SCOPE
 from opensquilla.gateway.session_services import get_session_storage
+from opensquilla.paths import default_opensquilla_home
 from opensquilla.persistence.meta_run_query import parse_since_ms
 from opensquilla.persistence.meta_run_writer import (
     RunRecord,
@@ -43,7 +53,18 @@ from opensquilla.session.storage import (
     MetaLaunchDraftUnavailableError,
     normalize_meta_launch_coordinates,
 )
+from opensquilla.skills.catalog_policy import (
+    STABLE_META_DEPENDENCIES,
+    is_invokable_meta,
+    is_stable_meta_root,
+    logical_locator,
+    meta_sort_key,
+)
+from opensquilla.skills.eligibility import live_eligibility_context
 from opensquilla.skills.hub.deps import install_deps
+from opensquilla.skills.hub.doctor import SkillDoctor
+from opensquilla.skills.hub.management import committed_store_read_guard
+from opensquilla.skills.loader import PinnedSkillLoader, SkillLoader
 from opensquilla.skills.meta.author_seed import draft_meta_skill_seed
 from opensquilla.skills.meta.enabled import is_meta_skill_enabled
 from opensquilla.skills.meta.readiness import (
@@ -125,6 +146,8 @@ _META_SETUP_ACTIVE_JOB_LIMIT = 4
 _META_REPLAY_TICKET_TTL_SECONDS = 30.0
 _META_REPLAY_TICKET_LIMIT = 128
 _META_REPLAY_LIVE_MODES = frozenset({"failed-step", "partial-context"})
+
+
 @dataclass(frozen=True)
 class _MetaReplayTicket:
     """Short-lived capability used to commit one live replay launch."""
@@ -271,10 +294,7 @@ def _run_id_param(params: dict[str, Any]) -> str:
 
 
 def _prune_meta_replay_tickets_locked(now: float) -> None:
-    expired = [
-        token for token, ticket in _META_REPLAY_TICKETS.items()
-        if ticket.expires_at <= now
-    ]
+    expired = [token for token, ticket in _META_REPLAY_TICKETS.items() if ticket.expires_at <= now]
     for token in expired:
         _META_REPLAY_TICKETS.pop(token, None)
     while len(_META_REPLAY_TICKETS) >= _META_REPLAY_TICKET_LIMIT:
@@ -324,11 +344,7 @@ def _consume_meta_replay_ticket(
         ticket = _META_REPLAY_TICKETS.get(token)
         if ticket is None:
             return None
-        if (
-            ticket.session_key != session_key
-            or ticket.run_id != run_id
-            or ticket.mode != mode
-        ):
+        if ticket.session_key != session_key or ticket.run_id != run_id or ticket.mode != mode:
             return None
         return _META_REPLAY_TICKETS.pop(token, None)
 
@@ -426,7 +442,6 @@ async def _handle_meta_runs_failures(params: Any, ctx: RpcContext) -> dict[str, 
     return {"runs": [_serialize_record_summary(row) for row in hydrated]}
 
 
-@_d.method("meta.runs.recovery", scope="operator.admin")
 async def _handle_meta_runs_recovery(params: Any, ctx: RpcContext) -> dict[str, Any]:
     """Return the latest unresolved failed-run ribbon for one session.
 
@@ -468,10 +483,7 @@ async def _handle_meta_runs_recovery(params: Any, ctx: RpcContext) -> dict[str, 
             >= (descendant.started_at_ms, descendant.run_id)
             or mode not in _META_REPLAY_LIVE_MODES
             or descendant.status in {"cancelled", "expired"}
-            or (
-                descendant.status == "failed"
-                and build_recovery_events(descendant) is None
-            )
+            or (descendant.status == "failed" and build_recovery_events(descendant) is None)
         ):
             continue
         superseded_run_ids.add(source.run_id)
@@ -500,7 +512,6 @@ async def _handle_meta_runs_draft(params: Any, ctx: RpcContext) -> dict[str, Any
     }
 
 
-@_d.method("meta.runs.confirm_preflight", scope="operator.admin")
 async def _handle_meta_runs_confirm_preflight(params: Any, ctx: RpcContext) -> dict[str, Any]:
     writer = _writer_from_context(ctx)
     p = params if isinstance(params, dict) else {}
@@ -549,7 +560,6 @@ async def _handle_meta_runs_diff(params: Any, ctx: RpcContext) -> dict[str, Any]
     }
 
 
-@_d.method("meta.runs.replay", scope="operator.admin")
 async def _handle_meta_runs_replay(params: Any, ctx: RpcContext) -> dict[str, Any]:
     writer = _writer_from_context(ctx)
     p = params if isinstance(params, dict) else {}
@@ -608,10 +618,7 @@ async def _handle_meta_runs_replay(params: Any, ctx: RpcContext) -> dict[str, An
         run_id=record.run_id,
         mode=mode,
     )
-    if (
-        consumed_ticket is None
-        or consumed_ticket.meta_skill_name != record.meta_skill_name
-    ):
+    if consumed_ticket is None or consumed_ticket.meta_skill_name != record.meta_skill_name:
         raise RpcHandlerError(
             ERROR_UNAUTHORIZED,
             "the replay authorization expired, was already used, or does not match",
@@ -704,7 +711,7 @@ def _meta_setup_plan(name: str, ctx: RpcContext) -> tuple[MetaSkillReadiness, di
     spec = skill_index.get(name)
     if (
         spec is None
-        or getattr(spec, "kind", "skill") != "meta"
+        or not is_invokable_meta(spec)
         or getattr(spec, "disable_model_invocation", False)
     ):
         raise RpcHandlerError(ERROR_NOT_FOUND, f"meta-skill not found: {name}")
@@ -763,9 +770,7 @@ def _setup_job_for_request(params: dict[str, Any]) -> _MetaSetupJob:
 
 
 def _active_meta_setup_job_count() -> int:
-    return sum(
-        job.status in {"queued", "running"} for job in _META_SETUP_JOBS.values()
-    )
+    return sum(job.status in {"queued", "running"} for job in _META_SETUP_JOBS.values())
 
 
 async def _run_meta_setup_job(
@@ -825,7 +830,9 @@ async def _run_meta_setup_job(
 
         job.phase = "verifying"
         job.message = "Verifying installed capabilities"
-        from opensquilla.engine.steps.skills_filter import invalidate_skill_eligibility_cache
+        from opensquilla.engine.steps.skill_catalog_projection import (
+            invalidate_skill_eligibility_cache,
+        )
 
         invalidate_skill_eligibility_cache()
         readiness, _ = await asyncio.to_thread(_meta_setup_plan, job.name, ctx)
@@ -854,7 +861,6 @@ async def _run_meta_setup_job(
         job.finished_at_ms = int(time.time() * 1000)
 
 
-@_d.method("meta.setup.plan", scope="operator.read")
 async def _handle_meta_setup_plan(params: Any, ctx: RpcContext) -> dict[str, Any]:
     p = params if isinstance(params, dict) else {}
     name = str(p.get("name") or "")
@@ -870,7 +876,6 @@ async def _handle_meta_setup_plan(params: Any, ctx: RpcContext) -> dict[str, Any
     return {"ok": True, "name": name, "readiness": readiness.to_dict()}
 
 
-@_d.method("meta.setup.install", scope="operator.admin")
 async def _handle_meta_setup_install(params: Any, ctx: RpcContext) -> dict[str, Any]:
     """Start an explicitly confirmed setup in the background."""
 
@@ -957,49 +962,220 @@ async def _handle_meta_setup_install(params: Any, ctx: RpcContext) -> dict[str, 
     return {"ok": True, "job": job.to_dict(), "reused": False}
 
 
-@_d.method("meta.setup.status", scope="operator.read")
 async def _handle_meta_setup_status(params: Any, ctx: RpcContext) -> dict[str, Any]:
     p = params if isinstance(params, dict) else {}
     _prune_meta_setup_jobs()
     return {"ok": True, "job": _setup_job_for_request(p).to_dict()}
 
 
-@_d.method("meta.list", scope="operator.read")
-async def _handle_meta_list(params: Any, ctx: RpcContext) -> dict[str, Any]:
-    """Enumerate invokable meta-skills for manual-invocation surfaces.
+def _meta_path_key(path: str) -> str:
+    return os.path.normcase(os.path.abspath(path)) if path else ""
 
-    Gated by the master ``meta_skill.enabled`` flag: when disabled the surface
-    receives an explicit empty list rather than a partial enumeration. Skills
-    are filtered to launchable ``kind == "meta"`` entries and sorted by name
-    for stable ordering across calls.
-    """
+
+def _meta_catalog_identity(spec: Any, install_ids: dict[str, str]) -> dict[str, str]:
+    return {
+        "layer": str(spec.layer),
+        "instance_id": str(getattr(spec, "instance_id", "") or ""),
+        "install_id": install_ids.get(_meta_path_key(str(spec.base_dir or "")), ""),
+    }
+
+
+@asynccontextmanager
+async def _read_meta_catalog(
+    ctx: RpcContext, reason: str,
+) -> AsyncIterator[tuple[Any, dict[str, str]]]:
+    """Pin Meta roots and their install identities to one committed catalog."""
+
+    loader = getattr(ctx, "skill_loader", None)
+    managed_dir = getattr(loader, "managed_dir", None)
+    service = getattr(ctx, "skill_management_service", None)
+    service_guard = getattr(service, "committed_store_read", None)
+    guard = (
+        service_guard() if callable(service_guard)
+        else committed_store_read_guard(managed_dir) if managed_dir is not None
+        else nullcontext()
+    )
+    async with guard:
+        if loader is None:
+            yield SimpleNamespace(skills=(), generation=0), {}
+            return
+        if hasattr(loader, "snapshot_for_turn"):
+            snapshot = await asyncio.to_thread(loader.snapshot_for_turn, reason)
+        else:
+            snapshot = SimpleNamespace(
+                skills=await asyncio.to_thread(loader.load_all), generation=0,
+            )
+        install_ids: dict[str, str] = {}
+        if managed_dir is not None:
+            injected = getattr(service, "lockfile_path", None)
+            lockfile_path = (
+                Path(injected) if injected else default_opensquilla_home() / "skills-lock.json"
+            )
+            doctor = SkillDoctor(
+                managed_dir=managed_dir,
+                lockfile_path=lockfile_path,
+                loader=cast(SkillLoader, PinnedSkillLoader(snapshot, loader)),
+                eligibility_context=live_eligibility_context(getattr(ctx.config, "skills", None)),
+            )
+            report = await asyncio.to_thread(doctor.doctor)
+            install_ids = {_meta_path_key(item.path): item.install_id for item in report.skills}
+        yield snapshot, install_ids
+
+
+def _meta_identity_param(params: dict[str, Any], camel: str, snake: str) -> str:
+    values = [params[key] for key in (camel, snake) if key in params]
+    if any(not isinstance(value, str) for value in values):
+        raise RpcHandlerError(ERROR_INVALID_REQUEST, f"{camel} must be a string")
+    normalized = [value.strip() for value in values]
+    if len(set(normalized)) > 1:
+        raise RpcHandlerError(ERROR_INVALID_REQUEST, f"{camel} and {snake} must match")
+    return normalized[0] if normalized else ""
+
+
+def _meta_dependency_names(spec: Any) -> list[str]:
+    dependency_names = (
+        list(STABLE_META_DEPENDENCIES.get(spec.name, ())) if is_stable_meta_root(spec) else []
+    )
+    if dependency_names:
+        return dependency_names
+    composition = getattr(spec, "composition_raw", None)
+    steps = composition.get("steps", []) if isinstance(composition, dict) else []
+    seen: set[str] = set()
+    for step in steps if isinstance(steps, list) else []:
+        if not isinstance(step, dict):
+            continue
+        candidates = [step.get("skill")]
+        routes = step.get("routes")
+        if isinstance(routes, list):
+            candidates.extend(route.get("skill") for route in routes if isinstance(route, dict))
+        for candidate in candidates:
+            if isinstance(candidate, str) and candidate and candidate not in seen:
+                seen.add(candidate)
+                dependency_names.append(candidate)
+    return dependency_names
+
+
+async def _handle_meta_list(params: Any, ctx: RpcContext) -> dict[str, Any]:
+    """Enumerate public Meta roots with passive readiness and exact identities."""
+
     if not is_meta_skill_enabled(ctx.config):
         return {"skills": [], "disabled": True}
-    def project_skills() -> list[dict[str, Any]]:
-        specs = _existing_specs(ctx)
+    async with _read_meta_catalog(ctx, "rpc.meta.list") as (snapshot, install_ids):
+        specs = list(snapshot.skills)
         skill_index = {spec.name: spec for spec in specs}
-        skills = []
-        for spec in specs:
-            if getattr(spec, "kind", "skill") != "meta":
-                continue
-            if getattr(spec, "disable_model_invocation", False):
-                continue
-            readiness = assess_meta_skill_readiness(
-                spec,
-                skill_index=skill_index,
-                ctx=meta_readiness_context(config=getattr(ctx, "config", None)),
-                verify_capabilities=False,
-                config=getattr(ctx, "config", None),
-            )
-            skills.append({
-                "name": spec.name,
-                "description": getattr(spec, "description", ""),
-                **readiness.to_dict(),
-            })
-        skills.sort(key=lambda skill: skill["name"])
-        return skills
+        generation = int(getattr(snapshot, "generation", 0) or 0)
 
-    return {"skills": await asyncio.to_thread(project_skills)}
+        def project_skills() -> list[dict[str, Any]]:
+            readiness_ctx = meta_readiness_context(config=ctx.config)
+            readiness_ctx.disabled_set = live_eligibility_context(
+                getattr(ctx.config, "skills", None),
+            ).disabled_set
+            skills = []
+            stable_specs = (
+                item for item in specs
+                if is_invokable_meta(item)
+                and not bool(getattr(item, "disable_model_invocation", False))
+                and item.name not in readiness_ctx.disabled_set
+            )
+            for spec in sorted(stable_specs, key=meta_sort_key):
+                readiness = assess_meta_skill_readiness(
+                    spec,
+                    skill_index=skill_index,
+                    ctx=readiness_ctx,
+                    verify_capabilities=False,
+                    config=ctx.config,
+                )
+                skills.append({
+                    **_meta_catalog_identity(spec, install_ids),
+                    "name": spec.name,
+                    "description": getattr(spec, "description", ""),
+                    "visibility": str(getattr(spec, "visibility", "meta")),
+                    "invocation": str(getattr(spec, "invocation", "meta_only")),
+                    "generation": generation,
+                    "digest": getattr(spec, "tree_digest", ""),
+                    "source": logical_locator(spec, generation=generation),
+                    "dependency_count": len(_meta_dependency_names(spec)),
+                    **readiness.to_dict(),
+                })
+            return skills
+
+        return {"skills": await asyncio.to_thread(project_skills)}
+
+
+async def _handle_meta_inspect(params: Any, ctx: RpcContext) -> dict[str, Any]:
+    """Inspect a public Meta winner; supplied identities never select a shadow."""
+
+    if not is_meta_skill_enabled(ctx.config):
+        return {"disabled": True}
+    p = params if isinstance(params, dict) else {}
+    name = p.get("name")
+    if not isinstance(name, str) or not name.strip():
+        raise RpcHandlerError(ERROR_INVALID_REQUEST, "name is required")
+    name = name.strip()
+    instance_id = _meta_identity_param(p, "instanceId", "instance_id")
+    install_id = _meta_identity_param(p, "installId", "install_id")
+    async with _read_meta_catalog(ctx, "rpc.meta.inspect") as (snapshot, install_ids):
+        generation = int(getattr(snapshot, "generation", 0) or 0)
+        specs = list(snapshot.skills)
+        index = {spec.name: spec for spec in specs}
+        root = index.get(name)
+        readiness_ctx = meta_readiness_context(config=ctx.config)
+        readiness_ctx.disabled_set = live_eligibility_context(
+            getattr(ctx.config, "skills", None),
+        ).disabled_set
+        if (
+            root is None or not is_invokable_meta(root)
+            or bool(getattr(root, "disable_model_invocation", False))
+            or name in readiness_ctx.disabled_set
+        ):
+            raise RpcHandlerError(ERROR_NOT_FOUND, f"meta skill not found: {name}")
+        identity = _meta_catalog_identity(root, install_ids)
+        if (
+            (instance_id and instance_id != identity["instance_id"])
+            or (install_id and install_id != identity["install_id"])
+        ):
+            raise RpcHandlerError(
+                ERROR_NOT_FOUND, f"meta skill identity does not match winner: {name}",
+            )
+        dependency_names = _meta_dependency_names(root)
+
+        dependencies: list[dict[str, Any]] = []
+        for dependency_name in dependency_names:
+            spec = index.get(dependency_name)
+            dependencies.append(
+                {
+                    "name": dependency_name,
+                    "available": spec is not None,
+                    "visibility": str(getattr(spec, "visibility", "internal")),
+                    "invocation": str(getattr(spec, "invocation", "meta_only")),
+                    "owners": list(getattr(spec, "owner_meta_skills", []) or []),
+                    "digest": getattr(spec, "tree_digest", "") if spec is not None else "",
+                    "source": (
+                        logical_locator(spec, generation=generation) if spec is not None else ""
+                    ),
+                }
+            )
+        readiness = await asyncio.to_thread(
+            assess_meta_skill_readiness,
+            root,
+            skill_index=index,
+            ctx=readiness_ctx,
+            verify_capabilities=False,
+            config=getattr(ctx, "config", None),
+        )
+        return {
+            **_meta_catalog_identity(root, install_ids),
+            "name": root.name,
+            "description": getattr(root, "description", ""),
+            "generation": generation,
+            "digest": getattr(root, "tree_digest", ""),
+            "source": logical_locator(root, generation=generation),
+            "visibility": str(getattr(root, "visibility", "meta")),
+            "invocation": str(getattr(root, "invocation", "meta_only")),
+            "dependencies": dependencies,
+            "dependency_count": len(dependencies),
+            **readiness.to_dict(),
+        }
 
 
 def _require_meta_draft_owner(ctx: RpcContext) -> None:
@@ -1011,7 +1187,6 @@ def _require_meta_draft_owner(ctx: RpcContext) -> None:
     )
 
 
-@_d.method("meta.drafts.list", scope=WRITE_SCOPE)
 async def _handle_meta_drafts_list(params: Any, ctx: RpcContext) -> dict[str, Any]:
     """Return live, unaccepted launch drafts for crash/app-restart recovery."""
 
@@ -1040,19 +1215,19 @@ async def _handle_meta_drafts_list(params: Any, ctx: RpcContext) -> dict[str, An
             projected: list[dict[str, Any]] = []
             for draft in drafts:
                 session_exists = (
-                    bool(await get_session(draft.session_key))
-                    if callable(get_session)
-                    else True
+                    bool(await get_session(draft.session_key)) if callable(get_session) else True
                 )
-                projected.append({
-                    "sessionKey": draft.session_key,
-                    "clientRequestId": draft.client_request_id,
-                    "name": draft.meta_skill_name,
-                    "launchText": draft.launch_text,
-                    "createdAt": draft.created_at,
-                    "expiresAt": draft.expires_at,
-                    "sessionExists": session_exists,
-                })
+                projected.append(
+                    {
+                        "sessionKey": draft.session_key,
+                        "clientRequestId": draft.client_request_id,
+                        "name": draft.meta_skill_name,
+                        "launchText": draft.launch_text,
+                        "createdAt": draft.created_at,
+                        "expiresAt": draft.expires_at,
+                        "sessionExists": session_exists,
+                    }
+                )
     except TimeoutError as exc:
         raise RpcHandlerError(
             ERROR_UNAVAILABLE,
@@ -1067,16 +1242,13 @@ async def _handle_meta_drafts_list(params: Any, ctx: RpcContext) -> dict[str, An
     }
 
 
-@_d.method("meta.drafts.discard", scope=WRITE_SCOPE)
 async def _handle_meta_drafts_discard(params: Any, ctx: RpcContext) -> dict[str, Any]:
     """Forget one launch only after an explicit user discard."""
 
     _require_meta_draft_owner(ctx)
     p = params if isinstance(params, dict) else {}
     raw_session_key = p.get("sessionKey") or p.get("key") or ""
-    raw_client_request_id = (
-        p.get("clientRequestId") or p.get("client_request_id") or ""
-    )
+    raw_client_request_id = p.get("clientRequestId") or p.get("client_request_id") or ""
     try:
         session_key, client_request_id = normalize_meta_launch_coordinates(
             raw_session_key,
@@ -1116,7 +1288,6 @@ async def _handle_meta_drafts_discard(params: Any, ctx: RpcContext) -> dict[str,
     }
 
 
-@_d.method("meta.run", scope="operator.write")
 async def _handle_meta_run(params: Any, ctx: RpcContext) -> dict[str, Any]:
     """Stamp a pending meta-skill launch for the ``/meta`` command surface.
 
@@ -1198,7 +1369,7 @@ async def _handle_meta_run(params: Any, ctx: RpcContext) -> dict[str, Any]:
     for spec in specs:
         if getattr(spec, "name", None) != name:
             continue
-        if getattr(spec, "kind", "skill") != "meta":
+        if not is_invokable_meta(spec):
             continue
         if getattr(spec, "disable_model_invocation", False):
             continue
@@ -1411,3 +1582,29 @@ async def _handle_meta_run(params: Any, ctx: RpcContext) -> dict[str, Any]:
     if draft_disposition is not None:
         result["drafted"] = True
     return result
+
+
+_META_RUN_CENTER_CONTRACT_IMPLEMENTATIONS = {
+    "meta.list": _handle_meta_list,
+    "meta.inspect": _handle_meta_inspect,
+    "meta.drafts.list": _handle_meta_drafts_list,
+    "meta.drafts.discard": _handle_meta_drafts_discard,
+    "meta.run": _handle_meta_run,
+    "meta.runs.confirm_preflight": _handle_meta_runs_confirm_preflight,
+    "meta.runs.recovery": _handle_meta_runs_recovery,
+    "meta.runs.replay": _handle_meta_runs_replay,
+    "meta.setup.plan": _handle_meta_setup_plan,
+    "meta.setup.install": _handle_meta_setup_install,
+    "meta.setup.status": _handle_meta_setup_status,
+}
+
+_META_RUN_CENTER_CONTRACT_HANDLERS = {
+    method: register_meta_run_center_contract(
+        _d,
+        method,
+        implementation,
+        internal_error=RpcHandlerError,
+        guest_allowed_checker=is_guest_rpc_method_allowed,
+    )
+    for method, implementation in _META_RUN_CENTER_CONTRACT_IMPLEMENTATIONS.items()
+}

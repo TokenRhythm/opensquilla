@@ -1,11 +1,16 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-if [[ "$#" -ne 2 ]]; then
-  echo "usage: $0 CANDIDATE_DMG LABEL" >&2
+if [[ "$#" -lt 2 || "$#" -gt 3 ]]; then
+  echo "usage: $0 CANDIDATE_DMG LABEL [BASELINE_VERSION]" >&2
   exit 2
 fi
 
+baseline_version="${3-0.5.3}"
+if [[ "${baseline_version}" != "0.5.3" && "${baseline_version}" != "0.5.4" ]]; then
+  echo "baseline version must be 0.5.3 or 0.5.4" >&2
+  exit 2
+fi
 candidate_dmg="$(cd "$(dirname "$1")" && pwd)/$(basename "$1")"
 label="$2"
 if [[ ! "${label}" =~ ^[A-Za-z0-9._-]{1,80}$ ]]; then
@@ -13,9 +18,9 @@ if [[ ! "${label}" =~ ^[A-Za-z0-9._-]{1,80}$ ]]; then
   exit 2
 fi
 
-sandbox="${RUNNER_TEMP}/opensquilla-release-preservation-${label}"
-old_dir="${sandbox}/v0.5.3"
-old_mount="${sandbox}/v0.5.3-mount"
+sandbox="${RUNNER_TEMP}/opensquilla-release-preservation-${label}-${baseline_version}"
+old_dir="${sandbox}/v${baseline_version}"
+old_mount="${sandbox}/v${baseline_version}-mount"
 candidate_mount="${sandbox}/candidate-mount"
 install_root="${sandbox}/Applications"
 user_data="${sandbox}/user-data/OpenSquilla"
@@ -23,7 +28,7 @@ profile="${user_data}/opensquilla"
 probe="${GITHUB_WORKSPACE}/.github/scripts/verify-release-profile-preservation.py"
 external_sentinels="${sandbox}/synthetic-system-tools"
 session_recovery_smoke="${GITHUB_WORKSPACE}/desktop/electron/scripts/test-packaged-session-recovery.mjs"
-old_asset="OpenSquilla-0.5.3-mac-arm64.dmg"
+old_asset="OpenSquilla-${baseline_version}-mac-arm64.dmg"
 mkdir -p "${old_dir}" "${old_mount}" "${candidate_mount}" "${install_root}" "${user_data}"
 
 cleanup() {
@@ -36,8 +41,8 @@ cleanup() {
 }
 trap cleanup EXIT
 
-gh release download v0.5.3 \
-  --repo opensquilla/opensquilla \
+gh release download "v${baseline_version}" \
+  --repo TokenRhythm/opensquilla \
   --pattern "${old_asset}" \
   --dir "${old_dir}"
 old_dmg="${old_dir}/${old_asset}"
@@ -47,15 +52,26 @@ test -f "${candidate_dmg}"
 hdiutil attach -nobrowse -readonly -mountpoint "${old_mount}" "${old_dmg}"
 ditto "${old_mount}/OpenSquilla.app" "${install_root}/OpenSquilla.app"
 hdiutil detach "${old_mount}" -quiet
-old_runtime="${install_root}/OpenSquilla.app/Contents/Resources/runtime/developer/darwin-arm64"
-test -x "${old_runtime}/python/bin/python3"
-test -x "${old_runtime}/node/bin/node"
+old_version="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' \
+  "${install_root}/OpenSquilla.app/Contents/Info.plist")"
+test "${old_version}" = "${baseline_version}"
+# v0.5.3 bundles developer tools; v0.5.4 uses the slim Runtime Pack layout.
+if [[ "${baseline_version}" == "0.5.3" ]]; then
+  old_runtime="${install_root}/OpenSquilla.app/Contents/Resources/runtime/developer/darwin-arm64"
+  test -x "${old_runtime}/python/bin/python3"
+  test -x "${old_runtime}/node/bin/node"
+else
+  old_runtime="${install_root}/OpenSquilla.app/Contents/Resources/runtime"
+  test ! -e "${old_runtime}/developer"
+  test -f "${old_runtime}/runtime-manifest.json"
+  test -f "${old_runtime}/runtime-pack-catalog.json"
+fi
 
 python "${probe}" seed --home "${profile}" --label "${label}" \
   --external-root "${external_sentinels}"
 
 hdiutil attach -nobrowse -readonly -mountpoint "${candidate_mount}" "${candidate_dmg}"
-mv "${install_root}/OpenSquilla.app" "${install_root}/OpenSquilla.v0.5.3.app"
+mv "${install_root}/OpenSquilla.app" "${install_root}/OpenSquilla.v${baseline_version}.app"
 ditto "${candidate_mount}/OpenSquilla.app" "${install_root}/OpenSquilla.app"
 hdiutil detach "${candidate_mount}" -quiet
 candidate_runtime="${install_root}/OpenSquilla.app/Contents/Resources/runtime"
@@ -111,7 +127,7 @@ PY
 python "${probe}" verify --home "${profile}" --label "${label}" \
   --external-root "${external_sentinels}"
 
-python - "${install_root}/OpenSquilla.app" "${install_root}/OpenSquilla.v0.5.3.app" <<'PY'
+python - "${install_root}/OpenSquilla.app" "${install_root}/OpenSquilla.v${baseline_version}.app" <<'PY'
 import shutil
 import sys
 
@@ -119,6 +135,6 @@ for app_path in sys.argv[1:]:
     shutil.rmtree(app_path)
 PY
 test ! -e "${install_root}/OpenSquilla.app"
-test ! -e "${install_root}/OpenSquilla.v0.5.3.app"
+test ! -e "${install_root}/OpenSquilla.v${baseline_version}.app"
 python "${probe}" verify --home "${profile}" --label "${label}" \
   --external-root "${external_sentinels}"

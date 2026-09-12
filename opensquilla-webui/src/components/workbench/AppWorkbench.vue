@@ -182,16 +182,8 @@ import { usePlatform } from '@/platform'
 import type { NativeWorkbenchSurfaceEvent } from '@/platform/types'
 import { useArtifactDocumentsStore } from '@/stores/artifactDocuments'
 import { useArtifactPromptAnnotationsStore } from '@/stores/artifactPromptAnnotations'
-import {
-  flushActiveWorkbenchDocumentContext,
-  useWorkbenchDocumentContextStore,
-  type ActiveWorkbenchDocumentContext,
-  type WorkbenchDocumentContextPrepareRequest,
-  type WorkbenchDocumentPrepareRequest,
-} from '@/stores/workbenchDocumentContext'
 import { useWorkbenchResourcesStore } from '@/stores/workbenchResources'
 import type { ArtifactPayload } from '@/types/artifacts'
-import type { ChatDocumentContext } from '@/types/chat'
 import {
   ARTIFACT_WORKBENCH_KEY,
   type ArtifactDocumentChange,
@@ -243,12 +235,12 @@ import {
 import {
   ARTIFACT_PROMPT_ANNOTATION_FOCUS_EVENT,
   ARTIFACT_PROMPT_ANNOTATION_REUSE_EVENT,
-  ARTIFACT_PROMPT_ANNOTATIONS_ACCEPTED_EVENT,
+  PAGE_ANNOTATIONS_SENT_EVENT,
   type ArtifactPromptAnnotationFocusDetail,
   type ArtifactPromptAnnotationReuseDetail,
-  type ArtifactPromptAnnotationsAcceptedDetail,
+  type PageAnnotationsSentDetail,
 } from '@/workbench/promptAnnotations'
-import { PromptAnnotationAcceptanceQueue } from '@/workbench/promptAnnotationAcceptanceQueue'
+import { PageAnnotationSendQueue } from '@/workbench/pageAnnotationSendQueue'
 import { useWorkbenchStore } from '@/workbench/store'
 import type {
   NativeSurfaceRect,
@@ -292,7 +284,6 @@ if (!injectedArtifactWorkbench) throw new Error('ArtifactWorkbench was not provi
 const artifactWorkbench = injectedArtifactWorkbench
 const artifactDocuments = useArtifactDocumentsStore()
 const artifactPromptAnnotations = useArtifactPromptAnnotationsStore()
-const workbenchDocumentContext = useWorkbenchDocumentContextStore()
 const workbenchResources = useWorkbenchResourcesStore()
 const artifactDocumentProvider = artifactWorkbench.documents
 artifactDocuments.setProvider(artifactDocumentProvider)
@@ -320,11 +311,6 @@ let stopSurfaceEvents: (() => void) | null = null
 let stopArtifactEvents: (() => void) | null = null
 let detachRuntime: (() => Promise<void>) | null = null
 let scopeChangeGeneration = 0
-const documentContextController = workbenchDocumentContext.attachController(
-  prepareActiveDocumentContext,
-  prepareWorkbenchDocument,
-)
-
 function artifactPreviewItemForExplicitOpen(
   options: Parameters<typeof createArtifactPreviewWorkbenchItem>[0],
 ): WorkbenchItem {
@@ -377,9 +363,11 @@ function onBrowserWorkbenchOpen(event: Event) {
 
 for (const definition of createArtifactWorkbenchDefinitions({
   artifactContent: artifactWorkbench.content,
+  artifactPreviews: artifactWorkbench.previews,
   artifactDocuments,
   promptAnnotations: props.promptAnnotationsEnabled ? {
     create: request => artifactPromptAnnotations.create(request),
+    setScreenshot: (annotationId, attachment) => artifactPromptAnnotations.setScreenshot(annotationId, attachment),
     update: (annotationId, body) => artifactPromptAnnotations.update(annotationId, body),
     discard: annotationId => artifactPromptAnnotations.discard(annotationId),
     beginOverlayEdit: (annotationId, sessionKey) => {
@@ -421,10 +409,6 @@ for (const definition of createArtifactWorkbenchDefinitions({
   previewLeasesEnabled: true,
   pushToast: (message, options) => pushToast(message, options),
   savePreviewPreferences: preferences => savePreviewPreferences(platform, preferences),
-  showFullPreviewNotice: () => pushToast(
-    t('workbench.artifactPreview.fullModeNotice'),
-    { tone: 'info', duration: 9000 },
-  ),
   t: (key, params) => String(t(key, params || {})),
 })) {
   workbenchPanelRegistry.register(definition, { replace: true })
@@ -443,11 +427,11 @@ workbenchPanelRegistry.register(createBrowserWorkbenchDefinition({
   t: (key, params) => String(t(key, params || {})),
 }), { replace: true })
 detachRuntime = attachWorkbenchRuntime(store, runtimeManager)
-const promptAnnotationAcceptanceQueue = new PromptAnnotationAcceptanceQueue()
-let promptAnnotationAcceptanceFlush: Promise<void> | null = null
-let promptAnnotationAcceptanceFlushRequested = false
-let promptAnnotationAcceptanceRetryTimer: ReturnType<typeof setTimeout> | null = null
-let promptAnnotationAcceptanceRetryDelay = 250
+const pageAnnotationSendQueue = new PageAnnotationSendQueue()
+let pageAnnotationSendFlush: Promise<void> | null = null
+let pageAnnotationSendFlushRequested = false
+let pageAnnotationSendRetryTimer: ReturnType<typeof setTimeout> | null = null
+let pageAnnotationSendRetryDelay = 250
 const stopPromptAnnotationLifecycle = store.onLifecycle(event => {
   // The acceptance response can arrive before the resource/session descriptor
   // is mounted. Open and update are the authoritative handoff boundaries;
@@ -457,7 +441,7 @@ const stopPromptAnnotationLifecycle = store.onLifecycle(event => {
     || event.type === 'update'
     || event.type === 'activate'
     || event.type === 'resume'
-  ) schedulePromptAnnotationAcceptanceFlush()
+  ) schedulePageAnnotationSendFlush()
 })
 
 function resourceSessionKey(item: WorkbenchItem): string {
@@ -513,7 +497,7 @@ async function openWorkbenchResource(resource: WorkbenchResource, item: Workbenc
   if (
     !current
     && resource.resource.type !== 'document'
-    && resource.capabilities.manualEdit
+    && resource.capabilities.edit
     && resource.sha256
   ) {
     await importWorkbenchResourceForSession(resource, sessionKey)
@@ -868,6 +852,18 @@ function onSurfaceRect(rect: NativeSurfaceRect) {
 }
 
 function onNativeSurfaceEvent(event: NativeWorkbenchSurfaceEvent) {
+  if (event.type === 'browser-opened') {
+    const detail = event.detail
+    if (!detail?.url || detail.sessionKey !== props.sessionId || !nativeApi) return
+    const item = createBrowserWorkbenchItem({ scopeId: detail.sessionKey, url: detail.url })
+    if (!item) return
+    item.id = event.surfaceId
+    item.title = detail.title || item.title
+    item.payload = { ...item.payload, adoptedNativeSurface: true, targetRef: detail.targetRef }
+    store.openItem(item)
+    store.setExpanded(true)
+    return
+  }
   runtimeManager.handleNativeSurfaceEvent(event)
 }
 
@@ -940,7 +936,19 @@ async function onPromptAnnotationFocus(event: Event) {
     detail.complete?.(false)
     return
   }
-  detail.complete?.(true)
+  const draft = artifactPromptAnnotations.annotations[detail.annotationId]
+  if (!draft?.targetRef || !draft.locatorHint || !nativeApi?.focusWorkbenchAnnotation) {
+    detail.complete?.(false)
+    return
+  }
+  try {
+    const result = await nativeApi.focusWorkbenchAnnotation({
+      surfaceId: item.id, targetRef: draft.targetRef, locatorHint: draft.locatorHint,
+    })
+    detail.complete?.(result.ok)
+  } catch {
+    detail.complete?.(false)
+  }
 }
 
 async function onPromptAnnotationReuse(event: Event) {
@@ -967,9 +975,9 @@ async function onPromptAnnotationReuse(event: Event) {
   detail.complete?.(true)
 }
 
-async function deliverPromptAnnotationAcceptance(
+async function deliverPageAnnotationSend(
   item: WorkbenchItem,
-  acceptedIds: readonly string[],
+  draftIds: readonly string[],
 ): Promise<boolean> {
   // A descriptor may be replaced while the runtime queue is draining. Keep
   // the acknowledgement queued in that case; the store's update lifecycle
@@ -977,8 +985,8 @@ async function deliverPromptAnnotationAcceptance(
   const current = store.items.find(candidate => candidate.id === item.id)
   if (current !== item || item.kind !== 'artifact-preview') return false
   runtimeManager.handleComponentEvent(item, {
-    type: 'artifact-prompt-annotations-accepted',
-    payload: { acceptedIds: [...acceptedIds] },
+    type: 'page-annotations-sent',
+    payload: { draftIds: [...draftIds] },
   })
   await runtimeManager.flush(item.id)
   if (store.items.find(candidate => candidate.id === item.id) !== item) return false
@@ -1003,58 +1011,58 @@ async function deliverPromptAnnotationAcceptance(
   return state.annotationMode !== true && state.annotationModeStopping !== true
 }
 
-async function flushPromptAnnotationAcceptanceQueue(): Promise<void> {
+async function flushPageAnnotationSendQueue(): Promise<void> {
   await nextTick()
   // A session can also have a resource collection or browser tab open. Only
   // artifact previews can consume this event; passing other session-scoped
   // items to the queue would make a no-op look like a failed delivery and
   // retain an already-applied acknowledgement until TTL expiry.
   const artifactItems = store.items.filter(item => item.kind === 'artifact-preview')
-  await promptAnnotationAcceptanceQueue.flush(
+  await pageAnnotationSendQueue.flush(
     artifactItems,
     sessionKeyFromWorkbenchItem,
-    deliverPromptAnnotationAcceptance,
+    deliverPageAnnotationSend,
   )
-  if (promptAnnotationAcceptanceQueue.size === 0) {
-    promptAnnotationAcceptanceRetryDelay = 250
+  if (pageAnnotationSendQueue.size === 0) {
+    pageAnnotationSendRetryDelay = 250
     return
   }
-  if (promptAnnotationAcceptanceRetryTimer) return
-  const delay = promptAnnotationAcceptanceRetryDelay
-  promptAnnotationAcceptanceRetryDelay = Math.min(delay * 2, 4_000)
-  promptAnnotationAcceptanceRetryTimer = setTimeout(() => {
-    promptAnnotationAcceptanceRetryTimer = null
-    schedulePromptAnnotationAcceptanceFlush()
+  if (pageAnnotationSendRetryTimer) return
+  const delay = pageAnnotationSendRetryDelay
+  pageAnnotationSendRetryDelay = Math.min(delay * 2, 4_000)
+  pageAnnotationSendRetryTimer = setTimeout(() => {
+    pageAnnotationSendRetryTimer = null
+    schedulePageAnnotationSendFlush()
   }, delay)
 }
 
-function schedulePromptAnnotationAcceptanceFlush(): void {
-  if (promptAnnotationAcceptanceRetryTimer) {
-    clearTimeout(promptAnnotationAcceptanceRetryTimer)
-    promptAnnotationAcceptanceRetryTimer = null
+function schedulePageAnnotationSendFlush(): void {
+  if (pageAnnotationSendRetryTimer) {
+    clearTimeout(pageAnnotationSendRetryTimer)
+    pageAnnotationSendRetryTimer = null
   }
-  if (promptAnnotationAcceptanceFlush) {
-    promptAnnotationAcceptanceFlushRequested = true
+  if (pageAnnotationSendFlush) {
+    pageAnnotationSendFlushRequested = true
     return
   }
-  promptAnnotationAcceptanceFlush = flushPromptAnnotationAcceptanceQueue()
+  pageAnnotationSendFlush = flushPageAnnotationSendQueue()
     .catch(() => undefined)
     .finally(() => {
-      promptAnnotationAcceptanceFlush = null
-      if (!promptAnnotationAcceptanceFlushRequested) return
-      promptAnnotationAcceptanceFlushRequested = false
-      schedulePromptAnnotationAcceptanceFlush()
+      pageAnnotationSendFlush = null
+      if (!pageAnnotationSendFlushRequested) return
+      pageAnnotationSendFlushRequested = false
+      schedulePageAnnotationSendFlush()
     })
 }
 
-async function onPromptAnnotationsAccepted(event: Event) {
-  const detail = (event as CustomEvent<ArtifactPromptAnnotationsAcceptedDetail>).detail
-  if (!detail?.sessionKey || detail.acceptedIds.length === 0) return
+async function onPageAnnotationsSent(event: Event) {
+  const detail = (event as CustomEvent<PageAnnotationsSentDetail>).detail
+  if (!detail?.sessionKey || detail.draftIds.length === 0) return
   // Chat acceptance can update the resource descriptor after this event. Keep
   // the acknowledgement until an artifact item exists instead of relying on
   // a fixed number of render ticks.
-  if (promptAnnotationAcceptanceQueue.enqueue(detail)) {
-    schedulePromptAnnotationAcceptanceFlush()
+  if (pageAnnotationSendQueue.enqueue(detail)) {
+    schedulePageAnnotationSendFlush()
   }
 }
 
@@ -1071,152 +1079,6 @@ async function beforeCloseItem(
   }
   return accepted
 }
-
-function activeWorkbenchDocumentContext(): ActiveWorkbenchDocumentContext | null {
-  if (!props.enabled || !props.routeActive || !store.expanded) return null
-  const sessionKey = props.sessionId.trim()
-  if (!sessionKey || store.activeSessionId !== sessionKey) return null
-  const item = store.activeItem
-  if (
-    !item
-    || item.kind !== 'artifact-preview'
-    || item.scope.type !== 'session'
-    || item.scope.id !== sessionKey
-  ) return null
-  const artifact = artifactFromWorkbenchItem(item)
-  if (!artifact) return null
-  const snapshot = artifactDocuments.snapshot(artifact, sessionKey)
-  const workspace = snapshot.workspace
-  if (
-    snapshot.stale
-    || workspace?.source !== 'document-api'
-    || !workspace.document.documentId
-    || !workspace.document.headRevisionId
-  ) return null
-  return {
-    activeItemId: item.id,
-    documentId: workspace.document.documentId,
-    headRevisionId: workspace.document.headRevisionId,
-    sessionKey,
-  }
-}
-
-function activeDocumentRequestIsCurrent(
-  request: WorkbenchDocumentContextPrepareRequest,
-): boolean {
-  if (request.isCurrent?.() === false) return false
-  const current = activeWorkbenchDocumentContext()
-  return current?.sessionKey === request.sessionKey
-    && current.activeItemId === request.activeItemId
-    && current.documentId === request.documentId
-}
-
-async function waitForLatestArtifactDocument(
-  artifact: ArtifactPayload,
-  sessionKey: string,
-) {
-  if (artifactDocuments.snapshot(artifact, sessionKey).loading) {
-    await new Promise<void>((resolve) => {
-      const stop = watch(
-        () => artifactDocuments.snapshot(artifact, sessionKey).loading,
-        loading => {
-          if (loading) return
-          stop()
-          resolve()
-        },
-      )
-    })
-  }
-  return artifactDocuments.snapshot(artifact, sessionKey)
-}
-
-async function prepareActiveDocumentContext(
-  request: WorkbenchDocumentContextPrepareRequest,
-) {
-  const item = store.activeItem
-  const artifact = item ? artifactFromWorkbenchItem(item) : null
-  if (!item || !artifact || !activeDocumentRequestIsCurrent(request)) return false
-
-  return flushActiveWorkbenchDocumentContext({
-    beforeClose: () => beforeCloseItem(item, { preserveRuntime: true }),
-    isCurrent: () => activeDocumentRequestIsCurrent(request),
-    readLatest: async () => {
-      const latest = await waitForLatestArtifactDocument(artifact, request.sessionKey)
-      if (!activeDocumentRequestIsCurrent(request)) return null
-      const workspace = latest.workspace
-      if (
-        latest.loading
-        || latest.stale
-        || workspace?.source !== 'document-api'
-        || workspace.document.documentId !== request.documentId
-        || !workspace.document.headRevisionId
-      ) return null
-      return {
-        documentId: workspace.document.documentId,
-        headRevisionId: workspace.document.headRevisionId,
-      }
-    },
-  })
-}
-
-function workbenchDocumentItem(request: WorkbenchDocumentPrepareRequest): WorkbenchItem | null {
-  if (
-    request.isCurrent?.() === false
-    || props.sessionId.trim() !== request.sessionKey
-    || store.activeSessionId !== request.sessionKey
-  ) return null
-  const matches = store.items.filter((item) => {
-    if (
-      item.kind !== 'artifact-preview'
-      || item.scope.type !== 'session'
-      || item.scope.id !== request.sessionKey
-    ) return false
-    const artifact = artifactFromWorkbenchItem(item)
-    if (!artifact) return false
-    return artifactDocuments.snapshot(artifact, request.sessionKey)
-      .workspace?.document.documentId === request.documentId
-  })
-  return matches.length === 1 ? matches[0]! : null
-}
-
-async function prepareWorkbenchDocument(
-  request: WorkbenchDocumentPrepareRequest,
-): Promise<ChatDocumentContext | null | false> {
-  const item = workbenchDocumentItem(request)
-  if (!item) return null
-  const artifact = artifactFromWorkbenchItem(item)
-  if (!artifact) return null
-  const isCurrent = () => (
-    request.isCurrent?.() !== false
-    && workbenchDocumentItem(request)?.id === item.id
-  )
-  if (!isCurrent()) return false
-  try {
-    if (!await beforeCloseItem(item, { preserveRuntime: true }) || !isCurrent()) return false
-    const latest = await waitForLatestArtifactDocument(artifact, request.sessionKey)
-    const workspace = latest.workspace
-    if (
-      !isCurrent()
-      || latest.loading
-      || latest.stale
-      || workspace?.source !== 'document-api'
-      || workspace.document.documentId !== request.documentId
-      || !workspace.document.headRevisionId
-    ) return false
-    return {
-      documentId: workspace.document.documentId,
-      headRevisionId: workspace.document.headRevisionId,
-    }
-  } catch {
-    return false
-  }
-}
-
-watch(
-  activeWorkbenchDocumentContext,
-  context => documentContextController.setActive(context),
-  { flush: 'sync', immediate: true },
-)
 
 async function setSessionScopeSafely(sessionId: string | null) {
   const generation = ++scopeChangeGeneration
@@ -1266,7 +1128,7 @@ watch(
       return
     }
     if (props.routeActive && sessionKey) {
-      void artifactWorkbench.ready().then(() => workbenchResources.load(sessionKey, true)).then(() => {
+      void workbenchResources.load(sessionKey, true).then(() => {
         refreshResourceCollectionItem(sessionKey)
       }).catch(() => undefined)
     }
@@ -1279,31 +1141,29 @@ onMounted(() => {
   stopArtifactEvents = () => documentChanges.close()
   const sessionKey = store.activeSessionId || props.sessionId
   if (props.routeActive && sessionKey) {
-    void artifactWorkbench.ready().then(() => refreshOpenArtifactDocuments(sessionKey))
-      .catch(() => undefined)
+    refreshOpenArtifactDocuments(sessionKey)
   }
   window.addEventListener(BROWSER_WORKBENCH_OPEN_EVENT, onBrowserWorkbenchOpen)
   window.addEventListener(ARTIFACT_PROMPT_ANNOTATION_FOCUS_EVENT, onPromptAnnotationFocus)
   window.addEventListener(ARTIFACT_PROMPT_ANNOTATION_REUSE_EVENT, onPromptAnnotationReuse)
   window.addEventListener(
-    ARTIFACT_PROMPT_ANNOTATIONS_ACCEPTED_EVENT,
-    onPromptAnnotationsAccepted,
+    PAGE_ANNOTATIONS_SENT_EVENT,
+    onPageAnnotationsSent,
   )
 })
 
 onBeforeUnmount(() => {
-  documentContextController.detach()
   stopPromptAnnotationLifecycle()
-  promptAnnotationAcceptanceQueue.clear()
-  if (promptAnnotationAcceptanceRetryTimer) clearTimeout(promptAnnotationAcceptanceRetryTimer)
-  promptAnnotationAcceptanceRetryTimer = null
-  promptAnnotationAcceptanceFlushRequested = false
+  pageAnnotationSendQueue.clear()
+  if (pageAnnotationSendRetryTimer) clearTimeout(pageAnnotationSendRetryTimer)
+  pageAnnotationSendRetryTimer = null
+  pageAnnotationSendFlushRequested = false
   window.removeEventListener(BROWSER_WORKBENCH_OPEN_EVENT, onBrowserWorkbenchOpen)
   window.removeEventListener(ARTIFACT_PROMPT_ANNOTATION_FOCUS_EVENT, onPromptAnnotationFocus)
   window.removeEventListener(ARTIFACT_PROMPT_ANNOTATION_REUSE_EVENT, onPromptAnnotationReuse)
   window.removeEventListener(
-    ARTIFACT_PROMPT_ANNOTATIONS_ACCEPTED_EVENT,
-    onPromptAnnotationsAccepted,
+    PAGE_ANNOTATIONS_SENT_EVENT,
+    onPageAnnotationsSent,
   )
   stopSurfaceEvents?.()
   stopSurfaceEvents = null

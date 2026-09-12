@@ -1,5 +1,8 @@
 ---
 name: meta-home-it-rescue
+visibility: experimental
+invocation: experimental_internal
+disable-model-invocation: true
 description: "Use this meta-skill instead of answering directly when the user needs help with home, small-team, laptop, browser, printer, Docker, Git, network, UI, or deployment troubleshooting that benefits from multi-skill orchestration across symptom intake, environment capture, web lookup, and repair planning."
 kind: meta
 meta_priority: 60

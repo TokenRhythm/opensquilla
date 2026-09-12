@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import json
 from collections.abc import AsyncIterator
+from copy import deepcopy
 from typing import Any
 
 import httpx
 import structlog
 
+from opensquilla.endpoint_identity import endpoint_replay_source
 from opensquilla.env import trust_env as _trust_env
 from opensquilla.execution_status import derive_is_error
 
@@ -36,6 +38,7 @@ from .types import (
     Message,
     ModelInfo,
     ProviderFinalRequestProjection,
+    ProviderReplayState,
     StreamEvent,
     TextDeltaEvent,
     ToolDefinition,
@@ -46,6 +49,31 @@ log = structlog.get_logger(__name__)
 
 _ANTHROPIC_API_BASE = "https://api.anthropic.com"
 _ANTHROPIC_VERSION = "2023-06-01"
+_ANTHROPIC_REPLAY_PROTOCOL = "anthropic_messages"
+
+
+def _anthropic_replay_source(provider_id: str, endpoint: str) -> str:
+    return endpoint_replay_source("anthropic_messages", provider_id, endpoint)
+
+
+def _native_content_projection(content: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Project known fields for comparison with current typed history.
+
+    Unknown blocks deliberately cannot match a typed message. Raw content may
+    preserve extra metadata, but cannot resurrect content removed by a history
+    filter, tool repair, or other request-local transformation.
+    """
+    fields = {
+        "text": ("type", "text"),
+        "thinking": ("type", "thinking", "signature"),
+        "redacted_thinking": ("type", "data"),
+        "tool_use": ("type", "id", "name", "input"),
+        "compaction": ("type", "content", "cache_control"),
+    }
+    return [
+        {key: block[key] for key in fields.get(str(block.get("type")), ()) if key in block}
+        for block in content
+    ]
 
 
 # The SKUs this adapter advertises from list_models. The LISTING SET is
@@ -102,16 +130,6 @@ def _document_unsupported_fallback_text(title: str | None) -> str:
     return f"[document attached but not consumable by this model] ({label})"
 
 
-def _has_document_block(messages: list[Message]) -> bool:
-    for msg in messages:
-        if isinstance(msg.content, str):
-            continue
-        for block in msg.content:
-            if getattr(block, "type", None) == "document":
-                return True
-    return False
-
-
 def _build_message_payload(
     msg: Message,
     model: str | None = None,
@@ -121,6 +139,12 @@ def _build_message_payload(
 ) -> dict[str, Any]:
     if isinstance(msg.content, str):
         return {"role": msg.role, "content": msg.content}
+    # The provider checks source/model as well; this helper also rejects an
+    # explicit foreign protocol when called independently.
+    replay_provider_state = replay_provider_state and (
+        msg.provider_replay is None
+        or msg.provider_replay.protocol == _ANTHROPIC_REPLAY_PROTOCOL
+    )
     parts: list[dict[str, Any]] = []
     tool_result_parts: list[dict[str, Any]] = []
     for block in msg.content:
@@ -182,9 +206,12 @@ def _build_message_payload(
                 "type": "thinking",
                 "thinking": block.thinking,
             }
-            if block.signature:
+            if block.signature is not None:
                 thinking_block["signature"] = block.signature
             parts.append(thinking_block)
+        elif block.type == "redacted_thinking":
+            if replay_provider_state:
+                parts.append({"type": "redacted_thinking", "data": block.data})
         elif block.type == "compaction":
             compaction_block: dict[str, Any] = {"type": "compaction"}
             if block.content is not None:
@@ -208,6 +235,23 @@ def _build_message_payload(
             )
     if tool_result_parts:
         parts = tool_result_parts + parts
+    state = msg.provider_replay
+    if replay_provider_state and state is not None and state.native_content is not None:
+        try:
+            native_matches = json.dumps(parts, sort_keys=True, allow_nan=False) == json.dumps(
+                _native_content_projection(state.native_content), sort_keys=True, allow_nan=False,
+            )
+        except (OverflowError, RecursionError, TypeError, ValueError):
+            native_matches = False
+        if native_matches:
+            parts = deepcopy(state.native_content)
+        else:
+            # Exact captured content is usable only while the current history
+            # still represents it. Never restore filtered text or tool calls.
+            parts = [
+                part for part in parts
+                if part["type"] not in {"thinking", "redacted_thinking"}
+            ]
     return {"role": msg.role, "content": parts}
 
 
@@ -318,6 +362,9 @@ class AnthropicProvider:
         # profiles such as MiniMax carry their own configured identity for
         # response attribution without changing Anthropic-shaped behavior.
         self.provider_id = (provider_id or self.provider_name).strip()
+        self._replay_source = _anthropic_replay_source(
+            self.provider_id, self._api_url("/v1/messages")
+        )
         self._listing_model_ids = listing_model_ids
         self._temperature_floor_model_ids = temperature_floor_model_ids
         self._temperature_floor = temperature_floor
@@ -335,6 +382,18 @@ class AnthropicProvider:
         """Prevent provider-private thinking/signature replay for this turn."""
 
         self._replay_provider_state = False
+
+    def can_replay_reasoning(self, message: Message) -> bool:
+        """Whether captured native state belongs to this continuation route."""
+        state = message.provider_replay
+        return bool(
+            self._replay_provider_state
+            and message.role == "assistant"
+            and state is not None
+            and state.protocol == _ANTHROPIC_REPLAY_PROTOCOL
+            and state.source == self._replay_source
+            and state.model == self._model
+        )
 
     def _api_url(self, path: str) -> str:
         """Build an API URL without duplicating the version prefix."""
@@ -368,7 +427,10 @@ class AnthropicProvider:
             _build_message_payload(
                 message,
                 model=self._model,
-                replay_provider_state=self._replay_provider_state,
+                replay_provider_state=(
+                    self._replay_provider_state
+                    and (message.provider_replay is None or self.can_replay_reasoning(message))
+                ),
                 record_unsupported_document=record_diagnostics,
             )
             for message in messages
@@ -569,7 +631,10 @@ class AnthropicProvider:
         cached_tokens = 0
         cache_creation_tokens = 0
         reasoning = ReasoningAccumulator()
-        thinking_signature: str | None = None
+        native_blocks: dict[int, dict[str, Any]] = {}
+        native_open_blocks: set[int] = set()
+        native_capture_invalid = False
+        native_capture_unsupported = False
         stop_reason = "end_turn"
         message_stopped = False
         message_started = False
@@ -720,6 +785,36 @@ class AnthropicProvider:
                             index = event.get("index", -1)
                             block = event.get("content_block", {})
                             btype = block.get("type")
+                            if (
+                                not isinstance(index, int) or isinstance(index, bool) or index < 0
+                                or index in native_blocks or not isinstance(btype, str)
+                                or not _is_finite_json_object(block)
+                            ):
+                                native_capture_invalid = True
+                            else:
+                                native_blocks[index] = deepcopy(block)
+                                native_open_blocks.add(index)
+                                string_fields = {
+                                    "text": ("text",),
+                                    "thinking": ("thinking", "signature"),
+                                    "redacted_thinking": ("data",),
+                                }
+                                for field in string_fields.get(btype, ()):
+                                    if field in block and not isinstance(block[field], str):
+                                        native_capture_invalid = True
+                                if btype == "text" and isinstance(block.get("text"), str):
+                                    if block["text"]:
+                                        text_parts.append(block["text"])
+                                        yield TextDeltaEvent(text=block["text"])
+                                elif btype == "thinking":
+                                    initial_thinking = block.get("thinking", "")
+                                    native_blocks[index].setdefault("thinking", "")
+                                    if isinstance(initial_thinking, str):
+                                        reasoning_event = reasoning.emit(initial_thinking)
+                                        if reasoning_event is not None:
+                                            yield reasoning_event
+                                elif btype == "redacted_thinking" and "data" not in block:
+                                    native_capture_invalid = True
                             if candidate_artifact is not None:
                                 if (
                                     index in candidate_open_blocks
@@ -773,10 +868,55 @@ class AnthropicProvider:
                                     continue
                                 for tool_event in tool_events:
                                     yield tool_event
+                                initial_input = block.get("input")
+                                if initial_input not in (None, {}):
+                                    if not _is_finite_json_object(initial_input):
+                                        invalid_tool_call_ids.add(str(block.get("id", "")))
+                                    else:
+                                        for tool_event in tools_acc.append(
+                                            index, json.dumps(initial_input, ensure_ascii=False)
+                                        ):
+                                            yield tool_event
 
                         elif etype == "content_block_delta":
                             delta = event.get("delta", {})
                             dtype = delta.get("type")
+                            index = event.get("index", -1)
+                            valid_index = (
+                                isinstance(index, int)
+                                and not isinstance(index, bool) and index >= 0
+                            )
+                            native_block = native_blocks.get(index) if valid_index else None
+                            if native_block is None or index not in native_open_blocks:
+                                native_capture_invalid = True
+                            elif dtype in {"text_delta", "thinking_delta", "signature_delta"}:
+                                field, expected_type = {
+                                    "text_delta": ("text", "text"),
+                                    "thinking_delta": ("thinking", "thinking"),
+                                    "signature_delta": ("signature", "thinking"),
+                                }[dtype]
+                                value = delta.get(field, "")
+                                previous = native_block.get(field, "")
+                                if (
+                                    native_block.get("type") != expected_type
+                                    or not isinstance(value, str) or not isinstance(previous, str)
+                                ):
+                                    native_capture_invalid = True
+                                else:
+                                    native_block[field] = previous + value
+                            elif dtype == "citations_delta" and native_block.get("type") == "text":
+                                citation = delta.get("citation")
+                                citations = native_block.setdefault("citations", [])
+                                if isinstance(citation, dict) and isinstance(citations, list):
+                                    citations.append(deepcopy(citation))
+                                else:
+                                    native_capture_invalid = True
+                            elif dtype != "input_json_delta":
+                                # Keep supporting future diagnostic/server-side
+                                # stream frames without claiming complete replay.
+                                native_capture_unsupported = True
+                            elif native_block.get("type") != "tool_use":
+                                native_capture_unsupported = True
                             if dtype == "text_delta":
                                 text = delta.get("text", "")
                                 text_parts.append(text)
@@ -825,11 +965,16 @@ class AnthropicProvider:
                                 reasoning_event = reasoning.emit(delta.get("thinking", ""))
                                 if reasoning_event is not None:
                                     yield reasoning_event
-                            elif dtype == "signature_delta":
-                                thinking_signature = delta.get("signature") or thinking_signature
 
                         elif etype == "content_block_stop":
                             index = event.get("index", -1)
+                            if (
+                                not isinstance(index, int) or isinstance(index, bool) or index < 0
+                                or index not in native_open_blocks
+                            ):
+                                native_capture_invalid = True
+                            else:
+                                native_open_blocks.discard(index)
                             if candidate_artifact is not None:
                                 if (
                                     index not in candidate_open_blocks
@@ -879,6 +1024,8 @@ class AnthropicProvider:
                                 arguments_valid = False
                             identity_valid = bool(tool_name.strip())
                             if arguments_valid and identity_valid:
+                                if index in native_blocks:
+                                    native_blocks[index]["input"] = deepcopy(arguments)
                                 try:
                                     tool_events = tools_acc.finish_with_arguments(
                                         index, arguments
@@ -993,6 +1140,16 @@ class AnthropicProvider:
                         yield ErrorEvent(message=message, code="incomplete_tool_call")
                         return
 
+                    if native_capture_invalid or native_open_blocks:
+                        code = (
+                            "invalid_stream_frame"
+                            if native_capture_invalid else "incomplete_stream"
+                        )
+                        message = "Anthropic response has invalid or incomplete content blocks"
+                        trace.record_error(code=code, message=message)
+                        yield ErrorEvent(message=message, code=code)
+                        return
+
                     # Tool block completion is provisional until the response
                     # itself reaches ``message_stop``.  Release complete calls
                     # atomically immediately before the terminal DoneEvent.
@@ -1015,6 +1172,13 @@ class AnthropicProvider:
                             truncated=False,
                         )
                     reasoning_content = reasoning.finalize()
+                    native_content = [native_blocks[index] for index in sorted(native_blocks)]
+                    thinking_blocks = [
+                        block for block in native_content if block.get("type") == "thinking"
+                    ]
+                    thinking_signature = (
+                        thinking_blocks[0].get("signature") if len(thinking_blocks) == 1 else None
+                    )
                     trace.record_response(
                         usage={
                             "input_tokens": input_tokens,
@@ -1040,6 +1204,16 @@ class AnthropicProvider:
                         cache_write_tokens=cache_creation_tokens,
                         model=self._model,
                         provider=self.provider_id,
+                        provider_replay=(
+                            ProviderReplayState(
+                                protocol=_ANTHROPIC_REPLAY_PROTOCOL,
+                                source=self._replay_source,
+                                model=self._model,
+                                native_content=native_content,
+                            )
+                            if candidate_artifact is None and not native_capture_unsupported
+                            else None
+                        ),
                     )
 
         except CandidateArtifactLimitError as exc:

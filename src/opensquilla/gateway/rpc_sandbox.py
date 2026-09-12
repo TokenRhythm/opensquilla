@@ -28,6 +28,9 @@ from opensquilla.application.sandbox_runtime import (
 from opensquilla.gateway.adapters.sandbox_runtime_contract import (
     register_sandbox_runtime_contract,
 )
+from opensquilla.gateway.adapters.workspace_catalog_contract import (
+    register_workspace_catalog_contract,
+)
 from opensquilla.gateway.guest_rpc_policy import is_guest_rpc_method_allowed
 from opensquilla.gateway.project_workspace_runtime import (
     authoritative_project_run_context,
@@ -1413,7 +1416,6 @@ async def _handle_sandbox_bundle_disable(params: dict | None, ctx: RpcContext) -
     return _payload(context)
 
 
-@_d.method("sandbox.path.list", scope="operator.read")
 async def _handle_sandbox_path_list(params: dict | None, ctx: RpcContext) -> dict:
     params = _require_params(params)
     session_key = _require_session_key(params)
@@ -1444,7 +1446,6 @@ async def _handle_sandbox_path_list(params: dict | None, ctx: RpcContext) -> dic
     }
 
 
-@_d.method("sandbox.path.create-directory", scope="operator.write")
 async def _handle_sandbox_path_create_directory(
     params: dict | None,
     ctx: RpcContext,
@@ -1488,7 +1489,6 @@ async def _handle_sandbox_path_create_directory(
     }
 
 
-@_d.method("sandbox.path.pick", scope="operator.write")
 async def _handle_sandbox_path_pick(params: dict | None, ctx: RpcContext) -> dict:
     params = _require_params(params)
     session_key = _require_session_key(params)
@@ -1566,3 +1566,21 @@ async def _handle_sandbox_workspace_set(params: dict | None, ctx: RpcContext) ->
     if callable(invalidate_adoption):
         invalidate_adoption()
     return _payload(context)
+
+
+_SANDBOX_PATH_CONTRACT_IMPLEMENTATIONS = {
+    "sandbox.path.list": _handle_sandbox_path_list,
+    "sandbox.path.create-directory": _handle_sandbox_path_create_directory,
+    "sandbox.path.pick": _handle_sandbox_path_pick,
+}
+
+_SANDBOX_PATH_CONTRACT_HANDLERS = {
+    method: register_workspace_catalog_contract(
+        _d,
+        method,
+        implementation,
+        internal_error=RpcHandlerError,
+        guest_allowed_checker=is_guest_rpc_method_allowed,
+    )
+    for method, implementation in _SANDBOX_PATH_CONTRACT_IMPLEMENTATIONS.items()
+}

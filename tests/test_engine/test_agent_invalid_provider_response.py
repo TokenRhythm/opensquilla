@@ -26,6 +26,7 @@ from opensquilla.provider import TextDeltaEvent as ProviderText
 from opensquilla.provider import ToolUseDeltaEvent as ProviderToolUseDelta
 from opensquilla.provider import ToolUseEndEvent as ProviderToolUseEnd
 from opensquilla.provider import ToolUseStartEvent as ProviderToolUseStart
+from opensquilla.provider.types import ContentBlockImage
 from opensquilla.session.manager import SessionManager
 from opensquilla.session.storage import SessionStorage
 from opensquilla.tools.dispatch import build_tool_handler
@@ -232,6 +233,58 @@ async def test_reasoning_only_first_turn_retries_without_disabling_thinking() ->
 
 
 @pytest.mark.asyncio
+async def test_reasoning_only_image_turn_preserves_thinking_on_retry() -> None:
+    provider = _SequenceProvider(
+        [
+            [
+                ProviderDone(
+                    stop_reason="stop",
+                    input_tokens=10,
+                    output_tokens=5,
+                    reasoning_tokens=5,
+                    reasoning_content="internal reasoning",
+                )
+            ],
+            [
+                ProviderText(text="image analyzed"),
+                ProviderDone(stop_reason="stop", input_tokens=11, output_tokens=2),
+            ],
+        ]
+    )
+    agent = Agent(
+        provider=provider,
+        config=AgentConfig(
+            thinking=ThinkingLevel.MEDIUM,
+            retry_base_backoff_ms=0,
+            retry_max_backoff_ms=0,
+        ),
+    )
+
+    events = [
+        event
+        async for event in agent.run_turn(
+            "describe the image",
+            extra_messages=[
+                Message(
+                    role="user",
+                    content=[ContentBlockImage(media_type="image/png", data="c3ludGhldGlj")],
+                )
+            ],
+        )
+    ]
+
+    assert any(event.kind == "done" and event.text == "image analyzed" for event in events)
+    warning = next(
+        event
+        for event in events
+        if event.kind == "warning" and event.code == "provider_reasoning_only_retry"
+    )
+    assert "thinking disabled" not in warning.message
+    assert provider.calls[0]["config"].thinking is True
+    assert provider.calls[1]["config"].thinking is True
+
+
+@pytest.mark.asyncio
 async def test_reasoning_only_prefill_recovery_cleans_synthetic_history(tmp_path) -> None:
     provider = _SequenceProvider(
         [
@@ -294,10 +347,7 @@ async def test_reasoning_only_prefill_recovery_cleans_synthetic_history(tmp_path
     assert assistant_messages[0].content[0].text == "ok"
     assert assistant_messages[0].reasoning_content is None
     logged = [json.loads(line) for line in runtime_events_path.read_text().splitlines()]
-    recovery_event = next(
-        event for event in logged if event.get("mechanism") == "reasoning_prefill_recovery"
-    )
-    assert recovery_event["injected_to_model"] is True
+    assert not any(event.get("feature") == "runtime_recovery" for event in logged)
 
 
 @pytest.mark.parametrize(
@@ -308,7 +358,7 @@ async def test_reasoning_only_prefill_recovery_cleans_synthetic_history(tmp_path
     ],
 )
 @pytest.mark.asyncio
-async def test_length_capped_reasoning_recovery_disables_thinking_on_next_call(
+async def test_length_capped_reasoning_recovery_preserves_thinking_on_next_call(
     tmp_path,
     reasoning_format: str,
     warning_code: str,
@@ -334,6 +384,7 @@ async def test_length_capped_reasoning_recovery_disables_thinking_on_next_call(
     agent = Agent(
         provider=provider,
         config=AgentConfig(
+            thinking=ThinkingLevel.MEDIUM,
             model_capabilities=ModelCapabilities(
                 supports_reasoning=True,
                 supports_tools=True,
@@ -349,15 +400,15 @@ async def test_length_capped_reasoning_recovery_disables_thinking_on_next_call(
     events = [event async for event in agent.run_turn("hello")]
 
     assert len(provider.calls) == 2
-    assert provider.calls[1]["config"].thinking is False
-    assert provider.calls[1]["config"].thinking_level == ThinkingLevel.OFF
-    assert provider.calls[1]["config"].thinking_budget_tokens == 0
+    assert all(call["config"].thinking is True for call in provider.calls)
+    assert provider.calls[1]["config"].thinking_level == ThinkingLevel.MEDIUM
+    assert provider.calls[1]["config"].thinking_budget_tokens == 10_000
     assert any(event.kind == "warning" and event.code == warning_code for event in events)
     assert any(event.kind == "done" and event.text == "ok" for event in events)
 
 
 @pytest.mark.asyncio
-async def test_tool_loop_observer_logs_reasoning_only_runtime_event(tmp_path) -> None:
+async def test_retired_tool_loop_observer_keeps_reasoning_only_recovery(tmp_path) -> None:
     provider = _SequenceProvider(
         [
             [
@@ -396,26 +447,13 @@ async def test_tool_loop_observer_logs_reasoning_only_runtime_event(tmp_path) ->
 
     events = [event async for event in agent.run_turn("hello")]
 
-    assert any(event.kind == "done" for event in events)
+    assert len(provider.calls) == 2
+    assert any(event.kind == "done" and event.text == "ok" for event in events)
     logged = [json.loads(line) for line in runtime_events_path.read_text().splitlines()]
     observer_events = [
         event for event in logged if event.get("mechanism") == "tool_loop_observer"
     ]
-    assert [event["reason"] for event in observer_events] == ["reasoning_only"]
-    assert observer_events[0]["feature"] == "runtime_observer"
-    assert observer_events[0]["injected_to_model"] is False
-    assert observer_events[0]["iteration"] == 1
-    assert observer_events[0]["session_key"] == "agent:test:runtime-observer"
-    assert observer_events[0]["evidence"]["post_tool_turn"] is False
-    assert observer_events[0]["details"]["post_tool_turn"] is False
-    assert observer_events[0]["details"]["reasoning_tokens"] == 5
-    assert observer_events[0]["read_files"] == []
-    assert observer_events[0]["changed_files"] == []
-    assert observer_events[0]["diff_paths"] == []
-    assert observer_events[0]["verification_commands"] == []
-    assert observer_events[0]["hint_text_sha256"] is None
-    assert observer_events[0]["trigger_confidence"] == "observed_runtime_signal"
-    assert isinstance(observer_events[0]["created_at"], str)
+    assert observer_events == []
 
 
 @pytest.mark.asyncio
@@ -498,10 +536,7 @@ async def test_post_tool_empty_recovery_nudges_once_and_cleans_history(tmp_path)
         for msg in agent._history
     )
     logged = [json.loads(line) for line in runtime_events_path.read_text().splitlines()]
-    recovery_event = next(
-        event for event in logged if event.get("mechanism") == "post_tool_empty_recovery"
-    )
-    assert recovery_event["injected_to_model"] is True
+    assert not any(event.get("feature") == "runtime_recovery" for event in logged)
 
 
 def test_tool_loop_observer_diff_paths_preserve_status_path_prefix(tmp_path) -> None:
@@ -586,11 +621,7 @@ async def test_final_diff_contract_warn_model_reaches_next_provider_request(
     assert "repository diff looks suspicious" in warning_messages[0].content
 
     logged = [json.loads(line) for line in runtime_events_path.read_text().splitlines()]
-    contract_event = next(
-        event for event in logged if event.get("feature") == "final_diff_contract"
-    )
-    assert contract_event["injected_to_model"] is True
-    assert contract_event["diff_paths"] == ["debug_case.php"]
+    assert not any(event.get("name") == "final_diff_contract.observed" for event in logged)
 
 
 @pytest.mark.asyncio
@@ -752,7 +783,7 @@ async def test_reasoning_only_post_tool_turn_retries_without_disabling_thinking(
 
 
 @pytest.mark.asyncio
-async def test_reasoning_only_retry_restores_thinking_after_retry_call() -> None:
+async def test_reasoning_only_retry_preserves_thinking_after_tool_call() -> None:
     provider = _SequenceProvider(
         [
             [
@@ -800,7 +831,6 @@ async def test_reasoning_only_retry_restores_thinking_after_retry_call() -> None
         provider=provider,
         config=AgentConfig(
             thinking=ThinkingLevel.MEDIUM,
-            reasoning_only_thinking_fallback=True,
             max_iterations=3,
             retry_base_backoff_ms=0,
             retry_max_backoff_ms=0,
@@ -822,10 +852,7 @@ async def test_reasoning_only_retry_restores_thinking_after_retry_call() -> None
 
     assert any(event.kind == "done" and event.text == "done" for event in events)
     assert len(provider.calls) == 4
-    assert provider.calls[0]["config"].thinking is True
-    assert provider.calls[1]["config"].thinking is True
-    assert provider.calls[2]["config"].thinking is False
-    assert provider.calls[3]["config"].thinking is True
+    assert all(call["config"].thinking is True for call in provider.calls)
 
 
 @pytest.mark.asyncio
@@ -1219,11 +1246,8 @@ async def test_large_reasoning_only_uses_fallback_before_same_model_retry() -> N
     assert any(event.kind == "done" and event.text == "ok" for event in events)
 
 
-@pytest.mark.parametrize("thinking", [False, ThinkingLevel.MEDIUM])
 @pytest.mark.asyncio
-async def test_large_length_capped_reasoning_only_fallback_disables_thinking(
-    thinking: bool | ThinkingLevel,
-) -> None:
+async def test_large_length_capped_reasoning_only_fallback_preserves_thinking() -> None:
     provider = _FallbackSequenceProvider(
         [
             [
@@ -1244,7 +1268,7 @@ async def test_large_length_capped_reasoning_only_fallback_disables_thinking(
     agent = Agent(
         provider=provider,
         config=AgentConfig(
-            thinking=thinking,
+            thinking=ThinkingLevel.MEDIUM,
             retry_base_backoff_ms=0,
             retry_max_backoff_ms=0,
         ),
@@ -1254,9 +1278,9 @@ async def test_large_length_capped_reasoning_only_fallback_disables_thinking(
 
     assert provider.fallback_reasons == ["reasoning_only"]
     assert len(provider.calls) == 2
-    assert provider.calls[1]["config"].thinking is False
-    assert provider.calls[1]["config"].thinking_level == ThinkingLevel.OFF
-    assert provider.calls[1]["config"].thinking_budget_tokens == 0
+    assert all(call["config"].thinking is True for call in provider.calls)
+    assert provider.calls[1]["config"].thinking_level == ThinkingLevel.MEDIUM
+    assert provider.calls[1]["config"].thinking_budget_tokens == 10_000
     assert any(event.kind == "done" and event.text == "ok" for event in events)
 
 
@@ -1349,7 +1373,7 @@ async def test_large_reasoning_only_with_thinking_disabled_uses_act_now_retry() 
 
 
 @pytest.mark.asyncio
-async def test_large_length_capped_reasoning_only_retry_disables_thinking() -> None:
+async def test_large_length_capped_reasoning_only_retry_preserves_thinking_setting() -> None:
     provider = _SequenceProvider(
         [
             [
@@ -1392,8 +1416,11 @@ async def test_large_length_capped_reasoning_only_retry_disables_thinking() -> N
     assert provider.calls[0]["config"].thinking_level is None
     assert provider.calls[0]["config"].max_tokens == 16_384
     assert provider.calls[1]["config"].thinking is False
-    assert provider.calls[1]["config"].thinking_level == ThinkingLevel.OFF
-    assert provider.calls[1]["config"].thinking_budget_tokens == 0
+    assert provider.calls[1]["config"].thinking_level is None
+    assert (
+        provider.calls[1]["config"].thinking_budget_tokens
+        == provider.calls[0]["config"].thinking_budget_tokens
+    )
     assert provider.calls[1]["config"].max_tokens == 16_384
     assert provider.calls[1]["messages"][-1].content == _REASONING_ONLY_ACT_NOW_DIRECTIVE
     visible_retry = next(
@@ -1467,15 +1494,11 @@ async def test_large_dashscope_reasoning_only_nudges_before_hard_fail(tmp_path) 
         for msg in provider.calls[1]["messages"]
     )
     logged = [json.loads(line) for line in runtime_events_path.read_text().splitlines()]
-    recovery_event = next(
-        event for event in logged if event.get("mechanism") == "reasoning_continuation_recovery"
-    )
-    assert recovery_event["injected_to_model"] is True
-    assert recovery_event["details"]["provider_reasoning_format"] == "dashscope"
+    assert not any(event.get("feature") == "runtime_recovery" for event in logged)
 
 
 @pytest.mark.asyncio
-async def test_repeated_large_dashscope_reasoning_only_disables_thinking_after_nudge() -> None:
+async def test_repeated_large_dashscope_reasoning_only_preserves_thinking() -> None:
     provider = _SequenceProvider(
         [
             [_large_reasoning_only_done()],
@@ -1496,7 +1519,6 @@ async def test_repeated_large_dashscope_reasoning_only_disables_thinking_after_n
                 reasoning_format="dashscope",
             ),
             reasoning_prefill_recovery_mode="recover",
-            reasoning_only_thinking_fallback=True,
             retry_base_backoff_ms=0,
             retry_max_backoff_ms=0,
         ),
@@ -1509,46 +1531,6 @@ async def test_repeated_large_dashscope_reasoning_only_disables_thinking_after_n
         event.kind == "warning" and event.code == "provider_reasoning_continuation"
         for event in events
     )
-    assert any(
-        event.kind == "warning" and event.code == "provider_large_context_visible_retry"
-        for event in events
-    )
-    assert not any(event.kind == "error" for event in events)
-    assert any(event.kind == "done" and event.text == "ok" for event in events)
-    assert provider.calls[2]["config"].thinking is False
-
-
-@pytest.mark.asyncio
-async def test_repeated_large_dashscope_reasoning_only_keeps_thinking_when_fallback_off() -> None:
-    provider = _SequenceProvider(
-        [
-            [_large_reasoning_only_done()],
-            [_large_reasoning_only_done()],
-            [
-                ProviderText(text="ok"),
-                ProviderDone(stop_reason="stop", input_tokens=4, output_tokens=1),
-            ],
-        ]
-    )
-    agent = Agent(
-        provider=provider,
-        config=AgentConfig(
-            thinking=ThinkingLevel.MEDIUM,
-            model_capabilities=ModelCapabilities(
-                supports_reasoning=True,
-                supports_tools=True,
-                reasoning_format="dashscope",
-            ),
-            reasoning_prefill_recovery_mode="recover",
-            reasoning_only_thinking_fallback=False,
-            retry_base_backoff_ms=0,
-            retry_max_backoff_ms=0,
-        ),
-    )
-
-    events = [event async for event in agent.run_turn("hello")]
-
-    assert len(provider.calls) == 3
     assert not any(event.kind == "error" for event in events)
     assert any(event.kind == "done" and event.text == "ok" for event in events)
     assert all(call["config"].thinking is True for call in provider.calls)

@@ -12,7 +12,7 @@ import { OBSERVABILITY_KEY, type UpdateNotice } from '@/modules/observability'
 //
 // Suppressed wherever the desktop shell manages update discovery and actions.
 // That includes native electron-updater on macOS and the versioned manual
-// installer flow on unsigned Windows. Browser surfaces keep this passive banner;
+// installer flow on Windows. Browser surfaces keep this passive banner;
 // older Windows shells without the managed capability retain their legacy banner.
 
 const { t } = useI18n()
@@ -20,7 +20,7 @@ const platform = getPlatform()
 const isDesktop = platform.id === 'desktop'
 
 const DISMISS_KEY = 'opensquilla-update-dismissed'
-const RELEASES_FALLBACK = 'https://github.com/opensquilla/opensquilla/releases'
+const RELEASES_FALLBACK = 'https://github.com/TokenRhythm/opensquilla/releases'
 const POLL_INTERVAL_MS = 15 * 60 * 1000
 const REQUEST_TIMEOUT_MS = 5 * 1000
 

@@ -505,7 +505,11 @@ def _anthropic_sse_body() -> bytes:
             "type": "message_start",
             "message": {"id": "msg_1", "model": "claude-test", "usage": {}},
         },
-        {"type": "content_block_delta", "delta": {"type": "text_delta", "text": "ok"}},
+        {"type": "content_block_start", "index": 0,
+         "content_block": {"type": "text", "text": ""}},
+        {"type": "content_block_delta", "index": 0,
+         "delta": {"type": "text_delta", "text": "ok"}},
+        {"type": "content_block_stop", "index": 0},
         {"type": "message_delta", "usage": {"output_tokens": 1}},
         {"type": "message_stop"},
     ]

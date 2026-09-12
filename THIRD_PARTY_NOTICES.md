@@ -41,8 +41,6 @@ resolved versions are recorded by `opensquilla-webui/package.json` and
 | marked (`marked`) | npm dependency used by `opensquilla-webui/src/composables/chat/useChatTextRendering.ts`; generated JavaScript under `src/opensquilla/gateway/static/dist/assets/` | MIT. Copyright (c) 2018+, MarkedJS and Copyright (c) 2011-2018, Christopher Jeffrey. The bundled Markdown-derived portion carries the John Gruber notice reproduced below. |
 | DOMPurify (`dompurify`) | npm dependency used by `opensquilla-webui/src/composables/chat/useChatTextRendering.ts`; generated JavaScript under `src/opensquilla/gateway/static/dist/assets/` | MPL-2.0 OR Apache-2.0. OpenSquilla distributes this component under the Apache-2.0 option. Copyright belongs to Cure53 and other contributors. |
 | highlight.js (`highlight.js`) | npm dependency used by `opensquilla-webui/src/composables/chat/useChatTextRendering.ts`; generated JavaScript under `src/opensquilla/gateway/static/dist/assets/` | BSD-3-Clause. Copyright (c) 2006, Ivan Sagalaev. |
-| Monaco Editor (`monaco-editor`) | HTML Artifact Studio source editor and language workers in generated JavaScript under `src/opensquilla/gateway/static/dist/assets/` | MIT. Copyright (c) 2016-present Microsoft Corporation. |
-| parse5 (`parse5`) | Canonical HTML source-location parser in generated JavaScript under `src/opensquilla/gateway/static/dist/assets/` | MIT. Copyright (c) 2013-2019 Ivan Nikulin. |
 | IBM Plex Sans and IBM Plex Mono | `opensquilla-webui/src/assets/fonts/ibm-plex-*.woff2` and generated Web UI font assets | SIL Open Font License 1.1. Copyright 2017 IBM Corp. with Reserved Font Name "Plex". |
 | Space Grotesk | `opensquilla-webui/src/assets/fonts/space-grotesk-*.woff2` and generated Web UI font assets | SIL Open Font License 1.1. Copyright 2020 The Space Grotesk Project Authors. |
 | Fraunces | `opensquilla-webui/src/themes/out-of-register/fonts/fraunces-*.woff2` and generated Web UI font assets | SIL Open Font License 1.1. Copyright 2020 The Fraunces Project Authors (https://github.com/undercasetype/Fraunces). |
@@ -329,13 +327,8 @@ in a package-local provenance file.
 
 - Component: SKILL.md frontmatter and instruction text for these bundled skills:
   - `sub-agent`
-- `cron`
   - `github`
-  - `nano-pdf`
   - `skill-creator`
-  - `summarize`
-  - `tmux`
-  - `weather`
 - Upstream project: https://github.com/openclaw/openclaw
 - License: MIT
 - Copyright notice: Copyright (c) 2025 Peter Steinberger
@@ -378,72 +371,41 @@ SOFTWARE.
 These bundled skill descriptors are authored and maintained by OpenSquilla and
 are released under OpenSquilla's repository license (Apache-2.0; see `LICENSE`):
 
-- `cron`
 - `code-task`
 - `AwesomeWebpageMetaSkill`
 - `awesome-webpage-image-download`
 - `awesome-webpage-research`
 - `deep-research`
 - `docx`
-- `git-diff`
 - `github`
 - `history-explorer`
-- `html-to-pdf`
-- `http-fetch`
-- `latex-compile`
-- `memory`
 - `meta-kid-project-planner`
 - `meta-paper-write`
 - `meta-short-drama`
 - `meta-skill-creator`
 - `multi-search-engine`
-- `nano-pdf`
 - `openrouter-video-generator`
-- `paper-abstract-author`
 - `paper-artifact-runtime`
 - `paper-citation-integrity-gate`
-- `paper-citation-planner`
 - `paper-delivery-summary`
-- `paper-experiment-stub`
 - `paper-latex-sanitizer`
 - `paper-length-gate`
-- `paper-outline-author`
-- `paper-plot-stub`
-- `paper-preference-planner`
 - `paper-quality-gate`
 - `paper-refbib-stub`
-- `paper-revision-author`
 - `paper-section-author`
 - `paper-source-readiness-gate`
-- `paper-source-curator`
 - `pdf-toolkit`
 - `pptx`
 - `skill-creator`
-- `skill-creator-linter`
-- `skill-creator-proposals`
-- `skill-creator-smoke-test`
 - `short-drama-delivery-audit`
 - `short-drama-review-normalizer`
-- `stack-trace-generic-probe`
-- `stack-trace-go-probe`
-- `stack-trace-js-probe`
-- `stack-trace-python-probe`
-- `stack-trace-rust-probe`
 - `sub-agent`
 - `srt-from-script`
 - `subtitle-burner`
-- `summarize`
 - `text-file-read`
 - `title-card-image`
-- `tmux`
 - `video-still-animator`
-- `weather`
 - `xlsx`
-- `advanced-dubbing-studio`
-- `music-and-singing-studio`
-- `voice-clone-lab`
-- `voice-conversion-studio`
-- `voiceover-studio`
 
 ## tokenjuice adapted reduction rules
 
@@ -527,7 +489,6 @@ SOFTWARE.
   - `deep-research`
   - `docx`
   - `html-coder`
-  - `html-to-pdf`
   - `multi-search-engine`
   - `nano-banana-pro`
   - `nano-banana-pro-openrouter`

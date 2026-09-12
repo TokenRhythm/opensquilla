@@ -10,6 +10,7 @@ from typing import Any
 
 import pytest
 
+from opensquilla.application.approval_queue import get_approval_queue, reset_approval_queue
 from opensquilla.engine import Agent, AgentConfig, ToolResult
 from opensquilla.engine.runtime import TurnRunner
 from opensquilla.engine.types import (
@@ -23,7 +24,6 @@ from opensquilla.engine.types import (
     ToolCall,
     ToolResultEvent,
 )
-from opensquilla.gateway.approval_queue import get_approval_queue, reset_approval_queue
 from opensquilla.provider import ChatConfig, Message, ToolDefinition, ToolInputSchema
 from opensquilla.provider import DoneEvent as ProviderDoneEvent
 from opensquilla.provider import TextDeltaEvent as ProviderTextDeltaEvent

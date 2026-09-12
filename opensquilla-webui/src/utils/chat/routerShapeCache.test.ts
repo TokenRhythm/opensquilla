@@ -7,9 +7,9 @@ function shape(overrides: Partial<RouterShape> = {}): RouterShape {
     slots: ['light', 'standard', 'heavy'],
     models: { light: 'a/x', standard: 'b/y', heavy: 'c/z' },
     configs: {
-      light: { model: 'a/x', supportsImage: false, imageOnly: false, ensembleEnabled: false },
-      standard: { model: 'b/y', supportsImage: true, imageOnly: false, ensembleEnabled: false },
-      heavy: { model: 'c/z', supportsImage: false, imageOnly: false, ensembleEnabled: true },
+      light: { model: 'a/x', imageOnly: false, ensembleEnabled: false },
+      standard: { model: 'b/y', imageOnly: false, ensembleEnabled: false },
+      heavy: { model: 'c/z', imageOnly: false, ensembleEnabled: true },
     },
     ...overrides,
   }
@@ -68,7 +68,15 @@ describe('routerShapeCache — forward compatibility + normalization', () => {
       models: { standard: 'b/y' },
       configs: { standard: { /* no model */ supportsImage: true } },
     }))
-    expect(decoded?.configs.standard).toEqual({ model: '', supportsImage: true, imageOnly: false })
+    expect(decoded?.configs.standard).toEqual({ model: '', imageOnly: false })
+  })
+
+  it('drops legacy image declarations while preserving cached route identity', () => {
+    const s = shape()
+    s.configs.standard!.supportsImage = true
+    const legacyCache = JSON.stringify({ v: 1, ...s })
+    expect(decodeRouterShape(legacyCache)).toEqual(shape())
+    expect(JSON.parse(encodeRouterShape(s)).configs.standard).not.toHaveProperty('supportsImage')
   })
 
   it('preserves the tier-scoped ensemble flag', () => {

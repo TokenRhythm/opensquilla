@@ -11,6 +11,7 @@ from types import SimpleNamespace
 from zipfile import ZipFile
 
 import pytest
+import yaml
 
 SCRIPT_PATH = Path(__file__).resolve().parents[2] / "scripts" / "build_wheelhouse_zip.py"
 REPO_ROOT = SCRIPT_PATH.parents[1]
@@ -817,31 +818,6 @@ def test_prepare_windows_portable_release_tree_includes_double_click_launcher(
     assert "$env:PYTHONIOENCODING = 'utf-8:replace'" in start_ps1
 
 
-def test_install_portable_wheelhouse_preinstalls_into_bundled_python(
-    tmp_path: Path,
-) -> None:
-    module = load_script()
-    release_root = tmp_path / "release"
-    package_dir = release_root / "packages"
-    site_packages = release_root / "runtime" / "python" / "Lib" / "site-packages"
-    package_dir.mkdir(parents=True)
-    site_packages.mkdir(parents=True)
-    wheel_path = package_dir / "demo-0.1.0-py3-none-any.whl"
-    with ZipFile(wheel_path, "w") as wheel:
-        wheel.writestr("demo_pkg/__init__.py", "VALUE = 1\n")
-        wheel.writestr("demo-0.1.0.dist-info/METADATA", "Name: demo\n")
-        wheel.writestr("demo-0.1.0.data/purelib/demo_extra.py", "EXTRA = 2\n")
-        wheel.writestr("demo-0.1.0.data/scripts/demo-script.py", "print('skip')\n")
-
-    module.install_portable_wheelhouse(release_root)
-
-    assert (site_packages / "demo_pkg" / "__init__.py").read_text(encoding="utf-8") == (
-        "VALUE = 1\n"
-    )
-    assert (site_packages / "demo_extra.py").read_text(encoding="utf-8") == "EXTRA = 2\n"
-    assert not (site_packages / "demo-script.py").exists()
-
-
 def test_create_zip_contains_release_directory_and_preserves_install_mode(tmp_path: Path) -> None:
     module = load_script()
     release_root = tmp_path / "OpenSquilla-0.1.0-macos-arm64-py312-recommended-wheelhouse"
@@ -932,11 +908,17 @@ def test_release_workflow_publishes_wheel_and_electron_assets_without_portable()
     assert "concurrency:" in workflow
     assert "release-assets-${{" in workflow
     assert "cancel-in-progress: false" in workflow
-    assert "timeout-minutes: 90" in workflow
-    assert workflow.count("timeout-minutes: 150") == 2
-    assert workflow.count("timeout-minutes: 75") == 1
-    assert workflow.count("timeout-minutes: 120") == 1
-    assert "timeout-minutes: 20" in workflow
+    jobs = yaml.safe_load(workflow)["jobs"]
+    for name, minutes in {
+        "build-release-assets": 90,
+        "build-desktop-macos": 150,
+        "build-desktop-windows": 150,
+        "audit-downloaded-macos-release": 75,
+        "audit-downloaded-windows-release": 120,
+        "audit-internal-windows-artifact": 120,
+        "publish-release": 20,
+    }.items():
+        assert jobs[name]["timeout-minutes"] == minutes
     assert "build-desktop-macos:" in workflow
     assert "build-desktop-windows:" in workflow
     assert "Validate workflow inputs" in workflow

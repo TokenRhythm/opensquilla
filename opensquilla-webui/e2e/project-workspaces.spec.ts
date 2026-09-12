@@ -1,4 +1,5 @@
 import { expect, test, type Page } from '@playwright/test'
+import { helloOkResponse } from './support/gateway-fixture'
 
 const CONTROL_URL = '/control/'
 
@@ -119,9 +120,7 @@ async function installProjectLifecycleRpc(
       switch (frame.method) {
         case 'connect':
           setTimeout(() => {
-            ws.send(JSON.stringify({
-              protocol: 3,
-              policy: { tick_interval_ms: 30_000 },
+            ws.send(helloOkResponse({
               auth: { principal: { isOwner: options.owner !== false } },
               features: {
                 methods: [
@@ -212,6 +211,8 @@ async function installProjectLifecycleRpc(
           if (state.historyDeleted) state.postDeleteSessionLists += 1
           respond(frame.id, {
             sessions: state.sent ? [session()] : [],
+            count: state.sent ? 1 : 0,
+            ts: 1_800_000_000,
             has_more: false,
           })
           return

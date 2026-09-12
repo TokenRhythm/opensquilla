@@ -89,15 +89,37 @@ export interface GoalCapabilities {
 
 export type GoalCenterErrorCode = 'not-found' | 'unsupported' | 'forbidden' | 'conflict' | 'unavailable' | 'invalid'
 
+export type GoalCenterFailureReason =
+  | 'invalid-objective'
+  | 'invalid-command'
+  | 'not-found'
+  | 'session-changed'
+  | 'changed'
+  | 'already-active'
+  | 'busy'
+  | 'not-resumable'
+  | 'execution-disabled'
+  | 'connection-required'
+  | 'plan-mode-active'
+  | 'plan-run-active'
+  | 'request-conflict'
+
 export class GoalCenterError extends Error {
   readonly code: GoalCenterErrorCode
+  readonly reason?: GoalCenterFailureReason
   readonly retryable?: boolean
   readonly details?: unknown
 
-  constructor(code: GoalCenterErrorCode, message: string, options: { retryable?: boolean; details?: unknown; cause?: unknown } = {}) {
+  constructor(code: GoalCenterErrorCode, message: string, options: {
+    reason?: GoalCenterFailureReason
+    retryable?: boolean
+    details?: unknown
+    cause?: unknown
+  } = {}) {
     super(message)
     this.name = 'GoalCenterError'
     this.code = code
+    this.reason = options.reason
     this.retryable = options.retryable
     this.details = options.details
     if (options.cause !== undefined) (this as Error & { cause?: unknown }).cause = options.cause

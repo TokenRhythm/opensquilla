@@ -1,5 +1,6 @@
 import { reactive, ref, watch, type Ref } from 'vue'
 import i18n from '@/i18n'
+import type { ConversationCursorSignal } from '@/modules/conversationRuntime'
 import type {
   MetaEvent,
   MetaPreflightPayload,
@@ -63,7 +64,7 @@ export interface UseMetaRunsOptions {
    */
   lastStreamSeq: Ref<number>
   /** Reset the shared cursor before comparing a restarted Gateway generation. */
-  observeStreamGeneration?: (payload: unknown) => boolean
+  observeStreamGeneration?: (signal: ConversationCursorSignal) => boolean
   /**
    * Send the hidden preflight confirmation (provider text with markers +
    * visible bubble text). Wired from ChatView's send path.

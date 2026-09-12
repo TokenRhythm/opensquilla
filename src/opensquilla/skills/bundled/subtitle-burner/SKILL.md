@@ -1,5 +1,9 @@
 ---
 name: subtitle-burner
+visibility: internal
+invocation: meta_only
+owner_meta_skills:
+  - meta-short-drama
 description: "Burn an SRT subtitle file into an MP4 via ffmpeg's subtitles filter (libass). Single-pass re-encode of video; audio copied as-is. Uses a verified managed Noto Sans CJK font when available. Used by meta-short-drama as the final subtitling step after merge."
 description_zh: "通过 ffmpeg 的 subtitles 滤镜（libass）把 SRT 字幕烧录进 MP4；视频单遍重编码，音频原样复制。可用时使用经过验证的托管 Noto Sans CJK 字体。由 meta-short-drama 在合并后执行最终字幕步骤。"
 provenance:

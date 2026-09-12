@@ -38,6 +38,7 @@
       { "code": "PERMISSION_DENIED" },
       { "code": "FLUSH_UNAVAILABLE", "retryable": true, "details": true },
       { "code": "FLUSH_DISK_ERROR", "retryable": true, "details": true },
+      { "code": "STORAGE_BUSY", "retryable": true, "retryAfterMs": true, "details": true },
       { "code": "INTERNAL_ERROR" }
     ]
   },

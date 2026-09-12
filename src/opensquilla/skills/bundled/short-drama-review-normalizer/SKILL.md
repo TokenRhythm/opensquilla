@@ -1,5 +1,9 @@
 ---
 name: short-drama-review-normalizer
+visibility: internal
+invocation: meta_only
+owner_meta_skills:
+  - meta-short-drama
 description: "Internal deterministic consent gate for meta-short-drama. Normalizes draft review and post-revision confirmation replies, and fails closed before external image/video generation."
 user-invocable: false
 disable-model-invocation: true

@@ -26,11 +26,28 @@ from pydantic.fields import FieldInfo
 from pydantic_settings import BaseSettings, PydanticBaseSettingsSource, SettingsConfigDict
 
 from opensquilla import __version__
+from opensquilla.application.config_secrets import (
+    _PUBLIC_SECRET_EXACT_KEYS as _PUBLIC_SECRET_EXACT_KEYS,
+)
+from opensquilla.application.config_secrets import (
+    _PUBLIC_SECRET_SUFFIXES as _PUBLIC_SECRET_SUFFIXES,
+)
+from opensquilla.application.config_secrets import (
+    _REDACTED as _REDACTED,
+)
+from opensquilla.application.config_secrets import (
+    is_sensitive_config_key as is_sensitive_config_key,
+)
+from opensquilla.application.config_secrets import (
+    redact_public_config as redact_public_config,
+)
 from opensquilla.gateway.config_migration import (
     LATEST_CONFIG_VERSION,
     ConfigParseError,
     backup_and_write_migrated_config,
+    handle_deprecated_skill_filter_env,
     migrate_config_payload,
+    strip_deprecated_skill_filter_settings,
 )
 from opensquilla.paths import default_opensquilla_home, native_io_path
 from opensquilla.provider.credentials import (
@@ -74,6 +91,28 @@ _LEGACY_CONTROL_UI_FRONTEND_WARNING = (
     "retired vanilla-JS UI; Vue is always served. Remove this setting or set "
     "it to 'vue'."
 )
+
+
+class _SettingsSourceWithoutFields(PydanticBaseSettingsSource):
+    """Filter local-TOML-only fields from any external settings source."""
+
+    def __init__(
+        self,
+        inner: PydanticBaseSettingsSource,
+        fields: frozenset[str],
+    ) -> None:
+        super().__init__(inner.settings_cls)
+        self._inner = inner
+        self._fields = fields
+
+    def get_field_value(self, field: FieldInfo, field_name: str) -> tuple[Any, str, bool]:
+        return self._inner.get_field_value(field, field_name)
+
+    def __call__(self) -> dict[str, Any]:
+        values = dict(self._inner())
+        for field_name in self._fields:
+            values.pop(field_name, None)
+        return values
 
 
 class ContextOverflowPolicy(StrEnum):
@@ -332,19 +371,17 @@ class SkillsConfig(BaseSettings):
     # every skill API. Default OFF — coding mode is opt-in.
     coding_mode: bool = False
     max_skills_prompt_chars: int = 8000
-    filter_enabled: bool = False
-    filter_top_k: int = 5
     # "system" = full system prompt (default)
     # "user_context" = ephemeral user-role context, after history and before current user
     # "user_message" = legacy compact system-prompt index
     injection_mode: str = "system"
 
-    # Relevance filtering is opt-in. Keep the default path dependency-free.
-    filter_strategy: Literal["lexical", "semantic", "hybrid"] = "lexical"
-    filter_lexical_top_n: int = 20
-    filter_semantic_top_n: int = 20
-    filter_rrf_k: int = 60
-    filter_embedding_model: str = "BAAI/bge-small-zh-v1.5"
+    @model_validator(mode="before")
+    @classmethod
+    def _ignore_retired_filter_settings(cls, data: Any) -> Any:
+        if isinstance(data, dict):
+            return strip_deprecated_skill_filter_settings(data)
+        return data
 
 
 class ToolsConfig(BaseModel):
@@ -370,11 +407,7 @@ class ToolsConfig(BaseModel):
     allow: list[str] = Field(default_factory=list)
     deny: list[str] = Field(default_factory=list)
     also_allow: list[str] = Field(default_factory=list)
-    # Model-facing tool description overrides. Keys name a tool
-    # ("exec_command") or a parameter ("exec_command.command" — dotted keys
-    # must be quoted in TOML); values replace the matching description
-    # verbatim. Inert unless the OPENSQUILLA_TOOL_DESCRIPTION_OVERRIDES env
-    # var enables them ("config"/"on", or a .toml/.json override file path).
+    # Deprecated, unused compatibility slot; preserve construction and saved configs.
     description_overrides: dict[str, str] = Field(default_factory=dict)
     workspace_write_deny_globs: list[str] = Field(default_factory=list)
     file_edit_requires_fresh_read: bool | None = None
@@ -515,6 +548,37 @@ class LlmProviderConfig(BaseSettings):
     # send provider.order=[name] so the provider is preferred without disabling
     # OpenRouter fallback.
     provider_routing: dict[str, str] = Field(default_factory=dict)
+    # Advanced local-only extensions for a custom OpenAI-compatible endpoint.
+    # Public configuration surfaces deliberately omit this field.
+    extra_body: dict[str, Any] = Field(default_factory=dict)
+
+    @classmethod
+    def settings_customise_sources(
+        cls,
+        settings_cls: type[BaseSettings],
+        init_settings: PydanticBaseSettingsSource,
+        env_settings: PydanticBaseSettingsSource,
+        dotenv_settings: PydanticBaseSettingsSource,
+        file_secret_settings: PydanticBaseSettingsSource,
+    ) -> tuple[PydanticBaseSettingsSource, ...]:
+        local_only = frozenset({"extra_body"})
+        return (
+            init_settings,
+            _SettingsSourceWithoutFields(env_settings, local_only),
+            _SettingsSourceWithoutFields(dotenv_settings, local_only),
+            _SettingsSourceWithoutFields(file_secret_settings, local_only),
+        )
+
+    @field_validator("extra_body", mode="before")
+    @classmethod
+    def _validate_extra_body(cls, value: Any) -> dict[str, Any]:
+        from opensquilla.provider.extra_body import normalize_extra_body
+
+        if value is None:
+            return {}
+        if not isinstance(value, dict):
+            raise ValueError("extra_body must be a TOML table / JSON object")
+        return normalize_extra_body(value)
 
     @model_validator(mode="after")
     def _normalize_direct_deepseek_model(self) -> LlmProviderConfig:
@@ -527,6 +591,12 @@ class LlmProviderConfig(BaseSettings):
         model = str(self.model or "").strip()
         if model in aliases:
             self.model = aliases[model]
+        return self
+
+    @model_validator(mode="after")
+    def _validate_custom_extra_body(self) -> LlmProviderConfig:
+        if self.extra_body and str(self.provider or "").strip().lower() != "custom":
+            raise ValueError("llm.extra_body is supported only when provider='custom'")
         return self
 
 
@@ -988,20 +1058,14 @@ class PromptConfig(BaseModel):
         "headless_repo_coding_scaffold",
     ] = "auto"
     platform_hint_enabled: bool = True
-    # Opt-in additive "Patch Evidence Protocol" system-prompt section for
-    # repo-coding/patching sessions. Overridable per run via the
-    # OPENSQUILLA_PATCH_EVIDENCE_PROTOCOL env var ("on"/"off").
+    # Deprecated, unused compatibility slot; preserve construction and saved configs.
     patch_evidence_protocol: bool = False
     # Opt-in additive "Reproduction Evidence" system-prompt section plus the
     # loop-side finalize-time red-evidence gate (engine.finalize_evidence_gate).
     # Overridable per run via the OPENSQUILLA_FINALIZE_EVIDENCE_GATE env var
     # ("on"/"off").
     finalize_evidence_gate: bool = False
-    # Opt-in switch restoring the earlier compact "Tool Call Style" and
-    # "Reply Guidelines" system-prompt directives (single-line narration,
-    # concise replies) for deployments tuned against the previous wording.
-    # Overridable per run via the OPENSQUILLA_LEGACY_PROMPT_STYLE env var
-    # ("on"/"off"). Off keeps the current wording unchanged.
+    # Deprecated, unused. Accepted so existing configuration still loads.
     legacy_prompt_style: bool = False
 
 
@@ -1469,6 +1533,7 @@ class AgentTokenSavingConfig(BaseSettings):
 
     # Tokenjuice projection is the default tool-result path.
     tool_result_projection_max_inline_chars: int = Field(default=60_000, ge=1000)
+    # Deprecated, unused. Accepted so existing configuration still loads.
     tool_result_fresh_diagnostic_policy_enabled: bool = Field(default=False)
     tool_result_diagnostic_retrieval_gate_enabled: bool = Field(default=False)
     tool_result_fresh_diagnostic_inline_max_chars: int = Field(default=64_000, ge=0)
@@ -1557,6 +1622,7 @@ class MCPServerEntry(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="OPENSQUILLA_MCP_SERVER_")
 
     name: str = ""
+    description: str = ""
     transport: str = "stdio"  # "stdio" | "sse"
     command: str | None = None  # for stdio
     args: list[str] = Field(default_factory=list)  # for stdio
@@ -2345,7 +2411,7 @@ class ModelOverrideConfig(BaseModel):
 
 
 class _EnvWithoutConfigVersion(PydanticBaseSettingsSource):
-    """Env-backed settings source that never yields ``config_version``.
+    """Filter env fields owned by explicit runtime resolution.
 
     ``config_version`` is the migration stamp owned by the config payload:
     ``migrate_config_payload`` injects it at every disk-load boundary, and
@@ -2354,7 +2420,10 @@ class _EnvWithoutConfigVersion(PydanticBaseSettingsSource):
     payload at all (e.g. the no-file default branch of ``GatewayConfig.load``
     and ``config_store.load_config``) — so
     ``OPENSQUILLA_GATEWAY_CONFIG_VERSION`` can never gate or skip migrations.
-    Only this one key is filtered; every other env override is untouched.
+    The transport-flow kill switch is also applied explicitly below so invalid
+    values can fall back to the validated default with a warning instead of
+    failing Gateway construction during Pydantic coercion. ``llm.extra_body``
+    is filtered here because its only supported source is local TOML.
     """
 
     def __init__(self, inner: PydanticBaseSettingsSource) -> None:
@@ -2367,6 +2436,10 @@ class _EnvWithoutConfigVersion(PydanticBaseSettingsSource):
     def __call__(self) -> dict[str, Any]:
         values = dict(self._inner())
         values.pop("config_version", None)
+        values.pop("ws_transport_flow_enabled", None)
+        llm = values.get("llm")
+        if isinstance(llm, dict):
+            llm.pop("extra_body", None)
         return values
 
 
@@ -2789,12 +2862,9 @@ class GatewayConfig(BaseSettings):
     # Source diff candidate ledger records recoverable source edit patches and
     # can surface lost candidate ids in final-diff recovery diagnostics.
     source_diff_candidate_mode: Literal["off", "log", "warn_model"] = "log"
-    # Runtime state capsule is an opt-in provider-visible factual summary for
-    # coding turns. ``log`` records telemetry only; ``inject`` adds it to the
-    # provider request view.
+    # Deprecated, unused compatibility slot; preserve construction and saved configs.
     runtime_state_capsule_mode: Literal["off", "log", "inject"] = "off"
-    # Text-only tool recovery is an opt-in guard for tool-capable turns where
-    # a model emits prose instead of a tool call.
+    # Deprecated, unused compatibility slot; preserve construction and saved configs.
     text_only_tool_recovery_mode: Literal["off", "log", "warn_model"] = "off"
     # Provider request timeout (single LLM HTTP/streaming request).
     llm_request_timeout_seconds: float = 120.0
@@ -2808,20 +2878,24 @@ class GatewayConfig(BaseSettings):
     webui_stream_idle_grace_seconds: float = 630.0
     # Maximum time the WebUI WebSocket may sit silent before the gateway
     # closes it with code 1011 and emits ``gateway.client_ws_keepalive_timeout``.
-    # ``0`` disables the keepalive deadline entirely (legacy behaviour).
-    # Sleeping browsers commonly stop sending pings; without this knob the
-    # server retains half-open connections after suspend.
-    client_ws_keepalive_timeout_s: float = 120.0
+    # Disabled by default: sleeping renderers stop application pings without
+    # implying a dead transport. Native WebSocket keepalive remains enabled.
+    client_ws_keepalive_timeout_s: float = 0.0
+    # Consumption feedback is enabled for the matched client/Gateway release.
+    # The environment override remains an emergency kill switch while
+    # capability negotiation preserves safe fallback for other peers.
+    ws_transport_flow_enabled: bool = True
     # WebSocket per-connection outbound writer queue. When enabled, every connection gets a
     # bounded asyncio.Queue + dedicated writer task; producers enqueue and
-    # return immediately. Slow clients trigger a fast 1011 close instead of
-    # back-pressuring the turn pipeline. Kill switch is read at connection
+    # return immediately. Legacy peers retain overflow-close protection;
+    # negotiated flow peers instead pause replayable streams and reconcile.
+    # Kill switch is read at connection
     # registration time only — affects new connections only; existing
     # connections retain their startup-time behavior.
     ws_writer_queue_enabled: bool = True
-    # Per-connection outbox depth. 512 is ~17s of buffered text_delta at
-    # 30 Hz, comfortably within the SessionStreamRegistry replay window
-    # (max_events_per_session=500). Minimum 16 to avoid pathological
+    # Per-connection outbox depth. This bounds wire work, not session replay:
+    # capability filtering and concurrent sessions make those counts distinct.
+    # Minimum 16 to avoid pathological
     # configurations that can never enqueue.
     ws_writer_queue_maxsize: int = Field(default=512, ge=16)
     # Legacy alias for the old runtime timeout setting. Kept so existing
@@ -2861,21 +2935,17 @@ class GatewayConfig(BaseSettings):
         dotenv_settings: PydanticBaseSettingsSource,
         file_secret_settings: PydanticBaseSettingsSource,
     ) -> tuple[PydanticBaseSettingsSource, ...]:
-        # Default source order, with env-backed sources filtered so the
-        # migration stamp and scoped user-consent records remain owned by
-        # authenticated config mutation surfaces.
+        # External sources cannot populate the migration stamp or scoped
+        # user-consent records; both belong to authenticated persistence paths.
         return (
             init_settings,
-            _EnvWithoutConfigVersion(
-                _EnvWithoutScopedTelemetryConsent(env_settings)
-            ),
-            _EnvWithoutConfigVersion(
-                _EnvWithoutScopedTelemetryConsent(dotenv_settings)
-            ),
-            _EnvWithoutScopedTelemetryConsent(file_secret_settings),
+            _EnvWithoutConfigVersion(_EnvWithoutScopedTelemetryConsent(env_settings)),
+            _EnvWithoutConfigVersion(_EnvWithoutScopedTelemetryConsent(dotenv_settings)),
+            _EnvWithoutConfigVersion(_EnvWithoutScopedTelemetryConsent(file_secret_settings)),
         )
 
     def model_post_init(self, __context: Any) -> None:
+        handle_deprecated_skill_filter_env()
         self._apply_concurrency_env_overrides()
 
     def _apply_concurrency_env_overrides(self) -> None:
@@ -2944,6 +3014,21 @@ class GatewayConfig(BaseSettings):
                     "falling back to default ws_writer_queue_enabled=%s",
                     ws_enabled_env,
                     self.ws_writer_queue_enabled,
+                )
+
+        flow_enabled_env = os.environ.get("OPENSQUILLA_GATEWAY_WS_TRANSPORT_FLOW_ENABLED")
+        if flow_enabled_env is not None:
+            normalized = flow_enabled_env.strip().lower()
+            if normalized in ("true", "1", "yes"):
+                self.ws_transport_flow_enabled = True
+            elif normalized in ("false", "0", "no"):
+                self.ws_transport_flow_enabled = False
+            else:
+                _log.warning(
+                    "OPENSQUILLA_GATEWAY_WS_TRANSPORT_FLOW_ENABLED=%r is not a valid bool; "
+                    "falling back to default ws_transport_flow_enabled=%s",
+                    flow_enabled_env,
+                    self.ws_transport_flow_enabled,
                 )
 
         ws_maxsize_env = os.environ.get("OPENSQUILLA_WS_WRITER_QUEUE_MAXSIZE")
@@ -3031,6 +3116,8 @@ class GatewayConfig(BaseSettings):
                 llm.pop("api_key_env", None)
             if not llm.get("api_key"):
                 llm.pop("api_key", None)
+            if not llm.get("extra_body"):
+                llm.pop("extra_body", None)
         llm_profiles = data.get("llm_profiles")
         if isinstance(llm_profiles, dict):
             # Empty credential fields are absence, not a stored credential.
@@ -3095,6 +3182,9 @@ class GatewayConfig(BaseSettings):
     def to_public_dict(self) -> dict[str, Any]:
         """Return a redacted config view safe for public control surfaces."""
         data = cast(dict[str, Any], redact_public_config(self.model_dump()))
+        llm = data.get("llm")
+        if isinstance(llm, dict):
+            llm.pop("extra_body", None)
         ensemble = data.get("llm_ensemble")
         if isinstance(ensemble, dict):
             from opensquilla.gateway.model_routing import (
@@ -3498,50 +3588,6 @@ def resolve_listen_address(
 
 
 # --- Public config redaction (pilot) --------------------------------------
-
-_PUBLIC_SECRET_EXACT_KEYS = frozenset(
-    {
-        "token",
-        "password",
-        "api_key",
-        "authorization",
-        "signing_secret",
-        "app_secret",
-        "verification_token",
-        # Channel-crypto secrets that no generic suffix above catches:
-        # channels.feishu.encrypt_key (event decryption key) and
-        # channels.wecom.encoding_aes_key (callback AES key). Exact names on
-        # purpose — NOT a blanket "_key" suffix: key-NAME/reference fields
-        # must stay readable (llm.api_key_env and the other *_env fields name
-        # WHICH env var a secret loads from and clients render them), and a
-        # "_key" suffix would also swallow future non-secret identifiers
-        # (session/public/idempotency keys). Add further crypto-material
-        # fields here individually, never by widening the suffix set.
-        "encrypt_key",
-        "encoding_aes_key",
-    }
-)
-_PUBLIC_SECRET_SUFFIXES = ("_token", "_secret", "_password", "_api_key")
-_REDACTED = "[redacted]"
-
-
-def is_sensitive_config_key(key: str) -> bool:
-    normalized = key.lower().replace("-", "_")
-    return normalized in _PUBLIC_SECRET_EXACT_KEYS or normalized.endswith(_PUBLIC_SECRET_SUFFIXES)
-
-
-def redact_public_config(value: Any) -> Any:
-    if isinstance(value, dict):
-        redacted: dict[str, Any] = {}
-        for key, item in value.items():
-            if is_sensitive_config_key(key) and item:
-                redacted[key] = _REDACTED
-            else:
-                redacted[key] = redact_public_config(item)
-        return redacted
-    if isinstance(value, list):
-        return [redact_public_config(item) for item in value]
-    return value
 
 
 def _delete_path(obj: dict[str, Any], path: str) -> None:

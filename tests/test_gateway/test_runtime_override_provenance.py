@@ -152,7 +152,7 @@ async def test_in_place_swap_drops_stale_records_before_later_saves(
 
     # Operator hand-edits the file, then the gateway applies the new state
     # in place (the reload / config.set path).
-    from opensquilla.gateway.rpc_config import _update_config_in_place
+    from opensquilla.gateway.adapters.app_settings import _update_config_in_place
 
     config_path.write_text(
         f'[llm]\nprovider = "openai"\nbase_url = "{_USER_URL}"\n'

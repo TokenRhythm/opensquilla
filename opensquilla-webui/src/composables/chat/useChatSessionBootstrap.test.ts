@@ -1,11 +1,11 @@
-import { ref } from 'vue'
+import { ref, type Ref } from 'vue'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
-import { RpcTimeoutError } from '@/lib/rpc'
 import type {
   SessionReadLease,
   SessionReadLifecycle,
 } from '@/modules/sessionReadLifecycle'
+import { SessionReadFailure } from '@/modules/sessionReadLifecycle'
 import type { SessionSubscriptionOutcome } from './useChatSessionSubscription'
 import {
   autoSendDraftIsUnchanged,
@@ -30,6 +30,8 @@ function createBootstrap(overrides: {
     context: SessionBootstrapPhaseContext,
   ) => Promise<SessionSubscriptionOutcome>
   criticalRequestsQueued?: () => Promise<void>
+  reconcileSession?: (context: SessionBootstrapPhaseContext) => Promise<SessionSubscriptionOutcome>
+  connectionState?: Ref<string>
 } = {}) {
   const loadHistoryImplementation = overrides.loadHistory || (async () => ({ ok: true }))
   const loadHistory = vi.fn(async (
@@ -67,6 +69,8 @@ function createBootstrap(overrides: {
     sessionReadLifecycle,
     loadHistory,
     subscribeSession,
+    reconcileSession: overrides.reconcileSession,
+    connectionState: overrides.connectionState,
     cancelHistory,
     cancelSubscription,
   })
@@ -87,6 +91,74 @@ afterEach(() => {
 })
 
 describe('useChatSessionBootstrap', () => {
+  it('merges gaps during an initial live read into a fresh reconciliation on the same lease', async () => {
+    let release!: (value: SessionSubscriptionOutcome) => void
+    const initial = new Promise<SessionSubscriptionOutcome>(resolve => { release = resolve })
+    const reconcileSession = vi.fn(async () => LIVE_READY)
+    const { api, openSessionRead, closeLease } = createBootstrap({ subscribeSession: () => initial, reconcileSession })
+    const run = api.startSessionBootstrap()
+    const recovery = api.retryLive()
+    expect(api.retryLive()).toBe(recovery)
+    expect(reconcileSession).not.toHaveBeenCalled()
+    release(LIVE_READY)
+    await run.live
+    await recovery
+    expect(reconcileSession).toHaveBeenCalledOnce()
+    expect(openSessionRead).toHaveBeenCalledOnce()
+    expect(closeLease).not.toHaveBeenCalled()
+    api.cancelSessionBootstrap()
+  })
+
+  it('automatically retries a failed live read on the original lease without a retry click', async () => {
+    vi.useFakeTimers()
+    const reconcileSession = vi.fn(async () => LIVE_READY)
+    const { api, openSessionRead, closeLease } = createBootstrap({
+      connectionState: ref('connected'),
+      subscribeSession: async () => ({ ...LIVE_READY, authoritative: false,
+        error: new SessionReadFailure('timeout', 'held subscribe', true) }),
+      reconcileSession,
+    })
+    const run = api.startSessionBootstrap()
+    await Promise.all([run.history, run.live])
+    await vi.advanceTimersByTimeAsync(500)
+    expect(reconcileSession).toHaveBeenCalledOnce()
+    expect(openSessionRead).toHaveBeenCalledOnce()
+    expect(closeLease).not.toHaveBeenCalled()
+    expect(api.livePhase.value).toBe('ready')
+    api.cancelSessionBootstrap()
+  })
+
+  it('publishes a history-only failure before notifying the automatic recovery watcher', async () => {
+    vi.useFakeTimers()
+    let available = false
+    const { api, loadHistory, subscribeSession, openSessionRead, closeLease } = createBootstrap({
+      connectionState: ref('connected'),
+      loadHistory: async () => available
+        ? { ok: true }
+        : { ok: false, error: new SessionReadFailure('unavailable', 'history offline', true) },
+    })
+    try {
+      const run = api.startSessionBootstrap()
+      await run.live
+      await vi.advanceTimersByTimeAsync(100)
+      await run.history
+      expect(api.historyPhase.value).toBe('error')
+      expect(api.livePhase.value).toBe('ready')
+      const failedAttempts = loadHistory.mock.calls.length
+
+      available = true
+      // No connection transition or unrelated live update wakes the watcher.
+      await vi.advanceTimersByTimeAsync(500)
+      expect(loadHistory).toHaveBeenCalledTimes(failedAttempts + 1)
+      expect(api.historyPhase.value).toBe('ready')
+      expect(subscribeSession).toHaveBeenCalledOnce()
+      expect(openSessionRead).toHaveBeenCalledOnce()
+      expect(closeLease).not.toHaveBeenCalled()
+    } finally {
+      api.cancelSessionBootstrap()
+    }
+  })
+
   it('releases optional traffic after the lease queues critical frames, not responses', async () => {
     let releaseHistory!: (result: SessionPhaseResult) => void
     let releaseLive!: (result: SessionSubscriptionOutcome) => void
@@ -115,7 +187,7 @@ describe('useChatSessionBootstrap', () => {
       loadHistory: async () => {
         attempt += 1
         return attempt === 1
-          ? { ok: false, error: new RpcTimeoutError('chat.history', 7_000) }
+          ? { ok: false, error: new SessionReadFailure('timeout', 'chat.history timed out', true) }
           : { ok: true }
       },
     })
@@ -238,7 +310,10 @@ describe('useChatSessionBootstrap', () => {
     const { api } = createBootstrap({
       loadHistory: async context => {
         historyContexts.push(context)
-        return { ok: false, error: new RpcTimeoutError('chat.history', 7_000) }
+        return {
+          ok: false,
+          error: new SessionReadFailure('timeout', 'chat.history timed out', true),
+        }
       },
       subscribeSession: async context => {
         liveContexts.push(context)
@@ -246,7 +321,11 @@ describe('useChatSessionBootstrap', () => {
           authoritative: false,
           live: false,
           backgroundOnly: false,
-          error: new RpcTimeoutError('sessions.messages.subscribe', 7_000),
+          error: new SessionReadFailure(
+            'timeout',
+            'sessions.messages.subscribe timed out',
+            true,
+          ),
         }
       },
     })
@@ -262,11 +341,7 @@ describe('useChatSessionBootstrap', () => {
 
   it('retries STORAGE_BUSY after the server delay without disturbing live', async () => {
     vi.useFakeTimers()
-    const busy = Object.assign(new Error('storage busy'), {
-      code: 'STORAGE_BUSY',
-      retryable: true,
-      retry_after_ms: 100,
-    })
+    const busy = new SessionReadFailure('busy', 'storage busy', true, 100)
     let attempt = 0
     const { api, loadHistory, subscribeSession } = createBootstrap({
       loadHistory: async () => {
@@ -287,10 +362,7 @@ describe('useChatSessionBootstrap', () => {
 
   it('retries failed history manually on the same lease', async () => {
     let recover = false
-    const failure = Object.assign(new Error('history unavailable'), {
-      code: 'HISTORY_UNAVAILABLE',
-      retryable: true,
-    })
+    const failure = new SessionReadFailure('unavailable', 'history unavailable', true)
     const { api, loadHistory, subscribeSession, openSessionRead } = createBootstrap({
       loadHistory: async () => recover ? { ok: true } : { ok: false, error: failure },
     })
@@ -308,10 +380,7 @@ describe('useChatSessionBootstrap', () => {
 
   it('reopens a dead lease before retrying history', async () => {
     let recover = false
-    const failure = Object.assign(new Error('history unavailable'), {
-      code: 'HISTORY_UNAVAILABLE',
-      retryable: false,
-    })
+    const failure = new SessionReadFailure('unavailable', 'history unavailable', false)
     const {
       api,
       loadHistory,
@@ -453,13 +522,11 @@ describe('useChatSessionBootstrap', () => {
     expect(autoSendDraftIsUnchanged(
       'draft', 'draft', [attachment], [attachment], 1, 2,
     )).toBe(false)
-    expect(shouldRetrySessionPhase(Object.assign(new Error('temporarily unavailable'), {
-      code: 'UNAVAILABLE',
-      retryable: true,
-    }))).toBe(true)
-    expect(shouldRetrySessionPhase(Object.assign(new Error('not authorized'), {
-      code: 'FORBIDDEN',
-      retryable: false,
-    }))).toBe(false)
+    expect(shouldRetrySessionPhase(
+      new SessionReadFailure('unavailable', 'temporarily unavailable', true),
+    )).toBe(true)
+    expect(shouldRetrySessionPhase(
+      new SessionReadFailure('unavailable', 'not authorized', false),
+    )).toBe(false)
   })
 })

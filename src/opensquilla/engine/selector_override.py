@@ -58,7 +58,7 @@ def _bounded_fallback_chain_required(turn_metadata: dict[str, Any]) -> bool:
     )
 
 
-def _provider_config_has_request_capacity(
+def provider_config_has_request_capacity(
     config: Any,
     turn_metadata: dict[str, Any],
     *,
@@ -121,7 +121,7 @@ def _require_provider_config_capacity(
     provider: str = "",
     model: str = "",
 ) -> None:
-    if _provider_config_has_request_capacity(
+    if provider_config_has_request_capacity(
         config,
         turn_metadata,
         provider=provider,
@@ -231,7 +231,7 @@ def _capacity_approved_fallback_entries(
     return [
         config
         for config in _materialize_fallback_configs(selector, entries)
-        if _provider_config_has_request_capacity(config, turn_metadata)
+        if provider_config_has_request_capacity(config, turn_metadata)
     ]
 
 
@@ -532,6 +532,74 @@ def _disable_selector_provider_state_replay(
         disable()
 
 
+def resolve_strict_router_fallback_chain(
+    config: Any,
+    turn_metadata: dict[str, Any],
+    *,
+    active_provider_id: str,
+    session_key: str = "",
+) -> list[object] | None:
+    """Resolve the private executable form of a strict Router fallback chain.
+
+    Turn metadata retains only provider/model identifiers.  Cross-provider
+    entries need their own configured credentials before the selector can
+    install them; same-provider entries remain compact mappings and reuse the
+    selector's active credentials.  Unresolvable cross-provider entries are
+    omitted instead of borrowing another provider's authority.
+    """
+
+    if turn_metadata.get("router_fallback_strict") is not True:
+        return None
+    raw_chain = turn_metadata.get("router_fallback_chain")
+    if not isinstance(raw_chain, list):
+        return None
+
+    active_provider = str(active_provider_id or "").strip().lower()
+    router_cfg = getattr(config, "squilla_router", None)
+    cross_provider_enabled = bool(
+        getattr(router_cfg, "cross_provider_tiers", False)
+    )
+    mismatch_policy = str(
+        getattr(router_cfg, "tier_provider_mismatch", "route") or "route"
+    ).strip().lower()
+    resolved_chain: list[object] = []
+    for raw_entry in raw_chain:
+        if not isinstance(raw_entry, dict):
+            continue
+        model = str(raw_entry.get("model") or "").strip()
+        if not model:
+            continue
+        provider = str(raw_entry.get("provider") or active_provider).strip().lower()
+        if not provider:
+            continue
+        if provider == active_provider:
+            entry = dict(raw_entry)
+            entry["provider"] = active_provider
+            resolved_chain.append(entry)
+            continue
+        if not cross_provider_enabled:
+            if mismatch_policy != "veto":
+                # Preserve the existing route-mode contract: foreign model ids
+                # execute through the configured active aggregator/provider.
+                entry = dict(raw_entry)
+                entry["provider"] = active_provider
+                resolved_chain.append(entry)
+            continue
+
+        # Keep fallback credential resolution private.  In particular, do not
+        # overwrite the selected head's routed_provider_resolution telemetry.
+        resolved = resolve_tier_provider_config(
+            config,
+            provider,
+            model,
+            session_key=session_key,
+            turn_metadata=None,
+        )
+        if resolved is not None:
+            resolved_chain.append(resolved)
+    return resolved_chain
+
+
 def apply_model_override(
     selector: Any,
     model: str,
@@ -539,6 +607,7 @@ def apply_model_override(
     turn_metadata: dict[str, Any],
     realign_routed_model: bool,
     tier_provider_config: Any | None = None,
+    strict_router_fallback_chain: Sequence[object] | None = None,
 ) -> Any:
     """Apply ``model`` to the cloned selector and resolve the provider.
 
@@ -550,8 +619,9 @@ def apply_model_override(
     ``routed_model`` intentionally records the would-be routed choice.
 
     ``tier_provider_config`` switches the turn to a cross-provider tier's
-    full ProviderConfig; the router fallback chain is skipped in that case
-    (its entries are same-provider models of the provider being left).
+    full ProviderConfig. A strict Router call may also supply an independently
+    resolved fallback chain whose cross-provider entries retain their own
+    configured credentials.
     """
     if turn_metadata.get("large_context_capacity_blocked") is True:
         from opensquilla.engine.capacity_admission import LargeContextCapacityError
@@ -561,6 +631,48 @@ def apply_model_override(
             or "No deployment has proven capacity for this attachment request."
         )
         raise LargeContextCapacityError(reason)
+
+    router_fallback_chain = (
+        list(strict_router_fallback_chain)
+        if strict_router_fallback_chain is not None
+        else (
+            turn_metadata.get("router_fallback_chain")
+            if turn_metadata.get("routing_applied") is True
+            else None
+        )
+    )
+
+    def install_strict_model_chain(strict_model: str) -> None:
+        """Install a verifiably isolated Router chain or fail closed.
+
+        The optional third-party selector seam predates
+        ``preserve_existing_tail``.  Calling its legacy two-argument hook would
+        leave an opaque configured/plugin tail executable, which violates the
+        image route's authorization boundary.  A selector that cannot prove it
+        cleared that tail must not execute the turn.
+        """
+
+        if not isinstance(router_fallback_chain, list):
+            raise RuntimeError("strict router fallback chain is unavailable")
+        override_with_chain = getattr(
+            selector,
+            "override_model_with_fallback_chain",
+            None,
+        )
+        if not callable(override_with_chain):
+            raise RuntimeError(
+                "selector does not support strict router fallback isolation"
+            )
+        try:
+            override_with_chain(
+                strict_model,
+                router_fallback_chain,
+                preserve_existing_tail=False,
+            )
+        except TypeError as exc:
+            raise RuntimeError(
+                "selector does not support strict router fallback isolation"
+            ) from exc
 
     if tier_provider_config is not None and hasattr(selector, "override_provider_config"):
         _require_provider_config_capacity(
@@ -572,15 +684,39 @@ def apply_model_override(
             ),
         )
         if turn_metadata.get("router_fallback_strict") is True:
-            try:
-                selector.override_provider_config(
-                    tier_provider_config,
-                    preserve_existing_tail=False,
-                )
-            except TypeError as exc:
-                raise RuntimeError(
-                    "selector does not support strict artifact fallback isolation"
-                ) from exc
+            override_provider_with_chain = getattr(
+                selector,
+                "override_provider_config_with_fallback_chain",
+                None,
+            )
+            if callable(override_provider_with_chain) and isinstance(
+                router_fallback_chain,
+                list,
+            ):
+                try:
+                    override_provider_with_chain(
+                        tier_provider_config,
+                        router_fallback_chain,
+                        preserve_existing_tail=False,
+                    )
+                except TypeError as exc:
+                    raise RuntimeError(
+                        "selector does not support strict router fallback isolation"
+                    ) from exc
+            else:
+                if router_fallback_chain:
+                    raise RuntimeError(
+                        "selector does not support strict router fallback isolation"
+                    )
+                try:
+                    selector.override_provider_config(
+                        tier_provider_config,
+                        preserve_existing_tail=False,
+                    )
+                except TypeError as exc:
+                    raise RuntimeError(
+                        "selector does not support strict artifact fallback isolation"
+                    ) from exc
         else:
             bounded_provider_override = getattr(
                 selector,
@@ -662,13 +798,13 @@ def apply_model_override(
         turn_metadata["routed_provider_fallback_model"] = str(
             getattr(current_config, "model", "") or ""
         )
+        if turn_metadata.get("router_fallback_strict") is True:
+            current_model = str(getattr(current_config, "model", "") or "").strip()
+            if not current_model:
+                raise RuntimeError("strict router fallback head is unavailable")
+            install_strict_model_chain(current_model)
         return _resolve_and_record_execution(selector, turn_metadata)
 
-    router_fallback_chain = (
-        turn_metadata.get("router_fallback_chain")
-        if turn_metadata.get("routing_applied") is True
-        else None
-    )
     override_with_fallback_chain = getattr(
         selector,
         "override_model_with_fallback_chain",
@@ -680,22 +816,8 @@ def apply_model_override(
         None,
     )
     bounded_fallbacks_required = _bounded_fallback_chain_required(turn_metadata)
-    if (
-        turn_metadata.get("router_fallback_strict") is True
-        and callable(override_with_fallback_chain)
-        and isinstance(router_fallback_chain, list)
-    ):
-        try:
-            override_with_fallback_chain(
-                model,
-                router_fallback_chain,
-                preserve_existing_tail=False,
-            )
-        except TypeError:
-            # Compatibility for third-party selector shims that implement
-            # the older two-argument hook. A strict Artifact turn must not
-            # silently retain their unknown fallback tail.
-            selector.override_model(model)
+    if turn_metadata.get("router_fallback_strict") is True:
+        install_strict_model_chain(model)
     elif bounded_fallbacks_required and callable(override_with_bounded_fallback_chain):
         approved_router_fallbacks = _capacity_approved_fallback_entries(
             selector,

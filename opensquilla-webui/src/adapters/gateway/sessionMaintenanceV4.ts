@@ -1,4 +1,4 @@
-import type { RpcCallOptions } from '@/lib/rpc'
+import type { TransportCallOptions as RpcCallOptions } from './transportTypes'
 import {
   SESSIONS_RESET_METHOD,
   type SessionsResetParams,

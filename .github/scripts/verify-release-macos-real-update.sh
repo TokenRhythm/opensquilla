@@ -1,11 +1,16 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-if [[ "$#" -ne 2 ]]; then
-  echo "usage: $0 CHANNEL_MANIFEST LABEL" >&2
+if [[ "$#" -lt 2 || "$#" -gt 3 ]]; then
+  echo "usage: $0 CHANNEL_MANIFEST LABEL [BASELINE_VERSION]" >&2
   exit 2
 fi
 
+baseline_version="${3-0.5.3}"
+if [[ "${baseline_version}" != "0.5.3" && "${baseline_version}" != "0.5.4" ]]; then
+  echo "baseline version must be 0.5.3 or 0.5.4" >&2
+  exit 2
+fi
 channel_manifest="$(cd "$(dirname "$1")" && pwd)/$(basename "$1")"
 label="$2"
 if [[ ! "${label}" =~ ^[A-Za-z0-9._-]{1,80}$ ]]; then
@@ -13,26 +18,28 @@ if [[ ! "${label}" =~ ^[A-Za-z0-9._-]{1,80}$ ]]; then
   exit 2
 fi
 
-sandbox="${RUNNER_TEMP}/opensquilla-real-updater-${label}"
-old_dir="${sandbox}/v0.5.3"
-old_mount="${sandbox}/v0.5.3-mount"
+sandbox="${RUNNER_TEMP}/opensquilla-real-updater-${label}-${baseline_version}"
+old_dir="${sandbox}/v${baseline_version}"
+old_mount="${sandbox}/v${baseline_version}-mount"
 user_data="${sandbox}/user-data/OpenSquilla"
 profile="${user_data}/opensquilla"
 probe="${GITHUB_WORKSPACE}/.github/scripts/verify-release-profile-preservation.py"
 driver="${GITHUB_WORKSPACE}/desktop/electron/scripts/test-packaged-real-update-flow.mjs"
 external_sentinels="${sandbox}/synthetic-system-tools"
 installed_app="/Applications/OpenSquilla.app"
-old_asset="OpenSquilla-0.5.3-mac-arm64.dmg"
-expected_version="$(python3 - "${channel_manifest}" <<'PY'
+old_asset="OpenSquilla-${baseline_version}-mac-arm64.dmg"
+expected_version="$(python3 - "${channel_manifest}" "${baseline_version}" <<'PY'
 import json
+import re
 import sys
 from pathlib import Path
 
 manifest = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
 version = manifest["version"]
+assert re.fullmatch(r"(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)", version), manifest
 assert manifest["tag"] == f"v{version}", manifest
 assert manifest["prerelease"] is False, manifest
-assert tuple(map(int, version.split("."))) > (0, 5, 3), manifest
+assert tuple(map(int, version.split("."))) > tuple(map(int, sys.argv[2].split("."))), manifest
 print(manifest["version"])
 PY
 )"
@@ -84,8 +91,8 @@ cleanup() {
 }
 trap cleanup EXIT
 
-gh release download v0.5.3 \
-  --repo opensquilla/opensquilla \
+gh release download "v${baseline_version}" \
+  --repo TokenRhythm/opensquilla \
   --pattern "${old_asset}" \
   --dir "${old_dir}"
 old_dmg="${old_dir}/${old_asset}"
@@ -94,9 +101,20 @@ hdiutil attach -nobrowse -readonly -mountpoint "${old_mount}" "${old_dmg}"
 ditto "${old_mount}/OpenSquilla.app" "${installed_app}"
 hdiutil detach "${old_mount}" -quiet
 
-old_runtime="${installed_app}/Contents/Resources/runtime/developer/darwin-arm64"
-test -x "${old_runtime}/python/bin/python3"
-test -x "${old_runtime}/node/bin/node"
+old_version="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' \
+  "${installed_app}/Contents/Info.plist")"
+test "${old_version}" = "${baseline_version}"
+# v0.5.3 bundles developer tools; v0.5.4 uses the slim Runtime Pack layout.
+if [[ "${baseline_version}" == "0.5.3" ]]; then
+  old_runtime="${installed_app}/Contents/Resources/runtime/developer/darwin-arm64"
+  test -x "${old_runtime}/python/bin/python3"
+  test -x "${old_runtime}/node/bin/node"
+else
+  old_runtime="${installed_app}/Contents/Resources/runtime"
+  test ! -e "${old_runtime}/developer"
+  test -f "${old_runtime}/runtime-manifest.json"
+  test -f "${old_runtime}/runtime-pack-catalog.json"
+fi
 python3 "${probe}" seed --home "${profile}" --label "${label}" \
   --external-root "${external_sentinels}"
 
@@ -107,6 +125,7 @@ node "${driver}" \
   --user-data-dir "${user_data}" \
   --channel-manifest "${channel_manifest}" \
   --expected-version "${expected_version}" \
+  --baseline-version "${baseline_version}" \
   --mode native
 
 # quitAndInstall is asynchronous after the old client exits. Require both the
@@ -127,11 +146,11 @@ while (( SECONDS < deadline )); do
   sleep 1
 done
 if [[ "${actual_version}" != "${expected_version}" ]]; then
-  echo "Official v0.5.3 updater did not install ${expected_version}" >&2
+  echo "Official v${baseline_version} updater did not install ${expected_version}" >&2
   exit 1
 fi
 if [[ -z "${relaunch_pid}" ]]; then
-  echo "Official v0.5.3 updater installed but did not automatically relaunch" >&2
+  echo "Official v${baseline_version} updater installed but did not automatically relaunch" >&2
   exit 1
 fi
 stop_installed_app

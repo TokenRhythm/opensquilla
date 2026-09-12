@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 import re
+import runpy
 import sqlite3
 import subprocess
 import sys
@@ -47,8 +48,11 @@ def test_desktop_electron_release_config_matches_current_release() -> None:
     assert not re.search(r"(?<=\d)(?:a|b|rc)\d+$", package["version"])
     assert package["repository"] == {
         "type": "git",
-        "url": "https://github.com/opensquilla/opensquilla.git",
+        "url": "https://github.com/TokenRhythm/opensquilla.git",
     }
+    assert build["publish"] == [
+        {"provider": "github", "owner": "TokenRhythm", "repo": "opensquilla"}
+    ]
     assert build["appId"] == "ai.opensquilla.desktop"
     assert build["productName"] == "OpenSquilla"
     assert build["artifactName"] == "OpenSquilla-${version}-${os}-${arch}.${ext}"
@@ -81,7 +85,7 @@ def test_release_workflow_builds_desktop_installers() -> None:
     assert "build-desktop-macos:" in workflow
     assert "build-desktop-windows:" in workflow
     assert "npx electron-builder --mac --publish never" in workflow
-    assert "npx electron-builder --win --publish never" in workflow
+    assert "node scripts/build-signed-windows.cjs" in workflow
     assert "npm run fetch:runtimes" not in workflow
     assert workflow.count("verify-sandbox-package.mjs --source") == 2
     assert workflow.count("verify-sandbox-package.mjs --release-source") == 2
@@ -204,7 +208,7 @@ fi
             "FAKE_RELEASE_STATE": json.dumps(
                 {"assets": [], "isDraft": draft, "isPrerelease": prerelease}
             ),
-            "GH_REPO": "opensquilla/opensquilla",
+            "GH_REPO": "TokenRhythm/opensquilla",
             "GH_TOKEN": "synthetic-test-token",
             "PATH": (
                 f"{fake_bin}{os.pathsep}{Path(sys.executable).parent}{os.pathsep}{env['PATH']}"
@@ -269,6 +273,74 @@ def test_release_upload_derives_preview_state_from_each_tag(tmp_path: Path) -> N
     assert preview_result.returncode == 0, preview_result.stderr
     assert "release upload v9.9.9" in stable_calls
     assert "release upload v9.9.9rc7" in preview_calls
+
+
+@pytest.mark.parametrize(
+    ("actual", "expected_summary"),
+    [
+        ('# changed comment\n[llm]\napi_key = "original-secret"\n', {"changed_paths": []}),
+        ('[llm]\napi_key = "replacement-secret"\n', {"changed_paths": ["llm.api_key"]}),
+        ('[llm]\napi_key = "invalid-secret', {"invalid_toml": True}),
+    ],
+)
+def test_release_profile_config_diagnostics_omit_values(
+    actual: str,
+    expected_summary: dict,
+) -> None:
+    probe = runpy.run_path(".github/scripts/verify-release-profile-preservation.py")
+    summary = probe["_config_change_summary"]('[llm]\napi_key = "original-secret"\n', actual)
+    parsed = json.loads(summary)
+
+    for key, value in expected_summary.items():
+        assert parsed[key] == value
+    assert "secret" not in summary
+    assert parsed["actual_text_sha256"] != parsed["expected_text_sha256"]
+
+
+@pytest.mark.parametrize("signed_seed", [False, True])
+@pytest.mark.parametrize(
+    "variant", ["seed", "migrated", "partial-migration", "comment", "identity", "external"]
+)
+def test_signed_retained_preservation_accepts_only_exact_seed_or_migration(
+    tmp_path: Path, variant: str, signed_seed: bool
+) -> None:
+    probe_path = Path(".github/scripts/verify-release-profile-preservation.py")
+    probe = runpy.run_path(str(probe_path))
+    home = tmp_path / "profile"
+    external = tmp_path / "external"
+    label = "signed-retained-contract"
+    probe["seed_profile"](home, label, external_root=external, signed_retained=signed_seed)
+    config = home / "config.toml"
+    if variant == "migrated":
+        config.write_text(
+            probe["_runtime_config_text"](home, signed_retained=signed_seed), encoding="utf-8"
+        )
+    elif variant == "partial-migration":
+        config.write_text("config_version = 1\n" + config.read_text(), encoding="utf-8")
+    elif variant == "comment":
+        config.write_text(config.read_text() + "\n# unexpected edit\n", encoding="utf-8")
+    elif variant == "identity":
+        (home / "workspace" / "IDENTITY.md").write_text("changed", encoding="utf-8")
+    elif variant == "external":
+        (external / "git" / "git-sentinel.bin").write_bytes(b"changed")
+    argv = [
+        sys.executable,
+        str(probe_path),
+        "verify-signed-retained",
+        "--home",
+        str(home),
+        "--label",
+        label,
+        "--external-root",
+        str(external),
+    ]
+    result = subprocess.run(argv, capture_output=True, text=True, check=False)
+    assert result.returncode == (0 if variant in {"seed", "migrated"} else 1), result.stderr
+    if variant in {"seed", "migrated"}:
+        # The new operation must not broaden either original installer check.
+        argv[2] = "verify-runtime" if variant == "seed" else "verify"
+        legacy = subprocess.run(argv, capture_output=True, text=True, check=False)
+        assert legacy.returncode == 1
 
 
 def test_release_profile_preservation_probe_covers_identity_config_and_chat_db(
@@ -414,6 +486,11 @@ def test_release_profile_preservation_probe_covers_identity_config_and_chat_db(
     )
     assert install_phase_rejected.returncode != 0
     assert "during installation" in install_phase_rejected.stderr
+    assert '"changed_paths": ["config_version", "control_ui.default_locale"]' in (
+        install_phase_rejected.stderr
+    )
+    assert '"expected_text_sha256"' in install_phase_rejected.stderr
+    assert '"actual_text_sha256"' in install_phase_rejected.stderr
 
     (home / "config.toml").write_text(config_text, encoding="utf-8", newline="")
 
@@ -632,7 +709,7 @@ def test_release_workflow_gates_built_and_downloaded_installers_on_profile_reten
     assert "runtime/developer/darwin-arm64" in mac_helper
     assert "test ! -e \"${candidate_runtime}/developer\"" in mac_helper
     assert "resources\\runtime\\developer\\windows-x64" in windows_helper
-    assert "retained the v0.5.3 bundled developer runtimes" in windows_helper
+    assert "retained bundled developer runtimes" in windows_helper
 
     assert "test-packaged-update-banner.mjs" in windows_helper
     assert "if ($VerifyLongRunningUpdateBanner)" in windows_helper
@@ -663,15 +740,41 @@ def test_release_workflow_gates_built_and_downloaded_installers_on_profile_reten
         "chat-session-load-state",
         'data-recovery-state=\"history-error\"',
         'data-recovery-state=\"live-degraded\"',
-        "chat-session-recovery-retry",
+        "automatic recovery must not navigate the page",
+        "automatic recovery must preserve the original composer instance",
+        "automatic recovery must not move focus away from the draft",
         "composer.isEditable()",
         "sendButton.isDisabled()",
         "expectedLastMessage",
         "healthyNavigationSocketIds.size",
-        "socketCount > 1",
+        "assertConcurrentRecoveryTransport",
+        "socketPolicies.get(recoverySocketIndex)?.concurrent_history_reads",
+        "newSocketCount: nextSocketIndex - recoverySocketCountBaseline",
+        "closeCount: physicalCloseCount - recoveryCloseCountBaseline",
+        "const terminalTransport = recoveryTransportSample()",
+        "const recoveredTransport = recoveryTransportSample()",
+        "processIdentity = await captureElectronProcessIdentity(app)",
+        "await cleanupPackagedFirstSend({",
+        "processesAfterCleanup: electronProcessSnapshot(processIdentity)",
+        "runError ??= error",
     ):
         assert contract in session_recovery_smoke
+    # Recovery must be observed through product-owned retries, not initiated
+    # by clicking the legacy manual control in the acceptance fixture.
+    assert "chat-session-recovery-retry" not in session_recovery_smoke
+    automatic_recovery = session_recovery_smoke[
+        session_recovery_smoke.index("  injectHang = false") :
+        session_recovery_smoke.index("  const recoveredTransport = recoveryTransportSample()")
+    ]
+    for manual_action in (".click(", ".reload(", ".goto(", ".focus("):
+        assert manual_action not in automatic_recovery
     assert "page.clock" not in session_recovery_smoke
+    assert "app?.close().catch" not in session_recovery_smoke
+    assert "unrouteBeforeQuit:" not in session_recovery_smoke
+    assert "deferQuit:" not in session_recovery_smoke
+    assert session_recovery_smoke.index("await cleanupPackagedFirstSend({") < (
+        session_recovery_smoke.index("if (runError) throw runError")
+    ) < session_recovery_smoke.index("console.log(JSON.stringify({")
     assert "OPENSQUILLA_TESTING: '0'" in session_recovery_smoke
     assert "verify-runtime" not in mac_helper
     assert "verify-runtime" not in windows_helper
@@ -693,10 +796,10 @@ def test_release_workflow_gates_built_and_downloaded_installers_on_profile_reten
         assert "actions/setup-node@v4" in audit
         assert "desktop/electron/package-lock.json" in audit
         assert "working-directory: desktop/electron" in audit
-        assert "run: npm ci" in audit
-        assert audit.index("run: npm ci") < audit.index(
-            "verify-release-", audit.index("run: npm ci")
-        )
+        assert audit.index("npm ci") < audit.index("npm run build")
+        assert audit.index("npm run build") < audit.index(
+            "await import('./scripts/packaged-first-send-cleanup.mjs')"
+        ) < audit.index("verify-release-", audit.index("npm ci"))
     assert "codesign --verify --deep --strict" in mac_audit
     assert "spctl -a -vv -t exec" in mac_audit
     assert "xcrun stapler validate" in mac_audit
@@ -756,11 +859,13 @@ def test_release_workflow_prestages_draft_without_advancing_channels() -> None:
     )
     for contract in (
         "OPENSQUILLA_DESKTOP_UPDATE_CHANNEL_ROOT",
-        "OPENSQUILLA_DESKTOP_UPDATE_SOURCE: 'oss'",
+        "OPENSQUILLA_DESKTOP_UPDATE_SOURCE: requireSourceFallback ? 'github' : 'oss'",
+        "const requireSourceFallback = downloadSourceMode === 'github-to-oss'",
+        "--download-source-mode requires signed-handoff download mode",
         "checkForUpdates()",
         "downloadUpdate()",
         "relaunchToUpdate()",
-        "installer reported success while the official v0.5.3 process remained live",
+        "installer reported success while the official v${baselineVersion} process remained live",
     ):
         assert contract in driver
 
@@ -849,15 +954,37 @@ def test_release_workflow_keeps_macos_signing_identity_auto_selected() -> None:
     assert "GH_TOKEN" not in mac_step
 
 
-def test_release_workflow_keeps_windows_build_unsigned_until_signing_is_available() -> None:
+def test_release_workflow_signs_windows_with_pinned_digicert_policy() -> None:
     workflow = Path(".github/workflows/wheelhouse-release.yml").read_text(encoding="utf-8")
-    windows_step = workflow.split("- name: Build unsigned Windows installer", 1)[1].split(
+    windows_job = workflow.split("  build-desktop-windows:", 1)[1].split(
+        "\n  publish-release:", 1
+    )[0]
+    windows_step = windows_job.split("- name: Build signed Windows installer", 1)[1].split(
         "- name: Verify Electron package", 1
     )[0]
 
-    assert "npx electron-builder --win --publish never" in windows_step
-    assert 'CSC_IDENTITY_AUTO_DISCOVERY: "false"' in windows_step
+    assert "environment:" in windows_job
+    assert "name: windows-code-signing" in windows_job
+    assert "${{ secrets.SM_HOST }}" in windows_job
+    assert "${{ secrets.SM_API_KEY }}" in windows_job
+    assert "${{ secrets.SM_CLIENT_CERT_FILE_B64 }}" in windows_job
+    assert "${{ secrets.SM_CLIENT_CERT_PASSWORD }}" in windows_job
+    assert "node scripts/build-signed-windows.cjs" in windows_step
+    assert ".github/scripts/verify-windows-signatures.ps1" in windows_job
+    assert "windows certsync" in windows_job
+    assert "Remove DigiCert client authentication material" in windows_job
+    assert 'CSC_IDENTITY_AUTO_DISCOVERY: "false"' not in windows_step
     assert not Path("desktop/electron/electron-builder.release.cjs").exists()
+
+    signing_policy = json.loads(
+        Path(".github/signing/windows-signing-policy.json").read_text(encoding="utf-8")
+    )
+    assert signing_policy["schemaVersion"] == 1
+    assert signing_policy["certificateSha1"] == "CBF0846AB04712002132A2991F57416639B70AF3"
+    assert signing_policy["publisherSubjectContains"] == (
+        "Beijing TokenRhythm Technologies Co., Ltd."
+    )
+    assert signing_policy["timestampUrl"] == "http://timestamp.digicert.com"
 
     for env_name in [
         "OPENSQUILLA_WINDOWS_AZURE_SIGNING",
@@ -876,51 +1003,36 @@ def test_release_workflow_keeps_windows_build_unsigned_until_signing_is_availabl
     assert "timestampRfc3161: 'http://timestamp.acs.microsoft.com'" not in workflow
 
 
-def test_release_docs_describe_unsigned_windows_policy() -> None:
+def test_release_docs_describe_signed_windows_policy() -> None:
     readme = Path("README.md").read_text(encoding="utf-8")
-    localized_readmes = {
-        "zh-Hans": Path("README.zh-Hans.md").read_text(encoding="utf-8"),
-        "ja": Path("README.ja.md").read_text(encoding="utf-8"),
-        "fr": Path("README.fr.md").read_text(encoding="utf-8"),
-        "de": Path("README.de.md").read_text(encoding="utf-8"),
-        "es": Path("README.es.md").read_text(encoding="utf-8"),
-    }
     releases = Path("RELEASES.md").read_text(encoding="utf-8")
     release_notes = Path(f"docs/releases/{CURRENT_VERSION}.md").read_text(encoding="utf-8")
     signing_policy = Path("docs/code-signing-policy.md").read_text(encoding="utf-8")
     privacy_policy = Path("PRIVACY.md").read_text(encoding="utf-8")
 
     assert "Code signing policy:" in readme
-    assert "Windows builds are currently unsigned" in readme
-    assert "Windows desktop installer is currently unsigned" in releases
-    assert "Windows release builds are currently unsigned" in signing_policy
-    assert "claim Windows code signing" in signing_policy
+    assert "v0.5.4 Windows installer remains unsigned" in readme
+    assert "Authenticode signs new Windows installers" in readme
+    assert "must Authenticode sign each new installer" in releases
+    assert "Release Assets workflow signs new Windows builds" in signing_policy
+    assert "windows-code-signing" in signing_policy
     assert "[`PRIVACY.md`](../PRIVACY.md)" in signing_policy
     assert "[@Open-Squilla](https://github.com/Open-Squilla)" in signing_policy
-    assert "Initial SignPath approvers" in signing_policy
+    assert "Initial Windows signing environment approvers" in signing_policy
     assert "network observability" in signing_policy
 
     for text in [readme, releases, release_notes]:
         assert "code-signing-policy.md" in text
 
+    assert "Windows desktop installer is currently unsigned" in release_notes
+
     assert "PRIVACY.md" in readme
     assert "THIRD_PARTY_NOTICES.md" in readme
     assert "### Reliability diagnostics" in privacy_policy
     assert "### Product and growth analytics" in privacy_policy
+    assert "streams the selected installer" in privacy_policy
     assert "OPENSQUILLA_TELEMETRY_DISABLED=true" in privacy_policy
     assert "future signing plan" not in readme
-
-    for text in [readme, releases]:
-        assert "signed desktop installers" not in text
-
-    for locale, phrase in {
-        "zh-Hans": "已签名的桌面",
-        "ja": "署名済みのデスクトップ",
-        "fr": "installateurs de bureau signés",
-        "de": "signierten Desktop",
-        "es": "instaladores de escritorio firmados",
-    }.items():
-        assert phrase not in localized_readmes[locale]
 
 
 def test_release_docs_warn_rc3_users_to_upgrade_in_place() -> None:
@@ -1136,7 +1248,7 @@ def test_all_readmes_default_install_paths_to_the_current_preview() -> None:
         assert f"OpenSquilla-{CURRENT_DESKTOP_VERSION}-win-x64.exe" in text, path
         assert all(url in text for url in oss_latest_assets), path
         assert wheel_url in text, path
-        assert "ghcr.io/opensquilla/opensquilla:latest" in text, path
+        assert "ghcr.io/tokenrhythm/opensquilla:latest" in text, path
         assert "0.5.0-Preview-2-Desktop" not in text, path
 
 

@@ -38,11 +38,6 @@ export function normalizeModelRoutingMode(value: unknown): ModelRoutingMode {
   return isModelRoutingMode(value) ? value : 'off'
 }
 
-export function isGatewayModelRoutingMode(value: unknown): value is GatewayModelRoutingMode {
-  return typeof value === 'string'
-    && GATEWAY_MODEL_ROUTING_MODES.includes(value as GatewayModelRoutingMode)
-}
-
 export function modelRoutingModeToGateway(mode: ModelRoutingMode): GatewayModelRoutingMode {
   if (mode === 'squilla_router') return 'router'
   if (mode === 'llm_ensemble') return 'ensemble'

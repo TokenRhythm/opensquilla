@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from pathlib import Path
 from typing import Any
 
 from starlette.applications import Starlette
@@ -18,27 +17,6 @@ from opensquilla.application.artifact_workbench import (
 )
 from opensquilla.gateway.adapters.artifact_content import GatewayArtifactContentPort
 from opensquilla.gateway.config import GatewayConfig
-from opensquilla.paths import media_root_from_config
-
-
-async def _session_id_for_download(session_manager: Any, session_key: str) -> str | None:
-    if not session_key:
-        return None
-    if session_manager is None:
-        return session_key
-    get_session = getattr(session_manager, "get_session", None)
-    if not callable(get_session):
-        return session_key
-    try:
-        session = await get_session(session_key)
-    except Exception:
-        return None
-    session_id = getattr(session, "session_id", None)
-    return session_id if isinstance(session_id, str) and session_id else None
-
-
-def _media_root_from_config(config: GatewayConfig) -> Path:
-    return media_root_from_config(config)
 
 
 def _safe_download_name(value: object) -> str:

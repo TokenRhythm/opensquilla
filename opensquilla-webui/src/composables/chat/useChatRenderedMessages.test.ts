@@ -56,6 +56,21 @@ function renderedMessagesFor(
   })
 }
 
+describe('useChatRenderedMessages scheduled provenance', () => {
+  it('keeps persisted sources and labels live cron completions before history arrives', () => {
+    const api = renderedMessagesFor([
+      { role: 'user', text: 'Run the inventory check.', ts: 1, provenanceKind: 'cron' },
+      { role: 'assistant', text: '12 items.', ts: 2, turnRunKind: 'cron_turn' },
+      { role: 'user', text: 'Scheduled trigger is a useful label.', ts: 3 },
+      { role: 'assistant', text: 'A normal follow-up.', ts: 4, turnRunKind: 'session_turn' },
+      { role: 'assistant', text: 'Persisted result.', ts: 5, provenanceKind: 'cron' },
+    ])
+
+    expect(api.renderedMessages.value.map(message => message.provenanceKind))
+      .toEqual(['cron', 'cron', undefined, undefined, 'cron'])
+  })
+})
+
 describe('useChatRenderedMessages annotation-only user turns', () => {
   it('keeps the live optimistic row when prompt annotations are the only visible payload', () => {
     const api = renderedMessagesFor([{
@@ -1182,6 +1197,150 @@ describe('useChatRenderedMessages immutable route history', () => {
     expect(strip?.gridCells?.map(cell => cell.model)).toEqual(['frozen/fast', 'frozen/winner'])
     expect(strip?.routerSettled).toBe(true)
   })
+})
+
+describe('useChatRenderedMessages image router candidates', () => {
+  it('preserves an actually executed legacy winner in restored history', () => {
+    const api = renderedMessagesFor([{
+      role: 'user',
+      text: 'Describe the shape.',
+      ts: 1,
+      attachments: [{
+        kind: 'file',
+        displayId: 'historical-image',
+        renderKey: 'historical-image',
+        name: 'shape.png',
+        mime: 'image/png',
+      }],
+    }, {
+      role: 'assistant',
+      text: 'A circle.',
+      ts: 2,
+      restoredFromHistory: true,
+      usage: {
+        routed_tier: 'image_model',
+        routed_model: 'historical/actual-winner',
+        routing_source: 'image_route',
+        router_tier_snapshot: {
+          version: 1,
+          request_kind: 'image',
+          tiers: [{
+            tier: 'image_model',
+            model: 'historical/actual-winner',
+            execution_kind: 'single_model',
+          }],
+        },
+      },
+    }], undefined, true)
+
+    const strip = api.renderedMessages.value.find(message => message.isRouterStrip)
+    expect(strip?.gridCells?.map(cell => cell.model)).toEqual(['historical/actual-winner'])
+    expect(strip?.winnerIdx).toBe(0)
+    expect(strip?.routerStatic).toBe(true)
+  })
+
+  it.each(['live', 'settled', 'restored'])(
+    'excludes implicit legacy image candidates from %s image routes',
+    (stage) => {
+      for (const snapshotKind of ['none', 'legacy', 'current']) {
+        const textEntries = [0, 1, 2, 3].map(index => ({
+          tier: `c${index}`,
+          model: `text/configured-${index}`,
+          execution_kind: 'single_model',
+        }))
+        const snapshot = snapshotKind === 'none' ? undefined : {
+          version: 1,
+          request_kind: 'image',
+          tiers: snapshotKind === 'legacy' ? [
+            textEntries[1],
+            { tier: 'image_model', model: 'legacy/unused-vision', execution_kind: 'single_model' },
+          ] : textEntries,
+        }
+        const route = {
+          tier: 'c1',
+          model: 'text/actual-winner',
+          source: 'image_route',
+          ...(snapshot ? { router_tier_snapshot: snapshot } : {}),
+        }
+        const messages: ChatMessage[] = [{
+          role: 'user',
+          text: 'Describe the attached shapes.',
+          ts: 1,
+          turnId: 'turn-image-candidates',
+          attachments: [{
+            kind: 'file',
+            displayId: 'synthetic-image',
+            renderKey: 'synthetic-image',
+            name: 'shapes.png',
+            mime: 'image/png',
+          }],
+        }]
+        if (stage !== 'restored') {
+          messages.push({
+            role: 'router',
+            text: '',
+            ts: 2,
+            turnId: 'turn-image-candidates',
+            provenanceKind: 'router_decision',
+            routerDecision: route,
+          })
+        }
+        if (stage !== 'live') {
+          messages.push({
+            role: 'assistant',
+            text: 'The image was not analyzed.',
+            ts: 3,
+            turnId: 'turn-image-candidates',
+            restoredFromHistory: stage === 'restored',
+            usage: {
+              routed_tier: route.tier,
+              routed_model: route.model,
+              routing_source: route.source,
+              route_plan: route,
+            },
+          })
+        }
+        const configs: Record<string, ChatRouterTierConfig> = Object.fromEntries(
+          textEntries.map(entry => [entry.tier, {
+            model: entry.model,
+            supportsImage: false,
+            imageOnly: false,
+          }]),
+        )
+        configs.image_model = {
+          model: 'legacy/unused-vision',
+          supportsImage: true,
+          imageOnly: true,
+        }
+        const before = JSON.stringify(messages)
+        const api = useChatRenderedMessages({
+          messages: ref(messages),
+          sessionKey: ref('agent:main:webchat:image-candidates'),
+          routerSlots: ref(Object.keys(configs)),
+          routerModels: ref({}),
+          routerTierConfigs: ref(configs),
+          routerVisualEffectsEnabled: ref(true),
+          routerVisualMode: ref('real_candidates'),
+          renderMarkdown: text => text,
+          stripGeneratedArtifactMarkers: text => text,
+          stripTimePrefix: text => text,
+          isSubagentCompletionMessage: () => false,
+        })
+
+        const strips = api.renderedMessages.value.filter(message => message.isRouterStrip)
+        expect(strips).toHaveLength(1)
+        const strip = strips[0]!
+        expect(strip.gridCells?.flatMap(cell => cell.tiers).sort()).toEqual(
+          snapshotKind === 'legacy' ? ['c1'] : ['c0', 'c1', 'c2', 'c3'],
+        )
+        expect(strip.gridCells?.some(cell => cell.model === 'legacy/unused-vision')).toBe(false)
+        expect(strip.gridCells?.[strip.winnerIdx ?? -1]?.model).toBe('text/actual-winner')
+        expect(strip.routerStatic).toBe(stage === 'restored')
+        expect(strip.routerSettled).toBe(stage === 'settled')
+        expect(JSON.stringify(messages)).toBe(before)
+      }
+    },
+  )
 })
 
 describe('useChatRenderedMessages router visual mode', () => {
@@ -2748,7 +2907,11 @@ describe('useChatRenderedMessages clarify history recovery', () => {
     })
   })
 
-  it('restores and settles a terminal request from its preserved request payload', () => {
+  it.each([
+    ['answered', 'replied'],
+    ['cancelled', 'expired'],
+    ['expired', 'expired'],
+  ] as const)('restores a %s request as %s from its preserved payload', (status, resolution) => {
     const api = renderedMessagesFor([
       {
         role: 'assistant',
@@ -2779,7 +2942,7 @@ describe('useChatRenderedMessages clarify history recovery', () => {
               },
             },
             result: JSON.stringify({
-              status: 'answered',
+              status,
               kind: 'user_input',
               paused: false,
               request_id: 'request-terminal-1',
@@ -2799,9 +2962,134 @@ describe('useChatRenderedMessages clarify history recovery', () => {
     expect(clarify?.key).toBe(
       'm-terminal-request-user-input:interrupt:request-terminal-1',
     )
-    expect(clarify?.resolution).toBe('replied')
+    expect(clarify?.resolution).toBe(resolution)
     expect(clarify?.clarify?.presentation).toBe('plan_questionnaire_v1')
   })
+
+  it.each(['succeeded', 'failed', 'cancelled', 'timeout', 'abandoned', 'interrupted'])(
+    'expires only unresolved structured input owned by the %s historical turn',
+    (status) => {
+      const request = (requestId: string | undefined, runId: string) => ({
+        status: 'input_required',
+        kind: 'user_input',
+        paused: true,
+        request_id: requestId,
+        run_id: runId,
+        step: 'scope',
+        clarify_schema: { fields: [{ name: 'scope', type: 'string' }] },
+      })
+      for (const hasTaskId of [true, false]) {
+        const owner = hasTaskId ? 'terminal-task' : 'terminal-turn'
+        const api = renderedMessagesFor([{
+          role: 'assistant', text: '', ts: 0, messageId: 'historical-questionnaire',
+          restoredFromHistory: true,
+          turnOutcome: {
+            turnId: 'terminal-turn',
+            ...(hasTaskId ? { taskId: owner } : {}),
+            status,
+          },
+          tool_calls: [
+            { type: 'tool_result', tool_use_id: 'pending', result: request('pending', owner) },
+            { type: 'tool_result', tool_use_id: 'accepted', result: request('accepted', owner) },
+            { type: 'tool_result', tool_use_id: 'other', result: request('other', 'other-task') },
+            { type: 'tool_result', tool_use_id: 'legacy', result: request(undefined, owner) },
+            {
+              type: 'tool_result', tool_use_id: 'accepted',
+              result: { kind: 'user_input', status: 'answered', paused: false, request_id: 'accepted' },
+            },
+          ],
+        }])
+        const clarifies = api.renderedMessages.value[0].parts?.filter(
+          (part): part is Extract<ChatPart, { type: 'interrupt' }> =>
+            part.type === 'interrupt' && part.interruptKind === 'clarify',
+        ) ?? []
+        expect(clarifies.map(part => part.resolution)).toEqual([
+          'expired', 'replied', null, null,
+        ])
+      }
+    },
+  )
+
+  it.each([
+    ['answered', 'expired'],
+    ['expired', 'answered'],
+  ] as const)('keeps accepted history after %s then %s and an expired live projection', (first, last) => {
+    const api = renderedMessagesFor([{
+      role: 'assistant', text: '', ts: 0, messageId: 'reordered-questionnaire',
+      turnOutcome: { turnId: 'terminal-turn', taskId: 'terminal-task', status: 'cancelled' },
+      tool_calls: [
+        {
+          type: 'tool_result', tool_use_id: 'question',
+          result: {
+            status: 'input_required', kind: 'user_input', paused: true,
+            request_id: 'accepted', run_id: 'terminal-task', step: 'scope',
+            clarify_schema: { fields: [{ name: 'scope', type: 'string' }] },
+          },
+        },
+        ...[first, last].map(status => ({
+          type: 'tool_result', tool_use_id: 'question',
+          result: { kind: 'user_input', status, paused: false, request_id: 'accepted' },
+        })),
+      ],
+    }], ref<ReadonlyMap<string, InterruptViewState>>(
+      new Map([['accepted', { resolution: 'expired', busy: false, error: '' }]]),
+    ))
+    const clarify = api.renderedMessages.value[0].parts?.find(
+      (part): part is Extract<ChatPart, { type: 'interrupt' }> =>
+        part.type === 'interrupt' && part.interruptKind === 'clarify',
+    )
+    expect(clarify?.resolution).toBe('replied')
+  })
+
+  it('updates a detached questionnaire timeline when its live request expires', () => {
+    const interrupt: Extract<ChatPart, { type: 'interrupt' }> = {
+      type: 'interrupt', interruptKind: 'clarify',
+      key: 'detached:interrupt:request-1',
+      clarify: { requestId: 'request-1', runId: 'task-1', step: 'scope', intro: '', fields: [] },
+      resolution: null, busy: false, error: '',
+    }
+    const interruptState = ref<ReadonlyMap<string, InterruptViewState>>(new Map())
+    const api = renderedMessagesFor([{
+      role: 'assistant', text: '', ts: 0, messageId: 'detached',
+      tool_calls: [],
+      timeline: [{ type: 'interrupt', approvalId: 'request-1' }],
+      interrupts: [interrupt],
+    }], interruptState)
+    const resolutions = () => {
+      const rendered = api.renderedMessages.value[0]
+      const part = rendered.parts?.find(item => item.type === 'interrupt')
+      const timeline = rendered.timelineItems?.find(item => item.type === 'interrupt')
+      return [part?.resolution, timeline?.part.resolution]
+    }
+    expect(resolutions()).toEqual([null, null])
+
+    interruptState.value = new Map([
+      ['request-1', { resolution: 'expired', busy: false, error: '' }],
+    ])
+    expect(resolutions()).toEqual(['expired', 'expired'])
+    expect(interrupt.resolution).toBeNull()
+  })
+
+  it.each([null, 'replied'] as const)(
+    'settles a frozen historical timeline while preserving its %s accepted outcome',
+    (resolution) => {
+      const api = renderedMessagesFor([{
+        role: 'assistant', text: '', ts: 0, messageId: 'frozen',
+        turnOutcome: { turnId: 'turn-1', taskId: 'task-1', status: 'cancelled' },
+        tool_calls: [],
+        timeline: [{ type: 'interrupt', approvalId: 'request-1' }],
+        interrupts: [{
+          type: 'interrupt', interruptKind: 'clarify', key: 'frozen:interrupt:request-1',
+          clarify: { requestId: 'request-1', runId: 'task-1', step: 'scope', intro: '', fields: [] },
+          resolution, busy: false, error: '',
+        }],
+      }])
+      const rendered = api.renderedMessages.value[0]
+      const expected = resolution || 'expired'
+      expect(rendered.parts?.find(part => part.type === 'interrupt')?.resolution).toBe(expected)
+      expect(rendered.timelineItems?.find(item => item.type === 'interrupt')?.part.resolution).toBe(expected)
+    },
+  )
 
   it('keeps consecutive requests distinct by requestId', () => {
     const request = (requestId: string) => ({

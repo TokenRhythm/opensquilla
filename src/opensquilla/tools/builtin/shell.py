@@ -163,7 +163,6 @@ from opensquilla.tools.run_mode import (
     trusted_sandbox_active,
 )
 from opensquilla.tools.source_diff_preservation import (
-    endgame_git_freeze_block_json,
     source_diff_preservation_block_json,
 )
 from opensquilla.tools.types import (
@@ -1563,12 +1562,6 @@ def _git_status_paths(output: str) -> list[str]:
     return paths
 
 
-def _sandbox_effectively_off() -> bool:
-    runtime = get_runtime()
-    effective = getattr(runtime, "effective", None) if runtime is not None else None
-    return runtime is None or not bool(getattr(effective, "sandbox_enabled", False))
-
-
 def _context_run_mode() -> str | None:
     return current_run_mode()
 
@@ -2286,16 +2279,6 @@ def _sandbox_shell_policy_cwd(cwd: str | None) -> Path | None:
     if cwd:
         return Path(cwd).expanduser().resolve(strict=False)
     return None
-
-
-def _trusted_windows_cmd_path() -> str:
-    comspec = os.environ.get("COMSPEC", "")
-    if _is_absolute_cmd_exe(comspec):
-        return comspec
-    system_root = os.environ.get("SystemRoot") or os.environ.get("SYSTEMROOT") or ""
-    if system_root and "\x00" not in system_root and ntpath.isabs(system_root):
-        return ntpath.join(system_root, "System32", "cmd.exe")
-    return r"C:\Windows\System32\cmd.exe"
 
 
 def _is_absolute_cmd_exe(path: str) -> bool:
@@ -5275,22 +5258,6 @@ def _runtime_readonly_shell_block(
     return None
 
 
-def _windows_runtime_readonly_shell_block(
-    tool_name: str,
-    command: str,
-    workdir: str | None,
-    *,
-    stdin: str | None = None,
-) -> dict[str, object] | None:
-    return _runtime_readonly_shell_block(
-        tool_name,
-        command,
-        workdir,
-        stdin=stdin,
-        runtime=get_runtime(),
-    )
-
-
 def _runtime_python_environment_mutation(
     command: str,
     workdir: str | None,
@@ -5640,23 +5607,6 @@ def _source_diff_preservation_shell_block(
         )
         if source_diff_block is not None:
             return source_diff_block
-    return None
-
-
-def _endgame_git_freeze_shell_block(
-    command: str,
-    *,
-    stdin: str | None = None,
-) -> str | None:
-    freeze_block = endgame_git_freeze_block_json(command=command)
-    if freeze_block is not None:
-        return freeze_block
-    if stdin is None:
-        return None
-    for stdin_chunk in _iter_stdin_guard_chunks(stdin):
-        freeze_block = endgame_git_freeze_block_json(command=stdin_chunk)
-        if freeze_block is not None:
-            return freeze_block
     return None
 
 
@@ -6691,12 +6641,6 @@ async def exec_command(
     scratch_block = _workspace_scratch_artifact_shell_block("exec_command", command, cwd)
     if scratch_block is not None:
         return json.dumps(scratch_block, ensure_ascii=False)
-    # Freeze first: when both guards would fire, the source-diff decision's
-    # candidate-lost marking and revert-observed events must not run for a
-    # command the freeze block prevents from executing at all.
-    endgame_freeze_block = _endgame_git_freeze_shell_block(command, stdin=stdin)
-    if endgame_freeze_block is not None:
-        return endgame_freeze_block
     source_diff_block = _source_diff_preservation_shell_block(command, cwd, stdin=stdin)
     if source_diff_block is not None:
         return source_diff_block
@@ -7213,11 +7157,6 @@ async def background_process(
     )
     if scratch_block is not None:
         return json.dumps(scratch_block, ensure_ascii=False)
-    # Freeze first, as in exec_command: no candidate-lost bookkeeping for a
-    # command the freeze block prevents from executing.
-    endgame_freeze_block = _endgame_git_freeze_shell_block(command)
-    if endgame_freeze_block is not None:
-        return endgame_freeze_block
     source_diff_block = _source_diff_preservation_shell_block(command, cwd)
     if source_diff_block is not None:
         return source_diff_block

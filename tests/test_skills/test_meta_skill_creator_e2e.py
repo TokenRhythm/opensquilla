@@ -3,23 +3,21 @@
 from __future__ import annotations
 
 import json
-import subprocess
-import sys
 from pathlib import Path
 
 # creator_fixtures is on sys.path via tests/test_skills/conftest.py
 from creator_fixtures import INTENT_PDF_DIGEST, INTENT_TRIP_PLANNER, synth_decision_log
 
 from opensquilla.engine.types import TextDeltaEvent
+from opensquilla.skills.creator.lint_runtime import lint_meta_skill
 from opensquilla.skills.loader import SkillLoader
 from opensquilla.skills.meta.orchestrator import MetaOrchestrator
 from opensquilla.skills.meta.parser import parse_meta_plan
 from opensquilla.skills.meta.types import MetaMatch, MetaResult
+from opensquilla.skills.proposals_lib import write_proposal
 
 REPO = Path(__file__).resolve().parents[2]
 _BUNDLED_BASE = REPO / "src" / "opensquilla" / "skills" / "bundled"
-PROPOSALS = _BUNDLED_BASE / "skill-creator-proposals" / "scripts" / "proposals.py"
-LINT = _BUNDLED_BASE / "skill-creator-linter" / "scripts" / "lint.py"
 BUNDLED = _BUNDLED_BASE
 
 
@@ -36,7 +34,8 @@ def test_creator_catalog_excludes_outer_creator_helper_skills() -> None:
     catalog = proposer._build_catalog_summary()
 
     assert "history-explorer" in catalog
-    assert "summarize" in catalog
+    assert "docx" in catalog
+    assert "ai-video-script" not in catalog
     assert "skill-creator-proposals" not in catalog
     assert "skill-creator-linter" not in catalog
     assert "skill-creator-smoke-test" not in catalog
@@ -54,13 +53,13 @@ def test_e2e_p1_proposal_lint_pass(tmp_path, monkeypatch) -> None:
 
     canned_slots = {
         "name": "synth-pdf-digest-pipeline",
-        "description": "Synthetic PDF digest: extract then summarize then memorize.",
+        "description": "Synthetic PDF digest: extract then create two reviewed briefs.",
         "meta_priority": 50,
         "triggers": ["synth pdf digest"],
         "steps": [
             {"id": "extract", "skill": "pdf-toolkit", "task": "extract", "with_keys": {}},
-            {"id": "digest", "skill": "summarize", "task": "summarize", "with_keys": {}},
-            {"id": "save", "skill": "memory", "task": "persist", "with_keys": {}},
+            {"id": "digest", "skill": "docx", "task": "docx", "with_keys": {}},
+            {"id": "save", "skill": "pdf-toolkit", "task": "persist", "with_keys": {}},
         ],
     }
     monkeypatch.setattr(
@@ -70,11 +69,7 @@ def test_e2e_p1_proposal_lint_pass(tmp_path, monkeypatch) -> None:
     skill_md = proposer.meta_skill_assemble("p1_sequential", json.dumps(canned_slots))
     assert "synth-pdf-digest-pipeline" in skill_md
 
-    proc = subprocess.run(
-        [sys.executable, str(LINT), "--skill-md-stdin", "--gates", "G1,G2"],
-        input=skill_md, capture_output=True, text=True, check=True,
-    )
-    lint_result = json.loads(proc.stdout)
+    lint_result = lint_meta_skill(skill_md)
     assert lint_result["G1"]["passed"]
     assert lint_result["G2"]["passed"]
 
@@ -93,15 +88,12 @@ def test_e2e_p1_proposal_lint_pass(tmp_path, monkeypatch) -> None:
     # so G3/G4 pass by stub-fixture construction only.
     assert smoke_result.get("degraded") is True
 
-    out = subprocess.run(
-        [sys.executable, str(PROPOSALS),
-         "--action", "write_proposal", "--home", str(home),
-         "--skill-md-inline", skill_md,
-         "--lint-result", json.dumps(lint_result),
-         "--smoke-result", json.dumps(smoke_result)],
-        capture_output=True, text=True, check=True,
+    persist = write_proposal(
+        home,
+        skill_md,
+        lint_result,
+        smoke_result,
     )
-    persist = json.loads(out.stdout)
     # D1: degraded smoke must NOT yield ``auto_enable_eligible``. The
     # proposal still persists (operators can review it on disk), but
     # the unattended creator pipeline cannot promote a candidate that
@@ -140,13 +132,13 @@ def test_creator_preserves_required_triggers_and_prior_step_context(monkeypatch)
             },
             {
                 "id": "diff_capture",
-                "skill": "git-diff",
+                "skill": "github",
                 "task": "Capture current diff",
                 "with_keys": {},
             },
             {
                 "id": "synthesize_report",
-                "skill": "summarize",
+                "skill": "docx",
                 "task": "Produce a Chinese root-cause report from all evidence",
                 "with_keys": {},
             },
@@ -160,7 +152,7 @@ def test_creator_preserves_required_triggers_and_prior_step_context(monkeypatch)
 
     slots_json = proposer.meta_skill_fill_slots(
         "p1_sequential",
-        history_summary="history-explorer -> git-diff -> summarize freq=5",
+        history_summary="history-explorer -> github -> docx freq=5",
         user_intent=(
             "请创建中文 traceback 根因诊断 meta-skill。"
             "触发短语要包含：诊断 traceback、traceback 根因、stack trace root cause。"
@@ -176,8 +168,8 @@ def test_creator_preserves_required_triggers_and_prior_step_context(monkeypatch)
 
     skill_md = proposer.meta_skill_assemble("p1_sequential", slots_json)
     assert "kind: skill_exec\n      skill: \"history-explorer\"" in skill_md
-    assert "kind: skill_exec\n      skill: \"git-diff\"" in skill_md
-    assert "kind: llm_chat\n      skill: \"summarize\"" in skill_md
+    assert 'skill: "github"' in skill_md
+    assert "kind: skill_exec\n      skill: \"docx\"" in skill_md
     assert "outputs.history_scan" in skill_md
     assert "outputs.diff_capture" in skill_md
 
@@ -224,7 +216,7 @@ def test_manual_creator_persist_auto_enables_when_setting_is_on(tmp_path) -> Non
 
     proposals_lib.write_auto_propose_settings(
         home,
-        {"auto_enable": True, "auto_enable_max_risk": "low"},
+        {"auto_enable": True, "auto_enable_max_risk": "medium"},
     )
     skill_md = """---
 name: synth-manual-auto-enable
@@ -240,7 +232,7 @@ composition:
       with:
         query: "{{ inputs.user_message | xml_escape | truncate(512) }}"
     - id: digest
-      skill: summarize
+      skill: docx
       depends_on: [explore]
       with:
         text: "{{ outputs.explore | truncate(2000) }}"
@@ -277,7 +269,7 @@ def test_auto_propose_persist_can_defer_manual_auto_enable(tmp_path) -> None:
 
     proposals_lib.write_auto_propose_settings(
         home,
-        {"auto_enable": True, "auto_enable_max_risk": "low"},
+        {"auto_enable": True, "auto_enable_max_risk": "medium"},
     )
     skill_md = """---
 name: synth-deferred-auto-enable
@@ -293,7 +285,7 @@ composition:
       with:
         query: "{{ inputs.user_message | xml_escape | truncate(512) }}"
     - id: digest
-      skill: summarize
+      skill: docx
       depends_on: [explore]
       with:
         text: "{{ outputs.explore | truncate(2000) }}"
@@ -369,8 +361,8 @@ async def test_orchestrator_drives_creator_dag_end_to_end(tmp_path, monkeypatch)
                 "name": "synth-orch-e2e", "description": "x" * 50,
                 "meta_priority": 50, "triggers": ["orch e2e trigger"],
                 "steps": [
-                    {"id": "a", "skill": "summarize", "task": "t", "with_keys": {}},
-                    {"id": "b", "skill": "memory", "task": "t", "with_keys": {}},
+                    {"id": "a", "skill": "docx", "task": "t", "with_keys": {}},
+                    {"id": "b", "skill": "pdf-toolkit", "task": "t", "with_keys": {}},
                 ],
             })
         if tool_name == "meta_skill_assemble":
@@ -520,7 +512,7 @@ async def test_orchestrator_p2_fan_out_merge_proposal(tmp_path, monkeypatch) -> 
                     {"id": "weather", "skill": "weather", "task": "w", "with_keys": {}},
                     {"id": "poi", "skill": "multi-search-engine", "task": "p", "with_keys": {}},
                 ],
-                "merge": {"id": "itin", "skill": "summarize", "task": "m", "with_keys": {}},
+                "merge": {"id": "itin", "skill": "docx", "task": "m", "with_keys": {}},
                 "tail": None,
             })
         if tool_name == "meta_skill_assemble":

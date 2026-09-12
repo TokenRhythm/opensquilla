@@ -1,4 +1,5 @@
 import { test, expect, type Page } from '@playwright/test'
+import { helloOkResponse } from './support/gateway-fixture'
 
 const CONTROL_URL = '/control/'
 const LIVE = process.env.OPENSQUILLA_E2E_LIVE === '1'
@@ -24,7 +25,7 @@ async function seedSearchHistory(page: Page, toolName: string) {
       }
       if (frame?.type !== 'req' || frame.id === undefined) return
       if (frame.method === 'connect') {
-        ws.send(JSON.stringify({ protocol: 3, policy: {} }))
+        ws.send(helloOkResponse())
         return
       }
       if (frame?.type === 'req' && frame.method === 'chat.history') {
@@ -84,7 +85,7 @@ async function seedPersistedSearchSourcesHistory(page: Page) {
       }
       if (frame?.type !== 'req' || frame.id === undefined) return
       if (frame.method === 'connect') {
-        ws.send(JSON.stringify({ protocol: 3, policy: {} }))
+        ws.send(helloOkResponse())
         return
       }
       if (frame?.type === 'req' && frame.method === 'chat.history') {

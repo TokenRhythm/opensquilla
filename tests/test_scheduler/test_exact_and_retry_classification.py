@@ -12,7 +12,9 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from opensquilla.gateway.rpc import RpcContext
-from opensquilla.gateway.rpc_cron import _handle_cron_add
+from opensquilla.gateway.rpc_cron import (
+    _cron_create_contract as _handle_cron_add,
+)
 from opensquilla.scheduler.jobs import (
     _apply_result_state,
     classify_error,

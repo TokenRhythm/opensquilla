@@ -1,9 +1,12 @@
 import { computed, hasInjectionContext, inject, ref, watch } from 'vue'
-import type { RpcCallOptions } from '@/lib/rpc'
 import { WORKSPACE_CATALOG_KEY, type WorkspaceCatalog, type WorkspaceHistoryDeletion, type WorkspaceItem } from '@/modules/workspaceCatalog'
 import { GATEWAY_ACCESS_KEY, type GatewayAccess } from '@/modules/gatewayAccess'
 
 type ProjectWorkspaceItem = WorkspaceItem
+interface WorkspaceCatalogReadOptions {
+  readonly signal?: AbortSignal
+  readonly timeoutMs?: number
+}
 export type { WorkspaceItem as ProjectWorkspaceItem } from '@/modules/workspaceCatalog'
 
 const workspaces = ref<ProjectWorkspaceItem[]>([])
@@ -45,7 +48,7 @@ export function useProjectWorkspaces(
   }
 
   async function loadWorkspaces(
-    callOptions?: RpcCallOptions,
+    requestOptions?: WorkspaceCatalogReadOptions,
   ): Promise<ProjectWorkspaceItem[]> {
     if (!gatewayAccess.canManageProjectWorkspaces) {
       resetWorkspaces()
@@ -55,7 +58,7 @@ export function useProjectWorkspaces(
     isLoading.value = true
     error.value = null
     try {
-      const loadedWorkspaces = [...await workspaceCatalog.list(callOptions)]
+      const loadedWorkspaces = [...await workspaceCatalog.list(requestOptions)]
       if (requestSequence === loadSequence) {
         workspaces.value = loadedWorkspaces
         hasLoaded.value = true

@@ -2,23 +2,38 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
-from typing import Any, Protocol
+from typing import Any, NotRequired, Protocol, TypedDict, cast
 
 from opensquilla.application.setup_mutations import (
     SetupConfigPort,
     SetupMutation,
+    SetupMutationEntry,
     SetupRuntimePort,
     commit_setup_mutation,
 )
 
 
+class CredentialRevealResult(TypedDict):
+    ok: bool
+    provider: str
+    source: str
+    envKey: NotRequired[str | None]
+    apiKey: str
+
+
+class CredentialClearDescription(TypedDict):
+    credentialAvailable: bool
+    credentialSource: str
+    credentialEnv: str
+    externalCredentialActive: bool
+
+
 class CredentialResolutionPort(Protocol):
-    def reveal_active(self, provider_id: str) -> Mapping[str, Any]: ...
+    def reveal_active(self, provider_id: str) -> CredentialRevealResult: ...
 
     def describe_clear_result(
         self, config: Any, provider_id: str, *, active: bool
-    ) -> Mapping[str, Any]: ...
+    ) -> CredentialClearDescription: ...
 
 
 class ProviderCredentialMutationPort(Protocol):
@@ -38,8 +53,11 @@ class ProviderCredentials:
         self._credentials = credentials
         self._mutations = mutations
 
-    def reveal_active(self, provider_id: str) -> dict[str, Any]:
-        return dict(self._credentials.reveal_active(provider_id))
+    def reveal_active(self, provider_id: str) -> CredentialRevealResult:
+        return cast(
+            CredentialRevealResult,
+            dict(self._credentials.reveal_active(provider_id)),
+        )
 
     async def clear_active(self, provider_id: str) -> SetupMutation:
         result = self._mutations.clear_active(
@@ -57,12 +75,15 @@ class ProviderCredentials:
             effects=(reconcile,),
             backup_credential_provider=provider_id,
         )
-        entry = {
-            **mutation.entry,
-            **self._credentials.describe_clear_result(
-                self._config.active_config(), provider_id, active=True
-            ),
-        }
+        entry = cast(
+            SetupMutationEntry,
+            {
+                **mutation.entry,
+                **self._credentials.describe_clear_result(
+                    self._config.active_config(), provider_id, active=True
+                ),
+            },
+        )
         return SetupMutation(
             changed=mutation.changed,
             restart_required=mutation.restart_required,
@@ -73,6 +94,8 @@ class ProviderCredentials:
 
 
 __all__ = [
+    "CredentialClearDescription",
+    "CredentialRevealResult",
     "CredentialResolutionPort",
     "ProviderCredentialMutationPort",
     "ProviderCredentials",

@@ -1,7 +1,8 @@
+import { loadContractValidators } from '../../../scripts/contracts/gateway_contract_verification.mjs'
 import { readFileSync } from 'node:fs'
-import { createRequire } from 'node:module'
 import { describe, expect, it } from 'vitest'
 import type { SessionRow, SessionTask } from './generated/v4/sessionsList'
+import { validateSessionsListResult } from './generated/v4/sessionsListValidators.mjs'
 
 // Compile-time Contract fixture: generated nullable wire types must admit the
 // null values already present in v4 golden responses.
@@ -22,8 +23,7 @@ interface FixtureDocument {
   cases: Array<{ id: string, wire?: unknown }>
 }
 
-const require = createRequire(import.meta.url)
-const validators = require('./generated/v4/sessionsListValidators.cjs') as {
+const validators = await loadContractValidators('sessions.list') as {
   validateSessionsListRequestFrame: ContractValidator
   validateSessionsListResponseFrame: ContractValidator
 }
@@ -37,6 +37,11 @@ function fixture(name: string): FixtureDocument {
 }
 
 describe('generated sessions.list v4 validators', () => {
+  it('publishes the production result validator as a native ESM import', () => {
+    expect(validateSessionsListResult({ sessions: [], count: 0, ts: 1 })).toBe(true)
+    expect(validateSessionsListResult({ sessions: [] })).toBe(false)
+  })
+
   it('accepts every request golden oracle', () => {
     for (const testCase of fixture('requests.json').cases) {
       if (testCase.wire === undefined) continue

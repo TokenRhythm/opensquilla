@@ -2,8 +2,10 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from opensquilla.identity.prompt import assemble_system_prompt
-from opensquilla.identity.types import AgentProfile
+from opensquilla.identity.types import AgentIdentity, AgentProfile
 
 
 def test_default_user_template_names_profile_fields() -> None:
@@ -240,35 +242,6 @@ def test_headless_repo_coding_scaffold_omits_hidden_git_tool_guidance() -> None:
     assert "Use `git_diff` to inspect the final source diff" not in prompt
 
 
-def test_patch_evidence_protocol_renders_when_enabled_in_scaffold_mode() -> None:
-    prompt = assemble_system_prompt(
-        AgentProfile(
-            agent_id="main",
-            prompt_mode="headless_repo_coding_scaffold",
-            patch_evidence_protocol=True,
-        ),
-        tools=[
-            "exec_command",
-            "read_file",
-            "edit_file",
-            "write_file",
-            "grep_search",
-            "glob_search",
-            "list_dir",
-            "git_status",
-            "git_diff",
-        ],
-    )
-
-    assert "## Patch Evidence Protocol" in prompt
-    assert "## Repository Coding Scaffold" in prompt
-    assert "not sufficient final evidence by itself" in prompt
-    assert "Do not modify existing test expectations" in prompt
-    assert "change hypothesis or inspect a different implementation layer" in prompt
-    assert "neighboring existing test" in prompt
-    assert "strongest command/output evidence" in prompt
-
-
 def test_patch_evidence_protocol_absent_by_default() -> None:
     scaffold_prompt = assemble_system_prompt(
         AgentProfile(agent_id="main", prompt_mode="headless_repo_coding_scaffold"),
@@ -281,6 +254,25 @@ def test_patch_evidence_protocol_absent_by_default() -> None:
 
     assert "## Patch Evidence Protocol" not in scaffold_prompt
     assert "## Patch Evidence Protocol" not in full_prompt
+
+
+@pytest.mark.parametrize(
+    "mode", ["full", "minimal", "none", "headless_source_edit", "headless_repo_coding_scaffold"]
+)
+@pytest.mark.parametrize("gate", [False, True])
+@pytest.mark.parametrize("tools", [None, ["exec_command", "read_file", "git_diff"]])
+def test_retired_patch_protocol_does_not_change_prompt(mode, gate, tools) -> None:
+    baseline = AgentProfile(agent_id="main", prompt_mode=mode, finalize_evidence_gate=gate)
+    legacy = AgentProfile(
+        agent_id="main",
+        prompt_mode=mode,
+        finalize_evidence_gate=gate,
+        patch_evidence_protocol=True,
+    )
+
+    assert assemble_system_prompt(legacy, tools=tools) == assemble_system_prompt(
+        baseline, tools=tools
+    )
 
 
 def test_patch_evidence_protocol_requires_tools() -> None:
@@ -396,7 +388,8 @@ def test_system_prompt_guides_generated_file_delivery() -> None:
     assert "local entry path" in prompt
     assert "Do not invent artifact download URLs" in prompt
     assert "do not call `publish_artifact` again" in prompt
-    assert "After `publish_artifact` succeeds" in prompt
+    assert "Publication does not end the turn" in prompt
+    assert "do not run more tools" not in prompt
     assert "final response" in prompt
 
 
@@ -501,27 +494,34 @@ def test_headless_source_edit_prompt_omits_hidden_git_diff_guidance() -> None:
     assert "Inspect the final source diff with `git_diff`" not in prompt
 
 
-def test_legacy_prompt_style_restores_compact_directives() -> None:
-    prompt = assemble_system_prompt(
-        AgentProfile(agent_id="main", prompt_mode="full", legacy_prompt_style=True),
-        tools=["exec_command", "apply_patch"],
+@pytest.mark.parametrize(
+    "prompt_mode",
+    ["full", "minimal", "none", "headless_source_edit", "headless_repo_coding_scaffold"],
+)
+@pytest.mark.parametrize("tools", [None, ["exec_command", "apply_patch"]])
+@pytest.mark.parametrize(
+    "runtime_info", [None, {"os": "Linux", "shell": "/bin/bash", "workspace_dir": "/tmp/ws"}]
+)
+def test_retired_legacy_prompt_style_does_not_change_rendering(
+    prompt_mode, tools, runtime_info
+) -> None:
+    expected = assemble_system_prompt(
+        AgentProfile(agent_id="main", prompt_mode=prompt_mode),
+        tools=tools,
+        runtime_info=runtime_info,
     )
+    assert assemble_system_prompt(
+        AgentProfile(agent_id="main", prompt_mode=prompt_mode, legacy_prompt_style=True),
+        tools=tools,
+        runtime_info=runtime_info,
+    ) == expected
 
-    assert (
-        "## Tool Call Style\n\n"
-        "- Narrate what you are about to do before invoking a tool.\n"
-        "- Only call tools when the task genuinely requires it."
-    ) in prompt
-    assert (
-        "## Reply Guidelines\n\n"
-        "- Use the conversation's language for replies\n"
-        "- When uncertain, ask for clarification rather than guessing\n"
-        "- Prefer concise replies unless detail is requested"
-    ) in prompt
-    assert "Before invoking a tool, send a brief user-visible note" not in prompt
-    assert "same language as the user's current conversation" not in prompt
-    assert "If the user writes in Chinese" not in prompt
-    assert "Match reply length to the request" not in prompt
+
+def test_retired_legacy_prompt_style_preserves_profile_positional_slot() -> None:
+    profile = AgentProfile("main", AgentIdentity(), None, {}, "full", False, False, True, False)
+
+    assert profile.legacy_prompt_style is True
+    assert profile.inject_time_prefix is False
 
 
 def test_legacy_prompt_style_absent_by_default() -> None:
@@ -535,21 +535,13 @@ def test_legacy_prompt_style_absent_by_default() -> None:
     assert "Prefer concise replies unless detail is requested" not in prompt
 
 
-def test_legacy_prompt_style_restores_runtime_section_spacing() -> None:
+def test_default_prompt_preserves_runtime_section_spacing() -> None:
     runtime_info = {"os": "Linux", "shell": "/bin/bash", "workspace_dir": "/tmp/ws"}
 
-    legacy_prompt = assemble_system_prompt(
-        AgentProfile(agent_id="main", prompt_mode="full", legacy_prompt_style=True),
-        tools=["exec_command"],
-        runtime_info=runtime_info,
-    )
     default_prompt = assemble_system_prompt(
         AgentProfile(agent_id="main", prompt_mode="full"),
         tools=["exec_command"],
         runtime_info=runtime_info,
     )
 
-    # Legacy style keeps a blank separator line between the Runtime section
-    # and the next header; the current style renders them adjacent.
-    assert "- Shell: /bin/bash\n\n## Reply Guidelines" in legacy_prompt
     assert "- Shell: /bin/bash\n## Reply Guidelines" in default_prompt

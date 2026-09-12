@@ -1,5 +1,9 @@
 ---
 name: multi-search-engine
+visibility: internal
+invocation: meta_only
+owner_meta_skills:
+  - meta-paper-write
 description: "Query scholarly metadata and the web through Crossref, Brave, Tavily, and DuckDuckGo with a single CLI surface. Trigger when the user asks for research search, fact lookup, source discovery, or engine comparison. Results retain DOI, publication year, and authors when supplied by Crossref, then deduplicate by DOI, arXiv ID, or normalized URL. API-key engines gate themselves on the relevant environment variable; Crossref and DuckDuckGo need no key."
 description_zh: "通过统一 CLI 使用 Crossref、Brave、Tavily 和 DuckDuckGo 查询学术元数据与网页。适用于研究搜索、事实查找、来源发现或引擎覆盖比较。结果会保留 Crossref 提供的 DOI、出版年份和作者，并按 DOI、arXiv ID 或规范化 URL 去重。需要密钥的引擎由对应环境变量启用；Crossref 和 DuckDuckGo 无需密钥。"
 homepage: ""

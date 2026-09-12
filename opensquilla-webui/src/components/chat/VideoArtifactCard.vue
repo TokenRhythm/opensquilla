@@ -147,13 +147,13 @@ function retainVideoPreview(entry: RetainedVideoPreview): void {
 </script>
 
 <script setup lang="ts">
-import { computed, nextTick, onUnmounted, ref, watch } from 'vue'
+import { computed, inject, nextTick, onUnmounted, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import Icon from '@/components/Icon.vue'
 import {
-  createArtifactPreview,
+  ARTIFACT_WORKBENCH_KEY,
   type ArtifactPreviewState,
-} from '@/composables/chat/useArtifactPreview'
+} from '@/modules/artifactWorkbench'
 import type { ArtifactPayload } from '@/types/artifacts'
 import {
   artifactFileSubtitle,
@@ -170,6 +170,8 @@ const emit = defineEmits<{
 }>()
 
 const { t } = useI18n()
+const artifactWorkbench = inject(ARTIFACT_WORKBENCH_KEY)
+if (!artifactWorkbench) throw new Error('ArtifactWorkbench was not provided')
 const playbackFailed = ref(false)
 const videoElement = ref<HTMLVideoElement | null>(null)
 const title = computed(() => artifactFileTitle(props.artifact))
@@ -204,7 +206,7 @@ function supportedByBrowser(blob: Blob): boolean {
 // A video fetch starts only after an explicit preview request. Using a fetched
 // Blob URL keeps session/auth credentials out of the media URL while avoiding
 // bandwidth and memory cost for videos the user never chooses to watch.
-const controller = createArtifactPreview({
+const controller = artifactWorkbench.previews.create({
   artifact: () => props.artifact,
   sessionKey: () => props.sessionKey,
   variant: 'content',

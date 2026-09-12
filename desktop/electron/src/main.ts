@@ -127,6 +127,16 @@ import {
   streamResponseToVerifiedFile,
 } from './update-verification.js'
 import { isUpdateCheckAllowed, UpdateCheckScheduler } from './update-check-scheduler.js'
+import { WindowsUpdateSecurityError } from './windows-update-security.js'
+import {
+  createWindowsUpdateCacheDescriptor,
+  loadWindowsUpdateCache,
+  saveWindowsUpdateCache,
+  verifyCachedInstaller,
+  type WindowsUpdateCacheDescriptor,
+} from './windows-update-cache.js'
+import { assertUnambiguousWindowsInstallation, launchWindowsInstaller, WindowsUpdateHandoffError } from './windows-update-handoff.js'
+import { WindowsUpdateCoordinator, WindowsUpdatePreparationError } from './windows-update-coordinator.js'
 import {
   canRevealDesktopApp,
   defaultDesktopPreferences,
@@ -156,22 +166,17 @@ import {
 } from './native-workbench-surface-contract.js'
 import {
   NativeWorkbenchSurfaceManager,
-  type NativeWorkbenchCandidatePreviewBinding,
 } from './native-workbench-surface.js'
 import {
   parseNativeWorkbenchAnnotationModeRequest,
   parseNativeWorkbenchAnnotationOverlayCloseRequest,
   parseNativeWorkbenchAnnotationOverlayShowRequest,
 } from './native-workbench-annotation-contract.js'
-import { DesktopArtifactBridge } from './desktop-artifact-bridge.js'
-import {
-  DESKTOP_ARTIFACT_BRIDGE_TOKEN_ENV,
-  DESKTOP_ARTIFACT_BRIDGE_URL_ENV,
-  DesktopArtifactBridgeLoopbackTransport,
-} from './desktop-artifact-bridge-loopback.js'
+import { DesktopBrowserServer, DESKTOP_BROWSER_URL_ENV, DESKTOP_BROWSER_TOKEN_ENV } from './desktop-browser.js'
 import { installDesktopZoomShortcuts } from './desktop-zoom-shortcuts.js'
 import {
   buildRendererConsoleLogEntry,
+  isLiveMainFrameConsoleMessage,
   buildRendererGoneLogEntry,
   buildRendererStateLogEntry,
   RendererConsoleLogLimiter,
@@ -893,9 +898,6 @@ const nativeWorkbenchSurfaces = new NativeWorkbenchSurfaceManager({
       : null
   ),
   getWindow: () => currentMainWindow(),
-  resolveCandidatePreview: resolveCandidatePreviewFromGateway,
-  releaseCandidatePreview: releaseCandidatePreviewFromGateway,
-  pinArtifactPreview: grant => artifactPreviewLeaseBroker.pinSurface(grant),
   emit: event => {
     if (event.type === 'error' || event.type === 'crashed') {
       desktopLog('native_workbench_surface_failed', {
@@ -919,139 +921,12 @@ const nativeWorkbenchSurfaces = new NativeWorkbenchSurfaceManager({
     window.webContents.send('desktop:workbench:surface-event', event)
   },
 })
-const desktopArtifactBridge = new DesktopArtifactBridge({
-  getActiveTarget: () => nativeWorkbenchSurfaces.getActiveArtifactBridgeTarget(),
-  acquireActiveTargetBinding: () => nativeWorkbenchSurfaces.acquireArtifactBridgeTargetBinding(),
-})
-const desktopArtifactBridgeLoopback = new DesktopArtifactBridgeLoopbackTransport(
-  desktopArtifactBridge,
-  {
-    audit: entry => desktopLog(entry.event, {
-      operation: entry.operation,
-      outcome: entry.outcome,
-      code: entry.code,
-      durationMs: entry.durationMs,
-    }),
-  },
+const desktopBrowser = new DesktopBrowserServer(
+  (request, signal) => nativeWorkbenchSurfaces.executeBrowser(request, signal),
+  entry => desktopLog(entry.event, { operation: entry.operation, outcome: entry.outcome,
+    code: entry.code, durationMs: entry.durationMs }),
 )
 
-async function resolveCandidatePreviewFromGateway(
-  candidateHandle: string,
-  signal: AbortSignal,
-): Promise<NativeWorkbenchCandidatePreviewBinding> {
-  const gatewayOrigin = gatewayState.owned && gatewayState.status === 'ready'
-    ? gatewayState.url
-    : null
-  const token = desktopArtifactBridgeLoopback.token()
-  if (!gatewayOrigin || !token) {
-    throw new Error('The Desktop candidate preview service is unavailable.')
-  }
-  const response = await desktopMonitoredFetch(
-    new URL('/api/v1/desktop-artifact-candidate-preview/resolve', gatewayOrigin),
-    {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${token}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({ version: 1, candidateHandle }),
-      redirect: 'error',
-      cache: 'no-store',
-      credentials: 'omit',
-      signal,
-    },
-  )
-  const contentType = response.headers.get('content-type')
-    ?.split(';', 1)[0]
-    ?.trim()
-    .toLowerCase()
-  const declaredLength = response.headers.get('content-length')
-  if (
-    contentType !== 'application/json'
-    || (declaredLength !== null && (
-      !/^\d+$/.test(declaredLength)
-      || Number(declaredLength) > 1024 * 1024
-    ))
-  ) throw new Error('The Desktop candidate preview response is invalid.')
-  const text = await response.text()
-  if (!response.ok || text.length > 1024 * 1024) {
-    throw new Error('The Desktop candidate preview service rejected the request.')
-  }
-  let raw: unknown
-  try {
-    raw = JSON.parse(text)
-  } catch {
-    throw new Error('The Desktop candidate preview response is invalid.')
-  }
-  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
-    throw new Error('The Desktop candidate preview response is invalid.')
-  }
-  const value = raw as Record<string, unknown>
-  const launchUrl = value.launch_url
-  const expectedOrigin = value.preview_origin
-  const candidateArtifactId = value.candidate_artifact_id
-  const leaseId = value.lease_id
-  const scopeId = value.scope_id
-  const effectiveMode = value.effective_mode
-  if (
-    typeof launchUrl !== 'string'
-    || typeof expectedOrigin !== 'string'
-    || typeof candidateArtifactId !== 'string'
-    || typeof leaseId !== 'string'
-    || typeof scopeId !== 'string'
-    || scopeId.length === 0
-    || scopeId.length > 512
-    || /[\u0000-\u001f\u007f]/.test(scopeId)
-    // Candidate previews are always rendered in the offline realm. Keep this
-    // check at the Gateway→Electron boundary as well as in the native surface
-    // so a compromised/stale response cannot widen browser-action authority.
-    || effectiveMode !== 'offline'
-    || value.candidate_handle !== candidateHandle
-  ) throw new Error('The Desktop candidate preview response is invalid.')
-  return {
-    candidateHandle,
-    candidateArtifactId,
-    leaseId,
-    launchUrl,
-    expectedOrigin,
-    scopeId,
-    mode: effectiveMode,
-  }
-}
-
-async function releaseCandidatePreviewFromGateway(
-  candidateHandle: string,
-  signal: AbortSignal,
-): Promise<void> {
-  const gatewayOrigin = gatewayState.owned && gatewayState.status === 'ready'
-    ? gatewayState.url
-    : null
-  const token = desktopArtifactBridgeLoopback.token()
-  // A missing Gateway/bridge identity is not a successful restore.  Native
-  // cleanup callers may intentionally swallow this error during shutdown,
-  // while the interactive discard path must retain the candidate handle and
-  // retry instead of claiming that the canonical preview was restored.
-  if (!gatewayOrigin || !token) {
-    throw new Error('The Desktop candidate preview cleanup service is unavailable.')
-  }
-  const response = await desktopMonitoredFetch(
-    new URL(
-      `/api/v1/desktop-artifact-candidate-preview/${encodeURIComponent(candidateHandle)}`,
-      gatewayOrigin,
-    ),
-    {
-      method: 'DELETE',
-      headers: { Authorization: `Bearer ${token}` },
-      redirect: 'error',
-      cache: 'no-store',
-      credentials: 'omit',
-      signal,
-    },
-  )
-  if (!response.ok) {
-    throw new Error('The Desktop candidate preview cleanup was rejected.')
-  }
-}
 function activeDesktopProfile(): DesktopProfilePaths {
   return primaryProfilePaths(app.getPath('userData'))
 }
@@ -1114,8 +989,8 @@ function desktopChildEnvironment(
   // Never let inherited/stale bridge credentials flow into helper, recovery,
   // probe, or migration children. startGateway adds its freshly generated
   // process-lifetime credentials only to the owned Gateway spawn.
-  delete environment[DESKTOP_ARTIFACT_BRIDGE_URL_ENV]
-  delete environment[DESKTOP_ARTIFACT_BRIDGE_TOKEN_ENV]
+  delete environment[DESKTOP_BROWSER_URL_ENV]
+  delete environment[DESKTOP_BROWSER_TOKEN_ENV]
   return {
     ...environment,
     ...additions,
@@ -2197,18 +2072,18 @@ function minimaxRouterProfile(provider: string): Record<string, RouterTier> {
 
 const ROUTER_PROFILES: Record<string, Record<string, RouterTier>> = {
   tokenrhythm: {
-    c0: { provider: 'tokenrhythm', model: 'deepseek-v4-flash-0731', description: 'Fast DeepSeek V4 Flash 0731 route for simple work', supportsImage: false },
-    c1: { provider: 'tokenrhythm', model: 'deepseek-v4-pro-0813', description: 'Default DeepSeek V4 Pro 0813 route for normal agent work', supportsImage: false },
-    c2: { provider: 'tokenrhythm', model: 'kimi-k2.7-code', description: 'Strong Kimi 2.7 Code route for harder coding and analysis', supportsImage: false },
-    c3: { provider: 'tokenrhythm', model: 'glm-5.2', description: 'Highest tier: shared B5 fusion; GLM 5.2 is retained for single-model C3 mode', supportsImage: false, ensembleEnabled: true },
-    image_model: { provider: 'tokenrhythm', model: 'kimi-k2.6', description: 'Vision route for image attachments', supportsImage: true, imageOnly: true },
+    c0: { provider: 'tokenrhythm', model: 'deepseek-v4-flash-0731', description: 'Fast DeepSeek V4 Flash 0731 route for simple work' },
+    c1: { provider: 'tokenrhythm', model: 'deepseek-v4-pro-0813', description: 'Default DeepSeek V4 Pro 0813 route for normal agent work' },
+    c2: { provider: 'tokenrhythm', model: 'kimi-k2.7-code', description: 'Strong Kimi 2.7 Code route for harder coding and analysis' },
+    c3: { provider: 'tokenrhythm', model: 'glm-5.2', description: 'Highest tier: shared B5 fusion; GLM 5.2 is retained for single-model C3 mode', ensembleEnabled: true },
+    image_model: { provider: 'tokenrhythm', model: 'kimi-k2.6', description: 'Vision route for image attachments', imageOnly: true },
   },
   openrouter: {
     c0: { provider: 'openrouter', model: 'deepseek/deepseek-v4-flash', description: 'Fast everyday work', thinkingLevel: 'high' },
     c1: { provider: 'openrouter', model: 'deepseek/deepseek-v4-pro', description: 'Balanced agent work', thinkingLevel: 'high' },
     c2: { provider: 'openrouter', model: 'z-ai/glm-5.2', description: 'Complex reasoning', thinkingLevel: 'high' },
     c3: { provider: 'openrouter', model: 'anthropic/claude-opus-4.8', description: 'Highest quality review and planning', thinkingLevel: 'high' },
-    image_model: { provider: 'openrouter', model: 'moonshotai/kimi-k2.6', description: 'Vision route for image attachments', supportsImage: true, imageOnly: true, thinkingLevel: 'medium' },
+    image_model: { provider: 'openrouter', model: 'moonshotai/kimi-k2.6', description: 'Vision route for image attachments', imageOnly: true, thinkingLevel: 'medium' },
   },
   openai: {
     c0: { provider: 'openai', model: 'gpt-5.4-nano', description: 'Fast simple work', thinkingLevel: 'none' },
@@ -2235,10 +2110,10 @@ const ROUTER_PROFILES: Record<string, Record<string, RouterTier>> = {
     c3: { provider: 'gemini', model: 'gemini-3.1-pro-preview', description: 'Deep reasoning', thinkingLevel: 'high' },
   },
   moonshot: {
-    c0: { provider: 'moonshot', model: 'kimi-k2.6', description: 'Fast multimodal work', supportsImage: true, thinkingLevel: 'low' },
-    c1: { provider: 'moonshot', model: 'kimi-k2.6', description: 'Balanced multimodal work', supportsImage: true, thinkingLevel: 'medium' },
-    c2: { provider: 'moonshot', model: 'kimi-k2.6', description: 'Complex text and image work', supportsImage: true, thinkingLevel: 'medium' },
-    c3: { provider: 'moonshot', model: 'kimi-k2.7-code', description: 'Code-heavy deep reasoning', supportsImage: true, thinkingLevel: 'high' },
+    c0: { provider: 'moonshot', model: 'kimi-k2.6', description: 'Fast multimodal work', thinkingLevel: 'low' },
+    c1: { provider: 'moonshot', model: 'kimi-k2.6', description: 'Balanced multimodal work', thinkingLevel: 'medium' },
+    c2: { provider: 'moonshot', model: 'kimi-k2.6', description: 'Complex text and image work', thinkingLevel: 'medium' },
+    c3: { provider: 'moonshot', model: 'kimi-k2.7-code', description: 'Code-heavy deep reasoning', thinkingLevel: 'high' },
   },
   kimi_coding_openai: textRouterProfile(
     'kimi_coding_openai',
@@ -2422,7 +2297,6 @@ function routerTierTomlLines(name: string, tier: RouterTier): string[] {
     `model = ${tomlString(tier.model)}`,
   ]
   if (tier.description) lines.push(`description = ${tomlString(tier.description)}`)
-  if (tier.supportsImage !== undefined) lines.push(`supports_image = ${tier.supportsImage ? 'true' : 'false'}`)
   if (tier.imageOnly !== undefined) lines.push(`image_only = ${tier.imageOnly ? 'true' : 'false'}`)
   if (tier.thinkingLevel) lines.push(`thinking_level = ${tomlString(tier.thinkingLevel)}`)
   if (tier.ensembleEnabled !== undefined) lines.push(`ensemble_enabled = ${tier.ensembleEnabled ? 'true' : 'false'}`)
@@ -3954,9 +3828,14 @@ const DESKTOP_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
     'update.manifestInvalid': 'The update information is invalid. Please try again later.',
     'update.sourceUnavailable': 'The update service is temporarily unavailable. Please try again later.',
     'update.checksumUnavailable': 'The installer cannot be verified because the official checksum is unavailable. No installer was opened.',
-    'update.integrityFailed': 'The downloaded installer failed integrity verification and was deleted.',
+    'update.integrityFailed': 'The installer failed integrity verification. Download the update again.',
     'update.downloadFailed': 'The update could not be downloaded. Please try again.',
     'update.installFailed': 'The update installer could not be opened. Please try again.',
+    'update.quitAndInstall': 'Quit and install',
+    'update.signatureInvalid': 'The installer signature does not match OpenSquilla. Download it again from the official release.',
+    'update.signatureUnavailable': 'Windows could not verify the installer signature. Try again; no installer was started.',
+    'update.installationAmbiguous': 'The current installation could not be identified uniquely. Use Show installer to select it in the installation wizard.',
+    'update.writersBusy': 'OpenSquilla is still saving changes. Let it finish, then try installing again.',
     'update.moveToApplications': 'Move OpenSquilla to your Applications folder to enable automatic updates, then try again.',
     'update.gatewayShutdownTimeout': 'OpenSquilla could not stop the local runtime. Try relaunching to update again.',
     'update.mockInstallTitle': 'Mock update restart',
@@ -4095,9 +3974,14 @@ const DESKTOP_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
     'update.manifestInvalid': '更新信息无效，请稍后重试。',
     'update.sourceUnavailable': '更新服务暂时不可用，请稍后重试。',
     'update.checksumUnavailable': '无法获取官方校验和，因此不能验证安装包；未打开任何安装包。',
-    'update.integrityFailed': '下载的安装包未通过完整性校验，已将其删除。',
+    'update.integrityFailed': '安装包未通过完整性校验。请重新下载更新。',
     'update.downloadFailed': '更新下载安装失败，请重试。',
     'update.installFailed': '无法打开更新安装包，请重试。',
+    'update.quitAndInstall': '退出并安装',
+    'update.signatureInvalid': '安装包签名与 OpenSquilla 不符，请从官方发布重新下载。',
+    'update.signatureUnavailable': 'Windows 暂时无法验证安装包签名，请重试；尚未启动安装程序。',
+    'update.installationAmbiguous': '无法唯一确定当前安装位置，请点击“显示安装包”并在安装向导中选择。',
+    'update.writersBusy': 'OpenSquilla 仍在保存更改，请等待完成后再次安装。',
     'update.moveToApplications': '请先将 OpenSquilla 移动到"应用程序"文件夹以启用自动更新，然后重试。',
     'update.gatewayShutdownTimeout': 'OpenSquilla 无法停止本地运行时。请再次尝试重启以更新。',
     'update.mockInstallTitle': '模拟重启更新',
@@ -4236,9 +4120,14 @@ const DESKTOP_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
     'update.manifestInvalid': 'アップデート情報が無効です。しばらくしてから再試行してください。',
     'update.sourceUnavailable': 'アップデートサービスを一時的に利用できません。後でもう一度お試しください。',
     'update.checksumUnavailable': '正規のチェックサムを取得できないため、インストーラを検証できません。インストーラは開かれていません。',
-    'update.integrityFailed': 'ダウンロードしたインストーラは整合性検証に失敗したため削除されました。',
+    'update.integrityFailed': 'インストーラーの整合性を確認できませんでした。更新を再ダウンロードしてください。',
     'update.downloadFailed': 'アップデートをダウンロードできませんでした。もう一度お試しください。',
     'update.installFailed': 'アップデートインストーラを開けませんでした。もう一度お試しください。',
+    'update.quitAndInstall': '終了してインストール',
+    'update.signatureInvalid': 'インストーラの署名が OpenSquilla と一致しません。公式リリースから再ダウンロードしてください。',
+    'update.signatureUnavailable': 'Windows が署名を検証できませんでした。再試行してください。インストーラは起動していません。',
+    'update.installationAmbiguous': '現在のインストール先を特定できません。「インストーラを表示」からウィザードで選択してください。',
+    'update.writersBusy': '変更を保存中です。完了後にインストールを再試行してください。',
     'update.moveToApplications': '自動アップデートを有効にするには、OpenSquilla を「アプリケーション」フォルダに移動してから再試行してください。',
     'update.gatewayShutdownTimeout': 'ローカルランタイムを停止できませんでした。もう一度、再起動してアップデートをお試しください。',
     'uninstall.confirmTitle': 'ローカルの OpenSquilla デスクトップデータを削除しますか？',
@@ -4366,9 +4255,14 @@ const DESKTOP_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
     'update.manifestInvalid': 'Les informations de mise à jour sont invalides. Réessayez plus tard.',
     'update.sourceUnavailable': 'Le service de mise à jour est temporairement indisponible. Réessayez plus tard.',
     'update.checksumUnavailable': 'Le programme d’installation ne peut pas être vérifié car la somme de contrôle officielle est indisponible. Aucun programme n’a été ouvert.',
-    'update.integrityFailed': 'Le programme d’installation téléchargé a échoué au contrôle d’intégrité et a été supprimé.',
+    'update.integrityFailed': 'Le programme d’installation a échoué au contrôle d’intégrité. Téléchargez à nouveau la mise à jour.',
     'update.downloadFailed': 'Impossible de télécharger la mise à jour. Réessayez.',
     'update.installFailed': 'Impossible d’ouvrir le programme d’installation. Réessayez.',
+    'update.quitAndInstall': 'Quitter et installer',
+    'update.signatureInvalid': 'La signature ne correspond pas à OpenSquilla. Téléchargez de nouveau la version officielle.',
+    'update.signatureUnavailable': 'Windows ne peut pas vérifier la signature. Réessayez ; le programme d’installation n’a pas été lancé.',
+    'update.installationAmbiguous': 'L’installation actuelle ne peut pas être identifiée. Affichez le programme d’installation pour la sélectionner dans l’assistant.',
+    'update.writersBusy': 'OpenSquilla enregistre encore les modifications. Réessayez après leur enregistrement.',
     'update.moveToApplications': 'Déplacez OpenSquilla dans votre dossier Applications pour activer les mises à jour automatiques, puis réessayez.',
     'update.gatewayShutdownTimeout': 'OpenSquilla n\'a pas pu arrêter le runtime local. Réessayez de relancer la mise à jour.',
     'uninstall.confirmTitle': 'Supprimer les données locales du bureau OpenSquilla ?',
@@ -4496,9 +4390,14 @@ const DESKTOP_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
     'update.manifestInvalid': 'Die Update-Informationen sind ungültig. Versuchen Sie es später erneut.',
     'update.sourceUnavailable': 'Der Update-Dienst ist vorübergehend nicht verfügbar. Versuchen Sie es später erneut.',
     'update.checksumUnavailable': 'Das Installationsprogramm kann nicht geprüft werden, weil die offizielle Prüfsumme nicht verfügbar ist. Es wurde nichts geöffnet.',
-    'update.integrityFailed': 'Das heruntergeladene Installationsprogramm hat die Integritätsprüfung nicht bestanden und wurde gelöscht.',
+    'update.integrityFailed': 'Das Installationsprogramm hat die Integritätsprüfung nicht bestanden. Lade das Update erneut herunter.',
     'update.downloadFailed': 'Das Update konnte nicht heruntergeladen werden. Versuchen Sie es erneut.',
     'update.installFailed': 'Das Update-Installationsprogramm konnte nicht geöffnet werden. Versuchen Sie es erneut.',
+    'update.quitAndInstall': 'Beenden und installieren',
+    'update.signatureInvalid': 'Die Signatur stimmt nicht mit OpenSquilla überein. Laden Sie die offizielle Version erneut herunter.',
+    'update.signatureUnavailable': 'Windows konnte die Signatur nicht prüfen. Versuchen Sie es erneut; die Installation wurde nicht gestartet.',
+    'update.installationAmbiguous': 'Die aktuelle Installation ist nicht eindeutig. Öffnen Sie das Installationsprogramm und wählen Sie sie im Assistenten aus.',
+    'update.writersBusy': 'OpenSquilla speichert noch Änderungen. Versuchen Sie die Installation danach erneut.',
     'update.moveToApplications': 'Verschieben Sie OpenSquilla in Ihren Programme-Ordner, um automatische Updates zu aktivieren, und versuchen Sie es erneut.',
     'update.gatewayShutdownTimeout': 'OpenSquilla konnte die lokale Laufzeitumgebung nicht stoppen. Versuchen Sie erneut, zum Aktualisieren neu zu starten.',
     'uninstall.confirmTitle': 'Lokale OpenSquilla-Desktop-Daten löschen?',
@@ -4626,9 +4525,14 @@ const DESKTOP_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
     'update.manifestInvalid': 'La información de actualización no es válida. Inténtalo más tarde.',
     'update.sourceUnavailable': 'El servicio de actualizaciones no está disponible temporalmente. Inténtalo más tarde.',
     'update.checksumUnavailable': 'No se puede verificar el instalador porque la suma de comprobación oficial no está disponible. No se abrió ningún instalador.',
-    'update.integrityFailed': 'El instalador descargado no superó la verificación de integridad y se eliminó.',
+    'update.integrityFailed': 'El instalador no superó la verificación de integridad. Descarga la actualización de nuevo.',
     'update.downloadFailed': 'No se pudo descargar la actualización. Inténtalo de nuevo.',
     'update.installFailed': 'No se pudo abrir el instalador de la actualización. Inténtalo de nuevo.',
+    'update.quitAndInstall': 'Salir e instalar',
+    'update.signatureInvalid': 'La firma no coincide con OpenSquilla. Descarga de nuevo la versión oficial.',
+    'update.signatureUnavailable': 'Windows no pudo verificar la firma. Inténtalo de nuevo; el instalador no se ha iniciado.',
+    'update.installationAmbiguous': 'No se pudo identificar la instalación actual. Muestra el instalador y selecciónala en el asistente.',
+    'update.writersBusy': 'OpenSquilla sigue guardando los cambios. Espera a que termine e intenta instalar de nuevo.',
     'update.moveToApplications': 'Mueve OpenSquilla a tu carpeta de Aplicaciones para habilitar las actualizaciones automáticas e inténtalo de nuevo.',
     'update.gatewayShutdownTimeout': 'OpenSquilla no pudo detener el runtime local. Intenta reiniciar para actualizar de nuevo.',
     'uninstall.confirmTitle': '¿Eliminar los datos locales de escritorio de OpenSquilla?',
@@ -5034,10 +4938,11 @@ function createApplicationMenu(): void {
   const appSubmenu: Electron.MenuItemConstructorOptions[] = [{ role: 'about' }]
   if (desktopUpdateMenuEnabled()) {
     appSubmenu.push({ type: 'separator' })
-    if (downloadedUpdateVersion !== null) {
+    if (downloadedUpdateVersion !== null || (windowsInstallerActionsSupported() && verifiedManualInstallerPath !== null)) {
       appSubmenu.push(
         {
-          label: desktopT('menu.relaunchToUpdate'),
+          label: windowsInstallerActionsSupported() ? desktopT('update.quitAndInstall') : desktopT('menu.relaunchToUpdate'),
+          enabled: !updateApplying && !manualInstallerActionInProgress,
           click: () => {
             void applyDownloadedUpdate()
           },
@@ -9256,14 +9161,14 @@ async function startGateway(): Promise<GatewayState> {
   // Start the main-process-only bridge before the final port-selection await.
   // Its random endpoint and 256-bit token are injected only into this owned
   // Gateway child below; they are never copied into the renderer environment.
-  let artifactBridgeEnvironment: NodeJS.ProcessEnv = {}
+  let browserEnvironment: NodeJS.ProcessEnv = {}
   try {
-    artifactBridgeEnvironment = await desktopArtifactBridgeLoopback.start()
+    browserEnvironment = await desktopBrowser.start()
   } catch {
     // The editor transport is additive. If loopback binding is unavailable,
     // keep the Gateway and download/source workflows usable with every native
     // capability disabled instead of weakening the transport boundary.
-    desktopLog('desktop_artifact_bridge_transport_unavailable')
+    desktopLog('desktop_browser_transport_unavailable')
   }
   const port = await findGatewayPort()
   // This is the final await before spawn. Update, quit, cleanup, and recovery
@@ -9321,7 +9226,7 @@ async function startGateway(): Promise<GatewayState> {
     ...(connection.searchApiKeyEnv && searchApiKey ? { [connection.searchApiKeyEnv]: searchApiKey } : {}),
     OPENSQUILLA_DESKTOP_GATEWAY_INSTANCE_NONCE: gatewayInstanceNonce,
     OPENSQUILLA_DESKTOP_GATEWAY_OWNERSHIP_DIR: gatewayOwnershipDir,
-    ...artifactBridgeEnvironment,
+    ...browserEnvironment,
     OPENSQUILLA_CONTROL_UI_DIST: desktopRendererDistPath(),
     // desktopChildEnvironment pins OPENSQUILLA_STATE_DIR to H. RC4's Python
     // recovery engine has already validated/reconciled the historical nested
@@ -9587,7 +9492,7 @@ async function createMainWindow(): Promise<BrowserWindow> {
   // folder without a reproduction. Only the trusted main frame is accepted: an
   // artifact or other child frame must not be able to write to the lifecycle log.
   window.webContents.on('console-message', (details) => {
-    if (details.frame !== window.webContents.mainFrame) return
+    if (!isLiveMainFrameConsoleMessage(window, details)) return
     const entry = buildRendererConsoleLogEntry({
       level: details.level,
       message: details.message,
@@ -10417,9 +10322,10 @@ function stopGateway(): void {
 // ── Desktop updates ──────────────────────────────────────────────────────────
 // macOS release builds are Developer-ID signed + notarized and ship the zip +
 // latest-mac.yml feed that Squirrel.Mac consumes, so in-place auto-update is
-// safe. Windows builds are currently unsigned, so the desktop shell discovers
-// the release but opens its exact versioned NSIS installer for an explicit
-// manual install. OPENSQUILLA_DESKTOP_ENABLE_WIN_UPDATE=1 opts in to native
+// safe. Windows hands off a verified full installer to the visible NSIS wizard.
+// OPENSQUILLA_DESKTOP_ENABLE_WIN_INSTALL=0 disables this handoff and retains the
+// manual Show installer action; signature and checksum checks still apply.
+// OPENSQUILLA_DESKTOP_ENABLE_WIN_UPDATE=1 opts in to native
 // Windows updating for local tests only; OPENSQUILLA_DESKTOP_DISABLE_AUTO_UPDATE
 // disables all shell-managed discovery.
 const { autoUpdater } = electronUpdater
@@ -10430,11 +10336,16 @@ let manualInstallerActionInProgress = false
 let updateApplying = false
 // A user/system quit that arrives while an update is still draining writers or
 // the gateway is deferred until that phase either fails safely or reaches the
-// updater-owned handoff. Only quitAndInstall may set handoff ready.
+// updater-owned handoff. A verified Windows installer spawn may also commit it.
 let updateInstallHandoffReady = false
 let quitRequestedDuringUpdateDrain = false
 let downloadedUpdateVersion: string | null = null
 let verifiedManualInstallerPath: string | null = null
+let windowsUpdateCacheDescriptor: WindowsUpdateCacheDescriptor | null = null
+let windowsUpdateCacheRestore: Promise<void> | null = null
+let windowsUpdateCacheRestoreAttempted = false
+const windowsUpdateCoordinator = new WindowsUpdateCoordinator()
+let windowsUpdateRecoveryGeneration = 0
 let updateGatewayShutdownProcess: ChildProcessWithoutNullStreams | null = null
 let mockDownloadedUpdate = false
 let mockUpdatePromptActive = false
@@ -10461,6 +10372,8 @@ type DesktopUpdateErrorCode =
   | 'integrity_failed'
   | 'download_failed'
   | 'install_failed'
+  | 'signature_invalid'
+  | 'signature_unavailable'
   | null
 
 interface DesktopUpdateState {
@@ -10474,6 +10387,7 @@ interface DesktopUpdateState {
   snoozedUntil: string | null
   canCheck: boolean
   canNativeInstall: boolean
+  canInstall?: boolean
   installMode: DesktopUpdateInstallMode
   releaseUrl: string | null
   source: DesktopUpdateSource | null
@@ -10633,6 +10547,89 @@ function desktopUpdateInstallMode(): DesktopUpdateInstallMode {
   return 'unsupported'
 }
 
+function windowsInstallerActionsSupported(): boolean {
+  // Keep the existing opt-in value compatible and allow an explicit emergency opt-out.
+  return process.platform === 'win32' && process.arch === 'x64'
+    && desktopUpdateManaged() && desktopUpdateInstallMode() === 'manual'
+    && process.env.OPENSQUILLA_DESKTOP_ENABLE_WIN_INSTALL !== '0'
+}
+
+function windowsUpdateDownloadDirectory(): string {
+  return join(app.getPath('userData'), 'update-downloads')
+}
+
+async function clearWindowsUpdateCache(): Promise<void> {
+  windowsUpdateCacheDescriptor = null
+  verifiedManualInstallerPath = null
+  createApplicationMenu()
+  await saveWindowsUpdateCache(windowsUpdateDownloadDirectory(), null)
+}
+
+function publishVerifiedWindowsInstaller(
+  verified: { path: string; descriptor: WindowsUpdateCacheDescriptor; candidate: DesktopUpdateCandidate },
+  source: DesktopUpdateSource,
+  fallbackUsed = false,
+): void {
+  windowsUpdateCacheDescriptor = verified.descriptor
+  verifiedManualInstallerPath = verified.path
+  desktopUpdateCandidate = verified.candidate
+  setDesktopUpdateState({
+    status: 'downloaded', latestVersion: verified.candidate.version, progress: 100,
+    releaseUrl: updateAssetUrl(verified.candidate, source), source, fallbackUsed,
+    error: null, errorCode: null,
+  })
+  createApplicationMenu()
+}
+
+async function restoreWindowsUpdateCache(forceRetry = false): Promise<void> {
+  if (windowsUpdateCacheRestore) return windowsUpdateCacheRestore
+  if (forceRetry && !verifiedManualInstallerPath) windowsUpdateCacheRestoreAttempted = false
+  if (windowsUpdateCacheRestoreAttempted || process.platform !== 'win32'
+    || !desktopUpdateManaged() || desktopUpdateInstallMode() !== 'manual'
+    || isQuitting || updateApplying || desktopWriters.closed) return
+  windowsUpdateCacheRestoreAttempted = true
+  windowsUpdateCacheRestore = (async () => {
+    try {
+      loadDesktopUpdatePersistence()
+      const descriptor = await loadWindowsUpdateCache(windowsUpdateDownloadDirectory())
+      if (!descriptor) return
+      windowsUpdateCacheDescriptor = descriptor
+      const verified = await verifyCachedInstaller(windowsUpdateDownloadDirectory(), descriptor, app.getVersion())
+      if (!verified) {
+        await clearWindowsUpdateCache()
+        return
+      }
+      // A concurrent Quit/migration owns its state; never reopen actions under it.
+      if (isQuitting || updateApplying || desktopWriters.closed) {
+        windowsUpdateCacheRestoreAttempted = false
+        return
+      }
+      publishVerifiedWindowsInstaller(verified, lastSuccessfulUpdateSource ?? 'oss')
+      desktopLog('update_windows_cache_restored', { version: verified.candidate.version })
+    } catch (error) {
+      if (error instanceof WindowsUpdateSecurityError && error.code === 'signature_invalid') {
+        await clearWindowsUpdateCache().catch(() => {})
+      }
+      desktopLog('update_windows_cache_unavailable', { error: String(error) })
+      // Retain a cache whose verification tool is temporarily unavailable.
+      // An explicit Download can retry the verification without fetching bytes.
+      if (forceRetry) throw error
+    }
+  })().finally(() => { windowsUpdateCacheRestore = null })
+  return windowsUpdateCacheRestore
+}
+
+async function revalidateReadyWindowsInstaller(): Promise<string> {
+  const verified = await verifyCachedInstaller(
+    windowsUpdateDownloadDirectory(), windowsUpdateCacheDescriptor, app.getVersion(),
+    { expectedCandidate: desktopUpdateCandidate ?? undefined },
+  )
+  if (!verified || verified.path !== verifiedManualInstallerPath) {
+    throw new UpdateChannelError('integrity_failed', 'The downloaded Windows installer is no longer valid.')
+  }
+  return verified.path
+}
+
 function desktopUpdateStatePath(): string {
   // Update availability is application-global and may be read before profile
   // inspection, so it must never resolve through an untrusted selected H.
@@ -10720,6 +10717,7 @@ function desktopUpdateSnapshot(): DesktopUpdateState {
     snoozedUntil: activeDesktopUpdateSnoozeFor(latestVersion),
     canCheck: desktopUpdateManaged() || mockUpdateVersion() !== null,
     canNativeInstall: installMode === 'native',
+    canInstall: installMode === 'native' || windowsInstallerActionsSupported(),
     installMode,
     releaseUrl: desktopUpdateReleaseUrl,
     source: desktopUpdateSource,
@@ -10814,6 +10812,8 @@ function showUpdateDialog(
 }
 
 function classifyDesktopUpdateError(err: unknown): Exclude<DesktopUpdateErrorCode, null> {
+  if (err instanceof WindowsUpdateSecurityError) return err.code
+  if (err instanceof WindowsUpdateHandoffError) return 'install_failed'
   if (err instanceof UpdateChannelError) {
     if (err.code === 'manifest_invalid' || err.code === 'current_version_invalid') return 'manifest_invalid'
     if (err.code === 'checksum_unavailable') return 'checksum_unavailable'
@@ -10825,7 +10825,16 @@ function classifyDesktopUpdateError(err: unknown): Exclude<DesktopUpdateErrorCod
   return updateDownloadInProgress ? 'download_failed' : 'source_unreachable'
 }
 
+function classifyDesktopUpdateTelemetryError(err: unknown): UpdateErrorCode {
+  const code = classifyDesktopUpdateError(err)
+  if (code === 'signature_invalid') return 'integrity_failed'
+  if (code === 'signature_unavailable') return 'internal_error'
+  return code
+}
+
 function desktopUpdateErrorMessage(code: Exclude<DesktopUpdateErrorCode, null>): string {
+  if (code === 'signature_invalid') return desktopT('update.signatureInvalid')
+  if (code === 'signature_unavailable') return desktopT('update.signatureUnavailable')
   if (code === 'manifest_invalid') return desktopT('update.manifestInvalid')
   if (code === 'checksum_unavailable') return desktopT('update.checksumUnavailable')
   if (code === 'integrity_failed') return desktopT('update.integrityFailed')
@@ -10904,21 +10913,36 @@ async function runMockUpdateFlow(version: string): Promise<void> {
 }
 
 async function downloadDesktopUpdate(): Promise<DesktopUpdateState> {
+  try {
+    await restoreWindowsUpdateCache(true)
+  } catch (error) {
+    const errorCode = classifyDesktopUpdateError(error)
+    return setDesktopUpdateState({ status: 'error', errorCode, error: desktopUpdateErrorMessage(errorCode) })
+  }
+  if (isQuitting || desktopWriters.closed || updateApplying || manualInstallerActionInProgress) return desktopUpdateSnapshot()
   if (
     desktopUpdateInstallMode() === 'manual'
     && desktopUpdateStatus === 'downloaded'
     && verifiedManualInstallerPath
   ) {
+    manualInstallerActionInProgress = true
     try {
+      await revalidateReadyWindowsInstaller()
       shell.showItemInFolder(verifiedManualInstallerPath)
     } catch (err) {
+      const errorCode = classifyDesktopUpdateError(err)
+      if (errorCode === 'integrity_failed' || errorCode === 'signature_invalid') {
+        await clearWindowsUpdateCache().catch(() => {})
+      }
       console.error('[updater] failed to reveal verified manual installer', err)
       return setDesktopUpdateState({
         status: 'error',
         progress: null,
-        error: desktopUpdateErrorMessage('install_failed'),
-        errorCode: 'install_failed',
+        error: desktopUpdateErrorMessage(errorCode),
+        errorCode,
       })
+    } finally {
+      manualInstallerActionInProgress = false
     }
     return desktopUpdateSnapshot()
   }
@@ -10968,14 +10992,15 @@ async function downloadDesktopUpdate(): Promise<DesktopUpdateState> {
 
   if (desktopUpdateInstallMode() === 'manual') {
     manualInstallerActionInProgress = true
+    let finishTelemetry: ((outcome: 'success' | 'fail', errorCode: UpdateErrorCode | null) => void) | undefined
     try {
       if (desktopUpdateStatus === 'checking') await checkForUpdates(true)
       if (!desktopUpdateCandidate) await checkForUpdates(true)
       const candidate = desktopUpdateCandidate
-      if (!candidate || desktopUpdateStatus !== 'available') return desktopUpdateSnapshot()
+      if (!candidate || !['available', 'error'].includes(desktopUpdateStatus)) return desktopUpdateSnapshot()
       const telemetryStartedAt = Date.now()
       let telemetryFinished = false
-      const finishTelemetry = (
+      finishTelemetry = (
         outcome: 'success' | 'fail',
         errorCode: UpdateErrorCode | null,
       ) => {
@@ -10993,6 +11018,17 @@ async function downloadDesktopUpdate(): Promise<DesktopUpdateState> {
       }
       updateDownloadInProgress = true
       verifiedManualInstallerPath = null
+
+      // Recover a previously completed download before probing or fetching bytes.
+      const cached = await verifyCachedInstaller(
+        windowsUpdateDownloadDirectory(), windowsUpdateCacheDescriptor, app.getVersion(),
+        { expectedCandidate: candidate },
+      )
+      if (cached) {
+        publishVerifiedWindowsInstaller(cached, desktopUpdateSource ?? lastSuccessfulUpdateSource ?? 'oss')
+        finishTelemetry('success', null)
+        return desktopUpdateSnapshot()
+      }
 
       let chosen: { source: DesktopUpdateSource; fallbackUsed: boolean }
       try {
@@ -11022,39 +11058,47 @@ async function downloadDesktopUpdate(): Promise<DesktopUpdateState> {
       })
       try {
         const expectedSha256 = await fetchCanonicalWindowsInstallerDigest(candidate)
-        const verified = await downloadVerifiedWindowsInstallerWithFallback(
+        const downloaded = await downloadVerifiedWindowsInstallerWithFallback(
           candidate,
           chosen,
           expectedSha256,
         )
-        verifiedManualInstallerPath = verified.path
-        rememberSuccessfulUpdateSource(verified.source)
-        setDesktopUpdateState({
-          status: 'downloaded',
-          latestVersion: candidate.version,
-          progress: 100,
-          checkedAt: new Date().toISOString(),
-          releaseUrl: updateAssetUrl(candidate, verified.source),
-          source: verified.source,
-          fallbackUsed: verified.fallbackUsed,
-          error: null,
-          errorCode: null,
-        })
-        try {
-          shell.showItemInFolder(verified.path)
-        } catch (err) {
-          throw new UpdateChannelError(
-            'install_failed',
-            `The verified installer could not be shown: ${String(err instanceof Error ? err.message : err)}`,
-          )
+        windowsUpdateCacheDescriptor = createWindowsUpdateCacheDescriptor(
+          candidate, expectedSha256, (await stat(downloaded.path)).size,
+        )
+        // The completed SHA-checked download can survive a temporarily
+        // unavailable OS verifier. Metadata alone never makes it installable.
+        await saveWindowsUpdateCache(windowsUpdateDownloadDirectory(), windowsUpdateCacheDescriptor)
+        const verified = await verifyCachedInstaller(
+          windowsUpdateDownloadDirectory(), windowsUpdateCacheDescriptor, app.getVersion(),
+          { expectedCandidate: candidate, expectedSha256 },
+        )
+        if (!verified) {
+          throw new UpdateChannelError('integrity_failed', 'The downloaded Windows installer is no longer valid.')
         }
+        // Use the same canonical path for first download, restart restoration,
+        // and install-time identity checks, including userData ancestor junctions.
+        rememberSuccessfulUpdateSource(downloaded.source)
+        setDesktopUpdateState({ checkedAt: new Date().toISOString() })
+        publishVerifiedWindowsInstaller(verified, downloaded.source, downloaded.fallbackUsed)
         finishTelemetry('success', null)
       } catch (err) {
         console.error('[updater] failed to prepare verified manual installer', err)
-        finishTelemetry('fail', classifyDesktopUpdateError(err))
+        const errorCode = classifyDesktopUpdateError(err)
+        finishTelemetry('fail', classifyDesktopUpdateTelemetryError(err))
+        if (errorCode === 'integrity_failed' || errorCode === 'signature_invalid') {
+          await clearWindowsUpdateCache().catch(() => {})
+        }
         showUpdateError(err)
         return desktopUpdateSnapshot()
       }
+      return desktopUpdateSnapshot()
+    } catch (err) {
+      finishTelemetry?.('fail', classifyDesktopUpdateTelemetryError(err))
+      if (err instanceof WindowsUpdateSecurityError && err.code === 'signature_invalid') {
+        await clearWindowsUpdateCache().catch(() => {})
+      }
+      showUpdateError(err)
       return desktopUpdateSnapshot()
     } finally {
       updateDownloadInProgress = false
@@ -11105,7 +11149,7 @@ async function downloadDesktopUpdate(): Promise<DesktopUpdateState> {
       outcome: 'fail',
       durationMs: Math.max(0, Date.now() - telemetryStartedAt),
       updateStage: 'download',
-      errorCode: classifyDesktopUpdateError(err),
+      errorCode: classifyDesktopUpdateTelemetryError(err),
       oldVersion: app.getVersion(),
       newVersion: candidate.version,
       result: null,
@@ -11716,14 +11760,24 @@ async function downloadNativeDesktopUpdateWithFallback(): Promise<void> {
 }
 
 function desktopUpdateCheckAllowed(): boolean {
+  if (isQuitting || desktopWriters.closed) return false
   return isUpdateCheckAllowed({
-    downloading: updateDownloadInProgress || (manualInstallerActionInProgress && desktopUpdateCandidate !== null),
+    downloading: updateDownloadInProgress || windowsUpdateCacheRestore !== null || (manualInstallerActionInProgress && desktopUpdateCandidate !== null),
     applying: updateApplying,
-    downloaded: downloadedUpdateVersion !== null || desktopUpdateStatus === 'downloaded',
+    // A manual installer is a reusable cache, not a pending native update.
+    // Keep discovery available so a newer or withdrawn candidate can replace it.
+    downloaded: desktopUpdateInstallMode() !== 'manual'
+      && (downloadedUpdateVersion !== null || desktopUpdateStatus === 'downloaded'),
   })
 }
 
 async function runDesktopUpdateCheck(): Promise<void> {
+  try {
+    await restoreWindowsUpdateCache(desktopUpdateCheckScheduler.manualRequestPending)
+  } catch (error) {
+    showUpdateError(error)
+    return
+  }
   // Keep this defensive guard even though the scheduler checks the same state:
   // download/apply events can change it between admission and execution.
   if (!desktopUpdateCheckAllowed()) return
@@ -11790,6 +11844,7 @@ async function runDesktopUpdateCheck(): Promise<void> {
   }
 
   if (nativeAutoUpdateEnabled()) initAutoUpdater()
+  const manualInstall = desktopUpdateInstallMode() === 'manual'
   const failureFallback: DesktopUpdateFailureFallback = {
     state: desktopUpdateSnapshot(),
     candidate: desktopUpdateCandidate,
@@ -11803,7 +11858,53 @@ async function runDesktopUpdateCheck(): Promise<void> {
     errorCode: null,
   })
   try {
-    const resolved = await resolveDesktopUpdate()
+    let resolved: ResolvedDesktopUpdate | null
+    try {
+      resolved = await resolveDesktopUpdate()
+    } catch (err) {
+      if (isQuitting || updateApplying || desktopWriters.closed) return
+      // Discovery failure must not discard an already downloaded installer.
+      // Verify it again before restoring actions, including on manual checks.
+      if (manualInstall && failureFallback.state.status === 'downloaded' && failureFallback.candidate) {
+        const cached = await verifyCachedInstaller(
+          windowsUpdateDownloadDirectory(), windowsUpdateCacheDescriptor, app.getVersion(),
+          { expectedCandidate: failureFallback.candidate },
+        )
+        if (isQuitting || updateApplying || desktopWriters.closed) return
+        if (cached) {
+          publishVerifiedWindowsInstaller(cached,
+            failureFallback.state.source ?? lastSuccessfulUpdateSource ?? 'oss',
+            failureFallback.state.fallbackUsed)
+          if (desktopUpdateCheckScheduler.consumeManualRequest()) {
+            const errorCode = classifyDesktopUpdateError(err)
+            setDesktopUpdateState({ errorCode, error: desktopUpdateErrorMessage(errorCode) })
+          }
+          finishTelemetry('fail', classifyDesktopUpdateTelemetryError(err), null, null)
+          return
+        }
+        await clearWindowsUpdateCache()
+        throw new UpdateChannelError('integrity_failed', 'The cached Windows installer is no longer valid.')
+      }
+      throw err
+    }
+    if (isQuitting || updateApplying || desktopWriters.closed) return
+    if (manualInstall) {
+      // Only the currently advertised candidate may regain downloaded status.
+      // A changed/withdrawn candidate also invalidates persisted metadata, so a
+      // subsequent restart cannot silently restore the superseded installer.
+      const cached = resolved ? await verifyCachedInstaller(
+        windowsUpdateDownloadDirectory(), windowsUpdateCacheDescriptor, app.getVersion(),
+        { expectedCandidate: resolved.candidate },
+      ) : null
+      if (isQuitting || updateApplying || desktopWriters.closed) return
+      if (cached && resolved) {
+        publishVerifiedWindowsInstaller(cached, resolved.source, resolved.fallbackUsed)
+        finishTelemetry('success', null, 'available', resolved.candidate.version)
+        return
+      }
+      await clearWindowsUpdateCache()
+      if (isQuitting || updateApplying || desktopWriters.closed) return
+    }
     if (!resolved) {
       desktopUpdateCandidate = null
       nativeUpdateReady = null
@@ -11822,7 +11923,6 @@ async function runDesktopUpdateCheck(): Promise<void> {
       finishTelemetry('success', null, 'not_available', null)
       return
     }
-    const manualInstall = desktopUpdateInstallMode() === 'manual'
     if (manualInstall) {
       verifiedManualInstallerPath = null
       desktopUpdateCandidate = resolved.candidate
@@ -11843,9 +11943,18 @@ async function runDesktopUpdateCheck(): Promise<void> {
     await checkNativeDesktopUpdate(resolved)
     finishTelemetry('success', null, 'available', resolved.candidate.version)
   } catch (err) {
+    if (isQuitting || updateApplying || desktopWriters.closed) return
     console.error('[updater] checkForUpdates failed', err)
-    finishTelemetry('fail', classifyDesktopUpdateError(err), null, null)
-    showUpdateError(err, failureFallback)
+    finishTelemetry('fail', classifyDesktopUpdateTelemetryError(err), null, null)
+    if (manualInstall) {
+      verifiedManualInstallerPath = null
+      if (classifyDesktopUpdateError(err) === 'signature_invalid') {
+        await clearWindowsUpdateCache().catch(() => {})
+      }
+    }
+    if (isQuitting || updateApplying || desktopWriters.closed) return
+    // A failed cache verification must never restore the old ready state.
+    showUpdateError(err, manualInstall && failureFallback.state.status === 'downloaded' ? null : failureFallback)
   }
 }
 
@@ -11899,7 +12008,7 @@ function restoreDownloadedUpdateRetryState(
   writerAdmissionToken: symbol | null = null,
 ): boolean {
   if (writerAdmissionToken) desktopWriters.reopen(writerAdmissionToken)
-  downloadedUpdateVersion = pendingVersion
+  if (desktopUpdateInstallMode() !== 'manual') downloadedUpdateVersion = pendingVersion
   updateApplying = false
   updateInstallHandoffReady = false
   isQuitting = false
@@ -11917,11 +12026,149 @@ function restoreDownloadedUpdateRetryState(
   return true
 }
 
+async function stopOwnedGatewaysForUpdate(): Promise<boolean> {
+  return await stopAndJoinAllLifecycleOwnedGateways((child) => {
+    updateGatewayShutdownProcess = child
+    allowGracefulShutdownWhileQuitting = true
+    try {
+      stopGateway()
+    } finally {
+      allowGracefulShutdownWhileQuitting = false
+    }
+  })
+}
+
+async function applyWindowsInstaller(): Promise<void> {
+  await restoreWindowsUpdateCache()
+  const candidate = desktopUpdateCandidate
+  if (!candidate || desktopUpdateStatus !== 'downloaded' || !verifiedManualInstallerPath) return
+  let writerAdmissionToken: symbol | null = null
+  let installerPath = ''
+  const previouslyOwned = liveLifecycleOwnedGatewayProcesses().length > 0
+  const profileKey = desktopProfileKey()
+  let recoveryGeneration = 0
+  let telemetryStartedAt = 0
+  const assertCanHandoff = () => {
+    if (liveLifecycleOwnedGatewayProcesses().length > 0 || !writerAdmissionToken
+      || desktopWriters.hasOtherOwner(writerAdmissionToken) || desktopWriters.activeCount !== 0) {
+      throw new Error('The desktop is still busy; the Windows installer was not started.')
+    }
+  }
+  await windowsUpdateCoordinator.run({
+    canStart: () => windowsInstallerActionsSupported() && !isQuitting && appExitPhase === 'running'
+      && !updateApplying && !updateDownloadInProgress && !manualInstallerActionInProgress && !desktopWriters.closed,
+    started: () => {
+      recoveryGeneration = ++windowsUpdateRecoveryGeneration
+      telemetryStartedAt = Date.now()
+      updateApplying = true
+      setAppExitPhase('deferred', 'verifying Windows update before installation')
+      setDesktopUpdateState({ status: 'applying', error: null, errorCode: null })
+      createApplicationMenu()
+    },
+    verify: async () => {
+      installerPath = await revalidateReadyWindowsInstaller()
+      await assertUnambiguousWindowsInstallation(app.getPath('exe'))
+    },
+    closeWriters: () => {
+      if (desktopWriters.closed || isQuitting || desktopUpdateCandidate !== candidate) {
+        throw new Error('Another desktop operation superseded the Windows update.')
+      }
+      writerAdmissionToken = desktopWriters.close('apply signed Windows installer')
+    },
+    waitForWriters: async (signal) => desktopWriters.waitForAtMost(0, signal),
+    stopGateways: async () => {
+      isQuitting = true
+      setAppExitPhase('draining', 'stopping Gateway for Windows installer')
+      return await stopOwnedGatewaysForUpdate()
+    },
+    assertCanHandoff,
+    launchInstaller: async () => {
+      // Draining can take time. Recheck the actual bytes immediately before
+      // execution as well, so a replaced download never reaches NSIS.
+      if (await revalidateReadyWindowsInstaller() !== installerPath) {
+        throw new UpdateChannelError('integrity_failed', 'The installer changed while preparing the update.')
+      }
+      assertCanHandoff()
+      // Telemetry is best-effort and must never block a signed installer handoff.
+      desktopReliabilityTelemetry.markUpdateHandoff(candidate.version)
+      await launchWindowsInstaller(installerPath)
+    },
+    committed: () => {
+      updateGatewayShutdownProcess = null
+      updateInstallHandoffReady = true
+      setAppExitPhase('committed', 'Windows installer process started')
+      desktopLog('update_windows_installer_handoff', { version: candidate.version, tag: candidate.tag })
+      app.quit()
+    },
+    recover: async (error, gatewayStopStarted) => {
+      const errorCode = error instanceof WindowsUpdatePreparationError
+        ? 'install_failed'
+        : error instanceof WindowsUpdateSecurityError || error instanceof UpdateChannelError
+          ? classifyDesktopUpdateError(error) : 'install_failed'
+      const telemetryErrorCode = error instanceof WindowsUpdatePreparationError
+        ? (error.reason === 'gateway_busy' ? 'gateway_shutdown_timeout' : 'install_failed')
+        : classifyDesktopUpdateTelemetryError(error)
+      desktopReliabilityTelemetry.clearUpdateHandoff()
+      desktopReliabilityTelemetry.recordUpdateResult({
+        outcome: error instanceof WindowsUpdatePreparationError ? 'timeout' : 'fail',
+        durationMs: Math.max(0, Date.now() - telemetryStartedAt),
+        updateStage: 'install',
+        errorCode: telemetryErrorCode,
+        oldVersion: app.getVersion(),
+        newVersion: candidate.version,
+        result: null,
+      })
+      if (errorCode === 'integrity_failed' || errorCode === 'signature_invalid') {
+        await clearWindowsUpdateCache().catch(() => {})
+      }
+      updateGatewayShutdownProcess = null
+      const foreignLifecycleOwnsExit = writerAdmissionToken
+        ? desktopWriters.hasOtherOwner(writerAdmissionToken) : desktopWriters.closed
+      if (foreignLifecycleOwnsExit) {
+        // Verification yields before we acquire writer admission. A concurrent
+        // recovery/cleanup may win; its exit and ownership state must survive.
+        if (writerAdmissionToken) desktopWriters.reopen(writerAdmissionToken)
+        updateApplying = false
+        setDesktopUpdateState({ status: verifiedManualInstallerPath ? 'downloaded' : 'error',
+          errorCode, error: desktopUpdateErrorMessage(errorCode) })
+        desktopLog('update_windows_superseded', { version: candidate.version })
+        return
+      }
+      const quitResumed = restoreDownloadedUpdateRetryState(candidate.version, writerAdmissionToken)
+      setDesktopUpdateState({
+        status: verifiedManualInstallerPath ? 'downloaded' : 'error',
+        errorCode,
+        error: error instanceof WindowsUpdateHandoffError && error.code === 'installation_ambiguous'
+          ? desktopT('update.installationAmbiguous')
+          : error instanceof WindowsUpdatePreparationError
+            ? desktopT(error.reason === 'writers_busy' ? 'update.writersBusy' : 'update.gatewayShutdownTimeout')
+            : desktopUpdateErrorMessage(errorCode),
+      })
+      desktopLog('update_windows_installer_failed', { version: candidate.version, errorCode, error: String(error) })
+      if (quitResumed || !gatewayStopStarted || !previouslyOwned) return
+      // If termination timed out, wait for these exact children. Never start a
+      // second Gateway or resurrect a profile after another lifecycle action.
+      const resume = () => {
+        if (recoveryGeneration !== windowsUpdateRecoveryGeneration || isQuitting || updateApplying
+          || desktopWriters.closed || appExitPhase !== 'running' || desktopProfileKey() !== profileKey
+          || liveLifecycleOwnedGatewayProcesses().length > 0) return
+        void openOrResumeDesktopApp().catch((resumeError) => {
+          desktopLog('update_windows_gateway_resume_failed', { error: String(resumeError) })
+        })
+      }
+      const stopping = liveLifecycleOwnedGatewayProcesses()
+      if (stopping.length === 0) resume()
+      else for (const child of stopping) child.once('exit', () => setImmediate(resume))
+    },
+  })
+}
+
 // Stop the owned gateway child and WAIT for it to exit before handing control to
 // the installer. The gateway holds the listen port + a PID lock and (on Windows)
 // open file handles under resources/runtime that the installer must overwrite —
 // orphaning it breaks the next launch. Mirrors the uninstall quiesce path.
 async function applyDownloadedUpdate(): Promise<void> {
+  if (windowsInstallerActionsSupported()) return await applyWindowsInstaller()
   if (updateApplying) return
   if (isQuitting || desktopWriters.closed) return
   if (!mockDownloadedUpdate && !downloadedUpdateVersion) return
@@ -11980,17 +12227,7 @@ async function applyDownloadedUpdate(): Promise<void> {
   })
   isQuitting = true
   setAppExitPhase('draining', 'stopping Gateway for downloaded update')
-  const exited = await stopAndJoinAllLifecycleOwnedGateways((child) => {
-    updateGatewayShutdownProcess = child
-    // We stay alive and await the exit below, so let the gateway take its
-    // Windows HTTP graceful drain instead of an immediate TerminateProcess.
-    allowGracefulShutdownWhileQuitting = true
-    try {
-      stopGateway()
-    } finally {
-      allowGracefulShutdownWhileQuitting = false
-    }
-  })
+  const exited = await stopOwnedGatewaysForUpdate()
   // Re-read the shared ownership set immediately before handoff. There is no
   // await between this check and quitAndInstall, so a child already stopping
   // for Retry/recovery cannot be skipped by the installer lifecycle.
@@ -12061,17 +12298,21 @@ async function applyDownloadedUpdate(): Promise<void> {
 
 // Lets the gateway-served Control UI know whether this desktop owns update
 // discovery. Discovery ownership and native installation are deliberately separate:
-// unsigned Windows builds use the managed exact-installer flow, while macOS
+// Windows builds use the managed exact-installer flow, while macOS
 // can install the verified archive in place.
 ipcMain.handle('desktop:update:managed', () => desktopUpdateManaged() || mockUpdateVersion() !== null)
 ipcMain.handle('desktop:update:supported', () => nativeAutoUpdateEnabled())
-ipcMain.handle('desktop:update:state', () => desktopUpdateSnapshot())
+ipcMain.handle('desktop:update:state', async () => {
+  await restoreWindowsUpdateCache()
+  return desktopUpdateSnapshot()
+})
 ipcMain.handle('desktop:update:check', async () => {
   await checkForUpdates(true)
   return desktopUpdateSnapshot()
 })
 ipcMain.handle('desktop:update:download', async () => downloadDesktopUpdate())
-ipcMain.handle('desktop:update:relaunch', async () => {
+ipcMain.handle('desktop:update:relaunch', async (event) => {
+  if (windowsInstallerActionsSupported() && !trustedMainWindowControlIpc(event)) return desktopUpdateSnapshot()
   await applyDownloadedUpdate()
   return desktopUpdateSnapshot()
 })
@@ -12144,10 +12385,6 @@ ipcMain.handle('desktop:workbench:capabilities', (event) => {
     ? { ...NATIVE_WORKBENCH_CAPABILITIES, modes: ['offline'] as const }
     : NATIVE_WORKBENCH_CAPABILITIES
 })
-ipcMain.handle('desktop:workbench:artifact:capabilities', (event) => {
-  if (!trustedControlUiIpc(event)) throw new Error('Untrusted Desktop artifact request.')
-  return desktopArtifactBridge.getCapabilities()
-})
 ipcMain.handle('desktop:workbench:annotation:capabilities', async (event) => {
   if (!trustedControlUiIpc(event)) throw new Error('Untrusted artifact annotation request.')
   return await nativeWorkbenchSurfaces.getArtifactAnnotationCapabilities()
@@ -12182,29 +12419,25 @@ ipcMain.handle('desktop:workbench:annotation:close-overlay', async (event, paylo
     return { ok: false, message: error instanceof Error ? error.message : String(error) }
   }
 })
-ipcMain.handle('desktop:workbench:artifact:capture-selection', async (event, payload: unknown) => {
-  if (!trustedControlUiIpc(event)) throw new Error('Untrusted Desktop artifact request.')
-  return await desktopArtifactBridge.captureSelection(payload)
+ipcMain.handle('desktop:workbench:browser:target', (event, payload: unknown) => {
+  if (!trustedControlUiIpc(event)) throw new Error('Untrusted browser request.')
+  const request = payload as { surfaceId?: unknown } | null
+  return nativeWorkbenchSurfaces.getBrowserTarget(parseNativeWorkbenchSurfaceId(request?.surfaceId))
 })
-ipcMain.handle('desktop:workbench:artifact:browser-inspect', async (event, payload: unknown) => {
-  if (!trustedControlUiIpc(event)) throw new Error('Untrusted Desktop artifact request.')
-  return await desktopArtifactBridge.browserInspect(payload)
+ipcMain.handle('desktop:workbench:annotation:focus', async (event, payload: unknown) => {
+  if (!trustedControlUiIpc(event)) throw new Error('Untrusted annotation request.')
+  const request = payload as { surfaceId?: unknown; targetRef?: unknown; locatorHint?: unknown } | null
+  if (typeof request?.targetRef !== 'string' || typeof request?.locatorHint !== 'string'
+    || request.targetRef.length > 128 || request.locatorHint.length > 4096) throw new Error('Invalid annotation focus request.')
+  return await nativeWorkbenchSurfaces.focusAnnotation(parseNativeWorkbenchSurfaceId(request.surfaceId), request.targetRef, request.locatorHint)
 })
-ipcMain.handle('desktop:workbench:artifact:browser-act', async (event, payload: unknown) => {
-  if (!trustedControlUiIpc(event)) throw new Error('Untrusted Desktop artifact request.')
-  return await desktopArtifactBridge.browserAct(payload)
-})
-ipcMain.handle('desktop:workbench:artifact:screenshot', async (event, payload: unknown) => {
-  if (!trustedControlUiIpc(event)) throw new Error('Untrusted Desktop artifact request.')
-  return await desktopArtifactBridge.screenshot(payload)
-})
-ipcMain.handle('desktop:workbench:artifact:office-flush', async (event, payload: unknown) => {
-  if (!trustedControlUiIpc(event)) throw new Error('Untrusted Desktop artifact request.')
-  return await desktopArtifactBridge.officeFlush(payload)
-})
-ipcMain.handle('desktop:workbench:artifact:reload-surface', async (event, payload: unknown) => {
-  if (!trustedControlUiIpc(event)) throw new Error('Untrusted Desktop artifact request.')
-  return await desktopArtifactBridge.reloadSurface(payload)
+ipcMain.handle('desktop:workbench:browser:screenshot', async (event, payload: unknown) => {
+  if (!trustedControlUiIpc(event)) throw new Error('Untrusted browser request.')
+  const request = payload as { surfaceId?: unknown; targetRef?: unknown } | null
+  const target = nativeWorkbenchSurfaces.getBrowserTarget(parseNativeWorkbenchSurfaceId(request?.surfaceId))
+  if (target.targetRef !== request?.targetRef) throw new Error('The screenshot page was replaced.')
+  return await nativeWorkbenchSurfaces.executeBrowser({ sessionKey: target.sessionKey,
+    operation: 'screenshot', targetRef: target.targetRef }, new AbortController().signal)
 })
 ipcMain.handle('desktop:workbench:preview-lease:create', async (event, payload: unknown) => {
   if (!trustedControlUiIpc(event)) throw new Error('Untrusted native Workbench request.')
@@ -12241,19 +12474,15 @@ ipcMain.handle('desktop:workbench:surface:create', async (event, payload: unknow
   }
   try {
     const request = parseNativeWorkbenchCreateRequest(payload)
-    let activePreviewArtifactId: string | null = null
     if (request.kind === 'artifact-preview') {
-      activePreviewArtifactId = artifactPreviewLeaseBroker.resolveSurfaceArtifactId(
-        request.payload,
-      )
-      if (!activePreviewArtifactId) {
+      if (!artifactPreviewLeaseBroker.authorizesSurface(request.payload)) {
         return {
           ok: false,
           message: 'The artifact preview lease is not authorized by this Desktop Gateway.',
         }
       }
     }
-    return await nativeWorkbenchSurfaces.createSurface(request, activePreviewArtifactId)
+    return await nativeWorkbenchSurfaces.createSurface(request)
   } catch (error) {
     return { ok: false, message: error instanceof Error ? error.message : String(error) }
   }
@@ -14561,6 +14790,7 @@ async function resumeBootStartup(): Promise<{ ok: boolean; error?: string; code?
     await loadDesktopRendererIntoCurrentWindow()
     if (!bootResumeAuthorityIsCurrent(authority)) return { ok: true }
     sendBootStatus('ready')
+    finishAppStartSuccess()
     return { ok: true }
   } catch (error) {
     if (directTelemetryAttempt) finishGatewayStartTelemetry(directTelemetryAttempt, error)
@@ -14791,14 +15021,14 @@ app.on('before-quit', (event) => {
     void nativeWorkbenchSurfaces.destroyAll()
     desktopReliabilityTelemetry.finishSession()
     destroyWindowsTray()
-    void desktopArtifactBridgeLoopback.close()
+    void desktopBrowser.close()
     stopGateway()
     return
   }
   // An updater drain owns the lifecycle until every writer and gateway has
   // exited. A user Quit or repeated signal during this phase is remembered and
-  // resumed if the update cannot hand off. Only quitAndInstall's synchronous
-  // handoff is allowed through this guard.
+  // resumed if the update cannot hand off. Native updater handoff or a verified
+  // Windows installer spawn is allowed through this guard.
   if (updateApplying) {
     if (updateInstallHandoffReady) {
       setAppExitPhase('committed', 'desktop updater owns exit')
@@ -14806,7 +15036,7 @@ app.on('before-quit', (event) => {
       void nativeWorkbenchSurfaces.destroyAll()
       desktopReliabilityTelemetry.finishSession()
       destroyWindowsTray()
-      void desktopArtifactBridgeLoopback.close()
+      void desktopBrowser.close()
       return
     }
     event.preventDefault()
@@ -14878,7 +15108,7 @@ app.on('before-quit', (event) => {
         setAppExitPhase('committed', 'all lifecycle-owned Gateways exited')
         desktopReliabilityTelemetry.finishSession()
         destroyWindowsTray()
-        void desktopArtifactBridgeLoopback.close()
+        void desktopBrowser.close()
         app.exit(0)
         return
       }
@@ -14907,7 +15137,7 @@ app.on('before-quit', (event) => {
   void nativeWorkbenchSurfaces.destroyAll()
   desktopReliabilityTelemetry.finishSession()
   destroyWindowsTray()
-  void desktopArtifactBridgeLoopback.close()
+  void desktopBrowser.close()
   stopGateway()
 })
 
@@ -14935,7 +15165,7 @@ app.on('activate', () => {
 app.on('will-quit', () => {
   desktopReliabilityTelemetry.finishSession()
   destroyWindowsTray()
-  void desktopArtifactBridgeLoopback.close()
+  void desktopBrowser.close()
 })
 
 configureChromiumKeychainPolicy()
@@ -15053,6 +15283,16 @@ if (!gotSingleInstanceLock) {
   })
 
   void app.whenReady().then(async () => {
+    // An OS wake is an observation, not permission to restart or reload.
+    const notifySystemResume = () => {
+      for (const window of BrowserWindow.getAllWindows()) {
+        if (!window.isDestroyed() && !window.webContents.isDestroyed()) {
+          window.webContents.send('desktop:system:resume')
+        }
+      }
+    }
+    powerMonitor.on('resume', notifySystemResume)
+    app.once('will-quit', () => powerMonitor.removeListener('resume', notifySystemResume))
     app.name = 'OpenSquilla'
     installDesktopRendererProtocol()
     desktopLocale = loadPersistedDesktopLocale() ?? resolveDesktopLocale()

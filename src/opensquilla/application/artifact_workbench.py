@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, NotRequired, Protocol, TypedDict
+
+_SHA256_RE = re.compile(r"^[a-f0-9]{64}$")
 
 
 def _identity(value: str, label: str) -> str:
@@ -171,27 +174,8 @@ class ChangeRevert:
             raise ValueError("expected state revision must be positive")
 
 
-@dataclass(frozen=True, slots=True)
-class EditSessionStart:
-    session_key: str
-    document_id: str
-    client_request_id: str | None = None
-
-    def __post_init__(self) -> None:
-        DocumentIdentity(self.session_key, self.document_id)
 
 
-@dataclass(frozen=True, slots=True)
-class EditSessionMutation:
-    session_key: str
-    edit_session_id: str
-    expected_state_revision: int
-
-    def __post_init__(self) -> None:
-        _identity(self.session_key, "session key")
-        _identity(self.edit_session_id, "edit session id")
-        if self.expected_state_revision < 1:
-            raise ValueError("expected edit session state revision must be positive")
 
 
 @dataclass(frozen=True, slots=True)
@@ -204,67 +188,10 @@ class SourceRead:
         DocumentIdentity(self.session_key, self.document_id)
 
 
-@dataclass(frozen=True, slots=True)
-class SourceEdit:
-    start_offset: int
-    end_offset: int
-    replacement: str
-
-    def __post_init__(self) -> None:
-        if self.start_offset < 0 or self.end_offset < self.start_offset:
-            raise ValueError("source edit range is invalid")
 
 
-@dataclass(frozen=True, slots=True)
-class SourcePatch:
-    session_key: str
-    document_id: str
-    expected_head_revision_id: str
-    expected_source_sha256: str
-    expected_state_revision: int
-    edits: Sequence[SourceEdit]
-    request_id: str
-    offset_encoding: str = "unicode-code-point"
-    edit_session_id: str | None = None
-    expected_edit_session_state_revision: int | None = None
-    expected_last_saved_revision_id: str | None = None
-
-    def __post_init__(self) -> None:
-        DocumentIdentity(self.session_key, self.document_id)
-        _identity(self.expected_head_revision_id, "expected head revision id")
-        _identity(self.expected_source_sha256, "expected source digest")
-        _identity(self.request_id, "request id")
-        if self.expected_state_revision < 1:
-            raise ValueError("expected state revision must be positive")
-        if not self.edits:
-            raise ValueError("at least one source edit is required")
-        edit_session_fields = (
-            self.edit_session_id,
-            self.expected_edit_session_state_revision,
-            self.expected_last_saved_revision_id,
-        )
-        if any(value is not None for value in edit_session_fields) and not all(
-            value is not None for value in edit_session_fields
-        ):
-            raise ValueError("edit session fencing fields must be supplied together")
 
 
-@dataclass(frozen=True, slots=True)
-class PromptAnnotationSelection:
-    selection_id: str
-    tag_name: str
-    element_path: str
-    element_proof_sha256: str
-    dom_sha256: str | None = None
-
-    def __post_init__(self) -> None:
-        for value, label in (
-            (self.selection_id, "selection id"),
-            (self.tag_name, "selection tag name"),
-            (self.element_path, "selection element path"),
-            (self.element_proof_sha256, "selection element proof"),
-        ):
-            _identity(value, label)
 
 
 @dataclass(frozen=True, slots=True)
@@ -283,43 +210,10 @@ class PromptAnnotationQuery:
             raise ValueError("annotation page limit must be between 1 and 500")
 
 
-@dataclass(frozen=True, slots=True)
-class PromptAnnotationCreate:
-    session_key: str
-    annotation_id: str
-    document_id: str
-    selection: PromptAnnotationSelection
-    revision_id: str | None = None
-    body: str | None = None
-
-    def __post_init__(self) -> None:
-        DocumentIdentity(self.session_key, self.document_id)
-        _identity(self.annotation_id, "annotation id")
-        if self.revision_id is not None:
-            _identity(self.revision_id, "revision id")
 
 
-@dataclass(frozen=True, slots=True)
-class PromptAnnotationIdentity:
-    session_key: str
-    annotation_id: str
-
-    def __post_init__(self) -> None:
-        _identity(self.session_key, "session key")
-        _identity(self.annotation_id, "annotation id")
 
 
-@dataclass(frozen=True, slots=True)
-class PromptAnnotationMutation:
-    session_key: str
-    annotation_id: str
-    expected_state_revision: int
-    body: str | None = None
-
-    def __post_init__(self) -> None:
-        PromptAnnotationIdentity(self.session_key, self.annotation_id)
-        if self.expected_state_revision < 1:
-            raise ValueError("expected annotation state revision must be positive")
 
 
 @dataclass(frozen=True, slots=True)
@@ -379,6 +273,12 @@ class WorkbenchResourceOpen:
             raise ValueError("unsupported resource open intent")
         if self.idempotency_key is not None:
             _identity(self.idempotency_key, "idempotency key")
+            if len(self.idempotency_key.encode("utf-8")) > 256:
+                raise ValueError("idempotency key is too long")
+        if self.expected_sha256 is not None and _SHA256_RE.fullmatch(
+            self.expected_sha256.lower()
+        ) is None:
+            raise ValueError("expected resource digest must be a SHA-256 value")
 
 
 @dataclass(frozen=True, slots=True)
@@ -408,6 +308,13 @@ class DocumentImport:
         _identity(self.idempotency_key, "idempotency key")
         if self.mode != "copy":
             raise ValueError("unsupported document import mode")
+        if len(self.idempotency_key.encode("utf-8")) > 256:
+            raise ValueError("idempotency key is too long")
+        if (
+            self.client_request_id is not None
+            and self.client_request_id != self.idempotency_key
+        ):
+            raise ValueError("idempotency key and client request id must match")
 
 
 @dataclass(frozen=True, slots=True)
@@ -423,6 +330,13 @@ class DocumentPublish:
         DocumentIdentity(self.session_key, self.document_id)
         _identity(self.revision_id, "revision id")
         _identity(self.idempotency_key, "idempotency key")
+        if len(self.idempotency_key.encode("utf-8")) > 256:
+            raise ValueError("idempotency key is too long")
+        if (
+            self.client_request_id is not None
+            and self.client_request_id != self.idempotency_key
+        ):
+            raise ValueError("idempotency key and client request id must match")
 
 
 @dataclass(frozen=True, slots=True)
@@ -600,6 +514,7 @@ class PreviewLeaseGrant:
     client: str
     source: Mapping[str, Any]
     expires_at: str
+    working_document_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -608,101 +523,308 @@ class PreviewLeaseRenewal:
     expires_at: str
 
 
-@dataclass(frozen=True, slots=True)
-class CandidatePreviewGrant:
-    candidate_handle: str
-    candidate_artifact_id: str
-    scope_id: str
-    lease: PreviewLeaseGrant
 
 
 @dataclass(frozen=True, slots=True)
 class WorkbenchRecoveryReport:
-    drafts: Mapping[str, int]
-    mutations: Mapping[str, int]
     resources: Mapping[str, int]
 
 
-class ArtifactCatalogPort(Protocol):
-    async def list_artifacts(self, query: ArtifactCatalogQuery) -> Mapping[str, Any]: ...
+# Stable business projections at the Application boundary. Gateway adapters
+# serialize these to the existing v4 spellings; the Application surface no
+# longer accepts an arbitrary response object as its result contract.
+class ArtifactProjection(TypedDict):
+    id: str
+    name: str
+    mime: str
+    size: int
+    download_url: str
+    kind: NotRequired[str | None]
+    sha256: NotRequired[str | None]
+    session_id: NotRequired[str | None]
+    source: NotRequired[str | None]
+    created_at: NotRequired[str | int | None]
+    store: NotRequired[str | None]
+    thumbnail_url: NotRequired[str | None]
 
-    async def get_artifact(self, identity: ArtifactIdentity) -> Mapping[str, Any]: ...
+
+class ArtifactListResult(TypedDict):
+    artifacts: list[ArtifactProjection]
+    has_more: bool
+    oldest_cursor: str | None
+    newest_cursor: str | None
+    total_count: int
+    page_size: int
+
+
+class ArtifactResult(TypedDict):
+    artifact: ArtifactProjection
+
+
+class DocumentProjection(TypedDict, total=False):
+    documentId: str
+    sessionKey: str
+    artifactId: str | None
+    name: str
+    stateRevision: int
+    headRevisionId: str | None
+    format: str
+    status: str
+
+
+class RevisionProjection(TypedDict, total=False):
+    revisionId: str
+    documentId: str
+    parentRevisionId: str | None
+    sourceSha256: str
+    createdAt: str
+
+
+class ChangeSetProjection(TypedDict, total=False):
+    changeSetId: str
+    documentId: str
+    revisionId: str | None
+    status: str
+    createdAt: str
+
+
+class ReceiptProjection(TypedDict, total=False):
+    requestId: str
+    idempotencyKey: str
+    operation: str
+    status: str
+
+
+
+
+class SourceProjection(TypedDict, total=False):
+    documentId: str
+    revisionId: str
+    source: str
+    sourceSha256: str
+    offsetEncoding: str
+
+
+class PromptAnnotationProjection(TypedDict, total=False):
+    annotationId: str
+    documentId: str
+    revisionId: str | None
+    status: str
+    body: str | None
+    stateRevision: int
+
+
+class ResourceProjection(TypedDict, total=False):
+    type: str
+    id: str
+    name: str
+    mime: str | None
+    size: int | None
+    sha256: str | None
+
+
+class BindingProjection(TypedDict, total=False):
+    bindingId: str
+    documentId: str
+    resourceId: str
+    status: str
+
+
+class PreviewProjection(TypedDict, total=False):
+    previewId: str
+    mode: str
+    entrypoint: str
+    expiresAt: str
+
+
+class PublicationProjection(TypedDict, total=False):
+    publicationId: str
+    documentId: str
+    revisionId: str
+    status: str
+
+
+class DocumentCapabilitiesResult(TypedDict):
+    capabilities: Mapping[str, object]
+    formats: Mapping[str, object]
+
+
+class DocumentOpenResult(TypedDict):
+    adopted: bool
+    document: DocumentProjection
+
+
+class DocumentListResult(TypedDict):
+    documents: list[DocumentProjection]
+
+
+class DocumentResult(TypedDict):
+    document: DocumentProjection
+
+
+class DocumentCloseResult(TypedDict):
+    closed: bool
+    document: DocumentProjection
+
+
+class RevisionListResult(TypedDict):
+    revisions: list[RevisionProjection]
+
+
+class RevisionMutationResult(TypedDict):
+    changeSet: ChangeSetProjection
+    document: DocumentProjection
+    receipt: ReceiptProjection
+    revision: RevisionProjection
+
+
+class ChangeListResult(TypedDict):
+    changeSets: list[ChangeSetProjection]
+
+
+class ChangeResult(TypedDict):
+    changeSet: ChangeSetProjection
+
+
+
+
+class SourceResult(TypedDict):
+    source: SourceProjection
+
+
+
+
+class AnnotationListResult(TypedDict):
+    annotations: list[PromptAnnotationProjection]
+
+
+
+
+
+
+class ResourceListResult(TypedDict):
+    resources: list[ResourceProjection]
+    hasMore: bool
+    nextCursor: str | None
+    pageSize: int
+    returnedCount: int
+    totalCount: int
+
+
+class ResourceResult(TypedDict):
+    resource: ResourceProjection
+
+
+class ResourceOpenResult(TypedDict, total=False):
+    pageContext: Mapping[str, object]
+    workingFile: str
+    resource: ResourceProjection
+    disposition: str
+    resolution: Mapping[str, object]
+    materialized: bool
+    reasonCode: str | None
+    document: DocumentProjection
+    revision: RevisionProjection
+    binding: BindingProjection
+    receipt: ReceiptProjection
+
+
+class PreviewCreateResult(TypedDict):
+    preview: PreviewProjection
+    resource: ResourceProjection
+
+
+class DocumentImportResult(TypedDict):
+    binding: BindingProjection
+    document: DocumentProjection
+    receipt: ReceiptProjection
+    revision: RevisionProjection
+
+
+class DocumentPublishResult(TypedDict):
+    deliverable: Mapping[str, object]
+    publication: PublicationProjection
+    receipt: ReceiptProjection
+
+
+class MutationResolutionResult(TypedDict, total=False):
+    status: str
+    result: Mapping[str, object]
+    document: DocumentProjection
+    retryAfterMs: int | None
+
+
+class ArtifactCatalogPort(Protocol):
+    async def list_artifacts(self, query: ArtifactCatalogQuery) -> ArtifactListResult: ...
+
+    async def get_artifact(self, identity: ArtifactIdentity) -> ArtifactResult: ...
 
 
 class DocumentWorkspacePort(Protocol):
-    async def capabilities(self, query: DocumentCapabilitiesQuery) -> Mapping[str, Any]: ...
+    async def capabilities(
+        self, query: DocumentCapabilitiesQuery
+    ) -> DocumentCapabilitiesResult: ...
 
-    async def open_document(self, command: DocumentOpen) -> Mapping[str, Any]: ...
+    async def open_document(self, command: DocumentOpen) -> DocumentOpenResult: ...
 
-    async def list_documents(self, query: SessionDocumentsQuery) -> Mapping[str, Any]: ...
+    async def list_documents(self, query: SessionDocumentsQuery) -> DocumentListResult: ...
 
-    async def get_document(self, identity: DocumentIdentity) -> Mapping[str, Any]: ...
+    async def get_document(self, identity: DocumentIdentity) -> DocumentResult: ...
 
-    async def rename_document(self, command: DocumentRename) -> Mapping[str, Any]: ...
+    async def rename_document(self, command: DocumentRename) -> DocumentResult: ...
 
-    async def close_document(self, identity: DocumentIdentity) -> Mapping[str, Any]: ...
+    async def close_document(self, identity: DocumentIdentity) -> DocumentCloseResult: ...
 
 
 class RevisionHistoryPort(Protocol):
-    async def list_revisions(self, query: RevisionListQuery) -> Mapping[str, Any]: ...
+    async def list_revisions(self, query: RevisionListQuery) -> RevisionListResult: ...
 
-    async def restore_revision(self, command: RevisionRestore) -> Mapping[str, Any]: ...
+    async def restore_revision(self, command: RevisionRestore) -> RevisionMutationResult: ...
 
 
 class ChangeHistoryPort(Protocol):
-    async def list_changes(self, query: ChangeListQuery) -> Mapping[str, Any]: ...
+    async def list_changes(self, query: ChangeListQuery) -> ChangeListResult: ...
 
-    async def get_change(self, identity: ChangeIdentity) -> Mapping[str, Any]: ...
+    async def get_change(self, identity: ChangeIdentity) -> ChangeResult: ...
 
-    async def revert_change(self, command: ChangeRevert) -> Mapping[str, Any]: ...
+    async def revert_change(self, command: ChangeRevert) -> RevisionMutationResult: ...
 
 
-class DocumentEditSessionPort(Protocol):
-    async def start_edit_session(self, command: EditSessionStart) -> Mapping[str, Any]: ...
-
-    async def heartbeat_edit_session(self, command: EditSessionMutation) -> Mapping[str, Any]: ...
-
-    async def close_edit_session(self, command: EditSessionMutation) -> Mapping[str, Any]: ...
 
 
 class DocumentSourcePort(Protocol):
-    async def read_source(self, query: SourceRead) -> Mapping[str, Any]: ...
+    async def read_source(self, query: SourceRead) -> SourceResult: ...
 
-    async def patch_source(self, command: SourcePatch) -> Mapping[str, Any]: ...
 
 
 class PromptAnnotationPort(Protocol):
-    async def list_annotations(self, query: PromptAnnotationQuery) -> Mapping[str, Any]: ...
+    async def list_annotations(self, query: PromptAnnotationQuery) -> AnnotationListResult: ...
 
-    async def create_annotation(self, command: PromptAnnotationCreate) -> Mapping[str, Any]: ...
 
-    async def focus_annotation(self, identity: PromptAnnotationIdentity) -> Mapping[str, Any]: ...
 
-    async def update_annotation(self, command: PromptAnnotationMutation) -> Mapping[str, Any]: ...
 
-    async def discard_annotation(self, command: PromptAnnotationMutation) -> Mapping[str, Any]: ...
 
 
 class WorkbenchResourcePort(Protocol):
-    async def list_resources(self, query: WorkbenchResourceListQuery) -> Mapping[str, Any]: ...
+    async def list_resources(self, query: WorkbenchResourceListQuery) -> ResourceListResult: ...
 
-    async def get_resource(self, query: WorkbenchResourceQuery) -> Mapping[str, Any]: ...
+    async def get_resource(self, query: WorkbenchResourceQuery) -> ResourceResult: ...
 
-    async def open_resource(self, command: WorkbenchResourceOpen) -> Mapping[str, Any]: ...
+    async def open_resource(self, command: WorkbenchResourceOpen) -> ResourceOpenResult: ...
 
 
 class ResourcePreviewPort(Protocol):
-    async def create_preview(self, command: WorkbenchPreviewCreate) -> Mapping[str, Any]: ...
+    async def create_preview(self, command: WorkbenchPreviewCreate) -> PreviewCreateResult: ...
 
 
 class DocumentTransferPort(Protocol):
-    async def import_document(self, command: DocumentImport) -> Mapping[str, Any]: ...
+    async def import_document(self, command: DocumentImport) -> DocumentImportResult: ...
 
-    async def publish_document(self, command: DocumentPublish) -> Mapping[str, Any]: ...
+    async def publish_document(self, command: DocumentPublish) -> DocumentPublishResult: ...
 
 
 class MutationOutcomePort(Protocol):
-    async def resolve_mutation(self, query: MutationResolution) -> Mapping[str, Any]: ...
+    async def resolve_mutation(self, query: MutationResolution) -> MutationResolutionResult: ...
 
 
 class ArtifactContentPort(Protocol):
@@ -738,15 +860,13 @@ class PreviewMaterialPort(Protocol):
 
     async def revoke_lease(self, identity: PreviewLeaseIdentity) -> None: ...
 
-    async def resolve_candidate(self, handle: str) -> CandidatePreviewGrant: ...
 
-    async def release_candidate(self, handle: str) -> None: ...
 
 
 class ArtifactRecoveryPort(Protocol):
-    async def recover_drafts(self) -> Mapping[str, int]: ...
+    async def retire_legacy_editor(self) -> None: ...
 
-    async def recover_mutations(self) -> Mapping[str, int]: ...
+
 
     async def recover_resources(self) -> Mapping[str, int]: ...
 
@@ -755,10 +875,10 @@ class ArtifactCatalog:
     def __init__(self, port: ArtifactCatalogPort) -> None:
         self._port = port
 
-    async def list(self, query: ArtifactCatalogQuery) -> Mapping[str, Any]:
+    async def list(self, query: ArtifactCatalogQuery) -> ArtifactListResult:
         return await self._port.list_artifacts(query)
 
-    async def get(self, identity: ArtifactIdentity) -> Mapping[str, Any]:
+    async def get(self, identity: ArtifactIdentity) -> ArtifactResult:
         return await self._port.get_artifact(identity)
 
 
@@ -766,22 +886,24 @@ class DocumentWorkspace:
     def __init__(self, port: DocumentWorkspacePort) -> None:
         self._port = port
 
-    async def capabilities(self, query: DocumentCapabilitiesQuery) -> Mapping[str, Any]:
+    async def capabilities(
+        self, query: DocumentCapabilitiesQuery
+    ) -> DocumentCapabilitiesResult:
         return await self._port.capabilities(query)
 
-    async def open(self, command: DocumentOpen) -> Mapping[str, Any]:
+    async def open(self, command: DocumentOpen) -> DocumentOpenResult:
         return await self._port.open_document(command)
 
-    async def list(self, query: SessionDocumentsQuery) -> Mapping[str, Any]:
+    async def list(self, query: SessionDocumentsQuery) -> DocumentListResult:
         return await self._port.list_documents(query)
 
-    async def get(self, identity: DocumentIdentity) -> Mapping[str, Any]:
+    async def get(self, identity: DocumentIdentity) -> DocumentResult:
         return await self._port.get_document(identity)
 
-    async def rename(self, command: DocumentRename) -> Mapping[str, Any]:
+    async def rename(self, command: DocumentRename) -> DocumentResult:
         return await self._port.rename_document(command)
 
-    async def close(self, identity: DocumentIdentity) -> Mapping[str, Any]:
+    async def close(self, identity: DocumentIdentity) -> DocumentCloseResult:
         return await self._port.close_document(identity)
 
 
@@ -789,10 +911,10 @@ class RevisionHistory:
     def __init__(self, port: RevisionHistoryPort) -> None:
         self._port = port
 
-    async def list(self, query: RevisionListQuery) -> Mapping[str, Any]:
+    async def list(self, query: RevisionListQuery) -> RevisionListResult:
         return await self._port.list_revisions(query)
 
-    async def restore(self, command: RevisionRestore) -> Mapping[str, Any]:
+    async def restore(self, command: RevisionRestore) -> RevisionMutationResult:
         return await self._port.restore_revision(command)
 
 
@@ -800,72 +922,50 @@ class ChangeHistory:
     def __init__(self, port: ChangeHistoryPort) -> None:
         self._port = port
 
-    async def list(self, query: ChangeListQuery) -> Mapping[str, Any]:
+    async def list(self, query: ChangeListQuery) -> ChangeListResult:
         return await self._port.list_changes(query)
 
-    async def get(self, identity: ChangeIdentity) -> Mapping[str, Any]:
+    async def get(self, identity: ChangeIdentity) -> ChangeResult:
         return await self._port.get_change(identity)
 
-    async def revert(self, command: ChangeRevert) -> Mapping[str, Any]:
+    async def revert(self, command: ChangeRevert) -> RevisionMutationResult:
         return await self._port.revert_change(command)
 
 
-class DocumentEditSession:
-    def __init__(self, port: DocumentEditSessionPort) -> None:
-        self._port = port
-
-    async def start(self, command: EditSessionStart) -> Mapping[str, Any]:
-        return await self._port.start_edit_session(command)
-
-    async def heartbeat(self, command: EditSessionMutation) -> Mapping[str, Any]:
-        return await self._port.heartbeat_edit_session(command)
-
-    async def close(self, command: EditSessionMutation) -> Mapping[str, Any]:
-        return await self._port.close_edit_session(command)
 
 
 class DocumentSource:
     def __init__(self, port: DocumentSourcePort) -> None:
         self._port = port
 
-    async def read(self, query: SourceRead) -> Mapping[str, Any]:
+    async def read(self, query: SourceRead) -> SourceResult:
         return await self._port.read_source(query)
 
-    async def patch(self, command: SourcePatch) -> Mapping[str, Any]:
-        return await self._port.patch_source(command)
 
 
 class PromptAnnotationApplication:
     def __init__(self, port: PromptAnnotationPort) -> None:
         self._port = port
 
-    async def list(self, query: PromptAnnotationQuery) -> Mapping[str, Any]:
+    async def list(self, query: PromptAnnotationQuery) -> AnnotationListResult:
         return await self._port.list_annotations(query)
 
-    async def create(self, command: PromptAnnotationCreate) -> Mapping[str, Any]:
-        return await self._port.create_annotation(command)
 
-    async def focus(self, identity: PromptAnnotationIdentity) -> Mapping[str, Any]:
-        return await self._port.focus_annotation(identity)
 
-    async def update(self, command: PromptAnnotationMutation) -> Mapping[str, Any]:
-        return await self._port.update_annotation(command)
 
-    async def discard(self, command: PromptAnnotationMutation) -> Mapping[str, Any]:
-        return await self._port.discard_annotation(command)
 
 
 class WorkbenchResourceApplication:
     def __init__(self, port: WorkbenchResourcePort) -> None:
         self._port = port
 
-    async def list(self, query: WorkbenchResourceListQuery) -> Mapping[str, Any]:
+    async def list(self, query: WorkbenchResourceListQuery) -> ResourceListResult:
         return await self._port.list_resources(query)
 
-    async def get(self, query: WorkbenchResourceQuery) -> Mapping[str, Any]:
+    async def get(self, query: WorkbenchResourceQuery) -> ResourceResult:
         return await self._port.get_resource(query)
 
-    async def open(self, command: WorkbenchResourceOpen) -> Mapping[str, Any]:
+    async def open(self, command: WorkbenchResourceOpen) -> ResourceOpenResult:
         return await self._port.open_resource(command)
 
 
@@ -873,7 +973,7 @@ class ResourcePreviewApplication:
     def __init__(self, port: ResourcePreviewPort) -> None:
         self._port = port
 
-    async def create(self, command: WorkbenchPreviewCreate) -> Mapping[str, Any]:
+    async def create(self, command: WorkbenchPreviewCreate) -> PreviewCreateResult:
         return await self._port.create_preview(command)
 
 
@@ -881,10 +981,10 @@ class DocumentTransferApplication:
     def __init__(self, port: DocumentTransferPort) -> None:
         self._port = port
 
-    async def import_document(self, command: DocumentImport) -> Mapping[str, Any]:
+    async def import_document(self, command: DocumentImport) -> DocumentImportResult:
         return await self._port.import_document(command)
 
-    async def publish_document(self, command: DocumentPublish) -> Mapping[str, Any]:
+    async def publish_document(self, command: DocumentPublish) -> DocumentPublishResult:
         return await self._port.publish_document(command)
 
 
@@ -892,7 +992,7 @@ class MutationOutcomeApplication:
     def __init__(self, port: MutationOutcomePort) -> None:
         self._port = port
 
-    async def resolve(self, query: MutationResolution) -> Mapping[str, Any]:
+    async def resolve(self, query: MutationResolution) -> MutationResolutionResult:
         return await self._port.resolve_mutation(query)
 
 
@@ -978,26 +1078,19 @@ class PreviewMaterialApplication:
     async def revoke(self, identity: PreviewLeaseIdentity) -> None:
         await self._port.revoke_lease(identity)
 
-    async def resolve_candidate(self, handle: str) -> CandidatePreviewGrant:
-        return await self._port.resolve_candidate(_identity(handle, "candidate preview handle"))
 
-    async def release_candidate(self, handle: str) -> None:
-        await self._port.release_candidate(_identity(handle, "candidate preview handle"))
 
 
 class ArtifactRecoveryApplication:
-    """Run the three durable Workbench recovery passes in dependency order."""
+    """Retire legacy editor authority before recovering normal imports and publication."""
 
     def __init__(self, port: ArtifactRecoveryPort) -> None:
         self._port = port
 
     async def reconcile(self) -> WorkbenchRecoveryReport:
-        drafts = await self._port.recover_drafts()
-        mutations = await self._port.recover_mutations()
+        await self._port.retire_legacy_editor()
         resources = await self._port.recover_resources()
         return WorkbenchRecoveryReport(
-            drafts=dict(drafts),
-            mutations=dict(mutations),
             resources=dict(resources),
         )
 
@@ -1008,7 +1101,6 @@ class ArtifactWorkbench:
     documents: DocumentWorkspace
     revisions: RevisionHistory
     changes: ChangeHistory
-    edit_sessions: DocumentEditSession
     source: DocumentSource
     prompt_annotations: PromptAnnotationApplication
     resources: WorkbenchResourceApplication
