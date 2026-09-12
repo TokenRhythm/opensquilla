@@ -92,6 +92,7 @@ def _channel_error() -> Iterator[None]:
             details={"fields": details} if details else None,
         ) from exc
 
+
 log = structlog.get_logger(__name__)
 
 _d = get_dispatcher()
@@ -143,9 +144,7 @@ class _GatewayProviderProbeRuntime:
         self._config = config
         self._usage_event_sink = usage_event_sink
 
-    async def probe_primary(
-        self, command: ProbePrimaryProvider
-    ) -> ProviderProbePayload:
+    async def probe_primary(self, command: ProbePrimaryProvider) -> ProviderProbePayload:
         return cast(
             "ProviderProbePayload",
             await _probe_primary_provider(
@@ -163,9 +162,7 @@ class _GatewayProviderProbeRuntime:
             await _discover_primary_models(command, config=self._config),
         )
 
-    async def discover_image_models(
-        self, provider_id: str
-    ) -> ImageModelDiscoveryResult:
+    async def discover_image_models(self, provider_id: str) -> ImageModelDiscoveryResult:
         return cast(
             "ImageModelDiscoveryResult",
             await _discover_image_models(provider_id),
@@ -227,9 +224,7 @@ class _GatewayProfileProbeRuntime:
         self._connection_id = connection_id
         self._usage_event_sink = usage_event_sink
 
-    async def probe_saved(
-        self, command: ProfileProbeCommand
-    ) -> ProviderProbePayload:
+    async def probe_saved(self, command: ProfileProbeCommand) -> ProviderProbePayload:
         return cast(
             "ProviderProbePayload",
             await _probe_saved_profile(
@@ -240,9 +235,7 @@ class _GatewayProfileProbeRuntime:
             ),
         )
 
-    async def probe_draft(
-        self, command: ProfileProbeCommand
-    ) -> ProviderProbePayload:
+    async def probe_draft(self, command: ProfileProbeCommand) -> ProviderProbePayload:
         return cast(
             "ProviderProbePayload",
             await _probe_draft_profile(
@@ -253,9 +246,7 @@ class _GatewayProfileProbeRuntime:
             ),
         )
 
-    async def discover_saved(
-        self, command: ProfileProbeCommand
-    ) -> ProviderModelDiscoveryResult:
+    async def discover_saved(self, command: ProfileProbeCommand) -> ProviderModelDiscoveryResult:
         return cast(
             "ProviderModelDiscoveryResult",
             await _discover_saved_profile_models(
@@ -265,9 +256,7 @@ class _GatewayProfileProbeRuntime:
             ),
         )
 
-    async def discover_draft(
-        self, command: ProfileProbeCommand
-    ) -> ProviderModelDiscoveryResult:
+    async def discover_draft(self, command: ProfileProbeCommand) -> ProviderModelDiscoveryResult:
         return cast(
             "ProviderModelDiscoveryResult",
             await _discover_draft_profile_models(
@@ -322,15 +311,11 @@ async def _models_discover(params: Any, ctx: RpcContext) -> dict[str, Any]:
     )
 
 
-async def _image_generation_models_discover(
-    params: Any, ctx: RpcContext
-) -> dict[str, Any]:
+async def _image_generation_models_discover(params: Any, ctx: RpcContext) -> dict[str, Any]:
 
     return cast(
         dict[str, Any],
-        await _provider_setup(ctx).discover_image_models(
-            str(_require(params, "providerId"))
-        ),
+        await _provider_setup(ctx).discover_image_models(str(_require(params, "providerId"))),
     )
 
 
@@ -370,23 +355,17 @@ async def _llm_profile_draft_probe(params: Any, ctx: RpcContext) -> dict[str, An
     )
 
 
-async def _llm_profile_models_discover(
-    params: Any, ctx: RpcContext
-) -> dict[str, Any]:
+async def _llm_profile_models_discover(params: Any, ctx: RpcContext) -> dict[str, Any]:
     return cast(
         dict[str, Any],
         await _profile_lifecycle(ctx).discover_models(_profile_probe_command(params)),
     )
 
 
-async def _llm_profile_draft_models_discover(
-    params: Any, ctx: RpcContext
-) -> dict[str, Any]:
+async def _llm_profile_draft_models_discover(params: Any, ctx: RpcContext) -> dict[str, Any]:
     return cast(
         dict[str, Any],
-        await _profile_lifecycle(ctx).discover_draft_models(
-            _profile_probe_command(params)
-        ),
+        await _profile_lifecycle(ctx).discover_draft_models(_profile_probe_command(params)),
     )
 
 
@@ -461,9 +440,9 @@ def _request_changes_active_provider_connection(params: Any, cfg: Any) -> bool:
         canonical_tokenrhythm_base_url,
     )
 
-    requested_provider = str(
-        params.get("providerId") or getattr(llm, "provider", "") or ""
-    ).strip().lower()
+    requested_provider = (
+        str(params.get("providerId") or getattr(llm, "provider", "") or "").strip().lower()
+    )
 
     comparisons = (
         ("apiKey", "api_key"),
@@ -514,9 +493,7 @@ async def _provider_configure(params: Any, ctx: RpcContext) -> dict[str, Any]:
             proxy=str(_param(params, "proxy", "")),
             preset_id=str(_param(params, "presetId", "")),
             router_action=str(_param(params, "routerAction", "preserve")),
-            image_generation_intent=str(
-                _param(params, "imageGenerationIntent", "preserve")
-            ),
+            image_generation_intent=str(_param(params, "imageGenerationIntent", "preserve")),
         )
         result = await _provider_setup(ctx).configure_primary(command)
     return cast(dict[str, Any], result.to_payload())
@@ -600,9 +577,7 @@ async def _llm_profile_active_remove(params: Any, ctx: RpcContext) -> dict[str, 
     replacement_provider_id = str(_require(params, "replacementProviderId"))
     replacement_model = str(_param(params, "replacementModel", "") or "")
     router_action = str(_param(params, "routerAction", "preserve"))
-    image_generation_intent = str(
-        _param(params, "imageGenerationIntent", "preserve")
-    )
+    image_generation_intent = str(_param(params, "imageGenerationIntent", "preserve"))
     try:
         result = await _profile_lifecycle(ctx).remove_active(
             RemoveActiveProfile(
@@ -615,12 +590,8 @@ async def _llm_profile_active_remove(params: Any, ctx: RpcContext) -> dict[str, 
         )
     except LlmProfileActivationError as exc:
         code_by_reason = {
-            "primary_pool_unsupported": (
-                "onboarding.llmProfile.primary_pool_unsupported"
-            ),
-            "router_provider_conflict": (
-                "onboarding.llmProfile.router_provider_conflict"
-            ),
+            "primary_pool_unsupported": ("onboarding.llmProfile.primary_pool_unsupported"),
+            "router_provider_conflict": ("onboarding.llmProfile.router_provider_conflict"),
         }
         raise RpcHandlerError(
             code_by_reason.get(exc.reason, "onboarding.llmProfile.invalid"),
@@ -679,12 +650,8 @@ async def _llm_profile_activate(params: Any, ctx: RpcContext) -> dict[str, Any]:
         )
     except LlmProfileActivationError as exc:
         code_by_reason = {
-            "primary_pool_unsupported": (
-                "onboarding.llmProfile.primary_pool_unsupported"
-            ),
-            "router_provider_conflict": (
-                "onboarding.llmProfile.router_provider_conflict"
-            ),
+            "primary_pool_unsupported": ("onboarding.llmProfile.primary_pool_unsupported"),
+            "router_provider_conflict": ("onboarding.llmProfile.router_provider_conflict"),
         }
         code = code_by_reason.get(exc.reason, "onboarding.llmProfile.invalid")
         details = {
@@ -1020,7 +987,7 @@ async def _probe_primary_provider(
     config: Any,
     usage_event_sink: Any,
 ) -> dict[str, Any]:
-    """Live one-token probe of a candidate provider config (nothing is saved)."""
+    """Live probe of a candidate provider config without saving it."""
     provider_id = command.provider_id
     cfg = config
     api_key = str(command.api_key or "")
@@ -1061,19 +1028,42 @@ async def _probe_primary_provider(
         if not proxy:
             proxy = str(getattr(cfg.llm, "proxy", "") or "")
     model = str(command.model or "")
+    allow_default_api_key_env = not same_provider or reuse_stored_credentials
     with _validation_error("onboarding.provider.invalid"):
-        result = await _usage_accounted_provider_probe(
-            usage_event_sink,
-            provider_id=str(provider_id),
-            model=model,
-            api_key=api_key,
-            api_key_env=api_key_env,
-            base_url=base_url,
-            proxy=proxy,
-            allow_default_api_key_env=(
-                not same_provider or reuse_stored_credentials
-            ),
-        )
+        if model.strip():
+            result = await _usage_accounted_provider_probe(
+                usage_event_sink,
+                provider_id=str(provider_id),
+                model=model,
+                api_key=api_key,
+                api_key_env=api_key_env,
+                base_url=base_url,
+                proxy=proxy,
+                allow_default_api_key_env=allow_default_api_key_env,
+            )
+        else:
+            # A model is unnecessary for an endpoint/credential connectivity
+            # check; model discovery exercises that path without a chat turn.
+            from opensquilla.onboarding.probe import (
+                ProviderProbeResult,
+                discover_provider_models,
+            )
+
+            listing = await discover_provider_models(
+                provider_id=str(provider_id),
+                api_key=api_key,
+                api_key_env=api_key_env,
+                base_url=base_url,
+                proxy=proxy,
+                allow_default_api_key_env=allow_default_api_key_env,
+            )
+            result = ProviderProbeResult(
+                ok=listing.ok,
+                provider_id=str(provider_id),
+                model="",
+                failure_kind=listing.failure_kind,
+                message=listing.detail,
+            )
     saved_model = str(getattr(cfg.llm, "model", "") or "").strip()
     if (
         same_provider
@@ -1193,13 +1183,9 @@ async def _discover_primary_models(
             api_key_env=api_key_env,
             base_url=base_url,
             proxy=proxy,
-            allow_default_api_key_env=(
-                not same_provider or reuse_stored_credentials
-            ),
+            allow_default_api_key_env=(not same_provider or reuse_stored_credentials),
             force_refresh=force_refresh,
-            persist_catalog=(
-                same_provider and reuse_stored_credentials and not request_overrides
-            ),
+            persist_catalog=(same_provider and reuse_stored_credentials and not request_overrides),
             catalog_config=cfg,
         )
     return result.to_payload()
@@ -1302,9 +1288,7 @@ async def _channel_probe(params: Any, ctx: RpcContext) -> dict[str, Any]:
         "probeKind": "local_validation",
         "restartRequired": True,
         "entry": redact_channel_entry(type_name, normalized),
-        "warnings": [
-            "Configuration is locally valid; no provider connection was attempted."
-        ],
+        "warnings": ["Configuration is locally valid; no provider connection was attempted."],
     }
 
 
@@ -1397,9 +1381,7 @@ async def _audio_configure(params: Any, ctx: RpcContext) -> dict[str, Any]:
 async def _capability_reset(params: Any, ctx: RpcContext) -> dict[str, Any]:
 
     with _validation_error("onboarding.capability.invalid"):
-        result = await _capability_setup(ctx).reset(
-            str(_require(params, "capabilityId"))
-        )
+        result = await _capability_setup(ctx).reset(str(_require(params, "capabilityId")))
     return cast(dict[str, Any], result.to_payload())
 
 
@@ -1537,9 +1519,7 @@ _PLATFORM_SETUP_IMPLEMENTATIONS = {
     "onboarding.llmProfile.probe": _llm_profile_probe,
     "onboarding.llmProfile.draft.probe": _llm_profile_draft_probe,
     "onboarding.llmProfile.models.discover": _llm_profile_models_discover,
-    "onboarding.llmProfile.draft.models.discover": (
-        _llm_profile_draft_models_discover
-    ),
+    "onboarding.llmProfile.draft.models.discover": (_llm_profile_draft_models_discover),
     "onboarding.router.configure": _router_configure,
     "onboarding.ensemble.configure": _ensemble_configure,
     "onboarding.search.configure": _search_configure,
