@@ -8,6 +8,8 @@ async API shape used by project call sites.
 from __future__ import annotations
 
 import asyncio
+import contextvars
+import functools
 import importlib
 import os
 import sqlite3
@@ -114,6 +116,32 @@ _native_available = _native_aiosqlite is not None
 _prefer_native: bool | None = None
 
 
+async def _run_locked[T](
+    lock: asyncio.Lock, func: Callable[..., T], *args: Any, **kwargs: Any
+) -> T:
+    """Keep the connection serialized until native work finishes, even on cancellation."""
+    await lock.acquire()
+    try:
+        context = contextvars.copy_context()
+        worker = asyncio.get_running_loop().run_in_executor(
+            None, functools.partial(context.run, func, *args, **kwargs)
+        )
+    except BaseException:
+        lock.release()
+        raise
+
+    def finished(result: asyncio.Future[T]) -> None:
+        lock.release()
+        # The caller may already have been cancelled; retrieve worker failures.
+        if not result.cancelled():
+            result.exception()
+
+    worker.add_done_callback(finished)
+    # A cancelled awaiter returns promptly, but cannot cancel the worker future
+    # or release its lock while SQLite is still using the connection/cursor.
+    return await asyncio.shield(worker)
+
+
 class _AsyncCursor:
     def __init__(self, cursor: sqlite3.Cursor, lock: asyncio.Lock) -> None:
         self._cursor = cursor
@@ -128,38 +156,30 @@ class _AsyncCursor:
         return self._cursor.lastrowid
 
     async def execute(self, sql: str, params: Iterable[Any] = ()) -> _AsyncCursor:
-        async with self._lock:
-            self._cursor = await asyncio.to_thread(self._cursor.execute, sql, tuple(params))
+        self._cursor = await _run_locked(self._lock, self._cursor.execute, sql, tuple(params))
         return self
 
     async def executemany(
         self, sql: str, seq_of_params: Iterable[Iterable[Any]]
     ) -> _AsyncCursor:
-        async with self._lock:
-            self._cursor = await asyncio.to_thread(
-                self._cursor.executemany,
-                sql,
-                cast(Any, seq_of_params),
-            )
+        self._cursor = await _run_locked(
+            self._lock, self._cursor.executemany, sql, cast(Any, seq_of_params)
+        )
         return self
 
     async def fetchone(self) -> Any:
-        async with self._lock:
-            return await asyncio.to_thread(self._cursor.fetchone)
+        return await _run_locked(self._lock, self._cursor.fetchone)
 
     async def fetchall(self) -> list[Any]:
-        async with self._lock:
-            return await asyncio.to_thread(self._cursor.fetchall)
+        return await _run_locked(self._lock, self._cursor.fetchall)
 
     async def fetchmany(self, size: int | None = None) -> list[Any]:
-        async with self._lock:
-            if size is None:
-                return await asyncio.to_thread(self._cursor.fetchmany)
-            return await asyncio.to_thread(self._cursor.fetchmany, size)
+        if size is None:
+            return await _run_locked(self._lock, self._cursor.fetchmany)
+        return await _run_locked(self._lock, self._cursor.fetchmany, size)
 
     async def close(self) -> None:
-        async with self._lock:
-            await asyncio.to_thread(self._cursor.close)
+        await _run_locked(self._lock, self._cursor.close)
 
     async def __aenter__(self) -> _AsyncCursor:
         return self
@@ -212,8 +232,7 @@ class _AsyncConnection:
         return self._conn.in_transaction
 
     async def _execute(self, sql: str, params: Iterable[Any] = ()) -> _AsyncCursor:
-        async with self._locked:
-            cursor = await asyncio.to_thread(self._conn.execute, sql, tuple(params))
+        cursor = await _run_locked(self._locked, self._conn.execute, sql, tuple(params))
         return _AsyncCursor(cursor, self._locked)
 
     def execute(self, sql: str, params: Iterable[Any] = ()) -> _CursorProxy:
@@ -222,45 +241,35 @@ class _AsyncConnection:
     async def _executemany(
         self, sql: str, seq_of_params: Iterable[Iterable[Any]]
     ) -> _AsyncCursor:
-        async with self._locked:
-            cursor = await asyncio.to_thread(
-                self._conn.executemany,
-                sql,
-                cast(Any, seq_of_params),
-            )
+        cursor = await _run_locked(
+            self._locked, self._conn.executemany, sql, cast(Any, seq_of_params)
+        )
         return _AsyncCursor(cursor, self._locked)
 
     def executemany(self, sql: str, seq_of_params: Iterable[Iterable[Any]]) -> _CursorProxy:
         return _CursorProxy(self._executemany(sql, seq_of_params))
 
     async def executescript(self, script: str) -> None:
-        async with self._locked:
-            await asyncio.to_thread(self._conn.executescript, script)
+        await _run_locked(self._locked, self._conn.executescript, script)
 
     async def commit(self) -> None:
-        async with self._locked:
-            await asyncio.to_thread(self._conn.commit)
+        await _run_locked(self._locked, self._conn.commit)
 
     async def rollback(self) -> None:
-        async with self._locked:
-            await asyncio.to_thread(self._conn.rollback)
+        await _run_locked(self._locked, self._conn.rollback)
 
     async def close(self) -> None:
-        async with self._locked:
-            await asyncio.to_thread(self._conn.close)
+        await _run_locked(self._locked, self._conn.close)
 
     async def cursor(self) -> _AsyncCursor:
-        async with self._locked:
-            cur = await asyncio.to_thread(self._conn.cursor)
+        cur = await _run_locked(self._locked, self._conn.cursor)
         return _AsyncCursor(cur, self._locked)
 
     async def enable_load_extension(self, enabled: bool) -> None:
-        async with self._locked:
-            await asyncio.to_thread(self._conn.enable_load_extension, enabled)
+        await _run_locked(self._locked, self._conn.enable_load_extension, enabled)
 
     async def load_extension(self, path: str) -> None:
-        async with self._locked:
-            await asyncio.to_thread(self._conn.load_extension, path)
+        await _run_locked(self._locked, self._conn.load_extension, path)
 
     async def create_function(
         self,
@@ -270,21 +279,20 @@ class _AsyncConnection:
         *,
         deterministic: bool = False,
     ) -> None:
-        async with self._locked:
-            await asyncio.to_thread(
-                self._conn.create_function,
-                name,
-                num_params,
-                func,
-                deterministic=deterministic,
-            )
+        await _run_locked(
+            self._locked,
+            self._conn.create_function,
+            name,
+            num_params,
+            func,
+            deterministic=deterministic,
+        )
 
     async def set_trace_callback(
         self,
         handler: Callable[[str], Any] | None,
     ) -> None:
-        async with self._locked:
-            await asyncio.to_thread(self._conn.set_trace_callback, handler)
+        await _run_locked(self._locked, self._conn.set_trace_callback, handler)
 
     async def __aenter__(self) -> _AsyncConnection:
         return self
