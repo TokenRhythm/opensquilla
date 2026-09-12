@@ -16,6 +16,7 @@ def test_receipt_round_trip(tmp_path: Path) -> None:
         entrypoints=["/x/bin/opensquilla"],
         owned_paths=["/x/tools/opensquilla"],
         data_root=str(tmp_path),
+        source_commit_id="0123456789abcdef0123456789abcdef01234567",
     )
     write_receipt(payload, home=tmp_path)
     loaded = read_receipt(tmp_path)

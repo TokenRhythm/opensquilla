@@ -27,7 +27,7 @@ const names = [
   'publishVerifiedWindowsInstaller', 'restoreWindowsUpdateCache', 'revalidateReadyWindowsInstaller',
   'activeDesktopUpdateSnoozeFor', 'clearDesktopUpdateSnoozeIfVersionChanged',
   'desktopUpdateSnapshot', 'publishDesktopUpdateState', 'setDesktopUpdateState', 'dismissDesktopUpdate',
-  'classifyDesktopUpdateError', 'desktopUpdateErrorMessage', 'showUpdateError', 'downloadDesktopUpdate',
+  'classifyDesktopUpdateError', 'classifyDesktopUpdateTelemetryError', 'desktopUpdateErrorMessage', 'showUpdateError', 'downloadDesktopUpdate',
   'desktopUpdateCheckAllowed', 'runDesktopUpdateCheck', 'checkForUpdates', 'applyWindowsInstaller',
 ]
 for (const name of names) assert.ok(declarations.has(name), `production function ${name} must exist`)
@@ -78,6 +78,12 @@ async function fixture(options = {}) {
   const signature = { error: null, hold: null, entered: null }
   const download = { hold: null, entered: null }
   const globals = {
+    desktopReliabilityTelemetry: {
+      recordUpdateResult: (event) => { (calls.telemetry ??= []).push(event) },
+      markUpdateHandoff: (version) => { (calls.handoffs ??= []).push(version); return true },
+      clearUpdateHandoff: () => { calls.handoffClears = (calls.handoffClears || 0) + 1 },
+      finishSession() {},
+    },
     process: { platform: options.platform ?? 'win32', arch: 'x64', env: { OPENSQUILLA_DESKTOP_ENABLE_WIN_INSTALL: '0' } },
     join, stat, setTimeout, setImmediate, AbortController,
     UpdateCheckScheduler, isUpdateCheckAllowed, WindowsUpdateSecurityError, WindowsUpdateHandoffError,
@@ -251,6 +257,10 @@ try {
       await f.subject.checkForUpdates(true)
       assert.equal(f.calls.channel, 1)
       assert.notEqual(f.state().status, 'downloaded')
+      const telemetry = f.calls.telemetry.filter(event => event.updateStage === 'check')
+      assert.equal(telemetry.length, 1)
+      assert.equal(telemetry[0].outcome, 'fail')
+      assert.equal(telemetry[0].errorCode, 'integrity_failed')
       assert.equal(f.context.verifiedManualInstallerPath, null)
       await mustNotApplyOldInstaller(f)
     })

@@ -1685,8 +1685,13 @@
     },
     "privacy": {
       "statusDisabledByEnv": "Durch eine Umgebungseinstellung deaktiviert.",
-      "networkReportingLabel": "Diagnose und Updates",
-      "networkReportingDesc": "Begrenzte Produktdiagnosedaten senden und nach Updates suchen. Gesprächsinhalte, Dateien und Inhalte von Modellanfragen werden nicht hochgeladen."
+      "statusNotChosen": "Es wurde noch keine Auswahl gespeichert. Bis zur Aktivierung werden keine Daten gesendet.",
+      "reliabilityDiagnosticsLabel": "Stabilitätsdiagnose",
+      "reliabilityDiagnosticsDesc": "Teilen Sie Vorgangsergebnisse, Laufzeiten und datenschutzfreundliche Fehlerfingerabdrücke, um Abstürze und Fehler zu diagnostizieren. Gesprächs- und Dateiinhalte sind nie enthalten.",
+      "productAnalyticsLabel": "Produkt- und Wachstumsanalyse",
+      "productAnalyticsDesc": "Teilen Sie Aktivierungsmeilensteine und die Anzahl tatsächlich gestarteter MetaSkill- und Programmiermodus-Ausführungen, um Konversion und Funktionsnutzung zu messen. Gesprächsinhalte, Aufgabenparameter, Dateien und rohe Konto-IDs werden nie einbezogen; verwendet wird eine zufällige, zweckgebundene Analysekennung.",
+      "networkReportingLabel": "Hauptschalter für Netzwerkdiagnosen",
+      "networkReportingDesc": "Zentrale Steuerung für Netzwerkdiagnosen, Analysen und Update-Prüfungen. Das Ausschalten überschreibt beide Optionen darunter."
     },
     "toast": {
       "loadFailed": "Einstellungen konnten nicht geladen werden: {error}",

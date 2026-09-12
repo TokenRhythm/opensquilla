@@ -234,7 +234,10 @@ async def test_config_apply_preserves_redacted_memory_remote_secrets(tmp_path):
     assert apply_res.error is None, apply_res.error
     _assert_memory_remote_secrets_preserved(cfg, config_path)
     persisted = tomllib.loads(config_path.read_text(encoding="utf-8"))
-    assert "network_observability_disabled_effective" not in persisted.get("privacy", {})
+    persisted_privacy = persisted.get("privacy", {})
+    assert "network_observability_disabled_effective" not in persisted_privacy
+    assert "reliability_diagnostics_forced_off" not in persisted_privacy
+    assert "product_analytics_forced_off" not in persisted_privacy
 
 
 @pytest.mark.asyncio

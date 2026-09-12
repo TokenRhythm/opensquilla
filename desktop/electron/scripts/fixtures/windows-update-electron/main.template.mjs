@@ -163,6 +163,13 @@ async function launchWindowsInstaller() {
   desktopLog('synthetic_spawn_succeeded', { executable })
 }
 
+const desktopReliabilityTelemetry = {
+  recordUpdateResult() {},
+  markUpdateHandoff() { return true },
+  clearUpdateHandoff() {},
+  finishSession() {},
+}
+
 // PRODUCTION_DECLARATIONS
 
 protocol.registerSchemesAsPrivileged([{ scheme: 'opensquilla-app', privileges: { standard: true, secure: true, supportFetchAPI: true } }])

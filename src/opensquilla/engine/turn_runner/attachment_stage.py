@@ -36,6 +36,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 from opensquilla.provider.request_proof import estimate_provider_media_tokens
+from opensquilla.telemetry.file_parse_facts import FileParseReliabilityFacts
 from opensquilla.token_estimation import estimate_attachment_text_tokens
 
 if TYPE_CHECKING:
@@ -254,6 +255,7 @@ class AttachmentStageOutput:
     extra_messages: list[Any] | None
     turn_input: str
     stats: AttachmentMaterializationStats
+    file_parse_facts: tuple[FileParseReliabilityFacts, ...] = ()
 
 
 class AttachmentStage:
@@ -321,7 +323,12 @@ class AttachmentStage:
             deadline_at_monotonic=deadline_at_monotonic
         )
 
-        def _prepare() -> tuple[list[Any] | None, AttachmentMaterializationStats]:
+        def _prepare() -> tuple[
+            list[Any] | None,
+            AttachmentMaterializationStats,
+            tuple[FileParseReliabilityFacts, ...],
+        ]:
+            file_parse_facts: list[FileParseReliabilityFacts] = []
             image_kwargs = (
                 {
                     "persist_image_material": inp.persist_image_material,
@@ -331,14 +338,25 @@ class AttachmentStage:
             )
             build_cancellable = getattr(self._builder, "build_cancellable", None)
             if callable(build_cancellable):
-                extra = build_cancellable(
-                    inp.effective_runtime_message,
-                    attachments,
-                    workspace_dir=inp.workspace_dir,
-                    session_id=inp.session_id,
-                    cancel_check=control.check,
-                    **image_kwargs,
-                )
+                if getattr(self._builder, "supports_file_parse_facts", False) is True:
+                    extra = build_cancellable(
+                        inp.effective_runtime_message,
+                        attachments,
+                        workspace_dir=inp.workspace_dir,
+                        session_id=inp.session_id,
+                        cancel_check=control.check,
+                        **image_kwargs,
+                        file_parse_fact_sink=file_parse_facts.append,
+                    )
+                else:
+                    extra = build_cancellable(
+                        inp.effective_runtime_message,
+                        attachments,
+                        workspace_dir=inp.workspace_dir,
+                        session_id=inp.session_id,
+                        cancel_check=control.check,
+                        **image_kwargs,
+                    )
             else:
                 extra = self._builder.build(
                     inp.effective_runtime_message,
@@ -355,7 +373,7 @@ class AttachmentStage:
                     0, inp.generated_normalization_attachment_count
                 ),
             )
-            return extra, stats
+            return extra, stats, tuple(file_parse_facts)
 
         try:
             await asyncio.wait_for(
@@ -403,7 +421,7 @@ class AttachmentStage:
                 inp.failure_cleanup()
 
         try:
-            extra_messages, stats = await asyncio.wait_for(
+            extra_messages, stats, file_parse_facts = await asyncio.wait_for(
                 asyncio.shield(future),
                 timeout=remaining_seconds,
             )
@@ -431,5 +449,6 @@ class AttachmentStage:
                 extra_messages=extra_messages,
                 turn_input=turn_input,
                 stats=stats,
+                file_parse_facts=file_parse_facts,
             )
         )

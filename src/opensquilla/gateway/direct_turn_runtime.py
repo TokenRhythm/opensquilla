@@ -130,6 +130,7 @@ async def run_direct_turn(
     publish: Callable[[str, str, dict[str, Any]], Awaitable[None]],
     normalize_terminal: Callable[[str, dict[str, Any]], dict[str, Any]],
     session_model: Callable[[SessionNode, str], str | None],
+    tui_connection: bool = False,
 ) -> None:
     """Stream one committed turn; acceptance and persistence belong to the caller."""
 
@@ -252,6 +253,7 @@ async def run_direct_turn(
             default_elevated=configured_default_elevated(config),
         )
         pin_sandbox_policy(tool_ctx, config)
+        from opensquilla.telemetry.contracts.common import ClientSurface, ExecutionMode
         raw_stream = runner.run(
             provider_message,
             session_key,
@@ -266,6 +268,8 @@ async def run_direct_turn(
             semantic_message=semantic_message,
             fresh_user_session=fresh_user_session,
             root_turn_id=turn_id,
+            telemetry_surface=ClientSurface.TUI if tui_connection else None,
+            telemetry_execution_mode=ExecutionMode.GATEWAY if tui_connection else None,
             **owner_kwargs(runner.run),
         )
         raw_idle_timeout = effective_agent_stream_idle_timeout_seconds(config)

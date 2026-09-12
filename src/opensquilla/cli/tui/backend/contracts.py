@@ -201,6 +201,10 @@ async def _noop_steer_active_turn(_text: str) -> bool:
     return False
 
 
+async def _noop_surface_ready() -> None:
+    return None
+
+
 @dataclass(frozen=True)
 class TuiRuntimeHooks:
     """Adapter-provided hooks for runtime side effects."""
@@ -214,6 +218,7 @@ class TuiRuntimeHooks:
     notice: Callable[[str], None] | None = None
     on_cancel_active_turn: Callable[[], Awaitable[None]] = _noop_cancel_active_turn
     on_steer_active_turn: Callable[[str], Awaitable[bool]] = _noop_steer_active_turn
+    on_surface_ready: Callable[[], Awaitable[None]] = _noop_surface_ready
     expose_surface: Callable[[TuiSurface], None] | None = None
     clear_exposed_surface: Callable[[], None] | None = None
 
