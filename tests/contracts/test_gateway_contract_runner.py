@@ -499,7 +499,7 @@ def test_compatibility_manifest_is_schema_derived_and_deterministic() -> None:
         "generatorSha256": runner._generator_digest(),
     }
     assert Counter(entry["lifecycle"] for entry in manifest["methods"]) == {
-        "stable": 205,
+        "stable": 207,
         "legacy": 3,
     }
     assert {
