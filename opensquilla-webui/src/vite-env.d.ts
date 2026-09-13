@@ -3,6 +3,7 @@
 import type {
   ArtifactNativeOpenResult,
   ArtifactOpenRequest,
+  PlatformFilesApi,
   DesktopMainWindowCloseBehavior,
   DesktopGatewayConnection,
   DesktopPreferences,
@@ -93,6 +94,8 @@ declare global {
     abandonCleanupTransaction?: () => Promise<unknown>
     setNativeTheme?: (payload: { source: 'light' | 'dark' | 'system' }) => Promise<unknown>
     openArtifact: (payload: ArtifactOpenRequest) => Promise<ArtifactNativeOpenResult>
+    saveArtifact?: PlatformFilesApi['saveArtifact']
+    sourceFileAction?: PlatformFilesApi['sourceFileAction']
     chooseProjectDirectory: (
       request?: ProjectDirectoryPickerRequest,
     ) => Promise<{ path: string } | null>
