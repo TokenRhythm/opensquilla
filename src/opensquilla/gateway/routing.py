@@ -619,6 +619,7 @@ def tool_context_from_envelope(
             envelope.metadata.get("sandbox_mounts")
         )
     generated_artifact_adopter = envelope.runtime_services.get("generated_artifact_adopter")
+    workspace_preview_opener = envelope.runtime_services.get("workspace_preview_opener")
     desktop_browser = None
     if (
         caller_kind is CallerKind.WEB
@@ -707,7 +708,20 @@ def tool_context_from_envelope(
             envelope.runtime_services.get("turn_cleanup_callbacks") or ()
         ),
         session_id=envelope.session_id,
+        workspace_preview_opener=(
+            workspace_preview_opener
+            if callable(workspace_preview_opener)
+            and caller_kind is CallerKind.WEB
+            and envelope.source_kind is SourceKind.WEB
+            and interaction_mode is InteractionMode.INTERACTIVE
+            and is_owner
+            and not guest_safe
+            else None
+        ),
     )
+    scopes = envelope.runtime_services.get("workspace_preview_scopes")
+    if isinstance(scopes, list):
+        ctx.workspace_preview_scopes = [dict(item) for item in scopes if isinstance(item, dict)]
     if sandbox_run_context_fresh:
         # Runtime-only authority marker copied from the RouteEnvelope field,
         # never from mutable metadata. Execution-time workspace validation is

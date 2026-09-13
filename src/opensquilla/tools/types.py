@@ -239,6 +239,10 @@ class ToolContext:
 
     desktop_browser: Any | None = field(default=None, repr=False)
     artifact_source_paths: dict[str, ArtifactSource] = field(default_factory=dict, repr=False)
+    workspace_preview_opener: Callable[..., Awaitable[dict[str, Any]]] | None = field(
+        default=None, repr=False,
+    )
+    workspace_preview_scopes: list[dict[str, str]] = field(default_factory=list, repr=False)
 
     def __post_init__(self) -> None:
         self.validate_path_roots()

@@ -21,6 +21,7 @@ from opensquilla.artifacts import (
     ArtifactRef,
     ArtifactSource,
     ArtifactStore,
+    _read_regular_bundle_file,
     artifact_bundle_manifest,
     collect_artifact_bundle,
 )
@@ -106,10 +107,13 @@ class WorkingFiles:
             return checked_path(Path(self.workspace), self.source_path)
         return checked_path(self.root, self.entrypoint)
 
-    def bundle(self) -> ArtifactBundle:
+    def bundle(self, *, read_guard: Callable[[Path], None] | None = None) -> ArtifactBundle:
         if self.source_path is not None and self.bundle_mode == "none":
+            entry = self.entry
+            if read_guard is not None:
+                read_guard(entry)
             return ArtifactBundle(entrypoint=self.entrypoint, files=(ArtifactBundleSourceFile(
-                path=self.entrypoint, mime=self.entry_mime, data=self.entry.read_bytes(),
+                path=self.entrypoint, mime=self.entry_mime, data=_read_regular_bundle_file(entry),
             ),))
         bundle = collect_artifact_bundle(
             self.entry,
@@ -117,6 +121,7 @@ class WorkingFiles:
             mode=self.bundle_mode or "directory",
             bundle_root=(self.root if self.bundle_mode in {None, "directory"} else None),
             entry_mime=self.entry_mime,
+            read_guard=read_guard,
         )
         if bundle is None:
             raise ArtifactValidationError("Working document has no HTML entrypoint")

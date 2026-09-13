@@ -154,4 +154,6 @@ def test_tool_context_appends_new_runtime_fields_after_legacy_fields() -> None:
         "image_analysis_target",
         "desktop_browser",
         "artifact_source_paths",
+        "workspace_preview_opener",
+        "workspace_preview_scopes",
     ]
