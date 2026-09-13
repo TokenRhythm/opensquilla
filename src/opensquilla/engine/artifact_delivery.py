@@ -36,8 +36,6 @@ log = logging.getLogger(__name__)
 _DELIVERABLE_SUFFIXES = frozenset(
     {
         ".csv",
-        ".htm",
-        ".html",
         ".json",
         ".pdf",
         ".pptx",
@@ -255,19 +253,48 @@ def _published_artifact_keys(
     }
 
 
+def _is_registered_preview_path(
+    target: Path, *, workspace: Path, scopes: list[dict[str, str]],
+) -> bool:
+    """Keep ordinary webpage sources out of the implicit delivery backstop."""
+    for scope in scopes:
+        try:
+            if Path(scope.get("workspace", "")).resolve() != workspace:
+                continue
+            source = (workspace / scope["source_path"]).resolve()
+            mode = scope.get("bundle_mode", "auto")
+            if target == source:
+                return True
+            # Only an explicitly selected directory grants a subtree scope.
+            # Auto-discovered dependencies must not suppress unrelated PDFs.
+            if mode == "directory" and scope.get("bundle_root"):
+                root = (workspace / scope["bundle_root"]).resolve()
+                if (
+                    root != workspace
+                    and root.is_relative_to(workspace)
+                    and target.is_relative_to(root)
+                ):
+                    return True
+        except (KeyError, OSError, RuntimeError, ValueError):
+            continue
+    return False
+
+
 def auto_publish_omitted_workspace_artifacts(
     ctx: ToolContext | None,
     *,
     final_text: str,
     attached_plan_run_ready: bool | None = None,
 ) -> OmittedArtifactPublishResult:
-    """Publish deliverable files the model wrote but forgot to publish.
+    """Publish non-web deliverables the model wrote but forgot to publish.
 
     This is intentionally conservative: a file must be written through a tracked
-    workspace file tool during the current turn, have a deliverable suffix, and
-    be named in the assistant's final text. Attached PlanRuns additionally
-    require live delivery-ready authorization resolved before entering this
-    blocking filesystem phase.
+    workspace file tool during the current turn, have a non-web deliverable
+    suffix, and be named in the assistant's final text. HTML source files are
+    preview/workspace material and require an explicit ``publish_artifact``
+    call for delivery. Attached PlanRuns additionally require live
+    delivery-ready authorization resolved before entering this blocking
+    filesystem phase.
     """
 
     if ctx is None:
@@ -313,6 +340,11 @@ def auto_publish_omitted_workspace_artifacts(
             # files are tracked for diagnostics and are not deliverables.
             continue
         target = Path(str(record.get("path") or "")).expanduser().resolve(strict=False)
+        if _is_registered_preview_path(
+            target, workspace=workspace,
+            scopes=ctx.workspace_preview_scopes,
+        ):
+            continue
         if str(target) in seen_paths:
             continue
         seen_paths.add(str(target))

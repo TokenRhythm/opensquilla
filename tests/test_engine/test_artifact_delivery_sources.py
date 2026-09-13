@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 from collections.abc import Iterator
@@ -67,10 +66,32 @@ async def test_custom_name_publication_satisfies_same_source_backstop(
     assert [item["id"] for item in ctx.published_artifacts] == [explicit["artifact"]["id"]]
 
 
+async def test_unregistered_html_sources_are_not_auto_published(
+    artifact_context: ToolContext,
+) -> None:
+    ctx = artifact_context
+    workspace = Path(ctx.workspace_dir)
+    with _active_context(ctx):
+        await write_file("site/index.html", "<h1>Home</h1>")
+        await write_file("site/about.html", "<h1>About</h1>")
+
+    result = auto_publish_omitted_workspace_artifacts(
+        ctx,
+        final_text="Created site/index.html and site/about.html",
+    )
+
+    assert result.artifacts == []
+    assert result.failure_summaries == []
+    assert ctx.published_artifacts == []
+    assert (workspace / "site/index.html").is_file()
+    assert (workspace / "site/about.html").is_file()
+
+
 async def test_failed_publication_of_rewritten_source_does_not_suppress_new_bytes(
     artifact_context: ToolContext,
 ) -> None:
     ctx = artifact_context
+    workspace = Path(ctx.workspace_dir)
     first_bytes = "<html><title>Version 1</title></html>"
     second_bytes = "<html><title>Version 2</title></html>"
     with _active_context(ctx):
@@ -88,17 +109,14 @@ async def test_failed_publication_of_rewritten_source_does_not_suppress_new_byte
     result = auto_publish_omitted_workspace_artifacts(ctx, final_text="Updated index.html")
 
     assert result.failure_summaries == []
-    assert len(result.artifacts) == 1
-    latest = result.artifacts[0]
-    assert latest["id"] != first["artifact"]["id"]
-    assert latest["sha256"] == hashlib.sha256(second_bytes.encode()).hexdigest()
+    assert result.artifacts == []
+    assert [item["id"] for item in ctx.published_artifacts] == [first["artifact"]["id"]]
     store = ArtifactStore(ctx.artifact_media_root)
     _, old_path = store.resolve_for_download(
         first["artifact"]["id"], session_id=ctx.artifact_session_id,
     )
-    _, new_path = store.resolve_for_download(latest["id"], session_id=ctx.artifact_session_id)
     assert old_path.read_bytes() == first_bytes.encode()
-    assert new_path.read_bytes() == second_bytes.encode()
+    assert (workspace / "index.html").read_bytes() == second_bytes.encode()
 
 
 @pytest.mark.parametrize("same_inode", [False, True], ids=["copied-bytes", "hardlink"])
@@ -125,8 +143,8 @@ async def test_same_bytes_at_a_different_source_still_need_delivery(
     result = auto_publish_omitted_workspace_artifacts(ctx, final_text="Created a.html and b.html")
 
     assert result.failure_summaries == []
-    assert [item["name"] for item in result.artifacts] == ["b.html"]
-    assert len(ctx.published_artifacts) == 2
+    assert result.artifacts == []
+    assert len(ctx.published_artifacts) == 1
 
 
 def _symlink_or_skip(link: Path, target: Path) -> None:
@@ -177,7 +195,7 @@ async def test_rejected_outside_source_cannot_suppress_workspace_delivery(
     assert ctx.published_artifacts == []
     result = auto_publish_omitted_workspace_artifacts(ctx, final_text="Created index.html")
 
-    assert [item["name"] for item in result.artifacts] == ["index.html"]
+    assert result.artifacts == []
     assert result.failure_summaries == []
 
 
@@ -245,7 +263,7 @@ async def test_posix_native_case_behavior_preserves_source_identity(
     )
 
     assert result.failure_summaries == []
-    assert [item["name"] for item in result.artifacts] == ([] if case_insensitive else [lower.name])
+    assert result.artifacts == []
 
 
 @pytest.mark.parametrize("name", [None, "旅游攻略.html"], ids=["default-name", "custom-name"])
@@ -275,18 +293,8 @@ async def test_changed_bundle_sidecar_does_not_count_as_already_delivered(
     result = auto_publish_omitted_workspace_artifacts(ctx, final_text="Updated index.html")
 
     assert result.failure_summaries == []
-    assert len(result.artifacts) == 1
-    fallback = result.artifacts[0]
-    assert fallback["id"] != old_id
-    assert fallback["sha256"] == explicit["artifact"]["sha256"]
-    # The existing backstop delivers the entry file, not a rebuilt bundle.
-    assert store.describe_preview_bundle(
-        fallback["id"], session_id=ctx.artifact_session_id,
-    ) is None
-    _, fallback_path = store.resolve_for_download(
-        fallback["id"], session_id=ctx.artifact_session_id,
-    )
-    assert fallback_path.read_text(encoding="utf-8") == entry
+    assert result.artifacts == []
+    assert [item["id"] for item in ctx.published_artifacts] == [old_id]
     old_style = store.resolve_preview_resource(
         old_id, session_id=ctx.artifact_session_id, logical_path="style.css",
     )
@@ -317,5 +325,5 @@ async def test_case_only_hardlinks_remain_distinct_sources_on_case_sensitive_fil
     result = auto_publish_omitted_workspace_artifacts(ctx, final_text="Created A.html and a.html")
 
     assert result.failure_summaries == []
-    assert [item["name"] for item in result.artifacts] == ["a.html"]
-    assert len(ctx.published_artifacts) == 2
+    assert result.artifacts == []
+    assert len(ctx.published_artifacts) == 1
