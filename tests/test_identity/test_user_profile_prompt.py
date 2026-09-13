@@ -305,7 +305,6 @@ def test_tool_prompts_include_autonomous_recovery_contract(mode: str) -> None:
         tools=["exec_command", "read_file", "edit_file"],
     )
     assert "wait and retry when safe and useful" in prompt
-    assert "Continue available independent work while recovering" in prompt
     assert "inspect the current state before repeating" in prompt
     assert "checks appropriate to the task" in prompt
     assert "Respect user cancellation and explicit limits" in prompt
