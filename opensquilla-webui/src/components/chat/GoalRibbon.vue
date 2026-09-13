@@ -78,7 +78,7 @@
       </div>
       <span v-if="!editing" ref="actionsRef" class="goal-ribbon__actions">
         <span
-          v-if="goal.status === 'complete'"
+          v-if="goal.status === 'complete' && !completeSettled"
           class="goal-ribbon__finalizing"
           role="status"
         >
@@ -86,7 +86,7 @@
           {{ t('chat.goal.finalizing') }}
         </span>
         <button
-          v-else
+          v-else-if="goal.status !== 'complete'"
           type="button"
           class="goal-ribbon__primary"
           :disabled="busy"
@@ -98,7 +98,7 @@
           {{ lifecycleLabel }}
         </button>
         <button
-          v-if="goal.status !== 'complete'"
+          v-if="completeMenuAvailable"
           ref="menuTrigger"
           type="button"
           class="goal-ribbon__menu-trigger"
@@ -208,6 +208,17 @@ type LifecycleAction = 'pause' | 'resume' | 'takeover'
 
 const goalHasUnsettledTask = computed(() => (
   props.goal.activeTaskId !== null || props.goal.executionState !== 'idle'
+))
+
+// A completed Goal only suppresses interactions while its final task is still
+// settling. Once idle, the overflow menu stays reachable so owners can edit
+// the objective or clear the completed Goal instead of the notice sticking
+// to the conversation forever (issue 1447).
+const completeSettled = computed(() => (
+  props.goal.status === 'complete' && !goalHasUnsettledTask.value
+))
+const completeMenuAvailable = computed(() => (
+  props.goal.status !== 'complete' || completeSettled.value
 ))
 
 const lifecycleAction = computed<LifecycleAction>(() => {
@@ -373,7 +384,7 @@ function focusMenuItem(position: 'first' | 'last') {
 }
 
 function openMenu(position: 'first' | 'last' = 'first') {
-  if (props.busy || props.goal.status === 'complete') return
+  if (props.busy || !completeMenuAvailable.value) return
   menuOpen.value = true
   void nextTick(() => focusMenuItem(position))
 }
