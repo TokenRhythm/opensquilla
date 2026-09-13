@@ -426,7 +426,7 @@ class AgentBootstrapStageOutput:
 
 
 def _allows_connection_recovery(inp: AgentBootstrapStageInput) -> bool:
-    """Only foreground user tasks may wait indefinitely for connectivity."""
+    """Only eligible foreground tasks may use bounded connectivity recovery."""
     ctx = inp.tool_context
     return bool(
         ctx is not None

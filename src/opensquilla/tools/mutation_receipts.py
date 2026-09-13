@@ -99,5 +99,4 @@ def record_semantic_mutation_receipt(
         except Exception:
             pass
 
-
     return receipt
