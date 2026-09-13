@@ -749,7 +749,11 @@ async def test_rolling_summary_can_replace_oversized_checkpoint_without_raw_entr
             entries=[],
             context_window_tokens=500,
             config=config,
-            previous_summary="oversized checkpoint " * 2_000,
+            # Keep the checkpoint oversized for the 500-token consumer window
+            # while remaining within the provider target's input budget even
+            # when tiktoken is unavailable and the portable len//4 estimator
+            # is used (as on a fresh Windows runner).
+            previous_summary="oversized checkpoint " * 800,
         )
     )
 

@@ -32,8 +32,6 @@
 
 - 📢 **2026-08-22** — 技術レポートの英語版が aiXiv に公開されました: [aixiv.260822.000001](https://aixiv.science/abs/aixiv.260822.000001)。中国語版は ChinaXiv で公開されています: [202608.00176](https://chinaxiv.org/abs/202608.00176)。OpenSquilla の引用方法は[引用](#引用)をご覧ください。
 
-- 📢 **2026-08-21** — 技術レポートの PDF 版を本リポジトリに収録しました: [English](docs/report/opensquilla-report-en.pdf) · [中文](docs/report/opensquilla-report-zh.pdf)。
-
 - 📢 **2026-07-14** — 技術レポート **[Agentic Routing: The Harness-Native Data Flywheel](https://arxiv.org/abs/2607.11399)** が arXiv に公開されました。harness ネイティブなルーターが日々の Agent トラフィックを自己改善型のデータフライホイールへと変える仕組みと、**マルチモデルのアンサンブルルーティングが Fable 5 を上回る**ことを示しています。
 
 ---

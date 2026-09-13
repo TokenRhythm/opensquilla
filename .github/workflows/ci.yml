@@ -1131,6 +1131,47 @@ jobs:
         with:
           enable-cache: true
 
+      - name: Resolve native Git Bash
+        shell: pwsh
+        run: |
+          $candidates = @(
+            (Get-Command bash.exe -CommandType Application -ErrorAction SilentlyContinue |
+              Select-Object -ExpandProperty Source -First 1),
+            "$env:ProgramFiles\Git\bin\bash.exe",
+            "$env:ProgramFiles\Git\usr\bin\bash.exe",
+            "${env:ProgramFiles(x86)}\Git\bin\bash.exe",
+            "${env:ProgramFiles(x86)}\Git\usr\bin\bash.exe",
+            "$env:LOCALAPPDATA\Programs\Git\bin\bash.exe",
+            "$env:LOCALAPPDATA\Programs\Git\usr\bin\bash.exe"
+          ) | Where-Object {
+            $_ -and (Test-Path -LiteralPath $_)
+          } | Select-Object -Unique
+
+          $probe = 'test -n "$BASH_VERSION" && case "$(uname -s 2>/dev/null)" in Linux*) exit 42;; esac && echo OPENSQUILLA_BASH_OK'
+          $diagnostics = [System.Collections.Generic.List[string]]::new()
+          foreach ($bash in $candidates) {
+            $output = (& $bash -lc $probe 2>&1 | Out-String).Trim()
+            $exitCode = $LASTEXITCODE
+            $diagnostics.Add("$bash => exit=$exitCode output=$output")
+            if ($exitCode -eq 0 -and $output -match 'OPENSQUILLA_BASH_OK') {
+              "OPENSQUILLA_BASH=$bash" |
+                Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+              if ($env:CI_REPORT_DIR) {
+                "bash=$bash" |
+                  Out-File -FilePath (Join-Path $env:CI_REPORT_DIR 'environment.txt') -Encoding utf8 -Append
+              }
+              exit 0
+            }
+          }
+
+          if ($env:CI_REPORT_DIR) {
+            "bash_candidates=$($candidates -join ';')" |
+              Out-File -FilePath (Join-Path $env:CI_REPORT_DIR 'environment.txt') -Encoding utf8 -Append
+            $diagnostics |
+              Out-File -FilePath (Join-Path $env:CI_REPORT_DIR 'bash-probe.txt') -Encoding utf8
+          }
+          throw "No verified native Git Bash found. Candidates: $($candidates -join '; ')"
+
       - name: Set up Bun
         if: ${{ matrix.shard == 'core' }}
         uses: oven-sh/setup-bun@v2

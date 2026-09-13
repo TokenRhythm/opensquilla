@@ -22,8 +22,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   final-diff `log` remains accepted but no longer observes. Actual recovery,
   warnings, salvage, observer events and independent turn-call logs remain.
   An unused failure-summary cache is removed; public settings/defaults are unchanged.
-  See [the event retirement notice](docs/experimental-diagnostic-retirement.md)
-  before using new main runs with historical experiment delivery checks.
+  Historical experiment-delivery details are preserved in Git history.
 - Retired the opt-in patch evidence ledger collector and JSON export. Legacy
   path configuration remains accepted and excludes old diagnostic files from
   final-diff checks, but no longer creates or overwrites a ledger. Recovery

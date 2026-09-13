@@ -27,8 +27,6 @@
 
 - 📢 **2026-08-22** — The English version of our technical report is now on aiXiv: [aixiv.260822.000001](https://aixiv.science/abs/aixiv.260822.000001), and the Chinese version is on ChinaXiv: [202608.00176](https://chinaxiv.org/abs/202608.00176). See [Citation](#citation) for how to cite OpenSquilla.
 
-- 📢 **2026-08-21** — PDF versions of our technical report are now available in this repo: [English](docs/report/opensquilla-report-en.pdf) · [中文](docs/report/opensquilla-report-zh.pdf).
-
 - 📢 **2026-07-14** — Our technical report **[Agentic Routing: The Harness-Native Data Flywheel](https://arxiv.org/abs/2607.11399)** is now on arXiv. It shows how the harness-native router turns everyday agent traffic into a self-improving data flywheel, and how **multi-model ensemble routing surpasses Fable 5**.
 
 ---
