@@ -3,6 +3,14 @@ import { describe, expect, it } from 'vitest'
 import appWorkbenchSource from './AppWorkbench.vue?raw'
 
 describe('AppWorkbench annotation mode status', () => {
+  it('keeps the original annotation target and includes its optional subpage when focusing', () => {
+    const start = appWorkbenchSource.indexOf('async function onPromptAnnotationFocus(')
+    const end = appWorkbenchSource.indexOf('\nasync function onPromptAnnotationReuse(', start)
+    const source = appWorkbenchSource.slice(start, end)
+    expect(source).toContain('targetRef: draft.targetRef')
+    expect(source).toContain('...(draft.pagePath ? { pagePath: draft.pagePath } : {})')
+    expect(source).not.toContain('getWorkbenchBrowserTarget')
+  })
   it('renders live guidance only for the active annotation toolbar action', () => {
     expect(appWorkbenchSource).toContain(
       'v-if="isActiveAnnotationToolbarItem(toolbarItem)"',

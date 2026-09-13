@@ -17,6 +17,7 @@ import {
 } from '@/testing/httpTransport.test-helper'
 import type { ArtifactPayload } from '@/types/artifacts'
 import { ARTIFACT_PREVIEW_ESCAPE_MESSAGE } from '@/utils/workbench/artifactPreview'
+import type { Window as TestWindow } from 'happy-dom'
 
 function artifact(overrides: Partial<ArtifactPayload> = {}): ArtifactPayload {
   return {
@@ -65,12 +66,27 @@ function mountPanel(
 }
 
 afterEach(() => {
+  (window as unknown as TestWindow).happyDOM.settings.disableIframePageLoading = false
   vi.unstubAllGlobals()
   vi.restoreAllMocks()
   document.body.innerHTML = ''
 })
 
 describe('ArtifactPreviewPanel', () => {
+  it('invalidates file actions after an opaque iframe navigates without changing preview permissions', async () => {
+    // Load events are injected deterministically; do not make real DNS requests.
+    (window as unknown as TestWindow).happyDOM.settings.disableIframePageLoading = true
+    const onWorkbenchEvent = vi.fn()
+    const mounted = mountPanel({ artifact: artifact(), previewLaunchUrl: 'http://preview.localhost/minimal.html', onWorkbenchEvent })
+    await settlePreview()
+    const frame = mounted.element.querySelector('iframe')!
+    frame.dispatchEvent(new Event('load'))
+    expect(onWorkbenchEvent).not.toHaveBeenCalledWith({ type: 'preview-page-unknown' })
+    frame.dispatchEvent(new Event('load'))
+    expect(onWorkbenchEvent).toHaveBeenCalledWith({ type: 'preview-page-unknown' })
+    expect(frame.getAttribute('sandbox')).not.toContain('allow-same-origin')
+    mounted.unmount()
+  })
   it('runs offline web HTML scripts in an opaque sandbox', async () => {
     const observed: { blob?: Blob } = {}
     const createObjectUrl = vi.spyOn(URL, 'createObjectURL').mockImplementation(blob => {
@@ -317,7 +333,7 @@ describe('ArtifactPreviewPanel', () => {
     await settlePreview()
 
     const actions = [...mounted.element.querySelectorAll<HTMLButtonElement>(
-      '.artifact-preview__actions button',
+      '.artifact-preview__actions button:not(.resource-actions-trigger)',
     )]
     expect(actions).toHaveLength(2)
     actions[0]?.click()
