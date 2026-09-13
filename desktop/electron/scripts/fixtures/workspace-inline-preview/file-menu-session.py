@@ -70,8 +70,10 @@ async def main(config_path: Path):
                     for name in ("index", "editorial", "dashboard", "minimal")
                 )
                 (root / site / f"{page}.html").write_text(
-                    f'<!doctype html><html><head><meta charset="utf-8"><link rel="stylesheet" href="style.css"></head>'
-                    f"<body><h1>{site}/{page}</h1><p>当前子页的固定内容。UTF-8 北京。</p>{links}</body></html>"
+                    "<!doctype html><html><head><meta charset=\"utf-8\">"
+                    '<link rel="stylesheet" href="style.css"></head>'
+                    f"<body><h1>{site}/{page}</h1>"
+                    f"<p>当前子页的固定内容。UTF-8 北京。</p>{links}</body></html>"
                 )
             args = {"path": f"{site}/index.html", "bundle": "directory", "bundle_root": site}
             segments.append(
@@ -101,8 +103,10 @@ async def main(config_path: Path):
             "assistant",
             "文件菜单固定样例：\n\n"
             "| 站点 | 首页 | 编辑风 | 仪表盘 | 极简 |\n|---|---|---|---|---|\n"
-            "| one | `one/index.html` | `one/editorial.html` | `one/dashboard.html` | `one/minimal.html` |\n"
-            "| two | `two/index.html` | `two/editorial.html` | `two/dashboard.html` | `two/minimal.html` |\n\n"
+            "| one | `one/index.html` | `one/editorial.html` | `one/dashboard.html` "
+            "| `one/minimal.html` |\n"
+            "| two | `two/index.html` | `two/editorial.html` | `two/dashboard.html` "
+            "| `two/minimal.html` |\n\n"
             "普通文字与 [外部网址](https://example.com) 保留原生右键。",
             tool_calls=segments,
         )
