@@ -2296,6 +2296,12 @@ class _ToolReliabilityState:
     emitted: bool = False
 
 
+# Managed provider recovery needs a stale-recovery bound even when a caller
+# explicitly disables the ordinary turn deadline (``timeout=0``). This bound
+# applies only while waiting for a transient connection to recover.
+MANAGED_CONNECTION_RECOVERY_CAP_SECONDS = 30 * 60
+
+
 class Agent:
     """Explicit state-machine agent.
 
@@ -6305,16 +6311,30 @@ class Agent:
         # Provider adapters own transport inactivity limits.
         _loop = asyncio.get_running_loop()
         _total_deadline = _loop.time() + self.config.timeout if self.config.timeout > 0 else None
+        _managed_recovery_deadline = (
+            _total_deadline
+            if _total_deadline is not None
+            else (
+                _loop.time() + MANAGED_CONNECTION_RECOVERY_CAP_SECONDS
+                if self.config.provider_connection_recovery_enabled
+                else None
+            )
+        )
 
-        async def _wait_before_provider_retry(delay: float) -> None:
-            if _total_deadline is None:
+        async def _wait_before_provider_retry(
+            delay: float,
+            *,
+            deadline: float | None = None,
+        ) -> None:
+            effective_deadline = _total_deadline if deadline is None else deadline
+            if effective_deadline is None:
                 await asyncio.sleep(delay)
                 return
-            remaining = _total_deadline - _loop.time()
+            remaining = effective_deadline - _loop.time()
             if remaining <= 0:
                 raise TimeoutError
             await asyncio.sleep(min(delay, remaining))
-            if delay >= remaining or _loop.time() >= _total_deadline:
+            if delay >= remaining or _loop.time() >= effective_deadline:
                 raise TimeoutError
 
         configured_capabilities = self.config.model_capabilities
@@ -10881,7 +10901,10 @@ class Agent:
                                 retry_after_ms=math.ceil(delay * 1000),
                                 started_at=time.time_ns() // 1_000_000,
                             )
-                            await _wait_before_provider_retry(delay)
+                            await _wait_before_provider_retry(
+                                delay,
+                                deadline=_managed_recovery_deadline,
+                            )
                             next_provider_activity_reason = "transport_transient"
                             yield ProviderActivityEvent(
                                 activity_id=provider_activity_id,

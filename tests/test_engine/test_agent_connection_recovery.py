@@ -191,7 +191,7 @@ async def test_connection_wait_stops_at_explicit_task_deadline(fast_wait):
     assert any(event.kind == "error" and event.code == "agent_runtime_timeout" for event in events)
 
 
-async def test_long_connection_wait_has_no_iteration_deadline(monkeypatch):
+async def test_managed_connection_wait_has_a_stale_recovery_bound(monkeypatch):
     loop = asyncio.get_running_loop()
     now = [loop.time()]
     original_sleep = asyncio.sleep
@@ -208,9 +208,10 @@ async def test_long_connection_wait_has_no_iteration_deadline(monkeypatch):
     events = await _run(
         provider, provider_connection_recovery_enabled=True, timeout=0, iteration_timeout=1800
     )
-    assert sum(delays) > 1800
-    assert len(provider.calls) == 36
-    assert any(event.kind == "done" and event.text == "done" for event in events)
+    assert sum(delays) == 1800
+    assert len(provider.calls) < 36
+    assert not any(event.kind == "done" and event.text == "done" for event in events)
+    assert any(event.kind == "error" and event.code == "agent_runtime_timeout" for event in events)
 
 
 async def test_connection_retry_keeps_completed_tool_results_without_reexecution(fast_wait):
