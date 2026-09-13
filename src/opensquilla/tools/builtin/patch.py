@@ -638,16 +638,10 @@ def _match_line(actual: str, expected: str) -> bool:
     return actual.rstrip("\r\n").rstrip(" \t") == expected.rstrip("\r\n").rstrip(" \t")
 
 
-def _apply_hunk(file_lines: list[str], hunk: Hunk) -> list[str]:
-    """Apply a single hunk to file_lines (0-indexed list of lines with newlines).
-
-    Returns the new list of lines.
-    """
-    # old_start is 1-indexed; convert to 0-indexed
-    pos = hunk.old_start - 1
-    result = list(file_lines)
-
-    # Verify context and deleted lines match
+def _hunk_verify_error(
+    file_lines: list[str], pos: int, hunk: Hunk
+) -> RetryableToolInputError | None:
+    """Return the anchoring error for hunk at 0-indexed pos, None when it fits."""
     check_pos = pos
     for raw in hunk.lines:
         if not raw:
@@ -655,20 +649,60 @@ def _apply_hunk(file_lines: list[str], hunk: Hunk) -> list[str]:
         prefix = raw[0]
         content = raw[1:]
         if prefix in (" ", "-"):
-            if check_pos >= len(result):
-                raise RetryableToolInputError(
+            if check_pos >= len(file_lines):
+                return RetryableToolInputError(
                     "apply_patch hunk context/delete exceeds file length at "
                     f"line {check_pos + 1}. Read the current file content and retry "
                     "with hunk line numbers and context that match the file."
                 )
-            if not _match_line(result[check_pos], content):
-                raise RetryableToolInputError(
+            if not _match_line(file_lines[check_pos], content):
+                return RetryableToolInputError(
                     f"apply_patch context mismatch at line {check_pos + 1}: "
                     f"expected {content.rstrip('\n')!r}, "
-                    f"got {result[check_pos].rstrip('\n')!r}. Read the current file "
+                    f"got {file_lines[check_pos].rstrip('\n')!r}. Read the current file "
                     "content and retry with exact surrounding context."
                 )
             check_pos += 1
+    return None
+
+
+def _relocate_hunk(file_lines: list[str], hunk: Hunk) -> int:
+    """Return the 0-indexed position where the hunk context block fits.
+
+    The declared anchor is tried first. When lines were inserted or removed
+    above the anchor the whole contiguous block merely shifts, so the search
+    expands one line at a time in both directions — the same drift recovery
+    git apply performs. Hunks without context or delete lines anchor nothing
+    and keep their declared position. A block that no longer exists
+    contiguously anywhere (e.g. a blank line landed inside the hunk window)
+    relocates nowhere and keeps the declared anchor for error reporting.
+    """
+    declared = hunk.old_start - 1
+    if not any(raw and raw[0] in (" ", "-") for raw in hunk.lines):
+        return declared
+    max_distance = max(declared, len(file_lines) - 1 - declared)
+    for distance in range(max_distance + 1):
+        candidates = (declared,) if distance == 0 else (declared + distance, declared - distance)
+        for candidate in candidates:
+            if 0 <= candidate < len(file_lines) and _hunk_verify_error(
+                file_lines, candidate, hunk
+            ) is None:
+                return candidate
+    return declared
+
+
+def _apply_hunk(file_lines: list[str], hunk: Hunk) -> list[str]:
+    """Apply a single hunk to file_lines (0-indexed list of lines with newlines).
+
+    Returns the new list of lines.
+    """
+    # old_start is 1-indexed; convert to 0-indexed, tolerating drift from
+    # insertions or removals above the anchor by relocating the block.
+    pos = _relocate_hunk(file_lines, hunk)
+    error = _hunk_verify_error(file_lines, pos, hunk)
+    if error is not None:
+        raise error
+    result = list(file_lines)
 
     # Now build new lines
     new_lines: list[str] = []
