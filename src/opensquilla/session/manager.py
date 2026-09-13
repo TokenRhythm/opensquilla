@@ -737,6 +737,9 @@ class SessionManager:
         checkpoint_workspace_dir: str | Path | None = None,
         media_root: str | Path | None = None,
         model_routing_mode_provider: Callable[[], str] | None = None,
+        execution_workspace_factory: (
+            Callable[[SessionNode], Awaitable[dict[str, Any] | None]] | None
+        ) = None,
     ) -> None:
         self._storage = storage
         self._memory_sync_notify = memory_sync_notify
@@ -753,6 +756,7 @@ class SessionManager:
         # children; None disables the copy (e.g. in tests that never touch disk).
         self._media_root = Path(media_root).expanduser() if media_root is not None else None
         self._model_routing_mode_provider = model_routing_mode_provider
+        self._execution_workspace_factory = execution_workspace_factory
         # In-process epoch cache so _emit_to_subscribers can
         # read the current epoch without a DB round-trip on every event.
         # Invalidated (updated) whenever increment_epoch commits a new value.
@@ -852,6 +856,16 @@ class SessionManager:
 
     # ── Lifecycle ────────────────────────────────────────────────────────────
 
+    async def _prepare_execution_workspace(self, node: SessionNode) -> None:
+        if node.execution_workspace is None and self._execution_workspace_factory is not None:
+            node.execution_workspace = await self._execution_workspace_factory(node)
+        if node.execution_workspace is not None:
+            from opensquilla.execution_workspaces import validate_execution_workspace
+
+            node.execution_workspace = await asyncio.to_thread(
+                validate_execution_workspace, node.execution_workspace,
+            )
+
     @staticmethod
     def _build_session_node(
         session_key: str,
@@ -927,6 +941,7 @@ class SessionManager:
                 agent_id=agent_id,
                 **create_kwargs,
             )
+            await self._prepare_execution_workspace(node)
             return PreparedSessionIntent(
                 node=node,
                 action="create",
@@ -965,6 +980,7 @@ class SessionManager:
             agent_id=agent_id,
             **self._prepare_new_session_kwargs(kwargs),
         )
+        await self._prepare_execution_workspace(node)
         await self._storage.upsert_session(node)
         return node
 
@@ -1753,6 +1769,7 @@ class SessionManager:
             display_name=display_name,
             origin=_branch_origin(parent.origin),
             workspace_id=parent.workspace_id,
+            execution_workspace=deepcopy(parent.execution_workspace),
             model_routing_mode=str(parent_routing["mode"]),
             model_routing_revision=0,
         )
@@ -2058,6 +2075,7 @@ class SessionManager:
             forked_from_parent=True,
             origin=_branch_origin(parent.origin),
             workspace_id=parent.workspace_id,
+            execution_workspace=deepcopy(parent.execution_workspace),
             model_routing_mode=str(parent_routing["mode"]),
             model_routing_revision=0,
         )
