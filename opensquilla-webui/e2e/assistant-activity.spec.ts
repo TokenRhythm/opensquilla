@@ -254,7 +254,7 @@ async function mockControlledActivityLifecycle(
   fixture: ControlledActivityLifecycleFixture = {},
 ) {
   let sendFrame: ((frame: string) => void) | null = null
-  let streamSeq = 3
+  let streamSeq = 100
   let settled = false
   let acceptedUserMessageId = 'activity-lifecycle-user'
 
@@ -263,7 +263,12 @@ async function mockControlledActivityLifecycle(
     sendFrame(wsEvent(event, {
       key: LIFECYCLE_SESSION_KEY,
       task_id: LIFECYCLE_TASK_ID,
+      stream_generation: 'e2e-stream-generation',
       stream_seq: streamSeq++,
+      schema_version: 1,
+      activity_id: `activity-${streamSeq}`,
+      started_at: Date.now(),
+      heartbeat: false,
       ...payload,
     }))
   }
@@ -291,6 +296,16 @@ async function mockControlledActivityLifecycle(
       if (method === 'connect') {
         ws.send(helloOkResponse({
           policy: { webui_stream_idle_grace_ms: 1_260_000 },
+          features: {
+            events: [
+              'session.event.state_change',
+              'session.event.provider_activity',
+              'session.event.tool_use_start',
+              'session.event.tool_result',
+              'session.event.text_delta',
+              'session.event.done',
+            ],
+          },
         }))
         return
       }
@@ -735,11 +750,18 @@ test.describe('Live assistant activity lifecycle', () => {
     const liveActivity = page.locator('.assistant-activity--live')
     await expect(liveActivity).toBeVisible()
     const liveStatus = liveActivity.locator('.assistant-activity__live-label')
+    await page.waitForTimeout(100)
     lifecycle.emit('session.event.provider_activity', {
       phase: 'retrying',
-      reason: 'connection_failed',
+      reason: 'transport_transient',
       retry_attempt: 7,
+      turn_id: 'turn-e2e-assistant-activity-lifecycle',
       retry_limit: 0,
+      schema_version: 1,
+      activity_id: 'provider-activity-unbounded-retry',
+      started_at: Date.now(),
+      heartbeat: false,
+      stream_seq: undefined,
     })
     await expect(liveStatus).toHaveText('Retrying · attempt 7')
     await expect(liveStatus).not.toContainText('7/0')
@@ -801,6 +823,7 @@ test.describe('Live assistant activity lifecycle', () => {
       tool_use_id: 'activity-failing',
       name: 'bash_exec',
       input: { command: 'exit 7' },
+      stream_seq: undefined,
     })
     lifecycle.emit('session.event.tool_result', {
       tool_use_id: 'activity-failing',
@@ -809,6 +832,7 @@ test.describe('Live assistant activity lifecycle', () => {
       result: 'exit 7',
       is_error: true,
       execution_status: { status: 'error' },
+      stream_seq: undefined,
     })
     const failedRow = liveActivity.locator('.tool-row--error').first()
     await expect(failedRow).toBeVisible()
@@ -817,6 +841,7 @@ test.describe('Live assistant activity lifecycle', () => {
       tool_use_id: 'activity-recovered',
       name: 'bash_exec',
       input: { command: 'printf recovered' },
+      stream_seq: undefined,
     })
     lifecycle.emit('session.event.tool_result', {
       tool_use_id: 'activity-recovered',
@@ -824,8 +849,9 @@ test.describe('Live assistant activity lifecycle', () => {
       input: { command: 'printf recovered' },
       result: 'recovered',
       execution_status: { status: 'success' },
+      stream_seq: undefined,
     })
-    lifecycle.emit('session.event.text_delta', { text: 'Recovered final answer.' })
+    lifecycle.emit('session.event.text_delta', { text: 'Recovered final answer.', stream_seq: undefined })
     await expect(page.getByText('Recovered final answer.', { exact: true })).toBeVisible()
 
     lifecycle.finish()
