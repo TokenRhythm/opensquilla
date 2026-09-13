@@ -12319,8 +12319,17 @@ class Agent:
 
         except TimeoutError:
             yield self._transition(AgentState.ERROR)
+            if self.config.timeout > 0:
+                timeout_message = f"Agent turn timed out after {self.config.timeout}s"
+            elif self.config.provider_connection_recovery_enabled:
+                timeout_message = (
+                    "Agent provider recovery timed out after "
+                    f"{MANAGED_CONNECTION_RECOVERY_CAP_SECONDS}s"
+                )
+            else:
+                timeout_message = "Agent turn timed out"
             terminal_error = ErrorEvent(
-                message=f"Agent turn timed out after {self.config.timeout}s",
+                message=timeout_message,
                 code="agent_runtime_timeout",
             )
             yield terminal_error
