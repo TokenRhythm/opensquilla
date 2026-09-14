@@ -5270,7 +5270,7 @@ async def start_gateway_server(
         memory_managers=svc.memory_managers,
         memory_stores=svc.memory_stores,
         memory_retrievers=svc.memory_retrievers,
-        sandbox_upgrade_report=svc.sandbox_upgrade_report,
+        sandbox_upgrade_report=getattr(svc, "sandbox_upgrade_report", None),
         extra_routes=webhook_routes or None,
     )
     app.state.gateway_ready = False
