@@ -218,6 +218,25 @@ def test_source_installers_fail_closed_when_frontend_build_fails() -> None:
     )
 
 
+def test_source_windows_installer_captures_node_exit_code_before_pipeline() -> None:
+    ps1 = SOURCE_PS1.read_text(encoding="utf-8")
+
+    node_probe = "$rawNodeVersion = & $nodeCommand.Source --version 2>$null"
+    node_exit_capture = "$nodeExitCode = $LASTEXITCODE"
+    node_output_normalization = "$rawNodeVersion = $rawNodeVersion | Select-Object -First 1"
+    node_probe_check = "if ($nodeExitCode -ne 0 -or -not $rawNodeVersion) {"
+
+    probe_index = ps1.index(node_probe)
+    assert ps1.index(node_exit_capture, probe_index) > probe_index
+    assert ps1.index(node_exit_capture, probe_index) < ps1.index(
+        node_output_normalization, probe_index
+    )
+    assert ps1.index(node_probe_check, probe_index) > ps1.index(
+        node_output_normalization, probe_index
+    )
+    assert "(& $nodeCommand.Source --version 2>$null | Select-Object" not in ps1
+
+
 def test_source_shell_dry_run_does_not_execute_node_npm_or_installer(
     tmp_path: Path,
 ) -> None:
