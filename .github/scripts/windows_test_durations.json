@@ -261,6 +261,7 @@
     "tests/test_cli/test_search_cmd.py": 0.365,
     "tests/test_cli/test_search_query_cmd.py": 0.211,
     "tests/test_cli/test_session_state_label.py": 0.017,
+    "tests/test_cli/test_sessions_cmd.py": 0.01,
     "tests/test_cli/test_skills_doctor_cmd.py": 0.353,
     "tests/test_cli/test_skills_gateway_fallback.py": 0.441,
     "tests/test_cli/test_skills_meta_runs.py": 4.461,
