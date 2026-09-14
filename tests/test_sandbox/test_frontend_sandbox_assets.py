@@ -23,7 +23,7 @@ def test_vue_has_no_standalone_sandbox_or_approvals_destination() -> None:
 
     assert "path: '/sandbox'" not in routes
     assert "path: '/approvals'" in routes
-    assert "redirect: '/sessions'" in routes
+    assert "redirect: '/chat'" in routes
 
 
 def test_vue_chat_wires_policy_limited_run_mode_into_send_metadata() -> None:
