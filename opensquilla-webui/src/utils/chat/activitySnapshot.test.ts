@@ -38,6 +38,26 @@ const snapshot: ActivitySnapshotV2 = {
 }
 
 describe('activitySnapshot v2', () => {
+  it('restores connection recovery with its attempt and no artificial retry limit', () => {
+    const normalized = normalizeActivitySnapshot({
+      version: 2,
+      task_id: 'turn-1',
+      turn_id: 'turn-1',
+      complete: false,
+      reasoning_utf16_length: 0,
+      entries: [{
+        type: 'phase', id: 'provider:retrying:7', order: 7, kind: 'provider',
+        phase: 'retrying', at: 7_000, ended_at: 8_000,
+        retry_attempt: 7, retry_limit: 0,
+      }],
+    }, 'turn-1', 'turn-1')
+
+    expect(normalized).toBeDefined()
+    expect(activityStatusHistory(normalized!)).toMatchObject([
+      { action: 'provider:retrying:7:0', label: 'Retrying · attempt 7', activityOrder: 7 },
+    ])
+  })
+
   it('restores phase, UTF-16 reasoning, text, and tool order without timestamps', () => {
     const normalized = normalizeActivitySnapshot({
       version: 2,

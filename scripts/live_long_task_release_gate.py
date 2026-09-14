@@ -268,7 +268,7 @@ _MINIMUM_PHYSICAL_REQUESTS: Final[dict[str, int]] = {
     # manual compaction performs one additional summarization request.
     "tool_compaction": 3,
     "long_answer": 1,
-    "fault_429_retry_after": 1,
+    "fault_429_retry_after": 2,
     "fault_503": 2,
     "fault_reset_before_first_token": 2,
     "fault_partial_then_reset": 2,
@@ -664,10 +664,11 @@ def validate_scenario_evidence(case: CaseSpec, result: DriverResult) -> None:
         if dom_nodes is None or int(dom_nodes) > 15_000:
             raise ValueError("scenario evidence requires counts.dom_nodes <= 15000")
     elif scenario == "fault_429_retry_after":
-        if result.physical_requests != 1:
-            raise ValueError("rate-limit scenario must not retry the same deployment")
-        if int(result.counts.get("retry_legs", 0)) != 0:
-            raise ValueError("rate-limit scenario must report zero retry legs")
+        if result.physical_requests < 2:
+            raise ValueError("rate-limit recovery requires at least two physical requests")
+        _require_count(result, "retry_legs")
+        _require_count(result, "retry_after_honored")
+        _require_metric_at_least(result, "retry_wait_ms", 8_000)
     elif scenario in {"fault_503", "fault_reset_before_first_token"}:
         _require_count(result, "retry_legs")
     elif scenario == "fault_partial_then_reset":

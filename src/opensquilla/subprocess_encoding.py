@@ -24,6 +24,7 @@ from __future__ import annotations
 import codecs
 import locale
 import os
+from collections.abc import Iterable
 
 
 def _windows_system_encoding() -> str | None:
@@ -145,3 +146,28 @@ def apply_utf8_child_env(env: dict[str, str]) -> dict[str, str]:
         env.setdefault("PYTHONUTF8", "1")
         env.setdefault("PYTHONIOENCODING", "utf-8")
     return env
+
+
+def select_subprocess_output_encoding(
+    chunks: Iterable[bytes], *, fallback_encoding: str | None = _DEFAULT_FALLBACK_ENCODING,
+) -> tuple[str, bool]:
+    """Choose the whole-stream decoder using bounded memory.
+
+    Return its encoding and whether EOF should flush an incomplete character.
+    Windows uses the same score and incomplete-tail behavior as
+    ``decode_subprocess_output``; POSIX always replaces incomplete UTF-8.
+    """
+    if not fallback_encoding:
+        return "utf-8", True
+    try:
+        fallback = codecs.getincrementaldecoder(fallback_encoding)("replace")
+    except LookupError:
+        return "utf-8", True
+    utf8 = codecs.getincrementaldecoder("utf-8")("replace")
+    utf8_score = fallback_score = 0
+    for chunk in chunks:
+        utf8_score += _misread_score(utf8.decode(chunk, final=False))
+        fallback_score += _misread_score(fallback.decode(chunk, final=False))
+    if fallback_score < utf8_score:
+        return fallback_encoding, False
+    return "utf-8", False

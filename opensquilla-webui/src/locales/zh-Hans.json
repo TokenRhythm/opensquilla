@@ -3724,6 +3724,7 @@
         "rateLimited": "受到限流 · {seconds} 秒后重试",
         "retryWait": "{seconds} 秒后重试",
         "retrying": "正在重试 {attempt}/{limit}",
+        "retryingWithoutLimit": "正在重试 · 第 {attempt} 次",
         "fallback": "正在切换备用模型"
       },
       "purpose": {
@@ -3785,11 +3786,23 @@
       "cancelled": "已取消"
     },
     "toolModal": {
+      "retry": "重试",
+      "logPending": "执行日志仍在保存中，请在命令结束后重试。",
+      "copyPage": "复制当前页",
       "tree": "树视图",
       "raw": "原始",
       "wrapLines": "自动换行",
       "preserveLines": "保留行宽",
-      "contentMeta": "{type} · {lines} 行 · {chars} 个字符"
+      "contentMeta": "{type} · {lines} 行 · {chars} 个字符",
+      "executionLog": "查看执行日志",
+      "toolResult": "工具返回内容",
+      "characterOffset": "字符位置",
+      "go": "跳转",
+      "previous": "上一页",
+      "next": "下一页",
+      "logRange": "第 {start}–{end} 个字符，共 {total} 个",
+      "logReadFailed": "执行日志加载失败，请重试。",
+      "logIncomplete": "日志不完整，仅能查看已保存的输出。"
     },
     "approval": {
       "required": "需要审批",
@@ -4446,7 +4459,7 @@
       "sectionDiagnostics": "诊断",
       "sectionResult": "结果",
       "sectionError": "错误",
-      "viewFull": "查看完整内容",
+      "viewFull": "展开内容",
       "activityViewDetails": "查看详情",
       "activityDetailsTitle": "详情",
       "activityBytesWritten": "已写入 {size}",

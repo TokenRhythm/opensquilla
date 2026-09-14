@@ -415,10 +415,15 @@ async def test_pending_input_waits_for_the_complete_tool_batch() -> None:
 
 
 @pytest.mark.asyncio
-async def test_no_pending_provider_anchors_current_request_after_tool_result(
+@pytest.mark.parametrize("legacy_setting", [None, "on", "trim:800", "sometimes"])
+async def test_retired_reminder_keeps_actual_user_request_without_extra_nudge(
     monkeypatch: pytest.MonkeyPatch,
+    legacy_setting: str | None,
 ) -> None:
-    monkeypatch.setenv("OPENSQUILLA_TURN_OBJECTIVE_REMINDER", "on")
+    if legacy_setting is None:
+        monkeypatch.delenv("OPENSQUILLA_TURN_OBJECTIVE_REMINDER", raising=False)
+    else:
+        monkeypatch.setenv("OPENSQUILLA_TURN_OBJECTIVE_REMINDER", legacy_setting)
     provider = _ToolBoundaryProvider()
     agent = _agent(provider)
 
@@ -426,27 +431,20 @@ async def test_no_pending_provider_anchors_current_request_after_tool_result(
 
     assert len(provider.calls) == 2
     second_request = provider.calls[1]
-    tool_result_index = _tool_result_index(second_request)
-    reminder_text = _message_text(second_request[tool_result_index + 1])
-    assert "Current user request" in reminder_text
-    assert "run echo" in reminder_text
+    assert _tool_result_index(second_request) > 0
+    actual_requests = [
+        message
+        for message in second_request
+        if message.role == "user"
+        and _message_text(message).split("\n\n[Runtime context for this turn]", 1)[0]
+        == "run echo"
+    ]
+    assert len(actual_requests) == 1
+    assert actual_requests[0].role == "user"
+    assert sum(message.content == "run echo" for message in agent._history) == 1
     assert not any(
         "Current user request" in _message_text(message) for message in agent._history
     )
-
-
-@pytest.mark.asyncio
-async def test_no_pending_default_sends_no_reminder_after_tool_result(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.delenv("OPENSQUILLA_TURN_OBJECTIVE_REMINDER", raising=False)
-    provider = _ToolBoundaryProvider()
-    agent = _agent(provider)
-
-    _events = [event async for event in agent.run_turn("run echo")]
-
-    assert len(provider.calls) == 2
-    second_request = provider.calls[1]
     assert not any(
         "Current user request" in _message_text(message) for message in second_request
     )

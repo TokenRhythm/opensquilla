@@ -1989,6 +1989,7 @@ def test_windows_high_risk_job_runs_parallel_reported_shards() -> None:
     assert '"${{ matrix.shard }}" == "recovery-migration"' in test_step["run"]
     assert '"${{ matrix.shard }}" == "gateway-sqlite"' in test_step["run"]
     assert '"${{ matrix.shard }}" == "desktop-installer-contracts"' in test_step["run"]
+    assert 'worker_args+=(--workers=3)' in test_step["run"]
     assert "worker_args+=(--workers=2)" in test_step["run"]
     assert '"${worker_args[@]}"' in test_step["run"]
     assert "set -euo pipefail" in test_step["run"]

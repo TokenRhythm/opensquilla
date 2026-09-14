@@ -166,7 +166,7 @@ describe('RunTrace code block copy control', () => {
     expect(inputSection?.querySelector('pre')).toBeNull()
     expect(inputSection?.textContent).toContain('JSON')
     expect(inputSection?.textContent).toContain('octopus-3d-clay.png')
-    expect(inputSection?.textContent).toContain('view full')
+    expect(inputSection?.textContent).toContain('expand content')
 
     app.unmount()
   })

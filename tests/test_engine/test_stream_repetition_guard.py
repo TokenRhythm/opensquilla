@@ -8,7 +8,6 @@ from typing import Any
 import pytest
 
 from opensquilla.engine import Agent, AgentConfig
-from opensquilla.engine.agent import _IterationStreamTimeoutError
 from opensquilla.engine.repetition_guard import (
     MODEL_REPETITION_LOOP_CODE,
     ModelRepetitionLoopError,
@@ -574,16 +573,16 @@ async def test_outer_wrapper_cancellation_propagates_once_to_provider() -> None:
 
 
 @pytest.mark.asyncio
-async def test_outer_wrapper_iteration_timeout_propagates_once_to_provider() -> None:
+async def test_outer_wrapper_task_deadline_propagates_once_to_provider() -> None:
     upstream = _LifecycleIterator(emit_first=False)
     guarded = guard_provider_text_stream(upstream)
     agent = _deadline_agent(iteration_timeout=0.01)
 
-    with pytest.raises(_IterationStreamTimeoutError):
+    with pytest.raises(TimeoutError, match="total timeout"):
         async for _ in agent._stream_provider_events_with_deadline(
             guarded,
             loop=asyncio.get_running_loop(),
-            total_deadline=None,
+            total_deadline=asyncio.get_running_loop().time() + 0.01,
         ):
             pass
 

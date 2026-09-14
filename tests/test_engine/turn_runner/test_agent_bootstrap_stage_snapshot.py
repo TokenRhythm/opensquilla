@@ -175,8 +175,6 @@ def _capture_locals_at_post_slice() -> dict[str, Any]:
         ),
         "effective_runtime_timeout": locs.get("effective_runtime_timeout"),
         "effective_max_iterations": locs.get("effective_max_iterations"),
-        "effective_iteration_timeout": locs.get("effective_iteration_timeout"),
-        "effective_tool_timeout": locs.get("effective_tool_timeout"),
         "effective_agent_request_timeout": locs.get(
             "effective_agent_request_timeout"
         ),
@@ -301,8 +299,6 @@ def _patch_budget_resolvers(runner, case):
 
     runtime_t = case["runtime_timeout"]
     max_iter = case["max_iterations"]
-    iter_t = case["iteration_timeout"]
-    tool_t = case["tool_timeout"]
     req_t = case["request_timeout"]
     retries = case["max_provider_retries"]
 
@@ -312,12 +308,6 @@ def _patch_budget_resolvers(runner, case):
     def _max_iter(self, session_key, mi):  # noqa: ARG001, ARG002
         return mi if mi is not None else max_iter
 
-    def _iter_t(self, session_key, it):  # noqa: ARG001, ARG002
-        return it if it is not None else iter_t
-
-    def _tool_t(self, session_key, tt):  # noqa: ARG001, ARG002
-        return tt if tt is not None else tool_t
-
     def _req_t(self, session_key, rt):  # noqa: ARG001, ARG002
         return rt if rt is not None else req_t
 
@@ -326,8 +316,6 @@ def _patch_budget_resolvers(runner, case):
 
     runner._resolve_agent_runtime_timeout = _runtime.__get__(runner, TurnRunner)
     runner._resolve_agent_max_iterations = _max_iter.__get__(runner, TurnRunner)
-    runner._resolve_agent_iteration_timeout = _iter_t.__get__(runner, TurnRunner)
-    runner._resolve_agent_tool_timeout = _tool_t.__get__(runner, TurnRunner)
     runner._resolve_agent_request_timeout = _req_t.__get__(runner, TurnRunner)
     runner._resolve_agent_max_provider_retries = _retries.__get__(runner, TurnRunner)
 
@@ -423,7 +411,6 @@ _CASE_BASE: dict[str, Any] = dict(
     runtime_timeout=60.0,
     max_iterations=10,
     iteration_timeout=30.0,
-    tool_timeout=20.0,
     request_timeout=120.0,
     max_provider_retries=3,
     thinking=False,
@@ -523,6 +510,7 @@ async def _drive(runner, case, monkeypatch):
         semantic_message=None,
         timeout=case["per_call_timeout"],
         max_iterations=case["per_call_max_iterations"],
+        iteration_timeout=case["iteration_timeout"],
     )
     try:
         async for event in gen:
@@ -617,8 +605,8 @@ async def test_agent_bootstrap_stage_snapshot(
         "agent_config_context_window_tokens": case["catalog_context_window"],
         "agent_config_max_iterations": expected_max_iterations,
         "agent_config_timeout": expected_runtime_timeout,
-        "agent_config_iteration_timeout": case["iteration_timeout"],
-        "agent_config_tool_timeout": case["tool_timeout"],
+        "agent_config_iteration_timeout": 0.0,
+        "agent_config_tool_timeout": 0.0,
         "agent_config_request_timeout": case["request_timeout"],
         "agent_config_max_provider_retries": case["max_provider_retries"],
         "agent_config_length_capped_continuations": 3,
@@ -636,8 +624,6 @@ async def test_agent_bootstrap_stage_snapshot(
         "agent_config_flush_enabled": False,
         "effective_runtime_timeout": expected_runtime_timeout,
         "effective_max_iterations": expected_max_iterations,
-        "effective_iteration_timeout": case["iteration_timeout"],
-        "effective_tool_timeout": case["tool_timeout"],
         "effective_agent_request_timeout": case["request_timeout"],
         "effective_max_provider_retries": case["max_provider_retries"],
         "private_memory_allowed": case["private_memory_allowed_value"],

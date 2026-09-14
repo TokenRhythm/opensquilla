@@ -1096,44 +1096,39 @@ async def test_task_runtime_stream_context_overflow_hides_raw_agent_error() -> N
 
 
 @pytest.mark.asyncio
-async def test_task_runtime_rolls_back_persisted_user_on_provider_budget_error() -> None:
+@pytest.mark.parametrize("error_code", [
+    "provider_request_budget_exhausted",
+    "provider_request_too_large",
+    "current_turn_context_exhausted",
+])
+async def test_task_runtime_preserves_accepted_inputs_on_provider_budget_error(
+    error_code: str,
+) -> None:
     emitted: list[tuple[str, str, dict[str, Any]]] = []
+
+    receipts: list[bool] = []
 
     class RecordingSessionManager:
         def __init__(self) -> None:
-            self.removed: list[tuple[str, str]] = []
-            self.rollback_lock: asyncio.Lock | None = None
-            self.rollback_lock_states: list[bool] = []
+            self.messages = {
+                "msg-1": "first input", "msg-2": "second input", "msg-3": "third input",
+            }
 
         async def get_session(self, session_key: str) -> Any:  # noqa: ARG002
             return None
 
-        async def remove_message(self, session_key: str, message_id: str) -> bool:
-            self.rollback_lock_states.append(
-                self.rollback_lock is not None and self.rollback_lock.locked()
-            )
-            self.removed.append((session_key, message_id))
-            return True
+        async def remove_message(self, session_key: str, message_id: str) -> bool:  # noqa: ARG002
+            return self.messages.pop(message_id, None) is not None
 
     class ProviderBudgetErrorRunner:
-        def __init__(self) -> None:
-            self.lock = asyncio.Lock()
-
-        def _get_session_lock(self, session_key: str) -> asyncio.Lock:  # noqa: ARG002
-            return self.lock
-
         async def run(self, message: str, session_key: str, **kwargs: Any):  # noqa: ARG002
-            yield ErrorEvent(
-                message='{"fallback_reason":"provider_request_budget_exhausted"}',
-                code="provider_request_budget_exhausted",
-            )
+            yield ErrorEvent(message="Context cannot fit the provider request", code=error_code)
 
     async def _emitter(session_key: str, event_name: str, payload: dict[str, Any]) -> None:
         emitted.append((session_key, event_name, payload))
 
     manager = RecordingSessionManager()
     runner = ProviderBudgetErrorRunner()
-    manager.rollback_lock = runner.lock
     run = SimpleNamespace(
         agent_id="main",
         task_id="task-1",
@@ -1149,6 +1144,7 @@ async def test_task_runtime_rolls_back_persisted_user_on_provider_budget_error()
         persisted_user_message_id="msg-1",
         persisted_user_message_ids=("msg-1", "msg-2", "msg-3"),
         stream_event_sink=None,
+        finalizer_receipt_sink=lambda: receipts.append(True),
     )
 
     with pytest.raises(TaskRuntimeStreamError) as exc_info:
@@ -1164,12 +1160,11 @@ async def test_task_runtime_rolls_back_persisted_user_on_provider_budget_error()
         )
 
     assert exc_info.value.code == "provider_request_too_large"
-    assert manager.removed == [
-        ("agent:main:test", "msg-1"),
-        ("agent:main:test", "msg-2"),
-        ("agent:main:test", "msg-3"),
-    ]
-    assert manager.rollback_lock_states == [True, True, True]
+    assert manager.messages == {
+        "msg-1": "first input", "msg-2": "second input", "msg-3": "third input",
+    }
+    assert receipts == []
+    assert [name for _, name, _ in emitted] == ["session.event.error"]
     payload = emitted[0][2]
     assert payload["code"] == "provider_request_too_large"
     assert "too large" in payload["terminal_message"]

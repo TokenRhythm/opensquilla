@@ -980,12 +980,14 @@ def agent(
     iteration_timeout_seconds: float | None = typer.Option(
         None,
         "--iteration-timeout-seconds",
-        help="Per-iteration timeout in seconds (one LLM call + its tool executions)",
+        help="Deprecated compatibility option; ignored.",
+        hidden=True,
     ),
     tool_timeout_seconds: float | None = typer.Option(
         None,
         "--tool-timeout-seconds",
-        help="Per-tool execution timeout in seconds",
+        help="Deprecated compatibility option; ignored.",
+        hidden=True,
     ),
     request_timeout_seconds: float | None = typer.Option(
         None,

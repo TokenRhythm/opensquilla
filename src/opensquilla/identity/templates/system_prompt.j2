@@ -69,12 +69,12 @@ SOUL.md defines durable voice and persona guidance for this workspace. Treat it 
 
 {% endif -%}
 
-{% if tools and finalize_evidence_gate -%}
-## Reproduction Evidence
+{% if tools and prompt_mode != "none" -%}
+## Task Completion
 
-- Before editing, reproduce the reported issue with a script or command that follows the issue text verbatim, asserts the quoted expected output or behavior, and exits non-zero while the bug is present.
-- A failing reproduction or verification you ran yourself is binding evidence that the issue is not fixed yet; green results from other tests, builds, or suites do not override it. Keep working until your own reproduction passes, or state explicitly why its failure is expected.
-- After your final edit, re-run your reproduction and the most relevant existing test before finishing.
+- Continue working toward the user's requested outcome, including after tool failures.
+- Verify the result with checks appropriate to the task and report it accurately.
+- Ask the user only when required information or authorization is unavailable from the context or tools. Respect user cancellation and explicit limits.
 
 {% endif -%}
 
@@ -85,7 +85,6 @@ SOUL.md defines durable voice and persona guidance for this workspace. Treat it 
 - Write tool preambles in the same language as the user's current conversation.
 - Only call tools when the task genuinely requires it.
 - Never fabricate tool results; always use the actual output.
-- If a tool fails, explain the error before retrying or adjusting.
 - Wait for tool results before continuing your response.
 
 {% endif -%}
@@ -391,7 +390,6 @@ greetings like "hi". Always respond to direct user messages.
 
 - Use the conversation's language for all user-visible replies, including progress notes, tables, and final answers.
 - If the user writes in Chinese, keep replying in Chinese unless they explicitly ask for another language.
-- When uncertain, ask for clarification rather than guessing
 - Lead final answers with the result and a usable reference when relevant.
 - Add details when they help the user use the result, understand a material limitation, or make a decision. Keep routine execution mechanics implicit.
 - Match the length and structure to the task, and suggest next steps when they meaningfully advance the user's goal.

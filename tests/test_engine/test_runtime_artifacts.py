@@ -1658,7 +1658,7 @@ async def test_goal_terminal_invalid_summary_degrades_without_system_error(
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "preflight_failure",
-    ["request_assembly", "request_validation", "identical_request_abort"],
+    ["request_assembly", "request_validation"],
 )
 @pytest.mark.parametrize("terminal_status", ["complete", "blocked"])
 async def test_goal_terminal_summary_preflight_failure_degrades_without_system_error(
@@ -1704,29 +1704,6 @@ async def test_goal_terminal_summary_preflight_failure_degrades_without_system_e
             "validate_provider_chat_admission",
             fail_terminal_summary_validation,
         )
-    else:
-        original_identical_action = Agent._identical_request_loop_break_action
-
-        def abort_terminal_summary_request(
-            agent: Agent,
-            request_messages: list[Message],
-            *,
-            first_attempt: bool,
-        ) -> str | None:
-            if getattr(agent.provider, "calls", 0) == 3:
-                return "abort"
-            return original_identical_action(
-                agent,
-                request_messages,
-                first_attempt=first_attempt,
-            )
-
-        monkeypatch.setattr(
-            Agent,
-            "_identical_request_loop_break_action",
-            abort_terminal_summary_request,
-        )
-
     provider, control_calls, qa_calls, events = await _run_goal_publish_loop(
         tmp_path,
         plain_final=False,

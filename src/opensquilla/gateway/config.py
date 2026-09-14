@@ -1060,10 +1060,7 @@ class PromptConfig(BaseModel):
     platform_hint_enabled: bool = True
     # Deprecated, unused compatibility slot; preserve construction and saved configs.
     patch_evidence_protocol: bool = False
-    # Opt-in additive "Reproduction Evidence" system-prompt section plus the
-    # loop-side finalize-time red-evidence gate (engine.finalize_evidence_gate).
-    # Overridable per run via the OPENSQUILLA_FINALIZE_EVIDENCE_GATE env var
-    # ("on"/"off").
+    # Deprecated, unused compatibility slot; preserve saved configurations.
     finalize_evidence_gate: bool = False
     # Deprecated, unused. Accepted so existing configuration still loads.
     legacy_prompt_style: bool = False
@@ -2845,10 +2842,9 @@ class GatewayConfig(BaseSettings):
     # meta turns retain the regular agent runtime budget. Disabled by default;
     # an explicit TurnRunner timeout still has priority when the cap is enabled.
     web_chat_runtime_timeout_seconds: float = Field(default=0.0, ge=0.0)
-    # Per-iteration timeout: one LLM call + its tool executions. ``None``
-    # means use the AgentConfig default.
+    # Deprecated, unused: provider inactivity and tool deadlines are separate.
     agent_iteration_timeout_seconds: float | None = None
-    # Per-tool execution timeout. ``None`` means use the AgentConfig default.
+    # Deprecated, unused: tools declare their own execution deadlines.
     agent_tool_timeout_seconds: float | None = None
     # Per-turn override for the single LLM HTTP/streaming request timeout.
     # ``None`` defers to ``llm_request_timeout_seconds`` so existing
@@ -2859,11 +2855,9 @@ class GatewayConfig(BaseSettings):
     agent_max_provider_retries: int | None = None
     # Agent model/tool loop budget for a single turn. 0 disables this cap.
     agent_max_iterations: int = Field(default=0, ge=0)
-    # Source diff preservation protects already-mutated source files from
-    # high-confidence destructive git restore/checkout/reset/clean commands.
+    # Deprecated, unused compatibility slot; preserve saved configurations.
     source_diff_preservation_mode: Literal["off", "log", "block"] = "log"
-    # Source diff candidate ledger records recoverable source edit patches and
-    # can surface lost candidate ids in final-diff recovery diagnostics.
+    # Deprecated, unused compatibility slot; preserve saved configurations.
     source_diff_candidate_mode: Literal["off", "log", "warn_model"] = "log"
     # Deprecated, unused compatibility slot; preserve construction and saved configs.
     runtime_state_capsule_mode: Literal["off", "log", "inject"] = "off"

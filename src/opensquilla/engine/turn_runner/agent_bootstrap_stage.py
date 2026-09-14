@@ -42,71 +42,11 @@ if TYPE_CHECKING:
     from opensquilla.provider.types import ModelCapabilities, ProviderRequestCorrelation
     from opensquilla.tools.types import ToolContext
 
-_PROGRESS_WATCHDOG_MODES = frozenset({"off", "log", "warn_model", "block"})
-_SOURCE_DIFF_PRESERVATION_MODES = frozenset({"off", "log", "block"})
-_SOURCE_DIFF_CANDIDATE_MODES = frozenset({"off", "log", "warn_model"})
 _TRUE_ENV_VALUES = frozenset({"1", "true", "yes", "on", "enabled"})
-
-
-def _progress_watchdog_mode_from_env() -> Literal["off", "log", "warn_model", "block"]:
-    raw = os.environ.get("OPENSQUILLA_PROGRESS_WATCHDOG_MODE", "off").strip().lower()
-    if raw in _PROGRESS_WATCHDOG_MODES:
-        return raw  # type: ignore[return-value]
-    return "off"
 
 
 def _runtime_recovery_mode_from_env() -> Literal["off", "log", "warn_model"]:
     return normalize_runtime_recovery_mode(os.environ.get("OPENSQUILLA_RUNTIME_RECOVERY_MODE"))
-
-
-def _final_diff_contract_mode_from_env() -> Literal["off", "log", "warn_model"]:
-    return normalize_runtime_recovery_mode(
-        os.environ.get("OPENSQUILLA_FINAL_DIFF_CONTRACT_MODE")
-    )
-
-
-def _normalize_source_diff_preservation_mode(
-    raw: str | None,
-    *,
-    default: Literal["off", "log", "block"] = "log",
-) -> Literal["off", "log", "block"]:
-    if raw is None:
-        return default
-    normalized = raw.strip().lower()
-    if normalized in _SOURCE_DIFF_PRESERVATION_MODES:
-        return normalized  # type: ignore[return-value]
-    return default
-
-
-def _source_diff_preservation_mode_from_env(
-    config_value: str | None = None,
-) -> Literal["off", "log", "block"]:
-    raw = os.environ.get("OPENSQUILLA_SOURCE_DIFF_PRESERVATION_MODE")
-    if raw is not None:
-        return _normalize_source_diff_preservation_mode(raw)
-    return _normalize_source_diff_preservation_mode(config_value)
-
-
-def _normalize_source_diff_candidate_mode(
-    raw: str | None,
-    *,
-    default: Literal["off", "log", "warn_model"] = "log",
-) -> Literal["off", "log", "warn_model"]:
-    if raw is None:
-        return default
-    normalized = raw.strip().lower()
-    if normalized in _SOURCE_DIFF_CANDIDATE_MODES:
-        return normalized  # type: ignore[return-value]
-    return default
-
-
-def _source_diff_candidate_mode_from_env(
-    config_value: str | None = None,
-) -> Literal["off", "log", "warn_model"]:
-    raw = os.environ.get("OPENSQUILLA_SOURCE_DIFF_CANDIDATE_MODE")
-    if raw is not None:
-        return _normalize_source_diff_candidate_mode(raw)
-    return _normalize_source_diff_candidate_mode(config_value)
 
 
 def _post_tool_empty_recovery_mode_from_env() -> Literal["off", "log", "warn_model"]:
@@ -121,64 +61,11 @@ def _reasoning_prefill_recovery_mode_from_env() -> Literal["off", "log", "recove
     )
 
 
-_FINALIZE_EVIDENCE_GATE_ENV = "OPENSQUILLA_FINALIZE_EVIDENCE_GATE"
-_FINALIZE_EVIDENCE_GATE_ON = frozenset({"on", "1", "true", "yes"})
-_FINALIZE_EVIDENCE_GATE_OFF = frozenset({"off", "0", "false", "no"})
-
-
-def _finalize_evidence_gate_from_env(config_value: bool = False) -> bool:
-    """Resolve the opt-in finalize-time red-evidence gate flag.
-
-    Default off. A non-blank ``OPENSQUILLA_FINALIZE_EVIDENCE_GATE`` overrides
-    ``config_value`` (gateway ``prompt.finalize_evidence_gate``), mirroring
-    ``runtime._resolve_finalize_evidence_gate`` so the loop-side gate and the
-    system-prompt section can never disagree. Unrecognized env values raise
-    instead of being silently ignored so a run manifest cannot record an
-    override the run did not actually apply.
-    """
-    raw = os.environ.get(_FINALIZE_EVIDENCE_GATE_ENV, "").strip().lower()
-    if not raw:
-        return bool(config_value)
-    if raw in _FINALIZE_EVIDENCE_GATE_ON:
-        return True
-    if raw in _FINALIZE_EVIDENCE_GATE_OFF:
-        return False
-    raise ValueError(
-        f"{_FINALIZE_EVIDENCE_GATE_ENV} must be one of: "
-        + ", ".join(sorted(_FINALIZE_EVIDENCE_GATE_ON | _FINALIZE_EVIDENCE_GATE_OFF))
-    )
-
-
-def _positive_int_from_env(name: str, default: int) -> int:
-    raw = os.environ.get(name)
-    if raw is None:
-        return default
-    try:
-        return max(1, int(raw))
-    except ValueError:
-        return default
-
-
-def _nonnegative_int_from_env(name: str, default: int) -> int:
-    raw = os.environ.get(name)
-    if raw is None:
-        return default
-    try:
-        return max(0, int(raw))
-    except ValueError:
-        return default
-
-
 def _bool_from_env(name: str, default: bool = False) -> bool:
     raw = os.environ.get(name)
     if raw is None:
         return default
     return raw.strip().lower() in _TRUE_ENV_VALUES
-
-
-def _name_tuple_from_env(name: str) -> tuple[str, ...]:
-    raw = os.environ.get(name, "")
-    return tuple(item.strip() for item in raw.split(",") if item.strip())
 
 
 # ---------------------------------------------------------------------------
@@ -194,8 +81,6 @@ class _ResolvedBudgets:
     runtime_timeout: float
     max_iterations: int
     max_iterations_source: str
-    iteration_timeout: float
-    tool_timeout: float
     request_timeout: float
     max_provider_retries: int
 
@@ -265,9 +150,7 @@ class _AgentConfigAuxiliaries:
     tool_result_store_max_bytes: int
     tool_result_store_disk_budget_bytes: int
     tool_result_store_retention_seconds: int
-    source_diff_preservation_mode: Literal["off", "log", "block"] | None
-    source_diff_candidate_mode: Literal["off", "log", "warn_model"] | None
-    # Gateway ``prompt.finalize_evidence_gate`` (env still overrides).
+    # Inert compatibility slot for older bootstrap integrations.
     finalize_evidence_gate: bool = False
 
 
@@ -288,13 +171,13 @@ class _MemorySnapshotResult:
 
 @runtime_checkable
 class TimeoutBudgetPort(Protocol):
-    """Wraps the five ``TurnRunner._resolve_agent_*`` helpers as a
+    """Wraps the active ``TurnRunner._resolve_agent_*`` helpers as a
     coordinated single-call port. Returns the resolved budget tuple in
     one shot to keep the stage body declarative.
 
     ``effective_runtime_timeout`` honors the per-call ``timeout``
     override (``float(timeout) if timeout is not None else
-    self._resolve_agent_runtime_timeout(session_key)``). The other four
+    self._resolve_agent_runtime_timeout(session_key)``). The remaining
     resolvers consume the per-call explicit override and the
     session/env/config fallback chain internally.
     """
@@ -305,8 +188,6 @@ class TimeoutBudgetPort(Protocol):
         session_key: str,
         timeout: float | None,
         max_iterations: int | None,
-        iteration_timeout: float | None,
-        tool_timeout: float | None,
         request_timeout: float | None,
         max_provider_retries: int | None,
     ) -> _ResolvedBudgets: ...
@@ -455,8 +336,6 @@ class AgentBootstrapStageInput:
     agent_id: str
     timeout: float | None
     max_iterations: int | None
-    iteration_timeout: float | None
-    tool_timeout: float | None
     request_timeout: float | None
     max_provider_retries: int | None
     length_capped_continuations: int | None
@@ -485,7 +364,6 @@ class AgentBootstrapStageOutput:
       ``agent.config``. Surfaced separately because PreflightCompactionStage
       reads ``agent_config.context_window_tokens`` directly.
     - ``effective_runtime_timeout`` / ``effective_max_iterations`` /
-      ``effective_iteration_timeout`` / ``effective_tool_timeout`` /
       ``effective_request_timeout`` / ``effective_max_provider_retries``:
       surfaced for parity assertions and downstream consumers.
     - ``model_capabilities``: the resolved ``ModelCapabilities`` (or
@@ -503,8 +381,6 @@ class AgentBootstrapStageOutput:
     effective_runtime_timeout: float
     effective_max_iterations: int
     effective_max_iterations_source: str
-    effective_iteration_timeout: float
-    effective_tool_timeout: float
     effective_request_timeout: float
     effective_max_provider_retries: int
     model_capabilities: ModelCapabilities | None
@@ -569,13 +445,11 @@ class AgentBootstrapStage:
         from opensquilla.engine.turn_runner.outcome import StageOutcome
         from opensquilla.engine.types import AgentConfig
 
-        # 1. Resolve runtime/iteration/tool/request/retry budgets
+        # 1. Resolve turn, iteration-count, request, and retry budgets
         budgets = self._timeout_budget.resolve_budgets(
             session_key=inp.session_key,
             timeout=inp.timeout,
             max_iterations=inp.max_iterations,
-            iteration_timeout=inp.iteration_timeout,
-            tool_timeout=inp.tool_timeout,
             request_timeout=inp.request_timeout,
             max_provider_retries=inp.max_provider_retries,
         )
@@ -880,8 +754,6 @@ class AgentBootstrapStage:
             provider_id=inp.active_provider_id,
             workspace_dir=inp.turn.metadata.get("bootstrap_workspace_dir") or None,
             timeout=budgets.runtime_timeout,
-            iteration_timeout=budgets.iteration_timeout,
-            tool_timeout=budgets.tool_timeout,
             request_timeout=budgets.request_timeout,
             max_provider_retries=budgets.max_provider_retries,
             length_capped_continuations=(
@@ -934,73 +806,11 @@ class AgentBootstrapStage:
             tool_result_store_max_bytes=aux.tool_result_store_max_bytes,
             tool_result_store_disk_budget_bytes=(aux.tool_result_store_disk_budget_bytes),
             tool_result_store_retention_seconds=(aux.tool_result_store_retention_seconds),
-            progress_watchdog_mode=_progress_watchdog_mode_from_env(),
-            progress_watchdog_repeated_tool_error_threshold=_positive_int_from_env(
-                "OPENSQUILLA_PROGRESS_WATCHDOG_TOOL_ERROR_THRESHOLD",
-                AgentConfig().progress_watchdog_repeated_tool_error_threshold,
-            ),
-            progress_watchdog_repeated_provider_failure_threshold=_positive_int_from_env(
-                "OPENSQUILLA_PROGRESS_WATCHDOG_PROVIDER_FAILURE_THRESHOLD",
-                AgentConfig().progress_watchdog_repeated_provider_failure_threshold,
-            ),
-            progress_watchdog_repeated_failure_anchor_threshold=_positive_int_from_env(
-                "OPENSQUILLA_PROGRESS_WATCHDOG_FAILURE_ANCHOR_THRESHOLD",
-                AgentConfig().progress_watchdog_repeated_failure_anchor_threshold,
-            ),
-            # Retain legacy final-diff exclusion; no longer enables ledger export.
-            patch_evidence_ledger_path=(
-                os.environ.get("OPENSQUILLA_PATCH_EVIDENCE_LEDGER_PATH") or None
-            ),
-            finalize_evidence_gate_enabled=_finalize_evidence_gate_from_env(
-                aux.finalize_evidence_gate
-            ),
-            provider_context_block_feedback=_bool_from_env(
-                "OPENSQUILLA_PROVIDER_CONTEXT_BLOCK_FEEDBACK",
-                AgentConfig().provider_context_block_feedback,
-            ),
-            identical_request_loop_break_threshold=_nonnegative_int_from_env(
-                "OPENSQUILLA_IDENTICAL_REQUEST_LOOP_BREAK",
-                AgentConfig().identical_request_loop_break_threshold,
-            ),
-            deadline_wrapup_margin_seconds=_nonnegative_int_from_env(
-                "OPENSQUILLA_DEADLINE_WRAPUP_MARGIN_SECONDS",
-                AgentConfig().deadline_wrapup_margin_seconds,
-            ),
-            final_diff_salvage=_bool_from_env(
-                "OPENSQUILLA_FINAL_DIFF_SALVAGE",
-                AgentConfig().final_diff_salvage,
-            ),
-            max_iterations_deadline_extend_seconds=_nonnegative_int_from_env(
-                "OPENSQUILLA_MAX_ITERATIONS_DEADLINE_EXTEND_SECONDS",
-                AgentConfig().max_iterations_deadline_extend_seconds,
-            ),
-            final_diff_salvage_veto=_bool_from_env(
-                "OPENSQUILLA_FINAL_DIFF_SALVAGE_VETO",
-                AgentConfig().final_diff_salvage_veto,
-            ),
             reasoning_only_act_now=_bool_from_env(
                 "OPENSQUILLA_REASONING_ONLY_ACT_NOW",
                 AgentConfig().reasoning_only_act_now,
             ),
-            repeated_tool_call_recovery_threshold=_nonnegative_int_from_env(
-                "OPENSQUILLA_TOOL_REPEAT_NUDGE_THRESHOLD",
-                AgentConfig().repeated_tool_call_recovery_threshold,
-            ),
-            repeated_tool_call_recovery_extra_tools=_name_tuple_from_env(
-                "OPENSQUILLA_TOOL_REPEAT_NUDGE_TOOLS",
-            ),
             runtime_recovery_mode=_runtime_recovery_mode_from_env(),
-            runtime_recovery_source_loop_max_nudges=_positive_int_from_env(
-                "OPENSQUILLA_RUNTIME_RECOVERY_SOURCE_LOOP_MAX_NUDGES",
-                AgentConfig().runtime_recovery_source_loop_max_nudges,
-            ),
-            final_diff_contract_mode=_final_diff_contract_mode_from_env(),
-            source_diff_preservation_mode=_source_diff_preservation_mode_from_env(
-                aux.source_diff_preservation_mode
-            ),
-            source_diff_candidate_mode=_source_diff_candidate_mode_from_env(
-                aux.source_diff_candidate_mode
-            ),
             post_tool_empty_recovery_mode=_post_tool_empty_recovery_mode_from_env(),
             reasoning_prefill_recovery_mode=_reasoning_prefill_recovery_mode_from_env(),
             runtime_events_path=(os.environ.get("OPENSQUILLA_RUNTIME_EVENTS_PATH") or None),
@@ -1040,8 +850,6 @@ class AgentBootstrapStage:
                 effective_runtime_timeout=budgets.runtime_timeout,
                 effective_max_iterations=budgets.max_iterations,
                 effective_max_iterations_source=budgets.max_iterations_source,
-                effective_iteration_timeout=budgets.iteration_timeout,
-                effective_tool_timeout=budgets.tool_timeout,
                 effective_request_timeout=budgets.request_timeout,
                 effective_max_provider_retries=budgets.max_provider_retries,
                 model_capabilities=catalog.capabilities,

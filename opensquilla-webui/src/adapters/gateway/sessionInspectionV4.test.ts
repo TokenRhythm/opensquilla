@@ -8,7 +8,7 @@ import {
   SESSIONS_PREVIEW_METHOD,
   type SessionsPreviewResult,
 } from '@/contracts/generated/v4/sessionsPreview'
-import { SessionInspectionContractError } from '@/modules/sessionInspection'
+import { SessionInspectionContractError, SessionInspectionLogNotReadyError } from '@/modules/sessionInspection'
 import { createV4SessionInspection } from './sessionInspectionV4'
 
 interface Call {
@@ -114,7 +114,7 @@ describe('v4 SessionInspection Adapter', () => {
         abortAction: 'reject',
       },
     }])
-    expect(Object.keys(inspection).sort()).toEqual(['history', 'preview'])
+    expect(Object.keys(inspection).sort()).toEqual(['history', 'preview', 'readExecutionLog'])
     expect('open' in inspection).toBe(false)
     expect('subscribe' in inspection).toBe(false)
   })
@@ -211,4 +211,64 @@ describe('v4 SessionInspection Adapter', () => {
       .toThrow(RangeError)
     expect(harness.calls).toHaveLength(0)
   })
+})
+
+describe('execution log inspection', () => {
+  const method = 'sessions.executionLog.read'
+  const handle = `tr-${'a'.repeat(32)}`
+  const firstPage = {
+    storage_kind: 'execution_log', handle, content: '故障🙂\n', offset: 0,
+    returned_chars: 4, next_offset: 4, chars: 8, complete: true,
+  }
+
+  it('validates Unicode character offsets independently from JavaScript string length', async () => {
+    const harness = makeHarness()
+    harness.results.set(method, firstPage)
+    const inspection = createV4SessionInspection(harness.rpc, { concurrentHistoryReads: () => true })
+    const signal = new AbortController().signal
+    await expect(inspection.readExecutionLog(' alpha ', handle, 0, { signal })).resolves.toEqual({
+      handle, content: '故障🙂\n', offset: 0, nextOffset: 4, chars: 8, complete: true,
+    })
+    expect(harness.calls[0]).toMatchObject({
+      method, params: { sessionKey: 'alpha', handle, offset: 0, limit: 12000 },
+      options: { signal, timeoutAction: 'reject', abortAction: 'reject' },
+    })
+    harness.results.set(method, {
+      ...firstPage, content: 'next', offset: 4, next_offset: null, complete: false,
+    })
+    await expect(inspection.readExecutionLog('alpha', handle, 4)).resolves.toMatchObject({
+      content: 'next', offset: 4, nextOffset: null, complete: false,
+    })
+  })
+
+  it.each([
+    { content: 'x'.repeat(12001) }, { handle: `tr-${'b'.repeat(32)}` },
+    { returned_chars: 5 }, { next_offset: 5 }, { next_offset: null },
+    { chars: 2 }, { offset: 1 }, { content: '', returned_chars: 0, next_offset: 0 },
+    { complete: 'yes' },
+  ])('rejects malformed or inconsistent pages %j', async patch => {
+    const harness = makeHarness()
+    harness.results.set(method, { ...firstPage, ...patch })
+    const inspection = createV4SessionInspection(harness.rpc, { concurrentHistoryReads: () => true })
+    await expect(inspection.readExecutionLog('alpha', handle, 0)).rejects.toBeInstanceOf(
+      SessionInspectionContractError,
+    )
+  })
+
+  it('rejects invalid handles and offsets before making a request', async () => {
+    const harness = makeHarness()
+    const inspection = createV4SessionInspection(harness.rpc, { concurrentHistoryReads: () => true })
+    for (const [id, offset] of [[handle, -1], [handle, 0.5], ['../log', 0]] as const) {
+      await expect(inspection.readExecutionLog('alpha', id, offset)).rejects.toBeInstanceOf(TypeError)
+    }
+    expect(harness.calls).toHaveLength(0)
+  })
+})
+
+
+it('maps a pending execution log response to a domain error', async () => {
+  const request = vi.fn().mockRejectedValue({ code: 'NOT_READY', retryable: true })
+  const inspection = createV4SessionInspection({ request }, { concurrentHistoryReads: () => true })
+  await expect(inspection.readExecutionLog('alpha', `tr-${'a'.repeat(32)}`, 0))
+    .rejects.toBeInstanceOf(SessionInspectionLogNotReadyError)
 })

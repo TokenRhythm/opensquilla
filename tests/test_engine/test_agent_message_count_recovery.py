@@ -312,8 +312,8 @@ class _ScaffoldLimitToolProvider:
         return []
 
 
-class _PerturbedAssistantTailLimitProvider:
-    """Reject only the 101-message assistant-tail perturbation request."""
+class _AssistantTailLimitProvider:
+    """Model a 100-message limit during reasoning-prefill recovery."""
 
     provider_name = "tokenrhythm"
 
@@ -837,12 +837,10 @@ async def test_message_limit_projects_completed_live_rounds_when_durable_prefix_
     initial_projection = agent._project_provider_request_message_count(
         messages,
         config=chat_config,
-        identical_request_perturbed=False,
         request_context_message=None,
         request_context_insert_index=0,
         runtime_context_message=runtime_context,
         runtime_context_insert_index=0,
-        turn_objective_message=None,
     )
     assert initial_projection is not None
     limit = 20
@@ -863,12 +861,10 @@ async def test_message_limit_projects_completed_live_rounds_when_durable_prefix_
         request_suffix_messages=[],
         proof=proof,
         config=chat_config,
-        identical_request_perturbed=False,
         request_context_message=None,
         request_context_insert_index=0,
         runtime_context_message=runtime_context,
         runtime_context_insert_index=0,
-        turn_objective_message=None,
         protected_turn_start_index=0,
     )
 
@@ -1032,12 +1028,12 @@ async def test_reasoning_scaffold_cleanup_preserves_recovered_tool_pairing(
 
 
 @pytest.mark.asyncio
-async def test_assistant_tail_loop_perturbation_uses_actual_count_for_recovery(
+async def test_retired_loop_perturbation_does_not_create_message_count_overflow(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     compact_requests: list[Any] = []
     _install_exact_compactor(monkeypatch, compact_requests)
-    provider = _PerturbedAssistantTailLimitProvider()
+    provider = _AssistantTailLimitProvider()
     agent = Agent(
         provider=provider,
         config=AgentConfig(
@@ -1054,18 +1050,17 @@ async def test_assistant_tail_loop_perturbation_uses_actual_count_for_recovery(
         ),
     )
     # 98 historical messages + current user + reasoning prefill = 100 in the
-    # pure request view.  The opt-in loop perturbation sees an assistant tail
-    # and appends one user message, producing the exact rejected count of 101.
+    # pure request view. The retired loop setting must not append another
+    # synthetic user message and trigger unnecessary count-limit compaction.
     agent.set_history(_plain_history(98))
 
     events = [event async for event in agent.run_turn("current user request")]
 
-    limit_call = next(call for call in provider.calls if call["action"] == "limit")
+    assert [call["action"] for call in provider.calls] == ["reasoning", "final"]
     final_call = next(call for call in provider.calls if call["action"] == "final")
-    assert limit_call["projection"].actual_wire_messages == 101
-    assert final_call["projection"].actual_wire_messages <= 90
-    assert len(compact_requests) == 1
-    assert any(
+    assert final_call["projection"].actual_wire_messages == 100
+    assert not compact_requests
+    assert not any(
         isinstance(event, WarningEvent)
         and event.code == "provider_request_message_limit_recovery_success"
         for event in events

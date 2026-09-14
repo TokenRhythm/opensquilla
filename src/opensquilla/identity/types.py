@@ -65,9 +65,7 @@ class AgentProfile:
     prompt_mode: str = "full"
     # Deprecated, unused compatibility slot; preserve construction and saved configs.
     patch_evidence_protocol: bool = False
-    # Opt-in additive "Reproduction Evidence" prompt section paired with the
-    # loop-side finalize-time red-evidence gate (see engine.runtime
-    # _resolve_finalize_evidence_gate). Composes with any prompt_mode.
+    # Retired compatibility slot; never read by prompt assembly or execution.
     finalize_evidence_gate: bool = False
     # Deprecated, unused compatibility slot. Keep its position and default
     # so older positional callers still bind inject_time_prefix correctly.

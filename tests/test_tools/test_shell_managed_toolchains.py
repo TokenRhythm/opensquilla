@@ -111,7 +111,7 @@ async def test_background_process_passes_managed_environment_to_child(
         pid = 12345
         stdin = None
         stdout = _Stream()
-        returncode: int | None = None
+        returncode: int | None = 0
 
         async def wait(self) -> int:
             self.returncode = 0

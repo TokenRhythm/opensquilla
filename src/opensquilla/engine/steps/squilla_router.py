@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import threading
 import time
 from collections.abc import Mapping
@@ -1109,36 +1108,6 @@ def _complete_request_estimated_tokens(
         )
     )
 
-    reminder_tokens = 0
-    reminder_setting = os.environ.get(
-        "OPENSQUILLA_TURN_OBJECTIVE_REMINDER",
-        "",
-    ).strip().lower()
-    if reminder_setting in {"on", "1", "true", "yes"}:
-        reminder_chars = 2_000
-    elif reminder_setting.startswith("trim:") and reminder_setting[5:].isdigit():
-        reminder_chars = max(0, int(reminder_setting[5:]))
-    elif reminder_setting in {"", "off", "0", "false", "no"}:
-        reminder_chars = 0
-    else:
-        # Agent construction will reject an invalid setting. Counting the full
-        # message here keeps admission conservative until that validation runs.
-        reminder_chars = len(semantic_message)
-    if reminder_chars > 0 and semantic_message:
-        objective = semantic_message.strip()
-        if len(objective) > reminder_chars:
-            objective = objective[:reminder_chars].rstrip() + "..."
-        reminder_tokens = estimate_tokens(
-            "\n".join(
-                (
-                    "[Current user request reminder]",
-                    "This is the active user request for this same turn, not a new request.",
-                    "Continue using the tool results above to make progress on:",
-                    objective,
-                )
-            )
-        )
-
     # The remaining reserve is only provider-specific JSON/role framing. All
     # content-bearing records, including the later runtime record, are counted
     # explicitly above.
@@ -1150,7 +1119,6 @@ def _complete_request_estimated_tokens(
         + skills_context_tokens
         + request_context_wrapper_tokens
         + runtime_context_tokens
-        + reminder_tokens
         + framing_tokens
     )
     metadata["large_context_material_tokens"] = material_tokens
@@ -1165,8 +1133,6 @@ def _complete_request_estimated_tokens(
         )
     if skills_context_tokens:
         metadata["large_context_skills_context_tokens"] = skills_context_tokens
-    if reminder_tokens:
-        metadata["large_context_request_reminder_tokens"] = reminder_tokens
     return total
 
 

@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 from typing import Any
-from unittest.mock import Mock
 
 import pytest
 
@@ -12,7 +11,6 @@ from opensquilla.engine.runtime_diagnostics import (
     classify_path,
     normalize_command_family,
 )
-from opensquilla.engine.runtime_recovery import source_loop_recovery_decision
 from opensquilla.git_runtime import (
     GitCapability,
     GitCapabilityState,
@@ -60,30 +58,6 @@ def _write(path: str) -> dict[str, Any]:
 
 def _read(path: str) -> dict[str, Any]:
     return {"relative_path": path, "operation": "read"}
-
-
-def _source_loop_event(
-    *,
-    reason: str = "repeated_failure_anchor",
-    path: str = "src/lib.rs",
-    path_class: str = "source",
-) -> dict[str, Any]:
-    return {
-        "feature": "runtime_observer",
-        "reason": reason,
-        "trigger_count": 3,
-        "command_family": "cargo:test",
-        "failure_anchor_hash": "abc123",
-        "failure_anchor_excerpt": "error[E0592]: duplicate definitions",
-        "changed_files": [path],
-        "diff_paths": [path],
-        "diff_fingerprint_before": "diff-a",
-        "diff_fingerprint_after": "diff-a",
-        "path_classes": {
-            "changed_files": {path: path_class},
-            "diff_paths": {path: path_class},
-        },
-    }
 
 
 def _message_text(messages: list[Any]) -> str:
@@ -151,118 +125,6 @@ def test_runtime_diff_paths_preserve_non_repository_as_unknown(
 
     assert agent._workspace_diff_paths_for_runtime_event() is None
     assert agent._runtime_git_state is GitRunState.NOT_REPOSITORY
-
-
-def test_source_loop_recovery_log_mode_observes_only() -> None:
-    decision = source_loop_recovery_decision(
-        global_mode="log",
-        diagnostic_events=[_source_loop_event()],
-        attempted=False,
-    )
-
-    assert decision is not None
-    assert decision.mechanism == "source_loop_recovery"
-    assert decision.action == "observe"
-    assert decision.injected_to_model is False
-    assert decision.message is None
-    assert decision.details["diff_paths"] == ["src/lib.rs"]
-    assert decision.details["failure_anchor_hash"] == "abc123"
-
-
-def test_source_loop_recovery_warn_model_nudges_once() -> None:
-    decision = source_loop_recovery_decision(
-        global_mode="warn_model",
-        diagnostic_events=[_source_loop_event()],
-        attempted=False,
-    )
-
-    assert decision is not None
-    assert decision.action == "nudge"
-    assert decision.injected_to_model is True
-    assert decision.message
-    assert decision.message.startswith("[Runtime recovery]")
-    assert decision.details["trigger_reason"] == "repeated_failure_anchor"
-
-    assert (
-        source_loop_recovery_decision(
-            global_mode="warn_model",
-            diagnostic_events=[_source_loop_event()],
-            attempted=True,
-        )
-        is None
-    )
-
-
-def test_source_loop_recovery_can_nudge_for_new_event_key_with_budget() -> None:
-    first = source_loop_recovery_decision(
-        global_mode="warn_model",
-        diagnostic_events=[_source_loop_event()],
-        attempted=False,
-        attempted_event_keys=set(),
-        max_nudges=2,
-    )
-    assert first is not None
-    first_key = first.details["recovery_event_key"]
-
-    second = source_loop_recovery_decision(
-        global_mode="warn_model",
-        diagnostic_events=[
-            _source_loop_event(),
-            _source_loop_event(reason="edit_churn_after_failure"),
-        ],
-        attempted=True,
-        attempted_event_keys={first_key},
-        max_nudges=2,
-    )
-
-    assert second is not None
-    assert second.details["trigger_reason"] == "edit_churn_after_failure"
-    assert second.details["source_loop_recovery_count"] == 2
-
-    assert (
-        source_loop_recovery_decision(
-            global_mode="warn_model",
-            diagnostic_events=[_source_loop_event(reason="repeated_source_read_after_write")],
-            attempted=True,
-            attempted_event_keys={
-                first_key,
-                second.details["recovery_event_key"],
-            },
-            max_nudges=2,
-        )
-        is None
-    )
-
-
-def test_source_loop_recovery_ignores_test_only_diff() -> None:
-    decision = source_loop_recovery_decision(
-        global_mode="warn_model",
-        diagnostic_events=[
-            _source_loop_event(path="tests/test_lib.py", path_class="test"),
-        ],
-        attempted=False,
-    )
-
-    assert decision is None
-
-
-def test_source_loop_recovery_ignores_scratch_like_source_dir_diff() -> None:
-    decision = source_loop_recovery_decision(
-        global_mode="warn_model",
-        diagnostic_events=[
-            _source_loop_event(
-                path="crates/regex/src/test_word_bug.rs",
-                path_class=classify_path("crates/regex/src/test_word_bug.rs"),
-            ),
-            _source_loop_event(
-                path="crates/regex/src/word.rs.test_fix",
-                path_class=classify_path("crates/regex/src/word.rs.test_fix"),
-            ),
-        ],
-        attempted=False,
-    )
-
-    assert decision is None
 
 
 def test_runtime_diagnostics_emits_repeated_failure_anchor_at_threshold() -> None:
@@ -613,79 +475,7 @@ async def test_agent_runtime_diagnostics_write_jsonl_without_model_hint(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("event_output", [False, True])
-async def test_agent_source_loop_recovery_warns_model_once(
-    tmp_path,
-    monkeypatch: pytest.MonkeyPatch,
-    event_output: bool,
-) -> None:
-    runtime_events_path = tmp_path / "runtime_events.jsonl"
-    ledger_path = tmp_path / "retired-ledger.json"
-    workspace = tmp_path / "repo"
-    workspace.mkdir()
-    monkeypatch.setattr(
-        Agent,
-        "_workspace_diff_paths_for_runtime_event",
-        lambda self: ["src/lib.rs"],
-    )
-    monkeypatch.setattr(
-        Agent,
-        "_workspace_diff_fingerprint_for_runtime_event",
-        lambda self: "same-diff",
-    )
-    tool_context = ToolContext(workspace_dir=str(workspace), agent_id="agent-1")
-
-    async def handler(call: ToolCall) -> ToolResult:
-        tool_context.workspace_file_writes.append(_write("src/lib.rs"))
-        return ToolResult(
-            tool_use_id=call.tool_use_id,
-            tool_name=call.tool_name,
-            content="error[E0592]: duplicate definitions with name `fallback_service`",
-            is_error=True,
-        )
-
-    provider = _ThreeToolProvider()
-    agent = Agent(
-        provider=provider,
-        config=AgentConfig(
-            max_iterations=5,
-            runtime_events_path=str(runtime_events_path) if event_output else None,
-            patch_evidence_ledger_path=str(ledger_path),
-            runtime_recovery_mode="warn_model",
-            progress_watchdog_mode="log",
-            tool_result_projection_max_inline_chars=10_000,
-            tool_failure_loop_block_threshold=0,
-        ),
-        tool_definitions=[_tool_def("exec_command")],
-        tool_handler=handler,
-        tool_context=tool_context,
-        session_key="session-1",
-    )
-    turn_log = Mock(wraps=agent._write_turn_call_log)
-    monkeypatch.setattr(agent, "_write_turn_call_log", turn_log)
-
-    events = [event async for event in agent.run_turn("fix the bug")]
-
-    assert events
-    assert provider.calls == 4
-    assert "[Runtime recovery]" in _message_text(provider.messages_by_call[3])
-    assert "[Runtime recovery]" not in _message_text(agent._history)
-    assert any(call.args[0] == "runtime_recovery" for call in turn_log.call_args_list)
-    assert agent.config.metadata["source_loop_recoveries"] == 1
-    assert not ledger_path.exists()
-    if not event_output:
-        return
-
-    logged = [
-        json.loads(line)
-        for line in runtime_events_path.read_text(encoding="utf-8").splitlines()
-    ]
-    assert any(event.get("feature") == "runtime_observer" for event in logged)
-    assert not any(event.get("feature") == "runtime_recovery" for event in logged)
-
-
-@pytest.mark.asyncio
-async def test_git_unavailable_skips_runtime_recovery_without_extra_model_retry(
+async def test_git_unavailable_records_observation_without_extra_model_retry(
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -754,71 +544,3 @@ async def test_git_unavailable_skips_runtime_recovery_without_extra_model_retry(
     assert not any(
         event.get("mechanism") == "source_loop_recovery" for event in logged
     )
-
-
-@pytest.mark.asyncio
-async def test_agent_source_loop_recovery_can_warn_for_second_source_loop_key(
-    tmp_path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    runtime_events_path = tmp_path / "runtime_events.jsonl"
-    workspace = tmp_path / "repo"
-    workspace.mkdir()
-    monkeypatch.setattr(
-        Agent,
-        "_workspace_diff_paths_for_runtime_event",
-        lambda self: ["src/lib.rs"],
-    )
-    monkeypatch.setattr(
-        Agent,
-        "_workspace_diff_fingerprint_for_runtime_event",
-        lambda self: "same-diff",
-    )
-    tool_context = ToolContext(workspace_dir=str(workspace), agent_id="agent-1")
-    tool_results_seen = 0
-
-    async def handler(call: ToolCall) -> ToolResult:
-        nonlocal tool_results_seen
-        tool_results_seen += 1
-        tool_context.workspace_file_writes.append(_write("src/lib.rs"))
-        error_name = "fallback_service" if tool_results_seen <= 3 else "router_service"
-        return ToolResult(
-            tool_use_id=call.tool_use_id,
-            tool_name=call.tool_name,
-            content=f"error[E0592]: duplicate definitions with name `{error_name}`",
-            is_error=True,
-        )
-
-    provider = _ThreeToolProvider(tool_turns=6)
-    agent = Agent(
-        provider=provider,
-        config=AgentConfig(
-            max_iterations=8,
-            runtime_events_path=str(runtime_events_path),
-            runtime_recovery_mode="warn_model",
-            runtime_recovery_source_loop_max_nudges=2,
-            progress_watchdog_mode="log",
-            tool_result_projection_max_inline_chars=10_000,
-            tool_failure_loop_block_threshold=0,
-        ),
-        tool_definitions=[_tool_def("exec_command")],
-        tool_handler=handler,
-        tool_context=tool_context,
-        session_key="session-1",
-    )
-
-    events = [event async for event in agent.run_turn("fix the bug")]
-
-    assert events
-    assert provider.calls == 7
-    assert "[Runtime recovery]" in _message_text(provider.messages_by_call[3])
-    assert "[Runtime recovery]" in _message_text(provider.messages_by_call[6])
-    assert agent.config.metadata["source_loop_recoveries"] == 2
-    assert "[Runtime recovery]" not in _message_text(agent._history)
-
-    logged = [
-        json.loads(line)
-        for line in runtime_events_path.read_text(encoding="utf-8").splitlines()
-    ]
-    assert any(event.get("feature") == "runtime_observer" for event in logged)
-    assert not any(event.get("feature") == "runtime_recovery" for event in logged)

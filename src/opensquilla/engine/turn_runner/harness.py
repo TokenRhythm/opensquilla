@@ -473,11 +473,11 @@ class _TurnRunnerMemoryFingerprintAdapter(MemoryFingerprintPort):
 # ---------------------------------------------------------------------------
 
 class _TurnRunnerTimeoutBudgetAdapter(TimeoutBudgetPort):
-    """Bind the five ``TurnRunner._resolve_agent_*`` helpers as a single port.
+    """Bind the active ``TurnRunner._resolve_agent_*`` helpers as a single port.
 
     The adapter composes the resolver chain in the order the inline body
     walks it. ``effective_runtime_timeout`` honors the per-call
-    ``timeout`` override; the other four resolvers consume the per-call
+    ``timeout`` override; the remaining resolvers consume the per-call
     explicit override and the session/env/config fallback chain
     internally.
     """
@@ -491,8 +491,6 @@ class _TurnRunnerTimeoutBudgetAdapter(TimeoutBudgetPort):
         session_key: str,
         timeout: float | None,
         max_iterations: int | None,
-        iteration_timeout: float | None,
-        tool_timeout: float | None,
         request_timeout: float | None,
         max_provider_retries: int | None,
     ) -> _ResolvedBudgets:
@@ -514,12 +512,6 @@ class _TurnRunnerTimeoutBudgetAdapter(TimeoutBudgetPort):
             runtime_timeout=runtime_timeout,
             max_iterations=resolved_max_iterations,
             max_iterations_source=max_iterations_source,
-            iteration_timeout=self._runner._resolve_agent_iteration_timeout(
-                session_key, iteration_timeout
-            ),
-            tool_timeout=self._runner._resolve_agent_tool_timeout(
-                session_key, tool_timeout
-            ),
             request_timeout=self._runner._resolve_agent_request_timeout(
                 session_key, request_timeout
             ),
@@ -924,23 +916,6 @@ class _TurnRunnerAgentConfigBuilderAdapter(AgentConfigBuilderPort):
                 agent_token_cfg,
                 "tool_result_store_retention_seconds",
                 7 * 24 * 60 * 60,
-            ),
-            source_diff_preservation_mode=getattr(
-                runner._config,
-                "source_diff_preservation_mode",
-                "log",
-            ),
-            source_diff_candidate_mode=getattr(
-                runner._config,
-                "source_diff_candidate_mode",
-                "log",
-            ),
-            finalize_evidence_gate=bool(
-                getattr(
-                    getattr(runner._config, "prompt", None),
-                    "finalize_evidence_gate",
-                    False,
-                )
             ),
         )
 

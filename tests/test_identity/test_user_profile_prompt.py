@@ -259,14 +259,12 @@ def test_patch_evidence_protocol_absent_by_default() -> None:
 @pytest.mark.parametrize(
     "mode", ["full", "minimal", "none", "headless_source_edit", "headless_repo_coding_scaffold"]
 )
-@pytest.mark.parametrize("gate", [False, True])
 @pytest.mark.parametrize("tools", [None, ["exec_command", "read_file", "git_diff"]])
-def test_retired_patch_protocol_does_not_change_prompt(mode, gate, tools) -> None:
-    baseline = AgentProfile(agent_id="main", prompt_mode=mode, finalize_evidence_gate=gate)
+def test_retired_patch_protocol_does_not_change_prompt(mode, tools) -> None:
+    baseline = AgentProfile(agent_id="main", prompt_mode=mode)
     legacy = AgentProfile(
         agent_id="main",
         prompt_mode=mode,
-        finalize_evidence_gate=gate,
         patch_evidence_protocol=True,
     )
 
@@ -288,52 +286,37 @@ def test_patch_evidence_protocol_requires_tools() -> None:
     assert "## Patch Evidence Protocol" not in prompt
 
 
-def test_finalize_evidence_gate_section_renders_when_enabled() -> None:
+@pytest.mark.parametrize(
+    "mode", ["full", "minimal", "headless_source_edit", "headless_repo_coding_scaffold"]
+)
+def test_retired_finalize_evidence_gate_cannot_change_prompt(mode: str) -> None:
+    options = {"tools": ["exec_command", "read_file", "edit_file"]}
+    assert assemble_system_prompt(
+        AgentProfile(agent_id="main", prompt_mode=mode, finalize_evidence_gate=True), **options
+    ) == assemble_system_prompt(AgentProfile(agent_id="main", prompt_mode=mode), **options)
+
+
+@pytest.mark.parametrize(
+    "mode", ["full", "minimal", "headless_source_edit", "headless_repo_coding_scaffold"]
+)
+def test_tool_prompts_include_autonomous_recovery_contract(mode: str) -> None:
     prompt = assemble_system_prompt(
-        AgentProfile(
-            agent_id="main",
-            prompt_mode="headless_repo_coding_scaffold",
-            finalize_evidence_gate=True,
-        ),
-        tools=["exec_command", "read_file", "edit_file", "git_diff"],
+        AgentProfile(agent_id="main", prompt_mode=mode),
+        tools=["exec_command", "read_file", "edit_file"],
     )
-
-    assert "## Reproduction Evidence" in prompt
-    assert "binding evidence that the issue is not fixed yet" in prompt
-    assert "exits non-zero while the bug is present" in prompt
-    assert "re-run your reproduction and the most relevant existing test" in prompt
-    # The section must not contain minimality directives or wording that
-    # devalues reproduction evidence.
-    section = prompt.split("## Reproduction Evidence", 1)[1].split("## ", 1)[0]
-    assert "minimal" not in section.lower()
-    assert "not sufficient" not in section.lower()
-
-
-def test_finalize_evidence_gate_section_absent_by_default() -> None:
-    scaffold_prompt = assemble_system_prompt(
-        AgentProfile(agent_id="main", prompt_mode="headless_repo_coding_scaffold"),
-        tools=["exec_command", "read_file", "edit_file", "git_diff"],
-    )
-    full_prompt = assemble_system_prompt(
-        AgentProfile(agent_id="main", prompt_mode="full"),
-        tools=["exec_command", "read_file", "edit_file", "git_diff"],
-    )
-
-    assert "## Reproduction Evidence" not in scaffold_prompt
-    assert "## Reproduction Evidence" not in full_prompt
-
-
-def test_finalize_evidence_gate_section_requires_tools() -> None:
-    prompt = assemble_system_prompt(
-        AgentProfile(
-            agent_id="main",
-            prompt_mode="headless_repo_coding_scaffold",
-            finalize_evidence_gate=True,
-        ),
-        tools=None,
-    )
-
+    assert "including after tool failures" in prompt
+    assert "checks appropriate to the task" in prompt
+    assert "Respect user cancellation and explicit limits" in prompt
+    assert "inspect the current state before repeating" not in prompt
+    assert "explain the error before retrying" not in prompt
+    assert "When uncertain, ask for clarification" not in prompt
     assert "## Reproduction Evidence" not in prompt
+
+
+@pytest.mark.parametrize("mode,tools", [("none", ["exec_command"]), ("full", None)])
+def test_autonomous_recovery_contract_requires_tools_and_prompt(mode, tools) -> None:
+    prompt = assemble_system_prompt(AgentProfile(agent_id="main", prompt_mode=mode), tools=tools)
+    assert "## Task Completion" not in prompt
 
 
 def test_system_prompt_disambiguates_session_send_from_channel_message() -> None:

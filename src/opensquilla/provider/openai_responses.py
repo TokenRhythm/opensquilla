@@ -28,7 +28,7 @@ from .error_redaction import (
     redact_upstream_error_text,
     redacted_httpx_error,
 )
-from .failures import retry_after_from_headers
+from .failures import CONNECTION_FAILED_CODE, is_connection_failure, retry_after_from_headers
 from .openai import _http_error_body_text, _resolve_llm_proxy, _versioned_api_url
 from .protocol import ProviderConnectionConfig, ProviderMetadata
 from .request_proof import (
@@ -441,22 +441,24 @@ class OpenAIResponsesProvider:
                     json=payload,
                 )
         except httpx.TimeoutException as exc:
+            code = CONNECTION_FAILED_CODE if is_connection_failure(exc) else "timeout"
             message = redact_upstream_error_text(
                 f"Request timed out: {str(exc) or repr(exc)}",
                 api_key=self._api_key,
                 max_len=2000,
             )
-            trace.record_error(code="timeout", message=message)
-            yield ErrorEvent(message=message, code="timeout")
+            trace.record_error(code=code, message=message)
+            yield ErrorEvent(message=message, code=code)
             return
         except httpx.RequestError as exc:
+            code = CONNECTION_FAILED_CODE if is_connection_failure(exc) else "request_error"
             message = redact_upstream_error_text(
                 f"Request error: {str(exc) or repr(exc)}",
                 api_key=self._api_key,
                 max_len=2000,
             )
-            trace.record_error(code="request_error", message=message)
-            yield ErrorEvent(message=message, code="request_error")
+            trace.record_error(code=code, message=message)
+            yield ErrorEvent(message=message, code=code)
             return
 
         if response.status_code != 200:

@@ -8,141 +8,21 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from opensquilla.engine.agent import Agent, _IterationStreamTimeoutError
+from opensquilla.engine.agent import Agent
 from opensquilla.engine.runtime import TurnRunner
-from opensquilla.engine.types import AgentConfig, DoneEvent
-from opensquilla.gateway.config import GatewayConfig
-
-
-class _SessionConfigManager:
-    def __init__(self, config: object | None) -> None:
-        self.config = config
-
-    def get_session_config(self, session_key: str) -> object | None:
-        return self.config
-
-
-def test_resolve_agent_iteration_timeout_prefers_explicit_value(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setenv("OPENSQUILLA_AGENT_ITERATION_TIMEOUT", "222")
-    runner = TurnRunner(
-        provider_selector=None,
-        session_manager=_SessionConfigManager(
-            SimpleNamespace(agent_iteration_timeout_seconds=111.0)
-        ),
-        config=GatewayConfig(agent_iteration_timeout_seconds=333.0),
-    )
-
-    assert runner._resolve_agent_iteration_timeout("agent:main:test", 444.0) == 444.0
-
-
-def test_resolve_agent_iteration_timeout_prefers_session_config(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setenv("OPENSQUILLA_AGENT_ITERATION_TIMEOUT", "222")
-    runner = TurnRunner(
-        provider_selector=None,
-        session_manager=_SessionConfigManager(
-            SimpleNamespace(agent_iteration_timeout_seconds=111.0)
-        ),
-        config=GatewayConfig(agent_iteration_timeout_seconds=333.0),
-    )
-
-    assert runner._resolve_agent_iteration_timeout("agent:main:test") == 111.0
-
-
-def test_resolve_agent_iteration_timeout_prefers_env_over_gateway_config(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setenv("OPENSQUILLA_AGENT_ITERATION_TIMEOUT", "222")
-    runner = TurnRunner(
-        provider_selector=None,
-        session_manager=_SessionConfigManager(None),
-        config=GatewayConfig(agent_iteration_timeout_seconds=333.0),
-    )
-
-    assert runner._resolve_agent_iteration_timeout("agent:main:test") == 222.0
-
-
-def test_resolve_agent_iteration_timeout_uses_gateway_config(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.delenv("OPENSQUILLA_AGENT_ITERATION_TIMEOUT", raising=False)
-    runner = TurnRunner(
-        provider_selector=None,
-        config=GatewayConfig(agent_iteration_timeout_seconds=333.0),
-    )
-
-    assert runner._resolve_agent_iteration_timeout("agent:main:test") == 333.0
-
-
-def test_resolve_agent_iteration_timeout_uses_agent_default_without_config(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.delenv("OPENSQUILLA_AGENT_ITERATION_TIMEOUT", raising=False)
-    runner = TurnRunner(provider_selector=None, config=None)
-
-    assert (
-        runner._resolve_agent_iteration_timeout("agent:main:test")
-        == AgentConfig().iteration_timeout
-    )
-
-
-def test_resolve_agent_iteration_timeout_invalid_env_falls_through(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setenv("OPENSQUILLA_AGENT_ITERATION_TIMEOUT", "not-a-float")
-    runner = TurnRunner(
-        provider_selector=None,
-        session_manager=_SessionConfigManager(None),
-        config=GatewayConfig(agent_iteration_timeout_seconds=333.0),
-    )
-
-    assert runner._resolve_agent_iteration_timeout("agent:main:test") == 333.0
-
-
-def test_resolve_agent_iteration_timeout_floors_to_5400_in_coding_mode(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.delenv("OPENSQUILLA_AGENT_ITERATION_TIMEOUT", raising=False)
-    cfg = GatewayConfig(agent_iteration_timeout_seconds=600.0)
-    cfg.skills.coding_mode = True  # coding mode waits on code-task up to 90 min
-    runner = TurnRunner(provider_selector=None, config=cfg)
-    # the per-iteration watchdog is floored so a long process(wait) is not clamped
-    assert runner._resolve_agent_iteration_timeout("agent:main:test") == 5400.0
-
-
-def test_resolve_agent_iteration_timeout_no_floor_when_coding_off(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.delenv("OPENSQUILLA_AGENT_ITERATION_TIMEOUT", raising=False)
-    cfg = GatewayConfig(agent_iteration_timeout_seconds=600.0)
-    runner = TurnRunner(provider_selector=None, config=cfg)
-    # coding mode OFF -> the configured small value is preserved (no floor)
-    assert runner._resolve_agent_iteration_timeout("agent:main:test") == 600.0
-
-
-def test_resolve_agent_iteration_timeout_rejects_invalid_explicit_value() -> None:
-    runner = TurnRunner(provider_selector=None, config=GatewayConfig())
-
-    with pytest.raises(ValueError, match="iteration_timeout"):
-        runner._resolve_agent_iteration_timeout("agent:main:test", -1.0)
+from opensquilla.engine.types import AgentConfig
+from opensquilla.provider import DoneEvent, TextDeltaEvent
 
 
 @pytest.mark.asyncio
-async def test_run_threads_iteration_timeout_into_agent_config(
+@pytest.mark.parametrize("legacy_timeout", [0.001, 444.0, -1.0])
+@pytest.mark.parametrize("legacy_option", ["iteration_timeout", "tool_timeout"])
+async def test_run_accepts_legacy_tool_and_iteration_timeouts_without_enforcing_them(
     monkeypatch: pytest.MonkeyPatch,
+    legacy_timeout: float,
+    legacy_option: str,
 ) -> None:
-    """Regression: runner.run(iteration_timeout=X) must reach AgentConfig.
-
-    iteration_timeout was previously declared on TurnRunner.run() and
-    referenced inside _run_turn() at the resolver call site, but never
-    plumbed through _run_turn()'s signature or the two run() -> _run_turn()
-    call sites. Every turn would hit NameError before reaching the resolver.
-    The existing isolation tests above exercise the resolver directly and
-    so would not have caught the threading gap.
-    """
+    """Legacy callers remain accepted, but bootstrap never arms the old watchdog."""
     from opensquilla.tools.types import ToolContext
 
     seen_kwargs: list[dict[str, Any]] = []
@@ -158,7 +38,8 @@ async def test_run_threads_iteration_timeout_into_agent_config(
     provider.provider_name = "stub"
 
     async def _chat(*args: Any, **kwargs: Any) -> AsyncIterator[Any]:
-        yield DoneEvent()
+        yield TextDeltaEvent(text="done")
+        yield DoneEvent(stop_reason="stop", input_tokens=1, output_tokens=1)
 
     provider.chat = _chat
 
@@ -181,21 +62,25 @@ async def test_run_threads_iteration_timeout_into_agent_config(
 
     tool_ctx = ToolContext(session_key="agent:main:iter-thread-test")
 
-    async for _ in runner.run(
-        message="hi",
-        session_key="agent:main:iter-thread-test",
-        tool_context=tool_ctx,
-        iteration_timeout=444.0,
-    ):
-        pass
+    events = [
+        event
+        async for event in runner.run(
+            message="hi",
+            session_key="agent:main:iter-thread-test",
+            tool_context=tool_ctx,
+            **{legacy_option: legacy_timeout},
+        )
+    ]
 
-    assert any(kw.get("iteration_timeout") == 444.0 for kw in seen_kwargs), (
-        f"AgentConfig never received iteration_timeout=444.0; saw {seen_kwargs!r}"
-    )
+    assert not [event for event in events if event.kind == "error"]
+    assert any(event.kind == "done" for event in events)
+
+    assert seen_kwargs, "The turn must reach agent bootstrap"
+    assert all(kw.get(legacy_option, 0.0) == 0.0 for kw in seen_kwargs)
 
 
 @pytest.mark.asyncio
-async def test_stream_iteration_timeout_does_not_double_close_provider_stream(
+async def test_stream_total_timeout_does_not_double_close_provider_stream(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     agent = Agent.__new__(Agent)
@@ -217,15 +102,36 @@ async def test_stream_iteration_timeout_does_not_double_close_provider_stream(
 
     loop = asyncio.get_running_loop()
 
-    with pytest.raises(_IterationStreamTimeoutError):
+    with pytest.raises(TimeoutError, match="total timeout"):
         async for _event in agent._stream_provider_events_with_deadline(
             provider_stream(),
             loop=loop,
-            total_deadline=None,
+            total_deadline=loop.time() + 0.01,
         ):
             pass
 
     assert close_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_legacy_iteration_timeout_does_not_stop_a_provider_response() -> None:
+    agent = Agent.__new__(Agent)
+    agent.config = AgentConfig(iteration_timeout=0.001)
+
+    async def provider_stream() -> AsyncIterator[dict[str, str]]:
+        await asyncio.sleep(0.02)
+        yield {"type": "chunk", "data": "ready"}
+
+    events = [
+        event
+        async for event in agent._stream_provider_events_with_deadline(
+            provider_stream(),
+            loop=asyncio.get_running_loop(),
+            total_deadline=None,
+        )
+    ]
+
+    assert events == [{"type": "chunk", "data": "ready"}]
 
 
 @pytest.mark.asyncio

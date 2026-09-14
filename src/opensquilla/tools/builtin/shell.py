@@ -152,18 +152,18 @@ from opensquilla.skills.runtime_env import (
     managed_skill_env,
     managed_toolchain_readonly_paths,
 )
-from opensquilla.subprocess_encoding import apply_utf8_child_env, decode_subprocess_output
+from opensquilla.subprocess_encoding import apply_utf8_child_env
 from opensquilla.tools.builtin.shell_policy import PolicyResult as SafeBinPolicyResult
 from opensquilla.tools.builtin.shell_policy import check_safe_bin
+from opensquilla.tools.output_capture import (
+    BoundedOutputCapture,
+)
 from opensquilla.tools.path_policy import reject_foreign_host_path
 from opensquilla.tools.registry import tool
 from opensquilla.tools.run_mode import (
     current_run_mode,
     full_host_access_active,
     trusted_sandbox_active,
-)
-from opensquilla.tools.source_diff_preservation import (
-    source_diff_preservation_block_json,
 )
 from opensquilla.tools.types import (
     CallerKind,
@@ -1394,8 +1394,9 @@ class _BgSession:
     agent_id: str | None = None
     is_owner_run: bool = False
     local_urls: list[str] = field(default_factory=list)
-    output_bytes: bytearray = field(default_factory=bytearray)
+    output_capture: BoundedOutputCapture = field(default_factory=BoundedOutputCapture)
     output_lines: list[str] = field(default_factory=list)
+    code_task_marker: dict[str, str] | None = None
     done: bool = False
     timed_out: bool = False
     killed: bool = False
@@ -5586,30 +5587,6 @@ def _workspace_scratch_artifact_shell_block(
     return None
 
 
-def _source_diff_preservation_shell_block(
-    command: str,
-    workdir: str | None,
-    *,
-    stdin: str | None = None,
-) -> str | None:
-    source_diff_block = source_diff_preservation_block_json(
-        command=command,
-        workdir=workdir,
-    )
-    if source_diff_block is not None:
-        return source_diff_block
-    if stdin is None:
-        return None
-    for stdin_chunk in _iter_stdin_guard_chunks(stdin):
-        source_diff_block = source_diff_preservation_block_json(
-            command=stdin_chunk,
-            workdir=workdir,
-        )
-        if source_diff_block is not None:
-            return source_diff_block
-    return None
-
-
 def _resolve_exec_timeout(timeout: float | int | None) -> float:
     if timeout is None:
         return _DEFAULT_EXEC_TIMEOUT
@@ -5842,6 +5819,8 @@ def _bg_session_payload(session: _BgSession) -> dict[str, object]:
         "killed": session.killed,
         "timed_out": session.timed_out,
     }
+    if output_details := session.output_capture.describe(only_if_needed=True):
+        payload["output_capture"] = output_details
     if session.local_urls:
         payload["local_urls"] = list(session.local_urls)
     code_task = _code_task_status_payload(session)
@@ -5854,7 +5833,7 @@ def _code_task_status_payload(session: _BgSession) -> dict[str, object] | None:
     if "code-task" not in session.command:
         return None
     output = _bg_rendered_output(session)
-    marker = _parse_code_task_marker(output)
+    marker = session.code_task_marker or _parse_code_task_marker(output)
     if marker is None:
         return None
     status_path = Path(marker["status_path"]).expanduser()
@@ -5984,20 +5963,19 @@ def _require_bg_session(session_id: str | None) -> _BgSession:
     return session
 
 
-async def _read_bg_output(session: _BgSession) -> None:
-    stdout = session.process.stdout
-    if stdout is None:
-        return
-    while chunk := await stdout.read(4096):
-        # Accumulate raw bytes and decode the whole buffer at render time so a
-        # multibyte character split across a 4 KB chunk boundary is not garbled,
-        # and so Windows legacy-code-page output is decoded correctly (issue #336).
-        session.output_bytes.extend(chunk)
+async def _read_bg_output(session: _BgSession, process_exited: asyncio.Event) -> None:
+    await session.output_capture.drain(
+        session.process.stdout, process_exited=process_exited,
+        idle_timeout=_BACKGROUND_KILL_TIMEOUT,
+    )
 
 
 def _bg_rendered_output(session: _BgSession) -> str:
-    """Decode the collected process output and append any synthetic markers."""
-    return decode_subprocess_output(bytes(session.output_bytes)) + "".join(session.output_lines)
+    """Render bounded head/tail output and explicit retrieval/omission details."""
+    return (
+        session.output_capture.preview() + "".join(session.output_lines)
+        + session.output_capture.notice()
+    )
 
 
 def _finalize_bg_session(session: _BgSession) -> None:
@@ -6018,6 +5996,10 @@ def _finalize_bg_session(session: _BgSession) -> None:
 
 
 async def _finalize_bg_session_async(session: _BgSession) -> None:
+    if "code-task" in session.command and session.code_task_marker is None:
+        session.code_task_marker = _parse_code_task_marker(_bg_rendered_output(session))
+    await session.output_capture.finish_async()
+    session.output_capture.release_preview()
     _finalize_bg_session(session)
     callbacks = list(session.async_cleanup_callbacks)
     session.async_cleanup_callbacks.clear()
@@ -6191,13 +6173,19 @@ async def _cancel_exec_stdin_writer(proc: Any, writer_task: asyncio.Task[None] |
         await writer_task
 
 
-async def _await_bg_output_task(output_task: asyncio.Task[None]) -> None:
-    try:
-        await asyncio.wait_for(output_task, timeout=_BACKGROUND_KILL_TIMEOUT)
-    except TimeoutError:
-        output_task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await output_task
+class _NonblockingOutputPipe:
+    def __init__(self, fd: int) -> None:
+        os.set_blocking(fd, False)
+        self.fd = fd
+
+    async def read(self, n: int) -> bytes:
+        while True:
+            try:
+                return os.read(self.fd, n)
+            except BlockingIOError:
+                await asyncio.sleep(0.01)
+            except BrokenPipeError:
+                return b""
 
 
 def _create_windows_host_shell_process(command: str, **kwargs: Any) -> Any:
@@ -6276,37 +6264,55 @@ async def _run_windows_host_shell_command_with_stdin(
     effective_timeout: float,
     on_process_started: Callable[[], None] | None = None,
 ) -> str:
+    capture = await BoundedOutputCapture.create("exec")
+    read_fd, write_fd = os.pipe()
     try:
-        with tempfile.TemporaryFile() as output_file:
-            creationflags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
-            proc = _create_windows_host_shell_process(
-                command,
-                stdin=subprocess.PIPE,
-                stdout=output_file,
-                stderr=subprocess.STDOUT,
-                cwd=cwd,
-                env=env,
-                creationflags=creationflags,
-            )
+        # A pipe keeps Windows communicate(input=...) on its proven worker
+        # path without letting communicate accumulate stdout or an unlimited
+        # temporary file. The reader applies backpressure one chunk at a time.
+        with os.fdopen(read_fd, "rb", buffering=0) as reader:
+            with os.fdopen(write_fd, "wb", buffering=0) as writer:
+                output_reader = _NonblockingOutputPipe(reader.fileno())
+                creationflags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+                proc = _create_windows_host_shell_process(
+                    command, stdin=subprocess.PIPE, stdout=writer, stderr=subprocess.STDOUT,
+                    cwd=cwd, env=env, creationflags=creationflags,
+                )
             if on_process_started is not None:
                 on_process_started()
             process_tree = capture_process_tree_owner(proc, isolated=os.name == "nt")
-            completed = await _communicate_windows_host_shell_process(
-                proc,
-                process_tree,
-                stdin_bytes,
-                effective_timeout,
-            )
-            await _terminate_exec_process_tree(proc, process_tree)
-            output_file.flush()
-            output_file.seek(0)
-            raw_output = output_file.read()
+
+            process_exited = asyncio.Event()
+            output_task = asyncio.create_task(capture.drain(
+                output_reader, process_exited=process_exited,
+                idle_timeout=_BACKGROUND_KILL_TIMEOUT,
+            ))
+            try:
+                completed = await _communicate_windows_host_shell_process(
+                    proc, process_tree, stdin_bytes, effective_timeout,
+                )
+            finally:
+                try:
+                    await asyncio.shield(_terminate_exec_process_tree(proc, process_tree))
+                finally:
+                    process_exited.set()
+                    try:
+                        await output_task
+                    finally:
+                        await capture.finish_async()
             if not completed:
-                return _exec_timeout_output(effective_timeout, command, raw_output)
-            output = decode_subprocess_output(raw_output)
-            return f"exit_code={proc.returncode}\n{output}"
+                return (
+                    _exec_timeout_output(effective_timeout, command, capture.preview())
+                    + capture.notice(
+                        retrieval_needed=len(capture.preview()) > _EXEC_TIMEOUT_OUTPUT_TAIL_CHARS,
+                    )
+                )
+            return f"exit_code={proc.returncode}\n{capture.preview()}{capture.notice()}"
     except Exception as exc:
-        return f"[error] {exc}"
+        output = capture.preview() + capture.notice()
+        return f"[error] {exc}" + (f"\n{output}" if output else "")
+    finally:
+        await capture.finish_async()
 
 
 def _exec_timeout_output(effective_timeout: float, command: str, raw: bytes | str) -> str:
@@ -6338,81 +6344,71 @@ async def _run_host_shell_command(
 ) -> str:
     if _use_windows_blocking_exec_stdin() and stdin_bytes is not None:
         return await _run_windows_host_shell_command_with_stdin(
-            command,
-            cwd=cwd,
-            env=env,
-            stdin_bytes=stdin_bytes,
-            effective_timeout=effective_timeout,
-            on_process_started=on_process_started,
+            command, cwd=cwd, env=env, stdin_bytes=stdin_bytes,
+            effective_timeout=effective_timeout, on_process_started=on_process_started,
         )
+    capture = await BoundedOutputCapture.create("exec")
     try:
-        with tempfile.TemporaryFile() as output_file:
-            subprocess_kwargs: dict[str, Any] = {
-                "stdin": asyncio.subprocess.PIPE if stdin_bytes is not None else None,
-                "stdout": output_file,
-                "stderr": asyncio.subprocess.STDOUT,
-                "cwd": cwd,
-                "env": env,
-            }
-            if os.name == "posix":
-                subprocess_kwargs["start_new_session"] = True
-            else:
-                creationflags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
-                if creationflags:
-                    subprocess_kwargs["creationflags"] = creationflags
-
-            loop = asyncio.get_running_loop()
-            deadline = loop.time() + effective_timeout
-
-            def timeout_result() -> str:
-                output_file.flush()
-                output_file.seek(0)
-                return _exec_timeout_output(effective_timeout, command, output_file.read())
-
-            proc = await _create_host_shell_subprocess(command, **subprocess_kwargs)
-            if on_process_started is not None:
-                on_process_started()
-            process_tree = capture_process_tree_owner(proc, isolated=True)
-            stdin_writer: asyncio.Task[None] | None = None
+        subprocess_kwargs: dict[str, Any] = {
+            "stdin": asyncio.subprocess.PIPE if stdin_bytes is not None else None,
+            "stdout": asyncio.subprocess.PIPE, "stderr": asyncio.subprocess.STDOUT,
+            "cwd": cwd, "env": env,
+        }
+        if os.name == "posix":
+            subprocess_kwargs["start_new_session"] = True
+        else:
+            creationflags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+            if creationflags:
+                subprocess_kwargs["creationflags"] = creationflags
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + effective_timeout
+        proc = await _create_host_shell_subprocess(command, **subprocess_kwargs)
+        if on_process_started is not None:
+            on_process_started()
+        process_tree = capture_process_tree_owner(proc, isolated=True)
+        process_exited = asyncio.Event()
+        output_task = asyncio.create_task(capture.drain(
+            proc.stdout, process_exited=process_exited,
+            idle_timeout=_BACKGROUND_KILL_TIMEOUT,
+        ))
+        stdin_writer: asyncio.Task[None] | None = None
+        completed = False
+        try:
             remaining = deadline - loop.time()
-            if remaining <= 0:
-                await _terminate_exec_process_tree(proc, process_tree)
-                return timeout_result()
-            try:
+            if remaining > 0:
                 if stdin_bytes is not None:
                     stdin_writer = asyncio.create_task(_write_exec_stdin(proc, stdin_bytes))
-                    if not await _wait_exec_stdin_writer(proc, stdin_writer, remaining):
-                        await _cancel_exec_stdin_writer(proc, stdin_writer)
-                        await _terminate_exec_process_tree(proc, process_tree)
-                        return timeout_result()
-            except TimeoutError:
-                await _cancel_exec_stdin_writer(proc, stdin_writer)
-                await _terminate_exec_process_tree(proc, process_tree)
-                return timeout_result()
-            except asyncio.CancelledError:
-                await _cancel_exec_stdin_writer(proc, stdin_writer)
-                await asyncio.shield(_terminate_exec_process_tree(proc, process_tree))
-                raise
-
-            try:
+                    written = await _wait_exec_stdin_writer(proc, stdin_writer, remaining)
+                else:
+                    written = True
                 remaining = deadline - loop.time()
-                if remaining <= 0 or not await _wait_exec_process(proc, remaining):
-                    await _cancel_exec_stdin_writer(proc, stdin_writer)
-                    await _terminate_exec_process_tree(proc, process_tree)
-                    return timeout_result()
-            except asyncio.CancelledError:
+                if written and remaining > 0:
+                    completed = await _wait_exec_process(proc, remaining)
+        except TimeoutError:
+            pass
+        finally:
+            try:
                 await _cancel_exec_stdin_writer(proc, stdin_writer)
                 await asyncio.shield(_terminate_exec_process_tree(proc, process_tree))
-                raise
-            await _cancel_exec_stdin_writer(proc, stdin_writer)
-            await _terminate_exec_process_tree(proc, process_tree)
-
-            output_file.flush()
-            output_file.seek(0)
-            output = decode_subprocess_output(output_file.read())
-            return f"exit_code={proc.returncode}\n{output}"
-    except Exception as e:
-        return f"[error] {e}"
+            finally:
+                process_exited.set()
+                try:
+                    await output_task
+                finally:
+                    await capture.finish_async()
+        if not completed:
+            return (
+                _exec_timeout_output(effective_timeout, command, capture.preview())
+                + capture.notice(
+                    retrieval_needed=len(capture.preview()) > _EXEC_TIMEOUT_OUTPUT_TAIL_CHARS,
+                )
+            )
+        return f"exit_code={proc.returncode}\n{capture.preview()}{capture.notice()}"
+    except Exception as exc:
+        output = capture.preview() + capture.notice()
+        return f"[error] {exc}" + (f"\n{output}" if output else "")
+    finally:
+        await capture.finish_async()
 
 
 async def _run_full_host_shell_command(
@@ -6641,9 +6637,6 @@ async def exec_command(
     scratch_block = _workspace_scratch_artifact_shell_block("exec_command", command, cwd)
     if scratch_block is not None:
         return json.dumps(scratch_block, ensure_ascii=False)
-    source_diff_block = _source_diff_preservation_shell_block(command, cwd, stdin=stdin)
-    if source_diff_block is not None:
-        return source_diff_block
     if not host_execution:
         hard_block = _shell_elevation_hard_block(
             "exec_command",
@@ -6989,6 +6982,11 @@ async def _start_host_background_process(
         **process_kwargs,
     )
     process_tree = capture_process_tree_owner(proc, isolated=True)
+    try:
+        output_capture = await BoundedOutputCapture.create("background_process")
+    except asyncio.CancelledError:
+        await asyncio.shield(_terminate_exec_process_tree(proc, process_tree))
+        raise
 
     ctx = current_tool_context.get()
     session = _BgSession(
@@ -7000,21 +6998,25 @@ async def _start_host_background_process(
         task_id=ctx.task_id if ctx is not None else None,
         agent_id=ctx.agent_id if ctx is not None else None,
         is_owner_run=bool(ctx.is_owner) if ctx is not None else False,
+        output_capture=output_capture,
         local_urls=_local_server_urls_from_command(command),
     )
     _bg_sessions[session_id] = session
 
     async def _collect_host() -> None:
-        output_task = asyncio.create_task(_read_bg_output(session))
+        process_exited = asyncio.Event()
+        output_task = asyncio.create_task(_read_bg_output(session, process_exited))
         try:
-            await asyncio.wait_for(proc.wait(), timeout=effective_timeout)
-        except TimeoutError:
-            session.timed_out = True
-            await _terminate_bg_session(session)
-            session.output_lines.append(f"[timeout after {effective_timeout}s]\n")
+            if not await _wait_exec_process(proc, effective_timeout):
+                session.timed_out = True
+                await _terminate_bg_session(session)
+                session.output_lines.append(f"[timeout after {effective_timeout}s]\n")
         finally:
-            await _await_bg_output_task(output_task)
-            await _finalize_bg_session_async(session)
+            process_exited.set()
+            try:
+                await output_task
+            finally:
+                await _finalize_bg_session_async(session)
 
     session.collector_task = asyncio.create_task(_collect_host())
     return _background_process_result(session)
@@ -7157,9 +7159,6 @@ async def background_process(
     )
     if scratch_block is not None:
         return json.dumps(scratch_block, ensure_ascii=False)
-    source_diff_block = _source_diff_preservation_shell_block(command, cwd)
-    if source_diff_block is not None:
-        return source_diff_block
     if not host_execution:
         hard_block = _shell_elevation_hard_block(
             "background_process",
@@ -7339,6 +7338,12 @@ async def background_process(
                 await managed_network.cleanup()
                 raise
             session_id = str(uuid.uuid4())[:8]
+            try:
+                output_capture = await BoundedOutputCapture.create("background_process")
+            except asyncio.CancelledError:
+                # Capture setup can be cancelled before session registration.
+                await _cleanup_unregistered_background_spawn(spawned, managed_network.cleanup)
+                raise
             ctx = current_tool_context.get()
             session = _BgSession(
                 session_id=session_id,
@@ -7349,6 +7354,7 @@ async def background_process(
                 task_id=ctx.task_id if ctx is not None else None,
                 agent_id=ctx.agent_id if ctx is not None else None,
                 is_owner_run=bool(ctx.is_owner) if ctx is not None else False,
+                output_capture=output_capture,
                 local_urls=_local_server_urls_from_command(command),
                 cleanup_callbacks=spawned.cleanup_callbacks,
                 async_cleanup_callbacks=[
@@ -7359,16 +7365,19 @@ async def background_process(
             _bg_sessions[session_id] = session
 
             async def _collect_restricted() -> None:
-                output_task = asyncio.create_task(_read_bg_output(session))
+                process_exited = asyncio.Event()
+                output_task = asyncio.create_task(_read_bg_output(session, process_exited))
                 try:
-                    await asyncio.wait_for(spawned.process.wait(), timeout=effective_timeout)
-                except TimeoutError:
-                    session.timed_out = True
-                    await _terminate_bg_session(session)
-                    session.output_lines.append(f"[timeout after {effective_timeout}s]\n")
+                    if not await _wait_exec_process(spawned.process, effective_timeout):
+                        session.timed_out = True
+                        await _terminate_bg_session(session)
+                        session.output_lines.append(f"[timeout after {effective_timeout}s]\n")
                 finally:
-                    await _await_bg_output_task(output_task)
-                    await _finalize_bg_session_async(session)
+                    process_exited.set()
+                    try:
+                        await output_task
+                    finally:
+                        await _finalize_bg_session_async(session)
 
             session.collector_task = asyncio.create_task(_collect_restricted())
             return _background_process_result(session)
@@ -7388,6 +7397,32 @@ async def background_process(
         effective_timeout=effective_timeout,
         runtime=runtime,
     )
+
+
+async def _cleanup_unregistered_background_spawn(
+    spawned: _SpawnedBackgroundProcess,
+    cleanup_network: Callable[[], Awaitable[None]],
+) -> None:
+    """Keep ownership of a successful spawn interrupted before registration."""
+    async def cleanup() -> None:
+        try:
+            await _terminate_exec_process_tree(spawned.process, spawned.process_tree)
+        finally:
+            for callback in spawned.cleanup_callbacks:
+                with contextlib.suppress(Exception):
+                    callback()
+            for async_callback in (*spawned.async_cleanup_callbacks, cleanup_network):
+                with contextlib.suppress(Exception):
+                    await async_callback()
+
+    cleanup_task = asyncio.create_task(cleanup())
+    try:
+        await asyncio.shield(cleanup_task)
+    except asyncio.CancelledError:
+        from opensquilla.engine.cancellation import park_background_task
+
+        park_background_task(cleanup_task, operation="unregistered_background_spawn")
+        raise
 
 
 async def _spawn_sandboxed_background_process(
@@ -7670,7 +7705,9 @@ async def process(
                         asyncio.shield(session.collector_task),
                         timeout=_BACKGROUND_KILL_TIMEOUT,
                     )
-            if not session.done:
+            if not session.done and (
+                session.collector_task is None or session.collector_task.done()
+            ):
                 await _finalize_bg_session_async(session)
         return json.dumps(
             {
@@ -7682,12 +7719,24 @@ async def process(
         )
 
     if action == "log":
-        output = _bg_rendered_output(session)
         start = max(0, int(offset or 0))
         requested_limit = 20000 if limit is None else int(limit)
         max_chars = max(0, min(requested_limit, 100000))
         end = start + max_chars
-        sliced = output[start:end]
+        capture = session.output_capture
+        if capture.spool is not None:
+            try:
+                sliced, total_chars = await asyncio.to_thread(capture.read_slice, start, end)
+            except (OSError, ValueError):
+                capture.incomplete_reason = "stored output unavailable; preview only"
+                output = await capture.preview_async()
+                sliced, total_chars = output[start:end], len(output)
+        else:
+            # Embedded callers may have no result store. Keep their existing
+            # preview, without mixing capture instructions into log offsets.
+            output = capture.preview() + "".join(session.output_lines)
+            sliced, total_chars = output[start:end], len(output)
+        output_details = session.output_capture.describe(only_if_needed=True)
         return json.dumps(
             {
                 "status": "ok",
@@ -7696,7 +7745,12 @@ async def process(
                 "output": sliced,
                 "offset": start,
                 "limit": max_chars,
-                "truncated": start > 0 or end < len(output),
+                "total_chars": total_chars,
+                "truncated": bool(
+                    start > 0 or end < total_chars
+                    or capture.storage_error or capture.incomplete_reason
+                    or (capture.spool is None and output_details.get("preview_omitted_bytes"))
+                ),
             }
         )
 
@@ -7711,7 +7765,9 @@ async def process(
                         asyncio.shield(session.collector_task),
                         timeout=_BACKGROUND_KILL_TIMEOUT,
                     )
-            if not session.done:
+            if not session.done and (
+                session.collector_task is None or session.collector_task.done()
+            ):
                 await _finalize_bg_session_async(session)
             status = _bg_status(session)
             return json.dumps(
@@ -7731,7 +7787,9 @@ async def process(
                     asyncio.shield(session.collector_task),
                     timeout=_BACKGROUND_KILL_TIMEOUT,
                 )
-        if not session.done:
+        if not session.done and (
+            session.collector_task is None or session.collector_task.done()
+        ):
             await _finalize_bg_session_async(session)
         status = _bg_status(session)
         return json.dumps(

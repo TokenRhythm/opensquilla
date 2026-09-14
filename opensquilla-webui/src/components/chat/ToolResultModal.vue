@@ -12,6 +12,15 @@
         </div>
         <div class="tool-sheet__actions">
           <button
+            v-if="canReadExecutionLog"
+            type="button"
+            class="btn btn--ghost tool-sheet__mode"
+            :disabled="logLoading"
+            @click="toggleExecutionLog"
+          >
+            {{ logMode ? t('chat.toolModal.toolResult') : t('chat.toolModal.executionLog') }}
+          </button>
+          <button
             v-if="treeHtml"
             type="button"
             class="btn btn--ghost tool-sheet__mode"
@@ -44,6 +53,22 @@
         </div>
       </header>
 
+      <div v-if="logMode" class="tool-sheet__log-navigation">
+        <form class="tool-sheet__log-controls" @submit.prevent="loadExecutionLog(Number(logOffsetInput))">
+          <label>
+            {{ t('chat.toolModal.characterOffset') }}
+            <input v-model="logOffsetInput" type="number" min="0" step="1" :disabled="logLoading">
+          </label>
+          <button type="submit" class="btn btn--ghost" :disabled="logLoading">{{ t(logPending ? 'chat.toolModal.retry' : 'chat.toolModal.go') }}</button>
+          <button type="button" class="btn btn--ghost" :disabled="logLoading || !logPage?.offset" @click="loadExecutionLog(Math.max(0, (logPage?.offset || 0) - LOG_PAGE_CHARS))">{{ t('chat.toolModal.previous') }}</button>
+          <button type="button" class="btn btn--ghost" :disabled="logLoading || logPage?.nextOffset == null" @click="loadExecutionLog(logPage?.nextOffset ?? 0)">{{ t('chat.toolModal.next') }}</button>
+        </form>
+        <p role="status">{{ logLoading ? t('chat.loadingEllipsis') : logPageRange }}</p>
+        <p v-if="logPending" role="status">{{ t('chat.toolModal.logPending') }}</p>
+        <p v-if="logError" role="alert">{{ t('chat.toolModal.logReadFailed') }}</p>
+        <p v-if="logPage && !logPage.complete" class="tool-sheet__log-warning">{{ t('chat.toolModal.logIncomplete') }}</p>
+      </div>
+
       <div class="tool-sheet__body">
         <div
           v-if="treeHtml && !rawMode"
@@ -62,7 +87,7 @@
           :aria-label="viewerRegionLabel"
         >
           <pre v-if="showLineNumbers" class="tool-sheet__line-numbers" aria-hidden="true">{{ lineNumberText }}</pre>
-          <pre class="tool-sheet__pre"><!-- eslint-disable-next-line vue/no-v-html -- Highlight.js escapes source and DOMPurify allow-lists its generated spans. --><code v-if="highlightedContent" class="hljs" :class="`language-${viewerLanguage}`" v-html="highlightedContent" /><code v-else>{{ content }}</code></pre>
+          <pre class="tool-sheet__pre"><!-- eslint-disable-next-line vue/no-v-html -- Highlight.js escapes source and DOMPurify allow-lists its generated spans. --><code v-if="highlightedContent" class="hljs" :class="`language-${viewerLanguage}`" v-html="highlightedContent" /><code v-else>{{ viewContent }}</code></pre>
         </div>
       </div>
     </aside>
@@ -70,7 +95,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onBeforeUnmount, ref, toRef, watch } from 'vue'
+import { computed, inject, onBeforeUnmount, ref, toRef, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import DOMPurify from 'dompurify'
 import hljs from 'highlight.js/lib/common'
@@ -78,6 +103,7 @@ import Icon from '@/components/Icon.vue'
 import { useDialogA11y } from '@/composables/useDialogA11y'
 import { useToasts } from '@/composables/useToasts'
 import type { ToolResultContext } from '@/types/chat'
+import { SESSION_INSPECTION_KEY, SessionInspectionLogNotReadyError, type ExecutionLogPage } from '@/modules/sessionInspection'
 import { copyTextWithFallback } from '@/utils/browser'
 
 const { t } = useI18n()
@@ -88,6 +114,7 @@ const props = defineProps<{
   title: string
   content: string
   context?: ToolResultContext
+  sessionKey?: string
 }>()
 
 const emit = defineEmits<{
@@ -100,6 +127,7 @@ const AUTO_OPEN_DEPTH = 2
 const MAX_TREE_SOURCE_CHARS = 300000
 const MAX_LEAF_STRING_CHARS = 2000
 const MAX_TREE_NODES = 4000
+const LOG_PAGE_CHARS = 12000
 
 const EXTENSION_LANGUAGE: Record<string, string> = {
   bash: 'bash',
@@ -147,6 +175,80 @@ const copied = ref(false)
 const closeBtn = ref<HTMLButtonElement | null>(null)
 const rootRef = ref<HTMLElement | null>(null)
 let copiedResetId: ReturnType<typeof setTimeout> | null = null
+const inspection = inject(SESSION_INSPECTION_KEY, null)
+const logMode = ref(false)
+const logPage = ref<ExecutionLogPage | null>(null)
+const logLoading = ref(false)
+const logError = ref(false)
+const logPending = ref(false)
+const logOffsetInput = ref<number | string>(0)
+let logRequest: AbortController | null = null
+const canReadExecutionLog = computed(() => Boolean(
+  inspection && props.sessionKey && props.context?.executionLogHandle
+    && props.context?.section !== 'input',
+))
+const viewContent = computed(() => logMode.value ? logPage.value?.content || '' : props.content)
+const logPageRange = computed(() => {
+  if (!logPage.value) return ''
+  const page = logPage.value
+  return t('chat.toolModal.logRange', {
+    start: page.content ? page.offset + 1 : page.offset,
+    end: page.offset + Array.from(page.content).length,
+    total: page.chars,
+  })
+})
+
+function resetExecutionLog() {
+  logRequest?.abort()
+  logRequest = null
+  logMode.value = false
+  logPage.value = null
+  logLoading.value = false
+  logError.value = false
+  logPending.value = false
+  logOffsetInput.value = 0
+  copied.value = false
+}
+
+async function loadExecutionLog(offset: number) {
+  if (!inspection || !props.sessionKey || !props.context?.executionLogHandle
+    || !Number.isSafeInteger(offset) || offset < 0) return
+  logRequest?.abort()
+  const request = new AbortController()
+  logRequest = request
+  logLoading.value = true
+  logError.value = false
+  logPending.value = false
+  try {
+    const page = await inspection.readExecutionLog(
+      props.sessionKey, props.context.executionLogHandle, offset, { signal: request.signal },
+    )
+    if (logRequest !== request || request.signal.aborted) return
+    copied.value = false
+    logPage.value = page
+    logOffsetInput.value = page.offset
+  } catch (error) {
+    if (logRequest === request && !request.signal.aborted) {
+      logPending.value = error instanceof SessionInspectionLogNotReadyError
+      logError.value = !logPending.value
+    }
+  } finally {
+    if (logRequest === request) {
+      logLoading.value = false
+      logRequest = null
+    }
+  }
+}
+
+function toggleExecutionLog() {
+  if (logMode.value) {
+    resetExecutionLog()
+  } else {
+    logMode.value = true
+    rawMode.value = true
+    void loadExecutionLog(0)
+  }
+}
 
 // Trap Tab focus inside the sheet, close on Escape, and restore focus to the
 // invoker on close; initial focus lands on the close button.
@@ -207,32 +309,36 @@ const filePath = computed(() =>
 const fileName = computed(() => filenameFromPath(filePath.value))
 const displayTitle = computed(() => fileName.value || props.title)
 const dialogLabel = computed(() => fileName.value ? `${fileName.value} · ${props.title}` : props.title)
-const contentLines = computed(() => props.content ? props.content.split(/\r\n|\r|\n/) : [])
+const contentLines = computed(() => viewContent.value ? viewContent.value.split(/\r\n|\r|\n/) : [])
 const viewerLanguage = computed(() => {
+  if (logMode.value) return 'plaintext'
   if (props.context?.format === 'diff') return 'diff'
   if (isReadFileSection.value && props.context?.section === 'error') return 'plaintext'
   const languagePath = props.context?.section === 'result' ? filePath.value : ''
-  return inferredLanguage(props.content, languagePath)
+  return inferredLanguage(viewContent.value, languagePath)
 })
 const viewerLanguageLabel = computed(() => LANGUAGE_LABEL[viewerLanguage.value] || 'Text')
 const contentMeta = computed(() => t('chat.toolModal.contentMeta', {
   type: viewerLanguageLabel.value,
   lines: contentLines.value.length.toLocaleString(),
-  chars: props.content.length.toLocaleString(),
+  chars: Array.from(viewContent.value).length.toLocaleString(),
 }))
 const viewerRegionLabel = computed(() => `${displayTitle.value} · ${contentMeta.value}`)
 const showLineNumbers = computed(() =>
   !wrapLines.value
+    && !logMode.value
     && contentLines.value.length > 0
     && contentLines.value.length <= MAX_LINE_NUMBER_COUNT,
 )
 const lineNumberText = computed(() =>
   Array.from({ length: contentLines.value.length }, (_, index) => String(index + 1)).join('\n'),
 )
-const copyLabel = computed(() => copied.value ? t('chat.copied') : t('chat.copy'))
+const copyLabel = computed(() => copied.value
+  ? t('chat.copied')
+  : t(logMode.value ? 'chat.toolModal.copyPage' : 'chat.copy'))
 
 const highlightedContent = computed(() => {
-  const content = props.content
+  const content = viewContent.value
   const language = viewerLanguage.value
   if (!content || content.length > HIGHLIGHT_MAX_CHARS || language === 'plaintext' || !hljs.getLanguage(language)) return ''
   try {
@@ -245,7 +351,7 @@ const highlightedContent = computed(() => {
 
 async function copyContent() {
   try {
-    await copyTextWithFallback(props.content)
+    await copyTextWithFallback(viewContent.value)
     copied.value = true
     if (copiedResetId) clearTimeout(copiedResetId)
     copiedResetId = setTimeout(() => {
@@ -296,7 +402,8 @@ function nodeHtml(value: unknown, key: string, depth: number, budget: { left: nu
 
 // Pre-rendered, fully escaped fold tree; empty string means "not JSON".
 const treeHtml = computed(() => {
-  const text = (props.content || '').trim()
+  if (logMode.value) return ''
+  const text = (viewContent.value || '').trim()
   if (!text || text.length > MAX_TREE_SOURCE_CHARS) return ''
   if (!/^[[{]/.test(text)) return ''
   try {
@@ -321,7 +428,10 @@ watch(() => props.open, open => {
   }
 })
 
+watch(() => [props.open, props.sessionKey, props.context?.executionLogHandle, props.context?.section], resetExecutionLog)
+
 onBeforeUnmount(() => {
+  resetExecutionLog()
   if (copiedResetId) clearTimeout(copiedResetId)
 })
 </script>
@@ -435,6 +545,29 @@ onBeforeUnmount(() => {
   min-height: 0;
   overflow: hidden;
   padding: var(--sp-3);
+}
+
+.tool-sheet__log-navigation {
+  border-bottom: 1px solid var(--border);
+  padding: var(--sp-2) var(--sp-4);
+  font-size: var(--fs-xs);
+}
+
+.tool-sheet__log-controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--sp-2);
+}
+
+.tool-sheet__log-controls input {
+  width: 9rem;
+  max-width: 100%;
+  margin-left: var(--sp-2);
+}
+
+.tool-sheet__log-warning {
+  color: var(--text-muted);
 }
 
 .tool-sheet__code,

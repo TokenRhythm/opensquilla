@@ -126,7 +126,7 @@ describe('ActivityToolDetails adaptive detail window', () => {
     expect(el.querySelector('.activity-tool-details__summary')).toBeNull()
     expect(el.querySelector('.activity-tool-details__fade')).not.toBeNull()
     expect(copy?.getAttribute('aria-label')).toBe('Copy')
-    expect(viewFull?.textContent?.trim()).toBe('view full')
+    expect(viewFull?.textContent?.trim()).toBe('expand content')
 
     copy?.click()
 

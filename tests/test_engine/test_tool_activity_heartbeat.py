@@ -54,11 +54,14 @@ class _OneToolProvider:
         return []
 
 
-def _tool_def(name: str = "slow_tool") -> ToolDefinition:
+def _tool_def(
+    name: str = "slow_tool", *, execution_timeout_seconds: float | None = None,
+) -> ToolDefinition:
     return ToolDefinition(
         name=name,
         description=f"Mock tool {name}",
         input_schema=ToolInputSchema(properties={}, required=[]),
+        execution_timeout_seconds=execution_timeout_seconds,
     )
 
 
@@ -80,10 +83,9 @@ async def test_long_active_tool_emits_run_heartbeat_before_tool_result() -> None
         provider=_OneToolProvider(),
         config=AgentConfig(
             max_iterations=1,
-            tool_timeout=1.0,
             metadata={"tool_activity_heartbeat_interval": 0.02},
         ),
-        tool_definitions=[_tool_def()],
+        tool_definitions=[_tool_def(execution_timeout_seconds=1.0)],
         tool_handler=_handler,
     )
 
@@ -124,10 +126,9 @@ async def test_tool_activity_heartbeat_does_not_extend_tool_timeout() -> None:
         provider=_OneToolProvider(),
         config=AgentConfig(
             max_iterations=1,
-            tool_timeout=0.06,
             metadata={"tool_activity_heartbeat_interval": 0.02},
         ),
-        tool_definitions=[_tool_def()],
+        tool_definitions=[_tool_def(execution_timeout_seconds=0.06)],
         tool_handler=_handler,
     )
 
@@ -168,8 +169,8 @@ async def test_stubborn_tool_late_success_cannot_replace_timeout(
 
     agent = Agent(
         provider=_OneToolProvider(),
-        config=AgentConfig(max_iterations=1, tool_timeout=0.01),
-        tool_definitions=[_tool_def()],
+        config=AgentConfig(max_iterations=1),
+        tool_definitions=[_tool_def(execution_timeout_seconds=0.01)],
         tool_handler=_handler,
     )
 
@@ -222,8 +223,8 @@ async def test_stubborn_tool_stop_uses_short_grace(
 
     agent = Agent(
         provider=_OneToolProvider(),
-        config=AgentConfig(max_iterations=1, tool_timeout=60.0),
-        tool_definitions=[_tool_def()],
+        config=AgentConfig(max_iterations=1),
+        tool_definitions=[_tool_def(execution_timeout_seconds=60.0)],
         tool_handler=_handler,
     )
     turn = asyncio.create_task(_collect_events(agent))
@@ -363,6 +364,7 @@ async def test_write_file_timeout_waits_for_disk_and_receipt_before_terminal(
     write_definition = next(item for item in definitions if item.name == "write_file")
     assert write_definition.cancellation_policy == "must_settle"
     assert "cancellation_policy" not in write_definition.model_dump()
+    write_definition.execution_timeout_seconds = 0.02
     agent = Agent(
         provider=_OneToolProvider(
             "write_file",
@@ -371,7 +373,6 @@ async def test_write_file_timeout_waits_for_disk_and_receipt_before_terminal(
         config=AgentConfig(
             max_iterations=1,
             iteration_timeout=1.0,
-            tool_timeout=0.02,
         ),
         tool_definitions=[write_definition],
         tool_handler=build_tool_handler(registry, ctx),
