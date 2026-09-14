@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest'
 import type { ArtifactPayload } from '@/types/artifacts'
 import {
   artifactFromWorkbenchItem,
+  fileActionArtifactFromWorkbenchItem,
   artifactWorkbenchItemId,
   createArtifactPreviewWorkbenchItem,
   initialSectionFromWorkbenchItem,
@@ -21,6 +22,18 @@ const artifact: ArtifactPayload = {
 }
 
 describe('artifact Workbench items', () => {
+  it('file menu follows current Document and the observed child, including Web leases without workingDocumentId', () => {
+    const item = createArtifactPreviewWorkbenchItem({ artifact: { ...artifact, documentId: 'doc_one', previewPagePath: 'minimal.html' },
+      sessionKey: 'session-one', resourceIdentity: 'document:doc_one', nativeHtml: false })
+    const state = { previewLaunchUrl: 'http://p-test.localhost/minimal.html',
+      workingFileEntrypoint: 'index.html', workingFileInitialPage: 'minimal.html' }
+    expect(fileActionArtifactFromWorkbenchItem(item, state)).toMatchObject({ source: 'workspace-preview', documentId: 'doc_one', previewPagePath: 'minimal.html' })
+    expect(fileActionArtifactFromWorkbenchItem(item, { ...state, currentUrl: 'http://p-test.localhost/editorial.html' })).toMatchObject({ previewPagePath: 'editorial.html' })
+    expect(fileActionArtifactFromWorkbenchItem(item, { ...state, workingFilePageUnknown: true })).toBeUndefined()
+    expect(fileActionArtifactFromWorkbenchItem(item, { ...state, currentUrl: 'https://elsewhere.example/index.html' })).toBeUndefined()
+    const delivery = createArtifactPreviewWorkbenchItem({ artifact: { ...artifact, documentId: 'doc_one' }, sessionKey: 'session-one', resourceIdentity: 'deliverable:artifact-1', nativeHtml: false })
+    expect(fileActionArtifactFromWorkbenchItem(delivery, {})).toEqual({ ...artifact, documentId: 'doc_one' })
+  })
   it('uses stable session-scoped identities without embedding raw session keys', () => {
     const first = artifactWorkbenchItemId('agent:main:webchat:private', artifact)
     const second = artifactWorkbenchItemId('agent:main:webchat:private', { ...artifact })

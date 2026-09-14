@@ -253,6 +253,10 @@ class ToolContext:
     tool_result_snapshot_writer: ToolResultSnapshotWriter | None = field(
         default=None, repr=False
     )
+    workspace_preview_opener: Callable[..., Awaitable[dict[str, Any]]] | None = field(
+        default=None, repr=False,
+    )
+    workspace_preview_scopes: list[dict[str, str]] = field(default_factory=list, repr=False)
 
     def __post_init__(self) -> None:
         self.validate_path_roots()

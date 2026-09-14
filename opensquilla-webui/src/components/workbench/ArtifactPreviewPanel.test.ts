@@ -17,6 +17,7 @@ import {
 } from '@/testing/httpTransport.test-helper'
 import type { ArtifactPayload } from '@/types/artifacts'
 import { ARTIFACT_PREVIEW_ESCAPE_MESSAGE } from '@/utils/workbench/artifactPreview'
+import type { Window as TestWindow } from 'happy-dom'
 
 function artifact(overrides: Partial<ArtifactPayload> = {}): ArtifactPayload {
   return {
@@ -65,12 +66,27 @@ function mountPanel(
 }
 
 afterEach(() => {
+  (window as unknown as TestWindow).happyDOM.settings.disableIframePageLoading = false
   vi.unstubAllGlobals()
   vi.restoreAllMocks()
   document.body.innerHTML = ''
 })
 
 describe('ArtifactPreviewPanel', () => {
+  it('invalidates file actions after an opaque iframe navigates without changing preview permissions', async () => {
+    // Load events are injected deterministically; do not make real DNS requests.
+    (window as unknown as TestWindow).happyDOM.settings.disableIframePageLoading = true
+    const onWorkbenchEvent = vi.fn()
+    const mounted = mountPanel({ artifact: artifact(), previewLaunchUrl: 'http://preview.localhost/minimal.html', onWorkbenchEvent })
+    await settlePreview()
+    const frame = mounted.element.querySelector('iframe')!
+    frame.dispatchEvent(new Event('load'))
+    expect(onWorkbenchEvent).not.toHaveBeenCalledWith({ type: 'preview-page-unknown' })
+    frame.dispatchEvent(new Event('load'))
+    expect(onWorkbenchEvent).toHaveBeenCalledWith({ type: 'preview-page-unknown' })
+    expect(frame.getAttribute('sandbox')).not.toContain('allow-same-origin')
+    mounted.unmount()
+  })
   it('runs offline web HTML scripts in an opaque sandbox', async () => {
     const observed: { blob?: Blob } = {}
     const createObjectUrl = vi.spyOn(URL, 'createObjectURL').mockImplementation(blob => {
@@ -146,6 +162,37 @@ describe('ArtifactPreviewPanel', () => {
 
     expect(mounted.element.querySelector('.artifact-preview__toolbar')).toBeNull()
     expect(mounted.element.querySelector('.artifact-preview__text')?.textContent).toBe('plain text')
+    mounted.unmount()
+  })
+
+  it('keeps refreshing on its own toolbar button and omits preview from the file menu', async () => {
+    vi.spyOn(URL, 'createObjectURL').mockReturnValue('about:blank#toolbar-preview')
+    vi.spyOn(URL, 'revokeObjectURL').mockImplementation(() => undefined)
+    const requestBinary = vi.fn().mockResolvedValue(httpBinaryResponse(
+      '<html><body>Preview</body></html>',
+      { contentType: 'text/html' },
+    ))
+    const mounted = mountPanel({ artifact: artifact() }, httpTransportTestDouble({ requestBinary }))
+    await settlePreview()
+    expect(requestBinary).toHaveBeenCalledOnce()
+
+    mounted.element.querySelector<HTMLButtonElement>('.resource-actions-trigger')!.click()
+    await settlePreview()
+    const menu = document.querySelector<HTMLElement>('[role="menu"]')!
+    expect(menu).not.toBeNull()
+    const actions = [...menu.querySelectorAll('[role="menuitem"]')]
+      .map(action => action.textContent?.trim())
+    expect(actions).not.toContain(en.resourceActions.preview)
+    expect(actions).not.toContain(en.workbench.artifactPreview.refresh)
+    expect(requestBinary).toHaveBeenCalledOnce()
+
+    menu.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }))
+    await nextTick()
+    mounted.element.querySelector<HTMLButtonElement>(
+      `[aria-label="${en.workbench.artifactPreview.refresh}"]`,
+    )!.click()
+    await settlePreview()
+    expect(requestBinary).toHaveBeenCalledTimes(2)
     mounted.unmount()
   })
 
@@ -317,7 +364,7 @@ describe('ArtifactPreviewPanel', () => {
     await settlePreview()
 
     const actions = [...mounted.element.querySelectorAll<HTMLButtonElement>(
-      '.artifact-preview__actions button',
+      '.artifact-preview__actions button:not(.resource-actions-trigger)',
     )]
     expect(actions).toHaveLength(2)
     actions[0]?.click()

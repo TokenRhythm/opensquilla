@@ -68,6 +68,15 @@ OFFLINE_MARKER_EXCLUSIONS = {
     "tests/test_skills/test_meta_skill_creator_smoke_live.py",
 }
 RECENTLY_ADDED_ACTIVE_TESTS = {
+    # Local-first workspace files use the 0.01s provisional floor until a
+    # comparable three-run Windows refresh supplies measured timings.
+    "tests/test_gateway/test_execution_workspace_preparation.py",
+    "tests/test_gateway/test_local_first_workspaces.py",
+    "tests/test_gateway/test_working_file_actions.py",
+    "tests/test_gateway/test_workspace_config_provenance.py",
+    "tests/test_gateway/test_workspace_preview_registration.py",
+    "tests/test_live_deliverable_acceptance.py",
+    "tests/test_tools/test_memory_workspace_ownership.py",
     # Artifact source/version regressions use the declared provisional floor.
     "tests/test_engine/test_artifact_delivery_sources.py",
     "tests/test_engine/test_runtime_artifact_context.py",

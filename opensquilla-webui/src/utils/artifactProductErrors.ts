@@ -9,6 +9,7 @@ export const ARTIFACT_PRODUCT_ERROR_CODES = [
   'PERMISSION_DENIED',
   'PREVIEW_CAPABILITY_EXPIRED',
   'PREVIEW_RENDERER_FAILED',
+  'PREVIEW_PAGE_UNSUPPORTED',
   'ANNOTATION_UNAVAILABLE',
   'ANNOTATION_BUSY',
   'INVALID_REQUEST',
@@ -62,6 +63,7 @@ const ARTIFACT_SCOPED_CURRENT_CODES = new Set<string>([
   'RESOURCE_UNSUPPORTED',
   'PREVIEW_CAPABILITY_EXPIRED',
   'PREVIEW_RENDERER_FAILED',
+  'PREVIEW_PAGE_UNSUPPORTED',
   'ANNOTATION_UNAVAILABLE',
   'ANNOTATION_BUSY',
 ])
@@ -120,6 +122,11 @@ const PRESENTATION: Readonly<Record<ArtifactProductErrorCode, {
     key: 'workbench.artifactErrors.previewRendererFailed',
     fallback: 'The preview could not be displayed. Try reopening it.',
     recovery: 'reopen-preview',
+  },
+  PREVIEW_PAGE_UNSUPPORTED: {
+    key: 'workbench.artifactErrors.previewPageUnsupported',
+    fallback: 'This client or Gateway does not support opening this subpage directly. Update and try again.',
+    recovery: 'ask-user',
   },
   ANNOTATION_UNAVAILABLE: {
     key: 'workbench.artifactErrors.annotationUnavailable',

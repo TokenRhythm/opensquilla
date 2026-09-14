@@ -11,6 +11,7 @@ import type {
   ChatRunStatusSource,
 } from '@/types/chat'
 import type { SessionReadSnapshot } from '@/modules/sessionReadLifecycle'
+import type { ConversationToolContent } from '@/modules/conversationEventContent'
 import {
   FINISHED_STREAM_TASK_ID,
   PENDING_STREAM_TASK_ID,
@@ -45,6 +46,7 @@ function createHarness(options: {
   withRouterRuntime?: boolean
   withRecoveryFence?: boolean
   taskOwnership?: ChatTaskOwnershipApi
+  onLiveToolResult?: (payload: ConversationToolContent) => void
 } = {}) {
   const messages = ref<ChatMessage[]>(options.messages ?? [])
   const sessionKey = ref('agent:main:test')
@@ -134,6 +136,7 @@ function createHarness(options: {
     }),
     usageModel: ref(''),
     stream,
+    onLiveToolResult: options.onLiveToolResult,
     normalizeRunStatus: (status: string) => status,
     sessionRunStatus: options.sessionRunStatus || (() => ({ status: 'idle', label: 'Idle', task: null })),
     applySessionRunState,
@@ -212,6 +215,59 @@ function createHarness(options: {
     stop: () => { detach(); scope.stop() },
   }
 }
+
+describe('live tool result actions', () => {
+  const payload = {
+    key: 'agent:main:test', task_id: 'turn-preview', epoch: 0, stream_seq: 1,
+    id: 'preview-1', name: 'open_workspace_preview', result: '{}',
+  }
+
+  it('only exposes accepted fresh active-task results, not duplicates or stale tasks', () => {
+    const onLiveToolResult = vi.fn()
+    const h = createHarness({ onLiveToolResult })
+    h.activeStreamTaskId.value = payload.task_id
+    try {
+      h.api.handlers.onToolResult(payload)
+      h.api.handlers.onToolResult(payload)
+      h.api.handlers.onToolResult({ ...payload, task_id: 'other-turn', stream_seq: 2 })
+      h.api.handlers.onToolResult({ ...payload, epoch: -1, stream_seq: 3 })
+      expect(onLiveToolResult).toHaveBeenCalledExactlyOnceWith(payload)
+    } finally { h.stop() }
+  })
+
+  it('renders authoritative snapshot results without triggering a fresh open action', () => {
+    const onLiveToolResult = vi.fn()
+    const h = createHarness({ onLiveToolResult })
+    try {
+      h.api.restoreLiveTurnSnapshot({
+        sessionKey: payload.key, taskId: payload.task_id,
+        events: [{ semanticKind: 'tool-result', payload }], currentStreamSeq: 1,
+      })
+      expect(h.stream.appendToolResult).toHaveBeenCalledOnce()
+      expect(onLiveToolResult).not.toHaveBeenCalled()
+      h.api.handlers.onToolResult({ ...payload, id: 'preview-2', stream_seq: 2 })
+      expect(onLiveToolResult).toHaveBeenCalledOnce()
+    } finally { h.stop() }
+  })
+
+  it.each([false, true])('preserves replay provenance through pending acceptance=%s', pending => {
+    const onLiveToolResult = vi.fn()
+    const h = createHarness({ onLiveToolResult })
+    h.activeStreamTaskId.value = pending ? PENDING_STREAM_TASK_ID : payload.task_id
+    try {
+      h.api.onConversationEvent({
+        kind: 'conversation', event: {
+          kind: 'known', semanticKind: 'tool-result', payload, meta: { replayed: true },
+          sessionKey: payload.key, taskId: payload.task_id, turnId: null,
+          streamGeneration: null, streamSeq: 1, connectionSeq: null, generationEpoch: null,
+        },
+      })
+      if (pending) h.api.bindActiveStreamTask(payload.task_id)
+      expect(h.stream.appendToolResult).toHaveBeenCalledOnce()
+      expect(onLiveToolResult).not.toHaveBeenCalled()
+    } finally { h.stop() }
+  })
+})
 
 describe('router card recovery projection', () => {
   const key = 'agent:main:test'

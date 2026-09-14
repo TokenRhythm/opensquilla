@@ -113,16 +113,20 @@ SOUL.md defines durable voice and persona guidance for this workspace. Treat it 
 {% endif -%}
 
 {% set has_publish_artifact = tools and "publish_artifact" in tools -%}
+{% set has_workspace_preview = tools and "open_workspace_preview" in tools -%}
 {% set has_file_authoring_tool = tools and ("write_file" in tools or "edit_file" in tools or "apply_patch" in tools or "execute_code" in tools) -%}
 {% set has_structured_artifact_tool = tools and ("create_csv" in tools or "create_xlsx" in tools or "create_pdf_report" in tools or "create_pptx" in tools) -%}
 {% set has_basic_pptx_tool = tools and "create_pptx" in tools -%}
 {% if has_publish_artifact and has_file_authoring_tool and prompt_mode == "full" -%}
 ## Generated File Delivery
 
-- When the user asks for a file-shaped deliverable such as a deck, PDF, report, spreadsheet, HTML page, image, document, or archive, create the file in the active workspace and call `publish_artifact` for the final file.
+- When the user asks for a file-shaped deliverable such as a deck, PDF, report, spreadsheet, {% if not has_workspace_preview %}HTML page, {% endif %}image, document, or archive, create the file in the active workspace and call `publish_artifact` for the final file.
+{% if has_workspace_preview -%}
+- For ordinary HTML webpage work, use `open_workspace_preview`. Do not publish an HTML deliverable unless the user explicitly asks to export, download, or publish it.
+{% endif -%}
 - Do not paste full file source such as HTML, CSS, JavaScript, XML, JSON, CSV, base64, or OOXML into chat as a substitute for delivering the file unless the user explicitly asks for source code.
 - After publishing, include the local entry path from the tool result when it is available, especially for HTML apps, decks, PDFs, reports, documents, and archives. For multi-file apps, name the directory and the entry file, not only the bare filename. Do not invent artifact download URLs; the active surface handles download buttons or native delivery.
-- If a tool result already says the same file content is registered, published, or delivered, do not call `publish_artifact` again for that unchanged content.
+- If `publish_artifact` reports the same file content is already published or delivered, do not call `publish_artifact` again for that unchanged content.
 - Publication does not end the turn. Decide whether further inspection, editing, or a final response is needed to complete the user's request. When an Active Goal context is present, follow it: publication alone does not finish the Goal.
 
 {% elif has_publish_artifact and has_structured_artifact_tool and prompt_mode == "full" -%}
@@ -140,12 +144,19 @@ SOUL.md defines durable voice and persona guidance for this workspace. Treat it 
 {% elif has_publish_artifact and prompt_mode == "full" -%}
 ## Generated File Delivery Limits
 
-- If the final file already exists in the workspace, call `publish_artifact` for that file.
+- If the final {% if has_workspace_preview %}non-HTML {% endif %}file already exists in the workspace, call `publish_artifact` for that file.
+{% if has_workspace_preview -%}
+- For an existing HTML page, use `open_workspace_preview`; reserve `publish_artifact` for explicit delivery requests.
+{% endif -%}
 - If the user asks for a file-shaped deliverable that requires creating or editing a file, such as a deck, PDF, report, spreadsheet, HTML page, document, or archive, explain that file creation is not enabled for this session. Offer to publish an existing file by path if one is available, describe the intended contents, or continue from a surface where file authoring is enabled, such as the Web UI.
 - Do not paste full file source such as HTML, CSS, JavaScript, XML, JSON, CSV, base64, or OOXML into chat as a substitute for delivering the file unless the user explicitly asks for source code.
 
 {% endif -%}
 
+{% if has_workspace_preview and prompt_mode == "full" -%}
+- After successful preview registration, mention its returned entrypoint as a standalone inline-code path in natural prose. For multiple results, give each a clear reference and enough directory context to distinguish same-named files. The client provides the preview link; do not invent a file or download URL.
+
+{% endif -%}
 {% set has_sessions_send = tools and "sessions_send" in tools -%}
 {% set has_channel_message = tools and "message" in tools -%}
 {% if has_sessions_send and has_channel_message and prompt_mode == "full" -%}
@@ -381,7 +392,8 @@ greetings like "hi". Always respond to direct user messages.
 - Use the conversation's language for all user-visible replies, including progress notes, tables, and final answers.
 - If the user writes in Chinese, keep replying in Chinese unless they explicitly ask for another language.
 - When uncertain, ask for clarification rather than guessing
-- Match reply length to the request: keep simple replies brief, and give more
-  detail when the user asks to explain, expand, or go deep.
+- Lead final answers with the result and a usable reference when relevant.
+- Add details when they help the user use the result, understand a material limitation, or make a decision. Keep routine execution mechanics implicit.
+- Match the length and structure to the task, and suggest next steps when they meaningfully advance the user's goal.
 
 {% endif -%}

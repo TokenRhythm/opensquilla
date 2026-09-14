@@ -13,6 +13,7 @@
         <span class="artifact-preview__meta">{{ artifactFileSubtitle(artifact) }}</span>
       </span>
       <span class="artifact-preview__actions">
+        <ResourceActionsMenu :artifact="artifact" :session-key="sessionKey" :previewable="false" trigger />
         <button
           v-if="preview.kind.value !== 'unsupported'"
           type="button"
@@ -167,6 +168,7 @@
           :sandbox="htmlSandbox"
           :allow="htmlPermissions"
           referrerpolicy="no-referrer"
+          @load="onHtmlFrameLoad"
         />
         <div
           v-else-if="preview.kind.value === 'html'"
@@ -187,6 +189,7 @@
 import { computed, inject, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import Icon from '@/components/Icon.vue'
+import ResourceActionsMenu from '@/components/ResourceActionsMenu.vue'
 import {
   ARTIFACT_WORKBENCH_KEY,
   type ArtifactPreviewResourceState,
@@ -245,6 +248,15 @@ const artifactWorkbench = inject(ARTIFACT_WORKBENCH_KEY)
 if (!artifactWorkbench) throw new Error('ArtifactWorkbench was not provided')
 const previewFrameRef = ref<HTMLIFrameElement | null>(null)
 const htmlFrameGeneration = ref(0)
+let loadedFrame: HTMLIFrameElement | null = null
+
+function onHtmlFrameLoad(event: Event) {
+  const frame = event.currentTarget as HTMLIFrameElement
+  // A cross-origin/opaque iframe cannot attest its new URL after navigation.
+  // Keep previewing it, but do not offer file operations for a guessed page.
+  if (loadedFrame === frame) emit('workbench-event', { type: 'preview-page-unknown' })
+  loadedFrame = frame
+}
 
 const preview = artifactWorkbench.previews.createResource({
   artifact: () => props.artifact,
