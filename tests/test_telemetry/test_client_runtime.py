@@ -379,6 +379,8 @@ async def test_close_drains_accepted_local_record_without_starting_upload(
     runtime = ScopedTelemetryRuntime(
         config=_config(tmp_path, reliability=True, growth=False)
     )
+    # Keep SQLite initialization outside the shutdown race's watchdog.
+    assert await runtime._scope_runtime(TelemetryScope.RELIABILITY) is not None
     entered = asyncio.Event()
     release = asyncio.Event()
     recorded = asyncio.Event()
@@ -422,6 +424,8 @@ async def test_close_during_start_does_not_leave_an_upload_task(
     runtime = ScopedTelemetryRuntime(
         config=_config(tmp_path, reliability=True, growth=False)
     )
+    # This race starts after recording, independently of outbox setup latency.
+    assert await runtime._scope_runtime(TelemetryScope.RELIABILITY) is not None
     entered = asyncio.Event()
     release = asyncio.Event()
 
