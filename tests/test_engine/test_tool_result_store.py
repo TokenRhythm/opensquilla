@@ -37,6 +37,18 @@ def _write(store: ToolResultStore, content: str, *, tool_use_id: str = "tool-1",
     return store.write(content, **kwargs)
 
 
+@pytest.mark.parametrize("newline", ["\n", "\r\n", "\r"])
+@pytest.mark.parametrize("max_bytes", [None, 200])
+def test_store_preserves_character_offsets_across_newline_formats(tmp_path, newline, max_bytes):
+    store = ToolResultStore(tmp_path)
+    body = (f"C:\\synthetic\\page 正文🙂{newline}" * 100) + "tail"
+    written = _write(store, body, max_bytes=max_bytes)
+    read = store.read(written.handle, session_id=_SESSION_ID)
+    assert read.content == body
+    assert read.sha256 == hashlib.sha256(body.encode("utf-8")).hexdigest()
+    assert _write(store, body, max_bytes=max_bytes).handle == written.handle
+
+
 def test_identical_content_dedupes_to_one_record(tmp_path: Path) -> None:
     store = ToolResultStore(tmp_path)
     body = "same output\n" + "x" * 2000

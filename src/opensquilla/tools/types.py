@@ -7,7 +7,7 @@ from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, TypedDict
 
 from opensquilla.artifacts import ArtifactSource
 from opensquilla.contracts.tool_presentation import ToolPresentationCategory
@@ -20,6 +20,16 @@ current_meta_skill_owner: contextvars.ContextVar[str] = contextvars.ContextVar(
     "current_meta_skill_owner",
     default="",
 )
+
+
+class ToolResultSnapshotReference(TypedDict):
+    handle: str
+    sha256: str
+
+
+ToolResultSnapshotWriter = Callable[
+    [str, str, str], Awaitable[ToolResultSnapshotReference | None]
+]
 
 
 class CallerKind(StrEnum):
@@ -239,6 +249,10 @@ class ToolContext:
 
     desktop_browser: Any | None = field(default=None, repr=False)
     artifact_source_paths: dict[str, ArtifactSource] = field(default_factory=dict, repr=False)
+    # Process-local, turn-bound callback; never included in a public wire schema.
+    tool_result_snapshot_writer: ToolResultSnapshotWriter | None = field(
+        default=None, repr=False
+    )
 
     def __post_init__(self) -> None:
         self.validate_path_roots()

@@ -1898,6 +1898,44 @@ async def test_dispatch_clamps_web_fetch_max_chars_before_handler() -> None:
 
 
 @pytest.mark.asyncio
+async def test_dispatch_allows_transient_search_retry_but_retains_repeat_budget():
+    from opensquilla.search.canonical import run_canonical_web_search
+    from opensquilla.search.types import SearchOptions, SearchProviderError, SearchResult
+
+    attempts = []
+
+    class Provider:
+        async def search(self, query, max_results):
+            attempts.append(query)
+            if len(attempts) == 1:
+                raise SearchProviderError("tavily", "timeout", "synthetic timeout", retryable=True)
+            return [SearchResult(title="Source", url="https://example.test", snippet="found")]
+
+    async def search(query, **kwargs):
+        return json.dumps(await run_canonical_web_search(
+            SearchOptions(query=query, provider="tavily"), provider_factory=lambda name: Provider(),
+        ))
+
+    registry = ToolRegistry()
+    registry.register(ToolSpec(name="web_search", description="search",
+                               parameters={"query": {"type": "string"}}), search)
+    handler = build_tool_handler(registry, ToolContext(
+        tool_run_budget_policy=ToolRunBudgetPolicy(), tool_run_budget_key="synthetic-search-turn",
+    ))
+    first = await handler(ToolCall(tool_use_id="search-1", tool_name="web_search",
+                                   arguments={"query": "dispatch transient retry"}))
+    assert json.loads(first.content)["retry_allowed"] is True
+    second = await handler(ToolCall(tool_use_id="search-2", tool_name="web_search",
+                                    arguments={"query": "dispatch transient retry"}))
+    assert json.loads(second.content)["ok"] is True
+    third = await handler(ToolCall(tool_use_id="search-3", tool_name="web_search",
+                                   arguments={"query": "dispatch transient retry"}))
+    assert json.loads(third.content)["reason"] == "tool_run_budget_exhausted"
+    assert json.loads(third.content)["retry_allowed"] is False
+    assert len(attempts) == 2
+
+
+@pytest.mark.asyncio
 async def test_dispatch_clamps_web_search_results_before_handler() -> None:
     registry = ToolRegistry()
     seen: dict[str, object] = {}
@@ -1942,7 +1980,7 @@ async def test_dispatch_clamps_web_search_results_before_handler() -> None:
     assert seen == {
         "query": "test",
         "max_results": 10,
-        "fetch_top_k": 3,
+        "fetch_top_k": None,
         "max_chars_per_source": 1500,
     }
 

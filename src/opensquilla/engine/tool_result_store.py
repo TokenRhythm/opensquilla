@@ -228,7 +228,9 @@ class ToolResultStore:
         if storage_encoding == "gzip+utf-8":
             content = gzip.decompress(content_path.read_bytes()).decode("utf-8")
         else:
-            content = content_path.read_text(encoding="utf-8")
+            # Universal newline conversion changes both the hash and raw_slice
+            # offsets for CRLF bodies. Decode the exact bytes that were stored.
+            content = content_path.read_bytes().decode("utf-8")
         payload = content.encode("utf-8")
         sha = hashlib.sha256(payload).hexdigest()
         if meta.get("session_id") != session_id:
