@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import base64
+import io
 import json
 from copy import deepcopy
 from typing import Any
 
 import pytest
+from PIL import Image
 
 from opensquilla.provider import request_proof
 from opensquilla.provider.anthropic import AnthropicProvider
@@ -342,6 +345,10 @@ def test_provider_request_proof_reserves_nonzero_budget_for_small_image() -> Non
 
 
 def test_provider_request_proof_blocks_media_only_request_when_reserve_exceeds_budget() -> None:
+    stream = io.BytesIO()
+    with Image.new("1", (2048, 2048)) as image:
+        image.save(stream, format="PNG")
+    data = base64.b64encode(stream.getvalue()).decode("ascii")
     with pytest.raises(ProviderRequestBudgetExceeded) as exc_info:
         prove_provider_payload(
             {
@@ -352,7 +359,7 @@ def test_provider_request_proof_blocks_media_only_request_when_reserve_exceeds_b
                             {
                                 "type": "image_url",
                                 "image_url": {
-                                    "url": "data:image/png;base64," + ("a" * 500_000),
+                                    "url": "data:image/png;base64," + data,
                                 },
                             },
                         ],

@@ -20,6 +20,11 @@ from opensquilla.artifacts import (
     ArtifactStore,
     artifact_payload,
 )
+from opensquilla.attachment_workspace import (
+    AttachmentWorkspaceMaterializer,
+    workspace_attachment_budget_from_config,
+)
+from opensquilla.contracts.attachments import IMAGE_ATTACHMENT_BYTES
 from opensquilla.contracts.image_validation import validate_image_bytes
 from opensquilla.engine.usage_accounting import (
     account_provider_stream,
@@ -135,11 +140,12 @@ def configure_audio(config: Any | None) -> None:
 @tool(
     name="image",
     description=(
-        "Analyze an image using the current model when it supports image input. "
+        "Load an image for the main model to inspect in its next step. "
         "Accepts only a real local file path or HTTP(S) URL. "
         "Do not call this tool for images already attached to the current chat turn; "
         "use the attachment content directly. "
-        "Returns the model's text analysis of the image."
+        "Returns image content and a loading receipt, not a separate model's analysis. "
+        "The current mode's image capability and request limits still apply."
     ),
     params={
         "path": {
@@ -156,10 +162,13 @@ def configure_audio(config: Any | None) -> None:
         },
     },
     required=["path", "prompt"],
+    runtime_only_arguments={"_tool_use_id"},
     sandbox=SandboxToolDescriptor.media(kind="media.analyze"),
     execution_timeout_seconds=_VISION_ANALYSIS_TIMEOUT_SECONDS,
 )
-async def image(path: str, prompt: str = "Describe this image") -> str:
+async def image(
+    path: str, prompt: str = "Describe this image", _tool_use_id: str = "",
+) -> str:
     if not prompt or not prompt.strip():
         raise ToolError("Prompt must not be empty")
 
@@ -177,13 +186,40 @@ async def image(path: str, prompt: str = "Describe this image") -> str:
             return json.dumps(path_block)
         image_bytes, media_type = await _read_image_file(path)
 
+    if _tool_use_id and len(image_bytes) > IMAGE_ATTACHMENT_BYTES:
+        raise SafeToolError("Image exceeds the supported attachment byte limit.")
     try:
         validate_image_bytes(image_bytes, media_type)
     except ValueError as exc:
         raise SafeToolError(f"Image appears corrupt or unreadable: {exc}") from exc
 
-    # Try provider vision call; graceful fallback if unavailable
     b64_data = base64.b64encode(image_bytes).decode()
+    if _tool_use_id:
+        context = current_tool_context.get()
+        if context is None:
+            raise SafeToolError("Image loading requires an active model tool call.")
+        image_content = {"mime": media_type, "data": b64_data}
+        receipt = {
+            "status": "loaded",
+            "path": path,
+            "note": "Image loaded for model input; it has not yet been analyzed.",
+        }
+        if is_url:
+            retained = await _retain_downloaded_image(image_bytes, media_type)
+            receipt["source_url"] = path
+            image_content["source_url"] = path
+            if retained["local_path"]:
+                receipt["local_path"] = retained["local_path"]
+                receipt["name"] = retained["name"]
+                image_content["local_path"] = retained["local_path"]
+                image_content["name"] = retained["name"]
+            else:
+                receipt["retention_note"] = retained["note"]
+        context.tool_result_media[_tool_use_id] = [image_content]
+        return json.dumps(receipt)
+
+    # Keep the text-returning API for callers outside model tool dispatch.
+    # Model calls use the typed result above and share the main request budget.
     try:
         description = await _call_vision_provider(b64_data, media_type, prompt)
         model_used = "provider"
@@ -207,6 +243,42 @@ async def image(path: str, prompt: str = "Describe this image") -> str:
         )
 
     return json.dumps({"description": description, "model": model_used, "path": path})
+
+
+async def _retain_downloaded_image(payload: bytes, mime: str) -> dict[str, str]:
+    context = current_tool_context.get()
+    config = context.sandbox_gateway_config if context is not None else None
+    if getattr(getattr(config, "attachments", None), "persist_transcripts", True) is False:
+        return {
+            "local_path": "", "note": "No local copy retained: attachment persistence disabled.",
+        }
+    if (
+        context is None or not context.workspace_dir
+        or not context.artifact_media_root or not context.artifact_session_id
+    ):
+        return {"local_path": "", "note": "No local copy retained: session workspace unavailable."}
+
+    from opensquilla.tools.write_policy import attachment_workspace_write_authorizer
+
+    workspace = Path(context.workspace_dir).expanduser().resolve()
+
+    materializer = AttachmentWorkspaceMaterializer(
+        media_root=Path(context.artifact_media_root),
+        workspace_dir=workspace,
+        disk_budget_bytes=workspace_attachment_budget_from_config(config),
+        authorize_write=attachment_workspace_write_authorizer(context),
+    )
+    result = await asyncio.to_thread(
+        materializer.materialize_bytes, payload,
+        name=f"image.{mime.split('/', 1)[1]}", mime=mime,
+        session_id=context.artifact_session_id,
+    )
+    if result.available and result.rel_path:
+        return {"local_path": result.rel_path, "name": result.name, "note": ""}
+    return {
+        "local_path": "",
+        "note": f"No local copy retained: {result.error or 'storage unavailable'}",
+    }
 
 
 async def _read_image_file(path: str) -> tuple[bytes, str]:

@@ -1297,7 +1297,7 @@ async def test_catalog_text_only_ladder_projects_image_without_prompt_injection(
     assert routed.metadata["image_input_projection_required"] is True
     assert routed.metadata["router_fallback_strict"] is True
     assert routed.metadata["router_fallback_chain"] == []
-    assert routed.metadata["route_max_history_turns"] == 1
+    assert "route_max_history_turns" not in routed.metadata
     assert routed.metadata["thinking_requested"] is True
     assert routed.metadata["thinking_level"] == ctx.config.squilla_router.tiers["c1"][
         "thinking_level"
@@ -1878,20 +1878,19 @@ async def test_global_fixed_lineup_keeps_image_provider_direct(
 
 
 @pytest.mark.asyncio
-async def test_gate_needs_image_routes_followup_to_vision_model(
+async def test_image_context_routes_followup_to_vision_model(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
         squilla_router_step,
         "_get_strategy",
-        lambda _config: pytest.fail("gate image routing should not invoke text strategy"),
+        lambda _config: pytest.fail("image context routing should not invoke text strategy"),
     )
     ctx = make_context("Continue from that image.")
     ctx.metadata["router_history_has_recent_image"] = True
     ctx.metadata["router_history_image_turn_count"] = 2
     ctx.metadata["router_turns_since_last_image"] = 1
-    ctx.metadata["router_vision_followup_gate_decision"] = "needs_image"
-    ctx.metadata["router_vision_followup_needs_image"] = True
+    ctx.metadata["image_context_has_images"] = True
     ctx.config.squilla_router.tiers = {
         "c0": {"model": "configured/vision", "supports_image": True},
         "c1": {"model": "configured/text", "supports_image": False},
@@ -1902,12 +1901,12 @@ async def test_gate_needs_image_routes_followup_to_vision_model(
     assert routed.model == "configured/vision"
     assert routed.metadata["routed_tier"] == "c0"
     assert routed.metadata["routing_source"] == "image_route"
-    assert routed.metadata["image_route_reason"] == "gate_history"
-    assert routed.metadata["route_max_history_turns"] == 8
+    assert routed.metadata["image_route_reason"] == "history_context"
+    assert "route_max_history_turns" not in routed.metadata
 
 
 @pytest.mark.asyncio
-async def test_sticky_without_gate_no_longer_routes_to_vision_model(
+async def test_sticky_without_image_context_does_not_route_to_vision_model(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     strategy = fake_strategy(
@@ -1920,8 +1919,7 @@ async def test_sticky_without_gate_no_longer_routes_to_vision_model(
     ctx.metadata["router_history_has_recent_image"] = True
     ctx.metadata["router_history_image_turn_count"] = 1
     ctx.metadata["router_vision_sticky_remaining"] = 3
-    ctx.metadata["router_vision_followup_gate_decision"] = "text_only"
-    ctx.metadata["router_vision_followup_needs_image"] = False
+    ctx.metadata["image_context_has_images"] = False
 
     routed = await apply_squilla_router(ctx)
 

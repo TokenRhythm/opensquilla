@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextvars
 import csv
 import difflib
@@ -536,6 +537,41 @@ def _looks_binary(raw: bytes, p: Path) -> str | None:
 def _read_binary_sample(p: Path, size: int = 8192) -> bytes:
     with p.open("rb") as fh:
         return fh.read(size)
+
+
+def _read_image_file_result(p: Path, sample: bytes) -> dict[str, object] | None:
+    """Build an image result inside the same read boundary as ordinary files."""
+    from opensquilla.contracts.attachment_sniff import sniff_mime_from_bytes
+    from opensquilla.contracts.attachments import IMAGE_ATTACHMENT_BYTES, IMAGE_ATTACHMENT_MIMES
+    from opensquilla.contracts.image_validation import validate_image_bytes
+
+    mime = sniff_mime_from_bytes(sample)
+    if mime not in IMAGE_ATTACHMENT_MIMES:
+        mime = {
+            ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+            ".gif": "image/gif", ".webp": "image/webp",
+        }.get(p.suffix.lower())
+    if mime is None:
+        return None
+    with p.open("rb") as stream:
+        payload = stream.read(IMAGE_ATTACHMENT_BYTES + 1)
+    if len(payload) > IMAGE_ATTACHMENT_BYTES:
+        raise SafeToolError("Image exceeds the supported attachment byte limit.")
+    try:
+        validate_image_bytes(payload, mime)
+    except ValueError:
+        raise SafeToolError("Image is corrupt, unreadable, or has an unsupported format.") from None
+    return {
+        "message": f"Loaded image ({mime}) for model input; it has not yet been analyzed.",
+        "image": {"mime": mime, "data": base64.b64encode(payload).decode("ascii")},
+    }
+
+
+def _publish_read_image(image: object, *, tool_use_id: str) -> None:
+    context = current_tool_context.get()
+    if context is None or not tool_use_id or not isinstance(image, dict):
+        raise SafeToolError("Image loading requires a model tool call to receive the image.")
+    context.tool_result_media[tool_use_id] = [image]
 
 
 def _is_search_excluded_path(path: Path) -> bool:
@@ -1652,7 +1688,9 @@ def _backup_receipt_note(
 @tool(
     name="read_file",
     description=(
-        "Read UTF-8 text file contents with line numbers. Supports offset and limit. "
+        "Read UTF-8 text with line numbers, or load PNG/JPEG/GIF/WebP images from a file path. "
+        "Images are supplied directly to the model, without a separate analysis call. "
+        "Supports offset and limit for text. "
         "Before modifying an existing workspace file with edit_file or write_file, "
         "read it once without offset or limit to establish fresh edit context. "
         "Use offset/limit for inspection windows only. For CSV/TSV/Excel workbook "
@@ -1668,6 +1706,7 @@ def _backup_receipt_note(
     },
     required=["path"],
     plan_access=PlanAccess.READ_ONLY,
+    runtime_only_arguments={"_tool_use_id"},
     sandbox=SandboxToolDescriptor.filesystem(
         kind="read_file",
         argv_factory=lambda a: ("read_file", str(a.get("path", ""))),
@@ -1676,7 +1715,12 @@ def _backup_receipt_note(
         record_payload=False,
     ),
 )
-async def read_file(path: str, offset: int | None = None, limit: int | None = None) -> str:
+async def read_file(
+    path: str,
+    offset: int | None = None,
+    limit: int | None = None,
+    _tool_use_id: str = "",
+) -> str:
     p = _resolve_path(path)
     blocked = _sensitive_access_block("read_file", p, path)
     if blocked is not None:
@@ -1704,6 +1748,9 @@ async def read_file(path: str, offset: int | None = None, limit: int | None = No
             )
         )
         if sandbox_result is not None:
+            metadata = getattr(sandbox_result, "metadata", {})
+            if isinstance(metadata, dict) and "image" in metadata:
+                _publish_read_image(metadata.pop("image"), tool_use_id=_tool_use_id)
             record_workspace_file_read(
                 p,
                 operation="read_file",
@@ -1715,6 +1762,11 @@ async def read_file(path: str, offset: int | None = None, limit: int | None = No
 
     loop = asyncio.get_event_loop()
     sample: bytes = await loop.run_in_executor(None, _read_binary_sample, p)
+    image_result = await loop.run_in_executor(None, _read_image_file_result, p, sample)
+    if image_result is not None:
+        _publish_read_image(image_result["image"], tool_use_id=_tool_use_id)
+        record_workspace_file_read(p, operation="read_file", complete=True)
+        return str(image_result["message"])
     if not sample:
         record_workspace_file_read(
             p,

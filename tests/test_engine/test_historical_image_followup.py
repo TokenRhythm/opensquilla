@@ -16,7 +16,6 @@ from opensquilla.engine import Agent, AgentConfig
 from opensquilla.engine.pipeline import TurnContext
 from opensquilla.engine.runtime import TurnRunner, _SelectorFallbackProvider
 from opensquilla.engine.steps.squilla_router import apply_squilla_router
-from opensquilla.engine.steps.vision_followup_gate import apply_vision_followup_gate
 from opensquilla.gateway.config import GatewayConfig
 from opensquilla.provider import (
     ChatConfig,
@@ -47,6 +46,7 @@ class _TranscriptEntry:
     tool_calls: list[Any] | None = None
     reasoning_content: str | None = None
     token_count: int | None = None
+    assistant_replay: dict[str, Any] | None = None
 
 
 @dataclass
@@ -87,6 +87,47 @@ class _FakeSessionManager:
         return []
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("lookback", [0, 1, 2])
+@pytest.mark.parametrize("queued_before_completion", [False, True])
+@pytest.mark.parametrize("prior_user_retained", [False, True])
+async def test_tool_loaded_active_images_ignore_the_legacy_turn_window(
+    lookback: int, queued_before_completion: bool, prior_user_retained: bool,
+) -> None:
+    manager = _FakeSessionManager()
+    key = "agent:main:tool-image-history"
+    config = GatewayConfig(llm={"provider": "openrouter"})
+    config.squilla_router.vision_history_lookback_turns = lookback
+    runner = TurnRunner(provider_selector=MagicMock(), session_manager=manager, config=config)
+    await manager.create(key)
+    if prior_user_retained:
+        await manager.append_message(key, "user", "Inspect the file.")
+    if queued_before_completion:
+        await manager.append_message(key, "user", "Continue.", message_id="current")
+    entry = await manager.append_message(key, "assistant", "The file has been inspected.")
+    entry.assistant_replay = {
+        "version": 1,
+        "messages": [
+            Message(role="assistant", content="Read the image file.").model_dump(mode="json"),
+            Message(role="user", content=[ContentBlockImage(
+                media_type="image/png", data=base64.b64encode(image_bytes()).decode("ascii"),
+            )]).model_dump(mode="json"),
+        ],
+    }
+    if not queued_before_completion:
+        await manager.append_message(key, "user", "A separate text question.")
+        await manager.append_message(key, "assistant", "Text answer.")
+        await manager.append_message(key, "user", "Continue.", message_id="current")
+    context = await runner._router_previous_assistant_context(
+        key, exclude_last_user=True, bound_user_message_id="current",
+    )
+
+    assert context["history_has_recent_image"] is True
+    if prior_user_retained:
+        assert context["turns_since_last_image"] == (0 if queued_before_completion else 1)
+    assert context["history_image_turn_count"] == 1
+
+
 class _CanonicalSessionManager(_FakeSessionManager):
     def __init__(self) -> None:
         super().__init__()
@@ -120,32 +161,6 @@ class _CapturingProvider:
 
     async def list_models(self) -> list[Any]:
         return []
-
-
-class _GateThenCaptureProvider(_CapturingProvider):
-    def __init__(self, gate_payload: str) -> None:
-        super().__init__()
-        self.gate_payload = gate_payload
-        self.gate_calls = 0
-
-    def chat(
-        self,
-        messages: list[Message],
-        tools: list[Any] | None = None,
-        config: ChatConfig | None = None,
-    ) -> AsyncIterator[Any]:
-        if (
-            config is not None
-            and isinstance(config.system, str)
-            and "requires reusing a previous image" in config.system
-        ):
-            self.gate_calls += 1
-            return self._gate_stream()
-        return super().chat(messages, tools=tools, config=config)
-
-    async def _gate_stream(self) -> AsyncIterator[Any]:
-        yield TextDeltaEvent(text=self.gate_payload)
-        yield DoneEvent(stop_reason="end_turn", input_tokens=9, output_tokens=5)
 
 
 def _b64(payload: bytes) -> str:
@@ -196,13 +211,170 @@ def _message_has_marker(message: Message, marker: str) -> bool:
     ) or isinstance(message.content, str) and marker in message.content
 
 
+@pytest.mark.parametrize("legacy_lookback", [0, 1, 8])
+async def test_image_route_keeps_old_text_and_image_paths_until_compaction(
+    tmp_path: Path, legacy_lookback: int,
+) -> None:
+    manager = _FakeSessionManager()
+    key = "agent:main:active-image-history"
+    config = GatewayConfig.model_validate({
+        "squilla_router": {"vision_history_lookback_turns": legacy_lookback},
+    })
+    runner = TurnRunner(provider_selector=MagicMock(), session_manager=manager, config=config)
+    node = await manager.create(key)
+    caption = "Keep the blue option as the comparison reference."
+    await manager.append_message(key, "user", _inline_image_envelope(caption), "initial-image")
+    await manager.append_message(key, "assistant", "The reference is recorded.")
+    for index in range(10):
+        await manager.append_message(key, "user", f"Text detail {index}.")
+        await manager.append_message(key, "assistant", f"Recorded detail {index}.")
+    await manager.append_message(key, "user", "Continue the comparison.", "current")
+
+    context = await runner._router_previous_assistant_context(
+        key, exclude_last_user=True, bound_user_message_id="current",
+    )
+    assert context["history_has_recent_image"] is True
+    provider = _CapturingProvider()
+    turn = await apply_squilla_router(TurnContext(
+        message="Continue the comparison.", session_key=key, config=config,
+        provider=provider, model=config.llm.model, tool_defs=[], system_prompt="",
+        metadata={"image_context_has_images": context["history_has_recent_image"]},
+    ))
+    agent = Agent(provider=provider, config=AgentConfig(
+        max_iterations=1,
+        model_vision_support="supported",
+        max_history_turns=turn.metadata.get("route_max_history_turns", 0),
+        workspace_dir=str(tmp_path / "workspace"),
+    ))
+    await runner._load_history(agent, key, bound_user_message_id="current")
+    events = [event async for event in agent.run_turn("Continue the comparison.")]
+
+    assert not any(event.kind == "error" for event in events)
+    sent = provider.calls[0]["messages"]
+    assert any(_message_has_marker(message, caption) for message in sent)
+    assert any(_message_has_marker(message, "Text detail 0.") for message in sent)
+    assert sum(_message_has_image(message) for message in sent) == 1
+    material_paths = list((tmp_path / "workspace" / ".opensquilla" / "attachments").rglob("*.png"))
+    assert len(material_paths) == 1
+    assert material_paths[0].read_bytes() == image_bytes()
+    assert any(
+        _message_has_marker(message, f".opensquilla/attachments/{node.session_id}/")
+        for message in sent
+    )
+
+
+@pytest.mark.parametrize("forked", [False, True])
+@pytest.mark.parametrize("write_policy", ["allowed", "write_deny", "budget", "disabled"])
+async def test_retained_tool_image_replay_uses_a_readable_current_session_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, forked: bool, write_policy: str,
+) -> None:
+    from opensquilla.attachment_workspace import AttachmentWorkspaceMaterializer
+    from opensquilla.engine.agent import _serialize_assistant_replay
+    from opensquilla.engine.history import decode_assistant_replay
+    from opensquilla.provider.openai import _build_openai_messages
+    from opensquilla.provider.types import ContentBlockToolResult, ContentBlockToolUse
+    from opensquilla.tools.builtin import filesystem
+    from opensquilla.tools.types import ToolContext, WorkspaceAccessError, current_tool_context
+
+    async def no_sandbox(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr(filesystem, "_run_sandbox_operation_if_required", no_sandbox)
+    manager = _FakeSessionManager()
+    key = "agent:main:retained-tool-image-replay"
+    node = await manager.create(key)
+    config = GatewayConfig(workspace_dir=str(tmp_path / "workspace"))
+    materializer = AttachmentWorkspaceMaterializer(
+        media_root=tmp_path / "media", workspace_dir=config.workspace_dir,
+    )
+    payload = image_bytes()
+    parent_id = "parent-session" if forked else node.session_id
+    material = materializer.materialize_bytes(
+        payload, name="image.png", mime="image/png", session_id=parent_id,
+    )
+    assert material.rel_path
+    url = "https://images.example.test/temporary-image"
+    receipt = json.dumps({
+        "status": "loaded", "path": url, "source_url": url,
+        "local_path": material.rel_path, "name": "image.png",
+    }, indent=2)
+    canonical = _serialize_assistant_replay([
+        Message(role="assistant", content=[ContentBlockToolUse(
+            id="image-read", name="image", input={"path": url},
+        )]),
+        Message(role="user", content=[
+            ContentBlockToolResult(tool_use_id="image-read", content=receipt),
+            ContentBlockImage(
+                media_type="image/png", data=_b64(payload), name="image.png",
+                source_url=url, local_path=material.rel_path, durable_retained=True,
+            ),
+        ]),
+    ])
+    saved_canonical = json.dumps(canonical)
+    await manager.append_message(key, "user", "Load the source image.")
+    entry = await manager.append_message(key, "assistant", "Image loaded.")
+    entry.assistant_replay = canonical
+    await manager.append_message(key, "user", "Read the local image again.", "current")
+    context = ToolContext(
+        workspace_dir=config.workspace_dir, workspace_strict=True,
+        artifact_session_id=node.session_id, artifact_media_root=str(tmp_path / "media"),
+        sandbox_gateway_config=config,
+    )
+    if write_policy == "write_deny":
+        context.workspace_write_deny_globs = [".opensquilla/attachments/**"]
+    elif write_policy == "budget":
+        config.attachments.workspace_attachment_disk_budget_bytes = len(payload)
+    elif write_policy == "disabled":
+        config.attachments.persist_transcripts = False
+    agent = Agent(provider=_CapturingProvider(), tool_context=context, config=AgentConfig(
+        model_vision_support="supported", workspace_dir=config.workspace_dir,
+    ))
+    runner = TurnRunner(provider_selector=MagicMock(), session_manager=manager, config=config)
+    await runner._load_history(agent, key, bound_user_message_id="current")
+
+    replayed = agent._history[-1]
+    image = next(block for block in replayed.content if isinstance(block, ContentBlockImage))
+    tool_result = next(
+        block for block in replayed.content if isinstance(block, ContentBlockToolResult)
+    )
+    if forked and write_policy != "allowed":
+        assert image.local_path is None
+        assert "local_path" not in json.loads(tool_result.content)
+        assert "No readable local copy" in json.loads(tool_result.content)["retention_note"]
+        assert image.data == _b64(payload)
+        assert json.dumps(entry.assistant_replay) == saved_canonical
+        child_material = (
+            Path(config.workspace_dir) / ".opensquilla" / "attachments" / node.session_id
+        )
+        assert not any(path.is_file() for path in child_material.rglob("*"))
+        return
+    assert image.local_path == json.loads(tool_result.content)["local_path"]
+    assert image.local_path.startswith(f".opensquilla/attachments/{node.session_id}/")
+    assert image.data == _b64(payload)
+    assert json.dumps(entry.assistant_replay) == saved_canonical
+    if not forked:
+        assert tool_result.content == receipt
+        assert _build_openai_messages(replayed) == _build_openai_messages(
+            decode_assistant_replay(canonical)[-1]
+        )
+    token = current_tool_context.set(context)
+    try:
+        await filesystem.read_file(image.local_path, _tool_use_id="reread")
+        if forked:
+            with pytest.raises(WorkspaceAccessError, match="another session"):
+                await filesystem.read_file(material.rel_path, _tool_use_id="foreign")
+    finally:
+        current_tool_context.reset(token)
+    assert context.tool_result_media["reread"][0]["data"] == _b64(payload)
+
+
 @pytest.mark.parametrize("image_source", ["active", "archive", "bound", "agent_history"])
 async def test_text_primary_fallback_recovers_selected_historical_original(
     image_source: str,
 ) -> None:
     manager = _CanonicalSessionManager()
     key = "agent:main:historical-selector-fallback"
-    await manager.create(key)
+    node = await manager.create(key)
     image_entry = _TranscriptEntry(
         "user",
         _inline_image_envelope("Describe this image.", image_bytes(color="#000001")),
@@ -235,13 +407,19 @@ async def test_text_primary_fallback_recovers_selected_historical_original(
     wrapper.configure_fallback_deployment_limits([
         (fallback_config, 0, 0, ModelCapabilities(supports_vision=True))
     ])
+    image_metadata: dict[str, Any] = {"attachment_count": 0}
+    if image_source == "archive":
+        manifest = build_attachment_manifest(
+            [image_entry], session_id=node.session_id, session_key=key,
+        )
+        image_metadata["image_intent_attachment_ids"] = [manifest.occurrences[0].attachment_id]
     agent = Agent(
         provider=wrapper,
         config=AgentConfig(
             model_id="configured-text",
             model_vision_support="unsupported",
             preserve_historical_images=image_source != "bound",
-            metadata={"attachment_count": 0},
+            metadata=image_metadata,
             max_provider_retries=0,
         ),
     )
@@ -276,15 +454,16 @@ async def test_text_primary_fallback_recovers_selected_historical_original(
 
 
 @pytest.mark.parametrize("archived", [False, True])
+@pytest.mark.parametrize("explicit_reference", [False, True])
 @pytest.mark.parametrize("opt_out", [False, True])
 async def test_current_upload_and_previous_image_selection_are_independent(
-    archived: bool, opt_out: bool,
+    archived: bool, explicit_reference: bool, opt_out: bool,
 ) -> None:
     from opensquilla.engine.turn_runner.agent_bootstrap_stage import _preserve_historical_images
 
     manager = _CanonicalSessionManager()
     key = "agent:main:compare-current-and-previous"
-    await manager.create(key)
+    node = await manager.create(key)
     previous = _TranscriptEntry(
         "user", _inline_image_envelope("Previous upload.", image_bytes(color="#000002")), "previous"
     )
@@ -301,26 +480,27 @@ async def test_current_upload_and_previous_image_selection_are_independent(
     metadata: dict[str, Any] = {
         "attachment_count": 1,
         "image_attachment_ids": ["att_current"],
+        "image_context_has_images": True,
         "router_history_has_recent_image": True,
         "router_turns_since_last_image": 1,
     }
-    if opt_out:
-        metadata["image_intent_attachment_ids"] = ["att_previous"]
-        metadata["image_route_reason"] = "gate_history"
+    if explicit_reference:
+        manifest = build_attachment_manifest(
+            [previous], session_id=node.session_id, session_key=key,
+        )
+        metadata["image_intent_attachment_ids"] = [manifest.occurrences[0].attachment_id]
     ctx = TurnContext(
         message=text, raw_message=text, session_key=key,
         model="configured-vision", config=config,
         attachments=[{"mime": "image/png", "data": _b64(image_bytes(color="#000003"))}],
         provider=_CapturingProvider(), tool_defs=[], system_prompt="", metadata=metadata,
     )
-    await apply_vision_followup_gate(ctx)
-    assert _preserve_historical_images(ctx.metadata) is not opt_out
+    assert _preserve_historical_images(ctx.metadata) is True
     provider = _CapturingProvider()
     agent = Agent(
         provider=provider,
         config=AgentConfig(
             model_vision_support="supported", metadata=ctx.metadata,
-            # The explicit veto must beat an older bootstrap/config flag too.
             preserve_historical_images=True,
         ),
     )
@@ -342,14 +522,15 @@ async def test_current_upload_and_previous_image_selection_are_independent(
     ]
     assert payloads == (
         [_b64(image_bytes(color="#000003"))]
-        if opt_out else [_b64(image_bytes(color="#000002")), _b64(image_bytes(color="#000003"))]
+        if archived and not explicit_reference
+        else [_b64(image_bytes(color="#000002")), _b64(image_bytes(color="#000003"))]
     )
 
 
-@pytest.mark.parametrize("gate_enabled", [False, True])
+@pytest.mark.parametrize("caption", ["Ignore the previous image", "Do not only inspect one image"])
 @pytest.mark.parametrize("current_upload", [False, True])
-async def test_current_text_image_opt_out_reaches_provider_when_gate_disabled(
-    gate_enabled: bool, current_upload: bool,
+async def test_natural_language_does_not_remove_explicit_image_reference(
+    caption: str, current_upload: bool,
 ) -> None:
     from opensquilla.engine.turn_runner.agent_bootstrap_stage import _preserve_historical_images
 
@@ -362,7 +543,7 @@ async def test_current_text_image_opt_out_reaches_provider_when_gate_disabled(
     previous_id = build_attachment_manifest(
         [previous], session_id=node.session_id, session_key=key,
     ).occurrences[0].attachment_id
-    text = f"Ignore the previous image {previous_id}; answer only the text question."
+    text = f"{caption} {previous_id}; answer the question."
     current = _TranscriptEntry(
         "user",
         _inline_image_envelope(text, image_bytes(color="#000003")) if current_upload else text,
@@ -371,12 +552,10 @@ async def test_current_text_image_opt_out_reaches_provider_when_gate_disabled(
     manager._canonical[key] = [previous, current]
     manager._transcripts[key] = [previous, current]
     config = GatewayConfig(llm={"provider": "openai"})
-    config.squilla_router.vision_followup_gate_enabled = gate_enabled
     metadata: dict[str, Any] = {
         "attachment_count": int(current_upload),
         "image_intent_attachment_ids": [previous_id],
-        "router_vision_followup_needs_image": True,
-        "router_vision_followup_gate_source": "explicit_attachment_id",
+        "image_context_has_images": True,
     }
     attachments = (
         [{"mime": "image/png", "data": _b64(image_bytes(color="#000003"))}]
@@ -388,7 +567,6 @@ async def test_current_text_image_opt_out_reaches_provider_when_gate_disabled(
         model="configured-vision", provider=provider, tool_defs=[],
         system_prompt="", attachments=attachments, metadata=metadata,
     )
-    await apply_vision_followup_gate(ctx)
     agent = Agent(
         provider=provider,
         config=AgentConfig(
@@ -412,9 +590,11 @@ async def test_current_text_image_opt_out_reaches_provider_when_gate_disabled(
         if isinstance(message.content, list) for block in message.content
         if isinstance(block, ContentBlockImage)
     ]
-    assert payloads == ([_b64(image_bytes(color="#000003"))] if current_upload else [])
-    assert ctx.metadata["router_vision_followup_gate_source"] == "explicit_opt_out"
-    assert ctx.metadata["router_vision_followup_needs_image"] is False
+    assert payloads == [
+        _b64(image_bytes(color="#000002")),
+        *([_b64(image_bytes(color="#000003"))] if current_upload else []),
+    ]
+    assert ctx.metadata["image_context_has_images"] is True
 
 
 @pytest.mark.asyncio
@@ -828,12 +1008,12 @@ async def test_persisted_compacted_archive_rehydrates_explicit_attachment_id() -
             None,
             [],
             "system",
-            [],
+            [{"resourceRef": {"type": "attachment", "id": attachment_id}}],
             semantic_message=current_prompt,
         )
         assert returned_provider is provider
         assert turn.metadata["image_intent_attachment_ids"] == [attachment_id]
-        assert turn.metadata["router_vision_followup_needs_image"] is True
+        assert turn.metadata["image_context_has_images"] is True
         agent = Agent(
             provider=provider,
             config=AgentConfig(
@@ -1069,13 +1249,13 @@ async def test_non_image_attachment_id_does_not_force_vision_route() -> None:
             None,
             [],
             "system",
-            [],
+            [{"resourceRef": {"type": "attachment", "id": document_id}}],
             semantic_message=prompt,
         )
 
         assert returned_provider is provider
         assert "image_intent_attachment_ids" not in turn.metadata
-        assert turn.metadata.get("router_vision_followup_needs_image") is not True
+        assert turn.metadata.get("image_context_has_images") is not True
     finally:
         await storage.close()
 
@@ -1101,18 +1281,17 @@ async def test_image_followup_routes_vision_and_replays_inline_history_image() -
     assert router_context["turns_since_last_image"] == 0
     assert router_context["last_image_turn_text"].startswith("Describe this image.")
 
-    gate_provider = _GateThenCaptureProvider(
-        '{"decision":"needs_image","confidence":0.92,"reason":"explicit continuation"}'
-    )
+    context_provider = _CapturingProvider()
     ctx = TurnContext(
         message="Continue from that image.",
         session_key=key,
         config=config,
-        provider=gate_provider,
+        provider=context_provider,
         model=config.llm.model,
         tool_defs=[],
         system_prompt="system",
         metadata={
+            "image_context_has_images": True,
             "router_history_user_texts": ["Describe this image."],
             "router_history_has_recent_image": True,
             "router_history_image_turn_count": 1,
@@ -1123,15 +1302,12 @@ async def test_image_followup_routes_vision_and_replays_inline_history_image() -
         },
         raw_message="Continue from that image.",
     )
-    gated = await apply_vision_followup_gate(ctx)
-    routed = await apply_squilla_router(gated)
-    assert gate_provider.gate_calls == 0
-    assert routed.metadata["router_vision_followup_gate_decision"] == "needs_image"
-    assert routed.metadata["router_vision_followup_gate_source"] == "explicit_image_reference"
-    assert routed.metadata["router_vision_followup_needs_image"] is True
+    routed = await apply_squilla_router(ctx)
+    assert context_provider.calls == []
+    assert routed.metadata["image_context_has_images"] is True
     assert routed.metadata["routing_source"] == "image_route"
-    assert routed.metadata["image_route_reason"] == "gate_history"
-    assert routed.metadata["route_max_history_turns"] == 8
+    assert routed.metadata["image_route_reason"] == "history_context"
+    assert "route_max_history_turns" not in routed.metadata
 
     provider = _CapturingProvider()
     agent = Agent(
@@ -1154,106 +1330,39 @@ async def test_image_followup_routes_vision_and_replays_inline_history_image() -
 
 
 @pytest.mark.asyncio
-async def test_gate_text_only_followup_does_not_image_route() -> None:
-    key = "agent:main:image-followup-gate-text"
+@pytest.mark.parametrize("has_image_context", [False, True])
+@pytest.mark.parametrize(
+    "message", ["Write a small program.", "Explain the panel.", "Ignore one panel."],
+)
+async def test_image_context_fact_routes_without_an_auxiliary_semantic_call(
+    has_image_context: bool,
+    message: str,
+) -> None:
     config = GatewayConfig(llm={"provider": "openrouter"})
-    provider = _GateThenCaptureProvider(
-        '{"decision":"text_only","confidence":0.9,"reason":"new coding task"}'
-    )
+    provider = _CapturingProvider()
     ctx = TurnContext(
-        message="Now write a Python script.",
-        session_key=key,
+        message=message,
+        session_key="agent:main:image-context-route",
         config=config,
         provider=provider,
         model=config.llm.model,
         tool_defs=[],
         system_prompt="system",
         metadata={
-            "router_history_user_texts": ["Describe this image."],
-            "router_history_has_recent_image": True,
-            "router_history_image_turn_count": 1,
-            "router_vision_sticky_remaining": 3,
-            "router_turns_since_last_image": 0,
-            "router_last_image_turn_text": "Describe this image.",
-            "router_vision_candidate_turns": 8,
-        },
-        raw_message="Now write a Python script.",
-    )
-
-    gated = await apply_vision_followup_gate(ctx)
-    turn = await apply_squilla_router(gated)
-
-    assert provider.gate_calls == 1
-    assert turn.metadata["router_vision_followup_gate_decision"] == "text_only"
-    assert turn.metadata["router_vision_followup_needs_image"] is False
-    assert turn.metadata.get("image_route_reason") is None
-
-
-@pytest.mark.asyncio
-async def test_gate_unknown_recent_fallback_routes_image() -> None:
-    config = GatewayConfig(llm={"provider": "openrouter"})
-    provider = _GateThenCaptureProvider(
-        '{"decision":"unknown","confidence":0.2,"reason":"ambiguous pronoun"}'
-    )
-    ctx = TurnContext(
-        message="What about this?",
-        session_key="agent:main:image-followup-unknown-recent",
-        config=config,
-        provider=provider,
-        model=config.llm.model,
-        tool_defs=[],
-        system_prompt="system",
-        metadata={
-            "router_history_has_recent_image": True,
-            "router_history_image_turn_count": 1,
-            "router_turns_since_last_image": 1,
-            "router_last_image_turn_text": "Describe this image.",
-            "router_vision_candidate_turns": 8,
-        },
-        raw_message="What about this?",
-    )
-
-    gated = await apply_vision_followup_gate(ctx)
-    routed = await apply_squilla_router(gated)
-
-    assert provider.gate_calls == 1
-    assert routed.metadata["router_vision_followup_gate_decision"] == "unknown"
-    assert routed.metadata["router_vision_followup_needs_image"] is True
-    assert routed.metadata["router_vision_followup_fallback"] == "image_if_recent"
-    assert routed.metadata["image_route_reason"] == "gate_history"
-
-
-@pytest.mark.asyncio
-async def test_gate_unknown_old_fallback_uses_text_router() -> None:
-    config = GatewayConfig(llm={"provider": "openrouter"})
-    provider = _GateThenCaptureProvider(
-        '{"decision":"unknown","confidence":0.2,"reason":"ambiguous but old"}'
-    )
-    ctx = TurnContext(
-        message="What about this?",
-        session_key="agent:main:image-followup-unknown-old",
-        config=config,
-        provider=provider,
-        model=config.llm.model,
-        tool_defs=[],
-        system_prompt="system",
-        metadata={
+            "image_context_has_images": has_image_context,
             "router_history_has_recent_image": True,
             "router_history_image_turn_count": 1,
             "router_turns_since_last_image": 3,
-            "router_last_image_turn_text": "Describe this image.",
-            "router_vision_candidate_turns": 8,
         },
-        raw_message="What about this?",
+        raw_message=message,
     )
 
-    gated = await apply_vision_followup_gate(ctx)
-    routed = await apply_squilla_router(gated)
+    routed = await apply_squilla_router(ctx)
 
-    assert provider.gate_calls == 1
-    assert routed.metadata["router_vision_followup_gate_decision"] == "unknown"
-    assert routed.metadata["router_vision_followup_needs_image"] is False
-    assert routed.metadata.get("image_route_reason") is None
+    assert provider.calls == []
+    assert routed.metadata.get("image_route_reason") == (
+        "history_context" if has_image_context else None
+    )
 
 
 @pytest.mark.asyncio
@@ -1344,7 +1453,7 @@ async def test_default_sticky_window_keeps_third_followup_active() -> None:
 
 
 @pytest.mark.asyncio
-async def test_image_history_outside_sticky_window_does_not_route_or_replay() -> None:
+async def test_recent_image_context_survives_the_legacy_sticky_window() -> None:
     manager = _FakeSessionManager()
     key = "agent:main:image-followup-sticky-expired"
     config = GatewayConfig(llm={"provider": "openrouter"})
@@ -1375,12 +1484,13 @@ async def test_image_history_outside_sticky_window_does_not_route_or_replay() ->
         tool_defs=[],
         system_prompt="system",
         metadata={
+            "image_context_has_images": True,
             "router_history_has_recent_image": True,
             "router_history_image_turn_count": 1,
         },
     )
     routed = await apply_squilla_router(ctx)
-    assert routed.metadata["routing_source"] != "image_route"
+    assert routed.metadata["routing_source"] == "image_route"
 
     provider = _CapturingProvider()
     agent = Agent(
@@ -1388,14 +1498,21 @@ async def test_image_history_outside_sticky_window_does_not_route_or_replay() ->
         config=AgentConfig(
             max_iterations=1,
             model_id=routed.model,
-            model_capabilities=ModelCapabilities(supports_vision=False),
+            model_capabilities=ModelCapabilities(supports_vision=True),
+            model_vision_support="supported",
         ),
     )
     await runner._load_history(agent, key)
     events = [event async for event in agent.run_turn("Current follow-up.")]
 
     assert any(event.kind == "done" for event in events)
-    assert not any(_message_has_image(message) for message in provider.calls[0]["messages"])
+    assert [
+        block.data
+        for message in provider.calls[0]["messages"]
+        if isinstance(message.content, list)
+        for block in message.content
+        if isinstance(block, ContentBlockImage)
+    ] == [_b64(image_bytes())]
 
 
 @pytest.mark.asyncio
@@ -1468,6 +1585,7 @@ async def test_text_model_history_keeps_image_as_marker_not_provider_image() -> 
         config=AgentConfig(
             max_iterations=1,
             model_capabilities=ModelCapabilities(supports_vision=False),
+            model_vision_support="unsupported",
         ),
     )
     await runner._load_history(agent, key)
@@ -1476,12 +1594,12 @@ async def test_text_model_history_keeps_image_as_marker_not_provider_image() -> 
     assert any(event.kind == "done" for event in events)
     sent_messages = provider.calls[0]["messages"]
     assert not any(_message_has_image(message) for message in sent_messages)
-    assert "historical attachment omitted" in str(sent_messages[0].content)
-    assert manifest.occurrences[0].attachment_id in str(sent_messages[0].content)
+    assert any(_message_has_marker(message, "图片") for message in sent_messages)
+    assert manifest.occurrences[0].attachment_id in str(sent_messages)
 
 
 @pytest.mark.asyncio
-async def test_text_only_followup_does_not_replay_history_image_on_vision_model() -> None:
+async def test_new_text_question_keeps_recent_image_context_on_vision_model() -> None:
     manager = _FakeSessionManager()
     key = "agent:main:image-followup-text-only-vision-model"
     config = GatewayConfig(llm={"provider": "openrouter"})
@@ -1504,5 +1622,10 @@ async def test_text_only_followup_does_not_replay_history_image_on_vision_model(
 
     assert any(event.kind == "done" for event in events)
     sent_messages = provider.calls[0]["messages"]
-    assert not any(_message_has_image(message) for message in sent_messages)
-    assert "historical attachment omitted" in str(sent_messages[0].content)
+    assert [
+        block.data
+        for message in sent_messages
+        if isinstance(message.content, list)
+        for block in message.content
+        if isinstance(block, ContentBlockImage)
+    ] == [_b64(image_bytes())]

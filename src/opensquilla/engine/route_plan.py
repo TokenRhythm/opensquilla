@@ -266,7 +266,7 @@ def _router_tier_snapshot(
         "image"
         if _text(metadata.get("routing_source")) == "image_route"
         or bool(metadata.get("image_route_reason"))
-        or bool(metadata.get("router_vision_followup_needs_image"))
+        or metadata.get("image_context_has_images") is True
         else "text"
     )
     shared_selection_mode = effective_ensemble_selection_mode(config)
