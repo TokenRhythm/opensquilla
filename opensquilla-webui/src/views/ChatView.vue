@@ -142,7 +142,11 @@
           v-if="!forkTransition && recoveryNoticeVisible && recoveryNoticeState"
           :state="recoveryNoticeState"
           :transport-state="gatewayConnectionState"
-          automatic
+          :action="recoveryNoticeState === 'live-degraded'
+            ? 'retry-live'
+            : recoveryNoticeState === 'history-error'
+              ? 'retry-history'
+              : undefined"
           @retry="recoveryNoticeState.startsWith('live-') ? retryLive() : retryHistory()"
         />
         <div
