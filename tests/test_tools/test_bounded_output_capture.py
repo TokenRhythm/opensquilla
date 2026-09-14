@@ -174,24 +174,55 @@ async def test_retained_capture_preserves_process_newlines(
     assert capture.describe()["retained_output_complete"] is True
 
 
-async def test_exec_timeout_preserves_output_and_retrievable_retained_text(tmp_path: Path) -> None:
+async def test_exec_timeout_preserves_output_and_retrievable_retained_text(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
     token = current_tool_context.set(ToolContext(
         session_key="test-session", tool_result_store_dir=str(tmp_path), agent_id="main",
     ))
-    code = "import sys,time; print('before waiting', flush=True); time.sleep(20)"
+    code = (
+        "import sys,time; sys.stdout.buffer.write(b'before waiting\\r\\n'); "
+        "sys.stdout.flush(); sys.stderr.buffer.write(b'ready\\n'); "
+        "sys.stderr.flush(); time.sleep(20)"
+    )
     argv = [sys.executable, "-c", code]
     command = subprocess.list2cmdline(argv) if os.name == "nt" else shlex.join(argv)
+    process_options = (
+        {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
+        if os.name == "nt" else {"start_new_session": True}
+    )
+    proc = None
     try:
+        # Start the real child before timing its blocked work. Windows shell
+        # and interpreter startup can consume the entire 0.5-second budget.
+        proc = await asyncio.create_subprocess_exec(
+            *argv, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            **process_options,
+        )
+        assert proc.stderr is not None
+        assert await asyncio.wait_for(proc.stderr.readline(), timeout=10) == b"ready\n"
+
+        async def ready_process(_command: str, **_kwargs):
+            return proc
+
+        monkeypatch.setattr(shell, "_create_host_shell_subprocess", ready_process)
         result = await shell._run_host_shell_command(
             command, cwd=None, env=dict(os.environ), stdin_bytes=None, effective_timeout=0.5,
         )
+        assert proc.returncode is not None
     finally:
-        current_tool_context.reset(token)
+        try:
+            if proc is not None and proc.returncode is None:
+                proc.kill()
+                await asyncio.wait_for(proc.wait(), timeout=5)
+        finally:
+            current_tool_context.reset(token)
     assert "[timeout after 0.5s]" in result
-    assert "before waiting" in result
+    # The command itself contains this text, so only inspect captured output.
+    assert "before waiting" in result.split("--- partial output before timeout ---\n", 1)[1]
     handle = result.split("tool_result_handle=", 1)[1].split(";", 1)[0]
     stored = ToolResultStore(tmp_path).read(handle, session_id="test-session")
-    assert "before waiting" in stored.content
+    assert stored.content == "before waiting\r\n"
 
 
 async def test_background_log_and_wait_retain_output_after_nonzero_exit(

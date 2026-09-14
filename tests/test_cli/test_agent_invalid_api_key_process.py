@@ -109,11 +109,26 @@ def test_invalid_api_key_exits_promptly_with_nonzero_status(tmp_path: Path) -> N
     host, port = server.server_address
     env = _isolated_agent_env(tmp_path, f"http://{host}:{port}/v1")
     assert env["OPENSQUILLA_TEST_PROFILE_LOCK_ROOT"] == "1"
+    stack_dump_path = tmp_path / "agent-child-stacks.txt"
+    stack_dump_path.touch()
+    # Record one bounded stack snapshot without filling the child's stderr pipe.
+    # Only include it in the test report if the process fails to make progress.
+    child_code = (
+        "import faulthandler\n"
+        f"with open({str(stack_dump_path)!r}, 'w', encoding='utf-8') as stack_dump:\n"
+        "    faulthandler.dump_traceback_later(\n"
+        f"        {_REQUEST_START_TIMEOUT_SECONDS / 2!r}, file=stack_dump)\n"
+        "    try:\n"
+        "        from opensquilla.cli.main import app\n"
+        "        app()\n"
+        "    finally:\n"
+        "        faulthandler.cancel_dump_traceback_later()\n"
+    )
     process = subprocess.Popen(
         [
             sys.executable,
             "-c",
-            "from opensquilla.cli.main import app; app()",
+            child_code,
             "agent",
             "-m",
             "Reply with INVALID_KEY_TEST",
@@ -131,7 +146,8 @@ def test_invalid_api_key_exits_promptly_with_nonzero_status(tmp_path: Path) -> N
             stdout, stderr = _stop_process(process)
             pytest.fail(
                 "agent CLI did not reach the local provider within the startup limit\n"
-                f"stdout:\n{stdout}\nstderr:\n{stderr}"
+                f"stdout:\n{stdout}\nstderr:\n{stderr}\n"
+                f"child stacks:\n{stack_dump_path.read_text(encoding='utf-8', errors='replace')}"
             )
         try:
             stdout, stderr = process.communicate(timeout=_POST_RESPONSE_EXIT_TIMEOUT_SECONDS)
@@ -139,7 +155,8 @@ def test_invalid_api_key_exits_promptly_with_nonzero_status(tmp_path: Path) -> N
             stdout, stderr = _stop_process(process)
             pytest.fail(
                 "agent CLI remained alive after the provider returned HTTP 401\n"
-                f"stdout:\n{stdout}\nstderr:\n{stderr}"
+                f"stdout:\n{stdout}\nstderr:\n{stderr}\n"
+                f"child stacks:\n{stack_dump_path.read_text(encoding='utf-8', errors='replace')}"
             )
     finally:
         if process.poll() is None:
