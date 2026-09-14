@@ -40,7 +40,7 @@
           v-if="showActivityDisclosure"
           :lifecycle="activityLifecycle"
           :step-count="activityStepCount"
-          :failure-count="documentWriterFailureCount"
+          :failure-count="toolFailureCount"
           :duration-seconds="activityDurationSeconds"
           :summary-label="displayActivitySummaryLabel"
           :detail-label="displayActivityDetailLabel"
@@ -656,7 +656,13 @@ const standaloneInterruptParts = computed(() =>
     )
   )),
 )
-const outcomePresentation = computed(() => turnOutcomePresentation(props.message.turnOutcome))
+const outcomePresentation = computed(() => {
+  const outcome = turnOutcomePresentation(props.message.turnOutcome)
+  if (outcome !== 'completed') return outcome
+  if (props.message.interrupted) return 'interrupted'
+  if (props.message.terminalFailure) return 'failed'
+  return outcome
+})
 const processRestart = computed(() => isProcessRestartOutcome(props.message.turnOutcome))
 
 function epochMilliseconds(value: string | number | null | undefined): number {
@@ -828,17 +834,6 @@ const activityLifecycle = computed<AssistantActivityLifecycle>(() => {
   if (outcomePresentation.value === 'interrupted') return 'interrupted'
   if (outcomePresentation.value === 'timeout') return 'failed'
   if (outcomePresentation.value === 'failed') return 'failed'
-  if (props.message.interrupted) return 'interrupted'
-  if (props.message.terminalFailure) return 'failed'
-  const hasTerminalFailure = !props.message.text.trim()
-    && (
-      (props.message.toolCalls || []).some(call => call.isError || call.status === 'error')
-      || (props.message.timelineItems || []).some(item =>
-        item.type === 'tool-group'
-        && item.group.calls.some(call => call.isError || call.status === 'error'),
-      )
-  )
-  if (hasTerminalFailure) return 'failed'
   return props.message.isStreaming ? 'working' : 'settled'
 })
 
@@ -928,7 +923,7 @@ const showActivityDisclosure = computed(() =>
   || props.message.activitySnapshotIncomplete === true,
 )
 
-const documentWriterFailureCount = computed(() =>
+const toolFailureCount = computed(() =>
   visibleActivityItems.value.reduce((count, item) => {
     if (item.type !== 'tool-group') return count
     return count + item.group.calls.filter(call =>
@@ -1105,12 +1100,6 @@ const activitySummaryLabel = computed(() => {
   if (mutationSummaryKey) {
     return withMaintenanceSummary([
       String(t(`chat.promptAnnotations.status.${mutationSummaryKey}`)),
-      activityCompactElapsedLabel.value,
-    ].filter(Boolean).join(' · '))
-  }
-  if (documentWriterFailureCount.value > 0) {
-    return withMaintenanceSummary([
-      String(t('sessions.status.failed')),
       activityCompactElapsedLabel.value,
     ].filter(Boolean).join(' · '))
   }

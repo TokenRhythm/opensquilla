@@ -254,7 +254,7 @@ async function mockControlledActivityLifecycle(
   fixture: ControlledActivityLifecycleFixture = {},
 ) {
   let sendFrame: ((frame: string) => void) | null = null
-  let streamSeq = 100
+  let streamSeq = 3
   let settled = false
   let acceptedUserMessageId = 'activity-lifecycle-user'
 
@@ -263,13 +263,7 @@ async function mockControlledActivityLifecycle(
     sendFrame(wsEvent(event, {
       key: LIFECYCLE_SESSION_KEY,
       task_id: LIFECYCLE_TASK_ID,
-      turn_id: 'turn-e2e-assistant-activity-lifecycle',
-      stream_generation: 'e2e-stream-generation',
       stream_seq: streamSeq++,
-      schema_version: 1,
-      activity_id: `activity-${streamSeq}`,
-      started_at: Date.now(),
-      heartbeat: false,
       ...payload,
     }))
   }
@@ -297,16 +291,6 @@ async function mockControlledActivityLifecycle(
       if (method === 'connect') {
         ws.send(helloOkResponse({
           policy: { webui_stream_idle_grace_ms: 1_260_000 },
-          features: {
-            events: [
-              'session.event.state_change',
-              'session.event.provider_activity',
-              'session.event.tool_use_start',
-              'session.event.tool_result',
-              'session.event.text_delta',
-              'session.event.done',
-            ],
-          },
         }))
         return
       }
@@ -419,7 +403,6 @@ async function mockControlledActivityLifecycle(
       settled = true
       emit('session.event.done', {
         text: 'Final verified answer.',
-        finalText: 'Final verified answer.',
         model: 'test/activity',
         input_tokens: 12,
         output_tokens: 4,
@@ -739,6 +722,32 @@ test.describe('Completed assistant activity disclosure', () => {
 })
 
 test.describe('Live assistant activity lifecycle', () => {
+  test('renders an unbounded provider retry as an attempt label', async ({ page }) => {
+    const lifecycle = await mockControlledActivityLifecycle(page)
+    await page.goto(
+      CONTROL_URL + 'chat?session=' + encodeURIComponent(LIFECYCLE_SESSION_KEY),
+    )
+    await expect(page.locator('.conn-pill.connected')).toBeVisible({ timeout: 10_000 })
+    await page.locator('.chat-textarea').fill('Reconnect and finish this task.')
+    await page.locator('.chat-send-btn[aria-label="Send"]').click()
+
+    const liveActivity = page.locator('.assistant-activity--live')
+    await expect(liveActivity).toBeVisible()
+    lifecycle.emit('session.event.provider_activity', {
+      phase: 'retrying',
+      reason: 'transport_transient',
+      retry_attempt: 7,
+      retry_limit: 0,
+    })
+    await expect(liveActivity.getByText('Retrying · attempt 7', { exact: true })).toBeVisible()
+    await expect(liveActivity).not.toContainText('7/0')
+    await expect(page.locator('.msg-error-card')).toHaveCount(0)
+
+    lifecycle.finish()
+    await expect(liveActivity).toHaveCount(0)
+    await expect(page.locator('.msg-ai .assistant-activity__summary')).toContainText('Completed')
+  })
+
   test('keeps a failed tool row when a later tool succeeds and the turn completes', async ({ page }) => {
     const lifecycle = await mockControlledActivityLifecycle(page, {
       donePayload: { text: 'Recovered final answer.' },
@@ -822,6 +831,7 @@ test.describe('Live assistant activity lifecycle', () => {
     await expect(liveActivity).toHaveCount(0)
     const settled = page.locator('.msg-ai .assistant-activity').last()
     await expect(settled).toBeVisible()
+    await expect(settled.locator('.assistant-activity__summary')).toContainText('Completed')
     await expect(settled.locator('.tool-row--error')).toHaveCount(1)
     await expect(settled.locator('.tool-row[data-op="command.run"]')).toHaveCount(2)
     await expect(page.getByText('Recovered final answer.', { exact: true })).toHaveCount(1)
