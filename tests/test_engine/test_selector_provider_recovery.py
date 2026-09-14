@@ -8,14 +8,18 @@ import pytest
 from opensquilla.engine import Agent, AgentConfig
 from opensquilla.engine.routing.health import ProviderHealthLedger
 from opensquilla.engine.runtime import _SelectorFallbackProvider
+from opensquilla.provider.failures import ProviderFailureKind
 from opensquilla.provider.selector import ModelSelector, ProviderConfig, SelectorConfig
 from opensquilla.provider.types import (
     ChatConfig,
     DoneEvent,
     ErrorEvent,
     Message,
+    ModelCapabilities,
     ReasoningDeltaEvent,
     TextDeltaEvent,
+    ToolDefinition,
+    ToolInputSchema,
     ToolUseStartEvent,
 )
 
@@ -49,10 +53,10 @@ class _Provider:
             yield event
 
 
-def _wrapper(monkeypatch, streams):
+def _wrapper(monkeypatch, streams, *, configs=None):
     calls = []
     providers = {name: _Provider(name, events, calls) for name, events in streams.items()}
-    configs = [
+    configs = configs or [
         ProviderConfig(
             provider="openai", model=name, api_key="dummy", base_url=f"https://{name}.test"
         )
@@ -176,12 +180,151 @@ async def test_connection_wait_is_cancelled_with_current_stream(monkeypatch):
     assert calls == ["primary"]
 
 
-@pytest.mark.parametrize("failure", [_connection(), _rate()], ids=["connection", "rate-limit"])
-async def test_normal_task_deadline_closes_provider_retry_wait(monkeypatch, failure):
-    provider, _, calls = _wrapper(monkeypatch, {"primary": [[failure]]})
+async def test_normal_task_deadline_closes_connection_retry_wait(monkeypatch):
+    provider, _, calls = _wrapper(monkeypatch, {"primary": [[_connection()]]})
     events = [event async for event in _agent(provider, timeout=0.05).run_turn("run")]
     assert calls == ["primary"]
     assert any(event.kind == "error" and event.code == "agent_runtime_timeout" for event in events)
+
+
+@pytest.mark.parametrize("timeout", [7, 8])
+@pytest.mark.parametrize("failed_leg", ["primary", "fallback"])
+async def test_rate_wait_beyond_deadline_uses_independent_fallback(
+    monkeypatch, clock, timeout, failed_leg
+):
+    streams = {}
+    if failed_leg == "fallback":
+        streams["unavailable"] = [[ErrorEvent(message="model not found", code="404")]]
+    streams.update({
+        "limited": [[ToolUseStartEvent(tool_use_id="discard", tool_name="write"), _rate()]],
+        "same_account": [_success()],
+        "independent": [_success()],
+    })
+    configs = [
+        ProviderConfig(
+            provider="openai", model=name, api_key="dummy",
+            base_url=f"https://{'limited' if name == 'same_account' else name}.test",
+        )
+        for name in streams
+    ]
+    provider, _, calls = _wrapper(monkeypatch, streams, configs=configs)
+
+    events = [event async for event in _agent(provider, timeout=timeout).run_turn("run")]
+
+    assert calls == (["unavailable"] if failed_leg == "fallback" else []) + [
+        "limited", "independent"
+    ]
+    assert clock[1] == []
+    assert not any(event.kind == "error" for event in events)
+    assert not any(getattr(event, "tool_use_id", "") == "discard" for event in events)
+    assert any(event.kind == "done" and event.text == "recovered" for event in events)
+
+
+@pytest.mark.parametrize("same_account_candidate", [False, True])
+async def test_rate_wait_beyond_deadline_without_independent_fallback_fails_without_waiting(
+    monkeypatch, clock, same_account_candidate
+):
+    streams = {"limited": [[_rate()]]}
+    if same_account_candidate:
+        streams["same_account"] = [_success()]
+    configs = [
+        ProviderConfig(provider="openai", model=name, api_key="dummy", base_url="https://same.test")
+        for name in streams
+    ]
+    provider, _, calls = _wrapper(monkeypatch, streams, configs=configs)
+
+    events = [event async for event in _agent(provider, timeout=8).run_turn("run")]
+
+    assert calls == ["limited"]
+    assert clock[1] == []
+    errors = [event for event in events if event.kind == "error"]
+    assert len(errors) == 1
+    assert errors[0].failure_kind == "rate_limited"
+    assert not any(
+        event.kind == "provider_activity" and event.phase == "retry_wait" for event in events
+    )
+
+
+async def test_deadline_fallback_keeps_each_provider_retry_budget(monkeypatch, clock):
+    provider, _, calls = _wrapper(monkeypatch, {
+        "primary": [[_rate()]] * 3 + [[ErrorEvent(
+            message="rate limit exceeded", code="429", retry_after_s=80
+        )]],
+        "secondary": [[_rate()]] * 3 + [_success()],
+    })
+
+    events = [event async for event in _agent(provider, timeout=60).run_turn("run")]
+
+    assert calls == ["primary"] * 4 + ["secondary"] * 4
+    assert clock[1] == [8] * 6
+    assert any(event.kind == "done" and event.text == "recovered" for event in events)
+
+
+@pytest.mark.parametrize("prefix", [TextDeltaEvent(text="partial"), ReasoningDeltaEvent(text="r")])
+async def test_rate_deadline_does_not_replay_committed_content(monkeypatch, clock, prefix):
+    provider, _, calls = _wrapper(monkeypatch, {
+        "primary": [[prefix, _rate()]], "secondary": [_success()]
+    })
+
+    events = [event async for event in _agent(provider, timeout=8).run_turn("run")]
+
+    assert calls == ["primary"]
+    assert clock[1] == []
+    assert any(event.kind == "error" for event in events)
+
+
+async def test_rate_deadline_fallback_keeps_tools_health_capacity_and_replay_policy(
+    monkeypatch, clock
+):
+    streams = {"limited": [[_rate()]], **{
+        name: [_success()] for name in ("excluded", "no_tools", "unhealthy", "allowed")
+    }}
+    provider, health, calls = _wrapper(monkeypatch, streams)
+    configs = list(provider._selector.remaining_chain())
+    provider._selector._install_capacity_fallback_bound(configs[2:])
+    provider._selector.disable_provider_state_replay()
+    provider.configure_fallback_deployment_limits([
+        (configs[2], 0, 0, ModelCapabilities(supports_tools=False)),
+    ])
+    health.record_failure("openai", "unhealthy", ProviderFailureKind.RATE_LIMITED)
+    agent = Agent(
+        provider,
+        AgentConfig(timeout=8, retry_base_backoff_ms=0, retry_max_backoff_ms=0),
+        tool_definitions=[ToolDefinition(
+            name="write", description="Write", input_schema=ToolInputSchema(properties={})
+        )],
+    )
+
+    events = [event async for event in agent.run_turn("run")]
+
+    assert calls == ["limited", "allowed"]
+    assert provider._selector.current_config.replay_provider_state is False
+    assert clock[1] == []
+    assert any(event.kind == "done" and event.text == "recovered" for event in events)
+
+
+async def test_rate_deadline_health_skip_without_tools_cannot_return_to_same_authority(
+    monkeypatch, clock
+):
+    streams = {
+        "limited": [[_rate()]], "unhealthy": [_success()],
+        "same_account": [_success()], "allowed": [_success()],
+    }
+    configs = [
+        ProviderConfig(
+            provider="openai", model=name, api_key="dummy",
+            base_url=f"https://{'limited' if name == 'same_account' else name}.test",
+        )
+        for name in streams
+    ]
+    provider, health, calls = _wrapper(monkeypatch, streams, configs=configs)
+    health.record_failure("openai", "unhealthy", ProviderFailureKind.RATE_LIMITED)
+
+    events = [event async for event in _agent(provider, timeout=8).run_turn("run")]
+
+    assert calls == ["limited", "allowed"]
+    assert clock[1] == []
+    assert any(event.kind == "done" and event.text == "recovered" for event in events)
 
 
 async def test_physical_attempt_limit_keeps_auxiliary_request_bounded(monkeypatch):

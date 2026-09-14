@@ -3840,8 +3840,9 @@ class Agent:
         *,
         requires_vision: bool = False,
         requires_tools: bool = False,
+        exclude_current_authority: bool = False,
     ) -> bool:
-        if requires_vision or requires_tools:
+        if requires_vision or requires_tools or exclude_current_authority:
             constrained_fallback = getattr(
                 self.provider,
                 "fallback_after_invalid_response_with_capabilities",
@@ -3855,6 +3856,10 @@ class Agent:
                         reason,
                         requires_vision=requires_vision,
                         requires_tools=requires_tools,
+                        **(
+                            {"exclude_current_authority": True}
+                            if exclude_current_authority else {}
+                        ),
                     )
                 )
             except Exception as exc:  # noqa: BLE001 - fallback support is optional
@@ -10857,13 +10862,29 @@ class Agent:
                             continue
                         _connection_wait_attempt = 0
 
-                        # The selector has already proved that honoring this
-                        # authority's Retry-After would cross the absolute turn
-                        # deadline (or the bounded 15-minute wait ceiling).
-                        # Retrying through Agent's outer loop could advance the
-                        # same selector again and accidentally call another
-                        # same-authority leg early, so this typed outcome is
-                        # terminal for the current turn.
+                        if (
+                            provider_error.code == "provider_retry_after_deadline"
+                            and retry_failed_call_safe
+                            and self._switch_to_invalid_response_fallback(
+                                provider_error.code,
+                                requires_tools=bool(provider_tools_for_call),
+                                exclude_current_authority=True,
+                            )
+                        ):
+                            next_provider_activity_reason = "rate_limited"
+                            yield ProviderActivityEvent(
+                                activity_id=provider_activity_id,
+                                phase="fallback",
+                                reason="rate_limited",
+                                retry_attempt=_call_attempt + 1,
+                                retry_limit=_fallback.max_retries,
+                                started_at=time.time_ns() // 1_000_000,
+                            )
+                            _call_attempt += 1
+                            continue
+
+                        # A wait that cannot fit may only move to a different
+                        # authority above. Never replay the rate-limited leg.
                         should_retry = (
                             provider_error.code not in {
                                 "provider_retry_after_deadline", "rate_limit_retry_exhausted"

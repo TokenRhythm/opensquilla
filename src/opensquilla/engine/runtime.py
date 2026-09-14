@@ -2374,6 +2374,14 @@ class _SelectorFallbackProvider:
                                 _fake=True,
                             ),
                         )
+                        turn_deadline = getattr(config, "turn_deadline_at_monotonic", None)
+                        if (
+                            isinstance(turn_deadline, int | float)
+                            and not isinstance(turn_deadline, bool)
+                            and asyncio.get_running_loop().time() + delay >= turn_deadline
+                        ):
+                            yield _selector_retry_after_deadline_error(retry_after_s=delay)
+                            return
                         if (
                             rate_retries >= self._retry_policy.max_retries
                             or delay > _SELECTOR_MAX_RETRY_AFTER_SECONDS
@@ -3342,6 +3350,7 @@ class _SelectorFallbackProvider:
         *,
         requires_vision: bool,
         requires_tools: bool = False,
+        exclude_current_authority: bool = False,
     ) -> bool:
         """Select an invalid-response fallback with exact capability evidence.
 
@@ -3356,14 +3365,33 @@ class _SelectorFallbackProvider:
             "next_fallback_after_failure_matching",
             None,
         )
+        failed_authority = _provider_authority_identity(self.active_deployment_config())
+        if exclude_current_authority and failed_authority is None:
+            return False
+
+        def candidate_allowed(candidate: Any) -> bool:
+            if exclude_current_authority:
+                authority = _provider_authority_identity(candidate)
+                if authority is None or authority == failed_authority:
+                    return False
+            return bool(
+                (
+                    not requires_vision
+                    or self._fallback_deployment_vision_support.get(
+                        _fallback_deployment_identity(candidate), "unknown"
+                    ) == "supported"
+                )
+                and (not requires_tools or self._fallback_candidate_accepts_tools(candidate))
+            )
+
         try:
-            if requires_vision or requires_tools:
+            if requires_vision or requires_tools or exclude_current_authority:
                 if not callable(matching_fallback):
                     # Legacy selector seams cannot prove vision support, but
                     # tool capability defaults to allowed-until-denied. The
                     # active-leg admission guard below still blocks a fallback
                     # that resolves to an explicit tools denial before I/O.
-                    if requires_vision:
+                    if requires_vision or exclude_current_authority:
                         return False
                     self._provider = self._selector.next_fallback_after_failure(
                         RuntimeError(reason)
@@ -3378,20 +3406,7 @@ class _SelectorFallbackProvider:
                 else:
                     self._provider = matching_fallback(
                         RuntimeError(reason),
-                        predicate=lambda candidate: bool(
-                            (
-                                not requires_vision
-                                or self._fallback_deployment_vision_support.get(
-                                    _fallback_deployment_identity(candidate),
-                                    "unknown",
-                                )
-                                == "supported"
-                            )
-                            and (
-                                not requires_tools
-                                or self._fallback_candidate_accepts_tools(candidate)
-                            )
-                        ),
+                        predicate=candidate_allowed,
                     )
             else:
                 self._provider = self._selector.next_fallback_after_failure(RuntimeError(reason))
@@ -3400,7 +3415,7 @@ class _SelectorFallbackProvider:
 
         self._note_fallback_hop()
         if requires_tools:
-            if not self._advance_past_explicit_tool_denials():
+            if not self._advance_past_explicit_tool_denials(candidate_predicate=candidate_allowed):
                 return False
         else:
             self._skip_benched_fallbacks()
@@ -3638,6 +3653,15 @@ class _SelectorFallbackProvider:
                 if emitted_user_visible_content:
                     yield event
                     continue
+
+                if (
+                    isinstance(event, ProviderErrorEvent)
+                    and event.code == "provider_retry_after_deadline"
+                ):
+                    self._record_health_failure(event)
+                    pre_text_buffer.drain(successful_leg=False)
+                    yield event
+                    return
 
                 if isinstance(event, ProviderReasoningDeltaEvent) and event.text:
                     if pre_text_buffer.has_incomplete_tool_call:
