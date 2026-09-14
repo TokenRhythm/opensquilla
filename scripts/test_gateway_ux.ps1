@@ -1,7 +1,7 @@
 param(
   [ValidateSet('Start', 'Stop')]
   [string]$Action = 'Start',
-  [int]$GatewayPort = 8765,
+  [int]$GatewayPort = 18791,
   [int]$WebPort = 5173
 )
 
@@ -28,11 +28,11 @@ if ($Action -eq 'Stop') {
 New-Item -ItemType Directory -Force -Path $state, $userState, $logs | Out-Null
 $env:OPENSQUILLA_STATE_DIR = $state
 $env:OPENSQUILLA_USER_STATE_DIR = $userState
-$env:OPENSQUILLA_LISTEN = "127.0.0.1:$GatewayPort"
+$env:OPENSQUILLA_LISTEN = "127.0.0.1"
 
 $uvCommand = (Get-Command uv -ErrorAction Stop).Source
 $npmCommand = (Get-Command npm.cmd -ErrorAction Stop).Source
-$gateway = Start-Process -FilePath $uvCommand -ArgumentList @('run', 'opensquilla', 'gateway', 'run', '--listen', "127.0.0.1:$GatewayPort") -WorkingDirectory $repo -RedirectStandardOutput (Join-Path $logs 'gateway.out.log') -RedirectStandardError (Join-Path $logs 'gateway.err.log') -PassThru
+$gateway = Start-Process -FilePath $uvCommand -ArgumentList @('run', 'opensquilla', 'gateway', 'run', '--listen', '127.0.0.1', '--port', "$GatewayPort") -WorkingDirectory $repo -RedirectStandardOutput (Join-Path $logs 'gateway.out.log') -RedirectStandardError (Join-Path $logs 'gateway.err.log') -PassThru
 $web = Start-Process -FilePath $npmCommand -ArgumentList @('run', 'dev', '--', '--host', '127.0.0.1', '--port', "$WebPort") -WorkingDirectory (Join-Path $repo 'opensquilla-webui') -RedirectStandardOutput (Join-Path $logs 'web.out.log') -RedirectStandardError (Join-Path $logs 'web.err.log') -PassThru
 @{ gateway = $gateway.Id; web = $web.Id; gatewayPort = $GatewayPort; webPort = $WebPort; root = $root } | ConvertTo-Json | Set-Content $pidFile
 
