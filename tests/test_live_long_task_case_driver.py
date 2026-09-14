@@ -9,6 +9,7 @@ from types import SimpleNamespace
 import pytest
 
 from scripts import live_long_task_case_driver as driver
+from scripts import live_long_task_release_gate as gate
 from scripts.long_task_fault_proxy import (
     DeterministicFaultProxy,
     FaultRequestRecord,
@@ -162,17 +163,23 @@ def test_long_reasoning_is_executed_through_real_browser_path(
     assert calls == ["write_config", "start", "browser", "cleanup"]
 
 
-def test_tool_compaction_reserves_provider_tool_followup_and_summary_legs(
+@pytest.mark.parametrize(
+    ("scenario", "physical_requests"),
+    [("tool_compaction", 2), ("fault_429_retry_after", 1)],
+)
+def test_case_reserves_required_provider_followup_and_summary_legs(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    scenario: str,
+    physical_requests: int,
 ) -> None:
     directory = _case_directory(tmp_path)
     path = _write_case(
         directory,
         _case_payload(
-            scenario="tool_compaction",
+            scenario=scenario,
             model="deepseek-v4-pro",
-            physical_requests=2,
+            physical_requests=physical_requests,
         ),
     )
     monkeypatch.setenv("DEEPSEEK_API_KEY", "synthetic-not-a-real-key")
@@ -969,6 +976,14 @@ def test_fault_429_case_proves_retry_after_was_not_violated(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("DEEPSEEK_API_KEY", "synthetic-not-a-real-key")
+    request_records: list[FaultRequestRecord] = []
+
+    class ObservedFaultProxy(DeterministicFaultProxy):
+        def close(self) -> None:
+            request_records.extend(self.records)
+            super().close()
+
+    monkeypatch.setattr(driver, "DeterministicFaultProxy", ObservedFaultProxy)
     case = driver.LiveCase(
         case_id="deepseek-fault-429-retry-after-synthetic-1",
         provider="deepseek",
@@ -986,11 +1001,32 @@ def test_fault_429_case_proves_retry_after_was_not_violated(
 
     result, exit_code = driver.execute_case(case)
 
-    assert exit_code == driver.EXIT_PASSED
+    assert exit_code == driver.EXIT_PASSED, json.dumps(result, sort_keys=True)
     assert result["status"] == "passed"
-    assert result["physical_requests"] == 1
-    assert result["counts"]["retry_legs"] == 0
-    assert result["counts"]["accounted_provider_legs"] == 1
+    assert result["physical_requests"] == 2
+    assert result["counts"]["retry_legs"] >= 1
+    assert result["counts"]["accounted_provider_legs"] == 2
+    assert [record.scenario for record in request_records] == [
+        FaultScenario.RATE_LIMITED.value,
+        FaultScenario.OK.value,
+    ]
+    # The synthetic server emits Retry-After: 8. Prove spacing at the real
+    # HTTP boundary, without replacing sleep or trusting activity labels.
+    assert (
+        request_records[1].received_monotonic_ns - request_records[0].received_monotonic_ns
+    ) >= 8_000_000_000
+    assert result["counts"]["retry_after_honored"] == 1
+    assert result["metrics"]["retry_wait_ms"] >= 8_000
+    gate.validate_scenario_evidence(
+        gate.CaseSpec(
+            case_id=case.case_id,
+            provider=case.provider,
+            model=case.model,
+            scenario=case.scenario,
+            repeat_index=case.repeat_index,
+        ),
+        gate.parse_driver_result(result, driver_exit_code=exit_code),
+    )
 
 
 @pytest.mark.ci_serial

@@ -1,0 +1,81 @@
+{
+  "format_version": 1,
+  "kind": "response",
+  "cases": [
+    {
+      "id": "response.unicode-continuation",
+      "coverage": "unicode-character-page-with-a-continuation-offset",
+      "expectation": "exact",
+      "wire": {
+        "type": "res",
+        "id": "execution-log-2",
+        "ok": true,
+        "payload": {
+          "storage_kind": "execution_log",
+          "handle": "tr-0123456789abcdef0123456789abcdef",
+          "offset": 9437184,
+          "content": "中🙂\n",
+          "returned_chars": 3,
+          "next_offset": 9437187,
+          "chars": 9437200,
+          "complete": true
+        }
+      }
+    },
+    {
+      "id": "response.incomplete-log-end",
+      "coverage": "retained-output-at-eof-does-not-claim-complete-capture",
+      "expectation": "exact",
+      "wire": {
+        "type": "res",
+        "id": "execution-log-3",
+        "ok": true,
+        "payload": {
+          "storage_kind": "execution_log",
+          "handle": "tr-0123456789abcdef0123456789abcdef",
+          "offset": 0,
+          "content": "partial\n",
+          "returned_chars": 8,
+          "next_offset": null,
+          "chars": 8,
+          "complete": false
+        }
+      }
+    },
+    {
+      "id": "response.log-not-ready",
+      "coverage": "running-log-remains-retryable-before-publication",
+      "expectation": "exact",
+      "wire": {
+        "type": "res",
+        "id": "execution-log-4",
+        "ok": false,
+        "error": {
+          "code": "NOT_READY",
+          "message": "Execution log is still being saved. Retry after the command finishes.",
+          "retryable": true
+        }
+      }
+    },
+    {
+      "id": "response.invalid-character-count",
+      "coverage": "reject-a-negative-returned-character-count",
+      "expectation": "reject",
+      "wire": {
+        "type": "res",
+        "id": "execution-log-invalid-count",
+        "ok": true,
+        "payload": {
+          "storage_kind": "execution_log",
+          "handle": "tr-0123456789abcdef0123456789abcdef",
+          "offset": 0,
+          "content": "",
+          "returned_chars": -1,
+          "next_offset": null,
+          "chars": 0,
+          "complete": true
+        }
+      }
+    }
+  ]
+}

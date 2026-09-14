@@ -3640,6 +3640,7 @@
         "rateLimited": "レート制限 · {seconds}秒後に再試行",
         "retryWait": "{seconds}秒後に再試行",
         "retrying": "再試行中 {attempt}/{limit}",
+        "retryingWithoutLimit": "再試行中 · {attempt}回目",
         "fallback": "予備モデルに切り替え中"
       },
       "purpose": {
@@ -3701,11 +3702,23 @@
       "cancelled": "キャンセル"
     },
     "toolModal": {
+      "retry": "再試行",
+      "logPending": "実行ログを保存しています。コマンドの終了後に再試行してください。",
+      "copyPage": "このページをコピー",
       "tree": "ツリー",
       "raw": "Raw",
       "wrapLines": "行を折り返す",
       "preserveLines": "行幅を維持",
-      "contentMeta": "{type} · {lines} 行 · {chars} 文字"
+      "contentMeta": "{type} · {lines} 行 · {chars} 文字",
+      "executionLog": "実行ログを表示",
+      "toolResult": "ツールの結果",
+      "characterOffset": "文字位置",
+      "go": "移動",
+      "previous": "前へ",
+      "next": "次へ",
+      "logRange": "{total} 文字中 {start}–{end}",
+      "logReadFailed": "実行ログを読み込めませんでした。再試行してください。",
+      "logIncomplete": "ログは不完全です。保存済みの出力のみ表示できます。"
     },
     "approval": {
       "required": "承認が必要です",
@@ -4362,7 +4375,7 @@
       "sectionDiagnostics": "診断",
       "sectionResult": "結果",
       "sectionError": "エラー",
-      "viewFull": "全文を表示",
+      "viewFull": "内容を展開",
       "activityViewDetails": "詳細を表示",
       "activityDetailsTitle": "詳細",
       "activityBytesWritten": "{size} を書き込み",

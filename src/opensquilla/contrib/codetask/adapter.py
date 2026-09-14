@@ -31,7 +31,6 @@ from opensquilla.contrib.codetask.agent_config import (
 )
 from opensquilla.contrib.codetask.config import (
     DEFAULT_AGENT_TIMEOUT,
-    DEFAULT_ITERATION_TIMEOUT,
     DEFAULT_MAX_ITERATIONS,
     DEFAULT_MAX_PROVIDER_RETRIES,
     agent_python,
@@ -172,8 +171,6 @@ class LocalAdapter:
             str(self.timeout),
             "--max-iterations",
             str(self.max_iterations),
-            "--iteration-timeout-seconds",
-            str(DEFAULT_ITERATION_TIMEOUT),
             "--max-provider-retries",
             str(DEFAULT_MAX_PROVIDER_RETRIES),
             "--transcript-path",

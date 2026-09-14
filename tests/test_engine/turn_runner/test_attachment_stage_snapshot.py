@@ -117,12 +117,6 @@ def _patch_budget_resolvers(runner: TurnRunner) -> None:
     def _max_iter(self, session_key, mi):  # noqa: ARG001, ARG002
         return mi if mi is not None else 10
 
-    def _iter_t(self, session_key, it):  # noqa: ARG001, ARG002
-        return it if it is not None else 30.0
-
-    def _tool_t(self, session_key, tt):  # noqa: ARG001, ARG002
-        return tt if tt is not None else 20.0
-
     def _req_t(self, session_key, rt):  # noqa: ARG001, ARG002
         return rt if rt is not None else 120.0
 
@@ -131,8 +125,6 @@ def _patch_budget_resolvers(runner: TurnRunner) -> None:
 
     runner._resolve_agent_runtime_timeout = _runtime.__get__(runner, TurnRunner)
     runner._resolve_agent_max_iterations = _max_iter.__get__(runner, TurnRunner)
-    runner._resolve_agent_iteration_timeout = _iter_t.__get__(runner, TurnRunner)
-    runner._resolve_agent_tool_timeout = _tool_t.__get__(runner, TurnRunner)
     runner._resolve_agent_request_timeout = _req_t.__get__(runner, TurnRunner)
     runner._resolve_agent_max_provider_retries = _retries.__get__(runner, TurnRunner)
 

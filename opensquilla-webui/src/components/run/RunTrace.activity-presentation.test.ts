@@ -646,7 +646,7 @@ describe('RunTrace activity presentation', () => {
     expect(details).not.toBeNull()
     expect(details?.classList.contains('activity-tool-details--bounded')).toBe(true)
     expect(window?.textContent).toContain('custom tool result')
-    expect(window?.textContent).toContain('view full')
+    expect(window?.textContent).toContain('expand content')
     expect(el.querySelector('.activity-tool-details__summary')).toBeNull()
     expect(el.querySelectorAll('.activity-tool-details__window')).toHaveLength(1)
     expect(el.querySelector('.tool-row-section')).toBeNull()

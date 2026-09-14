@@ -6,6 +6,7 @@ import string
 from types import SimpleNamespace
 from typing import Any
 
+import httpx
 import pytest
 
 import opensquilla.engine.agent as agent_mod
@@ -13,7 +14,7 @@ import opensquilla.engine.tokenjuice_adapter as tokenjuice_adapter_mod
 from opensquilla.engine import Agent, AgentConfig, ToolCall, ToolResult
 from opensquilla.engine.session_sanitize import session_payload_chars
 from opensquilla.engine.tool_result_store import ToolResultStore
-from opensquilla.engine.types import ToolResultEvent, ToolUseDeltaEvent
+from opensquilla.engine.types import ErrorEvent, ToolResultEvent, ToolUseDeltaEvent
 from opensquilla.gateway.approval_queue import get_approval_queue, reset_approval_queue
 from opensquilla.plugins.tokenjuice import reduce_tool_result as backend_reduce_tool_result
 from opensquilla.provider import (
@@ -28,6 +29,8 @@ from opensquilla.provider import DoneEvent as ProviderDoneEvent
 from opensquilla.provider import ToolUseDeltaEvent as ProviderToolUseDeltaEvent
 from opensquilla.provider import ToolUseEndEvent as ProviderToolUseEndEvent
 from opensquilla.provider import ToolUseStartEvent as ProviderToolUseStartEvent
+from opensquilla.provider.openai import OpenAIProvider
+from opensquilla.tools.builtin.code_exec import _execution_result_json
 from opensquilla.tools.types import ToolContext
 
 
@@ -1583,27 +1586,6 @@ async def test_custom_provider_gate_counts_tool_schema_in_full_envelope(
         tool_handler=handler,
         session_key="agent:main:session-1",
     )
-    surface_builds = 0
-
-    def hide_retrieval_after_first_call(
-        tools,
-        gate_details,
-        *,
-        recovery_read_paths,
-        recovery_reads_remaining,
-    ):
-        nonlocal surface_builds
-        del gate_details, recovery_read_paths, recovery_reads_remaining
-        surface_builds += 1
-        if surface_builds == 1 or not tools:
-            return tools
-        return [tool for tool in tools if tool.name != "retrieve_tool_result"]
-
-    monkeypatch.setattr(
-        agent,
-        "_workspace_edit_gate_tool_definitions",
-        hide_retrieval_after_first_call,
-    )
     original_estimate_chars = agent._estimate_live_request_chars
     estimate_observations: list[tuple[int, int, int]] = []
 
@@ -1620,7 +1602,18 @@ async def test_custom_provider_gate_counts_tool_schema_in_full_envelope(
 
     monkeypatch.setattr(agent, "_estimate_live_request_chars", capture_estimate_chars)
 
-    events = [event async for event in agent.run_turn("run diagnostics")]
+    events = []
+    async for event in agent.run_turn("run diagnostics"):
+        events.append(event)
+        if isinstance(event, ToolResultEvent):
+            # Withdraw retrieval from the actual next-call tool schema only
+            # after a recoverable projection exists. The large tool remains,
+            # so admission must count its schema along with the restored raw result.
+            assert agent.config.metadata["tool_projection_applied"] is True
+            assert any(tool.name == "retrieve_tool_result" for tool in agent.tool_definitions)
+            agent.tool_definitions[:] = [
+                tool for tool in agent.tool_definitions if tool.name != "retrieve_tool_result"
+            ]
 
     assert len(provider.calls) == 1
     assert estimate_observations
@@ -2232,6 +2225,106 @@ def test_typescript_runtime_directory_is_not_present() -> None:
     from pathlib import Path
 
     assert not (Path(__file__).resolve().parents[2] / "src/opensquilla/tokenjuice_runtime").exists()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("line_count", [6_000, 12_000])
+@pytest.mark.parametrize("recovery", ["available", "unavailable", "store_failure"])
+async def test_code_error_preview_stays_bounded_in_final_provider_request(
+    monkeypatch: pytest.MonkeyPatch, tmp_path, recovery: str, line_count: int,
+) -> None:
+    requests: list[dict[str, Any]] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        assert request.method == "POST"
+        assert request.url.path == "/v1/chat/completions"
+        requests.append(json.loads(request.content))
+        first = len(requests) == 1
+        delta = (
+            {"tool_calls": [{"index": 0, "id": "code-1", "type": "function", "function": {
+                "name": "execute_code", "arguments": '{"code":"synthetic"}',
+            }}]}
+            if first else {"content": "The synthetic command failed. Test finished."}
+        )
+        common = {
+            "id": "synthetic-response", "object": "chat.completion.chunk",
+            "model": "gpt-4o", "created": 1,
+        }
+        chunks = [
+            {**common, "choices": [{"index": 0, "delta": delta, "finish_reason": None}]},
+            {**common, "choices": [{
+                "index": 0, "delta": {}, "finish_reason": "tool_calls" if first else "stop",
+            }]},
+            {**common, "choices": [], "usage": {
+                "prompt_tokens": 100, "completion_tokens": 10, "total_tokens": 110,
+            }},
+        ]
+        body = "".join(f"data: {json.dumps(chunk)}\n\n" for chunk in chunks)
+        return httpx.Response(
+            200, headers={"content-type": "text/event-stream"},
+            content=body + "data: [DONE]\n\n",
+        )
+
+    real_client = httpx.AsyncClient
+    transport = httpx.MockTransport(respond)
+
+    def client(*args: Any, **kwargs: Any) -> httpx.AsyncClient:
+        kwargs.pop("proxy", None)
+        return real_client(*args, **{**kwargs, "transport": transport, "trust_env": False})
+
+    monkeypatch.setattr("opensquilla.provider.openai.httpx.AsyncClient", client)
+    output = "".join(
+        f"error {index:07d}: diagnostic detail alpha beta gamma delta\n"
+        for index in range(line_count)
+    )
+
+    async def handler(call: ToolCall) -> ToolResult:
+        assert call.tool_name == "execute_code"
+        return ToolResult(
+            tool_use_id=call.tool_use_id, tool_name=call.tool_name,
+            content=_execution_result_json(
+                returncode=1, stdout="", stderr=output, timed_out=False, elapsed_ms=1,
+            ),
+            is_error=True,
+        )
+
+    names = ["execute_code"]
+    if recovery != "unavailable":
+        names.append("retrieve_tool_result")
+    _declare_available_tools(handler, *names)
+    definitions = [ToolDefinition(
+        name="execute_code", description="Run synthetic code",
+        input_schema=ToolInputSchema(properties={"code": {"type": "string"}}, required=["code"]),
+    )]
+    if recovery != "unavailable":
+        definitions.append(_tool_def("retrieve_tool_result"))
+    agent = Agent(
+        provider=OpenAIProvider(
+            api_key="public-dummy-key", model="gpt-4o", base_url="https://probe.invalid/v1",
+        ),
+        # Keep the default context window and final request admission checks.
+        config=_recoverable_config(tmp_path),
+        tool_definitions=definitions, tool_handler=handler,
+        session_key="agent:main:session-1",
+    )
+    if recovery == "store_failure":
+        monkeypatch.setattr(agent, "_store_tool_result_snapshot", lambda *args, **kwargs: None)
+
+    events = [event async for event in agent.run_turn(
+        "Run execute_code once, report its result, then finish.",
+    )]
+
+    assert not [event for event in events if isinstance(event, ErrorEvent)]
+    assert len(requests) == 2
+    tool_messages = [message for message in requests[1]["messages"] if message["role"] == "tool"]
+    assert len(tool_messages) == 1
+    content = tool_messages[0]["content"]
+    # A 50k diagnostic preview plus its JSON/projection metadata must stay small
+    # even when projection cannot rely on retrieval. Inspect the actual HTTP body.
+    assert len(content) <= 55_000
+    assert "error 0000000" in content
+    assert f"error {line_count - 1:07d}" in content
+    assert "omitted" in content
 
 
 @pytest.mark.asyncio

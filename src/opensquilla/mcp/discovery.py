@@ -159,6 +159,7 @@ def _make_tool_handler(
         description=tool_def.description,
         parameters=properties,
         required=required,
+        execution_timeout_seconds=timeout_seconds + 5.0,
     )
 
     async def handler(**kwargs: Any) -> str:

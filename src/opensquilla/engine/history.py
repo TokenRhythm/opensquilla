@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import binascii
 import json
+import re
 from collections.abc import Callable, Collection, Mapping, Sequence
 from copy import deepcopy
 from dataclasses import dataclass, field
@@ -845,6 +846,15 @@ def reconstruct_messages_from_entry(
                 result_content: str | list[Any] = raw_result
             else:
                 result_content = str(raw_result)
+            log_handle = seg.get("execution_log_handle")
+            if (
+                isinstance(result_content, str)
+                and isinstance(log_handle, str)
+                and re.fullmatch(r"tr-[0-9a-f]{32}", log_handle)
+                and log_handle not in result_content
+            ):
+                # Transcript previews can omit the original tool's log address.
+                result_content += f"\nexecution_log_handle: {log_handle}"
             pending_results.append(
                 ContentBlockToolResult(
                     tool_use_id=tool_use_id,

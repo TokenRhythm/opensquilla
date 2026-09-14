@@ -1,7 +1,7 @@
 """Gateway registration Adapter for generated Session read Contracts.
 
 The generated descriptors own method identity, scope, guest policy and the
-wire models.  This Adapter adds only compatibility observation and fail-closed
+wire models.  This Adapter owns wire decoding, compatibility observation and
 result validation around the existing Gateway Implementations.  Application
 Modules never import generated models.
 """
@@ -20,6 +20,9 @@ from opensquilla.contracts.generated.v4.chat_history import (
 )
 from opensquilla.contracts.generated.v4.gateway_contract_registry import (
     GATEWAY_METHOD_CONTRACTS,
+)
+from opensquilla.contracts.generated.v4.sessions_execution_log_read import (
+    SessionsExecutionLogReadParams,
 )
 from opensquilla.contracts.generated.v4.sessions_messages_hydrate import (
     SessionsMessagesHydrateLegacyNonObjectParams,
@@ -59,6 +62,20 @@ Implementation = Callable[[Any, Any], Awaitable[Any]]
 
 class SessionReadContractError(ValueError):
     """Raised when a Session read result violates its generated Contract."""
+
+
+def decode_execution_log_read_params(params: object) -> tuple[str, str, int, int]:
+    """Validate the wire request and return session, handle, offset and limit."""
+    try:
+        request = SessionsExecutionLogReadParams.model_validate(params, strict=True)
+    except ValidationError as exc:
+        raise ValueError("Invalid execution log page parameters") from exc
+    if not request.sessionKey.strip():
+        raise ValueError("params.sessionKey is required")
+    # Omitted fields use defaults; explicit null is not a valid page boundary.
+    if request.offset is None or request.limit is None:
+        raise ValueError("params.offset and params.limit must be integers")
+    return request.sessionKey, request.handle, int(request.offset), int(request.limit)
 
 
 def _params_observer(
@@ -275,6 +292,7 @@ def register_sessions_preview_contract[ContextT, ResultT](
 
 __all__ = [
     "SessionReadContractError",
+    "decode_execution_log_read_params",
     "register_chat_history_contract",
     "register_sessions_messages_hydrate_contract",
     "register_sessions_messages_snapshot_contract",

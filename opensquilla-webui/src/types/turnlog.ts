@@ -39,6 +39,7 @@ type FrameBody =
       toolId: string
       name: string
       result: string
+      executionLogHandle?: string
       isError: boolean
       input: string
       at: number

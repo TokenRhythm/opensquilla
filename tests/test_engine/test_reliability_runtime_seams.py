@@ -382,11 +382,12 @@ class _OneToolProvider:
 def _one_tool_agent(handler: Any) -> Agent:
     return Agent(
         provider=_OneToolProvider(),
-        config=AgentConfig(max_iterations=1, tool_timeout=0.03),
+        config=AgentConfig(max_iterations=1),
         tool_definitions=[
             ToolDefinition(
                 name="private_custom_tool",
                 description="private tool description",
+                execution_timeout_seconds=0.03,
                 input_schema=ToolInputSchema(
                     properties={"private_argument": {"type": "string"}},
                     required=["private_argument"],
@@ -600,10 +601,12 @@ def _definition(
     properties: dict[str, Any] | None = None,
     *,
     required: list[str] | None = None,
+    execution_timeout_seconds: float | None = None,
 ) -> ToolDefinition:
     return ToolDefinition(
         name=name,
         description="test definition",
+        execution_timeout_seconds=execution_timeout_seconds,
         input_schema=ToolInputSchema(
             properties=properties or {},
             required=list(properties or {}) if required is None else required,
@@ -696,7 +699,10 @@ async def test_dispatch_boundary_trailing_call_is_not_reported() -> None:
 
 
 @pytest.mark.asyncio
-async def test_iteration_batch_deadline_reports_timeouts_not_cancellations() -> None:
+@pytest.mark.parametrize("concurrency", [1, 2])
+async def test_tool_batch_timeouts_settle_facts_and_allow_provider_to_continue(
+    concurrency: int,
+) -> None:
     provider = _ToolBatchProvider(
         [("slow-read", "read_file", {}), ("slow-search", "web_search", {})]
     )
@@ -709,21 +715,29 @@ async def test_iteration_batch_deadline_reports_timeouts_not_cancellations() -> 
     agent = Agent(
         provider=provider,
         config=AgentConfig(
-            max_iterations=1,
-            iteration_timeout=0.03,
-            tool_timeout=1,
-            max_safe_tool_concurrency=1,
+            max_iterations=2,
+            iteration_timeout=0.001,
+            max_safe_tool_concurrency=concurrency,
         ),
-        tool_definitions=[_definition("read_file"), _definition("web_search")],
+        tool_definitions=[
+            _definition("read_file", execution_timeout_seconds=0.03),
+            _definition("web_search", execution_timeout_seconds=0.03),
+        ],
         tool_handler=handler,
     )
     agent.set_tool_reliability_sink(facts.append)
 
-    await asyncio.wait_for(_collect_agent(agent), timeout=1)
+    events = await asyncio.wait_for(_collect_agent(agent), timeout=1)
 
     assert len(facts) == 2
     assert all(fact.outcome is ToolOutcome.TIMEOUT for fact in facts)
     assert all(fact.error_code is ToolErrorCode.TOOL_TIMEOUT for fact in facts)
+    results = [event for event in events if isinstance(event, ToolResultEvent)]
+    assert {event.tool_use_id for event in results} == {"slow-read", "slow-search"}
+    assert all(event.is_error and "timed out" in event.result for event in results)
+    assert not any(isinstance(event, ErrorEvent) for event in events)
+    assert provider.call_count == 2
+    assert any(isinstance(event, DoneEvent) and event.text == "done" for event in events)
 
 
 @pytest.mark.asyncio

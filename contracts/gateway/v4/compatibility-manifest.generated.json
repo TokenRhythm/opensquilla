@@ -1113,6 +1113,12 @@
     },
     {
       "lifecycle": "stable",
+      "name": "sessions.executionLog.read",
+      "schema": "sessions/sessions-execution-log-read.schema.json",
+      "schemaSha256": "306642eb0e8d1801242211af64af0590de4a23edd5da9c0664835402020ee77a"
+    },
+    {
+      "lifecycle": "stable",
       "name": "sessions.fork",
       "schema": "sessions/sessions-fork.schema.json",
       "schemaSha256": "10da0ca1f37930fa2a12ecaa8b0b58210d021d499d71bda5fa2d9a7da5e5d72b"
@@ -1433,10 +1439,10 @@
   "protocol": "opensquilla-websocket-json",
   "source": {
     "eventFamilyCount": 10,
-    "generatorSha256": "db063b7bff2dcb9d089926dc9f1d3c99c61c2e4dd42ba12f442701b03fff2df1",
-    "methodCount": 210,
-    "schemaCount": 220,
-    "schemaTreeSha256": "c7e251102d84f6b863f326e4ad4fa523d4d8d42fe5f16014591bad1852d536e1"
+    "generatorSha256": "a83e88741e52d1119093a49f59cae11f77875c4e2c0e9c552d4bf3860a5c58f6",
+    "methodCount": 211,
+    "schemaCount": 221,
+    "schemaTreeSha256": "e73d2c46e2f74d22a034603944b34a271d0583d1b48ed4213f2ae64eb484d93a"
   },
   "wireVersion": 4
 }

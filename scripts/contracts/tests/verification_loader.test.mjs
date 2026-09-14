@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import { readFileSync } from 'node:fs'
 import test from 'node:test'
 import { loadContractValidators } from '../gateway_contract_verification.mjs'
 
@@ -21,6 +22,24 @@ test('sessions.list verification still exposes all four real validators', async 
   assert.equal(validators.validateSessionsListParams({}), true)
   assert.equal(validators.validateSessionsListResult({ sessions: [], count: 0, ts: 1 }), true)
   assert.equal(validators.validateSessionsListResult({ sessions: [] }), false)
+})
+
+test('execution log fixtures validate frames and their params or results', async () => {
+  const validators = await loadContractValidators('sessions.executionLog.read')
+  for (const [file, frame, body, field] of [
+    ['requests', 'validateSessionsExecutionLogReadRequestFrame', 'validateSessionsExecutionLogReadParams', 'params'],
+    ['responses', 'validateSessionsExecutionLogReadResponseFrame', 'validateSessionsExecutionLogReadResult', 'payload'],
+  ]) {
+    const path = new URL(`../../../contracts/gateway/v4/sessions/fixtures/sessions-execution-log-read/${file}.json`, import.meta.url)
+    const { cases } = JSON.parse(readFileSync(path, 'utf8'))
+    for (const { id, wire, expectation } of cases) {
+      const accepted = expectation === 'exact'
+      assert.equal(validators[frame](structuredClone(wire)), accepted, id)
+      if (Object.hasOwn(wire, field)) {
+        assert.equal(validators[body](structuredClone(wire[field])), accepted, `${id}: ${field}`)
+      }
+    }
+  }
 })
 
 test('flow update verification preserves bounded identity and recovery control', async () => {

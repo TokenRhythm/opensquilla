@@ -21,6 +21,12 @@ current_meta_skill_owner: contextvars.ContextVar[str] = contextvars.ContextVar(
     default="",
 )
 
+# A fresh dictionary per dispatch keeps output references out of tool text and
+# isolates parallel calls. Reader workers can update the shared per-call value.
+current_execution_log: contextvars.ContextVar[dict[str, str] | None] = contextvars.ContextVar(
+    "current_execution_log", default=None,
+)
+
 
 class CallerKind(StrEnum):
     """Entry-point caller type — used in ToolContext for filtering decisions."""
@@ -72,6 +78,7 @@ class ToolContext:
     run_mode: str | None = None
     sandbox_mounts: list[dict[str, Any]] = field(default_factory=list)
     sandbox_run_context: Any | None = None
+    # Inert compatibility slots; no source-diff interventions or candidate capture.
     source_diff_preservation_mode: str = "log"
     source_diff_candidate_mode: str = "log"
     source_diff_candidates: list[dict[str, Any]] = field(default_factory=list)
@@ -243,6 +250,10 @@ class ToolContext:
         default=None, repr=False,
     )
     workspace_preview_scopes: list[dict[str, str]] = field(default_factory=list, repr=False)
+    # Output spools share the runtime's configured result-store budgets.
+    tool_result_store_max_bytes: int | None = 8 * 1024 * 1024
+    tool_result_store_disk_budget_bytes: int | None = 256 * 1024 * 1024
+    tool_result_store_retention_seconds: int | None = 7 * 24 * 60 * 60
 
     def __post_init__(self) -> None:
         self.validate_path_roots()

@@ -6,7 +6,6 @@ from opensquilla.plugins.tokenjuice.matcher import (
     command_argv,
     rule_matches,
     select_rule,
-    strip_leading_cd_prefix,
 )
 from opensquilla.plugins.tokenjuice.plugin import reduce_tool_result
 from opensquilla.plugins.tokenjuice.reducer import _summarize_window, reduce_with_rule
@@ -14,16 +13,15 @@ from opensquilla.plugins.tokenjuice.rules import load_rules
 from opensquilla.plugins.tokenjuice.types import Rule
 
 STRICT_ENV = "OPENSQUILLA_TOOLCOMP_MATCHER_STRICT"
-CD_UNWRAP_ENV = "OPENSQUILLA_TOOLCOMP_CD_UNWRAP"
 FAILURE_PRESERVE_ENV = "OPENSQUILLA_TOOLCOMP_FAILURE_PRESERVE"
-ALL_LEVER_ENVS = (STRICT_ENV, CD_UNWRAP_ENV, FAILURE_PRESERVE_ENV)
+ALL_LEVER_ENVS = (STRICT_ENV, FAILURE_PRESERVE_ENV)
 
 TRUTHY_VALUES = ["1", "true", "TRUE", "yes", "on", "enabled", " 1 "]
 FALSY_VALUES = ["", " ", "0", "false", "FALSE", "off", "no", "disabled"]
 UNKNOWN_VALUES = ["2", "banana", "strict-ish"]
 
 # Rule selections with the new strict default.  Composite commands and the
-# still-opt-in cd path deliberately use the generic fallback.
+# directory-changing shell chains deliberately use the generic fallback.
 DEFAULT_SELECTIONS = {
     "git status": "git/status",
     "git ls-files": "filesystem/git-ls-files",
@@ -327,121 +325,8 @@ def test_quoted_or_escaped_shell_operators_remain_single_commands(command: str) 
         r"Set-Location -LiteralPath C:\repo; git status",
     ],
 )
-def test_windows_shell_forms_are_not_reinterpreted_by_cd_unwrap(
-    monkeypatch: pytest.MonkeyPatch,
-    command: str,
-) -> None:
-    monkeypatch.setenv(CD_UNWRAP_ENV, "1")
+def test_windows_shell_forms_use_generic_fallback(command: str) -> None:
     assert _select(command) == "generic/fallback"
-
-
-def test_cd_unwrap_classifies_like_bare_forms(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv(CD_UNWRAP_ENV, "1")
-    pairs = [
-        ("cd /tmp/x && git status", "git status"),
-        ("cd /a && cd b && cargo build", "cargo build"),
-        ("cd /a && cd b && git ls-files", "git ls-files"),
-        ('cd "/tmp/some dir" && git status', "git status"),
-        ("cd '/tmp/x' && npm ls", "npm ls"),
-        ("pushd /tmp/x && git ls-files", "git ls-files"),
-    ]
-    for wrapped, bare in pairs:
-        assert _select(wrapped) == _select(bare) == DEFAULT_SELECTIONS[bare], wrapped
-
-
-def test_cd_unwrap_leaves_unsafe_prefixes_untouched(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv(CD_UNWRAP_ENV, "1")
-    for command in [
-        "cd /tmp/x > /dev/null && git status",
-        "cd /tmp/x | tee log && git status",
-        "cd /a; git status",
-        "cd && git status",
-        'cd "$(printf /tmp)" && git status',
-        "cd `printf /tmp` && git status",
-        'pushd "$(printf /tmp)" && pytest -q',
-    ]:
-        assert _select(command) == "generic/fallback", command
-
-
-@pytest.mark.parametrize(
-    "command",
-    [
-        "cd /tmp/x && git status | tee status.log",
-        "cd /tmp/x && git status > status.txt",
-        "cd /tmp/x && git status; pytest -q",
-        "cd /tmp/x && git status\npytest -q",
-        "cd /tmp/x && git status && pytest -q",
-        "cd /tmp/x && git status || pytest -q",
-        "cd /tmp/x && git status '",
-    ],
-)
-def test_cd_unwrap_rejects_composite_or_unparseable_tails(
-    monkeypatch: pytest.MonkeyPatch,
-    command: str,
-) -> None:
-    monkeypatch.setenv(CD_UNWRAP_ENV, "1")
-    assert _select(command) == "generic/fallback"
-
-
-def test_cd_unwrap_requires_horizontal_keyword_separator(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setenv(CD_UNWRAP_ENV, "1")
-    for command in [
-        "cd\n/tmp/build.sh && git status",
-        "cd\xa0/a && git status",
-        "cd /tmp\nmake && make install",
-    ]:
-        assert _select(command) == "generic/fallback", command
-
-
-@pytest.mark.parametrize("strict_value", FALSY_VALUES)
-def test_cd_unwrap_fails_safe_when_strict_is_explicitly_off(
-    monkeypatch: pytest.MonkeyPatch,
-    strict_value: str,
-) -> None:
-    monkeypatch.setenv(STRICT_ENV, strict_value)
-    monkeypatch.setenv(CD_UNWRAP_ENV, "1")
-    assert _select("cd /tmp/x && git status") == "generic/fallback"
-    assert _select("git status") == "filesystem/git-ls-files"
-
-
-def test_strict_and_cd_unwrap_compose(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv(STRICT_ENV, "1")
-    monkeypatch.setenv(CD_UNWRAP_ENV, "1")
-    assert _select("cd /tmp/x && git status") == "git/status"
-    assert _select('cd "/tmp/some dir" && npm test') == "tests/npm-test"
-    assert _select("pushd /tmp/x && git ls-files") == "filesystem/git-ls-files"
-    assert _select("cd /tmp/x && git worktree list") == "git/worktree-list"
-
-
-def test_strip_leading_cd_prefix_rules() -> None:
-    assert strip_leading_cd_prefix("cd /tmp/x && git status") == "git status"
-    assert strip_leading_cd_prefix("pushd /tmp/x && git status") == "git status"
-    assert strip_leading_cd_prefix("cd /a && cd b && cargo build") == "cargo build"
-    assert strip_leading_cd_prefix('cd "/tmp/some dir" && git status') == "git status"
-    assert strip_leading_cd_prefix("cd '/tmp/x' && npm ls") == "npm ls"
-    assert strip_leading_cd_prefix("cd /tmp/my\\ dir && ls") == "ls"
-    assert strip_leading_cd_prefix("cd /tmp/x >out && ls") == "cd /tmp/x >out && ls"
-    assert strip_leading_cd_prefix("cd /a; ls") == "cd /a; ls"
-    assert strip_leading_cd_prefix("cd '/unterminated && ls") == "cd '/unterminated && ls"
-    assert strip_leading_cd_prefix("echo cd /a && ls") == "echo cd /a && ls"
-    assert strip_leading_cd_prefix("cd && ls") == "cd && ls"
-    assert strip_leading_cd_prefix("cd /a &&") == "cd /a &&"
-    assert strip_leading_cd_prefix("cd\n/tmp/build.sh && ls") == "cd\n/tmp/build.sh && ls"
-    assert strip_leading_cd_prefix("cd\xa0/a && ls") == "cd\xa0/a && ls"
-    assert strip_leading_cd_prefix("cd /a\n&& ls") == "cd /a\n&& ls"
-    assert (
-        strip_leading_cd_prefix('cd "$(printf /tmp)" && git status')
-        == 'cd "$(printf /tmp)" && git status'
-    )
-    assert (
-        strip_leading_cd_prefix("cd `printf /tmp` && git status")
-        == "cd `printf /tmp` && git status"
-    )
-    assert strip_leading_cd_prefix("cd /a \n && ls") == "cd /a \n && ls"
-    chained = "cd /a && " * 9 + "ls"
-    assert strip_leading_cd_prefix(chained) == "cd /a && ls"
 
 
 def test_default_strict_rule_reduces_end_to_end() -> None:
@@ -525,8 +410,6 @@ def test_failure_preserve_does_not_change_selection(monkeypatch: pytest.MonkeyPa
 def test_truthy_env_values_enable_levers(monkeypatch: pytest.MonkeyPatch, value: str) -> None:
     monkeypatch.setenv(STRICT_ENV, value)
     assert _select("git status") == "git/status"
-    monkeypatch.setenv(CD_UNWRAP_ENV, value)
-    assert _select("cd '/tmp/x' && npm ls") == "package/npm-ls"
     monkeypatch.setenv(FAILURE_PRESERVE_ENV, value)
     assert _summarize_window(_rule("generic/fallback"), exit_code=1) == (
         BASELINE_FALLBACK_SUCCESS_WINDOW
@@ -539,7 +422,6 @@ def test_explicit_falsy_env_values_keep_levers_off(
     value: str,
 ) -> None:
     monkeypatch.setenv(STRICT_ENV, value)
-    monkeypatch.setenv(CD_UNWRAP_ENV, value)
     monkeypatch.setenv(FAILURE_PRESERVE_ENV, value)
     assert _select("git status") == "filesystem/git-ls-files"
     assert _select("cd /tmp/x && git status") == "generic/fallback"
@@ -559,11 +441,10 @@ def test_unknown_strict_value_fails_safe_to_enabled(
 
 
 @pytest.mark.parametrize("value", UNKNOWN_VALUES)
-def test_unknown_opt_in_values_keep_cd_and_failure_preserve_off(
+def test_unknown_opt_in_values_keep_failure_preserve_off(
     monkeypatch: pytest.MonkeyPatch,
     value: str,
 ) -> None:
-    monkeypatch.setenv(CD_UNWRAP_ENV, value)
     monkeypatch.setenv(FAILURE_PRESERVE_ENV, value)
     assert _select("cd /tmp/x && git status") == "generic/fallback"
     assert _summarize_window(_rule("generic/fallback"), exit_code=1) == (
