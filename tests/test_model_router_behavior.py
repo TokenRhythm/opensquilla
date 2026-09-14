@@ -601,8 +601,10 @@ async def test_attachment_below_large_floor_uses_effective_request_capacity(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("legacy_setting", ["on", "trim:800", "sometimes"])
 async def test_complete_estimate_replaces_legacy_fixed_headroom_at_boundary(
     monkeypatch: pytest.MonkeyPatch,
+    legacy_setting: str,
 ) -> None:
     fake_strategy(monkeypatch, "c2", 0.91, {"route_class": "R2"})
     catalog = ModelCatalog()
@@ -615,26 +617,34 @@ async def test_complete_estimate_replaces_legacy_fixed_headroom_at_boundary(
         }
     )
     monkeypatch.setattr("opensquilla.provider.model_catalog._shared_catalog", catalog)
-    ctx = make_context(
-        "Use the attachment.",
-        attachments=[{"type": "text/plain"}],
-    )
-    ctx.config.squilla_router.auto_thinking = False
-    ctx.config.squilla_router.tiers = {
-        "c2": {
-            "provider": "openrouter",
-            "model": "boundary-safe",
-            "thinking_level": "off",
+    async def route() -> TurnContext:
+        ctx = make_context(
+            "Use the attachment.",
+            attachments=[{"type": "text/plain"}],
+        )
+        ctx.config.squilla_router.auto_thinking = False
+        ctx.config.squilla_router.tiers = {
+            "c2": {
+                "provider": "openrouter",
+                "model": "boundary-safe",
+                "thinking_level": "off",
+            }
         }
-    }
-    ctx.metadata["attachment_material_estimated_tokens"] = 40_000
+        ctx.metadata["attachment_material_estimated_tokens"] = 40_000
+        return await finalize_squilla_router_capacity(await apply_squilla_router(ctx))
 
-    routed = await finalize_squilla_router_capacity(
-        await apply_squilla_router(ctx)
-    )
+    monkeypatch.delenv("OPENSQUILLA_TURN_OBJECTIVE_REMINDER", raising=False)
+    baseline = await route()
+    monkeypatch.setenv("OPENSQUILLA_TURN_OBJECTIVE_REMINDER", legacy_setting)
+    routed = await route()
 
     assert routed.metadata["routed_tier"] == "c2"
     assert routed.metadata["large_context_request_input_tokens"] < 47_600
+    assert routed.metadata["large_context_request_input_tokens"] == (
+        baseline.metadata["large_context_request_input_tokens"]
+    )
+    assert routed.metadata["large_context_runtime_context_tokens"] > 0
+    assert "large_context_request_reminder_tokens" not in routed.metadata
 
 
 @pytest.mark.asyncio

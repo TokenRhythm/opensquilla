@@ -61,6 +61,7 @@ const latest = vi.fn<SessionInspection['history']['latest']>()
 const before = vi.fn<SessionInspection['history']['before']>()
 const inspection: SessionInspection = {
   preview,
+  readExecutionLog: vi.fn(),
   history: { latest, before },
 }
 

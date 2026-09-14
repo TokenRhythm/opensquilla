@@ -6,11 +6,7 @@ import pytest
 
 from opensquilla.engine.runtime import (
     TurnRunner,
-    _resolve_finalize_evidence_gate,
     _resolve_identity_prompt_mode,
-)
-from opensquilla.engine.turn_runner.agent_bootstrap_stage import (
-    _finalize_evidence_gate_from_env,
 )
 from opensquilla.gateway.config import GatewayConfig
 
@@ -52,99 +48,6 @@ def test_identity_prompt_mode_env_accepts_headless_repo_coding_scaffold(monkeypa
     cfg = GatewayConfig(prompt={"mode": "auto"})
 
     assert _resolve_identity_prompt_mode(cfg) == "headless_repo_coding_scaffold"
-
-
-def test_finalize_evidence_gate_defaults_off(monkeypatch) -> None:
-    monkeypatch.delenv("OPENSQUILLA_FINALIZE_EVIDENCE_GATE", raising=False)
-
-    assert _resolve_finalize_evidence_gate(GatewayConfig()) is False
-
-
-def test_finalize_evidence_gate_config_opt_in(monkeypatch) -> None:
-    monkeypatch.delenv("OPENSQUILLA_FINALIZE_EVIDENCE_GATE", raising=False)
-    cfg = GatewayConfig(prompt={"finalize_evidence_gate": True})
-
-    assert _resolve_finalize_evidence_gate(cfg) is True
-
-
-def test_finalize_evidence_gate_env_on_overrides_config_off(monkeypatch) -> None:
-    monkeypatch.setenv("OPENSQUILLA_FINALIZE_EVIDENCE_GATE", "on")
-
-    assert _resolve_finalize_evidence_gate(GatewayConfig()) is True
-
-
-def test_finalize_evidence_gate_env_off_overrides_config_on(monkeypatch) -> None:
-    monkeypatch.setenv("OPENSQUILLA_FINALIZE_EVIDENCE_GATE", "off")
-    cfg = GatewayConfig(prompt={"finalize_evidence_gate": True})
-
-    assert _resolve_finalize_evidence_gate(cfg) is False
-
-
-def test_finalize_evidence_gate_env_blank_falls_through_to_config(monkeypatch) -> None:
-    monkeypatch.setenv("OPENSQUILLA_FINALIZE_EVIDENCE_GATE", "  ")
-    cfg = GatewayConfig(prompt={"finalize_evidence_gate": True})
-
-    assert _resolve_finalize_evidence_gate(cfg) is True
-
-
-def test_finalize_evidence_gate_env_rejects_unrecognized_value(monkeypatch) -> None:
-    monkeypatch.setenv("OPENSQUILLA_FINALIZE_EVIDENCE_GATE", "enabled")
-
-    with pytest.raises(ValueError, match="OPENSQUILLA_FINALIZE_EVIDENCE_GATE"):
-        _resolve_finalize_evidence_gate(GatewayConfig())
-
-
-def test_bootstrap_finalize_evidence_gate_env_defaults_off(monkeypatch) -> None:
-    monkeypatch.delenv("OPENSQUILLA_FINALIZE_EVIDENCE_GATE", raising=False)
-
-    assert _finalize_evidence_gate_from_env() is False
-
-
-@pytest.mark.parametrize("value", ["on", "1", "true", "YES"])
-def test_bootstrap_finalize_evidence_gate_env_on(monkeypatch, value: str) -> None:
-    monkeypatch.setenv("OPENSQUILLA_FINALIZE_EVIDENCE_GATE", value)
-
-    assert _finalize_evidence_gate_from_env() is True
-
-
-@pytest.mark.parametrize("value", ["off", "0", "false", "NO", "  "])
-def test_bootstrap_finalize_evidence_gate_env_off_or_blank(monkeypatch, value: str) -> None:
-    monkeypatch.setenv("OPENSQUILLA_FINALIZE_EVIDENCE_GATE", value)
-
-    assert _finalize_evidence_gate_from_env() is False
-
-
-def test_bootstrap_finalize_evidence_gate_env_rejects_unrecognized_value(monkeypatch) -> None:
-    monkeypatch.setenv("OPENSQUILLA_FINALIZE_EVIDENCE_GATE", "enabled")
-
-    with pytest.raises(ValueError, match="OPENSQUILLA_FINALIZE_EVIDENCE_GATE"):
-        _finalize_evidence_gate_from_env()
-
-
-def test_bootstrap_finalize_evidence_gate_uses_config_value_when_env_absent(
-    monkeypatch,
-) -> None:
-    # The gateway ``prompt.finalize_evidence_gate`` value must reach the
-    # loop-side gate through the same resolver the env override uses,
-    # matching the runtime prompt-section resolution above.
-    monkeypatch.delenv("OPENSQUILLA_FINALIZE_EVIDENCE_GATE", raising=False)
-
-    assert _finalize_evidence_gate_from_env(True) is True
-    assert _finalize_evidence_gate_from_env(False) is False
-
-
-def test_bootstrap_finalize_evidence_gate_env_blank_falls_through_to_config(
-    monkeypatch,
-) -> None:
-    monkeypatch.setenv("OPENSQUILLA_FINALIZE_EVIDENCE_GATE", "  ")
-
-    assert _finalize_evidence_gate_from_env(True) is True
-
-
-def test_bootstrap_finalize_evidence_gate_env_off_overrides_config_on(monkeypatch) -> None:
-    monkeypatch.setenv("OPENSQUILLA_FINALIZE_EVIDENCE_GATE", "off")
-
-    assert _finalize_evidence_gate_from_env(True) is False
 
 
 @pytest.mark.parametrize("env_value", [None, "0", "1", "on", "garbage"])

@@ -1154,6 +1154,23 @@ describe('projectAssistantActivityTimeline', () => {
     expect(JSON.stringify(projection.statusSteps)).not.toContain('raw reasoning body')
   })
 
+  it.each(['working', 'settled'] as const)('localizes retries without a fixed limit when %s', (lifecycle) => {
+    const projection = projectAssistantActivityTimeline([], {
+      lifecycle,
+      statusHistory: [
+        { action: 'provider:retrying:7:0', label: 'Retrying 7/0', at: 1_000 },
+      ],
+    })
+
+    expect(projection.statusSteps[0]?.label).toEqual({
+      code: 'chat.activity.provider.retryingWithoutLimit', params: { attempt: 7 },
+    })
+    for (const locale of [en, zhHans, ja, de, fr, es]) {
+      expect(locale.chat.activity.provider.retryingWithoutLimit).toContain('{attempt}')
+      expect(locale.chat.activity.provider.retryingWithoutLimit).not.toContain('{limit}')
+    }
+  })
+
   it('derives each phase duration from the next transition and terminal boundary', () => {
     const projection = projectAssistantActivityTimeline([], {
       lifecycle: 'settled',

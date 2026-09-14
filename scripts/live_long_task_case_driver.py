@@ -1694,6 +1694,20 @@ def _run_rpc_case(
     )
     counts["output_bytes"] = assistant_bytes
     counts["compactions"] = observation.compactions
+    if case.scenario == "fault_429_retry_after":
+        proxy_records = proxy.records if proxy is not None else ()
+        retry_wait_ms = 0.0
+        if (
+            len(proxy_records) >= 2
+            and proxy_records[0].scenario == FaultScenario.RATE_LIMITED.value
+        ):
+            retry_wait_ms = (
+                proxy_records[1].received_monotonic_ns - proxy_records[0].received_monotonic_ns
+            ) / 1_000_000
+        # This synthetic fault sends Retry-After: 8. Arrival timestamps prove
+        # the HTTP retry respected it, independently of UI activity labels.
+        metrics["retry_wait_ms"] = max(0.0, retry_wait_ms)
+        counts["retry_after_honored"] = int(retry_wait_ms >= 8_000)
     if case.scenario == "router":
         counts["router_decisions"] = asyncio.run(_router_decision_count(gateway, session_key))
     if case.scenario == "fallback":
@@ -1725,22 +1739,14 @@ def _run_rpc_case(
     )
 
     partial_terminal_is_expected = case.scenario == "fault_partial_then_reset"
-    rate_limit_terminal_is_expected = (
-        case.scenario == "fault_429_retry_after"
-        and observation.terminal_event == "session.event.error"
-        and physical_requests == 1
-        and _failure_class_from_records(records) == "rate-limit"
-    )
     passed = observation.completed or (
         partial_terminal_is_expected
         and bool(observation.terminal_event)
         and observation.text_chunks > 0
-    ) or rate_limit_terminal_is_expected
-    if (
-        not partial_terminal_is_expected
-        and not rate_limit_terminal_is_expected
-        and assistant_markers < 1
-    ):
+    )
+    if not partial_terminal_is_expected and assistant_markers < 1:
+        passed = False
+    if case.scenario == "fault_429_retry_after" and not counts["retry_after_honored"]:
         passed = False
     if case.scenario == "tool_compaction" and observation.compactions < 1:
         passed = False

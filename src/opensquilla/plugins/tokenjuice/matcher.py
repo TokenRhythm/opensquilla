@@ -9,11 +9,8 @@ from .types import Rule
 
 # Strict matching is the safe default: every declared rule criterion must
 # match.  An explicit falsy value retains the old permissive matcher as an
-# emergency rollback.  cd unwrapping remains opt-in and is only meaningful
-# together with strict matching.
+# emergency rollback.
 _MATCHER_STRICT_ENV = "OPENSQUILLA_TOOLCOMP_MATCHER_STRICT"
-_CD_UNWRAP_ENV = "OPENSQUILLA_TOOLCOMP_CD_UNWRAP"
-_TRUE_ENV_VALUES = frozenset({"1", "true", "yes", "on", "enabled"})
 _FALSE_ENV_VALUES = frozenset({"", "0", "false", "off", "no", "disabled"})
 
 # OpenSquilla's command-bearing shell tool.  A field named ``command`` on an
@@ -85,13 +82,6 @@ _GIT_GLOBAL_OPTIONS_WITHOUT_SUBCOMMAND = frozenset(
     }
 )
 
-# Only horizontal whitespace may separate the keyword from its argument: a
-# real shell terminates a bare `cd` statement at an unquoted newline.
-_LEADING_CD_PATTERN = re.compile(r"^\s*(?:cd|pushd)[ \t]+")
-_CD_ARG_STOP_CHARS = frozenset({"&", "|", ";", "<", ">", "\n"})
-_WINDOWS_DRIVE_PATH_PATTERN = re.compile(r"^[A-Za-z]:[\\/]")
-
-
 def _matcher_strict_enabled() -> bool:
     raw_value = os.environ.get(_MATCHER_STRICT_ENV)
     if raw_value is None:
@@ -100,11 +90,6 @@ def _matcher_strict_enabled() -> bool:
     # Unknown values fail safe.  A typo must not silently restore the
     # permissive matcher; only an explicit falsy value is a rollback request.
     return raw not in _FALSE_ENV_VALUES
-
-
-def _cd_unwrap_enabled() -> bool:
-    raw = os.environ.get(_CD_UNWRAP_ENV, "").strip().lower()
-    return raw in _TRUE_ENV_VALUES
 
 
 def command_argv(command: str | None, argv: list[str] | None = None) -> list[str]:
@@ -423,76 +408,6 @@ def _before_double_dash(argv: list[str]) -> list[str]:
         return argv
 
 
-def strip_leading_cd_prefix(command: str) -> str:
-    current = command.strip()
-    for _ in range(8):
-        unwrapped = _match_leading_cd_chain(current)
-        if unwrapped is None:
-            return current
-        current = unwrapped
-    return current
-
-
-def _looks_like_windows_cd_arg(raw_arg: str) -> bool:
-    value = raw_arg.strip()
-    if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
-        value = value[1:-1]
-    return bool(_WINDOWS_DRIVE_PATH_PATTERN.match(value) or value.startswith("\\\\"))
-
-
-def _match_leading_cd_chain(command: str) -> str | None:
-    keyword = _LEADING_CD_PATTERN.match(command)
-    if keyword is None:
-        return None
-
-    # The cd argument must be a single shell token: quoting and escapes are
-    # honoured, but an unquoted operator or redirection makes the prefix
-    # unsafe to strip, so the command is left untouched.
-    index = keyword.end()
-    arg_start = index
-    quote: str | None = None
-    escaping = False
-    saw_arg = False
-    while index < len(command):
-        char = command[index]
-        if escaping:
-            escaping = False
-        elif char == "\\":
-            escaping = True
-        elif quote == "'":
-            if char == "'":
-                quote = None
-        elif char == "`" or command[index : index + 2] == "$(":
-            # Command substitution in the directory token may itself emit
-            # output, so stripping the prefix would falsely attribute that
-            # output to the command after ``&&``.
-            return None
-        elif quote == '"':
-            if char == '"':
-                quote = None
-        elif char in {"'", '"'}:
-            quote = char
-        elif char in _CD_ARG_STOP_CHARS:
-            return None
-        elif char.isspace():
-            break
-        saw_arg = True
-        index += 1
-
-    if not saw_arg:
-        return None
-    if _looks_like_windows_cd_arg(command[arg_start:index]):
-        return None
-
-    while index < len(command) and command[index] in " \t":
-        index += 1
-
-    if command[index : index + 2] != "&&":
-        return None
-    tail = command[index + 2 :].strip()
-    return tail or None
-
-
 def rule_matches(
     rule: Rule,
     *,
@@ -664,18 +579,8 @@ def select_rule(
         if not command:
             return _generic_fallback_rule(rules)
 
-        # cd unwrapping remains opt-in.  Refuse the unsafe historical
-        # combination where unwrapping fed a permissive matcher and selected
-        # an unrelated rule.
-        if _cd_unwrap_enabled() and _matcher_strict_enabled():
-            unwrapped = strip_leading_cd_prefix(command)
-            if unwrapped != command.strip():
-                command = unwrapped
-                argv = command_argv(unwrapped, None)
-
         # A specialized reducer is safe only when all output belongs to one
-        # parseable command.  This also guards malformed tails produced by the
-        # optional cd unwrapping path.
+        # parseable command.
         if not _is_simple_shell_command(command) or (
             argv and _shell_dispatch_reparses(command_argv(command, argv))
         ):

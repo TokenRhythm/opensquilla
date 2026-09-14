@@ -78,6 +78,8 @@ def test_sandbox_off_uses_full_host_access_without_workspace_containment(
     ):
         assert flag in argv
     assert argv[argv.index("--permissions") + 1] == "full"
+    assert argv[argv.index("--timeout") + 1] == "10"
+    assert "--iteration-timeout-seconds" not in argv
     assert "--workspace-strict" not in argv
     assert "--workspace-lockdown" not in argv
     assert captured["cwd"] == str(repo)

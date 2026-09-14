@@ -264,6 +264,7 @@ export interface ChatToolCall {
   isError: boolean
   result: string
   resultPreview: string
+  executionLogHandle?: string
   sources?: unknown
   isOpen: boolean
   activityOrder?: number
@@ -299,6 +300,7 @@ export interface ToolResultContext {
   inputRaw?: string
   section?: 'input' | 'result' | 'error'
   format?: 'diff'
+  executionLogHandle?: string
 }
 
 export interface ChatToolCallGroup {

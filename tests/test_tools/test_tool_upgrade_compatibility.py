@@ -156,6 +156,45 @@ def test_tool_context_appends_new_runtime_fields_after_legacy_fields() -> None:
         "artifact_source_paths",
         "workspace_preview_opener",
         "workspace_preview_scopes",
+        "tool_result_store_max_bytes",
+        "tool_result_store_disk_budget_bytes",
+        "tool_result_store_retention_seconds",
         "execution_status_snapshot",
         "router_control_routing_revision",
     ]
+
+
+def test_tool_context_preserves_complete_legacy_positional_constructor() -> None:
+    defaults = ToolContext()
+    # Preserve the complete constructor published before output-spool fields.
+    legacy_fields = fields(ToolContext)[:105]
+    assert legacy_fields[-1].name == "workspace_preview_scopes"
+    legacy_values = [getattr(defaults, item.name) for item in legacy_fields]
+    source_paths = {}
+    preview_scopes = [{"path": "preview", "scope": "workspace"}]
+    legacy_values[-3] = source_paths
+    legacy_values[-1] = preview_scopes
+
+    context = ToolContext(*legacy_values)
+
+    assert context.artifact_source_paths is source_paths
+    assert context.workspace_preview_scopes is preview_scopes
+    assert context.tool_result_store_max_bytes == 8 * 1024 * 1024
+    assert context.tool_result_store_disk_budget_bytes == 256 * 1024 * 1024
+    assert context.tool_result_store_retention_seconds == 7 * 24 * 60 * 60
+
+
+def test_tool_context_preserves_output_spool_positional_constructor() -> None:
+    defaults = ToolContext()
+    published_fields = fields(ToolContext)[:108]
+    assert published_fields[-1].name == "tool_result_store_retention_seconds"
+    published_values = [getattr(defaults, item.name) for item in published_fields]
+    published_values[-3:] = [1024, 4096, 3600]
+
+    context = ToolContext(*published_values)
+
+    assert context.tool_result_store_max_bytes == 1024
+    assert context.tool_result_store_disk_budget_bytes == 4096
+    assert context.tool_result_store_retention_seconds == 3600
+    assert context.execution_status_snapshot is None
+    assert context.router_control_routing_revision is None

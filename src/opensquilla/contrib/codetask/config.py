@@ -21,7 +21,6 @@ DEFAULT_MODEL = ""  # empty = router / config decides
 DEFAULT_THINKING = ""
 DEFAULT_AGENT_TIMEOUT = 5400  # seconds (90 min); heavy repos spend ~15 min on clone+install
 DEFAULT_MAX_ITERATIONS = 300
-DEFAULT_ITERATION_TIMEOUT = 600
 DEFAULT_MAX_PROVIDER_RETRIES = 5
 
 # ---------------------------------------------------------------------------
