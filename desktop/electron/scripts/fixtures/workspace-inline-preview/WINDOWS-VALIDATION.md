@@ -77,6 +77,8 @@ node scripts/fixtures/workspace-inline-preview/verify-journey.mjs --source-root 
 
 如果脚本因本机条件无法完成某一步，可通过真实客户端操作补验，但必须保留原失败，不能手工修改数据库/store 来跳过流程。
 
+同时检查 `report.json` 的 `cleanAcceptance`、`hydrateContract` 和 `ui-transport.ndjson`。macOS 实测曾出现“后端已完成但界面一直工作中”，后续又观测到 `sessions.messages.hydrate result violated its generated v4 Contract.`。即使网页最终显示，也不能把该契约错误当正常断线或忽略；使用同源生成校验器给出的脱敏字段路径定位，不能放宽 schema、删除断言或自动刷新掩盖它。
+
 ### Web 必须观察到
 
 1. 普通任务 A/B 用同一相对路径生成不同标识的页面，持久根目录不同。

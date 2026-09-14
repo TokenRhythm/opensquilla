@@ -55,6 +55,8 @@ const { closeElectronWithDeadline } = await load('desktop/electron/scripts/e2e-s
 const { requireDesktopForeground } = await load('desktop/electron/scripts/live-html-foreground.mjs')
 const { desktopProfileFingerprint } = await load('desktop/electron/dist/desktop-gateway-ownership.js')
 const fixture = await load('desktop/electron/scripts/fixtures/workspace-inline-preview/provider.mjs')
+const hydrateValidatorPath = 'opensquilla-webui/src/contracts/generated/v4/sessionsMessagesHydrateValidators.mjs'
+const { validateSessionsMessagesHydrateResult } = await load(hydrateValidatorPath)
 const require = createRequire(join(desktopRoot, 'package.json'))
 const { chromium, _electron: electron } = require('playwright')
 const python = join(sourceRoot, '.venv', process.platform === 'win32' ? 'Scripts/python.exe' : 'bin/python')
@@ -80,6 +82,8 @@ const report = {
   schemaVersion: 1, surface, sourceRoot, output, startedAt: new Date().toISOString(), status: 'running',
   execution: { realGateway: true, realFileTools: true, realDatabase: true, modelFixtureOnly: true, seededSessions: false, directRpcMutations: false, automaticRetries: 0, paidCalls: false },
   checkpoints: [], turns: [], processes: [], cleanup: [],
+  cleanAcceptance: true,
+  hydrateContract: { checked: 0, invalidResponses: 0, keyMismatches: 0, consoleWarnings: 0, failures: [] },
 }
 let provider, gateway, app, browser, page, port, interruption
 const logStreams = []
@@ -87,6 +91,25 @@ process.on('SIGINT', () => { interruption ||= new Error('Interrupted by SIGINT')
 process.on('SIGTERM', () => { interruption ||= new Error('Interrupted by SIGTERM') })
 const persist = () => writeFile(join(output, 'report.json'), JSON.stringify(report, null, 2), { mode: 0o600 })
 const hash = bytes => createHash('sha256').update(bytes).digest('hex')
+function hydrateContractErrors(errors) {
+  // Only schema-defined field names and array indices can leave the inspector.
+  // Neither AJV's raw error params nor any rejected response values are logged.
+  const fields = new Set(['key', 'workspaceId', 'projectWorkspace', 'projectWorkspaceDeferred', 'active_task_group_ids', 'run_mode_lock', 'locked', 'runMode', 'source', 'pendingUserInputs', 'collaboration', 'routing', 'currentPlan', 'activePlanRun', 'goal', 'goalSnapshotStreamSeq', 'tasks', 'active_task', 'last_task', 'run_status', 'queued_task_ids', 'epoch', 'hydration_complete', 'deferred_fields'])
+  const pointer = value => String(value || '').split('/').map(part => !part || fields.has(part) || /^\d+$/.test(part) ? part : '<redacted-property>').join('/')
+  const types = new Set(['array', 'boolean', 'integer', 'null', 'number', 'object', 'string'])
+  return (errors || []).slice(0, 16).map(error => {
+    const missing = error.keyword === 'required' && fields.has(error.params?.missingProperty) ? `/${error.params.missingProperty}` : ''
+    const declared = Array.isArray(error.params?.type) ? error.params.type : [error.params?.type]
+    const expected = declared.filter(type => types.has(type))
+    return {
+      instancePath: pointer(error.instancePath) + missing,
+      keyword: ['type', 'required', 'const', 'enum', 'anyOf', 'additionalProperties'].includes(error.keyword) ? error.keyword : 'schema-rule',
+      expectedType: expected.length ? expected.join('|')
+        : error.keyword === 'const' && typeof error.params?.allowedValue === 'boolean' ? `boolean (literal ${error.params.allowedValue})`
+          : error.keyword === 'required' ? 'required property' : 'schema constraint',
+    }
+  })
+}
 function instrumentPage(observedPage) {
   const stream = createWriteStream(join(output, 'ui-transport.ndjson'), { flags: 'wx', mode: 0o600 })
   logStreams.push(stream)
@@ -113,11 +136,25 @@ function instrumentPage(observedPage) {
       try { value = JSON.parse(typeof bytes === 'string' ? bytes : bytes.toString('utf8')) } catch { append({ socketId, direction, type: 'non-json' }); return }
       const id = token(value?.id)
       const method = token(value?.method)
-      if (direction === 'sent' && id && method && requests.size < 1000) requests.set(`${socketId}:${id}`, method)
-      const summary = { socketId, direction, type: token(value?.type), id, method: method || requests.get(`${socketId}:${id}`), event: token(value?.event) }
+      if (direction === 'sent' && id && method && requests.size < 1000) requests.set(`${socketId}:${id}`, { method, key: value?.params?.key })
+      const request = requests.get(`${socketId}:${id}`)
+      const summary = { socketId, direction, type: token(value?.type), id, method: method || request?.method, event: token(value?.event) }
       if (typeof value?.ok === 'boolean') summary.ok = value.ok
       if (token(value?.error?.code)) summary.errorCode = value.error.code
       if (Number.isSafeInteger(value?.seq)) summary.sequence = value.seq
+      if (direction === 'received' && value?.type === 'res' && value.ok === true && summary.method === 'sessions.messages.hydrate') {
+        const valid = validateSessionsMessagesHydrateResult(value.payload)
+        const keyMatches = typeof request?.key === 'string' && value.payload?.key === request.key
+        const errors = valid ? [] : hydrateContractErrors(validateSessionsMessagesHydrateResult.errors)
+        report.hydrateContract.checked += 1
+        summary.contract = { valid, responseKeyMatchesRequest: keyMatches, errors }
+        if (!valid || !keyMatches) {
+          report.cleanAcceptance = false
+          report.hydrateContract.invalidResponses += Number(!valid)
+          report.hydrateContract.keyMismatches += Number(!keyMatches)
+          if (report.hydrateContract.failures.length < 20) report.hydrateContract.failures.push({ at: new Date().toISOString(), socketId, id, ...summary.contract })
+        }
+      }
       for (const body of [value?.params, value?.payload, value?.payload?.runtime, value?.payload?.snapshot]) {
         if (!body || typeof body !== 'object' || Array.isArray(body)) continue
         const key = body.sessionKey || body.session_key || body.key
@@ -135,6 +172,10 @@ function instrumentPage(observedPage) {
     socket.on('socketerror', () => append({ socketId, direction: 'lifecycle', type: 'socket-error' }))
   })
   const consoleSummary = (severity, text) => {
+    if (text.includes('sessions.messages.hydrate result violated its generated v4 Contract.') || text.includes('sessions.messages.hydrate violated its generated v4 Contract.')) {
+      report.cleanAcceptance = false
+      report.hydrateContract.consoleWarnings += 1
+    }
     if (diagnostic.console.length >= 100) return
     const rpcTimeout = text.match(/\b((?:sessions|chat|conversation|artifact)\.[a-z_.]+) timed out after (\d+)ms\b/)
     const known = ['Session stream subscription failed', 'Session metadata hydration failed', 'Session metadata recovery failed', 'Sequence gap detected', 'Connection closed', 'No conversation consumer owns this delivery', 'Failed to fetch'].find(message => text.includes(message))
@@ -407,6 +448,7 @@ try {
   report.source.webuiVerification = (await exec(process.execPath, ['scripts/verify-dist.mjs'], { cwd: join(sourceRoot, 'opensquilla-webui'), env })).stdout.trim()
   report.source.stagedWebuiVerification = (await exec(process.execPath, ['scripts/stage-dist.mjs', '--check'], { cwd: join(sourceRoot, 'opensquilla-webui'), env })).stdout.trim()
   report.source.desktopMainSha256 = hash(await readFile(join(desktopRoot, 'dist/main.js')))
+  report.source.hydrateValidator = { path: hydrateValidatorPath, sha256: hash(await readFile(join(sourceRoot, hydrateValidatorPath))) }
   port = await reservePort()
   provider = await fixture.startWorkspaceInlinePreviewProvider()
   await mkdir(profile, { recursive: true, mode: 0o700 })
@@ -582,6 +624,8 @@ ttl_sweep_interval_minutes = 0
     await screenshot('web-child-complete')
   }
   assert.equal(provider.snapshot().errors.length, 0)
+  report.functionalAcceptance = 'passed'
+  assert.equal(report.cleanAcceptance, true, 'Functional journey completed, but hydrate Contract diagnostics prevent clean acceptance; see hydrateContract.')
   report.status = 'passed'
 } catch (error) {
   report.status = 'failed'
@@ -613,6 +657,11 @@ ttl_sweep_interval_minutes = 0
     await persist()
   }
   for (const stream of logStreams) await new Promise(done => stream.end(done))
+  if (!report.cleanAcceptance && report.status === 'passed') {
+    report.status = 'failed'
+    process.exitCode = 1
+    report.firstFailure ||= { phase: 'contract-diagnostics', message: 'Hydrate Contract diagnostics prevent clean acceptance.' }
+  }
   report.finishedAt = new Date().toISOString()
   await persist()
   console.log(`${report.status}: ${join(output, 'report.json')}`)
