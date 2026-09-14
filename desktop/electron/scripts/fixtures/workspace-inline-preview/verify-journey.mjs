@@ -180,7 +180,7 @@ function instrumentPage(observedPage) {
     socket.on('socketerror', () => append({ socketId, direction: 'lifecycle', type: 'socket-error' }))
   })
   const consoleSummary = (severity, text) => {
-    if (text.includes('sessions.messages.hydrate result violated its generated v4 Contract.') || text.includes('sessions.messages.hydrate violated its generated v4 Contract.')) {
+    if (/sessions\.messages\.(hydrate|subscribe)( result)? violated its generated v4 Contract\./.test(text)) {
       report.cleanAcceptance = false
       report.hydrateContract.consoleWarnings += 1
     }
@@ -633,6 +633,8 @@ ttl_sweep_interval_minutes = 0
   }
   assert.equal(provider.snapshot().errors.length, 0)
   report.functionalAcceptance = 'passed'
+  assert.ok(report.hydrateContract.checked > 0, 'No real hydrate responses were observed.')
+  assert.ok(report.hydrateContract.legacyRunModeResponses > 0, 'The Safe-mode v3 compatibility path was not exercised.')
   assert.equal(report.cleanAcceptance, true, 'Functional journey completed, but hydrate Contract diagnostics prevent clean acceptance; see hydrateContract.')
   report.status = 'passed'
 } catch (error) {
