@@ -49,10 +49,7 @@ from opensquilla.sandbox.types import (
     SandboxRequest,
 )
 from opensquilla.subprocess_encoding import apply_utf8_child_env
-from opensquilla.tools.output_capture import (
-    OUTPUT_PREVIEW_BYTES,
-    BoundedOutputCapture,
-)
+from opensquilla.tools.output_capture import BoundedOutputCapture
 from opensquilla.tools.registry import tool
 from opensquilla.tools.run_mode import full_host_access_active, trusted_sandbox_active
 from opensquilla.tools.types import ToolError, current_tool_context
@@ -783,7 +780,7 @@ def _unsupported_windows_environment_subprocess_payload(reason: str) -> str:
 _MAX_TIMEOUT = 120
 _DEFAULT_TIMEOUT = 30
 _EXECUTION_TIMEOUT_PADDING = 5.0
-_MAX_OUTPUT_CHARS = OUTPUT_PREVIEW_BYTES // 2
+_MAX_OUTPUT_CHARS = 50_000
 _SANDBOX_PYTHON_CANDIDATES: tuple[Path, ...] = (
     Path("/usr/bin/python3"),
     Path("/bin/python3"),
@@ -836,6 +833,7 @@ def _execution_result_json(
     stderr: str,
     timed_out: bool,
     elapsed_ms: int,
+    capture: BoundedOutputCapture | None = None,
 ) -> str:
     def preview(text: str) -> str:
         if len(text) <= _MAX_OUTPUT_CHARS:
@@ -843,16 +841,18 @@ def _execution_result_json(
         half = _MAX_OUTPUT_CHARS // 2
         return text[:half] + "\n[output preview omitted characters]\n" + text[-half:]
 
-    return json.dumps(
-        {
-            "exit_code": returncode,
-            "stdout": preview(stdout),
-            "stderr": preview(stderr),
-            "timed_out": timed_out,
-            "elapsed_ms": elapsed_ms,
-        },
-        ensure_ascii=False,
-    )
+    payload = {
+        "exit_code": returncode,
+        "stdout": preview(stdout),
+        "stderr": preview(stderr),
+        "timed_out": timed_out,
+        "elapsed_ms": elapsed_ms,
+    }
+    if capture is not None:
+        truncated = len(stdout) > _MAX_OUTPUT_CHARS or len(stderr) > _MAX_OUTPUT_CHARS
+        if output_details := capture.describe(only_if_needed=not truncated):
+            payload["output_capture"] = output_details
+    return json.dumps(payload, ensure_ascii=False)
 
 
 def _append_code_exec_sandbox_network_hint(*, stdout: str, stderr: str) -> str:
@@ -1290,24 +1290,18 @@ async def execute_code(
         stderr = capture.preview("stderr")
         if timed_out:
             stderr += f"\nExecution timed out after {timeout}s"
-        payload = json.loads(_execution_result_json(
+        return finish(_execution_result_json(
             returncode=-1 if timed_out else (proc.returncode or 0),
             stdout=capture.preview("stdout"), stderr=stderr,
-            timed_out=timed_out, elapsed_ms=elapsed_ms,
+            timed_out=timed_out, elapsed_ms=elapsed_ms, capture=capture,
         ))
-        if output_details := capture.describe(only_if_needed=True):
-            payload["output_capture"] = output_details
-        return finish(json.dumps(payload, ensure_ascii=False))
     except Exception as exc:
         await capture.finish_async()
-        payload = json.loads(_execution_result_json(
+        return finish(_execution_result_json(
             returncode=-1, stdout=capture.preview("stdout"),
             stderr=capture.preview("stderr") + f"\nExecution error: {exc}",
-            timed_out=False, elapsed_ms=0,
-        ))
-        if output_details := capture.describe(only_if_needed=True):
-            payload["output_capture"] = output_details
-        return finish(json.dumps(payload, ensure_ascii=False), executed=process_started)
+            timed_out=False, elapsed_ms=0, capture=capture,
+        ), executed=process_started)
     finally:
         await capture.finish_async()
         if cleanup_dir:

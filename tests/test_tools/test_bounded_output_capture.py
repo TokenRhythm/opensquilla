@@ -479,6 +479,158 @@ async def test_execute_code_timeout_retains_both_streams(tmp_path: Path) -> None
         reset_runtime()
 
 
+@pytest.mark.parametrize("character", ["x", "界", "🙂"])
+@pytest.mark.parametrize("size", [50_000, 50_001])
+def test_execute_code_model_preview_character_boundary(character: str, size: int) -> None:
+    from opensquilla.tools.builtin.code_exec import _execution_result_json
+
+    text = "start" + character * (size - 8) + "end"
+    payload = json.loads(_execution_result_json(
+        returncode=1, stdout=text, stderr=text, timed_out=False, elapsed_ms=1,
+    ))
+    for stream in ("stdout", "stderr"):
+        if size == 50_000:
+            assert payload[stream] == text
+        else:
+            assert payload[stream] == (
+                text[:25_000] + "\n[output preview omitted characters]\n" + text[-25_000:]
+            )
+
+
+@pytest.mark.parametrize("retrieval_available", [False, True])
+async def test_execute_code_shortened_model_preview_keeps_full_log(
+    tmp_path: Path, retrieval_available: bool,
+) -> None:
+    from opensquilla.sandbox.config import SandboxSettings
+    from opensquilla.sandbox.integration import configure_runtime, reset_runtime
+    from opensquilla.tools.builtin import code_exec
+
+    configure_runtime(SandboxSettings(sandbox=False, security_grading=False), workspace=tmp_path)
+    token = current_tool_context.set(ToolContext(
+        session_key="test-session", workspace_dir=str(tmp_path), is_owner=True,
+        tool_result_store_dir=str(tmp_path / "store"),
+        tool_result_retrieval_available=retrieval_available,
+    ))
+    text = "start\n" + "界" * 40_000 + "\nretained middle\n" + "z" * 40_000 + "\nend"
+    code = (
+        "import sys; "
+        "text = 'start\\n' + '\\u754c' * 40000 + '\\nretained middle\\n' + 'z' * 40000 + '\\nend'; "
+        "sys.stdout.write(text); sys.stderr.write(text)"
+    )
+    try:
+        payload = json.loads(await code_exec.execute_code(code, timeout=10))
+        assert payload["exit_code"] == 0
+        for stream in ("stdout", "stderr"):
+            assert "retained middle" not in payload[stream]
+            assert payload[stream].startswith("start\n")
+            assert payload[stream].endswith("\nend")
+            assert len(payload[stream]) < 50_100
+        info = payload["output_capture"]
+        assert info["preview_omitted_bytes"] == 0
+        assert info["retained_output_complete"] is True
+        assert ("retrieval" in info) is retrieval_available
+        store = ToolResultStore(tmp_path / "store")
+        retained = store.read(info["tool_result_handle"], session_id="test-session")
+        assert retained.content == f"\n[stdout]\n{text}\n[stderr]\n{text}"
+    finally:
+        current_tool_context.reset(token)
+        reset_runtime()
+
+
+@pytest.mark.parametrize("failure", ["timeout", "error"])
+async def test_execute_code_appended_diagnostic_can_trigger_preview_limit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str,
+) -> None:
+    from opensquilla.sandbox.config import SandboxSettings
+    from opensquilla.sandbox.integration import configure_runtime, reset_runtime
+    from opensquilla.tools.builtin import code_exec
+
+    async def finished_process(proc, timeout):
+        await proc.wait()
+        if failure == "error":
+            raise OSError("synthetic wait failure")
+        return False
+
+    monkeypatch.setattr(shell, "_wait_exec_process", finished_process)
+    configure_runtime(SandboxSettings(sandbox=False, security_grading=False), workspace=tmp_path)
+    token = current_tool_context.set(ToolContext(
+        session_key="test-session", workspace_dir=str(tmp_path), is_owner=True,
+        tool_result_store_dir=str(tmp_path / "store"),
+    ))
+    try:
+        payload = json.loads(await code_exec.execute_code(
+            "import sys; sys.stderr.write('x' * 50000)", timeout=10,
+        ))
+        assert payload["exit_code"] == -1
+        assert payload["timed_out"] is (failure == "timeout")
+        diagnostic = (
+            "Execution timed out after 10.0s" if failure == "timeout"
+            else "Execution error: synthetic wait failure"
+        )
+        assert payload["stderr"].endswith(diagnostic)
+        assert "[output preview omitted characters]" in payload["stderr"]
+        assert len(payload["stderr"]) < 50_100
+        info = payload["output_capture"]
+        assert info["preview_omitted_bytes"] == 0
+        assert info["retained_output_complete"] is True
+        retained = ToolResultStore(tmp_path / "store").read(
+            info["tool_result_handle"], session_id="test-session",
+        )
+        assert retained.content == "\n[stderr]\n" + "x" * 50_000
+    finally:
+        current_tool_context.reset(token)
+        reset_runtime()
+
+
+@pytest.mark.parametrize("failure", ["no_store", "append", "finalize"])
+async def test_execute_code_preview_with_unavailable_full_log(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str,
+) -> None:
+    from opensquilla.engine import tool_result_store
+    from opensquilla.sandbox.config import SandboxSettings
+    from opensquilla.sandbox.integration import configure_runtime, reset_runtime
+    from opensquilla.tools.builtin import code_exec
+
+    def storage_failure(*args, **kwargs):
+        raise OSError("synthetic log storage failure")
+
+    if failure == "append":
+        monkeypatch.setattr(tool_result_store.ToolOutputSpool, "append", storage_failure)
+    elif failure == "finalize":
+        monkeypatch.setattr(tool_result_store, "_atomic_write_bytes", storage_failure)
+    configure_runtime(SandboxSettings(sandbox=False, security_grading=False), workspace=tmp_path)
+    token = current_tool_context.set(ToolContext(
+        session_key="test-session", workspace_dir=str(tmp_path), is_owner=True,
+        tool_result_store_dir="" if failure == "no_store" else str(tmp_path / "store"),
+        tool_result_retrieval_available=True,
+    ))
+    try:
+        payload = json.loads(await code_exec.execute_code(
+            "import sys; sys.stdout.write('x' * 80000 + 'last diagnostic')", timeout=10,
+        ))
+        assert payload["exit_code"] == 0
+        assert len(payload["stdout"]) < 50_100
+        assert payload["stdout"].endswith("last diagnostic")
+        info = payload["output_capture"]
+        assert info["retained_output_complete"] is False
+        if failure == "no_store":
+            assert info["retained_bytes"] == 0
+            assert "storage_error" not in info
+        else:
+            assert info["storage_error"] == "OSError"
+        if failure == "append":
+            store = ToolResultStore(tmp_path / "store")
+            assert store.read_output_metadata(
+                info["tool_result_handle"], session_id="test-session",
+            )["complete"] is False
+        else:
+            assert "tool_result_handle" not in info
+            assert "retrieval" not in info
+    finally:
+        current_tool_context.reset(token)
+        reset_runtime()
+
+
 async def test_slow_spool_does_not_block_preview_or_queue_unbounded_writes(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
