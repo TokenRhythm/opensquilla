@@ -194,8 +194,8 @@ test.describe('Vue behavior contracts', () => {
     await expect(page).toHaveURL(/\/control\/chat(?:\?|$)/)
 
     await page.goto(CONTROL_URL + 'still-not-a-route')
-    await page.locator('.not-found').getByRole('button', { name: 'Sessions' }).click()
-    await expect(page).toHaveURL(/\/control\/sessions(?:\?|$)/)
+    await page.locator('.not-found').getByRole('button', { name: 'Go to Chat' }).click()
+    await expect(page).toHaveURL(/\/control\/chat(?:\?|$)/)
   })
 
   test('drawer, nested preview, and lightbox own Escape while composer Escape aborts once', async ({ page }) => {
