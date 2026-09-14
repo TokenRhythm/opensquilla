@@ -848,6 +848,93 @@ describe('v4 SessionReadPort Adapter', () => {
     await lease.close()
   })
 
+  it.each(['subscribe', 'hydrate'] as const)(
+    'decodes only the v3 trusted run-mode alias at the %s boundary',
+    async (boundary) => {
+      const harness = makeHarness()
+      const result = boundary === 'subscribe' ? subscribeResult() : hydrateResult()
+      const wire = {
+        ...result,
+        run_mode_lock: { locked: true, runMode: 'trusted', source: 'task', extra: 'preserved' },
+        future_metadata: { runMode: 'trusted' },
+      }
+      const original = structuredClone(wire)
+      harness.results.set(SESSIONS_MESSAGES_SUBSCRIBE_METHOD, boundary === 'subscribe'
+        ? wire : subscribeResult({ ...metadataFields(false), hydration_complete: false }))
+      harness.results.set(SESSIONS_MESSAGES_HYDRATE_METHOD, wire)
+      const lease = createV4SessionReadPort(harness.rpc).open(openRequest())
+
+      await Promise.all([
+        expect(lease.live).resolves.toMatchObject({ sessionKey: 'alpha' }),
+        expect(lease.metadata).resolves.toMatchObject({
+          runModeLock: { locked: true, runMode: 'safe', source: 'task', additional: { extra: 'preserved' } },
+          additional: { future_metadata: { runMode: 'trusted' } },
+        }),
+      ])
+      expect(wire).toEqual(original)
+      await lease.close()
+    },
+  )
+
+  it.each(['trusted', 'unknown'])(
+    'validates run mode %s when reconciliation retries a lost subscribe ACK', async (runMode) => {
+      const harness = makeHarness()
+      harness.results.set(SESSIONS_MESSAGES_SUBSCRIBE_METHOD, new Error('subscribe ACK lost'))
+      const lease = createV4SessionReadPort(harness.rpc).open(openRequest())
+      await Promise.all([
+        expect(lease.live).rejects.toThrow('subscribe ACK lost'),
+        expect(lease.metadata).rejects.toThrow('subscribe ACK lost'),
+      ])
+      harness.results.set(SESSIONS_MESSAGES_SUBSCRIBE_METHOD, {
+        ...subscribeResult(), run_mode_lock: { locked: true, runMode },
+      })
+      harness.results.set(SESSIONS_MESSAGES_HYDRATE_METHOD, {
+        ...hydrateResult(), run_mode_lock: { locked: true, runMode: 'trusted' },
+      })
+      if (runMode === 'trusted') {
+        await expect(lease.reconcile()).resolves.toMatchObject({
+          initialMetadata: { runModeLock: { locked: true, runMode: 'safe' } },
+        })
+      } else {
+        await expect(lease.reconcile()).rejects.toBeInstanceOf(SessionReadContractError)
+      }
+      expect(harness.calls.filter(call => call.method === SESSIONS_MESSAGES_SUBSCRIBE_METHOD)).toHaveLength(2)
+      await lease.close()
+    },
+  )
+
+  it.each(['safe', 'full', undefined] as const)('preserves canonical or absent run mode %s', async (runMode) => {
+    const harness = makeHarness()
+    harness.results.set(SESSIONS_MESSAGES_HYDRATE_METHOD, {
+      ...hydrateResult(), run_mode_lock: { locked: runMode !== undefined, ...(runMode ? { runMode } : {}) },
+    })
+    harness.results.set(SESSIONS_MESSAGES_SUBSCRIBE_METHOD,
+      subscribeResult({ ...metadataFields(false), hydration_complete: false }))
+    const lease = createV4SessionReadPort(harness.rpc).open(openRequest())
+    await lease.live
+    await expect(lease.metadata).resolves.toMatchObject({
+      runModeLock: { locked: runMode !== undefined, runMode: runMode ?? null },
+    })
+    await lease.close()
+  })
+
+  it.each([
+    { locked: true, runMode: 'bypass' },
+    { locked: true, runMode: 'unknown' },
+    { locked: true, runMode: null },
+    { locked: 'yes', runMode: 'trusted' },
+    { locked: true, runMode: 'trusted', source: 42 },
+  ])('keeps malformed run-mode locks invalid: %j', async (lock) => {
+    const harness = makeHarness()
+    harness.results.set(SESSIONS_MESSAGES_SUBSCRIBE_METHOD,
+      subscribeResult({ ...metadataFields(false), hydration_complete: false }))
+    harness.results.set(SESSIONS_MESSAGES_HYDRATE_METHOD, { ...hydrateResult(), run_mode_lock: lock })
+    const lease = createV4SessionReadPort(harness.rpc).open(openRequest())
+    await lease.live
+    await expect(lease.metadata).rejects.toBeInstanceOf(SessionReadContractError)
+    await lease.close()
+  })
+
   it('normalizes only the legacy canonical proof fields before result validation', async () => {
     const harness = makeHarness()
     const legacy = { ...historyResult() } as Record<string, unknown>

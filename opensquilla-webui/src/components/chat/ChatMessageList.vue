@@ -93,6 +93,7 @@
           :goal-outcome="goalOutcomeFor(messages[entry.index], entry.index)"
           :goal-elapsed="goalElapsed"
           :resolve-session-availability="resolveSessionAvailability"
+          :resolve-workspace-preview-resource="resolveWorkspacePreviewResource"
           @fork="$emit('forkConversation', forkThroughTurnId(entry.index))"
           @regenerate="$emit('regenerateMessage', $event)"
           @toggle-share="$emit('toggleShareMessage', $event)"
@@ -204,6 +205,7 @@ const props = defineProps<{
   goal?: GoalSnapshot | null
   goalElapsed?: string
   resolveSessionAvailability?: (sessionKey: string) => Promise<boolean>
+  resolveWorkspacePreviewResource?: (sessionKey: string, documentId: string) => Promise<WorkbenchResource | null>
   /** Required for long-history virtualization; omitted by legacy embedders. */
   scrollContainer?: HTMLElement | null
   /** Session/render epoch used to invalidate deferred scroll corrections. */

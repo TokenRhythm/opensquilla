@@ -185,6 +185,14 @@ export interface ProjectDirectoryPickerRequest {
 }
 
 export interface PlatformFilesApi {
+  saveArtifact?: (payload: ArtifactOpenRequest) => Promise<{ status: 'saved' | 'cancelled' }>
+  sourceFileAction?: (payload: {
+    gatewayInstanceId: string
+    sessionKey: string
+    documentId: string
+    pagePath?: string
+    action: 'open' | 'reveal'
+  }) => Promise<void>
   /** Write the bytes to a temp file and open it with the OS default app. */
   openArtifact?: (payload: ArtifactOpenRequest) => Promise<ArtifactNativeOpenResult>
   /** Open the trusted host's native folder picker. Undefined on the web. */
@@ -395,6 +403,7 @@ export interface NativeArtifactPreviewLeaseCreateRequest {
   scopeId: string
   mode: WorkbenchPreviewMode
   authToken?: string
+  pagePath?: string
 }
 
 export interface NativeArtifactPreviewLeaseControlRequest {
@@ -429,7 +438,7 @@ export interface NativeWorkbenchApi {
   ): Promise<NativeWorkbenchSurfaceResult>
   getWorkbenchBrowserTarget?(request: { surfaceId: string }): Promise<NativeWorkbenchBrowserTarget>
   focusWorkbenchAnnotation?(request: {
-    surfaceId: string; targetRef: string; locatorHint: string
+    surfaceId: string; targetRef: string; locatorHint: string; pagePath?: string
   }): Promise<NativeWorkbenchSurfaceResult>
   captureWorkbenchScreenshot?(request: {
     surfaceId: string; targetRef: string

@@ -9,7 +9,7 @@ import pytest
 from opensquilla.engine.runtime import TurnRunner
 from opensquilla.gateway.config import GatewayConfig
 from opensquilla.tools.registry import DEFAULT_MODEL_TOOL_NAMES, get_default_registry
-from opensquilla.tools.types import ToolContext
+from opensquilla.tools.types import CallerKind, ToolContext
 
 # The active SWE profile: exactly these ten tools, no ``submit``.
 _SCAFFOLD_TOOLS = frozenset(
@@ -79,6 +79,67 @@ def test_build_tools_exposes_plan_run_delivery_controls_under_scaffold_profile(
     assert names == _MODEL_SCAFFOLD_TOOLS | plan_run_tools
     assert ctx.surfaced_tools is not None
     assert plan_run_tools <= ctx.surfaced_tools
+
+
+async def _preview_opener(*args, **kwargs):
+    return {"resourceId": "document:test"}
+
+
+@pytest.mark.parametrize("plan_run", [False, True])
+@pytest.mark.parametrize("supported", [False, True])
+def test_preview_is_exposed_by_default_only_with_web_capability(
+    tmp_path: Path, plan_run: bool, supported: bool
+) -> None:
+    runner = (
+        _runner_with_scaffold_profile()
+        if plan_run
+        else TurnRunner(provider_selector=None, config=GatewayConfig())
+    )
+    runner._tool_registry = get_default_registry()
+    ctx = ToolContext(
+        is_owner=True,
+        caller_kind=CallerKind.WEB,
+        workspace_dir=str(tmp_path),
+        plan_run_id="run-1" if plan_run else None,
+        workspace_preview_opener=_preview_opener if supported else None,
+    )
+
+    definitions, _handler = runner._build_tools(ctx)
+
+    assert ("open_workspace_preview" in {tool.name for tool in definitions}) is supported
+    assert ("open_workspace_preview" in ctx.authorized_tool_names) is supported
+
+
+@pytest.mark.parametrize("caller_kind", [CallerKind.AGENT, CallerKind.CHANNEL, CallerKind.CRON])
+def test_preview_is_not_exposed_to_non_web_callers(caller_kind: CallerKind) -> None:
+    runner = TurnRunner(provider_selector=None, config=GatewayConfig())
+    runner._tool_registry = get_default_registry()
+    ctx = ToolContext(
+        is_owner=True,
+        caller_kind=caller_kind,
+        workspace_preview_opener=_preview_opener,
+        surfaced_tools={"open_workspace_preview"},
+    )
+
+    definitions, _handler = runner._build_tools(ctx)
+
+    assert "open_workspace_preview" not in {tool.name for tool in definitions}
+    assert "open_workspace_preview" not in ctx.authorized_tool_names
+
+
+def test_preview_explicit_deny_wins_over_plan_run_surfacing() -> None:
+    runner = _runner_with_scaffold_profile()
+    ctx = ToolContext(
+        is_owner=True,
+        caller_kind=CallerKind.WEB,
+        workspace_preview_opener=_preview_opener,
+        plan_run_id="run-1",
+        denied_tools={"open_workspace_preview"},
+    )
+
+    definitions, _handler = runner._build_tools(ctx)
+
+    assert "open_workspace_preview" not in {tool.name for tool in definitions}
 
 
 def test_build_tools_plan_run_ignores_retired_submit_env(

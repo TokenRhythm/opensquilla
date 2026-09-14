@@ -17,6 +17,7 @@ import type { ArtifactPayload } from '@/types/artifacts'
 import { createV4ArtifactDocuments } from './artifactDocumentsV4'
 import { createV4WorkbenchResources } from './workbenchResourcesV4'
 import { createV4ArtifactContentAccess } from './artifactAccessV4'
+import { createWorkingFileAccess } from './privateWorkingFileAccess'
 import { createV4AttachmentContentAccess } from './attachmentAccessV4'
 import { createV4ArtifactPreviews } from './artifactPreviewsV4'
 import { documentChangeEventContract } from './artifactWorkbenchContracts'
@@ -244,7 +245,7 @@ export function createV4ArtifactWorkbench(
     artifacts: createV4ArtifactCatalog(rpc),
     documents: createV4ArtifactDocuments(operationRpc),
     resources: createV4WorkbenchResources(operationRpc),
-    content: { ...artifactContent, ...attachmentContent },
+    content: { ...artifactContent, ...attachmentContent, ...createWorkingFileAccess(http) },
     previews: createV4ArtifactPreviews(http),
     subscribeDocumentChanges(listener): ArtifactWorkbenchSubscription {
       listeners.add(listener)

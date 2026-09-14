@@ -278,6 +278,13 @@
       "type": "object",
       "additionalProperties": false,
       "properties": {
+        "pagePath": {
+          "type": ["string", "null"],
+          "minLength": 1,
+          "maxLength": 4096,
+          "pattern": "\\S",
+          "description": "Logical HTML page within the referenced document. The Gateway validates the current collection and source path; this hint does not grant access."
+        },
         "targetRef": {
           "type": [
             "string",

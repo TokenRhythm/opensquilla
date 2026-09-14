@@ -6,7 +6,7 @@ from typing import Any
 
 from starlette.applications import Starlette
 from starlette.requests import Request
-from starlette.responses import FileResponse, JSONResponse
+from starlette.responses import FileResponse, JSONResponse, Response
 from starlette.routing import Route
 
 from opensquilla.application.artifact_workbench import (
@@ -19,6 +19,7 @@ from opensquilla.application.artifact_workbench import (
     NativeArtifactOpenApplication,
     NativeArtifactOpenError,
     NativeArtifactUnsupportedError,
+    WorkingFileQuery,
 )
 from opensquilla.gateway.adapters import artifact_native as _artifact_native
 from opensquilla.gateway.adapters.artifact_content import GatewayArtifactContentPort
@@ -66,6 +67,48 @@ def register_artifact_routes(
             open_path=_open_path_with_default_app,
         )
     )
+
+    async def working_file_handler(request: Request) -> Response:
+        headers = {"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff"}
+        if not request_origin_allowed(request, config):
+            return forbidden_origin_response()
+        # Source paths are host material, unlike an immutable shared delivery.
+        if not _request_principal_is_owner(config, request):
+            return JSONResponse({"code": "OWNER_REQUIRED"}, status_code=403, headers=headers)
+        format_ = request.query_params.get("format", "content")
+        if format_ not in {"content", "metadata"}:
+            return JSONResponse({"code": "INVALID_REQUEST"}, status_code=400, headers=headers)
+        try:
+            material = await content.working_file(
+                WorkingFileQuery(
+                    request.headers.get("x-opensquilla-session-key", ""),
+                    request.path_params["document_id"],
+                    request.query_params.get("pagePath"),
+                )
+            )
+        except (ContentNotFoundError, ValueError):
+            return JSONResponse(
+                {"code": "WORKING_FILE_UNAVAILABLE"}, status_code=404, headers=headers
+            )
+        if format_ == "metadata":
+            return JSONResponse(
+                {
+                    "documentId": material.document_id,
+                    "pagePath": material.page_path,
+                    "sourcePath": str(material.path),
+                    "workspace": material.workspace,
+                    "name": material.path.name,
+                    "mime": material.media_type,
+                    "size": len(material.data),
+                },
+                headers=headers,
+            )
+        from urllib.parse import quote
+
+        headers["Content-Disposition"] = "attachment; filename*=UTF-8''" + quote(
+            material.path.name, safe=""
+        )
+        return Response(material.data, media_type=material.media_type, headers=headers)
 
     async def document_download_handler(request: Request) -> FileResponse | JSONResponse:
         document_id = request.path_params.get("document_id", "")
@@ -170,6 +213,13 @@ def register_artifact_routes(
 
         return JSONResponse({"ok": True, "status": "accepted"}, status_code=202)
 
+    app.router.routes.append(
+        Route(
+            "/api/v1/artifact-documents/{document_id}/working-file",
+            working_file_handler,
+            methods=["GET"],
+        )
+    )
     app.router.routes.append(
         Route("/api/v1/artifacts/{artifact_id}/open", open_handler, methods=["POST"])
     )

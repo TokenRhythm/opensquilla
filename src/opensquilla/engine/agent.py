@@ -360,6 +360,7 @@ _PROVIDER_OUTPUT_CONTINUE_PROMPT = (
     "tool call from scratch."
 )
 _PLAN_RUN_RECONCILIATION_LIMIT = 1
+PLAN_RUN_DELIVERY_TOOLS = frozenset({"publish_artifact", "open_workspace_preview"})
 
 
 def _plan_run_steps_ready_for_delivery(run: Any) -> bool:
@@ -12591,7 +12592,7 @@ class Agent:
                             {
                                 "status": "not_executed",
                                 "reason": "plan_run_delivery_only",
-                                "allowed_tools": ["publish_artifact"],
+                                "allowed_tools": sorted(PLAN_RUN_DELIVERY_TOOLS),
                             },
                             ensure_ascii=False,
                         ),
@@ -12662,7 +12663,7 @@ class Agent:
                         )
                         _record_completed_tool_result(results_by_id[tc.tool_use_id])
                         continue
-                    if plan_run_delivery_only and tc.tool_name != "publish_artifact":
+                    if plan_run_delivery_only and tc.tool_name not in PLAN_RUN_DELIVERY_TOOLS:
                         results_by_id[tc.tool_use_id] = _not_executed_during_plan_delivery(tc)
                         _record_completed_tool_result(results_by_id[tc.tool_use_id])
                         continue
@@ -14971,11 +14972,11 @@ class Agent:
     def _plan_run_delivery_tool_definitions(
         tools: list[ToolDefinition] | None,
     ) -> list[ToolDefinition] | None:
-        """Expose only final artifact delivery after all plan steps are done."""
+        """Expose only prepared preview registration or final artifact delivery."""
 
         if not tools:
             return None
-        delivery_tools = [tool for tool in tools if tool.name == "publish_artifact"]
+        delivery_tools = [tool for tool in tools if tool.name in PLAN_RUN_DELIVERY_TOOLS]
         return delivery_tools or None
 
     def _workspace_edit_gate_system_prompt(

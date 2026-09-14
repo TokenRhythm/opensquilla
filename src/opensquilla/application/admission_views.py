@@ -56,6 +56,14 @@ class PreparedAdmissionIntent(Protocol):
     def initial_transcript_entries(self) -> tuple[TranscriptMessage, ...]: ...
 
 
+@runtime_checkable
+class AdmissionPreparation(Protocol):
+    """Optional, process-local resources; absent on legacy preparation adapters."""
+
+    def mark_committed(self, session_id: str) -> None: ...
+    async def close(self) -> None: ...
+
+
 class AdmissionReceipt(Protocol):
     @property
     def request_fingerprint(self) -> str: ...

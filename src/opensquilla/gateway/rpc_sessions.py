@@ -1535,6 +1535,17 @@ def _workspace_metadata_for_session(session: Any, config: Any) -> dict[str, str]
     workspace = context_payload.get("workspace") if isinstance(context_payload, dict) else None
     workspace_path = _normalize_workspace_display_path(workspace)
 
+    binding = getattr(session, "execution_workspace", None)
+    if binding is not None and not getattr(session, "workspace_id", None):
+        from opensquilla.execution_workspaces import normalize_execution_workspace
+
+        try:
+            # Listing metadata must not probe the filesystem. A missing task
+            # directory still belongs to this task; execution validates it later.
+            workspace_path = normalize_execution_workspace(binding)["root"]
+        except ProjectWorkspaceStateError:
+            return {}
+
     if workspace_path is None:
         session_key = str(getattr(session, "session_key", "") or "")
         agent_id = _effective_agent_id_for_session(session, session_key)

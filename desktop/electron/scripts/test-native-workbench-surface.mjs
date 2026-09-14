@@ -34,6 +34,78 @@ const nativeWorkbenchSurfaceRuntime = await readFile(
   new URL('../dist/native-workbench-surface.js', import.meta.url),
   'utf8',
 )
+const annotationFocusStart = nativeWorkbenchSurfaceRuntime.indexOf('    async focusAnnotation(')
+const annotationFocusEnd = nativeWorkbenchSurfaceRuntime.indexOf('    async executeBrowser(', annotationFocusStart)
+assert.ok(annotationFocusStart >= 0 && annotationFocusEnd > annotationFocusStart)
+const focusAnnotation = new Function(
+  'DesktopBrowserError', 'randomUUID', 'NATIVE_WORKBENCH_ANNOTATION_SCROLL_FUNCTION',
+  'NATIVE_WORKBENCH_ANNOTATION_HIGHLIGHT_CONFIG',
+  `return ({${nativeWorkbenchSurfaceRuntime.slice(annotationFocusStart, annotationFocusEnd)}}).focusAnnotation`,
+)(DesktopBrowserError, randomUUID, 'scroll-selected-node', {})
+
+async function checkSubpageAnnotationFocus({
+  pagePath = 'layouts/editorial.html',
+  url = 'http://p-test.localhost:1234/layouts/editorial.html',
+  interruptAt,
+  replaceTarget = false,
+  expectedError,
+} = {}) {
+  const commands = []
+  const record = {
+    kind: 'artifact-preview', expectedOrigin: 'http://p-test.localhost:1234',
+    annotationDocumentGeneration: 1,
+    view: { webContents: { getURL: () => url } },
+  }
+  let replaced = false
+  const interrupt = phase => {
+    if (phase !== interruptAt) return
+    if (replaceTarget) replaced = true
+    else record.annotationDocumentGeneration += 1
+  }
+  const manager = {
+    getBrowserTarget: () => ({ targetRef: 'target-old', sessionKey: 'session-one' }),
+    browserRecord: () => replaced ? { ...record } : record,
+    isActiveAnnotationRecord: () => true,
+    browserRoot: async () => { interrupt('root'); return { rootObjectId: 'root' } },
+    async cdpCommand(_record, method, params, beforeSend) {
+      const phase = method === 'Runtime.callFunctionOn'
+        ? params.functionDeclaration === 'scroll-selected-node' ? 'scroll' : 'query'
+        : method
+      interrupt(`before-${phase}`)
+      beforeSend?.()
+      commands.push(phase)
+      interrupt(`after-${phase}`)
+      return { result: { objectId: 'selected' }, node: { backendNodeId: 7 } }
+    },
+    clearAnnotationFocusHighlight: async () => { interrupt('clear-highlight') },
+  }
+  try {
+    const result = focusAnnotation.call(manager, 'surface', 'target-old', 'h1', pagePath || undefined)
+    if (expectedError) {
+      await assert.rejects(result, error => error.code === expectedError)
+      assert.equal(commands.includes('scroll'), false, 'stale pages must not scroll another page')
+      assert.equal(commands.includes('Overlay.highlightNode'), false, 'stale pages must not highlight another page')
+    } else {
+      assert.equal((await result).ok, true)
+      assert.ok(commands.includes('scroll'))
+      assert.ok(commands.includes('Overlay.highlightNode'))
+    }
+  } finally {
+    clearTimeout(record.annotationFocusTimer)
+  }
+}
+
+await checkSubpageAnnotationFocus()
+await checkSubpageAnnotationFocus({ pagePath: 'layouts/with space.html', url: 'http://p-test.localhost:1234/layouts/with%20space.html' })
+await checkSubpageAnnotationFocus({ url: 'http://p-test.localhost:1234/layouts/dashboard.html', expectedError: 'PAGE_CHANGED' })
+await checkSubpageAnnotationFocus({ url: 'https://foreign.test/layouts/editorial.html', expectedError: 'PAGE_CHANGED' })
+// Existing callers without a subpage hint keep their protocol behavior.
+await checkSubpageAnnotationFocus({ pagePath: '', url: 'http://p-test.localhost:1234/index.html' })
+for (const interruptAt of ['root', 'after-query', 'after-DOM.describeNode', 'before-scroll']) {
+  await checkSubpageAnnotationFocus({ interruptAt, expectedError: 'PAGE_CHANGED' })
+}
+await checkSubpageAnnotationFocus({ interruptAt: 'root', replaceTarget: true, expectedError: 'PAGE_CHANGED' })
+
 // Exercise the compiled manager method without starting an Electron application.
 const browserExecutorStart = nativeWorkbenchSurfaceRuntime.indexOf('    async executeBrowser(')
 const browserExecutorEnd = nativeWorkbenchSurfaceRuntime.indexOf('    async snapshotBrowser(', browserExecutorStart)

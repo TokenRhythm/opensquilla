@@ -31,7 +31,8 @@ import {
 import { downloadBlob } from '@/utils/browser'
 import { isMacPlatform } from '@/utils/browser'
 import { promptAnnotationTargetLabel } from '@/utils/chat/promptAnnotationPresentation'
-import { classifyArtifactProductError } from '@/utils/artifactProductErrors'
+import { artifactProductClientError, classifyArtifactProductError } from '@/utils/artifactProductErrors'
+import { previewPagePathFromUrl } from '@/utils/workbench/previewPagePath'
 import {
   artifactFromWorkbenchItem,
   initialSectionFromWorkbenchItem,
@@ -185,7 +186,10 @@ function productErrorMessage(
   error: unknown,
   options: ArtifactWorkbenchProviderOptions,
 ): string {
-  const classified = classifyArtifactProductError(error)
+  const classified = classifyArtifactProductError(
+    error instanceof ArtifactPreviewLeaseError && error.code === 'PREVIEW_PAGE_UNSUPPORTED'
+      ? artifactProductClientError('PREVIEW_PAGE_UNSUPPORTED') : error,
+  )
   const translated = options.t(classified.messageKey)
   return translated === classified.messageKey ? classified.fallbackMessage : translated
 }
@@ -331,6 +335,8 @@ class ArtifactPreviewRuntime implements WorkbenchPanelRuntime {
   private item: WorkbenchItem
   private lease: ArtifactPreviewLease | null = null
   private leaseArtifactId = ''
+  private requestedPreviewPage: unknown
+  private sectionRequestId: number
   private leaseRenewTimer: ReturnType<typeof setInterval> | null = null
   private readonly nativeRecoveryAttemptedKeys = new Set<string>()
   private nativeRecoveryInFlight: Promise<void> | null = null
@@ -349,6 +355,8 @@ class ArtifactPreviewRuntime implements WorkbenchPanelRuntime {
     preferences: { mode: WorkbenchPreviewMode; noticeShown: boolean },
   ) {
     this.item = item
+    this.requestedPreviewPage = artifactFromWorkbenchItem(item)?.previewPagePath
+    this.sectionRequestId = initialSectionRequestIdFromWorkbenchItem(item)
     const preparedPreview = preparedPreviewFromWorkbenchItem(item)
     this.defaultMode = preparedPreview ? 'offline' : preferences.mode
     this.mode = preparedPreview ? 'offline' : preferences.mode
@@ -426,8 +434,32 @@ class ArtifactPreviewRuntime implements WorkbenchPanelRuntime {
       : null
   }
 
-  update(item: WorkbenchItem) {
+  async update(item: WorkbenchItem) {
+    const previousPage = this.requestedPreviewPage
+    const artifact = artifactFromWorkbenchItem(item)
+    const nextPage = artifact?.previewPagePath
+    const nextRequestId = initialSectionRequestIdFromWorkbenchItem(item)
+    // An explicit Preview open is a navigation request even if its original
+    // page is unchanged: the retained surface may have navigated elsewhere.
+    // Metadata updates preserve this ID; Source and immutable previews do not
+    // acquire a new working-document lease. IDs can wrap back to one.
+    const reopenPreview = nextRequestId > 0 && nextRequestId !== this.sectionRequestId
+      && initialSectionFromWorkbenchItem(item) === 'preview'
+      && !!artifact && isActiveDocumentArtifactCandidate(artifact)
+      && !preparedPreviewFromWorkbenchItem(item)
     this.item = item
+    this.requestedPreviewPage = nextPage
+    this.sectionRequestId = nextRequestId
+    if ((previousPage !== nextPage || reopenPreview) && previewLeaseEnabledForItem(item, this.options)) {
+      this.invalidateAnnotationSelectionAttempt()
+      // The Workbench runtime queue also serializes activation, native events and close.
+      try {
+        if (!this.context.isItemOpen()) return
+        await this.replaceLeasePreview()
+      } catch (error) {
+        await this.handleLeaseFailure(error)
+      }
+    }
     const preparedPreview = preparedPreviewFromWorkbenchItem(item)
     if (!preparedPreview) return
     this.defaultMode = 'offline'
@@ -446,6 +478,10 @@ class ArtifactPreviewRuntime implements WorkbenchPanelRuntime {
 
   async handleComponentEvent(event: WorkbenchComponentEvent, item: WorkbenchItem) {
     this.item = item
+    if (event.type === 'preview-page-unknown') {
+      this.context.updateRenderState({ workingFilePageUnknown: true })
+      return
+    }
     if (event.type === 'artifact-document-publish') {
       if (isPreparedImmutableResourcePreview(item)) return
       if (this.context.getRenderState().documentPublishing === true) return
@@ -1301,11 +1337,16 @@ class ArtifactPreviewRuntime implements WorkbenchPanelRuntime {
     this.releaseAnnotationScreenshot()
     promptAnnotations.beginOverlayEdit?.(annotationId, current.sessionKey)
     try {
+      const pagePath = this.lease ? previewPagePathFromUrl(
+        String(this.context.getRenderState().currentUrl || this.lease.launch_url), this.lease,
+      ) : undefined
+      if (this.lease && !pagePath) throw surfaceError('The selected preview page is unavailable')
       created = await promptAnnotations.create({
         annotationId,
         sessionKey: current.sessionKey,
         documentId: current.document.documentId,
         documentName: current.document.name,
+        ...(pagePath && pagePath !== this.lease?.entrypoint ? { pagePath } : {}),
         resourceId: /^(document|deliverable|attachment):/.test(String(this.item.payload.resourceIdentity || ''))
           ? String(this.item.payload.resourceIdentity)
           : `document:${current.document.documentId}`,
@@ -2116,6 +2157,10 @@ class ArtifactPreviewRuntime implements WorkbenchPanelRuntime {
         || !hasNativeLeaseBroker
       )
     ) {
+      if (originalArtifact.previewPagePath) {
+        throw new ArtifactPreviewLeaseError('This Desktop cannot open the requested preview page.',
+          409, 'PREVIEW_PAGE_UNSUPPORTED')
+      }
       this.nativeProtocolVersion = 1
       this.context.updateRenderState({
         compatibilityFallback: true,
@@ -2135,11 +2180,14 @@ class ArtifactPreviewRuntime implements WorkbenchPanelRuntime {
         {
           nativeBroker: nativeApi,
           sessionKey: artifactSessionKey(this.item, this.options),
+          ...(typeof originalArtifact.previewPagePath === 'string'
+            ? { pagePath: originalArtifact.previewPagePath } : {}),
         },
       )
     } catch (error) {
       if (
         error instanceof ArtifactPreviewLeaseError
+        && !originalArtifact.previewPagePath
         && (
           (error.status === 404 && !error.code)
           || error.status === 405
@@ -2168,6 +2216,10 @@ class ArtifactPreviewRuntime implements WorkbenchPanelRuntime {
       previewCollectionStatus: lease.source.collection_status,
       previewLeaseError: '',
       previewLaunchUrl: lease.launch_url,
+      workingFileDocumentId: lease.workingDocumentId || this.currentDocument()?.document.documentId || '',
+      workingFilePageUnknown: false,
+      workingFileEntrypoint: lease.entrypoint,
+      workingFileInitialPage: lease.page_path || lease.entrypoint,
       previewMode: lease.effective_mode,
       previewReadiness: lease.source.collection_status === 'partial'
         || lease.source.warning_codes.length > 0
@@ -2247,6 +2299,7 @@ class ArtifactPreviewRuntime implements WorkbenchPanelRuntime {
     }
     await this.releaseLease()
     this.context.updateRenderState({
+      currentUrl: '',
       effectiveMode: this.mode,
       missingResources: false,
       nativeSurfaceState: 'loading',
@@ -2254,6 +2307,7 @@ class ArtifactPreviewRuntime implements WorkbenchPanelRuntime {
       previewCollectionStatus: 'not_applicable',
       previewLeaseError: '',
       previewLaunchUrl: '',
+      workingFileDocumentId: '',
       previewMode: this.mode,
       previewReadiness: 'loading',
       previewState: 'loading',

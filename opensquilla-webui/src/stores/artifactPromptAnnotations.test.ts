@@ -26,6 +26,19 @@ describe('local page annotation drafts', () => {
     expect(restored.snapshotsForIds(['draft-1'])[0]).not.toHaveProperty('stateRevision')
   })
 
+  it('persists a subpage hint and does not acknowledge a replacement on another page', async () => {
+    const store = useArtifactPromptAnnotationsStore()
+    await store.create({ ...request, pagePath: 'layouts/editorial.html' })
+    const sent = store.snapshotsForIds(['draft-1'])
+    expect(sent[0].pagePath).toBe('layouts/editorial.html')
+    setActivePinia(createPinia())
+    const restored = useArtifactPromptAnnotationsStore()
+    expect(restored.snapshotsForIds(['draft-1'])[0].pagePath).toBe('layouts/editorial.html')
+    await restored.create({ ...request, pagePath: 'layouts/dashboard.html' })
+    restored.acknowledgeSent(sent)
+    expect(restored.annotations['draft-1'].pagePath).toBe('layouts/dashboard.html')
+  })
+
   it('persists the opaque screenshot upload without putting File bytes in local JSON', async () => {
     const store = useArtifactPromptAnnotationsStore()
     await store.create(request)

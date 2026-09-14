@@ -17,6 +17,7 @@ from opensquilla.engine.subagent import (
     SubagentExecutionTarget,
     subagent_task_inline_limit_bytes,
 )
+from opensquilla.execution_workspaces import validate_execution_workspace
 from opensquilla.gateway.routing import build_subagent_route_envelope
 from opensquilla.gateway.session_view import derive_transcript_title
 from opensquilla.provider.auxiliary_budget import resolve_auxiliary_request_budget
@@ -744,6 +745,13 @@ async def sessions_spawn(
                         f"'{parent_session_key}'"
                     )
             create = getattr(mgr, "create", None) or getattr(mgr, "create_session")
+            execution_workspace = getattr(parent_session, "execution_workspace", None)
+            if execution_workspace is not None and "workspace_id" not in create_kwargs:
+                # Freeze the task binding, not a possibly stale run-context cwd.
+                # Queued dispatch revalidates it again after loading the child.
+                create_kwargs["execution_workspace"] = await asyncio.to_thread(
+                    validate_execution_workspace, execution_workspace,
+                )
             created_session = await create(
                 **create_kwargs,
             )

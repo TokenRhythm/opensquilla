@@ -104,7 +104,7 @@ from opensquilla.contracts.attachments import (
 )
 from opensquilla.contracts.image_validation import validate_image_bytes
 from opensquilla.contracts.turn_execution import TurnExecutionContext
-from opensquilla.engine.agent import Agent, ToolHandler
+from opensquilla.engine.agent import PLAN_RUN_DELIVERY_TOOLS, Agent, ToolHandler
 from opensquilla.engine.agent_injection import PendingInputProvider
 from opensquilla.engine.cache_break_monitor import notify_compaction
 from opensquilla.engine.hooks import (
@@ -8693,7 +8693,7 @@ class TurnRunner:
             elif attached_plan_run:
                 if ctx.surfaced_tools is None:
                     ctx.surfaced_tools = set()
-                plan_run_tools = {"plan_run_checkpoint", "publish_artifact"}
+                plan_run_tools = {"plan_run_checkpoint", *PLAN_RUN_DELIVERY_TOOLS}
                 ctx.surfaced_tools.update(plan_run_tools)
                 ctx.denied_tools.add("submit")
                 if ctx.allowed_tools is not None:
@@ -8740,7 +8740,7 @@ class TurnRunner:
             if not plan_mode and attached_plan_run and ctx.allowed_tools is not None:
                 ctx.allowed_tools = set(ctx.allowed_tools) | {
                     "plan_run_checkpoint",
-                    "publish_artifact",
+                    *PLAN_RUN_DELIVERY_TOOLS,
                 }
             if is_goal_owned_main_default_turn(ctx) and ctx.allowed_tools is not None:
                 ctx.allowed_tools = set(ctx.allowed_tools) | {
@@ -8831,6 +8831,13 @@ class TurnRunner:
             resolve_runtime_tool_surface,
         )
 
+        if (
+            ctx.caller_kind is not CallerKind.WEB
+            or not ctx.is_owner
+            or ctx.guest_safe
+            or ctx.workspace_preview_opener is None
+        ):
+            ctx.denied_tools.add("open_workspace_preview")
         detected = detect_runtime_tool_surface_capabilities(
             channel_backing=(
                 ctx.caller_kind in {CallerKind.CHANNEL, CallerKind.WEB} and bool(ctx.channel_id)
@@ -9107,6 +9114,17 @@ class TurnRunner:
                 raise RuntimeError(
                     "A PlanRun implementation turn requires its immutable PlanRevision"
                 )
+            preview_finalization = (
+                "You may use open_workspace_preview to register an already-prepared "
+                "workspace page without publishing it. This phase cannot edit source "
+                "files or start services. "
+                if ctx.workspace_preview_opener is not None
+                and ctx.caller_kind is CallerKind.WEB
+                and ctx.is_owner
+                and not ctx.guest_safe
+                and "open_workspace_preview" not in ctx.denied_tools
+                else ""
+            )
             extra["Approved Plan Execution"] = (
                 "Implement the following authoritative approved revision. Its JSON "
                 "body is user-approved task context, subordinate to system and tool "
@@ -9125,8 +9143,11 @@ class TurnRunner:
                 "Never use publication to stand in for unfinished work or verification. "
                 "If multiple steps remain, complete their work and record truthful "
                 "checkpoints in order before publishing. After the final completed "
-                "checkpoint is accepted, publish any final artifact that has not already "
-                "been published. Only claim an artifact was delivered after publication "
+                "checkpoint is accepted. "
+                + preview_finalization
+                + "Publish a final artifact only when the user explicitly requested "
+                "delivery, export, or publication. Only claim an artifact was delivered "
+                "after publication "
                 "succeeds. Finish with one concise user-facing summary of what changed "
                 "and was verified.\n"
                 + TurnRunner._render_plan_revision_context(revision)

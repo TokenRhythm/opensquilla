@@ -9,6 +9,7 @@ import {
   artifactWorkbenchPreviewKind,
 } from '@/utils/workbench/artifactPreview'
 import type { WorkbenchItem } from './types'
+import { previewPagePathFromUrl } from '@/utils/workbench/previewPagePath'
 
 const BASE64_URL_ALPHABET =
   'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_'
@@ -211,6 +212,31 @@ export function artifactFromWorkbenchItem(
   return artifact && typeof artifact === 'object'
     ? artifact as ArtifactPayload
     : null
+}
+
+/** File operations follow the displayed Document, never a related delivery. */
+export function fileActionArtifactFromWorkbenchItem(
+  item: WorkbenchItem, state: Readonly<Record<string, unknown>>,
+): ArtifactPayload | undefined {
+  const artifact = artifactFromWorkbenchItem(item)
+  if (!artifact) return
+  const prepared = preparedPreviewFromWorkbenchItem(item)
+  if (prepared && prepared.resource.type !== 'document') return artifact
+  const documentId = typeof state.workingFileDocumentId === 'string' && state.workingFileDocumentId
+    ? state.workingFileDocumentId
+    : typeof artifact.documentId === 'string'
+      && item.payload.resourceIdentity === `document:${artifact.documentId}` ? artifact.documentId : ''
+  if (!documentId) return artifact
+  if (state.workingFilePageUnknown === true) return
+  const pagePath = state.previewLaunchUrl ? previewPagePathFromUrl(
+    String(state.currentUrl || state.previewLaunchUrl), {
+      launch_url: String(state.previewLaunchUrl), entrypoint: String(state.workingFileEntrypoint || ''),
+      page_path: String(state.workingFileInitialPage || ''),
+    },
+  ) : artifact.previewPagePath
+  if (state.previewLaunchUrl && !pagePath) return
+  return { ...artifact, source: 'workspace-preview', documentId,
+    ...(pagePath ? { previewPagePath: pagePath } : {}) }
 }
 
 export function navigationArtifactsFromWorkbenchItem(

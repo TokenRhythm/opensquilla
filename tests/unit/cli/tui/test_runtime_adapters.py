@@ -126,6 +126,76 @@ def _patch_standalone_services(monkeypatch: pytest.MonkeyPatch) -> _FakeServices
     return services
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("explicit_workspace", [False, True])
+async def test_standalone_start_and_new_keep_the_effective_cli_workspace(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, explicit_workspace: bool
+) -> None:
+    from opensquilla.cli.tui import standalone_runtime
+    from opensquilla.gateway.execution_workspaces import build_execution_workspace_factory
+
+    monkeypatch.setattr(
+        "opensquilla.gateway.config.default_opensquilla_home", lambda: tmp_path / "profile"
+    )
+    config = GatewayConfig.load(tmp_path / "config.toml", read_only=True)
+    selected = tmp_path / "selected" if explicit_workspace else Path(config.workspace_dir)
+    selected.mkdir(parents=True)
+    storage = await SessionStorage.open(str(tmp_path / "standalone-workspace.db"))
+    manager = SessionManager(
+        storage,
+        execution_workspace_factory=build_execution_workspace_factory(
+            config, profile_home=tmp_path,
+        ),
+    )
+    services = _FakeServices(config=config, session_manager=manager)
+
+    async def fake_build_services() -> _FakeServices:
+        return services
+
+    monkeypatch.setattr("opensquilla.gateway.build_services", fake_build_services)
+    monkeypatch.setattr(
+        "opensquilla.gateway.build_turn_runner_from_services", lambda _services: object()
+    )
+    seen_keys: list[str] = []
+
+    async def stream_response(
+        runner: object, session_key: str, context: Any, message: str, **kwargs: Any
+    ) -> TurnResult:
+        session = await storage.get_session(session_key)
+        assert session.execution_workspace["kind"] == "configured"
+        assert session.execution_workspace["root"] == str(selected.resolve())
+        assert context.workspace_dir == str(selected.resolve())
+        seen_keys.append(session_key)
+        return TurnResult(text="ok")
+
+    async def repl(*, dispatch: Any, **kwargs: Any) -> None:
+        assert await dispatch("first")
+        assert await dispatch("/new")
+        assert await dispatch("second")
+
+    deps = replace(
+        _standalone_deps(
+            stream_response=stream_response,
+            run_concurrent_repl=repl,
+            output_console=_RecordingConsole(),
+            error_panel_factory=lambda message: message,
+        ),
+        slash_services_factory=standalone_runtime.standalone_slash_services_from_runtime,
+    )
+    try:
+        await standalone_runtime.run_standalone_chat(
+            model=None,
+            session_id="agent:main:standalone:initial",
+            workspace=str(selected) if explicit_workspace else None,
+            deps=deps,
+        )
+    finally:
+        await storage.close()
+
+    assert len(seen_keys) == 2
+    assert seen_keys[0] != seen_keys[1]
+
+
 # --- Native terminal output ---------------------------------------------------
 
 

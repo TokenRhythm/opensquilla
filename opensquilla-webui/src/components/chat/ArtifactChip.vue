@@ -1,5 +1,6 @@
 <script setup lang="ts">
-import { computed } from 'vue'
+import { computed, ref } from 'vue'
+import ResourceActionsMenu from '@/components/ResourceActionsMenu.vue'
 import { useI18n } from 'vue-i18n'
 import Icon from '@/components/Icon.vue'
 import type { IconName } from '@/utils/icons'
@@ -9,6 +10,7 @@ const { t } = useI18n()
 
 const props = defineProps<{
   artifact: ArtifactPayload
+  sessionKey?: string
   category: string
   iconName: IconName
   title: string
@@ -24,6 +26,7 @@ const emit = defineEmits<{
   open: [artifact: ArtifactPayload]
   download: [artifact: ArtifactPayload]
 }>()
+const fileMenu = ref<InstanceType<typeof ResourceActionsMenu> | null>(null)
 
 // The card body maps to the primary action: Open when previewable, otherwise
 // Download. A previewable card never downloads on body click; a download-only
@@ -45,7 +48,8 @@ const bodyLabel = computed(() => {
 </script>
 
 <template>
-  <div class="msg-artifact-chip" :data-previewable="previewable ? 'true' : 'false'">
+  <div class="msg-artifact-chip" :data-previewable="previewable ? 'true' : 'false'"
+    @contextmenu="fileMenu?.show($event)" @keydown="fileMenu?.show($event)">
     <button
       type="button"
       class="msg-artifact-body"
@@ -64,6 +68,8 @@ const bodyLabel = computed(() => {
       </span>
     </button>
     <span class="msg-artifact-actions">
+      <ResourceActionsMenu ref="fileMenu" :artifact="artifact" :session-key="sessionKey"
+        :previewable="previewable" trigger @open="emit('open', $event)" />
       <!-- Previewable: an explicit "Open" verb plus an icon-only Download.
            Download-only: a single labelled "Download" action, no Open. -->
       <button

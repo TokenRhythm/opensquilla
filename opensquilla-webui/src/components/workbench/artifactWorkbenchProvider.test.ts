@@ -7,7 +7,10 @@ import type {
 } from '@/platform/types'
 import type { ArtifactPayload } from '@/types/artifacts'
 import { createLegacyArtifactWorkspace } from '@/workbench/artifactDocumentProvider'
-import { createArtifactPreviewWorkbenchItem } from '@/workbench/artifactItems'
+import {
+  createArtifactPreviewWorkbenchItem,
+  requestInitialSectionForWorkbenchItem,
+} from '@/workbench/artifactItems'
 import {
   artifactPayloadFromWorkbenchResource,
   resourceFromPreparedPreview,
@@ -142,6 +145,7 @@ async function createAnnotationDraftHarness(
   showOverlayResult: NativeWorkbenchSurfaceResult = { ok: true },
   atomicCloseRearm = false,
   workingDocumentId?: string,
+  navigatedPage?: string,
 ) {
   let currentHead = { ...artifact }
   const legacy = createLegacyArtifactWorkspace(artifact, 'session-a')
@@ -312,6 +316,12 @@ async function createAnnotationDraftHarness(
     visible: true,
   }, item)
   await runtime.performAction?.('toggle-annotation-mode', item)
+  if (navigatedPage) {
+    await runtime.handleNativeSurfaceEvent?.({
+      version: 3, surfaceId: item.id, type: 'navigation-state',
+      detail: { url: `${lease.preview_origin}/${navigatedPage}` },
+    }, item)
+  }
   await runtime.handleNativeSurfaceEvent?.({
     version: 3,
     surfaceId: item.id,
@@ -360,6 +370,229 @@ async function createAnnotationDraftHarness(
 }
 
 describe('artifact Workbench provider', () => {
+  describe('explicit preview reopen', () => {
+    async function setup(nativeHtml: boolean, options: Partial<Parameters<typeof createArtifactPreviewWorkbenchItem>[0]> = {}) {
+      const renderState: Record<string, unknown> = {}
+      const nativeApi: NativeWorkbenchApi = {
+        getCapabilities: vi.fn<NonNullable<NativeWorkbenchApi['getCapabilities']>>(
+          async () => ({ protocolVersions: [3], modes: ['offline'], maxSurfaces: 8 }),
+        ),
+        createArtifactPreviewLease: vi.fn(), renewArtifactPreviewLease: vi.fn(), revokeArtifactPreviewLease: vi.fn(),
+        createSurface: vi.fn(async () => ({ ok: true })),
+        destroySurface: vi.fn(async () => ({ ok: true })),
+        setSurfaceRect: vi.fn(async () => ({ ok: true })),
+        activateSurface: vi.fn(async () => ({ ok: true })),
+        onSurfaceEvent: vi.fn(() => () => undefined),
+      }
+      let leaseNumber = 0
+      const createLease = vi.fn<ArtifactPreviewAccess['createLease']>(async (_artifact, _mode, _client, request) => ({
+        version: 1, lease_id: `lease-${++leaseNumber}`, effective_mode: 'offline',
+        launch_url: `http://preview.localhost/${request?.pagePath || 'index.html'}?lease=${leaseNumber}`,
+        entrypoint: 'index.html', ...(request?.pagePath ? { page_path: request.pagePath } : {}),
+        preview_origin: 'http://preview.localhost', expires_at: '2099-01-01T00:00:00Z', idle_timeout_seconds: 3600,
+        workingDocumentId: 'doc_reopen',
+        source: { kind: 'bundle', collection_status: 'complete', file_count: 3, total_bytes: 128, warning_codes: [] },
+      }))
+      const item = createArtifactPreviewWorkbenchItem({
+        artifact, nativeHtml, sessionKey: 'session-a', initialSectionRequestId: 1, ...options,
+      })
+      const definition = createArtifactWorkbenchDefinitions({
+        artifactPreviews: { ...testArtifactPreviews, createLease, revokeLease: vi.fn(async () => undefined) },
+        baseOrigin: 'http://localhost', currentSessionId: () => 'session-a',
+        platform: { id: nativeHtml ? 'desktop' : 'web', capabilities: {}, files: {} } as unknown as Platform,
+        previewLeasesEnabled: true, confirmRemoteResources: vi.fn(async () => true),
+        getPreviewPreferences: async () => ({ mode: 'offline', noticeShown: true }),
+        pushToast: vi.fn(), t: key => key,
+      }).find(candidate => candidate.kind === 'artifact-preview')!
+      const runtime = await definition.createRuntime!(item, {
+        nativeWorkbenchApi: nativeHtml ? nativeApi : undefined,
+        getRenderState: () => renderState,
+        updateRenderState: patch => Object.assign(renderState, patch),
+        isItemOpen: () => true, setExpanded: vi.fn(), reportError: vi.fn(),
+      })
+      return { item, runtime, renderState, createLease, nativeApi }
+    }
+
+    for (const nativeHtml of [true, false]) {
+      describe(nativeHtml ? 'native' : 'DOM', () => {
+        it.each([undefined, 'pages/editorial.html'])('navigates back to the same explicit page %s after in-page navigation', async pagePath => {
+          const f = await setup(nativeHtml, { artifact: { ...artifact, ...(pagePath ? { previewPagePath: pagePath } : {}) } })
+          try {
+            expect(f.createLease).toHaveBeenCalledTimes(1)
+            if (nativeHtml) {
+              await f.runtime.handleNativeSurfaceEvent?.({
+                version: 3, surfaceId: f.item.id, type: 'navigation-state',
+                detail: { url: 'http://preview.localhost/dashboard.html' },
+              }, f.item)
+            } else {
+              await f.runtime.handleComponentEvent?.({ type: 'preview-page-unknown' }, f.item)
+            }
+            const next = requestInitialSectionForWorkbenchItem(f.item, f.item)
+            await f.runtime.update?.(next)
+            expect(f.createLease).toHaveBeenCalledTimes(2)
+            expect(f.createLease.mock.lastCall?.[3]?.pagePath).toBe(pagePath)
+            expect(f.renderState.previewLaunchUrl).toBe(`http://preview.localhost/${pagePath || 'index.html'}?lease=2`)
+            expect(f.renderState.currentUrl).toBe('')
+            expect(f.renderState.workingFilePageUnknown).toBe(false)
+            if (nativeHtml) {
+              expect(f.nativeApi.createSurface).toHaveBeenCalledTimes(2)
+              expect(vi.mocked(f.nativeApi.createSurface).mock.lastCall?.[0]).toMatchObject({
+                payload: { launchUrl: f.renderState.previewLaunchUrl },
+              })
+            }
+          } finally { await f.runtime.dispose?.('closed') }
+        })
+
+        it('does not reload on initial, duplicate or metadata-only updates', async () => {
+          const f = await setup(nativeHtml)
+          try {
+            await f.runtime.update?.(f.item)
+            expect(f.createLease).toHaveBeenCalledTimes(1)
+            const next = requestInitialSectionForWorkbenchItem(f.item, f.item)
+            await f.runtime.update?.(next)
+            expect(f.createLease).toHaveBeenCalledTimes(2)
+            const url = f.renderState.previewLaunchUrl
+            await f.runtime.update?.({ ...next, title: 'Updated metadata', payload: { ...next.payload, navigationArtifacts: [] } })
+            await f.runtime.update?.(next)
+            expect(f.createLease).toHaveBeenCalledTimes(2)
+            expect(f.renderState.previewLaunchUrl).toBe(url)
+          } finally { await f.runtime.dispose?.('closed') }
+        })
+
+        it('recognizes a wrapped explicit request id', async () => {
+          const f = await setup(nativeHtml, { initialSectionRequestId: Number.MAX_SAFE_INTEGER })
+          try {
+            const next = requestInitialSectionForWorkbenchItem(f.item, f.item)
+            expect(next.payload.initialSectionRequestId).toBe(1)
+            await f.runtime.update?.(next)
+            expect(f.createLease).toHaveBeenCalledTimes(2)
+          } finally { await f.runtime.dispose?.('closed') }
+        })
+
+        it.each(['source', 'non-HTML', 'prepared', 'zero-id'] as const)('does not navigate for %s updates', async kind => {
+          const f = await setup(nativeHtml, kind === 'non-HTML'
+            ? { artifact: { ...artifact, name: 'notes.txt', mime: 'text/plain' } }
+            : kind === 'prepared' ? { preparedPreview: {
+                protocolVersion: 1, mode: 'isolated', resource: { type: 'attachment', id: 'att_1' },
+                sandboxProfile: 'opaque-offline', network: false, launchUrl: '/prepared/att_1',
+              } } : {})
+          try {
+            const before = f.createLease.mock.calls.length
+            const next = requestInitialSectionForWorkbenchItem(f.item, f.item)
+            await f.runtime.update?.({ ...next, payload: {
+              ...next.payload,
+              ...(kind === 'source' ? { initialSection: 'source' } : {}),
+              ...(kind === 'zero-id' ? { initialSectionRequestId: 0 } : {}),
+            } })
+            expect(f.createLease).toHaveBeenCalledTimes(before)
+          } finally { await f.runtime.dispose?.('closed') }
+        })
+      })
+    }
+  })
+
+  it.each(['known-lease', 'unknown-lease', 'untyped-code'] as const)
+  ('presents only the recognized typed subpage failure for %s', async kind => {
+    const harness = await createAnnotationDraftHarness()
+    const privateDiagnostic = 'private gateway path /internal/fixture-value'
+    if (kind === 'untyped-code') {
+      vi.mocked(harness.nativeApi.getCapabilities!).mockRejectedValue(
+        Object.assign(new Error(privateDiagnostic), { code: 'PREVIEW_PAGE_UNSUPPORTED' }),
+      )
+    } else {
+      vi.mocked(harness.nativeApi.createArtifactPreviewLease!).mockResolvedValue({
+        ok: false, status: 409,
+        code: kind === 'known-lease' ? 'PREVIEW_PAGE_UNSUPPORTED' : 'UNKNOWN_LEASE_FAILURE',
+        message: privateDiagnostic,
+      })
+    }
+    try {
+      await harness.runtime.update?.(createArtifactPreviewWorkbenchItem({
+        artifact: { ...artifact, previewPagePath: 'editorial.html' },
+        nativeHtml: true, sessionKey: 'session-a',
+      }))
+      const expected = kind === 'known-lease'
+        ? 'This client or Gateway does not support opening this subpage directly. Update and try again.'
+        : 'The operation could not be completed. Try again.'
+      await vi.waitFor(() => expect(harness.renderState.previewLeaseError).toBe(expected))
+      expect(harness.renderState.previewBlocked).toBe(true)
+      expect(harness.renderState.previewLeaseError).not.toContain(privateDiagnostic)
+    } finally {
+      await harness.runtime.dispose?.('closed')
+    }
+  })
+
+  it('binds annotation context to the actual navigated subpage', async () => {
+    const harness = await createAnnotationDraftHarness({ ok: true }, false, undefined,
+      'pages/editorial.html')
+    expect(harness.createAnnotation).toHaveBeenCalledWith(expect.objectContaining({
+      pagePath: 'pages/editorial.html',
+    }))
+    await harness.runtime.dispose?.('closed')
+  })
+
+  it('keeps entrypoint annotations compatible with the original page context', async () => {
+    const harness = await createAnnotationDraftHarness()
+    expect(harness.createAnnotation.mock.calls[0]?.[0]).not.toHaveProperty('pagePath')
+    await harness.runtime.dispose?.('closed')
+  })
+
+  it.each(['old-protocol', 'missing-broker'])('does not substitute the homepage for a subpage on %s', async compatibility => {
+    const harness = await createAnnotationDraftHarness()
+    if (compatibility === 'old-protocol') {
+      vi.mocked(harness.nativeApi.getCapabilities!).mockResolvedValue({
+        protocolVersions: [1], modes: ['offline'], maxSurfaces: 8,
+      })
+    } else {
+      harness.nativeApi.createArtifactPreviewLease = undefined
+    }
+    await harness.runtime.update?.(createArtifactPreviewWorkbenchItem({
+      artifact: { ...artifact, previewPagePath: 'editorial.html' },
+      nativeHtml: true, sessionKey: 'session-a',
+    }))
+    await vi.waitFor(() => expect(harness.renderState.previewLeaseError)
+      .toBe('This client or Gateway does not support opening this subpage directly. Update and try again.'))
+    expect(harness.renderState.previewBlocked).toBe(true)
+    expect(harness.renderState.previewLaunchUrl).toBe('')
+    await harness.runtime.dispose?.('closed')
+  })
+
+  it('replaces the same Document surface for subpages and returning to its entrypoint', async () => {
+    const harness = await createAnnotationDraftHarness()
+    const createLease = vi.mocked(harness.nativeApi.createArtifactPreviewLease!)
+    const initial = await createLease.mock.results[0]!.value
+    if (!initial.ok) throw new Error('Expected initial lease')
+    createLease.mockImplementation(async request => ({
+      ...initial,
+      payload: {
+        ...initial.payload,
+        ...(request.pagePath ? { page_path: request.pagePath } : {}),
+        launch_url: `${initial.payload.preview_origin}/${request.pagePath || 'index.html'}`,
+      },
+    }))
+    const openPage = async (previewPagePath?: string) => {
+      const next = createArtifactPreviewWorkbenchItem({
+        artifact: { ...artifact, ...(previewPagePath ? { previewPagePath } : {}) },
+        nativeHtml: true, sessionKey: 'session-a',
+      })
+      expect(next.id).toBe(harness.item.id)
+      await harness.runtime.update?.(next)
+    }
+    await openPage('pages/editorial.html')
+    await vi.waitFor(() => expect(harness.renderState.previewLaunchUrl)
+      .toContain('/pages/editorial.html'))
+    expect(createLease).toHaveBeenLastCalledWith(expect.objectContaining({
+      pagePath: 'pages/editorial.html',
+    }))
+    await openPage('minimal.html')
+    await vi.waitFor(() => expect(harness.renderState.previewLaunchUrl).toContain('/minimal.html'))
+    await openPage()
+    await vi.waitFor(() => expect(harness.renderState.previewLaunchUrl).toContain('/index.html'))
+    expect(createLease.mock.lastCall?.[0]).not.toHaveProperty('pagePath')
+    expect(harness.renderState.currentUrl).toBe('')
+    await harness.runtime.dispose?.('closed')
+  })
+
   it.each([
     'surface-hidden',
     'surface-navigation',
