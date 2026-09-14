@@ -337,6 +337,7 @@ class ArtifactPreviewRuntime implements WorkbenchPanelRuntime {
   private lease: ArtifactPreviewLease | null = null
   private leaseArtifactId = ''
   private requestedPreviewPage: unknown
+  private sectionRequestId: number
   private leaseRenewTimer: ReturnType<typeof setInterval> | null = null
   private readonly nativeRecoveryAttemptedKeys = new Set<string>()
   private nativeRecoveryInFlight: Promise<void> | null = null
@@ -356,6 +357,7 @@ class ArtifactPreviewRuntime implements WorkbenchPanelRuntime {
   ) {
     this.item = item
     this.requestedPreviewPage = artifactFromWorkbenchItem(item)?.previewPagePath
+    this.sectionRequestId = initialSectionRequestIdFromWorkbenchItem(item)
     const preparedPreview = preparedPreviewFromWorkbenchItem(item)
     this.defaultMode = preparedPreview ? 'offline' : preferences.mode
     this.mode = preparedPreview ? 'offline' : preferences.mode
@@ -435,10 +437,21 @@ class ArtifactPreviewRuntime implements WorkbenchPanelRuntime {
 
   async update(item: WorkbenchItem) {
     const previousPage = this.requestedPreviewPage
-    const nextPage = artifactFromWorkbenchItem(item)?.previewPagePath
+    const artifact = artifactFromWorkbenchItem(item)
+    const nextPage = artifact?.previewPagePath
+    const nextRequestId = initialSectionRequestIdFromWorkbenchItem(item)
+    // An explicit Preview open is a navigation request even if its original
+    // page is unchanged: the retained surface may have navigated elsewhere.
+    // Metadata updates preserve this ID; Source and immutable previews do not
+    // acquire a new working-document lease. IDs can wrap back to one.
+    const reopenPreview = nextRequestId > 0 && nextRequestId !== this.sectionRequestId
+      && initialSectionFromWorkbenchItem(item) === 'preview'
+      && !!artifact && isActiveDocumentArtifactCandidate(artifact)
+      && !preparedPreviewFromWorkbenchItem(item)
     this.item = item
     this.requestedPreviewPage = nextPage
-    if (previousPage !== nextPage && previewLeaseEnabledForItem(item, this.options)) {
+    this.sectionRequestId = nextRequestId
+    if ((previousPage !== nextPage || reopenPreview) && previewLeaseEnabledForItem(item, this.options)) {
       this.invalidateAnnotationSelectionAttempt()
       // The Workbench runtime queue also serializes activation, native events and close.
       try {

@@ -17,6 +17,7 @@ from opensquilla.artifacts import (
     ArtifactSource,
     ArtifactStore,
     _read_regular_bundle_file,
+    artifact_mime_for_name,
     collect_artifact_bundle,
 )
 from opensquilla.engine.types import ArtifactEvent
@@ -147,15 +148,16 @@ class GeneratedArtifactAdopter:
             commit = await self.service.get_document_head(str(existing_row[0]))
             created = False
         else:
+            entry_mime = artifact_mime_for_name(entry)
             collected = await asyncio.to_thread(
                 collect_artifact_bundle, entry, workspace_root=root, mode=mode,
-                bundle_root=source_root, read_guard=read_guard,
+                bundle_root=source_root, entry_mime=entry_mime, read_guard=read_guard,
             )
-            artifact_args = {
+            artifact_args: dict[str, Any] = {
                 "session_id": self.session_id,
                 "session_key": self.session_key,
                 "name": entry.name,
-                "mime": "text/html",
+                "mime": entry_mime,
                 "source": "workspace-preview",
                 "visibility": "internal",
             }

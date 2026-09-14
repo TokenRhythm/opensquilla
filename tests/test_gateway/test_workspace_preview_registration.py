@@ -121,6 +121,62 @@ async def test_none_mode_is_html_and_notification_failure_does_not_undo_commit(p
     assert adopter.event_emitter.await_count == 1
 
 
+@pytest.mark.parametrize("suffix,mime", [
+    (".html", "text/html"),
+    (".htm", "text/html"),
+    (".xhtml", "application/xhtml+xml"),
+])
+@pytest.mark.parametrize("mode", ["none", "auto", "directory"])
+async def test_entry_mime_survives_registration_reopen_and_publication(preview, suffix, mime, mode):
+    context, adopter, workspace = preview
+    path = f"site/pages/entry{suffix}"
+    payload = (
+        b'<html xmlns="http://www.w3.org/1999/xhtml"><head>'
+        b'<link rel="stylesheet" href="../style.css" /></head>'
+        b'<body><h1>Live</h1></body></html>'
+    )
+    (workspace / path).write_bytes(payload)
+    collection = {"bundle": mode, **({"bundle_root": "site"} if mode == "directory" else {})}
+    opened = await _open(context, path=path, **collection)
+    head = await adopter.service.get_document_head(opened["documentId"])
+    assert head.revision.media_type == mime
+    ref = adopter.store.get_ref(
+        session_id=context.session_id, artifact_id=head.revision.artifact_id,
+    )
+    assert ref.mime == mime
+    binding = await get_working_files(adopter.service, opened["documentId"])
+    assert binding.entry_mime == mime
+    entry = next(file for file in binding.bundle().files if file.path == binding.entrypoint)
+    assert entry.mime == mime
+    assert entry.data == payload
+
+    reopened = await _open(context, path=path)
+    assert reopened["resourceId"] == opened["resourceId"]
+    assert reopened["created"] is False
+    assert len(await adopter.service.list_revisions(opened["documentId"])) == 1
+    assert context.published_artifacts == []
+    async with adopter.service.repository._read_transaction("test.preview-only") as conn:
+        cursor = await conn.execute("SELECT COUNT(*) FROM document_publications")
+        assert (await cursor.fetchone())[0] == 0
+
+    context.generated_artifact_adopter = adopter
+    adopter.source_paths = context.artifact_source_paths
+    token = current_tool_context.set(context)
+    try:
+        published = json.loads(await publish_artifact(path=path, **collection))
+    finally:
+        current_tool_context.reset(token)
+    event = next(
+        item for item in context.published_artifacts if item["id"] == published["artifact"]["id"]
+    )
+    assert event["mime"] == mime
+    await adopter(ArtifactEvent(**event))
+    documents = await adopter.service.list_documents(
+        session_key=context.session_key, session_id=context.session_id,
+    )
+    assert [document.document_id for document in documents] == [opened["documentId"]]
+
+
 @pytest.mark.parametrize("mode", ["none", "auto", "directory"])
 async def test_persisted_preview_scope_does_not_suppress_sibling_pdf(preview, mode):
     context, adopter, workspace = preview
