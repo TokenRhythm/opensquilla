@@ -77,6 +77,10 @@ RECENTLY_ADDED_ACTIVE_TESTS = {
     "tests/test_gateway/test_workspace_preview_registration.py",
     "tests/test_live_deliverable_acceptance.py",
     "tests/test_tools/test_memory_workspace_ownership.py",
+    # Image budget suites use the provisional floor until a Windows duration refresh.
+    "tests/test_engine/test_agent_image_compaction_budget.py",
+    "tests/test_provider_request_proof_images.py",
+    "tests/test_session/test_compaction_media_budget.py",
     # Artifact source/version regressions use the declared provisional floor.
     "tests/test_engine/test_artifact_delivery_sources.py",
     "tests/test_engine/test_runtime_artifact_context.py",
@@ -148,6 +152,7 @@ RECENTLY_ADDED_ACTIVE_TESTS = {
     "tests/unit/cli/tui/test_opentui_prefs.py",
     "tests/test_cli/test_gateway_client_steer.py",
     "tests/test_cli/test_gateway_client_sessions_contract.py",
+    "tests/test_cli/test_sessions_cmd.py",
     "tests/test_cli/test_skills_search_cmd.py",
     "tests/test_channels/test_admission_reason_persistence.py",
     "tests/test_channels/test_channel_admission.py",

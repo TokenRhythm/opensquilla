@@ -18,6 +18,9 @@ APPROVED_PACKAGE_IMPORTS: frozenset[tuple[str, str]] = frozenset({
     # Format-specific delivery validation reuses canonical attachment MIME and
     # container signatures; contracts remains implementation-free.
     ("artifact_validation.py", "contracts"),
+    # Retained images reuse canonical MIME limits and content validation before
+    # workspace materialization. Contracts never imports the workspace writer.
+    ("attachment_workspace.py", "contracts"),
     # ArtifactSession is a durable lower-level domain. It uses the shared
     # async-SQLite compatibility shim, while Gateway, session lifecycle, and
     # context-bound tools consume its public service without an import cycle.

@@ -61,6 +61,7 @@ class _StubSelector:
 
     def override_model(self, model: str) -> None:
         self.overridden_models.append(model)
+        self.current_model = model
 
     def resolve(self):
         return self.resolve_returns or _StubProvider("resolved-after-override")
@@ -522,7 +523,7 @@ async def test_prompt_assembler_stage_snapshot(
         "cache_breakpoints": case["cache_breakpoints"],
         "request_context_prompt": case["request_context_prompt"],
         "resolved_model": expected_resolved_model,
-        "selector_model": "claude-sonnet-4.5",
+        "selector_model": case.get("model") or "claude-sonnet-4.5",
         "session_id_for_log": case["session_id"],
         "trace_context_session_id": case["session_id"],
         "prompt_report_chars": len(case["final_prompt"]),

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import re
 from collections.abc import AsyncIterator
 from pathlib import Path
@@ -145,6 +146,7 @@ async def test_subagent_image_tool_uses_bound_physical_provider(
 
     import opensquilla.tools  # noqa: F401
     from opensquilla.provider import (
+        ContentBlockImage,
         ProviderRequestCorrelation,
         TextDeltaEvent,
         ToolUseEndEvent,
@@ -184,6 +186,10 @@ async def test_subagent_image_tool_uses_bound_physical_provider(
                 return
 
             main_calls.append(messages)
+            assert self.model == "vision-model"
+            assert correlation is not None
+            assert correlation.call_kind == "subagent.chat"
+            assert correlation.execution_id == "child-execution"
             if len(main_calls) == 1:
                 yield ToolUseStartEvent(tool_use_id="child-image", tool_name="image")
                 yield ToolUseEndEvent(
@@ -254,18 +260,31 @@ async def test_subagent_image_tool_uses_bound_physical_provider(
         ),
     )
 
-    child = parent._make_child_agent(SubagentSpec(task="inspect this"), depth=1)
+    child = parent._make_child_agent(
+        SubagentSpec(task="inspect this"), depth=1, execution_id="child-execution"
+    )
+    assert child.config.provider_id == "fake"
+    assert child.config.model_id == "vision-model"
+    assert child.provider.model == "vision-model"
     events = [event async for event in child.run_turn("Inspect sample.png")]
 
     assert len(main_calls) == 2
-    assert len(auxiliary_calls) == 1
-    assert auxiliary_calls[0][1].physical_attempt_limit == 1
-    assert "Child image description" in str(main_calls[1])
+    assert auxiliary_calls == []
+    images = [
+        block
+        for message in main_calls[1]
+        if isinstance(message.content, list)
+        for block in message.content
+        if isinstance(block, ContentBlockImage)
+    ]
+    assert len(images) == 1
+    assert images[0].media_type == "image/png"
+    assert base64.b64decode(images[0].data, validate=True) == (tmp_path / "sample.png").read_bytes()
     done = next(event for event in reversed(events) if event.kind == "done")
     assert done.text == "Finished"
-    assert done.input_tokens == 17
-    assert done.output_tokens == 5
-    assert done.billed_cost == 0.25
+    assert done.input_tokens == 10
+    assert done.output_tokens == 2
+    assert done.billed_cost == 0.0
     assert child._tool_context is not None
     assert child._tool_context.image_analysis_target is None
 

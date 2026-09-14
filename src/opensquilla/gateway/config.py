@@ -1436,9 +1436,12 @@ class SquillaRouterConfig(BaseSettings):
     estimated_output_savings_pct: float = 0.03
     upgrade_to_c3_compaction_enabled: bool = True
     self_learning: RouterSelfLearningConfig = Field(default_factory=RouterSelfLearningConfig)
+    # Deprecated compatibility fields: active history is retained until compaction;
+    # image routing no longer imposes a separate turn window.
     vision_history_lookback_turns: int = Field(default=8, ge=0)
     vision_history_candidate_turns: int = Field(default=8, ge=0)
     vision_sticky_followup_turns: int = Field(default=3, ge=0)
+    # Deprecated compatibility fields: image context no longer runs a separate gate.
     vision_followup_gate_enabled: bool = True
     vision_followup_gate_tier: str = "c0"
     vision_followup_gate_model: str | None = None
