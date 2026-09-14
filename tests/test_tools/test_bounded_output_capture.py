@@ -1220,3 +1220,332 @@ async def test_process_log_reads_middle_beyond_saved_preview(
     finally:
         await capture.finish_async()
         current_tool_context.reset(token)
+
+
+async def test_successful_exec_does_not_cancel_output_while_disk_write_is_pending(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import threading
+
+    from opensquilla.engine.tool_result_store import ToolOutputSpool
+
+    original_append = ToolOutputSpool.append
+    entered, release = threading.Event(), threading.Event()
+    first = True
+
+    def delayed_append(spool, chunk):
+        nonlocal first
+        if first:
+            first = False
+            entered.set()
+            assert release.wait(timeout=5)
+        original_append(spool, chunk)
+
+    expected = b"x" * 131072 + b"EXPECTED_END"
+    proc = None
+
+    async def create_process(_command, **kwargs):
+        nonlocal proc
+        proc = await asyncio.create_subprocess_exec(
+            sys.executable, "-c",
+            "import sys;sys.stdout.buffer.write(b'x'*131072+b'EXPECTED_END');sys.stdout.flush()",
+            **kwargs,
+        )
+        return proc
+
+    monkeypatch.setattr(ToolOutputSpool, "append", delayed_append)
+    monkeypatch.setattr(shell, "_create_host_shell_subprocess", create_process)
+    monkeypatch.setattr(shell, "_BACKGROUND_KILL_TIMEOUT", 0.05)
+    token = current_tool_context.set(ToolContext(
+        session_key="test-session", tool_result_store_dir=str(tmp_path),
+    ))
+    task = asyncio.create_task(shell._run_host_shell_command(
+        "synthetic output", cwd=None, env=dict(os.environ), stdin_bytes=None,
+        effective_timeout=10,
+    ))
+    try:
+        assert await asyncio.to_thread(entered.wait, 3)
+        assert proc is not None
+        assert await shell._wait_exec_process(proc, 3)
+        # The command already exited; only a healthy disk write remains pending.
+        await asyncio.sleep(0.15)
+    finally:
+        release.set()
+        try:
+            result = await asyncio.wait_for(task, timeout=5)
+        finally:
+            current_tool_context.reset(token)
+    record = _retained_output(ToolResultStore(tmp_path))
+    assert result.startswith("exit_code=0\n")
+    assert record.content.encode() == expected
+    metadata = ToolResultStore(tmp_path).read_output_metadata(
+        record.handle, session_id="test-session",
+    )
+    assert metadata["complete"] is True
+
+
+@pytest.mark.parametrize("error_type", [OSError, RuntimeError])
+async def test_background_reader_failure_finalizes_partial_log_and_releases_lease(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, error_type: type[Exception],
+) -> None:
+    from types import SimpleNamespace
+
+    class FailedReader:
+        calls = 0
+
+        async def read(self, size):
+            self.calls += 1
+            if self.calls == 1:
+                return b"saved before pipe failure\n"
+            raise error_type("synthetic output read failure")
+
+    async def exited():
+        return 0
+
+    proc = SimpleNamespace(returncode=0, stdout=FailedReader(), wait=exited, pid=99999999)
+
+    async def create_process(*args, **kwargs):
+        return proc
+
+    monkeypatch.setattr(shell, "_create_host_shell_subprocess", create_process)
+    monkeypatch.setattr(shell, "capture_process_tree_owner", lambda *args, **kwargs: None)
+    token = current_tool_context.set(ToolContext(
+        session_key="test-session", tool_result_store_dir=str(tmp_path),
+    ))
+    session = None
+    try:
+        result = await shell._start_host_background_process(
+            "synthetic command", cwd=None, effective_timeout=10, runtime=None,
+        )
+        session_id = result.splitlines()[0].split("=", 1)[1]
+        session = shell._bg_sessions[session_id]
+        cleaned = []
+        session.cleanup_callbacks.append(lambda: cleaned.append("cleanup"))
+        if error_type is OSError:
+            await session.collector_task
+        else:
+            with pytest.raises(error_type, match="synthetic output read failure"):
+                await session.collector_task
+        assert cleaned == ["cleanup"]
+        assert session.done
+        assert session.returncode == 0
+        capture = session.output_capture
+        assert capture.finished and capture.spool.lease.closed
+        store = ToolResultStore(tmp_path)
+        metadata = store.read_output_metadata(capture.handle, session_id="test-session")
+        assert metadata["complete"] is False
+        assert store.read(capture.handle, session_id="test-session").content == (
+            "saved before pipe failure\n"
+        )
+    finally:
+        if session is not None:
+            await session.output_capture.finish_async()
+            shell._bg_sessions.pop(session.session_id, None)
+        current_tool_context.reset(token)
+
+
+@pytest.mark.parametrize("native_pipe", [False, True])
+async def test_post_exit_output_idle_timer_restarts_after_each_chunk(
+    tmp_path: Path, native_pipe: bool,
+) -> None:
+    read_fd = write_fd = None
+    stream_reader = asyncio.StreamReader()
+    if native_pipe:
+        read_fd, write_fd = os.pipe()
+        reader = shell._NonblockingOutputPipe(read_fd)
+    else:
+        reader = stream_reader
+    capture = BoundedOutputCapture()
+    capture.spool = _spool(ToolResultStore(tmp_path))
+    exited = asyncio.Event()
+    exited.set()
+    task = asyncio.create_task(capture.drain(reader, process_exited=exited, idle_timeout=0.05))
+    expected = b""
+    try:
+        # Total post-exit output time exceeds the idle allowance several times.
+        for index in range(20):
+            chunk = f"line {index}\n".encode()
+            expected += chunk
+            if write_fd is not None:
+                os.write(write_fd, chunk)
+            else:
+                stream_reader.feed_data(chunk)
+            await asyncio.sleep(0.01)
+            assert not task.done()
+        if write_fd is not None:
+            os.close(write_fd)
+            write_fd = None
+        else:
+            stream_reader.feed_eof()
+        await asyncio.wait_for(task, timeout=1)
+        await capture.finish_async()
+        record = _retained_output(ToolResultStore(tmp_path))
+        assert record.content.encode() == expected
+        assert capture.describe()["retained_output_complete"] is True
+    finally:
+        if not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        await capture.finish_async()
+        for fd in (read_fd, write_fd):
+            if fd is not None:
+                os.close(fd)
+
+
+@pytest.mark.parametrize("native_pipe", [False, True])
+async def test_quiet_output_is_limited_only_after_process_exit(
+    tmp_path: Path, native_pipe: bool,
+) -> None:
+    read_fd = write_fd = None
+    stream_reader = asyncio.StreamReader()
+    if native_pipe:
+        read_fd, write_fd = os.pipe()
+        reader = shell._NonblockingOutputPipe(read_fd)
+    else:
+        reader = stream_reader
+    capture = BoundedOutputCapture()
+    capture.spool = _spool(ToolResultStore(tmp_path))
+    exited = asyncio.Event()
+    task = asyncio.create_task(capture.drain(reader, process_exited=exited, idle_timeout=0.03))
+    try:
+        await asyncio.sleep(0.1)
+        assert not task.done()
+        exited.set()
+        # Keep the pipe open without more output, like an inherited daemon handle.
+        await asyncio.wait_for(task, timeout=1)
+        await capture.finish_async()
+        assert capture.describe()["retained_output_complete"] is False
+        assert capture.incomplete_reason == "output pipe remained open after process exit"
+        assert capture.spool.lease.closed
+    finally:
+        if not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        await capture.finish_async()
+        for fd in (read_fd, write_fd):
+            if fd is not None:
+                os.close(fd)
+
+
+async def test_stop_returns_promptly_while_received_output_finishes_saving(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import threading
+
+    from opensquilla.engine.cancellation import cancel_task
+
+    capture = BoundedOutputCapture()
+    capture.spool = _spool(ToolResultStore(tmp_path))
+    original_append = capture.spool.append
+    entered, release = threading.Event(), threading.Event()
+
+    def delayed_append(chunk):
+        entered.set()
+        assert release.wait(timeout=5)
+        original_append(chunk)
+
+    monkeypatch.setattr(capture.spool, "append", delayed_append)
+    reader = asyncio.StreamReader()
+    reader.feed_data(b"output already read before Stop")
+    reader.feed_eof()
+
+    async def collect():
+        try:
+            await capture.drain(reader)
+        finally:
+            await capture.finish_async()
+
+    task = asyncio.create_task(collect())
+    try:
+        assert await asyncio.to_thread(entered.wait, 1)
+        settled = await asyncio.wait_for(cancel_task(
+            task, policy="bounded", operation="test-output-stop", grace_seconds=0.01,
+        ), timeout=1)
+        assert settled is False
+        assert not task.done()
+        assert not capture.spool.lease.closed
+        task.cancel()  # A second Stop must not abandon the in-flight write.
+        await asyncio.sleep(0)
+    finally:
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, timeout=2)
+    assert capture.spool.lease.closed
+    record = _retained_output(ToolResultStore(tmp_path))
+    assert record.content == "output already read before Stop"
+    assert capture.describe()["retained_output_complete"] is False
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Native Windows stdin and pipe behavior")
+async def test_windows_stdin_exec_retains_output_through_slow_disk(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import time
+
+    from opensquilla.engine.tool_result_store import ToolOutputSpool
+
+    original_append = ToolOutputSpool.append
+    first = True
+
+    def delayed_append(spool, chunk):
+        nonlocal first
+        if first:
+            first = False
+            time.sleep(0.15)
+        original_append(spool, chunk)
+
+    def create_process(_command, **kwargs):
+        return subprocess.Popen([
+            sys.executable, "-c",
+            "import sys;data=sys.stdin.buffer.read();"
+            "sys.stdout.buffer.write(data+b'EXPECTED_END');sys.stdout.flush()",
+        ], **kwargs)
+
+    monkeypatch.setattr(ToolOutputSpool, "append", delayed_append)
+    monkeypatch.setattr(shell, "_create_windows_host_shell_process", create_process)
+    monkeypatch.setattr(shell, "_BACKGROUND_KILL_TIMEOUT", 0.05)
+    token = current_tool_context.set(ToolContext(
+        session_key="test-session", tool_result_store_dir=str(tmp_path),
+    ))
+    expected = b"input and output\n" * 20000
+    try:
+        result = await asyncio.wait_for(shell._run_windows_host_shell_command_with_stdin(
+            "synthetic command", cwd=None, env=dict(os.environ), stdin_bytes=expected,
+            effective_timeout=10,
+        ), timeout=15)
+    finally:
+        current_tool_context.reset(token)
+    record = _retained_output(ToolResultStore(tmp_path))
+    assert result.startswith("exit_code=0\n")
+    assert record.content.encode() == expected + b"EXPECTED_END"
+    metadata = ToolResultStore(tmp_path).read_output_metadata(
+        record.handle, session_id="test-session",
+    )
+    assert metadata["complete"] is True
+
+
+async def test_windows_pipe_setup_failure_closes_both_descriptors(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original_pipe = os.pipe
+    descriptors = []
+
+    def create_pipe():
+        pair = original_pipe()
+        descriptors.extend(pair)
+        return pair
+
+    def fail_nonblocking(fd, blocking):
+        raise OSError("synthetic pipe setup failure")
+
+    monkeypatch.setattr(os, "pipe", create_pipe)
+    monkeypatch.setattr(os, "set_blocking", fail_nonblocking)
+    result = await shell._run_windows_host_shell_command_with_stdin(
+        "synthetic command", cwd=None, env=dict(os.environ), stdin_bytes=b"input",
+        effective_timeout=1,
+    )
+    assert "synthetic pipe setup failure" in result
+    assert len(descriptors) == 2
+    for fd in descriptors:
+        with pytest.raises(OSError):
+            os.fstat(fd)

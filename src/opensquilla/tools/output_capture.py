@@ -7,11 +7,12 @@ Physical storage failures remain explicit while readers continue draining pipes.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import struct
 import threading
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
 from opensquilla.engine.tool_result_store import (
     ToolOutputSpool,
@@ -28,6 +29,10 @@ from opensquilla.tools.types import current_execution_log, current_tool_context
 OUTPUT_PREVIEW_BYTES = 1024 * 1024
 OUTPUT_READ_BYTES = 64 * 1024
 _OUTPUT_FRAME_HEADER = struct.Struct(">BI")
+
+
+class OutputReader(Protocol):
+    async def read(self, n: int) -> bytes: ...
 
 
 @dataclass
@@ -164,15 +169,62 @@ class BoundedOutputCapture:
                 except OSError as exc:
                     self.storage_error = type(exc).__name__
 
-    async def drain(self, reader: asyncio.StreamReader | None, stream: str = "stdout") -> None:
+    async def drain(
+        self, reader: OutputReader | None, stream: str = "stdout", *,
+        process_exited: asyncio.Event | None = None, idle_timeout: float = 1.0,
+    ) -> None:
         if reader is None:
             return
+        exited = (
+            asyncio.create_task(process_exited.wait()) if process_exited is not None else None
+        )
         try:
-            while chunk := await reader.read(OUTPUT_READ_BYTES):
-                await asyncio.to_thread(self.feed, chunk, stream)
-        except (asyncio.CancelledError, OSError):
+            while True:
+                reading = asyncio.create_task(reader.read(OUTPUT_READ_BYTES))
+                try:
+                    if exited is not None and not exited.done():
+                        await asyncio.wait({reading, exited}, return_when=asyncio.FIRST_COMPLETED)
+                    if exited is not None and exited.done() and not reading.done():
+                        chunk = await asyncio.wait_for(reading, timeout=idle_timeout)
+                    else:
+                        chunk = await reading
+                finally:
+                    if not reading.done():
+                        reading.cancel()
+                        with contextlib.suppress(asyncio.CancelledError):
+                            await reading
+                if not chunk:
+                    break
+                # The idle deadline applies only to waiting for pipe data, never
+                # to a healthy write or its wait for an executor worker.
+                writing = asyncio.create_task(asyncio.to_thread(self.feed, chunk, stream))
+                try:
+                    await asyncio.shield(writing)
+                except asyncio.CancelledError:
+                    # Keep ownership of this already-read chunk until its write
+                    # settles. The turn's existing cancellation grace can park us.
+                    while not writing.done():
+                        try:
+                            await asyncio.shield(writing)
+                        except asyncio.CancelledError:
+                            continue
+                    writing.result()
+                    raise
+        except TimeoutError:
+            self.incomplete_reason = "output pipe remained open after process exit"
+        except OSError as exc:
+            self.incomplete_reason = f"output read failed ({type(exc).__name__})"
+        except asyncio.CancelledError:
             self.incomplete_reason = "output drain interrupted"
             raise
+        except Exception as exc:
+            self.incomplete_reason = f"output capture failed ({type(exc).__name__})"
+            raise
+        finally:
+            if exited is not None and not exited.done():
+                exited.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await exited
 
     def preview(self, stream: str = "stdout") -> str:
         with self._lock:

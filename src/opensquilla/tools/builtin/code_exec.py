@@ -1253,23 +1253,39 @@ async def execute_code(
         )
         process_started = True
         process_tree = capture_process_tree_owner(proc, isolated=True)
-        stdout_task = asyncio.create_task(capture.drain(proc.stdout, "stdout"))
-        stderr_task = asyncio.create_task(capture.drain(proc.stderr, "stderr"))
         timed_out = False
         from opensquilla.tools.builtin.shell import (
-            _await_bg_output_task,
+            _BACKGROUND_KILL_TIMEOUT,
             _terminate_exec_process_tree,
             _wait_exec_process,
         )
 
+        process_exited = asyncio.Event()
+        stdout_task = asyncio.create_task(capture.drain(
+            proc.stdout, "stdout", process_exited=process_exited,
+            idle_timeout=_BACKGROUND_KILL_TIMEOUT,
+        ))
+        stderr_task = asyncio.create_task(capture.drain(
+            proc.stderr, "stderr", process_exited=process_exited,
+            idle_timeout=_BACKGROUND_KILL_TIMEOUT,
+        ))
+
         try:
             timed_out = not await _wait_exec_process(proc, timeout)
         finally:
-            await asyncio.shield(_terminate_exec_process_tree(proc, process_tree))
-            await asyncio.gather(
-                _await_bg_output_task(stdout_task), _await_bg_output_task(stderr_task),
-            )
-            await capture.finish_async()
+            try:
+                await asyncio.shield(_terminate_exec_process_tree(proc, process_tree))
+            finally:
+                process_exited.set()
+                try:
+                    results = await asyncio.gather(
+                        stdout_task, stderr_task, return_exceptions=True,
+                    )
+                    for result in results:
+                        if isinstance(result, BaseException):
+                            raise result
+                finally:
+                    await capture.finish_async()
         elapsed_ms = (time.monotonic_ns() - start_ns) // 1_000_000
         stderr = capture.preview("stderr")
         if timed_out:

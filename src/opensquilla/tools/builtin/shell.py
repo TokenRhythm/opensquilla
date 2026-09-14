@@ -156,7 +156,6 @@ from opensquilla.subprocess_encoding import apply_utf8_child_env
 from opensquilla.tools.builtin.shell_policy import PolicyResult as SafeBinPolicyResult
 from opensquilla.tools.builtin.shell_policy import check_safe_bin
 from opensquilla.tools.output_capture import (
-    OUTPUT_READ_BYTES,
     BoundedOutputCapture,
 )
 from opensquilla.tools.path_policy import reject_foreign_host_path
@@ -5964,8 +5963,11 @@ def _require_bg_session(session_id: str | None) -> _BgSession:
     return session
 
 
-async def _read_bg_output(session: _BgSession) -> None:
-    await session.output_capture.drain(session.process.stdout)
+async def _read_bg_output(session: _BgSession, process_exited: asyncio.Event) -> None:
+    await session.output_capture.drain(
+        session.process.stdout, process_exited=process_exited,
+        idle_timeout=_BACKGROUND_KILL_TIMEOUT,
+    )
 
 
 def _bg_rendered_output(session: _BgSession) -> str:
@@ -6171,15 +6173,19 @@ async def _cancel_exec_stdin_writer(proc: Any, writer_task: asyncio.Task[None] |
         await writer_task
 
 
-async def _await_bg_output_task(output_task: asyncio.Task[None]) -> bool:
-    try:
-        await asyncio.wait_for(output_task, timeout=_BACKGROUND_KILL_TIMEOUT)
-        return True
-    except TimeoutError:
-        output_task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await output_task
-        return False
+class _NonblockingOutputPipe:
+    def __init__(self, fd: int) -> None:
+        os.set_blocking(fd, False)
+        self.fd = fd
+
+    async def read(self, n: int) -> bytes:
+        while True:
+            try:
+                return os.read(self.fd, n)
+            except BlockingIOError:
+                await asyncio.sleep(0.01)
+            except BrokenPipeError:
+                return b""
 
 
 def _create_windows_host_shell_process(command: str, **kwargs: Any) -> Any:
@@ -6260,13 +6266,13 @@ async def _run_windows_host_shell_command_with_stdin(
 ) -> str:
     capture = await BoundedOutputCapture.create("exec")
     read_fd, write_fd = os.pipe()
-    output_task: asyncio.Task[None] | None = None
     try:
         # A pipe keeps Windows communicate(input=...) on its proven worker
         # path without letting communicate accumulate stdout or an unlimited
         # temporary file. The reader applies backpressure one chunk at a time.
         with os.fdopen(read_fd, "rb", buffering=0) as reader:
             with os.fdopen(write_fd, "wb", buffering=0) as writer:
+                output_reader = _NonblockingOutputPipe(reader.fileno())
                 creationflags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
                 proc = _create_windows_host_shell_process(
                     command, stdin=subprocess.PIPE, stdout=writer, stderr=subprocess.STDOUT,
@@ -6276,20 +6282,24 @@ async def _run_windows_host_shell_command_with_stdin(
                 on_process_started()
             process_tree = capture_process_tree_owner(proc, isolated=os.name == "nt")
 
-            def drain_output() -> None:
-                while chunk := reader.read(OUTPUT_READ_BYTES):
-                    capture.feed(chunk)
-
-            output_task = asyncio.create_task(asyncio.to_thread(drain_output))
+            process_exited = asyncio.Event()
+            output_task = asyncio.create_task(capture.drain(
+                output_reader, process_exited=process_exited,
+                idle_timeout=_BACKGROUND_KILL_TIMEOUT,
+            ))
             try:
                 completed = await _communicate_windows_host_shell_process(
                     proc, process_tree, stdin_bytes, effective_timeout,
                 )
             finally:
-                await asyncio.shield(_terminate_exec_process_tree(proc, process_tree))
-                if not await _await_bg_output_task(output_task):
-                    capture.incomplete_reason = "output drain interrupted"
-                await capture.finish_async()
+                try:
+                    await asyncio.shield(_terminate_exec_process_tree(proc, process_tree))
+                finally:
+                    process_exited.set()
+                    try:
+                        await output_task
+                    finally:
+                        await capture.finish_async()
             if not completed:
                 return (
                     _exec_timeout_output(effective_timeout, command, capture.preview())
@@ -6356,7 +6366,11 @@ async def _run_host_shell_command(
         if on_process_started is not None:
             on_process_started()
         process_tree = capture_process_tree_owner(proc, isolated=True)
-        output_task = asyncio.create_task(capture.drain(proc.stdout))
+        process_exited = asyncio.Event()
+        output_task = asyncio.create_task(capture.drain(
+            proc.stdout, process_exited=process_exited,
+            idle_timeout=_BACKGROUND_KILL_TIMEOUT,
+        ))
         stdin_writer: asyncio.Task[None] | None = None
         completed = False
         try:
@@ -6373,10 +6387,15 @@ async def _run_host_shell_command(
         except TimeoutError:
             pass
         finally:
-            await _cancel_exec_stdin_writer(proc, stdin_writer)
-            await asyncio.shield(_terminate_exec_process_tree(proc, process_tree))
-            await _await_bg_output_task(output_task)
-            await capture.finish_async()
+            try:
+                await _cancel_exec_stdin_writer(proc, stdin_writer)
+                await asyncio.shield(_terminate_exec_process_tree(proc, process_tree))
+            finally:
+                process_exited.set()
+                try:
+                    await output_task
+                finally:
+                    await capture.finish_async()
         if not completed:
             return (
                 _exec_timeout_output(effective_timeout, command, capture.preview())
@@ -6985,16 +7004,19 @@ async def _start_host_background_process(
     _bg_sessions[session_id] = session
 
     async def _collect_host() -> None:
-        output_task = asyncio.create_task(_read_bg_output(session))
+        process_exited = asyncio.Event()
+        output_task = asyncio.create_task(_read_bg_output(session, process_exited))
         try:
-            await asyncio.wait_for(proc.wait(), timeout=effective_timeout)
-        except TimeoutError:
-            session.timed_out = True
-            await _terminate_bg_session(session)
-            session.output_lines.append(f"[timeout after {effective_timeout}s]\n")
+            if not await _wait_exec_process(proc, effective_timeout):
+                session.timed_out = True
+                await _terminate_bg_session(session)
+                session.output_lines.append(f"[timeout after {effective_timeout}s]\n")
         finally:
-            await _await_bg_output_task(output_task)
-            await _finalize_bg_session_async(session)
+            process_exited.set()
+            try:
+                await output_task
+            finally:
+                await _finalize_bg_session_async(session)
 
     session.collector_task = asyncio.create_task(_collect_host())
     return _background_process_result(session)
@@ -7343,16 +7365,19 @@ async def background_process(
             _bg_sessions[session_id] = session
 
             async def _collect_restricted() -> None:
-                output_task = asyncio.create_task(_read_bg_output(session))
+                process_exited = asyncio.Event()
+                output_task = asyncio.create_task(_read_bg_output(session, process_exited))
                 try:
-                    await asyncio.wait_for(spawned.process.wait(), timeout=effective_timeout)
-                except TimeoutError:
-                    session.timed_out = True
-                    await _terminate_bg_session(session)
-                    session.output_lines.append(f"[timeout after {effective_timeout}s]\n")
+                    if not await _wait_exec_process(spawned.process, effective_timeout):
+                        session.timed_out = True
+                        await _terminate_bg_session(session)
+                        session.output_lines.append(f"[timeout after {effective_timeout}s]\n")
                 finally:
-                    await _await_bg_output_task(output_task)
-                    await _finalize_bg_session_async(session)
+                    process_exited.set()
+                    try:
+                        await output_task
+                    finally:
+                        await _finalize_bg_session_async(session)
 
             session.collector_task = asyncio.create_task(_collect_restricted())
             return _background_process_result(session)
