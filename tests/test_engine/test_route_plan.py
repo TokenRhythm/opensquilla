@@ -248,14 +248,20 @@ def test_route_plan_freezes_text_candidates_aliases_ensemble_and_winner() -> Non
     assert event.router_tier_snapshot == snapshot
 
 
-def test_route_plan_freezes_configured_image_candidates_without_legacy_tier() -> None:
+@pytest.mark.parametrize(
+    "image_metadata",
+    [{"routing_source": "image_route"}, {"image_context_has_images": True}],
+)
+def test_route_plan_freezes_configured_image_candidates_without_legacy_tier(
+    image_metadata: dict[str, object],
+) -> None:
     turn = _turn()
     turn.metadata.update(
         {
             "routed_tier": "c0",
             "routed_provider": "image-provider",
             "routed_model": "image/winner",
-            "routing_source": "image_route",
+            **image_metadata,
         }
     )
     turn.config = SimpleNamespace(

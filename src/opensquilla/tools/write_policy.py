@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import re
+from collections.abc import Callable
 from dataclasses import dataclass
 from fnmatch import fnmatchcase
 from pathlib import Path
@@ -413,6 +414,32 @@ def gate_workspace_write_deny(
     error = SafeToolError(str(workspace_write_deny_block(tool_name, match)["message"]))
     error.policy_gate_denial = True
     raise error
+
+
+def attachment_workspace_write_authorizer(context: ToolContext) -> Callable[[Path], None]:
+    """Bind attachment writes to the turn that authorized their retention."""
+
+    def authorize_write(target: Path) -> None:
+        from opensquilla.tools.builtin import filesystem
+
+        token = current_tool_context.set(context)
+        try:
+            if not context.workspace_dir:
+                raise SafeToolError("Attachment workspace is unavailable")
+            workspace = Path(context.workspace_dir).expanduser().resolve()
+            filesystem._gate_workspace_lockdown_write("image", target, str(target))
+            block = filesystem._sandbox_path_access_envelope(target, write=True)
+            if block is None:
+                block = filesystem._cross_session_attachment_block("image", target, str(target))
+            if block is not None:
+                raise SafeToolError(
+                    str(block.get("message") or "Attachment workspace is not writable")
+                )
+            gate_workspace_write_deny("image", target, workspace=workspace)
+        finally:
+            current_tool_context.reset(token)
+
+    return authorize_write
 
 
 def _deny_retry_guidance(ctx: ToolContext | None = None) -> str:

@@ -280,7 +280,9 @@ async def test_runner_replay_respects_image_retention_after_sqlite_reload(
     cancel,
     persist,
 ):
-    payload = base64.b64encode(b"synthetic-transient-screenshot").decode("ascii")
+    from tests.helpers.image_bytes import image_bytes
+
+    payload = base64.b64encode(image_bytes()).decode("ascii")
     path = tmp_path / "sessions.db"
     storage = SessionStorage(str(path))
     await storage.connect()
