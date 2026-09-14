@@ -253,10 +253,6 @@ class ToolContext:
         default=None, repr=False,
     )
     workspace_preview_scopes: list[dict[str, str]] = field(default_factory=list, repr=False)
-    # Process-local, turn-bound callback; never included in a public wire schema.
-    tool_result_snapshot_writer: ToolResultSnapshotWriter | None = field(
-        default=None, repr=False
-    )
 
     def __post_init__(self) -> None:
         self.validate_path_roots()
@@ -278,6 +274,12 @@ class ToolContext:
             "scratch_dir must not equal or contain workspace_dir; use a disjoint "
             "scratch root or a dedicated scratch subdirectory inside the workspace"
         )
+
+    # Process-local, turn-bound callback; never included in a public wire schema.
+    # Keep this declaration last so runtime fields above retain their positions.
+    tool_result_snapshot_writer: ToolResultSnapshotWriter | None = field(
+        default=None, repr=False
+    )
 
 
 def is_goal_owned_main_default_turn(ctx: ToolContext | None) -> bool:

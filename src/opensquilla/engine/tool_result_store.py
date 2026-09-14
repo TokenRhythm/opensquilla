@@ -225,13 +225,11 @@ class ToolResultStore:
         content_name = str(meta.get("content_file") or TOOL_RESULT_CONTENT_NAME)
         storage_encoding = str(meta.get("storage_encoding") or "utf-8")
         content_path = record_dir / content_name
+        # Hash the stored bytes without text-mode CRLF/CR newline conversion.
+        payload = content_path.read_bytes()
         if storage_encoding == "gzip+utf-8":
-            content = gzip.decompress(content_path.read_bytes()).decode("utf-8")
-        else:
-            # Universal newline conversion changes both the hash and raw_slice
-            # offsets for CRLF bodies. Decode the exact bytes that were stored.
-            content = content_path.read_bytes().decode("utf-8")
-        payload = content.encode("utf-8")
+            payload = gzip.decompress(payload)
+        content = payload.decode("utf-8")
         sha = hashlib.sha256(payload).hexdigest()
         if meta.get("session_id") != session_id:
             raise ValueError("tool result session mismatch")
