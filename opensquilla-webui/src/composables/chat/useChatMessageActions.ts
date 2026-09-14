@@ -49,7 +49,20 @@ export interface UseChatMessageActionsOptions {
   notifyEditBlocked?: () => void
 }
 
+interface EditRestorePoint {
+  /** The transcript as it stood before edit truncated it. */
+  messages: ChatMessage[]
+  /** Whatever the composer held before edit overwrote it with the message. */
+  inputText: string
+  /** What edit put in the composer, so cancel can tell it apart from newer text. */
+  editedText: string
+  /** Ties the restore point to the edit that made it; see `cancelEdit`. */
+  forkBeforeMessageId: string
+}
+
 export function useChatMessageActions(options: UseChatMessageActionsOptions) {
+  let editRestorePoint: EditRestorePoint | null = null
+
   function copyableMessageText(message: ChatRenderedMessage): string {
     // User bubbles render the raw text with only the time prefix stripped, so
     // copy must match: the markdown sanitizers would truncate or strip literal
@@ -205,6 +218,17 @@ export function useChatMessageActions(options: UseChatMessageActionsOptions) {
       return
     }
     const text = sourceMessage.text || ''
+    // Everything below this line is undone by `cancelEdit`. Entering edit mode
+    // is not a decision the user has confirmed — the transcript shrinks to
+    // nothing on the first click, and until #1372 there was no way back:
+    // Escape cleared the composer and left the empty state on screen, which
+    // reads as the conversation having been deleted.
+    editRestorePoint = {
+      messages: options.messages.value,
+      inputText: options.inputText.value,
+      editedText: text,
+      forkBeforeMessageId,
+    }
     options.pendingForkBeforeMessageId.value = forkBeforeMessageId
     options.messages.value = options.messages.value.slice(0, msgIndex)
     options.inputText.value = text
@@ -212,9 +236,46 @@ export function useChatMessageActions(options: UseChatMessageActionsOptions) {
     options.focusComposer()
   }
 
+  /**
+   * Put the transcript and the draft back, if an edit is still uncommitted.
+   *
+   * Returns whether anything was restored, so a caller can tell an edit
+   * cancellation apart from an ordinary Escape and act on only one of them.
+   *
+   * The restore point is only honoured while `pendingForkBeforeMessageId` still
+   * holds the id the edit set. Sending consumes that id, and a second edit
+   * replaces it; in both cases the truncation has been made real by something
+   * the user did mean, and resurrecting the old array would put back messages
+   * the server no longer has.
+   */
+  function cancelEdit(): boolean {
+    const restore = editRestorePoint
+    if (!restore) return false
+    if (options.pendingForkBeforeMessageId.value !== restore.forkBeforeMessageId) {
+      // Drifted, so there is nothing safe to restore — but the point stays.
+      // Escape now consults this on every press, and discarding the undo on a
+      // press that could not use it would silently spend the one exit the user
+      // has.
+      return false
+    }
+    editRestorePoint = null
+    options.pendingForkBeforeMessageId.value = null
+    options.messages.value = restore.messages
+    // Only put the old draft back over the text this edit itself wrote.
+    // Anything else in the composer arrived afterwards — a message popped off
+    // the pending queue, a draft recovered from a rejected send — and belongs
+    // to the user, not to the edit being cancelled.
+    if (options.inputText.value === restore.editedText) {
+      options.inputText.value = restore.inputText
+    }
+    options.autoResizeTextarea()
+    return true
+  }
+
   return {
     copyMessage,
     regenerateMessage,
     editMessage,
+    cancelEdit,
   }
 }
