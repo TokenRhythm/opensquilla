@@ -58,7 +58,7 @@
         <div class="control-stat__hint">{{ costLine }}</div>
       </button>
 
-      <div class="control-stat control-stat--static">
+      <div class="control-stat control-stat--static" :title="t('sessions.overview.totalSessionsTitle')">
         <div class="control-stat__label">{{ t('sessions.overview.totalSessions') }}</div>
         <div class="control-stat__value">{{ sessionsCount }}</div>
       </div>
