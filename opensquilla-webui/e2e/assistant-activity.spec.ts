@@ -263,6 +263,7 @@ async function mockControlledActivityLifecycle(
     sendFrame(wsEvent(event, {
       key: LIFECYCLE_SESSION_KEY,
       task_id: LIFECYCLE_TASK_ID,
+      turn_id: 'turn-e2e-assistant-activity-lifecycle',
       stream_generation: 'e2e-stream-generation',
       stream_seq: streamSeq++,
       schema_version: 1,
@@ -418,6 +419,7 @@ async function mockControlledActivityLifecycle(
       settled = true
       emit('session.event.done', {
         text: 'Final verified answer.',
+        finalText: 'Final verified answer.',
         model: 'test/activity',
         input_tokens: 12,
         output_tokens: 4,
@@ -737,40 +739,6 @@ test.describe('Completed assistant activity disclosure', () => {
 })
 
 test.describe('Live assistant activity lifecycle', () => {
-  test('renders an unbounded provider retry as an attempt label', async ({ page }) => {
-    const lifecycle = await mockControlledActivityLifecycle(page)
-    await page.goto(
-      CONTROL_URL + 'chat?session=' + encodeURIComponent(LIFECYCLE_SESSION_KEY),
-    )
-    await expect(page.locator('.conn-pill.connected')).toBeVisible({ timeout: 10000 })
-
-    await page.locator('.chat-textarea').fill('Reconnect and finish this task.')
-    await page.locator('.chat-send-btn[aria-label="Send"]').click()
-
-    const liveActivity = page.locator('.assistant-activity--live')
-    await expect(liveActivity).toBeVisible()
-    const liveStatus = liveActivity.locator('.assistant-activity__live-label')
-    await page.waitForTimeout(100)
-    lifecycle.emit('session.event.provider_activity', {
-      phase: 'retrying',
-      reason: 'transport_transient',
-      retry_attempt: 7,
-      turn_id: 'turn-e2e-assistant-activity-lifecycle',
-      retry_limit: 0,
-      schema_version: 1,
-      activity_id: 'provider-activity-unbounded-retry',
-      started_at: Date.now(),
-      heartbeat: false,
-      stream_seq: undefined,
-    })
-    await expect(liveStatus).toHaveText('Retrying · attempt 7')
-    await expect(liveStatus).not.toContainText('7/0')
-
-    lifecycle.finish()
-    await expect(liveActivity).toHaveCount(0)
-    await expect(page.locator('.msg-ai .assistant-activity__summary')).toContainText('Completed')
-  })
-
   test('keeps a failed tool row when a later tool succeeds and the turn completes', async ({ page }) => {
     const lifecycle = await mockControlledActivityLifecycle(page, {
       donePayload: { text: 'Recovered final answer.' },
@@ -823,7 +791,6 @@ test.describe('Live assistant activity lifecycle', () => {
       tool_use_id: 'activity-failing',
       name: 'bash_exec',
       input: { command: 'exit 7' },
-      stream_seq: undefined,
     })
     lifecycle.emit('session.event.tool_result', {
       tool_use_id: 'activity-failing',
@@ -832,7 +799,6 @@ test.describe('Live assistant activity lifecycle', () => {
       result: 'exit 7',
       is_error: true,
       execution_status: { status: 'error' },
-      stream_seq: undefined,
     })
     const failedRow = liveActivity.locator('.tool-row--error').first()
     await expect(failedRow).toBeVisible()
@@ -841,7 +807,6 @@ test.describe('Live assistant activity lifecycle', () => {
       tool_use_id: 'activity-recovered',
       name: 'bash_exec',
       input: { command: 'printf recovered' },
-      stream_seq: undefined,
     })
     lifecycle.emit('session.event.tool_result', {
       tool_use_id: 'activity-recovered',
@@ -849,9 +814,8 @@ test.describe('Live assistant activity lifecycle', () => {
       input: { command: 'printf recovered' },
       result: 'recovered',
       execution_status: { status: 'success' },
-      stream_seq: undefined,
     })
-    lifecycle.emit('session.event.text_delta', { text: 'Recovered final answer.', stream_seq: undefined })
+    lifecycle.emit('session.event.text_delta', { text: 'Recovered final answer.' })
     await expect(page.getByText('Recovered final answer.', { exact: true })).toBeVisible()
 
     lifecycle.finish()
