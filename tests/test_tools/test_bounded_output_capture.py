@@ -498,8 +498,9 @@ def test_execute_code_model_preview_character_boundary(character: str, size: int
 
 
 @pytest.mark.parametrize("retrieval_available", [False, True])
+@pytest.mark.parametrize("newline", ["\n", "\r\n"], ids=["lf", "crlf"])
 async def test_execute_code_shortened_model_preview_keeps_full_log(
-    tmp_path: Path, retrieval_available: bool,
+    tmp_path: Path, retrieval_available: bool, newline: str,
 ) -> None:
     from opensquilla.sandbox.config import SandboxSettings
     from opensquilla.sandbox.integration import configure_runtime, reset_runtime
@@ -511,19 +512,22 @@ async def test_execute_code_shortened_model_preview_keeps_full_log(
         tool_result_store_dir=str(tmp_path / "store"),
         tool_result_retrieval_available=retrieval_available,
     ))
-    text = "start\n" + "界" * 40_000 + "\nretained middle\n" + "z" * 40_000 + "\nend"
+    text = (
+        "start\n" + "界" * 40_000 + "\nretained middle\n" + "z" * 40_000 + "\nend"
+    ).replace("\n", newline)
     code = (
         "import sys; "
         "text = 'start\\n' + '\\u754c' * 40000 + '\\nretained middle\\n' + 'z' * 40000 + '\\nend'; "
-        "sys.stdout.write(text); sys.stderr.write(text)"
+        f"data = text.replace('\\n', {newline!r}).encode('utf-8'); "
+        "sys.stdout.buffer.write(data); sys.stderr.buffer.write(data)"
     )
     try:
         payload = json.loads(await code_exec.execute_code(code, timeout=10))
         assert payload["exit_code"] == 0
         for stream in ("stdout", "stderr"):
             assert "retained middle" not in payload[stream]
-            assert payload[stream].startswith("start\n")
-            assert payload[stream].endswith("\nend")
+            assert payload[stream].startswith("start" + newline)
+            assert payload[stream].endswith(newline + "end")
             assert len(payload[stream]) < 50_100
         info = payload["output_capture"]
         assert info["preview_omitted_bytes"] == 0
