@@ -635,6 +635,10 @@ class ServiceContainer:
     usage_event_sink: Any = None
     usage_backfill_task: asyncio.Task[Any] | None = None
     sandbox_setup_task: asyncio.Task[Any] | None = field(default=None, repr=False)
+    # Best-effort profile normalization result exposed to the Desktop UI. The
+    # sandbox decoder remains authoritative for runtime behavior; this field
+    # only preserves the boot diagnostic so partial writes are visible.
+    sandbox_upgrade_report: dict[str, object] | None = None
     profile_import_maintenance_task: asyncio.Task[Any] | None = field(
         default=None,
         repr=False,
@@ -2978,6 +2982,7 @@ async def build_services(
     # already loaded through the legacy codec, so an optional on-disk cleanup
     # must never make the gateway unavailable.
     config_path = Path(str(getattr(config, "config_path", "") or ""))
+    sandbox_upgrade_report: dict[str, object] | None = None
     if config_path.is_file():
         from opensquilla.sandbox.upgrade_migration import (
             ensure_sandbox_upgrade_migrated,
@@ -2987,7 +2992,13 @@ async def build_services(
         log.info("build_services.sandbox_upgrade_started")
         try:
             upgrade_report = ensure_sandbox_upgrade_migrated(config_path.parent)
+            sandbox_upgrade_report = upgrade_report.to_dict()
         except Exception as exc:
+            sandbox_upgrade_report = {
+                "ok": False,
+                "status": "retry_required",
+                "error": f"{type(exc).__name__}: {exc}",
+            }
             log.warning(
                 "build_services.sandbox_upgrade_failed",
                 duration_ms=_elapsed_monotonic_ms(sandbox_upgrade_started_at),
@@ -3000,6 +3011,8 @@ async def build_services(
                 "build_services.sandbox_upgrade_finished",
                 ok=upgrade_report.ok,
                 status=upgrade_report.status,
+                stores=upgrade_report.stores,
+                committed_stores=upgrade_report.committed_stores,
                 error=upgrade_report.error,
                 duration_ms=_elapsed_monotonic_ms(sandbox_upgrade_started_at),
             )
@@ -3939,6 +3952,7 @@ async def build_services(
         growth_event_sink=growth_event_sink,
         deferred_warmups=deferred_warmups,
         sandbox_setup_task=sandbox_setup_task,
+        sandbox_upgrade_report=sandbox_upgrade_report,
     )
     if skill_loader is not None:
         try:
@@ -5256,6 +5270,7 @@ async def start_gateway_server(
         memory_managers=svc.memory_managers,
         memory_stores=svc.memory_stores,
         memory_retrievers=svc.memory_retrievers,
+        sandbox_upgrade_report=getattr(svc, "sandbox_upgrade_report", None),
         extra_routes=webhook_routes or None,
     )
     app.state.gateway_ready = False

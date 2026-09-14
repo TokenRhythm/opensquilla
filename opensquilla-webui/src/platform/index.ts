@@ -48,4 +48,5 @@ export type {
   PlatformSettingsApi,
   SearchProviderOption,
   WorkbenchPreviewMode,
+  SandboxUpgradeReport,
 } from './types'

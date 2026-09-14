@@ -30,6 +30,12 @@ export interface DesktopGatewayConnection {
   wsUrl: string | null
   authToken?: string | null
   error: string | null
+  sandboxUpgrade?: SandboxUpgradeReport | null
+}
+
+export interface SandboxUpgradeReport {
+  status?: string
+  error?: string | null
 }
 
 export interface DesktopRetryStartupResult {

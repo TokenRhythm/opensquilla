@@ -229,6 +229,12 @@ interface GatewayState {
   status: 'starting' | 'ready' | 'stopped' | 'error'
   logPath: string
   error?: string
+  sandboxUpgrade?: SandboxUpgradeReport | null
+}
+
+interface SandboxUpgradeReport {
+  status?: string
+  error?: string | null
 }
 
 interface DesktopGatewayConnection {
@@ -241,6 +247,7 @@ interface DesktopGatewayConnection {
   wsUrl: string | null
   authToken: string | null
   error: string | null
+  sandboxUpgrade?: SandboxUpgradeReport | null
 }
 
 type SecretEncryption = 'safeStorage' | 'plain'
@@ -828,6 +835,7 @@ const gatewayState: GatewayState = {
   owned: false,
   status: 'stopped',
   logPath: '',
+  sandboxUpgrade: null,
 }
 
 function desktopGatewayConnectionSnapshot(): DesktopGatewayConnection {
@@ -845,14 +853,47 @@ function desktopGatewayConnectionSnapshot(): DesktopGatewayConnection {
     wsUrl: ready ? gatewayState.url.replace(/^http/i, 'ws') + '/ws' : null,
     authToken: authToken ? desktopGatewayAuthToken(authToken) : null,
     error: gatewayState.error || null,
+    sandboxUpgrade: gatewayState.sandboxUpgrade ?? null,
+  }
+}
+
+let sandboxUpgradeRefreshInFlight = false
+
+async function refreshSandboxUpgradeReport(): Promise<void> {
+  if (sandboxUpgradeRefreshInFlight || gatewayState.status !== 'ready' || !gatewayState.url) return
+  sandboxUpgradeRefreshInFlight = true
+  try {
+    const response = await proxyDesktopRendererRequest(
+      new Request('opensquilla-app://desktop/api/system/status'),
+      '/api/system/status',
+    )
+    if (!response.ok) return
+    const payload = await response.json() as { sandboxUpgrade?: unknown }
+    const raw = payload.sandboxUpgrade
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return
+    const value = raw as Record<string, unknown>
+    gatewayState.sandboxUpgrade = {
+      ...(typeof value.status === 'string' ? { status: value.status } : {}),
+      ...(value.error === null || typeof value.error === 'string' ? { error: value.error } : {}),
+    }
+    publishGatewayConnection()
+  } catch {
+    // The Gateway connection remains authoritative when the optional
+    // diagnostic endpoint is unavailable.
+  } finally {
+    sandboxUpgradeRefreshInFlight = false
   }
 }
 
 function publishGatewayConnection(): void {
   gatewayConnectionRevision += 1
+  if (gatewayState.status !== 'ready') gatewayState.sandboxUpgrade = null
   const window = currentMainWindow()
   if (!window || !isDesktopRendererDocumentUrl(window.webContents.getURL())) return
   window.webContents.send('gateway:connection-changed', desktopGatewayConnectionSnapshot())
+  if (gatewayState.status === 'ready' && gatewayState.sandboxUpgrade === null) {
+    void refreshSandboxUpgradeReport()
+  }
 }
 
 interface GatewayConnectionTransition {
@@ -3479,6 +3520,7 @@ function clearReusableGatewayState(): void {
   gatewayState.owned = false
   gatewayState.status = 'stopped'
   gatewayState.error = undefined
+  gatewayState.sandboxUpgrade = null
   gatewayConnectionInstanceId = null
   gatewayProfileKey = null
   publishGatewayConnection()
@@ -12325,6 +12367,9 @@ ipcMain.handle('gateway:status', () => ({ ...gatewayState }))
 ipcMain.handle('gateway:connection', (event) => {
   if (!trustedMainWindowControlIpc(event)) {
     throw new Error('Untrusted Gateway connection request.')
+  }
+  if (gatewayState.status === 'ready' && gatewayState.sandboxUpgrade === null) {
+    void refreshSandboxUpgradeReport()
   }
   return desktopGatewayConnectionSnapshot()
 })

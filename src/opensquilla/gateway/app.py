@@ -92,6 +92,7 @@ def create_gateway_app(
     extra_routes: list[Route] | None = None,
     prompt_cache_keepalive_service: Any = None,
     skill_management_service: Any = None,
+    sandbox_upgrade_report: dict[str, object] | None = None,
 ) -> Starlette:
     """Build and return the Starlette ASGI application."""
     if diagnostics_state is None:
@@ -265,6 +266,7 @@ def create_gateway_app(
                 "status": "running",
                 "provider": provider_name,
                 "auth_mode": config.auth.mode,
+                "sandboxUpgrade": sandbox_upgrade_report,
             }
         )
 
