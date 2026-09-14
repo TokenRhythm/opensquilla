@@ -1,0 +1,198 @@
+name: Windows NSIS Upgrade Regression
+
+# Unsigned full packages on disposable runners; never installs on a developer's
+# machine. Signing, interactive UAC and Windows 10/11 remain release gates.
+on:
+  pull_request:
+    paths:
+      - desktop/electron/scripts/nsis/**
+      - desktop/electron/scripts/test-nsis-*.cjs
+      - desktop/electron/scripts/test-nsis-*.mjs
+      - desktop/electron/package.json
+      - desktop/electron/package-lock.json
+      - .github/scripts/verify-nsis-upgrade-regression.py
+      - .github/workflows/windows-nsis-upgrade-regression.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-nsis-upgrade-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHONUTF8: '1'
+  PYTHONUNBUFFERED: '1'
+
+jobs:
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          lfs: true
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22.12.0'
+          cache: npm
+          cache-dependency-path: |
+            opensquilla-webui/package-lock.json
+            desktop/electron/package-lock.json
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - name: Hydrate router assets
+        run: |
+          git lfs pull --include='src/opensquilla/squilla_router/models/**'
+          if ($LASTEXITCODE -ne 0) { throw 'Router LFS fetch failed' }
+      - name: Build and verify complete WebUI
+        working-directory: opensquilla-webui
+        run: |
+          npm ci
+          if ($LASTEXITCODE -ne 0) { throw 'WebUI npm ci failed' }
+          npm run build
+          if ($LASTEXITCODE -ne 0) { throw 'WebUI build failed' }
+          npm run verify:release-dist
+          if ($LASTEXITCODE -ne 0) { throw 'WebUI verification failed' }
+          node scripts/stage-dist.mjs
+          if ($LASTEXITCODE -ne 0) { throw 'WebUI staging failed' }
+      - name: Build complete unsigned Windows package
+        working-directory: desktop/electron
+        run: |
+          npm ci
+          if ($LASTEXITCODE -ne 0) { throw 'Electron npm ci failed' }
+          npm run test:nsis-upgrade
+          if ($LASTEXITCODE -ne 0) { throw 'NSIS template and native environment tests failed' }
+          npm run test:installer-progress
+          if ($LASTEXITCODE -ne 0) { throw 'Visible installer progress contract failed' }
+          node ../../.github/scripts/verify-sandbox-package.mjs --source
+          if ($LASTEXITCODE -ne 0) { throw 'Runtime catalog verification failed' }
+          npm run build:gateway
+          if ($LASTEXITCODE -ne 0) { throw 'Gateway build failed' }
+          npm run build
+          if ($LASTEXITCODE -ne 0) { throw 'Electron build failed' }
+          npm run verify:prepared
+          if ($LASTEXITCODE -ne 0) { throw 'Prepared package verification failed' }
+          node -e "const b=require('electron-builder'); b.build({targets:b.Platform.WINDOWS.createTarget('nsis'),publish:'never',config:{win:{signExecutable:false},forceCodeSigning:false}}).catch(e=>{console.error(e);process.exitCode=1})"
+          if ($LASTEXITCODE -ne 0) { throw 'NSIS build failed' }
+          npm run verify:package
+          if ($LASTEXITCODE -ne 0) { throw 'Package verification failed' }
+      - name: Record exact candidate identities
+        run: |
+          $root = Join-Path $PWD 'dist/desktop-electron'
+          $installers = @(Get-ChildItem -LiteralPath $root -Filter 'OpenSquilla-*-win-x64.exe' -File)
+          if ($installers.Count -ne 1) { throw 'Expected exactly one installer' }
+          $exe = Join-Path $root 'win-unpacked/OpenSquilla.exe'
+          $asar = Join-Path $root 'win-unpacked/resources/app.asar'
+          $manifest = [ordered]@{
+            sourceSha = (git rev-parse HEAD).Trim()
+            auditRunId = $env:GITHUB_RUN_ID
+            signing = 'unsigned regression only'
+            installerName = $installers[0].Name
+            installerSha256 = (Get-FileHash -LiteralPath $installers[0].FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+            executableSha256 = (Get-FileHash -LiteralPath $exe -Algorithm SHA256).Hash.ToLowerInvariant()
+            asarSha256 = (Get-FileHash -LiteralPath $asar -Algorithm SHA256).Hash.ToLowerInvariant()
+            version = ([Diagnostics.FileVersionInfo]::GetVersionInfo($exe)).ProductVersion
+          }
+          $manifest | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $root 'audit-candidate.json') -Encoding utf8
+          $manifest | ConvertTo-Json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nsis-regression-installer
+          path: |
+            dist/desktop-electron/OpenSquilla-*-win-x64.exe
+            dist/desktop-electron/audit-candidate.json
+          if-no-files-found: error
+          retention-days: 14
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: nsis-native-environment-evidence
+          path: ${{ runner.temp }}/nsis-upgrade-native-*/
+          if-no-files-found: warn
+          retention-days: 14
+
+  upgrade-and-start:
+    needs: build
+    runs-on: windows-2022
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      max-parallel: 6
+      matrix:
+        baseline: ['0.5.3', '0.5.4']
+        install-path: [default, custom]
+        scenario: [baseline, readlock, longpath]
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22.12.0'
+          cache: npm
+          cache-dependency-path: desktop/electron/package-lock.json
+      - name: Prepare packaged-client interaction probe
+        working-directory: desktop/electron
+        run: |
+          npm ci
+          if ($LASTEXITCODE -ne 0) { throw 'Probe npm ci failed' }
+          npm run build
+          if ($LASTEXITCODE -ne 0) { throw 'Probe build failed' }
+      - name: Download pinned official baseline
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          New-Item -ItemType Directory -Path old,candidate | Out-Null
+          gh release download 'v${{ matrix.baseline }}' --repo TokenRhythm/opensquilla --pattern 'OpenSquilla-${{ matrix.baseline }}-win-x64.exe' --dir old
+          if ($LASTEXITCODE -ne 0) { throw 'Baseline download failed' }
+      - uses: actions/download-artifact@v4
+        with:
+          name: nsis-regression-installer
+          path: candidate
+      - name: Verify upgrade, preserved data and real client restart
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $old = @(Get-ChildItem old -Filter '*.exe' -File)
+          $candidate = @(Get-ChildItem candidate -Filter '*.exe' -File)
+          if ($old.Count -ne 1 -or $candidate.Count -ne 1) { throw 'Unexpected installer count' }
+          $manifest = Get-Content candidate/audit-candidate.json -Raw | ConvertFrom-Json
+          if ($manifest.sourceSha -ne (git rev-parse HEAD).Trim()) { throw 'Candidate source mismatch' }
+          if ((Get-FileHash -LiteralPath $candidate[0].FullName -Algorithm SHA256).Hash.ToLowerInvariant() -ne $manifest.installerSha256) { throw 'Candidate hash mismatch' }
+          $arguments = @('.github/scripts/verify-nsis-upgrade-regression.py',
+            '--baseline-installer', $old[0].FullName, '--candidate-installer', $candidate[0].FullName,
+            '--baseline-version', '${{ matrix.baseline }}', '--candidate-version', $manifest.version,
+            '--case', '${{ matrix.scenario }}', '--install-path', '${{ matrix.install-path }}',
+            '--candidate-source-sha', $manifest.sourceSha,
+            '--candidate-installer-sha256', $manifest.installerSha256,
+            '--candidate-asar-sha256', $manifest.asarSha256,
+            '--candidate-executable-sha256', $manifest.executableSha256,
+            '--evidence-root', (Join-Path $env:RUNNER_TEMP 'nsis-regression-evidence'))
+          & python @arguments
+          if ($LASTEXITCODE -ne 0) { throw 'NSIS upgrade/startup regression assertions failed' }
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: nsis-${{ matrix.baseline }}-${{ matrix.install-path }}-${{ matrix.scenario }}
+          path: |
+            ${{ runner.temp }}/nsis-regression-evidence/
+            candidate/audit-candidate.json
+          if-no-files-found: warn
+          retention-days: 14
