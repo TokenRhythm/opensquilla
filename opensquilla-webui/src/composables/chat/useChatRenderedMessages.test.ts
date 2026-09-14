@@ -3342,10 +3342,11 @@ describe('useChatRenderedMessages ensemble metadata', () => {
     },
   )
 
-  it('preserves explicit legacy ensemble roles when trace is absent', () => {
+  it.each([false, true])('requires a trace for legacy ensemble roles (trace=%s)', hasTrace => {
     const api = renderedMessagesFor([{
       role: 'assistant', text: 'Fused answer.', ts: 0, restoredFromHistory: true,
       turn_usage: {
+        ...(hasTrace ? { ensemble_trace: { profile: 'legacy-fusion' } } : {}),
         model_usage_breakdown: [
           { role: 'proposer', model: 'proposer-model' },
           { role: 'primary_aggregator', model: 'aggregator-model' },
@@ -3354,6 +3355,12 @@ describe('useChatRenderedMessages ensemble metadata', () => {
     }], undefined, true)
 
     const strip = api.renderedMessages.value.find(message => message.isRouterStrip)
+    if (!hasTrace) {
+      // Ordinary parents can inherit these exact roles from child usage.
+      expect(strip).toBeUndefined()
+      expect(api.renderedMessages.value[0].meta?.ensemble).toBeUndefined()
+      return
+    }
     expect(strip?.routerPanel).toBe('llm-ensemble')
     expect(strip?.ensemble?.modelCount).toBe(2)
   })
