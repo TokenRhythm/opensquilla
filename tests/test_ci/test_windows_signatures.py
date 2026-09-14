@@ -133,7 +133,11 @@ class VerifierFixture:
     def tool(self, path: Path) -> Path:
         path.parent.mkdir(parents=True, exist_ok=True)
         if os.name == "nt":
-            path.touch()
+            # A zero-byte .exe is not a runnable Windows process and can leave
+            # PowerShell waiting until the subprocess timeout.  Use cmd.exe as
+            # a deterministic PE shim; its built-in `verify` command exits 0
+            # for the arguments passed by the verifier.
+            shutil.copyfile(os.environ.get("ComSpec", r"C:\\Windows\\System32\\cmd.exe"), path)
             self.scenario["tools"].append(str(path))
         else:
             # POSIX PowerShell resolves absolute executable paths before
