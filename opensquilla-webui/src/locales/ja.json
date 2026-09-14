@@ -236,7 +236,6 @@
       "setDefaultMode": "このモードを既定にする",
       "restoreDefaultMode": "既定のプレビューモードに戻す",
       "defaultModeSaved": "既定のプレビューモードを保存しました。",
-      "fullModeNotice": "インタラクティブプレビューはオンラインコンテンツを読み込めますが、OpenSquilla の権限、ローカルファイル、システムブラウザーのログインは共有しません。",
       "offlineWebLimits": "制限付きプレビューでは、一部の外部コンテンツや高度な Web 機能を利用できない場合があります。",
       "compatibilityFallback": "この Desktop バージョンでは従来の単一ファイルプレビューのみ利用できます。",
       "upgradeDesktopShort": "Desktop を更新",
@@ -1068,7 +1067,9 @@
       "modelNoMatches": "一致するモデルがありません — 入力した値をそのまま使えます。",
       "modelListTruncated": "{total} 件中 {shown} 件を表示 — 入力を続けると絞り込めます。",
       "modelProvenance": "プロバイダーのライブ一覧 · 機能情報の出典：{sources}",
-      "modelMetadataProvenance": "プロバイダーのライブ一覧 · 公式値を優先し、ない場合はカタログ値を使用"
+      "modelMetadataProvenance": "プロバイダーのライブ一覧 · 公式値を優先し、ない場合はカタログ値を使用",
+      "modelMultimodal": "マルチモーダル",
+      "modelMultimodalTitle": "画像入力に対応"
     },
     "preset": {
       "modeCustom": "カスタム"
@@ -1138,6 +1139,7 @@
       "removeCandidateAria": "{model} を削除",
       "ensembleEmpty": "候補モデルがまだありません。モデルサービスの設定を保存してルーティング階層を生成するか、候補を手動で追加してください。",
       "ensemblePipeline": "仕組み:候補モデルが並行してドラフトを作成し、集約モデルがドラフトを集約して最終回答を生成します。ツールを呼び出せるのは集約モデルのみです。",
+      "candidateModelHint": "「マルチモーダル」バッジは画像入力に対応するモデルを示します。画像リクエストは設定済みの画像対応ルートを使用します。",
       "ensembleFlowDesc": "複数モデルが並行して下書きし、アグリゲーターが 1 つの回答に統合します。呼び出しは増えます。",
       "legacyDynamicNotice": "この従来の融合プランは保存済みのモデル階層に従います。メンバーを編集するにはカスタム編成に変換してください。",
       "legacyDynamicMigrate": "カスタム編成に変換",
@@ -1693,8 +1695,13 @@
     },
     "privacy": {
       "statusDisabledByEnv": "環境設定により無効になっています。",
-      "networkReportingLabel": "診断とアップデート",
-      "networkReportingDesc": "限定的な製品診断データを送信してアップデートを確認します。会話内容、ファイル、モデルリクエストの内容はアップロードされません。"
+      "statusNotChosen": "選択はまだ保存されていません。有効にするまでデータは送信されません。",
+      "reliabilityDiagnosticsLabel": "安定性診断",
+      "reliabilityDiagnosticsDesc": "クラッシュや失敗の診断に役立てるため、操作結果、所要時間、プライバシーに配慮したエラー指紋を共有します。会話やファイルの内容は含まれません。",
+      "productAnalyticsLabel": "製品・成長分析",
+      "productAnalyticsDesc": "コンバージョンと機能利用を測定するため、有効化マイルストーンと、実際に開始された MetaSkill およびコーディングモードの実行回数を共有します。会話内容、タスク引数、ファイル、元のアカウント ID は含めず、ランダムな分析専用識別子を使用します。",
+      "networkReportingLabel": "ネットワーク診断のマスタースイッチ",
+      "networkReportingDesc": "ネットワーク診断、分析、アップデート確認を一括で制御します。無効にすると、下の 2 つの選択より優先されます。"
     },
     "toast": {
       "loadFailed": "設定の読み込みに失敗しました: {error}",

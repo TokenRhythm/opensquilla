@@ -721,14 +721,11 @@ async def test_bundle_source_read_resolves_html_entry_and_preserves_unicode(arti
         "artifacts.source.patch",
     ],
 )
-async def test_retired_editor_methods_return_actionable_upgrade_errors(
-    artifact_editing_env, method
-):
+async def test_removed_editor_methods_are_not_registered(artifact_editing_env, method):
     env = artifact_editing_env
     response = await _dispatch(env, method, {"sessionKey": SESSION_KEY})
     assert response.error is not None
-    assert response.error.code == "DOCUMENT_EDITING_RETIRED"
-    assert response.error.details == {"action": "update_client_and_reopen_page"}
+    assert response.error.code == "METHOD_NOT_FOUND"
     assert (
         await (await ArtifactSessionService.from_session_storage(env.storage)).list_documents(
             session_key=SESSION_KEY, session_id=env.session.session_id

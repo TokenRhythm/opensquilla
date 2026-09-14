@@ -999,7 +999,7 @@ async def _manual_compaction(gateway: GatewayProcess, session_key: str) -> bool:
     await client.connect(gateway.ws_url)
     try:
         payload = await client.call(
-            "sessions.compact",
+            "sessions.contextCompact",
             {
                 "key": session_key,
                 "wait": True,

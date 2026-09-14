@@ -11,10 +11,12 @@ import json
 import logging
 import os
 import re
+import secrets
 import shlex
 import shutil
 import subprocess
 import time
+from collections.abc import Callable
 from dataclasses import asdict
 from datetime import UTC, datetime
 from pathlib import Path
@@ -196,6 +198,7 @@ def _solve_unlocked(
     verification_mode: str = "red-green",
     run_id: str | None = None,
     max_attempts: int = _DEFAULT_MAX_ATTEMPTS,
+    coding_mode_usage_recorder: Callable[[str], None] | None = None,
 ) -> TaskResult:
     """Run one code-task end-to-end and return a structured TaskResult."""
     # 1. Resolve the task text first (cheap), so a bad task fails before cloning.
@@ -376,6 +379,24 @@ def _solve_unlocked(
     prev_patch_bytes = 0
     diff_exploded = False
     attempt = 0
+    usage_observation_sent = False
+    # Never reuse the operator-facing run id as telemetry state. It may contain
+    # spaces or path syntax that is valid for legacy code-task callers but not
+    # for the closed local telemetry ledger. This opaque key stays local.
+    coding_mode_usage_key = f"coding-use-{secrets.token_hex(12)}"
+
+    def _notify_coding_mode_usage() -> None:
+        nonlocal usage_observation_sent
+        if usage_observation_sent:
+            return
+        usage_observation_sent = True
+        if coding_mode_usage_recorder is None:
+            return
+        try:
+            coding_mode_usage_recorder(coding_mode_usage_key)
+        except Exception:
+            logger.debug("coding mode usage observation failed", exc_info=True)
+
     while attempt < max_attempts:
         # Budget + attempt-count decided BEFORE running, so a retry skipped for
         # lack of shared budget is NOT counted. Attempt 1 always runs and honors
@@ -448,9 +469,13 @@ def _solve_unlocked(
                     scratch_dir=scratch,
                     artifact_dir=artifact_dir,
                     status_callback=_agent_status,
+                    on_agent_started=_notify_coding_mode_usage,
                 )
             except TypeError as exc:
-                if "status_callback" not in str(exc):
+                if not any(
+                    keyword in str(exc)
+                    for keyword in ("status_callback", "on_agent_started")
+                ):
                     raise
                 outcome = adapter.run(
                     prompt,
@@ -458,6 +483,10 @@ def _solve_unlocked(
                     scratch_dir=scratch,
                     artifact_dir=artifact_dir,
                 )
+                # Compatibility path for injected/legacy adapters that do not
+                # expose the start callback. A successful return proves they
+                # did execute; the once-guard still collapses internal retries.
+                _notify_coding_mode_usage()
         except RuntimeError as exc:
             result.error = str(exc)
             break
@@ -646,6 +675,7 @@ def solve(
     verification_mode: str = "red-green",
     run_id: str | None = None,
     max_attempts: int = _DEFAULT_MAX_ATTEMPTS,
+    coding_mode_usage_recorder: Callable[[str], None] | None = None,
 ) -> TaskResult:
     """Run one code-task while excluding concurrent profile lifecycle mutations."""
 
@@ -664,6 +694,7 @@ def solve(
                 verification_mode=verification_mode,
                 run_id=run_id,
                 max_attempts=max_attempts,
+                coding_mode_usage_recorder=coding_mode_usage_recorder,
             )
         except (InputError, workspace.WorkspaceError):
             raise

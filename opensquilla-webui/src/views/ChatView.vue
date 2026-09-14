@@ -1811,6 +1811,7 @@ const {
   onFileInputChange,
   addAttachments,
   removeAttachment,
+  retireAttachments,
   retryAttachment,
   hasPendingAttachmentWork,
   prepareAttachmentsForSend,
@@ -2940,10 +2941,10 @@ const chatSessionRuntime = useChatSessionRuntime({
   resetSavingsPopupCooldown,
   restoreWidgetState,
   resetStreamLiveTurnState,
+  retireAttachments,
   resetDraftComposer: () => {
     artifactImageLightbox.close()
     inputText.value = ''
-    pendingAttachments.value = []
     resetComposerInputHistory()
     autoResizeTextarea()
   },

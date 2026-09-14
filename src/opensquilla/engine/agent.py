@@ -243,6 +243,17 @@ from opensquilla.session.compaction_lifecycle import (
 )
 from opensquilla.session.context_view import format_compaction_summary_context
 from opensquilla.session.terminal_reply import build_terminal_reply, safe_provider_failure_code
+from opensquilla.telemetry.contracts.reliability import (
+    ToolCategory,
+    ToolErrorCode,
+    ToolOutcome,
+)
+from opensquilla.telemetry.runtime_facts import (
+    ToolCallReliabilityFacts,
+    ToolReliabilitySink,
+    classify_tool_result,
+    tool_category_for_name,
+)
 from opensquilla.tool_boundary import AgentToolHandler as ToolHandler
 from opensquilla.tools.patch_classification import is_instrumentation_only_patch
 from opensquilla.tools.projected_arguments import find_projected_tool_argument
@@ -2330,31 +2341,6 @@ def _classify_provider_attempt(
     )
 
 
-def _chat_config_with_thinking_disabled(chat_cfg: ChatConfig) -> ChatConfig:
-    return ChatConfig(
-        max_tokens=chat_cfg.max_tokens,
-        temperature=chat_cfg.temperature,
-        top_p=chat_cfg.top_p,
-        system=chat_cfg.system,
-        thinking=False,
-        thinking_budget_tokens=0,
-        thinking_budget_explicit=False,
-        timeout=chat_cfg.timeout,
-        stop_sequences=chat_cfg.stop_sequences,
-        cache_breakpoints=chat_cfg.cache_breakpoints,
-        cache_mode=chat_cfg.cache_mode,
-        output_json_schema=chat_cfg.output_json_schema,
-        output_json_schema_strict=chat_cfg.output_json_schema_strict,
-        model_capabilities=chat_cfg.model_capabilities,
-        model_vision_support=chat_cfg.model_vision_support,
-        thinking_level=ThinkingLevel.OFF,
-        provider_request_max_chars=chat_cfg.provider_request_max_chars,
-        context_window_tokens_global_override=(chat_cfg.context_window_tokens_global_override),
-        provider_request_max_chars_explicit_cap=(chat_cfg.provider_request_max_chars_explicit_cap),
-        tool_choice=chat_cfg.tool_choice,
-    )
-
-
 def _strip_historical_image_blocks(
     messages: list[Message],
     *,
@@ -2527,6 +2513,18 @@ class _StreamAccumulator:
     json_chars: int = 0
 
 
+@dataclass(slots=True)
+class _ToolReliabilityState:
+    """Ephemeral correlation state; only its closed facts leave the Agent."""
+
+    category: ToolCategory
+    attempt_count: int = 0
+    active_duration_ms: int = 0
+    active_started_at: float | None = None
+    terminal: tuple[ToolOutcome, ToolErrorCode | None] | None = None
+    emitted: bool = False
+
+
 class Agent:
     """Explicit state-machine agent.
 
@@ -2620,6 +2618,8 @@ class Agent:
         self._usage_execution_context = usage_execution_context
         self._provider_request_correlation = provider_request_correlation
         self._execution_context = execution_context
+        self._tool_reliability_sink: ToolReliabilitySink | None = None
+        self._tool_reliability_states: dict[str, _ToolReliabilityState] = {}
         # Populated only by a successful real provider stream.  TurnRunner
         # publishes it after durable finalization, so failed/cancelled turns
         # can never arm a gateway keepalive probe.
@@ -2631,6 +2631,12 @@ class Agent:
                 self._tool_context,
             )
         self._meta_run_writer = (self.config.metadata or {}).get("meta_run_writer")
+        # The runtime injects this narrow callback into metadata so nested
+        # MetaSkill agents inherit the same growth sink without carrying the
+        # sink object or any user content through persistence.
+        self._metaskill_usage_recorder = (self.config.metadata or {}).get(
+            "metaskill_usage_recorder"
+        )
         self._pending_warnings: list[WarningEvent] = []
         (
             self._turn_objective_reminder_enabled,
@@ -2705,6 +2711,165 @@ class Agent:
                 ),
             )
         return resolve_tool_presentation(spec).to_payload()
+
+    def set_tool_reliability_sink(self, sink: ToolReliabilitySink | None) -> None:
+        """Install the optional synchronous, content-free result observer."""
+
+        self._tool_reliability_sink = sink
+
+    def settle_pending_tool_reliability_on_stream_close(self) -> None:
+        """Cancel admitted calls when an owning public stream closes early."""
+
+        self._flush_pending_tool_reliability(
+            terminal=(ToolOutcome.CANCEL, ToolErrorCode.CANCELLED),
+        )
+
+    def _begin_tool_reliability_attempt(
+        self,
+        *,
+        tool_use_id: str,
+        tool_name: str,
+    ) -> float | None:
+        if self._tool_reliability_sink is None:
+            return None
+        state = self._tool_reliability_states.get(tool_use_id)
+        if state is None:
+            state = _ToolReliabilityState(category=tool_category_for_name(tool_name))
+            self._tool_reliability_states[tool_use_id] = state
+        if state.emitted or state.active_started_at is not None:
+            return None
+        state.attempt_count += 1
+        state.active_started_at = time.monotonic()
+        return state.active_started_at
+
+    def _admit_tool_reliability_call(
+        self,
+        *,
+        tool_use_id: str,
+        tool_name: str,
+    ) -> None:
+        """Register a logical call once it enters the dispatch scheduler."""
+
+        if self._tool_reliability_sink is None:
+            return
+        self._tool_reliability_states.setdefault(
+            tool_use_id,
+            _ToolReliabilityState(category=tool_category_for_name(tool_name)),
+        )
+
+    def _end_tool_reliability_attempt(
+        self,
+        *,
+        tool_use_id: str,
+        started_at: float | None,
+    ) -> None:
+        if started_at is None:
+            return
+        state = self._tool_reliability_states.get(tool_use_id)
+        if state is None or state.emitted:
+            return
+        if state.active_started_at is not None:
+            state.active_duration_ms += max(
+                0,
+                int((time.monotonic() - state.active_started_at) * 1000),
+            )
+            state.active_started_at = None
+
+    def _set_tool_reliability_terminal(
+        self,
+        *,
+        tool_use_id: str,
+        outcome: ToolOutcome,
+        error_code: ToolErrorCode,
+    ) -> None:
+        state = self._tool_reliability_states.get(tool_use_id)
+        if state is not None and not state.emitted:
+            state.attempt_count = max(1, state.attempt_count)
+            state.terminal = (outcome, error_code)
+
+    def _settle_tool_reliability(
+        self,
+        *,
+        tool_use_id: str,
+        result: ToolResult,
+    ) -> None:
+        state = self._tool_reliability_states.get(tool_use_id)
+        if state is None or state.emitted:
+            return
+        state.attempt_count = max(1, state.attempt_count)
+        self._end_tool_reliability_attempt(
+            tool_use_id=tool_use_id,
+            started_at=state.active_started_at,
+        )
+        terminal = state.terminal
+        if terminal is None:
+            terminal = classify_tool_result(
+                status=(
+                    result.execution_status.get("status")
+                    if result.execution_status is not None
+                    else None
+                ),
+                reason=(
+                    result.execution_status.get("reason")
+                    if result.execution_status is not None
+                    else None
+                ),
+                is_error=result.is_error,
+            )
+        self._publish_tool_reliability(state, terminal=terminal)
+
+    def _flush_pending_tool_reliability(
+        self,
+        *,
+        terminal: tuple[ToolOutcome, ToolErrorCode],
+    ) -> None:
+        for state in tuple(self._tool_reliability_states.values()):
+            if state.emitted:
+                continue
+            state.attempt_count = max(1, state.attempt_count)
+            if state.active_started_at is not None:
+                state.active_duration_ms += max(
+                    0,
+                    int((time.monotonic() - state.active_started_at) * 1000),
+                )
+                state.active_started_at = None
+            self._publish_tool_reliability(
+                state,
+                terminal=state.terminal or terminal,
+            )
+        self._tool_reliability_states.clear()
+
+    def _publish_tool_reliability(
+        self,
+        state: _ToolReliabilityState,
+        *,
+        terminal: tuple[ToolOutcome, ToolErrorCode | None],
+    ) -> None:
+        if state.emitted:
+            return
+        state.emitted = True
+        facts = ToolCallReliabilityFacts(
+            tool_category=state.category,
+            outcome=terminal[0],
+            error_code=terminal[1],
+            duration_ms=state.active_duration_ms,
+            retry_count=max(0, state.attempt_count - 1),
+        )
+        sink = self._tool_reliability_sink
+        if sink is None:
+            return
+        try:
+            sink_result = sink(facts)
+            if inspect.isawaitable(sink_result):
+                close = getattr(sink_result, "close", None)
+                if callable(close):
+                    close()
+                logger.warning("agent.tool_reliability_sink_must_be_synchronous")
+        except BaseException as exc:  # observer must never change tool behavior
+            logger.warning(
+                "agent.tool_reliability_sink_failed",
+                error_type=type(exc).__name__,
+            )
 
     def _context_overflow_error(self) -> ErrorEvent:
         reason = self._last_compaction_refusal_reason
@@ -5784,6 +5949,8 @@ class Agent:
             clear_sandbox_approval_denials,
             prune_once_mount_grants,
         )
+        self._tool_reliability_states.clear()
+        pending_tool_terminal = (ToolOutcome.FAIL, ToolErrorCode.INTERNAL_ERROR)
 
         self._prompt_cache_keepalive_candidate = None
 
@@ -5823,7 +5990,17 @@ class Agent:
                     pending_input_provider=pending_input_provider,
                 ):
                     yield event
+        except asyncio.CancelledError:
+            pending_tool_terminal = (ToolOutcome.CANCEL, ToolErrorCode.CANCELLED)
+            raise
+        except GeneratorExit:
+            pending_tool_terminal = (ToolOutcome.CANCEL, ToolErrorCode.CANCELLED)
+            raise
+        except BaseException:
+            pending_tool_terminal = (ToolOutcome.FAIL, ToolErrorCode.INTERNAL_ERROR)
+            raise
         finally:
+            self._flush_pending_tool_reliability(terminal=pending_tool_terminal)
             self._freeze_current_replay_view()
             self._image_analysis_provider_wrapper = None
             for image_context, previous in image_context_bindings:
@@ -6170,9 +6347,6 @@ class Agent:
             context_window_tokens=self.config.context_window_tokens,
             max_output_tokens=self.config.max_tokens,
         )
-        _thinking_fallback_done = False
-        _disable_thinking_for_next_provider_call = False
-
         _log = structlog.get_logger("opensquilla.engine.agent")
 
         def _positive_float(value: Any) -> float | None:
@@ -6316,7 +6490,6 @@ class Agent:
         max_iterations_deadline_extension_logged = False
         deadline_wrapup_armed = False
         deadline_wrapup_message: Message | None = None
-        deadline_thinking_off_armed = False
         reasoning_only_act_now_message: Message | None = None
         workspace_diff_recovery_attempted = False
         failed_tool_finalization_recovery_keys: set[str] = set()
@@ -7656,14 +7829,6 @@ class Agent:
                         call_chat_cfg = call_chat_cfg.model_copy(
                             update={"tool_choice": forced_tool_choice}
                         )
-                    _attempt_thinking_disabled = False
-                    if _disable_thinking_for_next_provider_call:
-                        call_chat_cfg = _chat_config_with_thinking_disabled(call_chat_cfg)
-                        _disable_thinking_for_next_provider_call = False
-                        _attempt_thinking_disabled = True
-                    if deadline_thinking_off_armed:
-                        call_chat_cfg = _chat_config_with_thinking_disabled(call_chat_cfg)
-                        _attempt_thinking_disabled = True
                     if _total_deadline is not None:
                         call_chat_cfg = call_chat_cfg.model_copy(
                             update={
@@ -8366,45 +8531,6 @@ class Agent:
                                         ),
                                     )
                                     deadline_wrapup_armed = True
-                                    # The retry runs thinking-disabled: the
-                                    # margin exists to spend the last stretch
-                                    # answering, and a thinking-on retry can
-                                    # burn the entire remainder on another
-                                    # reasoning mega-stream that the hard
-                                    # deadline then kills with nothing
-                                    # delivered.
-                                    _disable_thinking_for_next_provider_call = True
-                                    if bool(
-                                        getattr(
-                                            self.config,
-                                            "deadline_wrapup_sticky_thinking_off",
-                                            False,
-                                        )
-                                    ):
-                                        # Sticky variant: the one-shot above
-                                        # covers only the retry; the next
-                                        # iteration re-enables thinking and can
-                                        # spend the rest of the margin on
-                                        # another mega-stream. Arming the
-                                        # deadline cutoff keeps every remaining
-                                        # call thinking-disabled.
-                                        deadline_thinking_off_armed = True
-                                        append_runtime_event(
-                                            self.config.runtime_events_path,
-                                            {
-                                                "feature": "deadline_wrapup",
-                                                "name": ("deadline_wrapup.sticky_thinking_off"),
-                                                "action": ("disable_thinking_until_deadline"),
-                                                "reason": ("reasoning_stream_preempt"),
-                                                "iteration": iterations,
-                                                "attempt": _call_attempt,
-                                                "session_key": self._session_key,
-                                                "agent_id": (
-                                                    self.config.tool_result_store_agent_id
-                                                    or self.config.metadata.get("agent_id")
-                                                ),
-                                            },
-                                        )
                                     self._write_turn_call_log(
                                         "turn_policy_decision",
                                         action="deadline_wrapup",
@@ -9013,31 +9139,6 @@ class Agent:
                                         last_actual_provider = usage_default_provider
                                     cost_receipt_counted = True
                                     turn_has_error_usage_receipt = True
-                                # One-shot thinking/reasoning fallback
-                                _err_lower = raw_ev.message.lower()
-                                _stream_image_failure = classify_image_failure(
-                                    raw_ev,
-                                    provider_name=getattr(
-                                        self.provider,
-                                        "provider_name",
-                                        "",
-                                    ),
-                                )
-                                if (
-                                    thinking_enabled
-                                    and not _thinking_fallback_done
-                                    and self.config.provider_error_thinking_fallback
-                                    and not goal_terminal_final_response_pending
-                                    and not _stream_image_failure.is_unsupported
-                                    and not attempt_irreversible_output_emitted
-                                    and not turn_image_retry_barrier_crossed
-                                    and ("thinking" in _err_lower or "reasoning" in _err_lower)
-                                ):
-                                    _thinking_fallback_done = True
-                                    _disable_thinking_for_next_provider_call = True
-                                    _got_error = True
-                                    break  # break stream, retry
-
                                 provider_error = raw_ev
                                 _got_error = True
                                 break  # break stream loop
@@ -9483,13 +9584,6 @@ class Agent:
                             attempt_classification.kind,
                             input_tokens=iter_input_tokens,
                         )
-                        if (
-                            large_context_invalid
-                            and attempt_classification.kind == _ProviderAttemptKind.REASONING_ONLY
-                            and (attempt_classification.stop_reason or "").lower() == "length"
-                        ):
-                            _thinking_fallback_done = True
-                            _disable_thinking_for_next_provider_call = True
                         supports_reasoning_replay = supports_reasoning_prefill_replay(
                             model_capabilities=self.config.model_capabilities,
                             reasoning_content=iter_reasoning_content,
@@ -9733,18 +9827,6 @@ class Agent:
                                             provider_default_reasoning=not thinking_enabled,
                                         )
                                     )
-                                disable_thinking = (
-                                    attempt_classification.stop_reason or ""
-                                ).lower() == "length" or bool(
-                                    getattr(
-                                        self.config,
-                                        "reasoning_only_thinking_fallback",
-                                        False,
-                                    )
-                                )
-                                if disable_thinking:
-                                    _thinking_fallback_done = True
-                                    _disable_thinking_for_next_provider_call = True
                                 logger.warning(
                                     "provider.large_context_visible_retry",
                                     session_key=self._session_key,
@@ -9763,7 +9845,6 @@ class Agent:
                                     iter_output_tokens=iter_output_tokens,
                                     iter_reasoning_tokens=iter_reasoning_tokens,
                                     reasoning_chars=len(iter_reasoning_content or ""),
-                                    thinking_disabled=disable_thinking,
                                     configured_max_tokens=max(
                                         0,
                                         int(getattr(call_chat_cfg, "max_tokens", 0) or 0),
@@ -9804,12 +9885,8 @@ class Agent:
                                         code="provider_large_context_visible_retry",
                                         message=(
                                             "The provider returned reasoning without visible "
-                                            "content for a large input; "
-                                            + (
-                                                "retrying once with thinking disabled."
-                                                if disable_thinking
-                                                else ("retrying once to request visible content.")
-                                            )
+                                            "content for a large input; retrying once to "
+                                            "request visible content."
                                         ),
                                     )
                                 next_provider_activity_reason = "reasoning_only"
@@ -9892,14 +9969,6 @@ class Agent:
                                         provider_default_reasoning=not thinking_enabled,
                                     )
                                 )
-                            disable_thinking = bool(
-                                thinking_enabled
-                                and getattr(
-                                    self.config,
-                                    "reasoning_only_thinking_fallback",
-                                    False,
-                                )
-                            )
                             reasoning_output_budget_exhausted = (
                                 attempt_classification.stop_reason or ""
                             ).lower() == "length"
@@ -9916,17 +9985,7 @@ class Agent:
                                     reasoning_tokens=iter_reasoning_tokens,
                                     reasoning_content=iter_reasoning_content,
                                 )
-                            if disable_thinking:
-                                _thinking_fallback_done = True
-                                _disable_thinking_for_next_provider_call = True
-                                yield WarningEvent(
-                                    code="provider_reasoning_only_retry",
-                                    message=(
-                                        "The provider returned reasoning without visible "
-                                        "content; retrying once with thinking disabled."
-                                    ),
-                                )
-                            elif reasoning_output_budget_exhausted:
+                            if reasoning_output_budget_exhausted:
                                 yield WarningEvent(
                                     code="provider_reasoning_only_retry",
                                     message=(
@@ -12110,6 +12169,10 @@ class Agent:
                     nonlocal workspace_edit_gate_recovery_read_paths
                     nonlocal workspace_edit_gate_recovery_reads_remaining
                     started = time.monotonic()
+                    reliability_started = self._begin_tool_reliability_attempt(
+                        tool_use_id=tc.tool_use_id,
+                        tool_name=tc.tool_name,
+                    )
                     self._write_turn_call_log(
                         "tool_request",
                         iteration=iterations,
@@ -12242,6 +12305,10 @@ class Agent:
                                         STOP_CANCEL_GRACE_SECONDS,
                                     ),
                                 )
+                            self._end_tool_reliability_attempt(
+                                tool_use_id=tc.tool_use_id,
+                                started_at=reliability_started,
+                            )
                             if execution_task is not None and execution_task.done():
                                 try:
                                     settled_result = execution_task.result()
@@ -12265,6 +12332,10 @@ class Agent:
                                 ),
                             )
                     duration_ms = int((time.monotonic() - started) * 1000)
+                    self._end_tool_reliability_attempt(
+                        tool_use_id=tc.tool_use_id,
+                        started_at=reliability_started,
+                    )
                     if len(self._effective_workspace_write_records()) > 0:
                         workspace_edit_gate_details = None
                         workspace_edit_gate_recovery_read_paths.clear()
@@ -12350,6 +12421,11 @@ class Agent:
                                                 timed_out=True,
                                             ),
                                         )
+                                        self._set_tool_reliability_terminal(
+                                            tool_use_id=tc.tool_use_id,
+                                            outcome=ToolOutcome.TIMEOUT,
+                                            error_code=ToolErrorCode.TOOL_TIMEOUT,
+                                        )
                                 return
                             wait_timeout = remaining if interval <= 0 else min(interval, remaining)
                             done, pending = await asyncio.wait(
@@ -12379,6 +12455,11 @@ class Agent:
                                                     reason="runtime_timeout",
                                                     timed_out=True,
                                                 ),
+                                            )
+                                            self._set_tool_reliability_terminal(
+                                                tool_use_id=tc.tool_use_id,
+                                                outcome=ToolOutcome.TIMEOUT,
+                                                error_code=ToolErrorCode.TOOL_TIMEOUT,
                                             )
                                     return
                                 now = time.monotonic()
@@ -12527,6 +12608,11 @@ class Agent:
                 ) -> AsyncIterator[RunHeartbeatEvent]:
                     if not batch:
                         return
+                    for admitted_call in batch:
+                        self._admit_tool_reliability_call(
+                            tool_use_id=admitted_call.tool_use_id,
+                            tool_name=admitted_call.tool_name,
+                        )
                     semaphore = asyncio.Semaphore(self._max_safe_tool_concurrency())
                     keyed_locks: dict[Any, asyncio.Lock] = {}
                     limiters: dict[Any, asyncio.Semaphore] = {}
@@ -12607,12 +12693,22 @@ class Agent:
                         active_ctx = (
                             current_tool_context.get() or self._tool_context or ToolContext()
                         )
-                        async for ev in self._run_one_streaming(tc, active_ctx):
-                            if isinstance(ev, ToolResult):
-                                results_by_id[tc.tool_use_id] = ev
-                                _record_completed_tool_result(ev)
-                            else:
-                                yield ev
+                        meta_reliability_started = self._begin_tool_reliability_attempt(
+                            tool_use_id=tc.tool_use_id,
+                            tool_name=tc.tool_name,
+                        )
+                        try:
+                            async for ev in self._run_one_streaming(tc, active_ctx):
+                                if isinstance(ev, ToolResult):
+                                    results_by_id[tc.tool_use_id] = ev
+                                    _record_completed_tool_result(ev)
+                                else:
+                                    yield ev
+                        finally:
+                            self._end_tool_reliability_attempt(
+                                tool_use_id=tc.tool_use_id,
+                                started_at=meta_reliability_started,
+                            )
                         meta_result = results_by_id.get(tc.tool_use_id)
                         if meta_result is not None and meta_result.terminates_turn:
                             dispatch_boundary = meta_result
@@ -12628,6 +12724,10 @@ class Agent:
                         async for event in _flush_parallel_batch(parallel_batch):
                             yield event
                         parallel_batch = []
+                        self._admit_tool_reliability_call(
+                            tool_use_id=tc.tool_use_id,
+                            tool_name=tc.tool_name,
+                        )
                         async for event in _collect_tool_tasks(
                             {asyncio.create_task(_run_one(tc)): tc}
                         ):
@@ -12761,6 +12861,10 @@ class Agent:
                             result,
                             tool_call=tc,
                         )
+                        self._settle_tool_reliability(
+                            tool_use_id=tc.tool_use_id,
+                            result=result,
+                        )
                         _record_completed_tool_result(projected_result)
                         yield ToolResultEvent(
                             tool_use_id=projected_result.tool_use_id,
@@ -12827,6 +12931,15 @@ class Agent:
                             except KeyError:
                                 approval_entry = None
                             if approval_entry is None or not approval_entry.resolved:
+                                self._set_tool_reliability_terminal(
+                                    tool_use_id=tc.tool_use_id,
+                                    outcome=ToolOutcome.CANCEL,
+                                    error_code=ToolErrorCode.CANCELLED,
+                                )
+                                self._settle_tool_reliability(
+                                    tool_use_id=tc.tool_use_id,
+                                    result=result,
+                                )
                                 turn_yielded = True
                                 break
                             if not approval_entry.approved:
@@ -12851,6 +12964,18 @@ class Agent:
                                     if resolution == "expired"
                                     else "approval_denied"
                                 )
+                                if explicit_human_denial:
+                                    self._set_tool_reliability_terminal(
+                                        tool_use_id=tc.tool_use_id,
+                                        outcome=ToolOutcome.DENIED,
+                                        error_code=ToolErrorCode.POLICY_DENIED,
+                                    )
+                                else:
+                                    self._set_tool_reliability_terminal(
+                                        tool_use_id=tc.tool_use_id,
+                                        outcome=ToolOutcome.CANCEL,
+                                        error_code=ToolErrorCode.CANCELLED,
+                                    )
                                 result = ToolResult(
                                     tool_use_id=tc.tool_use_id,
                                     tool_name=tc.tool_name,
@@ -12875,6 +13000,10 @@ class Agent:
                                 projected_result = await self._project_tool_result_for_delivery(
                                     result,
                                     tool_call=tc,
+                                )
+                                self._settle_tool_reliability(
+                                    tool_use_id=tc.tool_use_id,
+                                    result=result,
                                 )
                                 _record_completed_tool_result(projected_result)
                                 yield ToolResultEvent(
@@ -12908,6 +13037,10 @@ class Agent:
                             _record_completed_tool_result(projected_result)
                             pending_approval = _pending_approval_payload(result.content)
                             if pending_approval is None:
+                                self._settle_tool_reliability(
+                                    tool_use_id=tc.tool_use_id,
+                                    result=result,
+                                )
                                 yield ToolResultEvent(
                                     tool_use_id=projected_result.tool_use_id,
                                     tool_name=projected_result.tool_name,
@@ -12924,6 +13057,10 @@ class Agent:
                                 if replay_event is not None:
                                     yield replay_event
                     elif not deferred_user_input_handled:
+                        self._settle_tool_reliability(
+                            tool_use_id=tc.tool_use_id,
+                            result=result,
+                        )
                         yield ToolResultEvent(
                             tool_use_id=projected_result.tool_use_id,
                             tool_name=projected_result.tool_name,
@@ -18130,6 +18267,9 @@ class Agent:
             turn_id=getattr(self, "_turn_id", None),
             memory_persist_enabled=True,
             usage_tracker=self._usage_tracker,
+            metaskill_usage_recorder=self._metaskill_usage_recorder
+            if callable(self._metaskill_usage_recorder)
+            else None,
             skill_runtime_env=skill_runtime_env,
         )
         return orch, llm_chat, tool_invoker
@@ -19633,14 +19773,11 @@ class Agent:
                 self.config.identical_request_loop_break_threshold
             ),
             deadline_wrapup_margin_seconds=self.config.deadline_wrapup_margin_seconds,
-            reasoning_only_thinking_fallback=self.config.reasoning_only_thinking_fallback,
-            provider_error_thinking_fallback=(self.config.provider_error_thinking_fallback),
             final_diff_salvage=self.config.final_diff_salvage,
             max_iterations_deadline_extend_seconds=(
                 self.config.max_iterations_deadline_extend_seconds
             ),
             final_diff_salvage_veto=self.config.final_diff_salvage_veto,
-            deadline_wrapup_sticky_thinking_off=(self.config.deadline_wrapup_sticky_thinking_off),
             reasoning_only_act_now=self.config.reasoning_only_act_now,
             repeated_tool_call_recovery_threshold=(
                 self.config.repeated_tool_call_recovery_threshold

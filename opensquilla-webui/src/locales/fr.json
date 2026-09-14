@@ -236,7 +236,6 @@
       "setDefaultMode": "Utiliser ce mode par défaut",
       "restoreDefaultMode": "Rétablir le mode d’aperçu par défaut",
       "defaultModeSaved": "Mode d’aperçu par défaut enregistré.",
-      "fullModeNotice": "L’aperçu interactif peut charger du contenu en ligne, sans partager l’identité OpenSquilla, les fichiers locaux ni les connexions du navigateur système.",
       "offlineWebLimits": "Certains contenus externes et certaines fonctions web avancées peuvent être indisponibles dans l’aperçu restreint.",
       "compatibilityFallback": "Cette version Desktop ne prend en charge que l’ancien aperçu à fichier unique.",
       "upgradeDesktopShort": "Mettre Desktop à jour",
@@ -1068,7 +1067,9 @@
       "modelNoMatches": "Aucun modèle correspondant — vous pouvez garder votre saisie.",
       "modelListTruncated": "{shown} modèles sur {total} — continuez à taper pour affiner.",
       "modelProvenance": "Liste fournisseur en direct · source des capacités : {sources}",
-      "modelMetadataProvenance": "Liste fournisseur en direct · valeurs officielles prioritaires, sinon valeurs catalogue"
+      "modelMetadataProvenance": "Liste fournisseur en direct · valeurs officielles prioritaires, sinon valeurs catalogue",
+      "modelMultimodal": "Multimodal",
+      "modelMultimodalTitle": "Accepte les entrées d’image"
     },
     "preset": {
       "modeCustom": "personnalisé"
@@ -1138,6 +1139,7 @@
       "removeCandidateAria": "Retirer {model}",
       "ensembleEmpty": "Aucun modèle candidat pour le moment. Enregistrez les paramètres du service de modèles pour générer les niveaux de routage, ou ajoutez des candidats manuellement.",
       "ensemblePipeline": "Fonctionnement : les modèles proposants rédigent en parallèle, puis l'agrégateur fusionne les brouillons en réponse finale. Seul l'agrégateur peut appeler des outils.",
+      "candidateModelHint": "Le badge Multimodal indique qu’un modèle accepte les images. Les requêtes avec image suivent la route configurée compatible avec les images.",
       "ensembleFlowDesc": "Plusieurs modèles rédigent en parallèle ; un agrégateur les fusionne en une réponse. Plus d'appels.",
       "legacyDynamicNotice": "Cet ancien plan de fusion suit les niveaux de modèle enregistrés. Convertissez-le en composition personnalisée pour modifier ses membres.",
       "legacyDynamicMigrate": "Convertir en composition personnalisée",
@@ -1693,8 +1695,13 @@
     },
     "privacy": {
       "statusDisabledByEnv": "Désactivés par un paramètre d’environnement.",
-      "networkReportingLabel": "Diagnostics et mises à jour",
-      "networkReportingDesc": "Partage des données de diagnostic produit limitées et recherche les mises à jour. Le contenu des conversations, les fichiers et les requêtes de modèle ne sont pas envoyés."
+      "statusNotChosen": "Aucun choix n’a encore été enregistré. Aucune donnée n’est envoyée avant l’activation.",
+      "reliabilityDiagnosticsLabel": "Diagnostics de stabilité",
+      "reliabilityDiagnosticsDesc": "Partagez les résultats d’opération, les durées et des empreintes d’erreur respectueuses de la vie privée afin de diagnostiquer les plantages et les échecs. Le contenu des conversations et des fichiers n’est jamais inclus.",
+      "productAnalyticsLabel": "Analyse du produit et de la croissance",
+      "productAnalyticsDesc": "Partagez les jalons d’activation et le nombre d’exécutions de MetaSkill et du mode programmation après leur démarrage effectif, afin de mesurer la conversion et l’utilisation des fonctions. Le contenu des conversations, les paramètres de tâche, les fichiers et les identifiants de compte bruts ne sont jamais inclus ; un identifiant analytique aléatoire et dédié est utilisé.",
+      "networkReportingLabel": "Interrupteur principal des diagnostics réseau",
+      "networkReportingDesc": "Contrôle principal des diagnostics réseau, des analyses et des recherches de mises à jour. Sa désactivation remplace les deux choix ci-dessous."
     },
     "toast": {
       "loadFailed": "Échec du chargement des paramètres : {error}",

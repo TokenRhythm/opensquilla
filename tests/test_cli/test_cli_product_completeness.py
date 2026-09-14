@@ -1412,7 +1412,7 @@ def test_cron_commands_use_existing_rpc_payloads(monkeypatch):
     fake.rpc_payloads = {
         "cron.list": [{"id": "job-1", "name": "Daily", "agentId": "main"}],
         "cron.status": {"id": "job-1", "name": "Daily"},
-        "cron.add": {"id": "job-2", "expression": "*/5 * * * *"},
+        "cron.create": {"id": "job-2", "expression": "*/5 * * * *"},
         "cron.update": {"id": "job-1", "enabled": False},
         "cron.runs": [{"id": "run-1", "status": "ok"}],
     }
@@ -1448,7 +1448,7 @@ def test_cron_commands_use_existing_rpc_payloads(monkeypatch):
     assert ("cron.list", {"agentId": "main"}) in fake.calls
     assert ("cron.status", {"id": "job-1"}) in fake.calls
     assert (
-        "cron.add",
+        "cron.create",
         {
             "expression": "*/5 * * * *",
             "text": "check in",

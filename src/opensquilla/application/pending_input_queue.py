@@ -572,7 +572,7 @@ class PendingInputQueue:
                         command.expected_turn_id, "expected_turn_id"
                     )
                     return rejected_steer(
-                        SteerTurn(key, message, "durable", expected_turn_id=expected_turn),
+                        SteerTurn(key, message, expected_turn_id=expected_turn),
                         failure_code="STEER_UNSUPPORTED_INPUT",
                         capability={
                             "mode": "queue_only",
@@ -587,7 +587,6 @@ class PendingInputQueue:
                 SteerTurn(
                     session_key=key,
                     message=message,
-                    mode="durable",
                     expected_turn_id=command.expected_turn_id,
                     client_request_id=request_id,
                     client_message_id=message_id,

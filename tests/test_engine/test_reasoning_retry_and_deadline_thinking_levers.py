@@ -1,4 +1,4 @@
-"""Provider thinking fallback and retired experiment compatibility."""
+"""Provider retry thinking-contract and retired experiment compatibility."""
 
 from __future__ import annotations
 
@@ -114,7 +114,6 @@ async def test_retired_experiment_config_does_not_preempt_a_normal_turn() -> Non
         config=AgentConfig(
             thinking=ThinkingLevel.MEDIUM,
             timeout=60,
-            deadline_thinking_off_margin_seconds=120,
             finalize_evidence_strict=True,
             finalize_variant_challenge=True,
             submit_review_enabled=True,
@@ -156,36 +155,7 @@ async def test_retired_experiment_config_does_not_preempt_a_normal_turn() -> Non
 
 
 @pytest.mark.asyncio
-async def test_reasoning_only_fallback_disables_thinking_on_retry() -> None:
-    provider = _SequenceProvider([_reasoning_only_done(), _final_text()])
-    agent = Agent(
-        provider=provider,
-        config=AgentConfig(
-            thinking=ThinkingLevel.MEDIUM,
-            reasoning_only_thinking_fallback=True,
-            retry_base_backoff_ms=0,
-            retry_max_backoff_ms=0,
-        ),
-    )
-
-    events = [event async for event in agent.run_turn("hello")]
-
-    assert [event.kind for event in events if event.kind == "error"] == []
-    warning = next(
-        event
-        for event in events
-        if event.kind == "warning" and event.code == "provider_reasoning_only_retry"
-    )
-    assert "thinking disabled" in warning.message
-    done = next(event for event in events if event.kind == "done")
-    assert done.text == "ok"
-    assert len(provider.calls) == 2
-    assert provider.calls[0]["config"].thinking is True
-    assert provider.calls[1]["config"].thinking is False
-
-
-@pytest.mark.asyncio
-async def test_reasoning_only_fallback_default_off_keeps_thinking() -> None:
+async def test_reasoning_only_retry_preserves_thinking() -> None:
     provider = _SequenceProvider([_reasoning_only_done(), _final_text()])
     agent = Agent(
         provider=provider,
@@ -203,15 +173,13 @@ async def test_reasoning_only_fallback_default_off_keeps_thinking() -> None:
         for event in events
         if event.kind == "warning" and event.code == "provider_reasoning_only_retry"
     )
-    assert "thinking disabled" not in warning.message
+    assert "request visible content" in warning.message
     assert len(provider.calls) == 2
-    assert provider.calls[1]["config"].thinking is True
+    assert all(call["config"].thinking is True for call in provider.calls)
 
 
 @pytest.mark.asyncio
-async def test_reasoning_only_fallback_restores_thinking_after_retry_call() -> None:
-    # Retry (thinking off) returns a tool call; the next iteration's provider
-    # call must run with thinking re-enabled — the fallback is one-shot.
+async def test_reasoning_only_retry_preserves_thinking_across_tool_iteration() -> None:
     provider = _SequenceProvider(
         [_reasoning_only_done(), _echo_tool_call("use-1"), _final_text()]
     )
@@ -219,7 +187,6 @@ async def test_reasoning_only_fallback_restores_thinking_after_retry_call() -> N
         provider,
         AgentConfig(
             thinking=ThinkingLevel.MEDIUM,
-            reasoning_only_thinking_fallback=True,
             max_iterations=5,
             retry_base_backoff_ms=0,
             retry_max_backoff_ms=0,
@@ -230,13 +197,11 @@ async def test_reasoning_only_fallback_restores_thinking_after_retry_call() -> N
 
     assert any(event.kind == "done" for event in events)
     assert len(provider.calls) == 3
-    assert provider.calls[0]["config"].thinking is True
-    assert provider.calls[1]["config"].thinking is False
-    assert provider.calls[2]["config"].thinking is True
+    assert all(call["config"].thinking is True for call in provider.calls)
 
 
 @pytest.mark.asyncio
-async def test_provider_error_thinking_fallback_default_on_disables_retry() -> None:
+async def test_provider_reasoning_error_surfaces_without_changing_thinking() -> None:
     provider = _SequenceProvider(
         [
             [ProviderError(message="reasoning is unavailable", code="400")],
@@ -247,32 +212,6 @@ async def test_provider_error_thinking_fallback_default_on_disables_retry() -> N
         provider=provider,
         config=AgentConfig(
             thinking=ThinkingLevel.MEDIUM,
-            retry_base_backoff_ms=0,
-            retry_max_backoff_ms=0,
-        ),
-    )
-
-    events = [event async for event in agent.run_turn("hello")]
-
-    assert any(event.kind == "done" for event in events)
-    assert len(provider.calls) == 2
-    assert provider.calls[0]["config"].thinking is True
-    assert provider.calls[1]["config"].thinking is False
-
-
-@pytest.mark.asyncio
-async def test_provider_error_thinking_fallback_strict_off_never_disables() -> None:
-    provider = _SequenceProvider(
-        [
-            [ProviderError(message="reasoning is unavailable", code="400")],
-            _final_text(),
-        ]
-    )
-    agent = Agent(
-        provider=provider,
-        config=AgentConfig(
-            thinking=ThinkingLevel.MEDIUM,
-            provider_error_thinking_fallback=False,
             retry_base_backoff_ms=0,
             retry_max_backoff_ms=0,
         ),
@@ -281,42 +220,5 @@ async def test_provider_error_thinking_fallback_strict_off_never_disables() -> N
     events = [event async for event in agent.run_turn("hello")]
 
     assert any(event.kind == "error" for event in events)
-    assert provider.calls
+    assert len(provider.calls) == 1
     assert all(call["config"].thinking is True for call in provider.calls)
-
-
-def test_reasoning_only_thinking_fallback_env_plumbing(monkeypatch: pytest.MonkeyPatch) -> None:
-    # Helper-level check only; the full env -> bootstrap-stage -> AgentConfig
-    # threading is covered in turn_runner/test_agent_bootstrap_stage_unit.py.
-    from opensquilla.engine.turn_runner.agent_bootstrap_stage import (
-        _bool_from_env,
-    )
-
-    monkeypatch.delenv("OPENSQUILLA_REASONING_ONLY_THINKING_FALLBACK", raising=False)
-    assert _bool_from_env("OPENSQUILLA_REASONING_ONLY_THINKING_FALLBACK", False) is False
-    monkeypatch.setenv("OPENSQUILLA_REASONING_ONLY_THINKING_FALLBACK", "1")
-    assert _bool_from_env("OPENSQUILLA_REASONING_ONLY_THINKING_FALLBACK", False) is True
-
-
-def test_agent_config_preserves_thinking_fallback_defaults() -> None:
-    config = AgentConfig()
-
-    assert config.reasoning_only_thinking_fallback is False
-    assert config.provider_error_thinking_fallback is True
-
-
-def test_provider_error_thinking_fallback_env_is_strict(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    from opensquilla.engine.turn_runner.agent_bootstrap_stage import (
-        _strict_bool_from_env,
-    )
-
-    name = "OPENSQUILLA_PROVIDER_ERROR_THINKING_FALLBACK"
-    monkeypatch.delenv(name, raising=False)
-    assert _strict_bool_from_env(name, True) is True
-    monkeypatch.setenv(name, "off")
-    assert _strict_bool_from_env(name, True) is False
-    monkeypatch.setenv(name, "of")
-    with pytest.raises(ValueError, match=name):
-        _strict_bool_from_env(name, True)

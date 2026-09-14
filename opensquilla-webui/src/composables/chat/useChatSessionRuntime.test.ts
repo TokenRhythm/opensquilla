@@ -1,8 +1,15 @@
 import { ref } from 'vue'
-import { describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
-import { useChatSessionRuntime, type ChatUsageAccumulator } from './useChatSessionRuntime'
+import { useChatSessionRuntime, type ChatUsageAccumulator, type UseChatSessionRuntimeOptions } from './useChatSessionRuntime'
+import { useChatAttachments } from './useChatAttachments'
 import type { ChatMessage } from '@/types/chat'
+
+const pushToast = vi.hoisted(() => vi.fn())
+
+vi.mock('@/composables/useToasts', () => ({
+  useToasts: () => ({ pushToast }),
+}))
 
 function emptyUsage(): ChatUsageAccumulator {
   return {
@@ -15,6 +22,173 @@ function emptyUsage(): ChatUsageAccumulator {
     sessionSaved: 0,
   }
 }
+
+describe('useChatSessionRuntime attachment ownership', () => {
+  class DeferredFileReader {
+    onload: ((event: { target: { result: string } }) => void) | null = null
+    onerror: (() => void) | null = null
+
+    readAsDataURL() {
+      readers.push(this)
+    }
+
+    finish() {
+      this.onload?.({ target: { result: 'data:image/jpeg;base64,/9j/' } })
+    }
+  }
+  let readers: DeferredFileReader[]
+
+  beforeEach(() => {
+    readers = []
+    pushToast.mockClear()
+    vi.stubGlobal('FileReader', DeferredFileReader)
+  })
+
+  afterEach(() => {
+    vi.unstubAllGlobals()
+  })
+
+  function createRuntime(overrides: Partial<UseChatSessionRuntimeOptions> = {}) {
+    const attachments = useChatAttachments()
+    const sessionKey = ref('agent:main:webchat:first')
+    const runtime = useChatSessionRuntime({
+      sessionKey,
+      messages: ref<ChatMessage[]>([]),
+      pendingSessionIntent: ref(null),
+      routerDecisionPending: ref(null),
+      currentEpoch: ref(0),
+      lastStreamSeq: ref(0),
+      activeTaskGroups: ref(new Set<string>()),
+      aborted: ref(false),
+      lastHeaderRole: ref(''),
+      lastHeaderDay: ref(''),
+      usageAccum: ref(emptyUsage()),
+      usageModel: ref(''),
+      createSessionKey: () => 'agent:main:webchat:new-draft',
+      persistSession: key => { sessionKey.value = key },
+      cancelSessionBootstrap: vi.fn(),
+      startSessionBootstrap: () => ({
+        generation: 1,
+        criticalRequestsQueued: Promise.resolve(),
+        history: Promise.resolve({ ok: true }),
+        live: Promise.resolve({ authoritative: true, live: false, backgroundOnly: false }),
+      }),
+      loadCurrentSessionUsage: vi.fn(),
+      applySessionRunState: vi.fn(),
+      setCompactInFlight: vi.fn(),
+      hideCompactStatus: vi.fn(),
+      clearPendingQueue: vi.fn(),
+      switchPendingQueue: vi.fn(),
+      adoptPendingQueue: vi.fn(),
+      resetSavingsPopupCooldown: vi.fn(),
+      restoreWidgetState: vi.fn(),
+      resetStreamLiveTurnState: vi.fn(),
+      retireAttachments: attachments.retireAttachments,
+      ...overrides,
+    })
+    const addImage = (name: string) => attachments.addAttachment(
+      new File([new Uint8Array([0xff, 0xd8, 0xff])], name, { type: 'image/jpeg' }),
+    )
+    return { runtime, attachments, sessionKey, addImage }
+  }
+
+  it.each(['navigate', 'new task', 'slash reset'])(
+    'retires unsent files and late reads on %s',
+    async (transition) => {
+      const { runtime, attachments, addImage } = createRuntime()
+      await addImage('ready.jpg')
+      readers[0].finish()
+      await addImage('reading.jpg')
+
+      if (transition === 'navigate') await runtime.switchToSession('agent:main:webchat:second')
+      else if (transition === 'new task') await runtime.startDraftSession()
+      else runtime.resetCurrentSessionAfterSlash()
+
+      expect(attachments.pendingAttachments.value).toEqual([])
+      expect(attachments.hasPendingAttachmentWork()).toBe(false)
+      await addImage('current.jpg')
+      readers[1].finish()
+      readers[1].onerror?.()
+      readers[2].finish()
+
+      expect(attachments.pendingAttachments.value).toMatchObject([
+        { kind: 'inline', name: 'current.jpg' },
+      ])
+      expect(pushToast).not.toHaveBeenCalled()
+    },
+  )
+
+  it.each(['response handoff', 'draft rebind'])(
+    'preserves the composer and in-flight reads during %s',
+    async (transition) => {
+      const { runtime, attachments, addImage } = createRuntime()
+      await addImage('ready.jpg')
+      readers[0].finish()
+      await addImage('reading.jpg')
+
+      if (transition === 'response handoff') {
+        await runtime.adoptResponseSession('agent:main:webchat:accepted', 'request-1')
+      } else {
+        await runtime.rebindDraftSession('agent:main:webchat:server-draft', () => true)
+      }
+      readers[1].finish()
+
+      expect(attachments.pendingAttachments.value).toMatchObject([
+        { kind: 'inline', name: 'ready.jpg' },
+        { kind: 'inline', name: 'reading.jpg' },
+      ])
+      expect(pushToast).not.toHaveBeenCalled()
+    },
+  )
+
+  it('retires attachments only when delayed navigation commits', async () => {
+    let finishQueue!: () => void
+    const queue = new Promise<void>(resolve => { finishQueue = resolve })
+    const { runtime, attachments, addImage } = createRuntime({
+      switchPendingQueue: () => queue,
+    })
+    await addImage('source.jpg')
+
+    const switching = runtime.switchToSession('agent:main:webchat:second')
+    readers[0].finish()
+    expect(attachments.pendingAttachments.value).toMatchObject([{ kind: 'inline', name: 'source.jpg' }])
+
+    finishQueue()
+    await switching
+    expect(attachments.pendingAttachments.value).toEqual([])
+  })
+
+  it.each(['failed', 'superseded', 'unchanged'])(
+    'preserves attachments after %s navigation',
+    async (outcome) => {
+      let finishQueue!: () => void
+      const queue = new Promise<void>(resolve => { finishQueue = resolve })
+      const { runtime, attachments, sessionKey, addImage } = createRuntime({
+        switchPendingQueue: () => outcome === 'failed'
+          ? Promise.reject(new Error('queue unavailable'))
+          : queue,
+      })
+      await addImage('source.jpg')
+
+      if (outcome === 'unchanged') {
+        await runtime.switchToSession(sessionKey.value)
+      } else {
+        const switching = runtime.switchToSession('agent:main:webchat:second')
+        if (outcome === 'failed') {
+          await expect(switching).rejects.toThrow('queue unavailable')
+        } else {
+          await runtime.switchToSession(sessionKey.value)
+          finishQueue()
+          await switching
+        }
+      }
+      readers[0].finish()
+
+      expect(sessionKey.value).toBe('agent:main:webchat:first')
+      expect(attachments.pendingAttachments.value).toMatchObject([{ kind: 'inline', name: 'source.jpg' }])
+    },
+  )
+})
 
 describe('useChatSessionRuntime Meta draft recovery', () => {
   it('rebinds an untouched provisional draft without persisting it', async () => {

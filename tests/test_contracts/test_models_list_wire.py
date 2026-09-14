@@ -95,6 +95,12 @@ def test_model_row_values_map_from_model_info() -> None:
     assert row["metadata"] is None
 
 
+def test_model_row_exposes_vision_capability() -> None:
+    row = model_info_to_projection(_synthetic_model(supports_vision=True))
+
+    assert "vision" in row["capabilities"]
+
+
 def test_model_row_carries_normalized_provider_metadata() -> None:
     metadata = {
         "schemaVersion": 1,

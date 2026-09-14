@@ -16,6 +16,62 @@ from opensquilla.tools.types import SafeToolError, ToolContext, ToolError, curre
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("final_answer", ["The image contains blue pixels.", ""])
+async def test_image_analysis_retries_reasoning_only_once_without_changing_model_or_thinking(
+    tmp_path: Path, final_answer: str,
+) -> None:
+    from opensquilla.provider.correlation_context import bind_provider_request_correlation
+    from opensquilla.provider.types import (
+        ChatConfig,
+        DoneEvent,
+        ProviderRequestCorrelation,
+        ReasoningDeltaEvent,
+        TextDeltaEvent,
+    )
+    from tests.helpers.image_bytes import image_bytes
+
+    (tmp_path / "sample.png").write_bytes(image_bytes())
+    calls = []
+
+    class Provider:
+        provider_name = "openai"
+        model = "configured-vision"
+
+        async def chat(self, messages, config):
+            calls.append((messages, config))
+            yield ReasoningDeltaEvent(text="internal reasoning")
+            if len(calls) == 2 and final_answer:
+                yield TextDeltaEvent(text=final_answer)
+            yield DoneEvent(reasoning_content="internal reasoning")
+
+    provider = Provider()
+    config = ChatConfig(model_vision_support="supported", thinking=True)
+    token = current_tool_context.set(ToolContext(
+        workspace_dir=str(tmp_path), image_analysis_target=lambda: (provider, config),
+    ))
+    try:
+        with bind_provider_request_correlation(ProviderRequestCorrelation(
+            session_id="test-session", turn_id="test-turn", execution_id="test-call",
+            call_kind="primary",
+        )):
+            result = json.loads(await media.image("sample.png"))
+    finally:
+        current_tool_context.reset(token)
+
+    assert len(calls) == 2
+    assert calls[0][0] == calls[1][0]
+    assert all(call_config.thinking is True for _, call_config in calls)
+    correlations = [call_config.provider_request_correlation for _, call_config in calls]
+    assert correlations[0].execution_id != correlations[1].execution_id
+    assert "internal reasoning" not in json.dumps(result)
+    if final_answer:
+        assert result["description"] == final_answer
+    else:
+        assert result["status"] == "analysis_failed"
+        assert "description" not in result
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("bound_target", [False, True])
 async def test_image_tool_does_not_select_a_separate_model(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, bound_target: bool,
@@ -116,6 +172,7 @@ async def test_agent_binds_image_tool_to_actual_selected_deployment(
     expected_auxiliary_calls: int | None = None, tool_count: int = 1,
     with_tracker: bool = False, duplicate_done: bool = False,
     reject_initial_image: bool = False,
+    reasoning_only_first_analysis: bool = False,
 ) -> None:
     from types import SimpleNamespace
 
@@ -134,6 +191,7 @@ async def test_agent_binds_image_tool_to_actual_selected_deployment(
         Message,
         ModelCapabilities,
         ProviderRequestCorrelation,
+        ReasoningDeltaEvent,
         TextDeltaEvent,
         ToolDefinition,
         ToolInputSchema,
@@ -153,7 +211,10 @@ async def test_agent_binds_image_tool_to_actual_selected_deployment(
         async def chat(self, messages, tools=None, config=None):
             if config.provider_request_correlation.call_kind == "auxiliary.media":
                 auxiliary_calls.append((messages, tools, config))
-                yield TextDeltaEvent(text="Image description")
+                if reasoning_only_first_analysis and len(auxiliary_calls) == 1:
+                    yield ReasoningDeltaEvent(text="internal reasoning")
+                else:
+                    yield TextDeltaEvent(text="Image description")
                 receipt = DoneEvent(
                     model=self.model, input_tokens=77, output_tokens=8,
                     billed_cost=1.0, cost_source="provider_billed",
@@ -254,7 +315,9 @@ async def test_agent_binds_image_tool_to_actual_selected_deployment(
     allowed = support == "supported" and not ensemble
     call_count = int(allowed) if expected_auxiliary_calls is None else expected_auxiliary_calls
     assert len(auxiliary_calls) == call_count
-    assert len([result for result in tool_results if "description" in result]) == call_count
+    assert len([result for result in tool_results if "description" in result]) == (
+        max(0, call_count - 1) if reasoning_only_first_analysis else call_count
+    )
     if auxiliary_calls:
         assert auxiliary_calls[0][1] is None
         assert auxiliary_calls[0][2].physical_attempt_limit == 1
@@ -309,6 +372,20 @@ async def test_image_tool_shares_the_turn_hard_budget(
     await test_agent_binds_image_tool_to_actual_selected_deployment(
         tmp_path, "supported", False, False, budget=budget,
         expected_error=error, expected_auxiliary_calls=calls, tool_count=tool_count,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("call_limit", [0, 2])
+async def test_image_analysis_empty_retry_obeys_turn_call_limit_and_accounts_each_attempt(
+    tmp_path: Path, call_limit: int,
+) -> None:
+    await test_agent_binds_image_tool_to_actual_selected_deployment(
+        tmp_path, "supported", False, False,
+        budget={"max_turn_llm_calls": call_limit},
+        expected_error="turn_llm_call_budget_exceeded" if call_limit else None,
+        expected_auxiliary_calls=1 if call_limit else 2,
+        reasoning_only_first_analysis=True,
     )
 
 
@@ -545,6 +622,38 @@ async def test_fetch_image_url_resolves_relative_redirect_against_logical_url(
     ]
     assert image_bytes == b"png-bytes"
     assert media_type == "image/png"
+
+
+@pytest.mark.asyncio
+async def test_fetch_image_url_reports_http_status_for_expired_or_missing_url(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import httpx
+
+    class MissingClient:
+        def __init__(self, **kwargs: object) -> None:
+            pass
+
+        async def __aenter__(self) -> MissingClient:
+            return self
+
+        async def __aexit__(self, *args: object) -> None:
+            return None
+
+        async def get(self, url: str) -> httpx.Response:
+            return httpx.Response(
+                404,
+                request=httpx.Request("GET", url),
+            )
+
+    monkeypatch.setattr(media, "validate_http_url_for_fetch", lambda url: ["93.184.216.34"])
+    monkeypatch.setattr(httpx, "AsyncClient", MissingClient)
+    monkeypatch.setattr(
+        "opensquilla.tools.ssrf.pinned_transport", lambda *args, **kwargs: object()
+    )
+
+    with pytest.raises(ToolError, match=r"HTTP 404 \(Not Found\)"):
+        await media._fetch_image_url("https://images.example.test/expired.png")
 
 
 @pytest.mark.asyncio

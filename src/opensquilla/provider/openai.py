@@ -12,7 +12,7 @@ import sys
 from collections import Counter
 from collections.abc import AsyncIterator, Iterator, Mapping
 from copy import deepcopy
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from typing import Any, cast
 from urllib.parse import urlparse
@@ -51,6 +51,7 @@ from .error_redaction import (
     redact_upstream_error_text,
     redacted_httpx_error,
 )
+from .extra_body import merge_extra_body, normalize_extra_body
 from .failures import retry_after_from_headers
 from .fx import TOKENRHYTHM_CNY_PER_USD, TOKENRHYTHM_CNY_PER_USD_NANOS
 from .model_catalog import shared_catalog
@@ -251,7 +252,7 @@ def _is_inert_post_terminal_stream_frame(
         return False
 
     if not raw_choices:
-        return has_usage
+        return has_usage or policy.allow_post_terminal_empty_choices
     if not policy.allow_post_terminal_noop_choice or len(raw_choices) != 1:
         return False
 
@@ -376,6 +377,17 @@ def _model_listing_max_output(row: Mapping[str, Any]) -> int:
     raw_top_provider = row.get("top_provider")
     top_provider = raw_top_provider if isinstance(raw_top_provider, Mapping) else {}
     return _positive_model_listing_int(top_provider.get("max_completion_tokens"))
+
+
+def _model_listing_supports_vision(row: Mapping[str, Any]) -> bool:
+    """Read the standard OpenRouter modality declaration when present."""
+    architecture = row.get("architecture")
+    if not isinstance(architecture, Mapping):
+        return False
+    modalities = architecture.get("input_modalities")
+    if not isinstance(modalities, list):
+        return False
+    return any(str(modality).strip().lower() == "image" for modality in modalities)
 
 
 def _dashscope_endpoint_family(base_url: str) -> str:
@@ -1008,13 +1020,6 @@ def _apply_compat_request_constraints(
     tool_choice_auto_only = policy.thinking_tool_choice_auto_only or bool(
         reasoning_rule and reasoning_rule.thinking_tool_choice_auto_only
     )
-    prefer_pinned_over_thinking = (
-        policy.prefer_pinned_tool_choice_over_thinking
-        or bool(
-            reasoning_rule
-            and reasoning_rule.prefer_pinned_tool_choice_over_thinking
-        )
-    )
     if (
         tool_choice_auto_only
         and (
@@ -1025,34 +1030,12 @@ def _apply_compat_request_constraints(
         and "tool_choice" in payload
     ):
         tool_choice = payload["tool_choice"]
-        pinned_tool_choice = False
         if isinstance(tool_choice, Mapping):
             tool_choice_type = tool_choice.get("type")
-            pinned_tool_choice = tool_choice_type in {"tool", "function"}
         else:
             tool_choice_type = tool_choice
         if tool_choice_type in {"auto", "none"}:
             payload["tool_choice"] = tool_choice_type
-        elif (
-            prefer_pinned_over_thinking
-            and pinned_tool_choice
-            and not force_thinking
-        ):
-            if reasoning_rule and reasoning_rule.reasoning_format:
-                apply_reasoning_disable(
-                    payload,
-                    reasoning_rule.reasoning_format,
-                    ReasoningDisableArgs(model=model),
-                )
-            else:
-                payload["enable_thinking"] = False
-            payload.pop("thinking_budget", None)
-            payload.pop("reasoning_effort", None)
-            payload.pop("preserve_thinking", None)
-            if reasoning_rule is None:
-                for message in payload.get("messages", ()):
-                    if isinstance(message, dict):
-                        message.pop("reasoning_content", None)
         else:
             # The endpoint rejects required/pinned choices while thinking.
             # Preserve the requested reasoning mode and degrade the selector
@@ -3141,6 +3124,7 @@ class OpenAIProvider:
         compat: OpenAICompatPolicy | None = None,
         replay_provider_state: bool = True,
         provider_id: str | None = None,
+        extra_body: Mapping[str, Any] | None = None,
     ) -> None:
         self._api_key = clean_header_secret(api_key, label="LLM API key")
         self._model = model
@@ -3166,7 +3150,16 @@ class OpenAIProvider:
         # DashScope or OpenRouter instance to OpenAI, which is exactly what
         # this field exists to prevent.
         self.provider_id = (provider_id or self._provider_kind).strip()
-        self._compat = compat or compat_policy_for_kind(self._provider_kind)
+        if extra_body and self.provider_id.lower() != "custom":
+            raise ValueError("extra_body is supported only for provider 'custom'")
+        self._extra_body = normalize_extra_body(extra_body)
+        compat_policy = compat or compat_policy_for_kind(self._provider_kind)
+        if self.provider_id.lower() == "custom":
+            compat_policy = replace(
+                compat_policy,
+                allow_post_terminal_empty_choices=True,
+            )
+        self._compat = compat_policy
         self._replay_provider_state = replay_provider_state
         self._replay_source = _openai_replay_source(self._provider_kind, self._base_url)
         self._replay_captured_reasoning_content = (
@@ -3576,6 +3569,7 @@ class OpenAIProvider:
             cfg=cfg,
             has_tools=bool(tools),
         )
+        merge_extra_body(payload, self._extra_body)
         fallback_reason = (
             "native_is_error_unavailable"
             if any(message.get("role") == "tool" for message in openai_messages)
@@ -6478,6 +6472,7 @@ class OpenAIProvider:
                             display_name=m.get("name", m.get("id", "")),
                             context_window=m.get("context_length", 0),
                             max_output_tokens=_model_listing_max_output(m),
+                            supports_vision=_model_listing_supports_vision(m),
                         )
                         for m in rows
                         if m.get("id")

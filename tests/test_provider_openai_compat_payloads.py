@@ -1019,6 +1019,7 @@ def test_openrouter_list_models_reports_openrouter_provider(monkeypatch: Any) ->
                         "name": "DeepSeek V4 Flash",
                         "context_length": 128000,
                         "top_provider": {"max_completion_tokens": 8192},
+                        "architecture": {"input_modalities": ["text", "image"]},
                     }
                 ]
             },
@@ -1037,6 +1038,7 @@ def test_openrouter_list_models_reports_openrouter_provider(monkeypatch: Any) ->
     assert captured["url"] == "https://openrouter.ai/api/v1/models"
     assert rows[0].provider == "openrouter"
     assert rows[0].model_id == "deepseek/deepseek-v4-flash"
+    assert rows[0].supports_vision is True
 
 
 def test_openrouter_http_error_names_provider_request(monkeypatch: Any) -> None:

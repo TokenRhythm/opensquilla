@@ -40,4 +40,3 @@ def reset_contextvar_token(var: ContextVar[Any], token: Any) -> None:
         var.reset(token)
     except ValueError:
         pass
-

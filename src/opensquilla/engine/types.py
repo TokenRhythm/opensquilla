@@ -863,18 +863,6 @@ class AgentConfig:
     # so the model can still apply and verify its final changes. Set via
     # OPENSQUILLA_DEADLINE_WRAPUP_MARGIN_SECONDS.
     deadline_wrapup_margin_seconds: int = 0
-    # Retry the reasoning-only provider failure with thinking disabled instead
-    # of re-requesting visible content with thinking still enabled. Off by
-    # default (the retry keeps thinking on). Set via
-    # OPENSQUILLA_REASONING_ONLY_THINKING_FALLBACK.
-    reasoning_only_thinking_fallback: bool = False
-    # Retry provider errors mentioning thinking/reasoning with thinking
-    # disabled. Historical default on; strict benchmark arms can turn it off
-    # with OPENSQUILLA_PROVIDER_ERROR_THINKING_FALLBACK so every request keeps
-    # the frozen thinking contract.
-    provider_error_thinking_fallback: bool = True
-    # Deprecated, unused compatibility slot; preserve construction and saved configs.
-    deadline_thinking_off_margin_seconds: int = 0
     # Deprecated, unused compatibility slot; preserve positional/keyword construction.
     reasoning_stream_char_cap: int = 0
     # Re-apply captured source-diff candidates whose paths end the turn with
@@ -901,11 +889,6 @@ class AgentConfig:
     final_diff_salvage_veto: bool = False
     # Deprecated, unused compatibility slot; preserve positional/keyword construction.
     endgame_git_freeze_instrumentation_exempt: bool = False
-    # Make the wrap-up preempt's thinking-off sticky: when the wrap-up
-    # directive preempts a reasoning stream, disable thinking for every
-    # remaining provider call this turn instead of the next call only. Off by
-    # default. Set via OPENSQUILLA_DEADLINE_WRAPUP_STICKY_THINKING_OFF.
-    deadline_wrapup_sticky_thinking_off: bool = False
     # Deprecated, unused compatibility slot; preserve positional/keyword construction.
     endgame_fix_directive_margin_seconds: int = 0
     # Inject an act-now user message when a provider response is reasoning

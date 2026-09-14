@@ -168,7 +168,6 @@
           "_guest_profile_for_principal",
           "_handle_sessions_abort_contract",
           "_handle_sessions_send_contract",
-          "_handle_sessions_steer_contract",
           "_handle_sessions_steer_v2_contract",
           "_is_remote_web_guest",
           "_list_transcript_titles",

@@ -176,6 +176,77 @@ describe('useChatAttachments', () => {
     expect(pushToast).toHaveBeenCalledWith('Empty file: empty.txt', { tone: 'danger' })
   })
 
+  it('ignores a late inline image read after the attachment session is retired', async () => {
+    let reader: { onload: ((event: { target: { result: string } }) => void) | null } | undefined
+    class DeferredFileReader {
+      onload: ((event: { target: { result: string } }) => void) | null = null
+      onerror: (() => void) | null = null
+
+      readAsDataURL() {
+        reader = this
+      }
+    }
+    vi.stubGlobal('FileReader', DeferredFileReader)
+
+    const attachments = useChatAttachments()
+    await attachments.addAttachment(new File([new Uint8Array([0xff, 0xd8, 0xff])], 'photo.jpg', { type: 'image/jpeg' }))
+
+    expect(attachments.pendingAttachments.value).toMatchObject([{ kind: 'inline_pending', name: 'photo.jpg' }])
+    attachments.retireAttachments()
+    reader?.onload?.({ target: { result: 'data:image/jpeg;base64,/9j/' } })
+
+    expect(attachments.pendingAttachments.value).toEqual([])
+  })
+
+  it.each(['success', 'failure'])('ignores late upload %s after attachment retirement', async (outcome) => {
+    let resolveOldUpload!: (response: unknown) => void
+    let resolveCurrentUpload!: (response: unknown) => void
+    const fetchMock = vi.fn()
+      .mockImplementationOnce(() => new Promise(resolve => { resolveOldUpload = resolve }))
+      .mockImplementationOnce(() => new Promise(resolve => { resolveCurrentUpload = resolve }))
+    vi.stubGlobal('fetch', fetchMock)
+    const attachments = useTestChatAttachments()
+
+    await attachments.addAttachment(stagedPdf('old.pdf'))
+    attachments.retireAttachments()
+    await attachments.addAttachment(stagedPdf('current.pdf'))
+    resolveOldUpload(outcome === 'success'
+      ? successfulUploadResponse('old-file')
+      : { ok: false, status: 503, text: async () => 'upload unavailable' })
+    await flushUpload()
+
+    expect(attachments.pendingAttachments.value).toMatchObject([{ kind: 'uploading', name: 'current.pdf' }])
+    expect(attachments.hasPendingAttachmentWork()).toBe(true)
+    expect(pushToast).not.toHaveBeenCalled()
+
+    resolveCurrentUpload(successfulUploadResponse('current-file'))
+    await flushUpload()
+    expect(attachments.pendingAttachments.value).toMatchObject([
+      { kind: 'staged', name: 'current.pdf', file_uuid: 'current-file' },
+    ])
+    expect(attachments.hasPendingAttachmentWork()).toBe(false)
+  })
+
+  it('stops a retired batch while its file type is being read', async () => {
+    let finishRead!: (buffer: ArrayBuffer) => void
+    const unknownFile = new File(['text'], 'sample.unknown', { type: '' })
+    vi.spyOn(unknownFile, 'arrayBuffer').mockImplementation(() => new Promise(resolve => {
+      finishRead = resolve
+    }))
+    const fetchMock = vi.fn()
+    vi.stubGlobal('fetch', fetchMock)
+    const attachments = useTestChatAttachments()
+
+    const adding = attachments.addAttachments([unknownFile, stagedPdf('next.pdf')])
+    attachments.retireAttachments()
+    finishRead(new Uint8Array([116, 101, 120, 116]).buffer)
+    await adding
+
+    expect(attachments.pendingAttachments.value).toEqual([])
+    expect(fetchMock).not.toHaveBeenCalled()
+    expect(pushToast).not.toHaveBeenCalled()
+  })
+
   it('enforces the frontend aggregate attachment count before upload work starts', async () => {
     const fetchMock = vi.fn().mockResolvedValue(successfulUploadResponse('file-count'))
     vi.stubGlobal('fetch', fetchMock)

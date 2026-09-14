@@ -58,7 +58,7 @@ def _bounded_fallback_chain_required(turn_metadata: dict[str, Any]) -> bool:
     )
 
 
-def _provider_config_has_request_capacity(
+def provider_config_has_request_capacity(
     config: Any,
     turn_metadata: dict[str, Any],
     *,
@@ -121,7 +121,7 @@ def _require_provider_config_capacity(
     provider: str = "",
     model: str = "",
 ) -> None:
-    if _provider_config_has_request_capacity(
+    if provider_config_has_request_capacity(
         config,
         turn_metadata,
         provider=provider,
@@ -231,7 +231,7 @@ def _capacity_approved_fallback_entries(
     return [
         config
         for config in _materialize_fallback_configs(selector, entries)
-        if _provider_config_has_request_capacity(config, turn_metadata)
+        if provider_config_has_request_capacity(config, turn_metadata)
     ]
 
 

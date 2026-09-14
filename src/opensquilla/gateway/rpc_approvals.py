@@ -8,7 +8,6 @@ from typing import Any
 from opensquilla.application.approval_queue import get_approval_queue
 from opensquilla.application.approval_rpc import (
     approval_extend_rpc_payload,
-    approval_forget_rpc_payload,
     approval_lookup_status_rpc_payload,
     approval_request_rpc_payload,
     approval_resolve_rpc_payload,
@@ -196,16 +195,6 @@ async def _handle_exec_approval_snapshot(params: dict | None, ctx: RpcContext) -
     """Return a diagnostic snapshot for approval state."""
     queue = get_approval_queue()
     return approval_snapshot_rpc_payload(queue)
-
-
-@_d.method("exec.approval.forget", scope="operator.approvals")
-async def _handle_exec_approval_forget(params: dict | None, ctx: RpcContext) -> dict[str, Any]:
-    """Compatibility no-op for removed cached intent approvals."""
-    if isinstance(params, dict):
-        target = params.get("target")
-    else:
-        target = None
-    return approval_forget_rpc_payload(target)
 
 
 async def _handle_exec_approval_resolve(params: dict | None, ctx: RpcContext) -> dict[str, Any]:

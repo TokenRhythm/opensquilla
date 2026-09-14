@@ -24,7 +24,6 @@ from opensquilla.application.turn_input import (
 from opensquilla.session_key import canonicalize_session_key
 
 type TurnAdmissionSurface = Literal["webchat", "session"]
-type TurnSteerMode = Literal["durable", "legacy"]
 type InitialCollaborationMode = Literal["default", "plan"]
 type InitialRoutingMode = Literal["direct", "router", "ensemble"]
 
@@ -180,7 +179,6 @@ class CancelTurn:
 class SteerTurn:
     session_key: str
     message: str
-    mode: TurnSteerMode
     expected_turn_id: str | None = None
     client_request_id: str | None = None
     client_message_id: str | None = None
@@ -288,5 +286,4 @@ __all__ = [
     "TurnIngressPort",
     "TurnAdmissionSurface",
     "TurnSteeringPort",
-    "TurnSteerMode",
 ]

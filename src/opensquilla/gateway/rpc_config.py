@@ -15,6 +15,22 @@ if TYPE_CHECKING:
 _d = get_dispatcher()
 
 
+def _public_gateway_config_schema() -> dict[str, Any]:
+    """Return the RPC schema without local-file-only configuration fields."""
+
+    from opensquilla.gateway.config import GatewayConfig
+
+    schema = GatewayConfig.model_json_schema()
+    definitions = schema.get("$defs")
+    if isinstance(definitions, dict):
+        llm_schema = definitions.get("LlmProviderConfig")
+        if isinstance(llm_schema, dict):
+            properties = llm_schema.get("properties")
+            if isinstance(properties, dict):
+                properties.pop("extra_body", None)
+    return schema
+
+
 def _app_settings(
     ctx: RpcContext, *, source: str = "config.patch"
 ) -> AppSettings[GatewayConfig, ProviderConfig | None]:
@@ -105,9 +121,7 @@ async def _handle_config_effective(_params: dict | None, ctx: RpcContext) -> dic
 
 @_d.method("config.schema", scope="operator.admin")
 async def _handle_config_schema(params: dict | None, ctx: RpcContext) -> dict:
-    from opensquilla.gateway.config import GatewayConfig
-
-    schema = GatewayConfig.model_json_schema()
+    schema = _public_gateway_config_schema()
 
     if isinstance(params, dict) and params.get("section"):
         section = params["section"]
@@ -128,9 +142,7 @@ async def _handle_config_schema_lookup(params: dict | None, ctx: RpcContext) -> 
     if not isinstance(params, dict) or "path" not in params:
         raise ValueError("params.path is required")
 
-    from opensquilla.gateway.config import GatewayConfig
-
-    schema = GatewayConfig.model_json_schema()
+    schema = _public_gateway_config_schema()
     path = params["path"]
     parts = path.split(".")
 

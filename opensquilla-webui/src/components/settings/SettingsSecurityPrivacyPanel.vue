@@ -8,6 +8,12 @@ import SettingsPrivacyPanel from '@/components/settings/SettingsPrivacyPanel.vue
 interface PrivacyPanelContract {
   networkReportingEnabled: boolean
   networkReportingForcedOff: boolean
+  reliabilityDiagnosticsEnabled: boolean
+  reliabilityDiagnosticsDecision: boolean | null
+  reliabilityDiagnosticsForcedOff: boolean
+  productAnalyticsEnabled: boolean
+  productAnalyticsDecision: boolean | null
+  productAnalyticsForcedOff: boolean
 }
 
 defineProps<{
@@ -18,6 +24,8 @@ defineProps<{
 
 const emit = defineEmits<{
   updateNetworkReportingEnabled: [enabled: boolean]
+  updateReliabilityDiagnosticsEnabled: [enabled: boolean]
+  updateProductAnalyticsEnabled: [enabled: boolean]
 }>()
 
 const { t } = useI18n()
@@ -34,6 +42,8 @@ const { t } = useI18n()
       v-if="loaded"
       :panel="panel"
       @update-network-reporting-enabled="emit('updateNetworkReportingEnabled', $event)"
+      @update-reliability-diagnostics-enabled="emit('updateReliabilityDiagnosticsEnabled', $event)"
+      @update-product-analytics-enabled="emit('updateProductAnalyticsEnabled', $event)"
     />
     <div v-else class="security-loading" role="status">
       <LoadingSpinner />

@@ -79,6 +79,7 @@ export interface UseChatSessionRuntimeOptions {
   resetSavingsPopupCooldown: () => void
   restoreWidgetState: () => void
   resetStreamLiveTurnState: () => void
+  retireAttachments?: () => void
   resetDraftComposer?: () => void
 }
 
@@ -171,6 +172,7 @@ export function useChatSessionRuntime(options: UseChatSessionRuntimeOptions) {
   }
 
   function resetCurrentSessionAfterSlash() {
+    options.retireAttachments?.()
     resetSessionRuntimeState()
     resetCompactState()
     options.clearPendingQueue()
@@ -222,6 +224,9 @@ export function useChatSessionRuntime(options: UseChatSessionRuntimeOptions) {
     // pinned frame before cancelSessionBootstrap returns, so B never waits for
     // A's ACK and no connected event can observe a half-switched route.
     options.cancelSessionBootstrap()
+    // Server adoption still belongs to the current composer. Only an actual
+    // navigation retires its files and outstanding reads/uploads.
+    if (pendingQueuePolicy.kind === 'navigate') options.retireAttachments?.()
     resetCompactState()
     options.beginSessionResolution?.(key)
     options.persistSession(key, { source: 'runtime.switchToSession' })
@@ -373,6 +378,7 @@ export function useChatSessionRuntime(options: UseChatSessionRuntimeOptions) {
       return
     }
     options.cancelSessionBootstrap()
+    options.retireAttachments?.()
     resetCompactState()
     options.sessionKey.value = key
     resetSessionRuntimeState()

@@ -50,13 +50,9 @@ from opensquilla.session.manager import SessionManager
 from opensquilla.session.storage import SessionStorage
 from opensquilla.token_estimation import estimate_tokens
 from opensquilla.tools.types import ToolContext
+from tests.helpers.image_bytes import image_bytes
 
-_PNG_BYTES = (
-    b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01"
-    b"\x00\x00\x00\x01\x08\x06\x00\x00\x00\x1f\x15\xc4"
-    b"\x89\x00\x00\x00\nIDATx\x9cc\xf8\x0f\x00\x01\x01"
-    b"\x01\x00\x18\xdd\x8d\xb0\x00\x00\x00\x00IEND\xaeB`\x82"
-)
+_PNG_BYTES = image_bytes()
 
 _PROVIDER_ID = "tokenrhythm"
 _TEXT_MODEL = "deepseek-v4-pro-0813"

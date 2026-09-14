@@ -13,6 +13,7 @@ replies are kept — with a positional-trim fallback when no id is supplied.
 from __future__ import annotations
 
 import base64
+import io
 import json
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
@@ -21,6 +22,7 @@ from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
+from PIL import Image
 
 from opensquilla.engine import Agent, AgentConfig
 from opensquilla.engine.history import (
@@ -52,6 +54,7 @@ from opensquilla.session.manager import SessionManager
 from opensquilla.session.models import SessionContextState, SessionIntent, SessionSummary
 from opensquilla.session.storage import SessionStorage
 from opensquilla.token_estimation import estimate_tokens
+from tests.helpers.image_bytes import image_bytes
 
 
 @dataclass
@@ -150,6 +153,15 @@ def _history_user_texts(messages: list[Message]) -> list[str]:
         for m in messages[:-1]
         if m.role == "user" and isinstance(m.content, str)
     ]
+
+
+def _capacity_image_bytes(color: str = "blue") -> bytes:
+    """Keep valid PNG bytes large enough to exercise inline capacity projection."""
+    buffer = io.BytesIO()
+    with Image.open(io.BytesIO(image_bytes(color=color))) as source:
+        with source.resize((100, 100)) as image:
+            image.save(buffer, format="PNG", compress_level=0)
+    return buffer.getvalue()
 
 
 def _inline_images(text: str, *payloads: bytes) -> str:
@@ -394,7 +406,7 @@ async def test_router_capacity_projects_inline_images_after_route() -> None:
     manager = _FakeSessionManager()
     key = "agent:main:router-capacity-inline-images"
     await manager.create(key)
-    payloads = [bytes(range(256)) * 100, bytes(reversed(range(256))) * 100]
+    payloads = [_capacity_image_bytes("blue"), _capacity_image_bytes("red")]
     envelope = _inline_images("inspect both images", *payloads)
     historical_user = await manager.append_message(key, "user", envelope)
     await manager.append_message(key, "assistant", "historical answer")
@@ -759,7 +771,7 @@ async def test_router_capacity_preserves_plain_token_floor_but_clears_inline_med
     )
     inline_envelope = _inline_images(
         "image history row",
-        bytes(range(256)) * 120,
+        _capacity_image_bytes(),
     )
     inline_raw_floor = estimate_tokens(inline_envelope)
     inline_media = await project(
@@ -784,7 +796,7 @@ async def test_router_capacity_mixed_envelope_discounts_only_typed_image_data(
     manager = _FakeSessionManager()
     key = "agent:main:router-capacity-mixed-image-document"
     await manager.create(key)
-    image_data = base64.b64encode(bytes(range(256)) * 120).decode("ascii")
+    image_data = base64.b64encode(_capacity_image_bytes()).decode("ascii")
     document_data = base64.b64encode(bytes(reversed(range(256))) * 80).decode("ascii")
     envelope = json.dumps(
         {

@@ -34,7 +34,7 @@ const names = [
   'publishVerifiedWindowsInstaller', 'restoreWindowsUpdateCache', 'revalidateReadyWindowsInstaller',
   'activeDesktopUpdateSnoozeFor', 'clearDesktopUpdateSnoozeIfVersionChanged',
   'desktopUpdateSnapshot', 'publishDesktopUpdateState', 'setDesktopUpdateState',
-  'classifyDesktopUpdateError', 'desktopUpdateErrorMessage', 'showUpdateError', 'downloadDesktopUpdate',
+  'classifyDesktopUpdateError', 'classifyDesktopUpdateTelemetryError', 'desktopUpdateErrorMessage', 'showUpdateError', 'downloadDesktopUpdate',
   'desktopUpdateCheckAllowed', 'runDesktopUpdateCheck', 'checkForUpdates',
   'desktopUpdatePlatform', 'desktopUpdateLocaleTags',
   'fetchDesktopUpdateChannelFromRoot', 'fetchDesktopUpdateChannelFromGithubReleases', 'fetchDesktopUpdateChannel',
@@ -93,6 +93,10 @@ function fixture(options = {}) {
   const network = { offline: Boolean(options.offline) }
   const signature = { error: options.signatureError ?? null }
   const globals = {
+    desktopReliabilityTelemetry: {
+      recordUpdateResult: (event) => { (calls.telemetry ??= []).push(event) },
+      finishSession() {},
+    },
     process: { platform: 'win32', arch: 'x64', env: options.disableInstall ? { OPENSQUILLA_DESKTOP_ENABLE_WIN_INSTALL: '0' } : {} },
     join, stat, setTimeout, AbortSignal,
     UpdateCheckScheduler, isUpdateCheckAllowed, UpdateChannelError, WindowsUpdateSecurityError, WindowsUpdateHandoffError,
@@ -129,6 +133,7 @@ function fixture(options = {}) {
         if (signature.error) throw new WindowsUpdateSecurityError(signature.error, 'Synthetic signature verifier unavailable')
       } },
     ),
+    desktopMonitoredFetch: (...args) => globals.fetch(...args),
     fetch: async (input, init = {}) => {
       const url = new URL(String(input))
       const range = new Headers(init.headers).get('range')
@@ -261,6 +266,10 @@ try {
     const failed = await f.subject.downloadDesktopUpdate()
     assert.equal(failed.status, 'error', JSON.stringify(failed))
     assert.equal(failed.errorCode, 'signature_unavailable')
+    const failedTelemetry = f.calls.telemetry.filter(event => event.updateStage === 'download')
+    assert.equal(failedTelemetry.length, 1)
+    assert.equal(failedTelemetry[0].outcome, 'fail')
+    assert.equal(failedTelemetry[0].errorCode, 'internal_error')
     assert.equal(f.context.verifiedManualInstallerPath, null)
     assert.equal(f.calls.signatures, 1)
     assert.ok(!f.calls.states.some(state => state.status === 'downloaded'))

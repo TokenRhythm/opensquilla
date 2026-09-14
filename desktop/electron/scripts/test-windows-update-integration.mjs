@@ -24,7 +24,7 @@ const names = [
   'windowsInstallerActionsSupported', 'windowsUpdateDownloadDirectory',
   'clearWindowsUpdateCache', 'publishVerifiedWindowsInstaller', 'restoreWindowsUpdateCache',
   'revalidateReadyWindowsInstaller', 'restoreDownloadedUpdateRetryState',
-  'classifyDesktopUpdateError', 'desktopUpdateErrorMessage', 'applyWindowsInstaller',
+  'classifyDesktopUpdateError', 'classifyDesktopUpdateTelemetryError', 'desktopUpdateErrorMessage', 'applyWindowsInstaller',
   'downloadDesktopUpdate', 'showUpdateError', 'handleMainWindowClose',
 ]
 const declarations = new Map(parsed.statements.filter(ts.isFunctionDeclaration)
@@ -76,6 +76,12 @@ function fixture(options = {}) {
   const events = []
   const state = { status: 'downloaded' }
   const globals = {
+    desktopReliabilityTelemetry: {
+      recordUpdateResult: (event) => { (calls.telemetry ??= []).push(event) },
+      markUpdateHandoff: (version) => { (calls.handoffs ??= []).push(version); return options.telemetryEnabled !== false },
+      clearUpdateHandoff: () => { calls.handoffClears = (calls.handoffClears || 0) + 1 },
+      finishSession() {},
+    },
     process: { platform: 'win32', arch: 'x64', env: options.gateOff ? { OPENSQUILLA_DESKTOP_ENABLE_WIN_INSTALL: '0' } : {} },
     join, setImmediate,
     WindowsUpdateSecurityError, WindowsUpdateHandoffError, WindowsUpdatePreparationError, UpdateChannelError,
@@ -293,6 +299,14 @@ for (const value of [undefined, '1']) {
   assert.equal(f.calls.quit, 1)
   assert.equal(f.calls.verify, 2, 'verify again after the Gateway drain before launching')
   assert.equal(f.calls.resumes, 0)
+  assert.deepEqual(f.calls.handoffs, ['0.5.5'])
+}
+
+{
+  const f = fixture({ telemetryEnabled: false })
+  await f.subject.applyWindowsInstaller()
+  assert.equal(f.calls.launches, 1, 'telemetry storage failure must not block installer launch')
+  assert.equal(f.calls.quit, 1)
 }
 
 for (const code of ['signature_invalid', 'signature_unavailable']) {
@@ -337,6 +351,8 @@ for (const code of ['signature_invalid', 'signature_unavailable']) {
   assert.equal(f.state.status, 'downloaded')
   assert.equal(f.state.errorCode, 'install_failed')
   assert.ok(f.context.verifiedManualInstallerPath)
+  assert.deepEqual(f.calls.handoffs, ['0.5.5'])
+  assert.equal(f.calls.handoffClears, 1)
 }
 
 {
