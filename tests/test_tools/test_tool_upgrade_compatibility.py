@@ -156,4 +156,6 @@ def test_tool_context_appends_new_runtime_fields_after_legacy_fields() -> None:
         "artifact_source_paths",
         "workspace_preview_opener",
         "workspace_preview_scopes",
+        "execution_status_snapshot",
+        "router_control_routing_revision",
     ]

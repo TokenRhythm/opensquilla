@@ -120,8 +120,6 @@ class ToolContext:
     tool_run_budget_key: str | None = None
     router_control_config: Any | None = None
     router_control_hold_store: Any | None = None
-    # Frozen admission revision prevents old turns from changing newer holds.
-    router_control_routing_revision: int | None = None
     router_control_replay_depth: int = 0
     router_control_turn_hold_applied: bool = False
     # Read-only SkillCatalogSnapshot pinned at the start of this turn. Skill
@@ -247,6 +245,8 @@ class ToolContext:
     workspace_preview_scopes: list[dict[str, str]] = field(default_factory=list, repr=False)
     # Live, read-only facts from this accepted turn; never persisted session settings.
     execution_status_snapshot: Callable[[], dict[str, Any]] | None = field(default=None, repr=False)
+    # Frozen admission revision prevents old turns from changing newer holds.
+    router_control_routing_revision: int | None = None
 
     def __post_init__(self) -> None:
         self.validate_path_roots()

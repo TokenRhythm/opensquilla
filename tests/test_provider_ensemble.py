@@ -8629,17 +8629,25 @@ async def test_step3_first_success_does_not_cancel_slow_proposer(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("reset_idle", [False, True])
 async def test_step3_meaningful_stream_can_exceed_per_call_idle_budget(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, reset_idle: bool,
 ) -> None:
     monkeypatch.setattr(
         "opensquilla.provider.ensemble._ENSEMBLE_HEARTBEAT_INTERVAL_SECONDS",
         0.003,
     )
+    # Advance the provider's clock, not the OS scheduler: a busy runner can
+    # legitimately oversleep a 12 ms sleep beyond the unchanged 20 ms deadline.
+    clock = [1.0]
+    monkeypatch.setattr(
+        "opensquilla.provider.ensemble.time", SimpleNamespace(monotonic=lambda: clock[0]),
+    )
 
     async def _source() -> AsyncIterator[StreamEvent]:
         for index in range(4):
-            await asyncio.sleep(0.012)
+            await asyncio.sleep(0)
+            clock[0] += 0.012
             yield TextDeltaEvent(text=f"chunk-{index}")
         yield DoneEvent(model="steady")
 
@@ -8648,8 +8656,12 @@ async def test_step3_meaningful_stream_can_exceed_per_call_idle_budget(
         phase="step3",
         message="waiting",
         timeout_seconds=0.02,
-        reset_deadline_on_event=True,
+        reset_deadline_on_event=reset_idle,
     )
+    if not reset_idle:
+        with pytest.raises(TimeoutError):
+            _ = [event async for event in wrapped]
+        return
     events = [event async for event in wrapped]
 
     assert [event.text for event in events if isinstance(event, TextDeltaEvent)] == [
@@ -8659,6 +8671,7 @@ async def test_step3_meaningful_stream_can_exceed_per_call_idle_budget(
         "chunk-3",
     ]
     assert isinstance(events[-1], DoneEvent)
+    assert clock[0] - 1.0 > 0.02
 
 
 @pytest.mark.asyncio
