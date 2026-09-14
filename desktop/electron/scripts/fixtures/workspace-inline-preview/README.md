@@ -14,7 +14,9 @@ node /path/to/opensquilla/desktop/electron/scripts/fixtures/workspace-inline-pre
 The first JSON line gives `baseUrl`, model and exact prompts. Configure a fresh
 Desktop profile to use this Ollama base URL and model
 `opensquilla-inline-preview-fixture`, explicitly enabling `supports_vision`
-and `supports_tools` for that model. Do not change production permissions or
+and `supports_tools` for that model, with `context_window = 131072` and
+`max_output_tokens = 8192` in its model override. The generic unknown-model
+window is too small for the real Agent's prompt and tool schemas. Do not change production permissions or
 another profile's provider settings. Use ordinary single-model routing.
 
 In the actual Desktop app, send these exact current-turn messages:

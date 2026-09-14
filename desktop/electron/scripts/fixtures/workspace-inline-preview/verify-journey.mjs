@@ -71,6 +71,7 @@ const env = {
   OPENSQUILLA_STATE_DIR: profile, OPENSQUILLA_USER_STATE_DIR: join(output, 'user-state'),
   OPENSQUILLA_TEST_PROFILE_LOCK_ROOT: '1', OPENSQUILLA_TESTING: '0',
   OPENSQUILLA_MEMORY_DREAM_DISABLED: '1',
+  OPENSQUILLA_OPENROUTER_LIVE_PRICING: '0',
   OPENSQUILLA_GATEWAY_CONFIG_PATH: configPath, NO_PROXY: '127.0.0.1,localhost,::1',
   OPENSQUILLA_DESKTOP_SECRET_STORAGE: 'plain', OPENSQUILLA_DESKTOP_DISABLE_AUTO_UPDATE: '1',
   OPENSQUILLA_DESKTOP_REPO_ROOT: sourceRoot,
@@ -86,6 +87,74 @@ process.on('SIGINT', () => { interruption ||= new Error('Interrupted by SIGINT')
 process.on('SIGTERM', () => { interruption ||= new Error('Interrupted by SIGTERM') })
 const persist = () => writeFile(join(output, 'report.json'), JSON.stringify(report, null, 2), { mode: 0o600 })
 const hash = bytes => createHash('sha256').update(bytes).digest('hex')
+function instrumentPage(observedPage) {
+  const stream = createWriteStream(join(output, 'ui-transport.ndjson'), { flags: 'wx', mode: 0o600 })
+  logStreams.push(stream)
+  const diagnostic = report.uiTransport = { recorded: 0, discarded: 0, console: [], latest: [] }
+  const requests = new Map()
+  let socketNumber = 0
+  const token = value => typeof value === 'string' && /^[A-Za-z0-9_.:-]{1,160}$/.test(value) ? value : undefined
+  const append = summary => {
+    if (diagnostic.recorded >= 2000) { diagnostic.discarded += 1; return }
+    const record = { at: new Date().toISOString(), ...summary }
+    diagnostic.recorded += 1
+    diagnostic.latest.push(record)
+    if (diagnostic.latest.length > 100) diagnostic.latest.shift()
+    stream.write(`${JSON.stringify(record)}\n`)
+  }
+  observedPage.on('websocket', socket => {
+    const socketId = ++socketNumber
+    // No URL: a connection URL can contain a credential query parameter.
+    append({ socketId, direction: 'lifecycle', type: 'opened' })
+    const frame = (direction, event) => {
+      const bytes = event.payload
+      if (Buffer.byteLength(bytes) > 4 * 1024 * 1024) { append({ socketId, direction, type: 'oversize-not-inspected' }); return }
+      let value
+      try { value = JSON.parse(typeof bytes === 'string' ? bytes : bytes.toString('utf8')) } catch { append({ socketId, direction, type: 'non-json' }); return }
+      const id = token(value?.id)
+      const method = token(value?.method)
+      if (direction === 'sent' && id && method && requests.size < 1000) requests.set(`${socketId}:${id}`, method)
+      const summary = { socketId, direction, type: token(value?.type), id, method: method || requests.get(`${socketId}:${id}`), event: token(value?.event) }
+      if (typeof value?.ok === 'boolean') summary.ok = value.ok
+      if (token(value?.error?.code)) summary.errorCode = value.error.code
+      if (Number.isSafeInteger(value?.seq)) summary.sequence = value.seq
+      for (const body of [value?.params, value?.payload, value?.payload?.runtime, value?.payload?.snapshot]) {
+        if (!body || typeof body !== 'object' || Array.isArray(body)) continue
+        const key = body.sessionKey || body.session_key || body.key
+        if (typeof key === 'string' && /^agent:[A-Za-z0-9_-]+:(webchat|subagent):[A-Za-z0-9_-]+$/.test(key)) summary.sessionKey = key
+        for (const name of ['state', 'status', 'phase']) if (token(body[name])) (summary.runtime ||= {})[name] = body[name]
+        for (const name of ['authoritative', 'subscribed', 'sessionMissing', 'complete', 'fast_ack']) if (typeof body[name] === 'boolean') (summary.runtime ||= {})[name] = body[name]
+        for (const name of ['generation', 'epoch', 'seq', 'eventSeq']) if (Number.isSafeInteger(body[name])) (summary.runtime ||= {})[name] = body[name]
+      }
+      append(summary)
+      if (direction === 'received' && value?.type === 'res' && id) requests.delete(`${socketId}:${id}`)
+    }
+    socket.on('framesent', event => frame('sent', event))
+    socket.on('framereceived', event => frame('received', event))
+    socket.on('close', () => append({ socketId, direction: 'lifecycle', type: 'closed' }))
+    socket.on('socketerror', () => append({ socketId, direction: 'lifecycle', type: 'socket-error' }))
+  })
+  const consoleSummary = (severity, text) => {
+    if (diagnostic.console.length >= 100) return
+    const rpcTimeout = text.match(/\b((?:sessions|chat|conversation|artifact)\.[a-z_.]+) timed out after (\d+)ms\b/)
+    const known = ['Session stream subscription failed', 'Session metadata hydration failed', 'Session metadata recovery failed', 'Sequence gap detected', 'Connection closed', 'No conversation consumer owns this delivery', 'Failed to fetch'].find(message => text.includes(message))
+    // Arbitrary console text can contain prompts or credentials. Keep only
+    // a known class, bounded RPC identifiers, and a hash of the whole message.
+    const record = { at: new Date().toISOString(), severity, class: known || 'unclassified', textLength: text.length, textSha256: hash(text), ...(rpcTimeout ? { method: rpcTimeout[1], timeoutMs: Number(rpcTimeout[2]) } : {}) }
+    diagnostic.console.push(record)
+    append({ direction: 'console', type: severity, ...record })
+  }
+  observedPage.on('console', message => { if (['warning', 'error'].includes(message.type())) consoleSummary(message.type(), message.text()) })
+  observedPage.on('pageerror', error => consoleSummary('pageerror', error.message))
+}
+async function readSessionDiagnostics() {
+  if (!page || page.isClosed()) return null
+  return page.evaluate(() => {
+    const entries = window.OpenSquillaSessionDiag?.read?.() || []
+    const fields = ['t', 'iso', 'source', 'from', 'to', 'current', 'routeSession', 'requestSession', 'responseSession', 'reason', 'rendererInstance', 'generation', 'connId', 'handoffEpoch', 'targetKeyHash', 'phase', 'closeCode', 'wasClean', 'reconnectAttempt', 'delayMs', 'recoveryMs', 'loopLagMs', 'maxLoopLagMs']
+    return entries.slice(0, 100).map(entry => Object.fromEntries(fields.filter(name => typeof entry[name] === 'number' || typeof entry[name] === 'boolean' || typeof entry[name] === 'string' && entry[name].length <= 160).map(name => [name, entry[name]])))
+  })
+}
 async function poll(check, label, timeout = 60000) {
   let answer
   await waitFor(async () => {
@@ -401,6 +470,7 @@ ttl_sweep_interval_minutes = 0
     // Locale is an ordinary persisted UI preference, not a session/product store.
     await context.addInitScript(() => localStorage.setItem('opensquilla-locale', 'en'))
     page = await context.newPage()
+    instrumentPage(page)
     await page.goto(`http://127.0.0.1:${port}/control/chat`)
   } else {
     await writeSyntheticCredential(userData, { baseUrl: provider.baseUrl, model: fixture.model, disableNetworkObservability: true })
@@ -414,6 +484,7 @@ ttl_sweep_interval_minutes = 0
     const log = createWriteStream(join(output, 'electron.log'), { flags: 'wx', mode: 0o600 }); logStreams.push(log)
     app.process().stdout?.pipe(log, { end: false }); app.process().stderr?.pipe(log, { end: false })
     page = await app.firstWindow()
+    instrumentPage(page)
     await page.waitForURL(url => url.href.startsWith('opensquilla-app://desktop/chat'), { timeout: 180000 })
     report.desktopGateway = await poll(async () => {
       const status = await page.evaluate(() => window.opensquillaDesktop.getGatewayStatus())
@@ -430,7 +501,6 @@ ttl_sweep_interval_minutes = 0
       return { status, connection }
     }, 'isolated owned and authenticated Desktop Gateway', 60000)
   }
-  page.on('pageerror', error => { (report.pageErrors ||= []).push(error.message) })
   await page.locator('.chat-textarea').waitFor({ state: 'visible', timeout: 60000 })
   await screenshot('ready')
   if (surface === 'desktop') {
@@ -519,6 +589,7 @@ ttl_sweep_interval_minutes = 0
   process.exitCode = 1
   report.provider = provider?.snapshot()
   await persist()
+  await readSessionDiagnostics().then(value => { report.sessionDiagnostics = value }).catch(error => { report.sessionDiagnosticsError = error.name })
   await screenshot('first-failure').catch(failure => { report.failureScreenshotError = failure.message })
   await evidence().then(state => { report.failureDatabase = state }).catch(failure => { report.failureDatabaseError = failure.message })
   console.error(error.stack || error.message)
