@@ -29,7 +29,7 @@ from opensquilla.tools.types import (
 log = structlog.get_logger(__name__)
 
 DEFAULT_HEARTBEAT_PROMPT = (
-    "Read HEARTBEAT.md if it exists (workspace context). Follow it strictly. "
+    "Follow HEARTBEAT.md supplied in the Agent workspace context, if present. "
     "If nothing needs attention, reply HEARTBEAT_OK."
 )
 

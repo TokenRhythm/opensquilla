@@ -11,6 +11,7 @@ from opensquilla.gateway.execution_workspaces import build_execution_workspace_f
 from opensquilla.gateway.generated_artifact_adoption import GeneratedArtifactAdopter
 from opensquilla.project_workspaces import ProjectWorkspaceStateError
 from opensquilla.sandbox.run_context import RUN_CONTEXT_ORIGIN_KEY, get_run_context
+from opensquilla.session.keys import DmScope, build_cron_key, build_direct_key
 from opensquilla.session.manager import SessionIntent, SessionManager
 from opensquilla.session.models import SessionNode
 from opensquilla.session.storage import SessionStorage
@@ -29,6 +30,102 @@ async def test_new_ordinary_task_gets_a_durable_managed_workspace(tmp_path: Path
     assert binding["kind"] == "managed"
     assert Path(binding["root"]).parent == tmp_path / "tasks"
     assert Path(binding["root"]).is_dir()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("agent_id", "channel"),
+    [
+        ("main", "telegram"),
+        ("cron", "telegram"),
+        ("heartbeat", "telegram"),
+        ("main", "cron"),
+        ("main", "heartbeat"),
+    ],
+)
+async def test_scheduler_named_agents_and_channels_get_distinct_task_roots(
+    tmp_path: Path, agent_id: str, channel: str,
+) -> None:
+    async with SessionStorage(tmp_path / "sessions.sqlite") as storage:
+        manager = SessionManager(storage, execution_workspace_factory=(
+            build_execution_workspace_factory(GatewayConfig(), profile_home=tmp_path)
+        ))
+        roots = []
+        for peer_id in ("first-user", "second-user"):
+            key = build_direct_key(
+                agent_id, peer_id, channel=channel, dm_scope=DmScope.PER_CHANNEL_PEER,
+            )
+            session = await manager.create(key, agent_id=agent_id)
+            assert session.execution_workspace is not None
+            assert session.execution_workspace["kind"] == "managed"
+            root = Path(session.execution_workspace["root"])
+            assert root.parent == tmp_path / "tasks"
+            assert root.is_dir()
+            restored = await storage.get_session(key)
+            assert restored.execution_workspace == session.execution_workspace
+            roots.append(root)
+        assert roots[0] != roots[1]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("session_key", [
+    build_cron_key("scheduled-task", "first-run"),
+    "cron:scheduled-task",
+    "heartbeat:scheduled-task",
+    "system:scheduled-task",
+])
+async def test_scheduler_session_prefixes_do_not_allocate_task_roots(
+    tmp_path: Path, session_key: str,
+) -> None:
+    async with SessionStorage(tmp_path / "sessions.sqlite") as storage:
+        manager = SessionManager(storage, execution_workspace_factory=(
+            build_execution_workspace_factory(GatewayConfig(), profile_home=tmp_path)
+        ))
+        session = await manager.create(session_key)
+        assert session.execution_workspace is None
+        assert not (tmp_path / "tasks").exists()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("agent_id", "channel"),
+    [
+        ("cron", "telegram"),
+        ("heartbeat", "telegram"),
+        ("main", "cron"),
+        ("main", "heartbeat"),
+    ],
+)
+async def test_resumed_unbound_scheduler_named_session_keeps_legacy_workspace(
+    tmp_path: Path, agent_id: str, channel: str,
+) -> None:
+    config = GatewayConfig()
+    legacy_root = tmp_path / "legacy-workspace"
+    legacy_root.mkdir()
+    key = build_direct_key(
+        agent_id, "legacy-user", channel=channel, dm_scope=DmScope.PER_CHANNEL_PEER,
+    )
+    async with SessionStorage(tmp_path / "sessions.sqlite") as storage:
+        legacy = SessionNode(
+            session_key=key, session_id="legacy", agent_id=agent_id,
+            origin={RUN_CONTEXT_ORIGIN_KEY: {
+                "run_mode": "safe", "workspace": str(legacy_root),
+            }},
+        )
+        await storage.upsert_session(legacy)
+        manager = SessionManager(storage, execution_workspace_factory=(
+            build_execution_workspace_factory(config, profile_home=tmp_path)
+        ))
+        resumed, created = await manager.get_or_create(key, agent_id=agent_id)
+        assert created is False
+        assert resumed.session_id == legacy.session_id
+        assert resumed.execution_workspace is None
+        context = await get_run_context(
+            manager, key, config=config, workspace=config.workspace_dir,
+            include_user_grants=False,
+        )
+        assert context.workspace == str(legacy_root)
+        assert not (tmp_path / "tasks").exists()
 
 
 @pytest.mark.asyncio

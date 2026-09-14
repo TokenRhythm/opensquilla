@@ -13,6 +13,7 @@ import time
 import uuid
 from collections.abc import Callable, Mapping, MutableMapping
 from dataclasses import dataclass, field
+from functools import partial
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol, cast
@@ -4402,6 +4403,7 @@ async def start_gateway_server(
     # Lazy ref for channel_manager — cron handler captures it via closure,
     # populated after channel_manager is constructed below.
     _cm_holder: list = [None]
+    from opensquilla.gateway.project_workspace_runtime import prepare_heartbeat_tool_context
     from opensquilla.scheduler.heartbeat import (
         HeartbeatConfigWatcher,
         HeartbeatRunner,
@@ -4409,10 +4411,15 @@ async def start_gateway_server(
     from opensquilla.scheduler.heartbeat_loop import HeartbeatLoop
     from opensquilla.scheduler.heartbeat_service import HeartbeatService
 
+    heartbeat_storage = get_session_storage(svc.session_manager) or svc.session_manager
     heartbeat_service = HeartbeatService(
         turn_runner=turn_runner,
-        session_storage=get_session_storage(svc.session_manager) or svc.session_manager,
+        session_storage=heartbeat_storage,
         channel_manager_ref=lambda: _cm_holder[0],
+        prepare_tool_context=partial(
+            prepare_heartbeat_tool_context, storage=heartbeat_storage,
+            session_manager=svc.session_manager, config=config,
+        ),
     )
     heartbeat_loop = HeartbeatLoop(
         config=config,

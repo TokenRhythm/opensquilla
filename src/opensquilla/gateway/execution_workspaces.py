@@ -29,7 +29,6 @@ def build_execution_workspace_factory(
             session.workspace_id or session.parent_session_key or session.spawned_by
             or is_subagent_key(key) or is_guest_webchat_key(key)
             or key.startswith(("cron:", "heartbeat:", "system:"))
-            or ":cron:" in key or ":heartbeat:" in key
         ):
             return None
         source = getattr(config, "workspace_dir_source", None)
