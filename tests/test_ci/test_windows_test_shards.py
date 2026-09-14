@@ -68,6 +68,9 @@ OFFLINE_MARKER_EXCLUSIONS = {
     "tests/test_skills/test_meta_skill_creator_smoke_live.py",
 }
 RECENTLY_ADDED_ACTIVE_TESTS = {
+    "tests/test_engine/test_request_execution_identity.py",
+    "tests/test_tools/test_execution_status.py",
+    "tests/test_live_execution_identity_acceptance.py",
     # Local-first workspace files use the 0.01s provisional floor until a
     # comparable three-run Windows refresh supplies measured timings.
     "tests/test_gateway/test_execution_workspace_preparation.py",
