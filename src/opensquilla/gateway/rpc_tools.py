@@ -5,11 +5,6 @@ from __future__ import annotations
 import asyncio
 from typing import Any, cast
 
-from pydantic import ValidationError
-
-from opensquilla.contracts.generated.v4.sessions_execution_log_read import (
-    SessionsExecutionLogReadParams,
-)
 from opensquilla.contracts.generated.v4.sessions_execution_log_read_metadata import (
     SESSIONS_EXECUTION_LOG_READ_METHOD,
 )
@@ -18,6 +13,7 @@ from opensquilla.gateway.adapters._generated_contract_bindings import (
     generated_contract_bindings,
     register_generated_contract_binding,
 )
+from opensquilla.gateway.adapters.session_read_contract import decode_execution_log_read_params
 from opensquilla.gateway.guest_rpc_policy import is_guest_rpc_method_allowed
 from opensquilla.gateway.rpc import RpcContext, RpcHandlerError, get_dispatcher
 from opensquilla.gateway.search_status_runtime import read_search_status as _read_search_status
@@ -50,20 +46,11 @@ async def _handle_execution_log_read(params: dict | None, ctx: RpcContext) -> di
     from opensquilla.tools.builtin.tool_results import read_stored_tool_result_page
     from opensquilla.tools.types import SafeToolError
 
-    try:
-        request = SessionsExecutionLogReadParams.model_validate(params, strict=True)
-    except ValidationError as exc:
-        raise ValueError("Invalid execution log page parameters") from exc
-    if not request.sessionKey.strip():
-        raise ValueError("params.sessionKey is required")
-    # Optional generated fields use None for absence; the wire accepts omitted
-    # defaults, but explicit JSON null is not a valid character position/limit.
-    if request.offset is None or request.limit is None:
-        raise ValueError("params.offset and params.limit must be integers")
+    session_key, handle, offset, limit = decode_execution_log_read_params(params)
     storage = get_session_storage(ctx.session_manager)
     if storage is None:
         raise RpcHandlerError("NOT_FOUND", "Session not found")
-    session = await storage.get_session(canonicalize_session_key(request.sessionKey))
+    session = await storage.get_session(canonicalize_session_key(session_key))
     if session is None:
         raise RpcHandlerError("NOT_FOUND", "Session not found")
     try:
@@ -71,9 +58,9 @@ async def _handle_execution_log_read(params: dict | None, ctx: RpcContext) -> di
             read_stored_tool_result_page,
             media_root_from_config(ctx.config) / "tool-results",
             session.session_id,
-            request.handle,
-            offset=int(request.offset),
-            limit=int(request.limit),
+            handle,
+            offset=offset,
+            limit=limit,
         )
     except ToolOutputNotReadyError as exc:
         raise RpcHandlerError(
