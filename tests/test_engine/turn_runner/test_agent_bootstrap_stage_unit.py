@@ -173,6 +173,10 @@ class _DeploymentAwareCatalog:
 @dataclass
 class _DeploymentAwareProvider:
     active: Any
+    image_catalog_lookup: Any = None
+
+    def configure_image_continuation_catalog(self, lookup: Any) -> None:
+        self.image_catalog_lookup = lookup
 
     def active_deployment_config(self) -> Any:
         return self.active
@@ -512,19 +516,88 @@ async def test_source_diff_candidate_env_overrides_config(monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
-async def test_route_history_limit_metadata_threads_to_agent_config() -> None:
+async def test_legacy_route_history_limit_does_not_truncate_agent_history() -> None:
     stage = _make_stage()
     inp = _make_input(turn=_make_turn(metadata={"route_max_history_turns": 1}))
     out = await stage.run(inp)
-    assert out.output.agent_config.max_history_turns == 1
+    assert out.output.agent_config.max_history_turns == 0
 
 
 @pytest.mark.asyncio
 async def test_image_route_metadata_allows_historical_image_replay() -> None:
     stage = _make_stage()
-    inp = _make_input(turn=_make_turn(metadata={"image_route_reason": "gate_history"}))
+    inp = _make_input(turn=_make_turn(metadata={"image_context_has_images": True}))
     out = await stage.run(inp)
     assert out.output.agent_config.preserve_historical_images is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("vision_support", ["supported", "unsupported", "unknown"])
+async def test_history_image_retention_is_independent_of_model_capability(
+    vision_support: str,
+) -> None:
+    catalog = _RecordingModelCatalog(
+        catalog=replace(_default_catalog(), vision_support=vision_support),
+    )
+    turn = _make_turn(
+        metadata={
+            "image_context_has_images": True,
+            "router_vision_followup_gate_source": "explicit_opt_out",
+        }
+    )
+
+    out = await _make_stage(catalog=catalog).run(_make_input(turn=turn))
+
+    assert out.output.agent_config.preserve_historical_images is True
+    assert out.output.agent_config.model_vision_support == vision_support
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("routed_provider", "routed_model"),
+    [("provider-a", "old/model"), ("provider-b", "active/model")],
+)
+@pytest.mark.parametrize(
+    ("active_support", "stale_support"),
+    [("supported", "unsupported"), ("unsupported", "supported")],
+)
+async def test_route_capability_for_another_deployment_cannot_override_execution(
+    routed_provider: str,
+    routed_model: str,
+    active_support: str,
+    stale_support: str,
+) -> None:
+    catalog = _RecordingModelCatalog(
+        catalog=_ResolvedCatalog(
+            max_tokens=8_192,
+            context_window=64_000,
+            capabilities=ModelCapabilities(supports_vision=active_support == "supported"),
+            vision_support=active_support,
+        )
+    )
+    turn = _make_turn(
+        metadata={
+            "routed_provider": routed_provider,
+            "routed_model": routed_model,
+            "routed_model_vision_support": stale_support,
+            "image_context_has_images": True,
+        }
+    )
+
+    out = await _make_stage(catalog=catalog).run(
+        _make_input(
+            turn=turn,
+            resolved_model="active/model",
+            active_provider_id="provider-a",
+        )
+    )
+
+    config = out.output.agent_config
+    assert catalog.calls == [("active/model", "provider-a")]
+    assert (config.provider_id, config.model_id) == ("provider-a", "active/model")
+    assert (config.max_tokens, config.context_window_tokens) == (8_192, 64_000)
+    assert config.model_vision_support == active_support
+    assert config.preserve_historical_images is True
 
 
 @pytest.mark.asyncio
@@ -561,6 +634,7 @@ async def test_routed_primary_uses_exact_private_deployment_lookup() -> None:
     assert out.output.agent_config.context_window_tokens == 64_000
     assert catalog.deployment_calls == [("synthetic-routed-key-b", True)]
     assert catalog.generic_calls == []
+    assert provider.image_catalog_lookup == catalog.lookup_deployment
 
 
 @pytest.mark.asyncio

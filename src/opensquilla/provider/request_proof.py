@@ -2,14 +2,20 @@
 
 from __future__ import annotations
 
+import base64
+import binascii
 import contextlib
 import hashlib
+import io
 import json
 import os
+import warnings
 from collections.abc import Collection
 from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any
+
+from PIL import Image
 
 from .types import ProviderFinalRequestProjection
 
@@ -21,13 +27,12 @@ _PROOF_BUDGET_HEADROOM_RATIO = 0.10
 _PROOF_BUDGET_HEADROOM_MAX_CHARS = 16_384
 _PROOF_BUDGET_HEADROOM_MIN_CHARS = 512
 _CHARS_PER_TOKEN_EQUIVALENT = 4
-# Provider-neutral conservative reserves for model-visible media. Raw base64
-# bytes are not text tokens, but treating them as free lets media-only requests
-# bypass final-envelope admission. Each block therefore pays a fixed floor plus
-# a decoded-size increment. PDFs use a larger floor and denser byte-to-token
-# ratio because they may expand into page text and page images upstream.
+# Image tokens are an approximation of the request image's pixel grid, with a
+# fixed reserve for low-detail or unavailable dimensions. Provider resizing and
+# encoding differ, so this is not an upper bound or a model-specific price.
 _IMAGE_MEDIA_TOKEN_FLOOR = 1_024
-_IMAGE_MEDIA_BYTES_PER_TOKEN = 512
+_IMAGE_ESTIMATE_GRID_EDGE = 32
+# PDF expansion includes page text and images; keep its existing byte reserve.
 _PDF_MEDIA_TOKEN_FLOOR = 4_096
 _PDF_MEDIA_BYTES_PER_TOKEN = 128
 _TOOL_ARGUMENT_PROJECTION_PREFIX = "[tool_use_argument_projection]\n"
@@ -212,8 +217,8 @@ def _is_data_url(value: str) -> bool:
     return value.startswith("data:") and ";base64," in value[:128]
 
 
-def _media_placeholder(kind: str, value: str) -> str:
-    return f"[provider_request_{kind}_omitted: {len(value)} chars]"
+def _media_placeholder(kind: str) -> str:
+    return f"[provider_request_{kind}_omitted]"
 
 
 def _estimated_base64_decoded_bytes(value: str) -> int:
@@ -225,21 +230,63 @@ def _estimated_base64_decoded_bytes(value: str) -> int:
     return max(0, (encoded_chars * 3) // 4 - padding)
 
 
-def estimate_provider_media_tokens(kind: str, decoded_bytes: int) -> int:
-    """Return the provider-envelope reserve for one decoded media block."""
+def _image_pixel_dimensions(encoded_data: str) -> tuple[int, int] | None:
+    """Read dimensions without expanding pixels already validated at ingress."""
 
-    if kind == "pdf":
-        floor = _PDF_MEDIA_TOKEN_FLOOR
-        bytes_per_token = _PDF_MEDIA_BYTES_PER_TOKEN
-    else:
-        floor = _IMAGE_MEDIA_TOKEN_FLOOR
-        bytes_per_token = _IMAGE_MEDIA_BYTES_PER_TOKEN
+    encoded = encoded_data.split(",", 1)[1] if _is_data_url(encoded_data) else encoded_data
+    try:
+        payload = base64.b64decode(encoded, validate=True)
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", Image.DecompressionBombWarning)
+            with Image.open(io.BytesIO(payload)) as image:
+                dimensions = image.size
+                image.verify()
+        return dimensions
+    except (
+        binascii.Error,
+        OSError,
+        SyntaxError,
+        ValueError,
+        Image.DecompressionBombError,
+        Image.DecompressionBombWarning,
+    ):
+        return None
+
+
+def estimate_provider_media_tokens(
+    kind: str,
+    decoded_bytes: int,
+    *,
+    encoded_data: str | None = None,
+    detail: str | None = None,
+) -> int:
+    """Approximate media context use; image compression size is not token use.
+
+    Images use the exact encoded request version's dimensions when available.
+    The fixed fallback also applies to remote images without fetching them.
+    This estimate does not replace ingress validation or provider usage.
+    """
+
+    if kind != "pdf":
+        dimensions = (
+            _image_pixel_dimensions(encoded_data)
+            if encoded_data is not None and detail != "low"
+            else None
+        )
+        if dimensions is None:
+            return _IMAGE_MEDIA_TOKEN_FLOOR
+        width, height = dimensions
+        grid_width = (width + _IMAGE_ESTIMATE_GRID_EDGE - 1) // _IMAGE_ESTIMATE_GRID_EDGE
+        grid_height = (height + _IMAGE_ESTIMATE_GRID_EDGE - 1) // _IMAGE_ESTIMATE_GRID_EDGE
+        return max(_IMAGE_MEDIA_TOKEN_FLOOR, grid_width * grid_height)
+
+    bytes_per_token = _PDF_MEDIA_BYTES_PER_TOKEN
     size_tokens = (
         (decoded_bytes + bytes_per_token - 1) // bytes_per_token
         if decoded_bytes > 0
         else 0
     )
-    return floor + size_tokens
+    return _PDF_MEDIA_TOKEN_FLOOR + size_tokens
 
 
 def _budget_projection(
@@ -260,6 +307,7 @@ def _budget_projection(
         *,
         encoded_value: str | None = None,
         remote: bool = False,
+        detail: str | None = None,
     ) -> None:
         nonlocal reserved_blocks
         nonlocal image_blocks
@@ -277,7 +325,12 @@ def _budget_projection(
         pdf_blocks += kind == "pdf"
         remote_blocks += remote
         decoded_bytes += estimated_bytes
-        reserve_tokens += estimate_provider_media_tokens(kind, estimated_bytes)
+        reserve_tokens += estimate_provider_media_tokens(
+            kind,
+            estimated_bytes,
+            encoded_data=encoded_value,
+            detail=detail,
+        )
 
     def visit(value: Any, path: tuple[str | int, ...] = ()) -> Any:
         nonlocal media_chars, media_blocks
@@ -301,34 +354,34 @@ def _budget_projection(
             image_url = value.get("image_url")
             if isinstance(image_url, dict):
                 url = image_url.get("url")
+                detail = image_url.get("detail")
                 if isinstance(url, str) and _is_data_url(url):
-                    reserve_media("image", encoded_value=url)
+                    reserve_media("image", encoded_value=url, detail=detail)
                     media_chars += len(url)
                     media_blocks += 1
                     replaced = dict(value)
                     replaced["image_url"] = {
                         **image_url,
-                        "url": _media_placeholder("image_url", url),
+                        "url": _media_placeholder("image_url"),
                     }
                     return replaced
                 if isinstance(url, str):
-                    reserve_media("image", remote=True)
+                    reserve_media("image", remote=True, detail=detail)
                     return {
                         key: visit(item, (*path, key))
                         for key, item in value.items()
                     }
             if isinstance(image_url, str) and _is_data_url(image_url):
-                reserve_media("image", encoded_value=image_url)
+                reserve_media("image", encoded_value=image_url, detail=value.get("detail"))
                 media_chars += len(image_url)
                 media_blocks += 1
                 replaced = dict(value)
                 replaced["image_url"] = _media_placeholder(
                     "image_url",
-                    image_url,
                 )
                 return replaced
             if isinstance(image_url, str):
-                reserve_media("image", remote=True)
+                reserve_media("image", remote=True, detail=value.get("detail"))
                 return {
                     key: visit(item, (*path, key))
                     for key, item in value.items()
@@ -351,7 +404,7 @@ def _budget_projection(
                     media_chars += len(image)
                     media_blocks += 1
                     replaced_images.append(
-                        _media_placeholder("base64_image", image)
+                        _media_placeholder("base64_image")
                     )
                     changed = True
                 else:
@@ -367,6 +420,20 @@ def _budget_projection(
                 }
 
         source = value.get("source")
+        is_canonical_media = (
+            is_direct_content_block
+            and value.get("type") in {"image", "document"}
+            and value.get("source_type") in {"base64", "url"}
+            and "source" not in value
+        )
+        if is_canonical_media:
+            # Live request estimates see canonical blocks before adapter shaping.
+            source = {
+                "type": value["source_type"],
+                "media_type": value.get("media_type"),
+                "data": value.get("data"),
+                "url": value.get("data"),
+            }
         if (
             is_direct_content_block
             and value.get("type") == "image"
@@ -398,10 +465,13 @@ def _budget_projection(
                 media_chars += len(data)
                 media_blocks += 1
                 replaced = dict(value)
-                replaced["source"] = {
-                    **source,
-                    "data": _media_placeholder("base64_media", data),
-                }
+                if is_canonical_media:
+                    replaced["data"] = _media_placeholder("base64_media")
+                else:
+                    replaced["source"] = {
+                        **source,
+                        "data": _media_placeholder("base64_media"),
+                    }
                 return replaced
 
         return {
@@ -1645,7 +1715,11 @@ def project_provider_payload(
         proof["media_reserve_chars"] = media.reserve_chars
         proof["usage_source"] = "projected_text_plus_media_reserve"
         proof["token_estimate_source"] = f"{token_estimate_source}_plus_media_reserve"
-        proof["usage_confidence"] = "conservative_estimate"
+        proof["usage_confidence"] = (
+            "approximate_estimate" if media.image_blocks else "conservative_estimate"
+        )
+        if media.image_blocks:
+            proof["image_token_estimate_method"] = "pixel_grid_32_with_fixed_fallback"
         proof["projected_text_chars"] = projected_text_chars
         proof["projected_text_tokens"] = estimated_text_tokens
         proof["projected_context_chars"] = estimated_chars

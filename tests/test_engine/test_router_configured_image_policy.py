@@ -61,6 +61,35 @@ def _context(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("include_current_image", [True, False])
+@pytest.mark.parametrize(
+    "message",
+    ["Use the diagrams together.", "Ignore the left panel and describe the right panel."],
+)
+async def test_image_context_does_not_limit_history_when_current_image_is_added(
+    monkeypatch: pytest.MonkeyPatch,
+    include_current_image: bool,
+    message: str,
+) -> None:
+    _catalog_evidence(monkeypatch, supported=("configured/vision",))
+    ctx = _context({"c1": {"model": "configured/vision"}}, message=message)
+    ctx.config.squilla_router.vision_history_lookback_turns = 6
+    ctx.metadata["image_context_has_images"] = True
+    ctx.metadata["router_vision_followup_needs_image"] = False
+    if not include_current_image:
+        ctx.attachments = []
+
+    routed = await apply_squilla_router(ctx)
+
+    assert routed.model == "configured/vision"
+    assert routed.metadata["routing_source"] == "image_route"
+    assert routed.metadata["image_route_reason"] == (
+        "current_turn" if include_current_image else "history_context"
+    )
+    assert "route_max_history_turns" not in routed.metadata
+
+
+@pytest.mark.asyncio
 async def test_image_model_is_not_an_implicit_router_deployment(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

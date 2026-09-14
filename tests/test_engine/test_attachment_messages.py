@@ -217,6 +217,52 @@ def test_image_ref_hydrates_for_current_provider_call(tmp_path: Path) -> None:
     assert workspace_paths[0].read_bytes() == payload
 
 
+@pytest.mark.parametrize("storage", ["inline", "ref"])
+@pytest.mark.parametrize("caption", ["", "Compare these diagrams."])
+def test_upload_and_history_keep_the_same_multimodal_provider_payload(
+    tmp_path: Path, storage: str, caption: str,
+) -> None:
+    from opensquilla.provider.openai import _build_openai_messages
+    from opensquilla.provider.types import Message
+
+    workspace = tmp_path / "workspace"
+    attachments: list[dict[str, Any]] = []
+    persisted: list[dict[str, Any]] = []
+    for index in range(2):
+        payload = image_bytes(color=f"#{index + 1:06x}")
+        name = f"panel-{index}.png"
+        if storage == "ref":
+            attachment = _ref(tmp_path, payload, name=name, mime="image/png")
+            saved = {
+                "name": name, "mime": "image/png", "size": len(payload),
+                "sha256_ref": attachment["sha256"],
+            }
+        else:
+            attachment = {"name": name, "type": "image/png", "data": _b64(payload)}
+            saved = dict(attachment)
+        attachments.append(attachment)
+        persisted.append(saved)
+
+    current = TurnRunner._build_attachment_messages(
+        caption, attachments, media_root=tmp_path, workspace_dir=workspace, session_id="s1",
+    )
+    replayed = TurnRunner._maybe_unpack_attachments(
+        json.dumps({"text": caption, "attachments": persisted}),
+        preserve_image_attachments=True,
+        materialize_historical_attachments=True,
+        media_root=tmp_path,
+        workspace_dir=workspace,
+        session_id="s1",
+        source_message_id="image-turn",
+    )
+
+    assert current is not None
+    assert [block.type for block in replayed] == ["text", "image", "text", "image", "text"]
+    assert _build_openai_messages(Message(role="user", content=replayed)) == (
+        _build_openai_messages(current[0])
+    )
+
+
 def test_historical_inline_image_envelope_can_replay_for_vision() -> None:
     content = json.dumps(
         {
@@ -243,6 +289,40 @@ def test_historical_inline_image_envelope_can_replay_for_vision() -> None:
     assert len(image_blocks) == 1
     assert image_blocks[0].media_type == "image/png"
     assert image_blocks[0].data == _b64(image_bytes())
+
+
+@pytest.mark.parametrize("preserve_image", [False, True])
+@pytest.mark.parametrize("persist_material", [False, True])
+def test_history_image_path_is_readable_independently_of_native_replay(
+    tmp_path: Path, preserve_image: bool, persist_material: bool,
+) -> None:
+    payload = image_bytes()
+    envelope = json.dumps({
+        "text": "Inspect the sample.",
+        "attachments": [{"name": "sample.png", "mime": "image/png", "data": _b64(payload)}],
+    })
+    workspace = tmp_path / "workspace"
+    result = TurnRunner._maybe_unpack_attachments(
+        envelope,
+        preserve_image_attachments=preserve_image,
+        materialize_historical_attachments=True,
+        persist_image_material=persist_material,
+        workspace_dir=workspace,
+        media_root=tmp_path / "media",
+        session_id="history-owner",
+    )
+    texts = [block.text for block in result if isinstance(block, ContentBlockText)] if (
+        isinstance(result, list)
+    ) else [result]
+    paths = list((workspace / ".opensquilla" / "attachments").rglob("*.png"))
+    assert len(paths) == int(persist_material)
+    if persist_material:
+        assert paths[0].read_bytes() == payload
+        assert any(paths[0].relative_to(workspace).as_posix() in text for text in texts)
+    else:
+        assert all("at .opensquilla/attachments/" not in text for text in texts)
+    if preserve_image:
+        assert any(isinstance(block, ContentBlockImage) for block in result)
 
 
 def test_forked_legacy_historical_image_keeps_allowed_attachment_id() -> None:

@@ -125,6 +125,7 @@ def _materialization_stats(
             block_tokens = estimate_provider_media_tokens(
                 "image",
                 _base64_decoded_size(block.data),
+                encoded_data=block.data,
             )
         estimated_tokens += block_tokens
         block_tokens_by_index.append(block_tokens)

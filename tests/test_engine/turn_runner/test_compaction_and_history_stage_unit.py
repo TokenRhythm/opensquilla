@@ -9,7 +9,7 @@ exception-propagation contract without the runtime wrapper.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from types import SimpleNamespace
 from typing import Any
 
@@ -206,6 +206,29 @@ async def test_t3_not_applicable_falls_through_to_preflight() -> None:
     assert len(preflight.calls) == 1
     assert len(history.calls) == 1
     assert len(prepender.calls) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("with_resolver", [False, True])
+async def test_attachment_path_callback_only_reaches_compaction_ports(
+    with_resolver: bool,
+) -> None:
+    stage, t3, preflight, history, _ = _make_stage()
+
+    def resolver(attachment: dict[str, Any], session_key: str) -> str | None:
+        pytest.fail("the stage must forward the resolver without reading attachment files")
+
+    inp = replace(
+        _make_input(), attachment_path_resolver=resolver if with_resolver else None,
+    )
+    await stage.run(inp)
+
+    for call in (t3.calls[0], preflight.calls[0]):
+        if with_resolver:
+            assert call["attachment_path_resolver"] is resolver
+        else:
+            assert "attachment_path_resolver" not in call
+    assert "attachment_path_resolver" not in history.calls[0]
 
 
 @pytest.mark.asyncio
