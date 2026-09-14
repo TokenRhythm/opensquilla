@@ -90,3 +90,34 @@ Provider-only tests (their synthetic receipts are **not** end-to-end evidence):
 ```sh
 node --test desktop/electron/scripts/fixtures/workspace-inline-preview/provider.test.mjs
 ```
+
+## Real UI acceptance runner
+
+`verify-journey.mjs` drives the existing WebUI or Electron app with ordinary UI
+input. It launches only its own loopback Gateway/provider and creates a new
+profile; it never seeds sessions, Documents, or successful tool receipts. Web
+acceptance includes the two-task/restart journey and a real child writer.
+Desktop acceptance covers the native annotation, screenshot attachment and CSS
+edit described above. It does not automate operating-system save dialogs or
+claim Windows/Linux native acceptance when run on macOS.
+
+Prepare an authorized ordinary checkout, dependencies and current WebUI/Electron
+builds first. Follow the repository environment preflight; `.codex` and system
+temporary directories are rejected. The output parent must exist, and each
+output directory must be new and outside the checkout.
+
+```sh
+node desktop/electron/scripts/fixtures/workspace-inline-preview/verify-journey.mjs \
+  --source-root /absolute/ordinary/checkout \
+  --output /absolute/ordinary/evidence/web-first-attempt --surface web
+node desktop/electron/scripts/fixtures/workspace-inline-preview/verify-journey.mjs \
+  --source-root /absolute/ordinary/checkout \
+  --output /absolute/ordinary/evidence/desktop-first-attempt --surface desktop
+```
+
+The runner preserves screenshots, process logs, source/build identity, actual
+file hashes and read-only database evidence in `report.json`. A failed attempt
+remains failed: fix its cause and use a new output directory for the next run.
+It closes only processes it owns and retains evidence/profile files for review.
+The [Windows validation prompt](WINDOWS-VALIDATION.md) adds native file-manager,
+save-dialog and Windows-specific regression checks for a real Windows machine.

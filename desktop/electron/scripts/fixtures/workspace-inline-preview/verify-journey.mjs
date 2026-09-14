@@ -205,6 +205,7 @@ async function renderedPreview(heading, color) {
 }
 async function send(name, sessionKey) {
   report.phase = name
+  await persist()
   if (app) await requireDesktopForeground(app, page)
   const before = await evidence()
   const prior = new Set(before.turn_ingress_receipts.map(row => row.receipt_id))
@@ -341,7 +342,56 @@ try {
   provider = await fixture.startWorkspaceInlinePreviewProvider()
   await mkdir(profile, { recursive: true, mode: 0o700 })
   const quote = value => JSON.stringify(value)
-  await writeFile(configPath, `host = "127.0.0.1"\nport = ${port}\nstate_dir = ${quote(join(profile, 'state'))}\n[llm]\nprovider = "ollama"\nmodel = ${quote(fixture.model)}\nbase_url = ${quote(provider.baseUrl)}\n[models.ollama.${quote(fixture.model)}]\nsupports_tools = true\nsupports_vision = true\nsupports_reasoning = false\n[squilla_router]\nenabled = false\n[llm_ensemble]\nenabled = false\n[naming]\nenabled = false\n[heartbeat]\nenabled = false\n[mcp]\nenabled = false\n[privacy]\ndisable_network_observability = true\nreliability_diagnostics_enabled = false\nproduct_analytics_enabled = false\n[model_catalog]\nrefresh = "off"\n[sandbox]\nrun_mode = "safe"\nsandbox = true\nsecurity_grading = true\nnetwork_default = "proxy_allowlist"\n[permissions]\ndefault_mode = "off"\n[memory]\nflush_enabled = false\nrepair_enabled = false\nauto_capture_enabled = false\nretrieval_mode = "fts_only"\nttl_sweep_interval_minutes = 0\n`, { flag: 'wx', mode: 0o600 })
+  await writeFile(configPath, `host = "127.0.0.1"
+port = ${port}
+state_dir = ${quote(join(profile, 'state'))}
+
+[llm]
+provider = "ollama"
+model = ${quote(fixture.model)}
+base_url = ${quote(provider.baseUrl)}
+
+# Capacity of this deterministic test model, not a production budget override.
+[models.ollama.${quote(fixture.model)}]
+context_window = 131072
+max_output_tokens = 8192
+supports_tools = true
+supports_vision = true
+supports_reasoning = false
+
+[squilla_router]
+enabled = false
+[llm_ensemble]
+enabled = false
+[naming]
+enabled = false
+[heartbeat]
+enabled = false
+[mcp]
+enabled = false
+
+[privacy]
+disable_network_observability = true
+reliability_diagnostics_enabled = false
+product_analytics_enabled = false
+[model_catalog]
+refresh = "off"
+
+[sandbox]
+run_mode = "safe"
+sandbox = true
+security_grading = true
+network_default = "proxy_allowlist"
+[permissions]
+default_mode = "off"
+
+[memory]
+flush_enabled = false
+repair_enabled = false
+auto_capture_enabled = false
+retrieval_mode = "fts_only"
+ttl_sweep_interval_minutes = 0
+`, { flag: 'wx', mode: 0o600 })
   report.configuration = await runPython('import json,sys; from opensquilla.gateway.config import GatewayConfig; c=GatewayConfig.load(sys.argv[1],read_only=True); print(json.dumps({"provider":c.llm.provider,"model":c.llm.model,"baseUrl":c.llm.base_url,"stateDir":c.state_dir,"workspaceDir":c.workspace_dir,"explicitWorkspace":c.workspace_dir_source=="configured","memorySource":c.memory.source,"sandbox":c.sandbox.model_dump(),"routing":c.squilla_router.enabled,"models":{p:{m:o.model_dump() for m,o in v.items()} for p,v in c.models.items()}}))', configPath)
   assert.equal(report.configuration.explicitWorkspace, false, 'Fixture must not configure a shared workspace.')
   if (surface === 'web') {
@@ -462,6 +512,8 @@ try {
   report.status = 'failed'
   report.firstFailure ||= { phase: report.phase, name: error.name, message: error.message, stack: error.stack }
   process.exitCode = 1
+  report.provider = provider?.snapshot()
+  await persist()
   await screenshot('first-failure').catch(failure => { report.failureScreenshotError = failure.message })
   await evidence().then(state => { report.failureDatabase = state }).catch(failure => { report.failureDatabaseError = failure.message })
   console.error(error.stack || error.message)
@@ -482,6 +534,7 @@ try {
       report.cleanup.push({ name, ok: false, error: error.message }); report.status = 'failed'; process.exitCode = 1
       report.firstFailure ||= { phase: 'cleanup', message: error.message }
     }
+    await persist()
   }
   for (const stream of logStreams) await new Promise(done => stream.end(done))
   report.finishedAt = new Date().toISOString()
