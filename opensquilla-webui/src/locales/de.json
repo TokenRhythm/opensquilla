@@ -3441,7 +3441,7 @@
     "loadingSession": "Unterhaltungsverlauf wird wiederhergestellt…",
     "loadingSessionDescription": "Sie können die Unterhaltung währenddessen weiter verwenden.",
     "loadSessionFailed": "Unterhaltungsverlauf vorübergehend nicht verfügbar",
-    "loadSessionDescription": "Die Verbindung wurde möglicherweise unterbrochen oder der Verlaufsdienst ist vorübergehend nicht verfügbar. Bitte laden Sie erneut.",
+    "loadSessionDescription": "Der Gesprächsverlauf ist vorübergehend nicht verfügbar.",
     "reloadSession": "Verlauf neu laden",
     "retryingSession": "Unterhaltungsverlauf wird neu geladen…",
     "retryingSessionDescription": "Der Unterhaltungsverlauf wird wiederhergestellt…",
@@ -3915,7 +3915,7 @@
         "busy": "Der Zielstatus wird noch abgeschlossen. Der neueste Stand wird oben angezeigt.",
         "notResumable": "Dieses Ziel kann im aktuellen Zustand nicht fortgesetzt werden.",
         "executionDisabled": "Die Zielausführung ist in diesem Arbeitsbereich deaktiviert.",
-        "connectionRequired": "Verbinde diese Aufgabe erneut, bevor du das Ziel fortsetzt.",
+        "connectionRequired": "Diese Aufgabe kann derzeit noch nicht fortgesetzt werden.",
         "planModeActive": "Das Ziel wartet, bis der Planmodus beendet ist.",
         "planRunActive": "Das Ziel wartet, bis der aktive Planlauf beendet ist.",
         "requestConflict": "Diese Zielaktion wurde bereits für eine andere Anfrage verwendet. Versuche es erneut."
@@ -4225,7 +4225,7 @@
       "unknownProviderCalls": "{count} Provider-Aufruf mit unbekannter Nutzung | {count} Provider-Aufrufe mit unbekannter Nutzung"
     },
     "modelRouting": {
-      "updateFailed": "Modell-Routing konnte nicht umgeschaltet werden – zurückgesetzt. Prüfen Sie die Gateway-Verbindung und versuchen Sie es erneut.",
+      "updateFailed": "Modell-Routing konnte nicht umgeschaltet werden – zurückgesetzt. Die Änderung ist vorübergehend nicht verfügbar.",
       "sessionUpdateFailed": "Das Modellrouting dieses Chats konnte nicht aktualisiert werden: {error}"
     },
     "routeFeedback": {

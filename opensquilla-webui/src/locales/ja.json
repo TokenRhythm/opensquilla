@@ -3441,7 +3441,7 @@
     "loadingSession": "会話履歴を復元しています…",
     "loadingSessionDescription": "履歴の読み込み中も、この会話を引き続き使用できます。",
     "loadSessionFailed": "会話履歴を一時的に読み込めません",
-    "loadSessionDescription": "接続が中断されたか、履歴サービスが一時的に利用できない可能性があります。再読み込みしてください。",
+    "loadSessionDescription": "会話履歴は一時的に利用できません。",
     "reloadSession": "履歴を再読み込み",
     "retryingSession": "会話履歴を再読み込みしています…",
     "retryingSessionDescription": "会話履歴を復元しています…",
@@ -3915,7 +3915,7 @@
         "busy": "目標の状態を確定中です。最新の状態は上に表示されています。",
         "notResumable": "現在の状態からこの目標を再開できません。",
         "executionDisabled": "このワークスペースでは Goal の実行が無効です。",
-        "connectionRequired": "タスクを再接続してから目標を続行してください。",
+        "connectionRequired": "このタスクはまだ続行できません。",
         "planModeActive": "目標は Plan モードの終了を待ちます。",
         "planRunActive": "目標は進行中の Plan 実行の終了を待ちます。",
         "requestConflict": "この目標操作は別のリクエストですでに使用されています。もう一度お試しください。"

@@ -3441,7 +3441,7 @@
     "loadingSession": "Restauration de l’historique de la conversation…",
     "loadingSessionDescription": "Vous pouvez continuer à utiliser la conversation pendant le chargement.",
     "loadSessionFailed": "Historique de la conversation temporairement indisponible",
-    "loadSessionDescription": "La connexion a peut-être été interrompue ou le service d’historique est temporairement indisponible. Rechargez pour réessayer.",
+    "loadSessionDescription": "L’historique de la conversation est temporairement indisponible.",
     "reloadSession": "Recharger l’historique",
     "retryingSession": "Rechargement de l’historique…",
     "retryingSessionDescription": "Restauration de l’historique de la conversation…",
@@ -3915,7 +3915,7 @@
         "busy": "L'état de l'objectif est encore en cours de règlement. Son dernier état est affiché ci-dessus.",
         "notResumable": "Cet objectif ne peut pas être repris depuis son état actuel.",
         "executionDisabled": "L'exécution des objectifs est désactivée dans cet espace de travail.",
-        "connectionRequired": "Reconnectez cette tâche avant de poursuivre l'objectif.",
+        "connectionRequired": "Cette tâche n’est pas encore prête à continuer.",
         "planModeActive": "L'objectif attendra la fin du mode Plan.",
         "planRunActive": "L'objectif attendra la fin de l'exécution Plan active.",
         "requestConflict": "Cette action a déjà été utilisée pour une autre demande. Réessayez."

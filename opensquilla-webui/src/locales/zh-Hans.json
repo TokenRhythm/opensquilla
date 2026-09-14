@@ -3525,7 +3525,7 @@
     "loadingSession": "正在恢复会话历史…",
     "loadingSessionDescription": "历史加载期间，您仍可继续使用此会话。",
     "loadSessionFailed": "暂时无法恢复会话历史",
-    "loadSessionDescription": "连接可能中断，或历史服务暂时不可用。系统会继续尝试恢复。",
+    "loadSessionDescription": "会话历史暂时不可用。",
     "reloadSession": "重新加载历史",
     "retryingSession": "正在重新加载会话历史…",
     "retryingSessionDescription": "正在恢复会话历史…",
