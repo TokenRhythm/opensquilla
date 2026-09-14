@@ -83,7 +83,7 @@ const report = {
   execution: { realGateway: true, realFileTools: true, realDatabase: true, modelFixtureOnly: true, seededSessions: false, directRpcMutations: false, automaticRetries: 0, paidCalls: false },
   checkpoints: [], turns: [], processes: [], cleanup: [],
   cleanAcceptance: true,
-  hydrateContract: { checked: 0, invalidResponses: 0, keyMismatches: 0, consoleWarnings: 0, failures: [] },
+  hydrateContract: { validationBoundary: 'canonical-after-v3-alias', checked: 0, legacyRunModeResponses: 0, invalidResponses: 0, keyMismatches: 0, consoleWarnings: 0, failures: [] },
 }
 let provider, gateway, app, browser, page, port, interruption
 const logStreams = []
@@ -143,11 +143,19 @@ function instrumentPage(observedPage) {
       if (token(value?.error?.code)) summary.errorCode = value.error.code
       if (Number.isSafeInteger(value?.seq)) summary.sequence = value.seq
       if (direction === 'received' && value?.type === 'res' && value.ok === true && summary.method === 'sessions.messages.hydrate') {
-        const valid = validateSessionsMessagesHydrateResult(value.payload)
+        // The negotiated v3 wire legitimately names Safe "trusted". Check its
+        // canonical meaning with the unchanged v4 schema, not v3 bytes as v4.
+        // No other alias or malformed field is repaired by this inspector.
+        const legacyRunMode = value.payload?.run_mode_lock?.runMode === 'trusted'
+        const canonical = legacyRunMode
+          ? { ...value.payload, run_mode_lock: { ...value.payload.run_mode_lock, runMode: 'safe' } }
+          : value.payload
+        const valid = validateSessionsMessagesHydrateResult(canonical)
         const keyMatches = typeof request?.key === 'string' && value.payload?.key === request.key
         const errors = valid ? [] : hydrateContractErrors(validateSessionsMessagesHydrateResult.errors)
         report.hydrateContract.checked += 1
-        summary.contract = { valid, responseKeyMatchesRequest: keyMatches, errors }
+        report.hydrateContract.legacyRunModeResponses += Number(legacyRunMode)
+        summary.contract = { valid, legacyRunMode, responseKeyMatchesRequest: keyMatches, errors }
         if (!valid || !keyMatches) {
           report.cleanAcceptance = false
           report.hydrateContract.invalidResponses += Number(!valid)
