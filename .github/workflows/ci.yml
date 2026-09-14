@@ -1273,7 +1273,12 @@ jobs:
             # processes, or gateways from several tests.  Leave runner
             # headroom for those process-start handshakes instead of changing
             # their bounded readiness/timing assertions.
-            worker_args+=(--workers=2)
+            if [[ "${{ matrix.shard }}" == "recovery-migration" ||
+                  "${{ matrix.shard }}" == "gateway-sqlite" ]]; then
+              worker_args+=(--workers=3)
+            else
+              worker_args+=(--workers=2)
+            fi
           fi
 
           uv run python .github/scripts/windows_test_shards.py run \
