@@ -4411,7 +4411,7 @@ async def start_gateway_server(
     from opensquilla.scheduler.heartbeat_loop import HeartbeatLoop
     from opensquilla.scheduler.heartbeat_service import HeartbeatService
 
-    heartbeat_storage = get_session_storage(svc.session_manager) or svc.session_manager
+    heartbeat_storage = get_session_storage(svc.session_manager)
     heartbeat_service = HeartbeatService(
         turn_runner=turn_runner,
         session_storage=heartbeat_storage,

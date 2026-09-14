@@ -6,6 +6,7 @@ from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any
 
 from opensquilla.gateway.rpc import RpcHandlerError
+from opensquilla.gateway.session_services import SessionServiceUnavailableError
 from opensquilla.project_workspaces import (
     ProjectWorkspaceGuard,
     ProjectWorkspaceStateError,
@@ -127,11 +128,13 @@ async def prepare_heartbeat_tool_context(
     session_key: str,
     tool_context: ToolContext,
     *,
-    storage: SessionStorage,
+    storage: SessionStorage | None,
     session_manager: Any,
     config: Any,
 ) -> ToolContext:
     """Refresh the execution root without importing the session owner's authority."""
+    if not isinstance(storage, SessionStorage):
+        raise SessionServiceUnavailableError("Heartbeat requires session storage")
     session = await session_manager.get_session(session_key)
     if session is None:
         raise KeyError(f"Session not found: {session_key}")

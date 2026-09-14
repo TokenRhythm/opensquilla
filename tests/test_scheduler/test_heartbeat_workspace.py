@@ -14,6 +14,7 @@ from opensquilla.execution_workspaces import configured_execution_workspace
 from opensquilla.gateway.config import GatewayConfig
 from opensquilla.gateway.execution_workspaces import build_execution_workspace_factory
 from opensquilla.gateway.project_workspace_runtime import prepare_heartbeat_tool_context
+from opensquilla.gateway.session_services import SessionServiceUnavailableError
 from opensquilla.project_workspaces import ProjectWorkspaceStateError
 from opensquilla.run_mode import RunMode
 from opensquilla.sandbox.run_context import RUN_CONTEXT_ORIGIN_KEY, MountGrant, RunContext
@@ -133,6 +134,29 @@ async def test_heartbeat_revalidates_binding_before_every_run(
         # The periodic wrapper logs the same failure instead of starting a turn.
         await loop._tick()
         assert len(runner.calls) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("storage_kind", ["missing", "manager"])
+async def test_heartbeat_rejects_unavailable_storage_before_execution(
+    tmp_path: Path, workspace_config, storage_kind: str,
+) -> None:
+    config, _ = workspace_config
+    async with SessionStorage(tmp_path / "sessions.sqlite") as storage:
+        manager = SessionManager(storage, execution_workspace_factory=(
+            build_execution_workspace_factory(config, profile_home=tmp_path / "profile")
+        ))
+        session = await manager.create(KEY)
+        runner = _FileReadingRunner()
+        invalid_storage = None if storage_kind == "missing" else manager
+        loop = HeartbeatLoop(
+            config=config,
+            heartbeat_service=_service(config, invalid_storage, manager, runner),
+        )
+        with pytest.raises(SessionServiceUnavailableError, match="requires session storage"):
+            await loop.run_once_now(reason="test", agent_id="main", session_key=KEY)
+        assert runner.calls == []
+        assert (await storage.get_session(KEY)).model_dump() == session.model_dump()
 
 
 @pytest.mark.asyncio
