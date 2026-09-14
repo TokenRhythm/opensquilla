@@ -50,7 +50,6 @@ from opensquilla.sandbox.types import (
 )
 from opensquilla.subprocess_encoding import apply_utf8_child_env
 from opensquilla.tools.output_capture import (
-    OUTPUT_CAPTURE_TIMEOUT_PADDING,
     OUTPUT_PREVIEW_BYTES,
     BoundedOutputCapture,
 )
@@ -783,7 +782,7 @@ def _unsupported_windows_environment_subprocess_payload(reason: str) -> str:
 
 _MAX_TIMEOUT = 120
 _DEFAULT_TIMEOUT = 30
-_EXECUTION_TIMEOUT_PADDING = 5.0 + OUTPUT_CAPTURE_TIMEOUT_PADDING
+_EXECUTION_TIMEOUT_PADDING = 5.0
 _MAX_OUTPUT_CHARS = OUTPUT_PREVIEW_BYTES // 2
 _SANDBOX_PYTHON_CANDIDATES: tuple[Path, ...] = (
     Path("/usr/bin/python3"),
@@ -1280,7 +1279,8 @@ async def execute_code(
             stdout=capture.preview("stdout"), stderr=stderr,
             timed_out=timed_out, elapsed_ms=elapsed_ms,
         ))
-        payload["output_capture"] = capture.describe()
+        if output_details := capture.describe(only_if_needed=True):
+            payload["output_capture"] = output_details
         return finish(json.dumps(payload, ensure_ascii=False))
     except Exception as exc:
         await capture.finish_async()
@@ -1289,7 +1289,8 @@ async def execute_code(
             stderr=capture.preview("stderr") + f"\nExecution error: {exc}",
             timed_out=False, elapsed_ms=0,
         ))
-        payload["output_capture"] = capture.describe()
+        if output_details := capture.describe(only_if_needed=True):
+            payload["output_capture"] = output_details
         return finish(json.dumps(payload, ensure_ascii=False), executed=process_started)
     finally:
         await capture.finish_async()

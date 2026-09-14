@@ -948,7 +948,8 @@ def run_agent_command(
     tool_timeout_seconds: float | None = typer.Option(
         None,
         "--tool-timeout-seconds",
-        help="Per-tool execution timeout in seconds",
+        help="Deprecated compatibility option; ignored.",
+        hidden=True,
     ),
     request_timeout_seconds: float | None = typer.Option(
         None,

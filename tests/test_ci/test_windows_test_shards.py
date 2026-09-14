@@ -70,8 +70,7 @@ OFFLINE_MARKER_EXCLUSIONS = {
 RECENTLY_ADDED_ACTIVE_TESTS = {
     "tests/test_engine/test_agent_autonomous_tool_recovery.py",
     "tests/test_engine/test_agent_connection_recovery.py",
-    "tests/test_engine/test_selector_managed_recovery.py",
-    "tests/test_engine/test_selector_retry_after_lifetime.py",
+    "tests/test_engine/test_selector_provider_recovery.py",
     "tests/test_provider_connection_failure.py",
     "tests/test_tools/test_bounded_output_capture.py",
 

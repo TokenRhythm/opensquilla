@@ -375,7 +375,7 @@ _SHARED_TAIL_MATCHERS: tuple[FailureMatcher, ...] = (
     FailureMatcher(ProviderFailureKind.RATE_LIMITED, message_substrings=("rate limit",)),
     FailureMatcher(
         ProviderFailureKind.RATE_LIMITED,
-        raw_codes=frozenset({"provider_retry_after_deadline"}),
+        raw_codes=frozenset({"provider_retry_after_deadline", "rate_limit_retry_exhausted"}),
     ),
     FailureMatcher(
         ProviderFailureKind.PROVIDER_OVERLOADED,

@@ -618,7 +618,9 @@ async def test_selector_reasoning_commits_primary_and_suppresses_fallback() -> N
 
 
 @pytest.mark.asyncio
-async def test_selector_fallback_discards_failed_leg_tool_frames() -> None:
+async def test_selector_fallback_discards_failed_leg_tool_frames(
+    retry_sleeps: list[float],
+) -> None:
     primary = _SequenceProvider(
         [[
             ToolUseStartEvent(tool_use_id="ghost", tool_name="echo"),

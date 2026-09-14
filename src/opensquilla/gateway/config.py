@@ -2841,7 +2841,7 @@ class GatewayConfig(BaseSettings):
     web_chat_runtime_timeout_seconds: float = Field(default=0.0, ge=0.0)
     # Deprecated, unused: provider inactivity and tool deadlines are separate.
     agent_iteration_timeout_seconds: float | None = None
-    # Per-tool execution timeout. ``None`` means use the AgentConfig default.
+    # Deprecated, unused: tools declare their own execution deadlines.
     agent_tool_timeout_seconds: float | None = None
     # Per-turn override for the single LLM HTTP/streaming request timeout.
     # ``None`` defers to ``llm_request_timeout_seconds`` so existing

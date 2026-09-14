@@ -622,9 +622,6 @@ class ChatConfig(BaseModel):
         exclude=True,
         repr=False,
     )
-    # Only the Agent's primary call loop owns connection/rate-limit recovery.
-    # Auxiliary calls and direct provider users retain their existing policy.
-    agent_managed_recovery: bool = Field(default=False, exclude=True, repr=False)
     # Runtime-only absolute turn deadline. Provider selectors use it to avoid
     # violating an upstream Retry-After when the same account/endpoint owns the
     # next fallback leg. Adapters never serialize or send this value upstream.

@@ -1454,8 +1454,21 @@ async def test_selector_fallback_accounts_each_physical_leg_without_outer_duplic
     )
 
 
+@pytest.fixture
+def selector_retry_sleeps(monkeypatch: pytest.MonkeyPatch) -> list[float]:
+    sleeps: list[float] = []
+
+    async def sleep(delay: float) -> None:
+        sleeps.append(delay)
+
+    monkeypatch.setattr("opensquilla.engine.runtime.sleep_before_retry", sleep)
+    return sleeps
+
+
 @pytest.mark.asyncio
-async def test_selector_wrapper_without_ledger_scope_is_streaming_compatible() -> None:
+async def test_selector_wrapper_without_ledger_scope_is_streaming_compatible(
+    selector_retry_sleeps: list[float],
+) -> None:
     fallback = _PhysicalLegProvider(
         "anthropic",
         [ProviderText(text="ok"), ProviderDone(model="fallback-model")],
@@ -1464,23 +1477,32 @@ async def test_selector_wrapper_without_ledger_scope_is_streaming_compatible() -
         "openai",
         [ProviderError(message="rate limited", code="429")],
     )
+    primary.streams *= 4
     wrapper = _SelectorFallbackProvider(primary, _FallbackSelector(fallback))
 
     events = [event async for event in wrapper.chat([])]
 
     assert [getattr(event, "kind", "") for event in events] == [
-        "provider_activity",
-        "text_delta",
-        "done",
+        *["provider_activity"] * 7, "text_delta", "done",
     ]
-    assert (events[0].phase, events[0].reason) == ("fallback", "rate_limited")
-    assert events[0].retry_attempt == 1
-    assert events[0].started_at > 0
-    assert primary.calls == fallback.calls == 1
+    assert [(event.phase, event.retry_attempt) for event in events[:6]] == [
+        (phase, attempt)
+        for attempt in range(1, 4)
+        for phase in ("retry_wait", "retrying")
+    ]
+    assert all(event.retry_limit == 3 for event in events[:6])
+    assert (events[6].phase, events[6].reason) == ("fallback", "rate_limited")
+    assert events[6].retry_attempt == 1
+    assert all(event.started_at > 0 for event in events[:7])
+    assert primary.calls == 4
+    assert fallback.calls == 1
+    assert len(selector_retry_sleeps) == 3
 
 
 @pytest.mark.asyncio
-async def test_meta_helper_with_selector_records_only_physical_legs() -> None:
+async def test_meta_helper_with_selector_records_only_physical_legs(
+    selector_retry_sleeps: list[float],
+) -> None:
     sink = _RecordingSink()
     fallback = _PhysicalLegProvider(
         "anthropic",
@@ -1490,6 +1512,7 @@ async def test_meta_helper_with_selector_records_only_physical_legs() -> None:
         "openai",
         [ProviderError(message="rate limited", code="429")],
     )
+    primary.streams *= 4
     wrapper = _SelectorFallbackProvider(primary, _FallbackSelector(fallback))
     chat = make_llm_chat_from_provider(
         provider=wrapper,
@@ -1501,13 +1524,18 @@ async def test_meta_helper_with_selector_records_only_physical_legs() -> None:
     assert await chat("system", "user") == "ok"
 
     assert [(call.call_index, call.provider, call.model) for call in sink.started] == [
-        (1, "openai", "primary-model"),
-        (2, "anthropic", "fallback-model"),
+        *[(index, "openai", "primary-model") for index in range(1, 5)],
+        (5, "anthropic", "fallback-model"),
     ]
     assert {call.execution_id for call in sink.started} != {"turn-1"}
     assert all(call.run_kind == "meta_llm" for call in sink.started)
-    assert len(sink.finalized) == 1
-    assert len(sink.unknown) == 1
+    assert [call.call_index for call, _ in sink.finalized] == [5]
+    assert [(call.call_index, reason) for call, reason in sink.unknown] == [
+        (index, "provider_error:429") for index in range(1, 5)
+    ]
+    assert primary.calls == 4
+    assert fallback.calls == 1
+    assert len(selector_retry_sleeps) == 3
 
 
 @pytest.mark.asyncio

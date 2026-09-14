@@ -677,8 +677,8 @@ class AgentConfig:
     iteration_timeout: float = 0.0
     # HTTP-level timeout for a single LLM API request
     request_timeout: float = 120.0
-    # Per-tool execution timeout
-    tool_timeout: float = 60.0
+    # Deprecated, unused compatibility slot; tools declare their own deadlines.
+    tool_timeout: float = 0.0
     # Upper bound for same-turn safe tool execution. Safe tools can overlap, but
     # unbounded fan-out can overload local/network resources.
     max_safe_tool_concurrency: int = 6
@@ -908,9 +908,6 @@ class AgentConfig:
     # stays gateway-agnostic and a broken observer can never affect a turn.
     provider_call_observer: Callable[..., None] | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
-
-    # Runtime-only eligibility; not inherited by child agents.
-    provider_connection_recovery_enabled: bool = field(default=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         self.flush_triggers = list(normalize_flush_triggers_strict(self.flush_triggers))

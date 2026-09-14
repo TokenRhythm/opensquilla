@@ -341,7 +341,6 @@ async def test_provider_compaction_disables_tools_and_thinking_and_accounts_usag
     assert config.thinking_budget_explicit is False
     assert config.tool_choice is None
     assert config.physical_attempt_limit == 1
-    assert config.agent_managed_recovery is False
     assert config.provider_request_max_chars == 120_000
     assert config.provider_request_correlation is correlation
     assert "Preserve exact IDs." in str(config.system)

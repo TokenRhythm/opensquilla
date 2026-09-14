@@ -1711,7 +1711,6 @@ async def call_compaction_provider(
         tool_choice=None,
         candidate_output_mode="inert_artifact",
         physical_attempt_limit=1,
-        agent_managed_recovery=False,
         provider_request_correlation=provider_request_correlation,
     )
 

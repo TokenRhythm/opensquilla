@@ -37,6 +37,12 @@ def _write(store: ToolResultStore, text: str, *, budget: int):
     )
 
 
+def _retained_output(store: ToolResultStore):
+    records = store._iter_record_stats()
+    assert len(records) == 1
+    return store.read(records[0].record_dir.name, session_id="test-session")
+
+
 def test_spool_reservation_shares_snapshot_budget_and_is_not_evicted(tmp_path: Path) -> None:
     store = ToolResultStore(tmp_path)
     spool = _spool(store)
@@ -174,14 +180,16 @@ async def test_retained_capture_preserves_process_newlines(
     assert capture.describe()["retained_output_complete"] is True
 
 
+@pytest.mark.parametrize("output_size", [0, 30000])
 async def test_exec_timeout_preserves_output_and_retrievable_retained_text(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, output_size: int,
 ) -> None:
     token = current_tool_context.set(ToolContext(
         session_key="test-session", tool_result_store_dir=str(tmp_path), agent_id="main",
     ))
     code = (
-        "import sys,time; sys.stdout.buffer.write(b'before waiting\\r\\n'); "
+        "import sys,time; "
+        f"sys.stdout.buffer.write(b'x'*{output_size} + b'before waiting\\r\\n'); "
         "sys.stdout.flush(); sys.stderr.buffer.write(b'ready\\n'); "
         "sys.stderr.flush(); time.sleep(20)"
     )
@@ -220,9 +228,13 @@ async def test_exec_timeout_preserves_output_and_retrievable_retained_text(
     assert "[timeout after 0.5s]" in result
     # The command itself contains this text, so only inspect captured output.
     assert "before waiting" in result.split("--- partial output before timeout ---\n", 1)[1]
-    handle = result.split("tool_result_handle=", 1)[1].split(";", 1)[0]
-    stored = ToolResultStore(tmp_path).read(handle, session_id="test-session")
-    assert stored.content == "before waiting\r\n"
+    stored = _retained_output(ToolResultStore(tmp_path))
+    assert stored.content == "x" * output_size + "before waiting\r\n"
+    if output_size:
+        assert f"tool_result_handle={stored.handle}" in result
+        assert "partial output truncated" in result
+    else:
+        assert "output capture" not in result
 
 
 async def test_background_log_and_wait_retain_output_after_nonzero_exit(
@@ -276,16 +288,11 @@ async def test_background_log_and_wait_retain_output_after_nonzero_exit(
 
 def test_execute_code_declares_budget_including_cleanup() -> None:
     from opensquilla.tools.builtin import code_exec
-    from opensquilla.tools.output_capture import (
-        OUTPUT_FINALIZE_WAIT_SECONDS,
-        OUTPUT_SETUP_WAIT_SECONDS,
-    )
     from opensquilla.tools.registry import get_default_registry
 
     spec = get_default_registry().get("execute_code").spec
     required_padding = (
-        OUTPUT_SETUP_WAIT_SECONDS + OUTPUT_FINALIZE_WAIT_SECONDS
-        + shell._EXEC_TERMINATE_TIMEOUT + shell._EXEC_KILL_TIMEOUT
+        shell._EXEC_TERMINATE_TIMEOUT + shell._EXEC_KILL_TIMEOUT
         + shell._BACKGROUND_KILL_TIMEOUT
     )
     assert spec.execution_timeout_seconds >= code_exec._DEFAULT_TIMEOUT + required_padding
@@ -298,33 +305,23 @@ def test_execute_code_declares_budget_including_cleanup() -> None:
 
 
 @pytest.mark.parametrize("cancel", [False, True])
-async def test_capture_setup_wait_is_bounded_and_closes_late_lease(
+async def test_capture_setup_owns_lease_until_open_settles(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, cancel: bool,
 ) -> None:
     import threading
 
-    from opensquilla.tools import output_capture
-
-    entered, release, closed = threading.Event(), threading.Event(), threading.Event()
+    entered, release = threading.Event(), threading.Event()
     spools = []
     original_open = ToolResultStore.open_output_spool
 
     def stalled_open(store, **kwargs):
         spool = original_open(store, **kwargs)
         spools.append(spool)
-        original_close = spool.close
-
-        def observed_close():
-            original_close()
-            closed.set()
-
-        spool.close = observed_close
         entered.set()
         assert release.wait(timeout=5)
         return spool
 
     monkeypatch.setattr(ToolResultStore, "open_output_spool", stalled_open)
-    monkeypatch.setattr(output_capture, "OUTPUT_SETUP_WAIT_SECONDS", 0.05)
     token = current_tool_context.set(ToolContext(
         session_key="test-session", tool_result_store_dir=str(tmp_path), agent_id="main",
     ))
@@ -336,29 +333,25 @@ async def test_capture_setup_wait_is_bounded_and_closes_late_lease(
         assert await asyncio.to_thread(entered.wait, 1)
         if cancel:
             task.cancel()
-        done, _pending = await asyncio.wait({task}, timeout=1)
-        assert task in done
-        if cancel:
-            with pytest.raises(asyncio.CancelledError):
-                task.result()
-        else:
-            capture = task.result()
-            assert capture.spool is None
-            assert capture.storage_error == "OutputSetupTimeout"
-            # The normal execution/drain/finalize path stays usable even while
-            # the abandoned setup worker still owns its reservation.
-            reader = asyncio.StreamReader()
-            reader.feed_data(b"command completed after slow setup\n")
-            reader.feed_eof()
-            await capture.drain(reader)
-            await capture.finish_async()
-            assert "command completed" in capture.preview()
-            assert "tool_result_handle" not in capture.describe()
+            await asyncio.sleep(0)
+            task.cancel()
+            await asyncio.sleep(0)
+        assert not task.done()
         assert not spools[0].lease.closed
         assert ToolResultStore(tmp_path)._iter_record_stats()[0].active
     finally:
         release.set()
-        assert await asyncio.to_thread(closed.wait, 2)
+    if cancel:
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, timeout=2)
+    else:
+        capture = await asyncio.wait_for(task, timeout=2)
+        assert capture.spool is spools[0]
+        assert capture.storage_error is None
+        capture.feed(b"command completed after slow setup\n")
+        await capture.finish_async()
+        assert capture.handle
+        assert "command completed" in capture.preview()
     assert spools[0].lease.closed
 
 
@@ -389,6 +382,55 @@ async def test_capture_respects_operator_budget_overrides(tmp_path: Path) -> Non
         assert "FIRST_OUTPUT_835" in restored and "FINAL_EIO_927" in restored
     finally:
         current_tool_context.reset(token)
+
+
+async def test_complete_output_does_not_add_capture_instructions(tmp_path: Path) -> None:
+    capture = BoundedOutputCapture()
+    capture.spool = _spool(ToolResultStore(tmp_path))
+    capture.retrieval_available = True
+    capture.feed(b"complete output")
+    await capture.finish_async()
+
+    assert capture.handle is not None
+    assert capture.describe()["retained_output_complete"] is True
+    assert capture.describe(only_if_needed=True) == {}
+    assert capture.notice() == ""
+    assert _retained_output(ToolResultStore(tmp_path)).content == "complete output"
+
+
+@pytest.mark.parametrize("output_size", [20, 200])
+async def test_process_log_marks_capture_omission_even_when_response_fits(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, output_size: int,
+) -> None:
+    from types import SimpleNamespace
+    from typing import cast
+
+    capture = BoundedOutputCapture(preview_bytes=64)
+    capture.spool = _spool(ToolResultStore(tmp_path))
+    capture.retrieval_available = True
+    capture.feed(b"x" * output_size)
+    await capture.finish_async()
+    session = shell._BgSession(
+        session_id="log-test", command="synthetic command",
+        process=cast(asyncio.subprocess.Process, SimpleNamespace(returncode=0)),
+        session_key="test-session", output_capture=capture, done=True, returncode=0,
+    )
+    monkeypatch.setitem(shell._bg_sessions, session.session_id, session)
+    token = current_tool_context.set(ToolContext(session_key="test-session"))
+    try:
+        payload = json.loads(await shell.process("log", session_id=session.session_id, limit=1000))
+    finally:
+        current_tool_context.reset(token)
+
+    assert len(payload["output"]) < payload["limit"]
+    assert payload["truncated"] is (output_size > 64)
+    if output_size > 64:
+        assert "preview omitted" in payload["output"]
+        assert payload["session"]["output_capture"]["tool_result_handle"] == capture.handle
+        assert "retrieve_tool_result" in payload["output"]
+    else:
+        assert payload["output"] == "x" * output_size
+        assert "output_capture" not in payload["session"]
 
 
 def test_mcp_declares_configured_execution_budget_plus_cleanup() -> None:
@@ -430,8 +472,8 @@ async def test_execute_code_timeout_retains_both_streams(tmp_path: Path) -> None
         assert payload["timed_out"] is True
         assert "stdout ready" in payload["stdout"]
         assert "stderr ready" in payload["stderr"]
-        handle = payload["output_capture"]["tool_result_handle"]
-        retained = ToolResultStore(tmp_path / "store").read(handle, session_id="test-session")
+        assert "output_capture" not in payload
+        retained = _retained_output(ToolResultStore(tmp_path / "store"))
         assert "stdout ready" in retained.content
         assert "stderr ready" in retained.content
     finally:
@@ -612,13 +654,11 @@ async def test_execute_code_retains_native_child_bytes_alongside_utf8(
         assert payload["exit_code"] == 0
         assert payload["stdout"] == utf8_text
         assert payload["stderr"] == legacy_text
-        retained = ToolResultStore(tmp_path / "store").read(
-            payload["output_capture"]["tool_result_handle"], session_id="test-session",
-        ).content
+        assert "output_capture" not in payload
+        retained = _retained_output(ToolResultStore(tmp_path / "store")).content
         assert f"[stdout]\n{utf8_text}" in retained
         assert f"[stderr]\n{legacy_text}" in retained
         assert "�" not in retained
-        assert payload["output_capture"]["retained_output_complete"] is True
     finally:
         current_tool_context.reset(token)
         reset_runtime()
@@ -701,7 +741,7 @@ def test_failed_eviction_does_not_spend_bytes_still_on_disk(
     assert store.read(record.handle, session_id="test-session").content == "existing bytes"
 
 
-async def test_stop_bounds_finalization_without_releasing_live_writer_lease(
+async def test_finalization_waits_for_output_writer_before_closing_lease(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     import threading
@@ -709,101 +749,129 @@ async def test_stop_bounds_finalization_without_releasing_live_writer_lease(
     capture = BoundedOutputCapture()
     store = ToolResultStore(tmp_path)
     capture.spool = _spool(store)
-    entered, release = threading.Event(), threading.Event()
+    entered, release, finishing = threading.Event(), threading.Event(), threading.Event()
     original_append = capture.spool.append
     original_finish = capture.finish
-    finalizer_calls = 0
 
     def blocked_append(chunk: bytes) -> None:
         entered.set()
         assert release.wait(timeout=5)
         original_append(chunk)
 
-    def counted_finish() -> None:
-        nonlocal finalizer_calls
-        finalizer_calls += 1
+    def finish() -> None:
+        finishing.set()
         original_finish()
 
     monkeypatch.setattr(capture.spool, "append", blocked_append)
-    monkeypatch.setattr(capture, "finish", counted_finish)
+    monkeypatch.setattr(capture, "finish", finish)
     writer = asyncio.create_task(asyncio.to_thread(capture.feed, b"last diagnostic"))
     assert await asyncio.to_thread(entered.wait, 1)
-    started = asyncio.Event()
-
-    async def cancelled_tool() -> None:
-        try:
-            started.set()
-            await asyncio.Event().wait()
-        finally:
-            await capture.finish_async()
-            capture.release_preview()
-            # A second finally must not add another worker or wait budget.
-            await capture.finish_async()
-
-    task = asyncio.create_task(cancelled_tool())
-    await started.wait()
+    finalizer = asyncio.create_task(capture.finish_async())
     try:
-        task.cancel()
-        done, _pending = await asyncio.wait({task}, timeout=1)
-        assert task in done
-        with pytest.raises(asyncio.CancelledError):
-            task.result()
-        assert finalizer_calls == 1
-        assert capture.describe()["finalization_pending"] is True
-        assert "tool_result_handle" not in capture.describe()
-        assert "not yet persisted" in capture.notice()
-        assert "last diagnostic" in capture.preview()
+        assert await asyncio.to_thread(finishing.wait, 1)
+        assert not finalizer.done()
+        assert not capture.finished
+        assert capture.handle is None
         assert not capture.spool.lease.closed
         assert store._iter_record_stats()[0].active
     finally:
         release.set()
-        await writer
-        assert capture._finish_task is not None
-        await asyncio.wait_for(asyncio.shield(capture._finish_task), timeout=2)
+        await asyncio.wait_for(asyncio.gather(writer, finalizer), timeout=2)
     assert capture.spool.lease.closed
     assert capture.handle is not None
     assert store.read(capture.handle, session_id="test-session").content == "last diagnostic"
-    assert "finalization_pending" not in capture.describe()
+    capture.release_preview()
     assert not capture.previews["stdout"].head
 
 
-async def test_normal_finalization_observation_is_bounded_and_reuses_worker(
+async def test_finalization_waits_for_retained_output_and_is_idempotent(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     import threading
 
-    from opensquilla.tools import output_capture
-
     capture = BoundedOutputCapture()
     capture.spool = _spool(ToolResultStore(tmp_path))
     entered, release = threading.Event(), threading.Event()
-    original_finish = capture.finish
+    original_finish = capture.spool.finish
     calls = 0
 
-    def delayed_finish() -> None:
+    def delayed_finish(text: str) -> str:
         nonlocal calls
         calls += 1
         entered.set()
         assert release.wait(timeout=5)
-        original_finish()
+        return original_finish(text)
 
-    assert output_capture.OUTPUT_FINALIZE_WAIT_SECONDS == 5
-    monkeypatch.setattr(output_capture, "OUTPUT_FINALIZE_WAIT_SECONDS", 0.02)
-    monkeypatch.setattr(capture, "finish", delayed_finish)
+    monkeypatch.setattr(capture.spool, "finish", delayed_finish)
     capture.feed(b"result already produced")
+    tasks = [asyncio.create_task(capture.finish_async()) for _ in range(2)]
     try:
-        await asyncio.wait_for(capture.finish_async(), timeout=1)
-        assert entered.is_set()
-        for _ in range(3):
-            await capture.finish_async()
-        assert calls == 1
-        assert capture.describe()["finalization_pending"] is True
+        assert await asyncio.to_thread(entered.wait, 1)
+        assert not any(task.done() for task in tasks)
+        assert not capture.finished
+        assert capture.handle is None
     finally:
         release.set()
-        assert capture._finish_task is not None
-        await asyncio.wait_for(asyncio.shield(capture._finish_task), timeout=2)
+        await asyncio.wait_for(asyncio.gather(*tasks), timeout=2)
+    await capture.finish_async()
+    assert calls == 1
     assert capture.spool.lease.closed
     assert capture.handle is not None
+
+
+async def test_cancelled_finalizer_still_closes_lease_when_executor_was_busy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+
+    capture = BoundedOutputCapture()
+    store = ToolResultStore(tmp_path)
+    capture.spool = _spool(store)
+    capture.feed(b"retained before cancellation")
+    entered, release = threading.Event(), threading.Event()
+    queued, closed = asyncio.Event(), asyncio.Event()
+    loop = asyncio.get_running_loop()
+    original_finish = capture.finish
+
+    def busy_worker() -> None:
+        entered.set()
+        assert release.wait(timeout=5)
+
+    def finish() -> None:
+        try:
+            original_finish()
+        finally:
+            loop.call_soon_threadsafe(closed.set)
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        blocker = executor.submit(busy_worker)
+        assert entered.wait(timeout=1)
+
+        async def run_in_test_executor(function, *args):
+            future = loop.run_in_executor(executor, function, *args)
+            queued.set()
+            return await future
+
+        monkeypatch.setattr(asyncio, "to_thread", run_in_test_executor)
+        monkeypatch.setattr(capture, "finish", finish)
+        task = asyncio.create_task(capture.finish_async())
+        try:
+            await asyncio.wait_for(queued.wait(), timeout=1)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            assert not capture.spool.lease.closed
+        finally:
+            release.set()
+            await asyncio.wait_for(closed.wait(), timeout=2)
+            blocker.result(timeout=1)
+
+    assert capture.spool.lease.closed
+    assert capture.handle is not None
+    assert store.read(capture.handle, session_id="test-session").content == (
+        "retained before cancellation"
+    )
 
 
 async def test_code_capture_setup_cancellation_removes_temporary_cwd(

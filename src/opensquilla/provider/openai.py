@@ -5315,7 +5315,7 @@ class OpenAIProvider:
             if (
                 stream_timeout_fallback
                 and not emitted_stream_event
-                and not (cfg.agent_managed_recovery and code == CONNECTION_FAILED_CODE)
+                and code != CONNECTION_FAILED_CODE
             ):
                 event_name = (
                     "openrouter.stream_timeout_fallback_started"

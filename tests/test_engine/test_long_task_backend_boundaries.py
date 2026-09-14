@@ -12,6 +12,7 @@ import pytest
 import structlog.testing
 
 from opensquilla.engine import Agent, AgentConfig
+from opensquilla.engine.fallback import FallbackPolicy
 from opensquilla.engine.runtime import (
     TurnRunner,
     _SelectorFallbackProvider,
@@ -364,6 +365,7 @@ async def test_same_authority_fallback_waits_for_retry_after(
         primary,
         _Selector(primary_config, fallback_config, fallback),
     )
+    wrapper.configure_retry_policy(FallbackPolicy(max_retries=0))
 
     events = [
         event
@@ -403,6 +405,7 @@ async def test_independent_authority_fallback_does_not_wait_for_retry_after(
             fallback,
         ),
     )
+    wrapper.configure_retry_policy(FallbackPolicy(max_retries=0))
 
     events = [
         event
@@ -426,6 +429,7 @@ async def test_same_authority_retry_after_past_deadline_is_typed_terminal() -> N
     first = ProviderConfig("openrouter", "primary", api_key="same-account")
     second = ProviderConfig("openrouter", "fallback", api_key="same-account")
     wrapper = _SelectorFallbackProvider(primary, _Selector(first, second, fallback))
+    wrapper.configure_retry_policy(FallbackPolicy(max_retries=0))
 
     events = [
         event
@@ -465,6 +469,7 @@ async def test_same_authority_retry_after_over_wait_ceiling_is_typed_terminal(
     first = ProviderConfig("openrouter", "primary", api_key="same-account")
     second = ProviderConfig("openrouter", "fallback", api_key="same-account")
     wrapper = _SelectorFallbackProvider(primary, _Selector(first, second, fallback))
+    wrapper.configure_retry_policy(FallbackPolicy(max_retries=0))
 
     events = [
         event
@@ -486,7 +491,7 @@ async def test_same_authority_retry_after_over_wait_ceiling_is_typed_terminal(
     ("retry_after_s", "timeout"), [(8.0, 1.0), (901.0, 2_000.0)],
     ids=["past-turn-deadline", "past-wait-ceiling"],
 )
-async def test_agent_does_not_advance_same_authority_when_retry_wait_is_unavailable(
+async def test_agent_does_not_retry_after_selector_deadline_terminal(
     monkeypatch: pytest.MonkeyPatch, retry_after_s: float, timeout: float
 ) -> None:
     sleeps: list[float] = []
@@ -525,16 +530,18 @@ async def test_agent_does_not_advance_same_authority_when_retry_wait_is_unavaila
         provider=wrapper,
         config=AgentConfig(max_provider_retries=3, timeout=timeout),
     )
+    # Isolate fallback admission; the Agent still has its ordinary retry budget.
+    wrapper.configure_retry_policy(FallbackPolicy(max_retries=0))
 
     events = [event async for event in agent.run_turn("hello")]
 
     assert primary.calls == 1
     assert first_fallback.calls == 0
     assert second_fallback.calls == 0
-    assert selector.current_config == configs[0]
+    assert selector.current_config == configs[1]
     assert sleeps == []
     terminal = next(event for event in events if isinstance(event, EngineErrorEvent))
-    assert terminal.code == "429"
+    assert terminal.code == "provider_retry_after_deadline"
     assert terminal.failure_kind == "rate_limited"
     assert "raw rate limit body" not in repr(events)
 

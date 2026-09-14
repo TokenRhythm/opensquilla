@@ -13,7 +13,6 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from opensquilla.engine.cancellation import park_background_task
 from opensquilla.engine.tool_result_store import (
     DEFAULT_TOOL_RESULT_MAX_BYTES,
     ToolOutputSpool,
@@ -24,24 +23,7 @@ from opensquilla.tools.types import current_tool_context
 
 OUTPUT_PREVIEW_BYTES = 1024 * 1024
 OUTPUT_READ_BYTES = 64 * 1024
-OUTPUT_SETUP_WAIT_SECONDS = 5.0
-OUTPUT_FINALIZE_WAIT_SECONDS = 5.0
-OUTPUT_CANCEL_FINALIZE_WAIT_SECONDS = 0.25
-OUTPUT_CAPTURE_TIMEOUT_PADDING = OUTPUT_SETUP_WAIT_SECONDS + OUTPUT_FINALIZE_WAIT_SECONDS
 _OUTPUT_FRAME_HEADER = struct.Struct(">BI")
-
-
-def _close_late_spool(opening: asyncio.Task[ToolOutputSpool]) -> None:
-    async def close_when_ready() -> None:
-        try:
-            spool = await opening
-        except Exception:
-            return
-        await asyncio.to_thread(spool.close)
-
-    park_background_task(
-        asyncio.create_task(close_when_ready()), operation="tool_output_setup_cleanup",
-    )
 
 
 @dataclass
@@ -108,10 +90,6 @@ class BoundedOutputCapture:
         self._preview_released = False
         self._released_omitted = 0
         self._fallback_previews: dict[str, str] = {}
-        self._finish_task: asyncio.Task[None] | None = None
-        self._finish_parked = False
-        self._finalization_pending = False
-        self._release_after_finish = False
         self._lock = threading.Lock()
         self._write_lock = threading.Lock()
 
@@ -131,8 +109,6 @@ class BoundedOutputCapture:
         if not root or not session_id:
             return capture
         try:
-            # Storage setup is optional: bound observation without cancelling
-            # its worker. Late leases stay owned until cleanup can close them.
             opening = asyncio.create_task(asyncio.to_thread(
                 ToolResultStore(root).open_output_spool,
                 tool_name=tool_name, session_id=session_id,
@@ -147,15 +123,20 @@ class BoundedOutputCapture:
                 retention_seconds=ctx.tool_result_store_retention_seconds,
             ))
             try:
-                done, _pending = await asyncio.wait({opening}, timeout=OUTPUT_SETUP_WAIT_SECONDS)
+                capture.spool = await asyncio.shield(opening)
             except asyncio.CancelledError:
-                _close_late_spool(opening)
+                # A thread cannot be cancelled. Settle the open operation and
+                # close its lease before relinquishing ownership.
+                while not opening.done():
+                    try:
+                        await asyncio.shield(opening)
+                    except asyncio.CancelledError:
+                        continue
+                    except Exception:
+                        break
+                if not opening.cancelled() and opening.exception() is None:
+                    opening.result().close()
                 raise
-            if done:
-                capture.spool = opening.result()
-            else:
-                capture.storage_error = "OutputSetupTimeout"
-                _close_late_spool(opening)
         except Exception as exc:
             capture.storage_error = type(exc).__name__
         return capture
@@ -209,7 +190,6 @@ class BoundedOutputCapture:
         or later IO failure still produces useful, explicitly partial output.
         """
         with self._lock:
-            self._release_after_finish = True
             if self._preview_released or not self.finished or not self.handle:
                 return
             self._released_omitted = sum(view.omitted for view in self.previews.values())
@@ -231,15 +211,21 @@ class BoundedOutputCapture:
                 )
             except (OSError, ValueError):
                 pass
-        return self.preview() + "\n[retained output unavailable; latest diagnostic fallback only]"
+        self.incomplete_reason = "retained output unavailable; latest diagnostic fallback only"
+        return self.preview() + f"\n[{self.incomplete_reason}]"
 
-    def describe(self) -> dict[str, Any]:
+    def describe(self, *, only_if_needed: bool = False) -> dict[str, Any]:
         with self._lock:
             observed = sum(item.observed for item in self.previews.values())
             omitted = (
                 self._released_omitted if self._preview_released
                 else sum(item.omitted for item in self.previews.values())
             )
+            if only_if_needed and not (
+                omitted or self.storage_error or self.incomplete_reason
+                or (self.spool is not None and self.spool.size >= self.spool.max_bytes)
+            ):
+                return {}
             result: dict[str, Any] = {
                 "observed_bytes": observed,
                 "preview_omitted_bytes": omitted,
@@ -250,8 +236,6 @@ class BoundedOutputCapture:
                     and self.spool is not None and self.spool.size < self.spool.max_bytes
                 ),
             }
-            if self._finalization_pending and not self.handle:
-                result["finalization_pending"] = True
             if self.handle:
                 result["tool_result_handle"] = self.handle
                 if self.retrieval_available:
@@ -262,36 +246,32 @@ class BoundedOutputCapture:
                 result["storage_error"] = self.storage_error
             return result
 
-    def notice(self) -> str:
-        info = self.describe()
-        if not (
-            info.get("tool_result_handle") or info["preview_omitted_bytes"]
-            or self.storage_error or self.incomplete_reason or info.get("finalization_pending")
-        ):
+    def notice(self, *, retrieval_needed: bool = False) -> str:
+        info = self.describe(only_if_needed=not (retrieval_needed and self.handle))
+        if not info:
             return ""
-        text = "\n[output capture: "
+        details = []
         if info.get("tool_result_handle"):
-            text += f"retained output tool_result_handle={self.handle}; "
+            details.append(f"retained output tool_result_handle={self.handle}")
             if self.retrieval_available:
-                text += "use retrieve_tool_result to inspect retained fragments; "
-        text += f"preview omitted {info['preview_omitted_bytes']} bytes"
+                details.append("use retrieve_tool_result to inspect retained fragments")
+        if info["preview_omitted_bytes"]:
+            details.append(f"preview omitted {info['preview_omitted_bytes']} bytes")
         if not info["retained_output_complete"]:
-            text += "; retained output may omit bytes; not a full log"
-        if info.get("finalization_pending"):
-            text += "; retained output finalization pending, not yet persisted"
+            details.append("retained output may omit bytes; not a full log")
         if self.incomplete_reason:
-            text += f"; {self.incomplete_reason}"
+            details.append(self.incomplete_reason)
         if self.storage_error:
-            text += f"; storage unavailable ({self.storage_error}), pipe still drained"
-        return text + "]"
+            details.append(f"storage unavailable ({self.storage_error}), pipe still drained")
+        return "\n[output capture: " + "; ".join(details) + "]"
 
     def finish(self) -> None:
         with self._write_lock:
             with self._lock:
                 if self.finished:
                     return
-                self.finished = True
             if self.spool is None:
+                self.finished = True
                 return
             try:
                 raw = self.spool.prefix()
@@ -336,6 +316,8 @@ class BoundedOutputCapture:
                 self.storage_error = type(exc).__name__
             finally:
                 self.spool.close()
+                with self._lock:
+                    self.finished = True
 
     def _decode_retained_prefix(self, raw: bytes) -> str:
         if not self._framed_output:
@@ -359,49 +341,6 @@ class BoundedOutputCapture:
             if content
         )
 
-    def _finish_settled(self, task: asyncio.Task[None]) -> None:
-        self._finalization_pending = False
-        if not task.cancelled():
-            exception = task.exception()
-            if exception is not None:
-                self.storage_error = type(exception).__name__
-        if self._release_after_finish:
-            self.release_preview()
-
-    def _park_finalizer(self) -> None:
-        if self._finish_task is not None and not self._finish_parked:
-            self._finish_parked = True
-            park_background_task(self._finish_task, operation="tool_output_finalize")
-
     async def finish_async(self) -> None:
-        """Bound observation of storage cleanup; never cancel its worker.
-
-        A parked writer still owns its spool lease. Pending output returns an
-        honest in-memory diagnostic, without publishing an unready handle.
-        Repeated finally blocks observe the same task instead of queuing more
-        workers behind a stalled disk write.
-        """
-        if self._finish_task is None:
-            self._finish_task = asyncio.create_task(asyncio.to_thread(self.finish))
-            self._finish_task.add_done_callback(self._finish_settled)
-        task = self._finish_task
-        if self._finalization_pending and not task.done():
-            return
-        caller = asyncio.current_task()
-        timeout = (
-            OUTPUT_CANCEL_FINALIZE_WAIT_SECONDS
-            if caller is not None and caller.cancelling()
-            else OUTPUT_FINALIZE_WAIT_SECONDS
-        )
-        try:
-            done, _pending = await asyncio.wait({task}, timeout=timeout)
-        except asyncio.CancelledError:
-            if not task.done():
-                self._finalization_pending = True
-                self._park_finalizer()
-            raise
-        if not done:
-            self._finalization_pending = True
-            self._park_finalizer()
-        else:
-            self._finish_settled(task)
+        # Keep queued file cleanup runnable even if the caller is cancelled.
+        await asyncio.shield(asyncio.to_thread(self.finish))

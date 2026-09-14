@@ -111,8 +111,10 @@ async def test_identical_calls_execute_and_each_real_result_reaches_next_request
 
 
 @pytest.mark.parametrize("legacy_iteration_timeout", [0.0, 0.001])
-async def test_zero_generic_tool_budget_and_retired_iteration_budget_do_not_cancel_tools(
+@pytest.mark.parametrize("legacy_tool_timeout", [0.0, 0.001, 60.0])
+async def test_retired_generic_and_iteration_budgets_do_not_cancel_tools(
     legacy_iteration_timeout: float,
+    legacy_tool_timeout: float,
 ) -> None:
     provider = RepeatedCallProvider(2)
     calls = 0
@@ -127,7 +129,7 @@ async def test_zero_generic_tool_budget_and_retired_iteration_budget_do_not_canc
         provider=provider,
         config=AgentConfig(
             timeout=2,
-            tool_timeout=0,
+            tool_timeout=legacy_tool_timeout,
             iteration_timeout=legacy_iteration_timeout,
         ),
         tool_definitions=[_probe_definition()],
@@ -140,7 +142,7 @@ async def test_zero_generic_tool_budget_and_retired_iteration_budget_do_not_canc
     assert not any(isinstance(event, ErrorEvent) for event in events)
 
 
-async def test_declared_tool_timeout_still_applies_when_generic_budget_is_disabled() -> None:
+async def test_declared_tool_timeout_returns_error_and_allows_recovery() -> None:
     provider = RepeatedCallProvider(2)
     cancelled = asyncio.Event()
     calls = 0

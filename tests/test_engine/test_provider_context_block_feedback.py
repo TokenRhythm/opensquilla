@@ -10,7 +10,6 @@ import pytest
 from opensquilla.engine import Agent, AgentConfig
 from opensquilla.engine.agent import (
     _INVALID_PROVIDER_CONTEXT_ARGUMENTS_KEY,
-    _PROVIDER_CONTEXT_REPAIR_PROMPT,
 )
 from opensquilla.provider import (
     ChatConfig,
@@ -112,7 +111,7 @@ def _tool_use_ids(messages: list[Message]) -> list[str]:
 
 
 @pytest.mark.parametrize("legacy_feedback", [False, True])
-def test_feedback_keeps_pair_and_appends_repair_prompt(legacy_feedback: bool) -> None:
+def test_feedback_keeps_pair_without_an_extra_instruction(legacy_feedback: bool) -> None:
     agent = Agent(
         provider=CapturingProvider(),
         config=AgentConfig(provider_context_block_feedback=legacy_feedback),
@@ -129,14 +128,15 @@ def test_feedback_keeps_pair_and_appends_repair_prompt(legacy_feedback: bool) ->
     assert isinstance(blocked_result, ContentBlockToolResult)
     assert blocked_result.content == REJECTION_TEXT
     assert blocked_result.is_error is True
+    assert len(projected) == 3
     assert projected[-1].role == "user"
-    assert projected[-1].content == _PROVIDER_CONTEXT_REPAIR_PROMPT
+    assert projected[-1].content == [blocked_result]
     assert (
         agent.config.metadata["tool_argument_projection_replay_feedback"] == 1
     )
 
 
-def test_feedback_skips_repair_prompt_when_model_recovered() -> None:
+def test_feedback_preserves_later_results_when_model_recovered() -> None:
     agent = Agent(
         provider=CapturingProvider(),
         config=AgentConfig(provider_context_block_feedback=True),

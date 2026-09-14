@@ -156,7 +156,6 @@ from opensquilla.subprocess_encoding import apply_utf8_child_env
 from opensquilla.tools.builtin.shell_policy import PolicyResult as SafeBinPolicyResult
 from opensquilla.tools.builtin.shell_policy import check_safe_bin
 from opensquilla.tools.output_capture import (
-    OUTPUT_CAPTURE_TIMEOUT_PADDING,
     OUTPUT_READ_BYTES,
     BoundedOutputCapture,
 )
@@ -187,7 +186,7 @@ log = structlog.get_logger(__name__)
 _DEFAULT_EXEC_TIMEOUT = 60.0
 _MAX_EXEC_TIMEOUT = 600.0
 _APPROVAL_RETRY_WAIT_SECONDS = 180.0
-_EXEC_TOOL_TIMEOUT_PADDING = _APPROVAL_RETRY_WAIT_SECONDS + 5.0 + OUTPUT_CAPTURE_TIMEOUT_PADDING
+_EXEC_TOOL_TIMEOUT_PADDING = _APPROVAL_RETRY_WAIT_SECONDS + 5.0
 _DEFAULT_BACKGROUND_TIMEOUT = 1800.0
 _MAX_BACKGROUND_TIMEOUT = 5400.0
 _DEFAULT_PROCESS_WAIT_TIMEOUT = 600.0
@@ -5820,8 +5819,9 @@ def _bg_session_payload(session: _BgSession) -> dict[str, object]:
         "ended_at": session.ended_at,
         "killed": session.killed,
         "timed_out": session.timed_out,
-        "output_capture": session.output_capture.describe(),
     }
+    if output_details := session.output_capture.describe(only_if_needed=True):
+        payload["output_capture"] = output_details
     if session.local_urls:
         payload["local_urls"] = list(session.local_urls)
     code_task = _code_task_status_payload(session)
@@ -6293,7 +6293,9 @@ async def _run_windows_host_shell_command_with_stdin(
             if not completed:
                 return (
                     _exec_timeout_output(effective_timeout, command, capture.preview())
-                    + capture.notice()
+                    + capture.notice(
+                        retrieval_needed=len(capture.preview()) > _EXEC_TIMEOUT_OUTPUT_TAIL_CHARS,
+                    )
                 )
             return f"exit_code={proc.returncode}\n{capture.preview()}{capture.notice()}"
     except Exception as exc:
@@ -6378,7 +6380,9 @@ async def _run_host_shell_command(
         if not completed:
             return (
                 _exec_timeout_output(effective_timeout, command, capture.preview())
-                + capture.notice()
+                + capture.notice(
+                    retrieval_needed=len(capture.preview()) > _EXEC_TIMEOUT_OUTPUT_TAIL_CHARS,
+                )
             )
         return f"exit_code={proc.returncode}\n{capture.preview()}{capture.notice()}"
     except Exception as exc:
@@ -7621,7 +7625,7 @@ def get_bg_session(session_id: str) -> _BgSession | None:
         },
         "offset": {
             "type": "integer",
-            "description": "For log, character offset within the retained head/tail preview.",
+            "description": "For log, character offset to start reading from.",
         },
         "limit": {
             "type": "integer",
@@ -7699,6 +7703,7 @@ async def process(
         max_chars = max(0, min(requested_limit, 100000))
         end = start + max_chars
         sliced = output[start:end]
+        output_details = session.output_capture.describe(only_if_needed=True)
         return json.dumps(
             {
                 "status": "ok",
@@ -7707,7 +7712,11 @@ async def process(
                 "output": sliced,
                 "offset": start,
                 "limit": max_chars,
-                "truncated": start > 0 or end < len(output),
+                "truncated": bool(
+                    start > 0 or end < len(output)
+                    or output_details.get("preview_omitted_bytes")
+                    or (output_details and not output_details["retained_output_complete"])
+                ),
             }
         )
 

@@ -46,7 +46,7 @@ from opensquilla.engine.cancellation import (
     defer_async_cleanup,
 )
 from opensquilla.engine.elevation_triage import RuleAssessment, local_elevation_assessment
-from opensquilla.engine.fallback import FallbackPolicy, backoff_sleep
+from opensquilla.engine.fallback import FallbackPolicy, backoff_sleep, sleep_before_retry
 from opensquilla.engine.history import (
     limit_turns,
     project_incomplete_tool_history,
@@ -870,12 +870,6 @@ _TOOL_RESULT_HINT_PATH_PATTERN = re.compile(
 )
 
 
-_PROVIDER_CONTEXT_REPAIR_PROMPT = (
-    "A previous tool call contains provider-only compacted "
-    "tool arguments. Regenerate the complete tool arguments from the available "
-    "source context. Do not copy compacted placeholders. If no result was recorded, "
-    "verify current state before repeating any action with side effects."
-)
 # Read-only recognition of complete retired directives in existing histories.
 # Prefixes alone can also occur in real user messages and must not hide them.
 _RETIRED_RUNTIME_NUDGE_PATTERNS = (
@@ -2296,12 +2290,6 @@ class _ToolReliabilityState:
     emitted: bool = False
 
 
-# Managed provider recovery needs a stale-recovery bound even when a caller
-# explicitly disables the ordinary turn deadline (``timeout=0``). This bound
-# applies only while waiting for a transient connection to recover.
-MANAGED_CONNECTION_RECOVERY_CAP_SECONDS = 30 * 60
-
-
 class Agent:
     """Explicit state-machine agent.
 
@@ -2332,6 +2320,13 @@ class Agent:
     ) -> None:
         self.provider = provider
         self.config = config or AgentConfig()
+        configure_retry_policy = getattr(provider, "configure_retry_policy", None)
+        if callable(configure_retry_policy):
+            configure_retry_policy(FallbackPolicy(
+                max_retries=self.config.max_provider_retries,
+                base_backoff_ms=self.config.retry_base_backoff_ms,
+                max_backoff_ms=self.config.retry_max_backoff_ms,
+            ))
         self.tool_definitions = tool_definitions or []
         self._tool_definition_by_name = {tool.name: tool for tool in self.tool_definitions}
         self._raw_tool_handler = tool_handler
@@ -3549,7 +3544,7 @@ class Agent:
         )
 
     def _tool_execution_timeout(self, tool_call: ToolCall) -> float | None:
-        """Resolve a declared execution budget, or the generic fallback budget."""
+        """Resolve the tool's declared execution budget, if any."""
         budgets: list[float] = []
 
         def add_budget(value: Any) -> None:
@@ -3560,7 +3555,6 @@ class Agent:
             if math.isfinite(seconds) and seconds > 0:
                 budgets.append(seconds)
 
-        add_budget(self.config.tool_timeout)
         tool_def = self._tool_definition_by_name.get(tool_call.tool_name)
         if tool_def is not None:
             add_budget(tool_def.execution_timeout_seconds)
@@ -3704,7 +3698,6 @@ class Agent:
             model_capabilities=self.config.model_capabilities,
             model_vision_support=self.config.model_vision_support,
             physical_attempt_limit=1,
-            agent_managed_recovery=False,
             provider_request_max_chars=self._provider_request_proof_max_chars(),
             context_window_tokens_global_override=(
                 self.config.context_window_tokens_global_override
@@ -3885,31 +3878,6 @@ class Agent:
                 session_key=self._session_key,
                 reason=reason,
                 error=str(exc),
-            )
-            return False
-
-    def _switch_after_managed_provider_recovery(
-        self,
-        error: ProviderErrorEvent,
-        *,
-        requires_vision: bool,
-        requires_tools: bool,
-    ) -> bool:
-        fallback = getattr(self.provider, "fallback_after_managed_recovery", None)
-        if not callable(fallback):
-            return False
-        try:
-            return bool(
-                fallback(
-                    error,
-                    requires_vision=requires_vision,
-                    requires_tools=requires_tools,
-                )
-            )
-        except Exception as exc:  # noqa: BLE001 - optional provider fallback hook
-            logger.warning(
-                "provider.managed_recovery_fallback_failed",
-                exception_type=type(exc).__name__,
             )
             return False
 
@@ -6311,41 +6279,6 @@ class Agent:
         # Provider adapters own transport inactivity limits.
         _loop = asyncio.get_running_loop()
         _total_deadline = _loop.time() + self.config.timeout if self.config.timeout > 0 else None
-        _managed_recovery_deadline = (
-            _total_deadline
-            if _total_deadline is not None
-            else (
-                _loop.time() + MANAGED_CONNECTION_RECOVERY_CAP_SECONDS
-                if self.config.provider_connection_recovery_enabled
-                else None
-            )
-        )
-
-        async def _wait_before_provider_retry(
-            delay: float,
-            *,
-            deadline: float | None = None,
-        ) -> None:
-            effective_deadline = _total_deadline if deadline is None else deadline
-            retry_at = _loop.time() + delay
-            remaining_delay = delay
-            # Asyncio timers can fire before their deadline on coarse clocks.
-            # Retry-After must expire before another provider attempt starts.
-            while True:
-                sleep_delay = remaining_delay
-                if effective_deadline is not None:
-                    remaining_budget = effective_deadline - _loop.time()
-                    if remaining_budget <= 0:
-                        raise TimeoutError
-                    sleep_delay = min(sleep_delay, remaining_budget)
-                await asyncio.sleep(sleep_delay)
-                now = _loop.time()
-                if effective_deadline is not None and now >= effective_deadline:
-                    raise TimeoutError
-                remaining_delay = retry_at - now
-                if remaining_delay <= 0:
-                    return
-
         configured_capabilities = self.config.model_capabilities
         tools_supported = bool(
             configured_capabilities is None
@@ -6978,7 +6911,6 @@ class Agent:
 
                 _retry_attempt = 0
                 _connection_wait_attempt = 0
-                _managed_recovery_fallback_done = False
                 _call_attempt = 0
                 _retry_policy = _ProviderRetryPolicy.from_provider_budget(
                     _fallback.max_retries,
@@ -7397,11 +7329,7 @@ class Agent:
                             yield terminal_error
                         break
 
-                    call_chat_cfg = chat_cfg.model_copy(update={
-                        "agent_managed_recovery": (
-                            getattr(self.provider, "retry_failed_call_safe", True) is not False
-                        ),
-                    })
+                    call_chat_cfg = chat_cfg
                     if goal_terminal_final_response_pending:
                         call_chat_cfg = call_chat_cfg.model_copy(update={"tool_choice": None})
                     forced_tool_choice = self.config.metadata.get("meta_match_tool_choice")
@@ -10891,14 +10819,7 @@ class Agent:
                             getattr(self.provider, "retry_failed_call_safe", True) is not False
                         )
                         connection_failed = provider_error.code == CONNECTION_FAILED_CODE
-                        managed_failure = (
-                            connection_failed or failure_kind is ProviderFailureKind.RATE_LIMITED
-                        )
-                        if (
-                            connection_failed
-                            and retry_failed_call_safe
-                            and self.config.provider_connection_recovery_enabled
-                        ):
+                        if connection_failed and retry_failed_call_safe:
                             delay = min(60.0, 5.0 * 2 ** min(_connection_wait_attempt, 4))
                             _connection_wait_attempt += 1
                             yield ProviderActivityEvent(
@@ -10910,10 +10831,8 @@ class Agent:
                                 retry_after_ms=math.ceil(delay * 1000),
                                 started_at=time.time_ns() // 1_000_000,
                             )
-                            await _wait_before_provider_retry(
-                                delay,
-                                deadline=_managed_recovery_deadline,
-                            )
+                            async with asyncio.timeout_at(_total_deadline):
+                                await asyncio.sleep(delay)
                             next_provider_activity_reason = "transport_transient"
                             yield ProviderActivityEvent(
                                 activity_id=provider_activity_id,
@@ -10935,7 +10854,9 @@ class Agent:
                         # same-authority leg early, so this typed outcome is
                         # terminal for the current turn.
                         should_retry = (
-                            provider_error.code != "provider_retry_after_deadline"
+                            provider_error.code not in {
+                                "provider_retry_after_deadline", "rate_limit_retry_exhausted"
+                            }
                             and (
                                 _fallback.should_retry(kind, _retry_attempt)
                                 or failure_kind is ProviderFailureKind.RATE_LIMITED
@@ -10951,32 +10872,6 @@ class Agent:
                             )
                             should_retry = False
                         if not should_retry:
-                            if (
-                                managed_failure
-                                and retry_failed_call_safe
-                                and not _managed_recovery_fallback_done
-                            ):
-                                _managed_recovery_fallback_done = True
-                                if _total_deadline is not None and _loop.time() >= _total_deadline:
-                                    raise TimeoutError
-                                if self._switch_after_managed_provider_recovery(
-                                    provider_error,
-                                    requires_vision=self._count_image_blocks(request_messages) > 0,
-                                    requires_tools=bool(provider_tools_for_call),
-                                ):
-                                    next_provider_activity_reason = (
-                                        _provider_activity_reason_for_failure(failure_kind)
-                                    )
-                                    yield ProviderActivityEvent(
-                                        activity_id=provider_activity_id,
-                                        phase="fallback",
-                                        reason=next_provider_activity_reason,
-                                        retry_attempt=_retry_attempt,
-                                        retry_limit=_fallback.max_retries,
-                                        started_at=time.time_ns() // 1_000_000,
-                                    )
-                                    _call_attempt += 1
-                                    continue
                             yield self._transition(AgentState.ERROR)
                             terminal_error = ErrorEvent(
                                 message=_safe_provider_terminal_message(
@@ -11008,26 +10903,10 @@ class Agent:
                             and _loop.time() + resolved_retry_delay >= _total_deadline
                         )
                         if resolved_retry_delay is None or retry_exceeds_deadline:
-                            if _total_deadline is not None and _loop.time() >= _total_deadline:
-                                raise TimeoutError
-                            fallback_selected = False
-                            if managed_failure:
-                                if not _managed_recovery_fallback_done:
-                                    _managed_recovery_fallback_done = True
-                                    fallback_selected = (
-                                        self._switch_after_managed_provider_recovery(
-                                            provider_error,
-                                            requires_vision=(
-                                                self._count_image_blocks(request_messages) > 0
-                                            ),
-                                            requires_tools=bool(provider_tools_for_call),
-                                        )
-                                    )
-                            else:
-                                fallback_selected = self._switch_to_invalid_response_fallback(
-                                    failure_kind.value,
-                                    requires_tools=bool(provider_tools_for_call),
-                                )
+                            fallback_selected = self._switch_to_invalid_response_fallback(
+                                failure_kind.value,
+                                requires_tools=bool(provider_tools_for_call),
+                            )
                             if fallback_selected:
                                 next_provider_activity_reason = reason
                                 yield ProviderActivityEvent(
@@ -11070,7 +10949,8 @@ class Agent:
                             retry_after_ms=math.ceil(resolved_retry_delay * 1000),
                             started_at=time.time_ns() // 1_000_000,
                         )
-                        await _wait_before_provider_retry(resolved_retry_delay)
+                        async with asyncio.timeout_at(_total_deadline):
+                            await sleep_before_retry(resolved_retry_delay)
                         _retry_attempt += 1
                         next_provider_activity_reason = reason
                         yield ProviderActivityEvent(
@@ -12330,11 +12210,6 @@ class Agent:
             yield self._transition(AgentState.ERROR)
             if self.config.timeout > 0:
                 timeout_message = f"Agent turn timed out after {self.config.timeout}s"
-            elif self.config.provider_connection_recovery_enabled:
-                timeout_message = (
-                    "Agent provider recovery timed out after "
-                    f"{MANAGED_CONNECTION_RECOVERY_CAP_SECONDS}s"
-                )
             else:
                 timeout_message = "Agent turn timed out"
             terminal_error = ErrorEvent(
@@ -15378,13 +15253,10 @@ class Agent:
         the provider view (which leaves the model with no rejection signal and
         produces byte-identical retry loops), keep the pair: the tool_use input
         becomes the standard compacted-arguments placeholder and the error
-        tool_result carrying the rejection text stays visible. When the
-        rejection is the most recent event, the repair prompt is appended so
-        the model is explicitly told how to recover.
+        tool_result carrying the rejection and recovery guidance stays visible.
         """
         projected_messages: list[Message] = []
         projected_blocks = 0
-        last_blocked_result_index: int | None = None
         recorded_result_ids = {
             block.tool_use_id
             for message in messages if isinstance(message.content, list)
@@ -15396,7 +15268,6 @@ class Agent:
                 continue
             next_content: list[Any] = []
             changed = False
-            has_blocked_result = False
             for block in message.content:
                 if isinstance(block, ContentBlockToolUse) and block.id in blocked_tool_ids:
                     projected_blocks += 1
@@ -15412,11 +15283,6 @@ class Agent:
                         )
                     )
                     continue
-                if (
-                    isinstance(block, ContentBlockToolResult)
-                    and block.tool_use_id in blocked_tool_ids
-                ):
-                    has_blocked_result = True
                 next_content.append(block)
             if changed:
                 projected_message = message.model_copy(update={"content": next_content})
@@ -15429,20 +15295,10 @@ class Agent:
                     # Preserve facts even with trailing runtime/user context,
                     # rather than letting pairing repair discard the call.
                     projected_messages.extend(project_incomplete_tool_history([projected_message]))
-                    has_blocked_result = True
                 else:
                     projected_messages.append(projected_message)
             else:
                 projected_messages.append(message)
-            if has_blocked_result:
-                last_blocked_result_index = len(projected_messages) - 1
-
-        repair_prompt_appended = (
-            last_blocked_result_index is not None
-            and last_blocked_result_index == len(projected_messages) - 1
-        )
-        if repair_prompt_appended:
-            projected_messages.append(Message(role="user", content=_PROVIDER_CONTEXT_REPAIR_PROMPT))
 
         if record:
             self.config.metadata["tool_argument_projection_replay_feedback"] = (
@@ -15453,7 +15309,6 @@ class Agent:
                 "tool_argument_projection_replay_feedback",
                 tool_use_ids=sorted(blocked_tool_ids),
                 projected_blocks=projected_blocks,
-                repair_prompt_appended=repair_prompt_appended,
             )
         return projected_messages
 

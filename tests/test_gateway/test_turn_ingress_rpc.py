@@ -3562,9 +3562,9 @@ async def test_sessions_send_recovers_tool_and_provider_failures_before_one_comm
             return result
         return await original_sleep(delay, result)
 
-    # Advance the agent's retry clock with its simulated wait without moving
+    # Advance the retry clock with its simulated wait without moving
     # the real event loop's SQLite scheduling or test watchdog deadlines.
-    monkeypatch.setattr("opensquilla.engine.agent.asyncio", SimpleNamespace(**{
+    monkeypatch.setattr("opensquilla.engine.fallback.asyncio", SimpleNamespace(**{
         **vars(asyncio),
         "sleep": controlled_sleep,
         "get_running_loop": lambda: SimpleNamespace(time=lambda: retry_clock[0]),

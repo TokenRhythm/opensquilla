@@ -62,11 +62,6 @@ def test_billing_quota_takes_precedence_over_http_rate_limit(message) -> None:
     ) is ProviderFailureKind.INSUFFICIENT_CREDITS
 
 
-def test_agent_recovery_ownership_is_request_local() -> None:
-    config = ChatConfig(agent_managed_recovery=True)
-    assert ChatConfig().agent_managed_recovery is False
-    assert "agent_managed_recovery" not in config.model_dump()
-    assert "agent_managed_recovery" not in repr(config)
 
 
 @pytest.mark.parametrize(
@@ -108,7 +103,7 @@ async def test_adapters_preserve_connection_type_with_one_physical_attempt(
         event
         async for event in provider.chat(
             [Message(role="user", content="hi")],
-            config=ChatConfig(agent_managed_recovery=True),
+            config=ChatConfig(physical_attempt_limit=1),
         )
     ]
     errors = [event for event in events if isinstance(event, ErrorEvent)]
