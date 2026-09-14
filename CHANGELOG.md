@@ -63,6 +63,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Fixed
 
+- Default Gateway, CLI, decision, trace and safety logs no longer retain
+  prompt/conversation previews, tool output or exception payloads. Gateway
+  operational logs keep their level prefix and use JSON metadata with event
+  identifiers, counts, status codes and exception types; decision logs no longer
+  store prompt-derived intent text.
+  Support bundles re-filter current and rotated legacy logs, omitting legacy
+  free text that cannot be safely parsed. Existing local logs are not deleted
+  and may still contain pre-upgrade private content: review them before sharing
+  outside the bundle flow. Explicit raw turn-call capture remains opt-in (#1208).
+
 - Skill and Meta catalog reads remain compatible when the Web UI and Gateway
   are upgraded separately. Meta details fall back on older gateways; new
   gateways preserve public Meta list and detail responses for older clients.

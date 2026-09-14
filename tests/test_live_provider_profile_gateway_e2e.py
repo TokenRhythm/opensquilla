@@ -1636,9 +1636,17 @@ def test_attachment_capacity_requires_independent_request_and_response_models(
     assert evidence["ok"] is False
 
 
-def test_attachment_capacity_proof_parser_keeps_only_scalar_evidence(tmp_path: Path) -> None:
+@pytest.mark.parametrize("structured", [False, True])
+def test_attachment_capacity_proof_parser_keeps_only_scalar_evidence(
+    tmp_path: Path, structured: bool,
+) -> None:
     log_path = tmp_path / "debug.log"
     log_path.write_text(
+        '2026-01-01T00:00:00Z [DEBUG] opensquilla.provider: '
+        '{"estimated_tokens": 37720, "effective_proof_token_budget": 87704, '
+        '"media_blocks_reserved": 3, "fits": true, '
+        '"event": "provider.request_proof", "top_contributors": ["must-not-survive"]}\n'
+        if structured else
         "provider.request_proof estimated_tokens=37720 "
         "effective_proof_token_budget=87704 media_blocks_reserved=3 fits=True "
         "top_contributors=['must-not-survive']\n",
@@ -1656,8 +1664,9 @@ def test_attachment_capacity_proof_parser_keeps_only_scalar_evidence(tmp_path: P
     assert "must-not-survive" not in json.dumps(proof)
 
 
+@pytest.mark.parametrize("structured", [False, True])
 def test_attachment_capacity_http_error_parser_keeps_only_unique_status_scalars(
-    tmp_path: Path,
+    tmp_path: Path, structured: bool,
 ) -> None:
     stdout = tmp_path / "gateway.stdout.log"
     debug = tmp_path / "debug.log"
@@ -1669,6 +1678,9 @@ def test_attachment_capacity_http_error_parser_keeps_only_unique_status_scalars(
         encoding="utf-8",
     )
     debug.write_text(
+        '{"status_code": 429, "event": "provider.chat_http_error"}\n'
+        '{"status_code": 503, "event": "provider.chat_http_error"}\n'
+        if structured else
         "provider.chat_http_error provider='tokenrhythm' model='kimi-k2.6' "
         "status_code=429 response_body_chars=88\n"
         "provider.chat_http_error provider='tokenrhythm' model='kimi-k2.6' "

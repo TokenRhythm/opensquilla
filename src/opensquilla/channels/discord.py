@@ -748,7 +748,7 @@ class DiscordChannel:
 
     async def receive(self) -> IncomingMessage:
         msg = await self._queue.get()
-        log.debug("discord.receive", content=msg.content[:80])
+        log.debug("discord.receive", content_chars=len(msg.content))
         return msg
 
     async def resolve_inbound_attachment(self, attachment: Attachment) -> Attachment:
