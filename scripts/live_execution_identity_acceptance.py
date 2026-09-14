@@ -383,7 +383,6 @@ async def run(args) -> dict:
 
 
 def main() -> int:
-    structlog.configure(wrapper_class=structlog.make_filtering_bound_logger(logging.ERROR))
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--enable-live", action="store_true")
     parser.add_argument("--relay-ready", type=Path)
@@ -404,4 +403,7 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    # The output filter belongs only to this standalone probe process. Imported
+    # callers (including offline tests) must retain their own logging policy.
+    structlog.configure(wrapper_class=structlog.make_filtering_bound_logger(logging.ERROR))
     sys.exit(main())

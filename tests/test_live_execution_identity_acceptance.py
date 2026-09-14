@@ -1,6 +1,7 @@
 from types import SimpleNamespace
 
 import pytest
+import structlog
 
 from opensquilla.provider.types import DoneEvent, TextDeltaEvent
 from scripts import live_execution_identity_acceptance as live
@@ -63,5 +64,16 @@ async def test_live_process_rejects_real_key_before_file_or_network_access(monke
 
 def test_live_driver_is_disabled_by_default(monkeypatch, capsys):
     monkeypatch.setattr(live.sys, "argv", ["identity-probe"])
-    assert live.main() == 0
-    assert capsys.readouterr().out == '{"enabled":false}\n'
+    was_configured = structlog.is_configured()
+    previous_config = structlog.get_config()
+    try:
+        assert live.main() == 0
+        assert capsys.readouterr().out == '{"enabled":false}\n'
+        assert structlog.get_config() == previous_config
+        assert structlog.is_configured() is was_configured
+    finally:
+        # Preserve the host test process even if the regression assertion fails.
+        if was_configured:
+            structlog.configure(**previous_config)
+        else:
+            structlog.reset_defaults()
