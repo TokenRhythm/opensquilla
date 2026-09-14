@@ -1548,6 +1548,13 @@ async def _handle_sandbox_workspace_set(params: dict | None, ctx: RpcContext) ->
         session=session,
     )
     current_workspace = base_context.workspace
+    if getattr(session, "execution_workspace", None) is not None:
+        if workspace_path != current_workspace:
+            raise RpcHandlerError(
+                "EXECUTION_WORKSPACE_FIXED",
+                "A task-bound session cannot change its execution workspace.",
+            )
+        return _payload(base_context)
     context = await set_workspace(
         manager,
         session_key,

@@ -1,6 +1,23 @@
 <template>
   <div>
-    <div ref="rootEl" class="msg-ai-text" v-html="part.html" />
+    <ResourceActionsMenu ref="fileMenu" :session-key="sessionKey" @open="emit('openResource', $event)" />
+    <div v-if="part.html" ref="rootEl" class="msg-ai-text" v-html="part.html" />
+    <p v-if="unmentionedPreviews.length" class="workspace-preview-fallback">
+      <span>{{ t('workbench.artifactDocument.preview') }}: </span>
+      <template v-for="(preview, index) in unmentionedPreviews" :key="workspacePreviewIdentity(preview)">
+        <span v-if="index" aria-hidden="true"> · </span>
+        <button
+          type="button"
+          role="link"
+          class="workspace-file-link"
+          :title="previewLabel(preview)"
+          :aria-label="previewLabel(preview)"
+          @click.stop="emit('workspacePreview', preview)"
+          @contextmenu="showFileMenu($event, preview)"
+          @keydown="showFileMenu($event, preview)"
+        >{{ workspacePreviewLabel(preview, workspacePreviews) }}</button>
+      </template>
+    </p>
     <p v-if="missingCitationLabel" class="msg-ai-citation-warning">
       Some citations do not map to available sources: {{ missingCitationLabel }}
     </p>
@@ -9,9 +26,18 @@
 
 <script setup lang="ts">
 import { computed, onMounted, ref, watch } from 'vue'
+import ResourceActionsMenu from '@/components/ResourceActionsMenu.vue'
+import type { ArtifactPayload } from '@/types/artifacts'
 import { useI18n } from 'vue-i18n'
 import type { ChatPart, SourcePart } from '@/types/parts'
 import { decorateCitations } from '@/utils/chat/citations'
+import {
+  decorateWorkspacePreviewLinks,
+  workspacePreviewLabel,
+  workspacePreviewIdentity,
+  workspacePreviewOpenAction,
+  type WorkspacePreviewLink,
+} from '@/utils/chat/workspacePreviews'
 import { copyTextWithFallback } from '@/utils/browser'
 import { usePlatform } from '@/platform'
 import { requestBrowserWorkbenchOpen } from '@/workbench/browserItems'
@@ -20,16 +46,35 @@ const props = withDefaults(
   defineProps<{
     part: Extract<ChatPart, { type: 'text' }>
     sources?: SourcePart[]
+    workspacePreviews?: WorkspacePreviewLink[]
+    sessionKey?: string
   }>(),
-  { sources: () => [] },
+  { sources: () => [], workspacePreviews: () => [] },
 )
 
-const emit = defineEmits<{ citation: [sourceId: number] }>()
+const emit = defineEmits<{
+  citation: [sourceId: number]
+  workspacePreview: [preview: WorkspacePreviewLink]
+  openResource: [artifact: ArtifactPayload]
+}>()
 
 const { t } = useI18n()
 const platform = usePlatform()
+const fileMenu = ref<InstanceType<typeof ResourceActionsMenu> | null>(null)
+function showFileMenu(event: MouseEvent | KeyboardEvent, preview: WorkspacePreviewLink) {
+  void fileMenu.value?.show(event, workspacePreviewOpenAction(preview, props.sessionKey))
+}
 const rootEl = ref<HTMLDivElement | null>(null)
 const missingCitationIds = ref<number[]>([])
+const mentionedPreviewIds = ref<string[]>([])
+const unmentionedPreviews = computed(() => props.workspacePreviews.filter(
+  preview => !preview.previewPagePath
+    && !mentionedPreviewIds.value.includes(workspacePreviewIdentity(preview)),
+))
+
+function previewLabel(preview: WorkspacePreviewLink): string {
+  return t('chat.openTitle', { title: workspacePreviewLabel(preview, props.workspacePreviews) })
+}
 
 const missingCitationLabel = computed(() =>
   missingCitationIds.value.map(id => `[${id}]`).join(', '),
@@ -166,7 +211,13 @@ function decorateBrowserLinks() {
 // HTML sink and re-runs idempotently when the body re-renders during streaming.
 function decorate() {
   const root = rootEl.value
-  if (!root) return
+  if (!root) {
+    mentionedPreviewIds.value = []
+    return
+  }
+  mentionedPreviewIds.value = decorateWorkspacePreviewLinks(
+    root, props.workspacePreviews, preview => emit('workspacePreview', preview), previewLabel, showFileMenu,
+  )
   missingCitationIds.value = []
   decorateCitations(root, props.sources, {
     onActivate: n => emit('citation', n),
@@ -182,6 +233,7 @@ function decorate() {
 onMounted(decorate)
 watch(() => props.part.html, decorate, { flush: 'post' })
 watch(() => props.sources, decorate, { flush: 'post' })
+watch(() => props.workspacePreviews, decorate, { flush: 'post' })
 </script>
 
 <style scoped>
@@ -191,6 +243,42 @@ watch(() => props.sources, decorate, { flush: 'post' })
   color: var(--text);
   word-break: break-word;
   margin-bottom: 0.5rem;
+}
+
+.workspace-preview-fallback {
+  margin: 0.375rem 0 0.5rem;
+  font-size: 0.875rem;
+  line-height: 1.6;
+  color: var(--text-muted);
+  overflow-wrap: anywhere;
+}
+
+.workspace-file-link,
+.msg-ai-text :deep(.workspace-file-link) {
+  display: inline;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  font: inherit;
+  color: var(--accent);
+  text-align: left;
+  text-decoration: underline;
+  text-underline-offset: 0.18em;
+  cursor: pointer;
+  overflow-wrap: anywhere;
+}
+
+.workspace-file-link:focus-visible,
+.msg-ai-text :deep(.workspace-file-link:focus-visible) {
+  outline: 2px solid var(--accent);
+  outline-offset: 3px;
+  border-radius: var(--radius-sm);
+}
+
+.msg-ai-text :deep(.workspace-file-link code) {
+  padding: 0;
+  background: transparent;
+  color: inherit;
 }
 
 .msg-ai-text :deep(p) { margin: 0.375rem 0; }

@@ -26,6 +26,29 @@ const server = http.createServer(async (request, response) => {
   })
 
   response.setHeader('content-type', 'application/json')
+  if (['/api/v1/artifacts/art-subpage/preview-leases',
+    '/api/v1/artifacts/art-ignores-page/preview-leases'].includes(request.url)) {
+    const { pagePath } = JSON.parse(body)
+    assert.equal(pagePath, 'pages/editorial.html')
+    const selected = request.url.includes('art-subpage')
+    response.statusCode = 201
+    response.end(JSON.stringify({
+      version: 1,
+      lease_id: leaseId,
+      effective_mode: 'full',
+      launch_url: `${previewOrigin}/${selected ? pagePath : 'index.html'}`,
+      entrypoint: 'index.html',
+      ...(selected ? { page_path: pagePath } : {}),
+      expires_at: expiresAt,
+      preview_origin: previewOrigin,
+      idle_timeout_seconds: 28_800,
+      source: {
+        kind: 'bundle', collection_status: 'complete',
+        file_count: 2, total_bytes: 42, warning_codes: [],
+      },
+    }))
+    return
+  }
   if (request.url === '/api/v1/artifacts/art-denied/preview-leases') {
     response.statusCode = 429
     response.end(JSON.stringify({
@@ -155,6 +178,12 @@ try {
     leaseId: '../lease',
     scopeId,
   }))
+  for (const pagePath of ['', '../secret.html', '/index.html', 'a/../index.html',
+    'a\\index.html', 'index.html?x=1', '%2e%2e/secret.html', 'style.css', null]) {
+    assert.throws(() => parseArtifactPreviewLeaseCreateRequest({
+      version: 1, artifactId: 'art-subpage', scopeId, mode: 'full', pagePath,
+    }))
+  }
 
   const created = await broker.create({
     version: 1,
@@ -230,6 +259,27 @@ try {
   assert.equal(revoked.status, 204)
   assert.equal(broker.authorizesSurface(exactGrant), false)
   assert.equal(broker.resolveSurfaceArtifactId(exactGrant), null)
+
+  const selectedPage = await broker.create({
+    version: 1, artifactId: 'art-subpage', scopeId, mode: 'full',
+    pagePath: 'pages/editorial.html',
+  })
+  assert.equal(selectedPage.ok, true)
+  assert.equal(selectedPage.ok && selectedPage.payload.entrypoint, 'index.html')
+  assert.equal(selectedPage.ok && selectedPage.payload.page_path, 'pages/editorial.html')
+  const pageGrant = { ...exactGrant, launchUrl: `${previewOrigin}/pages/editorial.html` }
+  assert.equal(broker.authorizesSurface(pageGrant), true)
+  assert.equal(broker.authorizesSurface(exactGrant), false)
+  await broker.revoke({ version: 1, leaseId, scopeId })
+
+  const ignoredPage = await broker.create({
+    version: 1, artifactId: 'art-ignores-page', scopeId, mode: 'full',
+    pagePath: 'pages/editorial.html',
+  })
+  assert.equal(ignoredPage.ok, false)
+  assert.equal(ignoredPage.code, 'PREVIEW_PAGE_UNSUPPORTED')
+  assert.equal(requests.at(-1).method, 'DELETE')
+  assert.equal(broker.authorizesSurface(pageGrant), false)
 
   const denied = await broker.create({
     version: 1,

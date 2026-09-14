@@ -3379,6 +3379,7 @@ async def _accept_channel_runtime_turn_impl(
     raw_content: str,
     config: Any,
     busy_input_mode: str = "followup",
+    workspace_preparations: contextlib.AsyncExitStack,
 ) -> tuple[Any | None, str, _RuntimeChannelStreamRelay | None, bool]:
     """Atomically accept a channel message, task, and idempotency receipt."""
 
@@ -3449,6 +3450,11 @@ async def _accept_channel_runtime_turn_impl(
         agent_id=route_envelope.agent_id,
         **delivery_fields,
     )
+    workspace_preparation = getattr(intent_plan, "workspace_preparation", None)
+    from opensquilla.application.admission_views import AdmissionPreparation
+
+    if isinstance(workspace_preparation, AdmissionPreparation):
+        workspace_preparations.push_async_callback(workspace_preparation.close)
     route_envelope = _route_with_session_owner(route_envelope, intent_plan.node)
     from opensquilla.session.goals import ClaimGoalMutation, GoalClaimCandidate
 
@@ -3534,6 +3540,8 @@ async def _accept_channel_runtime_turn_impl(
             )
             if not isinstance(result, TurnAcceptanceResult):
                 raise TypeError("Channel commit did not return durable turn acceptance")
+            if isinstance(workspace_preparation, AdmissionPreparation):
+                workspace_preparation.mark_committed(result.receipt.session_id)
             return result
 
         def _before_activate(acceptance: TurnAcceptanceResult) -> None:
@@ -3640,7 +3648,10 @@ async def _accept_channel_runtime_turn(
 ) -> tuple[Any | None, str, _RuntimeChannelStreamRelay | None, bool]:
     """Fence user intent before channel session/workspace preparation."""
 
-    async with task_runtime.explicit_ingress_intent(route_envelope.session_key):
+    async with (
+        task_runtime.explicit_ingress_intent(route_envelope.session_key),
+        contextlib.AsyncExitStack() as workspace_preparations,
+    ):
         if ingested is None:
             assert principal_is_owner is not None
             await _apply_saved_channel_run_context(
@@ -3656,6 +3667,7 @@ async def _accept_channel_runtime_turn(
                 config=config,
             )
         return await _accept_channel_runtime_turn_impl(
+            workspace_preparations=workspace_preparations,
             channel=channel,
             msg=msg,
             session_manager=session_manager,

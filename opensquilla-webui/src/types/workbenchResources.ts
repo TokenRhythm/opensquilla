@@ -85,6 +85,8 @@ export interface WorkbenchResource {
   createdAt?: number | string | null
   updatedAt?: number | string | null
   downloadUrl?: string
+  /** HTML members of the current registered bundle; opening revalidates access. */
+  previewPages?: string[]
   capabilities: WorkbenchResourceCapabilities
   relations: WorkbenchResourceRelations
 }

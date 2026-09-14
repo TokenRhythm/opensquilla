@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import html
 import json
+from pathlib import PurePosixPath
 from typing import Any, cast
 
 
@@ -13,6 +14,7 @@ def normalize_page_context(value: object) -> dict[str, Any] | None:
     if not isinstance(value, dict) or not set(value) <= {
         "targetRef",
         "resourceId",
+        "pagePath",
         "annotations",
     }:
         raise ValueError("pageContext accepts page references and annotations only")
@@ -23,6 +25,19 @@ def normalize_page_context(value: object) -> dict[str, Any] | None:
             if not isinstance(item, str) or not item.strip() or len(item.encode()) > 512:
                 raise ValueError(f"Invalid pageContext.{key}")
             result[key] = item.strip()
+    page_path = value.get("pagePath")
+    if page_path is not None:
+        if (
+            not isinstance(page_path, str)
+            or not page_path.strip()
+            or len(page_path.encode()) > 4096
+            or PurePosixPath(page_path).is_absolute()
+            or ".." in PurePosixPath(page_path).parts
+            or any(character in page_path for character in ("\\", ":", "\x00"))
+            or not result.get("resourceId")
+        ):
+            raise ValueError("Invalid pageContext.pagePath")
+        result["pagePath"] = page_path
     annotations = value.get("annotations", [])
     if not isinstance(annotations, list) or len(annotations) > 16:
         raise ValueError("pageContext supports at most 16 annotations")
@@ -85,7 +100,7 @@ async def resolve_page_context(
         WorkbenchResourceRef,
     )
     from opensquilla.artifact_session import ArtifactSessionService
-    from opensquilla.artifact_session.working_files import ensure_working_files
+    from opensquilla.artifact_session.working_files import checked_path, ensure_working_files
     from opensquilla.artifacts import ArtifactStore
     from opensquilla.gateway.session_services import get_session_storage
     from opensquilla.gateway.workbench_resource_runtime import _WorkbenchResourceRuntimePort
@@ -112,7 +127,18 @@ async def resolve_page_context(
             workspace=workspace,
         )
         result["resourceId"] = f"document:{binding.document_id}"
-        result["workingFile"] = str(binding.entry)
+        working_file = binding.entry
+        if page_path := value.get("pagePath"):
+            candidate = checked_path(binding.root, page_path)
+            # A page hint selects an existing HTML member, never another source root.
+            # bundle() also revalidates and safely reads the current source files.
+            member = next((item for item in binding.bundle().files if item.path == page_path), None)
+            if member is None or member.mime.split(";", 1)[0].strip().lower() not in {
+                "text/html", "application/xhtml+xml",
+            }:
+                raise ValueError("Page context must reference an HTML page in the document")
+            working_file = binding.entry if page_path == binding.entrypoint else candidate
+        result["workingFile"] = str(working_file)
         result["workingDirectory"] = str(binding.root)
         result["versionId"] = binding.base_revision_id
         return result

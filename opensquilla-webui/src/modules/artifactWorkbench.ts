@@ -158,7 +158,26 @@ export interface AttachmentUploadReceipt {
 }
 
 /** Authenticated artifact and attachment bytes without endpoint or header leakage. */
+export interface WorkingFileRequest {
+  sessionKey: string
+  documentId: string
+  pagePath?: string
+  signal?: AbortSignal
+}
+
+export interface WorkingFileMetadata {
+  documentId: string
+  pagePath: string
+  sourcePath: string
+  workspace: string
+  name: string
+  mime: string
+  size: number
+}
+
 export interface ArtifactContentAccess {
+  workingFileMetadata?(request: WorkingFileRequest): Promise<WorkingFileMetadata | null>
+  fetchWorkingFile?(request: WorkingFileRequest): Promise<Blob>
   fetchArtifact(
     artifact: ArtifactPayload,
     request?: ArtifactAccessRequest,
@@ -288,6 +307,7 @@ export interface ArtifactPreviewLease {
   effective_mode: ArtifactPreviewMode
   launch_url: string
   entrypoint: string
+  page_path?: string
   expires_at: string
   preview_origin: string | null
   idle_timeout_seconds: number
@@ -311,6 +331,7 @@ export type ArtifactPreviewNativeBroker = Pick<
 export interface ArtifactPreviewLeaseRequest {
   nativeBroker?: ArtifactPreviewNativeBroker
   sessionKey?: string
+  pagePath?: string
 }
 
 export class ArtifactPreviewLeaseError extends Error {

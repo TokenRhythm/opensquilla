@@ -5,6 +5,7 @@ import type {
   WorkbenchResourceRelations,
   WorkbenchResourceType,
 } from '@/types/workbenchResources'
+import { isPreviewPagePath } from '@/utils/workbench/previewPagePath'
 
 export type { WorkbenchResourceProvider } from '@/modules/artifactWorkbench'
 
@@ -156,6 +157,9 @@ export function normalizeWorkbenchResource(value: unknown): WorkbenchResource | 
     createdAt: valueAt(raw, 'createdAt', 'created_at') as number | string | null | undefined,
     updatedAt: valueAt(raw, 'updatedAt', 'updated_at') as number | string | null | undefined,
     downloadUrl: stringAt(raw, 'downloadUrl', 'download_url') || undefined,
+    ...(resource.type === 'document' && Array.isArray(raw.previewPages)
+      ? { previewPages: [...new Set(raw.previewPages.filter(isPreviewPagePath))] }
+      : {}),
     capabilities: normalizeCapabilities(valueAt(raw, 'capabilities')),
     relations: normalizeRelations(valueAt(raw, 'relations')),
   }

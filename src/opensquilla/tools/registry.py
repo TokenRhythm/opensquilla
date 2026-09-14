@@ -48,6 +48,7 @@ DEFAULT_MODEL_TOOL_NAMES: frozenset[str] = frozenset(
         "image",
         "image_generate",
         "list_dir",
+        "open_workspace_preview",
         "pdf",
         "publish_artifact",
         "read_file",

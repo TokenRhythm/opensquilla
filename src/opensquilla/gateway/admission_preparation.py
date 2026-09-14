@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, replace
@@ -33,6 +34,7 @@ from opensquilla.sandbox.run_context import (
     RUN_CONTEXT_ORIGIN_KEY,
     RunContext,
     resolve_default_run_mode,
+    run_context_from_origin_payload,
 )
 from opensquilla.sandbox.run_mode_policy import (
     coerce_run_mode_for_principal,
@@ -41,7 +43,7 @@ from opensquilla.sandbox.run_mode_policy import (
 from opensquilla.sandbox.setup_runtime import current_sandbox_capability_report
 from opensquilla.session.manager import PreparedSessionIntent
 from opensquilla.session.models import SessionNode
-from opensquilla.session.storage import SessionStorage
+from opensquilla.session.storage import SessionStorage, _verify_project_workspace_guard
 
 if TYPE_CHECKING:
     from opensquilla.session.manager import SessionManager
@@ -275,16 +277,58 @@ async def prepare_route(
             )
 
             artifact_session_service = await ArtifactSessionService.from_session_storage(storage)
-            route_envelope.runtime_services["generated_artifact_adopter"] = (
-                GeneratedArtifactAdopter(
-                    service=artifact_session_service,
-                    store=ArtifactStore(media_root),
-                    session_key=key,
-                    session_id=session_id,
-                    event_emitter=event_emitter_factory(key),
-                    workspace=workspace_dir,
-                    preview_service=preview_service,
+
+            # Compare the admitted authority again inside the registration
+            # transaction; a reset or revoked project must not create a resource.
+            expected_binding = session.execution_workspace
+
+            async def validate_artifact_session(conn: Any) -> None:
+                async with conn.execute(
+                    "SELECT session_id, epoch, execution_workspace, origin FROM sessions "
+                    "WHERE session_key=?", (key,),
+                ) as cursor:
+                    row = await cursor.fetchone()
+                if (
+                    row is None or row["session_id"] != session_id
+                    or row["epoch"] != session_epoch
+                ):
+                    raise ValueError("workspace preview session generation changed")
+                binding = (
+                    json.loads(row["execution_workspace"]) if row["execution_workspace"] else None
                 )
+                if binding != expected_binding:
+                    raise ValueError("workspace preview workspace binding changed")
+                await _verify_project_workspace_guard(
+                    conn, session_node=session, entry_session_key=key,
+                    workspace_guard=workspace_guard,
+                )
+                if binding is not None and session.workspace_id is None:
+                    from opensquilla.execution_workspaces import validate_execution_workspace
+
+                    if validate_execution_workspace(binding)["root"] != workspace_dir:
+                        raise ValueError("workspace preview workspace binding changed")
+                elif session.workspace_id is None:
+                    origin = json.loads(row["origin"]) if row["origin"] else {}
+                    saved = run_context_from_origin_payload(origin.get(RUN_CONTEXT_ORIGIN_KEY))
+                    if saved is not None and saved.workspace not in {None, workspace_dir}:
+                        raise ValueError("workspace preview workspace binding changed")
+
+            adopter = GeneratedArtifactAdopter(
+                service=artifact_session_service,
+                store=ArtifactStore(media_root),
+                session_key=key,
+                session_id=session_id,
+                event_emitter=event_emitter_factory(key),
+                workspace=workspace_dir,
+                preview_service=preview_service,
+                validate_session=validate_artifact_session,
+            )
+            route_envelope.runtime_services["generated_artifact_adopter"] = adopter
+            route_envelope.runtime_services["workspace_preview_opener"] = (
+                adopter.open_workspace_preview
+            )
+            route_envelope.runtime_services["workspace_preview_scopes"] = (
+                await adopter.working_source_scopes()
             )
         except Exception as exc:  # noqa: BLE001 - adoption is a recoverable enhancement
             log.warning(

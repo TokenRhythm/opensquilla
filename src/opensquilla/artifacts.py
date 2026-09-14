@@ -14,7 +14,7 @@ import secrets
 import shutil
 import stat
 import unicodedata
-from collections.abc import Iterator, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime
 from html.parser import HTMLParser
@@ -1022,6 +1022,7 @@ def collect_artifact_bundle(
     entry_mime: str | None = None,
     max_bytes: int = DEFAULT_ARTIFACT_BUNDLE_MAX_BYTES,
     max_files: int = DEFAULT_ARTIFACT_BUNDLE_MAX_FILES,
+    read_guard: Callable[[Path], None] | None = None,
 ) -> ArtifactBundle | None:
     """Collect a safe, deterministic static webpage snapshot without executing code.
 
@@ -1104,6 +1105,8 @@ def collect_artifact_bundle(
                 raise ArtifactPathError("artifact bundle contains a path collision")
             return
         _ensure_no_bundle_link_components(root, source)
+        if read_guard is not None:
+            read_guard(source)
         data = _read_regular_bundle_file(source)
         if normalized == entrypoint and len(data) > DEFAULT_ARTIFACT_MAX_BYTES:
             raise ArtifactBudgetError(
@@ -1136,6 +1139,8 @@ def collect_artifact_bundle(
         stack = [root]
         while stack:
             directory = stack.pop()
+            if read_guard is not None:
+                read_guard(directory)
             try:
                 with os.scandir(native_io_path(directory)) as iterator:
                     entries = sorted(iterator, key=lambda item: item.name)

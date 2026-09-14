@@ -263,8 +263,14 @@ async def run_standalone_chat(
     if session_manager is None:
         raise RuntimeError("standalone chat requires session manager")
     session_key = session_id or f"agent:main:standalone:{uuid4().hex[:8]}"
-    await session_manager.get_or_create(session_key, agent_id="main")
     active_workspace = workspace or getattr(svc.config, "workspace_dir", None)
+    # This private standalone service also creates /new sessions. Give its
+    # allocator the trusted CLI root before the first session is created.
+    if active_workspace and svc.config is not None:
+        svc.config.workspace_dir = active_workspace
+        if hasattr(svc.config, "_workspace_dir_explicit"):
+            svc.config._workspace_dir_explicit = True
+    await session_manager.get_or_create(session_key, agent_id="main")
     effective_workspace_strict = _resolve_workspace_strict(
         cli_value=workspace_strict,
         config_value=getattr(svc.config, "workspace_strict", None),

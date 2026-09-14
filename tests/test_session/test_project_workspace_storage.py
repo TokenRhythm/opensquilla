@@ -538,7 +538,7 @@ async def test_project_history_delete_attempts_every_cleanup_after_failure(
 
         cleanup_calls: list[str] = []
 
-        async def cleanup(session: SessionNode) -> None:
+        async def cleanup(session: SessionNode, _material_cleanup: object) -> None:
             cleanup_calls.append(session.session_key)
             if session == sessions[0]:
                 raise RuntimeError("injected cleanup failure")
@@ -608,7 +608,7 @@ async def test_project_history_delete_cancellation_waits_for_commit_and_cleanup(
 
         cleanup_calls: list[str] = []
 
-        async def cleanup(session: SessionNode) -> None:
+        async def cleanup(session: SessionNode, _material_cleanup: object) -> None:
             cleanup_calls.append(session.session_key)
 
         monkeypatch.setattr(storage, "_commit_transaction", gated_commit)

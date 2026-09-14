@@ -8,6 +8,7 @@ import net from 'node:net'
 import { homedir, tmpdir } from 'node:os'
 import { basename, dirname, join, resolve } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
+import { saveArtifactFile, performSourceFileAction, type SaveArtifactRequest, type SourceFileActionRequest } from './resource-file-actions.js'
 import {
   DESKTOP_LOCALES,
   normalizeGatewayLocale,
@@ -12415,6 +12416,28 @@ ipcMain.handle('desktop:preferences:save', async (event, payload: DesktopPrefere
   return await saveDesktopPreferences(payload)
 })
 ipcMain.handle('desktop:artifact:open', async (_event, payload: ArtifactOpenRequest) => openArtifactWithDefaultApp(payload))
+ipcMain.handle('desktop:artifact:save', async (event, payload: SaveArtifactRequest) => {
+  if (!trustedMainWindowControlIpc(event)) throw new Error('Untrusted file save request.')
+  return saveArtifactFile(payload, async name => {
+    const window = currentMainWindow()
+    if (!window) throw new Error('Main window unavailable')
+    const choice = await dialog.showSaveDialog(window, { defaultPath: name })
+    return choice.canceled ? null : choice.filePath || null
+  })
+})
+ipcMain.handle('desktop:source-file:action', async (event, payload: SourceFileActionRequest) => {
+  if (!trustedControlUiIpc(event)) throw new Error('Untrusted source file request.')
+  await performSourceFileAction(payload, {
+    connection: () => {
+      if (!trustedControlUiIpc(event) || !gatewayState.owned || gatewayState.status !== 'ready') return null
+      const snapshot = desktopGatewayConnectionSnapshot()
+      if (!snapshot.instanceId || !snapshot.httpUrl || !snapshot.authToken) return null
+      return { instanceId: snapshot.instanceId, profile: snapshot.profileFingerprint,
+        url: snapshot.httpUrl, authToken: snapshot.authToken }
+    },
+    openPath: path => shell.openPath(path), reveal: path => shell.showItemInFolder(path),
+  })
+})
 ipcMain.handle('desktop:workspace:choose-directory', async (event, payload: unknown) => {
   if (!trustedControlUiIpc(event)) return null
   const choice = await dialog.showOpenDialog(
@@ -12471,10 +12494,15 @@ ipcMain.handle('desktop:workbench:browser:target', (event, payload: unknown) => 
 })
 ipcMain.handle('desktop:workbench:annotation:focus', async (event, payload: unknown) => {
   if (!trustedControlUiIpc(event)) throw new Error('Untrusted annotation request.')
-  const request = payload as { surfaceId?: unknown; targetRef?: unknown; locatorHint?: unknown } | null
+  const request = payload as { surfaceId?: unknown; targetRef?: unknown; locatorHint?: unknown; pagePath?: unknown } | null
   if (typeof request?.targetRef !== 'string' || typeof request?.locatorHint !== 'string'
     || request.targetRef.length > 128 || request.locatorHint.length > 4096) throw new Error('Invalid annotation focus request.')
-  return await nativeWorkbenchSurfaces.focusAnnotation(parseNativeWorkbenchSurfaceId(request.surfaceId), request.targetRef, request.locatorHint)
+  if (request.pagePath !== undefined && (typeof request.pagePath !== 'string'
+    || !request.pagePath || request.pagePath.length > 4096)) throw new Error('Invalid annotation page path.')
+  return await nativeWorkbenchSurfaces.focusAnnotation(
+    parseNativeWorkbenchSurfaceId(request.surfaceId), request.targetRef, request.locatorHint,
+    request.pagePath as string | undefined,
+  )
 })
 ipcMain.handle('desktop:workbench:browser:screenshot', async (event, payload: unknown) => {
   if (!trustedControlUiIpc(event)) throw new Error('Untrusted browser request.')

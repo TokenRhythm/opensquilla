@@ -475,8 +475,18 @@ export function useChatRenderedMessages(options: UseChatRenderedMessagesOptions)
         continue
       }
 
-      const usageEnsemble = ensembleMetaFromMessage(msg)
-      if (usageEnsemble) {
+      const hasTurnUsage = Boolean(routerUsageFromMessage(msg))
+      const callIdentity = routerModelCallIdFromMessage(msg)
+      // A trace-less receipt can settle known progress, but generic billing
+      // cannot prove fusion. Only retain evidence for this exact call in the
+      // current turn; the legacy settlement fallback is not an identity proof.
+      const matchingCallIndex = hasTurnUsage && callIdentity
+        ? turnRouterIndexes.get(`call:${callIdentity}`)
+        : undefined
+      const matchingCall = matchingCallIndex === undefined ? undefined : result[matchingCallIndex]
+      const ensemble = ensembleMetaFromMessage(msg)
+        ?? (matchingCall?.routerModelCallId === callIdentity ? matchingCall.ensemble : undefined)
+      if (ensemble) {
         const usageRouterDecision = routerDecisionFromUsage(msg, turnRouterDecision)
         if (usageRouterDecision) turnRouterDecision = usageRouterDecision
         const inLiveTurn = options.isStreaming?.value === true && i > lastUserIdx
@@ -484,7 +494,6 @@ export function useChatRenderedMessages(options: UseChatRenderedMessagesOptions)
           ...msg,
           routerSettled: msg.routerSettled === true || !inLiveTurn,
         }
-        const callIdentity = routerModelCallIdFromMessage(msg)
         const priorIndex = routerSettlementCandidateIndex(
           result,
           turnRouterIndexes,
@@ -497,7 +506,7 @@ export function useChatRenderedMessages(options: UseChatRenderedMessagesOptions)
           ? renderedCombinedRouterStrip(
               settledMessage,
               turnRouterDecision,
-              usageEnsemble,
+              ensemble,
               turnIdx,
               i,
               priorStrip?.messageId || `${msg.messageId || i}-router`,
@@ -506,7 +515,7 @@ export function useChatRenderedMessages(options: UseChatRenderedMessagesOptions)
             )
           : renderedEnsembleRouterStrip(
               settledMessage,
-              usageEnsemble,
+              ensemble,
               turnIdx,
               i,
               `${msg.messageId || i}-ensemble-router`,
@@ -520,7 +529,6 @@ export function useChatRenderedMessages(options: UseChatRenderedMessagesOptions)
         }
         prevRole = ''
       } else {
-        const hasTurnUsage = Boolean(msg.routerUsage || msg.usage || msg.turn_usage)
         const usageRouterDecision = routerDecisionFromUsage(
           msg,
           hasTurnUsage
@@ -981,12 +989,17 @@ export function useChatRenderedMessages(options: UseChatRenderedMessagesOptions)
   }
 
   function ensembleMeta(usage: Record<string, unknown>): ChatEnsembleMeta | undefined {
+    const trace = normalizeEnsembleTrace(usage.ensemble_trace || usage.ensembleTrace)
+    // Usage rows also include ordinary calls, image helpers, and child agents
+    // (including their fusion roles). Only this turn's own trace proves fusion.
+    const hasTrace = [trace?.profile, trace?.mode].some(
+      value => typeof value === 'string' && value.trim().length > 0,
+    )
+    if (!hasTrace) return undefined
+
     const breakdown = normalizeEnsembleUsageRows(
       usage.model_usage_breakdown || usage.modelUsageBreakdown,
     )
-    const trace = normalizeEnsembleTrace(usage.ensemble_trace || usage.ensembleTrace)
-    const hasTrace = Boolean(trace?.profile || trace?.mode)
-    if (!breakdown.length && !hasTrace) return undefined
 
     const traceCandidates = normalizeEnsembleUsageRows(trace?.candidates)
     const usedBreakdownIndexes = new Set<number>()
@@ -1065,10 +1078,13 @@ export function useChatRenderedMessages(options: UseChatRenderedMessagesOptions)
   ): boolean {
     if (isDirectEnsembleRouterDecision(decision)) return false
     if (hasEnsembleEvidence) return true
-    // Current tier configuration is only authoritative for a live decision.
-    // Restored history combines the two stages only when its own usage proves
-    // that ensemble execution actually happened.
-    return !restoredFromHistory && routerTierConfig(decision.tier).ensembleEnabled === true
+    // Live turns use their accepted snapshot, never mutable next-turn settings.
+    // History requires execution evidence rather than a planned ensemble tier.
+    const snapshot = normalizeRouterTierSnapshot(
+      decision.router_tier_snapshot ?? decision.routerTierSnapshot,
+    )
+    const selectedTier = snapshot?.tiers.find(entry => entry.tier === normalizeRouterTier(decision.tier))
+    return !restoredFromHistory && selectedTier?.execution_kind === 'ensemble'
   }
 
   function normalizeEnsembleUsageRows(value: unknown): ChatEnsembleUsageRow[] {

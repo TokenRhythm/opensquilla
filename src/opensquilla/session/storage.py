@@ -517,6 +517,8 @@ def _serialized_read[**P, R](
 # prompt-annotation drafts atomically consumed by chat turns. Version 24 added
 # durable idempotency receipts for artifact mutation attempts. Version 25 added
 # the persistent per-session model-routing mode and its compare-and-set revision.
+# Nullable execution workspace bindings are additive and are migrated without
+# changing the semantic session schema version used by upgrade compatibility.
 SCHEMA_VERSION = 25
 MAX_PENDING_CHAT_INPUTS = 5
 
@@ -594,6 +596,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     subject TEXT,
     origin TEXT,
     workspace_id TEXT,
+    execution_workspace TEXT,
     agent_id TEXT NOT NULL DEFAULT 'main',
     schema_version INTEGER NOT NULL DEFAULT 1,
     epoch INTEGER NOT NULL DEFAULT 0
@@ -1609,6 +1612,7 @@ def _deserialize_row(row: dict[str, Any]) -> dict[str, Any]:
         "turn_usage",
         "turn_context",
         "origin",
+        "execution_workspace",
         "details",
         "summary_payload",
         "missing_obligations",
@@ -1636,9 +1640,13 @@ def _deserialize_row(row: dict[str, Any]) -> dict[str, Any]:
             except (json.JSONDecodeError, TypeError):
                 if k == "assistant_replay":
                     raise ValueError("invalid assistant replay JSON") from None
+                if k == "execution_workspace":
+                    raise ValueError("invalid execution workspace JSON") from None
                 result[k] = None
             if k == "assistant_replay" and not isinstance(result[k], dict):
                 raise ValueError("assistant replay JSON must be an object")
+            if k == "execution_workspace" and not isinstance(result[k], dict):
+                raise ValueError("execution workspace JSON must be an object")
         elif k in bool_fields:
             result[k] = bool(v)
         else:
@@ -2347,6 +2355,7 @@ class SessionStorage:
         # Migrate older databases — add the epoch column if missing.
         await self._migrate_epoch_column()
         await self._migrate_workspace_id_column()
+        await self._migrate_execution_workspace_column()
         await self._migrate_collaboration_columns()
         await self._migrate_model_routing_columns()
         await self._migrate_derived_title_column()
@@ -2535,6 +2544,18 @@ class SessionStorage:
         if "workspace_id" not in columns:
             await self._conn.execute(
                 "ALTER TABLE sessions ADD COLUMN workspace_id TEXT"
+            )
+            await self._conn.commit()
+
+    async def _migrate_execution_workspace_column(self) -> None:
+        """Add the nullable durable execution-root binding to old databases."""
+
+        assert self._conn is not None
+        async with self._conn.execute("PRAGMA table_info(sessions)") as cur:
+            columns = {str(row[1]) for row in await cur.fetchall()}
+        if "execution_workspace" not in columns:
+            await self._conn.execute(
+                "ALTER TABLE sessions ADD COLUMN execution_workspace TEXT"
             )
             await self._conn.commit()
 
@@ -4972,6 +4993,7 @@ class SessionStorage:
             SELECT rowid, session_key, agent_id, origin
             FROM sessions
             WHERE workspace_id IS NULL
+              AND execution_workspace IS NULL
               AND origin IS NOT NULL
               AND rowid > ?
             ORDER BY rowid
@@ -5012,6 +5034,7 @@ class SessionStorage:
                 FROM sessions
                 WHERE session_key = ?
                   AND workspace_id IS NULL
+                  AND execution_workspace IS NULL
                   AND agent_id = ?
                   AND origin IS ?
                 """,
@@ -5037,6 +5060,7 @@ class SessionStorage:
                 SET workspace_id = ?
                 WHERE session_key = ?
                   AND workspace_id IS NULL
+                  AND execution_workspace IS NULL
                   AND agent_id = ?
                   AND origin IS ?
                 """,
@@ -5087,6 +5111,7 @@ class SessionStorage:
         expected_session_keys: Sequence[str] | None,
     ) -> list[str]:
         deleted: list[SessionNode] = []
+        material_cleanups = []
         async with self._write_transaction("delete_project_workspace_sessions") as conn:
             async with conn.execute(
                 """
@@ -5123,11 +5148,12 @@ class SessionStorage:
                 )
 
             for session in deleted:
+                material_cleanups.append(await self._prepare_deleted_session_cleanup(conn, session))
                 await self._delete_session_rows(conn, session)
 
-        for session in deleted:
+        for session, cleanup in zip(deleted, material_cleanups, strict=True):
             try:
-                await self._cleanup_deleted_session(session)
+                await self._cleanup_deleted_session(session, cleanup)
             except Exception:  # noqa: BLE001 - the database commit is authoritative.
                 log.warning(
                     "project_workspace.session_cleanup_failed "
@@ -5571,14 +5597,31 @@ class SessionStorage:
             (session.session_key,),
         )
 
-    async def _cleanup_deleted_session(self, session: SessionNode) -> None:
+    async def _prepare_deleted_session_cleanup(
+        self, conn: Any, session: SessionNode,
+    ) -> Callable[[], Awaitable[None]] | None:
+        from opensquilla.session.material_cleanup import prepare_session_material_cleanup
+
+        workspace = None
+        if session.workspace_id:
+            async with conn.execute(
+                "SELECT * FROM project_workspaces WHERE workspace_id=?", (session.workspace_id,),
+            ) as cursor:
+                row = await cursor.fetchone()
+            if row is not None:
+                workspace = ProjectWorkspace(**dict(row))
+        return await prepare_session_material_cleanup(session, workspace)
+
+    async def _cleanup_deleted_session(
+        self, session: SessionNode, cleanup: Callable[[], Awaitable[None]] | None,
+    ) -> None:
         # Cascade the on-disk session material (transcript media + workspace
         # attachment copies). DB-only deletion otherwise leaks both stores until
         # the transcript disk budget hard-fails. Best-effort via the registered
         # process-global hook; never fails the delete.
         from opensquilla.session.material_cleanup import run_session_material_cleanup
 
-        await run_session_material_cleanup(session.session_id, session.session_key)
+        await run_session_material_cleanup(session.session_id, session.session_key, cleanup)
 
         # G4 cleanup: cascade meta-skill audit rows for this session. The
         # sessions table is created lazily at runtime (not via yoyo), so
@@ -5597,6 +5640,7 @@ class SessionStorage:
     async def delete_session(self, session_key: str) -> None:
         session_key = canonicalize_session_key(session_key)
         session: SessionNode | None = None
+        cleanup = None
         async with self._write_transaction("delete_session") as conn:
             # Controls and drafts can exist on a provisional key before the
             # first accepted turn creates a sessions row. Fence those request
@@ -5633,17 +5677,19 @@ class SessionStorage:
                 row = await cursor.fetchone()
             if row is not None:
                 session = SessionNode(**_deserialize_row(dict(row)))
+                cleanup = await self._prepare_deleted_session_cleanup(conn, session)
                 await self._delete_session_rows(conn, session)
 
         _clear_pending_meta_launch_boundary(session_key)
         if session is None:
             return
-        await self._cleanup_deleted_session(session)
+        await self._cleanup_deleted_session(session, cleanup)
 
     async def prune_stale_session_records(self, before_ms: int) -> list[SessionNode]:
         """Delete and return the exact stale session generations committed."""
 
         deleted: list[SessionNode] = []
+        material_cleanups = []
         async with self._write_transaction("prune_stale_sessions") as conn:
             async with conn.execute(
                 "SELECT * FROM sessions WHERE updated_at < ?",
@@ -5652,10 +5698,11 @@ class SessionStorage:
                 rows = await cur.fetchall()
             for row in rows:
                 session = SessionNode(**_deserialize_row(dict(row)))
+                material_cleanups.append(await self._prepare_deleted_session_cleanup(conn, session))
                 await self._delete_session_rows(conn, session)
                 deleted.append(session)
-        for session in deleted:
-            await self._cleanup_deleted_session(session)
+        for session, cleanup in zip(deleted, material_cleanups, strict=True):
+            await self._cleanup_deleted_session(session, cleanup)
         return deleted
 
     async def prune_stale_sessions(self, before_ms: int) -> int:

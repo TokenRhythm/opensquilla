@@ -91,3 +91,67 @@ async def test_page_context_is_user_content_on_the_normal_owner_route(tmp_path, 
     assert "artifact_context" not in prepared.envelope.runtime_services
     assert "turn_authority_cleanup" not in prepared.envelope.runtime_services
     assert prepared.host_execute_allowed is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mutation", ["none", "epoch", "session_id", "binding", "revoked"])
+async def test_preview_registration_rechecks_admitted_authority(tmp_path, monkeypatch, mutation):
+    from opensquilla.gateway.execution_workspaces import build_execution_workspace_factory
+    from opensquilla.project_workspaces import ProjectWorkspaceStateError, project_path_key
+    from opensquilla.session.manager import SessionManager
+    from opensquilla.session.storage import SessionStorage
+    from opensquilla.tools.types import ToolContext, current_tool_context
+
+    deps = _route_dependencies(tmp_path, guest=False)
+    async with SessionStorage(tmp_path / "session.db") as storage:
+        sessions = SessionManager(storage, execution_workspace_factory=(
+            build_execution_workspace_factory(deps["config"], profile_home=tmp_path)
+        ))
+        session = await sessions.create(deps["key"])
+        root = Path(session.execution_workspace["root"])
+        if mutation == "revoked":
+            project = await storage.create_or_restore_project_workspace(
+                path=str(root), path_key=project_path_key(root), display_name="Preview project",
+                trusted_at=1, now_ms=1,
+            )
+            await storage.bind_session_workspace(session.session_key, project.workspace_id)
+            session = await storage.get_session(session.session_key)
+        deps.update(
+            session=session, session_id=session.session_id, storage=storage, sessions=sessions,
+        )
+        monkeypatch.setattr(
+            preparation, "resolve_default_run_mode",
+            AsyncMock(return_value=(RunMode.FULL, "config")),
+        )
+        prepared = await preparation.prepare_route(
+            AdmitTurn(session.session_key, "make a page", "session"), **deps,
+        )
+        opener = prepared.envelope.runtime_services["workspace_preview_opener"]
+        (root / "index.html").write_text("<h1>preview</h1>")
+        if mutation != "none":
+            async with storage._write_transaction("test.revoke_preview_authority") as conn:
+                if mutation == "revoked":
+                    await conn.execute("UPDATE project_workspaces SET trusted_at=NULL")
+                elif mutation == "binding":
+                    await conn.execute("UPDATE sessions SET execution_workspace=NULL")
+                elif mutation == "epoch":
+                    await conn.execute("UPDATE sessions SET epoch=epoch+1")
+                else:
+                    await conn.execute("UPDATE sessions SET session_id='replacement'")
+        context = ToolContext(
+            is_owner=True, session_key=session.session_key, session_id=session.session_id,
+            workspace_dir=str(root), workspace_preview_opener=opener,
+        )
+        token = current_tool_context.set(context)
+        try:
+            if mutation == "none":
+                assert (await opener(context, path="index.html"))["created"] is True
+            else:
+                with pytest.raises((ValueError, ProjectWorkspaceStateError)):
+                    await opener(context, path="index.html")
+                async with storage.conn.execute(
+                    "SELECT COUNT(*) FROM artifact_documents"
+                ) as cursor:
+                    assert (await cursor.fetchone())[0] == 0
+        finally:
+            current_tool_context.reset(token)
