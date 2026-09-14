@@ -1,8 +1,29 @@
 import type { DesktopGatewayConnection } from './platform/types'
 import { getPlatform } from './platform'
+import type { SandboxUpgradeReport } from './platform/types'
 
-function runtimeMessage(state: DesktopGatewayConnection): string {
+type RuntimeBannerState = DesktopGatewayConnection & {
+  sandboxUpgrade?: SandboxUpgradeReport | null
+}
+
+const SANDBOX_ATTENTION_STATUSES = new Set([
+  'partial_commit',
+  'cleanup_pending',
+  'retry_required',
+  'legacy_artifacts_present',
+])
+
+function sandboxUpgradeNeedsAttention(report: SandboxUpgradeReport | null | undefined): boolean {
+  return Boolean(report?.status && SANDBOX_ATTENTION_STATUSES.has(report.status))
+}
+
+function runtimeMessage(state: RuntimeBannerState): string {
   const chinese = (navigator.language || '').toLowerCase().startsWith('zh')
+  if (sandboxUpgradeNeedsAttention(state.sandboxUpgrade)) {
+    return chinese
+      ? '沙箱设置升级未完成，当前运行仍可用；请查看日志并重启后重试。'
+      : 'Sandbox settings were not fully upgraded. The runtime is usable; check the log and retry after restarting.'
+  }
   if (state.status === 'error') {
     return state.error || (chinese ? '本地运行时启动失败。' : 'The local runtime failed to start.')
   }
@@ -28,13 +49,14 @@ function installDesktopRuntimeBanner(): void {
     || !reveal
   ) return
 
-  const render = (state: DesktopGatewayConnection): void => {
+  const render = (state: RuntimeBannerState): void => {
     const text = runtimeMessage(state)
-    banner.hidden = state.status === 'ready'
-    banner.dataset.state = state.status
+    const migrationAttention = sandboxUpgradeNeedsAttention(state.sandboxUpgrade)
+    banner.hidden = state.status === 'ready' && !migrationAttention
+    banner.dataset.state = migrationAttention ? 'migration-warning' : state.status
     message.textContent = text
-    retry.hidden = state.status !== 'error'
-    reveal.hidden = state.status !== 'error'
+    retry.hidden = state.status !== 'error' || migrationAttention
+    reveal.hidden = state.status !== 'error' && !migrationAttention
   }
 
   retry.addEventListener('click', () => {
@@ -43,8 +65,12 @@ function installDesktopRuntimeBanner(): void {
   })
   reveal.addEventListener('click', () => { void gateway.revealLog?.() })
 
-  gateway.onConnection(render)
-  void gateway.getConnection().then(render)
+  gateway.onConnection(state => {
+    render(state)
+  })
+  void gateway.getConnection().then(state => {
+    render(state)
+  })
 }
 
 installDesktopRuntimeBanner()

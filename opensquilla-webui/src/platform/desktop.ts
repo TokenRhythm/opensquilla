@@ -12,6 +12,7 @@ import type {
   NativeWorkbenchSurfaceEvent,
   NativeWorkbenchSurfaceEventType,
   Platform,
+  SandboxUpgradeReport,
 } from './types'
 
 const DESKTOP_GATEWAY_STATUSES = new Set(['starting', 'ready', 'stopped', 'error'])
@@ -27,6 +28,19 @@ function normalizeDesktopGatewayConnection(payload: unknown): DesktopGatewayConn
   ) {
     throw new Error('The Desktop Gateway connection descriptor is invalid.')
   }
+  const rawSandboxUpgrade = raw.sandboxUpgrade
+  const sandboxUpgrade: SandboxUpgradeReport | undefined = rawSandboxUpgrade
+    && typeof rawSandboxUpgrade === 'object'
+    && !Array.isArray(rawSandboxUpgrade)
+    ? {
+      status: typeof (rawSandboxUpgrade as Record<string, unknown>).status === 'string'
+        ? (rawSandboxUpgrade as Record<string, unknown>).status as string
+        : undefined,
+      error: typeof (rawSandboxUpgrade as Record<string, unknown>).error === 'string'
+        ? (rawSandboxUpgrade as Record<string, unknown>).error as string
+        : null,
+    }
+    : undefined
   return {
     schemaVersion: 1,
     revision: raw.revision as number,
@@ -39,6 +53,7 @@ function normalizeDesktopGatewayConnection(payload: unknown): DesktopGatewayConn
     wsUrl: typeof raw.wsUrl === 'string' ? raw.wsUrl : null,
     authToken: typeof raw.authToken === 'string' ? raw.authToken : null,
     error: typeof raw.error === 'string' ? raw.error : null,
+    ...(sandboxUpgrade ? { sandboxUpgrade } : {}),
   }
 }
 
