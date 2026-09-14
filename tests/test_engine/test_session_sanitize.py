@@ -3103,7 +3103,7 @@ async def test_agent_refuses_mid_string_compacted_marker_in_tool_argument(
 
 
 @pytest.mark.asyncio
-async def test_agent_repair_prompt_keeps_provider_request_from_ending_on_assistant(
+async def test_agent_rejection_result_keeps_provider_request_from_ending_on_assistant(
     tmp_path,
 ) -> None:
     provider = TextThenCompactedToolArgumentsProvider()
@@ -3129,8 +3129,10 @@ async def test_agent_repair_prompt_keeps_provider_request_from_ending_on_assista
     assert len(provider.calls) == 2
     repair_messages = provider.calls[1]["messages"]
     assert repair_messages[-1].role == "user"
-    assert isinstance(repair_messages[-1].content, str)
-    assert "Regenerate the complete tool arguments" in repair_messages[-1].content
+    assert isinstance(repair_messages[-1].content, list)
+    assert len(repair_messages[-1].content) == 1
+    assert isinstance(repair_messages[-1].content[0], ContentBlockToolResult)
+    assert len(repair_messages) == len(provider.calls[0]["messages"]) + 2
     replay_payload = json.dumps(
         [message.model_dump(mode="json") for message in repair_messages],
         ensure_ascii=False,
@@ -3141,9 +3143,10 @@ async def test_agent_repair_prompt_keeps_provider_request_from_ending_on_assista
     )
     _assert_rejected_tool_pair_visible(repair_messages, "tool-compact", result_event.result)
     assert "_opensquilla_compacted_tool_arguments" not in replay_payload
+    assert "Regenerate the complete tool arguments" not in replay_payload
 
 
-def test_agent_repair_prompt_handles_tool_use_without_tool_result() -> None:
+def test_agent_preserves_missing_tool_result_as_history_without_extra_instruction() -> None:
     agent = Agent(provider=CapturingProvider(), config=AgentConfig())
     messages = [
         Message(role="user", content="make a deck"),
@@ -3165,9 +3168,11 @@ def test_agent_repair_prompt_handles_tool_use_without_tool_result() -> None:
 
     stripped = agent._strip_provider_context_marker_replay_for_provider(messages)
 
+    assert len(stripped) == len(messages)
+    assert stripped[0] == messages[0]
     assert stripped[-1].role == "user"
     assert isinstance(stripped[-1].content, str)
-    assert "Regenerate the complete tool arguments" in stripped[-1].content
+    assert stripped[-1].content.startswith("[Recorded tool history]")
     assert "verify current state" in stripped[-1].content
     replay_payload = json.dumps(
         [message.model_dump(mode="json") for message in stripped],
@@ -3176,6 +3181,8 @@ def test_agent_repair_prompt_handles_tool_use_without_tool_result() -> None:
     assert "tool-compact" in replay_payload
     assert "I will prepare the file." in replay_payload
     assert "Missing results do not establish whether execution occurred" in replay_payload
+    assert "Regenerate the complete tool arguments" not in replay_payload
+    assert '"tool_result"' not in stripped[-1].content
     assert "_opensquilla_compacted_tool_arguments" not in replay_payload
     assert repair_tool_pairing(stripped) == stripped
     assert not any(
@@ -3199,6 +3206,9 @@ def test_agent_repair_prompt_handles_tool_use_without_tool_result() -> None:
         )
         assert "I will prepare the file." in request_payload
         assert "Missing results do not establish whether execution occurred" in request_payload
+        assert "Regenerate the complete tool arguments" not in request_payload
+        assert request_payload.count("[Recorded tool history]") == 1
+        assert request_payload.count("[Runtime context]") == 1
         assert request_messages[-1].role == "user"
         assert repair_tool_pairing(request_messages) == request_messages
 
@@ -3243,8 +3253,12 @@ def test_agent_strips_string_provider_context_marker_replay() -> None:
     _assert_rejected_tool_pair_visible(
         stripped, "tool-compact-string", "missing required argument command"
     )
+    assert len(stripped) == len(messages)
+    assert stripped[0] == messages[0]
+    assert stripped[-1] == messages[-1]
+    assert "I will inspect the repo." in replay_payload
     assert "_opensquilla_compacted_tool_arguments" not in replay_payload
-    assert "Regenerate the complete tool arguments" in stripped[-1].content
+    assert "Regenerate the complete tool arguments" not in replay_payload
 
 
 @pytest.mark.asyncio
