@@ -986,7 +986,13 @@ export function useChatRenderedMessages(options: UseChatRenderedMessagesOptions)
     )
     const trace = normalizeEnsembleTrace(usage.ensemble_trace || usage.ensembleTrace)
     const hasTrace = Boolean(trace?.profile || trace?.mode)
-    if (!breakdown.length && !hasTrace) return undefined
+    // The ledger also emits breakdown rows for ordinary model calls and
+    // subagents. Only explicit ensemble execution metadata establishes fusion;
+    // row count (including a single surviving fallback) does not.
+    const hasEnsembleRole = breakdown.some(row => [
+      'proposer', 'aggregator', 'primary_aggregator', 'fixed_aggregator',
+    ].includes(String(row.role || '').trim().toLowerCase()))
+    if (!hasTrace && !hasEnsembleRole) return undefined
 
     const traceCandidates = normalizeEnsembleUsageRows(trace?.candidates)
     const usedBreakdownIndexes = new Set<number>()
@@ -1065,10 +1071,13 @@ export function useChatRenderedMessages(options: UseChatRenderedMessagesOptions)
   ): boolean {
     if (isDirectEnsembleRouterDecision(decision)) return false
     if (hasEnsembleEvidence) return true
-    // Current tier configuration is only authoritative for a live decision.
-    // Restored history combines the two stages only when its own usage proves
-    // that ensemble execution actually happened.
-    return !restoredFromHistory && routerTierConfig(decision.tier).ensembleEnabled === true
+    // Live turns use their accepted snapshot, never mutable next-turn settings.
+    // History requires execution evidence rather than a planned ensemble tier.
+    const snapshot = normalizeRouterTierSnapshot(
+      decision.router_tier_snapshot ?? decision.routerTierSnapshot,
+    )
+    const selectedTier = snapshot?.tiers.find(entry => entry.tier === normalizeRouterTier(decision.tier))
+    return !restoredFromHistory && selectedTier?.execution_kind === 'ensemble'
   }
 
   function normalizeEnsembleUsageRows(value: unknown): ChatEnsembleUsageRow[] {

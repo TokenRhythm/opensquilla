@@ -548,17 +548,35 @@ class _OmittedPublishProvider:
                 tool_use_id="write-1",
                 tool_name="write_file",
                 arguments={
-                    "path": "manual-big-write.html",
-                    "content": "<!doctype html><title>Manual</title>",
+                    "path": "manual-big-write.pdf",
+                    "content": "%PDF-1.4\nManual",
                 },
             )
             yield ProviderDone(stop_reason="tool_use", input_tokens=1, output_tokens=1)
             return
-        yield ProviderText(text="Created manual-big-write.html for you.")
+        yield ProviderText(text="Created manual-big-write.pdf for you.")
         yield ProviderDone(stop_reason="stop", input_tokens=1, output_tokens=1)
 
     async def list_models(self) -> list[ModelInfo]:
         return []
+
+
+class _OmittedHtmlProvider(_OmittedPublishProvider):
+    async def _stream(self, call_number: int) -> AsyncIterator[Any]:
+        if call_number == 1:
+            yield ProviderToolUseStart(tool_use_id="write-html", tool_name="write_file")
+            yield ProviderToolUseEnd(
+                tool_use_id="write-html",
+                tool_name="write_file",
+                arguments={
+                    "path": "site/index.html",
+                    "content": "<!doctype html><title>Preview</title>",
+                },
+            )
+            yield ProviderDone(stop_reason="tool_use", input_tokens=1, output_tokens=1)
+            return
+        yield ProviderText(text="Created site/index.html for preview.")
+        yield ProviderDone(stop_reason="stop", input_tokens=1, output_tokens=1)
 
 
 class _NamedPublishProvider(_OmittedPublishProvider):
@@ -576,12 +594,12 @@ class _NamedPublishProvider(_OmittedPublishProvider):
             yield ProviderToolUseStart(tool_use_id="publish-2", tool_name="publish_artifact")
             yield ProviderToolUseEnd(
                 tool_use_id="publish-2", tool_name="publish_artifact",
-                arguments={"path": "manual-big-write.html", "name": self.name},
+                arguments={"path": "manual-big-write.pdf", "name": self.name},
             )
             yield ProviderDone(stop_reason="tool_use", input_tokens=1, output_tokens=1)
             return
         yield ProviderText(
-            text="Created manual-big-write.html for you." if self.mention_source else "File ready."
+            text="Created manual-big-write.pdf for you." if self.mention_source else "File ready."
         )
         yield ProviderDone(stop_reason="stop", input_tokens=1, output_tokens=1)
 
@@ -643,15 +661,15 @@ class _OmittedPatchPublishProvider:
                 arguments={
                     "patch": (
                         "*** Begin Patch\n"
-                        "*** Add File: patched.html\n"
-                        "+<!doctype html><title>Patched</title>\n"
+                        "*** Add File: patched.pdf\n"
+                        "+%PDF-1.4\\nPatched\n"
                         "*** End Patch\n"
                     ),
                 },
             )
             yield ProviderDone(stop_reason="tool_use", input_tokens=1, output_tokens=1)
             return
-        yield ProviderText(text="Created patched.html.")
+        yield ProviderText(text="Created patched.pdf.")
         yield ProviderDone(stop_reason="stop", input_tokens=1, output_tokens=1)
 
     async def list_models(self) -> list[ModelInfo]:
@@ -708,8 +726,8 @@ class _MixedSizeOmittedPublishProvider:
         if call_number == 1:
             for index, payload in enumerate(
                 (
-                    {"path": "small.html", "content": "<title>ok</title>"},
-                    {"path": "large.html", "content": "<title>" + ("x" * 80) + "</title>"},
+                    {"path": "small.pdf", "content": "%PDF-small"},
+                    {"path": "large.pdf", "content": "%PDF-" + ("x" * 80)},
                 ),
                 start=1,
             ):
@@ -724,7 +742,7 @@ class _MixedSizeOmittedPublishProvider:
                 )
             yield ProviderDone(stop_reason="tool_use", input_tokens=1, output_tokens=1)
             return
-        yield ProviderText(text="Created small.html and large.html.")
+        yield ProviderText(text="Created small.pdf and large.pdf.")
         yield ProviderDone(stop_reason="stop", input_tokens=1, output_tokens=1)
 
     async def list_models(self) -> list[ModelInfo]:
@@ -778,7 +796,7 @@ class _SameContentOmittedPublishProvider:
 
     async def _stream(self, call_number: int) -> AsyncIterator[Any]:
         if call_number == 1:
-            for index, path in enumerate(("first.html", "second.html"), start=1):
+            for index, path in enumerate(("first.pdf", "second.pdf"), start=1):
                 yield ProviderToolUseStart(
                     tool_use_id=f"write-{index}",
                     tool_name="write_file",
@@ -788,12 +806,12 @@ class _SameContentOmittedPublishProvider:
                     tool_name="write_file",
                     arguments={
                         "path": path,
-                        "content": "<!doctype html><title>Same</title>",
+                        "content": "%PDF-same",
                     },
                 )
             yield ProviderDone(stop_reason="tool_use", input_tokens=1, output_tokens=1)
             return
-        yield ProviderText(text="Created first.html and second.html.")
+        yield ProviderText(text="Created first.pdf and second.pdf.")
         yield ProviderDone(stop_reason="stop", input_tokens=1, output_tokens=1)
 
     async def list_models(self) -> list[ModelInfo]:
@@ -827,13 +845,13 @@ class _PartialOmittedPublishProvider:
                 tool_use_id="write-1",
                 tool_name="write_file",
                 arguments={
-                    "path": "second.html",
-                    "content": "<!doctype html><title>Second</title>",
+                    "path": "second.pdf",
+                    "content": "%PDF-second",
                 },
             )
             yield ProviderDone(stop_reason="tool_use", input_tokens=1, output_tokens=1)
             return
-        yield ProviderText(text="Created runtime.txt and second.html.")
+        yield ProviderText(text="Created runtime.txt and second.pdf.")
         yield ProviderDone(stop_reason="stop", input_tokens=1, output_tokens=1)
 
     async def list_models(self) -> list[ModelInfo]:
@@ -2169,8 +2187,8 @@ async def test_turn_runner_auto_publishes_deliverable_file_when_model_omits_publ
 
         artifact_events = [event for event in events if isinstance(event, ArtifactEvent)]
         assert len(artifact_events) == 1
-        assert artifact_events[0].name == "manual-big-write.html"
-        assert artifact_events[0].mime == "text/html"
+        assert artifact_events[0].name == "manual-big-write.pdf"
+        assert artifact_events[0].mime == "application/pdf"
         assert artifact_events[0].session_id == session.session_id
         assert artifact_events[0].download_url == (
             f"/api/v1/artifacts/{artifact_events[0].id}"
@@ -2179,9 +2197,87 @@ async def test_turn_runner_auto_publishes_deliverable_file_when_model_omits_publ
         transcript = await manager.get_transcript(session_key)
         assistant = [entry for entry in transcript if entry.role == "assistant"][-1]
         payload = json.loads(assistant.content)
-        assert payload["text"] == "Created manual-big-write.html for you."
-        assert payload["artifacts"][0]["name"] == "manual-big-write.html"
+        assert payload["text"] == "Created manual-big-write.pdf for you."
+        assert payload["artifacts"][0]["name"] == "manual-big-write.pdf"
         assert payload["artifacts"][0]["source"] == "auto_publish_omitted"
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "caller_kind, preview_available, expected_artifacts",
+    [(CallerKind.WEB, True, 0), (CallerKind.WEB, False, 1), (CallerKind.CHANNEL, False, 1)],
+)
+async def test_turn_runner_html_backstop_respects_preview_capability(
+    tmp_path, caller_kind: CallerKind, preview_available: bool, expected_artifacts: int,
+) -> None:
+    storage = SessionStorage(":memory:")
+    await storage.connect()
+    manager = SessionManager(storage)
+    surface = "telegram" if caller_kind is CallerKind.CHANNEL else "webchat"
+    session_key = f"agent:main:{surface}:html-source-fallback"
+    session = await manager.create(session_key)
+    registry = _write_file_registry()
+
+    async def unused_preview(*args, **kwargs):
+        raise AssertionError("The omitted-publish provider never opens a preview")
+
+    registry.register(
+        ToolSpec(
+            name="open_workspace_preview",
+            description="Open a workspace preview",
+            parameters={},
+        ),
+        unused_preview,
+    )
+    runner = TurnRunner(
+        provider_selector=_ProviderSelector(_OmittedHtmlProvider()),
+        tool_registry=registry,
+        session_manager=manager,
+        config=GatewayConfig(
+            attachments=AttachmentsConfig(media_root=str(tmp_path / "media")),
+            squilla_router=SquillaRouterConfig(enabled=False),
+        ),
+    )
+    tool_context = ToolContext(
+        is_owner=True,
+        caller_kind=caller_kind,
+        # The channel fixture represents an authenticated file-writing operator.
+        channel_admin_verified=caller_kind is CallerKind.CHANNEL,
+        workspace_dir=str(tmp_path / "workspace"),
+        allowed_tools={"write_file", "open_workspace_preview"},
+        workspace_preview_opener=unused_preview if preview_available else None,
+        elevated="full",
+    )
+
+    try:
+        events = [
+            event
+            async for event in runner.run(
+                "make an html page",
+                session_key,
+                tool_context=tool_context,
+                history_has_persisted_user=False,
+                no_memory_capture=True,
+            )
+        ]
+
+        artifacts = [event for event in events if isinstance(event, ArtifactEvent)]
+        assert len(artifacts) == expected_artifacts
+        transcript = await manager.get_transcript(session_key)
+        assistant = [entry for entry in transcript if entry.role == "assistant"][-1]
+        if expected_artifacts:
+            payload = json.loads(assistant.content)
+            assert payload["artifacts"][0]["id"] == artifacts[0].id
+            assert payload["artifacts"][0]["source"] == "auto_publish_omitted"
+            _, downloaded = ArtifactStore(tmp_path / "media").resolve_for_download(
+                artifacts[0].id, session_id=session.session_id,
+            )
+            assert downloaded.read_bytes() == (tmp_path / "workspace/site/index.html").read_bytes()
+        else:
+            assert assistant.content == "Created site/index.html for preview."
+        assert (tmp_path / "workspace/site/index.html").is_file()
     finally:
         await storage.close()
 
@@ -2339,16 +2435,14 @@ async def test_repeated_cancel_persists_completed_artifact_and_interrupted_trans
         assert len(assistants) == 1
         payload = json.loads(assistants[0].content)
         assert "The generated file was delivered" in payload["text"]
-        assert payload["artifacts"][0]["name"] == "manual-big-write.html"
+        assert payload["artifacts"][0]["name"] == "manual-big-write.pdf"
 
         store = ArtifactStore(str(tmp_path / "media"))
         _, artifact_path = store.resolve_for_download(
             payload["artifacts"][0]["id"],
             session_id=session.session_id,
         )
-        assert artifact_path.read_text(encoding="utf-8") == (
-            "<!doctype html><title>Manual</title>"
-        )
+        assert artifact_path.read_text(encoding="utf-8") == "%PDF-1.4\nManual"
     finally:
         release_publish.set()
         release_assistant_append.set()
@@ -2521,7 +2615,7 @@ def test_auto_publish_nested_target_does_not_report_basename_as_resolved(tmp_pat
     workspace = tmp_path / "workspace"
     reports = workspace / "reports"
     reports.mkdir(parents=True)
-    target = reports / "deck.html"
+    target = reports / "deck.pdf"
     target.write_text("<title>Deck</title>", encoding="utf-8")
     ctx = ToolContext(
         is_owner=True,
@@ -2542,13 +2636,13 @@ def test_auto_publish_nested_target_does_not_report_basename_as_resolved(tmp_pat
 
     result = auto_publish_omitted_workspace_artifacts(
         ctx,
-        final_text="Created reports/deck.html for you.",
+        final_text="Created reports/deck.pdf for you.",
     )
 
     assert len(result.artifacts) == 1
     assert set(result.resolved_target_keys) == {
         "path:" + os.path.normcase(os.path.normpath(str(target.resolve()))),
-        "name:deck.html",
+        "name:deck.pdf",
     }
     assert "path:" + os.path.normcase(os.path.normpath("deck.html")) not in (
         result.resolved_target_keys
@@ -2582,13 +2676,13 @@ def test_artifact_delivery_target_key_preserves_whitespace_and_tolerates_nul(
     "target_name",
     [
         pytest.param(
-            "deck:unsafe.html",
+            "deck:unsafe.pdf",
             marks=pytest.mark.skipif(
                 os.name == "nt",
                 reason="colon is not a legal Windows workspace filename",
             ),
         ),
-        ("x" * 156) + ".html",
+        ("x" * 156) + ".pdf",
     ],
 )
 def test_auto_publish_dedupes_current_artifact_by_store_safe_name(
@@ -2608,7 +2702,7 @@ def test_auto_publish_dedupes_current_artifact_by_store_safe_name(
         session_id="session-safe-name",
         session_key="agent:main:webchat:safe-name",
         name=target.name,
-        mime="text/html",
+        mime="application/pdf",
         source="publish_artifact",
     )
     ctx = ToolContext(
@@ -2827,12 +2921,12 @@ async def test_turn_runner_auto_publishes_deliverable_file_created_by_apply_patc
         ]
 
         artifact_events = [event for event in events if isinstance(event, ArtifactEvent)]
-        assert [event.name for event in artifact_events] == ["patched.html"]
+        assert [event.name for event in artifact_events] == ["patched.pdf"]
 
         transcript = await manager.get_transcript(session_key)
         assistant = [entry for entry in transcript if entry.role == "assistant"][-1]
         payload = json.loads(assistant.content)
-        assert payload["artifacts"][0]["name"] == "patched.html"
+        assert payload["artifacts"][0]["name"] == "patched.pdf"
     finally:
         await storage.close()
 
@@ -2879,7 +2973,7 @@ async def test_turn_runner_marks_partial_omitted_artifact_delivery_failure(
         ]
 
         artifact_events = [event for event in events if isinstance(event, ArtifactEvent)]
-        assert [event.name for event in artifact_events] == ["small.html"]
+        assert [event.name for event in artifact_events] == ["small.pdf"]
         text_deltas = [event.text for event in events if isinstance(event, TextDeltaEvent)]
         done = next(event for event in events if isinstance(event, DoneEvent))
         assert any("File delivery failed:" in text for text in text_deltas)
@@ -2891,7 +2985,7 @@ async def test_turn_runner_marks_partial_omitted_artifact_delivery_failure(
         transcript = await manager.get_transcript(session_key)
         assistant = [entry for entry in transcript if entry.role == "assistant"][-1]
         payload = json.loads(assistant.content)
-        assert payload["artifacts"][0]["name"] == "small.html"
+        assert payload["artifacts"][0]["name"] == "small.pdf"
         assert "File delivery failed:" in payload["text"]
         assert "some generated files were attached" in payload["text"]
         assert "no downloadable file was attached" not in payload["text"]
@@ -2938,15 +3032,15 @@ async def test_turn_runner_auto_publishes_same_content_deliverables_by_name(
         ]
 
         artifact_events = [event for event in events if isinstance(event, ArtifactEvent)]
-        assert [event.name for event in artifact_events] == ["first.html", "second.html"]
+        assert [event.name for event in artifact_events] == ["first.pdf", "second.pdf"]
         assert artifact_events[0].sha256 == artifact_events[1].sha256
 
         transcript = await manager.get_transcript(session_key)
         assistant = [entry for entry in transcript if entry.role == "assistant"][-1]
         payload = json.loads(assistant.content)
         assert [artifact["name"] for artifact in payload["artifacts"]] == [
-            "first.html",
-            "second.html",
+            "first.pdf",
+            "second.pdf",
         ]
     finally:
         await storage.close()
@@ -2991,7 +3085,7 @@ async def test_turn_runner_auto_publishes_omitted_deliverable_after_existing_art
         ]
 
         artifact_events = [event for event in events if isinstance(event, ArtifactEvent)]
-        assert [event.name for event in artifact_events] == ["runtime.txt", "second.html"]
+        assert [event.name for event in artifact_events] == ["runtime.txt", "second.pdf"]
         assert artifact_events[0].id == "art-runtime"
         assert artifact_events[1].session_id == session.session_id
 
@@ -3000,7 +3094,7 @@ async def test_turn_runner_auto_publishes_omitted_deliverable_after_existing_art
         payload = json.loads(assistant.content)
         assert [artifact["name"] for artifact in payload["artifacts"]] == [
             "runtime.txt",
-            "second.html",
+            "second.pdf",
         ]
     finally:
         await storage.close()

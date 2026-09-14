@@ -615,6 +615,10 @@ export function createDesktopPlatform(): Platform {
         : {}),
     },
     files: {
+      ...(typeof window.opensquillaDesktop?.saveArtifact === 'function'
+        ? { saveArtifact: payload => requireDesktopApi().saveArtifact!(payload) } : {}),
+      ...(typeof window.opensquillaDesktop?.sourceFileAction === 'function'
+        ? { sourceFileAction: payload => requireDesktopApi().sourceFileAction!(payload) } : {}),
       openArtifact: (payload) => requireDesktopApi().openArtifact(payload),
       async chooseProjectDirectory(request) {
         const api = requireDesktopApi()

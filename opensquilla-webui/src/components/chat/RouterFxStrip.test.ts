@@ -1,6 +1,7 @@
 // @vitest-environment happy-dom
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { createApp, nextTick, reactive } from 'vue'
+import { createApp, nextTick, reactive, ref } from 'vue'
+import { useChatRenderedMessages } from '@/composables/chat/useChatRenderedMessages'
 import i18n from '@/i18n'
 import type { ChatRenderedMessage } from '@/types/chat'
 import RouterFxStrip from './RouterFxStrip.vue'
@@ -295,6 +296,43 @@ describe('RouterFxStrip model selection motion', () => {
 })
 
 describe('RouterFxStrip ensemble panel', () => {
+  it.each([false, true])('shows the lower handoff only for actual fusion (fusion=%s)', async actualFusion => {
+    const { renderedMessages } = useChatRenderedMessages({
+      messages: ref([
+        { role: 'user', text: 'Question', ts: 0 },
+        {
+          role: 'router', text: '', ts: 1, restoredFromHistory: true,
+          routerDecision: { tier: 'c1', model: 'deepseek-v4-pro-0813', source: 'v4_phase3' },
+        },
+        {
+          role: 'assistant', text: 'Answer', ts: 2, restoredFromHistory: true,
+          turn_usage: {
+            model: 'deepseek-v4-pro-0813',
+            model_usage_breakdown: [{ role: 'member', model: 'deepseek-v4-pro-0813' }],
+            ...(actualFusion ? { ensemble_trace: { profile: 'custom_b5', fallback_used: true } } : {}),
+          },
+        },
+      ]),
+      sessionKey: ref('fusion-classification'),
+      routerSlots: ref(['c1']),
+      routerModels: ref({}),
+      routerTierConfigs: ref({}),
+      routerVisualEffectsEnabled: ref(true),
+      routerVisualMode: ref('real_candidates'),
+      renderMarkdown: text => text,
+      stripGeneratedArtifactMarkers: text => text,
+      stripTimePrefix: text => text,
+      isSubagentCompletionMessage: () => false,
+    })
+    const strip = renderedMessages.value.find(message => message.isRouterStrip)!
+    const { app, el } = await mountStrip(strip)
+
+    expect(Boolean(el.querySelector('[data-testid="router-ensemble-handoff"]'))).toBe(actualFusion)
+    expect(Boolean(el.querySelector('[data-testid="router-ensemble-stage"]'))).toBe(actualFusion)
+    expect(Boolean(el.querySelector('[data-testid="router-ensemble-toggle"]'))).toBe(actualFusion)
+    app.unmount()
+  })
+
   it('shows every candidate as Proposer and the fuser as Aggregator', async () => {
     const roles = ['primary', 'contrast', 'fast_check', 'critic', 'aggregator']
     const { app, el } = await mountStrip(ensembleStrip({

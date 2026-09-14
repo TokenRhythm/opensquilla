@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import re
-from collections.abc import Sequence
+from collections.abc import Awaitable, Callable, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -225,6 +225,34 @@ class ArtifactSessionService:
             kind=kind,
             initial_artifact=_blob(initial_artifact),
             actor=_actor(actor),
+        )
+
+    async def register_working_source(
+        self, *, session_key: str, session_id: str, name: str,
+        initial_artifact: ArtifactBlobRef, actor: Actor, working_source: dict[str, str],
+        validate_session: Callable[[Any], Awaitable[None]] | None = None,
+    ) -> tuple[CommitResult, bool]:
+        """Register trusted source metadata and an internal initial version as one unit."""
+        from .working_files import WorkingFiles
+
+        normalized = {
+            key: _bounded_text(working_source[key], key, max_bytes=32768)
+            for key in ("workspace", "source_path", "relative_root", "entrypoint", "bundle_mode")
+        }
+        normalized["bundle_root"] = working_source.get("bundle_root", "")
+        if normalized["bundle_mode"] not in {"auto", "none", "directory"}:
+            raise ArtifactValidationError("Invalid working preview collection mode")
+        if (normalized["bundle_mode"] == "directory") != bool(normalized["bundle_root"]):
+            raise ArtifactValidationError("Invalid working preview collection root")
+        candidate = WorkingFiles(document_id="", base_revision_id="", **normalized)
+        candidate.entry
+        candidate.root
+        return await self.repository.register_working_source(
+            session_key=_bounded_text(session_key, "session_key", max_bytes=2048),
+            session_id=_bounded_text(session_id, "session_id", max_bytes=512),
+            name=_bounded_text(name, "name", max_bytes=512),
+            initial_artifact=_blob(initial_artifact),
+            actor=_actor(actor), working_source=normalized, validate_session=validate_session,
         )
 
     async def adopt_generated_deliverable(

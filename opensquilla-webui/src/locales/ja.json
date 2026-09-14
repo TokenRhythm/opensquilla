@@ -1,4 +1,13 @@
 {
+  "resourceActions": {
+    "more": "ファイル操作", "preview": "アプリ内でプレビュー", "openSource": "既定のアプリで開く",
+    "reveal": "ファイルマネージャーで表示", "revealFinder": "Finder で表示", "revealExplorer": "エクスプローラーで表示",
+    "openCopy": "ローカルコピーを開く", "saveAs": "名前を付けて保存…", "copyPath": "パスをコピー",
+    "copyGatewayPath": "サーバーのパスをコピー", "copyContents": "ファイル内容をコピー", "saved": "ファイルを保存しました",
+    "singleFile": "この HTML のみ保存します。参照するスタイル、画像、他のページは含まれません。",
+    "textOnly": "コピーできるのは 1 MiB 以下の UTF-8 テキストです。ファイルを保存してください。",
+    "unavailable": "現在のソースファイルを利用できません。既存のプレビューとダウンロードは変更されません。", "failed": "ファイル操作に失敗しました。"
+  },
   "workspaces": {
     "projects": "プロジェクト",
     "createProject": "プロジェクトを作成",
@@ -257,6 +266,7 @@
       "permissionDenied": "このページを更新する権限がありません。",
       "previewCapabilityExpired": "プレビューを開き直してください。",
       "previewRendererFailed": "プレビューを表示できませんでした。開き直してみてください。",
+      "previewPageUnsupported": "現在のクライアントまたは Gateway は、このサブページを直接開くことに対応していません。更新してから再試行してください。",
       "annotationUnavailable": "この注釈は一時的に利用できません。",
       "annotationBusy": "注釈を更新しています。しばらくしてからもう一度お試しください。",
       "invalidRequest": "リクエストを完了できませんでした。入力を確認してもう一度お試しください。",

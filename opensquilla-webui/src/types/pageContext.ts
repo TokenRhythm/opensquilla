@@ -10,6 +10,7 @@ export interface PageAnnotationInput {
 export interface ChatPageContext {
   targetRef?: string
   resourceId?: string
+  pagePath?: string
   annotations?: PageAnnotationInput[]
 }
 
@@ -17,7 +18,7 @@ export function normalizePageContext(value: unknown): ChatPageContext | null {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return null
   const raw = value as Record<string, unknown>
   const result: ChatPageContext = {}
-  for (const key of ['targetRef', 'resourceId'] as const) {
+  for (const key of ['targetRef', 'resourceId', 'pagePath'] as const) {
     if (typeof raw[key] === 'string' && raw[key].trim()) result[key] = raw[key].trim()
   }
   if (Array.isArray(raw.annotations)) {
@@ -40,12 +41,14 @@ export function pageContextForAnnotations(
 ): ChatPageContext | null {
   const first = snapshots[0]
   if (!first) return null
-  if (snapshots.some(item => item.targetRef !== first.targetRef || item.resourceId !== first.resourceId)) {
+  if (snapshots.some(item => item.targetRef !== first.targetRef
+    || item.resourceId !== first.resourceId || item.pagePath !== first.pagePath)) {
     throw new Error('Send annotations for one page at a time.')
   }
   return {
     ...(first.targetRef ? { targetRef: first.targetRef } : {}),
     ...(first.resourceId ? { resourceId: first.resourceId } : {}),
+    ...(first.pagePath ? { pagePath: first.pagePath } : {}),
     annotations: snapshots.map(item => ({
       text: item.body,
       ...(item.quote ? { selectionText: item.quote } : {}),
@@ -66,6 +69,7 @@ export function pageAnnotationSnapshots(value: unknown): PromptAnnotationSnapsho
     body: annotation.text,
     targetRef: context.targetRef,
     resourceId: context.resourceId,
+    pagePath: context.pagePath,
     locatorHint: annotation.locatorHint,
     tagName: '',
     quote: annotation.selectionText || null,

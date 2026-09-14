@@ -198,6 +198,10 @@ class SessionNode(SQLModel, table=True):
     # and continue to resolve the Agent/default OpenSquilla workspace.
     workspace_id: str | None = Field(default=None, index=True)
 
+    # Backend-owned execution root for new ordinary tasks. NULL is the legacy
+    # path-resolution contract, not a request to allocate a new directory.
+    execution_workspace: dict[str, Any] | None = Field(default=None, sa_column=Column(JSON))
+
     # Agent id for multi-agent support
     agent_id: str = "main"
 

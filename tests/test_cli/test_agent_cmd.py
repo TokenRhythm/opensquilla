@@ -73,6 +73,63 @@ class _FakeServices:
         return None
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("explicit_workspace", [False, True])
+async def test_cli_new_sessions_keep_the_effective_startup_workspace(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, explicit_workspace: bool
+) -> None:
+    from opensquilla.gateway.execution_workspaces import build_execution_workspace_factory
+
+    monkeypatch.setattr(
+        "opensquilla.gateway.config.default_opensquilla_home", lambda: tmp_path / "profile"
+    )
+    config = GatewayConfig.load(tmp_path / "config.toml", read_only=True)
+    selected = tmp_path / "selected" if explicit_workspace else Path(config.workspace_dir)
+    selected.mkdir(parents=True)
+    storage = await SessionStorage.open(str(tmp_path / "cli-workspace.db"))
+    contexts: list[Any] = []
+
+    class FakeTurnRunner:
+        def __init__(self, **kwargs: Any) -> None:
+            pass
+
+        async def run(
+            self, message: str, session_key: str, *,
+            expected_session_id: str | None = None,
+            expected_session_epoch: int | None = None,
+            **kwargs: Any,
+        ):
+            contexts.append(kwargs["tool_context"])
+            yield DoneEvent(text="ok")
+
+    async def fake_build_services(*, config: GatewayConfig, **kwargs: Any) -> _FakeServices:
+        manager = SessionManager(
+            storage,
+            execution_workspace_factory=build_execution_workspace_factory(
+                config, profile_home=tmp_path,
+            ),
+        )
+        return _FakeServices(config, manager)
+
+    monkeypatch.setattr("opensquilla.engine.runtime.TurnRunner", FakeTurnRunner)
+    monkeypatch.setattr("opensquilla.gateway.build_services", fake_build_services)
+    try:
+        for suffix in ("first", "second"):
+            key = f"agent:main:cli-workspace:{suffix}"
+            await run_agent_once(
+                message="pwd", session_id=key, config=config,
+                workspace=str(selected) if explicit_workspace else None,
+            )
+            session = await storage.get_session(key)
+            assert session.execution_workspace["kind"] == "configured"
+            assert session.execution_workspace["root"] == str(selected.resolve())
+    finally:
+        await storage.close()
+
+    assert [ctx.workspace_dir for ctx in contexts] == [str(selected.resolve())] * 2
+    assert config.workspace_dir_source == "default"
+
+
 def test_benchmark_transcript_preserves_tool_result_execution_status() -> None:
     status = {
         "version": 1,

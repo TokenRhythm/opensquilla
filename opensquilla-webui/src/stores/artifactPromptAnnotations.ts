@@ -42,6 +42,7 @@ function snapshotOf(annotation: PromptAnnotation, sentOrder: number): PromptAnno
     quote: annotation.quote,
     targetRef: annotation.targetRef,
     resourceId: annotation.resourceId,
+    pagePath: annotation.pagePath,
     locatorHint: annotation.locatorHint,
     targetText: annotation.targetText,
     targetKind: annotation.targetKind,
@@ -110,6 +111,7 @@ export const useArtifactPromptAnnotationsStore = defineStore('artifactPromptAnno
       annotationId: request.annotationId, sessionKey: request.sessionKey,
       documentId: request.documentId, documentName: request.documentName || 'artifact',
       resourceId: request.resourceId || request.selection.resourceId,
+      pagePath: request.pagePath,
       targetRef: request.selection.targetRef, locatorHint: request.selection.locatorHint,
       body: request.body || '', status: 'draft', tagName: request.selection.tagName,
       quote: request.selection.selectionText || null,
@@ -170,7 +172,8 @@ export const useArtifactPromptAnnotationsStore = defineStore('artifactPromptAnno
       // An acknowledgement for an older message cannot erase a newer composer edit.
       if (current?.body === snapshot.body
         && current.targetRef === snapshot.targetRef
-        && current.resourceId === snapshot.resourceId) {
+        && current.resourceId === snapshot.resourceId
+        && current.pagePath === snapshot.pagePath) {
         delete next[snapshot.annotationId]
         removedIds.push(snapshot.annotationId)
       }

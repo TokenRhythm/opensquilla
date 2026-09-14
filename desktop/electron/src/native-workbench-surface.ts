@@ -1506,30 +1506,53 @@ export class NativeWorkbenchSurfaceManager {
     return this.describeBrowserRecord(this.browserRecord(record.scopeId, record.targetRef))
   }
 
-  async focusAnnotation(surfaceId: string, targetRef: string, locatorHint: string) {
+  async focusAnnotation(surfaceId: string, targetRef: string, locatorHint: string, pagePath?: string) {
     const target = this.getBrowserTarget(surfaceId)
     if (target.targetRef !== targetRef) throw new DesktopBrowserError('TARGET_NOT_FOUND', 'The annotation page was replaced.', 404)
     const record = this.browserRecord(target.sessionKey, targetRef)
     if (!this.isActiveAnnotationRecord(record)) throw new DesktopBrowserError('TARGET_NOT_ACTIVE', 'Open the annotation page before focusing it.')
+    const generation = record.annotationDocumentGeneration
+    const assertCurrent = () => {
+      if (this.browserRecord(target.sessionKey, targetRef) !== record
+        || generation !== record.annotationDocumentGeneration) {
+        throw new DesktopBrowserError('PAGE_CHANGED', 'The annotation page changed before focus completed.')
+      }
+      if (pagePath !== undefined) {
+        let current: URL
+        try { current = new URL(record.view.webContents.getURL()) } catch {
+          throw new DesktopBrowserError('PAGE_CHANGED', 'The annotation page is unavailable.')
+        }
+        if (record.kind !== 'artifact-preview' || current.origin !== record.expectedOrigin
+          || decodeURIComponent(current.pathname).replace(/^\//, '') !== pagePath) {
+          throw new DesktopBrowserError('PAGE_CHANGED', 'Return to the annotated page or select the element again.')
+        }
+      }
+    }
+    assertCurrent()
     const group = `opensquilla-focus-${randomUUID()}`
     try {
       const { rootObjectId } = await this.browserRoot(record, group)
+      assertCurrent()
       const found = await this.cdpCommand(record, 'Runtime.callFunctionOn', {
         objectId: rootObjectId, objectGroup: group,
         functionDeclaration: 'function (selector) { const nodes = document.querySelectorAll(selector); return nodes.length === 1 ? nodes[0] : null }',
         arguments: [{ value: locatorHint }], returnByValue: false, silent: true,
-      }) as { result?: { objectId?: string } }
+      }, assertCurrent) as { result?: { objectId?: string } }
+      assertCurrent()
       if (!found.result?.objectId) throw new DesktopBrowserError('ELEMENT_NOT_FOUND', 'The annotated element is unavailable or ambiguous.')
-      const node = await this.cdpCommand(record, 'DOM.describeNode', { objectId: found.result.objectId }) as { node?: { backendNodeId?: number } }
+      const node = await this.cdpCommand(record, 'DOM.describeNode', { objectId: found.result.objectId }, assertCurrent) as { node?: { backendNodeId?: number } }
+      assertCurrent()
       await this.cdpCommand(record, 'Runtime.callFunctionOn', {
         objectId: found.result.objectId, functionDeclaration: NATIVE_WORKBENCH_ANNOTATION_SCROLL_FUNCTION,
         returnByValue: true, silent: true,
-      })
-      this.browserRecord(target.sessionKey, targetRef)
+      }, assertCurrent)
+      assertCurrent()
       await this.clearAnnotationFocusHighlight(record)
+      assertCurrent()
       await this.cdpCommand(record, 'Overlay.highlightNode', {
         backendNodeId: node.node?.backendNodeId, highlightConfig: NATIVE_WORKBENCH_ANNOTATION_HIGHLIGHT_CONFIG,
-      })
+      }, assertCurrent)
+      assertCurrent()
       record.annotationFocusTimer = setTimeout(() => { void this.clearAnnotationFocusHighlight(record) }, 2500)
       record.annotationFocusTimer.unref()
       return { ok: true, targetRef }

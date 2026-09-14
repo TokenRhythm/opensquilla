@@ -6,6 +6,7 @@ import type { ChatMessage, ChatRouterTierConfig } from '@/types/chat'
 import type { ModelRoutingMode } from '@/types/modelRouting'
 import type { ChatPart, InterruptViewState } from '@/types/parts'
 import type { TimeTranslator } from '@/utils/messageTime'
+import { workspacePreviewOpenAction, workspacePreviewsFromMessage } from '@/utils/chat/workspacePreviews'
 
 function renderedMessagesForRouterVisualMode(
   visualMode: 'real_candidates' | 'legacy_grid',
@@ -156,6 +157,73 @@ describe('useChatRenderedMessages maintenance events', () => {
         compactionId: 'cmp-7',
       },
     })
+  })
+})
+
+describe('useChatRenderedMessages workspace preview history', () => {
+  it('projects a completed historical preview call into an open action independent of activity disclosure', () => {
+    const result = JSON.stringify({
+      resourceId: 'document:doc_preview',
+      documentId: 'doc_preview',
+      entrypoint: '/tasks/a/beijing-weather.html',
+      previewStatus: 'ready',
+      open: { resourceId: 'document:doc_preview' },
+    })
+    const api = renderedMessagesFor([{
+      role: 'assistant',
+      text: '页面已完成：beijing-weather.html',
+      ts: 1,
+      messageId: 'assistant-preview',
+      turnId: 'turn-preview',
+      restoredFromHistory: true,
+      tool_calls: [
+        {
+          type: 'tool_use',
+          tool_use_id: 'preview-call',
+          name: 'open_workspace_preview',
+          input: { path: 'beijing-weather.html' },
+        },
+        {
+          type: 'tool_result',
+          tool_use_id: 'preview-call',
+          name: 'open_workspace_preview',
+          result,
+          is_error: false,
+        },
+      ],
+    }, {
+      role: 'assistant',
+      text: `beijing-weather.html ${result}`,
+      ts: 2,
+      restoredFromHistory: true,
+    }])
+
+    const [message, textOnlyMessage] = api.renderedMessages.value
+    expect(message.toolCalls).toEqual([
+      expect.objectContaining({ toolId: 'preview-call', name: 'open_workspace_preview', status: 'success' }),
+    ])
+    expect(message.timelineItems).toEqual([
+      expect.objectContaining({ type: 'tool-group' }),
+    ])
+    const links = workspacePreviewsFromMessage(message)
+    expect(links).toEqual([{
+      callId: 'preview-call',
+      documentId: 'doc_preview',
+      name: 'beijing-weather.html',
+      entrypoint: '/tasks/a/beijing-weather.html',
+      relativePath: undefined,
+    }])
+    // The open action does not depend on expanding or rendering the tool timeline.
+    expect(workspacePreviewsFromMessage({ ...message, timelineItems: [] })).toEqual(links)
+    expect(workspacePreviewOpenAction(links[0], 'agent:main:webchat:test')).toEqual({
+      source: 'workspace-preview',
+      documentId: 'doc_preview',
+      name: 'beijing-weather.html',
+      mime: 'text/html',
+      session_key: 'agent:main:webchat:test',
+    })
+    expect(message.artifacts ?? []).toEqual([])
+    expect(workspacePreviewsFromMessage(textOnlyMessage)).toEqual([])
   })
 })
 
@@ -1586,7 +1654,7 @@ describe('useChatRenderedMessages router visual mode', () => {
     expect(after?.routerTurnKey).toBe(before?.routerTurnKey)
   })
 
-  it('keeps the tier router and appends ensemble execution when C3 owns fusion', () => {
+  it.each([undefined, 'single_model', 'ensemble'] as const)('uses accepted C3 %s, not current config', (executionKind) => {
     const withMessages = useChatRenderedMessages({
       messages: ref<ChatMessage[]>([
         { role: 'user', text: 'hard question', ts: 0 },
@@ -1599,6 +1667,18 @@ describe('useChatRenderedMessages router visual mode', () => {
             tier: 'c3',
             model: 'anthropic/claude-opus-4.8',
             source: 'squilla_router',
+            ...(executionKind ? {
+              router_tier_snapshot: {
+                version: 1,
+                request_kind: 'text',
+                tiers: [
+                  { tier: 'c0', model: 'qwen/qwen3.7-flash', execution_kind: 'single_model' },
+                  { tier: 'c1', model: 'deepseek/deepseek-v4-flash', execution_kind: 'single_model' },
+                  { tier: 'c2', model: 'z-ai/glm-5.2', execution_kind: 'single_model' },
+                  { tier: 'c3', model: 'anthropic/claude-opus-4.8', execution_kind: executionKind },
+                ],
+              },
+            } : {}),
           },
         },
       ]),
@@ -1627,13 +1707,15 @@ describe('useChatRenderedMessages router visual mode', () => {
 
     const strip = withMessages.renderedMessages.value.find(message => message.isRouterStrip)
     const c3Index = strip?.gridCells?.findIndex(cell => cell.tiers.includes('c3')) ?? -1
-    expect(strip?.routerPanel).toBe('router-ensemble-sequence')
+    expect(strip?.routerPanel).toBe(
+      executionKind === 'ensemble' ? 'router-ensemble-sequence' : 'real-candidates',
+    )
     expect(strip?.routerMode).toBe('squilla_router')
     expect(strip?.gridCells || []).toHaveLength(4)
     expect(c3Index).toBeGreaterThanOrEqual(0)
     expect(strip?.winnerIdx).toBe(c3Index)
     expect(strip?.gridCells?.[c3Index]).toMatchObject({
-      executionKind: 'ensemble',
+      executionKind: executionKind ?? 'ensemble',
       tiers: ['c3'],
     })
   })
@@ -3185,6 +3267,97 @@ describe('useChatRenderedMessages clarify history recovery', () => {
 })
 
 describe('useChatRenderedMessages ensemble metadata', () => {
+  it.each([
+    ['live direct', 'usage', false],
+    ['restored direct', 'turn_usage', false],
+    ['live router', 'usage', true],
+    ['restored router', 'turn_usage', true],
+  ] as const)('does not classify ordinary model accounting as fusion: %s', (_, usageKey, routed) => {
+    const messages: ChatMessage[] = [{ role: 'user', text: 'Build a weather page.', ts: 0 }]
+    if (routed) messages.push({
+      role: 'router', text: '', ts: 1,
+      restoredFromHistory: usageKey === 'turn_usage',
+      routerDecision: { tier: 'c1', model: 'deepseek-v4-pro-0813', source: 'v4_phase3' },
+    })
+    messages.push({
+      role: 'assistant', text: 'Page ready.', ts: 2,
+      restoredFromHistory: usageKey === 'turn_usage',
+      [usageKey]: {
+        model: 'deepseek-v4-pro-0813',
+        routing_source: routed ? 'v4_phase3' : 'none',
+        routed_tier: routed ? 'c1' : undefined,
+        input_tokens: 45_432,
+        output_tokens: 2_217,
+        model_usage_breakdown: [{
+          role: 'member', profile: null, model: 'deepseek-v4-pro-0813',
+          input_tokens: 45_432, output_tokens: 2_217, request_count: 3,
+        }],
+      },
+    })
+
+    const rendered = renderedMessagesFor(messages, undefined, true).renderedMessages.value
+    const strips = rendered.filter(message => message.isRouterStrip)
+    const assistant = rendered.find(message => message.displayRole === 'assistant')
+
+    expect(assistant?.meta?.ensemble).toBeUndefined()
+    expect(assistant?.meta?.input).toBe(45_432)
+    expect(assistant?.meta?.output).toBe(2_217)
+    expect(strips).toHaveLength(routed ? 1 : 0)
+    if (routed) {
+      expect(strips[0].routerPanel).toBe('real-candidates')
+      expect(strips[0].ensemble).toBeUndefined()
+    }
+  })
+
+  it('does not infer fusion from several ordinary model or subagent usage rows', () => {
+    const api = renderedMessagesFor([{
+      role: 'assistant', text: 'Done.', ts: 0,
+      usage: {
+        model_usage_breakdown: [
+          { role: 'member', model: 'model-1' },
+          { role: 'subagent', model: 'model-2' },
+          { role: 'fallback', model: 'model-3' },
+        ],
+      },
+    }], undefined, true)
+
+    expect(api.renderedMessages.value.some(message => message.isRouterStrip)).toBe(false)
+    expect(api.renderedMessages.value[0].meta?.ensemble).toBeUndefined()
+  })
+
+  it.each(['ensemble_trace', 'ensembleTrace'] as const)(
+    'preserves real ensemble execution with one fallback model using %s', traceKey => {
+      const api = renderedMessagesFor([{
+        role: 'assistant', text: 'Fallback answer.', ts: 0, restoredFromHistory: true,
+        turn_usage: {
+          model_usage_breakdown: [{ role: 'fixed_direct', model: 'fallback-model' }],
+          [traceKey]: { profile: 'custom_b5', fallback_used: true, llm_request_count: 1 },
+        },
+      }], undefined, true)
+
+      const strip = api.renderedMessages.value.find(message => message.isRouterStrip)
+      expect(strip?.routerPanel).toBe('llm-ensemble')
+      expect(strip?.ensemble?.modelCount).toBe(1)
+      expect(strip?.ensemble?.fallbackUsed).toBe(true)
+    },
+  )
+
+  it('preserves explicit legacy ensemble roles when trace is absent', () => {
+    const api = renderedMessagesFor([{
+      role: 'assistant', text: 'Fused answer.', ts: 0, restoredFromHistory: true,
+      turn_usage: {
+        model_usage_breakdown: [
+          { role: 'proposer', model: 'proposer-model' },
+          { role: 'primary_aggregator', model: 'aggregator-model' },
+        ],
+      },
+    }], undefined, true)
+
+    const strip = api.renderedMessages.value.find(message => message.isRouterStrip)
+    expect(strip?.routerPanel).toBe('llm-ensemble')
+    expect(strip?.ensemble?.modelCount).toBe(2)
+  })
+
   it('reconstructs a settled ensemble strip from completed assistant usage', () => {
     const api = renderedMessagesFor([
       {

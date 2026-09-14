@@ -86,15 +86,133 @@ def _create(
     mode: str = "offline",
     preview_client: str = "web",
     origin: str | None = "http://127.0.0.1:18791",
+    page_path: str | None = None,
 ):
     headers = dict(_AUTH_HEADERS)
     if origin is not None:
         headers["Origin"] = origin
     return client.post(
         f"/api/v1/artifacts/{artifact_id}/preview-leases",
-        json={"version": 1, "mode": mode, "client": preview_client},
+        json={
+            "version": 1, "mode": mode, "client": preview_client,
+            **({"pagePath": page_path} if page_path is not None else {}),
+        },
         headers=headers,
     )
+
+
+def _publish_preview_site(tmp_path: Path):
+    return ArtifactStore(tmp_path).publish_bundle(
+        ArtifactBundle(entrypoint="index.html", files=(
+            ArtifactBundleSourceFile("index.html", "text/html", b"<h1>Home</h1>"),
+            ArtifactBundleSourceFile(
+                "layouts/editorial.html", "text/html", b"<h1>Editorial</h1>",
+            ),
+            ArtifactBundleSourceFile("style.css", "text/css", b"h1 { color: blue }"),
+            ArtifactBundleSourceFile("not-html.html", "text/plain", b"Not a page"),
+        )),
+        session_id=_SESSION_ID, session_key=_SESSION_KEY,
+        name="index.html", mime="text/html", source="test-preview-pages",
+    )
+
+
+@pytest.mark.parametrize("preview_client", ["web", "desktop"])
+def test_selected_member_page_keeps_canonical_lease_identity(
+    tmp_path: Path, preview_client,
+) -> None:
+    ref = _publish_preview_site(tmp_path)
+    app, service = _app(tmp_path)
+    service.set_listener_port(43123)
+    with TestClient(
+        app, base_url="http://127.0.0.1:18791", client=("127.0.0.1", 51000),
+    ) as client:
+        created = _create(
+            client, ref.id, preview_client=preview_client,
+            page_path="layouts/editorial.html",
+            origin=None if preview_client == "desktop" else "http://127.0.0.1:18791",
+        )
+        assert created.status_code == 201, created.text
+        payload = created.json()
+        assert payload["entrypoint"] == "index.html"
+        assert payload["page_path"] == "layouts/editorial.html"
+        if preview_client == "desktop":
+            with TestClient(
+                create_artifact_preview_resource_app(service),
+                base_url=payload["preview_origin"],
+            ) as native_client:
+                result = native_client.get(payload["launch_url"])
+        else:
+            result = client.get(payload["launch_url"])
+        assert result.status_code == 200
+        assert result.content == b"<h1>Editorial</h1>"
+
+
+@pytest.mark.parametrize("page_path", [
+    None, 1, False, [], {}, "", " ", "/index.html", "../index.html", "a/../index.html",
+    "./index.html", "a//index.html", "a\\index.html", "index.html?x=1", "index.html#top",
+    "%2e%2e/index.html", "a%2Findex.html", "file:index.html", "style.css", "index.html\x00",
+    " index.html", pytest.param("a" * 4097 + ".html", id="overlong"),
+])
+def test_selected_page_path_rejected_before_lease_allocation(tmp_path: Path, page_path) -> None:
+    ref = _publish_preview_site(tmp_path)
+    app, service = _app(tmp_path)
+    with TestClient(app, base_url="http://127.0.0.1:18791") as client:
+        response = client.post(
+            f"/api/v1/artifacts/{ref.id}/preview-leases",
+            headers=_AUTH_HEADERS,
+            json={"version": 1, "mode": "offline", "client": "web", "pagePath": page_path},
+        )
+    assert response.status_code == 400, response.text
+    assert response.json()["code"] == "INVALID_REQUEST"
+    assert service._leases_by_id == {}
+
+
+@pytest.mark.parametrize("page_path", ["missing.html", "outside/index.html", "not-html.html"])
+def test_selected_page_must_be_a_collected_html_member(tmp_path: Path, page_path) -> None:
+    ref = _publish_preview_site(tmp_path)
+    app, service = _app(tmp_path)
+    (tmp_path / "outside").mkdir()
+    (tmp_path / "outside/index.html").write_text("Private outside page")
+    with TestClient(app, base_url="http://127.0.0.1:18791") as client:
+        response = _create(client, ref.id, page_path=page_path)
+    assert response.status_code == 404, response.text
+    assert response.json()["code"] == "NOT_FOUND"
+    assert service._leases_by_id == {}
+
+
+def test_selected_working_page_reads_live_source_not_published_snapshot(tmp_path: Path) -> None:
+    ref = _publish_preview_site(tmp_path)
+    app, service = _app(tmp_path)
+    workspace = tmp_path / "workspace"
+    (workspace / "site/layouts").mkdir(parents=True)
+    (workspace / "site/index.html").write_text("<h1>Live home</h1>")
+    selected = workspace / "site/layouts/editorial.html"
+    selected.write_text("<h1>Live editorial</h1>")
+    service.register_working_files(
+        session_id=_SESSION_ID, artifact_id=ref.id,
+        binding=WorkingFiles(
+            document_id="doc-site", workspace=str(workspace), relative_root="site",
+            entrypoint="index.html", base_revision_id="revision-initial",
+        ),
+    )
+    with TestClient(app, base_url="http://127.0.0.1:18791") as client:
+        created = _create(client, ref.id, page_path="layouts/editorial.html")
+        assert created.status_code == 201, created.text
+        payload = created.json()
+        assert client.get(payload["launch_url"]).content == b"<h1>Live editorial</h1>"
+        selected.write_text("<h1>Changed editorial</h1>")
+        assert client.get(payload["launch_url"]).content == b"<h1>Changed editorial</h1>"
+        selected.unlink()
+        assert _create(client, ref.id, page_path="layouts/editorial.html").status_code == 404
+        private = workspace / "private.html"
+        private.write_text("<h1>Private page</h1>")
+        selected.symlink_to(private)
+        assert _create(client, ref.id, page_path="layouts/editorial.html").status_code == 404
+        assert len(service._leases_by_id) == 1
+    immutable = ArtifactStore(tmp_path).resolve_preview_resource(
+        ref.id, session_id=_SESSION_ID, logical_path="layouts/editorial.html",
+    )
+    assert immutable.path.read_bytes() == b"<h1>Editorial</h1>"
 
 
 def test_offline_lease_serves_html_without_gateway_credentials(tmp_path: Path) -> None:
