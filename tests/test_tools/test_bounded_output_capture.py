@@ -23,10 +23,10 @@ from opensquilla.tools.output_capture import OUTPUT_PREVIEW_BYTES, BoundedOutput
 from opensquilla.tools.types import ToolContext, current_tool_context
 
 
-def _spool(store: ToolResultStore, *, size: int = 1024, budget: int = 2048):
+def _spool(store: ToolResultStore):
     return store.open_output_spool(
         tool_name="exec", session_id="test-session", session_key="test-session",
-        agent_id="main", max_bytes=size, disk_budget_bytes=budget,
+        agent_id="main",
     )
 
 
@@ -38,29 +38,23 @@ def _write(store: ToolResultStore, text: str, *, budget: int):
 
 
 def _retained_output(store: ToolResultStore):
-    records = store._iter_record_stats()
+    records = store._iter_output_stats()
     assert len(records) == 1
     return store.read(records[0].record_dir.name, session_id="test-session")
 
 
-def test_spool_reservation_shares_snapshot_budget_and_is_not_evicted(tmp_path: Path) -> None:
+def test_execution_logs_do_not_share_snapshot_budget(tmp_path: Path) -> None:
     store = ToolResultStore(tmp_path)
     spool = _spool(store)
     try:
         spool.append(b"retained")
         os.utime(spool.record_dir / "output.spool", (1, 1))
-        # Expiry must not delete a running spool, and its full reservation must
-        # count even though the file is currently only eight bytes long.
-        with pytest.raises(ToolResultStoreBudgetError):
-            _write(store, "x" * 1100, budget=2048)
-        assert spool.prefix() == b"retained"
+        record = _write(store, "x" * 1100, budget=2048)
         assert spool.record_dir.exists()
-        record = _write(store, "x" * 1024, budget=2048)
-        assert store.read(record.handle, session_id="test-session").content == "x" * 1024
-        handle = spool.finish("retained")
-        assert store.read(handle, session_id="test-session").content == "retained"
-        # Completed records return their unused reservation to the same budget.
+        assert store.read(record.handle, session_id="test-session").content == "x" * 1100
+        handle = spool.finish()
         _write(store, "y" * 1900, budget=2048)
+        assert store.read(handle, session_id="test-session").content == "retained"
     finally:
         spool.close()
 
@@ -76,20 +70,23 @@ def test_active_spool_is_protected_across_processes(tmp_path: Path) -> None:
             "try:\n"
             " store.write('x'*1100, tool_use_id='x', tool_name='test', session_id='test-session', "
             "session_key='test-session', agent_id='main', disk_budget_bytes=2048)\n"
-            "except ToolResultStoreBudgetError:\n print('budget protected')\n"
+            "except ToolResultStoreBudgetError:\n print('unexpected snapshot failure')\n"
+            "other = store.open_output_spool(tool_name='exec', session_id='test-session', "
+            "session_key='test-session', agent_id='main', retention_seconds=0)\n"
+            "other.close()\nprint('active output protected')\n"
         )
         result = subprocess.run(
             [sys.executable, "-c", code], capture_output=True, text=True, timeout=10,
             env={**os.environ, "PYTHONPATH": str(Path(__file__).resolve().parents[2] / "src")},
         )
         assert result.returncode == 0, result.stderr
-        assert result.stdout.strip() == "budget protected"
+        assert result.stdout.strip() == "active output protected"
         assert spool.record_dir.exists()
     finally:
         spool.close()
 
 
-async def test_capture_drains_past_spool_cap_and_retains_latest_diagnostics(tmp_path: Path) -> None:
+async def test_capture_preserves_complete_log_past_snapshot_cap(tmp_path: Path) -> None:
     token = current_tool_context.set(ToolContext(
         session_key="test-session", tool_result_store_dir=str(tmp_path), agent_id="main",
     ))
@@ -98,7 +95,6 @@ async def test_capture_drains_past_spool_cap_and_retains_latest_diagnostics(tmp_
     finally:
         current_tool_context.reset(token)
     assert capture.spool is not None
-    assert capture.spool.max_bytes == DEFAULT_TOOL_RESULT_MAX_BYTES
     assert DEFAULT_TOOL_RESULT_DISK_BUDGET_BYTES == 256 * 1024 * 1024
     try:
         capture.feed(b"first diagnostic\n")
@@ -110,13 +106,17 @@ async def test_capture_drains_past_spool_cap_and_retains_latest_diagnostics(tmp_
         assert "LATEST EXIT DIAGNOSTIC" in capture.preview()
         await capture.finish_async()
         assert capture.handle
-        record = ToolResultStore(tmp_path).read(capture.handle, session_id="test-session")
-        assert record.size_bytes <= DEFAULT_TOOL_RESULT_MAX_BYTES
-        assert "first diagnostic" in record.content
-        assert "LATEST EXIT DIAGNOSTIC" in record.content
-        assert "output omitted between retained prefix" in record.content
-        assert capture.describe()["retained_output_complete"] is False
-        assert "not a full log" in capture.notice()
+        store = ToolResultStore(tmp_path)
+        meta = store.read_output_metadata(capture.handle, session_id="test-session")
+        assert meta["size_bytes"] > DEFAULT_TOOL_RESULT_MAX_BYTES
+        content = "".join(store.iter_text_chunks(capture.handle, session_id="test-session"))
+        assert content == (
+            "first diagnostic\n" + "x" * (160 * 65536) + "\nLATEST EXIT DIAGNOSTIC\n"
+        )
+        with pytest.raises(ToolResultStoreBudgetError, match="streaming"):
+            store.read(capture.handle, session_id="test-session")
+        assert capture.describe()["retained_output_complete"] is True
+        assert "not a full log" not in capture.notice()
     finally:
         capture.spool.close()
 
@@ -142,8 +142,8 @@ async def test_disk_write_failure_keeps_draining_and_reports_retained_fragments(
     assert capture.handle
     record = ToolResultStore(tmp_path).read(capture.handle, session_id="test-session")
     assert "before disk full" in record.content
-    assert "last failure diagnostic" in record.content
-    assert "omitted" in record.content
+    assert record.content == "before disk full\n"
+    assert "last failure diagnostic" in capture.preview()
     assert "not a full log" in capture.notice()
 
 
@@ -273,7 +273,7 @@ async def test_background_log_and_wait_retain_output_after_nonzero_exit(
         restored = await capture.preview_async()
         assert "start" in restored and "last error" in restored
         log_payload = json.loads(await shell.process(
-            "log", session_id=session_id, offset=max(0, len(restored) - 100), limit=100,
+            "log", session_id=session_id, offset=2_000_000 - 50, limit=100,
         ))
         assert "last error" in log_payload["output"]
         handle = payload["session"]["output_capture"]["tool_result_handle"]
@@ -338,7 +338,7 @@ async def test_capture_setup_owns_lease_until_open_settles(
             await asyncio.sleep(0)
         assert not task.done()
         assert not spools[0].lease.closed
-        assert ToolResultStore(tmp_path)._iter_record_stats()[0].active
+        assert ToolResultStore(tmp_path)._iter_output_stats()[0].active
     finally:
         release.set()
     if cancel:
@@ -355,7 +355,7 @@ async def test_capture_setup_owns_lease_until_open_settles(
     assert spools[0].lease.closed
 
 
-async def test_capture_respects_operator_budget_overrides(tmp_path: Path) -> None:
+async def test_snapshot_budget_overrides_do_not_truncate_execution_logs(tmp_path: Path) -> None:
     token = current_tool_context.set(ToolContext(
         session_key="test-session", tool_result_store_dir=str(tmp_path),
         tool_result_store_max_bytes=128, tool_result_store_disk_budget_bytes=128,
@@ -363,18 +363,18 @@ async def test_capture_respects_operator_budget_overrides(tmp_path: Path) -> Non
     ))
     try:
         capture = await BoundedOutputCapture.create("exec")
-        assert capture.spool is not None and capture.spool.max_bytes == 128
-        denied = await BoundedOutputCapture.create("exec")
-        assert denied.spool is None
-        assert denied.storage_error == "ToolResultStoreBudgetError"
+        assert capture.spool is not None
+        other = await BoundedOutputCapture.create("exec")
+        assert other.spool is not None
+        other.spool.close()
         capture.feed(b"FIRST_OUTPUT_835\n" + b"x" * 1024 + b"\nFINAL_EIO_927")
         await capture.finish_async()
         assert capture.handle is not None
         record = ToolResultStore(tmp_path).read(capture.handle, session_id="test-session")
-        assert record.size_bytes <= 128
+        assert record.size_bytes > 128
         assert "FIRST_OUTPUT_835" in record.content
         assert "FINAL_EIO_927" in record.content
-        assert capture.describe()["retained_output_complete"] is False
+        assert capture.describe()["retained_output_complete"] is True
         # Completed background jobs release their large preview and query the
         # retained record. The actual error must survive that transition too.
         capture.release_preview()
@@ -399,7 +399,7 @@ async def test_complete_output_does_not_add_capture_instructions(tmp_path: Path)
 
 
 @pytest.mark.parametrize("output_size", [20, 200])
-async def test_process_log_marks_capture_omission_even_when_response_fits(
+async def test_process_log_reads_full_output_independent_of_preview(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, output_size: int,
 ) -> None:
     from types import SimpleNamespace
@@ -423,13 +423,11 @@ async def test_process_log_marks_capture_omission_even_when_response_fits(
         current_tool_context.reset(token)
 
     assert len(payload["output"]) < payload["limit"]
-    assert payload["truncated"] is (output_size > 64)
+    assert payload["truncated"] is False
+    assert payload["output"] == "x" * output_size
     if output_size > 64:
-        assert "preview omitted" in payload["output"]
         assert payload["session"]["output_capture"]["tool_result_handle"] == capture.handle
-        assert "retrieve_tool_result" in payload["output"]
     else:
-        assert payload["output"] == "x" * output_size
         assert "output_capture" not in payload["session"]
 
 
@@ -532,7 +530,9 @@ async def test_released_preview_uses_bounded_diagnostic_if_stored_output_is_evic
     capture.release_preview()
     assert not capture.previews["stdout"].head
     assert not capture.previews["stdout"].tail
-    _write(ToolResultStore(tmp_path), "other" * 300, budget=1500)
+    # Explicit expiry remains separate from snapshot budget pressure.
+    store = ToolResultStore(tmp_path)
+    store._remove_expired(store._iter_output_stats(), 0)
     preview = await capture.preview_async()
     assert "last diagnostic" in preview
     assert "retained output unavailable" in preview
@@ -544,7 +544,7 @@ async def test_failed_storage_keeps_bounded_preview_for_queries(
     capture = BoundedOutputCapture(preview_bytes=256)
     capture.spool = _spool(ToolResultStore(tmp_path))
 
-    def disk_full(_content: str) -> str:
+    def disk_full(**_kwargs) -> str:
         raise OSError(28, "synthetic disk full at completion")
 
     monkeypatch.setattr(capture.spool, "finish", disk_full)
@@ -585,13 +585,19 @@ def test_multistream_retention_preserves_independent_legacy_and_utf8_encoding(
 ) -> None:
     from functools import partial
 
-    from opensquilla.subprocess_encoding import decode_subprocess_output
+    from opensquilla.subprocess_encoding import (
+        decode_subprocess_output,
+        select_subprocess_output_encoding,
+    )
     from opensquilla.tools import output_capture
 
     # Exercise the Windows code-page decision on every host. A Python process
     # can forward a native child's legacy output while its own stream is UTF-8.
     monkeypatch.setattr(output_capture, "decode_subprocess_output", partial(
         decode_subprocess_output, fallback_encoding=fallback_encoding,
+    ))
+    monkeypatch.setattr(output_capture, "select_subprocess_output_encoding", partial(
+        select_subprocess_output_encoding, fallback_encoding=fallback_encoding,
     ))
     capture = BoundedOutputCapture(streams=("stdout", "stderr"))
     capture.spool = _spool(ToolResultStore(tmp_path))
@@ -615,7 +621,6 @@ def test_multistream_retention_preserves_independent_legacy_and_utf8_encoding(
         assert capture.preview(stream) == text
         assert f"[{stream}]\n{text}" in record.content
     assert "�" not in record.content
-    assert record.size_bytes <= capture.spool.max_bytes
     assert capture.describe()["retained_output_complete"] is True
 
 
@@ -631,12 +636,18 @@ async def test_execute_code_retains_native_child_bytes_alongside_utf8(
 
     from opensquilla.sandbox.config import SandboxSettings
     from opensquilla.sandbox.integration import configure_runtime, reset_runtime
-    from opensquilla.subprocess_encoding import decode_subprocess_output
+    from opensquilla.subprocess_encoding import (
+        decode_subprocess_output,
+        select_subprocess_output_encoding,
+    )
     from opensquilla.tools import output_capture
     from opensquilla.tools.builtin import code_exec
 
     monkeypatch.setattr(output_capture, "decode_subprocess_output", partial(
         decode_subprocess_output, fallback_encoding=fallback_encoding,
+    ))
+    monkeypatch.setattr(output_capture, "select_subprocess_output_encoding", partial(
+        select_subprocess_output_encoding, fallback_encoding=fallback_encoding,
     ))
     configure_runtime(SandboxSettings(sandbox=False, security_grading=False), workspace=tmp_path)
     token = current_tool_context.set(ToolContext(
@@ -680,50 +691,51 @@ def test_small_output_after_spool_write_failure_retains_real_tail(
     assert capture.handle is not None
     retained = ToolResultStore(tmp_path).read(capture.handle, session_id="test-session").content
     assert "SAVED_PREFIX_649" in retained
-    assert "FINAL_WRITE_ERROR_396" in retained
+    assert "FINAL_WRITE_ERROR_396" in capture.preview()
+    assert "FINAL_WRITE_ERROR_396" not in retained
     assert capture.describe()["retained_output_complete"] is False
 
 
-def test_decoding_expansion_preserves_latest_diagnostic_within_spool_budget(
+def test_decoding_expansion_does_not_truncate_execution_log(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from functools import partial
 
-    from opensquilla.subprocess_encoding import decode_subprocess_output
+    from opensquilla.subprocess_encoding import (
+        decode_subprocess_output,
+        select_subprocess_output_encoding,
+    )
     from opensquilla.tools import output_capture
 
     monkeypatch.setattr(output_capture, "decode_subprocess_output", partial(
         decode_subprocess_output, fallback_encoding="cp936",
     ))
+    monkeypatch.setattr(output_capture, "select_subprocess_output_encoding", partial(
+        select_subprocess_output_encoding, fallback_encoding="cp936",
+    ))
     capture = BoundedOutputCapture()
-    capture.spool = _spool(ToolResultStore(tmp_path), size=128)
+    capture.spool = _spool(ToolResultStore(tmp_path))
     raw = ("中" * 48 + "FINAL_EIO_748").encode("cp936")
-    assert len(raw) < capture.spool.max_bytes < len(raw.decode("cp936").encode())
+    assert len(raw) < 128 < len(raw.decode("cp936").encode())
     capture.feed(raw)
     capture.finish()
     assert capture.handle is not None
     record = ToolResultStore(tmp_path).read(capture.handle, session_id="test-session")
     assert "FINAL_EIO_748" in record.content
-    assert record.size_bytes <= capture.spool.max_bytes
-    assert capture.describe()["retained_output_complete"] is False
+    assert capture.describe()["retained_output_complete"] is True
 
 
-@pytest.mark.parametrize("spool_bytes", [1, 4, 5, 6, 127, 128])
-def test_capped_multistream_frames_never_expand_disk_budget(
-    tmp_path: Path, spool_bytes: int,
-) -> None:
+def test_multistream_output_preserves_complete_frames(tmp_path: Path) -> None:
     capture = BoundedOutputCapture(streams=("stdout", "stderr"))
-    capture.spool = _spool(ToolResultStore(tmp_path), size=spool_bytes)
+    capture.spool = _spool(ToolResultStore(tmp_path))
     capture.feed("prefix你好".encode(), "stdout")
     capture.feed(b"x" * 256 + b"FINAL_FRAME_684", "stderr")
     capture.finish()
     assert capture.handle is not None
     record = ToolResultStore(tmp_path).read(capture.handle, session_id="test-session")
-    assert record.size_bytes <= spool_bytes
-    assert capture.spool.size <= spool_bytes
-    assert capture.describe()["retained_output_complete"] is False
-    if spool_bytes >= 127:
-        assert "FINAL_FRAME_684" in record.content
+    assert "prefix你好" in record.content
+    assert "FINAL_FRAME_684" in record.content
+    assert capture.describe()["retained_output_complete"] is True
 
 
 
@@ -773,7 +785,7 @@ async def test_finalization_waits_for_output_writer_before_closing_lease(
         assert not capture.finished
         assert capture.handle is None
         assert not capture.spool.lease.closed
-        assert store._iter_record_stats()[0].active
+        assert store._iter_output_stats()[0].active
     finally:
         release.set()
         await asyncio.wait_for(asyncio.gather(writer, finalizer), timeout=2)
@@ -795,12 +807,12 @@ async def test_finalization_waits_for_retained_output_and_is_idempotent(
     original_finish = capture.spool.finish
     calls = 0
 
-    def delayed_finish(text: str) -> str:
+    def delayed_finish(**kwargs) -> str:
         nonlocal calls
         calls += 1
         entered.set()
         assert release.wait(timeout=5)
-        return original_finish(text)
+        return original_finish(**kwargs)
 
     monkeypatch.setattr(capture.spool, "finish", delayed_finish)
     capture.feed(b"result already produced")
@@ -939,3 +951,272 @@ async def test_unregistered_background_spawn_cleanup_survives_repeated_stop(
     release.set()
     await asyncio.wait_for(cleaned.wait(), timeout=1)
     assert all(not path.exists() for path in paths)
+
+
+def test_full_log_finalization_and_middle_reads_keep_memory_bounded(tmp_path: Path) -> None:
+    import tracemalloc
+
+    capture = BoundedOutputCapture(preview_bytes=128)
+    store = ToolResultStore(tmp_path)
+    capture.spool = _spool(store)
+    chunk = b"x" * 65536
+    for _ in range(160):
+        capture.feed(chunk)
+    capture.feed(b"MIDDLE_FAILURE_731\n")
+    for _ in range(32):
+        capture.feed(chunk)
+    tracemalloc.start()
+    try:
+        capture.finish()
+        text, total = capture.read_slice(
+            160 * len(chunk), 160 * len(chunk) + len("MIDDLE_FAILURE_731\nx"),
+        )
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    assert text == "MIDDLE_FAILURE_731\nx"
+    assert total == 192 * len(chunk) + len(b"MIDDLE_FAILURE_731\n")
+    assert peak < 4 * 1024 * 1024
+    assert capture.describe()["retained_output_complete"] is True
+    assert capture.spool.path.stat().st_size == total
+
+
+def test_execution_log_expiry_is_separate_and_protects_active_writers(tmp_path: Path) -> None:
+    store = ToolResultStore(tmp_path)
+    active = _spool(store)
+    completed = _spool(store)
+    try:
+        active.append(b"active")
+        completed.append(b"complete")
+        handle = completed.finish()
+        os.utime(active.path, (1, 1))
+        os.utime(completed.path, (1, 1))
+        # Ordinary snapshots cannot delete logs, even with zero retention.
+        store.write(
+            "new snapshot", tool_use_id="call", tool_name="test",
+            session_id="test-session", session_key="test-session", agent_id="main",
+            retention_seconds=0, disk_budget_bytes=32,
+        )
+        assert store.read(handle, session_id="test-session").content == "complete"
+        other = _spool(store)
+        other.close()
+        assert active.path.exists()
+        assert not completed.path.exists()
+    finally:
+        active.close()
+        completed.close()
+
+
+def test_execution_log_metadata_and_reads_enforce_session_scope(tmp_path: Path) -> None:
+    store = ToolResultStore(tmp_path)
+    spool = store.open_output_spool(
+        tool_name="exec", session_id="session:a", session_key="session:a", agent_id="main",
+    )
+    spool.append(b"private synthetic output")
+    handle = spool.finish()
+    # These different session names deliberately share a sanitized directory.
+    with pytest.raises(ValueError, match="session mismatch"):
+        store.read_output_metadata(handle, session_id="session/a")
+    with pytest.raises(ValueError, match="session mismatch"):
+        list(store.iter_text_chunks(handle, session_id="session/a"))
+
+
+def test_execution_log_metadata_counts_lines_across_chunk_boundaries(tmp_path: Path) -> None:
+    capture = BoundedOutputCapture()
+    store = ToolResultStore(tmp_path)
+    capture.spool = _spool(store)
+    text = "x" * 65535 + "\r\nnext\rfinal\x85last\u2028"
+    capture.feed(text.encode())
+    capture.finish()
+    meta = store.read_output_metadata(capture.handle, session_id="test-session")
+    assert meta["chars"] == len(text)
+    assert meta["line_count"] == len(text.splitlines())
+    assert "".join(store.iter_text_chunks(
+        capture.handle, session_id="test-session", chunk_size=1,
+    )) == text
+
+
+def test_active_log_pages_do_not_emit_a_partial_utf8_character(tmp_path: Path) -> None:
+    capture = BoundedOutputCapture()
+    store = ToolResultStore(tmp_path)
+    capture.spool = _spool(store)
+    try:
+        character = "你".encode()
+        capture.feed(b"start " + character[:2])
+        first, count = capture.read_slice(0, 100)
+        assert (first, count) == ("start ", 6)
+        capture.feed(character[2:] + "好\nend".encode())
+        rest, count = capture.read_slice(len(first), 100)
+        assert (rest, count) == ("你好\nend", 12)
+        capture.finish()
+        assert first + rest == store.read(capture.handle, session_id="test-session").content
+    finally:
+        capture.spool.close()
+
+
+@pytest.mark.parametrize("written_bytes", [0, 3, 5, 8])
+def test_partial_frame_write_preserves_saved_bytes_and_marks_log_incomplete(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, written_bytes: int,
+) -> None:
+    capture = BoundedOutputCapture(streams=("stdout", "stderr"))
+    store = ToolResultStore(tmp_path)
+    capture.spool = _spool(store)
+    capture.feed(b"saved output", "stdout")
+    original_write = capture.spool.output.write
+
+    def short_write(chunk: bytes) -> int:
+        return original_write(chunk[:written_bytes])
+
+    monkeypatch.setattr(capture.spool.output, "write", short_write)
+    capture.feed(b"last diagnostic", "stderr")
+    capture.finish()
+    assert capture.storage_error == "OSError"
+    assert capture.handle is not None
+    meta = store.read_output_metadata(capture.handle, session_id="test-session")
+    assert meta["complete"] is False
+    assert meta["stored_size_bytes"] == capture.spool.path.stat().st_size
+    assert "saved output" in store.read(capture.handle, session_id="test-session").content
+    if written_bytes > 5:
+        assert "[stderr]\nlas" in store.read(capture.handle, session_id="test-session").content
+    assert "last diagnostic" in capture.preview("stderr")
+    assert "not a full log" in capture.notice()
+
+
+def test_finalization_publishes_metadata_after_content_is_available(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from opensquilla.engine import tool_result_store
+
+    capture = BoundedOutputCapture()
+    store = ToolResultStore(tmp_path)
+    capture.spool = _spool(store)
+    capture.feed(b"finished output")
+    original_write = tool_result_store._atomic_write_bytes
+
+    def publish_metadata(path: Path, content: bytes) -> None:
+        assert capture.spool.path.name == "content.bin"
+        assert capture.spool.path.read_bytes() == b"finished output"
+        assert not capture.spool.lease.closed
+        original_write(path, content)
+
+    monkeypatch.setattr(tool_result_store, "_atomic_write_bytes", publish_metadata)
+    capture.finish()
+    assert capture.handle is not None
+    assert capture.spool.lease.closed
+    assert store.read(capture.handle, session_id="test-session").content == "finished output"
+
+
+def test_metadata_write_failure_does_not_publish_a_complete_log(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from opensquilla.engine import tool_result_store
+
+    capture = BoundedOutputCapture()
+    store = ToolResultStore(tmp_path)
+    capture.spool = _spool(store)
+    capture.feed(b"finished output")
+
+    def failed_metadata_write(path: Path, content: bytes) -> None:
+        raise OSError(28, "synthetic metadata disk full")
+
+    monkeypatch.setattr(tool_result_store, "_atomic_write_bytes", failed_metadata_write)
+    capture.finish()
+    assert capture.handle is None
+    assert capture.storage_error == "OSError"
+    assert capture.spool.output.closed and capture.spool.lease.closed
+    assert capture.spool.path.read_bytes() == b"finished output"
+    assert not (capture.spool.record_dir / "meta.json").exists()
+    assert capture.describe()["retained_output_complete"] is False
+
+
+@pytest.mark.parametrize("field,value", [
+    ("streams", [[]]), ("encodings", []), ("decoder_final", ["yes"]),
+    ("size_bytes", -1), ("chars", "12"), ("encodings", ["unknown-codec"]),
+])
+def test_malformed_execution_log_metadata_returns_a_read_error(
+    tmp_path: Path, field: str, value: object,
+) -> None:
+    store = ToolResultStore(tmp_path)
+    spool = _spool(store)
+    spool.append(b"output")
+    handle = spool.finish()
+    metadata_path = spool.record_dir / "meta.json"
+    metadata = json.loads(metadata_path.read_text())
+    metadata[field] = value
+    metadata_path.write_text(json.dumps(metadata))
+    with pytest.raises(ValueError, match="invalid tool output"):
+        list(store.iter_text_chunks(handle, session_id="test-session"))
+
+
+def test_execution_log_detects_truncated_stored_payload(tmp_path: Path) -> None:
+    store = ToolResultStore(tmp_path)
+    spool = _spool(store)
+    spool.append(b"output")
+    handle = spool.finish()
+    spool.path.write_bytes(b"out")
+    with pytest.raises(ValueError, match="size mismatch"):
+        store.read_output_metadata(handle, session_id="test-session")
+
+
+@pytest.mark.parametrize("encoding", [None, "cp936", "cp932", "invalid-encoding"])
+@pytest.mark.parametrize("raw", [b"plain", "UTF8你好🙂".encode(), b"\xc2\x80", b"\xe4\xbd"])
+def test_streaming_encoding_selection_matches_existing_decoder(encoding, raw) -> None:
+    import codecs
+
+    from opensquilla.subprocess_encoding import (
+        decode_subprocess_output,
+        select_subprocess_output_encoding,
+    )
+
+    chunks = [raw[index:index + 1] for index in range(len(raw))]
+    selected, final = select_subprocess_output_encoding(chunks, fallback_encoding=encoding)
+    decoder = codecs.getincrementaldecoder(selected)("replace")
+    content = "".join(decoder.decode(chunk, final=False) for chunk in chunks)
+    content += decoder.decode(b"", final=final)
+    assert content == decode_subprocess_output(raw, fallback_encoding=encoding)
+
+
+@pytest.mark.parametrize("completed", [False, True])
+async def test_process_log_reads_middle_beyond_saved_preview(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, completed: bool,
+) -> None:
+    from types import SimpleNamespace
+    from typing import cast
+
+    token = current_tool_context.set(ToolContext(
+        session_key="test-session", tool_result_store_dir=str(tmp_path),
+    ))
+    capture = await BoundedOutputCapture.create("background_process")
+    try:
+        chunk = b"x" * (64 * 1024)
+        for _ in range(160):
+            capture.feed(chunk)
+        middle = "唯一的中间错误\r\n"
+        capture.feed(middle.encode())
+        for _ in range(160):
+            capture.feed(chunk)
+        assert middle not in capture.preview()
+        if completed:
+            await capture.finish_async()
+            capture.release_preview()
+        session = shell._BgSession(
+            session_id="full-log-test", command="synthetic command",
+            process=cast(asyncio.subprocess.Process, SimpleNamespace(
+                returncode=0 if completed else None,
+            )), session_key="test-session", output_capture=capture, done=completed,
+            output_lines=["synthetic process status"],
+        )
+        monkeypatch.setitem(shell._bg_sessions, session.session_id, session)
+        offset = len(chunk) * 160
+        first = json.loads(await shell.process(
+            "log", session_id=session.session_id, offset=offset, limit=4,
+        ))
+        second = json.loads(await shell.process(
+            "log", session_id=session.session_id, offset=offset + 4, limit=len(middle) - 4,
+        ))
+        assert first["output"] + second["output"] == middle
+        assert first["total_chars"] == len(chunk) * 320 + len(middle)
+        assert "capture" not in first["output"]
+    finally:
+        await capture.finish_async()
+        current_tool_context.reset(token)

@@ -5451,6 +5451,17 @@ class Agent:
             result,
             tool_call=tool_call,
         )
+        projected_result.execution_log_handle = result.execution_log_handle
+        if (
+            result.execution_log_handle
+            and projected_result.content != result.content
+            and result.execution_log_handle not in projected_result.content
+        ):
+            # The projection snapshot contains the tool preview, not the full
+            # execution output. Keep the original log address available too.
+            projected_result.content += (
+                f"\nexecution_log_handle: {result.execution_log_handle}"
+            )
         self._record_provider_tool_result_projection(result, projected_result)
         return projected_result
 
@@ -11836,6 +11847,7 @@ class Agent:
                                 tool_use_id=projected_pending.tool_use_id,
                                 tool_name=projected_pending.tool_name,
                                 result=projected_pending.content,
+                                execution_log_handle=projected_pending.execution_log_handle,
                                 is_error=projected_pending.is_error,
                                 arguments=tc.arguments,
                                 execution_status=projected_pending.execution_status,
@@ -11884,6 +11896,7 @@ class Agent:
                             tool_use_id=projected_result.tool_use_id,
                             tool_name=projected_result.tool_name,
                             result=projected_result.content,
+                            execution_log_handle=projected_result.execution_log_handle,
                             is_error=projected_result.is_error,
                             arguments=tc.arguments,
                             execution_status=projected_result.execution_status,
@@ -11917,6 +11930,7 @@ class Agent:
                                     tool_use_id=projected_result.tool_use_id,
                                     tool_name=projected_result.tool_name,
                                     result=projected_result.content,
+                                    execution_log_handle=projected_result.execution_log_handle,
                                     is_error=projected_result.is_error,
                                     arguments=tc.arguments,
                                     execution_status=projected_result.execution_status,
@@ -12023,6 +12037,7 @@ class Agent:
                                     tool_use_id=projected_result.tool_use_id,
                                     tool_name=projected_result.tool_name,
                                     result=projected_result.content,
+                                    execution_log_handle=projected_result.execution_log_handle,
                                     is_error=projected_result.is_error,
                                     arguments=tc.arguments,
                                     execution_status=projected_result.execution_status,
@@ -12058,6 +12073,7 @@ class Agent:
                                     tool_use_id=projected_result.tool_use_id,
                                     tool_name=projected_result.tool_name,
                                     result=projected_result.content,
+                                    execution_log_handle=projected_result.execution_log_handle,
                                     is_error=projected_result.is_error,
                                     arguments=tc.arguments,
                                     execution_status=projected_result.execution_status,
@@ -12078,6 +12094,7 @@ class Agent:
                             tool_use_id=projected_result.tool_use_id,
                             tool_name=projected_result.tool_name,
                             result=projected_result.content,
+                            execution_log_handle=projected_result.execution_log_handle,
                             is_error=projected_result.is_error,
                             arguments=tc.arguments,
                             execution_status=projected_result.execution_status,

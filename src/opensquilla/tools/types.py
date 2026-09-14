@@ -21,6 +21,12 @@ current_meta_skill_owner: contextvars.ContextVar[str] = contextvars.ContextVar(
     default="",
 )
 
+# A fresh dictionary per dispatch keeps output references out of tool text and
+# isolates parallel calls. Reader workers can update the shared per-call value.
+current_execution_log: contextvars.ContextVar[dict[str, str] | None] = contextvars.ContextVar(
+    "current_execution_log", default=None,
+)
+
 
 class CallerKind(StrEnum):
     """Entry-point caller type — used in ToolContext for filtering decisions."""

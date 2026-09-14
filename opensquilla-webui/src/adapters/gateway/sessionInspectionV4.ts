@@ -1,4 +1,4 @@
-import type { TransportCallOptions as RpcCallOptions } from './transportTypes'
+import { readTransportFailure, type TransportCallOptions as RpcCallOptions } from './transportTypes'
 import {
   SESSIONS_PREVIEW_METHOD,
   type SessionsPreviewParams,
@@ -9,7 +9,17 @@ import {
   validateSessionsPreviewResult,
 } from '@/contracts/generated/v4/sessionsPreviewValidators.mjs'
 import {
+  SESSIONS_EXECUTION_LOG_READ_METHOD,
+  type SessionsExecutionLogReadResult,
+} from '@/contracts/generated/v4/sessionsExecutionLogRead'
+import {
+  validateSessionsExecutionLogReadParams,
+  validateSessionsExecutionLogReadResult,
+} from '@/contracts/generated/v4/sessionsExecutionLogReadValidators.mjs'
+import {
   SessionInspectionContractError,
+  SessionInspectionLogNotReadyError,
+  type ExecutionLogPage,
   type SessionInspection,
   type SessionInspectionRequestOptions,
 } from '@/modules/sessionInspection'
@@ -140,6 +150,58 @@ export function createV4SessionInspection(
       : null
   }
 
+  async function readExecutionLog(
+    sessionKey: string,
+    handle: string,
+    offset: number,
+    requestOptions: SessionInspectionRequestOptions = {},
+  ): Promise<ExecutionLogPage> {
+    if (!handle.trim() || !Number.isSafeInteger(offset) || offset < 0) {
+      throw new TypeError('An execution log handle and non-negative offset are required.')
+    }
+    const params = { sessionKey: normalizedKey(sessionKey), handle, offset, limit: 12000 }
+    if (!validateSessionsExecutionLogReadParams(params)) {
+      throw new TypeError('Invalid execution log page request.')
+    }
+    let raw: SessionsExecutionLogReadResult
+    try {
+      raw = await rpc.request<SessionsExecutionLogReadResult>(
+        SESSIONS_EXECUTION_LOG_READ_METHOD,
+        params,
+        {
+          signal: requestSignal(requestOptions.signal),
+          timeoutMs: previewTimeoutMs(requestOptions, now),
+          timeoutAction: 'reject',
+          abortAction: 'reject',
+        },
+      )
+    } catch (error) {
+      if (readTransportFailure(error).code === 'NOT_READY') {
+        throw new SessionInspectionLogNotReadyError()
+      }
+      throw error
+    }
+    if (!validateSessionsExecutionLogReadResult(raw)) {
+      throw contractError(SESSIONS_EXECUTION_LOG_READ_METHOD)
+    }
+    const returnedChars = Array.from(raw.content).length
+    const end = raw.offset + returnedChars
+    if (raw.handle !== handle || raw.offset !== Math.min(offset, raw.chars)
+      || raw.returned_chars !== returnedChars || end > raw.chars
+      || raw.next_offset !== (end < raw.chars ? end : null)
+      || (end < raw.chars && returnedChars === 0)) {
+      throw new SessionInspectionContractError('Inconsistent execution log page.')
+    }
+    return Object.freeze({
+      handle,
+      content: raw.content,
+      offset: raw.offset,
+      nextOffset: raw.next_offset,
+      chars: raw.chars,
+      complete: raw.complete,
+    })
+  }
+
   function historyRequest(
     sessionKey: string,
     direction: 'latest' | 'before',
@@ -176,6 +238,7 @@ export function createV4SessionInspection(
 
   return Object.freeze({
     preview,
+    readExecutionLog,
     history: Object.freeze({
       latest: (sessionKey: string, historyOptions?: SessionReadHistoryOptions) =>
         historyRequest(sessionKey, 'latest', null, historyOptions),

@@ -7694,15 +7694,23 @@ async def process(
         )
 
     if action == "log":
-        output = (
-            await session.output_capture.preview_async()
-            + "".join(session.output_lines) + session.output_capture.notice()
-        )
         start = max(0, int(offset or 0))
         requested_limit = 20000 if limit is None else int(limit)
         max_chars = max(0, min(requested_limit, 100000))
         end = start + max_chars
-        sliced = output[start:end]
+        capture = session.output_capture
+        if capture.spool is not None:
+            try:
+                sliced, total_chars = await asyncio.to_thread(capture.read_slice, start, end)
+            except (OSError, ValueError):
+                capture.incomplete_reason = "stored output unavailable; preview only"
+                output = await capture.preview_async()
+                sliced, total_chars = output[start:end], len(output)
+        else:
+            # Embedded callers may have no result store. Keep their existing
+            # preview, without mixing capture instructions into log offsets.
+            output = capture.preview() + "".join(session.output_lines)
+            sliced, total_chars = output[start:end], len(output)
         output_details = session.output_capture.describe(only_if_needed=True)
         return json.dumps(
             {
@@ -7712,10 +7720,11 @@ async def process(
                 "output": sliced,
                 "offset": start,
                 "limit": max_chars,
+                "total_chars": total_chars,
                 "truncated": bool(
-                    start > 0 or end < len(output)
-                    or output_details.get("preview_omitted_bytes")
-                    or (output_details and not output_details["retained_output_complete"])
+                    start > 0 or end < total_chars
+                    or capture.storage_error or capture.incomplete_reason
+                    or (capture.spool is None and output_details.get("preview_omitted_bytes"))
                 ),
             }
         )

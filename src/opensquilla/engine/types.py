@@ -218,6 +218,7 @@ class ToolResultEvent:
     effect_outcome: ToolEffectOutcome | None = None
     generation_epoch: int = 0
     tool_presentation: dict[str, Any] | None = None
+    execution_log_handle: str | None = None
 
 
 @dataclass

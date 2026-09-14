@@ -76,6 +76,7 @@ from opensquilla.tools.types import (
     InvalidToolArgumentsError,
     ProjectedToolArgumentsError,
     ToolContext,
+    current_execution_log,
     current_tool_context,
 )
 
@@ -1460,6 +1461,8 @@ def build_tool_handler(
         reservation = reservation_or_control
 
         token = current_tool_context.set(effective_ctx)
+        execution_log: dict[str, str] = {}
+        log_token = current_execution_log.set(execution_log)
         tool_started_at = time.monotonic()
         raw_result: Any = None
         exception: BaseException | None = None
@@ -1543,8 +1546,10 @@ def build_tool_handler(
                         _budget_tracker_for(effective_ctx),
                         registered,
                     )
+                    final_result.execution_log_handle = execution_log.get("handle")
                     return final_result
             finally:
+                current_execution_log.reset(log_token)
                 current_tool_context.reset(token)
 
     # Agent-side lossy projection is only safe when the callable can actually

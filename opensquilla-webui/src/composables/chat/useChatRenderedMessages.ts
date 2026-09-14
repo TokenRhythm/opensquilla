@@ -1546,6 +1546,9 @@ export function useChatRenderedMessages(options: UseChatRenderedMessagesOptions)
         call.isError = toolResultIsError(segment)
         call.status = call.isError ? 'error' : 'success'
         call.result = resultStr
+        if (typeof segment.execution_log_handle === 'string') {
+          call.executionLogHandle = segment.execution_log_handle
+        }
         call.resultPreview = truncate(resultStr, 200)
         if (segment.sources !== undefined) call.sources = segment.sources
       }
@@ -1860,6 +1863,9 @@ function normalizeToolCalls(raw: RawToolCallPayload[] | undefined): ChatToolCall
       item.status = isError ? 'error' : 'success'
     }
     if (tc.sources !== undefined) item.sources = tc.sources
+    if (typeof tc.execution_log_handle === 'string') {
+      item.executionLogHandle = tc.execution_log_handle
+    }
     if (isError) {
       item.isError = true
       item.status = 'error'
@@ -1878,6 +1884,7 @@ function normalizeToolCalls(raw: RawToolCallPayload[] | undefined): ChatToolCall
     isError: item.isError,
     result: item.result,
     resultPreview: item.resultPreview,
+    executionLogHandle: item.executionLogHandle,
     sources: item.sources,
     isOpen: false,
     presentation: item.presentation,

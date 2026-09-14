@@ -1430,6 +1430,8 @@ def _persisted_tool_result_segment(
     }
     if event.tool_presentation is not None:
         segment["tool_presentation"] = dict(event.tool_presentation)
+    if event.execution_log_handle is not None:
+        segment["execution_log_handle"] = event.execution_log_handle
     if event.execution_status is not None:
         segment["execution_status"] = normalize_execution_status(event.execution_status)
 

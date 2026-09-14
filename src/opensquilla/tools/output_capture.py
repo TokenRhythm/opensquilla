@@ -1,7 +1,7 @@
-"""Bounded process-output capture, with retained fragments in ToolResultStore.
+"""Bounded process-output previews backed by complete execution logs.
 
-Readers await each write before reading again. There is no producer queue, and
-neither reaching the output budget nor a storage failure stops draining pipes.
+Readers await each write before reading again. There is no producer queue.
+Physical storage failures remain explicit while readers continue draining pipes.
 """
 
 from __future__ import annotations
@@ -14,12 +14,16 @@ from pathlib import Path
 from typing import Any
 
 from opensquilla.engine.tool_result_store import (
-    DEFAULT_TOOL_RESULT_MAX_BYTES,
     ToolOutputSpool,
     ToolResultStore,
+    _iter_output_text,
+    iter_output_bytes,
 )
-from opensquilla.subprocess_encoding import decode_subprocess_output
-from opensquilla.tools.types import current_tool_context
+from opensquilla.subprocess_encoding import (
+    decode_subprocess_output,
+    select_subprocess_output_encoding,
+)
+from opensquilla.tools.types import current_execution_log, current_tool_context
 
 OUTPUT_PREVIEW_BYTES = 1024 * 1024
 OUTPUT_READ_BYTES = 64 * 1024
@@ -64,8 +68,7 @@ class _Preview:
     def latest(self, limit: int) -> bytes:
         if limit <= 0:
             return b""
-        # Until head fills, the newest bytes still live there rather than in
-        # tail. A small disk budget can be exhausted well before that happens.
+        # Until head fills, the newest bytes still live there rather than in tail.
         return bytes(self.head[-limit:] + self.tail)[-limit:]
 
 
@@ -113,17 +116,12 @@ class BoundedOutputCapture:
                 ToolResultStore(root).open_output_spool,
                 tool_name=tool_name, session_id=session_id,
                 session_key=ctx.session_key or session_id, agent_id=ctx.agent_id or "main",
-                max_bytes=min(
-                    DEFAULT_TOOL_RESULT_MAX_BYTES,
-                    ctx.tool_result_store_max_bytes
-                    if ctx.tool_result_store_max_bytes is not None
-                    else DEFAULT_TOOL_RESULT_MAX_BYTES,
-                ),
-                disk_budget_bytes=ctx.tool_result_store_disk_budget_bytes,
                 retention_seconds=ctx.tool_result_store_retention_seconds,
             ))
             try:
                 capture.spool = await asyncio.shield(opening)
+                if (execution_log := current_execution_log.get()) is not None:
+                    execution_log["handle"] = capture.spool.handle
             except asyncio.CancelledError:
                 # A thread cannot be cancelled. Settle the open operation and
                 # close its lease before relinquishing ownership.
@@ -155,8 +153,7 @@ class BoundedOutputCapture:
                         # Retain original bytes until each stream's encoding
                         # can be selected independently. Python subprocesses
                         # can mix UTF-8 with a native child's Windows code page.
-                        # Framing shares the existing spool cap, including a
-                        # final partial frame when that cap is reached.
+                        # Frames preserve byte boundaries without truncating the log.
                         for offset in range(0, len(chunk), OUTPUT_READ_BYTES):
                             fragment = chunk[offset:offset + OUTPUT_READ_BYTES]
                             self.spool.append(_OUTPUT_FRAME_HEADER.pack(
@@ -223,7 +220,6 @@ class BoundedOutputCapture:
             )
             if only_if_needed and not (
                 omitted or self.storage_error or self.incomplete_reason
-                or (self.spool is not None and self.spool.size >= self.spool.max_bytes)
             ):
                 return {}
             result: dict[str, Any] = {
@@ -233,7 +229,7 @@ class BoundedOutputCapture:
                 "retained_output_complete": bool(
                     self.finished and self.handle
                     and not self.storage_error and not self.incomplete_reason
-                    and self.spool is not None and self.spool.size < self.spool.max_bytes
+                    and self.spool is not None
                 ),
             }
             if self.handle:
@@ -254,7 +250,7 @@ class BoundedOutputCapture:
         if info.get("tool_result_handle"):
             details.append(f"retained output tool_result_handle={self.handle}")
             if self.retrieval_available:
-                details.append("use retrieve_tool_result to inspect retained fragments")
+                details.append("use retrieve_tool_result to read the execution log")
         if info["preview_omitted_bytes"]:
             details.append(f"preview omitted {info['preview_omitted_bytes']} bytes")
         if not info["retained_output_complete"]:
@@ -274,72 +270,80 @@ class BoundedOutputCapture:
                 self.finished = True
                 return
             try:
-                raw = self.spool.prefix()
-                text = self._decode_retained_prefix(raw)
-                if len(text.encode("utf-8")) > self.spool.max_bytes:
-                    self.incomplete_reason = (
-                        self.incomplete_reason or "retained output exceeded its text budget"
-                    )
-                if (
-                    self.spool.size >= self.spool.max_bytes
-                    or self.storage_error or self.incomplete_reason
-                ):
-                    tail = "\n".join(
-                        f"[{name} latest diagnostics]\n"
-                        + decode_subprocess_output(view.latest(OUTPUT_PREVIEW_BYTES))
-                        for name, view in self.previews.items()
-                    )
-                    marker = "\n[output omitted between retained prefix and latest diagnostics]\n"
-                    # UTF-8 transcoding may expand legacy bytes. Reserve space
-                    # for the latest diagnostic tail and the omission marker.
-                    if len(marker.encode()) > self.spool.max_bytes // 4:
-                        marker = "\n[omitted]\n" if self.spool.max_bytes >= 48 else ""
-                    tail_limit = min(OUTPUT_PREVIEW_BYTES, self.spool.max_bytes // 2)
-                    tail_bytes = tail.encode("utf-8")[-tail_limit:] if tail_limit else b""
-                    room = max(0, self.spool.max_bytes - len(tail_bytes) - len(marker.encode()))
-                    text = (
-                        text.encode("utf-8")[:room].decode("utf-8", errors="ignore")
-                        + marker + tail_bytes.decode("utf-8", errors="ignore")
-                    )
-                encoded = text.encode("utf-8")
-                if len(encoded) > self.spool.max_bytes:
-                    marker = "\n[retained output truncated after decoding]\n"
-                    text = encoded[:self.spool.max_bytes - len(marker.encode())].decode(
-                        "utf-8", errors="ignore"
-                    ) + marker
-                    self.storage_error = self.storage_error or "DecodedOutputLimit"
-                self.retained_bytes = len(text.encode("utf-8"))
-                self.handle = self.spool.finish(text)
+                encodings, decoder_final = self._decoders()
+                self.handle = self.spool.finish(
+                    streams=self._stream_names, encodings=encodings,
+                    decoder_final=decoder_final,
+                    complete=not bool(self.storage_error or self.incomplete_reason),
+                )
+                self.retained_bytes = self.spool.size
             except Exception as exc:
-                # Storage/lock failures must never turn a completed command
-                # into a tool failure or prevent pipe drainage.
                 self.storage_error = type(exc).__name__
             finally:
                 self.spool.close()
                 with self._lock:
                     self.finished = True
 
-    def _decode_retained_prefix(self, raw: bytes) -> str:
-        if not self._framed_output:
-            return decode_subprocess_output(raw)
-        # These buffers together cannot exceed the one bounded spool prefix.
-        # Grouping by stream preserves multibyte characters split across reads
-        # and avoids decoding already-transcoded UTF-8 as a legacy code page.
-        streams = [bytearray() for _ in self._stream_names]
+    def _decoders(self, *, max_bytes: int | None = None) -> tuple[
+        tuple[str, ...], tuple[bool, ...],
+    ]:
+        assert self.spool is not None
+        selected = [
+            select_subprocess_output_encoding(iter_output_bytes(
+                self.spool.path, stream_index=index, framed=self._framed_output,
+                max_bytes=max_bytes, stream_count=len(self._stream_names),
+            ))
+            for index in range(len(self._stream_names))
+        ]
+        return tuple(item[0] for item in selected), tuple(item[1] for item in selected)
+
+    def read_slice(self, start: int, end: int | None = None) -> tuple[str, int]:
+        """Read a character range of the actual log, rather than its preview.
+
+        The caller bounds the requested range and runs this disk operation off
+        the event loop. Open a separate reader so writers keep their position.
+        """
+        start = max(0, start)
+        if end is None:
+            end = start + OUTPUT_PREVIEW_BYTES
+        end = max(start, end)
+        if self.spool is None:
+            text = self.preview()
+            return text[start:end], len(text)
+        total_chars = None
+        if self.handle:
+            meta = self.spool.store.read_output_metadata(
+                self.handle, session_id=self.spool.session_id,
+            )
+            total_chars = int(meta["chars"]) if meta is not None else None
+            chunks = self.spool.store.iter_text_chunks(
+                self.handle, session_id=self.spool.session_id,
+            )
+        else:
+            # Snapshot only the byte count under the writer lock. Readers do
+            # not hold it while scanning, and ignore subsequent appended frames.
+            with self._write_lock:
+                size = self.spool.size
+            encodings, decoder_final = self._decoders(max_bytes=size)
+            if not self.finished:
+                # A running process can append the rest of a character on its
+                # next write. Do not expose a replacement at the temporary EOF
+                # and then shift previously returned character offsets.
+                decoder_final = (False,) * len(self._stream_names)
+            chunks = _iter_output_text(
+                self.spool.path, self._stream_names, encodings, decoder_final,
+                max_bytes=size,
+            )
         offset = 0
-        while offset + _OUTPUT_FRAME_HEADER.size <= len(raw):
-            stream_index, size = _OUTPUT_FRAME_HEADER.unpack_from(raw, offset)
-            offset += _OUTPUT_FRAME_HEADER.size
-            if stream_index >= len(streams) or size > OUTPUT_READ_BYTES:
-                raise ValueError("invalid retained output frame")
-            end = min(len(raw), offset + size)
-            streams[stream_index].extend(raw[offset:end])
-            offset = end
-        return "".join(
-            f"\n[{name}]\n{decode_subprocess_output(bytes(content))}"
-            for name, content in zip(self._stream_names, streams, strict=True)
-            if content
-        )
+        parts = []
+        for text in chunks:
+            next_offset = offset + len(text)
+            if next_offset > start and offset < end:
+                parts.append(text[max(0, start - offset):max(0, end - offset)])
+            offset = next_offset
+            if next_offset >= end and total_chars is not None:
+                break
+        return "".join(parts), total_chars if total_chars is not None else offset
 
     async def finish_async(self) -> None:
         # Keep queued file cleanup runnable even if the caller is cancelled.
