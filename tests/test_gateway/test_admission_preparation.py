@@ -97,7 +97,7 @@ async def test_page_context_is_user_content_on_the_normal_owner_route(tmp_path, 
 @pytest.mark.parametrize("mutation", ["none", "epoch", "session_id", "binding", "revoked"])
 async def test_preview_registration_rechecks_admitted_authority(tmp_path, monkeypatch, mutation):
     from opensquilla.gateway.execution_workspaces import build_execution_workspace_factory
-    from opensquilla.project_workspaces import ProjectWorkspaceStateError
+    from opensquilla.project_workspaces import ProjectWorkspaceStateError, project_path_key
     from opensquilla.session.manager import SessionManager
     from opensquilla.session.storage import SessionStorage
     from opensquilla.tools.types import ToolContext, current_tool_context
@@ -111,7 +111,7 @@ async def test_preview_registration_rechecks_admitted_authority(tmp_path, monkey
         root = Path(session.execution_workspace["root"])
         if mutation == "revoked":
             project = await storage.create_or_restore_project_workspace(
-                path=str(root), path_key=str(root), display_name="Preview project",
+                path=str(root), path_key=project_path_key(root), display_name="Preview project",
                 trusted_at=1, now_ms=1,
             )
             await storage.bind_session_workspace(session.session_key, project.workspace_id)
