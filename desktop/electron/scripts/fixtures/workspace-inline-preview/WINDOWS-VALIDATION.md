@@ -79,6 +79,8 @@ node scripts/fixtures/workspace-inline-preview/verify-journey.mjs --source-root 
 
 同时检查 `report.json` 的 `cleanAcceptance`、`hydrateContract` 和 `ui-transport.ndjson`。macOS 实测曾出现“后端已完成但界面一直工作中”，后续又观测到 `sessions.messages.hydrate result violated its generated v4 Contract.`。即使网页最终显示，也不能把该契约错误当正常断线或忽略；使用同源生成校验器给出的脱敏字段路径定位，不能放宽 schema、删除断言或自动刷新掩盖它。
 
+该契约错误已用真实 adapter、wire codec 和生成校验器在内存中复现：客户端 `WEB_RPC_PROTOCOL_VERSION=3`，后端将运行中锁定的 `safe` 编码为旧别名 `trusted`；v4 hydrate 契约的 `/run_mode_lock/runMode` 只允许 `safe/full`，因此拒绝。空闲时省略字段，以及 `full`、v4 的 `safe` 对照均通过。先检查待验收 head 是否已有正式兼容修复；没有修复时保留失败，不改成 Full 模式规避，也不要在此验收任务里擅自升级全局协议或放宽校验。
+
 ### Web 必须观察到
 
 1. 普通任务 A/B 用同一相对路径生成不同标识的页面，持久根目录不同。
