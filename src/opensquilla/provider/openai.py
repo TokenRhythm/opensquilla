@@ -5600,8 +5600,9 @@ class OpenAIProvider:
                     headers=fallback_headers,
                     json=fallback_payload,
                 )
-        except httpx.TimeoutException as exc:
-            code = CONNECTION_FAILED_CODE if is_connection_failure(exc) else "timeout"
+        except httpx.TimeoutException:
+            # The earlier stream may have been accepted; keep compatibility retries finite.
+            code = "timeout"
             safe_error = redact_upstream_error_text(
                 f"Request timed out: {str(timeout_exc) or repr(timeout_exc)}",
                 api_key=self._api_key,
@@ -5621,7 +5622,7 @@ class OpenAIProvider:
             yield ErrorEvent(message=safe_error, code=code)
             return
         except httpx.RequestError as exc:
-            code = CONNECTION_FAILED_CODE if is_connection_failure(exc) else "request_error"
+            code = "request_error"
             safe_error = redact_upstream_error_text(
                 f"Request error: {str(exc) or repr(exc)}",
                 api_key=self._api_key,

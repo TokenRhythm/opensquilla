@@ -1,14 +1,17 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from collections import Counter
 
+import httpx
 import pytest
 
 from opensquilla.engine import Agent, AgentConfig
 from opensquilla.engine.routing.health import ProviderHealthLedger
 from opensquilla.engine.runtime import _SelectorFallbackProvider
 from opensquilla.provider.failures import ProviderFailureKind
+from opensquilla.provider.openai import OpenAIProvider
 from opensquilla.provider.selector import ModelSelector, ProviderConfig, SelectorConfig
 from opensquilla.provider.types import (
     ChatConfig,
@@ -77,6 +80,45 @@ def _agent(provider, **config):
     ))
 
 
+class _InterruptedOpenAIStream(httpx.AsyncByteStream):
+    def __init__(self, prefix=b""):
+        self.prefix = prefix
+
+    async def __aiter__(self):
+        if self.prefix:
+            yield self.prefix
+        raise httpx.ReadTimeout("stream interrupted after HTTP 200")
+
+
+def _openai_success():
+    return httpx.Response(200, headers={"content-type": "text/event-stream"}, content=(
+        b'data: {"choices":[{"delta":{"content":"recovered"},"finish_reason":"stop"}]}'
+        b'\n\ndata: [DONE]\n\n'
+    ))
+
+
+def _openai_wrapper(monkeypatch, handler, *, secondary=False):
+    original_client = httpx.AsyncClient
+
+    def client(*args, **kwargs):
+        kwargs.pop("proxy", None)
+        kwargs["transport"] = httpx.MockTransport(handler)
+        return original_client(*args, **kwargs)
+
+    monkeypatch.setattr(httpx, "AsyncClient", client)
+    configs = [ProviderConfig(
+        provider="openai", model=name, api_key="dummy", base_url=f"https://{name}.test",
+    ) for name in (["primary", "secondary"] if secondary else ["primary"])]
+    monkeypatch.setattr("opensquilla.provider.selector._build_provider", lambda config: (
+        OpenAIProvider(
+            api_key=config.api_key, model=config.model,
+            base_url=config.base_url, provider_kind="openrouter",
+        )
+    ))
+    selector = ModelSelector(SelectorConfig(primary=configs[0], fallbacks=configs[1:]))
+    return _SelectorFallbackProvider(selector.resolve(), selector)
+
+
 @pytest.fixture
 async def clock(monkeypatch):
     loop = asyncio.get_running_loop()
@@ -92,6 +134,117 @@ async def clock(monkeypatch):
     monkeypatch.setattr(loop, "time", lambda: now[0])
     monkeypatch.setattr("opensquilla.engine.fallback.asyncio.sleep", sleep)
     return now, delays
+
+
+@pytest.mark.parametrize("error_type", [httpx.ConnectError, httpx.ConnectTimeout])
+async def test_compat_connection_failure_keeps_finite_retry_budget(monkeypatch, clock, error_type):
+    calls = []
+
+    def handler(request):
+        streaming = json.loads(request.content)["stream"]
+        calls.append(streaming)
+        if streaming:
+            # A later success makes an accidental persistent retry fail promptly.
+            if calls.count(True) >= 7:
+                return _openai_success()
+            return httpx.Response(
+                200, headers={"content-type": "text/event-stream"},
+                stream=_InterruptedOpenAIStream(),
+            )
+        raise error_type("non-stream connection failed", request=request)
+
+    provider = _openai_wrapper(monkeypatch, handler)
+    events = [event async for event in _agent(
+        provider, timeout=1800, max_provider_retries=3,
+    ).run_turn("run")]
+
+    assert calls == [True, False] * 4
+    expected = "timeout" if error_type is httpx.ConnectTimeout else "request_error"
+    assert [event.code for event in events if event.kind == "error"] == [expected]
+    assert not any(event.kind == "done" for event in events)
+    assert not any(
+        event.kind == "provider_activity" and event.phase == "retry_wait" and event.retry_limit == 0
+        for event in events
+    )
+
+
+@pytest.mark.parametrize("error_type", [httpx.ConnectError, httpx.ConnectTimeout])
+async def test_first_request_connection_failure_still_recovers(monkeypatch, clock, error_type):
+    calls = []
+
+    def handler(request):
+        calls.append(json.loads(request.content)["stream"])
+        if len(calls) < 7:
+            raise error_type("first request connection failed", request=request)
+        return _openai_success()
+
+    provider = _openai_wrapper(monkeypatch, handler)
+    events = [event async for event in _agent(
+        provider, timeout=1800, max_provider_retries=3,
+    ).run_turn("run")]
+
+    assert calls == [True] * 7
+    assert [delay for delay in clock[1] if delay > 0] == [5, 10, 20, 40, 60, 60]
+    waits = [event for event in events if (
+        event.kind == "provider_activity" and event.phase == "retry_wait"
+    )]
+    assert [event.retry_limit for event in waits] == [0] * 6
+    assert not any(event.kind == "error" for event in events)
+    assert any(event.kind == "done" and event.text == "recovered" for event in events)
+
+
+@pytest.mark.parametrize("error_type", [httpx.ConnectError, httpx.ConnectTimeout])
+async def test_compat_connection_failure_can_use_configured_fallback(
+    monkeypatch, clock, error_type,
+):
+    calls = []
+
+    def handler(request):
+        streaming = json.loads(request.content)["stream"]
+        calls.append((request.url.host, streaming))
+        if request.url.host == "secondary.test" or calls.count(("primary.test", True)) >= 7:
+            return _openai_success()
+        if streaming:
+            return httpx.Response(
+                200, headers={"content-type": "text/event-stream"},
+                stream=_InterruptedOpenAIStream(),
+            )
+        raise error_type("non-stream connection failed", request=request)
+
+    provider = _openai_wrapper(monkeypatch, handler, secondary=True)
+    events = [event async for event in _agent(provider, timeout=1800).run_turn("run")]
+
+    assert calls == [("primary.test", True), ("primary.test", False), ("secondary.test", True)]
+    assert not any(event.kind == "error" for event in events)
+    assert any(event.kind == "done" and event.text == "recovered" for event in events)
+
+
+@pytest.mark.parametrize("delta", [{"content": "partial"}, {"reasoning_content": "reasoning"}])
+async def test_stream_timeout_after_content_does_not_resend_compat_or_fallback(
+    monkeypatch, clock, delta,
+):
+    calls = []
+    prefix = f'data: {json.dumps({"choices": [{"delta": delta, "finish_reason": None}]})}\n\n'
+
+    def handler(request):
+        calls.append((request.url.host, json.loads(request.content)["stream"]))
+        if request.url.host == "secondary.test":
+            return _openai_success()
+        return httpx.Response(
+            200, headers={"content-type": "text/event-stream"},
+            stream=_InterruptedOpenAIStream(prefix.encode()),
+        )
+
+    provider = _openai_wrapper(monkeypatch, handler, secondary=True)
+    events = [event async for event in _agent(provider, timeout=1800).run_turn("run")]
+
+    assert calls == [("primary.test", True)]
+    expected_kind = "text_delta" if "content" in delta else "thinking"
+    assert any(
+        event.kind == expected_kind and event.text == next(iter(delta.values())) for event in events
+    )
+    assert any(event.kind == "error" for event in events)
+    assert not any(event.kind == "done" for event in events)
 
 
 @pytest.mark.parametrize("retries", [0, 1, 3])
