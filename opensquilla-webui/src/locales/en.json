@@ -1,6 +1,7 @@
 {
   "resourceActions": {
-    "more": "File actions", "openSource": "Open original file", "reveal": "Show in file manager",
+    "more": "File actions", "preview": "Preview in app", "openSource": "Open with default app",
+    "reveal": "Show in file manager", "revealFinder": "Reveal in Finder", "revealExplorer": "Show in File Explorer",
     "openCopy": "Open a local copy", "saveAs": "Save as…", "copyPath": "Copy path",
     "copyGatewayPath": "Copy server path", "copyContents": "Copy file contents", "saved": "File saved",
     "singleFile": "Save this HTML file only; linked styles, images and pages are not included.",

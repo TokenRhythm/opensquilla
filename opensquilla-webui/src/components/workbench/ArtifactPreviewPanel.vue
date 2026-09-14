@@ -13,7 +13,7 @@
         <span class="artifact-preview__meta">{{ artifactFileSubtitle(artifact) }}</span>
       </span>
       <span class="artifact-preview__actions">
-        <ResourceActionsMenu :artifact="artifact" :session-key="sessionKey" trigger @open="reloadPreview" />
+        <ResourceActionsMenu :artifact="artifact" :session-key="sessionKey" :previewable="false" trigger />
         <button
           v-if="preview.kind.value !== 'unsupported'"
           type="button"

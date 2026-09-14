@@ -1157,7 +1157,8 @@ const activitySummaryLabel = computed(() => {
       activityCompactElapsedLabel.value,
     ].filter(Boolean).join(' · '))
   }
-  if (documentWriterFailureCount.value > 0) {
+  // Individual tool failures may recover; only legacy rows need this fallback.
+  if (!props.message.turnOutcome && documentWriterFailureCount.value > 0) {
     return withMaintenanceSummary([
       String(t('sessions.status.failed')),
       activityCompactElapsedLabel.value,

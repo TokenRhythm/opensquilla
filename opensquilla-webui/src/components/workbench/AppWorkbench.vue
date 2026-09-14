@@ -35,7 +35,7 @@
     <template #actions="{ item }">
       <ResourceActionsMenu v-if="item && resourceActionArtifact(item)" :key="item.id"
         :artifact="resourceActionArtifact(item)!" :session-key="sessionKeyFromWorkbenchItem(item)"
-        trigger @open="performPanelAction(item, 'refresh')" />
+        :previewable="false" trigger />
       <select
         v-if="artifactNavigationItems(item).length > 1"
         class="app-workbench__switcher"

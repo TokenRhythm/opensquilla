@@ -1,6 +1,7 @@
 {
   "resourceActions": {
-    "more": "Acciones de archivo", "openSource": "Abrir archivo original", "reveal": "Mostrar en el gestor de archivos",
+    "more": "Acciones de archivo", "preview": "Vista previa en la aplicación", "openSource": "Abrir con la aplicación predeterminada",
+    "reveal": "Mostrar en el gestor de archivos", "revealFinder": "Mostrar en Finder", "revealExplorer": "Mostrar en el Explorador de archivos",
     "openCopy": "Abrir una copia local", "saveAs": "Guardar como…", "copyPath": "Copiar ruta",
     "copyGatewayPath": "Copiar ruta del servidor", "copyContents": "Copiar contenido", "saved": "Archivo guardado",
     "singleFile": "Guardar solo este HTML, sin estilos, imágenes ni páginas vinculadas.",

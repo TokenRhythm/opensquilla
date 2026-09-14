@@ -2205,17 +2205,35 @@ async def test_turn_runner_auto_publishes_deliverable_file_when_model_omits_publ
 
 
 @pytest.mark.asyncio
-async def test_turn_runner_does_not_auto_publish_html_source_when_model_omits_publish(
-    tmp_path,
+@pytest.mark.parametrize(
+    "caller_kind, preview_available, expected_artifacts",
+    [(CallerKind.WEB, True, 0), (CallerKind.WEB, False, 1), (CallerKind.CHANNEL, False, 1)],
+)
+async def test_turn_runner_html_backstop_respects_preview_capability(
+    tmp_path, caller_kind: CallerKind, preview_available: bool, expected_artifacts: int,
 ) -> None:
     storage = SessionStorage(":memory:")
     await storage.connect()
     manager = SessionManager(storage)
-    session_key = "agent:main:webchat:html-source-no-fallback"
-    await manager.create(session_key)
+    surface = "telegram" if caller_kind is CallerKind.CHANNEL else "webchat"
+    session_key = f"agent:main:{surface}:html-source-fallback"
+    session = await manager.create(session_key)
+    registry = _write_file_registry()
+
+    async def unused_preview(*args, **kwargs):
+        raise AssertionError("The omitted-publish provider never opens a preview")
+
+    registry.register(
+        ToolSpec(
+            name="open_workspace_preview",
+            description="Open a workspace preview",
+            parameters={},
+        ),
+        unused_preview,
+    )
     runner = TurnRunner(
         provider_selector=_ProviderSelector(_OmittedHtmlProvider()),
-        tool_registry=_write_file_registry(),
+        tool_registry=registry,
         session_manager=manager,
         config=GatewayConfig(
             attachments=AttachmentsConfig(media_root=str(tmp_path / "media")),
@@ -2224,9 +2242,12 @@ async def test_turn_runner_does_not_auto_publish_html_source_when_model_omits_pu
     )
     tool_context = ToolContext(
         is_owner=True,
-        caller_kind=CallerKind.WEB,
+        caller_kind=caller_kind,
+        # The channel fixture represents an authenticated file-writing operator.
+        channel_admin_verified=caller_kind is CallerKind.CHANNEL,
         workspace_dir=str(tmp_path / "workspace"),
-        allowed_tools={"write_file"},
+        allowed_tools={"write_file", "open_workspace_preview"},
+        workspace_preview_opener=unused_preview if preview_available else None,
         elevated="full",
     )
 
@@ -2242,10 +2263,20 @@ async def test_turn_runner_does_not_auto_publish_html_source_when_model_omits_pu
             )
         ]
 
-        assert not any(isinstance(event, ArtifactEvent) for event in events)
+        artifacts = [event for event in events if isinstance(event, ArtifactEvent)]
+        assert len(artifacts) == expected_artifacts
         transcript = await manager.get_transcript(session_key)
         assistant = [entry for entry in transcript if entry.role == "assistant"][-1]
-        assert assistant.content == "Created site/index.html for preview."
+        if expected_artifacts:
+            payload = json.loads(assistant.content)
+            assert payload["artifacts"][0]["id"] == artifacts[0].id
+            assert payload["artifacts"][0]["source"] == "auto_publish_omitted"
+            _, downloaded = ArtifactStore(tmp_path / "media").resolve_for_download(
+                artifacts[0].id, session_id=session.session_id,
+            )
+            assert downloaded.read_bytes() == (tmp_path / "workspace/site/index.html").read_bytes()
+        else:
+            assert assistant.content == "Created site/index.html for preview."
         assert (tmp_path / "workspace/site/index.html").is_file()
     finally:
         await storage.close()

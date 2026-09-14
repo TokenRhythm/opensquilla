@@ -165,6 +165,37 @@ describe('ArtifactPreviewPanel', () => {
     mounted.unmount()
   })
 
+  it('keeps refreshing on its own toolbar button and omits preview from the file menu', async () => {
+    vi.spyOn(URL, 'createObjectURL').mockReturnValue('about:blank#toolbar-preview')
+    vi.spyOn(URL, 'revokeObjectURL').mockImplementation(() => undefined)
+    const requestBinary = vi.fn().mockResolvedValue(httpBinaryResponse(
+      '<html><body>Preview</body></html>',
+      { contentType: 'text/html' },
+    ))
+    const mounted = mountPanel({ artifact: artifact() }, httpTransportTestDouble({ requestBinary }))
+    await settlePreview()
+    expect(requestBinary).toHaveBeenCalledOnce()
+
+    mounted.element.querySelector<HTMLButtonElement>('.resource-actions-trigger')!.click()
+    await settlePreview()
+    const menu = document.querySelector<HTMLElement>('[role="menu"]')!
+    expect(menu).not.toBeNull()
+    const actions = [...menu.querySelectorAll('[role="menuitem"]')]
+      .map(action => action.textContent?.trim())
+    expect(actions).not.toContain(en.resourceActions.preview)
+    expect(actions).not.toContain(en.workbench.artifactPreview.refresh)
+    expect(requestBinary).toHaveBeenCalledOnce()
+
+    menu.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }))
+    await nextTick()
+    mounted.element.querySelector<HTMLButtonElement>(
+      `[aria-label="${en.workbench.artifactPreview.refresh}"]`,
+    )!.click()
+    await settlePreview()
+    expect(requestBinary).toHaveBeenCalledTimes(2)
+    mounted.unmount()
+  })
+
   it('opens PDFs fitted to the panel width without disabling frame interaction', async () => {
     const onWorkbenchEvent = vi.fn()
     vi.spyOn(URL, 'createObjectURL').mockReturnValue('about:blank?pdf-preview')

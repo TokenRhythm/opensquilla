@@ -1,6 +1,7 @@
 {
   "resourceActions": {
-    "more": "文件操作", "openSource": "打开原文件", "reveal": "在文件管理器中显示",
+    "more": "文件操作", "preview": "在应用中预览", "openSource": "用默认应用打开",
+    "reveal": "在文件管理器中显示", "revealFinder": "在 Finder 中显示", "revealExplorer": "在文件资源管理器中显示",
     "openCopy": "打开本地副本", "saveAs": "另存为…", "copyPath": "复制路径",
     "copyGatewayPath": "复制服务器路径", "copyContents": "复制文件内容", "saved": "文件已保存",
     "singleFile": "仅保存此 HTML 文件，不包含引用的样式、图片和其他页面。",

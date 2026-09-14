@@ -29,10 +29,11 @@ from opensquilla.artifacts import (
     collect_artifact_bundle,
 )
 from opensquilla.tools.path_aliases import resolve_workspace_alias
-from opensquilla.tools.types import ToolContext
+from opensquilla.tools.types import CallerKind, ToolContext
 
 log = logging.getLogger(__name__)
 
+_HTML_SUFFIXES = frozenset({".html", ".htm"})
 _DELIVERABLE_SUFFIXES = frozenset(
     {
         ".csv",
@@ -41,6 +42,7 @@ _DELIVERABLE_SUFFIXES = frozenset(
         ".pptx",
         ".tsv",
         ".xlsx",
+        *_HTML_SUFFIXES,
         *INSTALLER_ARTIFACT_SUFFIXES,
     }
 )
@@ -286,13 +288,13 @@ def auto_publish_omitted_workspace_artifacts(
     final_text: str,
     attached_plan_run_ready: bool | None = None,
 ) -> OmittedArtifactPublishResult:
-    """Publish non-web deliverables the model wrote but forgot to publish.
+    """Publish deliverables the model wrote but forgot to publish.
 
     This is intentionally conservative: a file must be written through a tracked
-    workspace file tool during the current turn, have a non-web deliverable
-    suffix, and be named in the assistant's final text. HTML source files are
-    preview/workspace material and require an explicit ``publish_artifact``
-    call for delivery. Attached PlanRuns additionally require live
+    workspace file tool during the current turn, have a deliverable suffix, and
+    be named in the assistant's final text. HTML is excluded on surfaces that
+    can open workspace previews, but still needs delivery on other surfaces.
+    Attached PlanRuns additionally require live
     delivery-ready authorization resolved before entering this blocking
     filesystem phase.
     """
@@ -316,6 +318,16 @@ def auto_publish_omitted_workspace_artifacts(
     if not records or not final_text.strip():
         return OmittedArtifactPublishResult()
 
+    preview_tool = "open_workspace_preview"
+    can_preview = (
+        ctx.caller_kind is CallerKind.WEB
+        and ctx.is_owner
+        and not ctx.guest_safe
+        and ctx.workspace_preview_opener is not None
+        and preview_tool not in ctx.denied_tools
+        and (ctx.allowed_tools is None or preview_tool in ctx.allowed_tools)
+        and (ctx.authorized_tool_names is None or preview_tool in ctx.authorized_tool_names)
+    )
     workspace = Path(ctx.workspace_dir).resolve()
     store = ArtifactStore(ctx.artifact_media_root)
     published: list[dict[str, Any]] = []
@@ -340,7 +352,7 @@ def auto_publish_omitted_workspace_artifacts(
             # files are tracked for diagnostics and are not deliverables.
             continue
         target = Path(str(record.get("path") or "")).expanduser().resolve(strict=False)
-        if _is_registered_preview_path(
+        if can_preview and _is_registered_preview_path(
             target, workspace=workspace,
             scopes=ctx.workspace_preview_scopes,
         ):
@@ -355,7 +367,8 @@ def auto_publish_omitted_workspace_artifacts(
         relative_path = target.relative_to(workspace)
         if relative_path.parts and relative_path.parts[0] in _EXCLUDED_TOP_LEVEL_DIRS:
             continue
-        if target.suffix.casefold() not in _DELIVERABLE_SUFFIXES:
+        suffix = target.suffix.casefold()
+        if suffix not in _DELIVERABLE_SUFFIXES or (can_preview and suffix in _HTML_SUFFIXES):
             continue
         if not target.is_file():
             continue

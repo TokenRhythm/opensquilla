@@ -1,6 +1,7 @@
 {
   "resourceActions": {
-    "more": "ファイル操作", "openSource": "元のファイルを開く", "reveal": "ファイルマネージャーで表示",
+    "more": "ファイル操作", "preview": "アプリ内でプレビュー", "openSource": "既定のアプリで開く",
+    "reveal": "ファイルマネージャーで表示", "revealFinder": "Finder で表示", "revealExplorer": "エクスプローラーで表示",
     "openCopy": "ローカルコピーを開く", "saveAs": "名前を付けて保存…", "copyPath": "パスをコピー",
     "copyGatewayPath": "サーバーのパスをコピー", "copyContents": "ファイル内容をコピー", "saved": "ファイルを保存しました",
     "singleFile": "この HTML のみ保存します。参照するスタイル、画像、他のページは含まれません。",

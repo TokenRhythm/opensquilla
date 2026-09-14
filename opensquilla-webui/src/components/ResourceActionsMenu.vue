@@ -7,7 +7,8 @@ import type { ArtifactPayload } from '@/types/artifacts'
 import { usePlatform } from '@/platform'
 import { useDialogLayer } from '@/composables/useDialogA11y'
 import { useToasts } from '@/composables/useToasts'
-import { copyTextWithFallback, downloadBlob } from '@/utils/browser'
+import { copyTextWithFallback, downloadBlob, isMacPlatform } from '@/utils/browser'
+import { artifactWorkbenchPreviewKind } from '@/utils/workbench/artifactPreview'
 import { isPreviewPagePath } from '@/utils/workbench/previewPagePath'
 import Icon from '@/components/Icon.vue'
 
@@ -40,6 +41,13 @@ let epoch = 0
 const source = computed(() => selected.value?.source === 'workspace-preview'
   && typeof selected.value.documentId === 'string')
 const readable = computed(() => source.value ? !!metadata.value : !!selected.value)
+const html = computed(() => !!selected.value && artifactWorkbenchPreviewKind({
+  ...selected.value,
+  ...(metadata.value ? { name: metadata.value.name, mime: metadata.value.mime } : {}),
+}) === 'html')
+const revealLabel = computed(() => t(isMacPlatform() ? 'resourceActions.revealFinder'
+  : typeof navigator !== 'undefined' && /Windows/i.test(navigator.userAgent)
+    ? 'resourceActions.revealExplorer' : 'resourceActions.reveal'))
 const signature = computed(() => [props.sessionKey, props.artifact?.id, props.artifact?.documentId,
   props.artifact?.previewPagePath, props.artifact?.download_url].join('\0'))
 
@@ -92,7 +100,8 @@ async function show(event: MouseEvent | KeyboardEvent, artifact = props.artifact
   const bounds = menu.value?.getBoundingClientRect()
   point.value = { left: Math.max(8, Math.min(point.value.left, window.innerWidth - (bounds?.width || 250) - 8)),
     top: Math.max(8, Math.min(point.value.top, window.innerHeight - (bounds?.height || 320) - 8)) }
-  menu.value?.querySelector<HTMLButtonElement>('button:not(:disabled)')?.focus()
+  const initialFocus = menu.value?.querySelector<HTMLButtonElement>('button:not(:disabled)') ?? menu.value
+  initialFocus?.focus()
   try {
     if (source.value) {
       const info = await workbench.content.workingFileMetadata?.(currentRequest(artifact, signal))
@@ -114,6 +123,9 @@ async function show(event: MouseEvent | KeyboardEvent, artifact = props.artifact
       await nextTick()
       const height = menu.value?.getBoundingClientRect().height || 0
       point.value = { ...point.value, top: Math.max(8, Math.min(point.value.top, window.innerHeight - height - 8)) }
+      if (visible.value && document.activeElement === menu.value) {
+        menu.value?.querySelector<HTMLButtonElement>('button:not(:disabled)')?.focus()
+      }
     }
   }
 }
@@ -199,6 +211,7 @@ function onKeydown(event: KeyboardEvent) {
   if (!['ArrowDown', 'ArrowUp', 'Home', 'End'].includes(event.key)) return
   event.preventDefault()
   const buttons = [...menu.value!.querySelectorAll<HTMLButtonElement>('button:not(:disabled)')]
+  if (!buttons.length) return
   const index = buttons.indexOf(document.activeElement as HTMLButtonElement)
   const next = event.key === 'Home' ? 0 : event.key === 'End' ? buttons.length - 1
     : (index + (event.key === 'ArrowDown' ? 1 : -1) + buttons.length) % buttons.length
@@ -215,20 +228,20 @@ defineExpose({ show })
   </button>
   <Teleport to="body">
     <div v-if="visible" class="resource-actions-backdrop" @pointerdown.self="cancel">
-      <div ref="menu" class="resource-actions-menu" role="menu" :aria-label="t('resourceActions.more')"
+      <div ref="menu" class="resource-actions-menu" role="menu" tabindex="-1" :aria-label="t('resourceActions.more')"
         :style="{ left: `${point.left}px`, top: `${point.top}px` }" @keydown="onKeydown" @contextmenu.prevent>
-        <button v-if="previewable" role="menuitem" type="button" @click="perform('preview')">{{ t('chat.open') }}</button>
+        <button v-if="previewable" role="menuitem" type="button" @click="perform('preview')">{{ t('resourceActions.preview') }}</button>
         <template v-if="localInstance && metadata">
           <button role="menuitem" type="button" @click="perform('open')">{{ t('resourceActions.openSource') }}</button>
-          <button role="menuitem" type="button" @click="perform('reveal')">{{ t('resourceActions.reveal') }}</button>
+          <button role="menuitem" type="button" @click="perform('reveal')">{{ revealLabel }}</button>
         </template>
         <button v-if="!source && platform.files.openArtifact" role="menuitem" type="button" @click="perform('copy-open')">{{ t('resourceActions.openCopy') }}</button>
         <template v-if="readable">
           <button role="menuitem" type="button" :title="source ? t('resourceActions.singleFile') : undefined" @click="perform('save')">
             {{ t(platform.files.saveArtifact ? 'resourceActions.saveAs' : 'chat.download') }}
           </button>
-          <button v-if="source" role="menuitem" type="button" @click="perform('path')">{{ t(localInstance ? 'resourceActions.copyPath' : 'resourceActions.copyGatewayPath') }}</button>
-          <button role="menuitem" type="button" @click="perform('contents')">{{ t('resourceActions.copyContents') }}</button>
+          <button v-if="source && !html" role="menuitem" type="button" @click="perform('path')">{{ t(localInstance ? 'resourceActions.copyPath' : 'resourceActions.copyGatewayPath') }}</button>
+          <button v-if="!html" role="menuitem" type="button" @click="perform('contents')">{{ t('resourceActions.copyContents') }}</button>
         </template>
         <small v-if="source && !readable" role="status">{{ t(loading ? 'common.loading' : 'resourceActions.unavailable') }}</small>
       </div>
