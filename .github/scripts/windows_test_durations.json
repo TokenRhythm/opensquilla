@@ -715,6 +715,7 @@
     "tests/test_gateway/test_sandbox_protocol_codec.py": 0.01,
     "tests/test_gateway/test_sandbox_runtime_contract_registration.py": 0.01,
     "tests/test_gateway/test_sandbox_v2_routes.py": 0.148,
+    "tests/test_gateway/test_search_operator_run_context.py": 0.01,
     "tests/test_gateway/test_search_runtime_config_gateway.py": 0.01,
     "tests/test_gateway/test_security_headers.py": 0.037,
     "tests/test_gateway/test_session_adapter_imports.py": 0.01,

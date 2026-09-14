@@ -28,6 +28,7 @@ from opensquilla.gateway.config import GatewayConfig
 from opensquilla.gateway.guest_rpc_policy import is_guest_rpc_method_allowed
 from opensquilla.gateway.log_status_runtime import read_log_status
 from opensquilla.gateway.memory_status_runtime import read_memory_status
+from opensquilla.gateway.operator_network import operator_network_context
 from opensquilla.gateway.rpc import RpcContext, RpcHandlerError, get_dispatcher
 from opensquilla.gateway.search_status_runtime import read_search_status
 from opensquilla.sandbox.status import status_payload as _sandbox_status_payload
@@ -111,9 +112,15 @@ async def _search_runtime_payload(
     params: dict[str, Any] | None,
     ctx: RpcContext,
 ) -> dict[str, Any]:
-    del ctx
     provider = (params or {}).get("provider")
-    return read_search_status(str(provider) if provider else None)
+    # The same probe context `search.status` and `search.query` run under.
+    # Without it the doctor warns that search queries are blocked and points the
+    # operator at `opensquilla search status`, which reports them fine — #1202's
+    # disagreement moved between two diagnostics on one gateway.
+    return read_search_status(
+        str(provider) if provider else None,
+        probe_context=lambda: operator_network_context(ctx.config),
+    )
 
 
 async def _provider_payload(

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Any, cast
 
+from opensquilla.gateway.operator_network import operator_network_context
 from opensquilla.gateway.rpc import RpcContext, get_dispatcher
 from opensquilla.gateway.search_status_runtime import read_search_status as _read_search_status
 from opensquilla.sandbox.integration import (
@@ -112,7 +113,10 @@ async def read_search_status(params: dict | None, ctx: RpcContext) -> dict[str, 
     if params is not None and not isinstance(params, dict):
         raise ValueError("params must be an object")
     provider = (params or {}).get("provider")
-    return _read_search_status(str(provider) if provider else None)
+    return _read_search_status(
+        str(provider) if provider else None,
+        probe_context=lambda: operator_network_context(ctx.config),
+    )
 
 
 @_d.method("search.status", scope="operator.read")
@@ -152,19 +156,20 @@ async def _handle_search_query(params: dict | None, ctx: RpcContext) -> dict[str
             provider=provider_name,
         )
 
-    payload_or_denial = await run_in_process_network_action(
-        action_kind="web.fetch",
-        argv=(
-            "web_search",
-            query,
-            str(limit or ""),
-            _search_plan_argv_token(
-                {"query": query, "provider": provider_name},
-                tool_name="web_discover",
+    with operator_network_context(ctx.config):
+        payload_or_denial = await run_in_process_network_action(
+            action_kind="web.fetch",
+            argv=(
+                "web_search",
+                query,
+                str(limit or ""),
+                _search_plan_argv_token(
+                    {"query": query, "provider": provider_name},
+                    tool_name="web_discover",
+                ),
             ),
-        ),
-        callback=_run_search,
-    )
+            callback=_run_search,
+        )
     if isinstance(payload_or_denial, DenialResult):
         denial = payload_or_denial
         return {
