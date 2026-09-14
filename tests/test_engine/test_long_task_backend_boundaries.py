@@ -488,11 +488,15 @@ async def test_same_authority_retry_after_over_wait_ceiling_is_typed_terminal(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("retry_after_s", "timeout"), [(8.0, 1.0), (901.0, 2_000.0)],
+    ("retry_after_s", "timeout", "expected_selected_index"),
+    [(8.0, 1.0, 0), (901.0, 2_000.0, 1)],
     ids=["past-turn-deadline", "past-wait-ceiling"],
 )
 async def test_agent_does_not_retry_after_selector_deadline_terminal(
-    monkeypatch: pytest.MonkeyPatch, retry_after_s: float, timeout: float
+    monkeypatch: pytest.MonkeyPatch,
+    retry_after_s: float,
+    timeout: float,
+    expected_selected_index: int,
 ) -> None:
     sleeps: list[float] = []
     original_sleep = asyncio.sleep
@@ -538,7 +542,7 @@ async def test_agent_does_not_retry_after_selector_deadline_terminal(
     assert primary.calls == 1
     assert first_fallback.calls == 0
     assert second_fallback.calls == 0
-    assert selector.current_config == configs[1]
+    assert selector.current_config == configs[expected_selected_index]
     assert sleeps == []
     terminal = next(event for event in events if isinstance(event, EngineErrorEvent))
     assert terminal.code == "provider_retry_after_deadline"
