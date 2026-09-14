@@ -43,6 +43,7 @@ cache-friendly system-prompt-rebuild contract.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
@@ -105,6 +106,7 @@ class T3UpgradeCompactionPort(Protocol):
         provider_request_correlation: ProviderRequestCorrelation | None = None,
         consumer_admission: Any | None = None,
         consumer_admission_fingerprint: str = "",
+        attachment_path_resolver: Callable[[dict[str, Any], str], str | None] | None = None,
         transcript_snapshot: TurnTranscriptSnapshot[Any] | None = None,
         expected_session_id: str | None = None,
         expected_session_epoch: int | None = None,
@@ -140,6 +142,7 @@ class PreflightCompactionPort(Protocol):
         provider_request_correlation: ProviderRequestCorrelation | None = None,
         consumer_admission: Any | None = None,
         consumer_admission_fingerprint: str = "",
+        attachment_path_resolver: Callable[[dict[str, Any], str], str | None] | None = None,
         transcript_snapshot: TurnTranscriptSnapshot[Any] | None = None,
         expected_session_id: str | None = None,
         expected_session_epoch: int | None = None,
@@ -241,6 +244,9 @@ class CompactionAndHistoryStageInput:
     )
     consumer_admission: Any | None = field(default=None, repr=False)
     consumer_admission_fingerprint: str = ""
+    attachment_path_resolver: Callable[[dict[str, Any], str], str | None] | None = field(
+        default=None, repr=False,
+    )
     # Explicit authority boundary supplied by the runtime. Restricted turns
     # load canonical history for the primary provider projection, but may not
     # invoke T3/preflight compaction or replay durable summaries because those
@@ -359,6 +365,8 @@ class CompactionAndHistoryStage:
             )
             await self._fire_before_compact(t3_state)
             t3_kwargs: dict[str, Any] = {}
+            if inp.attachment_path_resolver is not None:
+                t3_kwargs["attachment_path_resolver"] = inp.attachment_path_resolver
             if inp.transcript_snapshot is not None:
                 t3_kwargs["transcript_snapshot"] = inp.transcript_snapshot
             if inp.expected_session_id is not None or inp.expected_session_epoch is not None:
@@ -394,6 +402,8 @@ class CompactionAndHistoryStage:
                 )
                 await self._fire_before_compact(preflight_state)
                 preflight_kwargs: dict[str, Any] = {}
+                if inp.attachment_path_resolver is not None:
+                    preflight_kwargs["attachment_path_resolver"] = inp.attachment_path_resolver
                 if inp.transcript_snapshot is not None:
                     preflight_kwargs["transcript_snapshot"] = inp.transcript_snapshot
                 if inp.expected_session_id is not None or inp.expected_session_epoch is not None:

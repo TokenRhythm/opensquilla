@@ -718,7 +718,7 @@ class AgentConfig:
     context_overflow_threshold: float = 0.85  # trigger at 85%
     max_overflow_retries: int = 2
     max_history_turns: int = 0  # 0 = unlimited; compaction handles oversized history
-    preserve_historical_images: bool = False
+    preserve_historical_images: bool = True
     materialize_historical_attachments: bool = True
     # Retry policy for transient LLM errors (429, 500, 503)
     max_provider_retries: int = 3

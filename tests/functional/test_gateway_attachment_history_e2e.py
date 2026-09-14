@@ -255,7 +255,7 @@ def _configure_gateway(tmp_path: Path) -> GatewayConfig:
     return config
 
 
-async def _upload_png(app: Any) -> str:
+async def _upload_png(app: Any, payload: bytes = _PNG_BYTES) -> str:
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(
         transport=transport,
@@ -263,7 +263,7 @@ async def _upload_png(app: Any) -> str:
     ) as client:
         response = await client.post(
             "/api/v1/files/upload",
-            files={"file": ("first.png", _PNG_BYTES, "image/png")},
+            files={"file": ("first.png", payload, "image/png")},
         )
     assert response.status_code == 200, response.text
     payload = response.json()
@@ -687,7 +687,7 @@ async def test_gateway_unpersisted_upload_is_tool_readable_only_during_turn(
         ctx=_e2e_stack["ctx"], key=key, sink=sink,
         message="Inspect this upload", attachments=[_file_uuid_attachment(file_uuid)],
     )
-    assert tool_results and tool_results[0]["status"] == "not_analyzed"
+    assert tool_results and tool_results[0]["status"] == "loaded"
     assert paths and all(not path.exists() for path in paths)
     assert not list(Path(config.workspace_dir).rglob("*.png"))
     assert not (Path(config.attachments.media_root) / "transcripts" / session.session_id).exists()
@@ -844,14 +844,14 @@ async def test_gateway_direct_model_switch_replays_canonical_history_image(
 
 
 @pytest.mark.asyncio
-async def test_gateway_current_upload_does_not_replay_older_history_image(
+async def test_gateway_current_upload_keeps_recent_images_for_primary_model_selection(
     _e2e_stack: dict[str, Any],
 ) -> None:
     manager: SessionManager = _e2e_stack["manager"]
     subscription_manager: SubscriptionManager = _e2e_stack["subscription_manager"]
     sink: _EventSink = _e2e_stack["sink"]
     vision_provider: _RecordingProvider = _e2e_stack["vision_provider"]
-    key = "agent:main:current-image-only"
+    key = "agent:main:current-and-recent-image"
     await manager.create(session_key=key, agent_id="main")
     subscription_manager.subscribe_messages(sink.conn_id, key)
 
@@ -864,7 +864,8 @@ async def test_gateway_current_upload_does_not_replay_older_history_image(
         attachments=[_file_uuid_attachment(first_uuid)],
     )
 
-    second_uuid = await _upload_png(_e2e_stack["app"])
+    second_payload = image_bytes(color="red")
+    second_uuid = await _upload_png(_e2e_stack["app"], second_payload)
     await _send_session_turn(
         ctx=_e2e_stack["ctx"],
         key=key,
@@ -879,11 +880,15 @@ async def test_gateway_current_upload_does_not_replay_older_history_image(
         for message in sent_messages
         for block in _message_image_blocks(message)
     ]
-    assert len(image_blocks) == 1
+    assert [base64.b64decode(block.data, validate=True) for block in image_blocks] == [
+        _PNG_BYTES, second_payload,
+    ]
+    assert "Describe only this new image." in str(sent_messages[-1].content)
+    assert _e2e_stack["gate_provider"].calls == []
 
 
 @pytest.mark.asyncio
-async def test_gateway_upload_history_image_replays_through_squilla_router_gate_history(
+async def test_gateway_upload_history_image_routes_without_auxiliary_gate(
     _e2e_stack: dict[str, Any],
 ) -> None:
     manager: SessionManager = _e2e_stack["manager"]
@@ -932,7 +937,7 @@ async def test_gateway_upload_history_image_replays_through_squilla_router_gate_
     relative_workspace_image = workspace_images[0].relative_to(config.workspace_dir).as_posix()
     assert current_turn_markers == [
         (
-            f"[attachment available: first.png (image/png, {len(_PNG_BYTES)} bytes) "
+            "[attachment available: first.png (image/png) "
             f"at {relative_workspace_image}]"
         )
     ]
@@ -965,7 +970,7 @@ async def test_gateway_upload_history_image_replays_through_squilla_router_gate_
         message="What color is the small corner?",
     )
 
-    assert len(gate_provider.calls) == 1
+    assert len(gate_provider.calls) == 0
     assert len(vision_provider.calls) == vision_calls_before + 1
     final_call = vision_provider.calls[-1]
     sent_messages = final_call["messages"]
@@ -976,6 +981,17 @@ async def test_gateway_upload_history_image_replays_through_squilla_router_gate_
     ]
     assert image_blocks
     assert base64.b64decode(image_blocks[0].data, validate=True) == _PNG_BYTES
+    from opensquilla.provider.openai import _build_openai_messages
+
+    replayed_turn = next(message for message in sent_messages if _message_has_image(message))
+    initial_wire = _build_openai_messages(current_turn)[0]
+    replayed_wire = _build_openai_messages(replayed_turn)[0]
+    # The current date/time hint is intentionally scoped to each request.
+    # The complete preceding caption/image/path sequence must replay unchanged.
+    assert initial_wire["content"][-1]["text"].startswith(
+        "\n\n[Runtime context for this turn]"
+    )
+    assert replayed_wire == {**initial_wire, "content": initial_wire["content"][:-1]}
     assert isinstance(sent_messages[-1].content, str)
     assert sent_messages[-1].content.startswith("What color is the small corner?")
 
@@ -983,18 +999,13 @@ async def test_gateway_upload_history_image_replays_through_squilla_router_gate_
     assert router_events[-1]["source"] == "image_route"
     assert router_events[-1]["model"] == _VISION_MODEL
     done_events = _event_payloads(sink, "session.event.done")
-    assert done_events[-1]["image_route_reason"] == "gate_history"
-    assert done_events[-1]["vision_followup_needs_image"] is True
-    assert done_events[-1]["vision_followup_gate_decision"] == "needs_image"
+    assert done_events[-1]["image_route_reason"] == "history_context"
     assert bootstrap_configs[-1].preserve_historical_images is True
-    assert (
-        bootstrap_configs[-1].max_history_turns
-        == config.squilla_router.vision_history_lookback_turns
-    )
+    assert bootstrap_configs[-1].max_history_turns == 0
 
 
 @pytest.mark.asyncio
-async def test_gateway_current_image_capacity_uses_route_limited_media_history(
+async def test_gateway_current_image_capacity_uses_typed_media_history(
     _e2e_stack: dict[str, Any],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1080,20 +1091,15 @@ async def test_gateway_current_image_capacity_uses_route_limited_media_history(
         for message in sent_messages[:-1]
         if message.role == "user" and _message_has_image(message)
     ]
-    # A current upload does not request unrelated historical images. Router
-    # capacity replay may conservatively allow media, but execution filters
-    # the replay to the current occurrence IDs.
-    assert historical_users == []
+    # New uploads preserve recent typed images; the primary model receives
+    # the user's instruction about which image to discuss.
+    assert len(historical_users) == 3
     decoded_images = [
         base64.b64decode(block.data, validate=True)
         for message in sent_messages
         for block in _message_image_blocks(message)
     ]
-    assert payloads[0] not in decoded_images
-    assert payloads[1] not in decoded_images
-    assert payloads[2] not in decoded_images
-    assert payloads[3] not in decoded_images
-    assert _PNG_BYTES in decoded_images
+    assert decoded_images == [*payloads, _PNG_BYTES]
 
     # The provider may receive typed image blocks, but legacy envelope/base64
     # must never survive as text in the projected history.
@@ -1130,11 +1136,11 @@ async def test_gateway_current_image_capacity_uses_route_limited_media_history(
         if message.role == "user" and "legacy turn" in "\n".join(message_parts):
             replayed_legacy_user_turns += 1
     projected_history_text = "\n".join(projected_history_parts)
-    assert replayed_legacy_user_turns == 1
-    assert "legacy turn one" not in projected_history_text
-    assert "legacy turn two" not in projected_history_text
-    assert "legacy answer 1" not in projected_history_text
-    assert "legacy answer 2" not in projected_history_text
+    assert replayed_legacy_user_turns == 3
+    assert "legacy turn one" in projected_history_text
+    assert "legacy turn two" in projected_history_text
+    assert "legacy answer 1" in projected_history_text
+    assert "legacy answer 2" in projected_history_text
     assert "legacy turn three" in projected_history_text
     assert "legacy answer 3" in projected_history_text
 
@@ -1143,14 +1149,14 @@ async def test_gateway_current_image_capacity_uses_route_limited_media_history(
     assert router_events[-1]["model"] == _VISION_MODEL
     done_events = _event_payloads(sink, "session.event.done")
     assert done_events[-1]["image_route_reason"] == "current_turn"
-    assert bootstrap_configs[-1].max_history_turns == 1
+    assert bootstrap_configs[-1].max_history_turns == 0
     assert len(router_capacity_calls) == 1
-    assert router_capacity_calls[0]["max_history_turns"] == 1
+    assert router_capacity_calls[0]["max_history_turns"] == 0
     assert router_capacity_calls[0]["preserve_image_attachments"] is True
     assert router_capacity_calls[0]["reachable_provider_kinds"] == frozenset(
         {_PROVIDER_ID}
     )
-    assert router_capacity_calls[0]["result"]["history_capacity_message_count"] == 2
+    assert router_capacity_calls[0]["result"]["history_capacity_message_count"] == 6
     assert router_capacity_calls[0]["result"]["history_capacity_estimate_complete"] is True
     assert preflight_calls == 1
     persisted = await manager.get_session(key)
@@ -1160,7 +1166,7 @@ async def test_gateway_current_image_capacity_uses_route_limited_media_history(
 
 
 @pytest.mark.asyncio
-async def test_historical_image_material_is_not_replayed_without_vision_support(
+async def test_historical_image_material_is_preserved_before_text_model_projection(
     _e2e_stack: dict[str, Any],
 ) -> None:
     manager: SessionManager = _e2e_stack["manager"]
@@ -1189,14 +1195,16 @@ async def test_historical_image_material_is_not_replayed_without_vision_support(
         ),
     )
     await runner._load_history(agent, key)
+    assert any(_message_has_image(message) for message in agent._history)
     events = [event async for event in agent.run_turn("Follow up.")]
 
     assert any(getattr(event, "kind", None) == "done" for event in events)
     assert not any(_message_has_image(message) for message in provider.calls[0]["messages"])
+    assert any(_message_has_image(message) for message in agent._history)
 
 
 @pytest.mark.asyncio
-async def test_historical_image_material_outside_lookback_is_not_replayed(
+async def test_active_image_material_outside_legacy_lookback_is_replayed(
     _e2e_stack: dict[str, Any],
 ) -> None:
     manager: SessionManager = _e2e_stack["manager"]
@@ -1231,11 +1239,11 @@ async def test_historical_image_material_outside_lookback_is_not_replayed(
     events = [event async for event in agent.run_turn("Follow up.")]
 
     assert any(getattr(event, "kind", None) == "done" for event in events)
-    assert not any(_message_has_image(message) for message in provider.calls[0]["messages"])
+    assert any(_message_has_image(message) for message in provider.calls[0]["messages"])
 
 
 @pytest.mark.asyncio
-async def test_gate_text_only_followup_stays_text_and_does_not_replay_history_image(
+async def test_new_text_task_keeps_recent_images_and_reaches_primary_model_without_gate(
     _e2e_stack: dict[str, Any],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1260,9 +1268,6 @@ async def test_gate_text_only_followup_stays_text_and_does_not_replay_history_im
     )
     await manager.append_message(key, "user", "A text-only turn in between.")
     await manager.append_message(key, "assistant", "Text answer in between.")
-    gate_provider.text = (
-        '{"decision":"text_only","confidence":0.91,"reason":"new coding task"}'
-    )
     gate_calls_before = len(gate_provider.calls)
     text_calls_before = len(text_provider.calls)
     vision_calls_before = len(vision_provider.calls)
@@ -1274,12 +1279,75 @@ async def test_gate_text_only_followup_stays_text_and_does_not_replay_history_im
         message="Write a small Python script.",
     )
 
-    assert len(gate_provider.calls) == gate_calls_before + 1
-    assert len(text_provider.calls) == text_calls_before + 1
-    assert len(vision_provider.calls) == vision_calls_before
-    sent_messages = text_provider.calls[-1]["messages"]
-    assert not any(_message_has_image(message) for message in sent_messages)
+    assert len(gate_provider.calls) == gate_calls_before == 0
+    assert len(text_provider.calls) == text_calls_before
+    assert len(vision_provider.calls) == vision_calls_before + 1
+    sent_messages = vision_provider.calls[-1]["messages"]
+    assert any(_message_has_image(message) for message in sent_messages)
+    assert "Write a small Python script." in str(sent_messages[-1].content)
     done_events = _event_payloads(sink, "session.event.done")
-    assert done_events[-1]["vision_followup_gate_decision"] == "text_only"
-    assert done_events[-1]["vision_followup_needs_image"] is False
-    assert done_events[-1].get("image_route_reason") is None
+    assert done_events[-1]["image_route_reason"] == "history_context"
+
+
+@pytest.mark.asyncio
+async def test_gateway_free_text_attachment_id_does_not_replay_archived_image(
+    _e2e_stack: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from opensquilla.session.attachment_manifest import build_attachment_manifest
+
+    monkeypatch.setattr(squilla_router_step, "_get_strategy", lambda _cfg: _TextTierStrategy())
+    manager: SessionManager = _e2e_stack["manager"]
+    runner: TurnRunner = _e2e_stack["runner"]
+    sink: _EventSink = _e2e_stack["sink"]
+    key = "agent:main:archived-image-reference"
+    session = await manager.create(session_key=key, agent_id="main")
+    _e2e_stack["subscription_manager"].subscribe_messages(sink.conn_id, key)
+    file_uuid = await _upload_png(_e2e_stack["app"])
+    await _send_session_turn(
+        ctx=_e2e_stack["ctx"], key=key, sink=sink,
+        message="Describe the sample image.", attachments=[_file_uuid_attachment(file_uuid)],
+    )
+    manifest = build_attachment_manifest(
+        await manager.get_transcript(key), session_id=session.session_id, session_key=key,
+    )
+    attachment_id = manifest.occurrences[0].attachment_id
+    tail = await manager.append_message(key, "user", "A later text discussion.")
+    source = await manager.capture_compaction_source(key, boundary_message_id=tail.message_id)
+    assert await manager.persist_compaction_result(
+        key,
+        "The earlier image was discussed.",
+        [{"role": "user", "content": tail.content}],
+        compaction_id="synthetic-image-compaction",
+        removed_count=2,
+        source_entries=source.entries,
+        source_preimage=source.preimage,
+        source_boundary_message_id=source.boundary_message_id,
+        source_boundary_entry_id=source.boundary_entry_id,
+    )
+    assert [entry.message_id for entry in await manager.get_transcript(key)] == [tail.message_id]
+    assert len(await manager.get_canonical_transcript(key)) == 3
+    canonical_reads: list[str] = []
+    read_canonical = runner._canonical_transcript_for_attachment_replay
+
+    async def record_archive_read(session_key: str, *args: Any, **kwargs: Any) -> Any:
+        canonical_reads.append(session_key)
+        return await read_canonical(session_key, *args, **kwargs)
+
+    monkeypatch.setattr(runner, "_canonical_transcript_for_attachment_replay", record_archive_read)
+    vision_provider: _RecordingProvider = _e2e_stack["vision_provider"]
+    text_provider: _RecordingProvider = _e2e_stack["text_provider"]
+    vision_calls_before = len(vision_provider.calls)
+    text_calls_before = len(text_provider.calls)
+    await _send_session_turn(
+        ctx=_e2e_stack["ctx"], key=key, sink=sink,
+        message=f"Discuss attachment_id={attachment_id} again.",
+    )
+
+    assert _e2e_stack["gate_provider"].calls == []
+    assert canonical_reads == []
+    assert len(vision_provider.calls) == vision_calls_before
+    assert len(text_provider.calls) == text_calls_before + 1
+    assert not any(
+        _message_has_image(message) for message in text_provider.calls[-1]["messages"]
+    )

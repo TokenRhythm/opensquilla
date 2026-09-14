@@ -547,3 +547,50 @@ async def test_raising_hook_does_not_break_turn(
     assert captured is not None
     assert len(call_log["t3"]) == 1
     assert len(call_log["preflight"]) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("phase", ["t3", "preflight"])
+@pytest.mark.parametrize("supports_resolver", [False, True])
+async def test_attachment_path_adapter_preserves_legacy_runner_signatures(
+    phase: str, supports_resolver: bool,
+) -> None:
+    from opensquilla.engine.turn_runner.harness import (
+        _TurnRunnerPreflightCompactionAdapter,
+        _TurnRunnerT3UpgradeCompactionAdapter,
+    )
+
+    seen: dict[str, Any] = {}
+
+    def resolver(attachment: dict[str, Any], session_key: str) -> str | None:
+        return "assets/sample.png"
+
+    async def modern(*args: Any, attachment_path_resolver=None, **kwargs: Any) -> str:
+        seen["resolver"] = attachment_path_resolver
+        return "not_applicable"
+
+    async def legacy(*args: Any, compaction_provider=None, compaction_model=None) -> str:
+        seen["legacy_called"] = True
+        return "not_applicable"
+
+    runner = SimpleNamespace(
+        _maybe_compact_on_t3_upgrade=modern if supports_resolver else legacy,
+        _maybe_preflight_compact=modern if supports_resolver else legacy,
+    )
+    adapter = (
+        _TurnRunnerT3UpgradeCompactionAdapter(runner)
+        if phase == "t3" else _TurnRunnerPreflightCompactionAdapter(runner)
+    )
+    kwargs: dict[str, Any] = {
+        "session_key": "agent:main:synthetic-compaction",
+        "context_window_tokens": 64_000,
+        "compaction_provider": None,
+        "compaction_model": None,
+        "attachment_path_resolver": resolver,
+    }
+    if phase == "t3":
+        kwargs["turn"] = SimpleNamespace()
+
+    await adapter.maybe_compact(**kwargs)
+
+    assert seen == ({"resolver": resolver} if supports_resolver else {"legacy_called": True})

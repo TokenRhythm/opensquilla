@@ -684,6 +684,10 @@ class ContentBlockImage(BaseModel):
     attachment_id: str | None = Field(default=None, exclude=True, repr=False)
     # In-memory image bytes alone do not prove that a later turn can replay them.
     durable_retained: bool | None = Field(default=None, exclude=True, repr=False)
+    # Retained tool images carry replay metadata separately from provider pixels.
+    name: str | None = Field(default=None, exclude=True)
+    local_path: str | None = Field(default=None, exclude=True)
+    source_url: str | None = Field(default=None, exclude=True, repr=False)
 
 
 class ContentBlockDocument(BaseModel):

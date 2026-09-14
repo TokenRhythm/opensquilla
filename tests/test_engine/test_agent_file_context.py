@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import base64
 from collections.abc import AsyncIterator
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -15,6 +17,145 @@ from opensquilla.provider import (
 )
 from opensquilla.provider import DoneEvent as ProviderDone
 from opensquilla.provider import TextDeltaEvent as ProviderText
+from tests.helpers.image_bytes import image_bytes
+
+
+class _ReadImagesProvider:
+    provider_name = "test"
+    model = "file-reader"
+
+    def __init__(self, batches: list[list[Path]]) -> None:
+        self.batches = batches
+        self.requests: list[list[Message]] = []
+
+    def chat(self, messages: list[Message], tools=None, config=None) -> AsyncIterator[Any]:
+        self.requests.append([message.model_copy(deep=True) for message in messages])
+        return self.stream(len(self.requests) - 1)
+
+    async def stream(self, index: int) -> AsyncIterator[Any]:
+        from opensquilla.provider import ToolUseEndEvent, ToolUseStartEvent
+
+        if index < len(self.batches):
+            for position, path in enumerate(self.batches[index]):
+                call_id = f"read-{index}-{position}"
+                yield ToolUseStartEvent(tool_use_id=call_id, tool_name="read_file")
+                yield ToolUseEndEvent(
+                    tool_use_id=call_id, tool_name="read_file", arguments={"path": str(path)},
+                )
+            yield ProviderDone(stop_reason="tool_use", input_tokens=1, output_tokens=1)
+        else:
+            yield ProviderText(text="The file operations have finished.")
+            yield ProviderDone(stop_reason="stop", input_tokens=1, output_tokens=1)
+
+    async def list_models(self) -> list[Any]:
+        return []
+
+
+def _file_reader_agent(
+    workspace: Path, provider: _ReadImagesProvider, *, vision_support: str,
+) -> tuple[Agent, Any]:
+    from opensquilla.provider.types import ModelCapabilities
+    from opensquilla.tools.dispatch import build_tool_handler
+    from opensquilla.tools.registry import get_default_registry
+    from opensquilla.tools.types import ToolContext
+
+    context = ToolContext(
+        is_owner=True,
+        workspace_dir=str(workspace),
+        workspace_strict=True,
+        session_key="agent:main:read-image-test",
+        artifact_session_id="read-image-session",
+        allowed_tools={"read_file"},
+    )
+    registry = get_default_registry()
+    definitions = registry.to_tool_definitions(context)
+    assert len(definitions) == 1
+    assert definitions[0].name == "read_file"
+    assert "_tool_use_id" not in definitions[0].input_schema.properties
+    return Agent(
+        provider=provider,
+        config=AgentConfig(
+            workspace_dir=str(workspace),
+            model_vision_support=vision_support,
+            model_capabilities=ModelCapabilities(supports_vision=vision_support == "supported"),
+        ),
+        tool_context=context,
+        tool_definitions=definitions,
+        tool_handler=build_tool_handler(registry, context),
+    ), context
+
+
+@pytest.mark.parametrize("batched", [False, True])
+@pytest.mark.parametrize("vision_support", ["supported", "unsupported"])
+async def test_real_read_file_dispatch_supplies_images_to_next_model_request(
+    tmp_path: Path, batched: bool, vision_support: str,
+) -> None:
+    from opensquilla.provider.types import ContentBlockImage, ContentBlockText
+
+    png, jpeg = image_bytes("PNG"), image_bytes("JPEG", color="red")
+    paths = [tmp_path / "first.png", tmp_path / "second.jpg"]
+    for path, payload in zip(paths, (png, jpeg), strict=True):
+        path.write_bytes(payload)
+    batches = [paths] if batched else [[path] for path in paths]
+    provider = _ReadImagesProvider(batches)
+    agent, context = _file_reader_agent(tmp_path, provider, vision_support=vision_support)
+
+    events = [event async for event in agent.run_turn("Inspect these two local files.")]
+
+    assert len(provider.requests) == len(batches) + 1
+    loaded_count = 0
+    for request, batch in zip(provider.requests[1:], batches, strict=True):
+        loaded_count += len(batch)
+        blocks = [
+            block for message in request if isinstance(message.content, list)
+            for block in message.content
+        ]
+        results = [block for block in blocks if isinstance(block, ContentBlockToolResult)]
+        assert len(results) == loaded_count
+        assert all(not result.is_error and "Loaded image" in result.content for result in results)
+        images = [block for block in blocks if isinstance(block, ContentBlockImage)]
+        if vision_support == "supported":
+            assert [base64.b64decode(block.data) for block in images] == [png, jpeg][:loaded_count]
+            assert [block.media_type for block in images] == [
+                "image/png", "image/jpeg",
+            ][:loaded_count]
+        else:
+            assert images == []
+            assert any(
+                isinstance(block, ContentBlockText) and "图片未分析" in block.text
+                for block in blocks
+            )
+        assert all(base64.b64encode(png).decode() not in result.content for result in results)
+    assert context.tool_result_media == {}
+    assert not any(event.kind == "error" for event in events)
+
+
+async def test_real_read_file_dispatch_cannot_load_another_sessions_image(tmp_path: Path) -> None:
+    from opensquilla.attachment_workspace import _safe_path_segment
+    from opensquilla.provider.types import ContentBlockImage
+
+    other_directory = tmp_path / ".opensquilla" / "attachments" / _safe_path_segment(
+        "different-session", fallback="session",
+    )
+    other_directory.mkdir(parents=True)
+    foreign_image = other_directory / "other.png"
+    foreign_image.write_bytes(image_bytes())
+    provider = _ReadImagesProvider([[foreign_image]])
+    agent, context = _file_reader_agent(tmp_path, provider, vision_support="supported")
+
+    events = [event async for event in agent.run_turn("Inspect the specified local file.")]
+
+    assert len(provider.requests) == 2
+    blocks = [
+        block for message in provider.requests[-1] if isinstance(message.content, list)
+        for block in message.content
+    ]
+    assert not any(isinstance(block, ContentBlockImage) for block in blocks)
+    result = next(block for block in blocks if isinstance(block, ContentBlockToolResult))
+    assert result.is_error
+    assert "another session" in result.content
+    assert context.tool_result_media == {}
+    assert not any(event.kind == "error" for event in events)
 
 
 @pytest.mark.parametrize(
@@ -209,7 +350,7 @@ async def test_image_tool_result_reports_when_the_model_receives_no_image(
 
     async def capture(tool_call: Any) -> ToolResult:
         context.tool_result_media[tool_call.tool_use_id] = [
-            {"mime": "image/png", "data": "c3ludGhldGljLWltYWdl"}
+            {"mime": "image/png", "data": base64.b64encode(image_bytes()).decode("ascii")}
         ]
         return ToolResult(
             tool_use_id=tool_call.tool_use_id,
@@ -262,7 +403,7 @@ async def test_image_tool_result_reports_when_the_model_receives_no_image(
         if isinstance(block, ContentBlockImage)
     ]
     assert len(canonical_images) == 1
-    assert canonical_images[0].data == "c3ludGhldGljLWltYWdl"
+    assert canonical_images[0].data == base64.b64encode(image_bytes()).decode("ascii")
 
     provider.provider_name = "test"
     config.model_vision_support = "supported"

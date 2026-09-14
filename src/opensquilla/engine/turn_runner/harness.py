@@ -1108,6 +1108,7 @@ class _TurnRunnerT3UpgradeCompactionAdapter(T3UpgradeCompactionPort):
         provider_request_correlation: Any | None = None,
         consumer_admission: Any | None = None,
         consumer_admission_fingerprint: str = "",
+        attachment_path_resolver: Callable[[dict[str, Any], str], str | None] | None = None,
         transcript_snapshot: Any | None = None,
         expected_session_id: str | None = None,
         expected_session_epoch: int | None = None,
@@ -1115,6 +1116,11 @@ class _TurnRunnerT3UpgradeCompactionAdapter(T3UpgradeCompactionPort):
         from opensquilla.engine.runtime import _accepts_keyword_arg
 
         correlation_kwargs: dict[str, Any] = {}
+        if attachment_path_resolver is not None and _accepts_keyword_arg(
+            self._runner._maybe_compact_on_t3_upgrade,
+            "attachment_path_resolver",
+        ):
+            correlation_kwargs["attachment_path_resolver"] = attachment_path_resolver
         if _accepts_keyword_arg(
             self._runner._maybe_compact_on_t3_upgrade,
             "provider_request_correlation",
@@ -1203,6 +1209,7 @@ class _TurnRunnerPreflightCompactionAdapter(PreflightCompactionPort):
         provider_request_correlation: Any | None = None,
         consumer_admission: Any | None = None,
         consumer_admission_fingerprint: str = "",
+        attachment_path_resolver: Callable[[dict[str, Any], str], str | None] | None = None,
         transcript_snapshot: Any | None = None,
         expected_session_id: str | None = None,
         expected_session_epoch: int | None = None,
@@ -1210,6 +1217,11 @@ class _TurnRunnerPreflightCompactionAdapter(PreflightCompactionPort):
         from opensquilla.engine.runtime import _accepts_keyword_arg
 
         correlation_kwargs: dict[str, Any] = {}
+        if attachment_path_resolver is not None and _accepts_keyword_arg(
+            self._runner._maybe_preflight_compact,
+            "attachment_path_resolver",
+        ):
+            correlation_kwargs["attachment_path_resolver"] = attachment_path_resolver
         if _accepts_keyword_arg(
             self._runner._maybe_preflight_compact,
             "provider_request_correlation",

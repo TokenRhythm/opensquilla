@@ -1,637 +1,214 @@
+"""Image context is structural; no auxiliary model selects historical images."""
+
 from __future__ import annotations
 
+import base64
+import json
 from collections.abc import AsyncIterator
+from pathlib import Path
 from typing import Any
 
 import pytest
+import pytest_asyncio
 
-from opensquilla.engine.pipeline import TurnContext
 from opensquilla.engine.runtime import TurnRunner
-from opensquilla.engine.steps.vision_followup_gate import apply_vision_followup_gate
-from opensquilla.engine.usage_accounting import (
-    UsageCallResult,
-    UsageCallStart,
-    UsageExecutionContext,
-)
 from opensquilla.gateway.config import GatewayConfig
-from opensquilla.provider import auxiliary_budget
-from opensquilla.provider.types import (
-    ChatConfig,
-    DoneEvent,
-    Message,
-    ModelInfo,
-    ProviderRequestCorrelation,
-    StreamEvent,
-    TextDeltaEvent,
-    ToolDefinition,
-)
+from opensquilla.provider.types import ChatConfig, Message, StreamEvent, ToolDefinition
+from opensquilla.session.attachment_manifest import build_attachment_manifest
+from opensquilla.session.manager import SessionManager
+from opensquilla.session.storage import SessionStorage
+from tests.helpers.image_bytes import image_bytes
 
 
-class _FailProvider:
-    provider_name = "fail"
+class _NoAuxiliaryProvider:
+    provider_name = "test-provider"
+    model = "test-model"
+
+    def __init__(self) -> None:
+        self.calls: list[dict[str, Any]] = []
 
     def chat(
         self,
-        messages: list[Message],  # noqa: ARG002
-        tools: list[ToolDefinition] | None = None,  # noqa: ARG002
-        config: ChatConfig | None = None,  # noqa: ARG002
-    ) -> AsyncIterator[StreamEvent]:
-        raise AssertionError("gate should not call provider")
-
-    async def list_models(self) -> list[ModelInfo]:
-        return []
-
-
-class _JsonProvider:
-    provider_name = "json"
-
-    def __init__(self, payload: str, *, model: str = "") -> None:
-        self.payload = payload
-        self.model = model
-        self.calls: list[dict[str, Any]] = []
-
-    async def chat(
-        self,
         messages: list[Message],
         tools: list[ToolDefinition] | None = None,
         config: ChatConfig | None = None,
     ) -> AsyncIterator[StreamEvent]:
         self.calls.append({"messages": messages, "tools": tools, "config": config})
-        yield TextDeltaEvent(text=self.payload)
-        yield DoneEvent()
+        raise AssertionError("Image-context preparation must not call an auxiliary model")
 
-    async def list_models(self) -> list[ModelInfo]:
+    async def list_models(self) -> list[Any]:
         return []
 
 
-class _RaisingProvider:
-    provider_name = "raising"
-
-    async def chat(
-        self,
-        messages: list[Message],  # noqa: ARG002
-        tools: list[ToolDefinition] | None = None,  # noqa: ARG002
-        config: ChatConfig | None = None,  # noqa: ARG002
-    ) -> AsyncIterator[StreamEvent]:
-        raise RuntimeError("provider echoed private detail from local image")
-        yield TextDeltaEvent(text="unreachable")
-
-    async def list_models(self) -> list[ModelInfo]:
-        return []
+def _config(**router_overrides: Any) -> GatewayConfig:
+    return GatewayConfig(
+        llm={"provider": "openrouter", "model": "test-model"},
+        squilla_router={"enabled": False, **router_overrides},
+    )
 
 
-class _ReasoningOnlyProvider:
-    provider_name = "reasoning-only"
-
-    def __init__(self, payload: str) -> None:
-        self.payload = payload
-
-    async def chat(
-        self,
-        messages: list[Message],  # noqa: ARG002
-        tools: list[ToolDefinition] | None = None,  # noqa: ARG002
-        config: ChatConfig | None = None,  # noqa: ARG002
-    ) -> AsyncIterator[StreamEvent]:
-        yield DoneEvent(reasoning_content=self.payload)
-
-    async def list_models(self) -> list[ModelInfo]:
-        return []
-
-
-class _RecordingGateChat:
-    def __init__(self, payload: str) -> None:
-        self.payload = payload
-        self.calls: list[dict[str, Any]] = []
-
-    async def __call__(
-        self,
-        messages: list[Message],
-        tools: list[ToolDefinition] | None = None,
-        config: ChatConfig | None = None,
-    ) -> AsyncIterator[StreamEvent]:
-        self.calls.append({"messages": messages, "tools": tools, "config": config})
-        yield TextDeltaEvent(text=self.payload)
-        yield DoneEvent()
-
-
-class _RecordingSelector:
-    def __init__(self) -> None:
-        self.clones: list[_RecordingSelector] = []
-        self.model: str | None = None
-
-    def clone(self) -> _RecordingSelector:
-        child = _RecordingSelector()
-        self.clones.append(child)
-        return child
-
-    def override_model(self, model: str) -> None:
-        self.model = model
-
-    def resolve(self) -> _JsonProvider:
-        return _JsonProvider(
-            '{"decision":"text_only","confidence":0.88,"reason":"selector gate"}',
-            model=self.model or "",
-        )
-
-
-class _WindowCatalog:
-    def __init__(self, windows: dict[str, int]) -> None:
-        self.windows = windows
-
-    def resolve_context_window_with_source(
-        self,
-        model_id: str,
-        *,
-        provider: str = "",
-    ) -> tuple[int, str]:
-        del provider
-        return self.windows[model_id], "catalog"
-
-    def resolve_context_window(self, model_id: str, provider: str = "") -> int:
-        del provider
-        return self.windows[model_id]
-
-    def resolve_max_tokens(
-        self,
-        model_id: str,
-        user_override: int = 0,
-        provider: str = "",
-    ) -> int:
-        del model_id, provider
-        return max(1, user_override or 256)
-
-
-class _UsageSink:
-    def __init__(self) -> None:
-        self.started: list[UsageCallStart] = []
-        self.finalized: list[tuple[UsageCallStart, UsageCallResult]] = []
-        self.unknown: list[tuple[UsageCallStart, str]] = []
-
-    async def start(self, call: UsageCallStart) -> None:
-        self.started.append(call)
-
-    async def finalize(self, call: UsageCallStart, result: UsageCallResult) -> None:
-        self.finalized.append((call, result))
-
-    async def mark_unknown(self, call: UsageCallStart, reason: str) -> None:
-        self.unknown.append((call, reason))
-
-
-def _ctx(message: str, metadata: dict[str, Any] | None = None) -> TurnContext:
-    config = GatewayConfig(llm={"provider": "openrouter"})
-    return TurnContext(
+async def _prepare(
+    message: str,
+    *,
+    config: GatewayConfig | None = None,
+    manager: SessionManager | None = None,
+    session_key: str = "agent:main:image-context",
+    attachments: list[dict[str, Any]] | None = None,
+    **kwargs: Any,
+) -> Any:
+    provider = _NoAuxiliaryProvider()
+    runner = TurnRunner(provider_selector=None, session_manager=manager, config=config or _config())
+    turn, resolved = await runner._run_pipeline(
         message=message,
-        session_key="agent:main:test",
-        config=config,
-        provider=_FailProvider(),
-        model="text-model",
+        semantic_message=message,
+        session_key=session_key,
+        provider=provider,
+        cloned_selector=None,
         tool_defs=[],
-        system_prompt="system",
-        metadata=metadata or {},
-        raw_message=message,
+        base_prompt="Synthetic test prompt.",
+        attachments=attachments or [],
+        **kwargs,
     )
+    assert resolved is provider
+    assert provider.calls == []
+    assert not any("vision_followup_gate" in key for key in turn.metadata)
+    assert turn.raw_message == message
+    return turn
 
 
-@pytest.mark.asyncio
-async def test_gate_skips_when_no_history_image() -> None:
-    ctx = await apply_vision_followup_gate(_ctx("plain text"))
-
-    assert ctx.metadata["router_vision_followup_gate_decision"] == "not_applicable"
-    assert ctx.metadata.get("router_vision_followup_needs_image") is not True
+def _image() -> dict[str, str]:
+    return {"mime": "image/png", "data": base64.b64encode(image_bytes()).decode("ascii")}
 
 
-@pytest.mark.asyncio
-async def test_gate_skips_when_current_turn_has_image() -> None:
-    ctx = _ctx("describe this", {"router_history_has_recent_image": True})
-    ctx.attachments.append({"mime": "image/png", "data": "abc"})
-
-    out = await apply_vision_followup_gate(ctx)
-
-    assert out.metadata["router_vision_followup_gate_decision"] == "current_image"
-    assert out.metadata.get("router_vision_followup_needs_image") is not True
-
-
-@pytest.mark.parametrize("gate_enabled", [False, True])
-async def test_existing_image_opt_out_beats_current_upload_and_explicit_id(
-    gate_enabled: bool,
-) -> None:
-    ctx = _ctx(
-        "Compare the previous image.",
-        {
-            "router_vision_followup_gate_source": "explicit_opt_out",
-            "router_vision_followup_needs_image": True,
-            "image_intent_attachment_ids": ["att_previous"],
-        },
-    )
-    ctx.config.squilla_router.vision_followup_gate_enabled = gate_enabled
-    ctx.attachments.append({"mime": "image/png", "data": "abc"})
-
-    out = await apply_vision_followup_gate(ctx)
-
-    assert out.metadata["router_vision_followup_gate_source"] == "explicit_opt_out"
-    assert out.metadata["router_vision_followup_needs_image"] is False
-    assert len(out.attachments) == 1
-
-
-@pytest.mark.parametrize("gate_enabled", [False, True])
-@pytest.mark.parametrize("current_upload", [False, True])
+@pytest.mark.parametrize(
+    "current_image,history_image", [(False, False), (False, True), (True, False), (True, True)]
+)
 @pytest.mark.parametrize(
     "message",
     [
-        "Ignore the earlier screenshot att_example; answer the text question.",
-        "忽略之前那张截图 att_example，只回答文字问题。",
+        "Compare the latest image with the two earlier images.",
+        "Ignore only the first image and inspect the second.",
+        "Do not inspect any pictures; answer the text question.",
+        "不要只看第一张，请比较另外两张。",
+        "Ignoring image content, write a short greeting.",
+        "A plain text follow-up without attachment references.",
     ],
 )
-async def test_current_text_opt_out_overrides_attachment_id_intent(
-    gate_enabled: bool, current_upload: bool, message: str,
+async def test_wording_does_not_select_or_remove_image_context(
+    current_image: bool, history_image: bool, message: str
 ) -> None:
-    ctx = _ctx(
+    turn = await _prepare(
         message,
-        {
-            "router_history_has_recent_image": True,
-            "router_vision_followup_gate_source": "explicit_attachment_id",
-            "router_vision_followup_needs_image": True,
-            "image_intent_attachment_ids": ["att_example"],
-        },
+        attachments=[_image()] if current_image else [],
+        history_has_recent_image=history_image,
+        history_image_turn_count=2 if history_image else 0,
+        turns_since_last_image=1 if history_image else None,
     )
-    ctx.config.squilla_router.vision_followup_gate_enabled = gate_enabled
-    if current_upload:
-        ctx.attachments.append({"mime": "image/png", "data": "abc"})
-
-    out = await apply_vision_followup_gate(ctx)
-
-    assert out.metadata["router_vision_followup_gate_decision"] == "text_only"
-    assert out.metadata["router_vision_followup_gate_source"] == "explicit_opt_out"
-    assert out.metadata["router_vision_followup_needs_image"] is False
-    assert len(out.attachments) == int(current_upload)
+    assert turn.metadata["image_context_has_images"] is (current_image or history_image)
+    assert not turn.metadata.get("image_intent_attachment_ids")
+    assert len(turn.attachments) == int(current_image)
 
 
-async def test_disabled_gate_preserves_positive_attachment_id_intent() -> None:
-    ctx = _ctx(
-        "Describe the earlier screenshot att_example.",
-        {
-            "router_vision_followup_gate_source": "explicit_attachment_id",
-            "router_vision_followup_needs_image": True,
-            "image_intent_attachment_ids": ["att_example"],
-        },
+@pytest.mark.parametrize("gate_enabled", [False, True])
+async def test_legacy_gate_configuration_is_readable_but_inactive(gate_enabled: bool) -> None:
+    config = _config(
+        vision_followup_gate_enabled=gate_enabled,
+        vision_followup_gate_model="unused-selection-model",
+        vision_followup_gate_tier="c0",
+        vision_followup_gate_timeout_seconds=0.1,
+        vision_followup_gate_max_output_tokens=16,
+        vision_followup_gate_fallback_recent_turns=0,
+        vision_followup_gate_unknown_policy="text_only",
     )
-    ctx.config.squilla_router.vision_followup_gate_enabled = False
-
-    out = await apply_vision_followup_gate(ctx)
-
-    assert out.metadata["router_vision_followup_gate_decision"] == "disabled"
-    assert out.metadata["router_vision_followup_gate_source"] == "explicit_attachment_id"
-    assert out.metadata["router_vision_followup_needs_image"] is True
-
-
-
-
-@pytest.mark.asyncio
-async def test_gate_accepts_needs_image_json() -> None:
-    provider = _JsonProvider(
-        '{"decision":"needs_image","confidence":0.91,"reason":"spatial reference"}'
+    restored = GatewayConfig.model_validate(config.model_dump())
+    assert restored.squilla_router.vision_followup_gate_enabled is gate_enabled
+    assert restored.squilla_router.vision_followup_gate_model == "unused-selection-model"
+    turn = await _prepare(
+        "Do not use the first image; compare the remaining images.",
+        config=restored,
+        history_has_recent_image=True,
     )
-    ctx = _ctx(
-        "What is in the upper right?",
-        {
-            "router_history_has_recent_image": True,
-            "router_turns_since_last_image": 1,
-            "router_last_image_turn_text": "Describe this screenshot.",
-            "router_history_user_texts": ["Describe this screenshot."],
-        },
-    )
-    ctx.provider = provider
-
-    out = await apply_vision_followup_gate(ctx)
-
-    assert out.metadata["router_vision_followup_gate_decision"] == "needs_image"
-    assert out.metadata["router_vision_followup_needs_image"] is True
-    assert out.metadata["router_vision_followup_gate_confidence"] == 0.91
-    assert out.metadata["router_vision_followup_gate_reason"] == "spatial reference"
-    assert provider.calls[0]["tools"] == []
-    assert provider.calls[0]["config"].provider_request_max_chars > 0
+    assert turn.metadata["image_context_has_images"] is True
 
 
-@pytest.mark.asyncio
-async def test_gate_prefers_dedicated_gate_chat_over_primary_provider() -> None:
-    gate_chat = _RecordingGateChat(
-        '{"decision":"needs_image","confidence":0.93,"reason":"dedicated gate"}'
-    )
-    ctx = _ctx(
-        "Does the right side matter?",
-        {
-            "router_history_has_recent_image": True,
-            "router_turns_since_last_image": 1,
-            "router_vision_followup_gate_chat": gate_chat,
-            "router_vision_followup_gate_model": "deepseek/deepseek-v4-flash",
-        },
-    )
-    ctx.provider_request_correlation = ProviderRequestCorrelation(
-        session_id="session-1",
-        turn_id="turn-1",
-        execution_id="root-execution",
-        call_kind="agent.chat",
-    )
-
-    out = await apply_vision_followup_gate(ctx)
-
-    assert out.metadata["router_vision_followup_gate_decision"] == "needs_image"
-    assert out.metadata["router_vision_followup_gate_source"] == "llm"
-    assert out.metadata["router_vision_followup_gate_model"] == "deepseek/deepseek-v4-flash"
-    assert gate_chat.calls
-    correlation = gate_chat.calls[0]["config"].provider_request_correlation
-    assert correlation.session_id == "session-1"
-    assert correlation.turn_id == "turn-1"
-    assert correlation.execution_id != "root-execution"
-    assert correlation.call_kind == "auxiliary.vision_gate"
-
-
-@pytest.mark.asyncio
-async def test_runtime_gate_chat_uses_configured_lightweight_tier_model() -> None:
-    config = GatewayConfig(llm={"provider": "openrouter"})
-    runner = TurnRunner(provider_selector=None, config=config)
-    selector = _RecordingSelector()
-
-    chat, model = runner._make_vision_followup_gate_chat(selector)
-
-    assert model == "deepseek/deepseek-v4-flash"
-    assert callable(chat)
-    assert selector.clones[0].model == "deepseek/deepseek-v4-flash"
-    events = [
-        event
-        async for event in chat(
-            [Message(role="user", content="{}")],
-            tools=[],
-            config=ChatConfig(),
-        )
-    ]
-    assert any(isinstance(event, TextDeltaEvent) for event in events)
-
-
-@pytest.mark.asyncio
-async def test_dedicated_gate_budget_uses_small_gate_window_not_large_primary(
-    monkeypatch: pytest.MonkeyPatch,
+@pytest.mark.parametrize("window", [0, 1, 8])
+async def test_legacy_history_window_does_not_change_active_image_context(
+    window: int,
 ) -> None:
-    catalog = _WindowCatalog(
-        {
-            "base-large": 128_000,
-            "gate-small": 2_048,
-        }
+    turn = await _prepare(
+        "What about the picture?",
+        config=_config(vision_history_lookback_turns=window),
+        history_has_recent_image=True,
     )
-    monkeypatch.setattr(auxiliary_budget, "shared_catalog", lambda: catalog)
-    config = GatewayConfig(
-        llm={"provider": "openrouter", "model": "base-large"},
-        squilla_router={"vision_followup_gate_model": "gate-small"},
-    )
-    runner = TurnRunner(provider_selector=None, config=config)
-    selector = _RecordingSelector()
-    chat, model = runner._make_vision_followup_gate_chat(selector)
-    assert callable(chat)
-    assert model == "gate-small"
-
-    primary = _JsonProvider("unused", model="base-large")
-    ctx = _ctx(
-        "Does the right side matter?",
-        {
-            "router_history_has_recent_image": True,
-            "router_turns_since_last_image": 1,
-            "router_vision_followup_gate_chat": chat,
-            "router_vision_followup_gate_model": model,
-        },
-    )
-    ctx.config = config
-    ctx.provider = primary
-    ctx.model = "base-large"
-
-    out = await apply_vision_followup_gate(ctx)
-
-    # The closure owns the provider returned by its original resolve(), so
-    # inspect the target attached by TurnRunner rather than resolving again.
-    execution_target = getattr(
-        chat,
-        "_opensquilla_vision_gate_execution_target",
-    )
-    gate_provider = execution_target.provider
-    gate_config = gate_provider.calls[0]["config"]
-    gate_budget = auxiliary_budget.resolve_auxiliary_request_budget(
-        gate_provider,
-        max_output_tokens=config.squilla_router.vision_followup_gate_max_output_tokens,
-        model="gate-small",
-    )
-    primary_budget = auxiliary_budget.resolve_auxiliary_request_budget(
-        primary,
-        max_output_tokens=config.squilla_router.vision_followup_gate_max_output_tokens,
-        model="base-large",
-    )
-
-    assert out.metadata["router_vision_followup_gate_decision"] == "text_only"
-    assert gate_config.provider_request_max_chars == gate_budget.provider_request_max_chars
-    assert gate_config.provider_request_max_chars < primary_budget.provider_request_max_chars
+    assert turn.metadata["image_context_has_images"] is True
 
 
-@pytest.mark.asyncio
-async def test_runtime_gate_chat_records_one_child_execution() -> None:
-    sink = _UsageSink()
-    config = GatewayConfig(llm={"provider": "openrouter"})
-    runner = TurnRunner(provider_selector=None, config=config, usage_event_sink=sink)
-    selector = _RecordingSelector()
-    parent = UsageExecutionContext(
-        execution_id="turn-1",
-        agent_run_id="turn-1",
-        turn_id="turn-1",
-        session_id="session-1",
-        session_epoch=3,
-        agent_id="main",
-        run_kind="webchat",
-    )
-
-    chat, _ = runner._make_vision_followup_gate_chat(selector, parent)
-    assert callable(chat)
-    _ = [
-        event
-        async for event in chat(
-            [Message(role="user", content="{}")],
-            tools=[],
-            config=ChatConfig(),
+@pytest_asyncio.fixture
+async def persisted_image(tmp_path: Path) -> AsyncIterator[tuple[Any, Any, str]]:
+    storage = SessionStorage(str(tmp_path / "image-context.db"))
+    await storage.connect()
+    try:
+        manager = SessionManager(storage, inject_time_prefix=False)
+        node = await manager.create("agent:main:image-context")
+        entry = await manager.append_message(
+            node.session_key,
+            "user",
+            json.dumps({"text": "A synthetic image.", "attachments": [_image()]}),
         )
-    ]
-
-    assert len(sink.started) == 1
-    call = sink.started[0]
-    assert call.execution_id != "turn-1"
-    assert call.parent_turn_id == "turn-1"
-    assert call.session_id == "session-1"
-    assert call.session_epoch == 3
-    assert call.run_kind == "vision_followup_gate"
-    assert len(sink.finalized) == 1
-    assert sink.unknown == []
+        manifest = build_attachment_manifest(
+            [entry], session_id=node.session_id, session_key=node.session_key
+        )
+        yield manager, node, manifest.occurrences[0].attachment_id
+    finally:
+        await storage.close()
 
 
-@pytest.mark.asyncio
-async def test_gate_accepts_json_from_done_reasoning_content() -> None:
-    ctx = _ctx(
-        "Does the right side matter?",
-        {
-            "router_history_has_recent_image": True,
-            "router_turns_since_last_image": 1,
-        },
+@pytest.mark.parametrize(
+    "template", ["Describe {id}.", "Do not use {id}.", "只看其他图片，忽略 {id}。"]
+)
+async def test_free_text_attachment_id_is_left_for_the_model(
+    persisted_image: tuple[Any, Any, str], template: str
+) -> None:
+    manager, node, attachment_id = persisted_image
+    turn = await _prepare(
+        template.format(id=attachment_id),
+        manager=manager,
+        session_key=node.session_key,
+        expected_session_id=node.session_id,
+        expected_session_epoch=node.epoch,
     )
-    ctx.provider = _ReasoningOnlyProvider(
-        '{"decision":"needs_image","confidence":0.77,"reason":"reasoning json"}'
+    assert turn.metadata["image_context_has_images"] is False
+    assert "image_intent_attachment_ids" not in turn.metadata
+
+
+async def test_structured_attachment_reference_preserves_exact_id(
+    persisted_image: tuple[Any, Any, str],
+) -> None:
+    manager, node, attachment_id = persisted_image
+    turn = await _prepare(
+        "Inspect the attached item.",
+        manager=manager,
+        session_key=node.session_key,
+        config=_config(vision_history_lookback_turns=0),
+        attachments=[{"resourceRef": {"type": "attachment", "id": attachment_id}}],
+        expected_session_id=node.session_id,
+        expected_session_epoch=node.epoch,
     )
-
-    out = await apply_vision_followup_gate(ctx)
-
-    assert out.metadata["router_vision_followup_gate_decision"] == "needs_image"
-    assert out.metadata["router_vision_followup_needs_image"] is True
-    assert out.metadata["router_vision_followup_gate_confidence"] == 0.77
-    assert out.metadata["router_vision_followup_gate_reason"] == "reasoning json"
-    assert out.metadata["router_vision_followup_gate_source"] == "llm"
+    assert turn.metadata["image_context_has_images"] is True
+    assert turn.metadata["image_intent_attachment_ids"] == [attachment_id]
 
 
-@pytest.mark.asyncio
-async def test_gate_accepts_text_only_json() -> None:
-    provider = _JsonProvider(
-        '{"decision":"text_only","confidence":0.84,"reason":"asks for code"}'
+async def test_unknown_structured_id_does_not_claim_image_context(
+    persisted_image: tuple[Any, Any, str],
+) -> None:
+    manager, node, _ = persisted_image
+    turn = await _prepare(
+        "Inspect the attached item.",
+        manager=manager,
+        session_key=node.session_key,
+        attachments=[{"resourceRef": {"type": "attachment", "id": "att_missing_12345"}}],
+        expected_session_id=node.session_id,
+        expected_session_epoch=node.epoch,
     )
-    ctx = _ctx("Write a Python script.", {"router_history_has_recent_image": True})
-    ctx.provider = provider
-
-    out = await apply_vision_followup_gate(ctx)
-
-    assert out.metadata["router_vision_followup_gate_decision"] == "text_only"
-    assert out.metadata["router_vision_followup_needs_image"] is False
-    assert out.metadata["router_vision_followup_gate_confidence"] == 0.84
-
-
-@pytest.mark.parametrize("gate_enabled", [False, True])
-async def test_gate_respects_explicit_english_image_opt_out(gate_enabled: bool) -> None:
-    ctx = _ctx(
-        "Do not use or inspect the previous image. Reply exactly: TEXT-ONLY",
-        {
-            "router_history_has_recent_image": True,
-            "router_turns_since_last_image": 1,
-        },
-    )
-
-    ctx.config.squilla_router.vision_followup_gate_enabled = gate_enabled
-
-    out = await apply_vision_followup_gate(ctx)
-
-    assert out.metadata["router_vision_followup_gate_decision"] == "text_only"
-    assert out.metadata["router_vision_followup_gate_source"] == "explicit_opt_out"
-    assert out.metadata["router_vision_followup_needs_image"] is False
-
-
-@pytest.mark.parametrize("gate_enabled", [False, True])
-async def test_gate_respects_explicit_chinese_image_opt_out(gate_enabled: bool) -> None:
-    ctx = _ctx(
-        "不要看上一张图片，直接回答：TEXT-ONLY",
-        {
-            "router_history_has_recent_image": True,
-            "router_turns_since_last_image": 1,
-        },
-    )
-
-    ctx.config.squilla_router.vision_followup_gate_enabled = gate_enabled
-
-    out = await apply_vision_followup_gate(ctx)
-
-    assert out.metadata["router_vision_followup_gate_decision"] == "text_only"
-    assert out.metadata["router_vision_followup_gate_source"] == "explicit_opt_out"
-    assert out.metadata["router_vision_followup_needs_image"] is False
-
-
-@pytest.mark.asyncio
-async def test_gate_accepts_explicit_chinese_previous_image_reference() -> None:
-    ctx = _ctx(
-        "上一张图片是什么颜色？",
-        {
-            "router_history_has_recent_image": True,
-            "router_turns_since_last_image": 1,
-        },
-    )
-
-    out = await apply_vision_followup_gate(ctx)
-
-    assert out.metadata["router_vision_followup_gate_decision"] == "needs_image"
-    assert out.metadata["router_vision_followup_gate_source"] == "explicit_image_reference"
-    assert out.metadata["router_vision_followup_needs_image"] is True
-
-
-@pytest.mark.asyncio
-async def test_gate_accepts_explicit_english_previous_image_reference() -> None:
-    ctx = _ctx(
-        "What color was the previous image?",
-        {
-            "router_history_has_recent_image": True,
-            "router_turns_since_last_image": 1,
-        },
-    )
-
-    out = await apply_vision_followup_gate(ctx)
-
-    assert out.metadata["router_vision_followup_gate_decision"] == "needs_image"
-    assert out.metadata["router_vision_followup_gate_source"] == "explicit_image_reference"
-    assert out.metadata["router_vision_followup_needs_image"] is True
-
-
-@pytest.mark.asyncio
-async def test_gate_unknown_recent_falls_back_to_image() -> None:
-    provider = _JsonProvider(
-        '{"decision":"unknown","confidence":0.2,"reason":"ambiguous pronoun"}'
-    )
-    ctx = _ctx(
-        "What about this?",
-        {
-            "router_history_has_recent_image": True,
-            "router_turns_since_last_image": 1,
-        },
-    )
-    ctx.provider = provider
-
-    out = await apply_vision_followup_gate(ctx)
-
-    assert out.metadata["router_vision_followup_gate_decision"] == "unknown"
-    assert out.metadata["router_vision_followup_needs_image"] is True
-    assert out.metadata["router_vision_followup_fallback"] == "image_if_recent"
-
-
-@pytest.mark.asyncio
-async def test_gate_provider_error_fails_closed_without_raw_error_reason() -> None:
-    ctx = _ctx(
-        "What about this?",
-        {
-            "router_history_has_recent_image": True,
-            "router_turns_since_last_image": 1,
-        },
-    )
-    ctx.provider = _RaisingProvider()
-
-    out = await apply_vision_followup_gate(ctx)
-
-    assert out.metadata["router_vision_followup_gate_decision"] == "unknown"
-    assert out.metadata["router_vision_followup_gate_source"] == "error"
-    assert out.metadata["router_vision_followup_gate_reason"] == "RuntimeError"
-    assert out.metadata["router_vision_followup_needs_image"] is False
-    assert "router_vision_followup_fallback" not in out.metadata
-
-
-@pytest.mark.asyncio
-async def test_gate_unknown_old_falls_back_to_text() -> None:
-    provider = _JsonProvider(
-        '{"decision":"unknown","confidence":0.2,"reason":"ambiguous but old"}'
-    )
-    ctx = _ctx(
-        "What about this?",
-        {
-            "router_history_has_recent_image": True,
-            "router_turns_since_last_image": 3,
-        },
-    )
-    ctx.provider = provider
-
-    out = await apply_vision_followup_gate(ctx)
-
-    assert out.metadata["router_vision_followup_gate_decision"] == "unknown"
-    assert out.metadata["router_vision_followup_needs_image"] is False
+    assert turn.metadata["image_context_has_images"] is False
+    assert "image_intent_attachment_ids" not in turn.metadata
