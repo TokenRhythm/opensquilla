@@ -3451,11 +3451,11 @@
     "gatewayReconnecting": "Reconectando con el Gateway…",
     "automaticRecoveryDescription": "La recuperación es automática. Puedes seguir editando; el texto y los archivos sin enviar se conservan aquí.",
     "liveUnavailable": "Las actualizaciones en tiempo real no están disponibles temporalmente",
-    "liveUnavailableDescription": "El historial sigue disponible. Vuelve a conectarte antes de enviar.",
-    "liveUnavailableConnectedDescription": "La pasarela está conectada. Las actualizaciones en tiempo real de esta sesión se recuperarán automáticamente.",
+    "liveUnavailableDescription": "El historial sigue disponible. El envío se reanudará cuando se recuperen las actualizaciones en tiempo real.",
+    "liveUnavailableConnectedDescription": "La pasarela está conectada. Las actualizaciones en tiempo real de esta sesión no están disponibles temporalmente.",
     "reconnectLive": "Volver a conectar",
     "liveSendBlockedConnecting": "Se están restaurando las actualizaciones en tiempo real. Tu borrador está guardado.",
-    "liveSendBlockedDegraded": "Vuelve a conectar las actualizaciones en tiempo real antes de enviar. Tu borrador está guardado.",
+    "liveSendBlockedDegraded": "Las actualizaciones en tiempo real no están disponibles temporalmente. Tu borrador está guardado.",
     "noMessagesYet": "Aún no hay mensajes.",
     "newChat": "Nueva tarea",
     "chatWithSuffix": "Chat {suffix}",
@@ -4225,7 +4225,7 @@
       "unknownProviderCalls": "{count} llamada al proveedor tiene uso desconocido | {count} llamadas al proveedor tienen uso desconocido"
     },
     "modelRouting": {
-      "updateFailed": "No se pudo cambiar el enrutamiento de modelos — revertido. Comprueba la conexión con la pasarela e inténtalo de nuevo.",
+      "updateFailed": "No se pudo cambiar el enrutamiento de modelos — revertido. El cambio no está disponible temporalmente.",
       "sessionUpdateFailed": "No se pudo actualizar el enrutamiento de modelos de este chat: {error}"
     },
     "routeFeedback": {

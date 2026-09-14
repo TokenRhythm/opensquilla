@@ -3451,11 +3451,11 @@
     "gatewayReconnecting": "Reconnexion au Gateway…",
     "automaticRecoveryDescription": "La récupération est automatique. Vous pouvez continuer à écrire ; le texte et les pièces jointes non envoyés restent ici.",
     "liveUnavailable": "Les mises à jour en direct sont temporairement indisponibles",
-    "liveUnavailableDescription": "L’historique reste disponible. Reconnectez-vous avant d’envoyer.",
-    "liveUnavailableConnectedDescription": "La Gateway est connectée. Les mises à jour en direct de cette session seront rétablies automatiquement.",
+    "liveUnavailableDescription": "L’historique reste disponible. L’envoi reprendra une fois les mises à jour en direct rétablies.",
+    "liveUnavailableConnectedDescription": "La Gateway est connectée. Les mises à jour en direct de cette session sont temporairement indisponibles.",
     "reconnectLive": "Se reconnecter",
     "liveSendBlockedConnecting": "Les mises à jour en direct se reconnectent. Votre brouillon est conservé.",
-    "liveSendBlockedDegraded": "Reconnectez les mises à jour en direct avant d’envoyer. Votre brouillon est conservé.",
+    "liveSendBlockedDegraded": "Les mises à jour en direct sont temporairement indisponibles. Votre brouillon est conservé.",
     "noMessagesYet": "Aucun message pour l'instant.",
     "newChat": "Nouvelle tâche",
     "chatWithSuffix": "Chat {suffix}",
@@ -4225,7 +4225,7 @@
       "unknownProviderCalls": "{count} appel fournisseur a une utilisation inconnue | {count} appels fournisseur ont une utilisation inconnue"
     },
     "modelRouting": {
-      "updateFailed": "Impossible de changer le routage des modèles — rétabli. Vérifiez la connexion à la passerelle et réessayez.",
+      "updateFailed": "Impossible de changer le routage des modèles — rétabli. La modification est temporairement indisponible.",
       "sessionUpdateFailed": "Impossible de mettre à jour le routage des modèles de ce chat : {error}"
     },
     "routeFeedback": {

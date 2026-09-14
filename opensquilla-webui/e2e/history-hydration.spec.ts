@@ -452,7 +452,7 @@ test('recovers initial history failure automatically without stealing draft focu
 
   await composer.fill('Keep editing while history recovers.')
   await expect(loadState).toContainText(
-    'Recovering automatically. You can keep editing; unsent text and attachments stay here.',
+    'Conversation history is temporarily unavailable.',
   )
   await expect(loadState).toHaveAttribute('role', 'status')
   await expect(thread).toHaveAttribute('aria-busy', 'false')

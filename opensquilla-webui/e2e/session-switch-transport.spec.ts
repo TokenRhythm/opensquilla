@@ -392,7 +392,7 @@ test('workspace navigation keeps one transport while the target subscription rec
     '[data-testid="chat-session-recovery-status"][data-recovery-state="live-connecting"]',
   )
   await expect(liveRecovery).toContainText(
-    'Recovering automatically. You can keep editing; unsent text and attachments stay here.',
+    'Conversation history is temporarily unavailable.',
   )
   await expect(liveRecovery).toHaveAttribute('role', 'status')
 

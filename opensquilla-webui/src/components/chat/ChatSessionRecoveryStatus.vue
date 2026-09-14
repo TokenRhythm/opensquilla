@@ -3,8 +3,8 @@
     ref="statusRef"
     class="chat-session-recovery-status"
     :class="`chat-session-recovery-status--${state}`"
-    :role="isFailure ? 'alert' : 'status'"
-    :aria-live="isFailure ? 'assertive' : 'polite'"
+    :role="isFailure && actionKey ? 'alert' : 'status'"
+    :aria-live="isFailure && actionKey ? 'assertive' : 'polite'"
     aria-atomic="true"
     :data-recovery-state="state"
     data-testid="chat-session-recovery-status"
@@ -47,7 +47,7 @@ import type { ChatSessionRecoveryState } from '@/utils/chat/sessionLoadState'
 const props = defineProps<{
   state: ChatSessionRecoveryState
   transportState?: 'disconnected' | 'connecting' | 'connected'
-  action?: 'retry-history' | 'retry-live' | 'relogin'
+  action?: 'retry-history' | 'retry-live'
 }>()
 
 const emit = defineEmits<{
@@ -105,9 +105,7 @@ const description = computed(() => {
   })
 const action = computed(() => props.action === 'retry-live'
   ? t('chat.reconnectLive')
-  : props.action === 'relogin'
-    ? t('common.relogin')
-    : t('chat.reloadSession'))
+  : t('chat.reloadSession'))
 
 function requestRetry() {
   emit('retry')
