@@ -495,14 +495,19 @@ ttl_sweep_interval_minutes = 0
     assert.ok(!state.document_publications.some(row => [stable.get(a).documentId, stable.get(b).documentId].includes(row.document_id)), 'Child workflow published a working HTML Document.')
     await assertDefaultUntouched(state)
     const childTranscript = state.transcript_entries.filter(row => row.session_id === child.session_id)
-    const childWrites = childTranscript.flatMap(row => JSON.parse(row.tool_calls || '[]')).filter(call => {
-      const tool = call.function || call
-      const args = typeof tool.arguments === 'string' ? JSON.parse(tool.arguments) : tool.arguments
-      return tool.name === 'write_file' && args?.path === 'child.txt' && args.content === fixture.childFixture.content
-    })
+    // Canonical transcript tool_calls contains content blocks, including the
+    // result; it is not the provider's function/arguments wire representation.
+    const childBlocks = childTranscript.flatMap(row => JSON.parse(row.tool_calls || '[]'))
+    const childWrites = childBlocks.filter(block => block.type === 'tool_use'
+      && block.name === 'write_file' && block.input?.path === 'child.txt'
+      && block.input.content === fixture.childFixture.content)
     assert.equal(childWrites.length, 1, 'Persisted child transcript must attribute exactly one real child.txt write to the child.')
-    const writeReceipt = childTranscript.find(row => row.role === 'tool' && row.tool_call_id === childWrites[0].id)
-    assert.ok(writeReceipt?.content?.includes('Written ') && writeReceipt.content.includes('child.txt'), 'Persisted child write receipt missing.')
+    const writeReceipts = childBlocks.filter(block => block.type === 'tool_result'
+      && block.name === 'write_file' && block.tool_use_id === childWrites[0].tool_use_id)
+    assert.equal(writeReceipts.length, 1, 'Exactly one persisted result must match the child write tool_use_id.')
+    const writeReceipt = writeReceipts[0]
+    assert.equal(writeReceipt.is_error, false, 'Persisted child write failed.')
+    assert.equal(writeReceipt.result, `Written ${Buffer.byteLength(fixture.childFixture.content)} bytes to ${join(stable.get(a).binding.root, 'child.txt')}`, 'Child write receipt must identify the exact parent workspace file and byte count.')
     report.child = { spawned, child, childTranscript, writeReceipt, completed: provider.snapshot().completed, publications: state.document_publications, deliverables: state.deliverables, revisionsAfterChild: state.artifact_revisions, fileSha256: hash(await readFile(join(stable.get(a).binding.root, 'child.txt'))) }
     await screenshot('web-child-complete')
   }
