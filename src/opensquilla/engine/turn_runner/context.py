@@ -132,8 +132,6 @@ class TurnContext:
     agent_config: AgentConfig | None = None
     effective_runtime_timeout: float = 0.0
     effective_max_iterations: int = 0
-    effective_iteration_timeout: float = 0.0
-    effective_tool_timeout: float = 0.0
     effective_request_timeout: float = 0.0
     effective_max_provider_retries: int = 0
     model_capabilities: ModelCapabilities | None = None

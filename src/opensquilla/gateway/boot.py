@@ -61,7 +61,7 @@ from opensquilla.gateway.session_lifecycle import (
     apply_task_lifecycle_to_session,
     session_status_for_task_status,
 )
-from opensquilla.gateway.session_services import get_session_lock, get_session_storage
+from opensquilla.gateway.session_services import get_session_storage
 from opensquilla.gateway.session_streams import get_session_streams, reset_session_streams
 from opensquilla.gateway.task_runtime import TaskRuntimeShutdownResult
 from opensquilla.gateway.terminal_activity import (
@@ -1399,110 +1399,53 @@ async def dispatch_task_runtime_turn(
     )
     from opensquilla.engine.stream_wrappers import is_context_bound_owner
 
-    try:
-        with accepted_turn_config_scope(getattr(run, "accepted_config", None)):
-            raw_stream = turn_runner.run(run.message, run.session_key, **run_kwargs)
-            adopter = run.envelope.runtime_services.get("generated_artifact_adopter")
-            from opensquilla.gateway.working_versions import with_working_versions
+    with accepted_turn_config_scope(getattr(run, "accepted_config", None)):
+        raw_stream = turn_runner.run(run.message, run.session_key, **run_kwargs)
+        adopter = run.envelope.runtime_services.get("generated_artifact_adopter")
+        from opensquilla.gateway.working_versions import with_working_versions
 
-            async def emit_working_version(payload: dict[str, Any]) -> None:
-                await event_emitter(run.session_key, "session.event.artifact_state", payload)
+        async def emit_working_version(payload: dict[str, Any]) -> None:
+            await event_emitter(run.session_key, "session.event.artifact_state", payload)
 
-            raw_stream = with_working_versions(
-                raw_stream,
-                config=config,
-                session_manager=session_manager,
-                session_key=run.session_key,
-                session_id=run.envelope.session_id or getattr(session, "session_id", None),
-                workspace=tool_context.workspace_dir,
-                actor_id=run.task_id,
-                event_emitter=getattr(adopter, "event_emitter", None) or emit_working_version,
-                preview_service=getattr(adopter, "preview_service", None),
-            )
-            await _emit_task_runtime_stream_events(
-                raw_stream,
-                run.session_key,
-                event_emitter,
-                idle_timeout=stream_idle_timeout,
-                heartbeat_interval=heartbeat_interval,
-                context_bound=is_context_bound_owner(turn_runner),
-                stream_event_sink=getattr(run, "stream_event_sink", None),
-                task_id=getattr(run, "task_id", None),
-                session_id=getattr(run, "session_id", None),
-                session_epoch=getattr(run, "session_epoch", None),
-                client_message_id=getattr(run.envelope, "metadata", {}).get("client_message_id"),
-                user_message_id=getattr(run, "persisted_user_message_id", None),
-                surface_id=getattr(run.envelope, "metadata", {}).get("surface_id"),
-                input_mode=getattr(run, "input_mode", "user"),
-                run_kind=getattr(run, "run_kind", None),
-            )
-            finalizer_receipt_sink = getattr(run, "finalizer_receipt_sink", None)
-            if finalizer_receipt_sink is not None:
-                try:
-                    finalizer_receipt_sink()
-                except Exception:
-                    log.warning(
-                        "task_runtime.finalizer_receipt_failed",
-                        session_key=run.session_key,
-                        task_id=getattr(run, "task_id", None),
-                        exc_info=True,
-                    )
-    except TaskRuntimeStreamError as exc:
-        if exc.code in {
-            "provider_request_budget_exhausted",
-            "provider_request_too_large",
-            "current_turn_context_exhausted",
-        } and (
-            str(getattr(run.envelope, "metadata", {}).get("turn_context_intent") or "")
-            != "goal_set"
-        ):
-            rollback_reason = exc.code
-            remove_message = getattr(session_manager, "remove_message", None)
-            raw_message_ids = getattr(run, "persisted_user_message_ids", ())
-            message_ids: list[str] = []
-            for message_id in (
-                getattr(run, "persisted_user_message_id", None),
-                *(raw_message_ids if isinstance(raw_message_ids, list | tuple) else ()),
-            ):
-                if isinstance(message_id, str) and message_id and message_id not in message_ids:
-                    message_ids.append(message_id)
-
-            async def _remove_persisted_messages() -> None:
-                assert callable(remove_message)
-                for persisted_message_id in message_ids:
-                    try:
-                        removed = remove_message(
-                            run.session_key,
-                            persisted_message_id,
-                        )
-                        if inspect.isawaitable(removed):
-                            removed = await removed
-                        if removed:
-                            log.info(
-                                "task_runtime.user_message_rolled_back",
-                                session_key=run.session_key,
-                                message_id=persisted_message_id,
-                                reason=rollback_reason,
-                            )
-                    except Exception as rb_exc:  # noqa: BLE001 - preserve terminal error
-                        # Try every collected id even if one best-effort cleanup
-                        # fails; the provider error remains the terminal cause.
-                        log.warning(
-                            "task_runtime.user_message_rollback_failed",
-                            session_key=run.session_key,
-                            message_id=persisted_message_id,
-                            reason=rollback_reason,
-                            error=str(rb_exc),
-                        )
-
-            if callable(remove_message) and message_ids:
-                rollback_lock = get_session_lock(turn_runner, run.session_key)
-                if rollback_lock is None:
-                    await _remove_persisted_messages()
-                else:
-                    async with rollback_lock:
-                        await _remove_persisted_messages()
-        raise
+        raw_stream = with_working_versions(
+            raw_stream,
+            config=config,
+            session_manager=session_manager,
+            session_key=run.session_key,
+            session_id=run.envelope.session_id or getattr(session, "session_id", None),
+            workspace=tool_context.workspace_dir,
+            actor_id=run.task_id,
+            event_emitter=getattr(adopter, "event_emitter", None) or emit_working_version,
+            preview_service=getattr(adopter, "preview_service", None),
+        )
+        await _emit_task_runtime_stream_events(
+            raw_stream,
+            run.session_key,
+            event_emitter,
+            idle_timeout=stream_idle_timeout,
+            heartbeat_interval=heartbeat_interval,
+            context_bound=is_context_bound_owner(turn_runner),
+            stream_event_sink=getattr(run, "stream_event_sink", None),
+            task_id=getattr(run, "task_id", None),
+            session_id=getattr(run, "session_id", None),
+            session_epoch=getattr(run, "session_epoch", None),
+            client_message_id=getattr(run.envelope, "metadata", {}).get("client_message_id"),
+            user_message_id=getattr(run, "persisted_user_message_id", None),
+            surface_id=getattr(run.envelope, "metadata", {}).get("surface_id"),
+            input_mode=getattr(run, "input_mode", "user"),
+            run_kind=getattr(run, "run_kind", None),
+        )
+        finalizer_receipt_sink = getattr(run, "finalizer_receipt_sink", None)
+        if finalizer_receipt_sink is not None:
+            try:
+                finalizer_receipt_sink()
+            except Exception:
+                log.warning(
+                    "task_runtime.finalizer_receipt_failed",
+                    session_key=run.session_key,
+                    task_id=getattr(run, "task_id", None),
+                    exc_info=True,
+                )
 
 
 def build_session_material_cleanup(config: Any) -> Any:

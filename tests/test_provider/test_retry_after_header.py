@@ -11,6 +11,7 @@ from typing import Any
 import httpx
 import pytest
 
+from opensquilla.provider.codex_auth import CodexCredentials
 from opensquilla.provider.selector import build_provider
 from opensquilla.provider.types import ChatConfig, ErrorEvent, Message
 
@@ -126,3 +127,30 @@ async def test_missing_header_leaves_retry_after_none(
     assert errors
     assert errors[0].code == "429"
     assert errors[0].retry_after_s is None
+
+
+@pytest.mark.parametrize("provider_id", ["openai_codex", "ollama", "openai_responses"])
+@pytest.mark.parametrize(
+    "status,header,expected",
+    [(429, "60", 60.0), (503, "12", 12.0), (400, "60", None), (429, None, None)],
+)
+async def test_other_adapters_preserve_retry_after_without_changing_status(
+    monkeypatch, provider_id, status, header, expected
+):
+    _patch_transport(
+        monkeypatch,
+        lambda: httpx.Response(
+            status,
+            headers={"Retry-After": header} if header is not None else {},
+            json={"error": {"message": "synthetic upstream failure"}},
+        ),
+    )
+    monkeypatch.setattr(
+        "opensquilla.provider.openai_codex.load_codex_credentials",
+        lambda *_args: CodexCredentials(access_token="dummy-oauth"),
+    )
+    provider = build_provider(provider_id, "test-chat-model", api_key=FAKE_API_KEY)
+    errors = await _chat_errors(provider)
+    assert len(errors) == 1
+    assert errors[0].code == str(status)
+    assert errors[0].retry_after_s == expected

@@ -711,6 +711,7 @@
       :title="toolResultModal.title"
       :content="toolResultModal.content"
       :context="toolResultModal.context"
+      :session-key="sessionKey"
       @close="toolResultModal.open = false"
     />
 

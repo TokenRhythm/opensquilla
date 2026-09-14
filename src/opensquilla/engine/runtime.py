@@ -107,6 +107,7 @@ from opensquilla.contracts.turn_execution import TurnExecutionContext
 from opensquilla.engine.agent import PLAN_RUN_DELIVERY_TOOLS, Agent, ToolHandler
 from opensquilla.engine.agent_injection import PendingInputProvider
 from opensquilla.engine.cache_break_monitor import notify_compaction
+from opensquilla.engine.fallback import FallbackPolicy, backoff_sleep, sleep_before_retry
 from opensquilla.engine.hooks import (
     CompactionHook,
     DefaultTraceEmitterHook,
@@ -263,6 +264,7 @@ from opensquilla.provider import (
 from opensquilla.provider import (
     ToolUseStartEvent as ProviderToolUseStartEvent,
 )
+from opensquilla.provider.failures import CONNECTION_FAILED_CODE, is_connection_failure
 from opensquilla.provider.image_projection import (
     ImageProjectionMode,
     assert_text_only_messages,
@@ -1429,6 +1431,8 @@ def _persisted_tool_result_segment(
     }
     if event.tool_presentation is not None:
         segment["tool_presentation"] = dict(event.tool_presentation)
+    if event.execution_log_handle is not None:
+        segment["execution_log_handle"] = event.execution_log_handle
     if event.execution_status is not None:
         segment["execution_status"] = normalize_execution_status(event.execution_status)
 
@@ -2087,7 +2091,11 @@ def _selector_invalid_stream_order_error() -> ProviderErrorEvent:
     )
 
 
-def _selector_stream_exception_error(*, content_started: bool = False) -> ProviderErrorEvent:
+def _selector_stream_exception_error(
+    *,
+    content_started: bool = False,
+    error: BaseException | None = None,
+) -> ProviderErrorEvent:
     """Stable, provider-prose-free projection for an exception-raised stream."""
 
     return ProviderErrorEvent(
@@ -2096,7 +2104,13 @@ def _selector_stream_exception_error(*, content_started: bool = False) -> Provid
             if content_started
             else "The connection to the model provider was interrupted."
         ),
-        code="response_incomplete" if content_started else "request_error",
+        code=(
+            "response_incomplete"
+            if content_started
+            else CONNECTION_FAILED_CODE
+            if error is not None and is_connection_failure(error)
+            else "request_error"
+        ),
     )
 
 
@@ -2114,8 +2128,8 @@ async def _selector_safe_stream(
             yield event
     except (asyncio.CancelledError, UsageAccountingUnavailableError):
         raise
-    except Exception:  # noqa: BLE001 - raw provider prose must stop here
-        yield _selector_stream_exception_error(content_started=content_started())
+    except Exception as exc:  # noqa: BLE001 - raw provider prose must stop here
+        yield _selector_stream_exception_error(content_started=content_started(), error=exc)
     finally:
         # ``aclose`` on this wrapper must deterministically unwind the usage
         # accounting generator beneath it. Relying on async-generator GC left
@@ -2291,6 +2305,7 @@ class _SelectorFallbackProvider:
         self._pending_fallback_hops = 0
         self._last_executed_model = ""
         self._last_request_had_tools = False
+        self._retry_policy = FallbackPolicy()
         self._image_marker_deployment: _FallbackDeploymentIdentity | None = None
         self._image_marker_state = ImageMarkerState.NOT_ANALYZED
         self._image_marker_reason: str | None = None
@@ -2307,6 +2322,110 @@ class _SelectorFallbackProvider:
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._provider, name)
+
+    def configure_retry_policy(self, policy: FallbackPolicy) -> None:
+        self._retry_policy = policy
+
+    async def _retry_provider_stream(
+        self,
+        stream_factory: Callable[[], AsyncGenerator[Any, None]],
+        *,
+        provider: Any,
+        config: Any,
+        content_started: Callable[[], bool],
+        buffer: _SelectorPreTextBuffer,
+    ) -> AsyncGenerator[Any, None]:
+        """Retry the same physical leg before selector fallback sees its failure."""
+        rate_retries = 0
+        connection_retries = 0
+        attempts = 0
+        activity_id = uuid.uuid4().hex
+        physical_limit = max(0, int(getattr(config, "physical_attempt_limit", 0) or 0))
+        while True:
+            attempts += 1
+            retry_error: ProviderErrorEvent | None = None
+            stream = stream_factory()
+            try:
+                async for event in stream:
+                    if not isinstance(event, ProviderErrorEvent):
+                        yield event
+                        continue
+                    can_retry = (
+                        not content_started()
+                        and getattr(provider, "retry_failed_call_safe", True) is not False
+                        and (physical_limit == 0 or attempts < physical_limit)
+                    )
+                    if can_retry and event.code == CONNECTION_FAILED_CODE:
+                        delay = min(60.0, 5.0 * 2 ** min(connection_retries, 4))
+                        connection_retries += 1
+                        attempt, limit = connection_retries, 0
+                        reason: Literal["transport_transient", "rate_limited"] = (
+                            "transport_transient"
+                        )
+                    elif (
+                        can_retry
+                        and event.code == "429"
+                        and classify_provider_error(
+                            getattr(provider, "provider_name", ""),
+                            429,
+                            event.code,
+                            event.message,
+                        ) is ProviderFailureKind.RATE_LIMITED
+                    ):
+                        delay = max(
+                            _provider_retry_after_hint(event),
+                            backoff_sleep(
+                                rate_retries,
+                                self._retry_policy.base_backoff_ms,
+                                self._retry_policy.max_backoff_ms,
+                                _fake=True,
+                            ),
+                        )
+                        turn_deadline = getattr(config, "turn_deadline_at_monotonic", None)
+                        if (
+                            isinstance(turn_deadline, int | float)
+                            and not isinstance(turn_deadline, bool)
+                            and asyncio.get_running_loop().time() + delay >= turn_deadline
+                        ):
+                            yield _selector_retry_after_deadline_error(retry_after_s=delay)
+                            return
+                        if (
+                            rate_retries >= self._retry_policy.max_retries
+                            or delay > _SELECTOR_MAX_RETRY_AFTER_SECONDS
+                        ):
+                            yield replace(event, code="rate_limit_retry_exhausted")
+                            return
+                        rate_retries += 1
+                        attempt, limit = rate_retries, self._retry_policy.max_retries
+                        reason = "rate_limited"
+                    else:
+                        yield event
+                        return
+                    retry_error = event
+                    break
+            finally:
+                await stream.aclose()
+            if retry_error is None:
+                return
+            buffer.drain(successful_leg=False)
+            yield ProviderActivityEvent(
+                activity_id=activity_id,
+                phase="retry_wait",
+                reason=reason,
+                retry_attempt=attempt,
+                retry_limit=limit,
+                retry_after_ms=math.ceil(delay * 1000),
+                started_at=time.time_ns() // 1_000_000,
+            )
+            await sleep_before_retry(delay)
+            yield ProviderActivityEvent(
+                activity_id=activity_id,
+                phase="retrying",
+                reason=reason,
+                retry_attempt=attempt,
+                retry_limit=limit,
+                started_at=time.time_ns() // 1_000_000,
+            )
 
     def clone_for_model(self, model: str) -> _SelectorFallbackProvider:
         """Freeze an independent child chain at the currently active deployment.
@@ -3384,6 +3503,7 @@ class _SelectorFallbackProvider:
         *,
         requires_vision: bool,
         requires_tools: bool = False,
+        exclude_current_authority: bool = False,
     ) -> bool:
         """Select an invalid-response fallback with exact capability evidence.
 
@@ -3398,14 +3518,33 @@ class _SelectorFallbackProvider:
             "next_fallback_after_failure_matching",
             None,
         )
+        failed_authority = _provider_authority_identity(self.active_deployment_config())
+        if exclude_current_authority and failed_authority is None:
+            return False
+
+        def candidate_allowed(candidate: Any) -> bool:
+            if exclude_current_authority:
+                authority = _provider_authority_identity(candidate)
+                if authority is None or authority == failed_authority:
+                    return False
+            return bool(
+                (
+                    not requires_vision
+                    or self._fallback_deployment_vision_support.get(
+                        _fallback_deployment_identity(candidate), "unknown"
+                    ) == "supported"
+                )
+                and (not requires_tools or self._fallback_candidate_accepts_tools(candidate))
+            )
+
         try:
-            if requires_vision or requires_tools:
+            if requires_vision or requires_tools or exclude_current_authority:
                 if not callable(matching_fallback):
                     # Legacy selector seams cannot prove vision support, but
                     # tool capability defaults to allowed-until-denied. The
                     # active-leg admission guard below still blocks a fallback
                     # that resolves to an explicit tools denial before I/O.
-                    if requires_vision:
+                    if requires_vision or exclude_current_authority:
                         return False
                     self._provider = self._selector.next_fallback_after_failure(
                         RuntimeError(reason)
@@ -3420,20 +3559,7 @@ class _SelectorFallbackProvider:
                 else:
                     self._provider = matching_fallback(
                         RuntimeError(reason),
-                        predicate=lambda candidate: bool(
-                            (
-                                not requires_vision
-                                or self._fallback_deployment_vision_support.get(
-                                    _fallback_deployment_identity(candidate),
-                                    "unknown",
-                                )
-                                == "supported"
-                            )
-                            and (
-                                not requires_tools
-                                or self._fallback_candidate_accepts_tools(candidate)
-                            )
-                        ),
+                        predicate=candidate_allowed,
                     )
             else:
                 self._provider = self._selector.next_fallback_after_failure(RuntimeError(reason))
@@ -3442,7 +3568,7 @@ class _SelectorFallbackProvider:
 
         self._note_fallback_hop()
         if requires_tools:
-            if not self._advance_past_explicit_tool_denials():
+            if not self._advance_past_explicit_tool_denials(candidate_predicate=candidate_allowed):
                 return False
         else:
             self._skip_benched_fallbacks()
@@ -3634,14 +3760,20 @@ class _SelectorFallbackProvider:
                 content_started=lambda: emitted_user_visible_content,
             )
 
-        primary_stream = (
-            primary_stream_factory()
-            if provider_accounts_physical_usage(active_provider)
-            else account_provider_stream(
-                primary_stream_factory,
-                provider=active_provider_id,
-                model=active_model,
-            )
+        primary_stream = self._retry_provider_stream(
+            lambda: (
+                primary_stream_factory()
+                if provider_accounts_physical_usage(active_provider)
+                else account_provider_stream(
+                    primary_stream_factory,
+                    provider=active_provider_id,
+                    model=active_model,
+                )
+            ),
+            provider=active_provider,
+            config=active_config,
+            content_started=lambda: emitted_user_visible_content,
+            buffer=pre_text_buffer,
         )
         try:
             async for event in primary_stream:
@@ -3675,6 +3807,15 @@ class _SelectorFallbackProvider:
                 if emitted_user_visible_content:
                     yield event
                     continue
+
+                if (
+                    isinstance(event, ProviderErrorEvent)
+                    and event.code == "provider_retry_after_deadline"
+                ):
+                    self._record_health_failure(event)
+                    pre_text_buffer.drain(successful_leg=False)
+                    yield event
+                    return
 
                 if isinstance(event, ProviderReasoningDeltaEvent) and event.text:
                     if pre_text_buffer.has_incomplete_tool_call:
@@ -4017,17 +4158,23 @@ class _SelectorFallbackProvider:
                             content_started=lambda: fallback_committed,
                         )
 
-                    fallback_stream = (
-                        fallback_stream_factory()
-                        if provider_accounts_physical_usage(fallback_provider)
-                        else account_provider_stream(
-                            fallback_stream_factory,
-                            provider=fallback_provider_id,
-                            model=fallback_model,
-                        )
-                    )
                     fallback_buffer = _SelectorPreTextBuffer()
                     fallback_committed = False
+                    fallback_stream = self._retry_provider_stream(
+                        lambda: (
+                            fallback_stream_factory()
+                            if provider_accounts_physical_usage(fallback_provider)
+                            else account_provider_stream(
+                                fallback_stream_factory,
+                                provider=fallback_provider_id,
+                                model=fallback_model,
+                            )
+                        ),
+                        provider=fallback_provider,
+                        config=fallback_config,
+                        content_started=lambda: fallback_committed,
+                        buffer=fallback_buffer,
+                    )
                     fallback_activity_id = uuid.uuid4().hex
                     fallback_reasoning_started_at_ms = 0
                     fallback_reasoning_last_pulse_at = 0.0
@@ -4901,36 +5048,6 @@ def _resolve_identity_prompt_mode(config: object) -> str:
     if getattr(tools_cfg, "profile", None) == "memory_only":
         return "minimal"
     return "full"
-
-
-_FINALIZE_EVIDENCE_GATE_ENV = "OPENSQUILLA_FINALIZE_EVIDENCE_GATE"
-_FINALIZE_EVIDENCE_GATE_ON = {"on", "1", "true", "yes"}
-_FINALIZE_EVIDENCE_GATE_OFF = {"off", "0", "false", "no"}
-
-
-def _resolve_finalize_evidence_gate(config: object) -> bool:
-    """Resolve the opt-in finalize-time red-evidence gate prompt flag.
-
-    ``OPENSQUILLA_FINALIZE_EVIDENCE_GATE`` ("on"/"off") overrides
-    ``prompt.finalize_evidence_gate`` from gateway config; default is off.
-    The same env var also enables the loop-side gate (see
-    engine.turn_runner.agent_bootstrap_stage). Unrecognized env values raise
-    instead of being silently ignored so a run manifest cannot record an
-    override the run did not actually apply.
-    """
-    env_value = os.environ.get(_FINALIZE_EVIDENCE_GATE_ENV, "").strip().lower()
-    if env_value:
-        if env_value in _FINALIZE_EVIDENCE_GATE_ON:
-            return True
-        if env_value in _FINALIZE_EVIDENCE_GATE_OFF:
-            return False
-        raise ValueError(
-            f"{_FINALIZE_EVIDENCE_GATE_ENV} must be one of: "
-            + ", ".join(sorted(_FINALIZE_EVIDENCE_GATE_ON | _FINALIZE_EVIDENCE_GATE_OFF))
-        )
-
-    prompt_cfg = getattr(config, "prompt", None)
-    return bool(getattr(prompt_cfg, "finalize_evidence_gate", False))
 
 
 class _TaskOwnedSessionAppend:
@@ -6601,8 +6718,6 @@ class TurnRunner:
                     agent_id=agent_id,
                     timeout=runtime_timeout_override,
                     max_iterations=max_iterations,
-                    iteration_timeout=iteration_timeout,
-                    tool_timeout=tool_timeout,
                     request_timeout=request_timeout,
                     max_provider_retries=max_provider_retries,
                     length_capped_continuations=length_capped_continuations,
@@ -6669,8 +6784,6 @@ class TurnRunner:
             )
             effective_max_iterations = ab_out.effective_max_iterations  # noqa: F841
             effective_max_iterations_source = ab_out.effective_max_iterations_source  # noqa: F841
-            effective_iteration_timeout = ab_out.effective_iteration_timeout  # noqa: F841
-            effective_tool_timeout = ab_out.effective_tool_timeout  # noqa: F841
             effective_agent_request_timeout = ab_out.effective_request_timeout  # noqa: F841
             effective_max_provider_retries = ab_out.effective_max_provider_retries  # noqa: F841
             model_caps = ab_out.model_capabilities  # noqa: F841
@@ -8459,134 +8572,6 @@ class TurnRunner:
         self._last_agent_max_iterations_source = policy.max_iterations_source
         return policy.max_iterations
 
-    def _resolve_agent_iteration_timeout(
-        self,
-        session_key: str,
-        explicit: float | None = None,
-    ) -> float:
-        """Per-iteration timeout, with a coding-mode floor.
-
-        A coding-mode turn delegates to code-task and then blocks in a single
-        long ``process(action="wait")`` (code-task can run ~90 min). The
-        per-iteration watchdog must not clamp that wait, so floor the timeout
-        at 5400s while coding mode is on.
-        """
-        value = self._resolve_agent_iteration_timeout_base(session_key, explicit)
-        skills_cfg = getattr(self._config, "skills", None)
-        if bool(getattr(skills_cfg, "coding_mode", False)) and value < 5400.0:
-            return 5400.0
-        return value
-
-    def _resolve_agent_iteration_timeout_base(
-        self,
-        session_key: str,
-        explicit: float | None = None,
-    ) -> float:
-        """Resolve per-iteration timeout for this turn.
-
-        Precedence: explicit arg > session config > env > gateway config > default.
-        """
-
-        if explicit is not None:
-            if self._non_bool_number(explicit) and explicit >= 0:
-                return float(explicit)
-            raise ValueError("iteration_timeout must be a non-negative number")
-
-        sm = self._session_manager
-        if sm is not None and hasattr(sm, "get_session_config"):
-            try:
-                session_cfg = sm.get_session_config(session_key)
-                if session_cfg is not None:
-                    value = getattr(session_cfg, "agent_iteration_timeout_seconds", None)
-                    if self._non_bool_number(value) and value >= 0:
-                        return float(value)
-                    if value is not None:
-                        log.warning(
-                            "turn_runner.invalid_agent_iteration_timeout",
-                            source="session",
-                            value=value,
-                        )
-            except Exception:  # noqa: BLE001
-                pass
-
-        env_value = os.environ.get("OPENSQUILLA_AGENT_ITERATION_TIMEOUT")
-        if env_value is not None and env_value.strip():
-            raw = env_value.strip()
-            try:
-                value = float(raw)
-            except ValueError:
-                log.warning("turn_runner.invalid_agent_iteration_timeout", source="env", raw=raw)
-            else:
-                if value >= 0:
-                    return value
-                log.warning(
-                    "turn_runner.invalid_agent_iteration_timeout", source="env", value=value
-                )
-
-        value = getattr(self._config, "agent_iteration_timeout_seconds", None)
-        if self._non_bool_number(value) and value >= 0:
-            return float(value)
-        if value is not None:
-            log.warning(
-                "turn_runner.invalid_agent_iteration_timeout",
-                source="config",
-                value=value,
-            )
-
-        return AgentConfig().iteration_timeout
-
-    def _resolve_agent_tool_timeout(
-        self,
-        session_key: str,
-        explicit: float | None = None,
-    ) -> float:
-        """Resolve per-tool execution timeout for this turn."""
-
-        if explicit is not None:
-            if self._non_bool_number(explicit) and explicit >= 0:
-                return float(explicit)
-            raise ValueError("tool_timeout must be a non-negative number")
-
-        sm = self._session_manager
-        if sm is not None and hasattr(sm, "get_session_config"):
-            try:
-                session_cfg = sm.get_session_config(session_key)
-                if session_cfg is not None:
-                    value = getattr(session_cfg, "agent_tool_timeout_seconds", None)
-                    if self._non_bool_number(value) and value >= 0:
-                        return float(value)
-                    if value is not None:
-                        log.warning(
-                            "turn_runner.invalid_agent_tool_timeout",
-                            source="session",
-                            value=value,
-                        )
-            except Exception:  # noqa: BLE001
-                pass
-
-        env_value = os.environ.get("OPENSQUILLA_AGENT_TOOL_TIMEOUT")
-        if env_value is not None and env_value.strip():
-            raw = env_value.strip()
-            try:
-                value = float(raw)
-            except ValueError:
-                log.warning("turn_runner.invalid_agent_tool_timeout", source="env", raw=raw)
-            else:
-                if value >= 0:
-                    return value
-                log.warning("turn_runner.invalid_agent_tool_timeout", source="env", value=value)
-
-        value = getattr(self._config, "agent_tool_timeout_seconds", None)
-        if self._non_bool_number(value) and value >= 0:
-            return float(value)
-        if value is not None:
-            log.warning(
-                "turn_runner.invalid_agent_tool_timeout",
-                source="config",
-                value=value,
-            )
-
-        return AgentConfig().tool_timeout
 
     def _resolve_agent_request_timeout(
         self,
@@ -9592,7 +9577,6 @@ class TurnRunner:
         if agent_name is None and identity_fields is not None:
             agent_name = identity_fields.name
         prompt_mode = _resolve_identity_prompt_mode(self._config)
-        finalize_evidence_gate = _resolve_finalize_evidence_gate(self._config)
 
         agent_profile = AgentProfile(
             agent_id=agent_id,
@@ -9607,7 +9591,6 @@ class TurnRunner:
             agents_doc=agents_doc,
             workspace_files=workspace_files,
             prompt_mode=prompt_mode,
-            finalize_evidence_gate=finalize_evidence_gate,
         )
         os_name = os.uname().sysname if hasattr(os, "uname") else platform.system()
         runtime_info = {

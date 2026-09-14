@@ -69,6 +69,15 @@ OFFLINE_MARKER_EXCLUSIONS = {
 }
 RECENTLY_ADDED_ACTIVE_TESTS = {
     "tests/test_scripts/test_gateway_ux.py",
+    "tests/test_engine/test_agent_autonomous_tool_recovery.py",
+    "tests/test_engine/test_agent_connection_recovery.py",
+    "tests/test_engine/test_selector_provider_recovery.py",
+    "tests/test_provider_connection_failure.py",
+    "tests/test_tools/test_bounded_output_capture.py",
+    # Execution-log suites use the declared provisional floor until a Windows refresh.
+    "tests/test_gateway/test_rpc_execution_logs.py",
+    "tests/test_tools/test_execution_log_queries.py",
+
     # Local-first workspace files use the 0.01s provisional floor until a
     # comparable three-run Windows refresh supplies measured timings.
     "tests/test_gateway/test_execution_workspace_preparation.py",
@@ -153,6 +162,7 @@ RECENTLY_ADDED_ACTIVE_TESTS = {
     "tests/unit/cli/tui/test_opentui_prefs.py",
     "tests/test_cli/test_gateway_client_steer.py",
     "tests/test_cli/test_gateway_client_sessions_contract.py",
+    "tests/test_cli/test_sessions_cmd.py",
     "tests/test_cli/test_skills_search_cmd.py",
     "tests/test_channels/test_admission_reason_persistence.py",
     "tests/test_channels/test_channel_admission.py",
@@ -305,7 +315,6 @@ RECENTLY_ADDED_ACTIVE_TESTS = {
     "tests/test_tools/test_edit_file_closest_hint.py",
     "tests/test_tools/test_patch_classification.py",
     "tests/test_tools/test_plan_access.py",
-    "tests/test_tools/test_repeated_call_notice.py",
     "tests/test_tools/test_admin_audio_config.py",
     "tests/test_tools/test_admin_gateway_contract.py",
     "tests/test_tools/test_shell_self_kill_policy.py",

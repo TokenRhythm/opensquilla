@@ -3640,6 +3640,7 @@
         "rateLimited": "Limite atteinte · nouvel essai dans {seconds}s",
         "retryWait": "Nouvel essai dans {seconds}s",
         "retrying": "Nouvel essai {attempt}/{limit}",
+        "retryingWithoutLimit": "Nouvel essai · tentative {attempt}",
         "fallback": "Passage au modèle de secours"
       },
       "purpose": {
@@ -3701,11 +3702,23 @@
       "cancelled": "Annulé"
     },
     "toolModal": {
+      "retry": "Réessayer",
+      "logPending": "Le journal d’exécution est en cours d’enregistrement. Réessayez une fois la commande terminée.",
+      "copyPage": "Copier cette page",
       "tree": "Arborescence",
       "raw": "Brut",
       "wrapLines": "Retour à la ligne",
       "preserveLines": "Conserver la largeur des lignes",
-      "contentMeta": "{type} · {lines} lignes · {chars} caractères"
+      "contentMeta": "{type} · {lines} lignes · {chars} caractères",
+      "executionLog": "Voir le journal d’exécution",
+      "toolResult": "Résultat de l’outil",
+      "characterOffset": "Position du caractère",
+      "go": "Aller",
+      "previous": "Précédent",
+      "next": "Suivant",
+      "logRange": "Caractères {start}–{end} sur {total}",
+      "logReadFailed": "Impossible de charger le journal d’exécution. Réessayez.",
+      "logIncomplete": "Le journal est incomplet. Seule la sortie enregistrée est disponible."
     },
     "approval": {
       "required": "Approbation requise",
@@ -4362,7 +4375,7 @@
       "sectionDiagnostics": "diagnostics",
       "sectionResult": "résultat",
       "sectionError": "erreur",
-      "viewFull": "voir en entier",
+      "viewFull": "développer le contenu",
       "activityViewDetails": "voir les détails",
       "activityDetailsTitle": "détails",
       "activityBytesWritten": "{size} écrits",

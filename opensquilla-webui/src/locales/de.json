@@ -3640,6 +3640,7 @@
         "rateLimited": "Ratenlimit · neuer Versuch in {seconds}s",
         "retryWait": "Neuer Versuch in {seconds}s",
         "retrying": "Neuer Versuch {attempt}/{limit}",
+        "retryingWithoutLimit": "Neuer Versuch · Versuch {attempt}",
         "fallback": "Wechsel zum Ersatzmodell"
       },
       "purpose": {
@@ -3701,11 +3702,23 @@
       "cancelled": "Abgebrochen"
     },
     "toolModal": {
+      "retry": "Erneut versuchen",
+      "logPending": "Das Ausführungsprotokoll wird noch gespeichert. Versuchen Sie es nach Abschluss des Befehls erneut.",
+      "copyPage": "Diese Seite kopieren",
       "tree": "Baum",
       "raw": "Roh",
       "wrapLines": "Zeilen umbrechen",
       "preserveLines": "Zeilenbreite beibehalten",
-      "contentMeta": "{type} · {lines} Zeilen · {chars} Zeichen"
+      "contentMeta": "{type} · {lines} Zeilen · {chars} Zeichen",
+      "executionLog": "Ausführungsprotokoll anzeigen",
+      "toolResult": "Werkzeugergebnis",
+      "characterOffset": "Zeichenposition",
+      "go": "Los",
+      "previous": "Zurück",
+      "next": "Weiter",
+      "logRange": "Zeichen {start}–{end} von {total}",
+      "logReadFailed": "Das Ausführungsprotokoll konnte nicht geladen werden. Bitte erneut versuchen.",
+      "logIncomplete": "Das Protokoll ist unvollständig. Nur gespeicherte Ausgaben sind verfügbar."
     },
     "approval": {
       "required": "Genehmigung erforderlich",
@@ -4362,7 +4375,7 @@
       "sectionDiagnostics": "Diagnose",
       "sectionResult": "Ergebnis",
       "sectionError": "Fehler",
-      "viewFull": "vollständig anzeigen",
+      "viewFull": "Inhalt aufklappen",
       "activityViewDetails": "Details anzeigen",
       "activityDetailsTitle": "Details",
       "activityBytesWritten": "{size} geschrieben",

@@ -3145,3 +3145,33 @@ async def test_dispatch_terminal_search_ledger_isolated_by_turn_key() -> None:
     assert next_turn.execution_status is not None
     assert first.execution_status["reason"] == "search_blocked"
     assert next_turn.execution_status["reason"] == "search_blocked"
+
+
+@pytest.mark.asyncio
+async def test_repeated_reads_return_real_results_without_runtime_notices(monkeypatch) -> None:
+    monkeypatch.setenv("OPENSQUILLA_REPEATED_CALL_NOTICE", "1")
+    registry = ToolRegistry()
+    contents = ['{"value": "unchanged"}', '{"value": "unchanged"}', '{"value": "updated"}']
+    calls: list[str] = []
+
+    async def read_file(path: str) -> str:
+        calls.append(path)
+        return contents[len(calls) - 1]
+
+    registry.register(
+        ToolSpec(
+            name="read_file", description="read",
+            parameters={"path": {"type": "string"}}, required=["path"],
+        ),
+        read_file,
+    )
+    handler = build_tool_handler(registry, ToolContext(session_key="agent:main:repeated-read"))
+    results = [
+        await handler(ToolCall(
+            tool_use_id=f"read-{index}", tool_name="read_file", arguments={"path": "data.json"},
+        ))
+        for index in range(3)
+    ]
+    assert calls == ["data.json"] * 3
+    assert [result.content for result in results] == contents
+    assert all(not result.is_error for result in results)

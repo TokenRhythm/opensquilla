@@ -111,8 +111,8 @@ def test_mandatory_matrix_has_fixed_provider_model_and_repeat_coverage() -> None
             if case.scenario not in {"fault_429_retry_after", "fault_reset_before_first_token"}
         )
 
-    assert gate.minimum_physical_requests(cases) == 111
-    assert gate.BudgetLimits().physical_requests - gate.minimum_physical_requests(cases) == 9
+    assert gate.minimum_physical_requests(cases) == 117
+    assert gate.BudgetLimits().physical_requests - gate.minimum_physical_requests(cases) == 3
 
 
 def test_repeat_override_applies_to_each_selected_matrix_row() -> None:
@@ -281,6 +281,46 @@ def test_passed_row_without_durable_usage_leg_reconciliation_fails_closed() -> N
 
     assert exit_code == gate.EXIT_FAILED
     assert report["rows"][0]["stage"] == "scenario_assertion"
+
+
+@pytest.mark.parametrize(
+    ("requests", "retry_legs", "honored", "wait_ms", "expected_exit"),
+    [
+        (2, 1, 1, 8_000.0, gate.EXIT_PASSED),
+        (1, 0, 0, 0.0, gate.EXIT_FAILED),
+        (2, 0, 1, 8_000.0, gate.EXIT_FAILED),
+        (2, 1, 0, 8_000.0, gate.EXIT_FAILED),
+        (2, 1, 1, 7_999.0, gate.EXIT_FAILED),
+    ],
+)
+def test_rate_limit_recovery_requires_retry_and_measured_retry_after(
+    requests: int,
+    retry_legs: int,
+    honored: int,
+    wait_ms: float,
+    expected_exit: int,
+) -> None:
+    case = gate.CaseSpec(
+        case_id="deepseek-fault-429-one",
+        provider="deepseek",
+        model="deepseek-v4-flash",
+        scenario="fault_429_retry_after",
+        repeat_index=1,
+    )
+    result = _passing_result(requests=requests)
+    result.counts.update(retry_legs=retry_legs, retry_after_honored=honored)
+    result.metrics["retry_wait_ms"] = wait_ms
+
+    report, exit_code = gate.run_gate(
+        [case],
+        executor=lambda _case, _remaining: result,
+    )
+
+    assert exit_code == expected_exit
+    assert report["totals"]["physical_requests"] == requests
+    if expected_exit == gate.EXIT_FAILED:
+        assert report["rows"][0]["stage"] == "scenario_assertion"
+        assert report["rows"][0]["failure_class"] == "assertion"
 
 
 def test_long_answer_requires_real_relative_performance_evidence() -> None:

@@ -52,7 +52,7 @@ from .error_redaction import (
     redacted_httpx_error,
 )
 from .extra_body import merge_extra_body, normalize_extra_body
-from .failures import retry_after_from_headers
+from .failures import CONNECTION_FAILED_CODE, is_connection_failure, retry_after_from_headers
 from .fx import TOKENRHYTHM_CNY_PER_USD, TOKENRHYTHM_CNY_PER_USD_NANOS
 from .model_catalog import shared_catalog
 from .model_identity import (
@@ -5301,17 +5301,22 @@ class OpenAIProvider:
             )
             raise
         except httpx.TimeoutException as exc:
+            code = CONNECTION_FAILED_CODE if is_connection_failure(exc) else "timeout"
             safe_error = redact_upstream_error_text(
                 f"Request timed out: {str(exc) or repr(exc)}",
                 api_key=self._api_key,
                 max_len=2000,
             )
             trace.record_error(
-                code="timeout",
+                code=code,
                 message=safe_error,
                 metadata={"phase": "stream", "cache_shape": cache_shape},
             )
-            if stream_timeout_fallback and not emitted_stream_event:
+            if (
+                stream_timeout_fallback
+                and not emitted_stream_event
+                and code != CONNECTION_FAILED_CODE
+            ):
                 event_name = (
                     "openrouter.stream_timeout_fallback_started"
                     if self._provider_kind == "openrouter"
@@ -5401,15 +5406,16 @@ class OpenAIProvider:
                     visible_assistant_text_parts.append(deferred_event.text)
                 yield deferred_event
             deferred_post_native_events.clear()
-            yield ErrorEvent(message=safe_error, code="timeout")
+            yield ErrorEvent(message=safe_error, code=code)
         except httpx.RequestError as exc:
+            code = CONNECTION_FAILED_CODE if is_connection_failure(exc) else "request_error"
             safe_error = redact_upstream_error_text(
                 f"Request error: {str(exc) or repr(exc)}",
                 api_key=self._api_key,
                 max_len=2000,
             )
             trace.record_error(
-                code="request_error",
+                code=code,
                 message=safe_error,
                 metadata={"phase": "stream", "cache_shape": cache_shape},
             )
@@ -5428,7 +5434,7 @@ class OpenAIProvider:
                     visible_assistant_text_parts.append(deferred_event.text)
                 yield deferred_event
             deferred_post_native_events.clear()
-            yield ErrorEvent(message=safe_error, code="request_error")
+            yield ErrorEvent(message=safe_error, code=code)
         except CandidateArtifactLimitError as exc:
             message = "Candidate artifact exceeded bounded assembly limits"
             log.warning(
@@ -5595,6 +5601,8 @@ class OpenAIProvider:
                     json=fallback_payload,
                 )
         except httpx.TimeoutException:
+            # The earlier stream may have been accepted; keep compatibility retries finite.
+            code = "timeout"
             safe_error = redact_upstream_error_text(
                 f"Request timed out: {str(timeout_exc) or repr(timeout_exc)}",
                 api_key=self._api_key,
@@ -5607,24 +5615,25 @@ class OpenAIProvider:
                 timeout_phase=type(timeout_exc).__name__,
             )
             trace.record_error(
-                code="timeout",
+                code=code,
                 message=safe_error,
                 metadata={"phase": "non_stream_fallback", "cache_shape": cache_shape},
             )
-            yield ErrorEvent(message=safe_error, code="timeout")
+            yield ErrorEvent(message=safe_error, code=code)
             return
         except httpx.RequestError as exc:
+            code = "request_error"
             safe_error = redact_upstream_error_text(
                 f"Request error: {str(exc) or repr(exc)}",
                 api_key=self._api_key,
                 max_len=2000,
             )
             trace.record_error(
-                code="request_error",
+                code=code,
                 message=safe_error,
                 metadata={"phase": "non_stream_fallback", "cache_shape": cache_shape},
             )
-            yield ErrorEvent(message=safe_error, code="request_error")
+            yield ErrorEvent(message=safe_error, code=code)
             return
 
         response_ids: set[str] = set()

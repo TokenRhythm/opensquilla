@@ -3640,6 +3640,7 @@
         "rateLimited": "Límite de solicitudes · reintento en {seconds}s",
         "retryWait": "Reintento en {seconds}s",
         "retrying": "Reintentando {attempt}/{limit}",
+        "retryingWithoutLimit": "Reintentando · intento {attempt}",
         "fallback": "Cambiando al modelo alternativo"
       },
       "purpose": {
@@ -3701,11 +3702,23 @@
       "cancelled": "Cancelado"
     },
     "toolModal": {
+      "retry": "Reintentar",
+      "logPending": "El registro de ejecución aún se está guardando. Vuelva a intentarlo cuando termine el comando.",
+      "copyPage": "Copiar esta página",
       "tree": "Árbol",
       "raw": "Crudo",
       "wrapLines": "Ajustar líneas",
       "preserveLines": "Conservar ancho de línea",
-      "contentMeta": "{type} · {lines} líneas · {chars} caracteres"
+      "contentMeta": "{type} · {lines} líneas · {chars} caracteres",
+      "executionLog": "Ver registro de ejecución",
+      "toolResult": "Resultado de la herramienta",
+      "characterOffset": "Posición del carácter",
+      "go": "Ir",
+      "previous": "Anterior",
+      "next": "Siguiente",
+      "logRange": "Caracteres {start}–{end} de {total}",
+      "logReadFailed": "No se pudo cargar el registro de ejecución. Inténtalo de nuevo.",
+      "logIncomplete": "El registro está incompleto. Solo está disponible la salida guardada."
     },
     "approval": {
       "required": "Aprobación requerida",
@@ -4362,7 +4375,7 @@
       "sectionDiagnostics": "diagnósticos",
       "sectionResult": "resultado",
       "sectionError": "error",
-      "viewFull": "ver completo",
+      "viewFull": "expandir contenido",
       "activityViewDetails": "ver detalles",
       "activityDetailsTitle": "detalles",
       "activityBytesWritten": "{size} escritos",

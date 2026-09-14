@@ -3725,6 +3725,7 @@
         "rateLimited": "Rate limited · retrying in {seconds}s",
         "retryWait": "Retrying in {seconds}s",
         "retrying": "Retrying {attempt}/{limit}",
+        "retryingWithoutLimit": "Retrying · attempt {attempt}",
         "fallback": "Switching to backup model"
       },
       "purpose": {
@@ -3786,11 +3787,23 @@
       "cancelled": "Cancelled"
     },
     "toolModal": {
+      "retry": "Retry",
+      "logPending": "Execution log is still being saved. Try again when the command finishes.",
+      "copyPage": "Copy this page",
       "tree": "Tree",
       "raw": "Raw",
       "wrapLines": "Wrap lines",
       "preserveLines": "Preserve line width",
-      "contentMeta": "{type} · {lines} lines · {chars} chars"
+      "contentMeta": "{type} · {lines} lines · {chars} chars",
+      "executionLog": "View execution log",
+      "toolResult": "Tool result",
+      "characterOffset": "Character offset",
+      "go": "Go",
+      "previous": "Previous",
+      "next": "Next",
+      "logRange": "Characters {start}–{end} of {total}",
+      "logReadFailed": "Could not load execution log. Try again.",
+      "logIncomplete": "Log is incomplete. Only saved output is available."
     },
     "approval": {
       "required": "Approval required",
@@ -4447,7 +4460,7 @@
       "sectionDiagnostics": "diagnostics",
       "sectionResult": "result",
       "sectionError": "error",
-      "viewFull": "view full",
+      "viewFull": "expand content",
       "activityViewDetails": "view details",
       "activityDetailsTitle": "details",
       "activityBytesWritten": "{size} written",

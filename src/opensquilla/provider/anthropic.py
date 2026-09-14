@@ -16,7 +16,7 @@ from opensquilla.execution_status import derive_is_error
 
 from .candidate_artifact import CandidateArtifactBuilder, CandidateArtifactLimitError
 from .error_redaction import redact_upstream_error_code, redact_upstream_error_text
-from .failures import retry_after_from_headers
+from .failures import CONNECTION_FAILED_CODE, is_connection_failure, retry_after_from_headers
 from .model_catalog import shared_catalog
 from .registry import AuthHeaderStyle
 from .request_proof import (
@@ -1239,21 +1239,23 @@ class AnthropicProvider:
             )
             yield ErrorEvent(message=message, code="candidate_artifact_limit_exceeded")
         except httpx.TimeoutException as exc:
+            code = CONNECTION_FAILED_CODE if is_connection_failure(exc) else "timeout"
             message = redact_upstream_error_text(
                 f"Request timed out: {str(exc) or repr(exc)}",
                 api_key=self._api_key,
                 max_len=2000,
             )
-            trace.record_error(code="timeout", message=message)
-            yield ErrorEvent(message=message, code="timeout")
+            trace.record_error(code=code, message=message)
+            yield ErrorEvent(message=message, code=code)
         except httpx.RequestError as exc:
+            code = CONNECTION_FAILED_CODE if is_connection_failure(exc) else "request_error"
             message = redact_upstream_error_text(
                 f"Request error: {str(exc) or repr(exc)}",
                 api_key=self._api_key,
                 max_len=2000,
             )
-            trace.record_error(code="request_error", message=message)
-            yield ErrorEvent(message=message, code="request_error")
+            trace.record_error(code=code, message=message)
+            yield ErrorEvent(message=message, code=code)
         except Exception as exc:  # noqa: BLE001 - chat() contract: ErrorEvent instead of raising
             message = redact_upstream_error_text(
                 f"Provider response handling failed: {str(exc) or repr(exc)}",
