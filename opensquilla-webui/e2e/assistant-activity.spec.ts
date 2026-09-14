@@ -835,6 +835,122 @@ test.describe('Completed assistant activity disclosure', () => {
 })
 
 test.describe('Live assistant activity lifecycle', () => {
+  test('renders an unbounded provider retry as an attempt label', async ({ page }) => {
+    const lifecycle = await mockControlledActivityLifecycle(page)
+    await page.goto(
+      CONTROL_URL + 'chat?session=' + encodeURIComponent(LIFECYCLE_SESSION_KEY),
+    )
+    await expect(page.locator('.conn-pill.connected')).toBeVisible({ timeout: 10_000 })
+    await page.locator('.chat-textarea').fill('Reconnect and finish this task.')
+    await page.locator('.chat-send-btn[aria-label="Send"]').click()
+
+    const liveActivity = page.locator('.assistant-activity--live')
+    await expect(liveActivity).toBeVisible()
+    lifecycle.emit('session.event.provider_activity', {
+      phase: 'retrying',
+      reason: 'transport_transient',
+      retry_attempt: 7,
+      retry_limit: 0,
+    })
+    await expect(liveActivity.getByText('Retrying · attempt 7', { exact: true })).toBeVisible()
+    await expect(liveActivity).not.toContainText('7/0')
+    await expect(page.locator('.msg-error-card')).toHaveCount(0)
+
+    lifecycle.finish()
+    await expect(liveActivity).toHaveCount(0)
+    await expect(page.locator('.msg-ai .assistant-activity__summary')).toContainText('Completed')
+  })
+
+  test('keeps a failed tool row when a later tool succeeds and the turn completes', async ({ page }) => {
+    const lifecycle = await mockControlledActivityLifecycle(page, {
+      donePayload: { text: 'Recovered final answer.' },
+      settledMessages: acceptedUserMessageId => [{
+        role: 'user',
+        text: 'Recover after a tool failure.',
+        id: acceptedUserMessageId,
+        message_id: acceptedUserMessageId,
+        timestamp: Math.floor(Date.now() / 1000) - 30,
+      }, {
+        role: 'assistant',
+        text: 'Recovered final answer.',
+        id: 'activity-recovered-assistant',
+        message_id: 'activity-recovered-assistant',
+        timestamp: Math.floor(Date.now() / 1000),
+        tool_calls: [{
+          tool_use_id: 'activity-failing',
+          name: 'bash_exec',
+          groupId: 'activity-failure-group',
+          input: { command: 'exit 7' },
+          result: 'exit 7',
+          is_error: true,
+          execution_status: { status: 'error' },
+        }, {
+          tool_use_id: 'activity-recovered',
+          name: 'bash_exec',
+          groupId: 'activity-recovery-group',
+          input: { command: 'printf recovered' },
+          result: 'recovered',
+          execution_status: { status: 'success' },
+        }],
+        timeline: [
+          { type: 'tool-group', groupId: 'activity-failure-group' },
+          { type: 'tool-group', groupId: 'activity-recovery-group' },
+          { type: 'text', raw: 'Recovered final answer.' },
+        ],
+      }],
+    })
+    await page.goto(
+      CONTROL_URL + 'chat?session=' + encodeURIComponent(LIFECYCLE_SESSION_KEY),
+    )
+    await expect(page.locator('.conn-pill.connected')).toBeVisible({ timeout: 10000 })
+
+    await page.locator('.chat-textarea').fill('Recover after a tool failure.')
+    await page.locator('.chat-send-btn[aria-label="Send"]').click()
+    const liveActivity = page.locator('.assistant-activity--live')
+    await expect(liveActivity).toBeVisible()
+
+    lifecycle.emit('session.event.tool_use_start', {
+      tool_use_id: 'activity-failing',
+      name: 'bash_exec',
+      input: { command: 'exit 7' },
+    })
+    lifecycle.emit('session.event.tool_result', {
+      tool_use_id: 'activity-failing',
+      name: 'bash_exec',
+      input: { command: 'exit 7' },
+      result: 'exit 7',
+      is_error: true,
+      execution_status: { status: 'error' },
+    })
+    const failedRow = liveActivity.locator('.tool-row--error').first()
+    await expect(failedRow).toBeVisible()
+
+    lifecycle.emit('session.event.tool_use_start', {
+      tool_use_id: 'activity-recovered',
+      name: 'bash_exec',
+      input: { command: 'printf recovered' },
+    })
+    lifecycle.emit('session.event.tool_result', {
+      tool_use_id: 'activity-recovered',
+      name: 'bash_exec',
+      input: { command: 'printf recovered' },
+      result: 'recovered',
+      execution_status: { status: 'success' },
+    })
+    lifecycle.emit('session.event.text_delta', { text: 'Recovered final answer.' })
+    await expect(page.getByText('Recovered final answer.', { exact: true })).toBeVisible()
+
+    lifecycle.finish()
+    await expect(liveActivity).toHaveCount(0)
+    const settled = page.locator('.msg-ai .assistant-activity').last()
+    await expect(settled).toBeVisible()
+    await expect(settled.locator('.assistant-activity__summary')).toContainText('Completed')
+    await expect(settled.locator('.tool-row--error')).toHaveCount(1)
+    await expect(settled.locator('.tool-row[data-op="command.run"]')).toHaveCount(2)
+    await expect(page.getByText('Recovered final answer.', { exact: true })).toHaveCount(1)
+    await expect(page.locator('.msg-error-card')).toHaveCount(0)
+  })
+
   test('moves draft text back into activity when a later tool starts, then settles', async ({ page }) => {
     await page.emulateMedia({ reducedMotion: 'no-preference' })
     const lifecycle = await mockControlledActivityLifecycle(page)

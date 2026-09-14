@@ -17,6 +17,26 @@ from opensquilla.search.types import (
 
 
 @pytest.mark.asyncio
+async def test_search_parameter_contract_in_model_and_public_catalog():
+    from opensquilla.tools.registry import ToolRegistry, get_default_registry
+
+    registered = get_default_registry().get("web_search")
+    assert registered is not None
+    registry = ToolRegistry()
+    registry.register(registered.spec, registered.handler)
+    model = registry.to_tool_definitions()[0].input_schema.properties
+    public = (await registry.list_tools())[0]["schema"]["properties"]
+    for parameters in (model, public):
+        assert parameters["fetch_top_k"]["default"] == 0
+        assert parameters["fetch_top_k"]["minimum"] == 0
+        assert parameters["fetch_top_k"]["maximum"] == 5
+        assert parameters["max_results"]["maximum"] == 20
+        assert "default" not in parameters["max_results"]
+        assert "configured" in parameters["max_results"]["description"]
+        assert "runtime budget" in parameters["max_results"]["description"]
+
+
+@pytest.mark.asyncio
 async def test_web_search_tool_builds_canonical_options_and_returns_json(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -124,7 +144,7 @@ async def test_web_search_tool_uses_configured_source_backed_defaults(
             query="python release",
             mode="auto",
             max_results=7,
-            fetch_top_k=3,
+            fetch_top_k=0,
             max_chars_per_source=1500,
             provider=None,
         )

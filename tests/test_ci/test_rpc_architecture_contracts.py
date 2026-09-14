@@ -122,8 +122,8 @@ SESSIONS_LIST_LITERAL_ALLOWLIST: Counter[str] = Counter(
 SESSIONS_LIST_GATEWAY_ADAPTER = PACKAGE_ROOT / "gateway" / "adapters" / "sessions_list_contract.py"
 # The retired 20-method RPC surface is absent; exact inventory remains pinned
 # so this does not authorize unrelated wire growth.
-RUNTIME_RPC_METHOD_BASELINE = 291
-RUNTIME_RPC_METHOD_DIGEST = "950d9d6735c071e6110c4dbceb68c89d5054a466fa3045d0ab9a6d582555f724"
+RUNTIME_RPC_METHOD_BASELINE = 292
+RUNTIME_RPC_METHOD_DIGEST = "e09e5c20fa6a1d5159a2f6ae02e0c95009bb830be0ab53e9d109baf580d9a080"
 STATIC_RPC_DECORATOR_BASELINE = 77
 
 # Physical lines in the sessions/runtime slice remain tracked for the final
@@ -1479,7 +1479,9 @@ def test_runtime_rpc_surface_is_exact_and_contract_methods_use_generic_adapter()
         assert entry.handler.__module__ == "opensquilla.gateway.adapters.contract_method"
         assert entry.handler.__name__ == "handle_contract_method"
 
-    for method in ("sessions.messages.snapshot.read", "transport.flow.update"):
+    for method in (
+        "sessions.messages.snapshot.read", "transport.flow.update", "sessions.executionLog.read",
+    ):
         entry = registry.get_entry(method)
         assert entry is not None
         assert entry.required_scope == "operator.read"

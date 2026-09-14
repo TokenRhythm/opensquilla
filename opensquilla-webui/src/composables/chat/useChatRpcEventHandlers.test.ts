@@ -3283,6 +3283,39 @@ describe('useChatRpcEventHandlers ensemble activity', () => {
     }
   })
 
+  it('keeps provider recovery active without presenting a zero retry limit', () => {
+    const { api, stream, stop } = createHarness()
+
+    try {
+      api.handlers.onWireEventFixture('session.event.provider_activity', {
+        stream_seq: 1,
+        schema_version: 1,
+        phase: 'retry_wait',
+        reason: 'transport_transient',
+        retry_after_ms: 5_000,
+        activity_id: 'connection-recovery',
+      })
+      api.handlers.onWireEventFixture('session.event.provider_activity', {
+        stream_seq: 2,
+        schema_version: 1,
+        phase: 'retrying',
+        reason: 'transport_transient',
+        retry_attempt: 7,
+        retry_limit: 0,
+        activity_id: 'connection-recovery',
+      })
+
+      expect(stream.setStreamActivity).toHaveBeenLastCalledWith(
+        'Retrying · attempt 7',
+        'provider:retrying:7:0',
+      )
+      expect(stream.resetStreamIdleTimer).toHaveBeenCalledTimes(2)
+      expect(stream.endStreaming).not.toHaveBeenCalled()
+    } finally {
+      stop()
+    }
+  })
+
   it('restarts the hard idle timer after reconnect while a turn is streaming', () => {
     const { api, stream, stop } = createHarness()
 

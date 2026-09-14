@@ -806,8 +806,6 @@ def clamp_tool_arguments(
             next_args["fetch_top_k"] = (
                 min(value, fetch_top_k_cap) if fetch_top_k_cap is not None else value
             )
-        elif requested_fetch_top_k is None and fetch_top_k_cap is not None:
-            next_args["fetch_top_k"] = fetch_top_k_cap
 
         requested_chars = next_args.get("max_chars_per_source")
         chars_cap = policy.max_web_search_chars_per_source

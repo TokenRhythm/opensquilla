@@ -91,11 +91,11 @@ async def test_stubborn_provider_timeout_is_bounded_and_close_is_deferred(
         async for _event in agent._stream_provider_events_with_deadline(
             stream,
             loop=asyncio.get_running_loop(),
-            total_deadline=None,
+            total_deadline=asyncio.get_running_loop().time() + 0.01,
         ):
             pass
 
-    with pytest.raises(agent_module._IterationStreamTimeoutError):
+    with pytest.raises(TimeoutError, match="total timeout"):
         await asyncio.wait_for(consume(), timeout=0.2)
 
     assert stream.cancelled.is_set()

@@ -29,6 +29,7 @@ export type ConversationEventIdentity = {
 }
 
 export type ConversationEventData = ConversationEventIdentity & {
+  execution_log_handle?: string
   reason?: string
   status?: string
   run_status?: string
@@ -194,7 +195,7 @@ export type ConversationEventContext = {
 
 type WithIdentity<K extends keyof ConversationEventData> = Pick<ConversationEventData, keyof ConversationEventIdentity | K>
 export type ConversationTextContent = WithIdentity<'text' | 'presentation' | 'model_call_id' | 'iteration'>
-export type ConversationToolContent = WithIdentity<'id' | 'watchdogToolId' | 'name' | 'input' | 'input_delta' | 'arguments' | 'synthetic_from_text' | 'result' | 'approvalResult' | 'error' | 'is_error' | 'tool_presentation' | 'model_call_id' | 'iteration'>
+export type ConversationToolContent = WithIdentity<'id' | 'watchdogToolId' | 'name' | 'input' | 'input_delta' | 'arguments' | 'synthetic_from_text' | 'result' | 'approvalResult' | 'error' | 'is_error' | 'tool_presentation' | 'model_call_id' | 'iteration' | 'execution_log_handle'>
 export type ConversationThinkingContent = WithIdentity<'text' | 'model_call_id' | 'iteration' | 'block_id' | 'block_index' | 'content_kind' | 'ended_at' | 'status'>
 export type ConversationCompactionContent = WithIdentity<'status' | 'compacted' | 'detail' | 'reason' | 'skip_reason' | 'source' | 'phase' | 'compaction_id' | 'sequence' | 'heartbeat' | 'heartbeat_at' | 'elapsed_ms' | 'stage' | 'refused' | 'safe_to_send' | 'applied' | 'durability' | 'user_visible' | 'intent'>
 export type ConversationProviderActivity = WithIdentity<'activity_id' | 'phase' | 'reason' | 'retry_attempt' | 'retry_limit' | 'retry_after_ms' | 'heartbeat'>

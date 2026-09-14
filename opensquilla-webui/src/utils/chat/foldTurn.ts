@@ -423,6 +423,7 @@ export class TurnAccumulator {
         call.status = frame.isError ? 'error' : 'success'
         call.isError = frame.isError
         call.result = frame.result
+        call.executionLogHandle = frame.executionLogHandle
         call.resultPreview = truncateToolPreview(frame.result, 200)
         const timing = this.toolTimes.get(call.toolId)
         if (timing && !timing.endedAt) timing.endedAt = frame.at
@@ -864,6 +865,7 @@ export function foldTurn(
         tc.status = frame.isError ? 'error' : 'success'
         tc.isError = frame.isError
         tc.result = frame.result
+        tc.executionLogHandle = frame.executionLogHandle
         tc.resultPreview = truncateToolPreview(frame.result, 200)
         const timing = toolTimes.get(tc.toolId)
         if (timing && !timing.endedAt) timing.endedAt = frame.at
