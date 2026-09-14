@@ -20,6 +20,8 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+import structlog
+
 from opensquilla.contracts.turn_execution import AssistantMessageReservation
 from opensquilla.engine.steps.inject_time_prefix import stamp as _stamp_time_prefix
 from opensquilla.paths import default_opensquilla_home, native_io_path
@@ -82,10 +84,12 @@ from opensquilla.turn_outcome_projection import (
 )
 
 if TYPE_CHECKING:
+    from opensquilla.execution_workspaces import PreparedExecutionWorkspace
     from opensquilla.provider.types import ProviderRequestCorrelation
 
 _SANDBOX_RUN_CONTEXT_ORIGIN_KEY = "sandbox_run_context"
 _MODEL_ROUTING_MODES = frozenset({"direct", "router", "ensemble"})
+_log = structlog.get_logger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -374,7 +378,7 @@ def _now_iso() -> str:
 
 @dataclass(frozen=True)
 class PreparedSessionIntent:
-    """Pure session mutation plan consumed by the turn-acceptance transaction."""
+    """Session mutation plan and optional uncommitted filesystem preparation."""
 
     node: SessionNode
     action: str
@@ -382,6 +386,66 @@ class PreparedSessionIntent:
     previous_session_id: str | None = None
     previous_node: SessionNode | None = None
     initial_transcript_entries: tuple[TranscriptEntry, ...] = ()
+    workspace_preparation: PreparedSessionWorkspace | None = None
+
+
+@dataclass
+class PreparedSessionWorkspace:
+    """Settle a private allocation before its requesting coroutine can leave."""
+
+    allocation: PreparedExecutionWorkspace
+    storage: SessionStorage
+    session_key: str
+    session_id: str
+    committed: bool = False
+
+    def mark_committed(self, session_id: str) -> None:
+        # A successful request replay may belong to another candidate's session.
+        if session_id == self.session_id:
+            self.committed = True
+
+    async def close(self) -> None:
+        if self.committed:
+            return
+
+        async def settle() -> None:
+            try:
+                current = await self.storage.get_session(self.session_key)
+            except Exception as exc:
+                _log.warning(
+                    "execution_workspace.commit_outcome_unknown",
+                    session_key=self.session_key, error_type=type(exc).__name__,
+                )
+                return
+            if (
+                current is not None
+                and current.execution_workspace == self.allocation.binding
+            ):
+                self.committed = True
+                return
+            await asyncio.to_thread(self.allocation.rollback)
+
+        await _settle_workspace_operation(settle())
+
+
+async def _settle_workspace_operation[T](operation: Awaitable[T]) -> T:
+    """Keep a worker's result observable, propagating cancellation only when settled."""
+
+    task = asyncio.ensure_future(operation)
+    cancellation: asyncio.CancelledError | None = None
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError as exc:
+            cancellation = cancellation or exc
+        except BaseException:
+            break
+    if cancellation is not None:
+        # Observe worker errors without allowing them to hide the caller's cancel.
+        with contextlib.suppress(BaseException):
+            task.result()
+        raise cancellation
+    return task.result()
 
 
 @contextlib.asynccontextmanager
@@ -738,7 +802,9 @@ class SessionManager:
         media_root: str | Path | None = None,
         model_routing_mode_provider: Callable[[], str] | None = None,
         execution_workspace_factory: (
-            Callable[[SessionNode], Awaitable[dict[str, Any] | None]] | None
+            Callable[
+                [SessionNode], Awaitable[dict[str, Any] | PreparedExecutionWorkspace | None]
+            ] | None
         ) = None,
     ) -> None:
         self._storage = storage
@@ -856,15 +922,45 @@ class SessionManager:
 
     # ── Lifecycle ────────────────────────────────────────────────────────────
 
-    async def _prepare_execution_workspace(self, node: SessionNode) -> None:
-        if node.execution_workspace is None and self._execution_workspace_factory is not None:
-            node.execution_workspace = await self._execution_workspace_factory(node)
-        if node.execution_workspace is not None:
-            from opensquilla.execution_workspaces import validate_execution_workspace
+    async def _prepare_execution_workspace(
+        self, node: SessionNode,
+    ) -> PreparedSessionWorkspace | None:
+        from opensquilla.execution_workspaces import validate_execution_workspace
 
+        if node.execution_workspace is not None:
             node.execution_workspace = await asyncio.to_thread(
                 validate_execution_workspace, node.execution_workspace,
             )
+            return None
+        if self._execution_workspace_factory is None:
+            return None
+        preparation = None
+
+        async def prepare() -> None:
+            nonlocal preparation
+            from opensquilla.execution_workspaces import PreparedExecutionWorkspace
+
+            if node.execution_workspace is None and self._execution_workspace_factory is not None:
+                allocated = await self._execution_workspace_factory(node)
+                if isinstance(allocated, PreparedExecutionWorkspace):
+                    preparation = PreparedSessionWorkspace(
+                        allocated, self._storage, node.session_key, node.session_id,
+                    )
+                    node.execution_workspace = allocated.binding
+                else:
+                    node.execution_workspace = allocated
+            if node.execution_workspace is not None:
+                node.execution_workspace = await asyncio.to_thread(
+                    validate_execution_workspace, node.execution_workspace,
+                )
+
+        try:
+            await _settle_workspace_operation(prepare())
+        except BaseException:
+            if preparation is not None:
+                await preparation.close()
+            raise
+        return preparation
 
     @staticmethod
     def _build_session_node(
@@ -926,7 +1022,7 @@ class SessionManager:
         agent_id: str = "main",
         **create_kwargs: Any,
     ) -> PreparedSessionIntent:
-        """Prepare create/reset/continue state without writing durable state."""
+        """Prepare session state; the caller must settle any private workspace."""
 
         session_key = canonicalize_session_key(session_key)
         agent_id = normalize_agent_id(agent_id)
@@ -941,11 +1037,12 @@ class SessionManager:
                 agent_id=agent_id,
                 **create_kwargs,
             )
-            await self._prepare_execution_workspace(node)
+            preparation = await self._prepare_execution_workspace(node)
             return PreparedSessionIntent(
                 node=node,
                 action="create",
                 expected_epoch=int(node.epoch or 0),
+                workspace_preparation=preparation,
             )
         if resolved is SessionIntent.RESET_SAME_KEY:
             reset = self._build_reset_node(existing)
@@ -980,8 +1077,19 @@ class SessionManager:
             agent_id=agent_id,
             **self._prepare_new_session_kwargs(kwargs),
         )
-        await self._prepare_execution_workspace(node)
-        await self._storage.upsert_session(node)
+        preparation = await self._prepare_execution_workspace(node)
+        if preparation is None:
+            await self._storage.upsert_session(node)
+            return node
+
+        async def persist() -> None:
+            await self._storage.upsert_session(node)
+            preparation.mark_committed(node.session_id)
+
+        try:
+            await _settle_workspace_operation(persist())
+        finally:
+            await preparation.close()
         return node
 
     async def get_or_create(

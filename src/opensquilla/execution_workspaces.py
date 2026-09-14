@@ -8,11 +8,57 @@ request-time containment and lifetime checks.
 from __future__ import annotations
 
 import os
+import stat
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 from uuid import UUID, uuid4
 
+import structlog
+
 from opensquilla.project_workspaces import ProjectWorkspaceStateError
+
+_log = structlog.get_logger(__name__)
+
+
+@dataclass(frozen=True)
+class PreparedExecutionWorkspace:
+    """A binding plus deletion authority for this allocation only; never persisted."""
+
+    binding: dict[str, Any]
+    directory_identity: tuple[int, int]
+    parent_identity: tuple[int, int]
+
+    def rollback(self) -> None:
+        """Best-effort empty-root cleanup within the trusted profile namespace.
+
+        Identity checks and rmdir are not atomic against another local process
+        replacing the path. rmdir still refuses to remove any file contents.
+        """
+        root = Path(self.binding["root"])
+        try:
+            parent_stat = root.parent.lstat()
+            root_stat = root.lstat()
+            if (
+                not stat.S_ISDIR(root_stat.st_mode)
+                or not stat.S_ISDIR(parent_stat.st_mode)
+                or (root_stat.st_dev, root_stat.st_ino) != self.directory_identity
+                or (parent_stat.st_dev, parent_stat.st_ino) != self.parent_identity
+                or root.resolve(strict=True) != root
+                or getattr(root, "is_junction", lambda: False)()
+            ):
+                _log.warning("execution_workspace.rollback_identity_changed", root=str(root))
+                return
+            # rmdir is deliberately non-recursive: source files, replacements,
+            # configured roots, and the shared tasks/profile parents are not ours.
+            root.rmdir()
+        except FileNotFoundError:
+            return
+        except (OSError, RuntimeError, ValueError) as exc:
+            _log.warning(
+                "execution_workspace.rollback_preserved", root=str(root),
+                error_type=type(exc).__name__,
+            )
 
 
 def normalize_execution_workspace(value: Any) -> dict[str, Any]:
@@ -71,6 +117,13 @@ def configured_execution_workspace(path: str | Path) -> dict[str, Any]:
 
 
 def create_managed_workspace(profile_home: Path) -> dict[str, Any]:
+    """Create an immediately owned root (legacy allocation API)."""
+
+    return prepare_managed_workspace(profile_home).binding
+
+
+def prepare_managed_workspace(profile_home: Path) -> PreparedExecutionWorkspace:
+    prepared = None
     try:
         profile = profile_home.expanduser().resolve(strict=False)
         profile.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -83,8 +136,16 @@ def create_managed_workspace(profile_home: Path) -> dict[str, Any]:
         identity = uuid4().hex
         root = parent / identity
         root.mkdir(mode=0o700)
-        return validate_execution_workspace({
-            "version": 1, "id": identity, "kind": "managed", "root": str(root),
-        })
+        root_stat = root.lstat()
+        parent_stat = parent.lstat()
+        prepared = PreparedExecutionWorkspace(
+            binding={"version": 1, "id": identity, "kind": "managed", "root": str(root)},
+            directory_identity=(root_stat.st_dev, root_stat.st_ino),
+            parent_identity=(parent_stat.st_dev, parent_stat.st_ino),
+        )
+        validate_execution_workspace(prepared.binding)
+        return prepared
     except (OSError, RuntimeError, ValueError) as exc:
+        if prepared is not None:
+            prepared.rollback()
         raise ProjectWorkspaceStateError("unavailable") from exc

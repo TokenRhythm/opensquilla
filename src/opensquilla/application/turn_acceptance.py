@@ -40,6 +40,7 @@ from opensquilla.application.admission_views import (
     AdmissionMetaControl,
     AdmissionPlanRevision,
     AdmissionPlanRun,
+    AdmissionPreparation,
     AdmissionProjectOrigin,
     AdmissionSessionChanges,
     AdmissionSessionIntent,
@@ -192,7 +193,21 @@ async def _replay_retired_request(
 async def _accept_turn(
     command: AdmitTurn,
     ports: AdmissionPrimitives,
+    **options: Any,
+) -> AdmitTurnResult:
+    # Own preparations across route validation, receipt races and the final
+    # response, including failures before the commit/activation boundary.
+    async with contextlib.AsyncExitStack() as preparations:
+        return await _accept_turn_in_scope(
+            command, ports, preparations=preparations, **options,
+        )
+
+
+async def _accept_turn_in_scope(
+    command: AdmitTurn,
+    ports: AdmissionPrimitives,
     *,
+    preparations: contextlib.AsyncExitStack,
     plan_revision_id: str | None = None,
     plan_context_revision_id: str | None = None,
     plan_run_driver_kind: str | None = None,
@@ -517,6 +532,9 @@ async def _accept_turn(
                 agent_id=ports.effective_agent_id(existing_session, key),
                 **create_kwargs,
             )
+            preparation = getattr(plan, "workspace_preparation", None)
+            if isinstance(preparation, AdmissionPreparation):
+                preparations.push_async_callback(preparation.close)
             return plan.node, plan
         if session_manager.capabilities.apply_intent:
             applied_session, _intent_applied = await session_manager.apply_intent(
@@ -1147,7 +1165,11 @@ async def _accept_turn(
         """Persist a prefix edit and its numbered title in one allocation window."""
 
         if atomic_intent_plan is None or atomic_intent_plan.action != "fork":
-            return await storage.accept_turn(commit)
+            acceptance = await storage.accept_turn(commit)
+            preparation = getattr(atomic_intent_plan, "workspace_preparation", None)
+            if isinstance(preparation, AdmissionPreparation):
+                preparation.mark_committed(acceptance.receipt.session_id)
+            return acceptance
         title_parent = atomic_intent_plan.previous_node
         if title_parent is None:
             raise RuntimeError("Fork acceptance is missing its parent session")

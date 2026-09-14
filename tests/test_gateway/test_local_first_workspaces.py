@@ -21,7 +21,9 @@ async def test_new_ordinary_task_gets_a_durable_managed_workspace(tmp_path: Path
     factory = build_execution_workspace_factory(GatewayConfig(), profile_home=tmp_path)
     node = SessionNode(session_key="agent:main:webchat:local-first", session_id="sid")
 
-    binding = await factory(node)
+    prepared = await factory(node)
+    assert prepared is not None
+    binding = prepared.binding
 
     assert binding is not None
     assert binding["kind"] == "managed"

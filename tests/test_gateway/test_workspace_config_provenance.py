@@ -73,6 +73,7 @@ def test_environment_workspace_override_remains_configured(
 async def test_loaded_config_allocates_isolated_tasks_unless_explicitly_shared(
     tmp_path: Path, configured: bool
 ) -> None:
+    from opensquilla.execution_workspaces import PreparedExecutionWorkspace
     from opensquilla.gateway.execution_workspaces import build_execution_workspace_factory
 
     target = tmp_path / "config.toml"
@@ -84,6 +85,10 @@ async def test_loaded_config_allocates_isolated_tasks_unless_explicitly_shared(
 
     first = await factory(SessionNode(session_key="agent:main:webchat:first", session_id="one"))
     second = await factory(SessionNode(session_key="agent:main:webchat:second", session_id="two"))
+    if isinstance(first, PreparedExecutionWorkspace):
+        first = first.binding
+    if isinstance(second, PreparedExecutionWorkspace):
+        second = second.binding
 
     assert first is not None and second is not None
     assert first["kind"] == second["kind"] == ("configured" if configured else "managed")
