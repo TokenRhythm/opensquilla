@@ -292,7 +292,8 @@ class ToolResultStore:
             record_dir.mkdir(parents=True, exist_ok=False)
             lease = (record_dir / _TOOL_OUTPUT_LEASE_NAME).open("w+b")
             try:
-                lease.write(b"00")
+                # Windows byte-range locking requires a byte to lock.
+                lease.write(b"0")
                 lease.flush()
                 if not _try_file_lock(lease):
                     raise ToolResultStoreBudgetError("could not acquire output spool lease")
@@ -324,8 +325,7 @@ class ToolResultStore:
             return None
         meta = self._read_meta(record_dir)
         if meta is None:
-            active, _ = _output_spool_reservation(record_dir)
-            if active:
+            if _output_spool_active(record_dir):
                 raise ToolOutputNotReadyError("Execution log is still being saved")
             # Finalization may have published metadata between the first read
             # and releasing its existing writer lease.
@@ -476,10 +476,12 @@ class ToolResultStore:
         head, tail = bytearray(), bytearray()
         head_limit = max(1, max_bytes // 2)
         tail_limit = max(1, max_bytes - head_limit)
-        digest = hashlib.sha256()
+        # Execution-log chunks already verify their digest at EOF.
+        digest = hashlib.sha256() if output_meta is None else None
         observed = 0
         for chunk in chunks:
-            digest.update(chunk)
+            if digest is not None:
+                digest.update(chunk)
             observed += len(chunk)
             take = min(len(chunk), head_limit - len(head))
             head.extend(chunk[:take])
@@ -487,7 +489,9 @@ class ToolResultStore:
             tail.extend(remaining)
             if len(tail) > tail_limit:
                 del tail[:-tail_limit]
-        if digest.hexdigest() != meta.get("sha256") or observed != meta.get("size_bytes"):
+        if digest is not None and (
+            digest.hexdigest() != meta.get("sha256") or observed != meta.get("size_bytes")
+        ):
             raise ValueError("retained output integrity mismatch")
         omitted = observed - len(head) - len(tail)
         if omitted <= 0:
@@ -598,11 +602,11 @@ class ToolResultStore:
                     stat = content_path.stat()
                 except (OSError, ValueError):
                     continue
-                active, reservation = _output_spool_reservation(record_dir)
+                active = _output_spool_active(record_dir)
                 records.append(
                     _StoredMeta(
                         created_at=datetime.fromtimestamp(stat.st_mtime, tz=UTC),
-                        size_bytes=max(0, stat.st_size, reservation if active else 0),
+                        size_bytes=max(0, stat.st_size),
                         record_dir=record_dir,
                         active=active,
                     )
@@ -835,19 +839,16 @@ class ToolOutputSpool:
         # Abandoned partial output remains available for ordinary expiry cleanup.
 
 
-def _output_spool_reservation(record_dir: Path) -> tuple[bool, int]:
+def _output_spool_active(record_dir: Path) -> bool:
     lease_path = record_dir / _TOOL_OUTPUT_LEASE_NAME
     try:
         with lease_path.open("r+b") as lease:
             if _try_file_lock(lease):
                 _release_file_lock(lease)
-                return False, 0
-            # Windows locks byte zero; read the reservation after that byte.
-            lease.seek(1)
-            reserved = int(lease.read(32))
-            return True, max(0, reserved)
-    except (OSError, ValueError):
-        return False, 0
+                return False
+            return True
+    except OSError:
+        return False
 
 
 def _record_payload_exists(record_dir: Path) -> bool:

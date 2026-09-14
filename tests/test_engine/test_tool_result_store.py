@@ -51,6 +51,37 @@ def test_identical_content_dedupes_to_one_record(tmp_path: Path) -> None:
     assert len(list(tmp_path.rglob("content.txt"))) == 1
 
 
+@pytest.mark.parametrize("execution_log", [False, True], ids=["snapshot", "execution-log"])
+def test_output_preview_rejects_same_length_payload_corruption(
+    tmp_path: Path, execution_log: bool,
+) -> None:
+    store = ToolResultStore(tmp_path)
+    content = b"first line\nlast line\n"
+    if execution_log:
+        spool = store.open_output_spool(
+            tool_name="exec", session_id=_SESSION_ID, session_key=_SESSION_KEY, agent_id="main",
+        )
+        try:
+            spool.append(content)
+            handle = spool.finish()
+        finally:
+            spool.close()
+        record_dir = spool.record_dir
+    else:
+        handle = _write(store, content.decode()).handle
+        record_dir = store._record_dir(handle, session_id=_SESSION_ID)
+    assert store.read_output_preview(
+        handle, session_id=_SESSION_ID, max_bytes=1024,
+    ) == content.decode()
+
+    meta = json.loads((record_dir / "meta.json").read_text())
+    payload = record_dir / meta["content_file"]
+    payload.write_bytes(b"wrong line\nlast line\n")
+
+    with pytest.raises(ValueError, match="integrity mismatch"):
+        store.read_output_preview(handle, session_id=_SESSION_ID, max_bytes=1024)
+
+
 def test_dedup_hit_still_enforces_retention(tmp_path: Path) -> None:
     store = ToolResultStore(tmp_path)
     hot = _write(store, "hot output", tool_use_id="t1")

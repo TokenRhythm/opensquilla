@@ -16,9 +16,11 @@ from opensquilla.provider import DoneEvent, TextDeltaEvent
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("legacy_timeout", [0.001, 444.0, -1.0])
-async def test_run_accepts_legacy_iteration_timeout_without_enforcing_it(
+@pytest.mark.parametrize("legacy_option", ["iteration_timeout", "tool_timeout"])
+async def test_run_accepts_legacy_tool_and_iteration_timeouts_without_enforcing_them(
     monkeypatch: pytest.MonkeyPatch,
     legacy_timeout: float,
+    legacy_option: str,
 ) -> None:
     """Legacy callers remain accepted, but bootstrap never arms the old watchdog."""
     from opensquilla.tools.types import ToolContext
@@ -66,7 +68,7 @@ async def test_run_accepts_legacy_iteration_timeout_without_enforcing_it(
             message="hi",
             session_key="agent:main:iter-thread-test",
             tool_context=tool_ctx,
-            iteration_timeout=legacy_timeout,
+            **{legacy_option: legacy_timeout},
         )
     ]
 
@@ -74,7 +76,7 @@ async def test_run_accepts_legacy_iteration_timeout_without_enforcing_it(
     assert any(event.kind == "done" for event in events)
 
     assert seen_kwargs, "The turn must reach agent bootstrap"
-    assert all(kw.get("iteration_timeout", 0.0) == 0.0 for kw in seen_kwargs)
+    assert all(kw.get(legacy_option, 0.0) == 0.0 for kw in seen_kwargs)
 
 
 @pytest.mark.asyncio

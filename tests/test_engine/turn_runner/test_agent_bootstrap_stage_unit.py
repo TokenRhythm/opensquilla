@@ -41,8 +41,6 @@ def _default_budgets() -> _ResolvedBudgets:
         runtime_timeout=60.0,
         max_iterations=10,
         max_iterations_source="test budget",
-        iteration_timeout=30.0,
-        tool_timeout=20.0,
         request_timeout=120.0,
         max_provider_retries=3,
     )
@@ -60,8 +58,6 @@ def _default_aux(
     *,
     thinking: bool | ThinkingLevel = False,
     flush_compaction_requires_safe_receipt: bool = False,
-    source_diff_preservation_mode: str | None = "log",
-    source_diff_candidate_mode: str | None = "log",
 ) -> _AgentConfigAuxiliaries:
     return _AgentConfigAuxiliaries(
         thinking=thinking,
@@ -89,8 +85,6 @@ def _default_aux(
         tool_result_store_max_bytes=400_000,
         tool_result_store_disk_budget_bytes=4_000_000,
         tool_result_store_retention_seconds=3600,
-        source_diff_preservation_mode=source_diff_preservation_mode,
-        source_diff_candidate_mode=source_diff_candidate_mode,
     )
 
 
@@ -259,8 +253,6 @@ def _make_input(
     agent_id="agent:main",
     timeout=None,
     max_iterations=None,
-    iteration_timeout=None,
-    tool_timeout=None,
     request_timeout=None,
     max_provider_retries=None,
     length_capped_continuations=None,
@@ -282,8 +274,6 @@ def _make_input(
         agent_id=agent_id,
         timeout=timeout,
         max_iterations=max_iterations,
-        iteration_timeout=iteration_timeout,
-        tool_timeout=tool_timeout,
         request_timeout=request_timeout,
         max_provider_retries=max_provider_retries,
         length_capped_continuations=length_capped_continuations,
@@ -323,8 +313,6 @@ async def test_case01_success_all_defaults() -> None:
     assert o.effective_runtime_timeout == 60.0
     assert o.effective_max_iterations == 10
     assert o.effective_max_iterations_source == "test budget"
-    assert o.effective_iteration_timeout == 0.0
-    assert o.effective_tool_timeout == 20.0
     assert o.effective_request_timeout == 120.0
     assert o.effective_max_provider_retries == 3
     assert o.model_capabilities is None
@@ -768,15 +756,6 @@ async def test_case02_per_call_timeout_threaded() -> None:
     inp = _make_input(timeout=42.0)
     await stage.run(inp)
     assert budgets.calls[0]["timeout"] == 42.0
-
-
-@pytest.mark.asyncio
-async def test_legacy_iteration_timeout_is_inert() -> None:
-    budgets = _RecordingTimeoutBudget()
-    stage = _make_stage(budgets=budgets)
-    inp = _make_input(iteration_timeout=15.0)
-    await stage.run(inp)
-    assert budgets.calls[0]["iteration_timeout"] == 0.0
 
 
 @pytest.mark.asyncio

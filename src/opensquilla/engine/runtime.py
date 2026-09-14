@@ -6564,9 +6564,6 @@ class TurnRunner:
                     agent_id=agent_id,
                     timeout=runtime_timeout_override,
                     max_iterations=max_iterations,
-                    iteration_timeout=None,
-                    input_mode=input_mode,
-                    tool_timeout=tool_timeout,
                     request_timeout=request_timeout,
                     max_provider_retries=max_provider_retries,
                     length_capped_continuations=length_capped_continuations,
@@ -6633,8 +6630,6 @@ class TurnRunner:
             )
             effective_max_iterations = ab_out.effective_max_iterations  # noqa: F841
             effective_max_iterations_source = ab_out.effective_max_iterations_source  # noqa: F841
-            effective_iteration_timeout = ab_out.effective_iteration_timeout  # noqa: F841
-            effective_tool_timeout = ab_out.effective_tool_timeout  # noqa: F841
             effective_agent_request_timeout = ab_out.effective_request_timeout  # noqa: F841
             effective_max_provider_retries = ab_out.effective_max_provider_retries  # noqa: F841
             model_caps = ab_out.model_capabilities  # noqa: F841
@@ -8410,14 +8405,6 @@ class TurnRunner:
         self._last_agent_max_iterations_source = policy.max_iterations_source
         return policy.max_iterations
 
-
-    def _resolve_agent_tool_timeout(
-        self,
-        session_key: str,
-        explicit: float | None = None,
-    ) -> float:
-        """Retired compatibility hook; tools declare their own execution deadlines."""
-        return 0.0
 
     def _resolve_agent_request_timeout(
         self,

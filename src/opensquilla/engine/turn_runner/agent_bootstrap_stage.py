@@ -81,8 +81,6 @@ class _ResolvedBudgets:
     runtime_timeout: float
     max_iterations: int
     max_iterations_source: str
-    iteration_timeout: float
-    tool_timeout: float
     request_timeout: float
     max_provider_retries: int
 
@@ -152,8 +150,6 @@ class _AgentConfigAuxiliaries:
     tool_result_store_max_bytes: int
     tool_result_store_disk_budget_bytes: int
     tool_result_store_retention_seconds: int
-    source_diff_preservation_mode: Literal["off", "log", "block"] | None
-    source_diff_candidate_mode: Literal["off", "log", "warn_model"] | None
     # Inert compatibility slot for older bootstrap integrations.
     finalize_evidence_gate: bool = False
 
@@ -175,13 +171,13 @@ class _MemorySnapshotResult:
 
 @runtime_checkable
 class TimeoutBudgetPort(Protocol):
-    """Wraps the five ``TurnRunner._resolve_agent_*`` helpers as a
+    """Wraps the active ``TurnRunner._resolve_agent_*`` helpers as a
     coordinated single-call port. Returns the resolved budget tuple in
     one shot to keep the stage body declarative.
 
     ``effective_runtime_timeout`` honors the per-call ``timeout``
     override (``float(timeout) if timeout is not None else
-    self._resolve_agent_runtime_timeout(session_key)``). The other four
+    self._resolve_agent_runtime_timeout(session_key)``). The remaining
     resolvers consume the per-call explicit override and the
     session/env/config fallback chain internally.
     """
@@ -192,8 +188,6 @@ class TimeoutBudgetPort(Protocol):
         session_key: str,
         timeout: float | None,
         max_iterations: int | None,
-        iteration_timeout: float | None,
-        tool_timeout: float | None,
         request_timeout: float | None,
         max_provider_retries: int | None,
     ) -> _ResolvedBudgets: ...
@@ -361,8 +355,6 @@ class AgentBootstrapStageInput:
     agent_id: str
     timeout: float | None
     max_iterations: int | None
-    iteration_timeout: float | None
-    tool_timeout: float | None
     request_timeout: float | None
     max_provider_retries: int | None
     length_capped_continuations: int | None
@@ -378,7 +370,6 @@ class AgentBootstrapStageInput:
         default=None,
         repr=False,
     )
-    input_mode: str = "user"
 
 
 @dataclass(frozen=True)
@@ -392,7 +383,6 @@ class AgentBootstrapStageOutput:
       ``agent.config``. Surfaced separately because PreflightCompactionStage
       reads ``agent_config.context_window_tokens`` directly.
     - ``effective_runtime_timeout`` / ``effective_max_iterations`` /
-      ``effective_iteration_timeout`` / ``effective_tool_timeout`` /
       ``effective_request_timeout`` / ``effective_max_provider_retries``:
       surfaced for parity assertions and downstream consumers.
     - ``model_capabilities``: the resolved ``ModelCapabilities`` (or
@@ -410,8 +400,6 @@ class AgentBootstrapStageOutput:
     effective_runtime_timeout: float
     effective_max_iterations: int
     effective_max_iterations_source: str
-    effective_iteration_timeout: float
-    effective_tool_timeout: float
     effective_request_timeout: float
     effective_max_provider_retries: int
     model_capabilities: ModelCapabilities | None
@@ -476,13 +464,11 @@ class AgentBootstrapStage:
         from opensquilla.engine.turn_runner.outcome import StageOutcome
         from opensquilla.engine.types import AgentConfig
 
-        # 1. Resolve runtime/iteration/tool/request/retry budgets
+        # 1. Resolve turn, iteration-count, request, and retry budgets
         budgets = self._timeout_budget.resolve_budgets(
             session_key=inp.session_key,
             timeout=inp.timeout,
             max_iterations=inp.max_iterations,
-            iteration_timeout=0.0,
-            tool_timeout=inp.tool_timeout,
             request_timeout=inp.request_timeout,
             max_provider_retries=inp.max_provider_retries,
         )
@@ -872,8 +858,6 @@ class AgentBootstrapStage:
                 effective_runtime_timeout=budgets.runtime_timeout,
                 effective_max_iterations=budgets.max_iterations,
                 effective_max_iterations_source=budgets.max_iterations_source,
-                effective_iteration_timeout=0.0,
-                effective_tool_timeout=budgets.tool_timeout,
                 effective_request_timeout=budgets.request_timeout,
                 effective_max_provider_retries=budgets.max_provider_retries,
                 model_capabilities=catalog.capabilities,
