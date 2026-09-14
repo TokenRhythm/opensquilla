@@ -241,6 +241,8 @@ class ToolContext:
 
     desktop_browser: Any | None = field(default=None, repr=False)
     artifact_source_paths: dict[str, ArtifactSource] = field(default_factory=dict, repr=False)
+    # Live, read-only facts from this accepted turn; never persisted session settings.
+    execution_status_snapshot: Callable[[], dict[str, Any]] | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
         self.validate_path_roots()

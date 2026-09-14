@@ -263,6 +263,10 @@ from opensquilla.provider import (
 from opensquilla.provider import (
     ToolUseStartEvent as ProviderToolUseStartEvent,
 )
+from opensquilla.provider.execution_identity import (
+    project_execution_identity,
+    rebind_execution_identity,
+)
 from opensquilla.provider.image_projection import (
     ImageProjectionMode,
     assert_text_only_messages,
@@ -2867,6 +2871,8 @@ class _SelectorFallbackProvider:
     def _config_for_active_leg(self, config: Any) -> Any:
         """Bind one physical fallback to its own correlation and model budget."""
 
+        provider_id, model = self._active_deployment()
+        config = rebind_execution_identity(config, provider=provider_id, model=model)
         if not self._used_fallback:
             return config
         updates: dict[str, Any] = {}
@@ -3373,7 +3379,7 @@ class _SelectorFallbackProvider:
 
         return project_provider_final_request(
             self._provider,
-            messages,
+            project_execution_identity(messages, self._config_for_active_leg(config)),
             tools,
             self._config_for_active_leg(config),
             message_limit=message_limit,
@@ -3433,6 +3439,7 @@ class _SelectorFallbackProvider:
             active_config,
             stage="fallback" if self._used_fallback else "primary",
         )
+        physical_messages = project_execution_identity(physical_messages, active_config)
         if (
             tools
             and getattr(
@@ -3737,6 +3744,9 @@ class _SelectorFallbackProvider:
                         messages,
                         fallback_config,
                         stage="fallback",
+                    )
+                    fallback_messages = project_execution_identity(
+                        fallback_messages, fallback_config,
                     )
                     if (
                         tools

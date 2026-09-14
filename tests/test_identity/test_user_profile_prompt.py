@@ -78,9 +78,10 @@ def test_system_prompt_explains_dynamic_execution_identity_fields() -> None:
         tools=None,
     )
 
-    assert "Execution selected for this turn" in prompt
-    assert "`router_tier` is a routing class, not a model identity" in prompt
-    assert "For `multi_model_fusion`" in prompt
+    assert "When explicitly asked about the underlying model" in prompt
+    assert "use the current request's execution facts." in prompt
+    assert "Execution selected for this turn" not in prompt
+    assert "router_tier" not in prompt
 
 
 def test_system_prompt_disambiguates_session_memory_results() -> None:

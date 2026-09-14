@@ -1149,6 +1149,8 @@ async def test_turn_metadata_threaded_into_agent_config() -> None:
 
 @pytest.mark.asyncio
 async def test_selected_single_model_deployment_is_runtime_scoped_after_routing() -> None:
+    from opensquilla.provider.types import ExecutionIdentity
+
     turn = _make_turn(
         metadata={
             "routed_tier": "c0",
@@ -1169,17 +1171,15 @@ async def test_selected_single_model_deployment_is_runtime_scoped_after_routing(
     config = out.output.agent_config
     assert config.system_prompt == "CACHEABLE IDENTITY"
     assert config.request_context_prompt == "EXISTING DYNAMIC CONTEXT"
-    assert config.execution_identity_context == (
-        "[Execution selected for this turn]\n"
-        "execution_kind=single_model\n"
-        "selected_model=deepseek/deepseek-v4-flash\n"
-        "selected_provider=openrouter\n"
-        "router_tier=c0"
+    assert config.execution_identity == ExecutionIdentity(
+        model="deepseek/deepseek-v4-flash", provider="openrouter",
     )
 
 
 @pytest.mark.asyncio
 async def test_ensemble_is_identified_as_fusion_without_claiming_its_anchor() -> None:
+    from opensquilla.provider.execution_identity import render_execution_identity
+
     turn = _make_turn(
         metadata={
             "ensemble_enabled": True,
@@ -1198,13 +1198,11 @@ async def test_ensemble_is_identified_as_fusion_without_claiming_its_anchor() ->
     )
 
     assert out.output.agent_config.request_context_prompt == "ENSEMBLE CONTEXT"
-    assert out.output.agent_config.execution_identity_context == (
-        "[Execution selected for this turn]\n"
-        "execution_kind=multi_model_fusion\n"
-        "router_tier=c3"
+    identity = out.output.agent_config.execution_identity
+    assert identity is not None
+    assert render_execution_identity(identity) == (
+        'Current response execution: {"kind":"multi_model_fusion"}'
     )
-    assert "anchor/model" not in out.output.agent_config.execution_identity_context
-    assert "openrouter" not in out.output.agent_config.execution_identity_context
 
 
 @pytest.mark.asyncio
@@ -1248,20 +1246,15 @@ async def test_selected_execution_context_does_not_leak_across_mode_changes() ->
         )
     )
 
-    direct_context = direct.output.agent_config.execution_identity_context or ""
-    routed_context = routed.output.agent_config.execution_identity_context or ""
-    ensemble_context = ensemble.output.agent_config.execution_identity_context or ""
-    direct_again_context = direct_again.output.agent_config.execution_identity_context or ""
-    assert "execution_kind=single_model" in direct_context
-    assert "selected_model=direct/model-a" in direct_context
-    assert "router_tier=" not in direct_context
-    assert "selected_model=router/model-b" in routed_context
-    assert "router_tier=c1" in routed_context
-    assert "execution_kind=multi_model_fusion" in ensemble_context
-    assert "hidden/anchor" not in ensemble_context
-    assert "selected_model=direct/model-c" in direct_again_context
-    assert "router_tier=" not in direct_again_context
-    assert "hidden/anchor" not in direct_again_context
+    direct_context = direct.output.agent_config.execution_identity
+    routed_context = routed.output.agent_config.execution_identity
+    ensemble_context = ensemble.output.agent_config.execution_identity
+    direct_again_context = direct_again.output.agent_config.execution_identity
+    assert direct_context.kind == "single_model"
+    assert direct_context.model == "direct/model-a"
+    assert routed_context.model == "router/model-b"
+    assert ensemble_context.kind == "multi_model_fusion"
+    assert direct_again_context.model == "direct/model-c"
 
 
 def test_stage_name_constant() -> None:

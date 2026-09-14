@@ -586,9 +586,12 @@ def _install_exact_compactor(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("identity_enabled", [False, True])
 async def test_message_limit_recovery_retries_once_below_headroom_without_rewriting_history(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, identity_enabled: bool,
 ) -> None:
+    from opensquilla.provider.types import ExecutionIdentity
+
     compact_requests: list[Any] = []
     _install_exact_compactor(monkeypatch, compact_requests)
     provider = _ExactMessageLimitProvider([100, None])
@@ -598,6 +601,9 @@ async def test_message_limit_recovery_retries_once_below_headroom_without_rewrit
         config=AgentConfig(
             max_provider_retries=0,
             request_context_prompt="request-scoped evidence",
+            execution_identity=(
+                ExecutionIdentity(model="synthetic-model") if identity_enabled else None
+            ),
             flush_enabled=False,
         ),
     )
@@ -629,6 +635,13 @@ async def test_message_limit_recovery_retries_once_below_headroom_without_rewrit
     )
     assert not any(isinstance(event, CompactionEvent) for event in events)
     assert agent._history[: len(history)] == history
+    for messages in provider.calls:
+        assert sum(
+            "Current response execution:" in str(message.content) for message in messages
+        ) == int(identity_enabled)
+    assert all(
+        "Current response execution:" not in str(message.content) for message in agent._history
+    )
     assert not any("[Context summary]" in str(message.content) for message in agent._history)
     assert not any(
         "[Request context for this turn]" in str(message.content)
@@ -637,9 +650,12 @@ async def test_message_limit_recovery_retries_once_below_headroom_without_rewrit
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("identity_enabled", [False, True])
 async def test_message_limit_recovery_preserves_referenced_and_uploaded_images(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, identity_enabled: bool,
 ) -> None:
+    from opensquilla.provider.types import ExecutionIdentity
+
     compact_requests: list[Any] = []
     _install_exact_compactor(monkeypatch, compact_requests)
     provider = _ExactMessageLimitProvider([100, None])
@@ -649,6 +665,9 @@ async def test_message_limit_recovery_preserves_referenced_and_uploaded_images(
             max_provider_retries=0,
             flush_enabled=False,
             model_vision_support="supported",
+            execution_identity=(
+                ExecutionIdentity(model="synthetic-model") if identity_enabled else None
+            ),
             model_capabilities=ModelCapabilities(supports_vision=True),
         ),
     )
@@ -680,6 +699,9 @@ async def test_message_limit_recovery_preserves_referenced_and_uploaded_images(
             if isinstance(block, ContentBlockImage)
         ]
         assert images == [recovered_image, current_image]
+        assert sum(
+            "Current response execution:" in str(message.content) for message in messages
+        ) == int(identity_enabled)
     assert not any("b2xkLWltYWdl" in str(entry) for entry in compact_requests[0].entries)
     assert agent._request_image_context == []
 

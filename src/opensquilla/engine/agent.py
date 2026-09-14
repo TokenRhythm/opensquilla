@@ -166,6 +166,12 @@ from opensquilla.provider import (
     ToolUseStartEvent as ProviderToolUseStart,
 )
 from opensquilla.provider.correlation_context import bind_provider_request_correlation
+from opensquilla.provider.execution_identity import (
+    execution_from_evidence,
+    project_execution_identity,
+    with_execution_identity,
+    with_execution_span,
+)
 from opensquilla.provider.failures import ProviderFailureKind, classify_provider_error
 from opensquilla.provider.image_projection import (
     ImageMarkerState,
@@ -190,6 +196,7 @@ from opensquilla.provider.request_proof import (
 )
 from opensquilla.provider.types import (
     ContentBlockImage,
+    ExecutionIdentity,
     FailureInjector,
     ModelCapabilities,
     ProviderFinalRequestProjection,
@@ -2604,6 +2611,10 @@ class Agent:
             )
             tool_context.validate_path_roots()
         self._tool_context: ToolContext | None = tool_context
+        self._current_request_execution: dict[str, str] = {}
+        for context in (self._ingress_tool_context, self._tool_context):
+            if context is not None:
+                context.execution_status_snapshot = self._execution_status_snapshot
         # Test-only offline failure seam. ``None`` on every production path,
         # so the provider chat call below stays byte-identical to before when
         # it is unset; a test passes an explicit FailureInjector to script the
@@ -3185,6 +3196,7 @@ class Agent:
                 .provider_request_max_chars
             )
         return ChatConfig(
+            execution_identity=self._active_execution_identity(),
             max_tokens=output_tokens,
             temperature=self.config.temperature,
             top_p=self.config.top_p,
@@ -6271,6 +6283,7 @@ class Agent:
             removed_messages=max(len(sanitized_history) - len(history), 0),
         )
 
+        self._current_request_execution = {}
         # Build initial message list
         turn_messages: list[Message] = list(history)
         # Count-aware recovery may summarize only content before this boundary.
@@ -7875,6 +7888,15 @@ class Agent:
                             update={"active_user_message_index": (active_user_message_index)}
                         )
 
+                    active_identity = self._active_execution_identity()
+                    if active_identity is not None:
+                        call_chat_cfg = call_chat_cfg.model_copy(
+                            update={"execution_identity": active_identity}
+                        )
+                        request_messages = project_execution_identity(
+                            request_messages, call_chat_cfg,
+                        )
+
                     if call_recovery_downgraded and not bool(
                         getattr(
                             self.provider,
@@ -8766,6 +8788,17 @@ class Agent:
                                     # duplicate either legacy or ledger totals.
                                     continue
                                 provider_done_for_log = raw_ev
+                                self._current_request_execution = execution_from_evidence(
+                                    {
+                                        "model": raw_ev.model,
+                                        "provider": raw_ev.provider,
+                                        "ensemble_trace": raw_ev.ensemble_trace,
+                                        "execution_legs": self.config.metadata.get(
+                                            "execution_legs"
+                                        ),
+                                    },
+                                    request_identity=self._active_execution_identity(),
+                                )
                                 _got_done_event = True
                                 if keepalive_stable_history and self._session_key:
                                     try:
@@ -16379,6 +16412,37 @@ class Agent:
             before
         )
 
+    def _active_execution_identity(self) -> ExecutionIdentity | None:
+        identity = self.config.execution_identity
+        if identity is None or identity.kind == "multi_model_fusion":
+            return identity
+        metadata = provider_metadata(self.provider)
+        resolver = getattr(self.provider, "active_deployment_config", None)
+        deployment = resolver() if callable(resolver) else metadata
+        return replace(
+            identity,
+            provider=str(
+                getattr(deployment, "provider", "")
+                or metadata.provider_id or identity.provider or metadata.provider_name
+            ),
+            model=str(getattr(deployment, "model", "") or identity.model),
+        )
+
+    def _execution_status_snapshot(self) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        identity = self.config.execution_identity
+        if identity is not None:
+            selection = {"kind": identity.kind}
+            if identity.kind == "single_model":
+                for name in ("provider", "model"):
+                    value = getattr(identity, name)
+                    if value:
+                        selection[name] = value
+            result["selection"] = selection
+        if self._current_request_execution:
+            result["current_request"] = dict(self._current_request_execution)
+        return result
+
     def _runtime_context_block(self) -> str:
         now = datetime.now().astimezone()
         tzinfo = now.tzinfo
@@ -16390,14 +16454,12 @@ class Agent:
             "Use this runtime context for questions about the current date, time, or local "
             "time zone. Do not treat it as a user request.",
         ]
-        execution_identity = self.config.execution_identity_context
-        if execution_identity and execution_identity.strip():
-            lines.extend(("", execution_identity.strip()))
         return "\n".join(lines)
 
-    @staticmethod
-    def _runtime_context_message(runtime_context: str) -> Message:
-        return Message(role="user", content=runtime_context)
+    def _runtime_context_message(self, runtime_context: str) -> Message:
+        return with_execution_identity(
+            Message(role="user", content=runtime_context), self._active_execution_identity(),
+        )
 
     @staticmethod
     def _request_context_message(request_context: str | None) -> Message | None:
@@ -16511,12 +16573,22 @@ class Agent:
         if not isinstance(runtime_content, str):
             return runtime_context_message
         if isinstance(message.content, str):
-            return message.model_copy(update={"content": f"{message.content}\n\n{runtime_content}"})
+            prefix = message.content + "\n\n"
+            span = runtime_context_message.execution_identity_span
+            return with_execution_span(
+                message,
+                (len(prefix) + span[0], len(prefix) + span[1]) if span is not None else None,
+                content=prefix + runtime_content,
+            )
         if isinstance(message.content, list):
+            span = runtime_context_message.execution_identity_span
             return message.model_copy(
                 update={"content": [
                     *message.content,
-                    ContentBlockText(text=f"\n\n{runtime_content}"),
+                    with_execution_span(
+                        ContentBlockText(text=f"\n\n{runtime_content}"),
+                        (span[0] + 2, span[1] + 2) if span is not None else None,
+                    ),
                 ]},
             )
         return runtime_context_message

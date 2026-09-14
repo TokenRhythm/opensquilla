@@ -615,6 +615,9 @@ async def test_changing_request_context_does_not_pollute_persisted_history_prefi
 
 @pytest.mark.asyncio
 async def test_execution_selection_changes_only_current_runtime_suffix() -> None:
+    from opensquilla.provider.execution_identity import render_execution_identity
+    from opensquilla.provider.types import ExecutionIdentity
+
     provider = _CapturingProvider()
     breakpoints = [{"text": "stable base", "cache": "true"}]
     agent = Agent(
@@ -632,15 +635,13 @@ async def test_execution_selection_changes_only_current_runtime_suffix() -> None
     ]
     agent.set_history(history)
     selections = [
-        "execution_kind=single_model\nselected_model=example/model-a",
-        "execution_kind=single_model\nselected_model=example/model-b\nrouter_tier=c1",
-        "execution_kind=multi_model_fusion",
-        "execution_kind=single_model\nselected_model=example/model-c",
+        ExecutionIdentity(model="example/model-a"),
+        ExecutionIdentity(model="example/model-b"),
+        ExecutionIdentity(kind="multi_model_fusion"),
+        ExecutionIdentity(model="example/model-c"),
     ]
     for index, selection in enumerate(selections):
-        agent.config.execution_identity_context = (
-            "[Execution selected for this turn]\n" + selection
-        )
+        agent.config.execution_identity = selection
         events = [event async for event in agent.run_turn(f"question {index}")]
         assert any(event.kind == "done" for event in events)
         call = provider.calls[-1]
@@ -650,7 +651,7 @@ async def test_execution_selection_changes_only_current_runtime_suffix() -> None
         assert len(call["messages"]) == 3 + 2 * index
         content = call["messages"][-1].content
         assert content.startswith(f"question {index}")
-        assert selection in content
-        assert content.count("[Execution selected for this turn]") == 1
+        assert render_execution_identity(call["config"].execution_identity) in content
+        assert content.count("Current response execution:") == 1
         for prior in call["messages"][:-1]:
-            assert "[Execution selected for this turn]" not in str(prior.content)
+            assert "Current response execution:" not in str(prior.content)
