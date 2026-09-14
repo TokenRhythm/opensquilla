@@ -191,8 +191,10 @@ function Build-WebUI {
         exit 1
     }
 
-    $rawNodeVersion = (& $nodeCommand.Source --version 2>$null | Select-Object -First 1)
-    if ($LASTEXITCODE -ne 0 -or -not $rawNodeVersion) {
+    $rawNodeVersion = & $nodeCommand.Source --version 2>$null
+    $nodeExitCode = $LASTEXITCODE
+    $rawNodeVersion = $rawNodeVersion | Select-Object -First 1
+    if ($nodeExitCode -ne 0 -or -not $rawNodeVersion) {
         Write-Error 'install_source.ps1: could not determine the installed Node.js version.'
         exit 1
     }
