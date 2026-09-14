@@ -18,6 +18,7 @@ from opensquilla.execution_workspaces import configured_execution_workspace
 from opensquilla.gateway.boot import (
     build_session_material_cleanup,
 )
+from opensquilla.project_workspaces import project_path_key
 from opensquilla.session.material_cleanup import (
     reset_session_artifact_cleanup,
     reset_session_material_cleanup,
@@ -177,7 +178,8 @@ async def test_delete_captures_effective_material_root(
         node = SessionNode(session_key="agent:main:webchat:task", session_id="task")
         if root_kind == "project":
             project = await storage.create_or_restore_project_workspace(
-                path=str(actual), path_key=str(actual), display_name="Task", trusted_at=1,
+                path=str(actual), path_key=project_path_key(actual),
+                display_name="Task", trusted_at=1,
             )
             node.workspace_id = project.workspace_id
         elif root_kind == "legacy":
@@ -222,7 +224,7 @@ async def test_project_history_delete_cleans_only_its_sessions_material(tmp_path
     set_session_material_cleanup(build_session_material_cleanup(_config(media_root, default)))
     async with SessionStorage(tmp_path / "sessions.db") as storage:
         project = await storage.create_or_restore_project_workspace(
-            path=str(project_root), path_key=str(project_root),
+            path=str(project_root), path_key=project_path_key(project_root),
             display_name="Project", trusted_at=1,
         )
         node = SessionNode(
