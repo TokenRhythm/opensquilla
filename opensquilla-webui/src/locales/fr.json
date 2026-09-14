@@ -3452,7 +3452,7 @@
     "automaticRecoveryDescription": "La récupération est automatique. Vous pouvez continuer à écrire ; le texte et les pièces jointes non envoyés restent ici.",
     "liveUnavailable": "Les mises à jour en direct sont temporairement indisponibles",
     "liveUnavailableDescription": "L’historique reste disponible. Reconnectez-vous avant d’envoyer.",
-    "liveUnavailableConnectedDescription": "Le Gateway est connecté et l’historique reste disponible. L’envoi reprendra après le rétablissement des mises à jour en direct.",
+    "liveUnavailableConnectedDescription": "La Gateway est connectée. Les mises à jour en direct de cette session seront rétablies automatiquement.",
     "reconnectLive": "Se reconnecter",
     "liveSendBlockedConnecting": "Les mises à jour en direct se reconnectent. Votre brouillon est conservé.",
     "liveSendBlockedDegraded": "Reconnectez les mises à jour en direct avant d’envoyer. Votre brouillon est conservé.",
