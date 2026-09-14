@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import time
 
 import pytest
@@ -188,6 +189,38 @@ async def test_real_agent_wait_releases_same_leg_at_retry_after(monkeypatch):
     ]
     events = await _run(wrapper, max_provider_retries=1)
     assert calls == ["a", "a"]
+    assert any(event.kind == "done" for event in events)
+
+
+@pytest.mark.parametrize("timeout", [0, 2])
+async def test_early_timer_wakeup_does_not_consume_retry_or_switch_provider(monkeypatch, timeout):
+    loop = asyncio.get_running_loop()
+    now = [loop.time()]
+    original_sleep = asyncio.sleep
+    delays = []
+
+    async def early_sleep(delay):
+        delays.append(delay)
+        now[0] += delay / 2 if len(delays) <= 2 else delay
+        await original_sleep(0)
+
+    monkeypatch.setattr(loop, "time", lambda: now[0])
+    monkeypatch.setattr("opensquilla.engine.runtime.time.monotonic", lambda: now[0])
+    monkeypatch.setattr("opensquilla.engine.agent.asyncio.sleep", early_sleep)
+    wrapper, _, providers, _, _, calls = _setup(monkeypatch)
+    providers["a"].streams = [
+        [ErrorEvent(message="rate limit", code="429", retry_after_s=0.01)], _done()
+    ]
+
+    events = await _run(wrapper, timeout=timeout, max_provider_retries=1)
+
+    assert delays == pytest.approx([0.01, 0.005, 0.0025])
+    assert calls == ["a", "a"]
+    assert [
+        event.retry_attempt for event in events
+        if event.kind == "provider_activity" and event.phase == "retrying"
+    ] == [1]
+    assert not any(event.kind == "error" for event in events)
     assert any(event.kind == "done" for event in events)
 
 

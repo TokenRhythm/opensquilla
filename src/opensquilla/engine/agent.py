@@ -6327,15 +6327,24 @@ class Agent:
             deadline: float | None = None,
         ) -> None:
             effective_deadline = _total_deadline if deadline is None else deadline
-            if effective_deadline is None:
-                await asyncio.sleep(delay)
-                return
-            remaining = effective_deadline - _loop.time()
-            if remaining <= 0:
-                raise TimeoutError
-            await asyncio.sleep(min(delay, remaining))
-            if delay >= remaining or _loop.time() >= effective_deadline:
-                raise TimeoutError
+            retry_at = _loop.time() + delay
+            remaining_delay = delay
+            # Asyncio timers can fire before their deadline on coarse clocks.
+            # Retry-After must expire before another provider attempt starts.
+            while True:
+                sleep_delay = remaining_delay
+                if effective_deadline is not None:
+                    remaining_budget = effective_deadline - _loop.time()
+                    if remaining_budget <= 0:
+                        raise TimeoutError
+                    sleep_delay = min(sleep_delay, remaining_budget)
+                await asyncio.sleep(sleep_delay)
+                now = _loop.time()
+                if effective_deadline is not None and now >= effective_deadline:
+                    raise TimeoutError
+                remaining_delay = retry_at - now
+                if remaining_delay <= 0:
+                    return
 
         configured_capabilities = self.config.model_capabilities
         tools_supported = bool(

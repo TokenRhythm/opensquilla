@@ -149,6 +149,31 @@ def test_split_utf8_is_decoded_after_bounded_capture() -> None:
     assert capture.preview() == "alpha你好omega"
 
 
+@pytest.mark.parametrize("streams", [("stdout",), ("stdout", "stderr")])
+async def test_retained_capture_preserves_process_newlines(
+    tmp_path: Path, streams: tuple[str, ...],
+) -> None:
+    capture = BoundedOutputCapture(streams=streams)
+    capture.spool = _spool(ToolResultStore(tmp_path))
+    content = "progress 50%\rprogress 100%\r\ncomplete\n"
+    for stream in streams:
+        capture.feed(content.encode("utf-8"), stream)
+    await capture.finish_async()
+
+    assert capture.handle
+    store = ToolResultStore(tmp_path)
+    retained = store.read(capture.handle, session_id="test-session")
+    expected = (
+        "".join(f"\n[{stream}]\n{content}" for stream in streams)
+        if len(streams) > 1 else content
+    )
+    assert retained.content == expected
+    assert store.read_output_preview(
+        capture.handle, session_id="test-session", max_bytes=1024,
+    ) == expected
+    assert capture.describe()["retained_output_complete"] is True
+
+
 async def test_exec_timeout_preserves_output_and_retrievable_retained_text(tmp_path: Path) -> None:
     token = current_tool_context.set(ToolContext(
         session_key="test-session", tool_result_store_dir=str(tmp_path), agent_id="main",

@@ -97,6 +97,34 @@ def test_round_trip_read(tmp_path: Path) -> None:
     assert got.sha256 == record.sha256
 
 
+@pytest.mark.parametrize("newline", ["\n", "\r\n", "\r"])
+@pytest.mark.parametrize("storage_encoding", ["utf-8", "gzip+utf-8"])
+def test_round_trip_preserves_newlines(
+    tmp_path: Path, newline: str, storage_encoding: str,
+) -> None:
+    store = ToolResultStore(tmp_path)
+    content = f"进度 50%{newline}complete{newline}" * 100
+    record = _write(
+        store, content, max_bytes=128 if storage_encoding == "gzip+utf-8" else None,
+    )
+    assert record.storage_encoding == storage_encoding
+
+    restored = store.read(record.handle, session_id=_SESSION_ID)
+    assert restored.content == content
+    assert restored.size_bytes == len(content.encode("utf-8"))
+    assert restored.sha256 == hashlib.sha256(content.encode("utf-8")).hexdigest()
+
+
+def test_read_rejects_changed_newline_bytes(tmp_path: Path) -> None:
+    store = ToolResultStore(tmp_path)
+    record = _write(store, "first\r\nsecond\r\n")
+    content_path = store._record_dir(record.handle, session_id=_SESSION_ID) / "content.txt"
+    content_path.write_bytes(b"first\nsecond\n")
+
+    with pytest.raises(ValueError, match="tool result hash mismatch"):
+        store.read(record.handle, session_id=_SESSION_ID)
+
+
 def test_session_scoped_reads(tmp_path: Path) -> None:
     store = ToolResultStore(tmp_path)
     record = _write(store, "private output")

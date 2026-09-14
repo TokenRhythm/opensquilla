@@ -74,14 +74,18 @@ async def _run(provider, **config):
 
 
 @pytest.fixture
-def fast_wait(monkeypatch):
+async def fast_wait(monkeypatch):
     delays = []
     original_sleep = asyncio.sleep
+    loop = asyncio.get_running_loop()
+    now = [loop.time()]
 
     async def sleep(delay):
         delays.append(delay)
+        now[0] += delay
         await original_sleep(0)
 
+    monkeypatch.setattr(loop, "time", lambda: now[0])
     monkeypatch.setattr("opensquilla.engine.agent.asyncio.sleep", sleep)
     return delays
 
