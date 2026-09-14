@@ -79,7 +79,15 @@ node scripts/fixtures/workspace-inline-preview/verify-journey.mjs --source-root 
 
 同时检查 `report.json` 的 `cleanAcceptance`、`hydrateContract` 和 `ui-transport.ndjson`。macOS 实测曾出现“后端已完成但界面一直工作中”，后续又观测到 `sessions.messages.hydrate result violated its generated v4 Contract.`。即使网页最终显示，也不能把该契约错误当正常断线或忽略；使用同源生成校验器给出的脱敏字段路径定位，不能放宽 schema、删除断言或自动刷新掩盖它。
 
-该契约错误已用真实 adapter、wire codec 和生成校验器在内存中复现：客户端 `WEB_RPC_PROTOCOL_VERSION=3`，后端将运行中锁定的 `safe` 编码为旧别名 `trusted`；v4 hydrate 契约的 `/run_mode_lock/runMode` 只允许 `safe/full`，因此拒绝。空闲时省略字段，以及 `full`、v4 的 `safe` 对照均通过。先检查待验收 head 是否已有正式兼容修复；没有修复时保留失败，不改成 Full 模式规避，也不要在此验收任务里擅自升级全局协议或放宽校验。
+该契约错误已用真实 adapter、wire codec 和生成校验器在内存中复现：客户端 `WEB_RPC_PROTOCOL_VERSION=3`，后端将运行中锁定的 `safe` 编码为旧别名 `trusted`；v4 hydrate 契约的 `/run_mode_lock/runMode` 只允许 `safe/full`，因此拒绝。空闲时省略字段，以及 `full`、v4 的 `safe` 对照均通过。这些此前失败与对照事实必须保留。
+
+正式兼容修复为 `cd10af94c`：仅在 session metadata adapter 的 hydrate、首次 subscribe 和丢失 ACK 后重新 subscribe 三个结果边界，将 `run_mode_lock.runMode` 的精确旧值 `trusted` 转为 `safe`，再执行原有生成校验器。全局协议仍为 3，schema 不放宽；其他非法值和字段类型仍必须拒绝，附加字段和原始响应保持不变。先核实待验收 head 包含该修复或等效变更；缺少修复时保留失败，不改成 Full 模式规避，也不要在此验收任务里擅自升级全局协议或放宽校验。
+
+严格 runner 的证据要求由 `9736ffcd7` 补充：`hydrateContract.validationBoundary` 为 `canonical-after-v3-alias`，只转换上述旧别名后使用不变的 v4 schema 检查真实响应。Web 和 Desktop 每次运行都必须满足 `checked > 0`、`legacyRunModeResponses > 0`，且 `invalidResponses === 0`、`keyMismatches === 0`、`consoleWarnings === 0`、`cleanAcceptance === true`；其中 `consoleWarnings` 同时拦截 hydrate 和 subscribe 的生成契约错误。没有实际观察到 hydrate 或旧别名，即使功能步骤完成也不算严格通过。
+
+2026-09-14，macOS 普通检出在 `9736ffcd7` 上重新执行完整 Web 与 Desktop 命令，分别在新的 `web-04`、`desktop-04` 目录 exit 0：Web 为 26 个 hydrate / 9 个旧别名，Desktop 为 9 / 4，上述契约错误计数均为零。Web 完成隔离、三轮修改、重启恢复和真实子任务写入；Desktop 完成原生标注、截图附件和修改原 CSS。这是功能与协议门槛通过，不是控制台零告警；非契约启动/重连及未归因消息仍保留。
+
+以上 macOS 结果、修复提交、内存复现和定向测试不代表 Windows CI 或 Windows 实机已验收。上文 Windows CI 失败仍须在对应环境复现并对照，Windows 原生操作仍须实际执行；未取得相应成功证据的项目继续标记 FAIL 或 NOT RUN。
 
 ### Web 必须观察到
 
