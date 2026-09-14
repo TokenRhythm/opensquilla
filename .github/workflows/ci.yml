@@ -1349,7 +1349,7 @@ jobs:
         shell: bash
         run: uv sync --extra dev --extra recommended --extra mcp --frozen
 
-      - name: Test native profile recovery contracts
+      - name: Test native profile recovery and execution contracts
         shell: bash
         run: |
           set -euo pipefail
@@ -1357,6 +1357,10 @@ jobs:
             tests/test_recovery
             tests/test_migration/test_opensquilla_home_migration.py
             tests/test_desktop/test_electron_startup_contract.py
+            tests/test_engine/test_request_execution_identity.py
+            tests/test_gateway/test_session_model_routing_rpc.py
+            tests/test_tools/test_execution_status.py
+            tests/test_provider_ensemble.py
             -q
             --durations=50
             --junitxml="${CI_REPORT_DIR}/junit.xml"

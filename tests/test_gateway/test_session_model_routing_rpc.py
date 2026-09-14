@@ -10,6 +10,7 @@ import pytest
 from opensquilla.gateway.adapters.pending_input_queue import GatewayPendingInputQueueAdapter
 from opensquilla.gateway.admission_input import decode_admit_turn
 from opensquilla.gateway.config import GatewayConfig
+from opensquilla.gateway.model_routing import model_routing_snapshot
 from opensquilla.gateway.pending_input_primitives import pending_input_payload
 from opensquilla.gateway.rpc import RpcContext, RpcHandlerError
 from opensquilla.gateway.rpc_sessions import (
@@ -18,6 +19,7 @@ from opensquilla.gateway.rpc_sessions import (
     _handle_sessions_routing_set,
 )
 from opensquilla.gateway.scopes import METHOD_SCOPES, READ_SCOPE, WRITE_SCOPE
+from opensquilla.gateway.session_model_routing import capture_accepted_model_routing_config
 from opensquilla.router_control import RouterControlHoldStore
 from opensquilla.session.manager import SessionManager
 from opensquilla.session.models import SessionNode
@@ -96,11 +98,17 @@ async def test_session_routing_set_requires_expected_revision() -> None:
 
 
 @pytest.mark.asyncio
-async def test_session_mode_changes_clear_router_hold_without_replaying_side_effect() -> None:
+@pytest.mark.parametrize("old_mode,new_mode", [
+    (old, new) for old in ("direct", "router", "ensemble")
+    for new in ("direct", "router", "ensemble") if old != new
+])
+async def test_session_mode_changes_clear_router_hold_without_replaying_side_effect(
+    old_mode, new_mode,
+) -> None:
     storage = SessionStorage(":memory:")
     await storage.connect()
     try:
-        manager = SessionManager(storage, model_routing_mode_provider=lambda: "direct")
+        manager = SessionManager(storage, model_routing_mode_provider=lambda: old_mode)
         key = "agent:main:webchat:routing-rpc-hold-lifecycle"
         await manager.create(key)
         config = GatewayConfig()
@@ -113,29 +121,37 @@ async def test_session_mode_changes_clear_router_hold_without_replaying_side_eff
             session_manager=manager,
             turn_runner=runner,
         )
+        accepted = await capture_accepted_model_routing_config(
+            config, manager, session_key=key, run_kind="web_turn",
+        )
 
         hold_store.set_hold(key, target, evidence="synthetic stale hold")
         changed = await _handle_sessions_routing_set(
-            {"sessionKey": key, "mode": "router", "expectedRevision": 0},
+            {"sessionKey": key, "mode": new_mode, "expectedRevision": 0},
             ctx,
         )
         assert changed["routing"]["revision"] == 1
         assert "changed" not in changed
         assert "changed" not in changed["routing"]
         assert hold_store.get_valid(key) is None
+        assert model_routing_snapshot(accepted)["mode"] == old_mode
+        next_accepted = await capture_accepted_model_routing_config(
+            config, manager, session_key=key, run_kind="web_turn",
+        )
+        assert model_routing_snapshot(next_accepted)["mode"] == new_mode
 
         # A lost-ack retry did not change strategy and must not erase a hold
         # created after the successful write.
         hold_store.set_hold(key, target, evidence="synthetic current hold")
         replay = await _handle_sessions_routing_set(
-            {"sessionKey": key, "mode": "router", "expectedRevision": 0},
+            {"sessionKey": key, "mode": new_mode, "expectedRevision": 0},
             ctx,
         )
         assert replay["routing"]["revision"] == 1
         assert hold_store.get_valid(key) is not None
 
         changed_again = await _handle_sessions_routing_set(
-            {"sessionKey": key, "mode": "ensemble", "expectedRevision": 1},
+            {"sessionKey": key, "mode": old_mode, "expectedRevision": 1},
             ctx,
         )
         assert changed_again["routing"]["revision"] == 2
