@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator
 from types import SimpleNamespace
 from typing import Any
@@ -64,6 +65,23 @@ class _CapturingTurnLog:
 
     def write(self, kind: str, payload: dict[str, Any]) -> None:
         self.records.append({"kind": kind, "payload": payload})
+
+
+@pytest.fixture
+async def retry_sleeps(monkeypatch: pytest.MonkeyPatch) -> list[float]:
+    loop = asyncio.get_running_loop()
+    now = [loop.time()]
+    sleeps: list[float] = []
+    original_sleep = asyncio.sleep
+
+    async def fake_sleep(delay: float) -> None:
+        sleeps.append(delay)
+        now[0] += delay
+        await original_sleep(0)
+
+    monkeypatch.setattr(loop, "time", lambda: now[0])
+    monkeypatch.setattr("opensquilla.engine.agent.asyncio.sleep", fake_sleep)
+    return sleeps
 
 
 def test_provider_retry_delay_uses_larger_provider_hint() -> None:
@@ -175,7 +193,7 @@ def test_selector_buffer_coalesces_tool_deltas_and_rejects_oversized_content() -
 
 @pytest.mark.asyncio
 async def test_agent_retries_rate_limit_on_same_deployment_after_provider_wait(
-    monkeypatch: pytest.MonkeyPatch,
+    retry_sleeps: list[float],
 ) -> None:
     provider = _SequenceProvider(
         [
@@ -183,12 +201,6 @@ async def test_agent_retries_rate_limit_on_same_deployment_after_provider_wait(
             [TextDeltaEvent(text="ok"), DoneEvent(stop_reason="stop")],
         ]
     )
-    sleeps: list[float] = []
-
-    async def fake_sleep(delay: float) -> None:
-        sleeps.append(delay)
-
-    monkeypatch.setattr("opensquilla.engine.agent.asyncio.sleep", fake_sleep)
     agent = Agent(
         provider=provider,
         config=AgentConfig(
@@ -202,7 +214,7 @@ async def test_agent_retries_rate_limit_on_same_deployment_after_provider_wait(
     activity = [event for event in events if isinstance(event, ProviderActivityEvent)]
 
     assert provider.calls == 2
-    assert sleeps == [8.0]
+    assert retry_sleeps == [8.0]
     assert [event.phase for event in activity] == [
         "requesting",
         "retry_wait",
@@ -218,7 +230,7 @@ async def test_agent_retries_rate_limit_on_same_deployment_after_provider_wait(
 
 @pytest.mark.asyncio
 async def test_agent_retries_same_deployment_provider_overload(
-    monkeypatch: pytest.MonkeyPatch,
+    retry_sleeps: list[float],
 ) -> None:
     provider = _SequenceProvider(
         [
@@ -226,12 +238,6 @@ async def test_agent_retries_same_deployment_provider_overload(
             [TextDeltaEvent(text="ok"), DoneEvent(stop_reason="stop")],
         ]
     )
-    sleeps: list[float] = []
-
-    async def fake_sleep(delay: float) -> None:
-        sleeps.append(delay)
-
-    monkeypatch.setattr("opensquilla.engine.agent.asyncio.sleep", fake_sleep)
     agent = Agent(
         provider=provider,
         config=AgentConfig(
@@ -245,7 +251,7 @@ async def test_agent_retries_same_deployment_provider_overload(
     activity = [event for event in events if isinstance(event, ProviderActivityEvent)]
 
     assert provider.calls == 2
-    assert sleeps == [8.0]
+    assert retry_sleeps == [8.0]
     assert [event.phase for event in activity] == [
         "requesting",
         "retry_wait",
@@ -303,17 +309,11 @@ async def test_agent_normalizes_untrusted_provider_activity_fields() -> None:
 
 @pytest.mark.asyncio
 async def test_retry_after_that_exceeds_turn_deadline_does_not_retry_early(
-    monkeypatch: pytest.MonkeyPatch,
+    retry_sleeps: list[float],
 ) -> None:
     provider = _SequenceProvider(
         [[ErrorEvent(message="synthetic overload", code="503", retry_after_s=8.0)]]
     )
-    sleeps: list[float] = []
-
-    async def fake_sleep(delay: float) -> None:
-        sleeps.append(delay)
-
-    monkeypatch.setattr("opensquilla.engine.agent.asyncio.sleep", fake_sleep)
     agent = Agent(
         provider=provider,
         config=AgentConfig(
@@ -327,7 +327,7 @@ async def test_retry_after_that_exceeds_turn_deadline_does_not_retry_early(
     events = [event async for event in agent.run_turn("hello")]
 
     assert provider.calls == 1
-    assert sleeps == []
+    assert retry_sleeps == []
     assert not any(
         isinstance(event, ProviderActivityEvent)
         and event.phase in {"retry_wait", "retrying"}

@@ -3543,21 +3543,32 @@ async def test_sessions_send_recovers_tool_and_provider_failures_before_one_comm
     from opensquilla.tools.registry import ToolRegistry
     from opensquilla.tools.types import ToolSpec
 
+    # Recovery and persistence must not depend on downloading optional tokenizer data.
+    monkeypatch.setattr("opensquilla.token_estimation._get_encoding", lambda: None)
+
     emitted: list[tuple[str, dict[str, Any]]] = []
     tool_paths: list[str] = []
     requests: list[Any] = []
     retry_wait_started = asyncio.Event()
     release_retry = asyncio.Event()
     original_sleep = asyncio.sleep
+    retry_clock = [asyncio.get_running_loop().time()]
 
     async def controlled_sleep(delay: float, result: Any = None) -> Any:
         if delay == 5.0:
             retry_wait_started.set()
             await release_retry.wait()
+            retry_clock[0] += delay
             return result
         return await original_sleep(delay, result)
 
-    monkeypatch.setattr("opensquilla.engine.agent.asyncio.sleep", controlled_sleep)
+    # Advance the agent's retry clock with its simulated wait without moving
+    # the real event loop's SQLite scheduling or test watchdog deadlines.
+    monkeypatch.setattr("opensquilla.engine.agent.asyncio", SimpleNamespace(**{
+        **vars(asyncio),
+        "sleep": controlled_sleep,
+        "get_running_loop": lambda: SimpleNamespace(time=lambda: retry_clock[0]),
+    }))
 
     class RecoveringProvider:
         provider_name = "openai"
