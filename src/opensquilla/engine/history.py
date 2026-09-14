@@ -204,7 +204,7 @@ def project_history_replay_capacity(
     """Estimate replay tokens after the route's real history-tail policy.
 
     Typed media is replaced by a bounded placeholder before tokenization and
-    pays the same decoded-byte reserve used by provider request proof.  Plain
+    pays the same media estimate used by provider request proof.  Plain
     dictionaries (including arbitrary JSON/data URLs in tool arguments) are
     intentionally *not* recognized as media and remain fully tokenized.
     Invalid or unsupported typed media keeps its raw conservative projection
@@ -269,7 +269,9 @@ def project_history_replay_capacity(
             except (binascii.Error, ValueError):
                 estimate_complete = False
             else:
-                reserve = estimate_provider_media_tokens(media_kind, decoded_bytes)
+                reserve = estimate_provider_media_tokens(
+                    media_kind, decoded_bytes, encoded_data=value.data,
+                )
                 media_block_count += 1
                 media_reserve_tokens += reserve
                 dumped = value.model_dump(mode="json", exclude_none=True)

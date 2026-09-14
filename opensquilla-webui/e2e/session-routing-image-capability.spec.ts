@@ -1,5 +1,11 @@
 import { expect, test, type Page } from '@playwright/test'
 import { helloOkResponse } from './support/gateway-fixture'
+import {
+  chatHistoryPayload,
+  sessionMessagesHydratePayload,
+  sessionMessagesSnapshotPayload,
+  sessionMessagesSubscribePayload,
+} from './support/session-read-fixtures'
 
 const CONTROL_URL = '/control/chat?session='
 const SESSION_KEY = 'agent:main:webchat:e2e-session-routing-image'
@@ -28,6 +34,14 @@ async function installGateway(page: Page) {
   const methods: string[] = []
   const routingSets: Array<Record<string, unknown>> = []
   const chatSends: Array<Record<string, unknown>> = []
+  const sessionRouting = {
+    sessionKey: SESSION_KEY,
+    mode: 'ensemble',
+    revision: 2,
+    source: 'session',
+    initialized: true,
+    appliesTo: 'next_accepted_turn',
+  }
 
   await page.addInitScript(() => {
     window.localStorage.setItem('opensquilla-locale', 'en')
@@ -91,13 +105,8 @@ async function installGateway(page: Page) {
       }
       if (method === 'sessions.routing.set') {
         routingSets.push(frame.params || {})
-        ws.send(response(String(frame.id), {
-          sessionKey: SESSION_KEY,
-          mode: 'router',
-          revision: 3,
-          source: 'session',
-          initialized: true,
-        }))
+        Object.assign(sessionRouting, { mode: 'router', revision: 3 })
+        ws.send(response(String(frame.id), sessionRouting))
         return
       }
       if (method === 'models.routing.set') {
@@ -123,7 +132,7 @@ async function installGateway(page: Page) {
       ]
       const payloads: Record<string, unknown> = {
         'agents.list': { agents: [] },
-        'chat.history': { messages: history, has_more: false, canonical_complete: true },
+        'chat.history': chatHistoryPayload(history),
         'commands.list_for_surface': { commands: [] },
         'config.get': {
           squilla_router: { enabled: false, rollout_phase: 'observe', tiers: {} },
@@ -139,33 +148,14 @@ async function installGateway(page: Page) {
         },
         'onboarding.status': { audioConfigured: false },
         'sessions.list': { sessions: [], count: 0, ts: 1_800_000_000, has_more: false },
-        'sessions.messages.snapshot': {
-          key: SESSION_KEY,
-          events: [],
-          current_stream_seq: 0,
-        },
-        'sessions.messages.subscribe': {
-          key: SESSION_KEY,
-          sessionId: 'session-routing-image',
-          subscribed: true,
-          hydration_complete: true,
-          replay_complete: true,
-          current_stream_seq: 0,
-          run_status: 'idle',
-        },
-        'sessions.messages.hydrate': {
-          key: SESSION_KEY,
-          sessionId: 'session-routing-image',
-          hydration_complete: true,
-          run_status: 'idle',
-        },
-        'sessions.routing.get': {
-          sessionKey: SESSION_KEY,
-          mode: 'ensemble',
-          revision: 2,
-          source: 'session',
-          initialized: true,
-        },
+        'sessions.messages.snapshot': sessionMessagesSnapshotPayload(SESSION_KEY),
+        'sessions.messages.subscribe': sessionMessagesSubscribePayload(SESSION_KEY, {
+          routing: sessionRouting,
+        }),
+        'sessions.messages.hydrate': sessionMessagesHydratePayload(SESSION_KEY, {
+          routing: sessionRouting,
+        }),
+        'sessions.routing.get': sessionRouting,
         'usage.status': { sessions: [] },
       }
       ws.send(response(String(frame.id), payloads[method] ?? {}))

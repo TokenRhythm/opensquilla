@@ -10,7 +10,6 @@ from opensquilla.engine.steps.prompt_cache import apply_prompt_cache
 from opensquilla.engine.steps.reasoning_hint_observer import observe_reasoning_hint
 from opensquilla.engine.steps.resolve_model import resolve_model
 from opensquilla.engine.steps.skill_catalog_projection import resolve_skill_catalog
-from opensquilla.engine.steps.vision_followup_gate import apply_vision_followup_gate
 
 try:
     from opensquilla.engine.steps.squilla_router import (
@@ -29,7 +28,6 @@ except ImportError:
 __all__ = [
     "apply_prompt_cache",
     "apply_squilla_router",
-    "apply_vision_followup_gate",
     "enforce_coding_mode",
     "resolve_skill_catalog",
     "finalize_squilla_router_capacity",

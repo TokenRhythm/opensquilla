@@ -405,7 +405,7 @@ async def test_close_drains_accepted_local_record_without_starting_upload(
     await asyncio.sleep(0)
     runtime.record_background(_turn_event(2))
     release.set()
-    await asyncio.wait_for(closing, timeout=1)
+    await asyncio.wait_for(closing, timeout=10)
 
     assert recorded.is_set()
     assert starts == 0

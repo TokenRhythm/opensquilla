@@ -8,11 +8,13 @@ import uuid
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Protocol, cast
 
 import structlog
 
 from opensquilla.agent_ids import normalize_agent_id
+from opensquilla.agents.scope import resolve_agent_workspace_dir
 from opensquilla.application.session_maintenance import (
     CompactSession,
     SessionCompactionDeadlineError,
@@ -39,6 +41,10 @@ from opensquilla.application.session_maintenance import (
     SessionCompactionUsagePort,
     SessionMaintenance,
 )
+from opensquilla.attachment_workspace import (
+    AttachmentWorkspaceMaterializer,
+    workspace_attachment_budget_from_config,
+)
 from opensquilla.engine.cache_break_monitor import (
     compaction_terminal_status,
     notify_compaction,
@@ -53,6 +59,7 @@ from opensquilla.gateway.compaction_target import (
     resolve_gateway_compaction_target,
     resolve_gateway_consumer_budget,
 )
+from opensquilla.gateway.project_workspace_runtime import resolve_session_project_workspace
 from opensquilla.gateway.rpc.registry import RpcContext, RpcHandlerError
 from opensquilla.gateway.session_event_publisher import (
     buffer_session_event,
@@ -67,6 +74,8 @@ from opensquilla.gateway.usage_ledger_runtime import build_session_usage_scope
 from opensquilla.observability.network_policy import (
     provider_request_correlation_disabled,
 )
+from opensquilla.paths import media_root_from_config
+from opensquilla.project_workspaces import ProjectWorkspaceStateError
 from opensquilla.provider.types import (
     ProviderRequestCorrelation,
     derive_provider_request_correlation,
@@ -95,6 +104,7 @@ from opensquilla.session.compaction_lifecycle import (
     pre_compaction_flush_requires_safe_receipt,
 )
 from opensquilla.session.keys import canonicalize_session_key
+from opensquilla.session.models import SessionNode
 
 log = structlog.get_logger(__name__)
 
@@ -165,6 +175,7 @@ class GatewaySessionMaintenancePorts(
         self._context = context
         self._manager = context.session_manager
         self._storage = get_session_storage(self._manager)
+        self._attachment_workspace_dirs: dict[str, Path] = {}
 
     def timing(self) -> SessionCompactionTiming:
         settings = getattr(getattr(self._context, "config", None), "compaction", None)
@@ -210,6 +221,30 @@ class GatewaySessionMaintenancePorts(
         if session is None:
             return None
         session_id = getattr(session, "session_id", None)
+        gateway_config = self._context.config
+        if isinstance(session_id, str) and session_id:
+            self._attachment_workspace_dirs.pop(session_id, None)
+        if (
+            isinstance(session_id, str) and session_id and gateway_config is not None
+            and getattr(
+                getattr(gateway_config, "attachments", None), "persist_transcripts", True
+            ) is not False
+        ):
+            if getattr(session, "workspace_id", None):
+                if self._storage is not None:
+                    try:
+                        project = await resolve_session_project_workspace(
+                            self._storage, cast(SessionNode, session)
+                        )
+                    except ProjectWorkspaceStateError:
+                        project = None
+                    if project is not None:
+                        self._attachment_workspace_dirs[session_id] = Path(project.canonical_path)
+            else:
+                self._attachment_workspace_dirs[session_id] = resolve_agent_workspace_dir(
+                    normalize_agent_id(getattr(session, "agent_id", None) or "main"),
+                    gateway_config,
+                )
         return SessionCompactionSession(
             session_id=(session_id if isinstance(session_id, str) and session_id else None),
             agent_id=normalize_agent_id(getattr(session, "agent_id", None) or "main"),
@@ -267,6 +302,23 @@ class GatewaySessionMaintenancePorts(
         config.deadline_at_monotonic = operation_deadline
         arm_compaction_deadline(config, operation_id=compaction_id)
         session_id = session.session_id if session is not None else None
+        workspace_dir = self._attachment_workspace_dirs.get(session_id or "")
+        if (
+            workspace_dir is not None and session_id
+            and getattr(
+                getattr(self._context.config, "attachments", None), "persist_transcripts", True
+            ) is not False
+        ):
+            materializer = AttachmentWorkspaceMaterializer(
+                media_root=media_root_from_config(self._context.config),
+                workspace_dir=workspace_dir,
+                disk_budget_bytes=workspace_attachment_budget_from_config(self._context.config),
+            )
+            config.attachment_path_resolver = (
+                lambda attachment, _session_id: materializer.materialize_image_path(
+                    attachment, session_id
+                )
+            )
         compaction_correlation = (
             ProviderRequestCorrelation(
                 session_id=session_id,

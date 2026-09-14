@@ -52,6 +52,7 @@ from opensquilla.session.compaction_deployment import (
 )
 from opensquilla.session.compaction_lifecycle import CompactionTimeoutError
 from opensquilla.session.compaction_state import (
+    CompactionObligation,
     build_structured_summary_from_text,
     extract_compaction_obligations,
     render_structured_summary,
@@ -127,6 +128,11 @@ class CompactionConfig:
     # may disable only this redundant semantic-tail check for their isolated
     # completed prefix. Durable/session compaction always leaves it enabled.
     protect_semantic_tail: bool = True
+    # Runtime-owned materializer. It returns only verified workspace paths,
+    # and is absent when image retention is disabled or no workspace exists.
+    attachment_path_resolver: Callable[[dict[str, Any], str], str | None] | None = field(
+        default=None, repr=False, compare=False,
+    )
 
 
 @dataclass
@@ -526,6 +532,19 @@ def estimate_entry_replay_tokens(entry: Any) -> int:
 def estimate_entry_model_replay_tokens(entry: Any) -> int:
     """Estimate the full transcript payload size replayed to the model."""
 
+    media_budget = _entry_model_replay_media_budget(entry)
+    if media_budget is not None:
+        estimated = int(media_budget["estimated_tokens"])
+        if _entry_get(entry, "assistant_replay") is None:
+            try:
+                persisted = max(0, int(_entry_get(entry, "token_count") or 0))
+            except (TypeError, ValueError):
+                persisted = 0
+            # Preserve any legacy usage surplus after removing encoded pixels.
+            original = _estimate_tokens(str(_entry_get(entry, "content") or ""))
+            estimated = max(estimated, estimated + persisted - original)
+        return estimated
+
     assistant_replay = _entry_get(entry, "assistant_replay")
     if assistant_replay is not None:
         # The accepted messages already contain their text, tool results and
@@ -596,11 +615,88 @@ def _entry_model_replay_payload(entry: Any) -> dict[str, Any]:
 
 
 def estimate_entries_model_replay_chars(entries: Sequence[Any]) -> int:
-    """Conservatively count serialized characters for provider-visible history."""
+    """Count serialized text and the shared media equivalent for replay."""
 
     if not entries:
         return 0
-    return len(_json_text([_entry_model_replay_payload(entry) for entry in entries]))
+    payloads = [_entry_model_replay_payload(entry) for entry in entries]
+    chars = len(_json_text(payloads))
+    for entry, payload in zip(entries, payloads, strict=True):
+        media_budget = _entry_model_replay_media_budget(entry)
+        if media_budget is not None:
+            chars += int(media_budget["estimated_chars"]) - len(_json_text(payload))
+    return chars
+
+
+def _entry_model_replay_media_budget(entry: Any) -> dict[str, Any] | None:
+    """Project accepted media positions without discounting arbitrary tool JSON."""
+
+    from opensquilla.contracts.attachments import IMAGE_ATTACHMENT_MIMES
+    from opensquilla.provider.request_proof import project_provider_payload
+
+    replay = _entry_get(entry, "assistant_replay")
+    if isinstance(replay, Mapping) and isinstance(replay.get("messages"), list):
+        has_media = any(
+            isinstance(block, Mapping) and block.get("type") in {"image", "document"}
+            for message in replay["messages"]
+            if isinstance(message, Mapping) and isinstance(message.get("content"), list)
+            for block in message["content"]
+        )
+        if not has_media:
+            return None
+        payload = _entry_model_replay_payload(entry)
+        projected_replay = payload.pop("assistant_replay")
+        payload["messages"] = projected_replay["messages"]
+        payload["assistant_replay"] = {
+            key: value for key, value in projected_replay.items() if key != "messages"
+        }
+    else:
+        content = _entry_get(entry, "content")
+        if (
+            _entry_get(entry, "role") != "user"
+            or not isinstance(content, str)
+            or not content.lstrip().startswith("{")
+        ):
+            return None
+        try:
+            envelope = json.loads(content)
+        except (ValueError, TypeError):
+            return None
+        if (
+            not isinstance(envelope, dict)
+            or not isinstance(envelope.get("text"), str)
+            or not isinstance(envelope.get("attachments"), list)
+        ):
+            return None
+        blocks = []
+        for attachment in envelope["attachments"]:
+            if not isinstance(attachment, dict):
+                continue
+            mime = normalize_attachment_mime(
+                attachment.get("type") or attachment.get("mime") or attachment.get("media_type")
+            )
+            if mime not in IMAGE_ATTACHMENT_MIMES:
+                continue
+            data = attachment.get("data")
+            if isinstance(data, str) and data:
+                source_type = "base64"
+                attachment["data"] = "[image supplied separately]"
+            elif valid_sha256(attachment.get("sha256_ref")):
+                source_type = "url"
+                data = "[retained image reference]"
+            else:
+                continue
+            blocks.append({
+                "type": "image", "source_type": source_type, "media_type": mime, "data": data,
+            })
+        if not blocks:
+            return None
+        message = _entry_model_replay_payload(entry)
+        message["content"] = [{"type": "text", "text": _json_text(envelope)}, *blocks]
+        payload = {"messages": [message]}
+
+    proof = project_provider_payload(payload, projection_adapter="history_replay", proof_budget=0)
+    return proof if proof.get("media_blocks_reserved") else None
 
 
 def estimate_entry_model_replay_chars(entry: Any) -> int:
@@ -1210,6 +1306,7 @@ def _summarize_if_envelope(
     *,
     session_id: str = "",
     message_id: str = "",
+    image_paths: Mapping[int, str] | None = None,
 ) -> str:
     """Replace attachment-envelope JSON with a concise placeholder.
 
@@ -1270,10 +1367,68 @@ def _summarize_if_envelope(
             ordinal=ordinal,
             derived_id=derived_ids.get(ordinal),
         )
-        descs.append(f"{name} ({media}; attachment_id={attachment_id})")
+        path = image_paths.get(ordinal) if image_paths is not None else None
+        path_descriptor = f"; workspace_file={path}" if path else ""
+        descs.append(f"{name} ({media}; attachment_id={attachment_id}{path_descriptor})")
     if descs:
         return f"{text}\n[user attached: {', '.join(descs)}]"
     return text
+
+
+def _prepare_compaction_image_paths(
+    entries: list[dict[str, Any]],
+    *,
+    session_id: str,
+    resolver: Callable[[dict[str, Any], str], str | None],
+) -> list[dict[str, Any]]:
+    """Resolve retained images once, without changing canonical transcript rows."""
+    prepared: list[dict[str, Any]] = []
+    for entry in entries:
+        image_paths: dict[int, str] = {}
+        envelope = None
+        if entry.get("role") == "user":
+            try:
+                envelope = json.loads(str(entry.get("content") or ""))
+            except (TypeError, ValueError):
+                pass
+        attachments = envelope.get("attachments") if isinstance(envelope, dict) else None
+        replay = entry.get("assistant_replay")
+        if entry.get("role") == "assistant" and isinstance(replay, Mapping):
+            # Only accepted typed tool images are eligible. Re-resolve their
+            # bytes in this session; never adopt a path from tool result prose.
+            attachments = []
+            messages = replay.get("messages") if replay.get("version") == 1 else None
+            for message in messages if isinstance(messages, list) else []:
+                if not isinstance(message, Mapping) or message.get("role") != "user":
+                    continue
+                content = message.get("content")
+                for block in content if isinstance(content, list) else []:
+                    if (
+                        isinstance(block, Mapping)
+                        and block.get("type") == "image"
+                        and block.get("source_type", "base64") == "base64"
+                        and block.get("local_path")
+                    ):
+                        attachments.append({
+                            "mime": block.get("media_type"),
+                            "data": block.get("data"),
+                            "name": block.get("name"),
+                        })
+        if isinstance(attachments, list):
+            for ordinal, attachment in enumerate(attachments):
+                if not isinstance(attachment, dict):
+                    continue
+                try:
+                    path = resolver(attachment, session_id)
+                except (OSError, ValueError):
+                    path = None
+                if isinstance(path, str) and path:
+                    image_paths[ordinal] = path
+        prepared.append(
+            {**entry, "_compaction_image_paths": image_paths}
+            if isinstance(attachments, list) else entry
+        )
+    return prepared
 
 
 _COMPACTION_IMAGE_MARKER = (
@@ -1490,6 +1645,7 @@ def _format_chunk_for_llm(chunk: list[dict[str, Any]]) -> str:
             str(entry.get("content") or ""),
             session_id=str(entry.get("session_id") or ""),
             message_id=str(entry.get("message_id") or entry.get("id") or ""),
+            image_paths=entry.get("_compaction_image_paths"),
         )
         rendered_parts = [f"[{role}]: {content}"]
         tool_summary = _summarize_tool_calls_for_llm(entry.get("tool_calls"))
@@ -1520,6 +1676,7 @@ def _summarize_chunk_fallback(chunk: list[dict[str, Any]], policy: str) -> str:
             str(entry.get("content") or ""),
             session_id=str(entry.get("session_id") or ""),
             message_id=str(entry.get("message_id") or entry.get("id") or ""),
+            image_paths=entry.get("_compaction_image_paths"),
         )
         # Attachment descriptors are durable lookup handles, not expendable
         # prose.  Preview the user text while retaining the complete descriptor
@@ -2256,6 +2413,13 @@ async def compact_context_new(request: CompactionRequest) -> CompactionResult:
                 skip_reason=skip_reason,
             )
 
+    if cfg.attachment_path_resolver is not None:
+        to_compact = _prepare_compaction_image_paths(
+            to_compact,
+            session_id=request.session_id,
+            resolver=cfg.attachment_path_resolver,
+        )
+
     provider_native = cfg.llm_plan is not None
     legacy_raw = bool(cfg.api_key and cfg.model)
     network_enabled = provider_native or legacy_raw
@@ -2422,6 +2586,20 @@ async def compact_context_new(request: CompactionRequest) -> CompactionResult:
             {"role": "assistant", "content": prev_summary},
         )
     obligations = extract_compaction_obligations(obligation_entries)
+    # These paths come from verified materialization, not prose extraction or
+    # envelope fields. Preserve each full path even if the model summary omits it.
+    retained_paths = {
+        path
+        for entry in to_compact
+        for path in entry.get("_compaction_image_paths", {}).values()
+    } if cfg.attachment_path_resolver is not None else set()
+    existing_paths = {
+        item.value for item in obligations if item.kind == "file_path"
+    }
+    obligations.extend(
+        CompactionObligation(kind="file_path", value=path, critical=True)
+        for path in sorted(retained_paths - existing_paths)
+    )
     structured_summary, coverage = build_structured_summary_from_text(
         merged,
         obligations,

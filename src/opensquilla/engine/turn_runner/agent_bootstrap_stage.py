@@ -354,27 +354,8 @@ class AgentConfigBuilderPort(Protocol):
     ) -> _AgentConfigAuxiliaries: ...
 
 
-def _route_max_history_turns(metadata: dict[str, Any]) -> int:
-    value = metadata.get("route_max_history_turns")
-    if isinstance(value, int):
-        return max(0, value)
-    if isinstance(value, str):
-        try:
-            return max(0, int(value))
-        except ValueError:
-            return 0
-    return 0
-
-
 def _preserve_historical_images(metadata: dict[str, Any]) -> bool:
-    if metadata.get("router_vision_followup_gate_source") == "explicit_opt_out":
-        return False
-    image_route_reason = metadata.get("image_route_reason")
-    return bool(
-        image_route_reason == "gate_history"
-        or metadata.get("router_vision_followup_needs_image") is True
-        or metadata.get("image_intent_attachment_ids")
-    )
+    return metadata.get("image_context_has_images") is True
 
 
 @runtime_checkable
@@ -608,6 +589,13 @@ class AgentBootstrapStage:
             "lookup_deployment",
             None,
         )
+        configure_image_catalog = getattr(
+            inp.provider,
+            "configure_image_continuation_catalog",
+            None,
+        )
+        if callable(deployment_lookup) and callable(configure_image_catalog):
+            configure_image_catalog(deployment_lookup)
         active_deployment_config = getattr(
             inp.provider,
             "active_deployment_config",
@@ -653,11 +641,16 @@ class AgentBootstrapStage:
         routed_model_vision_support = agent_metadata.get(
             "routed_model_vision_support"
         )
+        routed_capability_matches_execution = (
+            str(agent_metadata.get("routed_model") or "") == inp.resolved_model
+            and str(agent_metadata.get("routed_provider") or inp.active_provider_id)
+            == inp.active_provider_id
+        )
         effective_model_vision_support: Literal[
             "supported", "unsupported", "unknown"
         ] = (
             routed_model_vision_support
-            if routed_model_vision_support
+            if routed_capability_matches_execution and routed_model_vision_support
             in {"supported", "unsupported", "unknown"}
             else catalog.vision_support
         )
@@ -907,7 +900,6 @@ class AgentBootstrapStage:
             provider_request_proof_max_chars_explicit=(
                 catalog.provider_request_proof_max_chars > 0
             ),
-            max_history_turns=_route_max_history_turns(inp.turn.metadata),
             preserve_historical_images=_preserve_historical_images(inp.turn.metadata),
             materialize_historical_attachments=bool(
                 inp.turn.metadata.get("bootstrap_workspace_dir")

@@ -279,7 +279,6 @@ async def test_runtime_pipeline_restores_mainline_meta_and_coding_order(
 
     assert [record.step_name for record in turn.metadata["pipeline_steps"]] == [
         "resolve_model",
-        "apply_vision_followup_gate",
         "apply_squilla_router",
         "observe_reasoning_hint",
         "meta_resolution",

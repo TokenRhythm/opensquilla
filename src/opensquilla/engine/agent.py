@@ -6,6 +6,7 @@ Core loop is under 500 lines. No recursive calls.
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextlib
 import copy
 import functools
@@ -29,7 +30,13 @@ from typing import Any, Literal
 import structlog
 
 from opensquilla.artifacts import artifact_payload
+from opensquilla.attachment_workspace import (
+    AttachmentWorkspaceMaterializer,
+    workspace_attachment_budget_from_config,
+)
 from opensquilla.context_budget import ContextBudgetClass, ContextBudgetGovernor
+from opensquilla.contracts.attachments import IMAGE_ATTACHMENT_MIMES, normalize_attachment_mime
+from opensquilla.contracts.image_validation import validate_image_bytes
 from opensquilla.contracts.turn_execution import TurnExecutionContext
 from opensquilla.engine.agent_injection import PendingInputProvider
 from opensquilla.engine.cache_break_monitor import (
@@ -186,6 +193,7 @@ from opensquilla.provider.protocol import (
 )
 from opensquilla.provider.request_proof import (
     ProviderRequestBudgetExceededError,
+    project_provider_payload,
     prove_provider_payload,
 )
 from opensquilla.provider.types import (
@@ -1817,6 +1825,22 @@ def _assistant_replay_tail(messages: list[Message], start: int) -> list[Message]
     return tail[first:]
 
 
+def _serialize_assistant_replay(messages: list[Message]) -> dict[str, Any]:
+    """Persist image provenance without adding it to provider wire messages."""
+    serialized = []
+    for message in messages:
+        payload = message.model_dump(mode="json")
+        if isinstance(message.content, list):
+            for block, stored in zip(message.content, payload["content"], strict=True):
+                if isinstance(block, ContentBlockImage):
+                    for key in ("name", "local_path", "source_url", "durable_retained"):
+                        value = getattr(block, key)
+                        if value is not None:
+                            stored[key] = value
+        serialized.append(payload)
+    return {"version": 1, "messages": serialized}
+
+
 def _native_assistant_content(
     provider_replay: ProviderReplayState | None,
     *,
@@ -2346,11 +2370,10 @@ def _strip_historical_image_blocks(
     *,
     preserve_images: bool = False,
 ) -> list[Message]:
-    """Remove image payload blocks from history before provider calls.
+    """Project history according to the configured image retention policy.
 
-    Current-turn uploads are passed through ``extra_messages`` and are not part
-    of the history list sanitized here. This prevents a later text follow-up
-    from replaying stale image input to a text-only route.
+    Current-turn uploads arrive through ``extra_messages``. Model capability
+    is checked separately on each physical request, including tool-loaded images.
     """
     if preserve_images:
         # Keep the historical object graph intact for a vision-capable route.
@@ -3348,13 +3371,9 @@ class Agent:
             preserve_tool_call_reasoning=thinking_enabled,
             preserve_reasoning_content=preserve_reasoning_content,
         )
-        preserve_historical_images = bool(
-            self.config.preserve_historical_images
-            and self.config.metadata.get("router_vision_followup_gate_source") != "explicit_opt_out"
-        )
         history = _strip_historical_image_blocks(
             history,
-            preserve_images=preserve_historical_images,
+            preserve_images=self.config.preserve_historical_images,
         )
         return repair_tool_pairing(limit_turns(history, self.config.max_history_turns))
 
@@ -5820,7 +5839,7 @@ class Agent:
         tail = _assistant_replay_tail(messages, start)
         if not tail:
             return None
-        return {"version": 1, "messages": [item.model_dump(mode="json") for item in tail]}
+        return _serialize_assistant_replay(tail)
 
     def _freeze_current_replay_view(self) -> None:
         """Release the live turn's history cells while keeping its accepted tail."""
@@ -6243,13 +6262,9 @@ class Agent:
         # history and make a later vision-capable turn unable to recover the
         # original attachment.
         canonical_sanitized_history = list(sanitized_history)
-        preserve_historical_images = bool(
-            self.config.preserve_historical_images
-            and self.config.metadata.get("router_vision_followup_gate_source") != "explicit_opt_out"
-        )
         sanitized_history = _strip_historical_image_blocks(
             sanitized_history,
-            preserve_images=preserve_historical_images,
+            preserve_images=self.config.preserve_historical_images,
         )
         self._write_context_stage(
             "session:sanitized",
@@ -6357,6 +6372,7 @@ class Agent:
             return parsed if parsed > 0 else None
 
         iterations = 0
+        tool_images_pending_admission = False
         overflow_retries = 0
         # Keep lifetime usage separate from the live context-window gauge.
         # Compaction shrinks what the model sees next; it must not erase the
@@ -7384,27 +7400,6 @@ class Agent:
                         return event
 
                     call_started_at = time.monotonic()
-                    provider_tools_for_call = (
-                        None
-                        if goal_terminal_final_response_pending
-                        or max_iterations_finalization_pending
-                        else provider_tool_definitions
-                    )
-                    provider_tools_for_call = self._workspace_edit_gate_tool_definitions(
-                        provider_tools_for_call,
-                        workspace_edit_gate_details,
-                        recovery_read_paths=workspace_edit_gate_recovery_read_paths,
-                        recovery_reads_remaining=(workspace_edit_gate_recovery_reads_remaining),
-                    )
-                    if plan_run_delivery_only:
-                        provider_tools_for_call = self._plan_run_delivery_tool_definitions(
-                            provider_tools_for_call
-                        )
-                    tools_supported_for_call = (
-                        tools_supported
-                        and not goal_terminal_final_response_pending
-                        and not max_iterations_finalization_pending
-                    )
                     ignored_post_delivery_tool_use = False
                     if message_count_request_view is not None:
                         base_request_turn_messages = message_count_request_view.materialize(
@@ -7460,6 +7455,88 @@ class Agent:
                         *base_request_turn_messages,
                         *request_suffix_messages,
                     ]
+                    if tool_images_pending_admission:
+                        tool_images_pending_admission = False
+                        if (
+                            count_provider_image_blocks(request_turn_messages) > 0
+                            and self._active_model_vision_support_for_call(chat_cfg) != "supported"
+                        ):
+                            prepare_continuation = getattr(
+                                self.provider, "prepare_image_continuation", None
+                            )
+                            rebound_config = None
+                            if callable(prepare_continuation):
+                                rebound_config = prepare_continuation(
+                                    request_turn_messages, chat_cfg
+                                )
+                                if inspect.isawaitable(rebound_config):
+                                    rebound_config = await rebound_config
+                            if isinstance(rebound_config, ChatConfig):
+                                chat_cfg = rebound_config
+                                identity = provider_metadata(self.provider)
+                                self.config.model_id = identity.model or self.config.model_id
+                                self.config.provider_id = (
+                                    identity.provider_id or identity.provider_name
+                                )
+                                self.config.model_capabilities = chat_cfg.model_capabilities
+                                tools_supported = (
+                                    getattr(chat_cfg.model_capabilities, "supports_tools", None)
+                                    is not False
+                                )
+                                provider_tool_definitions = (
+                                    (self.tool_definitions or None) if tools_supported else None
+                                )
+                                self.config.model_vision_support = chat_cfg.model_vision_support
+                                self.config.max_tokens = chat_cfg.max_tokens
+                                self.config.provider_request_proof_max_chars = (
+                                    chat_cfg.provider_request_max_chars
+                                )
+                                active_window = getattr(
+                                    self.provider, "active_context_window_tokens", None
+                                )
+                                if callable(active_window):
+                                    context_window = active_window()
+                                    if isinstance(context_window, int) and context_window > 0:
+                                        self.config.context_window_tokens = context_window
+                                image_projection_forced = False
+                                image_projection_forced_deployment = None
+                                image_projection_marker_state = ImageMarkerState.NOT_ANALYZED
+                                for key in (
+                                    "image_input_forced_rejection_reason",
+                                    "image_input_rejection_reason",
+                                    "image_input_projection_required",
+                                    "image_input_reason",
+                                ):
+                                    self.config.metadata.pop(key, None)
+                                self._write_turn_call_log(
+                                    "image_continuation_route",
+                                    action="rebind",
+                                    model=self.config.model_id,
+                                    provider=self.config.provider_id,
+                                    image_count=count_provider_image_blocks(request_turn_messages),
+                                    iteration=iterations,
+                                )
+                    provider_tools_for_call = (
+                        None
+                        if goal_terminal_final_response_pending
+                        or max_iterations_finalization_pending
+                        else provider_tool_definitions
+                    )
+                    provider_tools_for_call = self._workspace_edit_gate_tool_definitions(
+                        provider_tools_for_call,
+                        workspace_edit_gate_details,
+                        recovery_read_paths=workspace_edit_gate_recovery_read_paths,
+                        recovery_reads_remaining=(workspace_edit_gate_recovery_reads_remaining),
+                    )
+                    if plan_run_delivery_only:
+                        provider_tools_for_call = self._plan_run_delivery_tool_definitions(
+                            provider_tools_for_call
+                        )
+                    tools_supported_for_call = (
+                        tools_supported
+                        and not goal_terminal_final_response_pending
+                        and not max_iterations_finalization_pending
+                    )
                     base_recovery_available = self._tool_result_recovery_available()
                     call_retrieval_available = bool(
                         self._provider_schema_has_tool_result_retrieval(provider_tools_for_call)
@@ -12117,7 +12194,7 @@ class Agent:
 
                 def _tool_result_images(
                     tool_use_id: str, *, consume: bool = False
-                ) -> list[ContentBlockImage]:
+                ) -> list[ContentBlockImage | ContentBlockText]:
                     media_context = self._tool_context or current_tool_context.get()
                     media_by_call = getattr(media_context, "tool_result_media", None)
                     if not isinstance(media_by_call, dict):
@@ -12126,28 +12203,75 @@ class Agent:
                         media_by_call.pop(tool_use_id, []) if consume
                         else media_by_call.get(tool_use_id, [])
                     )
-                    images: list[ContentBlockImage] = []
+                    images: list[ContentBlockImage | ContentBlockText] = []
                     if isinstance(raw_media, list):
-                        for item in raw_media[:1]:
-                            if not isinstance(item, dict):
-                                continue
-                            data = item.get("data")
-                            if (
-                                item.get("mime") == "image/png" and isinstance(data, str)
-                                and 1 <= len(data) <= 16 * 1024 * 1024
-                            ):
-                                images.append(ContentBlockImage(media_type="image/png", data=data))
+                        for image_index, item in enumerate(raw_media, start=1):
+                            try:
+                                if not isinstance(item, dict):
+                                    raise ValueError("invalid image entry")
+                                data = item.get("data")
+                                mime = normalize_attachment_mime(item.get("mime"))
+                                if mime is None or mime not in IMAGE_ATTACHMENT_MIMES:
+                                    raise ValueError("unsupported image media type")
+                                if not isinstance(data, str) or not (
+                                    1 <= len(data) <= 16 * 1024 * 1024
+                                ):
+                                    raise ValueError("image is empty or exceeds the size limit")
+                                validate_image_bytes(base64.b64decode(data, validate=True), mime)
+                                attachment_id = item.get("attachment_id")
+                                retained_metadata = {
+                                    key: value for key in ("name", "local_path", "source_url")
+                                    if isinstance(value := item.get(key), str) and value
+                                }
+                                images.append(
+                                    ContentBlockImage(
+                                        media_type=mime,
+                                        data=data,
+                                        attachment_id=(
+                                            attachment_id
+                                            if isinstance(attachment_id, str) and attachment_id
+                                            else None
+                                        ),
+                                        durable_retained=(
+                                            True
+                                            if retained_metadata.get("local_path")
+                                            or isinstance(attachment_id, str) and attachment_id
+                                            else None
+                                        ),
+                                        name=retained_metadata.get("name"),
+                                        local_path=retained_metadata.get("local_path"),
+                                        source_url=retained_metadata.get("source_url"),
+                                    )
+                                )
+                            except ValueError:
+                                images.append(
+                                    ContentBlockText(
+                                        text=(
+                                            f"[Tool image {image_index} could not be loaded: "
+                                            "invalid, unsupported, or oversized image data. "
+                                            "This image was not analyzed.]"
+                                        )
+                                    )
+                                )
                     return images
 
                 def _record_completed_tool_result(
-                    result: ToolResult, *, images: list[ContentBlockImage] | None = None
+                    result: ToolResult,
+                    *,
+                    images: list[ContentBlockImage | ContentBlockText] | None = None,
                 ) -> None:
+                    nonlocal tool_images_pending_admission
+                    image_blocks = (
+                        _tool_result_images(result.tool_use_id) if images is None else images
+                    )
+                    if any(isinstance(block, ContentBlockImage) for block in image_blocks):
+                        tool_images_pending_admission = True
                     recorded_result_blocks[result.tool_use_id] = [
                         ContentBlockToolResult(
                             tool_use_id=result.tool_use_id, content=result.content,
                             is_error=result.is_error, execution_status=result.execution_status,
                         ),
-                        *(_tool_result_images(result.tool_use_id) if images is None else images),
+                        *image_blocks,
                     ]
                     # Completion order may differ from provider call order.
                     # Only recorded results appear; missing outcomes stay absent.
@@ -13865,10 +13989,7 @@ class Agent:
             done_event = DoneEvent(
                 text=final_text,
                 assistant_replay=(
-                    {
-                        "version": 1,
-                        "messages": [item.model_dump(mode="json") for item in replay_messages],
-                    }
+                    _serialize_assistant_replay(replay_messages)
                     if replay_messages else None
                 ),
                 input_tokens=done_input_tokens,
@@ -15777,9 +15898,12 @@ class Agent:
                 real_tokens = get_approx_tokens(message.content)
             else:
                 flat = _flatten_content_blocks(message.content)
-                real_tokens = get_approx_tokens(
-                    json.dumps(Agent._live_request_jsonable(message.content))
+                budget = project_provider_payload(
+                    {"messages": [Agent._live_request_jsonable(message)]},
+                    projection_adapter="live_compaction_entry",
+                    proof_budget=0,
                 )
+                real_tokens = int(budget["estimated_tokens"])
             entries.append(
                 {
                     "role": message.role,
@@ -16632,6 +16756,31 @@ class Agent:
         config.protected_recent_messages = self.config.compaction_protected_recent_messages
         config.total_timeout_seconds = self.config.compaction_total_timeout_seconds
         config.heartbeat_interval_seconds = self.config.compaction_heartbeat_interval_seconds
+        tool_context = self._tool_context or current_tool_context.get()
+        if tool_context is not None:
+            gateway_config = tool_context.sandbox_gateway_config
+            if (
+                tool_context.workspace_dir
+                and tool_context.artifact_media_root
+                and tool_context.artifact_session_id
+                and getattr(
+                    getattr(gateway_config, "attachments", None), "persist_transcripts", True
+                ) is not False
+            ):
+                from opensquilla.tools.write_policy import attachment_workspace_write_authorizer
+
+                materializer = AttachmentWorkspaceMaterializer(
+                    media_root=Path(tool_context.artifact_media_root),
+                    workspace_dir=tool_context.workspace_dir,
+                    disk_budget_bytes=workspace_attachment_budget_from_config(gateway_config),
+                    authorize_write=attachment_workspace_write_authorizer(tool_context),
+                )
+                session_id = tool_context.artifact_session_id
+                config.attachment_path_resolver = (
+                    lambda attachment, _session_id: materializer.materialize_image_path(
+                        attachment, session_id
+                    )
+                )
         return config
 
     @staticmethod
@@ -16665,17 +16814,11 @@ class Agent:
         tools: list[ToolDefinition] | None = None,
         config: ChatConfig | None = None,
     ) -> int:
-        """Estimate the current provider request size without lifetime usage."""
+        """Estimate text and native media without counting encoded pixels as prose."""
 
-        return max(
-            1,
-            self._estimate_live_request_chars(
-                messages,
-                tools=tools,
-                config=config,
-            )
-            // 4,
-        )
+        return max(1, int(self._project_live_request_budget(
+            messages, tools=tools, config=config,
+        )["estimated_tokens"]))
 
     def _estimate_live_request_chars(
         self,
@@ -16684,7 +16827,19 @@ class Agent:
         tools: list[ToolDefinition] | None = None,
         config: ChatConfig | None = None,
     ) -> int:
-        """Measure the complete conservative request envelope in JSON chars."""
+        """Return the same media-aware character budget used by wire admission."""
+
+        return int(self._project_live_request_budget(
+            messages, tools=tools, config=config,
+        )["estimated_chars"])
+
+    def _project_live_request_budget(
+        self,
+        messages: list[Message],
+        *,
+        tools: list[ToolDefinition] | None,
+        config: ChatConfig | None,
+    ) -> dict[str, Any]:
 
         payload: dict[str, Any] = {
             "messages": [self._live_request_jsonable(message) for message in messages],
@@ -16701,7 +16856,9 @@ class Agent:
             )
             payload.update(config_payload)
 
-        return len(json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str))
+        return project_provider_payload(
+            payload, projection_adapter="live_request", proof_budget=0,
+        )
 
     async def _check_context_overflow(
         self,
@@ -16804,16 +16961,8 @@ class Agent:
                 int(entry["token_count"])
                 for entry in self._message_count_compaction_entries(messages[protected_tail_start:])
             )
-            protected_tail_chars = len(
-                json.dumps(
-                    [
-                        self._live_request_jsonable(message)
-                        for message in messages[protected_tail_start:]
-                    ],
-                    ensure_ascii=False,
-                    sort_keys=True,
-                    default=str,
-                )
+            protected_tail_chars = self._estimate_live_request_chars(
+                messages[protected_tail_start:],
             )
             protected_tail_over_character_budget = bool(
                 char_threshold is not None and protected_tail_chars > char_threshold
@@ -17062,29 +17211,9 @@ class Agent:
                     return None
 
         # --- Compaction ---
-        # Flatten each message for the compaction LLM's *input* text, but size
-        # the budget/skip/cut decisions on the ORIGINAL structured content.
-        # _flatten_content_blocks clips tool results to 200 chars, so sizing on
-        # the flattened view made a tool-heavy (overflowing) context look tiny,
-        # so compaction always skipped and the CONTEXT_OVERFLOW retry died with
-        # compaction_not_smaller. Attaching a real token_count makes the
-        # compactor's estimator (which prefers a persisted token_count) measure
-        # the true replay size.
-        entries = []
-        for m in messages:
-            if isinstance(m.content, str):
-                flat = m.content
-                real_tokens = get_approx_tokens(m.content)
-            else:
-                flat = _flatten_content_blocks(m.content)
-                real_tokens = get_approx_tokens(json.dumps(Agent._live_request_jsonable(m.content)))
-            entries.append(
-                {
-                    "role": m.role,
-                    "content": flat,
-                    "token_count": real_tokens,
-                }
-            )
+        # Summaries consume flattened text; retention and cut decisions use
+        # the original structured message's text and native-media estimate.
+        entries = self._message_count_compaction_entries(messages)
 
         request = CompactionRequest(
             session_id="agent-turn",
