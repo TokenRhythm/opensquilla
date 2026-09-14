@@ -434,7 +434,7 @@ class GrowthEventSink:
         *,
         replay_only: bool,
     ) -> tuple[str, ProductActive, int] | None:
-        notice_version = CURRENT_NOTICE_VERSION_BY_SCOPE[TelemetryScope.GROWTH.value]
+        notice_version: Literal["growth-v2"] = "growth-v2"
         async with self._coordinator.authorized(
             TelemetryScope.GROWTH,
             checkpoint=ConsentCheckpoint.ENQUEUE,
