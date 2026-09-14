@@ -186,6 +186,36 @@ def test_coordinator_reports_retry_without_corrupting_locked_file(
     assert config.read_bytes() == original
 
 
+def test_coordinator_reports_partial_commit_when_later_store_is_locked(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = tmp_path / "config.toml"
+    config.write_text('[sandbox]\nrun_mode = "trusted"\n', encoding="utf-8")
+    preferences = tmp_path / "preferences.json"
+    preferences.write_text('{"runMode":"trusted"}', encoding="utf-8")
+    original_write = upgrade_migration._atomic_write
+    calls = 0
+
+    def fail_second(path: Path, payload: bytes) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise PermissionError("sharing violation")
+        original_write(path, payload)
+
+    monkeypatch.setattr(upgrade_migration, "_atomic_write", fail_second)
+
+    report = SandboxUpgradeCoordinator(tmp_path).run()
+
+    assert report.ok is False
+    assert report.status == "partial_commit"
+    assert report.committed_stores == ("config.toml",)
+    assert report.stores == ("config.toml", "preferences.json")
+    assert 'run_mode = "safe"' in config.read_text(encoding="utf-8")
+    assert json.loads(preferences.read_text(encoding="utf-8")) == {"runMode": "trusted"}
+
+
 def test_busy_profile_lock_returns_immediately_for_a_later_retry(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -281,6 +311,18 @@ def test_invalid_legacy_journal_is_not_manual_recovery(tmp_path: Path) -> None:
 
     assert report.ok is True
     assert report.status == "legacy_artifacts_present"
+    assert journal.exists()
+
+
+def test_invalid_legacy_journal_is_not_deleted_during_startup_retry(tmp_path: Path) -> None:
+    journal = tmp_path / upgrade_migration.JOURNAL_NAME
+    journal.write_text('{"migrationVersion":999}', encoding="utf-8")
+
+    report = SandboxUpgradeCoordinator(tmp_path).run()
+
+    assert report.ok is True
+    assert report.status == "cleanup_pending"
+    assert "unsupported migration version" in str(report.error)
     assert journal.exists()
 
 

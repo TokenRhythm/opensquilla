@@ -56,6 +56,12 @@ def test_desktop_renderer_is_local_and_gateway_connection_is_described() -> None
     assert "desktopGatewayConnectionSnapshot" in main_ts
     assert "gateway:connection-changed" in main_ts
     assert "gateway:connection" in _read("desktop/electron/src/preload.cts")
+    connection_handler = _section(
+        main_ts,
+        "ipcMain.handle('gateway:connection'",
+        "ipcMain.handle('gateway:cli-invocation'",
+    )
+    assert "refreshSandboxUpgradeReport()" in connection_handler
     assert "if (mainWindow === window) mainWindow = null" in main_ts
 
 
