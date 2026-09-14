@@ -5700,6 +5700,9 @@ class TurnRunner:
             tool_run_budget_key=f"{session_key}:{uuid.uuid4().hex}",
             router_control_config=getattr(self._turn_config(), "squilla_router", None),
             router_control_hold_store=self._router_control_hold_store,
+            router_control_routing_revision=getattr(
+                _ACCEPTED_TURN_CONFIG.get(), "session_routing_revision", None
+            ),
             router_control_replay_depth=router_control_replay_depth,
             router_control_turn_hold_applied=False,
         )
@@ -9857,6 +9860,9 @@ class TurnRunner:
                 provider_request_correlation,
             ),
             "router_control_hold_store": self._router_control_hold_store,
+            "router_control_routing_revision": getattr(
+                tool_context, "router_control_routing_revision", None
+            ),
             # Surface the resolved per-agent workspace so the meta_invoke
             # handler in Agent._run_one_streaming (agent.py ~L4724) can
             # find it without falling through to default_workspace_dir().

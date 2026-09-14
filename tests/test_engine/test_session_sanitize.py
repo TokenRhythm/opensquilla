@@ -2026,6 +2026,45 @@ async def test_agent_runtime_context_is_request_only_and_not_system_prefix() -> 
 
 
 @pytest.mark.asyncio
+async def test_execution_identity_reuses_runtime_context_without_extra_message() -> None:
+    provider = CapturingProvider()
+    agent = Agent(
+        provider=provider,
+        config=AgentConfig(
+            system_prompt="stable system",
+            execution_identity_context=(
+                "[Execution selected for this turn]\n"
+                "execution_kind=single_model\n"
+                "selected_model=example/model\n"
+                "selected_provider=example"
+            ),
+            cache_breakpoints=[{"text": "stable system", "cache": "true"}],
+            cache_mode="auto",
+            max_iterations=1,
+        ),
+    )
+
+    events = [event async for event in agent.run_turn("which model?")]
+
+    assert any(event.kind == "done" for event in events)
+    call = provider.calls[0]
+    assert call["config"].system == "stable system"
+    assert call["config"].cache_breakpoints == [
+        {"text": "stable system", "cache": "true"}
+    ]
+    assert len(call["messages"]) == 1
+    assert call["messages"][0].content.startswith("which model?")
+    assert "[Runtime context for this turn]" in call["messages"][0].content
+    assert "[Execution selected for this turn]" in call["messages"][0].content
+    assert "selected_model=example/model" in call["messages"][0].content
+    assert all(
+        "[Execution selected for this turn]" not in message.content
+        for message in agent._history
+        if isinstance(message.content, str)
+    )
+
+
+@pytest.mark.asyncio
 async def test_agent_runtime_context_does_not_precede_current_user_text() -> None:
     provider = CapturingProvider()
     agent = Agent(

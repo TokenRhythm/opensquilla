@@ -734,6 +734,10 @@ class AgentConfig:
     # Per-turn volatile request context injected after persisted history
     # and before the current user turn. It is not persisted to history.
     request_context_prompt: str | None = None
+    # Compact facts about the execution selected for this turn. Agent appends
+    # them to the existing volatile runtime context instead of creating another
+    # message or mutating the cacheable system prompt.
+    execution_identity_context: str | None = None
     # Per-turn user-role skill context injected after persisted history
     # and before the current user turn. The agent persists each turn's
     # skill context in history so provider KV-cache prefixes stay stable.

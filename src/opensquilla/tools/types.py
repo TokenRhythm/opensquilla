@@ -120,6 +120,8 @@ class ToolContext:
     tool_run_budget_key: str | None = None
     router_control_config: Any | None = None
     router_control_hold_store: Any | None = None
+    # Frozen admission revision prevents old turns from changing newer holds.
+    router_control_routing_revision: int | None = None
     router_control_replay_depth: int = 0
     router_control_turn_hold_applied: bool = False
     # Read-only SkillCatalogSnapshot pinned at the start of this turn. Skill

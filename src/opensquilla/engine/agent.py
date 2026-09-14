@@ -16390,6 +16390,9 @@ class Agent:
             "Use this runtime context for questions about the current date, time, or local "
             "time zone. Do not treat it as a user request.",
         ]
+        execution_identity = self.config.execution_identity_context
+        if execution_identity and execution_identity.strip():
+            lines.extend(("", execution_identity.strip()))
         return "\n".join(lines)
 
     @staticmethod

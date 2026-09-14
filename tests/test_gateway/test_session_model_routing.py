@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import json
+from collections.abc import AsyncIterator
 from types import SimpleNamespace
 from typing import Any
+from unittest.mock import MagicMock
 
 import pytest
 
 from opensquilla.engine.runtime import TurnRunner
+from opensquilla.engine.types import DoneEvent
 from opensquilla.gateway.config import GatewayConfig
 from opensquilla.gateway.model_routing import (
     capture_model_routing_config,
@@ -19,6 +22,7 @@ from opensquilla.gateway.session_model_routing import (
     accepted_model_routing_stream,
     capture_accepted_model_routing_config,
 )
+from opensquilla.tools.types import ToolContext
 
 
 @pytest.mark.asyncio
@@ -211,3 +215,33 @@ async def test_accepted_stream_scope_stays_active_during_direct_iteration() -> N
         pass
 
     assert observed == ["direct"]
+
+
+@pytest.mark.asyncio
+async def test_runtime_tool_context_uses_accepted_routing_mode_and_revision(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = GatewayConfig(squilla_router={"enabled": True, "rollout_phase": "full"})
+    accepted = capture_model_routing_config(
+        config, session_mode="direct", session_routing_revision=7
+    )
+    runner = TurnRunner(provider_selector=MagicMock(), config=config)
+    observed: list[ToolContext] = []
+
+    async def capture_turn(*args: Any, **kwargs: Any) -> AsyncIterator[DoneEvent]:
+        observed.append(args[5])
+        yield DoneEvent()
+
+    monkeypatch.setattr(runner, "_run_turn", capture_turn)
+    caller_context = ToolContext()
+    async for _event in accepted_model_routing_stream(
+        runner.run("synthetic request", "agent:main:revision-context", caller_context),
+        accepted,
+    ):
+        pass
+
+    assert len(observed) == 1
+    assert observed[0].router_control_routing_revision == 7
+    assert observed[0].router_control_config.enabled is False
+    assert caller_context.router_control_routing_revision is None
+    assert config.squilla_router.enabled is True

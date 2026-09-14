@@ -1147,6 +1147,123 @@ async def test_turn_metadata_threaded_into_agent_config() -> None:
     assert turn.metadata["agent_max_iterations_source"] == "test budget"
 
 
+@pytest.mark.asyncio
+async def test_selected_single_model_deployment_is_runtime_scoped_after_routing() -> None:
+    turn = _make_turn(
+        metadata={
+            "routed_tier": "c0",
+            "routing_applied": True,
+        }
+    )
+
+    out = await _make_stage().run(
+        _make_input(
+            turn=turn,
+            final_prompt="CACHEABLE IDENTITY",
+            request_context_prompt="EXISTING DYNAMIC CONTEXT",
+            resolved_model="deepseek/deepseek-v4-flash",
+            active_provider_id="openrouter",
+        )
+    )
+
+    config = out.output.agent_config
+    assert config.system_prompt == "CACHEABLE IDENTITY"
+    assert config.request_context_prompt == "EXISTING DYNAMIC CONTEXT"
+    assert config.execution_identity_context == (
+        "[Execution selected for this turn]\n"
+        "execution_kind=single_model\n"
+        "selected_model=deepseek/deepseek-v4-flash\n"
+        "selected_provider=openrouter\n"
+        "router_tier=c0"
+    )
+
+
+@pytest.mark.asyncio
+async def test_ensemble_is_identified_as_fusion_without_claiming_its_anchor() -> None:
+    turn = _make_turn(
+        metadata={
+            "ensemble_enabled": True,
+            "routed_tier": "c3",
+            "routing_applied": True,
+        }
+    )
+
+    out = await _make_stage().run(
+        _make_input(
+            turn=turn,
+            request_context_prompt="ENSEMBLE CONTEXT",
+            resolved_model="anchor/model",
+            active_provider_id="openrouter",
+        )
+    )
+
+    assert out.output.agent_config.request_context_prompt == "ENSEMBLE CONTEXT"
+    assert out.output.agent_config.execution_identity_context == (
+        "[Execution selected for this turn]\n"
+        "execution_kind=multi_model_fusion\n"
+        "router_tier=c3"
+    )
+    assert "anchor/model" not in out.output.agent_config.execution_identity_context
+    assert "openrouter" not in out.output.agent_config.execution_identity_context
+
+
+@pytest.mark.asyncio
+async def test_selected_execution_context_does_not_leak_across_mode_changes() -> None:
+    stage = _make_stage()
+
+    direct = await stage.run(
+        _make_input(
+            turn=_make_turn(),
+            resolved_model="direct/model-a",
+            active_provider_id="direct-provider",
+        )
+    )
+    routed = await stage.run(
+        _make_input(
+            turn=_make_turn(
+                metadata={"routed_tier": "c1", "routing_applied": True}
+            ),
+            resolved_model="router/model-b",
+            active_provider_id="router-provider",
+        )
+    )
+    ensemble = await stage.run(
+        _make_input(
+            turn=_make_turn(
+                metadata={
+                    "ensemble_enabled": True,
+                    "routed_tier": "c3",
+                    "routing_applied": True,
+                }
+            ),
+            resolved_model="hidden/anchor",
+            active_provider_id="hidden-provider",
+        )
+    )
+    direct_again = await stage.run(
+        _make_input(
+            turn=_make_turn(),
+            resolved_model="direct/model-c",
+            active_provider_id="direct-provider",
+        )
+    )
+
+    direct_context = direct.output.agent_config.execution_identity_context or ""
+    routed_context = routed.output.agent_config.execution_identity_context or ""
+    ensemble_context = ensemble.output.agent_config.execution_identity_context or ""
+    direct_again_context = direct_again.output.agent_config.execution_identity_context or ""
+    assert "execution_kind=single_model" in direct_context
+    assert "selected_model=direct/model-a" in direct_context
+    assert "router_tier=" not in direct_context
+    assert "selected_model=router/model-b" in routed_context
+    assert "router_tier=c1" in routed_context
+    assert "execution_kind=multi_model_fusion" in ensemble_context
+    assert "hidden/anchor" not in ensemble_context
+    assert "selected_model=direct/model-c" in direct_again_context
+    assert "router_tier=" not in direct_again_context
+    assert "hidden/anchor" not in direct_again_context
+
+
 def test_stage_name_constant() -> None:
     assert AgentBootstrapStage.name == "agent_bootstrap_stage"
 

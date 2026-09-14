@@ -48,6 +48,43 @@ _SOURCE_DIFF_CANDIDATE_MODES = frozenset({"off", "log", "warn_model"})
 _TRUE_ENV_VALUES = frozenset({"1", "true", "yes", "on", "enabled"})
 
 
+def _selected_execution_identity_context(
+    *,
+    model: str,
+    provider: str,
+    metadata: dict[str, Any],
+) -> str | None:
+    """Render compact, per-turn execution selection facts for the model.
+
+    The execution shape is known only after the routing/Ensemble pipeline.
+    The Agent appends these facts to its existing volatile runtime context, so
+    this feature adds no separate message and cannot change the cacheable system
+    prefix. An Ensemble has no single selected model; terminal execution
+    telemetry remains authoritative when a provider fallback changes the
+    physical deployment after request start.
+    """
+
+    ensemble_enabled = bool(metadata.get("ensemble_enabled"))
+    lines = [
+        "[Execution selected for this turn]",
+        f"execution_kind={'multi_model_fusion' if ensemble_enabled else 'single_model'}",
+    ]
+    if not ensemble_enabled:
+        selected_model = str(model or "").strip()
+        if not selected_model:
+            return None
+        selected_provider = str(
+            provider or metadata.get("executed_provider") or ""
+        ).strip()
+        lines.append(f"selected_model={selected_model}")
+        if selected_provider:
+            lines.append(f"selected_provider={selected_provider}")
+    routed_tier = str(metadata.get("routed_tier") or "").strip()
+    if routed_tier and metadata.get("routing_applied", True):
+        lines.append(f"router_tier={routed_tier}")
+    return "\n".join(lines)
+
+
 def _progress_watchdog_mode_from_env() -> Literal["off", "log", "warn_model", "block"]:
     raw = os.environ.get("OPENSQUILLA_PROGRESS_WATCHDOG_MODE", "off").strip().lower()
     if raw in _PROGRESS_WATCHDOG_MODES:
@@ -881,6 +918,11 @@ class AgentBootstrapStage:
             system_prompt=inp.final_prompt,
             cache_breakpoints=inp.cache_breakpoints,
             request_context_prompt=inp.request_context_prompt,
+            execution_identity_context=_selected_execution_identity_context(
+                model=inp.resolved_model,
+                provider=inp.active_provider_id,
+                metadata=agent_metadata,
+            ),
             cache_mode=inp.turn.metadata.get("cache_mode", "off"),
             skills_context_prompt=inp.turn.metadata.get("skills_context_prompt"),
             model_id=inp.resolved_model,

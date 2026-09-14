@@ -611,3 +611,46 @@ async def test_changing_request_context_does_not_pollute_persisted_history_prefi
         ensure_ascii=False,
     )
     assert "<memory_context>volatile two</memory_context>" not in old_prefix_payload
+
+
+@pytest.mark.asyncio
+async def test_execution_selection_changes_only_current_runtime_suffix() -> None:
+    provider = _CapturingProvider()
+    breakpoints = [{"text": "stable base", "cache": "true"}]
+    agent = Agent(
+        provider=provider,
+        config=AgentConfig(
+            system_prompt="stable base",
+            cache_breakpoints=breakpoints,
+            cache_mode="auto",
+            max_iterations=1,
+        ),
+    )
+    history = [
+        Message(role="user", content="old question"),
+        Message(role="assistant", content="old answer"),
+    ]
+    agent.set_history(history)
+    selections = [
+        "execution_kind=single_model\nselected_model=example/model-a",
+        "execution_kind=single_model\nselected_model=example/model-b\nrouter_tier=c1",
+        "execution_kind=multi_model_fusion",
+        "execution_kind=single_model\nselected_model=example/model-c",
+    ]
+    for index, selection in enumerate(selections):
+        agent.config.execution_identity_context = (
+            "[Execution selected for this turn]\n" + selection
+        )
+        events = [event async for event in agent.run_turn(f"question {index}")]
+        assert any(event.kind == "done" for event in events)
+        call = provider.calls[-1]
+        assert call["config"].system == "stable base"
+        assert call["config"].cache_breakpoints == breakpoints
+        assert call["messages"][:2] == history[:2]
+        assert len(call["messages"]) == 3 + 2 * index
+        content = call["messages"][-1].content
+        assert content.startswith(f"question {index}")
+        assert selection in content
+        assert content.count("[Execution selected for this turn]") == 1
+        for prior in call["messages"][:-1]:
+            assert "[Execution selected for this turn]" not in str(prior.content)
