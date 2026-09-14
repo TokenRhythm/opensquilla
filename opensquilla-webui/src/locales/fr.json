@@ -1,4 +1,13 @@
 {
+  "resourceActions": {
+    "more": "Actions du fichier", "preview": "Aperçu dans l’application", "openSource": "Ouvrir avec l’application par défaut",
+    "reveal": "Afficher dans le gestionnaire de fichiers", "revealFinder": "Afficher dans le Finder", "revealExplorer": "Afficher dans l’Explorateur de fichiers",
+    "openCopy": "Ouvrir une copie locale", "saveAs": "Enregistrer sous…", "copyPath": "Copier le chemin",
+    "copyGatewayPath": "Copier le chemin serveur", "copyContents": "Copier le contenu", "saved": "Fichier enregistré",
+    "singleFile": "Enregistrer uniquement ce HTML, sans les styles, images et pages liés.",
+    "textOnly": "La copie prend en charge le texte UTF-8 jusqu’à 1 MiB. Enregistrez plutôt le fichier.",
+    "unavailable": "Le fichier source est indisponible. Les aperçus et téléchargements existants sont inchangés.", "failed": "L’opération sur le fichier a échoué."
+  },
   "workspaces": {
     "projects": "Projets",
     "createProject": "Créer un projet",
@@ -257,6 +266,7 @@
       "permissionDenied": "Vous n’êtes pas autorisé à mettre à jour cette page.",
       "previewCapabilityExpired": "L’aperçu doit être rouvert.",
       "previewRendererFailed": "Impossible d’afficher l’aperçu. Essayez de le rouvrir.",
+      "previewPageUnsupported": "Ce client ou Gateway ne permet pas d’ouvrir directement cette sous-page. Effectuez une mise à jour, puis réessayez.",
       "annotationUnavailable": "Cette annotation est temporairement indisponible.",
       "annotationBusy": "Les annotations sont en cours de mise à jour. Patientez un instant puis réessayez.",
       "invalidRequest": "Impossible de terminer la requête. Vérifiez la saisie puis réessayez.",

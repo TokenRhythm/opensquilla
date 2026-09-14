@@ -1,4 +1,13 @@
 {
+  "resourceActions": {
+    "more": "Dateiaktionen", "preview": "Vorschau in der App", "openSource": "Mit Standard-App öffnen",
+    "reveal": "Im Dateimanager anzeigen", "revealFinder": "Im Finder anzeigen", "revealExplorer": "Im Datei-Explorer anzeigen",
+    "openCopy": "Lokale Kopie öffnen", "saveAs": "Speichern unter…", "copyPath": "Pfad kopieren",
+    "copyGatewayPath": "Serverpfad kopieren", "copyContents": "Dateiinhalt kopieren", "saved": "Datei gespeichert",
+    "singleFile": "Nur diese HTML-Datei speichern, ohne verknüpfte Stile, Bilder und Seiten.",
+    "textOnly": "Kopieren unterstützt UTF-8-Text bis 1 MiB. Speichern Sie stattdessen die Datei.",
+    "unavailable": "Quelldatei nicht verfügbar. Vorhandene Vorschauen und Downloads bleiben unverändert.", "failed": "Dateiaktion fehlgeschlagen."
+  },
   "workspaces": {
     "projects": "Projekte",
     "createProject": "Projekt erstellen",
@@ -257,6 +266,7 @@
       "permissionDenied": "Du hast keine Berechtigung, diese Seite zu aktualisieren.",
       "previewCapabilityExpired": "Die Vorschau muss erneut geöffnet werden.",
       "previewRendererFailed": "Die Vorschau konnte nicht angezeigt werden. Öffne sie erneut.",
+      "previewPageUnsupported": "Dieser Client oder das Gateway unterstützt das direkte Öffnen dieser Unterseite nicht. Aktualisiere die Software und versuche es erneut.",
       "annotationUnavailable": "Diese Anmerkung ist vorübergehend nicht verfügbar.",
       "annotationBusy": "Die Anmerkungen werden gerade aktualisiert. Warte einen Moment und versuche es erneut.",
       "invalidRequest": "Die Anfrage konnte nicht abgeschlossen werden. Prüfe die Eingabe und versuche es erneut.",

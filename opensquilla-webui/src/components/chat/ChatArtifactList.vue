@@ -130,6 +130,7 @@
         :data-artifact-key="artifactKey(artifact)"
         :artifact="artifact"
         :category="artifactCategory(artifact)"
+        :session-key="sessionKey"
         :icon-name="artifactIconName(artifact)"
         :title="artifactFileTitle(artifact)"
         :kind-pill="artifactKindPill(artifact)"

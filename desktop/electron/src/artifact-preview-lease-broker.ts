@@ -6,6 +6,7 @@ export interface ArtifactPreviewLeaseCreateRequest {
   scopeId: string
   mode: ArtifactPreviewLeaseMode
   authToken?: string
+  pagePath?: string
 }
 
 export interface ArtifactPreviewLeaseControlRequest {
@@ -29,6 +30,7 @@ export interface ArtifactPreviewLeasePayload {
   effective_mode: ArtifactPreviewLeaseMode
   launch_url: string
   entrypoint: string
+  page_path?: string
   expires_at: string
   preview_origin: string
   idle_timeout_seconds: number
@@ -134,13 +136,22 @@ function parseAuthToken(value: unknown): string | undefined {
   return parseBoundedString(value, 'The preview credential', MAX_CREDENTIAL_BYTES)
 }
 
+function parsePagePath(value: unknown): string {
+  const path = parseBoundedString(value, 'The preview page', 4096)
+  if (/[\\:%?#]/.test(path) || !/\.(html?|xhtml)$/i.test(path)
+    || path.split('/').some(part => !part || part === '.' || part === '..')) {
+    throw new Error('The preview page is invalid.')
+  }
+  return path
+}
+
 export function parseArtifactPreviewLeaseCreateRequest(
   value: unknown,
 ): ArtifactPreviewLeaseCreateRequest {
   const raw = objectRecord(value)
   if (
     !raw
-    || !exactKeys(raw, ['version', 'artifactId', 'scopeId', 'mode'], ['authToken'])
+    || !exactKeys(raw, ['version', 'artifactId', 'scopeId', 'mode'], ['authToken', 'pagePath'])
     || raw.version !== 1
     || typeof raw.version === 'boolean'
     || !ARTIFACT_ID_PATTERN.test(String(raw.artifactId ?? ''))
@@ -155,6 +166,7 @@ export function parseArtifactPreviewLeaseCreateRequest(
     scopeId: parseScopeId(raw.scopeId),
     mode: raw.mode,
     ...(authToken ? { authToken } : {}),
+    ...(Object.hasOwn(raw, 'pagePath') ? { pagePath: parsePagePath(raw.pagePath) } : {}),
   }
 }
 
@@ -265,7 +277,7 @@ function parseLeasePayload(
       'preview_origin',
       'idle_timeout_seconds',
       'source',
-    ], ['workingDocumentId'])
+    ], ['workingDocumentId', 'page_path'])
     || raw.version !== 1
     || typeof raw.version === 'boolean'
     || !LEASE_ID_PATTERN.test(String(raw.lease_id ?? ''))
@@ -301,6 +313,7 @@ function parseLeasePayload(
       effective_mode: raw.effective_mode,
       launch_url: launch.href,
       entrypoint: parseBoundedString(raw.entrypoint, 'The preview entrypoint', 4096),
+      ...(Object.hasOwn(raw, 'page_path') ? { page_path: parsePagePath(raw.page_path) } : {}),
       expires_at: expiry.value,
       preview_origin: previewOrigin,
       idle_timeout_seconds: parsePositiveInteger(
@@ -439,7 +452,8 @@ export class ArtifactPreviewLeaseBroker {
       'POST',
       request.scopeId,
       request.authToken,
-      JSON.stringify({ version: 1, mode: request.mode, client: 'desktop' }),
+      JSON.stringify({ version: 1, mode: request.mode, client: 'desktop',
+        ...(request.pagePath ? { pagePath: request.pagePath } : {}) }),
     )
     if (!response.ok) return response
     if (response.status !== 201) {
@@ -447,6 +461,14 @@ export class ArtifactPreviewLeaseBroker {
     }
     try {
       const parsed = parseLeasePayload(response.payload, request.mode)
+      if (request.pagePath && (parsed.payload.page_path !== request.pagePath
+        || decodeURIComponent(new URL(parsed.payload.launch_url).pathname) !== `/${request.pagePath}`)) {
+        await this.request(
+          new URL(`/api/v1/artifact-preview-leases/${encodeURIComponent(parsed.payload.lease_id)}`, gatewayOrigin),
+          'DELETE', request.scopeId, request.authToken,
+        )
+        return failure(409, 'PREVIEW_PAGE_UNSUPPORTED', 'The Gateway cannot open this preview page.')
+      }
       if (
         generation !== this.generation
         || parseOwnedGatewayOrigin(this.options.getOwnedGatewayUrl()) !== gatewayOrigin

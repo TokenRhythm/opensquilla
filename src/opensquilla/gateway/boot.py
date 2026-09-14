@@ -13,6 +13,7 @@ import time
 import uuid
 from collections.abc import Callable, Mapping, MutableMapping
 from dataclasses import dataclass, field
+from functools import partial
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol, cast
@@ -635,6 +636,10 @@ class ServiceContainer:
     usage_event_sink: Any = None
     usage_backfill_task: asyncio.Task[Any] | None = None
     sandbox_setup_task: asyncio.Task[Any] | None = field(default=None, repr=False)
+    # Best-effort profile normalization result exposed to the Desktop UI. The
+    # sandbox decoder remains authoritative for runtime behavior; this field
+    # only preserves the boot diagnostic so partial writes are visible.
+    sandbox_upgrade_report: dict[str, object] | None = None
     profile_import_maintenance_task: asyncio.Task[Any] | None = field(
         default=None,
         repr=False,
@@ -1457,35 +1462,77 @@ def build_session_material_cleanup(config: Any) -> Any:
     low-level ``session`` package only owns the hook registry + guarded remover.
     """
     from opensquilla.agents.scope import resolve_agent_workspace_dir
+    from opensquilla.artifact_session.working_files import checked_path
     from opensquilla.artifacts import ArtifactStore
     from opensquilla.attachment_refs import transcript_material_dir
     from opensquilla.attachment_workspace import _safe_path_segment
     from opensquilla.paths import media_root_from_config
+    from opensquilla.project_workspaces import _validate_stored_project_path
+    from opensquilla.sandbox.run_context import RUN_CONTEXT_ORIGIN_KEY, get_run_context
     from opensquilla.session.keys import parse_agent_id
     from opensquilla.session.material_cleanup import rmtree_scoped
 
-    async def _cleanup(session_id: str, session_key: str) -> None:
+    async def _prepare(session: Any, project: Any) -> Any:
+        session_id = session.session_id
+        session_key = session.session_key
+        media_root = media_root_from_config(config)
+        segment = _safe_path_segment(session_id, fallback="session")
+        workspace = None
+        try:
+            if session.workspace_id:
+                if project is None or project.trusted_at is None or project.removed_at is not None:
+                    raise ValueError("project workspace is unavailable")
+                workspace = Path(await asyncio.to_thread(_validate_stored_project_path, project))
+            else:
+                context = await get_run_context(
+                    None, session_key, config=config,
+                    workspace=str(resolve_agent_workspace_dir(parse_agent_id(session_key), config)),
+                    include_user_grants=False, session_node=session,
+                )
+                if not context.workspace:
+                    raise ValueError("session workspace is unavailable")
+                workspace = Path(context.workspace)
+                # Legacy saved roots are authority too: never follow a replaced
+                # link to a different directory while preparing deletion.
+                if context.source == "saved" and session.execution_workspace is None:
+                    saved_root = session.origin[RUN_CONTEXT_ORIGIN_KEY].get("workspace")
+                    if Path(saved_root).expanduser().absolute() != workspace:
+                        raise ValueError("saved workspace path changed")
+            if not workspace.is_dir():
+                raise ValueError("session workspace is unavailable")
+            checked_path(workspace, f".opensquilla/attachments/{segment}")
+        except (OSError, RuntimeError, TypeError, ValueError):
+            log.warning("session_material_cleanup.workspace_unavailable", session_id=session_id)
+            workspace = None
+
+        async def _cleanup() -> None:
+            await _remove_material(session_id, media_root, workspace, segment)
+
+        return _cleanup
+
+    async def _remove_material(
+        session_id: str, media_root: Path, workspace: Path | None, segment: str,
+    ) -> None:
         # 1. Canonical transcript-material store (keyed by session_id, outside
         #    the workspace).
-        media_root = media_root_from_config(config)
         rmtree_scoped(
             transcript_material_dir(media_root, session_id),
             expected_name=session_id,
         )
-        # 2. Tool-visible workspace materialization (per-session segment under the
-        #    per-agent workspace). Resolve the agent from the session key so the
-        #    workspace matches where the material was written.
-        agent_id = parse_agent_id(session_key)
-        workspace = Path(resolve_agent_workspace_dir(agent_id, config))
-        segment = _safe_path_segment(session_id, fallback="session")
-        attachments_dir = workspace / ".opensquilla" / "attachments" / segment
-        rmtree_scoped(attachments_dir, expected_name=segment)
+        # 2. Only the deleted generation's material under its captured root.
+        # Recheck link components after commit; never remove source/task roots.
+        if workspace is not None:
+            try:
+                attachments_dir = checked_path(workspace, f".opensquilla/attachments/{segment}")
+                rmtree_scoped(attachments_dir, expected_name=segment)
+            except (OSError, RuntimeError, ValueError):
+                log.warning("session_material_cleanup.workspace_changed", session_id=session_id)
         # 3. Every artifact owned by the deleted session, including listed
         #    chat artifacts, internal revisions/candidates, bundle blobs, and
         #    legacy layouts. ArtifactStore owns the scoped layout and link guards.
         ArtifactStore(media_root).delete_session_artifacts(session_id)
 
-    return _cleanup
+    return _prepare
 
 
 def build_session_artifact_cleanup(config: Any) -> Any:
@@ -2921,6 +2968,7 @@ async def build_services(
     # already loaded through the legacy codec, so an optional on-disk cleanup
     # must never make the gateway unavailable.
     config_path = Path(str(getattr(config, "config_path", "") or ""))
+    sandbox_upgrade_report: dict[str, object] | None = None
     if config_path.is_file():
         from opensquilla.sandbox.upgrade_migration import (
             ensure_sandbox_upgrade_migrated,
@@ -2930,7 +2978,13 @@ async def build_services(
         log.info("build_services.sandbox_upgrade_started")
         try:
             upgrade_report = ensure_sandbox_upgrade_migrated(config_path.parent)
+            sandbox_upgrade_report = upgrade_report.to_dict()
         except Exception as exc:
+            sandbox_upgrade_report = {
+                "ok": False,
+                "status": "retry_required",
+                "error": f"{type(exc).__name__}: {exc}",
+            }
             log.warning(
                 "build_services.sandbox_upgrade_failed",
                 duration_ms=_elapsed_monotonic_ms(sandbox_upgrade_started_at),
@@ -2943,6 +2997,8 @@ async def build_services(
                 "build_services.sandbox_upgrade_finished",
                 ok=upgrade_report.ok,
                 status=upgrade_report.status,
+                stores=upgrade_report.stores,
+                committed_stores=upgrade_report.committed_stores,
                 error=upgrade_report.error,
                 duration_ms=_elapsed_monotonic_ms(sandbox_upgrade_started_at),
             )
@@ -3007,6 +3063,7 @@ async def build_services(
 
     # ── Session manager ─────────────────────────────────────────────
     if session_manager is None:
+        from opensquilla.gateway.execution_workspaces import build_execution_workspace_factory
         from opensquilla.paths import media_root_from_config
         from opensquilla.session.manager import SessionManager
         from opensquilla.session.storage import SessionStorage
@@ -3031,6 +3088,7 @@ async def build_services(
             checkpoint_workspace_dir=config.workspace_dir,
             media_root=media_root_from_config(config),
             model_routing_mode_provider=lambda: model_routing_snapshot(config)["mode"],
+            execution_workspace_factory=build_execution_workspace_factory(config),
         )
 
     # Wire session manager into tool layer (like set_scheduler, set_gateway_config)
@@ -3882,6 +3940,7 @@ async def build_services(
         growth_event_sink=growth_event_sink,
         deferred_warmups=deferred_warmups,
         sandbox_setup_task=sandbox_setup_task,
+        sandbox_upgrade_report=sandbox_upgrade_report,
     )
     if skill_loader is not None:
         try:
@@ -4301,6 +4360,7 @@ async def start_gateway_server(
     # Lazy ref for channel_manager — cron handler captures it via closure,
     # populated after channel_manager is constructed below.
     _cm_holder: list = [None]
+    from opensquilla.gateway.project_workspace_runtime import prepare_heartbeat_tool_context
     from opensquilla.scheduler.heartbeat import (
         HeartbeatConfigWatcher,
         HeartbeatRunner,
@@ -4308,10 +4368,15 @@ async def start_gateway_server(
     from opensquilla.scheduler.heartbeat_loop import HeartbeatLoop
     from opensquilla.scheduler.heartbeat_service import HeartbeatService
 
+    heartbeat_storage = get_session_storage(svc.session_manager)
     heartbeat_service = HeartbeatService(
         turn_runner=turn_runner,
-        session_storage=get_session_storage(svc.session_manager) or svc.session_manager,
+        session_storage=heartbeat_storage,
         channel_manager_ref=lambda: _cm_holder[0],
+        prepare_tool_context=partial(
+            prepare_heartbeat_tool_context, storage=heartbeat_storage,
+            session_manager=svc.session_manager, config=config,
+        ),
     )
     heartbeat_loop = HeartbeatLoop(
         config=config,
@@ -5199,6 +5264,7 @@ async def start_gateway_server(
         memory_managers=svc.memory_managers,
         memory_stores=svc.memory_stores,
         memory_retrievers=svc.memory_retrievers,
+        sandbox_upgrade_report=getattr(svc, "sandbox_upgrade_report", None),
         extra_routes=webhook_routes or None,
     )
     app.state.gateway_ready = False

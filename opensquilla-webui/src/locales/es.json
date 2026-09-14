@@ -1,4 +1,13 @@
 {
+  "resourceActions": {
+    "more": "Acciones de archivo", "preview": "Vista previa en la aplicación", "openSource": "Abrir con la aplicación predeterminada",
+    "reveal": "Mostrar en el gestor de archivos", "revealFinder": "Mostrar en Finder", "revealExplorer": "Mostrar en el Explorador de archivos",
+    "openCopy": "Abrir una copia local", "saveAs": "Guardar como…", "copyPath": "Copiar ruta",
+    "copyGatewayPath": "Copiar ruta del servidor", "copyContents": "Copiar contenido", "saved": "Archivo guardado",
+    "singleFile": "Guardar solo este HTML, sin estilos, imágenes ni páginas vinculadas.",
+    "textOnly": "Solo se puede copiar texto UTF-8 de hasta 1 MiB. Guarda el archivo.",
+    "unavailable": "El archivo fuente no está disponible. Las vistas previas y descargas existentes no cambian.", "failed": "La operación de archivo falló."
+  },
   "workspaces": {
     "projects": "Proyectos",
     "createProject": "Crear proyecto",
@@ -257,6 +266,7 @@
       "permissionDenied": "No tienes permiso para actualizar esta página.",
       "previewCapabilityExpired": "Es necesario volver a abrir la vista previa.",
       "previewRendererFailed": "No se pudo mostrar la vista previa. Intenta volver a abrirla.",
+      "previewPageUnsupported": "Este cliente o Gateway no permite abrir esta subpágina directamente. Actualiza el software y vuelve a intentarlo.",
       "annotationUnavailable": "Esta anotación no está disponible temporalmente.",
       "annotationBusy": "Las anotaciones se están actualizando. Espera un momento y vuelve a intentarlo.",
       "invalidRequest": "No se pudo completar la solicitud. Revisa la entrada y vuelve a intentarlo.",

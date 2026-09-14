@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import os
 import re
 import secrets
-from collections.abc import Collection
+from collections.abc import Callable, Collection
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -16,6 +17,8 @@ from opensquilla.attachment_refs import (
     make_attachment_ref,
     read_attachment_ref_bytes,
 )
+from opensquilla.contracts.attachments import IMAGE_ATTACHMENT_BYTES, IMAGE_ATTACHMENT_MIMES
+from opensquilla.contracts.image_validation import validate_image_bytes
 
 _UNSAFE_FILENAME_CHARS = re.compile(r"[^A-Za-z0-9._@+=, -]+")
 _WHITESPACE = re.compile(r"\s+")
@@ -90,6 +93,7 @@ class AttachmentWorkspaceMaterializer:
         workspace_dir: str | Path,
         materializable_mimes: Collection[str] | None = None,
         disk_budget_bytes: int | None = None,
+        authorize_write: Callable[[Path], None] | None = None,
     ) -> None:
         self._media_root = Path(media_root)
         self._workspace_root = Path(workspace_dir)
@@ -97,6 +101,7 @@ class AttachmentWorkspaceMaterializer:
             frozenset(materializable_mimes) if materializable_mimes is not None else None
         )
         self._disk_budget_bytes = disk_budget_bytes
+        self._authorize_write = authorize_write
         # Lazily-scanned bytes under <workspace>/.opensquilla/attachments,
         # kept current across this instance's writes so a batch of
         # materializations pays for one directory walk.
@@ -202,6 +207,38 @@ class AttachmentWorkspaceMaterializer:
                 error=str(exc),
             )
 
+    def materialize_image_path(
+        self, attachment: dict[str, Any], session_id: str
+    ) -> str | None:
+        """Return a readable workspace path for retained, validated image material.
+
+        The caller authorizes retention and supplies a canonical transcript
+        attachment. Never use an arbitrary path stored in the envelope.
+        """
+        mime = _attachment_mime(attachment)
+        if mime not in IMAGE_ATTACHMENT_MIMES or not session_id or attachment.get("missing_reason"):
+            return None
+        try:
+            data = attachment.get("data")
+            if isinstance(data, str) and data:
+                if len(data) > ((IMAGE_ATTACHMENT_BYTES + 2) // 3) * 4:
+                    return None
+                payload = base64.b64decode(data, validate=True)
+            else:
+                ref = _coerce_attachment_ref(attachment, session_id=session_id)
+                if _attachment_size(ref) > IMAGE_ATTACHMENT_BYTES:
+                    return None
+                payload = read_attachment_ref_bytes(ref, media_root=self._media_root)
+            if len(payload) > IMAGE_ATTACHMENT_BYTES:
+                return None
+            validate_image_bytes(payload, mime)
+            result = self.materialize_bytes(
+                payload, name=_attachment_name(attachment), mime=mime, session_id=session_id
+            )
+            return result.rel_path if result.available else None
+        except (OSError, ValueError):
+            return None
+
     def _materialize_payload(
         self,
         payload: bytes,
@@ -227,11 +264,13 @@ class AttachmentWorkspaceMaterializer:
         session_segment = _safe_path_segment(scope, fallback="session")
         filename = f"{sha[:12]}-{_safe_filename(name)}"
         target_dir = root / ".opensquilla" / "attachments" / session_segment
-        target_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
         resolved_dir = target_dir.resolve()
         _assert_relative_to(resolved_dir, root)
         target = resolved_dir / filename
         _assert_relative_to(target.resolve(strict=False), root)
+        if self._authorize_write is not None:
+            self._authorize_write(target)
+        target_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
         return target
 
     def _write_or_reuse(

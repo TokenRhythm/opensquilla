@@ -27,6 +27,7 @@ export interface PromptAnnotation {
   body: string
   targetRef?: string
   resourceId?: string
+  pagePath?: string
   locatorHint?: string
   screenshotAttachment?: import('./chat').Attachment
   status: PromptAnnotationStatus
@@ -60,6 +61,7 @@ export interface PromptAnnotationSnapshot {
   body: string
   targetRef?: string
   resourceId?: string
+  pagePath?: string
   locatorHint?: string
   tagName: string
   targetStatus?: PromptAnnotationTargetStatus
@@ -78,6 +80,7 @@ export interface PromptAnnotationCreateRequest {
   documentId: string
   documentName?: string
   resourceId?: string
+  pagePath?: string
   selection: PromptAnnotationSelection
   body?: string
 }

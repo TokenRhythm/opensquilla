@@ -1433,9 +1433,12 @@ class SquillaRouterConfig(BaseSettings):
     estimated_output_savings_pct: float = 0.03
     upgrade_to_c3_compaction_enabled: bool = True
     self_learning: RouterSelfLearningConfig = Field(default_factory=RouterSelfLearningConfig)
+    # Deprecated compatibility fields: active history is retained until compaction;
+    # image routing no longer imposes a separate turn window.
     vision_history_lookback_turns: int = Field(default=8, ge=0)
     vision_history_candidate_turns: int = Field(default=8, ge=0)
     vision_sticky_followup_turns: int = Field(default=3, ge=0)
+    # Deprecated compatibility fields: image context no longer runs a separate gate.
     vision_followup_gate_enabled: bool = True
     vision_followup_gate_tier: str = "c0"
     vision_followup_gate_model: str | None = None
@@ -2939,6 +2942,9 @@ class GatewayConfig(BaseSettings):
         )
 
     def model_post_init(self, __context: Any) -> None:
+        # Capture input provenance before profile-path normalization assigns
+        # workspace_dir and adds it to Pydantic's mutable model_fields_set.
+        self._workspace_dir_explicit = "workspace_dir" in self.model_fields_set
         handle_deprecated_skill_filter_env()
         self._apply_concurrency_env_overrides()
 
@@ -3098,6 +3104,17 @@ class GatewayConfig(BaseSettings):
     _runtime_field_overrides: dict[str, tuple[Any, Any]] = PrivateAttr(default_factory=dict)
     _force_persist_paths: set[tuple[str, ...]] = PrivateAttr(default_factory=set)
     _provider_resolution: dict[str, Any] = PrivateAttr(default_factory=dict)
+    # ``workspace_dir`` has a non-empty historical default, so its value alone
+    # cannot tell the workspace allocator whether the operator explicitly
+    # selected a shared root. Keep that provenance out of persisted config.
+    _workspace_dir_explicit: bool = PrivateAttr(default=False)
+
+    @property
+    def workspace_dir_source(self) -> str:
+        explicit = self._workspace_dir_explicit or (
+            self._persist_raw_base is not None and "workspace_dir" in self._persist_raw_base
+        )
+        return "configured" if explicit else "default"
 
     def to_toml_dict(self) -> dict[str, Any]:
         """Convert config to a TOML-writable dict."""
@@ -3256,6 +3273,8 @@ class GatewayConfig(BaseSettings):
 
     def clear_runtime_override(self, path: str) -> None:
         self._runtime_field_overrides.pop(path, None)
+        if path == "workspace_dir":
+            self._workspace_dir_explicit = True
 
     def runtime_field_overrides(self) -> dict[str, tuple[Any, Any]]:
         return dict(self._runtime_field_overrides)
@@ -3276,6 +3295,7 @@ class GatewayConfig(BaseSettings):
         self._runtime_field_overrides = dict(other._runtime_field_overrides)
         self._force_persist_paths = set(other._force_persist_paths)
         self._provider_resolution = dict(other._provider_resolution)
+        self._workspace_dir_explicit = other._workspace_dir_explicit
 
     def provider_resolution(self) -> dict[str, Any]:
         """Return non-secret provider identity provenance for diagnostics."""
@@ -3368,6 +3388,7 @@ class GatewayConfig(BaseSettings):
         self._persist_raw_base = copy.deepcopy(other._persist_raw_base)
         self._force_persist_paths = set(other._force_persist_paths)
         self._provider_resolution = dict(other._provider_resolution)
+        self._workspace_dir_explicit = other._workspace_dir_explicit
 
     def mark_force_persist(self, path: str) -> None:
         """Always write ``path`` on the next persist, even if it equals the
@@ -3380,6 +3401,8 @@ class GatewayConfig(BaseSettings):
         """Mark an exact config path while preserving dotted mapping keys."""
         if path:
             self._force_persist_paths.add(tuple(path))
+            if path == ("workspace_dir",):
+                self._workspace_dir_explicit = True
 
     def force_persist_path_segments(self) -> set[tuple[str, ...]]:
         """Return exact one-shot force paths for the persistence layer."""
@@ -3426,6 +3449,8 @@ class GatewayConfig(BaseSettings):
             applied = cls._resolve_profile_path(override, config_path)
             setattr(cfg, field_name, applied)
             cfg.record_runtime_override(field_name, stored, applied)
+            if field_name == "workspace_dir":
+                cfg._workspace_dir_explicit = True
 
     @classmethod
     def load_from_toml(cls, path: str | Path) -> GatewayConfig:

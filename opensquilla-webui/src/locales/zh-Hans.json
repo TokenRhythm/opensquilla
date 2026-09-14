@@ -1,4 +1,13 @@
 {
+  "resourceActions": {
+    "more": "文件操作", "preview": "在应用中预览", "openSource": "用默认应用打开",
+    "reveal": "在文件管理器中显示", "revealFinder": "在 Finder 中显示", "revealExplorer": "在文件资源管理器中显示",
+    "openCopy": "打开本地副本", "saveAs": "另存为…", "copyPath": "复制路径",
+    "copyGatewayPath": "复制服务器路径", "copyContents": "复制文件内容", "saved": "文件已保存",
+    "singleFile": "仅保存此 HTML 文件，不包含引用的样式、图片和其他页面。",
+    "textOnly": "仅支持复制不超过 1 MiB 的 UTF-8 文本，请改用保存文件。",
+    "unavailable": "当前源文件不可用；已有预览和下载保持不变。", "failed": "文件操作失败。"
+  },
   "workspaces": {
     "projects": "项目",
     "createProject": "创建项目",
@@ -257,6 +266,7 @@
       "permissionDenied": "你没有权限更新此页面。",
       "previewCapabilityExpired": "需要重新打开预览。",
       "previewRendererFailed": "无法显示预览，请尝试重新打开。",
+      "previewPageUnsupported": "当前客户端或 Gateway 不支持直接打开此子页。请升级后重试。",
       "annotationUnavailable": "该批注暂时不可用。",
       "annotationBusy": "正在更新批注，请稍后重试。",
       "invalidRequest": "无法完成请求，请检查输入后重试。",

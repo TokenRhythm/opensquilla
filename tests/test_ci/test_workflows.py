@@ -899,6 +899,23 @@ def test_musl_toolchain_validator_bootstrap_is_stdlib_only() -> None:
     assert "--expect-platform-key" in result.stdout
 
 
+def test_desktop_installer_preparation_is_separate_and_required() -> None:
+    steps = _workflow("ci.yml")["jobs"]["desktop-check"]["steps"]
+    policy = next(s for s in steps if s["name"] == "Test installer tooling preparation policy")
+    prepare = next(s for s in steps if s["name"] == "Prepare installer contract tooling")
+    tests = next(s for s in steps if s["name"] == "Run desktop unit tests")
+    assert steps.index(policy) < steps.index(prepare) < steps.index(tests)
+    assert policy["run"] == "node --test scripts/test-prepare-installer-tooling.mjs"
+    assert prepare["env"]["OPENSQUILLA_INSTALLER_TOOLING_FILE"].startswith("${{ runner.temp }}/")
+    command = 'node scripts/prepare-installer-tooling.mjs "$OPENSQUILLA_INSTALLER_TOOLING_FILE"'
+    assert command in prepare["run"]
+    assert "$GITHUB_ENV" in prepare["run"]
+    assert "node scripts/test-installer-progress-contract.mjs" in tests["run"].splitlines()
+    for step in (policy, prepare, tests):
+        assert not step.get("continue-on-error")
+        assert "|| true" not in step["run"]
+
+
 def test_toolchain_validator_platform_assertion_never_overrides_detection(
     tmp_path: Path,
 ) -> None:

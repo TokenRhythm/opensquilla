@@ -150,6 +150,8 @@ export interface UseChatRpcEventHandlersOptions {
   usageAccum: Ref<ChatUsageAccumulator>
   usageModel: Ref<string>
   stream: ChatRpcStreamApi
+  /** Accepted fresh results only; authoritative history/snapshot replay is excluded. */
+  onLiveToolResult?: (payload: ConversationToolContent) => void
   normalizeRunStatus: (status: string) => string
   sessionRunStatus: (source: ChatRunStatusSource | null | undefined) => ChatRunStatus
   applySessionRunState: (source: ChatRunStatusSource | null | undefined) => void
@@ -207,6 +209,7 @@ type BufferedPendingStreamEvent = {
   event: ConversationSemanticEventKind
   payload: ConversationEventData
   replayWithoutSeq?: boolean
+  replayed?: boolean
 }
 
 type BufferedPendingReplayEntry =
@@ -216,6 +219,7 @@ type BufferedPendingReplayEntry =
       payload: ConversationEventData
       order: number
       replayWithoutSeq?: boolean
+      replayed?: boolean
     }
   | {
       kind: 'terminal'
@@ -679,6 +683,7 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
   function bufferPendingStreamEvent(
     event: ConversationSemanticEventKind,
     payload: ConversationEventData,
+    replayed = false,
   ): boolean {
     if (!isCurrentSessionPayload(payload)) return false
     if (isStaleEpoch(payload)) return false
@@ -714,7 +719,7 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
       markRecoveryDirty()
       return true
     }
-    buffered.push({ event, payload, ...(buffersSuccessor ? { replayWithoutSeq: true } : {}) })
+    buffered.push({ event, payload, replayed, ...(buffersSuccessor ? { replayWithoutSeq: true } : {}) })
     return true
   }
 
@@ -834,7 +839,7 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
       } else if (event === 'tool-use-ended') {
         handleRpcToolUseEnd(payload)
       } else if (event === 'tool-result') {
-        handleRpcToolResult(payload)
+        handleRpcToolResult(payload, entry.replayed)
       } else if (event === 'artifact-created') {
         handleRpcArtifact(payload)
       } else if (event === 'state-changed') {
@@ -928,6 +933,7 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
         event: entry.event,
         payload: { ...entry.payload },
         replayWithoutSeq: true,
+        replayed: true,
       })
     }
     if (snapshot.streamGeneration && options.streamGeneration) options.streamGeneration.value = snapshot.streamGeneration
@@ -998,6 +1004,7 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
       replayPendingStreamEvent({
         event: entry.event,
         payload: entry.payload,
+        replayed: entry.replayed,
         ...(replayWithoutSeq ? { replayWithoutSeq: true } : {}),
       })
     }
@@ -1580,15 +1587,16 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
     stream.appendToolEnd?.(payload)
   }
 
-  function handleRpcToolResult(payload: ConversationToolContent) {
+  function handleRpcToolResult(payload: ConversationToolContent, replayed = false) {
     if (isStaleEpoch(payload)) return
     if (aborted.value) return
-    if (bufferPendingStreamEvent('tool-result', payload)) return
+    if (bufferPendingStreamEvent('tool-result', payload, replayed)) return
     if (!isCurrentTaskPayload(payload)) return
     if (!isCurrentGenerationPayload(payload)) return
     if (!acceptStreamSeq(payload)) return
     stream.resetStreamIdleTimer()
     stream.appendToolResult(payload)
+    if (!replayed) options.onLiveToolResult?.(payload)
   }
 
   function handleRpcArtifact(payload: ArtifactPayload) {
@@ -2453,7 +2461,7 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
           handleRpcToolUseEnd(event.payload)
           break
         case 'tool-result':
-          handleRpcToolResult(event.payload)
+          handleRpcToolResult(event.payload, event.meta.replayed === true)
           break
         case 'artifact-created':
           handleRpcArtifact(event.payload)

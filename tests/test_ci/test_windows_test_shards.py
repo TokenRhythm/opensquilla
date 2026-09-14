@@ -73,7 +73,23 @@ RECENTLY_ADDED_ACTIVE_TESTS = {
     "tests/test_engine/test_selector_provider_recovery.py",
     "tests/test_provider_connection_failure.py",
     "tests/test_tools/test_bounded_output_capture.py",
+    # Execution-log suites use the declared provisional floor until a Windows refresh.
+    "tests/test_gateway/test_rpc_execution_logs.py",
+    "tests/test_tools/test_execution_log_queries.py",
 
+    # Local-first workspace files use the 0.01s provisional floor until a
+    # comparable three-run Windows refresh supplies measured timings.
+    "tests/test_gateway/test_execution_workspace_preparation.py",
+    "tests/test_gateway/test_local_first_workspaces.py",
+    "tests/test_gateway/test_working_file_actions.py",
+    "tests/test_gateway/test_workspace_config_provenance.py",
+    "tests/test_gateway/test_workspace_preview_registration.py",
+    "tests/test_live_deliverable_acceptance.py",
+    "tests/test_tools/test_memory_workspace_ownership.py",
+    # Image budget suites use the provisional floor until a Windows duration refresh.
+    "tests/test_engine/test_agent_image_compaction_budget.py",
+    "tests/test_provider_request_proof_images.py",
+    "tests/test_session/test_compaction_media_budget.py",
     # Artifact source/version regressions use the declared provisional floor.
     "tests/test_engine/test_artifact_delivery_sources.py",
     "tests/test_engine/test_runtime_artifact_context.py",

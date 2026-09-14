@@ -7,7 +7,7 @@ import json
 import secrets
 import time
 import weakref
-from collections.abc import AsyncIterator, Callable, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from pathlib import Path
 from typing import Any, Protocol, cast
@@ -750,6 +750,73 @@ class ArtifactSessionRepository:
             )
             return created, True
 
+    async def _bind_working_source_on_conn(
+        self, conn: Any, *, commit: CommitResult, session_key: str, session_id: str,
+        working_source: dict[str, str],
+    ) -> None:
+        await conn.execute(
+            "INSERT INTO artifact_working_files VALUES (?, ?, ?, ?, ?)",
+            (commit.document.document_id, working_source["workspace"],
+             working_source["relative_root"], working_source["entrypoint"],
+             commit.revision.revision_id),
+        )
+        await conn.execute(
+            "INSERT INTO artifact_working_sources "
+            "(document_id, session_key, session_id, workspace, source_path, "
+            "bundle_mode, bundle_root) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (commit.document.document_id, session_key, session_id, working_source["workspace"],
+             working_source["source_path"], working_source["bundle_mode"],
+             working_source["bundle_root"] or None),
+        )
+        await conn.execute(
+            "INSERT INTO artifact_working_source_versions VALUES (?, ?, ?, ?, ?, ?)",
+            (commit.revision.revision_id, commit.document.document_id,
+             working_source["relative_root"], working_source["entrypoint"],
+             working_source["bundle_mode"], working_source["bundle_root"] or None),
+        )
+
+    async def register_working_source(
+        self, *, session_key: str, session_id: str, name: str,
+        initial_artifact: ArtifactBlobRef, actor: Actor, working_source: dict[str, str],
+        validate_session: Callable[[Any], Awaitable[None]] | None = None,
+    ) -> tuple[CommitResult, bool]:
+        """Atomically bind source files and an internal baseline, without a deliverable origin."""
+        async with self._transaction("register_working_source") as conn:
+            if validate_session is not None:
+                await validate_session(conn)
+            row = await _fetchone(
+                conn, "SELECT * FROM artifact_working_sources "
+                "WHERE session_key=? AND session_id=? AND workspace=? AND source_path=?",
+                (
+                    session_key,
+                    session_id,
+                    working_source["workspace"],
+                    working_source["source_path"],
+                ),
+            )
+            if row is not None:
+                if (row["bundle_mode"], row["bundle_root"] or "") != (
+                    working_source["bundle_mode"], working_source["bundle_root"],
+                ):
+                    raise ArtifactConflictError(
+                        "Working preview collection scope is already registered"
+                    )
+                document = await self._get_document_on_conn(conn, row["document_id"])
+                revision = await self._get_revision_on_conn(conn, document.head_revision_id)
+                return CommitResult(document=document, revision=revision), False
+            commit = await self._create_document_on_conn(
+                conn, session_key=session_key, session_id=session_id, name=name,
+                kind=ArtifactKind.HTML, initial_artifact=initial_artifact, actor=actor,
+                document_id=self._id_factory("doc"), revision_id=self._id_factory("rev"),
+                created_at=self._clock(),
+            )
+            await self._bind_working_source_on_conn(
+                conn, commit=commit, session_key=session_key, session_id=session_id,
+                working_source=working_source,
+            )
+            return commit, True
+
     async def adopt_generated_deliverable(
         self,
         *,
@@ -909,25 +976,10 @@ class ArtifactSessionRepository:
             )
             binding = await self._get_document_source_binding_on_conn(conn, binding_id)
             if working_source is not None:
-                await conn.execute(
-                    "INSERT INTO artifact_working_files VALUES (?, ?, ?, ?, ?)",
-                    (commit.document.document_id, working_source["workspace"],
-                     working_source["relative_root"], working_source["entrypoint"],
-                     commit.revision.revision_id),
+                await self._bind_working_source_on_conn(
+                    conn, commit=commit, session_key=session_key, session_id=session_id,
+                    working_source=working_source,
                 )
-                await conn.execute("""
-                    INSERT INTO artifact_working_sources (
-                        document_id, session_key, session_id, workspace, source_path,
-                        bundle_mode, bundle_root
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
-                """, (commit.document.document_id, session_key, session_id,
-                       working_source["workspace"], working_source["source_path"],
-                       working_source["bundle_mode"], working_source["bundle_root"] or None))
-                await conn.execute("""
-                    INSERT INTO artifact_working_source_versions VALUES (?, ?, ?, ?, ?, ?)
-                """, (commit.revision.revision_id, commit.document.document_id,
-                       working_source["relative_root"], working_source["entrypoint"],
-                       working_source["bundle_mode"], working_source["bundle_root"] or None))
             return commit, binding, True
 
     async def retire_legacy_html_state(self) -> None:

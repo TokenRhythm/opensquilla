@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import os
 import re
@@ -10,13 +11,17 @@ import sys
 from pathlib import Path
 from unittest.mock import AsyncMock
 
+import pytest
+
 from opensquilla.engine import Agent, AgentConfig, ToolCall, ToolResult
 from opensquilla.engine.history import reconstruct_messages_from_entry
 from opensquilla.engine.runtime import _persisted_tool_result_segment
 from opensquilla.engine.tool_result_store import ToolResultStore
 from opensquilla.engine.types import ToolResultEvent
 from opensquilla.provider import (
+    ChatConfig,
     ContentBlockToolResult,
+    ModelCapabilities,
     TextDeltaEvent,
     ToolDefinition,
     ToolInputSchema,
@@ -24,12 +29,14 @@ from opensquilla.provider import (
 from opensquilla.provider import DoneEvent as ProviderDoneEvent
 from opensquilla.provider import ToolUseEndEvent as ProviderToolUseEndEvent
 from opensquilla.provider import ToolUseStartEvent as ProviderToolUseStartEvent
+from opensquilla.provider.protocol import count_provider_image_blocks
 from opensquilla.tools.builtin import shell
 from opensquilla.tools.builtin.tool_results import retrieve_tool_result
 from opensquilla.tools.dispatch import build_tool_handler
 from opensquilla.tools.output_capture import BoundedOutputCapture
 from opensquilla.tools.registry import ToolRegistry
 from opensquilla.tools.types import ToolContext, ToolSpec, current_execution_log
+from tests.helpers.image_bytes import image_bytes
 
 
 def test_persisted_tool_result_keeps_oversized_json_parseable_with_provider() -> None:
@@ -374,8 +381,9 @@ def test_history_retains_log_reference_when_result_text_is_shortened() -> None:
     assert len(segment["result"]) <= 100
 
 
+@pytest.mark.parametrize("load_image", [False, True])
 async def test_agent_queries_missing_middle_then_finishes_after_real_process_failure(
-    tmp_path: Path,
+    tmp_path: Path, load_image: bool,
 ) -> None:
     """Exercise real pipes/storage/dispatch with a deterministic model decision sequence."""
     marker = "MIDDLE_ERROR: missing synthetic dependency"
@@ -414,13 +422,33 @@ async def test_agent_queries_missing_middle_then_finishes_after_real_process_fai
 
     class Provider:
         provider_name = "deterministic-log-recovery"
+        model = "text-model"
 
         def __init__(self):
             self.calls = 0
             self.log_handle = None
+            self.image_routes = 0
+
+        async def prepare_image_continuation(self, messages, config):
+            assert count_provider_image_blocks(messages) == 1
+            self.image_routes += 1
+            self.model = "vision-model"
+            return config.model_copy(update={
+                "model_vision_support": "supported",
+                "model_capabilities": ModelCapabilities(supports_vision=True),
+            })
 
         def chat(self, messages, tools=None, config=None):
             self.calls += 1
+            assert isinstance(config, ChatConfig)
+            assert config.system == "Complete the synthetic verification."
+            assert {tool.name for tool in tools} == {
+                "load_image", "exec_command", "retrieve_tool_result",
+            }
+            if load_image and self.calls > 1:
+                assert self.model == "vision-model"
+                assert config.model_vision_support == "supported"
+                assert count_provider_image_blocks(messages) == 1
             results = [
                 block for message in messages if isinstance(message.content, list)
                 for block in message.content if isinstance(block, ContentBlockToolResult)
@@ -428,9 +456,13 @@ async def test_agent_queries_missing_middle_then_finishes_after_real_process_fai
             return self.stream(results)
 
         async def stream(self, results):
-            if self.calls == 1:
+            step = self.calls - int(load_image)
+            if step == 0:
+                name, arguments = "load_image", {}
+            elif step == 1:
                 name, arguments = "exec_command", {"command": "test"}
-            elif self.calls == 2:
+            elif step == 2:
+                assert results[-1].is_error
                 assert marker not in results[-1].content
                 match = re.search(
                     r"(?:execution_log_handle: |tool_result_handle=)(tr-[0-9a-f]{32})",
@@ -441,7 +473,7 @@ async def test_agent_queries_missing_middle_then_finishes_after_real_process_fai
                 name, arguments = "retrieve_tool_result", {
                     "handle": self.log_handle, "pattern": "MIDDLE_ERROR",
                 }
-            elif self.calls == 3:
+            elif step == 3:
                 assert marker in results[-1].content
                 name, arguments = "exec_command", {"command": "verify"}
             else:
@@ -457,6 +489,19 @@ async def test_agent_queries_missing_middle_then_finishes_after_real_process_fai
             yield ProviderDoneEvent(stop_reason="tool_use")
 
     provider = Provider()
+    dispatch = build_tool_handler(registry, ctx)
+
+    async def handler(call: ToolCall) -> ToolResult:
+        if call.tool_name != "load_image":
+            return await dispatch(call)
+        ctx.tool_result_media[call.tool_use_id] = [{
+            "mime": "image/png",
+            "data": base64.b64encode(image_bytes()).decode("ascii"),
+        }]
+        return ToolResult(
+            tool_use_id=call.tool_use_id, tool_name=call.tool_name, content="Image loaded.",
+        )
+
     agent = Agent(
         provider=provider,
         config=AgentConfig(
@@ -464,20 +509,26 @@ async def test_agent_queries_missing_middle_then_finishes_after_real_process_fai
             tool_result_store_session_id="synthetic-session",
             tool_result_store_session_key="synthetic-session",
             tool_result_store_agent_id="main",
+            model_id="text-model", model_vision_support="unsupported",
+            model_capabilities=ModelCapabilities(supports_vision=False),
+            preserve_historical_images=True,
+            system_prompt="Complete the synthetic verification.",
         ),
         tool_context=ctx,
-        tool_handler=build_tool_handler(registry, ctx),
+        tool_handler=handler,
         tool_definitions=[ToolDefinition(
             name=name, description="Synthetic test tool",
             input_schema=ToolInputSchema(properties={}, required=[]),
-        ) for name in registry.list_names()],
+        ) for name in ["load_image", *registry.list_names()]],
     )
     events = [event async for event in agent.run_turn("Run the synthetic verification.")]
-    assert provider.calls == 4
+    assert provider.calls == 4 + int(load_image)
+    assert provider.image_routes == int(load_image)
     assert executions == 2
     tool_events = [event for event in events if isinstance(event, ToolResultEvent)]
-    assert len(tool_events) == 3
-    assert tool_events[0].execution_log_handle == provider.log_handle
-    assert tool_events[0].is_error is True
+    assert len(tool_events) == 3 + int(load_image)
+    assert tool_events[int(load_image)].execution_log_handle == provider.log_handle
+    assert tool_events[int(load_image)].is_error is True
     assert tool_events[-1].is_error is False
     assert not any(event.kind == "error" for event in events)
+    assert sum(event.kind == "done" for event in events) == 1

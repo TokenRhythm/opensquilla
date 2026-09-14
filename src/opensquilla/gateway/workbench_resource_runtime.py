@@ -73,7 +73,7 @@ from opensquilla.gateway.session_services import (
     session_id_for_key,
 )
 from opensquilla.gateway.websocket import get_registry
-from opensquilla.html_format import is_html, validate_html
+from opensquilla.html_format import is_html, is_html_preview_path, validate_html
 from opensquilla.paths import media_root_from_config, native_io_path
 from opensquilla.session.attachment_manifest import legacy_attachment_id
 from opensquilla.session.keys import canonicalize_session_key
@@ -701,6 +701,7 @@ def _document_payload(
     binding: DocumentSourceBinding | None,
     publication: DocumentPublication | None,
     trusted_capabilities: bool,
+    preview_pages: list[str] | None = None,
 ) -> dict[str, Any]:
     profile = _format_profile(document.name, head.media_type)
     effective_editable = trusted_capabilities and profile.editable
@@ -749,6 +750,7 @@ def _document_payload(
             ),
         },
         "relations": relations,
+        **({"previewPages": preview_pages} if preview_pages is not None else {}),
     }
 
 
@@ -894,10 +896,11 @@ async def _resource_inventory(
         trusted_capabilities = (
             profile.editable or profile.agent_editable or profile.selection_context
         )
+        preview_pages = None
         if trusted_capabilities:
             try:
-                trusted_capabilities = await asyncio.to_thread(
-                    _bundle_available,
+                preview_pages = await asyncio.to_thread(
+                    _bundle_preview_pages,
                     store,
                     head.artifact_id,
                     session_id=session_id,
@@ -911,6 +914,7 @@ async def _resource_inventory(
                 binding=binding_by_document.get(document.document_id),
                 publication=latest_publication_by_document.get(document.document_id),
                 trusted_capabilities=trusted_capabilities,
+                preview_pages=preview_pages,
             )
         )
     attachment_resources = [
@@ -2385,6 +2389,24 @@ __all__ = [
 def _bundle_available(store: ArtifactStore, artifact_id: str, *, session_id: str) -> bool:
     store.validate_preview_bundle(artifact_id, session_id=session_id)
     return True
+
+
+def _bundle_preview_pages(
+    store: ArtifactStore, artifact_id: str, *, session_id: str,
+) -> list[str]:
+    """Project only HTML members of the verified, bounded head material."""
+    manifest = store.validate_preview_bundle(artifact_id, session_id=session_id)
+    if manifest is None:
+        ref, _path = store.resolve_for_download(artifact_id, session_id=session_id)
+        return [ref.name] if (
+            is_html_preview_path(ref.name)
+            and ref.mime.split(";", 1)[0].strip().lower() in _HTML_MIMES
+        ) else []
+    return [
+        item.path for item in manifest.files
+        if is_html_preview_path(item.path)
+        and item.mime.split(";", 1)[0].strip().lower() in _HTML_MIMES
+    ]
 
 
 async def ensure_document_working_files(

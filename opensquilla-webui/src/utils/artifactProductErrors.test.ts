@@ -8,6 +8,12 @@ import {
   isKnownArtifactProductErrorCode,
 } from './artifactProductErrors'
 import { mapArtifactProductFailure } from '@/adapters/gateway/artifactErrorMapping'
+import en from '@/locales/en.json'
+import zhHans from '@/locales/zh-Hans.json'
+import de from '@/locales/de.json'
+import es from '@/locales/es.json'
+import fr from '@/locales/fr.json'
+import ja from '@/locales/ja.json'
 
 function mapped(
   code: string,
@@ -86,6 +92,29 @@ describe('artifact product error classification', () => {
     const error = artifactProductClientError('DOCUMENT_UNAVAILABLE') as Error & { code?: string }
     expect(error.code).toBe('DOCUMENT_UNAVAILABLE')
     expect(error.message).toBe('This page is temporarily unavailable. Try again.')
+  })
+
+  it('classifies unsupported subpage navigation as an upgrade action without exposing diagnostics', () => {
+    const classified = classifyArtifactProductError(mapped('PREVIEW_PAGE_UNSUPPORTED'))
+    expect(classified).toMatchObject({
+      code: 'PREVIEW_PAGE_UNSUPPORTED', messageKey: 'workbench.artifactErrors.previewPageUnsupported',
+      recovery: 'ask-user', retryable: false,
+      fallbackMessage: 'This client or Gateway does not support opening this subpage directly. Update and try again.',
+    })
+    expect(classified.fallbackMessage).not.toContain('private detail')
+    expect(isKnownArtifactProductErrorCode('PREVIEW_PAGE_UNSUPPORTED')).toBe(true)
+    expect(artifactProductClientError('PREVIEW_PAGE_UNSUPPORTED').message).toBe(classified.fallbackMessage)
+  })
+
+  it('has localized subpage guidance for all six supported locales', () => {
+    const english = en.workbench.artifactErrors.previewPageUnsupported
+    for (const locale of [en, zhHans, de, es, fr, ja]) {
+      expect(locale.workbench.artifactErrors.previewPageUnsupported).toEqual(expect.any(String))
+      expect(locale.workbench.artifactErrors.previewPageUnsupported.length).toBeGreaterThan(0)
+      if (locale !== en) expect(locale.workbench.artifactErrors.previewPageUnsupported).not.toBe(english)
+    }
+    expect(zhHans.workbench.artifactErrors.previewPageUnsupported)
+      .toBe('当前客户端或 Gateway 不支持直接打开此子页。请升级后重试。')
   })
 
   it('carries only a stable reason code for localized unsupported resources', () => {

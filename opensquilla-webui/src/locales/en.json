@@ -1,4 +1,14 @@
 {
+  "resourceActions": {
+    "more": "File actions", "preview": "Preview in app", "openSource": "Open with default app",
+    "reveal": "Show in file manager", "revealFinder": "Reveal in Finder", "revealExplorer": "Show in File Explorer",
+    "openCopy": "Open a local copy", "saveAs": "Save as…", "copyPath": "Copy path",
+    "copyGatewayPath": "Copy server path", "copyContents": "Copy file contents", "saved": "File saved",
+    "singleFile": "Save this HTML file only; linked styles, images and pages are not included.",
+    "textOnly": "Copy supports UTF-8 text up to 1 MiB. Save this file instead.",
+    "unavailable": "The current source file is unavailable. Existing previews and downloads are unchanged.",
+    "failed": "The file action failed."
+  },
   "workspaces": {
     "projects": "Projects",
     "createProject": "Create project",
@@ -257,6 +267,7 @@
       "permissionDenied": "You do not have permission to update this page.",
       "previewCapabilityExpired": "The preview needs to be reopened.",
       "previewRendererFailed": "The preview could not be displayed. Try reopening it.",
+      "previewPageUnsupported": "This client or Gateway does not support opening this subpage directly. Update and try again.",
       "annotationUnavailable": "This annotation is temporarily unavailable.",
       "annotationBusy": "Annotations are being updated. Wait a moment and try again.",
       "invalidRequest": "The request could not be completed. Check the input and try again.",

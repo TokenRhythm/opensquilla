@@ -3,7 +3,9 @@ import { spawnSync } from 'node:child_process'
 import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
-import { fileURLToPath, pathToFileURL } from 'node:url'
+import { fileURLToPath } from 'node:url'
+
+import { loadNsisTooling } from './prepare-installer-tooling.mjs'
 
 import {
   INSTALLER_PROGRESS_INCLUDE,
@@ -72,25 +74,6 @@ assert.ok(
 
 function nsisPath(path) {
   return process.platform === 'win32' ? path : path.replaceAll('\\', '/')
-}
-
-async function loadNsisTooling() {
-  const appBuilderLibOutput = join(appBuilderLib, 'out')
-  const nsisUtilImport = await import(
-    pathToFileURL(join(appBuilderLibOutput, 'targets', 'nsis', 'nsisUtil.js')).href
-  )
-  const windowsToolsetImport = await import(pathToFileURL(join(appBuilderLibOutput, 'toolsets', 'windows.js')).href)
-  const nsisUtil = nsisUtilImport.default ?? nsisUtilImport
-  const windowsToolset = windowsToolsetImport.default ?? windowsToolsetImport
-  const makensis = await windowsToolset.getMakeNsisPath(
-    packageJson.build?.toolsets?.nsis,
-    packageJson.build?.nsis?.customNsisBinary,
-  )
-  return {
-    executable: makensis.path,
-    env: makensis.env ?? {},
-    templatesDir: nsisUtil.nsisTemplatesDir,
-  }
 }
 
 async function verifyInstallFilesControls(tooling) {
@@ -167,7 +150,11 @@ SectionEnd
     'utf8',
   )
 
-  const tooling = await loadNsisTooling()
+  // CI consumes only the prepared paths: a missing manifest fails, never downloads.
+  const preparedPath = process.env.OPENSQUILLA_INSTALLER_TOOLING_FILE
+  const tooling = preparedPath
+    ? JSON.parse(await readFile(preparedPath, 'utf8'))
+    : await loadNsisTooling()
   await verifyInstallFilesControls(tooling)
   compileFixture(tooling, installerFixture)
   compileFixture(tooling, uninstallerFixture)

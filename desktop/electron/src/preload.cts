@@ -20,6 +20,8 @@ if (process.isMainFrame) contextBridge.exposeInMainWorld('opensquillaDesktop', {
   saveDesktopPreferences: (payload: unknown) => ipcRenderer.invoke('desktop:preferences:save', payload),
   setNativeTheme: (payload: unknown) => ipcRenderer.invoke('desktop:theme:set', payload),
   openArtifact: (payload: unknown) => ipcRenderer.invoke('desktop:artifact:open', payload),
+  saveArtifact: (payload: unknown) => ipcRenderer.invoke('desktop:artifact:save', payload),
+  sourceFileAction: (payload: unknown) => ipcRenderer.invoke('desktop:source-file:action', payload),
   chooseProjectDirectory: (payload: unknown) => (
     ipcRenderer.invoke('desktop:workspace:choose-directory', payload)
   ),
