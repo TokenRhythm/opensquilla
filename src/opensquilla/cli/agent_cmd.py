@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import copy
 import getpass
 import json
@@ -462,12 +463,19 @@ async def run_agent_once(
 
         growth_sink = getattr(svc, "growth_event_sink", None)
         record_launch = getattr(growth_sink, "record_client_launch", None)
-        if callable(record_launch):
+        # Internal coding Agents retain turn/tool diagnostics, but their
+        # disposable profiles must not inflate CLI users or launch counts.
+        # Stateless is independent: a user's stateless CLI run still counts.
+        if callable(record_launch) and os.environ.get("OPENSQUILLA_CODETASK_CHILD") != "1":
             await record_launch(
                 surface=ClientSurface.CLI,
                 entrypoint=ClientEntrypoint.AGENT,
                 execution_mode=ExecutionMode.ONE_SHOT,
             )
+        record_active = getattr(growth_sink, "record_product_active", None)
+        if callable(record_active) and os.environ.get("OPENSQUILLA_CODETASK_CHILD") != "1":
+            with contextlib.suppress(Exception):
+                await record_active(surface=ClientSurface.CLI)
 
         async for event in runner.run(
             message,

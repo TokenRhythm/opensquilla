@@ -122,8 +122,8 @@ SESSIONS_LIST_LITERAL_ALLOWLIST: Counter[str] = Counter(
 SESSIONS_LIST_GATEWAY_ADAPTER = PACKAGE_ROOT / "gateway" / "adapters" / "sessions_list_contract.py"
 # The retired 20-method RPC surface is absent; exact inventory remains pinned
 # so this does not authorize unrelated wire growth.
-RUNTIME_RPC_METHOD_BASELINE = 291
-RUNTIME_RPC_METHOD_DIGEST = "950d9d6735c071e6110c4dbceb68c89d5054a466fa3045d0ab9a6d582555f724"
+RUNTIME_RPC_METHOD_BASELINE = 292
+RUNTIME_RPC_METHOD_DIGEST = "d88518a11f3f1b99f96066b5acf0586f51365f4e308eff7ff518094f9e484913"
 STATIC_RPC_DECORATOR_BASELINE = 77
 
 # Physical lines in the sessions/runtime slice remain tracked for the final
@@ -1288,6 +1288,7 @@ def test_static_rpc_decorator_sites_are_exact_and_contract_methods_are_adapter_r
             "logs.tail",
             "telemetry.consent.set",
             "telemetry.client_launch.record",
+            "telemetry.product_active.record",
             "plugin.approval.status",
             "plugin.approval.resolve",
             "plugin.approval.extend",

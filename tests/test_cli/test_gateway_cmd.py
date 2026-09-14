@@ -1223,6 +1223,60 @@ def _install_fake_start(server, holder, monkeypatch) -> None:
     monkeypatch.setattr(gateway_cmd, "start_gateway_server", fake_start)
 
 
+@pytest.mark.parametrize(
+    ("profile_kind", "desktop_env", "expected_surface"),
+    [
+        (None, None, "cli"),
+        ("desktop-primary", "1", "desktop"),
+        ("desktop-recovery", "1", "desktop"),
+        (None, "1", "desktop"),
+        (None, "0", "cli"),
+        ("cli", "1", "cli"),
+    ],
+)
+def test_gateway_run_records_launch_for_owning_surface(
+    tmp_path, monkeypatch, profile_kind, desktop_env, expected_surface
+) -> None:
+    config = tmp_path / "config.toml"
+    config.write_text('host = "127.0.0.1"\nport = 18791\n', encoding="utf-8")
+    monkeypatch.setenv("OPENSQUILLA_STATE_DIR", str(tmp_path))
+    for key, value in (
+        ("OPENSQUILLA_PROFILE_KIND", profile_kind),
+        ("OPENSQUILLA_DESKTOP", desktop_env),
+    ):
+        if value is None:
+            monkeypatch.delenv(key, raising=False)
+        else:
+            monkeypatch.setenv(key, value)
+
+    calls: list[dict[str, object]] = []
+
+    async def record_launch(**kwargs: object) -> bool:
+        calls.append(kwargs)
+        return True
+
+    server = _ShutdownProbeServer(fire="api_shutdown", via="http")
+    server._services = SimpleNamespace(
+        growth_event_sink=SimpleNamespace(record_client_launch=record_launch)
+    )
+    _install_fake_start(server, {}, monkeypatch)
+    monkeypatch.setattr(gateway_cmd, "_gateway_bind_available", lambda *_args: True)
+    monkeypatch.setattr(gateway_cmd, "_install_shutdown_handlers", lambda *_args: [])
+
+    gateway_cmd.run_gateway(
+        port=None, bind=None, listen="", debug=False, config_path=str(config)
+    )
+
+    assert calls == [
+        {
+            "surface": expected_surface,
+            "entrypoint": "gateway_run",
+            "execution_mode": "gateway",
+        }
+    ]
+    assert server.closed == ["api_shutdown"]
+
+
 def test_gateway_run_drains_via_close_on_shutdown_signal(tmp_path, monkeypatch) -> None:
     """A delivered SIGTERM must trigger server.close() (the graceful drain)."""
     config = tmp_path / "gw.toml"

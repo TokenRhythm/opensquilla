@@ -359,6 +359,11 @@ async def run_tui_runtime(
                 if not user_input.strip():
                     continue
 
+                # Observe at submission, including slash commands and busy-turn
+                # steering, without handing input content to the activity hook.
+                with contextlib.suppress(Exception):
+                    await hooks.on_user_activity()
+
                 category = config.classify_input(user_input)
 
                 if (

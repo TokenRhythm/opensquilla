@@ -22,6 +22,7 @@ from opensquilla.gateway.adapters.contract_method import (
 TELEMETRY_CONTRACT_METHODS: Final = (
     "telemetry.consent.set",
     "telemetry.client_launch.record",
+    "telemetry.product_active.record",
 )
 
 

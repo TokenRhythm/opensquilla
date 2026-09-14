@@ -1,15 +1,13 @@
-"""Effective consent policy for isolated telemetry scopes.
+"""Unified upload preference with independent runtime vetoes for each stream.
 
-Persisted choices and runtime vetoes are kept separate on purpose: a CI or
-kill-switch pause must never manufacture consent, erase an explicit decline,
-or mutate the operator's saved decision.
+The public consent-shaped state remains compatible with existing producers.
+Its allowed state expresses upload policy, not a newly authored consent record.
 """
 
 from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
-from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Any
 
@@ -67,8 +65,6 @@ class ScopeConsentState:
     def enabled(self) -> bool:
         return (
             self.decision is ConsentDecision.GRANTED
-            and self.record_complete
-            and self.notice_current
             and not self.forced_off_reasons
         )
 
@@ -82,16 +78,8 @@ class ScopeConsentState:
 
     @property
     def local_state_directive(self) -> LocalStateDirective:
-        """Return the narrow cleanup action implied by persisted consent.
+        """The unified V1 preference pauses retained telemetry state."""
 
-        Only an explicit, persisted decline authorizes deletion.  Runtime
-        vetoes such as CI, DNT, or a remote pause merely stop collection and
-        sending; they must leave the independently consented scope's queue and
-        identity untouched.
-        """
-
-        if self.persistently_disabled:
-            return LocalStateDirective.WIPE_SCOPE
         return LocalStateDirective.KEEP
 
     def allowed_at(self, checkpoint: ConsentCheckpoint | str) -> bool:
@@ -115,26 +103,8 @@ class ScopeConsentState:
             reasons.append("consent:unset")
         elif self.decision is ConsentDecision.DECLINED:
             reasons.append("consent:declined")
-        elif not self.record_complete:
-            reasons.append("consent:incomplete")
-        elif not self.notice_current:
-            reasons.append("consent:notice_stale")
         reasons.extend(self.forced_off_reasons)
         return tuple(reasons)
-
-
-_SCOPE_CONFIG_FIELDS = {
-    TelemetryScope.RELIABILITY: (
-        "reliability_diagnostics_enabled",
-        "reliability_notice_version",
-        "reliability_consented_at_utc",
-    ),
-    TelemetryScope.GROWTH: (
-        "product_analytics_enabled",
-        "product_analytics_notice_version",
-        "product_analytics_consented_at_utc",
-    ),
-}
 
 
 def resolve_scope_consent(
@@ -146,36 +116,25 @@ def resolve_scope_consent(
     transient_forced_off: bool = False,
     transient_reason: str = "remote_policy",
 ) -> ScopeConsentState:
-    """Resolve whether one telemetry scope may collect or upload now.
+    """Use the V1 global opt-out policy at both collection and upload boundaries.
 
-    Only the literal boolean ``True`` is a grant.  Missing metadata, malformed
-    UTC timestamps, stale notices, legacy/global privacy switches, DNT, and
-    automated environments all fail closed without changing saved consent.
+    Old scoped declines remain a total opt-out until config migration retires
+    those fields. Notice versions describe the event protocol and never require
+    an additional user prompt or a fabricated consent timestamp.
     """
 
     normalized_scope = TelemetryScope(scope)
-    enabled_field, notice_field, timestamp_field = _SCOPE_CONFIG_FIELDS[normalized_scope]
     privacy = getattr(config, "privacy", None)
-    configured_enabled = getattr(privacy, enabled_field, None)
-    notice_version = _nonempty_string(getattr(privacy, notice_field, None))
-    consented_at_utc = _nonempty_string(getattr(privacy, timestamp_field, None))
-
-    if configured_enabled is True:
-        decision = ConsentDecision.GRANTED
-    elif configured_enabled is False:
-        decision = ConsentDecision.DECLINED
-    else:
-        decision = ConsentDecision.UNSET
-
-    record_complete = (
-        decision is ConsentDecision.GRANTED
-        and notice_version is not None
-        and _is_utc_timestamp(consented_at_utc)
+    disabled = (
+        getattr(privacy, "disable_network_observability", False) is True
+        or getattr(privacy, "reliability_diagnostics_enabled", None) is False
+        or getattr(privacy, "product_analytics_enabled", None) is False
     )
-    required_notice = (
-        _nonempty_string(required_notice_version) or _CURRENT_NOTICE_VERSIONS[normalized_scope]
-    )
-    notice_current = notice_version == required_notice
+    decision = ConsentDecision.DECLINED if disabled else ConsentDecision.GRANTED
+    notice_version = _CURRENT_NOTICE_VERSIONS[normalized_scope]
+    # Retained call signature for older callers; authorization no longer depends
+    # on a consent-record version. Event schemas enforce their own versions.
+    del required_notice_version
     forced_reasons = list(
         telemetry_scope_forced_off_reasons(
             normalized_scope.value,
@@ -191,9 +150,9 @@ def resolve_scope_consent(
         scope=normalized_scope,
         decision=decision,
         notice_version=notice_version,
-        consented_at_utc=consented_at_utc,
-        record_complete=record_complete,
-        notice_current=notice_current,
+        consented_at_utc=None,
+        record_complete=not disabled,
+        notice_current=True,
         forced_off_reasons=tuple(dict.fromkeys(forced_reasons)),
     )
 
@@ -260,14 +219,3 @@ def _nonempty_string(value: object) -> str | None:
         return None
     text = value.strip()
     return text or None
-
-
-def _is_utc_timestamp(value: str | None) -> bool:
-    if value is None:
-        return False
-    candidate = f"{value[:-1]}+00:00" if value.endswith(("Z", "z")) else value
-    try:
-        parsed = datetime.fromisoformat(candidate)
-    except ValueError:
-        return False
-    return parsed.tzinfo is not None and parsed.utcoffset() == UTC.utcoffset(parsed)

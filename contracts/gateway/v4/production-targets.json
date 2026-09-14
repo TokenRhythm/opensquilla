@@ -2,6 +2,11 @@
   "format": 1,
   "targets": [
     {
+      "kind": "method",
+      "wireName": "telemetry.product_active.record",
+      "roles": ["result"]
+    },
+    {
       "kind": "event",
       "wireName": "transport.flow.dirty",
       "roles": ["payload"]

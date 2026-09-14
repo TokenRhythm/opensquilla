@@ -77,8 +77,8 @@ def _recorders(
 
 def _config(
     *,
-    reliability: bool | None = True,
-    growth: bool | None = True,
+    reliability: bool | None = None,
+    growth: bool | None = None,
     global_disabled: bool = False,
 ) -> SimpleNamespace:
     return SimpleNamespace(
@@ -261,16 +261,13 @@ async def test_claim_restore_falls_back_when_nofollow_utime_is_unavailable(
 @pytest.mark.parametrize(
     ("config", "payload"),
     [
-        (_config(reliability=False), _reliability_payload()),
-        (_config(reliability=None), _reliability_payload()),
-        (_config(growth=False), _growth_payload()),
         (
             _config(),
             _reliability_payload(notice_version="reliability-older"),
         ),
     ],
 )
-async def test_persistent_or_invalid_consent_deletes_event(
+async def test_invalid_event_notice_is_deleted(
     tmp_path: Path,
     config: SimpleNamespace,
     payload: dict[str, object],
@@ -325,6 +322,47 @@ async def test_temporary_forced_off_restores_valid_authorized_event(
     assert received == []
     assert ready.exists()
     assert not list((tmp_path / "reliability").glob("*.processing.*"))
+
+
+@pytest.mark.parametrize("disabled_field", [
+    "disable_network_observability",
+    "reliability_diagnostics_enabled",
+    "product_analytics_enabled",
+])
+@pytest.mark.parametrize("scope", ["reliability", "growth"])
+async def test_unified_decline_preserves_both_spools_and_reenable_resumes(
+    tmp_path: Path,
+    disabled_field: str,
+    scope: str,
+) -> None:
+    config = _config()
+    setattr(config.privacy, disabled_field, disabled_field == "disable_network_observability")
+    payload = _reliability_payload() if scope == "reliability" else _growth_payload()
+    ready = _write_ready(tmp_path, scope, payload)
+    received: list[object] = []
+    recorders = _recorders(config, received.append)
+
+    paused = await drain_desktop_early_spool(
+        tmp_path, config=config, recorders=recorders, env={}, now=NOW,
+    )
+
+    assert paused.retried == 1
+    assert paused.rejected == 0
+    assert received == []
+    assert ready.exists()
+    assert not list((tmp_path / scope).glob("*.processing.*"))
+
+    config.privacy.disable_network_observability = False
+    config.privacy.reliability_diagnostics_enabled = None
+    config.privacy.product_analytics_enabled = None
+    resumed = await drain_desktop_early_spool(
+        tmp_path, config=config, recorders=recorders, env={}, now=NOW,
+    )
+
+    assert resumed.enqueued == 1
+    assert resumed.rejected == 0
+    assert len(received) == 1
+    assert not ready.exists()
 
 
 async def test_enqueue_failure_restores_ready_for_idempotent_retry(tmp_path: Path) -> None:

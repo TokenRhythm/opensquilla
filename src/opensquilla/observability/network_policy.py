@@ -118,11 +118,9 @@ def telemetry_scope_forced_off_reasons(
 ) -> tuple[str, ...]:
     """Return transient/global vetoes for one scoped telemetry stream.
 
-    This function intentionally does not inspect the scope's persisted consent
-    value.  A user decision of ``False`` is durable opt-out state, whereas the
-    reasons returned here are effective-policy vetoes that must not rewrite or
-    erase that decision.  Callers can therefore pause for CI or a remote/global
-    kill switch and later resume only an independently valid consent record.
+    Both streams share the persisted global preference. Legacy per-stream
+    environment switches remain compatible administrative vetoes. A runtime
+    pause must not rewrite the saved preference or erase retained state.
     """
 
     normalized_scope = str(scope).strip().lower()

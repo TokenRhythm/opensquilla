@@ -44,7 +44,7 @@ function validateConsentMirrorForWrite(mirror: ConsentMirror): void {
       state.enabled === true
       && (
         !isSafeTelemetryVersion(state.notice_version)
-        || !isUtcConsentTimestamp(state.consented_at_utc)
+        || (state.consented_at_utc !== null && !isUtcConsentTimestamp(state.consented_at_utc))
       )
     ) {
       throw new TypeError(`Enabled ${scope} consent requires valid metadata.`)
@@ -289,7 +289,7 @@ export function resolveMirroredConsent(
       blockReason: 'consent_declined',
     }
   }
-  if (state.notice_version === null || state.consented_at_utc === null) {
+  if (state.notice_version === null) {
     return {
       scope,
       enabled: false,

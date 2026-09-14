@@ -17,7 +17,6 @@ from pathlib import Path
 from typing import Any
 
 from opensquilla.telemetry.consent import (
-    ConsentDecision,
     TelemetryScope,
     resolve_scope_consent,
 )
@@ -395,17 +394,10 @@ async def drain_desktop_early_spool(
                 env=env,
                 transient_forced_off=transient_forced_off,
             )
-            if (
-                consent.decision is not ConsentDecision.GRANTED
-                or not consent.record_complete
-                or not consent.notice_current
-                or event.notice_version != consent.notice_version
-            ):
-                raise _RejectedIngressError("telemetry scope consent is not currently valid")
-            if consent.forced_off:
-                raise _RetryableIngressError("telemetry scope is temporarily forced off")
+            if event.notice_version != consent.notice_version:
+                raise _RejectedIngressError("telemetry event notice version is not current")
             if not consent.enabled:
-                raise _RejectedIngressError("telemetry scope consent is not currently valid")
+                raise _RetryableIngressError("telemetry uploads are paused")
         except _RejectedIngressError:
             _unlink_best_effort(processing)
             rejected += 1
@@ -422,18 +414,8 @@ async def drain_desktop_early_spool(
                 retried += 1
             continue
         if record_result.status is RecordStatus.CONSENT_BLOCKED:
-            consent = resolve_scope_consent(
-                candidate.scope,
-                config=config,
-                env=env,
-                transient_forced_off=transient_forced_off,
-            )
-            if consent.forced_off:
-                if _restore_processing_claim(processing, candidate.path, now_timestamp):
-                    retried += 1
-            else:
-                _unlink_best_effort(processing)
-                rejected += 1
+            if _restore_processing_claim(processing, candidate.path, now_timestamp):
+                retried += 1
             continue
         if record_result.status is RecordStatus.NOTICE_MISMATCH:
             _unlink_best_effort(processing)

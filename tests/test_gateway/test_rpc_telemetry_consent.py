@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import tomllib
@@ -23,6 +24,7 @@ from opensquilla.gateway.rpc_config import (
 )
 from opensquilla.gateway.rpc_telemetry import (
     _handle_client_launch_record,
+    _handle_product_active_record,
     _handle_telemetry_consent_set,
 )
 from opensquilla.gateway.scopes import METHOD_SCOPES, WRITE_SCOPE
@@ -33,11 +35,10 @@ from opensquilla.telemetry.coordination import (
 )
 from opensquilla.telemetry.desktop_state import (
     desktop_consent_mirror_path,
-    desktop_early_spool_root,
 )
 from opensquilla.telemetry.growth.state import (
-    gateway_growth_milestone_state_path,
     growth_cohort_state_path,
+    write_active_growth_cohort,
 )
 from opensquilla.telemetry.identity import (
     TelemetryIdentityKind,
@@ -63,21 +64,11 @@ _VETO_ENV = (
 def _clear_runtime_vetoes(monkeypatch: pytest.MonkeyPatch) -> None:
     for name in _VETO_ENV:
         monkeypatch.delenv(name, raising=False)
-    real_reasons = rpc_telemetry.telemetry_scope_forced_off_reasons
     real_resolve = consent_transition.resolve_scope_consent
 
     def filtered_env() -> dict[str, str]:
         return {key: value for key, value in os.environ.items() if key != "PYTEST_CURRENT_TEST"}
 
-    monkeypatch.setattr(
-        rpc_telemetry,
-        "telemetry_scope_forced_off_reasons",
-        lambda scope, *, config: real_reasons(
-            scope,
-            config=config,
-            env=filtered_env(),
-        ),
-    )
     monkeypatch.setattr(
         consent_transition,
         "resolve_scope_consent",
@@ -183,6 +174,47 @@ async def test_client_launch_rpc_rejects_client_dimensions(tmp_path: Path) -> No
     assert raised.value.code == "INVALID_REQUEST"
 
 
+@pytest.mark.parametrize("surface", ["desktop", "web", "tui", "cli"])
+async def test_product_active_rpc_only_forwards_surface(tmp_path: Path, surface: str) -> None:
+    calls: list[dict[str, object]] = []
+
+    class Sink:
+        async def record_product_active(self, **kwargs: object) -> bool:
+            calls.append(kwargs)
+            return True
+
+    context = _context(_config(tmp_path), scopes=("operator.admin",))
+    context.turn_runner = type("Runner", (), {"growth_event_sink": Sink()})()
+    assert await _handle_product_active_record({"surface": surface}, context) == {"recorded": True}
+    assert calls == [{"surface": surface}]
+    assert METHOD_SCOPES["telemetry.product_active.record"] == WRITE_SCOPE
+
+
+@pytest.mark.parametrize("params", [
+    None, {}, {"surface": "unknown"}, {"surface": 1},
+    {"surface": "web", "analytics_user_id": "forged"},
+    {"surface": "desktop", "occurred_at_utc": _NOW},
+    {"surface": "tui", "prompt": "synthetic"},
+])
+async def test_product_active_rpc_rejects_extra_fields(tmp_path: Path, params: Any) -> None:
+    context = _context(_config(tmp_path), scopes=("operator.admin",))
+    with pytest.raises(RpcHandlerError) as raised:
+        await _handle_product_active_record(params, context)
+    assert raised.value.code == "INVALID_REQUEST"
+
+
+async def test_product_active_rpc_requires_authenticated_owner(tmp_path: Path) -> None:
+    context = _context(_config(tmp_path), scopes=("operator.write",))
+    with pytest.raises(RpcHandlerError) as raised:
+        await _handle_product_active_record({"surface": "web"}, context)
+    assert raised.value.code == "UNAUTHORIZED"
+
+
+async def test_product_active_rpc_without_sink_is_noop(tmp_path: Path) -> None:
+    context = _context(_config(tmp_path), scopes=("operator.admin",))
+    assert await _handle_product_active_record({"surface": "web"}, context) == {"recorded": False}
+
+
 @pytest.mark.parametrize(
     "params",
     [
@@ -278,307 +310,154 @@ async def test_rpc_uses_injected_or_process_shared_scope_coordinator(
     assert shared.revision(TelemetryScope.GROWTH) == before + 1
 
 
-async def test_server_authors_current_notice_and_utc_timestamp(
+@pytest.mark.parametrize("scope", ["reliability", "growth"])
+async def test_legacy_rpc_controls_both_streams_without_new_consent_metadata(
     tmp_path: Path,
+    scope: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(rpc_telemetry, "_utc_now", lambda: _NOW)
     config = _config(tmp_path)
+    context = _context(config)
+    disabled = await _handle_telemetry_consent_set({"scope": scope, "enabled": False}, context)
+    assert disabled["enabled"] is False
+    assert disabled["changed"] is True
+    assert disabled["cleanupPerformed"] is False
+    assert config.privacy.disable_network_observability
+    assert _mirror(config)["reliability"]["enabled"] is False
+    assert _mirror(config)["growth"]["enabled"] is False
 
-    result = await _handle_telemetry_consent_set(
-        {"scope": "reliability", "enabled": True},
-        _context(config),
-    )
-
-    assert result == {
-        "scope": "reliability",
+    enabled = await _handle_telemetry_consent_set({"scope": scope, "enabled": True}, context)
+    assert enabled == {
+        "scope": scope,
         "enabled": True,
-        "noticeVersion": "reliability-v1",
+        "noticeVersion": "reliability-v1" if scope == "reliability" else "growth-v2",
         "consentedAtUtc": _NOW,
         "changed": True,
         "cleanupPerformed": False,
         "cleanupComplete": True,
     }
-    assert config.privacy.reliability_diagnostics_enabled is True
-    assert config.privacy.reliability_notice_version == "reliability-v1"
-    assert config.privacy.reliability_consented_at_utc == _NOW
-    persisted = tomllib.loads((tmp_path / "config.toml").read_text(encoding="utf-8"))
-    assert persisted["privacy"]["reliability_diagnostics_enabled"] is True
-    assert persisted["privacy"]["reliability_notice_version"] == "reliability-v1"
-    assert persisted["privacy"]["reliability_consented_at_utc"] == _NOW
-    assert _mirror(config)["reliability"] == {
-        "enabled": True,
-        "notice_version": "reliability-v1",
-        "consented_at_utc": _NOW,
-        "forced_off": False,
-    }
+    assert not config.privacy.disable_network_observability
+    persisted = tomllib.loads((tmp_path / "config.toml").read_text(encoding="utf-8"))["privacy"]
+    assert persisted["disable_network_observability"] is False
+    for stream in ("reliability", "growth"):
+        mirror = _mirror(config)[stream]
+        assert mirror["enabled"] is True
+        assert mirror["consented_at_utc"] is None
+    assert config.privacy.reliability_diagnostics_enabled is None
+    assert config.privacy.product_analytics_enabled is None
 
 
-async def test_declined_scope_is_cleaned_before_it_can_be_enabled(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    config = _config(tmp_path, reliability=False)
-    order: list[str] = []
-
-    async def cleanup(*, scope: TelemetryScope, config: GatewayConfig) -> None:
-        assert scope is TelemetryScope.RELIABILITY
-        assert config.privacy.reliability_diagnostics_enabled is False
-        assert _mirror(config)["reliability"]["enabled"] is False
-        order.append("cleanup")
-
-    real_persist = rpc_telemetry.persist_gateway_config
-
-    def persist(candidate: GatewayConfig) -> None:
-        order.append("persist")
-        real_persist(candidate)
-
-    monkeypatch.setattr(rpc_telemetry, "persist_gateway_config", persist)
-    monkeypatch.setattr(rpc_telemetry, "_utc_now", lambda: _NOW)
-
-    result = await _handle_telemetry_consent_set(
-        {"scope": "reliability", "enabled": True},
-        _context(config, cleanup=cleanup),
-    )
-
-    assert order == ["cleanup", "persist"]
-    assert result["cleanupPerformed"] is True
-    assert config.privacy.reliability_diagnostics_enabled is True
-
-
-async def test_pre_enable_cleanup_failure_keeps_decline_closed(
+async def test_pause_and_resume_preserve_existing_identity_cohort_and_queued_state(
     tmp_path: Path,
 ) -> None:
-    config = _config(tmp_path, reliability=False)
+    config = _config(tmp_path)
+    identity_path = identity_state_path(TelemetryIdentityKind.ANALYTICS_USER, config=config)
+    identity = load_or_create_identity(identity_path, TelemetryIdentityKind.ANALYTICS_USER)
+    cohort_path = growth_cohort_state_path(config=config)
+    write_active_growth_cohort(cohort_path, activated_at_utc=_NOW)
+    queued = identity_path.parent / "growth_metaskill_usage.json"
+    queued.write_text('{"fixture":"retained"}', encoding="utf-8")
 
-    async def cleanup(**_: object) -> None:
-        raise OSError("synthetic cleanup failure")
+    async def forbidden_cleanup(**_: object) -> None:
+        pytest.fail("The V1 upload switch must not invoke withdrawal cleanup")
 
-    with pytest.raises(RpcHandlerError) as raised:
-        await _handle_telemetry_consent_set(
-            {"scope": "reliability", "enabled": True},
-            _context(config, cleanup=cleanup),
+    context = _context(config, cleanup=forbidden_cleanup, eligibility_cleanup=forbidden_cleanup)
+    for enabled in (False, True):
+        result = await _handle_telemetry_consent_set(
+            {"scope": "growth", "enabled": enabled}, context,
         )
+        assert result["cleanupPerformed"] is False
+        assert load_or_create_identity(
+            identity_path, TelemetryIdentityKind.ANALYTICS_USER,
+        ).value == identity.value
+        assert cohort_path.exists()
+        assert queued.read_text(encoding="utf-8") == '{"fixture":"retained"}'
 
-    assert raised.value.code == "TELEMETRY_CONSENT_CLEANUP_FAILED"
-    assert raised.value.accepted is False
-    assert config.privacy.reliability_diagnostics_enabled is False
-    assert _mirror(config)["reliability"]["enabled"] is False
-    assert not (tmp_path / "config.toml").exists()
+
+@pytest.mark.parametrize("method", ["legacy_rpc", "config_set"])
+async def test_migrated_decline_can_be_reenabled_and_stays_enabled_after_reload(
+    tmp_path: Path,
+    method: str,
+) -> None:
+    config_file = tmp_path / "config.toml"
+    config_file.write_text(
+        '[privacy]\nproduct_analytics_enabled = false\n'
+        'product_analytics_notice_version = "growth-v1"\n',
+        encoding="utf-8",
+    )
+    config = GatewayConfig.load(str(config_file), read_only=True)
+    config.state_dir = str(tmp_path / "state")
+    assert config.privacy.disable_network_observability
+    if method == "legacy_rpc":
+        await _handle_telemetry_consent_set(
+            {"scope": "reliability", "enabled": True}, _context(config),
+        )
+    else:
+        await _handle_config_set(
+            {"path": "privacy.disable_network_observability", "value": False},
+            _context(config, scopes=("operator.admin",)),
+        )
+    persisted = tomllib.loads(config_file.read_text(encoding="utf-8"))["privacy"]
+    assert persisted == {"disable_network_observability": False}
+    reloaded = GatewayConfig.load(str(config_file), read_only=True)
+    assert not reloaded.privacy.disable_network_observability
 
 
-async def test_persist_failure_does_not_open_gate_or_run_withdrawal_cleanup(
+async def test_persist_failure_keeps_both_live_gates_unchanged(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    config = _config(tmp_path, reliability=True)
-    cleanup_calls: list[TelemetryScope] = []
+    config = _config(tmp_path)
 
-    async def cleanup(*, scope: TelemetryScope, config: GatewayConfig) -> None:
-        cleanup_calls.append(scope)
-
-    def fail_persist(_: GatewayConfig) -> None:
-        raise OSError("synthetic persist failure")
+    def fail_persist(_: object) -> None:
+        raise OSError("synthetic persistence failure")
 
     monkeypatch.setattr(rpc_telemetry, "persist_gateway_config", fail_persist)
     with pytest.raises(RpcHandlerError) as raised:
         await _handle_telemetry_consent_set(
-            {"scope": "reliability", "enabled": False},
-            _context(config, cleanup=cleanup),
+            {"scope": "growth", "enabled": False}, _context(config),
         )
-
     assert raised.value.code == "TELEMETRY_CONSENT_PERSIST_FAILED"
     assert raised.value.accepted is False
-    assert config.privacy.reliability_diagnostics_enabled is True
-    assert cleanup_calls == []
-    # Desktop remains conservatively closed after the failed config commit.
+    assert not config.privacy.disable_network_observability
     assert _mirror(config)["reliability"]["enabled"] is False
+    assert _mirror(config)["growth"]["enabled"] is False
 
 
-async def test_withdrawal_persists_and_hot_closes_before_cleanup(
-    tmp_path: Path,
-) -> None:
-    config = _config(tmp_path, reliability=True)
-    observed: list[str] = []
-
-    async def cleanup(*, scope: TelemetryScope, config: GatewayConfig) -> None:
-        assert scope is TelemetryScope.RELIABILITY
-        assert config.privacy.reliability_diagnostics_enabled is False
-        assert config.privacy.reliability_notice_version is None
-        assert config.privacy.reliability_consented_at_utc is None
-        persisted = tomllib.loads((tmp_path / "config.toml").read_text(encoding="utf-8"))
-        assert persisted["privacy"]["reliability_diagnostics_enabled"] is False
-        assert "reliability_notice_version" not in persisted["privacy"]
-        assert "reliability_consented_at_utc" not in persisted["privacy"]
-        observed.append("closed-before-cleanup")
-
-    result = await _handle_telemetry_consent_set(
-        {"scope": "reliability", "enabled": False},
-        _context(config, cleanup=cleanup),
-    )
-
-    assert observed == ["closed-before-cleanup"]
-    assert result["changed"] is True
-    assert result["cleanupComplete"] is True
-
-
-async def test_cleanup_failure_after_withdrawal_leaves_durable_gate_closed(
-    tmp_path: Path,
-) -> None:
-    config = _config(tmp_path, reliability=True)
-
-    async def cleanup(*, config: GatewayConfig, **_: object) -> None:
-        assert config.privacy.reliability_diagnostics_enabled is False
-        raise OSError("synthetic cleanup failure")
-
-    with pytest.raises(RpcHandlerError) as raised:
-        await _handle_telemetry_consent_set(
-            {"scope": "reliability", "enabled": False},
-            _context(config, cleanup=cleanup),
-        )
-
-    assert raised.value.code == "TELEMETRY_CONSENT_CLEANUP_FAILED"
-    assert raised.value.accepted is True
-    assert raised.value.details["cleanupComplete"] is False
-    assert config.privacy.reliability_diagnostics_enabled is False
-    persisted = tomllib.loads((tmp_path / "config.toml").read_text(encoding="utf-8"))
-    assert persisted["privacy"]["reliability_diagnostics_enabled"] is False
-
-
-async def test_repeated_withdrawal_retries_cleanup_without_rewriting_config(
+async def test_preference_can_be_saved_while_environment_still_vetoes_uploads(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    config = _config(tmp_path, reliability=True)
-    cleanup_calls = 0
-    persist_calls = 0
-
-    async def cleanup(**_: object) -> None:
-        nonlocal cleanup_calls
-        cleanup_calls += 1
-
-    real_persist = rpc_telemetry.persist_gateway_config
-
-    def persist(candidate: GatewayConfig) -> None:
-        nonlocal persist_calls
-        persist_calls += 1
-        real_persist(candidate)
-
-    monkeypatch.setattr(rpc_telemetry, "persist_gateway_config", persist)
-    context = _context(config, cleanup=cleanup)
-    first = await _handle_telemetry_consent_set({"scope": "reliability", "enabled": False}, context)
-    second = await _handle_telemetry_consent_set(
-        {"scope": "reliability", "enabled": False}, context
-    )
-
-    assert first["changed"] is True
-    assert second["changed"] is False
-    assert cleanup_calls == 2
-    assert persist_calls == 1
-
-
-async def test_growth_default_cleanup_removes_identity_spool_and_calls_eligibility_hook(
-    tmp_path: Path,
-) -> None:
-    config = _config(tmp_path, reliability=True, growth=True)
-    identity_path = identity_state_path(TelemetryIdentityKind.ANALYTICS_USER, config=config)
-    load_or_create_identity(identity_path, TelemetryIdentityKind.ANALYTICS_USER)
-    cohort_path = growth_cohort_state_path(config=config)
-    milestone_path = gateway_growth_milestone_state_path(config=config)
-    cohort_path.write_text("{}", encoding="utf-8")
-    milestone_path.write_text("{}", encoding="utf-8")
-    spool_root = desktop_early_spool_root(str(config.state_dir))
-    growth_spool = spool_root / "growth"
-    reliability_spool = spool_root / "reliability"
-    growth_spool.mkdir(parents=True)
-    reliability_spool.mkdir()
-    for name in ("one.ready", "two.processing.7", ".three.7.tmp"):
-        (growth_spool / name).write_text("synthetic", encoding="utf-8")
-    other_scope = reliability_spool / "other.ready"
-    other_scope.write_text("keep", encoding="utf-8")
-    eligibility_calls = 0
-
-    async def clear_eligibility(*, config: GatewayConfig) -> None:
-        nonlocal eligibility_calls
-        assert config.privacy.product_analytics_enabled is False
-        eligibility_calls += 1
-
-    await _handle_telemetry_consent_set(
-        {"scope": "growth", "enabled": False},
-        _context(config, eligibility_cleanup=clear_eligibility),
-    )
-
-    assert not identity_path.exists()
-    assert not cohort_path.exists()
-    assert not milestone_path.exists()
-    assert not growth_spool.exists()
-    assert other_scope.exists()
-    assert eligibility_calls == 1
-    mirror = _mirror(config)
-    assert mirror["growth"]["enabled"] is False
-    assert mirror["reliability"]["enabled"] is True
-
-
-async def test_growth_cleanup_with_unmanaged_spool_is_accepted_but_incomplete(
-    tmp_path: Path,
-) -> None:
-    config = _config(tmp_path, growth=True)
-    identity_path = identity_state_path(TelemetryIdentityKind.ANALYTICS_USER, config=config)
-    load_or_create_identity(identity_path, TelemetryIdentityKind.ANALYTICS_USER)
-    spool_root = desktop_early_spool_root(str(config.state_dir))
-    growth_spool = spool_root / "growth"
-    growth_spool.mkdir(parents=True)
-    (growth_spool / "one.ready").write_text("synthetic", encoding="utf-8")
-    (growth_spool / "keep.local").write_text("keep", encoding="utf-8")
-
-    with pytest.raises(RpcHandlerError) as raised:
-        await _handle_telemetry_consent_set(
-            {"scope": "growth", "enabled": False},
-            _context(config),
-        )
-
-    assert raised.value.code == "TELEMETRY_CONSENT_CLEANUP_FAILED"
-    assert raised.value.accepted is True
-    assert raised.value.details["cleanupComplete"] is False
-    assert config.privacy.product_analytics_enabled is False
-    assert not identity_path.exists()
-    quarantines = tuple(spool_root.glob(".revoked-growth-*"))
-    assert len(quarantines) == 1
-    assert (quarantines[0] / "keep.local").read_text(encoding="utf-8") == "keep"
-    assert not (quarantines[0] / "one.ready").exists()
-
-
-async def test_forced_off_policy_allows_revoke_but_blocks_new_grant(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+    config = _config(tmp_path, growth=False)
     monkeypatch.setenv("DO_NOT_TRACK", "1")
-    declined = _config(tmp_path / "declined", reliability=False)
-    with pytest.raises(RpcHandlerError) as blocked:
-        await _handle_telemetry_consent_set(
-            {"scope": "reliability", "enabled": True},
-            _context(declined),
-        )
-    assert blocked.value.code == "TELEMETRY_CONSENT_FORCED_OFF"
-    assert declined.privacy.reliability_diagnostics_enabled is False
-
-    granted = _config(tmp_path / "granted", reliability=True)
-
-    async def cleanup(**_: object) -> None:
-        return None
-
     result = await _handle_telemetry_consent_set(
-        {"scope": "reliability", "enabled": False},
-        _context(granted, cleanup=cleanup),
+        {"scope": "growth", "enabled": True}, _context(config),
     )
-    assert result["enabled"] is False
-    assert granted.privacy.reliability_diagnostics_enabled is False
+    assert result["enabled"] is True
+    assert not config.privacy.disable_network_observability
+    for stream in ("reliability", "growth"):
+        assert _mirror(config)[stream]["forced_off"] is True
 
 
-async def test_unsafe_mirror_fails_before_config_or_cleanup_changes(
-    tmp_path: Path,
-) -> None:
-    config = _config(tmp_path, reliability=True)
+async def test_unified_change_waits_for_both_scope_boundaries(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    coordinator = scope_consent_coordinator_for(config)
+    async with coordinator.transition(TelemetryScope.GROWTH):
+        change = asyncio.create_task(_handle_telemetry_consent_set(
+            {"scope": "reliability", "enabled": False}, _context(config),
+        ))
+        await asyncio.sleep(0)
+        assert not change.done()
+        assert not config.privacy.disable_network_observability
+    await change
+    assert config.privacy.disable_network_observability
+    assert coordinator.revision(TelemetryScope.RELIABILITY) == 1
+    assert coordinator.revision(TelemetryScope.GROWTH) == 2
+
+
+async def test_unsafe_mirror_fails_before_config_changes(tmp_path: Path) -> None:
+    config = _config(tmp_path)
     target = desktop_consent_mirror_path(str(config.state_dir))
     target.parent.mkdir(parents=True)
     outside = tmp_path / "outside.json"
@@ -587,134 +466,79 @@ async def test_unsafe_mirror_fails_before_config_or_cleanup_changes(
         target.symlink_to(outside)
     except OSError:
         pytest.skip("symlinks are unavailable")
-    cleanup_calls = 0
-
-    async def cleanup(**_: object) -> None:
-        nonlocal cleanup_calls
-        cleanup_calls += 1
-
     with pytest.raises(RpcHandlerError) as raised:
         await _handle_telemetry_consent_set(
-            {"scope": "reliability", "enabled": False},
-            _context(config, cleanup=cleanup),
+            {"scope": "reliability", "enabled": False}, _context(config),
         )
-
     assert raised.value.code == "TELEMETRY_CONSENT_MIRROR_FAILED"
     assert raised.value.accepted is False
-    assert config.privacy.reliability_diagnostics_enabled is True
-    assert cleanup_calls == 0
+    assert not config.privacy.disable_network_observability
     assert outside.read_text(encoding="utf-8") == "unchanged"
 
 
-async def test_final_mirror_failure_is_accepted_and_retryable_without_config_rewrite(
+async def test_final_mirror_failure_can_retry_without_config_rewrite(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    config = _config(tmp_path)
-    monkeypatch.setattr(rpc_telemetry, "_utc_now", lambda: _NOW)
+    config = _config(tmp_path, growth=False)
     real_write = consent_transition.write_desktop_consent_mirror
-    mirror_writes = 0
+    writes = 0
 
-    def flaky_write(*args: object, **kwargs: object) -> Path:
-        nonlocal mirror_writes
-        mirror_writes += 1
-        if mirror_writes == 2:
+    def flaky_write(*args: Any, **kwargs: Any) -> Path:
+        nonlocal writes
+        writes += 1
+        if writes == 2:
             raise OSError("synthetic final mirror failure")
         return real_write(*args, **kwargs)
 
-    monkeypatch.setattr(
-        consent_transition,
-        "write_desktop_consent_mirror",
-        flaky_write,
-    )
+    monkeypatch.setattr(consent_transition, "write_desktop_consent_mirror", flaky_write)
     with pytest.raises(RpcHandlerError) as raised:
         await _handle_telemetry_consent_set(
-            {"scope": "reliability", "enabled": True},
-            _context(config),
+            {"scope": "growth", "enabled": True}, _context(config),
         )
-    assert raised.value.code == "TELEMETRY_CONSENT_MIRROR_FAILED"
     assert raised.value.accepted is True
-    assert config.privacy.reliability_diagnostics_enabled is True
-    assert _mirror(config)["reliability"]["enabled"] is False
-
-    retried = await _handle_telemetry_consent_set(
-        {"scope": "reliability", "enabled": True},
-        _context(config),
+    assert not config.privacy.disable_network_observability
+    assert _mirror(config)["growth"]["enabled"] is False
+    retry = await _handle_telemetry_consent_set(
+        {"scope": "growth", "enabled": True}, _context(config),
     )
-    assert retried["changed"] is False
-    assert _mirror(config)["reliability"]["enabled"] is True
+    assert retry["changed"] is False
+    assert _mirror(config)["growth"]["enabled"] is True
 
 
-async def test_generic_config_mutations_cannot_change_consent_records(
+async def test_generic_config_mutations_cannot_restore_retired_consent_records(
     tmp_path: Path,
 ) -> None:
-    config = _config(tmp_path, reliability=True, growth=False)
-    admin = _context(config, scopes=("operator.admin",))
-
+    config = _config(tmp_path)
+    context = _context(config, scopes=("operator.admin",))
     with pytest.raises(ValueError, match="read-only"):
         await _handle_config_set(
-            {"path": "privacy.reliability_diagnostics_enabled", "value": False},
-            admin,
+            {"path": "privacy.reliability_diagnostics_enabled", "value": False}, context,
         )
     with pytest.raises(ValueError, match="not safe"):
         await _handle_config_patch_safe(
-            {"patches": {"privacy.product_analytics_enabled": True}},
-            admin,
+            {"patches": {"privacy.product_analytics_enabled": True}}, context,
         )
-
     await _handle_config_patch(
-        {
-            "patches": {
-                "privacy.reliability_notice_version": "forged-v9",
-                "privacy.product_analytics_enabled": True,
-            },
-            "patch": {
-                "privacy": {
-                    "reliability_consented_at_utc": "1999-01-01T00:00:00Z",
-                    "product_analytics_notice_version": "forged-v9",
-                }
-            },
-        },
-        admin,
+        {"patches": {"privacy.product_analytics_notice_version": "forged-v9"}}, context,
     )
-    assert config.privacy.reliability_diagnostics_enabled is True
-    assert config.privacy.reliability_notice_version == "reliability-v1"
-    assert config.privacy.reliability_consented_at_utc == _NOW
-    assert config.privacy.product_analytics_enabled is False
-    assert config.privacy.product_analytics_notice_version is None
-
     replacement = config.model_dump(mode="python")
-    replacement["privacy"]["reliability_diagnostics_enabled"] = False
     replacement["privacy"]["product_analytics_enabled"] = True
-    replacement["privacy"]["product_analytics_notice_version"] = "forged-v9"
     replacement["privacy"]["product_analytics_consented_at_utc"] = _NOW
-    await _handle_config_apply({"config": replacement}, admin)
-    assert config.privacy.reliability_diagnostics_enabled is True
-    assert config.privacy.product_analytics_enabled is False
+    await _handle_config_apply({"config": replacement}, context)
+    assert config.privacy.product_analytics_enabled is None
+    assert config.privacy.product_analytics_consented_at_utc is None
+    assert not config.privacy.disable_network_observability
 
 
-async def test_config_reload_preserves_live_server_owned_consent(
+async def test_config_reload_migrates_legacy_decline_into_global_preference(
     tmp_path: Path,
 ) -> None:
-    config = _config(tmp_path, reliability=True, growth=False)
+    config = _config(tmp_path)
     (tmp_path / "config.toml").write_text(
-        "\n".join(
-            (
-                "[privacy]",
-                "reliability_diagnostics_enabled = false",
-                "product_analytics_enabled = true",
-                'product_analytics_notice_version = "growth-v2"',
-                f'product_analytics_consented_at_utc = "{_NOW}"',
-                "",
-            )
-        ),
-        encoding="utf-8",
+        "[privacy]\nreliability_diagnostics_enabled = false\n", encoding="utf-8",
     )
-
     result = await _handle_config_reload(None, _context(config, scopes=("operator.admin",)))
-
     assert result["ok"] is True
-    assert config.privacy.reliability_diagnostics_enabled is True
-    assert config.privacy.reliability_notice_version == "reliability-v1"
-    assert config.privacy.product_analytics_enabled is False
-    assert config.privacy.product_analytics_notice_version is None
+    assert config.privacy.disable_network_observability
+    assert config.privacy.reliability_diagnostics_enabled is None

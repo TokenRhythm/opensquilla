@@ -11,11 +11,13 @@ import asyncio
 import codecs
 import json
 import math
+import re
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Annotated, Any, Literal
+from urllib.parse import urlsplit
 
 import httpx
 from pydantic import UUID4, BaseModel, ConfigDict, Field, ValidationError
@@ -366,8 +368,9 @@ def _require_receipt_nesting_limit(value: Any) -> None:
 
 def _endpoint_url(base_url: str, scope: TelemetryScope) -> httpx.URL:
     try:
+        prefix = urlsplit(base_url).path.rstrip("/")
         base = httpx.URL(base_url)
-    except (TypeError, ValueError) as exc:
+    except (TypeError, ValueError, httpx.InvalidURL) as exc:
         raise ValueError("telemetry base URL is invalid") from exc
     if (
         base.scheme != "https"
@@ -377,8 +380,13 @@ def _endpoint_url(base_url: str, scope: TelemetryScope) -> httpx.URL:
         or base.query
         or base.fragment
     ):
-        raise ValueError("telemetry base URL must be an HTTPS origin without credentials")
-    return base.copy_with(path=_ENDPOINT_PATHS[scope], query=None, fragment=None)
+        raise ValueError("telemetry base URL must use HTTPS without credentials, query or fragment")
+    if prefix and (
+        not re.fullmatch(r"(?:/[A-Za-z0-9._~-]+)+", prefix)
+        or any(segment in {".", ".."} for segment in prefix.split("/"))
+    ):
+        raise ValueError("telemetry base URL path must be an unambiguous prefix")
+    return base.copy_with(path=prefix + _ENDPOINT_PATHS[scope], query=None, fragment=None)
 
 
 def _positive_finite(value: float, *, name: str) -> float:

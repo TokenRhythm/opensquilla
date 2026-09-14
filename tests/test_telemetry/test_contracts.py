@@ -42,6 +42,7 @@ from opensquilla.telemetry.contracts import (
     MetaSkillUsage,
     OnboardingCompleted,
     PerformanceSummary,
+    ProductActive,
     RegistrationResult,
     RegistrationStarted,
     TelemetryWireError,
@@ -303,6 +304,9 @@ def _valid_growth_payloads() -> list[tuple[type[object], dict[str, object]]]:
     coding_mode_usage = _growth_base("coding_mode_usage")
     coding_mode_usage.update(source="runtime")
 
+    product_active = _growth_base("product_active")
+    product_active.update(source="gateway", surface="desktop")
+
     return [
         (OnboardingCompleted, onboarding),
         (FirstAppReady, app_ready),
@@ -318,6 +322,7 @@ def _valid_growth_payloads() -> list[tuple[type[object], dict[str, object]]]:
         (ClientLaunch, client_launch),
         (MetaSkillUsage, metaskill_usage),
         (CodingModeUsage, coding_mode_usage),
+        (ProductActive, product_active),
     ]
 
 
@@ -359,6 +364,35 @@ def test_growth_discriminated_union_accepts_all_authoritative_events(
     dumped = event.model_dump(mode="json", exclude_none=False)
     assert dumped == payload
     assert dumped["sample_rate"] == 1
+
+
+@pytest.mark.parametrize("surface", ["desktop", "web", "tui", "cli"])
+def test_product_active_wire_accepts_only_closed_surface_envelope(surface: str) -> None:
+    payload = _growth_base("product_active")
+    payload.update(source="gateway", surface=surface)
+    batch_payload = {
+        "batch_version": 1,
+        "batch_id": BATCH_ID,
+        "sent_at_utc": SENT_AT,
+        "events": [payload],
+    }
+    batch = parse_telemetry_wire(_wire_json(batch_payload), target=TelemetryWireTarget.GROWTH_BATCH)
+    assert isinstance(batch.events[0], ProductActive)
+    assert batch.events[0].surface.value == surface
+
+
+@pytest.mark.parametrize("invalid", [
+    {"surface": "unknown"}, {"source": "desktop"}, {"outcome": "success"},
+    {"sample_rate": 0.5}, {"notice_version": "growth-v1"},
+    {"acquisition_id": ANALYTICS_USER_ID}, {"prompt": "synthetic forbidden content"},
+    {"event_version": 2},
+])
+def test_product_active_wire_rejects_extended_or_invalid_payload(invalid) -> None:
+    payload = _growth_base("product_active")
+    payload.update(source="gateway", surface="desktop")
+    payload.update(invalid)
+    with pytest.raises(TelemetryWireError):
+        parse_telemetry_wire(_wire_json(payload), target=TelemetryWireTarget.GROWTH_EVENT)
 
 
 def test_event_registry_is_keyed_by_name_and_version() -> None:
@@ -1051,7 +1085,7 @@ def test_protocol_manifest_and_fingerprint_are_stable_cross_language_golden() ->
 
     assert fingerprint == TELEMETRY_PROTOCOL_FINGERPRINT_SHA256
     assert TELEMETRY_PROTOCOL_FINGERPRINT_SHA256 == (
-        "37eef99b9de090a2032669d3caa9cd10f4357061658b2458326595361582732f"
+        "9e5d0501e6614fdcd4cf78f8a177db94b739fad156a0409f330809e5b2a5719f"
     )
     assert manifest_events == set(EVENT_MODELS)
     assert manifest["notice_versions"] == dict(CURRENT_NOTICE_VERSION_BY_SCOPE)

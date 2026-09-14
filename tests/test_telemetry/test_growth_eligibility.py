@@ -109,7 +109,7 @@ def test_activation_requires_effective_growth_consent() -> None:
     assert (
         activate_growth_cohort(
             GrowthEligibilityState.NEW_CANDIDATE,
-            _consent(enabled=None),
+            _consent(enabled=False),
         )
         is GrowthEligibilityState.NEW_CANDIDATE
     )
@@ -127,6 +127,20 @@ def test_activation_requires_effective_growth_consent() -> None:
         )
         is GrowthEligibilityState.NEW_CANDIDATE
     )
+
+
+def test_default_upload_policy_activates_only_proven_new_cohort() -> None:
+    consent = _consent(enabled=None)
+    assert consent.consented_at_utc is None
+    assert (
+        activate_growth_cohort(GrowthEligibilityState.NEW_CANDIDATE, consent)
+        is GrowthEligibilityState.ACTIVE
+    )
+    assert (
+        activate_growth_cohort(GrowthEligibilityState.PREEXISTING, consent)
+        is GrowthEligibilityState.PREEXISTING
+    )
+    assert not growth_milestone_collection_allowed(GrowthEligibilityState.PREEXISTING, consent)
 
 
 def test_activation_rejects_reliability_consent() -> None:

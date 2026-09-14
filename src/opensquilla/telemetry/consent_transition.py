@@ -72,12 +72,10 @@ async def global_network_observability_transition(
     current_config: Any | None,
     candidate_config: Any,
 ) -> AsyncIterator[None]:
-    """Serialize a global telemetry veto change with both scope boundaries.
+    """Serialize the unified preference with both enqueue/upload boundaries.
 
-    The global switch is a pause, not consent withdrawal, so this transaction
-    never deletes queues or identities. Both locks stay held from the first
-    fail-closed Desktop publication through the durable/live caller commit and
-    final mirror publication.
+    The V1 global preference pauses uploads without erasing retained telemetry
+    state, so re-enabling resumes the existing queues and analytics identity.
     """
 
     if current_config is None or _network_observability_disabled(

@@ -18,6 +18,30 @@ REMOVED_TEXT_BACKEND = "text" + "ual"
 REMOVED_BACKEND_IDS = ["terminal", REMOVED_TEXT_BACKEND, f"live-{REMOVED_TEXT_BACKEND}"]
 
 
+async def test_gateway_activity_hook_keeps_older_repl_callback_compatible() -> None:
+    from opensquilla.cli.repl import runtime_bridge
+
+    calls: list[str] = []
+
+    async def older_repl(
+        *, surface, scope, dispatch, abort_active_turn, steer_active_turn, on_surface_ready,
+    ) -> None:
+        calls.append("older")
+
+    async def current_repl(**kwargs: Any) -> None:
+        await kwargs["on_user_activity"]()
+
+    async def activity() -> None:
+        calls.append("active")
+
+    for runner in (older_repl, current_repl):
+        loop = runtime_bridge._gateway_input_loop_for(runner)
+        await loop(
+            scope={}, dispatch=lambda _: None, on_user_activity=activity,
+        )
+    assert calls == ["older", "active"]
+
+
 async def _fake_gateway_stream(*args: Any, **kwargs: Any) -> TurnResult:
     return TurnResult(text="gateway")
 

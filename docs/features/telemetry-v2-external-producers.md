@@ -8,6 +8,16 @@ their results.
 
 ## Shared destination
 
+For an isolated client verification run, set `OPENSQUILLA_TELEMETRY_BASE_URL`
+in the client process environment to an HTTPS collector base URL, optionally
+including a path prefix (for example `https://telemetry.example.com/test`).
+The Desktop Gateway inherits this setting; both v2 queues append their own
+`/v1/reliability/events` or `/v1/growth/events` path. It does not change the
+legacy v1 destination or the user's upload preference. Unset it to restore the
+default destination. An invalid explicit URL blocks v2 upload rather than
+falling back to the default server. Credentials, query strings, fragments,
+encoded path segments and relative path segments are not supported.
+
 All growth producers send strict v1 batches to:
 
 ```text
@@ -66,13 +76,27 @@ is accepted.
 | Account service | `registration_result` | the registration transaction reaches success, fail, or cancel |
 | Runtime | `metaskill_usage` | the first executable MetaSkill step starts; one event counts one run |
 | Runtime | `coding_mode_usage` | a Coding Mode task starts its coding Agent process; one event counts one run |
+| Gateway / CLI runtime | `product_active` | a Desktop or Web owner UI is visibly active, a TUI is ready or receives user input, or a CLI Agent run is submitted; deduplicated per profile, surface, and UTC day |
 
 `metaskill_usage` and `coding_mode_usage` intentionally carry no MetaSkill name,
 prompt, plan, step, command, repository, tool argument, or run identifier. The
 runtime-only events are emitted at their first demonstrated execution boundary,
-are gated by the Growth consent and active cohort receipt, and are counted by
-the dashboard as usage totals plus UTC daily trends. Enabling Coding Mode or
+are gated by the client's unified network-reporting policy, and are counted by
+the dashboard as usage totals plus UTC daily trends. They use a random
+analytics-only identity without requiring a fresh-install cohort; first-use
+funnel milestones still require that cohort. Enabling Coding Mode or
 injecting its turn directive without starting the coding Agent is not counted.
+
+`product_active` is a v1 Growth event with `source=gateway`, `outcome=null`,
+and one additional field: `surface` (`desktop`, `web`, `tui`, or `cli`). It
+reuses the profile's random `analytics_user_id`, does not create a fresh-user
+cohort, and contains no prompt, response, route, input, account ID, or extra
+identity. Background Gateway uptime and internal Coding Mode child processes
+do not count. Its daily observations support cross-surface DAU and rolling
+30-day MAU, both deduplicated by analytics identity rather than event totals.
+The local daily ledger is persisted before enqueue; retries retain `event_id`
+and occurrence time. It uses the existing unified reporting control and CI /
+`DO_NOT_TRACK` vetoes, with no new prompt or telemetry preference.
 
 `analytics_user_id` is a random analytics-only UUID. It is not a hash of the
 account ID. On successful registration, the account service stores the mapping
@@ -82,10 +106,9 @@ analytics user ID.
 
 ## Deliberately inactive boundaries
 
-The current ordinary NSIS package has no trustworthy acquisition token and the
-user has not yet granted Growth consent before installation. It therefore must
+The current ordinary NSIS package has no trustworthy acquisition token. It must
 not collect or upload `install_started` or `install_result`, and the desktop
-must not backfill them after consent. These events can be activated only after
+must not backfill them when client reporting is enabled. These events can be activated only after
 a guided installer or short-lived signed acquisition token is implemented with
 an explicit pre-install notice and consent receipt.
 

@@ -1347,6 +1347,12 @@
     },
     {
       "lifecycle": "stable",
+      "name": "telemetry.product_active.record",
+      "schema": "telemetry/telemetry-product-active-record.schema.json",
+      "schemaSha256": "372d1c0dce0c65f429df582d67432cb9e1809ee8cac7fec28281ef2067475f20"
+    },
+    {
+      "lifecycle": "stable",
       "name": "transport.flow.update",
       "schema": "transport/transport-flow-update.schema.json",
       "schemaSha256": "c637cfebaf5aa6c70fa29c6349d36f091a6de2fe445fe125e49a332b2dd7f5e6"
@@ -1433,10 +1439,10 @@
   "protocol": "opensquilla-websocket-json",
   "source": {
     "eventFamilyCount": 10,
-    "generatorSha256": "db063b7bff2dcb9d089926dc9f1d3c99c61c2e4dd42ba12f442701b03fff2df1",
-    "methodCount": 210,
-    "schemaCount": 220,
-    "schemaTreeSha256": "bd4f9854cf75508a253dc92182b05db08eb8af323ed5ab12af1c209d0ff43ccc"
+    "generatorSha256": "c4abcd1495df7b52cff59cd57dd928528b54a2004b0cf449f5a0d50cb0a57bcf",
+    "methodCount": 211,
+    "schemaCount": 221,
+    "schemaTreeSha256": "ac4fdd646f89caa0f363fd51a0cb7cc823a85d5de493a3d563698e3b3307d527"
   },
   "wireVersion": 4
 }

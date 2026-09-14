@@ -1108,12 +1108,6 @@ const activitySummaryLabel = computed(() => {
       activityCompactElapsedLabel.value,
     ].filter(Boolean).join(' · '))
   }
-  if (documentWriterFailureCount.value > 0) {
-    return withMaintenanceSummary([
-      String(t('sessions.status.failed')),
-      activityCompactElapsedLabel.value,
-    ].filter(Boolean).join(' · '))
-  }
   if (outcomePresentation.value !== 'completed') {
     const label = String(t({
       stopped: 'sessions.status.cancelled',
@@ -1125,6 +1119,12 @@ const activitySummaryLabel = computed(() => {
     return withMaintenanceSummary(
       [label, activityCompactElapsedLabel.value].filter(Boolean).join(' · '),
     )
+  }
+  if (activityLifecycle.value === 'failed') {
+    return withMaintenanceSummary([
+      String(t('sessions.status.failed')),
+      activityCompactElapsedLabel.value,
+    ].filter(Boolean).join(' · '))
   }
   if (activityCompletionConfirmed.value) {
     return withMaintenanceSummary([

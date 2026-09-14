@@ -173,6 +173,16 @@ class ClientLaunch(GrowthEventBase):
     execution_mode: ExecutionMode
 
 
+class ProductActive(GrowthEventBase):
+    """One daily observation of a user interacting with a product surface."""
+
+    event_name: Literal["product_active"]
+    source: Literal[EventSource.GATEWAY]
+    notice_version: Literal["growth-v2"]
+    outcome: None
+    surface: ClientSurface
+
+
 class MetaSkillUsage(GrowthEventBase):
     """One MetaSkill run whose first executable step has started."""
 
@@ -204,6 +214,7 @@ GrowthEvent = Annotated[
     | FirstTurnStarted
     | FirstTurnSucceeded
     | ClientLaunch
+    | ProductActive
     | MetaSkillUsage
     | CodingModeUsage,
     Field(discriminator="event_name"),
@@ -230,6 +241,7 @@ __all__ = [
     "LandingView",
     "MetaSkillUsage",
     "OnboardingCompleted",
+    "ProductActive",
     "RegistrationErrorCode",
     "RegistrationOutcome",
     "RegistrationResult",

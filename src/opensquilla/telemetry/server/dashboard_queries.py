@@ -25,6 +25,7 @@ from opensquilla.telemetry.contracts.reliability import (
 )
 from opensquilla.telemetry.server.storage import (
     _COMPATIBLE_PREVIOUS_PROTOCOL_FINGERPRINTS,
+    _LEGACY_PROTOCOL_FINGERPRINT_SHA256,
 )
 
 _SCHEMA_VERSION: Final = 1
@@ -121,11 +122,12 @@ _ACQUISITION_STAGES: Final = (
 )
 
 _ACTIVATION_STAGES: Final = (
-    _FunnelStage("first_app_ready", "first_app_ready"),
-    # Desktop saves onboarding before starting the gateway. Keep the ready
-    # cohort anchor while accepting that already-completed prerequisite, and
-    # retain support for older producers that reported readiness first.
-    _FunnelStage("onboarding_completed", "onboarding_result", "completed", 7 * 24, True),
+    # Desktop finishes onboarding before starting the gateway. Cohort membership
+    # follows the first completed onboarding, including users who never get ready.
+    _FunnelStage("onboarding_completed", "onboarding_result", "completed"),
+    # Older producers reported readiness first. Accept that prerequisite without
+    # allowing subsequent turns to predate either readiness or onboarding.
+    _FunnelStage("first_app_ready", "first_app_ready", None, 7 * 24, True),
     _FunnelStage("first_turn_started", "first_turn_started", window_hours_from_previous=7 * 24),
     _FunnelStage("first_turn_succeeded", "first_turn_result", "success", 7 * 24),
 )
@@ -157,6 +159,9 @@ class DashboardQueries:
             self._compatible_protocol_fingerprints.update(
                 _COMPATIBLE_PREVIOUS_PROTOCOL_FINGERPRINTS
             )
+            # The legacy event columns are unchanged; only the collector's
+            # client-launch uniqueness index needs migration before writing.
+            self._compatible_protocol_fingerprints.add(_LEGACY_PROTOCOL_FINGERPRINT_SHA256)
 
     def summary(self, window: UtcCohortWindow) -> dict[str, Any]:
         return {
@@ -488,6 +493,7 @@ class DashboardQueries:
                 "acquisition": acquisition,
                 "activation": activation,
                 "linkedInstallToReady": self._linked_install_to_ready(connection, window),
+                "productActivity": self._product_activity(connection, window),
                 "clientUsage": self._client_usage(connection, window),
                 "metaskillUsage": self._feature_usage(
                     connection,
@@ -502,6 +508,68 @@ class DashboardQueries:
                     note="编程 Agent 进程实际启动后计 1 次；仅开启模式不计数。",
                 ),
             }
+
+    @staticmethod
+    def _product_activity(
+        connection: sqlite3.Connection,
+        window: UtcCohortWindow,
+    ) -> dict[str, Any]:
+        """Count daily and rolling-30-day users across all observed surfaces."""
+
+        start_date = window.start.date().isoformat()
+        end_date = (window.end_exclusive - timedelta(days=1)).date().isoformat()
+        rows = connection.execute(
+            """
+            WITH RECURSIVE days(period) AS (
+                VALUES (?)
+                UNION ALL
+                SELECT date(period, '+1 day') FROM days WHERE period < ?
+            ), activity AS (
+                SELECT DISTINCT substr(occurred_at_utc, 1, 10) AS active_date,
+                                analytics_user_id
+                FROM events
+                WHERE event_name = 'product_active'
+                  AND event_version = 1
+                  AND source = 'gateway'
+                  AND outcome IS NULL
+                  AND sample_rate = 1
+                  AND notice_version = ?
+                  AND analytics_user_id IS NOT NULL
+                  AND json_extract(payload_json, '$.surface') IN ('desktop', 'web', 'tui', 'cli')
+                  AND occurred_at_utc >= date(?, '-29 days') || 'T00:00:00.000Z'
+                  AND occurred_at_utc < ?
+            )
+            SELECT days.period,
+                   date(days.period, '-29 days') AS mau_start_date,
+                   COUNT(DISTINCT CASE WHEN activity.active_date = days.period
+                         THEN activity.analytics_user_id END) AS dau,
+                   COUNT(DISTINCT activity.analytics_user_id) AS mau
+            FROM days
+            LEFT JOIN activity
+              ON activity.active_date >= date(days.period, '-29 days')
+             AND activity.active_date <= days.period
+            GROUP BY days.period
+            ORDER BY days.period
+            """,
+            (
+                start_date,
+                end_date,
+                CURRENT_NOTICE_VERSION_BY_SCOPE[TelemetryScope.GROWTH.value],
+                start_date,
+                window.sql_params[1],
+            ),
+        ).fetchall()
+        daily = [
+            {"period": str(row["period"]), "dau": int(row["dau"]), "mau": int(row["mau"])}
+            for row in rows
+        ]
+        return {
+            "asOfDate": end_date,
+            "mauStartDate": str(rows[-1]["mau_start_date"]),
+            "dau": daily[-1]["dau"],
+            "mau": daily[-1]["mau"],
+            "dailyTrend": daily,
+        }
 
     def _feature_usage(
         self,

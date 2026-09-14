@@ -2325,6 +2325,42 @@ async def test_system_event_keeps_bare_marker_on_a_middle_tool_boundary() -> Non
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("returncode", [0, 1])
+async def test_completed_background_process_does_not_emit_stale_notice(returncode: int) -> None:
+    state = _make_state()
+    state.turn_segments.extend([
+        {
+            "type": "tool_result",
+            "name": "background_process",
+            "result": "session_id=process-a\ncommand: synthetic-job\nstatus: running",
+            "execution_status": {"status": "unknown", "reason": "background_running"},
+        },
+        {
+            "type": "tool_result",
+            "name": "process",
+            "result": json.dumps({
+                "status": "ok",
+                "action": "wait",
+                "exited": True,
+                "session": {"session_id": "process-a", "returncode": returncode},
+            }),
+            "execution_status": {"status": "success" if returncode == 0 else "error"},
+        },
+    ])
+    final_text = "Process completed." if returncode == 0 else "Process exited unsuccessfully."
+    stage, _ = _make_stage(
+        agent_run=_RecordingAgentRun(events=[DoneEvent(text=final_text, text_snapshot=final_text)])
+    )
+
+    yielded = await _drain(stage, _make_input(state=state))
+
+    assert all("could not confirm" not in getattr(event, "text", "") for event in yielded)
+    assert isinstance(yielded[-1], DoneEvent)
+    assert yielded[-1].text == final_text
+    assert yielded[-1].text_snapshot == final_text
+
+
+@pytest.mark.asyncio
 async def test_system_event_runtime_notice_overrides_suppressed_model_delivery() -> None:
     state = _make_state()
     state.turn_segments.append(

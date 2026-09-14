@@ -652,6 +652,26 @@ describe('AssistantMessage activity disclosure', () => {
     expect(el.textContent).not.toContain('Draft suffix')
   })
 
+  it.each([
+    { status: 'succeeded', kind: 'completed', label: 'Completed', lifecycle: 'settled' },
+    { status: 'cancelled', kind: 'user_stopped', label: 'Stopped', lifecycle: 'interrupted' },
+    { status: 'timeout', kind: 'timeout', label: 'Timed out', lifecycle: 'failed' },
+    { status: 'failed', kind: 'failed', label: 'Failed', lifecycle: 'failed' },
+  ])('keeps the $status turn outcome when a tool failed', async ({ status, kind, label, lifecycle }) => {
+    const el = mountMessage(baseMessage({
+      turnOutcome: { turnId: 'turn-with-tool-failure', status, kind },
+    }), true)
+    await nextTick()
+
+    const activity = el.querySelector<HTMLElement>('.assistant-activity')
+    const summary = activity?.querySelector<HTMLElement>('.assistant-activity__summary')
+    expect(summary?.textContent).toContain(label)
+    expect(activity?.classList.contains(`assistant-activity--${lifecycle}`)).toBe(true)
+    expect(activity?.querySelector('.tool-row--error')).not.toBeNull()
+    expect(el.textContent).toContain('Network unavailable')
+    if (status !== 'failed') expect(summary?.textContent).not.toContain('Failed')
+  })
+
   it('restores routine phase rows and reopens settled reasoning content', async () => {
     const startedAt = Date.parse('2026-01-01T00:00:00.000Z')
     const el = mountMessage(baseMessage({
@@ -1426,6 +1446,7 @@ describe('AssistantMessage activity disclosure', () => {
 
     const activity = el.querySelector('.assistant-activity')
     expect(activity?.classList.contains('assistant-activity--failed')).toBe(true)
+    expect(activity?.querySelector('.assistant-activity__summary')?.textContent).toContain('Failed')
     expect(activity?.querySelector('.assistant-activity__summary')?.getAttribute('aria-expanded'))
       .toBe('false')
     expect(el.textContent).toContain('Partial answer before failure.')

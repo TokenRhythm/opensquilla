@@ -1,8 +1,7 @@
-"""RPC mutation boundary for scoped telemetry consent."""
+"""Compatibility RPC boundary for the unified telemetry upload preference."""
 
 from __future__ import annotations
 
-import inspect
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
@@ -20,7 +19,6 @@ from opensquilla.gateway.telemetry_connections import (
     is_registered_tui_connection,
     register_tui_connection,
 )
-from opensquilla.observability.network_policy import telemetry_scope_forced_off_reasons
 from opensquilla.telemetry.consent import (
     CURRENT_PRODUCT_ANALYTICS_NOTICE_VERSION,
     CURRENT_RELIABILITY_NOTICE_VERSION,
@@ -28,7 +26,6 @@ from opensquilla.telemetry.consent import (
 )
 from opensquilla.telemetry.consent_transition import (
     publish_desktop_consent_mirror,
-    telemetry_state_dir,
 )
 from opensquilla.telemetry.contracts.common import (
     ClientEntrypoint,
@@ -39,17 +36,6 @@ from opensquilla.telemetry.coordination import (
     ScopeConsentCoordinator,
     scope_consent_coordinator_for,
 )
-from opensquilla.telemetry.desktop_state import (
-    DesktopTelemetryStateError,
-    clear_desktop_early_spool_scope,
-)
-from opensquilla.telemetry.growth.state import delete_growth_cohort_state
-from opensquilla.telemetry.identity import (
-    TelemetryIdentityKind,
-    delete_identity,
-    identity_state_path,
-)
-from opensquilla.telemetry.outbox import TelemetryOutbox
 
 log = structlog.get_logger(__name__)
 
@@ -88,10 +74,6 @@ _SCOPE_FIELDS = {
 }
 
 
-def _utc_now() -> str:
-    return datetime.now(UTC).isoformat(timespec="milliseconds").replace("+00:00", "Z")
-
-
 def _strict_params(params: Any) -> tuple[TelemetryScope, bool]:
     if not isinstance(params, dict) or set(params) != _EXPECTED_PARAMS:
         raise RpcHandlerError(
@@ -116,73 +98,37 @@ def _strict_params(params: Any) -> tuple[TelemetryScope, bool]:
     return TelemetryScope(raw_scope), enabled
 
 
-async def _await_hook_result(result: Any) -> None:
-    if inspect.isawaitable(result):
-        await result
-
-
-async def _default_scope_cleanup(scope: TelemetryScope, config: Any) -> None:
-    """Clear only telemetry state whose exact location the Gateway owns."""
-
-    async with await TelemetryOutbox.open(telemetry_state_dir(config), scope) as outbox:
-        await outbox.clear_scope()
-    if scope is TelemetryScope.GROWTH:
-        delete_identity(identity_state_path(TelemetryIdentityKind.ANALYTICS_USER, config=config))
-        delete_growth_cohort_state(config=config)
-    desktop_cleanup = clear_desktop_early_spool_scope(telemetry_state_dir(config), scope)
-    if not desktop_cleanup.complete:
-        raise DesktopTelemetryStateError("desktop early spool could not be cleared completely")
-
-
-async def _cleanup_scope(scope: TelemetryScope, ctx: RpcContext) -> None:
-    cleanup = getattr(ctx, "telemetry_consent_cleanup", None)
-    if cleanup is None:
-        await _default_scope_cleanup(scope, ctx.config)
-    elif callable(cleanup):
-        await _await_hook_result(cleanup(scope=scope, config=ctx.config))
-    else:
-        raise TypeError("telemetry consent cleanup hook is not callable")
-
-    if scope is not TelemetryScope.GROWTH:
-        return
-    eligibility_cleanup = getattr(ctx, "telemetry_growth_eligibility_cleanup", None)
-    if eligibility_cleanup is None:
-        return
-    if not callable(eligibility_cleanup):
-        raise TypeError("growth eligibility cleanup hook is not callable")
-    await _await_hook_result(eligibility_cleanup(config=ctx.config))
+def _utc_now() -> str:
+    return datetime.now(UTC).isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
 
 def _commit_record(
     *,
     ctx: RpcContext,
-    fields: _ScopeFields,
     enabled: bool,
-    consented_at_utc: str | None,
 ) -> bool:
     privacy = ctx.config.privacy
-    notice_version = fields.notice_version if enabled else None
-    target = (enabled, notice_version, consented_at_utc)
-    current = tuple(
-        getattr(privacy, field) for field in (fields.enabled, fields.notice, fields.timestamp)
-    )
-    if current == target:
+    legacy_paths = {path for fields in _SCOPE_FIELDS.values() for path in fields.paths}
+    if privacy.disable_network_observability is (not enabled) and not any(
+        getattr(privacy, path.removeprefix("privacy.")) is not None
+        for path in legacy_paths
+    ):
         return False
 
     payload = ctx.config.model_dump(mode="python")
     privacy_payload = payload.setdefault("privacy", {})
     if not isinstance(privacy_payload, dict):
         raise TypeError("privacy config is unavailable")
-    privacy_payload[fields.enabled] = enabled
-    privacy_payload[fields.notice] = notice_version
-    privacy_payload[fields.timestamp] = consented_at_utc
+    privacy_payload["disable_network_observability"] = not enabled
+    for path in legacy_paths:
+        privacy_payload[path.removeprefix("privacy.")] = None
 
     candidate = GatewayConfig.model_validate(payload)
-    explicit_paths = set(fields.paths)
+    explicit_paths = legacy_paths | {"privacy.disable_network_observability"}
     inherit_then_clear_explicit(ctx.config, candidate, explicit_paths)
     candidate._mark_env_absorbed_secrets(payload)
     candidate.inherit_persist_provenance(ctx.config)
-    for path in fields.paths:
+    for path in explicit_paths:
         candidate.clear_runtime_override(path)
         candidate.mark_force_persist(path)
 
@@ -206,33 +152,6 @@ def _persist_failure(scope: TelemetryScope, enabled: bool, exc: Exception) -> Rp
         retryable=True,
         accepted=False,
         details={"scope": scope.value, "enabled": enabled},
-    )
-
-
-def _cleanup_failure(
-    scope: TelemetryScope,
-    *,
-    accepted: bool,
-    phase: str,
-    exc: Exception,
-) -> RpcHandlerError:
-    log.warning(
-        "gateway.telemetry_consent_cleanup_failed",
-        scope=scope.value,
-        phase=phase,
-        error=type(exc).__name__,
-    )
-    return RpcHandlerError(
-        "TELEMETRY_CONSENT_CLEANUP_FAILED",
-        "Local telemetry data could not be cleared completely. Try again.",
-        retryable=True,
-        accepted=accepted,
-        details={
-            "scope": scope.value,
-            "enabled": False,
-            "cleanupComplete": False,
-            "phase": phase,
-        },
     )
 
 
@@ -276,7 +195,7 @@ def _write_mirror(
     try:
         publish_desktop_consent_mirror(
             ctx.config,
-            fail_closed_scopes=(scope,) if fail_closed else (),
+            fail_closed_scopes=tuple(TelemetryScope) if fail_closed else (),
         )
     except Exception as exc:
         raise _mirror_failure(
@@ -332,137 +251,31 @@ async def _handle_telemetry_consent_set(
             retryable=True,
             accepted=False,
         )
-    async with coordinator.transition(scope):
-        privacy = ctx.config.privacy
-        previous_enabled = getattr(privacy, fields.enabled)
-
-        # A runtime/global veto may pause an existing grant, but it may never
-        # manufacture a new grant from an unset or declined record.
-        if enabled and previous_enabled is not True:
-            forced_off = telemetry_scope_forced_off_reasons(scope.value, config=ctx.config)
-            if forced_off:
-                raise RpcHandlerError(
-                    "TELEMETRY_CONSENT_FORCED_OFF",
-                    "This telemetry preference is disabled by current policy.",
-                    accepted=False,
-                    details={"scope": scope.value, "forcedOff": True},
-                )
-
-        # Close the Desktop producer before any cleanup or config mutation.
-        # The other scope is rebuilt from the still-authoritative live config.
-        _write_mirror(
-            scope,
-            ctx=ctx,
-            enabled=enabled,
-            fail_closed=True,
-            accepted=False,
-        )
-
-        cleanup_performed = False
-        if enabled:
-            # An explicit prior decline may have left state behind after a
-            # partial cleanup. Clear it before re-opening the collection gate.
-            if previous_enabled is False:
-                try:
-                    await _cleanup_scope(scope, ctx)
-                except Exception as exc:
-                    raise _cleanup_failure(
-                        scope,
-                        accepted=False,
-                        phase="before_enable",
-                        exc=exc,
-                    ) from exc
-                cleanup_performed = True
-
-            current_notice = getattr(privacy, fields.notice)
-            current_timestamp = getattr(privacy, fields.timestamp)
-            if (
-                previous_enabled is True
-                and current_notice == fields.notice_version
-                and isinstance(current_timestamp, str)
-                and current_timestamp
-            ):
-                # Also acts as the retry path after a prior final-mirror write
-                # failed: no config rewrite is needed, but Desktop can reopen.
-                _write_mirror(
-                    scope,
-                    ctx=ctx,
-                    enabled=True,
-                    fail_closed=False,
-                    accepted=True,
-                )
-                return _response(
-                    scope,
-                    enabled=True,
-                    notice_version=current_notice,
-                    consented_at_utc=current_timestamp,
-                    changed=False,
-                    cleanup_performed=cleanup_performed,
-                )
-
-            consented_at_utc = _utc_now()
-            try:
-                changed = _commit_record(
-                    ctx=ctx,
-                    fields=fields,
-                    enabled=True,
-                    consented_at_utc=consented_at_utc,
-                )
-            except Exception as exc:
-                raise _persist_failure(scope, True, exc) from exc
+    async with coordinator.transition(TelemetryScope.RELIABILITY):
+        async with coordinator.transition(TelemetryScope.GROWTH):
+            # The saved global preference may change while runtime vetoes
+            # (CI, DNT, or managed policy) continue to prevent actual uploads.
             _write_mirror(
-                scope,
-                ctx=ctx,
-                enabled=True,
-                fail_closed=False,
-                accepted=True,
+                scope, ctx=ctx, enabled=enabled, fail_closed=True, accepted=False,
+            )
+            try:
+                changed = _commit_record(ctx=ctx, enabled=enabled)
+            except Exception as exc:
+                raise _persist_failure(scope, enabled, exc) from exc
+            _write_mirror(
+                scope, ctx=ctx, enabled=enabled, fail_closed=False, accepted=True,
             )
             return _response(
                 scope,
-                enabled=True,
-                notice_version=fields.notice_version,
-                consented_at_utc=consented_at_utc,
+                enabled=enabled,
+                notice_version=fields.notice_version if enabled else None,
+                # Older clients require a timestamp to acknowledge this explicit
+                # preference action. It is not persisted as scoped consent and
+                # does not enter the upload-policy mirror or event envelope.
+                consented_at_utc=_utc_now() if enabled else None,
                 changed=changed,
-                cleanup_performed=cleanup_performed,
+                cleanup_performed=False,
             )
-
-        # Withdrawal is deliberately two-phase. Persist and hot-apply the
-        # closed gate first; only then erase queue/rejection/identity state.
-        # Repeated withdrawals still retry cleanup after an earlier partial
-        # failure, while avoiding an unnecessary config rewrite.
-        try:
-            changed = _commit_record(
-                ctx=ctx,
-                fields=fields,
-                enabled=False,
-                consented_at_utc=None,
-            )
-        except Exception as exc:
-            raise _persist_failure(scope, False, exc) from exc
-        try:
-            await _cleanup_scope(scope, ctx)
-        except Exception as exc:
-            raise _cleanup_failure(
-                scope,
-                accepted=True,
-                phase="after_disable",
-                exc=exc,
-            ) from exc
-        _write_mirror(
-            scope,
-            ctx=ctx,
-            enabled=False,
-            fail_closed=False,
-            accepted=True,
-        )
-        return _response(
-            scope,
-            enabled=False,
-            notice_version=None,
-            consented_at_utc=None,
-            changed=changed,
-            cleanup_performed=True,
-        )
 
 
 async def _handle_client_launch_record(
@@ -496,6 +309,33 @@ async def _handle_client_launch_record(
     return {"recorded": bool(recorded)}
 
 
+async def _handle_product_active_record(
+    params: dict[str, Any] | None,
+    ctx: RpcContext,
+) -> dict[str, Any]:
+    """Accept a content-free foreground activity observation from an owner UI."""
+
+    if (
+        not isinstance(params, dict)
+        or set(params) != {"surface"}
+        or type(params["surface"]) is not str
+        or params["surface"] not in {surface.value for surface in ClientSurface}
+    ):
+        raise RpcHandlerError(
+            "INVALID_REQUEST", "params must contain only a valid surface", accepted=False,
+        )
+    if not ctx.principal.is_owner or not ctx.principal.authenticated:
+        raise RpcHandlerError(
+            "UNAUTHORIZED", "An authenticated owner connection is required.", accepted=False,
+        )
+    sink = getattr(ctx.turn_runner, "growth_event_sink", None)
+    record = getattr(sink, "record_product_active", None)
+    if not callable(record):
+        return {"recorded": False}
+    recorded = await record(surface=ClientSurface(params["surface"]))
+    return {"recorded": bool(recorded)}
+
+
 _handle_telemetry_consent_set_contract = register_telemetry_contract(
     _d,
     "telemetry.consent.set",
@@ -510,10 +350,18 @@ _handle_client_launch_record_contract = register_telemetry_contract(
     internal_error=RpcHandlerError,
     guest_allowed_checker=is_guest_rpc_method_allowed,
 )
+_handle_product_active_record_contract = register_telemetry_contract(
+    _d,
+    "telemetry.product_active.record",
+    _handle_product_active_record,
+    internal_error=RpcHandlerError,
+    guest_allowed_checker=is_guest_rpc_method_allowed,
+)
 
 
 __all__ = [
     "_handle_client_launch_record",
+    "_handle_product_active_record",
     "_handle_telemetry_consent_set",
     "is_registered_tui_connection",
 ]

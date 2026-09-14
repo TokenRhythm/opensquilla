@@ -263,6 +263,7 @@ function launchEnvironment(isolatedHome, port) {
     OPENSQUILLA_TEST_PROFILE_LOCK_ROOT: '1',
     OPENSQUILLA_DESKTOP_GATEWAY_PORT: String(port),
     OPENSQUILLA_DESKTOP_DISABLE_AUTO_UPDATE: '1',
+    OPENSQUILLA_TESTING: '1',
     OPENSQUILLA_OPENROUTER_LIVE_PRICING: '0',
     UV_CACHE_DIR: join(isolatedHome, '.uv-cache'),
     HTTP_PROXY: 'http://127.0.0.1:1',
@@ -298,9 +299,9 @@ async function onboardingPage(app) {
   }, 'Desktop onboarding')
 }
 
-async function chooseTelemetryConsent(page, reliability = false, growth = false) {
-  await page.locator(`input[name="reliabilityDiagnosticsEnabled"][value="${reliability}"]`).check()
-  await page.locator(`input[name="productAnalyticsEnabled"][value="${growth}"]`).check()
+async function assertUnifiedTelemetryNotice(page) {
+  assert.equal(await page.locator('input[name="reliabilityDiagnosticsEnabled"], input[name="productAnalyticsEnabled"]').count(), 0)
+  assert.equal(await page.locator('[data-i18n="onboarding.telemetry.notice"]').count(), 1)
 }
 
 async function captureOnboarding(app, path) {
@@ -356,7 +357,7 @@ async function selectOllamaAndCompleteOnboarding(page) {
   if (!(await page.locator('#model').inputValue()).trim()) {
     await page.locator('#model').fill('synthetic-local-model')
   }
-  await chooseTelemetryConsent(page, false, false)
+  await assertUnifiedTelemetryNotice(page)
   await page.locator('#finish').click()
 }
 
@@ -590,7 +591,7 @@ try {
     join(settingsUserData, 'migration-provider-setup.json'),
   )
   await requiredKeyOnboarding.locator('#apiKey').fill('synthetic-new-imported-key')
-  await chooseTelemetryConsent(requiredKeyOnboarding, false, false)
+  await assertUnifiedTelemetryNotice(requiredKeyOnboarding)
   await requiredKeyOnboarding.locator('#finish').click()
 
   const rejectedProbeError = await waitFor(async () => {
@@ -651,17 +652,10 @@ try {
   )
   assert.equal(JSON.parse(fakeProvider.requests[1].body).model, 'gpt-5.4-mini')
   const adoptedConfig = await readFile(join(settingsTarget, 'config.toml'), 'utf8')
-  assert.match(adoptedConfig, /reliability_diagnostics_enabled = false/)
-  assert.match(adoptedConfig, /product_analytics_enabled = false/)
-  assert.doesNotMatch(adoptedConfig, /(?:reliability|product_analytics)_notice_version/)
-  assert.doesNotMatch(adoptedConfig, /(?:reliability|product_analytics)_consented_at_utc/)
   assert.equal(
-    adoptedConfig.replace(
-      /^reliability_diagnostics_enabled = false\r?\nproduct_analytics_enabled = false\r?\n/m,
-      '',
-    ),
+    adoptedConfig,
     importedConfigBeforeCredential.toString('utf8'),
-    'provider adoption changed imported config beyond explicit telemetry decisions',
+    'provider adoption must preserve the imported reporting configuration',
   )
   assert.deepEqual(
     await readFile(join(settingsTarget, '.env')),

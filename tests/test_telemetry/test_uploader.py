@@ -29,9 +29,37 @@ from opensquilla.telemetry.contracts import (
 )
 from opensquilla.telemetry.coordination import scope_consent_coordinator_for
 from opensquilla.telemetry.outbox import OutboxLimits, TelemetryOutbox
-from opensquilla.telemetry.uploader import TelemetryUploader, UploadStatus
+from opensquilla.telemetry.uploader import TelemetryUploader, UploadStatus, _endpoint_url
 
 _PROTOCOL_MANIFEST = telemetry_protocol_manifest()
+
+
+@pytest.mark.parametrize("scope", list(TelemetryScope))
+@pytest.mark.parametrize("prefix", ["", "/", "/test", "/test/", "/test/preview-v2"])
+def test_endpoint_preserves_explicit_prefix(scope: TelemetryScope, prefix: str) -> None:
+    assert str(_endpoint_url("https://telemetry.invalid" + prefix, scope)) == (
+        "https://telemetry.invalid" + prefix.rstrip("/") + f"/v1/{scope.value}/events"
+    )
+
+
+@pytest.mark.parametrize(
+    "base_url",
+    [
+        "",
+        "http://telemetry.invalid/test",
+        "https://user:secret@telemetry.invalid/test",
+        "https://telemetry.invalid/test?secret=x",
+        "https://telemetry.invalid/test#fragment",
+        "https://telemetry.invalid/test/../",
+        "https://telemetry.invalid/test/./nested",
+        "https://telemetry.invalid/test/%2e%2e",
+        "https://telemetry.invalid/test%2fnested",
+        "https://telemetry.invalid/test//nested",
+    ],
+)
+def test_endpoint_rejects_invalid_or_ambiguous_overrides(base_url: str) -> None:
+    with pytest.raises(ValueError):
+        _endpoint_url(base_url, TelemetryScope.RELIABILITY)
 
 
 def _uuid(number: int) -> str:
@@ -171,6 +199,7 @@ async def _uploader(
     clock: FakeClock | None = None,
     limits: OutboxLimits | None = None,
     random_value: Callable[[], float] = lambda: 0.5,
+    base_url: str = "https://telemetry.invalid",
 ) -> tuple[TelemetryOutbox, TelemetryUploader, httpx.AsyncClient]:
     outbox = await TelemetryOutbox.open(tmp_path, scope, clock=clock, limits=limits)
     client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
@@ -181,7 +210,7 @@ async def _uploader(
     )
     uploader = TelemetryUploader(
         outbox,
-        base_url="https://telemetry.invalid",
+        base_url=base_url,
         config=config,
         http_client=client,
         clock=clock,
@@ -193,8 +222,12 @@ async def _uploader(
     return outbox, uploader, client
 
 
-async def test_202_accepted_deletes_reliability_batch_and_uses_scope_endpoint(
+@pytest.mark.parametrize("scope", list(TelemetryScope))
+@pytest.mark.parametrize("prefix", ["", "/isolated-test/"])
+async def test_202_accepted_deletes_batch_and_uses_scoped_destination(
     tmp_path: Path,
+    scope: TelemetryScope,
+    prefix: str,
 ) -> None:
     seen: list[httpx.Request] = []
 
@@ -202,16 +235,22 @@ async def test_202_accepted_deletes_reliability_batch_and_uses_scope_endpoint(
         seen.append(request)
         return _accepted_response(request)
 
-    outbox, uploader, client = await _uploader(tmp_path, handler)
+    outbox, uploader, client = await _uploader(
+        tmp_path,
+        handler,
+        scope=scope,
+        base_url="https://telemetry.invalid" + prefix,
+    )
     try:
-        await outbox.enqueue(_turn_event())
+        event = _turn_event() if scope is TelemetryScope.RELIABILITY else _growth_event()
+        await outbox.enqueue(event)
 
         result = await uploader.upload_once()
 
         assert result.status is UploadStatus.UPLOADED
         assert result.event_count == 1
         assert (await outbox.stats()).pending_events == 0
-        assert seen[0].url.path == "/v1/reliability/events"
+        assert seen[0].url.path == prefix.rstrip("/") + f"/v1/{scope.value}/events"
         assert seen[0].headers["content-type"] == "application/json"
     finally:
         await uploader.close()
@@ -280,13 +319,11 @@ async def test_ambiguous_or_unbounded_202_receipt_never_acknowledges(
         batch_id = json.loads(request.content)["batch_id"]
         if variant == "duplicate_key":
             content = (
-                f'{{"ok":true,"batch_id":"{batch_id}",'
-                '"accepted":0,"accepted":1,"duplicates":0}'
+                f'{{"ok":true,"batch_id":"{batch_id}","accepted":0,"accepted":1,"duplicates":0}}'
             ).encode()
         elif variant == "extra_field":
             content = (
-                f'{{"ok":true,"batch_id":"{batch_id}",'
-                '"accepted":1,"duplicates":0,"unexpected":0}'
+                f'{{"ok":true,"batch_id":"{batch_id}","accepted":1,"duplicates":0,"unexpected":0}}'
             ).encode()
         elif variant == "deep":
             nested = "[" * 17 + "0" + "]" * 17
@@ -305,10 +342,7 @@ async def test_ambiguous_or_unbounded_202_receipt_never_acknowledges(
                 '"accepted":1,"duplicates":0,"unexpected":Infinity}'
             ).encode()
         else:
-            valid = (
-                f'{{"ok":true,"batch_id":"{batch_id}",'
-                '"accepted":1,"duplicates":0}'
-            ).encode()
+            valid = (f'{{"ok":true,"batch_id":"{batch_id}","accepted":1,"duplicates":0}}').encode()
             content = valid + (b" " * (17 * 1024))
         return httpx.Response(202, content=content)
 
@@ -697,7 +731,6 @@ async def test_revoke_transition_waits_for_already_started_request(
             nonlocal current
             async with coordinator.transition(TelemetryScope.RELIABILITY):
                 current = _consent_state(decision=ConsentDecision.DECLINED)
-                await outbox.clear_scope()
 
         revoke_task = asyncio.create_task(revoke())
         await asyncio.sleep(0)
