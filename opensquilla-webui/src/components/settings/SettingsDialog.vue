@@ -594,8 +594,7 @@ function navigateAway() {
   // directly (same breakpoint/platform branch as the '/' redirect in sharedRoutes)
   // so close is a single, predictable, loop-proof exit. `returnTo` is already
   // null for a cold deep link (onMounted rejects any '/settings…' back-entry).
-  const fallback = isDesktop || window.matchMedia('(max-width: 768px)').matches ? '/chat' : '/sessions'
-  void router.push(returnTo ?? fallback)
+  void router.push(returnTo ?? '/chat')
 }
 
 // The modal's leave transition finished — perform the deferred navigation that

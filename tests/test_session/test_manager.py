@@ -5144,3 +5144,97 @@ async def test_archive(manager):
     await manager.archive("agent:main:main")
     node = await manager._storage.get_session("agent:main:main")
     assert node.status == SessionStatus.DONE
+
+
+@pytest.mark.parametrize("failure", [None, "empty", "length", "missing_done", "oversized", "error"])
+async def test_suffix_manual_compaction_preserves_sqlite_source_until_valid_summary(
+    manager, monkeypatch, failure
+):
+    from opensquilla.provider.types import (
+        ChatConfig,
+        DoneEvent,
+        ErrorEvent,
+        TextDeltaEvent,
+        ToolDefinition,
+    )
+    from opensquilla.session.compaction import CompactionRequestContext
+    from opensquilla.session.compaction_deployment import (
+        CompactionExecutionPlan,
+        CompactionExecutionTarget,
+    )
+
+    monkeypatch.setenv("OPENSQUILLA_COMPACTION_PROMPT_LAYOUT", "suffix")
+    node = await manager.create("agent:test:suffix-manual")
+    for index in range(12):
+        await manager.append_message(
+            node.session_key,
+            "user" if index % 2 == 0 else "assistant",
+            f"Historical exchange {index}. " + "Routine context. " * 50,
+            token_count=250,
+        )
+    before = await manager.get_transcript(node.session_key)
+    requests = []
+
+    class CapturingProvider:
+        async def chat(self, messages, tools=None, config=None):
+            requests.append((messages, tools, config))
+            if failure == "error":
+                yield ErrorEvent(message="synthetic provider failure")
+                return
+            if failure != "empty":
+                yield TextDeltaEvent(
+                    text=("Long summary. " * 2000 if failure == "oversized" else
+                          "The historical exchanges are complete. No outstanding work.")
+                )
+            if failure != "missing_done":
+                yield DoneEvent(
+                    stop_reason="length" if failure == "length" else "end_turn",
+                    output_tokens=32,
+                )
+
+    config = CompactionConfig(
+        llm_plan=CompactionExecutionPlan(candidates=(CompactionExecutionTarget(
+            provider=CapturingProvider(), provider_id="test", model="current-model",
+            context_window_tokens=20_000,
+        ),)),
+        request_context=CompactionRequestContext(
+            chat_config=ChatConfig(system="Current system", max_tokens=4096, thinking=True),
+            tools=(ToolDefinition(name="lookup", description="Find facts", input_schema={}),),
+        ),
+        protected_recent_messages=2,
+    )
+    result = await manager.compact_with_result(
+        node.session_key, context_window_tokens=1000, config=config, trigger_reason="manual",
+    )
+    assert len(requests) == 1
+    messages, tools, sent_config = requests[0]
+    assert sent_config.system == "Current system"
+    assert sent_config.max_tokens == 4096
+    assert tools[0].name == "lookup"
+    assert "portable checkpoint" in messages[-1].content
+    after = await manager.get_transcript(node.session_key)
+    summaries = await manager.get_summaries(node.session_key)
+    async with manager._storage.conn.execute(
+        "SELECT message_id, content FROM compacted_transcript_entries "
+        "WHERE session_id = ? ORDER BY original_entry_id", (node.session_id,),
+    ) as cursor:
+        archived = await cursor.fetchall()
+    if failure:
+        assert result.removed_count == 0
+        assert [entry.model_dump() for entry in after] == [entry.model_dump() for entry in before]
+        assert summaries == []
+        assert archived == []
+    else:
+        assert result.removed_count > 0
+        assert [message.content for message in messages[:-1]] == [
+            entry.content for entry in before[:result.removed_count]
+        ]
+        assert [entry.message_id for entry in after] == [
+            entry.message_id for entry in before[result.removed_count:]
+        ]
+        assert [(row[0], row[1]) for row in archived] == [
+            (entry.message_id, entry.content) for entry in before[:result.removed_count]
+        ]
+        assert len(summaries) == 1
+        replay = format_compaction_summary_context([summaries[0].summary_text])
+        assert "historical exchanges are complete" in replay

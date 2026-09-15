@@ -1076,6 +1076,7 @@ class _TurnRunnerT3UpgradeCompactionAdapter(T3UpgradeCompactionPort):
         compaction_provider: Any | None,
         compaction_model: str | None,
         compaction_plan: Any | None = None,
+        compaction_request_context: Any | None = None,
         history_capacity_tokens: int | None = None,
         history_capacity_chars: int | None = None,
         history_has_persisted_user: bool = False,
@@ -1091,6 +1092,10 @@ class _TurnRunnerT3UpgradeCompactionAdapter(T3UpgradeCompactionPort):
         from opensquilla.engine.runtime import _accepts_keyword_arg
 
         correlation_kwargs: dict[str, Any] = {}
+        if compaction_request_context is not None and _accepts_keyword_arg(
+            self._runner._maybe_compact_on_t3_upgrade, "compaction_request_context"
+        ):
+            correlation_kwargs["compaction_request_context"] = compaction_request_context
         if attachment_path_resolver is not None and _accepts_keyword_arg(
             self._runner._maybe_compact_on_t3_upgrade,
             "attachment_path_resolver",
@@ -1177,6 +1182,7 @@ class _TurnRunnerPreflightCompactionAdapter(PreflightCompactionPort):
         compaction_provider: Any | None,
         compaction_model: str | None,
         compaction_plan: Any | None = None,
+        compaction_request_context: Any | None = None,
         history_capacity_tokens: int | None = None,
         history_capacity_chars: int | None = None,
         history_has_persisted_user: bool = False,
@@ -1192,6 +1198,10 @@ class _TurnRunnerPreflightCompactionAdapter(PreflightCompactionPort):
         from opensquilla.engine.runtime import _accepts_keyword_arg
 
         correlation_kwargs: dict[str, Any] = {}
+        if compaction_request_context is not None and _accepts_keyword_arg(
+            self._runner._maybe_preflight_compact, "compaction_request_context"
+        ):
+            correlation_kwargs["compaction_request_context"] = compaction_request_context
         if attachment_path_resolver is not None and _accepts_keyword_arg(
             self._runner._maybe_preflight_compact,
             "attachment_path_resolver",

@@ -223,9 +223,11 @@ from opensquilla.sandbox.elevation import (
 from opensquilla.session.compaction import (
     CompactionConfig,
     CompactionRequest,
+    CompactionRequestContext,
     arm_compaction_deadline,
     build_compaction_config_from_provider,
     compact_context,
+    compaction_prompt_layout,
     compaction_remaining_seconds,
     compaction_replay_summary,
     require_compaction_time,
@@ -2469,6 +2471,7 @@ class Agent:
         self._session_flush_service = session_flush_service
         self._last_compaction_refusal_reason: str | None = None
         self._pending_durable_compaction_event: CompactionEvent | None = None
+        self._compaction_request_context: CompactionRequestContext | None = None
         # Stable session/base consumer identity. Turn routing and ensemble
         # wrapping may replace ``self.provider`` with a narrower physical leg,
         # but that one-call choice must never redefine the window that owns
@@ -3028,6 +3031,35 @@ class Agent:
             ),
             tool_choice=None,
             provider_request_correlation=self._provider_request_correlation,
+        )
+
+    def build_compaction_request_context(
+        self, active_user_message: str = ""
+    ) -> CompactionRequestContext | None:
+        """Freeze current request settings for one suffix compaction operation."""
+        if compaction_prompt_layout() != "suffix":
+            return None
+        current = self._compaction_request_context
+        if current is not None:
+            chat_config = current.chat_config
+            tools = current.tools
+        else:
+            chat_config = self._provider_admission_chat_config(
+                active_user_message,
+                context_window_tokens=self.config.context_window_tokens,
+                max_output_tokens=self.config.max_tokens,
+            )
+            tools = tuple(self.tool_definitions) or None
+            if getattr(self.config.model_capabilities, "supports_tools", None) is False:
+                tools = None
+        resolve_config = getattr(self.provider, "compaction_chat_config", None)
+        if callable(resolve_config):
+            chat_config = resolve_config(chat_config)
+        if getattr(chat_config.model_capabilities, "supports_tools", None) is False:
+            tools = None
+        return CompactionRequestContext(
+            chat_config=chat_config.model_copy(deep=True),
+            tools=tuple(tool.model_copy(deep=True) for tool in tools) if tools else None,
         )
 
     def _project_durable_consumer_final_request(
@@ -5811,6 +5843,7 @@ class Agent:
             prune_once_mount_grants,
         )
         self._tool_reliability_states.clear()
+        self._compaction_request_context = None
         pending_tool_terminal = (ToolOutcome.FAIL, ToolErrorCode.INTERNAL_ERROR)
 
         self._prompt_cache_keepalive_candidate = None
@@ -5874,6 +5907,7 @@ class Agent:
         finally:
             self._flush_pending_tool_reliability(terminal=pending_tool_terminal)
             self._freeze_current_replay_view()
+            self._compaction_request_context = None
             self._image_analysis_provider_wrapper = None
             for snapshot_context, previous_writer in snapshot_context_bindings:
                 snapshot_context.tool_result_snapshot_writer = previous_writer
@@ -6213,6 +6247,10 @@ class Agent:
             context_window_tokens=self.config.context_window_tokens,
             max_output_tokens=self.config.max_tokens,
         )
+        if compaction_prompt_layout() == "suffix":
+            self._compaction_request_context = self.build_compaction_request_context(
+                thinking_prompt
+            )
         _log = structlog.get_logger("opensquilla.engine.agent")
 
         def _positive_float(value: Any) -> float | None:
@@ -7642,6 +7680,16 @@ class Agent:
                                 yield terminal_error
                             break
 
+                    if compaction_prompt_layout() == "suffix":
+                        self._compaction_request_context = CompactionRequestContext(
+                            chat_config=call_chat_cfg.model_copy(deep=True),
+                            tools=(
+                                tuple(
+                                    tool.model_copy(deep=True) for tool in provider_tools_for_call
+                                )
+                                if provider_tools_for_call else None
+                            ),
+                        )
                     self._write_turn_call_log(
                         "llm_request",
                         call_id=call_id,
@@ -13778,6 +13826,8 @@ class Agent:
                     "token_count": real_tokens,
                 }
             )
+            if compaction_prompt_layout() == "suffix":
+                entries[-1]["_provider_message"] = message.model_copy(deep=True)
         return entries
 
     @staticmethod
@@ -14595,6 +14645,7 @@ class Agent:
             context_window_tokens=self.config.context_window_tokens,
         )
         config.compaction_profile = self.config.compaction_profile
+        config.request_context = self.build_compaction_request_context()
         config.protected_recent_messages = self.config.compaction_protected_recent_messages
         config.total_timeout_seconds = self.config.compaction_total_timeout_seconds
         config.heartbeat_interval_seconds = self.config.compaction_heartbeat_interval_seconds

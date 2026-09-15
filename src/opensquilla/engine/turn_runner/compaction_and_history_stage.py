@@ -55,6 +55,7 @@ if TYPE_CHECKING:
         TurnTranscriptSnapshot,
     )
     from opensquilla.provider.types import ProviderRequestCorrelation
+    from opensquilla.session.compaction import CompactionRequestContext
     from opensquilla.session.compaction_deployment import CompactionExecutionPlan
 
 # Internal sentinels mirroring the runtime.py module-level constants. The
@@ -99,6 +100,7 @@ class T3UpgradeCompactionPort(Protocol):
         compaction_provider: Any | None,
         compaction_model: str | None,
         compaction_plan: CompactionExecutionPlan | None = None,
+        compaction_request_context: CompactionRequestContext | None = None,
         history_capacity_tokens: int | None = None,
         history_capacity_chars: int | None = None,
         history_has_persisted_user: bool = False,
@@ -135,6 +137,7 @@ class PreflightCompactionPort(Protocol):
         compaction_provider: Any | None,
         compaction_model: str | None,
         compaction_plan: CompactionExecutionPlan | None = None,
+        compaction_request_context: CompactionRequestContext | None = None,
         history_capacity_tokens: int | None = None,
         history_capacity_chars: int | None = None,
         history_has_persisted_user: bool = False,
@@ -234,6 +237,9 @@ class CompactionAndHistoryStageInput:
     compaction_plan: CompactionExecutionPlan | None = field(
         default=None,
         repr=False,
+    )
+    compaction_request_context: CompactionRequestContext | None = field(
+        default=None, repr=False
     )
     history_capacity_tokens: int | None = None
     history_capacity_chars: int | None = None
@@ -365,6 +371,8 @@ class CompactionAndHistoryStage:
             )
             await self._fire_before_compact(t3_state)
             t3_kwargs: dict[str, Any] = {}
+            if inp.compaction_request_context is not None:
+                t3_kwargs["compaction_request_context"] = inp.compaction_request_context
             if inp.attachment_path_resolver is not None:
                 t3_kwargs["attachment_path_resolver"] = inp.attachment_path_resolver
             if inp.transcript_snapshot is not None:
@@ -402,6 +410,8 @@ class CompactionAndHistoryStage:
                 )
                 await self._fire_before_compact(preflight_state)
                 preflight_kwargs: dict[str, Any] = {}
+                if inp.compaction_request_context is not None:
+                    preflight_kwargs["compaction_request_context"] = inp.compaction_request_context
                 if inp.attachment_path_resolver is not None:
                     preflight_kwargs["attachment_path_resolver"] = inp.attachment_path_resolver
                 if inp.transcript_snapshot is not None:

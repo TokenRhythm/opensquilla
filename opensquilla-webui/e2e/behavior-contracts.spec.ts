@@ -179,7 +179,7 @@ const PNG_1X1 = Buffer.from(
 
 test.describe('Vue behavior contracts', () => {
   test('unknown routes render the 404 actions without replacing the last stable route', async ({ page }) => {
-    await page.addInitScript(() => localStorage.setItem('opensquilla-last-route', '/sessions'))
+    await page.addInitScript(() => localStorage.setItem('opensquilla-last-route', '/chat'))
     await installMockGateway(page)
 
     await page.goto(CONTROL_URL + 'removed-legacy-screen')
@@ -187,16 +187,15 @@ test.describe('Vue behavior contracts', () => {
     await expect(notFound).toBeVisible()
     await expect(notFound.getByText('404', { exact: true })).toBeVisible()
     await expect(notFound.getByRole('button', { name: 'Go to Chat' })).toBeVisible()
-    await expect(notFound.getByRole('button', { name: 'Sessions' })).toBeVisible()
     await expect.poll(() => page.evaluate(() => localStorage.getItem('opensquilla-last-route')))
-      .toBe('/sessions')
+      .toBe('/chat')
 
     await notFound.getByRole('button', { name: 'Go to Chat' }).click()
     await expect(page).toHaveURL(/\/control\/chat(?:\?|$)/)
 
     await page.goto(CONTROL_URL + 'still-not-a-route')
-    await page.locator('.not-found').getByRole('button', { name: 'Sessions' }).click()
-    await expect(page).toHaveURL(/\/control\/sessions(?:\?|$)/)
+    await page.locator('.not-found').getByRole('button', { name: 'Go to Chat' }).click()
+    await expect(page).toHaveURL(/\/control\/chat(?:\?|$)/)
   })
 
   test('drawer, nested preview, and lightbox own Escape while composer Escape aborts once', async ({ page }) => {

@@ -6,9 +6,11 @@ import asyncio
 import hashlib
 import inspect
 import json
+import os
 import time
 import uuid
 from collections.abc import Awaitable, Callable, Mapping, Sequence
+from copy import deepcopy
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal, cast
 
@@ -19,7 +21,10 @@ from opensquilla.artifacts import artifact_history_context
 from opensquilla.env import trust_env as _trust_env
 from opensquilla.provider.app_attribution import provider_app_headers
 from opensquilla.provider.failures import classify_provider_error
-from opensquilla.provider.protocol import provider_connection_config
+from opensquilla.provider.protocol import (
+    project_provider_final_request,
+    provider_connection_config,
+)
 from opensquilla.provider.replay_budget import project_message_replay_budget
 from opensquilla.provider.tokenrhythm_correlation import (
     redact_tokenrhythm_install_ids,
@@ -33,6 +38,7 @@ from opensquilla.provider.types import (
     Message,
     ReasoningDeltaEvent,
     TextDeltaEvent,
+    ToolDefinition,
     derive_provider_request_correlation,
 )
 from opensquilla.redaction import redact_error_text
@@ -69,6 +75,22 @@ _COMPACTION_STREAM_CANCEL_GRACE_SECONDS = 0.05
 _MAX_CUSTOM_INSTRUCTIONS_CHARS = 2000
 CompactionProfile = Literal["conversation", "coding", "research", "support"]
 CompactionTrigger = Literal["token_budget", "message_count"]
+
+
+def compaction_prompt_layout() -> Literal["prefix", "suffix"]:
+    """Keep the suffix rollout opt-in without changing public configuration."""
+
+    if os.environ.get("OPENSQUILLA_COMPACTION_PROMPT_LAYOUT", "").strip().lower() == "suffix":
+        return "suffix"
+    return "prefix"
+
+
+@dataclass(frozen=True)
+class CompactionRequestContext:
+    """Current request settings, detached from any historical message snapshot."""
+
+    chat_config: ChatConfig = field(repr=False)
+    tools: tuple[ToolDefinition, ...] | None = field(default=None, repr=False)
 
 
 @dataclass
@@ -131,6 +153,9 @@ class CompactionConfig:
     # Runtime-owned materializer. It returns only verified workspace paths,
     # and is absent when image retention is disabled or no workspace exists.
     attachment_path_resolver: Callable[[dict[str, Any], str], str | None] | None = field(
+        default=None, repr=False, compare=False,
+    )
+    request_context: CompactionRequestContext | None = field(
         default=None, repr=False, compare=False,
     )
 
@@ -1106,6 +1131,27 @@ def _compaction_target_input_budget(
         or 0
     )
     output_reserve = int(getattr(target, "max_output_tokens", 0) or 1024)
+    context = request.config.request_context
+    if compaction_prompt_layout() == "suffix" and context is not None:
+        output_reserve = context.chat_config.max_tokens
+        if target is not None:
+            messages, tools, config = _build_suffix_compaction_call(
+                context, [], "", "", None,
+                provider=target.provider,
+                summary_output_tokens=target.max_output_tokens,
+                timeout=request.config.timeout_seconds,
+                provider_request_correlation=None,
+            )
+            projection = project_provider_final_request(target.provider, messages, tools, config)
+            if projection is not None:
+                output_reserve = _projected_generation_budget(projection.payload, config)
+                output_reserve += int(projection.proof.get("estimated_tokens") or 0)
+            else:
+                output_reserve += _estimate_tokens(_json_text({
+                    "system": config.system,
+                    "messages": [message.model_dump(mode="json") for message in messages],
+                    "tools": [tool.model_dump(mode="json") for tool in tools] if tools else None,
+                }))
     framing_reserve = max(128, context_window // 20)
     token_budget = max(1, context_window - output_reserve - framing_reserve)
     char_cap = int(getattr(target, "provider_request_max_chars", 0) or 0)
@@ -1734,6 +1780,146 @@ def _build_compaction_prompt(
     return system, user_content
 
 
+def _build_suffix_compaction_call(
+    context: CompactionRequestContext,
+    source_entries: list[dict[str, Any]],
+    previous_summary: str,
+    identifier_instruction: str,
+    custom_instructions: str | None,
+    *,
+    provider: Any,
+    summary_output_tokens: int,
+    timeout: float,
+    provider_request_correlation: ProviderRequestCorrelation | None,
+) -> tuple[list[Message], list[ToolDefinition] | None, ChatConfig]:
+    # Use the same durable-history reconstruction as ordinary requests. The
+    # caller has already selected the exact source range; a previous outbound
+    # request is neither its coverage proof nor its source of messages.
+    from opensquilla.engine.history import reconstruct_messages_from_entry, repair_tool_pairing
+    from opensquilla.engine.session_sanitize import (
+        project_historical_tool_payloads,
+        sanitize_session_messages,
+    )
+
+    messages: list[Message] = []
+    for entry in source_entries:
+        provider_message = entry.get("_provider_message")
+        if isinstance(provider_message, Message):
+            messages.append(provider_message.model_copy(deep=True))
+        else:
+            if str(entry.get("role") or "") not in {"user", "assistant"}:
+                raise _CompactionProviderError("suffix source has an unsupported history role")
+            messages.extend(
+                reconstruct_messages_from_entry(
+                    str(entry.get("role") or ""),
+                    entry.get("content") or "",
+                    entry.get("tool_calls"),
+                    entry.get("reasoning_content"),
+                    assistant_replay=entry.get("assistant_replay"),
+                    turn_context=entry.get("turn_context"),
+                )
+            )
+    messages, _ = sanitize_session_messages(messages)
+    messages, _ = project_historical_tool_payloads(
+        messages, preserve_reasoning_content=True,
+    )
+    messages = repair_tool_pairing(messages)
+    requires_replay = getattr(provider, "requires_complete_reasoning_history", None)
+    replay_compatible = getattr(provider, "can_replay_reasoning", None)
+    if (
+        callable(requires_replay)
+        and callable(replay_compatible)
+        and requires_replay(tools=context.tools, thinking=context.chat_config.thinking) is True
+    ):
+        # Match the main request's physical-provider continuation projection.
+        # This quotes incompatible history without changing the frozen source.
+        from opensquilla.engine.replay_compat import rebase_incomplete_reasoning_history
+
+        messages, _ = rebase_incomplete_reasoning_history(
+            messages, compatible=replay_compatible,
+        )
+    instruction = (
+        "Summarize the preceding conversation into a portable checkpoint. "
+        "Preserve key facts, decisions, unresolved questions and action items. "
+        "Write in the conversation's language. Return only the summary; do not call tools. "
+        f"Keep the summary within {summary_output_tokens} tokens."
+    )
+    if identifier_instruction:
+        instruction += f"\n\n{identifier_instruction}"
+    normalized = _normalize_custom_instructions(custom_instructions)
+    if normalized:
+        instruction += f"\n\nAdditional summary instructions:\n{normalized}"
+    if previous_summary:
+        instruction += (
+            "\n\nCarry forward the still-relevant information from this prior checkpoint "
+            "into the replacement summary:\n" + previous_summary
+        )
+    messages.append(Message(role="user", content=instruction))
+    config = context.chat_config.model_copy(
+        deep=True,
+        update={
+            "timeout": timeout,
+            "candidate_output_mode": "inert_artifact",
+            "physical_attempt_limit": 1,
+            "active_user_message_index": len(messages) - 1,
+            "provider_request_correlation": provider_request_correlation,
+        },
+    )
+    tools = deepcopy(list(context.tools)) if context.tools is not None else None
+    return messages, tools, config
+
+
+def _projected_generation_budget(payload: dict[str, Any], config: ChatConfig) -> int:
+    return next(
+        (
+            int(payload[key])
+            for key in ("max_output_tokens", "max_completion_tokens", "max_tokens")
+            if isinstance(payload.get(key), int) and int(payload[key]) > 0
+        ),
+        config.max_tokens,
+    )
+
+
+def _suffix_generation_budget(
+    target: CompactionExecutionTarget,
+    messages: list[Message],
+    tools: list[ToolDefinition] | None,
+    config: ChatConfig,
+) -> int:
+    """Check the final input and reserve the adapter's effective generation cap."""
+
+    projection = project_provider_final_request(target.provider, messages, tools, config)
+    if projection is None and callable(getattr(target.provider, "project_final_request", None)):
+        raise _CompactionProviderError("could not project suffix compaction request")
+    if projection is not None:
+        if not projection.fits:
+            raise _CompactionProviderError("suffix compaction request exceeds provider limits")
+        payload = projection.payload
+        generation_budget = _projected_generation_budget(payload, config)
+        input_tokens = int(projection.proof.get("estimated_tokens") or 0)
+        if input_tokens <= 0:
+            input_tokens = _estimate_tokens(_json_text(payload))
+    else:
+        # Extension providers may not implement final-request projection. Keep
+        # compatibility while accounting for all known input, including tools.
+        payload = {
+            "system": config.system,
+            "messages": [message.model_dump(mode="json") for message in messages],
+            "tools": [tool.model_dump(mode="json") for tool in tools] if tools else None,
+        }
+        generation_budget = config.max_tokens
+        input_tokens = _estimate_tokens(_json_text(payload))
+        char_cap = config.provider_request_max_chars or target.provider_request_max_chars
+        if char_cap > 0 and len(_json_text(payload)) > char_cap:
+            raise _CompactionProviderError("suffix compaction request exceeds character limit")
+    if generation_budget <= 0 or (
+        target.context_window_tokens > 0
+        and input_tokens + generation_budget > target.context_window_tokens
+    ):
+        raise _CompactionProviderError("suffix compaction input leaves insufficient output budget")
+    return generation_budget
+
+
 def _consume_compaction_close_result(task: asyncio.Future[Any]) -> None:
     """Consume a detached close result without surfacing a late cleanup failure."""
 
@@ -1842,8 +2028,11 @@ async def call_compaction_provider(
     compaction_id: str | None = None,
     chunk_index: int | None = None,
     candidate_index: int = 0,
+    request_context: CompactionRequestContext | None = None,
+    source_entries: list[dict[str, Any]] | None = None,
+    previous_summary: str = "",
 ) -> str | None:
-    """Summarize through the provider protocol, with tools and thinking disabled."""
+    """Summarize a selected source range through the provider protocol."""
 
     if timeout <= 0:
         return None
@@ -1851,6 +2040,7 @@ async def call_compaction_provider(
     if candidate_index < 0 or candidate_index >= len(plan.candidates):
         return None
     deployment = plan.candidates[candidate_index]
+    suffix = request_context is not None and compaction_prompt_layout() == "suffix"
     system, user_content = _build_compaction_prompt(
         chunk_text,
         identifier_instruction,
@@ -1870,6 +2060,8 @@ async def call_compaction_provider(
         physical_attempt_limit=1,
         provider_request_correlation=provider_request_correlation,
     )
+    tools: list[ToolDefinition] | None = None
+    generation_budget = deployment.max_output_tokens
 
     # Keep this import local: engine types import session lifecycle helpers
     # while the session package initializes this module.
@@ -1890,10 +2082,28 @@ async def call_compaction_provider(
         timeout_seconds=timeout,
     )
     try:
+        if suffix:
+            assert request_context is not None
+            if source_entries is None:
+                raise _CompactionProviderError("suffix compaction requires its selected source")
+            messages, tools, chat_config = _build_suffix_compaction_call(
+                request_context,
+                source_entries,
+                previous_summary,
+                identifier_instruction,
+                custom_instructions,
+                provider=deployment.provider,
+                summary_output_tokens=deployment.max_output_tokens,
+                timeout=timeout,
+                provider_request_correlation=provider_request_correlation,
+            )
+            generation_budget = _suffix_generation_budget(
+                deployment, messages, tools, chat_config,
+            )
         if provider_accounts_physical_usage(deployment.provider):
             provider_stream = deployment.provider.chat(
                 messages,
-                tools=None,
+                tools=tools,
                 config=chat_config,
             )
             accounted_stream = provider_stream
@@ -1902,7 +2112,7 @@ async def call_compaction_provider(
                 nonlocal provider_stream
                 provider_stream = deployment.provider.chat(
                     messages,
-                    tools=None,
+                    tools=tools,
                     config=chat_config,
                 )
                 return provider_stream
@@ -1917,6 +2127,7 @@ async def call_compaction_provider(
         reasoning_chunks: list[str] = []
         saw_done = False
         reported_output_tokens = 0
+        reported_reasoning_tokens = 0
         terminal_reasoning_content = ""
 
         def _enforce_output_budget() -> None:
@@ -1926,9 +2137,16 @@ async def call_compaction_provider(
             reasoning_text = streamed_reasoning or terminal_reasoning_content
             reasoning_tokens = _estimate_tokens(reasoning_text) if reasoning_text else 0
             estimated_output_tokens = visible_tokens + reasoning_tokens
-            if max(reported_output_tokens, estimated_output_tokens) > (
-                deployment.max_output_tokens
-            ):
+            if suffix and visible_tokens > deployment.max_output_tokens:
+                raise _CompactionProviderError("summary body exceeded compaction token budget")
+            # output_tokens commonly includes reasoning_tokens. Compare totals
+            # without adding the same reported reasoning twice; some adapters
+            # expose reasoning only in the terminal usage event.
+            if max(
+                reported_output_tokens,
+                estimated_output_tokens,
+                reported_reasoning_tokens + visible_tokens,
+            ) > generation_budget:
                 raise _CompactionProviderError(
                     "provider output exceeded compaction token budget"
                 )
@@ -1940,6 +2158,10 @@ async def call_compaction_provider(
                     if isinstance(event, ErrorEvent):
                         _report_compaction_credential_failure(deployment, event)
                     raise _CompactionProviderError(message)
+                if str(getattr(event, "kind", "")).startswith("tool_use"):
+                    raise _CompactionProviderError(
+                        "provider returned a tool call instead of summary"
+                    )
                 if isinstance(event, TextDeltaEvent) or getattr(event, "kind", "") == "text_delta":
                     text = str(getattr(event, "text", "") or "")
                     if text:
@@ -1956,9 +2178,16 @@ async def call_compaction_provider(
                 elif isinstance(event, DoneEvent) or getattr(event, "kind", "") == "done":
                     # Usage accounting finalizes on the same terminal event.
                     saw_done = True
+                    if str(getattr(event, "stop_reason", "") or "").lower() not in {
+                        "end_turn", "stop", "stop_sequence", "completed",
+                    }:
+                        raise _CompactionProviderError("provider returned an incomplete summary")
                     reported_output_tokens = max(
                         0,
                         int(getattr(event, "output_tokens", 0) or 0),
+                    )
+                    reported_reasoning_tokens = max(
+                        0, int(getattr(event, "reasoning_tokens", 0) or 0),
                     )
                     terminal_reasoning_content = str(
                         getattr(event, "reasoning_content", "") or ""
@@ -2421,6 +2650,22 @@ async def compact_context_new(request: CompactionRequest) -> CompactionResult:
         )
 
     provider_native = cfg.llm_plan is not None
+    suffix = bool(
+        cfg.request_context is not None
+        and compaction_prompt_layout() == "suffix"
+    )
+    if suffix and not provider_native:
+        return CompactionResult(
+            summary="",
+            kept_entries=entries,
+            removed_count=0,
+            chunks_processed=0,
+            summary_source="skipped",
+            tokens_before=total_tokens,
+            tokens_after=total_tokens,
+            remaining_budget_tokens=max(window - total_tokens, 0),
+            skip_reason="suffix_target_unavailable",
+        )
     legacy_raw = bool(cfg.api_key and cfg.model)
     network_enabled = provider_native or legacy_raw
     chunks: list[list[dict[str, Any]]]
@@ -2453,6 +2698,18 @@ async def compact_context_new(request: CompactionRequest) -> CompactionResult:
     fallback_chunks = 0
     max_calls = _compaction_llm_call_limit(cfg)
     prepruned_chunk_count = 0
+    if suffix and len(chunks) > max_calls:
+        return CompactionResult(
+            summary="",
+            kept_entries=entries,
+            removed_count=0,
+            chunks_processed=0,
+            summary_source="skipped",
+            tokens_before=total_tokens,
+            tokens_after=total_tokens,
+            remaining_budget_tokens=max(window - total_tokens, 0),
+            skip_reason="suffix_call_budget_exceeded",
+        )
     if network_enabled and len(chunks) > max_calls:
         deterministic_prefix: list[dict[str, Any]] = []
         prepruned_chunk_count = len(chunks) - max_calls
@@ -2476,11 +2733,13 @@ async def compact_context_new(request: CompactionRequest) -> CompactionResult:
         if cfg.llm_plan is not None:
             while candidate_index < len(cfg.llm_plan.candidates):
                 deployment = cfg.llm_plan.candidates[candidate_index]
-                candidate_chunk_text = _fit_compaction_input_to_target(
-                    request=request,
-                    target=deployment,
-                    previous_summary=rolling_summary,
-                    chunk=chunk,
+                candidate_chunk_text = (
+                    chunk_text if suffix else _fit_compaction_input_to_target(
+                        request=request,
+                        target=deployment,
+                        previous_summary=rolling_summary,
+                        chunk=chunk,
+                    )
                 )
                 if candidate_chunk_text is None:
                     log.info(
@@ -2497,6 +2756,12 @@ async def compact_context_new(request: CompactionRequest) -> CompactionResult:
                     break
                 cfg.last_attempted_target = deployment
                 llm_kwargs: dict[str, Any] = {}
+                if suffix:
+                    llm_kwargs.update(
+                        request_context=cfg.request_context,
+                        source_entries=chunk,
+                        previous_summary=rolling_summary,
+                    )
                 if request.provider_request_correlation is not None:
                     llm_kwargs["provider_request_correlation"] = (
                         derive_provider_request_correlation(
@@ -2563,6 +2828,20 @@ async def compact_context_new(request: CompactionRequest) -> CompactionResult:
         if llm_result:
             rolling_summary = llm_result.strip()
             llm_chunks += 1
+        elif suffix:
+            # A source-driven suffix must not replace unread or failed chunks
+            # with deterministic previews and then publish that as coverage.
+            return CompactionResult(
+                summary="",
+                kept_entries=entries,
+                removed_count=0,
+                chunks_processed=chunk_index,
+                summary_source="skipped",
+                tokens_before=total_tokens,
+                tokens_after=total_tokens,
+                remaining_budget_tokens=max(window - total_tokens, 0),
+                skip_reason="suffix_summary_failed",
+            )
         else:
             rolling_summary = _merge_rolling_fallback(
                 rolling_summary,
