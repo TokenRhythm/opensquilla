@@ -3664,6 +3664,10 @@ async def _delete_session_with_lifecycle(
 
         get_approval_queue().expire_pending_for_session(canonical_key)
         await storage.delete_session(canonical_key)
+        hold_store = getattr(ctx.turn_runner, "router_control_hold_store", None)
+        forget_routing = getattr(hold_store, "forget_session", None)
+        if callable(forget_routing):
+            forget_routing(canonical_key)
         get_session_streams().evict(canonical_key)
         for pending_input_id, session_ids in pending_material_owners.items():
             _cleanup_pending_input_scopes(
@@ -4671,9 +4675,29 @@ async def _handle_sessions_routing_set(
 
     async def _commit() -> dict[str, Any]:
         try:
-            return _session_routing_snapshot(
-                await setter(key, mode, expected_revision=expected_revision)
+            stored = await setter(key, mode, expected_revision=expected_revision)
+            snapshot = _session_routing_snapshot(stored)
+            changed = (
+                stored.get("changed") is True
+                if isinstance(stored, dict)
+                else getattr(stored, "changed", None) is True
             )
+            if changed:
+                # A router hold is an instruction within one routing strategy,
+                # not durable session configuration. Do not let an old tier pin
+                # disappear in Direct/Ensemble and silently reactivate after a
+                # later mode switch. Keep lost-ack retries side-effect free by
+                # clearing only when the atomic storage write changed the mode.
+                # Advancing the revision also rejects late writes by old turns.
+                hold_store = getattr(
+                    getattr(ctx, "turn_runner", None),
+                    "router_control_hold_store",
+                    None,
+                )
+                advance_revision = getattr(hold_store, "advance_routing_revision", None)
+                if callable(advance_revision):
+                    advance_revision(key, snapshot["revision"])
+            return snapshot
         except KeyError as exc:
             raise RpcHandlerError(
                 "SESSION_NOT_FOUND",

@@ -129,6 +129,15 @@ def test_router_control_tool_schema_includes_dynamic_target_enum() -> None:
     assert "model:z-ai/glm-5.2" not in target_schema["enum"]
 
 
+def test_router_control_tool_is_hidden_when_router_is_disabled() -> None:
+    ctx = _ctx()
+    ctx.router_control_config.enabled = False
+
+    definitions = get_default_registry().to_tool_definitions(ctx)
+
+    assert "router_control" not in {tool.name for tool in definitions}
+
+
 @pytest.mark.asyncio
 async def test_router_control_clear_hold_replays_when_hold_already_selected_turn() -> None:
     ctx = _ctx(hold_applied=True)

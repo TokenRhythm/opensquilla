@@ -2026,6 +2026,42 @@ async def test_agent_runtime_context_is_request_only_and_not_system_prefix() -> 
 
 
 @pytest.mark.asyncio
+async def test_execution_identity_reuses_runtime_context_without_extra_message() -> None:
+    from opensquilla.provider.types import ExecutionIdentity
+
+    provider = CapturingProvider()
+    agent = Agent(
+        provider=provider,
+        config=AgentConfig(
+            system_prompt="stable system",
+            execution_identity=ExecutionIdentity(provider="example", model="example/model"),
+            cache_breakpoints=[{"text": "stable system", "cache": "true"}],
+            cache_mode="auto",
+            max_iterations=1,
+        ),
+    )
+
+    events = [event async for event in agent.run_turn("which model?")]
+
+    assert any(event.kind == "done" for event in events)
+    call = provider.calls[0]
+    assert call["config"].system == "stable system"
+    assert call["config"].cache_breakpoints == [
+        {"text": "stable system", "cache": "true"}
+    ]
+    assert len(call["messages"]) == 1
+    assert call["messages"][0].content.startswith("which model?")
+    assert "[Runtime context for this turn]" in call["messages"][0].content
+    assert "Current response execution:" in call["messages"][0].content
+    assert '"model":"example/model"' in call["messages"][0].content
+    assert all(
+        "Current response execution:" not in message.content
+        for message in agent._history
+        if isinstance(message.content, str)
+    )
+
+
+@pytest.mark.asyncio
 async def test_agent_runtime_context_does_not_precede_current_user_text() -> None:
     provider = CapturingProvider()
     agent = Agent(

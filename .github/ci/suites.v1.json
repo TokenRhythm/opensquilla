@@ -4,7 +4,11 @@
   "macos_recovery_test_inputs": [
     "tests/test_recovery/**",
     "tests/test_migration/test_opensquilla_home_migration.py",
-    "tests/test_desktop/test_electron_startup_contract.py"
+    "tests/test_desktop/test_electron_startup_contract.py",
+    "tests/test_engine/test_request_execution_identity.py",
+    "tests/test_gateway/test_session_model_routing_rpc.py",
+    "tests/test_tools/test_execution_status.py",
+    "tests/test_provider_ensemble.py"
   ],
   "baseline_suites": [
     "readme-locale",
@@ -279,12 +283,21 @@
     "macos-recovery": {
       "execution_inputs": [
         "desktop/**",
+        "src/opensquilla/engine/**",
+        "src/opensquilla/provider/**",
+        "src/opensquilla/tools/**",
+        "src/opensquilla/gateway/**",
+        "src/opensquilla/router_control.py",
         "src/opensquilla/persistence/**",
         "src/opensquilla/recovery/**",
         "src/opensquilla/session/**",
         "tests/test_desktop/test_electron_startup_contract.py",
         "tests/test_migration/test_opensquilla_home_migration.py",
-        "tests/test_recovery/**"
+        "tests/test_recovery/**",
+        "tests/test_engine/test_request_execution_identity.py",
+        "tests/test_gateway/test_session_model_routing_rpc.py",
+        "tests/test_tools/test_execution_status.py",
+        "tests/test_provider_ensemble.py"
       ]
     },
     "release-packaging": {
