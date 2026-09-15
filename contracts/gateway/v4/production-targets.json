@@ -3,6 +3,11 @@
   "targets": [
     {
       "kind": "method",
+      "wireName": "telemetry.product_active.record",
+      "roles": ["result"]
+    },
+    {
+      "kind": "method",
       "wireName": "sessions.executionLog.read",
       "roles": ["params", "result"]
     },

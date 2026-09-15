@@ -54,6 +54,7 @@ _EVENT_SPECS: Final = (
     ("client_launch", 1, "growth"),
     ("metaskill_usage", 1, "growth"),
     ("coding_mode_usage", 1, "growth"),
+    ("product_active", 1, "growth"),
 )
 
 

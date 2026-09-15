@@ -326,10 +326,8 @@ class _EnvWithoutScopedTelemetryConsent(PydanticBaseSettingsSource):
 class PrivacyConfig(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="OPENSQUILLA_PRIVACY_")
 
-    # Scoped telemetry consent is deliberately tri-state.  ``None`` means the
-    # operator has not made a choice, while ``False`` records an explicit opt
-    # out.  The legacy global switch remains a hard veto, but its default
-    # ``False`` is not consent for either new scope.
+    # Retained for loading older clients' configs. The global privacy switch
+    # is the only persisted upload preference; legacy declines migrate to it.
     reliability_diagnostics_enabled: bool | None = None
     reliability_notice_version: str | None = None
     reliability_consented_at_utc: str | None = None
@@ -337,6 +335,17 @@ class PrivacyConfig(BaseSettings):
     product_analytics_notice_version: str | None = None
     product_analytics_consented_at_utc: str | None = None
     disable_network_observability: bool = False
+
+    @model_validator(mode="after")
+    def _migrate_scoped_telemetry_preferences(self) -> PrivacyConfig:
+        if (
+            self.reliability_diagnostics_enabled is False
+            or self.product_analytics_enabled is False
+        ):
+            self.disable_network_observability = True
+        for field_name in _SCOPED_TELEMETRY_CONSENT_FIELDS:
+            setattr(self, field_name, None)
+        return self
 
     @classmethod
     def settings_customise_sources(

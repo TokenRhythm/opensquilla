@@ -8,7 +8,7 @@ export const CURRENT_NOTICE_VERSION_BY_SCOPE: Readonly<Record<TelemetryScope, st
   })
 
 export const TELEMETRY_PROTOCOL_FINGERPRINT_SHA256 =
-  '37eef99b9de090a2032669d3caa9cd10f4357061658b2458326595361582732f'
+  '9e5d0501e6614fdcd4cf78f8a177db94b739fad156a0409f330809e5b2a5719f'
 
 type ResultOutcome = 'success' | 'fail' | 'timeout' | 'cancel'
 

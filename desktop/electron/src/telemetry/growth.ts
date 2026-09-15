@@ -53,7 +53,7 @@ interface DesktopGrowthPaths {
 export interface DesktopOnboardingReceipt {
   schema_version: 1
   notice_version: string
-  consented_at_utc: string
+  consented_at_utc: string | null
   completed_at_utc: string
 }
 
@@ -106,7 +106,7 @@ export interface GrowthProfileInspection {
  * Electron-owned new-user eligibility and first desktop milestones.
  *
  * Missing files never prove freshness. Only the recovery engine's exact
- * `fresh_profile` result can authorize onboarding, including its consent-bound
+ * `fresh_profile` result can authorize onboarding, including its policy-bound
  * settings receipt recovered after a process stop. Activation occurs only
  * after the current Growth-consent mirror is effective.
  */
@@ -150,7 +150,7 @@ export class DesktopGrowthTelemetry {
     if (
       !this.freshCandidate || this.inspectedProfileKey !== profileKey
       || !consent.enabled || consent.noticeVersion !== CURRENT_NOTICE_VERSION_BY_SCOPE.growth
-      || !isUtcTimestamp(consent.consentedAtUtc)
+      || (consent.consentedAtUtc !== null && !isUtcTimestamp(consent.consentedAtUtc))
       || environmentForcesOff('growth', this.env)
     ) return null
     const completedAt = canonicalNow(this.nowDate)
@@ -341,7 +341,7 @@ export function parseDesktopOnboardingReceipt(value: unknown): DesktopOnboarding
     ])
     || value.schema_version !== 1
     || typeof value.notice_version !== 'string'
-    || !isUtcTimestamp(value.consented_at_utc)
+    || (value.consented_at_utc !== null && !isUtcTimestamp(value.consented_at_utc))
     || !isUtcTimestamp(value.completed_at_utc)
   ) return null
   return value as unknown as DesktopOnboardingReceipt

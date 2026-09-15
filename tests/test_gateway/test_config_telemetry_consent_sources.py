@@ -155,7 +155,7 @@ def test_legacy_environment_switches_remain_effective_vetoes(
     assert GatewayConfig(_env_file=nested_env).privacy.disable_network_observability is True
 
 
-def test_authenticated_config_input_can_persist_scoped_consent() -> None:
+def test_legacy_scoped_grant_is_retired_without_manufacturing_a_new_record() -> None:
     privacy = GatewayConfig(
         privacy={
             "reliability_diagnostics_enabled": True,
@@ -164,6 +164,7 @@ def test_authenticated_config_input_can_persist_scoped_consent() -> None:
         }
     ).privacy
 
-    assert privacy.reliability_diagnostics_enabled is True
-    assert privacy.reliability_notice_version == "reliability-v1"
-    assert privacy.reliability_consented_at_utc == "2026-09-01T08:30:00.000Z"
+    assert privacy.disable_network_observability is False
+    assert privacy.reliability_diagnostics_enabled is None
+    assert privacy.reliability_notice_version is None
+    assert privacy.reliability_consented_at_utc is None

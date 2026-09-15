@@ -8,7 +8,9 @@ or standalone runtime dependencies.
 
 from __future__ import annotations
 
+import inspect
 from collections.abc import Awaitable, Callable, Coroutine, Mapping
+from contextlib import suppress
 from typing import TYPE_CHECKING, Any, Protocol, cast
 from urllib.parse import quote, urlsplit, urlunsplit
 
@@ -71,6 +73,7 @@ class GatewayTerminalReplRunner(Protocol):
         steer_active_turn: Callable[[str], Awaitable[bool]] | None = None,
         queue_max_size: int | None = None,
         on_surface_ready: Callable[[], Awaitable[None]] | None = None,
+        on_user_activity: Callable[[], Awaitable[None]] | None = None,
     ) -> None: ...
 
 
@@ -83,6 +86,7 @@ async def run_concurrent_repl(
     steer_active_turn: Callable[[str], Awaitable[bool]] | None = None,
     queue_max_size: int | None = None,
     on_surface_ready: Callable[[], Awaitable[None]] | None = None,
+    on_user_activity: Callable[[], Awaitable[None]] | None = None,
 ) -> None:
     kwargs: dict[str, Any] = {
         "surface": surface,
@@ -97,6 +101,8 @@ async def run_concurrent_repl(
         kwargs["steer_active_turn"] = steer_active_turn
     if on_surface_ready is not None:
         kwargs["on_surface_ready"] = on_surface_ready
+    if on_user_activity is not None:
+        kwargs["on_user_activity"] = on_user_activity
     await _runtime_bridge_for_selected_backend().run_concurrent_repl(
         **kwargs,
     )
@@ -203,15 +209,26 @@ def _gateway_input_loop_for(
         abort_active_turn: Callable[[], Awaitable[None]] | None = None,
         steer_active_turn: Callable[[str], Awaitable[bool]] | None = None,
         on_surface_ready: Callable[[], Awaitable[None]] | None = None,
+        on_user_activity: Callable[[], Awaitable[None]] | None = None,
     ) -> None:
-        await repl_runner(
-            surface=Surface.CLI_GATEWAY,
-            scope=scope,
-            dispatch=dispatch,
-            abort_active_turn=abort_active_turn,
-            steer_active_turn=steer_active_turn,
-            on_surface_ready=on_surface_ready,
-        )
+        kwargs: dict[str, Any] = {
+            "surface": Surface.CLI_GATEWAY,
+            "scope": scope,
+            "dispatch": dispatch,
+            "abort_active_turn": abort_active_turn,
+            "steer_active_turn": steer_active_turn,
+            "on_surface_ready": on_surface_ready,
+        }
+        if on_user_activity is not None:
+            with suppress(TypeError, ValueError):
+                parameters = inspect.signature(repl_runner).parameters.values()
+                if any(
+                    parameter.name == "on_user_activity"
+                    or parameter.kind is inspect.Parameter.VAR_KEYWORD
+                    for parameter in parameters
+                ):
+                    kwargs["on_user_activity"] = on_user_activity
+        await repl_runner(**kwargs)
 
     return _run_gateway_input_loop
 

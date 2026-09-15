@@ -43,7 +43,6 @@ import { useSettingsSection } from '@/composables/setup/useSettingsSection'
 import { SETTINGS_SECTIONS, type SettingsSectionId } from '@/composables/setup/settingsSections'
 import { GATEWAY_ACCESS_KEY } from '@/modules/gatewayAccess'
 import { useToasts } from '@/composables/useToasts'
-import { TELEMETRY_NOTICE_VERSION_BY_SCOPE } from '@/telemetry/protocol'
 import { useConfirm } from '@/composables/useConfirm'
 import { chooseRouterConflictAction, submitPrimaryProviderTransition } from '@/composables/setup/primaryProviderTransition'
 import { savedRouterActivationSafe } from '@/composables/setup/savedRouterSafety'
@@ -57,7 +56,6 @@ import {
   APP_SETTINGS_KEY,
   type AppSettings,
   type SettingsValue,
-  type TelemetryConsentDecision,
 } from '@/modules/appSettings'
 import {
   SETUP_WORKFLOW_KEY,
@@ -463,11 +461,6 @@ interface EffectiveConfigData {
 }
 
 type CapabilityId = 'search' | 'image_generation' | 'audio' | 'memory_embedding'
-type ConsentDraft = boolean | null
-
-export const RELIABILITY_DIAGNOSTICS_NOTICE_VERSION =
-  TELEMETRY_NOTICE_VERSION_BY_SCOPE.reliability
-export const PRODUCT_ANALYTICS_NOTICE_VERSION = TELEMETRY_NOTICE_VERSION_BY_SCOPE.growth
 
 export interface SettingsActionItem {
   label: string
@@ -502,8 +495,6 @@ const effectiveConfig = ref<EffectiveConfigData>({})
 const loaded = ref(false)
 const { section, setSection } = useSettingsSection('provider')
 const disableNetworkObservability = ref(false)
-const reliabilityDiagnosticsEnabled = ref<ConsentDraft>(null)
-const productAnalyticsEnabled = ref<ConsentDraft>(null)
 const capabilityResetPending = ref<CapabilityId | ''>('')
 const saveAllPending = ref(false)
 const providerSavePending = ref(false)
@@ -935,8 +926,6 @@ async function loadData(options: {
       if (!preserve?.audio) promotedForm.initAudioFromConfig(config.value)
       if (!preserve?.privacy) {
         disableNetworkObservability.value = currentDisableNetworkObservability.value
-        reliabilityDiagnosticsEnabled.value = currentReliabilityDiagnosticsDecision.value
-        productAnalyticsEnabled.value = currentProductAnalyticsDecision.value
       }
     }
     // Model listing is an optional UI accelerator and may involve an external
@@ -1399,45 +1388,8 @@ const networkObservabilityDisabledByEnvironment = computed(() => (
   currentEffectiveNetworkObservabilityDisabled.value && !currentDisableNetworkObservability.value
 ))
 
-function savedConsentDecision(
-  enabled: boolean | null | undefined,
-  noticeVersion: string | null | undefined,
-  consentedAtUtc: string | null | undefined,
-  currentNoticeVersion: string,
-): ConsentDraft {
-  if (enabled === false) return false
-  if (enabled !== true || noticeVersion !== currentNoticeVersion || !consentedAtUtc) return null
-  const parsed = Date.parse(consentedAtUtc)
-  if (!Number.isFinite(parsed) || !/(?:Z|[+-]00:00)$/i.test(consentedAtUtc)) return null
-  return true
-}
-
-const currentReliabilityDiagnosticsDecision = computed<ConsentDraft>(() => savedConsentDecision(
-  config.value.privacy?.reliability_diagnostics_enabled,
-  config.value.privacy?.reliability_notice_version,
-  config.value.privacy?.reliability_consented_at_utc,
-  RELIABILITY_DIAGNOSTICS_NOTICE_VERSION,
-))
-const currentProductAnalyticsDecision = computed<ConsentDraft>(() => savedConsentDecision(
-  config.value.privacy?.product_analytics_enabled,
-  config.value.privacy?.product_analytics_notice_version,
-  config.value.privacy?.product_analytics_consented_at_utc,
-  PRODUCT_ANALYTICS_NOTICE_VERSION,
-))
-const reliabilityDiagnosticsForcedOff = computed(() => (
-  disableNetworkObservability.value
-  || currentEffectiveNetworkObservabilityDisabled.value
-  || config.value.privacy?.reliability_diagnostics_forced_off === true
-))
-const productAnalyticsForcedOff = computed(() => (
-  disableNetworkObservability.value
-  || currentEffectiveNetworkObservabilityDisabled.value
-  || config.value.privacy?.product_analytics_forced_off === true
-))
 const privacyDirty = computed(() => (
   disableNetworkObservability.value !== currentDisableNetworkObservability.value
-  || reliabilityDiagnosticsEnabled.value !== currentReliabilityDiagnosticsDecision.value
-  || productAnalyticsEnabled.value !== currentProductAnalyticsDecision.value
 ))
 
 
@@ -1932,13 +1884,6 @@ const behaviorPanel = behaviorForm.createPanel({
 })
 
 const privacyPanel = computed(() => ({
-  reliabilityDiagnosticsEnabled: reliabilityDiagnosticsEnabled.value === true,
-  reliabilityDiagnosticsDecision: reliabilityDiagnosticsEnabled.value,
-  reliabilityDiagnosticsForcedOff: reliabilityDiagnosticsForcedOff.value,
-  productAnalyticsEnabled: productAnalyticsEnabled.value === true,
-  productAnalyticsDecision: productAnalyticsEnabled.value,
-  productAnalyticsForcedOff: productAnalyticsForcedOff.value,
-  // Retained for older Settings surfaces during a rolling UI/Gateway update.
   networkReportingEnabled: !(
     disableNetworkObservability.value || networkObservabilityDisabledByEnvironment.value
   ),
@@ -2756,16 +2701,6 @@ function setDisableNetworkObservability(enabled: boolean) {
 function setNetworkReportingEnabled(enabled: boolean) {
   if (networkObservabilityDisabledByEnvironment.value) return
   setDisableNetworkObservability(!enabled)
-}
-
-function setReliabilityDiagnosticsEnabled(enabled: boolean) {
-  if (enabled && reliabilityDiagnosticsForcedOff.value) return
-  reliabilityDiagnosticsEnabled.value = enabled
-}
-
-function setProductAnalyticsEnabled(enabled: boolean) {
-  if (enabled && productAnalyticsForcedOff.value) return
-  productAnalyticsEnabled.value = enabled
 }
 
 function setMemoryAutoCapture(enabled: boolean) {
@@ -3743,23 +3678,6 @@ async function safePatchConfig(patches: Record<string, unknown>): Promise<boolea
   return res?.restartRequired === true
 }
 
-async function setTelemetryConsent(
-  scope: TelemetryConsentDecision['scope'],
-  enabled: boolean,
-): Promise<TelemetryConsentDecision> {
-  const result = await appSettings.setTelemetryConsent(scope, enabled)
-  if (
-    !result
-    || result.scope !== scope
-    || result.enabled !== enabled
-    || (enabled && (!result.noticeVersion || !result.consentedAtUtc))
-    || (!enabled && (result.noticeVersion !== null || result.consentedAtUtc !== null))
-  ) {
-    throw new Error('Gateway returned an invalid telemetry consent result.')
-  }
-  return result
-}
-
 // Deep-merge form of config.patch: `patch` is a nested object merged into the
 // config tree (null deletes a key). Required for the models.<provider>.<model>
 // subtree, whose model-id keys contain dots/colons that dot-path patches would
@@ -3968,41 +3886,14 @@ async function savePrivacy(
 ): Promise<boolean> {
   try {
     const nextPrivacy = { ...(config.value.privacy || {}) }
-    let changed = false
-    let restart = false
-    if (reliabilityDiagnosticsEnabled.value !== currentReliabilityDiagnosticsDecision.value) {
-      const result = await setTelemetryConsent(
-        'reliability',
-        reliabilityDiagnosticsEnabled.value === true,
-      )
-      nextPrivacy.reliability_diagnostics_enabled = result.enabled
-      nextPrivacy.reliability_notice_version = result.noticeVersion
-      nextPrivacy.reliability_consented_at_utc = result.consentedAtUtc
-      reliabilityDiagnosticsEnabled.value = result.enabled
-      changed = true
-    }
-    if (productAnalyticsEnabled.value !== currentProductAnalyticsDecision.value) {
-      const result = await setTelemetryConsent(
-        'growth',
-        productAnalyticsEnabled.value === true,
-      )
-      nextPrivacy.product_analytics_enabled = result.enabled
-      nextPrivacy.product_analytics_notice_version = result.noticeVersion
-      nextPrivacy.product_analytics_consented_at_utc = result.consentedAtUtc
-      productAnalyticsEnabled.value = result.enabled
-      changed = true
-    }
-    if (value !== currentDisableNetworkObservability.value) {
-      restart = await safePatchConfig({
-        'privacy.disable_network_observability': value,
-      })
-      nextPrivacy.disable_network_observability = value
-      nextPrivacy.network_observability_disabled_effective = (
-        value || networkObservabilityDisabledByEnvironment.value
-      )
-      changed = true
-    }
-    if (!changed) return true
+    if (value === currentDisableNetworkObservability.value) return true
+    const restart = await safePatchConfig({
+      'privacy.disable_network_observability': value,
+    })
+    nextPrivacy.disable_network_observability = value
+    nextPrivacy.network_observability_disabled_effective = (
+      value || networkObservabilityDisabledByEnvironment.value
+    )
 
     if (options.reload === false) {
       config.value = {
@@ -4400,8 +4291,6 @@ async function copyConfigPath() {
     setAutoSessionTitles,
     setDisableNetworkObservability,
     setNetworkReportingEnabled,
-    setReliabilityDiagnosticsEnabled,
-    setProductAnalyticsEnabled,
     setMemoryAutoCapture,
     setProviderImageGenerationOptIn,
     setModelStrategy,

@@ -123,8 +123,8 @@ SESSIONS_LIST_GATEWAY_ADAPTER = PACKAGE_ROOT / "gateway" / "adapters" / "session
 # The retired 20-method RPC surface is absent; exact inventory remains pinned
 # so this does not authorize unrelated wire growth.
 # Primary-provider transitions add resetRecommended and upsertAndActivate.
-RUNTIME_RPC_METHOD_BASELINE = 294
-RUNTIME_RPC_METHOD_DIGEST = "132a1a074178ad198f71a74a328586f86bb140d08e91fc08263eb9f70c2ff708"
+RUNTIME_RPC_METHOD_BASELINE = 295
+RUNTIME_RPC_METHOD_DIGEST = "34c09211505ec1711fef3a294f254fdbc0ce1bf587d8cf1fc42b87e5943745b5"
 STATIC_RPC_DECORATOR_BASELINE = 77
 
 # Physical lines in the sessions/runtime slice remain tracked for the final
@@ -1289,6 +1289,7 @@ def test_static_rpc_decorator_sites_are_exact_and_contract_methods_are_adapter_r
             "logs.tail",
             "telemetry.consent.set",
             "telemetry.client_launch.record",
+            "telemetry.product_active.record",
             "plugin.approval.status",
             "plugin.approval.resolve",
             "plugin.approval.extend",

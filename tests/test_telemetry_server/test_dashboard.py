@@ -451,6 +451,213 @@ def test_authenticated_page_and_api_contain_aggregates_but_no_telemetry_ids(
     assert "<script src=" not in page.text
 
 
+@pytest.mark.parametrize(
+    ("launches", "expected_counts"),
+    [
+        ([], (0, 0)),
+        (
+            [("analytics-a", "tui"), ("analytics-a", "cli"), ("analytics-a", "tui")],
+            (1, 1),
+        ),
+        (
+            [
+                ("analytics-a", "tui"),
+                ("analytics-a", "cli"),
+                ("analytics-b", "tui"),
+                ("analytics-c", "cli"),
+                ("analytics-c", "cli"),
+            ],
+            (2, 2),
+        ),
+    ],
+    ids=["empty", "shared-user-and-repeat-launch", "distinct-users-and-repeat-launch"],
+)
+def test_terminal_user_card_counts_each_surface_independently(
+    tmp_path: Path,
+    dashboard_credential: str,
+    launches: list[tuple[str, str]],
+    expected_counts: tuple[int, int],
+) -> None:
+    app = _app(tmp_path, dashboard_credential)
+    with sqlite3.connect(tmp_path / "growth.sqlite3") as connection:
+        for sequence, (user_id, surface) in enumerate(launches):
+            connection.execute(
+                """
+                INSERT INTO events (
+                    event_id, payload_sha256, event_name, event_version,
+                    occurred_at_utc, source, app_version, platform, sample_rate,
+                    notice_version, analytics_user_id, payload_json, received_at_utc
+                ) VALUES (
+                    ?, ?, 'client_launch', 1, '2026-09-02T01:00:00.000Z',
+                    'cli', '1.2.3', 'macos', 1.0, 'growth-v2', ?, ?,
+                    '2026-09-02T01:00:01.000Z'
+                )
+                """,
+                (
+                    f"synthetic-launch-{sequence}",
+                    "a" * 64,
+                    user_id,
+                    json.dumps({"surface": surface}),
+                ),
+            )
+
+    with TestClient(app, base_url="https://preview.test") as client:
+        _login(client)
+        page = client.get(f"{_BASE}?start=2026-09-02&end=2026-09-02")
+
+    assert page.status_code == 200
+    card = re.search(
+        r'<article[^>]*id="terminal-user-counts"[^>]*>(.*?)</article>',
+        page.text,
+        re.DOTALL,
+    )
+    assert card is not None
+    assert "终端使用人数" in card.group(1)
+    rows = re.findall(
+        r'<span class="bar-name">([^<]+)</span>.*?<span class="bar-value">(\d+)</span>',
+        card.group(1),
+        re.DOTALL,
+    )
+    assert rows == [("TUI", str(expected_counts[0])), ("CLI", str(expected_counts[1]))]
+    for removed_label in ("终端使用交集", "仅 TUI", "仅 CLI", "两者都用"):
+        assert removed_label not in page.text
+
+
+def test_activation_funnel_follows_desktop_order_without_false_dropoff(
+    tmp_path: Path,
+    dashboard_credential: str,
+) -> None:
+    app = _app(tmp_path, dashboard_credential)
+    stages = [
+        ("onboarding_result", "completed"),
+        ("first_app_ready", "success"),
+        ("first_turn_started", None),
+        ("first_turn_result", "success"),
+    ]
+    with sqlite3.connect(tmp_path / "growth.sqlite3") as connection:
+        for minute, (event_name, outcome) in enumerate(stages):
+            occurred_at = f"2026-09-01T00:0{minute}:00.000Z"
+            connection.execute(
+                """
+                INSERT INTO events (
+                    event_id, payload_sha256, event_name, event_version,
+                    occurred_at_utc, source, app_version, platform, outcome,
+                    sample_rate, notice_version, analytics_user_id, payload_json,
+                    received_at_utc
+                ) VALUES (
+                    ?, ?, ?, 1, ?, 'desktop', '1.2.3', 'macos', ?,
+                    1.0, 'growth-v2', 'synthetic-new-user', '{}', ?
+                )
+                """,
+                (
+                    f"synthetic-activation-{minute}",
+                    "a" * 64,
+                    event_name,
+                    occurred_at,
+                    outcome,
+                    occurred_at,
+                ),
+            )
+
+    with TestClient(app, base_url="https://preview.test") as client:
+        _login(client)
+        query = "start=2026-09-01&end=2026-09-01"
+        page = client.get(f"{_BASE}?{query}")
+        api = client.get(f"{_BASE}/api/summary?{query}")
+
+    assert page.status_code == 200
+    card = re.search(
+        r'<article[^>]*id="activation-funnel"[^>]*>(.*?)</article>',
+        page.text,
+        re.DOTALL,
+    )
+    assert card is not None
+    assert "所选日期首次完成引导的用户" in card.group(1)
+    assert "从首次可用到首次成功对话" not in page.text
+    rows = re.findall(
+        r'<span class="bar-name">([^<]+)</span>.*?<span class="bar-value">(\d+)</span>',
+        card.group(1),
+        re.DOTALL,
+    )
+    assert rows == [
+        ("完成引导", "1"),
+        ("首次进入可用界面", "1"),
+        ("首次提问", "1"),
+        ("首次成功回复", "1"),
+    ]
+    assert api.status_code == 200
+    activation = api.json()["growth"]["activation"]
+    assert activation["stages"] == [
+        {"stage": "onboarding_completed", "deduplicatedCount": 1},
+        {"stage": "first_app_ready", "deduplicatedCount": 1},
+        {"stage": "first_turn_started", "deduplicatedCount": 1},
+        {"stage": "first_turn_succeeded", "deduplicatedCount": 1},
+    ]
+    assert [step["dropoffRate"] for step in activation["transitions"]] == [0.0, 0.0, 0.0]
+
+
+@pytest.mark.parametrize("has_activity", [False, True])
+def test_product_activity_cards_chart_and_api_use_product_wide_distinct_users(
+    tmp_path: Path, dashboard_credential: str, has_activity: bool,
+) -> None:
+    app = _app(tmp_path, dashboard_credential)
+    if has_activity:
+        events = [
+            ("synthetic-returning", "2026-09-15T01:00:00.000Z", "tui"),
+            ("synthetic-current", "2026-09-30T01:00:00.000Z", "desktop"),
+            ("synthetic-current", "2026-09-30T02:00:00.000Z", "web"),
+        ]
+        with sqlite3.connect(tmp_path / "growth.sqlite3") as connection:
+            for sequence, (user, occurred_at, surface) in enumerate(events):
+                connection.execute(
+                    """
+                    INSERT INTO events (
+                        event_id, payload_sha256, event_name, event_version, occurred_at_utc,
+                        source, app_version, platform, sample_rate, notice_version,
+                        analytics_user_id, payload_json, received_at_utc
+                    ) VALUES (?, ?, 'product_active', 1, ?, 'gateway', '1.2.3', 'macos',
+                              1, 'growth-v2', ?, ?, ?)
+                    """,
+                    (f"synthetic-activity-{sequence}", "a" * 64, occurred_at,
+                     user, json.dumps({"surface": surface}), occurred_at),
+                )
+
+    with TestClient(app, base_url="https://preview.test") as client:
+        _login(client)
+        query = "start=2026-09-30&end=2026-09-30"
+        page = client.get(f"{_BASE}?{query}")
+        response = client.get(f"{_BASE}/api/summary?{query}")
+
+    dau, mau = (1, 2) if has_activity else (0, 0)
+    assert page.status_code == response.status_code == 200
+    assert response.json()["growth"]["productActivity"] == {
+        "asOfDate": "2026-09-30", "mauStartDate": "2026-09-01",
+        "dau": dau, "mau": mau,
+        "dailyTrend": [{"period": "2026-09-30", "dau": dau, "mau": mau}],
+    }
+    assert f'id="product-dau">{dau}</div>' in page.text
+    assert f'id="product-mau">{mau}</div>' in page.text
+    assert page.text.index('id="product-activity-panel"') < page.text.index('id="terminal-trend"')
+    assert 'aria-label="每日匿名配置日活与滚动三十天月活趋势图"' in page.text
+    assert f'data-date="2026-09-30" data-dau="{dau}" data-mau="{mau}"' in page.text
+    assert "日活与月活（匿名配置）" in page.text
+    assert "按匿名配置标识统计 · 非账号口径" in page.text
+    assert "按匿名配置标识、UTC 日期统计" in page.text
+    assert "同一配置使用桌面端、网页端、TUI 或 CLI 跨入口只计 1 份" in page.text
+    assert "这是匿名配置口径，不是登录账号人数" in page.text
+    assert "同一人在不同设备或不同配置中使用可能重复统计" in page.text
+    assert "历史未上报不回填" in page.text
+    assert "月活配置（近 30 天）" in page.text
+    assert "日活配置 ${point.dau} 份 · 近 30 天活跃配置 ${point.mau} 份" in page.text
+    assert "日活与月活用户" not in page.text
+    assert "不受开始日期筛选影响" in page.text
+    assert ("当前统计区间暂无产品活跃上报。" in page.text) is not has_activity
+    assert "synthetic-current" not in page.text + response.text
+    assert "synthetic-returning" not in page.text + response.text
+    assert "V1 去重装机" in page.text
+    assert 'id="terminal-user-counts"' in page.text
+
+
 def test_logout_requires_session_bound_csrf_and_same_origin(
     tmp_path: Path,
     dashboard_credential: str,

@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
+from uuid import UUID
 
 import pytest
 
@@ -18,6 +19,8 @@ from opensquilla.telemetry.server.dashboard_queries import (
 )
 from opensquilla.telemetry.server.storage import (
     _COMPATIBLE_PREVIOUS_PROTOCOL_FINGERPRINTS,
+    _LEGACY_EXPECTED_SCHEMA_SQL,
+    _LEGACY_PROTOCOL_FINGERPRINT_SHA256,
     TelemetryIngestStorage,
 )
 
@@ -42,6 +45,7 @@ _EVENT_COLUMNS = (
     "first_batch_id",
     "received_at_utc",
 )
+_LEGACY_BATCH_ID = "00000000-0000-4000-8000-000000000100"
 
 
 def _database(tmp_path: Path, scope: TelemetryScope) -> Path:
@@ -101,10 +105,37 @@ def _database(tmp_path: Path, scope: TelemetryScope) -> Path:
     return path
 
 
+def _legacy_database(tmp_path: Path, scope: TelemetryScope) -> Path:
+    path = tmp_path / f"legacy-{scope.value}.sqlite3"
+    with sqlite3.connect(path) as connection:
+        for statement in _LEGACY_EXPECTED_SCHEMA_SQL.values():
+            connection.execute(statement)
+        connection.execute("PRAGMA user_version=1")
+        connection.execute(
+            """
+            INSERT INTO meta(singleton, schema_version, scope, protocol_fingerprint,
+                             created_at_utc)
+            VALUES (1, 1, ?, ?, '2026-09-01T00:00:00.000Z')
+            """,
+            (scope.value, _LEGACY_PROTOCOL_FINGERPRINT_SHA256),
+        )
+        connection.execute(
+            """
+            INSERT INTO ingest_batches(batch_id, body_sha256, sent_at_utc,
+                                       received_at_utc, accepted_count, duplicate_count)
+            VALUES (?, ?, '2026-09-01T00:00:00.000Z', '2026-09-01T00:00:00.000Z', 0, 0)
+            """,
+            (_LEGACY_BATCH_ID, "a" * 64),
+        )
+    return path
+
+
 def _insert(
     path: Path,
     *,
     sequence: int,
+    event_id: str | None = None,
+    first_batch_id: str | None = None,
     event_name: str,
     occurred_at: str,
     event_version: int = 1,
@@ -121,7 +152,7 @@ def _insert(
     payload: dict[str, Any] | None = None,
 ) -> None:
     values: dict[str, object] = {
-        "event_id": f"event-{sequence:04d}",
+        "event_id": event_id or f"event-{sequence:04d}",
         "payload_sha256": "a" * 64,
         "event_name": event_name,
         "event_version": event_version,
@@ -138,7 +169,7 @@ def _insert(
         "acquisition_id": acquisition_id,
         "analytics_user_id": analytics_user_id,
         "payload_json": json.dumps(payload or {}, separators=(",", ":")),
-        "first_batch_id": None,
+        "first_batch_id": first_batch_id,
         "received_at_utc": occurred_at,
     }
     placeholders = ",".join("?" for _ in _EVENT_COLUMNS)
@@ -182,6 +213,110 @@ def _assert_no_sensitive_output(value: object) -> None:
         assert forbidden not in serialized
 
 
+def test_product_activity_deduplicates_surfaces_and_repeated_days(tmp_path: Path) -> None:
+    queries, _, growth = _queries(tmp_path)
+    events = [
+        ("2026-09-01", "analytics-a", "desktop"),
+        ("2026-09-01", "analytics-a", "web"),
+        ("2026-09-01", "analytics-a", "tui"),
+        ("2026-09-01", "analytics-a", "cli"),
+        ("2026-09-01", "analytics-a", "cli"),
+        ("2026-09-02", "analytics-a", "web"),
+        ("2026-09-02", "analytics-b", "cli"),
+        ("2026-09-03", "analytics-b", "desktop"),
+    ]
+    for sequence, (day, user, surface) in enumerate(events, start=1):
+        _insert(
+            growth, sequence=sequence, event_name="product_active",
+            occurred_at=f"{day}T01:00:00.000Z", source="gateway",
+            analytics_user_id=user, notice_version="growth-v2", payload={"surface": surface},
+        )
+
+    result = queries.growth(UtcCohortWindow.from_dates("2026-09-01", "2026-09-03"))[
+        "productActivity"
+    ]
+
+    assert result == {
+        "asOfDate": "2026-09-03",
+        "mauStartDate": "2026-08-05",
+        "dau": 1,
+        "mau": 2,
+        "dailyTrend": [
+            {"period": "2026-09-01", "dau": 1, "mau": 1},
+            {"period": "2026-09-02", "dau": 2, "mau": 2},
+            {"period": "2026-09-03", "dau": 1, "mau": 2},
+        ],
+    }
+    _assert_no_sensitive_output(result)
+
+
+def test_product_activity_rolling_window_includes_history_before_selected_start(
+    tmp_path: Path,
+) -> None:
+    queries, _, growth = _queries(tmp_path)
+    events = [
+        ("2026-08-30T23:59:59.999Z", "analytics-too-old"),
+        ("2026-08-31T00:00:00.000Z", "analytics-expiring"),
+        ("2026-09-01T00:00:00.000Z", "analytics-earliest"),
+        ("2026-09-29T00:00:00.000Z", "analytics-returning"),
+        ("2026-09-30T00:00:00.000Z", "analytics-returning"),
+        ("2026-09-30T23:59:59.999Z", "analytics-new"),
+        ("2026-10-01T00:00:00.000Z", "analytics-future"),
+    ]
+    for sequence, (occurred_at, user) in enumerate(events, start=1):
+        _insert(
+            growth, sequence=sequence, event_name="product_active", occurred_at=occurred_at,
+            source="gateway", analytics_user_id=user, notice_version="growth-v2",
+            payload={"surface": "desktop"},
+        )
+
+    result = queries.growth(UtcCohortWindow.from_dates("2026-09-29", "2026-09-30"))[
+        "productActivity"
+    ]
+    assert result["dailyTrend"] == [
+        {"period": "2026-09-29", "dau": 1, "mau": 3},
+        {"period": "2026-09-30", "dau": 2, "mau": 3},
+    ]
+    assert (result["dau"], result["mau"]) == (2, 3)
+    assert result["mauStartDate"] == "2026-09-01"
+    one_day = queries.growth(UtcCohortWindow.from_dates("2026-09-30", "2026-09-30"))[
+        "productActivity"
+    ]
+    assert (one_day["dau"], one_day["mau"]) == (2, 3)
+    assert one_day["dailyTrend"] == result["dailyTrend"][-1:]
+    _assert_no_sensitive_output(result)
+
+
+@pytest.mark.parametrize("legacy_rows", [False, True])
+def test_product_activity_is_zero_filled_without_new_activity_events(
+    tmp_path: Path, legacy_rows: bool,
+) -> None:
+    queries, _, growth = _queries(tmp_path)
+    if legacy_rows:
+        for sequence, name in enumerate(
+            ["client_launch", "first_app_ready", "first_turn_started", "first_turn_result",
+             "metaskill_usage", "coding_mode_usage"], start=1,
+        ):
+            _insert(
+                growth, sequence=sequence, event_name=name,
+                occurred_at="2026-09-30T01:00:00.000Z", source="gateway",
+                analytics_user_id="analytics-legacy", notice_version="growth-v2",
+                payload={"surface": "cli", "entrypoint": "agent"},
+            )
+    result = queries.growth(UtcCohortWindow.from_dates("2026-09-29", "2026-09-30"))
+    assert result["productActivity"] == {
+        "asOfDate": "2026-09-30",
+        "mauStartDate": "2026-09-01",
+        "dau": 0,
+        "mau": 0,
+        "dailyTrend": [
+            {"period": "2026-09-29", "dau": 0, "mau": 0},
+            {"period": "2026-09-30", "dau": 0, "mau": 0},
+        ],
+    }
+    assert result["clientUsage"]["totals"]["cliUsers"] == int(legacy_rows)
+
+
 def test_database_connections_are_uri_read_only_and_query_only(tmp_path: Path) -> None:
     queries, _, _ = _queries(tmp_path)
 
@@ -215,6 +350,110 @@ async def test_queries_open_the_locked_collector_schema_without_migration(
     assert result["growth"]["acquisition"]["stages"][0]["deduplicatedCount"] == 0
     assert reliability_path.read_bytes() == reliability_before
     assert growth_path.read_bytes() == growth_before
+
+
+def test_legacy_collector_schema_aggregates_both_scopes_without_migration(tmp_path: Path) -> None:
+    reliability = _legacy_database(tmp_path, TelemetryScope.RELIABILITY)
+    growth = _legacy_database(tmp_path, TelemetryScope.GROWTH)
+    for sequence, outcome in enumerate(("success", "fail"), start=1):
+        _insert(
+            reliability,
+            sequence=sequence,
+            event_id=str(UUID(int=sequence)),
+            first_batch_id=_LEGACY_BATCH_ID,
+            event_name="app_start_result",
+            occurred_at="2026-09-01T01:00:00.000Z",
+            outcome=outcome,
+            app_session_id="synthetic-session",
+            duration_ms=100,
+            sample_rate=0.5 if outcome == "success" else 1,
+        )
+    for sequence, (event_name, outcome) in enumerate(
+        (
+            ("onboarding_result", "completed"),
+            ("first_app_ready", None),
+            ("first_turn_started", None),
+            ("first_turn_result", "success"),
+        ),
+        start=1,
+    ):
+        _insert(
+            growth,
+            sequence=sequence,
+            event_id=str(UUID(int=sequence)),
+            first_batch_id=_LEGACY_BATCH_ID,
+            event_name=event_name,
+            occurred_at=f"2026-09-01T01:0{sequence}:00.000Z",
+            outcome=outcome,
+            analytics_user_id="synthetic-user",
+        )
+    # Older stores have no per-day launch index. Repeated launches must still
+    # count the same user once for each terminal in read-only aggregation.
+    for sequence, surface in enumerate(("tui", "cli", "cli"), start=5):
+        _insert(
+            growth,
+            sequence=sequence,
+            event_id=str(UUID(int=sequence)),
+            first_batch_id=_LEGACY_BATCH_ID,
+            event_name="client_launch",
+            occurred_at="2026-09-01T01:05:00.000Z",
+            analytics_user_id="synthetic-user",
+            payload={"surface": surface, "entrypoint": "chat"},
+        )
+    before = {path: path.read_bytes() for path in (reliability, growth)}
+
+    result = DashboardQueries(
+        reliability_db_path=reliability,
+        growth_db_path=growth,
+    ).summary(_window())
+
+    assert result["reliability"]["appStart"]["estimatedEvents"] == 3
+    assert result["reliability"]["appStart"]["estimatedSuccesses"] == 2
+    activation = result["growth"]["activation"]
+    assert [stage["deduplicatedCount"] for stage in activation["stages"]] == [1, 1, 1, 1]
+    assert [transition["dropoffRate"] for transition in activation["transitions"]] == [0, 0, 0]
+    totals = result["growth"]["clientUsage"]["totals"]
+    assert (totals["tuiUsers"], totals["cliUsers"]) == (1, 1)
+    assert result["growth"]["metaskillUsage"]["totalUses"] == 0
+    assert result["growth"]["codingModeUsage"]["totalUses"] == 0
+    for path in (reliability, growth):
+        with sqlite3.connect(f"{path.as_uri()}?mode=ro", uri=True) as connection:
+            assert connection.execute("SELECT protocol_fingerprint FROM meta").fetchone() == (
+                _LEGACY_PROTOCOL_FINGERPRINT_SHA256,
+            )
+            assert connection.execute(
+                "SELECT name FROM sqlite_master "
+                "WHERE name = 'idx_events_client_launch_user_surface_day'"
+            ).fetchone() is None
+        assert path.read_bytes() == before[path]
+    _assert_no_sensitive_output(result)
+
+
+@pytest.mark.parametrize("scope", (TelemetryScope.RELIABILITY, TelemetryScope.GROWTH))
+@pytest.mark.parametrize("mismatch", ("scope", "fingerprint", "version", "column"))
+def test_legacy_collector_compatibility_keeps_schema_checks(
+    tmp_path: Path, scope: TelemetryScope, mismatch: str
+) -> None:
+    reliability = _legacy_database(tmp_path, TelemetryScope.RELIABILITY)
+    growth = _legacy_database(tmp_path, TelemetryScope.GROWTH)
+    path = reliability if scope is TelemetryScope.RELIABILITY else growth
+    with sqlite3.connect(path) as connection:
+        if mismatch == "scope":
+            other_scope = "growth" if scope is TelemetryScope.RELIABILITY else "reliability"
+            connection.execute("UPDATE meta SET scope = ?", (other_scope,))
+        elif mismatch == "fingerprint":
+            connection.execute("UPDATE meta SET protocol_fingerprint = ?", ("f" * 64,))
+        elif mismatch == "version":
+            connection.execute("PRAGMA user_version=2")
+        else:
+            connection.execute("ALTER TABLE events RENAME COLUMN duration_ms TO wrong_duration")
+    before = path.read_bytes()
+    queries = DashboardQueries(reliability_db_path=reliability, growth_db_path=growth)
+
+    with pytest.raises(DashboardDataError, match="incompatible"):
+        queries.summary(_window())
+
+    assert path.read_bytes() == before
 
 
 def test_each_scope_query_uses_one_consistent_read_snapshot(tmp_path: Path) -> None:
@@ -674,7 +913,11 @@ def test_growth_funnels_keep_identifiers_separate_and_use_fixed_windows(
     )
     add("first_turn_started", "2026-09-01T08:00:00.000Z", analytics="analytics-x")
     add("first_turn_result", "2026-09-01T09:00:00.000Z", analytics="analytics-x", outcome="success")
-    add("first_app_ready", "2026-09-02T04:30:00.000Z", analytics="analytics-y")
+    add(
+        "onboarding_result", "2026-09-02T04:30:00.000Z",
+        analytics="analytics-y", outcome="completed",
+    )
+    add("first_app_ready", "2026-09-02T04:30:00.000Z", analytics="analytics-ready-only")
 
     result = queries.growth(_window())
 
@@ -702,25 +945,40 @@ def test_growth_funnels_keep_identifiers_separate_and_use_fixed_windows(
 
 
 @pytest.mark.parametrize(
-    ("onboarding_at", "turn_at", "counts"),
+    ("ready_minutes", "turn_minutes", "success_minutes", "counts"),
     [
-        ("2026-08-31T23:59:00.000Z", "2026-09-01T00:02:00.000Z", [1, 1, 1, 1]),
-        ("2026-09-01T00:01:30.000Z", "2026-09-01T00:02:00.000Z", [1, 1, 1, 1]),
-        ("2026-08-31T23:59:00.000Z", "2026-09-01T00:00:00.000Z", [1, 1, 0, 0]),
-        ("2026-08-24T00:00:00.000Z", "2026-09-01T00:02:00.000Z", [1, 0, 0, 0]),
+        (1, 2, 3, [1, 1, 1, 1]),
+        (-1, 2, 3, [1, 1, 1, 1]),
+        (2, 1, 3, [1, 1, 0, 0]),
+        (-2, -1, 3, [1, 1, 0, 0]),
+        (10080, 10081, 10082, [1, 1, 1, 1]),
+        (10081, 10082, 10083, [1, 0, 0, 0]),
+        (-10080, 2, 3, [1, 1, 1, 1]),
+        (-10081, 2, 3, [1, 0, 0, 0]),
+        (1, 10082, 10083, [1, 1, 0, 0]),
+        (1, 2, 10083, [1, 1, 1, 0]),
     ],
 )
-def test_activation_accepts_saved_onboarding_before_ready_without_backdating_turns(
-    tmp_path: Path, onboarding_at: str, turn_at: str, counts: list[int],
+def test_activation_follows_desktop_order_and_accepts_legacy_readiness(
+    tmp_path: Path,
+    ready_minutes: int,
+    turn_minutes: int,
+    success_minutes: int,
+    counts: list[int],
 ) -> None:
     queries, _, growth = _queries(tmp_path)
-    # Replayed onboarding keeps its original completion time, even across the
-    # cohort date boundary. Arrival order does not determine funnel progression.
+    anchor = datetime(2026, 9, 1, tzinfo=UTC)
+
+    def timestamp(minutes: int) -> str:
+        return (anchor + timedelta(minutes=minutes)).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+
+    # Delivery order is deliberately reversed; occurrence time determines the
+    # journey, while completed onboarding determines cohort membership.
     events = [
-        ("first_app_ready", "2026-09-01T00:01:00.000Z", None),
-        ("first_turn_started", turn_at, None),
-        ("first_turn_result", "2026-09-01T00:03:00.000Z", "success"),
-        ("onboarding_result", onboarding_at, "completed"),
+        ("first_turn_result", timestamp(success_minutes), "success"),
+        ("first_turn_started", timestamp(turn_minutes), None),
+        ("first_app_ready", timestamp(ready_minutes), None),
+        ("onboarding_result", timestamp(0), "completed"),
     ]
     for sequence, (name, occurred_at, outcome) in enumerate(events, start=1):
         _insert(
@@ -732,8 +990,49 @@ def test_activation_accepts_saved_onboarding_before_ready_without_backdating_tur
     ]
     assert [stage["deduplicatedCount"] for stage in activation["stages"]] == counts
     assert [stage["stage"] for stage in activation["stages"]] == [
-        "first_app_ready", "onboarding_completed", "first_turn_started", "first_turn_succeeded",
+        "onboarding_completed", "first_app_ready", "first_turn_started", "first_turn_succeeded",
     ]
+    assert [transition["windowHours"] for transition in activation["transitions"]] == [168] * 3
+    if counts == [1, 1, 1, 1]:
+        assert [transition["dropoffRate"] for transition in activation["transitions"]] == [0] * 3
+
+
+def test_activation_cohort_uses_first_completed_onboarding_and_distinct_users(
+    tmp_path: Path,
+) -> None:
+    queries, _, growth = _queries(tmp_path)
+    events = [
+        ("onboarding_result", "2026-08-31T23:59:00.000Z", "old-user", "completed"),
+        ("onboarding_result", "2026-09-01T00:00:00.000Z", "old-user", "completed"),
+        ("first_app_ready", "2026-09-01T00:01:00.000Z", "old-user", None),
+        ("onboarding_result", "2026-09-01T23:58:00.000Z", "new-user", "completed"),
+        ("onboarding_result", "2026-09-01T23:59:00.000Z", "new-user", "completed"),
+        ("first_app_ready", "2026-09-02T00:00:00.000Z", "new-user", None),
+        ("first_turn_started", "2026-09-02T00:01:00.000Z", "new-user", None),
+        ("first_turn_result", "2026-09-02T00:02:00.000Z", "new-user", "success"),
+        ("first_turn_result", "2026-09-02T00:03:00.000Z", "new-user", "success"),
+        ("onboarding_result", "2026-09-01T00:00:00.000Z", "not-ready", "completed"),
+        ("first_turn_started", "2026-09-01T00:01:00.000Z", "not-ready", None),
+        ("first_turn_result", "2026-09-01T00:02:00.000Z", "not-ready", "success"),
+        ("onboarding_result", "2026-09-01T00:00:00.000Z", "cancelled-user", "cancelled"),
+        ("first_app_ready", "2026-09-01T00:01:00.000Z", "ready-only", None),
+    ]
+    for sequence, (name, occurred_at, user, outcome) in enumerate(events, start=1):
+        _insert(
+            growth, sequence=sequence, event_name=name, occurred_at=occurred_at,
+            analytics_user_id=user, outcome=outcome,
+        )
+
+    activation = queries.growth(UtcCohortWindow.from_dates("2026-09-01", "2026-09-01"))[
+        "activation"
+    ]
+    assert [stage["deduplicatedCount"] for stage in activation["stages"]] == [2, 1, 1, 1]
+    assert [transition["dropoffRate"] for transition in activation["transitions"]] == [0.5, 0, 0]
+    _assert_no_sensitive_output(activation)
+    following_day = queries.growth(UtcCohortWindow.from_dates("2026-09-02", "2026-09-02"))[
+        "activation"
+    ]
+    assert [stage["deduplicatedCount"] for stage in following_day["stages"]] == [0, 0, 0, 0]
 
 
 def test_utc_cohort_dates_are_strict_and_bounded() -> None:

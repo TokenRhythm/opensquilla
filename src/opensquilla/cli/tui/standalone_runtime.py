@@ -41,6 +41,7 @@ class StandaloneRunConcurrentRepl(Protocol):
         scope: StandaloneRuntimeScope,
         dispatch: Callable[[str], Coroutine[Any, Any, bool]],
         on_surface_ready: Callable[[], Coroutine[Any, Any, None]] | None = None,
+        on_user_activity: Callable[[], Coroutine[Any, Any, None]] | None = None,
     ) -> None: ...
 
 
@@ -501,6 +502,14 @@ async def run_standalone_chat(
 
     try:
 
+        async def _record_user_activity() -> None:
+            from opensquilla.telemetry.contracts.common import ClientSurface
+
+            sink = getattr(svc, "growth_event_sink", None)
+            record = getattr(sink, "record_product_active", None)
+            if callable(record):
+                await record(surface=ClientSurface.TUI)
+
         async def _record_surface_ready() -> None:
             from opensquilla.telemetry.contracts.common import (
                 ClientEntrypoint,
@@ -509,6 +518,7 @@ async def run_standalone_chat(
             )
 
             sink = getattr(svc, "growth_event_sink", None)
+            await _record_user_activity()
             record = getattr(sink, "record_client_launch", None)
             if callable(record):
                 await record(
@@ -528,6 +538,11 @@ async def run_standalone_chat(
             for parameter in parameters
         ):
             repl_kwargs["on_surface_ready"] = _record_surface_ready
+        if any(
+            parameter.name == "on_user_activity" or parameter.kind is inspect.Parameter.VAR_KEYWORD
+            for parameter in parameters
+        ):
+            repl_kwargs["on_user_activity"] = _record_user_activity
         await deps.run_concurrent_repl(**repl_kwargs)
     finally:
         await svc.close()

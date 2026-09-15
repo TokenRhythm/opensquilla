@@ -161,7 +161,7 @@ async def test_scope_mismatch_is_rejected_before_consent_callback(tmp_path: Path
         await growth.close()
 
 
-async def test_revoke_transition_linearizes_clear_after_inflight_enqueue(
+async def test_disable_transition_waits_for_inflight_enqueue_and_preserves_it(
     tmp_path: Path,
 ) -> None:
     outbox = await TelemetryOutbox.open(tmp_path, TelemetryScope.RELIABILITY)
@@ -187,7 +187,6 @@ async def test_revoke_transition_linearizes_clear_after_inflight_enqueue(
             nonlocal current
             async with coordinator.transition(TelemetryScope.RELIABILITY):
                 current = _state(decision=ConsentDecision.DECLINED)
-                await outbox.clear_scope()
 
         revoke_task = asyncio.create_task(revoke())
         await asyncio.sleep(0)
@@ -195,7 +194,7 @@ async def test_revoke_transition_linearizes_clear_after_inflight_enqueue(
         release_enqueue.set()
         assert (await record_task).status is RecordStatus.RECORDED
         await revoke_task
-        assert (await outbox.stats()).pending_events == 0
+        assert (await outbox.stats()).pending_events == 1
         assert coordinator.revision(TelemetryScope.RELIABILITY) == 1
     finally:
         await outbox.close()
@@ -218,7 +217,6 @@ async def test_record_waiting_behind_revoke_observes_decline_and_never_enqueues(
             transition_entered.set()
             current = _state(decision=ConsentDecision.DECLINED)
             await release_transition.wait()
-            await outbox.clear_scope()
 
     try:
         revoke_task = asyncio.create_task(revoke())

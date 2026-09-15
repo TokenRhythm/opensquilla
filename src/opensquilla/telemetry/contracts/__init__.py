@@ -53,6 +53,7 @@ from opensquilla.telemetry.contracts.growth import (
     LandingView,
     MetaSkillUsage,
     OnboardingCompleted,
+    ProductActive,
     RegistrationResult,
     RegistrationStarted,
 )
@@ -117,6 +118,7 @@ TelemetryEvent = (
     | FirstTurnStarted
     | FirstTurnSucceeded
     | ClientLaunch
+    | ProductActive
     | MetaSkillUsage
     | CodingModeUsage
 )
@@ -149,12 +151,14 @@ EVENT_MODELS = MappingProxyType(
         ("first_turn_started", 1): FirstTurnStarted,
         ("first_turn_result", 1): FirstTurnSucceeded,
         ("client_launch", 1): ClientLaunch,
+        ("product_active", 1): ProductActive,
         ("metaskill_usage", 1): MetaSkillUsage,
         ("coding_mode_usage", 1): CodingModeUsage,
     }
 )
 
 __all__ = [
+    "ProductActive",
     "CURRENT_NOTICE_VERSION_BY_SCOPE",
     "EVENT_MODELS",
     "MAX_GROWTH_BATCH_BYTES",

@@ -151,6 +151,7 @@ class GatewayRunInputLoop(Protocol):
         abort_active_turn: Callable[[], Awaitable[None]] | None = None,
         steer_active_turn: Callable[[str], Awaitable[bool]] | None = None,
         on_surface_ready: Callable[[], Awaitable[None]] | None = None,
+        on_user_activity: Callable[[], Awaitable[None]] | None = None,
     ) -> None: ...
 
 
@@ -1078,7 +1079,17 @@ async def run_gateway_chat(
 
         try:
 
+            async def _record_user_activity() -> None:
+                # Older Gateways may not offer this additive method. Activity
+                # delivery has a bounded wait and never changes turn state.
+                with suppress(Exception):
+                    await asyncio.wait_for(
+                        client.call("telemetry.product_active.record", {"surface": "tui"}),
+                        timeout=1.0,
+                    )
+
             async def _record_surface_ready() -> None:
+                await _record_user_activity()
                 await client.call("telemetry.client_launch.record", {})
 
             input_loop_kwargs: dict[str, Any] = {
@@ -1103,6 +1114,12 @@ async def run_gateway_chat(
                     for parameter in parameters
                 ):
                     input_loop_kwargs["on_surface_ready"] = _record_surface_ready
+                if any(
+                    parameter.name == "on_user_activity"
+                    or parameter.kind is inspect.Parameter.VAR_KEYWORD
+                    for parameter in parameters
+                ):
+                    input_loop_kwargs["on_user_activity"] = _record_user_activity
             await deps.run_input_loop(**input_loop_kwargs)
         except ConnectionError:
             exit_reason = "gateway_disconnect"

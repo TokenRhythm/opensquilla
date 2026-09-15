@@ -51,10 +51,11 @@ import { OnboardingSaveTelemetry } from './onboarding-save-telemetry.js'
 import {
   applyDesktopTelemetryConsentPayload,
   desktopPrivacyTomlLines,
+  emptyDesktopTelemetryConsent,
   parseDesktopTelemetryConsent,
   parseLegacyNetworkObservabilityDisabled,
   replaceDesktopTelemetryConsentInPrivacy,
-  requireExplicitOnboardingConsent,
+  resolveDesktopTelemetryConsent,
   type DesktopTelemetryConsent,
 } from './telemetry/onboarding-consent.js'
 import {
@@ -62,10 +63,7 @@ import {
   writeConsentMirror,
   type ConsentMirror,
 } from './telemetry/consent-mirror.js'
-import {
-  clearEarlyTelemetryScope,
-  DesktopTelemetryRuntimeGate,
-} from './telemetry/early-spool.js'
+import { DesktopTelemetryRuntimeGate } from './telemetry/early-spool.js'
 import {
   DesktopReliabilityTelemetry,
   type AppStartErrorCode,
@@ -82,7 +80,6 @@ import {
 } from './telemetry/build-identity.js'
 import { runTelemetrySideEffectFailOpen } from './telemetry/fail-open.js'
 import {
-  clearDesktopGrowthTelemetryState,
   DesktopGrowthTelemetry,
   parseDesktopOnboardingReceipt,
   type DesktopOnboardingReceipt,
@@ -2328,9 +2325,9 @@ function mirroredScopeConsent(
   scope: DesktopTelemetryConsent['reliability'],
   forcedOff: boolean,
 ): ConsentMirror['reliability'] {
-  const timestampIsUtc = typeof scope.consentedAtUtc === 'string'
+  const timestampIsUtc = scope.consentedAtUtc === null || (typeof scope.consentedAtUtc === 'string'
     && scope.consentedAtUtc.endsWith('Z')
-    && Number.isFinite(Date.parse(scope.consentedAtUtc))
+    && Number.isFinite(Date.parse(scope.consentedAtUtc)))
   if (scope.enabled !== true || scope.noticeVersion === null || !timestampIsUtc) {
     return {
       enabled: scope.enabled === false ? false : null,
@@ -2353,10 +2350,10 @@ async function writeDesktopConsentMirror(
   failClosed = false,
 ): Promise<void> {
   if (failClosed) desktopTelemetryRuntimeGate.close()
-  const consent = failClosed
-    ? parseDesktopTelemetryConsent(null)
-    : parseDesktopTelemetryConsent(configRaw)
-  const forcedOff = failClosed || parseLegacyNetworkObservabilityDisabled(configRaw) === true
+  const consent = failClosed || configRaw === null
+    ? emptyDesktopTelemetryConsent()
+    : resolveDesktopTelemetryConsent(configRaw)
+  const forcedOff = failClosed || configRaw === null
   await writeConsentMirror(desktopConsentMirrorPath(profile, configRaw), {
     schema_version: CONSENT_MIRROR_SCHEMA_VERSION,
     reliability: mirroredScopeConsent(consent.reliability, forcedOff),
@@ -2368,20 +2365,6 @@ async function syncDesktopConsentMirror(profile = activeDesktopProfile()): Promi
   desktopTelemetryRuntimeGate.close()
   const configRaw = await readOptionalDesktopText(join(profile.home, 'config.toml'))
   await writeDesktopConsentMirror(profile, configRaw)
-  const consent = parseDesktopTelemetryConsent(configRaw)
-  for (const scope of ['reliability', 'growth'] as const) {
-    if (consent[scope].enabled !== false) continue
-    const cleanup = clearEarlyTelemetryScope(
-      desktopEarlyTelemetrySpoolPath(profile, configRaw),
-      scope,
-    )
-    if (cleanup.unsafe || cleanup.failed > 0) {
-      throw new Error(`Could not clear declined ${scope} telemetry from the local early spool.`)
-    }
-  }
-  if (consent.growth.enabled === false) {
-    clearDesktopGrowthTelemetryState(desktopTelemetryDirectory(profile, configRaw))
-  }
   const credentialRaw = await readOptionalDesktopText(profile.credentialPath)
   const credential = credentialRaw === null
     ? null
@@ -2893,7 +2876,9 @@ async function saveDesktopCredential(
         payload,
         new Date().toISOString(),
       )
-    : null
+    : Object.prototype.hasOwnProperty.call(payload, 'disableNetworkObservability')
+      ? emptyDesktopTelemetryConsent()
+      : null
 
   if (defaults.requiresApiKey && !encryptedApiKey) throw new Error('API key is required.')
   if (modelRoutingMode === 'llm_ensemble' && !modelRoutingModeAllowed(modelRoutingMode, provider)
@@ -2908,9 +2893,13 @@ async function saveDesktopCredential(
 
   const now = new Date().toISOString()
   // Publish the receipt with the same recoverable settings transaction. It is
-  // valid only for the explicit consent grant made by a verified fresh profile.
-  const onboardingReceipt = completingOnboarding && !disableNetworkObservability && consentOverride !== null
-    ? desktopGrowthTelemetry.prepareOnboardingReceipt(targetProfile.home, consentOverride.growth)
+  // valid only for actual onboarding completion in a verified fresh profile.
+  const effectiveTelemetryConsent = resolveDesktopTelemetryConsent(
+    existingConfigRaw, disableNetworkObservability,
+    consentOverride ?? parseDesktopTelemetryConsent(existingConfigRaw),
+  )
+  const onboardingReceipt = completingOnboarding
+    ? desktopGrowthTelemetry.prepareOnboardingReceipt(targetProfile.home, effectiveTelemetryConsent.growth)
     : null
   const persistedOnboardingReceipt = onboardingReceipt ?? existing?.growthOnboardingReceipt
   const credential: DesktopConnection = {
@@ -3018,7 +3007,11 @@ async function saveImportedDesktopCredential(
   if (importedConfig === null) {
     throw new Error('The imported profile config.toml is missing; recover the profile before adoption.')
   }
-  const importedConsent = consentPayload === null
+  const hasImportedConsentPayload = consentPayload !== null && (
+    Object.prototype.hasOwnProperty.call(consentPayload, 'reliabilityDiagnosticsEnabled')
+    || Object.prototype.hasOwnProperty.call(consentPayload, 'productAnalyticsEnabled')
+  )
+  const importedConsent = !hasImportedConsentPayload
     ? null
     : applyDesktopTelemetryConsentPayload(
         parseDesktopTelemetryConsent(importedConfig),
@@ -3857,15 +3850,7 @@ const DESKTOP_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
     'onboarding.step5.subtitle': 'Search is optional. Start without another key, or connect a runtime-supported search provider.',
     'onboarding.step5.searchKey': 'Search API key',
     'onboarding.step5.searchHintDefault': 'DuckDuckGo is enough to start.',
-    'onboarding.telemetry.heading': 'Data choices',
-    'onboarding.telemetry.subtitle': 'Choose each category before starting. Both stay off until you decide.',
-    'onboarding.telemetry.reliabilityTitle': 'Stability diagnostics',
-    'onboarding.telemetry.reliabilityDesc': 'Share operation outcomes, timings, error codes, and crash fingerprints. Prompts, replies, file names, paths, contents, tool inputs, and full stacks are excluded.',
-    'onboarding.telemetry.growthTitle': 'Product and growth analytics',
-    'onboarding.telemetry.growthDesc': 'Share activation milestones and counts of MetaSkill and Coding Mode runs after they actually start, using a random, purpose-specific analytics ID—not your raw account ID. Prompts, replies, task parameters, files, and payment details are excluded.',
-    'onboarding.telemetry.enable': 'Enable',
-    'onboarding.telemetry.decline': 'Do not enable',
-    'onboarding.telemetry.required': 'Choose an option for both data categories.',
+    'onboarding.telemetry.notice': 'Operation results, errors, activation milestones, and actual feature usage help improve OpenSquilla. Uploads follow the network reporting setting in Security & Privacy. Prompts, replies, files, task parameters, and raw account IDs are excluded.',
     'onboarding.step5.back': 'Back',
     'onboarding.step5.finish': 'Start OpenSquilla',
   },
@@ -4003,15 +3988,7 @@ const DESKTOP_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
     'onboarding.step5.subtitle': '搜索为可选项。可以不添加其他密钥直接开始，或连接运行时支持的搜索提供商。',
     'onboarding.step5.searchKey': '搜索 API 密钥',
     'onboarding.step5.searchHintDefault': 'DuckDuckGo 足以开始使用。',
-    'onboarding.telemetry.heading': '数据选项',
-    'onboarding.telemetry.subtitle': '启动前请分别选择；在你做出选择之前，两类数据都保持关闭。',
-    'onboarding.telemetry.reliabilityTitle': '稳定性诊断',
-    'onboarding.telemetry.reliabilityDesc': '上传操作结果、耗时、错误码和崩溃指纹；不包含提示词、回复、文件名、路径、文件内容、工具入参或完整堆栈。',
-    'onboarding.telemetry.growthTitle': '产品与增长分析',
-    'onboarding.telemetry.growthDesc': '使用随机生成、仅用于分析的专用 ID 上传激活里程碑，以及 MetaSkill 和编程模式实际开始后的使用次数，不使用原始账号 ID；不包含提示词、回复、任务参数、文件或支付信息。',
-    'onboarding.telemetry.enable': '启用',
-    'onboarding.telemetry.decline': '不启用',
-    'onboarding.telemetry.required': '请为两类数据分别选择一个选项。',
+    'onboarding.telemetry.notice': '操作结果、错误、激活流程和功能实际使用次数用于改进 OpenSquilla，统一遵循“安全与隐私”中的网络上报设置；不包含提示词、回复、文件、任务参数或原始账号 ID。',
     'onboarding.step5.back': '返回',
     'onboarding.step5.finish': '启动 OpenSquilla',
   },
@@ -6354,20 +6331,12 @@ function onboardingHtml(
 	      padding: 4px 4px 4px 20px;
 	    }
 	    .field-pair { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 12px; }
-    .telemetry-consent {
+    .telemetry-notice {
       margin-top: 16px;
       padding-top: 14px;
       border-top: 1px solid var(--line);
     }
-    .telemetry-consent > h3 { margin: 0; font-size: 14px; }
-    .telemetry-consent > p { margin: 5px 0 12px; color: var(--muted); font-size: 12px; line-height: 1.45; }
-    .telemetry-consent-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
-    .telemetry-consent-card { padding: 12px; border: 1px solid var(--line); border-radius: 9px; }
-    .telemetry-consent-card strong { display: block; font-size: 13px; }
-    .telemetry-consent-card p { min-height: 48px; margin: 5px 0 10px; color: var(--muted); font-size: 11px; line-height: 1.45; }
-    .telemetry-consent-options { display: flex; flex-wrap: wrap; gap: 12px; }
-    .telemetry-consent-options label { display: inline-flex; align-items: center; gap: 5px; font-size: 12px; }
-    .telemetry-consent-options input { width: auto; min-height: 0; }
+    .telemetry-notice { color: var(--muted); font-size: 12px; line-height: 1.45; }
     .actions {
       display: flex;
       align-items: center;
@@ -6446,7 +6415,6 @@ function onboardingHtml(
       .deck { width: 100%; }
       .setup-card { position: relative; min-height: 620px; height: auto; padding: 24px 20px; }
       .provider, .field-pair { grid-template-columns: 1fr; gap: 4px; }
-      .telemetry-consent-grid { grid-template-columns: 1fr; }
       .provider-feature { grid-template-columns: 1fr; }
       .provider-feature-cta { width: 100%; }
       .provider-promo-copy {
@@ -6563,32 +6531,8 @@ function onboardingHtml(
             </div>
           </div>
         </section>
-        <section class="telemetry-consent" aria-labelledby="telemetryConsentHeading">
-          <h3 id="telemetryConsentHeading" data-i18n="onboarding.telemetry.heading">${ot('onboarding.telemetry.heading')}</h3>
-          <p data-i18n="onboarding.telemetry.subtitle">${ot('onboarding.telemetry.subtitle')}</p>
-          <div class="telemetry-consent-grid">
-            <fieldset class="telemetry-consent-card">
-              <legend class="sr-only" data-i18n="onboarding.telemetry.reliabilityTitle">${ot('onboarding.telemetry.reliabilityTitle')}</legend>
-              <strong aria-hidden="true" data-i18n="onboarding.telemetry.reliabilityTitle">${ot('onboarding.telemetry.reliabilityTitle')}</strong>
-              <p data-i18n="onboarding.telemetry.reliabilityDesc">${ot('onboarding.telemetry.reliabilityDesc')}</p>
-              <div class="telemetry-consent-options">
-                <label><input type="radio" name="reliabilityDiagnosticsEnabled" value="true"><span data-i18n="onboarding.telemetry.enable">${ot('onboarding.telemetry.enable')}</span></label>
-                <label><input type="radio" name="reliabilityDiagnosticsEnabled" value="false"><span data-i18n="onboarding.telemetry.decline">${ot('onboarding.telemetry.decline')}</span></label>
-              </div>
-            </fieldset>
-            <fieldset class="telemetry-consent-card">
-              <legend class="sr-only" data-i18n="onboarding.telemetry.growthTitle">${ot('onboarding.telemetry.growthTitle')}</legend>
-              <strong aria-hidden="true" data-i18n="onboarding.telemetry.growthTitle">${ot('onboarding.telemetry.growthTitle')}</strong>
-              <p data-i18n="onboarding.telemetry.growthDesc">${ot('onboarding.telemetry.growthDesc')}</p>
-              <div class="telemetry-consent-options">
-                <label><input type="radio" name="productAnalyticsEnabled" value="true"><span data-i18n="onboarding.telemetry.enable">${ot('onboarding.telemetry.enable')}</span></label>
-                <label><input type="radio" name="productAnalyticsEnabled" value="false"><span data-i18n="onboarding.telemetry.decline">${ot('onboarding.telemetry.decline')}</span></label>
-              </div>
-            </fieldset>
-          </div>
-          <span class="field-error" id="telemetryConsentError" role="alert" aria-live="polite"></span>
-        </section>
         <div class="error" id="error" role="alert" aria-live="assertive" tabindex="-1"></div>
+        <p class="telemetry-notice" data-i18n="onboarding.telemetry.notice">${ot('onboarding.telemetry.notice')}</p>
         </div>
         <footer class="actions">
           <button class="secondary" type="button" id="cancel" data-i18n="onboarding.step1.quit">${ot('onboarding.step1.quit')}</button>
@@ -6645,7 +6589,6 @@ function onboardingHtml(
     const modelEditDone = document.getElementById('modelEditDone');
     const searchApiKey = document.getElementById('searchApiKey');
     const searchApiKeyError = document.getElementById('searchApiKeyError');
-    const telemetryConsentError = document.getElementById('telemetryConsentError');
     const finish = document.getElementById('finish');
     const submitStatus = document.getElementById('submitStatus');
     const searchProvider = document.getElementById('searchProvider');
@@ -6667,8 +6610,6 @@ function onboardingHtml(
       return Object.freeze(value);
     }
     function onboardingPayloadSnapshot() {
-      const reliabilityChoice = document.querySelector('input[name="reliabilityDiagnosticsEnabled"]:checked');
-      const growthChoice = document.querySelector('input[name="productAnalyticsEnabled"]:checked');
       return deepFreeze({
         provider: provider.value,
         apiKey: apiKey.value,
@@ -6678,8 +6619,6 @@ function onboardingHtml(
         routerMode: routerMode.value,
         searchProvider: searchProvider.value,
         searchApiKey: searchApiKey.value,
-        reliabilityDiagnosticsEnabled: reliabilityChoice && reliabilityChoice.value === 'true',
-        productAnalyticsEnabled: growthChoice && growthChoice.value === 'true',
         locale: activeLocale,
       });
     }
@@ -6956,10 +6895,6 @@ function onboardingHtml(
         clearFieldError(apiKey, apiKeyError);
         clearFieldError(model, modelError);
         clearFieldError(searchApiKey, searchApiKeyError);
-        telemetryConsentError.textContent = '';
-        document.querySelectorAll('input[name="reliabilityDiagnosticsEnabled"], input[name="productAnalyticsEnabled"]').forEach((input) => {
-          input.removeAttribute('aria-invalid');
-        });
       }
       function presentValidationIssue(issue) {
         issue.output.textContent = issue.message;
@@ -6985,27 +6920,12 @@ function onboardingHtml(
       if (selectedSearch.requiresApiKey && !searchApiKey.value.trim()) {
         return { input: searchApiKey, output: searchApiKeyError, message: fmt('searchApiKeyRequired', { label: selectedSearch.label }) };
       }
-      const reliabilityChoice = document.querySelector('input[name="reliabilityDiagnosticsEnabled"]:checked');
-      const growthChoice = document.querySelector('input[name="productAnalyticsEnabled"]:checked');
-      if (!reliabilityChoice || !growthChoice) {
-        return {
-          input: reliabilityChoice || document.querySelector('input[name="reliabilityDiagnosticsEnabled"]'),
-          output: telemetryConsentError,
-          message: desktopMessage(activeLocale, 'onboarding.telemetry.required'),
-        };
-      }
       return null;
     }
     [[apiKey, apiKeyError], [model, modelError], [searchApiKey, searchApiKeyError]].forEach(([input, output]) => {
       input.addEventListener('input', () => {
         clearFieldError(input, output);
         if (input === model) renderModelField();
-      });
-    });
-    document.querySelectorAll('input[name="reliabilityDiagnosticsEnabled"], input[name="productAnalyticsEnabled"]').forEach((input) => {
-      input.addEventListener('change', () => {
-        telemetryConsentError.textContent = '';
-        input.removeAttribute('aria-invalid');
       });
     });
     modelEditToggle.addEventListener('click', () => {
@@ -14352,7 +14272,6 @@ async function performOnboardingSave(
         // remained open. Re-check it on every save attempt instead of carrying
         // a transient locked-keychain result across a user unlock.
         invalidateSecretStorageBackendCache()
-        requireExplicitOnboardingConsent(payload)
         if (pendingMigration?.phase === 'needs-setup' && pendingMigration.provider) {
           return await saveImportedDesktopCredential(
             pendingMigration,

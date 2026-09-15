@@ -31,11 +31,7 @@ NOTICE = CURRENT_NOTICE_VERSION_BY_SCOPE["reliability"]
 def _config(state_dir: Path):
     config = SimpleNamespace(
         state_dir=state_dir,
-        privacy=SimpleNamespace(
-            reliability_diagnostics_enabled=True,
-            reliability_notice_version=NOTICE,
-            reliability_consented_at_utc=CONSENTED_AT,
-        ),
+        privacy=SimpleNamespace(disable_network_observability=False),
     )
     scope_consent_coordinator_for(
         config,
@@ -44,7 +40,7 @@ def _config(state_dir: Path):
     return config
 
 
-def _active_session(state_dir: Path) -> Path:
+def _active_session(state_dir: Path, *, consented_at: str | None = None) -> Path:
     directory = state_dir / "telemetry" / "desktop-early-spool" / "reliability"
     directory.mkdir(parents=True)
     (directory / SESSION_MARKER_NAME).write_text(
@@ -54,7 +50,7 @@ def _active_session(state_dir: Path) -> Path:
                 "marker_kind": "desktop_reliability_session",
                 "app_session_id": APP_SESSION,
                 "started_at_ms": int(STARTED_AT.timestamp() * 1000),
-                "consent_generation": f"{NOTICE}\n{CONSENTED_AT}",
+                "consent_generation": f"{NOTICE}\n{consented_at or 'unified'}",
                 "clean_exit": False,
                 "performance_summary_emitted": False,
                 "gateway_turn_counts_applied": False,
@@ -69,7 +65,7 @@ def _active_session(state_dir: Path) -> Path:
                     "enabled": True,
                     "forced_off": False,
                     "notice_version": NOTICE,
-                    "consented_at_utc": CONSENTED_AT,
+                    "consented_at_utc": consented_at,
                 },
             }
         )
@@ -106,8 +102,11 @@ def offline_uploader(monkeypatch):
     monkeypatch.setattr(ScopedTelemetryRuntime, "upload_once", no_network)
 
 
-async def test_terminal_observer_counts_survive_gateway_restart_and_queue_replay(tmp_path):
-    target = _active_session(tmp_path)
+@pytest.mark.parametrize("consented_at", [None, CONSENTED_AT])
+async def test_terminal_observer_counts_survive_gateway_restart_and_queue_replay(
+    tmp_path, consented_at,
+):
+    target = _active_session(tmp_path, consented_at=consented_at)
     config = _config(tmp_path)
     runtime = ScopedTelemetryRuntime(config=config, env={})
     await _observe_turn(runtime, 0)
@@ -133,7 +132,7 @@ async def test_withdrawal_does_not_recreate_turn_counter_state(tmp_path):
     config = _config(tmp_path)
     runtime = ScopedTelemetryRuntime(config=config, env={})
     await _observe_turn(runtime, 1)
-    config.privacy.reliability_diagnostics_enabled = False
+    config.privacy.disable_network_observability = True
     cleanup = clear_desktop_early_spool_scope(tmp_path, TelemetryScope.RELIABILITY)
     assert cleanup.complete
     await _observe_turn(runtime, 1)
@@ -193,7 +192,10 @@ async def test_desktop_time_checkpoint_does_not_discard_a_terminal_count(tmp_pat
 
 
 @pytest.mark.parametrize("ending", ["finish", "recover"])
-async def test_gateway_observer_reaches_real_desktop_performance_summary(tmp_path, ending):
+@pytest.mark.parametrize("consented_at", [None, CONSENTED_AT])
+async def test_gateway_observer_reaches_real_desktop_performance_summary(
+    tmp_path, ending, consented_at,
+):
     """Run the Python producer against the built Desktop module, without Electron."""
     desktop = Path(__file__).parents[2] / "desktop" / "electron"
     node = shutil.which("node")
@@ -215,7 +217,7 @@ async def test_gateway_observer_reaches_real_desktop_performance_summary(tmp_pat
         growth: { enabled: false, forced_off: false, notice_version: null,
           consented_at_utc: null } });
       const gate = new DesktopTelemetryRuntimeGate(); gate.openAfterConsentSync();
-      let now = Date.parse(data.consented);
+      let now = data.startedAtMs;
       const options = { runtimeGate: gate, appVersion: () => '1.2.3', platform: 'macos',
         processStartedAtMs: now, nowMs: () => now, nowDate: () => new Date(now), env: {} };
       const first = new DesktopReliabilityTelemetry({...options, appSessionId: data.session});
@@ -239,7 +241,8 @@ async def test_gateway_observer_reaches_real_desktop_performance_summary(tmp_pat
             {
                 "state": str(tmp_path),
                 "notice": NOTICE,
-                "consented": CONSENTED_AT,
+                "consented": consented_at,
+                "startedAtMs": int(STARTED_AT.timestamp() * 1000),
                 "session": APP_SESSION,
             }
         ),

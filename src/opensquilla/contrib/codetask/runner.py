@@ -17,6 +17,7 @@ import shutil
 import subprocess
 import time
 from collections.abc import Callable
+from contextlib import ExitStack
 from dataclasses import asdict
 from datetime import UTC, datetime
 from pathlib import Path
@@ -679,7 +680,23 @@ def solve(
 ) -> TaskResult:
     """Run one code-task while excluding concurrent profile lifecycle mutations."""
 
-    with ProfileOperationLock(default_opensquilla_home()):
+    run_id = run_id or _default_run_id("task")
+    home = default_opensquilla_home().expanduser().resolve()
+    output_root = config.storage_root().expanduser().resolve()
+    lock_homes = {output_root}
+    # Desktop's normal task outputs live outside its running Gateway profile.
+    # Explicit output overrides and local source repositories remain subject
+    # to the original profile lease if they write back into that profile.
+    write_targets = [config.run_dir(run_id), config.scratch_dir(run_id)]
+    if verification_mode == "build" and not repo:
+        write_targets.append(config.build_workspace_dir())
+    if verification_mode == "build" and repo and "://" not in repo and not repo.startswith("git@"):
+        write_targets.append(Path(repo).expanduser())
+    if any(target.resolve().is_relative_to(home) for target in write_targets):
+        lock_homes.add(home)
+    with ExitStack() as leases:
+        for lock_home in sorted(lock_homes):
+            leases.enter_context(ProfileOperationLock(lock_home))
         try:
             return _solve_unlocked(
                 repo=repo,

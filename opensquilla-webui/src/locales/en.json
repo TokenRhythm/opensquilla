@@ -1822,8 +1822,8 @@
       "reliabilityDiagnosticsDesc": "Share operation outcomes, timings, and privacy-safe error fingerprints to help diagnose crashes and failures. Conversation and file content are never included.",
       "productAnalyticsLabel": "Product and growth analytics",
       "productAnalyticsDesc": "Share activation milestones and counts of MetaSkill and Coding Mode runs after they actually start, to measure conversion and feature use. Conversation content, task parameters, files, and raw account IDs are never included; a random, purpose-specific analytics identifier is used.",
-      "networkReportingLabel": "Network diagnostics master switch",
-      "networkReportingDesc": "Master control for network diagnostics, analytics, and update checks. Turning it off overrides both choices below."
+      "networkReportingLabel": "Diagnostics and usage reporting",
+      "networkReportingDesc": "Send anonymous diagnostics and usage statistics, including actual MetaSkill and Coding Mode run counts. Also controls update checks. Conversation content, task parameters, and files are not included."
     },
     "toast": {
       "loadFailed": "Failed to load settings: {error}",

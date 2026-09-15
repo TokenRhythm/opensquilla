@@ -390,17 +390,20 @@ full reference.
 
 ## Telemetry Privacy
 
-OpenSquilla has two isolated, optional telemetry scopes. Both remain off until
-the user saves consent for the current notice version in Privacy settings:
+OpenSquilla uses the existing **Network reporting** switch for both telemetry
+streams. Reporting is enabled by default and can be turned off in Privacy
+settings, without separate onboarding choices or consent popups:
 
 - **Reliability diagnostics** records bounded operation results for app and
   Gateway startup, crashes, turns, tools, file parsing, updates, and session
   performance.
-- **Product and growth analytics** records one-time acquisition, onboarding,
-  app-readiness, registration, and first-successful-turn milestones.
+- **Product and growth analytics** records client launches, actual MetaSkill
+  and Coding Mode executions, and one-time acquisition, onboarding,
+  app-readiness, registration, and first-successful-turn milestones. Existing
+  installations do not become new-user cohorts just by enabling reporting.
 
-Each scope has its own consent, random purpose-specific identifier, durable
-queue, upload endpoint, retention policy, and deletion path. Reliability events
+The streams retain separate purpose-specific identifiers, durable queues,
+upload endpoints, and retention policies. Reliability events
 go to `/v1/reliability/events`; growth events go to `/v1/growth/events`.
 Retries reuse `event_id` for server-side deduplication, and growth events are
 not sampled.
@@ -429,8 +432,10 @@ disable_network_observability = true
 ```
 
 This is a hard veto over both telemetry scopes, passive update checks, and
-automatic desktop update checks. It does not create, erase, or replace either
-saved per-scope consent decision. CI, test, and `DO_NOT_TRACK` environments
+automatic desktop update checks. Turning it off pauses pending uploads and
+stops collection without deleting local telemetry state. Previously saved
+per-scope declines are migrated to the unified switch being off; users can
+then change that one setting. CI, test, and `DO_NOT_TRACK` environments
 also fail closed for telemetry. Other user-initiated actions may still contact
 configured providers, search services, channels, or release hosts.
 Explicit update-availability checks remain disabled while the unified or

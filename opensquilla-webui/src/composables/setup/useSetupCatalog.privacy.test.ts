@@ -388,23 +388,24 @@ afterEach(() => {
 })
 
 describe('useSetupCatalog privacy settings', () => {
-  it('does not treat the legacy global false value as scoped telemetry consent', async () => {
+  it.each([
+    {},
+    { privacy: { disable_network_observability: false } },
+  ])('uses the legacy enabled default without separate consent drafts: %j', async config => {
     mockConfigSequence([
-      { privacy: { disable_network_observability: false } },
+      config,
     ])
     const { api, app } = await mountCatalog()
 
-    expect(api.privacyPanel.value).toMatchObject({
-      reliabilityDiagnosticsEnabled: false,
-      reliabilityDiagnosticsDecision: null,
-      productAnalyticsEnabled: false,
-      productAnalyticsDecision: null,
+    expect(api.privacyPanel.value).toEqual({
+      networkReportingEnabled: true,
+      networkReportingForcedOff: false,
     })
     expect(api.sectionDirty('securityPrivacy')).toBe(false)
     app.unmount()
   })
 
-  it('keeps the legacy row as an immediate global veto for both scoped controls', async () => {
+  it('updates the unified upload draft without saving until requested', async () => {
     mockConfigSequence([
       {
         privacy: {
@@ -424,133 +425,65 @@ describe('useSetupCatalog privacy settings', () => {
 
     expect(api.privacyPanel.value).toMatchObject({
       networkReportingEnabled: false,
-      reliabilityDiagnosticsEnabled: true,
-      reliabilityDiagnosticsDecision: true,
-      reliabilityDiagnosticsForcedOff: true,
-      productAnalyticsEnabled: true,
-      productAnalyticsDecision: true,
-      productAnalyticsForcedOff: true,
+      networkReportingForcedOff: false,
     })
     expect(api.sectionDirty('securityPrivacy')).toBe(true)
-    app.unmount()
-  })
-
-  it('saves the two consent scopes independently with notice metadata', async () => {
-    vi.useFakeTimers()
-    vi.setSystemTime(new Date('2026-09-01T08:30:00.000Z'))
-    mockConfigSequence([
-      { privacy: { disable_network_observability: false } },
-      {
-        privacy: {
-          disable_network_observability: false,
-          reliability_diagnostics_enabled: true,
-          reliability_notice_version: 'reliability-v1',
-          reliability_consented_at_utc: '2026-09-01T08:30:00.000Z',
-          product_analytics_enabled: false,
-        },
-      },
-    ])
-    const { api, app } = await mountCatalog()
-
-    api.setReliabilityDiagnosticsEnabled(true)
-    api.setProductAnalyticsEnabled(false)
-    expect(api.sectionDirty('securityPrivacy')).toBe(true)
-
-    await api.savePrivacy()
-
-    expect(rpcCall).toHaveBeenCalledWith('telemetry.consent.set', {
-      scope: 'reliability',
-      enabled: true,
-    })
-    expect(rpcCall).toHaveBeenCalledWith('telemetry.consent.set', {
-      scope: 'growth',
-      enabled: false,
-    })
     expect(rpcCall).not.toHaveBeenCalledWith('config.patch.safe', expect.anything())
-    expect(api.privacyPanel.value).toMatchObject({
-      reliabilityDiagnosticsEnabled: true,
-      reliabilityDiagnosticsDecision: true,
-      productAnalyticsEnabled: false,
-      productAnalyticsDecision: false,
-    })
-    expect(api.sectionDirty('securityPrivacy')).toBe(false)
+    expect(rpcCall).not.toHaveBeenCalledWith('telemetry.consent.set', expect.anything())
     app.unmount()
   })
 
-  it('allows granted consent to be revoked while its scope is forced off', async () => {
+  it('re-enables reporting through the same safe global setting after a migrated decline', async () => {
     mockConfigSequence([
+      { privacy: { disable_network_observability: true, product_analytics_enabled: false } },
       {
         privacy: {
           disable_network_observability: false,
-          reliability_diagnostics_enabled: true,
-          reliability_notice_version: 'reliability-v1',
-          reliability_consented_at_utc: '2026-09-01T08:30:00.000Z',
-          reliability_diagnostics_forced_off: true,
-          product_analytics_enabled: true,
-          product_analytics_notice_version: 'growth-v2',
-          product_analytics_consented_at_utc: '2026-09-01T08:30:00.000Z',
-          product_analytics_forced_off: false,
-        },
-      },
-      {
-        privacy: {
-          disable_network_observability: false,
-          reliability_diagnostics_enabled: false,
-          reliability_diagnostics_forced_off: true,
-          product_analytics_enabled: true,
-          product_analytics_notice_version: 'growth-v2',
-          product_analytics_consented_at_utc: '2026-09-01T08:30:00.000Z',
-          product_analytics_forced_off: false,
         },
       },
     ])
     const { api, app } = await mountCatalog()
 
-    expect(api.privacyPanel.value).toMatchObject({
-      reliabilityDiagnosticsEnabled: true,
-      reliabilityDiagnosticsDecision: true,
-      reliabilityDiagnosticsForcedOff: true,
-      productAnalyticsEnabled: true,
-      productAnalyticsDecision: true,
-      productAnalyticsForcedOff: false,
-    })
-    api.setReliabilityDiagnosticsEnabled(false)
-    expect(api.privacyPanel.value.reliabilityDiagnosticsDecision).toBe(false)
+    expect(api.privacyPanel.value.networkReportingEnabled).toBe(false)
+    api.setNetworkReportingEnabled(true)
     expect(api.sectionDirty('securityPrivacy')).toBe(true)
-    api.setReliabilityDiagnosticsEnabled(true)
-    expect(api.privacyPanel.value.reliabilityDiagnosticsDecision).toBe(false)
+
     await api.savePrivacy()
-    expect(rpcCall).toHaveBeenCalledWith('telemetry.consent.set', {
-      scope: 'reliability',
-      enabled: false,
+
+    expect(rpcCall).toHaveBeenCalledWith('config.patch.safe', {
+      patches: { 'privacy.disable_network_observability': false },
+    })
+    expect(rpcCall).not.toHaveBeenCalledWith('telemetry.consent.set', expect.anything())
+    expect(api.privacyPanel.value).toEqual({
+      networkReportingEnabled: true,
+      networkReportingForcedOff: false,
     })
     expect(api.sectionDirty('securityPrivacy')).toBe(false)
     app.unmount()
   })
 
-  it('blocks a forced-off unset scope from being enabled', async () => {
+  it('blocks reporting from being enabled while the environment disables it', async () => {
     mockConfigSequence([
       {
         privacy: {
           disable_network_observability: false,
-          product_analytics_forced_off: true,
+          network_observability_disabled_effective: true,
         },
       },
     ])
     const { api, app } = await mountCatalog()
 
-    api.setProductAnalyticsEnabled(true)
+    api.setNetworkReportingEnabled(true)
 
     expect(api.privacyPanel.value).toMatchObject({
-      productAnalyticsEnabled: false,
-      productAnalyticsDecision: null,
-      productAnalyticsForcedOff: true,
+      networkReportingEnabled: false,
+      networkReportingForcedOff: true,
     })
     expect(api.sectionDirty('securityPrivacy')).toBe(false)
     app.unmount()
   })
 
-  it('requires current notice metadata before displaying a stored true value as consent', async () => {
+  it('keeps reporting enabled after a notice-version update without prompting again', async () => {
     mockConfigSequence([
       {
         privacy: {
@@ -558,17 +491,22 @@ describe('useSetupCatalog privacy settings', () => {
           reliability_diagnostics_enabled: true,
           reliability_notice_version: 'reliability-v0',
           reliability_consented_at_utc: '2026-08-01T08:30:00.000Z',
+          product_analytics_enabled: true,
+          product_analytics_notice_version: 'growth-v1',
+          product_analytics_consented_at_utc: '2026-08-01T08:30:00.000Z',
         },
       },
     ])
     const { api, app } = await mountCatalog()
 
-    expect(api.privacyPanel.value).toMatchObject({
-      reliabilityDiagnosticsEnabled: false,
-      reliabilityDiagnosticsDecision: null,
+    expect(api.privacyPanel.value).toEqual({
+      networkReportingEnabled: true,
+      networkReportingForcedOff: false,
     })
-    api.setReliabilityDiagnosticsEnabled(true)
-    expect(api.sectionDirty('securityPrivacy')).toBe(true)
+    expect(api.sectionDirty('securityPrivacy')).toBe(false)
+    await api.savePrivacy()
+    expect(rpcCall).not.toHaveBeenCalledWith('telemetry.consent.set', expect.anything())
+    expect(confirmAction).not.toHaveBeenCalled()
     app.unmount()
   })
 

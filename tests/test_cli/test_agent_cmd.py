@@ -1710,6 +1710,67 @@ async def test_run_agent_once_can_opt_into_interactive_single_shot(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("child_marker", [None, "0", "1"])
+@pytest.mark.parametrize("stateless", [False, True])
+async def test_agent_launch_counts_user_cli_not_internal_coding_child(
+    monkeypatch: pytest.MonkeyPatch, child_marker: str | None, stateless: bool
+) -> None:
+    from opensquilla.telemetry.contracts.common import (
+        ClientEntrypoint,
+        ClientSurface,
+        ExecutionMode,
+    )
+
+    launches: list[dict[str, Any]] = []
+    active: list[dict[str, Any]] = []
+    turns: list[dict[str, Any]] = []
+
+    async def record_launch(**kwargs: Any) -> None:
+        launches.append(kwargs)
+
+    async def record_active(**kwargs: Any) -> None:
+        active.append(kwargs)
+
+    class FakeTurnRunner:
+        def __init__(self, **kwargs: Any) -> None:
+            pass
+
+        async def run(self, message: str, session_key: str, **kwargs: Any):
+            turns.append(kwargs)
+            yield DoneEvent(text="ok", model="synthetic-model")
+
+    async def fake_build_services(*, config: GatewayConfig, **kwargs: Any) -> _FakeServices:
+        svc = _FakeServices(config)
+        svc.growth_event_sink = SimpleNamespace(
+            record_client_launch=record_launch, record_product_active=record_active,
+        )
+        return svc
+
+    if child_marker is None:
+        monkeypatch.delenv("OPENSQUILLA_CODETASK_CHILD", raising=False)
+    else:
+        monkeypatch.setenv("OPENSQUILLA_CODETASK_CHILD", child_marker)
+    monkeypatch.setattr("opensquilla.engine.runtime.TurnRunner", FakeTurnRunner)
+    monkeypatch.setattr("opensquilla.gateway.build_services", fake_build_services)
+
+    result = await run_agent_once(
+        message="synthetic task", config=GatewayConfig(), stateless=stateless
+    )
+
+    assert result.status == "ok"
+    expected_launches = [] if child_marker == "1" else [{
+        "surface": ClientSurface.CLI,
+        "entrypoint": ClientEntrypoint.AGENT,
+        "execution_mode": ExecutionMode.ONE_SHOT,
+    }]
+    assert launches == expected_launches
+    assert active == ([] if child_marker == "1" else [{"surface": ClientSurface.CLI}])
+    assert len(turns) == 1
+    assert turns[0]["telemetry_surface"] is ClientSurface.CLI
+    assert turns[0]["telemetry_execution_mode"] is ExecutionMode.ONE_SHOT
+
+
+@pytest.mark.asyncio
 async def test_run_agent_once_can_opt_into_stateless_bootstrap(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
