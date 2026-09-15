@@ -377,13 +377,13 @@
       "lifecycle": "stable",
       "name": "config.patch",
       "schema": "platform/config-patch.schema.json",
-      "schemaSha256": "a41e9e9f715642fb55191e807e719fc1516ba312ecf3b13d99146197f3d8549d"
+      "schemaSha256": "a4df1cfc34a8e5af7155f08b6f857268699d0d2cc8d61da041a7d1e5a75bb432"
     },
     {
       "lifecycle": "stable",
       "name": "config.patch.safe",
       "schema": "platform/config-patch-safe.schema.json",
-      "schemaSha256": "f638fc27348411265f12995eb8642212f9e01b052d2a1f68cc190f5e85119f6c"
+      "schemaSha256": "2c8c7dda96c270bba0b5c499fe26fb29409e755acf44d864799f0bc4e93b04bd"
     },
     {
       "lifecycle": "stable",
@@ -738,9 +738,15 @@
     },
     {
       "lifecycle": "stable",
+      "name": "models.routing.resetRecommended",
+      "schema": "platform/models-routing-reset-recommended.schema.json",
+      "schemaSha256": "c38774a2ce580d398960e8114038b48400720da4fc861ad2d2779794ddd665ae"
+    },
+    {
+      "lifecycle": "stable",
       "name": "models.routing.set",
       "schema": "platform/models-routing-set.schema.json",
-      "schemaSha256": "071191f07419453b6258d09c1995736279d188e15defa82bf6ead3345f5b81eb"
+      "schemaSha256": "0e48986e51c7ac7879b6d00a2ca14f947f98787940a7e9d18ba37ee87e25676f"
     },
     {
       "lifecycle": "stable",
@@ -794,7 +800,7 @@
       "lifecycle": "stable",
       "name": "onboarding.ensemble.configure",
       "schema": "platform/onboarding-ensemble-configure.schema.json",
-      "schemaSha256": "fdf8e410557592b3613b6a7ebdac3ad8529468c6a9d67732c74cdfa0172ddbc1"
+      "schemaSha256": "eb197a889eeb5f8ac744ce2144947eb142e4882fd3db4b9169128f5b20ab7437"
     },
     {
       "lifecycle": "stable",
@@ -864,6 +870,12 @@
     },
     {
       "lifecycle": "stable",
+      "name": "onboarding.llmProfile.upsertAndActivate",
+      "schema": "platform/onboarding-llm-profile-upsert-and-activate.schema.json",
+      "schemaSha256": "e76809ed196d160d9ebbbb06c817cd6439145f5690e5d0aa59a1e499adb71bdd"
+    },
+    {
+      "lifecycle": "stable",
       "name": "onboarding.memory_embedding.configure",
       "schema": "platform/onboarding-memory-embedding-configure.schema.json",
       "schemaSha256": "0f1eb7452d7bdb97510e73c5ff16bb81daa17bde32ea02b94b22a0872feac5d6"
@@ -878,7 +890,7 @@
       "lifecycle": "stable",
       "name": "onboarding.provider.configure",
       "schema": "platform/onboarding-provider-configure.schema.json",
-      "schemaSha256": "630b4fd36ea57c1f7c8fcaf7b9d06094c00e5604754ad4c7b69d2eca25a26ad8"
+      "schemaSha256": "793f76bb6ccc564a2754412af4a22498de5147a525dfaf4c5f49851e34315e11"
     },
     {
       "lifecycle": "stable",
@@ -902,7 +914,7 @@
       "lifecycle": "stable",
       "name": "onboarding.router.configure",
       "schema": "platform/onboarding-router-configure.schema.json",
-      "schemaSha256": "ff69dba95d85610859125ec3ee974e539f399cff1cbc8538937b274958fe9bb2"
+      "schemaSha256": "9345c1e57f7fa6a7535c9379cf86ecceaa801d68c0b9e9029ab2f5cdb8c8ffde"
     },
     {
       "lifecycle": "stable",
@@ -1439,10 +1451,10 @@
   "protocol": "opensquilla-websocket-json",
   "source": {
     "eventFamilyCount": 10,
-    "generatorSha256": "a83e88741e52d1119093a49f59cae11f77875c4e2c0e9c552d4bf3860a5c58f6",
-    "methodCount": 211,
-    "schemaCount": 221,
-    "schemaTreeSha256": "e73d2c46e2f74d22a034603944b34a271d0583d1b48ed4213f2ae64eb484d93a"
+    "generatorSha256": "5d86c5f2e5f54e7e06de942777db27cff5408a92345c0a37ebf43fa3e9acf498",
+    "methodCount": 213,
+    "schemaCount": 223,
+    "schemaTreeSha256": "ef44b2d71b628adbd4e582c94a9ffad67153bcff5708d49ebc71e7eb12d36c39"
   },
   "wireVersion": 4
 }

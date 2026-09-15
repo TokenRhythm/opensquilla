@@ -869,6 +869,11 @@
       "memoryOptions": "Memory options"
     },
     "provider": {
+      "moreActions": "{provider} more actions",
+      "routerOutcomeSynchronized": "Router recommendations now follow the saved primary provider.",
+      "routerOutcomePreserved": "Saved Router tiers were preserved.",
+      "routerOutcomeDisabled": "Model Routing was turned off; saved tiers were preserved.",
+      "primarySavedAdditionalFailed": "The provider was saved, but additional settings could not be saved. Review settings before retrying.",
       "title": "Provider",
       "pageTitle": "Model Service",
       "pageDesc": "Connect providers and manage their credentials and models.",
@@ -877,6 +882,7 @@
       "configuredSummary": "{ready} of {count} ready. Testing sends one small model request.",
       "configuredDesc": "Saved providers remain available for routing until you remove them. Configuration verification sends a small model request using the saved settings; provider charges may apply.",
       "activeBadge": "Active",
+      "currentPrimary": "Current primary",
       "editingBadge": "Editing",
       "profileReady": "Credentials ready",
       "profileNeedsCredentials": "Needs credentials",
@@ -1152,12 +1158,45 @@
       "modelProvenance": "Live provider list · capability source: {sources}",
       "modelMetadataProvenance": "Live provider list · official values when available, catalog fallback otherwise",
       "modelMultimodal": "Multimodal",
-      "modelMultimodalTitle": "Supports image input"
+      "modelMultimodalTitle": "Supports image input",
+      "saveAndStart": "Save and start using",
+      "saveAndMakeActive": "Save and set as primary",
+      "saveActivateUpgradeHint": "Upgrade the Gateway to save and set a provider as primary in one operation.",
+      "primaryRoleHint": "The primary provider handles default direct requests and fallback. Custom multi-model strategies keep their own configuration.",
+      "activationCredentialRequired": "Add a usable credential before setting this provider as primary.",
+      "routerConflictTitle": "Choose how to handle existing model routes",
+      "routerConflictBody": "The saved Router uses {conflicts}, which conflicts with {provider}. Use {provider} recommendations to replace saved and unsaved Router tier edits, or keep the existing tiers with routing off when offered. Cancel keeps your mode and drafts.",
+      "routerUseRecommended": "Use the target provider’s recommended routes",
+      "routerDisablePreserve": "Keep routes and turn Router off",
+      "alreadyActive": "The target provider is already primary. This credential edit was not saved.",
+      "primarySaveUncertain": "The save result could not be confirmed. Your draft was kept. Check the saved configuration before retrying; an active provider alone does not confirm that credential edits were saved."
     },
     "preset": {
       "modeCustom": "custom tiers"
     },
     "modelStrategy": {
+      "summaryPrimary": "Saved primary",
+      "summaryRouter": "Model routing",
+      "summaryOn": "On",
+      "summaryOff": "Off",
+      "bindingFollowPrimary": "Recommended · follows primary",
+      "bindingCustom": "Custom tiers",
+      "bindingLegacy": "Existing tiers · follow behavior unspecified",
+      "resetRecommended": "Use {provider} recommended tiers",
+      "resettingRecommended": "Updating recommended tiers…",
+      "resetKeepsOff": "Updates tiers; model routing stays off.",
+      "resetKeepsMode": "Replaces tiers and keeps the current mode.",
+      "retainedDrafts": "Unsaved routing changes",
+      "crossProviderDisabledMismatch": "Saved tiers use other providers; cross-provider execution is off.",
+      "resetUpgradeHint": "Upgrade the Gateway to use recommended tiers in one operation.",
+      "operationPending": "Another provider or routing operation is in progress.",
+      "activationUpgradeHint": "This Gateway cannot confirm safe Router activation. Upgrade the Gateway to review and resolve provider conflicts.",
+      "savedRefreshFailed": "Saved, but the updated settings could not be refreshed. Reload settings before making another change.",
+      "resultUncertain": "The save result is unknown. Review refreshed settings before trying again.",
+      "resetTitle": "Use {provider} recommended tiers?",
+      "resetBody": "Replace saved and unsaved Router tier edits with {provider} recommended tiers? The current mode and Router switch stay unchanged. Other unsaved settings are kept.",
+      "resetConfirm": "Replace recommended tiers",
+      "resetSaved": "{provider} recommended tiers saved; the current mode is unchanged.",
       "title": "Model routing",
       "desc": "Choose how models are picked for each request.",
       "newSessionDefault": "This is the default for new chats. Existing chats keep their own routing mode.",
@@ -1188,7 +1227,7 @@
       "singleModelDesc": "Used for every request in Fixed model mode, and as the fallback if routing or ensemble execution cannot complete.",
       "singleModelPlaceholder": "Enter a model ID",
       "singleDesc": "Use one predictable model without automatic routing or model ensemble.",
-      "crossProviderNotice": "Cross-provider routing is active. Review each tier before saving.",
+      "crossProviderNotice": "Cross-provider execution is enabled.",
       "cards": {
         "router": {
           "title": "Intelligent model routing",
@@ -1836,7 +1875,10 @@
       "channelEnabled": "Channel enabled. Restart required.",
       "channelEnabledLive": "Channel enabled and started.",
       "channelDisabled": "Channel disabled. Restart required.",
-      "channelDisabledLive": "Channel disabled and stopped."
+      "channelDisabledLive": "Channel disabled and stopped.",
+      "providerSavedAndActivated": "{provider} was saved and set as primary.",
+      "modelStrategyPartialSaved": "Some model settings were saved. The primary change was not completed; remaining edits are still in the form.",
+      "modelStrategyPartialSaveUncertain": "Some model settings were saved. The primary change could not be confirmed; check the saved state. Remaining edits are still in the form."
     },
     "needs": {
       "noApiKey": "No API key required.",

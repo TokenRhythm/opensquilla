@@ -122,8 +122,9 @@ SESSIONS_LIST_LITERAL_ALLOWLIST: Counter[str] = Counter(
 SESSIONS_LIST_GATEWAY_ADAPTER = PACKAGE_ROOT / "gateway" / "adapters" / "sessions_list_contract.py"
 # The retired 20-method RPC surface is absent; exact inventory remains pinned
 # so this does not authorize unrelated wire growth.
-RUNTIME_RPC_METHOD_BASELINE = 292
-RUNTIME_RPC_METHOD_DIGEST = "e09e5c20fa6a1d5159a2f6ae02e0c95009bb830be0ab53e9d109baf580d9a080"
+# Primary-provider transitions add resetRecommended and upsertAndActivate.
+RUNTIME_RPC_METHOD_BASELINE = 294
+RUNTIME_RPC_METHOD_DIGEST = "132a1a074178ad198f71a74a328586f86bb140d08e91fc08263eb9f70c2ff708"
 STATIC_RPC_DECORATOR_BASELINE = 77
 
 # Physical lines in the sessions/runtime slice remain tracked for the final

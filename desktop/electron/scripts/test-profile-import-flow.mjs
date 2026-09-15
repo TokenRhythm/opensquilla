@@ -680,6 +680,7 @@ try {
     await readFile(join(settingsUserData, settingsBackups[0], 'workspace', 'IDENTITY.md'), 'utf8'),
     TARGET_IDENTITY,
   )
+  assert.equal(Object.hasOwn(adopted, 'routerPresetBinding'), false)
   const credentialBackup = join(
     settingsUserData,
     `desktop-credential.import-backup.${adopted.importTransactionId}.json`,

@@ -291,6 +291,7 @@ METHOD_SCOPES: dict[str, str] = {
     "workspaces.remove": WRITE_SCOPE,
     "workspaces.history.delete": WRITE_SCOPE,
     "models.routing.set": WRITE_SCOPE,
+    "models.routing.resetRecommended": ADMIN_SCOPE,
     # Deleting a session is a routine, per-user write op like reset/truncate above,
     # so it is write-scoped rather than admin-gated. Admin-gating it broke deletion
     # for every no-auth operator on a non-loopback bind — notably the default Docker
@@ -451,6 +452,7 @@ METHOD_SCOPES: dict[str, str] = {
     # The probe persists nothing but carries candidate credentials.
     "onboarding.provider.probe": ADMIN_SCOPE,
     "onboarding.llmProfile.upsert": ADMIN_SCOPE,
+    "onboarding.llmProfile.upsertAndActivate": ADMIN_SCOPE,
     "onboarding.llmProfile.credential.clear": ADMIN_SCOPE,
     "onboarding.llmProfile.remove": ADMIN_SCOPE,
     "onboarding.llmProfile.active.remove": ADMIN_SCOPE,

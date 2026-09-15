@@ -786,6 +786,11 @@
       "memoryOptions": "メモリのオプション"
     },
     "provider": {
+      "moreActions": "{provider} のその他の操作",
+      "routerOutcomeSynchronized": "Router の推奨階層を保存済みの主用プロバイダーに同期しました。",
+      "routerOutcomePreserved": "保存済みの Router 階層を保持しました。",
+      "routerOutcomeDisabled": "モデルルーティングはオフです。保存済みの階層を保持しました。",
+      "primarySavedAdditionalFailed": "プロバイダーを保存しましたが、追加設定を保存できませんでした。再試行する前に設定を確認してください。",
       "title": "プロバイダー",
       "pageTitle": "モデルサービス",
       "pageDesc": "プロバイダーを接続し、認証情報とモデルを管理します。",
@@ -794,6 +799,7 @@
       "configuredSummary": "{ready} / {count} 準備完了。テストは小さなリクエストを 1 回送信します。",
       "configuredDesc": "保存したプロバイダーは、手動で削除するまでルーティングに利用できます。構成の検証では保存済み設定を使って小規模なモデルリクエストを送信するため、プロバイダー料金が発生する場合があります。",
       "activeBadge": "使用中",
+      "currentPrimary": "現在の主用",
       "editingBadge": "編集中",
       "profileReady": "認証情報の準備完了",
       "profileNeedsCredentials": "認証情報が必要",
@@ -1069,12 +1075,45 @@
       "modelProvenance": "プロバイダーのライブ一覧 · 機能情報の出典：{sources}",
       "modelMetadataProvenance": "プロバイダーのライブ一覧 · 公式値を優先し、ない場合はカタログ値を使用",
       "modelMultimodal": "マルチモーダル",
-      "modelMultimodalTitle": "画像入力に対応"
+      "modelMultimodalTitle": "画像入力に対応",
+      "saveAndStart": "保存して使い始める",
+      "saveAndMakeActive": "保存して主用に設定",
+      "saveActivateUpgradeHint": "保存と主用への切り替えを一度に行うには Gateway を更新してください。",
+      "primaryRoleHint": "主用プロバイダーは既定の直接接続とフォールバックを担当します。カスタムの複数モデル戦略は既存の設定で動作します。",
+      "activationCredentialRequired": "主用に設定する前に使用可能な認証情報を追加してください。",
+      "routerConflictTitle": "既存のモデルルートの扱いを選択",
+      "routerConflictBody": "保存済みの Router は {conflicts} を使用し、{provider} と競合しています。{provider} の推奨設定を使うと、保存済みと未保存の階層編集が置き換わります。オフの選択肢がある場合は階層を保持してルーティングを無効化できます。キャンセルするとモードと下書きが保持されます。",
+      "routerUseRecommended": "切り替え先の推奨ルートを使用",
+      "routerDisablePreserve": "ルートを保持して Router をオフ",
+      "alreadyActive": "対象プロバイダーは既に主用です。この認証情報の編集は保存されていません。",
+      "primarySaveUncertain": "保存結果を確認できません。下書きを保持しました。再試行前に保存済み設定を確認してください。主用になっていても認証情報の編集が保存されたとは限りません。"
     },
     "preset": {
       "modeCustom": "カスタム"
     },
     "modelStrategy": {
+      "summaryPrimary": "保存済みの主用プロバイダー",
+      "summaryRouter": "モデルルーティング",
+      "summaryOn": "オン",
+      "summaryOff": "オフ",
+      "bindingFollowPrimary": "推奨 · 主用に追従",
+      "bindingCustom": "カスタム階層",
+      "bindingLegacy": "既存の階層 · 追従は未指定",
+      "resetRecommended": "{provider} の推奨階層を使用",
+      "resettingRecommended": "推奨階層を更新中…",
+      "resetKeepsOff": "階層を更新し、モデルルーティングはオフのままにします。",
+      "resetKeepsMode": "階層を置き換え、現在のモードを維持します。",
+      "retainedDrafts": "未保存のルーティング変更",
+      "crossProviderDisabledMismatch": "保存済みの階層は他のプロバイダーを使用していますが、プロバイダー間の実行はオフです。",
+      "resetUpgradeHint": "推奨階層を一度に適用するには Gateway を更新してください。",
+      "operationPending": "別のプロバイダーまたはルーティング操作が進行中です。",
+      "activationUpgradeHint": "この Gateway は Router を安全に有効化できるか確認できません。更新してプロバイダーの競合を確認・解決してください。",
+      "savedRefreshFailed": "保存しましたが、最新の設定を取得できませんでした。次の変更の前に設定を再読み込みしてください。",
+      "resultUncertain": "保存結果が不明です。再試行する前に更新された設定を確認してください。",
+      "resetTitle": "{provider} の推奨階層を使用しますか？",
+      "resetBody": "保存済みと未保存の Router 階層の編集を {provider} の推奨階層に置き換えますか？現在のモードと Router スイッチは維持されます。他の未保存設定は保持されます。",
+      "resetConfirm": "推奨階層に置き換える",
+      "resetSaved": "{provider} の推奨階層を保存しました。現在のモードは変更されません。",
       "title": "モデルルーティング",
       "desc": "リクエストごとのモデルの選び方を設定します。",
       "newSessionDefault": "これは新しいチャットの既定値です。既存のチャットはそれぞれのルーティングモードを維持します。",
@@ -1093,7 +1132,7 @@
       "advancedDesc": "フォールバックレベルとチャットでのルーティング表示。",
       "visualModeLabel": "ルーティング決定パネルの表示スタイル",
       "visualModeDesc": "チャット返信でのルーティング決定の表示方法。",
-      "crossProviderNotice": "プロバイダー横断ルーティングが有効です。保存前に各ティアを確認してください。",
+      "crossProviderNotice": "プロバイダー間の実行が有効です。",
       "cards": {
         "router": {
           "title": "インテリジェントモデルルーティング",
@@ -1753,7 +1792,10 @@
       "channelEnabled": "チャンネルを有効化しました。再起動が必要です。",
       "channelEnabledLive": "チャネルを有効化して起動しました。",
       "channelDisabled": "チャンネルを無効化しました。再起動が必要です。",
-      "channelDisabledLive": "チャネルを無効化して停止しました。"
+      "channelDisabledLive": "チャネルを無効化して停止しました。",
+      "providerSavedAndActivated": "{provider} を保存し主用に設定しました。",
+      "modelStrategyPartialSaved": "一部のモデル設定は保存されました。主用への変更は完了していません。未保存の編集はフォームに保持されています。",
+      "modelStrategyPartialSaveUncertain": "一部のモデル設定は保存されました。主用への切り替え結果を確認できませんでした。保存済みの状態を確認してください。残りの編集はフォームに保持されています。"
     },
     "needs": {
       "noApiKey": "API キーは不要です。",

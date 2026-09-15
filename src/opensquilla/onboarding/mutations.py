@@ -54,6 +54,12 @@ from opensquilla.onboarding.redaction import (
     redact_router_tiers_payload,
     redact_search_payload,
 )
+from opensquilla.onboarding.router_policy import (
+    LlmProfileActivationError,
+    reconcile_recommended_router,
+    validate_router_candidate,
+    validate_router_reactivation,
+)
 from opensquilla.onboarding.search_specs import get_search_provider_setup_spec
 from opensquilla.provider.environment import environment_value
 from opensquilla.provider.image_generation_credentials import (
@@ -67,6 +73,7 @@ from opensquilla.provider.image_generation_policy import (
 )
 from opensquilla.provider.preset_registry import ProviderPreset, get_preset
 from opensquilla.router_tiers import (
+    CUSTOM_B5_SELECTION_MODE,
     DEFAULT_TEXT_TIER,
     HIGHEST_TEXT_TIER,
     ROUTER_TIER_ENSEMBLE_SELECTION_MODES,
@@ -112,21 +119,6 @@ class MutationResult:
     warnings: list[str] = field(default_factory=list)
     public_payload: dict[str, Any] = field(default_factory=dict)
     remove_paths: tuple[str, ...] = ()
-
-
-class LlmProfileActivationError(ValueError):
-    """Stable, secret-free validation failure for profile promotion."""
-
-    def __init__(
-        self,
-        reason: str,
-        message: str | None = None,
-        *,
-        details: Mapping[str, Any] | None = None,
-    ) -> None:
-        self.reason = reason
-        self.details = dict(details or {})
-        super().__init__(message or reason)
 
 
 class LlmProfileRemovalError(ValueError):
@@ -247,23 +239,7 @@ def _reconcile_router_profile_for_provider(
     *,
     preset: ProviderPreset | None = None,
 ) -> None:
-    router_enabled = bool(getattr(cfg.squilla_router, "enabled", True))
-    preset = preset or get_preset(provider_id)
-    if preset is None:
-        raise ValueError(f"provider {provider_id!r} has no managed router preset")
-    router_payload = cfg.squilla_router.model_dump(mode="python")
-    router_payload.pop("tiers", None)
-    router_payload["enabled"] = router_enabled
-    router_payload["preset_binding"] = "follow_primary"
-    if preset.persistable and router_enabled:
-        router_payload["tier_profile"] = provider_id
-    else:
-        router_payload["tier_profile"] = None
-        router_payload["tiers"] = _preset_tiers_with_model(
-            preset,
-            str(getattr(cfg.llm, "model", "") or "").strip(),
-        )
-    cfg.squilla_router = SquillaRouterConfig(**router_payload)
+    reconcile_recommended_router(cfg, provider_id, preset=preset)
 
 
 def _normalize_explicit_text_tier(default_tier: str | None) -> str | None:
@@ -672,54 +648,6 @@ def _implicit_primary_and_router(config: GatewayConfig) -> bool:
     )
 
 
-def _router_provider_conflicts(
-    config: GatewayConfig,
-    target_provider: str,
-    *,
-    shared_selection_mode: str | None = None,
-) -> tuple[str, ...]:
-    """Foreign providers that would be vetoed/misrouted after a primary swap."""
-
-    router = config.squilla_router
-    if not bool(getattr(router, "enabled", False)):
-        return ()
-    if bool(getattr(router, "cross_provider_tiers", False)):
-        return ()
-    target = str(target_provider or "").strip().lower()
-    effective_shared_mode = (
-        effective_ensemble_selection_mode(config)
-        if shared_selection_mode is None
-        else str(shared_selection_mode or "").strip()
-    )
-    tiers = getattr(router, "tiers", {}) or {}
-    ensemble_globally_enabled = bool(
-        getattr(getattr(config, "llm_ensemble", None), "enabled", False)
-    )
-    dynamic_members_active = router_dynamic_tier_members_active(
-        tiers if isinstance(tiers, Mapping) else {},
-        shared_selection_mode=effective_shared_mode,
-        ensemble_globally_enabled=ensemble_globally_enabled,
-    )
-    conflicts: set[str] = set()
-    if isinstance(tiers, Mapping):
-        for tier_name, tier in tiers.items():
-            if not isinstance(tier, Mapping):
-                continue
-            provider_role = tier_provider_role(
-                tier_name,
-                tier,
-                shared_selection_mode=effective_shared_mode,
-                router_dynamic_members_active=dynamic_members_active,
-                ensemble_globally_enabled=ensemble_globally_enabled,
-            )
-            if provider_role not in {"direct", "dynamic_member"}:
-                continue
-            provider = str(tier.get("provider") or "").strip().lower()
-            if provider and provider != target:
-                conflicts.add(provider)
-    return tuple(sorted(conflicts))
-
-
 def _preserve_router_as_custom(
     cfg: GatewayConfig,
     *,
@@ -798,26 +726,10 @@ def _apply_primary_provider_router_policy(
     if not primary_changed:
         return
 
-    conflicts = _router_provider_conflicts(
-        source,
-        target_provider,
-        shared_selection_mode=effective_ensemble_selection_mode(candidate),
+    validate_router_candidate(
+        candidate,
+        allowed_actions=("use_recommended", "enable_cross_provider", "disable"),
     )
-    if conflicts:
-        joined = ", ".join(conflicts)
-        raise LlmProfileActivationError(
-            "router_provider_conflict",
-            "custom Router tiers reference provider(s) that differ from the "
-            f"new primary: {joined}",
-            details={
-                "conflictProviders": list(conflicts),
-                "allowedRouterActions": [
-                    "use_recommended",
-                    "enable_cross_provider",
-                    "disable",
-                ],
-            },
-        )
 
 
 def upsert_llm_provider(
@@ -1328,6 +1240,7 @@ def upsert_router(
     # Applying the mode patch here would silently escalate an operator's
     # rollout_phase='observe'/'prompt_only' to live 'full' routing and turn
     # off a running ensemble, so the stored strategy fields are preserved.
+    validate_router_reactivation(config, new_cfg)
     public_payload["default_tier"] = new_cfg.squilla_router.default_tier
     public_payload["tiers"] = redact_router_tiers_payload(new_cfg.squilla_router.tiers)
     public_payload["cross_provider_tiers"] = bool(new_cfg.squilla_router.cross_provider_tiers)
@@ -1465,7 +1378,19 @@ def upsert_llm_ensemble(
         and not bool(current.get("enabled", False))
         and selection_mode is None
     ):
-        activation = ensemble_activation_patches(config)
+        # An explicit lineup is the activation input, even when the client
+        # omits the unchanged selection mode from a preview-backed form.
+        # Planning against the old Router here can reject that new lineup or
+        # overwrite it with generated candidates. Preserve a saved mode; on
+        # first configuration, submitted candidates select the custom plan.
+        if candidates is not None:
+            activation = (
+                {}
+                if ensemble_selection_configured(config)
+                else {"llm_ensemble.selection_mode": CUSTOM_B5_SELECTION_MODE}
+            )
+        else:
+            activation = ensemble_activation_patches(config)
         if activation:
             merged["selection_mode"] = activation["llm_ensemble.selection_mode"]
             generated_fields.add("selection_mode")
@@ -1522,6 +1447,7 @@ def upsert_llm_ensemble(
     if proposer_max_retries is not None:
         new_cfg.mark_force_persist("llm_ensemble.proposer_max_retries")
 
+    validate_router_reactivation(config, new_cfg)
     payload: dict[str, Any] = {
         "enabled": new_ensemble.enabled,
         "selection_mode": new_ensemble.selection_mode,
@@ -3036,6 +2962,57 @@ def activate_llm_profile(
         changed=True,
         restart_required=False,
         public_payload=public_payload,
+    )
+
+
+def upsert_and_activate_llm_profile(
+    config: GatewayConfig,
+    *,
+    provider_id: str,
+    model: str | None = None,
+    api_key: str | None = None,
+    api_key_env: str | None = None,
+    api_key_env_pool: list[str] | tuple[str, ...] | None = None,
+    preserve_api_key: bool = False,
+    base_url: str | None = None,
+    proxy: str | None = None,
+    router_action: str | None = None,
+    image_generation_intent: str | None = None,
+) -> MutationResult:
+    """Build one fully validated candidate for saving and promoting a draft.
+
+    Both component mutations are pure, so validation failure cannot save a
+    partial draft. Reuse promotion's demotion and credential provenance rules.
+    Active edits must use the primary-provider operation, never a shadow profile.
+    """
+    provider = str(provider_id or "").strip().lower()
+    if provider == str(config.llm.provider or "").strip().lower():
+        raise LlmProfileActivationError(
+            "already_active", f"provider {provider!r} is already active"
+        )
+    saved = upsert_llm_profile(
+        config,
+        provider_id=provider,
+        model=model,
+        api_key=api_key,
+        api_key_env=api_key_env,
+        api_key_env_pool=api_key_env_pool,
+        preserve_api_key=preserve_api_key,
+        base_url=base_url,
+        proxy=proxy,
+    )
+    activated = activate_llm_profile(
+        saved.config,
+        provider_id=provider,
+        router_action=router_action,
+        image_generation_intent=image_generation_intent,
+    )
+    return MutationResult(
+        config=activated.config,
+        changed=saved.changed or activated.changed,
+        restart_required=saved.restart_required or activated.restart_required,
+        warnings=[*saved.warnings, *activated.warnings],
+        public_payload=activated.public_payload,
     )
 
 

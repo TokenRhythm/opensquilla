@@ -31,6 +31,12 @@ class UpsertProfile:
 
 
 @dataclass(frozen=True, slots=True)
+class UpsertAndActivateProfile(UpsertProfile):
+    router_action: str = "preserve"
+    image_generation_intent: str = "preserve"
+
+
+@dataclass(frozen=True, slots=True)
 class ActivateProfile:
     provider_id: str
     model: str = ""
@@ -70,6 +76,10 @@ class ProfileProbePort(Protocol):
 class ProfileMutationPort(Protocol):
     def upsert(self, config: Any, command: UpsertProfile) -> Any: ...
 
+    def upsert_and_activate(
+        self, config: Any, command: UpsertAndActivateProfile
+    ) -> Any: ...
+
     def activate(self, config: Any, command: ActivateProfile) -> Any: ...
 
     def remove(self, config: Any, provider_id: str) -> Any: ...
@@ -107,6 +117,28 @@ class ProfileLifecycle:
             await self._runtime.reconcile_profile_transition(
                 previous, config, provider_id=command.provider_id
             )
+
+        return await commit_setup_mutation(
+            result, config_port=self._config, effects=(reconcile,)
+        )
+
+    async def upsert_and_activate(
+        self, command: UpsertAndActivateProfile
+    ) -> SetupMutation:
+        current = self._config.active_config()
+        previous = current.model_copy(deep=True)
+        result = self._mutations.upsert_and_activate(current, command)
+
+        async def reconcile(config: Any) -> None:
+            # Promotion removes the target's saved profile. Invalidate any
+            # cached profile credentials only after its replacement is durable.
+            await self._runtime.discard_profile_credentials(command.provider_id)
+            await self._runtime.reconcile_profile_transition(
+                previous, config, provider_id=command.provider_id
+            )
+            await self._runtime.sync_primary_provider(config)
+            await self._runtime.sync_media(config)
+            await self._runtime.refresh_model_catalog(config)
 
         return await commit_setup_mutation(
             result, config_port=self._config, effects=(reconcile,)
@@ -213,4 +245,5 @@ __all__ = [
     "ProfileMutationPort",
     "RemoveActiveProfile",
     "UpsertProfile",
+    "UpsertAndActivateProfile",
 ]
