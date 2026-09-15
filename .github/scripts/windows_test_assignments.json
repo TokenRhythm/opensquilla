@@ -999,6 +999,7 @@
       "tests/test_tools/test_registry_visibility.py",
       "tests/test_tools/test_registry_visibility_boundary.py",
       "tests/test_tools/test_run_mode_full_host_fallback.py",
+      "tests/test_tools/test_session_search.py",
       "tests/test_tools/test_sessions_send_errors.py",
       "tests/test_tools/test_sessions_spawn_regressions.py",
       "tests/test_tools/test_sessions_spawn_subagent_gates.py",
