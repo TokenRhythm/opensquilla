@@ -526,6 +526,16 @@ async function settlePendingSave(app, outcome) {
   }, outcome)
 }
 
+// Dispatch the renderer click after the button is visible.  Hosted macOS and
+// Windows runners can keep the onboarding card in a CSS transition long
+// enough for Playwright's pointer hit-testing to miss the first click; the
+// DOM event still exercises the same single-flight handler on every platform.
+async function clickFinish(page) {
+  const finish = page.locator('#finish')
+  await finish.waitFor({ state: 'visible' })
+  await finish.evaluate((button) => button.click())
+}
+
 async function assertSubmitPending(
   page,
   app,
@@ -623,7 +633,7 @@ async function verifySubmitFeedbackAndSingleFlight() {
     await page.locator('#providerSelectToggle').click()
     assert.equal(await page.locator('#providerSelectToggle').getAttribute('aria-expanded'), 'true')
     assert.equal(await page.locator('#providerSelectPanel').isVisible(), true)
-    await page.locator('#finish').click()
+    await clickFinish(page)
     await assertSubmitPending(page, app, 1, {
       initialStatus: 'Desktop-Profil wird vorbereitet',
       savingLabel: 'Einrichtung wird gespeichert…',
@@ -681,7 +691,7 @@ async function verifySubmitFeedbackAndSingleFlight() {
     )
     await page.locator('#onboardingLocale').selectOption('en')
 
-    await page.locator('#finish').click()
+    await clickFinish(page)
     await assertSubmitPending(page, app, 2)
     await settlePendingSave(app, {
       reject: true,
@@ -689,7 +699,7 @@ async function verifySubmitFeedbackAndSingleFlight() {
     })
     await assertSubmitRestored(page, 'Synthetic onboarding save rejected.', 'synthetic-submit-key')
 
-    await page.locator('#finish').click()
+    await clickFinish(page)
     await assertSubmitPending(page, app, 3)
     await settlePendingSave(app, {
       reject: false,
