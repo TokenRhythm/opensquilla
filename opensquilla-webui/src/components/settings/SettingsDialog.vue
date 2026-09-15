@@ -104,8 +104,6 @@
             :loaded="loaded"
             :is-desktop="isDesktop"
             @update-network-reporting-enabled="setNetworkReportingEnabled"
-            @update-reliability-diagnostics-enabled="setReliabilityDiagnosticsEnabled"
-            @update-product-analytics-enabled="setProductAnalyticsEnabled"
           />
           <SettingsAppearancePanel v-else-if="section === 'interface'" />
           <SettingsKeyboardPanel v-else-if="section === 'shortcuts'" />
@@ -296,8 +294,6 @@ const {
   cancelProviderEdit,
   setAutoSessionTitles,
   setNetworkReportingEnabled,
-  setReliabilityDiagnosticsEnabled,
-  setProductAnalyticsEnabled,
   setMemoryAutoCapture,
   setProviderImageGenerationOptIn,
   setModelStrategy,

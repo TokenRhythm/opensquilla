@@ -729,6 +729,43 @@ async def test_unknown_background_tool_status_adds_confirmation_guard() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("returncode", [0, 1])
+async def test_completed_background_process_does_not_persist_stale_notice(returncode: int) -> None:
+    stage, recs = _make_stage()
+    final_text = "Process completed." if returncode == 0 else "Process exited unsuccessfully."
+    outcome = await stage.run(
+        _make_input(
+            final_text_parts=[final_text],
+            turn_segments=[
+                {
+                    "type": "tool_result",
+                    "name": "background_process",
+                    "result": "session_id=process-a\ncommand: synthetic-job\nstatus: running",
+                    "execution_status": {"status": "unknown", "reason": "background_running"},
+                },
+                {
+                    "type": "tool_result",
+                    "name": "process",
+                    "result": json.dumps({
+                        "status": "ok",
+                        "action": "wait",
+                        "exited": True,
+                        "session": {"session_id": "process-a", "returncode": returncode},
+                    }),
+                    "execution_status": {"status": "success" if returncode == 0 else "error"},
+                },
+            ],
+            done_event=DoneEvent(text=final_text, text_snapshot=final_text),
+        )
+    )
+
+    assert outcome.output.final_text == final_text
+    assert outcome.output.done_event is not None
+    assert outcome.output.done_event.text == final_text
+    assert recs["transcript_append"].calls[0]["content"] == final_text
+
+
+@pytest.mark.asyncio
 async def test_successful_background_tool_status_does_not_add_confirmation_guard() -> None:
     segments: list[dict[str, Any]] = [
         {

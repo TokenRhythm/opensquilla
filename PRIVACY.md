@@ -43,11 +43,15 @@ corresponding feature is enabled by configuration or user action.
 
 ## Network Observability Controls
 
-OpenSquilla exposes separate consent controls for **Reliability diagnostics**
-and **Product and growth analytics**. An unset choice, an explicit decline, an
-incomplete consent receipt, or a stale notice version is treated as disabled.
-The global control below is a hard veto over both telemetry scopes, passive
-update checks, and automatic desktop update checks:
+OpenSquilla uses one **Network reporting** control for Reliability diagnostics
+and Product and growth analytics, following the existing opt-out policy.
+Reporting is enabled by default; there are no separate telemetry choices or
+consent popups during onboarding. A notice-version update does not require a
+new choice or create a consent timestamp. An explicit decline saved under either
+of the former per-scope controls is migrated to the unified control being off.
+
+The control below disables both telemetry streams, passive update checks, and
+automatic desktop update checks:
 
 ```sh
 OPENSQUILLA_PRIVACY_DISABLE_NETWORK_OBSERVABILITY=true
@@ -68,7 +72,7 @@ OPENSQUILLA_UPDATE_CHECK_DISABLED=true
 ```
 
 `OPENSQUILLA_TELEMETRY_DISABLED=true` remains a hard veto for both new
-telemetry scopes. It does not grant consent and does not reactivate retired
+telemetry streams. It does not reactivate retired
 legacy telemetry. `OPENSQUILLA_UPDATE_CHECK_DISABLED=true` applies only to
 update checks.
 
@@ -82,7 +86,7 @@ unified or legacy opt-out controls.
 
 ### Reliability diagnostics
 
-When separately consented for the current notice, OpenSquilla may record the
+While unified reporting is enabled, OpenSquilla may record the
 result, bounded duration, enumerated error code, and other closed attributes
 for app startup, Gateway startup, detected crashes, AI turns, tool calls, file
 parsing, updates, and session performance. Reliability uses a random
@@ -92,13 +96,21 @@ Complete exception messages and stacks remain local.
 
 ### Product and growth analytics
 
-When separately consented for the current notice, OpenSquilla may record
+While unified reporting is enabled, OpenSquilla may record client launches,
+actual MetaSkill and Coding Mode executions, and
 one-time funnel milestones for acquisition, onboarding completion, first app
 readiness, registration, first turn start, and first successful response.
+Product activity is recorded at most once per analytics identity, surface, and
+UTC day to calculate daily active users and rolling 30-day monthly active users
+across Desktop, Web, TUI, and CLI. All surfaces within the same local profile
+reuse its random analytics identity. It includes only the surface and common telemetry fields, not activity
+content; merely running a background Gateway does not count as product activity.
+Client first-use milestones require fresh-install eligibility; enabling
+reporting on an existing installation does not backfill those milestones.
 Growth uses random, purpose-specific `acquisition_id` and
 `analytics_user_id` values. The analytics user ID is not a raw account ID or a
-hash of one, is not shared with Reliability, and is deleted locally when Growth
-consent is withdrawn.
+hash of one and is not shared with Reliability. Repeatable usage counts do not
+require the installation to qualify as a newly activated user.
 
 Website, CDN, and account-service milestones must be emitted by those services
 at their authoritative transaction boundary. They use independent server-side
@@ -111,7 +123,7 @@ external registration result.
 
 Both scopes use a strict field whitelist and reject unknown fields. They write
 to separate bounded local SQLite queues and upload batches to separate routes:
-`/v1/reliability/events` and `/v1/growth/events`. Consent is checked before
+`/v1/reliability/events` and `/v1/growth/events`. The reporting policy is checked before
 local collection and again immediately before network upload. Offline retries
 reuse `event_id` for deduplication. Growth events are not sampled.
 
@@ -123,11 +135,12 @@ fingerprints. Source IP addresses may be visible to network servers at the
 transport layer, but are not telemetry fields and are never used to join
 website and client identities.
 
-CI, test, and `DO_NOT_TRACK` environments fail closed for both scopes. A remote
-or local forced-off state pauses sending without manufacturing or changing a
-saved consent decision. Withdrawing a scope's consent deletes that scope's
-pending local telemetry; withdrawing Growth consent also deletes its local
-analytics identity.
+CI, test, and `DO_NOT_TRACK` environments fail closed for both streams. Disabling
+the unified control stops collection and pauses sending. It does not erase
+existing bounded queues, analytics identities, or first-use milestone state;
+pending events can resume after reporting is enabled again. Remote and
+environment-variable vetoes do not change the saved setting. Local data can be
+removed through the deletion options below.
 
 ### Retired legacy telemetry
 
@@ -136,8 +149,8 @@ at `/v1/usage`, and the `X-OpenSquilla-Install-Id` provider header are retired.
 Production code no longer starts those upload loops, records daily usage for
 them, derives an installation identifier from MAC or local IP data, or attaches
 that identifier to provider requests. Legacy modules and environment-variable
-names remain only for source/configuration compatibility and cannot opt a user
-into telemetry v2.
+names remain only for source/configuration compatibility; they do not restore
+the retired upload paths.
 
 ## Logs And Diagnostics
 

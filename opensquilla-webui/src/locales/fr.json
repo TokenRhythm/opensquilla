@@ -1739,8 +1739,8 @@
       "reliabilityDiagnosticsDesc": "Partagez les résultats d’opération, les durées et des empreintes d’erreur respectueuses de la vie privée afin de diagnostiquer les plantages et les échecs. Le contenu des conversations et des fichiers n’est jamais inclus.",
       "productAnalyticsLabel": "Analyse du produit et de la croissance",
       "productAnalyticsDesc": "Partagez les jalons d’activation et le nombre d’exécutions de MetaSkill et du mode programmation après leur démarrage effectif, afin de mesurer la conversion et l’utilisation des fonctions. Le contenu des conversations, les paramètres de tâche, les fichiers et les identifiants de compte bruts ne sont jamais inclus ; un identifiant analytique aléatoire et dédié est utilisé.",
-      "networkReportingLabel": "Interrupteur principal des diagnostics réseau",
-      "networkReportingDesc": "Contrôle principal des diagnostics réseau, des analyses et des recherches de mises à jour. Sa désactivation remplace les deux choix ci-dessous."
+      "networkReportingLabel": "Envoi des diagnostics et statistiques d’utilisation",
+      "networkReportingDesc": "Envoie des diagnostics et statistiques d’utilisation anonymes, dont le nombre d’exécutions effectives de MetaSkill et du mode programmation. Contrôle aussi la recherche de mises à jour. Le contenu des conversations, les paramètres de tâche et les fichiers sont exclus."
     },
     "toast": {
       "loadFailed": "Échec du chargement des paramètres : {error}",

@@ -27,6 +27,7 @@ def _state(
     decision: ConsentDecision,
     *,
     forced: bool = False,
+    consented_at: str | None = None,
 ) -> ScopeConsentState:
     notice = (
         CURRENT_RELIABILITY_NOTICE_VERSION
@@ -37,19 +38,23 @@ def _state(
         scope=scope,
         decision=decision,
         notice_version=notice if decision is ConsentDecision.GRANTED else None,
-        consented_at_utc=(
-            "2026-09-02T08:00:00Z" if decision is ConsentDecision.GRANTED else None
-        ),
+        consented_at_utc=consented_at if decision is ConsentDecision.GRANTED else None,
         record_complete=decision is ConsentDecision.GRANTED,
         notice_current=decision is ConsentDecision.GRANTED,
         forced_off_reasons=("ci",) if forced else (),
     )
 
 
-def test_atomic_mirror_matches_electron_closed_shape_and_permissions(tmp_path: Path) -> None:
+@pytest.mark.parametrize("consented_at", [None, "2026-09-02T08:00:00Z"])
+def test_atomic_mirror_matches_electron_closed_shape_and_permissions(
+    tmp_path: Path,
+    consented_at: str | None,
+) -> None:
     path = write_desktop_consent_mirror(
         tmp_path,
-        reliability=_state(TelemetryScope.RELIABILITY, ConsentDecision.GRANTED),
+        reliability=_state(
+            TelemetryScope.RELIABILITY, ConsentDecision.GRANTED, consented_at=consented_at,
+        ),
         growth=_state(TelemetryScope.GROWTH, ConsentDecision.DECLINED),
     )
     assert path == desktop_consent_mirror_path(tmp_path)
@@ -58,7 +63,7 @@ def test_atomic_mirror_matches_electron_closed_shape_and_permissions(tmp_path: P
         "reliability": {
             "enabled": True,
             "notice_version": CURRENT_RELIABILITY_NOTICE_VERSION,
-            "consented_at_utc": "2026-09-02T08:00:00Z",
+            "consented_at_utc": consented_at,
             "forced_off": False,
         },
         "growth": {

@@ -78,9 +78,12 @@ def record_desktop_turn(
             or consent.get("enabled") is not True
             or consent.get("forced_off") is not False
             or consent.get("notice_version") != CURRENT_NOTICE_VERSION_BY_SCOPE["reliability"]
-            or not isinstance(consent.get("consented_at_utc"), str)
+            or not (
+                consent.get("consented_at_utc") is None
+                or isinstance(consent.get("consented_at_utc"), str)
+            )
             or marker.get("consent_generation")
-            != (f"{consent['notice_version']}\n{consent['consented_at_utc']}")
+            != (f"{consent['notice_version']}\n{consent.get('consented_at_utc') or 'unified'}")
             or marker.get("marker_kind") != "desktop_reliability_session"
             or marker.get("clean_exit") is not False
             or marker.get("performance_summary_emitted") is not False

@@ -108,7 +108,10 @@ def _mirrored_scope(
         state.record_complete
         and isinstance(state.notice_version, str)
         and _SAFE_NOTICE_RE.fullmatch(state.notice_version) is not None
-        and _valid_utc_timestamp(state.consented_at_utc)
+        and (
+            state.consented_at_utc is None
+            or _valid_utc_timestamp(state.consented_at_utc)
+        )
     ):
         enabled = True
     else:

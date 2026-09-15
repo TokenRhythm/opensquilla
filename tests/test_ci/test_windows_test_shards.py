@@ -336,6 +336,12 @@ RECENTLY_ADDED_ACTIVE_TESTS = {
     "tests/test_contracts/test_ensemble_fallback_event_wire.py",
     "tests/test_contracts/test_turn_execution.py",
     "tests/test_engine/test_turn_control_terminal.py",
+    # New runtime-notice and telemetry pipeline suites use the provisional floor
+    # until a comparable three-run Windows duration refresh supplies timings.
+    "tests/test_engine/turn_runner/test_runtime_notices.py",
+    "tests/test_telemetry_server/test_product_active_pipeline.py",
+    "tests/test_telemetry_server/test_product_activity_pipeline.py",
+    "tests/test_telemetry_server/test_protocol_upgrade_pipeline.py",
 }
 
 

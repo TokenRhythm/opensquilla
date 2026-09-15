@@ -18,12 +18,13 @@ import {
   parseDesktopTelemetryConsent,
   parseLegacyNetworkObservabilityDisabled,
   replaceDesktopTelemetryConsentInPrivacy,
-  requireExplicitOnboardingConsent,
+  resolveDesktopTelemetryConsent,
 } from '../dist/telemetry/onboarding-consent.js'
 import {
   clearGrowthAnalyticsIdentity,
   CONSENT_MIRROR_SCHEMA_VERSION,
   readConsentMirror,
+  resolveMirroredConsent,
   writeConsentMirror,
 } from '../dist/telemetry/consent-mirror.js'
 
@@ -63,14 +64,33 @@ assert.deepEqual(desktopPrivacyTomlLines(false, parsed, true), [
   'product_analytics_enabled = false',
 ])
 
-assert.throws(
-  () => requireExplicitOnboardingConsent({ reliabilityDiagnosticsEnabled: true }),
-  /both telemetry categories/,
-)
-requireExplicitOnboardingConsent({
-  reliabilityDiagnosticsEnabled: false,
-  productAnalyticsEnabled: false,
+assert.deepEqual(resolveDesktopTelemetryConsent(null), {
+  reliability: { enabled: true, noticeVersion: 'reliability-v1', consentedAtUtc: null },
+  growth: { enabled: true, noticeVersion: 'growth-v2', consentedAtUtc: null },
 })
+for (const setting of [
+  'disable_network_observability = true',
+  'reliability_diagnostics_enabled = false',
+  'product_analytics_enabled = false',
+]) {
+  const effective = resolveDesktopTelemetryConsent(`[privacy]\n${setting}\n`)
+  assert.equal(effective.reliability.enabled, false)
+  assert.equal(effective.growth.enabled, false)
+}
+const oldGrowth = resolveDesktopTelemetryConsent('[privacy]\nproduct_analytics_enabled = true\nproduct_analytics_notice_version = "growth-v1"\n')
+assert.equal(oldGrowth.growth.enabled, true)
+assert.equal(oldGrowth.growth.noticeVersion, 'growth-v2')
+assert.equal(oldGrowth.growth.consentedAtUtc, null, 'policy migration must not manufacture a consent time')
+for (const raw of [
+  '["privacy"]\n"disable_network_observability" = true\n',
+  "['privacy']\n'product_analytics_enabled' = false\n",
+  'privacy = { disable_network_observability = true }\n',
+  'privacy.disable_network_observability = true\n',
+  '[privacy]\nproduct_analytics_enabled = "false"\n',
+]) {
+  assert.equal(resolveDesktopTelemetryConsent(raw).growth.enabled, false)
+  assert.equal(resolveDesktopTelemetryConsent(raw).reliability.enabled, false)
+}
 const changed = applyDesktopTelemetryConsentPayload(parsed, {
   reliabilityDiagnosticsEnabled: false,
   productAnalyticsEnabled: true,
@@ -134,6 +154,19 @@ try {
   await writeConsentMirror(mirrorPath, replacement)
   assert.deepEqual(readConsentMirror(mirrorPath), replacement)
   assert.equal(existsSync(mirrorPath), true)
+
+  const unifiedMirror = {
+    schema_version: 1,
+    reliability: { enabled: true, notice_version: 'reliability-v1', consented_at_utc: null, forced_off: false },
+    growth: { enabled: true, notice_version: 'growth-v2', consented_at_utc: null, forced_off: false },
+  }
+  await writeConsentMirror(mirrorPath, unifiedMirror)
+  for (const scope of ['reliability', 'growth']) {
+    assert.equal(resolveMirroredConsent(mirrorPath, scope, {}).enabled, true)
+    assert.equal(resolveMirroredConsent(mirrorPath, scope, { DO_NOT_TRACK: '1' }).enabled, false)
+    assert.equal(resolveMirroredConsent(mirrorPath, scope, { CI: '1' }).enabled, false)
+    assert.equal(resolveMirroredConsent(join(root, 'missing.json'), scope, {}).enabled, false)
+  }
 
   const identityPath = join(root, 'nested', 'growth_identity.json')
   writeFileSync(identityPath, '{"synthetic":"identity"}\n', { mode: 0o600 })

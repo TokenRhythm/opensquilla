@@ -13,7 +13,7 @@ import { CONSENT_MIRROR_SCHEMA_VERSION, writeConsentMirror } from '../dist/telem
 import { runTelemetrySideEffectFailOpen } from '../dist/telemetry/fail-open.js'
 import {
   applyDesktopTelemetryConsentPayload, desktopPrivacyTomlLines, parseDesktopTelemetryConsent,
-  parseLegacyNetworkObservabilityDisabled, requireExplicitOnboardingConsent,
+  parseLegacyNetworkObservabilityDisabled, resolveDesktopTelemetryConsent, emptyDesktopTelemetryConsent,
 } from '../dist/telemetry/onboarding-consent.js'
 import {
   clearDesktopGrowthTelemetryState, DesktopGrowthTelemetry, parseDesktopOnboardingReceipt,
@@ -42,8 +42,7 @@ const NOW = '2026-09-11T12:00:00.000Z'
 const READY_AT = '2026-09-11T12:01:00.000Z'
 const root = mkdtempSync(join(tmpdir(), 'opensquilla-growth-lifecycle-'))
 const payload = {
-  provider: 'ollama', model: 'synthetic-model', reliabilityDiagnosticsEnabled: false,
-  productAnalyticsEnabled: true,
+  provider: 'ollama', model: 'synthetic-model',
 }
 
 function harness(directory, {
@@ -90,7 +89,7 @@ function harness(directory, {
     writeConsentMirror, CONSENT_MIRROR_SCHEMA_VERSION, clearEarlyTelemetryScope,
     clearDesktopGrowthTelemetryState, parseDesktopOnboardingReceipt, runTelemetrySideEffectFailOpen,
     applyDesktopTelemetryConsentPayload, parseDesktopTelemetryConsent,
-    parseLegacyNetworkObservabilityDisabled, requireExplicitOnboardingConsent,
+    parseLegacyNetworkObservabilityDisabled, resolveDesktopTelemetryConsent, emptyDesktopTelemetryConsent,
     PROVIDER_BY_ID: new Map(), normalizeProvider: (value) => value,
     providerDefaults: () => defaults, normalizeRouterMode: () => 'disabled',
     normalizeModelRoutingMode: () => 'direct', routerModeForModelRoutingMode: () => 'disabled',
@@ -113,14 +112,14 @@ function harness(directory, {
     appExitPhase: deferred ? 'deferred' : 'running', abandonOnboardingFlow() {},
     completeOnboardingFlow: () => true,
     onboardingSaveFailure: (code, error) => ({ ok: false, code, error }),
-    applyDesktopSettingsPair: async (_profile, _credential, candidate, expected, _reserved, _locale, consent) => {
+    applyDesktopSettingsPair: async (_profile, credential, candidate, expected, _reserved, _locale, consent) => {
       assert.equal(existsSync(profile.credentialPath) ? readFileSync(profile.credentialPath, 'utf8') : null, expected)
       // Stand in for the existing recoverable credential/config pair commit.
       mkdirSync(profile.home, { recursive: true })
       writeFileSync(profile.credentialPath, candidate)
       const configPath = join(profile.home, 'config.toml')
-      const effectiveConsent = consent ?? parseDesktopTelemetryConsent(readFileSync(configPath, 'utf8'))
-      writeFileSync(configPath, desktopPrivacyTomlLines(false, effectiveConsent, true).join('\n'))
+      const effectiveConsent = consent ?? parseDesktopTelemetryConsent(existsSync(configPath) ? readFileSync(configPath, 'utf8') : null)
+      writeFileSync(configPath, desktopPrivacyTomlLines(credential.disableNetworkObservability, effectiveConsent, true).join('\n'))
       settingsPersisted = true
       if (failure === 'after_commit') throw new Error('synthetic process stop after settings commit')
     },
@@ -166,6 +165,7 @@ try {
     assert.equal(first.writerFinished, true)
     const receipt = JSON.parse(readFileSync(first.profile.credentialPath, 'utf8')).growthOnboardingReceipt
     assert.ok(receipt)
+    assert.equal(receipt.consented_at_utc, null)
     if (failure === 'after_commit') assert.deepEqual(first.events(), [])
     const recovered = harness(directory, { stableCode: 'ready', nowUtc: READY_AT })
     await recovered.context.syncDesktopConsentMirror()
@@ -207,19 +207,24 @@ try {
   assert.equal(JSON.parse(readFileSync(declined.profile.credentialPath, 'utf8')).growthOnboardingReceipt, undefined)
   assert.deepEqual(declined.events(), [])
 
-  const renewedDirectory = join(root, 'withdraw-and-renew')
+  const renewedDirectory = join(root, 'pause-and-resume')
   const consented = harness(renewedDirectory)
   await consented.context.syncDesktopConsentMirror()
   await consented.context.performOnboardingSave({ state: 'saving' }, payload)
-  clearDesktopGrowthTelemetryState(consented.paths.telemetryDirectory)
-  clearEarlyTelemetryScope(consented.paths.spoolRoot, 'growth')
-  const renewedConsent = applyDesktopTelemetryConsentPayload(parseDesktopTelemetryConsent(null), payload, '2026-09-12T00:00:00.000Z')
-  writeFileSync(join(consented.profile.home, 'config.toml'), desktopPrivacyTomlLines(false, renewedConsent, true).join('\n'))
+  const existingEvents = consented.events()
+  const existingIdentity = readFileSync(join(consented.paths.telemetryDirectory, 'growth_identity.json'), 'utf8')
+  await consented.context.saveDesktopCredential({ disableNetworkObservability: true })
+  consented.context.finishAppStartSuccess()
+  assert.deepEqual(consented.events(), existingEvents)
+  assert.equal(readFileSync(join(consented.paths.telemetryDirectory, 'growth_identity.json'), 'utf8'), existingIdentity)
+  await consented.context.saveDesktopCredential({ disableNetworkObservability: false })
   const renewed = harness(renewedDirectory, { stableCode: 'ready' })
   await renewed.context.syncDesktopConsentMirror()
   renewed.context.finishAppStartSuccess()
-  assert.deepEqual(renewed.events(), [])
-  assert.equal(existsSync(join(renewed.paths.telemetryDirectory, 'growth_cohort.json')), false)
+  assert.equal(renewed.events().filter((event) => event.event_name === 'onboarding_result').length, 1)
+  assert.equal(renewed.events().filter((event) => event.event_name === 'first_app_ready').length, 1)
+  assert.equal(existsSync(join(renewed.paths.telemetryDirectory, 'growth_cohort.json')), true)
+  assert.equal(readFileSync(join(renewed.paths.telemetryDirectory, 'growth_identity.json'), 'utf8'), existingIdentity)
 
   // A later ordinary settings save retains the receipt without creating a new
   // milestone, and normalization still accepts pre-receipt credentials.

@@ -3,8 +3,10 @@ from __future__ import annotations
 import asyncio
 import json
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
+
+import pytest
 
 from opensquilla.telemetry.consent import (
     CURRENT_PRODUCT_ANALYTICS_NOTICE_VERSION,
@@ -30,6 +32,7 @@ from opensquilla.telemetry.growth_sink import (
     read_coding_mode_usage_state,
     read_gateway_growth_milestone_state,
     read_metaskill_usage_state,
+    read_product_active_state,
 )
 from opensquilla.telemetry.identity import (
     TelemetryIdentityKind,
@@ -91,10 +94,10 @@ def _activate(config) -> None:
     )
 
 
-def _sink(runtime: CapturingRuntime, config) -> GrowthEventSink:
+def _sink(runtime: CapturingRuntime, config, *, env=None) -> GrowthEventSink:
     scope_consent_coordinator_for(
         config,
-        state_provider=lambda scope: resolve_scope_consent(scope, config=config, env={}),
+        state_provider=lambda scope: resolve_scope_consent(scope, config=config, env=env or {}),
     )
     return GrowthEventSink(
         runtime,  # type: ignore[arg-type]
@@ -105,7 +108,167 @@ def _sink(runtime: CapturingRuntime, config) -> GrowthEventSink:
     )
 
 
-async def test_no_consent_creates_no_growth_files_or_event(tmp_path) -> None:
+async def test_product_active_counts_each_surface_daily_without_creating_cohort(tmp_path) -> None:
+    config = _config(tmp_path, enabled=None)
+    runtime = CapturingRuntime()
+    sink = _sink(runtime, config)
+
+    for surface in ClientSurface:
+        assert await sink.record_product_active(surface=surface)
+    repeated = await asyncio.gather(
+        *(sink.record_product_active(surface=ClientSurface.DESKTOP) for _ in range(3))
+    )
+    assert repeated == [False, False, False]
+    assert await sink.record_product_active(
+        surface=ClientSurface.DESKTOP,
+        occurred_at=STARTED_AT + timedelta(days=1),
+    )
+    await sink.close()
+
+    assert len(runtime.events) == 5
+    assert {event.event_name for event in runtime.events} == {"product_active"}
+    assert len({event.analytics_user_id for event in runtime.events}) == 1
+    assert {event.surface for event in runtime.events} == set(ClientSurface)
+    assert not growth_cohort_state_path(config=config).exists()
+    assert not sink.marker_path.exists()
+    assert not (tmp_path / "telemetry" / "growth_client_launches.json").exists()
+    assert set(runtime.events[0].model_dump()) == {
+        "event_name", "event_version", "event_id", "occurred_at_utc", "source",
+        "app_version", "platform", "outcome", "error_code", "duration_ms",
+        "consent_scope", "notice_version", "sample_rate", "analytics_user_id", "surface",
+    }
+
+    resumed = _sink(runtime, _config(tmp_path))
+    assert not await resumed.record_product_active(surface=ClientSurface.DESKTOP)
+    await resumed.close()
+    assert len(runtime.events) == 5
+
+
+@pytest.mark.parametrize("env", [
+    {"CI": "true"}, {"GITHUB_ACTIONS": "true"}, {"DO_NOT_TRACK": "1"},
+    {"OPENSQUILLA_TELEMETRY_DISABLED": "true"},
+])
+async def test_product_active_honors_environment_veto_without_creating_state(tmp_path, env) -> None:
+    config = _config(tmp_path)
+    runtime = CapturingRuntime()
+    sink = _sink(runtime, config, env=env)
+
+    assert not await sink.record_product_active(surface=ClientSurface.CLI)
+    sink.observe_product_active(ClientSurface.DESKTOP)
+    await sink.close()
+
+    assert runtime.events == []
+    assert not (tmp_path / "telemetry").exists()
+
+
+async def test_product_active_pending_payload_is_replayed_after_restart(tmp_path) -> None:
+    config = _config(tmp_path)
+
+    class VerifyDurableRuntime(CapturingRuntime):
+        async def record(self, event, **kwargs):
+            state = read_product_active_state(sink.product_active_path)
+            assert any(record.event == event for record in state.values())
+            return await super().record(event, **kwargs)
+
+    runtime = VerifyDurableRuntime([RecordStatus.EVICTED])
+    sink = _sink(runtime, config)
+    assert not await sink.record_product_active(surface=ClientSurface.WEB)
+    pending = next(iter(read_product_active_state(sink.product_active_path).values()))
+    assert pending.status is GrowthMilestoneStatus.PENDING
+    await sink.close()
+
+    recovered_runtime = CapturingRuntime([RecordStatus.DUPLICATE])
+    recovered = _sink(recovered_runtime, _config(tmp_path))
+    await recovered.start()
+    async with asyncio.timeout(1):
+        while not recovered_runtime.events:
+            await asyncio.sleep(0.001)
+    await recovered.close()
+
+    assert recovered_runtime.events == [pending.event]
+    assert all(revision == 0 for revision in recovered_runtime.consent_revisions)
+    complete = next(iter(read_product_active_state(recovered.product_active_path).values()))
+    assert complete.status is GrowthMilestoneStatus.ENQUEUED
+    assert not growth_cohort_state_path(config=config).exists()
+
+
+async def test_product_active_retries_without_another_observation(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr("opensquilla.telemetry.growth_sink._RETRY_INITIAL_SECONDS", 0.01)
+    runtime = CapturingRuntime([RecordStatus.EVICTED, RecordStatus.EVICTED])
+    sink = _sink(runtime, _config(tmp_path))
+    await sink.start()
+    assert not await sink.record_product_active(surface=ClientSurface.TUI)
+    async with asyncio.timeout(1):
+        while len(runtime.events) < 3:
+            await asyncio.sleep(0.001)
+    await sink.close()
+
+    assert len(runtime.events) == 3
+    assert runtime.events[0] == runtime.events[1] == runtime.events[2]
+
+
+async def test_product_active_revocation_cleans_pending_without_replay(tmp_path) -> None:
+    config = _config(tmp_path)
+    runtime = CapturingRuntime([RecordStatus.EVICTED])
+    sink = _sink(runtime, config)
+    assert not await sink.record_product_active(surface=ClientSurface.CLI)
+    async with scope_consent_coordinator_for(config).transition(TelemetryScope.GROWTH):
+        config.privacy.disable_network_observability = True
+        removed = delete_growth_cohort_state(config=config)
+
+    assert sink.product_active_path in removed
+    await sink.replay_pending()
+    assert not await sink.record_product_active(surface=ClientSurface.CLI)
+    config.privacy.disable_network_observability = False
+    await sink.replay_pending()
+    await sink.close()
+
+    assert len(runtime.events) == 1
+    assert not sink.product_active_path.exists()
+
+
+async def test_product_active_failed_state_write_never_enqueues(tmp_path, monkeypatch) -> None:
+    def failed_write(*args):
+        raise OSError("synthetic disk failure")
+
+    monkeypatch.setattr(
+        "opensquilla.telemetry.growth_sink.write_product_active_state", failed_write
+    )
+    runtime = CapturingRuntime()
+    sink = _sink(runtime, _config(tmp_path))
+    assert not await sink.record_product_active(surface=ClientSurface.DESKTOP)
+    await sink.close()
+    assert runtime.events == []
+    assert not sink.product_active_path.exists()
+
+
+async def test_product_active_observer_drains_admitted_callbacks_on_close(tmp_path) -> None:
+    runtime = CapturingRuntime()
+    sink = _sink(runtime, _config(tmp_path))
+    sink.observe_product_active(ClientSurface.DESKTOP)
+    sink.observe_product_active(ClientSurface.DESKTOP)
+    await sink.close()
+    sink.observe_product_active(ClientSurface.WEB)
+    assert not await sink.record_product_active(surface=ClientSurface.WEB)
+    assert len(runtime.events) == 1
+
+
+async def test_product_active_retains_pending_when_daily_history_is_bounded(tmp_path) -> None:
+    runtime = CapturingRuntime([RecordStatus.EVICTED])
+    sink = _sink(runtime, _config(tmp_path))
+    assert not await sink.record_product_active(surface=ClientSurface.TUI)
+    original = next(iter(read_product_active_state(sink.product_active_path).values()))
+    for offset in range(1, 30):
+        assert await sink.record_product_active(
+            surface=ClientSurface.TUI, occurred_at=STARTED_AT + timedelta(days=offset)
+        )
+    await sink.close()
+    records = read_product_active_state(sink.product_active_path)
+    assert len(records) == 25
+    assert original in records.values()
+
+
+async def test_default_upload_policy_does_not_infer_new_user_cohort(tmp_path) -> None:
     config = _config(tmp_path, enabled=None)
     runtime = CapturingRuntime()
     sink = _sink(runtime, config)
@@ -117,6 +280,70 @@ async def test_no_consent_creates_no_growth_files_or_event(tmp_path) -> None:
 
     assert runtime.events == []
     assert not (tmp_path / "telemetry").exists()
+
+
+async def test_repeatable_usage_records_without_desktop_cohort_or_consent_fields(tmp_path) -> None:
+    config = _config(tmp_path)
+    config.privacy = SimpleNamespace(disable_network_observability=False)
+    runtime = CapturingRuntime()
+    sink = _sink(runtime, config)
+
+    assert await sink.record_client_launch(
+        surface=ClientSurface.CLI,
+        entrypoint=ClientEntrypoint.CHAT,
+        execution_mode=ExecutionMode.STANDALONE,
+    )
+    assert await sink.record_metaskill_usage("meta-run", STARTED_AT)
+    assert await sink.record_coding_mode_usage("coding-run", STARTED_AT)
+    await sink.record_turn_started(STARTED_AT)
+    await sink.record_turn_succeeded(SUCCEEDED_AT)
+
+    assert [event.event_name for event in runtime.events] == [
+        "client_launch", "metaskill_usage", "coding_mode_usage",
+    ]
+    identities = {event.analytics_user_id for event in runtime.events}
+    assert len(identities) == 1
+    assert next(iter(identities)).version == 4
+    assert not growth_cohort_state_path(config=config).exists()
+    assert not sink.marker_path.exists()
+
+    await sink.close()
+    config = _config(tmp_path)
+    config.privacy = SimpleNamespace(disable_network_observability=False)
+    resumed = _sink(runtime, config)
+    assert await resumed.record_metaskill_usage("second-meta-run", SUCCEEDED_AT)
+    assert runtime.events[-1].analytics_user_id in identities
+    await resumed.close()
+
+
+async def test_global_pause_never_creates_usage_identity_and_resumes_existing_identity(
+    tmp_path,
+) -> None:
+    config = _config(tmp_path)
+    config.privacy = SimpleNamespace(disable_network_observability=True)
+    runtime = CapturingRuntime()
+    sink = _sink(runtime, config)
+
+    assert not await sink.record_metaskill_usage("paused-run", STARTED_AT)
+    assert not await sink.record_coding_mode_usage("paused-coding", STARTED_AT)
+    assert not await sink.record_client_launch(
+        surface=ClientSurface.TUI,
+        entrypoint=ClientEntrypoint.CHAT,
+        execution_mode=ExecutionMode.GATEWAY,
+    )
+    assert not identity_state_path(TelemetryIdentityKind.ANALYTICS_USER, config=config).exists()
+    assert runtime.events == []
+
+    config.privacy.disable_network_observability = False
+    assert await sink.record_coding_mode_usage("first-use", STARTED_AT)
+    identity = runtime.events[-1].analytics_user_id
+    config.privacy.disable_network_observability = True
+    assert not await sink.record_coding_mode_usage("paused-second", STARTED_AT)
+    config.privacy.disable_network_observability = False
+    assert await sink.record_coding_mode_usage("resumed-use", SUCCEEDED_AT)
+    assert runtime.events[-1].analytics_user_id == identity
+    assert not growth_cohort_state_path(config=config).exists()
+    await sink.close()
 
 
 async def test_active_consent_without_fresh_cohort_proof_does_not_backfill(tmp_path) -> None:

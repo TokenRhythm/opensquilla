@@ -12,7 +12,7 @@ import sys
 import tempfile
 from pathlib import Path
 
-from opensquilla.paths import default_opensquilla_home
+from opensquilla.paths import default_opensquilla_home, desktop_profile_lifecycle_active
 
 # ---------------------------------------------------------------------------
 # Agent defaults for long-running repository tasks
@@ -76,12 +76,27 @@ BUILD_ARTIFACT_EXCLUDES = [
 _DATA_DIR = Path(__file__).resolve().parent / "data"
 
 
+def storage_root() -> Path:
+    """Keep Desktop-launched task outputs outside the live profile's lease.
+
+    This is an artifact directory, not a second configured Agent profile.
+    Operator configuration is still read from the original profile and the
+    actual child Agent retains its existing disposable scratch profile.
+    Standalone CLI installations keep their historical paths.
+    """
+    home = default_opensquilla_home()
+    if desktop_profile_lifecycle_active():
+        home = home.expanduser().resolve()
+        return home.with_name(f"{home.name}-code-task")
+    return home
+
+
 def runs_root() -> Path:
     """Root dir holding per-run working trees and artifacts."""
     override = os.environ.get("OPENSQUILLA_CODETASK_RUNS_DIR")
     if override:
         return Path(override).expanduser()
-    return default_opensquilla_home() / "code-task"
+    return storage_root() / "code-task"
 
 
 def build_workspace_dir() -> Path:
@@ -93,7 +108,7 @@ def build_workspace_dir() -> Path:
     override = os.environ.get("OPENSQUILLA_CODETASK_WORKSPACE_DIR")
     if override:
         return Path(override).expanduser()
-    return default_opensquilla_home() / "workspace"
+    return storage_root() / "workspace"
 
 
 def run_dir(run_id: str) -> Path:

@@ -32,6 +32,7 @@ from opensquilla.telemetry.contracts.growth import (
     FirstTurnStarted,
     FirstTurnSucceeded,
     MetaSkillUsage,
+    ProductActive,
 )
 from opensquilla.telemetry.coordination import scope_consent_coordinator_for
 from opensquilla.telemetry.growth.state import (
@@ -41,6 +42,7 @@ from opensquilla.telemetry.growth.state import (
     gateway_growth_milestone_state_path,
     growth_cohort_state_path,
     metaskill_usage_state_path,
+    product_active_state_path,
     read_active_growth_cohort,
     read_growth_state_object,
     write_growth_state_object,
@@ -49,6 +51,7 @@ from opensquilla.telemetry.identity import (
     IdentityStateError,
     TelemetryIdentityKind,
     identity_state_path,
+    load_or_create_identity,
     read_identity,
 )
 from opensquilla.telemetry.ids import new_event_id
@@ -63,6 +66,8 @@ _MARKER_KIND = "growth_gateway_milestones"
 _STATE_LOCK_TIMEOUT_SECONDS = 5.0
 CLIENT_LAUNCH_SCHEMA_VERSION = 1
 _CLIENT_LAUNCH_MARKER_KIND = "growth_client_launches"
+PRODUCT_ACTIVE_SCHEMA_VERSION = 1
+_PRODUCT_ACTIVE_MARKER_KIND = "growth_product_active"
 _MAX_CLIENT_LAUNCH_RECORDS = 8
 METASKILL_USAGE_SCHEMA_VERSION = 1
 _METASKILL_USAGE_MARKER_KIND = "growth_metaskill_usage"
@@ -74,7 +79,9 @@ _RETRY_INITIAL_SECONDS = 1.0
 _RETRY_MAX_SECONDS = 60.0
 
 FeatureUsageEvent = MetaSkillUsage | CodingModeUsage
-GrowthMilestoneEvent = FirstTurnStarted | FirstTurnSucceeded | ClientLaunch | FeatureUsageEvent
+GrowthMilestoneEvent = (
+    FirstTurnStarted | FirstTurnSucceeded | ClientLaunch | ProductActive | FeatureUsageEvent
+)
 GrowthMilestoneName = Literal["first_turn_started", "first_turn_result"]
 
 
@@ -118,9 +125,9 @@ class GatewayGrowthMilestoneState:
 class GrowthEventSink:
     """Adapt two content-free turn boundaries into strict Growth events.
 
-    The sink never creates cohort eligibility or an analytics identity.  Those
-    are Electron-owned because only desktop startup can distinguish a fresh
-    profile from an upgrade or import.
+    New-user milestones require Desktop-owned fresh-profile evidence. Repeatable
+    usage observations only require the unified upload policy and a random
+    analytics identity; creating that identity never creates a new-user cohort.
     """
 
     def __init__(
@@ -140,6 +147,7 @@ class GrowthEventSink:
         self._coordinator = scope_consent_coordinator_for(config)
         self._marker_path = gateway_growth_milestone_state_path(config=config)
         self._client_launch_path = client_launch_state_path(config=config)
+        self._product_active_path = product_active_state_path(config=config)
         self._metaskill_usage_path = metaskill_usage_state_path(config=config)
         self._coding_mode_usage_path = coding_mode_usage_state_path(config=config)
         self._cohort_path = growth_cohort_state_path(config=config)
@@ -156,6 +164,10 @@ class GrowthEventSink:
     @property
     def marker_path(self) -> Path:
         return self._marker_path
+
+    @property
+    def product_active_path(self) -> Path:
+        return self._product_active_path
 
     @property
     def metaskill_usage_path(self) -> Path:
@@ -188,6 +200,15 @@ class GrowthEventSink:
         if occurred_at is None:
             return
         self._schedule(self.record_turn_started(occurred_at))
+
+    def observe_product_active(self, surface: ClientSurface) -> None:
+        """Observe actual use without receiving prompts, routes, or user content."""
+
+        if self._closed or not isinstance(surface, ClientSurface):
+            return
+        occurred_at = self._safe_now()
+        if occurred_at is not None:
+            self._schedule(self._record_product_active(surface, occurred_at))
 
     def observe_turn_succeeded(self) -> None:
         """Capture a successful terminal boundary without receiving its output."""
@@ -256,6 +277,16 @@ class GrowthEventSink:
                     )
         except (GrowthStateError, IdentityStateError, OSError, ValueError, TypeError):
             log.debug("growth milestone replay rejected", exc_info=True)
+        try:
+            records = read_product_active_state(self._product_active_path)
+            for record in records.values():
+                if record.status is GrowthMilestoneStatus.PENDING:
+                    assert isinstance(record.event, ProductActive)
+                    await self._record_product_active(
+                        record.event.surface, record.event.occurred_at_utc, replay_only=True
+                    )
+        except (GrowthStateError, IdentityStateError, OSError, ValueError, TypeError):
+            log.debug("product activity replay rejected", exc_info=True)
 
     async def record_turn_started(self, occurred_at: datetime) -> None:
         await self._record_milestone("first_turn_started", occurred_at)
@@ -320,8 +351,21 @@ class GrowthEventSink:
             ) as permit:
                 if permit is None or self._closed:
                     return False
-                identity_value = self._active_identity_value()
+                identity_value = self._usage_identity_value()
                 if identity_value is None:
+                    return False
+                try:
+                    product_records = read_product_active_state(self._product_active_path)
+                except (GrowthStateError, OSError, ValueError, TypeError):
+                    log.debug("product activity retry state rejected", exc_info=True)
+                    product_records = {}
+                if any(
+                    record.status is GrowthMilestoneStatus.PENDING
+                    and str(record.event.analytics_user_id) == identity_value
+                    for record in product_records.values()
+                ):
+                    return True
+                if self._active_identity_value() is None:
                     return False
                 state = read_gateway_growth_milestone_state(self._marker_path)
                 return any(
@@ -333,6 +377,125 @@ class GrowthEventSink:
         except (GrowthStateError, IdentityStateError, OSError, ValueError, TypeError):
             log.debug("growth milestone retry state rejected", exc_info=True)
             return False
+
+    async def record_product_active(
+        self,
+        *,
+        surface: ClientSurface,
+        occurred_at: datetime | None = None,
+    ) -> bool:
+        """Enqueue one actual-use observation per identity/surface/UTC day."""
+
+        if self._closed:
+            return False
+        if not isinstance(surface, ClientSurface):
+            raise TypeError("surface must be a ClientSurface")
+        timestamp = self._safe_now() if occurred_at is None else occurred_at
+        if not _valid_utc_datetime(timestamp):
+            return False
+        assert isinstance(timestamp, datetime)
+        return await self._record_product_active(surface, timestamp)
+
+    async def _record_product_active(
+        self,
+        surface: ClientSurface,
+        occurred_at: datetime,
+        *,
+        replay_only: bool = False,
+    ) -> bool:
+        async with self._lock:
+            try:
+                prepared = await self._prepare_product_active(
+                    surface, occurred_at, replay_only=replay_only
+                )
+                if prepared is None:
+                    return False
+                key, event, consent_revision = prepared
+                result = await self._runtime.record(
+                    event, expected_consent_revision=consent_revision
+                )
+                if result.status not in {RecordStatus.RECORDED, RecordStatus.DUPLICATE}:
+                    return False
+                await self._acknowledge_product_active(key, event)
+                return True
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.debug("product activity persistence failed", exc_info=True)
+                return False
+            finally:
+                if not self._closed and asyncio.current_task() is not self._retry_task:
+                    self._retry_requested.set()
+
+    async def _prepare_product_active(
+        self,
+        surface: ClientSurface,
+        occurred_at: datetime,
+        *,
+        replay_only: bool,
+    ) -> tuple[str, ProductActive, int] | None:
+        notice_version: Literal["growth-v2"] = "growth-v2"
+        async with self._coordinator.authorized(
+            TelemetryScope.GROWTH,
+            checkpoint=ConsentCheckpoint.ENQUEUE,
+            notice_version=notice_version,
+        ) as permit:
+            if permit is None:
+                return None
+            identity_value = self._usage_identity_value(create=not replay_only)
+            if identity_value is None:
+                return None
+            key = f"{identity_value}:{surface.value}:{occurred_at.date().isoformat()}"
+            with ProfileOperationLock(
+                self._product_active_path, timeout=_STATE_LOCK_TIMEOUT_SECONDS
+            ):
+                records = read_product_active_state(self._product_active_path)
+                existing = records.get(key)
+                if existing is not None:
+                    if existing.status is GrowthMilestoneStatus.ENQUEUED:
+                        return None
+                    assert isinstance(existing.event, ProductActive)
+                    return key, existing.event, permit.revision
+                if replay_only:
+                    return None
+                event = ProductActive(
+                    event_name="product_active",
+                    event_version=1,
+                    event_id=new_event_id(),
+                    occurred_at_utc=occurred_at,
+                    source=EventSource.GATEWAY,
+                    app_version=self._app_version,
+                    platform=self._platform,
+                    outcome=None,
+                    error_code=None,
+                    duration_ms=None,
+                    consent_scope=ConsentScope.GROWTH,
+                    notice_version=notice_version,
+                    sample_rate=1,
+                    analytics_user_id=UUID(identity_value),
+                    surface=surface,
+                )
+                records[key] = GrowthMilestoneRecord(GrowthMilestoneStatus.PENDING, event)
+                write_product_active_state(self._product_active_path, records)
+                return key, event, permit.revision
+
+    async def _acknowledge_product_active(self, key: str, event: ProductActive) -> None:
+        async with self._coordinator.authorized(
+            TelemetryScope.GROWTH,
+            checkpoint=ConsentCheckpoint.ENQUEUE,
+            notice_version=CURRENT_NOTICE_VERSION_BY_SCOPE[TelemetryScope.GROWTH.value],
+        ) as permit:
+            if permit is None or self._usage_identity_value() != str(event.analytics_user_id):
+                return
+            with ProfileOperationLock(
+                self._product_active_path, timeout=_STATE_LOCK_TIMEOUT_SECONDS
+            ):
+                records = read_product_active_state(self._product_active_path)
+                existing = records.get(key)
+                if existing is None or existing.event.event_id != event.event_id:
+                    return
+                records[key] = GrowthMilestoneRecord(GrowthMilestoneStatus.ENQUEUED, event)
+                write_product_active_state(self._product_active_path, records)
 
     async def record_client_launch(
         self,
@@ -400,9 +563,8 @@ class GrowthEventSink:
         ) as permit:
             if permit is None:
                 return None
-            identity_value = self._active_identity_value()
-            if identity_value is None:
-                return None
+            identity_value = self._usage_identity_value(create=True)
+            assert identity_value is not None
             day = occurred_at.astimezone(UTC).date().isoformat()
             key = f"{identity_value}:{surface.value}:{day}"
             with ProfileOperationLock(
@@ -454,7 +616,7 @@ class GrowthEventSink:
             checkpoint=ConsentCheckpoint.ENQUEUE,
             notice_version=notice_version,
         ) as permit:
-            if permit is None or self._active_identity_value() != str(event.analytics_user_id):
+            if permit is None or self._usage_identity_value() != str(event.analytics_user_id):
                 return
             with ProfileOperationLock(
                 self._client_launch_path,
@@ -525,9 +687,8 @@ class GrowthEventSink:
         ) as permit:
             if permit is None:
                 return None
-            identity_value = self._active_identity_value()
-            if identity_value is None:
-                return None
+            identity_value = self._usage_identity_value(create=True)
+            assert identity_value is not None
             state_path = self._feature_usage_path(event_name)
             with ProfileOperationLock(
                 state_path,
@@ -586,7 +747,7 @@ class GrowthEventSink:
         ) as permit:
             if permit is None:
                 return
-            if self._active_identity_value() != str(event.analytics_user_id):
+            if self._usage_identity_value() != str(event.analytics_user_id):
                 return
             event_name = event.event_name
             state_path = self._feature_usage_path(event_name)
@@ -624,7 +785,7 @@ class GrowthEventSink:
         ) as permit:
             if permit is None:
                 return
-            identity_value = self._active_identity_value()
+            identity_value = self._usage_identity_value()
             if identity_value is None:
                 return
             pending: list[tuple[str, str, FeatureUsageEvent]] = []
@@ -861,6 +1022,17 @@ class GrowthEventSink:
     def _active_identity_value(self) -> str | None:
         if read_active_growth_cohort(self._cohort_path) is None:
             return None
+        return self._usage_identity_value()
+
+    def _usage_identity_value(self, *, create: bool = False) -> str | None:
+        """Resolve identity only while the caller holds an upload-policy permit."""
+
+        if create:
+            return load_or_create_identity(
+                self._identity_path,
+                TelemetryIdentityKind.ANALYTICS_USER,
+                now=self._clock(),
+            ).value
         identity = read_identity(
             self._identity_path,
             expected_kind=TelemetryIdentityKind.ANALYTICS_USER,
@@ -1031,6 +1203,40 @@ def write_client_launch_state(
     )
 
 
+def read_product_active_state(path: str | Path) -> dict[str, GrowthMilestoneRecord]:
+    """Read durable daily observations with their exact identity/surface/day key."""
+
+    records = _read_feature_usage_state(
+        path,
+        schema_version=PRODUCT_ACTIVE_SCHEMA_VERSION,
+        marker_kind=_PRODUCT_ACTIVE_MARKER_KIND,
+        event_type=ProductActive,
+        event_name="product_active",
+        label="product activity",
+    )
+    for key, record in records.items():
+        assert isinstance(record.event, ProductActive)
+        event = record.event
+        expected_key = (
+            f"{event.analytics_user_id}:{event.surface.value}:"
+            f"{event.occurred_at_utc.astimezone(UTC).date().isoformat()}"
+        )
+        if key != expected_key:
+            raise GrowthStateError("product activity key does not match its event")
+    return records
+
+
+def write_product_active_state(path: str | Path, records: dict[str, GrowthMilestoneRecord]) -> None:
+    """Keep pending observations intact and bound acknowledged daily history."""
+
+    _write_feature_usage_state(
+        path,
+        records,
+        schema_version=PRODUCT_ACTIVE_SCHEMA_VERSION,
+        marker_kind=_PRODUCT_ACTIVE_MARKER_KIND,
+    )
+
+
 def read_metaskill_usage_state(path: str | Path) -> dict[str, GrowthMilestoneRecord]:
     """Read the bounded, local-only MetaSkill usage deduplication ledger."""
 
@@ -1090,8 +1296,8 @@ def _read_feature_usage_state(
     *,
     schema_version: int,
     marker_kind: str,
-    event_type: type[MetaSkillUsage] | type[CodingModeUsage],
-    event_name: Literal["metaskill_usage", "coding_mode_usage"],
+    event_type: type[MetaSkillUsage] | type[CodingModeUsage] | type[ProductActive],
+    event_name: Literal["metaskill_usage", "coding_mode_usage", "product_active"],
     label: str,
 ) -> dict[str, GrowthMilestoneRecord]:
     payload = read_growth_state_object(path)
@@ -1247,6 +1453,9 @@ def _valid_feature_usage_run_key(value: object) -> bool:
 
 
 __all__ = [
+    "PRODUCT_ACTIVE_SCHEMA_VERSION",
+    "read_product_active_state",
+    "write_product_active_state",
     "GATEWAY_GROWTH_MILESTONE_SCHEMA_VERSION",
     "CLIENT_LAUNCH_SCHEMA_VERSION",
     "CODING_MODE_USAGE_SCHEMA_VERSION",

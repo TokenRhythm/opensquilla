@@ -1164,6 +1164,12 @@ const activitySummaryLabel = computed(() => {
       [label, activityCompactElapsedLabel.value].filter(Boolean).join(' · '),
     )
   }
+  if (activityLifecycle.value === 'failed') {
+    return withMaintenanceSummary([
+      String(t('sessions.status.failed')),
+      activityCompactElapsedLabel.value,
+    ].filter(Boolean).join(' · '))
+  }
   if (activityCompletionConfirmed.value) {
     return withMaintenanceSummary([
         String(t('chat.activity.lifecycle.settled')),

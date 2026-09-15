@@ -1185,26 +1185,13 @@ export class DesktopReliabilityTelemetry {
       'reliability',
       this.env,
     )
-    if (consent.blockReason === 'consent_declined') {
-      if (
-        this.consentGrantGeneration !== null
-        || this.sessionStarted
-        || this.currentMarker !== null
-        || this.pendingInstalledUpdate !== null
-      ) {
-        this.resetAfterConsentWithdrawal()
-      }
-      this.consentGrantGeneration = null
-      return { enabled: false, generationChanged: false }
-    }
     if (
       !consent.enabled
       || consent.noticeVersion !== CURRENT_NOTICE_VERSION_BY_SCOPE.reliability
-      || consent.consentedAtUtc === null
     ) {
       return { enabled: false, generationChanged: false }
     }
-    const generation = `${consent.noticeVersion}\n${consent.consentedAtUtc}`
+    const generation = `${consent.noticeVersion}\n${consent.consentedAtUtc ?? 'unified'}`
     if (this.consentGrantGeneration === null) {
       this.consentGrantGeneration = generation
       return { enabled: true, generationChanged: false }

@@ -36,8 +36,8 @@ class ScopeConsentCoordinator:
 
     A caller must keep the yielded context entered across the irreversible
     boundary: queue commit for ``ENQUEUE`` and request start for ``SEND``.
-    Consent mutation code must keep :meth:`transition` entered from its first
-    fail-closed state change through scope cleanup.
+    Preference mutation code holds both :meth:`transition` locks from the first
+    fail-closed Desktop snapshot through durable save and mirror publication.
     """
 
     def __init__(self, consent_state: ConsentStateProvider) -> None:

@@ -325,6 +325,7 @@ METHOD_SCOPES: dict[str, str] = {
     # withdrawal cleanup keep this separate from generic config mutation.
     "telemetry.consent.set": WRITE_SCOPE,
     "telemetry.client_launch.record": WRITE_SCOPE,
+    "telemetry.product_active.record": WRITE_SCOPE,
     # OpenSquilla-only; manual ``/meta`` command launch stamp.
     "meta.run": WRITE_SCOPE,
     # Raw prompts remain owner/admin-gated inside the handlers. WRITE_SCOPE is

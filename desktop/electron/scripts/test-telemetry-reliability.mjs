@@ -179,6 +179,29 @@ try {
     )
   }
 
+  // The unified reporting switch works without a synthetic consent timestamp,
+  // and pausing it preserves the session and already queued events.
+  {
+    const pausedRoot = join(root, 'unified-policy')
+    const pausedPaths = paths(pausedRoot)
+    await writeReliabilityConsent(pausedPaths.consentMirrorPath, true, null)
+    const runtime = telemetry({ clock: clock(), appSessionId: uuid(30), randomId: deterministicIds(31) })
+    runtime.synchronize(pausedPaths)
+    runtime.recordAppStartResult({ outcome: 'success', durationMs: 10, failureStage: null, errorCode: null })
+    const sessionPath = join(pausedPaths.spoolRoot, 'reliability', '.desktop-reliability-session.tmp')
+    const before = readFileSync(sessionPath, 'utf8')
+    const queued = readyEvents(pausedRoot)
+    assert.equal(JSON.parse(before).consent_generation, 'reliability-v1\nunified')
+    await writeReliabilityConsent(pausedPaths.consentMirrorPath, false)
+    runtime.recordMonitoredRequest(10_000)
+    assert.equal(readFileSync(sessionPath, 'utf8'), before)
+    assert.deepEqual(readyEvents(pausedRoot), queued)
+    await writeReliabilityConsent(pausedPaths.consentMirrorPath, true, null)
+    runtime.synchronize(pausedPaths)
+    assert.equal(JSON.parse(readFileSync(sessionPath, 'utf8')).app_session_id, uuid(30))
+    runtime.finishSession()
+  }
+
   // Closing the process gate for a consent resync only pauses persistence. It
   // must not reinterpret the temporary veto as a durable withdrawal.
   {

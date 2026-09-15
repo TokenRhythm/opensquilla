@@ -134,6 +134,34 @@ async def test_surface_ready_runs_only_after_surface_context_enters() -> None:
     assert observations == ["entered", "ready"]
 
 
+@pytest.mark.parametrize("activity_fails", [False, True])
+async def test_user_activity_observes_input_without_content(activity_fails: bool) -> None:
+    inputs: asyncio.Queue[str | None] = asyncio.Queue()
+    for value in (" ", "synthetic task", "/help", None):
+        inputs.put_nowait(value)
+    surface = _FakeSurface(inputs)
+    observed: list[str] = []
+    dispatched: list[str] = []
+
+    async def activity() -> None:
+        observed.append("active")
+        if activity_fails:
+            raise RuntimeError("synthetic unavailable")
+
+    async def dispatch(value: str) -> bool:
+        dispatched.append(value)
+        return True
+
+    await run_tui_runtime(
+        dispatch=dispatch,
+        surface_factory=_surface_factory(surface),
+        config=_runtime_config(concurrent_input_during_turn=False),
+        hooks=_runtime_hooks(on_user_activity=activity),
+    )
+    assert observed == ["active", "active"]
+    assert dispatched == ["synthetic task", "/help"]
+
+
 @pytest.mark.asyncio
 async def test_runtime_ignores_blank_input_lines() -> None:
     """A blank Enter is never a message: no dispatch, no echo, no queue entry.

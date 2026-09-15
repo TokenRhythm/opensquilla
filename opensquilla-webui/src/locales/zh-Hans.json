@@ -1821,8 +1821,8 @@
       "reliabilityDiagnosticsDesc": "发送操作结果、耗时和经隐私处理的错误指纹，用于诊断崩溃与失败；绝不包含对话或文件内容。",
       "productAnalyticsLabel": "产品与增长分析",
       "productAnalyticsDesc": "发送激活里程碑，以及 MetaSkill 和编程模式实际开始后的使用次数，用于衡量转化与功能使用；绝不包含对话内容、任务参数、文件或原始账号 ID，仅使用随机、专用的分析标识。",
-      "networkReportingLabel": "网络诊断总开关",
-      "networkReportingDesc": "统一控制网络诊断、分析和更新检查；关闭后会覆盖下方两个独立选择。"
+      "networkReportingLabel": "诊断与使用统计上报",
+      "networkReportingDesc": "发送匿名诊断和使用统计，包括 MetaSkill 与编程模式实际运行次数，同时控制更新检查。不包含对话内容、任务参数或文件。"
     },
     "toast": {
       "loadFailed": "加载设置失败：{error}",

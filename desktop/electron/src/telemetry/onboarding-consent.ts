@@ -59,16 +59,25 @@ function privacyAssignments(raw: string | null): Map<string, string> {
     const line = rawLine.trim()
     const section = line.match(/^\[\s*([^\]]+?)\s*\](?:\s*#.*)?$/)
     if (section) {
-      inPrivacy = section[1] === 'privacy'
+      inPrivacy = section[1] === 'privacy' || unquoteTomlString(section[1] ?? '') === 'privacy'
       continue
     }
     if (!inPrivacy || !line || line.startsWith('#')) continue
-    const assignment = line.match(/^([A-Za-z0-9_-]+)\s*=\s*(.*)$/)
+    const assignment = line.match(/^(?:([A-Za-z0-9_-]+)|"([A-Za-z0-9_-]+)"|'([A-Za-z0-9_-]+)')\s*=\s*(.*)$/)
     if (assignment) {
-      assignments.set(assignment[1] ?? '', String(assignment[2] ?? '').split('#', 1)[0]?.trim() ?? '')
+      assignments.set(assignment[1] ?? assignment[2] ?? assignment[3] ?? '', String(assignment[4] ?? '').split('#', 1)[0]?.trim() ?? '')
     }
   }
   return assignments
+}
+
+function requiresAuthoritativePrivacyParse(raw: string | null): boolean {
+  // Inline/dotted tables are valid TOML, but cannot be decided by this narrow
+  // early-start reader. Leave them closed until the Gateway publishes its mirror.
+  return raw !== null && raw.split(/\r?\n/).some((line) => (
+    /^\s*(?:privacy|"privacy"|'privacy')\s*[.=]/.test(line)
+    || /^\s*\[\s*(?:privacy|"privacy"|'privacy')\s*\./.test(line)
+  ))
 }
 
 function parsedScope(
@@ -105,6 +114,28 @@ export function parseLegacyNetworkObservabilityDisabled(raw: string | null): boo
   return value === undefined ? null : true
 }
 
+/** Both event streams follow the existing network-reporting setting. */
+export function resolveDesktopTelemetryConsent(
+  raw: string | null,
+  legacyDisabled = parseLegacyNetworkObservabilityDisabled(raw) === true,
+  persisted = parseDesktopTelemetryConsent(raw),
+): DesktopTelemetryConsent {
+  const assignments = privacyAssignments(raw)
+  const invalidLegacyChoice = Object.values(PRIVACY_FIELDS).some(({ enabled }) => {
+    const value = assignments.get(enabled)
+    return value !== undefined && value !== 'true' && value !== 'false'
+  })
+  const enabled = !legacyDisabled
+    && !requiresAuthoritativePrivacyParse(raw) && !invalidLegacyChoice
+    && persisted.reliability.enabled !== false && persisted.growth.enabled !== false
+  const scopeState = (scope: 'reliability' | 'growth'): DesktopScopeConsent => ({
+    enabled,
+    noticeVersion: enabled ? CURRENT_NOTICE_VERSION_BY_SCOPE[scope] : null,
+    consentedAtUtc: null,
+  })
+  return { reliability: scopeState('reliability'), growth: scopeState('growth') }
+}
+
 function explicitChoice(payload: DesktopTelemetryConsentPayload, key: keyof DesktopTelemetryConsentPayload): boolean | null {
   if (!Object.prototype.hasOwnProperty.call(payload, key)) return null
   const value = payload[key]
@@ -128,7 +159,7 @@ function scopeFromChoice(
 
 /**
  * Apply only explicit choices. Missing properties preserve the persisted state;
- * a fresh onboarding must call requireExplicitOnboardingConsent first.
+ * retained for compatibility with older desktop payloads.
  */
 export function applyDesktopTelemetryConsentPayload(
   persisted: DesktopTelemetryConsent,
@@ -142,15 +173,6 @@ export function applyDesktopTelemetryConsentPayload(
       ? persisted.reliability
       : scopeFromChoice(reliability, 'reliability', nowUtc),
     growth: growth === null ? persisted.growth : scopeFromChoice(growth, 'growth', nowUtc),
-  }
-}
-
-export function requireExplicitOnboardingConsent(payload: DesktopTelemetryConsentPayload): void {
-  if (
-    typeof payload.reliabilityDiagnosticsEnabled !== 'boolean'
-    || typeof payload.productAnalyticsEnabled !== 'boolean'
-  ) {
-    throw new TypeError('Choose whether to enable both telemetry categories before continuing.')
   }
 }
 

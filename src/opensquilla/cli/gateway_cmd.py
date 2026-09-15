@@ -293,7 +293,11 @@ def run_gateway(
         record_launch = getattr(growth_sink, "record_client_launch", None)
         if callable(record_launch):
             await record_launch(
-                surface=ClientSurface.CLI,
+                surface=(
+                    ClientSurface.DESKTOP
+                    if desktop_profile_lifecycle_active()
+                    else ClientSurface.CLI
+                ),
                 entrypoint=ClientEntrypoint.GATEWAY_RUN,
                 execution_mode=ExecutionMode.GATEWAY,
             )

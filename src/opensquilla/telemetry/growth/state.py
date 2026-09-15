@@ -23,6 +23,7 @@ GROWTH_COHORT_SCHEMA_VERSION = 1
 GROWTH_COHORT_STATE_NAME = "growth_cohort.json"
 GATEWAY_GROWTH_MILESTONE_STATE_NAME = "growth_gateway_milestones.json"
 CLIENT_LAUNCH_STATE_NAME = "growth_client_launches.json"
+PRODUCT_ACTIVE_STATE_NAME = "growth_product_active.json"
 METASKILL_USAGE_STATE_NAME = "growth_metaskill_usage.json"
 CODING_MODE_USAGE_STATE_NAME = "growth_coding_mode_usage.json"
 DESKTOP_GROWTH_MILESTONE_STATE_NAME = "growth_desktop_milestones.json"
@@ -70,6 +71,10 @@ def gateway_growth_milestone_state_path(*, config: Any | None = None) -> Path:
 
 def client_launch_state_path(*, config: Any | None = None) -> Path:
     return growth_telemetry_directory(config=config) / CLIENT_LAUNCH_STATE_NAME
+
+
+def product_active_state_path(*, config: Any | None = None) -> Path:
+    return growth_telemetry_directory(config=config) / PRODUCT_ACTIVE_STATE_NAME
 
 
 def metaskill_usage_state_path(*, config: Any | None = None) -> Path:
@@ -140,6 +145,7 @@ def delete_growth_cohort_state(*, config: Any | None = None) -> tuple[Path, ...]
         growth_cohort_state_path(config=config),
         gateway_growth_milestone_state_path(config=config),
         client_launch_state_path(config=config),
+        product_active_state_path(config=config),
         metaskill_usage_state_path(config=config),
         coding_mode_usage_state_path(config=config),
         growth_telemetry_directory(config=config) / DESKTOP_GROWTH_MILESTONE_STATE_NAME,
@@ -244,6 +250,8 @@ def _is_utc_timestamp(value: str) -> bool:
 
 
 __all__ = [
+    "PRODUCT_ACTIVE_STATE_NAME",
+    "product_active_state_path",
     "CODING_MODE_USAGE_STATE_NAME",
     "ActiveGrowthCohort",
     "CLIENT_LAUNCH_STATE_NAME",

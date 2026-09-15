@@ -19,6 +19,7 @@ import { GOAL_CONTINUITY_KEY } from './modules/goalContinuity'
 import { PLAN_CENTER_KEY } from './modules/planCenter'
 import { META_RUN_CENTER_KEY } from './modules/metaRunCenter'
 import { APP_SETTINGS_KEY } from './modules/appSettings'
+import { PRODUCT_ACTIVITY_KEY } from './modules/productActivity'
 import { PROVIDER_CONFIGURATION_KEY } from './modules/providerConfiguration'
 import { SETUP_WORKFLOW_KEY } from './modules/setupWorkflow'
 import { MIGRATION_OPERATIONS_KEY } from './modules/migrationOperations'
@@ -99,6 +100,7 @@ app.provide(GOAL_CONTINUITY_KEY, gatewayAdapters.goalContinuity)
 app.provide(PLAN_CENTER_KEY, gatewayAdapters.planCenter)
 app.provide(META_RUN_CENTER_KEY, gatewayAdapters.metaRunCenter)
 app.provide(APP_SETTINGS_KEY, gatewayAdapters.appSettings)
+app.provide(PRODUCT_ACTIVITY_KEY, gatewayAdapters.productActivity)
 app.provide(PROVIDER_CONFIGURATION_KEY, gatewayAdapters.providerConfiguration)
 app.provide(SETUP_WORKFLOW_KEY, gatewayAdapters.setupWorkflow)
 app.provide(MIGRATION_OPERATIONS_KEY, gatewayAdapters.migrationOperations)

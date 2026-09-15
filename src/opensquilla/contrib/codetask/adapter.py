@@ -356,6 +356,9 @@ def _agent_environment(
                 scratch_dir.expanduser().resolve() / "profile"
             ),
             "OPENSQUILLA_GATEWAY_CONFIG_PATH": str(per_run_config),
+            # A coding subprocess is implementation work for its parent turn,
+            # not a separate user-launched CLI client. Keep diagnostics enabled.
+            "OPENSQUILLA_CODETASK_CHILD": "1",
         }
     )
     return environment

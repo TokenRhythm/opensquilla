@@ -51,6 +51,7 @@ describe('Gateway Adapter composition', () => {
       'planCenter',
       'metaRunCenter',
       'appSettings',
+      'productActivity',
       'providerConfiguration',
       'setupWorkflow',
       'migrationOperations',

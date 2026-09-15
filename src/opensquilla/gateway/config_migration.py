@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any
 
 import tomli_w
+from pydantic import TypeAdapter
 
 from opensquilla.paths import default_opensquilla_home, native_io_path
 from opensquilla.search.types import MAX_SEARCH_RESULTS
@@ -106,6 +107,7 @@ DEPRECATED_SKILL_FILTER_FIELDS: frozenset[str] = frozenset(
 )
 _LEGACY_LLM_ENSEMBLE_TIMEOUT_SECONDS = frozenset({120.0, 300.0})
 _DEFAULT_LLM_ENSEMBLE_TIMEOUT_SECONDS = 3600.0
+_LEGACY_TELEMETRY_BOOL: TypeAdapter[bool | None] = TypeAdapter(bool | None)
 
 
 def _legacy_llm_ensemble_timeout_number(value: Any) -> float | None:
@@ -400,6 +402,7 @@ def migrate_config_payload(
         emit_diagnostics=emit_diagnostics,
     )
     _normalize_skill_filter_fields(builder, emit_diagnostics=emit_diagnostics)
+    _normalize_telemetry_upload_preference(builder)
     _clamp_search_max_results(builder)
     _park_unknown_channel_entries(builder, emit_diagnostics=emit_diagnostics)
     _disable_unverifiable_feishu_webhook_entries(builder)
@@ -418,6 +421,33 @@ def migrate_config_payload(
     builder.payload["config_version"] = LATEST_CONFIG_VERSION
 
     return builder.result()
+
+
+def _normalize_telemetry_upload_preference(builder: _MigrationBuilder) -> None:
+    privacy = builder.payload.get("privacy")
+    if not isinstance(privacy, dict):
+        return
+    legacy_choices = (
+        _LEGACY_TELEMETRY_BOOL.validate_python(privacy.get(name))
+        for name in ("reliability_diagnostics_enabled", "product_analytics_enabled")
+    )
+    # Match the prior config model's boolean coercion before discarding retired
+    # fields. Invalid old values must still raise rather than silently enable.
+    choices = tuple(legacy_choices)
+    if any(choice is False for choice in choices):
+        privacy["disable_network_observability"] = True
+        builder.changes.append("Preserved legacy telemetry opt-out in the global privacy switch")
+    for name in (
+        "reliability_diagnostics_enabled",
+        "reliability_notice_version",
+        "reliability_consented_at_utc",
+        "product_analytics_enabled",
+        "product_analytics_notice_version",
+        "product_analytics_consented_at_utc",
+    ):
+        if name in privacy:
+            privacy.pop(name)
+            builder.removed_fields.append(f"privacy.{name}")
 
 
 def _payload_config_version(payload: dict[str, Any]) -> int:

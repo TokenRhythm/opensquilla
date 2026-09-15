@@ -211,6 +211,7 @@ async def run_opentui_chat_runtime(
     abort_active_turn: ChatAbortTurn | None = None,
     steer_active_turn: Callable[[str], Awaitable[bool]] | None = None,
     on_surface_ready: Callable[[], Awaitable[None]] | None = None,
+    on_user_activity: Callable[[], Awaitable[None]] | None = None,
 ) -> None:
     """Compose the OpenTUI footer adapter with the TUI backend runtime."""
     context = OpenTuiChatRuntimeContext(
@@ -285,6 +286,7 @@ async def run_opentui_chat_runtime(
                         if on_surface_ready is not None
                         else TuiRuntimeHooks().on_surface_ready
                     ),
+                    on_user_activity=on_user_activity or TuiRuntimeHooks().on_user_activity,
                     expose_surface=context.expose_surface,
                     clear_exposed_surface=context.clear_output,
                 ),

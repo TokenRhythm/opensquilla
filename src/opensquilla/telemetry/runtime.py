@@ -1,15 +1,15 @@
 """Best-effort lifecycle for scoped telemetry recorders and uploaders.
 
-The runtime is deliberately lazy: merely starting a Gateway must not create
-telemetry state for a scope whose current consent is unset, declined, stale,
-or vetoed.  A scope is opened only after a fresh consent check, and the
-recorder/uploader repeat that check at their durable and network boundaries.
+The runtime opens each queue lazily under the unified upload preference.
+Recorders and uploaders repeat the policy and environment-veto checks at their
+durable and network boundaries; a paused stream retains its existing state.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import stat
 from collections.abc import Coroutine, Mapping
 from dataclasses import dataclass
@@ -57,7 +57,7 @@ class ScopedTelemetryRuntime:
         self,
         *,
         config: object,
-        base_url: str = DEFAULT_TELEMETRY_V2_BASE_URL,
+        base_url: str | None = None,
         state_dir: str | Path | None = None,
         upload_interval_seconds: float = DEFAULT_UPLOAD_INTERVAL_SECONDS,
         env: Mapping[str, str | None] | None = None,
@@ -68,7 +68,15 @@ class ScopedTelemetryRuntime:
             raise ValueError("upload_interval_seconds must be positive")
         self._config = config
         self._coordinator = scope_consent_coordinator_for(config)
-        self._base_url = base_url
+        process_env = os.environ if env is None else env
+        override_url = process_env.get("OPENSQUILLA_TELEMETRY_BASE_URL")
+        self._base_url = (
+            base_url
+            if base_url is not None
+            else override_url
+            if override_url is not None
+            else DEFAULT_TELEMETRY_V2_BASE_URL
+        )
         self._state_dir = Path(state_dir or telemetry_state_dir(config))
         self._upload_interval_seconds = float(upload_interval_seconds)
         self._env = env
