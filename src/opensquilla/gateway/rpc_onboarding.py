@@ -57,9 +57,7 @@ if TYPE_CHECKING:
 
 
 @contextmanager
-def _validation_error(
-    code: str, *, router_provider_id: str | None = None
-) -> Iterator[None]:
+def _validation_error(code: str, *, router_provider_id: str | None = None) -> Iterator[None]:
     """Translate a mutation validation error into a stable, client-localizable
     ``RpcHandlerError`` code, keeping the original English text as the message so
     the Web UI can fall back to it (and developers keep the detail).
@@ -572,9 +570,7 @@ async def _llm_profile_upsert_and_activate(params: Any, ctx: RpcContext) -> dict
     if not isinstance(params, dict) or any(value is None for value in params.values()):
         # Generated optional Python fields use None for omission. The new
         # wire Contract excludes explicit null so keep absence and clear distinct.
-        raise RpcHandlerError(
-            "INVALID_REQUEST", "Invalid save-and-activate profile parameters"
-        )
+        raise RpcHandlerError("INVALID_REQUEST", "Invalid save-and-activate profile parameters")
     try:
         p = validate_upsert_and_activate_params(params)
     except ValidationError as exc:
@@ -591,9 +587,7 @@ async def _llm_profile_upsert_and_activate(params: Any, ctx: RpcContext) -> dict
                 api_key=p.get("apiKey"),
                 api_key_env=p.get("apiKeyEnv"),
                 api_key_env_pool=p.get("apiKeyEnvPool"),
-                keep_current_secret=p.get(
-                    "keepCurrentSecret", p.get("preserveApiKey", False)
-                ),
+                keep_current_secret=p.get("keepCurrentSecret", p.get("preserveApiKey", False)),
                 base_url=p.get("baseUrl"),
                 proxy=p.get("proxy"),
                 router_action=p.get("routerAction", "preserve"),
