@@ -299,11 +299,14 @@ class ScopedTelemetryRuntime:
         except Exception:
             log.debug("telemetry event record failed", exc_info=True)
 
+    async def _run_upload_cycle(self) -> None:
+        await self._drain_desktop_spool()
+        for scope in TelemetryScope:
+            await self.upload_once(scope)
+
     async def _upload_loop(self) -> None:
         while True:
-            await self._drain_desktop_spool()
-            for scope in TelemetryScope:
-                await self.upload_once(scope)
+            await self._run_upload_cycle()
             await asyncio.sleep(self._upload_interval_seconds)
 
     async def _drain_desktop_spool(self) -> None:

@@ -134,12 +134,23 @@ async def test_legacy_iteration_timeout_does_not_stop_a_provider_response() -> N
     assert events == [{"type": "chunk", "data": "ready"}]
 
 
+@pytest.mark.parametrize(
+    ("configured_timeout", "total_deadline", "dynamic_deadline", "expected_timeout"),
+    [
+        (0.05, 10.05, 10.10, 0.05),
+        (0.0, None, 10.05, pytest.approx(0.05)),
+    ],
+)
 @pytest.mark.asyncio
-async def test_total_deadline_limited_wait_stays_total_timeout_on_early_wake(
+async def test_deadline_limited_wait_respects_total_and_dynamic_deadlines(
     monkeypatch: pytest.MonkeyPatch,
+    configured_timeout: float,
+    total_deadline: float | None,
+    dynamic_deadline: float,
+    expected_timeout: object,
 ) -> None:
     agent = Agent.__new__(Agent)
-    agent.config = SimpleNamespace(timeout=0.05, iteration_timeout=30.0)
+    agent.config = SimpleNamespace(timeout=configured_timeout, iteration_timeout=30.0)
     observed_timeouts: list[float | None] = []
 
     async def provider_stream() -> AsyncIterator[dict[str, str]]:
@@ -161,8 +172,8 @@ async def test_total_deadline_limited_wait_stays_total_timeout_on_early_wake(
         async for _event in agent._stream_provider_events_with_deadline(
             provider_stream(),
             loop=fake_loop,
-            total_deadline=10.05,
-            deadline_provider=lambda: 10.10,
+            total_deadline=total_deadline,
+            deadline_provider=lambda: dynamic_deadline,
         ):
             pass
 
@@ -171,4 +182,4 @@ async def test_total_deadline_limited_wait_stays_total_timeout_on_early_wake(
         exc_info.value,
         "_opensquilla_stream_deadline_at_monotonic",
     ) == pytest.approx(10.05)
-    assert observed_timeouts == [pytest.approx(0.05)]
+    assert observed_timeouts == [expected_timeout]

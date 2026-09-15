@@ -2309,6 +2309,66 @@ describe('useChatHistory canonical pagination', () => {
     })
   })
 
+  it('reconciles a confirmed empty draft after live reconnect', async () => {
+    const { api, messages, readHistory } = makeHistory(false, {
+      response: {
+        messages: [],
+        hasMore: false,
+        canonicalAvailable: false,
+        canonicalComplete: true,
+      },
+    })
+
+    await expect(api.reconcileHistory()).resolves.toEqual({ ok: true })
+
+    expect(readHistory).toHaveBeenCalledOnce()
+    expect(messages.value).toEqual([])
+    expect(api.historyState.value).toMatchObject({
+      initialLoadStatus: 'ready',
+      canonicalAvailable: false,
+      canonicalComplete: true,
+      recoveryError: false,
+    })
+  })
+
+  it.each([false, undefined])(
+    'does not accept unavailable empty reconciliation with completeness %s',
+    async canonicalComplete => {
+      const { api } = makeHistory(false, {
+        response: {
+          messages: [],
+          hasMore: false,
+          canonicalAvailable: false,
+          canonicalComplete,
+        },
+      })
+      const before = { ...api.historyState.value }
+
+      await expect(api.reconcileHistory()).resolves.toEqual({ ok: false })
+
+      expect(api.historyState.value).toEqual(before)
+    },
+  )
+
+  it('preserves loaded durable history when reconciliation claims a missing empty session', async () => {
+    const { api, messages, historyFixture } = makeHistory(false)
+    await api.loadHistory()
+    const beforeMessages = messages.value.slice()
+    const beforeState = { ...api.historyState.value }
+    historyFixture.mockResolvedValueOnce({
+      messages: [],
+      hasMore: false,
+      canonicalAvailable: false,
+      canonicalComplete: true,
+    })
+
+    await expect(api.reconcileHistory()).resolves.toEqual({ ok: false })
+
+    expect(messages.value).toEqual(beforeMessages)
+    expect(messages.value[0]?.messageId).toBe('m1')
+    expect(api.historyState.value).toEqual(beforeState)
+  })
+
   it('keeps an old-gateway empty success without canonical fields compatible', async () => {
     const { api } = makeHistory(false, {
       response: {

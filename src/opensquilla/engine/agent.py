@@ -13495,6 +13495,8 @@ class Agent:
             wait_budget: float | None = None
             if active_deadline is not None:
                 wait_budget = active_deadline - loop.time()
+                if total_deadline is not None:
+                    wait_budget = min(wait_budget, self.config.timeout)
                 if wait_budget <= 0:
                     raise _provider_stream_deadline_timeout(
                         timeout_seconds=self.config.timeout,
