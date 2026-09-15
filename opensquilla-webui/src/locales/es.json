@@ -3441,7 +3441,7 @@
     "loadingSession": "Restaurando el historial de la conversación…",
     "loadingSessionDescription": "Puedes seguir usando la conversación mientras se carga el historial.",
     "loadSessionFailed": "Historial de la conversación no disponible temporalmente",
-    "loadSessionDescription": "Es posible que la conexión se haya interrumpido o que el servicio de historial no esté disponible temporalmente. Vuelve a cargar para intentarlo de nuevo.",
+    "loadSessionDescription": "El historial de la conversación no está disponible temporalmente.",
     "reloadSession": "Volver a cargar el historial",
     "retryingSession": "Volviendo a cargar el historial…",
     "retryingSessionDescription": "Restaurando el historial de la conversación…",
@@ -3451,11 +3451,11 @@
     "gatewayReconnecting": "Reconectando con el Gateway…",
     "automaticRecoveryDescription": "La recuperación es automática. Puedes seguir editando; el texto y los archivos sin enviar se conservan aquí.",
     "liveUnavailable": "Las actualizaciones en tiempo real no están disponibles temporalmente",
-    "liveUnavailableDescription": "El historial sigue disponible. Vuelve a conectarte antes de enviar.",
-    "liveUnavailableConnectedDescription": "El Gateway está conectado y el historial sigue disponible. El envío se reanudará cuando se recuperen las actualizaciones en tiempo real.",
+    "liveUnavailableDescription": "El historial sigue disponible. El envío se reanudará cuando se recuperen las actualizaciones en tiempo real.",
+    "liveUnavailableConnectedDescription": "La pasarela está conectada. Las actualizaciones en tiempo real de esta sesión no están disponibles temporalmente.",
     "reconnectLive": "Volver a conectar",
     "liveSendBlockedConnecting": "Se están restaurando las actualizaciones en tiempo real. Tu borrador está guardado.",
-    "liveSendBlockedDegraded": "Vuelve a conectar las actualizaciones en tiempo real antes de enviar. Tu borrador está guardado.",
+    "liveSendBlockedDegraded": "Las actualizaciones en tiempo real no están disponibles temporalmente. Tu borrador está guardado.",
     "noMessagesYet": "Aún no hay mensajes.",
     "newChat": "Nueva tarea",
     "chatWithSuffix": "Chat {suffix}",
@@ -3928,7 +3928,7 @@
         "busy": "El estado del objetivo aún se está consolidando. Arriba se muestra el estado más reciente.",
         "notResumable": "Este objetivo no se puede reanudar desde su estado actual.",
         "executionDisabled": "La ejecución de objetivos está desactivada en este espacio de trabajo.",
-        "connectionRequired": "Vuelve a conectar esta tarea antes de continuar el objetivo.",
+        "connectionRequired": "Esta tarea aún no está lista para continuar.",
         "planModeActive": "El objetivo esperará hasta que termine el modo Plan.",
         "planRunActive": "El objetivo esperará a que termine la ejecución activa del Plan.",
         "requestConflict": "Esta acción ya se usó para otra solicitud. Inténtalo de nuevo."
@@ -4238,7 +4238,7 @@
       "unknownProviderCalls": "{count} llamada al proveedor tiene uso desconocido | {count} llamadas al proveedor tienen uso desconocido"
     },
     "modelRouting": {
-      "updateFailed": "No se pudo cambiar el enrutamiento de modelos — revertido. Comprueba la conexión con la pasarela e inténtalo de nuevo.",
+      "updateFailed": "No se pudo cambiar el enrutamiento de modelos — revertido. El cambio no está disponible temporalmente.",
       "sessionUpdateFailed": "No se pudo actualizar el enrutamiento de modelos de este chat: {error}"
     },
     "routeFeedback": {
