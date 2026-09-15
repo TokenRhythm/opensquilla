@@ -16,6 +16,7 @@ import type {
   DiscoveredModel,
   ProviderCredentialPanelState,
 } from '@/composables/setup/useSetupProviderForm'
+import type { ProviderProbeMode } from '@/modules/setupWorkflow'
 import { parseContextWindowInput } from '@/composables/setup/useSettingsPromotedForm'
 import { localizedRelativeTime } from '@/utils/messageTime'
 
@@ -114,7 +115,8 @@ const emit = defineEmits<{
   updateProviderField: [name: string, value: unknown]
   updateLlmTimeout: [value: number]
   updateContextWindow: [value: string]
-  probeConnection: []
+  probeConnection: [mode: ProviderProbeMode]
+  cancelProviderProbe: []
   refreshModels: []
   saveProvider: []
   saveProviderAndActivate: []
@@ -125,6 +127,7 @@ const emit = defineEmits<{
   removeProviderProfile: [value: string]
   addProvider: [value: string]
   probeConfiguredProvider: [value: string]
+  cancelConfiguredProviderProbe: [value: string]
   activateProvider: [providerId: string]
   updateImageGenerationOptIn: [enabled: boolean]
 }>()
@@ -265,6 +268,10 @@ function onEditorDialogKeydown(event: KeyboardEvent) {
 }
 
 function testConfigured(providerId: string) {
+  if (probeFor(providerId).phase === 'probing') {
+    emit('cancelConfiguredProviderProbe', providerId)
+    return
+  }
   if (providerBusy.value) return
   emit('probeConfiguredProvider', providerId)
 }
@@ -503,11 +510,11 @@ function providerStatusUnavailable(provider: ProviderPanelContract['configuredPr
 }
 
 function configuredTestLabel(provider: ProviderPanelContract['configuredProviders'][number]): string {
-  if (probeFor(provider.providerId).phase === 'probing') return t('setup.provider.testing')
+  if (probeFor(provider.providerId).phase === 'probing') return t('setup.provider.cancelTest')
   if (providerStatusUnavailable(provider)) return t('setup.provider.profileStatusUnavailable')
   if (!provider.ready) return t('setup.provider.addKeyToTest')
   if (!provider.probeModelAvailable) return t('setup.provider.addModelToTest')
-  return t('setup.provider.testSavedConnection')
+  return t('setup.provider.testSavedModel')
 }
 
 function configuredMenuItems(provider: ProviderPanelContract['configuredProviders'][number]): ProviderMenuItem[] {
@@ -521,7 +528,9 @@ function configuredMenuItems(provider: ProviderPanelContract['configuredProvider
     ariaLabel: `${configuredTestLabel(provider)} — ${provider.label}`,
     describedBy: 'setup-provider-configured-desc',
     className: 'setup-provider-card__test',
-    disabled: !provider.ready || !provider.probeModelAvailable || probeFor(provider.providerId).phase === 'probing',
+    busy: probeFor(provider.providerId).phase === 'probing',
+    disabled: probeFor(provider.providerId).phase !== 'probing'
+      && (!provider.ready || !provider.probeModelAvailable),
     hint: providerStatusUnavailable(provider) ? t('setup.provider.statusUnavailableTestHint')
       : !provider.ready ? t('setup.provider.addKeyToTestHint')
         : !provider.probeModelAvailable ? t('setup.provider.addModelToTestHint') : undefined,
@@ -553,7 +562,7 @@ function configuredRowFor(
 
 function probeStatus(providerId: string): string {
   const state = probeFor(providerId)
-  if (state.phase === 'probing') return t('setup.provider.testing')
+  if (state.phase === 'probing') return t('setup.provider.testingModel')
   if (state.phase === 'unverified') {
     const provider = configuredRowFor(providerId)
     if (!provider?.ready) return ''
@@ -572,11 +581,22 @@ function probeStatus(providerId: string): string {
     }
     return t('setup.provider.connectionNotTested')
   }
-  if (state.phase === 'verified') {
-    return t('setup.provider.connected')
+  if (state.phase === 'reachable') {
+    return t('setup.provider.reachableNotModelTested')
+  }
+  if (state.phase === 'model_verified' || state.phase === 'verified') {
+    return t('setup.provider.modelVerified')
+  }
+  if (state.phase === 'timed_out') {
+    return state.failureStage === 'reachability'
+      ? t('setup.provider.reachabilityTimedOut')
+      : t('setup.provider.modelTimedOut')
   }
   if (PROTOCOL_FAILURE_KINDS.has(state.failureKind)) {
     return t('setup.provider.streamIncompatible')
+  }
+  if (state.phase === 'reachable_error') {
+    return t('setup.provider.endpointResponded', { reason: probeFailureSentence(state) })
   }
   if (state.phase === 'key_invalid') {
     return t('setup.provider.keyRejected', { reason: probeFailureSentence(state) })
@@ -590,7 +610,7 @@ function probeStatus(providerId: string): string {
 function probeToneClass(providerId: string): string {
   const state = probeFor(providerId)
   if (state.phase === 'probing') return ''
-  if (state.phase === 'verified') return 'is-ready'
+  if (state.phase === 'reachable' || state.phase === 'model_verified' || state.phase === 'verified') return 'is-ready'
   if (state.phase !== 'unverified') return 'is-warn'
   const lastProbe = configuredRowFor(providerId)?.lastProbe
   if (lastProbe?.ok) return lastProbe.configChanged ? '' : 'is-ready'
@@ -957,7 +977,9 @@ const tokenRhythmCredentialReplacementRequired = computed(() => (
       @replace="panel.credentialPanel.onReplace?.()"
       @cancel-replace="panel.credentialPanel.onCancelReplace?.()"
       @remove-credential="panel.credentialPanel.onRemoveCredential?.()"
-      @test-connection="emit('probeConnection')"
+      @check-reachability="emit('probeConnection', 'reachability')"
+      @test-model="emit('probeConnection', 'model')"
+      @cancel-probe="emit('cancelProviderProbe')"
       @update-field="(name, value) => emit('updateProviderField', name, value)"
     />
 
@@ -1289,7 +1311,9 @@ const tokenRhythmCredentialReplacementRequired = computed(() => (
                   @replace="panel.credentialPanel.onReplace?.()"
                   @cancel-replace="panel.credentialPanel.onCancelReplace?.()"
                   @remove-credential="panel.credentialPanel.onRemoveCredential?.()"
-                  @test-connection="emit('probeConnection')"
+                  @check-reachability="emit('probeConnection', 'reachability')"
+                  @test-model="emit('probeConnection', 'model')"
+                  @cancel-probe="emit('cancelProviderProbe')"
                   @update-field="(name, value) => emit('updateProviderField', name, value)"
                 />
 
@@ -1345,10 +1369,7 @@ const tokenRhythmCredentialReplacementRequired = computed(() => (
               <button
                 type="button"
                 class="btn btn--primary"
-                :disabled="providerBusy || saving || !hasSavableProviderChange || (replacesCurrentProvider && panel.connection.phase !== 'verified')"
-                :title="replacesCurrentProvider && panel.connection.phase !== 'verified'
-                  ? t('setup.provider.currentSettingsNotTested')
-                  : undefined"
+                :disabled="providerBusy || saving || !hasSavableProviderChange"
                 :aria-busy="saving ? 'true' : undefined"
                 @click="emit('saveProvider')"
               >

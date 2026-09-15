@@ -11,6 +11,7 @@ export interface ProviderMenuItem {
   describedBy?: string
   icon: IconName
   disabled?: boolean
+  busy?: boolean
   hint?: string
   danger?: boolean
   separatorBefore?: boolean
@@ -170,6 +171,7 @@ onBeforeUnmount(() => window.removeEventListener('resize', onResize))
           class="theme-menu__item setup-provider-menu__item"
           :class="[item.className, { 'is-danger': item.danger }]"
           :disabled="disabled || item.disabled"
+          :aria-busy="item.busy ? 'true' : undefined"
           :aria-label="item.ariaLabel || item.label"
           :aria-describedby="item.describedBy"
           :title="item.hint || undefined"

@@ -60,7 +60,11 @@ from .model_identity import (
     DEEPSEEK_V4_MODEL_IDS,
     model_basename,
 )
-from .protocol import ProviderConnectionConfig, ProviderMetadata
+from .protocol import (
+    ProviderConnectionConfig,
+    ProviderMetadata,
+    ProviderModelListingResponseError,
+)
 from .reasoning_dialects import (
     ReasoningDisableArgs,
     ReasoningEnableArgs,
@@ -6329,12 +6333,12 @@ class OpenAIProvider:
                     if self._provider_kind == "tokenrhythm"
                     else resp.json()
                 )
+                if not isinstance(data, Mapping):
+                    raise TypeError("Provider model catalog must be a JSON object")
                 raw_rows = data.get("data", [])
-                rows = (
-                    [row for row in raw_rows if isinstance(row, Mapping)]
-                    if isinstance(raw_rows, list)
-                    else []
-                )
+                if not isinstance(raw_rows, list):
+                    raise TypeError("Provider model catalog data must be a list")
+                rows = [row for row in raw_rows if isinstance(row, Mapping)]
                 if self._compat.model_listing_excluded_ids:
                     excluded_model_ids = {
                         model_id.lower()
@@ -6496,7 +6500,13 @@ class OpenAIProvider:
                 )
         except Exception as exc:
             if raise_on_error:
-                if isinstance(exc, json.JSONDecodeError):
+                response_status = getattr(resp, "status_code", None)
+                if isinstance(response_status, int):
+                    safe_request_error = ProviderModelListingResponseError(
+                        "Provider model catalog response could not be parsed",
+                        status_code=response_status,
+                    )
+                elif isinstance(exc, json.JSONDecodeError):
                     safe_document = redact_tokenrhythm_install_ids(exc.doc)
                     if safe_document != exc.doc:
                         safe_request_error = RuntimeError(

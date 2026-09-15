@@ -3,6 +3,7 @@ import type {
   ConfigurePrimaryProvider,
   DiscoverPrimaryModels,
   ProbePrimaryProvider,
+  ProviderProbeMode,
   ProfileProbe,
   SetupDiscoveryResult,
   SetupWorkflow,
@@ -105,7 +106,9 @@ interface ProviderPanelContext {
  *
  *   unconfigured -- selectProvider(id) --> unverified
  *   unverified   -- probeConnection()  --> probing
- *   probing      -- probe ok           --> verified (auto-fires discoverModels)
+ *   probing      -- endpoint responds  --> reachable (auto-fires discoverModels)
+ *   probing      -- model responds     --> model_verified (auto-fires discoverModels)
+ *   probing      -- deadline expires   --> timed_out
  *   probing      -- auth-ish failure   --> key_invalid
  *   probing      -- other failure/RPC error --> unreachable
  *   any          -- credential/provider/baseUrl/proxy edit --> unverified
@@ -114,7 +117,11 @@ export type ConnectionPhase =
   | 'unconfigured'
   | 'unverified'
   | 'probing'
+  | 'reachable'
+  | 'reachable_error'
+  | 'model_verified'
   | 'verified'
+  | 'timed_out'
   | 'key_invalid'
   | 'unreachable'
 
@@ -236,6 +243,9 @@ export type DiscoveredModelsByProvider = Record<string, DiscoveredModelCatalog>
 
 export interface ConnectionState {
   phase: ConnectionPhase
+  verificationLevel?: 'reachable' | 'model_verified' | 'none'
+  failureStage?: 'reachability' | 'model' | ''
+  probeMode?: ProviderProbeMode | null
   failureKind: string
   detail: string
   /** Time until the first model response event, null when an older gateway does not report it. */
@@ -272,6 +282,9 @@ export interface ProviderCredentialPanelState {
   probeReady: boolean
   probeDisabledReason: string
   probeButtonLabel: string
+  reachabilityReady?: boolean
+  reachabilityDisabledReason?: string
+  probeModesSupported?: boolean
   connection: ConnectionState
   onReveal?: () => void
   onHideReveal?: () => void
@@ -294,10 +307,22 @@ const AUTH_FAILURE_KINDS = new Set(['auth_invalid'])
 const DEPLOYMENT_CONNECTION_FIELDS = new Set(['api_key', 'api_key_env', 'base_url', 'proxy'])
 
 export const PROVIDER_CREDENTIAL_REVEAL_TIMEOUT_MS = 30_000
+// Reachability normally completes at the backend's 8-second /models deadline.
+// Keep enough transport headroom for its documented fallback to the 60-second
+// model probe when an OpenAI-compatible endpoint does not implement /models.
+export const PROVIDER_REACHABILITY_REQUEST_TIMEOUT_MS = 70_000
+export const PROVIDER_MODEL_PROBE_REQUEST_TIMEOUT_MS = 65_000
+
+export function isModelVerifiedConnection(connection: Pick<ConnectionState, 'phase'>): boolean {
+  return connection.phase === 'model_verified' || connection.phase === 'verified'
+}
 
 function freshConnection(providerId: string): ConnectionState {
   return {
     phase: providerId ? 'unverified' : 'unconfigured',
+    verificationLevel: 'none',
+    failureStage: '',
+    probeMode: null,
     failureKind: '',
     detail: '',
     firstResponseMs: null,
@@ -351,6 +376,11 @@ function asRecord(value: unknown): Record<string, unknown> | null {
 
 function nullableString(value: unknown): string | null {
   return typeof value === 'string' && value.trim() ? value.trim() : null
+}
+
+export function isProbeTimeoutError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error ?? '')
+  return /timed?\s*out|timeout/i.test(message)
 }
 
 function nullablePositiveInteger(value: unknown): number | null {
@@ -620,8 +650,17 @@ export function useSetupProviderForm(setupWorkflow: SetupWorkflow) {
   let connectionEpoch = 0
   let discoverPromise: Promise<void> | null = null
   let discoverPromiseForceRefresh = false
+  let activeProbeController: AbortController | null = null
+  let connectionBeforeProbe: ConnectionState | null = null
+
+  function discardActiveProbe() {
+    activeProbeController?.abort()
+    activeProbeController = null
+    connectionBeforeProbe = null
+  }
 
   function resetConnection() {
+    discardActiveProbe()
     connectionEpoch += 1
     discoverPromise = null
     discoverPromiseForceRefresh = false
@@ -633,20 +672,42 @@ export function useSetupProviderForm(setupWorkflow: SetupWorkflow) {
     // model. It must not cancel an independent catalog request, though: model
     // discovery is deployment-scoped and remains valid while the user types or
     // chooses a model from that same provider.
+    const priorConnection = connection.value.phase === 'probing'
+      ? (connectionBeforeProbe ?? connection.value)
+      : connection.value
     if (connection.value.phase === 'probing') {
+      discardActiveProbe()
       connectionEpoch += 1
       discoverPromise = null
       discoverPromiseForceRefresh = false
     }
+    const endpointWasReachable = priorConnection.verificationLevel === 'reachable'
+      || priorConnection.verificationLevel === 'model_verified'
+      || isModelVerifiedConnection(priorConnection)
     connection.value = {
-      ...connection.value,
-      phase: providerSelected.value ? 'unverified' : 'unconfigured',
+      ...priorConnection,
+      phase: providerSelected.value
+        ? (endpointWasReachable ? 'reachable' : 'unverified')
+        : 'unconfigured',
       failureKind: '',
       detail: '',
       firstResponseMs: null,
       totalMs: null,
       latencyMs: null,
+      verificationLevel: endpointWasReachable ? 'reachable' : 'none',
+      failureStage: '',
+      probeMode: null,
     }
+  }
+
+  function cancelProbe() {
+    if (!activeProbeController) return
+    const restore = connectionBeforeProbe ?? freshConnection(providerSelected.value)
+    connectionEpoch += 1
+    activeProbeController.abort()
+    activeProbeController = null
+    connectionBeforeProbe = null
+    connection.value = restore
   }
 
   function clearRevealTimer() {
@@ -706,51 +767,113 @@ export function useSetupProviderForm(setupWorkflow: SetupWorkflow) {
     modelOverride?: string
     storedProfile?: boolean
     draftProfile?: boolean
+    mode?: ProviderProbeMode
   } = {}): Promise<void> {
     if (!providerSelected.value || connection.value.phase === 'probing') return
+    const requestedMode = options.mode ?? 'model'
+    const explicitProbeModesSupported = setupWorkflow.capabilities.providerProbeModes !== false
+    const mode = explicitProbeModesSupported
+      ? requestedMode
+      : 'model'
+    const modeParams = explicitProbeModesSupported
+      ? { mode }
+      : {}
     const epoch = ++connectionEpoch
     discoverPromise = null
     discoverPromiseForceRefresh = false
-    connection.value = { ...freshConnection(providerSelected.value), phase: 'probing' }
+    const controller = new AbortController()
+    connectionBeforeProbe = connection.value
+    activeProbeController = controller
+    connection.value = {
+      ...freshConnection(providerSelected.value),
+      phase: 'probing',
+      probeMode: mode,
+    }
     let outcome: ConnectionState
     try {
       const params = connectionParams(options.defaultModel, options.modelOverride)
       const draftParams = profileDraftParams(options.defaultModel, options.modelOverride)
       let res: SetupDiscoveryResult
       if (options.draftProfile) {
-        res = await setupWorkflow.profile.probeDraftProfile(draftParams)
+        res = await setupWorkflow.profile.probeDraftProfile({ ...draftParams, ...modeParams }, {
+          signal: controller.signal,
+          timeoutMs: mode === 'reachability'
+            ? PROVIDER_REACHABILITY_REQUEST_TIMEOUT_MS
+            : PROVIDER_MODEL_PROBE_REQUEST_TIMEOUT_MS,
+        })
       } else if (options.storedProfile) {
-        res = await setupWorkflow.profile.probeProfile({
+        const profileProbe: ProfileProbe = {
           providerId: providerSelected.value,
-          model: params.model || options.defaultModel || '',
+          ...modeParams,
+        }
+        const profileModel = params.model || options.defaultModel || ''
+        if (profileModel) profileProbe.model = profileModel
+        res = await setupWorkflow.profile.probeProfile(profileProbe, {
+          signal: controller.signal,
+          timeoutMs: mode === 'reachability'
+            ? PROVIDER_REACHABILITY_REQUEST_TIMEOUT_MS
+            : PROVIDER_MODEL_PROBE_REQUEST_TIMEOUT_MS,
         }) as SetupDiscoveryResult
       } else {
-        res = await setupWorkflow.provider.probePrimary(params) as SetupDiscoveryResult
+        res = await setupWorkflow.provider.probePrimary({ ...params, ...modeParams }, {
+          signal: controller.signal,
+          timeoutMs: mode === 'reachability'
+            ? PROVIDER_REACHABILITY_REQUEST_TIMEOUT_MS
+            : PROVIDER_MODEL_PROBE_REQUEST_TIMEOUT_MS,
+        }) as SetupDiscoveryResult
       }
       if (epoch !== connectionEpoch) return
       const timings = normalizeProbeTimings(res)
       if (res?.ok) {
-        outcome = { ...freshConnection(providerSelected.value), phase: 'verified', ...timings }
+        const verificationLevel = res.verificationLevel === 'model_verified'
+          || res.verificationLevel === 'reachable'
+          ? res.verificationLevel
+          : (mode === 'reachability' ? 'reachable' : 'model_verified')
+        outcome = {
+          ...freshConnection(providerSelected.value),
+          phase: verificationLevel,
+          verificationLevel,
+          probeMode: mode,
+          ...timings,
+        }
       } else {
         const kind = String(res?.failureKind || '')
         outcome = {
           ...freshConnection(providerSelected.value),
-          phase: AUTH_FAILURE_KINDS.has(kind) ? 'key_invalid' : 'unreachable',
+          phase: kind === 'probe_timeout'
+            ? 'timed_out'
+            : (AUTH_FAILURE_KINDS.has(kind)
+                ? 'key_invalid'
+                : (res.verificationLevel === 'reachable' ? 'reachable_error' : 'unreachable')),
+          verificationLevel: res.verificationLevel === 'reachable'
+            || res.verificationLevel === 'model_verified'
+            ? res.verificationLevel
+            : 'none',
+          failureStage: res.failureStage === 'reachability' || res.failureStage === 'model'
+            ? res.failureStage
+            : mode,
+          probeMode: mode,
           failureKind: kind,
-          detail: String(res?.message || ''),
+          detail: String(res?.message || res?.detail || ''),
           ...timings,
         }
       }
     } catch (err) {
       if (epoch !== connectionEpoch) return
+      if (controller.signal.aborted) return
       outcome = {
         ...freshConnection(providerSelected.value),
-        phase: 'unreachable',
+        phase: isProbeTimeoutError(err) ? 'timed_out' : 'unreachable',
+        failureStage: mode,
+        probeMode: mode,
+        failureKind: isProbeTimeoutError(err) ? 'probe_timeout' : '',
         detail: err instanceof Error ? err.message : String(err),
       }
     }
+    if (activeProbeController === controller) activeProbeController = null
+    connectionBeforeProbe = null
     connection.value = outcome
-    if (outcome.phase === 'verified') {
+    if (outcome.phase === 'reachable' || isModelVerifiedConnection(outcome)) {
       // Verified endpoint: immediately offer discovered models. The combined
       // verified+models state is kept live only; every explicit test click
       // re-probes so a newly issued key or recovered provider is not masked by
@@ -1065,6 +1188,7 @@ export function useSetupProviderForm(setupWorkflow: SetupWorkflow) {
     invalidateProbeVerdict: invalidateProbeVerdictPreservingCatalog,
     payload,
     probeConnection,
+    cancelProbe,
     discoverModels,
     createPanel,
   }

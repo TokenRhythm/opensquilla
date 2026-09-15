@@ -92,7 +92,7 @@ function panel(overrides: Record<string, unknown> = {}) {
       apiKeyEnvValue: '',
       probeReady: true,
       probeDisabledReason: '',
-      probeButtonLabel: 'Verify current configuration',
+      probeButtonLabel: 'Test model',
       connection: connection(),
       onReveal: vi.fn(),
       onReplace: vi.fn(),
@@ -222,7 +222,18 @@ describe('visible primary-provider save actions', () => {
 
 function testButton(el: HTMLElement): HTMLButtonElement | null {
   return Array.from(el.querySelectorAll<HTMLButtonElement>('.setup-provider-credential button.btn'))
-    .find(btn => (btn.textContent || '').includes('Verify current configuration') || (btn.textContent || '').includes('Verifying')) || null
+    .find(btn => (btn.textContent || '').includes('Check connection') || (btn.textContent || '').includes('Cancel connection check')) || null
+}
+
+async function openConfiguredEditor(el: HTMLElement, providerId = 'openai'): Promise<HTMLElement> {
+  el.querySelector<HTMLButtonElement>(
+    `[data-provider-id="${providerId}"] .setup-provider-card__select`,
+  )?.click()
+  await nextTick()
+  await nextTick()
+  const dialog = document.body.querySelector<HTMLElement>('#setup-provider-editor-dialog')
+  expect(dialog).toBeTruthy()
+  return dialog!
 }
 
 beforeEach(() => {
@@ -246,13 +257,25 @@ beforeEach(() => {
 })
 
 describe('SetupProviderPanel — verify configuration', () => {
-  it('emits probeConnection when Verify current configuration is clicked', async () => {
+  it('emits a reachability probe when Check connection is clicked', async () => {
     const onProbeConnection = vi.fn()
     const { app, el } = await mountPanel({}, { onProbeConnection })
     const button = testButton(el)
     expect(button?.disabled).toBe(false)
     button?.click()
-    expect(onProbeConnection).toHaveBeenCalledTimes(1)
+    expect(onProbeConnection).toHaveBeenCalledWith('reachability')
+    app.unmount()
+  })
+
+  it('emits a model probe only from the explicit Test model action', async () => {
+    const onProbeConnection = vi.fn()
+    const { app, el } = await mountPanel({}, { onProbeConnection })
+    const modelButton = Array.from(el.querySelectorAll<HTMLButtonElement>('button'))
+      .find(button => button.textContent?.trim() === 'Test model')
+
+    modelButton?.click()
+
+    expect(onProbeConnection).toHaveBeenCalledWith('model')
     app.unmount()
   })
 
@@ -261,10 +284,13 @@ describe('SetupProviderPanel — verify configuration', () => {
     expect(testButton(noProvider.el)).toBeNull()
     noProvider.app.unmount()
 
-    const probing = await mountPanel({ connection: connection({ phase: 'probing' }) })
+    const probing = await mountPanel({
+      connection: connection({ phase: 'probing', probeMode: 'reachability' }),
+    })
     const button = testButton(probing.el)
-    expect(button?.disabled).toBe(true)
-    expect(button?.textContent).toContain('Verifying configuration')
+    expect(button?.disabled).toBe(false)
+    expect(button?.textContent).toContain('Cancel connection check')
+    expect(button?.getAttribute('aria-busy')).toBe('true')
     expect(probing.el.querySelector('.setup-connection__spinner')).toBeTruthy()
     probing.app.unmount()
   })
@@ -289,10 +315,10 @@ describe('SetupProviderPanel — verify configuration', () => {
     app.unmount()
   })
 
-  it('shows Configuration verified for the current editor settings when verified', async () => {
-    const { app, el } = await mountPanel({ connection: connection({ phase: 'verified' }) })
+  it('shows a successful model call for model-verified editor settings', async () => {
+    const { app, el } = await mountPanel({ connection: connection({ phase: 'model_verified' }) })
     const pill = el.querySelector('.setup-connection__actions .control-pill.control-pill--ok')
-    expect(pill?.textContent).toContain('Configuration verified')
+    expect(pill?.textContent).toContain('Model call succeeded')
     app.unmount()
   })
 
@@ -322,6 +348,127 @@ describe('SetupProviderPanel — verify configuration', () => {
     })
     expect(el.querySelector('.setup-connection__hint')?.textContent)
       .toContain('Couldn\'t list models — type a model id.')
+    app.unmount()
+  })
+})
+
+describe('SetupProviderPanel — visible verification dialog', () => {
+  it('uses separate probe modes and shows successful model timings in the teleported editor', async () => {
+    const onProbeConnection = vi.fn()
+    const { app, el } = await mountPanel({
+      connection: connection({
+        phase: 'model_verified',
+        verificationLevel: 'model_verified',
+        probeMode: 'model',
+        firstResponseMs: 123,
+        totalMs: 412,
+      }),
+    }, { onProbeConnection })
+    const dialog = await openConfiguredEditor(el)
+    const buttons = Array.from(dialog.querySelectorAll<HTMLButtonElement>('button'))
+    const reachability = buttons.find(button => button.textContent?.trim() === 'Check connection')
+    const model = buttons.find(button => button.textContent?.trim() === 'Test model')
+
+    expect(reachability).toBeTruthy()
+    expect(model).toBeTruthy()
+    reachability?.click()
+    model?.click()
+    expect(onProbeConnection).toHaveBeenNthCalledWith(1, 'reachability')
+    expect(onProbeConnection).toHaveBeenNthCalledWith(2, 'model')
+
+    const result = dialog.querySelector('.setup-provider-credential__compact-result')
+    expect(result?.textContent).toContain('Model call succeeded')
+    expect(result?.textContent).toContain('First model response · 123 ms')
+    expect(result?.textContent).toContain('Complete probe · 412 ms')
+    app.unmount()
+  })
+
+  it('shows timings for a failed model stream in the teleported editor', async () => {
+    const { app, el } = await mountPanel({
+      connection: connection({
+        phase: 'unreachable',
+        verificationLevel: 'reachable',
+        failureStage: 'model',
+        probeMode: 'model',
+        failureKind: 'malformed_response',
+        detail: 'provider stream ended before a terminal frame',
+        firstResponseMs: 25,
+        totalMs: 87,
+      }),
+    })
+    const dialog = await openConfiguredEditor(el)
+    const result = dialog.querySelector('.setup-provider-credential__compact-result')
+
+    expect(result?.textContent).toContain('Streaming response incompatible')
+    expect(result?.textContent).toContain('First model response · 25 ms')
+    expect(result?.textContent).toContain('Complete probe · 87 ms')
+    app.unmount()
+  })
+
+  it('cancels an active model probe from the teleported editor', async () => {
+    const onCancelProviderProbe = vi.fn()
+    const { app, el } = await mountPanel({
+      connection: connection({ phase: 'probing', probeMode: 'model' }),
+    }, { onCancelProviderProbe })
+    const dialog = await openConfiguredEditor(el)
+    const cancel = Array.from(dialog.querySelectorAll<HTMLButtonElement>('button'))
+      .find(button => button.textContent?.trim() === 'Cancel test')
+
+    expect(cancel?.getAttribute('aria-busy')).toBe('true')
+    cancel?.click()
+    expect(onCancelProviderProbe).toHaveBeenCalledOnce()
+    app.unmount()
+  })
+
+  it('keeps Save enabled after a model timeout replaces an existing provider', async () => {
+    const onSaveProvider = vi.fn()
+    const { app, el } = await mountPanel({
+      editingPrimary: false,
+      profileSaveSupported: false,
+      connection: connection({
+        phase: 'timed_out',
+        verificationLevel: 'none',
+        failureStage: 'model',
+        probeMode: 'model',
+        failureKind: 'probe_timeout',
+        detail: 'Model probe timed out.',
+        totalMs: 60_000,
+      }),
+    }, { onSaveProvider, dirty: true })
+    const dialog = await openConfiguredEditor(el)
+    const save = dialog.querySelector<HTMLButtonElement>('.setup-provider-modal__footer .btn--primary')
+
+    expect(dialog.textContent).toContain('Model response timed out · verification incomplete')
+    expect(save?.disabled).toBe(false)
+    save?.click()
+    expect(onSaveProvider).toHaveBeenCalledOnce()
+    app.unmount()
+  })
+
+  it('points a disabled model action at one visible description in the teleported editor', async () => {
+    const { app, el } = await mountPanel({
+      credentialPanel: {
+        ...(panel().credentialPanel as Record<string, unknown>),
+        probeReady: false,
+        probeDisabledReason: 'Choose a model before testing it.',
+        reachabilityReady: true,
+        reachabilityDisabledReason: '',
+        probeModesSupported: true,
+      },
+    })
+    const dialog = await openConfiguredEditor(el)
+    const model = Array.from(dialog.querySelectorAll<HTMLButtonElement>('button'))
+      .find(button => button.textContent?.trim() === 'Test model')
+    const descriptionId = model?.getAttribute('aria-describedby') || ''
+    const descriptions = Array.from(document.body.querySelectorAll<HTMLElement>(
+      `[id="${descriptionId}"]`,
+    ))
+
+    expect(descriptionId).not.toBe('')
+    expect(descriptions).toHaveLength(1)
+    expect(dialog.contains(descriptions[0])).toBe(true)
+    expect(descriptions[0]?.closest('[hidden]')).toBeNull()
+    expect(descriptions[0]?.textContent).toContain('Choose a model before testing it.')
     app.unmount()
   })
 })
@@ -622,7 +769,7 @@ describe('SetupProviderPanel — configured provider management', () => {
     expect(identityLabel).toContain('Credentials ready')
     expect(identityLabel).toContain('Not verified')
     expect(row.textContent).not.toContain('Configuration verified')
-    expect(test?.textContent?.trim()).toBe('Verify saved configuration')
+    expect(test?.textContent?.trim()).toBe('Test saved model')
     expect(test?.getAttribute('aria-describedby')).toBe('setup-provider-configured-desc')
     expect(el.querySelector('#setup-provider-configured-desc')?.textContent).toContain(
       'Testing sends one small model request.',
@@ -646,7 +793,7 @@ describe('SetupProviderPanel — configured provider management', () => {
       expect(secondaryRow.querySelectorAll('.setup-provider-card__actions button')).toHaveLength(2)
 
       const primaryMenu = await openProviderMenu(el, 'openai')
-      expect(primaryMenu.textContent).toContain('Verify saved configuration')
+      expect(primaryMenu.textContent).toContain('Test saved model')
       expect(primaryMenu.textContent).toContain('Delete')
       expect(primaryMenu.textContent).not.toContain('Edit')
       primaryMenu.querySelector<HTMLButtonElement>('[role="menuitem"]')?.click()
@@ -668,7 +815,7 @@ describe('SetupProviderPanel — configured provider management', () => {
       configuredProviders: [configured[0]],
       configuredProviderProbes: {
         openai: connection({
-          phase: 'verified',
+          phase: 'model_verified',
           firstResponseMs: 123,
           totalMs: 412,
         }),
@@ -676,7 +823,7 @@ describe('SetupProviderPanel — configured provider management', () => {
     })
     const row = el.querySelector<HTMLElement>('[data-provider-id="openai"]')!
 
-    expect(row.textContent).toContain('✓ Configuration verified')
+    expect(row.textContent).toContain('Model call succeeded')
     expect(row.textContent).toContain('First model response · 123 ms')
     expect(row.textContent).toContain('Complete probe · 412 ms')
     expect(row.textContent?.indexOf('First model response'))
@@ -1100,6 +1247,7 @@ describe('SetupProviderPanel — configured provider management', () => {
     expect(menu.querySelector('[aria-label="Edit DeepSeek"]')).toBeTruthy()
     menu.querySelector<HTMLButtonElement>('.setup-provider-card__test')!.click()
     await nextTick()
+    expect(onSelectConfiguredProvider).not.toHaveBeenCalled()
     expect(onProbeConfiguredProvider).toHaveBeenCalledWith('deepseek')
     expect(document.querySelector('.setup-provider-menu')).toBeNull()
     expect(document.activeElement).toBe(el.querySelector('[data-provider-id="deepseek"] [aria-haspopup="menu"]'))
@@ -1110,6 +1258,33 @@ describe('SetupProviderPanel — configured provider management', () => {
     expect(onSelectConfiguredProvider).not.toHaveBeenCalled()
     const activeMenu = await openProviderMenu(el, 'openai')
     expect(activeMenu.querySelector('.setup-provider-card__delete')).toBeTruthy()
+    app.unmount()
+  })
+
+  it('turns the configured-provider model action into Cancel while probing', async () => {
+    const onProbeConfiguredProvider = vi.fn()
+    const onCancelConfiguredProviderProbe = vi.fn()
+    const readyConfigured = configured.map(row => (
+      row.providerId === 'deepseek' ? { ...row, ready: true } : row
+    ))
+    const { app, el } = await mountPanel({
+      configuredProviders: readyConfigured,
+      configuredProviderProbes: {
+        deepseek: connection({ phase: 'probing', probeMode: 'model' }),
+      },
+    }, {
+      onProbeConfiguredProvider,
+      onCancelConfiguredProviderProbe,
+    })
+    const menu = await openProviderMenu(el, 'deepseek')
+    const action = menu.querySelector<HTMLButtonElement>('.setup-provider-card__test')
+
+    expect(action?.disabled).toBe(false)
+    expect(action?.textContent?.trim()).toContain('Cancel test')
+    expect(action?.getAttribute('aria-busy')).toBe('true')
+    action?.click()
+    expect(onCancelConfiguredProviderProbe).toHaveBeenCalledWith('deepseek')
+    expect(onProbeConfiguredProvider).not.toHaveBeenCalled()
     app.unmount()
   })
 
@@ -1324,7 +1499,7 @@ describe('SetupProviderPanel — configured provider management', () => {
     expect(el.contains(menu)).toBe(false)
     expect(menu.getAttribute('role')).toBe('menu')
     expect(Array.from(menu.querySelectorAll('[role="menuitem"]')).map(item => item.textContent?.trim()))
-      .toEqual(['Edit', 'Verify saved configuration', 'Delete'])
+      .toEqual(['Edit', 'Test saved model', 'Delete'])
     expect(menu.querySelector('[role="separator"]')).toBeTruthy()
     expect(menu.querySelector('.setup-provider-card__delete')?.getAttribute('aria-label')).toBe('Remove provider — DeepSeek')
     app.unmount()
@@ -1638,7 +1813,7 @@ describe('SetupProviderPanel — editor scope', () => {
       credentialPanel: {
         ...(panel().credentialPanel as Record<string, unknown>),
         providerLabel: 'DeepSeek',
-        probeButtonLabel: 'Verify current configuration',
+        probeButtonLabel: 'Test model',
       },
     })
 

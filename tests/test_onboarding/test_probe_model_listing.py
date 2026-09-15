@@ -11,7 +11,6 @@ three adapters that support it (offline, stubbed transport).
 from __future__ import annotations
 
 import asyncio
-import json
 from typing import Any
 
 import httpx
@@ -20,6 +19,7 @@ import pytest
 from opensquilla.provider.ollama import OllamaProvider
 from opensquilla.provider.openai import OpenAIProvider
 from opensquilla.provider.openai_responses import OpenAIResponsesProvider
+from opensquilla.provider.protocol import ProviderModelListingResponseError
 
 _ADAPTER_MODULES = {
     "openai": "opensquilla.provider.openai",
@@ -74,6 +74,15 @@ def _garbled() -> httpx.Response:
     )
 
 
+def _wrong_shape(module: str) -> httpx.Response:
+    collection = "models" if module == "ollama" else "data"
+    return httpx.Response(
+        200,
+        headers={"content-type": "application/json"},
+        json={collection: {"unexpected": "shape"}},
+    )
+
+
 @pytest.mark.parametrize("module", sorted(_ADAPTER_MODULES))
 def test_list_models_default_swallows_http_errors(monkeypatch: Any, module: str) -> None:
     _patch_response(monkeypatch, module, _unauthorized())
@@ -110,5 +119,17 @@ def test_list_models_opt_in_raises_transport_error(monkeypatch: Any, module: str
 @pytest.mark.parametrize("module", sorted(_ADAPTER_MODULES))
 def test_list_models_opt_in_raises_on_garbled_body(monkeypatch: Any, module: str) -> None:
     _patch_response(monkeypatch, module, _garbled())
-    with pytest.raises(json.JSONDecodeError):
+    with pytest.raises(ProviderModelListingResponseError) as excinfo:
         asyncio.run(_build(module).list_models(raise_on_error=True))
+    assert excinfo.value.status_code == 200
+
+
+@pytest.mark.parametrize("module", sorted(_ADAPTER_MODULES))
+def test_list_models_opt_in_preserves_status_for_wrong_shape(
+    monkeypatch: Any,
+    module: str,
+) -> None:
+    _patch_response(monkeypatch, module, _wrong_shape(module))
+    with pytest.raises(ProviderModelListingResponseError) as excinfo:
+        asyncio.run(_build(module).list_models(raise_on_error=True))
+    assert excinfo.value.status_code == 200
