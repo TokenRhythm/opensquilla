@@ -123,6 +123,60 @@ describe('useChatSessionRoute', () => {
     })
   })
 
+  it('recovers only the route-scoped draft for the same Agent and project', () => {
+    const key = 'agent:main:webchat:project-draft'
+    localStorage.setItem(`opensquilla.chat.draft:${key}`, 'project draft')
+    routeMock.query = { agent: 'main', project: 'project-a' }
+    const route = useChatSessionRoute(ref(''))
+
+    expect(route.resolveInitialSession({
+      scopedDraft: {
+        sessionKey: key,
+        agentId: 'main',
+        projectId: 'project-a',
+      },
+    })).toMatchObject({
+      sessionKey: key,
+      draft: true,
+      recoveredDraft: true,
+    })
+
+    const wrongProject = route.resolveInitialSession({
+      scopedDraft: {
+        sessionKey: key,
+        agentId: 'main',
+        projectId: 'project-b',
+      },
+    })
+    expect(wrongProject.sessionKey).not.toBe(key)
+    expect(wrongProject.recoveredDraft).toBe(false)
+
+    const wrongAgent = route.resolveInitialSession({
+      scopedDraft: {
+        sessionKey: key,
+        agentId: 'research',
+        projectId: 'project-a',
+      },
+    })
+    expect(wrongAgent.sessionKey).not.toBe(key)
+    expect(wrongAgent.recoveredDraft).toBe(false)
+  })
+
+  it('ignores a route-scoped draft key with no saved text', () => {
+    routeMock.query = { agent: 'main' }
+    const route = useChatSessionRoute(ref(''))
+
+    const initial = route.resolveInitialSession({
+      scopedDraft: {
+        sessionKey: 'agent:main:webchat:missing',
+        agentId: 'main',
+        projectId: '',
+      },
+    })
+    expect(initial.sessionKey).not.toBe('agent:main:webchat:missing')
+    expect(initial.recoveredDraft).toBe(false)
+  })
+
   it('keeps only the project id in a project draft route and can return to a default draft', () => {
     routeMock.query = { agent: 'main', project: 'project-a' }
     const route = useChatSessionRoute(ref(''))

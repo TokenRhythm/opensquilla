@@ -705,6 +705,8 @@ try {
   assert.equal(generatedCredential.encryptedApiKey, 'synthetic-credential-only-secret')
   assert.equal(generatedCredential.configAuthority, 'generated')
   assert.equal(generatedCredential.importTransactionId, '')
+  assert.equal(Object.hasOwn(generatedCredential, 'routerPresetBinding'), false)
+  assert.doesNotMatch(generatedConfig, /preset_binding\s*=/)
   const credentialOnlyTransactions = await readdir(
     join(credentialOnlyUserData, 'backups', 'profile-consolidation'),
   )

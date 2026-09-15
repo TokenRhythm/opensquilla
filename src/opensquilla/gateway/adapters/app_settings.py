@@ -155,6 +155,13 @@ class GatewayAppSettingsPort:
     profile_ids = legacy_profile_ids()
     replace = staticmethod(_update_config_in_place)
     reconcile_routing = staticmethod(reconcile_model_routing_write)
+
+    @staticmethod
+    def validate_routing(previous: Any, candidate: Any, explicit_paths: set[str]) -> None:
+        from opensquilla.onboarding.router_policy import validate_router_reactivation
+
+        validate_router_reactivation(previous, candidate, explicit_paths=explicit_paths)
+
     routing_snapshot = staticmethod(model_routing_public_snapshot)
     catalog_fingerprint = staticmethod(_live_catalog_fingerprint)
     resolve_provider = staticmethod(resolve_provider_selector_config)
@@ -274,7 +281,9 @@ class GatewayAppSettingsPort:
 
         await GatewayModelRoutingRuntimePort(
             self.provider_selector, self.subscription_manager
-        ).publish_changed(cast(ModelRoutingSnapshot, previous), candidate, source=self.source)
+        ).publish_changed(
+            cast(ModelRoutingSnapshot, previous), candidate, source=self.source, force=True
+        )
 
     async def reconcile_dream(self) -> bool | None:
         from opensquilla.gateway.dream_bridge import get_dream_reconciler

@@ -68,6 +68,11 @@ OFFLINE_MARKER_EXCLUSIONS = {
     "tests/test_skills/test_meta_skill_creator_smoke_live.py",
 }
 RECENTLY_ADDED_ACTIVE_TESTS = {
+    # Primary-provider and validator coverage use the declared provisional
+    # floor until a comparable three-run Windows refresh supplies measured timings.
+    "tests/contracts/test_gateway_validator_profiles.py",
+    "tests/test_desktop/test_router_provider_bridge.py",
+    "tests/test_gateway/test_router_recommended_reset.py",
     "tests/test_scripts/test_gateway_ux.py",
     "tests/test_engine/test_agent_autonomous_tool_recovery.py",
     "tests/test_engine/test_agent_connection_recovery.py",
@@ -315,6 +320,8 @@ RECENTLY_ADDED_ACTIVE_TESTS = {
     "tests/test_tools/test_edit_file_closest_hint.py",
     "tests/test_tools/test_patch_classification.py",
     "tests/test_tools/test_plan_access.py",
+    # Agent transcript search uses the provisional floor until a Windows refresh.
+    "tests/test_tools/test_session_search.py",
     "tests/test_tools/test_admin_audio_config.py",
     "tests/test_tools/test_admin_gateway_contract.py",
     "tests/test_tools/test_shell_self_kill_policy.py",

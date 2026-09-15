@@ -890,6 +890,8 @@ jobs:
           npm run test:live-html-harness
           node scripts/test-onboarding-flow-coordinator.mjs
           node scripts/test-onboarding-save-telemetry.mjs
+          node scripts/test-router-tier-normalization.mjs
+          node scripts/test-desktop-router-config.mjs
           node scripts/test-ci-case-telemetry.mjs
           node scripts/test-telemetry-consent.mjs
           node scripts/test-telemetry-early-spool.mjs
@@ -1591,6 +1593,11 @@ jobs:
         working-directory: desktop/electron
         shell: bash
         run: npm run build
+
+      - name: Verify compiled Desktop Router against Gateway provider mutations
+        env:
+          OPENSQUILLA_REQUIRE_DESKTOP_ROUTER_BRIDGE: '1'
+        run: uv run --no-sync pytest -q tests/test_desktop/test_router_provider_bridge.py
 
       - name: Run compiled Desktop recovery flows
         working-directory: desktop/electron

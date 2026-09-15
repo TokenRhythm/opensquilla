@@ -26,9 +26,7 @@ async def _handle_models_list(params: dict | None, ctx: RpcContext) -> dict[str,
     capabilities = query.get("capabilities")
     if capabilities is not None and not isinstance(capabilities, list):
         raise ValueError("params.capabilities must be an array")
-    catalog = ModelCatalog(
-        GatewayModelCatalogPort(ctx.provider_selector, ctx.config)
-    )
+    catalog = ModelCatalog(GatewayModelCatalogPort(ctx.provider_selector, ctx.config))
     return cast(
         dict[str, Any],
         await catalog.query(
@@ -74,6 +72,30 @@ async def _handle_models_routing_set(
     return cast(dict[str, Any], await _model_routing(ctx).set_mode(params["mode"]))
 
 
+async def _handle_models_routing_reset_recommended(
+    params: dict | None,
+    ctx: RpcContext,
+) -> dict[str, Any]:
+    from opensquilla.gateway.adapters.platform_configuration_contract import (
+        validate_reset_recommended_params,
+    )
+
+    params = validate_reset_recommended_params(params)
+    if not isinstance(params, dict) or not isinstance(params.get("providerId"), str):
+        raise ValueError("params.providerId is required")
+    if not params["providerId"].strip():
+        raise ValueError("params.providerId is required")
+    if not isinstance(params.get("activateRouter", False), bool):
+        raise ValueError("params.activateRouter must be a boolean")
+    return cast(
+        dict[str, Any],
+        await _model_routing(ctx).reset_recommended(
+            params["providerId"],
+            activate_router=params.get("activateRouter", False),
+        ),
+    )
+
+
 # Generated descriptors own identity/scope/validation for the contracted
 # Platform configuration methods.
 from opensquilla.gateway.adapters.platform_configuration_contract import (  # noqa: E402
@@ -88,6 +110,7 @@ _PLATFORM_CONFIGURATION_IMPLEMENTATIONS = {
     "models.list": _handle_models_list,
     "models.routing.get": _handle_models_routing_get,
     "models.routing.set": _handle_models_routing_set,
+    "models.routing.resetRecommended": _handle_models_routing_reset_recommended,
 }
 
 _PLATFORM_CONFIGURATION_CONTRACT_HANDLERS = {

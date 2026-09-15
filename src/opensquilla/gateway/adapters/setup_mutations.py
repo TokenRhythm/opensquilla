@@ -22,6 +22,7 @@ from opensquilla.application.profile_lifecycle import (
     ActivateProfile,
     ProfileMutationPort,
     RemoveActiveProfile,
+    UpsertAndActivateProfile,
     UpsertProfile,
 )
 from opensquilla.application.provider_credentials import (
@@ -79,6 +80,29 @@ class OnboardingSetupMutationPort(
             preserve_api_key=command.keep_current_secret,
             base_url=command.base_url,
             proxy=command.proxy,
+        )
+
+    def upsert_and_activate(
+        self, config: Any, command: UpsertAndActivateProfile
+    ) -> Any:
+        from opensquilla.onboarding.mutations import upsert_and_activate_llm_profile
+
+        return upsert_and_activate_llm_profile(
+            config,
+            provider_id=command.provider_id,
+            model=command.model,
+            api_key=command.api_key,
+            api_key_env=command.api_key_env,
+            api_key_env_pool=(
+                list(command.api_key_env_pool)
+                if command.api_key_env_pool is not None
+                else None
+            ),
+            preserve_api_key=command.keep_current_secret,
+            base_url=command.base_url,
+            proxy=command.proxy,
+            router_action=command.router_action,
+            image_generation_intent=command.image_generation_intent,
         )
 
     def activate(self, config: Any, command: ActivateProfile) -> Any:

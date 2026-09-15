@@ -24,9 +24,9 @@ from opensquilla.engine.steps.squilla_router import (
 from opensquilla.gateway.config import GatewayConfig
 from opensquilla.onboarding.mutations import (
     _cross_provider_tier_warnings,
-    _router_provider_conflicts,
     upsert_router,
 )
+from opensquilla.onboarding.router_policy import router_provider_conflicts
 from opensquilla.provider.model_catalog import DeploymentModelLimits, ModelCatalog
 from opensquilla.provider.selector import ModelSelector, ProviderConfig, SelectorConfig
 from opensquilla.router_tiers import (
@@ -494,7 +494,7 @@ def test_global_fixed_lineup_suppresses_provider_switch_conflicts_and_warnings()
         },
     )
 
-    assert _router_provider_conflicts(config, "tokenrhythm") == ("openai",)
+    assert router_provider_conflicts(config, "tokenrhythm") == ()
     warnings = _cross_provider_tier_warnings(
         tiers,
         "deepseek",
@@ -1611,12 +1611,16 @@ def test_cross_provider_warning_accepts_case_variant_profile_keys(monkeypatch) -
     assert warnings == []
 
 
-def test_upsert_router_surfaces_cross_provider_warning() -> None:
-    cfg = GatewayConfig()  # defaults: openrouter provider + openrouter tiers
+def test_upsert_router_surfaces_existing_cross_provider_warning() -> None:
+    # Maintaining an already-executable legacy ladder still reports its
+    # mismatch; newly introducing a foreign dependency requires consent.
+    tiers = {"c2": {"provider": "openai", "model": "gpt-5.5"}}
+    cfg = GatewayConfig(llm={"provider": "openrouter"})
+    cfg.squilla_router.tiers.update(tiers)
     res = upsert_router(
         cfg,
         mode="recommended",
-        tiers={"c2": {"provider": "openai", "model": "gpt-5.5"}},
+        tiers=tiers,
     )
     assert any("cross-provider" in w.lower() for w in res.warnings)
 
@@ -1693,7 +1697,7 @@ def test_synthesized_managed_preset_does_not_generate_negative_vision_claims() -
 def test_upsert_router_redacts_secret_like_tier_fields() -> None:
     # Tiers are untyped dicts: a hand-written api_key must not be echoed
     # back through the router-configure RPC response.
-    cfg = GatewayConfig()
+    cfg = GatewayConfig(llm={"provider": "openrouter"})
     res = upsert_router(
         cfg,
         mode="recommended",
@@ -1710,7 +1714,7 @@ def test_upsert_router_redacts_camel_and_kebab_tier_secrets() -> None:
     # Only three known display aliases are canonicalized on write, so an
     # apiKey/accessToken passes into the stored tier verbatim — the echo
     # redaction must match secret-shaped keys in any spelling.
-    cfg = GatewayConfig()
+    cfg = GatewayConfig(llm={"provider": "openrouter"})
     res = upsert_router(
         cfg,
         mode="recommended",
@@ -1737,7 +1741,7 @@ def test_upsert_router_redacts_camel_and_kebab_tier_secrets() -> None:
 def test_upsert_router_redacts_acronym_style_tier_secrets() -> None:
     # Acronym runs have no lowercase->uppercase boundary (APIKey, APIKEY):
     # the acronym rule and the separator-free fallback must still match.
-    cfg = GatewayConfig()
+    cfg = GatewayConfig(llm={"provider": "openrouter"})
     res = upsert_router(
         cfg,
         mode="recommended",

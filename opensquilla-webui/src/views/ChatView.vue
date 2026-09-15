@@ -893,6 +893,7 @@ import { META_RUN_CENTER_KEY, type MetaRunCenter } from '@/modules/metaRunCenter
 import { runStatusLabelText as sessionRunStatusLabelText } from '@/composables/useSessions'
 import {
   shouldCanonicalizeInitialDraftRoute,
+  type ScopedDraftHistoryState,
   useChatSessionRoute,
 } from '@/composables/chat/useChatSessionRoute'
 import {
@@ -6412,6 +6413,41 @@ function consumeDraftPrefill() {
   } catch { /* ignore */ }
 }
 
+function scopedDraftFromHistoryState(
+  state: Record<string, unknown> | null,
+): ScopedDraftHistoryState | null {
+  if (
+    typeof state?.draftSessionKey !== 'string'
+    || typeof state.draftAgentId !== 'string'
+    || typeof state.draftProjectId !== 'string'
+  ) return null
+  return {
+    sessionKey: state.draftSessionKey,
+    agentId: state.draftAgentId,
+    projectId: state.draftProjectId,
+  }
+}
+
+function persistDraftHistoryState() {
+  if (!isDraftRoute() || !sessionKey.value) return
+  try {
+    const state = window.history.state as Record<string, unknown> | null
+    const agentId = draftAgentId()
+    const projectId = readProjectFromUrl()
+    if (
+      state?.draftSessionKey === sessionKey.value
+      && state.draftAgentId === agentId
+      && state.draftProjectId === projectId
+    ) return
+    window.history.replaceState({
+      ...state,
+      draftSessionKey: sessionKey.value,
+      draftAgentId: agentId,
+      draftProjectId: projectId,
+    }, '')
+  } catch { /* ignore */ }
+}
+
 async function chooseProjectPath(path: string) {
   projectPickerOpen.value = false
   if (!gatewayAccess.canChooseProject) return
@@ -6630,17 +6666,25 @@ onMounted(async () => {
   const initialHistoryState = window.history.state as Record<string, unknown> | null
   const hasExplicitDraftPrefill = typeof initialHistoryState?.prefill === 'string'
     && initialHistoryState.prefill.length > 0
+  const scopedDraft = scopedDraftFromHistoryState(initialHistoryState)
+  const canRecoverDraft = !hasLegacyNewChatQuery() && !hasExplicitDraftPrefill
+  const initialSession = resolveInitialSession({
+    recoverDraft: canRecoverDraft,
+    scopedDraft,
+  })
   const explicitFreshTask = isDraftRoute() && Boolean(
-    readAgentFromUrl()
-    || readProjectFromUrl()
-    || hasLegacyNewChatQuery()
-    || hasExplicitDraftPrefill,
+    hasLegacyNewChatQuery()
+    || hasExplicitDraftPrefill
+    || (
+      (readAgentFromUrl() || readProjectFromUrl())
+      && !scopedDraft
+      && !initialSession.recoveredDraft
+    ),
   )
   if (explicitFreshTask) draftPersistence.discardRecentDraft()
   // Initialize session key. Without an explicit ?session= the view opens as a
   // draft, except for the one most-recent non-empty draft recovered on a cold
   // /chat/new entry. Explicit new-task handoffs always remain clean.
-  const initialSession = resolveInitialSession({ recoverDraft: !explicitFreshTask })
   sessionKey.value = initialSession.sessionKey
   bindTailLayoutObservers()
   let initialDraftProjectGeneration: number | null = null
@@ -6983,7 +7027,10 @@ watch(() => [route.path, route.query.agent, route.query.project], async () => {
 })
 
 watch(inputText, (value) => {
-  if (value.length > 0) markProvisionalDraftUsed()
+  if (value.length > 0) {
+    markProvisionalDraftUsed()
+    persistDraftHistoryState()
+  }
 }, { flush: 'sync' })
 
 watch(() => pendingAttachments.value.length, (count) => {
