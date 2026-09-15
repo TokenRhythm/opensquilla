@@ -2755,6 +2755,10 @@ class GatewayConfig(BaseSettings):
 
     @model_validator(mode="after")
     def _default_squilla_router_profile_for_direct_provider(self) -> GatewayConfig:
+        return self.initialize_router_profile_defaults()
+
+    def initialize_router_profile_defaults(self) -> GatewayConfig:
+        """Resolve implicit Router defaults after loading or enabling routing."""
         router = self.squilla_router
         if not router or not getattr(router, "enabled", False):
             return self

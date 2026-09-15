@@ -26,6 +26,7 @@ EXPECTED_PLATFORM_CONFIGURATION_METHODS = (
     "providers.status",
     "models.routing.get",
     "models.routing.set",
+    "models.routing.resetRecommended",
 )
 EXPECTED_CHANNEL_SETUP_METHODS = (
     "onboarding.channel.probe",

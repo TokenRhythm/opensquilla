@@ -786,6 +786,11 @@
       "memoryOptions": "Opciones de memoria"
     },
     "provider": {
+      "moreActions": "Más acciones de {provider}",
+      "routerOutcomeSynchronized": "Las recomendaciones del Router siguen al proveedor principal guardado.",
+      "routerOutcomePreserved": "Se conservaron los niveles guardados del Router.",
+      "routerOutcomeDisabled": "El enrutamiento de modelos está desactivado; se conservaron los niveles guardados.",
+      "primarySavedAdditionalFailed": "El proveedor se guardó, pero otros ajustes no pudieron guardarse. Revísalos antes de reintentar.",
       "title": "Proveedor",
       "pageTitle": "Servicio de modelos",
       "pageDesc": "Conecta proveedores y gestiona sus credenciales y modelos.",
@@ -794,6 +799,7 @@
       "configuredSummary": "{ready} de {count} listos. La prueba envía una pequeña solicitud.",
       "configuredDesc": "Los proveedores guardados siguen disponibles para el enrutamiento hasta que los elimines. La verificación de la configuración envía una solicitud breve al modelo con los ajustes guardados; el proveedor puede aplicar cargos.",
       "activeBadge": "Activo",
+      "currentPrimary": "Proveedor principal actual",
       "editingBadge": "Editando",
       "profileReady": "Credenciales listas",
       "profileNeedsCredentials": "Necesita credenciales",
@@ -1069,12 +1075,45 @@
       "modelProvenance": "Lista del proveedor en vivo · fuente de capacidades: {sources}",
       "modelMetadataProvenance": "Lista del proveedor en vivo · valores oficiales si están disponibles; si no, valores del catálogo",
       "modelMultimodal": "Multimodal",
-      "modelMultimodalTitle": "Admite entradas de imagen"
+      "modelMultimodalTitle": "Admite entradas de imagen",
+      "saveAndStart": "Guardar y empezar",
+      "saveAndMakeActive": "Guardar y establecer como principal",
+      "saveActivateUpgradeHint": "Actualiza el Gateway para guardar y activar el proveedor en una sola operación.",
+      "primaryRoleHint": "El proveedor principal gestiona las solicitudes directas predeterminadas y el respaldo. Las estrategias personalizadas conservan su configuración.",
+      "activationCredentialRequired": "Añade credenciales válidas antes de establecer este proveedor como principal.",
+      "routerConflictTitle": "Elige cómo gestionar las rutas existentes",
+      "routerConflictBody": "El Router guardado usa {conflicts}, en conflicto con {provider}. Las recomendaciones de {provider} reemplazan los niveles guardados y sin guardar. Si se ofrece, puedes desactivar el enrutamiento conservando los niveles. Cancelar mantiene el modo y los borradores.",
+      "routerUseRecommended": "Usar las rutas recomendadas del proveedor de destino",
+      "routerDisablePreserve": "Conservar las rutas y desactivar Router",
+      "alreadyActive": "El proveedor de destino ya es el principal. Este cambio de credenciales no se guardó.",
+      "primarySaveUncertain": "No se pudo confirmar el guardado. Se conservó el borrador. Comprueba la configuración antes de reintentar; un proveedor activo no confirma que se hayan guardado las credenciales."
     },
     "preset": {
       "modeCustom": "personalizado"
     },
     "modelStrategy": {
+      "summaryPrimary": "Proveedor principal guardado",
+      "summaryRouter": "Enrutamiento de modelos",
+      "summaryOn": "Activado",
+      "summaryOff": "Desactivado",
+      "bindingFollowPrimary": "Recomendado · sigue al principal",
+      "bindingCustom": "Niveles personalizados",
+      "bindingLegacy": "Niveles existentes · seguimiento no definido",
+      "resetRecommended": "Usar niveles recomendados de {provider}",
+      "resettingRecommended": "Actualizando niveles recomendados…",
+      "resetKeepsOff": "Actualiza los niveles; el enrutamiento sigue desactivado.",
+      "resetKeepsMode": "Reemplaza los niveles y mantiene el modo actual.",
+      "retainedDrafts": "Cambios de enrutamiento sin guardar",
+      "crossProviderDisabledMismatch": "Los niveles guardados usan otros proveedores; la ejecución entre proveedores está desactivada.",
+      "resetUpgradeHint": "Actualiza el Gateway para aplicar los niveles recomendados en una sola operación.",
+      "operationPending": "Hay otra operación de proveedor o enrutamiento en curso.",
+      "activationUpgradeHint": "Este Gateway no puede confirmar una activación segura del Router. Actualízalo para revisar y resolver los conflictos de proveedores.",
+      "savedRefreshFailed": "Guardado, pero no se pudieron actualizar los ajustes. Recárgalos antes de hacer otro cambio.",
+      "resultUncertain": "Se desconoce el resultado del guardado. Revisa los ajustes actualizados antes de reintentar.",
+      "resetTitle": "¿Usar niveles recomendados de {provider}?",
+      "resetBody": "¿Reemplazar las ediciones guardadas y sin guardar de los niveles del Router por las recomendaciones de {provider}? El modo y el interruptor del Router no cambian. Los demás ajustes sin guardar se conservan.",
+      "resetConfirm": "Reemplazar por recomendaciones",
+      "resetSaved": "Niveles recomendados de {provider} guardados; el modo no ha cambiado.",
       "title": "Enrutamiento de modelos",
       "desc": "Elige cómo se selecciona el modelo para cada solicitud.",
       "newSessionDefault": "Este es el valor predeterminado de los chats nuevos. Los chats existentes conservan su propio modo de enrutamiento.",
@@ -1093,7 +1132,7 @@
       "advancedDesc": "Nivel de respaldo y presentación del enrutado en el chat.",
       "visualModeLabel": "Estilo del panel de decisión de enrutamiento",
       "visualModeDesc": "Cómo se muestra la decisión de enrutado en las respuestas.",
-      "crossProviderNotice": "El routing entre proveedores está activo. Revisa cada nivel antes de guardar.",
+      "crossProviderNotice": "La ejecución entre proveedores está activada.",
       "cards": {
         "router": {
           "title": "Enrutamiento inteligente de modelos",
@@ -1753,7 +1792,10 @@
       "channelEnabled": "Canal activado. Se requiere reiniciar.",
       "channelEnabledLive": "Canal habilitado e iniciado.",
       "channelDisabled": "Canal desactivado. Se requiere reiniciar.",
-      "channelDisabledLive": "Canal deshabilitado y detenido."
+      "channelDisabledLive": "Canal deshabilitado y detenido.",
+      "providerSavedAndActivated": "Se guardó {provider} y se estableció como principal.",
+      "modelStrategyPartialSaved": "Se guardaron algunos ajustes. El cambio del proveedor principal no se completó; los cambios pendientes siguen en el formulario.",
+      "modelStrategyPartialSaveUncertain": "Se guardaron algunos ajustes. No se pudo confirmar el cambio del proveedor principal; comprueba el estado guardado. Los cambios pendientes siguen en el formulario."
     },
     "needs": {
       "noApiKey": "No se requiere clave API.",

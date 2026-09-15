@@ -191,6 +191,18 @@ import {
   type RouterTier,
 } from './router-tier-normalization.js'
 import {
+  desktopRouterConfigTomlLines,
+  desktopRouterConfigPreambleLines,
+  desktopRouterPreambleLineIndexes,
+  desktopTomlSectionNames,
+  normalizeRouterPresetBinding,
+  resolveDesktopRouterUpdate,
+  type DesktopRouterWriteIntent,
+  type RouterPresetBinding,
+} from './desktop-router-config.js'
+import { defaultRouterTiers, ROUTER_PROFILES } from './desktop-router-profiles.js'
+import type { DesktopPrimaryProviderChange } from './desktop-primary-provider-change.js'
+import {
   DESKTOP_RENDERER_ENTRY,
   DESKTOP_RENDERER_SCHEME,
   DESKTOP_RENDERER_URL,
@@ -290,6 +302,7 @@ interface DesktopConnection {
   routerMode: RouterMode
   routerDefaultTier: TextRouterTier
   routerTiers: Record<string, RouterTier>
+  routerPresetBinding?: RouterPresetBinding
   searchProvider: string
   searchApiKeyEnv: string
   encryptedSearchApiKey?: string
@@ -311,6 +324,7 @@ interface OnboardingPayload {
   routerMode?: unknown
   routerDefaultTier?: unknown
   routerTiers?: unknown
+  routerResetToRecommended?: unknown
   searchProvider?: unknown
   searchApiKey?: unknown
   disableNetworkObservability?: unknown
@@ -365,6 +379,7 @@ interface DesktopSettingsSnapshot {
   routerMode: RouterMode
   routerDefaultTier: TextRouterTier
   routerTiers: Record<string, RouterTier>
+  routerPresetBinding?: RouterPresetBinding
   searchProvider: string
   searchApiKeyEnv: string
   searchApiKeyConfigured: boolean
@@ -1713,7 +1728,6 @@ function canonicalTierKey(name: string): string {
   return LEGACY_TEXT_TIER_ALIASES[name] ?? name
 }
 const ROUTER_PROFILE_IDS = new Set(['tokenrhythm', 'openrouter', 'dashscope', 'deepseek', 'gemini', 'volcengine', 'openai', 'zhipu', 'moonshot'])
-const INLINE_ROUTER_PROFILE_IDS = new Set(['tokenrhythm'])
 const TOKENRHYTHM_REGISTER_URL = 'https://tokenrhythm.studio/register'
 const DESKTOP_ENSEMBLE_PROFILES: Record<StaticEnsembleSelectionMode, {
   provider: string
@@ -2085,141 +2099,6 @@ const SEARCH_PROVIDER_BY_ID = new Map(
   SEARCH_PROVIDER_CATALOG.map((provider) => [provider.providerId, provider]),
 )
 
-function textRouterProfile(
-  provider: string,
-  c0: string,
-  c1: string,
-  c2: string,
-  c3: string,
-  subject: string,
-): Record<string, RouterTier> {
-  return {
-    c0: { provider, model: c0, description: `${subject} fast route`, thinkingLevel: 'off' },
-    c1: { provider, model: c1, description: `${subject} balanced route`, thinkingLevel: 'low' },
-    c2: { provider, model: c2, description: `${subject} strong route`, thinkingLevel: 'medium' },
-    c3: { provider, model: c3, description: `${subject} highest route`, thinkingLevel: 'high' },
-  }
-}
-
-function minimaxRouterProfile(provider: string): Record<string, RouterTier> {
-  return textRouterProfile(
-    provider,
-    'MiniMax-M2.7',
-    'MiniMax-M2.7',
-    'MiniMax-M3',
-    'MiniMax-M3',
-    'MiniMax',
-  )
-}
-
-const ROUTER_PROFILES: Record<string, Record<string, RouterTier>> = {
-  tokenrhythm: {
-    c0: { provider: 'tokenrhythm', model: 'deepseek-v4-flash-0731', description: 'Fast DeepSeek V4 Flash 0731 route for simple work' },
-    c1: { provider: 'tokenrhythm', model: 'deepseek-v4-pro-0813', description: 'Default DeepSeek V4 Pro 0813 route for normal agent work' },
-    c2: { provider: 'tokenrhythm', model: 'kimi-k2.7-code', description: 'Strong Kimi 2.7 Code route for harder coding and analysis' },
-    c3: { provider: 'tokenrhythm', model: 'glm-5.2', description: 'Highest tier: shared B5 fusion; GLM 5.2 is retained for single-model C3 mode', ensembleEnabled: true },
-    image_model: { provider: 'tokenrhythm', model: 'kimi-k2.6', description: 'Vision route for image attachments', imageOnly: true },
-  },
-  openrouter: {
-    c0: { provider: 'openrouter', model: 'deepseek/deepseek-v4-flash', description: 'Fast everyday work', thinkingLevel: 'high' },
-    c1: { provider: 'openrouter', model: 'deepseek/deepseek-v4-pro', description: 'Balanced agent work', thinkingLevel: 'high' },
-    c2: { provider: 'openrouter', model: 'z-ai/glm-5.2', description: 'Complex reasoning', thinkingLevel: 'high' },
-    c3: { provider: 'openrouter', model: 'anthropic/claude-opus-4.8', description: 'Highest quality review and planning', thinkingLevel: 'high' },
-    image_model: { provider: 'openrouter', model: 'moonshotai/kimi-k2.6', description: 'Vision route for image attachments', imageOnly: true, thinkingLevel: 'medium' },
-  },
-  openai: {
-    c0: { provider: 'openai', model: 'gpt-5.4-nano', description: 'Fast simple work', thinkingLevel: 'none' },
-    c1: { provider: 'openai', model: 'gpt-5.4-mini', description: 'Balanced agent work', thinkingLevel: 'low' },
-    c2: { provider: 'openai', model: 'gpt-5.5', description: 'Complex text tasks', thinkingLevel: 'medium' },
-    c3: { provider: 'openai', model: 'gpt-5.5', description: 'Deep review and analysis', thinkingLevel: 'high' },
-  },
-  dashscope: {
-    c0: { provider: 'dashscope', model: 'qwen3.6-flash', description: 'Fast simple work' },
-    c1: { provider: 'dashscope', model: 'qwen3.7-plus', description: 'Balanced agent work' },
-    c2: { provider: 'dashscope', model: 'qwen3.7-max', description: 'Complex text tasks' },
-    c3: { provider: 'dashscope', model: 'qwen3.7-max', description: 'Deep reasoning' },
-  },
-  deepseek: {
-    c0: { provider: 'deepseek', model: 'deepseek-v4-flash', description: 'Fast simple work' },
-    c1: { provider: 'deepseek', model: 'deepseek-v4-flash', description: 'Balanced agent work' },
-    c2: { provider: 'deepseek', model: 'deepseek-v4-pro', description: 'Complex text tasks' },
-    c3: { provider: 'deepseek', model: 'deepseek-v4-pro', description: 'Deep reasoning' },
-  },
-  gemini: {
-    c0: { provider: 'gemini', model: 'gemini-3.1-flash-lite', description: 'Fast simple work' },
-    c1: { provider: 'gemini', model: 'gemini-3.5-flash', description: 'Balanced agent work', thinkingLevel: 'low' },
-    c2: { provider: 'gemini', model: 'gemini-3.1-pro-preview', description: 'Complex text tasks', thinkingLevel: 'medium' },
-    c3: { provider: 'gemini', model: 'gemini-3.1-pro-preview', description: 'Deep reasoning', thinkingLevel: 'high' },
-  },
-  moonshot: {
-    c0: { provider: 'moonshot', model: 'kimi-k2.6', description: 'Fast multimodal work', thinkingLevel: 'low' },
-    c1: { provider: 'moonshot', model: 'kimi-k2.6', description: 'Balanced multimodal work', thinkingLevel: 'medium' },
-    c2: { provider: 'moonshot', model: 'kimi-k2.6', description: 'Complex text and image work', thinkingLevel: 'medium' },
-    c3: { provider: 'moonshot', model: 'kimi-k2.7-code', description: 'Code-heavy deep reasoning', thinkingLevel: 'high' },
-  },
-  kimi_coding_openai: textRouterProfile(
-    'kimi_coding_openai',
-    'kimi-for-coding',
-    'kimi-for-coding',
-    'kimi-for-coding',
-    'kimi-for-coding',
-    'Kimi Coding',
-  ),
-  kimi_coding_anthropic: textRouterProfile(
-    'kimi_coding_anthropic',
-    'kimi-for-coding',
-    'kimi-for-coding',
-    'kimi-for-coding',
-    'kimi-for-coding',
-    'Kimi Coding',
-  ),
-  volcengine: {
-    c0: { provider: 'volcengine', model: 'doubao-seed-2-0-lite-260215', description: 'Fast simple work' },
-    c1: { provider: 'volcengine', model: 'doubao-seed-2-0-lite-260215', description: 'Balanced agent work' },
-    c2: { provider: 'volcengine', model: 'doubao-seed-2-0-pro-260215', description: 'Complex text tasks' },
-    c3: { provider: 'volcengine', model: 'doubao-seed-2-0-pro-260215', description: 'Deep review and analysis' },
-  },
-  volcengine_coding_plan: textRouterProfile(
-    'volcengine_coding_plan',
-    'doubao-seed-2.0-lite',
-    'doubao-seed-2.0-pro',
-    'doubao-seed-2.0-code',
-    'doubao-seed-2.0-code',
-    'Volcengine Coding Plan',
-  ),
-  zhipu: {
-    c0: { provider: 'zhipu', model: 'glm-5-turbo', description: 'Fast simple work' },
-    c1: { provider: 'zhipu', model: 'glm-5', description: 'Balanced agent work' },
-    c2: { provider: 'zhipu', model: 'glm-5.1', description: 'Complex text tasks' },
-    c3: { provider: 'zhipu', model: 'glm-5.2', description: 'Deep reasoning', thinkingLevel: 'high' },
-  },
-  minimax: minimaxRouterProfile('minimax'),
-  minimax_cn: minimaxRouterProfile('minimax_cn'),
-  minimax_global: minimaxRouterProfile('minimax_global'),
-  minimax_coding_openai: minimaxRouterProfile('minimax_coding_openai'),
-  minimax_coding_anthropic: minimaxRouterProfile('minimax_coding_anthropic'),
-  mimo_openai: textRouterProfile(
-    'mimo_openai',
-    'mimo-v2.5',
-    'mimo-v2.5',
-    'mimo-v2.5-pro',
-    'mimo-v2.5-pro',
-    'MiMo',
-  ),
-  mimo_anthropic: textRouterProfile(
-    'mimo_anthropic',
-    'mimo-v2.5',
-    'mimo-v2.5',
-    'mimo-v2.5-pro',
-    'mimo-v2.5-pro',
-    'MiMo',
-  ),
-}
-
-function cloneRouterTiers(tiers: Record<string, RouterTier>): Record<string, RouterTier> {
-  return Object.fromEntries(Object.entries(tiers).map(([name, tier]) => [name, { ...tier }]))
-}
-
 function providerDefaults(provider: string): { model: string; baseUrl: string; apiKeyEnv: string; requiresApiKey: boolean; routerSupported: boolean } {
   const defaults = PROVIDER_BY_ID.get(provider) || PROVIDER_BY_ID.get('openrouter')!
   return {
@@ -2285,12 +2164,6 @@ function routerModeForModelRoutingMode(mode: ModelRoutingMode, provider: string)
   return normalizeRouterMode('recommended', provider)
 }
 
-function defaultRouterTiers(provider: string, mode: RouterMode): Record<string, RouterTier> {
-  if (mode === 'disabled') return {}
-  if (mode === 'openrouter-mix') return cloneRouterTiers(ROUTER_PROFILES.openrouter)
-  return cloneRouterTiers(ROUTER_PROFILES[provider] || ROUTER_PROFILES.openrouter)
-}
-
 function routerDefaultModel(tiers: Record<string, RouterTier>, defaultTier: TextRouterTier): string {
   return tiers[defaultTier]?.model || tiers.c1?.model || tiers.c0?.model || ''
 }
@@ -2330,41 +2203,6 @@ function inlineScriptJson(value: unknown): string {
     .replace(/</g, '\\u003c')
     .replace(/\u2028/g, '\\u2028')
     .replace(/\u2029/g, '\\u2029')
-}
-
-function routerTierTomlLines(name: string, tier: RouterTier): string[] {
-  const lines = [
-    `[squilla_router.tiers.${name}]`,
-    `provider = ${tomlString(tier.provider)}`,
-    `model = ${tomlString(tier.model)}`,
-  ]
-  if (tier.description) lines.push(`description = ${tomlString(tier.description)}`)
-  if (tier.imageOnly !== undefined) lines.push(`image_only = ${tier.imageOnly ? 'true' : 'false'}`)
-  if (tier.thinkingLevel) lines.push(`thinking_level = ${tomlString(tier.thinkingLevel)}`)
-  if (tier.ensembleEnabled !== undefined) lines.push(`ensemble_enabled = ${tier.ensembleEnabled ? 'true' : 'false'}`)
-  return lines
-}
-
-function routerConfigTomlLines(credential: DesktopConnection): string[] {
-  if (credential.routerMode === 'disabled') {
-    return [
-      '[squilla_router]',
-      'enabled = false',
-    ]
-  }
-  const tierLines = Object.entries(credential.routerTiers)
-    .filter(([, tier]) => tier.provider && tier.model)
-    .flatMap(([name, tier]) => ['', ...routerTierTomlLines(name, tier)])
-  return [
-    '[squilla_router]',
-    'enabled = true',
-    'rollout_phase = "full"',
-    `default_tier = ${tomlString(credential.routerDefaultTier)}`,
-    ...(credential.routerMode === 'recommended' && !INLINE_ROUTER_PROFILE_IDS.has(credential.provider)
-      ? [`tier_profile = ${tomlString(credential.provider)}`]
-      : []),
-    ...tierLines,
-  ]
 }
 
 function ensembleConfigTomlLines(credential: DesktopConnection): string[] {
@@ -2736,6 +2574,8 @@ function normalizeDesktopCredential(parsed: Partial<DesktopConnection>): Desktop
     routerMode,
     routerDefaultTier,
     routerTiers,
+    ...(normalizeRouterPresetBinding(parsed.routerPresetBinding)
+      ? { routerPresetBinding: normalizeRouterPresetBinding(parsed.routerPresetBinding) } : {}),
     searchProvider,
     searchApiKeyEnv: parsed.searchApiKeyEnv || searchDefaults.envKey,
     encryptedSearchApiKey: parsed.encryptedSearchApiKey || '',
@@ -2759,6 +2599,7 @@ const DESKTOP_CREDENTIAL_CONFIGURATION_FIELDS = [
   'routerMode',
   'routerDefaultTier',
   'routerTiers',
+  'routerPresetBinding',
   'searchProvider',
   'searchApiKeyEnv',
   'encryptedSearchApiKey',
@@ -2989,23 +2830,46 @@ async function saveDesktopCredential(
     : hasRouterMode
       ? undefined
       : existing?.modelRoutingMode
-  const modelRoutingMode = normalizeModelRoutingMode(rawModelRoutingMode, provider, legacyRouterMode)
-  const routerMode = routerModeForModelRoutingMode(modelRoutingMode, provider)
-  const routerDefaultTier = normalizeTextTier(payload.routerDefaultTier ?? existing?.routerDefaultTier)
-  const defaultTiers = defaultRouterTiers(provider, routerMode)
-  const existingTiers = existing && existing.provider === provider && existing.routerMode === routerMode
-    ? existing.routerTiers
-    : defaultTiers
-  const routerTiers = normalizeRouterTiers(payload.routerTiers ?? existingTiers, defaultTiers)
+  let modelRoutingMode = normalizeModelRoutingMode(rawModelRoutingMode, provider, legacyRouterMode)
+  let routerMode = routerModeForModelRoutingMode(modelRoutingMode, provider)
+  let routerUpdate = resolveDesktopRouterUpdate({
+    payload,
+    existing,
+    routerMode,
+    routerDefaultTier: normalizeTextTier(payload.routerDefaultTier ?? existing?.routerDefaultTier),
+    // A disabled Router retains its ladder for re-enabling. Defaults used for
+    // genuine fresh creation/reset are generated only in this trusted process.
+    defaultTiers: defaultRouterTiers(provider, normalizeRouterMode('recommended', provider)),
+    freshConfig: completingOnboarding && existing === null && existingConfigRaw === null,
+    providerChangedWithoutConfig: existingConfigRaw === null && existing !== null && existing.provider !== provider,
+  })
+  let primaryChange: DesktopPrimaryProviderChange | null = null
+  if (payload.provider !== undefined && existingConfigRaw !== null) {
+    const { prepareDesktopPrimaryProviderChange } = await import('./desktop-primary-provider-change.js')
+    primaryChange = prepareDesktopPrimaryProviderChange({
+      existingRaw: existingConfigRaw,
+      provider,
+      defaultTiers: defaultRouterTiers(provider, normalizeRouterMode('recommended', provider)),
+      requestedRouter: routerUpdate,
+      ...(hasModelRoutingMode || hasRouterMode ? { requestedMode: modelRoutingMode } : {}),
+    })
+    if (primaryChange) {
+      routerUpdate = { ...primaryChange.router, writeIntent: 'preserve' }
+      routerMode = primaryChange.router.routerMode as RouterMode
+      modelRoutingMode = primaryChange.modelRoutingMode
+    }
+  }
+  const providerChanged = primaryChange !== null || (existing !== null && existing.provider !== provider)
+  const { routerDefaultTier, routerTiers, routerPresetBinding } = routerUpdate
   const searchProvider = normalizeSearchProvider(payload.searchProvider ?? existing?.searchProvider)
   const searchDefaults = searchProviderDefaults(searchProvider)
   const apiKey = String(payload.apiKey || '').trim()
   const routerModel = routerDefaultModel(routerTiers, routerDefaultTier)
-  const directModel = String(payload.model || existing?.model || defaults.model).trim()
-  const model = routerMode === 'disabled'
+  const directModel = String(payload.model || (!providerChanged && existing?.model) || defaults.model).trim()
+  const model = routerMode === 'disabled' || (primaryChange && routerPresetBinding !== 'follow_primary')
     ? directModel
     : routerModel || directModel
-  const baseUrl = String(payload.baseUrl || existing?.baseUrl || defaults.baseUrl).trim() || defaults.baseUrl
+  const baseUrl = String(payload.baseUrl || (!providerChanged && existing?.baseUrl) || defaults.baseUrl).trim() || defaults.baseUrl
   const searchApiKey = String(payload.searchApiKey || '').trim()
   const resolvedApiKey = apiKey || (existing && provider === existing.provider ? decryptApiKey(existing) : '')
   const resolvedSearchApiKey = searchDefaults.requiresApiKey
@@ -3032,7 +2896,8 @@ async function saveDesktopCredential(
     : null
 
   if (defaults.requiresApiKey && !encryptedApiKey) throw new Error('API key is required.')
-  if (modelRoutingMode === 'llm_ensemble' && !modelRoutingModeAllowed(modelRoutingMode, provider)) {
+  if (modelRoutingMode === 'llm_ensemble' && !modelRoutingModeAllowed(modelRoutingMode, provider)
+    && !(primaryChange && !hasModelRoutingMode && !hasRouterMode)) {
     throw new Error('LLM Ensemble requires OpenRouter or TokenRhythm in desktop onboarding.')
   }
   if (!routerModel && routerMode !== 'disabled') throw new Error('Router tiers require a default model.')
@@ -3058,6 +2923,7 @@ async function saveDesktopCredential(
     routerMode,
     routerDefaultTier,
     routerTiers,
+    ...(routerPresetBinding ? { routerPresetBinding } : {}),
     searchProvider,
     searchApiKeyEnv: searchDefaults.envKey,
     encryptedSearchApiKey,
@@ -3091,6 +2957,8 @@ async function saveDesktopCredential(
       writerReserved,
       configLocale,
       consentOverride,
+      routerUpdate.writeIntent,
+      primaryChange,
     )
     await runDesktopTelemetryConsentSideEffect(
       'post_commit',
@@ -3221,8 +3089,9 @@ async function saveImportedDesktopCredential(
   }
 }
 
-// Sections the desktop config template owns and regenerates from the credential
-// on every write. Everything else in config.toml is treated as foreign
+// Sections the Desktop template emits. Router writes additionally require
+// explicit intent; otherwise its actual config subtree is preserved. Everything
+// else in config.toml is treated as foreign
 // (Control-UI/RPC-owned) and preserved verbatim across regenerations.
 const DESKTOP_OWNED_CONFIG_SECTIONS = ['llm', 'squilla_router', 'llm_ensemble', 'privacy', 'control_ui']
 // Top-level (pre-section) keys the desktop template emits itself. Any OTHER
@@ -3233,7 +3102,7 @@ const DESKTOP_OWNED_CONFIG_PREAMBLE_KEYS = ['search_provider', 'search_api_key_e
 
 function isDesktopOwnedConfigSection(header: string): boolean {
   const name = header.trim()
-  return DESKTOP_OWNED_CONFIG_SECTIONS.some((owned) => name === owned || name.startsWith(`${owned}.`))
+  return DESKTOP_OWNED_CONFIG_SECTIONS.some((owned) => name === owned || name.startsWith(`${owned}\u0000`))
 }
 
 // Return the lines of every top-level section that the desktop template does not
@@ -3242,11 +3111,12 @@ function isDesktopOwnedConfigSection(header: string): boolean {
 function foreignConfigSectionLines(raw: string): string[] {
   const out: string[] = []
   let keeping = false
-  for (const rawLine of raw.split(/\r?\n/)) {
-    const header = rawLine.trim().match(/^\[+\s*([^\]]+?)\s*\]+$/)
-    if (header) keeping = !isDesktopOwnedConfigSection(header[1] ?? '')
+  const sections = desktopTomlSectionNames(raw)
+  raw.split(/\r?\n/).forEach((rawLine, index) => {
+    const header = sections[index]
+    if (header !== null && header !== undefined) keeping = !isDesktopOwnedConfigSection(header)
     if (keeping) out.push(rawLine)
-  }
+  })
   while (out.length && out[out.length - 1].trim() === '') out.pop()
   return out
 }
@@ -3255,14 +3125,16 @@ function foreignConfigSectionLines(raw: string): string[] {
 // NOT emit itself, so RPC-written global scalars (llm_request_timeout_seconds,
 // log_level, workspace_dir, diagnostics_enabled, …) survive a regeneration. These
 // must be re-emitted in the preamble (before any [section]) to stay top-level.
-function foreignConfigPreambleLines(raw: string): string[] {
+function foreignConfigPreambleLines(raw: string, excludedKeys: readonly string[] = []): string[] {
   const out: string[] = []
-  for (const rawLine of raw.split(/\r?\n/)) {
+  const routerLines = desktopRouterPreambleLineIndexes(raw)
+  for (const [index, rawLine] of raw.split(/\r?\n/).entries()) {
+    if (routerLines.has(index)) continue
     if (/^\s*\[/.test(rawLine)) break // reached the first section header
     const key = rawLine.match(/^\s*(?:([A-Za-z0-9_-]+)|"([A-Za-z0-9_-]+)"|'([A-Za-z0-9_-]+)')\s*=/)
     if (!key) continue // blank line or comment
     const keyName = key[1] || key[2] || key[3] || ''
-    if (DESKTOP_OWNED_CONFIG_PREAMBLE_KEYS.includes(keyName)) continue
+    if (DESKTOP_OWNED_CONFIG_PREAMBLE_KEYS.includes(keyName) || excludedKeys.includes(keyName)) continue
     out.push(rawLine)
   }
   return out
@@ -3321,6 +3193,8 @@ function renderDesktopConfigAfterPreflight(
   existingRaw: string | null,
   defaultLocale: DesktopLocale,
   consentOverride: DesktopTelemetryConsent | null = null,
+  routerWriteIntent: DesktopRouterWriteIntent = 'preserve',
+  primaryChange: DesktopPrimaryProviderChange | null = null,
 ): string {
   // Retain the legacy privacy writer as the no-scoped-consent path. The
   // scoped writer extends it only when an explicit v2 decision exists.
@@ -3330,7 +3204,7 @@ function renderDesktopConfigAfterPreflight(
   const preservedControlUiLocale = persistedControlUiDefaultLocale(existingRaw)
   if (existingRaw !== null) {
     preservedForeignSections = foreignConfigSectionLines(existingRaw)
-    preservedForeignPreamble = foreignConfigPreambleLines(existingRaw)
+    preservedForeignPreamble = foreignConfigPreambleLines(existingRaw, primaryChange ? ['llm', 'llm_ensemble'] : [])
   }
   const hasPersistedState = preservedForeignPreamble.some((line) => (
     /^\s*(?:state_dir|"state_dir"|'state_dir')\s*=/.test(line)
@@ -3343,6 +3217,7 @@ function renderDesktopConfigAfterPreflight(
     `search_provider = ${tomlString(credential.searchProvider)}`,
     ...(credential.searchApiKeyEnv ? [`search_api_key_env = ${tomlString(credential.searchApiKeyEnv)}`] : []),
     ...preservedForeignPreamble,
+    ...(primaryChange?.routerPreamble ?? desktopRouterConfigPreambleLines(credential, existingRaw, routerWriteIntent)),
     '',
     '[llm]',
     `provider = ${tomlString(credential.provider)}`,
@@ -3350,8 +3225,8 @@ function renderDesktopConfigAfterPreflight(
     ...(credential.apiKeyEnv ? [`api_key_env = ${tomlString(credential.apiKeyEnv)}`] : []),
     `base_url = ${tomlString(credential.baseUrl)}`,
     '',
-    ...routerConfigTomlLines(credential),
-    ...ensembleConfigTomlLines(credential),
+    ...(primaryChange?.routerLines ?? desktopRouterConfigTomlLines(credential, existingRaw, routerWriteIntent)),
+    ...(primaryChange?.ensembleLines ?? ensembleConfigTomlLines(credential)),
     ...(consentOverride === null
       && parseDesktopTelemetryConsent(existingRaw).reliability.enabled === null
       && parseDesktopTelemetryConsent(existingRaw).growth.enabled === null
@@ -3376,6 +3251,8 @@ async function applyDesktopSettingsPair(
   writerReserved = false,
   defaultLocale = desktopLocale,
   consentOverride: DesktopTelemetryConsent | null = null,
+  routerWriteIntent: DesktopRouterWriteIntent = 'preserve',
+  primaryChange: DesktopPrimaryProviderChange | null = null,
 ): Promise<RecoveryProtocolResult> {
   const targetProfileKey = desktopProfileKey(profile)
   if (desktopProfileKey() !== targetProfileKey) {
@@ -3393,6 +3270,9 @@ async function applyDesktopSettingsPair(
     }
     const inspection = await preflightDesktopConfigWrite(profile)
     const expectedConfig = await readOptionalDesktopText(join(profile.home, 'config.toml'))
+    if (primaryChange && expectedConfig !== primaryChange.expectedConfig) {
+      throw new Error('Configuration changed while the provider switch was being prepared; retry.')
+    }
     const currentCredential = await readOptionalDesktopText(profile.credentialPath)
     if (currentCredential !== expectedCredential) {
       throw new Error('Desktop credential changed while settings were being prepared; retry.')
@@ -3404,6 +3284,8 @@ async function applyDesktopSettingsPair(
       expectedConfig,
       defaultLocale,
       consentOverride,
+      routerWriteIntent,
+      primaryChange,
     )
     const result = await runRecoveryCli(
       profile,
@@ -3487,6 +3369,8 @@ function settingsSnapshot(connection: DesktopConnection | null): DesktopSettings
     routerMode,
     routerDefaultTier,
     routerTiers,
+    ...(normalizeRouterPresetBinding(connection?.routerPresetBinding)
+      ? { routerPresetBinding: normalizeRouterPresetBinding(connection?.routerPresetBinding) } : {}),
     searchProvider,
     searchApiKeyEnv: connection?.searchApiKeyEnv || searchDefaults.envKey,
     searchApiKeyConfigured: Boolean(connection?.encryptedSearchApiKey),
@@ -5506,13 +5390,6 @@ function onboardingHtml(
       display: grid;
       place-items: center;
     }
-    .deck > .error {
-      position: absolute;
-      left: 32px;
-      right: 32px;
-      bottom: 20px;
-      z-index: 3;
-    }
     [hidden] {
       display: none !important;
     }
@@ -6711,6 +6588,7 @@ function onboardingHtml(
           </div>
           <span class="field-error" id="telemetryConsentError" role="alert" aria-live="polite"></span>
         </section>
+        <div class="error" id="error" role="alert" aria-live="assertive" tabindex="-1"></div>
         </div>
         <footer class="actions">
           <button class="secondary" type="button" id="cancel" data-i18n="onboarding.step1.quit">${ot('onboarding.step1.quit')}</button>
@@ -6718,7 +6596,6 @@ function onboardingHtml(
           <button class="primary" type="button" id="finish" data-i18n="onboarding.step5.finish">${ot('onboarding.step5.finish')}</button>
         </footer>
       </section>
-      <div class="error" id="error" role="alert" aria-live="assertive" tabindex="-1"></div>
     </form>
   </main>
   <script>
@@ -6740,11 +6617,9 @@ function onboardingHtml(
     }
     const providers = ${inlineScriptJson(PROVIDER_CATALOG)};
     const searchProviders = ${inlineScriptJson(SEARCH_PROVIDER_CATALOG)};
-    const routerProfiles = ${inlineScriptJson(ROUTER_PROFILES)};
     const initialProviderPrefill = ${inlineScriptJson(pendingProviderSetup)};
     let searchPaidOpen = false;
     let searchSectionOpen = false;
-    let routerTiers = clone(routerProfiles.openrouter);
     let modelEditorOpen = false;
     let submitting = false;
     const SUBMIT_SLOW_FEEDBACK_MS = 8_000;
@@ -6786,9 +6661,6 @@ function onboardingHtml(
     const providerSelectedBadges = document.getElementById('providerSelectedBadges');
     const providerSelectPanel = document.getElementById('providerSelectPanel');
     const providerOptions = document.getElementById('providerOptions');
-    function clone(value) {
-      return JSON.parse(JSON.stringify(value || {}));
-    }
     function deepFreeze(value) {
       if (!value || typeof value !== 'object' || Object.isFrozen(value)) return value;
       Object.values(value).forEach((item) => deepFreeze(item));
@@ -6804,8 +6676,6 @@ function onboardingHtml(
         model: model.value,
         modelRoutingMode: modelRoutingMode.value,
         routerMode: routerMode.value,
-        routerDefaultTier: 'c1',
-        routerTiers: clone(routerTiers),
         searchProvider: searchProvider.value,
         searchApiKey: searchApiKey.value,
         reliabilityDiagnosticsEnabled: reliabilityChoice && reliabilityChoice.value === 'true',
@@ -6835,9 +6705,6 @@ function onboardingHtml(
       modelEditDone.textContent = t.doneEditingModel;
       modelEditDone.disabled = !value;
     }
-	    function profileKeyForMode() {
-	      return provider.value;
-	    }
 	    function syncProviderDefaults(resetRouter) {
 	      const selected = currentProvider();
 	      apiKeyRequiredMarker.hidden = !selected.requiresApiKey;
@@ -6855,7 +6722,6 @@ function onboardingHtml(
 	      if (resetRouter) {
 	        modelRoutingMode.value = defaultModelRoutingModeFor(selected);
 	        syncRouterModeFromModelRouting();
-	        routerTiers = clone(routerProfiles[profileKeyForMode()]);
 	      }
 	      const modelRequired = modelRoutingMode.value === 'direct';
       modelRequiredMarker.hidden = !modelRequired;
@@ -8390,6 +8256,7 @@ async function adoptConsolidatedDesktopCredential(
           'encryptedApiKey',
           'modelRoutingMode',
           'routerMode',
+          'routerPresetBinding',
           'routerDefaultTier',
           'searchProvider',
           'searchApiKeyEnv',

@@ -697,6 +697,14 @@
     },
     {
       "kind": "method",
+      "wireName": "models.routing.resetRecommended",
+      "roles": [
+        "params",
+        "result"
+      ]
+    },
+    {
+      "kind": "method",
       "wireName": "onboarding.audio.configure",
       "roles": [
         "result"
@@ -797,6 +805,14 @@
       "kind": "method",
       "wireName": "onboarding.llmProfile.upsert",
       "roles": [
+        "result"
+      ]
+    },
+    {
+      "kind": "method",
+      "wireName": "onboarding.llmProfile.upsertAndActivate",
+      "roles": [
+        "params",
         "result"
       ]
     },

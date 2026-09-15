@@ -586,6 +586,10 @@ export function useSetupRouterForm() {
     routerVisualMode.value = normalizeRouterVisualMode(value)
   }
 
+  function acceptSavedVisualMode(value: unknown) {
+    visualModeBaseline.value = normalizeRouterVisualMode(value)
+  }
+
   function payload(): ConfigureRouter {
     const mode = routerMode.value === 'disabled'
       ? 'disabled'
@@ -595,10 +599,7 @@ export function useSetupRouterForm() {
           ? 'recommended'
           : 'custom'
     const body = buildRouterPayload(mode, routerDefaultTier.value, tierValues.value)
-    if (hasMixedTierProviders.value) {
-      body.crossProviderTiers = true
-      body.tierProviderMismatch = 'veto'
-    } else if (crossProviderTiers.value) {
+    if (crossProviderTiers.value) {
       body.crossProviderTiers = true
       body.tierProviderMismatch = tierProviderMismatch.value
     }
@@ -664,6 +665,7 @@ export function useSetupRouterForm() {
     enableFromSavedBinding,
     setRouterDefaultTier,
     setRouterVisualMode,
+    acceptSavedVisualMode,
     updateTierField,
     setEnsembleContext,
     payload,

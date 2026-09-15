@@ -261,7 +261,10 @@ async def test_config_apply_marks_absorbed_generic_key_before_persist_and_resolu
                     "model": model,
                     "api_key_env": "NEW_ENDPOINT_KEY",
                     "base_url": base_url,
-                }
+                },
+                # This key-resolution test selects a direct deployment;
+                # retaining the default foreign Router requires consent.
+                "squilla_router": {"enabled": False},
             }
         },
         ctx,
@@ -273,6 +276,7 @@ async def test_config_apply_marks_absorbed_generic_key_before_persist_and_resolu
     assert runtime.api_key == ""
     assert runtime.api_key_env_name == "NEW_ENDPOINT_KEY"
     assert "synthetic-generic-key" not in persisted
+    assert ctx.config.squilla_router.enabled is False
 
 
 @pytest.mark.parametrize("mutation", ["set", "patch"])

@@ -64,6 +64,9 @@
       },
       {
         "code": "INTERNAL_ERROR"
+      },
+      {
+        "code": "ROUTER_PROVIDER_CONFLICT"
       }
     ]
   },

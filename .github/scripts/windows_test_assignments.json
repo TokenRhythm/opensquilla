@@ -365,6 +365,7 @@
     "gateway-sqlite": [
       "tests/contracts/test_gateway_contract_runner.py",
       "tests/contracts/test_gateway_contract_toolchain_integration.py",
+      "tests/contracts/test_gateway_validator_profiles.py",
       "tests/contracts/test_sandbox_runtime_contract.py",
       "tests/contracts/test_sessions_changed_contract.py",
       "tests/contracts/test_sessions_directory_subscription_contract.py",
@@ -619,6 +620,7 @@
       "tests/test_gateway/test_readiness.py",
       "tests/test_gateway/test_root_control_ui_security.py",
       "tests/test_gateway/test_router_boot.py",
+      "tests/test_gateway/test_router_recommended_reset.py",
       "tests/test_gateway/test_router_tier_presets.py",
       "tests/test_gateway/test_routing_interaction_mode.py",
       "tests/test_gateway/test_rpc_agents.py",
@@ -1318,6 +1320,7 @@
       "tests/test_desktop/test_electron_startup_contract.py",
       "tests/test_desktop/test_gateway_tls_runtime.py",
       "tests/test_desktop/test_onboarding_main_process_flow_contract.py",
+      "tests/test_desktop/test_router_provider_bridge.py",
       "tests/test_dist/test_workspace_state.py",
       "tests/test_engine/test_agent_invalid_provider_response.py",
       "tests/test_engine/test_agent_llm_budget.py",

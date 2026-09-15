@@ -71,6 +71,12 @@ async def _serve_gateway() -> None:
     config.heartbeat.enabled = False
     config.squilla_router.enabled = False
     config.squilla_router.rollout_phase = "observe"
+    # The fixture's direct and routed modes share its offline deployment.
+    # Replacing llm after construction must not retain the default provider's ladder.
+    config.squilla_router.tiers = {
+        tier: {"provider": config.llm.provider, "model": config.llm.model}
+        for tier in ("c0", "c1", "c2", "c3")
+    }
     config.llm_ensemble.enabled = False
 
     storage = SessionStorage(str(state_dir / "sessions.db"))

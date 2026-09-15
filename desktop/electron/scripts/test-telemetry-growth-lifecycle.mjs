@@ -5,6 +5,8 @@ import { join } from 'node:path'
 import vm from 'node:vm'
 import ts from 'typescript'
 
+import { normalizeRouterPresetBinding, resolveDesktopRouterUpdate } from '../dist/desktop-router-config.js'
+import * as primaryProviderChange from '../dist/desktop-primary-provider-change.js'
 import { OnboardingSaveTelemetry } from '../dist/onboarding-save-telemetry.js'
 import { DesktopTelemetryRuntimeGate, clearEarlyTelemetryScope } from '../dist/telemetry/early-spool.js'
 import { CONSENT_MIRROR_SCHEMA_VERSION, writeConsentMirror } from '../dist/telemetry/consent-mirror.js'
@@ -33,7 +35,7 @@ assert.equal(extracted.length, names.size)
 const executable = ts.transpileModule(
   'let appStartResultRecorded = false;\n'
     + extracted.map((node) => node.getText(ast)).join('\n'),
-  { compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.None } },
+  { compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS } },
 ).outputText
 
 const NOW = '2026-09-11T12:00:00.000Z'
@@ -70,6 +72,11 @@ function harness(directory, {
   const defaults = { requiresApiKey: false, model: 'synthetic-model', baseUrl: '', apiKeyEnv: '' }
   const context = vm.createContext({
     Date: TestDate, join, Math, JSON, Buffer, OnboardingSaveTelemetry,
+    normalizeRouterPresetBinding, resolveDesktopRouterUpdate,
+    require(specifier) {
+      assert.equal(specifier, './desktop-primary-provider-change.js')
+      return primaryProviderChange
+    },
     desktopTelemetryRuntimeGate: gate, desktopGrowthTelemetry: growth,
     desktopReliabilityTelemetry: { synchronize() {}, recordAppStartResult: (event) => startupResults.push(event) },
     desktopProcessStartedAt: TestDate.now(), desktopLocale: 'en', onboardingSaveTelemetryAttempt: 0,

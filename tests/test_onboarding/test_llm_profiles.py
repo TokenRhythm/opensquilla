@@ -11,6 +11,7 @@ from opensquilla.onboarding.mutations import (
     activate_llm_profile,
     remove_active_llm_profile,
     remove_llm_profile,
+    upsert_and_activate_llm_profile,
     upsert_llm_profile,
 )
 from opensquilla.onboarding.status import get_onboarding_status
@@ -1102,3 +1103,180 @@ def test_profile_status_does_not_treat_route_member_model_as_direct_model() -> N
     assert rows["anthropic"]["ready"] is True
     assert rows["anthropic"]["primaryEligible"] is False
     assert rows["anthropic"]["primaryBlockReason"] == "missing_model"
+
+
+@pytest.mark.parametrize("edit", [False, True])
+def test_profile_save_and_activate_uses_submitted_deployment_and_can_switch_back(edit):
+    cfg = GatewayConfig(
+        llm={"provider": "openai", "model": "gpt-old", "api_key": "old-primary-key"},
+        llm_profiles={"deepseek": {"model": "old-model", "api_key": "old-profile-key"}}
+        if edit
+        else {},
+        squilla_router={"preset_binding": "follow_primary"},
+        image_generation={"enabled": False},
+    )
+    before = cfg.model_dump()
+    result = upsert_and_activate_llm_profile(
+        cfg,
+        provider_id="DeepSeek",
+        model="deepseek-new",
+        api_key="submitted-key",
+        base_url="https://deployment.example/v1",
+        proxy="http://proxy.example:8080",
+    )
+    assert cfg.model_dump() == before
+    active = result.config
+    assert active.llm.provider == "deepseek"
+    assert active.llm.model == "deepseek-new"
+    assert active.llm.api_key == "submitted-key"
+    assert active.llm.base_url == "https://deployment.example/v1"
+    assert active.llm.proxy == "http://proxy.example:8080"
+    assert "deepseek" not in active.llm_profiles
+    assert active.llm_profiles["openai"].api_key == "old-primary-key"
+    assert active.image_generation == cfg.image_generation
+    assert active.llm_ensemble == cfg.llm_ensemble
+    assert "submitted-key" not in repr(result.public_payload)
+    returned = activate_llm_profile(active, provider_id="openai").config
+    assert returned.llm.model == "gpt-old"
+    assert returned.llm.api_key == "old-primary-key"
+    assert returned.llm_profiles["deepseek"].api_key == "submitted-key"
+    assert returned.llm_profiles["deepseek"].base_url == "https://deployment.example/v1"
+
+
+def test_profile_save_and_activate_keep_omit_clear_and_endpoint_boundary(monkeypatch):
+    monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
+    cfg = GatewayConfig(
+        llm={"provider": "openai", "api_key": "primary-key"},
+        llm_profiles={
+            "deepseek": {
+                "model": "deepseek-stored",
+                "api_key": "stored-key",
+                "base_url": "https://one.example/v1",
+                "proxy": "http://proxy.example:8080",
+            }
+        },
+        squilla_router={"preset_binding": "follow_primary"},
+    )
+    active = upsert_and_activate_llm_profile(
+        cfg,
+        provider_id="deepseek",
+        preserve_api_key=True,
+        proxy="",
+    ).config
+    assert active.llm.model == "deepseek-stored"
+    assert active.llm.api_key == "stored-key"
+    assert active.llm.proxy == ""
+    assert active.llm.base_url == "https://one.example/v1"
+    for changes in ({"base_url": "https://two.example/v1"}, {"api_key": ""}):
+        with pytest.raises(LlmProfileActivationError) as error:
+            upsert_and_activate_llm_profile(
+                cfg,
+                provider_id="deepseek",
+                preserve_api_key=True,
+                **changes,
+            )
+        assert error.value.reason == "missing_credential"
+    assert cfg.llm_profiles["deepseek"].api_key == "stored-key"
+
+
+def test_profile_save_and_activate_rejects_active_before_building_profile(monkeypatch):
+    def unexpected(*args, **kwargs):
+        pytest.fail("already-active target must be rejected before profile upsert")
+
+    monkeypatch.setattr("opensquilla.onboarding.mutations.upsert_llm_profile", unexpected)
+    with pytest.raises(LlmProfileActivationError) as error:
+        cfg = GatewayConfig()
+        upsert_and_activate_llm_profile(cfg, provider_id=cfg.llm.provider, api_key="new-key")
+    assert error.value.reason == "already_active"
+
+
+@pytest.mark.parametrize("credential_source", ["env", "runtime", "explicit"])
+def test_profile_save_and_activate_preserves_secret_provenance(monkeypatch, credential_source):
+    target_key = "synthetic-target-key"
+    monkeypatch.setenv("DEEPSEEK_API_KEY", target_key)
+    cfg = GatewayConfig(
+        llm={
+            "provider": "openai",
+            "api_key": "synthetic-old-runtime-key",
+            "api_key_env": "OPENAI_API_KEY",
+        },
+        llm_profiles={"DeepSeek": {"model": "deepseek-chat", "api_key": target_key}}
+        if credential_source == "runtime"
+        else {},
+        squilla_router={"preset_binding": "follow_primary"},
+    )
+    cfg.mark_runtime_secret("llm.api_key")
+    kwargs = {}
+    if credential_source == "runtime":
+        cfg.mark_runtime_secret("llm_profiles.DeepSeek.api_key")
+        kwargs["preserve_api_key"] = True
+    elif credential_source == "explicit":
+        kwargs["api_key"] = target_key
+    else:
+        kwargs["api_key_env"] = "DEEPSEEK_API_KEY"
+    result = upsert_and_activate_llm_profile(cfg, provider_id="deepseek", **kwargs)
+    persisted = result.config.to_toml_dict()
+    assert "synthetic-old-runtime-key" not in repr(persisted)
+    assert "api_key" not in persisted["llm_profiles"]["openai"]
+    if credential_source == "explicit":
+        assert persisted["llm"]["api_key"] == target_key
+    else:
+        assert target_key not in repr(persisted)
+        assert "api_key" not in persisted["llm"]
+    assert target_key not in repr(result.public_payload)
+
+
+@pytest.mark.parametrize("action", ["preserve", "use_recommended", "disable"])
+def test_profile_save_and_activate_custom_router_resolution_is_atomic(action):
+    cfg = GatewayConfig(
+        llm={"provider": "openai", "api_key": "primary-key"},
+        squilla_router={"tier_profile": "openai", "preset_binding": "custom"},
+    )
+    before = cfg.model_dump()
+    if action == "preserve":
+        with pytest.raises(LlmProfileActivationError) as error:
+            upsert_and_activate_llm_profile(cfg, provider_id="deepseek", api_key="draft-key")
+        assert error.value.reason == "router_provider_conflict"
+    else:
+        candidate = upsert_and_activate_llm_profile(
+            cfg,
+            provider_id="deepseek",
+            api_key="draft-key",
+            router_action=action,
+        ).config
+        if action == "disable":
+            assert candidate.squilla_router.enabled is False
+            assert candidate.squilla_router.tiers == cfg.squilla_router.tiers
+        else:
+            assert candidate.squilla_router.preset_binding == "follow_primary"
+            assert candidate.squilla_router.tiers != cfg.squilla_router.tiers
+        assert candidate.llm_ensemble == cfg.llm_ensemble
+    assert cfg.model_dump() == before
+
+
+def test_profile_save_and_activate_rejects_pool_without_saving_draft():
+    cfg = GatewayConfig()
+    before = cfg.model_dump()
+    with pytest.raises(LlmProfileActivationError) as error:
+        upsert_and_activate_llm_profile(
+            cfg,
+            provider_id="deepseek",
+            api_key="draft-key",
+            api_key_env_pool=["POOL_KEY"],
+        )
+    assert error.value.reason == "primary_pool_unsupported"
+    assert cfg.model_dump() == before
+
+
+@pytest.mark.parametrize("intent,enabled", [("preserve", False), ("enable_provider_default", True)])
+def test_profile_save_and_activate_applies_only_explicit_image_intent(intent, enabled):
+    cfg = GatewayConfig(
+        llm={"provider": "openai", "api_key": "primary-key"},
+        squilla_router={"preset_binding": "follow_primary"},
+    )
+    result = upsert_and_activate_llm_profile(
+        cfg, provider_id="openrouter", api_key="draft-key", image_generation_intent=intent,
+    )
+    assert result.config.image_generation.enabled is enabled
+    assert cfg.image_generation.enabled is False
+    assert result.config.llm_ensemble == cfg.llm_ensemble

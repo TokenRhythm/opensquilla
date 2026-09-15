@@ -455,7 +455,7 @@ describe('useSetupRouterForm - model strategy semantics', () => {
     expect(f.payload().mode).toBe('custom')
   })
 
-  it('adds cross-provider router fields when tier providers differ', () => {
+  it('does not authorize cross-provider execution merely because tier providers differ', () => {
     const f = useSetupRouterForm()
     f.initFromConfig({
       enabled: true,
@@ -469,11 +469,10 @@ describe('useSetupRouterForm - model strategy semantics', () => {
     }, {}, 'openai')
 
     expect(f.hasMixedTierProviders.value).toBe(true)
+    expect(f.payload()).not.toHaveProperty('crossProviderTiers')
     expect(f.tierTemplateState.value).toBe('custom')
     expect(f.payload()).toMatchObject({
       mode: 'custom',
-      crossProviderTiers: true,
-      tierProviderMismatch: 'veto',
     })
   })
 
@@ -523,9 +522,8 @@ describe('useSetupRouterForm - model strategy semantics', () => {
 
     expect(f.routerProviderRoles.value).toEqual({})
     expect(f.hasMixedTierProviders.value).toBe(true)
+    expect(f.payload()).not.toHaveProperty('crossProviderTiers')
     expect(f.payload()).toMatchObject({
-      crossProviderTiers: true,
-      tierProviderMismatch: 'veto',
     })
     expect(f.tierEnsembleStatus.value).toBeNull()
   })
@@ -597,6 +595,7 @@ describe('useSetupRouterForm - model strategy semantics', () => {
 
     expect(f.routerProviderRoles.value).toEqual({ c3: 'dynamic_member' })
     expect(f.hasMixedTierProviders.value).toBe(true)
+    expect(f.payload()).not.toHaveProperty('crossProviderTiers')
     expect(makePanel(f, true).value.routerProviderRoles).toEqual({ c3: 'dynamic_member' })
   })
 
@@ -627,9 +626,8 @@ describe('useSetupRouterForm - model strategy semantics', () => {
       c3: 'direct',
     })
     expect(f.hasMixedTierProviders.value).toBe(true)
+    expect(f.payload()).not.toHaveProperty('crossProviderTiers')
     expect(f.payload()).toMatchObject({
-      crossProviderTiers: true,
-      tierProviderMismatch: 'veto',
     })
   })
 
@@ -665,6 +663,7 @@ describe('useSetupRouterForm - model strategy semantics', () => {
     }, 'custom_b5', false)
 
     expect(f.hasMixedTierProviders.value).toBe(true)
+    expect(f.payload()).not.toHaveProperty('crossProviderTiers')
 
     f.updateTierField('c3', 'ensembleEnabled', true)
     f.updateTierField('c3', 'ensembleSelectionMode', '')
@@ -789,6 +788,7 @@ describe('useSetupRouterForm - model strategy semantics', () => {
       c3: 'direct',
     })
     expect(f.hasMixedTierProviders.value).toBe(true)
+    expect(f.payload()).not.toHaveProperty('crossProviderTiers')
     expect(f.payload()).toMatchObject({
       tiers: {
         c3: {
@@ -831,10 +831,9 @@ describe('useSetupRouterForm - model strategy semantics', () => {
     }, {}, 'openrouter')
 
     expect(f.hasMixedTierProviders.value).toBe(true)
+    expect(f.payload()).not.toHaveProperty('crossProviderTiers')
     expect(makePanel(f, true).value.hasMixedTierProviders).toBe(true)
     expect(f.payload()).toMatchObject({
-      crossProviderTiers: true,
-      tierProviderMismatch: 'veto',
     })
   })
 
@@ -856,8 +855,6 @@ describe('useSetupRouterForm - model strategy semantics', () => {
 
     expect(f.payload()).toMatchObject({
       mode: 'custom',
-      crossProviderTiers: true,
-      tierProviderMismatch: 'veto',
       tiers: {
         c0: { provider: 'deepseek', model: '' },
       },
@@ -877,5 +874,17 @@ describe('useSetupRouterForm - model strategy semantics', () => {
     }, {}, 'openai')
 
     expect(makePanel(f, false).value.hasMixedTierProviders).toBe(true)
+  })
+})
+
+
+describe('saved cross-provider permission', () => {
+  it('preserves an explicit enabled permission and mismatch policy', () => {
+    const form = useSetupRouterForm()
+    form.initFromConfig({ enabled: true, cross_provider_tiers: true, tier_provider_mismatch: 'route', tiers: {
+      c0: { provider: 'openai', model: 'draft' }, c1: { provider: 'openrouter', model: 'saved' },
+    } }, {}, 'openai')
+    form.updateTierField('c0', 'model', 'edited')
+    expect(form.payload()).toMatchObject({ crossProviderTiers: true, tierProviderMismatch: 'route' })
   })
 })

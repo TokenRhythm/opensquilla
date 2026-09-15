@@ -786,6 +786,11 @@
       "memoryOptions": "Options de mémoire"
     },
     "provider": {
+      "moreActions": "Autres actions pour {provider}",
+      "routerOutcomeSynchronized": "Les recommandations du Router suivent le fournisseur principal enregistré.",
+      "routerOutcomePreserved": "Les niveaux enregistrés du Router ont été conservés.",
+      "routerOutcomeDisabled": "Le routage des modèles est désactivé ; les niveaux enregistrés ont été conservés.",
+      "primarySavedAdditionalFailed": "Le fournisseur a été enregistré, mais les paramètres supplémentaires n’ont pas pu l’être. Vérifiez-les avant de réessayer.",
       "title": "Fournisseur",
       "pageTitle": "Service de modèles",
       "pageDesc": "Connectez des fournisseurs et gérez leurs identifiants et modèles.",
@@ -794,6 +799,7 @@
       "configuredSummary": "{ready} sur {count} prêts. Le test envoie une petite requête.",
       "configuredDesc": "Les fournisseurs enregistrés restent disponibles pour le routage jusqu’à leur suppression. La vérification de la configuration envoie une petite requête au modèle avec les réglages enregistrés ; des frais du fournisseur peuvent s’appliquer.",
       "activeBadge": "Actif",
+      "currentPrimary": "Fournisseur principal actuel",
       "editingBadge": "En cours d’édition",
       "profileReady": "Identifiants prêts",
       "profileNeedsCredentials": "Identifiants requis",
@@ -1069,12 +1075,45 @@
       "modelProvenance": "Liste fournisseur en direct · source des capacités : {sources}",
       "modelMetadataProvenance": "Liste fournisseur en direct · valeurs officielles prioritaires, sinon valeurs catalogue",
       "modelMultimodal": "Multimodal",
-      "modelMultimodalTitle": "Accepte les entrées d’image"
+      "modelMultimodalTitle": "Accepte les entrées d’image",
+      "saveAndStart": "Enregistrer et commencer",
+      "saveAndMakeActive": "Enregistrer et définir comme principal",
+      "saveActivateUpgradeHint": "Mettez le Gateway à jour pour enregistrer et activer le fournisseur en une opération.",
+      "primaryRoleHint": "Le fournisseur principal gère les requêtes directes par défaut et le repli. Les stratégies personnalisées conservent leur configuration.",
+      "activationCredentialRequired": "Ajoutez des identifiants utilisables avant de définir ce fournisseur comme principal.",
+      "routerConflictTitle": "Choisir le traitement des routes existantes",
+      "routerConflictBody": "Le Router enregistré utilise {conflicts}, en conflit avec {provider}. Les recommandations de {provider} remplacent les niveaux enregistrés et non enregistrés. Si proposé, désactivez le routage en conservant les niveaux. Annuler conserve le mode et les brouillons.",
+      "routerUseRecommended": "Utiliser les routes recommandées du fournisseur cible",
+      "routerDisablePreserve": "Conserver les routes et désactiver Router",
+      "alreadyActive": "Le fournisseur cible est déjà principal. Cette modification des identifiants n’a pas été enregistrée.",
+      "primarySaveUncertain": "Le résultat de l’enregistrement est incertain. Le brouillon a été conservé. Vérifiez la configuration avant de réessayer ; un fournisseur actif ne confirme pas la sauvegarde des identifiants."
     },
     "preset": {
       "modeCustom": "personnalisé"
     },
     "modelStrategy": {
+      "summaryPrimary": "Fournisseur principal enregistré",
+      "summaryRouter": "Routage des modèles",
+      "summaryOn": "Activé",
+      "summaryOff": "Désactivé",
+      "bindingFollowPrimary": "Recommandé · suit le principal",
+      "bindingCustom": "Niveaux personnalisés",
+      "bindingLegacy": "Niveaux existants · suivi non défini",
+      "resetRecommended": "Utiliser les niveaux recommandés de {provider}",
+      "resettingRecommended": "Mise à jour des niveaux recommandés…",
+      "resetKeepsOff": "Met à jour les niveaux ; le routage reste désactivé.",
+      "resetKeepsMode": "Remplace les niveaux et conserve le mode actuel.",
+      "retainedDrafts": "Modifications de routage non enregistrées",
+      "crossProviderDisabledMismatch": "Les niveaux enregistrés utilisent d’autres fournisseurs ; l’exécution entre fournisseurs est désactivée.",
+      "resetUpgradeHint": "Mettez à jour le Gateway pour appliquer les niveaux recommandés en une seule opération.",
+      "operationPending": "Une opération de fournisseur ou de routage est en cours.",
+      "activationUpgradeHint": "Ce Gateway ne peut pas confirmer une activation sûre du Router. Mettez-le à jour pour examiner et résoudre les conflits de fournisseurs.",
+      "savedRefreshFailed": "Enregistré, mais les paramètres n’ont pas pu être actualisés. Rechargez-les avant toute autre modification.",
+      "resultUncertain": "Le résultat de l’enregistrement est inconnu. Vérifiez les paramètres actualisés avant de réessayer.",
+      "resetTitle": "Utiliser les niveaux recommandés de {provider} ?",
+      "resetBody": "Remplacer les modifications enregistrées et non enregistrées des niveaux du Router par les recommandations de {provider} ? Le mode et l’interrupteur du Router restent inchangés. Les autres paramètres non enregistrés sont conservés.",
+      "resetConfirm": "Remplacer par les recommandations",
+      "resetSaved": "Niveaux recommandés de {provider} enregistrés ; mode inchangé.",
       "title": "Routage des modèles",
       "desc": "Choisissez comment le modèle est sélectionné pour chaque requête.",
       "newSessionDefault": "C’est la valeur par défaut des nouveaux chats. Les chats existants conservent leur propre mode de routage.",
@@ -1093,7 +1132,7 @@
       "advancedDesc": "Niveau de repli et affichage du routage dans le chat.",
       "visualModeLabel": "Style du panneau de décision de routage",
       "visualModeDesc": "Affichage de la décision de routage dans les réponses.",
-      "crossProviderNotice": "Le routage inter-fournisseurs est actif. Vérifie chaque niveau avant d’enregistrer.",
+      "crossProviderNotice": "L’exécution entre fournisseurs est activée.",
       "cards": {
         "router": {
           "title": "Routage intelligent des modèles",
@@ -1753,7 +1792,10 @@
       "channelEnabled": "Canal activé. Redémarrage requis.",
       "channelEnabledLive": "Canal activé et démarré.",
       "channelDisabled": "Canal désactivé. Redémarrage requis.",
-      "channelDisabledLive": "Canal désactivé et arrêté."
+      "channelDisabledLive": "Canal désactivé et arrêté.",
+      "providerSavedAndActivated": "{provider} a été enregistré et défini comme principal.",
+      "modelStrategyPartialSaved": "Certains paramètres ont été enregistrés. Le changement de fournisseur principal n’a pas abouti ; les modifications restantes sont conservées.",
+      "modelStrategyPartialSaveUncertain": "Certains paramètres ont été enregistrés. Le changement de fournisseur principal n’a pas pu être confirmé ; vérifiez l’état enregistré. Les modifications restantes sont conservées."
     },
     "needs": {
       "noApiKey": "Aucune clé API requise.",

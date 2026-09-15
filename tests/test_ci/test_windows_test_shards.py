@@ -68,6 +68,11 @@ OFFLINE_MARKER_EXCLUSIONS = {
     "tests/test_skills/test_meta_skill_creator_smoke_live.py",
 }
 RECENTLY_ADDED_ACTIVE_TESTS = {
+    # Primary-provider and validator coverage use the declared provisional
+    # floor until a comparable three-run Windows refresh supplies measured timings.
+    "tests/contracts/test_gateway_validator_profiles.py",
+    "tests/test_desktop/test_router_provider_bridge.py",
+    "tests/test_gateway/test_router_recommended_reset.py",
     "tests/test_scripts/test_gateway_ux.py",
     "tests/test_engine/test_agent_autonomous_tool_recovery.py",
     "tests/test_engine/test_agent_connection_recovery.py",

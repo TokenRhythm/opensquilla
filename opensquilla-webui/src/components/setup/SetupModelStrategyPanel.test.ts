@@ -1916,15 +1916,65 @@ describe('SetupModelStrategyPanel', () => {
     app.unmount()
   })
 
-  it('shows cross-provider notice when model tiers use mixed providers', async () => {
-    const { app, el } = await mountPanel({
-      router: {
-        hasMixedTierProviders: true,
-      },
-    })
+  it('does not infer cross-provider execution from mixed tiers', async () => {
+    const { app, el } = await mountPanel({ router: { hasMixedTierProviders: true } })
+    expect(el.querySelector('[data-testid="routing-cross-provider-enabled"]')).toBeNull()
+    app.unmount()
+  })
+})
 
-    expect(el.textContent).toContain('Cross-provider routing')
+const summary = {
+  providerId: 'tokenrhythm', providerLabel: 'TokenRhythm', enabled: false,
+  binding: 'custom', crossProviderEnabled: false, hasForeignTierProviders: true,
+  hasUnsavedChanges: false, resetPending: false, resetDisabledReason: '',
+}
 
+describe('saved routing summary and recommended recovery', () => {
+  it('separates the saved primary, Router switch and custom ownership above mode cards', async () => {
+    const onResetRecommendedRouter = vi.fn()
+    const { app, el } = await mountPanel({ routingSummary: summary }, { onResetRecommendedRouter })
+    const facts = el.querySelector('[data-testid="routing-saved-summary"]')!
+    expect(facts.textContent).toContain('TokenRhythm')
+    expect(facts.textContent).toContain('Off')
+    expect(el.querySelector('[data-testid="routing-saved-binding"]')?.textContent).toBe('Custom tiers')
+    expect(facts.compareDocumentPosition(el.querySelector('.setup-model-strategy__cards')!))
+      .toBe(Node.DOCUMENT_POSITION_FOLLOWING)
+    expect(el.querySelector('[data-testid="routing-provider-mismatch"]')?.textContent).toContain('cross-provider execution is off')
+    expect(el.querySelector('[data-testid="routing-cross-provider-enabled"]')).toBeNull()
+    const reset = el.querySelector<HTMLButtonElement>('[data-testid="router-reset-recommended"]')!
+    expect(reset.disabled).toBe(false)
+    expect(document.getElementById(reset.getAttribute('aria-describedby')!)?.textContent).toContain('stays off')
+    reset.click()
+    expect(onResetRecommendedRouter).toHaveBeenCalledOnce()
+    app.unmount()
+  })
+
+  it.each([
+    ['follow_primary', 'Recommended · follows primary'],
+    ['legacy', 'Existing tiers · follow behavior unspecified'],
+  ])('shows %s ownership independently of the enabled state', async (binding, label) => {
+    const { app, el } = await mountPanel({ routingSummary: { ...summary, binding, enabled: true, hasUnsavedChanges: true, crossProviderEnabled: true } })
+    expect(el.querySelector('[data-testid="routing-saved-binding"]')?.textContent).toBe(label)
+    expect(el.querySelector('[data-testid="routing-cross-provider-enabled"]')).toBeTruthy()
+    expect(el.querySelector('[data-testid="routing-provider-mismatch"]')).toBeNull()
+    expect(el.querySelector('[data-testid="routing-unsaved"]')).toBeTruthy()
+    app.unmount()
+  })
+
+  it.each(['permission', 'capability', 'preset'])('shows the %s reason and prevents reset', async reason => {
+    const onResetRecommendedRouter = vi.fn()
+    const { app, el } = await mountPanel({ routingSummary: { ...summary, resetDisabledReason: reason } }, { onResetRecommendedRouter })
+    const reset = el.querySelector<HTMLButtonElement>('[data-testid="router-reset-recommended"]')!
+    expect(reset.disabled).toBe(true)
+    expect(document.getElementById(reset.getAttribute('aria-describedby')!)?.textContent).toBe(reason)
+    reset.click()
+    expect(onResetRecommendedRouter).not.toHaveBeenCalled()
+    app.unmount()
+  })
+
+  it('locks the reset button while another routing operation is pending', async () => {
+    const { app, el } = await mountPanel({ routingSummary: summary }, { routingModeBusy: true })
+    expect(el.querySelector<HTMLButtonElement>('[data-testid="router-reset-recommended"]')?.disabled).toBe(true)
     app.unmount()
   })
 })
