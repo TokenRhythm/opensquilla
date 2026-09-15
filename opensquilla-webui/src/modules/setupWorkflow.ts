@@ -39,9 +39,19 @@ export type SetupWorkflowErrorCode =
 
 export type SetupWorkflowFailureReason =
   | 'provider-invalid'
+  | 'router-provider-conflict'
+  | 'already-active'
   | 'router-invalid'
   | 'search-invalid'
   | 'image-generation-invalid'
+
+export type RouterResolutionAction = 'use_recommended' | 'disable'
+export interface RouterProviderConflict {
+  readonly reason: 'router_provider_conflict'
+  readonly providerId: string
+  readonly conflictProviders: readonly string[]
+  readonly allowedRouterActions: readonly string[]
+}
 
 export class SetupWorkflowError extends Error {
   constructor(
@@ -49,6 +59,7 @@ export class SetupWorkflowError extends Error {
     message: string,
     readonly reason?: SetupWorkflowFailureReason,
     readonly cause?: unknown,
+    readonly details?: RouterProviderConflict,
   ) {
     super(message)
     this.name = 'SetupWorkflowError'
@@ -84,6 +95,10 @@ export interface UpsertProfile {
 export interface ActivateProfile {
   providerId: string
   model?: string | null
+  routerAction?: string | null
+  imageGenerationIntent?: string | null
+}
+export interface UpsertAndActivateProfile extends UpsertProfile {
   routerAction?: string | null
   imageGenerationIntent?: string | null
 }
@@ -179,6 +194,7 @@ export interface ProviderSetup {
 }
 export interface ProfileLifecycle {
   upsertProfile(command: UpsertProfile, options?: SetupRequestOptions): Promise<SetupStatus>
+  upsertAndActivateProfile(command: UpsertAndActivateProfile, options?: SetupRequestOptions): Promise<SetupStatus>
   activateProfile(command: ActivateProfile, options?: SetupRequestOptions): Promise<SetupStatus>
   probeProfile(command: ProfileProbe, options?: SetupRequestOptions): Promise<SetupStatus>
   probeDraftProfile(command: ProfileProbe, options?: SetupRequestOptions): Promise<SetupDiscoveryResult>
@@ -199,6 +215,7 @@ export interface CapabilitySetup {
 }
 export interface SetupCapabilities {
   readonly profileLifecycle: boolean
+  readonly profileUpsertAndActivate: boolean
   readonly primaryProviderRemoval: boolean
   readonly imageModelDiscovery: boolean
 }

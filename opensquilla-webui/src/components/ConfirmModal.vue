@@ -125,8 +125,14 @@ useDialogA11y(modalRef, isOpen, onCancel, { initialFocus })
 
 .modal__footer {
   display: flex;
+  flex-wrap: wrap;
   gap: var(--sp-3);
   justify-content: flex-end;
+}
+
+.modal__footer .btn {
+  white-space: normal;
+  overflow-wrap: anywhere;
 }
 
 .modal__primary {

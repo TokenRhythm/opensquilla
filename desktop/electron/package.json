@@ -64,6 +64,7 @@
     "test:telemetry-build-identity": "npm run build && node scripts/test-telemetry-build-identity.mjs",
     "test:telemetry-reliability": "npm run build && node scripts/test-telemetry-reliability.mjs",
     "test:telemetry-growth": "npm run build && node scripts/test-telemetry-growth.mjs && node scripts/test-telemetry-growth-lifecycle.mjs",
+    "test:desktop-router-config": "npm run build && node scripts/test-desktop-router-config.mjs",
     "test:router-tier-normalization": "npm run build && node scripts/test-router-tier-normalization.mjs",
     "test:onboarding-flow": "npm run build && node scripts/test-onboarding-flow.mjs",
     "start": "electron .",
@@ -76,7 +77,8 @@
     "test:live-html-browser": "node --test scripts/test-live-html-business.mjs"
   },
   "dependencies": {
-    "electron-updater": "^6.6.2"
+    "electron-updater": "^6.6.2",
+    "smol-toml": "1.8.0"
   },
   "devDependencies": {
     "@types/node": "^25.9.1",

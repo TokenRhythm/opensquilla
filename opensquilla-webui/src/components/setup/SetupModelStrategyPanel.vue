@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, nextTick, onBeforeUnmount, ref, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, ref, useId, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import Icon from '@/components/Icon.vue'
 import SetupModelCombobox from '@/components/setup/SetupModelCombobox.vue'
@@ -94,6 +94,17 @@ interface ModelStrategyPanelContract {
   router: RouterPanelContract
   ensemble: EnsemblePanelContract
   single: SinglePanelContract
+  routingSummary?: {
+    providerId: string
+    providerLabel: string
+    enabled: boolean
+    binding: 'follow_primary' | 'custom' | 'legacy'
+    crossProviderEnabled: boolean
+    hasForeignTierProviders: boolean
+    hasUnsavedChanges: boolean
+    resetPending: boolean
+    resetDisabledReason: string
+  }
 }
 
 const props = defineProps<{
@@ -120,7 +131,21 @@ const emit = defineEmits<{
   updateEnsembleAllFailedPolicy: [value: string]
   updateEnsembleProposerMaxRetries: [value: number]
   goToSection: [value: string]
+  resetRecommendedRouter: []
 }>()
+
+const resetHelpId = `router-reset-help-${useId()}`
+const bindingLabel = computed(() => t(
+  props.panel.routingSummary?.binding === 'follow_primary' ? 'setup.modelStrategy.bindingFollowPrimary'
+    : props.panel.routingSummary?.binding === 'custom' ? 'setup.modelStrategy.bindingCustom'
+      : 'setup.modelStrategy.bindingLegacy',
+))
+
+function requestRecommendedReset() {
+  const summary = props.panel.routingSummary
+  if (!summary || summary.resetDisabledReason || summary.resetPending || props.routingModeBusy) return
+  emit('resetRecommendedRouter')
+}
 
 const showRouterDetails = computed(() => props.panel.activeStrategy === 'router')
 
@@ -739,6 +764,39 @@ function credentialLabel(candidate: EnsembleCandidateView): string {
     </div>
 
     <template v-else>
+      <section v-if="panel.routingSummary" class="setup-model-strategy__saved-summary" data-testid="routing-saved-summary">
+        <div class="setup-model-strategy__saved-facts">
+          <dl>
+            <div>
+              <dt>{{ t('setup.modelStrategy.summaryPrimary') }}</dt>
+              <dd>{{ panel.routingSummary.providerLabel || '—' }}</dd>
+            </div>
+            <div>
+              <dt>{{ t('setup.modelStrategy.summaryRouter') }}</dt>
+              <dd>{{ t(panel.routingSummary.enabled ? 'setup.modelStrategy.summaryOn' : 'setup.modelStrategy.summaryOff') }}</dd>
+            </div>
+          </dl>
+          <p class="setup-model-strategy__binding" data-testid="routing-saved-binding">{{ bindingLabel }}</p>
+          <p v-if="panel.routingSummary.hasUnsavedChanges" class="setup-model-strategy__draft" role="status" data-testid="routing-unsaved">
+            {{ t('setup.modelStrategy.retainedDrafts') }}
+          </p>
+        </div>
+        <div class="setup-model-strategy__reset">
+          <button
+            type="button"
+            class="btn btn--ghost"
+            data-testid="router-reset-recommended"
+            :disabled="Boolean(panel.routingSummary.resetDisabledReason) || panel.routingSummary.resetPending || routingModeBusy"
+            :aria-busy="panel.routingSummary.resetPending ? 'true' : undefined"
+            :aria-describedby="resetHelpId"
+            @click="requestRecommendedReset"
+          >
+            <Icon name="refresh" :size="15" aria-hidden="true" />
+            {{ t(panel.routingSummary.resetPending ? 'setup.modelStrategy.resettingRecommended' : 'setup.modelStrategy.resetRecommended', { provider: panel.routingSummary.providerLabel }) }}
+          </button>
+          <p :id="resetHelpId">{{ panel.routingSummary.resetDisabledReason || t(panel.routingSummary.enabled ? 'setup.modelStrategy.resetKeepsMode' : 'setup.modelStrategy.resetKeepsOff') }}</p>
+        </div>
+      </section>
       <section class="setup-model-strategy__mode" :aria-label="t('setup.modelStrategy.modeTitle')">
         <div class="setup-model-strategy__cards" role="radiogroup" :aria-label="t('setup.modelStrategy.modeTitle')">
           <label
@@ -769,8 +827,11 @@ function credentialLabel(candidate: EnsembleCandidateView): string {
         </div>
       </section>
 
-      <p v-if="showRouterDetails && panel.router.hasMixedTierProviders" class="setup-model-strategy__notice">
+      <p v-if="panel.routingSummary?.crossProviderEnabled" class="setup-model-strategy__notice" data-testid="routing-cross-provider-enabled">
         {{ t('setup.modelStrategy.crossProviderNotice') }}
+      </p>
+      <p v-else-if="panel.routingSummary?.hasForeignTierProviders" class="setup-model-strategy__notice" data-testid="routing-provider-mismatch">
+        {{ t('setup.modelStrategy.crossProviderDisabledMismatch') }}
       </p>
 
       <section v-if="showRouterDetails" class="control-section setup-model-strategy__detail">
@@ -1680,7 +1741,51 @@ function credentialLabel(candidate: EnsembleCandidateView): string {
 
 <style scoped>
 .setup-model-strategy {
+  container: model-strategy-panel / inline-size;
   gap: var(--sp-3);
+}
+
+.setup-model-strategy__saved-summary {
+  align-items: center;
+  background: transparent;
+  border: 0;
+  border-radius: 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--sp-3) var(--sp-5);
+  justify-content: space-between;
+  padding: var(--sp-1) 0 var(--sp-2);
+}
+.setup-model-strategy__saved-facts { flex: 1 1 260px; min-width: 0; }
+.setup-model-strategy__saved-facts dl {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--sp-2) var(--sp-5);
+  margin: 0;
+}
+.setup-model-strategy__saved-facts dl > div { min-width: 0; }
+.setup-model-strategy__saved-facts dt,
+.setup-model-strategy__reset p {
+  color: var(--text-muted);
+  font-size: var(--fs-xs);
+  line-height: 1.5;
+}
+.setup-model-strategy__saved-facts dd {
+  font-size: var(--fs-sm);
+  font-weight: 600;
+  margin: var(--sp-1) 0 0;
+  overflow-wrap: anywhere;
+}
+.setup-model-strategy__binding,
+.setup-model-strategy__draft { font-size: var(--fs-xs); margin: var(--sp-2) 0 0; overflow-wrap: anywhere; }
+.setup-model-strategy__binding { color: var(--text-muted); }
+.setup-model-strategy__draft { color: var(--accent); }
+.setup-model-strategy__reset { flex: 0 1 300px; min-width: 0; }
+.setup-model-strategy__reset .btn { height: auto; text-align: start; white-space: normal; overflow-wrap: anywhere; }
+.setup-model-strategy__reset p { margin: var(--sp-1) 0 0; }
+@container model-strategy-panel (max-width: 640px) {
+  .setup-model-strategy__saved-summary { align-items: stretch; flex-direction: column; }
+  .setup-model-strategy__saved-facts, .setup-model-strategy__reset { flex-basis: auto; }
 }
 
 .setup-model-strategy__page-head {

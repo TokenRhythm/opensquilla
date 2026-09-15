@@ -5,6 +5,8 @@ import { SetupWorkflowError } from '@/modules/setupWorkflow'
 
 const SETUP_REASON_KEYS = {
   'provider-invalid': 'errors.onboarding.provider',
+  'router-provider-conflict': 'setup.provider.routerConflictTitle',
+  'already-active': 'setup.provider.alreadyActive',
   'router-invalid': 'errors.onboarding.router',
   'search-invalid': 'errors.onboarding.search',
   'image-generation-invalid': 'errors.onboarding.image',

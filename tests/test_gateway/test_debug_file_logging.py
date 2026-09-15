@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import json
 import logging
 from logging.handlers import RotatingFileHandler
 
@@ -135,7 +136,9 @@ def test_disabled_file_logging_still_bridges_info_to_console(tmp_path, monkeypat
         opensquilla_logger.setLevel(original_level)
 
 
-def test_structlog_events_reach_debug_log_with_traceback(tmp_path, monkeypatch) -> None:
+def test_structlog_events_keep_exception_type_without_private_traceback(
+    tmp_path, monkeypatch,
+) -> None:
     _remove_debug_handlers()
     _remove_console_handlers()
     old_config = structlog.get_config()
@@ -154,9 +157,14 @@ def test_structlog_events_reach_debug_log_with_traceback(tmp_path, monkeypatch) 
         for handler in logging.getLogger().handlers:
             handler.flush()
         text = (tmp_path / "debug.log").read_text(encoding="utf-8")
-        assert "[ERROR] opensquilla.test_bridge: bridge_event" in text
-        assert "session_key='agent:test:bridge'" in text
-        assert "ValueError: synthetic-bridge-error" in text
+        event = json.loads(text.split(": ", 1)[1])
+        assert event["event"] == "bridge_event"
+        assert event["level"] == "ERROR"
+        assert event["logger"] == "opensquilla.test_bridge"
+        assert event["session_key"] == "agent:test:bridge"
+        assert event["exception_type"] == "ValueError"
+        assert "synthetic-bridge-error" not in text
+        assert "Traceback" not in text
         assert text.count("bridge_event") == 1
     finally:
         _remove_debug_handlers()

@@ -1,4 +1,5 @@
 export interface RouterTier {
+  [key: string]: unknown
   provider: string
   model: string
   description?: string
@@ -7,6 +8,7 @@ export interface RouterTier {
   imageOnly?: boolean
   thinkingLevel?: string
   ensembleEnabled?: boolean
+  ensembleSelectionMode?: string
 }
 
 const LEGACY_TEXT_TIER_ALIASES: Record<string, string> = {
@@ -63,13 +65,21 @@ export function normalizeRouterTiers(
     const hasEnsembleEnabled = Object.prototype.hasOwnProperty.call(tier, 'ensembleEnabled')
       || Object.prototype.hasOwnProperty.call(tier, 'ensemble_enabled')
     const ensembleEnabled = tier.ensembleEnabled ?? tier.ensemble_enabled
+    const extra = { ...tier }
+    for (const key of ['provider', 'model', 'description', 'supportsImage', 'supports_image',
+      'imageOnly', 'image_only', 'thinkingLevel', 'thinking_level', 'ensembleEnabled',
+      'ensemble_enabled', 'ensembleSelectionMode', 'ensemble_selection_mode']) delete extra[key]
     const normalizedTier: RouterTier = {
       ...out[name],
+      ...extra,
       provider,
       model,
       description: String(tier.description || out[name]?.description || ''),
       imageOnly: Boolean(tier.imageOnly ?? tier.image_only ?? out[name]?.imageOnly),
       thinkingLevel: String(tier.thinkingLevel ?? tier.thinking_level ?? out[name]?.thinkingLevel ?? ''),
+      ...((tier.ensembleSelectionMode ?? tier.ensemble_selection_mode ?? out[name]?.ensembleSelectionMode)
+        ? { ensembleSelectionMode: String(tier.ensembleSelectionMode ?? tier.ensemble_selection_mode ?? out[name]?.ensembleSelectionMode) }
+        : {}),
       ...(hasEnsembleEnabled
         ? { ensembleEnabled: normalizeBooleanSetting(ensembleEnabled, false) }
         : {}),

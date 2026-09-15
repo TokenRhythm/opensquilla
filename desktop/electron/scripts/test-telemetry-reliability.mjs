@@ -1079,7 +1079,7 @@ try {
     )
     const saveImported = mainSource.slice(
       mainSource.indexOf('async function saveImportedDesktopCredential'),
-      mainSource.indexOf('// Sections the desktop config template owns'),
+      mainSource.indexOf('const DESKTOP_OWNED_CONFIG_SECTIONS'),
     )
     assert.ok(
       saveImported.indexOf("'pre_commit'")

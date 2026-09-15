@@ -836,13 +836,13 @@ def _provider_proof_from_logs(paths: list[Path]) -> dict[str, Any]:
                 "estimated_tokens",
                 "effective_proof_token_budget",
             ):
-                match = re.search(rf"\b{field}=(\d+)", line)
+                match = re.search(rf'\b{field}"?\s*[:=]\s*(\d+)\b', line)
                 if match:
                     current[field] = int(match.group(1))
-            match = re.search(r"\bmedia_blocks_reserved=(\d+)", line)
+            match = re.search(r'\bmedia_blocks_reserved"?\s*[:=]\s*(\d+)\b', line)
             if match:
                 current["media_blocks"] = int(match.group(1))
-            match = re.search(r"\bfits=(True|False|true|false)", line)
+            match = re.search(r'\bfits"?\s*[:=]\s*(True|False|true|false)\b', line)
             if match:
                 current["fits"] = match.group(1).lower() == "true"
             if current:
@@ -1026,7 +1026,7 @@ def _attachment_capacity_llm_error_failure_kind(
 
 
 _ATTACHMENT_CAPACITY_HTTP_ERROR_RE = re.compile(
-    r"provider\.chat_http_error\b.*?\bstatus_code=(\d{3})\b"
+    r'\bstatus_code"?\s*[:=]\s*(\d{3})\b'
 )
 
 
@@ -1038,6 +1038,8 @@ def _attachment_capacity_provider_http_statuses(paths: list[Path]) -> list[int]:
         if not path.is_file():
             continue
         for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+            if "provider.chat_http_error" not in line:
+                continue
             match = _ATTACHMENT_CAPACITY_HTTP_ERROR_RE.search(line)
             if match is None:
                 continue

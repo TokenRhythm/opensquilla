@@ -21,6 +21,7 @@ from opensquilla.engine import tool_result_store as trs_module
 from opensquilla.provider import ContentBlockToolResult, ContentBlockToolUse, Message
 from opensquilla.tools import ToolRegistry, tool
 from opensquilla.tools.dispatch import build_tool_handler
+from opensquilla.tools.types import ToolContext, current_tool_context
 
 
 class _CapturingProvider:
@@ -59,7 +60,72 @@ def _agent_with_store(tmp_path: Path) -> Agent:
         ),
         tool_definitions=tool_definitions,
         tool_handler=tool_handler,
+        tool_context=ToolContext(session_key="agent:main:webchat:a", agent_id="main"),
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cancel", [False, True])
+async def test_turn_bound_body_writer_is_offloop_and_restored(tmp_path, monkeypatch, cancel):
+    agent = _agent_with_store(tmp_path)
+    loop_thread = threading.get_ident()
+    write_threads = []
+    original_write = trs_module.ToolResultStore.write
+
+    def write(self, *args, **kwargs):
+        write_threads.append(threading.get_ident())
+        return original_write(self, *args, **kwargs)
+
+    monkeypatch.setattr(trs_module.ToolResultStore, "write", write)
+    context = agent._tool_context
+    previous = context.tool_result_snapshot_writer
+    references = []
+
+    async def turn(*args, **kwargs):
+        assert context.tool_result_snapshot_writer is not None
+        token = current_tool_context.set(context)
+        try:
+            reference = await context.tool_result_snapshot_writer(
+                "<external-content>first\r\n正文🙂\r\nlast</external-content>",
+                "web_fetch", "fetch-1",
+            )
+            references.append(reference)
+            if cancel:
+                raise asyncio.CancelledError
+        finally:
+            current_tool_context.reset(token)
+        if False:
+            yield
+
+    monkeypatch.setattr(agent, "_turn_generator", turn)
+    if cancel:
+        with pytest.raises(asyncio.CancelledError):
+            _ = [event async for event in agent.run_turn("synthetic fetch")]
+    else:
+        _ = [event async for event in agent.run_turn("synthetic fetch")]
+    assert references[0] is not None
+    assert write_threads and all(thread != loop_thread for thread in write_threads)
+    assert context.tool_result_snapshot_writer is previous
+    record = trs_module.ToolResultStore(str(tmp_path / "store")).read(
+        references[0]["handle"], session_id="sid-a",
+    )
+    assert "\r\n正文🙂\r\n" in record.content
+
+
+@pytest.mark.asyncio
+async def test_body_writer_refuses_missing_scope_or_retrieval(tmp_path):
+    agent = _agent_with_store(tmp_path)
+    context = agent._tool_context
+    token = current_tool_context.set(context)
+    try:
+        assert await agent._write_tool_body_snapshot("body", "web_fetch", "") is None
+        context.tool_result_retrieval_available = False
+        assert await agent._write_tool_body_snapshot("body", "web_fetch", "fetch-1") is None
+        context.tool_result_retrieval_available = True
+        agent._provider_call_tool_result_retrieval_available = False
+        assert await agent._write_tool_body_snapshot("body", "web_fetch", "fetch-1") is None
+    finally:
+        current_tool_context.reset(token)
 
 
 def _bulky_messages() -> list[Message]:

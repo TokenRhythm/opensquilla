@@ -15,25 +15,17 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import re
 from dataclasses import asdict, dataclass, field, fields
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Literal
 
 from opensquilla.bootstrap_types import BootstrapFileReport
+from opensquilla.observability.log_privacy import log_metadata
 from opensquilla.paths import default_opensquilla_home
 
 SCHEMA_VERSION = 16
 _INTENT_SUMMARY_MAX_CHARS = 500
-_EMAIL_RE = re.compile(r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b", re.IGNORECASE)
-_URL_RE = re.compile(r"https?://[^\s<>'\"]+", re.IGNORECASE)
-_SECRET_ASSIGN_RE = re.compile(
-    r"\b(api[_-]?key|token|secret|password|authorization)\s*[:=]\s*([^\s,;]+)",
-    re.IGNORECASE,
-)
-_LONG_SECRET_RE = re.compile(r"\b(?:sk-[A-Za-z0-9_-]{16,}|[A-Za-z0-9_/-]{32,})\b")
-_ABS_PATH_RE = re.compile(r"(?<!\w)(?:/home/[^/\s]+|/Users/[^/\s]+|/root)(?:/[^\s]+)*")
 _VISION_GATE_DECISIONS = {"needs_image", "text_only", "unknown"}
 _VISION_GATE_STATIC_DECISIONS = {"disabled", "current_image", "not_applicable"}
 _VISION_GATE_STATIC_REASONS = {"candidate_window_expired"}
@@ -187,24 +179,8 @@ def _hash16(text: str) -> str:
 
 
 def build_intent_summary(message: str, max_chars: int = _INTENT_SUMMARY_MAX_CHARS) -> str:
-    """Return a bounded, redacted intent hint for history aggregation.
-
-    Default decision logs still avoid raw prompt storage. This derived summary
-    preserves enough task shape for history mining while removing common
-    secrets, emails, URLs, and machine-local absolute paths.
-    """
-
-    text = " ".join(str(message or "").split())
-    if not text:
-        return ""
-    text = _URL_RE.sub("[url]", text)
-    text = _EMAIL_RE.sub("[email]", text)
-    text = _SECRET_ASSIGN_RE.sub(lambda m: f"{m.group(1)}=[secret]", text)
-    text = _LONG_SECRET_RE.sub("[secret]", text)
-    text = _ABS_PATH_RE.sub(_redact_path_keep_basename, text)
-    if len(text) > max_chars:
-        text = text[: max(0, max_chars - 1)].rstrip() + "…"
-    return text
+    """Legacy helper: operational logs no longer store prompt-derived prose."""
+    return ""
 
 
 def build_vision_followup_gate_reason_code(
@@ -242,11 +218,6 @@ def build_vision_followup_gate_reason_code(
     if decision_text == "unknown":
         return "unknown"
     return None
-
-
-def _redact_path_keep_basename(match: re.Match[str]) -> str:
-    basename = match.group(0).rstrip("/").rsplit("/", 1)[-1]
-    return f"[path:{basename}]" if basename else "[path]"
 
 
 def _default_log_dir() -> Path:
@@ -287,8 +258,11 @@ def write_decision_entry(
     log_dir.mkdir(parents=True, exist_ok=True)
     day = datetime.now(UTC).strftime("%Y%m%d")
     path = log_dir / f"decisions-{day}.jsonl"
+    payload = log_metadata(asdict(entry))
+    # Old callers must not reintroduce prose, including in the debug mirror.
+    payload["intent_summary"] = None
     with path.open("a", encoding="utf-8") as fh:
-        fh.write(json.dumps(asdict(entry), ensure_ascii=False) + "\n")
+        fh.write(json.dumps(payload, ensure_ascii=False) + "\n")
 
     # Debug mirror: opt-in via OPENSQUILLA_DEBUG_LOG=1. Mirrors the *structured*
     # entry, never raw prompt bytes. Reuses `day` so primary and debug files
@@ -300,7 +274,7 @@ def write_decision_entry(
         with debug_path.open("a", encoding="utf-8") as fh:
             fh.write(
                 json.dumps(
-                    {"turn_id": entry.turn_id, "entry": asdict(entry)},
+                    {"turn_id": payload.get("turn_id"), "entry": payload},
                     ensure_ascii=False,
                 )
                 + "\n"

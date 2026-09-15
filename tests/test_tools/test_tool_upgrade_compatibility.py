@@ -159,6 +159,7 @@ def test_tool_context_appends_new_runtime_fields_after_legacy_fields() -> None:
         "tool_result_store_max_bytes",
         "tool_result_store_disk_budget_bytes",
         "tool_result_store_retention_seconds",
+        "tool_result_snapshot_writer",
         "execution_status_snapshot",
         "router_control_routing_revision",
     ]
@@ -196,5 +197,22 @@ def test_tool_context_preserves_output_spool_positional_constructor() -> None:
     assert context.tool_result_store_max_bytes == 1024
     assert context.tool_result_store_disk_budget_bytes == 4096
     assert context.tool_result_store_retention_seconds == 3600
+    assert context.execution_status_snapshot is None
+    assert context.router_control_routing_revision is None
+
+
+def test_tool_context_preserves_snapshot_writer_positional_constructor() -> None:
+    async def write_snapshot(content, tool_name, tool_use_id):
+        return None
+
+    defaults = ToolContext()
+    published_fields = fields(ToolContext)[:109]
+    assert published_fields[-1].name == "tool_result_snapshot_writer"
+    published_values = [getattr(defaults, item.name) for item in published_fields]
+    published_values[-1] = write_snapshot
+
+    context = ToolContext(*published_values)
+
+    assert context.tool_result_snapshot_writer is write_snapshot
     assert context.execution_status_snapshot is None
     assert context.router_control_routing_revision is None

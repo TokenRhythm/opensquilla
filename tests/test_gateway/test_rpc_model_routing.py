@@ -173,6 +173,66 @@ def test_other_provider_activation_with_one_candidate_fails_atomically() -> None
     assert cfg.llm_ensemble.candidates == []
 
 
+@pytest.mark.parametrize("provider", ["byteplus", "openrouter", "tokenrhythm"])
+def test_first_activation_uses_submitted_lineup_without_selection_mode(provider: str) -> None:
+    cfg = GatewayConfig(
+        llm={"provider": provider, "model": "primary-model"},
+        squilla_router={
+            "enabled": False,
+            "tiers": {
+                "c0": {"provider": provider, "model": "same-model"},
+                "c3": {"provider": provider, "model": "same-model"},
+            },
+        },
+    )
+    candidates = [
+        {"provider": provider, "model": "first-model", "thinking_level": "low"},
+        {"provider": provider, "model": "second-model", "role": "proposer"},
+        {"provider": provider, "model": "fusion-model", "role": "aggregator"},
+    ]
+
+    changed = upsert_llm_ensemble(cfg, enabled=True, candidates=candidates).config
+
+    assert changed.llm_ensemble.enabled is True
+    assert changed.llm_ensemble.selection_mode == "custom_b5"
+    assert [candidate.model for candidate in changed.llm_ensemble.candidates] == [
+        "first-model", "second-model", "fusion-model",
+    ]
+    assert changed.llm_ensemble.candidates[0].thinking_level == "low"
+    assert changed.llm_ensemble.candidates[-1].role == "aggregator"
+    assert {"llm_ensemble.selection_mode", "llm_ensemble.candidates"}.issubset(
+        changed.force_persist_paths()
+    )
+    assert cfg.llm_ensemble.enabled is False
+    assert cfg.llm_ensemble.candidates == []
+
+
+def test_submitted_lineup_keeps_existing_selection_mode_on_activation() -> None:
+    cfg = GatewayConfig(
+        llm={"provider": "tokenrhythm"},
+        llm_ensemble={"selection_mode": "static_openrouter_b5"},
+    )
+
+    changed = upsert_llm_ensemble(
+        cfg,
+        enabled=True,
+        candidates=[{"provider": "openrouter", "model": "stored-custom-model"}],
+    ).config
+
+    assert changed.llm_ensemble.selection_mode == "static_openrouter_b5"
+    assert changed.llm_ensemble.candidates[0].model == "stored-custom-model"
+
+
+def test_first_activation_with_explicit_empty_lineup_fails_without_generation() -> None:
+    cfg = GatewayConfig(llm={"provider": "tokenrhythm"})
+
+    with pytest.raises(ValueError, match="enabled proposer candidates"):
+        upsert_llm_ensemble(cfg, enabled=True, candidates=[])
+
+    assert cfg.llm_ensemble.enabled is False
+    assert cfg.llm_ensemble.candidates == []
+
+
 @pytest.mark.parametrize("invalid_provider", ["unknown-provider", "github_copilot"])
 def test_other_provider_activation_rejects_non_runtime_candidates_atomically(
     invalid_provider: str,
@@ -711,6 +771,7 @@ async def test_models_routing_set_persist_failure_never_reconciles_live_runtime(
 ) -> None:
     config = GatewayConfig(
         config_path=str(tmp_path / "routing-failure.toml"),
+        llm={"provider": "openrouter", "model": "test-model"},
         llm_ensemble={"enabled": False},
         squilla_router={"enabled": False, "rollout_phase": "observe"},
     )
@@ -905,6 +966,7 @@ async def test_onboarding_ensemble_configure_broadcasts_one_canonical_change(
 ) -> None:
     config = GatewayConfig(
         config_path=str(tmp_path / "ensemble.toml"),
+        llm={"provider": "openrouter", "model": "test-model"},
         llm_ensemble={"enabled": False, "selection_mode": "router_dynamic"},
         squilla_router={"enabled": False, "rollout_phase": "observe"},
     )
@@ -929,6 +991,46 @@ async def test_onboarding_ensemble_configure_broadcasts_one_canonical_change(
             },
         )
     ]
+
+
+async def test_ensemble_configure_persists_submitted_first_lineup_and_reenables(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from opensquilla.onboarding import config_store
+
+    path = tmp_path / "byteplus-ensemble.toml"
+    path.write_text(
+        '[llm]\nprovider = "byteplus"\nmodel = "seed-lite"\n'
+        '[squilla_router]\nenabled = false\ntier_profile = "byteplus"\n',
+        encoding="utf-8",
+    )
+    config = GatewayConfig.load(str(path))
+    ctx, events = _routing_event_ctx(config, monkeypatch)
+    persist = MagicMock(wraps=config_store.persist_config)
+    monkeypatch.setattr(config_store, "persist_config", persist)
+    candidates = [
+        {"provider": "byteplus", "model": "seed-lite", "role": "proposer"},
+        {"provider": "byteplus", "model": "seed-pro", "role": "proposer"},
+    ]
+
+    await _ensemble_configure({"enabled": True, "candidates": candidates}, ctx)
+
+    assert persist.call_count == 1
+    assert len(events) == 1
+    assert model_routing_snapshot(config)["mode"] == "ensemble"
+    reloaded = GatewayConfig.load(str(path))
+    assert reloaded.llm_ensemble.selection_mode == "custom_b5"
+    assert [row.model for row in reloaded.llm_ensemble.candidates] == ["seed-lite", "seed-pro"]
+    assert model_routing_snapshot(reloaded)["mode"] == "ensemble"
+
+    # A later mode-only reactivation must use the saved lineup rather than
+    # rediscovering the provider's one-model Router preset.
+    await _handle_models_routing_set({"mode": "router"}, ctx)
+    await _handle_models_routing_set({"mode": "ensemble"}, ctx)
+
+    assert model_routing_snapshot(config)["mode"] == "ensemble"
+    assert [row.model for row in config.llm_ensemble.candidates] == ["seed-lite", "seed-pro"]
 
 
 async def test_models_routing_set_reuses_safe_patch_broadcast_exactly_once(
@@ -1121,6 +1223,7 @@ async def test_legacy_safe_patch_ensemble_enable_repairs_router_dependency_once(
 ) -> None:
     config = GatewayConfig(
         config_path=str(tmp_path / "legacy-safe.toml"),
+        llm={"provider": "openrouter", "model": "test-model"},
         llm_ensemble={"enabled": False, "selection_mode": "router_dynamic"},
         squilla_router={"enabled": False, "rollout_phase": "observe"},
     )

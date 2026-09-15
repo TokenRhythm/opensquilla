@@ -1539,24 +1539,27 @@ def test_desktop_onboarding_exposes_immediate_and_slow_submit_feedback() -> None
 
 def test_desktop_tokenrhythm_single_page_onboarding_defaults_to_router() -> None:
     main_ts = _read("desktop/electron/src/main.ts")
+    router_profiles = _read("desktop/electron/src/desktop-router-profiles.ts")
+    router_config = _read("desktop/electron/src/desktop-router-config.ts")
     tokenrhythm_catalog = _section(main_ts, "id: 'tokenrhythm'", "id: 'openrouter'")
-    tokenrhythm_profile = _section(main_ts, "  tokenrhythm: {", "  openrouter: {")
+    tokenrhythm_profile = _section(router_profiles, "  tokenrhythm: {", "  openrouter: {")
     onboarding_html = _section(main_ts, "function onboardingHtml", "async function runOnboarding")
 
     assert "routerSupported: true" in tokenrhythm_catalog
     assert "ensembleSelectionMode: 'static_tokenrhythm_b5'" in tokenrhythm_catalog
     assert "model: 'deepseek-v4-pro-0813'" in tokenrhythm_catalog
-    assert "const INLINE_ROUTER_PROFILE_IDS = new Set(['tokenrhythm'])" in main_ts
-    assert "!INLINE_ROUTER_PROFILE_IDS.has(credential.provider)" in main_ts
+    assert "desktopRouterConfigTomlLines(credential, existingRaw, routerWriteIntent)" in main_ts
+    assert "`preset_binding = ${tomlValue(binding)}`" in router_config
     assert "return selected.routerSupported ? 'squilla_router' : 'direct';" in onboarding_html
     assert (
         "routerMode.value = modelRoutingMode.value === 'direct' ? 'disabled' : 'recommended';"
         in onboarding_html
     )
-    assert "routerTiers = clone(routerProfiles[profileKeyForMode()]);" in onboarding_html
-    assert "return provider.value;" in onboarding_html
-    assert "routerDefaultTier: 'c1'," in onboarding_html
-    assert "routerTiers: clone(routerTiers)," in onboarding_html
+    assert "routerTiers:" not in onboarding_html
+    assert "routerDefaultTier:" not in onboarding_html
+    assert "defaultTiers: defaultRouterTiers(provider," in main_ts
+    assert "routerDefaultTier: 'c1'," in router_config
+    assert "routerPresetBinding: 'follow_primary'," in router_config
     assert "[data-model-routing-mode]" not in onboarding_html
     assert "'selection_mode = \"custom_b5\"'" in main_ts
     assert "'[[llm_ensemble.candidates]]'" in main_ts
@@ -1573,7 +1576,7 @@ def test_desktop_tokenrhythm_single_page_onboarding_defaults_to_router() -> None
         assert model in tokenrhythm_profile
     assert "ensembleEnabled: true" in tokenrhythm_profile
     assert "thinkingLevel" not in tokenrhythm_profile
-    assert "ensemble_enabled = ${tier.ensembleEnabled ? 'true' : 'false'}" in main_ts
+    assert "ensemble_enabled = ${tomlValue(ensembleEnabled)}" in router_config
 
 
 def test_desktop_legacy_inline_router_does_not_inherit_new_c3_ensemble() -> None:
@@ -3924,7 +3927,7 @@ def test_complete_profile_import_holds_exclusive_writer_admission_through_reconc
     save_credential = _section(
         main_ts,
         "async function saveDesktopCredential",
-        "// Sections the desktop config template owns",
+        "const DESKTOP_OWNED_CONFIG_SECTIONS",
     )
     assert "writerReserved = false" in save_credential
     assert "writerReserved\n    ? () => {}" in save_credential
@@ -4091,7 +4094,7 @@ def test_single_page_onboarding_never_contains_profile_migration() -> None:
 
 def test_onboarding_inline_json_escapes_script_terminators_and_line_separators() -> None:
     main_ts = _read("desktop/electron/src/main.ts")
-    helper = _section(main_ts, "function inlineScriptJson", "function routerTierTomlLines")
+    helper = _section(main_ts, "function inlineScriptJson", "function ensembleConfigTomlLines")
     html = _section(main_ts, "function onboardingHtml", "async function runOnboarding")
 
     assert ".replace(/</g, '\\\\u003c')" in helper
@@ -4105,12 +4108,12 @@ def test_onboarding_inline_json_escapes_script_terminators_and_line_separators()
         "desktopLocale",
         "PROVIDER_CATALOG",
         "SEARCH_PROVIDER_CATALOG",
-        "ROUTER_PROFILES",
         "pendingProviderSetup",
     ):
         assert f"${{inlineScriptJson({value})}}" in html
     assert "${inlineScriptJson(PROVIDER_NOTE_MESSAGES)}" not in html
     assert "${inlineScriptJson(TEXT_ROUTER_TIERS)}" not in html
+    assert "${inlineScriptJson(ROUTER_PROFILES)}" not in html
 
 
 def test_migration_preload_bridge_and_progress_channel() -> None:

@@ -8,6 +8,7 @@ from typing import Any, Final
 from opensquilla.gateway.adapters._generated_contract_bindings import (
     generated_contract_bindings,
     register_generated_contract_binding,
+    validate_generated_contract_params,
 )
 from opensquilla.gateway.adapters.contract_method import (
     ErrorFactory,
@@ -24,6 +25,7 @@ PLATFORM_CONFIGURATION_CONTRACT_METHODS: Final = (
     "providers.status",
     "models.routing.get",
     "models.routing.set",
+    "models.routing.resetRecommended",
 )
 
 
@@ -35,6 +37,12 @@ _BINDINGS: Final = generated_contract_bindings(
     PLATFORM_CONFIGURATION_CONTRACT_METHODS,
     PlatformConfigurationContractError,
 )
+
+
+def validate_reset_recommended_params(params: Any) -> dict[str, Any]:
+    return validate_generated_contract_params(
+        "models.routing.resetRecommended", params, strict=True,
+    )
 
 
 def register_platform_configuration_contract[ContextT, ResultT](
@@ -60,4 +68,5 @@ __all__ = [
     "PLATFORM_CONFIGURATION_CONTRACT_METHODS",
     "PlatformConfigurationContractError",
     "register_platform_configuration_contract",
+    "validate_reset_recommended_params",
 ]
