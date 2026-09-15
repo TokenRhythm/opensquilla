@@ -550,6 +550,15 @@ def derive_provider_request_correlation(
     return replace(correlation, **updates) if updates else correlation
 
 
+@dataclass(frozen=True, slots=True)
+class ExecutionIdentity:
+    """Request-local deployment facts, not proof of upstream model weights."""
+
+    kind: Literal["single_model", "multi_model_fusion"] = "single_model"
+    provider: str = ""
+    model: str = ""
+
+
 class ChatConfig(BaseModel):
     """Runtime options for a single chat call."""
 
@@ -557,6 +566,7 @@ class ChatConfig(BaseModel):
     temperature: float | None = None
     top_p: float | None = None
     system: str | None = None
+    execution_identity: ExecutionIdentity | None = Field(default=None, exclude=True, repr=False)
     stop_sequences: list[str] = []
     thinking: bool = False
     thinking_budget_tokens: int = 5000
@@ -657,6 +667,11 @@ class ChatConfig(BaseModel):
 class ContentBlockText(BaseModel):
     type: Literal["text"] = "text"
     text: str
+    _execution_identity_span: tuple[int, int] | None = PrivateAttr(default=None)
+
+    @property
+    def execution_identity_span(self) -> tuple[int, int] | None:
+        return self._execution_identity_span
 
 
 class ContentBlockToolUse(BaseModel):
@@ -759,8 +774,13 @@ class Message(BaseModel):
 
     role: Literal["user", "assistant"]
     content: MessageContent
+    _execution_identity_span: tuple[int, int] | None = PrivateAttr(default=None)
     reasoning_content: str | None = None
     provider_replay: ProviderReplayState | None = None
+
+    @property
+    def execution_identity_span(self) -> tuple[int, int] | None:
+        return self._execution_identity_span
 
 
 # ---------------------------------------------------------------------------

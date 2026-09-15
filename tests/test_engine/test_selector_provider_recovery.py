@@ -17,6 +17,7 @@ from opensquilla.provider.types import (
     ChatConfig,
     DoneEvent,
     ErrorEvent,
+    ExecutionIdentity,
     Message,
     ModelCapabilities,
     ReasoningDeltaEvent,
@@ -299,6 +300,55 @@ async def test_selected_fallback_recovers_connection_without_returning_to_primar
     assert calls == ["primary", "secondary", "secondary", "secondary"]
     assert clock[1] == [5, 10]
     assert any(event.kind == "done" and event.text == "recovered" for event in events)
+
+
+@pytest.mark.parametrize("path", ["same_leg", "fallback", "deadline_fallback"])
+async def test_recovery_preserves_each_physical_request_execution_identity(
+    monkeypatch, clock, path
+):
+    captured = []
+    original_chat = _Provider.chat
+
+    async def capture_chat(self, messages, tools=None, config=None):
+        captured.append((
+            self.model, config.execution_identity,
+            json.dumps([message.model_dump() for message in messages], ensure_ascii=False),
+        ))
+        async for event in original_chat(self, messages, tools=tools, config=config):
+            yield event
+
+    monkeypatch.setattr(_Provider, "chat", capture_chat)
+    recovery = [[_connection()], [_connection()], _success()]
+    if path == "same_leg":
+        streams = {"primary": recovery}
+        expected = ["primary"] * 3
+    else:
+        failure = (
+            ErrorEvent(message="rate limit exceeded", code="429", retry_after_s=80)
+            if path == "deadline_fallback"
+            else ErrorEvent(message="model not found", code="404")
+        )
+        streams = {"primary": [[failure]], "secondary": recovery}
+        expected = ["primary", "secondary", "secondary", "secondary"]
+    provider, _, calls = _wrapper(monkeypatch, streams)
+    selected = ExecutionIdentity(provider="openai", model="primary")
+    agent = _agent(provider, execution_identity=selected, timeout=60)
+
+    events = [event async for event in agent.run_turn("Identify the current deployment.")]
+
+    assert calls == expected
+    assert clock[1] == [5, 10]
+    assert any(event.kind == "done" and event.text == "recovered" for event in events)
+    for model, identity, serialized in captured:
+        assert identity.provider == "openai"
+        assert identity.model == model
+        assert serialized.count("Current response execution:") == 1
+        assert json.dumps(f'"model":"{model}"')[1:-1] in serialized
+    assert len({serialized for model, _, serialized in captured if model == expected[-1]}) == 1
+    assert agent.config.execution_identity == selected
+    status = agent._execution_status_snapshot()
+    assert status["selection"]["model"] == "primary"
+    assert status["current_request"]["model"] == expected[-1]
 
 
 @pytest.mark.parametrize("prefix", [TextDeltaEvent(text="partial"), ReasoningDeltaEvent(text="r")])

@@ -6002,6 +6002,7 @@ class SessionStorage:
                     "revision": current_revision,
                     "source": "session",
                     "initialized": False,
+                    "changed": False,
                 }
             if expected_revision is not None and current_revision != expected_revision:
                 raise SessionRoutingConflictError(
@@ -6027,6 +6028,7 @@ class SessionStorage:
                 "revision": current_revision + 1,
                 "source": "session",
                 "initialized": current_mode is None,
+                "changed": True,
             }
 
     # ── Collaboration plans ────────────────────────────────────────────────

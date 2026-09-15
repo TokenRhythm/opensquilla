@@ -631,6 +631,11 @@ def test_manifest_change_during_scan_retries_once(tmp_path: Path, monkeypatch) -
 
 
 def test_twice_unstable_scan_keeps_last_known_good(tmp_path: Path, monkeypatch) -> None:
+    # Assert publication separately from the later compatibility auto-probe.
+    # Slow filesystems must not let get_by_name cross the 250 ms probe window
+    # halfway through this one logical observation.
+    clock = [1.0]
+    monkeypatch.setattr(skill_loader_module, "time", SimpleNamespace(monotonic=lambda: clock[0]))
     root = tmp_path / "skills"
     _write_skill(root, "alpha", "last known good")
     loader = _loader(root, tmp_path)
@@ -657,6 +662,9 @@ def test_twice_unstable_scan_keeps_last_known_good(tmp_path: Path, monkeypatch) 
     assert result.success is False
     assert result.generation == generation
     assert loader.get_by_name("alpha").description == "last known good"  # type: ignore[union-attr]
+    clock[0] += skill_loader_module._COMPAT_PROBE_INTERVAL_SECONDS + 0.01
+    assert loader.get_by_name("alpha").description == "third candidate"  # type: ignore[union-attr]
+    assert loader.snapshot().generation > generation
 
 
 def test_mutation_guard_hides_in_progress_write_until_next_access(tmp_path: Path) -> None:
