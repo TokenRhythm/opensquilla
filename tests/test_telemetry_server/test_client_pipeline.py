@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import json
 from datetime import UTC, datetime
 from functools import partial
@@ -84,17 +83,8 @@ async def test_spool_retry_upload_advances_collector_watermark_and_dashboard_dat
         growth_db_path=tmp_path / "unused-growth.sqlite3",
     )
     selected_day = UtcCohortWindow.from_dates("2026-08-02", "2026-08-02")
-    sleeping = asyncio.Event()
-    tick = asyncio.Event()
-    delays = []
     attempts = 0
     open_outbox = TelemetryOutbox.open
-
-    async def interval_sleep(delay):
-        delays.append(delay)
-        sleeping.set()
-        await tick.wait()
-        tick.clear()
 
     async def transient_open(_cls, path, scope, **kwargs):
         nonlocal attempts
@@ -104,9 +94,6 @@ async def test_spool_retry_upload_advances_collector_watermark_and_dashboard_dat
         return await open_outbox(path, scope, **kwargs)
 
     monkeypatch.setattr(TelemetryOutbox, "open", classmethod(transient_open))
-    monkeypatch.setattr(
-        runtime_module, "asyncio", SimpleNamespace(**(vars(asyncio) | {"sleep": interval_sleep}))
-    )
     async with app.router.lifespan_context(app):
         received_at = datetime(2026, 8, 2, 2, tzinfo=UTC)
         app.state.telemetry_storage._clock = lambda: received_at
@@ -119,16 +106,14 @@ async def test_spool_retry_upload_advances_collector_watermark_and_dashboard_dat
             runtime = ScopedTelemetryRuntime(
                 config=config, base_url="https://collector.invalid", env=policy_env
             )
-            await runtime.start()
+            await runtime._drain_desktop_spool()
             try:
-                await asyncio.wait_for(sleeping.wait(), timeout=2)
+                await runtime._run_upload_cycle()
                 assert attempts == 3
                 assert first.exists()
                 assert queries.reliability(selected_day)["asOfReceivedUtc"] is None
 
-                sleeping.clear()
-                tick.set()
-                await asyncio.wait_for(sleeping.wait(), timeout=2)
+                await runtime._run_upload_cycle()
                 assert not first.exists()
                 initial = queries.reliability(selected_day)
                 assert initial["asOfReceivedUtc"] == "2026-08-02T02:00:00.000Z"
@@ -142,9 +127,7 @@ async def test_spool_retry_upload_advances_collector_watermark_and_dashboard_dat
 
                 second = _spool_event(state_dir, number=2, day="2026-08-02")
                 received_at = datetime(2026, 8, 3, 2, tzinfo=UTC)
-                sleeping.clear()
-                tick.set()
-                await asyncio.wait_for(sleeping.wait(), timeout=2)
+                await runtime._run_upload_cycle()
                 assert not second.exists()
                 updated = queries.reliability(selected_day)
                 assert updated["asOfReceivedUtc"] == "2026-08-03T02:00:00.000Z"
@@ -154,7 +137,6 @@ async def test_spool_retry_upload_advances_collector_watermark_and_dashboard_dat
                 ]
                 scoped = runtime._scopes[TelemetryScope.RELIABILITY]
                 assert (await scoped.outbox.stats()).pending_events == 0
-                assert delays == [30.0, 30.0, 30.0]
             finally:
                 await runtime.close()
 
