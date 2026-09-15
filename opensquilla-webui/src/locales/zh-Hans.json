@@ -3525,7 +3525,7 @@
     "loadingSession": "正在恢复会话历史…",
     "loadingSessionDescription": "历史加载期间，您仍可继续使用此会话。",
     "loadSessionFailed": "暂时无法恢复会话历史",
-    "loadSessionDescription": "连接可能中断，或历史服务暂时不可用。请重新加载。",
+    "loadSessionDescription": "会话历史暂时不可用。",
     "reloadSession": "重新加载历史",
     "retryingSession": "正在重新加载会话历史…",
     "retryingSessionDescription": "正在恢复会话历史…",
@@ -3535,11 +3535,11 @@
     "gatewayReconnecting": "正在重新连接 Gateway…",
     "automaticRecoveryDescription": "正在自动恢复，可继续编辑；未发送的文字和附件会保留在这里。",
     "liveUnavailable": "实时更新暂不可用",
-    "liveUnavailableDescription": "历史消息仍可查看。请重新连接后再发送。",
-    "liveUnavailableConnectedDescription": "Gateway 已连接，历史消息仍可查看；当前会话实时更新恢复后即可发送。",
+    "liveUnavailableDescription": "历史消息仍可查看；实时更新恢复后即可发送。",
+    "liveUnavailableConnectedDescription": "Gateway 已连接。当前会话的实时更新暂时不可用。",
     "reconnectLive": "重新连接",
     "liveSendBlockedConnecting": "正在恢复实时更新，草稿已保留。",
-    "liveSendBlockedDegraded": "请先恢复实时更新再发送，草稿已保留。",
+    "liveSendBlockedDegraded": "实时更新暂时不可用，草稿已保留。",
     "noMessagesYet": "暂无消息。",
     "newChat": "新建任务",
     "chatWithSuffix": "聊天 {suffix}",
@@ -4012,7 +4012,7 @@
         "busy": "目标状态仍在结算，最新状态已显示在上方。",
         "notResumable": "当前状态下无法恢复这个目标。",
         "executionDisabled": "此工作区未启用 Goal 执行。",
-        "connectionRequired": "请重新连接当前任务后再继续目标。",
+        "connectionRequired": "当前任务暂时无法继续。",
         "planModeActive": "目标会等待 Plan 模式结束。",
         "planRunActive": "目标会等待当前 Plan 运行结束。",
         "requestConflict": "这次目标操作已用于其他请求，请重试。"
@@ -4322,7 +4322,7 @@
       "unknownProviderCalls": "{count} 次服务商调用的用量未知"
     },
     "modelRouting": {
-      "updateFailed": "切换模型路由失败，已恢复原设置。请检查网关连接后重试。",
+      "updateFailed": "无法切换模型路由，已恢复原设置。当前操作暂时不可用。",
       "sessionUpdateFailed": "无法更新当前会话的模型路由：{error}"
     },
     "routeFeedback": {

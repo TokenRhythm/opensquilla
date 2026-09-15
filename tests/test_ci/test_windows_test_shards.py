@@ -68,6 +68,7 @@ OFFLINE_MARKER_EXCLUSIONS = {
     "tests/test_skills/test_meta_skill_creator_smoke_live.py",
 }
 RECENTLY_ADDED_ACTIVE_TESTS = {
+    "tests/test_scripts/test_gateway_ux.py",
     "tests/test_engine/test_agent_autonomous_tool_recovery.py",
     "tests/test_engine/test_agent_connection_recovery.py",
     "tests/test_engine/test_selector_provider_recovery.py",

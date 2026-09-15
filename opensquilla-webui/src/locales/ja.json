@@ -3441,7 +3441,7 @@
     "loadingSession": "会話履歴を復元しています…",
     "loadingSessionDescription": "履歴の読み込み中も、この会話を引き続き使用できます。",
     "loadSessionFailed": "会話履歴を一時的に読み込めません",
-    "loadSessionDescription": "接続が中断されたか、履歴サービスが一時的に利用できない可能性があります。再読み込みしてください。",
+    "loadSessionDescription": "会話履歴は一時的に利用できません。",
     "reloadSession": "履歴を再読み込み",
     "retryingSession": "会話履歴を再読み込みしています…",
     "retryingSessionDescription": "会話履歴を復元しています…",
@@ -3451,11 +3451,11 @@
     "gatewayReconnecting": "Gateway に再接続しています…",
     "automaticRecoveryDescription": "自動的に復旧しています。編集を続けられます。未送信のテキストと添付ファイルはここに保持されます。",
     "liveUnavailable": "リアルタイム更新を一時的に利用できません",
-    "liveUnavailableDescription": "履歴は引き続き表示できます。送信前に再接続してください。",
-    "liveUnavailableConnectedDescription": "Gateway には接続済みで、履歴も表示できます。リアルタイム更新の復元後に送信を再開できます。",
+    "liveUnavailableDescription": "履歴は引き続き表示できます。リアルタイム更新の復旧後に送信を再開します。",
+    "liveUnavailableConnectedDescription": "Gateway は接続されています。このセッションのリアルタイム更新は一時的に利用できません。",
     "reconnectLive": "再接続",
-    "liveSendBlockedConnecting": "リアルタイム更新を復旧しています。下書きは保持されています。",
-    "liveSendBlockedDegraded": "送信前にリアルタイム更新を再接続してください。下書きは保持されています。",
+    "liveSendBlockedConnecting": "リアルタイム更新は一時的に利用できません。下書きは保持されています。",
+    "liveSendBlockedDegraded": "リアルタイム更新は一時的に利用できません。下書きは保持されています。",
     "noMessagesYet": "メッセージはまだありません。",
     "newChat": "新規タスク",
     "chatWithSuffix": "チャット {suffix}",
@@ -3928,7 +3928,7 @@
         "busy": "目標の状態を確定中です。最新の状態は上に表示されています。",
         "notResumable": "現在の状態からこの目標を再開できません。",
         "executionDisabled": "このワークスペースでは Goal の実行が無効です。",
-        "connectionRequired": "タスクを再接続してから目標を続行してください。",
+        "connectionRequired": "このタスクはまだ続行できません。",
         "planModeActive": "目標は Plan モードの終了を待ちます。",
         "planRunActive": "目標は進行中の Plan 実行の終了を待ちます。",
         "requestConflict": "この目標操作は別のリクエストですでに使用されています。もう一度お試しください。"
@@ -4238,7 +4238,7 @@
       "unknownProviderCalls": "{count} 件のプロバイダー呼び出しの使用量が不明"
     },
     "modelRouting": {
-      "updateFailed": "モデルルーティングを切り替えられませんでした。元に戻しました。ゲートウェイ接続を確認して再試行してください。",
+      "updateFailed": "モデルルーティングを切り替えられず、元に戻しました。この変更は一時的に利用できません。",
       "sessionUpdateFailed": "このチャットのモデルルーティングを更新できませんでした: {error}"
     },
     "routeFeedback": {

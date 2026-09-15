@@ -893,6 +893,7 @@
       "tests/test_scheduler/test_system_event_pinned_delivery.py",
       "tests/test_scheduler/test_tz_user_surfaces.py",
       "tests/test_scheduler/test_webhook_delivery.py",
+      "tests/test_scripts/test_gateway_ux.py",
       "tests/test_scripts/test_live_meta_soft_activation_e2e.py",
       "tests/test_scripts/test_meta_trigger_accuracy_script.py",
       "tests/test_scripts/test_refresh_models_dev_snapshot.py",

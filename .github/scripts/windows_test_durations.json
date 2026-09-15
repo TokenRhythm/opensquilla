@@ -1573,6 +1573,7 @@
     "tests/test_telemetry/test_build_identity.py": 0.01,
     "tests/test_telemetry/test_coding_mode_usage.py": 0.01,
     "tests/test_telemetry/test_desktop_turn_counts.py": 0.01,
-    "tests/test_telemetry_server/test_client_pipeline.py": 0.01
+    "tests/test_telemetry_server/test_client_pipeline.py": 0.01,
+    "tests/test_scripts/test_gateway_ux.py": 0.01
   }
 }

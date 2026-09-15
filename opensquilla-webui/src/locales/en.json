@@ -3526,7 +3526,7 @@
     "loadingSession": "Restoring conversation history…",
     "loadingSessionDescription": "You can keep using this conversation while history loads.",
     "loadSessionFailed": "Conversation history temporarily unavailable",
-    "loadSessionDescription": "The connection may have been interrupted, or history is temporarily unavailable. Reload to try again.",
+    "loadSessionDescription": "Conversation history is temporarily unavailable.",
     "reloadSession": "Reload history",
     "retryingSession": "Reloading conversation history…",
     "retryingSessionDescription": "Restoring conversation history…",
@@ -3536,11 +3536,11 @@
     "gatewayReconnecting": "Reconnecting to the Gateway…",
     "automaticRecoveryDescription": "Recovering automatically. You can keep editing; unsent text and attachments stay here.",
     "liveUnavailable": "Live updates are temporarily unavailable",
-    "liveUnavailableDescription": "History remains available. Reconnect before sending.",
-    "liveUnavailableConnectedDescription": "The Gateway is connected and history remains available. Sending resumes when this session's live updates recover.",
+    "liveUnavailableDescription": "History remains available. Sending resumes when live updates recover.",
+    "liveUnavailableConnectedDescription": "The Gateway is connected. Live updates for this session are temporarily unavailable.",
     "reconnectLive": "Reconnect",
     "liveSendBlockedConnecting": "Live updates are reconnecting. Your draft is saved.",
-    "liveSendBlockedDegraded": "Reconnect live updates before sending. Your draft is saved.",
+    "liveSendBlockedDegraded": "Live updates are temporarily unavailable. Your draft is saved.",
     "noMessagesYet": "No messages yet.",
     "newChat": "New task",
     "chatWithSuffix": "Chat {suffix}",
@@ -4013,7 +4013,7 @@
         "busy": "The goal state is still settling. Its latest status is shown above.",
         "notResumable": "This goal cannot be resumed from its current state.",
         "executionDisabled": "Goal execution is disabled in this workspace.",
-        "connectionRequired": "Reconnect this task before continuing the goal.",
+        "connectionRequired": "This task is not ready to continue yet.",
         "planModeActive": "The goal will wait until Plan mode ends.",
         "planRunActive": "The goal will wait for the active Plan run to finish.",
         "requestConflict": "That goal action was already used for a different request. Try again."
@@ -4323,7 +4323,7 @@
       "unknownProviderCalls": "{count} provider call has unknown usage | {count} provider calls have unknown usage"
     },
     "modelRouting": {
-      "updateFailed": "Couldn't switch model routing — reverted. Check the gateway connection and try again.",
+      "updateFailed": "Couldn't switch model routing — reverted. The change is temporarily unavailable.",
       "sessionUpdateFailed": "Couldn't update this chat's model routing: {error}"
     },
     "routeFeedback": {
