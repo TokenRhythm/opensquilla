@@ -38,7 +38,6 @@ ProviderFactory = Callable[[str], SearchProvider]
 Fetcher = Callable[[str, int], Awaitable[Any]]
 
 _FETCH_MIN_USEFUL_CHARS = 240
-_ROOT_DOMAIN_RESULT_LIMIT = 3
 _SEARCH_CACHE_TTL_SECONDS = 900
 _EXTERNAL_CONTENT_RE = re.compile(
     r"<external-content\b[^>]*>(?P<content>.*?)</external-content>",
@@ -153,7 +152,6 @@ async def run_canonical_web_search(
     hits = [_search_result_to_hit(result, selected_provider, options) for result in raw_results]
     hits = _filter_hits_by_domain_options(hits, options)
     hits, diagnostics.duplicate_count = dedupe_hits_by_canonical_url(hits)
-    hits, diagnostics.domain_limited_count = _limit_root_domain_spam(hits, options)
     for rank, hit in enumerate(hits, start=1):
         hit.rank = rank
 
@@ -267,7 +265,7 @@ async def _default_fetcher(url: str, max_chars: int) -> dict[str, Any]:
     web_fetch = importlib.import_module("opensquilla.tools.builtin.web_fetch")
     return cast(
         dict[str, Any],
-        await web_fetch.run_web_fetch_payload(url, max_chars=max_chars),
+        await web_fetch.run_web_fetch_payload(url, max_chars=max_chars, _search_excerpt=True),
     )
 
 
@@ -400,54 +398,6 @@ def _filter_hits_by_domain_options(
     ]
 
 
-def _limit_root_domain_spam(
-    hits: list[SearchHit],
-    options: SearchOptions,
-) -> tuple[list[SearchHit], int]:
-    if options.include_domains:
-        return hits, 0
-
-    root_counts: dict[str, int] = {}
-    limited: list[SearchHit] = []
-    limited_count = 0
-    for hit in hits:
-        root_domain = _root_domain(hit.domain)
-        count = root_counts.get(root_domain, 0)
-        if root_domain and count >= _ROOT_DOMAIN_RESULT_LIMIT:
-            limited_count += 1
-            continue
-        root_counts[root_domain] = count + 1
-        limited.append(hit)
-    return limited, limited_count
-
-
-# Generic second-level labels used under two-letter ccTLDs (e.g. co.uk,
-# com.au, gov.uk). When a host ends in one of these under a 2-letter TLD, the
-# registrable domain is the last THREE labels, not two — otherwise distinct
-# organizations (bbc.co.uk vs theguardian.co.uk) collapse into one root.
-_SECOND_LEVEL_SUFFIXES = frozenset(
-    {
-        "co", "com", "net", "org", "gov", "edu", "ac", "or", "ne", "go",
-        "mil", "sch", "ltd", "plc", "nhs", "police", "me",
-    }
-)
-
-
-def _root_domain(domain: str) -> str:
-    normalized = domain.lower().strip(".")
-    if not normalized:
-        return ""
-    labels = [label for label in normalized.split(".") if label]
-    if len(labels) <= 2:
-        return normalized
-    tld = labels[-1]
-    second = labels[-2]
-    # Public-suffix-aware: bbc.co.uk / gov.uk stay distinct roots.
-    if len(tld) == 2 and second in _SECOND_LEVEL_SUFFIXES and len(labels) >= 3:
-        return ".".join(labels[-3:])
-    return ".".join(labels[-2:])
-
-
 def _domain_allowed(
     domain: str,
     *,
@@ -493,7 +443,13 @@ async def _fetch_compact_excerpts(
             continue
 
         text = _extract_external_content_text(str(payload.get("text") or ""))
-        if not text.strip():
+        status = payload.get("status")
+        if (
+            not isinstance(status, int)
+            or not 200 <= status < 300
+            or payload.get("error")
+            or not text.strip()
+        ):
             hit.fetch_status = _fetch_failure_status(payload)
             hit.extractor = str(payload.get("extractor") or "")
             diagnostics.fetch_failed_count += 1
@@ -581,7 +537,8 @@ def _failure_payload(
         "error_class": error_class,
         "error": error,
         "provider_retryable": provider_retryable,
-        "retry_allowed": False,
+        "retry_allowed": provider_retryable
+        and error_kind in {"timeout", "network", "rate_limit", "http"},
     }
 
 

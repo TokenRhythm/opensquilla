@@ -40,7 +40,7 @@
           v-if="showActivityDisclosure"
           :lifecycle="activityLifecycle"
           :step-count="activityStepCount"
-          :failure-count="documentWriterFailureCount"
+          :failure-count="toolFailureCount"
           :duration-seconds="activityDurationSeconds"
           :summary-label="displayActivitySummaryLabel"
           :detail-label="displayActivityDetailLabel"
@@ -156,7 +156,11 @@
           <TextPart
             :part="activityProjection.answerPart"
             :sources="message.sources ?? []"
+            :workspace-previews="workspacePreviews"
+            :session-key="sessionKey"
+            @open-resource="emit('openArtifact', $event)"
             @citation="onCitation"
+            @workspace-preview="openWorkspacePreview"
           />
         </div>
       </template>
@@ -211,7 +215,20 @@
         class="plan-message-intro"
         :part="activityProjection.answerPart"
         :sources="message.sources ?? []"
+        :workspace-previews="workspacePreviews"
+        :session-key="sessionKey"
+        @open-resource="emit('openArtifact', $event)"
         @citation="onCitation"
+        @workspace-preview="openWorkspacePreview"
+      />
+
+      <TextPart
+        v-if="workspacePreviews.length && (!activityProjection.canSeparateActivity || !activityProjection.answerPart)"
+        :part="{ type: 'text', key: 'workspace-preview-fallback', rawText: '', html: '' }"
+        :workspace-previews="workspacePreviews"
+        :session-key="sessionKey"
+        @open-resource="emit('openArtifact', $event)"
+        @workspace-preview="openWorkspacePreview"
       />
 
       <PlanCard
@@ -458,6 +475,10 @@ import { useCopyFeedback } from '@/composables/chat/useCopyFeedback'
 import { useRelativeNow } from '@/composables/useRelativeNow'
 import { createdSessionsFromMessage } from '@/utils/chat/createdSessions'
 import {
+  workspacePreviewOpenAction, workspacePreviewPages, workspacePreviewsFromMessage, type WorkspacePreviewLink,
+} from '@/utils/chat/workspacePreviews'
+import type { WorkbenchResource } from '@/types/workbenchResources'
+import {
 } from '@/utils/chat/toolDisplay'
 import {
   hasIncompleteUsageCoverage,
@@ -525,6 +546,7 @@ const props = defineProps<{
   goalOutcome?: GoalSnapshot | null
   goalElapsed?: string
   resolveSessionAvailability?: (sessionKey: string) => Promise<boolean>
+  resolveWorkspacePreviewResource?: (sessionKey: string, documentId: string) => Promise<WorkbenchResource | null>
 }>()
 
 const emit = defineEmits<{
@@ -656,7 +678,13 @@ const standaloneInterruptParts = computed(() =>
     )
   )),
 )
-const outcomePresentation = computed(() => turnOutcomePresentation(props.message.turnOutcome))
+const outcomePresentation = computed(() => {
+  const outcome = turnOutcomePresentation(props.message.turnOutcome)
+  if (outcome !== 'completed') return outcome
+  if (props.message.interrupted) return 'interrupted'
+  if (props.message.terminalFailure) return 'failed'
+  return outcome
+})
 const processRestart = computed(() => isProcessRestartOutcome(props.message.turnOutcome))
 
 function epochMilliseconds(value: string | number | null | undefined): number {
@@ -816,6 +844,33 @@ const legacyTimelineItems = computed<ChatStreamTimelineItem[]>(() => {
 })
 
 const semanticCreatedSessions = computed(() => createdSessionsFromMessage(props.message))
+const registeredWorkspacePreviews = computed(() => workspacePreviewsFromMessage(props.message))
+const previewResources = ref<Record<string, WorkbenchResource>>({})
+const workspacePreviews = computed(() => registeredWorkspacePreviews.value.flatMap(
+  preview => workspacePreviewPages(preview, previewResources.value[preview.documentId]),
+))
+watch(
+  [() => props.sessionKey, () => props.resolveWorkspacePreviewResource,
+    () => JSON.stringify(registeredWorkspacePreviews.value)],
+  async ([key, resolve], _previous, onCleanup) => {
+    let active = true
+    onCleanup(() => { active = false })
+    previewResources.value = {}
+    if (!key || !resolve) return
+    const entries = await Promise.all(registeredWorkspacePreviews.value.filter(preview => preview.bundleRoot)
+      .map(async preview => {
+        try {
+          const resource = await resolve(key, preview.documentId)
+          return resource ? [preview.documentId, resource] as const : null
+        } catch { return null }
+      }))
+    if (active) previewResources.value = Object.fromEntries(entries.filter(entry => entry !== null))
+  },
+  { immediate: true, flush: 'sync' },
+)
+function openWorkspacePreview(preview: WorkspacePreviewLink) {
+  emit('openArtifact', workspacePreviewOpenAction(preview, props.sessionKey))
+}
 const createdSessions = computed(() => (
   props.message.createdSessionLinks ?? semanticCreatedSessions.value
 ))
@@ -828,17 +883,6 @@ const activityLifecycle = computed<AssistantActivityLifecycle>(() => {
   if (outcomePresentation.value === 'interrupted') return 'interrupted'
   if (outcomePresentation.value === 'timeout') return 'failed'
   if (outcomePresentation.value === 'failed') return 'failed'
-  if (props.message.interrupted) return 'interrupted'
-  if (props.message.terminalFailure) return 'failed'
-  const hasTerminalFailure = !props.message.text.trim()
-    && (
-      (props.message.toolCalls || []).some(call => call.isError || call.status === 'error')
-      || (props.message.timelineItems || []).some(item =>
-        item.type === 'tool-group'
-        && item.group.calls.some(call => call.isError || call.status === 'error'),
-      )
-  )
-  if (hasTerminalFailure) return 'failed'
   return props.message.isStreaming ? 'working' : 'settled'
 })
 
@@ -928,7 +972,7 @@ const showActivityDisclosure = computed(() =>
   || props.message.activitySnapshotIncomplete === true,
 )
 
-const documentWriterFailureCount = computed(() =>
+const toolFailureCount = computed(() =>
   visibleActivityItems.value.reduce((count, item) => {
     if (item.type !== 'tool-group') return count
     return count + item.group.calls.filter(call =>

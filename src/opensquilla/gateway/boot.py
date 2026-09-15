@@ -13,6 +13,7 @@ import time
 import uuid
 from collections.abc import Callable, Mapping, MutableMapping
 from dataclasses import dataclass, field
+from functools import partial
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol, cast
@@ -60,7 +61,7 @@ from opensquilla.gateway.session_lifecycle import (
     apply_task_lifecycle_to_session,
     session_status_for_task_status,
 )
-from opensquilla.gateway.session_services import get_session_lock, get_session_storage
+from opensquilla.gateway.session_services import get_session_storage
 from opensquilla.gateway.session_streams import get_session_streams, reset_session_streams
 from opensquilla.gateway.task_runtime import TaskRuntimeShutdownResult
 from opensquilla.gateway.terminal_activity import (
@@ -1398,110 +1399,53 @@ async def dispatch_task_runtime_turn(
     )
     from opensquilla.engine.stream_wrappers import is_context_bound_owner
 
-    try:
-        with accepted_turn_config_scope(getattr(run, "accepted_config", None)):
-            raw_stream = turn_runner.run(run.message, run.session_key, **run_kwargs)
-            adopter = run.envelope.runtime_services.get("generated_artifact_adopter")
-            from opensquilla.gateway.working_versions import with_working_versions
+    with accepted_turn_config_scope(getattr(run, "accepted_config", None)):
+        raw_stream = turn_runner.run(run.message, run.session_key, **run_kwargs)
+        adopter = run.envelope.runtime_services.get("generated_artifact_adopter")
+        from opensquilla.gateway.working_versions import with_working_versions
 
-            async def emit_working_version(payload: dict[str, Any]) -> None:
-                await event_emitter(run.session_key, "session.event.artifact_state", payload)
+        async def emit_working_version(payload: dict[str, Any]) -> None:
+            await event_emitter(run.session_key, "session.event.artifact_state", payload)
 
-            raw_stream = with_working_versions(
-                raw_stream,
-                config=config,
-                session_manager=session_manager,
-                session_key=run.session_key,
-                session_id=run.envelope.session_id or getattr(session, "session_id", None),
-                workspace=tool_context.workspace_dir,
-                actor_id=run.task_id,
-                event_emitter=getattr(adopter, "event_emitter", None) or emit_working_version,
-                preview_service=getattr(adopter, "preview_service", None),
-            )
-            await _emit_task_runtime_stream_events(
-                raw_stream,
-                run.session_key,
-                event_emitter,
-                idle_timeout=stream_idle_timeout,
-                heartbeat_interval=heartbeat_interval,
-                context_bound=is_context_bound_owner(turn_runner),
-                stream_event_sink=getattr(run, "stream_event_sink", None),
-                task_id=getattr(run, "task_id", None),
-                session_id=getattr(run, "session_id", None),
-                session_epoch=getattr(run, "session_epoch", None),
-                client_message_id=getattr(run.envelope, "metadata", {}).get("client_message_id"),
-                user_message_id=getattr(run, "persisted_user_message_id", None),
-                surface_id=getattr(run.envelope, "metadata", {}).get("surface_id"),
-                input_mode=getattr(run, "input_mode", "user"),
-                run_kind=getattr(run, "run_kind", None),
-            )
-            finalizer_receipt_sink = getattr(run, "finalizer_receipt_sink", None)
-            if finalizer_receipt_sink is not None:
-                try:
-                    finalizer_receipt_sink()
-                except Exception:
-                    log.warning(
-                        "task_runtime.finalizer_receipt_failed",
-                        session_key=run.session_key,
-                        task_id=getattr(run, "task_id", None),
-                        exc_info=True,
-                    )
-    except TaskRuntimeStreamError as exc:
-        if exc.code in {
-            "provider_request_budget_exhausted",
-            "provider_request_too_large",
-            "current_turn_context_exhausted",
-        } and (
-            str(getattr(run.envelope, "metadata", {}).get("turn_context_intent") or "")
-            != "goal_set"
-        ):
-            rollback_reason = exc.code
-            remove_message = getattr(session_manager, "remove_message", None)
-            raw_message_ids = getattr(run, "persisted_user_message_ids", ())
-            message_ids: list[str] = []
-            for message_id in (
-                getattr(run, "persisted_user_message_id", None),
-                *(raw_message_ids if isinstance(raw_message_ids, list | tuple) else ()),
-            ):
-                if isinstance(message_id, str) and message_id and message_id not in message_ids:
-                    message_ids.append(message_id)
-
-            async def _remove_persisted_messages() -> None:
-                assert callable(remove_message)
-                for persisted_message_id in message_ids:
-                    try:
-                        removed = remove_message(
-                            run.session_key,
-                            persisted_message_id,
-                        )
-                        if inspect.isawaitable(removed):
-                            removed = await removed
-                        if removed:
-                            log.info(
-                                "task_runtime.user_message_rolled_back",
-                                session_key=run.session_key,
-                                message_id=persisted_message_id,
-                                reason=rollback_reason,
-                            )
-                    except Exception as rb_exc:  # noqa: BLE001 - preserve terminal error
-                        # Try every collected id even if one best-effort cleanup
-                        # fails; the provider error remains the terminal cause.
-                        log.warning(
-                            "task_runtime.user_message_rollback_failed",
-                            session_key=run.session_key,
-                            message_id=persisted_message_id,
-                            reason=rollback_reason,
-                            error=str(rb_exc),
-                        )
-
-            if callable(remove_message) and message_ids:
-                rollback_lock = get_session_lock(turn_runner, run.session_key)
-                if rollback_lock is None:
-                    await _remove_persisted_messages()
-                else:
-                    async with rollback_lock:
-                        await _remove_persisted_messages()
-        raise
+        raw_stream = with_working_versions(
+            raw_stream,
+            config=config,
+            session_manager=session_manager,
+            session_key=run.session_key,
+            session_id=run.envelope.session_id or getattr(session, "session_id", None),
+            workspace=tool_context.workspace_dir,
+            actor_id=run.task_id,
+            event_emitter=getattr(adopter, "event_emitter", None) or emit_working_version,
+            preview_service=getattr(adopter, "preview_service", None),
+        )
+        await _emit_task_runtime_stream_events(
+            raw_stream,
+            run.session_key,
+            event_emitter,
+            idle_timeout=stream_idle_timeout,
+            heartbeat_interval=heartbeat_interval,
+            context_bound=is_context_bound_owner(turn_runner),
+            stream_event_sink=getattr(run, "stream_event_sink", None),
+            task_id=getattr(run, "task_id", None),
+            session_id=getattr(run, "session_id", None),
+            session_epoch=getattr(run, "session_epoch", None),
+            client_message_id=getattr(run.envelope, "metadata", {}).get("client_message_id"),
+            user_message_id=getattr(run, "persisted_user_message_id", None),
+            surface_id=getattr(run.envelope, "metadata", {}).get("surface_id"),
+            input_mode=getattr(run, "input_mode", "user"),
+            run_kind=getattr(run, "run_kind", None),
+        )
+        finalizer_receipt_sink = getattr(run, "finalizer_receipt_sink", None)
+        if finalizer_receipt_sink is not None:
+            try:
+                finalizer_receipt_sink()
+            except Exception:
+                log.warning(
+                    "task_runtime.finalizer_receipt_failed",
+                    session_key=run.session_key,
+                    task_id=getattr(run, "task_id", None),
+                    exc_info=True,
+                )
 
 
 def build_session_material_cleanup(config: Any) -> Any:
@@ -1518,35 +1462,77 @@ def build_session_material_cleanup(config: Any) -> Any:
     low-level ``session`` package only owns the hook registry + guarded remover.
     """
     from opensquilla.agents.scope import resolve_agent_workspace_dir
+    from opensquilla.artifact_session.working_files import checked_path
     from opensquilla.artifacts import ArtifactStore
     from opensquilla.attachment_refs import transcript_material_dir
     from opensquilla.attachment_workspace import _safe_path_segment
     from opensquilla.paths import media_root_from_config
+    from opensquilla.project_workspaces import _validate_stored_project_path
+    from opensquilla.sandbox.run_context import RUN_CONTEXT_ORIGIN_KEY, get_run_context
     from opensquilla.session.keys import parse_agent_id
     from opensquilla.session.material_cleanup import rmtree_scoped
 
-    async def _cleanup(session_id: str, session_key: str) -> None:
+    async def _prepare(session: Any, project: Any) -> Any:
+        session_id = session.session_id
+        session_key = session.session_key
+        media_root = media_root_from_config(config)
+        segment = _safe_path_segment(session_id, fallback="session")
+        workspace = None
+        try:
+            if session.workspace_id:
+                if project is None or project.trusted_at is None or project.removed_at is not None:
+                    raise ValueError("project workspace is unavailable")
+                workspace = Path(await asyncio.to_thread(_validate_stored_project_path, project))
+            else:
+                context = await get_run_context(
+                    None, session_key, config=config,
+                    workspace=str(resolve_agent_workspace_dir(parse_agent_id(session_key), config)),
+                    include_user_grants=False, session_node=session,
+                )
+                if not context.workspace:
+                    raise ValueError("session workspace is unavailable")
+                workspace = Path(context.workspace)
+                # Legacy saved roots are authority too: never follow a replaced
+                # link to a different directory while preparing deletion.
+                if context.source == "saved" and session.execution_workspace is None:
+                    saved_root = session.origin[RUN_CONTEXT_ORIGIN_KEY].get("workspace")
+                    if Path(saved_root).expanduser().absolute() != workspace:
+                        raise ValueError("saved workspace path changed")
+            if not workspace.is_dir():
+                raise ValueError("session workspace is unavailable")
+            checked_path(workspace, f".opensquilla/attachments/{segment}")
+        except (OSError, RuntimeError, TypeError, ValueError):
+            log.warning("session_material_cleanup.workspace_unavailable", session_id=session_id)
+            workspace = None
+
+        async def _cleanup() -> None:
+            await _remove_material(session_id, media_root, workspace, segment)
+
+        return _cleanup
+
+    async def _remove_material(
+        session_id: str, media_root: Path, workspace: Path | None, segment: str,
+    ) -> None:
         # 1. Canonical transcript-material store (keyed by session_id, outside
         #    the workspace).
-        media_root = media_root_from_config(config)
         rmtree_scoped(
             transcript_material_dir(media_root, session_id),
             expected_name=session_id,
         )
-        # 2. Tool-visible workspace materialization (per-session segment under the
-        #    per-agent workspace). Resolve the agent from the session key so the
-        #    workspace matches where the material was written.
-        agent_id = parse_agent_id(session_key)
-        workspace = Path(resolve_agent_workspace_dir(agent_id, config))
-        segment = _safe_path_segment(session_id, fallback="session")
-        attachments_dir = workspace / ".opensquilla" / "attachments" / segment
-        rmtree_scoped(attachments_dir, expected_name=segment)
+        # 2. Only the deleted generation's material under its captured root.
+        # Recheck link components after commit; never remove source/task roots.
+        if workspace is not None:
+            try:
+                attachments_dir = checked_path(workspace, f".opensquilla/attachments/{segment}")
+                rmtree_scoped(attachments_dir, expected_name=segment)
+            except (OSError, RuntimeError, ValueError):
+                log.warning("session_material_cleanup.workspace_changed", session_id=session_id)
         # 3. Every artifact owned by the deleted session, including listed
         #    chat artifacts, internal revisions/candidates, bundle blobs, and
         #    legacy layouts. ArtifactStore owns the scoped layout and link guards.
         ArtifactStore(media_root).delete_session_artifacts(session_id)
 
-    return _cleanup
+    return _prepare
 
 
 def build_session_artifact_cleanup(config: Any) -> Any:
@@ -2148,20 +2134,16 @@ def _render_structlog_event_for_stdlib(
 ) -> tuple[tuple[str], dict[str, Any]]:
     """Final structlog processor: render ``event key=value ...`` for stdlib.
 
-    Returns ``(args, kwargs)`` so ``exc_info``/``stack_info`` pass through to
-    ``logging`` natively and the Formatter renders tracebacks into every
-    attached handler (file and console).
+    Project metadata before any handler sees the event. Exception types remain
+    useful, but traceback prose, payloads and source literals must never reach
+    stdlib's exception renderer or a third-party handler.
     """
-    kwargs: dict[str, Any] = {}
-    exc_info = event_dict.pop("exc_info", None)
-    if exc_info:
-        kwargs["exc_info"] = exc_info
-    stack_info = event_dict.pop("stack_info", None)
-    if stack_info:
-        kwargs["stack_info"] = stack_info
-    event = str(event_dict.pop("event", ""))
-    parts = [event] + [f"{key}={event_dict[key]!r}" for key in event_dict]
-    return (" ".join(part for part in parts if part),), kwargs
+    from opensquilla.observability.log_privacy import private_log_event
+
+    fields = private_log_event(logger, method_name, event_dict)
+    event = fields.get("event", "unstructured_log")
+    parts = [event] + [f"{key}={value!r}" for key, value in fields.items() if key != "event"]
+    return (" ".join(parts),), {"extra": {"_opensquilla_log_metadata": fields}}
 
 
 def _structlog_explicitly_configured() -> bool:
@@ -2215,6 +2197,8 @@ def _remove_console_handlers(root: logging.Logger) -> None:
 
 def _setup_file_logging(config: GatewayConfig | None = None) -> None:
     """Configure structlog + stdlib logging to write to a debug.log file."""
+    from opensquilla.observability.log_privacy import PrivateLogFormatter
+
     config = config or GatewayConfig()
     root = logging.getLogger()
     _remove_debug_file_handlers(root)
@@ -2229,9 +2213,7 @@ def _setup_file_logging(config: GatewayConfig | None = None) -> None:
         console_handler = logging.StreamHandler(sys.stdout)
         setattr(console_handler, _CONSOLE_HANDLER_ATTR, True)
         console_handler.setLevel(log_level)
-        console_handler.setFormatter(
-            logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
-        )
+        console_handler.setFormatter(PrivateLogFormatter())
         root.addHandler(console_handler)
     except Exception as exc:  # noqa: BLE001 - logging must never block boot
         bridge_error = exc
@@ -2265,9 +2247,7 @@ def _setup_file_logging(config: GatewayConfig | None = None) -> None:
     setattr(file_handler, _DEBUG_FILE_HANDLER_ATTR, True)
     setattr(file_handler, "_opensquilla_previous_logger_level", opensquilla_logger.level)
     file_handler.setLevel(log_level)
-    file_handler.setFormatter(
-        logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
-    )
+    file_handler.setFormatter(PrivateLogFormatter())
 
     root.addHandler(file_handler)
     opensquilla_logger.setLevel(log_level)
@@ -3077,6 +3057,7 @@ async def build_services(
 
     # ── Session manager ─────────────────────────────────────────────
     if session_manager is None:
+        from opensquilla.gateway.execution_workspaces import build_execution_workspace_factory
         from opensquilla.paths import media_root_from_config
         from opensquilla.session.manager import SessionManager
         from opensquilla.session.storage import SessionStorage
@@ -3101,6 +3082,7 @@ async def build_services(
             checkpoint_workspace_dir=config.workspace_dir,
             media_root=media_root_from_config(config),
             model_routing_mode_provider=lambda: model_routing_snapshot(config)["mode"],
+            execution_workspace_factory=build_execution_workspace_factory(config),
         )
 
     # Wire session manager into tool layer (like set_scheduler, set_gateway_config)
@@ -4372,6 +4354,7 @@ async def start_gateway_server(
     # Lazy ref for channel_manager — cron handler captures it via closure,
     # populated after channel_manager is constructed below.
     _cm_holder: list = [None]
+    from opensquilla.gateway.project_workspace_runtime import prepare_heartbeat_tool_context
     from opensquilla.scheduler.heartbeat import (
         HeartbeatConfigWatcher,
         HeartbeatRunner,
@@ -4379,10 +4362,15 @@ async def start_gateway_server(
     from opensquilla.scheduler.heartbeat_loop import HeartbeatLoop
     from opensquilla.scheduler.heartbeat_service import HeartbeatService
 
+    heartbeat_storage = get_session_storage(svc.session_manager)
     heartbeat_service = HeartbeatService(
         turn_runner=turn_runner,
-        session_storage=get_session_storage(svc.session_manager) or svc.session_manager,
+        session_storage=heartbeat_storage,
         channel_manager_ref=lambda: _cm_holder[0],
+        prepare_tool_context=partial(
+            prepare_heartbeat_tool_context, storage=heartbeat_storage,
+            session_manager=svc.session_manager, config=config,
+        ),
     )
     heartbeat_loop = HeartbeatLoop(
         config=config,
@@ -5346,11 +5334,14 @@ async def start_gateway_server(
                 preview_socket.setblocking(False)
                 preview_port = int(preview_socket.getsockname()[1])
                 preview_service.set_listener_port(preview_port)
+                from opensquilla.observability.log_privacy import uvicorn_log_config
+
                 preview_config = uvicorn.Config(
                     app=create_artifact_preview_resource_app(preview_service),
                     host="127.0.0.1",
                     port=preview_port,
                     log_level="warning",
+                    log_config=uvicorn_log_config(),
                     access_log=False,
                     lifespan="off",
                 )
@@ -5418,7 +5409,10 @@ async def start_gateway_server(
         if config.tls.keyfile and config.tls.certfile:
             uvicorn_kwargs["ssl_keyfile"] = config.tls.keyfile
             uvicorn_kwargs["ssl_certfile"] = config.tls.certfile
+        from opensquilla.observability.log_privacy import uvicorn_log_config
+
         uv_config = uvicorn.Config(
+            log_config=uvicorn_log_config(),
             **uvicorn_kwargs,
         )
         server = uvicorn.Server(uv_config)

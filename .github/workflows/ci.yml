@@ -844,6 +844,18 @@ jobs:
         working-directory: desktop/electron
         run: npm run build
 
+      - name: Test installer tooling preparation policy
+        working-directory: desktop/electron
+        run: node --test scripts/test-prepare-installer-tooling.mjs
+
+      - name: Prepare installer contract tooling
+        working-directory: desktop/electron
+        env:
+          OPENSQUILLA_INSTALLER_TOOLING_FILE: ${{ runner.temp }}/installer-tooling.json
+        run: |
+          node scripts/prepare-installer-tooling.mjs "$OPENSQUILLA_INSTALLER_TOOLING_FILE"
+          echo "OPENSQUILLA_INSTALLER_TOOLING_FILE=$OPENSQUILLA_INSTALLER_TOOLING_FILE" >> "$GITHUB_ENV"
+
       - name: Run desktop unit tests
         working-directory: desktop/electron
         run: |
@@ -873,6 +885,8 @@ jobs:
           node scripts/test-desktop-renderer-log.mjs
           node scripts/test-artifact-preview-lease-broker.mjs
           node scripts/test-native-workbench-surface.mjs
+          node scripts/test-resource-file-actions.mjs
+          node --test scripts/fixtures/workspace-inline-preview/provider.test.mjs
           npm run test:live-html-harness
           node scripts/test-onboarding-flow-coordinator.mjs
           node scripts/test-onboarding-save-telemetry.mjs
@@ -1259,7 +1273,12 @@ jobs:
             # processes, or gateways from several tests.  Leave runner
             # headroom for those process-start handshakes instead of changing
             # their bounded readiness/timing assertions.
-            worker_args+=(--workers=2)
+            if [[ "${{ matrix.shard }}" == "recovery-migration" ||
+                  "${{ matrix.shard }}" == "gateway-sqlite" ]]; then
+              worker_args+=(--workers=3)
+            else
+              worker_args+=(--workers=2)
+            fi
           fi
 
           uv run python .github/scripts/windows_test_shards.py run \

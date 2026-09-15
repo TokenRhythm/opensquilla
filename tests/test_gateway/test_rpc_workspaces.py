@@ -964,7 +964,7 @@ async def test_history_delete_holds_sorted_session_locks_through_all_cleanup(
     release_cleanup = asyncio.Event()
     cleanup_calls: list[str] = []
 
-    async def cleanup(session: SessionNode) -> None:
+    async def cleanup(session: SessionNode, _material_cleanup: object) -> None:
         cleanup_calls.append(session.session_key)
         if len(cleanup_calls) == 1:
             cleanup_entered.set()
@@ -1558,7 +1558,7 @@ async def test_history_delete_real_quiescers_leave_no_late_rows_after_cancellati
     release_cleanup = asyncio.Event()
     cleanup_calls: list[str] = []
 
-    async def blocked_cleanup(node: SessionNode) -> None:
+    async def blocked_cleanup(node: SessionNode, _material_cleanup: object) -> None:
         cleanup_calls.append(node.session_key)
         if len(cleanup_calls) == 1:
             cleanup_started.set()

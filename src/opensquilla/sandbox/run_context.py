@@ -554,12 +554,19 @@ async def get_run_context(
         else await _get_session_node(session_manager, session_key)
     )
     if node is not None:
+        binding = getattr(node, "execution_workspace", None)
+        if binding is not None and not getattr(node, "workspace_id", None):
+            from opensquilla.execution_workspaces import validate_execution_workspace
+
+            workspace = validate_execution_workspace(binding)["root"]
         origin = _origin_dict(node)
         saved = _context_from_payload(
             _without_materialized_user_grants(origin.get(RUN_CONTEXT_ORIGIN_KEY)),
             "saved",
         )
         if saved is not None:
+            if binding is not None and not getattr(node, "workspace_id", None):
+                saved = replace(saved, workspace=workspace)
             return _with_user_grants(saved) if include_user_grants else saved
     configured_mode, _source = await resolve_default_run_mode(session_manager, config)
     context = RunContext(

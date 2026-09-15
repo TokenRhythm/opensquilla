@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import binascii
 import json
+import re
 from collections.abc import Callable, Collection, Mapping, Sequence
 from copy import deepcopy
 from dataclasses import dataclass, field
@@ -204,7 +205,7 @@ def project_history_replay_capacity(
     """Estimate replay tokens after the route's real history-tail policy.
 
     Typed media is replaced by a bounded placeholder before tokenization and
-    pays the same decoded-byte reserve used by provider request proof.  Plain
+    pays the same media estimate used by provider request proof.  Plain
     dictionaries (including arbitrary JSON/data URLs in tool arguments) are
     intentionally *not* recognized as media and remain fully tokenized.
     Invalid or unsupported typed media keeps its raw conservative projection
@@ -269,7 +270,9 @@ def project_history_replay_capacity(
             except (binascii.Error, ValueError):
                 estimate_complete = False
             else:
-                reserve = estimate_provider_media_tokens(media_kind, decoded_bytes)
+                reserve = estimate_provider_media_tokens(
+                    media_kind, decoded_bytes, encoded_data=value.data,
+                )
                 media_block_count += 1
                 media_reserve_tokens += reserve
                 dumped = value.model_dump(mode="json", exclude_none=True)
@@ -843,6 +846,15 @@ def reconstruct_messages_from_entry(
                 result_content: str | list[Any] = raw_result
             else:
                 result_content = str(raw_result)
+            log_handle = seg.get("execution_log_handle")
+            if (
+                isinstance(result_content, str)
+                and isinstance(log_handle, str)
+                and re.fullmatch(r"tr-[0-9a-f]{32}", log_handle)
+                and log_handle not in result_content
+            ):
+                # Transcript previews can omit the original tool's log address.
+                result_content += f"\nexecution_log_handle: {log_handle}"
             pending_results.append(
                 ContentBlockToolResult(
                     tool_use_id=tool_use_id,

@@ -12,6 +12,7 @@ import pytest
 import structlog.testing
 
 from opensquilla.engine import Agent, AgentConfig
+from opensquilla.engine.fallback import FallbackPolicy
 from opensquilla.engine.runtime import (
     TurnRunner,
     _SelectorFallbackProvider,
@@ -34,7 +35,7 @@ from opensquilla.provider import (
     ToolUseEndEvent,
     ToolUseStartEvent,
 )
-from opensquilla.provider.selector import ProviderConfig
+from opensquilla.provider.selector import ModelSelector, ProviderConfig, SelectorConfig
 from opensquilla.session.manager import SessionManager
 from opensquilla.session.storage import SessionStorage
 from opensquilla.tools.types import CallerKind, ToolContext
@@ -81,27 +82,6 @@ class _Selector:
         self.failures.append(str(exc))
         self.current_config = self._fallback_config
         return self._fallback
-
-
-class _MultiSelector:
-    def __init__(
-        self,
-        configs: list[ProviderConfig],
-        fallbacks: list[_SequenceProvider],
-    ) -> None:
-        assert len(configs) == len(fallbacks) + 1
-        self._configs = configs
-        self._fallbacks = fallbacks
-        self._index = 0
-        self.current_config = configs[0]
-
-    def next_fallback_after_failure(self, _exc: Exception) -> _SequenceProvider:
-        if self._index >= len(self._fallbacks):
-            raise IndexError("no fallback")
-        fallback = self._fallbacks[self._index]
-        self._index += 1
-        self.current_config = self._configs[self._index]
-        return fallback
 
 
 class _TurnRunnerSelector:
@@ -385,6 +365,7 @@ async def test_same_authority_fallback_waits_for_retry_after(
         primary,
         _Selector(primary_config, fallback_config, fallback),
     )
+    wrapper.configure_retry_policy(FallbackPolicy(max_retries=0))
 
     events = [
         event
@@ -424,6 +405,7 @@ async def test_independent_authority_fallback_does_not_wait_for_retry_after(
             fallback,
         ),
     )
+    wrapper.configure_retry_policy(FallbackPolicy(max_retries=0))
 
     events = [
         event
@@ -447,6 +429,7 @@ async def test_same_authority_retry_after_past_deadline_is_typed_terminal() -> N
     first = ProviderConfig("openrouter", "primary", api_key="same-account")
     second = ProviderConfig("openrouter", "fallback", api_key="same-account")
     wrapper = _SelectorFallbackProvider(primary, _Selector(first, second, fallback))
+    wrapper.configure_retry_policy(FallbackPolicy(max_retries=0))
 
     events = [
         event
@@ -486,6 +469,7 @@ async def test_same_authority_retry_after_over_wait_ceiling_is_typed_terminal(
     first = ProviderConfig("openrouter", "primary", api_key="same-account")
     second = ProviderConfig("openrouter", "fallback", api_key="same-account")
     wrapper = _SelectorFallbackProvider(primary, _Selector(first, second, fallback))
+    wrapper.configure_retry_policy(FallbackPolicy(max_retries=0))
 
     events = [
         event
@@ -503,9 +487,27 @@ async def test_same_authority_retry_after_over_wait_ceiling_is_typed_terminal(
 
 
 @pytest.mark.asyncio
-async def test_agent_does_not_advance_same_authority_after_retry_deadline_terminal() -> None:
+@pytest.mark.parametrize(
+    ("retry_after_s", "timeout", "expected_selected_index"),
+    [(8.0, 1.0, 0), (901.0, 2_000.0, 1)],
+    ids=["past-turn-deadline", "past-wait-ceiling"],
+)
+async def test_agent_does_not_retry_after_selector_deadline_terminal(
+    monkeypatch: pytest.MonkeyPatch,
+    retry_after_s: float,
+    timeout: float,
+    expected_selected_index: int,
+) -> None:
+    sleeps: list[float] = []
+    original_sleep = asyncio.sleep
+
+    async def fake_sleep(delay: float) -> None:
+        sleeps.append(delay)
+        await original_sleep(0)
+
+    monkeypatch.setattr("opensquilla.engine.agent.asyncio.sleep", fake_sleep)
     primary = _SequenceProvider(
-        [ErrorEvent(message="raw rate limit body", code="429", retry_after_s=901.0)]
+        [ErrorEvent(message="raw rate limit body", code="429", retry_after_s=retry_after_s)]
     )
     first_fallback = _SequenceProvider(
         [TextDeltaEvent(text="must not run first"), DoneEvent(stop_reason="stop")]
@@ -518,23 +520,34 @@ async def test_agent_does_not_advance_same_authority_after_retry_deadline_termin
         ProviderConfig("openrouter", "fallback-one", api_key="same-account"),
         ProviderConfig("openrouter", "fallback-two", api_key="same-account"),
     ]
-    wrapper = _SelectorFallbackProvider(
-        primary,
-        _MultiSelector(configs, [first_fallback, second_fallback]),
+    providers = dict(zip(
+        [config.model for config in configs],
+        [primary, first_fallback, second_fallback],
+        strict=True,
+    ))
+    monkeypatch.setattr(
+        "opensquilla.provider.selector._build_provider", lambda config: providers[config.model]
     )
+    selector = ModelSelector(SelectorConfig(primary=configs[0], fallbacks=configs[1:]))
+    wrapper = _SelectorFallbackProvider(selector.resolve(), selector)
     agent = Agent(
         provider=wrapper,
-        config=AgentConfig(max_provider_retries=3, timeout=2_000),
+        config=AgentConfig(max_provider_retries=3, timeout=timeout),
     )
+    # Isolate fallback admission; the Agent still has its ordinary retry budget.
+    wrapper.configure_retry_policy(FallbackPolicy(max_retries=0))
 
     events = [event async for event in agent.run_turn("hello")]
 
     assert primary.calls == 1
     assert first_fallback.calls == 0
     assert second_fallback.calls == 0
+    assert selector.current_config == configs[expected_selected_index]
+    assert sleeps == []
     terminal = next(event for event in events if isinstance(event, EngineErrorEvent))
     assert terminal.code == "provider_retry_after_deadline"
     assert terminal.failure_kind == "rate_limited"
+    assert "raw rate limit body" not in repr(events)
 
 
 @pytest.mark.asyncio

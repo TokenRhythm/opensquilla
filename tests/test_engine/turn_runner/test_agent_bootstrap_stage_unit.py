@@ -41,8 +41,6 @@ def _default_budgets() -> _ResolvedBudgets:
         runtime_timeout=60.0,
         max_iterations=10,
         max_iterations_source="test budget",
-        iteration_timeout=30.0,
-        tool_timeout=20.0,
         request_timeout=120.0,
         max_provider_retries=3,
     )
@@ -60,8 +58,6 @@ def _default_aux(
     *,
     thinking: bool | ThinkingLevel = False,
     flush_compaction_requires_safe_receipt: bool = False,
-    source_diff_preservation_mode: str | None = "log",
-    source_diff_candidate_mode: str | None = "log",
 ) -> _AgentConfigAuxiliaries:
     return _AgentConfigAuxiliaries(
         thinking=thinking,
@@ -89,8 +85,6 @@ def _default_aux(
         tool_result_store_max_bytes=400_000,
         tool_result_store_disk_budget_bytes=4_000_000,
         tool_result_store_retention_seconds=3600,
-        source_diff_preservation_mode=source_diff_preservation_mode,
-        source_diff_candidate_mode=source_diff_candidate_mode,
     )
 
 
@@ -173,6 +167,10 @@ class _DeploymentAwareCatalog:
 @dataclass
 class _DeploymentAwareProvider:
     active: Any
+    image_catalog_lookup: Any = None
+
+    def configure_image_continuation_catalog(self, lookup: Any) -> None:
+        self.image_catalog_lookup = lookup
 
     def active_deployment_config(self) -> Any:
         return self.active
@@ -259,8 +257,6 @@ def _make_input(
     agent_id="agent:main",
     timeout=None,
     max_iterations=None,
-    iteration_timeout=None,
-    tool_timeout=None,
     request_timeout=None,
     max_provider_retries=None,
     length_capped_continuations=None,
@@ -282,8 +278,6 @@ def _make_input(
         agent_id=agent_id,
         timeout=timeout,
         max_iterations=max_iterations,
-        iteration_timeout=iteration_timeout,
-        tool_timeout=tool_timeout,
         request_timeout=request_timeout,
         max_provider_retries=max_provider_retries,
         length_capped_continuations=length_capped_continuations,
@@ -323,8 +317,6 @@ async def test_case01_success_all_defaults() -> None:
     assert o.effective_runtime_timeout == 60.0
     assert o.effective_max_iterations == 10
     assert o.effective_max_iterations_source == "test budget"
-    assert o.effective_iteration_timeout == 30.0
-    assert o.effective_tool_timeout == 20.0
     assert o.effective_request_timeout == 120.0
     assert o.effective_max_provider_retries == 3
     assert o.model_capabilities is None
@@ -343,8 +335,6 @@ async def test_case01_success_all_defaults() -> None:
     assert o.agent_config.metadata["agent_max_iterations_source"] == "test budget"
 
 
-
-
 @pytest.mark.asyncio
 async def test_length_capped_continuations_threads_to_agent_config() -> None:
     stage = _make_stage()
@@ -355,6 +345,23 @@ async def test_length_capped_continuations_threads_to_agent_config() -> None:
 
 
 _RETIRED_EXPERIMENT_ENV_FIELDS = {
+    "OPENSQUILLA_PROGRESS_WATCHDOG_MODE": "progress_watchdog_mode",
+    "OPENSQUILLA_PROGRESS_WATCHDOG_REPEATED_TOOL_ERROR_THRESHOLD": (
+        "progress_watchdog_repeated_tool_error_threshold"
+    ),
+    "OPENSQUILLA_FINALIZE_EVIDENCE_GATE": "finalize_evidence_gate_enabled",
+    "OPENSQUILLA_PROVIDER_CONTEXT_BLOCK_FEEDBACK": "provider_context_block_feedback",
+    "OPENSQUILLA_IDENTICAL_REQUEST_LOOP_BREAK": "identical_request_loop_break_threshold",
+    "OPENSQUILLA_DEADLINE_WRAPUP_MARGIN_SECONDS": "deadline_wrapup_margin_seconds",
+    "OPENSQUILLA_FINAL_DIFF_SALVAGE": "final_diff_salvage",
+    "OPENSQUILLA_FINAL_DIFF_SALVAGE_VETO": "final_diff_salvage_veto",
+    "OPENSQUILLA_MAX_ITERATIONS_DEADLINE_EXTEND_SECONDS": "max_iterations_deadline_extend_seconds",
+    "OPENSQUILLA_TOOL_REPEAT_NUDGE_THRESHOLD": "repeated_tool_call_recovery_threshold",
+    "OPENSQUILLA_TOOL_REPEAT_NUDGE_TOOLS": "repeated_tool_call_recovery_extra_tools",
+    "OPENSQUILLA_FINAL_DIFF_CONTRACT_MODE": "final_diff_contract_mode",
+    "OPENSQUILLA_SOURCE_DIFF_PRESERVATION_MODE": "source_diff_preservation_mode",
+    "OPENSQUILLA_SOURCE_DIFF_CANDIDATE_MODE": "source_diff_candidate_mode",
+    "OPENSQUILLA_AGENT_ITERATION_TIMEOUT": "iteration_timeout",
     "OPENSQUILLA_FINALIZE_EVIDENCE_STRICT": "finalize_evidence_strict",
     "OPENSQUILLA_FINALIZE_VARIANT_CHALLENGE": "finalize_variant_challenge",
     "OPENSQUILLA_SUBMIT_REVIEW": "submit_review_enabled",
@@ -434,97 +441,88 @@ async def test_tool_repeat_nudge_threshold_env_zero_disables_recovery(monkeypatc
 
 
 @pytest.mark.asyncio
-async def test_deadline_wrapup_env_threads_to_agent_config(
-    monkeypatch,
-) -> None:
-    stage = _make_stage()
-    monkeypatch.delenv("OPENSQUILLA_DEADLINE_WRAPUP_MARGIN_SECONDS", raising=False)
-    default_out = await stage.run(_make_input())
-    assert default_out.output.agent_config.deadline_wrapup_margin_seconds == 0
-
-    monkeypatch.setenv("OPENSQUILLA_DEADLINE_WRAPUP_MARGIN_SECONDS", "360")
-    enabled_out = await stage.run(_make_input())
-
-    assert enabled_out.output.agent_config.deadline_wrapup_margin_seconds == 360
-
-
-@pytest.mark.asyncio
-async def test_final_diff_salvage_env_threads_to_agent_config(
-    monkeypatch,
-) -> None:
-    stage = _make_stage()
-    monkeypatch.delenv("OPENSQUILLA_FINAL_DIFF_SALVAGE", raising=False)
-    default_out = await stage.run(_make_input())
-    assert default_out.output.agent_config.final_diff_salvage is False
-
-    monkeypatch.setenv("OPENSQUILLA_FINAL_DIFF_SALVAGE", "1")
-    enabled_out = await stage.run(_make_input())
-
-    assert enabled_out.output.agent_config.final_diff_salvage is True
-
-
-@pytest.mark.asyncio
-async def test_source_diff_preservation_config_threads_to_agent_config(monkeypatch) -> None:
-    monkeypatch.delenv("OPENSQUILLA_SOURCE_DIFF_PRESERVATION_MODE", raising=False)
-    builder = _RecordingAgentConfigBuilder(
-        aux=_default_aux(source_diff_preservation_mode="block")
-    )
-    stage = _make_stage(aux=builder)
-    out = await stage.run(_make_input())
-
-    assert out.output.agent_config.source_diff_preservation_mode == "block"
-
-
-@pytest.mark.asyncio
-async def test_source_diff_preservation_env_overrides_config(monkeypatch) -> None:
-    monkeypatch.setenv("OPENSQUILLA_SOURCE_DIFF_PRESERVATION_MODE", "off")
-    builder = _RecordingAgentConfigBuilder(
-        aux=_default_aux(source_diff_preservation_mode="block")
-    )
-    stage = _make_stage(aux=builder)
-    out = await stage.run(_make_input())
-
-    assert out.output.agent_config.source_diff_preservation_mode == "off"
-
-
-@pytest.mark.asyncio
-async def test_source_diff_candidate_config_threads_to_agent_config(monkeypatch) -> None:
-    monkeypatch.delenv("OPENSQUILLA_SOURCE_DIFF_CANDIDATE_MODE", raising=False)
-    builder = _RecordingAgentConfigBuilder(
-        aux=_default_aux(source_diff_candidate_mode="warn_model")
-    )
-    stage = _make_stage(aux=builder)
-    out = await stage.run(_make_input())
-
-    assert out.output.agent_config.source_diff_candidate_mode == "warn_model"
-
-
-@pytest.mark.asyncio
-async def test_source_diff_candidate_env_overrides_config(monkeypatch) -> None:
-    monkeypatch.setenv("OPENSQUILLA_SOURCE_DIFF_CANDIDATE_MODE", "off")
-    builder = _RecordingAgentConfigBuilder(
-        aux=_default_aux(source_diff_candidate_mode="warn_model")
-    )
-    stage = _make_stage(aux=builder)
-    out = await stage.run(_make_input())
-
-    assert out.output.agent_config.source_diff_candidate_mode == "off"
-
-
-@pytest.mark.asyncio
-async def test_route_history_limit_metadata_threads_to_agent_config() -> None:
+async def test_legacy_route_history_limit_does_not_truncate_agent_history() -> None:
     stage = _make_stage()
     inp = _make_input(turn=_make_turn(metadata={"route_max_history_turns": 1}))
     out = await stage.run(inp)
-    assert out.output.agent_config.max_history_turns == 1
+    assert out.output.agent_config.max_history_turns == 0
 
 
 @pytest.mark.asyncio
 async def test_image_route_metadata_allows_historical_image_replay() -> None:
     stage = _make_stage()
-    inp = _make_input(turn=_make_turn(metadata={"image_route_reason": "gate_history"}))
+    inp = _make_input(turn=_make_turn(metadata={"image_context_has_images": True}))
     out = await stage.run(inp)
     assert out.output.agent_config.preserve_historical_images is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("vision_support", ["supported", "unsupported", "unknown"])
+async def test_history_image_retention_is_independent_of_model_capability(
+    vision_support: str,
+) -> None:
+    catalog = _RecordingModelCatalog(
+        catalog=replace(_default_catalog(), vision_support=vision_support),
+    )
+    turn = _make_turn(
+        metadata={
+            "image_context_has_images": True,
+            "router_vision_followup_gate_source": "explicit_opt_out",
+        }
+    )
+
+    out = await _make_stage(catalog=catalog).run(_make_input(turn=turn))
+
+    assert out.output.agent_config.preserve_historical_images is True
+    assert out.output.agent_config.model_vision_support == vision_support
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("routed_provider", "routed_model"),
+    [("provider-a", "old/model"), ("provider-b", "active/model")],
+)
+@pytest.mark.parametrize(
+    ("active_support", "stale_support"),
+    [("supported", "unsupported"), ("unsupported", "supported")],
+)
+async def test_route_capability_for_another_deployment_cannot_override_execution(
+    routed_provider: str,
+    routed_model: str,
+    active_support: str,
+    stale_support: str,
+) -> None:
+    catalog = _RecordingModelCatalog(
+        catalog=_ResolvedCatalog(
+            max_tokens=8_192,
+            context_window=64_000,
+            capabilities=ModelCapabilities(supports_vision=active_support == "supported"),
+            vision_support=active_support,
+        )
+    )
+    turn = _make_turn(
+        metadata={
+            "routed_provider": routed_provider,
+            "routed_model": routed_model,
+            "routed_model_vision_support": stale_support,
+            "image_context_has_images": True,
+        }
+    )
+
+    out = await _make_stage(catalog=catalog).run(
+        _make_input(
+            turn=turn,
+            resolved_model="active/model",
+            active_provider_id="provider-a",
+        )
+    )
+
+    config = out.output.agent_config
+    assert catalog.calls == [("active/model", "provider-a")]
+    assert (config.provider_id, config.model_id) == ("provider-a", "active/model")
+    assert (config.max_tokens, config.context_window_tokens) == (8_192, 64_000)
+    assert config.model_vision_support == active_support
+    assert config.preserve_historical_images is True
 
 
 @pytest.mark.asyncio
@@ -561,6 +559,7 @@ async def test_routed_primary_uses_exact_private_deployment_lookup() -> None:
     assert out.output.agent_config.context_window_tokens == 64_000
     assert catalog.deployment_calls == [("synthetic-routed-key-b", True)]
     assert catalog.generic_calls == []
+    assert provider.image_catalog_lookup == catalog.lookup_deployment
 
 
 @pytest.mark.asyncio
@@ -617,9 +616,10 @@ async def test_bootstrap_installs_known_fallback_limits_on_provider_wrapper() ->
         ("provider-b", "fallback/model"): (32_000, 8_192),
         ("provider-b", "unknown/model"): (200_000, 0),
     }
-    assert turn.metadata["route_plan"]["fallback_chain"][0]["capabilities"][
-        "effective_max_tokens"
-    ] == 8_192
+    assert (
+        turn.metadata["route_plan"]["fallback_chain"][0]["capabilities"]["effective_max_tokens"]
+        == 8_192
+    )
 
 
 @pytest.mark.asyncio
@@ -823,8 +823,6 @@ async def test_private_fallback_does_not_downgrade_fixed_glm_5_2_verification() 
     assert provider.private_limits[0][3] == ModelCapabilities(supports_tools=False)
 
 
-
-
 @pytest.mark.asyncio
 async def test_case02_per_call_timeout_threaded() -> None:
     budgets = _RecordingTimeoutBudget()
@@ -835,19 +833,8 @@ async def test_case02_per_call_timeout_threaded() -> None:
 
 
 @pytest.mark.asyncio
-async def test_case03_per_call_iteration_timeout_threaded() -> None:
-    budgets = _RecordingTimeoutBudget()
-    stage = _make_stage(budgets=budgets)
-    inp = _make_input(iteration_timeout=15.0)
-    await stage.run(inp)
-    assert budgets.calls[0]["iteration_timeout"] == 15.0
-
-
-@pytest.mark.asyncio
 async def test_case04_session_max_iterations_threaded() -> None:
-    budgets = _RecordingTimeoutBudget(
-        budgets=replace(_default_budgets(), max_iterations=5)
-    )
+    budgets = _RecordingTimeoutBudget(budgets=replace(_default_budgets(), max_iterations=5))
     stage = _make_stage(budgets=budgets)
     inp = _make_input(max_iterations=5)
     out = await stage.run(inp)
@@ -859,9 +846,7 @@ async def test_case04_session_max_iterations_threaded() -> None:
 async def test_case05_no_model_catalog_fallback() -> None:
     """Catalog fallback when adapter returns 8192/200_000/None."""
     catalog = _RecordingModelCatalog(
-        catalog=_ResolvedCatalog(
-            max_tokens=8192, context_window=200_000, capabilities=None
-        )
+        catalog=_ResolvedCatalog(max_tokens=8192, context_window=200_000, capabilities=None)
     )
     stage = _make_stage(catalog=catalog)
     inp = _make_input()
@@ -914,9 +899,7 @@ async def test_global_context_window_override_threads_to_agent_config() -> None:
 async def test_case06_model_with_capabilities_and_projection_limit() -> None:
     caps = SimpleNamespace(supports_reasoning=True)
     catalog = _RecordingModelCatalog(
-        catalog=_ResolvedCatalog(
-            max_tokens=8192, context_window=200_000, capabilities=caps
-        )
+        catalog=_ResolvedCatalog(max_tokens=8192, context_window=200_000, capabilities=caps)
     )
     aux_builder = _RecordingAgentConfigBuilder(
         aux=replace(
@@ -966,7 +949,7 @@ async def test_retired_text_only_tool_recovery_env_is_ignored(monkeypatch) -> No
 
 
 @pytest.mark.asyncio
-async def test_retired_patch_ledger_env_preserves_legacy_diff_exclusion(
+async def test_retired_patch_ledger_env_is_ignored(
     monkeypatch, tmp_path
 ) -> None:
     ledger_path = str(tmp_path / "legacy-ledger.json")
@@ -974,35 +957,7 @@ async def test_retired_patch_ledger_env_preserves_legacy_diff_exclusion(
 
     out = await _make_stage().run(_make_input())
 
-    assert out.output.agent_config.patch_evidence_ledger_path == ledger_path
-
-
-@pytest.mark.asyncio
-async def test_finalize_evidence_gate_config_value_propagates(monkeypatch) -> None:
-    monkeypatch.delenv("OPENSQUILLA_FINALIZE_EVIDENCE_GATE", raising=False)
-    stage = _make_stage(
-        aux=_RecordingAgentConfigBuilder(
-            aux=replace(_default_aux(), finalize_evidence_gate=True)
-        )
-    )
-
-    out = await stage.run(_make_input())
-
-    assert out.output.agent_config.finalize_evidence_gate_enabled is True
-
-
-@pytest.mark.asyncio
-async def test_finalize_evidence_gate_env_off_overrides_config(monkeypatch) -> None:
-    monkeypatch.setenv("OPENSQUILLA_FINALIZE_EVIDENCE_GATE", "off")
-    stage = _make_stage(
-        aux=_RecordingAgentConfigBuilder(
-            aux=replace(_default_aux(), finalize_evidence_gate=True)
-        )
-    )
-
-    out = await stage.run(_make_input())
-
-    assert out.output.agent_config.finalize_evidence_gate_enabled is False
+    assert out.output.agent_config.patch_evidence_ledger_path is None
 
 
 @pytest.mark.asyncio
@@ -1025,9 +980,7 @@ async def test_case06b_dispatch_tool_result_budget_propagates() -> None:
 async def test_case08_sync_manager_warm() -> None:
     sync_manager = SimpleNamespace(label="memsync")
     snap = _RecordingMemorySnapshot(
-        result=_MemorySnapshotResult(
-            sync_manager=sync_manager, private_memory_allowed=True
-        )
+        result=_MemorySnapshotResult(sync_manager=sync_manager, private_memory_allowed=True)
     )
     factory = _RecordingAgentFactory()
     stage = _make_stage(snapshot=snap, factory=factory)
@@ -1042,9 +995,7 @@ async def test_case08_sync_manager_warm() -> None:
 @pytest.mark.asyncio
 async def test_case09_private_memory_disabled() -> None:
     snap = _RecordingMemorySnapshot(
-        result=_MemorySnapshotResult(
-            sync_manager=None, private_memory_allowed=False
-        )
+        result=_MemorySnapshotResult(sync_manager=None, private_memory_allowed=False)
     )
     stage = _make_stage(snapshot=snap)
     inp = _make_input()
@@ -1056,9 +1007,7 @@ async def test_case09_private_memory_disabled() -> None:
 async def test_case10_snapshot_already_exists() -> None:
     """Stage returns whatever the port reports — port handles existence check."""
     snap = _RecordingMemorySnapshot(
-        result=_MemorySnapshotResult(
-            sync_manager=None, private_memory_allowed=True
-        )
+        result=_MemorySnapshotResult(sync_manager=None, private_memory_allowed=True)
     )
     stage = _make_stage(snapshot=snap)
     inp = _make_input()
@@ -1083,10 +1032,7 @@ async def test_case11_max_iterations_zero_threads_as_unlimited() -> None:
     assert out.output.effective_max_iterations_source == "explicit argument"
     assert out.output.agent_config.max_iterations == 0
     assert out.output.agent_config.metadata["agent_max_iterations"] == 0
-    assert (
-        out.output.agent_config.metadata["agent_max_iterations_source"]
-        == "explicit argument"
-    )
+    assert out.output.agent_config.metadata["agent_max_iterations_source"] == "explicit argument"
 
 
 @pytest.mark.asyncio

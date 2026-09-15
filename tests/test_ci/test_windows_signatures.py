@@ -133,7 +133,9 @@ class VerifierFixture:
     def tool(self, path: Path) -> Path:
         path.parent.mkdir(parents=True, exist_ok=True)
         if os.name == "nt":
-            path.touch()
+            # Supply a valid application for discovery. WRAPPER intercepts each
+            # path with a function that records arguments and controls the exit code.
+            shutil.copyfile(os.environ.get("ComSpec", r"C:\\Windows\\System32\\cmd.exe"), path)
             self.scenario["tools"].append(str(path))
         else:
             # POSIX PowerShell resolves absolute executable paths before

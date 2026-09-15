@@ -24,10 +24,16 @@ test('production cannot import or re-export the verification compiler', () => {
 test('production references exactly match the reviewed target policy', () => {
   const result = evaluateProductionTargets()
   assert.deepEqual(result.failures, [])
-  assert.equal(result.targets.length, 210)
+  assert.equal(result.targets.length, 212)
   assert.deepEqual(result.targets.filter(target => (
     target.startsWith('method:telemetry.product_active.record:')
   )), ['method:telemetry.product_active.record:result'])
+  assert.deepEqual(result.targets.filter(target => (
+    target.startsWith('method:sessions.executionLog.read:')
+  )), [
+    'method:sessions.executionLog.read:params',
+    'method:sessions.executionLog.read:result',
+  ])
   assert.deepEqual(result.targets.filter(target => (
     target.startsWith('method:meta.list:') || target.startsWith('method:meta.inspect:')
   )), ['method:meta.inspect:result', 'method:meta.list:result'])

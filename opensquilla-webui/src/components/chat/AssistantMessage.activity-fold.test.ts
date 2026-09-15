@@ -631,6 +631,7 @@ describe('AssistantMessage activity disclosure', () => {
     const failedRow = activity?.querySelector<HTMLElement>('.tool-row--error')
 
     expect(activity).not.toBeNull()
+    expect(summary?.textContent).toContain('Completed')
     expect(summary?.getAttribute('aria-expanded')).toBe('false')
     expect(activity?.dataset.shareExpanded).toBe('false')
     const reasoningFold = activity?.querySelector<HTMLDetailsElement>('details.thinking-fold')
@@ -670,6 +671,77 @@ describe('AssistantMessage activity disclosure', () => {
     expect(activity?.querySelector('.tool-row--error')).not.toBeNull()
     expect(el.textContent).toContain('Network unavailable')
     if (status !== 'failed') expect(summary?.textContent).not.toContain('Failed')
+  })
+
+  it.each([
+    { status: 'succeeded', kind: 'completed' },
+    { status: 'completed' },
+  ])('shows completed after a recovered edit when the outcome is $status', async (outcome) => {
+    const failedEdit = {
+      ...failedCall(),
+      name: 'edit_file',
+      displayName: 'Edit file',
+      result: 'Original text was not found',
+      resultPreview: 'Original text was not found',
+    }
+    const successfulEdit = successfulCall('retried-edit', 'edit_file')
+    const el = mountMessage(baseMessage({
+      text: 'The page was updated successfully.',
+      timelineItems: [failedEdit, successfulEdit].map(timelineGroup),
+      turnOutcome: { turnId: 'turn-recovered-edit', ...outcome },
+    }))
+    await nextTick()
+
+    const summary = el.querySelector<HTMLButtonElement>('.assistant-activity__summary')
+    expect(summary?.textContent).toContain('Completed · 7s')
+    expect(summary?.textContent).not.toContain('Failed')
+    summary?.click()
+    await nextTick()
+
+    expect(summary?.getAttribute('aria-expanded')).toBe('true')
+    expect(el.querySelectorAll('.tool-row')).toHaveLength(2)
+    const failedRow = el.querySelector<HTMLButtonElement>('.tool-row--error')
+    expect(failedRow).not.toBeNull()
+    failedRow?.click()
+    await nextTick()
+    expect(el.textContent).toContain('Original text was not found')
+    expect(el.textContent).toContain('The page was updated successfully.')
+  })
+
+  it.each([
+    { status: 'failed', kind: 'failed', label: 'Failed' },
+    { status: 'timeout', kind: 'timeout', label: 'Timed out' },
+    { status: 'cancelled', kind: 'user_stopped', label: 'Stopped' },
+    { status: 'abandoned', kind: 'interrupted', label: 'Interrupted' },
+  ])('keeps the $status outcome authoritative despite an earlier tool error', async ({ label, ...outcome }) => {
+    const el = mountMessage(baseMessage({
+      turnOutcome: { turnId: `turn-${outcome.status}`, ...outcome },
+    }))
+    await nextTick()
+
+    const summary = el.querySelector('.assistant-activity__summary')
+    expect(summary?.textContent).toContain(`${label} · 7s`)
+    expect(summary?.textContent).not.toContain('Completed')
+    expect(el.querySelector('.tool-row--error')).not.toBeNull()
+  })
+
+  it('keeps failed tool rows without treating a settled legacy answer as failed', async () => {
+    const el = mountMessage(baseMessage({ turnOutcome: undefined }))
+    await nextTick()
+
+    expect(el.querySelector('.assistant-activity__summary')?.textContent).toContain('Completed · 7s')
+    expect(el.querySelector('.assistant-activity--failed')).toBeNull()
+    expect(el.querySelector('.tool-row--error')).not.toBeNull()
+  })
+
+  it('keeps work live while retrying a failed tool before an outcome arrives', async () => {
+    const el = mountMessage(baseMessage({ isStreaming: true, turnOutcome: undefined }))
+    await nextTick()
+
+    expect(el.querySelector('.assistant-activity--live')).not.toBeNull()
+    expect(el.querySelector('.assistant-activity__live-head')?.getAttribute('aria-expanded')).toBe('true')
+    expect(el.querySelector('.assistant-activity__summary')).toBeNull()
+    expect(el.querySelector('.tool-row--error')).not.toBeNull()
   })
 
   it('restores routine phase rows and reopens settled reasoning content', async () => {
@@ -1142,6 +1214,55 @@ describe('AssistantMessage activity disclosure', () => {
     expect(el.querySelectorAll('.tool-row')).toHaveLength(2)
     expect(el.querySelector('.tool-row--error')).not.toBeNull()
     expect(el.textContent).toContain('Network unavailable')
+    expect(el.querySelector('.assistant-activity__summary')?.textContent).toContain('Completed')
+  })
+
+  it('uses the completed turn outcome for an empty answer with failed tool attempts', async () => {
+    const el = mountMessage(baseMessage({
+      text: '',
+      timelineItems: [timelineGroup(failedCall()), timelineGroup(successfulCall('retry', 'web_search'))],
+      parts: [],
+      statusHistory: [],
+      turnOutcome: { turnId: 'turn-recovered', status: 'succeeded', kind: 'completed' },
+    }))
+    await nextTick()
+
+    expect(el.querySelector('.assistant-activity__summary')?.textContent).toContain('Completed')
+    expect(el.querySelector('.assistant-activity--failed')).toBeNull()
+    expect(el.querySelectorAll('.tool-row--error')).toHaveLength(1)
+    expect(el.textContent).toContain('Network unavailable')
+  })
+
+  it.each<{ message: Partial<ChatRenderedMessage>, label: string }>([
+    { message: { terminalFailure: true }, label: 'Failed' },
+    { message: { interrupted: true }, label: 'Interrupted' },
+    {
+      message: { turnOutcome: { turnId: 'turn-failed', status: 'failed', kind: 'failed' } },
+      label: 'Failed',
+    },
+    {
+      message: { turnOutcome: { turnId: 'turn-timeout', status: 'timeout', kind: 'timeout' } },
+      label: 'Timed out',
+    },
+    {
+      message: {
+        turnOutcome: {
+          turnId: 'turn-stopped',
+          status: 'cancelled',
+          kind: 'user_stopped',
+          cancellationSource: 'webui_stop',
+        },
+      },
+      label: 'Stopped',
+    },
+  ])('preserves the terminal $label outcome when tools also failed', async ({ message, label }) => {
+    const el = mountMessage(baseMessage(message))
+    await nextTick()
+
+    const summary = el.querySelector('.assistant-activity__summary')
+    expect(summary?.textContent).toContain(label)
+    expect(summary?.textContent).not.toContain('Completed')
+    expect(el.querySelectorAll('.tool-row--error')).toHaveLength(1)
   })
 
   it('keeps interrupted activity collapsed while leaving the answer outside', async () => {

@@ -503,6 +503,7 @@ function toolResultContext(
     toolName: call.name,
     inputRaw: call.inputRaw || call.inputPreview,
     section,
+    executionLogHandle: section === 'input' ? undefined : call.executionLogHandle,
   }
 }
 
@@ -608,7 +609,7 @@ const ToolRowSections = defineComponent({
                 h('span', { class: 'tool-row-section__compact-snippet' }, compactSnippet(resultContent)),
               ])
             : h('pre', { class: 'tool-row-section__pre' }, call.resultPreview),
-          call.result.length > SECTION_PREVIEW_LIMIT || compact
+          call.result.length > SECTION_PREVIEW_LIMIT || compact || call.executionLogHandle
             ? h('button', {
                 type: 'button',
                 class: 'step-view-btn',

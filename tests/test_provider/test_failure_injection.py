@@ -123,7 +123,7 @@ async def test_exhausted_script_delegates_every_further_call() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Surface hop: non-retryable failures terminate without touching the provider
+# Authentication failures surface; managed rate limits share the finite retry budget
 # ---------------------------------------------------------------------------
 
 
@@ -144,19 +144,32 @@ async def test_auth_invalid_surfaces_without_retry() -> None:
     assert not any(entry.get("event") == "provider.retry" for entry in captured)
 
 
-async def test_rate_limit_surfaces_without_same_deployment_retry() -> None:
+@pytest.mark.parametrize("rate_failures", [1, 4])
+async def test_rate_limit_retries_same_deployment_with_finite_budget(rate_failures: int) -> None:
     provider = _FakeProvider()
-    injector = FailureInjector(script=[ProviderFailureKind.RATE_LIMITED, "succeed"])
+    injector = FailureInjector(
+        script=[*[ProviderFailureKind.RATE_LIMITED] * rate_failures, "succeed"]
+    )
     agent = _agent(provider, injector, max_provider_retries=3)
 
     with structlog.testing.capture_logs() as captured:
         events = [event async for event in agent.run_turn("hello")]
 
-    error = next(event for event in events if event.kind == "error")
-    assert error.code == "429"
-    assert provider.calls == []
-    assert injector.consumed == [ProviderFailureKind.RATE_LIMITED]
-    assert not any(entry.get("event") == "provider.retry" for entry in captured)
+    if rate_failures == 1:
+        assert not any(event.kind == "error" for event in events)
+        assert next(event for event in events if event.kind == "done").text == "ok"
+        assert len(provider.calls) == 1
+        assert injector.consumed == [ProviderFailureKind.RATE_LIMITED, "succeed"]
+    else:
+        error = next(event for event in events if event.kind == "error")
+        assert error.code == "429"
+        assert error.failure_kind == ProviderFailureKind.RATE_LIMITED.value
+        assert provider.calls == []
+        assert injector.consumed == [ProviderFailureKind.RATE_LIMITED] * 4
+    retry_logs = [entry for entry in captured if entry.get("event") == "provider.retry"]
+    assert [entry["kind"] for entry in retry_logs] == [
+        ProviderFailureKind.RATE_LIMITED.value
+    ] * min(rate_failures, 3)
 
 
 # ---------------------------------------------------------------------------
@@ -188,7 +201,7 @@ def test_retry_classification_and_fallback_model_rotation_order() -> None:
         max_retries=1,
         fallback_models=["model-primary", "model-fb-1", "model-fb-2"],
     )
-    # Rate limits bypass same-deployment retries; transient overloads retain them.
+    # The generic policy excludes rate limits; Agent owns their same-leg budget.
     assert policy.should_retry(ProviderFailureKind.RATE_LIMITED, 0) is False
     assert policy.should_retry(ProviderFailureKind.PROVIDER_OVERLOADED, 0) is True
     assert policy.should_retry(ProviderFailureKind.PROVIDER_OVERLOADED, 1) is False

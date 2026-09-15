@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
+from pathlib import Path
 from typing import Any, Protocol
 
 from opensquilla.application.artifact_workbench import (
@@ -16,6 +18,8 @@ from opensquilla.application.artifact_workbench import (
     ContentMaterial,
     ContentNotFoundError,
     DocumentContentQuery,
+    WorkingFileMaterial,
+    WorkingFileQuery,
 )
 from opensquilla.artifact_session import (
     ArtifactNotFoundError as ArtifactSessionNotFoundError,
@@ -54,6 +58,107 @@ class GatewayArtifactContentPort(ArtifactContentPort):
     ) -> None:
         self._config = config
         self._session_manager = session_manager
+
+    async def working_file(self, query: WorkingFileQuery) -> WorkingFileMaterial:
+        """Read an already-bound page; never materialize a copy or a version."""
+        from opensquilla.agents.scope import resolve_agent_workspace_dir
+        from opensquilla.artifact_session.working_files import checked_path, get_working_files
+        from opensquilla.gateway.project_workspace_runtime import authoritative_project_run_context
+        from opensquilla.gateway.rpc import RpcHandlerError
+        from opensquilla.html_format import is_html_preview_path
+        from opensquilla.project_workspaces import ProjectWorkspaceStateError
+        from opensquilla.sandbox.path_validation import decide_path_access
+        from opensquilla.sandbox.permissions import FileSystemPermissionProfile
+        from opensquilla.session.keys import parse_agent_id
+
+        storage = get_session_storage(self._session_manager)
+        if storage is None:
+            raise ContentNotFoundError("Working file unavailable")
+        session = await storage.get_session(query.session_key)
+        if session is None:
+            raise ContentNotFoundError("Working file unavailable")
+        service = await ArtifactSessionService.from_session_storage(storage)
+        try:
+            document = await service.get_document(query.document_id)
+            if (document.session_key, document.session_id) != (
+                query.session_key,
+                session.session_id,
+            ):
+                raise ContentNotFoundError("Working file unavailable")
+            binding = await get_working_files(service, query.document_id)
+            if binding is None or binding.source_path is None:
+                raise ContentNotFoundError("Working file unavailable")
+            default = resolve_agent_workspace_dir(parse_agent_id(query.session_key), self._config)
+
+            async def validate_workspace() -> None:
+                current = await storage.get_session(query.session_key)
+                if current is None or (current.session_id, current.epoch) != (
+                    session.session_id,
+                    session.epoch,
+                ):
+                    raise ContentNotFoundError("Working file unavailable")
+                context, _ = await authoritative_project_run_context(
+                    storage=storage,
+                    session_manager=self._session_manager,
+                    session=current,
+                    config=self._config,
+                    default_workspace=str(default) if default else None,
+                )
+                if not context.workspace or Path(context.workspace) != Path(binding.workspace):
+                    raise ContentNotFoundError("Working workspace is no longer available")
+
+            await validate_workspace()
+            selected = query.page_path or binding.entrypoint
+            if not is_html_preview_path(selected):
+                raise ContentNotFoundError("Working file is not an HTML page")
+            # The collector is the existing bounded, symlink-safe source reader.
+            # Its member inventory, not a path supplied by the caller, defines scope.
+            profile = FileSystemPermissionProfile.workspace(
+                workspace=Path(binding.workspace),
+                denied_read_roots=(
+                    Path(path).expanduser() for path in self._config.sandbox.denied_read_roots
+                ),
+                denied_read_globs=self._config.sandbox.denied_read_globs,
+            )
+
+            def read_guard(candidate: Path) -> None:
+                if (
+                    decide_path_access(
+                        candidate, workspace=binding.workspace, profile=profile
+                    ).status
+                    != "allowed"
+                ):
+                    raise ContentNotFoundError("Working file is outside the authorized read scope")
+
+            bundle = await asyncio.to_thread(binding.bundle, read_guard=read_guard)
+            member = next((item for item in bundle.files if item.path == selected), None)
+            if member is None or member.mime not in {"text/html", "application/xhtml+xml"}:
+                raise ContentNotFoundError("Working page unavailable")
+            path = (
+                binding.entry
+                if selected == binding.entrypoint
+                else checked_path(binding.root, selected)
+            )
+            await validate_workspace()
+            return WorkingFileMaterial(
+                query.document_id,
+                selected,
+                binding.workspace,
+                path,
+                member.mime,
+                member.data,
+            )
+        except (
+            ArtifactSessionNotFoundError,
+            ArtifactNotFoundError,
+            ProjectWorkspaceStateError,
+            RpcHandlerError,
+            OSError,
+            ValueError,
+        ) as exc:
+            raise ContentNotFoundError("Working file unavailable") from exc
+        finally:
+            await service.close()
 
     async def artifact_content(self, query: ArtifactContentQuery) -> ContentMaterial:
         session_id = await self._session_id(query.session_key)

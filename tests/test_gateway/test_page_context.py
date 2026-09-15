@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import json
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -13,7 +14,8 @@ from opensquilla.artifact_session import (
     ArtifactKind,
     ArtifactSessionService,
 )
-from opensquilla.artifacts import ArtifactStore
+from opensquilla.artifact_session.working_files import WorkingFiles, ensure_working_files
+from opensquilla.artifacts import ArtifactBundle, ArtifactBundleSourceFile, ArtifactStore
 from opensquilla.chat.history import transcript_entries_to_chat_messages
 from opensquilla.gateway.page_context import normalize_page_context, render_page_context
 from opensquilla.gateway.routing import tool_context_from_envelope
@@ -31,6 +33,13 @@ from tests.test_gateway.test_turn_ingress_rpc import SESSION_KEY, _open_real_sta
         {"annotations": [{"text": "edit", "grant": "old"}]},
         {"annotations": [{"text": ""}]},
         {"targetRef": "../" * 500},
+        {"pagePath": "page.html"},
+        {"resourceId": "document:one", "pagePath": "../outside.html"},
+        {"resourceId": "document:one", "pagePath": "/outside.html"},
+        {"resourceId": "document:one", "pagePath": "https://example.com/page.html"},
+        {"resourceId": "document:one", "pagePath": "dir\\page.html"},
+        {"resourceId": "document:one", "pagePath": "page\x00.html"},
+        {"resourceId": "document:one", "pagePath": "a" * 4097},
     ],
 )
 def test_page_context_accepts_only_bounded_ordinary_input(value):
@@ -99,11 +108,34 @@ async def test_page_and_attachment_share_normal_atomic_acceptance_and_replay(tmp
         assert len(stack.runtime._tasks) == 1
 
 
-async def test_page_resource_resolves_to_session_working_file_without_tool_restriction(tmp_path):
+@pytest.mark.parametrize(
+    ("page_path", "html_mime"),
+    [(path, "text/html") for path in (
+        None, "page.html", "layouts/editorial.html", "missing.html", "style.css", "linked.html",
+    )] + [
+        ("layouts/editorial.html", " Text/Html ; charset=utf-8"),
+        ("layouts/editorial.xhtml", " Application/Xhtml+Xml ; charset=utf-8"),
+    ],
+)
+async def test_page_resource_resolves_to_session_working_file_without_tool_restriction(
+    tmp_path, monkeypatch, page_path, html_mime,
+):
     async with _open_real_stack(tmp_path / "document.db") as stack:
         store = ArtifactStore(tmp_path / "media")
-        ref = store.publish_bytes(
-            b"<html><h1>Initial</h1></html>",
+        entry_bytes = b"<html><h1>Initial</h1></html>"
+        subpage_bytes = b"<html><h1>Editorial</h1></html>"
+        ref = store.publish_bundle(
+            ArtifactBundle(entrypoint="page.html", files=(
+                ArtifactBundleSourceFile(path="page.html", mime="text/html", data=entry_bytes),
+                ArtifactBundleSourceFile(
+                    path="layouts/editorial.html", mime="text/html", data=subpage_bytes,
+                ),
+                ArtifactBundleSourceFile(
+                    path="layouts/editorial.xhtml", mime="application/xhtml+xml",
+                    data=subpage_bytes,
+                ),
+                ArtifactBundleSourceFile(path="style.css", mime="text/css", data=b"h1{color:navy}"),
+            )),
             session_id=stack.session_id,
             session_key=SESSION_KEY,
             name="page.html",
@@ -125,6 +157,26 @@ async def test_page_resource_resolves_to_session_working_file_without_tool_restr
             ),
             actor=Actor(ActorKind.USER, "test-user"),
         )
+        if page_path == "linked.html":
+            binding = await ensure_working_files(
+                service, store, document_id=document.document.document_id,
+                session_key=SESSION_KEY, session_id=stack.session_id,
+                workspace=str(tmp_path / "workspace"),
+            )
+            outside = tmp_path / "outside.html"
+            outside.write_bytes(b"private outside source")
+            (binding.root / "linked.html").symlink_to(outside)
+        if html_mime != "text/html":
+            collect = WorkingFiles.bundle
+
+            def bundle_with_html_mime(binding):
+                bundle = collect(binding)
+                return replace(bundle, files=tuple(
+                    replace(item, mime=html_mime) if item.path == page_path else item
+                    for item in bundle.files
+                ))
+
+            monkeypatch.setattr(WorkingFiles, "bundle", bundle_with_html_mime)
         params = {
             "sessionKey": SESSION_KEY,
             "message": "解释选区",
@@ -133,11 +185,17 @@ async def test_page_resource_resolves_to_session_working_file_without_tool_restr
                 "resourceId": f"document:{document.document.document_id}",
                 "targetRef": "actual-page",
                 "annotations": [{"text": "解释标题"}],
+                **({"pagePath": page_path} if page_path is not None else {}),
             },
         }
         response = await get_dispatcher().dispatch(
             "page-resource", "chat.send", params, stack.context
         )
+        if page_path in {"missing.html", "style.css", "linked.html"}:
+            assert response.error is not None
+            assert not stack.runtime._tasks
+            await service.close()
+            return
         assert response.error is None, response.error
         await stack.wait_until_running()
         task = stack.runtime._tasks[response.payload["task_id"]]
@@ -146,7 +204,9 @@ async def test_page_resource_resolves_to_session_working_file_without_tool_restr
         )
         working_file = Path(page_context["workingFile"])
         assert working_file.is_relative_to(tmp_path / "workspace")
-        assert working_file.read_bytes() == b"<html><h1>Initial</h1></html>"
+        expected_bytes = subpage_bytes if (page_path or "").startswith("layouts/") else entry_bytes
+        assert working_file.read_bytes() == expected_bytes
+        assert working_file == Path(page_context["workingDirectory"]) / (page_path or "page.html")
         assert page_context["targetRef"] == "actual-page"
         assert page_context["versionId"] == document.revision.revision_id
         assert len(await service.list_revisions(document.document.document_id)) == 1

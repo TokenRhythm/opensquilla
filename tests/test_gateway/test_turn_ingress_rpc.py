@@ -3522,3 +3522,246 @@ async def test_public_send_continues_automation_session_with_queue_and_replay(
         ]
     finally:
         await reopened.close()
+
+
+@pytest.mark.asyncio
+async def test_sessions_send_recovers_tool_and_provider_failures_before_one_commit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from opensquilla.contracts.gateway_transport import TURN_COMMITTED_EVENT
+    from opensquilla.engine.runtime import TurnRunner
+    from opensquilla.provider.selector import ModelSelector, ProviderConfig, SelectorConfig
+    from opensquilla.provider.types import (
+        ContentBlockToolResult,
+        DoneEvent,
+        ErrorEvent,
+        TextDeltaEvent,
+        ToolUseEndEvent,
+        ToolUseStartEvent,
+    )
+    from opensquilla.tools.registry import ToolRegistry
+    from opensquilla.tools.types import ToolSpec
+
+    # Recovery and persistence must not depend on downloading optional tokenizer data.
+    monkeypatch.setattr("opensquilla.token_estimation._get_encoding", lambda: None)
+
+    emitted: list[tuple[str, dict[str, Any]]] = []
+    tool_paths: list[str] = []
+    requests: list[Any] = []
+    retry_wait_started = asyncio.Event()
+    release_retry = asyncio.Event()
+    original_sleep = asyncio.sleep
+    retry_clock = [asyncio.get_running_loop().time()]
+
+    async def controlled_sleep(delay: float, result: Any = None) -> Any:
+        if delay == 5.0:
+            retry_wait_started.set()
+            await release_retry.wait()
+            retry_clock[0] += delay
+            return result
+        return await original_sleep(delay, result)
+
+    # Advance the retry clock with its simulated wait without moving
+    # the real event loop's SQLite scheduling or test watchdog deadlines.
+    monkeypatch.setattr("opensquilla.engine.fallback.asyncio", SimpleNamespace(**{
+        **vars(asyncio),
+        "sleep": controlled_sleep,
+        "get_running_loop": lambda: SimpleNamespace(time=lambda: retry_clock[0]),
+    }))
+
+    class RecoveringProvider:
+        provider_name = "openai"
+        retry_failed_call_safe = True
+
+        async def chat(self, messages, tools=None, config=None):
+            requests.append(messages)
+            call_number = len(requests)
+            if call_number in {1, 2}:
+                yield ToolUseStartEvent(tool_use_id=f"read-{call_number}", tool_name="read_file")
+                yield ToolUseEndEvent(
+                    tool_use_id=f"read-{call_number}",
+                    tool_name="read_file",
+                    arguments={"path": "missing.txt" if call_number == 1 else "value.txt"},
+                )
+                yield DoneEvent(stop_reason="tool_use", input_tokens=2, output_tokens=1)
+            elif call_number == 3:
+                yield ErrorEvent(code="connection_failed", message="temporary connection failure")
+            else:
+                yield TextDeltaEvent(text="The recovered value is 42.")
+                yield DoneEvent(stop_reason="stop", input_tokens=2, output_tokens=1)
+
+    async def read_file(path: str) -> str:
+        tool_paths.append(path)
+        if path == "missing.txt":
+            raise FileNotFoundError("Use the available value.txt file")
+        return "42"
+
+    registry = ToolRegistry()
+    registry.register(
+        ToolSpec(
+            name="read_file",
+            description="Read the requested value file.",
+            parameters={"path": {"type": "string"}},
+            required=["path"],
+        ),
+        read_file,
+    )
+    provider = RecoveringProvider()
+    monkeypatch.setattr("opensquilla.provider.selector._build_provider", lambda _cfg: provider)
+    selector = ModelSelector(SelectorConfig(primary=ProviderConfig(
+        provider="openai", model="test-model", api_key="dummy", base_url="https://provider.test",
+    )))
+
+    async with _open_real_stack(tmp_path / "recovery-chain.db") as stack:
+        stack.context.config.squilla_router.enabled = False
+        stack.context.config.llm.model = "test-model"
+        runner = TurnRunner(
+            provider_selector=selector,
+            tool_registry=registry,
+            session_manager=stack.manager,
+            config=stack.context.config,
+        )
+        stack.context.turn_runner = runner
+
+        async def emit_event(_key: str, name: str, payload: dict[str, Any]) -> None:
+            emitted.append((name, payload))
+
+        async def turn_handler(run: Any) -> None:
+            stack.received_runs.append(run)
+            await dispatch_task_runtime_turn(
+                run,
+                config=stack.context.config,
+                session_manager=stack.manager,
+                turn_runner=runner,
+                event_emitter=emit_event,
+            )
+
+        stack.runtime._turn_handler = turn_handler
+        stack.runtime._event_emitter = emit_event
+        accepted = await get_dispatcher().dispatch(
+            "rpc-recovery-chain",
+            "sessions.send",
+            {
+                "key": SESSION_KEY,
+                "message": "Read the available value and report it.",
+                "clientRequestId": "recovery-chain-request",
+            },
+            stack.context,
+        )
+        assert accepted.ok is True
+        try:
+            await asyncio.wait_for(retry_wait_started.wait(), timeout=3.0)
+            running = await stack.storage.get_agent_task(accepted.payload["task_id"])
+            assert running is not None and running.status == AgentTaskStatus.RUNNING
+            assert tool_paths == ["missing.txt", "value.txt"]
+            assert not any(name in {
+                "session.event.error", "session.event.done", "task.failed",
+                "task.succeeded", TURN_COMMITTED_EVENT,
+            } for name, _ in emitted)
+            retry_waits = [
+                payload for name, payload in emitted
+                if name == "session.event.provider_activity" and payload["phase"] == "retry_wait"
+            ]
+            assert len(retry_waits) == 1
+            assert retry_waits[0]["retry_limit"] == 0
+        finally:
+            release_retry.set()
+        terminal = await stack.runtime.wait(accepted.payload["task_id"], timeout=3.0)
+
+        assert terminal.status == AgentTaskStatus.SUCCEEDED
+        assert len(requests) == 4
+        assert tool_paths == ["missing.txt", "value.txt"]
+        feedback = {
+            block.tool_use_id: block
+            for message in requests[-1]
+            if isinstance(message.content, list)
+            for block in message.content
+            if isinstance(block, ContentBlockToolResult)
+        }
+        assert feedback["read-1"].is_error is True
+        assert feedback["read-2"].is_error is False
+        assert feedback["read-2"].content == "42"
+        names = [name for name, _ in emitted]
+        assert "session.event.error" not in names
+        assert "task.failed" not in names
+        assert names.count("task.succeeded") == 1
+        assert names.count(TURN_COMMITTED_EVENT) == 1
+        assert names.index("task.succeeded") < names.index(TURN_COMMITTED_EVENT)
+        committed = next(payload for name, payload in emitted if name == TURN_COMMITTED_EVENT)
+        assert committed["task_id"] == accepted.payload["task_id"]
+        assert committed["user_message_id"] == accepted.payload["message_id"]
+        transcript = await stack.storage.get_transcript(stack.session_id)
+        assert sum(entry.message_id == accepted.payload["message_id"] for entry in transcript) == 1
+        assert any(entry.role == "assistant" and entry.content == "The recovered value is 42."
+                   for entry in transcript)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("error_code", [
+    "provider_request_budget_exhausted",
+    "provider_request_too_large",
+    "current_turn_context_exhausted",
+])
+async def test_sessions_send_replays_accepted_budget_failure_without_new_task_or_message(
+    tmp_path: Path,
+    error_code: str,
+) -> None:
+    from opensquilla.contracts.gateway_transport import TURN_COMMITTED_EVENT
+    from opensquilla.engine.types import ErrorEvent
+
+    async with _open_real_stack(tmp_path / "budget-failure-replay.db") as stack:
+        emitted: list[str] = []
+
+        class BudgetFailureRunner:
+            async def run(self, _message: str, _session_key: str, **_kwargs: Any):
+                yield ErrorEvent(code=error_code, message="The request exceeds the active budget.")
+
+        async def emit_event(_key: str, name: str, _payload: dict[str, Any]) -> None:
+            emitted.append(name)
+
+        async def turn_handler(run: Any) -> None:
+            stack.received_runs.append(run)
+            await dispatch_task_runtime_turn(
+                run,
+                config=stack.context.config,
+                session_manager=stack.manager,
+                turn_runner=BudgetFailureRunner(),
+                event_emitter=emit_event,
+            )
+
+        stack.runtime._turn_handler = turn_handler
+        stack.runtime._event_emitter = emit_event
+        params = {
+            "key": SESSION_KEY,
+            "message": "Keep this accepted input after the provider budget failure.",
+            "clientRequestId": CLIENT_REQUEST_ID,
+        }
+        first = await get_dispatcher().dispatch(
+            "rpc-budget-first", "sessions.send", params, stack.context,
+        )
+        assert first.ok is True
+        terminal = await stack.runtime.wait(first.payload["task_id"], timeout=2.0)
+        assert terminal.status == AgentTaskStatus.FAILED
+        before_replay = _table_counts(stack.db_path)
+        transcript = await stack.storage.get_transcript(stack.session_id)
+        accepted_input = [entry for entry in transcript
+                          if entry.message_id == first.payload["message_id"]]
+        assert len(accepted_input) == 1
+        assert accepted_input[0].content == params["message"]
+
+        replay = await get_dispatcher().dispatch(
+            "rpc-budget-replay", "sessions.send", params, stack.context,
+        )
+
+        assert replay.ok is True
+        assert replay.payload["accepted"] is True
+        assert replay.payload["replayed"] is True
+        assert replay.payload["task_status"] == "failed"
+        assert replay.payload["task_id"] == first.payload["task_id"]
+        assert replay.payload["message_id"] == first.payload["message_id"]
+        assert _table_counts(stack.db_path) == before_replay
+        assert before_replay["agent_tasks"] == before_replay["turn_ingress_receipts"] == 1
+        assert len(stack.received_runs) == 1
+        assert emitted.count("task.failed") == 1
+        assert TURN_COMMITTED_EVENT not in emitted

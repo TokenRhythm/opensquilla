@@ -23,6 +23,7 @@ from opensquilla.sandbox.operation_runtime import (
 from opensquilla.search.canonical import run_canonical_web_search
 from opensquilla.search.normalize import canonicalize_url, extract_domain
 from opensquilla.search.types import (
+    DEFAULT_SEARCH_FETCH_TOP_K,
     DEFAULT_SEARCH_MAX_RESULTS,
     MAX_SEARCH_RESULTS,
     Recency,
@@ -640,13 +641,15 @@ def _search_success_payload(payload: dict) -> dict:
     return result
 
 
-def _search_failure_payload(payload: dict, *, retryable: bool = False) -> dict:
+def _search_failure_payload(
+    payload: dict, *, retryable: bool = False, retry_allowed: bool = False
+) -> dict:
     result = dict(payload)
     message = str(result.get("error") or "")
     error_kind = str(result.get("error_kind") or "unknown")
     error_class = str(result.get("error_class") or "")
     result["ok"] = False
-    result["retry_allowed"] = False
+    result["retry_allowed"] = retry_allowed
     result["errorMessage"] = message
     result["error"] = {
         "kind": error_kind,
@@ -813,6 +816,7 @@ def _web_discover_payload_from_canonical(
     return _search_failure_payload(
         result,
         retryable=bool(payload.get("provider_retryable")),
+        retry_allowed=payload.get("retry_allowed") is True,
     )
 
 
@@ -911,7 +915,9 @@ async def run_web_search_payload(
         max_results=(
             _active_max_results if resolved_max_results is None else resolved_max_results
         ),
-        fetch_top_k=3 if resolved_fetch_top_k is None else resolved_fetch_top_k,
+        fetch_top_k=(
+            DEFAULT_SEARCH_FETCH_TOP_K if resolved_fetch_top_k is None else resolved_fetch_top_k
+        ),
         max_chars_per_source=1500 if resolved_max_chars is None else resolved_max_chars,
         include_domains=resolved_include_domains,
         exclude_domains=resolved_exclude_domains,
@@ -999,7 +1005,7 @@ def _search_domain_list(value: object, name: str) -> tuple[tuple[str, ...], str 
 async def _web_search_fetcher(url: str, max_chars: int) -> dict[str, object]:
     from opensquilla.tools.builtin.web_fetch import run_web_fetch_payload
 
-    return await run_web_fetch_payload(url, max_chars=max_chars)
+    return await run_web_fetch_payload(url, max_chars=max_chars, _search_excerpt=True)
 
 
 def _search_payload(
@@ -1049,7 +1055,8 @@ def _search_result_payload(provider_name: str, result: SearchResult) -> dict[str
     name="web_search",
     description=(
         "Source-backed web search for current information. Searches, deduplicates, "
-        "and can fetch compact citation-ready excerpts from top sources."
+        "and returns source previews. Fetching and further reading are agent decisions; "
+        "no pages are fetched unless fetch_top_k is explicitly positive."
     ),
     params={
         "query": {"type": "string", "description": "Search query."},
@@ -1060,15 +1067,31 @@ def _search_result_payload(provider_name: str, result: SearchResult) -> dict[str
         },
         "max_results": {
             "type": "integer",
-            "description": "Maximum number of deduplicated results to return.",
+            "description": (
+                "Maximum deduplicated results; uses configured search default when omitted. "
+                "Normalized to 1-20; the runtime budget may impose a lower ceiling."
+            ),
+            "minimum": 1,
+            "maximum": 20,
         },
         "fetch_top_k": {
             "type": "integer",
-            "description": "Number of top results to fetch for compact excerpts.",
+            "description": (
+                "Top results eligible for fetching when provider content is insufficient. "
+                "Defaults to 0; normalized to 0-5 and further limited by runtime budget."
+            ),
+            "default": DEFAULT_SEARCH_FETCH_TOP_K,
+            "minimum": 0,
+            "maximum": 5,
         },
         "max_chars_per_source": {
             "type": "integer",
-            "description": "Maximum excerpt characters per source.",
+            "description": (
+                "Maximum excerpt characters per source, default 1500. Normalized to "
+                "200-5000; the runtime budget may impose a lower ceiling."
+            ),
+            "minimum": 200,
+            "maximum": 5000,
         },
         "include_domains": {
             "type": "array",

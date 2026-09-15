@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import threading
 import time
 from collections.abc import Mapping
@@ -1109,36 +1108,6 @@ def _complete_request_estimated_tokens(
         )
     )
 
-    reminder_tokens = 0
-    reminder_setting = os.environ.get(
-        "OPENSQUILLA_TURN_OBJECTIVE_REMINDER",
-        "",
-    ).strip().lower()
-    if reminder_setting in {"on", "1", "true", "yes"}:
-        reminder_chars = 2_000
-    elif reminder_setting.startswith("trim:") and reminder_setting[5:].isdigit():
-        reminder_chars = max(0, int(reminder_setting[5:]))
-    elif reminder_setting in {"", "off", "0", "false", "no"}:
-        reminder_chars = 0
-    else:
-        # Agent construction will reject an invalid setting. Counting the full
-        # message here keeps admission conservative until that validation runs.
-        reminder_chars = len(semantic_message)
-    if reminder_chars > 0 and semantic_message:
-        objective = semantic_message.strip()
-        if len(objective) > reminder_chars:
-            objective = objective[:reminder_chars].rstrip() + "..."
-        reminder_tokens = estimate_tokens(
-            "\n".join(
-                (
-                    "[Current user request reminder]",
-                    "This is the active user request for this same turn, not a new request.",
-                    "Continue using the tool results above to make progress on:",
-                    objective,
-                )
-            )
-        )
-
     # The remaining reserve is only provider-specific JSON/role framing. All
     # content-bearing records, including the later runtime record, are counted
     # explicitly above.
@@ -1150,7 +1119,6 @@ def _complete_request_estimated_tokens(
         + skills_context_tokens
         + request_context_wrapper_tokens
         + runtime_context_tokens
-        + reminder_tokens
         + framing_tokens
     )
     metadata["large_context_material_tokens"] = material_tokens
@@ -1165,8 +1133,6 @@ def _complete_request_estimated_tokens(
         )
     if skills_context_tokens:
         metadata["large_context_skills_context_tokens"] = skills_context_tokens
-    if reminder_tokens:
-        metadata["large_context_request_reminder_tokens"] = reminder_tokens
     return total
 
 
@@ -1367,7 +1333,7 @@ async def finalize_squilla_router_capacity(ctx: TurnContext) -> TurnContext:
     selected_raw = str(ctx.metadata.get("routed_tier") or "").strip()
     selected_tier = selected_raw if selected_raw in tiers else None
     requires_image = _attachments_include_image(ctx.attachments) or (
-        ctx.metadata.get("router_vision_followup_needs_image") is True
+        ctx.metadata.get("image_context_has_images") is True
     )
     # A marker downgrade is a text request from the capacity stage's point of
     # view.  Keep compaction/capacity admission active and consider every
@@ -2025,23 +1991,20 @@ async def apply_squilla_router(ctx: TurnContext) -> TurnContext:
             )
 
     # Image-aware routing: skip ML and pick directly from the user's
-    # configured c0-c3 deployments for current uploads. ``image_model`` is a
+    # configured c0-c3 deployments for the current image context. ``image_model`` is a
     # legacy presentation/configuration field, not an executable fifth leg.
-    # Historical images require the upstream semantic follow-up gate;
-    # recent-image/sticky metadata alone is observability and replay context,
-    # not enough to force vision.
+    # The replay boundary supplies image presence from typed attachments;
+    # user wording does not remove images from the accepted context.
     #
     # This runs BEFORE the empty-text guard below: the image route is
     # deterministic and never consumes the message text, so an image turn with
     # an empty/whitespace caption must still be routed to a vision tier rather
     # than falling through the empty-text early return.
     current_turn_has_image = _attachments_include_image(ctx.attachments)
-    history_gate_needs_image = (
-        ctx.metadata.get("router_vision_followup_needs_image") is True
-    )
+    image_context_has_images = ctx.metadata.get("image_context_has_images") is True
     # Computed once and reused below by both the bypass and the policy engine's
     # capability gate (which must not recompute the signal).
-    turn_needs_image = current_turn_has_image or history_gate_needs_image
+    turn_needs_image = current_turn_has_image or image_context_has_images
     if turn_needs_image:
         c3_fusion_active = bool(
             getattr(getattr(ctx.config, "llm_ensemble", None), "enabled", False)
@@ -2074,15 +2037,8 @@ async def apply_squilla_router(ctx: TurnContext) -> TurnContext:
             if tier_support.get(name) == "unsupported"
         ]
 
-        image_route_reason = "current_turn" if current_turn_has_image else "gate_history"
-        history_turns = 1
-        if image_route_reason == "gate_history":
-            history_turns = max(
-                1,
-                int(getattr(router_cfg, "vision_history_lookback_turns", 8) or 1),
-            )
+        image_route_reason = "current_turn" if current_turn_has_image else "history_context"
         ctx.metadata["image_route_reason"] = image_route_reason
-        ctx.metadata["route_max_history_turns"] = history_turns
         ctx.metadata["router_image_tier_support"] = dict(tier_support)
         ctx.metadata["router_image_configured_tiers"] = list(configured_tiers)
 

@@ -2,12 +2,18 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 from pathlib import Path
 from typing import Any
 
-from opensquilla.engine.tool_result_store import ToolResultRecord, ToolResultStore
+from opensquilla.engine.tool_result_query import character_page, log_grep, log_ranges
+from opensquilla.engine.tool_result_store import (
+    ToolOutputNotReadyError,
+    ToolResultRecord,
+    ToolResultStore,
+)
 from opensquilla.tools.registry import tool
 from opensquilla.tools.types import PlanAccess, SafeToolError, current_tool_context
 
@@ -67,19 +73,6 @@ def _normalize_handle(handle: str) -> str:
     if match:
         return match.group(0)
     return str(handle or "").strip()
-
-
-def _read_record(handle: str) -> ToolResultRecord:
-    store_dir, session_id = _store_location()
-    try:
-        return ToolResultStore(store_dir).read(
-            _normalize_handle(handle),
-            session_id=session_id,
-        )
-    except Exception as exc:
-        raise SafeToolError(
-            "Stored tool result was not found for the current session."
-        ) from exc
 
 
 def _continuation_text(continuation: dict[str, Any] | None) -> str:
@@ -349,15 +342,7 @@ def _query(record: ToolResultRecord, *, query: str | None, context_lines: int) -
         return _grep(record, pattern=re.escape(text), context_lines=context_lines)
 
 
-def _line_ref_query(
-    record: ToolResultRecord,
-    query: str,
-    *,
-    context_lines: int,
-) -> str | None:
-    lines = record.content.splitlines()
-    if not lines:
-        return ""
+def _query_line_refs(query: str) -> list[int]:
     refs: list[int] = []
     seen: set[int] = set()
 
@@ -386,6 +371,20 @@ def _line_ref_query(
         except ValueError:
             continue
 
+    return refs
+
+
+def _line_ref_query(
+    record: ToolResultRecord,
+    query: str,
+    *,
+    context_lines: int,
+) -> str | None:
+    lines = record.content.splitlines()
+    if not lines:
+        return ""
+    refs = _query_line_refs(query)
+
     if not refs:
         return None
 
@@ -413,14 +412,17 @@ def _line_ref_query(
     name="retrieve_tool_result",
     description=(
         "Retrieve omitted raw output from a tool_result_projection or "
-        "aggregate_tool_result_compacted handle. Use this before acting on a "
+        "aggregate_tool_result_compacted handle, or an execution_log_handle. "
+        "Use this before acting on a "
         "projected result when exact diagnostics, source snippets, line ranges, "
         "or validation output may be needed."
     ),
     params={
         "handle": {
             "type": "string",
-            "description": "Stored raw tool result handle from tool_result_projection.",
+            "description": (
+                "Stored result handle from tool_result_projection or execution_log_handle."
+            ),
         },
         "mode": {
             "type": "string",
@@ -486,6 +488,31 @@ async def retrieve_tool_result(
     offset: int | None = None,
     limit: int | None = None,
 ) -> str:
+    store_dir, session_id = _store_location()
+    return await asyncio.to_thread(
+        query_stored_tool_result, store_dir, session_id, handle,
+        mode=mode, query=query, start_line=start_line, end_line=end_line,
+        pattern=pattern, context_lines=context_lines, max_chars=max_chars,
+        offset=offset, limit=limit,
+    )
+
+
+def query_stored_tool_result(
+    store_dir: str | Path,
+    session_id: str,
+    handle: str,
+    *,
+    mode: str = "metadata",
+    query: str | None = None,
+    start_line: int | None = None,
+    end_line: int | None = None,
+    pattern: str | None = None,
+    context_lines: int | None = None,
+    max_chars: int | None = None,
+    offset: int | None = None,
+    limit: int | None = None,
+) -> str:
+    """Query a session-owned stored result without depending on tool context."""
     selected_mode = _normalize_mode(
         mode,
         query=query,
@@ -524,7 +551,27 @@ async def retrieve_tool_result(
         minimum=0,
         maximum=_MAX_CONTEXT_LINES,
     )
-    record = _read_record(handle)
+    store = ToolResultStore(store_dir)
+    handle = _normalize_handle(handle)
+    try:
+        output_metadata = store.read_output_metadata(handle, session_id=session_id)
+        if output_metadata is None:
+            record = store.read(handle, session_id=session_id)
+        else:
+            return _query_execution_log(
+                store, session_id, output_metadata, mode=selected_mode,
+                query=normalized_query, pattern=normalized_pattern,
+                start_line=start_line, end_line=end_line, context_lines=ctx_lines,
+                char_limit=char_limit, offset=offset, raw_slice_limit=raw_slice_limit,
+            )
+    except ToolOutputNotReadyError as exc:
+        raise SafeToolError(
+            "Execution log is still being saved. Retry after the command finishes."
+        ) from exc
+    except (OSError, ValueError, KeyError) as exc:
+        raise SafeToolError(
+            "Stored tool result was not found for the current session."
+        ) from exc
 
     if selected_mode == "metadata":
         body = _metadata(record)
@@ -566,3 +613,175 @@ async def retrieve_tool_result(
         "---\n"
     )
     return _clip(header + body, max_chars=char_limit, continuation=continuation)
+
+
+def read_stored_tool_result_page(
+    store_dir: str | Path,
+    session_id: str,
+    handle: str,
+    *,
+    offset: int = 0,
+    limit: int = _DEFAULT_MAX_CHARS,
+) -> dict[str, Any]:
+    """Read one character page of an execution log without loading the full log."""
+    store = ToolResultStore(store_dir)
+    handle = _normalize_handle(handle)
+    try:
+        metadata = store.read_output_metadata(handle, session_id=session_id)
+        if metadata is None:
+            raise ValueError("not an execution log")
+        total = int(metadata["chars"])
+        start = _safe_int(offset, default=0, minimum=0, maximum=total)
+        count = _safe_int(limit, default=_DEFAULT_MAX_CHARS, minimum=1,
+                          maximum=_ABSOLUTE_MAX_CHARS)
+        body = character_page(
+            store.iter_text_chunks(handle, session_id=session_id), start, count,
+        )
+    except ToolOutputNotReadyError:
+        raise
+    except (OSError, ValueError, KeyError) as exc:
+        raise SafeToolError("Stored execution log was not found for the current session.") from exc
+    end = start + len(body)
+    return {
+        "storage_kind": "execution_log",
+        "handle": handle,
+        "offset": start,
+        "content": body,
+        "returned_chars": len(body),
+        "next_offset": end if end < total else None,
+        "chars": total,
+        "complete": bool(metadata.get("complete", False)),
+    }
+
+
+def _query_execution_log(
+    store: ToolResultStore, session_id: str, metadata: dict[str, Any], *,
+    mode: str, query: str | None, pattern: str | None, start_line: int | None,
+    end_line: int | None, context_lines: int, char_limit: int, offset: int | None,
+    raw_slice_limit: int,
+) -> str:
+    handle = str(metadata["handle"])
+    line_count = int(metadata["line_count"])
+    prefix = (
+        "[tool_result_retrieval]\n"
+        f"handle: {handle}\ntool_name: {metadata.get('tool_name', '')}\nmode: {mode}\n"
+        f"original_chars: {metadata['chars']}\n"
+        f"stored_log_is_complete: {str(bool(metadata.get('complete', False))).lower()}\n"
+    )
+    continuation = None
+    incomplete = False
+    if mode == "metadata":
+        body = json.dumps({"type": "tool_result_metadata", **metadata},
+                          ensure_ascii=False, sort_keys=True, indent=2)
+    elif mode == "raw_slice":
+        return _execution_log_raw_slice(
+            store, session_id, handle, prefix=prefix, total=int(metadata["chars"]),
+            offset=offset, limit=raw_slice_limit, max_chars=char_limit,
+        )
+    else:
+        ranges: list[tuple[int, int]] | None = None
+        labels = False
+        if mode == "slice":
+            start = _safe_int(start_line, default=1, minimum=1, maximum=max(1, line_count))
+            end = _safe_int(end_line, default=start + 199, minimum=start,
+                            maximum=max(start, line_count))
+            ranges = [(start, end)] if line_count else []
+        elif mode == "head_tail":
+            if line_count <= _DEFAULT_HEAD_TAIL_LINES * 2:
+                ranges = [(1, line_count)] if line_count else []
+            else:
+                ranges = [(1, _DEFAULT_HEAD_TAIL_LINES),
+                          (line_count - _DEFAULT_HEAD_TAIL_LINES + 1, line_count)]
+        elif mode == "query":
+            text = (query or "").strip()
+            if not text:
+                raise SafeToolError("query mode requires a non-empty query.")
+            match = _LINE_QUERY_RE.match(text)
+            if match:
+                first, last = sorted((int(match.group(1)), int(match.group(2) or match.group(1))))
+                start = min(max(1, line_count), max(1, first - context_lines))
+                end = min(max(1, line_count), max(start, last + context_lines))
+                ranges = [(start, end)] if line_count else []
+            else:
+                refs = _query_line_refs(text)
+                if refs:
+                    ranges = _merge_ranges([
+                        (max(1, ref - context_lines), min(line_count, ref + context_lines))
+                        for ref in refs if ref <= line_count
+                    ])
+                    labels = True
+                else:
+                    pattern = text
+                    try:
+                        re.compile(pattern)
+                    except re.error:
+                        pattern = re.escape(text)
+        if ranges is not None:
+            body, incomplete = log_ranges(
+                store, session_id, handle, ranges, max_chars=char_limit, labels=labels,
+                omission_notice=mode == "head_tail",
+            )
+            if labels and not ranges:
+                body = f"No matching in-range line references for query: {query}"
+        else:
+            if not pattern or not pattern.strip():
+                raise SafeToolError("grep mode requires a non-empty pattern.")
+            try:
+                body, incomplete = log_grep(
+                    store, session_id, handle, pattern=pattern, context_lines=context_lines,
+                    max_chars=char_limit, line_count=line_count,
+                )
+            except re.error as exc:
+                raise SafeToolError(f"Invalid grep pattern: {exc}") from exc
+        continuation = _same_mode_continuation(
+            handle=handle, mode=mode, max_chars=char_limit, query=query, pattern=pattern,
+            start_line=start_line, end_line=end_line, context_lines=context_lines,
+        )
+    probe = prefix + "returned_content_is_complete: true\n---\n" + body
+    complete = not incomplete and len(probe) <= char_limit
+    result = prefix + f"returned_content_is_complete: {str(complete).lower()}\n---\n" + body
+    return _clip(result, max_chars=char_limit, continuation=continuation)
+
+
+def _execution_log_raw_slice(
+    store: ToolResultStore, session_id: str, handle: str, *, prefix: str,
+    total: int, offset: int | None, limit: int, max_chars: int,
+) -> str:
+    start = _safe_int(offset, default=0, minimum=0, maximum=total)
+    requested = min(limit, total - start)
+    content = character_page(
+        store.iter_text_chunks(handle, session_id=session_id), start,
+        min(requested, max_chars),
+    ) if requested else ""
+    # Include the header and continuation in the response budget. Clipping
+    # after computing next_offset would permanently skip undisplayed text.
+    while True:
+        end = start + len(content)
+        next_offset = end if end < total else None
+        continuation = None
+        if next_offset is not None:
+            continuation = {
+                "available": True,
+                "next_call_strategy": "raw_slice_offset",
+                "next_call": {"name": "retrieve_tool_result", "arguments": {
+                    "handle": handle, "mode": "raw_slice", "offset": next_offset,
+                    "limit": limit, "max_chars": max_chars,
+                }},
+            }
+        complete = len(content) == requested
+        response = (
+            prefix + f"returned_content_is_complete: {str(complete).lower()}\n---\n"
+            f"offset: {start}\nreturned_chars: {len(content)}\n"
+            f"next_offset: {next_offset if next_offset is not None else ''}\n"
+            + content
+            + ("\n" + _continuation_text(continuation) if continuation else "")
+        )
+        excess = len(response) - max_chars
+        if excess <= 0 and (content or not requested):
+            return response
+        if excess >= len(content) or not content:
+            raise SafeToolError(
+                "max_chars is too small to return the execution-log page and its "
+                "continuation. Increase max_chars and retry the same offset."
+            )
+        content = content[:-excess]

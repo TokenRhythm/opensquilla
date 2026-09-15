@@ -1,4 +1,13 @@
 {
+  "resourceActions": {
+    "more": "Actions du fichier", "preview": "Aperçu dans l’application", "openSource": "Ouvrir avec l’application par défaut",
+    "reveal": "Afficher dans le gestionnaire de fichiers", "revealFinder": "Afficher dans le Finder", "revealExplorer": "Afficher dans l’Explorateur de fichiers",
+    "openCopy": "Ouvrir une copie locale", "saveAs": "Enregistrer sous…", "copyPath": "Copier le chemin",
+    "copyGatewayPath": "Copier le chemin serveur", "copyContents": "Copier le contenu", "saved": "Fichier enregistré",
+    "singleFile": "Enregistrer uniquement ce HTML, sans les styles, images et pages liés.",
+    "textOnly": "La copie prend en charge le texte UTF-8 jusqu’à 1 MiB. Enregistrez plutôt le fichier.",
+    "unavailable": "Le fichier source est indisponible. Les aperçus et téléchargements existants sont inchangés.", "failed": "L’opération sur le fichier a échoué."
+  },
   "workspaces": {
     "projects": "Projets",
     "createProject": "Créer un projet",
@@ -257,6 +266,7 @@
       "permissionDenied": "Vous n’êtes pas autorisé à mettre à jour cette page.",
       "previewCapabilityExpired": "L’aperçu doit être rouvert.",
       "previewRendererFailed": "Impossible d’afficher l’aperçu. Essayez de le rouvrir.",
+      "previewPageUnsupported": "Ce client ou Gateway ne permet pas d’ouvrir directement cette sous-page. Effectuez une mise à jour, puis réessayez.",
       "annotationUnavailable": "Cette annotation est temporairement indisponible.",
       "annotationBusy": "Les annotations sont en cours de mise à jour. Patientez un instant puis réessayez.",
       "invalidRequest": "Impossible de terminer la requête. Vérifiez la saisie puis réessayez.",
@@ -3431,7 +3441,7 @@
     "loadingSession": "Restauration de l’historique de la conversation…",
     "loadingSessionDescription": "Vous pouvez continuer à utiliser la conversation pendant le chargement.",
     "loadSessionFailed": "Historique de la conversation temporairement indisponible",
-    "loadSessionDescription": "La connexion a peut-être été interrompue ou le service d’historique est temporairement indisponible. Rechargez pour réessayer.",
+    "loadSessionDescription": "L’historique de la conversation est temporairement indisponible.",
     "reloadSession": "Recharger l’historique",
     "retryingSession": "Rechargement de l’historique…",
     "retryingSessionDescription": "Restauration de l’historique de la conversation…",
@@ -3441,11 +3451,11 @@
     "gatewayReconnecting": "Reconnexion au Gateway…",
     "automaticRecoveryDescription": "La récupération est automatique. Vous pouvez continuer à écrire ; le texte et les pièces jointes non envoyés restent ici.",
     "liveUnavailable": "Les mises à jour en direct sont temporairement indisponibles",
-    "liveUnavailableDescription": "L’historique reste disponible. Reconnectez-vous avant d’envoyer.",
-    "liveUnavailableConnectedDescription": "Le Gateway est connecté et l’historique reste disponible. L’envoi reprendra après le rétablissement des mises à jour en direct.",
+    "liveUnavailableDescription": "L’historique reste disponible. L’envoi reprendra une fois les mises à jour en direct rétablies.",
+    "liveUnavailableConnectedDescription": "La Gateway est connectée. Les mises à jour en direct de cette session sont temporairement indisponibles.",
     "reconnectLive": "Se reconnecter",
     "liveSendBlockedConnecting": "Les mises à jour en direct se reconnectent. Votre brouillon est conservé.",
-    "liveSendBlockedDegraded": "Reconnectez les mises à jour en direct avant d’envoyer. Votre brouillon est conservé.",
+    "liveSendBlockedDegraded": "Les mises à jour en direct sont temporairement indisponibles. Votre brouillon est conservé.",
     "noMessagesYet": "Aucun message pour l'instant.",
     "newChat": "Nouvelle tâche",
     "chatWithSuffix": "Chat {suffix}",
@@ -3630,6 +3640,7 @@
         "rateLimited": "Limite atteinte · nouvel essai dans {seconds}s",
         "retryWait": "Nouvel essai dans {seconds}s",
         "retrying": "Nouvel essai {attempt}/{limit}",
+        "retryingWithoutLimit": "Nouvel essai · tentative {attempt}",
         "fallback": "Passage au modèle de secours"
       },
       "purpose": {
@@ -3691,11 +3702,23 @@
       "cancelled": "Annulé"
     },
     "toolModal": {
+      "retry": "Réessayer",
+      "logPending": "Le journal d’exécution est en cours d’enregistrement. Réessayez une fois la commande terminée.",
+      "copyPage": "Copier cette page",
       "tree": "Arborescence",
       "raw": "Brut",
       "wrapLines": "Retour à la ligne",
       "preserveLines": "Conserver la largeur des lignes",
-      "contentMeta": "{type} · {lines} lignes · {chars} caractères"
+      "contentMeta": "{type} · {lines} lignes · {chars} caractères",
+      "executionLog": "Voir le journal d’exécution",
+      "toolResult": "Résultat de l’outil",
+      "characterOffset": "Position du caractère",
+      "go": "Aller",
+      "previous": "Précédent",
+      "next": "Suivant",
+      "logRange": "Caractères {start}–{end} sur {total}",
+      "logReadFailed": "Impossible de charger le journal d’exécution. Réessayez.",
+      "logIncomplete": "Le journal est incomplet. Seule la sortie enregistrée est disponible."
     },
     "approval": {
       "required": "Approbation requise",
@@ -3905,7 +3928,7 @@
         "busy": "L'état de l'objectif est encore en cours de règlement. Son dernier état est affiché ci-dessus.",
         "notResumable": "Cet objectif ne peut pas être repris depuis son état actuel.",
         "executionDisabled": "L'exécution des objectifs est désactivée dans cet espace de travail.",
-        "connectionRequired": "Reconnectez cette tâche avant de poursuivre l'objectif.",
+        "connectionRequired": "Cette tâche n’est pas encore prête à continuer.",
         "planModeActive": "L'objectif attendra la fin du mode Plan.",
         "planRunActive": "L'objectif attendra la fin de l'exécution Plan active.",
         "requestConflict": "Cette action a déjà été utilisée pour une autre demande. Réessayez."
@@ -4215,7 +4238,7 @@
       "unknownProviderCalls": "{count} appel fournisseur a une utilisation inconnue | {count} appels fournisseur ont une utilisation inconnue"
     },
     "modelRouting": {
-      "updateFailed": "Impossible de changer le routage des modèles — rétabli. Vérifiez la connexion à la passerelle et réessayez.",
+      "updateFailed": "Impossible de changer le routage des modèles — rétabli. La modification est temporairement indisponible.",
       "sessionUpdateFailed": "Impossible de mettre à jour le routage des modèles de ce chat : {error}"
     },
     "routeFeedback": {
@@ -4352,7 +4375,7 @@
       "sectionDiagnostics": "diagnostics",
       "sectionResult": "résultat",
       "sectionError": "erreur",
-      "viewFull": "voir en entier",
+      "viewFull": "développer le contenu",
       "activityViewDetails": "voir les détails",
       "activityDetailsTitle": "détails",
       "activityBytesWritten": "{size} écrits",

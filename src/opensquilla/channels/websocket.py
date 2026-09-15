@@ -36,7 +36,7 @@ class WebSocketChannel:
     async def receive(self) -> IncomingMessage:
         """Block until an inbound message is available."""
         msg = await self._queue.get()
-        log.debug("ws_channel.receive", conn_id=self.conn.conn_id, content=msg.content[:80])
+        log.debug("ws_channel.receive", conn_id=self.conn.conn_id, content_chars=len(msg.content))
         return msg
 
     async def send(self, message: OutgoingMessage) -> None:
@@ -50,7 +50,7 @@ class WebSocketChannel:
             payload["metadata"] = message.metadata
 
         await self.conn.send_event("channel.message", payload)
-        log.debug("ws_channel.send", conn_id=self.conn.conn_id, content=message.content[:80])
+        log.debug("ws_channel.send", conn_id=self.conn.conn_id, content_chars=len(message.content))
 
     async def edit(self, message_id: str, content: str) -> None:
         """Send an edit event over the WebSocket connection."""

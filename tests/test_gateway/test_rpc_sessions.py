@@ -134,6 +134,7 @@ class FakeSession:
     auth_profile_override_source: str | None = None
     epoch: int = 0
     workspace_id: str | None = None
+    execution_workspace: dict[str, Any] | None = None
 
 
 @pytest.mark.parametrize(
@@ -1797,6 +1798,64 @@ class TestSessionsList:
         assert row["workspace"] == str(workspace)
         assert row["workspaceLabel"] == "project-beta"
         assert row["workspaceDisplayPath"] == str(workspace)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("saved_context", [False, True])
+    async def test_list_uses_bound_task_workspace(self, dispatcher, tmp_path, saved_context):
+        workspace = tmp_path / "tasks" / "bound-task"
+        # No filesystem creation: metadata remains useful if the directory is
+        # temporarily unavailable, and must not display the shared fallback.
+        session = FakeSession(
+            session_key="agent:main:webchat:bound-workspace",
+            execution_workspace={
+                "version": 1,
+                "id": "6a56c8c1be4a496f9813150a71ba1ac2",
+                "kind": "managed",
+                "root": str(workspace),
+            },
+            origin={RUN_CONTEXT_ORIGIN_KEY: {"workspace": str(tmp_path / "old-shared")}}
+            if saved_context else None,
+        )
+        ctx = make_ctx(session_manager=FakeSessionManager([session]))
+
+        res = await dispatcher.dispatch("r1", "sessions.list", None, ctx)
+
+        assert res.ok is True
+        row = res.payload["sessions"][0]
+        assert row["workspace"] == str(workspace)
+        assert row["workspaceLabel"] == "bound-task"
+        assert row["workspaceDisplayPath"] == str(workspace)
+
+    @pytest.mark.asyncio
+    async def test_list_project_workspace_takes_precedence_over_task_binding(
+        self, dispatcher, tmp_path,
+    ):
+        project = tmp_path / "selected-project"
+        session = FakeSession(
+            session_key="agent:main:webchat:project-workspace",
+            workspace_id="project-id",
+            execution_workspace={
+                "version": 1,
+                "id": "6a56c8c1be4a496f9813150a71ba1ac2",
+                "kind": "managed",
+                "root": str(tmp_path / "old-task"),
+            },
+            origin={RUN_CONTEXT_ORIGIN_KEY: {"workspace": str(project)}},
+        )
+        ctx = make_ctx(session_manager=FakeSessionManager([session]))
+
+        res = await dispatcher.dispatch("r1", "sessions.list", None, ctx)
+
+        assert res.ok is True
+        assert res.payload["sessions"][0]["workspace"] == str(project)
+
+    def test_list_invalid_task_binding_does_not_display_shared_fallback(self, tmp_path):
+        session = FakeSession(
+            execution_workspace={"root": str(tmp_path / "invalid")},
+            origin={RUN_CONTEXT_ORIGIN_KEY: {"workspace": str(tmp_path / "old-shared")}},
+        )
+
+        assert rpc_sessions._workspace_metadata_for_session(session, GatewayConfig()) == {}
 
     @pytest.mark.asyncio
     async def test_list_keeps_default_opensquilla_workspace_flat(

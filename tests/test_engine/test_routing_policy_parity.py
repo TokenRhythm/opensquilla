@@ -28,7 +28,8 @@ The image-bypass cases were intentionally recaptured for the configured-only
 multimodal policy. Router now evaluates only c0-c3, treats omitted capability
 as probeable, prefers proven support, and never executes the legacy
 ``image_model`` row. Their goldens pin the strict configured fallback chain
-and image projection metadata; non-attachment cases retain their prior
+and image projection metadata. Active image history no longer relies on a
+selection gate or sets a separate history turn limit; non-attachment cases retain their prior
 byte-identical behavior.
 
 Classifier outputs are injected through a fake strategy: the corpus never
@@ -241,8 +242,8 @@ def build_corpus() -> list[Case]:
     )
     cases.append(
         Case(
-            name="image_gate_history_bypass",
-            metadata={"router_vision_followup_needs_image": True},
+            name="image_active_history_bypass",
+            metadata={"image_context_has_images": True},
             classify_expected=False,
         )
     )

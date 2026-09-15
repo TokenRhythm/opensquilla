@@ -7,7 +7,7 @@ from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, TypedDict
 
 from opensquilla.artifacts import ArtifactSource
 from opensquilla.contracts.tool_presentation import ToolPresentationCategory
@@ -20,6 +20,22 @@ current_meta_skill_owner: contextvars.ContextVar[str] = contextvars.ContextVar(
     "current_meta_skill_owner",
     default="",
 )
+
+# A fresh dictionary per dispatch keeps output references out of tool text and
+# isolates parallel calls. Reader workers can update the shared per-call value.
+current_execution_log: contextvars.ContextVar[dict[str, str] | None] = contextvars.ContextVar(
+    "current_execution_log", default=None,
+)
+
+
+class ToolResultSnapshotReference(TypedDict):
+    handle: str
+    sha256: str
+
+
+ToolResultSnapshotWriter = Callable[
+    [str, str, str], Awaitable[ToolResultSnapshotReference | None]
+]
 
 
 class CallerKind(StrEnum):
@@ -72,6 +88,7 @@ class ToolContext:
     run_mode: str | None = None
     sandbox_mounts: list[dict[str, Any]] = field(default_factory=list)
     sandbox_run_context: Any | None = None
+    # Inert compatibility slots; no source-diff interventions or candidate capture.
     source_diff_preservation_mode: str = "log"
     source_diff_candidate_mode: str = "log"
     source_diff_candidates: list[dict[str, Any]] = field(default_factory=list)
@@ -239,6 +256,14 @@ class ToolContext:
 
     desktop_browser: Any | None = field(default=None, repr=False)
     artifact_source_paths: dict[str, ArtifactSource] = field(default_factory=dict, repr=False)
+    workspace_preview_opener: Callable[..., Awaitable[dict[str, Any]]] | None = field(
+        default=None, repr=False,
+    )
+    workspace_preview_scopes: list[dict[str, str]] = field(default_factory=list, repr=False)
+    # Output spools share the runtime's configured result-store budgets.
+    tool_result_store_max_bytes: int | None = 8 * 1024 * 1024
+    tool_result_store_disk_budget_bytes: int | None = 256 * 1024 * 1024
+    tool_result_store_retention_seconds: int | None = 7 * 24 * 60 * 60
 
     def __post_init__(self) -> None:
         self.validate_path_roots()
@@ -260,6 +285,12 @@ class ToolContext:
             "scratch_dir must not equal or contain workspace_dir; use a disjoint "
             "scratch root or a dedicated scratch subdirectory inside the workspace"
         )
+
+    # Process-local, turn-bound callback; never included in a public wire schema.
+    # Keep this declaration last so runtime fields above retain their positions.
+    tool_result_snapshot_writer: ToolResultSnapshotWriter | None = field(
+        default=None, repr=False
+    )
 
 
 def is_goal_owned_main_default_turn(ctx: ToolContext | None) -> bool:

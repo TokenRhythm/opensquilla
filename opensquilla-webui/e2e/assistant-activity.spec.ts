@@ -28,6 +28,7 @@ async function captureActivityScreenshot(page: Page, name: string) {
 interface ActivityFixture {
   failed?: boolean
   searchTargets?: boolean
+  recoveredEdit?: boolean
 }
 
 interface ControlledActivityLifecycleFixture {
@@ -45,6 +46,27 @@ function wsEvent(event: string, payload: unknown) {
 
 async function mockActivityHistory(page: Page, fixture: ActivityFixture = {}) {
   const isSearchFixture = fixture.searchTargets === true
+  const now = Math.floor(Date.now() / 1000)
+  const recoveredTurnId = 'turn-activity-recovered-edit'
+  const recoveredToolCalls = fixture.recoveredEdit
+    ? [{
+        tool_use_id: 'activity-edit-failed',
+        name: 'edit_file',
+        groupId: 'activity-group',
+        input: { path: 'beijing-site/index.html', old_text: 'Old title', new_text: 'New title' },
+        result: 'old_text was not found; read the current file and retry.',
+        is_error: true,
+        execution_status: { status: 'error' },
+      }, {
+        tool_use_id: 'activity-edit-retried',
+        name: 'edit_file',
+        groupId: 'activity-group',
+        input: { path: 'beijing-site/index.html', old_text: 'Current title', new_text: 'New title' },
+        result: 'Successfully edited beijing-site/index.html',
+        is_error: false,
+        execution_status: { status: 'success' },
+      }]
+    : undefined
   await page.addInitScript(() => {
     window.localStorage.setItem('opensquilla-locale', 'en')
   })
@@ -70,9 +92,10 @@ async function mockActivityHistory(page: Page, fixture: ActivityFixture = {}) {
               role: 'assistant',
               text: 'The canonical answer is complete.',
               id: `assistant-activity-${fixture.failed ? 'failed' : 'success'}`,
-              timestamp: Math.floor(Date.now() / 1000) - 30,
+              timestamp: now - 30,
+              ...(fixture.recoveredEdit ? { turn_context: { turn_id: recoveredTurnId } } : {}),
               reasoning_content: 'I compared the available evidence before answering.',
-              tool_calls: [{
+              tool_calls: recoveredToolCalls ?? [{
                 tool_use_id: isSearchFixture ? 'activity-search' : 'activity-tool',
                 name: isSearchFixture ? 'web_search' : 'custom_tool',
                 groupId: 'activity-group',
@@ -96,7 +119,16 @@ async function mockActivityHistory(page: Page, fixture: ActivityFixture = {}) {
                 { type: 'tool-group', groupId: 'activity-group' },
                 { type: 'text', raw: 'Non-canonical streamed suffix.' },
               ],
-            }]),
+            }], fixture.recoveredEdit ? {
+              turn_outcomes: [{
+                turn_id: recoveredTurnId,
+                task_id: 'task-activity-recovered-edit',
+                status: 'succeeded',
+                started_at: now - 74,
+                finished_at: now - 30,
+                outcome: { kind: 'completed' },
+              }],
+            } : {}),
         }))
         return
       }
@@ -121,7 +153,21 @@ async function mockActivityHistory(page: Page, fixture: ActivityFixture = {}) {
         )))
         return
       }
-      ws.send(JSON.stringify({ type: 'res', id: frame.id, ok: true, payload: {} }))
+      const payloads: Record<string, unknown> = {
+        'agents.list': { agents: [] },
+        'commands.list_for_surface': { commands: [] },
+        'config.get': {
+          squilla_router: { enabled: false, rollout_phase: 'observe', tiers: {} },
+          permissions: {},
+          skills: {},
+        },
+        'onboarding.status': { audioConfigured: false },
+        'sandbox.run_mode.preference.get': { runMode: 'full', source: 'config' },
+        'sandbox.capability.status': { available: false },
+        'sessions.list': { sessions: [], count: 0, ts: now, has_more: false },
+        'usage.status': { sessions: [] },
+      }
+      ws.send(wsResponse(frame.id as string | number, payloads[String(frame.method || '')] ?? {}))
     })
     ws.send(JSON.stringify({ type: 'event', event: 'connect.challenge', payload: {} }))
   })
@@ -674,6 +720,73 @@ test.describe('Completed assistant activity disclosure', () => {
   })
 
   for (const width of [1440, 390] as const) {
+    test(`shows successful recovered edits without hiding the original error at ${width}px`, async ({
+      page,
+    }) => {
+      const runtimeErrors: string[] = []
+      page.on('pageerror', error => runtimeErrors.push(error.message))
+      page.on('console', message => {
+        if (message.type() === 'error' || message.type() === 'warning') {
+          runtimeErrors.push(message.text())
+        }
+      })
+      await page.route('**/api/approvals', route => route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({ mode: 'prompt', pending: [] }),
+      }))
+      await page.route('**/api/system/update', route => route.fulfill({
+        json: { available: false },
+      }))
+      await page.route('**/api/elevated-mode', route => route.fulfill({
+        json: { enabled: false },
+      }))
+      await page.route('**/control/static/dist/opensquilla-mark.png', route => route.fulfill({
+        contentType: 'image/png',
+        body: fs.readFileSync(new URL('../public/opensquilla-mark.png', import.meta.url)),
+      }))
+      await mockActivityHistory(page, { recoveredEdit: true })
+      await page.setViewportSize({ width, height: width === 390 ? 844 : 900 })
+      await page.emulateMedia({ reducedMotion: 'reduce' })
+      const sessionKey = `${SESSION_KEY}-recovered-${width}`
+      await page.goto(CONTROL_URL + 'chat?session=' + encodeURIComponent(sessionKey))
+      await expect(page.locator('.conn-pill.connected')).toBeVisible({ timeout: 10000 })
+      expect(new URL(page.url()).pathname).toBe('/control/chat')
+      expect(new URL(page.url()).searchParams.get('session')).toBe(sessionKey)
+      await expect(page).toHaveTitle(/OpenSquilla/)
+      await expect(page.locator('vite-error-overlay, #webpack-dev-server-client-overlay')).toHaveCount(0)
+      await expect(page.getByText('The canonical answer is complete.', { exact: true })).toBeVisible()
+
+      const activity = page.getByTestId('assistant-activity')
+      const summary = activity.locator('.assistant-activity__summary')
+      await expect(activity).toHaveAttribute('data-share-expanded', 'false')
+      await expect(summary).toHaveText('Completed · 44s')
+      await expect(summary).not.toContainText('Failed')
+      await captureActivityScreenshot(page, `recovered-edit-${width}-collapsed`)
+
+      await summary.press('Enter')
+      await expect(activity).toHaveAttribute('data-share-expanded', 'true')
+      const toolBatch = activity.locator('.assistant-activity-tool-batch')
+      await toolBatch.locator('summary').click()
+      await expect(toolBatch).toHaveAttribute('open', '')
+      const errorRow = activity.locator('.tool-row--error')
+      await expect(errorRow).toHaveCount(1)
+      await expect(errorRow).toBeVisible()
+      await expect(activity.getByText(
+        'old_text was not found; read the current file and retry.', { exact: true },
+      )).toBeVisible()
+      await expect(activity.locator('.tool-row[data-op="file.edit"]:not(.tool-row--error)')).toHaveCount(1)
+      await expect(summary).toHaveText('Completed · 44s')
+      const pageOverflow = await page.evaluate(() =>
+        document.documentElement.scrollWidth - document.documentElement.clientWidth,
+      )
+      expect(pageOverflow).toBeLessThanOrEqual(1)
+      await captureActivityScreenshot(page, `recovered-edit-${width}-expanded`)
+      expect(runtimeErrors).toEqual([])
+    })
+  }
+
+  for (const width of [1440, 390] as const) {
     for (const theme of ['light', 'dark'] as const) {
       for (const reducedMotion of ['no-preference', 'reduce'] as const) {
         test(`keeps compact receipts inside ${width}px ${theme} ${reducedMotion}`, async ({
@@ -722,6 +835,122 @@ test.describe('Completed assistant activity disclosure', () => {
 })
 
 test.describe('Live assistant activity lifecycle', () => {
+  test('renders an unbounded provider retry as an attempt label', async ({ page }) => {
+    const lifecycle = await mockControlledActivityLifecycle(page)
+    await page.goto(
+      CONTROL_URL + 'chat?session=' + encodeURIComponent(LIFECYCLE_SESSION_KEY),
+    )
+    await expect(page.locator('.conn-pill.connected')).toBeVisible({ timeout: 10_000 })
+    await page.locator('.chat-textarea').fill('Reconnect and finish this task.')
+    await page.locator('.chat-send-btn[aria-label="Send"]').click()
+
+    const liveActivity = page.locator('.assistant-activity--live')
+    await expect(liveActivity).toBeVisible()
+    lifecycle.emit('session.event.provider_activity', {
+      phase: 'retrying',
+      reason: 'transport_transient',
+      retry_attempt: 7,
+      retry_limit: 0,
+    })
+    await expect(liveActivity.getByText('Retrying · attempt 7', { exact: true })).toBeVisible()
+    await expect(liveActivity).not.toContainText('7/0')
+    await expect(page.locator('.msg-error-card')).toHaveCount(0)
+
+    lifecycle.finish()
+    await expect(liveActivity).toHaveCount(0)
+    await expect(page.locator('.msg-ai .assistant-activity__summary')).toContainText('Completed')
+  })
+
+  test('keeps a failed tool row when a later tool succeeds and the turn completes', async ({ page }) => {
+    const lifecycle = await mockControlledActivityLifecycle(page, {
+      donePayload: { text: 'Recovered final answer.' },
+      settledMessages: acceptedUserMessageId => [{
+        role: 'user',
+        text: 'Recover after a tool failure.',
+        id: acceptedUserMessageId,
+        message_id: acceptedUserMessageId,
+        timestamp: Math.floor(Date.now() / 1000) - 30,
+      }, {
+        role: 'assistant',
+        text: 'Recovered final answer.',
+        id: 'activity-recovered-assistant',
+        message_id: 'activity-recovered-assistant',
+        timestamp: Math.floor(Date.now() / 1000),
+        tool_calls: [{
+          tool_use_id: 'activity-failing',
+          name: 'bash_exec',
+          groupId: 'activity-failure-group',
+          input: { command: 'exit 7' },
+          result: 'exit 7',
+          is_error: true,
+          execution_status: { status: 'error' },
+        }, {
+          tool_use_id: 'activity-recovered',
+          name: 'bash_exec',
+          groupId: 'activity-recovery-group',
+          input: { command: 'printf recovered' },
+          result: 'recovered',
+          execution_status: { status: 'success' },
+        }],
+        timeline: [
+          { type: 'tool-group', groupId: 'activity-failure-group' },
+          { type: 'tool-group', groupId: 'activity-recovery-group' },
+          { type: 'text', raw: 'Recovered final answer.' },
+        ],
+      }],
+    })
+    await page.goto(
+      CONTROL_URL + 'chat?session=' + encodeURIComponent(LIFECYCLE_SESSION_KEY),
+    )
+    await expect(page.locator('.conn-pill.connected')).toBeVisible({ timeout: 10000 })
+
+    await page.locator('.chat-textarea').fill('Recover after a tool failure.')
+    await page.locator('.chat-send-btn[aria-label="Send"]').click()
+    const liveActivity = page.locator('.assistant-activity--live')
+    await expect(liveActivity).toBeVisible()
+
+    lifecycle.emit('session.event.tool_use_start', {
+      tool_use_id: 'activity-failing',
+      name: 'bash_exec',
+      input: { command: 'exit 7' },
+    })
+    lifecycle.emit('session.event.tool_result', {
+      tool_use_id: 'activity-failing',
+      name: 'bash_exec',
+      input: { command: 'exit 7' },
+      result: 'exit 7',
+      is_error: true,
+      execution_status: { status: 'error' },
+    })
+    const failedRow = liveActivity.locator('.tool-row--error').first()
+    await expect(failedRow).toBeVisible()
+
+    lifecycle.emit('session.event.tool_use_start', {
+      tool_use_id: 'activity-recovered',
+      name: 'bash_exec',
+      input: { command: 'printf recovered' },
+    })
+    lifecycle.emit('session.event.tool_result', {
+      tool_use_id: 'activity-recovered',
+      name: 'bash_exec',
+      input: { command: 'printf recovered' },
+      result: 'recovered',
+      execution_status: { status: 'success' },
+    })
+    lifecycle.emit('session.event.text_delta', { text: 'Recovered final answer.' })
+    await expect(page.getByText('Recovered final answer.', { exact: true })).toBeVisible()
+
+    lifecycle.finish()
+    await expect(liveActivity).toHaveCount(0)
+    const settled = page.locator('.msg-ai .assistant-activity').last()
+    await expect(settled).toBeVisible()
+    await expect(settled.locator('.assistant-activity__summary')).toContainText('Completed')
+    await expect(settled.locator('.tool-row--error')).toHaveCount(1)
+    await expect(settled.locator('.tool-row[data-op="command.run"]')).toHaveCount(2)
+    await expect(page.getByText('Recovered final answer.', { exact: true })).toHaveCount(1)
+    await expect(page.locator('.msg-error-card')).toHaveCount(0)
+  })
+
   test('moves draft text back into activity when a later tool starts, then settles', async ({ page }) => {
     await page.emulateMedia({ reducedMotion: 'no-preference' })
     const lifecycle = await mockControlledActivityLifecycle(page)

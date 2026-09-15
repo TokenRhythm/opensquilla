@@ -36,13 +36,12 @@ For a new runnable webpage when workspace file-authoring tools are available:
    workspace root.
 2. Keep `index.html`, local CSS/JavaScript, and every local asset inside that
    project root, using browser-relative references.
-3. Validate the finished project, then call `publish_artifact` exactly once
-   with the entry file and the complete dedicated root:
+3. Validate the finished project, then call `open_workspace_preview` with the
+   entry file and the complete dedicated root:
 
 ```json
 {
   "path": "webpage-<topic-slug>/index.html",
-  "mime": "text/html",
   "bundle": "directory",
   "bundle_root": "webpage-<topic-slug>"
 }
@@ -51,9 +50,9 @@ For a new runnable webpage when workspace file-authoring tools are available:
 Do not bundle the entire workspace. When a caller explicitly requests
 source-only output, forbids tool calls, or supplies its own deterministic
 writer—as AwesomeWebpageMetaSkill does—follow that narrower caller contract
-instead. When file authoring or `publish_artifact` is unavailable, return only
-the requested guidance or source and do not claim that a runnable project was
-published.
+instead. When file authoring or `open_workspace_preview` is unavailable, return
+only the requested guidance or source and do not claim that a runnable project
+was opened.
 
 ## Core Capabilities
 

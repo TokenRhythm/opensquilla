@@ -1,4 +1,13 @@
 {
+  "resourceActions": {
+    "more": "Dateiaktionen", "preview": "Vorschau in der App", "openSource": "Mit Standard-App öffnen",
+    "reveal": "Im Dateimanager anzeigen", "revealFinder": "Im Finder anzeigen", "revealExplorer": "Im Datei-Explorer anzeigen",
+    "openCopy": "Lokale Kopie öffnen", "saveAs": "Speichern unter…", "copyPath": "Pfad kopieren",
+    "copyGatewayPath": "Serverpfad kopieren", "copyContents": "Dateiinhalt kopieren", "saved": "Datei gespeichert",
+    "singleFile": "Nur diese HTML-Datei speichern, ohne verknüpfte Stile, Bilder und Seiten.",
+    "textOnly": "Kopieren unterstützt UTF-8-Text bis 1 MiB. Speichern Sie stattdessen die Datei.",
+    "unavailable": "Quelldatei nicht verfügbar. Vorhandene Vorschauen und Downloads bleiben unverändert.", "failed": "Dateiaktion fehlgeschlagen."
+  },
   "workspaces": {
     "projects": "Projekte",
     "createProject": "Projekt erstellen",
@@ -257,6 +266,7 @@
       "permissionDenied": "Du hast keine Berechtigung, diese Seite zu aktualisieren.",
       "previewCapabilityExpired": "Die Vorschau muss erneut geöffnet werden.",
       "previewRendererFailed": "Die Vorschau konnte nicht angezeigt werden. Öffne sie erneut.",
+      "previewPageUnsupported": "Dieser Client oder das Gateway unterstützt das direkte Öffnen dieser Unterseite nicht. Aktualisiere die Software und versuche es erneut.",
       "annotationUnavailable": "Diese Anmerkung ist vorübergehend nicht verfügbar.",
       "annotationBusy": "Die Anmerkungen werden gerade aktualisiert. Warte einen Moment und versuche es erneut.",
       "invalidRequest": "Die Anfrage konnte nicht abgeschlossen werden. Prüfe die Eingabe und versuche es erneut.",
@@ -3431,7 +3441,7 @@
     "loadingSession": "Unterhaltungsverlauf wird wiederhergestellt…",
     "loadingSessionDescription": "Sie können die Unterhaltung währenddessen weiter verwenden.",
     "loadSessionFailed": "Unterhaltungsverlauf vorübergehend nicht verfügbar",
-    "loadSessionDescription": "Die Verbindung wurde möglicherweise unterbrochen oder der Verlaufsdienst ist vorübergehend nicht verfügbar. Bitte laden Sie erneut.",
+    "loadSessionDescription": "Der Gesprächsverlauf ist vorübergehend nicht verfügbar.",
     "reloadSession": "Verlauf neu laden",
     "retryingSession": "Unterhaltungsverlauf wird neu geladen…",
     "retryingSessionDescription": "Der Unterhaltungsverlauf wird wiederhergestellt…",
@@ -3441,11 +3451,11 @@
     "gatewayReconnecting": "Verbindung zum Gateway wird wiederhergestellt…",
     "automaticRecoveryDescription": "Die Verbindung wird automatisch wiederhergestellt. Sie können weiter schreiben; ungesendeter Text und Anhänge bleiben erhalten.",
     "liveUnavailable": "Live-Aktualisierungen sind vorübergehend nicht verfügbar",
-    "liveUnavailableDescription": "Der Verlauf bleibt verfügbar. Stellen Sie vor dem Senden die Verbindung wieder her.",
-    "liveUnavailableConnectedDescription": "Das Gateway ist verbunden und der Verlauf bleibt verfügbar. Das Senden wird nach Wiederherstellung der Live-Aktualisierungen fortgesetzt.",
+    "liveUnavailableDescription": "Der Verlauf bleibt verfügbar. Der Versand wird fortgesetzt, sobald die Live-Aktualisierungen wiederhergestellt sind.",
+    "liveUnavailableConnectedDescription": "Das Gateway ist verbunden. Live-Aktualisierungen für diese Sitzung sind vorübergehend nicht verfügbar.",
     "reconnectLive": "Erneut verbinden",
     "liveSendBlockedConnecting": "Live-Aktualisierungen werden wiederhergestellt. Ihr Entwurf bleibt erhalten.",
-    "liveSendBlockedDegraded": "Stellen Sie vor dem Senden die Live-Verbindung wieder her. Ihr Entwurf bleibt erhalten.",
+    "liveSendBlockedDegraded": "Live-Aktualisierungen sind vorübergehend nicht verfügbar. Ihr Entwurf bleibt erhalten.",
     "noMessagesYet": "Noch keine Nachrichten.",
     "newChat": "Neue Aufgabe",
     "chatWithSuffix": "Chat {suffix}",
@@ -3630,6 +3640,7 @@
         "rateLimited": "Ratenlimit · neuer Versuch in {seconds}s",
         "retryWait": "Neuer Versuch in {seconds}s",
         "retrying": "Neuer Versuch {attempt}/{limit}",
+        "retryingWithoutLimit": "Neuer Versuch · Versuch {attempt}",
         "fallback": "Wechsel zum Ersatzmodell"
       },
       "purpose": {
@@ -3691,11 +3702,23 @@
       "cancelled": "Abgebrochen"
     },
     "toolModal": {
+      "retry": "Erneut versuchen",
+      "logPending": "Das Ausführungsprotokoll wird noch gespeichert. Versuchen Sie es nach Abschluss des Befehls erneut.",
+      "copyPage": "Diese Seite kopieren",
       "tree": "Baum",
       "raw": "Roh",
       "wrapLines": "Zeilen umbrechen",
       "preserveLines": "Zeilenbreite beibehalten",
-      "contentMeta": "{type} · {lines} Zeilen · {chars} Zeichen"
+      "contentMeta": "{type} · {lines} Zeilen · {chars} Zeichen",
+      "executionLog": "Ausführungsprotokoll anzeigen",
+      "toolResult": "Werkzeugergebnis",
+      "characterOffset": "Zeichenposition",
+      "go": "Los",
+      "previous": "Zurück",
+      "next": "Weiter",
+      "logRange": "Zeichen {start}–{end} von {total}",
+      "logReadFailed": "Das Ausführungsprotokoll konnte nicht geladen werden. Bitte erneut versuchen.",
+      "logIncomplete": "Das Protokoll ist unvollständig. Nur gespeicherte Ausgaben sind verfügbar."
     },
     "approval": {
       "required": "Genehmigung erforderlich",
@@ -3905,7 +3928,7 @@
         "busy": "Der Zielstatus wird noch abgeschlossen. Der neueste Stand wird oben angezeigt.",
         "notResumable": "Dieses Ziel kann im aktuellen Zustand nicht fortgesetzt werden.",
         "executionDisabled": "Die Zielausführung ist in diesem Arbeitsbereich deaktiviert.",
-        "connectionRequired": "Verbinde diese Aufgabe erneut, bevor du das Ziel fortsetzt.",
+        "connectionRequired": "Diese Aufgabe kann derzeit noch nicht fortgesetzt werden.",
         "planModeActive": "Das Ziel wartet, bis der Planmodus beendet ist.",
         "planRunActive": "Das Ziel wartet, bis der aktive Planlauf beendet ist.",
         "requestConflict": "Diese Zielaktion wurde bereits für eine andere Anfrage verwendet. Versuche es erneut."
@@ -4215,7 +4238,7 @@
       "unknownProviderCalls": "{count} Provider-Aufruf mit unbekannter Nutzung | {count} Provider-Aufrufe mit unbekannter Nutzung"
     },
     "modelRouting": {
-      "updateFailed": "Modell-Routing konnte nicht umgeschaltet werden – zurückgesetzt. Prüfen Sie die Gateway-Verbindung und versuchen Sie es erneut.",
+      "updateFailed": "Modell-Routing konnte nicht umgeschaltet werden – zurückgesetzt. Die Änderung ist vorübergehend nicht verfügbar.",
       "sessionUpdateFailed": "Das Modellrouting dieses Chats konnte nicht aktualisiert werden: {error}"
     },
     "routeFeedback": {
@@ -4352,7 +4375,7 @@
       "sectionDiagnostics": "Diagnose",
       "sectionResult": "Ergebnis",
       "sectionError": "Fehler",
-      "viewFull": "vollständig anzeigen",
+      "viewFull": "Inhalt aufklappen",
       "activityViewDetails": "Details anzeigen",
       "activityDetailsTitle": "Details",
       "activityBytesWritten": "{size} geschrieben",

@@ -372,6 +372,8 @@ async def test_close_drains_accepted_local_record_without_starting_upload(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     runtime = ScopedTelemetryRuntime(config=_config(tmp_path))
+    # Keep SQLite initialization outside the shutdown race's watchdog.
+    assert await runtime._scope_runtime(TelemetryScope.RELIABILITY) is not None
     entered = asyncio.Event()
     release = asyncio.Event()
     recorded = asyncio.Event()
@@ -398,7 +400,7 @@ async def test_close_drains_accepted_local_record_without_starting_upload(
     await asyncio.sleep(0)
     runtime.record_background(_turn_event(2))
     release.set()
-    await asyncio.wait_for(closing, timeout=1)
+    await asyncio.wait_for(closing, timeout=10)
 
     assert recorded.is_set()
     assert starts == 0
@@ -413,6 +415,8 @@ async def test_close_during_start_does_not_leave_an_upload_task(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     runtime = ScopedTelemetryRuntime(config=_config(tmp_path))
+    # This race starts after recording, independently of outbox setup latency.
+    assert await runtime._scope_runtime(TelemetryScope.RELIABILITY) is not None
     entered = asyncio.Event()
     release = asyncio.Event()
 

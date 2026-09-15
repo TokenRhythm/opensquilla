@@ -27,6 +27,7 @@ SearchFallbackMode = Literal["none", "auth_missing", "network"]
 # explicit number; MAX_SEARCH_RESULTS is the hard ceiling every surface clamps to
 # (it matches the per-provider upper bound, e.g. Brave's count cap).
 DEFAULT_SEARCH_MAX_RESULTS = 10
+DEFAULT_SEARCH_FETCH_TOP_K = 0
 MAX_SEARCH_RESULTS = 20
 
 
@@ -65,7 +66,7 @@ class SearchOptions:
     query: str
     mode: SearchMode = "auto"
     max_results: int = DEFAULT_SEARCH_MAX_RESULTS
-    fetch_top_k: int = 3
+    fetch_top_k: int = DEFAULT_SEARCH_FETCH_TOP_K
     max_chars_per_source: int = 1500
     include_domains: tuple[str, ...] = ()
     exclude_domains: tuple[str, ...] = ()

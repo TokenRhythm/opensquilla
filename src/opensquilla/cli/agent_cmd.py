@@ -610,11 +610,16 @@ def _with_agent_workspace_config(config: Any, workspace: str) -> Any:
     if memory is not None:
         update["memory"] = memory
     if hasattr(config, "model_copy"):
-        return config.model_copy(update=update)
-    copied = copy.copy(config)
-    setattr(copied, "workspace_dir", workspace)
-    if memory is not None:
-        setattr(copied, "memory", memory)
+        copied = config.model_copy(update=update)
+    else:
+        copied = copy.copy(config)
+        setattr(copied, "workspace_dir", workspace)
+        if memory is not None:
+            setattr(copied, "memory", memory)
+    # The CLI's effective startup root is trusted, including its legacy
+    # configured default. Gateway task allocation must not replace it.
+    if hasattr(copied, "_workspace_dir_explicit"):
+        copied._workspace_dir_explicit = True
     return copied
 
 
@@ -950,12 +955,14 @@ def run_agent_command(
     iteration_timeout_seconds: float | None = typer.Option(
         None,
         "--iteration-timeout-seconds",
-        help="Per-iteration timeout in seconds (one LLM call + its tool executions)",
+        help="Deprecated compatibility option; ignored.",
+        hidden=True,
     ),
     tool_timeout_seconds: float | None = typer.Option(
         None,
         "--tool-timeout-seconds",
-        help="Per-tool execution timeout in seconds",
+        help="Deprecated compatibility option; ignored.",
+        hidden=True,
     ),
     request_timeout_seconds: float | None = typer.Option(
         None,

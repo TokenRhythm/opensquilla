@@ -116,6 +116,7 @@ export type AssistantActivityStatusCode =
   | 'chat.activity.provider.rateLimited'
   | 'chat.activity.provider.retryWait'
   | 'chat.activity.provider.retrying'
+  | 'chat.activity.provider.retryingWithoutLimit'
   | 'chat.activity.provider.fallback'
   | 'chat.compact.compacting'
   | 'chat.compact.compacted'
@@ -878,10 +879,11 @@ function statusLabelFor(
       })
     }
     if (phase === 'retrying') {
-      return codeDescriptor('chat.activity.provider.retrying', {
-        attempt: Math.max(0, Number.parseInt(first, 10) || 0),
-        limit: Math.max(0, Number.parseInt(second, 10) || 0),
-      })
+      const attempt = Math.max(0, Number.parseInt(first, 10) || 0)
+      const limit = Math.max(0, Number.parseInt(second, 10) || 0)
+      return limit > 0
+        ? codeDescriptor('chat.activity.provider.retrying', { attempt, limit })
+        : codeDescriptor('chat.activity.provider.retryingWithoutLimit', { attempt })
     }
     if (phase === 'fallback') return codeDescriptor('chat.activity.provider.fallback')
     return codeDescriptor('chat.activity.lifecycle.working')

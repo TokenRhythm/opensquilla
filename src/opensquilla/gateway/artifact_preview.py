@@ -33,6 +33,7 @@ from opensquilla.application.artifact_workbench import (
 from opensquilla.artifact_session.working_files import WorkingFiles
 from opensquilla.artifacts import (
     ArtifactBundleUnsupportedError,
+    ArtifactError,
     ArtifactIntegrityError,
     ArtifactNotFoundError,
     ArtifactStore,
@@ -44,6 +45,7 @@ from opensquilla.gateway.origin_guard import (
     request_origin_allowed,
 )
 from opensquilla.gateway.scopes import is_loopback_address
+from opensquilla.html_format import is_html_preview_path
 from opensquilla.paths import media_root_from_config, native_io_path
 
 log = structlog.get_logger(__name__)
@@ -577,6 +579,11 @@ def register_artifact_preview_routes(
             return _api_error("mode must be full or offline", "INVALID_REQUEST", 400)
         if client not in {"desktop", "web"}:
             return _api_error("client must be desktop or web", "INVALID_REQUEST", 400)
+        page_path = body.get("pagePath")
+        if "pagePath" in body and not is_html_preview_path(page_path):
+            return _api_error(
+                "pagePath must be a normalized relative HTML path", "INVALID_REQUEST", 400,
+            )
 
         effective_mode = (
             "full"
@@ -625,15 +632,35 @@ def register_artifact_preview_routes(
         except (ArtifactNotFoundError, ValueError):
             return _api_error("Artifact not found", "NOT_FOUND", 404)
 
+        if page_path is not None:
+            try:
+                lease = lease_service.resolve_token(grant.token)
+                resource = await asyncio.to_thread(
+                    lease_service.resolve_resource, lease, page_path,
+                )
+                if (
+                    resource.logical_path != page_path
+                    or resource.mime.split(";", 1)[0].strip().lower() not in _HTML_MIMES
+                ):
+                    raise ArtifactNotFoundError("Preview page not found")
+            except (ArtifactError, OSError, ValueError) as exc:
+                lease_service.revoke(
+                    grant.lease_id, session_id=session_id, session_key=session_key,
+                )
+                if isinstance(exc, ArtifactIntegrityError):
+                    return _api_error("Artifact integrity check failed", "INTEGRITY_ERROR", 409)
+                return _api_error("Preview page not found", "NOT_FOUND", 404)
+
+        launch_path = page_path or grant.entrypoint
         use_loopback_transport = client == "desktop" or effective_mode == "full"
         if use_loopback_transport:
-            launch_url = lease_service.full_launch_url(grant.token, grant.entrypoint)
+            launch_url = lease_service.full_launch_url(grant.token, launch_path)
             preview_origin = (
                 f"http://p-{grant.token}.localhost:{lease_service.listener_port}"
             )
         else:
             encoded_entrypoint = quote(
-                grant.entrypoint.lstrip("/"),
+                launch_path.lstrip("/"),
                 safe=_URL_PATH_SAFE,
             )
             launch_url = f"/api/v1/artifact-preview/{grant.token}/{encoded_entrypoint}"
@@ -646,6 +673,8 @@ def register_artifact_preview_routes(
                 request.headers.get("x-opensquilla-preview-working-document") == "1"
             ),
         )
+        if page_path is not None:
+            payload["page_path"] = page_path
         response = JSONResponse(payload, status_code=201)
         _set_control_no_store(response)
         return response

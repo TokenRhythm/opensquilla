@@ -7,6 +7,11 @@
       "roles": ["result"]
     },
     {
+      "kind": "method",
+      "wireName": "sessions.executionLog.read",
+      "roles": ["params", "result"]
+    },
+    {
       "kind": "event",
       "wireName": "transport.flow.dirty",
       "roles": ["payload"]

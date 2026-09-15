@@ -423,6 +423,30 @@ class AttachmentContentQuery:
 
 
 @dataclass(frozen=True, slots=True)
+class WorkingFileQuery:
+    session_key: str
+    document_id: str
+    page_path: str | None = None
+
+    def __post_init__(self) -> None:
+        from opensquilla.html_format import is_html_preview_path
+
+        DocumentIdentity(self.session_key, self.document_id)
+        if self.page_path is not None and not is_html_preview_path(self.page_path):
+            raise ValueError("Invalid working page path")
+
+
+@dataclass(frozen=True, slots=True)
+class WorkingFileMaterial:
+    document_id: str
+    page_path: str
+    workspace: str
+    path: Path
+    media_type: str
+    data: bytes
+
+
+@dataclass(frozen=True, slots=True)
 class ContentMaterial:
     path: Path
     media_type: str
@@ -834,6 +858,8 @@ class ArtifactContentPort(Protocol):
 
     async def attachment_content(self, query: AttachmentContentQuery) -> ContentMaterial: ...
 
+    async def working_file(self, query: WorkingFileQuery) -> WorkingFileMaterial: ...
+
 
 class AttachmentStagingPort(Protocol):
     async def stage_attachment(
@@ -1008,6 +1034,9 @@ class ArtifactContentApplication:
 
     async def attachment(self, query: AttachmentContentQuery) -> ContentMaterial:
         return await self._port.attachment_content(query)
+
+    async def working_file(self, query: WorkingFileQuery) -> WorkingFileMaterial:
+        return await self._port.working_file(query)
 
 
 class AttachmentStagingApplication:

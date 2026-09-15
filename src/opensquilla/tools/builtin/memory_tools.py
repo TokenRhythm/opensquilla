@@ -364,8 +364,10 @@ def create_memory_tools(
         if memory_source == "workspace":
             from opensquilla.agents.scope import resolve_agent_workspace_dir
 
-            if ctx and ctx.workspace_dir:
-                wd: str | None = str(Path(ctx.workspace_dir).expanduser().resolve())
+            if ctx and ctx.memory_source_dir:
+                # Runtime resolves this from the Agent's memory configuration.
+                # A task execution directory is not a new long-term memory root.
+                wd: str | None = str(Path(ctx.memory_source_dir).expanduser().resolve())
             elif workspace_base:
                 wd = str(
                     resolve_agent_workspace_dir(

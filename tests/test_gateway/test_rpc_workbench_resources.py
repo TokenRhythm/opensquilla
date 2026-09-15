@@ -11,6 +11,8 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from starlette.applications import Starlette
+from starlette.testclient import TestClient
 
 import opensquilla.gateway.workbench_resource_runtime as resource_rpc
 from opensquilla.artifact_session import (
@@ -25,6 +27,8 @@ from opensquilla.artifact_session import (
 )
 from opensquilla.artifacts import ArtifactBundle, ArtifactBundleSourceFile, ArtifactStore
 from opensquilla.engine.types import ArtifactEvent
+from opensquilla.gateway.artifact_preview import register_artifact_preview_routes
+from opensquilla.gateway.config import AttachmentsConfig, GatewayConfig
 from opensquilla.gateway.generated_artifact_adoption import GeneratedArtifactAdopter
 from opensquilla.gateway.rpc import RpcContext, RpcUnavailableError, get_dispatcher
 from opensquilla.gateway.scopes import METHOD_SCOPES, READ_SCOPE, WRITE_SCOPE
@@ -33,6 +37,7 @@ from opensquilla.session.attachment_manifest import legacy_attachment_id
 from opensquilla.session.manager import SessionManager
 from opensquilla.session.models import TranscriptEntry
 from opensquilla.session.storage import SessionStorage
+from opensquilla.tools.types import ToolContext, current_tool_context
 
 SESSION_KEY = "agent:main:webchat:workbench-resources"
 
@@ -270,6 +275,83 @@ async def resource_env(tmp_path: Path):
 
 async def _dispatch(env, method: str, params: dict[str, object]):
     return await get_dispatcher().dispatch(f"test:{method}", method, params, env.ctx)
+
+
+@pytest.mark.parametrize("bundle_mode", ["directory", "none"])
+async def test_preview_pages_discovery_and_member_open_do_not_create_deliveries(
+    resource_env, bundle_mode,
+) -> None:
+    env = resource_env
+    workspace = Path(env.config.workspace_dir)
+    site = workspace / "site"
+    (site / "layouts").mkdir(parents=True)
+    (site / "index.html").write_text("<h1>Home</h1>")
+    (site / "layouts/editorial.html").write_text("<h1>Editorial</h1>")
+    (site / "layouts/dashboard.html").write_text("<h1>Dashboard</h1>")
+    (site / "style.css").write_text("h1 { color: blue }")
+    (workspace / "private.html").write_text("<h1>Other task</h1>")
+    service = await ArtifactSessionService.from_session_storage(env.storage)
+    app = Starlette()
+    preview_service = register_artifact_preview_routes(
+        app, session_manager=env.manager,
+        config=GatewayConfig(attachments=AttachmentsConfig(media_root=str(env.store.media_root))),
+    )
+    adopter = GeneratedArtifactAdopter(
+        service=service, store=env.store, session_key=SESSION_KEY,
+        session_id=env.session.session_id, workspace=str(workspace),
+        preview_service=preview_service,
+    )
+    context = ToolContext(
+        is_owner=True, session_key=SESSION_KEY, session_id=env.session.session_id,
+        workspace_dir=str(workspace),
+    )
+    token = current_tool_context.set(context)
+    try:
+        registered = await adopter.open_workspace_preview(
+            context, path="site/index.html", bundle=bundle_mode,
+            **({"bundle_root": "site"} if bundle_mode == "directory" else {}),
+        )
+    finally:
+        current_tool_context.reset(token)
+    changes_before = await _sqlite_total_changes(env.storage)
+    expected_pages = (
+        ["index.html", "layouts/dashboard.html", "layouts/editorial.html"]
+        if bundle_mode == "directory" else ["index.html"]
+    )
+    for method, extra in (
+        ("workbench.resources.list", {"types": ["document"]}),
+        ("workbench.resources.get", {"resourceRef": {
+            "type": "document", "documentId": registered["documentId"],
+        }}),
+    ):
+        result = await _dispatch(env, method, {"sessionKey": SESSION_KEY, **extra})
+        assert result.error is None, result.error
+        resource = (
+            result.payload["resources"][0] if method.endswith("list")
+            else result.payload["resource"]
+        )
+        assert sorted(resource["previewPages"]) == expected_pages
+        assert resource["resource"]["id"] == registered["documentId"]
+
+    head = await service.get_document_head(registered["documentId"])
+    with TestClient(app, base_url="http://127.0.0.1:18791") as client:
+        for page in expected_pages:
+            result = client.post(
+                f"/api/v1/artifacts/{head.revision.artifact_id}/preview-leases",
+                headers={"x-opensquilla-session-key": SESSION_KEY},
+                json={"version": 1, "mode": "offline", "client": "web", "pagePath": page},
+            )
+            assert result.status_code == 201, result.text
+            assert result.json()["entrypoint"] == "index.html"
+            assert result.json()["page_path"] == page
+            assert client.get(result.json()["launch_url"]).status_code == 200
+    assert await _sqlite_total_changes(env.storage) == changes_before
+    assert len(await service.list_revisions(registered["documentId"])) == 1
+    assert len(await service.list_documents(
+        session_key=SESSION_KEY, session_id=env.session.session_id,
+    )) == 1
+    assert not await service.list_document_publications(session_id=env.session.session_id)
+    assert not env.store.list_refs(session_id=env.session.session_id, limit=100).refs
 
 
 @pytest.mark.asyncio

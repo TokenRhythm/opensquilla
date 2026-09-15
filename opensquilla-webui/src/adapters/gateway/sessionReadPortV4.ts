@@ -211,6 +211,15 @@ function objectValue(value: unknown): Record<string, unknown> | null {
     : null
 }
 
+function canonicalSessionMetadata(value: unknown): unknown {
+  const result = objectValue(value)
+  const lock = objectValue(result?.run_mode_lock)
+  // Protocol 3 encodes Safe as "trusted". Decode only that wire alias;
+  // all other fields and invalid values still go through strict validation.
+  if (!result || lock?.runMode !== 'trusted') return value
+  return { ...result, run_mode_lock: { ...lock, runMode: 'safe' } }
+}
+
 function projectJson(value: unknown): unknown {
   if (Array.isArray(value)) return Object.freeze(value.map(projectJson))
   const item = objectValue(value)
@@ -384,7 +393,7 @@ async function hydrate(
   }
   const result = requireResult<SessionsMessagesHydrateResult>(
     SESSIONS_MESSAGES_HYDRATE_METHOD,
-    raw,
+    canonicalSessionMetadata(raw),
     validateSessionsMessagesHydrateResult,
   )
   if (result.key !== sessionKey) throw invalidContract(SESSIONS_MESSAGES_HYDRATE_METHOD)
@@ -535,7 +544,7 @@ export function createV4SessionReadPort(
           ),
         ).then(raw => requireResult<SessionsMessagesSubscribeResult>(
           SESSIONS_MESSAGES_SUBSCRIBE_METHOD,
-          raw,
+          canonicalSessionMetadata(raw),
           validateSessionsMessagesSubscribeResult,
         )).then(result => {
           if (result.key !== request.sessionKey || !result.subscribed) {
@@ -659,7 +668,7 @@ export function createV4SessionReadPort(
                 callOptions(request.signal, READ_TIMEOUT_MS, expectedGeneration, generation => { subscribedGeneration = generation }),
               )
               const subscription = requireResult<SessionsMessagesSubscribeResult>(
-                SESSIONS_MESSAGES_SUBSCRIBE_METHOD, raw, validateSessionsMessagesSubscribeResult,
+                SESSIONS_MESSAGES_SUBSCRIBE_METHOD, canonicalSessionMetadata(raw), validateSessionsMessagesSubscribeResult,
               )
               if (subscription.key !== request.sessionKey || !subscription.subscribed) {
                 throw invalidContract(SESSIONS_MESSAGES_SUBSCRIBE_METHOD)

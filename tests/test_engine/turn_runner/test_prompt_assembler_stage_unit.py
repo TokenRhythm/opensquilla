@@ -191,6 +191,7 @@ class _StubSelector:
 
     def override_model(self, model: str) -> None:
         self.overridden_models.append(model)
+        self.current_model = model
 
     def resolve(self):
         return self.resolve_returns
@@ -326,6 +327,25 @@ async def test_case01_plain_user_turn() -> None:
     assert o.squilla_router_tier == "T1"
     assert o.session_id_for_log == "session-id"
     assert o.trace_context_session_id == "session-id"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("explicit_model", [None, "synthetic/fixed-model"])
+async def test_image_continuation_authority_and_session_follow_stage_input(
+    explicit_model: str | None,
+) -> None:
+    turn = _make_turn()
+    turn.config = object()
+    selector = _StubSelector(resolve_returns=_StubProvider("selected"))
+    stage = _make_stage(executor=_RecordingPipelineExecutor(turn=turn))
+    inp = _make_input(cloned_selector=selector, model=explicit_model)
+
+    out = await stage.run(inp)
+
+    assert out.output.provider._image_routing_session_key == inp.session_key
+    assert out.output.provider._image_routing_config is (
+        None if explicit_model else turn.config
+    )
 
 
 @pytest.mark.asyncio
@@ -625,7 +645,7 @@ async def test_case03_history_router_context_threading() -> None:
 
 
 @pytest.mark.asyncio
-async def test_case04_squilla_router_fires_overrides_model() -> None:
+async def test_pipeline_recommendation_does_not_replace_physical_model_identity() -> None:
     selector = _StubSelector("sel4", current_model="claude-opus-4.5")
     routed_provider = _StubProvider("opus_routed")
     selector.resolve_returns = routed_provider
@@ -640,7 +660,7 @@ async def test_case04_squilla_router_fires_overrides_model() -> None:
     assert selector.overridden_models == []
     inner = getattr(out.output.provider, "_provider", None)
     assert inner is provider_after_pipeline
-    assert out.output.resolved_model == "claude-sonnet-4.5"
+    assert out.output.resolved_model == "claude-opus-4.5"
     assert out.output.squilla_router_tier == "premium"
 
 
@@ -677,6 +697,12 @@ async def test_explicit_model_override_reconciles_routed_model_and_clears_saving
     turn = _make_turn(
         metadata={
             "routed_model": "claude-sonnet-4.5",
+            "routed_model_vision_support": "unsupported",
+            "image_input_projection_required": True,
+            "image_input_mode": "marker",
+            "image_input_reason": "router_all_configured_tiers_unsupported",
+            "router_image_capability_exhausted": True,
+            "image_context_has_images": True,
             "savings_pct": 50.0,
             "savings_max_price_per_m": 9.0,
             "savings_routed_price_per_m": 3.0,
@@ -687,9 +713,18 @@ async def test_explicit_model_override_reconciles_routed_model_and_clears_saving
     stage = _make_stage(executor=executor)
     inp = _make_input(cloned_selector=selector, model="claude-haiku-4.5")
 
-    await stage.run(inp)
+    out = await stage.run(inp)
 
     # routed_model realigned to the model that actually ran; savings dropped.
+    assert out.output.resolved_model == "claude-haiku-4.5"
+    assert selector.current_config.model == out.output.resolved_model
+    assert turn.metadata["executed_model"] == out.output.resolved_model
+    assert "routed_model_vision_support" not in turn.metadata
+    assert "image_input_projection_required" not in turn.metadata
+    assert "image_input_mode" not in turn.metadata
+    assert "image_input_reason" not in turn.metadata
+    assert "router_image_capability_exhausted" not in turn.metadata
+    assert turn.metadata["image_context_has_images"] is True
     assert turn.metadata["routed_model"] == "claude-haiku-4.5"
     assert turn.metadata["savings_pct"] == 0.0
     assert turn.metadata["savings_max_price_per_m"] == 0.0

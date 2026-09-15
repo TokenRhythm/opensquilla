@@ -1,4 +1,13 @@
 {
+  "resourceActions": {
+    "more": "文件操作", "preview": "在应用中预览", "openSource": "用默认应用打开",
+    "reveal": "在文件管理器中显示", "revealFinder": "在 Finder 中显示", "revealExplorer": "在文件资源管理器中显示",
+    "openCopy": "打开本地副本", "saveAs": "另存为…", "copyPath": "复制路径",
+    "copyGatewayPath": "复制服务器路径", "copyContents": "复制文件内容", "saved": "文件已保存",
+    "singleFile": "仅保存此 HTML 文件，不包含引用的样式、图片和其他页面。",
+    "textOnly": "仅支持复制不超过 1 MiB 的 UTF-8 文本，请改用保存文件。",
+    "unavailable": "当前源文件不可用；已有预览和下载保持不变。", "failed": "文件操作失败。"
+  },
   "workspaces": {
     "projects": "项目",
     "createProject": "创建项目",
@@ -257,6 +266,7 @@
       "permissionDenied": "你没有权限更新此页面。",
       "previewCapabilityExpired": "需要重新打开预览。",
       "previewRendererFailed": "无法显示预览，请尝试重新打开。",
+      "previewPageUnsupported": "当前客户端或 Gateway 不支持直接打开此子页。请升级后重试。",
       "annotationUnavailable": "该批注暂时不可用。",
       "annotationBusy": "正在更新批注，请稍后重试。",
       "invalidRequest": "无法完成请求，请检查输入后重试。",
@@ -3515,7 +3525,7 @@
     "loadingSession": "正在恢复会话历史…",
     "loadingSessionDescription": "历史加载期间，您仍可继续使用此会话。",
     "loadSessionFailed": "暂时无法恢复会话历史",
-    "loadSessionDescription": "连接可能中断，或历史服务暂时不可用。请重新加载。",
+    "loadSessionDescription": "会话历史暂时不可用。",
     "reloadSession": "重新加载历史",
     "retryingSession": "正在重新加载会话历史…",
     "retryingSessionDescription": "正在恢复会话历史…",
@@ -3525,11 +3535,11 @@
     "gatewayReconnecting": "正在重新连接 Gateway…",
     "automaticRecoveryDescription": "正在自动恢复，可继续编辑；未发送的文字和附件会保留在这里。",
     "liveUnavailable": "实时更新暂不可用",
-    "liveUnavailableDescription": "历史消息仍可查看。请重新连接后再发送。",
-    "liveUnavailableConnectedDescription": "Gateway 已连接，历史消息仍可查看；当前会话实时更新恢复后即可发送。",
+    "liveUnavailableDescription": "历史消息仍可查看；实时更新恢复后即可发送。",
+    "liveUnavailableConnectedDescription": "Gateway 已连接。当前会话的实时更新暂时不可用。",
     "reconnectLive": "重新连接",
     "liveSendBlockedConnecting": "正在恢复实时更新，草稿已保留。",
-    "liveSendBlockedDegraded": "请先恢复实时更新再发送，草稿已保留。",
+    "liveSendBlockedDegraded": "实时更新暂时不可用，草稿已保留。",
     "noMessagesYet": "暂无消息。",
     "newChat": "新建任务",
     "chatWithSuffix": "聊天 {suffix}",
@@ -3714,6 +3724,7 @@
         "rateLimited": "受到限流 · {seconds} 秒后重试",
         "retryWait": "{seconds} 秒后重试",
         "retrying": "正在重试 {attempt}/{limit}",
+        "retryingWithoutLimit": "正在重试 · 第 {attempt} 次",
         "fallback": "正在切换备用模型"
       },
       "purpose": {
@@ -3775,11 +3786,23 @@
       "cancelled": "已取消"
     },
     "toolModal": {
+      "retry": "重试",
+      "logPending": "执行日志仍在保存中，请在命令结束后重试。",
+      "copyPage": "复制当前页",
       "tree": "树视图",
       "raw": "原始",
       "wrapLines": "自动换行",
       "preserveLines": "保留行宽",
-      "contentMeta": "{type} · {lines} 行 · {chars} 个字符"
+      "contentMeta": "{type} · {lines} 行 · {chars} 个字符",
+      "executionLog": "查看执行日志",
+      "toolResult": "工具返回内容",
+      "characterOffset": "字符位置",
+      "go": "跳转",
+      "previous": "上一页",
+      "next": "下一页",
+      "logRange": "第 {start}–{end} 个字符，共 {total} 个",
+      "logReadFailed": "执行日志加载失败，请重试。",
+      "logIncomplete": "日志不完整，仅能查看已保存的输出。"
     },
     "approval": {
       "required": "需要审批",
@@ -3989,7 +4012,7 @@
         "busy": "目标状态仍在结算，最新状态已显示在上方。",
         "notResumable": "当前状态下无法恢复这个目标。",
         "executionDisabled": "此工作区未启用 Goal 执行。",
-        "connectionRequired": "请重新连接当前任务后再继续目标。",
+        "connectionRequired": "当前任务暂时无法继续。",
         "planModeActive": "目标会等待 Plan 模式结束。",
         "planRunActive": "目标会等待当前 Plan 运行结束。",
         "requestConflict": "这次目标操作已用于其他请求，请重试。"
@@ -4299,7 +4322,7 @@
       "unknownProviderCalls": "{count} 次服务商调用的用量未知"
     },
     "modelRouting": {
-      "updateFailed": "切换模型路由失败，已恢复原设置。请检查网关连接后重试。",
+      "updateFailed": "无法切换模型路由，已恢复原设置。当前操作暂时不可用。",
       "sessionUpdateFailed": "无法更新当前会话的模型路由：{error}"
     },
     "routeFeedback": {
@@ -4436,7 +4459,7 @@
       "sectionDiagnostics": "诊断",
       "sectionResult": "结果",
       "sectionError": "错误",
-      "viewFull": "查看完整内容",
+      "viewFull": "展开内容",
       "activityViewDetails": "查看详情",
       "activityDetailsTitle": "详情",
       "activityBytesWritten": "已写入 {size}",

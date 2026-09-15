@@ -1,6 +1,15 @@
 {
   "cases": [
     {
+      "id": "document-subpage",
+      "valid": true,
+      "context": {
+        "resourceId": "document:doc-1",
+        "pagePath": "layouts/editorial.html",
+        "annotations": [{"text": "Change this page heading"}]
+      }
+    },
+    {
       "id": "references-and-annotations",
       "valid": true,
       "context": {

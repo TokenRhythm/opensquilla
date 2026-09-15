@@ -452,9 +452,10 @@ test('recovers initial history failure automatically without stealing draft focu
 
   await composer.fill('Keep editing while history recovers.')
   await expect(loadState).toContainText(
-    'Recovering automatically. You can keep editing; unsent text and attachments stay here.',
+    'Conversation history is temporarily unavailable.',
   )
   await expect(loadState).toHaveAttribute('role', 'status')
+  await expect(loadState.getByRole('button')).toHaveCount(0)
   await expect(thread).toHaveAttribute('aria-busy', 'false')
   await expect(composer).toBeEditable()
   await expect(page.locator('.chat-empty')).toHaveCount(0)
@@ -466,7 +467,7 @@ test('recovers initial history failure automatically without stealing draft focu
   const retrying = page.locator(
     '[data-testid="chat-session-recovery-status"][data-recovery-state="history-retrying"]',
   )
-  await expect(retrying).toContainText('Recovering automatically.')
+  await expect(retrying).toContainText('Reloading conversation history…')
   await expect(thread).toHaveAttribute('aria-busy', 'false')
   await expect(composer).toBeFocused()
   await expect(composer).toHaveValue('Keep editing while history recovers.')

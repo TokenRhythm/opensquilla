@@ -1,4 +1,14 @@
 {
+  "resourceActions": {
+    "more": "File actions", "preview": "Preview in app", "openSource": "Open with default app",
+    "reveal": "Show in file manager", "revealFinder": "Reveal in Finder", "revealExplorer": "Show in File Explorer",
+    "openCopy": "Open a local copy", "saveAs": "Save as…", "copyPath": "Copy path",
+    "copyGatewayPath": "Copy server path", "copyContents": "Copy file contents", "saved": "File saved",
+    "singleFile": "Save this HTML file only; linked styles, images and pages are not included.",
+    "textOnly": "Copy supports UTF-8 text up to 1 MiB. Save this file instead.",
+    "unavailable": "The current source file is unavailable. Existing previews and downloads are unchanged.",
+    "failed": "The file action failed."
+  },
   "workspaces": {
     "projects": "Projects",
     "createProject": "Create project",
@@ -257,6 +267,7 @@
       "permissionDenied": "You do not have permission to update this page.",
       "previewCapabilityExpired": "The preview needs to be reopened.",
       "previewRendererFailed": "The preview could not be displayed. Try reopening it.",
+      "previewPageUnsupported": "This client or Gateway does not support opening this subpage directly. Update and try again.",
       "annotationUnavailable": "This annotation is temporarily unavailable.",
       "annotationBusy": "Annotations are being updated. Wait a moment and try again.",
       "invalidRequest": "The request could not be completed. Check the input and try again.",
@@ -3515,7 +3526,7 @@
     "loadingSession": "Restoring conversation history…",
     "loadingSessionDescription": "You can keep using this conversation while history loads.",
     "loadSessionFailed": "Conversation history temporarily unavailable",
-    "loadSessionDescription": "The connection may have been interrupted, or history is temporarily unavailable. Reload to try again.",
+    "loadSessionDescription": "Conversation history is temporarily unavailable.",
     "reloadSession": "Reload history",
     "retryingSession": "Reloading conversation history…",
     "retryingSessionDescription": "Restoring conversation history…",
@@ -3525,11 +3536,11 @@
     "gatewayReconnecting": "Reconnecting to the Gateway…",
     "automaticRecoveryDescription": "Recovering automatically. You can keep editing; unsent text and attachments stay here.",
     "liveUnavailable": "Live updates are temporarily unavailable",
-    "liveUnavailableDescription": "History remains available. Reconnect before sending.",
-    "liveUnavailableConnectedDescription": "The Gateway is connected and history remains available. Sending resumes when this session's live updates recover.",
+    "liveUnavailableDescription": "History remains available. Sending resumes when live updates recover.",
+    "liveUnavailableConnectedDescription": "The Gateway is connected. Live updates for this session are temporarily unavailable.",
     "reconnectLive": "Reconnect",
     "liveSendBlockedConnecting": "Live updates are reconnecting. Your draft is saved.",
-    "liveSendBlockedDegraded": "Reconnect live updates before sending. Your draft is saved.",
+    "liveSendBlockedDegraded": "Live updates are temporarily unavailable. Your draft is saved.",
     "noMessagesYet": "No messages yet.",
     "newChat": "New task",
     "chatWithSuffix": "Chat {suffix}",
@@ -3714,6 +3725,7 @@
         "rateLimited": "Rate limited · retrying in {seconds}s",
         "retryWait": "Retrying in {seconds}s",
         "retrying": "Retrying {attempt}/{limit}",
+        "retryingWithoutLimit": "Retrying · attempt {attempt}",
         "fallback": "Switching to backup model"
       },
       "purpose": {
@@ -3775,11 +3787,23 @@
       "cancelled": "Cancelled"
     },
     "toolModal": {
+      "retry": "Retry",
+      "logPending": "Execution log is still being saved. Try again when the command finishes.",
+      "copyPage": "Copy this page",
       "tree": "Tree",
       "raw": "Raw",
       "wrapLines": "Wrap lines",
       "preserveLines": "Preserve line width",
-      "contentMeta": "{type} · {lines} lines · {chars} chars"
+      "contentMeta": "{type} · {lines} lines · {chars} chars",
+      "executionLog": "View execution log",
+      "toolResult": "Tool result",
+      "characterOffset": "Character offset",
+      "go": "Go",
+      "previous": "Previous",
+      "next": "Next",
+      "logRange": "Characters {start}–{end} of {total}",
+      "logReadFailed": "Could not load execution log. Try again.",
+      "logIncomplete": "Log is incomplete. Only saved output is available."
     },
     "approval": {
       "required": "Approval required",
@@ -3989,7 +4013,7 @@
         "busy": "The goal state is still settling. Its latest status is shown above.",
         "notResumable": "This goal cannot be resumed from its current state.",
         "executionDisabled": "Goal execution is disabled in this workspace.",
-        "connectionRequired": "Reconnect this task before continuing the goal.",
+        "connectionRequired": "This task is not ready to continue yet.",
         "planModeActive": "The goal will wait until Plan mode ends.",
         "planRunActive": "The goal will wait for the active Plan run to finish.",
         "requestConflict": "That goal action was already used for a different request. Try again."
@@ -4299,7 +4323,7 @@
       "unknownProviderCalls": "{count} provider call has unknown usage | {count} provider calls have unknown usage"
     },
     "modelRouting": {
-      "updateFailed": "Couldn't switch model routing — reverted. Check the gateway connection and try again.",
+      "updateFailed": "Couldn't switch model routing — reverted. The change is temporarily unavailable.",
       "sessionUpdateFailed": "Couldn't update this chat's model routing: {error}"
     },
     "routeFeedback": {
@@ -4436,7 +4460,7 @@
       "sectionDiagnostics": "diagnostics",
       "sectionResult": "result",
       "sectionError": "error",
-      "viewFull": "view full",
+      "viewFull": "expand content",
       "activityViewDetails": "view details",
       "activityDetailsTitle": "details",
       "activityBytesWritten": "{size} written",
