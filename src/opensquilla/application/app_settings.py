@@ -144,6 +144,9 @@ class SettingsRuntime[Config: SettingsConfig, PreparedProvider](Protocol):
     def reconcile_routing(
         self, candidate: Config, paths: set[str], *, previous: Config
     ) -> Mapping[str, object]: ...
+    def validate_routing(
+        self, previous: Config | None, candidate: Config, explicit_paths: set[str],
+    ) -> None: ...
     def routing_snapshot(self, config: Config | None) -> SettingsObject: ...
     def catalog_fingerprint(self, config: Config | None) -> tuple[str, str, str]: ...
     def resolve_provider(self, config: Config) -> PreparedProvider: ...
@@ -200,7 +203,8 @@ class AppSettings[Config: SettingsConfig, PreparedProvider]:
             if any(is_sensitive_config_key(segment) for segment in path.split(".")):
                 continue
             fields[path] = {
-                "value": redact_public_config(field["value"]), "source": field["source"]
+                "value": redact_public_config(field["value"]),
+                "source": field["source"],
             }
         return {"fields": fields}
 
@@ -232,6 +236,7 @@ class AppSettings[Config: SettingsConfig, PreparedProvider]:
             routing = self._runtime.reconcile_routing(candidate, explicit, previous=before.config)
             explicit.update(routing)
             force.update(tuple(path.split(".")) for path in routing)
+        self._runtime.validate_routing(before.config, candidate, explicit)
         if memory_paths is None or _memory_restart_required_for_paths(memory_paths):
             self._runtime.validate_embedding(candidate)
         inherit_then_clear_explicit(before.config, candidate, explicit - redacted)
@@ -249,7 +254,9 @@ class AppSettings[Config: SettingsConfig, PreparedProvider]:
         self, before: _SettingsBefore[Config], candidate: Config, result: SettingsMutation
     ) -> None:
         current = self._runtime.routing_snapshot(candidate)
-        if current != before.routing:
+        if current != before.routing or before.payload.get("squilla_router") != _config_dump(
+            candidate
+        ).get("squilla_router"):
             await self._runtime.publish_routing(before.routing, candidate)
             result["model_routing"] = {**current, "source": self._runtime.source}
 
@@ -417,7 +424,10 @@ class AppSettings[Config: SettingsConfig, PreparedProvider]:
         replacement = _strip_public_derived_config_fields(replacement)
         _reconcile_local_file_only_llm(before.payload, replacement)
         candidate = self._candidate(
-            before, replacement, _collect_paths(replacement) - _READONLY_PATHS, redacted,
+            before,
+            replacement,
+            _collect_paths(replacement) - _READONLY_PATHS,
+            redacted,
         )
         return await self._write(before, candidate)
 
@@ -696,11 +706,7 @@ def _reject_changed_local_file_only_apply(
     if not isinstance(replacement_llm, Mapping) or "extra_body" not in replacement_llm:
         return
     previous_llm = before.get("llm")
-    previous_value = (
-        previous_llm.get("extra_body", {})
-        if isinstance(previous_llm, Mapping)
-        else {}
-    )
+    previous_value = previous_llm.get("extra_body", {}) if isinstance(previous_llm, Mapping) else {}
     if replacement_llm.get("extra_body") != previous_value:
         raise ValueError("Path is local-file-only: llm.extra_body")
 
@@ -735,7 +741,8 @@ def _path_segments_is_or_contains_readonly(path: tuple[str, ...]) -> bool:
 
 
 def _preserve_readonly_config_values(
-    payload: SettingsObject, current_payload: SettingsObject,
+    payload: SettingsObject,
+    current_payload: SettingsObject,
 ) -> SettingsObject:
     cleaned = _prune_readonly_paths(payload)
     for path in sorted(_READONLY_PATHS):

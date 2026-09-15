@@ -441,6 +441,19 @@ class RpcRegistry:
                 details=details,
             )
         except ValueError as exc:
+            from opensquilla.onboarding.router_policy import (
+                PrimaryProviderChangedError,
+                RouterProviderConflictError,
+            )
+
+            if isinstance(exc, RouterProviderConflictError):
+                return make_error_res(
+                    req_id, "ROUTER_PROVIDER_CONFLICT", str(exc), details=exc.details
+                )
+            if isinstance(exc, PrimaryProviderChangedError):
+                return make_error_res(
+                    req_id, "CONFLICT", str(exc), details={"reason": "primary_changed"}
+                )
             if _is_artifact_product_method(method):
                 return _safe_artifact_dispatch_failure(
                     req_id,

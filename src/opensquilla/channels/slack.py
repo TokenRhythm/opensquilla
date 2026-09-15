@@ -227,7 +227,7 @@ class SlackChannel:
         """Block until an inbound message is available."""
         msg = await self._queue.get()
         self._last_message_at = datetime.now(UTC)
-        log.debug("slack.receive", channel=self.slack_channel_id, content=msg.content[:80])
+        log.debug("slack.receive", channel=self.slack_channel_id, content_chars=len(msg.content))
         return msg
 
     def parse_event(

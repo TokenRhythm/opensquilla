@@ -27,7 +27,13 @@ from opensquilla.onboarding.search_specs import (
     search_provider_catalog_payload,
 )
 from opensquilla.search.canonical import run_canonical_web_search
-from opensquilla.search.types import DEFAULT_SEARCH_MAX_RESULTS, Recency, SearchMode, SearchOptions
+from opensquilla.search.types import (
+    DEFAULT_SEARCH_FETCH_TOP_K,
+    DEFAULT_SEARCH_MAX_RESULTS,
+    Recency,
+    SearchMode,
+    SearchOptions,
+)
 
 search_app = typer.Typer(help="Configure and inspect web search providers.")
 
@@ -257,7 +263,7 @@ def _run_local_research_query(
         max_results=(
             max_results if max_results is not None else (limit if limit is not None else 10)
         ),
-        fetch_top_k=fetch_top_k if fetch_top_k is not None else 3,
+        fetch_top_k=fetch_top_k if fetch_top_k is not None else DEFAULT_SEARCH_FETCH_TOP_K,
         max_chars_per_source=max_chars_per_source if max_chars_per_source is not None else 1500,
         include_domains=tuple(include_domains or ()),
         exclude_domains=tuple(exclude_domains or ()),
@@ -270,7 +276,7 @@ def _run_local_research_query(
 async def _web_search_fetcher(url: str, max_chars: int) -> dict[str, object]:
     from opensquilla.tools.builtin.web_fetch import run_web_fetch_payload
 
-    return await run_web_fetch_payload(url, max_chars=max_chars)
+    return await run_web_fetch_payload(url, max_chars=max_chars, _search_excerpt=True)
 
 
 def _emit_invalid_request(message: str, *, json_output: bool) -> NoReturn:

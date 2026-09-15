@@ -6,6 +6,8 @@ import { dirname, join, resolve } from 'node:path'
 import { setTimeout as delay } from 'node:timers/promises'
 import { fileURLToPath } from 'node:url'
 import { _electron as electron } from 'playwright'
+import { desktopRouterConfigTomlLines } from '../dist/desktop-router-config.js'
+import { parse, stringify } from 'smol-toml'
 
 const scriptDir = dirname(fileURLToPath(import.meta.url))
 const packageRoot = resolve(scriptDir, '..')
@@ -758,6 +760,13 @@ async function verifyProbeBeforePersistenceAndRetry() {
       return text && formReady && !await page.locator('#finish').isDisabled() ? text : null
     }, 'rejected provider probe to restore onboarding editing')
     assert.match(errorText, /401|authentication|credential|API key/i)
+    const retryLayout = await page.evaluate(() => ({
+      error: document.querySelector('#error').getBoundingClientRect().toJSON(),
+      finish: document.querySelector('#finish').getBoundingClientRect().toJSON(),
+    }))
+    assert.ok(retryLayout.error.bottom <= retryLayout.finish.top,
+      `probe error must not cover the retry action: ${JSON.stringify(retryLayout)}`)
+    if (screenshotPath) await page.screenshot({ path: screenshotPath.replace(/\.png$/i, '') + '-retry.png' })
     assert.equal(errorText.includes(syntheticKey), false, 'probe errors must redact the submitted key')
     assert.equal(await page.locator('#apiKey').inputValue(), syntheticKey)
     assert.equal(await fileExists(credentialPath), false, 'a rejected probe must not persist credentials')
@@ -1192,6 +1201,9 @@ try {
   assert.equal(credential.provider, 'tokenrhythm')
   assert.equal(credential.modelRoutingMode, 'squilla_router')
   assert.equal(credential.routerMode, 'recommended')
+  assert.equal(credential.routerPresetBinding, 'follow_primary')
+  assert.match(config, /preset_binding = "follow_primary"/)
+  assert.doesNotMatch(config, /tier_profile\s*=/)
   assert.match(config, /reliability_diagnostics_enabled = true/)
   assert.match(config, /reliability_notice_version = "reliability-v1"/)
   assert.match(config, /reliability_consented_at_utc = "[^"\r\n]+Z"/)
@@ -1383,6 +1395,82 @@ try {
   assert.equal(await desktopPage.locator('#app').count(), 1)
   assert.equal(await desktopPage.locator('#desktop-runtime-banner').isVisible(), true)
   assert.equal(await desktopPage.locator('#desktop-runtime-retry').isVisible(), true)
+
+  // Exercise the real main-process save transaction after an isolated Control
+  // UI edit. Its config must win over Desktop's deliberately stale credential.
+  const routerConfigPath = join(userDataDir, 'opensquilla', 'config.toml')
+  const routerCredentialPath = join(userDataDir, 'desktop-credential.json')
+  const operatorConfig = config
+    .replace('preset_binding = "follow_primary"', 'preset_binding = "custom"')
+    .replace('model = "deepseek-v4-flash-0731"', 'model = "operator-custom-c0"')
+    + '\n[squilla_router.budget_gate]\naction = "cap"\nlimit_usd = 2.5\n'
+  await writeFile(routerConfigPath, operatorConfig)
+  const operatorRouter = desktopRouterConfigTomlLines(credential, operatorConfig, 'preserve')
+  const saveDesktop = payload => desktopPage.evaluate(
+    payload => window.opensquillaDesktop.saveDesktopSettings(payload), payload,
+  )
+  const rotated = await saveDesktop({ apiKey: 'synthetic-rotated-key' })
+  assert.equal(rotated.routerPresetBinding, 'follow_primary', 'key edits preserve credential metadata')
+  assert.deepEqual(desktopRouterConfigTomlLines(credential, await readFile(routerConfigPath, 'utf8'), 'preserve'), operatorRouter)
+  const disabled = await saveDesktop({ routerMode: 'disabled' })
+  assert.equal(disabled.routerPresetBinding, 'follow_primary')
+  assert.equal(disabled.routerTiers.c3.ensembleEnabled, true)
+  assert.deepEqual(desktopRouterConfigTomlLines(credential, await readFile(routerConfigPath, 'utf8'), 'preserve'),
+    operatorRouter.map(line => line === 'enabled = true' ? 'enabled = false' : line))
+  await saveDesktop({ routerMode: 'recommended' })
+  assert.deepEqual(desktopRouterConfigTomlLines(credential, await readFile(routerConfigPath, 'utf8'), 'preserve'), operatorRouter)
+  const historicalCredential = JSON.parse(await readFile(routerCredentialPath, 'utf8'))
+  delete historicalCredential.routerPresetBinding
+  await writeFile(routerCredentialPath, JSON.stringify(historicalCredential, null, 2))
+  const historicalSnapshot = await saveDesktop({ searchProvider: 'duckduckgo', routerPresetBinding: 'follow_primary' })
+  assert.equal(Object.hasOwn(historicalSnapshot, 'routerPresetBinding'), false)
+  assert.equal(Object.hasOwn(JSON.parse(await readFile(routerCredentialPath, 'utf8')), 'routerPresetBinding'), false)
+  assert.deepEqual(desktopRouterConfigTomlLines(credential, await readFile(routerConfigPath, 'utf8'), 'preserve'), operatorRouter)
+  const edited = await saveDesktop({ routerTiers: {
+    ...historicalSnapshot.routerTiers,
+    c1: { ...historicalSnapshot.routerTiers.c1, thinkingLevel: 'high', extra: { temperature: 0.3 } },
+  }, routerPresetBinding: 'follow_primary' })
+  assert.equal(edited.routerPresetBinding, 'custom')
+  assert.match(await readFile(routerConfigPath, 'utf8'), /thinking_level = "high"/)
+  const reset = await saveDesktop({ routerResetToRecommended: true,
+    routerTiers: { c1: { provider: 'tokenrhythm', model: 'untrusted-renderer-model' } } })
+  assert.equal(reset.routerPresetBinding, 'follow_primary')
+  assert.equal(reset.routerTiers.c1.model, 'deepseek-v4-pro-0813')
+  assert.match(await readFile(routerConfigPath, 'utf8'), /preset_binding = "follow_primary"/)
+
+  // Switching a generated Desktop profile must follow config.toml ownership,
+  // update its primary fallback, and retain the saved custom Ensemble plan.
+  const beforeSwitch = parse(await readFile(routerConfigPath, 'utf8'))
+  beforeSwitch.squilla_router.default_tier = 'c2'
+  beforeSwitch.squilla_router.rollout_phase = 'observe'
+  beforeSwitch.squilla_router.budget_gate = { action: 'cap', limit_usd: 2.5 }
+  beforeSwitch.llm_ensemble = { enabled: false, selection_mode: 'custom_b5',
+    candidates: [{ provider: 'tokenrhythm', model: 'custom/a' },
+      { provider: 'openrouter', model: 'custom/b' }],
+    proposer_max_retries: 3,
+  }
+  await writeFile(routerConfigPath, stringify(beforeSwitch))
+  const switched = await saveDesktop({ provider: 'openrouter', apiKey: 'synthetic-openrouter-key' })
+  const afterSwitch = parse(await readFile(routerConfigPath, 'utf8'))
+  assert.equal(switched.provider, 'openrouter')
+  assert.equal(switched.model, switched.routerTiers.c2.model)
+  assert.equal(switched.baseUrl, 'https://openrouter.ai/api/v1')
+  assert.equal(afterSwitch.llm.model, switched.model)
+  assert.equal(afterSwitch.squilla_router.preset_binding, 'follow_primary')
+  assert.equal(afterSwitch.squilla_router.enabled, true)
+  assert.equal(afterSwitch.squilla_router.rollout_phase, 'observe')
+  assert.deepEqual(afterSwitch.squilla_router.budget_gate, beforeSwitch.squilla_router.budget_gate)
+  assert.ok(Object.values(afterSwitch.squilla_router.tiers).every(tier => tier.provider === 'openrouter'))
+  assert.deepEqual(afterSwitch.llm_ensemble, beforeSwitch.llm_ensemble)
+
+  afterSwitch.squilla_router.preset_binding = 'custom'
+  await writeFile(routerConfigPath, stringify(afterSwitch))
+  const beforeRejectedConfig = await readFile(routerConfigPath, 'utf8')
+  const beforeRejectedCredential = await readFile(routerCredentialPath, 'utf8')
+  await assert.rejects(saveDesktop({ provider: 'tokenrhythm', apiKey: 'synthetic-tokenrhythm-key' }),
+    /Saved Router tiers use another provider/)
+  assert.equal(await readFile(routerConfigPath, 'utf8'), beforeRejectedConfig)
+  assert.equal(await readFile(routerCredentialPath, 'utf8'), beforeRejectedCredential)
 
   console.log(JSON.stringify({
     ok: true,

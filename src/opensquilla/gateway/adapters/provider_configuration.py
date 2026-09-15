@@ -75,9 +75,7 @@ def model_info_to_projection(model: dict[str, Any]) -> dict[str, Any]:
     capabilities: list[str] = ["chat"]
     context_window = model.get("context_window", 0)
     max_output_tokens = model.get("max_output_tokens", 0)
-    metadata = (
-        dict(model["metadata"]) if isinstance(model.get("metadata"), dict) else None
-    )
+    metadata = dict(model["metadata"]) if isinstance(model.get("metadata"), dict) else None
 
     if (
         provider_id.strip().lower() == "tokenrhythm"
@@ -87,31 +85,22 @@ def model_info_to_projection(model: dict[str, Any]) -> dict[str, Any]:
         context_window = _tokenrhythm_metadata_value(metadata, "contextWindow")
         max_output_tokens = _tokenrhythm_metadata_value(metadata, "maxOutputTokens")
         if context_window is None:
-            context_window = (
-                _positive_int(model.get("context_window")) or entry.context_window
-            )
+            context_window = _positive_int(model.get("context_window")) or entry.context_window
         if max_output_tokens is None:
             max_output_tokens = (
-                _positive_int(model.get("max_output_tokens"))
-                or entry.max_output_tokens
+                _positive_int(model.get("max_output_tokens")) or entry.max_output_tokens
             )
         declared_tools = _tokenrhythm_metadata_capability(metadata, "tools")
         declared_vision = _tokenrhythm_metadata_capability(metadata, "vision")
         declared_reasoning = _tokenrhythm_metadata_capability(metadata, "reasoning")
         supports_tools = (
-            declared_tools
-            if declared_tools is not None
-            else bool(model.get("supports_tools"))
+            declared_tools if declared_tools is not None else bool(model.get("supports_tools"))
         )
         supports_vision = (
-            declared_vision
-            if declared_vision is not None
-            else bool(model.get("supports_vision"))
+            declared_vision if declared_vision is not None else bool(model.get("supports_vision"))
         )
         supports_reasoning = (
-            False
-            if declared_reasoning is False
-            else bool(model.get("supports_reasoning"))
+            False if declared_reasoning is False else bool(model.get("supports_reasoning"))
         )
         if supports_tools:
             capabilities.append("tools")
@@ -196,24 +185,16 @@ class GatewayModelCatalogPort:
 
                 def snapshot_resolver(config: Any) -> Any:
                     try:
-                        spec = get_provider_spec(
-                            str(getattr(config, "provider", "") or "")
-                        )
+                        spec = get_provider_spec(str(getattr(config, "provider", "") or ""))
                     except UnknownProviderError:
                         return None
                     if spec.live_catalog_shape != "tokenrhythm":
                         return None
-                    return cached_tokenrhythm_models(
-                        _snapshot_config_for_selector_leg(config)
-                    )
+                    return cached_tokenrhythm_models(_snapshot_config_for_selector_leg(config))
 
-                detailed = await list_models_detailed(
-                    snapshot_resolver=snapshot_resolver
-                )
+                detailed = await list_models_detailed(snapshot_resolver=snapshot_resolver)
                 models = [model_info_to_projection(item) for item in detailed.models]
-                errors = [
-                    model_list_error_to_projection(item) for item in detailed.errors
-                ]
+                errors = [model_list_error_to_projection(item) for item in detailed.errors]
             else:
                 current = getattr(selector, "current_config", None)
                 provider_id = str(getattr(current, "provider", "") or "")
@@ -227,17 +208,11 @@ class GatewayModelCatalogPort:
                     )
 
                     cached = cached_tokenrhythm_models(self._config)
-                    models = [
-                        model_info_to_projection(item.model_dump()) for item in cached
-                    ]
+                    models = [model_info_to_projection(item.model_dump()) for item in cached]
                 else:
                     detailed = await list_models_detailed()
-                    models = [
-                        model_info_to_projection(item) for item in detailed.models
-                    ]
-                    errors = [
-                        model_list_error_to_projection(item) for item in detailed.errors
-                    ]
+                    models = [model_info_to_projection(item) for item in detailed.models]
+                    errors = [model_list_error_to_projection(item) for item in detailed.errors]
         except Exception:
             pass
         return cast(ModelCatalogResult, {"models": models, "errors": errors})
@@ -253,7 +228,41 @@ class GatewayModelRoutingPolicyPort:
         patches = model_routing_patches(config, mode)
         candidate = config.model_copy(deep=True)
         apply_model_routing_mode(candidate, mode, activation_config=config)
+        from opensquilla.onboarding.router_policy import validate_router_candidate
+
+        validate_router_candidate(candidate)
         return PreparedModelRouting(candidate, tuple(patches))
+
+    def prepare_recommended(
+        self,
+        config: Any,
+        provider_id: str,
+        *,
+        activate_router: bool = False,
+    ) -> PreparedModelRouting:
+        from opensquilla.onboarding.router_policy import (
+            PrimaryProviderChangedError,
+            reconcile_recommended_router,
+            validate_router_candidate,
+        )
+
+        if provider_id.strip().lower() != str(config.llm.provider).strip().lower():
+            raise PrimaryProviderChangedError(
+                "The saved primary provider changed; reload before resetting Router"
+            )
+        candidate = config.model_copy(deep=True)
+        reconcile_recommended_router(candidate, str(config.llm.provider))
+        patched = [
+            "squilla_router.tiers",
+            "squilla_router.tier_profile",
+            "squilla_router.preset_binding",
+        ]
+        for path in patched:
+            candidate.mark_force_persist(path)
+        if activate_router:
+            patched.extend(apply_model_routing_mode(candidate, "router", activation_config=config))
+            validate_router_candidate(candidate)
+        return PreparedModelRouting(candidate, tuple(patched))
 
 
 class GatewayModelRoutingRuntimePort:
@@ -280,9 +289,12 @@ class GatewayModelRoutingRuntimePort:
         config: Any,
         *,
         source: str,
+        force: bool = False,
     ) -> None:
         current = model_routing_public_snapshot(config)
-        if current == previous or self._subscription_manager is None:
+        if self._subscription_manager is None or (
+            current == previous and not force and source != "models.routing.resetRecommended"
+        ):
             return
         from opensquilla.gateway.event_bridge import EventBridge
         from opensquilla.gateway.scopes import READ_SCOPE

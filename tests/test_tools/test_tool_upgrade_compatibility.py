@@ -105,6 +105,7 @@ def test_shell_tools_preserve_legacy_approval_id_positions() -> None:
 
 def test_tool_context_appends_new_runtime_fields_after_legacy_fields() -> None:
     field_names = [item.name for item in fields(ToolContext)]
+    assert field_names.pop() == "tool_result_snapshot_writer"
 
     legacy_runtime_tail = [
         "sandbox_file_system_profile",

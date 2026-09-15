@@ -7,7 +7,7 @@ from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, TypedDict
 
 from opensquilla.artifacts import ArtifactSource
 from opensquilla.contracts.tool_presentation import ToolPresentationCategory
@@ -26,6 +26,16 @@ current_meta_skill_owner: contextvars.ContextVar[str] = contextvars.ContextVar(
 current_execution_log: contextvars.ContextVar[dict[str, str] | None] = contextvars.ContextVar(
     "current_execution_log", default=None,
 )
+
+
+class ToolResultSnapshotReference(TypedDict):
+    handle: str
+    sha256: str
+
+
+ToolResultSnapshotWriter = Callable[
+    [str, str, str], Awaitable[ToolResultSnapshotReference | None]
+]
 
 
 class CallerKind(StrEnum):
@@ -275,6 +285,12 @@ class ToolContext:
             "scratch_dir must not equal or contain workspace_dir; use a disjoint "
             "scratch root or a dedicated scratch subdirectory inside the workspace"
         )
+
+    # Process-local, turn-bound callback; never included in a public wire schema.
+    # Keep this declaration last so runtime fields above retain their positions.
+    tool_result_snapshot_writer: ToolResultSnapshotWriter | None = field(
+        default=None, repr=False
+    )
 
 
 def is_goal_owned_main_default_turn(ctx: ToolContext | None) -> bool:

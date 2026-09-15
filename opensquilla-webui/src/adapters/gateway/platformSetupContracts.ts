@@ -13,6 +13,8 @@ import { validateOnboardingProviderCredentialRevealResult as validateCredentialR
 import { ONBOARDING_PROVIDER_CREDENTIAL_CLEAR_METHOD } from '@/contracts/generated/v4/onboardingProviderCredentialClear'
 import { validateOnboardingProviderCredentialClearResult as validateCredentialClear } from '@/contracts/generated/v4/onboardingProviderCredentialClearValidators.mjs'
 import { ONBOARDING_LLM_PROFILE_UPSERT_METHOD } from '@/contracts/generated/v4/onboardingLlmProfileUpsert'
+import { ONBOARDING_LLM_PROFILE_UPSERT_AND_ACTIVATE_METHOD } from '@/contracts/generated/v4/onboardingLlmProfileUpsertAndActivate'
+import { validateOnboardingLlmProfileUpsertAndActivateResult as validateProfileUpsertAndActivate } from '@/contracts/generated/v4/onboardingLlmProfileUpsertAndActivateValidators.mjs'
 import { validateOnboardingLlmProfileUpsertResult as validateProfileUpsert } from '@/contracts/generated/v4/onboardingLlmProfileUpsertValidators.mjs'
 import { ONBOARDING_LLM_PROFILE_ACTIVATE_METHOD } from '@/contracts/generated/v4/onboardingLlmProfileActivate'
 import { validateOnboardingLlmProfileActivateResult as validateProfileActivate } from '@/contracts/generated/v4/onboardingLlmProfileActivateValidators.mjs'
@@ -61,6 +63,7 @@ export const setupContracts = {
   credentialReveal: descriptor(ONBOARDING_PROVIDER_CREDENTIAL_REVEAL_METHOD, validateCredentialReveal),
   credentialClear: descriptor(ONBOARDING_PROVIDER_CREDENTIAL_CLEAR_METHOD, validateCredentialClear),
   profileUpsert: descriptor(ONBOARDING_LLM_PROFILE_UPSERT_METHOD, validateProfileUpsert),
+  profileUpsertAndActivate: descriptor(ONBOARDING_LLM_PROFILE_UPSERT_AND_ACTIVATE_METHOD, validateProfileUpsertAndActivate),
   profileActivate: descriptor(ONBOARDING_LLM_PROFILE_ACTIVATE_METHOD, validateProfileActivate),
   profileRemove: descriptor(ONBOARDING_LLM_PROFILE_REMOVE_METHOD, validateProfileRemove),
   profileActiveRemove: descriptor(ONBOARDING_LLM_PROFILE_ACTIVE_REMOVE_METHOD, validateProfileActiveRemove),

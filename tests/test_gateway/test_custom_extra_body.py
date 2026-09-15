@@ -206,9 +206,19 @@ async def test_rpc_rejects_extra_body_writes_and_public_apply_preserves_it(tmp_p
     switch["llm"]["provider"] = "ollama"
     switch["llm"]["model"] = "local-model"
     switch["llm"]["base_url"] = "http://127.0.0.1:11434"
+    before_switch = path.read_bytes()
+    with pytest.raises(ValueError, match="Router tiers reference provider"):
+        await _handle_config_apply({"config": switch}, _ctx(config))
+    assert path.read_bytes() == before_switch
+    assert config.llm.provider == "custom"
+    assert config.llm.extra_body["top_k"] == 40
+
+    # Resolve the saved foreign ladder explicitly before switching providers.
+    switch["squilla_router"]["enabled"] = False
     await _handle_config_apply({"config": switch}, _ctx(config))
 
     assert config.llm.provider == "ollama"
+    assert config.squilla_router.enabled is False
     assert config.llm.extra_body == {}
     assert "extra_body" not in tomllib.loads(path.read_text())["llm"]
 

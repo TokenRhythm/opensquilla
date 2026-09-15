@@ -118,6 +118,158 @@ class _FinalizationCapturingProvider(_ToolCallingProvider):
         return self._stream(len(self.calls))
 
 
+class _SearchCallingProvider(_ToolCallingProvider):
+    async def _stream(self, call_number: int):
+        if call_number == 1:
+            yield ProviderToolUseStartEvent(tool_use_id="search-1", tool_name="web_search")
+            yield ProviderToolUseEndEvent(
+                tool_use_id="search-1", tool_name="web_search", arguments={"query": "synthetic"},
+            )
+            yield ProviderDoneEvent(stop_reason="tool_use", input_tokens=1, output_tokens=1)
+            return
+        yield TextDeltaEvent(text="done")
+        yield ProviderDoneEvent(stop_reason="stop", input_tokens=1, output_tokens=1)
+
+
+async def _canonical_search_fixture() -> str:
+    from opensquilla.search.canonical import run_canonical_web_search
+    from opensquilla.search.types import SearchOptions, SearchResult
+
+    class SearchProvider:
+        async def search(self, query, max_results):
+            return [SearchResult(
+                title=f"Source {i}", url=f"https://example.test/article/{i}",
+                snippet="Provider summary " * 50, content="Primary excerpt " * 60,
+                highlights=["Supporting highlight " * 60], provider="tavily",
+            ) for i in range(6)]
+
+    result = await run_canonical_web_search(
+        SearchOptions(query="synthetic", provider="tavily"),
+        provider_factory=lambda name: SearchProvider(),
+    )
+    return json.dumps(result, ensure_ascii=False)
+
+
+@pytest.mark.asyncio
+async def test_search_preview_only_changes_provider_input(tmp_path):
+    raw = await _canonical_search_fixture()
+
+    async def handler(call):
+        return ToolResult(tool_use_id=call.tool_use_id, tool_name=call.tool_name, content=raw)
+
+    _declare_available_tools(handler, "web_search", "retrieve_tool_result")
+    provider = _SearchCallingProvider()
+    agent = Agent(
+        provider=provider,
+        config=_recoverable_config(
+            tmp_path, context_window_tokens=1_000_000, max_iterations=2,
+            runtime_events_path=str(tmp_path / "events.jsonl"),
+            metadata={"tool_projection_tokenjuice_reducer": "previous_reducer"},
+        ),
+        tool_definitions=[_tool_def("web_search"), _tool_def("retrieve_tool_result")],
+        tool_handler=handler,
+    )
+    events = [event async for event in agent.run_turn("find synthetic sources")]
+    preview = _last_tool_result_content(provider.calls[1])
+    assert len(preview) < len(raw)
+    assert "Primary excerpt" in preview
+    assert "Supporting highlight" in preview
+    assert "Provider summary" not in preview
+    assert '"fetch_status":"not_requested"' in preview
+    assert next(event for event in events if isinstance(event, ToolResultEvent)).result == raw
+    assert _last_tool_result_content(agent.history_snapshot()) == raw
+    handle = _first_tool_result_handle(provider.calls[1])
+    record = ToolResultStore(str(tmp_path / "tool-results")).read(handle, session_id="session-1")
+    assert record.content == raw
+    assert agent.config.metadata["tool_projection_backend"] == "builtin_web_search"
+    assert agent.config.metadata["tool_projection_reducer"] == "builtin_web_search"
+    assert "tool_projection_tokenjuice_reducer" not in agent.config.metadata
+    runtime_events = [
+        json.loads(line) for line in (tmp_path / "events.jsonl").read_text().splitlines()
+    ]
+    applied = next(event for event in runtime_events
+                   if event.get("feature") == "tool_result_projection"
+                   and event.get("outcome") == "applied")
+    assert applied["mechanism"] == "builtin_web_search"
+    assert applied["reducer"] == "builtin_web_search"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("excerpt,snippet,expected", [
+    ("existing excerpt", "summary", "existing excerpt"),
+    (" ", "summary", "summary"),
+    ("", "", "highlight"),
+])
+async def test_search_preview_uses_one_existing_excerpt(excerpt, snippet, expected):
+    from opensquilla.engine.web_search_projection import reduce_canonical_search
+
+    payload = json.loads(await _canonical_search_fixture())
+    payload["results"][0].update(excerpt=excerpt, snippet=snippet, highlights=["highlight"])
+    reduction = reduce_canonical_search(json.dumps(payload))
+    assert reduction is not None
+    hit = json.loads(reduction.inline_text)["results"][0]
+    assert hit["excerpt"] == expected
+    assert "snippet" not in hit
+    if expected == "highlight":
+        assert "highlights" not in hit
+    else:
+        assert hit["highlights"] == ["highlight"]
+    assert hit["url"] == payload["results"][0]["url"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("excerpt,highlights,expected", [
+    ("Background only", ["The answer is in a later section"],
+     ["The answer is in a later section"]),
+    ("An operation is allowed", ["An operation is not allowed"],
+     ["An operation is not allowed"]),
+    ("Before covered passage after", ["", " \n", "covered passage"], []),
+    ("Background", ["unique passage", "unique passage", "passage"], ["unique passage"]),
+    ("Background", [" \n独有证据 🔎\r\n", "独有证据 🔎"], [" \n独有证据 🔎\r\n"]),
+    ("line one\nline two", ["line one line two"], ["line one line two"]),
+    ("Background", ["first passage", "second passage"], ["first passage", "second passage"]),
+    ("", ["first passage", "second passage"], ["second passage"]),
+])
+async def test_search_preview_preserves_complementary_highlights(excerpt, highlights, expected):
+    from opensquilla.engine.web_search_projection import reduce_canonical_search
+
+    payload = json.loads(await _canonical_search_fixture())
+    payload["results"][0].update(excerpt=excerpt, snippet="", highlights=highlights)
+    original = json.dumps(payload, ensure_ascii=False)
+    reduction = reduce_canonical_search(original)
+    assert reduction is not None
+    hit = json.loads(reduction.inline_text)["results"][0]
+    assert hit.get("highlights", []) == expected
+    assert json.dumps(payload, ensure_ascii=False) == original
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "case", ["no_store", "denied", "store_failure", "unknown", "error", "tiny"]
+)
+async def test_search_projection_preserves_raw_when_recovery_or_shape_unavailable(tmp_path, case):
+    raw = await _canonical_search_fixture()
+    config = _recoverable_config(tmp_path)
+    definitions = [_tool_def("retrieve_tool_result")]
+    if case == "no_store":
+        config.tool_result_store_dir = None
+    elif case == "denied":
+        definitions = []
+    elif case == "store_failure":
+        config.tool_result_store_max_bytes = 1
+    elif case == "unknown":
+        raw = json.dumps({"custom_results": ["custom " * 3000]})
+    elif case == "error":
+        raw = json.dumps({"ok": False, "error": "failure " * 3000})
+    elif case == "tiny":
+        raw = json.dumps({"ok": True, "query": "q", "mode": "auto", "provider_attempts": [],
+                          "diagnostics": {}, "sources": [], "results": []})
+    agent = Agent(provider=_Provider(), config=config, tool_definitions=definitions,
+                  tool_handler=_unused_retrieval_handler)
+    result = ToolResult(tool_use_id="search-1", tool_name="web_search", content=raw)
+    assert await agent._project_tool_result_for_llm(result) is result
+
+
 class _GuaranteedFinalizationCapturingProvider(_FinalizationCapturingProvider):
     final_request_admission_guaranteed = True
 

@@ -12,10 +12,12 @@ import type {
 } from '@/modules/setupWorkflow'
 import {
   SetupWorkflowError,
+  type RouterProviderConflict,
   type SetupWorkflowFailureReason,
 } from '@/modules/setupWorkflow'
 import { ONBOARDING_CATALOG_METHOD } from '@/contracts/generated/v4/onboardingCatalog'
 import { validateResult as validateOnboardingCatalogResult } from '@/contracts/generated/v4/onboardingCatalogValidators.mjs'
+import { validateOnboardingLlmProfileUpsertAndActivateParams } from '@/contracts/generated/v4/onboardingLlmProfileUpsertAndActivateValidators.mjs'
 import { setupContracts, type SetupContractDescriptor } from './platformSetupContracts'
 
 interface RpcTransport {
@@ -40,10 +42,23 @@ const object = (result: unknown, method: string): Record<string, unknown> => {
   return result as Record<string, unknown>
 }
 
-function mapSetupError(error: unknown): SetupWorkflowError {
+export function mapSetupError(error: unknown): SetupWorkflowError {
   if (error instanceof SetupWorkflowError) return error
   const failure = readTransportFailure(error)
   const wireCode = failure.code ?? ''
+  const routerConflict = wireCode === 'ROUTER_PROVIDER_CONFLICT'
+    || wireCode === 'onboarding.llmProfile.router_provider_conflict'
+  const details = failure.details && typeof failure.details === 'object' && !Array.isArray(failure.details)
+    ? failure.details as Record<string, unknown> : undefined
+  const routerDetails: RouterProviderConflict | undefined = routerConflict
+    && details?.reason === 'router_provider_conflict'
+    && typeof details.providerId === 'string'
+    && Array.isArray(details.conflictProviders)
+    && details.conflictProviders.every(value => typeof value === 'string')
+    && Array.isArray(details.allowedRouterActions)
+    && details.allowedRouterActions.every(value => typeof value === 'string')
+      ? details as unknown as RouterProviderConflict
+      : undefined
   const unsupported = wireCode === 'METHOD_NOT_FOUND'
     || /method.*not found|unknown method|not registered/i.test(failure.message)
   const code = unsupported
@@ -52,9 +67,9 @@ function mapSetupError(error: unknown): SetupWorkflowError {
       ? 'not-found'
       : wireCode === 'UNAUTHORIZED' || wireCode === 'FORBIDDEN'
         ? 'forbidden'
-        : wireCode.includes('CONFLICT')
+        : routerConflict || wireCode.includes('CONFLICT')
           ? 'conflict'
-          : wireCode.startsWith('INVALID_') || wireCode.endsWith('.invalid')
+          : wireCode === 'LLM_PROFILE_INVALID' || wireCode.startsWith('INVALID_') || wireCode.endsWith('.invalid')
             ? 'invalid'
             : 'unavailable'
   const reasons: Record<string, SetupWorkflowFailureReason> = {
@@ -63,7 +78,9 @@ function mapSetupError(error: unknown): SetupWorkflowError {
     'onboarding.search.invalid': 'search-invalid',
     'onboarding.imageGeneration.invalid': 'image-generation-invalid',
   }
-  return new SetupWorkflowError(code, failure.message, reasons[wireCode], error)
+  const reason = routerConflict ? 'router-provider-conflict'
+    : details?.reason === 'already_active' ? 'already-active' : reasons[wireCode]
+  return new SetupWorkflowError(code, failure.message, reason, error, routerDetails)
 }
 
 async function requestContract(
@@ -110,6 +127,16 @@ export function createV4SetupWorkflow(rpc: RpcTransport): SetupWorkflow {
   const profile: ProfileLifecycle = {
     upsertProfile(command, request) {
       return requestContract(rpc, setupContracts.profileUpsert, wireParams(command), request)
+    },
+    upsertAndActivateProfile(command, request) {
+      if (rpc.supports?.(setupContracts.profileUpsertAndActivate.method) !== true) {
+        return Promise.reject(new SetupWorkflowError('unsupported', 'This Gateway does not support saving and activating a provider in one operation.'))
+      }
+      const params = wireParams(command)
+      if (!validateOnboardingLlmProfileUpsertAndActivateParams(params)) {
+        return Promise.reject(new SetupWorkflowError('invalid', 'Save-and-activate profile parameters violated Contract'))
+      }
+      return requestContract(rpc, setupContracts.profileUpsertAndActivate, params, request)
     },
     activateProfile(command, request) {
       return requestContract(rpc, setupContracts.profileActivate, wireParams(command), request)
@@ -170,6 +197,9 @@ export function createV4SetupWorkflow(rpc: RpcTransport): SetupWorkflow {
     capabilities: {
       get profileLifecycle() {
         return rpc.supports?.(setupContracts.profileUpsert.method) !== false
+      },
+      get profileUpsertAndActivate() {
+        return rpc.supports?.(setupContracts.profileUpsertAndActivate.method) === true
       },
       get primaryProviderRemoval() {
         return rpc.supports?.(setupContracts.profileActiveRemove.method) !== false

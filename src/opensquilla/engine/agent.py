@@ -109,6 +109,10 @@ from opensquilla.engine.usage_accounting import (
     provider_accounts_physical_usage,
     start_usage_call,
 )
+from opensquilla.engine.web_search_projection import (
+    SEARCH_PREVIEW_REDUCER,
+    reduce_canonical_search,
+)
 from opensquilla.execution_status import (
     mark_execution_status_truncated,
     normalize_execution_status,
@@ -251,6 +255,8 @@ from opensquilla.tools.projected_arguments import find_projected_tool_argument
 from opensquilla.tools.registry import ToolRegistry
 from opensquilla.tools.types import (
     ToolContext,
+    ToolResultSnapshotReference,
+    ToolResultSnapshotWriter,
     current_tool_context,
     is_goal_owned_main_default_turn,
 )
@@ -4291,7 +4297,9 @@ class Agent:
             return
         event: dict[str, Any] = {
             "feature": "tool_result_projection",
-            "mechanism": "tokenjuice",
+            "mechanism": (
+                SEARCH_PREVIEW_REDUCER if reducer == SEARCH_PREVIEW_REDUCER else "tokenjuice"
+            ),
             "mode": "log",
             "reason": reason or outcome,
             "session_key": self._session_key,
@@ -4887,6 +4895,29 @@ class Agent:
             )
         return sanitized_messages
 
+    async def _write_tool_body_snapshot(
+        self, content: str, tool_name: str, tool_use_id: str
+    ) -> ToolResultSnapshotReference | None:
+        context = current_tool_context.get()
+        if (
+            not tool_use_id.strip()
+            or context is None
+            or not context.tool_result_retrieval_available
+            or not self._tool_result_recovery_available()
+            or self._tool_result_store_scope() is None
+            or (context is not self._tool_context and context is not self._ingress_tool_context)
+        ):
+            return None
+        record = await asyncio.to_thread(
+            self._store_tool_result_snapshot,
+            content,
+            tool_name=tool_name,
+            tool_use_id=tool_use_id,
+        )
+        if record is None:
+            return None
+        return {"handle": record.handle, "sha256": record.sha256}
+
     def _store_tool_result_snapshot(
         self,
         content: str,
@@ -5099,6 +5130,9 @@ class Agent:
         *,
         tool_call: ToolCall | None = None,
     ) -> ToolResult:
+        search_reduction = None
+        if result.tool_name == "web_search" and not result.is_error:
+            search_reduction = reduce_canonical_search(result.content)
         original_result = result
         projection_arguments = (
             dict(tool_call.arguments)
@@ -5119,12 +5153,18 @@ class Agent:
                 tool_use_id=result.tool_use_id,
                 tool_name=result.tool_name,
             )
+        if result.tool_name == "web_search" and search_reduction is None:
+            return result
         self.config.metadata["tool_projection_attempts"] = (
             self.config.metadata.get("tool_projection_attempts", 0) + 1
         )
         recovery_available = self._tool_result_recovery_available()
         json_guard_record: ToolResultRecord | None = None
-        guarded_content, guarded = _omit_large_json_tool_fields(result.content)
+        guarded_content, guarded = (
+            (result.content, False)
+            if search_reduction is not None
+            else _omit_large_json_tool_fields(result.content)
+        )
         if guarded:
             if not recovery_available:
                 return self._tool_result_projection_store_unavailable_noop(
@@ -5209,7 +5249,7 @@ class Agent:
                 json_guard_applied=json_guard_applied,
             )
             return result
-        reduction = reduce_tool_result_with_tokenjuice(
+        reduction = search_reduction or reduce_tool_result_with_tokenjuice(
             tool_name=result.tool_name,
             content=result.content,
             is_error=result.is_error,
@@ -5257,9 +5297,15 @@ class Agent:
                 reducer=reduction.reducer,
                 json_guard_applied=json_guard_applied,
             )
-        self.config.metadata["tool_projection_backend"] = "tokenjuice"
+        self.config.metadata["tool_projection_backend"] = (
+            SEARCH_PREVIEW_REDUCER if search_reduction is not None else "tokenjuice"
+        )
         if reduction.reducer:
-            self.config.metadata["tool_projection_tokenjuice_reducer"] = reduction.reducer
+            self.config.metadata["tool_projection_reducer"] = reduction.reducer
+            if search_reduction is None:
+                self.config.metadata["tool_projection_tokenjuice_reducer"] = reduction.reducer
+            else:
+                self.config.metadata.pop("tool_projection_tokenjuice_reducer", None)
         projected_content = reduction.inline_text
 
         stored: ToolResultRecord | None = None
@@ -5488,6 +5534,8 @@ class Agent:
                 f"\nexecution_log_handle: {result.execution_log_handle}"
             )
         self._record_provider_tool_result_projection(result, projected_result)
+        if result.tool_name == "web_search":
+            return result
         return projected_result
 
     def _tool_result_compression_mode(self) -> str:
@@ -5755,6 +5803,17 @@ class Agent:
 
         self._prompt_cache_keepalive_candidate = None
 
+        snapshot_context_bindings: list[
+            tuple[ToolContext, ToolResultSnapshotWriter | None]
+        ] = []
+        for snapshot_context in (self._ingress_tool_context, self._tool_context):
+            if snapshot_context is not None and not any(
+                snapshot_context is bound for bound, _previous in snapshot_context_bindings
+            ):
+                snapshot_context_bindings.append(
+                    (snapshot_context, snapshot_context.tool_result_snapshot_writer)
+                )
+                snapshot_context.tool_result_snapshot_writer = self._write_tool_body_snapshot
         image_context_bindings: list[
             tuple[ToolContext, Callable[[], tuple[Any, Any] | None] | None]
         ] = []
@@ -5804,6 +5863,8 @@ class Agent:
             self._flush_pending_tool_reliability(terminal=pending_tool_terminal)
             self._freeze_current_replay_view()
             self._image_analysis_provider_wrapper = None
+            for snapshot_context, previous_writer in snapshot_context_bindings:
+                snapshot_context.tool_result_snapshot_writer = previous_writer
             for image_context, previous in image_context_bindings:
                 image_context.image_analysis_target = previous
             self._request_image_context = []

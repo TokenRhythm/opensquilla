@@ -1,4 +1,5 @@
 import type { InjectionKey } from 'vue'
+import type { RouterProviderConflict } from './setupWorkflow'
 
 export interface ModelDescriptor {
   readonly id: string
@@ -104,6 +105,7 @@ export class ProviderConfigurationError extends Error {
     readonly code: ProviderConfigurationErrorCode,
     message: string,
     readonly cause?: unknown,
+    readonly details?: RouterProviderConflict,
   ) {
     super(message)
     this.name = 'ProviderConfigurationError'
@@ -142,6 +144,8 @@ export interface ProviderStatusQuery {
 }
 
 export interface ModelRouting {
+  readonly resetRecommendedSupported?: boolean
+  resetRecommended?(command: { providerId: string; activateRouter?: boolean }, options?: { signal?: AbortSignal }): Promise<ModelRoutingSnapshot>
   get(options?: { signal?: AbortSignal }): Promise<ModelRoutingSnapshot>
   setRouting(mode: RoutingMode, options?: { signal?: AbortSignal }): Promise<ModelRoutingSnapshot>
   subscribeChanged(listener: (snapshot: ModelRoutingSnapshot) => void): { close(): void }

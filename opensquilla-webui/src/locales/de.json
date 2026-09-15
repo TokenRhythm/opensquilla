@@ -786,6 +786,11 @@
       "memoryOptions": "Speicheroptionen"
     },
     "provider": {
+      "moreActions": "Weitere Aktionen für {provider}",
+      "routerOutcomeSynchronized": "Router-Empfehlungen folgen jetzt dem gespeicherten Hauptanbieter.",
+      "routerOutcomePreserved": "Gespeicherte Router-Stufen wurden beibehalten.",
+      "routerOutcomeDisabled": "Modellrouting ist deaktiviert; gespeicherte Ebenen wurden beibehalten.",
+      "primarySavedAdditionalFailed": "Der Anbieter wurde gespeichert, weitere Einstellungen jedoch nicht. Prüfen Sie die Einstellungen vor einem erneuten Versuch.",
       "title": "Anbieter",
       "pageTitle": "Modelldienst",
       "pageDesc": "Anbieter verbinden und ihre Zugangsdaten und Modelle verwalten.",
@@ -794,6 +799,7 @@
       "configuredSummary": "{ready} von {count} bereit. Der Test sendet eine kleine Modellanfrage.",
       "configuredDesc": "Gespeicherte Anbieter bleiben für das Routing verfügbar, bis sie entfernt werden. Die Konfigurationsprüfung sendet mit den gespeicherten Einstellungen eine kleine Modellanfrage; dabei können Anbietergebühren anfallen.",
       "activeBadge": "Aktiv",
+      "currentPrimary": "Aktueller Hauptanbieter",
       "editingBadge": "In Bearbeitung",
       "profileReady": "Anmeldedaten bereit",
       "profileNeedsCredentials": "Zugangsdaten erforderlich",
@@ -1069,12 +1075,45 @@
       "modelProvenance": "Live-Anbieterliste · Funktionsquelle: {sources}",
       "modelMetadataProvenance": "Live-Anbieterliste · offizielle Werte bevorzugt, sonst Katalogwerte",
       "modelMultimodal": "Multimodal",
-      "modelMultimodalTitle": "Unterstützt Bildeingaben"
+      "modelMultimodalTitle": "Unterstützt Bildeingaben",
+      "saveAndStart": "Speichern und verwenden",
+      "saveAndMakeActive": "Speichern und als primär festlegen",
+      "saveActivateUpgradeHint": "Aktualisieren Sie das Gateway, um Anbieter in einem Vorgang zu speichern und als primär festzulegen.",
+      "primaryRoleHint": "Der primäre Anbieter übernimmt direkte Standardanfragen und Fallback. Eigene Mehrmodellstrategien behalten ihre Konfiguration.",
+      "activationCredentialRequired": "Fügen Sie gültige Zugangsdaten hinzu, bevor Sie diesen Anbieter als primär festlegen.",
+      "routerConflictTitle": "Umgang mit vorhandenen Modellrouten wählen",
+      "routerConflictBody": "Der gespeicherte Router verwendet {conflicts}; dies steht im Konflikt mit {provider}. Empfehlungen von {provider} ersetzen gespeicherte und ungespeicherte Stufen. Falls angeboten, lässt sich das Routing bei unveränderten Stufen deaktivieren. Abbrechen behält Modus und Entwürfe.",
+      "routerUseRecommended": "Empfohlene Routen des Zielanbieters verwenden",
+      "routerDisablePreserve": "Routen behalten und Router deaktivieren",
+      "alreadyActive": "Der Zielanbieter ist bereits primär. Diese Änderung der Zugangsdaten wurde nicht gespeichert.",
+      "primarySaveUncertain": "Das Speicherergebnis ist unklar. Ihr Entwurf wurde behalten. Prüfen Sie vor einem erneuten Versuch die Konfiguration; ein primärer Anbieter bestätigt nicht die Speicherung der Zugangsdaten."
     },
     "preset": {
       "modeCustom": "benutzerdefiniert"
     },
     "modelStrategy": {
+      "summaryPrimary": "Gespeicherter Hauptanbieter",
+      "summaryRouter": "Modellrouting",
+      "summaryOn": "Ein",
+      "summaryOff": "Aus",
+      "bindingFollowPrimary": "Empfohlen · folgt Hauptanbieter",
+      "bindingCustom": "Eigene Stufen",
+      "bindingLegacy": "Bestehende Stufen · Bindung unbestimmt",
+      "resetRecommended": "Empfohlene Stufen von {provider} verwenden",
+      "resettingRecommended": "Empfohlene Stufen werden aktualisiert…",
+      "resetKeepsOff": "Aktualisiert Stufen; Modellrouting bleibt aus.",
+      "resetKeepsMode": "Ersetzt Stufen und behält den aktuellen Modus.",
+      "retainedDrafts": "Ungespeicherte Routingänderungen",
+      "crossProviderDisabledMismatch": "Gespeicherte Stufen verwenden andere Anbieter; anbieterübergreifende Ausführung ist aus.",
+      "resetUpgradeHint": "Gateway aktualisieren, um empfohlene Stufen atomar zu übernehmen.",
+      "operationPending": "Ein Anbieter- oder Routingvorgang läuft bereits.",
+      "activationUpgradeHint": "Dieses Gateway kann die sichere Router-Aktivierung nicht bestätigen. Aktualisieren Sie es, um Anbieterkonflikte zu prüfen und zu lösen.",
+      "savedRefreshFailed": "Gespeichert, aber die Einstellungen konnten nicht neu geladen werden. Vor weiteren Änderungen erneut laden.",
+      "resultUncertain": "Das Speicherergebnis ist unbekannt. Prüfen Sie die aktualisierten Einstellungen vor einem erneuten Versuch.",
+      "resetTitle": "Empfohlene Stufen von {provider} verwenden?",
+      "resetBody": "Gespeicherte und ungespeicherte Router-Stufen durch Empfehlungen von {provider} ersetzen? Modus und Router-Schalter bleiben unverändert. Andere ungespeicherte Einstellungen bleiben erhalten.",
+      "resetConfirm": "Durch Empfehlungen ersetzen",
+      "resetSaved": "Empfohlene Stufen von {provider} gespeichert; Modus unverändert.",
       "title": "Modellrouting",
       "desc": "Lege fest, wie Modelle für jede Anfrage ausgewählt werden.",
       "newSessionDefault": "Dies ist die Vorgabe für neue Chats. Bestehende Chats behalten ihren eigenen Routing-Modus.",
@@ -1093,7 +1132,7 @@
       "advancedDesc": "Fallback-Stufe und Darstellung des Routings im Chat.",
       "visualModeLabel": "Stil des Routing-Entscheidungspanels",
       "visualModeDesc": "Darstellung der Routing-Entscheidung in Chat-Antworten.",
-      "crossProviderNotice": "Provider-übergreifendes Routing ist aktiv. Prüfe jeden Tier vor dem Speichern.",
+      "crossProviderNotice": "Anbieterübergreifende Ausführung ist aktiviert.",
       "cards": {
         "router": {
           "title": "Intelligentes Modellrouting",
@@ -1139,7 +1178,7 @@
       "removeCandidateAria": "{model} entfernen",
       "ensembleEmpty": "Noch keine Kandidatenmodelle. Speichere zuerst die Modelldienst-Einstellungen, um Routing-Stufen zu erzeugen, oder füge Kandidaten manuell hinzu.",
       "ensemblePipeline": "So funktioniert es: Die Entwurfsmodelle schreiben parallel, dann verschmilzt der Aggregator die Entwürfe zur endgültigen Antwort. Nur der Aggregator kann Tools aufrufen.",
-      "candidateModelHint": "Das Multimodal-Label bedeutet, dass ein Modell Bildeingaben unterstützt. Bildanfragen verwenden die konfigurierte bildfähige Route.",
+      "candidateModelHint": "Das Modell-Ensemble unterstützt derzeit keine Bildanalyse. Wechseln Sie zur Bildanalyse zu „Intelligentes Modellrouting“ und konfigurieren Sie ein bildfähiges Modell, oder wählen Sie unter „Festes Modell“ ein bildfähiges Modell aus.",
       "ensembleFlowDesc": "Modelle entwerfen parallel; ein Aggregator führt sie zu einer Antwort zusammen. Mehr Aufrufe.",
       "legacyDynamicNotice": "Dieser ältere Fusionsplan folgt den gespeicherten Modellstufen. Zum Bearbeiten der Mitglieder in eine eigene Aufstellung umwandeln.",
       "legacyDynamicMigrate": "In eigene Aufstellung umwandeln",
@@ -1753,7 +1792,10 @@
       "channelEnabled": "Kanal aktiviert. Neustart erforderlich.",
       "channelEnabledLive": "Kanal aktiviert und gestartet.",
       "channelDisabled": "Kanal deaktiviert. Neustart erforderlich.",
-      "channelDisabledLive": "Kanal deaktiviert und gestoppt."
+      "channelDisabledLive": "Kanal deaktiviert und gestoppt.",
+      "providerSavedAndActivated": "{provider} wurde gespeichert und als primär festgelegt.",
+      "modelStrategyPartialSaved": "Einige Modelleinstellungen wurden gespeichert. Der Wechsel des primären Anbieters wurde nicht abgeschlossen; übrige Änderungen bleiben im Formular.",
+      "modelStrategyPartialSaveUncertain": "Einige Modelleinstellungen wurden gespeichert. Der Wechsel des primären Anbieters konnte nicht bestätigt werden; prüfen Sie den gespeicherten Zustand. Übrige Änderungen bleiben im Formular."
     },
     "needs": {
       "noApiKey": "Kein API-Schlüssel erforderlich.",
@@ -3441,7 +3483,7 @@
     "loadingSession": "Unterhaltungsverlauf wird wiederhergestellt…",
     "loadingSessionDescription": "Sie können die Unterhaltung währenddessen weiter verwenden.",
     "loadSessionFailed": "Unterhaltungsverlauf vorübergehend nicht verfügbar",
-    "loadSessionDescription": "Die Verbindung wurde möglicherweise unterbrochen oder der Verlaufsdienst ist vorübergehend nicht verfügbar. Bitte laden Sie erneut.",
+    "loadSessionDescription": "Der Gesprächsverlauf ist vorübergehend nicht verfügbar.",
     "reloadSession": "Verlauf neu laden",
     "retryingSession": "Unterhaltungsverlauf wird neu geladen…",
     "retryingSessionDescription": "Der Unterhaltungsverlauf wird wiederhergestellt…",
@@ -3451,11 +3493,11 @@
     "gatewayReconnecting": "Verbindung zum Gateway wird wiederhergestellt…",
     "automaticRecoveryDescription": "Die Verbindung wird automatisch wiederhergestellt. Sie können weiter schreiben; ungesendeter Text und Anhänge bleiben erhalten.",
     "liveUnavailable": "Live-Aktualisierungen sind vorübergehend nicht verfügbar",
-    "liveUnavailableDescription": "Der Verlauf bleibt verfügbar. Stellen Sie vor dem Senden die Verbindung wieder her.",
-    "liveUnavailableConnectedDescription": "Das Gateway ist verbunden und der Verlauf bleibt verfügbar. Das Senden wird nach Wiederherstellung der Live-Aktualisierungen fortgesetzt.",
+    "liveUnavailableDescription": "Der Verlauf bleibt verfügbar. Der Versand wird fortgesetzt, sobald die Live-Aktualisierungen wiederhergestellt sind.",
+    "liveUnavailableConnectedDescription": "Das Gateway ist verbunden. Live-Aktualisierungen für diese Sitzung sind vorübergehend nicht verfügbar.",
     "reconnectLive": "Erneut verbinden",
     "liveSendBlockedConnecting": "Live-Aktualisierungen werden wiederhergestellt. Ihr Entwurf bleibt erhalten.",
-    "liveSendBlockedDegraded": "Stellen Sie vor dem Senden die Live-Verbindung wieder her. Ihr Entwurf bleibt erhalten.",
+    "liveSendBlockedDegraded": "Live-Aktualisierungen sind vorübergehend nicht verfügbar. Ihr Entwurf bleibt erhalten.",
     "noMessagesYet": "Noch keine Nachrichten.",
     "newChat": "Neue Aufgabe",
     "chatWithSuffix": "Chat {suffix}",
@@ -3928,7 +3970,7 @@
         "busy": "Der Zielstatus wird noch abgeschlossen. Der neueste Stand wird oben angezeigt.",
         "notResumable": "Dieses Ziel kann im aktuellen Zustand nicht fortgesetzt werden.",
         "executionDisabled": "Die Zielausführung ist in diesem Arbeitsbereich deaktiviert.",
-        "connectionRequired": "Verbinde diese Aufgabe erneut, bevor du das Ziel fortsetzt.",
+        "connectionRequired": "Diese Aufgabe kann derzeit noch nicht fortgesetzt werden.",
         "planModeActive": "Das Ziel wartet, bis der Planmodus beendet ist.",
         "planRunActive": "Das Ziel wartet, bis der aktive Planlauf beendet ist.",
         "requestConflict": "Diese Zielaktion wurde bereits für eine andere Anfrage verwendet. Versuche es erneut."
@@ -4238,7 +4280,7 @@
       "unknownProviderCalls": "{count} Provider-Aufruf mit unbekannter Nutzung | {count} Provider-Aufrufe mit unbekannter Nutzung"
     },
     "modelRouting": {
-      "updateFailed": "Modell-Routing konnte nicht umgeschaltet werden – zurückgesetzt. Prüfen Sie die Gateway-Verbindung und versuchen Sie es erneut.",
+      "updateFailed": "Modell-Routing konnte nicht umgeschaltet werden – zurückgesetzt. Die Änderung ist vorübergehend nicht verfügbar.",
       "sessionUpdateFailed": "Das Modellrouting dieses Chats konnte nicht aktualisiert werden: {error}"
     },
     "routeFeedback": {
