@@ -698,6 +698,9 @@ def gateway_run(
         None,
         "--port",
         "-p",
+        min=0,
+        max=65535,
+        metavar="PORT",
         help="Port to bind (default: config port, usually 18791)",
     ),
     bind: str | None = typer.Option(
@@ -772,6 +775,9 @@ def gateway_start(
         None,
         "--port",
         "-p",
+        min=0,
+        max=65535,
+        metavar="PORT",
         help="Port to bind (default: config port, usually 18791)",
     ),
     bind: str | None = typer.Option(
@@ -804,6 +810,9 @@ def gateway_status(
         None,
         "--port",
         "-p",
+        min=0,
+        max=65535,
+        metavar="PORT",
         help="Port to inspect (default: config port, usually 18791)",
     ),
     bind: str | None = typer.Option(
@@ -840,6 +849,9 @@ def gateway_stop(
         None,
         "--port",
         "-p",
+        min=0,
+        max=65535,
+        metavar="PORT",
         help="Port to stop (default: config port, usually 18791)",
     ),
     bind: str | None = typer.Option(
@@ -872,6 +884,9 @@ def gateway_restart(
         None,
         "--port",
         "-p",
+        min=0,
+        max=65535,
+        metavar="PORT",
         help="Port to restart (default: config port, usually 18791)",
     ),
     bind: str | None = typer.Option(

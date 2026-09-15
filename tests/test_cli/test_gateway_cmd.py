@@ -667,6 +667,22 @@ def test_gateway_start_uses_config_host_port_when_flags_are_omitted(
     assert payload["url"] == "http://127.0.0.2:19999"
 
 
+def test_gateway_start_rejects_out_of_range_port_before_spawn(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.setenv("OPENSQUILLA_STATE_DIR", str(tmp_path / "home"))
+
+    def fail_popen(*_args, **_kwargs):
+        raise AssertionError("invalid port must not spawn a gateway")
+
+    monkeypatch.setattr(gateway_lifecycle.subprocess, "Popen", fail_popen)
+
+    result = runner.invoke(app, ["gateway", "start", "--port", "65536", "--json"])
+
+    assert result.exit_code == 2
+    assert "65536 is not in the range 0<=x<=65535" in result.stderr
+
+
 def test_gateway_status_uses_config_host_port_when_flags_are_omitted(
     tmp_path, monkeypatch
 ) -> None:
