@@ -1178,7 +1178,7 @@
       "removeCandidateAria": "Retirer {model}",
       "ensembleEmpty": "Aucun modèle candidat pour le moment. Enregistrez les paramètres du service de modèles pour générer les niveaux de routage, ou ajoutez des candidats manuellement.",
       "ensemblePipeline": "Fonctionnement : les modèles proposants rédigent en parallèle, puis l'agrégateur fusionne les brouillons en réponse finale. Seul l'agrégateur peut appeler des outils.",
-      "candidateModelHint": "Le badge Multimodal indique qu’un modèle accepte les images. Les requêtes avec image suivent la route configurée compatible avec les images.",
+      "candidateModelHint": "L’ensemble de modèles ne prend pas encore en charge l’analyse d’images. Pour analyser des images, passez à « Routage intelligent des modèles » et configurez un modèle compatible avec les images, ou sélectionnez-en un dans « Modèle fixe ».",
       "ensembleFlowDesc": "Plusieurs modèles rédigent en parallèle ; un agrégateur les fusionne en une réponse. Plus d'appels.",
       "legacyDynamicNotice": "Cet ancien plan de fusion suit les niveaux de modèle enregistrés. Convertissez-le en composition personnalisée pour modifier ses membres.",
       "legacyDynamicMigrate": "Convertir en composition personnalisée",

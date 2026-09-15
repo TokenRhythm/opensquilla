@@ -1178,7 +1178,7 @@
       "removeCandidateAria": "Quitar {model}",
       "ensembleEmpty": "Aún no hay modelos candidatos. Guarda la configuración del servicio de modelos para generar niveles de enrutamiento, o agrega candidatos manualmente.",
       "ensemblePipeline": "Cómo funciona: los modelos proponentes redactan en paralelo y el agregador fusiona los borradores en la respuesta final. Solo el agregador puede invocar herramientas.",
-      "candidateModelHint": "La etiqueta Multimodal indica que el modelo acepta imágenes. Las solicitudes con imágenes siguen la ruta configurada compatible con imágenes.",
+      "candidateModelHint": "El ensamble de modelos aún no admite el análisis de imágenes. Para analizar imágenes, cambia a «Enrutamiento inteligente de modelos» y configura un modelo compatible con imágenes, o selecciona uno en «Modelo fijo».",
       "ensembleFlowDesc": "Varios modelos redactan en paralelo y un agregador las combina en una respuesta. Usa más llamadas.",
       "legacyDynamicNotice": "Este plan de fusión heredado sigue los niveles de modelo guardados. Conviértelo en una alineación personalizada para editar sus miembros.",
       "legacyDynamicMigrate": "Convertir en alineación personalizada",

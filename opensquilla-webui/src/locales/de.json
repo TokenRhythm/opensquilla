@@ -1178,7 +1178,7 @@
       "removeCandidateAria": "{model} entfernen",
       "ensembleEmpty": "Noch keine Kandidatenmodelle. Speichere zuerst die Modelldienst-Einstellungen, um Routing-Stufen zu erzeugen, oder füge Kandidaten manuell hinzu.",
       "ensemblePipeline": "So funktioniert es: Die Entwurfsmodelle schreiben parallel, dann verschmilzt der Aggregator die Entwürfe zur endgültigen Antwort. Nur der Aggregator kann Tools aufrufen.",
-      "candidateModelHint": "Das Multimodal-Label bedeutet, dass ein Modell Bildeingaben unterstützt. Bildanfragen verwenden die konfigurierte bildfähige Route.",
+      "candidateModelHint": "Das Modell-Ensemble unterstützt derzeit keine Bildanalyse. Wechseln Sie zur Bildanalyse zu „Intelligentes Modellrouting“ und konfigurieren Sie ein bildfähiges Modell, oder wählen Sie unter „Festes Modell“ ein bildfähiges Modell aus.",
       "ensembleFlowDesc": "Modelle entwerfen parallel; ein Aggregator führt sie zu einer Antwort zusammen. Mehr Aufrufe.",
       "legacyDynamicNotice": "Dieser ältere Fusionsplan folgt den gespeicherten Modellstufen. Zum Bearbeiten der Mitglieder in eine eigene Aufstellung umwandeln.",
       "legacyDynamicMigrate": "In eigene Aufstellung umwandeln",

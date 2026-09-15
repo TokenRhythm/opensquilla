@@ -882,8 +882,9 @@ describe('SetupModelStrategyPanel', () => {
 
     const lineup = el.querySelector<HTMLElement>('[data-testid="ensemble-custom-lineup"]')!
     const imageHint = el.querySelector<HTMLElement>('[data-testid="ensemble-candidate-image-hint"]')
-    expect(imageHint?.textContent).toContain('The Multimodal badge means a model accepts image input')
-    expect(imageHint?.textContent).toContain('Image turns follow the configured image-capable route')
+    expect(imageHint?.textContent).toContain('Model ensemble does not support image analysis yet')
+    expect(imageHint?.textContent).toContain('switch to Intelligent model routing and configure an image-capable model')
+    expect(imageHint?.textContent).toContain('select an image-capable model under Fixed model')
     const steps = lineup.querySelectorAll<HTMLElement>('.setup-model-strategy__step')
     expect(steps).toHaveLength(2)
     expect(steps[0]?.textContent).toContain('Proposer')
