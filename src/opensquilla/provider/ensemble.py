@@ -57,6 +57,7 @@ from .deployment import (
     resolve_provider_deployment,
 )
 from .error_redaction import redact_upstream_error_code, redact_upstream_error_text
+from .execution_identity import project_execution_identity, rebind_execution_identity
 from .failures import ProviderFailureKind, classify_provider_error
 from .image_projection import (
     ImageMarkerState,
@@ -127,7 +128,9 @@ ENSEMBLE_FIXED_TERMINAL_MESSAGE = (
 )
 
 
-def _ensemble_request_messages(messages: list[Message]) -> list[Message]:
+def _ensemble_request_messages(
+    messages: list[Message], config: ChatConfig | None = None,
+) -> list[Message]:
     """Return a fresh text-only object graph for one physical member call.
 
     Ensemble is a text-only virtual model.  Re-project at every provider
@@ -142,7 +145,7 @@ def _ensemble_request_messages(messages: list[Message]) -> list[Message]:
         marker_state=ImageMarkerState.NOT_ANALYZED,
     )
     assert_text_only_messages(projection.messages)
-    return projection.messages
+    return project_execution_identity(projection.messages, config)
 log = structlog.get_logger(__name__)
 
 
@@ -1041,6 +1044,14 @@ def _derive_ensemble_chat_config(
 ) -> ChatConfig | None:
     if config is None or phase not in _ENSEMBLE_CORRELATION_PHASES:
         return config
+    rebound = rebind_execution_identity(
+        config,
+        kind=(
+            "single_model" if phase in {"fixed_direct", "fallback_single"} else "multi_model_fusion"
+        ),
+    )
+    assert rebound is not None
+    config = rebound
     correlation = _derive_ensemble_correlation(
         config.provider_request_correlation,
         phase,
@@ -1073,6 +1084,12 @@ def _member_chat_config(
     record_budget_rebound: bool = True,
 ) -> ChatConfig:
     cfg = base.model_copy(deep=True) if base is not None else ChatConfig()
+    rebound = rebind_execution_identity(
+        cfg, provider=member.provider_config.provider, model=member.provider_config.model,
+        kind="single_model" if role == "fixed_direct" else "multi_model_fusion",
+    )
+    assert rebound is not None
+    cfg = rebound
     updates: dict[str, Any] = {
         "max_tokens": _member_max_tokens(member),
         "model_capabilities": _member_model_capabilities(member),
@@ -1813,6 +1830,11 @@ class EnsembleProvider:
                     "physical_attempt_limit": 1,
                 }
             )
+        fallback_config = rebind_execution_identity(
+            fallback_config,
+            provider=self.fallback_provider_name,
+            model=self.fallback_model,
+        )
         return _derive_ensemble_chat_config(fallback_config, role)
 
     def _aggregator_candidate_budget(
@@ -3215,7 +3237,7 @@ class EnsembleProvider:
         provider_stream = _provider_stream_with_lifecycle(
             lambda: self._account_physical_stream(
                 lambda: provider.chat(
-                    _ensemble_request_messages(messages),
+                    _ensemble_request_messages(messages, chat_cfg),
                     tools=tools,
                     config=chat_cfg,
                 ),
@@ -3657,7 +3679,7 @@ class EnsembleProvider:
                 heartbeat_stream = _provider_stream_with_lifecycle(
                     lambda: self._account_physical_stream(
                         lambda: provider.chat(
-                            _ensemble_request_messages(messages),
+                            _ensemble_request_messages(messages, config),
                             tools=tools,
                             config=config,
                         ),
@@ -4266,7 +4288,7 @@ class EnsembleProvider:
                 async for event in _provider_stream_with_lifecycle(
                     lambda: self._account_physical_stream(
                         lambda: provider.chat(
-                            _ensemble_request_messages(fixed_messages),
+                            _ensemble_request_messages(fixed_messages, config),
                             tools=tools,
                             config=config,
                         ),

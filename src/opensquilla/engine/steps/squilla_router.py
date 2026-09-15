@@ -2346,7 +2346,11 @@ async def apply_squilla_router(ctx: TurnContext) -> TurnContext:
 
     hold_store = ctx.metadata.get("router_control_hold_store")
     if isinstance(hold_store, RouterControlHoldStore):
-        hold = hold_store.get_valid(ctx.session_key, decrement=True)
+        hold = hold_store.get_valid(
+            ctx.session_key,
+            decrement=True,
+            routing_revision=ctx.metadata.get("router_control_routing_revision"),
+        )
         if hold is not None and hold.tier in tiers and hold.tier in valid_tiers:
             applied_hold_tier = hold.tier
             if minimum_context_tier is not None:

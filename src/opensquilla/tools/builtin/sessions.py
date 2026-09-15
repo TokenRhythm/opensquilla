@@ -24,6 +24,7 @@ from opensquilla.provider.auxiliary_budget import resolve_auxiliary_request_budg
 from opensquilla.provider.correlation_context import (
     current_provider_request_correlation,
 )
+from opensquilla.provider.execution_identity import execution_from_evidence
 from opensquilla.provider.types import derive_provider_request_correlation
 from opensquilla.sandbox.run_context import RUN_CONTEXT_ORIGIN_KEY
 from opensquilla.session.keys import build_subagent_session_key, parse_agent_id
@@ -1090,7 +1091,10 @@ async def sessions_yield(
 
 @tool(
     name="session_status",
-    description="Show current session usage, cost, and model information.",
+    description=(
+        "Show session usage/cost. For live deployment facts, read execution.current_request; "
+        "model fields are session records."
+    ),
     params={},
     required=[],
     plan_access=PlanAccess.READ_ONLY,
@@ -1154,6 +1158,29 @@ async def session_status() -> str:
             run_mode = normalize_run_mode(getattr(ctx, "run_mode", None)).value
             data["run_mode"] = run_mode
             data["sandbox_enabled"] = run_mode != "full"
+        snapshot = getattr(ctx, "execution_status_snapshot", None)
+        execution = snapshot() if callable(snapshot) else {}
+        # Only read a bounded recent tail when status is requested. A missing
+        # durable completion is unknown, never inferred from current settings.
+        get_transcript = getattr(mgr, "get_transcript", None)
+        if session_key and callable(get_transcript):
+            entries = await get_transcript(
+                session_key, limit=50,
+                expected_session_id=getattr(ctx, "session_id", None),
+                expected_session_epoch=getattr(ctx, "session_epoch", None),
+            )
+            for entry in reversed(entries):
+                if getattr(entry, "role", None) != "assistant":
+                    continue
+                usage = getattr(entry, "turn_usage", None)
+                if isinstance(usage, dict) and usage:
+                    completed = execution_from_evidence(usage)
+                    if completed:
+                        completed["message_id"] = str(getattr(entry, "message_id", ""))
+                        execution["last_completed"] = completed
+                        break
+        if execution:
+            data["execution"] = execution
         return json.dumps(data)
     except ToolError:
         raise

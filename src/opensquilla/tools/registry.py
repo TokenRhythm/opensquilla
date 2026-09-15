@@ -125,7 +125,15 @@ class ToolRegistry:
         *,
         sort: bool = False,
     ) -> list[RegisteredTool]:
-        return visibility_policy.visible_registered_tools(self._tools.values(), ctx, sort=sort)
+        visible = visibility_policy.visible_registered_tools(
+            self._tools.values(),
+            ctx,
+            sort=sort,
+        )
+        router_cfg = getattr(ctx, "router_control_config", None) if ctx is not None else None
+        if router_cfg is not None and not bool(getattr(router_cfg, "enabled", False)):
+            visible = [tool for tool in visible if tool.spec.name != "router_control"]
+        return visible
 
     def _default_context(self) -> ToolContext:
         return visibility_policy.default_tool_context()

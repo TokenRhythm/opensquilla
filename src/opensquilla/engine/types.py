@@ -11,6 +11,7 @@ from opensquilla.contracts.turn_execution import (
     AnswerGenerationResetEvent,
 )
 from opensquilla.execution_status import ExecutionStatus
+from opensquilla.provider.types import ExecutionIdentity
 from opensquilla.session.compaction_lifecycle import (
     DEFAULT_FLUSH_TRIGGERS,
     normalize_flush_triggers_strict,
@@ -733,6 +734,8 @@ class AgentConfig:
     # Per-turn volatile request context injected after persisted history
     # and before the current user turn. It is not persisted to history.
     request_context_prompt: str | None = None
+    # Initial facts; physical request boundaries rebind this immutable snapshot.
+    execution_identity: ExecutionIdentity | None = None
     # Per-turn user-role skill context injected after persisted history
     # and before the current user turn. The agent persists each turn's
     # skill context in history so provider KV-cache prefixes stay stable.

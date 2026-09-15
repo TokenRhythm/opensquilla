@@ -287,10 +287,14 @@ class ToolContext:
         )
 
     # Process-local, turn-bound callback; never included in a public wire schema.
-    # Keep this declaration last so runtime fields above retain their positions.
+    # Keep after the published budget fields so their positions remain unchanged.
     tool_result_snapshot_writer: ToolResultSnapshotWriter | None = field(
         default=None, repr=False
     )
+    # Live, read-only facts from this accepted turn; never persisted session settings.
+    execution_status_snapshot: Callable[[], dict[str, Any]] | None = field(default=None, repr=False)
+    # Frozen admission revision prevents old turns from changing newer holds.
+    router_control_routing_revision: int | None = None
 
 
 def is_goal_owned_main_default_turn(ctx: ToolContext | None) -> bool:

@@ -307,6 +307,73 @@ def _openrouter_member(model: str, *, thinking: str | None = "high") -> Ensemble
     )
 
 
+@pytest.mark.parametrize(
+    "scenario", ["normal", "partial", "fixed_aggregator", "fixed_direct", "terminal"],
+)
+async def test_physical_execution_identity_tracks_ensemble_role(monkeypatch, scenario) -> None:
+    from opensquilla.provider.execution_identity import with_execution_identity
+    from opensquilla.provider.types import ExecutionIdentity
+
+    def success(model):
+        return _FakePlan(events=[TextDeltaEvent(text="synthetic draft"), DoneEvent(model=model)])
+
+    failure = _FakePlan(events=[ErrorEvent(message="synthetic rejection", code="400")])
+    registry = _FakeRegistry(plans={
+        "p1": success("p1"), "p2": success("p2"),
+        "agg": success("agg"), "fixed": success("fixed"),
+    })
+    if scenario in {"partial", "fixed_direct", "terminal"}:
+        registry.plans["p1"] = failure
+    if scenario in {"fixed_direct", "terminal"}:
+        registry.plans["p2"] = failure
+    if scenario == "fixed_aggregator":
+        registry.plans["agg"] = failure
+    if scenario == "terminal":
+        registry.plans["fixed"] = failure
+    monkeypatch.setattr("opensquilla.provider.ensemble._build_provider", registry.provider_for)
+    provider = EnsembleProvider(
+        profile_name="synthetic-identity",
+        proposers=[_member("p1"), _member("p2")],
+        aggregator=_member("agg"),
+        fallback_provider=registry.provider_for(ProviderConfig(provider="fake", model="fixed")),
+        fallback_provider_name="fake", fallback_model="fixed",
+        all_failed_policy="fallback_single", min_successful_proposers=1,
+        shuffle_candidates=False,
+    )
+    identity = ExecutionIdentity(kind="multi_model_fusion", model="hidden-anchor")
+    messages = [with_execution_identity(
+        Message(role="user", content="synthetic request"), identity,
+    )]
+    before = messages[0].model_dump_json()
+    config = ChatConfig(execution_identity=identity, provider_request_max_chars=50000)
+    context = TurnExecutionContext.create(
+        TurnIdentity("synthetic-turn", "synthetic-answer", "agent:main:synthetic-identity")
+    )
+
+    events = [
+        event async for event in provider.chat(messages, config=config, execution_context=context)
+    ]
+
+    assert registry.calls
+    for call in registry.calls:
+        facts = call["config"].execution_identity
+        assert facts.model == call["model"]
+        expected = (
+            "single_model" if call["model"] == "fixed" and scenario in {"fixed_direct", "terminal"}
+            else "multi_model_fusion"
+        )
+        assert facts.kind == expected
+        text = "\n".join(str(message.content) for message in call["messages"])
+        assert text.count("Current response execution:") == 1
+        assert f'"kind":"{expected}"' in text
+        assert "hidden-anchor" not in text
+        if expected == "single_model":
+            assert '"model":"fixed"' in text
+    assert messages[0].model_dump_json() == before
+    assert config.execution_identity == identity
+    assert any(isinstance(event, DoneEvent) for event in events) == (scenario != "terminal")
+
+
 def test_unknown_historical_member_is_unready_placeholder() -> None:
     member = _member_from_ref(
         SimpleNamespace(provider="historical-unknown", model="legacy-model"),
@@ -2554,10 +2621,14 @@ async def test_tool_continuation_keeps_one_public_aggregator_role(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("identity_enabled", [False, True])
 async def test_rebuilt_provider_restores_all_continuation_usage_without_replaying_proposers(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, identity_enabled: bool,
 ) -> None:
     """A router-control rebuild must keep the whole logical turn receipt."""
+
+    from opensquilla.provider.execution_identity import with_execution_identity
+    from opensquilla.provider.types import ExecutionIdentity
 
     registry = _AttemptRegistry(
         {
@@ -2656,7 +2727,8 @@ async def test_rebuilt_provider_restores_all_continuation_usage_without_replayin
         )
     )
     tools = [_tool()]
-    config = ChatConfig(max_tokens=99, thinking=False)
+    identity = ExecutionIdentity(kind="multi_model_fusion") if identity_enabled else None
+    config = ChatConfig(max_tokens=99, thinking=False, execution_identity=identity)
     provider = EnsembleProvider(
         profile_name="rebuilt-ensemble",
         proposers=[_member("p1"), _member("p2")],
@@ -2668,7 +2740,7 @@ async def test_rebuilt_provider_restores_all_continuation_usage_without_replayin
     first_events = [
         event
         async for event in provider.chat(
-            [Message(role="user", content="answer this")],
+            [with_execution_identity(Message(role="user", content="answer this"), identity)],
             tools=tools,
             config=config,
             execution_context=context,
@@ -2737,13 +2809,23 @@ async def test_rebuilt_provider_restores_all_continuation_usage_without_replayin
     assert final_done.usage_missing_count == 0
     assert final_done.ensemble_trace is not None
     assert final_done.ensemble_trace["llm_request_count"] == 5
+    if identity_enabled:
+        for call in registry.calls:
+            text = str([message.content for message in call["messages"]])
+            assert text.count("Current response execution:") == 1
+            assert '"kind":"multi_model_fusion"' in text
+            assert call["config"].execution_identity.model == call["model"]
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("identity_enabled", [False, True])
 async def test_rebuilt_provider_restores_fixed_fallback_continuation_usage(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, identity_enabled: bool,
 ) -> None:
     """A rebuilt fixed fallback must retain proposer and prior fixed rows."""
+
+    from opensquilla.provider.execution_identity import with_execution_identity
+    from opensquilla.provider.types import ExecutionIdentity
 
     registry = _AttemptRegistry(
         {
@@ -2811,7 +2893,8 @@ async def test_rebuilt_provider_restores_fixed_fallback_continuation_usage(
         )
     )
     tools = [_tool()]
-    config = ChatConfig(max_tokens=99, thinking=False)
+    identity = ExecutionIdentity(kind="multi_model_fusion") if identity_enabled else None
+    config = ChatConfig(max_tokens=99, thinking=False, execution_identity=identity)
     provider = EnsembleProvider(
         profile_name="rebuilt-fixed",
         proposers=[_member("p1")],
@@ -2827,7 +2910,7 @@ async def test_rebuilt_provider_restores_fixed_fallback_continuation_usage(
     first_events = [
         event
         async for event in provider.chat(
-            [Message(role="user", content="answer this")],
+            [with_execution_identity(Message(role="user", content="answer this"), identity)],
             tools=tools,
             config=config,
             execution_context=context,
@@ -2882,6 +2965,12 @@ async def test_rebuilt_provider_restores_fixed_fallback_continuation_usage(
     assert final_done.usage_missing_count == 1
     assert final_done.ensemble_trace is not None
     assert final_done.ensemble_trace["llm_request_count"] == 4
+    if identity_enabled:
+        for call in registry.calls:
+            text = str([message.content for message in call["messages"]])
+            assert text.count("Current response execution:") == 1
+            assert '"kind":"multi_model_fusion"' in text
+            assert call["config"].execution_identity.model == call["model"]
 
 
 @pytest.mark.asyncio
@@ -8540,17 +8629,25 @@ async def test_step3_first_success_does_not_cancel_slow_proposer(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("reset_idle", [False, True])
 async def test_step3_meaningful_stream_can_exceed_per_call_idle_budget(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, reset_idle: bool,
 ) -> None:
     monkeypatch.setattr(
         "opensquilla.provider.ensemble._ENSEMBLE_HEARTBEAT_INTERVAL_SECONDS",
         0.003,
     )
+    # Advance the provider's clock, not the OS scheduler: a busy runner can
+    # legitimately oversleep a 12 ms sleep beyond the unchanged 20 ms deadline.
+    clock = [1.0]
+    monkeypatch.setattr(
+        "opensquilla.provider.ensemble.time", SimpleNamespace(monotonic=lambda: clock[0]),
+    )
 
     async def _source() -> AsyncIterator[StreamEvent]:
         for index in range(4):
-            await asyncio.sleep(0.012)
+            await asyncio.sleep(0)
+            clock[0] += 0.012
             yield TextDeltaEvent(text=f"chunk-{index}")
         yield DoneEvent(model="steady")
 
@@ -8559,8 +8656,12 @@ async def test_step3_meaningful_stream_can_exceed_per_call_idle_budget(
         phase="step3",
         message="waiting",
         timeout_seconds=0.02,
-        reset_deadline_on_event=True,
+        reset_deadline_on_event=reset_idle,
     )
+    if not reset_idle:
+        with pytest.raises(TimeoutError):
+            _ = [event async for event in wrapped]
+        return
     events = [event async for event in wrapped]
 
     assert [event.text for event in events if isinstance(event, TextDeltaEvent)] == [
@@ -8570,6 +8671,7 @@ async def test_step3_meaningful_stream_can_exceed_per_call_idle_budget(
         "chunk-3",
     ]
     assert isinstance(events[-1], DoneEvent)
+    assert clock[0] - 1.0 > 0.02
 
 
 @pytest.mark.asyncio

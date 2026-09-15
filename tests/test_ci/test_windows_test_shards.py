@@ -79,6 +79,10 @@ RECENTLY_ADDED_ACTIVE_TESTS = {
     "tests/test_engine/test_selector_provider_recovery.py",
     "tests/test_provider_connection_failure.py",
     "tests/test_tools/test_bounded_output_capture.py",
+    # Execution identity suites use the provisional floor until a Windows refresh.
+    "tests/test_engine/test_request_execution_identity.py",
+    "tests/test_tools/test_execution_status.py",
+    "tests/test_live_execution_identity_acceptance.py",
     # Execution-log suites use the declared provisional floor until a Windows refresh.
     "tests/test_gateway/test_rpc_execution_logs.py",
     "tests/test_tools/test_execution_log_queries.py",
@@ -420,8 +424,15 @@ def _function_decorators(path: Path, function_name: str) -> set[str]:
     raise AssertionError(f"missing test function: {path}:{function_name}")
 
 
-def test_windows_shell_process_runtime_is_marked_ci_serial() -> None:
-    path = Path("tests/test_sandbox/test_windows_shell_process_runtime.py")
+@pytest.mark.parametrize(
+    "test_file",
+    [
+        "tests/test_sandbox/test_windows_shell_process_runtime.py",
+        "tests/test_scripts/test_gateway_ux.py",
+    ],
+)
+def test_windows_process_harnesses_are_marked_ci_serial(test_file: str) -> None:
+    path = Path(test_file)
     parsed = ast.parse(path.read_text(encoding="utf-8"))
 
     assert any(
