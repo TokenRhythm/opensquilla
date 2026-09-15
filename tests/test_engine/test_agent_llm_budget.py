@@ -133,6 +133,7 @@ class _StallingProvider:
 
     def __init__(self) -> None:
         self.calls: list[list[Message]] = []
+        self.stream_started = asyncio.Event()
         self.stream_closed = False
 
     def chat(
@@ -146,6 +147,7 @@ class _StallingProvider:
 
     async def _stream(self) -> AsyncIterator[Any]:
         try:
+            self.stream_started.set()
             await asyncio.sleep(60.0)
             yield ProviderText(text="late")
         finally:
@@ -1701,18 +1703,44 @@ async def test_provider_heartbeat_reaches_agent_stream() -> None:
 
 
 @pytest.mark.asyncio
-async def test_task_deadline_interrupts_stalled_provider_stream() -> None:
+async def test_task_deadline_interrupts_stalled_provider_stream(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     provider = _StallingProvider()
     agent = Agent(
         provider=provider,
-        config=AgentConfig(timeout=0.01, iteration_timeout=0, max_provider_retries=0),
+        config=AgentConfig(timeout=60.0, iteration_timeout=0, max_provider_retries=0),
     )
+    real_wait = asyncio.wait
+    deadline_limited_waits = 0
+
+    async def _expire_started_provider_wait(
+        futures: set[asyncio.Future[Any]],
+        *,
+        timeout: float | None = None,
+        return_when: str = asyncio.ALL_COMPLETED,
+    ) -> tuple[set[asyncio.Future[Any]], set[asyncio.Future[Any]]]:
+        nonlocal deadline_limited_waits
+        if provider.calls and deadline_limited_waits == 0:
+            deadline_limited_waits += 1
+            assert timeout is not None and 0 < timeout <= agent.config.timeout
+            # Expire the task deadline after the generator has entered its
+            # cleanup scope. A 10 ms wall-clock budget can expire during prompt
+            # setup, before there is a running provider stream to interrupt.
+            await provider.stream_started.wait()
+            assert len(futures) == 1
+            assert not next(iter(futures)).done()
+            return set(), futures
+        return await real_wait(futures, timeout=timeout, return_when=return_when)
+
+    monkeypatch.setattr(asyncio, "wait", _expire_started_provider_wait)
 
     events = await asyncio.wait_for(
         _collect_events(agent.run_turn("hello")),
         timeout=0.5,
     )
 
+    assert deadline_limited_waits == 1
     error_index = _event_index(
         events,
         lambda event: isinstance(event, ErrorEvent) and event.code == "agent_runtime_timeout",
