@@ -2134,20 +2134,16 @@ def _render_structlog_event_for_stdlib(
 ) -> tuple[tuple[str], dict[str, Any]]:
     """Final structlog processor: render ``event key=value ...`` for stdlib.
 
-    Returns ``(args, kwargs)`` so ``exc_info``/``stack_info`` pass through to
-    ``logging`` natively and the Formatter renders tracebacks into every
-    attached handler (file and console).
+    Project metadata before any handler sees the event. Exception types remain
+    useful, but traceback prose, payloads and source literals must never reach
+    stdlib's exception renderer or a third-party handler.
     """
-    kwargs: dict[str, Any] = {}
-    exc_info = event_dict.pop("exc_info", None)
-    if exc_info:
-        kwargs["exc_info"] = exc_info
-    stack_info = event_dict.pop("stack_info", None)
-    if stack_info:
-        kwargs["stack_info"] = stack_info
-    event = str(event_dict.pop("event", ""))
-    parts = [event] + [f"{key}={event_dict[key]!r}" for key in event_dict]
-    return (" ".join(part for part in parts if part),), kwargs
+    from opensquilla.observability.log_privacy import private_log_event
+
+    fields = private_log_event(logger, method_name, event_dict)
+    event = fields.get("event", "unstructured_log")
+    parts = [event] + [f"{key}={value!r}" for key, value in fields.items() if key != "event"]
+    return (" ".join(parts),), {"extra": {"_opensquilla_log_metadata": fields}}
 
 
 def _structlog_explicitly_configured() -> bool:
@@ -2201,6 +2197,8 @@ def _remove_console_handlers(root: logging.Logger) -> None:
 
 def _setup_file_logging(config: GatewayConfig | None = None) -> None:
     """Configure structlog + stdlib logging to write to a debug.log file."""
+    from opensquilla.observability.log_privacy import PrivateLogFormatter
+
     config = config or GatewayConfig()
     root = logging.getLogger()
     _remove_debug_file_handlers(root)
@@ -2215,9 +2213,7 @@ def _setup_file_logging(config: GatewayConfig | None = None) -> None:
         console_handler = logging.StreamHandler(sys.stdout)
         setattr(console_handler, _CONSOLE_HANDLER_ATTR, True)
         console_handler.setLevel(log_level)
-        console_handler.setFormatter(
-            logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
-        )
+        console_handler.setFormatter(PrivateLogFormatter())
         root.addHandler(console_handler)
     except Exception as exc:  # noqa: BLE001 - logging must never block boot
         bridge_error = exc
@@ -2251,9 +2247,7 @@ def _setup_file_logging(config: GatewayConfig | None = None) -> None:
     setattr(file_handler, _DEBUG_FILE_HANDLER_ATTR, True)
     setattr(file_handler, "_opensquilla_previous_logger_level", opensquilla_logger.level)
     file_handler.setLevel(log_level)
-    file_handler.setFormatter(
-        logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
-    )
+    file_handler.setFormatter(PrivateLogFormatter())
 
     root.addHandler(file_handler)
     opensquilla_logger.setLevel(log_level)
@@ -5340,11 +5334,14 @@ async def start_gateway_server(
                 preview_socket.setblocking(False)
                 preview_port = int(preview_socket.getsockname()[1])
                 preview_service.set_listener_port(preview_port)
+                from opensquilla.observability.log_privacy import uvicorn_log_config
+
                 preview_config = uvicorn.Config(
                     app=create_artifact_preview_resource_app(preview_service),
                     host="127.0.0.1",
                     port=preview_port,
                     log_level="warning",
+                    log_config=uvicorn_log_config(),
                     access_log=False,
                     lifespan="off",
                 )
@@ -5412,7 +5409,10 @@ async def start_gateway_server(
         if config.tls.keyfile and config.tls.certfile:
             uvicorn_kwargs["ssl_keyfile"] = config.tls.keyfile
             uvicorn_kwargs["ssl_certfile"] = config.tls.certfile
+        from opensquilla.observability.log_privacy import uvicorn_log_config
+
         uv_config = uvicorn.Config(
+            log_config=uvicorn_log_config(),
             **uvicorn_kwargs,
         )
         server = uvicorn.Server(uv_config)

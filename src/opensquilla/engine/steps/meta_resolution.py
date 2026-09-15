@@ -1314,9 +1314,8 @@ async def meta_resolution(ctx: TurnContext) -> TurnContext:
         # D1: log all candidate names + priorities so operators can
         # spot trigger overlaps from logs without re-running the turn.
         candidate_list=[(n, p) for p, n, _t in candidate_digest],
-        # Include the head of the actual input so an operator can
-        # diagnose accidental fires from the log alone.
-        message_head=semantic_text[:200],
-        trigger_scan_head=trigger_text[:200],
+        # Keep input size for diagnostics without persisting conversation text.
+        message_chars=len(semantic_text),
+        trigger_scan_chars=len(trigger_text),
     )
     return ctx

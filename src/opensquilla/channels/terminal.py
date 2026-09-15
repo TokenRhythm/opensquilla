@@ -37,7 +37,7 @@ class TerminalChannel:
         reader = await self._get_reader()
         line_bytes = await reader.readline()
         content = line_bytes.decode(errors="replace").rstrip("\n")
-        log.debug("terminal.receive", content=content[:80])
+        log.debug("terminal.receive", content_chars=len(content))
         return IncomingMessage(
             sender_id=self.sender_id,
             channel_id=self.channel_id,
@@ -48,7 +48,7 @@ class TerminalChannel:
         """Write message content to stdout."""
         loop = asyncio.get_event_loop()
         await loop.run_in_executor(None, self._write_stdout, message.content)
-        log.debug("terminal.send", content=message.content[:80])
+        log.debug("terminal.send", content_chars=len(message.content))
 
     async def edit(self, message_id: str, content: str) -> None:
         """Edit is not supported on terminal; re-print with prefix."""

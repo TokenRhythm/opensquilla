@@ -523,7 +523,7 @@ def meta_skill_fill_slots(
         _log.warning(
             "meta_skill_fill_slots.validation_failed_initial",
             pattern_id=pattern_id,
-            response_preview=response[:500],
+            response_chars=len(response),
             errors=str(exc.errors()[:5]) if exc.errors() else str(exc),
         )
         # N4 fix: Pydantic v2 custom-validator errors embed raw ValueError
@@ -547,7 +547,7 @@ def meta_skill_fill_slots(
             _log.warning(
                 "meta_skill_fill_slots.validation_failed_retry",
                 pattern_id=pattern_id,
-                response_preview=retry_response[:500],
+                response_chars=len(retry_response),
                 errors=str(retry_exc.errors()[:5]) if retry_exc.errors() else str(retry_exc),
             )
             raise _FillSlotsValidationError(
