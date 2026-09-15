@@ -313,6 +313,7 @@ async def _provider_probe(params: Any, ctx: RpcContext) -> dict[str, Any]:
     from opensquilla.application.provider_setup import ProbePrimaryProvider
 
     p = params if isinstance(params, dict) else {}
+    mode, mode_was_explicit = _probe_mode_param(p)
     command = ProbePrimaryProvider(
         provider_id=str(_require(params, "providerId")),
         model=str(p.get("model", "") or ""),
@@ -321,6 +322,7 @@ async def _provider_probe(params: Any, ctx: RpcContext) -> dict[str, Any]:
         base_url=str(p.get("baseUrl", "") or ""),
         proxy=str(p.get("proxy", "") or ""),
         preserve_api_key=bool(p.get("preserveApiKey", False)),
+        mode=mode if mode_was_explicit else None,
     )
     return cast(dict[str, Any], await _provider_setup(ctx).probe_primary(command))
 
@@ -447,6 +449,20 @@ def _bool_param(params: Any, key: str, default: bool = False) -> bool:
     if not isinstance(value, bool):
         raise ValueError(f"params.{key} must be a boolean")
     return value
+
+
+def _probe_mode_param(params: Any) -> tuple[str, bool]:
+    """Normalize probe mode while preserving omitted/null legacy behavior."""
+
+    if not isinstance(params, dict) or "mode" not in params:
+        return "model", False
+    raw_mode = params.get("mode")
+    if raw_mode is None:
+        return "model", False
+    mode = str(raw_mode).strip()
+    if not mode:
+        return "model", False
+    return mode, True
 
 
 def _provider_candidate_identity(
@@ -821,6 +837,16 @@ def _resolved_llm_profile_config(
     return resolution
 
 
+def _profile_model_for_probe(config: Any, provider_id: str) -> str:
+    """Return the stored model for a profile without changing its casing contract."""
+    provider = str(provider_id or "").strip().lower()
+    profiles = getattr(config, "llm_profiles", None) or {}
+    for key, profile in profiles.items():
+        if str(key or "").strip().lower() == provider:
+            return str(getattr(profile, "model", "") or "").strip()
+    return ""
+
+
 def _report_llm_profile_rpc_failure(
     provider_id: str,
     session_key: str,
@@ -857,6 +883,7 @@ def _profile_draft_config(
     draft = upsert_llm_profile(
         config,
         provider_id=provider,
+        model=values.get("model") if "model" in values else None,
         api_key=values.get("apiKey") if "apiKey" in values else None,
         api_key_env=values.get("apiKeyEnv") if "apiKeyEnv" in values else None,
         preserve_api_key=preserve_value,
@@ -876,6 +903,7 @@ async def _usage_accounted_provider_probe(
     base_url: str,
     proxy: str,
     allow_default_api_key_env: bool,
+    mode: str = "model",
 ) -> ProviderProbeExecutionResult:
     """Probe one deployment under the shared physical-call usage boundary."""
     import uuid
@@ -887,7 +915,10 @@ async def _usage_accounted_provider_probe(
         bind_usage_accounting_scope,
         provider_accounts_physical_usage,
     )
-    from opensquilla.onboarding.probe import probe_llm_provider
+    from opensquilla.onboarding.probe import (
+        MODEL_PROBE_TIMEOUT_SECONDS,
+        probe_llm_provider,
+    )
 
     usage_scope = None
     chat_stream_factory = None
@@ -915,6 +946,7 @@ async def _usage_accounted_provider_probe(
                 lambda: provider.chat(messages, config=chat_config),
                 provider=str(provider_id),
                 model=str(model),
+                close_timeout=None,
             )
 
     probe_kwargs: dict[str, Any] = {
@@ -925,6 +957,8 @@ async def _usage_accounted_provider_probe(
         "base_url": base_url,
         "proxy": proxy,
         "allow_default_api_key_env": allow_default_api_key_env,
+        "mode": mode,
+        "timeout": MODEL_PROBE_TIMEOUT_SECONDS,
     }
     if chat_stream_factory is not None:
         probe_kwargs["chat_stream_factory"] = chat_stream_factory
@@ -941,30 +975,41 @@ async def _probe_saved_profile(
 ) -> dict[str, Any]:
     """Run a small live probe using the stored profile's resolved deployment."""
     provider_id = command.provider_id
-    if "model" not in command.values:
-        raise ValueError("params.model is required")
+    requested_mode, mode_was_explicit = _probe_mode_param(command.values)
     model = str(command.values.get("model") or "").strip()
+    if requested_mode == "model" and (
+        "model" not in command.values or (mode_was_explicit and not model)
+    ):
+        raise ValueError("params.model is required")
     cfg = config
+    if requested_mode == "reachability":
+        model = model or _profile_model_for_probe(cfg, provider_id)
+    resolution_model = model if requested_mode == "model" else model or "reachability-probe"
     session_key = _llm_profile_rpc_session_key(connection_id, provider_id)
     with _validation_error("onboarding.llmProfile.invalid"):
         resolution = _resolved_llm_profile_config(
             cfg,
             provider_id,
-            model,
+            resolution_model,
             session_key=session_key,
         )
         deployment = resolution.provider_config
         result = await _usage_accounted_provider_probe(
             usage_event_sink,
             provider_id=deployment.provider,
-            model=deployment.model,
+            model=model,
             api_key=deployment.api_key,
             api_key_env="",
             base_url=deployment.base_url,
             proxy=deployment.proxy,
             allow_default_api_key_env=False,
+            mode=requested_mode,
         )
-        if not result.ok and resolution.credential_source == "profile_pool":
+        if (
+            not mode_was_explicit
+            and not result.ok
+            and resolution.credential_source == "profile_pool"
+        ):
             _report_llm_profile_rpc_failure(
                 deployment.provider,
                 session_key,
@@ -972,7 +1017,8 @@ async def _probe_saved_profile(
             )
     from opensquilla.onboarding.probe_history import record_probe
 
-    record_probe(cfg, deployment.provider, ok=result.ok, failure_kind=result.failure_kind)
+    if not mode_was_explicit:
+        record_probe(cfg, deployment.provider, ok=result.ok, failure_kind=result.failure_kind)
     return result.to_payload()
 
 
@@ -984,30 +1030,42 @@ async def _probe_draft_profile(
     usage_event_sink: Any,
 ) -> dict[str, Any]:
     """Probe the editor's current profile draft without saving any field."""
-    if "model" not in command.values:
+    requested_mode, mode_was_explicit = _probe_mode_param(command.values)
+    requested_model = str(command.values.get("model") or "").strip()
+    if requested_mode == "model" and (
+        "model" not in command.values or (mode_was_explicit and not requested_model)
+    ):
         raise ValueError("params.model is required")
-    model = str(command.values.get("model") or "").strip()
     with _validation_error("onboarding.llmProfile.invalid"):
         provider_id, draft = _profile_draft_config(command, config)
+        model = requested_model
+        if requested_mode == "reachability":
+            model = model or _profile_model_for_probe(draft, provider_id)
+        resolution_model = model if requested_mode == "model" else model or "reachability-probe"
         session_key = _llm_profile_rpc_session_key(connection_id, provider_id)
         resolution = _resolved_llm_profile_config(
             draft,
             provider_id,
-            model,
+            resolution_model,
             session_key=session_key,
         )
         deployment = resolution.provider_config
         result = await _usage_accounted_provider_probe(
             usage_event_sink,
             provider_id=deployment.provider,
-            model=deployment.model,
+            model=model,
             api_key=deployment.api_key,
             api_key_env="",
             base_url=deployment.base_url,
             proxy=deployment.proxy,
             allow_default_api_key_env=False,
+            mode=requested_mode,
         )
-        if not result.ok and resolution.credential_source == "profile_pool":
+        if (
+            not mode_was_explicit
+            and not result.ok
+            and resolution.credential_source == "profile_pool"
+        ):
             _report_llm_profile_rpc_failure(
                 deployment.provider,
                 session_key,
@@ -1144,7 +1202,16 @@ async def _probe_primary_provider(
             base_url = str(getattr(cfg.llm, "base_url", "") or "")
         if not proxy:
             proxy = str(getattr(cfg.llm, "proxy", "") or "")
-    model = str(command.model or "")
+    requested_mode = command.mode or "model"
+    saved_model = str(getattr(cfg.llm, "model", "") or "").strip()
+    model = str(command.model or "").strip()
+    if (
+        requested_mode == "reachability"
+        and not model
+        and same_provider
+        and reuse_stored_credentials
+    ):
+        model = saved_model
     with _validation_error("onboarding.provider.invalid"):
         result = await _usage_accounted_provider_probe(
             usage_event_sink,
@@ -1157,10 +1224,11 @@ async def _probe_primary_provider(
             allow_default_api_key_env=(
                 not same_provider or reuse_stored_credentials
             ),
+            mode=requested_mode,
         )
-    saved_model = str(getattr(cfg.llm, "model", "") or "").strip()
     if (
-        same_provider
+        command.mode is None
+        and same_provider
         and reuse_stored_credentials
         and not request_overrides
         and (not model.strip() or model.strip() == saved_model)

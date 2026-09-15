@@ -2,10 +2,12 @@ import { describe, expect, it, vi } from 'vitest'
 
 import type { RpcCallOptions, RpcEventHandler } from '@/lib/rpc'
 import { createPrivateGatewayTransports } from './privateTransports'
+import { createV4SetupWorkflow } from './setupWorkflowV4'
 
 function source() {
   return {
     connectionGeneration: 7,
+    policy: { provider_probe_modes: ['model', 'reachability'] },
     call: vi.fn(async () => ({ ok: true })) as <T = unknown>(
       method: string,
       params?: Record<string, unknown>,
@@ -66,6 +68,13 @@ describe('private Gateway transports', () => {
     expect(rpcSource.hasRpcMethod).toHaveBeenCalledWith('sessions.list')
     expect(rpcSource.hasRpcEvent).toHaveBeenCalledWith('sessions.changed')
     expect(rpcSource.rememberUnsupportedMethod).toHaveBeenCalledWith('legacy.method')
+  })
+
+  it('projects the negotiated provider probe modes into the setup workflow capability', () => {
+    const transports = createPrivateGatewayTransports(source())
+    const workflow = createV4SetupWorkflow(transports.rpc)
+
+    expect(workflow.capabilities.providerProbeModes).toBe(true)
   })
 
   it('owns idempotent event unsubscription', () => {

@@ -384,6 +384,8 @@ class PolicyInfo(BaseModel):
     tick_interval_ms: int = TICK_INTERVAL_MS
     concurrent_history_reads: bool = False
     concurrent_optional_read_methods: list[str] = []
+    cancellable_request_methods: list[str] = []
+    provider_probe_modes: list[str] = []
     agent_stream_heartbeat_interval_ms: int = 15_000
     agent_stream_idle_timeout_ms: int = 600_000
     webui_stream_idle_grace_ms: int = 630_000

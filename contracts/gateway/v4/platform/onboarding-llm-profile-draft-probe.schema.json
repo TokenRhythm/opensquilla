@@ -70,6 +70,16 @@
   "$defs": {
     "OnboardingLlmProfileDraftProbeParams": {
       "title": "onboarding.llmProfile.draft.probe params",
+      "oneOf": [
+        {
+          "$ref": "#/$defs/OnboardingLlmProfileDraftModelProbeParams"
+        },
+        {
+          "$ref": "#/$defs/OnboardingLlmProfileDraftReachabilityProbeParams"
+        }
+      ]
+    },
+    "OnboardingLlmProfileDraftModelProbeParams": {
       "type": "object",
       "additionalProperties": true,
       "properties": {
@@ -114,11 +124,72 @@
             "string",
             "null"
           ]
+        },
+        "mode": {
+          "enum": [
+            "model",
+            null
+          ]
         }
       },
       "required": [
         "providerId",
         "model"
+      ]
+    },
+    "OnboardingLlmProfileDraftReachabilityProbeParams": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "providerId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "model": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "apiKey": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "apiKeyEnv": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "keepCurrentSecret": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "baseUrl": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "proxy": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "mode": {
+          "const": "reachability"
+        }
+      },
+      "required": [
+        "providerId",
+        "mode"
       ]
     },
     "OnboardingLlmProfileDraftProbeRequestFrame": {
@@ -146,7 +217,22 @@
     },
     "OnboardingLlmProfileDraftProbeResult": {
       "type": "object",
-      "additionalProperties": true
+      "additionalProperties": true,
+      "properties": {
+        "ok": { "type": "boolean" },
+        "providerId": { "type": "string" },
+        "model": { "type": "string" },
+        "failureKind": { "type": "string" },
+        "message": { "type": "string" },
+        "code": { "type": "string" },
+        "latencyMs": { "type": "integer", "minimum": 0 },
+        "firstResponseMs": { "type": ["integer", "null"], "minimum": 0 },
+        "totalMs": { "type": "integer", "minimum": 0 },
+        "verificationLevel": {
+          "enum": ["reachable", "model_verified", "none"]
+        },
+        "failureStage": { "enum": ["reachability", "model"] }
+      }
     },
     "RpcError": {
       "type": "object",

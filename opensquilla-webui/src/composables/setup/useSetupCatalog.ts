@@ -7,6 +7,8 @@ import {
   normalizeCatalogSyncStatus,
   normalizeDiscoveredModels,
   normalizeProbeTimings,
+  PROVIDER_MODEL_PROBE_REQUEST_TIMEOUT_MS,
+  isProbeTimeoutError,
   useSetupProviderForm,
   type ConnectionState,
   type DiscoveredModelCatalog,
@@ -507,6 +509,10 @@ let saveAllRequestPending = false
 
 const providerForm = useSetupProviderForm(setupWorkflow)
 const configuredProviderProbes = ref<Record<string, ConnectionState>>({})
+const configuredProviderProbeRuns = new Map<string, {
+  controller: AbortController
+  previous: ConnectionState | undefined
+}>()
 let configuredProbeEpoch = 0
 const providerActivation = ref<{
   providerId: string
@@ -793,6 +799,9 @@ onMounted(async () => {
 })
 
 onUnmounted(() => {
+  providerForm.cancelProbe()
+  for (const run of configuredProviderProbeRuns.values()) run.controller.abort()
+  configuredProviderProbeRuns.clear()
 })
 
 // ---------------------------------------------------------------------------
@@ -846,6 +855,8 @@ async function loadData(options: {
     // reload may follow a key, endpoint, model, activation, or deletion
     // mutation, so stale results must never survive it.
     configuredProbeEpoch += 1
+    for (const run of configuredProviderProbeRuns.values()) run.controller.abort()
+    configuredProviderProbeRuns.clear()
     configuredProviderProbes.value = {}
     resetTierModelDiscovery()
     resetImageModelDiscovery()
@@ -1564,6 +1575,23 @@ const providerProbeMissingFields = computed(() => {
     .map(providerProbeFieldLabel)
 })
 
+const providerReachabilityMissingFields = computed(() => {
+  if (!providerForm.selectedProvider.value) return []
+  // A clean saved profile is resolved by the Gateway. Its endpoint may come
+  // from redacted or inherited state that is intentionally absent here.
+  if (providerSelectionKind.value === 'profile' && !providerForm.isDirty.value) return []
+  return providerFields.value
+    .filter(field => (
+      field.required === true
+      && field.name !== 'model'
+      && !isProviderCredentialField(field)
+    ))
+    .filter(field => !String(
+      providerForm.fieldValue(field, currentProviderConfig.value) ?? '',
+    ).trim())
+    .map(providerProbeFieldLabel)
+})
+
 const providerProbeDisabledReason = computed(() => {
   if (providerProbeMissingFields.value.length === 0) return ''
   return t('setup.provider.probeMissingRequired', {
@@ -1638,6 +1666,14 @@ const providerCredentialPanel = computed<ProviderCredentialPanelState | null>(()
   const probeDisabledReason = !fieldsReady
     ? providerProbeDisabledReason.value
     : (!credentialReady ? t('setup.provider.addKeyToTestHint') : '')
+  const reachabilityFieldsReady = providerReachabilityMissingFields.value.length === 0
+  const reachabilityDisabledReason = !reachabilityFieldsReady
+    ? t('setup.provider.probeMissingRequired', {
+        fields: providerReachabilityMissingFields.value.join(
+          t('setup.provider.requiredFieldJoiner'),
+        ),
+      })
+    : (!credentialReady ? t('setup.provider.addKeyToTestHint') : '')
 
   return {
     providerLabel: providerSpec.value.label || providerForm.selectedProvider.value,
@@ -1663,7 +1699,12 @@ const providerCredentialPanel = computed<ProviderCredentialPanelState | null>(()
     draftCredentialSource: hasDraftKey ? 'key' : (envReferenceEdited ? 'env' : ''),
     probeReady: Boolean(providerForm.selectedProvider.value) && fieldsReady && credentialReady,
     probeDisabledReason,
-    probeButtonLabel: credentialReady ? t('setup.provider.testCurrentSettings') : t('setup.provider.addKeyToTest'),
+    probeButtonLabel: credentialReady ? t('setup.provider.testModel') : t('setup.provider.addKeyToTest'),
+    reachabilityReady: Boolean(providerForm.selectedProvider.value)
+      && reachabilityFieldsReady
+      && credentialReady,
+    reachabilityDisabledReason,
+    probeModesSupported: setupWorkflow.capabilities.providerProbeModes !== false,
     connection: providerForm.connection.value,
     onReveal: revealProviderCredential,
     // Hiding is local-only and should remain available even while a save or
@@ -2507,6 +2548,9 @@ function cancelProviderEdit() {
 function freshConfiguredProbe(phase: ConnectionState['phase'] = 'unverified'): ConnectionState {
   return {
     phase,
+    verificationLevel: 'none',
+    failureStage: '',
+    probeMode: null,
     failureKind: '',
     detail: '',
     firstResponseMs: null,
@@ -2595,9 +2639,14 @@ async function probeConfiguredProvider(value: string) {
   const providerId = normalizeProviderId(value)
   const row = configuredProviders.value.find(item => normalizeProviderId(item.providerId) === providerId)
   if (!providerId || !row?.ready || configuredProviderProbes.value[providerId]?.phase === 'probing') return
+  const controller = new AbortController()
+  configuredProviderProbeRuns.set(providerId, {
+    controller,
+    previous: configuredProviderProbes.value[providerId],
+  })
   configuredProviderProbes.value = {
     ...configuredProviderProbes.value,
-    [providerId]: freshConfiguredProbe('probing'),
+    [providerId]: { ...freshConfiguredProbe('probing'), probeMode: 'model' },
   }
   const probeEpoch = configuredProbeEpoch
   const active = providerId === normalizeProviderId(currentProvider.value)
@@ -2606,33 +2655,74 @@ async function probeConfiguredProvider(value: string) {
     : representativeProviderModel(providerId)
   try {
     const probe = active ? setupWorkflow.provider.probePrimary : setupWorkflow.profile.probeProfile
-    const res = await probe({ providerId, model }) as {
+    const res = await probe(
+      {
+        providerId,
+        model,
+        ...(setupWorkflow.capabilities.providerProbeModes !== false
+          ? { mode: 'model' as const }
+          : {}),
+      },
+      {
+        signal: controller.signal,
+        timeoutMs: PROVIDER_MODEL_PROBE_REQUEST_TIMEOUT_MS,
+      },
+    ) as {
       ok?: boolean
       failureKind?: string
       message?: string
+      detail?: string
+      verificationLevel?: 'reachable' | 'model_verified' | 'none'
+      failureStage?: 'reachability' | 'model'
       firstResponseMs?: number
       totalMs?: number
       latencyMs?: number
     }
-    if (probeEpoch !== configuredProbeEpoch) return
+    if (
+      controller.signal.aborted
+      || probeEpoch !== configuredProbeEpoch
+      || configuredProviderProbeRuns.get(providerId)?.controller !== controller
+    ) return
     const timings = normalizeProbeTimings(res)
     configuredProviderProbes.value = {
       ...configuredProviderProbes.value,
       [providerId]: {
-        ...freshConfiguredProbe(res?.ok ? 'verified' : (res?.failureKind === 'auth_invalid' ? 'key_invalid' : 'unreachable')),
+        ...freshConfiguredProbe(res?.ok
+          ? 'model_verified'
+          : (res?.failureKind === 'probe_timeout'
+              ? 'timed_out'
+              : (res?.failureKind === 'auth_invalid'
+                  ? 'key_invalid'
+                  : (res?.verificationLevel === 'reachable'
+                      ? 'reachable_error'
+                      : 'unreachable')))),
+        verificationLevel: res?.ok ? 'model_verified' : (res?.verificationLevel ?? 'none'),
+        failureStage: res?.failureStage ?? (res?.ok ? '' : 'model'),
+        probeMode: 'model',
         failureKind: String(res?.failureKind || ''),
-        detail: String(res?.message || ''),
+        detail: String(res?.message || res?.detail || ''),
         ...timings,
       },
     }
   } catch (err) {
-    if (probeEpoch !== configuredProbeEpoch) return
+    if (
+      controller.signal.aborted
+      || probeEpoch !== configuredProbeEpoch
+      || configuredProviderProbeRuns.get(providerId)?.controller !== controller
+    ) return
     configuredProviderProbes.value = {
       ...configuredProviderProbes.value,
       [providerId]: {
-        ...freshConfiguredProbe('unreachable'),
+        ...freshConfiguredProbe(isProbeTimeoutError(err) ? 'timed_out' : 'unreachable'),
+        failureStage: 'model',
+        probeMode: 'model',
+        failureKind: isProbeTimeoutError(err) ? 'probe_timeout' : '',
         detail: saveFailedMessage(err),
       },
+    }
+  } finally {
+    if (configuredProviderProbeRuns.get(providerId)?.controller === controller) {
+      configuredProviderProbeRuns.delete(providerId)
     }
   }
 }
@@ -2648,6 +2738,18 @@ function pushPrimaryRouterOutcome(action: string | undefined, previousBinding: s
   pushToast(t(action === 'disable' ? 'setup.provider.routerOutcomeDisabled'
     : action === 'use_recommended' || previousBinding === 'follow_primary' ? 'setup.provider.routerOutcomeSynchronized'
       : 'setup.provider.routerOutcomePreserved'))
+}
+
+function cancelConfiguredProviderProbe(value: string) {
+  const providerId = normalizeProviderId(value)
+  const run = configuredProviderProbeRuns.get(providerId)
+  if (!run) return
+  run.controller.abort()
+  configuredProviderProbeRuns.delete(providerId)
+  const next = { ...configuredProviderProbes.value }
+  if (run.previous) next[providerId] = run.previous
+  else delete next[providerId]
+  configuredProviderProbes.value = next
 }
 
 async function activateProvider(value: string) {
@@ -2874,11 +2976,13 @@ async function removeProviderCredential() {
 }
 
 // Optional accelerator: live-probe the CURRENT (possibly unsaved) provider
-// form values. Never gates saving. The probe RPC requires a model id, so an
-// empty model field falls back to the catalog's default for the provider.
-async function probeProviderConnection() {
+// form values. Never gates saving. Only the explicit model test needs a model;
+// endpoint reachability can run before the user chooses one.
+async function probeProviderConnection(mode: 'reachability' | 'model' = 'reachability') {
   if (providerInteractionLocked()) return
-  if (!providerCredentialPanel.value?.probeReady) return
+  const credentialPanel = providerCredentialPanel.value
+  if (!credentialPanel) return
+  if (mode === 'reachability' ? !credentialPanel.reachabilityReady : !credentialPanel.probeReady) return
   const storedProfileDraft = selectedStoredProfile.value && providerForm.isDirty.value
   const persistedStoredProfile = selectedStoredProfile.value && !storedProfileDraft
   await providerForm.probeConnection({
@@ -2890,6 +2994,7 @@ async function probeProviderConnection() {
       : undefined,
     storedProfile: persistedStoredProfile,
     draftProfile: storedProfileDraft,
+    mode,
   })
   // Verification is deliberately non-mutating. The editor keeps the verified
   // draft visible so the user can review the discovered model and then commit
@@ -3720,13 +3825,6 @@ async function saveProvider(options: SaveOptions = {}): Promise<boolean> {
     && Boolean(currentProvider.value)
     && !profileSaveSupported.value
   )
-  if (
-    replacesPrimaryOnLegacyGateway
-    && providerForm.connection.value.phase !== 'verified'
-  ) {
-    pushToast(t('setup.provider.currentSettingsNotTested'), { tone: 'danger' })
-    return false
-  }
   let primaryAcknowledged = false
   let refreshStarted = false
   let resolvedRouterAction: 'use_recommended' | 'disable' | undefined
@@ -4319,8 +4417,10 @@ async function copyConfigPath() {
     updateLlmTimeout,
     updateContextWindow,
     probeProviderConnection,
+    cancelProviderProbe: providerForm.cancelProbe,
     refreshProviderModels,
     probeConfiguredProvider,
+    cancelConfiguredProviderProbe,
     activateProvider,
     removeProviderProfile,
     revealProviderCredential,

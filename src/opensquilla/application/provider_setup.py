@@ -23,6 +23,8 @@ class ProviderProbeResult(TypedDict):
     latencyMs: int
     firstResponseMs: int | None
     totalMs: int
+    verificationLevel: NotRequired[str]
+    failureStage: NotRequired[str]
 
 
 class DiscoveredModelPricing(TypedDict):
@@ -80,6 +82,10 @@ class ProbePrimaryProvider:
     base_url: str = ""
     proxy: str = ""
     preserve_api_key: bool = False
+    # ``None`` preserves the legacy RPC contract, including probe-history
+    # side effects. New UI probes always send an explicit mode and stay
+    # diagnostic-only so client-side cancellation cannot cause a late write.
+    mode: str | None = None
 
 
 @dataclass(frozen=True, slots=True)

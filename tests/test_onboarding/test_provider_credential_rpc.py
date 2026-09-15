@@ -12,7 +12,9 @@ from opensquilla.gateway import rpc_onboarding
 from opensquilla.gateway.auth import Principal
 from opensquilla.gateway.config import GatewayConfig, LlmProviderConfig
 from opensquilla.gateway.rpc import RpcContext, RpcHandlerError
+from opensquilla.onboarding.probe import ProviderProbeResult
 from opensquilla.provider.failures import ProviderFailureKind
+from opensquilla.provider.types import DoneEvent
 
 
 def _sse_ok_body() -> bytes:
@@ -132,6 +134,8 @@ async def test_provider_probe_rpc_binds_synthetic_usage_scope(
         scope = current_usage_accounting_scope()
         assert scope is not None
         assert callable(kwargs.get("chat_stream_factory"))
+        assert kwargs["mode"] == "model"
+        assert kwargs["timeout"] == 60.0
         observed.append(scope.context)
         return _ProbePayload()
 
@@ -150,6 +154,162 @@ async def test_provider_probe_rpc_binds_synthetic_usage_scope(
     assert payload["ok"] is True
     assert observed[0].run_kind == "onboarding_probe"
     assert observed[0].session_id
+
+
+async def test_provider_probe_rpc_forwards_reachability_mode(
+    tmp_path, monkeypatch: Any
+) -> None:
+    captured: dict[str, Any] = {}
+
+    async def fake_probe_llm_provider(**kwargs: Any) -> _ProbePayload:
+        captured.update(kwargs)
+        return _ProbePayload()
+
+    monkeypatch.setattr(
+        "opensquilla.onboarding.probe.probe_llm_provider",
+        fake_probe_llm_provider,
+    )
+    ctx = _stored_openai_ctx(tmp_path)
+
+    payload = await rpc_onboarding._provider_probe(
+        {"providerId": "openai", "model": "gpt-4o", "mode": "reachability"},
+        ctx,
+    )
+
+    assert payload["ok"] is True
+    assert captured["mode"] == "reachability"
+    assert captured["timeout"] == 60.0
+
+
+async def test_primary_reachability_fallback_uses_saved_model_when_request_omits_it(
+    tmp_path,
+    monkeypatch: Any,
+) -> None:
+    request = httpx.Request("GET", "https://api.openai.com/v1/models")
+    response = httpx.Response(404, request=request)
+    selected_models: list[str] = []
+    calls: list[str] = []
+
+    class _Provider:
+        provider_name = "openai"
+
+        async def list_models(self, *, raise_on_error: bool = False) -> list[Any]:
+            calls.append("list")
+            raise httpx.HTTPStatusError(
+                "404 Not Found",
+                request=request,
+                response=response,
+            )
+
+        def chat(self, messages: Any, tools: Any = None, config: Any = None) -> Any:
+            calls.append("chat")
+
+            async def stream() -> Any:
+                yield DoneEvent()
+
+            return stream()
+
+    def build_provider(provider_id: str, model: str, **kwargs: Any) -> _Provider:
+        selected_models.append(model)
+        return _Provider()
+
+    monkeypatch.setattr("opensquilla.onboarding.probe.build_provider", build_provider)
+
+    payload = await rpc_onboarding._provider_probe(
+        {"providerId": "openai", "mode": "reachability"},
+        _stored_openai_ctx(tmp_path),
+    )
+
+    assert payload["ok"] is True
+    assert payload["verificationLevel"] == "model_verified"
+    assert selected_models == ["gpt-4o"]
+    assert calls == ["list", "chat"]
+
+
+@pytest.mark.parametrize("mode_fields", [{}, {"mode": None}])
+async def test_legacy_primary_probe_still_requires_an_explicit_model(
+    tmp_path,
+    mode_fields: dict[str, Any],
+) -> None:
+    with pytest.raises(RpcHandlerError, match="Model is required"):
+        await rpc_onboarding._provider_probe(
+            {"providerId": "openai", **mode_fields},
+            _stored_openai_ctx(tmp_path),
+        )
+
+
+async def test_reachability_only_result_does_not_update_model_probe_history(
+    tmp_path, monkeypatch: Any
+) -> None:
+    recorded: list[dict[str, Any]] = []
+
+    async def fake_probe_llm_provider(**kwargs: Any) -> ProviderProbeResult:
+        return ProviderProbeResult(
+            ok=True,
+            provider_id="openai",
+            model="gpt-4o",
+            verification_level="reachable",
+            failure_stage="reachability",
+        )
+
+    monkeypatch.setattr(
+        "opensquilla.onboarding.probe.probe_llm_provider",
+        fake_probe_llm_provider,
+    )
+    monkeypatch.setattr(
+        "opensquilla.onboarding.probe_history.record_probe",
+        lambda *args, **kwargs: recorded.append(dict(kwargs)),
+    )
+
+    payload = await rpc_onboarding._provider_probe(
+        {"providerId": "openai", "model": "gpt-4o", "mode": "reachability"},
+        _stored_openai_ctx(tmp_path),
+    )
+
+    assert payload["verificationLevel"] == "reachable"
+    assert recorded == []
+
+
+async def test_explicit_model_probe_is_diagnostic_but_legacy_probe_updates_history(
+    tmp_path, monkeypatch: Any
+) -> None:
+    recorded: list[dict[str, Any]] = []
+
+    async def fake_probe_llm_provider(**kwargs: Any) -> ProviderProbeResult:
+        return ProviderProbeResult(
+            ok=True,
+            provider_id="openai",
+            model="gpt-4o",
+        )
+
+    monkeypatch.setattr(
+        "opensquilla.onboarding.probe.probe_llm_provider",
+        fake_probe_llm_provider,
+    )
+    monkeypatch.setattr(
+        "opensquilla.onboarding.probe_history.record_probe",
+        lambda *args, **kwargs: recorded.append(dict(kwargs)),
+    )
+    ctx = _stored_openai_ctx(tmp_path)
+
+    await rpc_onboarding._provider_probe(
+        {"providerId": "openai", "model": "gpt-4o", "mode": "model"},
+        ctx,
+    )
+    assert recorded == []
+
+    await rpc_onboarding._provider_probe(
+        {"providerId": "openai", "model": "gpt-4o"},
+        ctx,
+    )
+    await rpc_onboarding._provider_probe(
+        {"providerId": "openai", "model": "gpt-4o", "mode": None},
+        ctx,
+    )
+    assert recorded == [
+        {"ok": True, "failure_kind": ""},
+        {"ok": True, "failure_kind": ""},
+    ]
 
 
 async def test_provider_probe_rpc_reuses_stored_base_url_and_proxy_when_blank(
