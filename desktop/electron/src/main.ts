@@ -6531,6 +6531,7 @@ function onboardingHtml(
             </div>
           </div>
         </section>
+        <div class="error" id="error" role="alert" aria-live="assertive" tabindex="-1"></div>
         <p class="telemetry-notice" data-i18n="onboarding.telemetry.notice">${ot('onboarding.telemetry.notice')}</p>
         </div>
         <footer class="actions">
