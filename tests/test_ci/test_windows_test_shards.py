@@ -418,8 +418,15 @@ def _function_decorators(path: Path, function_name: str) -> set[str]:
     raise AssertionError(f"missing test function: {path}:{function_name}")
 
 
-def test_windows_shell_process_runtime_is_marked_ci_serial() -> None:
-    path = Path("tests/test_sandbox/test_windows_shell_process_runtime.py")
+@pytest.mark.parametrize(
+    "test_file",
+    [
+        "tests/test_sandbox/test_windows_shell_process_runtime.py",
+        "tests/test_scripts/test_gateway_ux.py",
+    ],
+)
+def test_windows_process_harnesses_are_marked_ci_serial(test_file: str) -> None:
+    path = Path(test_file)
     parsed = ast.parse(path.read_text(encoding="utf-8"))
 
     assert any(

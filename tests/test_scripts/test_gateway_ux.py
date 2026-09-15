@@ -11,6 +11,10 @@ from pathlib import Path
 
 import pytest
 
+# PowerShell cold starts and native process trees share the hosted runner's
+# process budget. Keep their deadlines independent of the parallel worker pool.
+pytestmark = pytest.mark.ci_serial
+
 SCRIPT = Path(__file__).resolve().parents[2] / "scripts/test_gateway_ux.ps1"
 
 
