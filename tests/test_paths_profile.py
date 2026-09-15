@@ -8,6 +8,7 @@ from opensquilla.paths import (
     default_opensquilla_home,
     default_profile_name,
     default_profiles_root,
+    desktop_profile_lifecycle_active,
     is_valid_profile_name,
     profile_home,
     state_dir,
@@ -42,6 +43,39 @@ _INVALID_NAMES = [
     "name'quote",
     'name"quote',
 ]
+
+
+@pytest.mark.parametrize(
+    ("profile_kind", "desktop_env", "expected"),
+    [
+        (None, None, False),
+        ("desktop-primary", None, True),
+        ("desktop-recovery", "0", True),
+        (" Desktop-Primary ", "false", True),
+        ("cli", "1", False),
+        ("unknown", "yes", False),
+        (None, "1", True),
+        (None, "true", True),
+        (None, "yes", True),
+        (None, "on", True),
+        (" ", " TRUE ", True),
+        (None, "0", False),
+        (None, "false", False),
+    ],
+)
+def test_desktop_profile_lifecycle_selection(
+    monkeypatch, profile_kind, desktop_env, expected
+) -> None:
+    for key, value in (
+        ("OPENSQUILLA_PROFILE_KIND", profile_kind),
+        ("OPENSQUILLA_DESKTOP", desktop_env),
+    ):
+        if value is None:
+            monkeypatch.delenv(key, raising=False)
+        else:
+            monkeypatch.setenv(key, value)
+
+    assert desktop_profile_lifecycle_active() is expected
 
 
 @pytest.mark.parametrize("name", _VALID_NAMES)

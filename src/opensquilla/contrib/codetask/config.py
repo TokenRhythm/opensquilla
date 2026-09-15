@@ -12,7 +12,7 @@ import sys
 import tempfile
 from pathlib import Path
 
-from opensquilla.paths import default_opensquilla_home
+from opensquilla.paths import default_opensquilla_home, desktop_profile_lifecycle_active
 
 # ---------------------------------------------------------------------------
 # Agent defaults for long-running repository tasks
@@ -85,8 +85,6 @@ def storage_root() -> Path:
     actual child Agent retains its existing disposable scratch profile.
     Standalone CLI installations keep their historical paths.
     """
-    from opensquilla.cli.gateway_lifecycle import desktop_profile_lifecycle_active
-
     home = default_opensquilla_home()
     if desktop_profile_lifecycle_active():
         home = home.expanduser().resolve()

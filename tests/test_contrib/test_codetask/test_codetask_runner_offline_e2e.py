@@ -17,6 +17,7 @@ from opensquilla.contrib.codetask.types import AgentOutcome, TaskState
 from opensquilla.paths import default_opensquilla_home
 from opensquilla.recovery.errors import ProfileLockBusyError
 from opensquilla.recovery.locking import ProfileOperationLock
+from opensquilla.runtime_packs import get_runtime_pack_service
 
 
 class _OfflineAdapter:
@@ -103,14 +104,32 @@ def test_desktop_scratch_runner_works_while_primary_profile_is_locked(monkeypatc
     config_path = desktop_home / "config.toml"
     config_path.write_text('[llm]\nprovider="ollama"\nmodel="offline-model"\n')
     (desktop_home / "existing.txt").write_text("synthetic existing data")
+    nested_data = desktop_home / "existing-data" / "nested"
+    nested_data.mkdir(parents=True)
+    (nested_data / "original.txt").write_bytes(b"synthetic nested data")
     monkeypatch.setenv("OPENSQUILLA_STATE_DIR", str(desktop_home))
     monkeypatch.setenv("OPENSQUILLA_PROFILE_KIND", "desktop-primary")
     monkeypatch.setenv("OPENSQUILLA_DESKTOP", "1")
     monkeypatch.setenv("OPENSQUILLA_GATEWAY_CONFIG_PATH", str(config_path))
     monkeypatch.setenv("OPENSQUILLA_USER_STATE_DIR", str(tmp_path / "user-state"))
+    monkeypatch.delenv("OPENSQUILLA_GATEWAY_STATE_DIR", raising=False)
+    monkeypatch.delenv("OPENSQUILLA_RUNTIME_PACKS_ROOT", raising=False)
     monkeypatch.delenv("OPENSQUILLA_CODETASK_RUNS_DIR", raising=False)
     monkeypatch.setenv("OPENSQUILLA_CODETASK_SCRATCH_DIR", str(tmp_path / "scratch"))
-    before = {p.relative_to(desktop_home): p.read_bytes() for p in desktop_home.rglob("*")}
+    # Separate first-time Runtime Pack initialization from code-task writes:
+    # Windows Git/Bash discovery initializes it even when selecting a host tool.
+    runtime_service = get_runtime_pack_service()
+    assert runtime_service.root == desktop_home / "state" / "runtime-packs" / "v1"
+
+    def profile_snapshot() -> dict[Path, bytes | None]:
+        # Directory entries stay in the snapshot so new directories also fail
+        # the final comparison instead of being silently omitted.
+        return {
+            path.relative_to(desktop_home): None if path.is_dir() else path.read_bytes()
+            for path in desktop_home.rglob("*")
+        }
+
+    before = profile_snapshot()
 
     class _DesktopAdapter(_OfflineAdapter):
         def run(self, prompt, *, repo, scratch_dir, artifact_dir):
@@ -140,7 +159,7 @@ def test_desktop_scratch_runner_works_while_primary_profile_is_locked(monkeypatc
     assert Path(result.artifact_dir) == desktop_home.with_name("profile-code-task") / (
         "code-task/desktop-scratch"
     )
-    after = {p.relative_to(desktop_home): p.read_bytes() for p in desktop_home.rglob("*")}
+    after = profile_snapshot()
     assert after == before
 
 
