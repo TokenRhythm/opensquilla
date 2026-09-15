@@ -515,7 +515,8 @@ jobs:
             -CandidateInstaller $candidates[0].FullName `
             -Label "reused-$env:BASELINE_VERSION-$env:INSTALL_MODE" `
             -InstallMode $env:INSTALL_MODE `
-            -BaselineVersion $env:BASELINE_VERSION
+            -BaselineVersion $env:BASELINE_VERSION `
+            -VerifyInterruptedUpgrade
       - name: Upload isolated Windows upgrade diagnostics
         if: always()
         uses: actions/upload-artifact@v4

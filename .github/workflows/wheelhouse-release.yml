@@ -1558,8 +1558,8 @@ jobs:
           BASELINE_VERSION: ${{ matrix.baseline-version }}
         run: |
           $ErrorActionPreference = 'Stop'
-          # This gate covers pre-handoff failure isolation and a successful normal NSIS
-          # handoff. It does not claim transactional rollback after the old uninstaller starts.
+          # This gate covers pre-handoff failure isolation, an interrupted NSIS rollback,
+          # and a successful normal NSIS handoff. The historical preview path does not claim transactional rollback.
           $candidates = @(Get-ChildItem 'release-audit/OpenSquilla-*-win-x64.exe' -File)
           if ($candidates.Count -ne 1) {
             throw "Expected exactly one downloaded Windows installer; got $($candidates.Count)."
@@ -1569,7 +1569,8 @@ jobs:
             -Label "downloaded-asset-$env:INSTALL_MODE" `
             -RealUpdateChannelManifest updater-rehearsal/channel-manifest.json `
             -InstallMode $env:INSTALL_MODE `
-            -BaselineVersion $env:BASELINE_VERSION
+            -BaselineVersion $env:BASELINE_VERSION `
+            -VerifyInterruptedUpgrade
 
       - name: Verify preview Windows installer replacement compatibility
         if: ${{ needs.prestage-draft-updater-assets.outputs.prerelease == 'true' }}
@@ -1648,4 +1649,5 @@ jobs:
             -CandidateInstaller $candidates[0].FullName `
             -Label "internal-$env:BASELINE_VERSION-$env:INSTALL_MODE" `
             -InstallMode $env:INSTALL_MODE `
-            -BaselineVersion $env:BASELINE_VERSION
+            -BaselineVersion $env:BASELINE_VERSION `
+            -VerifyInterruptedUpgrade

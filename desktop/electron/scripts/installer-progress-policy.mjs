@@ -2,6 +2,9 @@ import { lstat, readFile } from 'node:fs/promises'
 import { join, resolve } from 'node:path'
 
 export const INSTALLER_PROGRESS_INCLUDE = 'scripts/nsis/installer-progress.nsh'
+export const INSTALLER_TEMPLATE = 'scripts/nsis/installer.nsh'
+export const INSTALLER_RECOVERY_INCLUDE = 'scripts/nsis/installer-recovery.nsh'
+export const INSTALLER_RECOVERY_HELPER = 'scripts/nsis/installer-recovery.ps1'
 
 const REQUIRED_INCLUDES = ['LogicLib.nsh', 'nsDialogs.nsh', 'WinMessages.nsh']
 const REQUIRED_FRAGMENTS = [
@@ -23,6 +26,7 @@ const REQUIRED_FRAGMENTS = [
 
 const ALLOWED_SOURCE_LINES = [
   /^!include\s+"[^"]+"$/,
+  /^!addincludedir\s+"[^"]+"$/i,
   /^!ifndef\s+[A-Z0-9_.]+$/i,
   /^!endif$/,
   /^!define(?:\s+\/ifndef)?\s+[A-Z0-9_.]+\s+.+$/i,
@@ -152,5 +156,24 @@ export async function verifyInstallerProgressPolicy(packageRoot, packageJson) {
 
   const source = await readFile(includePath, 'utf8')
   failures.push(...validateInstallerProgressSource(source))
+
+  const scriptPath = resolve(packageRoot, INSTALLER_TEMPLATE)
+  if (!(await pathIsFile(scriptPath))) {
+    failures.push(`custom NSIS installer template is missing at ${scriptPath}`)
+  } else {
+    const script = await readFile(scriptPath, 'utf8')
+    for (const fragment of [
+      '!include "installer-recovery.nsh"',
+      '!include "extractAppPackage.nsh"',
+    ]) {
+      if (!script.includes(fragment)) failures.push(`custom NSIS script is missing recovery contract: ${fragment}`)
+    }
+  }
+
+  for (const relativePath of [INSTALLER_RECOVERY_INCLUDE, INSTALLER_RECOVERY_HELPER]) {
+    if (!(await pathIsFile(resolve(packageRoot, relativePath)))) {
+      failures.push(`NSIS recovery resource is missing at ${resolve(packageRoot, relativePath)}`)
+    }
+  }
   return failures
 }

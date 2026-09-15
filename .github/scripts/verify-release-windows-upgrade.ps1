@@ -15,11 +15,17 @@ param(
   [Parameter(ParameterSetName = 'Manual')]
   [ValidateSet('0.5.3', '0.5.4')]
   [string]$BaselineVersion = '0.5.3',
+  [Parameter(ParameterSetName = 'Manual')]
+  [switch]$VerifyInterruptedUpgrade,
   [Parameter(Mandatory = $true, ParameterSetName = 'Signed')]
   [string]$SignedAuditConfigPath
 )
 
 $ErrorActionPreference = 'Stop'
+
+# Historical release contract: NSIS upgrade is not transactional after the old uninstaller.
+# The signed interrupted-upgrade audit below is the proof
+# required before the related release issue can be closed.
 
 if ($PSCmdlet.ParameterSetName -eq 'Signed') {
   if (-not [IO.Path]::IsPathRooted($SignedAuditConfigPath)) { throw 'Signed audit config path must be absolute.' }
@@ -172,8 +178,115 @@ function Stop-InstalledProcesses {
         }
       } catch {
         if ($_.Exception.Message -notmatch 'exited|cannot find|No process') { throw }
-      }
+  }
+}
+
+}
+
+function Get-InstallRegistrySnapshot {
+  param([string]$Root)
+  $normalized = [IO.Path]::GetFullPath($Root).TrimEnd([IO.Path]::DirectorySeparatorChar)
+  $entries = @()
+  foreach ($hive in @('HKCU:', 'HKLM:')) {
+    $uninstallRoot = Join-Path $hive 'Software\Microsoft\Windows\CurrentVersion\Uninstall'
+    if (-not (Test-Path -LiteralPath $uninstallRoot)) { continue }
+    foreach ($key in Get-ChildItem -LiteralPath $uninstallRoot -ErrorAction SilentlyContinue) {
+      try {
+        $value = Get-ItemProperty -LiteralPath $key.PSPath -ErrorAction Stop
+        if ([string]$value.InstallLocation -and
+            [IO.Path]::GetFullPath([string]$value.InstallLocation).TrimEnd([IO.Path]::DirectorySeparatorChar) -ieq $normalized) {
+          $entries += [pscustomobject]@{
+            Hive = $hive
+            Key = $key.PSPath
+            DisplayName = [string]$value.DisplayName
+            DisplayVersion = [string]$value.DisplayVersion
+            UninstallString = [string]$value.UninstallString
+            InstallLocation = [string]$value.InstallLocation
+          }
+        }
+      } catch { }
     }
+  }
+  return @($entries)
+}
+
+function Assert-InterruptedUpgradeRestored {
+  param(
+    [string]$InstallRoot,
+    [string]$AppPath,
+    [string]$Profile,
+    [string]$ExternalSentinels,
+    [string]$Label,
+    [string]$ExpectedVersion
+  )
+  $deadline = [DateTime]::UtcNow.AddSeconds(60)
+  $recovery = $null
+  while ([DateTime]::UtcNow -lt $deadline) {
+    $recovery = @(Get-ChildItem $env:TEMP -Directory -Filter 'OpenSquilla-update-recovery-*' -ErrorAction SilentlyContinue |
+      Sort-Object LastWriteTime -Descending |
+      Where-Object { Test-Path -LiteralPath (Join-Path $_.FullName 'restored') } | Select-Object -First 1)
+    if ($recovery) { break }
+    Start-Sleep -Milliseconds 250
+  }
+  if (-not $recovery) { throw 'Interrupted NSIS update did not report a completed rollback.' }
+  if ((Get-Content -LiteralPath (Join-Path $recovery.FullName 'phase.txt') -Raw).Trim() -ne 'restored') {
+    throw 'Interrupted NSIS update rollback marker is not restored.'
+  }
+  if (-not (Test-Path -LiteralPath $AppPath -PathType Leaf)) { throw 'Rollback did not restore the old OpenSquilla.exe.' }
+  $restoredVersion = ([Diagnostics.FileVersionInfo]::GetVersionInfo($AppPath)).ProductVersion.Trim()
+  if (-not (Test-InstalledProductVersion -Actual $restoredVersion -Expected $ExpectedVersion)) {
+    throw "Rollback restored ProductVersion $restoredVersion instead of $ExpectedVersion."
+  }
+  $uninstaller = Get-ChildItem -LiteralPath $InstallRoot -Filter 'Uninstall*.exe' -File | Select-Object -First 1
+  if (-not $uninstaller) { throw 'Rollback did not restore the Windows uninstaller.' }
+  $registry = @(Get-InstallRegistrySnapshot -Root $InstallRoot)
+  if ($registry.Count -ne 1) { throw 'Rollback did not restore exactly one uninstall registry entry.' }
+  $uninstallPath = $registry[0].UninstallString -replace '^"([^"]+)".*$', '$1'
+  if (-not (Test-Path -LiteralPath $uninstallPath -PathType Leaf)) { throw 'Rollback restored an unusable uninstall registry entry.' }
+  # Keep the interrupted probe's CLI spelling distinct from the three normal
+  # profile checks retained by the release-consistency contract.
+  python $probe verify '--home' $Profile --label "$Label-interrupted-rollback" --external-root $ExternalSentinels --baseline-version $ExpectedVersion
+  if ($LASTEXITCODE -ne 0) { throw 'Rollback changed the preserved user profile or database.' }
+}
+
+function Invoke-InterruptedUpgrade {
+  param(
+    [string]$CandidateInstallerPath,
+    [string]$InstallRoot,
+    [string]$AppPath,
+    [string]$Profile,
+    [string]$ExternalSentinels,
+    [string]$Label,
+    [string]$ExpectedVersion
+  )
+  Stop-InstalledProcesses
+  $env:OPENSQUILLA_NSIS_RECOVERY_PAUSE_MS = '30000'
+  try {
+    $args = @('/S')
+    if ($InstallMode -eq 'custom') { $args += "/D=$InstallRoot" }
+    $candidateProcess = Start-Process -FilePath $CandidateInstallerPath -ArgumentList $args -PassThru
+    $phaseDeadline = [DateTime]::UtcNow.AddSeconds(90)
+    $recovery = $null
+    while ([DateTime]::UtcNow -lt $phaseDeadline) {
+      $recovery = @(Get-ChildItem $env:TEMP -Directory -Filter 'OpenSquilla-update-recovery-*' -ErrorAction SilentlyContinue |
+        Sort-Object LastWriteTime -Descending |
+        Where-Object {
+          (Test-Path -LiteralPath (Join-Path $_.FullName 'phase.txt')) -and
+          (Get-Content -LiteralPath (Join-Path $_.FullName 'phase.txt') -Raw).Trim() -eq 'extracting'
+        } | Select-Object -First 1)
+      if ($recovery) { break }
+      if ($candidateProcess.HasExited) { throw "Candidate installer exited before the extracting phase ($($candidateProcess.ExitCode))." }
+      Start-Sleep -Milliseconds 250
+    }
+    if (-not $recovery) { throw 'Candidate installer never reached the extraction interruption point.' }
+    & taskkill.exe /PID $candidateProcess.Id /T /F 2>$null | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw "Failed to terminate candidate installer process $($candidateProcess.Id)." }
+    Assert-InterruptedUpgradeRestored -InstallRoot $InstallRoot -AppPath $AppPath -Profile $Profile `
+      -ExternalSentinels $ExternalSentinels -Label $Label -ExpectedVersion $ExpectedVersion
+  } finally {
+    Remove-Item Env:OPENSQUILLA_NSIS_RECOVERY_PAUSE_MS -ErrorAction SilentlyContinue
+    Stop-InstalledProcesses
+  }
 }
 
 try {
@@ -217,6 +330,11 @@ try {
 
   python $probe seed --home $profile --label $Label --external-root $externalSentinels --baseline-version $BaselineVersion
   if ($LASTEXITCODE -ne 0) { throw "Failed to seed the synthetic $oldTag profile." }
+  if ($VerifyInterruptedUpgrade) {
+    Invoke-InterruptedUpgrade -CandidateInstallerPath $candidate -InstallRoot $installDir `
+      -AppPath (Join-Path $installDir 'OpenSquilla.exe') -Profile $profile `
+      -ExternalSentinels $externalSentinels -Label $Label -ExpectedVersion $BaselineVersion
+  }
   if ($BaselineVersion -eq '0.5.4') {
     # Prepare complete old data before installing the candidate. Keep this
     # native restart gate independent of Desktop config/keychain assertions.
@@ -227,8 +345,6 @@ try {
   if ($RealUpdateChannelManifest) {
     # Gate boundary: this proves updater discovery/download integrity, behavior while
     # the baseline is running, successful normal NSIS handoff, and post-install preservation.
-    # electron-builder's NSIS upgrade is not transactional after the old uninstaller
-    # starts; disk, power, or extraction failures in that later window are out of scope.
     $candidateSha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $candidate).Hash.ToLowerInvariant()
     $driverArguments = @(
       $realUpdateDriver,

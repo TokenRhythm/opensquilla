@@ -8,7 +8,10 @@ import { fileURLToPath } from 'node:url'
 import { loadNsisTooling } from './prepare-installer-tooling.mjs'
 
 import {
+  INSTALLER_RECOVERY_HELPER,
+  INSTALLER_RECOVERY_INCLUDE,
   INSTALLER_PROGRESS_INCLUDE,
+  INSTALLER_TEMPLATE,
   validateInstallerProgressSource,
   verifyInstallerProgressPolicy,
 } from './installer-progress-policy.mjs'
@@ -18,11 +21,22 @@ const packageRoot = resolve(scriptDir, '..')
 const packageJson = JSON.parse(await readFile(join(packageRoot, 'package.json'), 'utf8'))
 const includePath = resolve(packageRoot, INSTALLER_PROGRESS_INCLUDE)
 const includeSource = await readFile(includePath, 'utf8')
+const customScriptSource = await readFile(resolve(packageRoot, INSTALLER_TEMPLATE), 'utf8')
+const recoveryIncludeSource = await readFile(resolve(packageRoot, INSTALLER_RECOVERY_INCLUDE), 'utf8')
+const recoveryHelperSource = await readFile(resolve(packageRoot, INSTALLER_RECOVERY_HELPER), 'utf8')
 const appBuilderLib = join(packageRoot, 'node_modules', 'app-builder-lib')
 const assistedInstallerSource = await readFile(join(appBuilderLib, 'templates', 'nsis', 'assistedInstaller.nsh'), 'utf8')
-const installSectionSource = await readFile(join(appBuilderLib, 'templates', 'nsis', 'installSection.nsh'), 'utf8')
+const installSectionSource = await readFile(join(packageRoot, 'scripts', 'nsis', 'installSection.nsh'), 'utf8')
 
 assert.deepEqual(await verifyInstallerProgressPolicy(packageRoot, packageJson), [])
+assert.ok(customScriptSource.includes('installer-recovery.nsh'))
+assert.ok(includeSource.includes('!addincludedir "${PROJECT_DIR}\\scripts\\nsis"'))
+for (const fragment of ['OpenSquillaPrepareUpdateRecovery', 'OpenSquillaCommitUpdateRecovery', 'OpenSquillaMarkUpdateRecoveryPhase', 'OpenSquillaRecoveryPauseIfRequested']) {
+  assert.ok(recoveryIncludeSource.includes(fragment), `recovery include is missing ${fragment}`)
+}
+for (const fragment of ['robocopy.exe', 'Wait-ForParentExit', 'restored', 'reg.exe']) {
+  assert.ok(recoveryHelperSource.includes(fragment), `recovery helper is missing ${fragment}`)
+}
 assert.ok(
   validateInstallerProgressSource(`${includeSource}\nDelete "$TEMP\\unexpected"`).some((failure) =>
     failure.includes('forbidden file-system mutation'),
@@ -70,6 +84,14 @@ assert.ok(installApplicationFilesIndex >= 0, 'electron-builder installApplicatio
 assert.ok(
   installApplicationFilesIndex < customInstallIndex,
   'customInstall must remain after electron-builder installs application files',
+)
+assert.ok(
+  installSectionSource.indexOf('OpenSquillaPrepareUpdateRecovery') < installSectionSource.indexOf('!insertmacro uninstallOldVersion'),
+  'recovery backup must be prepared before the old uninstaller starts',
+)
+assert.ok(
+  installSectionSource.indexOf('OpenSquillaCommitUpdateRecovery') > customInstallIndex,
+  'recovery commit must happen after the application files and registry are written',
 )
 
 function nsisPath(path) {
