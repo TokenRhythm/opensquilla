@@ -551,6 +551,96 @@ async def test_apply_patch_context_drift_still_rejects_real_mismatch(
 
 
 @pytest.mark.asyncio
+async def test_apply_patch_relocates_hunk_after_insertion_above_context(
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / "src" / "feature.py"
+    target.parent.mkdir()
+    # A blank line was inserted above the hunk window after the patch was
+    # authored: the context block stays contiguous but shifts down one line.
+    target.write_text("intro = 0\n\nvalue = 1\nname = 'a'\n", encoding="utf-8")
+    token = current_tool_context.set(ToolContext(workspace_dir=str(tmp_path)))
+    apply_patch = _original_async(patch_tool.apply_patch)
+    try:
+        result = await apply_patch(
+            """*** Begin Patch
+*** Update File: src/feature.py
+@@ -2,2 +2,2 @@
+-value = 1
++value = 2
+ name = 'a'
+*** End Patch"""
+        )
+    finally:
+        current_tool_context.reset(token)
+
+    assert "1 file(s) modified" in result
+    assert target.read_text(encoding="utf-8") == "intro = 0\n\nvalue = 2\nname = 'a'\n"
+
+
+@pytest.mark.asyncio
+async def test_apply_patch_relocates_hunk_after_removal_above_context(
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / "src" / "feature.py"
+    target.parent.mkdir()
+    # A line above the hunk window was removed after the patch was authored:
+    # the context block stays contiguous but shifts up one line.
+    target.write_text("value = 1\nname = 'a'\n", encoding="utf-8")
+    token = current_tool_context.set(ToolContext(workspace_dir=str(tmp_path)))
+    apply_patch = _original_async(patch_tool.apply_patch)
+    try:
+        result = await apply_patch(
+            """*** Begin Patch
+*** Update File: src/feature.py
+@@ -2,2 +2,2 @@
+-value = 1
++value = 2
+ name = 'a'
+*** End Patch"""
+        )
+    finally:
+        current_tool_context.reset(token)
+
+    assert "1 file(s) modified" in result
+    assert target.read_text(encoding="utf-8") == "value = 2\nname = 'a'\n"
+
+
+@pytest.mark.asyncio
+async def test_apply_patch_relocation_prefers_nearest_match(
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / "src" / "feature.py"
+    target.parent.mkdir()
+    # The context block appears twice: once one line below the declared
+    # anchor and once further down. Relocation must pick the nearest one.
+    target.write_text(
+        "head = 0\n\nvalue = 1\nname = 'a'\ntail = 0\nvalue = 1\nname = 'a'\n",
+        encoding="utf-8",
+    )
+    token = current_tool_context.set(ToolContext(workspace_dir=str(tmp_path)))
+    apply_patch = _original_async(patch_tool.apply_patch)
+    try:
+        result = await apply_patch(
+            """*** Begin Patch
+*** Update File: src/feature.py
+@@ -2,2 +2,2 @@
+-value = 1
++value = 2
+ name = 'a'
+*** End Patch"""
+        )
+    finally:
+        current_tool_context.reset(token)
+
+    assert "1 file(s) modified" in result
+    assert (
+        target.read_text(encoding="utf-8")
+        == "head = 0\n\nvalue = 2\nname = 'a'\ntail = 0\nvalue = 1\nname = 'a'\n"
+    )
+
+
+@pytest.mark.asyncio
 async def test_apply_patch_allows_workspace_under_sensitive_parent(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
