@@ -815,6 +815,7 @@
       "tests/test_observability/test_decision_log_cost_source.py",
       "tests/test_observability/test_decision_log_skills_invoked.py",
       "tests/test_observability/test_install_telemetry.py",
+      "tests/test_observability/test_log_privacy.py",
       "tests/test_observability/test_network_policy.py",
       "tests/test_observability/test_prompt_report.py",
       "tests/test_observability/test_redact.py",

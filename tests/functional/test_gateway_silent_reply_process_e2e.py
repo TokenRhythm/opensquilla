@@ -34,6 +34,7 @@ _MODEL = "e2e/silent-reply"
 _FIRST_VISIBLE = "VISIBLE_FIRST"
 _SILENT_SENTINEL = "NO_REPLY"
 _THIRD_VISIBLE = "VISIBLE_THIRD"
+_OBJECTIVE = "Exercise automatic Goal continuation."
 _SERVER_MODE_ENV = "OPENSQUILLA_SILENT_REPLY_E2E_SERVER"
 
 
@@ -357,7 +358,7 @@ async def test_real_gateway_suppresses_goal_sentinel_everywhere(
             "goals.set",
             {
                 "sessionKey": session_key,
-                "objective": "Exercise automatic Goal continuation.",
+                "objective": _OBJECTIVE,
                 "clientRequestId": str(uuid.uuid4()),
                 "clientMessageId": str(uuid.uuid4()),
             },
@@ -484,6 +485,17 @@ async def test_real_gateway_suppresses_goal_sentinel_everywhere(
     assert _SILENT_SENTINEL not in json.dumps(raw_rows, ensure_ascii=False)
     raw_assistant_text = [content for role, content, _tools in raw_rows if role == "assistant"]
     assert raw_assistant_text == [_FIRST_VISIBLE, _THIRD_VISIBLE]
+
+    # Public delivery and canonical persistence keep their full content, but
+    # ordinary diagnostics must not create a second copy of the conversation.
+    logs = tmp_path / "logs"
+    assert list(logs.glob("decisions-*.jsonl"))
+    assert (logs / "debug.log").is_file()
+    assert not list(logs.glob("turn-calls-*.jsonl"))
+    for path in (gateway_log, *logs.glob("*.log*"), *logs.glob("*.jsonl")):
+        text = path.read_text(encoding="utf-8")
+        for content in (_OBJECTIVE, _FIRST_VISIBLE, _THIRD_VISIBLE):
+            assert content not in text, f"conversation content leaked through {path.name}"
 
 
 if __name__ == "__main__" and os.environ.get(_SERVER_MODE_ENV) == "1":

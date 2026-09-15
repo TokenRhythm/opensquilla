@@ -915,6 +915,7 @@
     "tests/test_observability/test_decision_log_cost_source.py": 0.01,
     "tests/test_observability/test_decision_log_skills_invoked.py": 0.036,
     "tests/test_observability/test_install_telemetry.py": 0.926,
+    "tests/test_observability/test_log_privacy.py": 0.01,
     "tests/test_observability/test_network_policy.py": 0.134,
     "tests/test_observability/test_prompt_report.py": 0.01,
     "tests/test_observability/test_redact.py": 0.031,

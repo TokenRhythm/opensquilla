@@ -26,6 +26,8 @@ from typing import Any
 
 import structlog
 
+from opensquilla.observability.log_privacy import private_log_event
+
 _CLI_DEFAULT: tuple[Any, Any] | None = None
 
 
@@ -49,6 +51,12 @@ def configure_cli_structlog() -> None:
     wrapper_class = structlog.make_filtering_bound_logger(logging.WARNING)
     logger_factory = _StderrPrintLoggerFactory()
     structlog.configure(
+        processors=[
+            structlog.contextvars.merge_contextvars,
+            structlog.processors.add_log_level,
+            private_log_event,
+            structlog.dev.ConsoleRenderer(),
+        ],
         wrapper_class=wrapper_class,
         logger_factory=logger_factory,
         cache_logger_on_first_use=False,
