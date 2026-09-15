@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Opt-in reasoning replay check through Agent, finalizer, and reopened SQLite.
+"""Opt-in reasoning replay and suffix compaction checks through reopened SQLite.
 
 Only synthetic prompts and pure tools are used. Native response/request data
 stays in memory; the public report contains counts and boolean assertions only.
 Run one provider per process with credentials supplied in its registry env var.
+Compaction variants have fixed physical generation limits and disable automatic retries.
 """
 
 from __future__ import annotations
@@ -12,6 +13,7 @@ import argparse
 import asyncio
 import contextlib
 import copy
+import hashlib
 import io
 import json
 import logging
@@ -31,6 +33,7 @@ sys.path.insert(0, str(REPO_ROOT))
 
 import httpx  # noqa: E402
 
+from opensquilla.engine.cache_break_monitor import add_compaction_listener  # noqa: E402
 from opensquilla.engine.runtime import TurnRunner  # noqa: E402
 from opensquilla.gateway.config import GatewayConfig  # noqa: E402
 from opensquilla.provider import ModelCapabilities  # noqa: E402
@@ -80,6 +83,25 @@ TOKENRHYTHM_TOOL_REASONING_MODELS = frozenset(
     {"deepseek-v4-flash", "deepseek-v4-flash-0731", "deepseek-v4-pro", "deepseek-v4-pro-0813"}
 )
 THINKING_CHOICES = ("default", "off", "minimal", "low", "medium", "high", "xhigh", "adaptive")
+COMPACTION_VARIANTS = (
+    "basic", "tools", "replay_off", "model_switch", "repeated", "truncated", "long_reasoning",
+)
+COMPACTION_CALL_LIMITS = {
+    "basic": 3, "tools": 4, "replay_off": 4, "model_switch": 3,
+    "repeated": 5, "truncated": 3, "long_reasoning": 3,
+}
+COMPACTION_FIRST_PROMPT = (
+    "This is a synthetic memory test. Invent a new label of exactly eight lowercase letters. "
+    "Reply only COMPACTION_LABEL=<your label>. Keep that label as the durable fact for the "
+    "next turn. Do not use tools."
+)
+COMPACTION_TAIL_MARKER = "SYNTHETIC_COMPACTION_CURRENT_TAIL"
+COMPACTION_SOURCE_MARKER = "SYNTHETIC_COMPACTION_OLD_HISTORY"
+COMPACTION_ENTRY_PATTERN = r"SYNTHETIC_COMPACTION_ENTRY_[0-9]+_(?:USER|ASSISTANT)"
+COMPACTION_PADDING = (
+    "This is disposable synthetic background prose about arranging colored paper on a table. "
+    "It contains no task requirements and can be summarized in a single short sentence. "
+)
 
 
 class ReplayCheckError(RuntimeError):
@@ -318,9 +340,16 @@ class _ObservedStream(httpx.AsyncByteStream):
 
 
 class WireObserver:
-    def __init__(self, endpoint: str, transport: httpx.AsyncBaseTransport | None = None):
+    def __init__(
+        self,
+        endpoint: str,
+        transport: httpx.AsyncBaseTransport | None = None,
+        *,
+        max_calls: int | None = None,
+    ):
         self.endpoint = endpoint.rstrip("/")
         self.transport = transport
+        self.max_calls = max_calls
         self.calls: list[WireCall] = []
         self.engine_error_codes: list[str] = []
         self.replay_checks: dict[str, Any] = {}
@@ -332,6 +361,10 @@ class WireObserver:
         async def send(client: httpx.AsyncClient, request: httpx.Request, **kwargs: Any):
             observed = str(request.url).startswith(self.endpoint + "/")
             if observed and request.url.path.endswith("/chat/completions"):
+                _require(
+                    self.max_calls is None or len(self.calls) < self.max_calls,
+                    "physical_model_call_limit",
+                )
                 call = WireCall(request=json.loads(request.content))
                 self.calls.append(call)
                 if self.transport is None:
@@ -613,12 +646,33 @@ def _usage_report(calls: list[WireCall]) -> dict[str, Any]:
         return float(value) if isinstance(value, (float, int)) else 0.0
 
     costs = [numeric(call.usage["cost"]) for call in calls if "cost" in call.usage]
+
+    def usage_detail(call: WireCall, detail: str, name: str, legacy: str = "") -> int | None:
+        details = call.usage.get(detail)
+        value = details.get(name) if isinstance(details, dict) else None
+        if value is None and legacy:
+            value = call.usage.get(legacy)
+        return int(value) if type(value) in (int, float) else None
+
+    cached = [
+        usage_detail(call, "prompt_tokens_details", "cached_tokens", "prompt_cache_hit_tokens")
+        for call in calls
+    ]
+    reasoning = [
+        usage_detail(call, "completion_tokens_details", "reasoning_tokens") for call in calls
+    ]
     return {
         "model_calls": len(calls),
         "input_tokens": sum(int(numeric(call.usage.get("prompt_tokens"))) for call in calls),
         "output_tokens": sum(int(numeric(call.usage.get("completion_tokens"))) for call in calls),
         "provider_reported_cost_usd": sum(costs) if costs else None,
         "cost_reported": bool(costs),
+        "cached_input_tokens_by_call": cached,
+        "reasoning_tokens_by_call": reasoning,
+        "cached_input_tokens": sum(value for value in cached if value is not None)
+        if any(value is not None for value in cached) else None,
+        "reasoning_tokens": sum(value for value in reasoning if value is not None)
+        if any(value is not None for value in reasoning) else None,
         "last_http_status": calls[-1].status_code if calls else None,
     }
 
@@ -689,6 +743,12 @@ def _wire_diagnostics(observer: WireObserver) -> dict[str, Any]:
 
     return {
         "engine_error_codes": list(observer.engine_error_codes),
+        "request_models_by_call": [
+            model if isinstance(model := call.request.get("model"), str)
+            and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:/+-]{0,199}", model)
+            else "invalid"
+            for call in observer.calls
+        ],
         **observer.replay_checks,
         "calls": [
             {
@@ -725,6 +785,629 @@ def _wire_diagnostics(observer: WireObserver) -> dict[str, Any]:
     }
 
 
+def _compaction_generated_label(content: str) -> str | None:
+    # The memory check needs a new, unambiguous fact, not exact compliance
+    # with the fixture's preferred label length or formatting.
+    match = re.search(r"\bCOMPACTION_LABEL\s*[:=]\s*[`\"']?([A-Za-z0-9_-]{4,64})\b", content)
+    return match.group(1) if match else None
+
+
+def _canonical_message_digests(entries: list[Any]) -> dict[str, str]:
+    """Compare archived bodies, not only identities; never publish synthetic content."""
+    fields = (
+        "role",
+        "content",
+        "tool_calls",
+        "tool_call_id",
+        "reasoning_content",
+        "assistant_replay",
+    )
+    return {
+        entry.message_id: hashlib.sha256(
+            json.dumps(
+                {name: getattr(entry, name, None) for name in fields},
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode()
+        ).hexdigest()
+        for entry in entries
+    }
+
+
+def _is_compaction_wire_call(call: WireCall) -> bool:
+    messages = call.request.get("messages", [])
+    return bool(
+        messages
+        and messages[-1].get("role") == "user"
+        and "Summarize the preceding conversation into a portable checkpoint."
+        in str(messages[-1].get("content", ""))
+    )
+
+
+def _compaction_tool_history_representation(call: WireCall) -> str:
+    """Validate native or quoted pairs without conflating their wire representations."""
+    pending: dict[str, int] = {}
+    matched = 0
+    recorded_tools = False
+    messages = []
+    for message in call.request.get("messages", []):
+        content = message.get("content")
+        if isinstance(content, str) and content.startswith("Recorded conversation context:"):
+            try:
+                records = json.loads(content.split("\n", 1)[1])
+            except (IndexError, TypeError, ValueError):
+                return "invalid"
+            for record in records:
+                blocks = record.get("content")
+                for block in blocks if isinstance(blocks, list) else []:
+                    if block.get("type") == "tool_use":
+                        recorded_tools = True
+                        messages.append(
+                            {
+                                "tool_calls": [
+                                    {
+                                        "id": block.get("id"),
+                                        "function": {
+                                            "name": block.get("name"),
+                                            "arguments": json.dumps(block.get("input")),
+                                        },
+                                    }
+                                ]
+                            }
+                        )
+                    elif block.get("type") == "tool_result":
+                        messages.append(
+                            {
+                                "role": "tool",
+                                "tool_call_id": block.get("tool_use_id"),
+                                "content": block.get("content"),
+                            }
+                        )
+        else:
+            messages.append(message)
+    for message in messages:
+        for tool in message.get("tool_calls") or []:
+            function = tool.get("function") or {}
+            if function.get("name") != "replay_step":
+                return "invalid"
+            try:
+                value = json.loads(function.get("arguments", ""))["value"]
+                pending[tool["id"]] = value + 11
+            except (KeyError, TypeError, ValueError):
+                return "invalid"
+        if message.get("role") == "tool":
+            expected = pending.pop(message.get("tool_call_id"), None)
+            try:
+                actual = json.loads(message.get("content", ""))
+            except (TypeError, ValueError):
+                return "invalid"
+            if expected is None or actual != {"next_value": expected}:
+                return "invalid"
+            matched += 1
+    if matched != 1 or pending:
+        return "invalid"
+    return "recorded" if recorded_tools else "native"
+
+
+def _compaction_coverage(variant: str) -> dict[str, Any]:
+    expected = [
+        "source_range",
+        "current_tail",
+        "archive_integrity",
+        "summary_replayed",
+        "memory_recall",
+        "current_configuration",
+    ]
+    if variant in {"tools", "replay_off"}:
+        expected.extend(("tool_roundtrip", "tool_schema"))
+    if variant == "replay_off":
+        expected.extend(("native_parent_state", "replay_disabled"))
+    if variant == "model_switch":
+        expected.append("model_switch")
+    if variant == "repeated":
+        expected.extend(("repeated_compaction", "cumulative_memory"))
+    if variant == "long_reasoning":
+        expected.append("reasoning_over_1024")
+    if variant == "truncated":
+        expected = ["length_observed", "source_preserved", "no_summary_committed"]
+    return {
+        "expected": expected,
+        "observed": dict.fromkeys(expected, False),
+        "status": "not_covered",
+    }
+
+
+async def _run_compaction_case(
+    root: Path,
+    *,
+    provider: str,
+    model: str,
+    api_key: str,
+    observer: WireObserver | None,
+    thinking: str,
+    variant: str = "basic",
+    next_model: str | None = None,
+) -> dict[str, Any]:
+    """Exercise real automatic preflight, bounded wire calls and reopened SQLite."""
+    _require(variant in COMPACTION_VARIANTS, "invalid_compaction_variant")
+    if variant == "model_switch":
+        _require(bool(next_model) and next_model != model, "distinct_next_model_required")
+    endpoint = registry_endpoint(provider)
+    limit = COMPACTION_CALL_LIMITS[variant]
+    observer = observer or WireObserver(endpoint, max_calls=limit)
+    observer.max_calls = min(observer.max_calls or limit, limit)
+    coverage = _compaction_coverage(variant)
+    observed = coverage["observed"]
+    observer.replay_checks["coverage"] = coverage
+    config = _config(root, provider, model, endpoint, thinking=thinking)
+    catalog = _Catalog()
+    catalog_loaded = False
+    if provider == "openrouter" and observer.transport is None:
+        try:
+            await catalog._catalog.fetch_openrouter(api_key, endpoint.removesuffix("/v1"))
+        except Exception:
+            raise ReplayCheckError("catalog_setup_failed") from None
+        catalog_loaded = True
+    tools_enabled = variant in {"tools", "replay_off"}
+    config.agent_max_iterations = 2 if tools_enabled else 1
+    registry = ToolRegistry()
+    tool_values: list[int] = []
+
+    async def step(value: int) -> str:
+        tool_values.append(value)
+        return json.dumps({"next_value": value + 11})
+
+    if tools_enabled:
+        registry.register(
+            ToolSpec(
+                name="replay_step",
+                description="Pure synthetic test: return value plus eleven.",
+                parameters={"value": {"type": "integer"}},
+                required=["value"],
+            ),
+            step,
+        )
+    key = "agent:main:synthetic-suffix-compaction"
+    db = root / "sessions.sqlite"
+    labels: list[str] = []
+    original: dict[str, str] = {}
+    previous_canonical: dict[str, str] = {}
+    summary_indexes: list[int] = []
+    prefix_counts: list[int] = []
+    message_json_prefix_chars: list[int] = []
+    source_entry_marker_counts: list[int] = []
+    seed_repetitions = 15 if variant in {"long_reasoning", "tools", "replay_off"} else 25
+    first_prompt = COMPACTION_FIRST_PROMPT
+    if tools_enabled:
+        first_prompt = (
+            "This is a synthetic memory and tool test. Call replay_step exactly once with "
+            "value=7. Wait for its result, then invent a new label of exactly eight lowercase "
+            "letters and reply only COMPACTION_LABEL=<your label>. Do not invent tool results."
+        )
+    if variant == "long_reasoning":
+        # A real workload, never fabricated response reasoning: the summary must
+        # reconcile a sequence of ledger edits while keeping its visible answer short.
+        ledger = "\n".join(
+            f"Ledger event {index}: add {index * 17 + 3}, subtract {index * 11 + 5}; "
+            f"record remainder modulo {index + 41} before the next event."
+            for index in range(1, 41)
+        )
+        first_prompt += (
+            "\nFor the eventual compact checkpoint, carefully reconcile every ledger event "
+            "from balance 271, checking the running balance and remainder after each event. "
+            "Do not calculate it in this initial answer. When later asked to summarize, "
+            "perform those checks internally; the visible checkpoint must retain the generated "
+            "label and report only the final balance and remainder in under 120 words. "
+            "Do not copy the ledger, intermediate steps, or background prose into the summary.\n"
+            + ledger
+        )
+    first_prompt = "SYNTHETIC_COMPACTION_ENTRY_5_USER\n" + first_prompt
+    tail_repetitions = 30 if variant == "replay_off" else 55
+    tail_prompt = (
+        "SYNTHETIC_COMPACTION_ENTRY_6_USER\n"
+        f"{COMPACTION_TAIL_MARKER}\n{COMPACTION_PADDING * tail_repetitions}\n"
+        "The background prose above is disposable. Return the exact label you invented "
+        "in your previous answer, followed by COMPACTION_RECALL_OK. Do not invent a new "
+        "label and do not use tools."
+    )
+    prompts = [first_prompt, tail_prompt]
+    if variant == "repeated":
+        prompts[1] = tail_prompt + (
+            " After recalling that first label, invent a distinct second label and append "
+            "COMPACTION_LABEL_2=<new eight lowercase letters>. Retain both labels."
+        )
+        prompts.append(
+            f"{COMPACTION_TAIL_MARKER}_SECOND\n{COMPACTION_PADDING * 55}\n"
+            "Return both labels you invented, in order, followed by COMPACTION_RECALL_OK. "
+            "Do not invent new labels and do not use tools."
+        )
+    compaction_events: list[dict[str, Any]] = []
+    attempted_by_turn: list[bool] = []
+    observer.replay_checks["compaction_events"] = compaction_events
+    observer.replay_checks["compaction_attempted_by_turn"] = attempted_by_turn
+
+    def observe_compaction_event(session_key: str, payload: dict[str, Any]) -> None:
+        if session_key != key:
+            return
+        event: dict[str, Any] = {}
+        for name in ("status", "source", "phase", "reason", "effect_status", "skip_reason"):
+            value = payload.get(name)
+            if isinstance(value, str) and re.fullmatch(r"[a-z_]{1,80}", value):
+                event[name] = value
+        for name in ("removed_count", "kept_count", "tokens_before", "tokens_after"):
+            if type(payload.get(name)) is int:
+                event[name] = payload[name]
+        compaction_events.append(event)
+
+    with contextlib.ExitStack() as stack:
+        stack.enter_context(observer.observe())
+        stack.enter_context(patch.dict(
+            os.environ, {"OPENSQUILLA_COMPACTION_PROMPT_LAYOUT": "suffix"}
+        ))
+        stack.callback(add_compaction_listener(observe_compaction_event))
+        for turn, prompt in enumerate(prompts):
+            storage = SessionStorage(str(db))
+            await storage.connect()
+            try:
+                manager = SessionManager(
+                    storage,
+                    inject_time_prefix=False,
+                    checkpoint_workspace_dir=config.workspace_dir,
+                )
+                if turn == 0:
+                    await manager.create(session_key=key, agent_id="main")
+                    for index in range(5):
+                        await manager.append_message(
+                            key,
+                            "user",
+                            f"SYNTHETIC_COMPACTION_ENTRY_{index}_USER\n"
+                            f"{COMPACTION_SOURCE_MARKER if index == 0 else 'Background'}\n"
+                            f"{COMPACTION_PADDING * seed_repetitions}",
+                        )
+                        await manager.append_message(
+                            key, "assistant",
+                            f"SYNTHETIC_COMPACTION_ENTRY_{index}_ASSISTANT "
+                            "Background acknowledged.",
+                        )
+                else:
+                    restored = _canonical_message_digests(
+                        await manager.get_canonical_transcript(key)
+                    )
+                    _require(restored == previous_canonical, "database_reopen_state_mismatch")
+                    config.compaction.enabled = True
+                    config.llm.context_window_tokens = 20_000
+                    if variant == "model_switch":
+                        config.llm.model = next_model
+                    if variant == "truncated":
+                        config.llm.max_tokens = 1
+                    if variant == "long_reasoning":
+                        config.llm.max_tokens = 8192
+                        config.llm.thinking = "high"
+                        config.llm.context_window_tokens = 48_000
+                        config.preflight_compact_ratio = 0.1
+                    if variant in {"repeated", "tools", "replay_off"}:
+                        config.preflight_compact_ratio = 0.2
+                selector_config = SelectorConfig(
+                    primary=ProviderConfig(
+                        provider=provider,
+                        model=config.llm.model,
+                        api_key=api_key,
+                        base_url=endpoint,
+                        replay_provider_state=not (variant == "replay_off" and turn > 0),
+                    )
+                )
+                runner = TurnRunner(
+                    provider_selector=ModelSelector(selector_config),
+                    tool_registry=registry,
+                    session_manager=manager,
+                    config=config,
+                    model_catalog=catalog,
+                )
+                before_entries = await manager.get_transcript(key)
+                before_active = _canonical_message_digests(before_entries)
+                source_entry_markers = {
+                    marker for entry in before_entries
+                    for marker in re.findall(COMPACTION_ENTRY_PATTERN, entry.content or "")
+                }
+                call_start = len(observer.calls)
+                user = await manager.append_message(key, "user", prompt)
+                events = [
+                    event
+                    async for event in runner.run(
+                        prompt,
+                        session_key=key,
+                        bound_user_message_id=user.message_id,
+                        tool_context=ToolContext(is_owner=True, workspace_dir=config.workspace_dir),
+                    )
+                ]
+                attempted_by_turn.append(runner.has_attempted_compaction_this_turn(key))
+                observer.engine_error_codes.extend(
+                    safe_provider_failure_code(
+                        getattr(event, "code", None), getattr(event, "failure_kind", None)
+                    )
+                    for event in events
+                    if event.kind == "error"
+                )
+                if variant != "truncated" or turn == 0:
+                    _require(not observer.engine_error_codes, "turn_failed")
+                canonical = _canonical_message_digests(await manager.get_canonical_transcript(key))
+                _require(
+                    all(canonical.get(mid) == digest for mid, digest in previous_canonical.items()),
+                    "compaction_archive_changed_history",
+                )
+                previous_canonical = canonical
+                if turn == 0:
+                    _require(
+                        len(observer.calls) == (2 if tools_enabled else 1),
+                        "unexpected_parent_call_count",
+                    )
+                    _require(
+                        all(call.request.get("model") == model for call in observer.calls),
+                        "parent_request_model_mismatch",
+                    )
+                    parent = observer.calls[-1]
+                    generated_label = _compaction_generated_label(
+                        parent.response.get("content") or ""
+                    )
+                    _require(generated_label is not None, "parent_generated_label_missing")
+                    assert generated_label is not None
+                    labels.append(generated_label)
+                    _require(
+                        all(
+                            generated_label not in json.dumps(call.request)
+                            for call in observer.calls
+                        ),
+                        "parent_label_already_in_input",
+                    )
+                    original = canonical
+                    continue
+                stage_calls = observer.calls[call_start:]
+                _require(
+                    all(call.request.get("model") == config.llm.model for call in stage_calls),
+                    "compaction_request_model_mismatch",
+                )
+                compact = next(
+                    (call for call in stage_calls if _is_compaction_wire_call(call)), None
+                )
+                summaries = await manager.get_summaries(key)
+                active_entries = await manager.get_transcript(key)
+                active = _canonical_message_digests(active_entries)
+                if variant == "truncated":
+                    observed["length_observed"] = bool(
+                        compact and compact.finish_reason == "length"
+                    )
+                    observed["source_preserved"] = all(
+                        active.get(mid) == digest for mid, digest in before_active.items()
+                    )
+                    observed["no_summary_committed"] = not summaries
+                    if observed["length_observed"]:
+                        _require(observed["source_preserved"], "truncated_summary_deleted_source")
+                        _require(observed["no_summary_committed"], "truncated_summary_committed")
+                    break
+                _require(
+                    compact is not None and len(stage_calls) == 2, "compaction_live_not_covered"
+                )
+                assert compact is not None
+                _require(len(summaries) == turn, "single_compaction_not_persisted")
+                latest = summaries[-1]
+                _require(latest.summary_source == "llm", "compaction_used_fallback")
+                _require(
+                    latest.coverage_status in {"pass", "pass_with_backfill", "unknown"},
+                    "compaction_coverage_failed",
+                )
+                summary_text = latest.summary_text
+                _require(
+                    all(label in summary_text for label in labels), "summary_generated_fact_missing"
+                )
+                _require(
+                    not before_active.keys() & active.keys(), "compaction_old_history_still_active"
+                )
+                _require(
+                    any(
+                        entry.message_id == user.message_id and entry.content == prompt
+                        for entry in active_entries
+                    ),
+                    "compaction_current_tail_changed",
+                )
+                _require(
+                    all(canonical.get(mid) == digest for mid, digest in original.items()),
+                    "compaction_archive_lost_history",
+                )
+                compact_messages = compact.request.get("messages", [])
+                compact_history = json.dumps(compact_messages[:-1])
+                _require(
+                    all(marker in compact_history for marker in source_entry_markers),
+                    "compaction_source_entry_missing",
+                )
+                source_entry_marker_counts.append(len(source_entry_markers))
+                _require(labels[-1] in compact_history, "compaction_source_not_covered")
+                if turn == 1:
+                    _require(
+                        COMPACTION_SOURCE_MARKER in compact_history, "compaction_source_not_covered"
+                    )
+                    _require(
+                        COMPACTION_TAIL_MARKER not in compact_history,
+                        "compaction_included_current_tail",
+                    )
+                else:
+                    _require(
+                        COMPACTION_TAIL_MARKER + "_SECOND" not in compact_history,
+                        "compaction_included_current_tail",
+                    )
+                resumed = stage_calls[-1]
+                resumed_input = json.dumps(resumed.request, ensure_ascii=False)
+                _require(
+                    summary_text
+                    in "\n".join(
+                        message.get("content") or ""
+                        for message in resumed.request.get("messages", [])
+                        if isinstance(message.get("content"), str)
+                    ),
+                    "persisted_summary_not_in_next_request",
+                )
+                _require(
+                    COMPACTION_TAIL_MARKER in resumed_input, "current_tail_not_in_next_request"
+                )
+                answer = resumed.response.get("content") or ""
+                _require(
+                    all(label in answer for label in labels) and "COMPACTION_RECALL_OK" in answer,
+                    "compaction_memory_recall_mismatch",
+                )
+                _require(
+                    compact.completed
+                    and compact.finish_reason == "stop"
+                    and resumed.completed
+                    and resumed.finish_reason == "stop",
+                    "incomplete_provider_response",
+                )
+                for name in (
+                    "model",
+                    "tools",
+                    "thinking",
+                    "reasoning",
+                    "reasoning_effort",
+                    "enable_thinking",
+                    "preserve_thinking",
+                    "max_tokens",
+                    "max_completion_tokens",
+                ):
+                    _require(
+                        compact.request.get(name) == resumed.request.get(name),
+                        "compaction_request_configuration_changed",
+                    )
+                    if variant not in {"model_switch", "long_reasoning", "replay_off"}:
+                        _require(
+                            parent.request.get(name) == compact.request.get(name),
+                            "compaction_request_configuration_changed",
+                        )
+                common = 0
+                for left, right in zip(
+                    parent.request.get("messages", []), compact_messages, strict=False
+                ):
+                    if left != right:
+                        break
+                    common += 1
+                if turn == 1 and variant not in {"model_switch", "replay_off"}:
+                    _require(common > 1, "parent_history_prefix_not_reused")
+                # Rebased recorded-history JSON grows within one message. Count
+                # characters separately; whole-message equality is not token equality.
+                parent_json = json.dumps(parent.request.get("messages", []), ensure_ascii=False)
+                compact_json = json.dumps(compact_messages, ensure_ascii=False)
+                common_chars = 0
+                for left_char, right_char in zip(parent_json, compact_json, strict=False):
+                    if left_char != right_char:
+                        break
+                    common_chars += 1
+                message_json_prefix_chars.append(common_chars)
+                prefix_counts.append(common)
+                summary_indexes.append(observer.calls.index(compact))
+                observed.update(
+                    dict.fromkeys(
+                        (
+                            "source_range",
+                            "current_tail",
+                            "archive_integrity",
+                            "summary_replayed",
+                            "memory_recall",
+                            "current_configuration",
+                        ),
+                        True,
+                    )
+                )
+                if tools_enabled:
+                    observed["tool_roundtrip"] = (
+                        tool_values == [7]
+                        and _compaction_tool_history_representation(compact) != "invalid"
+                    )
+                    observer.replay_checks["tool_history_representation"] = (
+                        _compaction_tool_history_representation(compact)
+                    )
+                    observed["tool_schema"] = bool(compact.request.get("tools"))
+                    _require(observed["tool_roundtrip"], "compaction_tool_pair_missing")
+                    _require(observed["tool_schema"], "compaction_tool_schema_missing")
+                if variant == "replay_off":
+                    observed["native_parent_state"] = any(
+                        bool(
+                            call.native_reasoning_content or call.response.get("reasoning_details")
+                        )
+                        for call in observer.calls[:call_start]
+                    )
+                    # TokenRhythm tool routes may require an empty reasoning_content
+                    # placeholder. Empty schema fields do not replay native state.
+                    observed["replay_disabled"] = all(
+                        not message.get("reasoning_content")
+                        and not message.get("reasoning_details")
+                        for call in observer.calls[call_start:]
+                        for message in call.request.get("messages", [])
+                        if message.get("role") == "assistant"
+                    )
+                    _require(observed["replay_disabled"], "disabled_replay_native_state_leaked")
+                if variant == "model_switch":
+                    observed["model_switch"] = parent.request.get("model") != compact.request.get(
+                        "model"
+                    ) and compact.request.get("model") == resumed.request.get("model")
+                    _require(observed["model_switch"], "compaction_used_previous_model")
+                if variant == "long_reasoning":
+                    reasoning = _usage_report([compact])["reasoning_tokens_by_call"][0]
+                    observed["reasoning_over_1024"] = reasoning is not None and reasoning > 1024
+                if variant == "repeated" and turn == 1:
+                    match = re.search(
+                        r"COMPACTION_LABEL_2\s*[:=]\s*[`\"']?([A-Za-z0-9_-]{4,64})", answer
+                    )
+                    _require(bool(match), "second_generated_label_missing")
+                    assert match is not None
+                    new_label = match.group(1)
+                    _require(
+                        new_label != labels[0] and new_label not in resumed_input,
+                        "second_label_already_in_input",
+                    )
+                    labels.append(new_label)
+                if variant == "repeated" and turn == 2:
+                    observed["repeated_compaction"] = len(summaries) == 2
+                    observed["cumulative_memory"] = all(
+                        label in summary_text and label in answer for label in labels
+                    )
+                parent = resumed
+            finally:
+                await storage.close()
+    covered = all(observed.get(code) is True for code in coverage["expected"])
+    coverage["status"] = "covered" if covered else "not_covered"
+    return {
+        "ok": covered,
+        "status": "passed" if covered else "compaction_variant_not_covered",
+        "provider": provider,
+        "model": model,
+        "scenario": "compaction",
+        "compaction_variant": variant,
+        "compaction_next_model": next_model,
+        "thinking": thinking,
+        **_usage_report(observer.calls),
+        "coverage": coverage,
+        "storage_reopened": True,
+        "new_agent_after_restart": True,
+        "compaction_source_verified": observed.get("source_range", False),
+        "compaction_current_tail_verified": observed.get("current_tail", False),
+        "compaction_archive_verified": observed.get("archive_integrity", False),
+        "compaction_memory_recall_verified": observed.get("memory_recall", False),
+        "compaction_configuration_verified": observed.get("current_configuration", False),
+        "compaction_summary_replayed": observed.get("summary_replayed", False),
+        "common_parent_prefix_messages": prefix_counts[0] if prefix_counts else 0,
+        "common_parent_prefix_messages_by_summary": prefix_counts,
+        "common_message_json_prefix_chars_by_summary": message_json_prefix_chars,
+        "summary_call_indexes": summary_indexes,
+        "tool_calls": len(tool_values),
+        "tool_history_representation": observer.replay_checks.get("tool_history_representation"),
+        "source_digest_fields_verified": True,
+        "source_entry_markers_verified": source_entry_marker_counts,
+        "request_models_by_call": [call.request.get("model") for call in observer.calls],
+        "replay_transition": {"parent": True, "current": variant != "replay_off"},
+        "compaction_events": compaction_events,
+        "compaction_attempted_by_turn": attempted_by_turn,
+        "catalog_loaded": catalog_loaded,
+    }
+
+
 async def run_case(
     root: Path,
     *,
@@ -735,9 +1418,17 @@ async def run_case(
     scenario: str = "tools",
     thinking: str = "low",
     require_native_replay: bool | None = None,
+    compaction_variant: str = "basic",
+    compaction_next_model: str | None = None,
 ) -> dict[str, Any]:
-    _require(scenario in {"tools", "chat"}, "invalid_scenario")
+    _require(scenario in {"tools", "chat", "compaction"}, "invalid_scenario")
     _require(thinking in THINKING_CHOICES, "invalid_thinking_level")
+    if scenario == "compaction":
+        return await _run_compaction_case(
+            root, provider=provider, model=model, api_key=api_key,
+            observer=observer, thinking=thinking,
+            variant=compaction_variant, next_model=compaction_next_model,
+        )
     endpoint = registry_endpoint(provider)
     observer = observer or WireObserver(endpoint)
     config = _config(root, provider, model, endpoint, thinking=thinking)
@@ -869,8 +1560,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--live", action="store_true", help="Explicitly enable paid provider calls")
     parser.add_argument("--provider", choices=sorted(DEFAULT_MODELS), default="deepseek")
     parser.add_argument("--model")
-    parser.add_argument("--scenario", choices=("tools", "chat"), default="tools")
+    parser.add_argument("--scenario", choices=("tools", "chat", "compaction"), default="tools")
     parser.add_argument("--thinking", choices=THINKING_CHOICES, default="low")
+    parser.add_argument("--compaction-variant", choices=COMPACTION_VARIANTS, default="basic")
+    parser.add_argument("--compaction-next-model")
     parser.add_argument(
         "--require-native-replay", action=argparse.BooleanOptionalAction, default=None
     )
@@ -891,6 +1584,11 @@ def main(argv: list[str] | None = None) -> int:
     if not api_key or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:/+-]{0,199}", model):
         print(json.dumps({"ok": False, "status": "missing_credential_or_invalid_model"}))
         return 2
+    if args.compaction_next_model and not re.fullmatch(
+        r"[A-Za-z0-9][A-Za-z0-9._:/+-]{0,199}", args.compaction_next_model
+    ):
+        print(json.dumps({"ok": False, "status": "invalid_next_model"}))
+        return 2
     root = Path(tempfile.mkdtemp(prefix="opensquilla-reasoning-replay-"))
     root.chmod(0o700)
     # Prevent unrelated diagnostic modes from writing wire payloads to the
@@ -904,7 +1602,11 @@ def main(argv: list[str] | None = None) -> int:
         "OPENSQUILLA_OPENROUTER_LIVE_PRICING": "0",
     }
     report: dict[str, Any]
-    observer = WireObserver(registry_endpoint(args.provider))
+    observer = WireObserver(
+        registry_endpoint(args.provider),
+        max_calls=COMPACTION_CALL_LIMITS[args.compaction_variant]
+        if args.scenario == "compaction" else None
+    )
     try:
         with (
             patch.dict(os.environ, env, clear=True),
@@ -922,6 +1624,8 @@ def main(argv: list[str] | None = None) -> int:
                     scenario=args.scenario,
                     thinking=args.thinking,
                     require_native_replay=args.require_native_replay,
+                    compaction_variant=args.compaction_variant,
+                    compaction_next_model=args.compaction_next_model,
                 )
             )
     except ReplayCheckError as exc:
@@ -939,6 +1643,8 @@ def main(argv: list[str] | None = None) -> int:
         scenario=args.scenario,
         thinking=args.thinking,
         require_native_replay=args.require_native_replay,
+        compaction_variant=args.compaction_variant,
+        compaction_next_model=args.compaction_next_model,
     )
     report.update(_usage_report(observer.calls))
     report.update(_wire_diagnostics(observer))

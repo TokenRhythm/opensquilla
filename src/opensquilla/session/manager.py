@@ -41,6 +41,7 @@ from opensquilla.session.compaction import (
     arm_compaction_deadline,
     await_compaction_phase,
     compact_context,
+    compaction_prompt_layout,
     compaction_remaining_seconds,
     effective_protected_recent_messages,
     require_compaction_time,
@@ -664,6 +665,16 @@ def _frozen_compaction_prefix_hash(
         "compaction_profile": config.compaction_profile,
         "protected_recent_messages": config.protected_recent_messages,
         "consumer_admission_fingerprint": consumer_admission_fingerprint,
+        "prompt_layout": compaction_prompt_layout(),
+        "request_context": (
+            {
+                "chat_config": config.request_context.chat_config.model_dump(mode="json"),
+                "tools": [
+                    tool.model_dump(mode="json") for tool in (config.request_context.tools or ())
+                ],
+            }
+            if config.request_context is not None else None
+        ),
     }
     digest.update(_stable_json(request_shape).encode("utf-8"))
     return digest.hexdigest()
@@ -3200,6 +3211,8 @@ class SessionManager:
         # callers may reuse a config object, so isolate it before arming; a
         # concurrent waiter must never reset the owner's deadline or call cap.
         effective_config = replace(config) if config is not None else CompactionConfig()
+        if effective_config.request_context is not None:
+            effective_config.request_context = deepcopy(effective_config.request_context)
         persisted_compaction_id = compaction_id or new_compaction_id()
         arm_compaction_deadline(
             effective_config,

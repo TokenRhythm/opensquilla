@@ -199,6 +199,54 @@ class _LiveTurnMessageLimitProvider(_ExactMessageLimitProvider):
         yield ProviderDoneEvent(stop_reason="stop", input_tokens=1, output_tokens=1)
 
 
+class _SuffixMessageLimitProvider(_ExactMessageLimitProvider):
+    """Use the real compactor while capturing its auxiliary provider request."""
+
+    def __init__(
+        self, limits: list[int | None], *, summary_failed: bool = False, first_tool: bool = False,
+    ) -> None:
+        super().__init__(limits)
+        self.summary_failed = summary_failed
+        self.first_tool = first_tool
+        self.summary_calls: list[tuple[list[Message], list[Any] | None, ChatConfig]] = []
+        self.ordinary_configs: list[ChatConfig] = []
+        self.ordinary_tools: list[list[Any] | None] = []
+
+    def provider_metadata(self):
+        return self._projector.provider_metadata()
+
+    def chat(self, messages, tools=None, config=None):
+        assert config is not None
+        if config.candidate_output_mode == "inert_artifact":
+            self.summary_calls.append((
+                [message.model_copy(deep=True) for message in messages],
+                [tool.model_copy(deep=True) for tool in tools] if tools else None,
+                config.model_copy(deep=True),
+            ))
+            return self._summary_stream()
+        self.ordinary_configs.append(config.model_copy(deep=True))
+        self.ordinary_tools.append(
+            [tool.model_copy(deep=True) for tool in tools] if tools else None
+        )
+        return super().chat(messages, tools, config)
+
+    async def _stream(self, projection, limit):
+        if self.first_tool and len(self.calls) == 1:
+            yield ToolUseStartEvent(tool_use_id="current-check", tool_name="check")
+            yield ToolUseEndEvent(tool_use_id="current-check", tool_name="check", arguments={})
+            yield ProviderDoneEvent(stop_reason="tool_use", input_tokens=1, output_tokens=1)
+            return
+        async for event in super()._stream(projection, limit):
+            yield event
+
+    async def _summary_stream(self):
+        yield TextDeltaEvent(text="The newly selected delivery color is azure.")
+        if self.summary_failed:
+            yield ProviderDoneEvent(stop_reason="length", output_tokens=10)
+        else:
+            yield ProviderDoneEvent(stop_reason="stop", output_tokens=10)
+
+
 class _ScaffoldLimitToolProvider:
     """Exercise count recovery across one-shot reasoning scaffold cleanup."""
 
@@ -583,6 +631,161 @@ def _install_exact_compactor(
         )
 
     monkeypatch.setattr("opensquilla.engine.agent.compact_context", _compact)
+
+
+@pytest.mark.parametrize("summary_failed", [False, True], ids=["accepted", "truncated"])
+async def test_message_count_suffix_uses_current_source_and_request_without_parent(
+    monkeypatch: pytest.MonkeyPatch,
+    summary_failed: bool,
+) -> None:
+    monkeypatch.setenv("OPENSQUILLA_COMPACTION_PROMPT_LAYOUT", "suffix")
+    provider = _SuffixMessageLimitProvider([100, None], summary_failed=summary_failed)
+    history = _plain_history()
+    for message in history[:18]:
+        message.content += " Synthetic background describing completed work." * 10
+    history[3].content = "The newly selected delivery color is azure."
+    tools = [ToolDefinition(
+        name="check",
+        description="Run a synthetic check.",
+        input_schema=ToolInputSchema(),
+    )]
+    agent = Agent(
+        provider=provider,
+        config=AgentConfig(
+            model_id="glm-5.2",
+            context_window_tokens=64_000,
+            max_tokens=8192,
+            thinking=ThinkingLevel.MEDIUM,
+            thinking_budget_tokens=2048,
+            max_provider_retries=0,
+            system_prompt="Current shared request instructions.",
+            flush_enabled=False,
+            model_capabilities=ModelCapabilities(supports_tools=True, supports_reasoning=True),
+        ),
+        tool_definitions=tools,
+    )
+    agent.set_history(history)
+    assert agent._compaction_request_context is None
+
+    events = [event async for event in agent.run_turn("current user request")]
+
+    assert len(provider.summary_calls) == 1
+    summary_messages, summary_tools, summary_config = provider.summary_calls[0]
+    cut = len(summary_messages) - 1
+    assert summary_messages[:-1] == history[:cut]
+    assert "The newly selected delivery color is azure." in str(summary_messages)
+    assert "current user request" not in str(summary_messages)
+    assert "Summarize the preceding conversation" in summary_messages[-1].content
+    assert summary_tools == provider.ordinary_tools[0] == tools
+    assert summary_config.system == provider.ordinary_configs[0].system
+    assert summary_config.max_tokens == provider.ordinary_configs[0].max_tokens == 8192
+    assert summary_config.thinking_budget_tokens == 2048
+    assert agent._history[:len(history)] == history
+    assert not any(isinstance(event, CompactionEvent) for event in events)
+    if summary_failed:
+        assert len(provider.calls) == 1
+        assert any(
+            isinstance(event, ErrorEvent)
+            and event.code == "provider_request_message_limit_exhausted"
+            for event in events
+        )
+    else:
+        assert len(provider.calls) == 2
+        assert provider.projections[-1].actual_wire_messages <= 90
+        assert provider.calls[-1][2:2 + len(history) - cut] == history[cut:]
+        assert "delivery color is azure" in str(provider.calls[-1][0].content)
+        assert not any(isinstance(event, ErrorEvent) for event in events)
+
+
+async def test_message_count_suffix_refreshes_config_and_tools_between_turns(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("OPENSQUILLA_COMPACTION_PROMPT_LAYOUT", "suffix")
+    provider = _SuffixMessageLimitProvider([100, None, 100, None])
+    history = _plain_history()
+    for message in history[:24]:
+        message.content += " Synthetic background describing completed work." * 10
+    agent = Agent(
+        provider=provider,
+        config=AgentConfig(
+            model_id="glm-5.2",
+            context_window_tokens=64_000,
+            max_tokens=8192,
+            system_prompt="First-turn instructions.",
+            max_provider_retries=0,
+            flush_enabled=False,
+            model_capabilities=ModelCapabilities(supports_tools=True),
+        ),
+        tool_definitions=[ToolDefinition(
+            name="old_check", description="First-turn tool.", input_schema=ToolInputSchema(),
+        )],
+    )
+    agent.set_history(history)
+    first_events = [event async for event in agent.run_turn("first request")]
+    assert not any(isinstance(event, ErrorEvent) for event in first_events)
+    assert agent._compaction_request_context is None
+
+    agent.config.system_prompt = "Second-turn instructions."
+    agent.config.max_tokens = 4096
+    agent.tool_definitions[:] = [ToolDefinition(
+        name="new_check", description="Second-turn tool.", input_schema=ToolInputSchema(),
+    )]
+    second_events = [event async for event in agent.run_turn("second request")]
+
+    assert not any(isinstance(event, ErrorEvent) for event in second_events)
+    assert len(provider.summary_calls) == 2
+    _, first_tools, first_config = provider.summary_calls[0]
+    _, second_tools, second_config = provider.summary_calls[1]
+    assert first_config.system == "First-turn instructions."
+    assert first_config.max_tokens == 8192
+    assert [tool.name for tool in first_tools or []] == ["old_check"]
+    assert second_config.system == provider.ordinary_configs[2].system
+    assert second_config.system == "Second-turn instructions."
+    assert second_config.max_tokens == provider.ordinary_configs[2].max_tokens == 4096
+    assert [tool.name for tool in second_tools or []] == ["new_check"]
+    assert agent._compaction_request_context is None
+
+
+async def test_message_count_suffix_uses_latest_call_config_within_tool_turn(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("OPENSQUILLA_COMPACTION_PROMPT_LAYOUT", "suffix")
+    provider = _SuffixMessageLimitProvider([None, 100, None], first_tool=True)
+    history = _plain_history()
+    for message in history[:24]:
+        message.content += " Synthetic background describing completed work." * 10
+
+    async def handle_tool(call):
+        return ToolResult(
+            tool_use_id=call.tool_use_id, tool_name=call.tool_name, content="check complete",
+        )
+
+    agent = Agent(
+        provider=provider,
+        config=AgentConfig(
+            model_id="glm-5.2",
+            context_window_tokens=64_000,
+            max_tokens=8192,
+            max_provider_retries=0,
+            flush_enabled=False,
+            metadata={"meta_match_tool_choice": "required"},
+            model_capabilities=ModelCapabilities(supports_tools=True),
+        ),
+        tool_definitions=[ToolDefinition(
+            name="check", description="Run a synthetic check.", input_schema=ToolInputSchema(),
+        )],
+        tool_handler=handle_tool,
+    )
+    agent.set_history(history)
+
+    events = [event async for event in agent.run_turn("continue the check")]
+
+    assert not any(isinstance(event, ErrorEvent) for event in events)
+    assert len(provider.summary_calls) == 1
+    assert provider.ordinary_configs[0].tool_choice == "required"
+    assert provider.ordinary_configs[1].tool_choice is None
+    assert provider.summary_calls[0][2].tool_choice is None
+    assert any("current-check" in str(message.content) for message in provider.calls[-1])
 
 
 @pytest.mark.asyncio

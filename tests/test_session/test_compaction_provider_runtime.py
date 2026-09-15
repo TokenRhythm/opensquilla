@@ -18,12 +18,18 @@ from opensquilla.provider.types import (
     ChatConfig,
     DoneEvent,
     ErrorEvent,
+    Message,
+    ProviderFinalRequestProjection,
     ProviderRequestCorrelation,
     ReasoningDeltaEvent,
     TextDeltaEvent,
+    ToolDefinition,
+    ToolUseStartEvent,
 )
 from opensquilla.session.compaction import (
+    CompactionConfig,
     CompactionRequest,
+    CompactionRequestContext,
     arm_compaction_deadline,
     build_compaction_config_from_provider,
     call_compaction_provider,
@@ -850,3 +856,403 @@ def test_execution_plan_refuses_more_than_two_calls() -> None:
 
     with pytest.raises(ValueError, match="between 1 and 2"):
         CompactionExecutionPlan(candidates=(target,), max_calls=3)
+
+
+def _suffix_config(provider: _Provider, *, window: int = 16_000) -> CompactionConfig:
+    return CompactionConfig(
+        identifier_policy="off",
+        llm_plan=CompactionExecutionPlan(candidates=(CompactionExecutionTarget(
+            provider=provider,
+            provider_id="openrouter",
+            model="provider/model",
+            context_window_tokens=window,
+            max_output_tokens=1024,
+        ),)),
+        request_context=CompactionRequestContext(
+            chat_config=ChatConfig(
+                system="Stable ordinary request instructions.",
+                max_tokens=4096,
+                thinking=True,
+                thinking_budget_tokens=2048,
+                thinking_budget_explicit=True,
+            ),
+            tools=(ToolDefinition(
+                name="lookup",
+                description="Look up a synthetic record.",
+                input_schema={"type": "object", "properties": {}},
+            ),),
+        ),
+    )
+
+
+@pytest.mark.asyncio
+async def test_suffix_reads_selected_source_including_new_assistant_and_preserves_tail(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("OPENSQUILLA_COMPACTION_PROMPT_LAYOUT", "suffix")
+    fact = "The newly chosen delivery color is azure."
+    provider = _Provider(lambda: _Stream([
+        TextDeltaEvent(text=fact), DoneEvent(output_tokens=12),
+    ]))
+    config = _suffix_config(provider)
+    entries = _entries(6)
+    # This response was not part of the request that generated it. It must
+    # nevertheless be summarized when the current selected range includes it.
+    entries[3]["content"] = fact
+    entries[3]["_provider_message"] = Message(
+        role="assistant", content=fact, reasoning_content="native reasoning",
+    )
+    original = [dict(entry) for entry in entries]
+
+    result = await compact_context(CompactionRequest(
+        session_id="fresh-source",
+        entries=entries,
+        context_window_tokens=1000,
+        forced_prefix_cut=4,
+        previous_summary="The original destination remains north.",
+        config=config,
+    ))
+
+    assert result.removed_count == result.kept_start_index == 4
+    assert result.kept_entries == entries[4:]
+    assert fact in result.summary
+    messages, tools, sent_config = provider.calls[0]
+    assert [message.content for message in messages[:-1]] == [
+        entry["content"] for entry in entries[:4]
+    ]
+    assert messages[3].reasoning_content == "native reasoning"
+    assert "message 4" not in str(messages)
+    assert str(messages).count("The original destination remains north.") == 1
+    assert "Summarize the preceding conversation" in messages[-1].content
+    assert sent_config is not None and config.request_context is not None
+    assert sent_config.system == config.request_context.chat_config.system
+    assert sent_config.thinking_budget_tokens == 2048
+    assert sent_config.max_tokens == 4096
+    assert sent_config.physical_attempt_limit == 1
+    assert tools == list(config.request_context.tools or ())
+    assert tools[0] is not config.request_context.tools[0]
+    assert config.request_context.chat_config.physical_attempt_limit == 0
+    assert entries == original
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stream_reasoning", [True, False])
+async def test_suffix_reasoning_uses_generation_budget_not_summary_body_budget(
+    monkeypatch: pytest.MonkeyPatch, stream_reasoning: bool,
+) -> None:
+    monkeypatch.setenv("OPENSQUILLA_COMPACTION_PROMPT_LAYOUT", "suffix")
+    events: list[Any] = []
+    if stream_reasoning:
+        events.append(ReasoningDeltaEvent(text="reasoning " * 1600))
+    events.extend([
+        TextDeltaEvent(text="A short valid checkpoint."),
+        DoneEvent(output_tokens=3000, reasoning_tokens=2990),
+    ])
+    provider = _Provider(lambda: _Stream(events))
+    config = _suffix_config(provider)
+    assert config.llm_plan is not None
+
+    result = await call_compaction_provider(
+        "", "", config.llm_plan,
+        request_context=config.request_context,
+        source_entries=_entries(2),
+    )
+
+    assert result == "A short valid checkpoint."
+    assert provider.calls[0][2].max_tokens == 4096
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("events", [
+    [DoneEvent(output_tokens=1000, reasoning_tokens=1000)],
+    [TextDeltaEvent(text="partial"), DoneEvent(stop_reason="length")],
+    [TextDeltaEvent(text="partial"), DoneEvent(stop_reason="max_tokens")],
+    [TextDeltaEvent(text="partial"), ErrorEvent(message="synthetic failure")],
+    [TextDeltaEvent(text="partial")],
+    [ToolUseStartEvent(tool_use_id="call-1", tool_name="lookup"), DoneEvent()],
+    [TextDeltaEvent(text="short"), DoneEvent(output_tokens=4097)],
+    [TextDeltaEvent(text="overlong summary " * 3000), DoneEvent(output_tokens=2)],
+])
+async def test_suffix_invalid_summary_does_not_publish_fallback_or_remove_source(
+    monkeypatch: pytest.MonkeyPatch, events: list[Any],
+) -> None:
+    monkeypatch.setenv("OPENSQUILLA_COMPACTION_PROMPT_LAYOUT", "suffix")
+    provider = _Provider(lambda: _Stream(events))
+    entries = _entries(6)
+
+    result = await compact_context(CompactionRequest(
+        session_id="suffix-rejected",
+        entries=entries,
+        context_window_tokens=1000,
+        forced_prefix_cut=4,
+        config=_suffix_config(provider),
+    ))
+
+    assert result.removed_count == 0
+    assert result.kept_entries == entries
+    assert result.summary == ""
+    assert result.skip_reason == "suffix_summary_failed"
+    assert len(provider.calls) == 1
+    assert provider.streams[0].closed
+
+
+@pytest.mark.asyncio
+async def test_suffix_without_current_context_uses_existing_prefix_llm(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("OPENSQUILLA_COMPACTION_PROMPT_LAYOUT", "suffix")
+    provider = _Provider(_successful_stream)
+    config = _suffix_config(provider)
+    config.request_context = None
+
+    result = await compact_context(CompactionRequest(
+        session_id="first-or-restored-session",
+        entries=_entries(6),
+        context_window_tokens=1000,
+        forced_prefix_cut=4,
+        config=config,
+    ))
+
+    assert result.removed_count == 4
+    assert result.summary_source == "llm"
+    messages, tools, sent_config = provider.calls[0]
+    assert len(messages) == 1
+    assert tools is None
+    assert sent_config is not None and sent_config.thinking is False
+
+
+@pytest.mark.asyncio
+async def test_suffix_unavailable_target_does_not_commit_deterministic_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("OPENSQUILLA_COMPACTION_PROMPT_LAYOUT", "suffix")
+    provider = _Provider(_successful_stream)
+    config = _suffix_config(provider)
+    # A failed per-operation deployment refresh clears the plan while the
+    # current request context remains available. This is a suffix failure,
+    # not the no-context compatibility path.
+    config.llm_plan = None
+    entries = _entries(6)
+
+    result = await compact_context(CompactionRequest(
+        session_id="unavailable-suffix-deployment",
+        entries=entries,
+        context_window_tokens=1000,
+        forced_prefix_cut=4,
+        config=config,
+    ))
+
+    assert result.removed_count == 0
+    assert result.kept_entries == entries
+    assert result.summary == ""
+    assert result.summary_source == "skipped"
+    assert result.skip_reason == "suffix_target_unavailable"
+    assert provider.calls == []
+
+
+@pytest.mark.asyncio
+async def test_suffix_does_not_preprune_source_to_satisfy_call_cap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("OPENSQUILLA_COMPACTION_PROMPT_LAYOUT", "suffix")
+    provider = _Provider(_successful_stream)
+    entries = _entries(40)
+    for entry in entries:
+        entry["content"] += " detailed synthetic background" * 200
+    result = await compact_context(CompactionRequest(
+        session_id="too-many-complete-rounds",
+        entries=entries,
+        context_window_tokens=1000,
+        forced_prefix_cut=38,
+        config=_suffix_config(provider, window=5000),
+    ))
+
+    assert result.removed_count == 0
+    assert result.kept_entries == entries
+    assert result.skip_reason == "suffix_call_budget_exceeded"
+    assert provider.calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cap_field", ["max_tokens", "max_completion_tokens", "max_output_tokens"])
+@pytest.mark.parametrize("effective_cap,accept", [(3100, True), (2500, False)])
+async def test_suffix_enforces_effective_adapter_generation_cap(
+    monkeypatch: pytest.MonkeyPatch, cap_field: str, effective_cap: int, accept: bool,
+) -> None:
+    monkeypatch.setenv("OPENSQUILLA_COMPACTION_PROMPT_LAYOUT", "suffix")
+    provider = _Provider(lambda: _Stream([
+        TextDeltaEvent(text="short checkpoint"),
+        DoneEvent(output_tokens=3000, reasoning_tokens=2990),
+    ]))
+
+    def project(messages, tools, config, *, message_limit=None):
+        return ProviderFinalRequestProjection(
+            payload={cap_field: effective_cap},
+            proof={"estimated_tokens": 100},
+            wire_message_count=len(messages),
+            message_limit=None,
+            fits_message_count=None,
+            fits=True,
+        )
+
+    monkeypatch.setattr(provider, "project_final_request", project, raising=False)
+    config = _suffix_config(provider)
+    assert config.llm_plan is not None
+    result = await call_compaction_provider(
+        "", "", config.llm_plan,
+        request_context=config.request_context,
+        source_entries=_entries(2),
+    )
+    assert (result == "short checkpoint") is accept
+
+
+@pytest.mark.asyncio
+async def test_suffix_input_reserves_full_generation_budget_before_sending(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("OPENSQUILLA_COMPACTION_PROMPT_LAYOUT", "suffix")
+    provider = _Provider(_successful_stream)
+
+    def project(messages, tools, config, *, message_limit=None):
+        return ProviderFinalRequestProjection(
+            payload={"max_completion_tokens": 4096},
+            proof={"estimated_tokens": 2500},
+            wire_message_count=len(messages),
+            message_limit=None,
+            fits_message_count=None,
+            fits=True,
+        )
+
+    monkeypatch.setattr(provider, "project_final_request", project, raising=False)
+    config = _suffix_config(provider, window=6000)
+    assert config.llm_plan is not None
+    result = await call_compaction_provider(
+        "", "", config.llm_plan,
+        request_context=config.request_context,
+        source_entries=_entries(2),
+    )
+    assert result is None
+    assert provider.calls == []
+
+
+@pytest.mark.asyncio
+async def test_suffix_multiple_chunks_read_each_complete_source_round_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("OPENSQUILLA_COMPACTION_PROMPT_LAYOUT", "suffix")
+    provider = _Provider(lambda: _Stream([
+        TextDeltaEvent(text=f"checkpoint after chunk {len(provider.calls)}"),
+        DoneEvent(output_tokens=6),
+    ]))
+    entries = _entries(6)
+    for entry in entries[:4]:
+        entry["content"] += " background" * 180
+
+    result = await compact_context(CompactionRequest(
+        session_id="two-source-rounds",
+        entries=entries,
+        context_window_tokens=1000,
+        forced_prefix_cut=4,
+        config=_suffix_config(provider, window=5000),
+    ))
+
+    assert len(provider.calls) == 2
+    assert result.removed_count == 4
+    assert result.kept_entries == entries[4:]
+    seen_source = [
+        message.content
+        for messages, _tools, _config in provider.calls
+        for message in messages[:-1]
+    ]
+    assert seen_source == [entry["content"] for entry in entries[:4]]
+    assert "checkpoint after chunk 1" in provider.calls[1][0][-1].content
+    assert result.summary == "checkpoint after chunk 2"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", [
+    [TextDeltaEvent(text="incomplete second checkpoint"), DoneEvent(stop_reason="length")],
+    [ErrorEvent(message="synthetic second-chunk failure")],
+])
+async def test_suffix_later_chunk_failure_preserves_the_entire_source(
+    monkeypatch: pytest.MonkeyPatch, failure: list[Any],
+) -> None:
+    monkeypatch.setenv("OPENSQUILLA_COMPACTION_PROMPT_LAYOUT", "suffix")
+    provider = _Provider(lambda: _Stream(
+        [TextDeltaEvent(text="first checkpoint"), DoneEvent(output_tokens=3)]
+        if len(provider.calls) == 1 else failure
+    ))
+    entries = _entries(6)
+    for entry in entries[:4]:
+        entry["content"] += " background" * 180
+
+    result = await compact_context(CompactionRequest(
+        session_id="second-chunk-failure",
+        entries=entries,
+        context_window_tokens=1000,
+        forced_prefix_cut=4,
+        config=_suffix_config(provider, window=5000),
+    ))
+
+    assert len(provider.calls) == 2
+    assert "first checkpoint" in provider.calls[1][0][-1].content
+    assert result.removed_count == 0
+    assert result.kept_entries == entries
+    assert result.summary == ""
+    assert result.skip_reason == "suffix_summary_failed"
+    assert all(stream.closed for stream in provider.streams)
+
+
+@pytest.mark.asyncio
+async def test_suffix_reconstructs_durable_tool_result_inside_selected_assistant_row(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("OPENSQUILLA_COMPACTION_PROMPT_LAYOUT", "suffix")
+    provider = _Provider(_successful_stream)
+    entries = [
+        {"role": "user", "content": "Look up the synthetic dispatch decision."},
+        {
+            "role": "assistant", "content": "The dispatch decision is complete.",
+            "tool_calls": [
+                {"type": "tool_use", "id": "lookup-1", "name": "lookup", "input": {}},
+                {"type": "tool_result", "tool_use_id": "lookup-1", "result": "Dispatch west."},
+            ],
+        },
+    ]
+    config = _suffix_config(provider)
+    assert config.llm_plan is not None
+
+    result = await call_compaction_provider(
+        "", "", config.llm_plan,
+        request_context=config.request_context,
+        source_entries=entries,
+    )
+
+    assert result == "portable summary"
+    messages = provider.calls[0][0]
+    assert [message.role for message in messages] == ["user", "assistant", "user", "user"]
+    result_block = messages[2].content[0]
+    assert result_block.tool_use_id == "lookup-1"
+    assert result_block.content == "Dispatch west."
+
+
+@pytest.mark.asyncio
+async def test_suffix_declines_broken_final_projection_without_sending(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("OPENSQUILLA_COMPACTION_PROMPT_LAYOUT", "suffix")
+    provider = _Provider(_successful_stream)
+
+    def project(*args, **kwargs):
+        raise ValueError("synthetic projection failure")
+
+    monkeypatch.setattr(provider, "project_final_request", project, raising=False)
+    config = _suffix_config(provider)
+    assert config.llm_plan is not None
+    result = await call_compaction_provider(
+        "", "", config.llm_plan,
+        request_context=config.request_context,
+        source_entries=_entries(2),
+    )
+    assert result is None
+    assert provider.calls == []
