@@ -253,6 +253,63 @@ def test_manual_compaction_uses_exact_credential_limits(
     target = resolve_gateway_compaction_target(ctx, session)
     assert target.plan is not None
     assert target.plan.primary.context_window_tokens == (configured_window or 64_000)
+    assert target.plan.primary.max_generation_tokens == 8192
+    assert target.plan.primary.max_output_tokens == 1024
+
+
+@pytest.mark.parametrize("writer_provider,configured_output,known_window,expected_output", [
+    ("openai", 8192, True, 8192),
+    ("openai", 512, True, 512),
+    ("openrouter", 8192, True, 3072),
+    ("openrouter", 8192, False, 3072),
+])
+def test_manual_writer_generation_budget_is_separate_from_body_and_consumer(
+    monkeypatch: pytest.MonkeyPatch, writer_provider: str, configured_output: int,
+    known_window: bool, expected_output: int,
+) -> None:
+    from opensquilla.provider.model_catalog import ModelCatalog
+    from opensquilla.session.compaction import _build_prefix_compaction_call
+
+    catalog = ModelCatalog()
+    writer_limits = {"max_output_tokens": 3072}
+    if known_window:
+        writer_limits["context_window"] = 32_000
+    catalog.set_user_overrides({f"{writer_provider}/synthetic-writer": writer_limits})
+    for module in (
+        "opensquilla.gateway.compaction_target", "opensquilla.session.compaction_deployment",
+        "opensquilla.provider.model_catalog",
+    ):
+        monkeypatch.setattr(f"{module}.shared_catalog", lambda: catalog)
+    config = GatewayConfig(llm={
+        "provider": "openai", "model": "synthetic-base", "api_key": "synthetic-key",
+        "context_window_tokens": 64_000, "max_tokens": configured_output,
+    })
+    config.compaction.provider = writer_provider
+    config.compaction.model = "synthetic-writer"
+    config.llm_profiles[writer_provider] = LlmProviderProfile(
+        api_key="synthetic-writer-key", base_url="https://api.example.test/v1",
+    )
+    target = resolve_gateway_compaction_target(
+        _ctx(config, ProviderConfig(
+            provider="openai", model="synthetic-base", api_key="synthetic-key",
+        )),
+        SimpleNamespace(session_key="agent:main:webchat:writer-generation"),
+    )
+
+    assert target.plan is not None
+    writer = target.plan.primary
+    assert writer.provider_id == writer_provider
+    assert writer.max_output_tokens == 1024
+    assert writer.max_generation_tokens == expected_output
+    _, sent = _build_prefix_compaction_call(
+        writer, "synthetic history", "", None, timeout=30,
+        request_context=None, provider_request_correlation=None,
+    )
+    assert sent.max_tokens == expected_output
+    assert "within 1024 tokens" in sent.system
+    if not known_window:
+        assert writer.context_window_source == "bounded_fallback"
+        assert sent.provider_context_window_tokens == 0
 
 
 def test_manual_consumer_admission_uses_exact_adapter_projection() -> None:

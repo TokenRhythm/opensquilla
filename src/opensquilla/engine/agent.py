@@ -14007,55 +14007,24 @@ class Agent:
 
     @staticmethod
     def _tool_result_requires_raw_preservation(message: Message) -> bool:
+        """Keep active protocol state; completed errors may leave a request window."""
+        from opensquilla.session.compaction import _execution_status_is_live
+
         if not isinstance(message.content, list):
             return False
-        unresolved_markers = {
-            "pending",
-            "queued",
-            "running",
-            "in_progress",
-            "requires_action",
-            "awaiting_approval",
-        }
         for block in message.content:
             if not isinstance(block, ContentBlockToolResult):
                 continue
-            if bool(getattr(block, "is_error", False)):
+            if _execution_status_is_live(block.execution_status):
                 return True
-            raw_status = getattr(block, "execution_status", None)
-            if isinstance(raw_status, dict):
-                raw_status_name = str(raw_status.get("status") or "").strip().lower()
-                if raw_status_name in unresolved_markers | {
-                    "error",
-                    "failed",
-                    "failure",
-                    "timeout",
-                    "timed_out",
-                    "cancelled",
-                    "unresolved",
-                }:
-                    return True
-                normalized_status = normalize_execution_status(raw_status)
-                normalized_name = normalized_status["status"]
-                if normalized_name in {"error", "timeout", "cancelled"}:
-                    return True
-                if normalized_name == "unknown" and (
-                    normalized_status["source"] != "legacy"
-                    or normalized_status["reason"] not in {None, "legacy_missing_status"}
-                    or normalized_status["preservation_class"] == "ephemeral"
-                ):
-                    return True
-            raw = block.content
-            if not isinstance(raw, str):
+            if not isinstance(block.content, str):
                 continue
             try:
-                parsed = json.loads(raw)
+                parsed = json.loads(block.content)
             except (TypeError, json.JSONDecodeError):
                 continue
-            if (
-                isinstance(parsed, dict)
-                and str(parsed.get("status") or parsed.get("execution_status") or "").lower()
-                in unresolved_markers
+            if isinstance(parsed, dict) and _execution_status_is_live(
+                parsed.get("execution_status") or parsed
             ):
                 return True
         return False

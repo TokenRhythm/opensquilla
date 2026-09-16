@@ -102,6 +102,9 @@ class CompactionExecutionTarget:
     context_window_tokens: int = 0
     context_window_source: str = "model_catalog"
     max_output_tokens: int = DEFAULT_COMPACTION_OUTPUT_TOKENS
+    # The portable body cap is independent of the provider's whole generation
+    # allowance, which may also be consumed by unavoidable reasoning.
+    max_generation_tokens: int | None = None
     provider_request_max_chars: int = 0
     provider_request_max_chars_explicit_cap: int | None = field(default=None, repr=False)
     deployment_fingerprint: str = ""
@@ -124,6 +127,8 @@ class CompactionExecutionTarget:
             raise ValueError("context_window_tokens must be non-negative")
         if self.max_output_tokens <= 0:
             raise ValueError("max_output_tokens must be positive")
+        if self.max_generation_tokens is not None and self.max_generation_tokens <= 0:
+            raise ValueError("max_generation_tokens must be positive")
         if self.provider_request_max_chars < 0:
             raise ValueError("provider_request_max_chars must be non-negative")
         if not self.deployment_fingerprint:
@@ -266,6 +271,7 @@ def build_compaction_llm_plan_from_provider_config(
     provider_request_max_chars: int = 0,
     max_calls: int = MAX_COMPACTION_LLM_CALLS,
     max_output_tokens: int = DEFAULT_COMPACTION_OUTPUT_TOKENS,
+    max_generation_tokens: int | None = None,
     deployment_fingerprint: str = "",
     portable: bool = True,
     source: str = "provider_config",
@@ -310,6 +316,7 @@ def build_compaction_llm_plan_from_provider_config(
                 context_window_tokens=resolved_window,
                 context_window_source=window_source,
                 max_output_tokens=resolved_output,
+                max_generation_tokens=max_generation_tokens,
                 provider_request_max_chars=resolved_chars,
                 provider_request_max_chars_explicit_cap=max(
                     0, int(provider_request_max_chars or 0),
@@ -334,6 +341,7 @@ def build_compaction_llm_plan_from_provider(
     provider_request_max_chars: int = 0,
     max_calls: int = MAX_COMPACTION_LLM_CALLS,
     max_output_tokens: int = DEFAULT_COMPACTION_OUTPUT_TOKENS,
+    max_generation_tokens: int | None = None,
     deployment_fingerprint: str = "",
     portable: bool = True,
     source: str = "resolved_provider",
@@ -384,6 +392,7 @@ def build_compaction_llm_plan_from_provider(
                 context_window_tokens=resolved_window,
                 context_window_source=window_source,
                 max_output_tokens=resolved_output,
+                max_generation_tokens=max_generation_tokens,
                 provider_request_max_chars=resolved_chars,
                 provider_request_max_chars_explicit_cap=max(
                     0, int(provider_request_max_chars or 0),

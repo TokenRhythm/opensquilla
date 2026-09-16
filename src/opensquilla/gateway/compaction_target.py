@@ -858,7 +858,7 @@ def resolve_gateway_compaction_target(
     physical_model = _text(metadata.model) or preferred_model
     compat_plan = None
     try:
-        context_window, output_tokens, request_max_chars = _execution_budget(
+        context_window, output_tokens, generation_tokens, request_max_chars = _execution_budget(
             ctx,
             physical_provider,
             physical_model,
@@ -869,6 +869,7 @@ def resolve_gateway_compaction_target(
             model=physical_model,
             context_window_tokens=context_window,
             max_output_tokens=output_tokens,
+            max_generation_tokens=generation_tokens,
             provider_request_max_chars=request_max_chars,
             source="selected_provider_compat",
         )
@@ -1115,7 +1116,7 @@ def _build_plan(
 ) -> CompactionExecutionPlan:
     provider_id = _text(provider_config.provider).lower()
     model = _text(provider_config.model)
-    context_window, output_tokens, request_max_chars = _execution_budget(
+    context_window, output_tokens, generation_tokens, request_max_chars = _execution_budget(
         ctx,
         provider_id,
         model,
@@ -1125,6 +1126,7 @@ def _build_plan(
         provider_config,
         context_window_tokens=context_window,
         max_output_tokens=output_tokens,
+        max_generation_tokens=generation_tokens,
         provider_request_max_chars=request_max_chars,
         source=source,
     )
@@ -1137,8 +1139,8 @@ def _execution_budget(
     *,
     provider: object | None = None,
     deployment: ProviderConfig | None = None,
-) -> tuple[int, int, int]:
-    """Return writer window/output and only the operator-owned character cap."""
+) -> tuple[int, int, int, int]:
+    """Resolve the physical writer's window, body cap and generation allowance."""
     catalog = shared_catalog()
     gateway_config = getattr(ctx, "config", None)
     llm_config = getattr(gateway_config, "llm", None)
@@ -1174,6 +1176,14 @@ def _execution_budget(
         DEFAULT_COMPACTION_OUTPUT_TOKENS,
         provider_output_limit or DEFAULT_COMPACTION_OUTPUT_TOKENS,
     )
+    configured_output = (
+        int(getattr(llm_config, "max_tokens", 0) or 0)
+        if configured_provider == provider_id else 0
+    )
+    generation_tokens = (
+        catalog.resolve_max_tokens(model, user_override=configured_output, provider=provider_id)
+        if configured_output > 0 else provider_output_limit
+    )
     return (
         (
             int(context_window)
@@ -1181,6 +1191,7 @@ def _execution_budget(
             else 0
         ),
         max(1, output_tokens),
+        max(1, int(generation_tokens or output_tokens)),
         _configured_request_char_cap(ctx, provider_id),
     )
 
