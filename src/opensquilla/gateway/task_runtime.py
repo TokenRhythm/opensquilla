@@ -67,8 +67,10 @@ from opensquilla.session.goals import (
 from opensquilla.session.keys import canonicalize_session_key, normalize_agent_id, parse_agent_id
 from opensquilla.session.models import AgentTaskRecord, AgentTaskStatus, QueueMode
 from opensquilla.session.terminal_reply import (
+    append_error_ref,
     build_terminal_reply,
     is_context_payload_too_large,
+    safe_error_id,
     safe_provider_failure_code,
     safe_provider_failure_message,
     sanitize_agent_error,
@@ -4626,6 +4628,7 @@ class TaskRuntime:
                 error_class=str(getattr(exc, "code", None) or type(exc).__name__),
                 error_message=str(exc),
                 failure_kind=failure_kind,
+                error_id=safe_error_id(getattr(exc, "error_id", None)),
                 retry_after_ms=safe_retry_after_ms(getattr(exc, "retry_after_ms", None)),
                 activity_snapshot=getattr(exc, "activity_snapshot", None),
                 usage_call_index=getattr(exc, "usage_call_index", None),
@@ -6212,6 +6215,7 @@ class TaskRuntime:
         error_class: str | None = None,
         error_message: str | None = None,
         failure_kind: str | None = None,
+        error_id: str | None = None,
         retry_after_ms: int | None = None,
         activity_snapshot: object = None,
         usage_call_index: int | None = None,
@@ -6238,6 +6242,7 @@ class TaskRuntime:
                         error_class=error_class,
                         error_message=error_message,
                         failure_kind=failure_kind,
+                        error_id=error_id,
                         retry_after_ms=retry_after_ms,
                         activity_snapshot=activity_snapshot,
                         usage_call_index=usage_call_index,
@@ -6287,6 +6292,7 @@ class TaskRuntime:
         error_class: str | None = None,
         error_message: str | None = None,
         failure_kind: str | None = None,
+        error_id: str | None = None,
         retry_after_ms: int | None = None,
         activity_snapshot: object = None,
         usage_call_index: int | None = None,
@@ -6354,10 +6360,13 @@ class TaskRuntime:
             "terminal_reason": terminal_reason,
             "error_class": error_class,
             "error_message": error_message,
+            "failure_kind": failure_kind,
         }
         if failure_kind:
             error_class = safe_provider_failure_code(error_class, failure_kind)
-            error_message = safe_provider_failure_message(failure_kind)
+            error_message = safe_provider_failure_message(
+                failure_kind, code=error_class, message=error_message
+            )
             terminal_payload["error_class"] = error_class
             terminal_payload["error_message"] = error_message
         elif (
@@ -6389,6 +6398,7 @@ class TaskRuntime:
                     error_class=error_class,
                     error_message=error_message,
                     failure_kind=failure_kind,
+                    error_id=error_id,
                     retry_after_ms=retry_after_ms,
                     activity_snapshot=activity_snapshot,
                     terminal_at=terminal_update["finished_at"],
@@ -6452,7 +6462,25 @@ class TaskRuntime:
                 ),
             }
             if status != AgentTaskStatus.SUCCEEDED:
-                payload["terminal_message"] = build_terminal_reply(terminal_payload)
+                payload["terminal_message"] = append_error_ref(
+                    build_terminal_reply(terminal_payload), safe_error_id(error_id)
+                )
+                if failure_kind or safe_error_id(error_id):
+                    details = terminal_update.get("details")
+                    turn_outcome = (
+                        details.get("turn_outcome") if isinstance(details, dict) else None
+                    )
+                    if not isinstance(turn_outcome, dict):
+                        turn_outcome = outcome_from_error(
+                            code=terminal_reason if terminal_reason != "error" else error_class,
+                            message=error_message,
+                            error_class=error_class,
+                            failure_kind=failure_kind,
+                        ).to_dict()
+                        if safe_error_id(error_id):
+                            turn_outcome["error_id"] = error_id
+                    payload["code"] = error_class
+                    payload["turn_outcome"] = dict(turn_outcome)
             if status != AgentTaskStatus.SUCCEEDED and is_usage_accounting_barrier(error_class):
                 details = terminal_update.get("details")
                 details = details if isinstance(details, dict) else {}
@@ -6472,7 +6500,9 @@ class TaskRuntime:
                 )
                 payload.update(replay_proof)
                 terminal_payload.update(replay_proof)
-                payload["terminal_message"] = build_terminal_reply(terminal_payload)
+                payload["terminal_message"] = append_error_ref(
+                    build_terminal_reply(terminal_payload), safe_error_id(error_id)
+                )
                 if not isinstance(turn_outcome, dict):
                     turn_outcome = outcome_from_error(
                         code=error_class,
@@ -6483,6 +6513,8 @@ class TaskRuntime:
                     if retry_after_ms is not None:
                         turn_outcome["retry_after_ms"] = retry_after_ms
                 turn_outcome.update(replay_proof)
+                if safe_error_id(error_id):
+                    turn_outcome["error_id"] = error_id
                 payload["turn_outcome"] = dict(turn_outcome)
                 if not isinstance(snapshot, dict):
                     snapshot = terminal_activity_snapshot(
@@ -6521,6 +6553,7 @@ class TaskRuntime:
                         error_class=error_class,
                         error_message=error_message,
                         failure_kind=failure_kind,
+                        error_id=error_id,
                         retry_after_ms=retry_after_ms,
                         activity_snapshot=activity_snapshot,
                         usage_call_index=usage_call_index,
@@ -6960,6 +6993,7 @@ class TaskRuntime:
         usage_call_index: int | None,
         no_prior_provider_dispatch: bool,
         replay_safe: bool,
+        error_id: str | None = None,
     ) -> dict[str, Any]:
         outcome = _subagent_group_outcome_from_provenance(task.envelope.input_provenance)
         existing = await self._storage.get_agent_task(task.task_id)
@@ -7042,6 +7076,8 @@ class TaskRuntime:
                 error_class=error_class,
                 failure_kind=failure_kind,
             ).to_dict()
+            if safe_error_id(error_id):
+                turn_outcome["error_id"] = error_id
             if cancellation is not None:
                 turn_outcome["cancellation_source"] = cancellation["source"]
             if is_usage_accounting_barrier(error_class):
@@ -7130,6 +7166,7 @@ class TaskRuntime:
         usage_call_index: int | None,
         no_prior_provider_dispatch: bool,
         replay_safe: bool,
+        error_id: str | None = None,
     ) -> bool:
         """Retry one terminal task-row update after its public fallback event."""
 
@@ -7149,6 +7186,7 @@ class TaskRuntime:
                     error_class=error_class,
                     error_message=error_message,
                     failure_kind=failure_kind,
+                    error_id=error_id,
                     retry_after_ms=retry_after_ms,
                     activity_snapshot=preserved_activity_snapshot,
                     terminal_at=int(terminal_update["finished_at"]),

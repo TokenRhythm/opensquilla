@@ -286,6 +286,7 @@ from opensquilla.session.storage import (
 from opensquilla.session.terminal_reply import (
     append_error_ref,
     build_terminal_reply,
+    safe_error_id,
     safe_provider_failure_code,
     safe_provider_failure_message,
     sanitize_agent_error,
@@ -1731,14 +1732,19 @@ def _task_summary(row: Any) -> dict[str, Any]:
     if terminal_reason is not None:
         summary["terminal_reason"] = terminal_reason
     if summary.get("status") in {"failed", "timeout", "abandoned", "cancelled"}:
-        summary["terminal_message"] = build_terminal_reply(
+        outcome = summary.get("turn_outcome", {})
+        summary["terminal_message"] = append_error_ref(build_terminal_reply(
             {
                 "status": summary.get("status"),
                 "terminal_reason": terminal_reason,
                 "error_class": getattr(row, "error_class", None),
                 "error_message": getattr(row, "error_message", None),
+                "failure_kind": outcome.get("failure_kind"),
+                **{key: outcome[key] for key in (
+                    "usage_call_index", "no_prior_provider_dispatch", "replay_safe"
+                ) if key in outcome},
             }
-        )
+        ), safe_error_id(outcome.get("error_id")))
     return summary
 
 
@@ -1747,17 +1753,18 @@ def _normalize_terminal_event_payload(event_name: str, payload: dict[str, Any]) 
         return payload
 
     prior_outcome = payload.get("turn_outcome")
+    prior_outcome = prior_outcome if isinstance(prior_outcome, dict) else {}
     prior_failure_kind = (
-        prior_outcome.get("failure_kind")
-        if isinstance(prior_outcome, dict)
-        else payload.get("failure_kind")
+        prior_outcome.get("failure_kind") or payload.get("failure_kind")
     )
     message = payload.get("message")
     error_message = payload.get("error_message")
     raw_message = error_message if isinstance(error_message, str) and error_message else message
     raw_text = raw_message if isinstance(raw_message, str) and raw_message else "Agent error"
     if isinstance(prior_failure_kind, str) and prior_failure_kind:
-        raw_text = safe_provider_failure_message(prior_failure_kind)
+        raw_text = safe_provider_failure_message(
+            prior_failure_kind, code=payload.get("code"), message=raw_text
+        )
     code = payload.get("code")
     if isinstance(prior_failure_kind, str) and prior_failure_kind:
         code = safe_provider_failure_code(
@@ -1767,12 +1774,15 @@ def _normalize_terminal_event_payload(event_name: str, payload: dict[str, Any]) 
     code_text = str(code or "").lower()
     is_timeout = "timeout" in code_text or "stream idle" in raw_text.lower()
     terminal_payload = {
-        "status": "timeout" if is_timeout else "failed",
+        **payload,
+        "status": payload.get("status") or ("timeout" if is_timeout else "failed"),
         "terminal_reason": payload.get("terminal_reason") or ("timeout" if is_timeout else "error"),
         "error_class": code,
         "error_message": raw_text,
-        **payload,
+        "failure_kind": prior_failure_kind,
     }
+    if prior_failure_kind:
+        terminal_payload.pop("terminal_message", None)
     _, safe_error_message = sanitize_agent_error(
         terminal_payload,
         fallback_error_class=str(code) if code else None,
@@ -1781,8 +1791,13 @@ def _normalize_terminal_event_payload(event_name: str, payload: dict[str, Any]) 
     # Join the user-visible reply to its durable turn_errors row: hex ids keep
     # substring-based timeout classification stable, and append_error_ref is
     # idempotent so the CLI client's re-normalization cannot double-suffix.
-    error_id = payload.get("error_id")
-    error_ref = error_id if isinstance(error_id, str) else None
+    error_ids = [
+        source["error_id"] for source in (payload, prior_outcome)
+        if "error_id" in source and source["error_id"] != ""
+    ]
+    error_ref = safe_error_id(error_ids[0]) if error_ids else None
+    if any(safe_error_id(value) != error_ref for value in error_ids):
+        error_ref = None
     terminal_message = append_error_ref(build_terminal_reply(terminal_payload), error_ref)
     # Serialize the typed turn outcome onto the wire so every surface (Web UI,
     # CLI, channels) can render a specific cause + retryability + recovery
@@ -1796,7 +1811,22 @@ def _normalize_terminal_event_payload(event_name: str, payload: dict[str, Any]) 
         message=safe_error_message,
         error_class=str(code) if code else None,
         failure_kind=(str(prior_failure_kind) if isinstance(prior_failure_kind, str) else None),
-    )
+    ).to_dict()
+    # Preserve existing public extensions, not arbitrary provider fields. In
+    # particular, re-normalization must not erase the stricter usage proof.
+    for key in (
+        "retry_after_ms", "usage_call_index", "no_prior_provider_dispatch", "replay_safe",
+        "user_message_id", "cancellation_source", "document_mutation_outcome",
+        "documentMutationOutcome",
+    ):
+        if key in prior_outcome:
+            outcome[key] = prior_outcome[key]
+    if error_ref is not None:
+        outcome["error_id"] = error_ref
+    elif error_ids:
+        # Preserve invalid/conflicting evidence across repeated normalization;
+        # omission would let a later pass trust the surviving top-level id.
+        outcome["error_id"] = None
     sensitive_provider_fields = {
         "provider_error_message",
         "provider_response_body",
@@ -1817,7 +1847,7 @@ def _normalize_terminal_event_payload(event_name: str, payload: dict[str, Any]) 
         "terminal_message": terminal_message,
         "terminal_reason": terminal_payload["terminal_reason"],
         "error_message": safe_error_message,
-        "turn_outcome": outcome.to_dict(),
+        "turn_outcome": outcome,
     }
 
 

@@ -79,6 +79,7 @@ from opensquilla.session.models import SessionStatus
 from opensquilla.session.terminal_reply import (
     append_error_ref,
     build_terminal_reply,
+    safe_error_id,
     safe_provider_failure_code,
     safe_provider_failure_message,
     sanitize_agent_error,
@@ -306,6 +307,7 @@ class TaskRuntimeStreamError(RuntimeError):
         usage_call_index: int | None = None,
         no_prior_provider_dispatch: bool = False,
         replay_safe: bool = False,
+        error_id: str | None = None,
     ) -> None:
         super().__init__(message)
         self.code = code
@@ -316,6 +318,7 @@ class TaskRuntimeStreamError(RuntimeError):
         self.usage_call_index = usage_call_index
         self.no_prior_provider_dispatch = no_prior_provider_dispatch
         self.replay_safe = replay_safe
+        self.error_id = safe_error_id(error_id)
 
 
 # fmt: off
@@ -1872,6 +1875,7 @@ async def _emit_task_runtime_stream_events(
 
     error_message: str | None = None
     error_code: str | None = None
+    error_id: str | None = None
     failure_kind: str | None = None
     terminal_reason: str | None = None
     retry_after_ms: int | None = None
@@ -1969,7 +1973,9 @@ async def _emit_task_runtime_stream_events(
             raw_failure_kind = event_dict.pop("failure_kind", None)
             failure_kind = str(raw_failure_kind) if isinstance(raw_failure_kind, str) else None
             if failure_kind:
-                error_message = safe_provider_failure_message(failure_kind)
+                error_message = safe_provider_failure_message(
+                    failure_kind, code=error_code, message=error_message
+                )
                 error_code = safe_provider_failure_code(error_code, failure_kind)
                 event_dict["code"] = error_code
                 code = error_code
@@ -1989,6 +1995,7 @@ async def _emit_task_runtime_stream_events(
                 "terminal_reason": terminal_reason,
                 "error_class": code,
                 "error_message": error_message,
+                "failure_kind": failure_kind,
             }
             safe_error_code, safe_error_message = sanitize_agent_error(
                 terminal_payload,
@@ -2013,9 +2020,8 @@ async def _emit_task_runtime_stream_events(
             terminal_message = build_terminal_reply(terminal_payload)
             # Additive ref suffix joining the reply to its durable turn_errors
             # row; absent when no record was written (error_id empty).
-            event_error_id = event_dict.get("error_id")
-            if isinstance(event_error_id, str) and event_error_id:
-                terminal_message = append_error_ref(terminal_message, event_error_id)
+            error_id = safe_error_id(event_dict.get("error_id"))
+            terminal_message = append_error_ref(terminal_message, error_id)
             event_dict["message"] = terminal_message
             event_dict["terminal_message"] = terminal_message
             event_dict["terminal_reason"] = terminal_payload["terminal_reason"]
@@ -2024,7 +2030,7 @@ async def _emit_task_runtime_stream_events(
             # without exposing a second raw top-level field. Clients can now
             # offer an explicit retry for transient terminal failures even
             # when a Retry-After hint exceeded the remaining turn deadline.
-            if failure_kind or is_usage_accounting_barrier(error_code):
+            if failure_kind or error_id or is_usage_accounting_barrier(error_code):
                 from opensquilla.engine.outcome import outcome_from_error
 
                 outcome = outcome_from_error(
@@ -2033,6 +2039,8 @@ async def _emit_task_runtime_stream_events(
                     error_class=error_code,
                     failure_kind=failure_kind,
                 ).to_dict()
+                if error_id is not None:
+                    outcome["error_id"] = error_id
                 if is_usage_accounting_barrier(error_code):
                     retry_after_ms = safe_retry_after_ms(raw_retry_after_ms)
                     if retry_after_ms is not None:
@@ -2118,6 +2126,7 @@ async def _emit_task_runtime_stream_events(
             code=error_code,
             terminal_reason=terminal_reason,
             failure_kind=failure_kind,
+            error_id=error_id,
             retry_after_ms=retry_after_ms,
             activity_snapshot=activity_snapshot,
             usage_call_index=replay_proof.get("usage_call_index"),

@@ -104,6 +104,8 @@ _SAFE_PROVIDER_TERMINAL_CODES = frozenset(
         "invalid_response_status",
         "invalid_stream_frame",
         "invalid_stream_order",
+        "iteration_timeout",
+        "llm_timeout",
         "model_repetition_loop_detected",
         "provider_protocol_error",
         "provider_output_truncated",
@@ -114,13 +116,16 @@ _SAFE_PROVIDER_TERMINAL_CODES = frozenset(
         "request_error",
         "response_incomplete",
         "synthetic_upstream_failure",
+        "stream_idle_timeout",
         "timeout",
         "usage_limit_reached",
     }
 )
 
 
-def safe_provider_failure_message(failure_kind: str | None) -> str:
+def safe_provider_failure_message(
+    failure_kind: str | None, *, code: str | None = None, message: str | None = None
+) -> str:
     """Project a stable provider failure kind to allowlisted user text.
 
     This is a defense-in-depth boundary for Gateway producers other than the
@@ -128,6 +133,11 @@ def safe_provider_failure_message(failure_kind: str | None) -> str:
     credentials and must never reach a client or durable terminal record.
     """
 
+    if code == "empty_response" and isinstance(message, str) and message.lower() in {
+        _REASONING_ONLY_OUTPUT_BUDGET_ERROR_MESSAGE,
+        _REASONING_ONLY_EMPTY_ERROR_MESSAGE,
+    }:
+        return message
     normalized = str(failure_kind or "").strip().lower().replace("-", "_")
     return _SAFE_PROVIDER_FAILURE_MESSAGES.get(
         normalized,
@@ -147,6 +157,13 @@ def safe_provider_failure_code(raw_code: str | None, failure_kind: str | None) -
     if normalized_kind in _SAFE_PROVIDER_FAILURE_MESSAGES:
         return f"provider_{normalized_kind}"
     return "provider_error"
+
+
+def safe_error_id(value: object) -> str | None:
+    """Accept only the existing durable diagnostic reference format."""
+    if isinstance(value, str) and len(value) == 8 and all(c in "0123456789abcdef" for c in value):
+        return value
+    return None
 
 
 def build_terminal_reply(
@@ -181,7 +198,7 @@ def build_terminal_reply(
     if (
         status == AgentTaskStatus.TIMEOUT.value
         or reason == "timeout"
-        or error_class == "iteration_timeout"
+        or error_class in {"iteration_timeout", "llm_timeout", "stream_idle_timeout", "timeout"}
         or "timeouterror" in error_class
         or "iteration_timeout" in error_message
         or "stream idle" in error_message
@@ -291,6 +308,9 @@ def build_terminal_reply(
             "sent. Earlier work in this turn may already have run or been billed."
         )
     if status == AgentTaskStatus.FAILED.value or reason in {"error", "tool_error"}:
+        failure_kind = _normalize(_read_value(record_or_payload, "failure_kind"))
+        if failure_kind:
+            return safe_provider_failure_message(failure_kind)
         return "The task failed before it could finish."
     if status == AgentTaskStatus.SUCCEEDED.value or reason in {"completed", "done"}:
         return "The task completed."
