@@ -111,11 +111,12 @@ async def test_compaction_acceptance_matrix_uses_real_runner_and_durable_content
     if provider == "openrouter":
         _compaction_openrouter_catalog(monkeypatch, model, next_model)
     has_tools = variant in {"tools", "replay_off"}
-    summary_indexes = [2] if has_tools else [1, 3] if variant == "repeated" else [1]
+    summary_indexes = [2] if has_tools else [1, 3, 5] if variant == "repeated" else [1]
     requests = []
     source_snapshots = []
     label = "qzmvkrpa"
     second_label = "bzntcpxd"
+    third_label = "hxlqfwse"
     summary = (
         f"The durable fact is COMPACTION_LABEL={label}. "
         "SYNTHETIC_COMPACTION_OLD_HISTORY was disposable background about colored paper. "
@@ -126,14 +127,16 @@ async def test_compaction_acceptance_matrix_uses_real_runner_and_durable_content
         payload = json.loads(request.content)
         index = len(requests)
         requests.append(payload)
-        assert index < (5 if variant == "repeated" else 4 if has_tools else 3)
+        assert index < (7 if variant == "repeated" else 4 if has_tools else 3)
         if index in summary_indexes:
             source_snapshots.append(await _compaction_rows(tmp_path))
             assert "summar" in json.dumps(payload["messages"][-1]).lower()
             assert label in json.dumps(payload["messages"])
-            if index == 3:
+            if index >= 3:
                 assert summary in json.dumps(payload["messages"])
                 assert second_label in json.dumps(payload["messages"])
+            if index == 5:
+                assert third_label in json.dumps(payload["messages"])
         if has_tools and index == 0:
             delta = {"tool_calls": [{
                 "index": 0, "id": "synthetic-compaction-tool", "type": "function",
@@ -143,14 +146,22 @@ async def test_compaction_acceptance_matrix_uses_real_runner_and_durable_content
         else:
             if index in summary_indexes:
                 content = summary
-                if index == 3:
+                if index >= 3:
                     content += f" Also preserve COMPACTION_LABEL_2={second_label}."
+                if index == 5:
+                    content += f" Also preserve COMPACTION_LABEL_3={third_label}."
                 if variant == "truncated":
                     content = "The"
             elif index == (1 if has_tools else 0):
                 content = f"COMPACTION_LABEL={label}"
             elif variant == "repeated" and index == 2:
                 content = f"{label} COMPACTION_RECALL_OK COMPACTION_LABEL_2={second_label}"
+            elif variant == "repeated" and index == 4:
+                content = (
+                    f"{label} {second_label} COMPACTION_RECALL_OK COMPACTION_LABEL_3={third_label}"
+                )
+            elif variant == "repeated" and index == 6:
+                content = f"{label} {second_label} {third_label} COMPACTION_RECALL_OK"
             elif variant == "truncated":
                 content = "OK"
             else:
@@ -296,12 +307,12 @@ async def test_compaction_acceptance_matrix_uses_real_runner_and_durable_content
         assert requests[1].get("max_tokens", requests[1].get("max_completion_tokens")) == 1
     else:
         assert report["source_entry_markers_verified"] == (
-            [11, 1] if variant == "repeated" else [11]
+            [11, 1, 1] if variant == "repeated" else [11]
         )
         assert len(summaries) == len(summary_indexes)
         assert all(item.summary_source == "llm" for item in summaries)
         assert label in summaries[-1].summary_text
-        expected_calls = 5 if variant == "repeated" else 4 if has_tools else 3
+        expected_calls = 7 if variant == "repeated" else 4 if has_tools else 3
         assert report["model_calls"] == len(requests) == expected_calls
     if has_tools:
         tools = requests[summary_indexes[0]]["tools"]
@@ -346,8 +357,11 @@ async def test_compaction_acceptance_matrix_uses_real_runner_and_durable_content
         assert [request["model"] for request in requests] == [model, next_model, next_model]
     if variant == "repeated":
         assert "SYNTHETIC_COMPACTION_ENTRY_6_USER" in json.dumps(requests[3]["messages"][:-1])
+        assert "SYNTHETIC_COMPACTION_ENTRY_7_USER" in json.dumps(requests[5]["messages"][:-1])
         assert second_label in summaries[-1].summary_text
+        assert third_label in summaries[-1].summary_text
         assert second_label in observer.calls[-1].response["content"]
+        assert third_label in observer.calls[-1].response["content"]
         assert label in observer.calls[-1].response["content"]
     if variant == "long_reasoning":
         assert report["reasoning_tokens_by_call"][1] == reasoning_evidence
@@ -438,6 +452,213 @@ async def test_suffix_smoke_uses_real_preflight_and_reopened_sqlite(
     assert report["cached_input_tokens_by_call"] == [0, 4000, 4000]
     assert "qzmvkrpa" not in json.dumps(report)
     assert "synthetic-test-key" not in json.dumps(report)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provider", ["deepseek", "tokenrhythm", "openrouter"])
+@pytest.mark.parametrize("layout", ["prefix", "suffix"])
+@pytest.mark.parametrize("profile", harness.COMPACTION_TASKS)
+async def test_compaction_task_facts_use_both_layouts_and_real_storage(
+    tmp_path, monkeypatch, provider, layout, profile, native_window=None, omitted_summary_fact=None,
+    expected_summary_calls=1,
+):
+    monkeypatch.setenv("OPENSQUILLA_OPENROUTER_LIVE_PRICING", "0")
+    monkeypatch.setenv("OPENSQUILLA_LIVE_DISABLE_DOTENV", "1")
+    model = harness.DEFAULT_MODELS[provider]
+    if provider == "openrouter":
+        _compaction_openrouter_catalog(monkeypatch, model)
+    facts = harness.compaction_task_facts(profile)
+    label = "syntheticnewlabel"
+    fact_json = json.dumps(facts, ensure_ascii=False)
+    summary = f"COMPACTION_LABEL={label}. Task facts: " + json.dumps(
+        {key: value for key, value in facts.items() if key != omitted_summary_fact},
+        ensure_ascii=False,
+    )
+    calls = []
+
+    async def respond(request):
+        payload = json.loads(request.content)
+        index = len(calls)
+        calls.append(payload)
+        assert index < expected_summary_calls + 2
+        if 1 <= index <= expected_summary_calls:
+            assert harness._is_compaction_wire_call(harness.WireCall(request=payload))
+            source = json.dumps(payload["messages"], ensure_ascii=False)
+            if expected_summary_calls == 1:
+                assert all(value in source for value in facts.values())
+            if native_window is None:
+                assert label in source
+            assert harness.COMPACTION_TAIL_MARKER not in source
+        content = (
+            f"COMPACTION_LABEL={label}" if index == 0 else summary
+            if index <= expected_summary_calls
+            else f"{label} COMPACTION_RECALL_OK {fact_json}"
+        )
+        frames = [
+            {"choices": [{"index": 0, "delta": {"content": content}}]},
+            {"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+             "usage": {"prompt_tokens": 7000 if index <= expected_summary_calls else 5000,
+                       "completion_tokens": 200}},
+        ]
+        return httpx.Response(200, stream=_SSE(frames),
+                              headers={"content-type": "text/event-stream"})
+
+    endpoint = harness.registry_endpoint(provider)
+    observer = harness.WireObserver(endpoint, httpx.MockTransport(respond),
+                                    endpoints={provider: endpoint})
+    operation = harness.run_case(
+        tmp_path, provider=provider, model=model, api_key="synthetic-test-key",
+        observer=observer, scenario="compaction", thinking="off",
+        compaction_options=harness.CompactionCaseOptions(
+            layout=layout, task_profile=profile, context_window_tokens=native_window,
+            native_pressure=native_window is not None,
+        ),
+    )
+    if omitted_summary_fact:
+        with pytest.raises(harness.ReplayCheckError, match="summary_critical_fact_missing"):
+            await operation
+        checks = harness._wire_diagnostics(observer)["critical_fact_checks"]
+        assert checks[0]["summary"][omitted_summary_fact] is False
+        assert all(checks[0]["answer"].values())
+        return
+    report = await operation
+    assert report["ok"] is True
+    assert report["layout"] == layout
+    assert report["model_calls"] == expected_summary_calls + 2
+    assert report["critical_fact_checks"] == [{
+        "summary": dict.fromkeys(facts, True), "answer": dict.fromkeys(facts, True),
+    }]
+    assert len(report["source_fixture_sha256"]) == 64
+    assert report["pressure_checks"][0]["same_payload_scope"] is False
+    calls = harness._wire_diagnostics(observer)["calls"]
+    assert calls[-1]["physical_prompt_tokens"] == 5000
+    assert all(call["provider"] == provider for call in calls)
+    hashes, _, summaries, rows = await _compaction_rows(tmp_path)
+    assert len(hashes) == len(rows)
+    assert len(summaries) == 1
+    assert all(fact in summaries[0].summary_text for fact in facts.values())
+    if native_window is not None:
+        assert report["preflight_ratio"] == 0.85
+        assert report["acceptance_scope"] == "native_window_pressure"
+        assert report["coverage"]["observed"]["native_pressure"] is True
+        assert report["pressure_checks"][0]["before_parent"]["estimated_pressure_ratio"] >= 0.85
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("window", [200_000, 1_000_000])
+async def test_native_window_pressure_uses_production_trigger_and_real_storage(
+    tmp_path, monkeypatch, window,
+):
+    from opensquilla.provider.model_catalog import DeploymentModelLimits, shared_catalog
+
+    monkeypatch.setattr(shared_catalog(), "resolve_deployment_limits", lambda *args, **kwargs:
+                        DeploymentModelLimits(window, 4096, True, True))
+    await test_compaction_task_facts_use_both_layouts_and_real_storage(
+        tmp_path, monkeypatch, "tokenrhythm", "suffix", "coding", native_window=window,
+    )
+
+
+@pytest.mark.asyncio
+async def test_native_pressure_accepts_two_complete_summary_chunks(tmp_path, monkeypatch):
+    from opensquilla.provider.model_catalog import DeploymentModelLimits, shared_catalog
+    from opensquilla.session import compaction
+
+    monkeypatch.setattr(shared_catalog(), "resolve_deployment_limits", lambda *args, **kwargs:
+                        DeploymentModelLimits(200000, 4096, True, True))
+    original = compaction._chunk_entries
+
+    def two_chunks(entries, budget, **kwargs):
+        chunks = original(entries, budget, **kwargs)
+        if len(chunks) == 1 and len(chunks[0]) >= 4:
+            cut = (len(chunks[0]) // 4) * 2
+            return [chunks[0][:cut], chunks[0][cut:]]
+        return chunks
+
+    monkeypatch.setattr(compaction, "_chunk_entries", two_chunks)
+    await test_compaction_task_facts_use_both_layouts_and_real_storage(
+        tmp_path, monkeypatch, "tokenrhythm", "suffix", "coding", native_window=200000,
+        expected_summary_calls=2,
+    )
+
+
+@pytest.mark.asyncio
+async def test_failed_live_fact_acceptance_retains_field_diagnostics(tmp_path, monkeypatch):
+    await test_compaction_task_facts_use_both_layouts_and_real_storage(
+        tmp_path, monkeypatch, "tokenrhythm", "suffix", "coding", omitted_summary_fact="owner",
+    )
+
+
+@pytest.mark.asyncio
+async def test_comparison_reuses_frozen_sqlite_input_and_locks_controls(tmp_path, monkeypatch):
+    from scripts.live_compaction_comparison import (
+        compare_measurements,
+        read_snapshot,
+        run_comparison,
+    )
+
+    monkeypatch.setenv("OPENSQUILLA_LIVE_DISABLE_DOTENV", "1")
+    snapshot = tmp_path / "frozen"
+    source = tmp_path / "source"
+    source.mkdir()
+    facts = harness.compaction_task_facts("coding")
+    label = "qxvzrjtk"
+    endpoint = harness.registry_endpoint("tokenrhythm")
+
+    async def parent_response(request):
+        return httpx.Response(200, stream=_SSE([
+            {"choices": [{"delta": {"content": f"COMPACTION_LABEL={label}"}}]},
+            {"choices": [{"delta": {}, "finish_reason": "stop"}]},
+        ]), headers={"content-type": "text/event-stream"})
+
+    observer = harness.WireObserver(endpoint, httpx.MockTransport(parent_response))
+    exported = await harness.run_case(
+        source, provider="tokenrhythm", model="deepseek-v4-flash", api_key="synthetic-key",
+        observer=observer, scenario="compaction", thinking="off",
+        compaction_options=harness.CompactionCaseOptions(task_profile="coding"),
+        comparison_snapshot_out=snapshot,
+    )
+    assert exported["status"] == "comparison_snapshot_exported"
+    assert len(observer.calls) == 1
+    original_database = (snapshot / "sessions.sqlite").read_bytes()
+    manifest = read_snapshot(snapshot, secrets=("synthetic-key",))
+    assert manifest["settings"]["preflight_ratio"] == 0.85
+    measured = []
+
+    async def comparison_response(request):
+        payload = json.loads(request.content)
+        summary = harness._is_compaction_wire_call(harness.WireCall(request=payload))
+        content = (f"COMPACTION_LABEL={label}. " if summary else
+                   f"{label} COMPACTION_RECALL_OK ") + json.dumps(facts)
+        return httpx.Response(200, stream=_SSE([
+            {"choices": [{"delta": {"content": content}}]},
+            {"choices": [{"delta": {}, "finish_reason": "stop"}],
+             "usage": {"prompt_tokens": 6000, "completion_tokens": 180}},
+        ]), headers={"content-type": "text/event-stream"})
+
+    for name, tokens, chars in (("natural", None, None), ("controlled", 7000, 30000)):
+        run_root = tmp_path / name
+        run_root.mkdir()
+        observed = harness.WireObserver(endpoint, httpx.MockTransport(comparison_response))
+        result = await run_comparison(run_root, snapshot, api_key="synthetic-key",
+                                      observer=observed, history_tokens=tokens, history_chars=chars)
+        assert result["ok"] is True
+        proof = result["comparison"]
+        assert proof["archive_preserved"] is True
+        assert all(proof["answer_fact_checks"].values())
+        assert proof["source_sha256"] == manifest["source_sha256"]
+        if tokens is not None:
+            assert proof["capacity_samples"]
+            assert all(sample["applied_tokens"] == tokens for sample in proof["capacity_samples"])
+        measured.append(proof)
+    for key in ("source_sha256", "prompt_sha256", "controls_sha256", "actual_system_sha256",
+                "actual_tools_sha256", "actual_model", "actual_controls_sha256"):
+        assert measured[0][key] == measured[1][key]
+    measured_natural = {"comparison": measured[0]}
+    assert compare_measurements(measured_natural, measured_natural)["comparable"] is True
+    with pytest.raises(harness.ReplayCheckError,
+                       match="comparison_inputs_or_controls_do_not_match"):
+        compare_measurements(measured_natural, {"comparison": measured[1]})
+    assert (snapshot / "sessions.sqlite").read_bytes() == original_database
 
 
 def _anthropic_response(call_index: int, model: str) -> tuple[list[dict], list[dict]]:
