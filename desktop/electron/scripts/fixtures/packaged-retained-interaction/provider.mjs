@@ -6,7 +6,9 @@ import { sha256 } from './contract.mjs'
 // from the current user message. History/substrings must never select a turn.
 const timePrefix = /^\[\d{4}-\d{2}-\d{2}T\d{2}:\d{2}[+\-]\d{2}:\d{2} (?:Mon|Tue|Wed|Thu|Fri|Sat|Sun) [A-Za-z0-9_+\-/]+\]\n/
 // Agent._runtime_context_block appends the OS-localized timezone to a turn.
-const runtimeSuffix = /\n\n\[Runtime context for this turn\]\nCurrent local date\/time: \d{4}-\d{2}-\d{2}T\d{2}:\d{2}[+\-]\d{2}:\d{2} \((?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)\)\nTime zone \/ location hint: [^\r\n]{1,128}\nUse this runtime context for questions about the current date, time, or local time zone\. Do not treat it as a user request\.$/
+// Ollama joins text blocks with one space; consume only that optional separator.
+// The direct synthetic route may append its exact deployment identity afterward.
+const runtimeSuffix = / ?\n\n\[Runtime context for this turn\]\nCurrent local date\/time: \d{4}-\d{2}-\d{2}T\d{2}:\d{2}[+\-]\d{2}:\d{2} \((?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)\)\nTime zone \/ location hint: [^\r\n]{1,128}\nUse this runtime context for questions about the current date, time, or local time zone\. Do not treat it as a user request\.(?:\nCurrent response execution: (\{[^\r\n]*\}))?$/
 
 // The provider is not given the sentinel's contents. It can complete the tool
 // turn only after read_file returns the nonce whose hash the driver supplied.
@@ -45,7 +47,14 @@ export async function startRetainedProvider({ baseUrl, model, messages, sentinel
       assert.ok(Array.isArray(payload.messages), 'Missing provider messages')
       const userIndex = payload.messages.findLastIndex(message => message.role === 'user')
       const content = payload.messages[userIndex]?.content
-      const prompt = typeof content === 'string' ? content.replace(timePrefix, '').replace(runtimeSuffix, '') : content
+      const prompt = typeof content === 'string' ? content.replace(timePrefix, '').replace(runtimeSuffix, (_suffix, execution) => {
+        if (execution !== undefined) {
+          const expected = { kind: 'single_model', provider: 'ollama', model }
+          assert.deepEqual(JSON.parse(execution), expected, 'Unexpected audit execution identity')
+          assert.equal(execution, JSON.stringify(expected), 'Unexpected audit execution identity format')
+        }
+        return ''
+      }) : content
       if (prompt === messages.first) {
         assert.equal(++state.first, 1, 'Duplicate first send')
         send(response, messages.firstAnswer)

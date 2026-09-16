@@ -1463,6 +1463,41 @@ async def test_chat_history_mutation_ledger_overrides_task_facts_and_is_scoped(
 
 
 @pytest.mark.asyncio
+async def test_chat_history_preserves_provider_failure_reference_without_error_row(tmp_path):
+    storage = await SessionStorage.open(str(tmp_path / "provider-error.db"))
+    manager = SessionManager(storage, inject_time_prefix=False)
+    session_key = "agent:main:webchat:provider-error"
+    await manager.create(session_key)
+    try:
+        with turn_context_scope({"turn_id": "provider-turn"}):
+            await manager.append_message(session_key, "user", "synthetic request")
+            await manager.append_message(session_key, "assistant", "Partial answer")
+        outcome = {
+            "kind": "failed", "reason": "401", "error_class": "401",
+            "failure_kind": "auth_invalid", "error_id": "abcdef01", "retryable": False,
+        }
+        await storage.create_agent_task(AgentTaskRecord(
+            task_id="provider-turn", session_key=session_key, agent_id="main",
+            source_kind="webui", queue_mode="followup", run_kind="session_turn",
+            status=AgentTaskStatus.FAILED, terminal_reason="error", error_class="401",
+            details={"turn_id": "provider-turn", "turn_outcome": outcome},
+        ))
+        result = await _handle_chat_history(
+            {"sessionKey": session_key, "limit": 10},
+            RpcContext(conn_id="test", principal=SimpleNamespace(role="operator"),
+                       session_manager=manager),
+        )
+        projected = result["turn_outcomes"][0]
+        assert projected["outcome"] == outcome
+        assert projected["terminal_message"] == (
+            "The model provider rejected the configured credentials. (ref: abcdef01)"
+        )
+        assert [m["text"] for m in result["messages"]] == ["synthetic request", "Partial answer"]
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
 async def test_chat_history_projects_usage_barrier_retry_and_activity_snapshot(tmp_path) -> None:
     storage = SessionStorage(str(tmp_path / "history-usage-barrier.db"))
     await storage.connect()

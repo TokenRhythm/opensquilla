@@ -351,15 +351,27 @@ async def test_six_safe_tools_run_concurrent() -> None:
 async def test_safe_tool_concurrency_limit_caps_in_flight_tasks() -> None:
     """Safe tools should run concurrently, but not without an upper bound."""
     tool_names = _SAFE_SAMPLE
+    assert len(tool_names) == 6
     max_in_flight = 0
     in_flight = 0
+    started: list[str] = []
+    completed: list[str] = []
+    batch_started = [asyncio.Event() for _ in range(3)]
+    release_batch = [asyncio.Event() for _ in range(3)]
 
     async def _handler(tc: ToolCall) -> ToolResult:
         nonlocal in_flight, max_in_flight
         in_flight += 1
         max_in_flight = max(max_in_flight, in_flight)
-        await asyncio.sleep(_TOOL_SLEEP_S)
-        in_flight -= 1
+        batch = len(started) // 2
+        started.append(tc.tool_name)
+        try:
+            if len(started) % 2 == 0:
+                batch_started[batch].set()
+            await release_batch[batch].wait()
+            completed.append(tc.tool_name)
+        finally:
+            in_flight -= 1
         return ToolResult(
             tool_use_id=tc.tool_use_id,
             tool_name=tc.tool_name,
@@ -374,12 +386,34 @@ async def test_safe_tool_concurrency_limit_caps_in_flight_tasks() -> None:
         tool_handler=_handler,
     )
 
-    t0 = time.monotonic()
-    await _collect(agent)
-    elapsed = time.monotonic() - t0
+    turn = asyncio.create_task(_collect(agent))
+    try:
+        # Each pair must enter together while later tools remain blocked.
+        # The timeout only bounds a broken dispatcher; no elapsed duration
+        # decides whether its concurrency contract passes.
+        async with asyncio.timeout(5):
+            for batch in range(3):
+                await batch_started[batch].wait()
+                # Let already runnable contenders attempt admission before
+                # releasing this pair; a missing cap must expose a third.
+                await asyncio.sleep(0)
+                assert len(started) == (batch + 1) * 2
+                assert len(completed) == batch * 2
+                assert in_flight == 2
+                release_batch[batch].set()
+            await turn
+    finally:
+        for release in release_batch:
+            release.set()
+        if not turn.done():
+            turn.cancel()
+        await asyncio.gather(turn, return_exceptions=True)
 
     assert max_in_flight == 2
-    assert 2 * _TOOL_SLEEP_S <= elapsed < 4 * _TOOL_SLEEP_S
+    assert in_flight == 0
+    assert sorted(started) == sorted(tool_names)
+    assert sorted(completed) == sorted(tool_names)
+    assert len(provider.calls) == 2
 
 
 # ---------------------------------------------------------------------------

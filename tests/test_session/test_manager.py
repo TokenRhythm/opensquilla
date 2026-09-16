@@ -3662,13 +3662,24 @@ async def test_compact_with_result_strict_coverage_installs_verified_backfill(ma
 
 
 @pytest.mark.asyncio
-async def test_compact_with_result_writes_portable_context_state(manager):
+@pytest.mark.parametrize("fallback_tokenizer", [False, True])
+async def test_compact_with_result_writes_portable_context_state(
+    manager, monkeypatch, fallback_tokenizer,
+):
+    from opensquilla import token_estimation
+
+    if fallback_tokenizer:
+        monkeypatch.setattr(
+            token_estimation, "_encoding", token_estimation._ENCODING_UNAVAILABLE,
+        )
+    # Keep pressure above the window while allowing the portable payload to fit
+    # with either the normal tokenizer or the conservative offline estimator.
     await manager.create("agent:main:main")
     await manager.append_message(
         "agent:main:main",
         "user",
         "Goal: keep portable state. File src/opensquilla/session/models.py.",
-        token_count=250,
+        token_count=1500,
     )
     for i in range(8):
         await manager.append_message(
@@ -3680,7 +3691,7 @@ async def test_compact_with_result_writes_portable_context_state(manager):
 
     result = await manager.compact_with_result(
         "agent:main:main",
-        context_window_tokens=300,
+        context_window_tokens=1000,
         config=synthetic_compaction_config(safety_margin=1.0),
     )
 
