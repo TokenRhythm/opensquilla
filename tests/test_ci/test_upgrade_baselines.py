@@ -244,38 +244,47 @@ def test_packaged_recovery_preserves_original_failure_after_cleanup(
         encoding="utf-8",
     )
     # This is a synthetic error/cleanup contract, not a recovery-latency check.
-    # Allow Windows CI headroom for Node startup and captured-pipe completion.
-    try:
-        result = subprocess.run(
-            [
-                node,
-                str(tmp_path / "test-packaged-session-recovery.mjs"),
-                "--executable",
-                str(tmp_path / "synthetic.exe"),
-                "--user-data-dir",
-                str(tmp_path / "profile"),
-                "--session-key",
-                "synthetic-main",
-                "--switch-session-key",
-                "synthetic-peer",
-                "--label",
-                "synthetic",
-            ],
-            capture_output=True,
-            text=True,
-            check=False,
-            timeout=30 if os.name == "nt" else 10,
-        )
-    except subprocess.TimeoutExpired as error:
-        error.add_note(f"Captured stdout: {error.stdout!r}\nCaptured stderr: {error.stderr!r}")
-        raise
+    # File-backed output avoids Windows pipe-reader threads and preserves partial
+    # diagnostics even when the child has not exited by the original deadline.
+    stdout_path = tmp_path / "node-stdout.log"
+    stderr_path = tmp_path / "node-stderr.log"
+    with stdout_path.open("wb") as stdout_file, stderr_path.open("wb") as stderr_file:
+        try:
+            result = subprocess.run(
+                [
+                    node,
+                    str(tmp_path / "test-packaged-session-recovery.mjs"),
+                    "--executable",
+                    str(tmp_path / "synthetic.exe"),
+                    "--user-data-dir",
+                    str(tmp_path / "profile"),
+                    "--session-key",
+                    "synthetic-main",
+                    "--switch-session-key",
+                    "synthetic-peer",
+                    "--label",
+                    "synthetic",
+                ],
+                stdout=stdout_file,
+                stderr=stderr_file,
+                check=False,
+                timeout=30 if os.name == "nt" else 10,
+            )
+        except subprocess.TimeoutExpired as error:
+            error.add_note(
+                f"Captured stdout: {stdout_path.read_text(encoding='utf-8', errors='replace')!r}\n"
+                f"Captured stderr: {stderr_path.read_text(encoding='utf-8', errors='replace')!r}"
+            )
+            raise
+    stdout = stdout_path.read_text(encoding="utf-8")
+    stderr = stderr_path.read_text(encoding="utf-8")
     assert result.returncode != 0
-    assert "packaged_session_recovery_failed_before_cleanup" in result.stderr
-    assert "synthetic-cleanup-ran" in result.stderr
-    assert "Error: synthetic recovery fault" in result.stderr
-    assert not result.stdout
+    assert "packaged_session_recovery_failed_before_cleanup" in stderr
+    assert "synthetic-cleanup-ran" in stderr
+    assert "Error: synthetic recovery fault" in stderr
+    assert not stdout
     if cleanup_fails:
-        assert result.stderr.rindex("Error: synthetic recovery fault") > result.stderr.rindex(
+        assert stderr.rindex("Error: synthetic recovery fault") > stderr.rindex(
             "Error: synthetic cleanup fault"
         )
 

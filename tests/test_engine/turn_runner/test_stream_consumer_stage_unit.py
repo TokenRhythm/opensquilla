@@ -164,6 +164,7 @@ class _RecordingCompactionPersist:
         removed_count: int = 0,
         source_entries: tuple[Any, ...] | None = None,
         source_preimage: tuple[tuple[Any, ...], ...] | None = None,
+        source_context_fingerprint: str | None = None,
         source_boundary_message_id: str | None = None,
         source_boundary_entry_id: int | None = None,
         expected_session_id: str | None = None,
@@ -187,6 +188,7 @@ class _RecordingCompactionPersist:
                 "removed_count": removed_count,
                 "source_entries": source_entries,
                 "source_preimage": source_preimage,
+                "source_context_fingerprint": source_context_fingerprint,
                 "source_boundary_message_id": source_boundary_message_id,
                 "source_boundary_entry_id": source_boundary_entry_id,
                 "expected_session_id": expected_session_id,
@@ -295,6 +297,7 @@ def _make_input(
     tool_context: Any | None = None,
     compaction_source_entries: tuple[Any, ...] | None = None,
     compaction_source_preimage: tuple[tuple[Any, ...], ...] | None = None,
+    compaction_source_context_fingerprint: str | None = None,
     compaction_source_boundary_message_id: str | None = None,
     compaction_source_boundary_entry_id: int | None = None,
     expected_session_id: str | None = None,
@@ -324,6 +327,7 @@ def _make_input(
         tool_context=tool_context,
         compaction_source_entries=compaction_source_entries,
         compaction_source_preimage=compaction_source_preimage,
+        compaction_source_context_fingerprint=compaction_source_context_fingerprint,
         compaction_source_boundary_message_id=(
             compaction_source_boundary_message_id
         ),
@@ -1697,6 +1701,7 @@ async def test_compaction_handler_runs_persist_snapshot_prompt_in_order() -> Non
     inp = _make_input(
         compaction_source_entries=source_entries,
         compaction_source_preimage=source_preimage,
+        compaction_source_context_fingerprint="frozen-context",
         compaction_source_boundary_message_id="source-boundary",
         compaction_source_boundary_entry_id=7,
         expected_session_id="session-admitted",
@@ -1718,6 +1723,7 @@ async def test_compaction_handler_runs_persist_snapshot_prompt_in_order() -> Non
     assert persist.calls[0]["removed_count"] == 4
     assert persist.calls[0]["source_entries"] is source_entries
     assert persist.calls[0]["source_preimage"] is source_preimage
+    assert persist.calls[0]["source_context_fingerprint"] == "frozen-context"
     assert persist.calls[0]["source_boundary_message_id"] == "source-boundary"
     assert persist.calls[0]["source_boundary_entry_id"] == 7
     assert persist.calls[0]["expected_session_id"] == "session-admitted"

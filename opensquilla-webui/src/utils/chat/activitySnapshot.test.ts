@@ -9,6 +9,7 @@ import {
   normalizeActivitySnapshot,
   restoreActivityInterruptTimeline,
 } from './activitySnapshot'
+import { projectAssistantActivityTimeline } from './assistantActivity'
 
 const snapshot: ActivitySnapshotV2 = {
   version: 2,
@@ -38,6 +39,26 @@ const snapshot: ActivitySnapshotV2 = {
 }
 
 describe('activitySnapshot v2', () => {
+  it('restores temporary maintenance without promoting it to a saved summary', () => {
+    const normalized = normalizeActivitySnapshot({
+      version: 2, task_id: 'turn-1', turn_id: 'turn-1',
+      complete: true, reasoning_utf16_length: 0,
+      entries: [{
+        type: 'maintenance', id: 'cmp-temporary', order: 1,
+        maintenance_type: 'context_compaction', state: 'completed',
+        at: 1_000, ended_at: 2_000, source: 'automatic', durability: 'request_scoped',
+      }],
+    }, 'turn-1', 'turn-1')
+
+    expect(normalized).toBeDefined()
+    const history = activityStatusHistory(normalized!)
+    expect(history).toMatchObject([{ state: 'completed', durability: 'request_scoped' }])
+    const projection = projectAssistantActivityTimeline([], { lifecycle: 'settled', statusHistory: history })
+    expect(projection.statusSteps[0]).toMatchObject({
+      isCurrent: false, label: { code: 'chat.compact.temporarilyReduced' },
+    })
+  })
+
   it('restores connection recovery with its attempt and no artificial retry limit', () => {
     const normalized = normalizeActivitySnapshot({
       version: 2,

@@ -351,6 +351,37 @@ def format_compaction_summary_context(summary_texts: Sequence[str]) -> str | Non
     )
 
 
+def compaction_summary_replay_is_complete(summary_text: str) -> bool:
+    """Whether a new checkpoint survives the ordinary replay wrapper unchanged.
+
+    Legacy checkpoints retain their bounded display compatibility. New durable
+    checkpoints must not depend on that lossy compatibility projection.
+    """
+
+    text = summary_text.strip()
+    if not text:
+        return False
+    expected = f"{_COMPACTION_SUMMARY_CONTEXT_HEADER}\n[Summary 1]\n{text}"
+    return format_compaction_summary_context([text]) == expected
+
+
+def compaction_replay_is_complete(summary_texts: Sequence[str], rendered: str | None) -> bool:
+    """Check whether an existing checkpoint set is intact and unambiguous."""
+
+    texts = [text.strip() for text in summary_texts if text.strip()]
+    if not texts or not rendered:
+        return False
+    for text in texts:
+        if text not in rendered:
+            return False
+        if text.startswith(_STRUCTURED_COMPACTION_SUMMARY_HEADER) and (
+            _split_structured_summary_sections(text) is None
+            or text.count(_STRUCTURED_COMPACTION_SUMMARY_HEADER) != 1
+        ):
+            return False
+    return True
+
+
 def compaction_context_fingerprint(
     *,
     context_states: Sequence[SessionContextState],

@@ -8,6 +8,7 @@ import json
 import logging
 import random
 import re
+import secrets
 import sqlite3
 import time
 from collections.abc import (
@@ -2435,6 +2436,35 @@ class SessionStorage:
                 finally:
                     await connection.close()
             self._usage_backfill_indexes_ready = True
+
+    async def ensure_daily_usage_store_id(self) -> str:
+        """Keep upload deduplication scoped to this database, including after moves.
+
+        Create the identity only when an enabled uploader has pending data.
+        Confirm the persisted winner inside the transaction so concurrent
+        connections cannot start sending under different temporary identities.
+        """
+        key = "telemetry.daily_usage_store_id"
+        async with self._write_transaction("ensure_daily_usage_store_id") as conn:
+            await conn.execute(
+                """
+                INSERT INTO runtime_preferences (
+                    preference_key, preference_value, updated_at
+                ) VALUES (?, ?, ?)
+                ON CONFLICT(preference_key) DO NOTHING
+                """,
+                (key, secrets.token_hex(16), _now_ms()),
+            )
+            async with conn.execute(
+                "SELECT preference_value FROM runtime_preferences WHERE preference_key = ?",
+                (key,),
+            ) as cur:
+                row = await cur.fetchone()
+            if row is None or re.fullmatch(r"[0-9a-f]{32}", str(row[0])) is None:
+                # Rotating a damaged existing identity would replay accepted days.
+                raise ValueError("Invalid daily usage store identity")
+            store_id = str(row[0])
+        return store_id
 
     async def record_daily_usage(
         self,

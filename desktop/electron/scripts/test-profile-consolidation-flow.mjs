@@ -797,8 +797,8 @@ try {
     invalidCredentialStableCode: skippedCredentialEvent.stableCode,
   }, null, 2))
 } catch (error) {
-  const desktopLog = await readFile(join(userData, 'logs', 'desktop.log'), 'utf8').catch(() => '')
-  const gatewayLog = await readFile(join(userData, 'logs', 'gateway.log'), 'utf8').catch(() => '')
+  const desktopLog = await readFile(join(activeAppUserData, 'logs', 'desktop.log'), 'utf8').catch(() => '')
+  const gatewayLog = await readFile(join(activeAppUserData, 'logs', 'gateway.log'), 'utf8').catch(() => '')
   console.error(JSON.stringify({
     phase: 'run-error-before-cleanup',
     error: String(error?.stack || error),
