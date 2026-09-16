@@ -729,6 +729,47 @@
     }
   },
   "setup": {
+    "capacity": {
+      "customOpenAI": "Personnalisé · compatible OpenAI",
+      "customAnthropic": "Personnalisé · compatible Anthropic",
+      "partialSaved": "Enregistré : {saved}. Non enregistré : {pending}. Les valeurs non enregistrées sont conservées.",
+      "providerPartialSaved": "Le fournisseur a été enregistré. Les limites du modèle n’ont pas été enregistrées ; vos saisies sont conservées.",
+      "backToRouting": "Retour au routage intelligent",
+      "editSharedEnsemble": "Modifier l’ensemble partagé",
+      "sharedEnsemble": "C3 et la fusion de modèles partagent cet ensemble.",
+      "title": "Paramètres du modèle",
+      "forModel": "Paramètres du modèle — {model}",
+      "unknown": "Limites à confirmer",
+      "contextWindow": "Fenêtre de contexte",
+      "maxOutputTokens": "Longueur maximale de sortie",
+      "scope": "S’applique partout où ce modèle est utilisé avec ce fournisseur.",
+      "current": "Actuellement {value} tokens · {source}",
+      "source": {
+        "catalog": "Catalogue de modèles",
+        "default": "Valeur par défaut du système",
+        "config": "Configuration globale",
+        "override": "Valeur manuelle"
+      },
+      "autoValue": "Automatique ({value})",
+      "autoHint": "Laissez vide pour le mode automatique ; saisissez un entier positif pour modifier la valeur.",
+      "requestHint": "Limite de sortie du modèle ; les réponses peuvent être plus courtes.",
+      "localHint": "Cette valeur doit correspondre au contexte configuré sur votre serveur de modèles local.",
+      "serverControlled": "La longueur de sortie est contrôlée par le serveur.",
+      "restore": "Rétablir les valeurs automatiques",
+      "positiveInteger": "Saisissez un entier positif ou laissez vide pour une valeur automatique.",
+      "upgrade": "Mettez à jour le Gateway pour consulter et modifier les limites. Les paramètres existants restent disponibles.",
+      "loadFailed": "Impossible de charger les limites du modèle. Vos modifications sont conservées.",
+      "retry": "Réessayer",
+      "draftHint": "Après Terminé, cliquez sur Enregistrer les modifications dans les paramètres.",
+      "done": "Terminé",
+      "invalid": "Vérifiez les valeurs des limites avant d’enregistrer.",
+      "saved": "Limites du modèle enregistrées.",
+      "saveFailed": "Impossible d’enregistrer les limites du modèle. Les valeurs non enregistrées sont conservées.",
+      "unknownHint": "Une ou deux limites du modèle restent à confirmer. Les valeurs par défaut sont utilisées ; vous pouvez définir les limites ici.",
+      "automaticSource": "Automatique · {source}",
+      "unsaved": "Non enregistré",
+      "effective": "Limite effective : {value} tokens"
+    },
     "cli": {
       "advancedTitle": "Avancé · CLI intégrée",
       "hintBundled": "Ces commandes utilisent la CLI intégrée à l'application ; collez-les dans un terminal pour les exécuter.",
@@ -1166,7 +1207,7 @@
       "openrouterFixedDesc": "Quand le service de modèles utilise {provider}, le routage agrégé utilise quatre modèles proposants et un agrégateur.",
       "openrouterFixedProposer": "Modèle proposant",
       "openrouterFixedAggregator": "Agrégateur",
-      "credentialReady": "Connecté",
+      "credentialReady": "Identifiants disponibles",
       "credentialNeeded": "Identifiants {provider} requis",
       "credentialMissingEnv": "{envKey} requis",
       "credentialUnknown": "Identifiants non vérifiés",
@@ -1197,7 +1238,7 @@
       "aggregatorNote": "Fusionne tous les brouillons en réponse finale ; seul membre pouvant appeler des outils",
       "aggregatorSectionLabel": "Agrégateur",
       "aggregatorSectionDesc": "Un seul agrégateur produit la réponse finale. Choisissez le modèle le plus puissant de la composition.",
-      "aggregatorInheritedNote": "Aucun agrégateur assigné — le modèle de chat actuel fusionne les brouillons",
+      "aggregatorInheritedNote": "Utilise le modèle actuel",
       "proposerSectionLabel": "Proposants",
       "proposerRoleLabel": "Proposant",
       "aggregatorRoleLabel": "Agrégateur",
@@ -1215,7 +1256,7 @@
       "replaceCandidateConfirm": "Remplacer",
       "candidateDuplicate": "Ce modèle figure déjà dans la liste des proposants.",
       "addProposer": "Ajouter un proposant",
-      "chooseAggregator": "Choisir l'agrégateur",
+      "chooseAggregator": "Changer de modèle",
       "aggregatorPickerTitle": "Choisir l'agrégateur",
       "aggregatorFromProposers": "Utiliser un proposant existant",
       "aggregatorOtherModel": "Ou choisir un autre modèle",
@@ -1234,7 +1275,8 @@
       "proposerRetriesDesc": "Uniquement les échecs réessayables ; la requête initiale ne compte pas comme nouvelle tentative.",
       "proposerRetriesOption": "Au plus {count} nouvelles tentatives après la requête initiale",
       "runtimeLimitsLabel": "Limites de temps",
-      "runtimeLimits": "Proposants {proposerTimeout}s au total · inactivité de l'agrégateur entre événements {aggregatorTimeout}s (configurée {configuredAggregatorTimeout}s) · délai total du tour séparé"
+      "runtimeLimits": "Proposants {proposerTimeout}s au total · inactivité de l'agrégateur entre événements {aggregatorTimeout}s (configurée {configuredAggregatorTimeout}s) · délai total du tour séparé",
+      "fallbackModelLabel": "Modèle de secours"
     },
     "behavior": {
       "title": "Comportement des sessions",
@@ -1730,7 +1772,9 @@
       "dataMaintenanceAria": "Ouvrir la maintenance des données",
       "runTraceLabel": "Tiroir de trace d'exécution dans les Journaux",
       "runTraceDesc": "Rend les lignes de journal interactives et ouvre un tiroir de détail par étape de nœud dans la vue Journaux.",
-      "runTraceAria": "Tiroir de trace d'exécution dans les Journaux (prend effet après rechargement)"
+      "runTraceAria": "Tiroir de trace d'exécution dans les Journaux (prend effet après rechargement)",
+      "configFileLabel": "Fichier de configuration",
+      "configFileDesc": "D’autres options sont disponibles dans le fichier de configuration."
     },
     "privacy": {
       "statusDisabledByEnv": "Désactivés par un paramètre d’environnement.",

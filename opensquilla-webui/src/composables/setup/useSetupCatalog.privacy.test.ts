@@ -181,6 +181,12 @@ async function mountCatalog() {
     },
   } as unknown as import('@/modules/setupWorkflow').SetupWorkflow)
   app.provide(PROVIDER_CONFIGURATION_KEY, {
+    capacitySupported: true,
+    resolveCapacity: async (models: readonly {provider: string; model: string}[]) => ({models: models.map(target => ({
+      ...target, localRuntime: false,
+      contextWindow: { automatic: 8192, automaticSource: 'default', override: null, value: 8192, source: 'default', editable: true },
+      maxOutputTokens: { automatic: 16384, automaticSource: 'default', override: null, value: 16384, source: 'default', editable: true },
+    }))}),
     catalog: async () => [],
     list: async () => ({ models: [], errors: [] }),
     status: async () => ({ activeProvider: null, providerResolution: {}, providers: [], count: 0 }),
@@ -6986,5 +6992,128 @@ describe('recommended Router reset and activation safety', () => {
     expect(api.sectionStatus('provider').tone).toBe('is-warn')
     expect(api.providerPanel.value.providerSelected).toBe('openrouter')
     app.unmount()
+  })
+})
+
+
+describe('capacity save integration', () => {
+  it.each(['131072', ''])('restores the prior routing draft when provider editing is cancelled after entering %s', async value => {
+    const { api, app } = await primaryTransitionScenario()
+    try {
+      const target = { provider: 'openrouter', model: 'example.vendor/model.v1:latest' }
+      api.modelCapacity.ensure(target)
+      await vi.waitFor(() => expect(api.modelCapacity.rows.size).toBeGreaterThan(0))
+      api.modelCapacity.update(target, { contextWindow: '65536', maxOutputTokens: '' }, 'modelStrategy')
+      await api.requestSelectConfiguredProvider('openrouter')
+      api.modelCapacity.update(target, { contextWindow: value, maxOutputTokens: '' }, 'provider:openrouter')
+      api.cancelProviderEdit()
+      expect(api.modelCapacity.values(target).contextWindow).toBe('65536')
+      expect(api.modelCapacity.dirty('modelStrategy')).toBe(true)
+      expect(api.modelCapacity.dirty('provider:openrouter')).toBe(false)
+    } finally { app.unmount() }
+  })
+  it('does not restore a routing draft after its provider edit was saved', async () => {
+    const { api, app } = await primaryTransitionScenario()
+    try {
+      const target = { provider: 'openrouter', model: 'example.vendor/model.v1:latest' }
+      api.modelCapacity.ensure(target)
+      await vi.waitFor(() => expect(api.modelCapacity.rows.size).toBeGreaterThan(0))
+      api.modelCapacity.update(target, { contextWindow: '65536', maxOutputTokens: '' }, 'modelStrategy')
+      await api.requestSelectConfiguredProvider('openrouter')
+      api.modelCapacity.update(target, { contextWindow: '131072', maxOutputTokens: '' }, 'provider:openrouter')
+      expect(await api.saveProvider({ reload: false })).toBe(true)
+      api.cancelProviderEdit()
+      expect(api.modelCapacity.dirty('modelStrategy')).toBe(false)
+    } finally { app.unmount() }
+  })
+  it('identifies an unsaved routing panel style separately from saved model tiers', async () => {
+    const scenario = await primaryTransitionScenario(false, (method, params) => {
+      if (method === 'onboarding.router.configure') {
+        scenario.saved.squilla_router.tiers.c0.model = String((params?.tiers as Record<string, { model: string }>).c0!.model)
+        return { changed: true }
+      }
+      if (method === 'config.patch.safe') throw new Error('synthetic style save failure')
+      return { changed: true }
+    })
+    const { api, app } = scenario
+    try {
+      const target = { provider: 'openrouter', model: 'example.vendor/model.v1:latest' }
+      api.modelCapacity.ensure(target)
+      await vi.waitFor(() => expect(api.modelCapacity.rows.size).toBeGreaterThan(0))
+      api.updateTierField('c0', 'model', 'saved-new-route')
+      api.setRouterVisualMode('legacy_grid')
+      api.modelCapacity.update(target, { contextWindow: '65536', maxOutputTokens: '' }, 'modelStrategy')
+      expect(await api.saveModelStrategy()).toBe(false)
+      expect(pushToast).toHaveBeenCalledWith(expect.stringContaining('Saved: Intelligent model routing. Not saved: Routing decision panel style, Model settings.'), { tone: 'danger' })
+      expect(api.modelStrategyPanel.value.router.routerVisualMode).toBe('legacy_grid')
+      expect(api.modelCapacity.values(target).contextWindow).toBe('65536')
+      rpcCall.mockClear()
+      await api.saveModelStrategy({ reload: false })
+      expect(rpcCall.mock.calls.some(([method]) => method === 'onboarding.router.configure')).toBe(false)
+      expect(rpcCall.mock.calls.some(([method]) => method === 'config.patch.safe')).toBe(true)
+    } finally { app.unmount() }
+  })
+  it('rebases acknowledged routing while retaining a rejected capacity draft', async () => {
+    const scenario = await primaryTransitionScenario(false, (method, params) => {
+      if (method === 'onboarding.router.configure') {
+        scenario.saved.squilla_router.tiers.c0.model = String((params?.tiers as Record<string, { model: string }>).c0!.model)
+        return { changed: true }
+      }
+      if (method === 'config.patch' && params?.patch) throw new Error('synthetic capacity save failure')
+      return { changed: true }
+    })
+    const { api, app } = scenario
+    try {
+      const target = { provider: 'openrouter', model: 'example.vendor/model.v1:latest' }
+      api.modelCapacity.ensure(target)
+      await vi.waitFor(() => expect(api.modelCapacity.rows.size).toBeGreaterThan(0))
+      api.updateTierField('c0', 'model', 'saved-new-route')
+      api.modelCapacity.update(target, { contextWindow: '65536', maxOutputTokens: '' }, 'modelStrategy')
+      expect(await api.saveModelStrategy()).toBe(false)
+      expect(api.modelStrategyPanel.value.router.tierRows[0]?.model).toBe('saved-new-route')
+      expect(api.modelCapacity.values(target).contextWindow).toBe('65536')
+      expect(pushToast).toHaveBeenCalledWith(expect.stringContaining('Saved: Intelligent model routing. Not saved: Model settings.'), { tone: 'danger' })
+      rpcCall.mockClear()
+      await api.saveModelStrategy({ reload: false })
+      expect(rpcCall.mock.calls.some(([method]) => method === 'onboarding.router.configure')).toBe(false)
+    } finally { app.unmount() }
+  })
+  it.each(['provider', 'profile', 'modelStrategy'] as const)('saves capacity-only work through %s without activation or connection validation', async location => {
+    const { api, app } = await primaryTransitionScenario()
+    try {
+      if (location === 'profile') await api.selectConfiguredProvider('tokenrhythm')
+      const provider = location === 'profile' ? 'tokenrhythm' : 'openrouter'
+      const target = { provider, model: 'example.vendor/model.v1:latest' }
+      api.modelCapacity.ensure(target)
+      await Promise.resolve(); await Promise.resolve(); await nextTick()
+      const scope = location === 'modelStrategy' ? 'modelStrategy' : `provider:${provider}`
+      api.modelCapacity.update(target, { contextWindow: '262144', maxOutputTokens: '65536' }, scope)
+      rpcCall.mockClear()
+      const saved = location === 'modelStrategy' ? await api.saveModelStrategy({ reload: false }) : await api.saveProvider({ reload: false })
+      expect(saved).toBe(true)
+      expect(rpcCall.mock.calls.filter(([method]) => method === 'config.patch')).toEqual([['config.patch', {
+        patch: { models: { [provider]: { [target.model]: { context_window: 262144, max_output_tokens: 65536 } } } },
+      }]])
+      expect(rpcCall.mock.calls.some(([method]) => /configure|activate|probe/.test(method))).toBe(false)
+      expect(api.modelCapacity.dirty(scope)).toBe(false)
+    } finally { app.unmount() }
+  })
+  it('retains a rejected capacity patch and submits no second write for invalid values', async () => {
+    const { api, app } = await primaryTransitionScenario(false, method => {
+      if (method === 'config.patch') throw new Error('synthetic disk failure')
+      return { changed: true }
+    })
+    try {
+      const target = { provider: 'openrouter', model: 'example.v1/model:latest' }
+      api.modelCapacity.ensure(target)
+      await Promise.resolve(); await Promise.resolve(); await nextTick()
+      api.modelCapacity.update(target, { contextWindow: '65536', maxOutputTokens: '' }, 'modelStrategy')
+      expect(await api.saveModelStrategy({ reload: false })).toBe(false)
+      expect(api.modelCapacity.values(target).contextWindow).toBe('65536')
+      api.modelCapacity.update(target, { contextWindow: '-1', maxOutputTokens: '' }, 'modelStrategy')
+      rpcCall.mockClear()
+      expect(await api.saveModelStrategy({ reload: false })).toBe(false)
+      expect(rpcCall).not.toHaveBeenCalled()
+    } finally { app.unmount() }
   })
 })

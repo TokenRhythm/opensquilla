@@ -8,6 +8,10 @@
       <div class="msg-error-card__body">
         <span class="msg-error-card__heading">{{ errorHeading }}</span>
         <span v-if="message.text" class="msg-error-card__text">{{ message.text }}</span>
+        <RouterLink v-if="showModelCapacity" class="msg-error-card__resume"
+          :to="{ path: '/settings/modelStrategy', query: message.modelCapacity ? {
+            capacityProvider: message.modelCapacity.provider, capacityModel: message.modelCapacity.model,
+          } : {} }">{{ t('setup.capacity.title') }}</RouterLink>
         <button
           v-if="showResume"
           type="button"
@@ -47,6 +51,7 @@
 
 <script setup lang="ts">
 import { computed, ref } from 'vue'
+import { RouterLink } from 'vue-router'
 import { useI18n } from 'vue-i18n'
 import Icon from '@/components/Icon.vue'
 import type { ChatRenderedMessage } from '@/types/chat'
@@ -75,6 +80,7 @@ const emit = defineEmits<{
 }>()
 const resolving = ref(false)
 const retryResolving = ref(false)
+const showModelCapacity = computed(() => ['provider_request_too_large', 'provider_request_budget_exhausted'].includes(props.message.errorCode || ''))
 const showResume = computed(
   () =>
     props.message.displayRole === 'error' &&

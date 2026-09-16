@@ -1,6 +1,7 @@
 // @vitest-environment happy-dom
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { createApp, nextTick } from 'vue'
+import { createMemoryHistory, createRouter } from 'vue-router'
 import i18n from '@/i18n'
 import type { ChatRenderedMessage } from '@/types/chat'
 import { normalizeTurnOutcome } from '@/utils/chat/turnOutcome'
@@ -39,6 +40,10 @@ async function mountMsg(
     retryAvailable,
   })
   app.use(i18n)
+  const router = createRouter({ history: createMemoryHistory(), routes: [{ path: '/:pathMatch(.*)*', component: { render: () => null } }] })
+  app.use(router)
+  await router.push('/')
+  await router.isReady()
   app.mount(el)
   await nextTick()
   return { app, el }
@@ -50,6 +55,19 @@ beforeEach(() => {
 })
 
 describe('SystemMessage sandbox resume', () => {
+  it('links a capacity failure to the exact provider and punctuation-containing model without retrying', async () => {
+    const onRetry = vi.fn()
+    const target = { provider: 'custom_anthropic', model: 'example.vendor/model.v1:latest', contextWindow: 8192, source: 'default' as const }
+    const { app, el } = await mountMsg(errorMessage({ errorCode: 'provider_request_too_large', modelCapacity: target }), undefined, onRetry, true)
+    const href = el.querySelector<HTMLAnchorElement>('.msg-error-card__resume')?.getAttribute('href')
+    const url = new URL(href!, 'https://capacity.invalid')
+    expect(url.pathname).toBe('/settings/modelStrategy')
+    expect(url.searchParams.get('capacityProvider')).toBe(target.provider)
+    expect(url.searchParams.get('capacityModel')).toBe(target.model)
+    expect(el.querySelector('button')).toBeNull()
+    expect(onRetry).not.toHaveBeenCalled()
+    app.unmount()
+  })
   it('renders a Resume button for a sandbox-pause error and emits resume once on click', async () => {
     const onResume = vi.fn()
     const { app, el } = await mountMsg(

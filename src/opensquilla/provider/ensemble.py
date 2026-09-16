@@ -642,6 +642,7 @@ class _MemberRequestBudgetBinding:
     rederive: bool
     top_level_explicit_cap: int = 0
     inherit_top_level_cap: bool = True
+    confirmed: bool = True
 
 
 @dataclass
@@ -966,17 +967,15 @@ def _member_tools_capability_is_verified(
 
 
 def _member_max_tokens(member: EnsembleMemberConfig) -> int:
-    if member.max_tokens and member.max_tokens > 0:
-        return member.max_tokens
     cfg = member.provider_config
     try:
         return shared_catalog().resolve_max_tokens(
             cfg.model,
-            user_override=0,
+            user_override=max(0, member.max_tokens or 0),
             provider=cfg.provider,
         )
     except Exception:
-        return ChatConfig().max_tokens
+        return member.max_tokens or ChatConfig().max_tokens
 
 
 def _member_budget_key(member: EnsembleMemberConfig) -> tuple[str, str, str]:
@@ -1664,6 +1663,7 @@ class EnsembleProvider:
         if (
             binding is None
             or not binding.rederive
+            or not binding.confirmed
             or context_window_tokens <= 0
         ):
             return (
@@ -2622,6 +2622,7 @@ class EnsembleProvider:
         if self._require_attachment_capacity_proof and (
             aggregator_binding is None
             or not aggregator_binding.rederive
+            or not aggregator_binding.confirmed
             or int(aggregator_binding.context_window_tokens or 0) <= 0
         ):
             async for event in self._fallback_or_error(
@@ -7074,7 +7075,10 @@ def _runtime_member_request_budget_bindings(
                 if same_top_level_provider
                 else "unavailable"
             ),
-            rederive=reliable_context,
+            # Defaults remain usable for ordinary calls, but each member must
+            # use its own default instead of inheriting a larger outer window.
+            rederive=context_window is not None and context_window > 0,
+            confirmed=reliable_context,
             top_level_explicit_cap=member_explicit_cap,
             inherit_top_level_cap=same_top_level_provider,
         )

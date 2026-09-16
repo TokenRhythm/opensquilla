@@ -375,19 +375,15 @@ def _discover_model_row(info: ModelInfo, provider_id: str) -> dict[str, object]:
     elif info.context_window > 0:
         context_window = info.context_window
     else:
-        context_window = entry.context_window
-    max_output = (
-        info.max_output_tokens if info.max_output_tokens > 0 else entry.max_output_tokens
-    )
+        context_window = catalog.resolve_context_window(info.model_id, provider_id)
+    max_output = info.max_output_tokens if info.max_output_tokens > 0 else entry.max_output_tokens
     tools = _metadata_capability(metadata, "tools")
     reasoning = _metadata_capability(metadata, "reasoning")
     vision = _metadata_capability(metadata, "vision")
     safe_tools = info.supports_tools or entry.supports_tools
     tools_enabled = False if tools is False else safe_tools
     safe_reasoning = info.supports_reasoning or entry.supports_reasoning
-    reasoning_enabled = (
-        False if reasoning is False else safe_reasoning
-    )
+    reasoning_enabled = False if reasoning is False else safe_reasoning
     safe_vision = info.supports_vision or entry.supports_vision
     vision_enabled = False if vision is False else safe_vision
     capabilities: list[str] = ["chat"]
@@ -556,24 +552,57 @@ async def discover_selectable_provider_models(
     persist_catalog: bool = False,
     catalog_config: object | None = None,
 ) -> ProviderModelsDiscoverResult:
-    """Return only verified live catalogs suitable for a model picker.
+    """Return endpoint-declared custom models or verified official catalogs.
 
     This is the selector-facing policy boundary. Unknown and unsupported
     provider ids remain validation errors, matching raw discovery. All other
-    providers default to an empty, successful catalog *before* credential
+    non-custom providers default to an empty, successful catalog *before* credential
     resolution or provider construction, preserving the manual model-id
     escape hatch without presenting guessed data as authoritative.
 
     A trusted provider id is not enough on its own: an operator-supplied
     OpenAI-compatible re-host can serve a completely different model set.
-    Live selection is therefore allowed only when the effective base URL uses
+    Official-provider selection is allowed only when the effective base URL uses
     HTTPS and the provider's allowlisted official host (or one of its
-    subdomains).
+    subdomains). Explicit custom providers query their configured endpoint;
+    only declared capacity fields enter that provider's runtime metadata.
     """
     provider_id = (provider_id or "").strip()
     spec = get_provider_spec(provider_id)  # raises UnknownProviderError(ValueError)
     if not spec.runtime_supported:
         raise ValueError(f"Provider '{provider_id}' has no runtime support to discover.")
+
+    if provider_id in {"custom", "custom_anthropic"}:
+        from opensquilla.provider.model_capacity import (
+            custom_capacity_identity,
+            install_custom_capacity,
+            resolve_model_capacities,
+        )
+        from opensquilla.provider.model_catalog import shared_catalog
+
+        identity = custom_capacity_identity(catalog_config, provider_id)
+        result = await discover_provider_models(
+            provider_id=provider_id,
+            api_key=api_key,
+            api_key_env=api_key_env,
+            base_url=base_url,
+            proxy=proxy,
+            allow_default_api_key_env=allow_default_api_key_env,
+        )
+        if persist_catalog and result.ok and catalog_config is not None:
+            catalog = shared_catalog()
+            install_custom_capacity(catalog, identity, provider_id, result.models)
+            capacities = resolve_model_capacities(
+                catalog,
+                catalog_config,
+                [{"provider": provider_id, "model": str(row["id"])} for row in result.models],
+            )["models"]
+            by_model = {capacity["model"]: capacity for capacity in capacities}
+            for row in result.models:
+                capacity = by_model[str(row["id"])]
+                row["contextWindow"] = capacity["contextWindow"]["value"]
+                row["maxOutputTokens"] = capacity["maxOutputTokens"]["value"]
+        return result
 
     if spec.selectable_model_catalog != "verified_live":
         return ProviderModelsDiscoverResult(ok=True, provider_id=provider_id)
@@ -602,9 +631,7 @@ async def discover_selectable_provider_models(
             is_official_tokenrhythm_endpoint,
         )
 
-        tokenrhythm_production_catalog = is_official_tokenrhythm_endpoint(
-            effective_base_url
-        )
+        tokenrhythm_production_catalog = is_official_tokenrhythm_endpoint(effective_base_url)
 
     if tokenrhythm_production_catalog:
         default_env_key = spec.env_key if allow_default_api_key_env else ""
@@ -640,9 +667,7 @@ async def discover_selectable_provider_models(
     # foreign hosts, and lookalike suffixes. Treat an admitted TokenRhythm
     # non-production origin as its own declared catalog authority.
 
-    discovery_provider_id = (
-        spec.selectable_model_discovery_provider_id or provider_id
-    )
+    discovery_provider_id = spec.selectable_model_discovery_provider_id or provider_id
     discover_kwargs: dict[str, Any] = {
         "provider_id": discovery_provider_id,
         "api_key": api_key,
@@ -650,11 +675,7 @@ async def discover_selectable_provider_models(
         # A sibling discovery provider owns a different protocol path. Its
         # registry default is the only trusted listing endpoint; never pass
         # the configured chat base path across protocols.
-        "base_url": (
-            base_url.strip()
-            if discovery_provider_id == provider_id
-            else ""
-        ),
+        "base_url": (base_url.strip() if discovery_provider_id == provider_id else ""),
         "proxy": proxy,
     }
     if not allow_default_api_key_env:

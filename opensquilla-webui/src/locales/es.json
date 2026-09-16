@@ -729,6 +729,47 @@
     }
   },
   "setup": {
+    "capacity": {
+      "customOpenAI": "Personalizado · compatible con OpenAI",
+      "customAnthropic": "Personalizado · compatible con Anthropic",
+      "partialSaved": "Guardado: {saved}. Sin guardar: {pending}. Se conservan los valores pendientes.",
+      "providerPartialSaved": "Se guardó el proveedor. Los límites del modelo no se guardaron; se conservan los datos introducidos.",
+      "backToRouting": "Volver al enrutamiento inteligente",
+      "editSharedEnsemble": "Editar conjunto compartido",
+      "sharedEnsemble": "C3 y la fusión de modelos comparten este conjunto.",
+      "title": "Ajustes del modelo",
+      "forModel": "Ajustes del modelo — {model}",
+      "unknown": "Límites sin confirmar",
+      "contextWindow": "Ventana de contexto",
+      "maxOutputTokens": "Longitud máxima de salida",
+      "scope": "Se aplica donde se utilice este modelo con este proveedor.",
+      "current": "Actual: {value} tokens · {source}",
+      "source": {
+        "catalog": "Catálogo de modelos",
+        "default": "Valor predeterminado del sistema",
+        "config": "Configuración global",
+        "override": "Valor manual"
+      },
+      "autoValue": "Automático ({value})",
+      "autoHint": "Deja vacío para usar el valor automático; introduce un entero positivo para cambiarlo.",
+      "requestHint": "Límite de salida del modelo; las respuestas pueden ser más cortas.",
+      "localHint": "Este valor debe coincidir con el contexto configurado en tu servidor de modelos local.",
+      "serverControlled": "El servidor controla la longitud de salida.",
+      "restore": "Restaurar valores automáticos",
+      "positiveInteger": "Introduce un entero positivo o deja el campo vacío para usar el valor automático.",
+      "upgrade": "Actualiza el Gateway para ver y editar los límites. La configuración existente sigue disponible.",
+      "loadFailed": "No se pudo cargar los límites del modelo. Se conservan tus cambios.",
+      "retry": "Reintentar",
+      "draftHint": "Después de Listo, selecciona Guardar cambios en la página de ajustes.",
+      "done": "Listo",
+      "invalid": "Revisa los límites del modelo antes de guardar.",
+      "saved": "Límites del modelo guardados.",
+      "saveFailed": "No se pudo guardar los límites del modelo. Se conservan los valores pendientes.",
+      "unknownHint": "Uno o ambos límites del modelo están sin confirmar. Se usan los valores predeterminados; puedes configurar los límites aquí.",
+      "automaticSource": "Automático · {source}",
+      "unsaved": "Sin guardar",
+      "effective": "Límite efectivo: {value} tokens"
+    },
     "cli": {
       "advancedTitle": "Avanzado · CLI integrada",
       "hintBundled": "Estos comandos usan la CLI integrada en la aplicación; pégalos en una terminal para ejecutarlos.",
@@ -1166,7 +1207,7 @@
       "openrouterFixedDesc": "Cuando el servicio de modelos usa {provider}, el enrutamiento agregado usa cuatro modelos proponentes y un agregador.",
       "openrouterFixedProposer": "Modelo proponente",
       "openrouterFixedAggregator": "Agregador",
-      "credentialReady": "Conectado",
+      "credentialReady": "Credenciales disponibles",
       "credentialNeeded": "Se necesitan credenciales de {provider}",
       "credentialMissingEnv": "Se necesita {envKey}",
       "credentialUnknown": "Credenciales no comprobadas",
@@ -1197,7 +1238,7 @@
       "aggregatorNote": "Fusiona todos los borradores en la respuesta final; el único miembro que puede invocar herramientas",
       "aggregatorSectionLabel": "Agregador",
       "aggregatorSectionDesc": "Exactamente un agregador produce la respuesta final. Elige el modelo más potente de tu alineación.",
-      "aggregatorInheritedNote": "Sin agregador asignado — el modelo de chat actual fusiona los borradores",
+      "aggregatorInheritedNote": "Usa el modelo actual",
       "proposerSectionLabel": "Proponentes",
       "proposerRoleLabel": "Proponente",
       "aggregatorRoleLabel": "Agregador",
@@ -1215,7 +1256,7 @@
       "replaceCandidateConfirm": "Reemplazar",
       "candidateDuplicate": "Este modelo ya está en la lista de proponentes.",
       "addProposer": "Agregar proponente",
-      "chooseAggregator": "Elegir agregador",
+      "chooseAggregator": "Cambiar modelo",
       "aggregatorPickerTitle": "Elegir el agregador",
       "aggregatorFromProposers": "Usar un proponente existente",
       "aggregatorOtherModel": "O elegir otro modelo",
@@ -1234,7 +1275,8 @@
       "proposerRetriesDesc": "Solo fallos reintentables; la solicitud inicial no cuenta como reintento.",
       "proposerRetriesOption": "Como máximo {count} reintentos tras la solicitud inicial",
       "runtimeLimitsLabel": "Límites de tiempo",
-      "runtimeLimits": "Proponentes {proposerTimeout}s en total · inactividad del agregador entre eventos {aggregatorTimeout}s (configurado {configuredAggregatorTimeout}s) · límite total del turno separado"
+      "runtimeLimits": "Proponentes {proposerTimeout}s en total · inactividad del agregador entre eventos {aggregatorTimeout}s (configurado {configuredAggregatorTimeout}s) · límite total del turno separado",
+      "fallbackModelLabel": "Modelo de respaldo"
     },
     "behavior": {
       "title": "Comportamiento de la sesión",
@@ -1730,7 +1772,9 @@
       "dataMaintenanceAria": "Abrir el mantenimiento de datos",
       "runTraceLabel": "Panel de traza de ejecución en Registros",
       "runTraceDesc": "Hace que las líneas de registro sean interactivas y abre un panel de detalle de pasos por nodo para cada línea en la vista de Registros.",
-      "runTraceAria": "Panel de traza de ejecución en Registros (surte efecto tras recargar)"
+      "runTraceAria": "Panel de traza de ejecución en Registros (surte efecto tras recargar)",
+      "configFileLabel": "Archivo de configuración",
+      "configFileDesc": "Puedes ajustar más opciones en el archivo de configuración."
     },
     "privacy": {
       "statusDisabledByEnv": "Desactivados por una configuración del entorno.",

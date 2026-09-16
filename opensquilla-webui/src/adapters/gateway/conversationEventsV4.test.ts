@@ -1,5 +1,6 @@
 import { readFileSync } from 'node:fs'
 import { describe, expect, it } from 'vitest'
+import { projectConversationContent } from './conversationContentV4'
 import {
   canonicalConversationEventName,
   conversationSemanticEventKind,
@@ -26,6 +27,13 @@ function fixture(name: string): FixtureDocument {
 }
 
 describe('conversation event v4 Adapter', () => {
+  it('projects validated capacity provenance on failures only and rejects malformed targets', () => {
+    const model_capacity = { provider: 'custom', model: 'example.vendor/model.v1:latest', contextWindow: 8192, source: 'default' }
+    expect(projectConversationContent({ model_capacity }, 'turn-failed').modelCapacity).toEqual(model_capacity)
+    expect(projectConversationContent({ model_capacity }, 'text-delta').modelCapacity).toBeUndefined()
+    expect(projectConversationContent({ model_capacity: { ...model_capacity, model: ' ' } }, 'turn-failed').modelCapacity).toBeUndefined()
+    expect(projectConversationContent({ model_capacity: { ...model_capacity, contextWindow: -1 } }, 'turn-failed').modelCapacity).toBeUndefined()
+  })
   it('decodes every valid canonical, legacy, and future event fixture', () => {
     for (const testCase of fixture('events.json').cases) {
       const wire = testCase.wire as Record<string, unknown>

@@ -8,6 +8,7 @@ import SetupNeedList from '@/components/SetupNeedList.vue'
 import SetupCommandBlock from '@/components/setup/SetupCommandBlock.vue'
 import SetupProviderCredentialCard from '@/components/setup/SetupProviderCredentialCard.vue'
 import SetupProviderRecommendation from '@/components/setup/SetupProviderRecommendation.vue'
+import SetupModelCapacity from '@/components/setup/SetupModelCapacity.vue'
 import SetupModelCombobox from '@/components/setup/SetupModelCombobox.vue'
 import SetupProviderCatalogDialog from '@/components/setup/SetupProviderCatalogDialog.vue'
 import SetupProviderMenu, { type ProviderMenuItem } from '@/components/setup/SetupProviderMenu.vue'
@@ -1311,6 +1312,12 @@ const tokenRhythmCredentialReplacementRequired = computed(() => (
                       @update="(name, val) => emit('updateProviderField', name, val)"
                     />
                   </template>
+                  <SetupModelCapacity
+                    inline :provider="panel.providerSelected"
+                    :model="String(panel.providerFieldValue({ name: 'model', label: '' }) || '')"
+                    :scope="`provider:${panel.providerSelected.trim().toLowerCase()}`"
+                    :disabled="providerBusy || saving"
+                  />
                 </section>
               </fieldset>
             </div>

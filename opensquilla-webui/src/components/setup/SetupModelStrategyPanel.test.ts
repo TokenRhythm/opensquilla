@@ -190,9 +190,9 @@ describe('SetupModelStrategyPanel', () => {
     expect(strategyRowsText).toContain('Token-efficient')
     expect(strategyRowsText).toContain('Predictable')
     expect(strategyRowsText).toContain('Capability-first')
-    const strategyBadges = Array.from(el.querySelectorAll<HTMLElement>('.setup-model-strategy__card .control-pill'))
+    const strategyBadges = Array.from(el.querySelectorAll<HTMLElement>('.setup-model-strategy__card-badge'))
     expect(strategyBadges).toHaveLength(3)
-    expect(strategyBadges.every(badge => badge.classList.contains('control-pill--info'))).toBe(true)
+    expect(strategyBadges.some(badge => badge.classList.contains('control-pill'))).toBe(false)
     expect(strategyBadges.some(badge => badge.classList.contains('control-pill--ok'))).toBe(false)
     expect(strategyBadges.some(badge => badge.classList.contains('control-pill--queued'))).toBe(false)
     expect(strategyRowsText).not.toContain('Recommended')
@@ -882,9 +882,9 @@ describe('SetupModelStrategyPanel', () => {
 
     const lineup = el.querySelector<HTMLElement>('[data-testid="ensemble-custom-lineup"]')!
     const imageHint = el.querySelector<HTMLElement>('[data-testid="ensemble-candidate-image-hint"]')
-    expect(imageHint?.textContent).toContain('Model ensemble does not support image analysis yet')
-    expect(imageHint?.textContent).toContain('switch to Intelligent model routing and configure an image-capable model')
-    expect(imageHint?.textContent).toContain('select an image-capable model under Fixed model')
+    expect(imageHint?.textContent).toContain('Ensemble supports text only')
+    expect(imageHint?.textContent).toContain('For images, use intelligent routing')
+    expect(imageHint?.textContent).toContain('a fixed model that supports images')
     const steps = lineup.querySelectorAll<HTMLElement>('.setup-model-strategy__step')
     expect(steps).toHaveLength(2)
     expect(steps[0]?.textContent).toContain('Proposer')
@@ -894,7 +894,8 @@ describe('SetupModelStrategyPanel', () => {
     expect(el.querySelector('[data-testid="ensemble-custom-aggregator-inherited"]')?.textContent)
       .toContain('deepseek/deepseek-v4-pro')
     expect(steps[0]?.textContent).toContain('Proposers')
-    expect(el.textContent).toContain('DeepSeek · deepseek-v4-pro')
+    expect(el.querySelector('.setup-model-identity__model')?.textContent).toBe('deepseek-v4-pro')
+    expect(el.querySelector('.setup-model-identity__provider')?.textContent?.trim()).toBe('DeepSeek')
     expect(el.textContent).not.toContain('Primary')
     expect(el.textContent).not.toContain('Contrast')
     expect(el.textContent).not.toContain('Fast check')
@@ -1048,8 +1049,9 @@ describe('SetupModelStrategyPanel', () => {
       },
     )
 
-    expect(el.textContent).toContain('DeepSeek · deepseek-v4-pro')
-    expect(el.textContent).toContain('Connected')
+    expect(el.querySelector('.setup-model-identity__model')?.textContent).toBe('deepseek-v4-pro')
+    expect(el.querySelector('.setup-model-identity__provider')?.textContent?.trim()).toBe('DeepSeek')
+    expect(el.textContent).toContain('Credentials ready')
 
     el.querySelector<HTMLButtonElement>('[data-testid="setup-model-strategy-add-candidate-trigger"]')?.click()
     await nextTick()
@@ -1711,8 +1713,8 @@ describe('SetupModelStrategyPanel', () => {
     expect(el.querySelector('[data-testid="ensemble-custom-lineup"]')).toBeNull()
     const lineup = el.querySelector<HTMLElement>('[data-testid="ensemble-legacy-lineup"]')!
     expect(lineup).toBeTruthy()
-    expect(lineup.textContent).toContain('DeepSeek · shared-model')
-    expect(lineup.textContent).toContain('TokenRhythm · glm-5.2')
+    expect(Array.from(lineup.querySelectorAll('.setup-model-identity__model'), node => node.textContent)).toEqual(['shared-model', 'glm-5.2', 'shared-model'])
+    expect(Array.from(lineup.querySelectorAll('.setup-model-identity__provider'), node => node.textContent?.trim())).toEqual(['DeepSeek', 'TokenRhythm', 'DeepSeek'])
     expect(lineup.querySelectorAll('[role="listitem"]')).toHaveLength(3)
     expect(lineup.querySelector('.setup-model-strategy__candidate-actions')).toBeNull()
     expect(lineup.querySelector('[data-testid="ensemble-replace-aggregator"]')).toBeNull()
@@ -1820,12 +1822,17 @@ describe('SetupModelStrategyPanel', () => {
       expect(fixedModelInput?.getAttribute('aria-describedby'))
         .toBe('setup-provider-model_strategy_fixed_model-description')
       if (activeStrategy === 'single') {
+        expect(fixedSection.tagName).toBe('SECTION')
+        expect(fixedSection.querySelector('summary')).toBeNull()
         expect(fixedSection.querySelector('h4')?.textContent).toContain('Fixed model')
         expect(fixedSection.querySelector('.control-section__head .control-section__desc')?.textContent)
           .toContain('Choose the model used for every request.')
         expect(fixedSection.textContent)
           .toContain('without automatic routing or model ensemble')
       } else {
+        expect(fixedSection.tagName).toBe('DETAILS')
+        expect((fixedSection as HTMLDetailsElement).open).toBe(false)
+        expect(fixedSection.querySelector('summary')?.textContent).toContain('Fallback model')
         expect(fixedSection.querySelector('.control-section__head')).toBeNull()
         expect(fixedSection.querySelector('.control-row__desc')).toBeNull()
         expect(fixedSection.textContent).not.toContain('Choose the model used for every request.')
@@ -1931,7 +1938,7 @@ const summary = {
 }
 
 describe('saved routing summary and recommended recovery', () => {
-  it('separates the saved primary, Router switch and custom ownership above mode cards', async () => {
+  it('separates the saved primary, Router switch and custom ownership below mode cards', async () => {
     const onResetRecommendedRouter = vi.fn()
     const { app, el } = await mountPanel({ routingSummary: summary }, { onResetRecommendedRouter })
     const facts = el.querySelector('[data-testid="routing-saved-summary"]')!
@@ -1939,7 +1946,7 @@ describe('saved routing summary and recommended recovery', () => {
     expect(facts.textContent).toContain('Off')
     expect(el.querySelector('[data-testid="routing-saved-binding"]')?.textContent).toBe('Custom tiers')
     expect(facts.compareDocumentPosition(el.querySelector('.setup-model-strategy__cards')!))
-      .toBe(Node.DOCUMENT_POSITION_FOLLOWING)
+      .toBe(Node.DOCUMENT_POSITION_PRECEDING)
     expect(el.querySelector('[data-testid="routing-provider-mismatch"]')?.textContent).toContain('cross-provider execution is off')
     expect(el.querySelector('[data-testid="routing-cross-provider-enabled"]')).toBeNull()
     const reset = el.querySelector<HTMLButtonElement>('[data-testid="router-reset-recommended"]')!

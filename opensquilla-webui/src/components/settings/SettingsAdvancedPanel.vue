@@ -3,11 +3,13 @@ import { computed, ref } from 'vue'
 import { useI18n } from 'vue-i18n'
 import ControlSwitch from '@/components/ControlSwitch.vue'
 import LoadingSpinner from '@/components/LoadingSpinner.vue'
+import Icon from '@/components/Icon.vue'
 import MemoryLearningGroup from '@/components/settings/MemoryLearningGroup.vue'
 
 defineProps<{
   autoCapture: boolean
   loaded: boolean
+  configPath?: string
 }>()
 
 const { t } = useI18n()
@@ -15,6 +17,7 @@ const emit = defineEmits<{
   'update-auto-capture': [enabled: boolean]
   'open-agent-configuration': []
   'open-data-maintenance': []
+  'copy-config-path': []
 }>()
 
 // Client-only "Labs" preferences. Each row reads/writes ONE localStorage key
@@ -163,6 +166,20 @@ const agentConfigAriaLabel = computed(() =>
 
     <h4 class="advanced-group advanced-group--management">{{ t('setup.advanced.managementGroup') }}</h4>
 
+    <div v-if="configPath" class="control-row control-row--stack" data-testid="advanced-config-file">
+      <div class="control-row__label-block">
+        <span class="control-row__label">{{ t('setup.advanced.configFileLabel') }}</span>
+        <span class="control-row__desc">{{ t('setup.advanced.configFileDesc') }}</span>
+      </div>
+      <div class="advanced-config-file__path">
+        <code>{{ configPath }}</code>
+        <button type="button" class="btn btn--icon btn--ghost"
+          :aria-label="t('settings.dialog.copyConfigPath')" :title="t('settings.dialog.copyConfigPath')"
+          @click="emit('copy-config-path')"
+        ><Icon name="copy" :size="14" /></button>
+      </div>
+    </div>
+
     <div class="control-row">
       <div class="control-row__label-block">
         <span class="control-row__label">{{ t('setup.advanced.agentConfigLabel') }}</span>
@@ -200,6 +217,9 @@ const agentConfigAriaLabel = computed(() =>
 </template>
 
 <style scoped>
+.advanced-config-file__path { display: flex; align-items: center; gap: var(--sp-2); min-width: 0; width: 100%; }
+.advanced-config-file__path code { flex: 1; min-width: 0; overflow-wrap: anywhere; color: var(--text-muted); font-family: var(--font-mono); font-size: var(--fs-xs); user-select: text; }
+.advanced-config-file__path .btn { flex-shrink: 0; }
 .advanced-group {
   color: var(--text-dim);
   font-size: var(--fs-xs);

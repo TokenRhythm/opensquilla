@@ -4,27 +4,40 @@
     {
       "kind": "method",
       "wireName": "telemetry.product_active.record",
-      "roles": ["result"]
+      "roles": [
+        "result"
+      ]
     },
     {
       "kind": "method",
       "wireName": "sessions.executionLog.read",
-      "roles": ["params", "result"]
+      "roles": [
+        "params",
+        "result"
+      ]
     },
     {
       "kind": "event",
       "wireName": "transport.flow.dirty",
-      "roles": ["payload"]
+      "roles": [
+        "payload"
+      ]
     },
     {
       "kind": "method",
       "wireName": "transport.flow.update",
-      "roles": ["params", "result"]
+      "roles": [
+        "params",
+        "result"
+      ]
     },
     {
       "kind": "method",
       "wireName": "sessions.messages.snapshot.read",
-      "roles": ["params", "result"]
+      "roles": [
+        "params",
+        "result"
+      ]
     },
     {
       "kind": "event",
@@ -673,6 +686,14 @@
     {
       "kind": "method",
       "wireName": "migration.sources.preview",
+      "roles": [
+        "params",
+        "result"
+      ]
+    },
+    {
+      "kind": "method",
+      "wireName": "models.capacity.resolve",
       "roles": [
         "params",
         "result"

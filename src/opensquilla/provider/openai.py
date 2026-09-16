@@ -6474,13 +6474,28 @@ class OpenAIProvider:
                         )
                     models = result
                 else:
+                    from .model_capacity import custom_listing_capacity
+
                     models = [
                         ModelInfo(
                             provider=self.provider_id,
                             model_id=m["id"],
                             display_name=m.get("name", m.get("id", "")),
-                            context_window=m.get("context_length", 0),
-                            max_output_tokens=_model_listing_max_output(m),
+                            context_window=(
+                                custom_listing_capacity(m).get("context_window", 0)
+                                if self.provider_id == "custom"
+                                else m.get("context_length", 0)
+                            ),
+                            max_output_tokens=(
+                                custom_listing_capacity(m).get("max_output_tokens", 0)
+                                if self.provider_id == "custom"
+                                else _model_listing_max_output(m)
+                            ),
+                            metadata=(
+                                {"capacity": custom_listing_capacity(m)}
+                                if self.provider_id == "custom"
+                                else None
+                            ),
                             supports_vision=_model_listing_supports_vision(m),
                         )
                         for m in rows

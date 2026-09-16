@@ -23,6 +23,7 @@ EXPECTED_PLATFORM_CONFIGURATION_METHODS = (
     "config.patch",
     "config.patch.safe",
     "models.list",
+    "models.capacity.resolve",
     "providers.status",
     "models.routing.get",
     "models.routing.set",

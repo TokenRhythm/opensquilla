@@ -14,6 +14,15 @@ if TYPE_CHECKING:
 _d = get_dispatcher()
 
 
+async def _handle_models_capacity_resolve(params: dict | None, ctx: RpcContext) -> dict[str, Any]:
+    from opensquilla.provider.model_capacity import resolve_model_capacities
+    from opensquilla.provider.model_catalog import shared_catalog
+
+    if not isinstance(params, dict):
+        raise ValueError("params must be an object")
+    return resolve_model_capacities(shared_catalog(), ctx.config, params["models"])
+
+
 async def _handle_models_list(params: dict | None, ctx: RpcContext) -> dict[str, Any]:
     from opensquilla.application.provider_configuration import ModelCatalog
     from opensquilla.gateway.adapters.provider_configuration import (
@@ -107,6 +116,7 @@ from opensquilla.gateway.guest_rpc_policy import (  # noqa: E402
 from opensquilla.gateway.rpc import RpcHandlerError  # noqa: E402
 
 _PLATFORM_CONFIGURATION_IMPLEMENTATIONS = {
+    "models.capacity.resolve": _handle_models_capacity_resolve,
     "models.list": _handle_models_list,
     "models.routing.get": _handle_models_routing_get,
     "models.routing.set": _handle_models_routing_set,

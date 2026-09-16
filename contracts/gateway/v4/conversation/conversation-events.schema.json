@@ -147,6 +147,43 @@
       "type": "object",
       "additionalProperties": true,
       "properties": {
+        "model_capacity": {
+          "type": [
+            "object",
+            "null"
+          ],
+          "additionalProperties": false,
+          "required": [
+            "provider",
+            "model",
+            "contextWindow",
+            "source"
+          ],
+          "properties": {
+            "provider": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 1024
+            },
+            "model": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 1024
+            },
+            "contextWindow": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "source": {
+              "enum": [
+                "default",
+                "catalog",
+                "config",
+                "override"
+              ]
+            }
+          }
+        },
         "key": {
           "type": ["string", "null"],
           "minLength": 1

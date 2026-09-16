@@ -466,9 +466,10 @@ function onKeydown(event: KeyboardEvent) {
           : 'control-row__desc'"
       >{{ field.description }}</span>
     </div>
+    <div :class="$slots.actions ? 'setup-model-combobox__control-group control-row__control' : 'setup-model-combobox__passthrough'">
     <div
       class="setup-model-combobox"
-      :class="[cell ? undefined : 'control-row__control', { 'has-catalog': catalogAvailable }]"
+      :class="[cell || $slots.actions ? undefined : 'control-row__control', { 'has-catalog': catalogAvailable }]"
     >
       <input
         :id="fieldId"
@@ -663,10 +664,19 @@ function onKeydown(event: KeyboardEvent) {
         </div>
       </Teleport>
     </div>
+    <span v-if="$slots.actions" class="setup-model-combobox__actions"><slot name="actions" /></span>
+    </div>
   </div>
 </template>
 
 <style scoped>
+.setup-model-combobox__passthrough { display: contents; }
+.setup-model-combobox__control-group { display: flex; align-items: center; gap: var(--sp-2); min-width: 0; }
+.setup-model-combobox__control-group > .setup-model-combobox { flex: 1; min-width: 0; }
+.setup-model-combobox__control-group input { width: 100%; box-sizing: border-box; }
+.setup-model-combobox__actions { display: flex; align-items: center; gap: var(--sp-1); flex-shrink: 0; }
+@media (max-width: 760px) { .setup-model-combobox__actions { flex-direction: column; align-items: flex-end; } }
+
 /* Cell mode: the wrapper is a grid/table cell — the input fills it. No label
    chrome. The dropdown is teleported to <body>, so the cell never clips it. */
 .setup-model-combobox--cellwrap {

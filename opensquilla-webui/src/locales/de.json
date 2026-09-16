@@ -729,6 +729,47 @@
     }
   },
   "setup": {
+    "capacity": {
+      "customOpenAI": "Benutzerdefiniert · OpenAI-kompatibel",
+      "customAnthropic": "Benutzerdefiniert · Anthropic-kompatibel",
+      "partialSaved": "Gespeichert: {saved}. Nicht gespeichert: {pending}. Ungespeicherte Werte bleiben erhalten.",
+      "providerPartialSaved": "Der Anbieter wurde gespeichert. Die Modellgrenzen wurden nicht gespeichert; Ihre Eingaben bleiben erhalten.",
+      "backToRouting": "Zurück zum intelligenten Routing",
+      "editSharedEnsemble": "Gemeinsames Ensemble bearbeiten",
+      "sharedEnsemble": "C3 und das Modellensemble verwenden diese gemeinsame Zusammenstellung.",
+      "title": "Modelleinstellungen",
+      "forModel": "Modelleinstellungen — {model}",
+      "unknown": "Grenzen unbestätigt",
+      "contextWindow": "Kontextfenster",
+      "maxOutputTokens": "Maximale Ausgabelänge",
+      "scope": "Gilt überall, wo dieses Modell mit diesem Anbieter verwendet wird.",
+      "current": "Aktuell {value} Tokens · {source}",
+      "source": {
+        "catalog": "Modellkatalog",
+        "default": "Systemstandard",
+        "config": "Globale Konfiguration",
+        "override": "Manueller Wert"
+      },
+      "autoValue": "Automatisch ({value})",
+      "autoHint": "Leer lassen für Automatik; zum Überschreiben eine positive ganze Zahl eingeben.",
+      "requestHint": "Ausgabegrenze des Modells; tatsächliche Antworten können kürzer sein.",
+      "localHint": "Der Wert muss zum konfigurierten Kontext Ihres lokalen Modellservers passen.",
+      "serverControlled": "Die Ausgabelänge wird vom Server gesteuert.",
+      "restore": "Automatische Werte wiederherstellen",
+      "positiveInteger": "Positive ganze Zahl eingeben oder für Automatik leer lassen.",
+      "upgrade": "Aktualisieren Sie das Gateway, um die Modellgrenzen anzuzeigen und zu bearbeiten. Bestehende Modelleinstellungen bleiben verfügbar.",
+      "loadFailed": "Modellgrenzen konnten nicht geladen werden. Ihre Änderungen bleiben erhalten.",
+      "retry": "Erneut versuchen",
+      "draftHint": "Nach Fertig auf der Einstellungsseite Änderungen speichern wählen.",
+      "done": "Fertig",
+      "invalid": "Prüfen Sie die Modellgrenzen vor dem Speichern.",
+      "saved": "Modellgrenzen gespeichert.",
+      "saveFailed": "Modellgrenzen konnten nicht gespeichert werden. Ungespeicherte Werte bleiben erhalten.",
+      "unknownHint": "Eine oder beide Modellgrenzen sind unbestätigt. Systemstandardwerte werden verwendet; Sie können die Grenzen hier einstellen.",
+      "automaticSource": "Automatisch · {source}",
+      "unsaved": "Nicht gespeichert",
+      "effective": "Wirksame Grenze: {value} Tokens"
+    },
     "cli": {
       "advancedTitle": "Erweitert · integrierte CLI",
       "hintBundled": "Diese Befehle verwenden die in der App integrierte CLI; zum Ausführen in ein Terminal einfügen.",
@@ -1166,7 +1207,7 @@
       "openrouterFixedDesc": "Wenn der Modelldienst {provider} nutzt, verwendet Ensemble-Routing vier Vorschlagsmodelle und einen Aggregator.",
       "openrouterFixedProposer": "Vorschlagsmodell",
       "openrouterFixedAggregator": "Aggregator",
-      "credentialReady": "Verbunden",
+      "credentialReady": "Zugangsdaten verfügbar",
       "credentialNeeded": "{provider}-Zugangsdaten erforderlich",
       "credentialMissingEnv": "{envKey} erforderlich",
       "credentialUnknown": "Zugangsdaten nicht geprüft",
@@ -1197,7 +1238,7 @@
       "aggregatorNote": "Verschmilzt alle Entwürfe zur endgültigen Antwort; einziges Mitglied mit Tool-Zugriff",
       "aggregatorSectionLabel": "Aggregator",
       "aggregatorSectionDesc": "Genau ein Aggregator erzeugt die endgültige Antwort. Wählen Sie das stärkste Modell der Aufstellung.",
-      "aggregatorInheritedNote": "Kein Aggregator zugewiesen — das aktuelle Chat-Modell verschmilzt die Entwürfe",
+      "aggregatorInheritedNote": "Folgt dem aktuellen Modell",
       "proposerSectionLabel": "Entwürfe",
       "proposerRoleLabel": "Entwurf",
       "aggregatorRoleLabel": "Aggregation",
@@ -1215,7 +1256,7 @@
       "replaceCandidateConfirm": "Ersetzen",
       "candidateDuplicate": "Dieses Modell ist bereits in der Liste der Entwurfsmodelle enthalten.",
       "addProposer": "Entwurf hinzufügen",
-      "chooseAggregator": "Aggregator auswählen",
+      "chooseAggregator": "Modell ändern",
       "aggregatorPickerTitle": "Aggregator auswählen",
       "aggregatorFromProposers": "Vorhandenen Entwurf verwenden",
       "aggregatorOtherModel": "Oder ein anderes Modell auswählen",
@@ -1234,7 +1275,8 @@
       "proposerRetriesDesc": "Nur wiederholbare Fehler; die erste Anfrage zählt nicht als Wiederholung.",
       "proposerRetriesOption": "Höchstens {count} Wiederholungen nach der ersten Anfrage",
       "runtimeLimitsLabel": "Zeitlimits",
-      "runtimeLimits": "Entwürfe insgesamt {proposerTimeout}s · Aggregator-Leerlauf zwischen Anbieterereignissen {aggregatorTimeout}s (konfiguriert {configuredAggregatorTimeout}s) · separates Gesamtlimit der Runde"
+      "runtimeLimits": "Entwürfe insgesamt {proposerTimeout}s · Aggregator-Leerlauf zwischen Anbieterereignissen {aggregatorTimeout}s (konfiguriert {configuredAggregatorTimeout}s) · separates Gesamtlimit der Runde",
+      "fallbackModelLabel": "Fallback-Modell"
     },
     "behavior": {
       "title": "Sitzungsverhalten",
@@ -1730,7 +1772,9 @@
       "dataMaintenanceAria": "Datenpflege öffnen",
       "runTraceLabel": "Run-Trace-Schublade in Protokollen",
       "runTraceDesc": "Macht Protokollzeilen interaktiv und öffnet eine zeilenweise Detailschublade für Knotenschritte in der Protokollansicht.",
-      "runTraceAria": "Run-Trace-Schublade in Protokollen (wird nach dem Neuladen wirksam)"
+      "runTraceAria": "Run-Trace-Schublade in Protokollen (wird nach dem Neuladen wirksam)",
+      "configFileLabel": "Konfigurationsdatei",
+      "configFileDesc": "Weitere Optionen lassen sich in der Konfigurationsdatei anpassen."
     },
     "privacy": {
       "statusDisabledByEnv": "Durch eine Umgebungseinstellung deaktiviert.",

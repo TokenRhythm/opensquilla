@@ -1225,10 +1225,10 @@ async def _discover_primary_models(
     candidate credentials, so it must not be reachable at the read/write
     tiers even though it changes no state.
 
-    Selector discovery is fail-closed: only registry-verified providers on
-    their official hosts are queried. Self-hosted and arbitrary endpoints
-    remain manual-entry surfaces; raw CLI diagnostics retain their broader
-    endpoint-probing behavior.
+    Official-provider catalogs require registry-verified hosts. Explicit
+    custom providers can list their configured endpoint's models. Other
+    self-hosted endpoints retain manual entry; raw CLI diagnostics keep their
+    broader endpoint-probing behavior.
 
     Blank credentials fall back to the stored config's only while a supplied
     candidate Base URL remains same-origin; omitted Base URLs reuse the stored
