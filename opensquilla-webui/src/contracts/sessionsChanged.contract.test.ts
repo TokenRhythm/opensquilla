@@ -1,3 +1,4 @@
+import { loadContractValidators } from '../../../scripts/contracts/gateway_contract_verification.mjs'
 import { readFileSync } from 'node:fs'
 import { describe, expect, it } from 'vitest'
 import type {
@@ -15,7 +16,7 @@ interface FixtureDocument {
   cases: Array<{ id: string, wire?: unknown }>
 }
 
-const validators = await import('./generated/v4/sessionsChangedValidators.mjs') as {
+const validators = await loadContractValidators('sessions.changed', { kind: 'event' }) as {
   validateSessionsChangedEventPayload: ContractValidator
 }
 

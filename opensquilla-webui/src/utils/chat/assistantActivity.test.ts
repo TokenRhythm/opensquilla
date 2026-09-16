@@ -1154,6 +1154,23 @@ describe('projectAssistantActivityTimeline', () => {
     expect(JSON.stringify(projection.statusSteps)).not.toContain('raw reasoning body')
   })
 
+  it.each(['working', 'settled'] as const)('localizes retries without a fixed limit when %s', (lifecycle) => {
+    const projection = projectAssistantActivityTimeline([], {
+      lifecycle,
+      statusHistory: [
+        { action: 'provider:retrying:7:0', label: 'Retrying 7/0', at: 1_000 },
+      ],
+    })
+
+    expect(projection.statusSteps[0]?.label).toEqual({
+      code: 'chat.activity.provider.retryingWithoutLimit', params: { attempt: 7 },
+    })
+    for (const locale of [en, zhHans, ja, de, fr, es]) {
+      expect(locale.chat.activity.provider.retryingWithoutLimit).toContain('{attempt}')
+      expect(locale.chat.activity.provider.retryingWithoutLimit).not.toContain('{limit}')
+    }
+  })
+
   it('derives each phase duration from the next transition and terminal boundary', () => {
     const projection = projectAssistantActivityTimeline([], {
       lifecycle: 'settled',
@@ -1287,7 +1304,7 @@ describe('projectAssistantActivityTimeline', () => {
     expect(projection.statusSteps[0]?.label.code).toBe('chat.compact.skipped')
   })
 
-  it('merges adjacent automatic completions and keeps durable metadata', () => {
+  it('keeps request-scoped reductions distinct from adjacent saved summaries', () => {
     const projection = projectAssistantActivityTimeline([], {
       lifecycle: 'settled',
       statusHistory: [
@@ -1314,13 +1331,20 @@ describe('projectAssistantActivityTimeline', () => {
       ],
     })
 
-    expect(projection.statusSteps).toHaveLength(1)
+    expect(projection.statusSteps).toHaveLength(2)
     expect(projection.statusSteps[0]).toMatchObject({
+      id: 'cmp-request-scoped',
+      state: 'completed',
+      isCurrent: false,
+      durability: 'request_scoped',
+      label: { code: 'chat.compact.temporarilyReduced' },
+    })
+    expect(projection.statusSteps[1]).toMatchObject({
       id: 'cmp-durable',
       state: 'completed',
       source: 'automatic',
       durability: 'durable',
-      label: { code: 'chat.compact.compacted' },
+      label: { code: 'chat.compact.summarySaved' },
     })
   })
 

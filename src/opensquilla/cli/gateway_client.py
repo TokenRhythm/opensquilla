@@ -939,17 +939,6 @@ class GatewayClient:
         result = await self._call("config.patch.safe", {"patches": patches})
         return result if isinstance(result, dict) else {}
 
-    async def forget_approvals(self, target: str | None = None) -> dict[str, Any]:
-        """Wipe cached intent approvals on the server.
-
-        ``target`` selects a specific path/command; omit to clear all.
-        Returns the scope reported by the server.
-        """
-        params: dict[str, Any] = {}
-        if target:
-            params["target"] = target
-        return cast(dict[str, Any], await self._call("exec.approval.forget", params))
-
     async def approvals_snapshot(self) -> dict[str, Any]:
         """Return current approval mode + cache contents (diagnostic)."""
         return cast(dict[str, Any], await self._call("exec.approval.snapshot", {}))

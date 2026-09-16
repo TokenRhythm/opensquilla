@@ -14,7 +14,7 @@ test.afterEach(({ page }) => {
 test.describe('Chat topbar global controls', () => {
   test('non-chat language and theme popovers are mutually exclusive', async ({ page }) => {
     await page.addInitScript(() => localStorage.setItem('opensquilla-locale', 'en'))
-    await page.goto('/control/sessions')
+    await page.goto('/control/chat')
 
     const language = page.getByTestId('language-switcher-trigger')
     const theme = page.getByRole('button', { name: 'Theme', exact: true })

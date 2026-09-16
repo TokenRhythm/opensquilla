@@ -400,20 +400,21 @@ export class WorkbenchRuntimeManager {
             ),
           }
         : {}),
-      ...(nativeApi.screenshot
-        ? {
-            screenshot: request => (
-              mayShow()
-                ? nativeApi.screenshot!(request)
-                : Promise.resolve({
-                    ok: false as const,
-                    method: 'screenshot' as const,
-                    code: 'unavailable',
-                    message: 'Workbench surface is no longer active',
-                  })
-            ),
-          }
-        : {}),
+      ...(nativeApi.getWorkbenchBrowserTarget ? {
+        getWorkbenchBrowserTarget: request => isCurrent()
+          ? nativeApi.getWorkbenchBrowserTarget!(request)
+          : Promise.reject(new Error('Workbench surface is no longer active')),
+      } : {}),
+      ...(nativeApi.focusWorkbenchAnnotation ? {
+        focusWorkbenchAnnotation: request => mayShow()
+          ? nativeApi.focusWorkbenchAnnotation!(request)
+          : Promise.resolve(ignored()),
+      } : {}),
+      ...(nativeApi.captureWorkbenchScreenshot ? {
+        captureWorkbenchScreenshot: request => mayShow()
+          ? nativeApi.captureWorkbenchScreenshot!(request)
+          : Promise.reject(new Error('Workbench surface is no longer active')),
+      } : {}),
       async createSurface(request) {
         if (!isCurrent()) return ignored()
         const result = await nativeApi.createSurface(request)

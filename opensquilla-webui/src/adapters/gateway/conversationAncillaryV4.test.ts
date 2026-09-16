@@ -56,7 +56,7 @@ describe('conversation ancillary v4 adapters', () => {
     )
 
     await usage.status('agent:main:webchat:test')
-    await usage.query({ timezone: 'UTC' })
+    await usage.snapshot('all', { timezone: 'UTC' })
     await usage.costBreakdown()
     await commands.list('web_chat')
     await feedback.submit('decision-1', 'up')

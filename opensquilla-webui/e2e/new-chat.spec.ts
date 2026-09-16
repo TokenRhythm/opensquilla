@@ -58,6 +58,52 @@ test.describe('New chat draft state', () => {
     })
   })
 
+  test('refreshing a clicked New task preserves its unsent draft', async ({ page }) => {
+    await page.goto(CONTROL_URL)
+    await page.locator('.sidebar-new-session').click()
+    await expect(page).toHaveURL(/\/chat\/new\?agent=main$/)
+
+    const text = 'draft typed after clicking New task '.repeat(200)
+    const textarea = page.locator('.chat-textarea')
+    await textarea.fill(text)
+    await expect.poll(() => page.evaluate(pointerKey => {
+      const pointer = localStorage.getItem(pointerKey)
+      return pointer ? localStorage.getItem(`opensquilla.chat.draft:${pointer}`) : null
+    }, RECENT_DRAFT_SESSION_KEY)).toBe(text)
+
+    await page.reload()
+
+    await expect(textarea).toHaveValue(text)
+  })
+
+  test('a cleared scoped draft does not delete another tab draft on refresh', async ({
+    page,
+    context,
+  }) => {
+    await page.goto(CONTROL_URL)
+    await page.locator('.sidebar-new-session').click()
+    const textarea = page.locator('.chat-textarea')
+    await textarea.fill('draft cleared in this tab')
+    await textarea.fill('')
+
+    const otherPage = await context.newPage()
+    await otherPage.goto(CONTROL_URL)
+    await otherPage.locator('.sidebar-new-session').click()
+    await otherPage.locator('.chat-textarea').fill('keep the other tab draft')
+    await expect.poll(() => otherPage.evaluate(pointerKey => {
+      const pointer = localStorage.getItem(pointerKey)
+      return pointer ? localStorage.getItem(`opensquilla.chat.draft:${pointer}`) : null
+    }, RECENT_DRAFT_SESSION_KEY)).toBe('keep the other tab draft')
+
+    await page.reload()
+
+    await expect(textarea).toHaveValue('')
+    await expect.poll(() => page.evaluate(pointerKey => {
+      const pointer = localStorage.getItem(pointerKey)
+      return pointer ? localStorage.getItem(`opensquilla.chat.draft:${pointer}`) : null
+    }, RECENT_DRAFT_SESSION_KEY)).toBe('keep the other tab draft')
+  })
+
   test('explicit New task preserves another session draft', async ({ page }) => {
     const otherKey = 'agent:main:webchat:e2e-other-draft'
     await seedRecoverableDraft(page, otherKey, 'keep the other draft')

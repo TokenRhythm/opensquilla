@@ -9,7 +9,7 @@ from typing import Any
 from opensquilla.application.artifact_workbench import ArtifactRecoveryPort
 from opensquilla.artifact_session import ArtifactSessionService, DocumentImportAttempt
 from opensquilla.artifacts import ArtifactStore
-from opensquilla.gateway import artifact_mutation_recovery, document_resource_recovery
+from opensquilla.gateway import document_resource_recovery
 from opensquilla.gateway.document_resource_recovery import (
     DocumentImportRecoverySource,
 )
@@ -43,19 +43,8 @@ class GatewayArtifactRecoveryPort(ArtifactRecoveryPort):
         self._store = store
         self._import_source_resolver = import_source_resolver
 
-    async def recover_drafts(self) -> Mapping[str, int]:
-        return _counters(
-            await artifact_mutation_recovery.reject_orphaned_artifact_drafts(
-                self._service, self._store
-            )
-        )
-
-    async def recover_mutations(self) -> Mapping[str, int]:
-        return _counters(
-            await artifact_mutation_recovery.reconcile_pending_artifact_mutations(
-                self._service, self._store
-            )
-        )
+    async def retire_legacy_editor(self) -> None:
+        await self._service.retire_legacy_html_state()
 
     async def recover_resources(self) -> Mapping[str, int]:
         return _counters(

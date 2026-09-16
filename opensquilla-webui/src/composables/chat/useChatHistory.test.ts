@@ -3,6 +3,7 @@ import { describe, expect, it, vi } from 'vitest'
 import { nextTick, ref, watch, type Ref } from 'vue'
 
 import { useChatHistory } from './useChatHistory'
+import { projectAssistantActivityTimeline } from '@/utils/chat/assistantActivity'
 import type { ChatMessage, ChatTurnOutcome } from '@/types/chat'
 import { RpcTimeoutError } from '@/lib/rpc'
 import {
@@ -1338,6 +1339,49 @@ describe('useChatHistory canonical pagination', () => {
     expect(messages.value[0]?.turnId).toBe('turn-1')
   })
 
+  it.each([
+    ['emergency_ephemeral', undefined],
+    ['completed', 'request_scoped'],
+  ])('restores a temporary %s reduction without claiming a saved summary', async (status, durability) => {
+    const { api, messages } = makeHistory(false, {
+      response: {
+        messages: [{
+          id: 'assistant-temporary',
+          role: 'assistant',
+          text: 'Continued after reducing the request context.',
+          turnContext: {
+            turnId: 'turn-temporary',
+            activityMarkers: [{
+              kind: 'context_compaction',
+              id: 'cmp-temporary',
+              status,
+              durability,
+              at: 1_720_000_000_000,
+            }],
+          },
+        }],
+        canonicalComplete: true,
+        hasMore: false,
+      },
+    })
+
+    await api.loadHistory()
+
+    expect(messages.value).toHaveLength(1)
+    expect(messages.value[0]).toMatchObject({
+      restoredFromHistory: true,
+      statusHistory: [{ state: 'completed', durability: 'request_scoped' }],
+    })
+    const projection = projectAssistantActivityTimeline([], {
+      lifecycle: 'settled',
+      statusHistory: messages.value[0]!.statusHistory,
+    })
+    expect(projection.statusSteps[0]).toMatchObject({
+      isCurrent: false,
+      label: { code: 'chat.compact.temporarilyReduced' },
+    })
+  })
+
   it('prefers a durable summary boundary over duplicate activity metadata', async () => {
     const { api, messages } = makeHistory(false, {
       response: {
@@ -1844,6 +1888,139 @@ describe('useChatHistory canonical pagination', () => {
     ])
   })
 
+  it('keeps an early-steer route bound through a running history refresh', async () => {
+    const turnId = 'turn-running-route'
+    const { api, messages } = makeHistory(false, {
+      preserveLiveTail: true,
+      messages: [
+        {
+          role: 'user',
+          text: 'prepare a summary',
+          ts: 1,
+          messageId: 'user-original',
+        },
+        {
+          role: 'router',
+          text: '',
+          ts: 2,
+          messageId: 'router-1.0',
+          turnId,
+          routerModelCallId: '1.0',
+          routerIteration: 1,
+        },
+        { role: 'assistant', text: 'first segment', ts: 3, turnId },
+        {
+          role: 'user',
+          text: 'add risks',
+          ts: 4,
+          messageId: 'steer-1',
+          turnId,
+          inputDisposition: 'applied',
+          inputDispositionRevision: 2,
+        },
+        { role: 'assistant', text: 'continued segment', ts: 5, turnId },
+      ],
+      response: {
+        messages: [
+          {
+            id: 'user-original',
+            messageId: 'user-original',
+            role: 'user',
+            text: 'prepare a summary',
+            createdAt: '2026-07-06T01:00:00Z',
+            turnContext: { turnId },
+          },
+          {
+            id: 'steer-1',
+            messageId: 'steer-1',
+            role: 'user',
+            text: 'add risks',
+            createdAt: '2026-07-06T01:00:01Z',
+            turnContext: {
+              turnId,
+              intent: 'steer',
+              disposition: 'applied',
+              revision: 2,
+            },
+          },
+        ],
+        hasMore: false,
+      },
+    })
+
+    await api.loadHistory()
+
+    expect(messages.value.map(message => [message.role, message.text])).toEqual([
+      ['user', 'prepare a summary'],
+      ['router', ''],
+      ['assistant', 'first segment'],
+      ['user', 'add risks'],
+      ['assistant', 'continued segment'],
+    ])
+    expect(messages.value.filter(message => message.role === 'router')).toEqual([
+      expect.objectContaining({
+        messageId: 'router-1.0',
+        turnId,
+        routerModelCallId: '1.0',
+        routerIteration: 1,
+      }),
+    ])
+  })
+
+  it('keeps an automatic live route after an assistant-only history window', async () => {
+    const { api, messages } = makeHistory(false, {
+      preserveLiveTail: true,
+      messages: [
+        {
+          role: 'user',
+          text: 'Start the Goal',
+          ts: 1,
+          messageId: 'user-root',
+          turnId: 'turn-root',
+          restoredFromHistory: true,
+        },
+        {
+          role: 'router',
+          text: '',
+          ts: 4,
+          messageId: 'router-current',
+          turnId: 'turn-continuation-current',
+          turnInputMode: 'system_event',
+          turnRunKind: 'goal',
+          routerModelCallId: '1.0',
+          routerIteration: 1,
+        },
+      ],
+      response: {
+        messages: [{
+          id: 'answer-earlier',
+          messageId: 'answer-earlier',
+          role: 'assistant',
+          text: 'Earlier continuation output',
+          createdAt: '2026-07-06T01:00:00Z',
+          turnContext: {
+            turnId: 'turn-continuation-earlier',
+            inputMode: 'system_event',
+            runKind: 'goal',
+          },
+        }],
+        hasMore: true,
+      },
+    })
+
+    await api.loadHistory()
+
+    expect(messages.value.map(message => message.messageId)).toEqual([
+      'answer-earlier',
+      'router-current',
+    ])
+    expect(messages.value[1]).toMatchObject({
+      turnId: 'turn-continuation-current',
+      routerModelCallId: '1.0',
+      routerIteration: 1,
+    })
+  })
+
   it('bridges forward without dropping loaded pages when a refresh has no message-id overlap', async () => {
     const initial = Array.from({ length: 50 }, (_, index) => historyMessage(`m-${index + 250}`))
     const earlier = Array.from({ length: 50 }, (_, index) => historyMessage(`m-${index + 200}`))
@@ -2307,6 +2484,66 @@ describe('useChatHistory canonical pagination', () => {
       canonicalAvailable: false,
       canonicalComplete: true,
     })
+  })
+
+  it('reconciles a confirmed empty draft after live reconnect', async () => {
+    const { api, messages, readHistory } = makeHistory(false, {
+      response: {
+        messages: [],
+        hasMore: false,
+        canonicalAvailable: false,
+        canonicalComplete: true,
+      },
+    })
+
+    await expect(api.reconcileHistory()).resolves.toEqual({ ok: true })
+
+    expect(readHistory).toHaveBeenCalledOnce()
+    expect(messages.value).toEqual([])
+    expect(api.historyState.value).toMatchObject({
+      initialLoadStatus: 'ready',
+      canonicalAvailable: false,
+      canonicalComplete: true,
+      recoveryError: false,
+    })
+  })
+
+  it.each([false, undefined])(
+    'does not accept unavailable empty reconciliation with completeness %s',
+    async canonicalComplete => {
+      const { api } = makeHistory(false, {
+        response: {
+          messages: [],
+          hasMore: false,
+          canonicalAvailable: false,
+          canonicalComplete,
+        },
+      })
+      const before = { ...api.historyState.value }
+
+      await expect(api.reconcileHistory()).resolves.toEqual({ ok: false })
+
+      expect(api.historyState.value).toEqual(before)
+    },
+  )
+
+  it('preserves loaded durable history when reconciliation claims a missing empty session', async () => {
+    const { api, messages, historyFixture } = makeHistory(false)
+    await api.loadHistory()
+    const beforeMessages = messages.value.slice()
+    const beforeState = { ...api.historyState.value }
+    historyFixture.mockResolvedValueOnce({
+      messages: [],
+      hasMore: false,
+      canonicalAvailable: false,
+      canonicalComplete: true,
+    })
+
+    await expect(api.reconcileHistory()).resolves.toEqual({ ok: false })
+
+    expect(messages.value).toEqual(beforeMessages)
+    expect(messages.value[0]?.messageId).toBe('m1')
+    expect(api.historyState.value).toEqual(beforeState)
   })
 
   it('keeps an old-gateway empty success without canonical fields compatible', async () => {

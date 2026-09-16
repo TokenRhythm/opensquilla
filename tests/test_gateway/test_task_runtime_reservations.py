@@ -27,7 +27,8 @@ from opensquilla.gateway.task_runtime import (
     TaskRuntime,
 )
 from opensquilla.sandbox.run_mode import RunMode
-from opensquilla.session.models import AgentTaskRecord, AgentTaskStatus
+from opensquilla.session.models import AgentTaskRecord, AgentTaskStatus, SessionNode
+from opensquilla.session.storage import SessionStorage, StaleEpochError
 
 
 @dataclass
@@ -36,7 +37,14 @@ class _TrackingStorage:
     create_calls: list[str] = field(default_factory=list)
     update_calls: list[tuple[str, dict[str, Any]]] = field(default_factory=list)
 
-    async def create_agent_task(self, record: AgentTaskRecord) -> None:
+    async def create_agent_task(
+        self,
+        record: AgentTaskRecord,
+        *,
+        expected_session_id: str | None = None,
+        expected_session_epoch: int | None = None,
+    ) -> None:
+        del expected_session_id, expected_session_epoch
         self.create_calls.append(record.task_id)
         self.records[record.task_id] = record
 
@@ -60,23 +68,103 @@ class _TrackingStorage:
         self.records[record.task_id] = record
 
 
+class _DroppingKwargsStorage(_TrackingStorage):
+    async def create_agent_task(
+        self,
+        record: AgentTaskRecord,
+        **_kwargs: Any,
+    ) -> None:
+        await super().create_agent_task(record)
+
+
 @dataclass(frozen=True)
 class _PersistenceResult:
     replayed: bool = False
 
 
-def _envelope(session_key: str = "agent-1::reservation") -> RouteEnvelope:
+def _envelope(
+    session_key: str = "agent-1::reservation",
+    *,
+    session_id: str | None = None,
+    session_epoch: int | None = None,
+) -> RouteEnvelope:
     return RouteEnvelope(
         source_kind=SourceKind.WEB,
         source_name="reservation-test",
         agent_id="agent-1",
         session_key=session_key,
         input_provenance={"kind": "synthetic-test"},
+        session_id=session_id,
+        session_epoch=session_epoch,
     )
 
 
 async def _noop_turn_handler(_run: Any) -> None:
     return
+
+
+@pytest.mark.asyncio
+async def test_direct_enqueue_rejects_stale_owner_before_task_activation(tmp_path) -> None:
+    storage = await SessionStorage.open(str(tmp_path / "stale-owner.db"))
+    key = "agent:main:webchat:stale-runtime-owner"
+    admitted = SessionNode(
+        session_key=key,
+        session_id="runtime-owner-old",
+        epoch=0,
+    )
+    await storage.upsert_session(admitted)
+    replacement = admitted.model_copy(deep=True)
+    replacement.session_id = "runtime-owner-new"
+    replacement.epoch = 1
+    await storage.upsert_session(replacement)
+    handler_started = asyncio.Event()
+
+    async def handler(_run: Any) -> None:
+        handler_started.set()
+
+    runtime = TaskRuntime(storage=storage, turn_handler=handler)
+    task_id = "stale-owner-runtime-task"
+    try:
+        with pytest.raises(StaleEpochError, match="durable admission"):
+            await runtime.enqueue(
+                _envelope(
+                    key,
+                    session_id=admitted.session_id,
+                    session_epoch=0,
+                ),
+                "must not execute",
+                task_id=task_id,
+            )
+
+        assert await storage.get_agent_task(task_id) is None
+        assert handler_started.is_set() is False
+        assert runtime._tasks == {}
+        assert runtime._reservations_by_session == {}
+    finally:
+        await runtime.shutdown(graceful=True, timeout=1.0)
+        await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_direct_enqueue_modern_owner_rejects_dropping_kwargs_storage() -> None:
+    storage = _DroppingKwargsStorage()
+    handler_started = asyncio.Event()
+
+    async def handler(_run: Any) -> None:
+        handler_started.set()
+
+    runtime = TaskRuntime(storage=storage, turn_handler=handler)
+
+    with pytest.raises(RuntimeError, match="exact session-owner storage CAS"):
+        await runtime.enqueue(
+            _envelope(session_id="session-owner", session_epoch=0),
+            "must not execute",
+        )
+
+    assert storage.create_calls == []
+    assert storage.records == {}
+    assert not handler_started.is_set()
+    assert runtime._reservations_by_session == {}
 
 
 @pytest.mark.asyncio
@@ -196,6 +284,56 @@ async def test_reserve_preserves_task_id_without_capturing_accepted_config() -> 
 
 
 @pytest.mark.asyncio
+async def test_reserve_persists_exact_session_owner_in_task_details() -> None:
+    runtime = TaskRuntime(
+        storage=_TrackingStorage(),
+        turn_handler=_noop_turn_handler,
+    )
+
+    reservation = await runtime.reserve(
+        _envelope(session_id="session-owner", session_epoch=0),
+        "reserved",
+    )
+
+    assert reservation.task_record.details is not None
+    assert reservation.task_record.details["session_id"] == "session-owner"
+    assert reservation.task_record.details["session_epoch"] == 0
+    assert reservation.runtime_task.envelope.session_id == "session-owner"
+    assert reservation.runtime_task.envelope.session_epoch == 0
+
+    await runtime.abort_reservation(reservation)
+
+
+@pytest.mark.asyncio
+async def test_reserve_rejects_epoch_without_session_id() -> None:
+    runtime = TaskRuntime(
+        storage=_TrackingStorage(),
+        turn_handler=_noop_turn_handler,
+    )
+
+    with pytest.raises(ValueError, match="session_epoch requires"):
+        await runtime.reserve(_envelope(session_epoch=0), "malformed")
+
+
+@pytest.mark.asyncio
+async def test_reserve_keeps_id_only_legacy_owner_epoch_unknown() -> None:
+    runtime = TaskRuntime(
+        storage=_TrackingStorage(),
+        turn_handler=_noop_turn_handler,
+    )
+
+    reservation = await runtime.reserve(
+        _envelope(session_id="legacy-session"),
+        "legacy",
+    )
+
+    assert reservation.task_record.details is not None
+    assert reservation.task_record.details["session_id"] == "legacy-session"
+    assert "session_epoch" not in reservation.task_record.details
+    await runtime.abort_reservation(reservation)
+
+
+@pytest.mark.asyncio
 async def test_activate_captures_accepted_config_once() -> None:
     storage = _TrackingStorage()
     handler_started = asyncio.Event()
@@ -284,6 +422,34 @@ async def test_activate_passes_session_and_run_kind_to_contextual_config_provide
         "selection_mode": "",
         "run_kind": "channel_turn",
     }
+
+
+@pytest.mark.asyncio
+async def test_cron_turn_persists_terminal_assistant_payload() -> None:
+    storage = _TrackingStorage()
+
+    async def handler(run: Any) -> None:
+        assert run.assistant_message_sink is not None
+        run.assistant_message_sink("assistant-cron", "durable cron result")
+
+    runtime = TaskRuntime(storage=storage, turn_handler=handler)
+    handle = await runtime.enqueue(
+        _envelope(session_id="cron-owner", session_epoch=3),
+        "scheduled task",
+        run_kind="cron_turn",
+    )
+
+    terminal = await runtime.wait(handle.task_id, timeout=1.0)
+
+    assert terminal.status == AgentTaskStatus.SUCCEEDED
+    assert terminal.details is not None
+    assert terminal.details["session_id"] == "cron-owner"
+    assert terminal.details["session_epoch"] == 3
+    assert terminal.details["terminal_assistant_message_id"] == "assistant-cron"
+    assert (
+        terminal.details["terminal_assistant_message_content"]
+        == "durable cron result"
+    )
 
 
 @pytest.mark.asyncio
@@ -1700,6 +1866,7 @@ async def test_concurrent_execution_fences_cannot_erase_driver_change_signal(
     async def controlled_drain(
         keys: tuple[str, ...],
         _key_set: frozenset[str],
+        **_kwargs: Any,
     ) -> None:
         nonlocal first_drain_calls
         if keys == (first_key,):

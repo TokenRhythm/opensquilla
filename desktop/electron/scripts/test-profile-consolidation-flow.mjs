@@ -705,6 +705,8 @@ try {
   assert.equal(generatedCredential.encryptedApiKey, 'synthetic-credential-only-secret')
   assert.equal(generatedCredential.configAuthority, 'generated')
   assert.equal(generatedCredential.importTransactionId, '')
+  assert.equal(Object.hasOwn(generatedCredential, 'routerPresetBinding'), false)
+  assert.doesNotMatch(generatedConfig, /preset_binding\s*=/)
   const credentialOnlyTransactions = await readdir(
     join(credentialOnlyUserData, 'backups', 'profile-consolidation'),
   )
@@ -795,8 +797,8 @@ try {
     invalidCredentialStableCode: skippedCredentialEvent.stableCode,
   }, null, 2))
 } catch (error) {
-  const desktopLog = await readFile(join(userData, 'logs', 'desktop.log'), 'utf8').catch(() => '')
-  const gatewayLog = await readFile(join(userData, 'logs', 'gateway.log'), 'utf8').catch(() => '')
+  const desktopLog = await readFile(join(activeAppUserData, 'logs', 'desktop.log'), 'utf8').catch(() => '')
+  const gatewayLog = await readFile(join(activeAppUserData, 'logs', 'gateway.log'), 'utf8').catch(() => '')
   console.error(JSON.stringify({
     phase: 'run-error-before-cleanup',
     error: String(error?.stack || error),

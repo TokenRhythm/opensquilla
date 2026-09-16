@@ -11,6 +11,10 @@ import asyncio
 from typing import Any, Protocol, cast
 
 
+class SessionServiceUnavailableError(RuntimeError):
+    """The session manager cannot expose its durable storage surface."""
+
+
 class SessionStorageProvider(Protocol):
     @property
     def storage(self) -> Any: ...
@@ -34,6 +38,48 @@ def get_session_storage(session_manager: object | None) -> Any | None:
     if storage is not None:
         return storage
     return getattr(session_manager, "_storage", None)
+
+
+async def read_session_identity(
+    session_manager: object | None, session_key: str,
+) -> tuple[str | None, int | None]:
+    """Read the durable owner pair used to fence snapshot capture/installation."""
+    from opensquilla.session.storage import bounded_interactive_storage_reads
+
+    storage = get_session_storage(session_manager)
+    if storage is None:
+        return None, None
+    with bounded_interactive_storage_reads():
+        session = await storage.get_session(session_key)
+    return (session.session_id, session.epoch) if session is not None else (None, None)
+
+
+async def session_id_for_key(
+    session_manager: object | None,
+    session_key: str,
+) -> str | None:
+    """Resolve a durable session id without importing another RPC surface."""
+
+    if session_manager is None:
+        raise SessionServiceUnavailableError("session manager is not wired")
+
+    get_session = getattr(session_manager, "get_session", None)
+    try:
+        if callable(get_session):
+            session = await get_session(session_key)
+        else:
+            storage = get_session_storage(session_manager)
+            if storage is None:
+                raise SessionServiceUnavailableError("session storage is not wired")
+            session = await storage.get_session(session_key)
+    except KeyError:
+        session = None
+    if session is None:
+        return None
+    session_id = getattr(session, "session_id", None)
+    if not isinstance(session_id, str) or not session_id:
+        return None
+    return session_id
 
 
 def get_session_epoch(session_manager: object | None, session_key: str) -> int | None:

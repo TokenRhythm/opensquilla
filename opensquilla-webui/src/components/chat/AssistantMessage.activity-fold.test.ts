@@ -18,6 +18,8 @@ import AssistantMessage from './AssistantMessage.vue'
 import { ARTIFACT_WORKBENCH_KEY, type ArtifactWorkbench } from '@/modules/artifactWorkbench'
 import { GATEWAY_ACCESS_KEY, type GatewayAccess } from '@/modules/gatewayAccess'
 import { createV4ArtifactContentAccess } from '@/adapters/gateway/artifactAccessV4'
+import { createV4ArtifactPreviews } from '@/adapters/gateway/artifactPreviewsV4'
+import { httpTransportTestDouble } from '@/testing/httpTransport.test-helper'
 
 const mountedApps: App[] = []
 
@@ -35,18 +37,6 @@ function failedCall(): ChatToolCallRenderItem {
     result: 'Network unavailable',
     resultPreview: 'Network unavailable',
     isOpen: false,
-  }
-}
-
-function failedDocumentWriterCall(name = 'document_apply'): ChatToolCallRenderItem {
-  return {
-    ...failedCall(),
-    toolId: `failed-${name}`,
-    renderKey: `failed-${name}`,
-    name,
-    displayName: 'Apply document change',
-    result: 'Proposal validation failed',
-    resultPreview: 'Proposal validation failed',
   }
 }
 
@@ -251,6 +241,7 @@ function mountMessage(
   showTurnOutcome = false,
   extraProps: Record<string, unknown> = {},
 ): HTMLElement {
+  const http = httpTransportTestDouble()
   const el = document.createElement('div')
   document.body.appendChild(el)
   const app = createApp({
@@ -281,7 +272,8 @@ function mountMessage(
     isLocalOwner: false,
   } as GatewayAccess)
   app.provide(ARTIFACT_WORKBENCH_KEY, {
-    content: createV4ArtifactContentAccess(),
+    content: createV4ArtifactContentAccess(http),
+    previews: createV4ArtifactPreviews(http, { baseOrigin: () => 'http://localhost' }),
   } as ArtifactWorkbench)
   app.mount(el)
   return el
@@ -628,7 +620,7 @@ describe('AssistantMessage activity disclosure', () => {
       .toContain('Completed')
   })
 
-  it('keeps the canonical answer outside activity and hides failed tool content', async () => {
+  it('keeps the canonical answer outside activity and exposes failed tool content', async () => {
     const el = mountMessage(baseMessage())
     await nextTick()
 
@@ -639,6 +631,7 @@ describe('AssistantMessage activity disclosure', () => {
     const failedRow = activity?.querySelector<HTMLElement>('.tool-row--error')
 
     expect(activity).not.toBeNull()
+    expect(summary?.textContent).toContain('Completed')
     expect(summary?.getAttribute('aria-expanded')).toBe('false')
     expect(activity?.dataset.shareExpanded).toBe('false')
     const reasoningFold = activity?.querySelector<HTMLDetailsElement>('details.thinking-fold')
@@ -648,9 +641,9 @@ describe('AssistantMessage activity disclosure', () => {
     expect(activity?.querySelector('.assistant-activity__summary-arrow')).not.toBeNull()
     expect(activity?.textContent).toContain('Checked the available evidence.')
     expect(activity?.textContent).toContain('Searched the web')
-    expect(activity?.textContent).not.toContain('1 web action')
+    expect(activity?.textContent).toContain('1 web action')
     expect(activity?.textContent).not.toContain('failure recovered')
-    expect(failedRow).toBeNull()
+    expect(failedRow).not.toBeNull()
 
     expect(answer?.textContent).toBe('Canonical answer')
     expect(activity?.contains(answer ?? null)).toBe(false)
@@ -658,6 +651,116 @@ describe('AssistantMessage activity disclosure', () => {
     expect(activity?.querySelector('.activity-narration')?.textContent).toContain('Draft prefix')
     expect(activity?.textContent).toContain('Draft prefix')
     expect(el.textContent).not.toContain('Draft suffix')
+  })
+
+  it.each([
+    { status: 'succeeded', kind: 'completed', label: 'Completed', lifecycle: 'settled' },
+    { status: 'cancelled', kind: 'user_stopped', label: 'Stopped', lifecycle: 'interrupted' },
+    { status: 'timeout', kind: 'timeout', label: 'Timed out', lifecycle: 'failed' },
+    { status: 'failed', kind: 'failed', label: 'Failed', lifecycle: 'failed' },
+  ])('keeps the $status turn outcome when a tool failed', async ({ status, kind, label, lifecycle }) => {
+    const el = mountMessage(baseMessage({
+      turnOutcome: { turnId: 'turn-with-tool-failure', status, kind },
+    }), true)
+    await nextTick()
+
+    const activity = el.querySelector<HTMLElement>('.assistant-activity')
+    const summary = activity?.querySelector<HTMLElement>('.assistant-activity__summary')
+    expect(summary?.textContent).toContain(label)
+    expect(activity?.classList.contains(`assistant-activity--${lifecycle}`)).toBe(true)
+    expect(activity?.querySelector('.tool-row--error')).not.toBeNull()
+    expect(el.textContent).toContain('Network unavailable')
+    if (status !== 'failed') expect(summary?.textContent).not.toContain('Failed')
+  })
+
+  it.each([
+    { status: 'succeeded', kind: 'completed' },
+    { status: 'completed' },
+  ])('shows completed after a recovered edit when the outcome is $status', async (outcome) => {
+    const failedEdit = {
+      ...failedCall(),
+      name: 'edit_file',
+      displayName: 'Edit file',
+      result: 'Original text was not found',
+      resultPreview: 'Original text was not found',
+    }
+    const successfulEdit = successfulCall('retried-edit', 'edit_file')
+    const el = mountMessage(baseMessage({
+      text: 'The page was updated successfully.',
+      timelineItems: [failedEdit, successfulEdit].map(timelineGroup),
+      turnOutcome: { turnId: 'turn-recovered-edit', ...outcome },
+    }))
+    await nextTick()
+
+    const summary = el.querySelector<HTMLButtonElement>('.assistant-activity__summary')
+    expect(summary?.textContent).toContain('Completed · 7s')
+    expect(summary?.textContent).not.toContain('Failed')
+    summary?.click()
+    await nextTick()
+
+    expect(summary?.getAttribute('aria-expanded')).toBe('true')
+    expect(el.querySelectorAll('.tool-row')).toHaveLength(2)
+    const failedRow = el.querySelector<HTMLButtonElement>('.tool-row--error')
+    expect(failedRow).not.toBeNull()
+    failedRow?.click()
+    await nextTick()
+    expect(el.textContent).toContain('Original text was not found')
+    expect(el.textContent).toContain('The page was updated successfully.')
+  })
+
+  it.each([
+    { status: 'failed', kind: 'failed', label: 'Failed' },
+    { status: 'timeout', kind: 'timeout', label: 'Timed out' },
+    { status: 'cancelled', kind: 'user_stopped', label: 'Stopped' },
+    { status: 'abandoned', kind: 'interrupted', label: 'Interrupted' },
+  ])('keeps the $status outcome authoritative despite an earlier tool error', async ({ label, ...outcome }) => {
+    const el = mountMessage(baseMessage({
+      turnOutcome: { turnId: `turn-${outcome.status}`, ...outcome },
+    }))
+    await nextTick()
+
+    const summary = el.querySelector('.assistant-activity__summary')
+    expect(summary?.textContent).toContain(`${label} · 7s`)
+    expect(summary?.textContent).not.toContain('Completed')
+    expect(el.querySelector('.tool-row--error')).not.toBeNull()
+  })
+
+  it('keeps failed tool rows without treating a settled legacy answer as failed', async () => {
+    const el = mountMessage(baseMessage({ turnOutcome: undefined }))
+    await nextTick()
+
+    expect(el.querySelector('.assistant-activity__summary')?.textContent).toContain('Completed · 7s')
+    expect(el.querySelector('.assistant-activity--failed')).toBeNull()
+    expect(el.querySelector('.tool-row--error')).not.toBeNull()
+  })
+
+  it('keeps work live while retrying a failed tool before an outcome arrives', async () => {
+    const el = mountMessage(baseMessage({ isStreaming: true, turnOutcome: undefined }))
+    await nextTick()
+
+    expect(el.querySelector('.assistant-activity--live')).not.toBeNull()
+    expect(el.querySelector('.assistant-activity__live-head')?.getAttribute('aria-expanded')).toBe('true')
+    expect(el.querySelector('.assistant-activity__summary')).toBeNull()
+    expect(el.querySelector('.tool-row--error')).not.toBeNull()
+  })
+
+  it.each([
+    ['request_scoped', 'History temporarily reduced; continuing'],
+    ['durable', 'Summary saved'],
+  ])('keeps %s wording in the folded activity summary', async (durability, label) => {
+    const el = mountMessage(baseMessage({
+      timelineItems: [],
+      statusHistory: [{
+        action: 'context_compaction', label: '', at: 1_000,
+        id: 'cmp-folded', category: 'maintenance', state: 'completed',
+        source: 'automatic', durability,
+      }],
+    }))
+    await nextTick()
+
+    const summary = el.querySelector('.assistant-activity__summary')
+    expect(summary?.textContent).toContain(label)
+    if (durability === 'request_scoped') expect(summary?.textContent).not.toContain('Summary saved')
   })
 
   it('restores routine phase rows and reopens settled reasoning content', async () => {
@@ -1091,97 +1194,29 @@ describe('AssistantMessage activity disclosure', () => {
     expect(el.textContent).not.toContain('Inspecting files.Implementation complete.')
   })
 
-  it('does not render an activity disclosure containing only a failed tool', async () => {
-    const timelineItems = failedTimeline().filter(item => item.type === 'tool-group')
+  it('keeps failed generic browser and file tools visible', async () => {
+    const calls = ['browser', 'edit_file'].map(name => ({ ...failedCall(), name, toolId: name, renderKey: name }))
     const el = mountMessage(baseMessage({
-      text: '',
-      timelineItems,
-      toolCalls: [failedCall()],
-      parts: [],
-      statusHistory: [],
+      text: '', timelineItems: calls.map(timelineGroup), toolCalls: calls, parts: [], statusHistory: [],
     }))
     await nextTick()
-
-    const activity = el.querySelector('.assistant-activity')
-    expect(activity).toBeNull()
-    expect(el.querySelector('.tool-row--error')).toBeNull()
-  })
-
-  it.each(['document_apply', 'document_patch'])(
-    'keeps a failed %s page update visible and uses the unified successful summary',
-    async (writerName) => {
-      const failedWriter = failedDocumentWriterCall(writerName)
-      const failedApply = timelineGroup(failedWriter)
-      if (failedApply.type !== 'tool-group') throw new Error('expected tool group')
-      failedApply.group.isError = true
-      failedApply.group.status = 'error'
-      const successfulApply = timelineGroup(successfulCall('applied-document', writerName))
-      const el = mountMessage(baseMessage({
-        timelineItems: [failedApply, successfulApply],
-        toolCalls: [failedWriter, successfulCall('applied-document', writerName)],
-        parts: [],
-        statusHistory: [],
-        turnOutcome: {
-          turnId: 'turn-document-apply',
-          status: 'succeeded',
-          documentMutationOutcome: {
-            version: 1,
-            status: 'applied',
-            corrected: true,
-            proposalAttempts: 2,
-          },
-        },
-      }))
-      await nextTick()
-
-      const activity = el.querySelector<HTMLElement>('.assistant-activity')
-      expect(
-        activity?.querySelector('.assistant-activity__summary')?.getAttribute('aria-expanded'),
-      ).toBe('false')
-      expect(activity?.querySelector('.assistant-activity__summary')?.textContent)
-        .toContain('Page updated')
-      expect(activity?.querySelector('.assistant-activity__summary')?.textContent)
-        .not.toMatch(/receipt|reconciliation|revision|document_(?:apply|patch)/i)
-      expect(activity?.querySelector('.tool-row--error')).not.toBeNull()
-      expect(activity?.textContent).not.toContain('Proposal validation failed')
-    },
-  )
-
-  it('hides restored failures whose error state only survived on the group', async () => {
-    const staleFailure = timelineGroup(successfulCall('stale-failure', 'execute_code'))
-    if (staleFailure.type !== 'tool-group') throw new Error('expected tool group')
-    staleFailure.group.isError = true
-    staleFailure.group.status = 'error'
-    const el = mountMessage(baseMessage({
-      timelineItems: [staleFailure],
-      parts: [],
-      statusHistory: [],
-    }))
-    await nextTick()
-
-    expect(el.querySelector('.assistant-activity')).toBeNull()
-    expect(el.querySelector('.tool-row')).toBeNull()
-    expect(el.textContent).not.toContain('Failed')
-  })
-
-  it('keeps a restored document writer failure with a canonical operation key', async () => {
-    const restoredFailure = timelineGroup(successfulCall('restored-writer', 'document_patch'))
-    if (restoredFailure.type !== 'tool-group') throw new Error('expected tool group')
-    restoredFailure.group.operationKey = 'document.update'
-    restoredFailure.group.isError = true
-    restoredFailure.group.status = 'error'
-    const el = mountMessage(baseMessage({
-      timelineItems: [restoredFailure],
-      parts: [],
-      statusHistory: [],
-    }))
-    await nextTick()
-
     expect(el.querySelector('.assistant-activity')).not.toBeNull()
-    expect(el.textContent).toContain('Failed')
+    expect(el.querySelectorAll('.tool-row--error')).toHaveLength(2)
+    expect(el.textContent).toContain('Network unavailable')
   })
 
-  it('keeps successful calls while removing failed calls from a mixed group', async () => {
+  it('retains failures when only the restored group carries the error state', async () => {
+    const item = timelineGroup(successfulCall('restored-failure', 'exec'))
+    if (item.type !== 'tool-group') throw new Error('expected tool group')
+    item.group.isError = true
+    item.group.status = 'error'
+    const el = mountMessage(baseMessage({ timelineItems: [item], parts: [], statusHistory: [] }))
+    await nextTick()
+    expect(el.querySelector('.assistant-activity')).not.toBeNull()
+    expect(el.querySelector('.tool-row--error')).not.toBeNull()
+  })
+
+  it('keeps successful and failed calls from a mixed group', async () => {
     const success = successfulCall('successful-command', 'execute_code')
     const mixed = timelineGroup(success)
     if (mixed.type !== 'tool-group') throw new Error('expected tool group')
@@ -1195,9 +1230,58 @@ describe('AssistantMessage activity disclosure', () => {
     }))
     await nextTick()
 
-    expect(el.querySelectorAll('.tool-row')).toHaveLength(1)
-    expect(el.querySelector('.tool-row--error')).toBeNull()
-    expect(el.textContent).not.toContain('Network unavailable')
+    expect(el.querySelectorAll('.tool-row')).toHaveLength(2)
+    expect(el.querySelector('.tool-row--error')).not.toBeNull()
+    expect(el.textContent).toContain('Network unavailable')
+    expect(el.querySelector('.assistant-activity__summary')?.textContent).toContain('Completed')
+  })
+
+  it('uses the completed turn outcome for an empty answer with failed tool attempts', async () => {
+    const el = mountMessage(baseMessage({
+      text: '',
+      timelineItems: [timelineGroup(failedCall()), timelineGroup(successfulCall('retry', 'web_search'))],
+      parts: [],
+      statusHistory: [],
+      turnOutcome: { turnId: 'turn-recovered', status: 'succeeded', kind: 'completed' },
+    }))
+    await nextTick()
+
+    expect(el.querySelector('.assistant-activity__summary')?.textContent).toContain('Completed')
+    expect(el.querySelector('.assistant-activity--failed')).toBeNull()
+    expect(el.querySelectorAll('.tool-row--error')).toHaveLength(1)
+    expect(el.textContent).toContain('Network unavailable')
+  })
+
+  it.each<{ message: Partial<ChatRenderedMessage>, label: string }>([
+    { message: { terminalFailure: true }, label: 'Failed' },
+    { message: { interrupted: true }, label: 'Interrupted' },
+    {
+      message: { turnOutcome: { turnId: 'turn-failed', status: 'failed', kind: 'failed' } },
+      label: 'Failed',
+    },
+    {
+      message: { turnOutcome: { turnId: 'turn-timeout', status: 'timeout', kind: 'timeout' } },
+      label: 'Timed out',
+    },
+    {
+      message: {
+        turnOutcome: {
+          turnId: 'turn-stopped',
+          status: 'cancelled',
+          kind: 'user_stopped',
+          cancellationSource: 'webui_stop',
+        },
+      },
+      label: 'Stopped',
+    },
+  ])('preserves the terminal $label outcome when tools also failed', async ({ message, label }) => {
+    const el = mountMessage(baseMessage(message))
+    await nextTick()
+
+    const summary = el.querySelector('.assistant-activity__summary')
+    expect(summary?.textContent).toContain(label)
+    expect(summary?.textContent).not.toContain('Completed')
+    expect(el.querySelectorAll('.tool-row--error')).toHaveLength(1)
   })
 
   it('keeps interrupted activity collapsed while leaving the answer outside', async () => {
@@ -1502,12 +1586,13 @@ describe('AssistantMessage activity disclosure', () => {
 
     const activity = el.querySelector('.assistant-activity')
     expect(activity?.classList.contains('assistant-activity--failed')).toBe(true)
+    expect(activity?.querySelector('.assistant-activity__summary')?.textContent).toContain('Failed')
     expect(activity?.querySelector('.assistant-activity__summary')?.getAttribute('aria-expanded'))
       .toBe('false')
     expect(el.textContent).toContain('Partial answer before failure.')
   })
 
-  it('preserves legacy narration but removes failed tool rows when no canonical answer exists', async () => {
+  it('preserves legacy narration and failed tool rows when no canonical answer exists', async () => {
     const el = mountMessage(baseMessage({
       text: '   ',
       parts: [],
@@ -1519,8 +1604,8 @@ describe('AssistantMessage activity disclosure', () => {
     expect(el.querySelector('.assistant-activity')).toBeNull()
     expect(text).toContain('Draft prefix')
     expect(text).toContain('Draft suffix')
-    expect(text).not.toContain('Search')
-    expect(text).not.toContain('Network unavailable')
+    expect(text).toContain('Search')
+    expect(text).toContain('Network unavailable')
     expect(text.indexOf('Draft prefix')).toBeLessThan(text.indexOf('Draft suffix'))
   })
 

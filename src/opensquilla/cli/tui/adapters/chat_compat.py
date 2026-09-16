@@ -210,16 +210,6 @@ async def async_file_prompt_and_attachments(
     )
 
 
-async def forget_server_approvals(
-    client: object | None,
-    target: str | None = None,
-) -> bool:
-    return await _slash_bridge.forget_server_approvals(
-        client,
-        target,
-    )
-
-
 async def handle_approvals_command(cmd: str, client: object | None = None) -> None:
     await _slash_bridge.handle_approvals_command(
         cmd,

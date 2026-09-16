@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -10,6 +11,7 @@ import pytest
 from opensquilla.application.provider_configuration import (
     ModelCatalog,
     ModelRouting,
+    PreparedModelRouting,
     ProviderStatus,
 )
 
@@ -54,14 +56,120 @@ async def test_model_catalog_filters_models_but_preserves_errors() -> None:
 
 @pytest.mark.asyncio
 async def test_routing_accepts_only_a_nonempty_domain_mode() -> None:
-    port = ProviderPort()
-    routing = ModelRouting(port)
+    events: list[str] = []
+
+    class ConfigPort:
+        def __init__(self) -> None:
+            self.config = SimpleNamespace(mode="fixed")
+
+        def active_config(self) -> Any:
+            return self.config
+
+        def persist_candidate(self, candidate: Any, **_kwargs: Any) -> str:
+            events.append("persist")
+            return "/tmp/config.toml"
+
+        def install_candidate(self, candidate: Any) -> Any:
+            events.append("install")
+            self.config = candidate
+            return candidate
+
+    class PolicyPort:
+        def snapshot(self, config: Any) -> Mapping[str, Any]:
+            return {"mode": config.mode}
+
+        def prepare(self, _config: Any, mode: str) -> PreparedModelRouting:
+            events.append("prepare-candidate")
+            return PreparedModelRouting(
+                SimpleNamespace(mode=mode),
+                ("squilla_router.enabled",),
+            )
+
+    class RuntimePort:
+        def prepare_reconciliation(self, config: Any) -> Any:
+            events.append("prepare-runtime")
+            return config.mode
+
+        async def reconcile(self, config: Any, prepared: Any) -> None:
+            events.append(f"reconcile:{prepared}:{config.mode}")
+
+        async def publish_changed(
+            self,
+            previous: Mapping[str, Any],
+            config: Any,
+            *,
+            source: str,
+        ) -> None:
+            events.append(f"publish:{source}:{previous['mode']}:{config.mode}")
+
+    routing = ModelRouting(ConfigPort(), PolicyPort(), RuntimePort())
 
     assert await routing.read() == {"mode": "fixed"}
-    assert (await routing.set_mode("  auto  "))["mode"] == "auto"
+    result = await routing.set_mode("  auto  ")
+    assert result == {
+        "mode": "auto",
+        "patched": ["squilla_router.enabled"],
+        "restart_required": False,
+    }
+    assert events == [
+        "prepare-candidate",
+        "prepare-runtime",
+        "persist",
+        "install",
+        "reconcile:auto:auto",
+        "publish:config.patch.safe:fixed:auto",
+    ]
     with pytest.raises(ValueError, match="routing mode is required"):
         await routing.set_mode("  ")
-    assert port.routing_modes == ["auto"]
+
+
+@pytest.mark.asyncio
+async def test_routing_persist_failure_stops_before_live_reconciliation() -> None:
+    events: list[str] = []
+    current = SimpleNamespace(mode="direct")
+
+    class ConfigPort:
+        def active_config(self) -> Any:
+            return current
+
+        def persist_candidate(self, _candidate: Any, **_kwargs: Any) -> str:
+            events.append("persist")
+            raise OSError("disk full")
+
+        def install_candidate(self, candidate: Any) -> Any:
+            events.append("install")
+            return candidate
+
+    class PolicyPort:
+        def snapshot(self, config: Any) -> Mapping[str, Any]:
+            return {"mode": config.mode}
+
+        def prepare(self, _config: Any, mode: str) -> PreparedModelRouting:
+            return PreparedModelRouting(SimpleNamespace(mode=mode), ("routing",))
+
+    class RuntimePort:
+        def prepare_reconciliation(self, _config: Any) -> Any:
+            events.append("prepare-runtime")
+            return None
+
+        async def reconcile(self, _config: Any, _prepared: Any) -> None:
+            events.append("reconcile")
+
+        async def publish_changed(
+            self,
+            _previous: Mapping[str, Any],
+            _config: Any,
+            *,
+            source: str,
+        ) -> None:
+            events.append(f"publish:{source}")
+
+    routing = ModelRouting(ConfigPort(), PolicyPort(), RuntimePort())
+    with pytest.raises(OSError, match="disk full"):
+        await routing.set_mode("router")
+
+    assert current.mode == "direct"
+    assert events == ["prepare-runtime", "persist"]
 
 
 @pytest.mark.asyncio

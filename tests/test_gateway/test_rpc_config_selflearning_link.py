@@ -206,10 +206,8 @@ async def test_patch_safe_allows_memory_learning_toggles(tmp_path) -> None:
     safe path must still run the dream linkage (it delegates to the full
     patch handler)."""
 
-    from opensquilla.gateway.rpc_config import (
-        _SAFE_WRITE_PATCH_PATHS,
-        _handle_config_patch_safe,
-    )
+    from opensquilla.application.app_settings import _SAFE_WRITE_PATCH_PATHS
+    from opensquilla.gateway.rpc_config import _handle_config_patch_safe
 
     assert "squilla_router.self_learning.enabled" in _SAFE_WRITE_PATCH_PATHS
     assert "memory.dream.enabled" in _SAFE_WRITE_PATCH_PATHS

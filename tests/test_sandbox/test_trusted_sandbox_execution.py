@@ -644,8 +644,14 @@ async def test_full_host_access_code_exec_resolves_host_python(monkeypatch, tmp_
         pid = 6301
         returncode = 0
 
-        async def communicate(self):
-            return b"host python\n", b""
+        def __init__(self) -> None:
+            import asyncio
+
+            self.stdout = asyncio.StreamReader()
+            self.stdout.feed_data(b"host python\n")
+            self.stdout.feed_eof()
+            self.stderr = asyncio.StreamReader()
+            self.stderr.feed_eof()
 
     def _fake_resolve_python_bin(*, sandbox_enabled: bool) -> str:
         resolve_calls.append(sandbox_enabled)

@@ -667,6 +667,142 @@ def test_gateway_start_uses_config_host_port_when_flags_are_omitted(
     assert payload["url"] == "http://127.0.0.2:19999"
 
 
+_INVALID_PORT_MESSAGE = (
+    "Gateway port must be an integer between 0 and 65535. "
+    "Fix port in the config file or OPENSQUILLA_GATEWAY_PORT."
+)
+_INVALID_PORT_CASES = [
+    ("flag", "-1"),
+    ("flag", "65536"),
+    ("config", "-1"),
+    ("config", "65536"),
+    ("mixed-config", "65536"),
+    ("environment", "-1"),
+    ("environment", "65536"),
+    ("environment", "synthetic-sensitive-token"),
+]
+
+
+def _invalid_port_options(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    source: str,
+    value: str,
+) -> list[str]:
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("OPENSQUILLA_STATE_DIR", str(home))
+    monkeypatch.setenv("OPENSQUILLA_PROFILE_KIND", "cli")
+    monkeypatch.setenv("OPENSQUILLA_USER_STATE_DIR", str(tmp_path / "user-state"))
+    monkeypatch.delenv("OPENSQUILLA_GATEWAY_CONFIG_PATH", raising=False)
+    monkeypatch.delenv("OPENSQUILLA_GATEWAY_PORT", raising=False)
+    target = home / "config.toml"
+    # A legacy document makes unexpected migration writes visible as well.
+    configured_port = value if source in {"config", "mixed-config"} else "18791"
+    document = "" if source == "environment" else f"port = {configured_port}\n"
+    if source == "mixed-config":
+        document += 'debug = "synthetic-sensitive-token"\n'
+    target.write_text(document, encoding="utf-8")
+    _write_pidfile(_record(pid=12345))
+    log = gateway_lifecycle.gateway_log_path()
+    log.parent.mkdir(parents=True, exist_ok=True)
+    log.write_bytes(b"preserve existing gateway log\n")
+
+    def forbidden_operation(*_args, **_kwargs):
+        raise AssertionError("invalid port must be rejected before lifecycle operations")
+
+    monkeypatch.setattr(gateway_lifecycle.subprocess, "Popen", forbidden_operation)
+    monkeypatch.setattr(gateway_cmd, "_gateway_bind_available", forbidden_operation)
+    monkeypatch.setattr(gateway_cmd, "start_gateway_server", forbidden_operation)
+    for method in ("_spawn_gateway", "_probe_health", "_pid_running", "_terminate_pid"):
+        monkeypatch.setattr(Manager, method, forbidden_operation)
+
+    options = ["--config", str(target)]
+    if source == "flag":
+        options.extend(["--port", value])
+    elif source == "environment":
+        monkeypatch.setenv("OPENSQUILLA_GATEWAY_PORT", value)
+    return options
+
+
+@pytest.mark.parametrize("action", ["start", "status", "stop", "restart"])
+@pytest.mark.parametrize(("source", "value"), _INVALID_PORT_CASES)
+def test_gateway_lifecycle_rejects_invalid_port_as_safe_json_before_side_effects(
+    action: str,
+    source: str,
+    value: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    options = _invalid_port_options(tmp_path, monkeypatch, source, value)
+    before = _profile_tree_snapshot(tmp_path)
+
+    result = runner.invoke(app, ["gateway", action, *options, "--json"])
+
+    assert result.exit_code == 2, result.output
+    payload = _payload(result)
+    assert payload["ok"] is False
+    assert payload["action"] == action
+    assert payload["state"] == f"{action}_failed"
+    assert payload["code"] == "INVALID_PORT"
+    assert payload["message"] == _INVALID_PORT_MESSAGE
+    assert "synthetic-sensitive-token" not in result.output
+    assert "Traceback" not in result.output
+    assert "HEALTH_TIMEOUT" not in result.output
+    assert _profile_tree_snapshot(tmp_path) == before
+
+
+@pytest.mark.parametrize(("source", "value"), _INVALID_PORT_CASES)
+def test_gateway_run_rejects_invalid_port_before_bind_without_traceback(
+    source: str,
+    value: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    options = _invalid_port_options(tmp_path, monkeypatch, source, value)
+    before = _profile_tree_snapshot(tmp_path)
+
+    result = runner.invoke(app, ["gateway", "run", *options])
+
+    assert result.exit_code == 2, result.output
+    if source == "flag":
+        assert "0<=x<=65535" in result.output
+    else:
+        assert " ".join(_INVALID_PORT_MESSAGE.split()) in " ".join(result.output.split())
+    assert "synthetic-sensitive-token" not in result.output
+    assert "Traceback" not in result.output
+    # The foreground command acquires process/profile locks before config load;
+    # none of the operator's existing config, pidfile, or log may be changed.
+    after = _profile_tree_snapshot(tmp_path)
+    assert {name: after.get(name) for name in before} == before
+
+
+@pytest.mark.parametrize("port", [0, 1, 65535])
+def test_gateway_start_keeps_valid_port_boundaries(
+    port: int,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("OPENSQUILLA_STATE_DIR", str(tmp_path / "home"))
+    monkeypatch.delenv("OPENSQUILLA_GATEWAY_PORT", raising=False)
+    calls = []
+
+    def fake_popen(argv, **kwargs):
+        calls.append(argv)
+        return SimpleNamespace(pid=4246)
+
+    monkeypatch.setattr(gateway_lifecycle.subprocess, "Popen", fake_popen)
+    _patch_health(monkeypatch, False)
+    _patch_wait_for_health(monkeypatch, True)
+
+    result = runner.invoke(app, ["gateway", "start", "--port", str(port), "--json"])
+
+    assert result.exit_code == 0, result.output
+    assert len(calls) == 1
+    assert calls[0][calls[0].index("--port") + 1] == str(port)
+    assert _payload(result)["port"] == port
+
+
 def test_gateway_status_uses_config_host_port_when_flags_are_omitted(
     tmp_path, monkeypatch
 ) -> None:
@@ -1221,6 +1357,60 @@ def _install_fake_start(server, holder, monkeypatch) -> None:
         return server
 
     monkeypatch.setattr(gateway_cmd, "start_gateway_server", fake_start)
+
+
+@pytest.mark.parametrize(
+    ("profile_kind", "desktop_env", "expected_surface"),
+    [
+        (None, None, "cli"),
+        ("desktop-primary", "1", "desktop"),
+        ("desktop-recovery", "1", "desktop"),
+        (None, "1", "desktop"),
+        (None, "0", "cli"),
+        ("cli", "1", "cli"),
+    ],
+)
+def test_gateway_run_records_launch_for_owning_surface(
+    tmp_path, monkeypatch, profile_kind, desktop_env, expected_surface
+) -> None:
+    config = tmp_path / "config.toml"
+    config.write_text('host = "127.0.0.1"\nport = 18791\n', encoding="utf-8")
+    monkeypatch.setenv("OPENSQUILLA_STATE_DIR", str(tmp_path))
+    for key, value in (
+        ("OPENSQUILLA_PROFILE_KIND", profile_kind),
+        ("OPENSQUILLA_DESKTOP", desktop_env),
+    ):
+        if value is None:
+            monkeypatch.delenv(key, raising=False)
+        else:
+            monkeypatch.setenv(key, value)
+
+    calls: list[dict[str, object]] = []
+
+    async def record_launch(**kwargs: object) -> bool:
+        calls.append(kwargs)
+        return True
+
+    server = _ShutdownProbeServer(fire="api_shutdown", via="http")
+    server._services = SimpleNamespace(
+        growth_event_sink=SimpleNamespace(record_client_launch=record_launch)
+    )
+    _install_fake_start(server, {}, monkeypatch)
+    monkeypatch.setattr(gateway_cmd, "_gateway_bind_available", lambda *_args: True)
+    monkeypatch.setattr(gateway_cmd, "_install_shutdown_handlers", lambda *_args: [])
+
+    gateway_cmd.run_gateway(
+        port=None, bind=None, listen="", debug=False, config_path=str(config)
+    )
+
+    assert calls == [
+        {
+            "surface": expected_surface,
+            "entrypoint": "gateway_run",
+            "execution_mode": "gateway",
+        }
+    ]
+    assert server.closed == ["api_shutdown"]
 
 
 def test_gateway_run_drains_via_close_on_shutdown_signal(tmp_path, monkeypatch) -> None:

@@ -1,5 +1,35 @@
 import { setTimeout as delay } from 'node:timers/promises'
 import { terminateWindowsProcessTree } from '../dist/windows-process-tree.js'
+import {
+  desktopGatewayStartIdentityConflict,
+  desktopProcessStartIdentity,
+} from '../dist/desktop-gateway-ownership.js'
+
+// A recycled PID belongs to a different process, not a Gateway that failed to
+// exit. Unknown identities never prove exit; a denied PID probe means present.
+export function gatewayProcessSnapshot(record, {
+  probePid = pid => process.kill(pid, 0),
+  readStartIdentity = desktopProcessStartIdentity,
+} = {}) {
+  let pidPresent = true
+  try {
+    probePid(record.pid)
+  } catch (error) {
+    pidPresent = error?.code !== 'ESRCH'
+  }
+  const liveStartIdentity = pidPresent ? readStartIdentity(record.pid) : null
+  const identityConflict = desktopGatewayStartIdentityConflict(
+    record.start_identity, liveStartIdentity,
+  )
+  return {
+    pid: record.pid,
+    recordedStartIdentity: record.start_identity,
+    liveStartIdentity,
+    pidPresent,
+    identityConflict,
+    alive: pidPresent && !identityConflict,
+  }
+}
 
 const FORCED_PROCESS_EXIT_TIMEOUT_MS = 5_000
 const WINDOWS_PROCESS_TREE_KILL_TIMEOUT_MS = 5_000

@@ -4,6 +4,8 @@ import sys
 
 _DESKTOP_CA_PROBE_ARG = "--_desktop-ca-probe"
 _DESKTOP_CA_PROBE_OK = "opensquilla-desktop-ca-store-ok"
+_DESKTOP_TOOL_SEARCH_PROBE_ARG = "--_desktop-tool-search-probe"
+_DESKTOP_TOOL_SEARCH_PROBE_OK = "opensquilla-desktop-tool-search-ok"
 _SANDBOX_FILESYSTEM_WORKER_ARG = "--_sandbox-filesystem-worker"
 _INTERNAL_CHILD_ARG = "--internal-child"
 
@@ -48,6 +50,26 @@ def _run_desktop_ca_probe() -> int:
     print(f"{_DESKTOP_CA_PROBE_OK} x509_ca={ca_certificate_count}")
     return 0
 
+
+def _run_desktop_tool_search_probe() -> int:
+    """Exercise frozen tool-search code and its dynamically loaded Unicode data."""
+    try:
+        from opensquilla.tools.search import tokenize_for_bm25
+
+        tokens = tokenize_for_bm25("文件 résumé Straße")
+        if tokens != ("wenjian", "resum", "strass"):
+            raise ValueError("Unexpected tool-search normalization")
+    except Exception:
+        print(
+            "OpenSquilla Desktop tool search could not load its Unicode resources.",
+            file=sys.stderr,
+        )
+        return 1
+
+    print(_DESKTOP_TOOL_SEARCH_PROBE_OK)
+    return 0
+
+
 if __name__ == "__main__":
     if _is_recovery_invocation(sys.argv):
         # Set this before importing *any* recovery module.  The lightweight
@@ -60,6 +82,9 @@ if __name__ == "__main__":
 
     if sys.argv[1:] == [_DESKTOP_CA_PROBE_ARG]:
         raise SystemExit(_run_desktop_ca_probe())
+
+    if sys.argv[1:] == [_DESKTOP_TOOL_SEARCH_PROBE_ARG]:
+        raise SystemExit(_run_desktop_tool_search_probe())
 
     if sys.argv[1:] == [_SANDBOX_FILESYSTEM_WORKER_ARG]:
         from opensquilla.sandbox.runtime_launcher import dispatch_internal_child

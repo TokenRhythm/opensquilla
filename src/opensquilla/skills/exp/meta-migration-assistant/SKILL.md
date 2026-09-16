@@ -1,5 +1,8 @@
 ---
 name: meta-migration-assistant
+visibility: experimental
+invocation: experimental_internal
+disable-model-invocation: true
 description: "Use this meta-skill instead of answering directly when the user needs a concrete migration plan that benefits from multi-skill orchestration across migration classification, authoritative guide lookup, optional repo diff inspection, and step-by-step validation planning."
 kind: meta
 meta_priority: 50

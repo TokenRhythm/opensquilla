@@ -7,9 +7,14 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: Existing tag to upload; leave empty for an internal test-package artifact
+        description: Tag containing signing support for a new/Draft release; leave empty for an internal signed test artifact
         required: false
         default: ""
+      internal_windows_only:
+        description: Build only internal Windows signed artifacts and legacy upgrade audits; requires an empty tag
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -26,18 +31,44 @@ env:
   OSSUTIL_SHA256: 3ae4d9fc85a7a6e9f5654d1599766f1a3a42a3692870887b5ae9338d582ef65a
 
 jobs:
+  release-preflight:
+    name: Validate release source before signing
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      source_sha: ${{ steps.source.outputs.source_sha }}
+    steps:
+      - name: Checkout workflow validation tooling
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          ref: ${{ github.workflow_sha }}
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Validate immutable release source and Draft state
+        id: source
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_WORKFLOW_SHA: ${{ github.workflow_sha }}
+          INTERNAL_WINDOWS_ONLY: ${{ inputs.internal_windows_only || false }}
+        run: python .github/scripts/release_signing_preflight.py
+
   build-control-ui:
     name: Build verified Web UI artifact
+    needs: release-preflight
     runs-on: ubuntu-latest
     timeout-minutes: 15
     outputs:
+      source_sha: ${{ needs.release-preflight.outputs.source_sha }}
       webui_mode: ${{ steps.webui-contract.outputs.mode }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
           persist-credentials: false
-          ref: ${{ env.RELEASE_TAG != '' && env.RELEASE_TAG || github.ref }}
+          ref: ${{ needs.release-preflight.outputs.source_sha }}
 
       - name: Detect Web UI artifact contract
         id: webui-contract
@@ -140,6 +171,9 @@ jobs:
 
   build-release-assets:
     name: Build Python release assets
+    if: ${{ inputs.internal_windows_only != true }}
+    outputs:
+      source_sha: ${{ needs.build-control-ui.outputs.source_sha }}
     needs: build-control-ui
     runs-on: windows-latest
     timeout-minutes: 90
@@ -157,7 +191,7 @@ jobs:
         with:
           lfs: true
           persist-credentials: false
-          ref: ${{ env.RELEASE_TAG != '' && env.RELEASE_TAG || github.ref }}
+          ref: ${{ needs.build-control-ui.outputs.source_sha }}
 
       - name: Download verified Web UI artifact
         uses: actions/download-artifact@v4
@@ -348,6 +382,7 @@ jobs:
 
   build-desktop-macos:
     name: Build macOS Electron installer
+    if: ${{ inputs.internal_windows_only != true }}
     needs: build-control-ui
     runs-on: macos-latest
     timeout-minutes: 150
@@ -357,7 +392,7 @@ jobs:
         with:
           lfs: true
           persist-credentials: false
-          ref: ${{ env.RELEASE_TAG != '' && env.RELEASE_TAG || github.ref }}
+          ref: ${{ needs.build-control-ui.outputs.source_sha }}
 
       - name: Download verified Web UI artifact
         uses: actions/download-artifact@v4
@@ -414,6 +449,7 @@ jobs:
         run: |
           npm run build:gateway
           npm run build
+          npm run verify:prepared
           npx electron-builder --mac --publish never
 
       - name: Verify Electron package
@@ -479,20 +515,41 @@ jobs:
           overwrite: true
 
   build-desktop-windows:
-    name: Build unsigned Windows Electron installer
+    name: Build and verify signed Windows Electron installer
     needs: build-control-ui
     # Keep the v0.5.3 upgrade baseline on the OS generation it shipped on.
     # The legacy NSIS installer can crash with 0xC0000005 on Windows Server 2025
     # before the candidate installer or profile-preservation checks run.
     runs-on: windows-2022
     timeout-minutes: 150
+    environment:
+      name: windows-code-signing
     steps:
+      - name: Reject untrusted signing invocation
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ('${{ github.event_name }}' -eq 'push') {
+            if ('${{ github.ref_type }}' -ne 'tag' -or '${{ github.ref_name }}' -notlike 'v*') {
+              throw 'Windows signing on push is restricted to v* tags.'
+            }
+          } elseif ('${{ github.event_name }}' -eq 'workflow_dispatch') {
+            if ('${{ github.ref_type }}' -ne 'branch') {
+              throw 'Manually dispatched signing jobs must use a branch workflow ref.'
+            }
+            if ('${{ env.RELEASE_TAG }}' -ne '' -and '${{ github.ref }}' -ne 'refs/heads/main') {
+              throw 'Existing-tag release uploads must be dispatched from main.'
+            }
+          } else {
+            throw 'Unsupported Windows signing event.'
+          }
+
       - name: Checkout
         uses: actions/checkout@v4
         with:
           lfs: true
           persist-credentials: false
-          ref: ${{ env.RELEASE_TAG != '' && env.RELEASE_TAG || github.ref }}
+          ref: ${{ needs.build-control-ui.outputs.source_sha }}
 
       - name: Download verified Web UI artifact
         uses: actions/download-artifact@v4
@@ -525,6 +582,69 @@ jobs:
         if: needs.build-control-ui.outputs.webui_mode == 'source-built'
         run: node opensquilla-webui/scripts/stage-dist.mjs
 
+      - name: Configure DigiCert KeyLocker credentials
+        shell: pwsh
+        env:
+          SM_HOST_SECRET: ${{ secrets.SM_HOST }}
+          SM_API_KEY_SECRET: ${{ secrets.SM_API_KEY }}
+          SM_CLIENT_CERT_FILE_B64_SECRET: ${{ secrets.SM_CLIENT_CERT_FILE_B64 }}
+          SM_CLIENT_CERT_PASSWORD_SECRET: ${{ secrets.SM_CLIENT_CERT_PASSWORD }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          foreach ($name in @(
+            'SM_HOST_SECRET',
+            'SM_API_KEY_SECRET',
+            'SM_CLIENT_CERT_FILE_B64_SECRET',
+            'SM_CLIENT_CERT_PASSWORD_SECRET'
+          )) {
+            if ([string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable($name))) {
+              throw "Required windows-code-signing environment secret is missing: $name"
+            }
+          }
+          $clientCertificate = Join-Path $env:RUNNER_TEMP 'digicert-client-auth.p12'
+          [IO.File]::WriteAllBytes(
+            $clientCertificate,
+            [Convert]::FromBase64String($env:SM_CLIENT_CERT_FILE_B64_SECRET)
+          )
+          "SM_HOST=$env:SM_HOST_SECRET" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "SM_API_KEY=$env:SM_API_KEY_SECRET" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "SM_CLIENT_CERT_FILE=$clientCertificate" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "SM_CLIENT_CERT_PASSWORD=$env:SM_CLIENT_CERT_PASSWORD_SECRET" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Install and initialize DigiCert KeyLocker KSP
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $msi = Join-Path $env:RUNNER_TEMP 'Keylockertools-windows-x64.msi'
+          Invoke-WebRequest `
+            -Uri 'https://one.digicert.com/signingmanager/api-ui/v1/releases/Keylockertools-windows-x64.msi/download' `
+            -Headers @{ 'x-api-key' = $env:SM_API_KEY } `
+            -OutFile $msi
+          $install = Start-Process msiexec.exe `
+            -ArgumentList @('/i', $msi, '/quiet', '/qn', '/norestart') `
+            -Wait -PassThru
+          if ($install.ExitCode -notin @(0, 3010)) {
+            throw "DigiCert KeyLocker tools installation failed with exit code $($install.ExitCode)."
+          }
+          $smctl = Get-ChildItem 'C:/Program Files/DigiCert' -Filter smctl.exe -Recurse -File |
+            Select-Object -First 1
+          if ($null -eq $smctl) { throw 'smctl.exe was not installed.' }
+          $signTool = Get-ChildItem 'C:/Program Files (x86)/Windows Kits/10/bin' `
+            -Filter signtool.exe -Recurse -File |
+            Where-Object { $_.Directory.Name -eq 'x64' } |
+            Sort-Object FullName -Descending |
+            Select-Object -First 1
+          if ($null -eq $signTool) { throw 'x64 signtool.exe was not found.' }
+          $smctl.DirectoryName | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+          $signTool.DirectoryName | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+          "SIGNTOOL_PATH=$($signTool.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          & $smctl.FullName windows ksp list
+          if ($LASTEXITCODE -ne 0) { throw 'DigiCert KSP registration check failed.' }
+          & $smctl.FullName keypair ls
+          if ($LASTEXITCODE -ne 0) { throw 'DigiCert KeyLocker keypair access check failed.' }
+          & $smctl.FullName windows certsync
+          if ($LASTEXITCODE -ne 0) { throw 'DigiCert certificate synchronization failed.' }
+
       - name: Install Electron dependencies
         working-directory: desktop/electron
         run: npm ci
@@ -539,16 +659,20 @@ jobs:
         working-directory: desktop/electron
         run: node ../../.github/scripts/verify-sandbox-package.mjs --release-source
 
-      - name: Build unsigned Windows installer
+      - name: Build signed Windows installer
         working-directory: desktop/electron
-        shell: bash
-        env:
-          CSC_IDENTITY_AUTO_DISCOVERY: "false"
+        shell: pwsh
         run: |
-          set -euo pipefail
           npm run build:gateway
+          if ($LASTEXITCODE -ne 0) { throw 'Gateway build failed.' }
           npm run build
-          npx electron-builder --win --publish never
+          if ($LASTEXITCODE -ne 0) { throw 'Electron build failed.' }
+          node scripts/build-signed-windows.cjs
+          if ($LASTEXITCODE -ne 0) { throw 'Signed Windows packaging failed.' }
+
+      - name: Verify Windows Authenticode signatures and timestamps
+        shell: pwsh
+        run: .github/scripts/verify-windows-signatures.ps1
 
       - name: Verify Electron package
         working-directory: desktop/electron
@@ -566,7 +690,21 @@ jobs:
           OPENSQUILLA_REQUIRE_PACKAGED_GATEWAY_SMOKE: "1"
         run: npm run verify:gateway-smoke
 
+      - name: Retain internal signed candidate for diagnosis
+        if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag == '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-signed-candidate-diagnostics
+          overwrite: true
+          path: |
+            dist/desktop-electron/*.exe
+            dist/desktop-electron/*.blockmap
+            dist/desktop-electron/latest.yml
+          if-no-files-found: error
+          retention-days: 7
+
       - name: Gate packaged first-send renderer
+        timeout-minutes: 15
         working-directory: desktop/electron
         shell: pwsh
         run: |
@@ -599,6 +737,28 @@ jobs:
             -Label built-candidate `
             -VerifyLongRunningUpdateBanner
 
+      - name: Remove DigiCert client authentication material
+        if: ${{ always() }}
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $clientCertificate = Join-Path $env:RUNNER_TEMP 'digicert-client-auth.p12'
+          if (Test-Path -LiteralPath $clientCertificate) {
+            Remove-Item -LiteralPath $clientCertificate -Force
+          }
+          $msi = Join-Path $env:RUNNER_TEMP 'Keylockertools-windows-x64.msi'
+          if (Test-Path -LiteralPath $msi) { Remove-Item -LiteralPath $msi -Force }
+
+      - name: Retain Windows first-send failure log
+        if: ${{ failure() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-first-send-failure-log
+          overwrite: true
+          path: ${{ runner.temp }}/p1-5-first-send-${{ github.run_id }}-${{ github.run_attempt }}/logs/desktop.log
+          if-no-files-found: warn
+          retention-days: 7
+
       - name: List Windows artifacts
         shell: bash
         run: find dist/desktop-electron -maxdepth 2 -type f -print
@@ -615,6 +775,9 @@ jobs:
 
   publish-release:
     name: Publish release assets
+    if: ${{ inputs.internal_windows_only != true }}
+    outputs:
+      source_sha: ${{ needs.build-release-assets.outputs.source_sha }}
     needs:
       - build-release-assets
       - build-desktop-macos
@@ -629,7 +792,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           persist-credentials: false
-          ref: ${{ env.RELEASE_TAG }}
+          ref: ${{ needs.build-release-assets.outputs.source_sha }}
 
       - name: Download release assets
         uses: actions/download-artifact@v4
@@ -927,6 +1090,7 @@ jobs:
     permissions:
       contents: read
     outputs:
+      source_sha: ${{ needs.publish-release.outputs.source_sha }}
       prerelease: ${{ steps.draft-metadata.outputs.prerelease }}
     env:
       ALIYUN_OSS_BUCKET: ${{ vars.ALIYUN_OSS_BUCKET }}
@@ -942,7 +1106,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           persist-credentials: false
-          ref: ${{ env.RELEASE_TAG }}
+          ref: ${{ needs.publish-release.outputs.source_sha }}
 
       - name: Validate Draft and OSS prestage configuration
         shell: bash
@@ -1120,20 +1284,24 @@ jobs:
           overwrite: true
 
   audit-downloaded-macos-release:
-    name: Audit downloaded macOS draft assets
+    name: Audit downloaded macOS Draft (v${{ matrix.baseline-version }} upgrade)
     if: ${{ github.event_name == 'push' || github.event.inputs.tag != '' }}
     needs: prestage-draft-updater-assets
     runs-on: macos-latest
     timeout-minutes: 75
     permissions:
       contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        baseline-version: ['0.5.3', '0.5.4']
     steps:
       - name: Checkout release verification helpers
         uses: actions/checkout@v4
         with:
           lfs: false
           persist-credentials: false
-          ref: ${{ env.RELEASE_TAG }}
+          ref: ${{ needs.prestage-draft-updater-assets.outputs.source_sha }}
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -1149,7 +1317,10 @@ jobs:
 
       - name: Install Electron release verification dependencies
         working-directory: desktop/electron
-        run: npm ci
+        run: |
+          npm ci
+          npm run build
+          node --input-type=module -e "await import('./scripts/packaged-first-send-cleanup.mjs')"
 
       - name: Download loopback-only updater rehearsal manifest
         uses: actions/download-artifact@v4
@@ -1265,20 +1436,22 @@ jobs:
           validate_app "${mounted}/OpenSquilla.app"
           hdiutil detach "${mounted}" -quiet
 
-      - name: Verify official v0.5.3 macOS updater discovery, download, apply, and relaunch
+      - name: Verify official baseline macOS updater discovery, download, apply, and relaunch
         if: ${{ needs.prestage-draft-updater-assets.outputs.prerelease == 'false' }}
         env:
           GH_TOKEN: ${{ github.token }}
+          BASELINE_VERSION: ${{ matrix.baseline-version }}
         shell: bash
         run: |
           set -euo pipefail
           .github/scripts/verify-release-macos-real-update.sh \
-            updater-rehearsal/channel-manifest.json downloaded-asset
+            updater-rehearsal/channel-manifest.json downloaded-asset "${BASELINE_VERSION}"
 
       - name: Verify preview macOS installer replacement compatibility
         if: ${{ needs.prestage-draft-updater-assets.outputs.prerelease == 'true' }}
         env:
           GH_TOKEN: ${{ github.token }}
+          BASELINE_VERSION: ${{ matrix.baseline-version }}
         shell: bash
         run: |
           set -euo pipefail
@@ -1288,13 +1461,13 @@ jobs:
             exit 1
           fi
           .github/scripts/verify-release-macos-upgrade.sh \
-            "${candidates[0]}" downloaded-preview-asset
+            "${candidates[0]}" downloaded-preview-asset "${BASELINE_VERSION}"
 
   audit-downloaded-windows-release:
-    name: Audit downloaded Windows Draft (${{ matrix.install-mode }} install)
+    name: Audit downloaded Windows Draft (v${{ matrix.baseline-version }}, ${{ matrix.install-mode }} install)
     if: ${{ github.event_name == 'push' || github.event.inputs.tag != '' }}
     needs: prestage-draft-updater-assets
-    # Match the build-time upgrade gate while v0.5.3 is the baseline.
+    # Match the build-time gate because v0.5.3 remains an upgrade baseline.
     runs-on: windows-2022
     timeout-minutes: 120
     permissions:
@@ -1302,6 +1475,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        baseline-version: ['0.5.3', '0.5.4']
         install-mode: [default, custom]
     steps:
       - name: Checkout release verification helpers
@@ -1309,7 +1483,7 @@ jobs:
         with:
           lfs: false
           persist-credentials: false
-          ref: ${{ env.RELEASE_TAG }}
+          ref: ${{ needs.prestage-draft-updater-assets.outputs.source_sha }}
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -1325,7 +1499,14 @@ jobs:
 
       - name: Install Electron release verification dependencies
         working-directory: desktop/electron
-        run: npm ci
+        shell: pwsh
+        run: |
+          npm ci
+          if ($LASTEXITCODE -ne 0) { throw 'Verification dependency installation failed.' }
+          npm run build
+          if ($LASTEXITCODE -ne 0) { throw 'Verification harness build failed.' }
+          node --input-type=module -e "await import('./scripts/packaged-first-send-cleanup.mjs')"
+          if ($LASTEXITCODE -ne 0) { throw 'Verification harness import failed.' }
 
       - name: Download loopback-only updater rehearsal manifest
         uses: actions/download-artifact@v4
@@ -1368,12 +1549,13 @@ jobs:
             }
           }
 
-      - name: Verify official v0.5.3 Windows updater download and installer handoff
+      - name: Verify official baseline Windows updater download and installer handoff
         if: ${{ needs.prestage-draft-updater-assets.outputs.prerelease == 'false' }}
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
           INSTALL_MODE: ${{ matrix.install-mode }}
+          BASELINE_VERSION: ${{ matrix.baseline-version }}
         run: |
           $ErrorActionPreference = 'Stop'
           # This gate covers pre-handoff failure isolation and a successful normal NSIS
@@ -1386,7 +1568,8 @@ jobs:
             -CandidateInstaller $candidates[0].FullName `
             -Label "downloaded-asset-$env:INSTALL_MODE" `
             -RealUpdateChannelManifest updater-rehearsal/channel-manifest.json `
-            -InstallMode $env:INSTALL_MODE
+            -InstallMode $env:INSTALL_MODE `
+            -BaselineVersion $env:BASELINE_VERSION
 
       - name: Verify preview Windows installer replacement compatibility
         if: ${{ needs.prestage-draft-updater-assets.outputs.prerelease == 'true' }}
@@ -1394,6 +1577,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           INSTALL_MODE: ${{ matrix.install-mode }}
+          BASELINE_VERSION: ${{ matrix.baseline-version }}
         run: |
           $ErrorActionPreference = 'Stop'
           $candidates = @(Get-ChildItem 'release-audit/OpenSquilla-*-win-x64.exe' -File)
@@ -1403,4 +1587,65 @@ jobs:
           .github/scripts/verify-release-windows-upgrade.ps1 `
             -CandidateInstaller $candidates[0].FullName `
             -Label "downloaded-preview-$env:INSTALL_MODE" `
-            -InstallMode $env:INSTALL_MODE
+            -InstallMode $env:INSTALL_MODE `
+            -BaselineVersion $env:BASELINE_VERSION
+
+
+  audit-internal-windows-artifact:
+    name: Audit signed Windows test artifact (v${{ matrix.baseline-version }}, ${{ matrix.install-mode }})
+    if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag == '' }}
+    needs: [build-control-ui, build-desktop-windows]
+    runs-on: windows-2022
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        baseline-version: ['0.5.3', '0.5.4']
+        install-mode: [default, custom]
+    steps:
+      - name: Checkout the signed artifact source
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          ref: ${{ needs.build-control-ui.outputs.source_sha }}
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22.12.0"
+          cache: npm
+          cache-dependency-path: desktop/electron/package-lock.json
+      - name: Install release verification dependencies
+        working-directory: desktop/electron
+        shell: pwsh
+        run: |
+          npm ci
+          if ($LASTEXITCODE -ne 0) { throw 'Verification dependency installation failed.' }
+          npm run build
+          if ($LASTEXITCODE -ne 0) { throw 'Verification harness build failed.' }
+          node --input-type=module -e "await import('./scripts/packaged-first-send-cleanup.mjs')"
+          if ($LASTEXITCODE -ne 0) { throw 'Verification harness import failed.' }
+      - name: Download the signed Windows test artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: opensquilla-electron-windows
+          path: release-audit
+      - name: Verify downloaded signature, install, launch, and uninstall
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BASELINE_VERSION: ${{ matrix.baseline-version }}
+          INSTALL_MODE: ${{ matrix.install-mode }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $candidates = @(Get-ChildItem 'release-audit/OpenSquilla-*-win-x64.exe' -File)
+          if ($candidates.Count -ne 1) { throw 'Expected one signed test installer.' }
+          .github/scripts/verify-windows-signatures.ps1 -InstallerPath $candidates[0].FullName
+          .github/scripts/verify-release-windows-upgrade.ps1 `
+            -CandidateInstaller $candidates[0].FullName `
+            -Label "internal-$env:BASELINE_VERSION-$env:INSTALL_MODE" `
+            -InstallMode $env:INSTALL_MODE `
+            -BaselineVersion $env:BASELINE_VERSION

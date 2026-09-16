@@ -12,11 +12,7 @@ from opensquilla.application.artifact_workbench import (
     MutationOutcomeApplication,
     MutationResolution,
     PromptAnnotationApplication,
-    PromptAnnotationCreate,
-    PromptAnnotationIdentity,
-    PromptAnnotationMutation,
     PromptAnnotationQuery,
-    PromptAnnotationSelection,
     ResourcePreviewApplication,
     WorkbenchPreviewCreate,
     WorkbenchResourceApplication,
@@ -38,17 +34,9 @@ class RecordingPort:
     async def list_annotations(self, value: object) -> Mapping[str, Any]:
         return await self._record("annotations.list", value)
 
-    async def create_annotation(self, value: object) -> Mapping[str, Any]:
-        return await self._record("annotations.create", value)
 
-    async def focus_annotation(self, value: object) -> Mapping[str, Any]:
-        return await self._record("annotations.focus", value)
 
-    async def update_annotation(self, value: object) -> Mapping[str, Any]:
-        return await self._record("annotations.update", value)
 
-    async def discard_annotation(self, value: object) -> Mapping[str, Any]:
-        return await self._record("annotations.discard", value)
 
     async def list_resources(self, value: object) -> Mapping[str, Any]:
         return await self._record("resources.list", value)
@@ -72,43 +60,6 @@ class RecordingPort:
         return await self._record("mutations.resolve", value)
 
 
-@pytest.mark.asyncio
-async def test_prompt_annotation_application_uses_explicit_commands() -> None:
-    port = RecordingPort()
-    application = PromptAnnotationApplication(port)
-    selection = PromptAnnotationSelection("selection-1", "p", "0/1", "a" * 64)
-    commands = [
-        ("annotations.list", application.list(PromptAnnotationQuery("session-1"))),
-        (
-            "annotations.create",
-            application.create(
-                PromptAnnotationCreate(
-                    "session-1", "annotation-1", "document-1", selection
-                )
-            ),
-        ),
-        (
-            "annotations.focus",
-            application.focus(PromptAnnotationIdentity("session-1", "annotation-1")),
-        ),
-        (
-            "annotations.update",
-            application.update(
-                PromptAnnotationMutation("session-1", "annotation-1", 1, "updated")
-            ),
-        ),
-        (
-            "annotations.discard",
-            application.discard(
-                PromptAnnotationMutation("session-1", "annotation-1", 2)
-            ),
-        ),
-    ]
-
-    for expected, operation in commands:
-        assert await operation == {"operation": expected}
-
-    assert [name for name, _value in port.calls] == [name for name, _call in commands]
 
 
 @pytest.mark.asyncio
@@ -127,7 +78,7 @@ async def test_resource_transfer_and_outcome_applications_keep_distinct_ports() 
     )
     await previews.create(WorkbenchPreviewCreate("session-1", resource))
     await transfers.import_document(
-        DocumentImport("session-1", resource, "import-1", client_request_id="request-1")
+        DocumentImport("session-1", resource, "import-1", client_request_id="import-1")
     )
     await transfers.publish_document(
         DocumentPublish("session-1", "document-1", "revision-1", "publish-1")
@@ -158,3 +109,13 @@ def test_resource_and_mutation_commands_fail_closed() -> None:
         )
     with pytest.raises(ValueError, match="mutation request id"):
         MutationResolution("session-1", "document.publish", "")
+
+
+@pytest.mark.asyncio
+async def test_historical_prompt_annotations_remain_read_only() -> None:
+    port = RecordingPort()
+    application = PromptAnnotationApplication(port)
+    query = PromptAnnotationQuery("session-1")
+    assert await application.list(query) == {"operation": "annotations.list"}
+    assert port.calls == [("annotations.list", query)]
+    assert not any(hasattr(application, name) for name in ("create", "focus", "update", "discard"))

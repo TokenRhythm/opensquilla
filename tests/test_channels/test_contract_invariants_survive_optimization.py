@@ -133,16 +133,28 @@ def test_run_channel_contract_isolated_under_optimization() -> None:
 
     This is the headline regression: a crafted plugin's ``CAPABILITY_TIER``
     must never be accepted when the interpreter is hardened. We verify by
-    importing the helpers in a subprocess with ``-O``.
+    loading the complete contract module in a subprocess with ``-O``.
     """
 
     import subprocess
+    from pathlib import Path
 
     snippet = """
+import importlib.util
 import sys
 from types import ModuleType
 
-from opensquilla.channels.contract import assert_capability_tier
+if sys.flags.optimize != 1:
+    print('NOT-OPTIMIZED')
+    sys.exit(5)
+
+spec = importlib.util.spec_from_file_location('isolated_channel_contract', sys.argv[1])
+if spec is None or spec.loader is None:
+    raise RuntimeError('Cannot load the channel contract source')
+contract = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = contract
+spec.loader.exec_module(contract)
+assert_capability_tier = contract.assert_capability_tier
 
 m = ModuleType('bad')
 m.CAPABILITY_TIER = 'PURPLE-experimental'
@@ -160,8 +172,12 @@ except Exception as exc:
 print('NO-RAISE')
 sys.exit(4)
 """
+    # contract.py depends only on the standard library. Loading its real source
+    # directly avoids channels.__init__ importing every adapter and Gateway
+    # dependency under a second bytecode optimization mode. Registering the
+    # module above preserves the normal environment required by dataclasses.
     result = subprocess.run(
-        [sys.executable, "-O", "-c", snippet],
+        [sys.executable, "-I", "-S", "-O", "-c", snippet, str(Path(contract.__file__).resolve())],
         capture_output=True,
         text=True,
         check=False,

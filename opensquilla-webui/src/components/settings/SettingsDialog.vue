@@ -127,7 +127,7 @@
               v-if="section === 'provider'"
               :panel="providerPanel"
               :dirty="providerDraftDirty"
-              :saving="saveAllPending || providerSavePending"
+              :saving="saveAllPending || providerSavePending || primaryMutationPending || modelStrategyRoutingBusy || providerPanel.busy"
               @update-provider-selected="selectProvider"
               @provider-change="onProviderChange"
               @update-provider-field="updateProviderField"
@@ -136,6 +136,7 @@
               @probe-connection="probeProviderConnection"
               @refresh-models="refreshProviderModels"
               @save-provider="saveProvider"
+              @save-provider-and-activate="saveProviderAndActivate"
               @cancel-provider-edit="cancelProviderEdit"
               @copy="copyCommand"
               @go-to-section="selectSection"
@@ -149,8 +150,9 @@
             <SetupModelStrategyPanel
               v-else-if="section === 'modelStrategy'"
               :panel="modelStrategyPanel"
-              :routing-mode-busy="modelStrategyRoutingBusy"
+              :routing-mode-busy="modelStrategyRoutingBusy || providerPanel.busy"
               @update-strategy="setModelStrategy"
+              @reset-recommended-router="resetRecommendedRouter"
               @update-fixed-provider="setFixedProvider"
               @update-fixed-model="setFixedModel"
               @update-router-default-tier="setRouterDefaultTier"
@@ -295,6 +297,7 @@ const {
   setMemoryAutoCapture,
   setProviderImageGenerationOptIn,
   setModelStrategy,
+  resetRecommendedRouter,
   setFixedProvider,
   setFixedModel,
   setRouterDefaultTier,
@@ -325,6 +328,8 @@ const {
   onImageProviderChange,
   useImageRecommendation,
   saveProvider,
+  saveProviderAndActivate,
+  primaryMutationPending,
   resetCapability,
   copyCommand,
   copyConfigPath,
@@ -422,11 +427,12 @@ const hasSettingsExitDraft = computed(() => (
 const hasPendingSettingsWrite = computed(() => (
   saveAllPending.value
   || providerSavePending.value
+  || primaryMutationPending.value
   || modelStrategyRoutingBusy.value
   || closeSavePending.value
 ))
 const settingsInteractionLocked = computed(() => (
-  saveAllPending.value || closeSavePending.value
+  saveAllPending.value || closeSavePending.value || primaryMutationPending.value
 ))
 const shouldGuardBrowserUnload = computed(() => (
   hasSettingsExitDraft.value || hasPendingSettingsWrite.value
@@ -588,8 +594,7 @@ function navigateAway() {
   // directly (same breakpoint/platform branch as the '/' redirect in sharedRoutes)
   // so close is a single, predictable, loop-proof exit. `returnTo` is already
   // null for a cold deep link (onMounted rejects any '/settings…' back-entry).
-  const fallback = isDesktop || window.matchMedia('(max-width: 768px)').matches ? '/chat' : '/sessions'
-  void router.push(returnTo ?? fallback)
+  void router.push(returnTo ?? '/chat')
 }
 
 // The modal's leave transition finished — perform the deferred navigation that

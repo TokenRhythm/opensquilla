@@ -46,14 +46,22 @@ describe('v4 TurnCommands Adapter', () => {
     expect(request).toHaveBeenCalledWith(CHAT_SEND_METHOD, params)
   })
 
+  it.each(['documentContext', 'document_context', 'promptAnnotationIds', 'prompt_annotation_ids'])(
+    'requires a fresh user decision before replaying retired %s input', key => {
+      expect(() => toWireSendParams({
+        message: 'old draft', sessionKey: 'session-1',
+        [key]: key.toLowerCase().includes('context') ? { documentId: 'old-doc' } : ['old-annotation'],
+      })).toThrow(expect.objectContaining({ failureCode: 'DOCUMENT_EDITING_RETIRED', accepted: false }))
+    },
+  )
+
   it('projects canonical send fields to the v4 source alias at the adapter boundary', () => {
     const params = toWireSendParams({
       message: 'hello',
       sessionKey: 'agent:main:test',
       clientRequestId: 'request-1',
       clientMessageId: 'message-1',
-      promptAnnotationIds: ['annotation-1'],
-      documentContext: { documentId: 'doc-1', headRevisionId: 'rev-1' },
+      pageContext: { resourceId: 'document:doc-1', annotations: [{ text: 'Make this larger', locatorHint: 'h1' }] },
       source: { elevated: 'operator', runMode: 'safe' },
       intent: 'new_chat',
       workspaceId: 'workspace-1',
@@ -71,8 +79,7 @@ describe('v4 TurnCommands Adapter', () => {
       sessionKey: 'agent:main:test',
       clientRequestId: 'request-1',
       clientMessageId: 'message-1',
-      promptAnnotationIds: ['annotation-1'],
-      documentContext: { documentId: 'doc-1', headRevisionId: 'rev-1' },
+      pageContext: { resourceId: 'document:doc-1', annotations: [{ text: 'Make this larger', locatorHint: 'h1' }] },
       _source: { elevated: 'operator', runMode: 'safe' },
       intent: 'new_chat',
       workspaceId: 'workspace-1',

@@ -49,6 +49,7 @@ function browserAction(event: WorkbenchComponentEvent): BrowserAction | null {
 
 class BrowserWorkbenchRuntime implements WorkbenchPanelRuntime {
   private created = false
+  private adoptOnInitialize: boolean
   private item: WorkbenchItem
   private rect: NativeSurfaceRect | null = null
 
@@ -58,6 +59,7 @@ class BrowserWorkbenchRuntime implements WorkbenchPanelRuntime {
     private readonly options: BrowserWorkbenchProviderOptions,
   ) {
     this.item = item
+    this.adoptOnInitialize = item.payload.adoptedNativeSurface === true
     this.context.updateRenderState({
       canGoBack: false,
       canGoForward: false,
@@ -68,6 +70,8 @@ class BrowserWorkbenchRuntime implements WorkbenchPanelRuntime {
   }
 
   async initialize() {
+    const adopt = this.adoptOnInitialize
+    this.adoptOnInitialize = false
     const native = this.context.nativeWorkbenchApi
     this.context.updateRenderState({ errorMessage: '', loading: true })
     try {
@@ -79,23 +83,26 @@ class BrowserWorkbenchRuntime implements WorkbenchPanelRuntime {
         throw new Error('Update OpenSquilla Desktop to use the side browser.')
       }
       const url = browserUrlFromWorkbenchItem(this.item)
-      const result = await native.createSurface({
-        version: 2,
-        surfaceId: this.item.id,
-        kind: 'url-preview',
-        payload: {
-          url,
-          scopeId: this.item.scope.type === 'session' ? this.item.scope.id : 'app',
-        },
-      })
-      if (!result.ok) {
-        throw new Error(result.message || 'Could not open the side browser.')
+      if (!adopt) {
+        const result = await native.createSurface({
+          version: 2,
+          surfaceId: this.item.id,
+          kind: 'url-preview',
+          payload: {
+            url,
+            scopeId: this.item.scope.type === 'session' ? this.item.scope.id : 'app',
+          },
+        })
+        if (!result.ok) {
+          throw new Error(result.message || 'Could not open the side browser.')
+        }
       }
       if (!this.context.isItemOpen()) {
         await this.hideAndDestroySurface()
         return
       }
       this.created = true
+      if (adopt) this.context.updateRenderState({ loading: false })
       await this.syncRect()
     } catch (error) {
       await this.failSurface(error)
@@ -235,7 +242,9 @@ class BrowserWorkbenchRuntime implements WorkbenchPanelRuntime {
       }
       if (request.visible) {
         const activated = await this.context.nativeWorkbenchApi.activateSurface(this.item.id)
-        if (!activated.ok) {
+        // A tab may suspend while its layout request is pending. The scoped
+        // API keeps that page hidden; it must remain available for the next resume.
+        if (!activated.ok && activated.message !== 'Workbench surface is no longer active') {
           throw new Error(activated.message || 'Could not activate the side browser.')
         }
       }

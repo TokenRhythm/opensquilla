@@ -723,8 +723,11 @@ function loadOptionalImage(src: string): Promise<HTMLImageElement | null> {
   })
 }
 
-function staticAssetUrl(path: string): string {
-  const base = document.getElementById('opensquilla-data')?.dataset.basePath || '/control'
+export function staticAssetUrl(path: string): string {
+  const rawBase = document.getElementById('opensquilla-data')?.dataset.basePath || '/control'
+  // Desktop uses the root base path. Keep `/static/...` origin-relative instead
+  // of producing `//static/...`, which browsers interpret as a different host.
+  const base = rawBase.replace(/\/+$/, '')
   return `${base}/static/${path.replace(/^\/+/, '')}`
 }
 

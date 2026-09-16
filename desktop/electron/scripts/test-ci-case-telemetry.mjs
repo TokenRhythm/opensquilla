@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { spawnSync } from 'node:child_process'
+import { spawn, spawnSync } from 'node:child_process'
 import { EventEmitter, once } from 'node:events'
 import { mkdtemp, readFile, rm } from 'node:fs/promises'
 import { createServer } from 'node:http'
@@ -17,6 +17,7 @@ import {
   closeElectronWithDeadline,
   closeHttpServerWithDeadline,
   desktopShutdownEvidenceSince,
+  gatewayProcessSnapshot,
   trackHttpServerConnections,
 } from './e2e-shutdown-helpers.mjs'
 import { terminateWindowsProcessTree } from '../dist/windows-process-tree.js'
@@ -28,6 +29,37 @@ const outputPath = join(root, 'reports', 'cases.jsonl')
 const emitted = []
 
 try {
+  for (const scheme of [
+    'windows-creation-filetime:', 'linux-proc-start-ticks:', 'posix-ps-lstart:',
+  ]) {
+    const record = { pid: 1234, start_identity: `${scheme}old` }
+    const probePid = pid => assert.equal(pid, record.pid)
+    const recycled = gatewayProcessSnapshot(record, {
+      probePid,
+      readStartIdentity: () => `${scheme}new`,
+    })
+    assert.equal(recycled.pidPresent, true)
+    assert.equal(recycled.identityConflict, true)
+    assert.equal(recycled.alive, false, 'PID reuse must not keep the old Gateway alive')
+    for (const liveStartIdentity of [record.start_identity, null, 'runtime-start:unknown']) {
+      assert.equal(gatewayProcessSnapshot(record, {
+        probePid,
+        readStartIdentity: () => liveStartIdentity,
+      }).alive, true, 'matching or unprovable identities must keep waiting')
+    }
+    assert.equal(gatewayProcessSnapshot(record, {
+      probePid: () => { throw Object.assign(new Error('missing'), { code: 'ESRCH' }) },
+      readStartIdentity: () => { assert.fail('an absent PID needs no identity probe') },
+    }).alive, false)
+    assert.equal(gatewayProcessSnapshot(record, {
+      probePid: () => { throw Object.assign(new Error('denied'), { code: 'EPERM' }) },
+      readStartIdentity: () => null,
+    }).alive, true, 'a denied probe is not exit evidence')
+  }
+  assert.equal(gatewayProcessSnapshot({ pid: 1234, start_identity: 'runtime-start:old' }, {
+    probePid: () => {},
+    readStartIdentity: () => 'windows-creation-filetime:new',
+  }).alive, true, 'an opaque recorded identity cannot prove PID reuse')
   const telemetry = startCaseTelemetry({
     caseName: 'direct-case',
     os: 'TestOS',
@@ -197,58 +229,99 @@ try {
     error: 'taskkill exceeded 25ms',
   })
 
-  let killedWith = null
+  // ElectronApplication.process() depends on a live Playwright dispatcher.
+  // Successful close disposes it, so even diagnostics must retain the owned
+  // ChildProcess beforehand instead of accessing the application afterward.
+  const nativeFixtureSource = await readFile(
+    join(scriptDir, 'test-desktop-window-background-flow.mjs'), 'utf8',
+  )
+  const assertNativeShutdownProcessOwnership = source => {
+    const closeIndex = source.indexOf('const shutdown = await closeElectronWithDeadline(')
+    const capture = /const\s+ownedChild\s*=\s*desktopApp\s*\.\s*process\s*\(\s*\)/.exec(source)
+    assert.ok(closeIndex >= 0, 'native fixture must retain bounded Electron shutdown')
+    assert.ok(capture && capture.index < closeIndex,
+      'capture the owned ChildProcess before closing Electron')
+    assert.doesNotMatch(source.slice(closeIndex), /desktopApp\s*\.\s*process\s*\(/,
+      'never call the disposed Playwright process accessor after close begins')
+    assert.match(source.slice(closeIndex), /childExited:\s*ownedChild\s*\?/,
+      'post-close diagnostics must inspect the retained owned handle')
+  }
+  assertNativeShutdownProcessOwnership(nativeFixtureSource)
+  assert.throws(() => assertNativeShutdownProcessOwnership(
+    nativeFixtureSource.replace('childExited: ownedChild ?', 'childExited: desktopApp.process() ?'),
+  ), /never call the disposed Playwright process accessor/)
+  assert.throws(() => assertNativeShutdownProcessOwnership(
+    nativeFixtureSource.replace(/const\s+ownedChild\s*=\s*desktopApp\s*\.\s*process\s*\(\s*\)/, ''),
+  ), /capture the owned ChildProcess before closing Electron/)
+
   const shutdownLogs = []
-  const hangingProcess = new EventEmitter()
-  Object.assign(hangingProcess, {
-    pid: 43,
-    exitCode: null,
-    signalCode: null,
-    killed: false,
+  // The production helper invokes real taskkill on Windows, so this fixture
+  // must own its PID rather than supplying a synthetic EventEmitter PID.
+  const hangingProcess = spawn(process.execPath, ['-e', `
+    process.on('disconnect', () => process.exit(0));
+    process.send({ type: 'ready', pid: process.pid });
+    setInterval(() => {}, 1000);
+  `], {
+    stdio: ['ignore', 'ignore', 'ignore', 'ipc'],
+    windowsHide: true,
   })
-  hangingProcess.kill = signal => {
-    killedWith = signal
-    hangingProcess.killed = true
-    hangingProcess.signalCode = signal
-    queueMicrotask(() => hangingProcess.emit('exit', null, signal))
-    return true
+  const hangingProcessClosed = new Promise(resolveClose => hangingProcess.once('close', resolveClose))
+  try {
+    const [ready] = await once(hangingProcess, 'message', { signal: AbortSignal.timeout(5_000) })
+    assert.deepEqual(ready, { type: 'ready', pid: hangingProcess.pid })
+    const hangingElectron = {
+      close: () => new Promise(() => {}),
+      process: () => hangingProcess,
+    }
+    const hangingShutdown = await closeElectronWithDeadline({
+      app: hangingElectron,
+      phase: 'unit-hanging-electron',
+      timeoutMs: 25,
+      diagnosticTimeoutMs: 25,
+      diagnostics: async () => ({ marker: 'bounded-diagnostic' }),
+      emit: line => shutdownLogs.push(line),
+    })
+    assert.equal(hangingShutdown.closed, false)
+    assert.equal(hangingShutdown.closeErrorCode, 'DESKTOP_E2E_SHUTDOWN_TIMEOUT')
+    assert.equal(hangingShutdown.forcedExitSucceeded, true)
+    assert.equal(hangingShutdown.processTreeReaped, true)
+    assert.match(hangingShutdown.error.message, /DESKTOP_E2E_ELECTRON_SHUTDOWN_FAILED/)
+    assert.ok(hangingProcess.exitCode !== null || hangingProcess.signalCode !== null)
+    assert.equal(shutdownLogs.length, 1)
+    const shutdownLog = JSON.parse(shutdownLogs[0])
+    assert.deepEqual({
+      ...shutdownLog,
+      error: String(shutdownLog.error).split('\n')[0],
+    }, {
+      event: 'desktop_e2e_electron_shutdown_failed',
+      phase: 'unit-hanging-electron',
+      timeoutMs: 25,
+      error: 'Error: unit-hanging-electron Electron shutdown timed out after 25ms',
+      process: {
+        pid: hangingProcess.pid,
+        exitCode: null,
+        signalCode: null,
+        killed: false,
+      },
+      diagnostics: { marker: 'bounded-diagnostic' },
+    })
+  } finally {
+    if (hangingProcess.exitCode === null && hangingProcess.signalCode === null) {
+      hangingProcess.kill('SIGKILL')
+    }
+    let closeTimer
+    try {
+      await Promise.race([
+        hangingProcessClosed,
+        new Promise((_, reject) => {
+          closeTimer = setTimeout(() => reject(new Error('Owned telemetry fixture did not close')), 5_000)
+        }),
+      ])
+    } finally {
+      clearTimeout(closeTimer)
+    }
   }
-  const hangingElectron = {
-    close: () => new Promise(() => {}),
-    process: () => hangingProcess,
-  }
-  const hangingShutdown = await closeElectronWithDeadline({
-    app: hangingElectron,
-    phase: 'unit-hanging-electron',
-    timeoutMs: 25,
-    diagnosticTimeoutMs: 25,
-    diagnostics: async () => ({ marker: 'bounded-diagnostic' }),
-    emit: line => shutdownLogs.push(line),
-  })
-  assert.equal(hangingShutdown.closed, false)
-  assert.equal(hangingShutdown.closeErrorCode, 'DESKTOP_E2E_SHUTDOWN_TIMEOUT')
-  assert.equal(hangingShutdown.forcedExitSucceeded, true)
-  assert.equal(hangingShutdown.processTreeReaped, true)
-  assert.match(hangingShutdown.error.message, /DESKTOP_E2E_ELECTRON_SHUTDOWN_FAILED/)
-  assert.equal(killedWith, 'SIGKILL')
-  assert.equal(shutdownLogs.length, 1)
-  const shutdownLog = JSON.parse(shutdownLogs[0])
-  assert.deepEqual({
-    ...shutdownLog,
-    error: String(shutdownLog.error).split('\n')[0],
-  }, {
-    event: 'desktop_e2e_electron_shutdown_failed',
-    phase: 'unit-hanging-electron',
-    timeoutMs: 25,
-    error: 'Error: unit-hanging-electron Electron shutdown timed out after 25ms',
-    process: {
-      pid: 43,
-      exitCode: null,
-      signalCode: null,
-      killed: false,
-    },
-    diagnostics: { marker: 'bounded-diagnostic' },
-  })
+  assert.throws(() => process.kill(hangingProcess.pid, 0), { code: 'ESRCH' })
 
   const shutdownCheckpoint = '{"event":"previous_launch"}\n'
   const cleanGatewayExit = JSON.stringify({
@@ -383,6 +456,8 @@ try {
     'cli-pass',
     'cli-fail',
   ])
+  await import('./test-packaged-first-send-cleanup.mjs')
+  await import('./test-session-recovery-transport-contract.mjs')
   console.log('Desktop E2E case telemetry checks passed')
 } finally {
   await rm(root, { recursive: true, force: true })

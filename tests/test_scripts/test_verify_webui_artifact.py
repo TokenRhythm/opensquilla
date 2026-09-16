@@ -312,6 +312,7 @@ def test_node_and_python_source_fingerprints_share_order_and_line_endings(
 
 
 @pytest.mark.skipif(shutil.which("node") is None, reason="node not on PATH")
+@pytest.mark.ci_serial
 def test_node_verifier_runs_when_invoked_through_symlink(tmp_path: Path) -> None:
     symlink = tmp_path / "verify-dist-link.mjs"
     try:

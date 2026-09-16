@@ -458,7 +458,7 @@ class DingTalkChannel:
 
     async def receive(self) -> IncomingMessage:
         msg = await self._queue.get()
-        log.debug("dingtalk.inbound_received", content=msg.content[:80])
+        log.debug("dingtalk.inbound_received", content_chars=len(msg.content))
         return msg
 
     def is_group_mentioned(self, msg: IncomingMessage) -> bool:

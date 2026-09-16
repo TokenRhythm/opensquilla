@@ -100,7 +100,8 @@ _DO_NOT_REPEAT_MARKERS = ("do not repeat", "don't repeat", "不要重复", "不�
 _ARTIFACT_MARKERS = ("artifact", "generated artifact", "附件", "产物")
 _DECISION_PREFIXES = ("decision:", "rationale:", "reason:", "decided:", "决定:", "原因:")
 _IDENTIFIER_RE = re.compile(
-    r"\b(?:[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
+    r"(?<![A-Za-z0-9_-])att_[A-Za-z0-9_-]{8,160}(?![A-Za-z0-9_-])"
+    r"|\b(?:[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
     r"|[0-9a-fA-F]{12,64})\b"
 )
 _ARTIFACT_NAME_RE = re.compile(
@@ -287,10 +288,11 @@ def _add_obligation(
     source_role: str | None,
     source_entry_id: int | None,
     max_obligations: int,
+    preserve_value: bool = False,
 ) -> None:
     if max_obligations <= 0:
         return
-    cleaned = _clean_obligation_text(value)
+    cleaned = _string_value(value).strip() if preserve_value else _clean_obligation_text(value)
     if not cleaned:
         return
     key = (kind, cleaned.casefold())
@@ -373,6 +375,7 @@ def _extract_rendered_structured_obligations(
                     source_role=source_role,
                     source_entry_id=source_entry_id,
                     max_obligations=max_obligations,
+                    preserve_value=kind == "file_path",
                 )
             continue
         if section_kind is None:
@@ -394,6 +397,7 @@ def _extract_rendered_structured_obligations(
             source_role=source_role,
             source_entry_id=source_entry_id,
             max_obligations=max_obligations,
+            preserve_value=section_kind == "file_path",
         )
 
 

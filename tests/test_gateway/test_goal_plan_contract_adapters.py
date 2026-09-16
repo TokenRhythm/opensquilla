@@ -15,6 +15,7 @@ from opensquilla.gateway.adapters.goals_contract import (
 )
 from opensquilla.gateway.adapters.plans_contract import (
     register_plans_cancel_run_contract,
+    register_plans_capabilities_contract,
     register_plans_implement_contract,
     register_plans_revise_contract,
     register_plans_set_mode_contract,
@@ -64,6 +65,38 @@ async def test_r1_adapter_registers_one_handler_and_preserves_wire_result(
     assert entry is not None
     assert entry.handler is handler
     assert entry.required_scope == "operator.write"
+
+
+@pytest.mark.asyncio
+async def test_plans_capabilities_registers_generated_read_contract_exactly_once() -> None:
+    registry = RpcRegistry()
+    expected = {
+        "planMode": True,
+        "initialModeOnSend": True,
+        "atomicInitialMode": True,
+    }
+    seen: list[Any] = []
+
+    async def implementation(params: Any, _ctx: Any) -> dict[str, Any]:
+        seen.append(params)
+        return expected
+
+    handler = register_plans_capabilities_contract(
+        registry,
+        implementation,
+        internal_error=RpcHandlerError,
+        guest_allowed_checker=is_guest_rpc_method_allowed,
+    )
+    params = {"legacy": True}
+
+    result = await handler(params, cast(Any, object()))
+
+    assert result is expected
+    assert seen == [params]
+    entry = registry.get_entry("plans.capabilities")
+    assert entry is not None
+    assert entry.handler is handler
+    assert entry.required_scope == "operator.read"
 
 
 @pytest.mark.asyncio

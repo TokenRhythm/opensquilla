@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
-from typing import Any, Literal, Protocol
+from typing import Literal, NotRequired, Protocol, TypedDict
 
 
 @dataclass(frozen=True, slots=True)
@@ -45,89 +45,135 @@ class ReadinessFinding:
     title: str
     detail: str
     readiness_impact: ReadinessImpact | None = None
-    evidence: Mapping[str, Any] | None = None
+    evidence: Mapping[str, object] | None = None
     fix_steps: tuple[ReadinessFixStep, ...] = ()
     restart_required: bool = False
 
 
+class RuntimeStatusResult(TypedDict):
+    status: str
+    version: str
+    uptime_ms: int
+    active_sessions: int
+    provider: NotRequired[str | None]
+
+
+class RouterLearningStatusResult(TypedDict):
+    agentId: str
+    enabled: bool
+    captureEnabled: bool
+    trainingReachable: bool
+    dream: Mapping[str, object]
+    activeModel: Mapping[str, object]
+    samples: Mapping[str, object] | None
+    gate: Mapping[str, object] | None
+    lastReceipt: Mapping[str, object] | None
+    error: NotRequired[str]
+
+
+class LogStatusResult(TypedDict):
+    raw_turn_call_log: Mapping[str, object]
+    gateway_file_log: Mapping[str, object]
+    diagnostics_enabled: Mapping[str, object]
+    trace_log: NotRequired[Mapping[str, object]]
+    diagnostics: NotRequired[Mapping[str, object]]
+    env: NotRequired[Mapping[str, object]]
+
+
+type LogEntry = str | Mapping[str, object]
+
+
+class LogTailResult(TypedDict):
+    lines: list[LogEntry]
+    cursor: int
+    has_more: bool
+
+
+class ReadinessReport(TypedDict):
+    status: str
+    ready: bool
+    summary: str
+    counts: Mapping[str, int]
+    impactCounts: Mapping[str, int]
+    findings: list[Mapping[str, object]]
+    agentId: str
+    configPath: NotRequired[str]
+
+
 class RuntimeStatusPort(Protocol):
-    async def snapshot(self) -> Mapping[str, Any]: ...
+    async def snapshot(self) -> RuntimeStatusResult: ...
 
 
 class RouterLearningStatusPort(Protocol):
-    async def snapshot(self, query: RouterLearningQuery) -> Mapping[str, Any]: ...
+    async def snapshot(self, query: RouterLearningQuery) -> RouterLearningStatusResult: ...
 
 
 class LogReaderPort(Protocol):
-    async def status(self) -> Mapping[str, Any]: ...
+    async def status(self) -> LogStatusResult: ...
 
-    async def tail(self, query: LogTailQuery) -> Mapping[str, Any]: ...
+    async def tail(self, query: LogTailQuery) -> LogTailResult: ...
 
 
 class ReadinessDataPort(Protocol):
-    async def provider(self, query: ReadinessQuery) -> Mapping[str, Any]: ...
+    async def provider(self, query: ReadinessQuery) -> Sequence[ReadinessFinding]: ...
 
-    async def logs(self, query: ReadinessQuery) -> Mapping[str, Any]: ...
+    async def logs(self, query: ReadinessQuery) -> Sequence[ReadinessFinding]: ...
 
-    async def memory(self, query: ReadinessQuery) -> Mapping[str, Any]: ...
+    async def memory(self, query: ReadinessQuery) -> Sequence[ReadinessFinding]: ...
 
-    async def channels(self, query: ReadinessQuery) -> Mapping[str, Any]: ...
+    async def channels(self, query: ReadinessQuery) -> Sequence[ReadinessFinding]: ...
 
-    async def sandbox(self, query: ReadinessQuery) -> Mapping[str, Any]: ...
+    async def sandbox(self, query: ReadinessQuery) -> Sequence[ReadinessFinding]: ...
 
-    async def router(self, query: ReadinessQuery) -> Mapping[str, Any]: ...
+    async def router(self, query: ReadinessQuery) -> Sequence[ReadinessFinding]: ...
 
-    async def squilla_router(self, query: ReadinessQuery) -> Mapping[str, Any]: ...
+    async def squilla_router(self, query: ReadinessQuery) -> Sequence[ReadinessFinding]: ...
 
-    async def memory_embedding(self, query: ReadinessQuery) -> Mapping[str, Any]: ...
+    async def memory_embedding(self, query: ReadinessQuery) -> Sequence[ReadinessFinding]: ...
 
-    async def search(self, query: ReadinessQuery) -> Mapping[str, Any]: ...
+    async def search(self, query: ReadinessQuery) -> Sequence[ReadinessFinding]: ...
 
-    async def image_generation(self, query: ReadinessQuery) -> Mapping[str, Any]: ...
+    async def image_generation(self, query: ReadinessQuery) -> Sequence[ReadinessFinding]: ...
 
-    async def llm_ensemble(self, query: ReadinessQuery) -> Mapping[str, Any]: ...
+    async def llm_ensemble(self, query: ReadinessQuery) -> Sequence[ReadinessFinding]: ...
 
 
-class ReadinessEvaluationPort(Protocol):
+class ReadinessReportPort(Protocol):
     def normalize_agent_id(self, value: str) -> str: ...
-
-    def evaluate(
-        self, surface: str, payload: Mapping[str, Any]
-    ) -> Sequence[ReadinessFinding]: ...
 
     def build_report(
         self,
         findings: Sequence[ReadinessFinding],
         *,
         config_path: str | None,
-    ) -> dict[str, Any]: ...
+    ) -> ReadinessReport: ...
 
 
 class RuntimeStatus:
     def __init__(self, port: RuntimeStatusPort) -> None:
         self._port = port
 
-    async def read(self) -> dict[str, Any]:
-        return dict(await self._port.snapshot())
+    async def read(self) -> RuntimeStatusResult:
+        return await self._port.snapshot()
 
 
 class RouterLearningStatus:
     def __init__(self, port: RouterLearningStatusPort) -> None:
         self._port = port
 
-    async def read(self, query: RouterLearningQuery) -> dict[str, Any]:
+    async def read(self, query: RouterLearningQuery) -> RouterLearningStatusResult:
         agent_id = str(query.agent_id or "main").strip() or "main"
-        return dict(await self._port.snapshot(RouterLearningQuery(agent_id)))
+        return await self._port.snapshot(RouterLearningQuery(agent_id))
 
 
 class LogReader:
     def __init__(self, port: LogReaderPort) -> None:
         self._port = port
 
-    async def status(self) -> dict[str, Any]:
-        return dict(await self._port.status())
+    async def status(self) -> LogStatusResult:
+        return await self._port.status()
 
-    async def tail(self, query: LogTailQuery) -> dict[str, Any]:
+    async def tail(self, query: LogTailQuery) -> LogTailResult:
         if query.cursor < 0:
             raise ValueError("cursor must be non-negative")
         if query.limit < 1:
@@ -137,13 +183,13 @@ class LogReader:
             limit=min(query.limit, 1000),
             level=(query.level or "").strip().upper() or None,
         )
-        return dict(await self._port.tail(bounded))
+        return await self._port.tail(bounded)
 
 
 @dataclass(frozen=True, slots=True)
 class _ReadinessCollection:
     surface: str
-    collect: Callable[[ReadinessQuery], Awaitable[Mapping[str, Any]]]
+    collect: Callable[[ReadinessQuery], Awaitable[Sequence[ReadinessFinding]]]
 
 
 _COLLECTION_INSPECT_COMMANDS = {
@@ -168,10 +214,10 @@ class ReadinessDiagnostics:
     def __init__(
         self,
         port: ReadinessDataPort,
-        evaluation: ReadinessEvaluationPort,
+        reporting: ReadinessReportPort,
     ) -> None:
         self._port = port
-        self._evaluation = evaluation
+        self._reporting = reporting
 
     async def assess(
         self,
@@ -179,10 +225,10 @@ class ReadinessDiagnostics:
         *,
         connection_id: str,
         config_path: str | None = None,
-    ) -> dict[str, Any]:
+    ) -> ReadinessReport:
         normalized = replace(
             query,
-            agent_id=self._evaluation.normalize_agent_id(str(query.agent_id or "main")),
+            agent_id=self._reporting.normalize_agent_id(str(query.agent_id or "main")),
             deep=bool(query.deep),
             probe_providers=bool(query.probe_providers),
         )
@@ -199,7 +245,7 @@ class ReadinessDiagnostics:
         for collection in self._collections():
             findings.extend(await self._evaluate(collection, normalized))
 
-        report = self._evaluation.build_report(findings, config_path=config_path)
+        report = self._reporting.build_report(findings, config_path=config_path)
         report["agentId"] = normalized.agent_id
         if config_path:
             report["configPath"] = config_path
@@ -226,8 +272,7 @@ class ReadinessDiagnostics:
         query: ReadinessQuery,
     ) -> list[ReadinessFinding]:
         try:
-            payload = await collection.collect(query)
-            return list(self._evaluation.evaluate(collection.surface, payload))
+            return list(await collection.collect(query))
         except Exception as exc:  # noqa: BLE001 - diagnostics isolate partial failures.
             return [self._collection_error(collection.surface, exc)]
 
@@ -264,16 +309,21 @@ class ReadinessDiagnostics:
 __all__ = [
     "LogReader",
     "LogReaderPort",
+    "LogStatusResult",
     "LogTailQuery",
+    "LogTailResult",
     "ReadinessDataPort",
     "ReadinessDiagnostics",
-    "ReadinessEvaluationPort",
     "ReadinessFinding",
     "ReadinessFixStep",
     "ReadinessQuery",
+    "ReadinessReport",
+    "ReadinessReportPort",
     "RouterLearningQuery",
     "RouterLearningStatus",
     "RouterLearningStatusPort",
+    "RouterLearningStatusResult",
     "RuntimeStatus",
     "RuntimeStatusPort",
+    "RuntimeStatusResult",
 ]

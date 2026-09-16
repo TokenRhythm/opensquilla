@@ -1176,7 +1176,7 @@ class FeishuChannel:
     async def receive(self) -> IncomingMessage:
         msg = await self._queue.get()
         self._last_message_at = datetime.now(UTC)
-        log.debug("feishu.receive", content=msg.content[:80])
+        log.debug("feishu.receive", content_chars=len(msg.content))
         return msg
 
     # ------------------------------------------------------------------

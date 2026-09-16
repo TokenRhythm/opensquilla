@@ -2,15 +2,16 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Any, Protocol
+from typing import NotRequired, Protocol, TypedDict
+
+from opensquilla.application.skill_source import resolve_install_source
 
 
 @dataclass(frozen=True, slots=True)
 class InstallSkill:
     identifier: str
-    source: str = "clawhub"
+    source: str | None = None
     operation_id: str = ""
     force: bool = False
     replace_source: bool = False
@@ -19,6 +20,7 @@ class InstallSkill:
     def __post_init__(self) -> None:
         if not self.identifier:
             raise ValueError("skill identifier is required")
+        object.__setattr__(self, "source", resolve_install_source(self.identifier, self.source))
 
 
 @dataclass(frozen=True, slots=True)
@@ -55,18 +57,57 @@ class UninstallSkill:
             raise ValueError("skill identity is required")
 
 
+class SkillReloadError(TypedDict, total=False):
+    name: str
+    code: str
+    message: str
+
+
+class SkillReloadResult(TypedDict):
+    success: bool
+    changed: bool
+    partial: bool
+    generation: int
+    added: list[str]
+    removed: list[str]
+    modified: list[str]
+    errors: list[SkillReloadError]
+
+
+class SkillMutationResult(TypedDict):
+    success: bool
+    cancelled: NotRequired[bool]
+    message: NotRequired[str]
+    name: NotRequired[str]
+    installId: NotRequired[str]
+
+
+class SkillCancelResult(TypedDict):
+    success: bool
+    cancelled: bool
+    message: str
+    pending: bool
+
+
+class SkillDependencyInstallResult(TypedDict):
+    success: bool
+    kind: str
+    message: str
+    missing_still: object
+
+
 class SkillManagementPort(Protocol):
-    async def reload(self) -> Mapping[str, Any]: ...
+    async def reload(self) -> SkillReloadResult: ...
 
-    async def install(self, command: InstallSkill) -> Mapping[str, Any]: ...
+    async def install(self, command: InstallSkill) -> SkillMutationResult: ...
 
-    async def cancel(self, command: CancelSkillInstall) -> Mapping[str, Any]: ...
+    async def cancel(self, command: CancelSkillInstall) -> SkillCancelResult: ...
 
     async def install_dependencies(
         self, command: InstallSkillDependencies
-    ) -> Mapping[str, Any]: ...
+    ) -> SkillDependencyInstallResult: ...
 
-    async def uninstall(self, command: UninstallSkill) -> Mapping[str, Any]: ...
+    async def uninstall(self, command: UninstallSkill) -> SkillMutationResult: ...
 
 
 class SkillManagement:
@@ -75,21 +116,21 @@ class SkillManagement:
     def __init__(self, port: SkillManagementPort) -> None:
         self._port = port
 
-    async def reload(self) -> Mapping[str, Any]:
+    async def reload(self) -> SkillReloadResult:
         return await self._port.reload()
 
-    async def install(self, command: InstallSkill) -> Mapping[str, Any]:
+    async def install(self, command: InstallSkill) -> SkillMutationResult:
         return await self._port.install(command)
 
-    async def cancel(self, command: CancelSkillInstall) -> Mapping[str, Any]:
+    async def cancel(self, command: CancelSkillInstall) -> SkillCancelResult:
         return await self._port.cancel(command)
 
     async def install_dependencies(
         self, command: InstallSkillDependencies
-    ) -> Mapping[str, Any]:
+    ) -> SkillDependencyInstallResult:
         return await self._port.install_dependencies(command)
 
-    async def uninstall(self, command: UninstallSkill) -> Mapping[str, Any]:
+    async def uninstall(self, command: UninstallSkill) -> SkillMutationResult:
         return await self._port.uninstall(command)
 
 
@@ -99,5 +140,9 @@ __all__ = [
     "InstallSkillDependencies",
     "SkillManagement",
     "SkillManagementPort",
+    "SkillCancelResult",
+    "SkillDependencyInstallResult",
+    "SkillMutationResult",
+    "SkillReloadResult",
     "UninstallSkill",
 ]

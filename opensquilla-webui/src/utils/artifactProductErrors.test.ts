@@ -7,18 +7,29 @@ import {
   classifyArtifactProductError,
   isKnownArtifactProductErrorCode,
 } from './artifactProductErrors'
+import { mapArtifactProductFailure } from '@/adapters/gateway/artifactErrorMapping'
+import en from '@/locales/en.json'
+import zhHans from '@/locales/zh-Hans.json'
+import de from '@/locales/de.json'
+import es from '@/locales/es.json'
+import fr from '@/locales/fr.json'
+import ja from '@/locales/ja.json'
+
+function mapped(
+  code: string,
+  fields: Record<string, unknown> = {},
+) {
+  return mapArtifactProductFailure(Object.assign(new Error('private detail'), { code, ...fields }))
+}
 
 describe('artifact product error classification', () => {
   it('maps compatibility codes without exposing their raw messages', () => {
-    const error = Object.assign(new Error('lease 44 on revision abc failed'), {
-      code: 'ARTIFACT_EDIT_SESSION_STALE',
-      retryable: true,
-    })
+    const error = mapped('ARTIFACT_EDIT_SESSION_STALE', { retryable: true })
 
     expect(classifyArtifactProductError(error)).toMatchObject({
-      code: 'EDIT_SESSION_RENEWAL_REQUIRED',
-      messageKey: 'workbench.artifactErrors.editSessionRenewalRequired',
-      recovery: 'reacquire-edit-session',
+      code: 'DOCUMENT_EDITING_RETIRED',
+      messageKey: 'workbench.artifactErrors.documentEditingRetired',
+      recovery: 'ask-user',
       retryable: true,
     })
     expect(classifyArtifactProductError(error).fallbackMessage)
@@ -45,9 +56,7 @@ describe('artifact product error classification', () => {
     ['INVALID_PARAMS', 'INVALID_REQUEST'],
     ['BAD_REQUEST', 'INVALID_REQUEST'],
   ] as const)('maps legacy %s to the stable %s recovery category', (legacy, stable) => {
-    expect(classifyArtifactProductError(Object.assign(new Error('private detail'), {
-      code: legacy,
-    })).code).toBe(stable)
+    expect(classifyArtifactProductError(mapped(legacy)).code).toBe(stable)
   })
 
   it('uses a safe internal category for unknown raw failures', () => {
@@ -58,27 +67,20 @@ describe('artifact product error classification', () => {
   })
 
   it('does not query a known rejected write and preserves pending transport writes', () => {
-    expect(artifactMutationOutcomeMayBePending(Object.assign(new Error('rejected'), {
-      code: 'DOCUMENT_CHANGED',
+    expect(artifactMutationOutcomeMayBePending(mapped('DOCUMENT_CHANGED', {
       accepted: false,
     }))).toBe(false)
-    expect(artifactMutationOutcomeMayBePending(Object.assign(new Error('timeout'), {
-      code: 'RPC_TIMEOUT',
-    }))).toBe(true)
-    expect(artifactMutationOutcomeMayBePending(Object.assign(new Error('closed'), {
-      code: 'RPC_TRANSPORT_ERROR',
+    expect(artifactMutationOutcomeMayBePending(mapped('RPC_TIMEOUT'))).toBe(true)
+    expect(artifactMutationOutcomeMayBePending(mapped('RPC_TRANSPORT_ERROR', {
       accepted: null,
     }))).toBe(true)
-    expect(artifactMutationOutcomeMayBePending(Object.assign(new Error('not connected'), {
-      code: 'RPC_TRANSPORT_ERROR',
+    expect(artifactMutationOutcomeMayBePending(mapped('RPC_TRANSPORT_ERROR', {
       accepted: false,
     }))).toBe(false)
   })
 
   it('presents read transport failures as unavailable while writes resolve uncertainty', () => {
-    const timeout = Object.assign(new Error('private timeout detail'), {
-      code: 'RPC_TIMEOUT',
-    })
+    const timeout = mapped('RPC_TIMEOUT')
     expect(classifyArtifactProductError(timeout)).toMatchObject({
       code: 'DOCUMENT_UNAVAILABLE',
       recovery: 'retry-same-request',
@@ -92,6 +94,29 @@ describe('artifact product error classification', () => {
     expect(error.message).toBe('This page is temporarily unavailable. Try again.')
   })
 
+  it('classifies unsupported subpage navigation as an upgrade action without exposing diagnostics', () => {
+    const classified = classifyArtifactProductError(mapped('PREVIEW_PAGE_UNSUPPORTED'))
+    expect(classified).toMatchObject({
+      code: 'PREVIEW_PAGE_UNSUPPORTED', messageKey: 'workbench.artifactErrors.previewPageUnsupported',
+      recovery: 'ask-user', retryable: false,
+      fallbackMessage: 'This client or Gateway does not support opening this subpage directly. Update and try again.',
+    })
+    expect(classified.fallbackMessage).not.toContain('private detail')
+    expect(isKnownArtifactProductErrorCode('PREVIEW_PAGE_UNSUPPORTED')).toBe(true)
+    expect(artifactProductClientError('PREVIEW_PAGE_UNSUPPORTED').message).toBe(classified.fallbackMessage)
+  })
+
+  it('has localized subpage guidance for all six supported locales', () => {
+    const english = en.workbench.artifactErrors.previewPageUnsupported
+    for (const locale of [en, zhHans, de, es, fr, ja]) {
+      expect(locale.workbench.artifactErrors.previewPageUnsupported).toEqual(expect.any(String))
+      expect(locale.workbench.artifactErrors.previewPageUnsupported.length).toBeGreaterThan(0)
+      if (locale !== en) expect(locale.workbench.artifactErrors.previewPageUnsupported).not.toBe(english)
+    }
+    expect(zhHans.workbench.artifactErrors.previewPageUnsupported)
+      .toBe('当前客户端或 Gateway 不支持直接打开此子页。请升级后重试。')
+  })
+
   it('carries only a stable reason code for localized unsupported resources', () => {
     const error = artifactProductClientError('RESOURCE_UNSUPPORTED', {
       reasonCode: 'html_encoding_unsupported',
@@ -100,10 +125,18 @@ describe('artifact product error classification', () => {
     expect(artifactProductReasonCode(new Error('localized text is not protocol'))).toBeNull()
   })
 
+  it('projects the legacy not-draft rejection into the canonical annotation reason', () => {
+    const error = mapped('ARTIFACT_ANNOTATION_NOT_DRAFT')
+    expect(error.code).toBe('ANNOTATION_UNAVAILABLE')
+    expect(artifactProductReasonCode(error)).toBe('not_draft')
+  })
+
   it('identifies artifact-scoped codes without claiming generic chat failures', () => {
     expect(isKnownArtifactProductErrorCode('ANNOTATION_UNAVAILABLE')).toBe(true)
-    expect(isKnownArtifactProductErrorCode('DOCUMENT_IMPORT_FORMAT_UNSUPPORTED')).toBe(true)
-    expect(isKnownArtifactProductErrorCode('WORKBENCH_PREVIEW_UNSUPPORTED')).toBe(true)
+    expect(isKnownArtifactProductErrorCode(
+      mapped('DOCUMENT_IMPORT_FORMAT_UNSUPPORTED').code,
+    )).toBe(true)
+    expect(isKnownArtifactProductErrorCode(mapped('WORKBENCH_PREVIEW_UNSUPPORTED').code)).toBe(true)
     expect(isKnownArtifactProductErrorCode('INVALID_REQUEST')).toBe(false)
     expect(isKnownArtifactProductErrorCode('INTERNAL_ERROR')).toBe(false)
     expect(isKnownArtifactProductErrorCode('SOME_CHAT_FAILURE')).toBe(false)

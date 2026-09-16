@@ -1,47 +1,32 @@
 from __future__ import annotations
 
-from contextlib import asynccontextmanager
 from unittest.mock import AsyncMock
 
 import pytest
 
+from opensquilla.application.skill_catalog import (
+    SkillCatalogReadPort,
+    SkillIdentity,
+    SkillSearchPage,
+    SkillSearchQuery,
+)
 from opensquilla.gateway.adapters.skill_catalog import (
     GatewaySkillCatalogAdapter,
-    GatewaySkillCatalogReadPort,
 )
-from opensquilla.gateway.rpc import RpcContext
 
 
 @pytest.mark.asyncio
-async def test_skill_catalog_adapter_pins_lifecycle_reads_and_projects_aliases() -> None:
-    list_reader = AsyncMock(return_value={"skills": [{"name": "demo"}]})
-    detail_reader = AsyncMock(return_value={"name": "demo", "content": "# Demo"})
-    search_reader = AsyncMock(
-        return_value={
-            "results": [{"name": "remote"}],
-            "diagnostics": [{"code": "source.timeout"}],
-            "partial": True,
-            "allSourcesUnavailable": False,
-        }
+async def test_skill_catalog_adapter_projects_aliases_to_typed_read_queries() -> None:
+    reader = AsyncMock(spec=SkillCatalogReadPort)
+    reader.list.return_value = [{"name": "demo"}]
+    reader.detail.return_value = {"name": "demo", "content": "# Demo"}
+    reader.search.return_value = SkillSearchPage(
+        results=[{"name": "remote"}],
+        diagnostics=[{"code": "source.timeout"}],
+        partial=True,
+        all_sources_unavailable=False,
     )
-    guarded = 0
-
-    @asynccontextmanager
-    async def committed_read():
-        nonlocal guarded
-        guarded += 1
-        yield
-
-    context = RpcContext(conn_id="test")
-    adapter = GatewaySkillCatalogAdapter(
-        GatewaySkillCatalogReadPort(
-            context,
-            list_reader=list_reader,
-            detail_reader=detail_reader,
-            search_reader=search_reader,
-            committed_read=committed_read,
-        )
-    )
+    adapter = GatewaySkillCatalogAdapter(reader)
 
     assert await adapter.list({"includeLifecycle": True}) == {
         "skills": [{"name": "demo"}]
@@ -61,14 +46,14 @@ async def test_skill_catalog_adapter_pins_lifecycle_reads_and_projects_aliases()
         "allSourcesUnavailable": False,
     }
 
-    assert guarded == 2
-    assert detail_reader.await_args.args[0] == {
-        "name": "demo",
-        "instanceId": "managed:1",
-        "installId": "install-1",
-        "includeLifecycle": True,
-    }
-    assert search_reader.await_args.args[0]["limit"] == 100
+    reader.list.assert_awaited_once_with(include_lifecycle=True)
+    reader.detail.assert_awaited_once_with(
+        SkillIdentity(name="demo", instance_id="managed:1", install_id="install-1"),
+        include_lifecycle=True,
+    )
+    reader.search.assert_awaited_once_with(
+        SkillSearchQuery(query="demo", limit=100)
+    )
 
 
 @pytest.mark.asyncio

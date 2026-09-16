@@ -95,7 +95,7 @@ def _write_slow_compaction_server(
             from opensquilla.gateway.boot import start_gateway_server
             from opensquilla.gateway.config import AuthConfig, GatewayConfig
             from opensquilla.gateway.websocket import SubscriptionManager
-            from opensquilla.session.compaction import CompactionConfig
+            from tests.helpers.compaction import synthetic_compaction_config
             from opensquilla.session.manager import SessionManager
             from opensquilla.session.storage import SessionStorage
 
@@ -121,7 +121,7 @@ def _write_slow_compaction_server(
                     return await super().compact_with_result(
                         session_key,
                         context_window_tokens,
-                        CompactionConfig(),
+                        synthetic_compaction_config(),
                         custom_instructions,
                         **kwargs,
                     )
@@ -295,6 +295,12 @@ def _start_slow_compaction_gateway(
     session_key: str,
     env: dict[str, str],
 ) -> subprocess.Popen[str]:
+    repo_root = Path(__file__).resolve().parents[2]
+    child_env = env.copy()
+    python_path = [str(repo_root / "src"), str(repo_root)]
+    if child_env.get("PYTHONPATH"):
+        python_path.append(child_env["PYTHONPATH"])
+    child_env["PYTHONPATH"] = os.pathsep.join(python_path)
     server_script = tmp_path / "slow_compaction_gateway.py"
     _write_slow_compaction_server(
         server_script,
@@ -307,7 +313,7 @@ def _start_slow_compaction_gateway(
         server = subprocess.Popen(
             [sys.executable, str(server_script)],
             cwd=Path.cwd(),
-            env=env,
+            env=child_env,
             stdout=output_stream,
             stderr=subprocess.STDOUT,
             text=True,

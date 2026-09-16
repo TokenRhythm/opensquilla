@@ -32,6 +32,8 @@ INTERACTIVE_RUN_KINDS = frozenset(
 
 
 class DailyUsageStorage(Protocol):
+    async def ensure_daily_usage_store_id(self) -> str: ...
+
     async def record_daily_usage(
         self,
         *,
@@ -101,7 +103,7 @@ async def upload_pending_daily_usage(
     """Upload pending aggregates for completed UTC days; failures stay retryable.
 
     The current (still-accumulating) day is deliberately excluded: the
-    event ID — sent as the ``Idempotency-Key`` — is stable per (install,
+    event ID — sent as the ``Idempotency-Key`` — is stable per (database,
     day), so an intraday snapshot would freeze the day at its first upload
     on any endpoint that honors idempotency semantics. Waiting until the
     UTC day has closed means each day is uploaded exactly once with its
@@ -124,11 +126,13 @@ async def upload_pending_daily_usage(
     if install_telemetry._telemetry_skip_reason(config=config) is not None:
         return 0
 
+    store_id = await storage.ensure_daily_usage_store_id()
     uploaded = 0
     for row in rows:
         payload = _daily_payload(
             row,
             install_id=install_id,
+            store_id=store_id,
             sent_at=_utc_now(),
         )
         # The privacy flag is hot-reloadable. Do not start another request
@@ -170,13 +174,14 @@ def _daily_payload(
     row: dict[str, Any],
     *,
     install_id: str,
+    store_id: str,
     sent_at: str,
 ) -> dict[str, Any]:
     day = str(row["day"])
     return {
         "schema_version": DAILY_TELEMETRY_SCHEMA_VERSION,
         "event": "daily_usage",
-        "event_id": _daily_event_id(install_id, day),
+        "event_id": _daily_event_id(store_id, day),
         "install_id": install_id,
         "opensquilla_version": __version__,
         "day": day,
@@ -189,11 +194,16 @@ def _daily_payload(
     }
 
 
-def _daily_event_id(install_id: str, day: str) -> str:
-    """Derive a retry-stable event ID from the existing install identity."""
+def _daily_event_id(store_id: str, day: str) -> str:
+    """Give independent profile databases distinct, retry-stable daily keys.
+
+    The random local discriminator is never uploaded. Unlike installation
+    identity it belongs to the aggregate store, not the machine, and survives
+    database moves and changes to the separate installation state.
+    """
     digest = hmac.new(
-        install_id.encode("utf-8"),
-        f"daily-usage:v1:{day}".encode(),
+        store_id.encode("utf-8"),
+        f"daily-usage:store-v1:{day}".encode(),
         hashlib.sha256,
     ).digest()
     return base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")

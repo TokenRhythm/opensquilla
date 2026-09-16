@@ -1,6 +1,8 @@
 import {
   type ConversationEventHandle,
   type ConversationEventHub,
+  type ConversationEventListener,
+  type ConversationRecoveryScope,
 } from '@/modules/conversationEventHub'
 import type { ConversationSessionRuntime } from '@/modules/conversationSessionRuntime'
 import type { ConversationEvent } from '@/modules/conversationEvents'
@@ -15,7 +17,8 @@ import type { ConversationEvent } from '@/modules/conversationEvents'
  * runtime is supplied.
  */
 export type ChatRpcSubscriptionHandlers = {
-  onEvent: (message: ConversationEvent) => void
+  onEvent: ConversationEventListener<ConversationEvent>
+  onRecoveryRequired?: (scope: ConversationRecoveryScope) => Promise<boolean>
   onConnectionState?: (state: string) => void
   onDecodeError?: (error: unknown) => void
 }
@@ -37,6 +40,7 @@ export function useChatRpcSubscriptions(
   let detachEvent: (() => void) | null = null
   let detachState: (() => void) | null = null
   let detachDecodeError: (() => void) | null = null
+  let detachRecovery: (() => void) | null = null
 
   function subscribe(): () => void {
     unsubscribe()
@@ -53,6 +57,9 @@ export function useChatRpcSubscriptions(
     if (handlers.onDecodeError) {
       detachDecodeError = hub.observeDecodeError(handlers.onDecodeError)
     }
+    if (handlers.onRecoveryRequired) {
+      detachRecovery = hub.observeRecoveryRequired(handlers.onRecoveryRequired)
+    }
     return unsubscribe
   }
 
@@ -63,6 +70,8 @@ export function useChatRpcSubscriptions(
     detachState = null
     detachDecodeError?.()
     detachDecodeError = null
+    detachRecovery?.()
+    detachRecovery = null
     activeHandle?.close()
     activeHandle = null
   }
@@ -81,7 +90,7 @@ export function useChatRpcSubscriptions(
   /** Open an additional logical stream without acquiring another WebSocket. */
   function open(
     key: string,
-    listener: (message: ConversationEvent) => void = handlers.onEvent,
+    listener: ConversationEventListener<ConversationEvent> = handlers.onEvent,
   ) {
     const handle = hub.open(key)
     const detach = handle.observe(listener)

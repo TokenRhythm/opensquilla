@@ -3,9 +3,9 @@ import type { InjectionKey } from 'vue'
 export type RouteFeedbackRating = 'up' | 'down' | 'neutral'
 
 export interface RouteFeedbackResult {
-  readonly accepted?: boolean
-  readonly recorded?: string
-  readonly reason?: string
+  readonly accepted: boolean
+  readonly reason?: string | null
+  readonly recorded?: string | null
 }
 
 export interface RouteFeedback {

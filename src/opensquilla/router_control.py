@@ -131,6 +131,8 @@ def resolve_router_control_target(
 
 
 def render_router_control_prompt_block(router_cfg: object | None) -> str:
+    if router_cfg is None or not bool(getattr(router_cfg, "enabled", False)):
+        return ""
     targets = [
         target
         for target in build_router_control_targets(router_cfg)
@@ -168,6 +170,7 @@ class RouterControlHoldStore:
 
     def __init__(self) -> None:
         self._holds: dict[str, RouterControlHold] = {}
+        self._routing_revisions: dict[str, int] = {}
 
     def __deepcopy__(self, memo: dict[int, object]) -> RouterControlHoldStore:
         # TurnRunner copies routing metadata before running the bounded router step,
@@ -209,13 +212,34 @@ class RouterControlHoldStore:
     def clear(self, session_key: str) -> RouterControlHold | None:
         return self._holds.pop(session_key, None)
 
+    def forget_session(self, session_key: str) -> None:
+        """Drop ephemeral state after session deletion has drained all writers."""
+
+        self.clear(session_key)
+        self._routing_revisions.pop(session_key, None)
+
+    def advance_routing_revision(self, session_key: str, revision: int) -> None:
+        """Invalidate holds and older turns after a durable mode transition."""
+
+        if revision > self._routing_revisions.get(session_key, -1):
+            self._routing_revisions[session_key] = revision
+            self.clear(session_key)
+
+    def is_current_revision(self, session_key: str, revision: int | None) -> bool:
+        # Background/direct callers without a session acceptance snapshot keep
+        # their existing global-policy semantics.
+        return revision is None or revision >= self._routing_revisions.get(session_key, 0)
+
     def get_valid(
         self,
         session_key: str,
         *,
         now_monotonic: float | None = None,
         decrement: bool = False,
+        routing_revision: int | None = None,
     ) -> RouterControlHold | None:
+        if not self.is_current_revision(session_key, routing_revision):
+            return None
         now = time.monotonic() if now_monotonic is None else now_monotonic
         hold = self._holds.get(session_key)
         if hold is None:

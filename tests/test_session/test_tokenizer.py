@@ -5,6 +5,7 @@ from __future__ import annotations
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -286,28 +287,51 @@ def test_a_wedged_encoding_load_returns_within_the_configured_budget(
     release = threading.Event()
     entered = threading.Event()
     completed = threading.Event()
+    load_join_timeouts: list[float | None] = []
+    loaders: list[threading.Thread] = []
+
+    class _RecordingLoadThread(threading.Thread):
+        def start(self) -> None:
+            loaders.append(self)
+            super().start()
+            assert entered.wait(5), "encoding loader did not enter its blocked section"
+
+        def join(self, timeout: float | None = None) -> None:
+            load_join_timeouts.append(timeout)
+            super().join(timeout)
 
     def _wedged():
         entered.set()
-        release.wait(30)
+        release.wait(5)
         completed.set()
         return _FakeEncoding(2)
 
     monkeypatch.setattr(token_estimation, "_load_encoding", _wedged)
     monkeypatch.setenv(token_estimation._ENCODING_LOAD_TIMEOUT_ENV, "0.05")
+    monkeypatch.setattr(
+        token_estimation,
+        "threading",
+        SimpleNamespace(**(vars(threading) | {"Thread": _RecordingLoadThread})),
+    )
 
-    started = time.monotonic()
     try:
         estimate = tokenizer.estimate_tokens_with_source("a" * 400)
-        elapsed = time.monotonic() - started
 
         assert entered.is_set()
         assert estimate == (200, "utf8_unicode_conservative")
-        assert elapsed < 0.5
+        # Check the real join budget, independent of when CI schedules us.
+        assert load_join_timeouts == [0.05]
+        assert not completed.is_set()
         assert token_estimation._encoding is token_estimation._ENCODING_UNAVAILABLE
     finally:
         release.set()
-        assert completed.wait(1)
+        assert completed.wait(5)
+        for loader in loaders:
+            # Join the actual worker, not only the loader-body event. Calling
+            # the base method keeps this cleanup out of the production budget.
+            threading.Thread.join(loader, 5)
+            assert not loader.is_alive()
+    assert token_estimation._encoding is token_estimation._ENCODING_UNAVAILABLE
 
 
 def test_a_timed_out_load_is_sticky_and_is_not_retried(
@@ -406,6 +430,12 @@ def test_concurrent_callers_share_one_timed_out_load(
     start = threading.Event()
     calls: list[int] = []
     results: list[tuple[int, str]] = []
+    load_join_timeouts: list[float | None] = []
+
+    class _RecordingLoadThread(threading.Thread):
+        def join(self, timeout: float | None = None) -> None:
+            load_join_timeouts.append(timeout)
+            super().join(timeout)
 
     def _wedged():
         calls.append(1)
@@ -420,20 +450,27 @@ def test_concurrent_callers_share_one_timed_out_load(
     monkeypatch.setattr(token_estimation, "_load_encoding", _wedged)
     monkeypatch.setenv(token_estimation._ENCODING_LOAD_TIMEOUT_ENV, "0.05")
     threads = [threading.Thread(target=_caller) for _ in range(8)]
+    # Record only this module's loader without patching the shared threading module.
+    monkeypatch.setattr(
+        token_estimation,
+        "threading",
+        SimpleNamespace(**(vars(threading) | {"Thread": _RecordingLoadThread})),
+    )
     for thread in threads:
         thread.start()
 
-    started = time.monotonic()
     try:
         start.set()
         for thread in threads:
             thread.join(2)
-        elapsed = time.monotonic() - started
 
         assert all(not thread.is_alive() for thread in threads)
         assert results == [(200, "utf8_unicode_conservative")] * 8
         assert len(calls) == 1
-        assert elapsed < 0.5
+        # Check the actual shared load budget, independent of caller scheduling.
+        assert load_join_timeouts == [0.05]
+        assert not completed.is_set()
+        assert token_estimation._encoding is token_estimation._ENCODING_UNAVAILABLE
     finally:
         release.set()
         assert completed.wait(1)

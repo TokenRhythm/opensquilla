@@ -8,9 +8,63 @@ last.  Gateway-specific state is hidden behind narrow ports.
 
 from __future__ import annotations
 
-from collections.abc import Awaitable, Callable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
-from typing import Any, Protocol
+from typing import Any, Protocol, TypedDict, cast
+
+
+class SetupMutationEntry(TypedDict, total=False):
+    providerId: str
+    provider: str
+    model: str
+    apiKey: str
+    apiKeyEnv: str
+    apiKeyEnvPool: list[str]
+    baseUrl: str
+    proxy: str
+    enabled: bool
+    presetId: str
+    routerAction: str
+    imageGenerationIntent: str
+    mode: str
+    defaultTier: str
+    tiers: dict[str, object]
+    crossProviderTiers: bool
+    tierProviderMismatch: str
+    selectionMode: str
+    modelOptions: list[str]
+    candidates: list[dict[str, object]]
+    minSuccessfulProposers: int
+    proposerMaxRetries: int
+    allFailedPolicy: str
+    maxResults: int
+    useEnvProxy: bool
+    fallbackPolicy: str
+    diagnostics: bool
+    primary: str
+    size: str
+    outputFormat: str
+    fallbacks: list[str]
+    credentialMode: str
+    onnxDir: str
+    ttsVoice: str
+    ttsModel: str
+    languageCode: str
+    capabilityId: str
+    reset: bool
+    removed: bool
+    credentialAvailable: bool
+    credentialSource: str
+    credentialEnv: str
+    externalCredentialActive: bool
+
+
+class SetupMutationPayload(TypedDict):
+    changed: bool
+    restartRequired: bool
+    configPath: str
+    entry: SetupMutationEntry
+    warnings: list[str]
 
 
 @dataclass(frozen=True, slots=True)
@@ -20,17 +74,17 @@ class SetupMutation:
     changed: bool
     restart_required: bool
     config_path: str
-    entry: Mapping[str, Any]
+    entry: SetupMutationEntry
     warnings: tuple[str, ...]
 
-    def to_payload(self) -> dict[str, Any]:
-        return {
-            "changed": self.changed,
-            "restartRequired": self.restart_required,
-            "configPath": self.config_path,
-            "entry": dict(self.entry),
-            "warnings": list(self.warnings),
-        }
+    def to_payload(self) -> SetupMutationPayload:
+        return SetupMutationPayload(
+            changed=self.changed,
+            restartRequired=self.restart_required,
+            configPath=self.config_path,
+            entry=cast(SetupMutationEntry, dict(self.entry)),
+            warnings=list(self.warnings),
+        )
 
 
 class SetupConfigPort(Protocol):
@@ -104,7 +158,7 @@ async def commit_setup_mutation(
         changed=bool(result.changed),
         restart_required=bool(result.restart_required),
         config_path=config_path,
-        entry=dict(result.public_payload),
+        entry=cast(SetupMutationEntry, dict(result.public_payload)),
         warnings=tuple(str(item) for item in result.warnings),
     )
 
@@ -112,6 +166,8 @@ async def commit_setup_mutation(
 __all__ = [
     "SetupConfigPort",
     "SetupMutation",
+    "SetupMutationEntry",
+    "SetupMutationPayload",
     "SetupRuntimePort",
     "commit_setup_mutation",
 ]

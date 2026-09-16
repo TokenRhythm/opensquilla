@@ -36,6 +36,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
+from opensquilla.asyncio_utils import reset_contextvar_token
 from opensquilla.private_paths import (
     _WindowsPrivateDaclVerificationError,
     apply_windows_private_dacl,
@@ -235,7 +236,7 @@ def task_process_scope(
     try:
         yield
     finally:
-        _CURRENT_TASK_PROCESS_SCOPE.reset(token)
+        reset_contextvar_token(_CURRENT_TASK_PROCESS_SCOPE, token)
 
 
 def _current_task_process_scope() -> _TaskProcessScope | None:
@@ -2727,16 +2728,6 @@ def _posix_controller_matches(record: _PersistedOwnerRecord) -> bool:
     except (OSError, AttributeError):
         return False
     return _posix_anchor_command_matches(record)
-
-
-async def _wait_until(check: Any, timeout: float) -> bool:
-    deadline = asyncio.get_running_loop().time() + max(0.0, timeout)
-    while check():
-        remaining = deadline - asyncio.get_running_loop().time()
-        if remaining <= 0:
-            return False
-        await asyncio.sleep(min(_POLL_INTERVAL_SECONDS, remaining))
-    return True
 
 
 def _terminate_persisted_posix_owner_sync(reference: _PersistedOwnerRef) -> bool:

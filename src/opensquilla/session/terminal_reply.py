@@ -12,6 +12,23 @@ from opensquilla.silent_reply import (
 )
 
 CONTEXT_PAYLOAD_TOO_LARGE_CODE = "provider_request_too_large"
+CONTEXT_PAYLOAD_TOO_LARGE_MESSAGES = {
+    "provider_system_prompt_too_large": (
+        "The fixed system instructions exceed the provider request budget. "
+        "Shorten the system instructions or choose a larger-context model. "
+        "Stored history was not changed."
+    ),
+    "provider_tool_schema_too_large": (
+        "The tool definitions exceed the provider request budget. "
+        "Reduce the available tools or choose a larger-context model. "
+        "Stored history was not changed."
+    ),
+    "provider_protected_context_too_large": (
+        "The current input and protected recent context still exceed the "
+        "provider request budget after safe history reduction. Shorten the "
+        "current input or choose a larger-context model. Stored history was not changed."
+    ),
+}
 ENSEMBLE_MULTIMODAL_UNSUPPORTED_CODE = "ensemble_multimodal_unsupported"
 ENSEMBLE_MULTIMODAL_UNSUPPORTED_MESSAGE = (
     "Ensemble does not support image input yet. "
@@ -87,6 +104,8 @@ _SAFE_PROVIDER_TERMINAL_CODES = frozenset(
         "invalid_response_status",
         "invalid_stream_frame",
         "invalid_stream_order",
+        "iteration_timeout",
+        "llm_timeout",
         "model_repetition_loop_detected",
         "provider_protocol_error",
         "provider_output_truncated",
@@ -97,13 +116,16 @@ _SAFE_PROVIDER_TERMINAL_CODES = frozenset(
         "request_error",
         "response_incomplete",
         "synthetic_upstream_failure",
+        "stream_idle_timeout",
         "timeout",
         "usage_limit_reached",
     }
 )
 
 
-def safe_provider_failure_message(failure_kind: str | None) -> str:
+def safe_provider_failure_message(
+    failure_kind: str | None, *, code: str | None = None, message: str | None = None
+) -> str:
     """Project a stable provider failure kind to allowlisted user text.
 
     This is a defense-in-depth boundary for Gateway producers other than the
@@ -111,6 +133,11 @@ def safe_provider_failure_message(failure_kind: str | None) -> str:
     credentials and must never reach a client or durable terminal record.
     """
 
+    if code == "empty_response" and isinstance(message, str) and message.lower() in {
+        _REASONING_ONLY_OUTPUT_BUDGET_ERROR_MESSAGE,
+        _REASONING_ONLY_EMPTY_ERROR_MESSAGE,
+    }:
+        return message
     normalized = str(failure_kind or "").strip().lower().replace("-", "_")
     return _SAFE_PROVIDER_FAILURE_MESSAGES.get(
         normalized,
@@ -130,6 +157,13 @@ def safe_provider_failure_code(raw_code: str | None, failure_kind: str | None) -
     if normalized_kind in _SAFE_PROVIDER_FAILURE_MESSAGES:
         return f"provider_{normalized_kind}"
     return "provider_error"
+
+
+def safe_error_id(value: object) -> str | None:
+    """Accept only the existing durable diagnostic reference format."""
+    if isinstance(value, str) and len(value) == 8 and all(c in "0123456789abcdef" for c in value):
+        return value
+    return None
 
 
 def build_terminal_reply(
@@ -164,7 +198,7 @@ def build_terminal_reply(
     if (
         status == AgentTaskStatus.TIMEOUT.value
         or reason == "timeout"
-        or error_class == "iteration_timeout"
+        or error_class in {"iteration_timeout", "llm_timeout", "stream_idle_timeout", "timeout"}
         or "timeouterror" in error_class
         or "iteration_timeout" in error_message
         or "stream idle" in error_message
@@ -173,6 +207,12 @@ def build_terminal_reply(
     if is_context_payload_too_large(record_or_payload) or (
         isinstance(existing, str) and _contains_context_payload_marker(existing)
     ):
+        # Only our complete, fixed diagnostics may survive this boundary.
+        # Upstream prose (including text appended to a known message) stays
+        # behind the generic context-error projection below.
+        for message in CONTEXT_PAYLOAD_TOO_LARGE_MESSAGES.values():
+            if error_message == _normalize(message):
+                return message
         return (
             "The request is too large for the provider context window after "
             "automatic context compaction and payload reduction. OpenSquilla "
@@ -259,6 +299,9 @@ def build_terminal_reply(
             "sent. Earlier work in this turn may already have run or been billed."
         )
     if status == AgentTaskStatus.FAILED.value or reason in {"error", "tool_error"}:
+        failure_kind = _normalize(_read_value(record_or_payload, "failure_kind"))
+        if failure_kind:
+            return safe_provider_failure_message(failure_kind)
         return "The task failed before it could finish."
     if status == AgentTaskStatus.SUCCEEDED.value or reason in {"completed", "done"}:
         return "The task completed."

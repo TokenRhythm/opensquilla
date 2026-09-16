@@ -109,6 +109,43 @@ _DURATION_FILE: Final[Path] = Path(__file__).with_name("windows_test_durations.j
 _ASSIGNMENT_FILE: Final[Path] = Path(__file__).with_name("windows_test_assignments.json")
 
 
+# These files are excluded from offline CI by its marker expression.
+OFFLINE_MARKER_EXCLUSIONS: Final[frozenset[str]] = frozenset(
+    {
+        "tests/functional/test_agent_synthetic_golden.py",
+        "tests/functional/test_gateway_llm_e2e.py",
+        "tests/functional/test_live_agent_context_boundary_e2e.py",
+        "tests/functional/test_live_channel_telegram_smoke.py",
+        "tests/functional/test_live_openrouter_compaction.py",
+        "tests/functional/test_llm_smoke.py",
+        "tests/functional/test_webui_browser_e2e.py",
+        "tests/integration/cli/tui_real_terminal/test_architecture_prompt.py",
+        "tests/integration/cli/tui_real_terminal/test_completion_menu.py",
+        "tests/integration/cli/tui_real_terminal/test_complex_ui_state.py",
+        "tests/integration/cli/tui_real_terminal/test_exit_restoration.py",
+        "tests/integration/cli/tui_real_terminal/test_framebuffer.py",
+        "tests/integration/cli/tui_real_terminal/test_framebuffer_recovery.py",
+        "tests/integration/cli/tui_real_terminal/test_gateway_empty_bootstrap_startup.py",
+        "tests/integration/cli/tui_real_terminal/test_idle_resize_round_trip.py",
+        "tests/integration/cli/tui_real_terminal/test_launch_input_loop.py",
+        "tests/integration/cli/tui_real_terminal/test_live_opentui_real_cli.py",
+        "tests/integration/cli/tui_real_terminal/test_long_streaming.py",
+        "tests/integration/cli/tui_real_terminal/test_mouse_scroll_stability.py",
+        "tests/integration/cli/tui_real_terminal/test_packaged_gateway_e2e.py",
+        "tests/integration/cli/tui_real_terminal/test_source_gateway_bootstrap_startup.py",
+        "tests/integration/cli/tui_real_terminal/test_terminal_changes.py",
+        "tests/live/test_search_api_matrix_live.py",
+        "tests/live/test_skill_hub_canary_live.py",
+        "tests/live/test_multi_provider_matrix_live.py",
+        "tests/live/test_search_retrieval_live.py",
+        "tests/live/test_tokenrhythm_catalog_live.py",
+        "tests/live/test_web_search_agent_e2e.py",
+        "tests/test_skills/test_meta_router_live.py",
+        "tests/test_skills/test_meta_skill_creator_smoke_live.py",
+    }
+)
+
+
 def discover_test_files(root: Path) -> tuple[str, ...]:
     """Return every pytest file below ``tests/`` as a repository-relative path."""
 
@@ -434,9 +471,15 @@ def assignment_governance_summary(root: Path) -> dict[str, object]:
         current_seconds[assignments[path]] += weight
     baseline_max = max(baseline_seconds.values())
     current_max = max(current_seconds.values())
+    active = set(discover_test_files(root)) - OFFLINE_MARKER_EXCLUSIONS
+    unweighted = sorted(active - weights.keys())
     return {
         "schema_version": 1,
         "assignment_sha256": assignment_snapshot_fingerprint(),
+        "unweighted_active_files": unweighted,
+        "timing_refresh_recommended": (
+            len(unweighted) > 4 or len(unweighted) / max(len(active), 1) >= 0.01
+        ),
         "guardrails": guardrails,
         "overrides": list(overrides),
         "baseline_predicted_seconds": {
@@ -1008,6 +1051,25 @@ def _list(args: argparse.Namespace) -> int:
 def _report(args: argparse.Namespace) -> int:
     report = assignment_governance_summary(args.root.resolve())
     print(json.dumps(report, indent=2, sort_keys=True))
+    summary = getattr(args, "github_summary", None)
+    if summary is not None:
+        missing = report["unweighted_active_files"]
+        lines = [
+            "## Test timing coverage",
+            "",
+            f"Active test files without historical timing weights: {len(missing)}.",
+            "These tests remain assigned and execute normally.",
+            "",
+        ]
+        lines.extend(f"- `{path}`" for path in missing)
+        with summary.open("a", encoding="utf-8") as handle:
+            handle.write("\n".join(lines) + "\n")
+        if report["timing_refresh_recommended"]:
+            print(
+                "::warning title=Test timing refresh recommended::"
+                "Historical timing weights need refreshing. "
+                "See the job summary for files; test coverage is unchanged."
+            )
     return 0
 
 
@@ -1034,6 +1096,7 @@ def _parser() -> argparse.ArgumentParser:
         "report", help="report governed assignments and predicted shard weights"
     )
     report_parser.add_argument("--root", type=Path, default=Path.cwd())
+    report_parser.add_argument("--github-summary", type=Path)
     report_parser.set_defaults(handler=_report)
 
     run_parser = subparsers.add_parser("run", help="run one shard through pytest")

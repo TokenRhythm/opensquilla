@@ -2,9 +2,8 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Any, Protocol
+from typing import Any, NotRequired, Protocol, TypedDict, cast
 
 from opensquilla.application.setup_mutations import (
     SetupConfigPort,
@@ -12,6 +11,50 @@ from opensquilla.application.setup_mutations import (
     SetupRuntimePort,
     commit_setup_mutation,
 )
+
+
+class ProviderProbeResult(TypedDict):
+    ok: bool
+    providerId: str
+    model: str
+    failureKind: str
+    message: str
+    code: str
+    latencyMs: int
+    firstResponseMs: int | None
+    totalMs: int
+
+
+class DiscoveredModelPricing(TypedDict):
+    inputPer1k: float
+    outputPer1k: float
+
+
+class DiscoveredModel(TypedDict):
+    id: str
+    name: str
+    contextWindow: int | None
+    maxOutputTokens: int | None
+    capabilities: list[str]
+    pricing: DiscoveredModelPricing | None
+    capabilitySource: str
+    metadata: NotRequired[dict[str, object] | None]
+
+
+class ProviderModelDiscoveryResult(TypedDict):
+    ok: bool
+    failureKind: str
+    detail: str
+    source: str
+    models: list[DiscoveredModel]
+    catalog: dict[str, object] | None
+
+
+class ImageModelDiscoveryResult(TypedDict):
+    ok: bool
+    providerId: str
+    source: str
+    models: list[DiscoveredModel]
 
 
 @dataclass(frozen=True, slots=True)
@@ -50,13 +93,13 @@ class DiscoverPrimaryModels:
 
 
 class ProviderProbePort(Protocol):
-    async def probe_primary(self, command: ProbePrimaryProvider) -> Mapping[str, Any]: ...
+    async def probe_primary(self, command: ProbePrimaryProvider) -> ProviderProbeResult: ...
 
     async def discover_primary_models(
         self, command: DiscoverPrimaryModels
-    ) -> Mapping[str, Any]: ...
+    ) -> ProviderModelDiscoveryResult: ...
 
-    async def discover_image_models(self, provider_id: str) -> Mapping[str, Any]: ...
+    async def discover_image_models(self, provider_id: str) -> ImageModelDiscoveryResult: ...
 
 
 class PrimaryProviderMutationPort(Protocol):
@@ -92,22 +135,33 @@ class ProviderSetup:
             ),
         )
 
-    async def probe_primary(self, command: ProbePrimaryProvider) -> dict[str, Any]:
-        return dict(await self._probes.probe_primary(command))
+    async def probe_primary(self, command: ProbePrimaryProvider) -> ProviderProbeResult:
+        return cast(ProviderProbeResult, dict(await self._probes.probe_primary(command)))
 
     async def discover_primary_models(
         self, command: DiscoverPrimaryModels
-    ) -> dict[str, Any]:
-        return dict(await self._probes.discover_primary_models(command))
+    ) -> ProviderModelDiscoveryResult:
+        return cast(
+            ProviderModelDiscoveryResult,
+            dict(await self._probes.discover_primary_models(command)),
+        )
 
-    async def discover_image_models(self, provider_id: str) -> dict[str, Any]:
-        return dict(await self._probes.discover_image_models(provider_id))
+    async def discover_image_models(self, provider_id: str) -> ImageModelDiscoveryResult:
+        return cast(
+            ImageModelDiscoveryResult,
+            dict(await self._probes.discover_image_models(provider_id)),
+        )
 
 
 __all__ = [
     "ConfigurePrimaryProvider",
+    "DiscoveredModel",
+    "DiscoveredModelPricing",
     "DiscoverPrimaryModels",
+    "ImageModelDiscoveryResult",
     "ProbePrimaryProvider",
+    "ProviderModelDiscoveryResult",
+    "ProviderProbeResult",
     "PrimaryProviderMutationPort",
     "ProviderProbePort",
     "ProviderSetup",

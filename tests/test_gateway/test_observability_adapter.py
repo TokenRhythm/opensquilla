@@ -1,51 +1,54 @@
 from __future__ import annotations
 
-from typing import Any
-
 import pytest
 
-from opensquilla.application.observability import ReadinessQuery
-from opensquilla.gateway.adapters.observability import GatewayReadinessDataPort
+from opensquilla.application.observability import ReadinessFinding, ReadinessQuery
+from opensquilla.gateway import rpc_doctor
 from opensquilla.gateway.rpc import RpcContext
+from opensquilla.gateway.rpc_doctor import _GatewayReadinessRuntime
 
 
 @pytest.mark.asyncio
-async def test_readiness_adapter_projects_domain_queries_to_existing_collectors() -> None:
-    calls: list[tuple[str, dict[str, Any] | None]] = []
+async def test_readiness_runtime_projects_queries_to_domain_collectors(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[str, object]] = []
 
-    def reader(name: str):
-        async def collect(
-            params: dict[str, Any] | None,
-            context: RpcContext,
-        ) -> dict[str, Any]:
-            assert context.conn_id == "test"
-            calls.append((name, params))
-            return {"surface": name}
+    def findings(surface: str, payload: dict[str, object]) -> tuple[ReadinessFinding, ...]:
+        calls.append((surface, payload))
+        return (
+            ReadinessFinding(
+                id=f"{surface}.ready",
+                severity="ok",
+                surface=surface,
+                title="Ready",
+                detail="Ready",
+            ),
+        )
 
-        return collect
+    async def provider(params: object, context: RpcContext) -> dict[str, str]:
+        assert context.conn_id == "test"
+        calls.append(("provider", params))
+        return {"surface": "provider"}
 
-    port = GatewayReadinessDataPort(
-        RpcContext(conn_id="test"),
-        provider=reader("provider"),
-        logs=reader("logs"),
-        memory=reader("memory"),
-        channels=reader("channels"),
-        sandbox=reader("sandbox"),
-        router=reader("router"),
-        squilla_router=reader("squilla_router"),
-        memory_embedding=reader("memory_embedding"),
-        search=reader("search"),
-        image_generation=reader("image_generation"),
-        llm_ensemble=reader("llm_ensemble"),
-    )
+    def router(context: RpcContext, *, deep: bool) -> dict[str, str]:
+        assert context.conn_id == "test"
+        calls.append(("router", deep))
+        return {"surface": "router"}
+
+    monkeypatch.setattr(rpc_doctor, "_provider_payload", provider)
+    monkeypatch.setattr(rpc_doctor, "_router_payload", router)
+    monkeypatch.setattr(rpc_doctor, "evaluate_readiness_surface", findings)
+
+    port = _GatewayReadinessRuntime(RpcContext(conn_id="test"))
     query = ReadinessQuery(agent_id="operator", deep=False, probe_providers=True)
 
-    assert await port.provider(query) == {"surface": "provider"}
-    assert await port.memory(query) == {"surface": "memory"}
-    assert await port.router(query) == {"surface": "router"}
+    assert [item.id for item in await port.provider(query)] == ["provider.ready"]
+    assert [item.id for item in await port.router(query)] == ["router.ready"]
 
     assert calls == [
         ("provider", {"probeModels": True}),
-        ("memory", {"agentId": "operator", "deep": False}),
-        ("router", {"deep": False}),
+        ("provider", {"surface": "provider"}),
+        ("router", False),
+        ("router", {"surface": "router"}),
     ]

@@ -1,3 +1,4 @@
+import { normalizePageContext, type ChatPageContext } from '@/types/pageContext'
 import { computed, nextTick, ref, watch, type Ref } from 'vue'
 import type {
   Attachment,
@@ -18,9 +19,10 @@ import type {
   PendingInputWalRecord,
   PendingInputWalState,
 } from '@/utils/chat/pendingInputWal'
-import type {
-  PendingInputQueuePort,
-  PendingInputServerItem,
+import {
+  PendingInputQueueError,
+  type PendingInputQueuePort,
+  type PendingInputServerItem,
 } from '@/modules/pendingInputQueue'
 import { snapshotSteerRequest } from './useChatSteerDelivery'
 
@@ -28,7 +30,7 @@ const MAX_PENDING = 5
 const MAX_REMOVAL_TOMBSTONES = 256
 const MAX_PROMPT_ANNOTATION_IDS = 16
 
-function normalizePromptAnnotationIds(
+function normalizeAnnotationDraftIds(
   ids: unknown,
 ): string[] {
   return (Array.isArray(ids) ? ids : [])
@@ -108,7 +110,8 @@ export interface PendingQueueOwnerContext {
 
 export interface PendingQueuePayload {
   text: string
-  promptAnnotationIds?: readonly string[]
+  draftIds?: readonly string[]
+  pageContext?: ChatPageContext
   attachments?: Attachment[]
   intent?: string | null
   confirmedPlainText?: boolean
@@ -265,8 +268,10 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
       clientRequestId: item.pendingClientRequestId!,
       clientMessageId: item.pendingClientMessageId!,
       text: item.text,
-      ...(item.promptAnnotationIds?.length
-        ? { promptAnnotationIds: normalizePromptAnnotationIds(item.promptAnnotationIds) }
+      ...(item.retiredAnnotationInput ? { retiredAnnotationInput: true } : {}),
+      ...(item.pageContext ? { pageContext: normalizePageContext(item.pageContext)! } : {}),
+      ...(item.draftIds?.length
+        ? { draftIds: normalizeAnnotationDraftIds(item.draftIds) }
         : {}),
       attachments: (item.attachments || []).map(attachment => ({ ...attachment })),
       intent: item.intent,
@@ -302,8 +307,11 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
     return {
       pendingUiId: record.pendingInputId,
       text: record.text,
-      ...(normalizePromptAnnotationIds(record.promptAnnotationIds).length
-        ? { promptAnnotationIds: normalizePromptAnnotationIds(record.promptAnnotationIds) }
+      ...((record.retiredAnnotationInput || record.promptAnnotationIds?.length)
+        ? { retiredAnnotationInput: true } : {}),
+      ...(record.pageContext ? { pageContext: normalizePageContext(record.pageContext)! } : {}),
+      ...(normalizeAnnotationDraftIds(record.draftIds).length
+        ? { draftIds: normalizeAnnotationDraftIds(record.draftIds) }
         : {}),
       attachments: record.attachments.map(attachment => ({ ...attachment })),
       intent: record.intent,
@@ -431,9 +439,8 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
     ))
   }
 
-  function rpcErrorCode(error: unknown): string {
-    const code = (error as { code?: unknown } | null)?.code
-    return typeof code === 'string' ? code : ''
+  function pendingQueueFailure(error: unknown): PendingInputQueueError | null {
+    return error instanceof PendingInputQueueError ? error : null
   }
 
   function durableAttachmentMetadata(attachment: Attachment): Attachment {
@@ -461,7 +468,7 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
   async function ensureServerStaged(item: ChatPendingItem): Promise<void> {
     const pendingInputId = item.pendingInputId
     if (!pendingInputId || !options.pendingInputWal) return
-    if (item.ownerRequestId) return
+    if (item.ownerRequestId || item.retiredAnnotationInput) return
     if (
       item.pendingPersistenceState === 'cancelling'
       || item.pendingRetainAfterCancel === true
@@ -519,13 +526,11 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
                 pendingInputId,
                 clientRequestId: item.pendingClientRequestId,
                 clientMessageId: item.pendingClientMessageId,
-                message: providerMessage || 'Describe these attachments',
+                message: providerMessage || item.pageContext?.annotations?.map(item => item.text).join('\n') || 'Describe these attachments',
                 attachments: sendable.map(serializeSendableAttachment),
-                ...(item.promptAnnotationIds?.length
-                  ? { promptAnnotationIds: normalizePromptAnnotationIds(item.promptAnnotationIds) }
-                  : {}),
+                ...(item.pageContext ? { pageContext: item.pageContext } : {}),
                 ...(item.confirmedPlainText ? { confirmedPlainText: true } : {}),
-                ...(sendable.length > 0 || literalSlashEscape
+                ...(sendable.length > 0 || literalSlashEscape || Boolean(item.pageContext?.annotations?.length)
                   ? { displayText: queuedText }
                   : {}),
                 ...(item.intent ? { intent: item.intent } : {}),
@@ -559,11 +564,11 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
             flushDeferredPendingDrain()
             return
           } catch (error) {
-            const code = rpcErrorCode(error)
+            const kind = pendingQueueFailure(error)?.kind
             if (
               !refreshedLostUpload
               && options.prepareAttachmentsForSend
-              && (code === 'ATTACHMENT_EXPIRED' || code === 'ATTACHMENT_LOST_IN_RESTART')
+              && (kind === 'attachment-expired' || kind === 'attachment-lost')
               && item.attachments.some(attachment => attachment.kind === 'staged' && attachment.file)
             ) {
               refreshedLostUpload = true
@@ -578,10 +583,10 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
           }
         }
       } catch (error) {
-        const code = rpcErrorCode(error)
+        const failure = pendingQueueFailure(error)
         if (
-          code === 'PENDING_INPUT_CANCELLED'
-          || code === 'PENDING_INPUT_ALREADY_DISPATCHED'
+          failure?.kind === 'cancelled'
+          || failure?.kind === 'already-dispatched'
         ) {
           // A peer or an earlier crashed tab already committed the durable
           // terminal outcome. Treat that server tombstone as authoritative
@@ -593,12 +598,12 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
           broadcastChange(sessionKey, pendingInputId, 'removed')
           return
         }
-        if (code === 'METHOD_NOT_FOUND') {
+        if (failure?.kind === 'unsupported') {
           await writeWalItem(item, 'local_only')
           flushDeferredPendingDrain()
           return
         }
-        if ((error as { accepted?: unknown } | null)?.accepted === false) {
+        if (failure?.accepted === false) {
           await writeWalItem(item, 'retryable').catch(() => {})
           options.onPendingPersistenceError?.('server_rejected')
           return
@@ -735,11 +740,8 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
               : serverItem.message || '',
             attachments: serverAttachments,
             intent: typeof serverItem.intent === 'string' ? serverItem.intent : null,
-            ...(normalizePromptAnnotationIds(serverItem.promptAnnotationIds).length
-              ? {
-                  promptAnnotationIds: normalizePromptAnnotationIds(serverItem.promptAnnotationIds),
-                }
-              : {}),
+            ...(normalizePageContext(serverItem.pageContext)
+              ? { pageContext: normalizePageContext(serverItem.pageContext)! } : {}),
             ...(serverItem.confirmedPlainText === true ? { confirmedPlainText: true } : {}),
             ownerSessionKey: sessionKey,
             pendingInputId,
@@ -761,10 +763,8 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
           // snapshot with safe server-owned metadata before marking it staged.
           item.attachments = serverAttachments
         }
-        const serverPromptAnnotationIds = normalizePromptAnnotationIds(serverItem.promptAnnotationIds)
-        if (serverPromptAnnotationIds.length > 0) {
-          item.promptAnnotationIds = serverPromptAnnotationIds
-        }
+        const serverPageContext = normalizePageContext(serverItem.pageContext)
+        if (serverPageContext) item.pageContext = serverPageContext
         item.pendingRequestFingerprint = serverItem.requestFingerprint
         item.pendingServerRevision = typeof serverItem.revision === 'number'
           ? serverItem.revision
@@ -868,11 +868,12 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
       return false
     }
     const ownerRequestId = resolveOwnerRequestId(owner)
-    const promptAnnotationIds = normalizePromptAnnotationIds(payload.promptAnnotationIds)
+    const draftIds = normalizeAnnotationDraftIds(payload.draftIds)
     const item: ChatPendingItem = {
       pendingUiId: createClientRequestId(),
       text: payload.text,
-      ...(promptAnnotationIds.length ? { promptAnnotationIds } : {}),
+      ...(payload.pageContext ? { pageContext: normalizePageContext(payload.pageContext)! } : {}),
+      ...(draftIds.length ? { draftIds } : {}),
       attachments: (payload.attachments || []).map(a => ({ ...a })),
       intent: payload.intent ?? null,
       ...(payload.confirmedPlainText ? { confirmedPlainText: true } : {}),
@@ -915,7 +916,9 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
     owner?: PendingQueueOwner,
     enqueueOptions?: {
       confirmedPlainText?: boolean
-      promptAnnotationIds?: readonly string[]
+      draftIds?: readonly string[]
+      pageContext?: ChatPageContext
+      attachments?: Attachment[]
     },
   ): boolean | Promise<boolean> {
     if (isControlInput(text) && !enqueueOptions?.confirmedPlainText) return false
@@ -924,10 +927,11 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
     const composerIntent = options.pendingSessionIntent.value
     const queued = enqueuePendingPayload({
       text,
-      ...(enqueueOptions?.promptAnnotationIds?.length
-        ? { promptAnnotationIds: enqueueOptions.promptAnnotationIds }
+      ...(enqueueOptions?.pageContext ? { pageContext: enqueueOptions.pageContext } : {}),
+      ...(enqueueOptions?.draftIds?.length
+        ? { draftIds: enqueueOptions.draftIds }
         : {}),
-      attachments: options.pendingAttachments.value,
+      attachments: enqueueOptions?.attachments ?? options.pendingAttachments.value,
       intent: composerIntent,
       ...(enqueueOptions?.confirmedPlainText ? { confirmedPlainText: true } : {}),
     }, owner)
@@ -1226,6 +1230,7 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
     const item = pendingQueue.value[index]
     if (
       !item
+      || item.retiredAnnotationInput
       || (item.hiddenControl && !allowHiddenControl)
       || item.deliveryState === 'steering'
       || item.steerAttempt?.phase === 'submitting'
@@ -1524,11 +1529,9 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
       || item.hiddenControl
       || item.deliveryState
       || item.steerAttempt
-      // Annotation IDs refer to durable drafts owned by the annotation store.
-      // This queue only has the IDs, not enough snapshot data to reconstruct
-      // those drafts in the composer. Never turn such a queued batch into a
-      // plain-text edit and silently drop its annotation context.
-      || item.promptAnnotationIds?.length
+      // The text editor cannot reconstruct a frozen page selection. Keep the
+      // complete queued context until it is sent or explicitly removed.
+      || item.pageContext
       || item.pendingPersistenceState === 'saving'
       || item.pendingPersistenceState === 'cancelling'
       || hasUneditablePendingAttachments(item)
@@ -1662,6 +1665,7 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
     clearPendingDrainAfterTerminalTimer()
     if (pendingQueue.value.length === 0) return
     const head = pendingQueue.value[0]
+    if (head?.retiredAnnotationInput) return
     const ownerSessionKey = head?.ownerSessionKey || options.sessionKey.value
     if (ownerSessionKey !== options.sessionKey.value) {
       if (head) head.deliveryState = 'retryable'

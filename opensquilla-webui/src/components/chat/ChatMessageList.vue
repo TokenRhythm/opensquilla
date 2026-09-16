@@ -57,6 +57,7 @@
           @edit="$emit('editMessage', $event)"
           @edit-attachment="$emit('editAttachment', $event)"
           @preview-attachment="$emit('previewAttachment', $event)"
+          @preview-image="$emit('previewImage', $event, messages[entry.index].attachments || [])"
           @reuse-prompt-annotation="$emit('reusePromptAnnotation', $event)"
           @toggle-share="$emit('toggleShareMessage', $event)"
         />
@@ -92,6 +93,7 @@
           :goal-outcome="goalOutcomeFor(messages[entry.index], entry.index)"
           :goal-elapsed="goalElapsed"
           :resolve-session-availability="resolveSessionAvailability"
+          :resolve-workspace-preview-resource="resolveWorkspacePreviewResource"
           @fork="$emit('forkConversation', forkThroughTurnId(entry.index))"
           @regenerate="$emit('regenerateMessage', $event)"
           @toggle-share="$emit('toggleShareMessage', $event)"
@@ -203,6 +205,7 @@ const props = defineProps<{
   goal?: GoalSnapshot | null
   goalElapsed?: string
   resolveSessionAvailability?: (sessionKey: string) => Promise<boolean>
+  resolveWorkspacePreviewResource?: (sessionKey: string, documentId: string) => Promise<WorkbenchResource | null>
   /** Required for long-history virtualization; omitted by legacy embedders. */
   scrollContainer?: HTMLElement | null
   /** Session/render epoch used to invalidate deferred scroll corrections. */
@@ -219,6 +222,7 @@ const emit = defineEmits<{
   editMessage: [message: ChatRenderedMessage]
   editAttachment: [attachment: import('@/types/chat').DisplayAttachment]
   previewAttachment: [attachment: import('@/types/chat').DisplayAttachment]
+  previewImage: [attachment: import('@/types/chat').DisplayAttachment, attachments: import('@/types/chat').DisplayAttachment[]]
   reusePromptAnnotation: [annotation: PromptAnnotationSnapshot]
   regenerateMessage: [
     message: ChatRenderedMessage,

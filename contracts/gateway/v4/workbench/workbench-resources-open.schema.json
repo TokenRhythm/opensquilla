@@ -242,6 +242,25 @@
         "reasonCode": {
           "type": "string",
           "minLength": 1
+        },
+        "pageContext": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "resourceId"
+          ],
+          "properties": {
+            "resourceId": {
+              "type": "string",
+              "pattern": "^document:.+",
+              "maxLength": 512
+            }
+          }
+        },
+        "workingFile": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Absolute path to the ordinary editable working file, in the Gateway filesystem."
         }
       }
     },

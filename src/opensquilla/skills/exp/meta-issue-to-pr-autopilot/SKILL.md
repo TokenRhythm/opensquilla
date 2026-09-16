@@ -1,5 +1,7 @@
 ---
 name: meta-issue-to-pr-autopilot
+visibility: experimental
+invocation: experimental_internal
 description: "[DEPRECATED] Issue-to-PR autopilot — opens a PR via `gh`, runs a sub-agent fix loop, and writes to git. Disabled pending the E5 bounded sub-agent contract + side-effect ledger (plan §3.1 A8 / §5.3 E4): no risk metadata enforcement, no per-step budget, no rollback path. Do not re-enable without `metadata.opensquilla.risk: high` + capabilities {vcs, filesystem-write, network-write, subprocess} and a saga-style compensation step."
 kind: meta
 meta_priority: 0

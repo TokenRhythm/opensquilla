@@ -2,7 +2,41 @@
 
 from __future__ import annotations
 
+WORKING_FILES_SCHEMA = """
+CREATE TABLE IF NOT EXISTS artifact_working_files (
+    document_id TEXT PRIMARY KEY REFERENCES artifact_documents(document_id) ON DELETE CASCADE,
+    workspace TEXT NOT NULL,
+    relative_root TEXT NOT NULL,
+    entrypoint TEXT NOT NULL,
+    base_revision_id TEXT NOT NULL REFERENCES artifact_revisions(revision_id)
+)
+"""
+
 SCHEMA_STATEMENTS: tuple[str, ...] = (
+    WORKING_FILES_SCHEMA,
+    """
+    CREATE TABLE IF NOT EXISTS artifact_working_sources (
+        document_id TEXT PRIMARY KEY REFERENCES artifact_working_files(document_id)
+            ON DELETE CASCADE,
+        session_key TEXT NOT NULL,
+        session_id TEXT NOT NULL,
+        workspace TEXT NOT NULL,
+        source_path TEXT NOT NULL,
+        bundle_mode TEXT NOT NULL CHECK(bundle_mode IN ('auto', 'none', 'directory')),
+        bundle_root TEXT,
+        UNIQUE(session_key, session_id, workspace, source_path)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS artifact_working_source_versions (
+        revision_id TEXT PRIMARY KEY REFERENCES artifact_revisions(revision_id) ON DELETE CASCADE,
+        document_id TEXT NOT NULL REFERENCES artifact_working_files(document_id) ON DELETE CASCADE,
+        relative_root TEXT NOT NULL,
+        entrypoint TEXT NOT NULL,
+        bundle_mode TEXT NOT NULL CHECK(bundle_mode IN ('auto', 'none', 'directory')),
+        bundle_root TEXT
+    )
+    """,
     """
     CREATE TABLE IF NOT EXISTS artifact_documents (
         document_id            TEXT PRIMARY KEY,

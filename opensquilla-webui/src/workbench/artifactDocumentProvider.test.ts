@@ -11,7 +11,6 @@ import {
   normalizeArtifactChangeSet,
   normalizeArtifactDocument,
   normalizeArtifactEditCapabilities,
-  normalizeArtifactEditSession,
   normalizeArtifactRevision,
 } from './artifactDocumentProvider'
 
@@ -29,6 +28,48 @@ const officeArtifact: ArtifactPayload = {
 }
 
 describe('artifact document provider', () => {
+  it('uses a restored head included outside the latest hundred revisions', async () => {
+    const revision = (generation: number) => ({
+      id: `revision-${generation}`, documentId: 'document-html', generation,
+      artifactId: `artifact-${generation}`, sha256: 'a'.repeat(64),
+      name: 'page.html', mime: 'text/html', size: generation,
+      source: generation === 1 ? 'initial' : 'agent',
+    })
+    const revisionList = [
+      ...Array.from({ length: 100 }, (_, index) => revision(150 - index)),
+      revision(1),
+    ]
+    const call = vi.fn(async (method: string) => {
+      if (method === ARTIFACT_DOCUMENT_RPC_METHODS.capabilities) {
+        return { formats: { html: { preview: true } } }
+      }
+      if (method === ARTIFACT_DOCUMENT_RPC_METHODS.documentsGet) {
+        return { document: { id: 'document-html', name: 'page.html', format: 'html',
+          headRevisionId: 'revision-1', generation: 150, stateRevision: 151 } }
+      }
+      if (method === ARTIFACT_DOCUMENT_RPC_METHODS.revisionsList) return { revisions: revisionList }
+      if (method === ARTIFACT_DOCUMENT_RPC_METHODS.changesList) return { changeSets: [] }
+      throw new Error(`Unexpected RPC: ${method}`)
+    })
+    const provider = createRpcArtifactDocumentProvider({
+      call: call as unknown as GenericRpcCall,
+      hasRpcMethod: () => true,
+      rememberUnsupportedMethod: vi.fn(),
+    })
+    const workspace = await provider.loadWorkspace({
+      id: 'artifact-150', documentId: 'document-html', name: 'page.html', mime: 'text/html',
+      download_url: '/api/v1/artifacts/artifact-150',
+    }, 'session-a')
+
+    expect(workspace.document.headRevisionId).toBe('revision-1')
+    expect(workspace.revisions).toHaveLength(101)
+    expect(workspace.revisions.filter(item => item.revisionId === 'revision-1')).toHaveLength(1)
+    expect(workspace.headArtifact).toMatchObject({
+      id: 'artifact-1', size: 1, documentId: 'document-html',
+      download_url: '/api/v1/artifact-documents/document-html',
+    })
+  })
+
   it('does not promote a preview-only format into selection or editing', () => {
     const capabilities = normalizeArtifactEditCapabilities({
       formats: {
@@ -393,70 +434,6 @@ describe('artifact document provider', () => {
     )
   })
 
-  it('preserves source CAS metadata returned by read and patch RPCs', async () => {
-    const call = vi.fn(async (method: string) => {
-      if (method === ARTIFACT_DOCUMENT_RPC_METHODS.sourceRead) {
-        return {
-          source: {
-            documentId: 'doc-html',
-            revisionId: 'rev-1',
-            language: 'html',
-            text: '<h1>Before</h1>',
-            sha256: 'a'.repeat(64),
-            offsetEncoding: 'unicode-code-point',
-            stateRevision: 3,
-          },
-        }
-      }
-      if (method === ARTIFACT_DOCUMENT_RPC_METHODS.sourcePatch) {
-        return {
-          source: {
-            documentId: 'doc-html',
-            revisionId: 'rev-2',
-            sha256: 'b'.repeat(64),
-            offsetEncoding: 'unicode-code-point',
-            patchCount: 1,
-            stateRevision: 4,
-          },
-        }
-      }
-      throw new Error(`Unexpected RPC: ${method}`)
-    })
-    const provider = createRpcArtifactDocumentProvider({
-      call: call as unknown as GenericRpcCall,
-      hasRpcMethod: () => true,
-      rememberUnsupportedMethod: vi.fn(),
-    })
-
-    const source = await provider.readSource({
-      sessionKey: 'session-a',
-      documentId: 'doc-html',
-    })
-    const patched = await provider.patchSource({
-      sessionKey: 'session-a',
-      documentId: 'doc-html',
-      expectedHeadRevisionId: 'rev-1',
-      expectedStateRevision: 3,
-      expectedSourceSha256: 'a'.repeat(64),
-      offsetEncoding: 'unicode-code-point',
-      patches: [{ startOffset: 4, endOffset: 10, replacement: 'After' }],
-    })
-
-    expect(source).toMatchObject({
-      revisionId: 'rev-1',
-      content: '<h1>Before</h1>',
-      sha256: 'a'.repeat(64),
-      patchCount: null,
-      offsetEncoding: 'unicode-code-point',
-    })
-    expect(patched).toMatchObject({
-      revisionId: 'rev-2',
-      sha256: 'b'.repeat(64),
-      patchCount: 1,
-      offsetEncoding: 'unicode-code-point',
-    })
-  })
-
   it('normalizes the product-only mutation resolution wire', async () => {
     const call = vi.fn(async (method: string) => {
       expect(method).toBe(ARTIFACT_DOCUMENT_RPC_METHODS.mutationResolve)
@@ -480,7 +457,7 @@ describe('artifact document provider', () => {
 
     await expect(provider.resolveMutation?.({
       sessionKey: 'session-a',
-      operation: 'source.patch',
+      operation: 'revision.restore',
       requestId: 'request-a',
       documentId: 'doc-html',
     })).resolves.toEqual({
@@ -493,132 +470,6 @@ describe('artifact document provider', () => {
         stateRevision: 4,
       },
     })
-  })
-
-  it('normalizes and advances explicit edit sessions while preserving legacy fallback', async () => {
-    let sessionStateRevision = 1
-    let lastSavedRevisionId = 'rev-1'
-    const editSessionPayload = (status = 'active') => ({
-      id: 'edit-session-1',
-      documentId: 'doc-html',
-      baseRevisionId: 'rev-1',
-      lastSavedRevisionId,
-      mode: 'edit',
-      status,
-      stateRevision: sessionStateRevision,
-      expiresAt: Date.now() + 60_000,
-    })
-    const call = vi.fn(async (method: string, params?: Record<string, unknown>) => {
-      if (method === ARTIFACT_DOCUMENT_RPC_METHODS.editSessionStart) {
-        return { editSession: editSessionPayload() }
-      }
-      if (method === ARTIFACT_DOCUMENT_RPC_METHODS.editSessionHeartbeat) {
-        expect(params).toMatchObject({
-          editSessionId: 'edit-session-1',
-          expectedStateRevision: 1,
-        })
-        sessionStateRevision = 2
-        return { editSession: editSessionPayload() }
-      }
-      if (method === ARTIFACT_DOCUMENT_RPC_METHODS.sourcePatch) {
-        expect(params).toMatchObject({
-          editSessionId: 'edit-session-1',
-          expectedEditSessionStateRevision: 2,
-          expectedLastSavedRevisionId: 'rev-1',
-        })
-        sessionStateRevision = 3
-        lastSavedRevisionId = 'rev-2'
-        return {
-          source: {
-            documentId: 'doc-html',
-            revisionId: 'rev-2',
-            sha256: 'b'.repeat(64),
-            stateRevision: 2,
-          },
-          editSession: editSessionPayload(),
-        }
-      }
-      if (method === ARTIFACT_DOCUMENT_RPC_METHODS.editSessionClose) {
-        expect(params).toMatchObject({
-          editSessionId: 'edit-session-1',
-          expectedStateRevision: 3,
-        })
-        sessionStateRevision = 4
-        return { editSession: editSessionPayload('closed') }
-      }
-      throw new Error(`Unexpected RPC: ${method}`)
-    })
-    const provider = createRpcArtifactDocumentProvider({
-      call: call as unknown as GenericRpcCall,
-      hasRpcMethod: () => true,
-      rememberUnsupportedMethod: vi.fn(),
-    })
-
-    const started = await provider.startEditSession?.({
-      sessionKey: 'session-a',
-      documentId: 'doc-html',
-      mode: 'edit',
-      clientRequestId: 'request-1',
-    })
-    expect(started).toMatchObject({
-      editSessionId: 'edit-session-1',
-      stateRevision: 1,
-      lastSavedRevisionId: 'rev-1',
-    })
-    const heartbeat = await provider.heartbeatEditSession?.({
-      sessionKey: 'session-a',
-      editSessionId: started!.editSessionId,
-      expectedStateRevision: started!.stateRevision,
-    })
-    const saved = await provider.patchSource({
-      sessionKey: 'session-a',
-      documentId: 'doc-html',
-      expectedHeadRevisionId: 'rev-1',
-      expectedSourceSha256: 'a'.repeat(64),
-      expectedStateRevision: 1,
-      offsetEncoding: 'unicode-code-point',
-      patches: [{ startOffset: 0, endOffset: 0, replacement: '<main />' }],
-      editSessionId: heartbeat!.editSessionId,
-      expectedEditSessionStateRevision: heartbeat!.stateRevision,
-      expectedLastSavedRevisionId: heartbeat!.lastSavedRevisionId,
-    })
-    const closed = await provider.closeEditSession?.({
-      sessionKey: 'session-a',
-      editSessionId: saved!.editSession!.editSessionId,
-      expectedStateRevision: saved!.editSession!.stateRevision,
-    })
-
-    expect(saved).toMatchObject({
-      revisionId: 'rev-2',
-      editSession: {
-        editSessionId: 'edit-session-1',
-        lastSavedRevisionId: 'rev-2',
-        stateRevision: 3,
-      },
-    })
-    expect(closed).toMatchObject({ status: 'closed', stateRevision: 4 })
-    expect(normalizeArtifactEditSession({
-      editSessionId: 'camel-id',
-      documentId: 'doc-html',
-      mode: 'edit',
-    })?.editSessionId).toBe('camel-id')
-
-    const rememberUnsupportedMethod = vi.fn()
-    const legacy = createRpcArtifactDocumentProvider({
-      call: vi.fn().mockRejectedValue(Object.assign(new Error('Method not found'), {
-        code: 'METHOD_NOT_FOUND',
-      })),
-      hasRpcMethod: () => true,
-      rememberUnsupportedMethod,
-    })
-    await expect(legacy.startEditSession?.({
-      sessionKey: 'session-a',
-      documentId: 'doc-html',
-      mode: 'edit',
-    })).resolves.toBeNull()
-    expect(rememberUnsupportedMethod).toHaveBeenCalledWith(
-      ARTIFACT_DOCUMENT_RPC_METHODS.editSessionStart,
-    )
   })
 
   it('uses artifacts.get as a compatibility fallback and keeps Office download-only', async () => {

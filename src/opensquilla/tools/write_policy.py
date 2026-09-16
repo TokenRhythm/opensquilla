@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import re
+from collections.abc import Callable
 from dataclasses import dataclass
 from fnmatch import fnmatchcase
 from pathlib import Path
@@ -381,7 +382,6 @@ def workspace_write_deny_block(
     command: str | None = None,
 ) -> dict[str, object]:
     guidance = _deny_retry_guidance()
-    guidance += _verify_mirror_guidance(match)
     payload: dict[str, object] = {
         "status": "blocked",
         "reason": "workspace_write_deny",
@@ -416,6 +416,32 @@ def gate_workspace_write_deny(
     raise error
 
 
+def attachment_workspace_write_authorizer(context: ToolContext) -> Callable[[Path], None]:
+    """Bind attachment writes to the turn that authorized their retention."""
+
+    def authorize_write(target: Path) -> None:
+        from opensquilla.tools.builtin import filesystem
+
+        token = current_tool_context.set(context)
+        try:
+            if not context.workspace_dir:
+                raise SafeToolError("Attachment workspace is unavailable")
+            workspace = Path(context.workspace_dir).expanduser().resolve()
+            filesystem._gate_workspace_lockdown_write("image", target, str(target))
+            block = filesystem._sandbox_path_access_envelope(target, write=True)
+            if block is None:
+                block = filesystem._cross_session_attachment_block("image", target, str(target))
+            if block is not None:
+                raise SafeToolError(
+                    str(block.get("message") or "Attachment workspace is not writable")
+                )
+            gate_workspace_write_deny("image", target, workspace=workspace)
+        finally:
+            current_tool_context.reset(token)
+
+    return authorize_write
+
+
 def _deny_retry_guidance(ctx: ToolContext | None = None) -> str:
     # Opt-in override for the remediation sentence appended to deny messages.
     # The scratch-dir guidance below tells the model to recreate the file in
@@ -436,51 +462,4 @@ def _scratch_retry_guidance(ctx: ToolContext | None = None) -> str:
     return (
         " Temporary reproduction, debug, verification, or candidate-patch files "
         f"must be written under the configured scratch directory instead: {scratch_dir}."
-    )
-
-
-def verify_mirror_path(
-    match_path: str, resolved_path: str, ctx: ToolContext | None = None
-) -> str | None:
-    """Writable mirror path for a deny-blocked workspace file, or None.
-
-    Mirrors live under ``<scratch_dir>/verify-mirror/<workspace-relative-path>``
-    so a denied in-package test edit can still be exercised in scratch. Only
-    resolvable when a scratch directory and a workspace root are both
-    configured and the target sits inside the workspace.
-    """
-
-    active = ctx if ctx is not None else current_tool_context.get()
-    scratch_dir = getattr(active, "scratch_dir", None) if active is not None else None
-    if not scratch_dir:
-        return None
-    workspace = _workspace_root(active)
-    if workspace is None:
-        return None
-    try:
-        relative = (
-            Path(resolved_path).expanduser().resolve(strict=False).relative_to(workspace)
-        ).as_posix()
-    except ValueError:
-        return None
-    if not relative:
-        return None
-    scratch = Path(scratch_dir).expanduser().resolve(strict=False)
-    return (scratch / "verify-mirror" / relative).as_posix()
-
-
-def _verify_mirror_guidance(
-    match: WorkspaceWriteDenyMatch, ctx: ToolContext | None = None
-) -> str:
-    active = ctx if ctx is not None else current_tool_context.get()
-    if active is None or not getattr(active, "scratch_verify_mirror_active", False):
-        return ""
-    mirror = verify_mirror_path(match.path, match.resolved_path, active)
-    if not mirror:
-        return ""
-    return (
-        f" To exercise this file's checks without modifying it, copy it to the "
-        f"writable mirror {mirror} first, keep the mirror copy identical to the "
-        "workspace original, and add any new checks as separate files under the "
-        "same verify-mirror directory."
     )

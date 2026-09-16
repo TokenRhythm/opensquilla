@@ -9,28 +9,27 @@ from opensquilla.application.observability import (
     _COLLECTION_INSPECT_COMMANDS as _APPLICATION_COLLECTION_INSPECT_COMMANDS,
 )
 from opensquilla.application.observability import (
+    ReadinessDataPort,
     ReadinessDiagnostics,
+    ReadinessFinding,
     ReadinessQuery,
 )
+from opensquilla.application.provider_configuration import ProviderStatus
 from opensquilla.gateway.adapters.observability import (
-    GatewayReadinessDataPort,
-    GatewayReadinessEvaluationPort,
+    GatewayReadinessReportPort,
+    evaluate_readiness_surface,
 )
 from opensquilla.gateway.adapters.observability_contract import (
     register_observability_contract,
 )
+from opensquilla.gateway.adapters.provider_configuration import GatewayProviderStatusPort
+from opensquilla.gateway.channel_status_runtime import read_channel_status
 from opensquilla.gateway.config import GatewayConfig
 from opensquilla.gateway.guest_rpc_policy import is_guest_rpc_method_allowed
+from opensquilla.gateway.log_status_runtime import read_log_status
+from opensquilla.gateway.memory_status_runtime import read_memory_status
 from opensquilla.gateway.rpc import RpcContext, RpcHandlerError, get_dispatcher
-from opensquilla.gateway.rpc_channels import read_channel_status as _handle_channels_status
-from opensquilla.gateway.rpc_logs import read_log_status as _build_logs_status
-from opensquilla.gateway.rpc_system import read_memory_status as _handle_doctor_memory_status
-from opensquilla.gateway.rpc_tools import (
-    read_provider_status as _handle_providers_status,
-)
-from opensquilla.gateway.rpc_tools import (
-    read_search_status as _handle_search_status,
-)
+from opensquilla.gateway.search_status_runtime import read_search_status
 from opensquilla.sandbox.status import status_payload as _sandbox_status_payload
 
 _d = get_dispatcher()
@@ -44,6 +43,13 @@ _UNKNOWN_SEARCH_PROVIDER_RE = re.compile(
     r"|unknown search provider: ['\"]([^'\"]+)['\"]",
     re.IGNORECASE,
 )
+
+
+def _build_logs_status(ctx: RpcContext) -> dict[str, Any]:
+    return read_log_status(
+        config=getattr(ctx, "config", None),
+        diagnostics_state=getattr(ctx, "diagnostics_state", None),
+    )
 
 
 def _config_path(ctx: RpcContext) -> str | None:
@@ -76,9 +82,13 @@ def _search_api_key_env(ctx: RpcContext, payload: dict[str, Any]) -> str:
         return ""
 
 
-async def _search_payload(ctx: RpcContext) -> dict[str, Any]:
+async def _search_payload(
+    params: dict[str, Any] | None,
+    ctx: RpcContext,
+) -> dict[str, Any]:
+    del params
     try:
-        payload = cast(dict[str, Any], await _handle_search_status({}, ctx))
+        payload = cast(dict[str, Any], await _search_runtime_payload({}, ctx))
         payload.setdefault("apiKeyEnv", _search_api_key_env(ctx, payload))
         return payload
     except (KeyError, ValueError) as exc:
@@ -95,6 +105,72 @@ async def _search_payload(ctx: RpcContext) -> dict[str, Any]:
             "buildable": False,
             "error": str(exc),
         }
+
+
+async def _search_runtime_payload(
+    params: dict[str, Any] | None,
+    ctx: RpcContext,
+) -> dict[str, Any]:
+    del ctx
+    provider = (params or {}).get("provider")
+    return read_search_status(str(provider) if provider else None)
+
+
+async def _provider_payload(
+    params: dict[str, Any] | None,
+    ctx: RpcContext,
+) -> dict[str, Any]:
+    query = params or {}
+    return cast(
+        dict[str, Any],
+        await ProviderStatus(
+            GatewayProviderStatusPort(
+                config=ctx.config,
+                provider_selector=ctx.provider_selector,
+                provider_stats=ctx.provider_stats,
+            )
+        ).read(
+            provider_id=query.get("provider"),
+            probe_models=bool(query.get("probeModels", False)),
+        ),
+    )
+
+
+async def _readiness_provider(
+    query: ReadinessQuery,
+    ctx: RpcContext,
+) -> dict[str, Any]:
+    """Collect the provider projection from one typed readiness query."""
+
+    return await _provider_payload({"probeModels": query.probe_providers}, ctx)
+
+
+async def _readiness_memory(
+    query: ReadinessQuery,
+    ctx: RpcContext,
+) -> dict[str, Any]:
+    """Collect memory health from explicit runtime dependencies."""
+
+    return await read_memory_status(
+        {"agentId": query.agent_id, "deep": query.deep},
+        memory_backend=getattr(ctx, "memory_backend", None),
+        memory_managers=getattr(ctx, "memory_managers", None),
+        session_manager=getattr(ctx, "session_manager", None),
+    )
+
+
+async def _channel_payload(
+    params: dict[str, Any] | None,
+    ctx: RpcContext,
+) -> dict[str, Any]:
+    del params
+    from opensquilla.gateway.boot import _boot_id
+
+    return await read_channel_status(
+        config=getattr(ctx, "config", None),
+        channel_manager=getattr(ctx, "channel_manager", None),
+        boot_id=_boot_id,
+    )
 
 
 def _sandbox_payload(ctx: RpcContext) -> dict[str, Any]:
@@ -266,9 +342,7 @@ def _router_payload(ctx: RpcContext, *, deep: bool = False) -> dict[str, Any]:
         "error": error,
         "activeProvider": active_provider,
         "crossProviderTiers": bool(getattr(router, "cross_provider_tiers", False)),
-        "tierProviderMismatch": str(
-            getattr(router, "tier_provider_mismatch", "route") or "route"
-        ),
+        "tierProviderMismatch": str(getattr(router, "tier_provider_mismatch", "route") or "route"),
         "mismatchedTierProviders": mismatched_tier_providers,
         "routerProviderRoles": provider_roles,
     }
@@ -335,27 +409,21 @@ def _llm_ensemble_payload(ctx: RpcContext) -> dict[str, Any]:
             decorated["apiKeyEnv"] = str(
                 get_provider_spec(static_profile.provider_id).env_key or ""
             )
-            decorated["credentialAvailable"] = bool(
-                decorated["configurationReady"]
-            )
+            decorated["credentialAvailable"] = bool(decorated["configurationReady"])
         elif decorated["enabled"] and decorated["selectionMode"] == CUSTOM_B5_SELECTION_MODE:
             decorated["lineupReady"] = bool(decorated["configurationReady"])
-            decorated["lineupBlockedReason"] = str(
-                decorated["blockedReason"] or ""
-            )
+            decorated["lineupBlockedReason"] = str(decorated["blockedReason"] or "")
         return decorated
 
     payload = decorate(ensemble_runtime_status(config))
     configured_policy = str(
-        getattr(config.llm_ensemble, "all_failed_policy", "fallback_single")
-        or "fallback_single"
+        getattr(config.llm_ensemble, "all_failed_policy", "fallback_single") or "fallback_single"
     ).strip()
     payload.setdefault("configuredAllFailedPolicy", configured_policy)
     payload.setdefault("effectiveAllFailedPolicy", configured_policy)
     payload.setdefault("policyDeprecated", False)
     payload["tierEnsembleStatuses"] = {
-        tier: decorate(runtime)
-        for tier, runtime in tier_ensemble_runtime_statuses(config).items()
+        tier: decorate(runtime) for tier, runtime in tier_ensemble_runtime_statuses(config).items()
     }
     return payload
 
@@ -401,37 +469,78 @@ def _memory_embedding_payload(ctx: RpcContext) -> dict[str, Any]:
     }
 
 
-async def _doctor_status_contract(
-    params: dict | None, ctx: RpcContext
-) -> dict[str, Any]:
+async def _doctor_status_contract(params: dict | None, ctx: RpcContext) -> dict[str, Any]:
     if params is not None and not isinstance(params, dict):
         raise ValueError("params must be an object")
     params = params or {}
-    port = GatewayReadinessDataPort(
-        ctx,
-        provider=_handle_providers_status,
-        logs=lambda _params, context: _build_logs_status(context),
-        memory=_handle_doctor_memory_status,
-        channels=_handle_channels_status,
-        sandbox=lambda _params, context: _sandbox_payload(context),
-        router=lambda query, context: _router_payload(
-            context, deep=bool((query or {}).get("deep", True))
+    port = _GatewayReadinessRuntime(ctx)
+    return cast(
+        dict[str, Any],
+        await ReadinessDiagnostics(port, GatewayReadinessReportPort()).assess(
+            ReadinessQuery(
+                agent_id=str(params.get("agentId") or "main"),
+                deep=bool(params.get("deep", True)),
+                probe_providers=bool(params.get("probeProviders", False)),
+            ),
+            connection_id=ctx.conn_id,
+            config_path=_config_path(ctx),
         ),
-        squilla_router=lambda _params, context: _squilla_router_runtime_payload(context),
-        memory_embedding=lambda _params, context: _memory_embedding_payload(context),
-        search=lambda _params, context: _search_payload(context),
-        image_generation=lambda _params, context: _image_generation_payload(context),
-        llm_ensemble=lambda _params, context: _llm_ensemble_payload(context),
     )
-    return await ReadinessDiagnostics(port, GatewayReadinessEvaluationPort()).assess(
-        ReadinessQuery(
-            agent_id=str(params.get("agentId") or "main"),
-            deep=bool(params.get("deep", True)),
-            probe_providers=bool(params.get("probeProviders", False)),
-        ),
-        connection_id=ctx.conn_id,
-        config_path=_config_path(ctx),
-    )
+
+
+class _GatewayReadinessRuntime(ReadinessDataPort):
+    """Compose doctor data from domain projections, never other RPC handlers."""
+
+    def __init__(self, ctx: RpcContext) -> None:
+        self._ctx = ctx
+
+    @staticmethod
+    def _findings(
+        surface: str,
+        payload: dict[str, Any],
+    ) -> tuple[ReadinessFinding, ...]:
+        return evaluate_readiness_surface(surface, payload)
+
+    async def provider(self, query: ReadinessQuery) -> tuple[ReadinessFinding, ...]:
+        return self._findings("provider", await _readiness_provider(query, self._ctx))
+
+    async def logs(self, query: ReadinessQuery) -> tuple[ReadinessFinding, ...]:
+        del query
+        return self._findings("logs", _build_logs_status(self._ctx))
+
+    async def memory(self, query: ReadinessQuery) -> tuple[ReadinessFinding, ...]:
+        return self._findings("memory", await _readiness_memory(query, self._ctx))
+
+    async def channels(self, query: ReadinessQuery) -> tuple[ReadinessFinding, ...]:
+        del query
+        return self._findings("channels", await _channel_payload(None, self._ctx))
+
+    async def sandbox(self, query: ReadinessQuery) -> tuple[ReadinessFinding, ...]:
+        del query
+        return self._findings("sandbox", _sandbox_payload(self._ctx))
+
+    async def router(self, query: ReadinessQuery) -> tuple[ReadinessFinding, ...]:
+        return self._findings("router", _router_payload(self._ctx, deep=bool(query.deep)))
+
+    async def squilla_router(self, query: ReadinessQuery) -> tuple[ReadinessFinding, ...]:
+        del query
+        return self._findings("squilla_router", _squilla_router_runtime_payload(self._ctx))
+
+    async def memory_embedding(self, query: ReadinessQuery) -> tuple[ReadinessFinding, ...]:
+        del query
+        return self._findings("memory_embedding", _memory_embedding_payload(self._ctx))
+
+    async def search(self, query: ReadinessQuery) -> tuple[ReadinessFinding, ...]:
+        del query
+        return self._findings("search", await _search_payload(None, self._ctx))
+
+    async def image_generation(self, query: ReadinessQuery) -> tuple[ReadinessFinding, ...]:
+        del query
+        return self._findings("image_generation", _image_generation_payload(self._ctx))
+
+    async def llm_ensemble(self, query: ReadinessQuery) -> tuple[ReadinessFinding, ...]:
+        del query
+        return self._findings("llm_ensemble", _llm_ensemble_payload(self._ctx))
 
 
 _handle_doctor_status = register_observability_contract(

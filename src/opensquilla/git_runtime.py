@@ -22,6 +22,7 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
+from opensquilla.asyncio_utils import reset_contextvar_token
 from opensquilla.run_mode import RunMode, normalize_run_mode
 from opensquilla.subprocess_encoding import decode_subprocess_output
 
@@ -110,7 +111,7 @@ def git_run_mode_scope(run_mode: RunMode | str | None):
     try:
         yield
     finally:
-        _ACTIVE_GIT_RUN_MODE.reset(token)
+        reset_contextvar_token(_ACTIVE_GIT_RUN_MODE, token)
 
 
 def _environment_value(environment: Mapping[str, str], name: str) -> str:

@@ -18,8 +18,6 @@ from opensquilla.application.artifact_workbench import (
     ChangeListQuery,
     ChangeRevert,
     DocumentCapabilitiesQuery,
-    DocumentEditSession,
-    DocumentEditSessionPort,
     DocumentIdentity,
     DocumentImport,
     DocumentOpen,
@@ -31,18 +29,12 @@ from opensquilla.application.artifact_workbench import (
     DocumentTransferPort,
     DocumentWorkspace,
     DocumentWorkspacePort,
-    EditSessionMutation,
-    EditSessionStart,
     MutationOutcomeApplication,
     MutationOutcomePort,
     MutationResolution,
     PromptAnnotationApplication,
-    PromptAnnotationCreate,
-    PromptAnnotationIdentity,
-    PromptAnnotationMutation,
     PromptAnnotationPort,
     PromptAnnotationQuery,
-    PromptAnnotationSelection,
     ResourcePreviewApplication,
     ResourcePreviewPort,
     RevisionHistory,
@@ -50,8 +42,6 @@ from opensquilla.application.artifact_workbench import (
     RevisionListQuery,
     RevisionRestore,
     SessionDocumentsQuery,
-    SourceEdit,
-    SourcePatch,
     SourceRead,
     WorkbenchPreviewCreate,
     WorkbenchResourceApplication,
@@ -67,114 +57,7 @@ from opensquilla.gateway.adapters.artifact_workbench_contract import (
 from opensquilla.gateway.rpc import RpcContext
 
 WorkbenchHandler = Callable[[dict[str, Any] | None, RpcContext], Awaitable[dict[str, Any]]]
-
-
-class _CallbackPort:
-    """Keep RpcContext in the Adapter while preserving the proven implementation."""
-
-    def __init__(
-        self,
-        implementation: WorkbenchHandler,
-        params: dict[str, Any] | None,
-        ctx: RpcContext,
-    ) -> None:
-        self._implementation = implementation
-        self._params = params
-        self._ctx = ctx
-
-    async def _call(self, request: object) -> Mapping[str, Any]:
-        del request
-        return await self._implementation(self._params, self._ctx)
-
-    async def list_artifacts(self, value: ArtifactCatalogQuery) -> Mapping[str, Any]:
-        return await self._call(value)
-
-    async def get_artifact(self, value: ArtifactIdentity) -> Mapping[str, Any]:
-        return await self._call(value)
-
-    async def capabilities(self, value: DocumentCapabilitiesQuery) -> Mapping[str, Any]:
-        return await self._call(value)
-
-    async def open_document(self, value: DocumentOpen) -> Mapping[str, Any]:
-        return await self._call(value)
-
-    async def list_documents(self, value: SessionDocumentsQuery) -> Mapping[str, Any]:
-        return await self._call(value)
-
-    async def get_document(self, value: DocumentIdentity) -> Mapping[str, Any]:
-        return await self._call(value)
-
-    async def rename_document(self, value: DocumentRename) -> Mapping[str, Any]:
-        return await self._call(value)
-
-    async def close_document(self, value: DocumentIdentity) -> Mapping[str, Any]:
-        return await self._call(value)
-
-    async def list_revisions(self, value: RevisionListQuery) -> Mapping[str, Any]:
-        return await self._call(value)
-
-    async def restore_revision(self, value: RevisionRestore) -> Mapping[str, Any]:
-        return await self._call(value)
-
-    async def list_changes(self, value: ChangeListQuery) -> Mapping[str, Any]:
-        return await self._call(value)
-
-    async def get_change(self, value: ChangeIdentity) -> Mapping[str, Any]:
-        return await self._call(value)
-
-    async def revert_change(self, value: ChangeRevert) -> Mapping[str, Any]:
-        return await self._call(value)
-
-    async def start_edit_session(self, value: EditSessionStart) -> Mapping[str, Any]:
-        return await self._call(value)
-
-    async def heartbeat_edit_session(self, value: EditSessionMutation) -> Mapping[str, Any]:
-        return await self._call(value)
-
-    async def close_edit_session(self, value: EditSessionMutation) -> Mapping[str, Any]:
-        return await self._call(value)
-
-    async def read_source(self, value: SourceRead) -> Mapping[str, Any]:
-        return await self._call(value)
-
-    async def patch_source(self, value: SourcePatch) -> Mapping[str, Any]:
-        return await self._call(value)
-
-    async def list_annotations(self, value: PromptAnnotationQuery) -> Mapping[str, Any]:
-        return await self._call(value)
-
-    async def create_annotation(self, value: PromptAnnotationCreate) -> Mapping[str, Any]:
-        return await self._call(value)
-
-    async def focus_annotation(self, value: PromptAnnotationIdentity) -> Mapping[str, Any]:
-        return await self._call(value)
-
-    async def update_annotation(self, value: PromptAnnotationMutation) -> Mapping[str, Any]:
-        return await self._call(value)
-
-    async def discard_annotation(self, value: PromptAnnotationMutation) -> Mapping[str, Any]:
-        return await self._call(value)
-
-    async def list_resources(self, value: WorkbenchResourceListQuery) -> Mapping[str, Any]:
-        return await self._call(value)
-
-    async def get_resource(self, value: WorkbenchResourceQuery) -> Mapping[str, Any]:
-        return await self._call(value)
-
-    async def open_resource(self, value: WorkbenchResourceOpen) -> Mapping[str, Any]:
-        return await self._call(value)
-
-    async def create_preview(self, value: WorkbenchPreviewCreate) -> Mapping[str, Any]:
-        return await self._call(value)
-
-    async def import_document(self, value: DocumentImport) -> Mapping[str, Any]:
-        return await self._call(value)
-
-    async def publish_document(self, value: DocumentPublish) -> Mapping[str, Any]:
-        return await self._call(value)
-
-    async def resolve_mutation(self, value: MutationResolution) -> Mapping[str, Any]:
-        return await self._call(value)
+WorkbenchPortFactory = Callable[[RpcContext], object]
 
 
 class GatewayArtifactWorkbenchAdapter:
@@ -182,26 +65,26 @@ class GatewayArtifactWorkbenchAdapter:
 
     def __init__(
         self,
-        ctx: RpcContext,
-        implementation: WorkbenchHandler,
+        port: object,
         params: dict[str, Any] | None,
     ) -> None:
-        self._port = _CallbackPort(implementation, params, ctx)
+        self._port = port
         self._params = params if isinstance(params, dict) else {}
 
     @classmethod
-    def bind(cls, method: str, implementation: WorkbenchHandler) -> WorkbenchHandler:
+    def bind(cls, method: str, port_factory: WorkbenchPortFactory) -> WorkbenchHandler:
         if method not in ARTIFACT_WORKBENCH_CONTRACT_METHODS:
             raise ValueError(f"unsupported Artifact Workbench method: {method}")
 
         async def handle(params: dict[str, Any] | None, ctx: RpcContext) -> dict[str, Any]:
-            return await cls(ctx, implementation, params).dispatch(method)
+            return await cls(port_factory(ctx), params).dispatch(method)
 
         return handle
 
     async def dispatch(self, method: str) -> dict[str, Any]:
         p = self._params
         port = self._port
+        result: Mapping[str, object]
         if method == "artifacts.list":
             result = await ArtifactCatalog(cast(ArtifactCatalogPort, port)).list(
                 ArtifactCatalogQuery(
@@ -215,10 +98,8 @@ class GatewayArtifactWorkbenchAdapter:
                 ArtifactIdentity(self._text("sessionKey"), self._text("artifactId"))
             )
         elif method == "artifacts.edit.capabilities":
-            session_key = self._optional_text("sessionKey")
             document_id = self._optional_text("documentId")
-            if session_key is None or document_id is None:
-                session_key = document_id = None
+            session_key = self._text("sessionKey") if document_id is not None else None
             result = await DocumentWorkspace(cast(DocumentWorkspacePort, port)).capabilities(
                 DocumentCapabilitiesQuery(session_key, document_id)
             )
@@ -228,7 +109,7 @@ class GatewayArtifactWorkbenchAdapter:
             )
         elif method == "artifacts.documents.list":
             result = await DocumentWorkspace(cast(DocumentWorkspacePort, port)).list(
-                SessionDocumentsQuery(self._text("sessionKey"), self._limit("limit", 100))
+                SessionDocumentsQuery(self._text("sessionKey"), self._strict_limit("limit"))
             )
         elif method == "artifacts.documents.get":
             result = await DocumentWorkspace(cast(DocumentWorkspacePort, port)).get(
@@ -247,35 +128,12 @@ class GatewayArtifactWorkbenchAdapter:
             result = await DocumentWorkspace(cast(DocumentWorkspacePort, port)).close(
                 self._document_identity()
             )
-        elif method == "documents.editSessions.start":
-            result = await DocumentEditSession(cast(DocumentEditSessionPort, port)).start(
-                EditSessionStart(
-                    self._text("sessionKey"),
-                    self._text("documentId"),
-                    self._optional_text("clientRequestId"),
-                )
-            )
-        elif method in {
-            "documents.editSessions.heartbeat",
-            "documents.editSessions.close",
-        }:
-            command = EditSessionMutation(
-                self._text("sessionKey"),
-                self._text("editSessionId"),
-                self._positive("expectedStateRevision"),
-            )
-            application = DocumentEditSession(cast(DocumentEditSessionPort, port))
-            result = (
-                await application.heartbeat(command)
-                if method.endswith("heartbeat")
-                else await application.close(command)
-            )
         elif method == "artifacts.revisions.list":
             result = await RevisionHistory(cast(RevisionHistoryPort, port)).list(
                 RevisionListQuery(
                     self._text("sessionKey"),
                     self._text("documentId"),
-                    self._limit("limit", 100),
+                    self._strict_limit("limit"),
                 )
             )
         elif method == "artifacts.revisions.restore":
@@ -294,7 +152,7 @@ class GatewayArtifactWorkbenchAdapter:
                 ChangeListQuery(
                     self._text("sessionKey"),
                     self._text("documentId"),
-                    self._limit("limit", 100),
+                    self._strict_limit("limit"),
                 )
             )
         elif method == "artifacts.changes.get":
@@ -322,49 +180,8 @@ class GatewayArtifactWorkbenchAdapter:
                     self._text("sessionKey"),
                     self._optional_text("documentId"),
                     self._optional_text("status") or "draft",
-                    self._limit("limit", 500, maximum=500),
+                    self._strict_limit("limit", default=500),
                 )
-            )
-        elif method == "artifacts.prompt_annotations.create":
-            selection = self._mapping("selection")
-            raw_body = p.get("body")
-            if raw_body is not None and not isinstance(raw_body, str):
-                raise ValueError("body must be a string")
-            result = await PromptAnnotationApplication(cast(PromptAnnotationPort, port)).create(
-                PromptAnnotationCreate(
-                    self._text("sessionKey"),
-                    self._text("annotationId"),
-                    self._text("documentId"),
-                    PromptAnnotationSelection(
-                        self._mapping_text(selection, "selectionId"),
-                        self._mapping_text(selection, "tagName"),
-                        self._mapping_text(selection, "elementPath"),
-                        self._mapping_text(selection, "elementProofSha256"),
-                        self._mapping_optional_text(selection, "domSha256"),
-                    ),
-                    self._optional_text("revisionId"),
-                    cast(str | None, raw_body),
-                )
-            )
-        elif method == "artifacts.prompt_annotations.focus":
-            result = await PromptAnnotationApplication(cast(PromptAnnotationPort, port)).focus(
-                PromptAnnotationIdentity(self._text("sessionKey"), self._text("annotationId"))
-            )
-        elif method in {
-            "artifacts.prompt_annotations.update",
-            "artifacts.prompt_annotations.discard",
-        }:
-            annotation_command = PromptAnnotationMutation(
-                self._text("sessionKey"),
-                self._text("annotationId"),
-                self._positive("expectedStateRevision"),
-                self._optional_text("body"),
-            )
-            annotation_application = PromptAnnotationApplication(cast(PromptAnnotationPort, port))
-            result = (
-                await annotation_application.update(annotation_command)
-                if method.endswith("update")
-                else await annotation_application.discard(annotation_command)
             )
         elif method == "artifacts.source.read":
             result = await DocumentSource(cast(DocumentSourcePort, port)).read(
@@ -374,45 +191,22 @@ class GatewayArtifactWorkbenchAdapter:
                     self._optional_text("revisionId"),
                 )
             )
-        elif method == "artifacts.source.patch":
-            raw_edits = p.get("patches")
-            if not isinstance(raw_edits, list):
-                raise ValueError("patches must be a list")
-            edits = tuple(
-                SourceEdit(
-                    self._mapping_int(self._as_mapping(item, "patch"), "startOffset"),
-                    self._mapping_int(self._as_mapping(item, "patch"), "endOffset"),
-                    self._mapping_text(self._as_mapping(item, "patch"), "replacement", strip=False),
-                )
-                for item in raw_edits
-            )
-            result = await DocumentSource(cast(DocumentSourcePort, port)).patch(
-                SourcePatch(
-                    self._text("sessionKey"),
-                    self._text("documentId"),
-                    self._text("expectedHeadRevisionId"),
-                    self._text("expectedSourceSha256"),
-                    self._positive("expectedStateRevision"),
-                    edits,
-                    self._manual_request_id(),
-                    self._optional_text("offsetEncoding") or "unicode-code-point",
-                    self._optional_text("editSessionId"),
-                    self._optional_positive("expectedEditSessionStateRevision"),
-                    self._optional_text("expectedLastSavedRevisionId"),
-                )
-            )
         elif method == "workbench.resources.list":
             raw_types = p.get("types")
-            resource_types = (
-                tuple(item for item in raw_types if isinstance(item, str))
-                if isinstance(raw_types, list)
-                else ("document", "attachment", "deliverable", "url")
-            )
+            resource_types: tuple[str, ...]
+            if raw_types is None:
+                resource_types = ("document", "attachment", "deliverable", "url")
+            elif not isinstance(raw_types, list) or not raw_types:
+                raise ValueError("types must be a non-empty array")
+            elif any(not isinstance(item, str) for item in raw_types):
+                raise ValueError("types contains an unsupported resource type")
+            else:
+                resource_types = tuple(cast(list[str], raw_types))
             result = await WorkbenchResourceApplication(cast(WorkbenchResourcePort, port)).list(
                 WorkbenchResourceListQuery(
                     self._text("sessionKey"),
                     resource_types,
-                    self._limit("limit", 100, maximum=500),
+                    self._strict_limit("limit", null_is_default=False),
                     self._optional_text("cursor"),
                 )
             )
@@ -425,7 +219,7 @@ class GatewayArtifactWorkbenchAdapter:
                 WorkbenchResourceOpen(
                     self._text("sessionKey"),
                     self._resource_ref(),
-                    self._optional_request_id(),
+                    self._optional_idempotency_key(),
                     self._optional_text("expectedSha256"),
                     self._optional_text("intent") or "edit-current",
                 )
@@ -445,11 +239,11 @@ class GatewayArtifactWorkbenchAdapter:
                 DocumentImport(
                     self._text("sessionKey"),
                     self._resource_ref("source"),
-                    self._request_id(),
+                    self._idempotency_key(),
                     self._optional_text("expectedSha256"),
                     self._optional_text("clientRequestId"),
                     self._optional_text("name"),
-                    self._optional_text("mode") or "copy",
+                    self._text("mode").lower(),
                 )
             )
         elif method == "documents.publish":
@@ -460,7 +254,7 @@ class GatewayArtifactWorkbenchAdapter:
                     self._text("sessionKey"),
                     self._text("documentId"),
                     self._text("revisionId"),
-                    self._request_id(),
+                    self._idempotency_key(),
                     self._optional_text("clientRequestId"),
                     self._optional_text("name"),
                 )
@@ -483,19 +277,26 @@ class GatewayArtifactWorkbenchAdapter:
 
     def _resource_ref(self, field: str | None = None) -> WorkbenchResourceRef:
         if field is None:
-            value = self._params.get("resourceRef", self._params.get("resource"))
+            value = self._params.get("resourceRef")
+            if not isinstance(value, Mapping):
+                value = self._params.get("resource")
         else:
             value = self._params.get(field)
         raw = self._as_mapping(value, field or "resourceRef")
-        resource_type = self._mapping_text(raw, "type")
+        resource_type = self._mapping_text(raw, "type").lower()
         id_field = {
             "attachment": "attachmentId",
             "document": "documentId",
             "deliverable": "artifactId",
             "url": "urlId",
         }.get(resource_type)
-        resource_id = self._mapping_optional_text(raw, id_field or "id")
-        resource_id = resource_id or self._mapping_text(raw, "id")
+        canonical_id = self._mapping_optional_text(raw, id_field or "id")
+        legacy_id = self._mapping_optional_text(raw, "id")
+        if canonical_id is not None and legacy_id is not None and canonical_id != legacy_id:
+            raise ValueError(f"{field or 'resourceRef'} identity aliases must match")
+        resource_id = canonical_id or legacy_id
+        if resource_id is None:
+            raise ValueError(f"{field or 'resourceRef'} identity is required")
         return WorkbenchResourceRef(resource_type, resource_id)
 
     def _request_id(self) -> str:
@@ -507,6 +308,8 @@ class GatewayArtifactWorkbenchAdapter:
     def _manual_request_id(self) -> str:
         request_id = self._optional_text("clientRequestId")
         if request_id is not None:
+            if len(request_id) > 256:
+                raise ValueError("clientRequestId is too long")
             return request_id
         canonical = json.dumps(
             self._params,
@@ -517,14 +320,34 @@ class GatewayArtifactWorkbenchAdapter:
         return f"legacy-{hashlib.sha256(canonical).hexdigest()}"
 
     def _optional_request_id(self) -> str | None:
-        return next(
-            (
-                value
-                for name in ("idempotencyKey", "clientRequestId", "requestId")
-                if (value := self._optional_text(name)) is not None
-            ),
-            None,
+        supplied = tuple(
+            value
+            for name in ("idempotencyKey", "clientRequestId", "requestId")
+            if (value := self._optional_text(name)) is not None
         )
+        if len(set(supplied)) > 1:
+            raise ValueError("request identity aliases must match")
+        if supplied and len(supplied[0].encode("utf-8")) > 256:
+            raise ValueError("request identity is too long")
+        return supplied[0] if supplied else None
+
+    def _idempotency_key(self) -> str:
+        value = self._optional_idempotency_key()
+        if value is None:
+            raise ValueError("idempotencyKey or clientRequestId is required")
+        return value
+
+    def _optional_idempotency_key(self) -> str | None:
+        supplied = tuple(
+            value
+            for name in ("idempotencyKey", "clientRequestId")
+            if (value := self._optional_text(name)) is not None
+        )
+        if len(set(supplied)) > 1:
+            raise ValueError("idempotencyKey and clientRequestId must match")
+        if supplied and len(supplied[0].encode("utf-8")) > 256:
+            raise ValueError("idempotency key is too long")
+        return supplied[0] if supplied else None
 
     def _text(self, name: str) -> str:
         return self._mapping_text(self._params, name)
@@ -532,8 +355,7 @@ class GatewayArtifactWorkbenchAdapter:
     def _optional_text(self, name: str) -> str | None:
         return self._mapping_optional_text(self._params, name)
 
-    def _mapping(self, name: str) -> Mapping[str, Any]:
-        return self._as_mapping(self._params.get(name), name)
+
 
     @staticmethod
     def _as_mapping(value: object, name: str) -> Mapping[str, Any]:
@@ -554,6 +376,7 @@ class GatewayArtifactWorkbenchAdapter:
             return None
         return cls._mapping_text(values, name)
 
+
     @staticmethod
     def _mapping_int(values: Mapping[str, Any], name: str) -> int:
         value = values.get(name)
@@ -567,16 +390,35 @@ class GatewayArtifactWorkbenchAdapter:
             raise ValueError(f"{name} must be positive")
         return value
 
-    def _optional_positive(self, name: str) -> int | None:
-        if name not in self._params or self._params[name] is None:
-            return None
-        return self._positive(name)
 
     def _limit(self, name: str, default: int, *, maximum: int | None = None) -> int:
         value = self._params.get(name)
-        if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        if isinstance(value, bool):
             return default
-        return min(value, maximum) if maximum is not None else value
+        try:
+            parsed = int(cast(Any, value))
+        except (TypeError, ValueError):
+            return default
+        if parsed < 1:
+            return default
+        return min(parsed, maximum) if maximum is not None else parsed
+
+    def _strict_limit(
+        self,
+        name: str,
+        default: int = 100,
+        *,
+        maximum: int = 500,
+        null_is_default: bool = True,
+    ) -> int:
+        if name not in self._params:
+            return default
+        value = self._params[name]
+        if value is None and null_is_default:
+            return default
+        if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+            raise ValueError(f"{name} must be a positive integer")
+        return min(int(value), maximum)
 
 
-__all__ = ["GatewayArtifactWorkbenchAdapter", "WorkbenchHandler"]
+__all__ = ["GatewayArtifactWorkbenchAdapter", "WorkbenchHandler", "WorkbenchPortFactory"]

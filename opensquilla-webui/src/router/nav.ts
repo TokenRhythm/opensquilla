@@ -3,7 +3,6 @@ import type { PlatformId } from '@/platform'
 import type { RouteRecordRaw } from 'vue-router'
 import type { IconName } from '@/utils/icons'
 import i18n from '@/i18n'
-import { desktopRoutes } from './desktopRoutes'
 import { sharedRoutes } from './sharedRoutes'
 import { webRoutes } from './webRoutes'
 
@@ -18,7 +17,6 @@ export interface NavigationItem {
 const navRoutes = [
   ...sharedRoutes,
   ...webRoutes,
-  ...desktopRoutes,
 ]
 
 function routePlatforms(platforms: unknown): PlatformId[] {

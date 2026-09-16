@@ -170,6 +170,21 @@ export function useChatPlans(options: UseChatPlansOptions) {
   )
   const currentPlan = ref<PlanRevisionSnapshot | null>(null)
   const activePlanRun = ref<PlanRunSnapshot | null>(null)
+  const settledTaskIds = ref<ReadonlySet<string>>(new Set())
+  const visiblePlanRun = computed<PlanRunSnapshot | null>(() => {
+    const run = activePlanRun.value
+    if (
+      run?.activeTaskId
+      && settledTaskIds.value.has(run.activeTaskId)
+      && (run.status === 'queued' || run.status === 'running')
+    ) {
+      // The task has ended, but its separate PlanRun update may still be in
+      // flight. Pause presentation without changing authoritative progress or
+      // creating a terminal state that would prevent the run from resuming.
+      return { ...run, status: 'paused', activeTaskId: undefined }
+    }
+    return run
+  })
   const modeBusy = ref(false)
   const pendingAction = ref<PlanCardAction | 'cancel-run' | 'revise' | null>(null)
   const modeAppliesNextTurn = ref(false)
@@ -189,6 +204,7 @@ export function useChatPlans(options: UseChatPlansOptions) {
     collaboration.value = { mode: 'default', revision: 0 }
     currentPlan.value = null
     activePlanRun.value = null
+    settledTaskIds.value = new Set()
     modeBusy.value = false
     pendingAction.value = null
     modeAppliesNextTurn.value = false
@@ -353,6 +369,15 @@ export function useChatPlans(options: UseChatPlansOptions) {
       if (event.kind === 'run') applyPlanRunEvent({ sessionKey: event.sessionKey, planRun: event.run })
     })
     return () => subscription.close()
+  }
+
+  function noteTaskSettled(taskId: string, epoch?: number) {
+    if (!acceptEpoch({ epoch }, true)) return
+    if (!taskId || settledTaskIds.value.has(taskId)) return
+    const next = new Set(settledTaskIds.value)
+    next.add(taskId)
+    if (next.size > 256) next.delete(next.values().next().value!)
+    settledTaskIds.value = next
   }
 
   async function setMode(mode: CollaborationMode): Promise<boolean> {
@@ -536,7 +561,7 @@ export function useChatPlans(options: UseChatPlansOptions) {
     initialCollaborationMode,
     currentPlan,
     currentPlanRevisionId,
-    activePlanRun,
+    activePlanRun: visiblePlanRun,
     modeBusy,
     modeAppliesNextTurn,
     pendingAction,
@@ -545,6 +570,7 @@ export function useChatPlans(options: UseChatPlansOptions) {
     reset,
     applyBootstrap,
     subscribe,
+    noteTaskSettled,
     setMode,
     toggleMode,
     beginReplan,

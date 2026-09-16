@@ -10,6 +10,12 @@ function rpc() {
     if (method === 'config.effective') return { fields: { theme: { value: 'dark', source: 'config' } } } as T
     if (method === 'config.patch.safe') return { patched: ['theme'], restartRequired: true } as T
     if (method === 'config.patch') return { patched: ['llm.model'], restartRequired: false } as T
+    if (method === 'telemetry.consent.set') return {
+      scope: params?.scope,
+      enabled: params?.enabled,
+      noticeVersion: params?.enabled ? `${params?.scope}-v1` : null,
+      consentedAtUtc: params?.enabled ? '2026-09-03T00:00:00Z' : null,
+    } as T
     if (method === 'models.list') return { models: [], errors: [] } as T
     if (method === 'onboarding.catalog') return { providers: [{ providerId: 'openai', label: 'OpenAI' }] } as T
     if (method === 'models.routing.get') return { mode: 'direct', provider: 'openai' } as T
@@ -84,11 +90,29 @@ describe('Platform configuration adapters', () => {
     )
     await settings.merge({ llm: { model: 'gpt-4' } })
     expect(source.request).toHaveBeenCalledWith('config.patch', { patch: { llm: { model: 'gpt-4' } } }, expect.any(Object))
+    await expect(settings.setTelemetryConsent('reliability', true)).resolves.toEqual({
+      scope: 'reliability',
+      enabled: true,
+      noticeVersion: 'reliability-v1',
+      consentedAtUtc: '2026-09-03T00:00:00Z',
+    })
+    expect(source.request).toHaveBeenCalledWith(
+      'telemetry.consent.set',
+      { scope: 'reliability', enabled: true },
+      expect.objectContaining({ timeoutAction: 'reject', abortAction: 'reject' }),
+    )
   })
 
   it('normalizes provider and setup snapshots without exposing transport details', async () => {
     const source = rpc()
-    const providers = createV4ProviderConfiguration(source)
+    let routingChanged: (payload: unknown) => void = () => {}
+    const close = vi.fn()
+    const providers = createV4ProviderConfiguration(source, {
+      subscribe: vi.fn((_event, handler) => {
+        routingChanged = handler
+        return { close }
+      }),
+    })
     expect(await providers.catalog()).toEqual([{ providerId: 'openai', label: 'OpenAI' }])
     expect(await providers.list()).toEqual({ models: [], errors: [] })
     expect(await providers.status()).toMatchObject({
@@ -104,6 +128,36 @@ describe('Platform configuration adapters', () => {
     await expect(providers.setRouting('unknown' as never)).rejects.toThrow('Unsupported routing mode')
     await providers.setRouting('ensemble')
     expect(source.request).toHaveBeenCalledWith('models.routing.set', { mode: 'ensemble' }, expect.any(Object))
+    const onChanged = vi.fn()
+    const subscription = providers.subscribeChanged(onChanged)
+    routingChanged({
+      mode: 'router',
+      router_enabled: true,
+      ensemble_enabled: false,
+      rollout_phase: 'full',
+      selection_mode: 'router_dynamic',
+      selection_configured: true,
+      activation_preview: {
+        selection_mode: 'router_dynamic',
+        selection_configured: true,
+        proposer_count: 1,
+        member_providers: ['openai'],
+        candidates: [],
+        blocked_reason: null,
+      },
+      router_required_by_ensemble: false,
+      image_input: { admission: 'allowed', reason: 'router_image_route_available' },
+      applies_to: 'next_accepted_turn',
+      capabilities_by_mode: {
+        direct: { image_input: { admission: 'allowed', reason: 'model_vision_supported' } },
+        router: { image_input: { admission: 'allowed', reason: 'router_image_route_available' } },
+        ensemble: { image_input: { admission: 'blocked', reason: 'ensemble_mode_unsupported' } },
+      },
+      source: 'test',
+    })
+    expect(onChanged).toHaveBeenCalledWith(expect.objectContaining({ mode: 'router' }))
+    subscription.close()
+    expect(close).toHaveBeenCalledOnce()
     const setup = createV4SetupWorkflow(source)
     expect(await setup.status()).toEqual({ ready: true })
     await expect(setup.capability.configureRouter({ mode: 'recommended' })).resolves.toMatchObject({

@@ -2,18 +2,29 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { createPinia, setActivePinia } from 'pinia'
 
 import { useRpcStore } from '@/stores/rpc'
-import type { SessionListEntry } from '@/contracts/generated/v4/sessionsList'
+import type {
+  SessionListEntry,
+  SessionsListResult,
+} from '@/contracts/generated/v4/sessionsList'
 import { createV4SessionDirectory } from '@/adapters/gateway/sessionDirectoryV4'
 import { createPrivateGatewayTransports } from '@/adapters/gateway/privateTransports'
 import { sessionMatches, useSessions } from './useSessions'
 
 interface SessionPageFixture {
-  sessions?: SessionListEntry[]
+  sessions: SessionListEntry[]
   keys?: SessionListEntry[]
   hasMore?: boolean
   has_more?: boolean
   nextCursor?: string | null
   next_cursor?: string | null
+}
+
+function sessionsListResult(fixture: SessionPageFixture): SessionsListResult {
+  return {
+    count: fixture.sessions.length,
+    ts: 1,
+    ...fixture,
+  }
 }
 
 function rows(start: number, end: number) {
@@ -41,7 +52,7 @@ describe('useSessions pagination', () => {
     const call = vi.spyOn(rpc, 'call').mockImplementation(async () => {
       const response = responses.shift()
       if (!response) throw new Error('unexpected sessions.list call')
-      return await response
+      return sessionsListResult(await response)
     })
     const transports = createPrivateGatewayTransports(rpc)
     return {
@@ -138,6 +149,64 @@ describe('useSessions pagination', () => {
     errorLog.mockRestore()
   })
 
+  it('retains the complete directory when a refresh returns a malformed result', async () => {
+    const errorLog = vi.spyOn(console, 'error').mockImplementation(() => {})
+    try {
+      const { call, sessions } = setup([
+        { sessions: rows(0, 2), has_more: true, next_cursor: 'page-2' },
+        { sessions: rows(2, 4), has_more: false },
+      ])
+      await sessions.loadSessions()
+      await sessions.loadMoreSessions()
+      const complete = sessions.sessionsList.value
+
+      call.mockResolvedValueOnce(sessionsListResult({
+        sessions: rows(100, 102), has_more: true, next_cursor: 'replacement-2',
+      })).mockResolvedValueOnce({ sessions: [] })
+      await sessions.loadSessions()
+
+      expect(sessions.sessionsList.value).toBe(complete)
+      expect(sessions.sessionsList.value.map(item => item.key)).toEqual(rows(0, 4).map(item => item.key))
+      expect(sessions.sessionListError.value).toBe(false)
+      expect(sessions.isLoading.value).toBe(false)
+      expect(sessions.hasMore.value).toBe(false)
+      expect(errorLog).toHaveBeenCalledWith(
+        '[useSessions] session directory error:', 'sessions.list returned an invalid response',
+      )
+    } finally {
+      errorLog.mockRestore()
+    }
+  })
+
+  it('keeps the page and cursor retryable when an appended result is malformed', async () => {
+    const errorLog = vi.spyOn(console, 'error').mockImplementation(() => {})
+    try {
+      const { call, sessions } = setup([
+        { sessions: rows(0, 2), has_more: true, next_cursor: 'page-2' },
+      ])
+      await sessions.loadSessions()
+      const firstPage = sessions.sessionsList.value
+      call.mockResolvedValueOnce({ sessions: [] })
+      await sessions.loadMoreSessions()
+
+      expect(sessions.sessionsList.value).toBe(firstPage)
+      expect(sessions.hasMore.value).toBe(true)
+      expect(sessions.loadMoreError.value).toBe(true)
+      expect(sessions.isLoadingMore.value).toBe(false)
+
+      call.mockResolvedValueOnce(sessionsListResult({ sessions: rows(2, 4), has_more: false }))
+      await sessions.loadMoreSessions()
+      expect(call).toHaveBeenLastCalledWith('sessions.list', {
+        limit: 200, view: 'session-list-v1', cursor: 'page-2',
+      }, expect.objectContaining({ signal: expect.any(AbortSignal) }))
+      expect(sessions.sessionsList.value).toHaveLength(4)
+      expect(sessions.hasMore.value).toBe(false)
+      expect(sessions.loadMoreError.value).toBe(false)
+    } finally {
+      errorLog.mockRestore()
+    }
+  })
+
   it('discards an append from an old traversal when a concurrent refresh wins', async () => {
     const stalePage = deferred<SessionPageFixture>()
     const { call, sessions } = setup([
@@ -214,9 +283,9 @@ describe('useSessions pagination', () => {
     ])
   })
 
-  it('treats a legacy response without page metadata as terminal', async () => {
+  it('treats a response without page metadata as terminal', async () => {
     const legacyKeys = rows(0, 200).map(row => row.key)
-    const { call, sessions } = setup([{ keys: legacyKeys }])
+    const { call, sessions } = setup([{ sessions: legacyKeys }])
 
     await sessions.loadSessions()
     await sessions.loadMoreSessions()

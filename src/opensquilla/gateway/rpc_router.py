@@ -22,20 +22,28 @@ import os
 import re
 from collections.abc import Mapping
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, cast
 
 import structlog
 
-from opensquilla.application.observability import RouterLearningQuery, RouterLearningStatus
+from opensquilla.application.conversation_ancillary import (
+    RouteFeedbackPort,
+    RouteFeedbackResult,
+    SubmitRouteFeedback,
+)
+from opensquilla.application.observability import (
+    RouterLearningQuery,
+    RouterLearningStatus,
+    RouterLearningStatusPort,
+    RouterLearningStatusResult,
+)
 from opensquilla.engine.steps.router_decision_record import get_decision_writer
 from opensquilla.gateway.adapters.conversation_ancillary import (
     GatewayConversationAncillaryAdapter,
-    GatewayConversationAncillaryCallbacks,
 )
 from opensquilla.gateway.adapters.conversation_ancillary_contract import (
     register_conversation_ancillary_contract,
 )
-from opensquilla.gateway.adapters.observability import GatewayRouterLearningStatusPort
 from opensquilla.gateway.adapters.observability_contract import (
     register_observability_contract,
 )
@@ -131,7 +139,7 @@ async def _handle_router_decisions_list(params: Any, ctx: RpcContext) -> dict[st
     return {"decisions": [_wire_decision(row) for row in rows]}
 
 
-async def _handle_router_feedback_submit(params: Any, ctx: RpcContext) -> dict[str, Any]:
+async def _submit_route_feedback(params: Any, ctx: RpcContext) -> dict[str, Any]:
     """Record a user rating (up/down/neutral) for one routing decision.
 
     The F7 feedback intake, live: ``decisionId`` is resolved through the
@@ -145,14 +153,19 @@ async def _handle_router_feedback_submit(params: Any, ctx: RpcContext) -> dict[s
     The rating never mutates the ``router_decisions`` table or routing state;
     consumption happens offline at dataset-build time.
     """
-    p = params if isinstance(params, dict) else {}
-    decision_id = sanitize_token(p.get("decisionId") or p.get("decision_id"))
+    if isinstance(params, SubmitRouteFeedback):
+        decision_value: object = params.decision_id
+        rating: object = params.rating
+    else:
+        raw = params if isinstance(params, dict) else {}
+        decision_value = raw.get("decisionId") or raw.get("decision_id")
+        rating = raw.get("rating")
+    decision_id = sanitize_token(decision_value)
     if decision_id is None:
         raise RpcHandlerError(
             ERROR_INVALID_REQUEST,
             "decisionId must be an id token",
         )
-    rating = p.get("rating")
     if not isinstance(rating, str) or rating not in _FEEDBACK_RATINGS:
         raise RpcHandlerError(
             ERROR_INVALID_REQUEST,
@@ -227,7 +240,10 @@ async def _handle_router_feedback_submit(params: Any, ctx: RpcContext) -> dict[s
     return {"accepted": True, "recorded": rating}
 
 
-async def read_router_learning_status(agent_id_value: str, ctx: RpcContext) -> dict[str, Any]:
+async def read_router_learning_status(
+    request: RouterLearningQuery | str,
+    ctx: RpcContext,
+) -> dict[str, Any]:
     """Read-only status of the router self-learning loop for one agent.
 
     Everything here is derived from on-disk state the loop already writes
@@ -239,6 +255,7 @@ async def read_router_learning_status(agent_id_value: str, ctx: RpcContext) -> d
     The Gateway Adapter supplies a normalized domain query.
     """
 
+    agent_id_value = request.agent_id if isinstance(request, RouterLearningQuery) else request
     agent_id = sanitize_token(agent_id_value)
     if agent_id is None:
         raise RpcHandlerError(ERROR_INVALID_REQUEST, "agentId must be an id token")
@@ -366,15 +383,26 @@ async def read_router_learning_status(agent_id_value: str, ctx: RpcContext) -> d
     return payload
 
 
+class _GatewayRouterLearningStatusRuntime(RouterLearningStatusPort):
+    """Read router-learning state from its persisted/runtime primitives."""
+
+    def __init__(self, ctx: RpcContext) -> None:
+        self._ctx = ctx
+
+    async def snapshot(self, query: RouterLearningQuery) -> RouterLearningStatusResult:
+        return cast(
+            RouterLearningStatusResult,
+            await read_router_learning_status(query, self._ctx),
+        )
+
+
 async def _router_selflearning_status_contract(
     params: Any, ctx: RpcContext
 ) -> dict[str, Any]:
     p = params if isinstance(params, dict) else {}
     agent_id = p.get("agentId") or p.get("agent_id") or "main"
-    status = RouterLearningStatus(
-        GatewayRouterLearningStatusPort(ctx, read_router_learning_status)
-    )
-    return await status.read(RouterLearningQuery(str(agent_id)))
+    status = RouterLearningStatus(_GatewayRouterLearningStatusRuntime(ctx))
+    return dict(await status.read(RouterLearningQuery(str(agent_id))))
 
 
 _handle_selflearning_status = register_observability_contract(
@@ -386,15 +414,21 @@ _handle_selflearning_status = register_observability_contract(
 )
 
 
+class _GatewayRouteFeedbackPort(RouteFeedbackPort):
+    def __init__(self, context: RpcContext) -> None:
+        self._context = context
+
+    async def submit(self, command: SubmitRouteFeedback) -> RouteFeedbackResult:
+        return cast(
+            RouteFeedbackResult,
+            await _submit_route_feedback(command, self._context),
+        )
+
+
 async def _handle_router_feedback_submit_contract(
     params: dict[str, Any] | None, ctx: RpcContext
 ) -> dict[str, Any]:
-    adapter = GatewayConversationAncillaryAdapter(
-        ctx,
-        GatewayConversationAncillaryCallbacks(
-            route_feedback=_handle_router_feedback_submit,
-        ),
-    )
+    adapter = GatewayConversationAncillaryAdapter(feedback=_GatewayRouteFeedbackPort(ctx))
     return await adapter.submit_feedback(params)
 
 

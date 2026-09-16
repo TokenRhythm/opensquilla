@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
-from typing import Any, Protocol
+from typing import Any, NotRequired, Protocol, TypedDict
 
 
 @dataclass(frozen=True, slots=True)
@@ -46,39 +46,94 @@ class SetChannelAdmin:
     admin: bool
 
 
+class ChannelProjection(TypedDict):
+    name: str
+    status: NotRequired[str | None]
+    connected: NotRequired[bool | None]
+    pendingPairings: NotRequired[int | None]
+
+
+class ChannelStatusResult(TypedDict):
+    channels: list[ChannelProjection]
+    bootId: NotRequired[str | None]
+
+
+class ChannelGetResult(TypedDict):
+    entry: Mapping[str, object] | None
+    secretFields: list[str]
+
+
+class ChannelProbeResult(TypedDict):
+    status: str
+    connected: bool
+    latencyMs: NotRequired[float | None]
+    detail: NotRequired[str | None]
+    result: NotRequired[Mapping[str, object] | None]
+
+
+class ChannelActionResult(TypedDict):
+    status: str
+    channel: str
+
+
+class PairingProjection(TypedDict):
+    pairingId: str
+    channelName: str
+    senderId: str
+    status: str
+    pairingCode: NotRequired[str]
+    senderName: NotRequired[str | None]
+    createdAt: NotRequired[str | None]
+    approvedAt: NotRequired[str | None]
+
+
+class PairingMutationResult(TypedDict):
+    pairing: PairingProjection
+    adminGranted: NotRequired[bool]
+    adminRemoved: NotRequired[bool]
+    warnings: NotRequired[list[str]]
+
+
+class ChannelAdminResult(TypedDict):
+    channelName: str
+    senderId: str
+    admin: bool
+    admins: list[str]
+
+
 class ChannelAdministrationPort(Protocol):
-    async def status(self) -> Mapping[str, Any]: ...
+    async def status(self) -> ChannelStatusResult: ...
 
-    async def get(self, target: ChannelTarget) -> Mapping[str, Any]: ...
+    async def get(self, target: ChannelTarget) -> ChannelGetResult: ...
 
-    async def probe(self, command: ProbeChannel) -> Mapping[str, Any]: ...
+    async def probe(self, command: ProbeChannel) -> ChannelProbeResult: ...
 
-    async def restart(self, target: ChannelTarget) -> Mapping[str, Any]: ...
+    async def restart(self, target: ChannelTarget) -> ChannelActionResult: ...
 
-    async def logout(self, target: ChannelTarget) -> Mapping[str, Any]: ...
+    async def logout(self, target: ChannelTarget) -> ChannelActionResult: ...
 
 
 class ChannelPairingPort(Protocol):
-    async def list(self, query: PairingQuery) -> Sequence[Mapping[str, Any]]: ...
+    async def list(self, query: PairingQuery) -> Sequence[PairingProjection]: ...
 
-    async def approve(self, command: ApprovePairing) -> Mapping[str, Any]: ...
+    async def approve(self, command: ApprovePairing) -> PairingMutationResult: ...
 
-    async def revoke(self, target: PairingTarget) -> Mapping[str, Any]: ...
+    async def revoke(self, target: PairingTarget) -> PairingMutationResult: ...
 
-    async def set_admin(self, command: SetChannelAdmin) -> Mapping[str, Any]: ...
+    async def set_admin(self, command: SetChannelAdmin) -> ChannelAdminResult: ...
 
 
 class ChannelAdministration:
     def __init__(self, port: ChannelAdministrationPort) -> None:
         self._port = port
 
-    async def status(self) -> Mapping[str, Any]:
+    async def status(self) -> ChannelStatusResult:
         return await self._port.status()
 
-    async def get(self, name: str) -> Mapping[str, Any]:
+    async def get(self, name: str) -> ChannelGetResult:
         return await self._port.get(ChannelTarget(self._name(name)))
 
-    async def probe(self, command: ProbeChannel) -> Mapping[str, Any]:
+    async def probe(self, command: ProbeChannel) -> ChannelProbeResult:
         if command.entry is not None:
             if not isinstance(command.entry, Mapping):
                 raise ValueError("channel entry must be an object")
@@ -87,10 +142,10 @@ class ChannelAdministration:
             raise ValueError("channel entry or name required")
         return await self._port.probe(replace(command, name=self._name(command.name)))
 
-    async def restart(self, name: str) -> Mapping[str, Any]:
+    async def restart(self, name: str) -> ChannelActionResult:
         return await self._port.restart(ChannelTarget(self._name(name)))
 
-    async def logout(self, name: str) -> Mapping[str, Any]:
+    async def logout(self, name: str) -> ChannelActionResult:
         return await self._port.logout(ChannelTarget(self._name(name)))
 
     @staticmethod
@@ -105,7 +160,7 @@ class ChannelPairingAdministration:
     def __init__(self, port: ChannelPairingPort) -> None:
         self._port = port
 
-    async def list(self, query: PairingQuery) -> Sequence[Mapping[str, Any]]:
+    async def list(self, query: PairingQuery) -> Sequence[PairingProjection]:
         channel_name = self._name(query.channel_name)
         status = query.status.strip() if isinstance(query.status, str) else None
         if query.limit is not None and query.limit < 0:
@@ -116,14 +171,14 @@ class ChannelPairingAdministration:
             replace(query, channel_name=channel_name, status=status or None)
         )
 
-    async def approve(self, command: ApprovePairing) -> Mapping[str, Any]:
+    async def approve(self, command: ApprovePairing) -> PairingMutationResult:
         target = self._target(command.target)
         return await self._port.approve(replace(command, target=target))
 
-    async def revoke(self, target: PairingTarget) -> Mapping[str, Any]:
+    async def revoke(self, target: PairingTarget) -> PairingMutationResult:
         return await self._port.revoke(self._target(target))
 
-    async def set_admin(self, command: SetChannelAdmin) -> Mapping[str, Any]:
+    async def set_admin(self, command: SetChannelAdmin) -> ChannelAdminResult:
         channel_name = self._name(command.channel_name)
         sender_id = command.sender_id.strip() if isinstance(command.sender_id, str) else ""
         if not sender_id:

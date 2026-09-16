@@ -1,5 +1,9 @@
 import type { InjectionKey } from 'vue'
 import type { ConversationEventSource } from './conversationEventHub'
+import type { ConversationCronResult, ConversationEnsembleProgress, ConversationEventContext, ConversationEventData, ConversationProviderActivity } from './conversationEventContent'
+import type { ConversationAnswerReset, ConversationSubagentCompletion } from './conversationEventContent'
+import type { ConversationCompactionContent, ConversationTextContent, ConversationThinkingContent, ConversationToolContent } from './conversationEventContent'
+import type { ConversationArtifact, ConversationCommittedTurn, ConversationEventIdentity, ConversationInputDisposition, ConversationLifecycle, ConversationRoutingDecision, ConversationTurnCompletion, ConversationWarning } from './conversationEventContent'
 
 /** Protocol-neutral meanings emitted by the Conversation event Adapter. */
 export type ConversationSemanticEventKind =
@@ -54,13 +58,8 @@ export type ConversationSemanticEventKind =
   | 'warning'
   | 'unknown'
 
-export interface ConversationEventProjection {
-  readonly kind: 'known' | 'unknown'
-  readonly semanticKind: ConversationSemanticEventKind
-  readonly isKnown: boolean
-  readonly payload: Readonly<Record<string, unknown>> | null
-  readonly rawPayload: unknown
-  readonly meta: Readonly<Record<string, unknown>> | null
+interface ConversationEventPosition {
+  readonly meta: ConversationEventContext
   readonly sessionKey: string | null
   readonly taskId: string | null
   readonly turnId: string | null
@@ -68,29 +67,52 @@ export interface ConversationEventProjection {
   readonly streamSeq: number | null
   readonly connectionSeq: number | null
   readonly generationEpoch: number | null
-  readonly schemaVersion: number | null
-  readonly legacy: boolean
 }
+
+type ProjectedEvent<K extends ConversationSemanticEventKind, P> = ConversationEventPosition & {
+  readonly kind: 'known'
+  readonly semanticKind: K
+  readonly payload: P
+}
+
+export type ConversationEventProjection =
+  | ProjectedEvent<'cron-result', ConversationCronResult>
+  | ProjectedEvent<'provider-activity', ConversationProviderActivity>
+  | ProjectedEvent<'ensemble-progress', ConversationEnsembleProgress>
+  | ProjectedEvent<'answer-generation-reset', ConversationAnswerReset>
+  | ProjectedEvent<'subagent-completed', ConversationSubagentCompletion>
+  | ProjectedEvent<'text-delta', ConversationTextContent>
+  | ProjectedEvent<'tool-use-started' | 'tool-use-delta' | 'tool-use-ended' | 'tool-result', ConversationToolContent>
+  | ProjectedEvent<'thinking-started' | 'thinking-delta' | 'thinking-ended', ConversationThinkingContent>
+  | ProjectedEvent<'compaction-progress', ConversationCompactionContent>
+  | ProjectedEvent<'turn-completed', ConversationTurnCompletion>
+  | ProjectedEvent<'turn-committed', ConversationCommittedTurn>
+  | ProjectedEvent<'input-disposition', ConversationInputDisposition>
+  | ProjectedEvent<'router-decision', ConversationRoutingDecision>
+  | ProjectedEvent<'warning', ConversationWarning>
+  | ProjectedEvent<'artifact-created', ConversationArtifact>
+  | ProjectedEvent<Extract<ConversationSemanticEventKind, `task-${string}`> | 'turn-failed' | 'state-changed' | 'run-heartbeat' | 'session-epoch-changed', ConversationLifecycle>
+  | ProjectedEvent<'approval-requested' | 'approval-resolved' | 'artifact-state-changed' | 'collaboration-mode-changed' | 'goal-changed' | 'goal-run-changed' | 'meta-preflight' | 'meta-run-announced' | 'meta-run-completed' | 'meta-step-state' | 'plan-revision' | 'plan-run' | 'router-control-replay' | 'steer-received', ConversationEventIdentity>
+  | (ConversationEventPosition & {
+  readonly kind: 'unknown'
+  readonly semanticKind: 'unknown'
+  readonly diagnostic: { readonly eventName: string }
+})
 
 export type ConversationEvent =
   | {
       kind: 'conversation'
       event: ConversationEventProjection
-      /** Opaque producer-owned payload; the Adapter never rewrites tool/user data. */
-      payload: unknown
-      meta: unknown
     }
   | {
       kind: 'sessions-changed'
-      payload: unknown
-      meta: unknown
+      payload: ConversationEventData
     }
   | {
       kind: 'approval'
       action: 'requested' | 'resolved'
       sessionKey: string | null
-      payload: unknown
-      meta: unknown
+      payload: ConversationEventData
     }
   | {
       kind: 'invalid'

@@ -28,7 +28,10 @@ from pathlib import Path
 from typing import Any
 
 from opensquilla import __version__
-from opensquilla.observability.network_policy import network_observability_disabled
+from opensquilla.observability.network_policy import (
+    network_observability_disabled,
+    telemetry_scope_forced_off_reasons,
+)
 from opensquilla.paths import default_opensquilla_home
 
 log = logging.getLogger(__name__)
@@ -284,7 +287,12 @@ def _state_path(*, config: Any | None, explicit: str | Path | None) -> Path:
 
 
 def _telemetry_disabled(*, config: Any | None = None) -> bool:
-    return network_observability_disabled(config=config)
+    privacy = getattr(config, "privacy", None)
+    return (
+        network_observability_disabled(config=config)
+        or getattr(privacy, "reliability_diagnostics_enabled", None) is False
+        or getattr(privacy, "product_analytics_enabled", None) is False
+    )
 
 
 def _telemetry_skip_reason(*, config: Any | None = None) -> str | None:
@@ -293,7 +301,10 @@ def _telemetry_skip_reason(*, config: Any | None = None) -> str | None:
     ci_env = _ci_environment_name()
     if ci_env is not None:
         return f"environment:{ci_env}"
-    return None
+    # Installation and daily usage reports share the product-analytics vetoes.
+    # Keep the original legacy switches above, including the update-check veto.
+    reasons = telemetry_scope_forced_off_reasons("growth", config=config)
+    return reasons[0] if reasons else None
 
 
 def _ci_environment_detected() -> bool:

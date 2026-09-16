@@ -1,8 +1,4 @@
 import {
-  parseDesktopArtifactAnnotationProofV2,
-  type DesktopArtifactAnnotationProofV2,
-} from './desktop-artifact-bridge-contract.js'
-import {
   NATIVE_WORKBENCH_PROTOCOL_VERSION_V3,
   NATIVE_WORKBENCH_PROTOCOL_VERSION_V4,
   parseNativeWorkbenchSurfaceId,
@@ -18,7 +14,6 @@ export const NATIVE_WORKBENCH_ANNOTATION_OVERLAY_WIDTH = 304
 export const NATIVE_WORKBENCH_ANNOTATION_OVERLAY_HEIGHT = 160
 
 const OPAQUE_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/
-const SHA256_PATTERN = /^[a-f0-9]{64}$/
 
 export interface NativeWorkbenchAnnotationCapabilities {
   version: NativeWorkbenchAnnotationProtocolVersion
@@ -71,23 +66,19 @@ export interface NativeWorkbenchAnnotationRect {
   height: number
 }
 
-/**
- * A bounded, untrusted candidate emitted to the trusted Control UI. The
- * Gateway must still match it against the canonical revision before creating
- * an editable source anchor.
- */
+/** Bounded page context for annotation messages; it grants no source-edit authority. */
 export interface NativeWorkbenchAnnotationSelection {
   selectionId: string
   tagName: string
   elementPath: string
-  domSha256?: string
-  elementProofSha256: string
+  targetRef: string
+  locatorHint: string
+  selectionText: string
   rect: NativeWorkbenchAnnotationRect
 }
 
 export interface NativeWorkbenchAnnotationSelectionCandidate
-  extends Omit<NativeWorkbenchAnnotationSelection, 'selectionId'> {
-  annotationProofV2?: DesktopArtifactAnnotationProofV2
+  extends Omit<NativeWorkbenchAnnotationSelection, 'selectionId' | 'targetRef'> {
   viewportWidth: number
   viewportHeight: number
 }
@@ -314,9 +305,8 @@ export function parseNativeWorkbenchAnnotationSelection(
       'ok',
       'tagName',
       'elementPath',
-      'domSha256',
-      'elementProofSha256',
-      'annotationProofV2',
+      'locatorHint',
+      'selectionText',
       'rect',
       'viewportWidth',
       'viewportHeight',
@@ -327,12 +317,10 @@ export function parseNativeWorkbenchAnnotationSelection(
     || typeof selection.elementPath !== 'string'
     || selection.elementPath.length === 0
     || selection.elementPath.length > NATIVE_WORKBENCH_ANNOTATION_ELEMENT_PATH_MAX_LENGTH
-    || (selection.domSha256 !== undefined && (
-      typeof selection.domSha256 !== 'string'
-      || !SHA256_PATTERN.test(selection.domSha256)
-    ))
-    || typeof selection.elementProofSha256 !== 'string'
-    || !SHA256_PATTERN.test(selection.elementProofSha256)
+    || typeof selection.locatorHint !== 'string'
+    || selection.locatorHint.length > 4096
+    || typeof selection.selectionText !== 'string'
+    || selection.selectionText.length > 4096
     || !finiteRect
     || !Number.isFinite(selection.viewportWidth)
     || !Number.isFinite(selection.viewportHeight)
@@ -346,15 +334,8 @@ export function parseNativeWorkbenchAnnotationSelection(
   return {
     tagName: selection.tagName,
     elementPath: selection.elementPath,
-    ...(selection.domSha256 === undefined ? {} : { domSha256: selection.domSha256 }),
-    elementProofSha256: selection.elementProofSha256,
-    ...(selection.annotationProofV2 === undefined
-      ? {}
-      : {
-          annotationProofV2: parseDesktopArtifactAnnotationProofV2(
-            selection.annotationProofV2,
-          ),
-        }),
+    locatorHint: selection.locatorHint,
+    selectionText: selection.selectionText,
     rect: {
       x: rect.x as number,
       y: rect.y as number,

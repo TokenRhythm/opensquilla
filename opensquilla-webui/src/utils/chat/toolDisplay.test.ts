@@ -1,13 +1,8 @@
 import { describe, expect, it } from 'vitest'
 
 import {
-  isDocumentAgentToolName,
-  isDocumentWriterToolName,
   toolDisplayInputText,
-  toolActionLabel,
-  toolDisplayName,
   toolGroupStatusText,
-  toolOperationKey,
   toolResultCount,
   toolSecondaryText,
   toolStatusText,
@@ -120,7 +115,6 @@ describe('toolResultCount', () => {
     expect(toolResultCount(JSON.stringify({ results }), 'web_search')).toBe(2)
   })
 })
-
 describe('category-specific tool lifecycle presentation', () => {
   const presentation = (
     category: ToolPresentation['category'],
@@ -241,86 +235,5 @@ describe('category-specific tool lifecycle presentation', () => {
     expect(toolStatusText(toolCall({ name, presentation: rule, isRunning: true }))).toBe(running)
     expect(toolStatusText(toolCall({ name, presentation: rule, status: 'success' }))).toBe(done)
     expect(toolStatusText(toolCall({ name, presentation: rule, status: 'error', isError: true }))).toBe(failed)
-  })
-})
-
-describe('page tool product presentation', () => {
-  it.each([
-    ['create_source', 'file.write'],
-    ['write_scratch', 'file.write'],
-    ['edit_source', 'file.edit'],
-    ['apply_patch', 'file.edit'],
-  ])('maps source mutation %s to %s details', (name, operation) => {
-    expect(toolOperationKey(name)).toBe(operation)
-  })
-
-  it.each([
-    'document_inspect',
-    'document_read',
-    'document_locate',
-    'document_apply',
-    'document_patch',
-    'document_browser_inspect',
-    'document_browser_act',
-    'document_browser_screenshot',
-    'document_browser_reload',
-    'document_finish',
-    'mcp__document_browser_act',
-  ])('recognizes %s as document-agent activity', (name) => {
-    expect(isDocumentAgentToolName(name)).toBe(true)
-  })
-
-  it.each([
-    'document_apply',
-    'document_patch',
-    'gateway.document_apply',
-    'gateway/document_patch',
-    'gateway:document_apply',
-    'gateway__document_patch',
-  ])('recognizes %s as a document writer', (name) => {
-    expect(isDocumentWriterToolName(name)).toBe(true)
-  })
-
-  it('does not classify ordinary file writers as document writers', () => {
-    expect(isDocumentWriterToolName('apply_patch')).toBe(false)
-    expect(isDocumentWriterToolName('edit_file')).toBe(false)
-  })
-
-  it.each([
-    ['document_read', 'document.read', 'Read page'],
-    ['document_locate', 'document.read', 'Read page'],
-    ['gateway.document_inspect', 'document.read', 'Read page'],
-    ['document_browser_inspect', 'document.read', 'Read page'],
-    ['document_browser_screenshot', 'document.read', 'Read page'],
-    ['document_browser_reload', 'document.read', 'Read page'],
-    ['document_browser_act', 'document.update', 'Update page'],
-    ['document_finish', 'document.update', 'Update page'],
-    ['document_apply', 'document.update', 'Update page'],
-    ['document_patch', 'document.update', 'Update page'],
-  ])('maps %s to a product action', (name, operation, label) => {
-    expect(toolOperationKey(name)).toBe(operation)
-    expect(toolDisplayName(name, '{}')).toBe(label)
-    expect(toolActionLabel(name)).toBe(label)
-  })
-
-  it('never exposes page-tool protocol payloads as secondary text', () => {
-    const raw = JSON.stringify({
-      expectedSha256: 'a'.repeat(64),
-      cursor: 'private-cursor',
-      grant: 'one-time-grant',
-    })
-    expect(toolSecondaryText({
-      toolId: 'tool-1',
-      name: 'document_apply',
-      displayName: 'document_apply',
-      inputRaw: raw,
-      inputPreview: raw,
-      result: raw,
-      resultPreview: raw,
-      isRunning: false,
-      status: 'success',
-      isError: false,
-      isOpen: false,
-    })).toBe('')
   })
 })

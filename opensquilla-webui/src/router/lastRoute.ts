@@ -1,6 +1,5 @@
 // Persist + restore the last-viewed view so the app reopens where you left off
-// instead of always landing on the default (Sessions on desktop / Chat on
-// mobile). Only stable, known views are restorable; the route path is stored
+// instead of always landing on Chat. Only stable, known views are restorable; the route path is stored
 // without query/hash so a stale session key can never reopen a dead chat, and
 // an unknown/removed path falls back to the default.
 
@@ -15,7 +14,6 @@ export const LAST_ROUTE_KEY = 'opensquilla-last-route'
 // since the query is dropped.
 const RESTORABLE = new Set<string>([
   '/chat',
-  '/sessions',
   '/channels',
   '/cron',
   '/skills',

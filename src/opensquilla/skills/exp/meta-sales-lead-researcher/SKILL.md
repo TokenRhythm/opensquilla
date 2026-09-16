@@ -1,5 +1,8 @@
 ---
 name: meta-sales-lead-researcher
+visibility: experimental
+invocation: experimental_internal
+disable-model-invocation: true
 description: "Use this meta-skill instead of answering directly when the user wants account research, lead qualification, company/person briefing, outreach prep, or a sales call brief that benefits from multi-skill orchestration across web research, browser/source review, CRM-style notes, and email drafting."
 kind: meta
 meta_priority: 59

@@ -209,6 +209,12 @@ export class InMemorySessionReadPortAdapter implements SessionReadPort {
       metadata,
       readHistory,
       retryMetadata,
+      reconcile: async () => {
+        if (closed || request.signal.aborted) throw abortError()
+        const current = this.fixtures.get(request.sessionKey)
+        if (!current) throw missing
+        return fixturePhase(current.live, current.liveDelayMs ?? 0, current.liveError, request.signal)
+      },
       close,
     })
   }

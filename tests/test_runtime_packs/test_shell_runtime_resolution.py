@@ -155,6 +155,67 @@ def test_runtime_environment_reapplication_remains_strict_for_guest(
     assert observed == [True]
 
 
+@pytest.mark.parametrize(("coding_mode", "expected"), [(True, "1"), (False, "0")])
+def test_base_shell_environment_exports_live_coding_mode_and_config_path(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    coding_mode: bool,
+    expected: str,
+) -> None:
+    config_path = tmp_path / "selected-config.toml"
+    monkeypatch.setenv("OPENSQUILLA_CODING_MODE_ACTIVE", "stale")
+    monkeypatch.setenv(
+        "OPENSQUILLA_CODING_MODE_CONFIG_PATH",
+        str(tmp_path / "stale-config.toml"),
+    )
+    monkeypatch.setattr(
+        shell,
+        "_runtime_shell_environment",
+        lambda environment, **kwargs: dict(environment),
+    )
+    token = current_tool_context.set(
+        ToolContext(
+            coding_mode=coding_mode,
+            sandbox_gateway_config=SimpleNamespace(config_path=config_path),
+        )
+    )
+    try:
+        environment = shell._base_shell_environment()
+    finally:
+        current_tool_context.reset(token)
+
+    assert environment["OPENSQUILLA_CODING_MODE_ACTIVE"] == expected
+    assert environment["OPENSQUILLA_CODING_MODE_CONFIG_PATH"] == str(config_path)
+
+
+def test_base_shell_environment_drops_stale_coding_config_without_authoritative_path(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv(
+        "OPENSQUILLA_CODING_MODE_CONFIG_PATH",
+        str(tmp_path / "stale-config.toml"),
+    )
+    monkeypatch.setattr(
+        shell,
+        "_runtime_shell_environment",
+        lambda environment, **kwargs: dict(environment),
+    )
+    token = current_tool_context.set(
+        ToolContext(
+            coding_mode=False,
+            sandbox_gateway_config=SimpleNamespace(config_path=""),
+        )
+    )
+    try:
+        environment = shell._base_shell_environment()
+    finally:
+        current_tool_context.reset(token)
+
+    assert environment["OPENSQUILLA_CODING_MODE_ACTIVE"] == "0"
+    assert "OPENSQUILLA_CODING_MODE_CONFIG_PATH" not in environment
+
+
 def test_strict_guest_does_not_inherit_managed_skill_toolchain_path(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

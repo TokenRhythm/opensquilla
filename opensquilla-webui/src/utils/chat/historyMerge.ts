@@ -286,10 +286,13 @@ function assistantIndexesForTurn(messages: ChatMessage[], userIndex: number): nu
 function reconcileOptimisticTurnFields(
   prev: ChatMessage[],
   incoming: ChatMessage[],
-  consumedOptimisticRows?: Set<ChatMessage>,
+  consumedOptimisticRows?: Map<ChatMessage, number>,
 ): ChatMessage[] {
   const reconciled = reconcileHistoryMessages(prev, incoming)
   const merged = reconciled === incoming ? incoming.slice() : reconciled
+  // A durable row already present locally cannot be the new canonical identity
+  // of another optimistic segment just because a repeated snapshot has caught up.
+  const previousIds = new Set(prev.map(message => message.messageId).filter(Boolean))
   const previousUserIndexById = new Map<string, number>()
 
   prev.forEach((message, index) => {
@@ -311,19 +314,25 @@ function reconcileOptimisticTurnFields(
     const incomingAssistants = assistantIndexesForTurn(incoming, incomingUserIndex)
       .filter(index => {
         const assistant = incoming[index]
-        return assistant?.restoredFromHistory === true && Boolean(assistant?.messageId)
+        return assistant?.restoredFromHistory === true
+          && Boolean(assistant?.messageId)
+          && !previousIds.has(assistant.messageId)
       })
     if (previousAssistants.length !== 1 || incomingAssistants.length !== 1) return
 
     const previousAssistant = prev[previousAssistants[0]]
     const incomingAssistantIndex = incomingAssistants[0]
     const serverAssistant = merged[incomingAssistantIndex]
+    if (
+      previousAssistant.turnId && serverAssistant.turnId
+      && previousAssistant.turnId !== serverAssistant.turnId
+    ) return
     merged[incomingAssistantIndex] = mergeLiveOnlyFields(
       previousAssistant,
       serverAssistant,
       { preserveTurnIdentity: true },
     )
-    consumedOptimisticRows?.add(previousAssistant)
+    consumedOptimisticRows?.set(previousAssistant, incomingAssistantIndex)
   })
 
   // Automatic Goal/heartbeat turns have no durable user row of their own, so
@@ -354,6 +363,7 @@ function reconcileOptimisticTurnFields(
   }
   for (const message of incoming) {
     if (!message.messageId || message.restoredFromHistory !== true) continue
+    if (previousIds.has(message.messageId)) continue
     const signature = assistantSignature(message)
     if (!signature) continue
     incomingSignatureCounts.set(
@@ -363,13 +373,14 @@ function reconcileOptimisticTurnFields(
   }
   incoming.forEach((message, index) => {
     if (!message.messageId || message.restoredFromHistory !== true) return
+    if (previousIds.has(message.messageId)) return
     const signature = assistantSignature(message)
     if (!signature || incomingSignatureCounts.get(signature) !== 1) return
     const candidates = optimisticBySignature.get(signature) ?? []
     if (candidates.length !== 1) return
     const optimistic = candidates[0]
     merged[index] = mergeLiveOnlyFields(optimistic, merged[index])
-    consumedOptimisticRows?.add(optimistic)
+    consumedOptimisticRows?.set(optimistic, index)
   })
 
   return merged
@@ -612,29 +623,54 @@ export function reconcileRunningHistoryMessages(
   const previousLastUserIndex = lastUserIndex(prev)
   if (previousLastUserIndex < 0) return reconcileHistoryMessages(prev, incoming)
 
+  const incomingById = new Map(
+    incoming
+      .filter((message): message is ChatMessage & { messageId: string } => Boolean(message.messageId))
+      .map(message => [message.messageId, message]),
+  )
+
   // A same-turn steer is another user row with the same explicit turn id. It
   // must not become the anchor that hides the live Router/tool/assistant tail
-  // preceding it. Walk back to the first user row in that causal turn.
+  // preceding it. The optimistic first user can still lack a turn id when an
+  // early steer triggers history sync, so let its durable canonical row or the
+  // explicitly identified live rows before the steer prove the missing turn.
   let liveAnchorUserIndex = previousLastUserIndex
+  let liveStartIndex = previousLastUserIndex + 1
+  let nextUserIndex = previousLastUserIndex
   const liveTurnId = prev[previousLastUserIndex]?.turnId
   if (liveTurnId) {
     for (let index = previousLastUserIndex - 1; index >= 0; index--) {
       const candidate = prev[index]
-      if (candidate?.role !== 'user') continue
-      if (candidate.turnId !== liveTurnId) break
+      const candidateTurnId = candidate.turnId
+        ?? (candidate.role === 'user' && candidate.messageId
+          ? incomingById.get(candidate.messageId)?.turnId
+          : undefined)
+      // An automatic turn can start without a user row. Keep its identified
+      // prefix before a steer, but never infer ownership across another turn.
+      if (candidateTurnId && candidateTurnId !== liveTurnId) break
+      if (candidate.role !== 'user') {
+        if (candidateTurnId === liveTurnId) liveStartIndex = index
+        continue
+      }
+      const ownsVisibleLiveRows = prev
+        .slice(index + 1, nextUserIndex)
+        .some(message => message.turnId === liveTurnId)
+      if (candidateTurnId !== liveTurnId && !ownsVisibleLiveRows) break
       liveAnchorUserIndex = index
+      liveStartIndex = index + 1
+      nextUserIndex = index
     }
   }
 
   const liveAnchor = prev[liveAnchorUserIndex]
-  const incomingIds = new Set(incoming.map(message => message.messageId).filter(Boolean))
+  const incomingIds = new Set(incomingById.keys())
   const preserveConfirmedAnchor = Boolean(
     liveAnchor?.role === 'user'
     && liveAnchor.restoredFromHistory !== true
     && liveAnchor.messageId
     && !incomingIds.has(liveAnchor.messageId),
   )
-  const liveTail = prev.slice(liveAnchorUserIndex + 1)
+  const liveTail = prev.slice(liveStartIndex)
   if (liveTail.length === 0) {
     const merged = reconcileHistoryMessages(prev, incoming)
     // A mutation-confirmed user row can arrive locally after an older,
@@ -647,33 +683,60 @@ export function reconcileRunningHistoryMessages(
     return merged
   }
 
-  const consumedOptimisticRows = new Set<ChatMessage>()
+  const consumedOptimisticRows = new Map<ChatMessage, number>()
   const merged = reconcileOptimisticTurnFields(prev, incoming, consumedOptimisticRows)
-  const existingIds = new Set(merged.map(msg => msg.messageId).filter(Boolean))
-  const existingFallbackKeys = new Set(merged.map(fallbackMessageKey))
-  const confirmedAnchorToPreserve = (
-    preserveConfirmedAnchor
-    && liveAnchor.messageId
-    && !existingIds.has(liveAnchor.messageId)
-  ) ? [liveAnchor] : []
-  const tailToPreserve = [...confirmedAnchorToPreserve, ...liveTail.filter(msg => {
-    if (consumedOptimisticRows.has(msg)) return false
-    if (msg.messageId) return !existingIds.has(msg.messageId)
-    return !existingFallbackKeys.has(fallbackMessageKey(msg))
-  })]
-  if (tailToPreserve.length === 0) return merged
-  if (confirmedAnchorToPreserve.length > 0) {
-    // The incoming snapshot predates this server-confirmed input. Keep the
-    // complete older transcript in place, then append the confirmed input and
-    // its live tail in causal order.
-    return [...merged, ...tailToPreserve]
+  const canonicalRows = merged.slice()
+  const previousIds = new Set(prev.map(message => message.messageId).filter(Boolean))
+  const matchedCanonicalRows = new Set<ChatMessage>()
+  let insertAfter = preserveConfirmedAnchor
+    ? merged.length - 1
+    : insertionIndexForLiveTail(merged, liveAnchor)
+  if (!preserveConfirmedAnchor && liveStartIndex < liveAnchorUserIndex) {
+    // The first known user may itself be a steer. Its canonical row is a
+    // right boundary for the preceding live output, not an insertion anchor.
+    insertAfter = insertAfter >= 0 && sameMessage(merged[insertAfter], liveAnchor)
+      ? insertAfter - 1
+      : merged.length - 1
+  } else if (insertAfter < 0) {
+    insertAfter = merged.length - 1
+  }
+  const liveRows = preserveConfirmedAnchor && liveStartIndex > liveAnchorUserIndex
+    ? [liveAnchor, ...liveTail]
+    : liveTail
+
+  // Advance through canonical rows that history already contains and insert
+  // only the missing live rows between them. This preserves an applied steer
+  // as an interior boundary instead of moving its continuation before it.
+  for (const message of liveRows) {
+    const consumedIndex = consumedOptimisticRows.get(message)
+    let existing = consumedIndex !== undefined
+      ? canonicalRows[consumedIndex]
+      : message.messageId
+        ? merged.find(candidate => candidate.messageId === message.messageId)
+        : message.clientId
+          ? merged.find(candidate => candidate.clientId === message.clientId)
+          : undefined
+    if (!existing && !message.messageId) {
+      // Display text and timestamps are only a legacy canonical fallback.
+      // Distinct live checkpoints can share both during synchronous replay.
+      // Match each canonical candidate once and respect known identities.
+      existing = canonicalRows.find(candidate =>
+        !matchedCanonicalRows.has(candidate)
+        && (!candidate.messageId || !previousIds.has(candidate.messageId))
+        && !(message.clientId && candidate.clientId && message.clientId !== candidate.clientId)
+        && !(message.turnId && candidate.turnId && message.turnId !== candidate.turnId)
+        && fallbackMessageKey(candidate) === fallbackMessageKey(message),
+      )
+    }
+    if (existing) {
+      matchedCanonicalRows.add(existing)
+      insertAfter = Math.max(insertAfter, merged.indexOf(existing))
+      continue
+    }
+    const insertionIndex = insertAfter + 1
+    merged.splice(insertionIndex, 0, message)
+    insertAfter = insertionIndex
   }
 
-  const insertAfter = insertionIndexForLiveTail(merged, prev[liveAnchorUserIndex])
-  if (insertAfter < 0) return [...merged, ...tailToPreserve]
-  return [
-    ...merged.slice(0, insertAfter + 1),
-    ...tailToPreserve,
-    ...merged.slice(insertAfter + 1),
-  ]
+  return merged
 }

@@ -1,11 +1,14 @@
 import { describe, expect, it, vi } from 'vitest'
-import { nextTick, ref } from 'vue'
+import { nextTick, ref, type Ref } from 'vue'
+import { createV4SessionReadPort } from '@/adapters/gateway/sessionReadPortV4'
+import type { TransportCallOptions } from '@/adapters/gateway/transportTypes'
 import {
   goalHasRenderedTerminalAnchor,
   normalizeGoal,
   useChatGoals,
   type GoalContinuityStorage,
 } from './useChatGoals'
+import { GoalCenterError } from '@/modules/goalCenter'
 import type { GoalEvent, GoalReattachInput } from '@/modules/goalContinuity'
 
 const SESSION_KEY = 'agent:main:webchat:test'
@@ -95,7 +98,10 @@ function mutation(goal: unknown, extra: Record<string, unknown> = {}) {
   }
 }
 
-function harness(continuityStorage?: GoalContinuityStorage) {
+function harness(
+  continuityStorage?: GoalContinuityStorage,
+  streamGeneration?: Ref<string | null>,
+) {
   const handlers = new Map<string, (...args: unknown[]) => void>()
   const toGoalEvent = (value: unknown): GoalEvent => {
     const source = (value && typeof value === 'object' && !Array.isArray(value))
@@ -162,6 +168,7 @@ function harness(continuityStorage?: GoalContinuityStorage) {
     goalContinuity,
     sessionKey,
     currentEpoch,
+    streamGeneration,
     ensureSessionKey,
     ensureSubscribed,
     onSetAccepted,
@@ -188,6 +195,116 @@ async function flushAsyncWork() {
 }
 
 describe('useChatGoals', () => {
+  it.each(['subscribe', 'hydrate', 'retry'] as const)(
+    'keeps newer Goal events when %s metadata carries an earlier questionnaire cursor',
+    async source => {
+      const metadata = {
+        key: SESSION_KEY,
+        epoch: 1,
+        workspaceId: null,
+        projectWorkspace: null,
+        projectWorkspaceDeferred: false,
+        active_task_group_ids: [],
+        run_mode_lock: { locked: false },
+        pendingUserInputs: [],
+        collaboration: null,
+        routing: null,
+        currentPlan: null,
+        activePlanRun: null,
+        goal: null,
+        goalSnapshotStreamSeq: 0,
+        tasks: [],
+        active_task: null,
+        last_task: null,
+        run_status: 'idle',
+        hydration_complete: true,
+        deferred_fields: [],
+      }
+      const wireResults: Record<string, unknown> = {
+        'sessions.messages.subscribe': {
+          ...metadata,
+          subscribed: true,
+          stream_generation: 'stream-1',
+          current_stream_seq: 0,
+          replay_complete: true,
+          replay_gap_reason: null,
+          replayed_count: 0,
+          ...(source !== 'subscribe' ? {
+            hydration_complete: false,
+            deferred_fields: ['goal', 'goalSnapshotStreamSeq'],
+          } : {}),
+        },
+        'sessions.messages.snapshot': {
+          key: SESSION_KEY,
+          task_id: null,
+          stream_generation: 'stream-1',
+          current_stream_seq: 0,
+          events: [],
+        },
+        'sessions.messages.hydrate': metadata,
+        'sessions.messages.unsubscribe': null,
+      }
+      const transport: Parameters<typeof createV4SessionReadPort>[0] = {
+        generation: 1,
+        request<T>(
+          method: string,
+          _params?: Record<string, unknown>,
+          options?: TransportCallOptions,
+        ): Promise<T> {
+          options?.onSent?.(1)
+          return Promise.resolve(wireResults[method] as T)
+        },
+      }
+      const lease = createV4SessionReadPort(transport).open({
+        sessionKey: SESSION_KEY,
+        includeInitialHistory: false,
+        resumeFrom: { streamGeneration: null, streamSeq: 0 },
+        signal: new AbortController().signal,
+      })
+      try {
+        const live = await lease.live
+        const projected = source === 'subscribe'
+          ? live.initialMetadata
+          : source === 'retry'
+            ? await lease.retryMetadata()
+            : await lease.metadata
+        // A generation-less live event is an authoritative legacy transport
+        // signal. A questionnaire read's older cursor must not change it back.
+        const h = harness(undefined, ref<string | null>(null))
+        h.api.applyHydration(live.initialMetadata)
+        const emit = (revision: number, streamSeq: number, complete = false) => {
+          h.handlers.get('session.event.goal')!({
+            sessionKey: SESSION_KEY,
+            sessionId: SESSION_ID,
+            epoch: 1,
+            streamSeq,
+            goal: goalPayload(complete ? 'complete' : 'active', {
+              stateRevision: revision,
+              progressRevision: revision - 1,
+              ...(complete ? {
+                activeTaskId: null,
+                executionState: 'idle',
+                terminalReason: 'complete',
+              } : {}),
+            }),
+          })
+        }
+        emit(2, 1)
+        emit(3, 2)
+        expect(h.api.activeGoal.value?.stateRevision).toBe(3)
+        expect(h.api.applyHydration(projected)).toBe(false)
+        expect(h.api.activeGoal.value?.stateRevision).toBe(3)
+        emit(4, 3, true)
+        expect(h.api.activeGoal.value).toBeNull()
+        expect(h.api.lastGoal.value).toMatchObject({
+          goalId: 'g1', status: 'complete', stateRevision: 4,
+        })
+      } finally {
+        await lease.close()
+      }
+    },
+  )
+
   it('arms and disarms the composer draft', () => {
     const { api } = harness()
     expect(api.draftArmed.value).toBe(false)
@@ -583,7 +700,8 @@ describe('useChatGoals', () => {
     expect(storage.entries()).toHaveLength(0)
   })
 
-  it('offers explicit takeover after automatic reattach fails without using Resume', async () => {
+  it('retries transient reattachment with the same token without takeover or Resume', async () => {
+    vi.useFakeTimers()
     const storage = new MemoryContinuityStorage()
     const first = harness(storage)
     first.rpc.call.mockResolvedValueOnce(mutation(goalPayload(), {
@@ -605,7 +723,7 @@ describe('useChatGoals', () => {
       }),
     })
     await flushAsyncWork()
-    expect(refreshed.api.connectionTakeoverAvailable.value).toBe(true)
+    expect(refreshed.api.connectionTakeoverAvailable.value).toBe(false)
 
     refreshed.rpc.call.mockResolvedValueOnce(mutation(goalPayload('active', {
       continuationDeferredReason: null,
@@ -614,18 +732,19 @@ describe('useChatGoals', () => {
     }), {
       continuityToken: 'continuity-token-2',
     }))
-    expect(await refreshed.api.takeOverConnection()).toBe(true)
+    await vi.advanceTimersByTimeAsync(500)
     expect(refreshed.goalContinuity.reattach).toHaveBeenLastCalledWith({
       sessionKey: SESSION_KEY,
       sessionId: SESSION_ID,
       epoch: 1,
       expectedGoalId: 'g1',
-      takeover: true,
+      continuityToken: 'continuity-token-1',
       sourceKind: 'web',
     })
     expect(refreshed.rpc.call).not.toHaveBeenCalledWith('goals.resume', expect.anything())
     expect(refreshed.api.activeGoal.value?.continuationDeferredReason).toBeNull()
     expect(storage.entries()[0]?.[1]).toContain('continuity-token-2')
+    vi.useRealTimers()
   })
 
   it('does not let a cursorless mutation response roll back a newer live execution state', async () => {
@@ -1009,9 +1128,10 @@ describe('useChatGoals', () => {
         executionState: 'working',
       }),
     })
-    const error = Object.assign(
-      new Error('The Goal still owns an unsettled task'),
-      { code: 'GOAL_BUSY' },
+    const error = new GoalCenterError(
+      'conflict',
+      'The Goal still owns an unsettled task',
+      { reason: 'busy', retryable: true },
     )
     rpc.call.mockRejectedValueOnce(error)
 

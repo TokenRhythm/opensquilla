@@ -1,45 +1,79 @@
 # OpenSquilla Code Signing Policy
 
 This policy documents the current code signing status for OpenSquilla release
-artifacts and the rules for any future signing workflow.
+artifacts and the rules for the signing workflow.
 
 ## Current Status
 
-Windows release builds are currently unsigned. The Windows desktop installer,
-updater metadata, and checksums are built and published without a Windows
-code-signing certificate. Download pages and release notes must not claim Windows code signing
-until a signing workflow has been approved, enabled, and verified for the
-specific release artifact.
+The Release Assets workflow signs new Windows builds through DigiCert KeyLocker
+with the Beijing TokenRhythm Technologies Co., Ltd. public code-signing
+certificate. The protected `windows-code-signing` GitHub environment gates
+access to CI credentials. Manually dispatched test artifacts from approved
+branches and `v*` release tags fail closed when credentials are unavailable,
+signing fails, or the resulting Authenticode identity and timestamp do not
+match policy. Historical release assets retain their original signing status.
 
 macOS release packaging is handled separately through the Apple signing and
 notarization path configured by maintainers for macOS artifacts. This document's
-planned SignPath section applies to Windows code signing for open-source
-community release artifacts.
+Windows signing policy applies to open-source community release artifacts.
+
+## Release Source And Validation
+
+Before any build or signing approval, Release Assets resolves the selected
+source to one commit and verifies that it contains the Windows signing scripts
+and a supported signing policy. The workflow commit and source commit are
+recorded separately. All build and audit jobs consume that same source commit.
+An existing-tag dispatch must originate from main and target a new or Draft
+release whose source already contains signing support. Historical unsigned
+tags and already published releases are rejected before signing; the workflow
+does not inject new signing scripts into old source trees.
+
+An approved empty-tag dispatch creates internal signed artifacts and audits the
+same Windows installer on independent Windows runners for both official
+baselines (0.5.3 and 0.5.4) and both default and custom installation paths.
+The audit verifies the downloaded signature, installation, launch, profile
+preservation, and uninstallation without access to KeyLocker credentials.
+When the candidate version equals a baseline, that case demonstrates
+reinstallation, not an upgrade to a newer release.
+
+Internal runs also retain a separate signed diagnostic candidate for seven days
+before the first-send gate, so a failed runtime test does not require signing
+again just to inspect the bytes. This diagnostic artifact is not a validated
+release and is never consumed by publication or the successful-build audit
+matrix. First-send failures retain only the isolated synthetic desktop log;
+client authentication material is excluded.
+
+To repeat Windows validation without another signing operation, dispatch
+`Desktop Fault Injection` with `windows_source_run_id`, the retained
+`windows_artifact_name`, and `run_windows_release_audit: true`. Leave the macOS
+source empty for Windows-only validation. It runs the first-send gate and the
+four baseline/path audits on independent Windows runners using the original
+signed installer. The audit checkout identifies the verification harness;
+the selected Release Assets run identifies the packaged source. A harness-only
+repair may validate those existing bytes, while a runtime change requires a
+new signed candidate.
+
+Internal artifacts do not publish a GitHub Release or exercise OSS prestaging
+and real updater downloads. Before publishing a new version, the tag workflow
+must also pass the Draft download and real updater audit matrix. Draft upload
+and immutable OSS prestaging happen before these audits. Retry a failed audit
+with the original artifacts; rebuilding or signing again can change bytes and
+is not permitted to replace an immutable OSS object under the same version.
 
 ## User Verification
 
 Users should download OpenSquilla release artifacts from the official GitHub
 Releases page and compare file hashes against the published `SHA256SUMS` file
-for the same release. A matching checksum verifies that the downloaded bytes
-match the bytes published by the project; it does not imply Windows Authenticode
-code signing while Windows builds remain unsigned.
+for the same release. On Windows, users can also inspect the installer digital
+signature and verify that the publisher is Beijing TokenRhythm Technologies
+Co., Ltd.
 
-## Future SignPath Foundation Plan
+## Windows Signer Disclosure
 
-OpenSquilla is preparing to apply for free open-source Windows code signing
-through SignPath Foundation. This is not enabled yet.
-
-If the project is approved and signing is enabled, the affected open-source
-community release artifacts may show `SignPath Foundation` as the Windows
-publisher. Because approval is still pending, the following attribution is a
-planned signing disclosure and does not claim that current Windows artifacts are
-signed:
-
-Free code signing provided by SignPath.io, certificate by SignPath Foundation.
-
-The SignPath Foundation path will apply only to OpenSquilla open-source
-community artifacts that are released under the project's OSI-approved license
-and that do not include proprietary or commercial-only components.
+The Windows publisher identity is pinned in
+`.github/signing/windows-signing-policy.json`. Changing the expected
+certificate, publisher, or timestamp endpoint requires a reviewed repository
+change and a successful signed test build before a release tag is created.
 
 ## Privacy Policy
 
@@ -71,18 +105,18 @@ OPENSQUILLA_UPDATE_CHECK_DISABLED=true
 This policy does not restrict future commercial editions, enterprise builds,
 hosted services, support offerings, or proprietary add-ons from using a
 separate commercial code-signing certificate or a separate commercial signing
-service. Commercial or proprietary release artifacts must not be signed with
-the SignPath Foundation certificate path unless they independently satisfy the
-foundation program requirements.
+service. Commercial or proprietary release artifacts must use credentials and
+certificate identities that are separately approved for their distribution
+scope.
 
 ## Release Build Requirements
 
-Any future Windows signing workflow must run before updater metadata, blockmaps,
+The Windows signing workflow must run before updater metadata, blockmaps,
 and `SHA256SUMS` are finalized. Signing an `.exe` after `latest.yml`,
 `.blockmap`, or `SHA256SUMS` has been generated changes the installer bytes and
 invalidates those release metadata files.
 
-Before enabling Windows signing, maintainers must verify:
+Maintainers must verify:
 
 - the signing provider and certificate are approved for the exact artifact type
 - the build runs from the trusted release workflow
@@ -97,23 +131,23 @@ Before enabling Windows signing, maintainers must verify:
 
 ## Roles And Approval
 
-Repository: <https://github.com/opensquilla/opensquilla>
+Repository: <https://github.com/TokenRhythm/opensquilla>
 
 Initial committers and reviewers:
 
 - [@Open-Squilla](https://github.com/Open-Squilla)
 
-Initial SignPath approvers:
+Initial Windows signing environment approvers:
 
 - [@Open-Squilla](https://github.com/Open-Squilla)
 
-OpenSquilla maintainers are responsible for release approval, release notes, and
-final publication. If SignPath signing is enabled later, SignPath approvers will
-approve signing requests only for the open-source community artifacts covered by
-this policy. Additional committers, reviewers, or SignPath approvers must be
-listed in this policy before they approve release signing requests. All
-committers, reviewers, and approvers must use multi-factor authentication for
-GitHub and SignPath access.
+OpenSquilla maintainers are responsible for release approval, release notes,
+and final publication. Windows signing environment approvers approve signing
+jobs only for the open-source community artifacts covered by this policy.
+Additional committers, reviewers, or signing approvers must be listed in this
+policy before they approve release signing requests. All committers, reviewers,
+and approvers must use multi-factor authentication for GitHub and DigiCert ONE
+access.
 
 ## Revocation Or Incident Response
 

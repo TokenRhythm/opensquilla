@@ -11,14 +11,15 @@ from unittest.mock import AsyncMock
 import pytest
 
 from opensquilla.gateway import context_overflow
+from opensquilla.gateway.compaction_target import resolve_gateway_compaction_target
 from opensquilla.gateway.config import ContextOverflowPolicy, GatewayConfig
 from opensquilla.gateway.context_overflow import (
     OverflowOutcome,
     apply_context_overflow_policy,
 )
-from opensquilla.gateway.rpc_chat import _enforce_context_overflow, _handle_chat_send
+from opensquilla.gateway.rpc_chat import _handle_chat_send
 from opensquilla.provider.types import ProviderRequestCorrelation
-from opensquilla.session.compaction import CompactionConfig
+from opensquilla.session.compaction import CompactionConfig, build_compaction_config_from_provider
 from opensquilla.session.compaction_state import (
     StructuredCompactionSummary,
     render_structured_summary,
@@ -50,17 +51,19 @@ class _FakeSessionManager:
         # Simulate a successful compaction: collapse history into a single
         # short summary entry so the next estimate fits easily.
         self.compact_calls.append((session_key, budget, config))
-        self._transcript = [_FakeEntry(content="[summary]")]
-        return "[summary]"
+        self._transcript = [_FakeEntry(content="ok")]
+        return "ok"
 
 
 class _ResultCompactionSessionManager(_FakeSessionManager):
     async def compact_with_result(self, session_key: str, budget: int, config=None, **kwargs):
         self.compact_calls.append((session_key, budget, config))
         self.compact_kwargs.append(dict(kwargs))
-        self._transcript = [_FakeEntry(content="[summary]")]
+        # The success fixture must fit the tiny test budget even when the
+        # optional tokenizer is unavailable and conservative estimation is used.
+        self._transcript = [_FakeEntry(content="ok")]
         return SimpleNamespace(
-            summary="[summary]",
+            summary="ok",
             kept_entries=[{"role": "assistant", "content": "[tail]"}],
             removed_count=5,
             chunks_processed=2,
@@ -103,8 +106,8 @@ class _FailingCompactionSessionManager(_FakeSessionManager):
 class _LegacyCompactSessionManager(_FakeSessionManager):
     async def compact(self, session_key: str, budget: int) -> str:
         self.compact_calls.append((session_key, budget, None))
-        self._transcript = [_FakeEntry(content="[summary]")]
-        return "[summary]"
+        self._transcript = [_FakeEntry(content="ok")]
+        return "ok"
 
 
 def _assert_armed_compact_call(
@@ -462,32 +465,6 @@ async def test_auto_summarize_invokes_compaction_and_retries_once() -> None:
     assert outcome.tokens_after <= outcome.budget_tokens
 
 
-@pytest.mark.asyncio
-async def test_restricted_turn_refuses_before_gateway_auxiliary_compaction() -> None:
-    cfg = _cfg(
-        ContextOverflowPolicy.AUTO_SUMMARIZE,
-        budget=10,
-        flush_enabled=True,
-    )
-    sm = _CheckpointingSessionManager(_history(6, 40))
-    flush_service = SimpleNamespace(execute=AsyncMock())
-
-    outcome = await apply_context_overflow_policy(
-        config=cfg,
-        message="m",
-        transcript=sm._transcript,
-        session_key="agent:main:restricted-overflow",
-        session_manager=sm,
-        flush_service=flush_service,
-        restricted_turn=True,
-    )
-
-    assert outcome.over_budget is True
-    assert outcome.reason == "restricted_turn_compaction_disabled"
-    assert outcome.refusal is not None
-    assert sm.calls == []
-    assert sm.compact_calls == []
-    flush_service.execute.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -539,6 +516,30 @@ async def test_auto_summarize_preserves_root_and_splits_auxiliary_executions() -
     assert flush_correlation.turn_id == compaction_correlation.turn_id
     assert flush_correlation.execution_id != compaction_correlation.execution_id
     assert flush_correlation.call_kind == "auxiliary.session_flush"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "manager_type",
+    [_FakeSessionManager, _ResultCompactionSessionManager, _LegacyCompactSessionManager],
+)
+async def test_auto_summarize_small_result_without_optional_tokenizer(
+    monkeypatch, manager_type,
+) -> None:
+    from opensquilla import token_estimation
+
+    monkeypatch.setattr(token_estimation, "_get_encoding", lambda: None)
+    manager = manager_type(_history(6, 40))
+    outcome = await apply_context_overflow_policy(
+        config=_cfg(ContextOverflowPolicy.AUTO_SUMMARIZE, budget=10),
+        message="m",
+        transcript=manager._transcript,
+        session_key="s-fallback-tokenizer",
+        session_manager=manager,
+    )
+
+    assert outcome.summarized is True
+    assert outcome.tokens_after <= 10
 
 
 @pytest.mark.asyncio
@@ -1370,21 +1371,29 @@ async def test_chat_send_accepts_turn_without_synchronous_context_overflow_gate(
     async def _unexpected_gate(*args: Any, **kwargs: Any) -> dict[str, Any]:
         raise AssertionError("chat.send must not synchronously refuse overflow")
 
-    async def _fake_sessions_send(
+    async def _fake_admit(
         params: dict[str, Any],
-        _ctx: Any,
-        **_kwargs: Any,
+        *,
+        surface: str,
     ) -> dict[str, Any]:
+        assert surface == "webchat"
         accepted.update(params)
-        return {"status": "accepted", "key": params["key"], "task_id": "task-long-context"}
+        key = params["sessionKey"]
+        return {
+            "ok": True,
+            "sessionKey": key,
+            "status": "accepted",
+            "key": key,
+            "task_id": "task-long-context",
+        }
 
     monkeypatch.setattr(
-        "opensquilla.gateway.rpc_chat._enforce_context_overflow",
+        "opensquilla.gateway.context_overflow.apply_context_overflow_policy",
         _unexpected_gate,
     )
     monkeypatch.setattr(
-        "opensquilla.gateway.rpc_sessions._handle_sessions_send",
-        _fake_sessions_send,
+        "opensquilla.gateway.rpc_chat._chat_turn_admission_adapter",
+        lambda _ctx: SimpleNamespace(admit=_fake_admit),
     )
 
     result = await _handle_chat_send({"message": "m", "sessionKey": "s-auto"}, ctx)
@@ -1397,53 +1406,7 @@ async def test_chat_send_accepts_turn_without_synchronous_context_overflow_gate(
         "task_id": "task-long-context",
     }
     assert accepted["message"] == "m"
-    assert accepted["key"] == "s-auto"
-
-
-def test_chat_send_creates_webchat_session_with_agent_from_key(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    cfg = _cfg(ContextOverflowPolicy.AUTO_SUMMARIZE, budget=10)
-    sm = SimpleNamespace(
-        get_or_create=AsyncMock(
-            return_value=SimpleNamespace(
-                session_key="agent:kid-project:webchat:abc",
-                agent_id="kid-project",
-            )
-        ),
-    )
-    ctx = SimpleNamespace(
-        config=cfg,
-        session_manager=sm,
-        principal=SimpleNamespace(role="owner"),
-    )
-
-    async def _fake_sessions_send(
-        params: dict[str, Any],
-        _ctx: Any,
-        **_kwargs: Any,
-    ) -> dict[str, Any]:
-        return {"status": "accepted", "key": params["key"], "task_id": "task-1"}
-
-    monkeypatch.setattr(
-        "opensquilla.gateway.rpc_sessions._handle_sessions_send",
-        _fake_sessions_send,
-    )
-
-    async def _run() -> dict[str, Any]:
-        return await _handle_chat_send(
-            {"message": "m", "sessionKey": "agent:kid-project:webchat:abc"},
-            ctx,
-        )
-
-    result = asyncio.run(_run())
-
-    assert result["ok"] is True
-    sm.get_or_create.assert_awaited_once_with(
-        session_key="agent:kid-project:webchat:abc",
-        agent_id="kid-project",
-        display_name="WebChat",
-    )
+    assert accepted["sessionKey"] == "s-auto"
 
 
 @pytest.mark.asyncio
@@ -1458,9 +1421,24 @@ async def test_rpc_chat_auto_summarize_builds_provider_compaction_config() -> No
     selector = _FakeProviderSelector()
     ctx = SimpleNamespace(config=cfg, session_manager=sm, provider_selector=selector)
 
-    refusal = await _enforce_context_overflow(ctx, "s-auto", "m")
+    session = await sm._storage.get_session("s-auto")
+    target = resolve_gateway_compaction_target(ctx, session)
+    outcome = await apply_context_overflow_policy(
+        config=cfg,
+        message="m",
+        transcript=sm._transcript,
+        session_key="s-auto",
+        session_manager=sm,
+        compaction_config=build_compaction_config_from_provider(
+            target.provider,
+            model_override=target.model,
+            compaction_config=cfg.compaction,
+            compaction_plan=target.plan,
+        ),
+    )
 
-    assert refusal is None
+    assert outcome.refusal is None
+    assert outcome.summarized is True
     config = sm.compact_calls[0][2]
     assert isinstance(config, CompactionConfig)
     assert config.api_key == "overflow-provider-key"

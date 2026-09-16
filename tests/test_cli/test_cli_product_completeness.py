@@ -349,6 +349,41 @@ def test_config_set_legacy_ensemble_toggle_persists_canonical_router_mode(
     assert reloaded.llm_ensemble.enabled is True
     assert reloaded.squilla_router.enabled is True
     assert reloaded.squilla_router.rollout_phase == "full"
+    assert all(
+        tier["provider"] == reloaded.llm.provider
+        for tier in reloaded.squilla_router.tiers.values()
+    )
+
+
+def test_config_set_ensemble_toggle_rejects_custom_foreign_router_without_writes(
+    tmp_path: Path,
+) -> None:
+    from opensquilla.onboarding.router_policy import RouterProviderConflictError
+
+    target = tmp_path / "custom-routing.toml"
+    original = '\n'.join([
+        '[llm]',
+        'provider = "tokenrhythm"',
+        '[llm_ensemble]',
+        'enabled = false',
+        'selection_mode = "router_dynamic"',
+        '[squilla_router]',
+        'enabled = false',
+        'preset_binding = "custom"',
+        '[squilla_router.tiers.c1]',
+        'provider = "openrouter"',
+        'model = "synthetic-model"',
+        '',
+    ])
+    target.write_text(original, encoding="utf-8")
+
+    result = runner.invoke(
+        app, ["config", "set", "llm_ensemble.enabled", "true", "--config", str(target)]
+    )
+
+    assert result.exit_code != 0
+    assert isinstance(result.exception, RouterProviderConflictError)
+    assert target.read_text(encoding="utf-8") == original
 
 
 def test_config_set_get_privacy_network_observability_round_trips(tmp_path: Path):
@@ -1412,7 +1447,7 @@ def test_cron_commands_use_existing_rpc_payloads(monkeypatch):
     fake.rpc_payloads = {
         "cron.list": [{"id": "job-1", "name": "Daily", "agentId": "main"}],
         "cron.status": {"id": "job-1", "name": "Daily"},
-        "cron.add": {"id": "job-2", "expression": "*/5 * * * *"},
+        "cron.create": {"id": "job-2", "expression": "*/5 * * * *"},
         "cron.update": {"id": "job-1", "enabled": False},
         "cron.runs": [{"id": "run-1", "status": "ok"}],
     }
@@ -1448,7 +1483,7 @@ def test_cron_commands_use_existing_rpc_payloads(monkeypatch):
     assert ("cron.list", {"agentId": "main"}) in fake.calls
     assert ("cron.status", {"id": "job-1"}) in fake.calls
     assert (
-        "cron.add",
+        "cron.create",
         {
             "expression": "*/5 * * * *",
             "text": "check in",

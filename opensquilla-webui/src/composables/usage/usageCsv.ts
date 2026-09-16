@@ -1,22 +1,11 @@
 import { serializeNativeBilling } from './nativeBilling'
-import type { SessionRow, UsageSnapshot } from '@/types/usage'
+import type { UsageSession, UsageSnapshot } from '@/types/usage'
 
 const DEFAULT_CNY_RATE = 7.25
 
-function rowValue(row: Record<string, unknown>, ...keys: string[]): unknown {
-  for (const key of keys) {
-    if (row[key] != null) return row[key]
-  }
-  return null
-}
-
-function costSource(row: SessionRow): string {
-  return String(rowValue(row, 'cost_source', 'costSource') || 'none')
-}
-
 export function buildUsageCsv(
   snapshot: UsageSnapshot | null,
-  visibleRows: SessionRow[],
+  visibleRows: UsageSession[],
   cnyRate = DEFAULT_CNY_RATE,
 ): string {
   const headers = [
@@ -75,7 +64,7 @@ export function buildUsageCsv(
     totals?.missingCostEntries ?? '',
     'false',
     '',
-    serializeNativeBilling(totals as unknown as Record<string, unknown> | undefined),
+    serializeNativeBilling(totals),
     totals?.pendingBillingReceiptCount ?? '',
     snapshot?.coverage.nativeBilling.status || '',
     snapshot?.coverage.nativeBilling.exactFromMs ?? '',
@@ -84,31 +73,26 @@ export function buildUsageCsv(
     snapshot?.coverage.nativeBilling.pendingReceiptCount ?? '',
   ]
   const rows = visibleRows.map(row => {
-    const cost = rowValue(row, 'cost_usd', 'costUsd')
-    const costUsd = cost != null ? Number(cost) : null
+    const costUsd = row.costUsd
     return [
       'session',
       ...common,
-      rowValue(row, 'session', 'sessionKey', 'key') || '',
-      rowValue(row, 'input_tokens', 'inputTokens') ?? '',
-      rowValue(row, 'output_tokens', 'outputTokens') ?? '',
-      rowValue(row, 'cache_read_tokens', 'cacheReadTokens') ?? '',
-      rowValue(row, 'cache_write_tokens', 'cacheWriteTokens') ?? '',
-      costUsd != null ? costUsd.toFixed(6) : '',
+      row.session || row.sessionKey,
+      row.inputTokens ?? '',
+      row.outputTokens ?? '',
+      row.cacheReadTokens ?? '',
+      row.cacheWriteTokens ?? '',
+      costUsd?.toFixed(6) ?? '',
       costUsd != null ? (costUsd * cnyRate).toFixed(6) : '',
-      rowValue(row, 'billed_cost_usd', 'billedCostUsd') != null
-        ? Number(rowValue(row, 'billed_cost_usd', 'billedCostUsd')).toFixed(6)
-        : '',
-      rowValue(row, 'estimated_cost_usd', 'estimatedCostUsd') != null
-        ? Number(rowValue(row, 'estimated_cost_usd', 'estimatedCostUsd')).toFixed(6)
-        : '',
-      rowValue(row, 'estimated_event_count', 'estimatedEventCount') ?? '',
-      costSource(row),
-      rowValue(row, 'missing_cost_entries', 'missingCostEntries') ?? '',
-      rowValue(row, 'cost_ephemeral', 'costEphemeral') ? 'true' : 'false',
+      row.billedCostUsd?.toFixed(6) ?? '',
+      row.estimatedCostUsd?.toFixed(6) ?? '',
+      row.estimatedEventCount ?? '',
+      row.costSource,
+      row.missingCostEntries ?? '',
+      row.costEphemeral ? 'true' : 'false',
       row.model || '',
       serializeNativeBilling(row),
-      rowValue(row, 'pending_billing_receipt_count', 'pendingBillingReceiptCount') ?? '',
+      row.pendingBillingReceiptCount,
       snapshot?.coverage.nativeBilling.status || '',
       snapshot?.coverage.nativeBilling.exactFromMs ?? '',
       snapshot?.coverage.nativeBilling.reasonCodes.join('|') || '',

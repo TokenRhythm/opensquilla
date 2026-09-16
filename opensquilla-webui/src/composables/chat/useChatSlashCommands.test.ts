@@ -5,10 +5,10 @@ import { parseMetaCommandInvocation, useChatSlashCommands } from './useChatSlash
 import type { RpcCallOptions } from '@/lib/rpc'
 import type { MetaRunCenter } from '@/modules/metaRunCenter'
 import type { SessionMaintenance } from '@/modules/sessionMaintenance'
+import { usageReportingDouble } from '@/testing/usage.test-helper'
 import type { MetaSetupReadiness } from '@/types/metaSetup'
 import {
   commandCatalogFromTestRpc,
-  usageReportingFromTestRpc,
 } from '@/testing/conversationAncillary.test-helper'
 
 function deferred() {
@@ -54,9 +54,9 @@ function harness(
     recover: vi.fn(async () => null),
     confirmPreflight: vi.fn(async () => ({})),
     replay: vi.fn(async () => ({})),
-    setupPlan: vi.fn(async () => ({})),
-    setupStatus: vi.fn(async () => ({})),
-    setupInstall: vi.fn(async () => ({})),
+    setupPlan: vi.fn(async () => { throw new Error('Setup planning is not configured') }),
+    setupStatus: vi.fn(async () => { throw new Error('Setup polling is not configured') }),
+    setupInstall: vi.fn(async () => { throw new Error('Installation is not configured') }),
     subscribe: vi.fn(() => ({ close: vi.fn() })),
   }
   const activatePlanMode = vi.fn(async () => true)
@@ -96,7 +96,7 @@ function harness(
   }
   const api = useChatSlashCommands({
     commandCatalog: commandCatalogFromTestRpc(rpc),
-    usageReporting: usageReportingFromTestRpc(rpc),
+    usageReporting: usageReportingDouble(),
     sessionMaintenance,
     metaRunCenter,
     catalogCallOptions,

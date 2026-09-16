@@ -2,15 +2,16 @@
 """Discover and generate every language-neutral Gateway v4 Contract.
 
 ``sessions.list`` predates this aggregate runner.  It deliberately keeps its
-original entry point so that adopting the runner does not rewrite its already
-reviewed generated artifacts.  New Contracts use the generic JSON Schema
-2020-12 path below.
+original entry point for its already-reviewed Python and TypeScript types.  Its
+runtime validators use the aggregate runner's browser-safe ESM path, as do new
+Contracts generated from the generic JSON Schema 2020-12 path below.
 """
 
 from __future__ import annotations
 
 import argparse
 import ast
+import copy
 import hashlib
 import importlib.util
 import json
@@ -20,6 +21,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any, Literal
@@ -29,9 +31,14 @@ CONTRACT_ROOT = ROOT / "contracts/gateway/v4"
 PYTHON_OUTPUT_ROOT = ROOT / "src/opensquilla/contracts/generated/v4"
 TYPESCRIPT_OUTPUT_ROOT = ROOT / "opensquilla-webui/src/contracts/generated/v4"
 AJV_GENERATOR = ROOT / "scripts/contracts/generate_gateway_contract_ajv.mjs"
+TYPESCRIPT_GENERATOR = (
+    ROOT / "opensquilla-webui/node_modules/json-schema-to-typescript/dist/src/cli.js"
+)
 JSON_SCHEMA_2020_12 = "https://json-schema.org/draft/2020-12/schema"
 GATEWAY_PROTOCOL = "opensquilla-websocket-json"
 REGISTRATION_OUTPUT = PYTHON_OUTPUT_ROOT / "gateway_contract_registry.py"
+COMPATIBILITY_MANIFEST_OUTPUT = CONTRACT_ROOT / "compatibility-manifest.generated.json"
+PRODUCTION_TARGET_MANIFEST = CONTRACT_ROOT / "production-targets.json"
 
 PINNED_CODEGEN = {
     "python": {
@@ -59,8 +66,19 @@ LEGACY_GENERATORS = {
 
 WIRE_NAME_PATTERN = re.compile(r"^[a-z][a-zA-Z0-9_]*(?:\.[a-z][a-zA-Z0-9_]*)+$")
 LEGACY_ROOT_METHOD_NAMES = frozenset({"status"})
+LEGACY_HYPHENATED_WIRE_NAMES = frozenset({"sandbox.path.create-directory"})
 SCOPE_PATTERN = re.compile(r"^[a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*)*$")
 ERROR_CODE_PATTERN = re.compile(r"^[A-Z][A-Z0-9_]*$")
+LEGACY_DOTTED_ERROR_CODES = frozenset(
+    {
+        "migration.candidate_unavailable",
+        "migration.invalid_params",
+        "migration.preview_unavailable",
+        "migration.unavailable",
+        "onboarding.channel.invalid",
+        "onboarding.channel.not_found",
+    }
+)
 IDENTIFIER_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 FILE_STEM_PATTERN = re.compile(r"^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$")
 SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
@@ -68,8 +86,12 @@ METHOD_KINDS = frozenset({"query", "command"})
 IDEMPOTENCY_KINDS = frozenset({"read-only", "idempotent", "non-idempotent"})
 TIMEOUT_POLICIES = frozenset({"caller", "server", "transport"})
 CAPABILITY_KINDS = frozenset({"method-availability"})
+METHOD_LIFECYCLES = frozenset({"stable", "legacy"})
 
-Mode = Literal["write", "check", "verify-determinism"]
+Mode = Literal["write", "check", "verify-determinism", "write-determinism", "check-determinism"]
+Profile = Literal["production", "verification"]
+ValidatorTargets = dict[tuple[str, str], tuple[str, ...]]
+MAX_GENERATOR_JOBS = 32
 
 
 class ContractConfigurationError(RuntimeError):
@@ -107,19 +129,16 @@ class ContractSpec:
 
     @property
     def outputs(self) -> tuple[Path, ...]:
-        # Generic validators are imported by the browser-side Vite adapter.
-        # They must be native ESM: Vite intentionally does not transform
-        # source-tree .cjs files during dev, so a named import would leave the
-        # browser with a CommonJS module that has no exports.  The legacy
-        # sessions.list generator remains byte-for-byte CJS compatible.
-        validator_suffix = "Validators.cjs" if self.uses_legacy_generator else "Validators.mjs"
-        declaration_suffix = ".d.cts" if self.uses_legacy_generator else ".d.mts"
+        # Validators are imported by browser-side Vite adapters. They must be
+        # native ESM: Vite intentionally does not transform source-tree .cjs
+        # files during dev, so a named import would leave the browser with a
+        # CommonJS module that has no exports.
         return (
             PYTHON_OUTPUT_ROOT / f"{self.python_stem}.py",
             PYTHON_OUTPUT_ROOT / f"{self.python_stem}_metadata.py",
             TYPESCRIPT_OUTPUT_ROOT / f"{self.typescript_stem}.ts",
-            TYPESCRIPT_OUTPUT_ROOT / f"{self.typescript_stem}{validator_suffix}",
-            TYPESCRIPT_OUTPUT_ROOT / f"{self.typescript_stem}Validators{declaration_suffix}",
+            TYPESCRIPT_OUTPUT_ROOT / f"{self.typescript_stem}Validators.mjs",
+            TYPESCRIPT_OUTPUT_ROOT / f"{self.typescript_stem}Validators.d.mts",
         )
 
     @property
@@ -135,6 +154,50 @@ class ContractSpec:
             raise ContractConfigurationError(
                 f"{self.schema}: Contract has no generated {role!r} target"
             ) from exc
+
+
+def load_production_targets(
+    specs: tuple[ContractSpec, ...],
+    path: Path = PRODUCTION_TARGET_MANIFEST,
+) -> ValidatorTargets:
+    """Validate explicit production policy against the complete Schema inventory."""
+
+    try:
+        document = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise ContractConfigurationError(f"cannot read production target manifest: {path}") from exc
+    if (
+        not isinstance(document, dict)
+        or set(document) != {"format", "targets"}
+        or type(document["format"]) is not int
+        or document["format"] != 1
+        or not isinstance(document["targets"], list)
+    ):
+        raise ContractConfigurationError("invalid production target manifest format")
+    contracts = {(spec.contract_type, spec.wire_name): spec for spec in specs}
+    selected: ValidatorTargets = {}
+    for entry in document["targets"]:
+        if (
+            not isinstance(entry, dict)
+            or set(entry) != {"kind", "wireName", "roles"}
+            or not isinstance(entry["kind"], str)
+            or not isinstance(entry["wireName"], str)
+        ):
+            raise ContractConfigurationError("invalid production target entry")
+        key = (entry["kind"], entry["wireName"])
+        if key not in contracts or key in selected:
+            raise ContractConfigurationError(f"unknown or duplicate production Contract: {key}")
+        roles = entry["roles"]
+        available = tuple(role for role, _ in contracts[key].targets)
+        if (
+            not isinstance(roles, list)
+            or not roles
+            or not all(isinstance(role, str) and role in available for role in roles)
+            or len(set(roles)) != len(roles)
+        ):
+            raise ContractConfigurationError(f"invalid production validator roles: {key}")
+        selected[key] = tuple(role for role in available if role in roles)
+    return selected
 
 
 def _snake_case(value: str) -> str:
@@ -223,9 +286,7 @@ def load_contract(schema: Path, *, contract_root: Path = CONTRACT_ROOT) -> Contr
     if not isinstance(document, dict):
         raise ContractConfigurationError(f"{schema}: Contract schema must be an object")
     if document.get("$schema") != JSON_SCHEMA_2020_12:
-        raise ContractConfigurationError(
-            f"{schema}: Contract must use JSON Schema 2020-12"
-        )
+        raise ContractConfigurationError(f"{schema}: Contract must use JSON Schema 2020-12")
     if not isinstance(document.get("$id"), str):
         raise ContractConfigurationError(f"{schema}: Contract must declare a string $id")
     if document.get("x-opensquilla-codegen") != PINNED_CODEGEN:
@@ -239,9 +300,7 @@ def load_contract(schema: Path, *, contract_root: Path = CONTRACT_ROOT) -> Contr
     )
     protocol = wire.get("protocol")
     if protocol != GATEWAY_PROTOCOL:
-        raise ContractConfigurationError(
-            f"{schema}: Gateway protocol must be {GATEWAY_PROTOCOL!r}"
-        )
+        raise ContractConfigurationError(f"{schema}: Gateway protocol must be {GATEWAY_PROTOCOL!r}")
     wire_version = wire.get("version")
     if wire_version != 4:
         raise ContractConfigurationError(f"{schema}: only Gateway wire version 4 is supported")
@@ -251,9 +310,7 @@ def load_contract(schema: Path, *, contract_root: Path = CONTRACT_ROOT) -> Contr
         )
     file_stem = schema.name.removesuffix(".schema.json")
     if not FILE_STEM_PATTERN.fullmatch(file_stem):
-        raise ContractConfigurationError(
-            f"{schema}: Contract filename must use lower-kebab-case"
-        )
+        raise ContractConfigurationError(f"{schema}: Contract filename must use lower-kebab-case")
 
     method = document.get("x-opensquilla-method")
     event = document.get("x-opensquilla-event")
@@ -270,6 +327,7 @@ def load_contract(schema: Path, *, contract_root: Path = CONTRACT_ROOT) -> Contr
         if (
             not WIRE_NAME_PATTERN.fullmatch(wire_name)
             and wire_name not in LEGACY_ROOT_METHOD_NAMES
+            and wire_name not in LEGACY_HYPHENATED_WIRE_NAMES
         ):
             raise ContractConfigurationError(
                 f"{schema}: method name {wire_name!r} is not a legal dotted identifier"
@@ -286,14 +344,10 @@ def load_contract(schema: Path, *, contract_root: Path = CONTRACT_ROOT) -> Contr
                 f"{schema}: method Contract guestAllowed must be a boolean"
             )
         if idempotency not in IDEMPOTENCY_KINDS:
-            raise ContractConfigurationError(
-                f"{schema}: unsupported idempotency {idempotency!r}"
-            )
+            raise ContractConfigurationError(f"{schema}: unsupported idempotency {idempotency!r}")
         errors = metadata.get("errors")
         if not isinstance(errors, list):
-            raise ContractConfigurationError(
-                f"{schema}: method Contract errors must be an array"
-            )
+            raise ContractConfigurationError(f"{schema}: method Contract errors must be an array")
         for error in errors:
             error_metadata = _require_mapping(
                 error,
@@ -301,7 +355,10 @@ def load_contract(schema: Path, *, contract_root: Path = CONTRACT_ROOT) -> Contr
                 schema=schema,
             )
             error_code = _require_string(error_metadata, "code", schema=schema)
-            if not ERROR_CODE_PATTERN.fullmatch(error_code):
+            if (
+                not ERROR_CODE_PATTERN.fullmatch(error_code)
+                and error_code not in LEGACY_DOTTED_ERROR_CODES
+            ):
                 raise ContractConfigurationError(
                     f"{schema}: error code {error_code!r} is not a legal identifier"
                 )
@@ -327,9 +384,7 @@ def load_contract(schema: Path, *, contract_root: Path = CONTRACT_ROOT) -> Contr
         if not isinstance(semantic_kind, str) or not semantic_kind:
             raise ContractConfigurationError(f"{schema}: method kind must be a string")
         if semantic_kind not in METHOD_KINDS:
-            raise ContractConfigurationError(
-                f"{schema}: unsupported method kind {semantic_kind!r}"
-            )
+            raise ContractConfigurationError(f"{schema}: unsupported method kind {semantic_kind!r}")
         if not legacy_contract:
             timeout = metadata.get("timeout")
             if not isinstance(timeout, dict):
@@ -355,10 +410,56 @@ def load_contract(schema: Path, *, contract_root: Path = CONTRACT_ROOT) -> Contr
             if (
                 not WIRE_NAME_PATTERN.fullmatch(capability_name)
                 and capability_name not in LEGACY_ROOT_METHOD_NAMES
+                and capability_name not in LEGACY_HYPHENATED_WIRE_NAMES
             ):
                 raise ContractConfigurationError(
                     f"{schema}: capability name {capability_name!r} is not legal"
                 )
+        lifecycle = metadata.get("lifecycle", "stable")
+        if lifecycle not in METHOD_LIFECYCLES:
+            raise ContractConfigurationError(
+                f"{schema}: method lifecycle {lifecycle!r} is not supported"
+            )
+        canonical_alias = metadata.get("canonicalAlias")
+        if lifecycle == "legacy":
+            if not isinstance(canonical_alias, str) or not canonical_alias:
+                raise ContractConfigurationError(
+                    f"{schema}: legacy method must declare canonicalAlias"
+                )
+            if (
+                not WIRE_NAME_PATTERN.fullmatch(canonical_alias)
+                and canonical_alias not in LEGACY_ROOT_METHOD_NAMES
+                and canonical_alias not in LEGACY_HYPHENATED_WIRE_NAMES
+            ):
+                raise ContractConfigurationError(
+                    f"{schema}: canonicalAlias {canonical_alias!r} is not legal"
+                )
+            if canonical_alias == wire_name:
+                raise ContractConfigurationError(
+                    f"{schema}: legacy method canonicalAlias must differ from its name"
+                )
+        elif canonical_alias is not None:
+            raise ContractConfigurationError(
+                f"{schema}: stable method must not declare canonicalAlias"
+            )
+        compatibility_aliases = metadata.get("compatibilityAliases", [])
+        if not isinstance(compatibility_aliases, list) or any(
+            not isinstance(alias, str)
+            or not alias
+            or (
+                not WIRE_NAME_PATTERN.fullmatch(alias)
+                and alias not in LEGACY_ROOT_METHOD_NAMES
+                and alias not in LEGACY_HYPHENATED_WIRE_NAMES
+            )
+            for alias in compatibility_aliases
+        ):
+            raise ContractConfigurationError(
+                f"{schema}: compatibilityAliases must contain legal wire names"
+            )
+        if len(set(compatibility_aliases)) != len(compatibility_aliases):
+            raise ContractConfigurationError(
+                f"{schema}: compatibilityAliases must not contain duplicates"
+            )
         contract_type: Literal["method", "event"] = "method"
     else:
         metadata = _require_mapping(event, label="x-opensquilla-event", schema=schema)
@@ -368,14 +469,26 @@ def load_contract(schema: Path, *, contract_root: Path = CONTRACT_ROOT) -> Contr
                 f"{schema}: event name {wire_name!r} is not a legal dotted identifier"
             )
         _require_string(metadata, "delivery", schema=schema)
+        wire_names = metadata.get("wireNames")
+        if wire_names is not None:
+            if (
+                not isinstance(wire_names, list)
+                or not wire_names
+                or any(
+                    not isinstance(name, str) or not WIRE_NAME_PATTERN.fullmatch(name)
+                    for name in wire_names
+                )
+                or len(set(wire_names)) != len(wire_names)
+            ):
+                raise ContractConfigurationError(
+                    f"{schema}: event wireNames must be unique legal wire names"
+                )
         schema_version = metadata.get("schemaVersion")
         if type(schema_version) is not int or schema_version < 1:
             raise ContractConfigurationError(
                 f"{schema}: event Contract schemaVersion must be a positive integer"
             )
-        declared_event_targets = [
-            role for role in ("frame", "payload") if role in metadata
-        ]
+        declared_event_targets = [role for role in ("frame", "payload") if role in metadata]
         if len(declared_event_targets) != 1:
             raise ContractConfigurationError(
                 f"{schema}: event Contract must declare exactly one of frame or payload"
@@ -488,17 +601,24 @@ def _capture(command: list[str], *, env: dict[str, str], purpose: str) -> str:
 
 
 def _generator_digest() -> str:
-    source = Path(__file__).read_bytes() + b"\0" + AJV_GENERATOR.read_bytes()
+    source = (
+        Path(__file__).read_bytes()
+        + b"\0"
+        + AJV_GENERATOR.read_bytes()
+        + b"\0"
+        + PRODUCTION_TARGET_MANIFEST.read_bytes()
+    )
     return hashlib.sha256(source).hexdigest()
 
 
 def _header(spec: ContractSpec, prefix: str) -> str:
     source_digest = hashlib.sha256(spec.schema.read_bytes()).hexdigest()
+    # Keep generator provenance in the aggregate registry and compatibility manifest.
+    # Repeating it here makes any generator or target-policy change rewrite every artifact.
     return (
         f"{prefix} @generated by scripts/contracts/generate_gateway_contracts.py; "
         "do not edit.\n"
         f"{prefix} source-sha256: {source_digest}\n"
-        f"{prefix} generator-sha256: {_generator_digest()}\n"
     )
 
 
@@ -564,8 +684,7 @@ def _schema_allows_null(
         branches = schema.get(keyword)
         if isinstance(branches, list):
             branch_results = [
-                _schema_allows_null(branch, definitions, seen_refs=seen_refs)
-                for branch in branches
+                _schema_allows_null(branch, definitions, seen_refs=seen_refs) for branch in branches
             ]
             if keyword == "oneOf":
                 allows = allows and sum(branch_results) == 1
@@ -575,8 +694,7 @@ def _schema_allows_null(
     all_of = schema.get("allOf")
     if isinstance(all_of, list):
         allows = allows and all(
-            _schema_allows_null(branch, definitions, seen_refs=seen_refs)
-            for branch in all_of
+            _schema_allows_null(branch, definitions, seen_refs=seen_refs) for branch in all_of
         )
 
     negated = schema.get("not")
@@ -670,9 +788,7 @@ def _union_parts(node: ast.expr) -> list[ast.expr]:
         return [*_union_parts(node.left), *_union_parts(node.right)]
     if isinstance(node, ast.Subscript):
         value = node.value
-        is_union = (
-            isinstance(value, ast.Name) and value.id == "Union"
-        ) or (
+        is_union = (isinstance(value, ast.Name) and value.id == "Union") or (
             isinstance(value, ast.Attribute)
             and isinstance(value.value, ast.Name)
             and value.value.id == "typing"
@@ -737,9 +853,7 @@ def _normalise_optional_non_nullable_defaults(spec: ContractSpec, text: str) -> 
             definition: _optional_non_nullable_fields_for_definition(spec, definition)
             for definition in _reachable_definition_names(spec, spec.target(target_role))
         }
-    target_fields = {
-        definition: fields for definition, fields in target_fields.items() if fields
-    }
+    target_fields = {definition: fields for definition, fields in target_fields.items() if fields}
     if not target_fields:
         return text
     tree = ast.parse(text)
@@ -810,9 +924,7 @@ def _normalise_optional_non_nullable_defaults(spec: ContractSpec, text: str) -> 
                 line_end = len(text)
             line = text[_source_offset(lines, value_lineno, 0) : line_end]
             if "# type: ignore[assignment]" not in line:
-                replacements.append(
-                    (line_end, line_end, "  # type: ignore[assignment]")
-                )
+                replacements.append((line_end, line_end, "  # type: ignore[assignment]"))
 
     for start, end, replacement in reversed(replacements):
         text = text[:start] + replacement + text[end:]
@@ -842,8 +954,7 @@ def _schema_contains_json_number(
         )
     declared_type = schema.get("type")
     if (isinstance(declared_type, str) and declared_type in {"integer", "number"}) or (
-        isinstance(declared_type, list)
-        and {"integer", "number"}.intersection(declared_type)
+        isinstance(declared_type, list) and {"integer", "number"}.intersection(declared_type)
     ):
         return True
     for keyword in ("anyOf", "oneOf", "allOf", "prefixItems"):
@@ -882,8 +993,7 @@ def _normalise_json_number_types(spec: ContractSpec, text: str) -> str:
     if not isinstance(definitions, dict):
         return text
     has_number = _schema_contains_json_number(spec.document, definitions) or any(
-        _schema_contains_json_number(definition, definitions)
-        for definition in definitions.values()
+        _schema_contains_json_number(definition, definitions) for definition in definitions.values()
     )
     if not has_number:
         return text
@@ -954,9 +1064,7 @@ def _normalise_json_number_types(spec: ContractSpec, text: str) -> str:
     for required_name in ("WithJsonSchema", "BeforeValidator"):
         if required_name not in names:
             names.insert(0, required_name)
-    replacement = "from pydantic import (\n" + "".join(
-        f"    {name},\n" for name in names
-    ) + ")"
+    replacement = "from pydantic import (\n" + "".join(f"    {name},\n" for name in names) + ")"
     text = text[:start] + replacement + text[end:]
     text = re.sub(r"\bStrictInt\b", "_JsonInteger", text)
     text = re.sub(r"\bStrictFloat\b", "_JsonNumber", text)
@@ -983,11 +1091,11 @@ def _normalise_json_number_types(spec: ContractSpec, text: str) -> str:
         )
     if has_strict_float:
         helper_parts.append(
-        "\n\n_JsonNumber = Annotated[\n"
-        "    int | float,\n"
-        "    BeforeValidator(_validate_json_number),\n"
-        "    WithJsonSchema({'type': 'number'}),\n"
-        "]"
+            "\n\n_JsonNumber = Annotated[\n"
+            "    int | float,\n"
+            "    BeforeValidator(_validate_json_number),\n"
+            "    WithJsonSchema({'type': 'number'}),\n"
+            "]"
         )
     if has_strict_int:
         helper_parts.append(
@@ -1003,9 +1111,7 @@ def _normalise_json_number_types(spec: ContractSpec, text: str) -> str:
 
 def _registration_header(specs: tuple[ContractSpec, ...]) -> str:
     sources = b"\0".join(
-        spec.relative_schema.as_posix().encode("utf-8")
-        + b"\0"
-        + spec.schema.read_bytes()
+        spec.relative_schema.as_posix().encode("utf-8") + b"\0" + spec.schema.read_bytes()
         for spec in specs
     )
     return (
@@ -1034,13 +1140,9 @@ def render_registration_descriptor(specs: tuple[ContractSpec, ...]) -> str:
         module = f"opensquilla.contracts.generated.v4.{spec.python_stem}"
         alias_prefix = f"_{spec.python_stem}"
         if spec.contract_type == "method":
-            model_aliases = {
-                role: f"{alias_prefix}_{role}_model" for role, _ in spec.targets
-            }
+            model_aliases = {role: f"{alias_prefix}_{role}_model" for role, _ in spec.targets}
             for role, definition in spec.targets:
-                imports.append(
-                    f"from {module} import {definition} as {model_aliases[role]}"
-                )
+                imports.append(f"from {module} import {definition} as {model_aliases[role]}")
             timeout = _canonical_value(spec.metadata.get("timeout"))
             capability = _canonical_value(spec.metadata.get("capability"))
             errors = _canonical_value(spec.metadata["errors"])
@@ -1080,7 +1182,7 @@ def render_registration_descriptor(specs: tuple[ContractSpec, ...]) -> str:
     imports_block = "\n".join(sorted(imports))
     method_block = "\n".join(method_entries)
     event_block = "\n".join(event_entries)
-    body = f'''from dataclasses import dataclass
+    body = f"""from dataclasses import dataclass
 from typing import Any, Final
 
 {imports_block}
@@ -1122,7 +1224,7 @@ GATEWAY_METHOD_CONTRACTS: Final[dict[str, GatewayMethodContract]] = {{
 GATEWAY_EVENT_CONTRACTS: Final[dict[str, GatewayEventContract]] = {{
 {event_block}
 }}
-'''
+"""
     return _registration_header(specs) + body
 
 
@@ -1186,10 +1288,14 @@ def _typescript_metadata(spec: ContractSpec, text: str) -> str:
     return text.rstrip() + "\n\n" + "\n".join(lines) + "\n"
 
 
-def _validator_declarations(spec: ContractSpec) -> str:
+def _validator_declarations(
+    spec: ContractSpec,
+    roles: tuple[str, ...] | None = None,
+) -> str:
     exports = "\n".join(
         f"export const validate{definition}: ContractValidator"
-        for _, definition in spec.targets
+        for role, definition in spec.targets
+        if roles is None or role in roles
     )
     return _normalise(
         spec,
@@ -1202,7 +1308,80 @@ def _validator_declarations(spec: ContractSpec) -> str:
     )
 
 
-def render_generic(spec: ContractSpec) -> dict[Path, str]:
+def _render_validators(
+    spec: ContractSpec,
+    roles: tuple[str, ...] | None,
+) -> dict[Path, str]:
+    if roles == ():
+        return {}
+    available = {role for role, _ in spec.targets}
+    if roles is not None and (not set(roles) <= available or len(set(roles)) != len(roles)):
+        raise ContractConfigurationError(f"invalid validator roles for {spec.wire_name}")
+    command = ["node", str(AJV_GENERATOR), str(spec.schema), "--esm"]
+    if roles is not None:
+        command.extend(["--roles", ",".join(roles)])
+    validator = _capture(
+        command,
+        env=_environment(),
+        purpose=f"validator generation for {spec.wire_name}",
+    )
+    return {
+        spec.outputs[3]: _normalise(spec, validator, prefix="//"),
+        spec.outputs[4]: _validator_declarations(spec, roles),
+    }
+
+
+def _typescript_params_schema(spec: ContractSpec) -> dict[str, Any]:
+    """Expose required-only object alternatives to the pinned TS compiler.
+
+    json-schema-to-typescript otherwise loses the surrounding properties when
+    an anyOf branch only names required fields. Distribute those constraints
+    in a private compiler input; the wire schema and runtime validators retain
+    their original source.
+    """
+
+    document = copy.deepcopy(spec.document)
+    if spec.contract_type != "method":
+        return document
+    for name in _reachable_definition_names(spec, spec.target("params")):
+        schema = document["$defs"][name]
+        branches = schema.get("anyOf")
+        properties = schema.get("properties")
+        if (
+            schema.get("type") != "object"
+            or not isinstance(properties, dict)
+            or not isinstance(branches, list)
+            or not branches
+            or any(key in schema for key in ("$id", "$anchor", "$dynamicAnchor", "$defs"))
+            or not all(
+                isinstance(branch, dict)
+                and set(branch) == {"required"}
+                and isinstance(branch["required"], list)
+                and all(isinstance(key, str) and key in properties for key in branch["required"])
+                for branch in branches
+            )
+        ):
+            continue
+        common = {key: value for key, value in schema.items() if key != "anyOf"}
+        document["$defs"][name] = {
+            "anyOf": [
+                {
+                    **common,
+                    "required": list(
+                        dict.fromkeys([*common.get("required", []), *branch["required"]])
+                    ),
+                }
+                for branch in branches
+            ]
+        }
+    return document
+
+
+def render_generic(
+    spec: ContractSpec,
+    *,
+    validator_roles: tuple[str, ...] | None = None,
+) -> dict[Path, str]:
     """Render one non-legacy Contract with the pinned generators."""
 
     if spec.uses_legacy_generator:
@@ -1214,6 +1393,11 @@ def render_generic(spec: ContractSpec) -> dict[Path, str]:
         tmp = Path(raw_tmp)
         python_tmp = tmp / f"{spec.python_stem}.py"
         typescript_tmp = tmp / f"{spec.typescript_stem}.ts"
+        typescript_schema = _typescript_params_schema(spec)
+        typescript_input = spec.schema
+        if typescript_schema != spec.document:
+            typescript_input = tmp / spec.schema.name
+            _write_text_lf(typescript_input, json.dumps(typescript_schema, ensure_ascii=False))
         _run(
             [
                 sys.executable,
@@ -1245,16 +1429,16 @@ def render_generic(spec: ContractSpec) -> dict[Path, str]:
             env=env,
             purpose=f"Python generation for {spec.wire_name}",
         )
+        # Invoke the pinned package's json2ts entry point directly; npm exec
+        # would start another npm process for every Schema in every render.
         _run(
             [
-                "npm",
-                "--prefix",
-                "opensquilla-webui",
-                "exec",
-                "--",
-                "json2ts",
+                "node",
+                str(TYPESCRIPT_GENERATOR),
                 "--input",
-                str(spec.schema),
+                str(typescript_input),
+                "--cwd",
+                str(spec.schema.parent),
                 "--output",
                 str(typescript_tmp),
                 "--unreachableDefinitions",
@@ -1264,14 +1448,8 @@ def render_generic(spec: ContractSpec) -> dict[Path, str]:
             env=env,
             purpose=f"TypeScript generation for {spec.wire_name}",
         )
-        validator = _capture(
-            ["node", str(AJV_GENERATOR), str(spec.schema), "--esm"],
-            env=env,
-            purpose=f"validator generation for {spec.wire_name}",
-        )
-        python_output, metadata_output, typescript_output, validator_output, declarations_output = (
-            spec.outputs
-        )
+        validators = _render_validators(spec, validator_roles)
+        python_output, metadata_output, typescript_output = spec.outputs[:3]
         python_source = _normalise_json_number_types(
             spec,
             python_tmp.read_text(encoding="utf-8"),
@@ -1292,8 +1470,7 @@ def render_generic(spec: ContractSpec) -> dict[Path, str]:
                 ),
                 prefix="//",
             ),
-            validator_output: _normalise(spec, validator, prefix="//"),
-            declarations_output: _validator_declarations(spec),
+            **validators,
         }
 
 
@@ -1313,7 +1490,12 @@ def _load_legacy_generator(generator: Path) -> Any:
     return module
 
 
-def _run_legacy(spec: ContractSpec, mode: Mode) -> int:
+def render_legacy(spec: ContractSpec) -> dict[Path, str]:
+    """Render the three frozen legacy type artifacts.
+
+    Runtime validators intentionally use ``_render_validators`` so production
+    adapters receive the same browser-safe ESM format as every other Contract.
+    """
     generator = next(
         generator
         for schema, generator in LEGACY_GENERATORS.items()
@@ -1328,65 +1510,128 @@ def _run_legacy(spec: ContractSpec, mode: Mode) -> int:
     # Keep the historical generator byte-for-byte stable while making its
     # npm invocation work on Windows, where the executable is npm.cmd.
     legacy._run = portable_run
-    first = legacy.render()
-    if mode == "verify-determinism":
-        return int(first != legacy.render())
-    if mode == "write":
-        for path, content in (
-            (legacy.PYTHON_OUTPUT, first.python),
-            (legacy.PYTHON_METADATA_OUTPUT, first.python_metadata),
-            (legacy.TYPESCRIPT_OUTPUT, first.typescript),
-            (legacy.VALIDATOR_OUTPUT, first.validator_javascript),
-            (legacy.VALIDATOR_DECLARATIONS_OUTPUT, first.validator_declarations),
-        ):
-            current = path.read_text(encoding="utf-8") if path.exists() else None
-            if current != content:
-                _write_text_lf(path, content)
-        return 0
-    return int(legacy._check(first))
-
-
-def _run_generic(spec: ContractSpec, mode: Mode) -> int:
-    rendered = render_generic(spec)
-    if mode == "verify-determinism":
-        if rendered != render_generic(spec):
-            print(f"non-deterministic Contract generation: {spec.schema}", file=sys.stderr)
-            return 1
-        return 0
-    if mode == "write":
-        for path, content in rendered.items():
-            _write_text_lf(path, content)
-        return 0
-
-    stale = []
-    for path, content in rendered.items():
-        current = path.read_text(encoding="utf-8") if path.exists() else None
-        if current != content:
-            stale.append(path)
-    for path in stale:
-        print(f"stale generated Gateway Contract artifact: {path}", file=sys.stderr)
-    return int(bool(stale))
-
-
-def _run_registration_descriptor(specs: tuple[ContractSpec, ...], mode: Mode) -> int:
-    rendered = render_registration_descriptor(specs)
-    if mode == "verify-determinism":
-        return int(rendered != render_registration_descriptor(specs))
-    if mode == "write":
-        _write_text_lf(REGISTRATION_OUTPUT, rendered)
-        return 0
-    current = (
-        REGISTRATION_OUTPUT.read_text(encoding="utf-8")
-        if REGISTRATION_OUTPUT.exists()
-        else None
-    )
-    if current != rendered:
-        print(
-            f"stale generated Gateway Contract artifact: {REGISTRATION_OUTPUT}",
-            file=sys.stderr,
+    rendered = legacy.render()
+    return dict(
+        zip(
+            spec.outputs[:3],
+            (rendered.python, rendered.python_metadata, rendered.typescript),
+            strict=True,
         )
-        return 1
-    return 0
+    )
+
+
+def _canonical_schema_bytes(spec: ContractSpec) -> bytes:
+    return json.dumps(
+        spec.document,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+
+
+def _schema_digest(spec: ContractSpec) -> str:
+    return hashlib.sha256(_canonical_schema_bytes(spec)).hexdigest()
+
+
+def _schema_tree_digest(specs: tuple[ContractSpec, ...]) -> str:
+    digest = hashlib.sha256()
+    for spec in sorted(specs, key=lambda item: item.relative_schema.as_posix()):
+        digest.update(spec.relative_schema.as_posix().encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(_canonical_schema_bytes(spec))
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
+def render_compatibility_manifest(specs: tuple[ContractSpec, ...]) -> str:
+    """Render the Schema-owned method lifecycle and event-family identities."""
+
+    method_specs = {spec.wire_name: spec for spec in specs if spec.contract_type == "method"}
+    for spec in method_specs.values():
+        lifecycle = str(spec.metadata.get("lifecycle", "stable"))
+        if lifecycle == "legacy":
+            canonical_name = str(spec.metadata["canonicalAlias"])
+            canonical = method_specs.get(canonical_name)
+            if canonical is None:
+                raise ContractConfigurationError(
+                    f"{spec.schema}: canonicalAlias {canonical_name!r} has no method Contract"
+                )
+            if canonical.metadata.get("lifecycle", "stable") != "stable":
+                raise ContractConfigurationError(
+                    f"{spec.schema}: canonicalAlias {canonical_name!r} is not stable"
+                )
+            aliases = canonical.metadata.get("compatibilityAliases", [])
+            if spec.wire_name not in aliases:
+                raise ContractConfigurationError(
+                    f"{canonical.schema}: compatibilityAliases must include "
+                    f"legacy method {spec.wire_name!r}"
+                )
+        else:
+            for alias in spec.metadata.get("compatibilityAliases", []):
+                legacy = method_specs.get(alias)
+                if (
+                    legacy is None
+                    or legacy.metadata.get("lifecycle") != "legacy"
+                    or legacy.metadata.get("canonicalAlias") != spec.wire_name
+                ):
+                    raise ContractConfigurationError(
+                        f"{spec.schema}: compatibility alias {alias!r} must be backed "
+                        "by a legacy method Contract"
+                    )
+
+    methods: list[dict[str, Any]] = []
+    events: list[dict[str, Any]] = []
+    for spec in specs:
+        schema_path = spec.relative_schema.as_posix()
+        schema_digest = _schema_digest(spec)
+        if spec.contract_type == "method":
+            lifecycle = str(spec.metadata.get("lifecycle", "stable"))
+            entry: dict[str, Any] = {
+                "name": spec.wire_name,
+                "lifecycle": lifecycle,
+                "schema": schema_path,
+                "schemaSha256": schema_digest,
+            }
+            if lifecycle == "legacy":
+                entry["canonicalName"] = spec.metadata["canonicalAlias"]
+            aliases = spec.metadata.get("compatibilityAliases", [])
+            if aliases:
+                entry["compatibilityAliases"] = list(aliases)
+            methods.append(entry)
+            continue
+
+        declared_wire_names = spec.metadata.get("wireNames")
+        wire_names = (
+            list(declared_wire_names) if isinstance(declared_wire_names, list) else [spec.wire_name]
+        )
+        events.append(
+            {
+                "family": spec.wire_name,
+                "wireNames": wire_names,
+                "delivery": spec.metadata["delivery"],
+                "schemaVersion": spec.metadata["schemaVersion"],
+                "schema": schema_path,
+                "schemaSha256": schema_digest,
+            }
+        )
+
+    methods.sort(key=lambda entry: str(entry["name"]))
+    events.sort(key=lambda entry: str(entry["family"]))
+    manifest = {
+        "format": 1,
+        "protocol": GATEWAY_PROTOCOL,
+        "wireVersion": 4,
+        "source": {
+            "schemaCount": len(specs),
+            "methodCount": len(methods),
+            "eventFamilyCount": len(events),
+            "schemaTreeSha256": _schema_tree_digest(specs),
+            "generatorSha256": _generator_digest(),
+        },
+        "methods": methods,
+        "events": events,
+    }
+    return json.dumps(manifest, indent=2, sort_keys=True) + "\n"
 
 
 GENERATED_MARKERS = (
@@ -1443,33 +1688,60 @@ def reconcile_orphans(
     return 0
 
 
-def expected_artifacts(specs: tuple[ContractSpec, ...]) -> frozenset[Path]:
+def expected_artifacts(
+    specs: tuple[ContractSpec, ...],
+    *,
+    profile: Profile = "production",
+) -> frozenset[Path]:
+    targets = load_production_targets(discover_contracts()) if profile == "production" else None
     return frozenset(
-        [REGISTRATION_OUTPUT]
-        + [output for spec in specs for output in spec.outputs]
+        [REGISTRATION_OUTPUT, COMPATIBILITY_MANIFEST_OUTPUT]
+        + [
+            output
+            for spec in specs
+            for output in (
+                spec.outputs
+                if targets is None or targets.get((spec.contract_type, spec.wire_name))
+                else spec.outputs[:3]
+            )
+        ]
     )
 
 
-def build_hash_manifest(specs: tuple[ContractSpec, ...]) -> dict[str, object]:
+def build_hash_manifest(
+    specs: tuple[ContractSpec, ...],
+    *,
+    profile: Profile = "production",
+    output_root: Path | None = None,
+) -> dict[str, object]:
     """Build a portable, derived manifest for cross-platform CI comparison."""
 
-    expected = expected_artifacts(specs)
+    destination = _destination_root(profile, output_root)
+    expected = frozenset(
+        destination / path.relative_to(ROOT) for path in expected_artifacts(specs, profile=profile)
+    )
+    _validate_output_tree(destination, expected)
     missing = sorted((path for path in expected if not path.exists()), key=str)
     if missing:
         raise RuntimeError(
-            "cannot hash missing generated artifacts: "
-            + ", ".join(str(path) for path in missing)
+            "cannot hash missing generated artifacts: " + ", ".join(str(path) for path in missing)
         )
     artifacts: dict[str, str] = {}
     for path in sorted(expected, key=lambda item: item.as_posix()):
         text = path.read_text(encoding="utf-8").replace("\r\n", "\n")
-        relative = path.relative_to(ROOT).as_posix()
+        relative = path.relative_to(destination).as_posix()
         artifacts[relative] = hashlib.sha256(text.encode("utf-8")).hexdigest()
     return {"format": 1, "artifacts": artifacts}
 
 
-def write_hash_manifest(path: Path, specs: tuple[ContractSpec, ...]) -> None:
-    manifest = build_hash_manifest(specs)
+def write_hash_manifest(
+    path: Path,
+    specs: tuple[ContractSpec, ...],
+    *,
+    profile: Profile = "production",
+    output_root: Path | None = None,
+) -> None:
+    manifest = build_hash_manifest(specs, profile=profile, output_root=output_root)
     _write_text_lf(
         path,
         json.dumps(manifest, indent=2, sort_keys=True) + "\n",
@@ -1478,9 +1750,7 @@ def write_hash_manifest(path: Path, specs: tuple[ContractSpec, ...]) -> None:
 
 def _validate_hash_manifest(value: object, *, label: str) -> dict[str, str]:
     if not isinstance(value, dict) or set(value) != {"format", "artifacts"}:
-        raise RuntimeError(
-            f"{label} Contract hash manifest must contain only format and artifacts"
-        )
+        raise RuntimeError(f"{label} Contract hash manifest must contain only format and artifacts")
     if type(value["format"]) is not int or value["format"] != 1:
         raise RuntimeError(f"{label} Contract hash manifest format must be 1")
     artifacts = value["artifacts"]
@@ -1493,19 +1763,14 @@ def _validate_hash_manifest(value: object, *, label: str) -> dict[str, str]:
         if not isinstance(raw_path, str) or not raw_path or "\\" in raw_path:
             raise RuntimeError(f"{label} Contract hash manifest has an invalid path")
         path = PurePosixPath(raw_path)
-        if (
-            path.is_absolute()
-            or ".." in path.parts
-            or path.as_posix() != raw_path
-        ):
+        if path.is_absolute() or ".." in path.parts or path.as_posix() != raw_path:
             raise RuntimeError(
                 f"{label} Contract hash manifest path must be canonical and repo-relative: "
                 f"{raw_path!r}"
             )
         if not isinstance(digest, str) or not SHA256_PATTERN.fullmatch(digest):
             raise RuntimeError(
-                f"{label} Contract hash manifest digest must be lowercase sha256: "
-                f"{raw_path!r}"
+                f"{label} Contract hash manifest digest must be lowercase sha256: {raw_path!r}"
             )
         validated[raw_path] = digest
     return validated
@@ -1532,19 +1797,149 @@ def compare_hash_manifests(left: Path, right: Path) -> int:
     return 1
 
 
-def run(mode: Mode, specs: tuple[ContractSpec, ...] | None = None) -> int:
-    """Run the requested mode for all discovered Contracts."""
+def _destination_root(profile: Profile, output_root: Path | None) -> Path:
+    if profile not in ("production", "verification"):
+        raise ContractConfigurationError(f"unknown Contract profile: {profile}")
+    if profile == "production" and output_root is None:
+        return ROOT
+    if output_root is None:
+        raise ContractConfigurationError("verification output must be outside the production tree")
+    destination = output_root.resolve()
+    if destination.is_relative_to(ROOT) or ROOT.is_relative_to(destination):
+        raise ContractConfigurationError("profile output must be outside the production tree")
+    return destination
 
+
+def _validate_output_tree(destination: Path, paths: frozenset[Path]) -> None:
+    """Preflight the complete publication/cleanup surface before touching files."""
+    roots = tuple(
+        destination / root.relative_to(ROOT)
+        for root in (PYTHON_OUTPUT_ROOT, TYPESCRIPT_OUTPUT_ROOT)
+    )
+    for path in (*paths, *roots):
+        if not path.resolve().is_relative_to(destination):
+            raise ContractConfigurationError(f"generated output is outside its tree: {path}")
+        for ancestor in (path, *path.parents):
+            if ancestor == destination:
+                break
+            if ancestor.is_symlink() or ancestor.is_junction():
+                raise ContractConfigurationError(f"generated output contains a link: {ancestor}")
+    pending = list(roots)
+    while pending:
+        path = pending.pop()
+        if path.is_symlink() or path.is_junction():
+            raise ContractConfigurationError(f"generated output contains a link: {path}")
+        if path.is_dir():
+            pending.extend(path.iterdir())
+
+
+def render_tree(
+    specs: tuple[ContractSpec, ...],
+    *,
+    profile: Profile = "production",
+    jobs: int = 1,
+) -> dict[Path, str]:
+    """Compile the entire tree before publishing artifacts or deleting orphans."""
+    _validate_jobs(jobs)
+    targets = load_production_targets(discover_contracts()) if profile == "production" else None
+    ordered = tuple(sorted(specs, key=lambda spec: spec.relative_schema.as_posix()))
+
+    def render_contract(spec: ContractSpec) -> dict[Path, str]:
+        roles = None if targets is None else targets.get((spec.contract_type, spec.wire_name), ())
+        if spec.uses_legacy_generator:
+            artifacts = render_legacy(spec)
+            # Production now publishes the selected sessions.list result role;
+            # verification materializes all four roles. The legacy generator
+            # remains authoritative only for the three frozen type artifacts.
+            artifacts.update(_render_validators(spec, roles))
+            return artifacts
+        return render_generic(spec, validator_roles=roles)
+
+    rendered: dict[Path, str] = {}
+
+    def merge_artifacts(artifacts: dict[Path, str]) -> None:
+        duplicate = rendered.keys() & artifacts.keys()
+        if duplicate:
+            raise ContractConfigurationError(f"duplicate generated artifact: {sorted(duplicate)}")
+        rendered.update(artifacts)
+
+    if jobs == 1:
+        for spec in ordered:
+            merge_artifacts(render_contract(spec))
+    else:
+        # Workers only render into private temporary directories. map yields
+        # results in Schema order, independently of worker completion order.
+        with ThreadPoolExecutor(max_workers=jobs) as executor:
+            for artifacts in executor.map(render_contract, ordered):
+                merge_artifacts(artifacts)
+    rendered[REGISTRATION_OUTPUT] = render_registration_descriptor(ordered)
+    rendered[COMPATIBILITY_MANIFEST_OUTPUT] = render_compatibility_manifest(ordered)
+    return rendered
+
+
+def run(
+    mode: Mode,
+    specs: tuple[ContractSpec, ...] | None = None,
+    *,
+    profile: Profile = "production",
+    output_root: Path | None = None,
+    jobs: int = 1,
+) -> int:
+    """Generate, check, or independently regenerate a complete profile tree."""
+    _validate_jobs(jobs)
+    destination = _destination_root(profile, output_root)
     selected = specs if specs is not None else discover_contracts()
+    rendered = render_tree(selected, profile=profile, jobs=jobs)
+    expected = frozenset(destination / path.relative_to(ROOT) for path in rendered)
+    _validate_output_tree(destination, expected)
+    if mode in ("verify-determinism", "write-determinism", "check-determinism"):
+        # Each render invokes the pinned tools in independent temporary dirs.
+        second = render_tree(tuple(reversed(selected)), profile=profile, jobs=jobs)
+        if rendered != second:
+            print("non-deterministic Gateway Contract artifact tree", file=sys.stderr)
+            return 1
+        if mode == "verify-determinism":
+            return 0
+        mode = "write" if mode == "write-determinism" else "check"
+        # Recheck the publication surface after the independent second render.
+        _validate_output_tree(destination, expected)
     failed = False
-    for spec in selected:
-        result = _run_legacy(spec, mode) if spec.uses_legacy_generator else _run_generic(spec, mode)
-        failed = bool(result) or failed
-    failed = bool(_run_registration_descriptor(selected, mode)) or failed
-    failed = bool(
-        reconcile_orphans(expected_artifacts(selected), mode=mode)
-    ) or failed
-    return int(failed)
+    for path, content in rendered.items():
+        target = destination / path.relative_to(ROOT)
+        current = target.read_text(encoding="utf-8") if target.exists() else None
+        if current == content:
+            continue
+        if mode == "write":
+            _write_text_lf(target, content)
+        else:
+            print(f"stale generated Gateway Contract artifact: {target}", file=sys.stderr)
+            failed = True
+    roots = tuple(
+        destination / root.relative_to(ROOT)
+        for root in (
+            PYTHON_OUTPUT_ROOT,
+            TYPESCRIPT_OUTPUT_ROOT,
+        )
+    )
+    return int(bool(reconcile_orphans(expected, mode=mode, roots=roots)) or failed)
+
+
+def _validate_jobs(jobs: int) -> None:
+    if type(jobs) is not int or not 1 <= jobs <= MAX_GENERATOR_JOBS:
+        raise ContractConfigurationError(
+            f"generator jobs must be between 1 and {MAX_GENERATOR_JOBS}"
+        )
+
+
+def _parse_jobs(value: str) -> int:
+    try:
+        jobs = int(value)
+        _validate_jobs(jobs)
+    except (ValueError, ContractConfigurationError) as exc:
+        raise argparse.ArgumentTypeError(
+            f"generator jobs must be between 1 and {MAX_GENERATOR_JOBS}"
+        ) from exc
+    return jobs
 
 
 def main() -> int:
@@ -1553,8 +1948,18 @@ def main() -> int:
     mode.add_argument("--write", action="store_true")
     mode.add_argument("--check", action="store_true")
     mode.add_argument("--verify-determinism", action="store_true")
+    mode.add_argument("--check-determinism", action="store_true")
+    mode.add_argument("--write-determinism", action="store_true")
     mode.add_argument("--hash-manifest", type=Path)
     mode.add_argument("--compare-hash-manifests", nargs=2, type=Path)
+    parser.add_argument("--profile", choices=("production", "verification"), default="production")
+    parser.add_argument("--output-root", type=Path)
+    parser.add_argument(
+        "--jobs",
+        type=_parse_jobs,
+        default=1,
+        help=f"parallel Schema compilers (1-{MAX_GENERATOR_JOBS})",
+    )
     args = parser.parse_args()
     try:
         if args.compare_hash_manifests:
@@ -1562,16 +1967,27 @@ def main() -> int:
             return compare_hash_manifests(left, right)
         specs = discover_contracts()
         if args.hash_manifest:
-            write_hash_manifest(args.hash_manifest, specs)
+            write_hash_manifest(
+                args.hash_manifest,
+                specs,
+                profile=args.profile,
+                output_root=args.output_root,
+            )
             return 0
         selected_mode: Mode
         if args.write:
             selected_mode = "write"
         elif args.verify_determinism:
             selected_mode = "verify-determinism"
+        elif args.check_determinism:
+            selected_mode = "check-determinism"
+        elif args.write_determinism:
+            selected_mode = "write-determinism"
         else:
             selected_mode = "check"
-        return run(selected_mode, specs)
+        return run(
+            selected_mode, specs, profile=args.profile, output_root=args.output_root, jobs=args.jobs
+        )
     except (ContractConfigurationError, RuntimeError) as exc:
         print(str(exc), file=sys.stderr)
         return 1

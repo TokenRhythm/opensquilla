@@ -1,9 +1,8 @@
 """Unified-diff instrumentation classification.
 
-Covers the classifier behind the endgame instrumentation policies: the git
-freeze exemption (OPENSQUILLA_ENDGAME_GIT_FREEZE_INSTRUMENTATION_EXEMPT) and
-the final-diff salvage veto (OPENSQUILLA_FINAL_DIFF_SALVAGE_VETO) both need to
-tell diagnostic print/log additions apart from substantive changes.
+Covers the classifier used by the final-diff salvage veto
+(OPENSQUILLA_FINAL_DIFF_SALVAGE_VETO) to tell diagnostic print/log additions
+apart from substantive changes.
 Classification is conservative: anything not positively identified as
 instrumentation counts as substantive.
 """

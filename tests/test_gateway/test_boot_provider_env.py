@@ -7,12 +7,12 @@ import pytest
 
 from opensquilla.gateway.config import GatewayConfig
 from opensquilla.gateway.llm_runtime import resolve_llm_runtime_config
+from opensquilla.gateway.provider_runtime import sync_provider_selector as _sync_provider_selector
 from opensquilla.gateway.rpc_config import (
     _handle_config_apply,
     _handle_config_patch,
     _handle_config_patch_safe,
     _handle_config_set,
-    _sync_provider_selector,
 )
 from opensquilla.onboarding.config_store import load_config
 
@@ -261,7 +261,10 @@ async def test_config_apply_marks_absorbed_generic_key_before_persist_and_resolu
                     "model": model,
                     "api_key_env": "NEW_ENDPOINT_KEY",
                     "base_url": base_url,
-                }
+                },
+                # This key-resolution test selects a direct deployment;
+                # retaining the default foreign Router requires consent.
+                "squilla_router": {"enabled": False},
             }
         },
         ctx,
@@ -273,6 +276,7 @@ async def test_config_apply_marks_absorbed_generic_key_before_persist_and_resolu
     assert runtime.api_key == ""
     assert runtime.api_key_env_name == "NEW_ENDPOINT_KEY"
     assert "synthetic-generic-key" not in persisted
+    assert ctx.config.squilla_router.enabled is False
 
 
 @pytest.mark.parametrize("mutation", ["set", "patch"])
@@ -469,6 +473,28 @@ async def test_config_patch_safe_accepts_privacy_network_observability_toggle(tm
     assert ctx.config.privacy.disable_network_observability is True
     persisted = tomllib.loads((tmp_path / "config.toml").read_text())
     assert persisted["privacy"]["disable_network_observability"] is True
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "privacy.reliability_diagnostics_enabled",
+        "privacy.reliability_notice_version",
+        "privacy.reliability_consented_at_utc",
+        "privacy.product_analytics_enabled",
+        "privacy.product_analytics_notice_version",
+        "privacy.product_analytics_consented_at_utc",
+    ],
+)
+async def test_config_patch_safe_rejects_server_owned_telemetry_consent(
+    tmp_path,
+    path: str,
+) -> None:
+    cfg = GatewayConfig(config_path=str(tmp_path / "config.toml"))
+    ctx = SimpleNamespace(config=cfg)
+
+    with pytest.raises(ValueError, match="not safe for operator.write"):
+        await _handle_config_patch_safe({"patches": {path: True}}, ctx)
 
 
 async def test_config_patch_safe_accepts_memory_auto_capture_toggle(tmp_path) -> None:

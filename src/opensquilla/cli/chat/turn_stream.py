@@ -33,6 +33,7 @@ from opensquilla.engine.types import done_text_snapshot
 from opensquilla.execution_status import derive_is_error
 from opensquilla.router_tiers import tier_index
 from opensquilla.session.terminal_reply import build_terminal_reply
+from opensquilla.telemetry.contracts.common import ClientSurface, ExecutionMode
 
 _DEFAULT_STREAM_HEARTBEAT_INTERVAL_SECONDS = 15.0
 _DEFAULT_STREAM_IDLE_TIMEOUT_SECONDS = 600.0
@@ -155,6 +156,45 @@ def image_prompt_and_attachments(command: str) -> tuple[str, list[dict[str, str]
     raise ValueError("Image attachments are not configured.")
 
 
+async def _standalone_session_owner_kwargs(
+    session_manager: Any,
+    turn_runner: Any,
+    session_key: str,
+) -> dict[str, Any]:
+    from opensquilla.engine.runtime import _accepts_explicit_keyword_arg
+    from opensquilla.gateway.session_services import get_session_storage
+    from opensquilla.session.storage import SessionStorage
+
+    storage = get_session_storage(session_manager)
+    if not isinstance(storage, SessionStorage):
+        return {}
+    if not all(
+        _accepts_explicit_keyword_arg(session_manager.append_message, name)
+        for name in ("expected_session_id", "expected_session_epoch")
+    ):
+        raise RuntimeError("Session writer cannot enforce a durable owner")
+    if not all(
+        _accepts_explicit_keyword_arg(turn_runner.run, name)
+        for name in ("expected_session_id", "expected_session_epoch")
+    ):
+        raise RuntimeError("Turn runner cannot enforce a durable owner")
+    session = await storage.get_session(session_key)
+    session_id = getattr(session, "session_id", None)
+    session_epoch = getattr(session, "epoch", None)
+    if (
+        not isinstance(session_id, str)
+        or not session_id
+        or isinstance(session_epoch, bool)
+        or not isinstance(session_epoch, int)
+        or session_epoch < 0
+    ):
+        raise RuntimeError("Session has no durable owner")
+    return {
+        "expected_session_id": session_id,
+        "expected_session_epoch": session_epoch,
+    }
+
+
 def default_turn_stream_dependencies(
     *,
     renderer_factory: Callable[..., Any] | None = None,
@@ -175,9 +215,7 @@ def default_turn_stream_dependencies(
             _BackendFallbackRenderer if renderer_factory is None else renderer_factory
         ),
         stream_wrapper=wrap_cli_turn_stream if stream_wrapper is None else stream_wrapper,
-        approval_handler=(
-            _noop_approval_handler if approval_handler is None else approval_handler
-        ),
+        approval_handler=(_noop_approval_handler if approval_handler is None else approval_handler),
         cancel_clearer=_noop_cancel_clearer if cancel_clearer is None else cancel_clearer,
         image_attachment_builder=(
             image_prompt_and_attachments
@@ -919,9 +957,7 @@ async def stream_response_gateway(
                         if callable(bind_identity):
                             turn_id = event.get("turn_id") or event.get("task_id")
                             client_message_id = event.get("client_message_id")
-                            if isinstance(turn_id, str) and isinstance(
-                                client_message_id, str
-                            ):
+                            if isinstance(turn_id, str) and isinstance(client_message_id, str):
                                 await bind_identity(turn_id, client_message_id)
                     elif event_name == "session.event.text_delta":
                         await _append_text_delta(
@@ -1010,9 +1046,7 @@ async def stream_response_gateway(
                             source="gateway",
                             turn_id=session_key,
                         )
-                        tool_name = (
-                            event.get("tool_name") or event.get("toolName") or "tool"
-                        )
+                        tool_name = event.get("tool_name") or event.get("toolName") or "tool"
                         tool_args = event.get("input") or event.get("arguments")
                         tool_use_id = event.get("tool_use_id") or event.get("toolUseId")
                         _emit_tui_domain_event(
@@ -1050,11 +1084,8 @@ async def stream_response_gateway(
                         if not is_approval_or_blocked_result(event.get("result")):
                             tool_use_id = event.get("tool_use_id") or event.get("toolUseId")
                             success = _tool_result_success_from_status(
-                                event.get("execution_status")
-                                or event.get("executionStatus"),
-                                legacy_is_error=bool(
-                                    event.get("is_error") or event.get("isError")
-                                ),
+                                event.get("execution_status") or event.get("executionStatus"),
+                                legacy_is_error=bool(event.get("is_error") or event.get("isError")),
                             )
                             _emit_tui_domain_event(
                                 stream_deps,
@@ -1065,9 +1096,7 @@ async def stream_response_gateway(
                                     "success": success,
                                     "execution_status": event.get("execution_status")
                                     or event.get("executionStatus"),
-                                    "is_error": bool(
-                                        event.get("is_error") or event.get("isError")
-                                    ),
+                                    "is_error": bool(event.get("is_error") or event.get("isError")),
                                 },
                                 turn_id=session_key,
                             )
@@ -1181,7 +1210,13 @@ async def stream_response_gateway(
                         )
             except (KeyboardInterrupt, asyncio.CancelledError):
                 stream_deps.cancel_clearer()
-                await client.abort_session(session_key)
+                try:
+                    await client.abort_session(session_key)
+                except Exception:
+                    # The gateway connection may already be gone (that is
+                    # often why the user interrupted). The turn is still
+                    # cancelled locally so the REPL can re-prompt.
+                    pass
                 cancelled = True
             except Exception:
                 await _finish_text_delta_stream(
@@ -1287,8 +1322,18 @@ async def stream_response_turnrunner(
     stream_deps = _resolve_tui_event_sink_for_output(stream_deps, tui_output)
     session_manager = getattr(svc, "session_manager", None) if svc is not None else None
     config = getattr(svc, "config", None) if svc is not None else None
+    owner_kwargs = await _standalone_session_owner_kwargs(
+        session_manager,
+        turn_runner,
+        session_key,
+    )
     if session_manager is not None:
-        _persisted = await session_manager.append_message(session_key, role="user", content=message)
+        _persisted = await session_manager.append_message(
+            session_key,
+            role="user",
+            content=message,
+            **owner_kwargs,
+        )
         if _persisted is not None and isinstance(_persisted.content, str):
             message = _persisted.content
     from opensquilla.gateway.session_model_routing import (
@@ -1362,6 +1407,9 @@ async def stream_response_turnrunner(
                         model=model,
                         timeout=timeout,
                         pending_input_provider=pending_input_provider,
+                        telemetry_surface=ClientSurface.TUI,
+                        telemetry_execution_mode=ExecutionMode.STANDALONE,
+                        **owner_kwargs,
                     ),
                     accepted_config,
                 )
@@ -1386,9 +1434,7 @@ async def stream_response_turnrunner(
                             source="turn_runner",
                             turn_id=session_key,
                         )
-                        authoritative_text = str(
-                            event.authoritative_text_snapshot or ""
-                        )
+                        authoritative_text = str(event.authoritative_text_snapshot or "")
                         if event.terminal:
                             terminal_text = str(
                                 event.terminal_text_snapshot
@@ -1700,8 +1746,18 @@ async def handle_image_command_turnrunner(
 
     session_manager = getattr(svc, "session_manager", None) if svc is not None else None
     config = getattr(svc, "config", None) if svc is not None else None
+    owner_kwargs = await _standalone_session_owner_kwargs(
+        session_manager,
+        turn_runner,
+        session_key,
+    )
     if session_manager is not None:
-        _persisted = await session_manager.append_message(session_key, role="user", content=prompt)
+        _persisted = await session_manager.append_message(
+            session_key,
+            role="user",
+            content=prompt,
+            **owner_kwargs,
+        )
         if _persisted is not None and isinstance(_persisted.content, str):
             prompt = _persisted.content
     from opensquilla.gateway.session_model_routing import (
@@ -1748,6 +1804,9 @@ async def handle_image_command_turnrunner(
                         attachments=attachments,
                         timeout=timeout,
                         pending_input_provider=pending_input_provider,
+                        telemetry_surface=ClientSurface.TUI,
+                        telemetry_execution_mode=ExecutionMode.STANDALONE,
+                        **owner_kwargs,
                     ),
                     accepted_config,
                 )

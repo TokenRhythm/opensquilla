@@ -1,8 +1,5 @@
 from __future__ import annotations
 
-from collections.abc import Mapping
-from typing import Any
-
 import pytest
 
 from opensquilla.application.observability import (
@@ -18,10 +15,10 @@ class _LogPort:
     def __init__(self) -> None:
         self.query: LogTailQuery | None = None
 
-    async def status(self) -> Mapping[str, Any]:
+    async def status(self) -> dict[str, object]:
         return {"gateway_file_log": {"enabled": True}}
 
-    async def tail(self, query: LogTailQuery) -> Mapping[str, Any]:
+    async def tail(self, query: LogTailQuery) -> dict[str, object]:
         self.query = query
         return {"lines": ["ready"], "cursor": 5, "has_more": False}
 
@@ -30,42 +27,42 @@ class _ReadinessPort:
     def __init__(self) -> None:
         self.calls: list[str] = []
 
-    async def _ready(self, surface: str) -> Mapping[str, Any]:
+    async def _ready(self, surface: str) -> tuple[ReadinessFinding, ...]:
         self.calls.append(surface)
-        return {}
+        return ()
 
-    async def provider(self, query: ReadinessQuery) -> Mapping[str, Any]:
+    async def provider(self, query: ReadinessQuery) -> tuple[ReadinessFinding, ...]:
         self.calls.append("provider")
         raise RuntimeError("provider unavailable")
 
-    async def logs(self, query: ReadinessQuery) -> Mapping[str, Any]:
+    async def logs(self, query: ReadinessQuery) -> tuple[ReadinessFinding, ...]:
         return await self._ready("logs")
 
-    async def memory(self, query: ReadinessQuery) -> Mapping[str, Any]:
+    async def memory(self, query: ReadinessQuery) -> tuple[ReadinessFinding, ...]:
         return await self._ready("memory")
 
-    async def channels(self, query: ReadinessQuery) -> Mapping[str, Any]:
+    async def channels(self, query: ReadinessQuery) -> tuple[ReadinessFinding, ...]:
         return await self._ready("channels")
 
-    async def sandbox(self, query: ReadinessQuery) -> Mapping[str, Any]:
+    async def sandbox(self, query: ReadinessQuery) -> tuple[ReadinessFinding, ...]:
         return await self._ready("sandbox")
 
-    async def router(self, query: ReadinessQuery) -> Mapping[str, Any]:
+    async def router(self, query: ReadinessQuery) -> tuple[ReadinessFinding, ...]:
         return await self._ready("router")
 
-    async def squilla_router(self, query: ReadinessQuery) -> Mapping[str, Any]:
+    async def squilla_router(self, query: ReadinessQuery) -> tuple[ReadinessFinding, ...]:
         return await self._ready("squilla_router")
 
-    async def memory_embedding(self, query: ReadinessQuery) -> Mapping[str, Any]:
+    async def memory_embedding(self, query: ReadinessQuery) -> tuple[ReadinessFinding, ...]:
         return await self._ready("memory_embedding")
 
-    async def search(self, query: ReadinessQuery) -> Mapping[str, Any]:
+    async def search(self, query: ReadinessQuery) -> tuple[ReadinessFinding, ...]:
         return await self._ready("search")
 
-    async def image_generation(self, query: ReadinessQuery) -> Mapping[str, Any]:
+    async def image_generation(self, query: ReadinessQuery) -> tuple[ReadinessFinding, ...]:
         return await self._ready("image_generation")
 
-    async def llm_ensemble(self, query: ReadinessQuery) -> Mapping[str, Any]:
+    async def llm_ensemble(self, query: ReadinessQuery) -> tuple[ReadinessFinding, ...]:
         return await self._ready("llm_ensemble")
 
 
@@ -73,17 +70,12 @@ class _EvaluationPort:
     def normalize_agent_id(self, value: str) -> str:
         return value.strip().lower()
 
-    def evaluate(
-        self, surface: str, payload: Mapping[str, Any]
-    ) -> tuple[ReadinessFinding, ...]:
-        return ()
-
     def build_report(
         self,
         findings: tuple[ReadinessFinding, ...] | list[ReadinessFinding],
         *,
         config_path: str | None,
-    ) -> dict[str, Any]:
+    ) -> dict[str, object]:
         return {
             "status": "action_required"
             if any(finding.severity == "error" for finding in findings)
@@ -115,9 +107,7 @@ class _EvaluationPort:
 async def test_log_reader_normalizes_tail_query_before_calling_port() -> None:
     port = _LogPort()
 
-    result = await LogReader(port).tail(
-        LogTailQuery(cursor=3, limit=5_000, level=" info ")
-    )
+    result = await LogReader(port).tail(LogTailQuery(cursor=3, limit=5_000, level=" info "))
 
     assert result == {"lines": ["ready"], "cursor": 5, "has_more": False}
     assert port.query == LogTailQuery(cursor=3, limit=1_000, level="INFO")
@@ -165,7 +155,6 @@ async def test_readiness_diagnostics_isolates_collectors_in_stable_order() -> No
     assert unavailable["severity"] == "error"
     assert unavailable["evidence"] == {"errorType": "RuntimeError"}
     assert any(
-        step.get("command")
-        == "opensquilla providers status --json --config /tmp/opensquilla.toml"
+        step.get("command") == "opensquilla providers status --json --config /tmp/opensquilla.toml"
         for step in unavailable["fixSteps"]
     )

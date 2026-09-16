@@ -163,6 +163,22 @@ async def test_squilla_router_refreshes_hold_idle_ttl_through_copied_metadata(
     assert store.get_valid("agent:main:test-refresh") is None
 
 
+def test_old_routing_revision_cannot_consume_new_hold() -> None:
+    cfg = _router_cfg(_router_tier_profile_defaults("openrouter"))
+    store = RouterControlHoldStore()
+    key = "agent:main:revision-hold"
+    store.advance_routing_revision(key, 2)
+    target = resolve_router_control_target(cfg, "tier:c1")
+    hold = store.set_hold(key, target, evidence="synthetic hold", turns_remaining=3)
+
+    assert store.get_valid(key, routing_revision=0, decrement=True) is None
+    assert hold.turns_remaining == 3
+    # A late/idempotent notification cannot clear a newer hold.
+    store.advance_routing_revision(key, 1)
+    store.advance_routing_revision(key, 2)
+    assert store.get_valid(key, routing_revision=2) is hold
+
+
 @pytest.mark.asyncio
 async def test_squilla_router_applies_hold_before_normal_classification(monkeypatch) -> None:
     cfg = _router_cfg(_router_tier_profile_defaults("openrouter"))
@@ -300,6 +316,13 @@ async def test_large_attachment_foreign_hold_veto_fails_closed(monkeypatch) -> N
 
 @pytest.mark.asyncio
 async def test_image_attachments_bypass_text_hold(monkeypatch) -> None:
+    class _TextCatalog:
+        def resolve_deployment_vision_support(self, _model: str, **_kwargs: object) -> str:
+            return "unsupported"
+
+    monkeypatch.setattr(
+        "opensquilla.engine.steps.squilla_router.shared_catalog", lambda: _TextCatalog()
+    )
     cfg = _router_cfg(_router_tier_profile_defaults("openrouter"))
     target = resolve_router_control_target(cfg, "tier:c3")
     store = RouterControlHoldStore()
@@ -325,7 +348,9 @@ async def test_image_attachments_bypass_text_hold(monkeypatch) -> None:
 
     assert out.metadata["routing_source"] == "image_route"
     assert out.metadata.get("router_control_hold_applied") is not True
-    assert out.model == "moonshotai/kimi-k2.6"
+    assert out.model == cfg.tiers["c1"]["model"]
+    assert out.metadata["image_input_mode"] == "marker"
+    assert out.metadata["router_image_capability_exhausted"] is True
 
 
 def test_prompt_block_contains_canonical_targets_not_aliases() -> None:
@@ -344,6 +369,13 @@ def test_prompt_block_contains_canonical_targets_not_aliases() -> None:
     assert "description" not in block
     assert "Use labels only to map explicit model-name requests" in block
     assert "must choose one target_id exactly" in block
+
+
+def test_prompt_block_is_absent_when_router_is_disabled() -> None:
+    cfg = _router_cfg(_router_tier_profile_defaults("openrouter"))
+    cfg.enabled = False
+
+    assert render_router_control_prompt_block(cfg) == ""
 
 
 def test_ensemble_tier_is_presented_as_virtual_model_without_changing_anchor() -> None:

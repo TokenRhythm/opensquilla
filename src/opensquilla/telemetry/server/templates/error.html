@@ -1,0 +1,17 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>埋点预览面板错误</title>
+    <style nonce="{{ csp_nonce }}">
+      body { font: 16px system-ui, sans-serif; max-width: 42rem; margin: 10vh auto; padding: 1rem; color: #172033; }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>预览面板暂不可用（{{ status_code }}）</h1>
+      <p>{{ message }}</p>
+    </main>
+  </body>
+</html>

@@ -26,7 +26,7 @@ from opensquilla.gateway.rpc.registry import RpcContext
 from opensquilla.gateway.rpc_router import (
     _bounded_limit,
     _handle_router_decisions_list,
-    _handle_router_feedback_submit,
+    _submit_route_feedback,
 )
 from opensquilla.gateway.scopes import METHOD_SCOPES, READ_SCOPE, WRITE_SCOPE
 from opensquilla.persistence.migrator import apply_pending
@@ -389,7 +389,7 @@ async def test_feedback_submit_records_to_sidecar(
     writer.record_decision(_base_record())
     before = writer.list_decisions()
 
-    payload = await _handle_router_feedback_submit(
+    payload = await _submit_route_feedback(
         {"decisionId": "d" * 32, "rating": "down"},
         RpcContext(conn_id="test"),
     )
@@ -429,7 +429,7 @@ async def test_feedback_submit_uses_configured_retention_days(
         squilla_router={"self_learning": {"retention_days": 60}}
     )
 
-    payload = await _handle_router_feedback_submit(
+    payload = await _submit_route_feedback(
         {"decisionId": "d" * 32, "rating": "down"},
         RpcContext(conn_id="test", config=cfg),
     )
@@ -442,7 +442,7 @@ async def test_feedback_submit_unknown_decision_is_soft_failure(
     writer: RouterDecisionWriter, tmp_path: Path, monkeypatch
 ) -> None:
     monkeypatch.setenv("OPENSQUILLA_STATE_DIR", str(tmp_path))
-    payload = await _handle_router_feedback_submit(
+    payload = await _submit_route_feedback(
         {"decisionId": "f" * 32, "rating": "up"},
         RpcContext(conn_id="test"),
     )
@@ -457,12 +457,12 @@ async def test_feedback_submit_last_write_wins_and_neutral_revokes(
     from opensquilla.squilla_router.self_learning.feedback import load_feedback_map
 
     ctx = RpcContext(conn_id="test")
-    await _handle_router_feedback_submit({"decisionId": "d" * 32, "rating": "down"}, ctx)
-    await _handle_router_feedback_submit({"decisionId": "d" * 32, "rating": "up"}, ctx)
+    await _submit_route_feedback({"decisionId": "d" * 32, "rating": "down"}, ctx)
+    await _submit_route_feedback({"decisionId": "d" * 32, "rating": "up"}, ctx)
     fb = load_feedback_map("main", home=tmp_path)
     assert fb["d" * 32].rating == "up"  # revision wins
 
-    await _handle_router_feedback_submit(
+    await _submit_route_feedback(
         {"decisionId": "d" * 32, "rating": "neutral"}, ctx
     )
     assert load_feedback_map("main", home=tmp_path) == {}  # revoked
@@ -475,7 +475,7 @@ async def test_feedback_submit_preserves_ensemble_kind(
     monkeypatch.setenv("OPENSQUILLA_STATE_DIR", str(tmp_path))
     writer.record_decision(_base_record(decision_id="e" * 32, executed_kind="ensemble"))
 
-    await _handle_router_feedback_submit(
+    await _submit_route_feedback(
         {"decisionId": "e" * 32, "rating": "down"},
         RpcContext(conn_id="test"),
     )

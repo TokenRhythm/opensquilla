@@ -37,33 +37,6 @@ describe('ChatView prompt annotation focus and reuse', () => {
     expect(source).toContain("t('chat.promptAnnotations.editingBlocked')")
   })
 
-  it('activates the trusted preview before invoking the server focus RPC', () => {
-    const start = chatViewSource.indexOf('async function jumpPromptAnnotation(')
-    const end = chatViewSource.indexOf('\nasync function reusePromptAnnotation(', start)
-    const source = chatViewSource.slice(start, end)
-
-    expect(start).toBeGreaterThan(-1)
-    expect(source).toContain('const activated = await focusArtifactPromptAnnotation({')
-    expect(source).toContain('await artifactPromptAnnotationsStore.focus(annotationId)')
-    expect(source.indexOf('await focusArtifactPromptAnnotation({'))
-      .toBeLessThan(source.indexOf('artifactPromptAnnotationsStore.focus(annotationId)'))
-    expect(source).toContain("promptAnnotationRpcErrorCode(error) === 'ARTIFACT_REVISION_CHANGED'")
-    expect(source).not.toContain("if (annotation.freshness === 'stale') return")
-    expect(source).not.toContain('artifactPromptAnnotationsStore.markAnnotationStale(')
-  })
-
-  it('flushes a matching open document before preparing annotation drafts', () => {
-    const start = chatViewSource.indexOf('preparePromptAnnotationsForSend: async (ids')
-    const end = chatViewSource.indexOf('\n  promptAnnotationSnapshots:', start)
-    const source = chatViewSource.slice(start, end)
-
-    expect(start).toBeGreaterThan(-1)
-    expect(source).toContain('workbenchDocumentContextStore.prepareDocumentForSend(')
-    expect(source).toContain('artifactPromptAnnotationsStore.prepareForSend(ids)')
-    expect(source.indexOf('prepareDocumentForSend('))
-      .toBeLessThan(source.indexOf('prepareForSend(ids)'))
-  })
-
   it('reuses a history snapshot only through explicit current-DOM reselection', () => {
     const start = chatViewSource.indexOf('async function reusePromptAnnotation(')
     const end = chatViewSource.indexOf('\nconst promptCacheKeepaliveOpen', start)
@@ -86,16 +59,17 @@ describe('ChatView prompt annotation focus and reuse', () => {
     const draft = chatViewSource.slice(draftStart, draftEnd)
 
     expect(validationStart).toBeGreaterThan(-1)
-    expect(validation).toContain("timeoutAction: 'reconnect'")
-    expect(validation).toContain("abortAction: 'reject'")
-    expect(validation).not.toContain("abortAction: 'reconnect'")
+    expect(validation).toContain('timeoutMs: Math.max(1, deadlineAt - Date.now())')
+    expect(validation).toContain('signal: controller.signal')
+    expect(validation).not.toContain('timeoutAction:')
+    expect(validation).not.toContain('abortAction:')
     expect(draftStart).toBeGreaterThan(-1)
-    expect(draft).not.toContain('sessionConversation.ready(')
     expect(draft).not.toContain('rpc.ready(')
     expect(draft).toContain('await projectWorkspaces.loadWorkspaces({')
-    expect(draft).toContain("timeoutAction: 'reconnect'")
-    expect(draft).toContain("abortAction: 'reject'")
-    expect(draft).not.toContain("abortAction: 'reconnect'")
+    expect(draft).toContain('timeoutMs: Math.max(1, deadlineAt - Date.now())')
+    expect(draft).toContain('signal: controller.signal')
+    expect(draft).not.toContain('timeoutAction:')
+    expect(draft).not.toContain('abortAction:')
   })
 
   it('queues Session optional reads only after bootstrap critical frames', () => {
@@ -115,5 +89,28 @@ describe('ChatView prompt annotation focus and reuse', () => {
     expect(sessionWatch).toContain('scheduleSessionOptionalReads({')
     expect(sessionWatch).not.toContain('artifactPromptAnnotationsStore.load(')
     expect(sessionWatch).not.toContain('void loadSessionArtifacts()')
+  })
+
+  it('coalesces Hello metadata behind the existing admission gate', () => {
+    const flushStart = chatViewSource.indexOf('function flushSessionOptionalReads()')
+    const flushEnd = chatViewSource.indexOf('\nfunction scheduleSessionOptionalReads(', flushStart)
+    const flush = chatViewSource.slice(flushStart, flushEnd)
+    const helloStart = chatViewSource.indexOf('watch(() => gatewayAccess.availability, (state, previous) => {')
+    const helloEnd = chatViewSource.indexOf('\nwatch(shareableMessageCount', helloStart)
+    const hello = chatViewSource.slice(helloStart, helloEnd)
+
+    expect(flushStart).toBeGreaterThan(-1)
+    expect(flush).toContain('if (!optionalSessionRpcAllowed.value) return')
+    expect(flush.indexOf('if (!optionalSessionRpcAllowed.value) return'))
+      .toBeLessThan(flush.indexOf('void loadFeatureToggles()'))
+    expect(flush).toContain('if (chatViewDisposed || !gatewayAccess.isAvailable) return')
+    expect(flush).toContain('if (pendingFeatureToggleRefresh) {')
+    expect(flush).toContain('pendingFeatureToggleRefresh = false')
+    expect(flush).toContain('if (postBootstrapMetadataStarted) void loadFeatureToggles()')
+    expect(flush).toContain('else startPostBootstrapMetadata()')
+    expect(helloStart).toBeGreaterThan(-1)
+    expect(hello).toContain('pendingFeatureToggleRefresh = true')
+    expect(hello).toContain('flushSessionOptionalReads()')
+    expect(hello).not.toContain('loadFeatureToggles()')
   })
 })

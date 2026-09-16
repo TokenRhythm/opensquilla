@@ -6,7 +6,6 @@ import {
   type PendingQueueOwnerContext,
 } from '@/composables/chat/useChatPendingQueue'
 import type { Attachment, ChatMessage } from '@/types/chat'
-import type { FoldLiveTurnMode } from './useChatTurnLog'
 import {
   useChatSend,
   type ChatSendOutcome,
@@ -276,7 +275,6 @@ describe('chat send session handoff', () => {
       showThinkingIndicator: vi.fn(),
       hideThinkingIndicator: vi.fn(),
       appendFrame: vi.fn(),
-      useReducer: ref<FoldLiveTurnMode>(false),
     }
     const rpc = {
       call: vi.fn(<T = unknown>() => new Promise<T>((resolve) => {

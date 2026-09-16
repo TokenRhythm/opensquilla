@@ -16,22 +16,11 @@ interface AppliedMutationMarker {
 function appliedMutationMarkers(
   messages: readonly ChatRenderedMessage[],
 ): AppliedMutationMarker[] {
-  return messages.flatMap((message, index) => {
-    const mutation = message.turnOutcome?.documentMutationOutcome
-    if (mutation?.status !== 'applied') return []
-    const identity = mutation.resultRevisionId
-      || mutation.changeSetId
-      || mutation.attemptId
-      || message.turnId
-      || message.messageId
-      || message.id
-      || `message-${message.sourceIndex ?? index}`
-    return [{
-      key: String(identity),
-      restoredFromHistory: message.restoredFromHistory === true,
-      turnKey: String(message.turnKey || ''),
-    }]
-  })
+  return messages.flatMap(message => (message.artifacts || []).map(artifact => ({
+    key: String(artifact.id || artifact.key || artifact.download_url || artifact.name),
+    restoredFromHistory: message.restoredFromHistory === true,
+    turnKey: String(message.turnKey || ''),
+  })))
 }
 
 function latestUserTurnKey(messages: readonly ChatRenderedMessage[]): string {
@@ -45,7 +34,7 @@ function latestUserTurnKey(messages: readonly ChatRenderedMessage[]): string {
 }
 
 /**
- * Keeps a small, session-local unread marker for newly applied document edits.
+ * Keeps a small, session-local unread marker for new and updated artifacts.
  * Restored history establishes a baseline and never creates a fresh marker.
  */
 export function useDeliverableUpdateIndicator(

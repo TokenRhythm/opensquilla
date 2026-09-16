@@ -6,7 +6,10 @@ import {
   createV4SessionDirectory,
   normalizeV4SessionItem,
 } from './sessionDirectoryV4'
-import { SESSIONS_LIST_METHOD } from '@/contracts/generated/v4/sessionsList'
+import {
+  SESSIONS_LIST_METHOD,
+  type SessionsListResult,
+} from '@/contracts/generated/v4/sessionsList'
 import { SESSIONS_RESOLVE_METHOD } from '@/contracts/generated/v4/sessionsResolve'
 import { SESSIONS_SEARCH_METHOD } from '@/contracts/generated/v4/sessionsSearch'
 import type { SessionDirectory } from '@/modules/sessionDirectory'
@@ -30,6 +33,12 @@ const callPolicy = {
   timeoutMs: 10_000,
   timeoutAction: 'reject',
   abortAction: 'reject',
+}
+
+function sessionsListResult(
+  overrides: Partial<SessionsListResult> = {},
+): SessionsListResult {
+  return { sessions: [], count: 0, ts: 1, ...overrides }
 }
 
 function fixtureCase(document: string, caseId: string): WireFixture {
@@ -65,7 +74,7 @@ describe('v4 SessionDirectory Adapter', () => {
   })
 
   it('hides wire method, view, aliases, and extension fields behind the seam', async () => {
-    const requestTransport = vi.fn().mockResolvedValue({
+    const requestTransport = vi.fn().mockResolvedValue(sessionsListResult({
       sessions: [{
         key: 'agent:main:subagent:child',
         title: 'Inspect checkout failures',
@@ -84,7 +93,7 @@ describe('v4 SessionDirectory Adapter', () => {
       }],
       has_more: true,
       next_cursor: 'cursor-2',
-    })
+    }))
     const directory = createV4SessionDirectory({
       request: requestTransport as SessionDirectoryTransport['request'],
     })
@@ -131,20 +140,33 @@ describe('v4 SessionDirectory Adapter', () => {
     expect(page.items[0].parent).not.toHaveProperty('title')
   })
 
-  it('returns exact counts and keeps the legacy bounded-list fallback', async () => {
-    const exactRequest = vi.fn().mockResolvedValue({ total_count: 42 })
+  it('returns exact counts and keeps the bounded-list fallback', async () => {
+    const exactRequest = vi.fn().mockResolvedValue(sessionsListResult({ total_count: 42 }))
     const exactDirectory = createV4SessionDirectory({
       request: exactRequest as SessionDirectoryTransport['request'],
     })
     await expect(exactDirectory.count()).resolves.toEqual({ value: 42, exact: true })
 
-    const legacyRequest = vi.fn().mockResolvedValue({
-      keys: ['agent:main:webchat:one', 'unknown', 'agent:main:webchat:two'],
+    const boundedRequest = vi.fn().mockResolvedValue(sessionsListResult({
+      sessions: ['agent:main:webchat:one', 'unknown', 'agent:main:webchat:two'],
+    }))
+    const boundedDirectory = createV4SessionDirectory({
+      request: boundedRequest as SessionDirectoryTransport['request'],
     })
-    const legacyDirectory = createV4SessionDirectory({
-      request: legacyRequest as SessionDirectoryTransport['request'],
+    await expect(boundedDirectory.count()).resolves.toEqual({ value: 2, exact: false })
+  })
+
+  it('rejects an incomplete sessions.list result instead of treating it as empty', async () => {
+    const directory = createV4SessionDirectory({
+      request: vi.fn().mockResolvedValue({ sessions: [] }) as
+        SessionDirectoryTransport['request'],
     })
-    await expect(legacyDirectory.count()).resolves.toEqual({ value: 2, exact: false })
+
+    await expect(directory.listPage({ limit: 200 })).rejects.toMatchObject({
+      name: 'SessionDirectoryError',
+      code: 'unavailable',
+      message: 'sessions.list returned an invalid response',
+    })
   })
 
   it('resolves a session through the typed Adapter and preserves v4 call policy', async () => {
@@ -349,7 +371,7 @@ describe('v4 SessionDirectory Adapter', () => {
   it('owns its v4 readiness, timeout, and abort policy', async () => {
     const controller = new AbortController()
     const ready = vi.fn().mockResolvedValue(undefined)
-    const requestTransport = vi.fn().mockResolvedValue({ sessions: [] })
+    const requestTransport = vi.fn().mockResolvedValue(sessionsListResult())
     const directory = createV4SessionDirectory({
       ready,
       request: requestTransport as SessionDirectoryTransport['request'],
@@ -373,7 +395,7 @@ describe('v4 SessionDirectory Adapter', () => {
   it('passes caller cancellation through the count query without reconnect ownership', async () => {
     const controller = new AbortController()
     const ready = vi.fn().mockResolvedValue(undefined)
-    const requestTransport = vi.fn().mockResolvedValue({ totalCount: 4 })
+    const requestTransport = vi.fn().mockResolvedValue(sessionsListResult({ totalCount: 4 }))
     const directory = createV4SessionDirectory({
       ready,
       request: requestTransport as SessionDirectoryTransport['request'],

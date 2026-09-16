@@ -1,5 +1,9 @@
 ---
 name: title-card-image
+visibility: internal
+invocation: meta_only
+owner_meta_skills:
+  - meta-short-drama
 description: "Render a static title / ending card PNG with Pillow. Centered headline + optional subtitle on a solid-colour background. Uses managed or platform CJK fonts with glyph verification and fails actionably instead of rendering tofu. Pure deterministic, no LLM, no network. Used by meta-short-drama for opening and closing cards."
 description_zh: "使用 Pillow 渲染静态片头/片尾 PNG，在纯色背景上居中显示标题和可选副标题。使用托管或平台 CJK 字体并验证字形；无法正确渲染时给出可操作错误，而不是输出方框字。过程完全确定，不使用 LLM 或网络。由 meta-short-drama 生成片头片尾卡。"
 provenance:

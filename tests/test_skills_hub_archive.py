@@ -200,8 +200,10 @@ def test_posix_permission_bits_are_retained_as_bundle_metadata() -> None:
     assert normalized.file_modes["scripts/run.sh"] == 0o755
 
 
-def test_default_archive_and_expanded_limits_are_fifty_mib() -> None:
+def test_default_byte_limits_are_unlimited_and_entries_are_bounded() -> None:
     limits = ArchiveLimits()
 
-    assert limits.max_archive_bytes == 50 * 1024 * 1024
-    assert limits.max_expanded_bytes == 50 * 1024 * 1024
+    assert limits.max_archive_bytes is None
+    assert limits.max_entry_bytes is None
+    assert limits.max_entries == 4096
+    assert limits.max_expanded_bytes is None

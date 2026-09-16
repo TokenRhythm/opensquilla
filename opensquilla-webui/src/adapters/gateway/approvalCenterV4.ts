@@ -1,4 +1,7 @@
-import type { RpcCallOptions, RpcEventHandler } from '@/lib/rpc'
+import type {
+  TransportCallOptions as RpcCallOptions,
+  TransportEventHandler as RpcEventHandler,
+} from './transportTypes'
 import { HttpTransportError } from './privateHttpTransport'
 import type {
   ApprovalCenter,

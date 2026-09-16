@@ -71,7 +71,7 @@ def test_changed_source_mutation_receipt_increments_workspace_epoch(
     assert events[0]["name"] == "workspace.semantic_mutation_receipt"
 
 
-def test_changed_source_mutation_receipt_captures_candidate(tmp_path: Path) -> None:
+def test_source_mutation_receipt_keeps_facts_without_capturing_patch(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     target = _init_git_workspace(workspace)
     before = fingerprint_file(target)
@@ -94,9 +94,10 @@ def test_changed_source_mutation_receipt_captures_candidate(tmp_path: Path) -> N
 
     assert receipt is not None
     assert receipt["receipt_id"].startswith("mut-")
-    assert len(ctx.source_diff_candidates) == 1
-    assert ctx.source_diff_candidates[0]["paths"] == ["src/app.py"]
-    assert ctx.source_diff_candidates[0]["receipt_id"] == receipt["receipt_id"]
+    assert receipt["changed"] is True
+    assert receipt["classification"] == "source"
+    assert ctx.workspace_mutation_receipts == [receipt]
+    assert ctx.source_diff_candidates == []
 
 
 def test_hidden_configured_scratch_receipt_is_not_source(tmp_path: Path) -> None:

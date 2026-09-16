@@ -7,6 +7,9 @@ import pytest
 from opensquilla.channels.admission import CHANNEL_ADMIN_VERIFIED_METADATA_KEY
 from opensquilla.channels.types import IncomingMessage
 from opensquilla.gateway.auth import Principal
+from opensquilla.gateway.project_workspace_runtime import (
+    apply_run_context_route_metadata,
+)
 from opensquilla.gateway.routing import (
     build_channel_route_envelope,
     build_cli_route_envelope,
@@ -14,10 +17,7 @@ from opensquilla.gateway.routing import (
     tool_context_from_envelope,
 )
 from opensquilla.gateway.rpc import RpcContext
-from opensquilla.gateway.rpc_sessions import (
-    _apply_run_context_route_metadata,
-    _trusted_run_mode_hint,
-)
+from opensquilla.gateway.rpc_sessions import _trusted_run_mode_hint
 from opensquilla.sandbox.run_context import (
     DomainGrant,
     MountGrant,
@@ -105,7 +105,7 @@ async def test_valid_named_token_preserves_persisted_full_without_owner_authorit
         session_key="agent:main:webchat:host-token",
         principal_is_owner=False,
     )
-    _apply_run_context_route_metadata(
+    apply_run_context_route_metadata(
         envelope,
         run_context,
         principal_is_owner=False,
@@ -209,7 +209,7 @@ def test_channel_route_preserves_explicit_trusted_choice_for_owner() -> None:
     _mark_verified_channel_admin(envelope)
     # A saved per-session /sandbox trusted choice remains trusted for a
     # verified channel administrator, just as it does in the WebUI.
-    _apply_run_context_route_metadata(
+    apply_run_context_route_metadata(
         envelope,
         RunContext(run_mode=RunMode.SAFE, source="saved"),
         principal_is_owner=True,
@@ -231,7 +231,7 @@ def test_channel_route_default_run_context_matches_sandbox_context_for_owner() -
     )
     _mark_verified_channel_admin(envelope)
     # A default (unsaved) run context must not count as an explicit choice.
-    _apply_run_context_route_metadata(
+    apply_run_context_route_metadata(
         envelope,
         RunContext(run_mode=RunMode.SAFE, source="default"),
         principal_is_owner=True,
@@ -264,12 +264,12 @@ def test_verified_channel_admin_matches_web_owner_run_context(run_mode: RunMode)
     )
     channel_run_context = RunContext(run_mode=run_mode, source="default")
     web_run_context = RunContext(run_mode=run_mode, source="default")
-    _apply_run_context_route_metadata(
+    apply_run_context_route_metadata(
         channel_envelope,
         channel_run_context,
         principal_is_owner=True,
     )
-    _apply_run_context_route_metadata(
+    apply_run_context_route_metadata(
         web_envelope,
         web_run_context,
         principal_is_owner=True,
@@ -334,7 +334,7 @@ def test_route_metadata_hydrates_full_sandbox_run_context() -> None:
         ),
     )
 
-    _apply_run_context_route_metadata(
+    apply_run_context_route_metadata(
         envelope,
         run_context,
         principal_is_owner=True,
@@ -403,7 +403,7 @@ def test_fresh_route_metadata_preserves_user_scope_grants_for_execution(
         ),
     )
 
-    _apply_run_context_route_metadata(
+    apply_run_context_route_metadata(
         envelope,
         run_context,
         principal_is_owner=True,

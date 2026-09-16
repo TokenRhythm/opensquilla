@@ -74,6 +74,7 @@ class NewSession:
 class SessionIdentity:
     session_key: str
     session_id: str
+    epoch: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -241,7 +242,11 @@ class SessionLifecycleStorePort(Protocol):
 
     async def create(self, session: NewSession) -> SessionIdentity: ...
 
-    async def append_initial_user_message(self, session_key: str, message: str) -> None: ...
+    async def append_initial_user_message(
+        self,
+        session: SessionIdentity,
+        message: str,
+    ) -> None: ...
 
     async def rename(self, session_key: str, display_name: str) -> None: ...
 
@@ -339,7 +344,7 @@ class SessionLifecycle:
         seeded = False
         if command.initial_message:
             await self._store.append_initial_user_message(
-                identity.session_key,
+                identity,
                 command.initial_message,
             )
             seeded = True

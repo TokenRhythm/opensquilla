@@ -1,3 +1,4 @@
+import type { ChatPageContext } from '@/types/pageContext'
 import type { InjectionKey } from 'vue'
 import type {
   ConversationCursor,
@@ -5,6 +6,7 @@ import type {
   ConversationRuntime,
 } from './conversationRuntime'
 import type { ConversationSemanticEventKind } from './conversationEvents'
+import type { ConversationRoutingSnapshot } from './conversationEventContent'
 import type {
   ConversationSubscriptionAttempt,
   ConversationSubscriptionLifecycle,
@@ -45,6 +47,11 @@ export interface SessionReadMetadata {
   readonly runStatus: string
   readonly queuedTaskIds: readonly string[]
   readonly epoch: number | null
+  /** Lower bound for pending-input hydration, not an authoritative transport cursor. */
+  readonly pendingUserInputsCursor?: {
+    readonly streamGeneration: string | null
+    readonly currentStreamSeq: number | null
+  }
   readonly hydrationComplete: boolean
   readonly deferredFields: readonly string[]
   readonly additional: SessionReadJsonObject
@@ -52,14 +59,15 @@ export interface SessionReadMetadata {
 
 export interface SessionReadSnapshotEvent {
   readonly semanticKind: ConversationSemanticEventKind
-  /** The event payload is immutable but otherwise opaque to this read Module. */
-  readonly payload: SessionReadJsonObject
+  readonly payload: import('./conversationEventContent').ConversationEventData
 }
 
 export interface SessionReadSnapshot {
   readonly sessionKey: string
   readonly taskId: string | null
   readonly events: readonly SessionReadSnapshotEvent[]
+  readonly streamGeneration?: string
+  readonly currentStreamSeq?: number
 }
 
 export interface SessionReadLive {
@@ -70,6 +78,8 @@ export interface SessionReadLive {
   readonly initialMetadata: SessionReadMetadata
   readonly snapshot: SessionReadSnapshot | null
   readonly reloadRequired: SessionReadReloadReason | null
+  /** Call only after the full projection has been installed by its current owner. */
+  readonly confirmInstalled?: () => Promise<void>
 }
 
 export interface SessionReadMessageProvenance {
@@ -94,12 +104,13 @@ export interface SessionReadMessage {
   readonly text: string
   readonly createdAt: SessionReadTimestamp
   readonly reasoningContent: string | null
-  readonly routerDecision: SessionReadJsonObject | null
+  readonly routerDecision: ConversationRoutingSnapshot | null
   readonly artifacts: readonly SessionReadJsonObject[]
   readonly toolCalls: readonly unknown[]
   readonly timeline: readonly unknown[]
   readonly attachments: readonly SessionReadJsonObject[]
   readonly promptAnnotations: readonly unknown[]
+  readonly pageContext?: ChatPageContext
   readonly provenance: SessionReadMessageProvenance
   readonly turnContext: SessionReadTurnContext | null
   readonly usage: SessionReadJsonObject | null
@@ -194,6 +205,8 @@ export interface SessionReadLease {
   readonly metadata: Promise<SessionReadMetadata>
   readonly history: SessionReadHistoryReader
   retryMetadata(): Promise<SessionReadMetadata>
+  /** Refresh the current subscription without releasing its delivery authority. */
+  reconcile(): Promise<SessionReadLive>
   close(): Promise<void>
 }
 
@@ -246,6 +259,7 @@ export interface SessionReadPortLease {
   readonly metadata: Promise<SessionReadMetadata>
   readHistory(request: SessionReadPortHistoryRequest): Promise<SessionReadHistoryPage>
   retryMetadata(): Promise<SessionReadMetadata>
+  reconcile(): Promise<SessionReadPortLive>
   close(): Promise<void>
 }
 
@@ -257,6 +271,7 @@ export interface SessionReadPort {
 export interface SessionReadRuntimeOwner {
   readonly cursor: ConversationRuntime
   readonly subscriptions: ConversationSubscriptionLifecycle<SessionReadPortLease>
+  readonly prepareReadRetirement?: (key: string) => (released?: boolean) => void
 }
 
 export interface SessionReadLifecycleFactory {
@@ -281,6 +296,22 @@ export class SessionReadContractError extends Error {
   constructor(message: string) {
     super(message)
     this.name = 'SessionReadContractError'
+  }
+}
+
+export type SessionReadFailureKind = 'aborted' | 'timeout' | 'busy' | 'unavailable' | 'too-large'
+
+/** Recoverable read failure projected by a transport Adapter. */
+export class SessionReadFailure extends Error {
+  constructor(
+    readonly kind: SessionReadFailureKind,
+    message: string,
+    readonly retryable: boolean,
+    readonly retryAfterMs = 0,
+    readonly cause?: unknown,
+  ) {
+    super(message)
+    this.name = 'SessionReadFailure'
   }
 }
 
@@ -309,6 +340,7 @@ export interface CreateSessionReadLifecycleOptions {
   readonly runtime: ConversationRuntime
   /** Externally owned subscription identity/cancellation owner. */
   readonly subscriptions: ConversationSubscriptionLifecycle<SessionReadPortLease>
+  readonly prepareReadRetirement?: (key: string) => (released?: boolean) => void
 }
 
 const DEFAULT_HISTORY_LIMIT = 100
@@ -389,6 +421,7 @@ export function createSessionReadLifecycle(
 
   function open(request: SessionReadOpenRequest): SessionReadLease {
     const sessionKey = normalizedSessionKey(request.sessionKey)
+    const retireReleasedRead = options.prepareReadRetirement?.(sessionKey)
     const prior = active
     const seed = prior?.sessionKey === sessionKey
       ? prior.cursor
@@ -437,7 +470,7 @@ export function createSessionReadLifecycle(
 
     const criticalRequestsQueued = acquire.then(portLease => portLease.criticalRequestsQueued)
 
-    const live = acquire.then(portLease => portLease.live).then(value => {
+    function projectLive(value: SessionReadPortLive): SessionReadLive {
       assertCurrent(state, options.subscriptions)
       if (value.sessionKey !== sessionKey) {
         throw new SessionReadContractError(
@@ -445,28 +478,49 @@ export function createSessionReadLifecycle(
         )
       }
       const generation = options.runtime.observeGeneration(state.cursor, value.cursor)
-      state.cursor = generation.cursor
+      let installedCursor = generation.cursor
       if (value.snapshotCursor) {
-        const snapshot = options.runtime.acceptSnapshot(state.cursor, value.snapshotCursor)
-        if (snapshot.accepted) state.cursor = snapshot.cursor
+        const snapshot = options.runtime.acceptSnapshot(installedCursor, value.snapshotCursor)
+        if (snapshot.accepted) installedCursor = snapshot.cursor
       }
       const replay = options.runtime.applyReplayCursor(
-        state.cursor,
+        installedCursor,
         value.cursor,
         generation.reset,
       )
-      state.cursor = replay.cursor
+      if (!value.confirmInstalled) state.cursor = replay.cursor
       return Object.freeze({
         sessionKey: value.sessionKey,
         activity: value.activity,
         activeTaskId: value.activeTaskId,
         initialMetadata: value.initialMetadata,
         snapshot: value.snapshot,
+        confirmInstalled: value.confirmInstalled ? async () => {
+          assertCurrent(state, options.subscriptions)
+          state.cursor = replay.cursor
+          await value.confirmInstalled!()
+        } : undefined,
         reloadRequired: replay.requiresHistory
           ? (generation.reset ? 'generationChanged' : 'replayGap')
           : null,
       } satisfies SessionReadLive)
-    })
+    }
+    const live = acquire.then(portLease => portLease.live).then(projectLive)
+    let reconciliation: Promise<SessionReadLive> | null = null
+    function reconcile(): Promise<SessionReadLive> {
+      if (reconciliation) return reconciliation
+      const current = (async () => {
+        assertCurrent(state, options.subscriptions)
+        const portLease = await acquire
+        const value = await portLease.reconcile()
+        return projectLive(value)
+      })()
+      const observed = current.finally(() => {
+        if (reconciliation === observed) reconciliation = null
+      })
+      reconciliation = observed
+      return observed
+    }
 
     const metadata = acquire.then(portLease => portLease.metadata).then(value => {
       assertCurrent(state, options.subscriptions)
@@ -564,12 +618,20 @@ export function createSessionReadLifecycle(
       }
       const portLease = state.portLease
       if (portLease) {
-        await portLease.close()
+        try {
+          await portLease.close()
+          retireReleasedRead?.()
+        } catch (error) {
+          retireReleasedRead?.(false)
+          throw error
+        }
         return
       }
       try {
         await (await acquire).close()
+        retireReleasedRead?.()
       } catch {
+        retireReleasedRead?.(false)
         // A locally closed acquisition has no remote lease left to release.
       }
     }
@@ -584,7 +646,11 @@ export function createSessionReadLifecycle(
       // SessionReadSessionMissingError as an ordinary local cancellation.
       // Other live failures keep the existing immediate close/fence behavior.
       if (error instanceof SessionReadSessionMissingError) await Promise.resolve()
-      if (!state.closedReason) await closeState('closed').catch(() => {})
+      // A request-level read failure does not revoke a subscription that may
+      // already be active on the healthy socket. Reconcile owns its recovery.
+      if (!(error instanceof SessionReadFailure && (error.retryable || error.kind === 'too-large')) && !state.closedReason) {
+        await closeState('closed').catch(() => {})
+      }
     })
     void criticalRequestsQueued.catch(() => {})
     void metadata.catch(() => {})
@@ -595,6 +661,7 @@ export function createSessionReadLifecycle(
       metadata,
       history,
       retryMetadata,
+      reconcile,
       close: () => closeState('closed'),
     })
     currentLease = lease
@@ -617,6 +684,7 @@ export function createSessionReadLifecycleFactory(
         port,
         runtime: owner.cursor,
         subscriptions: owner.subscriptions,
+        prepareReadRetirement: owner.prepareReadRetirement,
       })
     },
   })

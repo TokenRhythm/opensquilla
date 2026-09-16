@@ -491,3 +491,20 @@ describe('TurnAccumulator — incremental live projection', () => {
     })
   })
 })
+
+describe('execution log reference preservation', () => {
+  it('keeps the original log handle in both live and replay projections', () => {
+    const handle = `tr-${'a'.repeat(32)}`
+    const event: Frame = {
+      kind: 'tool-result', seq: 0, toolId: 'execution', name: 'exec', input: '{}',
+      result: 'model-sized preview', executionLogHandle: handle, isError: true, at: 1,
+    }
+    const accumulator = new TurnAccumulator()
+    accumulator.append(event)
+    for (const projection of [fold([event]), accumulator.snapshot(renderMarkdown, toolCallGroups)]) {
+      expect(projection.toolCalls[0]).toMatchObject({
+        executionLogHandle: handle, result: 'model-sized preview', status: 'error',
+      })
+    }
+  })
+})
