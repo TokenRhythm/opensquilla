@@ -710,10 +710,9 @@ class _ErrorHandler:
             _LLM_TIMEOUT_ENVELOPE,
             _drop_unpaired_tool_use_segments,
         )
-        from opensquilla.engine.types import ErrorEvent as _ErrorEvent
-
         if event.code == "timeout":
-            event = _ErrorEvent(
+            event = replace(
+                event,
                 message=_LLM_TIMEOUT_ENVELOPE["user_message"],
                 code=_LLM_TIMEOUT_ENVELOPE["error_class"],
             )

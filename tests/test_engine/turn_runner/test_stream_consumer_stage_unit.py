@@ -1440,10 +1440,23 @@ async def test_generated_artifact_adoption_failure_keeps_delivery() -> None:
 def test_error_handler_rewrites_timeout_envelope() -> None:
     state = _make_state()
     handler = _ErrorHandler()
-    result = handler.handle(ErrorEvent(message="x", code="timeout"), state)
+    event = ErrorEvent(
+        message="x", code="timeout", error_id="abcd1234",
+        failure_kind="transport_transient", generation_epoch=3,
+        retry_after_ms=8000, usage_call_index=2,
+        no_prior_provider_dispatch=False, replay_safe=False,
+    )
+    result = handler.handle(event, state)
     assert result is _SUPPRESS
     assert state.pending_error_event is not None
     assert state.pending_error_event.code == "llm_timeout"
+    assert state.pending_error_event.error_id == event.error_id
+    assert state.pending_error_event.failure_kind == event.failure_kind
+    assert state.pending_error_event.generation_epoch == event.generation_epoch
+    assert state.pending_error_event.retry_after_ms == event.retry_after_ms
+    assert state.pending_error_event.usage_call_index == event.usage_call_index
+    assert state.pending_error_event.no_prior_provider_dispatch is False
+    assert state.pending_error_event.replay_safe is False
 
 
 def test_error_handler_drops_unpaired_tool_use_on_incomplete_stream() -> None:
