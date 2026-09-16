@@ -1122,19 +1122,16 @@ const activityDetailLabel = computed(() => {
   return parts.join(' · ')
 })
 
-const completedMaintenanceCount = computed(() =>
-  activityProjection.value.statusSteps.filter(step =>
-    step.category === 'maintenance' && step.state === 'completed',
-  ).length,
-)
-
 function withMaintenanceSummary(label: string): string {
-  const count = completedMaintenanceCount.value
-  if (!count) return label
-  const maintenance = count > 1
-    ? `${String(t('chat.compact.compacted'))} ×${count}`
-    : String(t('chat.compact.compacted'))
-  return [label, maintenance].filter(Boolean).join(' · ')
+  const counts = new Map<string, number>()
+  for (const step of activityProjection.value.statusSteps) {
+    if (step.category !== 'maintenance' || step.state !== 'completed') continue
+    counts.set(step.label.code, (counts.get(step.label.code) ?? 0) + 1)
+  }
+  const maintenance = [...counts].map(([code, count]) =>
+    count > 1 ? `${String(t(code))} ×${count}` : String(t(code)),
+  )
+  return [label, ...maintenance].filter(Boolean).join(' · ')
 }
 
 const activitySummaryLabel = computed(() => {

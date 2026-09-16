@@ -1941,17 +1941,27 @@ async def test_custom_config():
 
 @pytest.mark.asyncio
 async def test_strict_identifier_policy_in_summary():
+    identifier = "12345678-1234-5678-90ab-1234567890ab"
     entries = _make_entries(10, tokens_each=200)
+    entries[0]["content"] += f" Tracking identifier: {identifier}."
+    config = synthetic_compaction_config(
+        identifier_policy="strict", summary=f"Preserve tracking identifier {identifier}.",
+    )
     result = await compact_context(
         CompactionRequest(
-            session_id="s1",
-            entries=entries,
-            context_window_tokens=500,
-            config=CompactionConfig(identifier_policy="strict"),
+            session_id="s1", entries=entries, context_window_tokens=1000, config=config,
         )
     )
-    if result.summary:
-        assert "identifier" in result.summary.lower() or "IMPORTANT" in result.summary
+
+    assert result.removed_count > 0
+    assert result.summary
+    assert "identifier" in result.summary.lower() or "IMPORTANT" in result.summary
+    assert identifier in result.summary
+    assert config.llm_plan is not None
+    [(messages, _, chat_config)] = config.llm_plan.primary.provider.calls
+    assert "IMPORTANT: Preserve all opaque identifiers exactly as written" in chat_config.system
+    assert "Do NOT shorten, reconstruct, or paraphrase any identifier." in chat_config.system
+    assert identifier in messages[0].content
 
 
 @pytest.mark.asyncio

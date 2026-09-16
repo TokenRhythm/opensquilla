@@ -4126,6 +4126,8 @@
     "compact": {
       "compacting": "コンテキストを圧縮中",
       "compacted": "コンテキストを圧縮しました",
+      "temporarilyReduced": "履歴を一時的に短縮して処理を続けています",
+      "summarySaved": "要約を保存しました",
       "historyPreserved": "以前のコンテキストを要約しました。元のメッセージは履歴で引き続き確認できます",
       "historyIncomplete": "以前のコンテキストを要約しました。一部の元のメッセージは利用できません",
       "historySummarized": "以前のコンテキストを要約しました",

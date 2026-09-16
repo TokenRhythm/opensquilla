@@ -168,6 +168,7 @@ async def test_compaction_does_not_restore_deleted_url_image_after_write_access_
     from opensquilla.engine import Agent, AgentConfig
     from opensquilla.session.compaction import CompactionRequest, compact_context
     from opensquilla.tools.builtin import filesystem
+    from tests.helpers.compaction import synthetic_compaction_config
     from tests.helpers.image_bytes import image_bytes
 
     payload = image_bytes()
@@ -200,6 +201,7 @@ async def test_compaction_does_not_restore_deleted_url_image_after_write_access_
         provider=SimpleNamespace(provider_name="test"), config=AgentConfig(), tool_context=context,
     )
     config = agent._build_compaction_config()
+    config.llm_plan = synthetic_compaction_config().llm_plan
     config.protected_recent_messages = 2
     assert config.attachment_path_resolver is not None
     image = context.tool_result_media["download"][0]
