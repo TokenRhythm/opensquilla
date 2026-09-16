@@ -68,6 +68,10 @@ OFFLINE_MARKER_EXCLUSIONS = {
     "tests/test_skills/test_meta_skill_creator_smoke_live.py",
 }
 RECENTLY_ADDED_ACTIVE_TESTS = {
+    # Telemetry regressions use provisional weights until the next comparable
+    # Windows duration refresh supplies measured timings.
+    "tests/test_engine/test_runtime_usage_telemetry.py",
+    "tests/test_observability/test_usage_telemetry_identity.py",
     # Primary-provider and validator coverage use the declared provisional
     # floor until a comparable three-run Windows refresh supplies measured timings.
     "tests/contracts/test_gateway_validator_profiles.py",
