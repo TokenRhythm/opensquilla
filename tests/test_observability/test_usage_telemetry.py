@@ -46,6 +46,9 @@ def _enable_telemetry_for_test(monkeypatch) -> None:
     monkeypatch.delenv("GITHUB_ACTIONS", raising=False)
     monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
     monkeypatch.delenv(install_telemetry.TELEMETRY_TESTING_ENV, raising=False)
+    monkeypatch.delenv("CI", raising=False)
+    monkeypatch.delenv(network_policy.DO_NOT_TRACK_ENV, raising=False)
+    monkeypatch.delenv(network_policy.PRODUCT_ANALYTICS_DISABLED_ENV, raising=False)
 
 
 async def test_records_only_completed_interactive_turns(tmp_path, monkeypatch):
@@ -134,6 +137,89 @@ async def test_opt_out_does_not_create_daily_row(tmp_path, monkeypatch):
         )
         assert recorded is False
         assert await storage.list_pending_daily_usage(before_day="9999-12-31") == []
+    finally:
+        await storage.close()
+
+
+@pytest.mark.parametrize(
+    ("env_name", "config_field"),
+    [
+        ("CI", None),
+        (network_policy.DO_NOT_TRACK_ENV, None),
+        (network_policy.PRODUCT_ANALYTICS_DISABLED_ENV, None),
+        (network_policy.NETWORK_OBSERVABILITY_DISABLED_ENV, None),
+        (network_policy.LEGACY_TELEMETRY_DISABLED_ENV, None),
+        (network_policy.LEGACY_UPDATE_CHECK_DISABLED_ENV, None),
+        (None, "disable_network_observability"),
+        (None, "reliability_diagnostics_enabled"),
+        (None, "product_analytics_enabled"),
+    ],
+)
+async def test_reporting_veto_pauses_daily_collection_and_preserves_pending_usage(
+    tmp_path, monkeypatch, env_name, config_field
+):
+    _enable_telemetry_for_test(monkeypatch)
+    monkeypatch.setenv(
+        usage_telemetry.USAGE_TELEMETRY_ENDPOINT_ENV, "https://example.test/v1/usage"
+    )
+    config = _config(tmp_path)
+    if env_name is not None:
+        monkeypatch.setenv(env_name, "true")
+    else:
+        setattr(config.privacy, config_field, config_field == "disable_network_observability")
+    identity_calls: list[Any] = []
+    payloads: list[dict[str, Any]] = []
+
+    def ensure_id(*, config):
+        identity_calls.append(config)
+        return "synthetic-install-id"
+
+    async def fake_post(endpoint, payload):
+        payloads.append(payload)
+        return True, None
+
+    monkeypatch.setattr(install_telemetry, "ensure_install_telemetry_id", ensure_id)
+    monkeypatch.setattr(usage_telemetry, "_post_payload", fake_post)
+    storage = await SessionStorage.open(str(tmp_path / "sessions.db"))
+    try:
+        assert not await usage_telemetry.record_completed_turn(
+            storage,
+            config=config,
+            run_kind="default",
+            done_event=_done(),
+            now=datetime(2026, 7, 20, 12, tzinfo=UTC),
+        )
+        assert await storage.list_pending_daily_usage(before_day="9999-12-31") == []
+
+        await storage.record_daily_usage(
+            day="2026-07-19",
+            input_tokens=100,
+            output_tokens=20,
+            cached_tokens=30,
+            cache_write_tokens=4,
+            updated_at=1,
+        )
+        retained = await storage.list_pending_daily_usage(before_day="2026-07-21")
+        assert await usage_telemetry.upload_pending_daily_usage(
+            storage, config=config, today=date(2026, 7, 21)
+        ) == 0
+        assert identity_calls == []
+        assert payloads == []
+        assert not (tmp_path / "state" / "install_telemetry.json").exists()
+        assert await storage.list_pending_daily_usage(before_day="2026-07-21") == retained
+
+        if env_name is not None:
+            monkeypatch.delenv(env_name)
+        else:
+            setattr(config.privacy, config_field, config_field != "disable_network_observability")
+        assert await usage_telemetry.upload_pending_daily_usage(
+            storage, config=config, today=date(2026, 7, 21)
+        ) == 1
+        assert identity_calls == [config]
+        assert len(payloads) == 1
+        assert payloads[0]["day"] == "2026-07-19"
+        assert payloads[0]["input_tokens"] == 100
+        assert await storage.list_pending_daily_usage(before_day="2026-07-21") == []
     finally:
         await storage.close()
 

@@ -1297,6 +1297,12 @@ async def test_gateway_free_text_attachment_id_does_not_replay_archived_image(
     from opensquilla.session.attachment_manifest import build_attachment_manifest
 
     monkeypatch.setattr(squilla_router_step, "_get_strategy", lambda _cfg: _TextTierStrategy())
+    # Random attachment tokens can contain complaint terms such as "sb" and
+    # upgrade the text route, independently of archived-image replay.
+    monkeypatch.setattr(
+        "opensquilla.gateway.transcripts._new_attachment_id",
+        lambda: "att_abcdefghijklmnopQRstuvwx",
+    )
     manager: SessionManager = _e2e_stack["manager"]
     runner: TurnRunner = _e2e_stack["runner"]
     sink: _EventSink = _e2e_stack["sink"]

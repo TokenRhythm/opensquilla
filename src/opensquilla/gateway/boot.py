@@ -118,6 +118,27 @@ def _log_gateway_startup_phase(
     return time.monotonic()
 
 
+def _start_background_install_telemetry(config: GatewayConfig) -> None:
+    def _log_result(result: Any) -> None:
+        log.debug(
+            "gateway.install_telemetry",
+            skipped_reason=result.skipped_reason,
+            telemetry_event=result.event,
+            sent=result.sent,
+            uploaded=result.uploaded,
+            endpoint_configured=result.endpoint_configured,
+        )
+
+    try:
+        from opensquilla.observability.install_telemetry import (
+            start_background_install_telemetry,
+        )
+
+        start_background_install_telemetry(config=config, on_result=_log_result)
+    except Exception:
+        log.debug("gateway.install_telemetry_skipped", exc_info=True)
+
+
 def _auto_propose_usage_execution_context(
     agent_id: str,
     usage_event_sink: Any | None,
@@ -3874,9 +3895,9 @@ async def build_services(
 
     provider_stats = ProviderStatsStore()
 
-    # The v2 runtime is isolated from legacy install/usage telemetry. It is
-    # lazy and fail-closed: no scope files or network calls occur without a
-    # current explicit consent record. Engine observers receive only
+    # V2 reliability/growth events run alongside V1 install/daily usage
+    # aggregates. Each pipeline checks the current reporting preference at
+    # collection and upload boundaries. Engine observers receive only
     # synchronous, content-free adapter callables below.
     telemetry_runtime = None
     reliability_event_sink = None
@@ -5290,6 +5311,26 @@ async def start_gateway_server(
     gateway_ready_phase_emitted = False
     gateway_ready_wait_started_at = startup_phase_started_at
 
+    def _start_post_ready_observability() -> None:
+        # Only the listening Gateway owns V1 uploads. Embedded app construction
+        # must not launch workers. The install worker is a daemon; daily usage
+        # belongs to the service container and is cancelled before storage closes.
+        if not run:
+            return
+        _start_background_install_telemetry(config)
+        try:
+            from opensquilla.observability.usage_telemetry import (
+                run_daily_usage_upload_loop,
+            )
+
+            daily_usage_storage = get_session_storage(svc.session_manager)
+            if daily_usage_storage is not None:
+                svc.daily_usage_telemetry_task = create_background_task(
+                    run_daily_usage_upload_loop(daily_usage_storage, config=config)
+                )
+        except Exception:
+            log.debug("gateway.usage_telemetry_upload_skipped", exc_info=True)
+
     def _publish_gateway_ready_if_complete() -> None:
         nonlocal gateway_ready_phase_emitted
         if gateway_ready_phase_emitted or not listener_ready or not runtime_state_ready:
@@ -5306,6 +5347,7 @@ async def start_gateway_server(
         svc.sandbox_setup_task = create_background_task(
             _ensure_sandbox_setup_on_boot(config)
         )
+        _start_post_ready_observability()
 
     server_handle = GatewayServer(app=app, config=config)
     server_handle._pid_lock = _pid_lock

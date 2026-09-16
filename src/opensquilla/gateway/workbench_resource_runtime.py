@@ -557,6 +557,7 @@ async def adopt_generated_deliverable_if_editable(
     ref: ArtifactRef,
     actor: Actor | None = None,
     working_source: dict[str, str] | None = None,
+    publication_id: str = "",
 ) -> tuple[Document, Revision, DocumentSourceBinding, bool] | None:
     """Associate a generated HTML deliverable and its complete resource bundle with a document.
 
@@ -615,6 +616,7 @@ async def adopt_generated_deliverable_if_editable(
         ),
         actor=actor or Actor(kind=ActorKind.SYSTEM, actor_id="generated-deliverable"),
         working_source=working_source,
+        publication_id=publication_id,
     )
     return commit.document, commit.revision, binding, created
 

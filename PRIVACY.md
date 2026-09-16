@@ -43,14 +43,15 @@ corresponding feature is enabled by configuration or user action.
 
 ## Network Observability Controls
 
-OpenSquilla uses one **Network reporting** control for Reliability diagnostics
-and Product and growth analytics, following the existing opt-out policy.
+OpenSquilla uses one **Network reporting** control for V1 installation and daily
+usage statistics, V2 Reliability diagnostics, and V2 Product and growth analytics,
+following the existing opt-out policy.
 Reporting is enabled by default; there are no separate telemetry choices or
 consent popups during onboarding. A notice-version update does not require a
 new choice or create a consent timestamp. An explicit decline saved under either
 of the former per-scope controls is migrated to the unified control being off.
 
-The control below disables both telemetry streams, passive update checks, and
+The control below disables all telemetry streams, passive update checks, and
 automatic desktop update checks:
 
 ```sh
@@ -71,10 +72,10 @@ OPENSQUILLA_TELEMETRY_DISABLED=true
 OPENSQUILLA_UPDATE_CHECK_DISABLED=true
 ```
 
-`OPENSQUILLA_TELEMETRY_DISABLED=true` remains a hard veto for both new
-telemetry streams. It does not reactivate retired
-legacy telemetry. `OPENSQUILLA_UPDATE_CHECK_DISABLED=true` applies only to
-update checks.
+`OPENSQUILLA_TELEMETRY_DISABLED=true` remains a hard veto for V1 and V2
+telemetry. `OPENSQUILLA_UPDATE_CHECK_DISABLED=true` disables update checks and,
+for compatibility with V1, installation and daily usage uploads; it does not
+disable V2 telemetry.
 
 Manual user-initiated actions may still contact network services after user
 intent, including release downloads and configured providers, search, channels,
@@ -127,7 +128,7 @@ to separate bounded local SQLite queues and upload batches to separate routes:
 local collection and again immediately before network upload. Offline retries
 reuse `event_id` for deduplication. Growth events are not sampled.
 
-Telemetry payloads never include prompts, responses, provider configuration,
+V2 telemetry payloads never include prompts, responses, provider configuration,
 agent configuration, tool arguments, task parameters, file names, file paths,
 file contents, raw exception messages, complete stacks, usernames, hostnames,
 API keys, raw account IDs, order data, IP addresses, MAC addresses, or device
@@ -142,15 +143,41 @@ pending events can resume after reporting is enabled again. Remote and
 environment-variable vetoes do not change the saved setting. Local data can be
 removed through the deletion options below.
 
-### Retired legacy telemetry
+### V1 installation and daily usage statistics
 
-The automatic installation upload at `/v1/install`, the daily token aggregate
-at `/v1/usage`, and the `X-OpenSquilla-Install-Id` provider header are retired.
-Production code no longer starts those upload loops, records daily usage for
-them, derives an installation identifier from MAC or local IP data, or attaches
-that identifier to provider requests. Legacy modules and environment-variable
-names remain only for source/configuration compatibility; they do not restore
-the retired upload paths.
+V1 statistics run alongside V2. After the Gateway listener and runtime are ready,
+a background worker sends `install` on first use and `version_seen` once per
+new version to `/v1/install`. These events contain a pseudonymous installation
+identifier, application version, installation method, OS/version, architecture,
+Python major/minor version, and first-seen/send timestamps.
+
+Completed top-level interactive turns contribute local UTC daily counters for
+conversation turns, input tokens, output tokens, cached tokens, and cache-write
+tokens. A background task uploads pending completed days to `/v1/usage` at startup
+and retries hourly. The current UTC day is excluded until it ends. Existing
+installation state is retained. Daily event IDs use a random identity saved in
+each aggregate database, so separate profiles on one machine do not collide.
+The identity is kept across restarts, retries, and database moves; it is not
+itself uploaded. Retained pending days can resume when reporting is re-enabled.
+
+On upgrade, completed days already marked uploaded remain untouched. Pending
+legacy days use the new database-specific keys. Older versions did not record
+upload attempts, so a legacy day already accepted by the server whose
+acknowledgment was lost may be counted again during this one-time transition.
+
+V1 preserves its installation identity: a local SHA-256 digest derived from
+available MAC addresses, then local IP addresses if needed, with a persisted
+random fallback. Raw MAC/IP values are not uploaded. This identifier is separate
+from V2 identities and is not attached to provider requests; the
+`X-OpenSquilla-Install-Id` provider header remains retired. V1 payloads contain
+no prompts, responses, file contents, tool arguments, credentials, or account IDs.
+
+The unified opt-out, either previously saved scope decline, the legacy telemetry
+opt-out, the product-analytics environment veto, and CI/test/`DO_NOT_TRACK`
+suppression apply before V1 collection and again before upload. Pausing V1 keeps
+existing installation state and pending daily counters. Endpoint overrides remain
+available through `OPENSQUILLA_TELEMETRY_ENDPOINT` and
+`OPENSQUILLA_USAGE_TELEMETRY_ENDPOINT`.
 
 ## Logs And Diagnostics
 
