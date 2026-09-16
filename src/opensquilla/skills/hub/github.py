@@ -45,7 +45,8 @@ from opensquilla.skills.hub.tree_io import (
     validate_portable_tree,
     validate_tree_entry_count,
 )
-from opensquilla.skills.io_worker import run_staging_worker
+from opensquilla.skills.io_worker import check_staging_cancelled, run_staging_worker
+from opensquilla.skills.manifest import MAX_SKILL_FILE_BYTES
 
 log = structlog.get_logger(__name__)
 
@@ -61,14 +62,40 @@ def _download_slots() -> asyncio.Semaphore:
     return _DOWNLOAD_SLOTS[loop]
 
 
-async def _download_file(client: Any, url: str, target: Path, headers: dict[str, str]) -> None:
+@dataclass
+class _DownloadBudget:
+    limit: int | None
+    used: int = 0
+
+    def reserve(self, size: int) -> None:
+        # All workers run on the same event loop; reservation and write contain
+        # no await, so concurrent files cannot each spend the remaining budget.
+        if exceeds_limit(self.used + size, self.limit):
+            raise SkillSourceFetchError.diagnostic(
+                "FETCH_SIZE_LIMIT",
+                "GitHub Skill exceeds the configured expanded-size limit.",
+                phase=DiagnosticPhase.FETCH,
+            )
+        self.used += size
+
+
+async def _download_file(
+    client: Any, url: str, target: Path, headers: dict[str, str],
+    *, budget: _DownloadBudget | None = None,
+) -> None:
     import httpx
 
+    reserved = 0
     async with _download_slots():
         for attempt in range(3):
             try:
                 target.parent.mkdir(parents=True, exist_ok=True)
                 with target.open("wb") as output:
+                    if budget is not None:
+                        # Only release a retry's partial bytes once truncation
+                        # has removed them from disk.
+                        budget.used -= reserved
+                        reserved = 0
                     stream = getattr(client, "stream", None)
                     if callable(stream):
                         async with stream("GET", url, headers=headers) as response:
@@ -86,6 +113,9 @@ async def _download_file(client: Any, url: str, target: Path, headers: dict[str,
                                         "Skill file exceeds configured limit.",
                                         phase=DiagnosticPhase.FETCH,
                                     )
+                                if budget is not None:
+                                    budget.reserve(len(chunk))
+                                    reserved += len(chunk)
                                 output.write(chunk)
                     else:
                         response = await client.get(url, headers=headers)
@@ -98,6 +128,9 @@ async def _download_file(client: Any, url: str, target: Path, headers: dict[str,
                             len(response.content), DEFAULT_ARCHIVE_LIMITS.max_entry_bytes
                         ):
                             raise ValueError("GitHub Skill file exceeds configured limit")
+                        if budget is not None:
+                            budget.reserve(len(response.content))
+                            reserved += len(response.content)
                         output.write(response.content)
                 return
             except SkillSourceFetchError as exc:
@@ -111,10 +144,27 @@ async def _download_file(client: Any, url: str, target: Path, headers: dict[str,
 
 
 def _manifest_prefix(path: Path) -> str:
+    def too_large() -> SkillSourceFetchError:
+        return SkillSourceFetchError.diagnostic(
+            "MANIFEST_TOO_LARGE", f"SKILL.md exceeds {MAX_SKILL_FILE_BYTES} bytes",
+            phase=DiagnosticPhase.MANIFEST, path=path.name,
+        )
+
+    check_staging_cancelled()
+    if path.stat().st_size > MAX_SKILL_FILE_BYTES:
+        raise too_large()
     decoder = codecs.getincrementaldecoder("utf-8")()
     prefix = ""
+    size = 0
     with path.open("rb") as stream:
-        while chunk := stream.read(CHUNK_SIZE):
+        while True:
+            check_staging_cancelled()
+            chunk = stream.read(min(CHUNK_SIZE, MAX_SKILL_FILE_BYTES + 1 - size))
+            if not chunk:
+                break
+            size += len(chunk)
+            if size > MAX_SKILL_FILE_BYTES:
+                raise too_large()
             decoded = decoder.decode(chunk)
             if len(prefix) < CHUNK_SIZE:
                 prefix += decoded[: CHUNK_SIZE - len(prefix)]
@@ -958,6 +1008,7 @@ class GitHubSource(SkillSource):
                 file_modes: dict[str, int] = {}
                 pending = iter(selected)
                 actual_total = 0
+                budget = _DownloadBudget(DEFAULT_ARCHIVE_LIMITS.max_expanded_bytes)
 
                 async def worker() -> None:
                     nonlocal actual_total
@@ -967,7 +1018,9 @@ class GitHubSource(SkillSource):
                             f"{quote(ref.ref, safe='')}/{quote(path, safe='/')}"
                         )
                         target = destination.joinpath(*PurePosixPath(rel_path).parts)
-                        await _download_file(client, raw_url, target, self._headers())
+                        await _download_file(
+                            client, raw_url, target, self._headers(), budget=budget,
+                        )
                         actual_total += target.stat().st_size
                         if exceeds_limit(actual_total, DEFAULT_ARCHIVE_LIMITS.max_expanded_bytes):
                             raise ValueError("Skill exceeds configured expanded-size limit")
@@ -1030,7 +1083,9 @@ class GitHubSource(SkillSource):
                 hint="Use an explicit repository subpath containing one Skill.",
             )
         try:
-            skill_md = _manifest_prefix(destination / manifest_paths[0])
+            skill_md = await run_staging_worker(
+                _manifest_prefix, destination / manifest_paths[0],
+            )
         except UnicodeDecodeError:
             raise SkillSourceFetchError.diagnostic(
                 "MANIFEST_ENCODING_INVALID",

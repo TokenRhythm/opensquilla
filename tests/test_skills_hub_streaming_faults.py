@@ -6,6 +6,7 @@ import asyncio
 import errno
 import threading
 from contextlib import asynccontextmanager, contextmanager
+from dataclasses import replace
 from pathlib import Path
 
 import httpx
@@ -15,7 +16,174 @@ from opensquilla.skills.hub.github import GitHubSource, _download_file
 from opensquilla.skills.hub.management import SkillManagementService
 from opensquilla.skills.hub.router import SourceRouter
 from opensquilla.skills.hub.source import SkillSourceFetchError
-from tests.test_skills_hub_streaming import Response, StreamingClient
+from tests.test_skills_hub_streaming import MANIFEST, Response, StreamingClient
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("declared_size", [None, 1])
+async def test_download_budget_bounds_concurrent_writes_with_inaccurate_sizes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, declared_size: int | None,
+) -> None:
+    from opensquilla.skills.hub import github
+
+    class Client(StreamingClient):
+        count = 4
+
+        async def get(self, url, **kwargs):
+            response = await super().get(url, **kwargs)
+            if "/git/trees/" in url and declared_size is not None:
+                for item in response.payload["tree"]:
+                    item["size"] = declared_size
+            return response
+
+        @asynccontextmanager
+        async def stream(self, method, url, **kwargs):
+            def chunks():
+                if url.endswith("/SKILL.md"):
+                    yield MANIFEST
+                else:
+                    yield from (b"data" for _ in range(50))
+
+            yield Response(chunks=chunks)
+
+    limit = len(MANIFEST) + 24
+    monkeypatch.setattr(httpx, "AsyncClient", Client)
+    monkeypatch.setattr(
+        github, "DEFAULT_ARCHIVE_LIMITS",
+        replace(github.DEFAULT_ARCHIVE_LIMITS, max_expanded_bytes=limit),
+    )
+    source = GitHubSource()
+    resolution = await source.resolve("https://github.com/acme/demo")
+    destination = tmp_path / "tree"
+    with pytest.raises(SkillSourceFetchError) as raised:
+        await source.fetch_resolved_into(resolution, destination)
+    assert raised.value.diagnostics[0].code == "FETCH_SIZE_LIMIT"
+    assert sum(p.stat().st_size for p in destination.rglob("*") if p.is_file()) <= limit
+
+
+@pytest.mark.asyncio
+async def test_manifest_size_rejected_before_reading_contents(tmp_path, monkeypatch):
+    from opensquilla.skills.manifest import MAX_SKILL_FILE_BYTES
+
+    class Client(StreamingClient):
+        count = 0
+
+        @asynccontextmanager
+        async def stream(self, method, url, **kwargs):
+            yield Response(chunks=lambda: iter([b"x" * (MAX_SKILL_FILE_BYTES + 1)]))
+
+    original_open = Path.open
+    manifest_reads = []
+
+    def observe_open(path, mode="r", *args, **kwargs):
+        if path.name == "SKILL.md" and mode == "rb":
+            manifest_reads.append(path)
+        return original_open(path, mode, *args, **kwargs)
+
+    monkeypatch.setattr(httpx, "AsyncClient", Client)
+    monkeypatch.setattr(Path, "open", observe_open)
+    source = GitHubSource()
+    resolution = await source.resolve("https://github.com/acme/demo")
+    with pytest.raises(SkillSourceFetchError) as raised:
+        await source.fetch_resolved_into(resolution, tmp_path / "tree")
+    assert raised.value.diagnostics[0].code == "MANIFEST_TOO_LARGE"
+    assert not manifest_reads
+
+
+@pytest.mark.asyncio
+async def test_manifest_validation_uses_settled_worker(tmp_path, monkeypatch):
+    from opensquilla.skills.hub import github
+
+    monkeypatch.setattr(httpx, "AsyncClient", StreamingClient)
+    monkeypatch.setattr(StreamingClient, "count", 0)
+    original_prefix = github._manifest_prefix
+    threads = []
+
+    def observe_prefix(path):
+        threads.append(threading.get_ident())
+        return original_prefix(path)
+
+    monkeypatch.setattr(github, "_manifest_prefix", observe_prefix)
+    source = GitHubSource()
+    resolution = await source.resolve("https://github.com/acme/demo")
+    await source.fetch_resolved_into(resolution, tmp_path / "tree")
+    assert threads and threading.get_ident() not in threads
+
+
+@pytest.mark.asyncio
+async def test_retry_releases_only_truncated_download_bytes(tmp_path):
+    from opensquilla.skills.hub.github import _DownloadBudget
+
+    class InterruptedResponse(Response):
+        async def aiter_bytes(self, *args):
+            yield b"part"
+            raise httpx.ReadError("synthetic interrupted download")
+
+    class Client:
+        calls = 0
+
+        @asynccontextmanager
+        async def stream(self, method, url, **kwargs):
+            self.calls += 1
+            yield (
+                InterruptedResponse() if self.calls == 1
+                else Response(chunks=lambda: iter([b"complete"]))
+            )
+
+    # Another file has already consumed four bytes of the common budget.
+    budget = _DownloadBudget(limit=12, used=4)
+    target = tmp_path / "file"
+    client = Client()
+    await _download_file(client, "https://example.invalid/file", target, {}, budget=budget)
+    assert target.read_bytes() == b"complete"
+    assert budget.used == 12
+    assert client.calls == 2
+
+
+@pytest.mark.asyncio
+async def test_manifest_cancellation_settles_read_worker(tmp_path, monkeypatch):
+    monkeypatch.setattr(httpx, "AsyncClient", StreamingClient)
+    monkeypatch.setattr(StreamingClient, "count", 0)
+    started = threading.Event()
+    release = threading.Event()
+    finished = threading.Event()
+    original_open = Path.open
+
+    class SlowRead:
+        def __init__(self, handle):
+            self.handle = handle
+
+        def read(self, size):
+            started.set()
+            if not release.wait(5):
+                raise TimeoutError("test did not release manifest read")
+            return self.handle.read(size)
+
+    @contextmanager
+    def slow_open(path, mode="r", *args, **kwargs):
+        with original_open(path, mode, *args, **kwargs) as handle:
+            if path.name == "SKILL.md" and mode == "rb":
+                try:
+                    yield SlowRead(handle)
+                finally:
+                    finished.set()
+            else:
+                yield handle
+
+    monkeypatch.setattr(Path, "open", slow_open)
+    source = GitHubSource()
+    resolution = await source.resolve("https://github.com/acme/demo")
+    task = asyncio.create_task(source.fetch_resolved_into(resolution, tmp_path / "tree"))
+    try:
+        assert await asyncio.to_thread(started.wait, 2)
+        task.cancel()
+        await asyncio.sleep(0)
+        assert not task.done(), "worker must settle before staging can be removed"
+    finally:
+        release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, 2)
+    assert finished.is_set()
 
 
 @pytest.mark.asyncio

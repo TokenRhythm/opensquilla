@@ -233,6 +233,7 @@ class _LineScan:
         self.verdict = "safe"
         self.line = 1
         self.window = ""
+        self.window_left = ""
         self.prefix = ""
         self.matched: set[int] = set()
         self.in_backtick = False
@@ -260,6 +261,9 @@ class _LineScan:
                 self.window += normalized[offset : offset + 2048]
                 if len(self.window) > 512:
                     self.match(final=False)
+                    # Preserve the preceding character so trimming inside an
+                    # identifier cannot manufacture a regex word boundary.
+                    self.window_left = self.window[-257:-256]
                     self.window = self.window[-256:]
             self.backticks(part)
 
@@ -296,15 +300,16 @@ class _LineScan:
                     self.subshell = 2
 
     def match(self, *, final: bool) -> None:
+        text = self.window_left + self.window
         for number, (category, _, pattern) in enumerate(self.patterns):
             if number in self.matched or category == "hidden_unicode":
                 continue
             if pattern is _SHELL_INJECTION[1]:
                 continue
-            for match in pattern.finditer(self.window):
+            for match in pattern.finditer(text, len(self.window_left)):
                 # Leave enough lookahead for the localhost exclusion and enough
                 # overlap for a word that spans two transport chunks.
-                if final or match.end() <= len(self.window) - 128:
+                if final or match.end() <= len(text) - 128:
                     self.matched.add(number)
                     break
 
@@ -325,7 +330,7 @@ class _LineScan:
                     ScanFinding(category, severity, self.line, text, pattern.pattern)
                 )
         self.line += 1
-        self.window = self.prefix = self.shell_tail = ""
+        self.window = self.window_left = self.prefix = self.shell_tail = ""
         self.matched.clear()
         self.in_backtick = self.subshell_complete = False
         self.subshell = 0
