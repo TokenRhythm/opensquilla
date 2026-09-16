@@ -336,6 +336,7 @@ def windows_powershell(request: pytest.FixtureRequest) -> str:
     return executable
 
 
+@pytest.mark.ci_serial
 def test_source_powershell_parses_with_legacy_windows_ansi_encoding(
     windows_powershell: str,
 ) -> None:

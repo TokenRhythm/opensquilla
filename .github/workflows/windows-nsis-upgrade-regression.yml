@@ -163,7 +163,7 @@ jobs:
           New-Item -ItemType Directory -Path old,candidate | Out-Null
           gh release download 'v${{ matrix.baseline }}' --repo TokenRhythm/opensquilla --pattern 'OpenSquilla-${{ matrix.baseline }}-win-x64.exe' --dir old
           if ($LASTEXITCODE -ne 0) { throw 'Baseline download failed' }
-      - uses: actions/download-artifact@v4
+      - uses: ./.github/actions/download-required-artifact
         with:
           name: nsis-regression-installer
           path: candidate

@@ -6120,7 +6120,7 @@ describe('useSetupCatalog optional provider credentials', () => {
     ['custom', 'Custom OpenAI-compatible endpoint', 'CUSTOM_LLM_API_KEY'],
     ['custom_anthropic', 'Custom Anthropic-compatible endpoint', 'CUSTOM_ANTHROPIC_API_KEY'],
   ])(
-    'exposes an optional key and blocks %s probes until required fields exist',
+    'allows %s connection checks without a model once required connection fields exist',
     async (providerId, label, envKey) => {
       rpcCall.mockImplementation(async (method: string) => {
         if (method === 'onboarding.catalog') {
@@ -6171,8 +6171,25 @@ describe('useSetupCatalog optional provider credentials', () => {
       api.probeProviderConnection()
       expect(rpcCall.mock.calls.some(call => call[0] === 'onboarding.provider.probe')).toBe(false)
 
-      api.updateProviderField('model', 'test-model')
       api.updateProviderField('base_url', 'https://custom.example.test/v1')
+      expect(api.providerPanel.value.credentialPanel).toMatchObject({
+        probeReady: false,
+        reachabilityReady: true,
+        reachabilityDisabledReason: '',
+      })
+      await api.probeProviderConnection()
+      expect(rpcCall).toHaveBeenCalledWith('onboarding.provider.probe', {
+        providerId,
+        baseUrl: 'https://custom.example.test/v1',
+        mode: 'reachability',
+      })
+      await api.probeProviderConnection('model')
+      expect(rpcCall.mock.calls.filter(call => call[0] === 'onboarding.provider.probe')).toHaveLength(1)
+      expect(rpcCall.mock.calls.some(call => (
+        call[0] === 'onboarding.provider.configure' || call[0] === 'onboarding.llmProfile.upsert'
+      ))).toBe(false)
+
+      api.updateProviderField('model', 'test-model')
       credential = api.providerPanel.value.credentialPanel
       expect(credential?.probeReady).toBe(true)
       expect(credential?.probeDisabledReason).toBe('')

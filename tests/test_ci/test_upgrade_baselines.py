@@ -207,6 +207,7 @@ def test_packaged_recovery_transport_contract_runs_in_desktop_node_ci() -> None:
 @pytest.mark.parametrize(
     ("launch_fails", "cleanup_fails"), [(False, False), (False, True), (True, False)]
 )
+@pytest.mark.ci_serial
 def test_packaged_recovery_preserves_original_failure_after_cleanup(
     tmp_path: Path, launch_fails: bool, cleanup_fails: bool
 ) -> None:
@@ -613,28 +614,48 @@ def _run_rehearsal_driver(
         cache = driver.parent / "user-data" / "update-downloads"
         cache.mkdir(parents=True, exist_ok=True)
         (cache / f"OpenSquilla-{candidate}-win-x64.exe").write_bytes(cached_bytes)
-    return subprocess.run(
-        arguments,
-        env={
-            **os.environ,
-            "SYNTHETIC_BASELINE_VERSION": installed,
-            "SYNTHETIC_CANDIDATE_VERSION": candidate,
-            "SYNTHETIC_UPDATE_MODE": mode,
-            "SYNTHETIC_COMPLETE_SIGNED": "1" if complete_signed else "0",
-            "SYNTHETIC_CAN_INSTALL": "1" if can_install else "0",
-            "SYNTHETIC_EXPECTED_SOURCE": (
-                "github" if download_source_mode == "github-to-oss" else "oss"
-            ),
-            "SYNTHETIC_FALLBACK_FAULT": fallback_fault,
-        },
-        capture_output=True,
-        text=True,
-        check=False,
-        timeout=15,
+    environment = {
+        **os.environ,
+        "SYNTHETIC_BASELINE_VERSION": installed,
+        "SYNTHETIC_CANDIDATE_VERSION": candidate,
+        "SYNTHETIC_UPDATE_MODE": mode,
+        "SYNTHETIC_COMPLETE_SIGNED": "1" if complete_signed else "0",
+        "SYNTHETIC_CAN_INSTALL": "1" if can_install else "0",
+        "SYNTHETIC_EXPECTED_SOURCE": (
+            "github" if download_source_mode == "github-to-oss" else "oss"
+        ),
+        "SYNTHETIC_FALLBACK_FAULT": fallback_fault,
+    }
+    # Keep the process deadline independent of Windows pipe-reader threads.
+    # Files also retain partial diagnostics if the driver itself hangs.
+    stdout_path = driver.parent / "rehearsal-stdout.log"
+    stderr_path = driver.parent / "rehearsal-stderr.log"
+    with stdout_path.open("wb") as stdout_file, stderr_path.open("wb") as stderr_file:
+        try:
+            result = subprocess.run(
+                arguments,
+                env=environment,
+                stdout=stdout_file,
+                stderr=stderr_file,
+                check=False,
+                timeout=15,
+            )
+        except subprocess.TimeoutExpired as error:
+            error.add_note(
+                f"Captured stdout: {stdout_path.read_text(encoding='utf-8', errors='replace')!r}\n"
+                f"Captured stderr: {stderr_path.read_text(encoding='utf-8', errors='replace')!r}"
+            )
+            raise
+    return subprocess.CompletedProcess(
+        result.args,
+        result.returncode,
+        stdout_path.read_text(encoding="utf-8"),
+        stderr_path.read_text(encoding="utf-8"),
     )
 
 
 @pytest.mark.parametrize("baseline", [None, "0.5.3", "0.5.4"])
+@pytest.mark.ci_serial
 def test_rehearsal_driver_accepts_selected_baseline(
     rehearsal_driver: tuple[str, Path], baseline: str | None
 ) -> None:
@@ -644,6 +665,10 @@ def test_rehearsal_driver_accepts_selected_baseline(
     assert f"DOWNLOAD_REACHED:{selected}" in result.stderr
 
 
+# Keep all consumers of the shared Node driver in the serial phase. Otherwise
+# moving one cold-start probe leaves the next consumer exposed to the same
+# Windows runner contention; these are behavior contracts, not latency checks.
+@pytest.mark.ci_serial
 def test_rehearsal_driver_rejects_mislabeled_official_baseline(
     rehearsal_driver: tuple[str, Path],
 ) -> None:
@@ -662,6 +687,7 @@ def test_rehearsal_driver_rejects_mislabeled_official_baseline(
         ("0.5.4", "0.5.5rc1", "must be a canonical stable version"),
     ],
 )
+@pytest.mark.ci_serial
 def test_rehearsal_driver_rejects_invalid_versions_before_launch(
     rehearsal_driver: tuple[str, Path], baseline: str, candidate: str, message: str
 ) -> None:
@@ -674,6 +700,7 @@ def test_rehearsal_driver_rejects_invalid_versions_before_launch(
 
 
 @pytest.mark.parametrize("baseline", [None, "0.5.3", "0.5.4", "0.5.5rc1"])
+@pytest.mark.ci_serial
 def test_signed_handoff_rejects_missing_or_legacy_baseline_before_launch(
     rehearsal_driver: tuple[str, Path], baseline: str | None
 ) -> None:
@@ -690,6 +717,7 @@ def test_signed_handoff_rejects_missing_or_legacy_baseline_before_launch(
 
 
 @pytest.mark.parametrize("missing", ["source_sha", "expected_sha"])
+@pytest.mark.ci_serial
 def test_signed_handoff_requires_pinned_artifact_before_launch(
     rehearsal_driver: tuple[str, Path], missing: str
 ) -> None:
@@ -707,6 +735,7 @@ def test_signed_handoff_requires_pinned_artifact_before_launch(
 
 
 @pytest.mark.parametrize("fault", ["capability-denied", "cache-replaced"])
+@pytest.mark.ci_serial
 def test_signed_handoff_rejects_unverified_or_changed_candidate(
     rehearsal_driver: tuple[str, Path], fault: str
 ) -> None:
@@ -727,6 +756,7 @@ def test_signed_handoff_rejects_unverified_or_changed_candidate(
     assert not (rehearsal_driver[1].parent / "handoff.json").exists()
 
 
+@pytest.mark.ci_serial
 def test_signed_handoff_records_only_handoff_until_outer_audit_verifies_install(
     rehearsal_driver: tuple[str, Path],
 ) -> None:
@@ -759,6 +789,7 @@ def test_signed_handoff_records_only_handoff_until_outer_audit_verifies_install(
 
 
 @pytest.mark.parametrize("fault", ["", "discovery", "download"])
+@pytest.mark.ci_serial
 def test_signed_download_fallback_requires_both_stage_observations(
     rehearsal_driver: tuple[str, Path], fault: str
 ) -> None:
@@ -785,6 +816,7 @@ def test_signed_download_fallback_requires_both_stage_observations(
     ("native", "github-to-oss"), ("manual", "oss"),
     ("signed-cached-handoff", "github-to-oss"), ("signed-handoff", "invalid"),
 ])
+@pytest.mark.ci_serial
 def test_download_source_override_rejects_other_modes_before_launch(
     rehearsal_driver: tuple[str, Path], mode: str, source: str
 ) -> None:
@@ -1173,6 +1205,7 @@ def test_windows_default_install_refuses_existing_installation_before_download(
 
 
 @pytest.mark.skipif(os.name != "nt", reason="Native Windows KnownFolder read")
+@pytest.mark.ci_serial
 def test_windows_nsis_known_folder_is_independent_of_localappdata_environment(
     windows_upgrade_harness: tuple[str, Path],
 ) -> None:
