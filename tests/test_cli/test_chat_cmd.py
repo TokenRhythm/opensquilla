@@ -8,13 +8,14 @@ import json
 from collections.abc import Iterable
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from rich.console import Console
 from typer.testing import CliRunner
 
 from opensquilla.cli import chat_cmd
+from opensquilla.cli.chat import turn_stream
 from opensquilla.cli.chat.turn_stream import (
     _standalone_session_owner_kwargs as _chat_session_owner_kwargs,
 )
@@ -2269,7 +2270,15 @@ async def test_gateway_stream_cancelled_error_aborts_turn(monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
-async def test_gateway_stream_interrupt_tolerates_abort_failure(monkeypatch) -> None:
+@pytest.mark.parametrize("interrupt_type", [KeyboardInterrupt, asyncio.CancelledError])
+async def test_gateway_stream_interrupt_tolerates_abort_failure(
+    monkeypatch, interrupt_type: type[BaseException]
+) -> None:
+    finalize = AsyncMock(wraps=turn_stream.renderer_finalize)
+    close = AsyncMock(wraps=turn_stream.renderer_close)
+    monkeypatch.setattr(turn_stream, "renderer_finalize", finalize)
+    monkeypatch.setattr(turn_stream, "renderer_close", close)
+
     class BrokenAbortGatewayClient(_FakeGatewayClient):
         async def send_message(self, session_key, message, attachments=None, elevated=None):
             self.send_calls.append(
@@ -2280,14 +2289,13 @@ async def test_gateway_stream_interrupt_tolerates_abort_failure(monkeypatch) -> 
                     "elevated": elevated,
                 }
             )
-            raise KeyboardInterrupt
+            raise interrupt_type
             yield {}
 
         async def abort_session(self, session_key: str) -> dict[str, object]:
             self.abort_calls.append(session_key)
             raise ConnectionError(
-                "Gateway connection lost; restart chat or reconnect before "
-                "sending another command."
+                "Gateway connection lost; restart chat or reconnect before sending another command."
             )
 
     BrokenAbortGatewayClient.instances = []
@@ -2304,6 +2312,10 @@ async def test_gateway_stream_interrupt_tolerates_abort_failure(monkeypatch) -> 
     assert result.cancelled is True
     assert fake.abort_calls == ["agent:main:abc123"]
     assert fake.send_calls[0]["message"] == "hello"
+
+    finalize.assert_awaited_once()
+    assert finalize.await_args.kwargs["cancelled"] is True
+    close.assert_awaited_once()
 
 
 @pytest.mark.asyncio
