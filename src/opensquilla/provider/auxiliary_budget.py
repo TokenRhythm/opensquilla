@@ -11,6 +11,7 @@ from opensquilla.provider.model_catalog import (
     shared_catalog,
 )
 from opensquilla.provider.protocol import provider_metadata
+from opensquilla.provider.request_proof import effective_proof_token_budget
 from opensquilla.token_estimation import estimate_tokens
 
 _UNKNOWN_DEPLOYMENT_CONTEXT_TOKENS = 32_000
@@ -27,6 +28,7 @@ class AuxiliaryRequestBudget:
     max_input_tokens: int
     provider_request_max_chars: int
     context_window_source: str
+    provider_request_max_chars_explicit_cap: int = 0
 
 
 class AuxiliaryRequestTooLargeError(ValueError):
@@ -44,7 +46,7 @@ class AuxiliaryRequestTooLargeError(ValueError):
         self.max_chars = max(1, int(max_chars))
         self.actual_tokens = max(0, int(actual_tokens))
         self.max_tokens = max(0, int(max_tokens))
-        if self.max_tokens and self.actual_tokens > self.max_tokens:
+        if self.actual_tokens > self.max_tokens:
             detail = f"{self.actual_tokens} > {self.max_tokens} tokens"
         else:
             detail = f"{self.actual_chars} > {self.max_chars} chars"
@@ -139,18 +141,17 @@ def resolve_auxiliary_request_budget(
     ).snapshot()
     derived_cap = snapshot.provider_request_max_chars
     explicit_cap = max(0, int(provider_request_max_chars or 0))
-    effective_cap = min(explicit_cap, derived_cap) if explicit_cap else derived_cap
+    effective_cap = explicit_cap or derived_cap
+    input_tokens, _headroom = effective_proof_token_budget(snapshot.usable_tokens)
     return AuxiliaryRequestBudget(
         provider_id=resolved_provider,
         model=resolved_model,
         context_window_tokens=max(1, int(window)),
         max_output_tokens=max(1, resolved_output),
-        max_input_tokens=max(
-            1,
-            int(snapshot.usable_tokens * snapshot.threshold),
-        ),
+        max_input_tokens=input_tokens,
         provider_request_max_chars=max(1, int(effective_cap)),
         context_window_source=str(window_source),
+        provider_request_max_chars_explicit_cap=explicit_cap,
     )
 
 
@@ -208,7 +209,7 @@ def ensure_auxiliary_text_fits(
     messages: list[Any],
     *,
     max_chars: int,
-    max_tokens: int = 0,
+    max_tokens: int | None = None,
     system: str = "",
 ) -> int:
     """Reject an oversized auxiliary request before starting a physical call."""
@@ -216,8 +217,8 @@ def ensure_auxiliary_text_fits(
     actual = auxiliary_text_chars(messages, system=system)
     if actual > max(1, int(max_chars)):
         raise AuxiliaryRequestTooLargeError(actual_chars=actual, max_chars=max_chars)
-    resolved_max_tokens = max(0, int(max_tokens or 0))
-    if resolved_max_tokens:
+    if max_tokens is not None:
+        resolved_max_tokens = max(0, int(max_tokens))
         actual_tokens = auxiliary_text_tokens(messages, system=system)
         if actual_tokens > resolved_max_tokens:
             raise AuxiliaryRequestTooLargeError(

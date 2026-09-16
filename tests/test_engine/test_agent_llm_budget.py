@@ -55,6 +55,7 @@ from opensquilla.session.compaction_deployment import (
     CompactionExecutionTarget,
 )
 from opensquilla.tools.types import CallerKind, ToolContext
+from tests.helpers.compaction import synthetic_compaction_config
 
 RAW_CURRENT_TURN_OVERFLOW_MESSAGE = (
     "Context overflow is in the current turn's recent tool calls or "
@@ -437,6 +438,92 @@ def test_preflight_history_capacity_reserves_non_history_envelope() -> None:
         active_user_in_history=True,
         context_window_tokens=4_000,
     ) == persisted_capacity
+
+
+@pytest.mark.parametrize("consumer_window_known", [False, True])
+def test_raw_attachment_capacity_keeps_durable_consumer_window_provenance(
+    consumer_window_known: bool,
+) -> None:
+    base_provider = OpenAIProvider(api_key="test", model="base-model")
+    agent = Agent(
+        provider=OpenAIProvider(api_key="test", model="routed-model"),
+        config=AgentConfig(
+            model_id="routed-model",
+            context_window_tokens=32_000,
+            context_window_known=True,
+            max_tokens=8_192,
+        ),
+    )
+    agent.bind_durable_consumer(
+        provider=base_provider,
+        model_id="base-model",
+        context_window_tokens=200_000,
+        context_window_known=consumer_window_known,
+        max_output_tokens=8_192,
+        provider_request_proof_max_chars=30_000,
+    )
+    arguments = {
+        "active_user_message": "synthetic",
+        "active_user_in_history": False,
+        "attachments": [{"type": "text", "content": "small"}],
+        "context_window_tokens": 200_000,
+        "consumer_provider": base_provider,
+        "consumer_model_id": "base-model",
+        "consumer_max_output_tokens": 8_192,
+        "consumer_provider_request_max_chars": 30_000,
+    }
+
+    known_route_capacity = agent.preflight_history_capacity(**arguments)
+    agent.config.context_window_known = False
+    unknown_route_capacity = agent.preflight_history_capacity(**arguments)
+
+    assert known_route_capacity == unknown_route_capacity
+    tokens, chars = known_route_capacity
+    assert tokens > 0 and chars > 0
+    if consumer_window_known:
+        assert tokens > 100_000
+    else:
+        assert tokens < 30_000 // 4
+
+
+def test_raw_attachment_capacity_reserves_actual_anthropic_generation_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from opensquilla.engine import agent as agent_module
+    from opensquilla.provider.anthropic import AnthropicProvider
+
+    provider = AnthropicProvider(api_key="test", model="claude-sonnet-4-20250514")
+    agent = Agent(
+        provider=provider,
+        config=AgentConfig(
+            model_id="claude-sonnet-4-20250514",
+            context_window_tokens=128_000,
+            max_tokens=1_024,
+            thinking=True,
+            thinking_budget_tokens=10_000,
+        ),
+    )
+    observed: list[dict[str, Any]] = []
+
+    def capture_proof(payload: dict[str, Any], **kwargs: Any) -> dict[str, Any]:
+        observed.append({"generation_budget": payload["max_tokens"], **kwargs})
+        return prove_provider_payload(payload, **kwargs)
+
+    monkeypatch.setattr(agent_module, "prove_provider_payload", capture_proof)
+    capacity, _ = agent.preflight_history_capacity(
+        active_user_message="synthetic",
+        active_user_in_history=False,
+        attachments=[{"type": "text", "content": "small"}],
+    )
+
+    assert len(observed) == 1
+    # Anthropic raises the wire output cap to thinking + 4,096. Both input
+    # dimensions must reserve that cap once, before proof headroom and fixed
+    # request content are subtracted.
+    assert observed[0]["generation_budget"] == 14_096
+    assert observed[0]["token_budget"] == 128_000 - 14_096 - 20_000
+    assert observed[0]["proof_budget"] == 4 * observed[0]["token_budget"]
+    assert 0 < capacity < observed[0]["token_budget"] - 4_096
 
 
 def test_durable_consumer_projection_uses_base_model_config() -> None:
@@ -2332,6 +2419,84 @@ async def test_inline_overflow_compaction_preserves_original_structured_tail(
     assert isinstance(outcome.messages[-1].content, list)
 
 
+@pytest.mark.parametrize("pressure", ["tokens", "chars"])
+async def test_inline_compaction_uses_proven_history_capacity_in_real_core(
+    monkeypatch: pytest.MonkeyPatch, pressure: str,
+) -> None:
+    from opensquilla.session.compaction import compact_context as compact_core
+
+    provider = OpenAIProvider(api_key="synthetic-offline", model="synthetic-model")
+    agent = Agent(
+        provider=provider,
+        config=AgentConfig(
+            model_id="synthetic-model",
+            context_window_tokens=12_000 if pressure == "tokens" else 32_000,
+            max_tokens=8192,
+            provider_request_proof_max_chars=100_000 if pressure == "tokens" else 10_000,
+            flush_enabled=False,
+        ),
+    )
+    summary_config = synthetic_compaction_config()
+    summary_provider = summary_config.llm_plan.primary.provider
+    monkeypatch.setattr(agent, "_build_compaction_config", lambda: summary_config)
+    requests = []
+
+    async def capture_request(request):
+        requests.append(request)
+        return await compact_core(request)
+
+    monkeypatch.setattr("opensquilla.engine.agent.compact_context", capture_request)
+    messages = [
+        Message(role="user" if index % 2 == 0 else "assistant",
+                content="Completed ordinary background. " * 150)
+        for index in range(4)
+    ]
+    current = Message(role="user", content="Continue the active task exactly")
+    messages.append(current)
+    fixed_capacity = agent.preflight_history_capacity(
+        active_user_message="", active_user_in_history=False,
+    )
+    projection = agent._project_compaction_consumer_request(
+        consumer_provider=provider,
+        replay_summary="",
+        kept_entries=agent._message_count_compaction_entries(messages),
+        active_user_message="",
+        active_user_in_history=False,
+        bound_user_message_id=None,
+        attachment_messages=None,
+        runtime_context_message=agent._freeze_preflight_runtime_context_message(),
+        context_window_tokens=agent.config.context_window_tokens,
+        max_output_tokens=8192,
+        consumer_provider_request_max_chars=agent.config.provider_request_proof_max_chars,
+    )
+    assert projection is not None and not projection.fits
+    proof = projection.proof
+    if pressure == "chars":
+        assert proof["estimated_tokens"] < proof["effective_proof_token_budget"] * 0.85
+    else:
+        assert proof["estimated_chars"] < proof["effective_proof_budget"] * 0.85
+
+    outcome = await agent._check_context_overflow(
+        messages,
+        estimated_context_tokens=proof["estimated_tokens"],
+        estimated_context_chars=proof["estimated_chars"],
+        protected_turn_start_index=4,
+        compaction_window_tokens=agent.config.context_window_tokens,
+        request_window_tokens=proof["effective_proof_token_budget"],
+        request_window_chars=proof["effective_proof_budget"],
+        durable_consumer_overflow_proven=True,
+        provider_overflow=True,
+    )
+
+    assert len(requests) == 1
+    assert (requests[0].context_window_tokens, requests[0].context_window_chars) == fixed_capacity
+    assert len(summary_provider.calls) == 1
+    assert outcome is not None and outcome.compacted and not outcome.ephemeral_only
+    assert outcome.removed_count == 4
+    assert outcome.messages[-1] is current
+    assert messages[-1] is current and len(messages) == 5
+
+
 @pytest.mark.asyncio
 async def test_soft_pressure_keeps_protected_current_turn_when_final_request_fits(
     monkeypatch: pytest.MonkeyPatch,
@@ -3423,7 +3588,14 @@ async def test_narrow_route_uses_stable_window_when_stable_consumer_also_overflo
     events = [event async for event in agent.run_turn("current request stays exact")]
 
     assert len(compact_requests) == 1
-    assert compact_requests[0].context_window_tokens == 16_000
+    assert (compact_requests[0].context_window_tokens,
+            compact_requests[0].context_window_chars) == agent.preflight_history_capacity(
+        active_user_message="", active_user_in_history=False,
+        context_window_tokens=16_000, consumer_provider=stable,
+        consumer_max_output_tokens=512, consumer_provider_request_max_chars=40_000,
+    )
+    assert compact_requests[0].context_window_tokens > 8_000
+    assert compact_requests[0].context_window_chars > 4_000
     assert len(routed.calls) == 2
     assert len(stable.projected_configs) >= 2
     assert all(config.max_tokens == 512 for config in stable.projected_configs)
@@ -3486,7 +3658,14 @@ async def test_narrow_route_cannot_force_stable_compaction_to_its_request_cap(
     events = [event async for event in agent.run_turn("current request stays exact")]
 
     assert len(compact_requests) == 1
-    assert compact_requests[0].context_window_tokens == 16_000
+    assert (compact_requests[0].context_window_tokens,
+            compact_requests[0].context_window_chars) == agent.preflight_history_capacity(
+        active_user_message="", active_user_in_history=False,
+        context_window_tokens=16_000, consumer_provider=stable,
+        consumer_max_output_tokens=512, consumer_provider_request_max_chars=40_000,
+    )
+    assert compact_requests[0].context_window_tokens > 8_000
+    assert compact_requests[0].context_window_chars > 4_000
     assert len(stable.projected_configs) >= 2
     assert len(routed.calls) == 1
     compaction_events = [
@@ -3554,7 +3733,14 @@ async def test_mixed_pressure_does_not_install_candidate_that_stable_consumer_re
     events = [event async for event in agent.run_turn("current request stays exact")]
 
     assert len(compact_requests) == 1
-    assert compact_requests[0].context_window_tokens == 16_000
+    assert (compact_requests[0].context_window_tokens,
+            compact_requests[0].context_window_chars) == agent.preflight_history_capacity(
+        active_user_message="", active_user_in_history=False,
+        context_window_tokens=16_000, consumer_provider=stable,
+        consumer_max_output_tokens=512, consumer_provider_request_max_chars=40_000,
+    )
+    assert compact_requests[0].context_window_tokens > 8_000
+    assert compact_requests[0].context_window_chars > 4_000
     assert len(stable.projected_configs) >= 2
     assert len(routed.calls) == 1
     assert not any(isinstance(event, CompactionEvent) for event in events)

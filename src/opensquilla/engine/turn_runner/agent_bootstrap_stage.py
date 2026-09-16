@@ -113,6 +113,7 @@ class _ResolvedCatalog:
     top_p: float | None = None
     # Explicit provider-request proof budget (chars); 0 keeps the derived path.
     provider_request_proof_max_chars: int = 0
+    context_window_known: bool = True
 
 
 @dataclass(frozen=True)
@@ -626,10 +627,13 @@ class AgentBootstrapStage:
                     if fallback_catalog.auto_max_tokens_known
                     else 0
                 )
+                physical_window = (
+                    fallback_catalog.context_window if fallback_catalog.context_window_known else 0
+                )
                 private_fallback_limits.append(
                     (
                         deployment,
-                        fallback_catalog.context_window,
+                        physical_window,
                         effective_max_tokens,
                         fallback_catalog.capabilities,
                     )
@@ -650,7 +654,7 @@ class AgentBootstrapStage:
                 fallback_capabilities.setdefault(
                     (fallback_provider, fallback_model),
                     (
-                        fallback_catalog.context_window,
+                        physical_window,
                         effective_max_tokens,
                         fallback_catalog.capabilities,
                     ),
@@ -674,7 +678,7 @@ class AgentBootstrapStage:
                     fallback_provider,
                 )
                 fallback_capabilities[(fallback_provider, fallback_model)] = (
-                    fallback_catalog.context_window,
+                    fallback_catalog.context_window if fallback_catalog.context_window_known else 0,
                     (
                         fallback_catalog.auto_max_tokens
                         if fallback_catalog.auto_max_tokens_known
@@ -774,6 +778,7 @@ class AgentBootstrapStage:
             temperature=catalog.temperature,
             top_p=catalog.top_p,
             context_window_tokens=catalog.context_window,
+            context_window_known=catalog.context_window_known,
             context_window_tokens_global_override=(
                 catalog.context_window_tokens_global_override
             ),

@@ -72,6 +72,8 @@ from .request_proof import (
     project_final_request_payload,
     protected_tool_result_indexes,
     prove_provider_payload_from_env,
+    provider_request_character_budget,
+    provider_request_token_budget,
 )
 from .stream_assembly import (
     ReasoningAccumulator,
@@ -3607,7 +3609,8 @@ class OpenAIProvider:
         return project_final_request_payload(
             payload,
             projection_adapter=self._provider_kind,
-            proof_budget=cfg.provider_request_max_chars,
+            proof_budget=provider_request_character_budget(payload, cfg),
+            token_budget=provider_request_token_budget(payload, cfg),
             status_projection_mode="content_envelope",
             fallback_reason=fallback_reason,
             active_user_message_index=wire_active_user_index,
@@ -3726,7 +3729,8 @@ class OpenAIProvider:
         budget_decision = coordinate_provider_context_budget(
             payload,
             projection_adapter=self._provider_kind,
-            proof_budget=cfg.provider_request_max_chars,
+            proof_budget=provider_request_character_budget(payload, cfg),
+            token_budget=provider_request_token_budget(payload, cfg),
             status_projection_mode="content_envelope",
             fallback_reason=fallback_reason,
             active_user_message_index=wire_active_user_index,
@@ -3753,6 +3757,7 @@ class OpenAIProvider:
         try:
             prove_provider_payload_from_env(
                 payload,
+                token_budget=provider_request_token_budget(payload, cfg),
                 projection_adapter=self._provider_kind,
                 status_projection_mode="content_envelope",
                 fallback_reason=fallback_reason,

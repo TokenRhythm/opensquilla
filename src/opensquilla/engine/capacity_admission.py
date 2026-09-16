@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
-from opensquilla.context_budget import CHARS_PER_TOKEN, ContextBudgetGovernor
+from opensquilla.context_budget import ContextBudgetGovernor
 from opensquilla.provider.model_catalog import (
     resolve_effective_context_window,
     shared_catalog,
 )
+from opensquilla.provider.request_proof import effective_proof_token_budget
 
 NON_MATERIAL_INPUT_HEADROOM_TOKENS = 8_192
 MAX_THINKING_BUDGET_TOKENS = 50_000
@@ -91,13 +92,12 @@ def model_has_request_capacity(
         max_output_tokens=max_output,
         thinking_budget_tokens=max(0, int(thinking_budget_tokens)),
         context_overflow_threshold=0.85,
+        provider_request_proof_max_chars=provider_request_proof_max_chars,
     ).snapshot()
-    safe_input_tokens = budget.provider_request_max_chars // CHARS_PER_TOKEN
-    if provider_request_proof_max_chars > 0:
-        safe_input_tokens = min(
-            safe_input_tokens,
-            int(provider_request_proof_max_chars) // CHARS_PER_TOKEN,
-        )
+    safe_input_tokens, _headroom = effective_proof_token_budget(budget.usable_tokens)
+    # This prefilter receives token estimates, not the serialized request.
+    # Its character cap is enforced separately by the final adapter proof;
+    # converting that cap to tokens would conflate two independent limits.
     required_input_tokens = (
         resolved_request_tokens
         if resolved_request_tokens > 0

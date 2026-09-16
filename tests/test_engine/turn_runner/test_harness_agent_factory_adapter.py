@@ -94,6 +94,7 @@ def test_model_catalog_adapter_defaults_to_200k_without_override() -> None:
     resolved = adapter.lookup("qwen3.6-flash")
 
     assert resolved.context_window == 200_000
+    assert resolved.context_window_known is False
     assert resolved.context_window_tokens_global_override == 0
     assert resolved.max_tokens == 32768
 
@@ -112,6 +113,7 @@ def test_model_catalog_adapter_honors_context_window_tokens_override() -> None:
     resolved = adapter.lookup("qwen3.6-flash")
 
     assert resolved.context_window == 1_000_000
+    assert resolved.context_window_known is True
     assert resolved.context_window_tokens_global_override == 1_000_000
     assert resolved.max_tokens == 32768
 
@@ -322,6 +324,28 @@ def test_model_catalog_adapter_does_not_hard_cap_unknown_fallback() -> None:
     assert resolved.max_tokens == 131_072
     assert resolved.auto_max_tokens == 16_384
     assert resolved.auto_max_tokens_known is False
+    assert resolved.context_window_known is False
+
+
+def test_model_catalog_adapter_rebinds_unknown_deployment_only_with_explicit_window() -> None:
+    from opensquilla.engine.turn_runner.harness import _TurnRunnerModelCatalogAdapter
+    from opensquilla.provider.model_catalog import ModelCatalog
+    from opensquilla.provider.selector import ProviderConfig
+
+    llm = SimpleNamespace(provider="tokenrhythm", context_window_tokens=900_000, max_tokens=0)
+    adapter = _TurnRunnerModelCatalogAdapter(
+        _catalog_runner(llm=llm, model_catalog=ModelCatalog()),
+    )
+    deployment = ProviderConfig(
+        provider="tokenrhythm", model="synthetic-private-model",
+        base_url="https://synthetic.example/v1", api_key="synthetic-key",
+    )
+    unknown = adapter.lookup_deployment(deployment)
+    explicit = adapter.lookup_deployment(deployment, include_global_overrides=True)
+    assert unknown.context_window == 200_000
+    assert unknown.context_window_known is False
+    assert explicit.context_window == 900_000
+    assert explicit.context_window_known is True
 
 
 def test_model_catalog_adapter_ignores_junk_context_window_values() -> None:

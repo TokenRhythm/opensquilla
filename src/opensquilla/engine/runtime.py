@@ -285,6 +285,7 @@ from opensquilla.provider.protocol import (
     count_provider_image_blocks,
     project_provider_final_request,
     project_provider_message_count,
+    provider_connection_config,
     provider_metadata,
     validate_provider_chat_admission,
 )
@@ -2961,6 +2962,7 @@ class _SelectorFallbackProvider:
             return None
         identity = _fallback_deployment_identity(deployment)
         window = max(1, int(catalog.context_window))
+        physical_window = window if getattr(catalog, "context_window_known", True) else 0
         output_limit = min(max(1, int(config.max_tokens)), max(1, int(catalog.max_tokens)))
         proof = ContextBudgetGovernor.from_values(
             context_window_tokens=window,
@@ -2976,11 +2978,12 @@ class _SelectorFallbackProvider:
             "model_capabilities": catalog.capabilities,
             "model_vision_support": catalog.vision_support,
             "provider_request_max_chars": proof,
+            "provider_context_window_tokens": physical_window,
             "provider_request_max_chars_explicit_cap": explicit_proof,
         })
         self._selector = candidate_selector
         self._provider = candidate_provider
-        self._fallback_deployment_limits[identity] = (window, output_limit)
+        self._fallback_deployment_limits[identity] = (physical_window, output_limit)
         if catalog.capabilities is not None:
             self._fallback_deployment_capabilities[identity] = catalog.capabilities
         self._fallback_deployment_vision_support[identity] = catalog.vision_support
@@ -3175,6 +3178,7 @@ class _SelectorFallbackProvider:
             )
 
         context_window, effective_max_tokens = self._active_fallback_limits()
+        updates["provider_context_window_tokens"] = context_window
         try:
             original_max_tokens = max(0, int(getattr(config, "max_tokens", 0) or 0))
         except (TypeError, ValueError):
@@ -7001,7 +7005,9 @@ class TurnRunner:
                 previous_deployment_identities=previous_deployment_identities,
                 fallback_provider_configs=selector_remaining_chain[1:],
                 compaction_config=configured_compaction,
-                context_window_tokens=compaction_context_window_tokens,
+                context_window_tokens=(
+                    compaction_context_window_tokens if agent.config.context_window_known else 0
+                ),
                 session_key=session_key,
                 credential_pool_acquirer=acquire_profile_credential,
                 credential_pool_failure_reporter=report_profile_credential_failure,
@@ -7028,8 +7034,35 @@ class TurnRunner:
                         self._model_catalog,
                         fresh_model,
                         provider=fresh_provider,
-                        global_override=(getattr(llm_cfg, "context_window_tokens", 0) or 0),
+                        global_override=(
+                            (getattr(llm_cfg, "context_window_tokens", 0) or 0)
+                            if str(getattr(llm_cfg, "provider", "")).strip().lower()
+                            == fresh_provider.strip().lower()
+                            else 0
+                        ),
                     )
+                    deployment_limits = getattr(
+                        self._model_catalog, "resolve_deployment_limits", None,
+                    )
+                    if (
+                        _fresh_window_source not in {"override", "config"}
+                        and callable(deployment_limits)
+                    ):
+                        limits = deployment_limits(
+                            fresh_model,
+                            provider=fresh_provider,
+                            api_key=str(getattr(fresh_current, "api_key", "") or ""),
+                            base_url=str(getattr(fresh_current, "base_url", "") or ""),
+                            proxy=str(getattr(fresh_current, "proxy", "") or ""),
+                        )
+                        fresh_window = limits.context_window
+                        _fresh_window_source = (
+                            "catalog"
+                            if getattr(limits, "context_window_known", True)
+                            else "default"
+                        )
+                    if _fresh_window_source == "default":
+                        fresh_window = 0
                 return resolve_compaction_execution_plan(
                     app_config=self._turn_config(),
                     active_provider=provider,
@@ -7045,6 +7078,7 @@ class TurnRunner:
                 )
 
             stable_consumer_window_tokens = compaction_context_window_tokens
+            stable_consumer_window_known = agent.config.context_window_known
             stable_consumer_max_output_tokens = agent.config.max_tokens
             stable_consumer_model_id = agent.config.model_id
             stable_consumer_capabilities = agent.config.model_capabilities
@@ -7076,6 +7110,7 @@ class TurnRunner:
                             global_override=base_global_window,
                         )
                     )
+                    stable_consumer_window_known = _stable_window_source != "default"
                     stable_consumer_max_output_tokens = int(
                         self._model_catalog.resolve_max_tokens(
                             base_model,
@@ -7084,6 +7119,21 @@ class TurnRunner:
                         )
                         or agent.config.max_tokens
                     )
+                    resolve_limits = getattr(
+                        self._model_catalog, "resolve_deployment_limits", None,
+                    )
+                    if callable(resolve_limits):
+                        connection = provider_connection_config(durable_base_consumer_provider)
+                        limits = resolve_limits(
+                            base_model, provider=base_provider,
+                            api_key=connection.api_key, base_url=connection.base_url,
+                        )
+                        stable_consumer_max_output_tokens = limits.max_output_tokens
+                        if _stable_window_source not in {"override", "config"}:
+                            stable_consumer_window_tokens = limits.context_window
+                            stable_consumer_window_known = bool(
+                                getattr(limits, "context_window_known", True)
+                            )
                     stable_consumer_model_id = base_model
                     stable_consumer_capabilities = self._model_catalog.get_capabilities(
                         base_model,
@@ -7124,6 +7174,7 @@ class TurnRunner:
                     provider=durable_base_consumer_provider,
                     model_id=stable_consumer_model_id,
                     context_window_tokens=stable_consumer_window_tokens,
+                    context_window_known=stable_consumer_window_known,
                     max_output_tokens=stable_consumer_max_output_tokens,
                     model_capabilities=stable_consumer_capabilities,
                     provider_request_proof_max_chars=(stable_consumer_proof_max_chars),
@@ -12402,14 +12453,15 @@ class TurnRunner:
             transcript[:durable_prefix_end]
         )
         safety_margin = float(
-            getattr(compaction_config or CompactionConfig(), "safety_margin", 1.2) or 1.2
+            getattr(compaction_config or CompactionConfig(), "safety_margin", 1 / 0.85) or 1 / 0.85
         )
+        trigger_ratio = self._preflight_compact_ratio()
         durable_tokens_within_budget = bool(
-            durable_history_tokens * safety_margin <= history_window_tokens
+            durable_history_tokens < history_window_tokens * trigger_ratio
         )
         durable_chars_within_budget = bool(
             history_capacity_chars is None
-            or durable_history_chars * safety_margin <= int(history_capacity_chars)
+            or durable_history_chars < int(history_capacity_chars) * trigger_ratio
         )
         if durable_tokens_within_budget and durable_chars_within_budget:
             log.info(
@@ -13160,7 +13212,7 @@ class TurnRunner:
             if active_user_index is not None
             else 0
         )
-        safety_margin = float(getattr(compaction_config, "safety_margin", 1.2) or 1.2)
+        safety_margin = float(getattr(compaction_config, "safety_margin", 1 / 0.85) or 1 / 0.85)
         if (
             protected_request_tokens > 0
             and protected_request_tokens * safety_margin > history_window_tokens
@@ -13250,6 +13302,13 @@ class TurnRunner:
             status="started",
             tokens_before=total_tokens,
             context_window_tokens=context_window_tokens,
+            history_capacity_tokens=history_window_tokens,
+            history_capacity_chars=history_capacity_chars,
+            durable_history_tokens=durable_history_tokens,
+            durable_history_chars=durable_history_chars,
+            threshold=threshold,
+            char_threshold=char_threshold,
+            ratio=ratio,
             heartbeat_interval_seconds=compaction_config.heartbeat_interval_seconds,
             **compaction_effect_payload(status="started"),
             **compaction_lifecycle_payload(compaction_id, COMPACTION_TRIGGERED_EVENT),

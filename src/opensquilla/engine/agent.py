@@ -122,7 +122,6 @@ from opensquilla.engine.web_search_projection import (
 )
 from opensquilla.execution_status import (
     mark_execution_status_truncated,
-    normalize_execution_status,
     runtime_execution_status,
 )
 from opensquilla.git_runtime import GitRunState, run_git
@@ -194,8 +193,12 @@ from opensquilla.provider.protocol import (
 )
 from opensquilla.provider.request_proof import (
     ProviderRequestBudgetExceededError,
+    effective_proof_token_budget,
     project_provider_payload,
+    projected_generation_budget,
     prove_provider_payload,
+    provider_request_character_budget,
+    provider_request_token_budget,
 )
 from opensquilla.provider.types import (
     ContentBlockImage,
@@ -2493,6 +2496,7 @@ class Agent:
         self._durable_consumer_provider: Any = self.provider
         self._durable_consumer_model_id = self.config.model_id
         self._durable_consumer_window_tokens = self.config.context_window_tokens
+        self._durable_consumer_window_known = self.config.context_window_known
         self._durable_consumer_max_output_tokens = self.config.max_tokens
         self._durable_consumer_model_capabilities = self.config.model_capabilities
         self._durable_consumer_provider_request_max_chars = (
@@ -2936,6 +2940,7 @@ class Agent:
         model_id: str | None,
         context_window_tokens: int,
         max_output_tokens: int,
+        context_window_known: bool = True,
         model_capabilities: ModelCapabilities | None = None,
         provider_request_proof_max_chars: int = 0,
     ) -> None:
@@ -2943,6 +2948,7 @@ class Agent:
 
         self._durable_consumer_provider = provider
         self._durable_consumer_model_id = model_id
+        self._durable_consumer_window_known = context_window_known
         self._durable_consumer_window_tokens = max(
             1,
             int(context_window_tokens or 0),
@@ -2969,6 +2975,7 @@ class Agent:
         active_user_message: str,
         *,
         context_window_tokens: int,
+        context_window_known: bool | None = None,
         max_output_tokens: int | None = None,
         model_capabilities: ModelCapabilities | None = None,
         provider_request_proof_max_chars: int | None = None,
@@ -3059,6 +3066,12 @@ class Agent:
                 self.config.thinking if isinstance(self.config.thinking, ThinkingLevel) else None
             ),
             provider_request_max_chars=proof_budget,
+            provider_context_window_tokens=(
+                max(0, int(context_window_tokens))
+                if (self.config.context_window_known
+                    if context_window_known is None else context_window_known)
+                else 0
+            ),
             context_window_tokens_global_override=(
                 self.config.context_window_tokens_global_override
             ),
@@ -3148,7 +3161,13 @@ class Agent:
                 "max_tokens": max_output_tokens,
                 "model_capabilities": self._durable_consumer_model_capabilities,
                 "provider_request_max_chars": proof_budget,
-                "provider_request_max_chars_explicit_cap": proof_budget,
+                "provider_request_max_chars_explicit_cap": (
+                    self._durable_consumer_provider_request_max_chars
+                ),
+                "provider_context_window_tokens": (
+                    self._durable_consumer_window_tokens
+                    if self._durable_consumer_window_known else 0
+                ),
             }
         )
         return project_provider_final_request(
@@ -3314,6 +3333,11 @@ class Agent:
         chat_config = self._provider_admission_chat_config(
             active_user_message,
             context_window_tokens=context_window_tokens,
+            context_window_known=(
+                self._durable_consumer_window_known
+                if consumer_provider is self._durable_consumer_provider
+                else self.config.context_window_known
+            ),
             max_output_tokens=max_output_tokens,
             model_capabilities=consumer_model_capabilities,
             provider_request_proof_max_chars=(consumer_provider_request_max_chars),
@@ -3584,34 +3608,37 @@ class Agent:
         }
         if self.config.output_json_schema is not None:
             payload["response_format"] = self._live_request_jsonable(self.config.output_json_schema)
-        proof_budget = self._provider_request_proof_max_chars()
-        if context_window_tokens is not None:
-            try:
-                thinking_enabled, thinking_budget = self.config.resolve_thinking(
-                    active_user_message
-                )
-            except Exception:  # noqa: BLE001 - lightweight config compatibility
-                thinking_enabled = False
-                thinking_budget = 0
-            proof_budget = (
-                ContextBudgetGovernor.from_values(
-                    context_window_tokens=context_window_tokens,
-                    max_output_tokens=(consumer_max_output_tokens or self.config.max_tokens),
-                    thinking_budget_tokens=thinking_budget if thinking_enabled else 0,
-                    context_overflow_threshold=self.config.context_overflow_threshold,
-                    provider_request_proof_max_chars=max(
-                        0,
-                        int(consumer_provider_request_max_chars or 0),
-                    ),
-                )
-                .snapshot()
-                .provider_request_max_chars
+        fallback_config = self._provider_admission_chat_config(
+            active_user_message,
+            context_window_tokens=effective_window,
+            context_window_known=(
+                self._durable_consumer_window_known
+                if exact_provider is self._durable_consumer_provider
+                else self.config.context_window_known
+            ),
+            max_output_tokens=consumer_max_output_tokens,
+            model_capabilities=consumer_model_capabilities,
+            provider_request_proof_max_chars=consumer_provider_request_max_chars,
+        )
+        # Raw ingress attachments cannot enter an exact wire projection yet.
+        # The typed envelope can still reveal the adapter's actual generation
+        # cap, including provider-specific reasoning reserves, without I/O.
+        generation_projection = project_provider_final_request(
+            exact_provider, fixed_messages, self.tool_definitions, fallback_config
+        )
+        payload["max_tokens"] = (
+            projected_generation_budget(generation_projection.payload, fallback_config.max_tokens)
+            if generation_projection is not None
+            else fallback_config.max_tokens + (
+                fallback_config.thinking_budget_tokens if fallback_config.thinking else 0
             )
+        )
         try:
             proof = prove_provider_payload(
                 payload,
                 projection_adapter="preflight_history_capacity",
-                proof_budget=proof_budget,
+                proof_budget=provider_request_character_budget(payload, fallback_config),
+                token_budget=provider_request_token_budget(payload, fallback_config),
             )
         except ProviderRequestBudgetExceededError as exc:
             proof = exc.proof
@@ -3833,6 +3860,9 @@ class Agent:
             model_vision_support=self.config.model_vision_support,
             physical_attempt_limit=1,
             provider_request_max_chars=self._provider_request_proof_max_chars(),
+            provider_context_window_tokens=(
+                self.config.context_window_tokens if self.config.context_window_known else 0
+            ),
             context_window_tokens_global_override=(
                 self.config.context_window_tokens_global_override
             ),
@@ -7273,6 +7303,9 @@ class Agent:
                                     (self.tool_definitions or None) if tools_supported else None
                                 )
                                 self.config.model_vision_support = chat_cfg.model_vision_support
+                                self.config.context_window_known = (
+                                    chat_cfg.provider_context_window_tokens > 0
+                                )
                                 self.config.max_tokens = chat_cfg.max_tokens
                                 self.config.provider_request_proof_max_chars = (
                                     chat_cfg.provider_request_max_chars
@@ -7711,9 +7744,8 @@ class Agent:
                                 config=call_chat_cfg,
                             )
                             budget = self._context_budget_governor().snapshot()
-                            token_limit = max(
-                                1,
-                                int(budget.usable_tokens * budget.threshold),
+                            token_limit, _ = effective_proof_token_budget(
+                                budget.usable_tokens,
                             )
                             char_limit = budget.provider_request_max_chars
                             restored_request_fits = bool(
@@ -15403,6 +15435,32 @@ class Agent:
                 )
                 return _local_after_failure("provider_recent_tail_too_large")
 
+        history_window_tokens = window_tokens
+        history_window_chars: int | None = None
+        if durable_consumer_overflow_proven is True and (
+            request_window_tokens is not None or request_window_chars is not None
+        ):
+            # The core compacts history, whereas the overflow proof includes
+            # the complete request. Reserve the stable consumer's fixed
+            # envelope and generation budget before selecting its history.
+            # A routed member's smaller request cap must not rewrite durable
+            # history. The active user/tool tail already belongs to entries.
+            history_window_tokens, history_window_chars = self.preflight_history_capacity(
+                active_user_message="",
+                active_user_in_history=False,
+                context_window_tokens=self._durable_consumer_window_tokens,
+                consumer_provider=self._durable_consumer_provider,
+                consumer_max_output_tokens=self._durable_consumer_max_output_tokens,
+                consumer_model_id=self._durable_consumer_model_id,
+                consumer_model_capabilities=self._durable_consumer_model_capabilities,
+                consumer_provider_request_max_chars=(
+                    self._durable_consumer_provider_request_max_chars
+                ),
+            )
+            if history_window_tokens <= 0 or history_window_chars <= 0:
+                self._last_compaction_refusal_reason = "provider_request_budget_exhausted"
+                return _local_after_failure("provider_request_budget_exhausted")
+
         protected_start: int | None = None
         compaction_id = new_compaction_id()
         compaction_config = self._build_compaction_config()
@@ -15426,6 +15484,13 @@ class Agent:
                 status="started",
                 tokens_before=estimated_context_tokens,
                 context_window_tokens=window_tokens,
+                request_capacity_tokens=pressure_window_tokens,
+                request_capacity_chars=request_window_chars,
+                request_tokens=estimated_context_tokens,
+                request_chars=estimated_context_chars,
+                threshold=threshold,
+                char_threshold=char_threshold,
+                ratio=self.config.context_overflow_threshold,
                 heartbeat_interval_seconds=compaction_config.heartbeat_interval_seconds,
                 **compaction_effect_payload(status="started"),
                 **compaction_lifecycle_payload(
@@ -15623,7 +15688,8 @@ class Agent:
         request = CompactionRequest(
             session_id="agent-turn",
             entries=entries,
-            context_window_tokens=window_tokens,
+            context_window_tokens=history_window_tokens,
+            context_window_chars=history_window_chars,
             config=compaction_config,
             provider_request_correlation=derive_provider_request_correlation(
                 self._provider_request_correlation,
@@ -18119,6 +18185,7 @@ class Agent:
             max_turn_tool_errors=self.config.max_turn_tool_errors,
             length_capped_continuations=self.config.length_capped_continuations,
             context_window_tokens=child_target.context_window_tokens,
+            context_window_known=child_target.context_window_known,
             workspace_dir=spec.workspace_dir or self.config.workspace_dir,
             flush_enabled=self.config.flush_enabled,
             flush_triggers=list(self.config.flush_triggers),

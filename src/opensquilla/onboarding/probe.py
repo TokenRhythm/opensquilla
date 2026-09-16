@@ -177,6 +177,10 @@ async def probe_llm_provider(
         timeout=timeout,
         thinking=False,
         provider_request_max_chars=request_budget.provider_request_max_chars,
+        provider_context_window_tokens=request_budget.context_window_tokens,
+        provider_request_max_chars_explicit_cap=(
+            request_budget.provider_request_max_chars_explicit_cap
+        ),
     )
     messages = [Message(role="user", content="ping")]
     ensure_auxiliary_text_fits(

@@ -912,6 +912,10 @@ class AgentConfig:
     # stays gateway-agnostic and a broken observer can never affect a turn.
     provider_call_observer: Callable[..., None] | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
+    # Internal provenance: a compatibility/default history window is not a
+    # physical provider fact. Direct AgentConfig callers retain their supplied
+    # window; runtime catalog resolution explicitly marks unknown values false.
+    context_window_known: bool = True
 
     def __post_init__(self) -> None:
         self.flush_triggers = list(normalize_flush_triggers_strict(self.flush_triggers))

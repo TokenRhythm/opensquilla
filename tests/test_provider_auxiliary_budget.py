@@ -117,6 +117,29 @@ def test_auxiliary_budget_prefers_physical_metadata_over_stale_hints(
     assert budget.provider_request_max_chars == 1200
 
 
+def test_auxiliary_input_budget_uses_physical_headroom_not_soft_threshold(
+    small_catalog: _Catalog,
+) -> None:
+    small_catalog.context_window = 32_000
+    budget = resolve_auxiliary_request_budget(
+        _ChatProvider(), max_output_tokens=4_000, context_overflow_threshold=0.50,
+        provider_request_max_chars=1_000,
+    )
+    assert budget.max_input_tokens == 21_600
+    assert budget.provider_request_max_chars == 1_000
+    assert budget.provider_request_max_chars_explicit_cap == 1_000
+
+
+def test_exhausted_auxiliary_input_budget_is_not_disabled(small_catalog: _Catalog) -> None:
+    budget = resolve_auxiliary_request_budget(_ChatProvider(), max_output_tokens=9_000)
+    assert budget.max_input_tokens == 0
+    with pytest.raises(AuxiliaryRequestTooLargeError, match="tokens"):
+        ensure_auxiliary_text_fits(
+            [Message(role="user", content="synthetic")],
+            max_chars=1_000, max_tokens=budget.max_input_tokens,
+        )
+
+
 def test_auxiliary_text_preflight_rejects_before_physical_call() -> None:
     with pytest.raises(AuxiliaryRequestTooLargeError, match="resolved deployment budget"):
         ensure_auxiliary_text_fits(

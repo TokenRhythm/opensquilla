@@ -1171,6 +1171,10 @@ async def _provider_complete(
     config = ChatConfig(
         max_tokens=budget.max_output_tokens,
         provider_request_max_chars=budget.provider_request_max_chars,
+        provider_context_window_tokens=budget.context_window_tokens,
+        provider_request_max_chars_explicit_cap=(
+            budget.provider_request_max_chars_explicit_cap
+        ),
         provider_request_correlation=current_provider_request_correlation(),
     )
     scope = current_usage_accounting_scope()

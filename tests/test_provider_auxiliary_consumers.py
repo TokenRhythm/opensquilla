@@ -109,6 +109,8 @@ async def test_media_chat_receives_nonzero_resolved_request_cap(
     assert provider.calls == 1
     assert provider.config is not None
     assert provider.config.provider_request_max_chars > 0
+    assert provider.config.provider_context_window_tokens == small_catalog.context_window
+    assert provider.config.provider_request_max_chars_explicit_cap == 0
     assert provider.config.max_tokens == 64
 
 
@@ -161,6 +163,8 @@ async def test_dream_chat_receives_nonzero_resolved_request_cap(
 
     assert provider.config is not None
     assert provider.config.provider_request_max_chars > 0
+    assert provider.config.provider_context_window_tokens == small_catalog.context_window
+    assert provider.config.provider_request_max_chars_explicit_cap == 0
 
 
 @pytest.mark.asyncio
@@ -183,6 +187,8 @@ async def test_meta_chat_binds_base_deployment_budget(
 
     assert provider.config is not None
     assert provider.config.provider_request_max_chars > 0
+    assert provider.config.provider_context_window_tokens == small_catalog.context_window
+    assert provider.config.provider_request_max_chars_explicit_cap == 0
     assert provider.config.max_tokens == 128
 
 
@@ -220,3 +226,5 @@ async def test_profile_import_completion_binds_nonzero_request_cap(
     assert result == "ok"
     assert provider.config is not None
     assert provider.config.provider_request_max_chars > 0
+    assert provider.config.provider_context_window_tokens == small_catalog.context_window
+    assert provider.config.provider_request_max_chars_explicit_cap == 0

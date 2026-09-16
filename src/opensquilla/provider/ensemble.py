@@ -21,7 +21,7 @@ from typing import Any, Literal, cast
 
 import structlog
 
-from opensquilla.context_budget import CHARS_PER_TOKEN, ContextBudgetGovernor
+from opensquilla.context_budget import ContextBudgetGovernor
 from opensquilla.contracts.turn_execution import (
     EnsembleContinuationSnapshot,
     ProviderAdmissionError,
@@ -72,7 +72,9 @@ from .protocol import (
     project_provider_final_request,
     project_provider_message_count,
 )
+from .request_proof import effective_proof_token_budget
 from .selector import ModelSelector, ProviderConfig, SelectorConfig
+from .tokenrhythm_catalog import TOKENRHYTHM_API_BASE_URL, tokenrhythm_authority_identity
 from .types import (
     ChatConfig,
     ContentBlockToolResult,
@@ -970,7 +972,14 @@ def _member_max_tokens(member: EnsembleMemberConfig) -> int:
         return member.max_tokens
     cfg = member.provider_config
     try:
-        return shared_catalog().resolve_max_tokens(
+        catalog = shared_catalog()
+        deployment_limits = getattr(catalog, "resolve_deployment_limits", None)
+        if callable(deployment_limits):
+            return int(deployment_limits(
+                cfg.model, provider=cfg.provider, api_key=cfg.api_key,
+                base_url=cfg.base_url, proxy=cfg.proxy,
+            ).max_output_tokens)
+        return catalog.resolve_max_tokens(
             cfg.model,
             user_override=0,
             provider=cfg.provider,
@@ -984,7 +993,12 @@ def _member_budget_key(member: EnsembleMemberConfig) -> tuple[str, str, str]:
     return (
         str(cfg.provider or "").strip().lower(),
         str(cfg.model or "").strip().lower(),
-        str(cfg.base_url or "").strip().rstrip("/").lower(),
+        tokenrhythm_authority_identity(
+            provider=cfg.provider,
+            base_url=cfg.base_url or TOKENRHYTHM_API_BASE_URL,
+            api_key=cfg.api_key,
+        )
+        or str(cfg.base_url or "").strip().rstrip("/").lower(),
     )
 
 
@@ -1137,7 +1151,14 @@ def _member_chat_config(
         if rebound_cap <= 0 and request_budget_binding.inherit_top_level_cap:
             rebound_cap = inherited_cap
         effective = effective.model_copy(
-            update={"provider_request_max_chars": rebound_cap}
+            update={
+                "provider_request_max_chars": rebound_cap,
+                "provider_request_max_chars_explicit_cap": explicit_cap,
+                "provider_context_window_tokens": (
+                    (request_budget_binding.context_window_tokens or 0)
+                    if request_budget_binding.rederive else 0
+                ),
+            }
         )
     if (
         request_budget_binding is not None
@@ -1685,11 +1706,9 @@ class EnsembleProvider:
             thinking_budget_tokens=thinking_budget_tokens,
             context_overflow_threshold=binding.context_overflow_threshold,
         ).snapshot()
-        request_max_chars = budget.provider_request_max_chars
-        explicit_cap = max(0, int(binding.top_level_explicit_cap or 0))
-        if explicit_cap > 0:
-            request_max_chars = min(request_max_chars, explicit_cap)
-        safe_input_tokens = request_max_chars // CHARS_PER_TOKEN
+        # Character caps are checked against the final wire payload. They do
+        # not describe a model's token capacity.
+        safe_input_tokens, _ = effective_proof_token_budget(budget.usable_tokens)
         if self._attachment_request_input_tokens > safe_input_tokens:
             return (
                 f"{role} attachment request exceeds its proven capacity; "
@@ -1794,6 +1813,11 @@ class EnsembleProvider:
                 update={"timeout": self.aggregator_timeout_seconds}
             )
         return aggregator_cfg
+
+    def compaction_chat_config(self, config: ChatConfig) -> ChatConfig:
+        """Bind summary generation to the aggregator without invoking proposers."""
+
+        return self._aggregator_chat_config(config, ())
 
     def _fixed_chat_config(
         self,
@@ -7050,6 +7074,19 @@ def _runtime_member_request_budget_bindings(
                     provider=member_cfg.provider,
                     global_override=member_global_context_override,
                 )
+                deployment_limits = getattr(model_catalog, "resolve_deployment_limits", None)
+                if resolved_source not in {"override", "config"} and callable(deployment_limits):
+                    limits = deployment_limits(
+                        member_cfg.model,
+                        provider=member_cfg.provider,
+                        api_key=member_cfg.api_key,
+                        base_url=member_cfg.base_url,
+                        proxy=member_cfg.proxy,
+                    )
+                    resolved_window = limits.context_window
+                    resolved_source = (
+                        "catalog" if getattr(limits, "context_window_known", True) else "default"
+                    )
                 context_window = int(resolved_window)
                 context_source = str(resolved_source or "default")
             except Exception:  # noqa: BLE001 - an unknown member keeps the outer cap

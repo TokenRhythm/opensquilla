@@ -2571,6 +2571,10 @@ def make_llm_chat_from_provider(
             max_tokens=request_budget.max_output_tokens,
             temperature=0.0,
             provider_request_max_chars=request_budget.provider_request_max_chars,
+            provider_context_window_tokens=request_budget.context_window_tokens,
+            provider_request_max_chars_explicit_cap=(
+                request_budget.provider_request_max_chars_explicit_cap
+            ),
             provider_request_correlation=call_provider_request_correlation,
         )
         messages = [Message(role="user", content=user_message)]

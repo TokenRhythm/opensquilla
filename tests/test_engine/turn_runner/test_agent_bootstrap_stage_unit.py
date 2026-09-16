@@ -586,6 +586,7 @@ async def test_bootstrap_installs_known_fallback_limits_on_provider_wrapper() ->
                 capabilities=None,
                 auto_max_tokens=16_384,
                 auto_max_tokens_known=False,
+                context_window_known=False,
             ),
         }
     )
@@ -614,7 +615,7 @@ async def test_bootstrap_installs_known_fallback_limits_on_provider_wrapper() ->
 
     assert provider.limits == {
         ("provider-b", "fallback/model"): (32_000, 8_192),
-        ("provider-b", "unknown/model"): (200_000, 0),
+        ("provider-b", "unknown/model"): (0, 0),
     }
     assert (
         turn.metadata["route_plan"]["fallback_chain"][0]["capabilities"]["effective_max_tokens"]
@@ -856,6 +857,20 @@ async def test_case05_no_model_catalog_fallback() -> None:
     assert out.output.model_capabilities is None
     assert out.output.agent_config.metadata["resolved_output_cap_tokens"] == 8192
     assert out.output.agent_config.metadata["resolved_context_window_tokens"] == 200_000
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("known", [False, True])
+async def test_context_window_provenance_reaches_agent_without_replacing_history_window(
+    known: bool,
+) -> None:
+    catalog = _RecordingModelCatalog(
+        catalog=replace(_default_catalog(), context_window_known=known),
+    )
+    out = await _make_stage(catalog=catalog).run(_make_input())
+    assert out.output is not None
+    assert out.output.agent_config.context_window_known is known
+    assert out.output.agent_config.context_window_tokens == 200_000
 
 
 @pytest.mark.asyncio

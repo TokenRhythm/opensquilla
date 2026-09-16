@@ -8,13 +8,16 @@ from opensquilla.gateway.compaction_target import (
     GatewayConsumerBudget,
     _manual_consumer_messages,
     build_gateway_consumer_admission,
+    limit_gateway_consumer_budget,
     resolve_gateway_compaction_target,
     resolve_gateway_consumer_budget,
 )
 from opensquilla.gateway.config import GatewayConfig, LlmProviderProfile
+from opensquilla.provider.anthropic import AnthropicProvider
 from opensquilla.provider.ollama import OllamaProvider
 from opensquilla.provider.openai import OpenAIProvider
 from opensquilla.provider.protocol import provider_connection_config
+from opensquilla.provider.request_proof import provider_request_character_budget
 from opensquilla.provider.selector import ProviderConfig
 from opensquilla.provider.types import (
     ChatConfig,
@@ -177,6 +180,81 @@ def test_manual_consumer_budget_uses_stable_base_not_last_routed_model() -> None
     )
 
 
+@pytest.mark.parametrize("configured_window", [0, 32_000])
+def test_gateway_preserves_unknown_window_compatibility(
+    monkeypatch: pytest.MonkeyPatch, configured_window: int,
+) -> None:
+    from opensquilla.gateway import compaction_target as target_module
+
+    model = "synthetic-undocumented-window"
+    config = GatewayConfig(llm={
+        "provider": "openai", "model": model, "api_key": "synthetic-key",
+        "context_window_tokens": configured_window,
+        "provider_request_proof_max_chars": 500_000,
+    })
+    ctx = _ctx(config, ProviderConfig(
+        provider="openai", model=model, api_key="synthetic-key",
+    ))
+    session = SimpleNamespace(session_key="agent:main:webchat:unknown-window")
+    projected_windows: list[int] = []
+    project = target_module.project_provider_final_request
+
+    def capture_projection(provider, messages, tools, chat_config):
+        projected_windows.append(chat_config.provider_context_window_tokens)
+        return project(provider, messages, tools, chat_config)
+
+    monkeypatch.setattr(target_module, "project_provider_final_request", capture_projection)
+    budget = resolve_gateway_consumer_budget(ctx, session)
+    assert budget.context_window_known is (configured_window > 0)
+    admission, _ = build_gateway_consumer_admission(budget)
+    assert admission("synthetic checkpoint", []) is True
+    assert projected_windows == [configured_window, configured_window]
+    target = resolve_gateway_compaction_target(ctx, session)
+    assert target.plan is not None
+    assert target.plan.primary.context_window_source == (
+        "caller_resolved" if configured_window else "bounded_fallback"
+    )
+
+
+@pytest.mark.parametrize("configured_window", [0, 96_000])
+def test_manual_compaction_uses_exact_credential_limits(
+    monkeypatch: pytest.MonkeyPatch, configured_window: int,
+) -> None:
+    from opensquilla.provider.model_catalog import ModelCatalog
+    from opensquilla.provider.tokenrhythm_catalog import (
+        parse_tokenrhythm_declared,
+        tokenrhythm_authority_identity,
+    )
+
+    model = "qwen3.7-max"
+    key = "synthetic-limited-authority"
+    base = "https://tokenrhythm.studio/v1"
+    authority = tokenrhythm_authority_identity(provider="tokenrhythm", base_url=base, api_key=key)
+    assert authority is not None
+    catalog = ModelCatalog()
+    catalog.set_tokenrhythm_snapshot_sidecars(published={}, declared_by_authority={
+        authority: parse_tokenrhythm_declared({"data": [{
+            "id": model, "context_length": 64_000, "max_completion_tokens": 8192,
+        }]}),
+    })
+    monkeypatch.setattr("opensquilla.gateway.compaction_target.shared_catalog", lambda: catalog)
+    config = GatewayConfig(llm={
+        "provider": "tokenrhythm", "model": model, "api_key": key, "base_url": base,
+        "context_window_tokens": configured_window, "max_tokens": 0, "thinking": "off",
+    })
+    ctx = _ctx(config, ProviderConfig(
+        provider="tokenrhythm", model=model, api_key=key, base_url=base,
+    ))
+    session = SimpleNamespace(session_key="agent:main:webchat:credential-window")
+    budget = resolve_gateway_consumer_budget(ctx, session)
+    assert budget.context_window_tokens == (configured_window or 64_000)
+    assert budget.context_window_known is True
+    assert budget.max_output_tokens == 8192
+    target = resolve_gateway_compaction_target(ctx, session)
+    assert target.plan is not None
+    assert target.plan.primary.context_window_tokens == (configured_window or 64_000)
+
+
 def test_manual_consumer_admission_uses_exact_adapter_projection() -> None:
     config = GatewayConfig(
         llm={
@@ -252,6 +330,73 @@ def test_manual_consumer_admission_fails_closed_without_projector() -> None:
     )
 
     assert admission("checkpoint", []) is False
+
+
+def test_manual_consumer_uses_adapter_generation_cap_once_for_thinking() -> None:
+    config = GatewayConfig(llm={
+        "provider": "anthropic",
+        "model": "claude-3-7-sonnet-latest",
+        "api_key": "synthetic-key",
+        "context_window_tokens": 64_000,
+        "max_tokens": 1_024,
+        "thinking": "medium",
+    })
+    budget = resolve_gateway_consumer_budget(
+        _ctx(config, ProviderConfig(
+            provider="anthropic", model="claude-3-7-sonnet-latest", api_key="synthetic-key",
+        )),
+        SimpleNamespace(session_key="agent:main:webchat:thinking-budget"),
+    )
+
+    assert isinstance(budget.provider, AnthropicProvider)
+    # This adapter raises max_tokens to thinking + 4096. The resulting cap
+    # already includes reasoning and must not reserve another 10000 tokens.
+    assert budget.max_output_tokens == 14_096
+    assert budget.provider_request_max_chars == (64_000 - 20_000 - 14_096) * 4
+    assert budget.provider_request_max_chars_explicit_cap == 0
+    admission, _ = build_gateway_consumer_admission(budget)
+    assert admission("synthetic complete checkpoint", []) is True
+
+
+def test_manual_window_cap_does_not_reduce_actual_generation_reserve() -> None:
+    provider = OpenAIProvider(api_key="synthetic-key", model="synthetic-model")
+    budget = GatewayConsumerBudget(
+        provider=provider, provider_id="openai", model="synthetic-model",
+        context_window_tokens=128_000, max_output_tokens=16_384,
+        provider_request_max_chars=400_000, provider_request_max_chars_explicit_cap=0,
+    )
+    limited = limit_gateway_consumer_budget(budget, 4_096)
+    assert limited.context_window_tokens == 4_096
+    assert limited.max_output_tokens == 16_384
+    admission, _ = build_gateway_consumer_admission(limited)
+    assert admission("synthetic checkpoint", []) is False
+
+
+@pytest.mark.parametrize("explicit_cap", [0, 12_345])
+def test_gateway_summary_target_preserves_character_cap_provenance(explicit_cap: int) -> None:
+    config = GatewayConfig(llm={
+        "provider": "openai", "model": "synthetic-model", "api_key": "synthetic-key",
+        "context_window_tokens": 32_000, "provider_request_proof_max_chars": explicit_cap,
+    })
+    target = resolve_gateway_compaction_target(
+        _ctx(config, ProviderConfig(
+            provider="openai", model="synthetic-model", api_key="synthetic-key",
+        )),
+        SimpleNamespace(session_key="agent:main:webchat:summary-cap"),
+    )
+    assert target.plan is not None
+    writer = target.plan.primary
+    assert writer.provider_request_max_chars_explicit_cap == explicit_cap
+    chat_config = ChatConfig(
+        max_tokens=writer.max_output_tokens,
+        provider_context_window_tokens=writer.context_window_tokens,
+        provider_request_max_chars=writer.provider_request_max_chars,
+        provider_request_max_chars_explicit_cap=writer.provider_request_max_chars_explicit_cap,
+    )
+    # An adapter that raises its generation allowance must be able to update
+    # a derived character cap, while an operator's cap remains independent.
+    final_cap = provider_request_character_budget({"max_tokens": 8_000}, chat_config)
+    assert final_cap == (explicit_cap or (32_000 - 4_000 - 8_000) * 4)
 
 
 def _native_consumer_fixture(opaque: str = "synthetic-native-data"):
