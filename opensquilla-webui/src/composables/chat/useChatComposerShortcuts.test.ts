@@ -40,6 +40,7 @@ function field(value: string, caret: 'start' | 'end' | 'middle' | number, end?: 
 
 function harness(over: {
   inputText?: string
+  messages?: ChatMessage[]
   pendingQueue?: ChatPendingItem[]
   canQueueMore?: boolean
   safari?: boolean
@@ -62,7 +63,7 @@ function harness(over: {
   const api = useChatComposerShortcuts({
     inputText,
     composing: ref(false),
-    messages: ref<ChatMessage[]>([]),
+    messages: ref<ChatMessage[]>(over.messages ?? []),
     pendingQueue: ref<ChatPendingItem[]>(over.pendingQueue ?? []),
     canQueueMore: ref(over.canQueueMore ?? true),
     slashOpen: ref(over.slashOpen ?? false),
@@ -298,6 +299,26 @@ describe('useChatComposerShortcuts', () => {
 })
 
 describe('Escape and message edits', () => {
+  it('resets history navigation so ArrowDown cannot overwrite the restored draft', () => {
+    const { api, inputText, spies } = harness({
+      messages: [{ role: 'user', text: 'earlier request', ts: null }],
+    })
+    api.onTextareaKeydown(keydown({ key: 'ArrowUp', target: field('', 'start') }))
+    expect(inputText.value).toBe('earlier request')
+    inputText.value = 'edited message'
+    spies.cancelMessageEdit.mockImplementation(() => {
+      inputText.value = 'restored draft'
+      return true
+    })
+
+    api.onTextareaKeydown(keydown({ key: 'Escape', target: field('edited message', 'end') }))
+    const down = keydown({ key: 'ArrowDown', target: field('restored draft', 'end') })
+    api.onTextareaKeydown(down)
+
+    expect(inputText.value).toBe('restored draft')
+    expect(down.preventDefault).not.toHaveBeenCalled()
+  })
+
   it('cancels an uncommitted edit instead of clearing the composer', () => {
     // #1372: edit mode empties the transcript on the first click, and Escape
     // used to clear the draft and leave that empty state on screen. Cancelling

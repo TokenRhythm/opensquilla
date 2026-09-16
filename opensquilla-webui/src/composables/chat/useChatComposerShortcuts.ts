@@ -133,7 +133,7 @@ export function useChatComposerShortcuts(options: UseChatComposerShortcutsOption
       // Streaming still belongs to Stop.
       if (options.cancelMessageEdit?.()) {
         e.preventDefault()
-        clearTextareaUndoState()
+        resetInputHistory()
         return
       }
       if (options.pendingQueue.value.length === 0 && options.inputText.value) {

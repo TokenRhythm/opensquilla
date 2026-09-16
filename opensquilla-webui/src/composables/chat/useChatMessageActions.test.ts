@@ -179,10 +179,9 @@ describe('useChatMessageActions branching edits', () => {
     expect(options.messages.value.map(message => message.text)).toEqual(['sent since'])
   })
 
-  it('drops the restore point once the fork id has been consumed', () => {
-    // Sending makes the truncation real. `pendingForkBeforeMessageId` moving
-    // off the edit's id is the evidence, and restoring past it would put back
-    // messages the fork has already replaced.
+  it('does not restore while the fork id has been consumed', () => {
+    // A send consumes the fork id before admission. Cancellation must remain
+    // unavailable until a rejected send restores that id.
     const { api, options, pendingForkBeforeMessageId } = makeOptions([
       { role: 'user', text: 'A', ts: null, messageId: 'msg-A' },
       { role: 'assistant', text: 'ack A', ts: null, messageId: 'msg-a1' },
@@ -202,13 +201,15 @@ describe('useChatMessageActions branching edits', () => {
     expect(options.messages.value.map(message => message.text)).toEqual(['A', 'ack A'])
   })
 
-  it('keeps the newer edit when a second one replaces the first', () => {
+  it('restores the original transcript and draft after consecutive unsubmitted edits', () => {
     const { api, options, pendingForkBeforeMessageId } = makeOptions([
       { role: 'user', text: 'A', ts: null, messageId: 'msg-A' },
       { role: 'assistant', text: 'ack A', ts: null, messageId: 'msg-a1' },
       { role: 'user', text: 'B', ts: null, messageId: 'msg-B' },
       { role: 'assistant', text: 'ack B', ts: null, messageId: 'msg-b1' },
     ])
+
+    options.inputText.value = 'half-written draft'
 
     api.editMessage(renderedMessage({
       role: 'user', displayRole: 'user', sourceIndex: 2, messageId: 'msg-B', text: 'B',
@@ -219,15 +220,15 @@ describe('useChatMessageActions branching edits', () => {
 
     expect(pendingForkBeforeMessageId.value).toBe('msg-A')
     expect(api.cancelEdit()).toBe(true)
-    // The second edit's restore point replaces the first, so cancelling gets
-    // back only what the first edit left. Starting a second edit therefore
-    // spends the first one's undo: B and its reply are no longer reachable
-    // from here. Refusing the second edit while a restore frame is live would
-    // close that, and is a behaviour change beyond this fix.
-    expect(options.messages.value.map(message => message.text)).toEqual(['A', 'ack A'])
+    expect(options.messages.value.map(message => message.text)).toEqual([
+      'A', 'ack A', 'B', 'ack B',
+    ])
+    expect(options.inputText.value).toBe('half-written draft')
+    expect(pendingForkBeforeMessageId.value).toBeNull()
+    expect(api.cancelEdit()).toBe(false)
   })
 
-  it('keeps the restore point when the fork id has drifted', () => {
+  it.each([null, 'msg-other'])('keeps the restore point while the fork id is %s', (forkId) => {
     // Escape consults `cancelEdit` on every press now, so a press made while
     // the frame is unusable must not spend the undo: the fork id can come back
     // (a rejected send restores its own attempt), and the user still has only
@@ -241,7 +242,7 @@ describe('useChatMessageActions branching edits', () => {
     api.editMessage(renderedMessage({
       role: 'user', displayRole: 'user', sourceIndex: 2, messageId: 'msg-B', text: 'B',
     }))
-    pendingForkBeforeMessageId.value = 'msg-other'
+    pendingForkBeforeMessageId.value = forkId
     expect(api.cancelEdit()).toBe(false)
 
     pendingForkBeforeMessageId.value = 'msg-B'
@@ -270,6 +271,75 @@ describe('useChatMessageActions branching edits', () => {
     expect(api.cancelEdit()).toBe(true)
     expect(options.messages.value.map(message => message.text)).toEqual(['A', 'ack A', 'B'])
     expect(options.inputText.value).toBe('popped off the queue')
+  })
+
+  it.each(['', 'replacement draft'])(
+    'preserves newer composer content after consecutive edits: %j',
+    replacement => {
+      const { api, options } = makeOptions([
+        { role: 'user', text: 'A', ts: null, messageId: 'msg-A' },
+        { role: 'assistant', text: 'ack A', ts: null },
+        { role: 'user', text: 'B', ts: null, messageId: 'msg-B' },
+      ])
+      options.inputText.value = 'original draft'
+      api.editMessage(renderedMessage({ sourceIndex: 2, messageId: 'msg-B' }))
+      api.editMessage(renderedMessage({ sourceIndex: 0, messageId: 'msg-A' }))
+      options.inputText.value = replacement
+
+      expect(api.cancelEdit()).toBe(true)
+      expect(options.messages.value.map(message => message.text)).toEqual(['A', 'ack A', 'B'])
+      expect(options.inputText.value).toBe(replacement)
+    },
+  )
+
+  it('keeps cancellation unavailable during streaming without spending the restore point', () => {
+    const { api, options } = makeOptions([
+      { role: 'user', text: 'A', ts: null, messageId: 'msg-A' },
+    ])
+    api.editMessage(renderedMessage({ sourceIndex: 0, messageId: 'msg-A' }))
+    options.isStreaming.value = true
+
+    expect(api.cancelEdit()).toBe(false)
+    expect(options.messages.value).toEqual([])
+    options.isStreaming.value = false
+    expect(api.cancelEdit()).toBe(true)
+    expect(options.messages.value[0]?.messageId).toBe('msg-A')
+  })
+
+  it('discards the old restore point when leaving a session', () => {
+    const { api, options, pendingForkBeforeMessageId } = makeOptions([
+      { role: 'user', text: 'A', ts: null, messageId: 'msg-A' },
+    ])
+    api.editMessage(renderedMessage({ sourceIndex: 0, messageId: 'msg-A' }))
+    api.discardEditRestorePoint()
+    options.messages.value = [{ role: 'user', text: 'another session', ts: null }]
+    options.inputText.value = 'another draft'
+    pendingForkBeforeMessageId.value = 'msg-A'
+
+    expect(api.cancelEdit()).toBe(false)
+    expect(options.messages.value[0]?.text).toBe('another session')
+    expect(options.inputText.value).toBe('another draft')
+  })
+
+  it('starts a new restore point after the previous edit has been sent', () => {
+    const { api, options, pendingForkBeforeMessageId } = makeOptions([
+      { role: 'user', text: 'A', ts: null, messageId: 'msg-A' },
+      { role: 'assistant', text: 'ack A', ts: null },
+      { role: 'user', text: 'B', ts: null, messageId: 'msg-B' },
+    ])
+    api.editMessage(renderedMessage({ sourceIndex: 2, messageId: 'msg-B' }))
+    pendingForkBeforeMessageId.value = null
+    const submitted: ChatMessage[] = [
+      ...options.messages.value,
+      { role: 'user', text: 'revised B', ts: null, messageId: 'msg-revised-B' },
+    ]
+    options.messages.value = submitted
+    options.inputText.value = 'new draft'
+    api.editMessage(renderedMessage({ sourceIndex: 0, messageId: 'msg-A' }))
+
+    expect(api.cancelEdit()).toBe(true)
+    expect(options.messages.value).toEqual(submitted)
+    expect(options.inputText.value).toBe('new draft')
   })
 
   it('records the previous user message id before regenerating', async () => {

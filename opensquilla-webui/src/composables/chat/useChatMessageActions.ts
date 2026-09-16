@@ -63,6 +63,10 @@ interface EditRestorePoint {
 export function useChatMessageActions(options: UseChatMessageActionsOptions) {
   let editRestorePoint: EditRestorePoint | null = null
 
+  function discardEditRestorePoint() {
+    editRestorePoint = null
+  }
+
   function copyableMessageText(message: ChatRenderedMessage): string {
     // User bubbles render the raw text with only the time prefix stripped, so
     // copy must match: the markdown sanitizers would truncate or strip literal
@@ -193,6 +197,7 @@ export function useChatMessageActions(options: UseChatMessageActionsOptions) {
       options.notifyDeliveryBlocked?.()
       return false
     }
+    discardEditRestorePoint()
     options.pendingForkBeforeMessageId.value = forkBeforeMessageId
     options.messages.value = options.messages.value.slice(0, userMsgIndex)
     options.inputText.value = userText
@@ -223,9 +228,14 @@ export function useChatMessageActions(options: UseChatMessageActionsOptions) {
     // nothing on the first click, and until #1372 there was no way back:
     // Escape cleared the composer and left the empty state on screen, which
     // reads as the conversation having been deleted.
+    const previous = editRestorePoint
+    const continuesEdit = previous
+      && options.pendingForkBeforeMessageId.value === previous.forkBeforeMessageId
     editRestorePoint = {
-      messages: options.messages.value,
-      inputText: options.inputText.value,
+      // Choosing an earlier message while editing is still uncommitted. Keep
+      // the complete transcript and draft from before the first edit.
+      messages: continuesEdit ? previous.messages : options.messages.value,
+      inputText: continuesEdit ? previous.inputText : options.inputText.value,
       editedText: text,
       forkBeforeMessageId,
     }
@@ -243,14 +253,13 @@ export function useChatMessageActions(options: UseChatMessageActionsOptions) {
    * cancellation apart from an ordinary Escape and act on only one of them.
    *
    * The restore point is only honoured while `pendingForkBeforeMessageId` still
-   * holds the id the edit set. Sending consumes that id, and a second edit
-   * replaces it; in both cases the truncation has been made real by something
-   * the user did mean, and resurrecting the old array would put back messages
-   * the server no longer has.
+   * holds the id the latest edit set. Sending consumes that id before admission;
+   * a rejected send may restore it, so retain the point until cancellation or
+   * session navigation. A second unsubmitted edit keeps the original snapshot.
    */
   function cancelEdit(): boolean {
     const restore = editRestorePoint
-    if (!restore) return false
+    if (!restore || options.isStreaming.value) return false
     if (options.pendingForkBeforeMessageId.value !== restore.forkBeforeMessageId) {
       // Drifted, so there is nothing safe to restore — but the point stays.
       // Escape now consults this on every press, and discarding the undo on a
@@ -277,5 +286,6 @@ export function useChatMessageActions(options: UseChatMessageActionsOptions) {
     regenerateMessage,
     editMessage,
     cancelEdit,
+    discardEditRestorePoint,
   }
 }
