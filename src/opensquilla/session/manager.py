@@ -45,17 +45,20 @@ from opensquilla.session.compaction import (
     compaction_remaining_seconds,
     effective_protected_recent_messages,
     require_compaction_time,
+    validate_compaction_artifact,
 )
 from opensquilla.session.compaction_deployment import compaction_deployment_fingerprint
-from opensquilla.session.compaction_lifecycle import new_compaction_id
+from opensquilla.session.compaction_lifecycle import ConsumerAdmissionStaleError, new_compaction_id
 from opensquilla.session.compaction_state import (
     StructuredCompactionSummary,
     build_structured_summary_from_text,
     extract_compaction_obligations,
+    render_structured_summary,
 )
 from opensquilla.session.context_view import (
     build_compaction_context_records,
     compaction_context_fingerprint,
+    compaction_replay_is_complete,
     format_compaction_summary_context,
 )
 from opensquilla.session.keys import canonicalize_session_key, normalize_agent_id
@@ -110,6 +113,7 @@ class CompactionSourceSnapshot:
     preimage: tuple[tuple[Any, ...], ...]
     boundary_message_id: str | None
     boundary_entry_id: int | None
+    context_fingerprint: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -2726,11 +2730,29 @@ class SessionManager:
                 else []
             )
         boundary = source_entries[-1] if source_entries else None
+        node = await self._storage.get_session(session_key)
+        if node is None:
+            raise KeyError(f"Session not found: {session_key}")
+        _require_expected_session_owner(
+            node,
+            expected_session_id=expected_session_id,
+            expected_session_epoch=expected_session_epoch,
+            operation="compaction source capture",
+        )
+        summaries = await self._storage.get_all_summaries(node.session_id)
+        context_states = await self._storage.get_context_states(
+            session_key,
+            expected_session_id=expected_session_id,
+            expected_session_epoch=expected_session_epoch,
+        )
         return CompactionSourceSnapshot(
             entries=tuple(source_entries),
             preimage=_transcript_preimage(source_entries),
             boundary_message_id=boundary.message_id if boundary is not None else None,
             boundary_entry_id=boundary.id if boundary is not None else None,
+            context_fingerprint=compaction_context_fingerprint(
+                context_states=context_states, summaries=summaries,
+            ),
         )
 
     async def record_memory_checkpoint(
@@ -3405,25 +3427,47 @@ class SessionManager:
 
         if result.removed_count == 0 and not result.replaced_previous_summary:
             return result
-        if not result.summary:
-            _structlog.get_logger(__name__).warning(
-                "session_compaction.empty_summary_not_persisted",
-                session_key=session_key,
-                removed_count=result.removed_count,
-            )
-            return replace(result, skip_reason=result.skip_reason or "empty_summary")
-
         require_compaction_time(effective_config, phase="validating")
         from opensquilla.session.compaction import (
             compaction_replay_summary,
             consumer_admission_accepts,
         )
 
-        if not consumer_admission_accepts(
-            consumer_admission,
-            compaction_replay_summary(result),
-            result.kept_entries,
+        rejection = None
+        if (
+            not isinstance(result.removed_count, int)
+            or isinstance(result.removed_count, bool)
+            or not 0 <= result.removed_count <= len(raw)
+            or result.kept_start_index != result.removed_count
+            or result.kept_entries != raw[result.removed_count:]
         ):
+            rejection = "invalid_source_boundary"
+        elif not result.summary.strip():
+            rejection = "empty_summary"
+        coverage = None
+        if rejection is None:
+            obligation_entries = _attachment_safe_obligation_entries(raw[:result.removed_count])
+            if previous_summary:
+                obligation_entries.insert(0, {"role": "assistant", "content": previous_summary})
+            try:
+                coverage, rejection = validate_compaction_artifact(
+                    compaction_replay_summary(result),
+                    extract_compaction_obligations(obligation_entries),
+                    summary_replay_renderer=_durable_summary_replay,
+                )
+            except (TypeError, ValueError):
+                rejection = "invalid_summary"
+        if rejection is None:
+            try:
+                if not consumer_admission_accepts(
+                    consumer_admission,
+                    compaction_replay_summary(result),
+                    result.kept_entries,
+                ):
+                    rejection = "consumer_admission_failed"
+            except ConsumerAdmissionStaleError:
+                rejection = "consumer_admission_stale"
+        if rejection is not None:
             return replace(
                 result,
                 summary="",
@@ -3431,8 +3475,9 @@ class SessionManager:
                 removed_count=0,
                 replaced_previous_summary=False,
                 chunks_processed=0,
+                kept_start_index=0,
                 summary_source="skipped",
-                skip_reason="consumer_admission_stale_or_failed",
+                skip_reason=rejection,
                 tokens_after=result.tokens_before,
                 remaining_budget_tokens=max(
                     context_window_tokens - result.tokens_before,
@@ -3524,8 +3569,14 @@ class SessionManager:
                     ),
                 )
 
-            removed_entries = current_entries[: len(current_entries) - len(result.kept_entries)]
+            removed_entries = current_entries[:result.removed_count]
             kept_entries = current_entries[len(removed_entries) :]
+            assert coverage is not None
+            result = replace(
+                result,
+                coverage_status=coverage.status,
+                missing_obligations=coverage.missing_obligations,
+            )
             summary_record = SessionSummary(
                 session_id=current_node.session_id,
                 session_key=session_key,
@@ -3656,6 +3707,7 @@ class SessionManager:
         source_preimage: Sequence[Sequence[Any]] | None = None,
         source_boundary_message_id: str | None = None,
         source_boundary_entry_id: int | None = None,
+        source_context_fingerprint: str | None = None,
         expected_session_id: str | None = None,
         expected_session_epoch: int | None = None,
     ) -> bool:
@@ -3756,7 +3808,7 @@ class SessionManager:
             )
             removed_entries = entries[: max(0, len(entries) - len(kept_entries))]
             preserved_entries = entries[len(removed_entries) :]
-        if removed_entries and not summary:
+        if not summary.strip():
             _log.warning(
                 "persist_compaction.empty_summary_not_persisted",
                 session_key=session_key,
@@ -3775,6 +3827,8 @@ class SessionManager:
         # transcript system marker because history loading would make that
         # marker provider-visible and cache-hostile.
         summary_record = None
+        expected_context_fingerprint = None
+        previous_covered_through_id = 0
         if summary:
             if deadline_config is not None:
                 require_compaction_time(deadline_config, phase="validating")
@@ -3790,28 +3844,72 @@ class SessionManager:
                 }
                 for entry in removed_entries
             ]
-            if summary_format == "structured_v1" and summary_payload is not None:
-                structured_summary = StructuredCompactionSummary.model_validate(
-                    summary_payload
+            obligation_entries = _attachment_safe_obligation_entries(raw_removed_entries)
+            replaces_prior_context = (
+                isinstance(summary_payload, dict)
+                and isinstance(summary_payload.get("source_coverage"), dict)
+                and summary_payload["source_coverage"].get("replaces_prior_context") is True
+            )
+            prior_summaries = await self._storage.get_all_summaries(node.session_id)
+            prior_states = await self._storage.get_context_states(
+                session_key,
+                expected_session_id=expected_session_id,
+                expected_session_epoch=expected_session_epoch,
+            )
+            expected_context_fingerprint = compaction_context_fingerprint(
+                context_states=prior_states, summaries=prior_summaries,
+            )
+            prior_records = build_compaction_context_records(
+                context_states=prior_states, summaries=prior_summaries,
+            )
+            if (
+                source_context_fingerprint is not None
+                and source_context_fingerprint != expected_context_fingerprint
+            ) or (replaces_prior_context and prior_records and not source_context_fingerprint):
+                _log.warning(
+                    "persist_compaction.stale_context_state_skipped",
+                    session_key=session_key,
                 )
-                resolved_coverage_status = coverage_status
-                resolved_missing_obligations = list(missing_obligations or ())
-                resolved_critical_carry_forward = list(
-                    critical_carry_forward
-                    if critical_carry_forward is not None
-                    else structured_summary.critical_carry_forward
+                return False
+            if replaces_prior_context:
+                previous_covered_through_id = max(
+                    (record.covered_through_id for record in prior_records), default=0,
                 )
-            else:
-                obligations = extract_compaction_obligations(
-                    _attachment_safe_obligation_entries(raw_removed_entries)
-                )
-                structured_summary, coverage = build_structured_summary_from_text(
-                    summary,
+                obligation_entries.insert(0, {
+                    "role": "assistant",
+                    "content": "\n\n".join(record.text for record in prior_records),
+                })
+            obligations = extract_compaction_obligations(obligation_entries)
+            try:
+                if summary_format == "structured_v1" and summary_payload is not None:
+                    structured_summary = StructuredCompactionSummary.model_validate(
+                        summary_payload
+                    )
+                else:
+                    structured_summary, _ = build_structured_summary_from_text(
+                        summary,
+                        obligations,
+                        block_missing_critical=True,
+                    )
+                coverage, rejection = validate_compaction_artifact(
+                    render_structured_summary(structured_summary.model_dump(mode="json")),
                     obligations,
+                    summary_replay_renderer=_durable_summary_replay,
                 )
-                resolved_coverage_status = coverage.status
-                resolved_missing_obligations = coverage.missing_obligations
-                resolved_critical_carry_forward = coverage.critical_carry_forward
+            except (TypeError, ValueError):
+                rejection = "invalid_summary"
+            if rejection is not None:
+                _log.warning(
+                    "persist_compaction.invalid_summary_not_persisted",
+                    session_key=session_key, reason=rejection,
+                )
+                return False
+
+            structured_summary.source_coverage.update({
+                "status": coverage.status,
+                "checked_obligations": coverage.checked_obligations,
+                "covered_obligations": coverage.covered_obligations,
+            })
 
             summary_record = SessionSummary(
                 session_id=node.session_id,
@@ -3821,17 +3919,20 @@ class SessionManager:
                 summary_text=summary,
                 summary_payload=structured_summary.model_dump(mode="json"),
                 summary_format="structured_v1",
-                coverage_status=resolved_coverage_status,
-                missing_obligations=resolved_missing_obligations,
-                critical_carry_forward=resolved_critical_carry_forward,
+                coverage_status=coverage.status,
+                missing_obligations=coverage.missing_obligations,
+                critical_carry_forward=list(structured_summary.critical_carry_forward),
                 removed_count=len(removed_entries),
                 kept_count=persisted_kept_count,
                 flush_receipt_status=_compaction_flush_status_for_persistence(
                     flush_receipt_status
                 ),
-                covered_through_id=max((entry.id or 0) for entry in removed_entries)
-                if removed_entries
-                else 0,
+                covered_through_id=max(
+                    previous_covered_through_id,
+                    max((entry.id or 0) for entry in removed_entries)
+                    if removed_entries
+                    else 0,
+                ),
             )
 
         if expected_source_entries is not None:
@@ -3867,9 +3968,33 @@ class SessionManager:
                 )
                 rewritten_entries.append(entry)
 
+        assert summary_record is not None
+        context_state = self._portable_structured_summary_state(node, summary_record)
+        assert context_state is not None
+        # SQLite assigns the new state a later id, including when its timestamp
+        # ties an existing checkpoint. Simulate that ordering without persisting
+        # a synthetic id, then verify the complete post-commit replay set.
+        candidate_state = context_state.model_copy(update={
+            "id": max((state.id or 0 for state in prior_states), default=0) + 1,
+        })
+        candidate_records = build_compaction_context_records(
+            context_states=[*prior_states, candidate_state],
+            summaries=[*prior_summaries, summary_record],
+        )
+        expected_replay = [render_structured_summary(context_state.payload)]
+        if not replaces_prior_context:
+            expected_replay.extend(record.text for record in prior_records)
+        if not compaction_replay_is_complete(
+            expected_replay,
+            format_compaction_summary_context([record.text for record in candidate_records]),
+        ):
+            _log.warning(
+                "persist_compaction.invalid_summary_not_persisted",
+                session_key=session_key, reason="summary_replay_incomplete",
+            )
+            return False
         node.compaction_count = (node.compaction_count or 0) + 1
         node.updated_at = _now_ms()
-        context_state = self._portable_structured_summary_state(node, summary_record)
         canonical_entries_for_manifest = (
             await self._storage.get_canonical_transcript(node.session_id)
         )
@@ -3904,6 +4029,7 @@ class SessionManager:
                 archived_entries=removed_entries if summary_record is not None else None,
                 expected_session_id=expected_session_id,
                 expected_session_epoch=expected_session_epoch,
+                expected_context_fingerprint=expected_context_fingerprint,
                 **rewrite_kwargs,
             )
         )

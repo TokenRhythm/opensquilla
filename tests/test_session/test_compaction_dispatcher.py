@@ -17,6 +17,7 @@ from opensquilla.session.compaction import (
     compact_context,
     compact_context_new,
 )
+from tests.helpers.compaction import synthetic_compaction_config
 
 
 def _make_request(
@@ -154,7 +155,7 @@ async def test_new_avoids_mid_turn_cut_for_agent_flattened_tool_blocks():
         session_id="agent-flattened-boundary-test",
         entries=entries,
         context_window_tokens=500,
-        config=CompactionConfig(safety_margin=1.0),
+        config=synthetic_compaction_config(safety_margin=1.0),
     )
     result = await compact_context_new(request)
 
@@ -199,15 +200,15 @@ async def test_new_can_cut_after_completed_tool_round(monkeypatch):
         session_id="boundary-start-test",
         entries=entries,
         context_window_tokens=23,
-        config=CompactionConfig(safety_margin=1.0),
+        config=synthetic_compaction_config(safety_margin=1.0),
     )
 
     result = await compact_context_new(request)
 
     assert result.removed_count == 0
-    assert result.summary_source == "fallback"
+    assert result.summary_source == "llm"
     assert result.kept_entries == entries
-    assert result.skip_reason == "quality_gate_failed"
+    assert result.skip_reason == "summary_does_not_fit"
     assert result.quality_report["fits_context_window"] is False
 
 
