@@ -150,22 +150,35 @@ async def test_stubborn_tool_late_success_cannot_replace_timeout(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(agent_module, "TIMEOUT_CANCEL_GRACE_SECONDS", 0.02)
+    started = asyncio.Event()
     cancelled = asyncio.Event()
     release = asyncio.Event()
     finished = asyncio.Event()
+    observed_cancellations: list[tuple[float, str]] = []
+    real_cancel_task = agent_module.cancel_task
+
+    async def observe_cancel_task(task: Any, **kwargs: Any) -> bool:
+        if kwargs["operation"] == "tool:slow_tool":
+            observed_cancellations.append((kwargs["grace_seconds"], kwargs["policy"]))
+        return await real_cancel_task(task, **kwargs)
+
+    monkeypatch.setattr(agent_module, "cancel_task", observe_cancel_task)
 
     async def _handler(tc: ToolCall) -> ToolResult:
+        started.set()
         try:
-            await release.wait()
-        except asyncio.CancelledError:
-            cancelled.set()
-            await release.wait()
-        finished.set()
-        return ToolResult(
-            tool_use_id=tc.tool_use_id,
-            tool_name=tc.tool_name,
-            content="late-success",
-        )
+            try:
+                await release.wait()
+            except asyncio.CancelledError:
+                cancelled.set()
+                await release.wait()
+            return ToolResult(
+                tool_use_id=tc.tool_use_id,
+                tool_name=tc.tool_name,
+                content="late-success",
+            )
+        finally:
+            finished.set()
 
     agent = Agent(
         provider=_OneToolProvider(),
@@ -174,20 +187,35 @@ async def test_stubborn_tool_late_success_cannot_replace_timeout(
         tool_handler=_handler,
     )
 
-    events = await asyncio.wait_for(
-        _collect_events(agent),
-        timeout=0.2,
-    )
-    result = next(event for event in events if isinstance(event, ToolResultEvent))
+    turn = asyncio.create_task(_collect_events(agent))
+    try:
+        # Provider/agent startup is not part of the tool cancellation grace.
+        await asyncio.wait_for(started.wait(), timeout=5.0)
+        await asyncio.wait_for(cancelled.wait(), timeout=5.0)
+        events = await asyncio.wait_for(asyncio.shield(turn), timeout=5.0)
+        result = next(event for event in events if isinstance(event, ToolResultEvent))
 
-    assert cancelled.is_set()
-    assert result.is_error
-    assert result.execution_status is not None
-    assert result.execution_status["status"] == "timeout"
-    assert "late-success" not in result.result
+        assert observed_cancellations == [(0.02, "bounded")]
+        assert not finished.is_set(), "Timeout waited for the stubborn tool to finish"
+        assert result.is_error
+        assert result.execution_status is not None
+        assert result.execution_status["status"] == "timeout"
 
-    release.set()
-    await asyncio.wait_for(finished.wait(), timeout=0.2)
+        release.set()
+        await asyncio.wait_for(finished.wait(), timeout=5.0)
+        assert result.execution_status["status"] == "timeout"
+        assert all(
+            "late-success" not in event.result
+            for event in events
+            if isinstance(event, ToolResultEvent)
+        )
+    finally:
+        release.set()
+        if not turn.done():
+            turn.cancel()
+        await asyncio.wait_for(asyncio.gather(turn, return_exceptions=True), timeout=5.0)
+        if started.is_set():
+            await asyncio.wait_for(finished.wait(), timeout=5.0)
 
 
 @pytest.mark.asyncio
