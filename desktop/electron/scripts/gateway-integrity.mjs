@@ -113,6 +113,7 @@ export function gatewayInputs(repoRoot) {
     'desktop/electron/package.json', 'desktop/electron/package-lock.json',
     'desktop/electron/scripts/build-gateway.mjs', 'desktop/electron/scripts/gateway-entry.py',
     'desktop/electron/scripts/gateway-integrity.mjs',
+    'scripts/release_dependency_inventory.py',
   ]) inputs[path] = fileHash(join(repoRoot, path))
   return inputs
 }
@@ -141,6 +142,15 @@ export function verifyGatewayIntegrity(repoRoot, runtimeRoot, { prepared = false
   if (record.schemaVersion !== 1 || record.platform !== platform || (prepared && record.arch !== process.arch)
     || !record.inputs || !record.outputs || !Object.keys(record.outputs).length) fail('missing or incompatible Gateway build record')
   assertInventory(gatewayInputs(repoRoot), record.inputs, 'stale Gateway build inputs')
+  const dependencyPath = join(runtimeRoot, 'dependency-inventory.json')
+  const dependencies = JSON.parse(readFileSync(dependencyPath, 'utf8'))
+  if (fileHash(dependencyPath) !== record.outputs['dependency-inventory.json']
+    || dependencies.schemaVersion !== 1 || dependencies.kind !== 'pyinstaller'
+    || dependencies.lockSha256 !== record.inputs['uv.lock']
+    || !Array.isArray(dependencies.packages)
+    || !dependencies.packages.some((entry) => entry.bundled && entry.name !== 'opensquilla')) {
+    fail('missing or mismatched frozen dependency inventory')
+  }
   // Signing changes native binaries. Bind every prepared output before signing;
   // final bundles still require source-matched migrations/models and provenance,
   // with the existing platform signing gate responsible for signed executables.

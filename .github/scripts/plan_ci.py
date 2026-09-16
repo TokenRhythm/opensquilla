@@ -402,6 +402,7 @@ _PYTHON_TARGET_RULES: Final[tuple[tuple[tuple[str, ...], tuple[str, ...]], ...]]
     (("src/opensquilla/onboarding/",), ("tests/test_onboarding",)),
 )
 _FIXED_PLATFORM_MATRIX: Final[dict[str, tuple[tuple[str, str], ...]]] = {
+    "dependency-audit": (("ubuntu-latest", "default"),),
     "workflow-lint": (("ubuntu-latest", "default"),),
     "readme-locale": (("ubuntu-latest", "default"),),
     "frontend-artifact": (("ubuntu-latest", "artifact"),),

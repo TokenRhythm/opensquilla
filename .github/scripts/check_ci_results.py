@@ -12,10 +12,11 @@ from typing import Final
 
 PLANNER_RESULT: Final[tuple[str, str]] = ("RESULT_PLANNER", "Plan CI suites")
 BASELINE_SUITES: Final[frozenset[str]] = frozenset(
-    {"readme-locale", "workflow-lint"}
+    {"dependency-audit", "readme-locale", "workflow-lint"}
 )
 
 JOB_RESULT_LABELS: Final[dict[str, str]] = {
+    "RESULT_DEPENDENCY_AUDIT": "Fresh dependency security audit",
     "RESULT_WORKFLOW_LINT": "Workflow lint",
     "RESULT_README_LOCALE": "README locale parity",
     "RESULT_FRONTEND_ARTIFACT": "Frontend artifact",
@@ -37,6 +38,7 @@ JOB_RESULT_LABELS: Final[dict[str, str]] = {
 
 KNOWN_SUITES: Final[frozenset[str]] = frozenset(
     {
+        "dependency-audit",
         "desktop-recovery-e2e",
         "desktop-static",
         "frontend-artifact",
@@ -60,6 +62,7 @@ KNOWN_SUITES: Final[frozenset[str]] = frozenset(
 # Keep this mapping explicit so contract drift fails closed instead of silently
 # accepting a planner suite that the aggregate gate does not understand.
 SUITE_RESULT_REQUIREMENTS: Final[dict[str, tuple[str, ...]]] = {
+    "dependency-audit": ("RESULT_DEPENDENCY_AUDIT",),
     "desktop-recovery-e2e": ("RESULT_DESKTOP_RECOVERY_E2E",),
     "desktop-static": ("RESULT_DESKTOP",),
     "frontend-artifact": ("RESULT_FRONTEND_ARTIFACT",),

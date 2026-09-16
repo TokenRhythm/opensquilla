@@ -92,6 +92,8 @@
           :show-turn-outcome="isTurnTip(entry.index)"
           :goal-outcome="goalOutcomeFor(messages[entry.index], entry.index)"
           :goal-elapsed="goalElapsed"
+          :goal-removable="goalRemovable && !shareMode"
+          :goal-busy="goalBusy"
           :resolve-session-availability="resolveSessionAvailability"
           :resolve-workspace-preview-resource="resolveWorkspacePreviewResource"
           @fork="$emit('forkConversation', forkThroughTurnId(entry.index))"
@@ -110,6 +112,7 @@
           @plan-implement-current="$emit('planImplementCurrent', $event)"
           @plan-implement-new="$emit('planImplementNew', $event)"
           @plan-replan="$emit('planReplan', $event)"
+          @goal-clear="$emit('goalClear', $event)"
         />
         <SystemMessage
           v-else
@@ -204,6 +207,8 @@ const props = defineProps<{
   isStreaming?: boolean
   goal?: GoalSnapshot | null
   goalElapsed?: string
+  goalRemovable?: boolean
+  goalBusy?: boolean
   resolveSessionAvailability?: (sessionKey: string) => Promise<boolean>
   resolveWorkspacePreviewResource?: (sessionKey: string, documentId: string) => Promise<WorkbenchResource | null>
   /** Required for long-history virtualization; omitted by legacy embedders. */
@@ -244,6 +249,7 @@ const emit = defineEmits<{
   planImplementCurrent: [target: PlanCardActionTarget]
   planImplementNew: [target: PlanCardActionTarget]
   planReplan: [target: PlanCardActionTarget]
+  goalClear: [goal: GoalSnapshot]
 }>()
 
 const VIRTUALIZATION_STORAGE_KEY = 'opensquilla.chat.virtualizeHistory'

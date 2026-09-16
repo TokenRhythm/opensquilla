@@ -37,6 +37,11 @@ pytest_file_selection_arg = SHARD_MODULE["_pytest_file_selection_arg"]
 
 OFFLINE_MARKER_EXCLUSIONS = SHARD_MODULE["OFFLINE_MARKER_EXCLUSIONS"]
 RECENTLY_ADDED_ACTIVE_TESTS = {
+    # Security inventory, rendering, and functional probes use measured Windows
+    # testcase totals until the next comparable three-run duration refresh.
+    "tests/test_desktop/test_gateway_functional_probes.py",
+    "tests/test_scripts/test_release_dependency_inventory.py",
+    "tests/test_security/test_weasyprint_presentational_hints.py",
     # Telemetry regressions use provisional weights until the next comparable
     # Windows duration refresh supplies measured timings.
     "tests/test_engine/test_runtime_usage_telemetry.py",

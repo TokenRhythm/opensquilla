@@ -142,6 +142,11 @@ try {
   const updateBannerCount = await page.locator('[data-testid="update-banner"]').count()
   assert.equal(updateBannerCount, 0, 'desktop native update should suppress the web release banner')
 
+  // Startup profile consolidation can still hold the writer gate when the
+  // one-second mock timer fires. Exercise the renderer update flow after
+  // readiness; automatic scheduling has its own deterministic contract tests.
+  await page.evaluate(() => window.opensquillaDesktop.checkForUpdates())
+
   const availableState = await waitFor(async () => {
     return await page.evaluate(async () => {
       const api = window.opensquillaDesktop
@@ -196,6 +201,15 @@ try {
       'mock install keeps the pending relaunch menu available for repeated inspection',
     )
   } else {
+    // Native applying temporarily hides the indicator. Reopen its popover
+    // once the mock install returns, as a user would for another inspection.
+    await waitFor(async () => (await page.evaluate(
+      () => window.opensquillaDesktop.getUpdateState(),
+    ))?.status === 'downloaded', 'mock install to return to downloaded')
+    await updateIndicator.waitFor({ state: 'visible', timeout: 30_000 })
+    if (await updateIndicator.getAttribute('aria-expanded') !== 'true') {
+      await updateIndicator.click({ force: true })
+    }
     await page.locator('[data-testid="desktop-update-relaunch"]').waitFor({
       state: 'visible',
       timeout: 30_000,
