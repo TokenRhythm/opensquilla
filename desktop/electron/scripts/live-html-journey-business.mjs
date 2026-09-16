@@ -64,11 +64,22 @@ async function semanticControl(spec) {
   const element = candidates[0] || pool.find(item => name(item).includes(wanted))
   if (!element) throw new Error('SEMANTIC_CONTROL_MISSING')
   element.scrollIntoView({ block: 'center', inline: 'nearest', behavior: 'instant' })
-  let rect = element.getBoundingClientRect()
+  const nextFrameRect = () => new Promise((resolve, reject) => {
+    let frame
+    const unavailable = () => reject(new Error('SEMANTIC_CONTROL_UNAVAILABLE'))
+    const remaining = spec.deadline - Date.now()
+    if (remaining <= 0) { unavailable(); return }
+    const timer = setTimeout(() => { cancelAnimationFrame(frame); unavailable() }, remaining)
+    frame = requestAnimationFrame(() => {
+      clearTimeout(timer)
+      if (Date.now() >= spec.deadline) unavailable()
+      else resolve(element.getBoundingClientRect())
+    })
+  })
+  let rect = await nextFrameRect()
   let stable = false
   for (let attempt = 0; attempt < 8; attempt++) {
-    await new Promise(resolve => setTimeout(resolve, 16))
-    const next = element.getBoundingClientRect()
+    const next = await nextFrameRect()
     stable = ['x', 'y', 'width', 'height'].every(key => Math.abs(next[key] - rect[key]) <= 0.5)
     rect = next
     if (stable) break
@@ -101,12 +112,14 @@ export function createBusinessDriver(app, getPreviewId, capture) {
     const result = await app.evaluate(async ({ webContents }, request) => {
       const contents = webContents.fromId(request.id)
       if (!contents || contents.isDestroyed()) throw new Error('SELECTED_PREVIEW_DESTROYED')
-      let point
+      let point, lastSemanticError
       const until = Date.now() + 4000
       while (!point) {
-        try { point = await contents.executeJavaScript(`(${request.resolver})(${JSON.stringify({ ...request.spec, kind: request.kind })})`, true) }
+        try { point = await contents.executeJavaScript(`(${request.resolver})(${JSON.stringify({ ...request.spec, kind: request.kind, deadline: until })})`, true) }
         catch (error) {
-          if (!/SEMANTIC_CONTROL_(?:MISSING|UNAVAILABLE|COVERED)\b/.test(String(error)) || Date.now() >= until) throw error
+          if (!/SEMANTIC_CONTROL_(?:MISSING|UNAVAILABLE|COVERED)\b/.test(String(error))) throw error
+          if (Date.now() >= until) throw lastSemanticError || error
+          lastSemanticError = error
           await new Promise(resolve => setTimeout(resolve, 100))
         }
       }

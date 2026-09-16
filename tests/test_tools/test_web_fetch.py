@@ -12,10 +12,29 @@ from opensquilla.tools.builtin.web_fetch import (
     _cache,
     _present_content,
     _resolve_effective_max_chars,
+    _web_fetch_httpx_client_kwargs,
     _wrap_content,
     web_fetch,
 )
 from opensquilla.tools.types import ToolContext, current_tool_context
+
+_PROXY_ENV_VARS = (
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "ALL_PROXY",
+    "http_proxy",
+    "https_proxy",
+    "all_proxy",
+    "NO_PROXY",
+    "no_proxy",
+)
+
+
+def _clear_proxy_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    for name in _PROXY_ENV_VARS:
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.delenv("REQUEST_METHOD", raising=False)
+    monkeypatch.delenv("OPENSQUILLA_WEB_FETCH_TRUST_PROXY_DNS", raising=False)
 
 
 @pytest.fixture
@@ -520,3 +539,174 @@ async def test_web_fetch_resolves_relative_redirect_against_logical_url(
         "https://origin.example.test/final",
     ]
     assert payload["final_url"] == "https://origin.example.test/final"
+
+
+def _client_kwargs_for(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    url: str = "https://support.claude.com/en/articles/example",
+    vetted: list[str] | None = None,
+    managed: dict[str, object] | None = None,
+    pin: object | None = None,
+) -> dict[str, object]:
+    sentinel = object() if pin is None else pin
+    monkeypatch.setattr(
+        "opensquilla.tools.builtin.web_fetch._pinned_transport",
+        lambda *args, **kwargs: sentinel,
+    )
+    return _web_fetch_httpx_client_kwargs(
+        url,
+        ["20.205.243.166"] if vetted is None else vetted,
+        {"User-Agent": "test"},
+        {"trust_env": False} if managed is None else managed,
+    )
+
+
+def test_web_fetch_uses_https_proxy_without_pinning_when_trust_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _clear_proxy_env(monkeypatch)
+    monkeypatch.setenv("OPENSQUILLA_WEB_FETCH_TRUST_PROXY_DNS", "1")
+    monkeypatch.setenv("HTTPS_PROXY", "http://127.0.0.1:7897")
+
+    def _must_not_pin(*args: object, **kwargs: object) -> object:
+        raise AssertionError("env proxy must skip DNS pinning")
+
+    monkeypatch.setattr(
+        "opensquilla.tools.builtin.web_fetch._pinned_transport", _must_not_pin
+    )
+    kwargs = _web_fetch_httpx_client_kwargs(
+        "https://github.com/example/repo/releases",
+        ["20.205.243.166"],
+        {"User-Agent": "test"},
+        {"trust_env": True},
+    )
+
+    assert kwargs["proxy"] == "http://127.0.0.1:7897"
+    assert kwargs["trust_env"] is True
+    assert "transport" not in kwargs
+
+
+def test_web_fetch_uses_all_proxy_for_https_when_scheme_proxy_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _clear_proxy_env(monkeypatch)
+    monkeypatch.setenv("OPENSQUILLA_WEB_FETCH_TRUST_PROXY_DNS", "1")
+    monkeypatch.setenv("ALL_PROXY", "http://127.0.0.1:7897")
+    kwargs = _client_kwargs_for(monkeypatch, managed={"trust_env": True})
+    assert kwargs["proxy"] == "http://127.0.0.1:7897"
+    assert "transport" not in kwargs
+
+
+def test_web_fetch_uses_http_proxy_for_http_url_when_trust_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _clear_proxy_env(monkeypatch)
+    monkeypatch.setenv("OPENSQUILLA_WEB_FETCH_TRUST_PROXY_DNS", "1")
+    monkeypatch.setenv("HTTP_PROXY", "http://127.0.0.1:7897")
+    kwargs = _client_kwargs_for(
+        monkeypatch,
+        url="http://example.test/page",
+        vetted=["93.184.216.34"],
+        managed={"trust_env": True},
+    )
+    assert kwargs["proxy"] == "http://127.0.0.1:7897"
+    assert "transport" not in kwargs
+
+
+def test_web_fetch_ignores_env_proxy_when_trust_env_off(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _clear_proxy_env(monkeypatch)
+    monkeypatch.setenv("HTTPS_PROXY", "http://127.0.0.1:7897")
+    monkeypatch.setenv("ALL_PROXY", "http://127.0.0.1:7897")
+    pin = object()
+    kwargs = _client_kwargs_for(monkeypatch, managed={"trust_env": False}, pin=pin)
+    assert "proxy" not in kwargs
+    assert kwargs["transport"] is pin
+
+
+def test_web_fetch_pins_when_trust_env_on_but_no_proxy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _clear_proxy_env(monkeypatch)
+    pin = object()
+    kwargs = _client_kwargs_for(monkeypatch, managed={"trust_env": True}, pin=pin)
+    assert "proxy" not in kwargs
+    assert kwargs["trust_env"] is True
+    assert kwargs["transport"] is pin
+
+
+def test_web_fetch_keeps_managed_sandbox_proxy_and_skips_pinning(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _clear_proxy_env(monkeypatch)
+    monkeypatch.setenv("HTTPS_PROXY", "http://attacker.invalid:1")
+
+    def _must_not_pin(*args: object, **kwargs: object) -> object:
+        raise AssertionError("managed proxy must skip DNS pinning")
+
+    monkeypatch.setattr(
+        "opensquilla.tools.builtin.web_fetch._pinned_transport", _must_not_pin
+    )
+    kwargs = _web_fetch_httpx_client_kwargs(
+        "https://example.test/page",
+        ["1.1.1.1"],
+        {"User-Agent": "test"},
+        {"proxy": "http://127.0.0.1:9", "trust_env": False},
+    )
+    assert kwargs["proxy"] == "http://127.0.0.1:9"
+    assert kwargs["trust_env"] is False
+    assert "transport" not in kwargs
+
+
+@pytest.mark.asyncio
+async def test_web_fetch_passes_env_proxy_to_httpx_client(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: list[dict[str, object]] = []
+
+    class RecordingClient:
+        def __init__(self, **kwargs: object) -> None:
+            captured.append(kwargs)
+
+        async def __aenter__(self) -> RecordingClient:
+            return self
+
+        async def __aexit__(self, *args: object) -> None:
+            return None
+
+        async def get(self, url: str) -> httpx.Response:
+            return httpx.Response(
+                200,
+                headers={"content-type": "text/plain"},
+                text="ok",
+                request=httpx.Request("GET", url),
+            )
+
+    _cache.clear()
+    _clear_proxy_env(monkeypatch)
+    monkeypatch.setenv("OPENSQUILLA_WEB_FETCH_TRUST_PROXY_DNS", "1")
+    monkeypatch.setenv("HTTPS_PROXY", "http://127.0.0.1:7897")
+    monkeypatch.setattr("opensquilla.tools.builtin.web_fetch.httpx.AsyncClient", RecordingClient)
+    monkeypatch.setattr(
+        "opensquilla.tools.builtin.web_fetch._check_ssrf", lambda url: ["20.205.243.166"]
+    )
+    monkeypatch.setattr(
+        "opensquilla.tools.builtin.web_fetch._pinned_transport",
+        lambda *args, **kwargs: object(),
+    )
+    monkeypatch.setattr(
+        "opensquilla.tools.builtin.web_fetch.managed_network_httpx_kwargs",
+        lambda: {"trust_env": True},
+    )
+    monkeypatch.setattr("opensquilla.tools.builtin.web_fetch._RETRY_DELAY_SECONDS", 0)
+
+    payload = json.loads(
+        await inspect.unwrap(web_fetch)("https://github.com/example/repo/releases")
+    )
+
+    assert payload["status"] == 200
+    assert captured
+    assert all(item.get("proxy") == "http://127.0.0.1:7897" for item in captured)
+    assert all("transport" not in item for item in captured)

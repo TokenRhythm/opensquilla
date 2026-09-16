@@ -185,6 +185,11 @@ Check:
 - the selected provider is configured;
 - required API key environment variables are visible to the gateway process;
 - proxy settings match your network;
+- `web_fetch` through a system proxy needs `OPENSQUILLA_TRUST_ENV=1`
+  (`search_use_env_proxy` covers search providers only);
+- if the proxy must resolve page hostnames, review the trust boundary before
+  enabling `OPENSQUILLA_WEB_FETCH_TRUST_PROXY_DNS=1` in
+  [Environment Proxies](configuration.md#environment-proxies);
 - the gateway was restarted after config edits;
 - tool permissions allow web search/fetch for the current run.
 

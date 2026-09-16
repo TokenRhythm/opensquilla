@@ -35,8 +35,10 @@ def trust_env() -> bool:
     Gated by ``OPENSQUILLA_TRUST_ENV``. Off by default — opensquilla defaults to
     deterministic, env-isolated networking so a stray HTTP_PROXY in a parent
     shell cannot silently reroute agent traffic. Set ``OPENSQUILLA_TRUST_ENV=1``
-    (e.g. in ~/.opensquilla/.env) to opt in; required on WSL2 / corporate networks
-    where the only route to external APIs is a shell-exported proxy.
+    (e.g. in ~/.opensquilla/.env) to opt in; required on WSL2, corporate, and
+    censored networks where the only route to external APIs is a shell-exported
+    proxy. The same gate covers channel adapters, providers, ``http_request``,
+    and ``web_fetch``.
     """
     return os.environ.get("OPENSQUILLA_TRUST_ENV", "").strip().lower() in _TRUTHY
 

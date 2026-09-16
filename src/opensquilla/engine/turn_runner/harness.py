@@ -2072,9 +2072,8 @@ class _TurnRunnerTurnErrorPersistAdapter(TurnErrorPersistPort):
     """Bind ``TurnRunner._persist_turn_error`` as a Protocol port.
 
     Forwards verbatim. The helper owns its own log-and-continue
-    try/except and guards both ``session_manager is None`` and
-    ``event is None`` internally, so the adapter and stage body have no
-    additional guards.
+    try/except and guards ``event is None`` internally; diagnostic recording
+    does not require a session manager.
     """
 
     def __init__(self, runner: TurnRunner) -> None:
@@ -2088,6 +2087,11 @@ class _TurnRunnerTurnErrorPersistAdapter(TurnErrorPersistPort):
         append_transcript: bool = True,
         expected_session_id: str | None = None,
         expected_session_epoch: int | None = None,
+        turn_id: str | None = None,
+        surface: str = "unknown",
+        provider: str | None = None,
+        model: str | None = None,
+        fallback_hops: int = 0,
     ) -> None:
         await self._runner._persist_turn_error(
             session_key,
@@ -2095,6 +2099,11 @@ class _TurnRunnerTurnErrorPersistAdapter(TurnErrorPersistPort):
             append_transcript=append_transcript,
             expected_session_id=expected_session_id,
             expected_session_epoch=expected_session_epoch,
+            turn_id=turn_id,
+            surface=surface,
+            provider=provider,
+            model=model,
+            fallback_hops=fallback_hops,
         )
 
 
