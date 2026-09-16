@@ -2779,6 +2779,9 @@ async def test_sessions_send_fast_replay_consumes_legacy_meta_launch_draft(
         assert await stack.storage.list_meta_launch_drafts(session_key=SESSION_KEY) == []
 
 
+# Keep the SQLite-backed startup prerequisite within its scheduling budget;
+# the contract below checks replay state, not replay latency under runner load.
+@pytest.mark.ci_serial
 @pytest.mark.asyncio
 async def test_sessions_send_replay_exposes_terminal_task_status(tmp_path: Path) -> None:
     async with _open_real_stack(tmp_path / "sessions.db") as stack:
