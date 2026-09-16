@@ -7160,8 +7160,8 @@ watch(optionalSessionRpcAllowed, admitted => {
 }, { flush: 'sync' })
 
 watch(sessionKey, () => {
-  chatMessageActions.discardEditRestorePoint()
   pendingForkBeforeMessageId.value = null
+  chatMessageActions.discardEditRestorePoint()
   // Retire any in-flight page walk and clear the old Session before starting
   // the new one, so a late response cannot leak deliverables across tabs/routes.
   resetSessionArtifacts()
