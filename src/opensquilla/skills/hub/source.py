@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 from opensquilla.skills.hub.contracts import (
@@ -264,6 +265,7 @@ class SkillBundle:
     meta: SkillMeta | None = None
     resolution: SourceResolution | None = None
     file_modes: dict[str, int] = field(default_factory=dict)
+    directory: Path | None = None
 
     @property
     def skill_md(self) -> str | None:
@@ -302,6 +304,21 @@ class SkillSource(ABC):
         """Fetch a prior resolution; legacy sources still receive the old identifier."""
 
         return await self.fetch(resolution.requested_identifier)
+
+    async def fetch_resolved_into(
+        self,
+        resolution: SourceResolution,
+        destination: Path,
+    ) -> SkillBundle | None:
+        """Write to service-owned staging; legacy source adapters remain supported."""
+        from opensquilla.skills.hub.tree_io import write_legacy_bundle
+        from opensquilla.skills.io_worker import run_staging_worker
+
+        bundle = await self.fetch_resolved(resolution)
+        if bundle is not None:
+            await run_staging_worker(write_legacy_bundle, bundle, destination)
+            bundle.directory = destination
+        return bundle
 
     @abstractmethod
     async def inspect(self, identifier: str) -> SkillMeta | None:
