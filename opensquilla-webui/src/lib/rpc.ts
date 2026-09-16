@@ -64,6 +64,14 @@ function isHelloPolicy(value: unknown): value is Record<string, unknown> {
     Object.prototype.hasOwnProperty.call(value, 'concurrent_optional_read_methods')
     && !isStringArray(value.concurrent_optional_read_methods)
   ) return false;
+  if (
+    Object.prototype.hasOwnProperty.call(value, 'cancellable_request_methods')
+    && !isStringArray(value.cancellable_request_methods)
+  ) return false;
+  if (
+    Object.prototype.hasOwnProperty.call(value, 'provider_probe_modes')
+    && !isStringArray(value.provider_probe_modes)
+  ) return false;
   return true;
 }
 
@@ -166,6 +174,8 @@ export interface RpcCallOptions {
   signal?: AbortSignal;
   timeoutAction?: RpcTerminationAction;
   abortAction?: RpcTerminationAction;
+  /** Send a capability-gated cancellation frame before rejecting on abort. */
+  cancelOnAbort?: boolean;
   /** Reject before send unless the current socket still owns this generation. */
   expectedGeneration?: number;
   /** Called synchronously only after the request frame is accepted by send(). */
@@ -462,6 +472,7 @@ export class RpcClient {
       }
 
       const id = String(++this._reqId);
+      let requestSent = false;
       const pending: PendingRequest = {
         resolve,
         reject,
@@ -479,6 +490,21 @@ export class RpcClient {
 
       if (options.signal) {
         pending.abortHandler = () => {
+          if (
+            options.cancelOnAbort
+            && requestSent
+            && this._pending.get(id)?.generation === generation
+            && this._isCurrentSocket(socket, generation)
+            && socket.readyState === WebSocket.OPEN
+            && this._cancellableRequestMethods().has(method)
+          ) {
+            try {
+              socket.send(JSON.stringify({ type: 'cancel', id }));
+            } catch {
+              // Cancellation is best-effort. Preserve the existing local abort
+              // behavior if the control frame cannot be sent.
+            }
+          }
           terminate(new RpcAbortError(method), options.abortAction || 'reject');
         };
         options.signal.addEventListener('abort', pending.abortHandler, { once: true });
@@ -511,6 +537,7 @@ export class RpcClient {
 
       try {
         socket.send(frame);
+        requestSent = true;
       } catch (error) {
         const sendError = new RpcTransportError(
           error instanceof Error ? error.message : 'Failed to send RPC request',
@@ -606,6 +633,11 @@ export class RpcClient {
 
   get policy(): Record<string, unknown> {
     return this._policy || {};
+  }
+
+  private _cancellableRequestMethods(): Set<string> {
+    const methods = this._policy?.cancellable_request_methods;
+    return new Set(isStringArray(methods) ? methods : []);
   }
 
   /**

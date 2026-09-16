@@ -167,6 +167,63 @@ describe('Platform configuration adapters', () => {
     expect(source.request).toHaveBeenCalledWith('onboarding.router.configure', { mode: 'recommended' }, expect.any(Object))
   })
 
+  it('passes provider probe modes, cancellation, and caller-specific timeouts to transport', async () => {
+    const source = rpc()
+    const setup = createV4SetupWorkflow(source)
+    const controller = new AbortController()
+
+    await setup.provider.probePrimary(
+      { providerId: 'openai', mode: 'reachability' },
+      { signal: controller.signal, timeoutMs: 70_000 },
+    )
+    expect(source.request).toHaveBeenLastCalledWith(
+      'onboarding.provider.probe',
+      { providerId: 'openai', mode: 'reachability' },
+      {
+        timeoutMs: 70_000,
+        timeoutAction: 'reject',
+        abortAction: 'reject',
+        cancelOnAbort: true,
+        signal: controller.signal,
+      },
+    )
+
+    await setup.provider.probePrimary(
+      { providerId: 'openai', model: 'gpt-4o', mode: 'model' },
+      { timeoutMs: 65_000 },
+    )
+    expect(source.request).toHaveBeenLastCalledWith(
+      'onboarding.provider.probe',
+      { providerId: 'openai', model: 'gpt-4o', mode: 'model' },
+      expect.objectContaining({ timeoutMs: 65_000, cancelOnAbort: true }),
+    )
+
+    await setup.profile.probeProfile({ providerId: 'openai', mode: 'model' })
+    expect(source.request).toHaveBeenLastCalledWith(
+      'onboarding.llmProfile.probe',
+      { providerId: 'openai', mode: 'model' },
+      expect.objectContaining({ cancelOnAbort: true }),
+    )
+
+    await setup.profile.probeDraftProfile({ providerId: 'openai', mode: 'reachability' })
+    expect(source.request).toHaveBeenLastCalledWith(
+      'onboarding.llmProfile.draft.probe',
+      { providerId: 'openai', mode: 'reachability' },
+      expect.objectContaining({ cancelOnAbort: true }),
+    )
+
+    await setup.profile.probeProfile({ providerId: 'openai', model: 'gpt-4o' })
+    expect(source.request).toHaveBeenLastCalledWith(
+      'onboarding.llmProfile.probe',
+      { providerId: 'openai', model: 'gpt-4o' },
+      {
+        timeoutMs: 20_000,
+        timeoutAction: 'reject',
+        abortAction: 'reject',
+      },
+    )
+  })
+
   it('keeps migration discovery and preview read-only behind the domain seam', async () => {
     const source = rpc()
     const migration = createV4MigrationOperations(source)

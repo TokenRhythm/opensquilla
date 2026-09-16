@@ -2,10 +2,12 @@ import { describe, expect, it, vi } from 'vitest'
 
 import type { RpcCallOptions, RpcEventHandler } from '@/lib/rpc'
 import { createPrivateGatewayTransports } from './privateTransports'
+import { createV4SetupWorkflow } from './setupWorkflowV4'
 
 function source() {
   return {
     connectionGeneration: 7,
+    policy: { provider_probe_modes: ['model', 'reachability'] },
     call: vi.fn(async () => ({ ok: true })) as <T = unknown>(
       method: string,
       params?: Record<string, unknown>,
@@ -66,6 +68,37 @@ describe('private Gateway transports', () => {
     expect(rpcSource.hasRpcMethod).toHaveBeenCalledWith('sessions.list')
     expect(rpcSource.hasRpcEvent).toHaveBeenCalledWith('sessions.changed')
     expect(rpcSource.rememberUnsupportedMethod).toHaveBeenCalledWith('legacy.method')
+  })
+
+  it('projects the negotiated provider probe modes into the setup workflow capability', () => {
+    const transports = createPrivateGatewayTransports(source())
+    const workflow = createV4SetupWorkflow(transports.rpc)
+
+    expect(workflow.capabilities.providerProbeModes).toBe(true)
+  })
+
+  it.each([
+    undefined,
+    null,
+    {},
+    { provider_probe_modes: 'model,reachability' },
+    { provider_probe_modes: ['model'] },
+    { provider_probe_modes: ['reachability'] },
+    { provider_probe_modes: ['model', 'reachability', 1] },
+  ])('keeps legacy probing for missing or incomplete policy %j', policy => {
+    const transports = createPrivateGatewayTransports({ ...source(), policy })
+    expect(createV4SetupWorkflow(transports.rpc).capabilities.providerProbeModes).toBe(false)
+  })
+
+  it('reflects a replacement connection policy without rebuilding the workflow', () => {
+    const rpcSource = source()
+    const workflow = createV4SetupWorkflow(createPrivateGatewayTransports(rpcSource).rpc)
+
+    expect(workflow.capabilities.providerProbeModes).toBe(true)
+    rpcSource.policy = { provider_probe_modes: ['model'] }
+    expect(workflow.capabilities.providerProbeModes).toBe(false)
+    rpcSource.policy = { provider_probe_modes: ['reachability', 'model'] }
+    expect(workflow.capabilities.providerProbeModes).toBe(true)
   })
 
   it('owns idempotent event unsubscription', () => {
