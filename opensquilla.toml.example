@@ -346,6 +346,11 @@ source = "workspace"
 # index_captured_turns = false
 # capture_excluded_run_kinds = ["recall", "session_recall"]
 # capture_excluded_provenance_kinds = ["recall", "tool_result", "memory_injected"]
+# Session flush writes dated memory notes for [memory.dream] to consolidate.
+# Off by default. It is not the only writer of those notes -- the memory_save
+# tool writes the same memory/<date>.md files -- so leaving it off reduces
+# Dream's supply of candidates rather than eliminating it.
+# flush_enabled = false
 
 [memory.dream]
 # Dream consolidation is safety-first by default. Background scheduling and
