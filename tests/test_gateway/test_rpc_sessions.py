@@ -8331,7 +8331,7 @@ class TestSessionsContextCompact:
         assert cache_break_monitor.compaction_terminal_status(compaction_id) == "cancelled"
 
     @pytest.mark.asyncio
-    async def test_context_compact_emits_skipped_when_nothing_removed(
+    async def test_context_compact_emits_failed_when_summary_is_empty(
         self,
         dispatcher,
         session,
@@ -8353,19 +8353,63 @@ class TestSessionsContextCompact:
         )
 
         assert res.ok is True
+        assert res.payload["status"] == "failed"
+        assert res.payload["reason"] == "empty_summary"
         assert res.payload["compacted"] is False
         assert res.payload["applied"] is False
         assert res.payload["durability"] == "none"
         assert res.payload["skip_reason"] == "empty_summary"
         assert res.payload["user_visible"] is True
-        assert [payload["status"] for _, payload in events] == ["started", "skipped"]
+        assert [payload["status"] for _, payload in events] == ["started", "failed"]
         assert events[-1][1]["applied"] is False
         assert events[-1][1]["durability"] == "none"
-        assert events[-1][1]["skip_reason"] == "empty_summary"
+        assert events[-1][1]["reason"] == "empty_summary"
         assert [payload["status"] for _, _, payload in emitted] == [
             "started",
-            "skipped",
+            "failed",
         ]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("skip_reason", ["within_budget", "no_entries"])
+    async def test_context_compact_emits_skipped_for_benign_noop(
+        self,
+        dispatcher,
+        session,
+        skip_reason: str,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        manager = FakeSessionManager([session])
+
+        async def _noop(*_args: Any, **_kwargs: Any) -> Any:
+            return SimpleNamespace(
+                summary="", removed_count=0, kept_entries=[], summary_source="skipped",
+                tokens_before=100, tokens_after=100, chunks_processed=0,
+                coverage_status="unknown", skip_reason=skip_reason,
+            )
+
+        manager.compact_with_result = _noop  # type: ignore[method-assign]
+        ctx = make_ctx(session_manager=manager)
+        events: list[tuple[str, dict[str, Any]]] = []
+        emitted = _capture_compaction_emits(monkeypatch)
+        monkeypatch.setattr(
+            session_maintenance_adapter,
+            "notify_compaction",
+            lambda session_key, **payload: events.append((session_key, payload)),
+        )
+
+        res = await dispatcher.dispatch(
+            "r1", "sessions.contextCompact", {"key": session.session_key}, ctx
+        )
+
+        assert res.ok is True
+        assert res.payload["status"] == "skipped"
+        assert res.payload["reason"] == skip_reason
+        assert res.payload["compacted"] is False
+        assert res.payload["applied"] is False
+        assert res.payload["durability"] == "none"
+        assert [payload["status"] for _, payload in events] == ["started", "skipped"]
+        assert events[-1][1]["skip_reason"] == skip_reason
+        assert [payload["status"] for _, _, payload in emitted] == ["started", "skipped"]
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(

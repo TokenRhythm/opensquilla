@@ -18,15 +18,8 @@ from dataclasses import dataclass, field, replace
 from enum import StrEnum
 from typing import Protocol
 
+from opensquilla.compaction_status import compaction_failure_status
 from opensquilla.session_key import canonicalize_session_key
-
-_STALE_SKIP_REASONS = frozenset(
-    {
-        "stale_preimage",
-        "stale_context_state",
-        "consumer_admission_stale_or_failed",
-    }
-)
 
 
 @dataclass(frozen=True, slots=True)
@@ -639,8 +632,8 @@ class _ManualCompactionOperation:
                 )
             raise
 
-        status = "completed" if outcome.applied else (
-            "stale" if outcome.skip_reason in _STALE_SKIP_REASONS else "skipped"
+        status = "completed" if outcome.applied else compaction_failure_status(
+            outcome.skip_reason or "empty_summary"
         )
         reason = None if outcome.applied else (outcome.skip_reason or "empty_summary")
         await self._publish(

@@ -828,6 +828,7 @@ describe('useChatStream render coalescing', () => {
 
     for (const [status, id] of [
       ['completed', 'cmp-completed'],
+      ['emergency_ephemeral', 'cmp-temporary'],
       ['skipped', 'cmp-skipped'],
       ['stale', 'cmp-stale'],
       ['cancelled', 'cmp-cancelled'],
@@ -838,11 +839,13 @@ describe('useChatStream render coalescing', () => {
 
     expect(api.foldedTurn.value.statusHistory.map(entry => [entry.id, entry.state])).toEqual([
       ['cmp-completed', 'completed'],
+      ['cmp-temporary', 'completed'],
       ['cmp-skipped', 'skipped'],
       ['cmp-stale', 'stale'],
       ['cmp-cancelled', 'cancelled'],
       ['cmp-failed', 'failed'],
     ])
+    expect(api.foldedTurn.value.statusHistory[1]?.durability).toBe('request_scoped')
     api.cleanup()
   })
 
