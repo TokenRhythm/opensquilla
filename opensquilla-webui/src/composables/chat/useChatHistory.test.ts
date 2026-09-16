@@ -1923,6 +1923,60 @@ describe('useChatHistory canonical pagination', () => {
     ])
   })
 
+  it('keeps an automatic live route after an assistant-only history window', async () => {
+    const { api, messages } = makeHistory(false, {
+      preserveLiveTail: true,
+      messages: [
+        {
+          role: 'user',
+          text: 'Start the Goal',
+          ts: 1,
+          messageId: 'user-root',
+          turnId: 'turn-root',
+          restoredFromHistory: true,
+        },
+        {
+          role: 'router',
+          text: '',
+          ts: 4,
+          messageId: 'router-current',
+          turnId: 'turn-continuation-current',
+          turnInputMode: 'system_event',
+          turnRunKind: 'goal',
+          routerModelCallId: '1.0',
+          routerIteration: 1,
+        },
+      ],
+      response: {
+        messages: [{
+          id: 'answer-earlier',
+          messageId: 'answer-earlier',
+          role: 'assistant',
+          text: 'Earlier continuation output',
+          createdAt: '2026-07-06T01:00:00Z',
+          turnContext: {
+            turnId: 'turn-continuation-earlier',
+            inputMode: 'system_event',
+            runKind: 'goal',
+          },
+        }],
+        hasMore: true,
+      },
+    })
+
+    await api.loadHistory()
+
+    expect(messages.value.map(message => message.messageId)).toEqual([
+      'answer-earlier',
+      'router-current',
+    ])
+    expect(messages.value[1]).toMatchObject({
+      turnId: 'turn-continuation-current',
+      routerModelCallId: '1.0',
+      routerIteration: 1,
+    })
+  })
+
   it('bridges forward without dropping loaded pages when a refresh has no message-id overlap', async () => {
     const initial = Array.from({ length: 50 }, (_, index) => historyMessage(`m-${index + 250}`))
     const earlier = Array.from({ length: 50 }, (_, index) => historyMessage(`m-${index + 200}`))

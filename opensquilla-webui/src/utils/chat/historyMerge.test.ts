@@ -291,6 +291,37 @@ describe('reconcileHistoryMessages', () => {
 })
 
 describe('reconcileHistoryWindow', () => {
+  it('does not carry live assistant metadata into an explicitly different turn', () => {
+    const user = msg({ role: 'user', text: 'Start the Goal', messageId: 'user-root' })
+    const previous = [
+      user,
+      msg({
+        text: 'Working',
+        turnId: 'turn-earlier',
+        clientId: 'assistant-local',
+        reasoning: reasoning(8),
+      }),
+    ]
+    const incoming = [
+      { ...user, restoredFromHistory: true },
+      msg({
+        text: 'Working',
+        messageId: 'assistant-current',
+        turnId: 'turn-current',
+        restoredFromHistory: true,
+      }),
+    ]
+
+    const merged = reconcileHistoryWindow(previous, incoming)
+
+    expect(merged[1]).toMatchObject({
+      messageId: 'assistant-current',
+      turnId: 'turn-current',
+    })
+    expect(merged[1].clientId).toBeUndefined()
+    expect(merged[1].reasoning).toBeUndefined()
+  })
+
   it('preserves a live turn id when durable user ownership uniquely matches old history', () => {
     const previous = [
       msg({
@@ -1197,5 +1228,194 @@ describe('reconcileRunningHistoryMessages', () => {
       ['user', 'current steer'],
     ])
     expect(out.some(message => message.turnId === 'turn-old' && message.role === 'assistant')).toBe(false)
+  })
+
+  it('appends an unanchored live route after the canonical history window', () => {
+    const olderAnswer = msg({
+      text: 'Earlier response',
+      messageId: 'answer-old',
+      restoredFromHistory: true,
+    })
+    const previous = [
+      olderAnswer,
+      msg({ role: 'user', text: 'New request', clientId: 'user-local' }),
+      msg({ role: 'router', messageId: 'router-current', turnId: 'turn-current' }),
+    ]
+
+    const out = reconcileRunningHistoryMessages(previous, [olderAnswer])
+
+    expect(out.map(message => message.messageId)).toEqual(['answer-old', 'router-current'])
+  })
+
+  it.each([
+    { historyKind: 'explicit root turn', rootTurnId: 'turn-root' },
+    { historyKind: 'legacy root without turn identity', rootTurnId: undefined },
+  ])('isolates a steered automatic turn from $historyKind', ({ rootTurnId }) => {
+    const root = msg({
+      role: 'user',
+      text: 'Start the Goal',
+      messageId: 'user-root',
+      turnId: rootTurnId,
+      restoredFromHistory: true,
+    })
+    const steer = msg({
+      role: 'user',
+      text: 'Adjust the continuation',
+      messageId: 'user-steer',
+      turnId: 'turn-continuation',
+      inputDisposition: 'applied',
+    })
+    const previous = [
+      root,
+      msg({ text: 'Old live segment', turnId: 'turn-root' }),
+      msg({
+        role: 'router',
+        messageId: 'router-current',
+        turnId: 'turn-continuation',
+        turnInputMode: 'system_event',
+        turnRunKind: 'goal',
+        routerModelCallId: '1.0',
+        routerIteration: 1,
+      }),
+      steer,
+    ]
+    const incoming = [root, { ...steer, restoredFromHistory: true }]
+
+    const out = reconcileRunningHistoryMessages(previous, incoming)
+
+    expect(out.map(message => message.messageId)).toEqual([
+      'user-root',
+      'router-current',
+      'user-steer',
+    ])
+    expect(out.some(message => message.text === 'Old live segment')).toBe(false)
+    expect(out[1]).toMatchObject({
+      turnId: 'turn-continuation',
+      routerModelCallId: '1.0',
+      routerIteration: 1,
+    })
+    expect(reconcileRunningHistoryMessages(out, incoming)).toEqual(out)
+  })
+
+  it('keeps distinct steer checkpoints with the same timestamp and text', () => {
+    const user = msg({ role: 'user', messageId: 'user-root', turnId: 'turn-current' })
+    const firstSteer = msg({
+      role: 'user',
+      messageId: 'steer-first',
+      turnId: 'turn-current',
+      inputDisposition: 'applied',
+    })
+    const secondSteer = msg({ ...firstSteer, messageId: 'steer-second' })
+    const checkpoint = msg({ text: 'Working', ts: 1_000, turnId: 'turn-current' })
+    const previous = [
+      user,
+      msg({ ...checkpoint, clientId: 'checkpoint-first' }),
+      firstSteer,
+      msg({ ...checkpoint, clientId: 'checkpoint-second' }),
+      secondSteer,
+    ]
+    const incoming = [user, firstSteer, secondSteer]
+      .map(message => ({ ...message, restoredFromHistory: true }))
+
+    const out = reconcileRunningHistoryMessages(previous, incoming)
+
+    expect(out.map(message => message.messageId ?? message.clientId)).toEqual([
+      'user-root',
+      'checkpoint-first',
+      'steer-first',
+      'checkpoint-second',
+      'steer-second',
+    ])
+    expect(reconcileRunningHistoryMessages(out, incoming)).toEqual(out)
+  })
+
+  it('deduplicates repeated delivery of a checkpoint by its stable client identity', () => {
+    const user = msg({ role: 'user', messageId: 'user-root', turnId: 'turn-current' })
+    const checkpoint = msg({
+      text: 'Working',
+      ts: 1_000,
+      clientId: 'checkpoint-first',
+      turnId: 'turn-current',
+    })
+    const previous = [user, checkpoint, { ...checkpoint, ts: 1_001 }]
+
+    const out = reconcileRunningHistoryMessages(previous, [
+      { ...user, restoredFromHistory: true },
+    ])
+
+    expect(out.map(message => message.messageId ?? message.clientId)).toEqual([
+      'user-root',
+      'checkpoint-first',
+    ])
+  })
+
+  it('matches only one live checkpoint to a canonical row with weak identity', () => {
+    const user = msg({ role: 'user', messageId: 'user-root', turnId: 'turn-current' })
+    const checkpoint = msg({ text: 'Working', ts: 1_000, turnId: 'turn-current' })
+    const previous = [
+      user,
+      msg({ ...checkpoint, clientId: 'checkpoint-first' }),
+      msg({ ...checkpoint, clientId: 'checkpoint-second' }),
+    ]
+    const incoming = [
+      { ...user, restoredFromHistory: true },
+      msg({ ...checkpoint, messageId: 'answer-first', restoredFromHistory: true }),
+    ]
+
+    const out = reconcileRunningHistoryMessages(previous, incoming)
+
+    expect(out.map(message => message.messageId ?? message.clientId)).toEqual([
+      'user-root',
+      'answer-first',
+      'checkpoint-second',
+    ])
+    expect(out.filter(message => message.text === 'Working')).toHaveLength(2)
+    expect(reconcileRunningHistoryMessages(out, incoming)).toEqual(out)
+  })
+
+  it('keeps a later route after an optimistic assistant replaced by canonical history', () => {
+    const user = msg({ role: 'user', messageId: 'user-root', turnId: 'turn-current' })
+    const firstSegment = msg({ text: 'First segment', ts: 1, turnId: 'turn-current' })
+    const steer = msg({
+      role: 'user',
+      messageId: 'user-steer',
+      turnId: 'turn-current',
+      inputDisposition: 'applied',
+    })
+    const previous = [
+      user,
+      firstSegment,
+      msg({
+        role: 'router',
+        ts: 2,
+        messageId: 'router-second',
+        turnId: 'turn-current',
+        routerModelCallId: '2.0',
+      }),
+      steer,
+      msg({ text: 'Second segment', ts: 3, turnId: 'turn-current' }),
+    ]
+    const incoming = [
+      { ...user, restoredFromHistory: true },
+      msg({
+        ...firstSegment,
+        ts: 10,
+        messageId: 'answer-first',
+        restoredFromHistory: true,
+      }),
+      { ...steer, restoredFromHistory: true },
+    ]
+
+    const out = reconcileRunningHistoryMessages(previous, incoming)
+
+    expect(out.map(message => message.messageId ?? message.text)).toEqual([
+      'user-root',
+      'answer-first',
+      'router-second',
+      'user-steer',
+      'Second segment',
+    ])
+    expect(out.filter(message => message.text === 'First segment')).toHaveLength(1)
+    expect(reconcileRunningHistoryMessages(out, incoming)).toEqual(out)
   })
 })
