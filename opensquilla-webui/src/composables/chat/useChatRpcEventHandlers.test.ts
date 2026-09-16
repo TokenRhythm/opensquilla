@@ -217,6 +217,70 @@ function createHarness(options: {
 }
 
 describe('live tool result actions', () => {
+  it.each(['task.timeout', 'session.event.error'])('settles %s after history restored its authoritative timeout', event => {
+    const h = createHarness({ messages: [{
+      role: 'error', text: 'The task timed out.', ts: null, turnId: 'provider-turn',
+      terminalNotice: true,
+      turnOutcome: { turnId: 'provider-turn', status: 'timeout', statusSource: 'task', failureKind: 'overloaded', errorId: 'abcdef01' },
+    }], endStreaming: messages => { messages.push({ role: 'assistant', text: 'Partial answer', ts: null }) } })
+    try {
+      h.activeStreamTaskId.value = 'provider-turn'
+      h.api.handlers.onWireEventFixture(event, {
+        key: h.sessionKey.value, task_id: 'provider-turn', turn_id: 'provider-turn', stream_seq: 1,
+        turn_outcome: { failure_kind: 'overloaded', error_id: 'abcdef01' },
+      })
+      expect(h.messages.value.filter(message => message.role === 'error')).toHaveLength(1)
+      expect(h.stream.endStreaming).toHaveBeenCalledOnce()
+      expect(h.onTaskSettled).toHaveBeenCalledOnce()
+      expect(h.activeStreamTaskId.value).toBe(FINISHED_STREAM_TASK_ID)
+      expect(h.messages.value.find(message => message.role === 'assistant')?.turnOutcome?.status).toBe('timeout')
+      expect(h.applySessionRunState.mock.lastCall?.[0].run_status).toBe('timeout')
+    } finally { h.stop() }
+  })
+
+  it.each([
+    ['session.event.error', 'task.timeout'],
+    ['task.timeout', 'session.event.error'],
+  ])('preserves authoritative timeout for %s then %s', (first, second) => {
+    const h = createHarness({ endStreaming: messages => {
+      messages.push({ role: 'assistant', text: 'Partial answer', ts: null })
+    } })
+    h.activeStreamTaskId.value = 'provider-turn'
+    const payload = {
+      key: h.sessionKey.value, task_id: 'provider-turn', turn_id: 'provider-turn', code: 'llm_timeout',
+      terminal_reason: 'timeout', terminal_message: 'The task timed out before it could finish.',
+      turn_outcome: { failure_kind: 'transport_transient', error_id: 'abcdef01', kind: 'interrupted' },
+    }
+    try {
+      h.api.handlers.onWireEventFixture(first!, { ...payload, stream_seq: 1 })
+      h.stream.isStreaming.value = false
+      h.api.handlers.onWireEventFixture(second!, { ...payload, stream_seq: 2 })
+      expect(h.messages.value.filter(message => message.role === 'error')).toHaveLength(1)
+      expect(h.messages.value.find(message => message.role === 'error')?.turnOutcome?.status).toBe('timeout')
+      expect(h.messages.value.find(message => message.role === 'assistant')?.turnOutcome?.status).toBe('timeout')
+      expect(h.applySessionRunState.mock.lastCall?.[0].run_status).toBe('timeout')
+      expect(h.stream.endStreaming).toHaveBeenCalledOnce()
+    } finally { h.stop() }
+  })
+
+  it('does not let an old terminal update change a successor run state', () => {
+    const h = createHarness()
+    const payload = {
+      key: h.sessionKey.value, task_id: 'old-turn', turn_id: 'old-turn', code: '429',
+      turn_outcome: { failure_kind: 'rate_limited', error_id: 'abcdef01' },
+    }
+    try {
+      h.activeStreamTaskId.value = 'old-turn'
+      h.api.handlers.onWireEventFixture('session.event.error', { ...payload, stream_seq: 1 })
+      h.activeStreamTaskId.value = 'new-turn'
+      const calls = h.applySessionRunState.mock.calls.length
+      h.api.handlers.onWireEventFixture('task.timeout', { ...payload, terminal_reason: 'timeout', stream_seq: 2 })
+      expect(h.applySessionRunState).toHaveBeenCalledTimes(calls)
+      expect(h.stream.endStreaming).toHaveBeenCalledOnce()
+      expect(h.activeStreamTaskId.value).toBe('new-turn')
+    } finally { h.stop() }
+  })
+
   it.each([
     ['session.event.error', 'task.failed'],
     ['task.failed', 'session.event.error'],

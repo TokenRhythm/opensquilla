@@ -88,6 +88,7 @@ const diagnosticId = computed(() => props.message.turnId && props.message.turnId
 const errorText = computed(() => localizedChatErrorMessage(
   props.message.errorCode, props.message.text,
   props.message.turnOutcome?.replaySafe === true, props.message.turnOutcome?.failureKind,
+  props.message.turnOutcome?.status,
 ))
 
 async function copyDiagnosticId() {

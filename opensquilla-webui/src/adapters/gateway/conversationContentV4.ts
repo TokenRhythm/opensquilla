@@ -307,6 +307,10 @@ export function projectConversationContent(payload: unknown, kind?: Conversation
       ...source,
       turn_id: source.turn_id ?? source.turnId ?? taskId,
       status: kind === 'task-timed-out' ? 'timeout' : kind === 'task-abandoned' ? 'abandoned' : 'failed',
+      ...(kind !== 'turn-failed' ? {
+        statusSource: 'task',
+        reason: source.terminal_reason ?? source.terminalReason ?? source.reason,
+      } : {}),
     })
     const errorCode = usageAccountingErrorCode(source)
     if (errorCode) result.error_class = errorCode

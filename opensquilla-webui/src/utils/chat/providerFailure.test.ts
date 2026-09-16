@@ -1,9 +1,10 @@
 import { describe, expect, it } from 'vitest'
-import i18n from '@/i18n'
+import i18n, { loadLocaleMessages } from '@/i18n'
 import type { ChatMessage } from '@/types/chat'
 import { normalizeTurnOutcome } from './turnOutcome'
 import { localizedChatErrorMessage } from './errors'
 import { dedupeTerminalErrorNotices } from './terminalErrorNotices'
+import { reconcileClientTerminalNotices } from './historyMerge'
 
 describe('provider terminal metadata', () => {
   it.each(['turn_outcome', 'outcome', 'turnOutcome'])('normalizes %s and live metadata identically', key => {
@@ -33,16 +34,62 @@ describe('provider terminal metadata', () => {
     }
   })
 
-  it.each(['en', 'zh-Hans', 'de', 'es', 'fr', 'ja'] as const)('localizes allowlisted causes in %s', locale => {
+  it.each(['en', 'zh-Hans', 'de', 'es', 'fr', 'ja'] as const)('localizes allowlisted causes in %s', async locale => {
+    await loadLocaleMessages(locale)
     i18n.global.locale.value = locale
     for (const kind of ['rate_limited', 'provider_overloaded', 'auth_invalid', 'context_overflow',
       'unsupported_feature', 'insufficient_credits', 'model_not_found', 'transport_transient',
-      'policy_refusal', 'empty_response', 'malformed_response', 'bad_request']) {
+      'policy_refusal', 'empty_response', 'malformed_response', 'bad_request'] as const) {
       const message = localizedChatErrorMessage('429', 'safe fallback', false, kind)
       expect(message).not.toBe('safe fallback')
       expect(message).not.toContain('chat.providerFailure.')
+      expect(message).toBe(i18n.global.getLocaleMessage(locale).chat.providerFailure[kind])
     }
     i18n.global.locale.value = 'en'
+  })
+
+  const user = (turnId: string): ChatMessage => ({
+    role: 'user', text: 'Synthetic request', turnId, messageId: `user-${turnId}`, ts: null,
+  })
+  const notice = (errorId: string | null, turnId = 'turn-a'): ChatMessage => ({
+    role: 'error', text: 'Safe error', turnId, ts: null, terminalNotice: true, errorCode: '429',
+    turnOutcome: { turnId, status: 'failed', errorId, failureKind: 'rate_limited' },
+  })
+
+  it.each(['abcdef01', null])('retains conflict evidence from live reference %s through repeated history sync', errorId => {
+    const incoming = [user('turn-a'), { ...notice('abcdef02'), messageId: 'durable-error' }]
+    const result = reconcileClientTerminalNotices([user('turn-a'), notice(errorId)], incoming)
+    expect(result.filter(message => message.role === 'error')).toHaveLength(1)
+    expect(result.find(message => message.role === 'error')?.turnOutcome?.errorId).toBeNull()
+    expect(reconcileClientTerminalNotices(result, incoming).find(message => message.role === 'error')?.turnOutcome?.errorId).toBeNull()
+  })
+
+  it('never moves an identified error to another turn with identical user text', () => {
+    expect(reconcileClientTerminalNotices([user('turn-a'), notice('abcdef01')], [user('turn-b')]))
+      .toEqual([user('turn-b')])
+  })
+
+  it('keeps a terminal cause distinct from an unrelated same-turn error', () => {
+    const other: ChatMessage = { role: 'error', text: 'Synthetic tool failure', turnId: 'turn-a', ts: null }
+    const result = reconcileClientTerminalNotices([user('turn-a'), notice('abcdef01')], [user('turn-a'), other])
+    expect(result).toContainEqual(other)
+    expect(result.filter(message => message.terminalNotice)).toHaveLength(1)
+  })
+
+  it('merges a partial history page without requiring its user row', () => {
+    const result = reconcileClientTerminalNotices([notice(null)], [{ ...notice('abcdef01'), messageId: 'durable-error' }])
+    expect(result).toHaveLength(1)
+    expect(result[0]?.turnOutcome?.errorId).toBeNull()
+  })
+
+  it.each([false, true])('keeps lifecycle timeout authoritative with reversed=%s', reversed => {
+    const terminal: ChatMessage = { ...notice('abcdef01'), text: 'Safe timeout', turnOutcome: {
+      ...notice('abcdef01').turnOutcome!, status: 'timeout', statusSource: 'task', reason: 'hard_deadline_exceeded',
+    } }
+    const rich = notice('abcdef01')
+    const [merged] = dedupeTerminalErrorNotices(reversed ? [rich, terminal] : [terminal, rich])
+    expect(merged?.text).toBe('Safe timeout')
+    expect(merged?.turnOutcome).toMatchObject({ status: 'timeout', reason: 'hard_deadline_exceeded', errorId: 'abcdef01' })
   })
 
   it('keeps more specific terminal guidance', () => {

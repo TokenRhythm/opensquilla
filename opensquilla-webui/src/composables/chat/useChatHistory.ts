@@ -361,6 +361,7 @@ function turnOutcomeRecord(outcome: SessionReadTurnOutcome): Record<string, unkn
     turnId: outcome.turnId,
     taskId: outcome.taskId ?? undefined,
     status: outcome.status,
+    statusSource: 'task',
     startedAt: outcome.startedAt ?? undefined,
     finishedAt: outcome.finishedAt ?? undefined,
     outcome: outcome.outcome,
@@ -421,6 +422,7 @@ function attachHistoryTurnOutcomes(
               outcome.terminalMessage || message.text,
               outcome.replaySafe === true,
               outcome.failureKind,
+              outcome.status,
             ),
             errorCode: outcome.errorClass,
             terminalNotice: true,
@@ -522,6 +524,7 @@ function attachHistoryTurnOutcomes(
         outcome.terminalMessage || '',
         outcome.replaySafe === true,
         outcome.failureKind,
+        outcome.status,
       ),
       ts: outcome.finishedAt ?? null,
       turnId: outcome.turnId,
@@ -1290,7 +1293,8 @@ export function useChatHistory(options: UseChatHistoryOptions) {
         const transcript = interleaveHistoryModelCallSegments(
           rehomePromotedSteerRows(
             dedupeTerminalErrorNotices([
-              ...mapped.filter(msg => !existing.has(messageKey(msg))),
+              ...mapped.filter(msg => !existing.has(messageKey(msg))
+                || (msg.role === 'error' && msg.terminalNotice && msg.turnId)),
               ...previousTranscript,
             ]),
           ),
@@ -1314,9 +1318,7 @@ export function useChatHistory(options: UseChatHistoryOptions) {
         )
         const transcript = interleaveHistoryModelCallSegments(
           rehomePromotedSteerRows(
-            dedupeTerminalErrorNotices(
-              reconcileClientTerminalNotices(previousTranscript, nextMessages),
-            ),
+            reconcileClientTerminalNotices(previousTranscript, nextMessages),
           ),
         )
         options.messages.value = mergeHistoryMaintenance(

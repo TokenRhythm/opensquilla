@@ -342,6 +342,8 @@ export function normalizeTurnOutcome(
     turnId,
     ...(taskId ? { taskId } : {}),
     status,
+    ...(record.statusSource === 'task' || nested.statusSource === 'task'
+      ? { statusSource: 'task' as const } : {}),
     ...(errorIdState.present
       ? { errorId: errorIdState.valid && turnIdState.valid && !containers.invalid ? errorIdState.value : null }
       : {}),

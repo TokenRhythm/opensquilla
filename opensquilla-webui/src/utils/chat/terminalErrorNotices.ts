@@ -30,10 +30,26 @@ export function dedupeTerminalErrorNotices(messages: ChatMessage[]): ChatMessage
       turnId: message.turnId,
       ...(other.turnOutcome ? { outcome: other.turnOutcome } : {}),
     })
+    // Rich stream receipts can add classification/reference evidence, but
+    // cannot replace the scheduler's status or terminal reason.
+    const lifecycle = [preferred, other].find(message => message.turnOutcome?.statusSource === 'task')
+      ?? [preferred, other].find(message => ['timeout', 'abandoned', 'cancelled'].includes(message.turnOutcome?.status ?? ''))
+    if (turnOutcome && lifecycle?.turnOutcome) {
+      const authority = lifecycle.turnOutcome
+      turnOutcome.status = authority.status
+      if (authority.reason !== undefined) turnOutcome.reason = authority.reason
+      if (authority.kind !== undefined) turnOutcome.kind = authority.kind
+      turnOutcome.statusSource = authority.statusSource
+      if (authority.terminalMessage !== undefined) turnOutcome.terminalMessage = authority.terminalMessage
+    }
+    const fallback = lifecycle && lifecycle.turnOutcome?.status !== 'failed'
+      ? lifecycle.turnOutcome?.terminalMessage || lifecycle.text
+      : preferred.text
     result[index] = {
       ...other, ...preferred, turnOutcome,
       text: localizedChatErrorMessage(
-        preferred.errorCode, preferred.text, turnOutcome?.replaySafe === true, turnOutcome?.failureKind,
+        preferred.errorCode, fallback, turnOutcome?.replaySafe === true, turnOutcome?.failureKind,
+        turnOutcome?.status,
       ),
     }
   }

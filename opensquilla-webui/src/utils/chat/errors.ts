@@ -15,7 +15,9 @@ export function localizedChatErrorMessage(
   fallback: string,
   replaySafe = false,
   failureKind?: string,
+  terminalStatus?: string,
 ): string {
+  if (terminalStatus === 'timeout' || terminalStatus === 'abandoned' || terminalStatus === 'cancelled') return fallback
   if (isUsageAccountingBarrier(code)) {
     return i18n.global.t(
       replaySafe

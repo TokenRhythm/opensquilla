@@ -3353,6 +3353,30 @@ describe('useChatHistory optimistic local rows', () => {
     expect(messages.value.find(message => message.role === 'assistant')?.text).toBe('Partial answer')
   })
 
+  it.each([false, true])('retains reference conflicts across history loading with prepend=%s', async prepend => {
+    const { api, historyFixture, messages } = makeHistory(true)
+    const page = (errorId: string): SessionReadHistoryPageFixture => ({
+      messages: [{
+        id: 'provider-error', messageId: 'provider-error', role: 'system', text: 'Error: safe message',
+        createdAt: '2026-01-01T09:00:00Z', turnContext: { turnId: 'provider-turn' },
+      }],
+      turnOutcomes: [{
+        turnId: 'provider-turn', taskId: 'provider-turn', status: 'failed',
+        outcome: { kind: 'failed', error_class: '429', failure_kind: 'rate_limited', error_id: errorId },
+      }],
+      hasMore: true, oldestCursor: 'provider-error', newestCursor: 'provider-error', scope: 'session',
+    })
+    historyFixture.mockResolvedValueOnce(page('abcdef01')).mockResolvedValue(page('abcdef02'))
+    await api.loadHistory()
+    expect(messages.value.find(message => message.role === 'error')?.turnOutcome?.errorId).toBe('abcdef01')
+    if (prepend) await api.loadEarlierHistory()
+    else await api.loadHistory()
+    expect(messages.value.filter(message => message.role === 'error')).toHaveLength(1)
+    expect(messages.value.find(message => message.role === 'error')?.turnOutcome?.errorId).toBeNull()
+    await api.loadHistory()
+    expect(messages.value.find(message => message.role === 'error')?.turnOutcome?.errorId).toBeNull()
+  })
+
   it('keeps exact-turn optimistic usage activity through repeated history catch-up', async () => {
     const pendingResponse: SessionReadHistoryPageFixture = {
       messages: [{

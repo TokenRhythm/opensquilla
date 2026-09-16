@@ -2122,10 +2122,14 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
     // Queued/Stop terminals have separate ownership exceptions below. They
     // must not teach the current renderer another turn's generation identity.
     if (!isCurrentGenerationPayload(payloadObj, isCurrentTaskPayload(payloadObj))) return
+    const terminalStatus = eventTaskTerminalStatus(eventKind)
     const noticeTurnId = payloadObj.terminalOutcome?.turnId || payloadTurnId(payloadObj)
     if (
-      (eventKind === 'turn-failed' || eventKind === 'task-failed' || eventKind === 'task-timed-out')
+      (eventKind === 'turn-failed' || eventKind === 'task-failed' || eventKind === 'task-timed-out' || eventKind === 'task-abandoned')
       && noticeTurnId
+      // History may restore a notice before the live owner receives its
+      // terminal. That owner must still pass through normal stream settlement.
+      && !(isCurrentTaskPayload(payloadObj) && stream.isStreaming.value)
       && messages.value.some(message => message.role === 'error'
         && message.terminalNotice && message.turnId === noticeTurnId)
     ) {
@@ -2136,11 +2140,30 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
         turnId: noticeTurnId, turnOutcome: payloadObj.terminalOutcome,
         terminalNotice: true, ts: new Date().toISOString(),
       }])
+      const mergedOutcome = messages.value.find(message => message.role === 'error'
+        && message.terminalNotice && message.turnId === noticeTurnId)?.turnOutcome
+      if (mergedOutcome) {
+        messages.value = messages.value.map(message => message.role === 'assistant' && message.turnId === noticeTurnId
+          ? { ...message, turnOutcome: { ...message.turnOutcome, ...mergedOutcome } }
+          : message)
+      }
+      // A late receipt may enrich an old notice, never another active turn's
+      // run state. The finished tombstone may still receive its own lifecycle.
+      const latestTurnId = [...messages.value].reverse().find(message => message.turnId)?.turnId
+      const ownsRunState = isCurrentTaskPayload(payloadObj)
+        || (activeStreamTaskId.value === FINISHED_STREAM_TASK_ID
+          && latestTurnId === noticeTurnId
+          && !options.taskOwnership?.hasAuthoritativeWork.value)
+      if (terminalStatus && ownsRunState) {
+        options.applySessionRunState(activeTaskGroups.value.size > 0
+          ? activeTaskGroupRunState(payloadObj)
+          : { run_status: terminalStatus === 'abandoned' ? 'interrupted' : terminalStatus,
+              last_task: { ...payloadObj, status: terminalStatus } })
+      }
       options.scheduleHistorySync()
       return
     }
     const taskSucceededFallback = eventKind === 'task-succeeded'
-    const terminalStatus = eventTaskTerminalStatus(eventKind)
     const terminalEvent = isTerminalEvent(eventKind)
     // Rich done/error receipts are terminal ownership evidence too, even
     // though only compact task.* events encode a lifecycle status in the event
@@ -2412,6 +2435,7 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
           serverMessage,
           turnOutcome?.replaySafe === true,
           turnOutcome?.failureKind,
+          turnOutcome?.status,
         ),
         errorCode,
         turnId: terminalTurnId || undefined,
@@ -2420,11 +2444,18 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
         ts: new Date().toISOString(),
       })
       messages.value = dedupeTerminalErrorNotices(messages.value)
+      const mergedOutcome = terminalTurnId
+        ? messages.value.find(message => message.role === 'error'
+          && message.terminalNotice && message.turnId === terminalTurnId)?.turnOutcome
+        : turnOutcome
+      if (completedMessage?.role === 'assistant') completedMessage.turnOutcome = mergedOutcome
       options.scheduleHistorySync()
       if (activeTaskGroups.value.size > 0) {
         options.applySessionRunState(activeTaskGroupRunState(payload))
       } else {
-        options.applySessionRunState({ run_status: 'failed', last_task: { ...(payload || {}), status: 'failed' } })
+        const status = mergedOutcome?.status || terminalStatus || 'failed'
+        options.applySessionRunState({ run_status: status === 'abandoned' ? 'interrupted' : status,
+          last_task: { ...(payload || {}), status } })
       }
       const terminalTaskId = payloadTurnId(payload)
       if (

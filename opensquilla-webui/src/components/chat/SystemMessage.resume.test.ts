@@ -53,6 +53,16 @@ beforeEach(() => {
 })
 
 describe('SystemMessage sandbox resume', () => {
+  it('keeps lifecycle timeout text ahead of a preserved provider classification', async () => {
+    const { app, el } = await mountMsg(errorMessage({
+      text: 'The task timed out before it could finish.', errorCode: '429', turnId: 't',
+      turnOutcome: { turnId: 't', status: 'timeout', statusSource: 'task', failureKind: 'rate_limited' },
+    }))
+    expect(el.querySelector('.msg-error__text')?.textContent).toBe('The task timed out before it could finish.')
+    expect(el.querySelectorAll('button')).toHaveLength(0)
+    app.unmount()
+  })
+
   it('copies only a validated diagnostic id and never offers provider replay', async () => {
     const { app, el } = await mountMsg(errorMessage({
       text: 'safe fallback', errorCode: '429', turnId: 't',

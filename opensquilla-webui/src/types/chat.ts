@@ -411,6 +411,8 @@ export interface ChatTurnOutcome {
   turnId: string
   taskId?: string
   status: string
+  /** Client-only provenance: lifecycle/history status outranks a stream receipt. */
+  statusSource?: 'task'
   kind?: string
   reason?: string
   cancellationSource?: string
