@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import json
 from collections.abc import AsyncIterator, Callable
 from types import SimpleNamespace
 from typing import Any
@@ -18,8 +20,13 @@ from opensquilla.provider import (
     DoneEvent as ProviderDone,
 )
 from opensquilla.provider import (
+    ErrorEvent as ProviderError,
+)
+from opensquilla.provider import (
     Message,
     ModelInfo,
+    OpenAIProvider,
+    ReasoningDeltaEvent,
 )
 from opensquilla.provider import (
     TextDeltaEvent as ProviderText,
@@ -231,6 +238,259 @@ async def test_normal_turn_reads_transcript_once_before_provider(
     assert not any(isinstance(event, ErrorEvent) for event in events)
     assert provider.read_counts_at_dispatch == [1]
     assert read_count == 1
+
+
+@pytest.mark.asyncio
+async def test_runtime_prefix_preflight_inherits_current_generation_budget(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    monkeypatch.setenv("OPENSQUILLA_COMPACTION_PROMPT_LAYOUT", "prefix")
+    calls = []
+
+    class Provider(_CountingProvider):
+        projector = OpenAIProvider(
+            api_key="synthetic-test-key", model=_MODEL,
+            base_url="https://example.invalid/v1", provider_kind="openrouter",
+        )
+
+        def project_final_request(self, messages, tools=None, config=None, *, message_limit=None):
+            return self.projector.project_final_request(
+                messages, tools, config, message_limit=message_limit,
+            )
+
+        def chat(self, messages, tools=None, config=None):
+            calls.append((messages, tools, config.model_copy(deep=True)))
+            if config.candidate_output_mode == "inert_artifact":
+                return self.summary()
+            return self._stream()
+
+        async def summary(self):
+            yield ReasoningDeltaEvent(text="synthetic reasoning " * 600)
+            yield ProviderText(text="Earlier synthetic work completed; continue the current task.")
+            yield ProviderDone(stop_reason="stop", output_tokens=3000, reasoning_tokens=2980)
+
+    storage = SessionStorage(":memory:")
+    await storage.connect()
+    manager = SessionManager(
+        storage, inject_time_prefix=False, checkpoint_workspace_dir=str(tmp_path),
+    )
+    key = "agent:main:prefix-generation-budget"
+    await manager.create(key)
+    for index in range(8):
+        await manager.append_message(
+            key, "user" if index % 2 == 0 else "assistant",
+            f"Synthetic earlier work {index}. " * 30, token_count=5000,
+        )
+    provider = Provider(lambda: 0)
+    monkeypatch.setattr(
+        "opensquilla.session.compaction_deployment.build_provider_from_config",
+        lambda config: provider,
+    )
+    config = _config()
+    config.llm.context_window_tokens = 64000
+    config.llm.max_tokens = 8192
+    config.compaction.enabled = True
+    config.squilla_router.enabled = False
+    runner = TurnRunner(
+        provider_selector=_Selector(provider), session_manager=manager, config=config,
+    )
+    try:
+        events = await _run(runner, key)
+        assert not any(isinstance(event, ErrorEvent) for event in events)
+        summaries = [call for call in calls if call[2].candidate_output_mode == "inert_artifact"]
+        ordinary = [call for call in calls if call[2].candidate_output_mode != "inert_artifact"]
+        assert len(summaries) == len(ordinary) == 1
+        assert summaries[0][2].max_tokens == ordinary[0][2].max_tokens == 8192
+        assert summaries[0][1] is None
+        assert summaries[0][2].system.startswith("You are a conversation compactor.")
+        assert "within 1024 tokens" in summaries[0][2].system
+        assert len(await manager.get_summaries(key)) == 1
+        assert (await manager.get_session(key)).compaction_count == 1
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["body_cap", "timeout", "circuit"])
+@pytest.mark.parametrize("hard_overflow", [False, True])
+async def test_failed_preflight_never_restarts_paid_compaction_in_agent(
+    monkeypatch: pytest.MonkeyPatch, tmp_path, failure: str, hard_overflow: bool,
+) -> None:
+    monkeypatch.setenv("OPENSQUILLA_COMPACTION_PROMPT_LAYOUT", "prefix")
+
+    class Provider(_CountingProvider):
+        def __init__(self):
+            super().__init__(lambda: 0)
+            self.projector = OpenAIProvider(
+                api_key="synthetic-test-key", model=_MODEL,
+                base_url="https://example.invalid/v1", provider_kind="openrouter",
+            )
+            self.summary_calls = 0
+            self.main_calls = 0
+
+        def project_final_request(self, messages, tools=None, config=None, *, message_limit=None):
+            return self.projector.project_final_request(
+                messages, tools, config, message_limit=message_limit,
+            )
+
+        def chat(self, messages, tools=None, config=None):
+            if config.candidate_output_mode == "inert_artifact":
+                self.summary_calls += 1
+                return self.summary()
+            projection = self.project_final_request(messages, tools, config)
+            if not projection.fits:
+                return self.rejected(projection.proof)
+            self.main_calls += 1
+            return self._stream()
+
+        async def rejected(self, proof):
+            yield ProviderError(
+                message=json.dumps(proof), code="provider_request_budget_exhausted",
+            )
+
+        async def summary(self):
+            if failure == "timeout":
+                await asyncio.sleep(5)
+            yield ProviderText(text="synthetic oversized summary " * 2_000)
+            yield ProviderDone(stop_reason="stop", output_tokens=5_000)
+
+    storage = SessionStorage(":memory:")
+    await storage.connect()
+    manager = SessionManager(
+        storage, inject_time_prefix=False, checkpoint_workspace_dir=str(tmp_path),
+    )
+    key = "agent:main:preflight-failure-budget"
+    node = await manager.create(key)
+    for index in range(8):
+        repetitions = (2_000 if index >= 6 else 1_000) if hard_overflow else 30
+        await manager.append_message(
+            key, "user" if index % 2 == 0 else "assistant",
+            f"Synthetic earlier work {index}. " * repetitions, token_count=5_000,
+        )
+    original = await manager.get_transcript(key)
+    provider = Provider()
+    monkeypatch.setattr(
+        "opensquilla.session.compaction_deployment.build_provider_from_config",
+        lambda config: provider,
+    )
+    config = _config()
+    config.llm.context_window_tokens = 64_000
+    config.llm.max_tokens = 4_096
+    config.llm.provider_request_proof_max_chars = 100_000
+    config.compaction.enabled = True
+    config.compaction.protected_recent_messages = 2
+    config.compaction.total_timeout_seconds = 1.0 if failure == "timeout" else 120
+    config.squilla_router.enabled = False
+    runner = TurnRunner(
+        provider_selector=_Selector(provider), session_manager=manager, config=config,
+    )
+    if failure == "circuit":
+        for _ in range(3):
+            runner._record_compaction_failure(key)
+    try:
+        events = await _run(runner, key)
+        assert provider.summary_calls == (0 if failure == "circuit" else 1)
+        assert provider.main_calls == (0 if hard_overflow else 1)
+        assert any(isinstance(event, ErrorEvent) for event in events) is hard_overflow
+        if hard_overflow:
+            errors = [event for event in events if isinstance(event, ErrorEvent)]
+            assert errors[-1].code == "provider_request_too_large"
+        assert runner._compaction_failures[key].count == (3 if failure == "circuit" else 1)
+        assert key not in runner._turn_compaction_failed_sessions
+        current = await manager.get_transcript(key)
+        assert current[:len(original)] == original
+        assert await manager.get_summaries(key) == []
+        assert (await manager.get_session(key)).compaction_count == 0
+        async with storage._conn.execute(
+            "SELECT count(*) FROM compacted_transcript_entries WHERE session_id = ?",
+            (node.session_id,),
+        ) as cursor:
+            assert (await cursor.fetchone())[0] == 0
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("request_local_history", [False, True])
+async def test_inline_source_rejects_equal_length_temporary_window_after_append(
+    monkeypatch: pytest.MonkeyPatch,
+    request_local_history: bool,
+) -> None:
+    storage = SessionStorage(":memory:")
+    await storage.connect()
+    manager = SessionManager(storage, inject_time_prefix=False)
+    session_key = "agent:main:snapshot-request-window"
+    await manager.create(session_key)
+    for index in range(8):
+        await manager.append_message(
+            session_key, "user" if index % 2 == 0 else "assistant",
+            f"old-{index} " + "x" * 500, token_count=300,
+        )
+    original = await manager.get_transcript(session_key)
+    runner = TurnRunner(
+        provider_selector=_Selector(_CountingProvider(lambda: 0)),
+        session_manager=manager,
+        config=_config(),
+    )
+    captured = []
+    stream = runner._stream_consumer_stage.run
+
+    async def observe_stream(inp):
+        captured.append(inp)
+        async for event in stream(inp):
+            yield event
+
+    async def append_after_local_window(key, *args, transcript_snapshot=None, **kwargs):
+        frozen = list(await transcript_snapshot.get_entries())
+        assert await runner._record_emergency_ephemeral_compaction(
+            key, frozen, 1000, compaction_id="synthetic-alignment",
+            phase="preflight", reason="summary_failed",
+            expected_session_id=kwargs.get("expected_session_id"),
+            expected_session_epoch=kwargs.get("expected_session_epoch"),
+        )
+        for index in range(6):
+            await manager.append_message(
+                key, "user" if index % 2 == 0 else "assistant",
+                f"new-{index}", token_count=10,
+            )
+
+    monkeypatch.setattr(runner._stream_consumer_stage, "run", observe_stream)
+    if request_local_history:
+        monkeypatch.setattr(runner, "_maybe_preflight_compact", append_after_local_window)
+
+    try:
+        events = await _run(runner, session_key)
+        assert not any(isinstance(event, ErrorEvent) for event in events)
+        assert len(captured) == 1
+        inp = captured[0]
+        # The temporary projection and original snapshot have equal length,
+        # but their contents cover different rows.
+        loaded = inp.agent.history_snapshot()[:8]
+        assert len(loaded) == len(original)
+        assert loaded[0].content == original[6 if request_local_history else 0].content
+        if request_local_history:
+            assert inp.compaction_source_entries == ()
+            assert inp.compaction_source_preimage == ()
+        else:
+            assert inp.compaction_source_entries == tuple(original)
+
+        before_persist = await manager.get_transcript(session_key)
+        installed = await manager.persist_compaction_result(
+            session_key, "Earlier synthetic work complete.",
+            [{"role": item.role, "content": item.content} for item in loaded[2:]],
+            removed_count=2,
+            source_entries=inp.compaction_source_entries,
+            source_preimage=inp.compaction_source_preimage,
+            source_context_fingerprint=inp.compaction_source_context_fingerprint,
+        )
+        assert installed is not request_local_history
+        assert await manager.get_transcript(session_key) == (
+            before_persist if request_local_history else before_persist[2:]
+        )
+        assert await manager.get_canonical_transcript(session_key) == before_persist
+    finally:
+        await storage.close()
 
 
 @pytest.mark.asyncio

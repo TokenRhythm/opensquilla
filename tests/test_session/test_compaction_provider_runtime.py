@@ -831,22 +831,12 @@ async def test_fallback_replans_summary_input_for_its_own_smaller_window() -> No
         )
     )
 
-    assert result.summary_source == "llm"
+    assert result.removed_count == 0
+    assert result.kept_entries == _entries(30)
+    assert result.skip_reason == "summary_failed"
     assert len(primary.calls) == 1
-    assert len(fallback.calls) == 1
-    primary_content = primary.calls[0][0][0].content
-    fallback_content = fallback.calls[0][0][0].content
-    assert isinstance(primary_content, str)
-    assert isinstance(fallback_content, str)
-    assert len(fallback_content) < len(primary_content)
-    assert primary.calls[0][1] is None
-    assert fallback.calls[0][1] is None
-    assert primary.calls[0][2] is not None
-    assert fallback.calls[0][2] is not None
-    assert primary.calls[0][2].max_tokens == 768
-    assert fallback.calls[0][2].max_tokens == 128
-    assert primary.calls[0][2].candidate_output_mode == "inert_artifact"
-    assert fallback.calls[0][2].candidate_output_mode == "inert_artifact"
+    # The fallback cannot summarize this frozen range without dropping input.
+    assert fallback.calls == []
 
 
 def test_new_operation_rearms_deadline_and_call_budget() -> None:

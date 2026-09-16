@@ -23,8 +23,11 @@ from opensquilla.session.attachment_manifest import (
     manifest_context_state,
 )
 from opensquilla.session.compaction import CompactionConfig, CompactionResult
+from opensquilla.session.compaction_lifecycle import ConsumerAdmissionStaleError
+from opensquilla.session.compaction_state import StructuredCompactionSummary
 from opensquilla.session.context_view import (
     build_compaction_context_records,
+    compaction_replay_is_complete,
     format_compaction_summary_context,
 )
 from opensquilla.session.manager import SessionManager
@@ -49,6 +52,7 @@ from opensquilla.turn_outcome_projection import (
     build_fork_terminal_outcome_projection,
     extract_fork_terminal_outcome_projection,
 )
+from tests.helpers.compaction import synthetic_compaction_config
 
 
 @pytest_asyncio.fixture
@@ -2678,6 +2682,7 @@ async def test_legacy_summary_database_compacts_and_replays_after_restart(tmp_pa
         node.session_key,
         context_window_tokens=1000,
         compaction_id="cmp-legacy-upgrade-replacement",
+        config=synthetic_compaction_config(),
     )
     assert result.removed_count > 0
     assert result.summary_payload is not None
@@ -2973,7 +2978,9 @@ async def test_compact_reduces_transcript(manager):
     # Add many large messages
     for i in range(20):
         await manager.append_message("agent:main:main", "user", "x" * 500, token_count=200)
-    summary = await manager.compact("agent:main:main", context_window_tokens=1000)
+    summary = await manager.compact(
+        "agent:main:main", context_window_tokens=1000, config=synthetic_compaction_config(),
+    )
     assert summary != ""
     node = await manager._storage.get_session("agent:main:main")
     assert node.compaction_count == 1
@@ -2996,10 +3003,12 @@ async def test_compact_with_result_returns_source_and_persists(manager):
         )
     original_contents = [entry.content for entry in await manager.get_transcript("agent:main:main")]
 
-    result = await manager.compact_with_result("agent:main:main", context_window_tokens=1000)
+    result = await manager.compact_with_result(
+        "agent:main:main", context_window_tokens=1000, config=synthetic_compaction_config(),
+    )
 
     assert result.summary
-    assert result.summary_source == "fallback"
+    assert result.summary_source == "llm"
     node = await manager._storage.get_session("agent:main:main")
     assert node.compaction_count == 1
     transcript = await manager.get_transcript("agent:main:main")
@@ -3184,7 +3193,7 @@ async def test_compact_with_result_singleflight_shares_generation_and_commit(
         "_acquire_compaction_singleflight",
         track_acquire,
     )
-    shared_config = CompactionConfig()
+    shared_config = synthetic_compaction_config()
 
     owner = asyncio.create_task(
         manager.compact_with_result(
@@ -3258,11 +3267,15 @@ async def test_compact_with_result_singleflight_waiter_cancel_does_not_cancel_ow
     )
 
     owner = asyncio.create_task(
-        manager.compact_with_result("agent:main:main", context_window_tokens=1000)
+        manager.compact_with_result(
+            "agent:main:main", context_window_tokens=1000, config=synthetic_compaction_config(),
+        )
     )
     await asyncio.wait_for(generation_started.wait(), timeout=1)
     waiter = asyncio.create_task(
-        manager.compact_with_result("agent:main:main", context_window_tokens=1000)
+        manager.compact_with_result(
+            "agent:main:main", context_window_tokens=1000, config=synthetic_compaction_config(),
+        )
     )
     await asyncio.wait_for(waiter_joined.wait(), timeout=1)
 
@@ -3312,6 +3325,7 @@ async def test_compact_with_result_skips_rewrite_when_transcript_changes(manager
         "agent:main:main",
         context_window_tokens=1000,
         mutation_context=mutation_context,
+        config=synthetic_compaction_config(),
     )
 
     assert result.summary == ""
@@ -3369,6 +3383,7 @@ async def test_compact_with_result_rejects_owner_rotated_at_exact_boundaries(
             mutation_context=mutation_context,
             expected_session_id=admitted.session_id,
             expected_session_epoch=int(admitted.epoch or 0),
+            config=synthetic_compaction_config(),
         )
 
     assert replacement is not None
@@ -3396,6 +3411,7 @@ async def test_compact_with_result_marks_unsafe_receipt_as_degraded_forensic(man
         "agent:main:main",
         context_window_tokens=1000,
         flush_receipt_status="unsafe",
+        config=synthetic_compaction_config(),
     )
 
     assert result.removed_count > 0
@@ -3422,6 +3438,7 @@ async def test_degraded_compaction_preimage_can_be_listed_for_repair(manager):
         "agent:main:main",
         context_window_tokens=1000,
         flush_receipt_status="degraded_forensic",
+        config=synthetic_compaction_config(),
     )
 
     pending = await manager.list_degraded_compactions(agent_id="main")
@@ -3450,6 +3467,7 @@ async def test_compaction_flush_status_can_be_backfilled_by_compaction_id(manage
         context_window_tokens=1000,
         compaction_id="cmp-bg-flush",
         flush_receipt_status="degraded_forensic",
+        config=synthetic_compaction_config(),
     )
 
     updated = await manager.mark_compaction_flush_receipt_status(
@@ -3479,6 +3497,7 @@ async def test_noop_memory_flush_compaction_status_does_not_enter_repair_queue(m
         "agent:main:main",
         context_window_tokens=1000,
         flush_receipt_status="noop_no_memory",
+        config=synthetic_compaction_config(),
     )
 
     assert result.removed_count > 0
@@ -3502,6 +3521,7 @@ async def test_archive_only_memory_flush_compaction_status_does_not_enter_repair
         "agent:main:main",
         context_window_tokens=1000,
         flush_receipt_status="archive_only",
+        config=synthetic_compaction_config(),
     )
 
     assert result.removed_count > 0
@@ -3564,7 +3584,7 @@ async def test_compact_with_result_summarizes_completed_tool_round(manager):
     result = await manager.compact_with_result(
         "agent:main:main",
         context_window_tokens=1_200,
-        config=CompactionConfig(safety_margin=1.2),
+        config=synthetic_compaction_config(safety_margin=1.2),
     )
 
     assert result.removed_count > 0
@@ -3620,7 +3640,7 @@ async def test_compact_with_result_strict_coverage_installs_verified_backfill(ma
     result = await manager.compact_with_result(
         "agent:main:main",
         context_window_tokens=300,
-        config=CompactionConfig(safety_margin=1.0, coverage_blocking=True),
+        config=synthetic_compaction_config(safety_margin=1.0, coverage_blocking=True),
     )
 
     assert result.removed_count > 0
@@ -3661,7 +3681,7 @@ async def test_compact_with_result_writes_portable_context_state(manager):
     result = await manager.compact_with_result(
         "agent:main:main",
         context_window_tokens=300,
-        config=CompactionConfig(safety_margin=1.0),
+        config=synthetic_compaction_config(safety_margin=1.0),
     )
 
     states = await manager.get_context_states("agent:main:main")
@@ -3725,7 +3745,7 @@ async def test_compact_with_result_preserves_tool_metadata_for_boundary_cut(mana
     result = await manager.compact_with_result(
         "agent:main:main",
         context_window_tokens=500,
-        config=CompactionConfig(safety_margin=1.0),
+        config=synthetic_compaction_config(safety_margin=1.0),
     )
 
     assert result.removed_count == 2
@@ -3764,7 +3784,7 @@ async def test_compact_counts_tool_calls_when_token_count_is_underreported(manag
     result = await manager.compact_with_result(
         "agent:main:main",
         context_window_tokens=300,
-        config=CompactionConfig(
+        config=synthetic_compaction_config(
             safety_margin=1.0,
             # This test isolates the wire-token estimator. Default production
             # policy correctly retains the unresolved tool call as raw state.
@@ -3831,7 +3851,9 @@ async def test_compact_rewrite_failure_keeps_session_state_atomic(
     _fail_next_summary_insert(monkeypatch, manager._storage)
 
     with pytest.raises(RuntimeError, match="rewrite insert failed"):
-        await manager.compact("agent:main:main", context_window_tokens=1000)
+        await manager.compact(
+            "agent:main:main", context_window_tokens=1000, config=synthetic_compaction_config(),
+        )
 
     assert await manager.get_transcript("agent:main:main") == original_transcript
     assert (
@@ -5362,3 +5384,257 @@ async def test_suffix_manual_compaction_preserves_sqlite_source_until_valid_summ
         assert len(summaries) == 1
         replay = format_compaction_summary_context([summaries[0].summary_text])
         assert "historical exchanges are complete" in replay
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("invalid", ["missing_fact", "oversized", "malformed", "empty", "header"])
+async def test_precomputed_compaction_revalidates_claimed_pass_without_removing_rows(
+    manager, invalid,
+):
+    node = await manager.create("agent:main:untrusted-candidate")
+    content = (
+        "Preserve src/required_checkpoint.py." if invalid == "missing_fact" else "Earlier work."
+    )
+    await manager.append_message(node.session_key, "user", content)
+    await manager.append_message(node.session_key, "assistant", "Acknowledged.")
+    await manager.append_message(node.session_key, "user", "Continue current work.")
+    before = await manager.get_transcript(node.session_key)
+    source = await manager.capture_compaction_source(node.session_key)
+    payload = StructuredCompactionSummary(
+        current_status="x" * 16_553 if invalid == "oversized" else "Earlier work complete.",
+        source_coverage={"status": "pass", "checked_obligations": 0},
+    ).model_dump(mode="json")
+    if invalid == "malformed":
+        payload["files_and_artifacts"] = "invalid-list"
+    if invalid == "header":
+        payload["current_status"] = ""
+
+    installed = await manager.persist_compaction_result(
+        node.session_key,
+        " " if invalid == "empty" else "Claimed complete summary.",
+        [{"role": "user", "content": "Continue current work."}],
+        summary_payload=payload, summary_format="structured_v1", coverage_status="pass",
+        removed_count=2, source_entries=source.entries, source_preimage=source.preimage,
+        source_context_fingerprint=source.context_fingerprint,
+    )
+
+    assert installed is False
+    assert await manager.get_transcript(node.session_key) == before
+    assert await manager.get_canonical_transcript(node.session_key) == before
+    assert await manager.get_summaries(node.session_key) == []
+    assert await manager.get_context_states(node.session_key) == []
+    assert (await manager.get_session(node.session_key)).compaction_count == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "change", ["none", "missing_proof", "before_persist", "at_commit", "lost_fact"],
+)
+async def test_precomputed_summary_replacement_checks_source_context_and_commit_cas(
+    manager, monkeypatch, change,
+):
+    node = await manager.create("agent:main:replace-checkpoint")
+    prior = "Earlier work touched src/required_checkpoint.py."
+    old_summary = await manager._storage.save_summary(SessionSummary(
+        session_id=node.session_id, session_key=node.session_key,
+        summary_text=prior, covered_through_id=0,
+    ))
+    await manager.append_message(node.session_key, "user", "Earlier exchange.")
+    await manager.append_message(node.session_key, "assistant", "Acknowledged.")
+    await manager.append_message(node.session_key, "user", "Continue current work.")
+    source = await manager.capture_compaction_source(node.session_key)
+    before = await manager.get_transcript(node.session_key)
+    payload = StructuredCompactionSummary(
+        current_status="Earlier work complete." if change == "lost_fact" else prior,
+        source_coverage={"status": "pass", "replaces_prior_context": True},
+    ).model_dump(mode="json")
+
+    async def change_context():
+        await manager._storage.save_summary(SessionSummary(
+            session_id=node.session_id, session_key=node.session_key,
+            summary_text="Concurrent checkpoint.", covered_through_id=0,
+        ))
+
+    if change == "before_persist":
+        await change_context()
+    if change == "at_commit":
+        rewrite = manager._storage.rewrite_compacted_session
+
+        async def concurrent_rewrite(**kwargs):
+            await change_context()
+            return await rewrite(**kwargs)
+
+        monkeypatch.setattr(manager._storage, "rewrite_compacted_session", concurrent_rewrite)
+
+    installed = await manager.persist_compaction_result(
+        node.session_key, payload["current_status"],
+        [{"role": "user", "content": "Continue current work."}],
+        summary_payload=payload, summary_format="structured_v1", coverage_status="pass",
+        removed_count=2, source_entries=source.entries, source_preimage=source.preimage,
+        source_context_fingerprint=(
+            None if change == "missing_proof" else source.context_fingerprint
+        ),
+    )
+
+    assert installed is (change == "none")
+    summaries = await manager.get_summaries(node.session_key)
+    assert summaries[0].id == old_summary.id
+    assert summaries[0].summary_text == prior
+    assert await manager.get_canonical_transcript(node.session_key) == before
+    if installed:
+        assert await manager.get_transcript(node.session_key) == before[2:]
+        assert len(summaries) == 2
+        assert summaries[-1].coverage_status == "pass"
+        assert summaries[-1].summary_payload["source_coverage"]["checked_obligations"] > 0
+        assert "src/required_checkpoint.py" in summaries[-1].summary_text
+    else:
+        assert await manager.get_transcript(node.session_key) == before
+        assert len(summaries) == (2 if change in {"before_persist", "at_commit"} else 1)
+        assert await manager.get_context_states(node.session_key) == []
+        assert (await manager.get_session(node.session_key)).compaction_count == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("exceeds_total_replay_budget", [False, True])
+async def test_precomputed_append_validates_all_final_checkpoints(
+    manager, exceeds_total_replay_budget,
+):
+    node = await manager.create("agent:main:checkpoint-append-budget")
+    repeats = 650 if exceeds_total_replay_budget else 20
+    old_summary = await manager._storage.save_summary(SessionSummary(
+        session_id=node.session_id, session_key=node.session_key,
+        summary_text="old checkpoint " * repeats,
+    ))
+    await manager.append_message(node.session_key, "user", "Earlier task.")
+    await manager.append_message(node.session_key, "assistant", "Earlier answer.")
+    await manager.append_message(node.session_key, "user", "Current task.")
+    original = await manager.get_transcript(node.session_key)
+    source = await manager.capture_compaction_source(node.session_key)
+    candidate = StructuredCompactionSummary(
+        current_status="new checkpoint " * 600,
+        source_coverage={"status": "pass", "replaces_prior_context": False},
+    )
+    installed = await manager.persist_compaction_result(
+        node.session_key, candidate.current_status,
+        [{"role": "user", "content": "Current task."}],
+        summary_payload=candidate.model_dump(mode="json"), summary_format="structured_v1",
+        coverage_status="pass", removed_count=2, source_entries=source.entries,
+        source_preimage=source.preimage, source_context_fingerprint=source.context_fingerprint,
+    )
+
+    assert installed is not exceeds_total_replay_budget
+    summaries = await manager.get_summaries(node.session_key)
+    assert summaries[0] == old_summary
+    records = build_compaction_context_records(
+        context_states=await manager.get_context_states(node.session_key), summaries=summaries,
+    )
+    texts = [record.text for record in records]
+    assert compaction_replay_is_complete(texts, format_compaction_summary_context(texts))
+    assert len(summaries) == (1 if exceeds_total_replay_budget else 2)
+    assert await manager.get_transcript(node.session_key) == (
+        original if exceeds_total_replay_budget else original[2:]
+    )
+    assert await manager.get_canonical_transcript(node.session_key) == original
+    assert (await manager.get_session(node.session_key)).compaction_count == int(installed)
+
+
+@pytest.mark.asyncio
+async def test_precomputed_summary_only_replacement_preserves_coverage_boundary(manager):
+    node = await manager.create("agent:main:summary-only-replacement")
+    await manager.append_message(node.session_key, "user", "Earlier work.")
+    await manager.append_message(node.session_key, "assistant", "Acknowledged.")
+    await manager.append_message(node.session_key, "user", "Current request.")
+    original = await manager.get_transcript(node.session_key)
+    source = await manager.capture_compaction_source(node.session_key)
+    assert await manager.persist_compaction_result(
+        node.session_key, "Earlier work complete.",
+        [{"role": "user", "content": "Current request."}],
+        removed_count=2, source_entries=source.entries, source_preimage=source.preimage,
+        source_context_fingerprint=source.context_fingerprint,
+    )
+    prior_boundary = (await manager.get_summaries(node.session_key))[-1].covered_through_id
+    assert prior_boundary > 0
+
+    source = await manager.capture_compaction_source(node.session_key)
+    replacement = StructuredCompactionSummary(
+        current_status="Earlier work complete; continue the current request.",
+        source_coverage={"replaces_prior_context": True},
+    )
+    assert await manager.persist_compaction_result(
+        node.session_key, replacement.current_status,
+        [{"role": "user", "content": "Current request."}],
+        summary_format="structured_v1", summary_payload=replacement.model_dump(mode="json"),
+        removed_count=0, source_entries=source.entries, source_preimage=source.preimage,
+        source_context_fingerprint=source.context_fingerprint,
+    )
+
+    summaries = await manager.get_summaries(node.session_key)
+    assert summaries[-1].covered_through_id == prior_boundary
+    records = build_compaction_context_records(
+        summaries=summaries, context_states=await manager.get_context_states(node.session_key),
+    )
+    assert len(records) == 1
+    assert replacement.current_status in records[0].text
+    assert await manager.get_transcript(node.session_key) == original[2:]
+    assert await manager.get_canonical_transcript(node.session_key) == original
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("invalid", "expected_reason"),
+    [
+        ("empty", "empty_summary"),
+        ("missing_fact", "coverage_blocked"),
+        ("oversized", "summary_replay_incomplete"),
+        ("boundary", "invalid_source_boundary"),
+        ("overrun", "invalid_source_boundary"),
+        ("tail", "invalid_source_boundary"),
+        ("consumer_reject", "consumer_admission_failed"),
+        ("consumer_stale", "consumer_admission_stale"),
+    ],
+)
+async def test_manager_final_candidate_gate_preserves_original_context(
+    manager, monkeypatch, invalid, expected_reason,
+):
+    node = await manager.create("agent:main:final-candidate")
+    content = (
+        "Preserve src/required_checkpoint.py." if invalid == "missing_fact" else "Earlier work."
+    )
+    await manager.append_message(node.session_key, "user", content)
+    await manager.append_message(node.session_key, "assistant", "Acknowledged.")
+    await manager.append_message(node.session_key, "user", "Current request.")
+    before = await manager.get_transcript(node.session_key)
+
+    async def candidate(request):
+        removed = 4 if invalid == "overrun" else 2
+        summary = (
+            "" if invalid == "empty"
+            else "x" * 16_553 if invalid == "oversized"
+            else "Earlier work complete."
+        )
+        return CompactionResult(
+            summary=summary,
+            kept_entries=[] if invalid == "tail" else request.entries[removed:],
+            removed_count=removed, kept_start_index=1 if invalid == "boundary" else removed,
+            chunks_processed=1, summary_source="llm", coverage_status="pass",
+        )
+
+    def admission(*_):
+        if invalid == "consumer_stale":
+            raise ConsumerAdmissionStaleError("consumer changed")
+        return False
+
+    monkeypatch.setattr(session_manager_module, "compact_context", candidate)
+    result = await manager.compact_with_result(
+        node.session_key, context_window_tokens=100_000,
+        consumer_admission=admission if invalid.startswith("consumer_") else None,
+    )
+
+    assert result.skip_reason == expected_reason
+    assert result.summary == ""
+    assert result.removed_count == result.kept_start_index == 0
+    assert result.replaced_previous_summary is False
+    assert await manager.get_transcript(node.session_key) == before
+    assert await manager.get_summaries(node.session_key) == []
+    assert await manager.get_context_states(node.session_key) == []
+    assert (await manager.get_session(node.session_key)).compaction_count == 0

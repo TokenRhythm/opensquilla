@@ -1079,8 +1079,27 @@ def test_privacy_docs_describe_network_observability_controls() -> None:
         assert "OPENSQUILLA_UPDATE_CHECK_DISABLED=true" in text, path
 
     privacy = docs["PRIVACY.md"]
-    assert "The automatic installation upload at `/v1/install`" in privacy
-    assert "are retired" in privacy
+    normalized_privacy = " ".join(privacy.split())
+    assert "V1 statistics run alongside V2." in privacy
+    assert (
+        "sends `install` on first use and `version_seen` once per new version to `/v1/install`"
+    ) in normalized_privacy
+    assert (
+        "conversation turns, input tokens, output tokens, cached tokens, and cache-write tokens"
+    ) in normalized_privacy
+    assert (
+        "uploads pending completed days to `/v1/usage` at startup and retries hourly"
+    ) in normalized_privacy
+    assert "The current UTC day is excluded until it ends." in normalized_privacy
+    assert "`X-OpenSquilla-Install-Id` provider header remains retired" in normalized_privacy
+    assert (
+        "`OPENSQUILLA_TELEMETRY_DISABLED=true` remains a hard veto for V1 and V2 telemetry"
+    ) in normalized_privacy
+    assert (
+        "`OPENSQUILLA_UPDATE_CHECK_DISABLED=true` disables update checks and, "
+        "for compatibility with V1, installation and daily usage uploads; "
+        "it does not disable V2 telemetry"
+    ) in normalized_privacy
     assert "passive update checks" in privacy
     assert "automatic desktop update checks at startup" in privacy
     assert "during long-running app sessions" in privacy

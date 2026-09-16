@@ -427,7 +427,6 @@ async def test_t3_within_budget_skips_flush_and_compact() -> None:
 async def test_t3_budget_check_counts_full_tool_call_replay(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import opensquilla.session.compaction as compaction_module
 
     monkeypatch.setattr(
         compaction_module,
@@ -532,7 +531,7 @@ async def test_t3_stale_preimage_skip_does_not_mark_compacted(
     assert result == "handled"
     assert sm.compact_calls == [(session_key, 100_000)]
     assert runner.has_compacted_this_turn(session_key) is False
-    skipped = [payload for _, payload in events if payload.get("status") == "skipped"]
+    skipped = [payload for _, payload in events if payload.get("status") == "stale"]
     assert skipped[-1]["reason"] == "stale_preimage"
     assert skipped[-1]["applied"] is False
     assert skipped[-1]["durability"] == "none"
@@ -864,7 +863,7 @@ async def test_t3_compact_failure_uses_emergency_ephemeral_history_trim(
     assert len(await sm.get_transcript(session_key)) == len(transcript)
     assert len(agent.history) < len(transcript)
     assert summary_context is not None
-    assert "emergency request-scoped compaction" in summary_context.lower()
+    assert "temporary history window" in summary_context.lower()
     statuses = [payload["status"] for _, payload in events]
     assert statuses[:2] == ["started", "emergency_ephemeral"]
     assert "failed" not in statuses
@@ -900,14 +899,16 @@ async def test_t3_open_circuit_still_uses_request_scoped_emergency_trim(
         count=3,
         opened_at=runtime_module.time.monotonic(),
     )
-    emergency_requests: list[Any] = []
-    original_compact_context = compaction_module.compact_context
+    from opensquilla.engine import request_window
 
-    async def capture_emergency_request(request: Any) -> Any:
-        emergency_requests.append(request)
-        return await original_compact_context(request)
+    selected_windows: list[int] = []
+    original_cuts = request_window.iter_window_prefix_cuts
 
-    monkeypatch.setattr(compaction_module, "compact_context", capture_emergency_request)
+    def observe_cuts(roles, **kwargs):
+        selected_windows.append(kwargs["protected_start"])
+        return original_cuts(roles, **kwargs)
+
+    monkeypatch.setattr(request_window, "iter_window_prefix_cuts", observe_cuts)
 
     result = await runner._maybe_compact_on_t3_upgrade(
         session_key,
@@ -924,6 +925,7 @@ async def test_t3_open_circuit_still_uses_request_scoped_emergency_trim(
     assert emergency["reason"] == "durable_compaction_circuit_open"
     assert emergency["durability"] == "request_scoped"
     assert runner._compaction_failures[session_key].count == 3
-    assert len(emergency_requests) == 1
-    assert emergency_requests[0].context_window_tokens == 1_500
-    assert emergency_requests[0].context_window_chars == 5_000
+    assert selected_windows == [len(transcript) - 2]
+    override = runner._emergency_compaction_overrides[session_key]
+    assert override.history_window_tokens == 1_500
+    assert override.history_capacity_chars == 5_000

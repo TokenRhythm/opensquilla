@@ -4,7 +4,10 @@ import type {
   ChatToolCallRenderItem,
 } from '@/types/chat'
 import type { ChatPart, StatusPart } from '@/types/parts'
-import { compactionSkippedLabelCode } from '@/utils/chat/compactionStatus'
+import {
+  compactionCompletedLabelCode,
+  compactionSkippedLabelCode,
+} from '@/utils/chat/compactionStatus'
 
 type TextPart = Extract<ChatPart, { type: 'text' }>
 
@@ -120,6 +123,8 @@ export type AssistantActivityStatusCode =
   | 'chat.activity.provider.fallback'
   | 'chat.compact.compacting'
   | 'chat.compact.compacted'
+  | 'chat.compact.summarySaved'
+  | 'chat.compact.temporarilyReduced'
   | 'chat.compact.withinBudget'
   | 'chat.compact.skipped'
   | 'chat.compact.cancelled'
@@ -854,7 +859,7 @@ function statusLabelFor(
       return codeDescriptor('chat.compact.cancelled')
     }
     if (entry.state === 'running') return codeDescriptor('chat.compact.compacting')
-    return codeDescriptor('chat.compact.compacted')
+    return codeDescriptor(compactionCompletedLabelCode(entry.durability))
   }
   const action = String(entry.action || '').trim()
   const normalized = action.toLowerCase()
@@ -999,10 +1004,9 @@ function isAutomaticCompletedMaintenance(step: AssistantActivityStatusStep): boo
 }
 
 /**
- * One automatic compaction may be observed through both a transient request
- * lifecycle and the durable history rewrite. When the backend uses different
- * ids for those adjacent terminal observations, present them as one maintenance
- * result. A failure or any intervening phase is a hard boundary.
+ * Adjacent automatic completions with the same durability can share one row.
+ * Temporary request reductions and saved summaries remain distinct outcomes.
+ * A failure or any intervening phase is a hard boundary.
  */
 function mergeAdjacentAutomaticCompletedMaintenance(
   steps: AssistantActivityStatusStep[],
@@ -1015,17 +1019,8 @@ function mergeAdjacentAutomaticCompletedMaintenance(
       && isAutomaticCompletedMaintenance(previous)
       && isAutomaticCompletedMaintenance(step)
       && previous.id !== step.id
+      && previous.label.code === step.label.code
     ) {
-      const preferred = step.durability === 'durable' && previous.durability !== 'durable'
-        ? step
-        : previous
-      merged[merged.length - 1] = {
-        ...preferred,
-        // Preserve the first visual position and keyed DOM row while allowing
-        // durable metadata (including its id) to become authoritative.
-        key: previous.key,
-        at: previous.at,
-      }
       continue
     }
     merged.push(step)

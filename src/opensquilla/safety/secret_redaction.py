@@ -75,7 +75,9 @@ def _is_secret_assignment_key(key: str) -> bool:
     lowered = key.lower()
     if lowered == "authorization":
         return False
-    return is_secret_key(lowered) or lowered.endswith(("token", ".token", "_token", "-token"))
+    return is_secret_key(lowered) or lowered.endswith(
+        ("token", ".token", "_token", "-token")
+    )
 
 
 def _redact_assignment(match: re.Match[str]) -> str:
@@ -85,25 +87,72 @@ def _redact_assignment(match: re.Match[str]) -> str:
     return f"{key}{separator}{_REDACTED}"
 
 
-def redact_secret_text(text: str) -> str:
+def redact_secret_text(
+    text: str,
+    *,
+    code_file: bool = False,
+    secret_file: bool = False,
+) -> str:
+    """Redact secrets while preserving ordinary source-code assignments.
+
+    ``code_file`` skips generic assignment matching, which otherwise corrupts
+    source variables and fixtures. ``secret_file`` is authoritative and
+    re-enables assignment matching for credential-bearing files such as
+    ``.env`` and shell profiles. Known provider-key prefixes and authorization
+    headers are always redacted.
+    """
+    code_file = code_file and not secret_file
     redacted = text
     redacted = _AUTH_HEADER_RE.sub(_redact_auth_header, redacted)
-    redacted = _SECRET_ASSIGNMENT_RE.sub(_redact_assignment, redacted)
-    redacted = _SECRET_QUOTED_ASSIGNMENT_RE.sub(_redact_assignment, redacted)
+    if not code_file:
+        redacted = _SECRET_ASSIGNMENT_RE.sub(_redact_assignment, redacted)
+        redacted = _SECRET_QUOTED_ASSIGNMENT_RE.sub(_redact_assignment, redacted)
     for pattern in _SECRET_TOKEN_PATTERNS:
         redacted = pattern.sub(_REDACTED, redacted)
     return redacted
 
 
-def redact_secret_value(value: Any, *, key: str | None = None) -> Any:
+def redact_secret_value(
+    value: Any,
+    *,
+    key: str | None = None,
+    code_file: bool = False,
+    secret_file: bool = False,
+) -> Any:
     if key and is_secret_key(key):
         return _REDACTED
     if isinstance(value, str):
-        return redact_secret_text(value)
+        return redact_secret_text(
+            value,
+            code_file=code_file,
+            secret_file=secret_file,
+        )
     if isinstance(value, dict):
-        return {str(k): redact_secret_value(v, key=str(k)) for k, v in value.items()}
+        return {
+            str(k): redact_secret_value(
+                v,
+                key=str(k),
+                code_file=code_file,
+                secret_file=secret_file,
+            )
+            for k, v in value.items()
+        }
     if isinstance(value, list):
-        return [redact_secret_value(item) for item in value]
+        return [
+            redact_secret_value(
+                item,
+                code_file=code_file,
+                secret_file=secret_file,
+            )
+            for item in value
+        ]
     if isinstance(value, tuple):
-        return tuple(redact_secret_value(item) for item in value)
+        return tuple(
+            redact_secret_value(
+                item,
+                code_file=code_file,
+                secret_file=secret_file,
+            )
+            for item in value
+        )
     return value
