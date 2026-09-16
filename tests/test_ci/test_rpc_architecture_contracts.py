@@ -123,9 +123,10 @@ SESSIONS_LIST_GATEWAY_ADAPTER = PACKAGE_ROOT / "gateway" / "adapters" / "session
 # The retired 20-method RPC surface is absent; exact inventory remains pinned
 # so this does not authorize unrelated wire growth.
 # Primary-provider transitions add resetRecommended and upsertAndActivate.
-RUNTIME_RPC_METHOD_BASELINE = 296
-RUNTIME_RPC_METHOD_DIGEST = "094f1e13c86c667dda71cb240c47e32a0d8f8db710e0ac913c926443d3de641a"
-STATIC_RPC_DECORATOR_BASELINE = 77
+# Retire the five legacy memory raw-fallback and repair methods.
+RUNTIME_RPC_METHOD_BASELINE = 291
+RUNTIME_RPC_METHOD_DIGEST = "af6b515f5959431237e706b83d403f6ef379709d5abb90315336d88131268097"
+STATIC_RPC_DECORATOR_BASELINE = 72
 
 # Physical lines in the sessions/runtime slice remain tracked for the final
 # closure measurement below.  The temporary S2a cumulative growth budget was
