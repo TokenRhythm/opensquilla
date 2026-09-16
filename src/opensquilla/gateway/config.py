@@ -10,7 +10,7 @@ import threading
 import warnings
 from enum import StrEnum
 from pathlib import Path
-from typing import Any, Literal, cast
+from typing import Annotated, Any, Literal, cast
 
 from pydantic import (
     AliasChoices,
@@ -2473,6 +2473,9 @@ class GoalConfig(BaseSettings):
     runtime_budget_seconds: int = Field(default=3_600, ge=60, le=86_400)
 
 
+GatewayPort = Annotated[int, Field(ge=0, le=65535)]
+
+
 class GatewayConfig(BaseSettings):
     model_config = SettingsConfigDict(
         env_prefix="OPENSQUILLA_GATEWAY_",
@@ -2488,7 +2491,7 @@ class GatewayConfig(BaseSettings):
     # precedence order (explicit kwarg/flag > OPENSQUILLA_LISTEN > OPENSQUILLA_GATEWAY_HOST
     # > default) is testable without the pydantic-settings env cache.
     host: str = "127.0.0.1"
-    port: int = 18791
+    port: GatewayPort = 18791
     # Resolved from installed distribution metadata (opensquilla.__version__),
     # not operator config. UI/RPC surfaces read __version__ directly, so any
     # stale value persisted in config.toml has no display effect.
