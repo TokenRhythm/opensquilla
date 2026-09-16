@@ -3930,6 +3930,8 @@ async def test_goal_settlement_storage_failure_compensates_fail_closed(
 async def test_goal_event_observer_failure_never_changes_durable_tool_result(
     tmp_path: Path,
 ) -> None:
+    from structlog.testing import capture_logs
+
     service: GoalService | None = None
 
     async def handler(run: TaskRun) -> None:
@@ -3960,19 +3962,24 @@ async def test_goal_event_observer_failure_never_changes_durable_tool_result(
             raise OSError("synthetic event observer failure")
 
         stack.service._event_emitter = fail_emit
-        created = await _handle_goals_set(_set_params(), stack.context)
-        # The synthetic observer raises on every lifecycle projection. Under a
-        # loaded suite, rendering those expected warning tracebacks can take
-        # longer than the normal in-memory task path without changing the
-        # durability contract under test.
-        task = await stack.runtime.wait(created["taskId"], timeout=5.0)
-        complete = await _wait_for_goal(
-            stack.storage,
-            lambda goal: goal.status == "complete" and goal.active_task_id is None,
-        )
+        # Capture expected observer failures without rendering their tracebacks
+        # on the event loop while the bounded durability check is running.
+        with capture_logs() as logs:
+            created = await _handle_goals_set(_set_params(), stack.context)
+            task = await stack.runtime.wait(created["taskId"], timeout=5.0)
+            complete = await _wait_for_goal(
+                stack.storage,
+                lambda goal: goal.status == "complete" and goal.active_task_id is None,
+            )
         assert task.status == AgentTaskStatus.SUCCEEDED
         assert complete.progress_revision == 1
         assert complete.terminal_reason == "model_complete"
+        failures = [
+            event for event in logs if event["event"] == "goal.event_emit_failed"
+        ]
+        assert {event["event_type"] for event in failures} == {"created", "updated"}
+        assert all(event["log_level"] == "warning" for event in failures)
+        assert all(event["exc_info"] is True for event in failures)
 
 
 @pytest.mark.asyncio
