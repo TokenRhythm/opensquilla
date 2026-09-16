@@ -37,6 +37,7 @@ from opensquilla.usage_reasons import (
 
 _NANOS_PER_USD = Decimal("1000000000")
 _CANCELLED_USAGE_TERMINAL_GRACE_SECONDS = 0.25
+_PROVIDER_STREAM_CLOSE_TIMEOUT_SECONDS = 0.25
 log = structlog.get_logger(__name__)
 
 
@@ -409,6 +410,7 @@ async def account_provider_stream(
     *,
     provider: str,
     model: str,
+    close_timeout: float | None = _PROVIDER_STREAM_CLOSE_TIMEOUT_SECONDS,
 ) -> AsyncGenerator[Any, None]:
     """Account exactly one physical ``provider.chat`` invocation.
 
@@ -418,16 +420,25 @@ async def account_provider_stream(
 
     scope = current_usage_accounting_scope()
     if scope is None:
-        async for event in stream_factory():
-            yield event
+        unaccounted_stream = stream_factory()
+        try:
+            async for event in unaccounted_stream:
+                yield event
+        finally:
+            await _close_accounted_provider_stream(
+                unaccounted_stream,
+                timeout=close_timeout,
+            )
         return
 
     call = await start_usage_call(scope, provider=provider, model=model)
+    stream: AsyncIterator[Any] | None = None
     terminal = False
     cancelled = False
     unknown_reason = "provider_stream_ended_without_usage"
     try:
-        async for event in stream_factory():
+        stream = stream_factory()
+        async for event in stream:
             kind = str(getattr(event, "kind", "") or "")
             if kind == "done" and not terminal:
                 # Preserve the physical deployment for compatibility rollups
@@ -453,15 +464,49 @@ async def account_provider_stream(
         unknown_reason = "provider_exception"
         raise
     finally:
-        if not terminal:
-            if cancelled:
-                await _mark_usage_call_unknown_after_cancellation(
-                    scope,
-                    call,
-                    unknown_reason,
-                )
-            else:
-                await mark_usage_call_unknown(scope, call, unknown_reason)
+        try:
+            if not terminal:
+                if cancelled:
+                    await _mark_usage_call_unknown_after_cancellation(
+                        scope,
+                        call,
+                        unknown_reason,
+                    )
+                else:
+                    await mark_usage_call_unknown(scope, call, unknown_reason)
+        finally:
+            if stream is not None:
+                await _close_accounted_provider_stream(stream, timeout=close_timeout)
+
+
+async def _close_accounted_provider_stream(
+    stream: AsyncIterator[Any],
+    *,
+    timeout: float | None,
+) -> None:
+    """Close the physical stream when the accounting wrapper stops early."""
+
+    if timeout is not None:
+        from opensquilla.engine.repetition_guard import close_async_iterator_bounded
+
+        await close_async_iterator_bounded(
+            stream,
+            timeout=timeout,
+            event_prefix="usage_accounting.provider_stream",
+        )
+        return
+    aclose = getattr(stream, "aclose", None)
+    if not callable(aclose):
+        return
+    try:
+        await aclose()
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:  # noqa: BLE001 - cleanup must preserve provider outcome
+        log.warning(
+            "usage_accounting.provider_stream_close_failed",
+            error_type=type(exc).__name__,
+        )
 
 
 def _usage_int(value: Any) -> int:

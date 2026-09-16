@@ -126,6 +126,9 @@ describe('isHelloOkFrame', () => {
     ['a malformed optional-read list', helloOkFrame({
       policy: { concurrent_optional_read_methods: ['sessions.list', 42] },
     })],
+    ['a malformed cancellable-request list', helloOkFrame({
+      policy: { cancellable_request_methods: ['onboarding.provider.probe', 42] },
+    })],
     ['a scalar auth payload', helloOkFrame({ auth: 'owner' })],
   ])('rejects %s', (_label, frame) => {
     expect(isHelloOkFrame(frame)).toBe(false)
@@ -804,6 +807,7 @@ describe('RpcClient', () => {
     const result = callOnReadySocket(client, 'sessions.messages.snapshot', {}, { signal: controller.signal })
     const request = JSON.parse(socket.sent[socket.sent.length - 1]) as { id: string }
     const caught = result.catch((error: unknown) => error)
+    const framesBeforeAbort = socket.sent.length
     controller.abort()
 
     const error = await caught
@@ -814,8 +818,57 @@ describe('RpcClient', () => {
       method: 'sessions.messages.snapshot',
     })
     expect(pendingCount(client)).toBe(0)
+    expect(socket.sent).toHaveLength(framesBeforeAbort)
 
     socket.receive({ type: 'res', id: request.id, ok: true, payload: 'late' })
+    expect(pendingCount(client)).toBe(0)
+    client.disconnect()
+  })
+
+  it('sends a capability-gated cancellation frame before rejecting an aborted call', async () => {
+    const client = new RpcClient()
+    const controller = new AbortController()
+    client.connect('ws://rpc.test')
+    const socket = MockWebSocket.instances[0]
+    establishConnection(socket, {
+      cancellable_request_methods: ['onboarding.provider.probe'],
+    })
+
+    const result = client.call(
+      'onboarding.provider.probe',
+      { providerId: 'openai', mode: 'model' },
+      { signal: controller.signal, cancelOnAbort: true },
+    )
+    const request = JSON.parse(socket.sent[socket.sent.length - 1]) as { id: string }
+    const caught = result.catch((error: unknown) => error)
+    controller.abort()
+
+    await expect(caught).resolves.toBeInstanceOf(RpcAbortError)
+    expect(JSON.parse(socket.sent[socket.sent.length - 1])).toEqual({
+      type: 'cancel',
+      id: request.id,
+    })
+    expect(pendingCount(client)).toBe(0)
+    client.disconnect()
+  })
+
+  it('keeps cancel-on-abort local when an older Gateway does not advertise support', async () => {
+    const client = new RpcClient()
+    const controller = new AbortController()
+    client.connect('ws://rpc.test')
+    const socket = MockWebSocket.instances[0]
+    establishConnection(socket)
+
+    const result = client.call(
+      'onboarding.provider.probe',
+      { providerId: 'openai', mode: 'model' },
+      { signal: controller.signal, cancelOnAbort: true },
+    ).catch((error: unknown) => error)
+    const framesBeforeAbort = socket.sent.length
+    controller.abort()
+
+    await expect(result).resolves.toBeInstanceOf(RpcAbortError)
+    expect(socket.sent).toHaveLength(framesBeforeAbort)
     expect(pendingCount(client)).toBe(0)
     client.disconnect()
   })

@@ -19,6 +19,7 @@ from opensquilla.onboarding.probe import (
     discover_selectable_provider_models,
 )
 from opensquilla.provider.failures import ProviderFailureKind
+from opensquilla.provider.protocol import ProviderModelListingResponseError
 
 
 def _patch_response(monkeypatch: Any, response_factory) -> list[httpx.Request]:
@@ -504,6 +505,31 @@ def test_discover_classifies_connection_failure_as_transport_transient(
     result = _discover(provider_id="openai", api_key="sk-test")
     assert result.ok is False
     assert result.failure_kind == ProviderFailureKind.TRANSPORT_TRANSIENT.value
+    assert result.models == []
+
+
+def test_discover_classifies_unparseable_model_listing_as_malformed_response(
+    monkeypatch: Any,
+) -> None:
+    class _Provider:
+        async def list_models(self, *, raise_on_error: bool = False) -> list[Any]:
+            assert raise_on_error is True
+            raise ProviderModelListingResponseError(
+                "Model listing response was not valid JSON",
+                status_code=200,
+            )
+
+    monkeypatch.setattr(
+        probe_module,
+        "build_provider",
+        lambda *args, **kwargs: _Provider(),
+    )
+
+    result = _discover(provider_id="openai", api_key="sk-test")
+
+    assert result.ok is False
+    assert result.failure_kind == ProviderFailureKind.MALFORMED_RESPONSE.value
+    assert result.source == "none"
     assert result.models == []
 
 

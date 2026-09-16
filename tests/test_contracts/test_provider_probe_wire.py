@@ -21,7 +21,12 @@ import json
 from typing import Any
 
 import httpx
+import pytest
+from pydantic import ValidationError
 
+from opensquilla.contracts.generated.v4.gateway_contract_registry import (
+    GATEWAY_METHOD_CONTRACTS,
+)
 from opensquilla.gateway import rpc_onboarding
 from opensquilla.gateway.config import GatewayConfig
 from opensquilla.gateway.rpc import RpcContext
@@ -42,6 +47,8 @@ PROBE_ENVELOPE_KEYS = frozenset(
         "latencyMs",
         "firstResponseMs",
         "totalMs",
+        "verificationLevel",
+        "failureStage",
     }
 )
 
@@ -109,6 +116,8 @@ async def test_probe_envelope_keys_are_frozen_on_ok_path(tmp_path, monkeypatch: 
     assert isinstance(payload["firstResponseMs"], int)
     assert payload["firstResponseMs"] >= 0
     assert payload["totalMs"] == payload["latencyMs"]
+    assert payload["verificationLevel"] == "model_verified"
+    assert payload["failureStage"] == "model"
 
 
 async def test_probe_envelope_keys_are_frozen_on_classified_failure(
@@ -135,6 +144,8 @@ async def test_probe_envelope_keys_are_frozen_on_classified_failure(
     assert payload["latencyMs"] >= 0
     assert payload["firstResponseMs"] is None
     assert payload["totalMs"] == payload["latencyMs"]
+    assert payload["verificationLevel"] == "none"
+    assert payload["failureStage"] == "model"
 
 
 async def test_probe_latency_is_zero_when_network_never_reached(
@@ -154,9 +165,86 @@ async def test_probe_latency_is_zero_when_network_never_reached(
     assert payload["latencyMs"] == 0
     assert payload["firstResponseMs"] is None
     assert payload["totalMs"] == 0
+    assert payload["verificationLevel"] == "none"
+    assert payload["failureStage"] == "model"
+
+
+async def test_reachability_mode_is_an_additive_probe_contract(
+    tmp_path, monkeypatch: Any
+) -> None:
+    _patch_probe_response(
+        monkeypatch,
+        httpx.Response(
+            200,
+            headers={"content-type": "application/json"},
+            content=b'{"data":[{"id":"gpt-4o","object":"model"}]}',
+        ),
+    )
+
+    payload = await rpc_onboarding._provider_probe(
+        {
+            "providerId": "openai",
+            "model": "gpt-4o",
+            "apiKey": "sk-test",
+            "mode": "reachability",
+        },
+        _ctx(tmp_path),
+    )
+
+    assert set(payload) == PROBE_ENVELOPE_KEYS
+    assert payload["ok"] is True
+    assert payload["verificationLevel"] == "reachable"
+    assert payload["failureStage"] == "reachability"
+    assert payload["firstResponseMs"] is None
 
 
 def test_probe_method_is_admin_scoped() -> None:
     # Frozen on purpose: the probe accepts candidate credentials in params
     # (like onboarding.models.discover), so it must never drop below admin.
     assert METHOD_SCOPES["onboarding.provider.probe"] == ADMIN_SCOPE
+
+
+@pytest.mark.parametrize(
+    ("params", "valid"),
+    [
+        ({"providerId": "openai", "model": "gpt-4o"}, True),
+        ({"providerId": "openai", "model": ""}, True),
+        ({"providerId": "openai", "model": None}, True),
+        ({"providerId": "openai", "model": None, "mode": None}, True),
+        ({"providerId": "openai", "model": "", "mode": "model"}, True),
+        ({"providerId": "openai", "mode": "reachability"}, True),
+        ({"providerId": "openai", "model": "gpt-4o", "mode": "reachability"}, True),
+        ({"providerId": "openai"}, False),
+        ({"providerId": "openai", "mode": None}, False),
+        ({"providerId": "openai", "mode": "model"}, False),
+    ],
+)
+def test_draft_probe_contract_only_allows_reachability_to_omit_model(
+    params: dict[str, object],
+    valid: bool,
+) -> None:
+    descriptor = GATEWAY_METHOD_CONTRACTS["onboarding.llmProfile.draft.probe"]
+
+    if valid:
+        descriptor.params_model.model_validate(params)
+        descriptor.request_model.model_validate(
+            {
+                "type": "req",
+                "id": "draft-probe-contract",
+                "method": "onboarding.llmProfile.draft.probe",
+                "params": params,
+            }
+        )
+        return
+
+    with pytest.raises(ValidationError):
+        descriptor.params_model.model_validate(params)
+    with pytest.raises(ValidationError):
+        descriptor.request_model.model_validate(
+            {
+                "type": "req",
+                "id": "draft-probe-contract",
+                "method": "onboarding.llmProfile.draft.probe",
+                "params": params,
+            }
+        )
