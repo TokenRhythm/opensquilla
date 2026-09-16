@@ -417,7 +417,8 @@ support bundle.
 V1 installation/version reporting at `/v1/install` and daily conversation/token
 totals at `/v1/usage` run alongside V2 after Gateway readiness. Only completed
 UTC days are uploaded; pending days retry hourly. Existing installation state
-and daily event IDs preserve deduplication. V1 retains its pseudonymous installation
+is retained. Daily event IDs use a persistent random identity per aggregate
+database to separate profiles while keeping retries stable. V1 retains its pseudonymous installation
 ID derived locally from MAC/IP data, with a persisted random fallback; raw MAC/IP
 values are not uploaded. The `X-OpenSquilla-Install-Id` provider header remains
 retired, and V2 keeps its independent identities.

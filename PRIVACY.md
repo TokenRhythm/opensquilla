@@ -155,8 +155,15 @@ Completed top-level interactive turns contribute local UTC daily counters for
 conversation turns, input tokens, output tokens, cached tokens, and cache-write
 tokens. A background task uploads pending completed days to `/v1/usage` at startup
 and retries hourly. The current UTC day is excluded until it ends. Existing
-installation state and per-day event IDs preserve deduplication after upgrades
-and retries. Retained pending days can resume when reporting is re-enabled.
+installation state is retained. Daily event IDs use a random identity saved in
+each aggregate database, so separate profiles on one machine do not collide.
+The identity is kept across restarts, retries, and database moves; it is not
+itself uploaded. Retained pending days can resume when reporting is re-enabled.
+
+On upgrade, completed days already marked uploaded remain untouched. Pending
+legacy days use the new database-specific keys. Older versions did not record
+upload attempts, so a legacy day already accepted by the server whose
+acknowledgment was lost may be counted again during this one-time transition.
 
 V1 preserves its installation identity: a local SHA-256 digest derived from
 available MAC addresses, then local IP addresses if needed, with a persisted
