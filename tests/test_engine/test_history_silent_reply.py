@@ -331,6 +331,7 @@ def test_clear_compaction_turn_state_discards_emergency_override() -> None:
     runner = TurnRunner(provider_selector=MagicMock())
     runner.mark_compaction_attempted_this_turn(key)
     runner.mark_compacted_this_turn(key)
+    runner._turn_compaction_failed_sessions.add(key)
     runner._emergency_compaction_overrides[key] = (
         runtime_module._EmergencyCompactionOverride(
             summary="request-scoped summary",
@@ -346,6 +347,7 @@ def test_clear_compaction_turn_state_discards_emergency_override() -> None:
 
     assert not runner.has_attempted_compaction_this_turn(key)
     assert not runner.has_compacted_this_turn(key)
+    assert key not in runner._turn_compaction_failed_sessions
     assert key not in runner._emergency_compaction_overrides
 
 
