@@ -18,7 +18,16 @@
       </span>
       <span v-if="metaText && !inline" class="goal-outcome__meta">{{ metaText }}</span>
     </span>
-
+    <button
+      v-if="canRemove"
+      type="button"
+      class="goal-outcome__remove"
+      :disabled="busy"
+      @click="clearGoal"
+    >
+      <Icon name="trash" :size="14" aria-hidden="true" />
+      <span>{{ t('chat.goal.remove') }}</span>
+    </button>
   </div>
 </template>
 
@@ -26,17 +35,31 @@
 import { computed } from 'vue'
 import { useI18n } from 'vue-i18n'
 import Icon from '@/components/Icon.vue'
-import type { GoalSnapshot } from '@/composables/chat/useChatGoals'
+import { goalHasSettledTerminalOutcome, type GoalSnapshot } from '@/composables/chat/useChatGoals'
 
 const props = withDefaults(defineProps<{
   goal: GoalSnapshot
   elapsed: string
   inline?: boolean
+  removable?: boolean
+  busy?: boolean
 }>(), {
   inline: false,
+  removable: false,
+  busy: false,
 })
 
+const emit = defineEmits<{
+  clear: [goal: GoalSnapshot]
+}>()
+
 const { t } = useI18n()
+const canRemove = computed(() => props.removable && goalHasSettledTerminalOutcome(props.goal))
+
+function clearGoal() {
+  if (props.busy || !canRemove.value) return
+  emit('clear', props.goal)
+}
 
 const titleText = computed(() => {
   if (!props.inline) return t('chat.goal.completeTitle')
@@ -80,6 +103,7 @@ const metaText = computed(() => {
 }
 .goal-outcome--inline {
   display: inline-flex;
+  flex-wrap: wrap;
   width: auto;
   max-width: 100%;
   margin: 0;
@@ -130,6 +154,34 @@ const metaText = computed(() => {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+.goal-outcome__remove {
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  justify-content: center;
+  gap: var(--sp-1, 4px);
+  min-height: 28px;
+  padding: var(--sp-1, 4px) var(--sp-2, 8px);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-muted, var(--muted));
+  font: inherit;
+  white-space: nowrap;
+  cursor: pointer;
+}
+.goal-outcome__remove:hover:not(:disabled) {
+  color: var(--danger);
+  background: color-mix(in srgb, var(--danger) 10%, transparent);
+}
+.goal-outcome__remove:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+.goal-outcome__remove:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
 @media (max-width: 720px) {
   .goal-outcome {
     align-items: stretch;
@@ -137,6 +189,20 @@ const metaText = computed(() => {
   }
   .goal-outcome--inline {
     display: flex;
+    flex-direction: row;
+    align-items: center;
+  }
+  .goal-outcome__summary {
+    flex-wrap: wrap;
+  }
+  .goal-outcome__title {
+    flex-shrink: 1;
+    white-space: normal;
+  }
+  .goal-outcome__remove {
+    align-self: flex-start;
+    min-width: 44px;
+    min-height: 44px;
   }
 }
 </style>
