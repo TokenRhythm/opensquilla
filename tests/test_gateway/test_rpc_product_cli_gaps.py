@@ -23,7 +23,11 @@ from opensquilla.search.registry import register_provider
 from opensquilla.search.types import SearchProviderError, SearchProviderSpec, SearchResult
 from opensquilla.session.models import MemoryDurableReceipt
 from opensquilla.session.storage import SessionStorage
-from opensquilla.tools.builtin.web import configure_search, run_web_discover_payload
+from opensquilla.tools.builtin.web import (
+    configure_search,
+    reset_search_runtime,
+    run_web_discover_payload,
+)
 
 
 @dataclass
@@ -89,7 +93,7 @@ def _ctx(**kwargs: Any) -> RpcContext:
 def _reset_search_config():
     configure_search("duckduckgo", max_results=5)
     yield
-    configure_search("duckduckgo", max_results=5)
+    reset_search_runtime()
 
 
 @pytest.mark.asyncio

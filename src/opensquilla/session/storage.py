@@ -28,6 +28,7 @@ from functools import wraps
 from typing import TYPE_CHECKING, Any, Concatenate, cast
 
 from opensquilla.compat import aiosqlite
+from opensquilla.session.attachment_manifest import preserve_attachment_occurrence_ids
 from opensquilla.session.cost_rollup import rollup_cost_source
 from opensquilla.session.goals import (
     GOAL_EFFECTIVE_CONTEXT_DETAIL_KEY,
@@ -116,7 +117,6 @@ from opensquilla.turn_outcome_projection import (
 from opensquilla.usage_reasons import normalize_usage_unknown_reason
 
 if TYPE_CHECKING:
-    from opensquilla.artifact_session import PreparedPromptAnnotationTarget, PromptAnnotation
     from opensquilla.persistence.meta_run_writer import MetaRunWriter
     from opensquilla.project_workspaces import ProjectWorkspaceGuard
 
@@ -517,6 +517,8 @@ def _serialized_read[**P, R](
 # prompt-annotation drafts atomically consumed by chat turns. Version 24 added
 # durable idempotency receipts for artifact mutation attempts. Version 25 added
 # the persistent per-session model-routing mode and its compare-and-set revision.
+# Nullable execution workspace bindings are additive and are migrated without
+# changing the semantic session schema version used by upgrade compatibility.
 SCHEMA_VERSION = 25
 MAX_PENDING_CHAT_INPUTS = 5
 
@@ -594,6 +596,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     subject TEXT,
     origin TEXT,
     workspace_id TEXT,
+    execution_workspace TEXT,
     agent_id TEXT NOT NULL DEFAULT 'main',
     schema_version INTEGER NOT NULL DEFAULT 1,
     epoch INTEGER NOT NULL DEFAULT 0
@@ -825,6 +828,7 @@ CREATE TABLE IF NOT EXISTS transcript_entries (
     tool_calls TEXT,
     tool_call_id TEXT,
     reasoning_content TEXT,
+    assistant_replay TEXT,
     turn_usage TEXT,
     turn_context TEXT,
     created_at INTEGER NOT NULL,
@@ -863,6 +867,7 @@ CREATE TABLE IF NOT EXISTS compacted_transcript_entries (
     tool_calls TEXT,
     tool_call_id TEXT,
     reasoning_content TEXT,
+    assistant_replay TEXT,
     turn_usage TEXT,
     turn_context TEXT,
     created_at INTEGER NOT NULL,
@@ -1495,6 +1500,7 @@ def _transcript_preimage(
             entry.provenance_source_tool,
             entry.schema_version,
             _stable_json(entry.tool_calls),
+            _stable_json(entry.assistant_replay),
             _stable_json(entry.turn_usage),
             _stable_json(entry.turn_context),
         )
@@ -1602,9 +1608,11 @@ def _deserialize_row(row: dict[str, Any]) -> dict[str, Any]:
     json_fields = {
         "delivery_context",
         "tool_calls",
+        "assistant_replay",
         "turn_usage",
         "turn_context",
         "origin",
+        "execution_workspace",
         "details",
         "summary_payload",
         "missing_obligations",
@@ -1630,7 +1638,15 @@ def _deserialize_row(row: dict[str, Any]) -> dict[str, Any]:
             try:
                 result[k] = json.loads(v)
             except (json.JSONDecodeError, TypeError):
+                if k == "assistant_replay":
+                    raise ValueError("invalid assistant replay JSON") from None
+                if k == "execution_workspace":
+                    raise ValueError("invalid execution workspace JSON") from None
                 result[k] = None
+            if k == "assistant_replay" and not isinstance(result[k], dict):
+                raise ValueError("assistant replay JSON must be an object")
+            if k == "execution_workspace" and not isinstance(result[k], dict):
+                raise ValueError("execution workspace JSON must be an object")
         elif k in bool_fields:
             result[k] = bool(v)
         else:
@@ -2339,10 +2355,12 @@ class SessionStorage:
         # Migrate older databases — add the epoch column if missing.
         await self._migrate_epoch_column()
         await self._migrate_workspace_id_column()
+        await self._migrate_execution_workspace_column()
         await self._migrate_collaboration_columns()
         await self._migrate_model_routing_columns()
         await self._migrate_derived_title_column()
         await self._migrate_transcript_reasoning_content_column()
+        await self._migrate_assistant_replay_column()
         await self._migrate_transcript_turn_usage_column()
         await self._migrate_transcript_turn_context_column()
         await self._migrate_summary_metadata_columns()
@@ -2529,6 +2547,18 @@ class SessionStorage:
             )
             await self._conn.commit()
 
+    async def _migrate_execution_workspace_column(self) -> None:
+        """Add the nullable durable execution-root binding to old databases."""
+
+        assert self._conn is not None
+        async with self._conn.execute("PRAGMA table_info(sessions)") as cur:
+            columns = {str(row[1]) for row in await cur.fetchall()}
+        if "execution_workspace" not in columns:
+            await self._conn.execute(
+                "ALTER TABLE sessions ADD COLUMN execution_workspace TEXT"
+            )
+            await self._conn.commit()
+
     async def _migrate_collaboration_columns(self) -> None:
         """Idempotently widen legacy sessions with durable Plan mode state."""
 
@@ -2618,6 +2648,21 @@ class SessionStorage:
             await self._conn.execute(
                 "ALTER TABLE transcript_entries ADD COLUMN reasoning_content TEXT"
             )
+            await self._conn.commit()
+
+    async def _migrate_assistant_replay_column(self) -> None:
+        """Add optional accepted-message storage without rewriting old rows."""
+        assert self._conn is not None
+        changed = False
+        for table in ("transcript_entries", "compacted_transcript_entries"):
+            async with self._conn.execute(f"PRAGMA table_info({table})") as cur:
+                columns = {row[1] for row in await cur.fetchall()}
+            if "assistant_replay" not in columns:
+                await self._conn.execute(
+                    f"ALTER TABLE {table} ADD COLUMN assistant_replay TEXT"
+                )
+                changed = True
+        if changed:
             await self._conn.commit()
 
     async def _migrate_transcript_turn_usage_column(self) -> None:
@@ -4948,6 +4993,7 @@ class SessionStorage:
             SELECT rowid, session_key, agent_id, origin
             FROM sessions
             WHERE workspace_id IS NULL
+              AND execution_workspace IS NULL
               AND origin IS NOT NULL
               AND rowid > ?
             ORDER BY rowid
@@ -4988,6 +5034,7 @@ class SessionStorage:
                 FROM sessions
                 WHERE session_key = ?
                   AND workspace_id IS NULL
+                  AND execution_workspace IS NULL
                   AND agent_id = ?
                   AND origin IS ?
                 """,
@@ -5013,6 +5060,7 @@ class SessionStorage:
                 SET workspace_id = ?
                 WHERE session_key = ?
                   AND workspace_id IS NULL
+                  AND execution_workspace IS NULL
                   AND agent_id = ?
                   AND origin IS ?
                 """,
@@ -5063,6 +5111,7 @@ class SessionStorage:
         expected_session_keys: Sequence[str] | None,
     ) -> list[str]:
         deleted: list[SessionNode] = []
+        material_cleanups = []
         async with self._write_transaction("delete_project_workspace_sessions") as conn:
             async with conn.execute(
                 """
@@ -5099,11 +5148,12 @@ class SessionStorage:
                 )
 
             for session in deleted:
+                material_cleanups.append(await self._prepare_deleted_session_cleanup(conn, session))
                 await self._delete_session_rows(conn, session)
 
-        for session in deleted:
+        for session, cleanup in zip(deleted, material_cleanups, strict=True):
             try:
-                await self._cleanup_deleted_session(session)
+                await self._cleanup_deleted_session(session, cleanup)
             except Exception:  # noqa: BLE001 - the database commit is authoritative.
                 log.warning(
                     "project_workspace.session_cleanup_failed "
@@ -5547,14 +5597,31 @@ class SessionStorage:
             (session.session_key,),
         )
 
-    async def _cleanup_deleted_session(self, session: SessionNode) -> None:
+    async def _prepare_deleted_session_cleanup(
+        self, conn: Any, session: SessionNode,
+    ) -> Callable[[], Awaitable[None]] | None:
+        from opensquilla.session.material_cleanup import prepare_session_material_cleanup
+
+        workspace = None
+        if session.workspace_id:
+            async with conn.execute(
+                "SELECT * FROM project_workspaces WHERE workspace_id=?", (session.workspace_id,),
+            ) as cursor:
+                row = await cursor.fetchone()
+            if row is not None:
+                workspace = ProjectWorkspace(**dict(row))
+        return await prepare_session_material_cleanup(session, workspace)
+
+    async def _cleanup_deleted_session(
+        self, session: SessionNode, cleanup: Callable[[], Awaitable[None]] | None,
+    ) -> None:
         # Cascade the on-disk session material (transcript media + workspace
         # attachment copies). DB-only deletion otherwise leaks both stores until
         # the transcript disk budget hard-fails. Best-effort via the registered
         # process-global hook; never fails the delete.
         from opensquilla.session.material_cleanup import run_session_material_cleanup
 
-        await run_session_material_cleanup(session.session_id, session.session_key)
+        await run_session_material_cleanup(session.session_id, session.session_key, cleanup)
 
         # G4 cleanup: cascade meta-skill audit rows for this session. The
         # sessions table is created lazily at runtime (not via yoyo), so
@@ -5573,6 +5640,7 @@ class SessionStorage:
     async def delete_session(self, session_key: str) -> None:
         session_key = canonicalize_session_key(session_key)
         session: SessionNode | None = None
+        cleanup = None
         async with self._write_transaction("delete_session") as conn:
             # Controls and drafts can exist on a provisional key before the
             # first accepted turn creates a sessions row. Fence those request
@@ -5609,17 +5677,19 @@ class SessionStorage:
                 row = await cursor.fetchone()
             if row is not None:
                 session = SessionNode(**_deserialize_row(dict(row)))
+                cleanup = await self._prepare_deleted_session_cleanup(conn, session)
                 await self._delete_session_rows(conn, session)
 
         _clear_pending_meta_launch_boundary(session_key)
         if session is None:
             return
-        await self._cleanup_deleted_session(session)
+        await self._cleanup_deleted_session(session, cleanup)
 
     async def prune_stale_session_records(self, before_ms: int) -> list[SessionNode]:
         """Delete and return the exact stale session generations committed."""
 
         deleted: list[SessionNode] = []
+        material_cleanups = []
         async with self._write_transaction("prune_stale_sessions") as conn:
             async with conn.execute(
                 "SELECT * FROM sessions WHERE updated_at < ?",
@@ -5628,10 +5698,11 @@ class SessionStorage:
                 rows = await cur.fetchall()
             for row in rows:
                 session = SessionNode(**_deserialize_row(dict(row)))
+                material_cleanups.append(await self._prepare_deleted_session_cleanup(conn, session))
                 await self._delete_session_rows(conn, session)
                 deleted.append(session)
-        for session in deleted:
-            await self._cleanup_deleted_session(session)
+        for session, cleanup in zip(deleted, material_cleanups, strict=True):
+            await self._cleanup_deleted_session(session, cleanup)
         return deleted
 
     async def prune_stale_sessions(self, before_ms: int) -> int:
@@ -5931,6 +6002,7 @@ class SessionStorage:
                     "revision": current_revision,
                     "source": "session",
                     "initialized": False,
+                    "changed": False,
                 }
             if expected_revision is not None and current_revision != expected_revision:
                 raise SessionRoutingConflictError(
@@ -5956,6 +6028,7 @@ class SessionStorage:
                 "revision": current_revision + 1,
                 "source": "session",
                 "initialized": current_mode is None,
+                "changed": True,
             }
 
     # ── Collaboration plans ────────────────────────────────────────────────
@@ -10389,6 +10462,9 @@ class SessionStorage:
 
         entry.id = int(existing[0])
         entry.created_at = int(existing[1])
+        # Replacement is authoritative, including replay state. Keeping an old
+        # envelope when the caller supplies None could revive an abandoned
+        # generation; accepted-message callers supply their complete envelope.
         data = entry.model_dump(exclude={"id", "created_at"})
         assignments = [f"{column} = ?" for column in data]
         values = [_serialize(data[column]) for column in data]
@@ -10516,6 +10592,7 @@ class SessionStorage:
                 tool_calls,
                 tool_call_id,
                 reasoning_content,
+                assistant_replay,
                 turn_usage,
                 turn_context,
                 created_at,
@@ -10539,6 +10616,7 @@ class SessionStorage:
                 tool_calls,
                 tool_call_id,
                 reasoning_content,
+                assistant_replay,
                 turn_usage,
                 turn_context,
                 created_at,
@@ -12439,9 +12517,6 @@ class SessionStorage:
         goal_mutation: (
             StartGoalMutation | ClaimGoalMutation | ClaimCurrentGoalMutation | None
         ) = None,
-        expected_prompt_annotations: Sequence[PromptAnnotation] = (),
-        prepared_prompt_annotation_targets: Sequence[PreparedPromptAnnotationTarget] = (),
-        prompt_annotation_turn_id: str | None = None,
         pending_input_id: str | None = None,
         pending_input_fingerprint: str | None = None,
         pending_input_revision: int | None = None,
@@ -12485,24 +12560,6 @@ class SessionStorage:
             raise ValueError("Goal turns cannot start or claim a Plan run")
         if goal_mutation is not None and meta_control_intent_id is not None:
             raise ValueError("Goal turns cannot consume a MetaSkill control intent")
-        expected_prompt_annotations = tuple(expected_prompt_annotations)
-        prepared_prompt_annotation_targets = tuple(prepared_prompt_annotation_targets)
-        if expected_prompt_annotations and prepared_prompt_annotation_targets:
-            raise ValueError(
-                "prompt annotation acceptance cannot use legacy and prepared inputs together"
-            )
-        prompt_annotation_acceptance = bool(
-            expected_prompt_annotations or prepared_prompt_annotation_targets
-        )
-        if prompt_annotation_acceptance:
-            if session_node is not None or merge_into_task:
-                raise ValueError(
-                    "prompt annotations require an existing session and a distinct turn"
-                )
-            if not isinstance(prompt_annotation_turn_id, str) or not (
-                prompt_annotation_turn_id := prompt_annotation_turn_id.strip()
-            ):
-                raise ValueError("prompt_annotation_turn_id is required")
         pending_guard_values = (
             pending_input_id,
             pending_input_fingerprint,
@@ -12778,35 +12835,6 @@ class SessionStorage:
                     ),
                 )
 
-            if prompt_annotation_acceptance:
-                from opensquilla.artifact_session import (
-                    consume_prepared_prompt_annotations_on_conn,
-                    consume_prompt_annotations_on_conn,
-                )
-
-                assert prompt_annotation_turn_id is not None
-                if prepared_prompt_annotation_targets:
-                    await consume_prepared_prompt_annotations_on_conn(
-                        conn,
-                        prepared_targets=prepared_prompt_annotation_targets,
-                        session_key=entry.session_key,
-                        session_id=entry.session_id,
-                        session_epoch=expected_epoch,
-                        message_id=entry.message_id,
-                        turn_id=prompt_annotation_turn_id,
-                        updated_at=updated_at,
-                    )
-                else:
-                    await consume_prompt_annotations_on_conn(
-                        conn,
-                        expected_annotations=expected_prompt_annotations,
-                        session_key=entry.session_key,
-                        session_id=entry.session_id,
-                        session_epoch=expected_epoch,
-                        message_id=entry.message_id,
-                        turn_id=prompt_annotation_turn_id,
-                        updated_at=updated_at,
-                    )
             if pending_input_id is not None:
                 pending = await self._select_pending_chat_input(
                     conn,
@@ -13963,6 +13991,7 @@ class SessionStorage:
                 tool_calls,
                 tool_call_id,
                 reasoning_content,
+                assistant_replay,
                 turn_usage,
                 turn_context,
                 created_at,
@@ -13986,6 +14015,7 @@ class SessionStorage:
                 tool_calls,
                 tool_call_id,
                 reasoning_content,
+                assistant_replay,
                 turn_usage,
                 turn_context,
                 created_at,
@@ -14053,6 +14083,7 @@ class SessionStorage:
                 tool_calls,
                 tool_call_id,
                 reasoning_content,
+                assistant_replay,
                 turn_usage,
                 turn_context,
                 created_at,
@@ -14076,6 +14107,7 @@ class SessionStorage:
                 tool_calls,
                 tool_call_id,
                 reasoning_content,
+                assistant_replay,
                 turn_usage,
                 turn_context,
                 created_at,
@@ -14611,6 +14643,7 @@ class SessionStorage:
                     tool_calls,
                     tool_call_id,
                     reasoning_content,
+                    assistant_replay,
                     turn_usage,
                     turn_context,
                     created_at,
@@ -14638,6 +14671,7 @@ class SessionStorage:
                     tool_calls,
                     tool_call_id,
                     reasoning_content,
+                    assistant_replay,
                     turn_usage,
                     turn_context,
                     created_at,
@@ -14793,6 +14827,7 @@ class SessionStorage:
                 tool_calls,
                 tool_call_id,
                 reasoning_content,
+                assistant_replay,
                 turn_usage,
                 turn_context,
                 created_at,
@@ -14817,6 +14852,7 @@ class SessionStorage:
                 tool_calls,
                 tool_call_id,
                 reasoning_content,
+                assistant_replay,
                 turn_usage,
                 turn_context,
                 created_at,
@@ -14834,26 +14870,45 @@ class SessionStorage:
                 """,
                 (target_session_id, target_session_key, source_session_id),
             )
-            if terminal_outcome_projections is None:
-                return
             async with conn.execute(
-                "SELECT id, turn_context FROM compacted_transcript_entries "
+                "SELECT id, role, message_id, content, turn_context "
+                "FROM compacted_transcript_entries "
                 "WHERE session_id = ?",
                 (target_session_id,),
             ) as cursor:
                 rows = await cursor.fetchall()
             for row in rows:
+                content = row["content"]
+                rebound_content = (
+                    preserve_attachment_occurrence_ids(
+                        content,
+                        session_id=source_session_id,
+                        source_message_id=row["message_id"],
+                    )
+                    if row["role"] == "user"
+                    else content
+                )
                 context = _json_object_or_none(row["turn_context"])
                 turn_id = turn_id_from_context(context)
-                rebound_context = attach_fork_terminal_outcome_projection(
-                    context,
-                    terminal_outcome_projections.get(turn_id or ""),
+                rebound_context = (
+                    attach_fork_terminal_outcome_projection(
+                        context,
+                        terminal_outcome_projections.get(turn_id or ""),
+                    )
+                    if terminal_outcome_projections is not None
+                    else context
                 )
-                if rebound_context == context:
+                if rebound_content == content and rebound_context == context:
                     continue
                 await conn.execute(
-                    "UPDATE compacted_transcript_entries SET turn_context = ? WHERE id = ?",
-                    (_serialize(rebound_context), row["id"]),
+                    "UPDATE compacted_transcript_entries "
+                    "SET content = ?, turn_context = ? WHERE id = ?",
+                    (
+                        rebound_content,
+                        _serialize(rebound_context) if rebound_context != context
+                        else row["turn_context"],
+                        row["id"],
+                    ),
                 )
 
     @_serialized_read
@@ -15433,6 +15488,7 @@ class SessionStorage:
                 tool_calls,
                 tool_call_id,
                 reasoning_content,
+                assistant_replay,
                 turn_usage,
                 turn_context,
                 created_at,
@@ -15486,15 +15542,41 @@ class SessionStorage:
     # ── SessionContextState CRUD ─────────────────────────────────────────────
 
     async def save_context_state(
-        self, state: SessionContextState
+        self,
+        state: SessionContextState,
+        *,
+        expected_session_id: str | None = None,
+        expected_session_epoch: int | None = None,
     ) -> SessionContextState:
         """Persist portable or provider-native context state for later replay."""
+        _validate_optional_session_owner(
+            session_id=expected_session_id,
+            session_epoch=expected_session_epoch,
+        )
+        if (expected_session_id is None) != (expected_session_epoch is None):
+            raise ValueError("context state write requires an exact session owner")
+        if expected_session_id is not None and state.session_id != expected_session_id:
+            raise ValueError("context state does not match the expected session owner")
         state.session_key = canonicalize_session_key(state.session_key)
         data = state.model_dump(exclude={"id"})
         cols = list(data.keys())
         placeholders = ", ".join("?" for _ in cols)
         values = [_serialize(data[c]) for c in cols]
         async with self._write_transaction("save_context_state") as conn:
+            if expected_session_id is not None:
+                assert expected_session_epoch is not None
+                if not await _matches_session_owner_on_conn(
+                    conn,
+                    session_key=state.session_key,
+                    session_id=expected_session_id,
+                    session_epoch=expected_session_epoch,
+                ):
+                    await self._raise_stale_epoch(
+                        conn,
+                        session_key=state.session_key,
+                        expected_epoch=expected_session_epoch,
+                        expected_session_id=expected_session_id,
+                    )
             async with conn.execute(
                 "INSERT INTO session_context_states "
                 f"({', '.join(cols)}) VALUES ({placeholders})",

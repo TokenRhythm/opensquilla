@@ -105,6 +105,79 @@ class _GitHubSkillRef:
         return f"https://github.com/{self.repo_full}/tree/{self.ref}"
 
 
+def _select_skill_tree(
+    entries: list[Any],
+    ref: _GitHubSkillRef,
+    resolution: SourceResolution,
+    *,
+    tree_path_prefix: str = "",
+) -> tuple[_GitHubSkillRef, SourceResolution]:
+    """Discover complete, immutable candidate paths before downloading any files."""
+    names = (
+        {_MANIFEST_NAME, "skill.md", "skills.md"}
+        if resolution.allow_legacy_manifest_names
+        else {_MANIFEST_NAME}
+    )
+    manifests: list[str] = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            raise source_invalid_response_error(
+                phase=DiagnosticPhase.FETCH, source_name="GitHub",
+            )
+        raw_path = str(entry.get("path") or "")
+        path = f"{tree_path_prefix}/{raw_path}" if tree_path_prefix else raw_path
+        relative = _relative_to_skill_dir(path, ref.skill_dir)
+        if relative is None or PurePosixPath(path).name not in names:
+            continue
+        try:
+            normalized = normalize_relative_path(path).as_posix()
+        except ArchiveNormalizationError as exc:
+            raise SkillSourceFetchError.diagnostic(
+                "ARTIFACT_PATH_UNSAFE", "GitHub returned an unsafe manifest path.",
+                phase=DiagnosticPhase.SECURITY, path=path,
+            ) from exc
+        if entry.get("type") == "blob":
+            manifests.append(normalized)
+    manifests.sort()
+    if not manifests:
+        raise SkillSourceFetchError.diagnostic(
+            "MANIFEST_MISSING", "The selected GitHub directory contains no Skill manifest.",
+            phase=DiagnosticPhase.MANIFEST,
+            hint="Choose a directory containing SKILL.md.",
+        )
+    if len(manifests) != 1:
+        candidates = []
+        for path in manifests[:100]:
+            directory = str(PurePosixPath(path).parent)
+            directory = "" if directory == "." else directory
+            candidate = replace(ref, path=directory)
+            candidates.append({
+                "name": PurePosixPath(directory).name or ref.repo,
+                "path": directory,
+                "identifier": candidate.canonical_identifier,
+            })
+        raise SkillSourceFetchError.diagnostic(
+            "SOURCE_TREE_AMBIGUOUS", "Select one Skill directory from this GitHub repository.",
+            phase=DiagnosticPhase.ARCHIVE,
+            details={
+                "manifests": manifests[:100], "selectionRequired": True,
+                "repository": ref.repo_full, "immutableRevision": ref.ref,
+                "candidateCount": len(manifests), "candidates": candidates,
+            },
+            hint="Install an exact candidate directory or specify a Skill subpath.",
+        )
+    directory = str(PurePosixPath(manifests[0]).parent)
+    directory = "" if directory == "." else directory
+    if directory == ref.skill_dir:
+        return ref, resolution
+    selected = replace(ref, path=directory)
+    return selected, replace(
+        resolution, canonical_identifier=selected.canonical_identifier,
+        skill_path=directory, upstream_url=selected.homepage,
+        package_identifier=f"{selected.repo_full.casefold()}:{directory}",
+    )
+
+
 def _clean_repo_name(repo: str) -> str:
     return repo[:-4] if repo.endswith(".git") else repo
 
@@ -641,6 +714,9 @@ class GitHubSource(SkillSource):
                             hint="Reduce the number of files in the selected Skill directory.",
                         )
 
+                ref, resolution = _select_skill_tree(
+                    tree_data["tree"], ref, resolution, tree_path_prefix=tree_path_prefix,
+                )
                 files: dict[str, str | bytes] = {}
                 selected: list[tuple[str, str, int, int]] = []
                 declared_total = 0

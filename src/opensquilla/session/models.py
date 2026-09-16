@@ -198,6 +198,10 @@ class SessionNode(SQLModel, table=True):
     # and continue to resolve the Agent/default OpenSquilla workspace.
     workspace_id: str | None = Field(default=None, index=True)
 
+    # Backend-owned execution root for new ordinary tasks. NULL is the legacy
+    # path-resolution contract, not a request to allocate a new directory.
+    execution_workspace: dict[str, Any] | None = Field(default=None, sa_column=Column(JSON))
+
     # Agent id for multi-agent support
     agent_id: str = "main"
 
@@ -227,6 +231,11 @@ class TranscriptEntry(SQLModel, table=True):
     tool_calls: list[dict[str, Any]] | None = Field(default=None, sa_column=Column(JSON))
     tool_call_id: str | None = None
     reasoning_content: str | None = None
+    # Accepted provider messages, separate from the turn's display aggregates.
+    # None identifies legacy rows whose original message boundaries are unknown.
+    assistant_replay: dict[str, Any] | None = Field(
+        default=None, sa_column=Column(JSON), repr=False
+    )
     turn_usage: dict[str, Any] | None = Field(default=None, sa_column=Column(JSON))
     # Gateway-owned causal identity shared by every durable row in one turn.
     # Additive JSON keeps older readers and pre-identity transcript rows valid.

@@ -1,3 +1,4 @@
+import { normalizePageContext } from '@/types/pageContext'
 import {
   readTransportFailure,
 } from './transportTypes'
@@ -72,14 +73,6 @@ function numberValue(value: unknown): number | undefined {
   return typeof value === 'number' && Number.isFinite(value) ? value : undefined
 }
 
-function stringListValue(value: unknown): string[] | undefined {
-  if (!Array.isArray(value)) return undefined
-  const values = value
-    .map(entry => String(entry ?? '').trim())
-    .filter(Boolean)
-  return values.length ? [...new Set(values)] : []
-}
-
 function projectServerAttachment(value: unknown): PendingInputServerAttachment | null {
   if (!isRecord(value)) return null
   const name = stringValue(value.name) || 'attachment'
@@ -106,9 +99,7 @@ function projectPendingInputItem(value: unknown): PendingInputServerItem | null 
         return projected ? [projected] : []
       })
     : undefined
-  const promptAnnotationIds = stringListValue(
-    firstValue(value, 'promptAnnotationIds', 'prompt_annotation_ids'),
-  )
+  const pageContext = normalizePageContext(firstValue(value, 'pageContext', 'page_context'))
   const message = typeof value.message === 'string' ? value.message : undefined
   const displayValue = firstValue(value, 'displayText', 'display_text')
   const displayText = typeof displayValue === 'string' ? displayValue : undefined
@@ -132,7 +123,7 @@ function projectPendingInputItem(value: unknown): PendingInputServerItem | null 
     ...(position !== undefined ? { position } : {}),
     ...(revision !== undefined ? { revision } : {}),
     ...(requestFingerprint !== undefined ? { requestFingerprint } : {}),
-    ...(promptAnnotationIds !== undefined ? { promptAnnotationIds } : {}),
+    ...(pageContext ? { pageContext } : {}),
     ...(intent !== undefined ? { intent } : {}),
     ...(value.confirmedPlainText === true ? { confirmedPlainText: true } : {}),
   }

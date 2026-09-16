@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from pathlib import Path
 from typing import Any
 
 from starlette.applications import Starlette
@@ -18,11 +17,6 @@ from opensquilla.application.artifact_workbench import (
 )
 from opensquilla.gateway.adapters.artifact_content import GatewayArtifactContentPort
 from opensquilla.gateway.config import GatewayConfig
-from opensquilla.paths import media_root_from_config
-
-
-def _media_root_from_config(config: GatewayConfig) -> Path:
-    return media_root_from_config(config)
 
 
 def _safe_download_name(value: object) -> str:

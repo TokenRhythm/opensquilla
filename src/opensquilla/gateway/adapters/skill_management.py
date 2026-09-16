@@ -32,8 +32,8 @@ class GatewaySkillManagementAdapter:
         identifier = params["identifier"]
         if not isinstance(identifier, str):
             raise ValueError("params.identifier must be a string")
-        source = params.get("source", "clawhub")
-        if not isinstance(source, str):
+        source = params.get("source")
+        if "source" in params and not isinstance(source, str):
             raise ValueError("params.source must be a string")
         command = InstallSkill(
             identifier=identifier,

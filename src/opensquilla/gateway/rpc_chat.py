@@ -36,6 +36,7 @@ from opensquilla.gateway.rpc import (
     RpcUnavailableError,
     get_dispatcher,
 )
+from opensquilla.gateway.user_input_broker import UserInputRequestNotFoundError
 
 _d = get_dispatcher()
 log = structlog.get_logger(__name__)
@@ -146,11 +147,19 @@ async def _submit_clarification(
         resolve_user_input = getattr(task_runtime, "resolve_user_input", None)
         if not callable(resolve_user_input):
             raise RpcUnavailableError("Deferred user-input resolution is not available")
-        result = await resolve_user_input(
-            session_key=session_key,
-            request_id=request_id,
-            fields=fields,
-        )
+        try:
+            result = await resolve_user_input(
+                session_key=session_key,
+                request_id=request_id,
+                fields=fields,
+            )
+        except UserInputRequestNotFoundError as exc:
+            raise RpcHandlerError(
+                "USER_INPUT_EXPIRED",
+                "The user-input request is no longer available.",
+                retryable=False,
+                accepted=False,
+            ) from exc
         log.info(
             "chat.clarify_submit.deferred",
             session_key=session_key,

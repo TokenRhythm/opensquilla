@@ -33,7 +33,7 @@ class _Runtime:
         return {"key": command.session_key, "accepted": True}
 
 
-async def test_canonical_and_legacy_commands_share_one_application_entry() -> None:
+async def test_turn_commands_share_one_application_entry() -> None:
     runtime = _Runtime()
     application = TurnAdmission(
         ingress=runtime,
@@ -47,11 +47,9 @@ async def test_canonical_and_legacy_commands_share_one_application_entry() -> No
     await application.admit(
         AdmitTurn(" agent:main:webchat:one ", "hello", "session", intent="continue")
     )
-    await application.steer(SteerTurn(" agent:main:webchat:one ", "guide", "durable"))
-    await application.steer(SteerTurn(" agent:main:webchat:one ", "guide", "legacy"))
+    await application.steer(SteerTurn(" agent:main:webchat:one ", "guide"))
 
     assert {command.surface for command in runtime.admissions} == {"webchat", "session"}
-    assert {command.mode for command in runtime.steers} == {"durable", "legacy"}
     assert all(
         command.session_key == "agent:main:webchat:one"
         for command in (*runtime.admissions, *runtime.steers)
@@ -97,7 +95,6 @@ async def test_pending_steer_requires_complete_atomic_guard() -> None:
             SteerTurn(
                 "agent:main:webchat:one",
                 "guide",
-                "durable",
                 pending_input=PendingInputGuard("pending-1", "fingerprint", 2),
             )
         )

@@ -8,6 +8,7 @@ import {
   type ArtifactPreviewMode,
 } from '@/modules/artifactWorkbench'
 import type { ArtifactPayload } from '@/types/artifacts'
+import { isPreviewPagePath, previewPagePathFromUrl } from '@/utils/workbench/previewPagePath'
 import {
   HttpTransportError,
 } from './privateHttpTransport'
@@ -138,12 +139,26 @@ export function parseArtifactPreviewLease(
   if (!launch.ok) {
     throw new ArtifactPreviewLeaseError('Artifact preview returned an invalid origin.', 502)
   }
+  const workingDocumentId = raw.workingDocumentId
+  if (raw.page_path !== undefined && !isPreviewPagePath(raw.page_path)) {
+    throw new ArtifactPreviewLeaseError('Artifact preview returned an invalid page.', 502)
+  }
+  if (Object.prototype.hasOwnProperty.call(raw, 'workingDocumentId') && (
+    typeof workingDocumentId !== 'string'
+    || !workingDocumentId
+    || workingDocumentId.length > 512
+    || workingDocumentId !== workingDocumentId.trim()
+    || /[\u0000-\u001f\u007f]/.test(workingDocumentId)
+  )) {
+    throw new ArtifactPreviewLeaseError('Artifact preview returned an invalid working document.', 502)
+  }
   return {
     version: 1,
     lease_id: leaseId,
     effective_mode: effectiveMode,
     launch_url: launch.url,
     entrypoint,
+    ...(typeof raw.page_path === 'string' ? { page_path: raw.page_path } : {}),
     expires_at: expiresAt,
     preview_origin: previewOrigin,
     idle_timeout_seconds: typeof raw.idle_timeout_seconds === 'number'
@@ -151,6 +166,7 @@ export function parseArtifactPreviewLease(
       ? Math.max(1, Math.floor(raw.idle_timeout_seconds))
       : 28_800,
     source: parseSource(raw.source),
+    ...(typeof workingDocumentId === 'string' ? { workingDocumentId } : {}),
   }
 }
 
@@ -196,12 +212,26 @@ function desktopBrokerUnavailable(): ArtifactPreviewLeaseError {
 }
 
 export async function createArtifactPreviewLease(
-  http: Pick<ArtifactPreviewLeaseHttpTransport, 'requestJson'>,
+  http: ArtifactPreviewLeaseHttpTransport,
   artifact: ArtifactPayload,
   mode: ArtifactPreviewMode,
   client: PlatformId,
   context: ArtifactPreviewLeaseContext,
 ): Promise<ArtifactPreviewLease> {
+  if (context.pagePath !== undefined && !isPreviewPagePath(context.pagePath)) {
+    throw new ArtifactPreviewLeaseError('The preview page path is invalid.', 400, 'INVALID_REQUEST')
+  }
+  async function accept(value: unknown): Promise<ArtifactPreviewLease> {
+    const lease = parseArtifactPreviewLease(value, context.baseOrigin)
+    if (context.pagePath && (lease.page_path !== context.pagePath
+      || previewPagePathFromUrl(lease.launch_url, lease) !== context.pagePath)) {
+      // Older Gateways may ignore the additive target. Never silently open the homepage.
+      await revokeArtifactPreviewLease(http, lease.lease_id, context).catch(() => undefined)
+      throw new ArtifactPreviewLeaseError('This Gateway cannot open the requested preview page.',
+        409, 'PREVIEW_PAGE_UNSUPPORTED')
+    }
+    return lease
+  }
   if (client === 'desktop') {
     const artifactId = artifactPreviewId(artifact)
     if (!artifactId) {
@@ -217,13 +247,14 @@ export async function createArtifactPreviewLease(
         artifactId,
         mode,
         scopeId: context.sessionKey || '',
+        ...(context.pagePath ? { pagePath: context.pagePath } : {}),
         ...(authToken ? { authToken } : {}),
       })
     } catch {
       throw desktopBrokerUnavailable()
     }
     if (!result.ok) throw brokerError(result)
-    return parseArtifactPreviewLease(result.payload, context.baseOrigin)
+    return accept(result.payload)
   }
   const artifactId = artifactPreviewId(artifact)
   if (!artifactId) {
@@ -237,7 +268,7 @@ export async function createArtifactPreviewLease(
       client,
       context,
     )
-    return parseArtifactPreviewLease(payload, context.baseOrigin)
+    return await accept(payload)
   } catch (error) {
     translateTransportError(error)
   }

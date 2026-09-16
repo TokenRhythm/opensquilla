@@ -16,6 +16,8 @@ from opensquilla.gateway.adapters.contract_method import (
 )
 
 META_RUN_CENTER_CONTRACT_METHODS: Final = (
+    "meta.list",
+    "meta.inspect",
     "meta.drafts.list",
     "meta.drafts.discard",
     "meta.run",

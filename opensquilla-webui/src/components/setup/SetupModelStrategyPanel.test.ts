@@ -280,6 +280,32 @@ describe('SetupModelStrategyPanel', () => {
     app.unmount()
   })
 
+  it('keeps the legacy image tier out of the model strategy table', async () => {
+    const { app, el } = await mountPanel({
+      activeStrategy: 'router',
+      router: {
+        tierRows: [
+          ...panel().router.tierRows,
+          {
+            name: 'image_model',
+            provider: 'openrouter',
+            model: 'legacy/vision-model',
+            thinkingLevel: '',
+            supportsImage: true,
+          },
+        ],
+      },
+    })
+
+    expect(el.querySelector('[aria-label="image_model model"]')).toBeNull()
+    expect(el.querySelector('[aria-label="image_model thinking level"]')).toBeNull()
+    expect(el.querySelector('[aria-label$="supports image"]')).toBeNull()
+    expect(el.textContent).not.toContain('legacy/vision-model')
+    expect(el.textContent).not.toContain('Image model')
+
+    app.unmount()
+  })
+
   it('offers a compact provider shortcut when only one provider is available', async () => {
     const onGoToSection = vi.fn()
     const { app, el } = await mountPanel({
@@ -317,6 +343,9 @@ describe('SetupModelStrategyPanel', () => {
     expect(el.querySelector('[aria-label="c0 request entry"]')).toBeTruthy()
     expect(el.querySelector('.setup-tier-table__row.is-head')?.textContent)
       .toContain('Request entry')
+    expect(el.querySelector('[aria-label$="supports image"]')).toBeNull()
+    expect(el.querySelector('[data-testid="router-image-capability-hint"]')?.textContent)
+      .toContain('detected automatically from provider metadata and request results')
 
     app.unmount()
   })
@@ -852,6 +881,10 @@ describe('SetupModelStrategyPanel', () => {
     })
 
     const lineup = el.querySelector<HTMLElement>('[data-testid="ensemble-custom-lineup"]')!
+    const imageHint = el.querySelector<HTMLElement>('[data-testid="ensemble-candidate-image-hint"]')
+    expect(imageHint?.textContent).toContain('Model ensemble does not support image analysis yet')
+    expect(imageHint?.textContent).toContain('switch to Intelligent model routing and configure an image-capable model')
+    expect(imageHint?.textContent).toContain('select an image-capable model under Fixed model')
     const steps = lineup.querySelectorAll<HTMLElement>('.setup-model-strategy__step')
     expect(steps).toHaveLength(2)
     expect(steps[0]?.textContent).toContain('Proposer')
@@ -1884,15 +1917,65 @@ describe('SetupModelStrategyPanel', () => {
     app.unmount()
   })
 
-  it('shows cross-provider notice when model tiers use mixed providers', async () => {
-    const { app, el } = await mountPanel({
-      router: {
-        hasMixedTierProviders: true,
-      },
-    })
+  it('does not infer cross-provider execution from mixed tiers', async () => {
+    const { app, el } = await mountPanel({ router: { hasMixedTierProviders: true } })
+    expect(el.querySelector('[data-testid="routing-cross-provider-enabled"]')).toBeNull()
+    app.unmount()
+  })
+})
 
-    expect(el.textContent).toContain('Cross-provider routing')
+const summary = {
+  providerId: 'tokenrhythm', providerLabel: 'TokenRhythm', enabled: false,
+  binding: 'custom', crossProviderEnabled: false, hasForeignTierProviders: true,
+  hasUnsavedChanges: false, resetPending: false, resetDisabledReason: '',
+}
 
+describe('saved routing summary and recommended recovery', () => {
+  it('separates the saved primary, Router switch and custom ownership above mode cards', async () => {
+    const onResetRecommendedRouter = vi.fn()
+    const { app, el } = await mountPanel({ routingSummary: summary }, { onResetRecommendedRouter })
+    const facts = el.querySelector('[data-testid="routing-saved-summary"]')!
+    expect(facts.textContent).toContain('TokenRhythm')
+    expect(facts.textContent).toContain('Off')
+    expect(el.querySelector('[data-testid="routing-saved-binding"]')?.textContent).toBe('Custom tiers')
+    expect(facts.compareDocumentPosition(el.querySelector('.setup-model-strategy__cards')!))
+      .toBe(Node.DOCUMENT_POSITION_FOLLOWING)
+    expect(el.querySelector('[data-testid="routing-provider-mismatch"]')?.textContent).toContain('cross-provider execution is off')
+    expect(el.querySelector('[data-testid="routing-cross-provider-enabled"]')).toBeNull()
+    const reset = el.querySelector<HTMLButtonElement>('[data-testid="router-reset-recommended"]')!
+    expect(reset.disabled).toBe(false)
+    expect(document.getElementById(reset.getAttribute('aria-describedby')!)?.textContent).toContain('stays off')
+    reset.click()
+    expect(onResetRecommendedRouter).toHaveBeenCalledOnce()
+    app.unmount()
+  })
+
+  it.each([
+    ['follow_primary', 'Recommended · follows primary'],
+    ['legacy', 'Existing tiers · follow behavior unspecified'],
+  ])('shows %s ownership independently of the enabled state', async (binding, label) => {
+    const { app, el } = await mountPanel({ routingSummary: { ...summary, binding, enabled: true, hasUnsavedChanges: true, crossProviderEnabled: true } })
+    expect(el.querySelector('[data-testid="routing-saved-binding"]')?.textContent).toBe(label)
+    expect(el.querySelector('[data-testid="routing-cross-provider-enabled"]')).toBeTruthy()
+    expect(el.querySelector('[data-testid="routing-provider-mismatch"]')).toBeNull()
+    expect(el.querySelector('[data-testid="routing-unsaved"]')).toBeTruthy()
+    app.unmount()
+  })
+
+  it.each(['permission', 'capability', 'preset'])('shows the %s reason and prevents reset', async reason => {
+    const onResetRecommendedRouter = vi.fn()
+    const { app, el } = await mountPanel({ routingSummary: { ...summary, resetDisabledReason: reason } }, { onResetRecommendedRouter })
+    const reset = el.querySelector<HTMLButtonElement>('[data-testid="router-reset-recommended"]')!
+    expect(reset.disabled).toBe(true)
+    expect(document.getElementById(reset.getAttribute('aria-describedby')!)?.textContent).toBe(reason)
+    reset.click()
+    expect(onResetRecommendedRouter).not.toHaveBeenCalled()
+    app.unmount()
+  })
+
+  it('locks the reset button while another routing operation is pending', async () => {
+    const { app, el } = await mountPanel({ routingSummary: summary }, { routingModeBusy: true })
+    expect(el.querySelector<HTMLButtonElement>('[data-testid="router-reset-recommended"]')?.disabled).toBe(true)
     app.unmount()
   })
 })

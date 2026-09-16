@@ -26,6 +26,29 @@ const server = http.createServer(async (request, response) => {
   })
 
   response.setHeader('content-type', 'application/json')
+  if (['/api/v1/artifacts/art-subpage/preview-leases',
+    '/api/v1/artifacts/art-ignores-page/preview-leases'].includes(request.url)) {
+    const { pagePath } = JSON.parse(body)
+    assert.equal(pagePath, 'pages/editorial.html')
+    const selected = request.url.includes('art-subpage')
+    response.statusCode = 201
+    response.end(JSON.stringify({
+      version: 1,
+      lease_id: leaseId,
+      effective_mode: 'full',
+      launch_url: `${previewOrigin}/${selected ? pagePath : 'index.html'}`,
+      entrypoint: 'index.html',
+      ...(selected ? { page_path: pagePath } : {}),
+      expires_at: expiresAt,
+      preview_origin: previewOrigin,
+      idle_timeout_seconds: 28_800,
+      source: {
+        kind: 'bundle', collection_status: 'complete',
+        file_count: 2, total_bytes: 42, warning_codes: [],
+      },
+    }))
+    return
+  }
   if (request.url === '/api/v1/artifacts/art-denied/preview-leases') {
     response.statusCode = 429
     response.end(JSON.stringify({
@@ -155,6 +178,12 @@ try {
     leaseId: '../lease',
     scopeId,
   }))
+  for (const pagePath of ['', '../secret.html', '/index.html', 'a/../index.html',
+    'a\\index.html', 'index.html?x=1', '%2e%2e/secret.html', 'style.css', null]) {
+    assert.throws(() => parseArtifactPreviewLeaseCreateRequest({
+      version: 1, artifactId: 'art-subpage', scopeId, mode: 'full', pagePath,
+    }))
+  }
 
   const created = await broker.create({
     version: 1,
@@ -220,8 +249,6 @@ try {
   assert.equal(renewed.ok, true)
   assert.equal(renewed.ok && renewed.payload.lease_id, leaseId)
 
-  const releaseSurfacePin = broker.pinSurface(exactGrant)
-  assert.equal(typeof releaseSurfacePin?.release, 'function')
   const revoked = await broker.revoke({
     version: 1,
     leaseId,
@@ -229,80 +256,30 @@ try {
     authToken: 'synthetic-bearer',
   })
   assert.equal(revoked.ok, true)
-  assert.equal(revoked.status, 202)
-  assert.equal(broker.authorizesSurface(exactGrant), true)
-  await releaseSurfacePin.release()
+  assert.equal(revoked.status, 204)
   assert.equal(broker.authorizesSurface(exactGrant), false)
   assert.equal(broker.resolveSurfaceArtifactId(exactGrant), null)
 
-  let replacementNow = Date.now()
-  let replacementSequence = 0
-  const replacementDeletes = []
-  const replacementBroker = new ArtifactPreviewLeaseBroker({
-    getOwnedGatewayUrl: () => gatewayUrl,
-    now: () => replacementNow,
-    fetchImpl: async (input, init) => {
-      const url = new URL(String(input))
-      if (init?.method === 'DELETE') {
-        replacementDeletes.push(url.pathname)
-        return new Response(null, { status: 204 })
-      }
-      replacementSequence += 1
-      const token = String(replacementSequence).padStart(32, 'e')
-      const origin = `http://p-${token}.localhost:48721`
-      return new Response(JSON.stringify({
-        version: 1,
-        lease_id: `apl-replacement_${replacementSequence}`,
-        effective_mode: 'offline',
-        launch_url: `${origin}/index.html`,
-        entrypoint: 'index.html',
-        expires_at: new Date(
-          replacementNow + (replacementSequence === 1 ? 1_000 : 60 * 60 * 1_000),
-        ).toISOString(),
-        preview_origin: origin,
-        idle_timeout_seconds: 28_800,
-        source: {
-          kind: 'single_file',
-          collection_status: 'not_applicable',
-          file_count: 1,
-          total_bytes: 42,
-          warning_codes: [],
-        },
-      }), {
-        status: 201,
-        headers: { 'content-type': 'application/json' },
-      })
-    },
+  const selectedPage = await broker.create({
+    version: 1, artifactId: 'art-subpage', scopeId, mode: 'full',
+    pagePath: 'pages/editorial.html',
   })
-  const replacementCreated = await replacementBroker.create({
-    version: 1,
-    artifactId: 'art-replacement',
-    scopeId: `${scopeId}:replacement`,
-    mode: 'offline',
+  assert.equal(selectedPage.ok, true)
+  assert.equal(selectedPage.ok && selectedPage.payload.entrypoint, 'index.html')
+  assert.equal(selectedPage.ok && selectedPage.payload.page_path, 'pages/editorial.html')
+  const pageGrant = { ...exactGrant, launchUrl: `${previewOrigin}/pages/editorial.html` }
+  assert.equal(broker.authorizesSurface(pageGrant), true)
+  assert.equal(broker.authorizesSurface(exactGrant), false)
+  await broker.revoke({ version: 1, leaseId, scopeId })
+
+  const ignoredPage = await broker.create({
+    version: 1, artifactId: 'art-ignores-page', scopeId, mode: 'full',
+    pagePath: 'pages/editorial.html',
   })
-  assert.equal(replacementCreated.ok, true)
-  const replacementOriginalGrant = {
-    launchUrl: replacementCreated.payload.launch_url,
-    expectedOrigin: replacementCreated.payload.preview_origin,
-    scopeId: `${scopeId}:replacement`,
-    mode: 'offline',
-  }
-  const replacementPin = replacementBroker.pinSurface(replacementOriginalGrant)
-  assert.ok(replacementPin)
-  replacementNow += 2_000
-  const recoveredGrant = await replacementPin.ensureCurrent()
-  assert.ok(recoveredGrant)
-  assert.notEqual(recoveredGrant.launchUrl, replacementOriginalGrant.launchUrl)
-  assert.equal(replacementSequence, 2)
-  const retiredRevoke = await replacementBroker.revoke({
-    version: 1,
-    leaseId: replacementCreated.payload.lease_id,
-    scopeId: `${scopeId}:replacement`,
-  })
-  assert.equal(retiredRevoke.ok, true)
-  assert.equal(retiredRevoke.status, 202)
-  await replacementPin.release()
-  assert.deepEqual(replacementDeletes, ['/api/v1/artifact-preview-leases/apl-replacement_2'])
+  assert.equal(ignoredPage.ok, false)
+  assert.equal(ignoredPage.code, 'PREVIEW_PAGE_UNSUPPORTED')
+  assert.equal(requests.at(-1).method, 'DELETE')
+  assert.equal(broker.authorizesSurface(pageGrant), false)
 
   const denied = await broker.create({
     version: 1,
@@ -728,3 +705,32 @@ try {
 }
 
 console.log('artifact preview lease broker tests passed')
+
+
+// Exercise the strict authenticated response parser through the actual broker.
+for (const marker of [undefined, 'document-fixture', null, 4, '', ' document-fixture', 'document-fixture\n', 'x'.repeat(513)]) {
+  const identityBroker = new ArtifactPreviewLeaseBroker({
+    getOwnedGatewayUrl: () => 'http://127.0.0.1:18791',
+    fetchImpl: async (_input, init) => {
+      if (init.method === 'DELETE') return new Response(null, { status: 204 })
+      assert.equal(init.headers['x-opensquilla-session-key'], scopeId)
+      assert.equal(init.headers['x-opensquilla-preview-working-document'], '1')
+      return new Response(JSON.stringify({
+        version: 1, lease_id: leaseId, effective_mode: 'full',
+        launch_url: `${previewOrigin}/index.html`, entrypoint: 'index.html',
+        expires_at: expiresAt, preview_origin: previewOrigin, idle_timeout_seconds: 28800,
+        source: { kind: 'single_file', collection_status: 'not_applicable',
+          file_count: 1, total_bytes: 42, warning_codes: [] },
+        ...(marker !== undefined ? { workingDocumentId: marker } : {}),
+      }), { status: 201, headers: { 'content-type': 'application/json' } })
+    },
+  })
+  const result = await identityBroker.create({version: 1, artifactId: 'art-identity', scopeId, mode: 'full'})
+  if (marker === undefined || marker === 'document-fixture') {
+    assert.equal(result.ok, true, JSON.stringify(result))
+    assert.equal(result.payload.workingDocumentId, marker)
+    if (marker === undefined) assert.equal(Object.hasOwn(result.payload, 'workingDocumentId'), false)
+  } else assert.equal(result.ok, false, 'Invalid server working identity must fail closed')
+  await identityBroker.revokeAll()
+}
+console.log('working document lease identity tests passed (8 cases)')

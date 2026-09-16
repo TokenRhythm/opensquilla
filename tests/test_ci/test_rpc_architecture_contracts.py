@@ -35,6 +35,8 @@ GENERATED_WIRE_IMPORT_ALLOWLIST = frozenset(
         # Session read Contracts are consumed only by the Gateway registration
         # Adapter; Application Modules and handlers receive domain values.
         "src/opensquilla/gateway/adapters/session_read_contract.py",
+        # Additive connection-local snapshot and consumption control Contracts.
+        "src/opensquilla/gateway/adapters/connection_recovery_contract.py",
         # SandboxRuntime handlers stay legacy-compatible while generated
         # descriptors own registration metadata and success validation.
         "src/opensquilla/gateway/adapters/sandbox_runtime_contract.py",
@@ -42,6 +44,8 @@ GENERATED_WIRE_IMPORT_ALLOWLIST = frozenset(
         # Gateway Adapter helper; domain registrars retain explicit ownership
         # of their method inventories and public signatures.
         "src/opensquilla/gateway/adapters/_generated_contract_bindings.py",
+        # Scoped telemetry wire models terminate at the registration Adapter.
+        "src/opensquilla/gateway/adapters/telemetry_contract.py",
     }
 )
 GENERATED_METADATA_IMPORT_ALLOWLIST = frozenset(
@@ -50,7 +54,6 @@ GENERATED_METADATA_IMPORT_ALLOWLIST = frozenset(
         "src/opensquilla/engine/commands.py",
         "src/opensquilla/gateway/app.py",
         "src/opensquilla/gateway/guest_rpc_policy.py",
-        "src/opensquilla/gateway/rpc_system.py",
         "src/opensquilla/gateway/scopes.py",
     }
 )
@@ -117,9 +120,12 @@ SESSIONS_LIST_LITERAL_ALLOWLIST: Counter[str] = Counter(
     }
 )
 SESSIONS_LIST_GATEWAY_ADAPTER = PACKAGE_ROOT / "gateway" / "adapters" / "sessions_list_contract.py"
-RUNTIME_RPC_METHOD_BASELINE = 306
-RUNTIME_RPC_METHOD_DIGEST = "b95b0d01e58f0d2b221b459b322c5cf0b05f050d567186b703bd67f6260a8fc4"
-STATIC_RPC_DECORATOR_BASELINE = 87
+# The retired 20-method RPC surface is absent; exact inventory remains pinned
+# so this does not authorize unrelated wire growth.
+# Primary-provider transitions add resetRecommended and upsertAndActivate.
+RUNTIME_RPC_METHOD_BASELINE = 295
+RUNTIME_RPC_METHOD_DIGEST = "34c09211505ec1711fef3a294f254fdbc0ce1bf587d8cf1fc42b87e5943745b5"
+STATIC_RPC_DECORATOR_BASELINE = 77
 
 # Physical lines in the sessions/runtime slice remain tracked for the final
 # closure measurement below.  The temporary S2a cumulative growth budget was
@@ -180,7 +186,10 @@ F2_GATEWAY_COMPOSITION_ROOT = "opensquilla-webui/src/adapters/gateway/gatewayAda
 # Its structure is governed separately below and by the WebUI architecture
 # import gate.  The three stable Transport files totalled 1,125 physical lines
 # on the reviewed #1525 baseline.
-F2_TRANSPORT_FOUNDATION_LOC_CEILING = 1_125
+# Connection stability adds 69 reviewed lines at this private seam: one flow
+# owner, consumed/gap hooks, staging/install control and validated orphan-read
+# credit cleanup. Domain recovery stays outside the generic transport seam.
+F2_TRANSPORT_FOUNDATION_LOC_CEILING = 1_125 + 69
 
 WEBUI_SOURCE_ROOT = ROOT / "opensquilla-webui" / "src"
 WEBUI_LEGACY_TRANSPORT_IDENTIFIERS = (
@@ -1231,13 +1240,11 @@ def test_static_rpc_decorator_sites_are_exact_and_contract_methods_are_adapter_r
             "sessions.delete",
             "sessions.reset",
             "sessions.contextCompact",
-            "sessions.compact",
             "chat.send",
             "chat.abort",
             "sessions.send",
             "sessions.abort",
             "sessions.steer.v2",
-            "sessions.steer",
             "sessions.pending_inputs.enqueue",
             "sessions.pending_inputs.list",
             "sessions.pending_inputs.update",
@@ -1268,7 +1275,6 @@ def test_static_rpc_decorator_sites_are_exact_and_contract_methods_are_adapter_r
             "channels.pairing.revoke",
             "cron.list",
             "cron.status",
-            "cron.add",
             "cron.create",
             "cron.update",
             "cron.remove",
@@ -1281,6 +1287,9 @@ def test_static_rpc_decorator_sites_are_exact_and_contract_methods_are_adapter_r
             "doctor.status",
             "logs.status",
             "logs.tail",
+            "telemetry.consent.set",
+            "telemetry.client_launch.record",
+            "telemetry.product_active.record",
             "plugin.approval.status",
             "plugin.approval.resolve",
             "plugin.approval.extend",
@@ -1306,6 +1315,8 @@ def test_static_rpc_decorator_sites_are_exact_and_contract_methods_are_adapter_r
             "workspaces.pin",
             "workspaces.remove",
             "workspaces.history.delete",
+            "meta.list",
+            "meta.inspect",
             "meta.drafts.list",
             "meta.drafts.discard",
             "meta.run",
@@ -1467,6 +1478,15 @@ def test_runtime_rpc_surface_is_exact_and_contract_methods_use_generic_adapter()
         assert entry is not None
         assert entry.name == method
         assert entry.required_scope == scope
+        assert entry.handler.__module__ == "opensquilla.gateway.adapters.contract_method"
+        assert entry.handler.__name__ == "handle_contract_method"
+
+    for method in (
+        "sessions.messages.snapshot.read", "transport.flow.update", "sessions.executionLog.read",
+    ):
+        entry = registry.get_entry(method)
+        assert entry is not None
+        assert entry.required_scope == "operator.read"
         assert entry.handler.__module__ == "opensquilla.gateway.adapters.contract_method"
         assert entry.handler.__name__ == "handle_contract_method"
 

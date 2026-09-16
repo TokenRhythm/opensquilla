@@ -333,3 +333,52 @@ async def test_attachment_preparation_bounds_executor_admission() -> None:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
         await asyncio.to_thread(executor.shutdown, True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("terminal", ["cancel", "timeout"])
+async def test_transient_cleanup_waits_until_attachment_worker_stops(
+    tmp_path: Path, terminal: str,
+) -> None:
+    started = threading.Event()
+    release = threading.Event()
+    stopped = threading.Event()
+    cleaned = asyncio.Event()
+    material = tmp_path / "temporary.png"
+
+    class _BlockedBuilder:
+        def build(self, *args: Any, **kwargs: Any) -> None:
+            material.write_bytes(b"current image")
+            started.set()
+            try:
+                assert release.wait(2.0)
+                assert material.read_bytes() == b"current image"
+            finally:
+                stopped.set()
+
+    def cleanup() -> None:
+        assert stopped.is_set()
+        material.unlink()
+        cleaned.set()
+
+    stage = AttachmentStage(builder=_BlockedBuilder())
+    task = asyncio.create_task(stage.run(AttachmentStageInput(
+        effective_runtime_message="Inspect image",
+        attachments=[{"type": "image/png", "data": "eA=="}],
+        timeout_seconds=0.1 if terminal == "timeout" else 2.0,
+        failure_cleanup=cleanup,
+    )))
+    try:
+        assert await asyncio.to_thread(started.wait, 1.0)
+        if terminal == "cancel":
+            task.cancel()
+        with pytest.raises(asyncio.CancelledError if terminal == "cancel" else TimeoutError):
+            await task
+        assert material.exists()
+        assert not cleaned.is_set()
+        release.set()
+        await asyncio.wait_for(cleaned.wait(), 1.0)
+        assert not material.exists()
+    finally:
+        release.set()
+        await asyncio.to_thread(stage._executor.shutdown, True)

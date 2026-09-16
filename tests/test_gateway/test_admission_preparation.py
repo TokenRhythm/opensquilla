@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
@@ -10,84 +9,13 @@ from unittest.mock import AsyncMock, Mock
 import pytest
 
 from opensquilla.application.turn_admission import AdmitTurn
-from opensquilla.application.turn_input import DocumentTurnContext
 from opensquilla.gateway import admission_preparation as preparation
-from opensquilla.gateway.artifact_contexts import BoundPromptAnnotationContext
 from opensquilla.gateway.auth import Principal
 from opensquilla.gateway.config import GatewayConfig
 from opensquilla.gateway.rpc import RpcHandlerError
 from opensquilla.run_mode import RunMode
 from opensquilla.sandbox.run_context import RunContext
 from opensquilla.session.models import SessionNode
-
-
-@pytest.mark.asyncio
-async def test_plain_turn_does_not_open_artifact_services(tmp_path: Path, monkeypatch) -> None:
-    open_service = AsyncMock()
-    monkeypatch.setattr(preparation.ArtifactSessionService, "from_session_storage", open_service)
-    focus = AsyncMock()
-    emitter = Mock()
-    binding = await preparation.bind_artifact(
-        AdmitTurn("agent:main:synthetic", "hello", "session"),
-        key="agent:main:synthetic",
-        session_id="session-synthetic",
-        session=SessionNode(session_key="agent:main:synthetic", session_id="session-synthetic"),
-        storage=SimpleNamespace(),
-        media_root=tmp_path,
-        principal_actor_id=None,
-        event_emitter_factory=emitter,
-        load_followup_focus=focus,
-    )
-    assert binding == preparation.ArtifactBinding()
-    open_service.assert_not_awaited()
-    focus.assert_not_awaited()
-    emitter.assert_not_called()
-
-
-@pytest.mark.asyncio
-async def test_document_scope_mismatch_fails_before_focus_or_events(tmp_path: Path, monkeypatch):
-    document = SimpleNamespace(
-        session_key="agent:main:another",
-        session_id="session-synthetic",
-        document_id="document-synthetic",
-        head_revision_id="revision-synthetic",
-    )
-    revision = SimpleNamespace(
-        document_id="document-synthetic",
-        revision_id="revision-synthetic",
-    )
-    service = SimpleNamespace(
-        get_document_head=AsyncMock(
-            return_value=SimpleNamespace(document=document, revision=revision),
-        )
-    )
-    monkeypatch.setattr(
-        preparation.ArtifactSessionService,
-        "from_session_storage",
-        AsyncMock(return_value=service),
-    )
-    focus, emitter = AsyncMock(), Mock()
-    with pytest.raises(RpcHandlerError) as caught:
-        await preparation.bind_artifact(
-            AdmitTurn(
-                "agent:main:synthetic",
-                "edit",
-                "session",
-                document_context=DocumentTurnContext("document-synthetic", "revision-synthetic"),
-            ),
-            key="agent:main:synthetic",
-            session_id="session-synthetic",
-            session=SessionNode(session_key="agent:main:synthetic", session_id="session-synthetic"),
-            storage=SimpleNamespace(),
-            media_root=tmp_path,
-            principal_actor_id=None,
-            event_emitter_factory=emitter,
-            load_followup_focus=focus,
-        )
-    assert caught.value.code == "DOCUMENT_UNAVAILABLE"
-    assert caught.value.retryable is False
-    focus.assert_not_awaited()
-    emitter.assert_not_called()
 
 
 def _route_dependencies(tmp_path: Path, *, guest: bool) -> dict:
@@ -97,7 +25,6 @@ def _route_dependencies(tmp_path: Path, *, guest: bool) -> dict:
         "key": session.session_key,
         "session_id": session.session_id,
         "atomic_intent_plan": None,
-        "binding": preparation.ArtifactBinding(),
         "workspace_guard": None,
         "storage": SimpleNamespace(),
         "sessions": SimpleNamespace(update=AsyncMock()),
@@ -112,11 +39,7 @@ def _route_dependencies(tmp_path: Path, *, guest: bool) -> dict:
         "guest_safe": guest,
         "guest_profile_factory": Mock(),
         "event_emitter_factory": Mock(return_value=AsyncMock()),
-        "candidate_loop_supported": lambda _capabilities: False,
-        "source_only_context": lambda context: replace(
-            context, tool_names=frozenset({"document_read"})
-        ),
-        "authority_scope": None,
+        "page_context_resolver": AsyncMock(),
     }
 
 
@@ -137,55 +60,98 @@ async def test_unavailable_guest_sandbox_rejects_before_allocating_workspace(tmp
     deps["sessions"].update.assert_not_awaited()
 
 
+
+
 @pytest.mark.asyncio
-async def test_incomplete_desktop_bridge_releases_authority_and_updates_binding(
-    tmp_path, monkeypatch
-):
-    from opensquilla.gateway import desktop_artifact_bridge
-
+async def test_page_context_is_user_content_on_the_normal_owner_route(tmp_path, monkeypatch):
     deps = _route_dependencies(tmp_path, guest=False)
-    context = BoundPromptAnnotationContext(
-        session_key=deps["key"],
-        session_id=deps["session_id"],
-        document_id="document-synthetic",
-        revision_id="revision-synthetic",
-        snapshots=(),
-        artifact_format="html",
-        tool_names=frozenset({"document_read", "document_finish"}),
-        operation_class="selection_edit",
-        request_context_prompt="synthetic context",
-    )
-    deps["binding"] = preparation.ArtifactBinding(context=context, service=SimpleNamespace())
-    order: list[str] = []
-
-    async def capabilities():
-        order.append("capabilities")
-        raise RuntimeError("synthetic capability failure")
-
-    async def close():
-        order.append("close")
-
-    lease = SimpleNamespace(capabilities=capabilities, aclose=close)
-    bridge = SimpleNamespace(acquire_binding=AsyncMock(return_value=lease))
-    deps["authority_scope"] = SimpleNamespace(register=lambda _cleanup: order.append("register"))
-    monkeypatch.setattr(
-        desktop_artifact_bridge, "get_desktop_artifact_bridge_client", lambda: bridge
-    )
     monkeypatch.setattr(
         preparation,
         "authoritative_project_run_context",
-        AsyncMock(return_value=(RunContext(run_mode=RunMode.FULL), None)),
+        AsyncMock(return_value=(RunContext(run_mode=RunMode.FULL, workspace=str(tmp_path)), None)),
     )
     monkeypatch.setattr(
-        preparation,
-        "resolve_default_run_mode",
+        preparation, "resolve_default_run_mode",
         AsyncMock(return_value=(RunMode.FULL, "config")),
     )
-    prepared = await preparation.prepare_route(AdmitTurn(deps["key"], "edit", "session"), **deps)
-    assert order == ["register", "capabilities", "close"]
-    assert deps["binding"].context.tool_names == frozenset({"document_read"})
-    assert prepared.envelope.runtime_services["artifact_context"] is deps["binding"].context
-    assert "desktop_artifact_bridge" not in prepared.envelope.runtime_services
-    assert "turn_cleanup_callbacks" not in prepared.envelope.runtime_services
+    deps["page_context_resolver"].return_value = {
+        "targetRef": "page-synthetic",
+        "annotations": [{"text": "Use a blue heading"}],
+    }
+    command = AdmitTurn(
+        deps["key"], "update the heading", "session",
+        page_context={"targetRef": "page-synthetic"},
+    )
+    prepared = await preparation.prepare_route(command, **deps)
+    deps["page_context_resolver"].assert_awaited_once_with(
+        command.page_context, session_key=deps["key"], session_id=deps["session_id"],
+        workspace=str(tmp_path),
+    )
+    assert "Use a blue heading" in prepared.page_context_text
+    assert "artifact_context" not in prepared.envelope.runtime_services
+    assert "turn_authority_cleanup" not in prepared.envelope.runtime_services
     assert prepared.host_execute_allowed is True
-    deps["sessions"].update.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mutation", ["none", "epoch", "session_id", "binding", "revoked"])
+async def test_preview_registration_rechecks_admitted_authority(tmp_path, monkeypatch, mutation):
+    from opensquilla.gateway.execution_workspaces import build_execution_workspace_factory
+    from opensquilla.project_workspaces import ProjectWorkspaceStateError, project_path_key
+    from opensquilla.session.manager import SessionManager
+    from opensquilla.session.storage import SessionStorage
+    from opensquilla.tools.types import ToolContext, current_tool_context
+
+    deps = _route_dependencies(tmp_path, guest=False)
+    async with SessionStorage(tmp_path / "session.db") as storage:
+        sessions = SessionManager(storage, execution_workspace_factory=(
+            build_execution_workspace_factory(deps["config"], profile_home=tmp_path)
+        ))
+        session = await sessions.create(deps["key"])
+        root = Path(session.execution_workspace["root"])
+        if mutation == "revoked":
+            project = await storage.create_or_restore_project_workspace(
+                path=str(root), path_key=project_path_key(root), display_name="Preview project",
+                trusted_at=1, now_ms=1,
+            )
+            await storage.bind_session_workspace(session.session_key, project.workspace_id)
+            session = await storage.get_session(session.session_key)
+        deps.update(
+            session=session, session_id=session.session_id, storage=storage, sessions=sessions,
+        )
+        monkeypatch.setattr(
+            preparation, "resolve_default_run_mode",
+            AsyncMock(return_value=(RunMode.FULL, "config")),
+        )
+        prepared = await preparation.prepare_route(
+            AdmitTurn(session.session_key, "make a page", "session"), **deps,
+        )
+        opener = prepared.envelope.runtime_services["workspace_preview_opener"]
+        (root / "index.html").write_text("<h1>preview</h1>")
+        if mutation != "none":
+            async with storage._write_transaction("test.revoke_preview_authority") as conn:
+                if mutation == "revoked":
+                    await conn.execute("UPDATE project_workspaces SET trusted_at=NULL")
+                elif mutation == "binding":
+                    await conn.execute("UPDATE sessions SET execution_workspace=NULL")
+                elif mutation == "epoch":
+                    await conn.execute("UPDATE sessions SET epoch=epoch+1")
+                else:
+                    await conn.execute("UPDATE sessions SET session_id='replacement'")
+        context = ToolContext(
+            is_owner=True, session_key=session.session_key, session_id=session.session_id,
+            workspace_dir=str(root), workspace_preview_opener=opener,
+        )
+        token = current_tool_context.set(context)
+        try:
+            if mutation == "none":
+                assert (await opener(context, path="index.html"))["created"] is True
+            else:
+                with pytest.raises((ValueError, ProjectWorkspaceStateError)):
+                    await opener(context, path="index.html")
+                async with storage.conn.execute(
+                    "SELECT COUNT(*) FROM artifact_documents"
+                ) as cursor:
+                    assert (await cursor.fetchone())[0] == 0
+        finally:
+            current_tool_context.reset(token)

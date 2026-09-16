@@ -29,7 +29,12 @@ def _embedded(marker_text: str) -> str:
         _emergency_compact_string(_LONG_VALUE, label="text"),
         _hard_compact_string(_LONG_VALUE, label="reasoning_content"),
         _compact_argument_string(_LONG_VALUE, preview=False),
-        _media_placeholder("image_url", _LONG_VALUE),
+        _media_placeholder("image_url"),
+        _media_placeholder("base64_image"),
+        _media_placeholder("base64_media"),
+        "[provider_request_image_url_omitted: 2048 chars]",
+        "[provider_request_base64_image_omitted: 2048 chars]",
+        "[provider_request_base64_media_omitted: 2048 chars]",
     ],
     ids=[
         "compact_string",
@@ -37,7 +42,12 @@ def _embedded(marker_text: str) -> str:
         "emergency_compact_string",
         "hard_compact_string",
         "compact_argument_string",
-        "media_placeholder",
+        "media_image_url",
+        "media_base64_image",
+        "media_base64_media",
+        "legacy_media_image_url",
+        "legacy_media_base64_image",
+        "legacy_media_base64_media",
     ],
 )
 def test_detects_every_instantiated_marker_embedded_mid_string(

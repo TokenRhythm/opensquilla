@@ -141,10 +141,13 @@ METHOD_SCOPES: dict[str, str] = {
     "sessions.preview": READ_SCOPE,
     SESSIONS_RESOLVE_METHOD: READ_SCOPE,
     "sessions.bootstrap": READ_SCOPE,
+    "sessions.executionLog.read": READ_SCOPE,
     "sessions.subscribe": READ_SCOPE,
     "sessions.unsubscribe": READ_SCOPE,
     "workspaces.list": READ_SCOPE,  # OpenSquilla-only; owner-guarded local paths.
     "sessions.messages.snapshot": READ_SCOPE,
+    "sessions.messages.snapshot.read": READ_SCOPE,
+    "transport.flow.update": READ_SCOPE,
     "sessions.messages.subscribe": READ_SCOPE,
     "sessions.messages.hydrate": READ_SCOPE,
     "sessions.messages.unsubscribe": READ_SCOPE,
@@ -169,7 +172,6 @@ METHOD_SCOPES: dict[str, str] = {
     "workbench.previews.create": READ_SCOPE,
     "gateway.identity.get": READ_SCOPE,
     "last-heartbeat": READ_SCOPE,
-    "system-presence": READ_SCOPE,
     "doctor.status": READ_SCOPE,
     "doctor.memory.status": READ_SCOPE,
     "diagnostics.status": READ_SCOPE,
@@ -222,6 +224,7 @@ METHOD_SCOPES: dict[str, str] = {
     "usage.cost": READ_SCOPE,
     "usage.query": READ_SCOPE,
     "meta.list": READ_SCOPE,  # OpenSquilla-only; invokable meta-skill catalog.
+    "meta.inspect": READ_SCOPE,  # OpenSquilla-only; body-free stable dependency tree.
     "meta.setup.plan": READ_SCOPE,  # OpenSquilla-only; dependency setup preview.
     "meta.setup.status": READ_SCOPE,  # OpenSquilla-only; background setup progress.
     "meta.runs.list": READ_SCOPE,
@@ -240,10 +243,6 @@ METHOD_SCOPES: dict[str, str] = {
     "onboarding.catalog": READ_SCOPE,
     "onboarding.router.catalog": READ_SCOPE,
     # ----- write -----
-    "wake": WRITE_SCOPE,
-    "send": WRITE_SCOPE,
-    "agent": WRITE_SCOPE,
-    "agent.wait": WRITE_SCOPE,
     "chat.send": WRITE_SCOPE,
     "chat.abort": WRITE_SCOPE,
     "chat.clarify_submit": WRITE_SCOPE,
@@ -252,18 +251,10 @@ METHOD_SCOPES: dict[str, str] = {
     "artifacts.documents.rename": WRITE_SCOPE,
     "artifacts.revisions.restore": WRITE_SCOPE,
     "artifacts.changes.revert": WRITE_SCOPE,
-    "artifacts.prompt_annotations.create": WRITE_SCOPE,
-    "artifacts.prompt_annotations.focus": WRITE_SCOPE,
-    "artifacts.prompt_annotations.update": WRITE_SCOPE,
-    "artifacts.prompt_annotations.discard": WRITE_SCOPE,
-    "artifacts.source.patch": WRITE_SCOPE,
     "artifacts.mutations.resolve": WRITE_SCOPE,
     "workbench.resources.open": WRITE_SCOPE,
     "documents.import": WRITE_SCOPE,
     "documents.publish": WRITE_SCOPE,
-    "documents.editSessions.start": WRITE_SCOPE,
-    "documents.editSessions.heartbeat": WRITE_SCOPE,
-    "documents.editSessions.close": WRITE_SCOPE,
     "search.query": WRITE_SCOPE,
     SESSIONS_CREATE_METHOD: WRITE_SCOPE,
     "sessions.fork": WRITE_SCOPE,
@@ -289,12 +280,10 @@ METHOD_SCOPES: dict[str, str] = {
     "goals.pause": WRITE_SCOPE,
     "goals.resume": WRITE_SCOPE,
     "goals.reattach": WRITE_SCOPE,
-    "sessions.steer": WRITE_SCOPE,
     "sessions.steer.v2": WRITE_SCOPE,
     "sessions.abort": WRITE_SCOPE,
     "sessions.reset": WRITE_SCOPE,
     "sessions.contextCompact": WRITE_SCOPE,
-    "sessions.compact": WRITE_SCOPE,
     "sessions.truncate": WRITE_SCOPE,
     "workspaces.open": WRITE_SCOPE,  # OpenSquilla-only; owner-guarded project lifecycle.
     "workspaces.update": WRITE_SCOPE,
@@ -302,6 +291,7 @@ METHOD_SCOPES: dict[str, str] = {
     "workspaces.remove": WRITE_SCOPE,
     "workspaces.history.delete": WRITE_SCOPE,
     "models.routing.set": WRITE_SCOPE,
+    "models.routing.resetRecommended": ADMIN_SCOPE,
     # Deleting a session is a routine, per-user write op like reset/truncate above,
     # so it is write-scoped rather than admin-gated. Admin-gating it broke deletion
     # for every no-auth operator on a non-loopback bind — notably the default Docker
@@ -331,6 +321,11 @@ METHOD_SCOPES: dict[str, str] = {
     "sandbox.path.create-directory": WRITE_SCOPE,  # OpenSquilla-only; owner-guarded path creation.
     # OpenSquilla-only; explicit override of `config.` admin prefix.
     "config.patch.safe": WRITE_SCOPE,
+    # Explicit, notice-bound user consent. Server-authored metadata and
+    # withdrawal cleanup keep this separate from generic config mutation.
+    "telemetry.consent.set": WRITE_SCOPE,
+    "telemetry.client_launch.record": WRITE_SCOPE,
+    "telemetry.product_active.record": WRITE_SCOPE,
     # OpenSquilla-only; manual ``/meta`` command launch stamp.
     "meta.run": WRITE_SCOPE,
     # Raw prompts remain owner/admin-gated inside the handlers. WRITE_SCOPE is
@@ -348,7 +343,6 @@ METHOD_SCOPES: dict[str, str] = {
     "exec.approval.waitDecision": APPROVALS_SCOPE,
     "exec.approval.status": APPROVALS_SCOPE,
     "exec.approval.snapshot": APPROVALS_SCOPE,
-    "exec.approval.forget": APPROVALS_SCOPE,
     "exec.approval.resolve": APPROVALS_SCOPE,
     "exec.approval.extend": APPROVALS_SCOPE,
     "plugin.approval.request": APPROVALS_SCOPE,
@@ -379,10 +373,7 @@ METHOD_SCOPES: dict[str, str] = {
     # the `config.` prefix default would already classify it as admin.
     "config.reload": ADMIN_SCOPE,
     "chat.inject": ADMIN_SCOPE,
-    "system-event": ADMIN_SCOPE,
     "set-heartbeats": ADMIN_SCOPE,
-    "secrets.reload": ADMIN_SCOPE,
-    "secrets.resolve": ADMIN_SCOPE,
     "agents.create": ADMIN_SCOPE,
     "agents.update": ADMIN_SCOPE,
     "agents.delete": ADMIN_SCOPE,
@@ -428,8 +419,7 @@ METHOD_SCOPES: dict[str, str] = {
     "diagnostics.set": ADMIN_SCOPE,
     "onboarding.provider.credential.reveal": ADMIN_SCOPE,
     "onboarding.provider.credential.clear": ADMIN_SCOPE,
-    "cron.add": ADMIN_SCOPE,
-    "cron.create": ADMIN_SCOPE,  # OpenSquilla-only alias for cron.add.
+    "cron.create": ADMIN_SCOPE,
     "cron.update": ADMIN_SCOPE,
     "cron.remove": ADMIN_SCOPE,
     "cron.run": ADMIN_SCOPE,
@@ -463,6 +453,7 @@ METHOD_SCOPES: dict[str, str] = {
     # The probe persists nothing but carries candidate credentials.
     "onboarding.provider.probe": ADMIN_SCOPE,
     "onboarding.llmProfile.upsert": ADMIN_SCOPE,
+    "onboarding.llmProfile.upsertAndActivate": ADMIN_SCOPE,
     "onboarding.llmProfile.credential.clear": ADMIN_SCOPE,
     "onboarding.llmProfile.remove": ADMIN_SCOPE,
     "onboarding.llmProfile.active.remove": ADMIN_SCOPE,

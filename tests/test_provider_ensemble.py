@@ -59,6 +59,7 @@ from opensquilla.provider.ensemble import (
     ensemble_runtime_status,
 )
 from opensquilla.provider.failures import ProviderFailureKind
+from opensquilla.provider.image_projection import count_image_blocks
 from opensquilla.provider.request_proof import project_final_request_payload
 from opensquilla.provider.selector import ProviderConfig
 from opensquilla.provider.types import (
@@ -306,6 +307,73 @@ def _openrouter_member(model: str, *, thinking: str | None = "high") -> Ensemble
     )
 
 
+@pytest.mark.parametrize(
+    "scenario", ["normal", "partial", "fixed_aggregator", "fixed_direct", "terminal"],
+)
+async def test_physical_execution_identity_tracks_ensemble_role(monkeypatch, scenario) -> None:
+    from opensquilla.provider.execution_identity import with_execution_identity
+    from opensquilla.provider.types import ExecutionIdentity
+
+    def success(model):
+        return _FakePlan(events=[TextDeltaEvent(text="synthetic draft"), DoneEvent(model=model)])
+
+    failure = _FakePlan(events=[ErrorEvent(message="synthetic rejection", code="400")])
+    registry = _FakeRegistry(plans={
+        "p1": success("p1"), "p2": success("p2"),
+        "agg": success("agg"), "fixed": success("fixed"),
+    })
+    if scenario in {"partial", "fixed_direct", "terminal"}:
+        registry.plans["p1"] = failure
+    if scenario in {"fixed_direct", "terminal"}:
+        registry.plans["p2"] = failure
+    if scenario == "fixed_aggregator":
+        registry.plans["agg"] = failure
+    if scenario == "terminal":
+        registry.plans["fixed"] = failure
+    monkeypatch.setattr("opensquilla.provider.ensemble._build_provider", registry.provider_for)
+    provider = EnsembleProvider(
+        profile_name="synthetic-identity",
+        proposers=[_member("p1"), _member("p2")],
+        aggregator=_member("agg"),
+        fallback_provider=registry.provider_for(ProviderConfig(provider="fake", model="fixed")),
+        fallback_provider_name="fake", fallback_model="fixed",
+        all_failed_policy="fallback_single", min_successful_proposers=1,
+        shuffle_candidates=False,
+    )
+    identity = ExecutionIdentity(kind="multi_model_fusion", model="hidden-anchor")
+    messages = [with_execution_identity(
+        Message(role="user", content="synthetic request"), identity,
+    )]
+    before = messages[0].model_dump_json()
+    config = ChatConfig(execution_identity=identity, provider_request_max_chars=50000)
+    context = TurnExecutionContext.create(
+        TurnIdentity("synthetic-turn", "synthetic-answer", "agent:main:synthetic-identity")
+    )
+
+    events = [
+        event async for event in provider.chat(messages, config=config, execution_context=context)
+    ]
+
+    assert registry.calls
+    for call in registry.calls:
+        facts = call["config"].execution_identity
+        assert facts.model == call["model"]
+        expected = (
+            "single_model" if call["model"] == "fixed" and scenario in {"fixed_direct", "terminal"}
+            else "multi_model_fusion"
+        )
+        assert facts.kind == expected
+        text = "\n".join(str(message.content) for message in call["messages"])
+        assert text.count("Current response execution:") == 1
+        assert f'"kind":"{expected}"' in text
+        assert "hidden-anchor" not in text
+        if expected == "single_model":
+            assert '"model":"fixed"' in text
+    assert messages[0].model_dump_json() == before
+    assert config.execution_identity == identity
+    assert any(isinstance(event, DoneEvent) for event in events) == (scenario != "terminal")
+
+
 def test_unknown_historical_member_is_unready_placeholder() -> None:
     member = _member_from_ref(
         SimpleNamespace(provider="historical-unknown", model="legacy-model"),
@@ -393,6 +461,7 @@ def _build_tokenrhythm_budget_provider(
     catalog: Any | None = None,
     enable_rebinding: bool = True,
     context_window_tokens: int = 0,
+    attachment_input_tokens: int = 0,
 ) -> EnsembleProvider:
     cfg = _tokenrhythm_ensemble_config(
         explicit_cap=explicit_cap,
@@ -410,6 +479,10 @@ def _build_tokenrhythm_budget_provider(
         _enable_member_request_budget_rebinding=enable_rebinding,
         _model_catalog=catalog or _BudgetCatalog(),
         _context_overflow_threshold=0.85,
+        turn_metadata={
+            "large_context_capacity_required": attachment_input_tokens > 0,
+            "large_context_request_input_tokens": attachment_input_tokens,
+        },
     )
 
 
@@ -1223,14 +1296,21 @@ def _ensemble_for_validation(
     ],
     ids=["base64", "historical-url", "mixed", "typed-tool-result"],
 )
-async def test_ensemble_rejects_typed_images_before_starting_any_leg(
+async def test_ensemble_projects_typed_images_before_starting_any_leg(
     monkeypatch: pytest.MonkeyPatch,
     messages: list[Message],
 ) -> None:
+    original_snapshot = [
+        message.model_dump(mode="json", exclude_none=True) for message in messages
+    ]
     registry = _FakeRegistry(
         {
-            "p1": _FakePlan([DoneEvent(model="p1")]),
-            "agg": _FakePlan([DoneEvent(model="agg")]),
+            "p1": _FakePlan(
+                [TextDeltaEvent(text="draft"), DoneEvent(model="p1")]
+            ),
+            "agg": _FakePlan(
+                [TextDeltaEvent(text="final"), DoneEvent(model="agg")]
+            ),
         }
     )
     monkeypatch.setattr("opensquilla.provider.ensemble._build_provider", registry.provider_for)
@@ -1238,19 +1318,51 @@ async def test_ensemble_rejects_typed_images_before_starting_any_leg(
 
     events = [event async for event in provider.chat(messages)]
 
-    assert len(events) == 1
-    assert isinstance(events[0], ErrorEvent)
-    assert events[0].code == "ensemble_multimodal_unsupported"
-    assert events[0].message == (
-        "Ensemble does not support image input yet. "
-        "Switch to a single-model routing mode and try again."
+    assert [call["model"] for call in registry.calls] == ["p1", "agg"]
+    assert all(count_image_blocks(call["messages"]) == 0 for call in registry.calls)
+    assert "图片未分析" in str(registry.calls[0]["messages"])
+    assert count_image_blocks(messages) == 1
+    assert [
+        message.model_dump(mode="json", exclude_none=True) for message in messages
+    ] == original_snapshot
+    assert not any(isinstance(event, ErrorEvent) for event in events)
+    assert any(isinstance(event, DoneEvent) for event in events)
+
+
+@pytest.mark.asyncio
+async def test_ensemble_gives_each_physical_member_a_fresh_text_only_copy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registry = _FakeRegistry(
+        {
+            "p1": _FakePlan([TextDeltaEvent(text="one"), DoneEvent(model="p1")]),
+            "p2": _FakePlan([TextDeltaEvent(text="two"), DoneEvent(model="p2")]),
+            "agg": _FakePlan([TextDeltaEvent(text="final"), DoneEvent(model="agg")]),
+        }
     )
-    assert registry.calls == []
+    monkeypatch.setattr("opensquilla.provider.ensemble._build_provider", registry.provider_for)
+    provider = _ensemble_for_validation(proposers=[_member("p1"), _member("p2")])
+    messages = [
+        Message(
+            role="user",
+            content=[ContentBlockImage(media_type="image/png", data="aW1hZ2U=")],
+        )
+    ]
+
+    events = [event async for event in provider.chat(messages)]
+
+    calls = {call["model"]: call for call in registry.calls}
+    assert set(calls) == {"p1", "p2", "agg"}
+    assert calls["p1"]["messages"] is not calls["p2"]["messages"]
+    assert calls["p1"]["messages"][0] is not calls["p2"]["messages"][0]
+    assert all(count_image_blocks(call["messages"]) == 0 for call in calls.values())
+    assert count_image_blocks(messages) == 1
+    assert any(isinstance(event, DoneEvent) for event in events)
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("all_failed_policy", ["error", "fallback_single"])
-async def test_ensemble_image_validation_precedes_empty_lineup_fallback(
+async def test_ensemble_image_projection_preserves_empty_lineup_policy(
     all_failed_policy: Literal["error", "fallback_single"],
 ) -> None:
     registry = _FakeRegistry(
@@ -1276,10 +1388,16 @@ async def test_ensemble_image_validation_precedes_empty_lineup_fallback(
 
     events = [event async for event in provider.chat(messages)]
 
-    assert [getattr(event, "code", "") for event in events] == [
-        "ensemble_multimodal_unsupported"
-    ]
-    assert registry.calls == []
+    if all_failed_policy == "error":
+        assert [getattr(event, "code", "") for event in events] == [
+            "ensemble_no_proposers"
+        ]
+        assert registry.calls == []
+    else:
+        assert [call["model"] for call in registry.calls] == ["fallback"]
+        assert count_image_blocks(registry.calls[0]["messages"]) == 0
+        assert "图片未分析" in str(registry.calls[0]["messages"])
+        assert not any(isinstance(event, ErrorEvent) for event in events)
 
 
 def test_ensemble_image_validation_does_not_guess_untyped_or_document_content() -> None:
@@ -2503,10 +2621,14 @@ async def test_tool_continuation_keeps_one_public_aggregator_role(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("identity_enabled", [False, True])
 async def test_rebuilt_provider_restores_all_continuation_usage_without_replaying_proposers(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, identity_enabled: bool,
 ) -> None:
     """A router-control rebuild must keep the whole logical turn receipt."""
+
+    from opensquilla.provider.execution_identity import with_execution_identity
+    from opensquilla.provider.types import ExecutionIdentity
 
     registry = _AttemptRegistry(
         {
@@ -2605,7 +2727,8 @@ async def test_rebuilt_provider_restores_all_continuation_usage_without_replayin
         )
     )
     tools = [_tool()]
-    config = ChatConfig(max_tokens=99, thinking=False)
+    identity = ExecutionIdentity(kind="multi_model_fusion") if identity_enabled else None
+    config = ChatConfig(max_tokens=99, thinking=False, execution_identity=identity)
     provider = EnsembleProvider(
         profile_name="rebuilt-ensemble",
         proposers=[_member("p1"), _member("p2")],
@@ -2617,7 +2740,7 @@ async def test_rebuilt_provider_restores_all_continuation_usage_without_replayin
     first_events = [
         event
         async for event in provider.chat(
-            [Message(role="user", content="answer this")],
+            [with_execution_identity(Message(role="user", content="answer this"), identity)],
             tools=tools,
             config=config,
             execution_context=context,
@@ -2686,13 +2809,23 @@ async def test_rebuilt_provider_restores_all_continuation_usage_without_replayin
     assert final_done.usage_missing_count == 0
     assert final_done.ensemble_trace is not None
     assert final_done.ensemble_trace["llm_request_count"] == 5
+    if identity_enabled:
+        for call in registry.calls:
+            text = str([message.content for message in call["messages"]])
+            assert text.count("Current response execution:") == 1
+            assert '"kind":"multi_model_fusion"' in text
+            assert call["config"].execution_identity.model == call["model"]
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("identity_enabled", [False, True])
 async def test_rebuilt_provider_restores_fixed_fallback_continuation_usage(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, identity_enabled: bool,
 ) -> None:
     """A rebuilt fixed fallback must retain proposer and prior fixed rows."""
+
+    from opensquilla.provider.execution_identity import with_execution_identity
+    from opensquilla.provider.types import ExecutionIdentity
 
     registry = _AttemptRegistry(
         {
@@ -2760,7 +2893,8 @@ async def test_rebuilt_provider_restores_fixed_fallback_continuation_usage(
         )
     )
     tools = [_tool()]
-    config = ChatConfig(max_tokens=99, thinking=False)
+    identity = ExecutionIdentity(kind="multi_model_fusion") if identity_enabled else None
+    config = ChatConfig(max_tokens=99, thinking=False, execution_identity=identity)
     provider = EnsembleProvider(
         profile_name="rebuilt-fixed",
         proposers=[_member("p1")],
@@ -2776,7 +2910,7 @@ async def test_rebuilt_provider_restores_fixed_fallback_continuation_usage(
     first_events = [
         event
         async for event in provider.chat(
-            [Message(role="user", content="answer this")],
+            [with_execution_identity(Message(role="user", content="answer this"), identity)],
             tools=tools,
             config=config,
             execution_context=context,
@@ -2831,6 +2965,12 @@ async def test_rebuilt_provider_restores_fixed_fallback_continuation_usage(
     assert final_done.usage_missing_count == 1
     assert final_done.ensemble_trace is not None
     assert final_done.ensemble_trace["llm_request_count"] == 4
+    if identity_enabled:
+        for call in registry.calls:
+            text = str([message.content for message in call["messages"]])
+            assert text.count("Current response execution:") == 1
+            assert '"kind":"multi_model_fusion"' in text
+            assert call["config"].execution_identity.model == call["model"]
 
 
 @pytest.mark.asyncio
@@ -3073,14 +3213,16 @@ async def test_ensemble_resolves_max_tokens_per_openrouter_member(
 
 
 @pytest.mark.parametrize("outer_cap", [367_200, 2_896_800])
+@pytest.mark.parametrize("attachment_input_tokens", [0, 1_000])
 @pytest.mark.asyncio
 async def test_tokenrhythm_ensemble_rebinds_request_cap_per_member_context(
     monkeypatch: pytest.MonkeyPatch,
     outer_cap: int,
+    attachment_input_tokens: int,
 ) -> None:
     registry = _tokenrhythm_budget_registry()
     monkeypatch.setattr("opensquilla.provider.ensemble._build_provider", registry.provider_for)
-    provider = _build_tokenrhythm_budget_provider()
+    provider = _build_tokenrhythm_budget_provider(attachment_input_tokens=attachment_input_tokens)
 
     events = [
         event
@@ -3117,6 +3259,95 @@ async def test_tokenrhythm_ensemble_rebinds_request_cap_per_member_context(
     assert aggregator_trace["effective_context_window_source"] == "catalog"
     assert aggregator_trace["effective_provider_request_max_chars"] == 2_896_800
     assert aggregator_trace["provider_request_max_chars_source"] == "member_context"
+
+
+@pytest.mark.parametrize(
+    ("attachment_input_tokens", "explicit_cap"),
+    [(10_000_000, 0), (10_000_000, 100_000_000), (1_000, 2_000)],
+)
+@pytest.mark.asyncio
+async def test_ensemble_skips_all_members_when_frozen_request_exceeds_capacity(
+    monkeypatch: pytest.MonkeyPatch,
+    attachment_input_tokens: int,
+    explicit_cap: int,
+) -> None:
+    registry = _tokenrhythm_budget_registry()
+    monkeypatch.setattr("opensquilla.provider.ensemble._build_provider", registry.provider_for)
+    provider = _build_tokenrhythm_budget_provider(
+        attachment_input_tokens=attachment_input_tokens,
+        explicit_cap=explicit_cap,
+    )
+
+    events = [event async for event in provider.chat([Message(role="user", content="x")])]
+
+    assert registry.calls == []
+    assert events
+
+
+@pytest.mark.asyncio
+async def test_attachment_capacity_quorum_failure_skips_otherwise_eligible_proposer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    small, large, aggregator, fallback_member = [
+        replace(_member(model, thinking="off"), max_tokens=1_000)
+        for model in ("small", "large", "aggregator", "fallback")
+    ]
+    registry = _FakeRegistry({
+        model: _FakePlan([TextDeltaEvent(text=model), DoneEvent(model=model)])
+        for model in ("small", "large", "aggregator", "fallback")
+    })
+    monkeypatch.setattr("opensquilla.provider.ensemble._build_provider", registry.provider_for)
+    reliable = _MemberRequestBudgetBinding(
+        context_window_tokens=128_000,
+        context_window_source="catalog",
+        context_overflow_threshold=0.85,
+        cap_source="member_context",
+        rederive=True,
+        inherit_top_level_cap=True,
+    )
+    provider = EnsembleProvider(
+        profile_name="attachment-quorum",
+        proposers=[small, large],
+        aggregator=aggregator,
+        fallback_provider=registry.provider_for(fallback_member.provider_config),
+        fallback_provider_name="fake",
+        fallback_model="fallback",
+        min_successful_proposers=2,
+        all_failed_policy="fallback_single",
+        _attachment_request_input_tokens=20_000,
+        _fallback_request_budget_member=fallback_member,
+        _member_request_budget_bindings={
+            ("fake", "small", ""): replace(reliable, context_window_tokens=16_000),
+            ("fake", "large", ""): reliable,
+            ("fake", "aggregator", ""): reliable,
+            ("fake", "fallback", ""): reliable,
+        },
+    )
+
+    events = [event async for event in provider.chat([Message(role="user", content="x")])]
+
+    assert [call["model"] for call in registry.calls] == ["fallback"]
+    done = next(event for event in events if isinstance(event, DoneEvent))
+    assert done.ensemble_trace is not None
+    candidates = {candidate["model"]: candidate for candidate in done.ensemble_trace["candidates"]}
+    assert candidates["small"]["error_code"] == "provider_request_budget_exhausted"
+    assert candidates["large"]["error_code"] == "quorum_unreachable"
+    assert not any(candidate["request_started"] for candidate in candidates.values())
+
+
+@pytest.mark.asyncio
+async def test_ensemble_skips_members_when_attachment_capacity_is_unknown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registry = _tokenrhythm_budget_registry()
+    monkeypatch.setattr("opensquilla.provider.ensemble._build_provider", registry.provider_for)
+    provider = _build_tokenrhythm_budget_provider(attachment_input_tokens=1)
+    provider._member_request_budget_bindings.clear()
+
+    events = [event async for event in provider.chat([Message(role="user", content="x")])]
+
+    assert registry.calls == []
+    assert events
 
 
 @pytest.mark.asyncio
@@ -8398,17 +8629,25 @@ async def test_step3_first_success_does_not_cancel_slow_proposer(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("reset_idle", [False, True])
 async def test_step3_meaningful_stream_can_exceed_per_call_idle_budget(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, reset_idle: bool,
 ) -> None:
     monkeypatch.setattr(
         "opensquilla.provider.ensemble._ENSEMBLE_HEARTBEAT_INTERVAL_SECONDS",
         0.003,
     )
+    # Advance the provider's clock, not the OS scheduler: a busy runner can
+    # legitimately oversleep a 12 ms sleep beyond the unchanged 20 ms deadline.
+    clock = [1.0]
+    monkeypatch.setattr(
+        "opensquilla.provider.ensemble.time", SimpleNamespace(monotonic=lambda: clock[0]),
+    )
 
     async def _source() -> AsyncIterator[StreamEvent]:
         for index in range(4):
-            await asyncio.sleep(0.012)
+            await asyncio.sleep(0)
+            clock[0] += 0.012
             yield TextDeltaEvent(text=f"chunk-{index}")
         yield DoneEvent(model="steady")
 
@@ -8417,8 +8656,12 @@ async def test_step3_meaningful_stream_can_exceed_per_call_idle_budget(
         phase="step3",
         message="waiting",
         timeout_seconds=0.02,
-        reset_deadline_on_event=True,
+        reset_deadline_on_event=reset_idle,
     )
+    if not reset_idle:
+        with pytest.raises(TimeoutError):
+            _ = [event async for event in wrapped]
+        return
     events = [event async for event in wrapped]
 
     assert [event.text for event in events if isinstance(event, TextDeltaEvent)] == [
@@ -8428,6 +8671,7 @@ async def test_step3_meaningful_stream_can_exceed_per_call_idle_budget(
         "chunk-3",
     ]
     assert isinstance(events[-1], DoneEvent)
+    assert clock[0] - 1.0 > 0.02
 
 
 @pytest.mark.asyncio

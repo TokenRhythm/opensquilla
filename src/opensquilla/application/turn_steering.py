@@ -1,9 +1,8 @@
-"""Expected-turn steering and legacy append rollback, without transport ownership."""
+"""Expected-turn steering without transport ownership."""
 
 from __future__ import annotations
 
 from collections.abc import Awaitable, Callable, Mapping
-from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass
 from typing import Literal, Protocol
 
@@ -103,16 +102,6 @@ class SteeringAcceptanceError(RuntimeError):
         self.failure = failure
 
 
-class SteeringRollbackError(RuntimeError):
-    """A rejected legacy input remains durable and must not be resent blindly."""
-
-    def __init__(self, key: str, message_id: str | None, target_turn_id: str) -> None:
-        super().__init__("The rejected steering input could not be rolled back")
-        self.session_key = key
-        self.message_id = message_id
-        self.target_turn_id = target_turn_id
-
-
 @dataclass(frozen=True, slots=True)
 class NormalizedSteeringText:
     message: str
@@ -137,12 +126,6 @@ class PreparedSteeringInput:
 
 
 @dataclass(frozen=True, slots=True)
-class AppendedSteeringInput:
-    message_text: str | None
-    message_id: str | None
-
-
-@dataclass(frozen=True, slots=True)
 class RuntimeSteeringDecision:
     accepted: bool
     task_id: str | None = None
@@ -156,8 +139,6 @@ class SteeringNotice:
     session_key: str
     message_id: str | None
     context: SteeringContext
-    durable: bool = False
-    rejected_orphan: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -182,9 +163,6 @@ class SteeringPrimitives(Protocol):
 
     @property
     def durable_available(self) -> bool: ...
-
-    @property
-    def legacy_available(self) -> bool: ...
 
     def normalize(self, message: str, *, is_web_source: bool) -> NormalizedSteeringText: ...
 
@@ -228,37 +206,6 @@ class SteeringPrimitives(Protocol):
     def notify_appended(self, entry: SteeringTranscript) -> None: ...
 
     async def disposition(self, acceptance: SteeringAcceptance) -> SteeringDisposition: ...
-
-    async def active_turn(self, key: str) -> str | None: ...
-
-    def session_lock(self, key: str) -> AbstractAsyncContextManager[object]: ...
-
-    async def append(
-        self,
-        key: str,
-        message: str,
-        context: SteeringContext,
-    ) -> AppendedSteeringInput: ...
-
-    async def steer_runtime(
-        self,
-        key: str,
-        message: str,
-        *,
-        semantic_message: str,
-        message_id: str | None,
-        client_message_id: str,
-        surface_id: str,
-    ) -> str | None: ...
-
-    async def remove(self, key: str, message_id: str) -> bool: ...
-
-    async def update_context(
-        self,
-        key: str,
-        message_id: str,
-        context: SteeringContext,
-    ) -> bool: ...
 
     async def publish_steer(self, notice: SteeringNotice) -> None: ...
 
@@ -304,17 +251,12 @@ def rejected_steer(
 
 
 class TurnSteering:
-    """Own replay, atomic expected-turn acceptance and rejected legacy input recovery."""
+    """Own replay and atomic expected-turn acceptance."""
 
     def __init__(self, ports: SteeringPrimitives) -> None:
         self._ports = ports
 
     async def steer(self, command: SteerTurn) -> SteerTurnResult:
-        if command.mode == "durable":
-            return await self._durable(command)
-        return await self._legacy(command)
-
-    async def _durable(self, command: SteerTurn) -> SteerTurnResult:
         ports, key = self._ports, command.session_key
         target = self._required(command.expected_turn_id, "expected_turn_id")
         request_id = self._required(command.client_request_id, "client_request_id")
@@ -416,7 +358,7 @@ class TurnSteering:
             raise RuntimeError("accepted steering input has no durable receipt")
         if not acceptance.replayed:
             ports.notify_appended(prepared.entry)
-            notice = SteeringNotice(key, acceptance.receipt.message_id, context, durable=True)
+            notice = SteeringNotice(key, acceptance.receipt.message_id, context)
             try:
                 await ports.publish_steer(notice)
                 await ports.publish_disposition(notice)
@@ -435,121 +377,6 @@ class TurnSteering:
         )
         _metric("accepted", key=key)
         return await self._response(acceptance, request_id, message_id, surface)
-
-    async def _legacy(self, command: SteerTurn) -> SteerTurnResult:
-        ports, key = self._ports, command.session_key
-        log.info(
-            "sessions.steer.legacy_used",
-            session_key=key,
-            deprecated=True,
-            replacement="sessions.steer.v2",
-        )
-        _metric("legacy_requested", key=key)
-        await ports.session(key)
-        if not ports.legacy_available:
-            return {"status": "unavailable", "accepted": False, "key": key}
-        target = await ports.active_turn(key)
-        if not target:
-            return {"status": "idle", "accepted": False, "key": key}
-        normalized = ports.normalize(command.message, is_web_source=command.is_web_source)
-        if normalized.generated_attachments:
-            raise ValueError("Steering does not support generated attachments")
-        message_id = command.client_message_id
-        surface = command.surface_id
-        if message_id is None or surface is None:
-            raise ValueError("legacy steering requires resolved client and surface identities")
-        context = SteeringContext(target, message_id, surface)
-        async with ports.session_lock(key):
-            entry = await ports.append(key, normalized.message, context)
-        message = entry.message_text if entry.message_text is not None else normalized.message
-        user_message_id = entry.message_id
-        accepted_turn = await ports.steer_runtime(
-            key,
-            message,
-            semantic_message=normalized.semantic_message,
-            message_id=user_message_id,
-            client_message_id=message_id,
-            surface_id=surface,
-        )
-        if not accepted_turn:
-            removed = False
-            rollback_error: str | None = None
-            if user_message_id:
-                try:
-                    removed = await ports.remove(key, user_message_id)
-                except Exception as exc:  # noqa: BLE001 - classify dirty rollback.
-                    rollback_error = str(exc)
-            if removed:
-                return {"status": "idle", "accepted": False, "key": key}
-            rejected = SteeringContext(
-                target, message_id, surface, disposition="rejected", revision=2
-            )
-            if user_message_id:
-                try:
-                    updated = await ports.update_context(key, user_message_id, rejected)
-                    if not updated:
-                        log.warning(
-                            "sessions.steer.dirty_context_update_missed",
-                            session_key=key,
-                            message_id=user_message_id,
-                        )
-                except Exception:  # noqa: BLE001 - dirty failure remains authoritative.
-                    log.warning(
-                        "sessions.steer.dirty_context_update_failed",
-                        session_key=key,
-                        message_id=user_message_id,
-                        exc_info=True,
-                    )
-            try:
-                await ports.publish_disposition(
-                    SteeringNotice(key, user_message_id, rejected, rejected_orphan=True)
-                )
-            except Exception:  # noqa: BLE001 - caller still receives dirty failure.
-                log.warning(
-                    "sessions.steer.dirty_disposition_emit_failed",
-                    session_key=key,
-                    message_id=user_message_id,
-                    exc_info=True,
-                )
-            log.warning(
-                "sessions.steer.rollback_failed",
-                session_key=key,
-                message_id=user_message_id,
-                error=rollback_error,
-            )
-            raise SteeringRollbackError(key, user_message_id, target)
-        accepted_context = SteeringContext(accepted_turn, message_id, surface)
-        if user_message_id:
-            try:
-                await ports.update_context(key, user_message_id, accepted_context)
-            except Exception:  # noqa: BLE001 - input already belongs to the runtime.
-                log.warning(
-                    "sessions.steer.context_update_failed",
-                    session_key=key,
-                    message_id=user_message_id,
-                    exc_info=True,
-                )
-        notice = SteeringNotice(key, user_message_id, accepted_context)
-        try:
-            await ports.publish_steer(notice)
-            await ports.publish_disposition(notice)
-        except Exception:  # noqa: BLE001 - runtime acceptance is authoritative.
-            log.warning(
-                "sessions.steer.accepted_event_emit_failed",
-                session_key=key,
-                message_id=user_message_id,
-                exc_info=True,
-            )
-        return {
-            "status": "accepted",
-            "accepted": True,
-            "key": key,
-            "turn_id": accepted_turn,
-            "client_message_id": message_id,
-            "user_message_id": user_message_id,
-            "surface_id": surface,
-            "disposition": "next_safe_boundary",
-        }
 
     async def _response(
         self,

@@ -2084,7 +2084,7 @@ pre {
      so the More drawer and dialogs dim it. */
   .mobile-tabbar {
     display: grid;
-    grid-template-columns: repeat(4, minmax(0, 1fr));
+    grid-template-columns: repeat(3, minmax(0, 1fr));
     position: fixed;
     left: 0;
     right: 0;

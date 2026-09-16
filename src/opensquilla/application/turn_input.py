@@ -30,10 +30,6 @@ class MemoryCapturePolicy:
     run_kind: str | None = None
 
 
-@dataclass(frozen=True, slots=True)
-class DocumentTurnContext:
-    document_id: str
-    head_revision_id: str
 
 
 @dataclass(frozen=True, slots=True)

@@ -51,7 +51,10 @@ function makeStream(): ChatRpcStreamApi {
   }
 }
 
-function makeHarness(activeStreamTaskId = '') {
+function makeHarness(
+  activeStreamTaskId = '',
+  taskOwnership?: UseChatRpcEventHandlersOptions['taskOwnership'],
+) {
   const stream = makeStream()
   const messages: Ref<ChatMessage[]> = ref([])
   const activeTaskId = ref(activeStreamTaskId)
@@ -61,6 +64,7 @@ function makeHarness(activeStreamTaskId = '') {
     lastStreamSeq: ref(0),
     activeTaskGroups: ref(new Set<string>()),
     activeStreamTaskId: activeTaskId,
+    taskOwnership,
     aborted: ref(false),
     messages,
     pendingQueue: ref([]),
@@ -92,6 +96,7 @@ function makeHarness(activeStreamTaskId = '') {
     saveWidgetState: vi.fn(),
     handleSessionConnectionState: vi.fn(),
     loadCurrentSessionUsage: vi.fn(),
+    onRecoveryRequired: vi.fn(),
   }
   const scope = effectScope()
   const rawApi = scope.run(() => useChatRpcEventHandlers(options))!
@@ -126,6 +131,21 @@ function toolUse(taskId: string | undefined, toolName: string): ConversationTool
 }
 
 describe('issue #344 — live stream is bound to a single task', () => {
+  it('fences post-subscription callbacks when a same-socket snapshot starts before the old read settles', async () => {
+    const { api, options, scope } = makeHarness('task-B')
+    let finish!: (value: { authoritative: boolean, live: boolean, backgroundOnly: boolean }) => void
+    options.subscribeSession = vi.fn(() => new Promise<{ authoritative: boolean, live: boolean, backgroundOnly: boolean }>(resolve => { finish = resolve }))
+    options.onSessionSubscribed = vi.fn()
+    try {
+      api.handlers.onConnectionState('connected')
+      api.beginRecovery()
+      finish({ authoritative: true, live: true, backgroundOnly: false })
+      await Promise.resolve()
+      await Promise.resolve()
+      expect(options.onSessionSubscribed).not.toHaveBeenCalled()
+    } finally { scope.stop() }
+  })
+
   it.each([
     { extra: {}, safe: true },
     { extra: { noPriorProviderDispatch: null }, safe: false },
@@ -179,6 +199,151 @@ describe('issue #344 — live stream is bound to a single task', () => {
     const { api, stream } = makeHarness('task-B')
     api.handlers.onToolUseStart(toolUse(undefined, 'shell'))
     expect(stream.appendToolCall).toHaveBeenCalledTimes(1)
+  })
+
+  it('fences an explicit legacy turn before routing, rendering, or advancing the cursor', () => {
+    const { api, options, stream, scope } = makeHarness('task-B')
+    try {
+      const stale = { session_key: SESSION, turn_id: 'task-A' }
+      api.handlers.onWireEventFixture('session.event.ensemble_progress', {
+        ...stale, stream_seq: 100, event_type: 'proposer_finish', proposer_model: 'old-model',
+      })
+      api.handlers.onWireEventFixture('session.event.router_decision', {
+        ...stale, stream_seq: 101, tier: 'c1', model: 'old-model', source: 'llm_ensemble',
+      })
+      api.handlers.onWireEventFixture('session.event.text_delta', {
+        ...stale, stream_seq: 102, text: 'old text',
+      })
+      api.handlers.onWireEventFixture('session.event.thinking', {
+        ...stale, stream_seq: 103, text: 'old thinking',
+      })
+      api.handlers.onWireEventFixture('session.event.router_control_replay', {
+        ...stale, stream_seq: 104,
+      })
+      expect(options.appendEnsembleProgress).not.toHaveBeenCalled()
+      expect(options.queueRouterDecision).not.toHaveBeenCalled()
+      expect(options.handleRouterControlReplay).not.toHaveBeenCalled()
+      expect(stream.appendDelta).not.toHaveBeenCalled()
+      expect(stream.showThinkingIndicator).not.toHaveBeenCalled()
+      expect(options.lastStreamSeq.value).toBe(0)
+
+      // A positive current turn remains sufficient without task_id. Truly
+      // untagged progress also keeps the compatibility behavior from #1598.
+      api.handlers.onWireEventFixture('session.event.ensemble_progress', {
+        session_key: SESSION, turn_id: 'task-B', stream_seq: 1,
+        event_type: 'proposer_finish', proposer_model: 'current-model',
+      })
+      api.handlers.onWireEventFixture('session.event.ensemble_progress', {
+        session_key: SESSION, stream_seq: 2,
+        event_type: 'proposer_finish', proposer_model: 'untagged-model',
+      })
+      expect(options.appendEnsembleProgress).toHaveBeenCalledTimes(2)
+      expect(options.lastStreamSeq.value).toBe(2)
+    } finally { scope.stop() }
+  })
+
+  it('buffers turn-only progress and completion until the matching send is accepted', () => {
+    const { api, options, stream, activeTaskId, scope } = makeHarness(PENDING_STREAM_TASK_ID)
+    try {
+      for (const [turnId, streamSeq] of [['task-A', 100], ['task-B', 1]] as const) {
+        api.handlers.onWireEventFixture('session.event.ensemble_progress', {
+          session_key: SESSION, turn_id: turnId, stream_seq: streamSeq,
+          event_type: 'proposer_finish', proposer_model: turnId,
+        })
+      }
+      api.handlers.onWireEventFixture('session.event.done', {
+        session_key: SESSION, turn_id: 'task-B', stream_seq: 2,
+        final_text: 'current answer',
+      })
+      expect(options.appendEnsembleProgress).not.toHaveBeenCalled()
+      expect(stream.endStreaming).not.toHaveBeenCalled()
+      expect(options.lastStreamSeq.value).toBe(0)
+
+      api.bindActiveStreamTask('task-B')
+
+      expect(options.appendEnsembleProgress).toHaveBeenCalledExactlyOnceWith(
+        expect.objectContaining({ turn_id: 'task-B', proposer_model: 'task-B' }),
+      )
+      expect(stream.endStreaming).toHaveBeenCalledTimes(1)
+      expect(activeTaskId.value).toBe(FINISHED_STREAM_TASK_ID)
+      expect(options.lastStreamSeq.value).toBe(2)
+      api.handlers.onWireEventFixture('session.event.ensemble_progress', {
+        session_key: SESSION, turn_id: 'task-B', stream_seq: 3,
+        event_type: 'proposer_finish', proposer_model: 'finished-late-model',
+      })
+      expect(options.appendEnsembleProgress).toHaveBeenCalledTimes(1)
+    } finally { scope.stop() }
+  })
+
+  it.each(['session.event.ensemble_progress', 'session.event.thinking'])(
+    'does not let a stale turn adopt the next turn generation through %s', event => {
+      const { api, options, stream, scope } = makeHarness('task-B')
+      stream.setAssistantMessageId = vi.fn()
+      try {
+        api.handlers.onWireEventFixture(event, {
+          session_key: SESSION, turn_id: 'task-A', stream_seq: 100,
+          assistant_message_id: 'assistant-A', generation_epoch: 1,
+          event_type: 'proposer_finish', proposer_model: 'old-model', text: 'old thinking',
+        })
+        expect(stream.setAssistantMessageId).not.toHaveBeenCalled()
+        api.handlers.onWireEventFixture('session.event.text_delta', {
+          session_key: SESSION, turn_id: 'task-B', stream_seq: 1,
+          assistant_message_id: 'assistant-B', generation_epoch: 2, text: 'current text',
+        })
+        expect(stream.appendDelta).toHaveBeenCalledExactlyOnceWith('current text')
+        expect(stream.setAssistantMessageId).toHaveBeenCalledExactlyOnceWith('assistant-B')
+        expect(options.lastStreamSeq.value).toBe(1)
+      } finally { scope.stop() }
+    },
+  )
+
+  it.each(['task-B', PENDING_STREAM_TASK_ID])(
+    'settles real task ownership for a turn-only completion while renderer is %s', renderTaskId => {
+      const taskOwnership = useChatTaskOwnership()
+      taskOwnership.noteRunning('task-B')
+      const { api, options, stream, activeTaskId, scope } = makeHarness(renderTaskId, taskOwnership)
+      options.onTaskSettled = vi.fn()
+      vi.mocked(stream.endStreaming).mockImplementation(() => { stream.isStreaming.value = false })
+      try {
+        api.handlers.onWireEventFixture('session.event.done', {
+          session_key: SESSION, turn_id: 'task-B', stream_seq: 1, final_text: 'current answer',
+        })
+        if (renderTaskId === PENDING_STREAM_TASK_ID) {
+          expect(stream.endStreaming).not.toHaveBeenCalled()
+          api.bindActiveStreamTask('task-B')
+        }
+        expect(stream.endStreaming).toHaveBeenCalledTimes(1)
+        expect(taskOwnership.runningTaskId.value).toBe('')
+        expect(taskOwnership.hasAuthoritativeWork.value).toBe(false)
+        expect(taskOwnership.isSettled('task-B')).toBe(true)
+        expect(options.onTaskSettled).toHaveBeenCalledWith('task-B', undefined)
+        expect(activeTaskId.value).toBe(FINISHED_STREAM_TASK_ID)
+        expect(stream.isStreaming.value).toBe(false)
+      } finally { scope.stop() }
+    },
+  )
+
+  it('rejects a foreign session before adopting an untagged legacy generation', () => {
+    const { api, options, stream, scope } = makeHarness('task-B')
+    stream.setAssistantMessageId = vi.fn()
+    try {
+      api.handlers.onWireEventFixture('session.event.ensemble_progress', {
+        session_key: 'agent:main:webchat:other-session', stream_seq: 100,
+        assistant_message_id: 'assistant-old', generation_epoch: 1,
+        event_type: 'proposer_finish', proposer_model: 'old-model',
+      })
+      expect(stream.setAssistantMessageId).not.toHaveBeenCalled()
+      expect(options.appendEnsembleProgress).not.toHaveBeenCalled()
+      expect(options.lastStreamSeq.value).toBe(0)
+
+      api.handlers.onWireEventFixture('session.event.text_delta', {
+        session_key: SESSION, turn_id: 'task-B', stream_seq: 1,
+        assistant_message_id: 'assistant-B', generation_epoch: 2, text: 'current text',
+      })
+      expect(stream.appendDelta).toHaveBeenCalledExactlyOnceWith('current text')
+      expect(stream.setAssistantMessageId).toHaveBeenCalledExactlyOnceWith('assistant-B')
+      expect(options.lastStreamSeq.value).toBe(1)
+    } finally { scope.stop() }
   })
 
   it("does not end the current stream on a stale task's terminal error", () => {
@@ -606,8 +771,8 @@ describe('issue #344 — live stream is bound to a single task', () => {
     expect(stream.appendToolCall).toHaveBeenCalledWith(earlyTool)
   })
 
-  it('bounds early stream buffering while preserving the newest frames', () => {
-    const { api, stream } = makeHarness(PENDING_STREAM_TASK_ID)
+  it('marks overflow dirty and installs the complete authoritative text instead of a truncated tail', () => {
+    const { api, stream, options, scope } = makeHarness(PENDING_STREAM_TASK_ID)
 
     for (let index = 0; index < 70; index++) {
       api.handlers.onTextDelta({
@@ -620,13 +785,22 @@ describe('issue #344 — live stream is bound to a single task', () => {
 
     api.bindActiveStreamTask('task-B')
 
-    expect(stream.appendDelta).toHaveBeenCalledTimes(64)
-    const calls = vi.mocked(stream.appendDelta).mock.calls
-    expect(calls[0]?.[0]).toBe('delta-6')
-    expect(calls[calls.length - 1]?.[0]).toBe('delta-69')
+    expect(options.onRecoveryRequired).toHaveBeenCalledOnce()
+    expect(stream.appendDelta).not.toHaveBeenCalled()
+    const completeText = Array.from({ length: 70 }, (_, index) => `delta-${index}`).join('')
+    api.beginRecovery()
+    api.restoreLiveTurnSnapshot({
+      sessionKey: SESSION, taskId: 'task-B', currentStreamSeq: 70, streamGeneration: 'stream-1',
+      events: [{ semanticKind: 'text-delta', payload: { key: SESSION, task_id: 'task-B', text: completeText } }],
+    })
+    expect(api.finishRecovery()).toBe(true)
+    expect(stream.appendDelta).toHaveBeenCalledOnce()
+    expect(vi.mocked(stream.appendDelta).mock.calls[0]?.[0]).toBe(completeText)
+    expect(options.lastStreamSeq.value).toBe(70)
+    scope.stop()
   })
 
-  it('bounds pending terminal task buckets and retains the newest tasks', () => {
+  it('marks terminal bucket overflow dirty and recovers only the authoritative task terminal', () => {
     const oldest = makeHarness(PENDING_STREAM_TASK_ID)
     for (let index = 0; index < 9; index++) {
       oldest.api.handlers.onWireEventFixture('task.failed', {
@@ -638,6 +812,7 @@ describe('issue #344 — live stream is bound to a single task', () => {
 
     oldest.api.bindActiveStreamTask('task-0')
     expect(oldest.stream.endStreaming).not.toHaveBeenCalled()
+    expect(oldest.options.onRecoveryRequired).toHaveBeenCalledOnce()
 
     const newest = makeHarness(PENDING_STREAM_TASK_ID)
     for (let index = 0; index < 9; index++) {
@@ -649,8 +824,21 @@ describe('issue #344 — live stream is bound to a single task', () => {
     }
 
     newest.api.bindActiveStreamTask('task-8')
+    expect(newest.options.onRecoveryRequired).toHaveBeenCalledOnce()
+    expect(newest.stream.endStreaming).not.toHaveBeenCalled()
+    newest.api.beginRecovery()
+    newest.api.restoreLiveTurnSnapshot({
+      sessionKey: SESSION, taskId: 'task-8', currentStreamSeq: 9,
+      events: [{ semanticKind: 'turn-failed', payload: {
+        key: SESSION, task_id: 'task-8', terminal_message: 'Task 8 failed.',
+      } }],
+    })
+    expect(newest.api.finishRecovery()).toBe(true)
     expect(newest.stream.endStreaming).toHaveBeenCalledTimes(1)
     expect(newest.messages.value[newest.messages.value.length - 1]?.text).toBe('Task 8 failed.')
+    expect(newest.options.lastStreamSeq.value).toBe(9)
+    oldest.scope.stop()
+    newest.scope.stop()
   })
 
   it("accepts the exact Stop target's cancelled terminal without poisoning the render id", () => {

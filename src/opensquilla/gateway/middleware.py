@@ -18,7 +18,6 @@ from opensquilla.gateway.origin_guard import (
     forbidden_origin_response,
     request_origin_allowed,
 )
-from opensquilla.gateway.scopes import is_loopback_address
 
 log = structlog.get_logger(__name__)
 
@@ -31,9 +30,7 @@ _ARTIFACT_PREVIEW_CONTROL_PATH_RE = re.compile(
     r"|artifacts/[^/]+/preview-leases"
     r")/?$"
 )
-_DESKTOP_CANDIDATE_PREVIEW_PATH_RE = re.compile(
-    r"^/api/v1/desktop-artifact-candidate-preview(?:/|$)"
-)
+
 
 
 def _is_artifact_preview_capability_path(path: str) -> bool:
@@ -46,24 +43,8 @@ def _is_artifact_preview_control_path(path: str) -> bool:
     return _ARTIFACT_PREVIEW_CONTROL_PATH_RE.fullmatch(path) is not None
 
 
-def _is_desktop_candidate_preview_path(path: str) -> bool:
-    return _DESKTOP_CANDIDATE_PREVIEW_PATH_RE.match(path) is not None
 
 
-def _desktop_candidate_bridge_authorized(request: Request) -> bool:
-    if not _is_desktop_candidate_preview_path(request.url.path):
-        return False
-    peer_ip = request.client.host if request.client is not None else None
-    if not is_loopback_address(peer_ip) or request.headers.get("origin") is not None:
-        return False
-    supplied = request.headers.get("authorization", "")
-    if not supplied.startswith("Bearer "):
-        return False
-    from opensquilla.gateway.desktop_artifact_bridge import (
-        desktop_artifact_bridge_token_valid,
-    )
-
-    return desktop_artifact_bridge_token_valid(supplied[7:])
 
 
 _CONTROL_PLANE_PATHS = frozenset({"/health", "/healthz", "/ready", "/readyz"})
@@ -158,7 +139,6 @@ class AuthMiddleware(BaseHTTPMiddleware):
         if (
             request.url.path in self.PUBLIC_PATHS
             or request.url.path.startswith(self.PUBLIC_PATH_PREFIXES)
-            or _desktop_candidate_bridge_authorized(request)
             or _is_control_ui_request(
                 request,
                 base_path=self._config.control_ui.base_path,
@@ -306,7 +286,6 @@ class ErrorHandlingMiddleware(BaseHTTPMiddleware):
                 )
             if (
                 _is_artifact_preview_control_path(request.url.path)
-                or _is_desktop_candidate_preview_path(request.url.path)
             ):
                 log.error(
                     "http.request_failed",

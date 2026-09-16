@@ -20,6 +20,7 @@ import math
 import os
 import platform
 import re
+import tempfile
 import time
 import uuid
 from collections import deque
@@ -42,7 +43,7 @@ from urllib.parse import urlsplit
 
 import structlog
 
-from opensquilla.artifacts import artifact_marker
+from opensquilla.artifacts import ArtifactSource, artifact_marker
 from opensquilla.attachment_refs import (
     is_attachment_ref,
     make_attachment_ref,
@@ -101,10 +102,12 @@ from opensquilla.contracts.attachments import (
 from opensquilla.contracts.attachments import (
     normalize_attachment_mime as _normalize_attachment_mime,
 )
+from opensquilla.contracts.image_validation import validate_image_bytes
 from opensquilla.contracts.turn_execution import TurnExecutionContext
-from opensquilla.engine.agent import Agent, ToolHandler
+from opensquilla.engine.agent import PLAN_RUN_DELIVERY_TOOLS, Agent, ToolHandler
 from opensquilla.engine.agent_injection import PendingInputProvider
 from opensquilla.engine.cache_break_monitor import notify_compaction
+from opensquilla.engine.fallback import FallbackPolicy, backoff_sleep, sleep_before_retry
 from opensquilla.engine.hooks import (
     CompactionHook,
     DefaultTraceEmitterHook,
@@ -139,6 +142,9 @@ from opensquilla.engine.turn_runner import (
     TurnFinalizerStageInput,
     TurnTranscriptSnapshot,
     rebind_attachment_prompt,
+)
+from opensquilla.engine.turn_runner.attachment_stage import (
+    _AttachmentPreparationCancelledError,
 )
 from opensquilla.engine.turn_runner.context import (
     control_terminal_event_for_context,
@@ -175,7 +181,6 @@ from opensquilla.engine.turn_runner.harness import (
     _TurnRunnerTranscriptAppendAdapter,
     _TurnRunnerTurnErrorPersistAdapter,
     _TurnRunnerTurnMemoryCaptureAdapter,
-    _TurnRunnerUsageTelemetryAdapter,
     create_turn_execution_context,
 )
 from opensquilla.engine.turn_runner.prompt_assembler_stage import (
@@ -189,10 +194,14 @@ from opensquilla.engine.turn_runner.stream_consumer_stage import (
 from opensquilla.engine.types import (
     AgentConfig,
     AgentEvent,
+    AnswerGenerationResetEvent,
+    ControlTerminalEvent,
     ControlTerminalReason,
     DoneEvent,
     ErrorEvent,
     RouterControlReplayEvent,
+    RunHeartbeatEvent,
+    TextDeltaEvent,
     ThinkingLevel,
     ToolResultEvent,
     WarningEvent,
@@ -233,6 +242,7 @@ from opensquilla.provider import (
     ErrorEvent as ProviderErrorEvent,
 )
 from opensquilla.provider import (
+    ImageMarkerState,
     ModelCapabilities,
     ProviderActivityEvent,
     ProviderFailureKind,
@@ -240,6 +250,7 @@ from opensquilla.provider import (
     ProviderRecoveryAction,
     classify_provider_error,
     decide_recovery_action,
+    image_marker,
 )
 from opensquilla.provider import (
     ReasoningDeltaEvent as ProviderReasoningDeltaEvent,
@@ -253,26 +264,39 @@ from opensquilla.provider import (
 from opensquilla.provider import (
     ToolUseStartEvent as ProviderToolUseStartEvent,
 )
+from opensquilla.provider.execution_identity import (
+    project_execution_identity,
+    rebind_execution_identity,
+)
+from opensquilla.provider.failures import CONNECTION_FAILED_CODE, is_connection_failure
+from opensquilla.provider.image_projection import (
+    ImageProjectionMode,
+    assert_text_only_messages,
+    bind_image_attachment_ids,
+    classify_image_failure,
+    project_messages,
+)
 from opensquilla.provider.model_catalog import (
     resolve_effective_context_window,
     shared_catalog,
 )
 from opensquilla.provider.protocol import (
     count_provider_image_blocks,
-    image_input_admission_error,
     project_provider_final_request,
     project_provider_message_count,
     provider_metadata,
     validate_provider_chat_admission,
 )
 from opensquilla.provider.types import (
-    EnsembleProgressEvent as ProviderEnsembleProgressEvent,
-)
-from opensquilla.provider.types import (
+    ChatConfig,
+    Message,
     ProviderGenerationResetEvent,
     ProviderRequestCorrelation,
     VisionSupport,
     derive_provider_request_correlation,
+)
+from opensquilla.provider.types import (
+    EnsembleProgressEvent as ProviderEnsembleProgressEvent,
 )
 from opensquilla.router_control import (
     RouterControlHoldStore,
@@ -335,8 +359,37 @@ from opensquilla.session.terminal_reply import (
     sanitize_agent_error,
 )
 from opensquilla.skills.toolchains.manager import managed_toolchain_state_scope
+from opensquilla.telemetry.contracts.common import (
+    ClientSurface,
+    ExecutionMode,
+    ResultOutcome,
+)
+from opensquilla.telemetry.contracts.reliability import (
+    FileParseErrorCode,
+    TurnErrorCode,
+    TurnFailureStage,
+)
+from opensquilla.telemetry.file_parse_facts import (
+    FileParseReliabilityFacts,
+    FileParseReliabilitySink,
+    file_size_bucket,
+    file_type_for_media_type,
+)
+from opensquilla.telemetry.runtime_facts import (
+    GrowthMilestoneSink,
+    ToolReliabilitySink,
+    TurnFactAccumulator,
+    TurnReliabilitySink,
+    classify_control_terminal,
+    classify_turn_error,
+    current_turn_failure_stage,
+    mark_current_turn_failure_stage,
+    reset_client_runtime_dimensions,
+    reset_current_turn_failure_stage,
+    set_client_runtime_dimensions,
+    set_current_turn_failure_stage,
+)
 from opensquilla.token_estimation import estimate_tokens
-from opensquilla.tools.description_overrides import resolve_tool_description_overrides
 from opensquilla.tools.run_mode import effective_run_mode_for_context
 from opensquilla.tools.types import (
     CallerKind,
@@ -375,39 +428,8 @@ _T3_HANDLED: Final[str] = "handled"
 _T3_FLUSH_FAILED: Final[str] = "flush_failed"
 _T3_COMPACT_FAILED: Final[str] = "compact_failed"
 _IMAGE_GENERATION_TOOL_NAMES: Final[frozenset[str]] = frozenset({"image_generate"})
-_ARTIFACT_ENSEMBLE_BYPASS_OPERATIONS: Final[frozenset[str]] = frozenset(
-    {"browser_use"}
-)
-_ARTIFACT_ENSEMBLE_AGGREGATOR_ONLY_OPERATIONS: Final[frozenset[str]] = frozenset(
-    {"selection_edit", "structural_edit", "conflict_recovery"}
-)
 
 
-def _artifact_ensemble_bypass_reason(metadata: object) -> str | None:
-    """Return a content-free reason for unsupported browser-use ensembles.
-
-    Source-backed prompt annotations deliberately keep the configured Ensemble:
-    proposers receive the same bounded annotation context without tools, while
-    the aggregator alone owns the Artifact tool surface and terminating write.
-    """
-
-    if not isinstance(metadata, dict):
-        return None
-    operation = metadata.get("artifact_operation_class")
-    if operation not in _ARTIFACT_ENSEMBLE_BYPASS_OPERATIONS:
-        return None
-    return "artifact_browser_use"
-
-
-def _artifact_requires_aggregator_only_ensemble(metadata: object) -> bool:
-    """Whether this turn must keep the configured Ensemble or fail closed."""
-
-    if not isinstance(metadata, dict):
-        return False
-    return (
-        metadata.get("artifact_operation_class")
-        in _ARTIFACT_ENSEMBLE_AGGREGATOR_ONLY_OPERATIONS
-    )
 _ARTIFACT_DELIVERY_FAILURE_MARKER: Final[str] = "File delivery failed:"
 _ARTIFACT_DELIVERY_TOOL_NAMES: Final[frozenset[str]] = frozenset(
     {"publish_artifact", "create_pptx"}
@@ -581,6 +603,16 @@ def _is_materializable_attachment_mime(mime: Any) -> bool:
     return normalized is not None and normalized not in _IMAGE_ATTACHMENT_MIMES
 
 
+def _historical_image_bytes_match_claim(media_type: str, raw: bytes) -> bool:
+    """Turn unreadable legacy image material into an unavailable marker."""
+
+    try:
+        validate_image_bytes(raw, media_type)
+    except ValueError:
+        return False
+    return True
+
+
 def collect_invoked_skills(
     turn_segments: list[dict],
     *,
@@ -678,6 +710,8 @@ _IMAGE_ANALYSIS_TOOL_POLICY = _ToolConcurrencyPolicy(
     max_inflight=2,
     limit_key=("media", "image_analysis"),
 )
+
+
 def _get_tool_concurrency_policy(
     tool_name: str,
     arguments: Mapping[str, Any] | None = None,
@@ -1162,9 +1196,8 @@ def _bounded_tool_result_metadata(
             _add_bounded_tool_result_metadata(metadata, key, diagnostics[key])
 
         diagnostic_attempts = diagnostics.get("provider_attempts")
-        if (
-            "provider_attempt_count" not in metadata
-            and isinstance(diagnostic_attempts, list | tuple)
+        if "provider_attempt_count" not in metadata and isinstance(
+            diagnostic_attempts, list | tuple
         ):
             metadata["provider_attempt_count"] = len(diagnostic_attempts)
 
@@ -1402,6 +1435,8 @@ def _persisted_tool_result_segment(
     }
     if event.tool_presentation is not None:
         segment["tool_presentation"] = dict(event.tool_presentation)
+    if event.execution_log_handle is not None:
+        segment["execution_log_handle"] = event.execution_log_handle
     if event.execution_status is not None:
         segment["execution_status"] = normalize_execution_status(event.execution_status)
 
@@ -1485,11 +1520,7 @@ def _artifact_delivery_effective_publish_name(
         raw_name = arguments.get("name")
         requested_name = raw_name if isinstance(raw_name, str) else None
         artifact_name = (requested_name or target_name).strip() or target_name
-        if (
-            requested_name
-            and not Path(artifact_name).suffix
-            and Path(target_name).suffix
-        ):
+        if requested_name and not Path(artifact_name).suffix and Path(target_name).suffix:
             artifact_name = f"{artifact_name}{Path(target_name).suffix}"
     except (OSError, RuntimeError, ValueError):
         return None
@@ -1561,6 +1592,7 @@ def _artifact_delivery_target_keys(
         if root_path_key is not None:
             keys.append(root_path_key)
     return tuple(dict.fromkeys(keys))
+
 
 def _artifact_delivery_failure_notice(*, partial: bool = False) -> str:
     if partial:
@@ -1759,9 +1791,7 @@ _SELECTOR_MAX_RETRY_AFTER_SECONDS: Final[float] = 900.0
 _SELECTOR_REASONING_TRUNCATED_NOTICE: Final[str] = (
     "[Earlier model reasoning was truncated for display.]\n\n"
 )
-_SELECTOR_PRE_TEXT_BUFFER_OVERFLOW_CODE: Final[str] = (
-    "provider_pretext_buffer_exhausted"
-)
+_SELECTOR_PRE_TEXT_BUFFER_OVERFLOW_CODE: Final[str] = "provider_pretext_buffer_exhausted"
 _SELECTOR_PRE_TEXT_BUFFER_OVERFLOW_MESSAGE: Final[str] = (
     "The model response exceeded the safe pre-answer buffer limit."
 )
@@ -1837,16 +1867,18 @@ class _SelectorPreTextBuffer:
     @staticmethod
     def _event_buffer_bytes(event: Any) -> int:
         if isinstance(event, ProviderToolUseDeltaEvent):
-            return len(event.tool_use_id.encode("utf-8")) + len(
-                event.json_fragment.encode("utf-8")
-            )
+            return len(event.tool_use_id.encode("utf-8")) + len(event.json_fragment.encode("utf-8"))
         try:
             payload = asdict(event)
             serialized = json.dumps(
                 payload,
                 ensure_ascii=False,
                 separators=(",", ":"),
-                default=str,
+                default=lambda value: (
+                    value.model_dump(mode="json")
+                    if callable(getattr(value, "model_dump", None))
+                    else str(value)
+                ),
             )
             return len(serialized.encode("utf-8"))
         except (TypeError, ValueError):
@@ -1896,11 +1928,7 @@ class _SelectorPreTextBuffer:
         if isinstance(event, ProviderToolUseStartEvent):
             tool_use_id = str(event.tool_use_id or "")
             tool_name = str(event.tool_name or "")
-            if (
-                not tool_use_id
-                or not tool_name
-                or tool_use_id in self._seen_tool_use_ids
-            ):
+            if not tool_use_id or not tool_name or tool_use_id in self._seen_tool_use_ids:
                 self._mark_protocol_error()
                 return False
             self._seen_tool_use_ids.add(tool_use_id)
@@ -1963,13 +1991,10 @@ class _SelectorPreTextBuffer:
             return
         if isinstance(event, ProviderToolUseDeltaEvent):
             fragment = str(event.json_fragment or "")
-            byte_count = len(event.tool_use_id.encode("utf-8")) + len(
-                fragment.encode("utf-8")
-            )
+            byte_count = len(event.tool_use_id.encode("utf-8")) + len(fragment.encode("utf-8"))
             tail = self._entries[-1] if self._entries else None
             if not (
-                isinstance(tail, _BufferedToolUseDeltas)
-                and tail.tool_use_id == event.tool_use_id
+                isinstance(tail, _BufferedToolUseDeltas) and tail.tool_use_id == event.tool_use_id
             ):
                 tail = _BufferedToolUseDeltas(tool_use_id=event.tool_use_id)
                 self._entries.append(tail)
@@ -2070,7 +2095,11 @@ def _selector_invalid_stream_order_error() -> ProviderErrorEvent:
     )
 
 
-def _selector_stream_exception_error(*, content_started: bool = False) -> ProviderErrorEvent:
+def _selector_stream_exception_error(
+    *,
+    content_started: bool = False,
+    error: BaseException | None = None,
+) -> ProviderErrorEvent:
     """Stable, provider-prose-free projection for an exception-raised stream."""
 
     return ProviderErrorEvent(
@@ -2079,7 +2108,13 @@ def _selector_stream_exception_error(*, content_started: bool = False) -> Provid
             if content_started
             else "The connection to the model provider was interrupted."
         ),
-        code="response_incomplete" if content_started else "request_error",
+        code=(
+            "response_incomplete"
+            if content_started
+            else CONNECTION_FAILED_CODE
+            if error is not None and is_connection_failure(error)
+            else "request_error"
+        ),
     )
 
 
@@ -2097,8 +2132,8 @@ async def _selector_safe_stream(
             yield event
     except (asyncio.CancelledError, UsageAccountingUnavailableError):
         raise
-    except Exception:  # noqa: BLE001 - raw provider prose must stop here
-        yield _selector_stream_exception_error(content_started=content_started())
+    except Exception as exc:  # noqa: BLE001 - raw provider prose must stop here
+        yield _selector_stream_exception_error(content_started=content_started(), error=exc)
     finally:
         # ``aclose`` on this wrapper must deterministically unwind the usage
         # accounting generator beneath it. Relying on async-generator GC left
@@ -2174,8 +2209,7 @@ def _selector_retry_after_deadline_error(
 ) -> ProviderErrorEvent:
     return ProviderErrorEvent(
         message=(
-            "The model provider requested a retry delay beyond this turn's "
-            "remaining deadline."
+            "The model provider requested a retry delay beyond this turn's remaining deadline."
         ),
         code="provider_retry_after_deadline",
         retry_after_s=retry_after_s,
@@ -2248,6 +2282,8 @@ def _selector_execution_leg_failure_code(
 class _SelectorFallbackProvider:
     """Provider wrapper that switches to selector fallback on pre-content errors."""
 
+    projects_image_input_per_leg = True
+
     def __init__(
         self,
         provider: Any,
@@ -2255,10 +2291,16 @@ class _SelectorFallbackProvider:
         turn_metadata: dict[str, Any] | None = None,
         *,
         health_ledger: ProviderHealthLedger | None = None,
+        image_routing_config: Any | None = None,
+        image_routing_session_key: str = "",
     ) -> None:
         self._provider = provider
         self._selector = selector
         self._turn_metadata = turn_metadata
+        self._image_routing_config = image_routing_config
+        self._image_routing_session_key = image_routing_session_key
+        self._image_continuation_rebound = False
+        self._image_catalog_lookup: Any = None
         # Opt-in provider health ledger (engine/routing/health.py). None —
         # the default everywhere today — makes every ledger hook below a
         # no-op, keeping the default fallback path byte-identical.
@@ -2267,10 +2309,14 @@ class _SelectorFallbackProvider:
         self._pending_fallback_hops = 0
         self._last_executed_model = ""
         self._last_request_had_tools = False
+        self._retry_policy = FallbackPolicy()
+        self._image_marker_deployment: _FallbackDeploymentIdentity | None = None
+        self._image_marker_state = ImageMarkerState.NOT_ANALYZED
+        self._image_marker_reason: str | None = None
+        self._image_probe_forbidden = False
+        self.last_image_request_had_native_images = False
         self._fallback_limits: dict[tuple[str, str], tuple[int, int]] = {}
-        self._fallback_deployment_limits: dict[
-            _FallbackDeploymentIdentity, tuple[int, int]
-        ] = {}
+        self._fallback_deployment_limits: dict[_FallbackDeploymentIdentity, tuple[int, int]] = {}
         self._fallback_deployment_capabilities: dict[
             _FallbackDeploymentIdentity, ModelCapabilities
         ] = {}
@@ -2280,6 +2326,110 @@ class _SelectorFallbackProvider:
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._provider, name)
+
+    def configure_retry_policy(self, policy: FallbackPolicy) -> None:
+        self._retry_policy = policy
+
+    async def _retry_provider_stream(
+        self,
+        stream_factory: Callable[[], AsyncGenerator[Any, None]],
+        *,
+        provider: Any,
+        config: Any,
+        content_started: Callable[[], bool],
+        buffer: _SelectorPreTextBuffer,
+    ) -> AsyncGenerator[Any, None]:
+        """Retry the same physical leg before selector fallback sees its failure."""
+        rate_retries = 0
+        connection_retries = 0
+        attempts = 0
+        activity_id = uuid.uuid4().hex
+        physical_limit = max(0, int(getattr(config, "physical_attempt_limit", 0) or 0))
+        while True:
+            attempts += 1
+            retry_error: ProviderErrorEvent | None = None
+            stream = stream_factory()
+            try:
+                async for event in stream:
+                    if not isinstance(event, ProviderErrorEvent):
+                        yield event
+                        continue
+                    can_retry = (
+                        not content_started()
+                        and getattr(provider, "retry_failed_call_safe", True) is not False
+                        and (physical_limit == 0 or attempts < physical_limit)
+                    )
+                    if can_retry and event.code == CONNECTION_FAILED_CODE:
+                        delay = min(60.0, 5.0 * 2 ** min(connection_retries, 4))
+                        connection_retries += 1
+                        attempt, limit = connection_retries, 0
+                        reason: Literal["transport_transient", "rate_limited"] = (
+                            "transport_transient"
+                        )
+                    elif (
+                        can_retry
+                        and event.code == "429"
+                        and classify_provider_error(
+                            getattr(provider, "provider_name", ""),
+                            429,
+                            event.code,
+                            event.message,
+                        ) is ProviderFailureKind.RATE_LIMITED
+                    ):
+                        delay = max(
+                            _provider_retry_after_hint(event),
+                            backoff_sleep(
+                                rate_retries,
+                                self._retry_policy.base_backoff_ms,
+                                self._retry_policy.max_backoff_ms,
+                                _fake=True,
+                            ),
+                        )
+                        turn_deadline = getattr(config, "turn_deadline_at_monotonic", None)
+                        if (
+                            isinstance(turn_deadline, int | float)
+                            and not isinstance(turn_deadline, bool)
+                            and asyncio.get_running_loop().time() + delay >= turn_deadline
+                        ):
+                            yield _selector_retry_after_deadline_error(retry_after_s=delay)
+                            return
+                        if (
+                            rate_retries >= self._retry_policy.max_retries
+                            or delay > _SELECTOR_MAX_RETRY_AFTER_SECONDS
+                        ):
+                            yield replace(event, code="rate_limit_retry_exhausted")
+                            return
+                        rate_retries += 1
+                        attempt, limit = rate_retries, self._retry_policy.max_retries
+                        reason = "rate_limited"
+                    else:
+                        yield event
+                        return
+                    retry_error = event
+                    break
+            finally:
+                await stream.aclose()
+            if retry_error is None:
+                return
+            buffer.drain(successful_leg=False)
+            yield ProviderActivityEvent(
+                activity_id=activity_id,
+                phase="retry_wait",
+                reason=reason,
+                retry_attempt=attempt,
+                retry_limit=limit,
+                retry_after_ms=math.ceil(delay * 1000),
+                started_at=time.time_ns() // 1_000_000,
+            )
+            await sleep_before_retry(delay)
+            yield ProviderActivityEvent(
+                activity_id=activity_id,
+                phase="retrying",
+                reason=reason,
+                retry_attempt=attempt,
+                retry_limit=limit,
+                started_at=time.time_ns() // 1_000_000,
+            )
 
     def clone_for_model(self, model: str) -> _SelectorFallbackProvider:
         """Freeze an independent child chain at the currently active deployment.
@@ -2302,20 +2452,15 @@ class _SelectorFallbackProvider:
         metadata = provider_metadata(self._provider)
         if metadata.provider_kind == "ensemble":
             raise ValueError(
-                "A selector-wrapped ensemble cannot be cloned as a single "
-                "subagent deployment."
+                "A selector-wrapped ensemble cannot be cloned as a single subagent deployment."
             )
 
         remaining_chain = getattr(self._selector, "remaining_chain", None)
         if not callable(remaining_chain):
-            raise ValueError(
-                "The active selector cannot freeze an independent subagent chain."
-            )
+            raise ValueError("The active selector cannot freeze an independent subagent chain.")
         chain = list(remaining_chain())
         if not chain or not all(isinstance(cfg, ProviderConfig) for cfg in chain):
-            raise ValueError(
-                "The active selector did not expose a concrete deployment chain."
-            )
+            raise ValueError("The active selector did not expose a concrete deployment chain.")
 
         def clone_config(cfg: ProviderConfig) -> ProviderConfig:
             return replace(
@@ -2331,11 +2476,7 @@ class _SelectorFallbackProvider:
         )
         frozen_selector.override_model(model)
         frozen_provider = frozen_selector.resolve()
-        metadata_copy = (
-            dict(self._turn_metadata)
-            if isinstance(self._turn_metadata, dict)
-            else None
-        )
+        metadata_copy = dict(self._turn_metadata) if isinstance(self._turn_metadata, dict) else None
         return _SelectorFallbackProvider(
             frozen_provider,
             frozen_selector,
@@ -2362,9 +2503,7 @@ class _SelectorFallbackProvider:
     @property
     def active_provider_id(self) -> str:
         """Configured identity of the selector deployment serving this turn."""
-        return str(
-            getattr(self._selector, "active_provider_id", "") or self.provider_name
-        )
+        return str(getattr(self._selector, "active_provider_id", "") or self.provider_name)
 
     def disable_provider_state_replay(self) -> None:
         """Rebuild the active fallback chain without provider-private replay."""
@@ -2373,6 +2512,14 @@ class _SelectorFallbackProvider:
             return
         disable()
         self._provider = self._selector.resolve()
+
+    def requires_complete_reasoning_history(self, *, tools: Any, thinking: bool) -> bool:
+        requires = getattr(self._provider, "requires_complete_reasoning_history", None)
+        return callable(requires) and requires(tools=tools, thinking=thinking) is True
+
+    def can_replay_reasoning(self, message: Any) -> bool:
+        compatible = getattr(self._provider, "can_replay_reasoning", None)
+        return callable(compatible) and compatible(message) is True
 
     def _realign_routed_model_after_fallback(self) -> None:
         """Failover changed the running model — telemetry must follow.
@@ -2450,9 +2597,173 @@ class _SelectorFallbackProvider:
             _fallback_deployment_identity(deployment)
         )
         return bool(
-            capabilities is None
-            or getattr(capabilities, "supports_tools", None) is not False
+            capabilities is None or getattr(capabilities, "supports_tools", None) is not False
         )
+
+    @staticmethod
+    def _image_attachment_ids_from_metadata(config: Any) -> tuple[str, ...]:
+        """Read stable attachment ids without making a provider call.
+
+        The selector wrapper is deliberately a transport boundary and must
+        not inspect or mutate the canonical transcript.  It only needs the
+        optional ids already stamped on the per-turn config so a marker can
+        point back to the preserved attachment.
+        """
+
+        metadata = config if isinstance(config, Mapping) else getattr(config, "metadata", None)
+        if not isinstance(metadata, Mapping):
+            return ()
+        result: list[str] = []
+        seen: set[str] = set()
+        for key in (
+            "image_attachment_ids",
+            "image_intent_attachment_ids",
+            "attachment_ids",
+        ):
+            raw_ids = metadata.get(key)
+            if isinstance(raw_ids, str):
+                values: Sequence[Any] = (raw_ids,)
+            elif isinstance(raw_ids, Sequence) and not isinstance(
+                raw_ids,
+                (bytes, bytearray),
+            ):
+                values = raw_ids
+            else:
+                continue
+            for value in values:
+                if not isinstance(value, str) or not value.strip():
+                    continue
+                normalized = value.strip()[:164]
+                if normalized in seen:
+                    continue
+                seen.add(normalized)
+                result.append(normalized)
+        return tuple(result)
+
+    def configure_image_request_projection(
+        self,
+        *,
+        force_marker: bool,
+        marker_state: ImageMarkerState,
+        forbid_unknown_probe: bool,
+        reason: str | None,
+    ) -> None:
+        """Bind explicit retry policy to one request, not its result telemetry."""
+
+        self._image_marker_deployment = (
+            _fallback_deployment_identity(self.active_deployment_config())
+            if force_marker
+            else None
+        )
+        self._image_marker_state = marker_state
+        self._image_marker_reason = reason
+        self._image_probe_forbidden = forbid_unknown_probe
+
+    def _project_image_messages_for_active_leg(
+        self,
+        messages: Sequence[Any],
+        config: Any,
+        *,
+        stage: str,
+    ) -> list[Any]:
+        """Build a fresh request view for the currently selected deployment.
+
+        ``Agent`` retains a projected view for admission and diagnostics but
+        passes canonical input to this wrapper because a fallback is a new physical
+        request with a different capability fact.  In particular, a known
+        text-only fallback receives a truthful marker instead of a terminal
+        admission error; an unknown deployment remains native and can be
+        probed once by the provider.
+        """
+
+        active_config = self._config_for_active_leg(config)
+        support = str(
+            getattr(active_config, "model_vision_support", "unknown") or "unknown"
+        ).strip().lower()
+        if support not in {"supported", "unsupported", "unknown"}:
+            support = "unknown"
+
+        provider_kind = ""
+        provider_name = ""
+        try:
+            identity = provider_metadata(self._provider)
+            provider_kind = str(
+                getattr(identity, "provider_kind", "") or ""
+            ).strip().lower()
+            provider_name = str(
+                getattr(identity, "provider_name", "") or ""
+            ).strip().lower()
+        except Exception:  # noqa: BLE001 - metadata is optional at this boundary
+            provider_kind = str(
+                getattr(self._provider, "provider_kind", "") or ""
+            ).strip().lower()
+            provider_name = str(
+                getattr(self._provider, "provider_name", "") or ""
+            ).strip().lower()
+
+        turn_metadata = self._turn_metadata
+        force_marker = self._image_marker_deployment == _fallback_deployment_identity(
+            self.active_deployment_config()
+        )
+        unsafe_probe = self._image_probe_forbidden and support == "unknown"
+        ensemble_text_only = provider_kind == "ensemble" or provider_name == "ensemble"
+        should_marker = (
+            force_marker or unsafe_probe or support == "unsupported" or ensemble_text_only
+        )
+
+        if ensemble_text_only:
+            reason = "ensemble_text_only"
+        elif force_marker:
+            reason = self._image_marker_reason or "configured_marker_fallback"
+        elif unsafe_probe:
+            reason = "image_probe_unsafe_after_irreversible_effect"
+        elif support == "unsupported":
+            reason = "model_vision_unsupported"
+        else:
+            reason = "capability_probe" if support == "unknown" else "model_vision_supported"
+        marker_state = (
+            self._image_marker_state if force_marker else ImageMarkerState.NOT_ANALYZED
+        )
+        mode = ImageProjectionMode.MARKER if should_marker else ImageProjectionMode.NATIVE
+
+        projection = project_messages(
+            messages,
+            mode=mode,
+            marker_state=marker_state,
+            attachment_ids=self._image_attachment_ids_from_metadata(
+                self._turn_metadata or active_config
+            ),
+        )
+        self.last_image_request_had_native_images = projection.output_image_count > 0
+        if projection.input_image_count and isinstance(turn_metadata, dict):
+            # These fields describe the physical leg that is about to run.
+            # A previous native probe must not leave stale metadata after a
+            # configured text-only fallback receives marker projection.
+            turn_metadata["image_input_mode"] = mode.value
+            turn_metadata["image_input_reason"] = reason
+            turn_metadata["image_input_count"] = projection.input_image_count
+            turn_metadata["image_input_output_count"] = projection.output_image_count
+            turn_metadata["image_input_marker_count"] = projection.marker_count
+            turn_metadata["image_input_stage"] = stage
+            if should_marker:
+                turn_metadata["image_input_marker_state"] = marker_state.value
+            else:
+                turn_metadata.pop("image_input_marker_state", None)
+        if should_marker:
+            assert_text_only_messages(projection.messages)
+        result = projection.messages
+        if self.requires_complete_reasoning_history(
+            tools=self._last_request_had_tools,
+            thinking=bool(getattr(active_config, "thinking", False)),
+        ):
+            from opensquilla.engine.replay_compat import rebase_incomplete_reasoning_history
+
+            result, rebased = rebase_incomplete_reasoning_history(
+                list(result), compatible=self.can_replay_reasoning
+            )
+            if rebased and isinstance(turn_metadata, dict):
+                turn_metadata["reasoning_replay_context_rebuilt"] = True
+        return result
 
     def _advance_past_explicit_tool_denials(
         self,
@@ -2466,10 +2777,7 @@ class _SelectorFallbackProvider:
         while current_config is not None:
             candidate_compatible = bool(
                 self._fallback_candidate_accepts_tools(current_config)
-                and (
-                    candidate_predicate is None
-                    or candidate_predicate(current_config)
-                )
+                and (candidate_predicate is None or candidate_predicate(current_config))
             )
             health_eligible = True
             if (
@@ -2484,10 +2792,7 @@ class _SelectorFallbackProvider:
                     )
                     for candidate in remaining_chain()
                     if self._fallback_candidate_accepts_tools(candidate)
-                    and (
-                        candidate_predicate is None
-                        or candidate_predicate(candidate)
-                    )
+                    and (candidate_predicate is None or candidate_predicate(candidate))
                 ]
                 if candidates:
                     health_eligible = self._health_ledger.eligible(
@@ -2525,6 +2830,192 @@ class _SelectorFallbackProvider:
 
         return getattr(self._selector, "current_config", None)
 
+    def configure_image_continuation_catalog(self, lookup: Any) -> None:
+        """Reuse the turn's exact deployment resolver for tool-loaded images."""
+
+        self._image_catalog_lookup = lookup
+
+    def active_context_window_tokens(self) -> int:
+        return self._active_fallback_limits()[0]
+
+    def compaction_chat_config(self, config: ChatConfig) -> ChatConfig:
+        """Use the current physical leg's request settings for suffix summaries."""
+        return cast(ChatConfig, self._config_for_active_leg(config))
+
+    async def prepare_image_continuation(
+        self, messages: list[Message], config: ChatConfig,
+    ) -> ChatConfig | None:
+        """Admit tool-loaded pictures through the configured image routing policy.
+
+        Only automatic turns receive this authority. Selection prepares a fresh
+        selector, so an unavailable deployment cannot disturb the active call.
+        Completed tools and the canonical message list remain untouched.
+        """
+
+        gateway_config = self._image_routing_config
+        router_config = getattr(gateway_config, "squilla_router", None)
+        if (
+            not getattr(router_config, "enabled", False)
+            or getattr(router_config, "rollout_phase", "observe") == "observe"
+            or not callable(self._image_catalog_lookup)
+            or not _count_image_blocks(messages)
+        ):
+            return None
+        if self.active_model_vision_support(config) == "supported":
+            return cast(ChatConfig, self._config_for_active_leg(config))
+
+        from opensquilla.engine.history import (
+            HistoryReplayProjection,
+            project_history_replay_capacity,
+        )
+        from opensquilla.engine.selector_override import (
+            apply_model_override,
+            cross_provider_tier_config,
+            resolve_strict_router_fallback_chain,
+        )
+        from opensquilla.engine.steps.squilla_router import (
+            apply_squilla_router,
+            finalize_squilla_router_capacity,
+        )
+
+        capacity = project_history_replay_capacity(
+            HistoryReplayProjection(messages=tuple(messages)),
+        )
+        provider_id, model = self._active_deployment()
+        metadata = self._turn_metadata or {}
+        session_key = self._image_routing_session_key
+        turn = TurnContext(
+            message="",
+            session_key=session_key,
+            config=gateway_config,
+            provider=self._provider,
+            model=model,
+            tool_defs=[],
+            system_prompt=config.system or "",
+            metadata={
+                "image_context_has_images": True,
+                "had_attachments": True,
+                "executed_provider": provider_id,
+                "executed_model": model,
+                "routing_history_capacity_estimated_tokens": capacity.estimated_tokens,
+                "routing_history_capacity_message_count": capacity.message_count,
+                "routing_history_capacity_estimate_complete": capacity.estimate_complete,
+                **(
+                    {"provider_state_continuity": metadata["provider_state_continuity"]}
+                    if isinstance(metadata.get("provider_state_continuity"), dict)
+                    else {}
+                ),
+            },
+        )
+        turn = await apply_squilla_router(turn)
+        turn = await finalize_squilla_router_capacity(turn)
+        if (
+            turn.metadata.get("routing_applied") is not True
+            or turn.metadata.get("image_input_projection_required") is True
+            or turn.metadata.get("large_context_capacity_blocked") is True
+            or not turn.model
+        ):
+            return None
+        tier_provider_config = cross_provider_tier_config(
+            gateway_config, turn.metadata, turn.model,
+            active_provider_id=provider_id, session_key=session_key,
+        )
+        if turn.metadata.get("routed_provider_blocked"):
+            return None
+        try:
+            candidate_selector = self._selector.clone()
+            candidate_provider = apply_model_override(
+                candidate_selector,
+                turn.model,
+                turn_metadata=turn.metadata,
+                realign_routed_model=False,
+                tier_provider_config=tier_provider_config,
+                strict_router_fallback_chain=resolve_strict_router_fallback_chain(
+                    gateway_config, turn.metadata,
+                    active_provider_id=provider_id, session_key=session_key,
+                ),
+            )
+            deployment = candidate_selector.current_config
+            catalog = self._image_catalog_lookup(deployment, include_global_overrides=True)
+        except Exception as exc:  # noqa: BLE001 - failed preparation keeps the active deployment
+            log.warning(
+                "selector.image_continuation_unavailable",
+                model=turn.model,
+                error=type(exc).__name__,
+            )
+            return None
+        if turn.metadata.get("routed_provider_blocked") or catalog.vision_support == "unsupported":
+            return None
+        identity = _fallback_deployment_identity(deployment)
+        window = max(1, int(catalog.context_window))
+        output_limit = min(max(1, int(config.max_tokens)), max(1, int(catalog.max_tokens)))
+        proof = ContextBudgetGovernor.from_values(
+            context_window_tokens=window,
+            max_output_tokens=output_limit,
+            thinking_budget_tokens=(config.thinking_budget_tokens or 0) if config.thinking else 0,
+            context_overflow_threshold=AgentConfig().context_overflow_threshold,
+        ).snapshot().provider_request_max_chars
+        explicit_proof = max(0, int(catalog.provider_request_proof_max_chars or 0))
+        if explicit_proof:
+            proof = min(proof, explicit_proof)
+        rebound = config.model_copy(update={
+            "max_tokens": output_limit,
+            "model_capabilities": catalog.capabilities,
+            "model_vision_support": catalog.vision_support,
+            "provider_request_max_chars": proof,
+            "provider_request_max_chars_explicit_cap": explicit_proof,
+        })
+        self._selector = candidate_selector
+        self._provider = candidate_provider
+        self._fallback_deployment_limits[identity] = (window, output_limit)
+        if catalog.capabilities is not None:
+            self._fallback_deployment_capabilities[identity] = catalog.capabilities
+        self._fallback_deployment_vision_support[identity] = catalog.vision_support
+        self._image_continuation_rebound = True
+        self._image_marker_deployment = None
+        self._image_marker_reason = None
+        self._image_probe_forbidden = False
+        if self._turn_metadata is not None:
+            self._turn_metadata["image_continuation_provider"] = str(deployment.provider)
+            self._turn_metadata["image_continuation_model"] = str(deployment.model)
+        return rebound
+
+    def active_model_vision_support(self, config: Any) -> VisionSupport:
+        """Return exact tri-state evidence for the current physical leg."""
+
+        active_config = self._config_for_active_leg(config)
+        raw_support: Any = getattr(
+            active_config,
+            "model_vision_support",
+            "unknown",
+        )
+        return (
+            cast(VisionSupport, raw_support)
+            if raw_support in {"supported", "unsupported", "unknown"}
+            else "unknown"
+        )
+
+    def image_analysis_target(self, config: ChatConfig) -> tuple[Any, ChatConfig] | None:
+        """Expose only the current physical leg, never its fallback chain."""
+
+        active_config = self._config_for_active_leg(config)
+        identity = provider_metadata(self._provider)
+        if (
+            active_config.model_vision_support != "supported"
+            or "ensemble" in {identity.provider_kind, identity.provider_name}
+        ):
+            return None
+        return self._provider, active_config
+
+    def mark_active_model_vision_supported(self) -> None:
+        """Remember a successful native image request for this exact leg."""
+
+        current_config = getattr(self._selector, "current_config", None)
+        if current_config is not None:
+            self._fallback_deployment_vision_support[
+                _fallback_deployment_identity(current_config)
+            ] = "supported"
+
     def configure_fallback_deployment_limits(
         self,
         limits: Sequence[tuple[Any, int, int] | tuple[Any, int, int, Any]],
@@ -2532,9 +3023,7 @@ class _SelectorFallbackProvider:
         """Install exact deployment budgets and capabilities in private memory."""
 
         normalized: dict[_FallbackDeploymentIdentity, tuple[int, int]] = {}
-        normalized_capabilities: dict[
-            _FallbackDeploymentIdentity, ModelCapabilities
-        ] = {}
+        normalized_capabilities: dict[_FallbackDeploymentIdentity, ModelCapabilities] = {}
         for item in limits:
             if not isinstance(item, tuple) or len(item) not in {3, 4}:
                 continue
@@ -2625,14 +3114,10 @@ class _SelectorFallbackProvider:
         # compatibility fallback when an embedded caller did not run the
         # bootstrap configurator above.
         route_plan = (
-            self._turn_metadata.get("route_plan")
-            if isinstance(self._turn_metadata, dict)
-            else None
+            self._turn_metadata.get("route_plan") if isinstance(self._turn_metadata, dict) else None
         )
         fallback_chain = (
-            route_plan.get("fallback_chain")
-            if isinstance(route_plan, Mapping)
-            else None
+            route_plan.get("fallback_chain") if isinstance(route_plan, Mapping) else None
         )
         if isinstance(fallback_chain, list):
             for candidate in fallback_chain:
@@ -2662,18 +3147,18 @@ class _SelectorFallbackProvider:
     def _config_for_active_leg(self, config: Any) -> Any:
         """Bind one physical fallback to its own correlation and model budget."""
 
-        if not self._used_fallback:
+        provider_id, model = self._active_deployment()
+        config = rebind_execution_identity(config, provider=provider_id, model=model)
+        if not self._used_fallback and not self._image_continuation_rebound:
             return config
         updates: dict[str, Any] = {}
         correlation = getattr(config, "provider_request_correlation", None)
-        if isinstance(correlation, ProviderRequestCorrelation) and not (
+        if self._used_fallback and isinstance(correlation, ProviderRequestCorrelation) and not (
             correlation.call_kind.endswith(".provider_fallback")
         ):
-            updates["provider_request_correlation"] = (
-                derive_provider_request_correlation(
-                    correlation,
-                    call_kind=f"{correlation.call_kind}.provider_fallback",
-                )
+            updates["provider_request_correlation"] = derive_provider_request_correlation(
+                correlation,
+                call_kind=f"{correlation.call_kind}.provider_fallback",
             )
 
         context_window, effective_max_tokens = self._active_fallback_limits()
@@ -2687,16 +3172,12 @@ class _SelectorFallbackProvider:
             updates["max_tokens"] = physical_max_tokens
 
         current_config = getattr(self._selector, "current_config", None)
-        provider_id = str(
-            getattr(current_config, "provider", "") or self.provider_name
-        ).strip()
+        provider_id = str(getattr(current_config, "provider", "") or self.provider_name).strip()
         model = str(getattr(current_config, "model", "") or "").strip()
         if model:
             deployment_identity = _fallback_deployment_identity(current_config)
             deployment_capabilities = (
-                self._fallback_deployment_capabilities.get(
-                    deployment_identity
-                )
+                self._fallback_deployment_capabilities.get(deployment_identity)
                 if current_config is not None
                 else None
             )
@@ -2714,12 +3195,8 @@ class _SelectorFallbackProvider:
                         resolved_capabilities = deployment_resolver(
                             model,
                             provider=provider_id,
-                            api_key=str(
-                                getattr(current_config, "api_key", "") or ""
-                            ),
-                            base_url=str(
-                                getattr(current_config, "base_url", "") or ""
-                            ),
+                            api_key=str(getattr(current_config, "api_key", "") or ""),
+                            base_url=str(getattr(current_config, "base_url", "") or ""),
                         )
                     elif provider_id.strip().lower() == "tokenrhythm":
                         resolved_capabilities = ModelCapabilities()
@@ -2727,9 +3204,7 @@ class _SelectorFallbackProvider:
                         resolved_capabilities = catalog.get_capabilities(
                             model,
                             provider_name=provider_id,
-                            base_url=str(
-                                getattr(current_config, "base_url", "") or ""
-                            ),
+                            base_url=str(getattr(current_config, "base_url", "") or ""),
                         )
                 updates["model_capabilities"] = resolved_capabilities
             except Exception as exc:  # noqa: BLE001 - optional capability refinement
@@ -2788,12 +3263,16 @@ class _SelectorFallbackProvider:
                 if bool(getattr(config, "thinking", False))
                 else 0
             )
-            fallback_proof_cap = ContextBudgetGovernor.from_values(
-                context_window_tokens=context_window,
-                max_output_tokens=physical_max_tokens,
-                thinking_budget_tokens=thinking_budget_tokens,
-                context_overflow_threshold=AgentConfig().context_overflow_threshold,
-            ).snapshot().provider_request_max_chars
+            fallback_proof_cap = (
+                ContextBudgetGovernor.from_values(
+                    context_window_tokens=context_window,
+                    max_output_tokens=physical_max_tokens,
+                    thinking_budget_tokens=thinking_budget_tokens,
+                    context_overflow_threshold=AgentConfig().context_overflow_threshold,
+                )
+                .snapshot()
+                .provider_request_max_chars
+            )
             explicit_proof_cap = _non_negative_int(
                 getattr(config, "provider_request_max_chars_explicit_cap", 0)
             )
@@ -2927,11 +3406,6 @@ class _SelectorFallbackProvider:
                 return index
         return 0
 
-    def _can_escalate_local_admission_failure(self, config: Any = None) -> bool:
-        """Return whether any authorized leg has a larger context window."""
-
-        return self._local_admission_fallback_index(config) > 0
-
     def _skip_benched_fallbacks(self) -> None:
         """Advance past benched fallback deployments (opt-in ledger only).
 
@@ -2973,12 +3447,73 @@ class _SelectorFallbackProvider:
             requires_tools=self._last_request_had_tools,
         )
 
+    def fallback_after_image_rejection(self, reason: str) -> bool:
+        """Advance to the next configured Router image probe, if any.
+
+        Router image routes install a strict c0-c3-only selector chain.  This
+        method deliberately uses that static chain instead of plugin failover,
+        records the exact rejected deployment as text-only for the rest of the
+        turn, and accepts unknown candidates for one native probe.  Direct and
+        Ensemble requests return ``False`` so their same-model marker policy
+        remains intact.
+        """
+
+        metadata = self._turn_metadata
+        if not isinstance(metadata, dict) or not (
+            metadata.get("router_fallback_strict") is True
+            and metadata.get("routing_source") == "image_route"
+            and metadata.get("image_input_mode") != "marker"
+        ):
+            return False
+
+        current_config = getattr(self._selector, "current_config", None)
+        if current_config is not None:
+            self._fallback_deployment_vision_support[
+                _fallback_deployment_identity(current_config)
+            ] = "unsupported"
+
+        next_matching = getattr(self._selector, "next_fallback_matching", None)
+        if not callable(next_matching):
+            return False
+
+        def _probeable(candidate: Any) -> bool:
+            return (
+                self._fallback_deployment_vision_support.get(
+                    _fallback_deployment_identity(candidate),
+                    "unknown",
+                )
+                != "unsupported"
+            )
+
+        try:
+            self._provider = next_matching(predicate=_probeable)
+        except Exception:  # noqa: BLE001 - exhaustion selects marker fallback
+            return False
+        self._note_fallback_hop()
+        metadata["router_image_probe_failure_count"] = (
+            int(metadata.get("router_image_probe_failure_count") or 0) + 1
+        )
+        metadata["router_fallback_reason"] = "image_capability_rejection"
+        metadata["image_input_reason"] = "router_next_configured_image_probe"
+        metadata["image_input_stage"] = "fallback"
+        log.info(
+            "selector.image_probe_fallback",
+            reason=reason,
+            provider=self.active_provider_id,
+            model=str(
+                getattr(getattr(self._selector, "current_config", None), "model", "")
+                or ""
+            ),
+        )
+        return True
+
     def fallback_after_invalid_response_with_capabilities(
         self,
         reason: str,
         *,
         requires_vision: bool,
         requires_tools: bool = False,
+        exclude_current_authority: bool = False,
     ) -> bool:
         """Select an invalid-response fallback with exact capability evidence.
 
@@ -2993,14 +3528,33 @@ class _SelectorFallbackProvider:
             "next_fallback_after_failure_matching",
             None,
         )
+        failed_authority = _provider_authority_identity(self.active_deployment_config())
+        if exclude_current_authority and failed_authority is None:
+            return False
+
+        def candidate_allowed(candidate: Any) -> bool:
+            if exclude_current_authority:
+                authority = _provider_authority_identity(candidate)
+                if authority is None or authority == failed_authority:
+                    return False
+            return bool(
+                (
+                    not requires_vision
+                    or self._fallback_deployment_vision_support.get(
+                        _fallback_deployment_identity(candidate), "unknown"
+                    ) == "supported"
+                )
+                and (not requires_tools or self._fallback_candidate_accepts_tools(candidate))
+            )
+
         try:
-            if requires_vision or requires_tools:
+            if requires_vision or requires_tools or exclude_current_authority:
                 if not callable(matching_fallback):
                     # Legacy selector seams cannot prove vision support, but
                     # tool capability defaults to allowed-until-denied. The
                     # active-leg admission guard below still blocks a fallback
                     # that resolves to an explicit tools denial before I/O.
-                    if requires_vision:
+                    if requires_vision or exclude_current_authority:
                         return False
                     self._provider = self._selector.next_fallback_after_failure(
                         RuntimeError(reason)
@@ -3015,31 +3569,16 @@ class _SelectorFallbackProvider:
                 else:
                     self._provider = matching_fallback(
                         RuntimeError(reason),
-                        predicate=lambda candidate: bool(
-                            (
-                                not requires_vision
-                                or self._fallback_deployment_vision_support.get(
-                                    _fallback_deployment_identity(candidate),
-                                    "unknown",
-                                )
-                                == "supported"
-                            )
-                            and (
-                                not requires_tools
-                                or self._fallback_candidate_accepts_tools(candidate)
-                            )
-                        ),
+                        predicate=candidate_allowed,
                     )
             else:
-                self._provider = self._selector.next_fallback_after_failure(
-                    RuntimeError(reason)
-                )
+                self._provider = self._selector.next_fallback_after_failure(RuntimeError(reason))
         except Exception:  # noqa: BLE001 - fallback support is optional
             return False
 
         self._note_fallback_hop()
         if requires_tools:
-            if not self._advance_past_explicit_tool_denials():
+            if not self._advance_past_explicit_tool_denials(candidate_predicate=candidate_allowed):
                 return False
         else:
             self._skip_benched_fallbacks()
@@ -3052,7 +3591,14 @@ class _SelectorFallbackProvider:
         *,
         reject_unknown_capability: bool,
     ) -> ProviderErrorEvent | None:
-        """Return and record an image admission error for the active physical leg."""
+        """Keep legacy admission API while making image handling non-terminal.
+
+        Images are projected by :meth:`_project_image_messages_for_active_leg`
+        immediately before this check.  Unknown capability is intentionally
+        probed once, and an explicit text-only fact is represented by a marker
+        rather than an ``ErrorEvent``.  The keyword is retained for callers
+        and third-party subclasses compiled against the old seam.
+        """
 
         raw_vision_support = getattr(config, "model_vision_support", "unknown")
         vision_support: VisionSupport = (
@@ -3060,26 +3606,28 @@ class _SelectorFallbackProvider:
             if raw_vision_support in {"supported", "unsupported", "unknown"}
             else "unknown"
         )
-        error = image_input_admission_error(
-            messages,
-            vision_support=vision_support,
-            reject_unknown=reject_unknown_capability,
-        )
-        if error is None:
-            return None
         image_count = _count_image_blocks(messages)
-        if self._turn_metadata is not None:
-            self._turn_metadata["image_input_mode"] = "rejected"
-            self._turn_metadata["image_input_reason"] = (
-                "capability_unknown"
-                if vision_support == "unknown"
-                else "model_vision_unsupported"
+        if image_count and self._turn_metadata is not None:
+            # A residual image here indicates a caller bypassed the projection
+            # helper. Do not turn that programming seam into a user-visible
+            # terminal error; retain bounded diagnostics and let the provider
+            # (or Agent's precise image-failure retry) remain authoritative.
+            self._turn_metadata.setdefault(
+                "image_input_mode",
+                "native" if vision_support != "unsupported" else "marker",
+            )
+            self._turn_metadata.setdefault(
+                "image_input_reason",
+                "capability_probe" if vision_support == "unknown" else "model_vision_unsupported",
             )
             self._turn_metadata["image_input_count"] = image_count
             self._turn_metadata["image_input_stage"] = (
                 "fallback" if self._used_fallback else "primary"
             )
-        return error
+        # ``reject_unknown_capability`` is deliberately ignored.  Unknown is
+        # not evidence of unsupported capability and must not strand a turn.
+        del reject_unknown_capability
+        return None
 
     def validate_chat_admission(
         self,
@@ -3114,7 +3662,7 @@ class _SelectorFallbackProvider:
 
         return project_provider_final_request(
             self._provider,
-            messages,
+            project_execution_identity(messages, self._config_for_active_leg(config)),
             tools,
             self._config_for_active_leg(config),
             message_limit=message_limit,
@@ -3169,6 +3717,12 @@ class _SelectorFallbackProvider:
         active_provider = self._provider
         active_provider_id, active_model = self._active_deployment()
         active_config = self._config_for_active_leg(config)
+        physical_messages = self._project_image_messages_for_active_leg(
+            messages,
+            active_config,
+            stage="fallback" if self._used_fallback else "primary",
+        )
+        physical_messages = project_execution_identity(physical_messages, active_config)
         if (
             tools
             and getattr(
@@ -3183,13 +3737,14 @@ class _SelectorFallbackProvider:
                 code="model_tools_unsupported",
             )
             return
-        validation_error = self.validate_chat_admission(messages, config)
+        validation_error = self.validate_chat_admission(physical_messages, config)
         if validation_error is not None:
             yield validation_error
             return
 
         if self._used_fallback:
             self._commit_fallback_hops()
+        if self._used_fallback or self._image_continuation_rebound:
             self._realign_routed_model_after_fallback()
         self._last_executed_model = active_model
         record_execution_leg(
@@ -3212,18 +3767,24 @@ class _SelectorFallbackProvider:
 
         def primary_stream_factory() -> AsyncGenerator[Any, None]:
             return _selector_safe_stream(
-                lambda: active_provider.chat(messages, **primary_chat_kwargs),
+                lambda: active_provider.chat(physical_messages, **primary_chat_kwargs),
                 content_started=lambda: emitted_user_visible_content,
             )
 
-        primary_stream = (
-            primary_stream_factory()
-            if provider_accounts_physical_usage(active_provider)
-            else account_provider_stream(
-                primary_stream_factory,
-                provider=active_provider_id,
-                model=active_model,
-            )
+        primary_stream = self._retry_provider_stream(
+            lambda: (
+                primary_stream_factory()
+                if provider_accounts_physical_usage(active_provider)
+                else account_provider_stream(
+                    primary_stream_factory,
+                    provider=active_provider_id,
+                    model=active_model,
+                )
+            ),
+            provider=active_provider,
+            config=active_config,
+            content_started=lambda: emitted_user_visible_content,
+            buffer=pre_text_buffer,
         )
         try:
             async for event in primary_stream:
@@ -3257,6 +3818,15 @@ class _SelectorFallbackProvider:
                 if emitted_user_visible_content:
                     yield event
                     continue
+
+                if (
+                    isinstance(event, ProviderErrorEvent)
+                    and event.code == "provider_retry_after_deadline"
+                ):
+                    self._record_health_failure(event)
+                    pre_text_buffer.drain(successful_leg=False)
+                    yield event
+                    return
 
                 if isinstance(event, ProviderReasoningDeltaEvent) and event.text:
                     if pre_text_buffer.has_incomplete_tool_call:
@@ -3348,10 +3918,21 @@ class _SelectorFallbackProvider:
                     else 0
                 )
                 local_admission_escalation = local_admission_fallback_index > 0
-                if isinstance(event, ProviderErrorEvent) and (
-                    _should_use_selector_fallback(self.provider_name, event)
-                    or event.code == "invalid_stream_order"
-                    or local_admission_escalation
+                precise_image_capability_rejection = bool(
+                    isinstance(event, ProviderErrorEvent)
+                    and classify_image_failure(
+                        event,
+                        provider_name=active_provider_id or self.provider_name,
+                    ).is_unsupported
+                )
+                if (
+                    isinstance(event, ProviderErrorEvent)
+                    and not precise_image_capability_rejection
+                    and (
+                        _should_use_selector_fallback(self.provider_name, event)
+                        or event.code == "invalid_stream_order"
+                        or local_admission_escalation
+                    )
                 ):
                     if not local_admission_escalation:
                         self._record_health_failure(event)
@@ -3369,6 +3950,7 @@ class _SelectorFallbackProvider:
                     legacy_selection_mutated = False
                     try:
                         if local_admission_escalation:
+
                             def _local_candidate_predicate(candidate: Any) -> bool:
                                 return self._local_admission_candidate_is_compatible(
                                     failed_authority_config,
@@ -3422,10 +4004,8 @@ class _SelectorFallbackProvider:
                                     predicate=self._fallback_candidate_accepts_tools,
                                 )
                             else:
-                                self._provider = (
-                                    self._selector.next_fallback_after_failure(
-                                        selector_failure
-                                    )
+                                self._provider = self._selector.next_fallback_after_failure(
+                                    selector_failure
                                 )
                         else:
                             self._provider = self._selector.next_fallback_after_failure(
@@ -3446,9 +4026,7 @@ class _SelectorFallbackProvider:
                         if not self._advance_past_explicit_tool_denials(
                             candidate_predicate=local_candidate_predicate
                         ):
-                            for buffered_event in pre_text_buffer.drain(
-                                successful_leg=False
-                            ):
+                            for buffered_event in pre_text_buffer.drain(successful_leg=False):
                                 yield buffered_event
                             yield event
                             return
@@ -3461,6 +4039,14 @@ class _SelectorFallbackProvider:
                     fallback_provider = self._provider
                     fallback_provider_id, fallback_model = self._active_deployment()
                     fallback_config = self._config_for_active_leg(config)
+                    fallback_messages = self._project_image_messages_for_active_leg(
+                        messages,
+                        fallback_config,
+                        stage="fallback",
+                    )
+                    fallback_messages = project_execution_identity(
+                        fallback_messages, fallback_config,
+                    )
                     if (
                         tools
                         and getattr(
@@ -3471,14 +4057,12 @@ class _SelectorFallbackProvider:
                         is False
                     ):
                         yield ProviderErrorEvent(
-                            message=(
-                                "The selected fallback model does not support tool calling."
-                            ),
+                            message=("The selected fallback model does not support tool calling."),
                             code="model_tools_unsupported",
                         )
                         return
                     fallback_admission_error = self._reject_unsupported_image_input(
-                        messages,
+                        fallback_messages,
                         fallback_config,
                         reject_unknown_capability=True,
                     )
@@ -3487,7 +4071,7 @@ class _SelectorFallbackProvider:
                         return
                     fallback_validation_error = validate_provider_chat_admission(
                         fallback_provider,
-                        messages,
+                        fallback_messages,
                         fallback_config,
                     )
                     if fallback_validation_error is not None:
@@ -3499,12 +4083,9 @@ class _SelectorFallbackProvider:
                         None,
                     )
                     retry_after_hint = _provider_retry_after_hint(event)
-                    if (
-                        retry_after_hint > 0
-                        and _same_provider_authority(
-                            failed_authority_config,
-                            fallback_authority_config,
-                        )
+                    if retry_after_hint > 0 and _same_provider_authority(
+                        failed_authority_config,
+                        fallback_authority_config,
                     ):
                         retry_reason = _provider_activity_reason_for_error(
                             active_provider_id or self.provider_name,
@@ -3540,9 +4121,7 @@ class _SelectorFallbackProvider:
                         await asyncio.sleep(retry_after_hint)
                     self._commit_fallback_hops()
                     if local_admission_escalation and self._turn_metadata is not None:
-                        self._turn_metadata["router_fallback_reason"] = (
-                            "local_admission_escalation"
-                        )
+                        self._turn_metadata["router_fallback_reason"] = "local_admission_escalation"
                     self._realign_routed_model_after_fallback()
                     self._last_executed_model = fallback_model
                     # The phase frame is yielded before the fallback adapter is
@@ -3577,7 +4156,7 @@ class _SelectorFallbackProvider:
                     def fallback_stream_factory() -> AsyncGenerator[Any, None]:
                         return _selector_safe_stream(
                             lambda: fallback_provider.chat(
-                                messages,
+                                fallback_messages,
                                 tools=tools,
                                 config=fallback_config,
                                 **(
@@ -3593,17 +4172,23 @@ class _SelectorFallbackProvider:
                             content_started=lambda: fallback_committed,
                         )
 
-                    fallback_stream = (
-                        fallback_stream_factory()
-                        if provider_accounts_physical_usage(fallback_provider)
-                        else account_provider_stream(
-                            fallback_stream_factory,
-                            provider=fallback_provider_id,
-                            model=fallback_model,
-                        )
-                    )
                     fallback_buffer = _SelectorPreTextBuffer()
                     fallback_committed = False
+                    fallback_stream = self._retry_provider_stream(
+                        lambda: (
+                            fallback_stream_factory()
+                            if provider_accounts_physical_usage(fallback_provider)
+                            else account_provider_stream(
+                                fallback_stream_factory,
+                                provider=fallback_provider_id,
+                                model=fallback_model,
+                            )
+                        ),
+                        provider=fallback_provider,
+                        config=fallback_config,
+                        content_started=lambda: fallback_committed,
+                        buffer=fallback_buffer,
+                    )
                     fallback_activity_id = uuid.uuid4().hex
                     fallback_reasoning_started_at_ms = 0
                     fallback_reasoning_last_pulse_at = 0.0
@@ -3639,18 +4224,14 @@ class _SelectorFallbackProvider:
                             ):
                                 if fallback_buffer.has_incomplete_tool_call:
                                     fallback_buffer.drain(successful_leg=False)
-                                    invalid_order_error = (
-                                        _selector_invalid_stream_order_error()
-                                    )
+                                    invalid_order_error = _selector_invalid_stream_order_error()
                                     self._record_health_failure(invalid_order_error)
                                     yield invalid_order_error
                                     return
                                 now_monotonic = time.monotonic()
                                 first_reasoning = fallback_reasoning_started_at_ms == 0
                                 if first_reasoning:
-                                    fallback_reasoning_started_at_ms = (
-                                        time.time_ns() // 1_000_000
-                                    )
+                                    fallback_reasoning_started_at_ms = time.time_ns() // 1_000_000
                                 if (
                                     first_reasoning
                                     or now_monotonic - fallback_reasoning_last_pulse_at
@@ -3667,9 +4248,7 @@ class _SelectorFallbackProvider:
                                 # The fallback leg follows the same visible commit
                                 # boundary as the primary: reasoning streams live,
                                 # and no later leg may replace it invisibly.
-                                for buffered_event in fallback_buffer.drain(
-                                    successful_leg=True
-                                ):
+                                for buffered_event in fallback_buffer.drain(successful_leg=True):
                                     yield buffered_event
                                 fallback_committed = True
                                 self._record_health_success()
@@ -3682,9 +4261,7 @@ class _SelectorFallbackProvider:
                             ):
                                 fallback_buffer.append(fallback_event)
                                 if fallback_buffer.protocol_error:
-                                    invalid_order_error = (
-                                        _selector_invalid_stream_order_error()
-                                    )
+                                    invalid_order_error = _selector_invalid_stream_order_error()
                                     self._record_health_failure(invalid_order_error)
                                     yield invalid_order_error
                                     return
@@ -3704,9 +4281,7 @@ class _SelectorFallbackProvider:
                                 yield invalid_order_error
                                 return
                             if _is_non_empty_provider_text_delta(fallback_event):
-                                for buffered_event in fallback_buffer.drain(
-                                    successful_leg=True
-                                ):
+                                for buffered_event in fallback_buffer.drain(successful_leg=True):
                                     yield buffered_event
                                 fallback_committed = True
                                 self._record_health_success()
@@ -3717,17 +4292,14 @@ class _SelectorFallbackProvider:
                                     fallback_buffer.drain(successful_leg=False)
                                     incomplete_error = ProviderErrorEvent(
                                         message=(
-                                            "Provider stream ended with an incomplete "
-                                            "tool call"
+                                            "Provider stream ended with an incomplete tool call"
                                         ),
                                         code="incomplete_tool_stream",
                                     )
                                     self._record_health_failure(incomplete_error)
                                     yield incomplete_error
                                     return
-                                tool_leg_committed = (
-                                    fallback_buffer.has_completed_tool_call
-                                )
+                                tool_leg_committed = fallback_buffer.has_completed_tool_call
                                 for buffered_event in fallback_buffer.drain(
                                     # A no-text/no-tool Done is classified by
                                     # Agent as an invalid or reasoning-only
@@ -3933,9 +4505,7 @@ def _render_preview_only_attachment_text(
         else "read_full: material path unavailable."
     )
     truncation = (
-        f"\n\n[attachment preview truncated: {len(decoded)} chars total]"
-        if truncated
-        else ""
+        f"\n\n[attachment preview truncated: {len(decoded)} chars total]" if truncated else ""
     )
     return (
         "[large text attachment materialized]\n"
@@ -3949,6 +4519,65 @@ def _render_preview_only_attachment_text(
         f"{preview}"
         f"{truncation}"
     )
+
+
+def _publish_file_parse_fact(
+    sink: Callable[[FileParseReliabilityFacts], object] | None,
+    *,
+    media_type: str,
+    size_bytes: int,
+    started_at: float,
+    error_code: FileParseErrorCode | None = None,
+    outcome: ResultOutcome | None = None,
+) -> None:
+    if sink is None:
+        return
+    file_type = file_type_for_media_type(media_type)
+    if file_type is None:
+        return
+    resolved_outcome = outcome or (
+        ResultOutcome.SUCCESS if error_code is None else ResultOutcome.FAIL
+    )
+    facts = FileParseReliabilityFacts(
+        file_type=file_type,
+        size_bucket=file_size_bucket(size_bytes),
+        outcome=resolved_outcome,
+        error_code=error_code,
+        duration_ms=max(0, int((time.monotonic() - started_at) * 1000)),
+    )
+    try:
+        sink(facts)
+    except BaseException:
+        return
+
+
+def _pdf_parse_error_code(error: ValueError) -> FileParseErrorCode:
+    local_reason = str(error).casefold()
+    if "requires" in local_reason or "dependency" in local_reason:
+        return FileParseErrorCode.PARSER_DEPENDENCY_MISSING
+    if "no extractable text" in local_reason:
+        return FileParseErrorCode.NO_EXTRACTABLE_TEXT
+    return FileParseErrorCode.MALFORMED_PDF
+
+
+def _office_parse_error_code(error: ValueError) -> FileParseErrorCode:
+    local_reason = str(error).casefold()
+    if "decompresses beyond" in local_reason:
+        return FileParseErrorCode.DECOMPRESSION_LIMIT
+    if "missing dependency" in local_reason or "requires" in local_reason:
+        return FileParseErrorCode.PARSER_DEPENDENCY_MISSING
+    if "no extractable text" in local_reason:
+        return FileParseErrorCode.NO_EXTRACTABLE_TEXT
+    return FileParseErrorCode.INVALID_OFFICE_CONTAINER
+
+
+def _email_parse_error_code(error: ValueError) -> FileParseErrorCode:
+    local_reason = str(error).casefold()
+    if "optional 'extract-msg'" in local_reason or "requires" in local_reason:
+        return FileParseErrorCode.PARSER_DEPENDENCY_MISSING
+    if "no extractable text" in local_reason:
+        return FileParseErrorCode.NO_EXTRACTABLE_TEXT
+    return FileParseErrorCode.INTERNAL_ERROR
 
 
 def _extract_pdf_attachment_text(
@@ -3980,6 +4609,8 @@ def _extract_pdf_attachment_text(
                 page_text = page.extract_text() or ""
                 if page_text.strip():
                     page_texts.append(f"--- Page {index} ---\n{page_text}")
+    except (_AttachmentPreparationCancelledError, TimeoutError):
+        raise
     except Exception as exc:  # noqa: BLE001 - pdfplumber raises several parser errors
         raise ValueError(f"PDF attachment {filename!r} could not be read: {exc}") from exc
 
@@ -4049,7 +4680,7 @@ def _office_zip_guard(
                                 "byte safety limit"
                             )
             return total
-    except ValueError:
+    except (ValueError, _AttachmentPreparationCancelledError, TimeoutError):
         raise
     except Exception as exc:  # noqa: BLE001 - zipfile raises several error types
         raise ValueError(
@@ -4090,10 +4721,7 @@ def _extract_xlsx_text(raw_bytes: bytes) -> str:
                 if row_index >= _XLSX_MAX_ROWS_PER_SHEET:
                     rows.append(f"[sheet truncated at {_XLSX_MAX_ROWS_PER_SHEET} rows]")
                     break
-                cells = [
-                    "" if value is None else str(value)
-                    for value in row[:_XLSX_MAX_COLS]
-                ]
+                cells = ["" if value is None else str(value) for value in row[:_XLSX_MAX_COLS]]
                 if any(cells):
                     rows.append(",".join(cells))
             if rows:
@@ -4169,16 +4797,12 @@ def _extract_office_attachment_text(
         cancel_check()
     try:
         extracted = extractor(raw_bytes).strip()
-    except ValueError:
+    except (ValueError, _AttachmentPreparationCancelledError, TimeoutError):
         raise
     except ImportError as exc:  # pragma: no cover - dependency is declared
-        raise ValueError(
-            f"office text extraction requires a missing dependency: {exc}"
-        ) from exc
+        raise ValueError(f"office text extraction requires a missing dependency: {exc}") from exc
     except Exception as exc:  # noqa: BLE001 - parsers raise many error types
-        raise ValueError(
-            f"office attachment {filename!r} could not be read: {exc}"
-        ) from exc
+        raise ValueError(f"office attachment {filename!r} could not be read: {exc}") from exc
     if not extracted:
         raise ValueError(f"office attachment {filename!r} has no extractable text")
     if cancel_check is not None:
@@ -4326,9 +4950,7 @@ def _extract_msg_text(raw_bytes: bytes) -> str:
     return rendered.strip()
 
 
-def _extract_email_attachment_text(
-    raw_bytes: bytes, filename: str, media_type: str
-) -> str:
+def _extract_email_attachment_text(raw_bytes: bytes, filename: str, media_type: str) -> str:
     """Extract text from an email attachment.
 
     .eml/.mbox use the stdlib email/mailbox parsers (zero dependency); .msg uses
@@ -4343,9 +4965,7 @@ def _extract_email_attachment_text(
     except ValueError:
         raise
     except Exception as exc:  # noqa: BLE001 - email parsers raise many error types
-        raise ValueError(
-            f"email attachment {filename!r} could not be read: {exc}"
-        ) from exc
+        raise ValueError(f"email attachment {filename!r} could not be read: {exc}") from exc
     if not extracted:
         raise ValueError(f"email attachment {filename!r} has no extractable text")
     return _truncate_attachment_text(extracted)
@@ -4427,17 +5047,14 @@ def _resolve_identity_prompt_mode(config: object) -> str:
     if env_prompt_mode:
         if env_prompt_mode not in allowed_modes:
             raise ValueError(
-                "OPENSQUILLA_PROMPT_MODE must be one of: "
-                + ", ".join(sorted(allowed_modes))
+                "OPENSQUILLA_PROMPT_MODE must be one of: " + ", ".join(sorted(allowed_modes))
             )
         return env_prompt_mode
 
     prompt_cfg = getattr(config, "prompt", None)
     prompt_mode = str(getattr(prompt_cfg, "mode", "auto") or "auto")
     if prompt_mode not in allowed_modes:
-        raise ValueError(
-            "prompt.mode must be one of: " + ", ".join(sorted(allowed_modes))
-        )
+        raise ValueError("prompt.mode must be one of: " + ", ".join(sorted(allowed_modes)))
     if prompt_mode != "auto":
         return prompt_mode
 
@@ -4445,130 +5062,6 @@ def _resolve_identity_prompt_mode(config: object) -> str:
     if getattr(tools_cfg, "profile", None) == "memory_only":
         return "minimal"
     return "full"
-
-
-_PATCH_EVIDENCE_PROTOCOL_ENV = "OPENSQUILLA_PATCH_EVIDENCE_PROTOCOL"
-_PATCH_EVIDENCE_PROTOCOL_ON = {"on", "1", "true", "yes"}
-_PATCH_EVIDENCE_PROTOCOL_OFF = {"off", "0", "false", "no"}
-
-
-def _resolve_patch_evidence_protocol(config: object) -> bool:
-    """Resolve the opt-in Patch Evidence Protocol prompt flag.
-
-    ``OPENSQUILLA_PATCH_EVIDENCE_PROTOCOL`` ("on"/"off") overrides
-    ``prompt.patch_evidence_protocol`` from gateway config; default is off.
-    Unrecognized env values raise instead of being silently ignored so a
-    run manifest cannot record an override the run did not actually apply.
-    """
-    env_value = os.environ.get(_PATCH_EVIDENCE_PROTOCOL_ENV, "").strip().lower()
-    if env_value:
-        if env_value in _PATCH_EVIDENCE_PROTOCOL_ON:
-            return True
-        if env_value in _PATCH_EVIDENCE_PROTOCOL_OFF:
-            return False
-        raise ValueError(
-            f"{_PATCH_EVIDENCE_PROTOCOL_ENV} must be one of: "
-            + ", ".join(
-                sorted(_PATCH_EVIDENCE_PROTOCOL_ON | _PATCH_EVIDENCE_PROTOCOL_OFF)
-            )
-        )
-
-    prompt_cfg = getattr(config, "prompt", None)
-    return bool(getattr(prompt_cfg, "patch_evidence_protocol", False))
-
-
-_FINALIZE_EVIDENCE_GATE_ENV = "OPENSQUILLA_FINALIZE_EVIDENCE_GATE"
-_FINALIZE_EVIDENCE_GATE_ON = {"on", "1", "true", "yes"}
-_FINALIZE_EVIDENCE_GATE_OFF = {"off", "0", "false", "no"}
-
-
-def _resolve_finalize_evidence_gate(config: object) -> bool:
-    """Resolve the opt-in finalize-time red-evidence gate prompt flag.
-
-    ``OPENSQUILLA_FINALIZE_EVIDENCE_GATE`` ("on"/"off") overrides
-    ``prompt.finalize_evidence_gate`` from gateway config; default is off.
-    The same env var also enables the loop-side gate (see
-    engine.turn_runner.agent_bootstrap_stage). Unrecognized env values raise
-    instead of being silently ignored so a run manifest cannot record an
-    override the run did not actually apply.
-    """
-    env_value = os.environ.get(_FINALIZE_EVIDENCE_GATE_ENV, "").strip().lower()
-    if env_value:
-        if env_value in _FINALIZE_EVIDENCE_GATE_ON:
-            return True
-        if env_value in _FINALIZE_EVIDENCE_GATE_OFF:
-            return False
-        raise ValueError(
-            f"{_FINALIZE_EVIDENCE_GATE_ENV} must be one of: "
-            + ", ".join(
-                sorted(_FINALIZE_EVIDENCE_GATE_ON | _FINALIZE_EVIDENCE_GATE_OFF)
-            )
-        )
-
-    prompt_cfg = getattr(config, "prompt", None)
-    return bool(getattr(prompt_cfg, "finalize_evidence_gate", False))
-
-
-_LEGACY_PROMPT_STYLE_ENV = "OPENSQUILLA_LEGACY_PROMPT_STYLE"
-_LEGACY_PROMPT_STYLE_ON = {"on", "1", "true", "yes"}
-_LEGACY_PROMPT_STYLE_OFF = {"off", "0", "false", "no"}
-
-
-def _resolve_legacy_prompt_style(config: object) -> bool:
-    """Resolve the opt-in legacy prompt style flag.
-
-    ``OPENSQUILLA_LEGACY_PROMPT_STYLE`` ("on"/"off") overrides
-    ``prompt.legacy_prompt_style`` from gateway config; default is off and
-    keeps the current prompt wording byte-identical. Unrecognized env values
-    raise instead of being silently ignored so a run manifest cannot record
-    an override the run did not actually apply.
-    """
-    env_value = os.environ.get(_LEGACY_PROMPT_STYLE_ENV, "").strip().lower()
-    if env_value:
-        if env_value in _LEGACY_PROMPT_STYLE_ON:
-            return True
-        if env_value in _LEGACY_PROMPT_STYLE_OFF:
-            return False
-        raise ValueError(
-            f"{_LEGACY_PROMPT_STYLE_ENV} must be one of: "
-            + ", ".join(sorted(_LEGACY_PROMPT_STYLE_ON | _LEGACY_PROMPT_STYLE_OFF))
-        )
-
-    prompt_cfg = getattr(config, "prompt", None)
-    return bool(getattr(prompt_cfg, "legacy_prompt_style", False))
-
-
-_SUBMIT_REVIEW_ENV = "OPENSQUILLA_SUBMIT_REVIEW"
-_SUBMIT_REVIEW_ON = {"on", "1", "true", "yes"}
-_SUBMIT_REVIEW_OFF = {"off", "0", "false", "no"}
-
-
-def _resolve_submit_review(config: object) -> bool:
-    """Resolve the opt-in review-on-submit checkpoint flag at surface time.
-
-    ``OPENSQUILLA_SUBMIT_REVIEW`` ("on"/"off") overrides
-    ``config.submit_review_enabled``; default is off. The env read mirrors
-    ``engine.turn_runner.agent_bootstrap_stage._submit_review_from_env`` so the
-    tool-surfacing decision here agrees with the loop-side gate: the loop config
-    (``AgentConfig`` built in agent_bootstrap_stage) and the TurnRunner
-    ``self._config`` are distinct objects, so reading the config field alone
-    surfaces ``submit`` only when the two happen to share provenance. Reading the
-    same env var directly keeps surfacing and loop behaviour in lockstep.
-    Unrecognized env values raise instead of being silently ignored so an
-    experiment manifest cannot record a lever the run did not actually apply.
-    """
-    env_value = os.environ.get(_SUBMIT_REVIEW_ENV, "").strip().lower()
-    if env_value:
-        if env_value in _SUBMIT_REVIEW_ON:
-            return True
-        if env_value in _SUBMIT_REVIEW_OFF:
-            return False
-        raise ValueError(
-            f"{_SUBMIT_REVIEW_ENV} must be one of: "
-            + ", ".join(sorted(_SUBMIT_REVIEW_ON | _SUBMIT_REVIEW_OFF))
-        )
-
-    return bool(getattr(config, "submit_review_enabled", False))
 
 
 class _TaskOwnedSessionAppend:
@@ -4652,6 +5145,12 @@ class TurnRunner:
             Callable[[PromptCacheKeepaliveCandidate], None] | None
         ) = None,
         prompt_cache_keepalive_armed: Callable[[str], bool] | None = None,
+        turn_reliability_sink: TurnReliabilitySink | None = None,
+        tool_reliability_sink: ToolReliabilitySink | None = None,
+        file_parse_reliability_sink: FileParseReliabilitySink | None = None,
+        turn_growth_started_sink: GrowthMilestoneSink | None = None,
+        turn_growth_succeeded_sink: GrowthMilestoneSink | None = None,
+        growth_event_sink: Any | None = None,
     ) -> None:
         self._provider_selector = provider_selector
         self._tool_registry = tool_registry
@@ -4671,6 +5170,15 @@ class TurnRunner:
         self._usage_event_sink = usage_event_sink
         self._prompt_cache_keepalive_recorder = prompt_cache_keepalive_recorder
         self._prompt_cache_keepalive_armed = prompt_cache_keepalive_armed
+        self._turn_reliability_sink = turn_reliability_sink
+        self._tool_reliability_sink = tool_reliability_sink
+        self._file_parse_reliability_sink = file_parse_reliability_sink
+        self._turn_growth_started_sink = turn_growth_started_sink
+        self._turn_growth_succeeded_sink = turn_growth_succeeded_sink
+        # Owner-authenticated telemetry RPCs need the durable launch producer;
+        # keep the handle explicit rather than attaching an undeclared field.
+        self.growth_event_sink = growth_event_sink
+        self._reliability_clock = time.monotonic
         # Populated alongside the existing session-id lookup so live usage
         # events retain reset fencing without a second storage round trip.
         self._usage_session_epoch_by_key: dict[str, int] = {}
@@ -4796,7 +5304,6 @@ class TurnRunner:
             turn_memory_capture=_TurnRunnerTurnMemoryCaptureAdapter(self),
             session_totals=_TurnRunnerSessionTotalsAdapter(self),
             turn_error_persist=_TurnRunnerTurnErrorPersistAdapter(self),
-            usage_telemetry=_TurnRunnerUsageTelemetryAdapter(self),
         )
 
     def _turn_config(self) -> Any:
@@ -4937,11 +5444,19 @@ class TurnRunner:
     ) -> ToolContext:
         attachments_cfg = getattr(self._config, "attachments", None)
         media_root = self._attachment_media_root()
-        session_id, session_epoch, workspace_id = (
-            await self._resolve_session_identity_for_log(session_key)
+        session_id, session_epoch, workspace_id = await self._resolve_session_identity_for_log(
+            session_key
         )
         if not session_id:
             session_id = session_key.split(":")[-1] or session_key
+        # A caller may reuse its base context for sequential or concurrent
+        # turns. Publications and their private source identities belong only
+        # to this turn; never clear the caller's shared containers in place.
+        source_paths: dict[str, ArtifactSource] = {}
+        adopter = tool_context.generated_artifact_adopter
+        with_source_paths = getattr(adopter, "with_source_paths", None)
+        if callable(with_source_paths):
+            adopter = with_source_paths(source_paths)
         return replace(
             tool_context,
             session_key=session_key,
@@ -4953,6 +5468,9 @@ class TurnRunner:
             workspace_id=workspace_id,
             sandbox_session_manager=self._session_manager,
             sandbox_gateway_config=self._config,
+            published_artifacts=[],
+            artifact_source_paths=source_paths,
+            generated_artifact_adopter=adopter,
             workspace_file_writes=[],
             artifact_max_bytes=getattr(attachments_cfg, "artifact_max_bytes", None),
             artifact_disk_budget_bytes=getattr(
@@ -5148,6 +5666,31 @@ class TurnRunner:
     async def _append_session_message(self, session_key: str, **append_kwargs: Any) -> Any:
         if self._session_manager is None:
             return None
+        assistant_replay = append_kwargs.get("assistant_replay")
+        if assistant_replay is not None and (
+            getattr(
+                getattr(self._turn_config(), "attachments", None), "persist_transcripts", True
+            ) is False
+        ):
+            from opensquilla.engine.history import decode_assistant_replay
+
+            # Normal completion and cancellation share this durable boundary.
+            # Keep request-local images in the live canonical messages, but do
+            # not retain their bytes in the transcript when persistence is off.
+            # The shared content projection preserves native reasoning and
+            # tool associations, including images nested inside tool results.
+            projection = project_messages(
+                decode_assistant_replay(assistant_replay),
+                mode=ImageProjectionMode.MARKER,
+                marker_state=ImageMarkerState.UNAVAILABLE,
+            )
+            if projection.changed:
+                append_kwargs["assistant_replay"] = {
+                    "version": 1,
+                    "messages": [
+                        message.model_dump(mode="json") for message in projection.messages
+                    ],
+                }
         async with self._session_write_context(session_key):
             return await self._session_manager.append_message(
                 session_key,
@@ -5186,7 +5729,222 @@ class TurnRunner:
         pending_input_provider: PendingInputProvider | None = None,
         bound_user_message_id: str | None = None,
         assistant_message_sink: Callable[[str | None, str], None] | None = None,
-        document_mutation_outcome_sink: Callable[[dict[str, Any]], None] | None = None,
+        root_turn_id: str | None = None,
+        provider_request_correlation: ProviderRequestCorrelation | None = None,
+        assistant_message_id: str | None = None,
+        expected_session_id: str | None = None,
+        expected_session_epoch: int | None = None,
+        telemetry_surface: ClientSurface | None = None,
+        telemetry_execution_mode: ExecutionMode | None = None,
+    ) -> AsyncIterator[AgentEvent]:
+        """Run one public turn and publish exactly one content-free result fact."""
+
+        if (telemetry_surface is None) != (telemetry_execution_mode is None):
+            raise ValueError("telemetry runtime dimensions must be supplied together")
+        telemetry_token = (
+            None
+            if telemetry_surface is None or telemetry_execution_mode is None
+            else set_client_runtime_dimensions(
+                telemetry_surface,
+                telemetry_execution_mode,
+            )
+        )
+
+        clock = getattr(self, "_reliability_clock", time.monotonic)
+        accumulator = TurnFactAccumulator(started_at=clock())
+        failure_stage_token = set_current_turn_failure_stage(TurnFailureStage.TURN_SETUP)
+        outcome = ResultOutcome.SUCCESS
+        error_code: TurnErrorCode | None = None
+        failure_stage: TurnFailureStage | None = None
+        terminal_observed = False
+        growth_turn = input_mode == "user" and run_kind == "default"
+        growth_success_published = False
+        if growth_turn:
+            self._publish_growth_milestone(
+                getattr(self, "_turn_growth_started_sink", None),
+                warning_event="turn_runner.growth_started_sink_failed",
+            )
+        try:
+            stream = cast(
+                AsyncGenerator[AgentEvent, None],
+                self._run_without_reliability(
+                    message,
+                    session_key,
+                    tool_context,
+                    agent_id=agent_id,
+                    model=model,
+                    attachments=attachments,
+                    timeout=timeout,
+                    max_iterations=max_iterations,
+                    iteration_timeout=iteration_timeout,
+                    tool_timeout=tool_timeout,
+                    request_timeout=request_timeout,
+                    max_provider_retries=max_provider_retries,
+                    length_capped_continuations=length_capped_continuations,
+                    input_mode=input_mode,
+                    persist_input=persist_input,
+                    input_provenance=input_provenance,
+                    history_has_persisted_user=history_has_persisted_user,
+                    fresh_user_session=fresh_user_session,
+                    session_intent=session_intent,
+                    semantic_message=semantic_message,
+                    run_kind=run_kind,
+                    heartbeat_ack_max_chars=heartbeat_ack_max_chars,
+                    bootstrap_context_mode=bootstrap_context_mode,
+                    no_memory_capture=no_memory_capture,
+                    ingress_pipeline_steps=ingress_pipeline_steps,
+                    router_control_replay_depth=router_control_replay_depth,
+                    pending_input_provider=pending_input_provider,
+                    bound_user_message_id=bound_user_message_id,
+                    assistant_message_sink=assistant_message_sink,
+                    root_turn_id=root_turn_id,
+                    provider_request_correlation=provider_request_correlation,
+                    assistant_message_id=assistant_message_id,
+                    expected_session_id=expected_session_id,
+                    expected_session_epoch=expected_session_epoch,
+                ),
+            )
+            async with contextlib.aclosing(stream):
+                async for event in stream:
+                    now = clock()
+                    if isinstance(event, (TextDeltaEvent, DoneEvent)) and bool(event.text):
+                        accumulator.observe_text(now)
+                    elif isinstance(event, RunHeartbeatEvent):
+                        accumulator.observe_heartbeat(now, idle_ms=event.idle_ms)
+                    else:
+                        accumulator.observe_progress(now)
+                    if isinstance(event, AnswerGenerationResetEvent) and event.terminal:
+                        outcome, error_code = classify_turn_error(
+                            code=event.terminal_error_code,
+                            failure_kind=event.terminal_failure_kind,
+                        )
+                        failure_stage = current_turn_failure_stage()
+                        terminal_observed = True
+                    elif isinstance(event, ErrorEvent):
+                        outcome, error_code = classify_turn_error(
+                            code=event.code,
+                            failure_kind=event.failure_kind,
+                        )
+                        failure_stage = current_turn_failure_stage()
+                        terminal_observed = True
+                    elif isinstance(event, ControlTerminalEvent):
+                        outcome, error_code = classify_control_terminal(event.reason)
+                        failure_stage = current_turn_failure_stage()
+                        terminal_observed = True
+                    elif isinstance(event, DoneEvent):
+                        terminal_observed = True
+                    if (
+                        growth_turn
+                        and not growth_success_published
+                        and isinstance(event, DoneEvent)
+                        and outcome is ResultOutcome.SUCCESS
+                    ):
+                        # DoneEvent is the authoritative successful terminal.
+                        # Settle before yielding so a consumer that closes the
+                        # generator immediately after Done cannot lose it.
+                        growth_success_published = True
+                        self._publish_growth_milestone(
+                            getattr(self, "_turn_growth_succeeded_sink", None),
+                            warning_event="turn_runner.growth_succeeded_sink_failed",
+                        )
+                    yield event
+        except asyncio.CancelledError:
+            if not terminal_observed:
+                outcome = ResultOutcome.CANCEL
+                error_code = TurnErrorCode.UNKNOWN
+                failure_stage = current_turn_failure_stage()
+            raise
+        except GeneratorExit:
+            if not terminal_observed:
+                outcome = ResultOutcome.CANCEL
+                error_code = TurnErrorCode.UNKNOWN
+                failure_stage = current_turn_failure_stage()
+            raise
+        except TimeoutError:
+            outcome = ResultOutcome.TIMEOUT
+            error_code = TurnErrorCode.PROVIDER_TIMEOUT
+            failure_stage = current_turn_failure_stage()
+            raise
+        except BaseException:
+            outcome = ResultOutcome.FAIL
+            error_code = TurnErrorCode.INTERNAL_ERROR
+            failure_stage = current_turn_failure_stage()
+            raise
+        finally:
+            facts = accumulator.finish(
+                clock(),
+                outcome=outcome,
+                error_code=error_code,
+                failure_stage=failure_stage,
+            )
+            sink = self._turn_reliability_sink
+            if sink is not None:
+                try:
+                    sink_result = sink(facts)
+                    if inspect.isawaitable(sink_result):
+                        close = getattr(sink_result, "close", None)
+                        if callable(close):
+                            close()
+                        log.warning("turn_runner.reliability_sink_must_be_synchronous")
+                except BaseException as exc:  # observer must never change the turn
+                    log.warning(
+                        "turn_runner.reliability_sink_failed",
+                        error_type=type(exc).__name__,
+                    )
+            if telemetry_token is not None:
+                reset_client_runtime_dimensions(telemetry_token)
+            reset_current_turn_failure_stage(failure_stage_token)
+
+    @staticmethod
+    def _publish_growth_milestone(
+        sink: GrowthMilestoneSink | None,
+        *,
+        warning_event: str,
+    ) -> None:
+        if sink is None:
+            return
+        try:
+            sink_result = sink()
+            if inspect.isawaitable(sink_result):
+                close = getattr(sink_result, "close", None)
+                if callable(close):
+                    close()
+                log.warning("turn_runner.growth_sink_must_be_synchronous")
+        except BaseException as exc:
+            log.warning(warning_event, error_type=type(exc).__name__)
+
+    async def _run_without_reliability(
+        self,
+        message: str,
+        session_key: str,
+        tool_context: ToolContext,
+        agent_id: str = "main",
+        model: str | None = None,
+        attachments: list[dict] | None = None,
+        timeout: float | None = None,
+        max_iterations: int | None = None,
+        iteration_timeout: float | None = None,
+        tool_timeout: float | None = None,
+        request_timeout: float | None = None,
+        max_provider_retries: int | None = None,
+        length_capped_continuations: int | None = None,
+        input_mode: str = "user",
+        persist_input: bool = False,
+        input_provenance: dict[str, Any] | str | None = None,
+        history_has_persisted_user: bool = True,
+        fresh_user_session: bool | None = None,
+        session_intent: str | None = None,
+        semantic_message: str | None = None,
+        run_kind: str = "default",
+        heartbeat_ack_max_chars: int = 300,
+        bootstrap_context_mode: str | None = None,
+        no_memory_capture: bool = False,
+        ingress_pipeline_steps: list[PipelineStepRecord] | None = None,
+        router_control_replay_depth: int = 0,
+        *,
+        pending_input_provider: PendingInputProvider | None = None,
+        bound_user_message_id: str | None = None,
+        assistant_message_sink: Callable[[str | None, str], None] | None = None,
         root_turn_id: str | None = None,
         provider_request_correlation: ProviderRequestCorrelation | None = None,
         assistant_message_id: str | None = None,
@@ -5221,27 +5979,17 @@ class TurnRunner:
             )
         normalized_input_provenance = self._normalize_input_provenance(input_provenance)
         lock = self.get_session_lock(session_key)
-        # Resolved once per turn; ValueError propagates so a run manifest
-        # cannot record an override the run did not actually apply.
-        resolved_description_overrides = resolve_tool_description_overrides(self._config)
         effective_tool_context = replace(
             tool_context,
             session_key=session_key,
             tool_run_budget_key=f"{session_key}:{uuid.uuid4().hex}",
             router_control_config=getattr(self._turn_config(), "squilla_router", None),
             router_control_hold_store=self._router_control_hold_store,
+            router_control_routing_revision=getattr(
+                _ACCEPTED_TURN_CONFIG.get(), "session_routing_revision", None
+            ),
             router_control_replay_depth=router_control_replay_depth,
             router_control_turn_hold_applied=False,
-            tool_description_overrides=(
-                resolved_description_overrides[0]
-                if resolved_description_overrides
-                else None
-            ),
-            tool_description_overrides_source=(
-                resolved_description_overrides[1]
-                if resolved_description_overrides
-                else None
-            ),
         )
         configured_state_dir = getattr(self._turn_config(), "state_dir", None)
 
@@ -5265,9 +6013,7 @@ class TurnRunner:
             return contextlib.nullcontext()
 
         def git_mode_scope():
-            return git_run_mode_scope(
-                effective_run_mode_for_context(effective_tool_context)
-            )
+            return git_run_mode_scope(effective_run_mode_for_context(effective_tool_context))
 
         logical_turn_id = (
             root_turn_id.strip()
@@ -5330,69 +6076,9 @@ class TurnRunner:
                     git_mode_scope(),
                     process_scope(),
                 ):
-                    async for event in self._run_turn(
-                        message,
-                        session_key,
-                        agent_id,
-                        model,
-                        attachments or [],
-                        effective_tool_context,
-                        timeout=timeout,
-                        max_iterations=max_iterations,
-                        iteration_timeout=iteration_timeout,
-                        tool_timeout=tool_timeout,
-                        request_timeout=request_timeout,
-                        max_provider_retries=max_provider_retries,
-                        length_capped_continuations=length_capped_continuations,
-                        input_mode=input_mode,
-                        persist_input=persist_input,
-                        input_provenance=normalized_input_provenance,
-                        history_has_persisted_user=history_has_persisted_user,
-                        fresh_user_session=fresh_user_session,
-                        session_intent=session_intent,
-                        semantic_message=semantic_message,
-                        pending_input_provider=pending_input_provider,
-                        run_kind=run_kind,
-                        heartbeat_ack_max_chars=heartbeat_ack_max_chars,
-                        bootstrap_context_mode=bootstrap_context_mode,
-                        no_memory_capture=no_memory_capture,
-                        ingress_pipeline_steps=ingress_pipeline_steps,
-                        router_control_replay_depth=router_control_replay_depth,
-                        bound_user_message_id=bound_user_message_id,
-                        assistant_message_sink=assistant_message_sink,
-                        document_mutation_outcome_sink=document_mutation_outcome_sink,
-                        root_turn_id=logical_turn_id,
-                        provider_request_correlation=provider_request_correlation,
-                        assistant_message_id=assistant_message_id,
-                        expected_session_id=expected_session_id,
-                        expected_session_epoch=expected_session_epoch,
-                        execution_context=execution_context,
-                    ):
-                        yield event
-            finally:
-                self.clear_compaction_turn_state(session_key)
-                await execution_context.close()
-        else:
-            async with lock:
-                # Standalone/legacy runners do not have TaskRuntime's durable
-                # admission CAS. Validate while holding the same session lock
-                # that reset must acquire, before resolving any provider/tools.
-                await validate_standalone_owner()
-                # Record this Task as the lock owner in the ContextVar so that
-                # any nested call to run() within the same Task can detect re-entry.
-                _map: dict[int, asyncio.Task[Any]] = dict(owner_map or {})
-                if current_task is not None:
-                    _map[id(lock)] = current_task
-                _token = _SESSION_LOCK_OWNER.set(_map)
-                try:
-                    with (
-                        managed_toolchain_state_scope(configured_state_dir),
-                        runtime_pack_state_scope(configured_state_dir),
-                        policy_scope(),
-                        git_mode_scope(),
-                        process_scope(),
-                    ):
-                        async for event in self._run_turn(
+                    turn_stream = cast(
+                        AsyncGenerator[AgentEvent, None],
+                        self._run_turn(
                             message,
                             session_key,
                             agent_id,
@@ -5422,19 +6108,88 @@ class TurnRunner:
                             router_control_replay_depth=router_control_replay_depth,
                             bound_user_message_id=bound_user_message_id,
                             assistant_message_sink=assistant_message_sink,
-                            document_mutation_outcome_sink=document_mutation_outcome_sink,
                             root_turn_id=logical_turn_id,
                             provider_request_correlation=provider_request_correlation,
                             assistant_message_id=assistant_message_id,
                             expected_session_id=expected_session_id,
                             expected_session_epoch=expected_session_epoch,
                             execution_context=execution_context,
-                        ):
+                        ),
+                    )
+                    async with contextlib.aclosing(turn_stream):
+                        async for event in turn_stream:
                             yield event
+            finally:
+                self.clear_compaction_turn_state(session_key)
+                await execution_context.close()
+        else:
+            async with lock:
+                # Standalone/legacy runners do not have TaskRuntime's durable
+                # admission CAS. Validate while holding the same session lock
+                # that reset must acquire, before resolving any provider/tools.
+                await validate_standalone_owner()
+                # Record this Task as the lock owner in the ContextVar so that
+                # any nested call to run() within the same Task can detect re-entry.
+                _map: dict[int, asyncio.Task[Any]] = dict(owner_map or {})
+                if current_task is not None:
+                    _map[id(lock)] = current_task
+                _token = _SESSION_LOCK_OWNER.set(_map)
+                try:
+                    with (
+                        managed_toolchain_state_scope(configured_state_dir),
+                        runtime_pack_state_scope(configured_state_dir),
+                        policy_scope(),
+                        git_mode_scope(),
+                        process_scope(),
+                    ):
+                        turn_stream = cast(
+                            AsyncGenerator[AgentEvent, None],
+                            self._run_turn(
+                                message,
+                                session_key,
+                                agent_id,
+                                model,
+                                attachments or [],
+                                effective_tool_context,
+                                timeout=timeout,
+                                max_iterations=max_iterations,
+                                iteration_timeout=iteration_timeout,
+                                tool_timeout=tool_timeout,
+                                request_timeout=request_timeout,
+                                max_provider_retries=max_provider_retries,
+                                length_capped_continuations=length_capped_continuations,
+                                input_mode=input_mode,
+                                persist_input=persist_input,
+                                input_provenance=normalized_input_provenance,
+                                history_has_persisted_user=history_has_persisted_user,
+                                fresh_user_session=fresh_user_session,
+                                session_intent=session_intent,
+                                semantic_message=semantic_message,
+                                pending_input_provider=pending_input_provider,
+                                run_kind=run_kind,
+                                heartbeat_ack_max_chars=heartbeat_ack_max_chars,
+                                bootstrap_context_mode=bootstrap_context_mode,
+                                no_memory_capture=no_memory_capture,
+                                ingress_pipeline_steps=ingress_pipeline_steps,
+                                router_control_replay_depth=router_control_replay_depth,
+                                bound_user_message_id=bound_user_message_id,
+                                assistant_message_sink=assistant_message_sink,
+                                root_turn_id=logical_turn_id,
+                                provider_request_correlation=provider_request_correlation,
+                                assistant_message_id=assistant_message_id,
+                                expected_session_id=expected_session_id,
+                                expected_session_epoch=expected_session_epoch,
+                                execution_context=execution_context,
+                            ),
+                        )
+                        async with contextlib.aclosing(turn_stream):
+                            async for event in turn_stream:
+                                yield event
                 finally:
                     self.clear_compaction_turn_state(session_key)
                     _SESSION_LOCK_OWNER.reset(_token)
                     await execution_context.close()
+
 
     async def _run_turn(
         self,
@@ -5468,7 +6223,6 @@ class TurnRunner:
         pending_input_provider: PendingInputProvider | None = None,
         bound_user_message_id: str | None = None,
         assistant_message_sink: Callable[[str | None, str], None] | None = None,
-        document_mutation_outcome_sink: Callable[[dict[str, Any]], None] | None = None,
         root_turn_id: str | None = None,
         provider_request_correlation: ProviderRequestCorrelation | None = None,
         assistant_message_id: str | None = None,
@@ -5476,6 +6230,7 @@ class TurnRunner:
         expected_session_epoch: int | None = None,
         execution_context: TurnExecutionContext | None = None,
     ) -> AsyncIterator[AgentEvent]:
+        mark_current_turn_failure_stage(TurnFailureStage.TURN_SETUP)
         # Observability: bracket turn setup + stream loop with monotonic clock
         # so latency_ms reflects the full turn.
         turn_started_at = time.monotonic()
@@ -5539,6 +6294,8 @@ class TurnRunner:
         # the normal-completion path does.
         current_text_parts: list[str] = []
         stream_state: _StreamState | None = None
+        agent: Agent | None = None
+        attachment_cleanup: Callable[[], None] | None = None
         self._emit_turn_event(
             "turn_start",
             trace_context,
@@ -5582,6 +6339,7 @@ class TurnRunner:
             else:
                 provider_request_correlation = None
 
+            mark_current_turn_failure_stage(TurnFailureStage.INPUT_PROCESSING)
             session_append: Any = self._session_manager
             if (
                 session_append is not None
@@ -5642,6 +6400,38 @@ class TurnRunner:
 
             transcript_snapshot = TurnTranscriptSnapshot[Any](_load_turn_transcript)
 
+            mark_current_turn_failure_stage(TurnFailureStage.PROVIDER_AND_TOOLS)
+            persist_image_material = (
+                getattr(
+                    getattr(self._turn_config(), "attachments", None),
+                    "persist_transcripts", True,
+                ) is not False
+            )
+            image_workspace_dir: str | None = None
+            image_failure_cleanup: Callable[[], None] | None = None
+            if (
+                not persist_image_material
+                and tool_context is not None
+                and any(
+                    (_normalize_attachment_mime(
+                        item.get("type") or item.get("mime") or item.get("media_type")
+                    ) or "").startswith("image/")
+                    for item in (attachments or [])
+                )
+            ):
+                previous_scratch = tool_context.scratch_dir
+                if previous_scratch:
+                    Path(previous_scratch).mkdir(parents=True, exist_ok=True)
+                temporary_images = tempfile.TemporaryDirectory(
+                    prefix="image-input-", dir=previous_scratch or None,
+                )
+                image_workspace_dir = temporary_images.name
+                if not previous_scratch:
+                    # Freeze tool policy only after the turn-local read root is known.
+                    tool_context = replace(tool_context, scratch_dir=image_workspace_dir)
+                image_failure_cleanup = temporary_images.cleanup
+                attachment_cleanup = image_failure_cleanup
+
             pt_outcome = await self._provider_and_tools_stage.run(
                 ProviderAndToolsStageInput(
                     session_key=session_key,
@@ -5701,15 +6491,11 @@ class TurnRunner:
             )
             generated_normalization_attachment_count = 0
             if isinstance(normalization_metadata, dict):
-                raw_generated_count = normalization_metadata.get(
-                    "generated_attachment_count"
-                )
+                raw_generated_count = normalization_metadata.get("generated_attachment_count")
                 if isinstance(raw_generated_count, int) and not isinstance(
                     raw_generated_count, bool
                 ):
-                    generated_normalization_attachment_count = max(
-                        0, raw_generated_count
-                    )
+                    generated_normalization_attachment_count = max(0, raw_generated_count)
             attachment_timeout = (
                 float(timeout)
                 if isinstance(timeout, int | float)
@@ -5717,23 +6503,45 @@ class TurnRunner:
                 and timeout > 0
                 else None
             )
+            mark_current_turn_failure_stage(TurnFailureStage.ATTACHMENT_PROCESSING)
+            # Once the worker is admitted, it owns failure cleanup until it has stopped.
+            attachment_cleanup = None
             att_outcome = await self._attachment_stage.run(
                 AttachmentStageInput(
                     effective_runtime_message=runtime_message,
                     attachments=attachments,
                     workspace_dir=getattr(tool_context, "workspace_dir", None),
-                    session_id=(
-                        attachment_materialization_session_id
-                        if attachments
-                        else None
-                    ),
+                    session_id=(attachment_materialization_session_id if attachments else None),
                     generated_normalization_attachment_count=(
                         generated_normalization_attachment_count
                     ),
                     timeout_seconds=attachment_timeout,
+                    persist_image_material=persist_image_material,
+                    image_workspace_dir=image_workspace_dir,
+                    failure_cleanup=image_failure_cleanup,
                 )
             )
+            attachment_cleanup = image_failure_cleanup
+            if attachment_cleanup is not None and tool_context is not None:
+                tool_context.turn_cleanup_callbacks.append(attachment_cleanup)
             att_out = att_outcome.require_output()
+            file_parse_sink = getattr(self, "_file_parse_reliability_sink", None)
+            if file_parse_sink is not None:
+                for file_parse_facts in att_out.file_parse_facts:
+                    try:
+                        sink_result = file_parse_sink(file_parse_facts)
+                        if inspect.isawaitable(sink_result):
+                            close = getattr(sink_result, "close", None)
+                            if callable(close):
+                                close()
+                            log.warning(
+                                "turn_runner.file_parse_reliability_sink_must_be_synchronous"
+                            )
+                    except BaseException as exc:
+                        log.warning(
+                            "turn_runner.file_parse_reliability_sink_failed",
+                            error_type=type(exc).__name__,
+                        )
 
             turn_usage_scope: UsageAccountingScope | None = None
             if self._usage_event_sink is not None:
@@ -5756,6 +6564,7 @@ class TurnRunner:
                 )
 
             with bind_usage_accounting_scope(turn_usage_scope):
+                mark_current_turn_failure_stage(TurnFailureStage.PROMPT_ASSEMBLY)
                 pa_outcome = await self._prompt_assembler_stage.run(
                     PromptAssemblerStageInput(
                         runtime_message=runtime_message,
@@ -5805,6 +6614,28 @@ class TurnRunner:
                 att_out.extra_messages,
                 effective_runtime_message,
             )
+            current_attachment_ids = turn.metadata.get(
+                "current_image_attachment_ids", turn.metadata.get("image_attachment_ids")
+            )
+            if extra_msgs:
+                current_ids = (
+                    current_attachment_ids
+                    if isinstance(current_attachment_ids, Sequence)
+                    and not isinstance(current_attachment_ids, (str, bytes, bytearray))
+                    else ()
+                )
+                durable_retained = turn.metadata.get("image_attachment_durable_retained")
+                if not isinstance(durable_retained, bool):
+                    durable_retained = None
+                extra_msgs = bind_image_attachment_ids(
+                    extra_msgs,
+                    [
+                        value
+                        for value in current_ids
+                        if isinstance(value, str) and value.strip()
+                    ],
+                    durable_retained=durable_retained,
+                )
             attachment_turn_input = (
                 effective_runtime_message if extra_msgs is None else ""
             )
@@ -5812,16 +6643,6 @@ class TurnRunner:
             final_prompt_str = final_prompt
             cache_breakpoints = pa_out.cache_breakpoints
             request_context_prompt = pa_out.request_context_prompt
-            artifact_request_context = getattr(
-                getattr(tool_context, "artifact_context", None),
-                "request_context_prompt",
-                None,
-            )
-            if isinstance(artifact_request_context, str) and artifact_request_context.strip():
-                request_context_prompt = _prepend_request_context_prompt(
-                    request_context_prompt,
-                    artifact_request_context,
-                )
             resolved_model = pa_out.resolved_model
             provider_name = pa_out.provider_name
             # Prompt assembly may resolve the mutable current session after a
@@ -5888,9 +6709,7 @@ class TurnRunner:
                 tool_context.router_control_turn_hold_applied = bool(
                     turn.metadata.get("router_control_hold_applied")
                 )
-            active_provider_id = (
-                getattr(cloned_selector, "active_provider_id", "") or provider_name
-            )
+            active_provider_id = getattr(cloned_selector, "active_provider_id", "") or provider_name
             runtime_timeout_override = self._web_chat_runtime_timeout_override(
                 session_key,
                 explicit=timeout,
@@ -5898,6 +6717,7 @@ class TurnRunner:
                 input_mode=input_mode,
                 turn_metadata=turn.metadata,
             )
+            mark_current_turn_failure_stage(TurnFailureStage.AGENT_BOOTSTRAP)
             ab_outcome = await self._agent_bootstrap_stage.run(
                 AgentBootstrapStageInput(
                     provider=provider,
@@ -5915,8 +6735,6 @@ class TurnRunner:
                     agent_id=agent_id,
                     timeout=runtime_timeout_override,
                     max_iterations=max_iterations,
-                    iteration_timeout=iteration_timeout,
-                    tool_timeout=tool_timeout,
                     request_timeout=request_timeout,
                     max_provider_retries=max_provider_retries,
                     length_capped_continuations=length_capped_continuations,
@@ -5930,6 +6748,13 @@ class TurnRunner:
             )
             ab_out = ab_outcome.require_output()
             agent = ab_out.agent
+            tool_reliability_setter = getattr(
+                agent,
+                "set_tool_reliability_sink",
+                None,
+            )
+            if callable(tool_reliability_setter):
+                tool_reliability_setter(self._tool_reliability_sink)
             keepalive_capture_enabled = False
             if (
                 self._prompt_cache_keepalive_recorder is not None
@@ -5976,8 +6801,6 @@ class TurnRunner:
             )
             effective_max_iterations = ab_out.effective_max_iterations  # noqa: F841
             effective_max_iterations_source = ab_out.effective_max_iterations_source  # noqa: F841
-            effective_iteration_timeout = ab_out.effective_iteration_timeout  # noqa: F841
-            effective_tool_timeout = ab_out.effective_tool_timeout  # noqa: F841
             effective_agent_request_timeout = ab_out.effective_request_timeout  # noqa: F841
             effective_max_provider_retries = ab_out.effective_max_provider_retries  # noqa: F841
             model_caps = ab_out.model_capabilities  # noqa: F841
@@ -5999,20 +6822,26 @@ class TurnRunner:
             forced_image_rejection_reason = str(
                 turn.metadata.get("image_input_forced_rejection_reason", "") or ""
             ).strip()
-            image_input_preflight_blocked = bool(
+            image_input_projection_required = bool(
                 forced_image_rejection_reason
                 or (
                     current_turn_image_count > 0
                     and agent_config.model_vision_support == "unsupported"
                 )
+                or turn.metadata.get("image_input_projection_required") is True
             )
-            if image_input_preflight_blocked:
-                turn.metadata["image_input_mode"] = "rejected"
+            if image_input_projection_required:
+                turn.metadata["image_input_mode"] = "marker"
                 turn.metadata["image_input_reason"] = (
                     forced_image_rejection_reason or "model_vision_unsupported"
                 )
                 turn.metadata["image_input_count"] = current_turn_image_count
                 turn.metadata["image_input_stage"] = "primary"
+            # Kept as a named local for frame-walking compatibility tests.  A
+            # missing image capability is no longer an admission block and
+            # must never suppress compaction; the physical request is shaped
+            # to text later at the shared provider boundary.
+            image_input_preflight_blocked = False
             # 6. Compaction (t3 + preflight) + history load + request-context
             # prepend. CompactionAndHistoryStage owns the four-call sequence
             # (t3_upgrade → preflight → load_history → prepend_request_context_prompt).
@@ -6032,6 +6861,7 @@ class TurnRunner:
                         global_override=getattr(llm_cfg, "context_window_tokens", 0) or 0,
                     )
                     compaction_context_window_tokens = window
+            from opensquilla.session.compaction import compaction_prompt_layout
             from opensquilla.session.compaction_deployment import (
                 CompactionDeploymentIdentity,
                 resolve_compaction_execution_plan,
@@ -6061,19 +6891,13 @@ class TurnRunner:
             previous_deployment_identities: list[CompactionDeploymentIdentity] = []
             if self._session_manager is not None:
                 try:
-                    compaction_session = await self._session_manager.get_session(
-                        session_key
-                    )
+                    compaction_session = await self._session_manager.get_session(session_key)
                 except Exception:  # noqa: BLE001 - optional provenance candidate
                     compaction_session = None
                 if compaction_session is not None:
                     current_identity = (
-                        str(
-                            getattr(selector_current_config, "provider", "") or ""
-                        ).strip(),
-                        str(
-                            getattr(selector_current_config, "model", "") or ""
-                        ).strip(),
+                        str(getattr(selector_current_config, "provider", "") or "").strip(),
+                        str(getattr(selector_current_config, "model", "") or "").strip(),
                     )
                     recorded_provider = str(
                         getattr(compaction_session, "model_provider", None) or ""
@@ -6086,9 +6910,7 @@ class TurnRunner:
                     override_provider = str(
                         getattr(compaction_session, "provider_override", None) or ""
                     ).strip()
-                    selected_model = str(
-                        getattr(compaction_session, "model", None) or ""
-                    ).strip()
+                    selected_model = str(getattr(compaction_session, "model", None) or "").strip()
                     previous_identities: list[tuple[str, str, str]] = []
                     if recorded_provider and recorded_model:
                         previous_identities.append(
@@ -6150,6 +6972,7 @@ class TurnRunner:
                 app_config=self._turn_config(),
                 active_provider=provider,
                 active_provider_config=selector_current_config,
+                active_only=compaction_prompt_layout() == "suffix",
                 previous_deployment_identities=previous_deployment_identities,
                 fallback_provider_configs=selector_remaining_chain[1:],
                 compaction_config=configured_compaction,
@@ -6173,57 +6996,36 @@ class TurnRunner:
                 )
                 fresh_window = 0
                 fresh_model = str(getattr(fresh_current, "model", "") or "")
-                fresh_provider = str(
-                    getattr(fresh_current, "provider", "") or ""
-                )
+                fresh_provider = str(getattr(fresh_current, "provider", "") or "")
                 if fresh_model and self._model_catalog is not None:
-                    llm_cfg = (
-                        getattr(self._config, "llm", None)
-                        if self._config
-                        else None
-                    )
-                    fresh_window, _fresh_window_source = (
-                        resolve_effective_context_window(
-                            self._model_catalog,
-                            fresh_model,
-                            provider=fresh_provider,
-                            global_override=(
-                                getattr(llm_cfg, "context_window_tokens", 0) or 0
-                            ),
-                        )
+                    llm_cfg = getattr(self._config, "llm", None) if self._config else None
+                    fresh_window, _fresh_window_source = resolve_effective_context_window(
+                        self._model_catalog,
+                        fresh_model,
+                        provider=fresh_provider,
+                        global_override=(getattr(llm_cfg, "context_window_tokens", 0) or 0),
                     )
                 return resolve_compaction_execution_plan(
                     app_config=self._turn_config(),
                     active_provider=provider,
                     active_provider_config=fresh_current,
-                    previous_deployment_identities=(
-                        previous_deployment_identities
-                    ),
+                    active_only=compaction_prompt_layout() == "suffix",
+                    previous_deployment_identities=(previous_deployment_identities),
                     fallback_provider_configs=fresh_chain[1:],
                     compaction_config=configured_compaction,
                     context_window_tokens=fresh_window,
                     session_key=session_key,
                     credential_pool_acquirer=acquire_profile_credential,
-                    credential_pool_failure_reporter=(
-                        report_profile_credential_failure
-                    ),
+                    credential_pool_failure_reporter=(report_profile_credential_failure),
                 )
 
             stable_consumer_window_tokens = compaction_context_window_tokens
             stable_consumer_max_output_tokens = agent.config.max_tokens
             stable_consumer_model_id = agent.config.model_id
             stable_consumer_capabilities = agent.config.model_capabilities
-            stable_consumer_proof_max_chars = (
-                agent.config.provider_request_proof_max_chars
-            )
-            stable_consumer_metadata = provider_metadata(
-                durable_base_consumer_provider
-            )
-            llm_cfg = (
-                getattr(self._config, "llm", None)
-                if self._config
-                else None
-            )
+            stable_consumer_proof_max_chars = agent.config.provider_request_proof_max_chars
+            stable_consumer_metadata = provider_metadata(durable_base_consumer_provider)
+            llm_cfg = getattr(self._config, "llm", None) if self._config else None
             if (
                 bool(turn.metadata.get("routing_applied", False))
                 and self._model_catalog is not None
@@ -6233,9 +7035,9 @@ class TurnRunner:
                     base_model,
                 ) = _stable_consumer_execution_identity(turn.metadata)
                 if base_model:
-                    configured_llm_provider = str(
-                        getattr(llm_cfg, "provider", "") or ""
-                    ).strip().lower()
+                    configured_llm_provider = (
+                        str(getattr(llm_cfg, "provider", "") or "").strip().lower()
+                    )
                     base_global_window = (
                         getattr(llm_cfg, "context_window_tokens", 0) or 0
                         if configured_llm_provider == base_provider.lower()
@@ -6258,12 +7060,10 @@ class TurnRunner:
                         or agent.config.max_tokens
                     )
                     stable_consumer_model_id = base_model
-                    stable_consumer_capabilities = (
-                        self._model_catalog.get_capabilities(
-                            base_model,
-                            provider_name=base_provider,
-                            base_url=stable_consumer_metadata.base_url,
-                        )
+                    stable_consumer_capabilities = self._model_catalog.get_capabilities(
+                        base_model,
+                        provider_name=base_provider,
+                        base_url=stable_consumer_metadata.base_url,
                     )
                     stable_consumer_proof_max_chars = (
                         int(
@@ -6301,14 +7101,10 @@ class TurnRunner:
                     context_window_tokens=stable_consumer_window_tokens,
                     max_output_tokens=stable_consumer_max_output_tokens,
                     model_capabilities=stable_consumer_capabilities,
-                    provider_request_proof_max_chars=(
-                        stable_consumer_proof_max_chars
-                    ),
+                    provider_request_proof_max_chars=(stable_consumer_proof_max_chars),
                 )
             agent.config.compaction_execution_plan = compaction_plan
-            agent.config.compaction_execution_plan_factory = (
-                _refresh_compaction_plan_for_operation
-            )
+            agent.config.compaction_execution_plan_factory = _refresh_compaction_plan_for_operation
             history_capacity_tokens = max(
                 1,
                 int(compaction_context_window_tokens),
@@ -6326,9 +7122,7 @@ class TurnRunner:
                 "build_compaction_consumer_admission",
                 None,
             )
-            if callable(preflight_history_capacity) and callable(
-                build_consumer_admission
-            ):
+            if callable(preflight_history_capacity) and callable(build_consumer_admission):
                 (
                     history_capacity_tokens,
                     history_capacity_chars,
@@ -6339,14 +7133,10 @@ class TurnRunner:
                     attachment_messages=extra_msgs,
                     context_window_tokens=compaction_context_window_tokens,
                     consumer_provider=durable_base_consumer_provider,
-                    consumer_max_output_tokens=(
-                        stable_consumer_max_output_tokens
-                    ),
+                    consumer_max_output_tokens=(stable_consumer_max_output_tokens),
                     consumer_model_id=stable_consumer_model_id,
                     consumer_model_capabilities=stable_consumer_capabilities,
-                    consumer_provider_request_max_chars=(
-                        stable_consumer_proof_max_chars
-                    ),
+                    consumer_provider_request_max_chars=(stable_consumer_proof_max_chars),
                 )
                 (
                     consumer_admission,
@@ -6361,9 +7151,7 @@ class TurnRunner:
                     max_output_tokens=stable_consumer_max_output_tokens,
                     consumer_model_id=stable_consumer_model_id,
                     consumer_model_capabilities=stable_consumer_capabilities,
-                    consumer_provider_request_max_chars=(
-                        stable_consumer_proof_max_chars
-                    ),
+                    consumer_provider_request_max_chars=(stable_consumer_proof_max_chars),
                 )
             else:
                 log.debug(
@@ -6378,7 +7166,25 @@ class TurnRunner:
                 active_user_in_history=history_has_persisted_user,
                 attachment_count=len(attachments),
             )
+            attachment_path_resolver = None
+            compaction_workspace = getattr(tool_context, "workspace_dir", None)
+            if persist_image_material and compaction_workspace and tool_context is not None:
+                from opensquilla.tools.write_policy import attachment_workspace_write_authorizer
+
+                compaction_materializer = AttachmentWorkspaceMaterializer(
+                    media_root=self._attachment_media_root(),
+                    workspace_dir=compaction_workspace,
+                    disk_budget_bytes=workspace_attachment_budget_from_config(self._config),
+                    authorize_write=attachment_workspace_write_authorizer(tool_context),
+                )
+                attachment_path_resolver = compaction_materializer.materialize_image_path
+            build_compaction_context = getattr(agent, "build_compaction_request_context", None)
+            compaction_request_context = (
+                build_compaction_context(effective_runtime_message)
+                if callable(build_compaction_context) else None
+            )
             with bind_usage_accounting_scope(turn_usage_scope):
+                mark_current_turn_failure_stage(TurnFailureStage.CONTEXT_PREPARATION)
                 compaction_correlation = derive_provider_request_correlation(
                     provider_request_correlation,
                     execution_id=uuid.uuid4().hex,
@@ -6394,6 +7200,7 @@ class TurnRunner:
                         compaction_provider=provider,
                         compaction_model=compaction_model,
                         compaction_plan=compaction_plan,
+                        compaction_request_context=compaction_request_context,
                         history_capacity_tokens=history_capacity_tokens,
                         history_capacity_chars=history_capacity_chars,
                         turn=turn,
@@ -6405,15 +7212,9 @@ class TurnRunner:
                         bound_user_message_id=bound_user_message_id,
                         provider_request_correlation=compaction_correlation,
                         consumer_admission=consumer_admission,
-                        consumer_admission_fingerprint=(
-                            consumer_admission_fingerprint
-                        ),
-                        restricted_turn=bool(
-                            tool_context is not None
-                            and getattr(tool_context, "exclusive_tools", None)
-                            is not None
-                        ),
+                        consumer_admission_fingerprint=consumer_admission_fingerprint,
                         skip_compaction=image_input_preflight_blocked,
+                        attachment_path_resolver=attachment_path_resolver,
                         transcript_snapshot=transcript_snapshot,
                     )
                 )
@@ -6462,9 +7263,7 @@ class TurnRunner:
                     source_snapshot = await capture_compaction_source(
                         session_key,
                         boundary_message_id=(
-                            bound_user_message_id
-                            if history_has_persisted_user
-                            else None
+                            bound_user_message_id if history_has_persisted_user else None
                         ),
                         **capture_kwargs,
                     )
@@ -6501,12 +7300,8 @@ class TurnRunner:
                     if source_is_entry_aligned:
                         compaction_source_entries = source_entries
                         compaction_source_preimage = source_snapshot.preimage
-                        compaction_source_boundary_message_id = (
-                            source_snapshot.boundary_message_id
-                        )
-                        compaction_source_boundary_entry_id = (
-                            source_snapshot.boundary_entry_id
-                        )
+                        compaction_source_boundary_message_id = source_snapshot.boundary_message_id
+                        compaction_source_boundary_entry_id = source_snapshot.boundary_entry_id
                     else:
                         # ``CompactionEvent.removed_count`` is a provider
                         # Message count. Only use it as a durable row boundary
@@ -6529,6 +7324,7 @@ class TurnRunner:
             # CancelledError handler below still sees them.
             error_message: str | None = None
             pending_error_event: ErrorEvent | None = None
+            pending_error_failure_stage: TurnFailureStage | None = None
             done_event: DoneEvent | None = None
             turn_input = attachment_turn_input
 
@@ -6575,53 +7371,81 @@ class TurnRunner:
                 execution_context=execution_context,
             )
             router_control_replay_event: RouterControlReplayEvent | None = None
-            with bind_usage_accounting_scope(turn_usage_scope):
-                async for event in self._stream_consumer_stage.run(stream_inp):
-                    if isinstance(event, RouterControlReplayEvent):
-                        router_control_replay_event = event
+            mark_current_turn_failure_stage(TurnFailureStage.AGENT_EXECUTION)
+            stage_stream = self._stream_consumer_stage.run(stream_inp)
+            stage_stream_exhausted = False
+            try:
+                with bind_usage_accounting_scope(turn_usage_scope):
+                    async for event in stage_stream:
+                        if isinstance(event, RouterControlReplayEvent):
+                            router_control_replay_event = event
+                            yield event
+                            break
                         yield event
-                        break
-                    yield event
+                    else:
+                        stage_stream_exhausted = True
+            finally:
+                stage_close = getattr(stage_stream, "aclose", None)
+                if callable(stage_close):
+                    await stage_close()
+                if not stage_stream_exhausted:
+                    reliability_close = getattr(
+                        agent,
+                        "settle_pending_tool_reliability_on_stream_close",
+                        None,
+                    )
+                    if callable(reliability_close):
+                        try:
+                            reliability_close()
+                        except BaseException as exc:  # observer cannot alter the turn
+                            log.warning(
+                                "turn_runner.tool_reliability_close_failed",
+                                error_type=type(exc).__name__,
+                            )
             if router_control_replay_event is not None:
-                async for replayed_event in self._run_turn(
-                    message,
-                    session_key,
-                    agent_id,
-                    model,
-                    attachments,
-                    tool_context,
-                    timeout=timeout,
-                    max_iterations=max_iterations,
-                    iteration_timeout=iteration_timeout,
-                    tool_timeout=tool_timeout,
-                    request_timeout=request_timeout,
-                    max_provider_retries=max_provider_retries,
-                    length_capped_continuations=length_capped_continuations,
-                    input_mode=input_mode,
-                    persist_input=False,
-                    input_provenance=input_provenance,
-                    history_has_persisted_user=True,
-                    fresh_user_session=False,
-                    session_intent=session_intent,
-                    semantic_message=semantic_message,
-                    pending_input_provider=pending_input_provider,
-                    bound_user_message_id=bound_user_message_id,
-                    run_kind=run_kind,
-                    heartbeat_ack_max_chars=heartbeat_ack_max_chars,
-                    bootstrap_context_mode=bootstrap_context_mode,
-                    no_memory_capture=no_memory_capture,
-                    ingress_pipeline_steps=ingress_pipeline_steps,
-                    router_control_replay_depth=router_control_replay_depth + 1,
-                    assistant_message_sink=assistant_message_sink,
-                    document_mutation_outcome_sink=document_mutation_outcome_sink,
-                    root_turn_id=turn_id,
-                    provider_request_correlation=provider_request_correlation,
-                    assistant_message_id=assistant_message_id,
-                    expected_session_id=expected_session_id,
-                    expected_session_epoch=expected_session_epoch,
-                    execution_context=execution_context,
-                ):
-                    yield replayed_event
+                replay_stream = cast(
+                    AsyncGenerator[AgentEvent, None],
+                    self._run_turn(
+                        message,
+                        session_key,
+                        agent_id,
+                        model,
+                        attachments,
+                        tool_context,
+                        timeout=timeout,
+                        max_iterations=max_iterations,
+                        iteration_timeout=iteration_timeout,
+                        tool_timeout=tool_timeout,
+                        request_timeout=request_timeout,
+                        max_provider_retries=max_provider_retries,
+                        length_capped_continuations=length_capped_continuations,
+                        input_mode=input_mode,
+                        persist_input=False,
+                        input_provenance=input_provenance,
+                        history_has_persisted_user=True,
+                        fresh_user_session=False,
+                        session_intent=session_intent,
+                        semantic_message=semantic_message,
+                        pending_input_provider=pending_input_provider,
+                        bound_user_message_id=bound_user_message_id,
+                        run_kind=run_kind,
+                        heartbeat_ack_max_chars=heartbeat_ack_max_chars,
+                        bootstrap_context_mode=bootstrap_context_mode,
+                        no_memory_capture=no_memory_capture,
+                        ingress_pipeline_steps=ingress_pipeline_steps,
+                        router_control_replay_depth=router_control_replay_depth + 1,
+                        assistant_message_sink=assistant_message_sink,
+                        root_turn_id=turn_id,
+                        provider_request_correlation=provider_request_correlation,
+                        assistant_message_id=assistant_message_id,
+                        expected_session_id=expected_session_id,
+                        expected_session_epoch=expected_session_epoch,
+                        execution_context=execution_context,
+                    ),
+                )
+                async with contextlib.aclosing(replay_stream):
+                    async for replayed_event in replay_stream:
+                        yield replayed_event
                 return
             # Read terminal state off the shared _StreamState. The
             # five pass-by-reference lists were mutated in place, so
@@ -6631,22 +7455,9 @@ class TurnRunner:
             current_text_parts = stream_state.current_text_parts
             error_message = stream_state.error_message
             pending_error_event = stream_state.pending_error_event
+            if pending_error_event is not None:
+                pending_error_failure_stage = current_turn_failure_stage()
             done_event = stream_state.done_event
-            if (
-                done_event is not None
-                and done_event.document_mutation_outcome is not None
-                and document_mutation_outcome_sink is not None
-            ):
-                try:
-                    document_mutation_outcome_sink(
-                        dict(done_event.document_mutation_outcome)
-                    )
-                except Exception:  # noqa: BLE001 - persistence continues below
-                    log.warning(
-                        "turn_runner.document_mutation_outcome_sink_failed",
-                        session_key=session_key,
-                        exc_info=True,
-                    )
             # Post-stage edge owned by the harness: flush remaining
             # text segment. The stage's post-stream notify already
             # fired (it is the last action of the stage body).
@@ -6657,6 +7468,7 @@ class TurnRunner:
             # fire in legacy order: heartbeat normalize -> transcript
             # append -> memory capture (try/except) -> error persist ->
             # session totals rollup (try/except).
+            mark_current_turn_failure_stage(TurnFailureStage.RESULT_FINALIZATION)
             fin_outcome = await self._turn_finalizer_stage.run(
                 TurnFinalizerStageInput(
                     final_text_parts=final_text_parts,
@@ -6816,6 +7628,9 @@ class TurnRunner:
                 pending_error_event is not None
                 and not stream_state.terminal_generation_reset
             ):
+                mark_current_turn_failure_stage(
+                    pending_error_failure_stage or TurnFailureStage.AGENT_EXECUTION
+                )
                 yield pending_error_event
 
         except asyncio.CancelledError as exc:
@@ -6865,13 +7680,10 @@ class TurnRunner:
                 and _could_be_human_silent_reply_prefix(raw_partial_text_untrimmed)
             )
             if (
-                (
-                    input_mode == "system_event"
-                    and run_kind in {"goal", "heartbeat"}
-                    and is_silent_reply_prefix(raw_partial_text)
-                )
-                or human_prefix_was_withheld
-            ):
+                input_mode == "system_event"
+                and run_kind in {"goal", "heartbeat"}
+                and is_silent_reply_prefix(raw_partial_text)
+            ) or human_prefix_was_withheld:
                 # The shared stream stage deliberately holds control-token
                 # candidates. A Stop can land between chunks; never persist a
                 # fragment that was not presented to the user as prose.
@@ -6899,17 +7711,12 @@ class TurnRunner:
                 # retaining any tool, artifact, or activity records that were
                 # already presented before cancellation.
                 normalized_segments = [
-                    segment
-                    for segment in normalized_segments
-                    if segment.get("type") != "text"
+                    segment for segment in normalized_segments if segment.get("type") != "text"
                 ]
             elif (
                 raw_segment_text == raw_partial_text
                 and segment_normalization.changed
-                and (
-                    not partial_normalization.changed
-                    or segment_text == partial_text
-                )
+                and (not partial_normalization.changed or segment_text == partial_text)
             ):
                 # A completed tool boundary is also a presentation boundary.
                 # Prefer a validated deletion-only segment projection when the
@@ -6926,9 +7733,7 @@ class TurnRunner:
                         reconciled_segments.append(segment)
                         continue
                     if partial_text and not inserted_text:
-                        reconciled_segments.append(
-                            {"type": "text", "text": partial_text}
-                        )
+                        reconciled_segments.append({"type": "text", "text": partial_text})
                         inserted_text = True
                 if partial_text and not inserted_text:
                     reconciled_segments.append({"type": "text", "text": partial_text})
@@ -6936,6 +7741,17 @@ class TurnRunner:
             turn_segments[:] = normalized_segments
             final_text_parts[:] = [partial_text] if partial_text else []
             reasoning_content = "".join(reasoning_parts).strip()
+            assistant_replay = None
+            replay_snapshot = getattr(agent, "current_assistant_replay", None)
+            if callable(replay_snapshot):
+                try:
+                    assistant_replay = replay_snapshot()
+                except Exception:
+                    log.warning(
+                        "turn_runner.cancelled_replay_snapshot_failed",
+                        session_key=session_key,
+                        turn_id=turn_id,
+                    )
             cancelled_turn_usage: dict[str, Any] | None = None
             if self._session_manager is not None and pipeline_usage_context is not None:
                 storage = getattr(self._session_manager, "storage", None)
@@ -6958,6 +7774,7 @@ class TurnRunner:
                         )
             if (
                 partial_text or turn_segments or turn_artifacts or reasoning_content
+                or assistant_replay is not None
             ) and self._session_manager is not None:
                 try:
                     body = _cancelled_partial_response_text(partial_text, turn_artifacts)
@@ -6971,10 +7788,10 @@ class TurnRunner:
                         "content": body,
                         "tool_calls": turn_segments if turn_segments else None,
                         "reasoning_content": reasoning_content or None,
-                        "assistant_message_id": (
-                            execution_context.identity.assistant_message_id
-                        ),
+                        "assistant_message_id": (execution_context.identity.assistant_message_id),
                     }
+                    if assistant_replay is not None:
+                        append_kwargs["assistant_replay"] = assistant_replay
                     if expected_session_id is not None:
                         append_kwargs["expected_session_id"] = expected_session_id
                     if expected_session_epoch is not None:
@@ -7121,9 +7938,7 @@ class TurnRunner:
                     provider_boundary_failure_kind,
                 )
                 error_code = event_code
-                error_message = safe_provider_failure_message(
-                    provider_boundary_failure_kind
-                )
+                error_message = safe_provider_failure_message(provider_boundary_failure_kind)
             elif isinstance(exc, UsageAccountingUnavailableError):
                 event_code = str(
                     getattr(exc, "code", UsageAccountingUnavailableError.code)
@@ -7136,8 +7951,7 @@ class TurnRunner:
             else:
                 event_code = (
                     error_code
-                    if error_code
-                    in {"provider_request_too_large", "provider_output_truncated"}
+                    if error_code in {"provider_request_too_large", "provider_output_truncated"}
                     else "agent_error"
                 )
             log.error(
@@ -7151,9 +7965,7 @@ class TurnRunner:
             if turn_obj is not None:
                 try:
                     fallback_hops = int(
-                        (getattr(turn_obj, "metadata", None) or {}).get(
-                            "router_fallback_hops", 0
-                        )
+                        (getattr(turn_obj, "metadata", None) or {}).get("router_fallback_hops", 0)
                     )
                 except (TypeError, ValueError):
                     fallback_hops = 0
@@ -7173,9 +7985,7 @@ class TurnRunner:
                 # into turn_errors; the stable kind/code above is sufficient.
                 exc=None if provider_boundary_failure_kind else exc,
                 provider=(
-                    type(provider_for_log).__name__
-                    if provider_for_log is not None
-                    else None
+                    type(provider_for_log).__name__ if provider_for_log is not None else None
                 ),
                 model=resolved_model or None,
                 fallback_hops=fallback_hops,
@@ -7214,9 +8024,7 @@ class TurnRunner:
                     "turn_error",
                     {
                         "error_type": type(exc).__name__,
-                        "provider_failure_kind": (
-                            provider_boundary_failure_kind or None
-                        ),
+                        "provider_failure_kind": (provider_boundary_failure_kind or None),
                         "message_chars": len(str(exc)),
                     },
                 )
@@ -7261,6 +8069,15 @@ class TurnRunner:
                     else None
                 ),
             )
+
+        finally:
+            if attachment_cleanup is not None:
+                attachment_cleanup()
+                if (
+                    tool_context is not None
+                    and attachment_cleanup in tool_context.turn_cleanup_callbacks
+                ):
+                    tool_context.turn_cleanup_callbacks.remove(attachment_cleanup)
 
     @staticmethod
     def _write_trace_event(
@@ -7409,8 +8226,8 @@ class TurnRunner:
     async def _resolve_session_id_for_log(self, session_key: str) -> str | None:
         """Best-effort lookup of the transcript identity for observability."""
 
-        session_id, _session_epoch, _workspace_id = (
-            await self._resolve_session_identity_for_log(session_key)
+        session_id, _session_epoch, _workspace_id = await self._resolve_session_identity_for_log(
+            session_key
         )
         return session_id
 
@@ -7781,134 +8598,6 @@ class TurnRunner:
         self._last_agent_max_iterations_source = policy.max_iterations_source
         return policy.max_iterations
 
-    def _resolve_agent_iteration_timeout(
-        self,
-        session_key: str,
-        explicit: float | None = None,
-    ) -> float:
-        """Per-iteration timeout, with a coding-mode floor.
-
-        A coding-mode turn delegates to code-task and then blocks in a single
-        long ``process(action="wait")`` (code-task can run ~90 min). The
-        per-iteration watchdog must not clamp that wait, so floor the timeout
-        at 5400s while coding mode is on.
-        """
-        value = self._resolve_agent_iteration_timeout_base(session_key, explicit)
-        skills_cfg = getattr(self._config, "skills", None)
-        if bool(getattr(skills_cfg, "coding_mode", False)) and value < 5400.0:
-            return 5400.0
-        return value
-
-    def _resolve_agent_iteration_timeout_base(
-        self,
-        session_key: str,
-        explicit: float | None = None,
-    ) -> float:
-        """Resolve per-iteration timeout for this turn.
-
-        Precedence: explicit arg > session config > env > gateway config > default.
-        """
-
-        if explicit is not None:
-            if self._non_bool_number(explicit) and explicit >= 0:
-                return float(explicit)
-            raise ValueError("iteration_timeout must be a non-negative number")
-
-        sm = self._session_manager
-        if sm is not None and hasattr(sm, "get_session_config"):
-            try:
-                session_cfg = sm.get_session_config(session_key)
-                if session_cfg is not None:
-                    value = getattr(session_cfg, "agent_iteration_timeout_seconds", None)
-                    if self._non_bool_number(value) and value >= 0:
-                        return float(value)
-                    if value is not None:
-                        log.warning(
-                            "turn_runner.invalid_agent_iteration_timeout",
-                            source="session",
-                            value=value,
-                        )
-            except Exception:  # noqa: BLE001
-                pass
-
-        env_value = os.environ.get("OPENSQUILLA_AGENT_ITERATION_TIMEOUT")
-        if env_value is not None and env_value.strip():
-            raw = env_value.strip()
-            try:
-                value = float(raw)
-            except ValueError:
-                log.warning("turn_runner.invalid_agent_iteration_timeout", source="env", raw=raw)
-            else:
-                if value >= 0:
-                    return value
-                log.warning(
-                    "turn_runner.invalid_agent_iteration_timeout", source="env", value=value
-                )
-
-        value = getattr(self._config, "agent_iteration_timeout_seconds", None)
-        if self._non_bool_number(value) and value >= 0:
-            return float(value)
-        if value is not None:
-            log.warning(
-                "turn_runner.invalid_agent_iteration_timeout",
-                source="config",
-                value=value,
-            )
-
-        return AgentConfig().iteration_timeout
-
-    def _resolve_agent_tool_timeout(
-        self,
-        session_key: str,
-        explicit: float | None = None,
-    ) -> float:
-        """Resolve per-tool execution timeout for this turn."""
-
-        if explicit is not None:
-            if self._non_bool_number(explicit) and explicit >= 0:
-                return float(explicit)
-            raise ValueError("tool_timeout must be a non-negative number")
-
-        sm = self._session_manager
-        if sm is not None and hasattr(sm, "get_session_config"):
-            try:
-                session_cfg = sm.get_session_config(session_key)
-                if session_cfg is not None:
-                    value = getattr(session_cfg, "agent_tool_timeout_seconds", None)
-                    if self._non_bool_number(value) and value >= 0:
-                        return float(value)
-                    if value is not None:
-                        log.warning(
-                            "turn_runner.invalid_agent_tool_timeout",
-                            source="session",
-                            value=value,
-                        )
-            except Exception:  # noqa: BLE001
-                pass
-
-        env_value = os.environ.get("OPENSQUILLA_AGENT_TOOL_TIMEOUT")
-        if env_value is not None and env_value.strip():
-            raw = env_value.strip()
-            try:
-                value = float(raw)
-            except ValueError:
-                log.warning("turn_runner.invalid_agent_tool_timeout", source="env", raw=raw)
-            else:
-                if value >= 0:
-                    return value
-                log.warning("turn_runner.invalid_agent_tool_timeout", source="env", value=value)
-
-        value = getattr(self._config, "agent_tool_timeout_seconds", None)
-        if self._non_bool_number(value) and value >= 0:
-            return float(value)
-        if value is not None:
-            log.warning(
-                "turn_runner.invalid_agent_tool_timeout",
-                source="config",
-                value=value,
-            )
-
-        return AgentConfig().tool_timeout
 
     def _resolve_agent_request_timeout(
         self,
@@ -8150,19 +8839,9 @@ class TurnRunner:
             and not getattr(skill, "disable_model_invocation", False)
             for skill in loaded_skills
         )
-        plan_mode = (
-            ctx is not None
-            and str(getattr(ctx, "collaboration_mode", "default")) == "plan"
-        )
+        plan_mode = ctx is not None and str(getattr(ctx, "collaboration_mode", "default")) == "plan"
         attached_plan_run = bool(
             ctx is not None and str(getattr(ctx, "plan_run_id", "") or "").strip()
-        )
-        # The coding submit/review handshake is a mutation workflow and has no
-        # meaning in Plan mode or an attached PlanRun implementation. It is
-        # suppressed at schema construction and again in Agent's special
-        # dispatch branch.
-        submit_review_enabled = (
-            _resolve_submit_review(self._config) and not plan_mode and not attached_plan_run
         )
         if ctx is not None:
             # A lossy tool-result projection is only useful when the model can
@@ -8179,10 +8858,6 @@ class TurnRunner:
                 ctx.surfaced_tools.add("meta_invoke")
             else:
                 ctx.denied_tools.add("meta_invoke")
-            if submit_review_enabled:
-                if ctx.surfaced_tools is None:
-                    ctx.surfaced_tools = set()
-                ctx.surfaced_tools.add("submit")
             if plan_mode:
                 if ctx.surfaced_tools is None:
                     ctx.surfaced_tools = set()
@@ -8196,7 +8871,7 @@ class TurnRunner:
             elif attached_plan_run:
                 if ctx.surfaced_tools is None:
                     ctx.surfaced_tools = set()
-                plan_run_tools = {"plan_run_checkpoint", "publish_artifact"}
+                plan_run_tools = {"plan_run_checkpoint", *PLAN_RUN_DELIVERY_TOOLS}
                 ctx.surfaced_tools.update(plan_run_tools)
                 ctx.denied_tools.add("submit")
                 if ctx.allowed_tools is not None:
@@ -8211,9 +8886,7 @@ class TurnRunner:
         if metadata is not None:
             metadata["meta_skill_enabled"] = meta_skill_enabled
             if skill_catalog is not None:
-                metadata["skill_catalog_generation"] = int(
-                    getattr(skill_catalog, "generation", 0)
-                )
+                metadata["skill_catalog_generation"] = int(getattr(skill_catalog, "generation", 0))
 
         if ctx is not None:
             caller_ctx = ctx
@@ -8242,12 +8915,10 @@ class TurnRunner:
             # not relax a profile allowlist. Restore only controls authorized
             # by this frozen turn context; explicit denies still win in the
             # registry visibility check.
-            if submit_review_enabled and ctx.allowed_tools is not None:
-                ctx.allowed_tools = set(ctx.allowed_tools) | {"submit"}
             if not plan_mode and attached_plan_run and ctx.allowed_tools is not None:
                 ctx.allowed_tools = set(ctx.allowed_tools) | {
                     "plan_run_checkpoint",
-                    "publish_artifact",
+                    *PLAN_RUN_DELIVERY_TOOLS,
                 }
             if is_goal_owned_main_default_turn(ctx) and ctx.allowed_tools is not None:
                 ctx.allowed_tools = set(ctx.allowed_tools) | {
@@ -8260,12 +8931,6 @@ class TurnRunner:
             coding_mode = bool(getattr(skills_cfg, "coding_mode", False))
             ctx.denied_tools.update(coding_mode_denied_tools(coding_mode))
             ctx.coding_mode = coding_mode
-            # Policy/profile/runtime layers above may add tools. A restricted
-            # turn's capability ceiling is applied last and can never be
-            # widened by those lower-authority layers.
-            from opensquilla.tools.visibility import apply_exclusive_tool_ceiling
-
-            ctx = apply_exclusive_tool_ceiling(ctx)
             if ctx is not caller_ctx:
                 caller_ctx.allowed_tools = (
                     set(ctx.allowed_tools) if ctx.allowed_tools is not None else None
@@ -8328,10 +8993,7 @@ class TurnRunner:
             skill.name
             for skill in loaded_skills
             if not getattr(skill, "disable_model_invocation", False)
-            and (
-                meta_skill_enabled
-                or getattr(skill, "kind", "skill") != "meta"
-            )
+            and (meta_skill_enabled or getattr(skill, "kind", "skill") != "meta")
         }
         tool_handler = build_tool_handler(
             self._tool_registry,
@@ -8340,10 +9002,6 @@ class TurnRunner:
         )
         return tool_defs, tool_handler
 
-    def _filter_tool_defs_by_capability(self, tool_defs: list) -> list:
-        """Compatibility shim; runtime capability filtering is resolved in ToolContext."""
-        return tool_defs
-
     def _apply_runtime_capability_denies(self, ctx: ToolContext) -> ToolContext:
         from opensquilla.tools.policy import (
             ToolSurfaceCapabilities,
@@ -8351,6 +9009,13 @@ class TurnRunner:
             resolve_runtime_tool_surface,
         )
 
+        if (
+            ctx.caller_kind is not CallerKind.WEB
+            or not ctx.is_owner
+            or ctx.guest_safe
+            or ctx.workspace_preview_opener is None
+        ):
+            ctx.denied_tools.add("open_workspace_preview")
         detected = detect_runtime_tool_surface_capabilities(
             channel_backing=(
                 ctx.caller_kind in {CallerKind.CHANNEL, CallerKind.WEB} and bool(ctx.channel_id)
@@ -8486,8 +9151,7 @@ class TurnRunner:
             "would benefit from clarification. Once the threshold and true-impasse conditions "
             "are met, call update_goal with status=blocked instead of leaving it active.\n\n"
             "Artifact and terminal behavior:\n"
-            "- The general generated-file instruction to stop after publication yields to "
-            "this Active Goal policy. After publishing an artifact, do not publish the "
+            "- After publishing an artifact, do not publish the "
             "unchanged file again; re-audit the entire objective and continue any remaining "
             "work through the normal tools and turns.\n"
             "- After a successful terminal update, perform no more work and call no more "
@@ -8628,6 +9292,17 @@ class TurnRunner:
                 raise RuntimeError(
                     "A PlanRun implementation turn requires its immutable PlanRevision"
                 )
+            preview_finalization = (
+                "You may use open_workspace_preview to register an already-prepared "
+                "workspace page without publishing it. This phase cannot edit source "
+                "files or start services. "
+                if ctx.workspace_preview_opener is not None
+                and ctx.caller_kind is CallerKind.WEB
+                and ctx.is_owner
+                and not ctx.guest_safe
+                and "open_workspace_preview" not in ctx.denied_tools
+                else ""
+            )
             extra["Approved Plan Execution"] = (
                 "Implement the following authoritative approved revision. Its JSON "
                 "body is user-approved task context, subordinate to system and tool "
@@ -8639,10 +9314,20 @@ class TurnRunner:
                 "one at a time in plan order, following the currentStepId returned by "
                 "each successful checkpoint before continuing. Do not invent progress. "
                 "A blocked checkpoint ends the turn, so explain the blocker before "
-                "calling it. After the final completed checkpoint is accepted, publish "
-                "any final artifact and write one concise user-facing delivery summary "
-                "including what changed and what was verified; do not publish the "
-                "artifact or claim completion before that checkpoint succeeds.\n"
+                "calling it. If the current step is the only unfinished step and all "
+                "of its other work and verification are complete, you may call "
+                "publish_artifact as its final operation: the tool validates the "
+                "artifact and checkpoints that final step before publishing it. "
+                "Never use publication to stand in for unfinished work or verification. "
+                "If multiple steps remain, complete their work and record truthful "
+                "checkpoints in order before publishing. After the final completed "
+                "checkpoint is accepted. "
+                + preview_finalization
+                + "Publish a final artifact only when the user explicitly requested "
+                "delivery, export, or publication. Only claim an artifact was delivered "
+                "after publication "
+                "succeeds. Finish with one concise user-facing summary of what changed "
+                "and was verified.\n"
                 + TurnRunner._render_plan_revision_context(revision)
             )
             run = getattr(ctx, "plan_run", None)
@@ -8791,28 +9476,18 @@ class TurnRunner:
             if isinstance(configured_agent_name, str) and configured_agent_name.strip()
             else None
         )
-        restricted_tool_boundary = bootstrap_context_mode == "restricted_tool_boundary"
         bootstrap_workspace_dir = self._resolve_bootstrap_workspace_dir(agent_id)
         bootstrap_context_key = bootstrap_context_mode or "full"
         bootstrap_snap_key = (agent_id, session_key, bootstrap_context_key) if session_key else None
-        # An empty ``filenames`` iterable historically means "use the default
-        # bootstrap files" inside identity.workspace.  Do not attempt to
-        # express the PromptAnnotation boundary through ``filenames=()``:
-        # that silently loaded AGENTS/SOUL/TOOLS and the other bootstrap
-        # files.  Bypass both the cache and filesystem loader explicitly.
-        if restricted_tool_boundary:
-            workspace_files: dict[str, str] = {}
-            visible_bootstrap_report: list[Any] = []
-        else:
-            bootstrap_snap = (
-                self._bootstrap_snapshots.get(bootstrap_snap_key)
-                if bootstrap_snap_key is not None
-                else None
-            )
-        if not restricted_tool_boundary and bootstrap_snap is not None:
+        bootstrap_snap = (
+            self._bootstrap_snapshots.get(bootstrap_snap_key)
+            if bootstrap_snap_key is not None
+            else None
+        )
+        if bootstrap_snap is not None:
             workspace_files = dict(bootstrap_snap.workspace_files)
             visible_bootstrap_report = list(bootstrap_snap.report)
-        elif not restricted_tool_boundary:
+        else:
             safety_cfg = getattr(self._config, "safety", None) if self._config else None
             bootstrap_filenames: tuple[str, ...]
             bootstrap_filenames = (
@@ -8866,7 +9541,6 @@ class TurnRunner:
         stateless_prompt = bootstrap_context_mode in {
             "stateless",
             "stateless_keep_project_rules",
-            "restricted_tool_boundary",
         }
         private_memory_allowed = (
             False if stateless_prompt else allows_private_memory_prompt_injection(session_key)
@@ -8928,26 +9602,7 @@ class TurnRunner:
         )
         if agent_name is None and identity_fields is not None:
             agent_name = identity_fields.name
-        # Global coding prompt modes and evidence protocols describe a local
-        # workspace workflow.  PromptAnnotation has no workspace authority;
-        # force the small generic identity/tool preface and keep every coding
-        # or git-oriented protocol out of this provider projection.
-        prompt_mode = (
-            "minimal"
-            if restricted_tool_boundary
-            else _resolve_identity_prompt_mode(self._config)
-        )
-        patch_evidence_protocol = (
-            False
-            if restricted_tool_boundary
-            else _resolve_patch_evidence_protocol(self._config)
-        )
-        finalize_evidence_gate = (
-            False
-            if restricted_tool_boundary
-            else _resolve_finalize_evidence_gate(self._config)
-        )
-        legacy_prompt_style = _resolve_legacy_prompt_style(self._config)
+        prompt_mode = _resolve_identity_prompt_mode(self._config)
 
         agent_profile = AgentProfile(
             agent_id=agent_id,
@@ -8962,35 +9617,20 @@ class TurnRunner:
             agents_doc=agents_doc,
             workspace_files=workspace_files,
             prompt_mode=prompt_mode,
-            patch_evidence_protocol=patch_evidence_protocol,
-            finalize_evidence_gate=finalize_evidence_gate,
-            legacy_prompt_style=legacy_prompt_style,
         )
         os_name = os.uname().sysname if hasattr(os, "uname") else platform.system()
-        # The restricted provider projection must not contain a synthetic
-        # "Working directory: restricted" line either: even though it is not
-        # a host path, it advertises a workspace contract that this turn does
-        # not possess.  Local docs paths are omitted for the same reason.
-        runtime_info = (
-            None
-            if restricted_tool_boundary
-            else {
-                "os": os_name,
-                "shell": os.environ.get("SHELL", ""),
-                "workspace_dir": str(workspace_dir or bootstrap_workspace_dir),
-            }
-        )
+        runtime_info = {
+            "os": os_name,
+            "shell": os.environ.get("SHELL", ""),
+            "workspace_dir": str(workspace_dir or bootstrap_workspace_dir),
+        }
         base_prompt = assemble_system_prompt(
             agent_profile,
             tools=[td.name for td in tool_defs] if tool_defs else None,
             memory=memory_text,
             runtime_info=runtime_info,
-            docs_path=(None if restricted_tool_boundary else self._resolve_docs_path()),
-            heartbeat_prompt=(
-                None
-                if restricted_tool_boundary
-                else getattr(self._config, "heartbeat_prompt", None)
-            ),
+            docs_path=(self._resolve_docs_path()),
+            heartbeat_prompt=(getattr(self._config, "heartbeat_prompt", None)),
         )
         # daily_notes, workspace_files, and extra_context are per-turn /
         # per-day volatile content. Keeping them in the cacheable base
@@ -9138,124 +9778,6 @@ class TurnRunner:
             provider_request_correlation=meta_correlation,
         )
 
-    def _resolve_vision_followup_gate_model(self) -> str | None:
-        router_cfg = getattr(self._turn_config(), "squilla_router", None)
-        if router_cfg is None:
-            return None
-        configured_model = str(
-            getattr(router_cfg, "vision_followup_gate_model", "") or ""
-        ).strip()
-        if configured_model:
-            return configured_model
-        tier_name = str(getattr(router_cfg, "vision_followup_gate_tier", "c0") or "").strip()
-        if not tier_name:
-            return None
-        tiers = getattr(router_cfg, "tiers", {})
-        if not isinstance(tiers, Mapping):
-            return None
-        tier = tiers.get(tier_name)
-        if not isinstance(tier, Mapping):
-            return None
-        model = tier.get("model")
-        if not isinstance(model, str):
-            return None
-        model = model.strip()
-        return model or None
-
-    def _make_vision_followup_gate_chat(
-        self,
-        cloned_selector: Any,
-        usage_execution_context: UsageExecutionContext | None = None,
-    ) -> tuple[Any | None, str | None]:
-        from opensquilla.engine.steps.vision_followup_gate import (
-            VisionFollowupGateExecutionTarget,
-            bind_vision_followup_gate_execution_target,
-        )
-
-        gate_model = self._resolve_vision_followup_gate_model()
-        if not gate_model or cloned_selector is None:
-            return None, gate_model
-        if not hasattr(cloned_selector, "clone"):
-            return None, gate_model
-        try:
-            gate_selector = cloned_selector.clone()
-            gate_selector.override_model(gate_model)
-            gate_provider = gate_selector.resolve()
-        except Exception:
-            return None, gate_model
-        gate_metadata = provider_metadata(gate_provider)
-        gate_provider_id = str(
-            gate_metadata.provider_id
-            or getattr(gate_selector, "active_provider_id", "")
-            or gate_metadata.provider_name
-            or gate_metadata.provider_kind
-            or ""
-        )
-        gate_execution_model = str(gate_metadata.model or gate_model)
-
-        async def _chat(
-            messages: list[Any],
-            tools: Any = None,
-            config: Any = None,
-        ) -> AsyncIterator[Any]:
-            scope: UsageAccountingScope | None = None
-            if self._usage_event_sink is not None:
-                request_correlation = getattr(
-                    config,
-                    "provider_request_correlation",
-                    None,
-                )
-                execution_id = (
-                    request_correlation.execution_id
-                    if isinstance(request_correlation, ProviderRequestCorrelation)
-                    else uuid.uuid4().hex
-                )
-                parent = usage_execution_context
-                scope = UsageAccountingScope(
-                    sink=self._usage_event_sink,
-                    context=UsageExecutionContext(
-                        execution_id=execution_id,
-                        agent_run_id=execution_id,
-                        turn_id=execution_id,
-                        parent_turn_id=(
-                            parent.turn_id or parent.execution_id
-                            if parent is not None
-                            else None
-                        ),
-                        session_id=parent.session_id if parent is not None else None,
-                        session_epoch=parent.session_epoch if parent is not None else 0,
-                        agent_id=parent.agent_id if parent is not None else "",
-                        run_kind="vision_followup_gate",
-                    ),
-                )
-            with bind_usage_accounting_scope(scope):
-                stream = (
-                    gate_provider.chat(messages, tools=tools, config=config)
-                    if scope is not None
-                    and provider_accounts_physical_usage(gate_provider)
-                    else account_provider_stream(
-                        lambda: gate_provider.chat(
-                            messages,
-                            tools=tools,
-                            config=config,
-                        ),
-                        provider=gate_provider_id,
-                        model=gate_execution_model,
-                    )
-                )
-                async for event in stream:
-                    yield event
-
-        bind_vision_followup_gate_execution_target(
-            _chat,
-            VisionFollowupGateExecutionTarget(
-                provider=gate_provider,
-                provider_id=gate_provider_id,
-                model=gate_execution_model,
-            ),
-        )
-        return _chat, gate_execution_model
-
     def _load_daily_notes(self, workspace_dir: Any) -> dict[str, str]:
         from opensquilla.identity.workspace import load_daily_notes
 
@@ -9299,6 +9821,10 @@ class TurnRunner:
         usage_execution_context: UsageExecutionContext | None = None,
         provider_request_correlation: ProviderRequestCorrelation | None = None,
         router_history_replay_request: RouterHistoryReplayRequest | None = None,
+        bound_user_message_id: str | None = None,
+        transcript_snapshot: TurnTranscriptSnapshot[Any] | None = None,
+        expected_session_id: str | None = None,
+        expected_session_epoch: int | None = None,
     ) -> tuple[Any, Any]:
         """Run the pre-turn pipeline and re-resolve provider if model changed.
 
@@ -9313,9 +9839,7 @@ class TurnRunner:
         from opensquilla.engine.steps import (
             apply_prompt_cache,
             apply_squilla_router,
-            apply_vision_followup_gate,
             enforce_coding_mode,
-            filter_skills,
             finalize_squilla_router_capacity,
             inject_platform_hint,
             inject_subagent_grounding,
@@ -9323,6 +9847,7 @@ class TurnRunner:
             meta_resolution,
             observe_reasoning_hint,
             resolve_model,
+            resolve_skill_catalog,
         )
         from opensquilla.engine.steps.squilla_router import (
             commit_deferred_router_history,
@@ -9373,30 +9898,8 @@ class TurnRunner:
 
         _bounded_apply_squilla_router.__name__ = "apply_squilla_router"
 
-        restricted_tool_boundary = bool(
-            tool_context is not None
-            and getattr(tool_context, "exclusive_tools", None) is not None
-        )
-        # DOM-backed PromptAnnotation turns are source-addressed and do not
-        # depend on historical image interpretation.  Do not even construct
-        # the auxiliary gate target: selector resolution and every physical
-        # auxiliary request are outside this restricted turn's call budget.
-        if restricted_tool_boundary:
-            gate_chat, gate_model = None, None
-        else:
-            gate_chat, gate_model = self._make_vision_followup_gate_chat(
-                cloned_selector,
-                usage_execution_context,
-            )
-        # A PromptAnnotation request is a self-contained ArtifactSession turn.
-        # Neither a pinned catalog nor the compatibility global loader may
-        # leak skills into its provider projection.
-        agent_skill_loader = None if restricted_tool_boundary else self._skill_loader
-        if (
-            not restricted_tool_boundary
-            and skill_catalog is not None
-            and self._skill_loader is not None
-        ):
+        agent_skill_loader = self._skill_loader
+        if skill_catalog is not None and self._skill_loader is not None:
             from opensquilla.skills.loader import PinnedSkillLoader
 
             agent_skill_loader = PinnedSkillLoader(skill_catalog, self._skill_loader)
@@ -9415,6 +9918,14 @@ class TurnRunner:
             # roots while keeping every catalog read free of filesystem probes.
             "skill_loader": agent_skill_loader,
             "meta_run_writer": getattr(self, "_meta_run_writer", None),
+            # A content-free callback for the authoritative MetaSkill run
+            # boundary. It is copied to sub-Agent configs by the orchestrator
+            # and never enters persisted run inputs or telemetry payloads.
+            "metaskill_usage_recorder": getattr(
+                getattr(self, "growth_event_sink", None),
+                "observe_metaskill_usage",
+                None,
+            ),
             # PR9+: meta_resolution's awaiting branch calls this first when
             # the SKILL.md has ``nl_extract: true``. None keeps clarify reply
             # parsing on the deterministic compatibility path.
@@ -9425,6 +9936,9 @@ class TurnRunner:
                 provider_request_correlation,
             ),
             "router_control_hold_store": self._router_control_hold_store,
+            "router_control_routing_revision": getattr(
+                tool_context, "router_control_routing_revision", None
+            ),
             # Surface the resolved per-agent workspace so the meta_invoke
             # handler in Agent._run_one_streaming (agent.py ~L4724) can
             # find it without falling through to default_workspace_dir().
@@ -9436,19 +9950,15 @@ class TurnRunner:
             # default_workspace_dir() and exec_command sandbox blocked
             # paths under ``/root/`` instead of the gateway workspace.
             "bootstrap_workspace_dir": (
-                ""
-                if restricted_tool_boundary
-                else (
-                    getattr(tool_context, "workspace_dir", None)
-                    or (
-                        str(
-                            self._resolve_bootstrap_workspace_dir(
-                                getattr(tool_context, "agent_id", "main") or "main"
-                            )
+                getattr(tool_context, "workspace_dir", None)
+                or (
+                    str(
+                        self._resolve_bootstrap_workspace_dir(
+                            getattr(tool_context, "agent_id", "main") or "main"
                         )
-                        if tool_context is not None
-                        else ""
                     )
+                    if tool_context is not None
+                    else ""
                 )
             ),
             # Opaque callable only: credential bytes never enter metadata,
@@ -9477,65 +9987,32 @@ class TurnRunner:
                 )
             ),
         }
-        if restricted_tool_boundary:
-            # Lock observability to the provider-visible projection.  These
-            # fields are deliberately explicit rather than relying on
-            # PromptReport's default values so later pipeline refactors cannot
-            # make an injected catalog look empty only in telemetry.
-            initial_metadata.update(
-                {
-                    "filtered_skill_ids": [],
-                    "skill_count": 0,
-                    "skills_rendered_count": 0,
-                    "skills_prompt_chars": 0,
-                    "router_vision_followup_gate_decision": "not_applicable",
-                    "router_vision_followup_gate_reason": (
-                        "prompt_annotation_dom_selection"
-                    ),
-                    "router_vision_followup_gate_source": "prompt_annotation",
-                    "router_vision_followup_needs_image": False,
-                }
-            )
-        elif skill_catalog is not None:
+        if skill_catalog is not None:
             initial_metadata["skill_catalog_generation"] = int(
                 getattr(skill_catalog, "generation", 0)
             )
         initial_provider_config = getattr(cloned_selector, "current_config", None)
         if initial_provider_config is not None:
-            durable_base_provider = str(
-                getattr(initial_provider_config, "provider", "") or ""
-            )
-            durable_base_model = str(
-                getattr(initial_provider_config, "model", "") or ""
-            )
+            durable_base_provider = str(getattr(initial_provider_config, "provider", "") or "")
+            durable_base_model = str(getattr(initial_provider_config, "model", "") or "")
             initial_metadata["executed_provider"] = durable_base_provider
             initial_metadata["executed_model"] = durable_base_model
             # ``executed_*`` follows the routed/fallback leg later. Keep a
             # separate immutable identity for durable history pressure.
             initial_metadata["durable_base_provider"] = durable_base_provider
             initial_metadata["durable_base_model"] = durable_base_model
-        if gate_chat is not None:
-            initial_metadata["router_vision_followup_gate_chat"] = gate_chat
-        if gate_model:
-            initial_metadata["router_vision_followup_gate_model"] = gate_model
         if normalization_metadata is not None:
             initial_metadata["input_normalization"] = dict(normalization_metadata)
             material_tokens = normalization_metadata.get("material_estimated_tokens")
             if type(material_tokens) is int and material_tokens > 0:
                 initial_metadata["material_estimated_tokens"] = material_tokens
         if attachment_materialization is not None:
-            initial_metadata["had_attachments"] = bool(
-                attachment_materialization.attachment_count
-            )
-            initial_metadata["attachment_count"] = int(
-                attachment_materialization.attachment_count
-            )
+            initial_metadata["had_attachments"] = bool(attachment_materialization.attachment_count)
+            initial_metadata["attachment_count"] = int(attachment_materialization.attachment_count)
             initial_metadata["attachment_material_estimated_tokens"] = int(
                 attachment_materialization.estimated_tokens
             )
-            initial_metadata[
-                "attachment_generated_normalization_estimated_tokens"
-            ] = int(
+            initial_metadata["attachment_generated_normalization_estimated_tokens"] = int(
                 attachment_materialization.generated_normalization_estimated_tokens
             )
             initial_metadata["attachment_parse_failure_count"] = int(
@@ -9547,6 +10024,80 @@ class TurnRunner:
             initial_metadata["attachment_image_count"] = int(
                 attachment_materialization.image_count
             )
+        candidate_attachment_ids = self._attachment_ids_from_resource_refs(attachments)
+        explicit_attachment_ids = await self._validated_image_attachment_ids(
+            session_key,
+            candidate_attachment_ids,
+            transcript_snapshot=transcript_snapshot,
+            expected_session_id=expected_session_id,
+            expected_session_epoch=expected_session_epoch,
+        )
+        if explicit_attachment_ids:
+            # Structured attachment references survive the active history window.
+            initial_metadata["image_intent_attachment_ids"] = list(
+                explicit_attachment_ids
+            )
+        if bound_user_message_id:
+            try:
+                bound_entries: Sequence[Any]
+                if transcript_snapshot is not None:
+                    bound_entries = await transcript_snapshot.get_entries()
+                elif self._session_manager is not None:
+                    owner_kwargs: dict[str, Any] = {}
+                    if _require_optional_exact_session_owner(
+                        expected_session_id, expected_session_epoch
+                    ):
+                        getter = self._session_manager.get_transcript
+                        if all(
+                            _accepts_explicit_keyword_arg(getter, name)
+                            for name in ("expected_session_id", "expected_session_epoch")
+                        ):
+                            owner_kwargs = {
+                                "expected_session_id": expected_session_id,
+                                "expected_session_epoch": expected_session_epoch,
+                            }
+                        elif _has_session_storage(self._session_manager):
+                            raise RuntimeError(
+                                "Bound image replay requires exact session ownership"
+                            )
+                    bound_entries = await self._session_manager.get_transcript(
+                        session_key, **owner_kwargs
+                    )
+                else:
+                    bound_entries = []
+                bound_entry = next(
+                    (
+                        entry
+                        for entry in bound_entries
+                        if str(getattr(entry, "message_id", "") or "")
+                        == bound_user_message_id
+                    ),
+                    None,
+                )
+                if bound_entry is not None:
+                    bound_content = str(getattr(bound_entry, "content", "") or "")
+                    bound_attachment_ids = self._attachment_ids_from_envelope(
+                        bound_content,
+                        image_only=True,
+                    )
+                    initial_metadata["image_attachment_durable_retained"] = (
+                        self._image_retention_from_envelope(bound_content)
+                    )
+                    if bound_attachment_ids:
+                        initial_metadata["current_image_attachment_ids"] = list(
+                            bound_attachment_ids
+                        )
+            except Exception as exc:  # noqa: BLE001 - marker IDs are additive
+                if (
+                    (expected_session_id is not None or expected_session_epoch is not None)
+                    and _has_session_storage(self._session_manager)
+                ):
+                    raise
+                log.debug(
+                    "turn_runner.bound_attachment_ids_unavailable",
+                    message_id=bound_user_message_id,
+                    error=type(exc).__name__,
+                )
         if input_provenance:
             if isinstance(input_provenance, dict):
                 normalized_provenance = dict(input_provenance)
@@ -9575,6 +10126,13 @@ class TurnRunner:
         initial_metadata["routing_history_capacity_estimate_complete"] = bool(
             history_capacity_estimate_complete
         )
+        from opensquilla.engine.steps.squilla_router import _attachments_include_image
+
+        initial_metadata["image_context_has_images"] = bool(
+            _attachments_include_image(attachments)
+            or explicit_attachment_ids
+            or history_has_recent_image
+        )
         if history_has_recent_image:
             initial_metadata["router_history_has_recent_image"] = True
             initial_metadata["router_history_image_turn_count"] = max(
@@ -9582,35 +10140,18 @@ class TurnRunner:
                 1,
             )
         if vision_sticky_remaining > 0:
-            initial_metadata["router_vision_sticky_remaining"] = int(
-                vision_sticky_remaining
-            )
+            initial_metadata["router_vision_sticky_remaining"] = int(vision_sticky_remaining)
         if turns_since_last_image is not None:
-            initial_metadata["router_turns_since_last_image"] = int(
-                turns_since_last_image
-            )
+            initial_metadata["router_turns_since_last_image"] = int(turns_since_last_image)
         if last_image_turn_text:
             initial_metadata["router_last_image_turn_text"] = last_image_turn_text
         if vision_candidate_turns > 0:
-            initial_metadata["router_vision_candidate_turns"] = int(
-                vision_candidate_turns
-            )
+            initial_metadata["router_vision_candidate_turns"] = int(vision_candidate_turns)
         if flags_text_override:
             initial_metadata["router_flags_text_override"] = flags_text_override
         if tool_context is not None:
             initial_metadata["channel_kind"] = tool_context.channel_kind
             initial_metadata["channel_id"] = tool_context.channel_id
-            artifact_context = getattr(tool_context, "artifact_context", None)
-            artifact_format = getattr(artifact_context, "artifact_format", None)
-            artifact_operation = getattr(artifact_context, "operation_class", None)
-            if isinstance(artifact_format, str) and isinstance(
-                artifact_operation, str
-            ):
-                # Content-free enums only. Document/anchor ids and selection
-                # material remain on the runtime ToolContext and never enter
-                # router telemetry or persisted pipeline metadata.
-                initial_metadata["artifact_format"] = artifact_format
-                initial_metadata["artifact_operation_class"] = artifact_operation
 
         # Budget gate (opt-in): seed the session's already-accumulated spend so
         # the router step can read it. Gated on an active limit, so the default
@@ -9653,52 +10194,41 @@ class TurnRunner:
             metadata=initial_metadata,
             raw_message=semantic_message,
             routing_hint=routing_hint,
-            skill_catalog=(None if restricted_tool_boundary else skill_catalog),
+            skill_catalog=(skill_catalog),
             provider_request_correlation=provider_request_correlation,
         )
         planning_turn = (
             tool_context is not None
-            and str(getattr(tool_context, "collaboration_mode", "default"))
-            == "plan"
+            and str(getattr(tool_context, "collaboration_mode", "default")) == "plan"
         )
         pipeline_steps: list[TurnStep] = [resolve_model]
-        if not restricted_tool_boundary:
-            pipeline_steps.append(apply_vision_followup_gate)
         pipeline_steps.extend(
             [
                 _bounded_apply_squilla_router,
                 observe_reasoning_hint,
             ]
         )
-        if not planning_turn and not restricted_tool_boundary:
+        if not planning_turn:
             pipeline_steps.extend([meta_resolution, enforce_coding_mode])
-        if restricted_tool_boundary:
-            # PromptAnnotation turns cannot be subagents/PlanRuns at ingress,
-            # and their prompt projection intentionally excludes skill, meta,
-            # coding-workspace and subagent bootstrap text.  Routing and cache
-            # behavior remain shared with ordinary Direct/Router/Ensemble
-            # turns.
-            pipeline_steps.extend([inject_platform_hint, apply_prompt_cache])
-        else:
-            pipeline_steps.extend(
-                [
-                    filter_skills,
-                    inject_subagent_grounding,
-                    inject_platform_hint,
-                    apply_prompt_cache,
-                ]
-            )
-        if not planning_turn and not restricted_tool_boundary:
+        pipeline_steps.extend(
+            [
+                resolve_skill_catalog,
+                inject_subagent_grounding,
+                inject_platform_hint,
+                apply_prompt_cache,
+            ]
+        )
+        if not planning_turn:
             pipeline_steps.insert(-4, meta_command_launch)
         turn = await run_pipeline(turn, pipeline_steps)
         if router_history_replay_request is not None:
             history_capacity = await self._router_history_capacity_for_request(
                 session_key,
                 router_history_replay_request,
-                max_history_turns=self._route_history_turn_limit(turn.metadata),
+                max_history_turns=0,
                 preserve_image_attachments=(
                     turn.metadata.get("image_route_reason")
-                    in {"current_turn", "gate_history"}
+                    in {"current_turn", "history_context"}
                 ),
                 reachable_provider_kinds=self._route_capacity_provider_kinds(
                     turn,
@@ -9734,23 +10264,34 @@ class TurnRunner:
                 from opensquilla.engine.selector_override import (
                     apply_model_override,
                     cross_provider_tier_config,
+                    resolve_strict_router_fallback_chain,
                 )
 
+                turn_config = self._turn_config()
+                active_provider_id = getattr(
+                    cloned_selector,
+                    "active_provider_id",
+                    "",
+                )
                 provider = apply_model_override(
                     cloned_selector,
                     turn.model,
                     turn_metadata=turn.metadata,
                     realign_routed_model=False,
                     tier_provider_config=cross_provider_tier_config(
-                        self._turn_config(),
+                        turn_config,
                         turn.metadata,
                         turn.model,
-                        active_provider_id=getattr(
-                            cloned_selector,
-                            "active_provider_id",
-                            "",
-                        ),
+                        active_provider_id=active_provider_id,
                         session_key=turn.session_key,
+                    ),
+                    strict_router_fallback_chain=(
+                        resolve_strict_router_fallback_chain(
+                            turn_config,
+                            turn.metadata,
+                            active_provider_id=active_provider_id,
+                            session_key=turn.session_key,
+                        )
                     ),
                 )
             return turn, provider
@@ -9763,9 +10304,7 @@ class TurnRunner:
         # single-model fallback cannot accidentally run the tier-local model.
         tier_ensemble_mode = ""
         tier_ensemble_binding = "single"
-        configured_selection_mode = effective_ensemble_selection_mode(
-            self._turn_config()
-        )
+        configured_selection_mode = effective_ensemble_selection_mode(self._turn_config())
         if bool(turn.metadata.get("routing_applied", False)):
             tier_ensemble_mode, tier_ensemble_binding = tier_ensemble_execution(
                 getattr(router_cfg, "tiers", None),
@@ -9781,16 +10320,10 @@ class TurnRunner:
         # its physical baseline and all-failed fallback. Legacy tier-local
         # selection modes remain readable and still choose their historical
         # plan/lineup, but they no longer own a second hidden fallback model.
-        fixed_baseline_ensemble = bool(
-            ensemble_globally_enabled or tier_ensemble_mode
-        )
+        fixed_baseline_ensemble = bool(ensemble_globally_enabled or tier_ensemble_mode)
         if fixed_baseline_ensemble:
-            fixed_provider = str(
-                getattr(initial_provider_config, "provider", "") or ""
-            ).strip()
-            fixed_model = str(
-                getattr(initial_provider_config, "model", "") or ""
-            ).strip()
+            fixed_provider = str(getattr(initial_provider_config, "provider", "") or "").strip()
+            fixed_model = str(getattr(initial_provider_config, "model", "") or "").strip()
             if not fixed_provider or not fixed_model:
                 log.error(
                     "llm_ensemble.missing_fixed_fallback",
@@ -9802,15 +10335,43 @@ class TurnRunner:
                     "missing_fixed_fallback: configure a non-empty fixed/direct "
                     "provider and model before enabling multi-model fusion"
                 )
-            turn.metadata["ensemble_fallback_provider"] = fixed_provider
-            turn.metadata["ensemble_fallback_model"] = fixed_model
+
+            # Attachment admission proves the routed logical deployment before
+            # Ensemble replaces it with the configured fixed baseline. If that
+            # baseline cannot carry the same request, keep the proven routed
+            # single-model path and its capacity-filtered selector fallback.
+            if turn.metadata.get("large_context_capacity_required") is True:
+                from opensquilla.engine.selector_override import (
+                    provider_config_has_request_capacity,
+                )
+
+                if not provider_config_has_request_capacity(
+                    initial_provider_config,
+                    turn.metadata,
+                ):
+                    fixed_baseline_ensemble = False
+                    turn.metadata["ensemble_wrap_skipped_reason"] = (
+                        "fixed_fallback_request_capacity"
+                    )
+                    turn.metadata["ensemble_capacity_bypassed"] = True
+                    log.warning(
+                        "llm_ensemble.wrap_skipped",
+                        reason="fixed_fallback_request_capacity",
+                        provider=fixed_provider,
+                        model=fixed_model,
+                    )
+
+            if fixed_baseline_ensemble:
+                turn.metadata["ensemble_fallback_provider"] = fixed_provider
+                turn.metadata["ensemble_fallback_model"] = fixed_model
 
             # Static/custom plans own their members' reasoning policy.  The
             # tier value remains stored as the reversible single-model draft,
             # but must not leak into the shared plan.  Legacy router_dynamic
             # continues to derive per-member thinking from its tier rows.
             if (
-                selection_mode != ROUTER_DYNAMIC_SELECTION_MODE
+                fixed_baseline_ensemble
+                and selection_mode != ROUTER_DYNAMIC_SELECTION_MODE
                 and turn.metadata.get("thinking_source") == "squilla_router_tier"
             ):
                 turn.metadata.pop("thinking_requested", None)
@@ -9825,9 +10386,7 @@ class TurnRunner:
 
             if not fixed_baseline_ensemble or initial_provider_config is None:
                 return
-            provider_id = str(
-                getattr(initial_provider_config, "provider", "") or ""
-            )
+            provider_id = str(getattr(initial_provider_config, "provider", "") or "")
             model_id = str(getattr(initial_provider_config, "model", "") or "")
             turn.metadata["executed_provider"] = provider_id
             turn.metadata["executed_model"] = model_id
@@ -9844,9 +10403,9 @@ class TurnRunner:
             ):
                 if key in turn.metadata:
                     turn.metadata[key] = 0.0
+
         routed_plan_owns_tier = (
-            selection_mode == ROUTER_DYNAMIC_SELECTION_MODE
-            or tier_ensemble_binding == "legacy"
+            selection_mode == ROUTER_DYNAMIC_SELECTION_MODE or tier_ensemble_binding == "legacy"
         )
         if (
             fixed_baseline_ensemble
@@ -9873,23 +10432,17 @@ class TurnRunner:
                 # directly; otherwise the trace would claim a dynamic plan ran
                 # even though its Router-selected member was unavailable.
                 routed_plan_blocked_reason = str(
-                    turn.metadata.get("routed_provider_blocked")
-                    or "routed_plan_provider_blocked"
+                    turn.metadata.get("routed_provider_blocked") or "routed_plan_provider_blocked"
                 )
-                turn.metadata["ensemble_anchor_blocked_reason"] = (
-                    routed_plan_blocked_reason
-                )
-                turn.metadata["ensemble_anchor_provider_resolution"] = (
-                    turn.metadata.get("routed_provider_resolution")
-                    or {
-                        "provider": str(
-                            turn.metadata.get("routed_provider") or ""
-                        ),
-                        "model": str(turn.model or ""),
-                        "ready": False,
-                        "reason": routed_plan_blocked_reason,
-                    }
-                )
+                turn.metadata["ensemble_anchor_blocked_reason"] = routed_plan_blocked_reason
+                turn.metadata["ensemble_anchor_provider_resolution"] = turn.metadata.get(
+                    "routed_provider_resolution"
+                ) or {
+                    "provider": str(turn.metadata.get("routed_provider") or ""),
+                    "model": str(turn.model or ""),
+                    "ready": False,
+                    "reason": routed_plan_blocked_reason,
+                }
                 turn.metadata["routed_provider_fallback_provider"] = str(
                     getattr(initial_provider_config, "provider", "") or ""
                 )
@@ -9916,23 +10469,19 @@ class TurnRunner:
                     getattr(routed_plan_provider_config, "model", "") or ""
                 )
                 if turn.metadata.get("routed_provider_resolution") is not None:
-                    turn.metadata["ensemble_anchor_provider_resolution"] = (
-                        turn.metadata.get("routed_provider_resolution")
+                    turn.metadata["ensemble_anchor_provider_resolution"] = turn.metadata.get(
+                        "routed_provider_resolution"
                     )
                 else:
-                    routed_provider = str(
-                        turn.metadata.get("routed_provider") or ""
-                    ).strip().lower()
-                    active_provider = str(
-                        getattr(initial_provider_config, "provider", "") or ""
-                    ).strip().lower()
+                    routed_provider = (
+                        str(turn.metadata.get("routed_provider") or "").strip().lower()
+                    )
+                    active_provider = (
+                        str(getattr(initial_provider_config, "provider", "") or "").strip().lower()
+                    )
                     turn.metadata["ensemble_anchor_provider_resolution"] = {
-                        "provider": str(
-                            getattr(routed_plan_provider_config, "provider", "") or ""
-                        ),
-                        "model": str(
-                            getattr(routed_plan_provider_config, "model", "") or ""
-                        ),
+                        "provider": str(getattr(routed_plan_provider_config, "provider", "") or ""),
+                        "model": str(getattr(routed_plan_provider_config, "model", "") or ""),
                         "ready": True,
                         "reason": (
                             "same_provider"
@@ -9961,46 +10510,40 @@ class TurnRunner:
             from opensquilla.engine.selector_override import (
                 apply_model_override,
                 cross_provider_tier_config,
+                resolve_strict_router_fallback_chain,
             )
 
+            turn_config = self._turn_config()
+            active_provider_id = getattr(
+                cloned_selector,
+                "active_provider_id",
+                "",
+            )
             provider = apply_model_override(
                 cloned_selector,
                 turn.model,
                 turn_metadata=turn.metadata,
                 realign_routed_model=False,
                 tier_provider_config=cross_provider_tier_config(
-                    self._turn_config(),
+                    turn_config,
                     turn.metadata,
                     turn.model,
-                    active_provider_id=getattr(cloned_selector, "active_provider_id", ""),
+                    active_provider_id=active_provider_id,
+                    session_key=turn.session_key,
+                ),
+                strict_router_fallback_chain=resolve_strict_router_fallback_chain(
+                    turn_config,
+                    turn.metadata,
+                    active_provider_id=active_provider_id,
                     session_key=turn.session_key,
                 ),
             )
 
-        artifact_ensemble_bypass = _artifact_ensemble_bypass_reason(turn.metadata)
-        artifact_requires_aggregator_ensemble = (
-            _artifact_requires_aggregator_only_ensemble(turn.metadata)
-        )
-
         def record_ensemble_unavailable(reason: str) -> None:
             turn.metadata["ensemble_wrap_skipped_reason"] = reason
             _record_fixed_ensemble_execution(reason)
-            if artifact_requires_aggregator_ensemble:
-                raise RuntimeError(f"artifact_ensemble_unavailable:{reason}")
 
-        if artifact_ensemble_bypass is not None:
-            record_ensemble_unavailable(artifact_ensemble_bypass)
-        if (
-            provider is None
-            and getattr(ensemble_cfg, "enabled", False)
-            and artifact_requires_aggregator_ensemble
-        ):
-            record_ensemble_unavailable("missing_primary_provider")
-        if (
-            provider is not None
-            and (ensemble_globally_enabled or tier_ensemble_mode)
-            and artifact_ensemble_bypass is None
-        ):
+        if provider is not None and fixed_baseline_ensemble:
             from opensquilla.engine.selector_override import (
                 acquire_profile_credential,
                 report_profile_credential_failure,
@@ -10018,8 +10561,7 @@ class TurnRunner:
             )
             plan_provider_config = (
                 initial_provider_config
-                if tier_ensemble_binding == "shared"
-                and initial_provider_config is not None
+                if tier_ensemble_binding == "shared" and initial_provider_config is not None
                 else current_provider_config
             )
             if routed_plan_provider_config is not None:
@@ -10035,9 +10577,7 @@ class TurnRunner:
                 turn.metadata["ensemble_wrap_skipped_reason"] = (
                     f"unsupported_tier_selection_mode:{selection_mode}"
                 )
-                _record_fixed_ensemble_execution(
-                    str(turn.metadata["ensemble_wrap_skipped_reason"])
-                )
+                _record_fixed_ensemble_execution(str(turn.metadata["ensemble_wrap_skipped_reason"]))
                 return turn, provider
             if routed_plan_blocked_reason:
                 blocked_prefix = (
@@ -10052,9 +10592,7 @@ class TurnRunner:
                 turn.metadata["ensemble_wrap_skipped_reason"] = (
                     f"{blocked_prefix}:{routed_plan_blocked_reason}"
                 )
-                _record_fixed_ensemble_execution(
-                    str(turn.metadata["ensemble_wrap_skipped_reason"])
-                )
+                _record_fixed_ensemble_execution(str(turn.metadata["ensemble_wrap_skipped_reason"]))
                 return turn, provider
             # A custom plan is one saved lineup.  Preflight every deployment
             # with the same session credential resolver used by construction;
@@ -10075,9 +10613,7 @@ class TurnRunner:
                     "llm_ensemble.wrap_skipped",
                     reason="missing_provider_selector_current_config",
                 )
-                record_ensemble_unavailable(
-                    "missing_provider_selector_current_config"
-                )
+                record_ensemble_unavailable("missing_provider_selector_current_config")
             elif not getattr(current_provider_config, "provider", None) or not getattr(
                 current_provider_config,
                 "model",
@@ -10087,9 +10623,7 @@ class TurnRunner:
                     "llm_ensemble.wrap_skipped",
                     reason="incomplete_provider_selector_current_config",
                 )
-                record_ensemble_unavailable(
-                    "incomplete_provider_selector_current_config"
-                )
+                record_ensemble_unavailable("incomplete_provider_selector_current_config")
             elif static_b5_profile(selection_mode) is not None and not (
                 static_b5_credential_available(
                     self._turn_config(),
@@ -10108,9 +10642,7 @@ class TurnRunner:
                     "llm_ensemble.wrap_skipped",
                     reason=f"{selection_mode}_no_credential",
                 )
-                turn.metadata["ensemble_wrap_skipped_reason"] = (
-                    f"{selection_mode}_no_credential"
-                )
+                turn.metadata["ensemble_wrap_skipped_reason"] = f"{selection_mode}_no_credential"
                 record_ensemble_unavailable(f"{selection_mode}_no_credential")
             elif not custom_lineup_ready:
                 log.warning(
@@ -10124,14 +10656,11 @@ class TurnRunner:
                     f"{selection_mode}_not_ready:"
                     f"{custom_lineup_blocked_reason or 'deployment_unavailable'}"
                 )
-                record_ensemble_unavailable(
-                    str(turn.metadata["ensemble_wrap_skipped_reason"])
-                )
+                record_ensemble_unavailable(str(turn.metadata["ensemble_wrap_skipped_reason"]))
             else:
                 turn.metadata["ensemble_enabled"] = True
                 tier_scoped_ensemble = bool(tier_ensemble_mode) and (
-                    not ensemble_globally_enabled
-                    or tier_ensemble_binding == "legacy"
+                    not ensemble_globally_enabled or tier_ensemble_binding == "legacy"
                 )
                 turn.metadata["ensemble_activation_source"] = (
                     "router_tier" if tier_scoped_ensemble else "global"
@@ -10151,16 +10680,11 @@ class TurnRunner:
                     turn_metadata=turn.metadata,
                     _enable_member_request_budget_rebinding=True,
                     _model_catalog=self._model_catalog,
-                    _context_overflow_threshold=(
-                        AgentConfig().context_overflow_threshold
-                    ),
+                    _context_overflow_threshold=(AgentConfig().context_overflow_threshold),
                     _credential_pool_acquirer=acquire_profile_credential,
-                    _credential_pool_failure_reporter=(
-                        report_profile_credential_failure
-                    ),
+                    _credential_pool_failure_reporter=(report_profile_credential_failure),
                     _session_key=turn.session_key,
                     _fallback_selector=cloned_selector,
-                    _artifact_mutation=artifact_requires_aggregator_ensemble,
                     _selection_mode_override=selection_mode,
                     _plan_provider_config=plan_provider_config,
                     _dynamic_baseline_provider_config=initial_provider_config,
@@ -10209,20 +10733,6 @@ class TurnRunner:
         return turn, provider
 
     @staticmethod
-    def _route_history_turn_limit(metadata: Mapping[str, Any]) -> int:
-        raw = metadata.get("route_max_history_turns")
-        if isinstance(raw, bool):
-            return 0
-        if isinstance(raw, int):
-            return max(0, raw)
-        if isinstance(raw, str):
-            try:
-                return max(0, int(raw))
-            except ValueError:
-                return 0
-        return 0
-
-    @staticmethod
     def _route_capacity_provider_kinds(
         turn: Any,
         *,
@@ -10254,16 +10764,21 @@ class TurnRunner:
             tiers = getattr(router_cfg, "tiers", None)
             requires_image = metadata.get("image_route_reason") in {
                 "current_turn",
-                "gate_history",
+                "history_context",
             }
             if isinstance(tiers, Mapping):
-                for raw_tier in tiers.values():
+                for tier_name, raw_tier in tiers.items():
                     if not isinstance(raw_tier, Mapping):
                         continue
-                    if requires_image and not bool(raw_tier.get("supports_image", False)):
+                    if requires_image and normalize_text_tier(tier_name) is None:
                         continue
-                    if not requires_image and bool(raw_tier.get("image_only", False)):
+                    if bool(raw_tier.get("image_only", False)):
                         continue
+                    if not str(raw_tier.get("model") or "").strip():
+                        continue
+                    # Every configured c-tier may be reached by a native probe
+                    # or the final marker fallback. Legacy image switches do
+                    # not establish the physical deployment's capabilities.
                     _add(raw_tier.get("provider") or active_provider)
 
         # Unknown/legacy selector shapes retain the previous conservative
@@ -10436,12 +10951,12 @@ class TurnRunner:
         trim_last_user: bool,
         bound_slice_applied: bool,
         image_replay_entry_indexes: Collection[int] = (),
+        allowed_image_attachment_ids: frozenset[str] | None = None,
         media_root: Path | None = None,
         session_id: str | None = None,
         materialize_historical_attachments: bool = False,
         workspace_dir: str | Path | None = None,
         historical_materializer: AttachmentWorkspaceMaterializer | None = None,
-        restricted_turn: bool = False,
         require_capacity_proof: bool = False,
     ) -> Any:
         """Project transcript rows through the same replay decoder for all consumers."""
@@ -10470,11 +10985,7 @@ class TurnRunner:
                 and raw_content.startswith(_CONTEXT_SUMMARY_MARKER)
             ):
                 return HistoryReplayEntryProjection(
-                    legacy_summary_marker=(
-                        None
-                        if restricted_turn
-                        else _strip_context_summary_marker(raw_content)
-                    )
+                    legacy_summary_marker=_strip_context_summary_marker(raw_content)
                 )
             subagent_notice = _subagent_terminal_history_notice(entry)
             if subagent_notice is not None:
@@ -10512,6 +11023,12 @@ class TurnRunner:
                 else:
                     projected_content = self._maybe_unpack_attachments(
                         raw_content,
+                        persist_image_material=(
+                            getattr(
+                                getattr(self._turn_config(), "attachments", None),
+                                "persist_transcripts", True,
+                            ) is not False
+                        ),
                         preserve_image_attachments=preserve_image,
                         materialize_historical_attachments=(
                             materialize_historical_attachments
@@ -10520,6 +11037,8 @@ class TurnRunner:
                         session_id=session_id,
                         workspace_dir=workspace_dir,
                         historical_materializer=historical_materializer,
+                        allowed_image_attachment_ids=allowed_image_attachment_ids,
+                        source_message_id=getattr(entry, "message_id", None),
                     )
                 if require_capacity_proof and recognized and valid:
                     persisted_token_count = (
@@ -10539,6 +11058,7 @@ class TurnRunner:
                 content=projected_content,
                 tool_calls=getattr(entry, "tool_calls", None),
                 reasoning_content=getattr(entry, "reasoning_content", None),
+                assistant_replay=getattr(entry, "assistant_replay", None),
                 turn_context=(turn_context if isinstance(turn_context, dict) else None),
                 estimate_complete=estimate_complete,
                 persisted_token_count=persisted_token_count,
@@ -10660,35 +11180,23 @@ class TurnRunner:
                 for index, entry in enumerate(entries)
                 if index >= bound_index and getattr(entry, "role", None) == "user"
             }
-        elif (
-            exclude_last_user
-            and entries
-            and getattr(entries[-1], "role", None) == "user"
-        ):
+        elif exclude_last_user and entries and getattr(entries[-1], "role", None) == "user":
             excluded_user_indexes.add(len(entries) - 1)
 
         image_replay_entry_indexes: set[int] = set()
         replay_session_id: str | None = None
         if preserve_image_attachments:
-            router_cfg = getattr(self._turn_config(), "squilla_router", None)
-            lookback = int(
-                getattr(router_cfg, "vision_history_lookback_turns", 3) or 0
-            )
-            if lookback > 0:
-                user_entry_indexes = [
-                    index
-                    for index, entry in enumerate(entries)
-                    if index not in excluded_user_indexes
-                    and getattr(entry, "role", None) == "user"
-                    and isinstance(getattr(entry, "content", None), str)
-                    and bool(str(getattr(entry, "content", "")).strip())
-                ]
-                image_replay_entry_indexes = set(user_entry_indexes[-lookback:])
-                replay_session_id = expected_session_id
-                if replay_session_id is None:
-                    replay_session_id = await self._resolve_session_id_for_log(session_key)
-                if replay_session_id is None:
-                    replay_session_id = session_key
+            image_replay_entry_indexes = {
+                index
+                for index, entry in enumerate(entries)
+                if index not in excluded_user_indexes
+                and getattr(entry, "role", None) == "user"
+            }
+            replay_session_id = expected_session_id
+            if replay_session_id is None:
+                replay_session_id = await self._resolve_session_id_for_log(session_key)
+            if replay_session_id is None:
+                replay_session_id = session_key
 
         replay = self._project_history_replay(
             entries,
@@ -10870,11 +11378,7 @@ class TurnRunner:
             )
         get_transcript = getattr(self._session_manager, "get_transcript", None)
         if not callable(get_transcript):
-            return (
-                {"history_capacity_estimate_complete": False}
-                if include_capacity
-                else {}
-            )
+            return {"history_capacity_estimate_complete": False} if include_capacity else {}
         try:
             exact_owner = _require_optional_exact_session_owner(
                 expected_session_id,
@@ -10903,11 +11407,7 @@ class TurnRunner:
                     transcript = await transcript
         except Exception:  # noqa: BLE001 - router context must never block a turn
             log.debug("turn_runner.router_context_failed", session_key=session_key)
-            return (
-                {"history_capacity_estimate_complete": False}
-                if include_capacity
-                else {}
-            )
+            return {"history_capacity_estimate_complete": False} if include_capacity else {}
         entries = list(transcript or [])
         # When the turn is bound to a specific user message id (queued-sends
         # path), exclude the bound current prompt AND every later user entry
@@ -10928,11 +11428,7 @@ class TurnRunner:
                 for index, entry in enumerate(entries)
                 if index >= bound_index and getattr(entry, "role", None) == "user"
             }
-        elif (
-            exclude_last_user
-            and entries
-            and getattr(entries[-1], "role", None) == "user"
-        ):
+        elif exclude_last_user and entries and getattr(entries[-1], "role", None) == "user":
             excluded_user_indexes.add(len(entries) - 1)
 
         capacity_context: dict[str, Any] = {}
@@ -10949,7 +11445,35 @@ class TurnRunner:
 
         user_texts: list[str] = []
         user_contents: list[str] = []
+        user_image_flags: list[bool] = []
+        unanchored_image_replay = False
         for index, entry in enumerate(entries):
+            if getattr(entry, "role", None) == "assistant":
+                # A queued user row can precede the previous turn's completion.
+                # Match history replay: exclude queued user rows, not the
+                # completed assistant/tool messages that follow their ingress.
+                replay = getattr(entry, "assistant_replay", None)
+                if isinstance(replay, dict):
+                    from opensquilla.engine.history import (
+                        AssistantReplayError,
+                        decode_assistant_replay,
+                    )
+                    from opensquilla.provider.types import ContentBlockImage
+
+                    try:
+                        replay_messages = decode_assistant_replay(replay)
+                    except AssistantReplayError:
+                        replay_messages = []
+                    if any(
+                        isinstance(block, ContentBlockImage)
+                        for message in replay_messages
+                        if isinstance(message.content, list)
+                        for block in message.content
+                    ):
+                        if user_image_flags:
+                            user_image_flags[-1] = True
+                        else:
+                            unanchored_image_replay = True
             if getattr(entry, "role", None) != "user":
                 continue
             if index in excluded_user_indexes:
@@ -10960,6 +11484,7 @@ class TurnRunner:
             if not isinstance(content, str) or not content.strip():
                 continue
             user_contents.append(content)
+            user_image_flags.append(self._attachment_envelope_has_image(content))
             unpacked = self._maybe_unpack_attachments(content)
             text = unpacked.strip() if isinstance(unpacked, str) else content.strip()
             if len(text) > _ROUTER_HISTORY_USER_MAX_CHARS:
@@ -10970,56 +11495,22 @@ class TurnRunner:
         if user_texts:
             context["history_user_texts"] = user_texts[-_ROUTER_HISTORY_USER_MAX_TURNS:]
         router_cfg = getattr(self._turn_config(), "squilla_router", None)
-        lookback = int(
-            getattr(
-                router_cfg,
-                "vision_history_lookback_turns",
-                8,
+        image_positions = [index for index, has_image in enumerate(user_image_flags) if has_image]
+        if image_positions or unanchored_image_replay:
+            context["history_has_recent_image"] = True
+            context["history_image_turn_count"] = (
+                len(image_positions) + int(unanchored_image_replay)
             )
-            or 0
-        )
-        candidate_turns = int(
-            getattr(
-                router_cfg,
-                "vision_history_candidate_turns",
-                lookback,
+        if image_positions:
+            turns_since_last_image = len(user_contents) - image_positions[-1] - 1
+            context["turns_since_last_image"] = turns_since_last_image
+            context["vision_candidate_turns"] = len(user_contents)
+            context["last_image_turn_text"] = user_texts[image_positions[-1]]
+            sticky_turns = int(
+                getattr(router_cfg, "vision_sticky_followup_turns", 2) or 0
             )
-            or 0
-        )
-        if lookback > 0 or candidate_turns > 0:
-            recent_limit = max(lookback, candidate_turns)
-            recent_user_contents = user_contents[-recent_limit:]
-            image_positions = [
-                index
-                for index, content in enumerate(recent_user_contents)
-                if self._attachment_envelope_has_image(content)
-            ]
-            image_turn_count = len(image_positions)
-            if image_turn_count:
-                context["history_has_recent_image"] = True
-                context["history_image_turn_count"] = image_turn_count
-                turns_since_last_image = (
-                    len(recent_user_contents) - image_positions[-1] - 1
-                )
-                context["turns_since_last_image"] = turns_since_last_image
-                context["vision_candidate_turns"] = candidate_turns
-                absolute_image_index = (
-                    len(user_contents) - len(recent_user_contents) + image_positions[-1]
-                )
-                if 0 <= absolute_image_index < len(user_texts):
-                    context["last_image_turn_text"] = user_texts[absolute_image_index]
-                sticky_turns = int(
-                    getattr(
-                        router_cfg,
-                        "vision_sticky_followup_turns",
-                        2,
-                    )
-                    or 0
-                )
-                if sticky_turns > 0 and turns_since_last_image < sticky_turns:
-                    context["vision_sticky_remaining"] = (
-                        sticky_turns - turns_since_last_image
-                    )
+            if sticky_turns > 0 and turns_since_last_image < sticky_turns:
+                context["vision_sticky_remaining"] = sticky_turns - turns_since_last_image
 
         for entry in reversed(entries):
             if getattr(entry, "role", None) != "assistant":
@@ -11352,9 +11843,7 @@ class TurnRunner:
                 intent_summary=build_intent_summary(message),
                 trace_id=trace_id or turn_id,
                 decision_id=(
-                    turn_obj.metadata.get("router_decision_id")
-                    if turn_obj is not None
-                    else None
+                    turn_obj.metadata.get("router_decision_id") if turn_obj is not None else None
                 ),
                 tool_profile=prompt_report.tool_profile if prompt_report else None,
                 prompt_hash=prompt_hash,
@@ -11376,9 +11865,7 @@ class TurnRunner:
                 skill_count=prompt_report.skill_count if prompt_report else 0,
                 skills_prompt_chars=prompt_report.skills_prompt_chars if prompt_report else 0,
                 memory_md_present=prompt_report.memory_md_present if prompt_report else False,
-                daily_notes_omitted=(
-                    prompt_report.daily_notes_omitted if prompt_report else False
-                ),
+                daily_notes_omitted=(prompt_report.daily_notes_omitted if prompt_report else False),
                 daily_notes_count_before_omit=(
                     prompt_report.daily_notes_count_before_omit if prompt_report else 0
                 ),
@@ -11439,9 +11926,7 @@ class TurnRunner:
                     prompt_report.session_flush_fallback_reason if prompt_report else None
                 ),
                 image_route_reason=(
-                    turn_obj.metadata.get("image_route_reason")
-                    if turn_obj is not None
-                    else None
+                    turn_obj.metadata.get("image_route_reason") if turn_obj is not None else None
                 ),
                 vision_followup_gate_decision=(
                     turn_obj.metadata.get("router_vision_followup_gate_decision")
@@ -11455,9 +11940,7 @@ class TurnRunner:
                 ),
                 vision_followup_gate_reason=(
                     build_vision_followup_gate_reason_code(
-                        decision=turn_obj.metadata.get(
-                            "router_vision_followup_gate_decision"
-                        ),
+                        decision=turn_obj.metadata.get("router_vision_followup_gate_decision"),
                         source=turn_obj.metadata.get("router_vision_followup_gate_source"),
                         reason=turn_obj.metadata.get("router_vision_followup_gate_reason"),
                         fallback=turn_obj.metadata.get("router_vision_followup_fallback"),
@@ -11668,6 +12151,8 @@ class TurnRunner:
         compaction_provider: Any | None = None,
         compaction_model: str | None = None,
         compaction_plan: Any | None = None,
+        compaction_request_context: Any | None = None,
+        attachment_path_resolver: Callable[[dict[str, Any], str], str | None] | None = None,
         history_capacity_tokens: int | None = None,
         history_capacity_chars: int | None = None,
         history_has_persisted_user: bool = False,
@@ -11798,11 +12283,7 @@ class TurnRunner:
 
         compaction_config = None
         configured_compaction = getattr(getattr(self, "_config", None), "compaction", None)
-        if (
-            compaction_provider is not None
-            or compaction_model
-            or configured_compaction is not None
-        ):
+        if compaction_provider is not None or compaction_model or configured_compaction is not None:
             from opensquilla.session.compaction import build_compaction_config_from_provider
 
             compaction_config = build_compaction_config_from_provider(
@@ -11833,12 +12314,10 @@ class TurnRunner:
         total_chars = checkpoint_chars + estimate_entries_model_replay_chars(transcript)
         durable_prefix_end = len(transcript) - protected_suffix_count
         durable_history_tokens = checkpoint_tokens + sum(
-            estimate_entry_model_replay_tokens(entry)
-            for entry in transcript[:durable_prefix_end]
+            estimate_entry_model_replay_tokens(entry) for entry in transcript[:durable_prefix_end]
         )
-        durable_history_chars = (
-            checkpoint_chars
-            + estimate_entries_model_replay_chars(transcript[:durable_prefix_end])
+        durable_history_chars = checkpoint_chars + estimate_entries_model_replay_chars(
+            transcript[:durable_prefix_end]
         )
         safety_margin = float(
             getattr(compaction_config or CompactionConfig(), "safety_margin", 1.2) or 1.2
@@ -11891,15 +12370,12 @@ class TurnRunner:
             else 0
         )
         if (
-            (
-                protected_request_tokens > 0
-                and protected_request_tokens * safety_margin > history_window_tokens
-            )
-            or (
-                history_capacity_chars is not None
-                and protected_request_chars > 0
-                and protected_request_chars * safety_margin > int(history_capacity_chars)
-            )
+            protected_request_tokens > 0
+            and protected_request_tokens * safety_margin > history_window_tokens
+        ) or (
+            history_capacity_chars is not None
+            and protected_request_chars > 0
+            and protected_request_chars * safety_margin > int(history_capacity_chars)
         ):
             log.info(
                 "t3_upgrade_compaction.skipped",
@@ -11914,6 +12390,8 @@ class TurnRunner:
             )
             return _T3_HANDLED
         compaction_config = compaction_config or CompactionConfig()
+        compaction_config.request_context = compaction_request_context
+        compaction_config.attachment_path_resolver = attachment_path_resolver
         compaction_config.protected_recent_messages = max(
             effective_protected_recent_messages(compaction_config),
             protected_suffix_count,
@@ -11924,6 +12402,7 @@ class TurnRunner:
                 session_key,
                 transcript,
                 history_window_tokens,
+                attachment_path_resolver=attachment_path_resolver,
                 compaction_id=new_compaction_id(),
                 phase="t3_upgrade",
                 reason="durable_compaction_circuit_open",
@@ -11939,6 +12418,7 @@ class TurnRunner:
                 session_key,
                 transcript,
                 history_window_tokens,
+                attachment_path_resolver=attachment_path_resolver,
                 compaction_id=new_compaction_id(),
                 phase="t3_upgrade",
                 reason="protected_history_boundary_unsupported",
@@ -12085,10 +12565,7 @@ class TurnRunner:
                 deterministic_receipt_safe=checkpoint_saved and not requires_safe_receipt,
                 required=self._pre_compaction_flush_enabled(),
             )
-            if (
-                requires_safe_receipt
-                and not memory_status.allows_destructive_compaction
-            ):
+            if requires_safe_receipt and not memory_status.allows_destructive_compaction:
                 log.warning(
                     "t3_upgrade_compaction.skipped",
                     session_key=session_key,
@@ -12151,9 +12628,7 @@ class TurnRunner:
                     compact_method,
                     "provider_request_correlation",
                 ):
-                    compact_kwargs["provider_request_correlation"] = (
-                        provider_request_correlation
-                    )
+                    compact_kwargs["provider_request_correlation"] = provider_request_correlation
                 if _accepts_keyword_arg(compact_method, "consumer_admission"):
                     compact_kwargs["consumer_admission"] = consumer_admission
                 if _accepts_keyword_arg(
@@ -12171,9 +12646,7 @@ class TurnRunner:
                         "protected_boundary_message_id",
                     )
                 ):
-                    compact_kwargs["protected_boundary_message_id"] = (
-                        bound_user_message_id
-                    )
+                    compact_kwargs["protected_boundary_message_id"] = bound_user_message_id
                 compaction_result = await await_compaction_phase(
                     self._session_manager.compact_with_result(
                         session_key,
@@ -12231,12 +12704,9 @@ class TurnRunner:
                         **observed_payload,
                     )
             if result:
-                durable_transcript_changed = (
-                    compaction_result is None
-                    or (
-                        int(getattr(compaction_result, "removed_count", 0) or 0) > 0
-                        and bool(getattr(compaction_result, "summary", "") or "")
-                    )
+                durable_transcript_changed = compaction_result is None or (
+                    int(getattr(compaction_result, "removed_count", 0) or 0) > 0
+                    and bool(getattr(compaction_result, "summary", "") or "")
                 )
                 if durable_transcript_changed and transcript_snapshot is not None:
                     transcript_snapshot.invalidate()
@@ -12265,6 +12735,7 @@ class TurnRunner:
                         session_key,
                         transcript,
                         history_window_tokens,
+                        attachment_path_resolver=attachment_path_resolver,
                         compaction_id=compaction_id,
                         phase="t3_upgrade",
                         reason=skip_reason,
@@ -12343,6 +12814,7 @@ class TurnRunner:
                 session_key,
                 transcript,
                 history_window_tokens,
+                attachment_path_resolver=attachment_path_resolver,
                 compaction_id=compaction_id,
                 phase="t3_upgrade",
                 reason="compact_failed",
@@ -12379,6 +12851,8 @@ class TurnRunner:
         compaction_provider: Any | None = None,
         compaction_model: str | None = None,
         compaction_plan: Any | None = None,
+        compaction_request_context: Any | None = None,
+        attachment_path_resolver: Callable[[dict[str, Any], str], str | None] | None = None,
         history_capacity_tokens: int | None = None,
         history_capacity_chars: int | None = None,
         history_has_persisted_user: bool = False,
@@ -12442,11 +12916,7 @@ class TurnRunner:
         )
 
         configured_compaction = getattr(getattr(self, "_config", None), "compaction", None)
-        if (
-            compaction_provider is not None
-            or compaction_model
-            or configured_compaction is not None
-        ):
+        if compaction_provider is not None or compaction_model or configured_compaction is not None:
             compaction_config = build_compaction_config_from_provider(
                 compaction_provider,
                 model_override=compaction_model,
@@ -12456,6 +12926,8 @@ class TurnRunner:
             )
         else:
             compaction_config = CompactionConfig()
+        compaction_config.request_context = compaction_request_context
+        compaction_config.attachment_path_resolver = attachment_path_resolver
         if self.has_attempted_compaction_this_turn(session_key):
             log.info(
                 "preflight_compaction.skipped",
@@ -12512,32 +12984,23 @@ class TurnRunner:
         total_chars = checkpoint_chars + estimate_entries_model_replay_chars(transcript)
         durable_prefix_end = len(transcript) - protected_suffix_count
         durable_history_tokens = checkpoint_tokens + sum(
-            estimate_entry_model_replay_tokens(entry)
-            for entry in transcript[:durable_prefix_end]
+            estimate_entry_model_replay_tokens(entry) for entry in transcript[:durable_prefix_end]
         )
-        durable_history_chars = (
-            checkpoint_chars
-            + estimate_entries_model_replay_chars(transcript[:durable_prefix_end])
+        durable_history_chars = checkpoint_chars + estimate_entries_model_replay_chars(
+            transcript[:durable_prefix_end]
         )
         ratio = self._preflight_compact_ratio()
         threshold = int(history_window_tokens * ratio)
         char_threshold = (
-            int(int(history_capacity_chars) * ratio)
-            if history_capacity_chars is not None
-            else None
+            int(int(history_capacity_chars) * ratio) if history_capacity_chars is not None else None
         )
         durable_token_pressure = durable_history_tokens > threshold
         durable_char_pressure = bool(
-            char_threshold is not None
-            and durable_history_chars > char_threshold
+            char_threshold is not None and durable_history_chars > char_threshold
         )
         if not durable_token_pressure and not durable_char_pressure:
-            if (
-                total_tokens > threshold
-                or (
-                    char_threshold is not None
-                    and total_chars > char_threshold
-                )
+            if total_tokens > threshold or (
+                char_threshold is not None and total_chars > char_threshold
             ):
                 log.info(
                     "preflight_compaction.skipped",
@@ -12578,15 +13041,12 @@ class TurnRunner:
         )
         safety_margin = float(getattr(compaction_config, "safety_margin", 1.2) or 1.2)
         if (
-            (
-                protected_request_tokens > 0
-                and protected_request_tokens * safety_margin > history_window_tokens
-            )
-            or (
-                history_capacity_chars is not None
-                and protected_request_chars > 0
-                and protected_request_chars * safety_margin > int(history_capacity_chars)
-            )
+            protected_request_tokens > 0
+            and protected_request_tokens * safety_margin > history_window_tokens
+        ) or (
+            history_capacity_chars is not None
+            and protected_request_chars > 0
+            and protected_request_chars * safety_margin > int(history_capacity_chars)
         ):
             log.info(
                 "preflight_compaction.skipped",
@@ -12610,6 +13070,7 @@ class TurnRunner:
                 session_key,
                 transcript,
                 history_window_tokens,
+                attachment_path_resolver=attachment_path_resolver,
                 compaction_id=new_compaction_id(),
                 phase="preflight",
                 reason="durable_compaction_circuit_open",
@@ -12625,6 +13086,7 @@ class TurnRunner:
                 session_key,
                 transcript,
                 history_window_tokens,
+                attachment_path_resolver=attachment_path_resolver,
                 compaction_id=new_compaction_id(),
                 phase="preflight",
                 reason="protected_history_boundary_unsupported",
@@ -12783,10 +13245,7 @@ class TurnRunner:
                 deterministic_receipt_safe=checkpoint_saved and not requires_safe_receipt,
                 required=self._pre_compaction_flush_enabled(),
             )
-            if (
-                requires_safe_receipt
-                and not memory_status.allows_destructive_compaction
-            ):
+            if requires_safe_receipt and not memory_status.allows_destructive_compaction:
                 log.warning(
                     "preflight_compaction.skipped",
                     session_key=session_key,
@@ -12850,9 +13309,7 @@ class TurnRunner:
                     compact_method,
                     "provider_request_correlation",
                 ):
-                    compact_kwargs["provider_request_correlation"] = (
-                        provider_request_correlation
-                    )
+                    compact_kwargs["provider_request_correlation"] = provider_request_correlation
                 if _accepts_keyword_arg(compact_method, "consumer_admission"):
                     compact_kwargs["consumer_admission"] = consumer_admission
                 if _accepts_keyword_arg(
@@ -12870,9 +13327,7 @@ class TurnRunner:
                         "protected_boundary_message_id",
                     )
                 ):
-                    compact_kwargs["protected_boundary_message_id"] = (
-                        bound_user_message_id
-                    )
+                    compact_kwargs["protected_boundary_message_id"] = bound_user_message_id
                 compaction_result = await await_compaction_phase(
                     self._session_manager.compact_with_result(
                         session_key,
@@ -12983,6 +13438,7 @@ class TurnRunner:
                 session_key,
                 transcript,
                 history_window_tokens,
+                attachment_path_resolver=attachment_path_resolver,
                 compaction_id=compaction_id,
                 phase="preflight",
                 reason="compact_failed",
@@ -13010,9 +13466,7 @@ class TurnRunner:
             )
             return
         if not result:
-            skip_reason = str(
-                getattr(compaction_result, "skip_reason", None) or "empty_summary"
-            )
+            skip_reason = str(getattr(compaction_result, "skip_reason", None) or "empty_summary")
             if skip_reason == "stale_preimage":
                 notify_compaction(
                     session_key,
@@ -13037,6 +13491,7 @@ class TurnRunner:
                 session_key,
                 transcript,
                 history_window_tokens,
+                attachment_path_resolver=attachment_path_resolver,
                 compaction_id=compaction_id,
                 phase="preflight",
                 reason=skip_reason,
@@ -13048,12 +13503,9 @@ class TurnRunner:
             if emergency_applied:
                 return
         if result:
-            durable_transcript_changed = (
-                compaction_result is None
-                or (
-                    int(getattr(compaction_result, "removed_count", 0) or 0) > 0
-                    and bool(getattr(compaction_result, "summary", "") or "")
-                )
+            durable_transcript_changed = compaction_result is None or (
+                int(getattr(compaction_result, "removed_count", 0) or 0) > 0
+                and bool(getattr(compaction_result, "summary", "") or "")
             )
             if durable_transcript_changed and transcript_snapshot is not None:
                 transcript_snapshot.invalidate()
@@ -13344,12 +13796,7 @@ class TurnRunner:
         """Wait for detached pre-compaction writes for exactly these sessions."""
 
         keys = tuple(
-            sorted(
-                {
-                    canonicalize_session_key(session_key)
-                    for session_key in session_keys
-                }
-            )
+            sorted({canonicalize_session_key(session_key) for session_key in session_keys})
         )
         if not keys:
             return
@@ -13358,12 +13805,7 @@ class TurnRunner:
             pending = {
                 task
                 for session_key in keys
-                if (
-                    task := self._active_pre_compaction_flush_tasks.get(
-                        session_key
-                    )
-                )
-                is not None
+                if (task := self._active_pre_compaction_flush_tasks.get(session_key)) is not None
                 and not task.done()
             }
             pending.update(
@@ -13514,6 +13956,7 @@ class TurnRunner:
             "tool_calls": silent_reply.segments,
             "tool_call_id": getattr(entry, "tool_call_id", None),
             "reasoning_content": getattr(entry, "reasoning_content", None),
+            "assistant_replay": copy.deepcopy(getattr(entry, "assistant_replay", None)),
             "turn_usage": getattr(entry, "turn_usage", None),
             "turn_context": turn_context,
         }
@@ -13528,6 +13971,7 @@ class TurnRunner:
             tool_calls=raw.get("tool_calls"),
             tool_call_id=raw.get("tool_call_id"),
             reasoning_content=raw.get("reasoning_content"),
+            assistant_replay=copy.deepcopy(raw.get("assistant_replay")),
             turn_usage=raw.get("turn_usage"),
             turn_context=raw.get("turn_context"),
         )
@@ -13539,6 +13983,7 @@ class TurnRunner:
         history_window_tokens: int,
         *,
         compaction_id: str,
+        attachment_path_resolver: Callable[[dict[str, Any], str], str | None] | None = None,
         phase: str,
         reason: str,
         protected_recent_messages: int = 0,
@@ -13567,6 +14012,7 @@ class TurnRunner:
                         model=None,
                         api_key="",
                         operation_id=compaction_id,
+                        attachment_path_resolver=attachment_path_resolver,
                         protected_recent_messages=max(
                             0,
                             int(protected_recent_messages or 0),
@@ -13602,11 +14048,7 @@ class TurnRunner:
         kept_entries = [self._emergency_replay_entry(raw) for raw in result.kept_entries]
         if len(kept_entries) >= len(transcript):
             return False
-        summary = (
-            "Emergency request-scoped compaction\n"
-            f"Reason: {reason}\n\n"
-            f"{result.summary}"
-        )
+        summary = f"Emergency request-scoped compaction\nReason: {reason}\n\n{result.summary}"
         self._emergency_compaction_overrides[session_key] = _EmergencyCompactionOverride(
             summary=summary,
             kept_entries=kept_entries,
@@ -13665,6 +14107,233 @@ class TurnRunner:
         )
         return False
 
+    async def _canonical_transcript_for_attachment_replay(
+        self,
+        session_key: str,
+        active_entries: Sequence[Any],
+        *,
+        expected_session_id: str | None = None,
+        expected_session_epoch: int | None = None,
+    ) -> list[Any]:
+        """Read the raw archive only when image replay needs it.
+
+        Ordinary provider history intentionally remains the compacted active
+        tail plus durable summaries. A structured attachment reference may need
+        an image row that compaction moved to ``compacted_transcript_entries``.
+        This helper keeps that recovery read-only and falls back to the active
+        snapshot for older/fake session managers that do not expose the
+        canonical API.
+        """
+
+        exact_owner = _require_optional_exact_session_owner(
+            expected_session_id, expected_session_epoch
+        )
+        manager = self._session_manager
+        getter = getattr(manager, "get_canonical_transcript", None)
+        if not callable(getter):
+            if exact_owner and _has_session_storage(manager):
+                raise RuntimeError("canonical history reader does not support exact ownership")
+            return list(active_entries)
+        getter_kwargs: dict[str, Any] = {}
+        if exact_owner:
+            if all(
+                _accepts_explicit_keyword_arg(getter, name)
+                for name in ("expected_session_id", "expected_session_epoch")
+            ):
+                getter_kwargs["expected_session_id"] = expected_session_id
+                getter_kwargs["expected_session_epoch"] = expected_session_epoch
+            elif _has_session_storage(manager):
+                raise RuntimeError("canonical history reader does not support exact ownership")
+        try:
+            canonical = getter(session_key, **getter_kwargs)
+            if inspect.isawaitable(canonical):
+                canonical = await canonical
+            if canonical:
+                return list(canonical)
+        except Exception as exc:  # noqa: BLE001 - replay must not block a turn
+            if exact_owner and _has_session_storage(manager):
+                raise
+            log.warning(
+                "turn_runner.canonical_attachment_replay_failed",
+                session_key=session_key,
+                error=type(exc).__name__,
+            )
+        return list(active_entries)
+
+    async def _validated_image_attachment_ids(
+        self,
+        session_key: str,
+        candidate_ids: Sequence[str],
+        *,
+        transcript_snapshot: TurnTranscriptSnapshot[Any] | None = None,
+        expected_session_id: str | None = None,
+        expected_session_epoch: int | None = None,
+    ) -> tuple[str, ...]:
+        """Resolve current-input references to image occurrences in this session."""
+
+        exact_owner = _require_optional_exact_session_owner(
+            expected_session_id, expected_session_epoch
+        )
+        if not candidate_ids or self._session_manager is None:
+            return ()
+        try:
+            if transcript_snapshot is not None:
+                active_entries = list(await transcript_snapshot.get_entries())
+            else:
+                get_transcript = self._session_manager.get_transcript
+                getter_kwargs: dict[str, Any] = {}
+                if exact_owner:
+                    if all(
+                        _accepts_explicit_keyword_arg(get_transcript, name)
+                        for name in ("expected_session_id", "expected_session_epoch")
+                    ):
+                        getter_kwargs["expected_session_id"] = expected_session_id
+                        getter_kwargs["expected_session_epoch"] = expected_session_epoch
+                    elif _has_session_storage(self._session_manager):
+                        raise RuntimeError(
+                            "session history reader does not support exact ownership"
+                        )
+                active_entries = list(await get_transcript(session_key, **getter_kwargs))
+            canonical_entries = await self._canonical_transcript_for_attachment_replay(
+                session_key,
+                active_entries,
+                expected_session_id=expected_session_id,
+                expected_session_epoch=expected_session_epoch,
+            )
+            session_id = (
+                expected_session_id
+                if exact_owner
+                else await self._resolve_session_id_for_log(session_key)
+            )
+            if not session_id:
+                return ()
+            from opensquilla.session.attachment_manifest import build_attachment_manifest
+
+            manifest = build_attachment_manifest(
+                canonical_entries,
+                session_id=session_id,
+                session_key=session_key,
+            )
+            by_id = {
+                occurrence.attachment_id: occurrence
+                for occurrence in manifest.occurrences
+            }
+            return tuple(
+                attachment_id
+                for attachment_id in candidate_ids
+                if attachment_id in by_id
+                and str(by_id[attachment_id].mime).lower().startswith("image/")
+            )
+        except Exception as exc:  # noqa: BLE001 - an unverified ID stays text-only
+            if exact_owner and _has_session_storage(self._session_manager):
+                raise
+            log.debug(
+                "turn_runner.image_attachment_reference_unverified",
+                session_key=session_key,
+                error=type(exc).__name__,
+            )
+            return ()
+
+    async def _persist_attachment_manifest_best_effort(
+        self,
+        session_key: str,
+        entries: Sequence[Any],
+        *,
+        expected_session_id: str | None = None,
+        expected_session_epoch: int | None = None,
+    ) -> None:
+        """Lazily backfill the portable attachment index for this session.
+
+        Older sessions have no manifest row.  Building it on the first replay
+        read keeps migration online and lets later compaction commits merge the
+        same metadata atomically.  Equality is checked against the newest
+        valid row so ordinary turns do not append unbounded duplicate states.
+        """
+
+        exact_owner = _require_optional_exact_session_owner(
+            expected_session_id, expected_session_epoch
+        )
+        manager = self._session_manager
+        saver = getattr(manager, "save_context_state", None)
+        getter = getattr(manager, "get_context_states", None)
+        if not callable(saver) or not callable(getter) or not entries:
+            return
+        owner_kwargs: dict[str, Any] = {}
+        if exact_owner:
+            if all(
+                _accepts_explicit_keyword_arg(method, name)
+                for method in (getter, saver)
+                for name in ("expected_session_id", "expected_session_epoch")
+            ):
+                owner_kwargs["expected_session_id"] = expected_session_id
+                owner_kwargs["expected_session_epoch"] = expected_session_epoch
+            elif _has_session_storage(manager):
+                raise RuntimeError("attachment manifest storage does not support exact ownership")
+        try:
+            from opensquilla.session.attachment_manifest import (
+                ATTACHMENT_MANIFEST_PROVIDER,
+                ATTACHMENT_MANIFEST_STATE_KIND,
+                AttachmentManifestError,
+                attachment_manifest_from_context_state,
+                build_attachment_manifest,
+                manifest_context_state,
+            )
+
+            session_id = (
+                expected_session_id
+                if exact_owner
+                else await self._resolve_session_id_for_log(session_key)
+            )
+            if not session_id:
+                return
+            manifest = build_attachment_manifest(
+                entries,
+                session_id=session_id,
+                session_key=session_key,
+            )
+            if not manifest.occurrences:
+                return
+            states = await getter(
+                session_key,
+                provider=ATTACHMENT_MANIFEST_PROVIDER,
+                state_kind=ATTACHMENT_MANIFEST_STATE_KIND,
+                **owner_kwargs,
+            )
+            latest = None
+            for state in sorted(
+                states or [],
+                key=lambda item: (
+                    int(getattr(item, "created_at", 0) or 0),
+                    int(getattr(item, "id", 0) or 0),
+                ),
+                reverse=True,
+            ):
+                try:
+                    latest = attachment_manifest_from_context_state(state)
+                    break
+                except (AttachmentManifestError, TypeError, ValueError):
+                    continue
+            if latest is not None:
+                manifest = latest.merge(
+                    manifest.occurrences,
+                    covered_through_id=manifest.covered_through_id,
+                )
+            if (
+                latest is not None
+                and latest.occurrences == manifest.occurrences
+                and latest.covered_through_id == manifest.covered_through_id
+            ):
+                return
+            await saver(manifest_context_state(manifest), **owner_kwargs)
+        except Exception as exc:  # noqa: BLE001 - manifest is additive
+            if exact_owner and _has_session_storage(manager):
+                raise
+            log.debug(
+                "turn_runner.attachment_manifest_persist_skipped",
+                session_key=session_key,
+                error=type(exc).__name__,
+            )
+
     async def _load_history(
         self,
         agent: Agent,
@@ -13672,7 +14341,6 @@ class TurnRunner:
         *,
         trim_last_user: bool = True,
         bound_user_message_id: str | None = None,
-        restricted_turn: bool = False,
         transcript_snapshot: TurnTranscriptSnapshot[Any] | None = None,
         expected_session_id: str | None = None,
         expected_session_epoch: int | None = None,
@@ -13690,6 +14358,7 @@ class TurnRunner:
         assistant replies. When the id is absent or not found, fall back to the
         positional trim.
         """
+        agent.set_request_image_context([])
         if self._session_manager is None:
             return None
 
@@ -13718,17 +14387,14 @@ class TurnRunner:
                     transcript_kwargs["expected_session_epoch"] = expected_session_epoch
             transcript = await get_transcript(session_key, **transcript_kwargs)
 
-        from opensquilla.provider import Message
+        from opensquilla.engine.history import reconstruct_messages_from_entry
+        from opensquilla.provider.types import ContentBlockImage, ContentBlockText
 
         history: list[Message] = []
         summary_markers: list[str] = []
         exact_owner = expected_session_id is not None or expected_session_epoch is not None
         emergency_overrides = getattr(self, "_emergency_compaction_overrides", {})
-        emergency_override = (
-            None
-            if restricted_turn
-            else emergency_overrides.pop(session_key, None)
-        )
+        emergency_override = emergency_overrides.pop(session_key, None)
         if emergency_override is not None:
             override_has_owner = (
                 emergency_override.expected_session_id is not None
@@ -13771,10 +14437,120 @@ class TurnRunner:
                     transcript_len=len(transcript),
                 )
         bound_slice_applied = bool(bound_skip_indexes)
-        model_caps = getattr(getattr(agent, "config", None), "model_capabilities", None)
+        agent_config = getattr(agent, "config", None)
+        metadata = getattr(agent_config, "metadata", {})
+        if not isinstance(metadata, Mapping):
+            metadata = {}
+        # Keep active canonical pictures independent of prose and model capability.
+        # Only physical dispatch may downgrade them to unsupported-model markers.
         preserve_image_history = bool(
-            getattr(getattr(agent, "config", None), "preserve_historical_images", False)
-            and getattr(model_caps, "supports_vision", False)
+            getattr(agent_config, "preserve_historical_images", True)
+        )
+        current_attachment_count = _non_negative_int(metadata.get("attachment_count"))
+
+        requested_attachment_id_list: list[str] = []
+        seen_requested_attachment_ids: set[str] = set()
+        for key in (
+            "image_attachment_ids",
+            "image_intent_attachment_ids",
+            "attachment_ids",
+        ):
+            if key == "image_attachment_ids" and current_attachment_count > 0:
+                continue
+            raw_ids = metadata.get(key)
+            if isinstance(raw_ids, str):
+                values: Sequence[Any] = (raw_ids,)
+            elif isinstance(raw_ids, Sequence) and not isinstance(
+                raw_ids, (bytes, bytearray)
+            ):
+                values = raw_ids
+            else:
+                continue
+            for value in values:
+                if not isinstance(value, str) or not value.strip():
+                    continue
+                normalized_id = value.strip()[:164]
+                if normalized_id in seen_requested_attachment_ids:
+                    continue
+                seen_requested_attachment_ids.add(normalized_id)
+                requested_attachment_id_list.append(normalized_id)
+        requested_attachment_ids = tuple(requested_attachment_id_list)
+        requested_image_id_filter = (
+            frozenset(requested_attachment_ids)
+            if requested_attachment_ids
+            else None
+        )
+
+        # A queued/retried task may keep the original persisted user-message
+        # id while the client sends no attachment bytes on the second
+        # execution (for example after changing to a vision model).  Treat it
+        # as an attachment replay only when that exact persisted row is an
+        # image envelope; every ordinary bound text turn also has zero current
+        # attachments and must not pull unrelated archived images into scope.
+        bound_attachment_replay_candidate = bool(
+            bound_user_message_id and current_attachment_count == 0
+        )
+        bound_row_has_image: bool | None = None
+        if bound_attachment_replay_candidate:
+            for entry in transcript:
+                if (
+                    getattr(entry, "role", None) == "user"
+                    and str(getattr(entry, "message_id", "") or "")
+                    == bound_user_message_id
+                ):
+                    bound_row_has_image = self._attachment_envelope_has_image(
+                        str(getattr(entry, "content", "") or "")
+                    )
+                    break
+
+        # Only a structured reference or a bound retry reloads archived bytes.
+        # Active context alone must not undo compaction by pulling in the archive.
+        independent_replay_signal = bool(requested_attachment_ids)
+        canonical_lookup_required = bool(
+            independent_replay_signal
+            or (
+                bound_attachment_replay_candidate
+                and bound_row_has_image is None
+            )
+        )
+        canonical_transcript = (
+            await self._canonical_transcript_for_attachment_replay(
+                session_key,
+                transcript,
+                expected_session_id=expected_session_id,
+                expected_session_epoch=expected_session_epoch,
+            )
+            if canonical_lookup_required
+            else list(transcript)
+        )
+        if bound_attachment_replay_candidate and bound_row_has_image is None:
+            bound_row_has_image = any(
+                getattr(entry, "role", None) == "user"
+                and str(getattr(entry, "message_id", "") or "")
+                == bound_user_message_id
+                and self._attachment_envelope_has_image(
+                    str(getattr(entry, "content", "") or "")
+                )
+                for entry in canonical_transcript
+            )
+        bound_attachment_replay_requested = bool(
+            bound_attachment_replay_candidate and bound_row_has_image is True
+        )
+        replay_signal = bool(
+            preserve_image_history or independent_replay_signal or bound_attachment_replay_requested
+        )
+        replay_selected_images = replay_signal
+        if replay_selected_images and agent_config is not None:
+            # Agent performs a final history sanitation pass immediately
+            # before provider projection.  Carry the resolved image intent to
+            # that pass so an explicitly rehydrated canonical image is not
+            # downgraded a second time.
+            agent_config.preserve_historical_images = True
+        await self._persist_attachment_manifest_best_effort(
+            session_key,
+            canonical_transcript,
+            expected_session_id=expected_session_id,
+            expected_session_epoch=expected_session_epoch,
         )
         workspace_dir = getattr(getattr(agent, "config", None), "workspace_dir", None)
         materialize_historical_attachments = bool(
@@ -13785,17 +14561,12 @@ class TurnRunner:
             )
             and workspace_dir
         )
-        lookback = int(
-            getattr(
-                getattr(self._turn_config(), "squilla_router", None),
-                "vision_history_lookback_turns",
-                3,
-            )
-            or 0
-        )
         image_replay_entry_indexes: set[int] = set()
+        request_image_replay_entries: list[Any] = []
+        bound_image_replay_entries: list[Any] = []
+        requested_source_message_ids: set[str] = set()
         image_replay_session_id: str | None = None
-        if preserve_image_history and lookback > 0:
+        if replay_signal:
             current_user_entry_index = bound_index
             if current_user_entry_index is None:
                 current_user_entry_index = (
@@ -13814,23 +14585,146 @@ class TurnRunner:
                 and isinstance(getattr(entry, "content", None), str)
                 and bool(str(getattr(entry, "content", "")).strip())
             ]
-            image_replay_entry_indexes = set(user_entry_indexes[-lookback:])
+            if preserve_image_history:
+                image_replay_entry_indexes = set(user_entry_indexes)
             image_replay_session_id = expected_session_id
             if image_replay_session_id is None:
                 image_replay_session_id = await self._resolve_session_id_for_log(session_key)
             if image_replay_session_id is None:
                 image_replay_session_id = session_key
+
+            if bound_attachment_replay_requested:
+                bound_image_replay_entries = [
+                    entry
+                    for entry in canonical_transcript
+                    if getattr(entry, "role", None) == "user"
+                    and str(getattr(entry, "message_id", "") or "")
+                    == bound_user_message_id
+                    and self._attachment_envelope_has_image(
+                        str(getattr(entry, "content", "") or "")
+                    )
+                ][:1]
+            # The id-bound prompt and later queued user prompts are never
+            # historical replay candidates. On the simple path exclude the
+            # final active user row, matching the normal trim behavior.
+            excluded_canonical_message_ids: set[str] = set()
+            if bound_user_message_id:
+                bound_found = False
+                for entry in canonical_transcript:
+                    message_id = str(getattr(entry, "message_id", "") or "")
+                    if getattr(entry, "role", None) != "user":
+                        continue
+                    if message_id == bound_user_message_id:
+                        bound_found = True
+                    if bound_found and message_id:
+                        excluded_canonical_message_ids.add(message_id)
+            elif trim_last_user:
+                for entry in reversed(canonical_transcript):
+                    if getattr(entry, "role", None) == "user":
+                        message_id = str(getattr(entry, "message_id", "") or "")
+                        if message_id:
+                            excluded_canonical_message_ids.add(message_id)
+                        break
+
+            candidate_entries: list[Any] = []
+            if requested_attachment_ids:
+                try:
+                    from opensquilla.session.attachment_manifest import (
+                        build_attachment_manifest,
+                    )
+
+                    requested_manifest = build_attachment_manifest(
+                        canonical_transcript,
+                        session_id=image_replay_session_id or session_key,
+                        session_key=session_key,
+                    )
+                    requested_source_message_ids = {
+                        occurrence.source_message_id
+                        for occurrence in requested_manifest.by_ids(
+                            requested_attachment_ids
+                        )
+                    }
+                except Exception:  # noqa: BLE001 - raw envelope IDs still work
+                    requested_source_message_ids = set()
+                explicit_matches: list[Any] = []
+                for entry in canonical_transcript:
+                    if getattr(entry, "role", None) != "user":
+                        continue
+                    if (
+                        str(getattr(entry, "message_id", "") or "")
+                        in excluded_canonical_message_ids
+                    ):
+                        continue
+                    entry_message_id = str(
+                        getattr(entry, "message_id", "") or ""
+                    )
+                    if (
+                        entry_message_id in requested_source_message_ids
+                        or self._attachment_envelope_contains_ids(
+                            str(getattr(entry, "content", "") or ""),
+                            requested_attachment_ids,
+                        )
+                    ):
+                        explicit_matches.append(entry)
+                        if entry_message_id:
+                            requested_source_message_ids.add(entry_message_id)
+                candidate_entries = explicit_matches
+                if replay_selected_images and requested_source_message_ids:
+                    image_replay_entry_indexes.update(
+                        index
+                        for index, entry in enumerate(transcript)
+                        if str(getattr(entry, "message_id", "") or "")
+                        in requested_source_message_ids
+                    )
+            active_message_ids = {
+                str(getattr(entry, "message_id", "") or "")
+                for entry in transcript
+                if getattr(entry, "message_id", None)
+            }
+            replayed_active_message_ids = {
+                str(getattr(transcript[index], "message_id", "") or "")
+                for index in image_replay_entry_indexes
+            }
+            request_image_replay_entries = [
+                entry
+                for entry in candidate_entries
+                if requested_attachment_ids
+                or str(getattr(entry, "message_id", "") or "") not in active_message_ids
+                or str(getattr(entry, "message_id", "") or "") in replayed_active_message_ids
+            ]
+            # Requested attachments are injected after ordinary history is
+            # limited. Do not also send their bytes from an active raw row.
+            request_image_message_ids = {
+                str(getattr(entry, "message_id", "") or "")
+                for entry in request_image_replay_entries
+            }
+            image_replay_entry_indexes.difference_update(
+                index
+                for index, entry in enumerate(transcript)
+                if str(getattr(entry, "message_id", "") or "")
+                in request_image_message_ids
+            )
         attachment_replay_session_id = image_replay_session_id
-        if attachment_replay_session_id is None and materialize_historical_attachments:
+        history_has_image_envelope = any(
+            getattr(entry, "role", None) == "user"
+            and self._attachment_envelope_has_image(
+                str(getattr(entry, "content", "") or "")
+            )
+            for entry in transcript
+        )
+        if attachment_replay_session_id is None and (
+            materialize_historical_attachments or history_has_image_envelope
+        ):
             attachment_replay_session_id = expected_session_id
             if attachment_replay_session_id is None:
-                attachment_replay_session_id = await self._resolve_session_id_for_log(
-                    session_key
-                )
+                attachment_replay_session_id = await self._resolve_session_id_for_log(session_key)
             if attachment_replay_session_id is None:
                 attachment_replay_session_id = session_key
         history_materializer: AttachmentWorkspaceMaterializer | None = None
         if materialize_historical_attachments and workspace_dir and attachment_replay_session_id:
+            from opensquilla.tools.write_policy import attachment_workspace_write_authorizer
+
+            history_tool_context = getattr(agent, "_tool_context", None)
             # One instance per history load so first-materialization replays
             # pay for a single workspace-tree budget scan, not one per entry.
             history_materializer = AttachmentWorkspaceMaterializer(
@@ -13838,11 +14732,14 @@ class TurnRunner:
                 workspace_dir=workspace_dir,
                 materializable_mimes=None,
                 disk_budget_bytes=workspace_attachment_budget_from_config(self._config),
+                authorize_write=(
+                    attachment_workspace_write_authorizer(history_tool_context)
+                    if history_tool_context is not None else None
+                ),
             )
         # For a durable exact-owner turn, validate the owner before replay can
         # materialize transcript attachments into the shared workspace.  The
-        # same read is reused below for provider context; restricted turns
-        # intentionally omit its contents but still need the ownership fence.
+        # same read is reused below for provider context.
         context_states = (
             await self._load_context_states(
                 session_key,
@@ -13860,22 +14757,115 @@ class TurnRunner:
             image_replay_entry_indexes=image_replay_entry_indexes,
             media_root=self._attachment_media_root(),
             session_id=attachment_replay_session_id,
+            allowed_image_attachment_ids=requested_image_id_filter,
             materialize_historical_attachments=materialize_historical_attachments,
             workspace_dir=workspace_dir,
             historical_materializer=history_materializer,
-            restricted_turn=restricted_turn,
         )
         history = list(replay.messages)
+        if attachment_replay_session_id:
+            retain_history_material = getattr(
+                getattr(self._turn_config(), "attachments", None), "persist_transcripts", True,
+            ) is not False
+            self._restore_retained_history_image_paths(
+                history,
+                history_materializer if retain_history_material else None,
+                attachment_replay_session_id,
+            )
         summary_markers.extend(replay.legacy_summary_markers)
-        if restricted_turn:
-            # Context states, durable summaries, and legacy summary markers
-            # were produced before this turn's restricted provider projection.
-            # Their plain-text bodies may contain historical tool arguments or
-            # local paths, so omit them from this one provider view. Persisted
-            # state remains untouched for ordinary future turns.
-            if history:
-                agent.set_history(history)
-            return None
+
+        # Image selection belongs to this request, even when its source row
+        # lives in the archive or outside the ordinary history window. Bind
+        # only attachment content as protected input; do not replay old user
+        # instructions as new instructions alongside it.
+        request_image_context: list[Message] = []
+        if request_image_replay_entries:
+            for entry in request_image_replay_entries:
+                raw_content = str(getattr(entry, "content", "") or "")
+                if not raw_content:
+                    continue
+                replay_content = self._maybe_unpack_attachments(
+                    raw_content,
+                    persist_image_material=(
+                        getattr(
+                            getattr(self._turn_config(), "attachments", None),
+                            "persist_transcripts", True,
+                        ) is not False
+                    ),
+                    preserve_image_attachments=replay_selected_images,
+                    allowed_image_attachment_ids=requested_image_id_filter,
+                    materialize_historical_attachments=materialize_historical_attachments,
+                    media_root=self._attachment_media_root(),
+                    session_id=attachment_replay_session_id,
+                    workspace_dir=workspace_dir,
+                    historical_materializer=history_materializer,
+                    source_message_id=getattr(entry, "message_id", None),
+                    include_envelope_text=False,
+                )
+                request_image_context.extend(
+                    reconstruct_messages_from_entry(
+                        "user",
+                        replay_content,
+                        None,
+                        None,
+                    )
+                )
+        if bound_image_replay_entries:
+            # The caller re-appends the bound prompt text, so inject only its
+            # attachment projection here.  This works for both active and
+            # compacted rows and avoids duplicating the user instruction.
+            bound_attachment_history: list[Message] = []
+            for entry in bound_image_replay_entries:
+                replay_content = self._maybe_unpack_attachments(
+                    str(getattr(entry, "content", "") or ""),
+                    persist_image_material=(
+                        getattr(
+                            getattr(self._turn_config(), "attachments", None),
+                            "persist_transcripts", True,
+                        ) is not False
+                    ),
+                    preserve_image_attachments=True,
+                    materialize_historical_attachments=(
+                        materialize_historical_attachments
+                    ),
+                    media_root=self._attachment_media_root(),
+                    session_id=attachment_replay_session_id,
+                    workspace_dir=workspace_dir,
+                    historical_materializer=history_materializer,
+                    source_message_id=getattr(entry, "message_id", None),
+                    include_envelope_text=False,
+                )
+                if replay_content:
+                    bound_attachment_history.extend(
+                        reconstruct_messages_from_entry(
+                            "user",
+                            replay_content,
+                            None,
+                            None,
+                        )
+                    )
+            if bound_attachment_history:
+                request_image_context.extend(bound_attachment_history)
+        for replay_message in request_image_context:
+            if isinstance(replay_message.content, list) and any(
+                isinstance(block, ContentBlockImage) for block in replay_message.content
+            ):
+                # This note belongs only to the request-local projection. A
+                # later text fallback may replace the blocks with markers.
+                replay_message.content = [
+                    ContentBlockText(
+                        text=(
+                            "Image replay context for this request: native image blocks below "
+                            "are preserved originals reattached from earlier conversation turns; "
+                            "no new upload is required. Determine current image availability "
+                            "from these blocks or their fallback markers, not prior assistant "
+                            "claims that an image was not analyzed."
+                        )
+                    ),
+                    *replay_message.content,
+                ]
+                break
+        agent.set_request_image_context(request_image_context)
         if not exact_owner:
             context_states = await self._load_context_states(session_key)
         provider = getattr(agent, "provider", None)
@@ -14009,9 +14999,7 @@ class TurnRunner:
                 )
             )
             replay_compaction_id = (
-                replayed_compaction_ids[0]
-                if replayed_compaction_ids
-                else new_compaction_id()
+                replayed_compaction_ids[0] if replayed_compaction_ids else new_compaction_id()
             )
             notify_compaction(
                 session_key,
@@ -14057,26 +15045,248 @@ class TurnRunner:
         return False
 
     @staticmethod
+    def _attachment_envelope_contains_ids(
+        content: str,
+        attachment_ids: Sequence[str],
+    ) -> bool:
+        """Return whether an envelope names one of the requested occurrences."""
+
+        if not content or not content.lstrip().startswith("{"):
+            return False
+        try:
+            parsed = json.loads(content)
+        except (json.JSONDecodeError, ValueError):
+            return False
+        if not isinstance(parsed, dict):
+            return False
+        wanted = {value.strip() for value in attachment_ids if value.strip()}
+        if not wanted:
+            return False
+        atts = parsed.get("attachments") or []
+        if not isinstance(atts, list):
+            return False
+        return any(
+            isinstance(att, dict)
+            and isinstance(att.get("attachment_id"), str)
+            and att["attachment_id"].strip() in wanted
+            for att in atts
+        )
+
+    @staticmethod
+    def _attachment_ids_from_resource_refs(
+        attachments: Sequence[Mapping[str, Any]],
+    ) -> tuple[str, ...]:
+        """Read canonical attachment IDs from structured resource references."""
+
+        from opensquilla.session.attachment_manifest import valid_attachment_id
+
+        result: list[str] = []
+        seen: set[str] = set()
+        for attachment in attachments:
+            if not isinstance(attachment, Mapping):
+                continue
+            for key in ("resourceRef", "resource_ref", "resource"):
+                raw_ref = attachment.get(key)
+                if not isinstance(raw_ref, Mapping):
+                    continue
+                resource_type = str(
+                    raw_ref.get("type") or raw_ref.get("resource_type") or ""
+                ).strip().lower()
+                if resource_type != "attachment":
+                    continue
+                attachment_id = valid_attachment_id(
+                    raw_ref.get("id") or raw_ref.get("resource_id")
+                )
+                if attachment_id is None or attachment_id in seen:
+                    continue
+                seen.add(attachment_id)
+                result.append(attachment_id)
+        return tuple(result)
+
+    @staticmethod
+    def _image_retention_from_envelope(content: str) -> bool | None:
+        """Confirm current-upload retention from saved material, not logical IDs.
+
+        A mixed or incomplete envelope has no shared retention fact. Its
+        current-upload markers stay conservative instead of promising replay.
+        """
+
+        try:
+            parsed = json.loads(content)
+        except (json.JSONDecodeError, ValueError):
+            return None
+        attachments = parsed.get("attachments") if isinstance(parsed, dict) else None
+        if not isinstance(attachments, list):
+            return None
+        retention: list[bool | None] = []
+        for attachment in attachments:
+            if not isinstance(attachment, dict):
+                continue
+            mime = (
+                attachment.get("type")
+                or attachment.get("mime")
+                or attachment.get("media_type")
+            )
+            if not isinstance(mime, str) or not mime.startswith("image/"):
+                continue
+            if attachment.get("missing_reason"):
+                retention.append(False)
+            elif any(
+                isinstance(attachment.get(key), str) and attachment[key]
+                for key in ("data", "sha256_ref")
+            ):
+                retention.append(True)
+            else:
+                retention.append(None)
+        if retention and all(value is retention[0] for value in retention):
+            return retention[0]
+        return None
+
+    @staticmethod
+    def _attachment_ids_from_envelope(
+        content: str,
+        *,
+        image_only: bool = False,
+    ) -> tuple[str, ...]:
+        """Read bounded logical IDs from a persisted attachment envelope."""
+
+        if not content or not content.lstrip().startswith("{"):
+            return ()
+        try:
+            parsed = json.loads(content)
+        except (json.JSONDecodeError, ValueError):
+            return ()
+        if not isinstance(parsed, dict):
+            return ()
+        attachments = parsed.get("attachments")
+        if not isinstance(attachments, list):
+            return ()
+        from opensquilla.session.attachment_manifest import valid_attachment_id
+
+        result: list[str] = []
+        for attachment in attachments:
+            if not isinstance(attachment, dict):
+                continue
+            if image_only:
+                media_type = (
+                    attachment.get("type")
+                    or attachment.get("mime")
+                    or attachment.get("media_type")
+                )
+                if not (
+                    isinstance(media_type, str)
+                    and media_type.startswith("image/")
+                ):
+                    continue
+            attachment_id = valid_attachment_id(attachment.get("attachment_id"))
+            if attachment_id is not None:
+                result.append(attachment_id)
+        return tuple(result)
+
+    @staticmethod
+    def _restore_retained_history_image_paths(
+        messages: list[Message],
+        materializer: AttachmentWorkspaceMaterializer | None,
+        session_id: str,
+    ) -> None:
+        """Rebind retained tool images to this session without rewriting unchanged replay."""
+
+        from opensquilla.attachment_workspace import _safe_path_segment
+        from opensquilla.provider.types import ContentBlockImage, ContentBlockToolResult
+
+        current_path_prefix = (
+            ".opensquilla", "attachments", _safe_path_segment(session_id, fallback="session"),
+        )
+        for message in messages:
+            if not isinstance(message.content, list):
+                continue
+            paths: dict[tuple[str, str | None], str | None] = {}
+            blocks = list(message.content)
+            for index, block in enumerate(blocks):
+                if not (
+                    isinstance(block, ContentBlockImage)
+                    and block.source_type == "base64"
+                    and block.durable_retained is True
+                    and block.local_path
+                    and block.name
+                ):
+                    continue
+                path = (
+                    materializer.materialize_image_path(
+                        {"mime": block.media_type, "data": block.data, "name": block.name},
+                        session_id,
+                    ) if materializer is not None else None
+                )
+                if path and path != block.local_path:
+                    paths[(block.local_path, block.source_url)] = path
+                    blocks[index] = block.model_copy(update={"local_path": path})
+                elif not path and Path(block.local_path).parts[:3] != current_path_prefix:
+                    paths[(block.local_path, block.source_url)] = None
+                    blocks[index] = block.model_copy(update={"local_path": None})
+            if not paths:
+                continue
+            for index, block in enumerate(blocks):
+                if not isinstance(block, ContentBlockToolResult) or not isinstance(
+                    block.content, str,
+                ):
+                    continue
+                try:
+                    receipt = json.loads(block.content)
+                except (ValueError, TypeError):
+                    continue
+                if not isinstance(receipt, dict):
+                    continue
+                local_path, source_url = receipt.get("local_path"), receipt.get("source_url")
+                if not isinstance(local_path, str) or not (
+                    source_url is None or isinstance(source_url, str)
+                ):
+                    continue
+                identity = (local_path, source_url)
+                if identity not in paths:
+                    continue
+                path = paths[identity]
+                if path:
+                    receipt["local_path"] = path
+                else:
+                    receipt.pop("local_path", None)
+                    receipt["retention_note"] = (
+                        "No readable local copy is available in this session; "
+                        "the image remains included in this tool result."
+                    )
+                blocks[index] = block.model_copy(update={"content": json.dumps(receipt)})
+            message.content = blocks
+
+    @staticmethod
+    def _image_attachment_material_marker(name: Any, mime: str, path: str) -> str:
+        """Keep the model-visible reference stable when an upload enters history."""
+
+        label = _sanitize_attachment_filename(name)
+        return f"[attachment available: {label} ({mime}) at {path}]"
+
+    @staticmethod
     def _maybe_unpack_attachments(
         content: str,
         *,
         preserve_image_attachments: bool = False,
+        allowed_image_attachment_ids: frozenset[str] | None = None,
         materialize_historical_attachments: bool = False,
         media_root: Path | None = None,
         session_id: str | None = None,
         workspace_dir: str | Path | None = None,
         workspace_attachment_budget_bytes: int | None = None,
         historical_materializer: AttachmentWorkspaceMaterializer | None = None,
+        source_message_id: str | None = None,
+        include_envelope_text: bool = True,
+        persist_image_material: bool = True,
     ) -> Any:
-        """Reduce persisted attachment envelopes to text-only history.
+        """Replay active images and expose retained attachments through workspace paths.
 
         User messages with attachments are persisted as a JSON envelope
         ``{"text": "...", "attachments": [{"type": "image/png", "data": "<b64>"}...]}``
         in ``transcript_entries.content`` (see rpc_sessions._persist_user_message).
-        Historical images are text markers by default so text routes do not
-        replay old image blocks to providers that cannot consume them. When the
-        caller has already selected a vision model, a bounded recent window can
-        be hydrated back into image blocks.
+        Active images retain their original position until compaction. Retained
+        paths let the main model read the material again when needed. Provider
+        capability projection happens separately at the request boundary.
 
         Returns the original string for non-envelope content so non-attachment
         history (assistant text, tool results) is unaffected. On any parse error,
@@ -14114,6 +15324,23 @@ class TurnRunner:
         omitted: list[str] = []
         replay_blocks: list[Any] = []
         preserved_image = False
+        occurrence_ids: dict[int, str] = {}
+        attachment_identity_session_id = session_id or "history"
+        try:
+            from opensquilla.session.attachment_manifest import (
+                extract_attachment_occurrences_from_envelope,
+            )
+
+            occurrence_ids = {
+                occurrence.ordinal: occurrence.attachment_id
+                for occurrence in extract_attachment_occurrences_from_envelope(
+                    content,
+                    session_id=attachment_identity_session_id,
+                    source_message_id=source_message_id or "unknown",
+                )
+            }
+        except (TypeError, ValueError):
+            occurrence_ids = {}
         if not materialize_historical_attachments:
             historical_materializer = None
         elif historical_materializer is None and session_id and workspace_dir:
@@ -14126,19 +15353,19 @@ class TurnRunner:
                 materializable_mimes=None,
                 disk_budget_bytes=workspace_attachment_budget_bytes,
             )
-        if preserve_image_attachments and text:
+        if preserve_image_attachments and include_envelope_text:
             from opensquilla.provider.types import ContentBlockText
 
             replay_blocks.append(ContentBlockText(text=text))
-        for att in atts:
+        for ordinal, att in enumerate(atts):
             if not isinstance(att, dict):
                 continue
             media_type = att.get("type") or att.get("mime") or att.get("media_type")
             if not isinstance(media_type, str):
                 continue
             # Persisted attachment envelope: ``sha256_ref`` indicates the bytes live on
-            # disk under media/transcripts/<session>/<sha>. Text routes keep
-            # a marker; vision routes may replay a bounded recent image window.
+            # disk under media/transcripts/<session>/<sha>. Capability projection
+            # may omit pixels later without changing this canonical history.
             data = att.get("data")
             sha_ref = att.get("sha256_ref")
             missing_reason = att.get("missing_reason")
@@ -14151,18 +15378,88 @@ class TurnRunner:
             name = att.get("name")
             fallback = "image" if media_type.startswith("image/") else "attachment"
             label = name if isinstance(name, str) and name.strip() else fallback
-            if preserve_image_attachments and media_type in _IMAGE_ATTACHMENT_MIMES:
-                from opensquilla.provider.types import ContentBlockImage
+            attachment_id = occurrence_ids.get(ordinal)
+            if attachment_id is None:
+                # Keep legacy IDs deterministic when an old envelope omitted
+                # them. This is metadata-only; no bytes or paths enter the
+                # marker or persisted state.
+                try:
+                    from opensquilla.session.attachment_manifest import legacy_attachment_id
+
+                    attachment_id = legacy_attachment_id(
+                        session_id=attachment_identity_session_id,
+                        message_id=source_message_id or "unknown",
+                        index=ordinal,
+                        sha256=(sha_ref if isinstance(sha_ref, str) else None),
+                    )
+                except Exception:  # noqa: BLE001 - marker identity is advisory
+                    attachment_id = None
+            image_material_marker = ""
+            if (
+                historical_materializer is not None
+                and session_id
+                and persist_image_material
+                and media_type in _IMAGE_ATTACHMENT_MIMES
+            ):
+                image_path = historical_materializer.materialize_image_path(att, session_id)
+                if image_path:
+                    image_material_marker = TurnRunner._image_attachment_material_marker(
+                        name, media_type, image_path,
+                    )
+            image_replay_allowed = (
+                allowed_image_attachment_ids is None
+                or attachment_id in allowed_image_attachment_ids
+            )
+            if (
+                preserve_image_attachments
+                and image_replay_allowed
+                and media_type in _IMAGE_ATTACHMENT_MIMES
+            ):
+                from opensquilla.provider.types import ContentBlockImage, ContentBlockText
 
                 if isinstance(data, str) and data:
                     try:
-                        base64.b64decode(data, validate=True)
+                        raw_bytes = base64.b64decode(data, validate=True)
                     except (binascii.Error, ValueError):
-                        omitted.append(f"[attachment unavailable: {label} ({media_type})]")
-                    else:
-                        replay_blocks.append(
-                            ContentBlockImage(media_type=media_type, data=data)
+                        omitted.append(
+                            image_marker(
+                                ImageMarkerState.UNAVAILABLE,
+                                attachment_id=attachment_id,
+                            )
                         )
+                    else:
+                        if not _historical_image_bytes_match_claim(media_type, raw_bytes):
+                            omitted.append(
+                                image_marker(
+                                    ImageMarkerState.UNAVAILABLE,
+                                    attachment_id=attachment_id,
+                                )
+                            )
+                            continue
+                        if (
+                            allowed_image_attachment_ids is not None
+                            and attachment_id is not None
+                        ):
+                            from opensquilla.provider.types import ContentBlockText
+
+                            replay_blocks.append(
+                                ContentBlockText(
+                                    text=(
+                                        "[historical image "
+                                        f"attachment_id={attachment_id}]"
+                                    )
+                                )
+                            )
+                        replay_blocks.append(
+                            ContentBlockImage(
+                                media_type=media_type,
+                                data=data,
+                                attachment_id=attachment_id,
+                                durable_retained=True,
+                            )
+                        )
+                        if image_material_marker:
+                            replay_blocks.append(ContentBlockText(text=image_material_marker))
                         preserved_image = True
                     continue
                 if isinstance(sha_ref, str) and sha_ref and media_root and session_id:
@@ -14178,21 +15475,53 @@ class TurnRunner:
                     )
                     try:
                         raw_bytes = read_attachment_ref_bytes(ref, media_root=media_root)
-                    except (FileNotFoundError, ValueError) as exc:
-                        omitted.append(f"[attachment unavailable: {label}: {exc}]")
+                    except (FileNotFoundError, ValueError):
+                        omitted.append(
+                            image_marker(
+                                ImageMarkerState.UNAVAILABLE,
+                                attachment_id=attachment_id,
+                            )
+                        )
                     else:
+                        if not _historical_image_bytes_match_claim(media_type, raw_bytes):
+                            omitted.append(
+                                image_marker(
+                                    ImageMarkerState.UNAVAILABLE,
+                                    attachment_id=attachment_id,
+                                )
+                            )
+                            continue
+                        if (
+                            allowed_image_attachment_ids is not None
+                            and attachment_id is not None
+                        ):
+                            from opensquilla.provider.types import ContentBlockText
+
+                            replay_blocks.append(
+                                ContentBlockText(
+                                    text=(
+                                        "[historical image "
+                                        f"attachment_id={attachment_id}]"
+                                    )
+                                )
+                            )
                         replay_blocks.append(
                             ContentBlockImage(
                                 media_type=media_type,
                                 data=base64.b64encode(raw_bytes).decode("ascii"),
+                                attachment_id=attachment_id,
+                                durable_retained=True,
                             )
                         )
+                        if image_material_marker:
+                            replay_blocks.append(ContentBlockText(text=image_material_marker))
                         preserved_image = True
                     continue
             if (
                 historical_materializer is not None
                 and session_id
                 and _is_materializable_attachment_mime(media_type)
+                and not media_type.startswith("image/")
             ):
                 materializer = historical_materializer
                 result = None
@@ -14231,7 +15560,26 @@ class TurnRunner:
                     )
                     omitted.append(render_attachment_material_marker(result, prefix=prefix))
                     continue
-            omitted.append(f"[historical attachment omitted: {label} ({media_type})]")
+            if media_type in _IMAGE_ATTACHMENT_MIMES:
+                if image_material_marker:
+                    omitted.append(image_material_marker)
+                marker = image_marker(
+                    (
+                        ImageMarkerState.UNAVAILABLE
+                        if missing_reason and not data and not sha_ref
+                        else ImageMarkerState.NOT_REREAD
+                    ),
+                    attachment_id=attachment_id,
+                )
+                # Retain the legacy phrase for clients/tests that recognize
+                # it, while adding the explicit state and stable ID required
+                # for a model switch after compaction.
+                omitted.append(
+                    f"[historical attachment omitted: {label} ({media_type}); "
+                    f"{marker[1:-1]}]"
+                )
+            else:
+                omitted.append(f"[historical attachment omitted: {label} ({media_type})]")
         if preserved_image:
             if omitted:
                 from opensquilla.provider.types import ContentBlockText
@@ -14239,8 +15587,10 @@ class TurnRunner:
                 replay_blocks.extend(ContentBlockText(text=marker) for marker in omitted)
             return replay_blocks
         if not omitted:
-            return text
-        return "\n".join([text, *omitted]).strip()
+            return text if include_envelope_text else ""
+        return "\n".join(
+            [*((text,) if include_envelope_text and text else ()), *omitted]
+        ).strip()
 
     @staticmethod
     def _maybe_unpack_assistant_artifacts(content: str) -> str:
@@ -14280,6 +15630,10 @@ class TurnRunner:
         session_id: str | None = None,
         workspace_attachment_budget_bytes: int | None = None,
         cancel_check: Callable[[], None] | None = None,
+        file_parse_fact_sink: Callable[[FileParseReliabilityFacts], object]
+        | None = None,
+        persist_image_material: bool = True,
+        image_workspace_dir: str | Path | None = None,
     ) -> list | None:
         """Build a multimodal user message that carries the attachments.
 
@@ -14312,6 +15666,14 @@ class TurnRunner:
         attachment_blocks: list[Any] = []
         office_batch_decompressed_budget = [_OFFICE_DECOMPRESSED_LIMIT]
         turn_materializer: AttachmentWorkspaceMaterializer | None = None
+        image_materializer = (
+            AttachmentWorkspaceMaterializer(
+                media_root=media_root or Path("."),
+                workspace_dir=image_workspace_dir,
+                materializable_mimes=None,
+                disk_budget_bytes=workspace_attachment_budget_bytes,
+            ) if image_workspace_dir is not None else None
+        )
         if workspace_dir:
             # One instance per turn so the attachment batch shares a single
             # budget scan instead of re-walking the tree per attachment.
@@ -14366,10 +15728,7 @@ class TurnRunner:
                     raise ValueError(f"attachments[{index}].data must be valid base64") from exc
             max_bytes = _attachment_size_limit_for_mime(
                 media_type,
-                staged=(
-                    att.get("_was_staged") is True
-                    and _can_stage_attachment_mime(media_type)
-                ),
+                staged=(att.get("_was_staged") is True and _can_stage_attachment_mime(media_type)),
             )
             if len(raw_bytes) > max_bytes:
                 raise ValueError(f"attachments[{index}] exceeds the {max_bytes} byte limit")
@@ -14377,8 +15736,9 @@ class TurnRunner:
             name_raw = att.get("name")
             filename = _sanitize_attachment_filename(name_raw)
             material_marker = ""
-            if turn_materializer is not None:
-                materializer = turn_materializer
+            temporary_image = media_type.startswith("image/") and not persist_image_material
+            materializer = image_materializer if temporary_image else turn_materializer
+            if materializer is not None:
                 if is_attachment_ref(att):
                     result = materializer.materialize(att, session_id=session_id)
                 else:
@@ -14390,12 +15750,20 @@ class TurnRunner:
                     )
                 if cancel_check is not None:
                     cancel_check()
+                if temporary_image and result.rel_path and image_workspace_dir is not None:
+                    result = replace(
+                        result, rel_path=str(Path(image_workspace_dir) / result.rel_path)
+                    )
                 prefix = (
                     "attachment available"
                     if result.available
                     else "attachment unavailable"
                 )
                 material_marker = render_attachment_material_marker(result, prefix=prefix)
+                if media_type in _IMAGE_ATTACHMENT_MIMES and result.available and result.rel_path:
+                    material_marker = TurnRunner._image_attachment_material_marker(
+                        filename, media_type, result.rel_path,
+                    )
             if missing_ref_marker:
                 missing_text = (
                     "\n\n".join([missing_ref_marker, material_marker])
@@ -14407,10 +15775,23 @@ class TurnRunner:
                 continue
 
             if media_type in _IMAGE_ATTACHMENT_MIMES:
-                attachment_blocks.append(ContentBlockImage(media_type=media_type, data=data))
+                raw_attachment_id = att.get("attachment_id")
+                attachment_blocks.append(
+                    ContentBlockImage(
+                        media_type=media_type,
+                        data=data,
+                        attachment_id=(
+                            raw_attachment_id.strip()[:164]
+                            if isinstance(raw_attachment_id, str)
+                            and raw_attachment_id.strip()
+                            else None
+                        ),
+                    )
+                )
                 if material_marker:
                     attachment_blocks.append(ContentBlockText(text=material_marker))
             elif media_type == "application/pdf":
+                parse_started_at = time.monotonic()
                 try:
                     extracted_pdf_text = _extract_pdf_attachment_text(
                         raw_bytes,
@@ -14418,8 +15799,42 @@ class TurnRunner:
                         cancel_check=cancel_check,
                     )
                 except ValueError as exc:
+                    _publish_file_parse_fact(
+                        file_parse_fact_sink,
+                        media_type=media_type,
+                        size_bytes=len(raw_bytes),
+                        started_at=parse_started_at,
+                        error_code=_pdf_parse_error_code(exc),
+                    )
                     extracted_pdf_text = (
                         f"[attachment unavailable: PDF text could not be extracted: {exc}]"
+                    )
+                except _AttachmentPreparationCancelledError:
+                    _publish_file_parse_fact(
+                        file_parse_fact_sink,
+                        media_type=media_type,
+                        size_bytes=len(raw_bytes),
+                        started_at=parse_started_at,
+                        error_code=FileParseErrorCode.CANCELLED,
+                        outcome=ResultOutcome.CANCEL,
+                    )
+                    raise
+                except TimeoutError:
+                    _publish_file_parse_fact(
+                        file_parse_fact_sink,
+                        media_type=media_type,
+                        size_bytes=len(raw_bytes),
+                        started_at=parse_started_at,
+                        error_code=FileParseErrorCode.PARSE_TIMEOUT,
+                        outcome=ResultOutcome.TIMEOUT,
+                    )
+                    raise
+                else:
+                    _publish_file_parse_fact(
+                        file_parse_fact_sink,
+                        media_type=media_type,
+                        size_bytes=len(raw_bytes),
+                        started_at=parse_started_at,
                     )
                 if material_marker:
                     extracted_pdf_text = "\n\n".join(
@@ -14436,6 +15851,7 @@ class TurnRunner:
                 wrapped = _render_file_context_block(filename, media_type, extracted_pdf_text)
                 attachment_blocks.append(ContentBlockText(text=wrapped))
             elif media_type in _OFFICE_ATTACHMENT_MIMES:
+                parse_started_at = time.monotonic()
                 try:
                     extracted_office_text = _extract_office_attachment_text(
                         raw_bytes,
@@ -14445,37 +15861,77 @@ class TurnRunner:
                         cancel_check=cancel_check,
                     )
                 except ValueError as exc:
+                    _publish_file_parse_fact(
+                        file_parse_fact_sink,
+                        media_type=media_type,
+                        size_bytes=len(raw_bytes),
+                        started_at=parse_started_at,
+                        error_code=_office_parse_error_code(exc),
+                    )
                     extracted_office_text = (
-                        "[attachment unavailable: document text could not be "
-                        f"extracted: {exc}]"
+                        f"[attachment unavailable: document text could not be extracted: {exc}]"
+                    )
+                except _AttachmentPreparationCancelledError:
+                    _publish_file_parse_fact(
+                        file_parse_fact_sink,
+                        media_type=media_type,
+                        size_bytes=len(raw_bytes),
+                        started_at=parse_started_at,
+                        error_code=FileParseErrorCode.CANCELLED,
+                        outcome=ResultOutcome.CANCEL,
+                    )
+                    raise
+                except TimeoutError:
+                    _publish_file_parse_fact(
+                        file_parse_fact_sink,
+                        media_type=media_type,
+                        size_bytes=len(raw_bytes),
+                        started_at=parse_started_at,
+                        error_code=FileParseErrorCode.PARSE_TIMEOUT,
+                        outcome=ResultOutcome.TIMEOUT,
+                    )
+                    raise
+                else:
+                    _publish_file_parse_fact(
+                        file_parse_fact_sink,
+                        media_type=media_type,
+                        size_bytes=len(raw_bytes),
+                        started_at=parse_started_at,
                     )
                 if material_marker:
-                    extracted_office_text = "\n\n".join(
-                        [extracted_office_text, material_marker]
-                    )
-                wrapped = _render_file_context_block(
-                    filename, media_type, extracted_office_text
-                )
+                    extracted_office_text = "\n\n".join([extracted_office_text, material_marker])
+                wrapped = _render_file_context_block(filename, media_type, extracted_office_text)
                 attachment_blocks.append(ContentBlockText(text=wrapped))
             elif media_type in _EMAIL_ATTACHMENT_MIMES:
+                parse_started_at = time.monotonic()
                 try:
                     extracted_email_text = _extract_email_attachment_text(
                         raw_bytes, filename, media_type
                     )
                 except ValueError as exc:
+                    _publish_file_parse_fact(
+                        file_parse_fact_sink,
+                        media_type=media_type,
+                        size_bytes=len(raw_bytes),
+                        started_at=parse_started_at,
+                        error_code=_email_parse_error_code(exc),
+                    )
                     extracted_email_text = (
-                        "[attachment unavailable: email could not be "
-                        f"extracted: {exc}]"
+                        f"[attachment unavailable: email could not be extracted: {exc}]"
+                    )
+                else:
+                    _publish_file_parse_fact(
+                        file_parse_fact_sink,
+                        media_type=media_type,
+                        size_bytes=len(raw_bytes),
+                        started_at=parse_started_at,
                     )
                 if material_marker:
-                    extracted_email_text = "\n\n".join(
-                        [extracted_email_text, material_marker]
-                    )
-                wrapped = _render_file_context_block(
-                    filename, media_type, extracted_email_text
-                )
+                    extracted_email_text = "\n\n".join([extracted_email_text, material_marker])
+                wrapped = _render_file_context_block(filename, media_type, extracted_email_text)
                 attachment_blocks.append(ContentBlockText(text=wrapped))
             elif media_type in _ENGINE_TEXT_FAMILY_MIMES:
+                parse_started_at = time.monotonic()
                 if (
                     is_attachment_ref(att)
                     and att.get("_provider_inline_policy") == "preview_only"
@@ -14494,9 +15950,33 @@ class TurnRunner:
                             limit=_TEXT_ATTACHMENT_TEXT_LIMIT,
                         )
                     except UnicodeDecodeError:
+                        _publish_file_parse_fact(
+                            file_parse_fact_sink,
+                            media_type=media_type,
+                            size_bytes=len(raw_bytes),
+                            started_at=parse_started_at,
+                            error_code=FileParseErrorCode.INVALID_UTF8,
+                        )
                         decoded_text = (
                             "[attachment unavailable: declared text content is not valid UTF-8]"
                         )
+                    else:
+                        _publish_file_parse_fact(
+                            file_parse_fact_sink,
+                            media_type=media_type,
+                            size_bytes=len(raw_bytes),
+                            started_at=parse_started_at,
+                        )
+                if (
+                    is_attachment_ref(att)
+                    and att.get("_provider_inline_policy") == "preview_only"
+                ):
+                    _publish_file_parse_fact(
+                        file_parse_fact_sink,
+                        media_type=media_type,
+                        size_bytes=len(raw_bytes),
+                        started_at=parse_started_at,
+                    )
                 if material_marker:
                     decoded_text = "\n\n".join([decoded_text, material_marker])
                 wrapped = _render_file_context_block(filename, media_type, decoded_text)

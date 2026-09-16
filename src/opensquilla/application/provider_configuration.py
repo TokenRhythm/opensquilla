@@ -141,6 +141,14 @@ class ModelRoutingPolicyPort(Protocol):
 
     def prepare(self, config: Any, mode: str) -> PreparedModelRouting: ...
 
+    def prepare_recommended(
+        self,
+        config: Any,
+        provider_id: str,
+        *,
+        activate_router: bool,
+    ) -> PreparedModelRouting: ...
+
 
 class ModelRoutingRuntimePort(Protocol):
     def prepare_reconciliation(self, config: Any) -> Any: ...
@@ -196,9 +204,7 @@ class ModelCatalog:
             models = [
                 row
                 for row in models
-                if required.issubset(
-                    {str(item) for item in row.get("capabilities", ())}
-                )
+                if required.issubset({str(item) for item in row.get("capabilities", ())})
             ]
         return ModelCatalogResult(models=models, errors=errors)
 
@@ -234,6 +240,30 @@ class ModelRouting:
         current = self._config.active_config()
         previous = self._policy.snapshot(current)
         candidate = self._policy.prepare(current, normalized)
+        return await self._commit(previous, candidate, source="config.patch.safe")
+
+    async def reset_recommended(
+        self,
+        provider_id: str,
+        *,
+        activate_router: bool = False,
+    ) -> ModelRoutingMutation:
+        current = self._config.active_config()
+        previous = self._policy.snapshot(current)
+        candidate = self._policy.prepare_recommended(
+            current,
+            provider_id,
+            activate_router=activate_router,
+        )
+        return await self._commit(previous, candidate, source="models.routing.resetRecommended")
+
+    async def _commit(
+        self,
+        previous: ModelRoutingSnapshot,
+        candidate: PreparedModelRouting,
+        *,
+        source: str,
+    ) -> ModelRoutingMutation:
         prepared_runtime = self._runtime.prepare_reconciliation(candidate.config)
         self._config.persist_candidate(candidate.config, restart_required=False)
         live = self._config.install_candidate(candidate.config)
@@ -241,7 +271,7 @@ class ModelRouting:
         await self._runtime.publish_changed(
             previous,
             live,
-            source="config.patch.safe",
+            source=source,
         )
         return cast(
             ModelRoutingMutation,

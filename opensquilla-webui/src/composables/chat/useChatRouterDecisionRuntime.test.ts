@@ -14,9 +14,10 @@ function makeRuntime(
   const scrollToBottom = vi.fn()
   const activeTurnUsesEnsemble = ref(modelRoutingMode === 'llm_ensemble')
   const activeTurnId = ref('turn-current')
+  const sessionKey = ref('sess')
   const runtime = useChatRouterDecisionRuntime({
     messages: messagesRef,
-    sessionKey: ref('sess'),
+    sessionKey,
     isStreaming: ref(isStreaming),
     autoScroll: ref(autoScroll),
     activeTurnUsesEnsemble,
@@ -35,8 +36,133 @@ function makeRuntime(
     scrollToBottom,
     activeTurnUsesEnsemble,
     activeTurnId,
+    sessionKey,
   }
 }
+
+describe('router attempt ownership', () => {
+  const progress = (turnId = 'turn-current') => ({
+    turn_id: turnId, event_type: 'proposer_start' as const,
+    proposer_provider: 'provider', proposer_model: 'candidate',
+  })
+  const decision = (seq: number, turnId = 'turn-current') => ({
+    turn_id: turnId, stream_seq: seq, tier: 'c1', model: 'provider/selected', source: 'squilla_router',
+  })
+
+  it('attaches untagged progress to the current tagged decision', () => {
+    const { runtime, messagesRef } = makeRuntime([{ role: 'user', text: 'q', ts: 0, turnId: 'turn-current' }])
+    runtime.queueRouterDecision(decision(10))
+    runtime.appendEnsembleProgress({
+      event_type: 'proposer_start', proposer_provider: 'provider', proposer_model: 'candidate',
+    })
+    const cards = messagesRef.value.filter(message => message.role === 'router')
+    expect(cards).toHaveLength(1)
+    expect(cards[0]?.ensemble?.models[0]?.model).toBe('candidate')
+  })
+
+  it('assigns untagged progress after replay to a new provisional card', () => {
+    const { runtime, messagesRef } = makeRuntime([{ role: 'user', text: 'q', ts: 0, turnId: 'turn-current' }])
+    runtime.queueRouterDecision(decision(10))
+    runtime.appendEnsembleProgress({ ...progress(), proposer_model: 'first' })
+    runtime.handleRouterControlReplay({ turn_id: 'turn-current', stream_seq: 20 })
+    runtime.appendEnsembleProgress({
+      event_type: 'proposer_start', proposer_provider: 'provider', proposer_model: 'second',
+    })
+    runtime.queueRouterDecision(decision(22))
+    const cards = messagesRef.value.filter(message => message.role === 'router')
+    expect(cards).toHaveLength(2)
+    expect(cards.map(card => card.messageId)).toEqual(['router-sess-10', 'router-sess-22'])
+    expect(cards.map(card => card.ensemble?.models.map(model => model.model)))
+      .toEqual([['first'], ['second']])
+  })
+
+  it('uses the same boundary identity for live and snapshot replay', () => {
+    const { runtime, messagesRef } = makeRuntime([{ role: 'user', text: 'q', ts: 0, turnId: 'turn-current' }])
+    runtime.handleRouterControlReplay({ turn_id: 'turn-current', stream_seq: 10 })
+    runtime.appendEnsembleProgress(progress())
+    runtime.resetRouterReplayCursor()
+    runtime.handleRouterControlReplay({ turn_id: 'turn-current' }, 10)
+    runtime.appendEnsembleProgress(progress())
+    runtime.queueRouterDecision(decision(12))
+    const cards = messagesRef.value.filter(message => message.role === 'router')
+    expect(cards).toHaveLength(1)
+    expect(cards[0]?.messageId).toBe('router-sess-12')
+  })
+
+  it('keeps unsequenced replay boundaries separate instead of guessing their identity', () => {
+    const { runtime, messagesRef } = makeRuntime([{ role: 'user', text: 'q', ts: 0, turnId: 'turn-current' }])
+    runtime.appendEnsembleProgress(progress())
+    runtime.handleRouterControlReplay()
+    runtime.appendEnsembleProgress(progress())
+    runtime.queueRouterDecision(decision(12))
+    const cards = messagesRef.value.filter(message => message.role === 'router')
+    expect(cards).toHaveLength(2)
+    expect(cards[0]?.messageId).not.toBe(cards[1]?.messageId)
+    expect(cards[1]?.messageId).toBe('router-sess-12')
+  })
+
+  it('does not reuse a replay boundary from a different stream generation', () => {
+    const { runtime, messagesRef } = makeRuntime([{ role: 'user', text: 'q', ts: 0, turnId: 'turn-current' }])
+    runtime.handleRouterControlReplay({ turn_id: 'turn-current', stream_seq: 10, stream_generation: 'a' })
+    runtime.appendEnsembleProgress(progress())
+    runtime.handleRouterControlReplay({ turn_id: 'turn-current', stream_seq: 10, stream_generation: 'b' })
+    runtime.appendEnsembleProgress(progress())
+    runtime.queueRouterDecision(decision(12))
+    expect(messagesRef.value.filter(message => message.role === 'router')).toHaveLength(2)
+  })
+
+  it('keeps replay ownership per turn when another turn receives a late decision', () => {
+    const { runtime, messagesRef } = makeRuntime([{ role: 'user', text: 'q', ts: 0, turnId: 'first' }])
+    runtime.appendEnsembleProgress(progress('first'))
+    messagesRef.value.push({ role: 'user', text: 'q2', ts: 1, turnId: 'second' })
+    runtime.handleRouterControlReplay({ turn_id: 'second', stream_seq: 10 })
+    runtime.appendEnsembleProgress(progress('second'))
+    runtime.queueRouterDecision(decision(11, 'first'))
+    runtime.queueRouterDecision(decision(12, 'second'))
+    const cards = messagesRef.value.filter(message => message.role === 'router')
+    expect(cards).toHaveLength(2)
+    expect(cards.map(card => [card.turnId, card.messageId])).toEqual([
+      ['first', 'router-sess-11'], ['second', 'router-sess-12'],
+    ])
+  })
+
+  it('does not promote a history row that only resembles a local provisional card', () => {
+    const { runtime, messagesRef } = makeRuntime([{
+      role: 'router', text: '', ts: 0, turnId: 'turn-current',
+      messageId: 'router-sess-ensemble-1', provenanceKind: 'router_decision',
+      routerDecision: { tier: 'c1', model: 'provider/old', source: 'llm_ensemble' },
+      restoredFromHistory: true,
+    }])
+    runtime.queueRouterDecision(decision(12))
+    expect(messagesRef.value.filter(message => message.role === 'router')).toHaveLength(2)
+  })
+
+  it('does not promote a provisional card twice for different real decisions', () => {
+    const { runtime, messagesRef } = makeRuntime([{ role: 'user', text: 'q', ts: 0, turnId: 'turn-current' }])
+    runtime.appendEnsembleProgress(progress())
+    runtime.queueRouterDecision(decision(11))
+    runtime.queueRouterDecision(decision(12))
+    expect(messagesRef.value.filter(message => message.role === 'router').map(card => card.messageId))
+      .toEqual(['router-sess-11', 'router-sess-12'])
+  })
+
+  it('drops pending decisions and ownership after switching sessions', () => {
+    const { runtime, messagesRef, sessionKey } = makeRuntime([{ role: 'user', text: 'q', ts: 0, turnId: 'turn-current' }])
+    runtime.queueRouterDecision({ ...decision(10), key: 'sess' })
+    runtime.handleRouterControlReplay({ turn_id: 'turn-current', stream_seq: 11 })
+    runtime.queueRouterDecision({ ...decision(12), key: 'sess' })
+    sessionKey.value = 'new'
+    messagesRef.value = [{ role: 'user', text: 'q2', ts: 0, turnId: 'turn-current' }]
+    runtime.flushPendingRouterDecision()
+    runtime.appendEnsembleProgress({ ...progress(), key: 'sess' })
+    runtime.queueRouterDecision({ ...decision(13), key: 'sess' })
+    expect(messagesRef.value).toHaveLength(1)
+    runtime.appendEnsembleProgress({ ...progress(), key: 'new' })
+    runtime.queueRouterDecision({ ...decision(14), key: 'new' })
+    expect(messagesRef.value.filter(message => message.role === 'router').map(card => card.messageId))
+      .toEqual(['router-new-14'])
+  })
+})
 
 describe('router decision identity', () => {
   it('reuses the live stream identity when the same decision is replayed from a snapshot', () => {
@@ -153,6 +279,82 @@ describe('router decision identity', () => {
 })
 
 describe('appendEnsembleProgress', () => {
+  it('promotes a same-turn provisional card when its real decision arrives', () => {
+    const { runtime, messagesRef } = makeRuntime([
+      { role: 'user', text: 'q', ts: 0, turnId: 'turn-1' },
+    ])
+
+    runtime.appendEnsembleProgress({
+      event_type: 'proposer_finish',
+      turn_id: 'turn-1',
+      proposer_provider: 'openrouter',
+      proposer_model: 'qwen/qwen3.7-plus',
+    })
+    const provisional = messagesRef.value.find(message => message.role === 'router')!
+    ;(provisional as ChatMessage & { routerExecutionModel?: string }).routerExecutionModel = 'fallback-model'
+
+    runtime.queueRouterDecision({
+      turn_id: 'turn-1',
+      stream_seq: 12,
+      tier: 'c1',
+      model: 'provider/selected',
+      source: 'squilla_router',
+    })
+
+    const routers = messagesRef.value.filter(message => message.role === 'router')
+    expect(routers).toHaveLength(1)
+    expect(routers[0]).toMatchObject({
+      messageId: 'router-sess-12',
+      turnId: 'turn-1',
+      routerDecision: { model: 'provider/selected' },
+    })
+    expect(routers[0]?.ensemble?.models).toHaveLength(1)
+    expect((routers[0] as ChatMessage & { routerExecutionModel?: string }).routerExecutionModel)
+      .toBe('fallback-model')
+  })
+
+  it('does not promote a provisional card across a router control replay boundary', () => {
+    const { runtime, messagesRef } = makeRuntime([
+      { role: 'user', text: 'q', ts: 0, turnId: 'turn-1' },
+    ])
+
+    runtime.appendEnsembleProgress({
+      event_type: 'proposer_start',
+      turn_id: 'turn-1',
+      proposer_provider: 'openrouter',
+      proposer_model: 'qwen/qwen3.7-plus',
+    })
+    runtime.handleRouterControlReplay()
+    runtime.queueRouterDecision({
+      turn_id: 'turn-1',
+      stream_seq: 13,
+      tier: 'c1',
+      model: 'provider/replayed',
+      source: 'squilla_router',
+    })
+
+    expect(messagesRef.value.filter(message => message.role === 'router')).toHaveLength(2)
+  })
+
+  it('promotes a handoff card without dropping its identity', () => {
+    const { runtime, messagesRef } = makeRuntime([
+      { role: 'user', text: 'q', ts: 0, turnId: 'turn-1' },
+    ])
+
+    runtime.markEnsembleHandoff()
+    runtime.queueRouterDecision({
+      turn_id: 'turn-1',
+      stream_seq: 14,
+      tier: 'c1',
+      model: 'provider/selected',
+      source: 'squilla_router',
+    })
+
+    const routers = messagesRef.value.filter(message => message.role === 'router')
+    expect(routers).toHaveLength(1)
+    expect(routers[0]).toMatchObject({ messageId: 'router-sess-14', turnId: 'turn-1' })
+  })
+
   it('normalizes every internal candidate label to the public Proposer role', () => {
     const { runtime, messagesRef } = makeRuntime([{ role: 'user', text: 'q', ts: 0 }])
 

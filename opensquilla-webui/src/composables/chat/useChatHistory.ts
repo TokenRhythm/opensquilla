@@ -1,3 +1,4 @@
+import { pageAnnotationSnapshots } from '@/types/pageContext'
 import { nextTick, ref, type Ref } from 'vue'
 import type {
   ChatMessage,
@@ -49,7 +50,7 @@ import {
 import { isImageInputUnsupported, localizedChatErrorMessage } from '@/utils/chat/errors'
 import { isUsageAccountingBarrier } from '@/utils/chat/usageAccountingFailure'
 import { interleaveHistoryModelCallSegments } from '@/utils/chat/historyModelCallSegments'
-import { normalizePromptAnnotationSnapshot } from '@/workbench/artifactPromptAnnotationProvider'
+import { normalizePromptAnnotationSnapshot } from '@/utils/chat/promptAnnotationHistory'
 
 function recordArray<T extends Record<string, unknown>>(value: unknown): T[] {
   return Array.isArray(value)
@@ -839,10 +840,12 @@ export function useChatHistory(options: UseChatHistoryOptions) {
       planRevisions: planRevisionsFromToolSegments(msg.toolCalls),
       timeline: recordArray<ChatTimelineSegment>(msg.timeline),
       attachments: normalizeDisplayAttachments([...msg.attachments], { messageId }),
-      promptAnnotations: msg.promptAnnotations
-        .map(normalizePromptAnnotationSnapshot)
-        .filter((item): item is PromptAnnotationSnapshot => item !== null)
-        .sort((left, right) => left.sentOrder - right.sentOrder),
+      promptAnnotations: msg.pageContext
+        ? pageAnnotationSnapshots(msg.pageContext)
+        : msg.promptAnnotations
+            .map(normalizePromptAnnotationSnapshot)
+            .filter((item): item is PromptAnnotationSnapshot => item !== null)
+            .sort((left, right) => (left.sentOrder || 0) - (right.sentOrder || 0)),
       provenanceKind: msg.provenance.kind || '',
       provenanceSourceSessionKey: msg.provenance.sourceSessionKey || '',
       provenanceSourceTool: msg.provenance.sourceTool || '',
@@ -1074,7 +1077,17 @@ export function useChatHistory(options: UseChatHistoryOptions) {
       if (!isCurrentRequest()) return { ok: false, cancelled: true }
       const msgs = data.messages
       const canonicalAvailable = data.canonicalAvailable
-      if (canonicalAvailable === false) {
+      // A draft WebChat key has no canonical store yet, but the server can
+      // positively confirm its empty transcript. Reconnection must accept
+      // that state without treating unavailable or already-loaded history
+      // as empty, or the first message remains blocked by the live fence.
+      const confirmedEmptyDraft = data.canonicalComplete === true
+        && msgs.length === 0
+        && !data.hasMore
+        && !params.prepend
+        && !hasLoadedEarlier
+        && options.messages.value.length === 0
+      if (canonicalAvailable === false && !confirmedEmptyDraft) {
         if (nonReconnecting) {
           restoreSilentBackgroundState()
           return { ok: false }
@@ -1237,7 +1250,7 @@ export function useChatHistory(options: UseChatHistoryOptions) {
         }
       }
 
-      if (canonicalAvailable !== false) failedHistoryRequest = null
+      if (canonicalAvailable !== false || confirmedEmptyDraft) failedHistoryRequest = null
       // Gate the full-session error on explicit coverage metadata. Older
       // Gateways used canonical_available=false for a legitimate empty WebChat
       // session but did not yet publish canonical_complete.
@@ -1573,6 +1586,15 @@ export function useChatHistory(options: UseChatHistoryOptions) {
     }
   }
 
+  async function reconcileHistory(): Promise<SessionPhaseResult | void> {
+    const key = options.sessionKey.value
+    // A read admitted before the snapshot cannot prove a terminal transition
+    // after its watermark. Join it, then admit one fresh current-window read.
+    await activeHistory?.promise.catch(() => {})
+    if (options.sessionKey.value !== key) return { ok: false, cancelled: true }
+    return loadHistory({ nonReconnecting: true })
+  }
+
   function cleanup() {
     cancelActiveHistory()
     historySyncPending = false
@@ -1584,6 +1606,7 @@ export function useChatHistory(options: UseChatHistoryOptions) {
     historySessionKey,
     historyState,
     loadHistory,
+    reconcileHistory,
     loadEarlierHistory,
     retryHistory,
     markSessionMissing,

@@ -31,6 +31,8 @@ from opensquilla.engine.types import (
     ToolUseStartEvent,
     WarningEvent,
 )
+from opensquilla.telemetry.contracts.reliability import TurnFailureStage
+from opensquilla.telemetry.runtime_facts import current_turn_failure_stage
 
 # Reuse upstream patch helpers from's equivalence harness -- this
 # stage sits after all six prior stages so the same upstream patching
@@ -107,12 +109,6 @@ def _patch_budget_resolvers(runner: TurnRunner) -> None:
     def _max_iter(self, session_key, mi):  # noqa: ARG001, ARG002
         return mi if mi is not None else 10
 
-    def _iter_t(self, session_key, it):  # noqa: ARG001, ARG002
-        return it if it is not None else 30.0
-
-    def _tool_t(self, session_key, tt):  # noqa: ARG001, ARG002
-        return tt if tt is not None else 20.0
-
     def _req_t(self, session_key, rt):  # noqa: ARG001, ARG002
         return rt if rt is not None else 120.0
 
@@ -121,8 +117,6 @@ def _patch_budget_resolvers(runner: TurnRunner) -> None:
 
     runner._resolve_agent_runtime_timeout = _runtime.__get__(runner, TurnRunner)
     runner._resolve_agent_max_iterations = _max_iter.__get__(runner, TurnRunner)
-    runner._resolve_agent_iteration_timeout = _iter_t.__get__(runner, TurnRunner)
-    runner._resolve_agent_tool_timeout = _tool_t.__get__(runner, TurnRunner)
     runner._resolve_agent_request_timeout = _req_t.__get__(runner, TurnRunner)
     runner._resolve_agent_max_provider_retries = _retries.__get__(runner, TurnRunner)
 
@@ -786,6 +780,7 @@ async def test_stream_consumer_stage_snapshot(
     if case.expected_pending_error_code is not None:
         tail = next(e for e in reversed(yielded) if isinstance(e, ErrorEvent))
         assert tail.code == case.expected_pending_error_code
+        assert current_turn_failure_stage() is TurnFailureStage.AGENT_EXECUTION
 
     if case.expected_done_present:
         assert any(isinstance(e, DoneEvent) for e in yielded)

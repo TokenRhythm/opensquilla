@@ -26,6 +26,9 @@ EXPECTED_METHOD_METADATA = {
     "onboarding.channel.remove": ("operator.admin", "command", "idempotent"),
     "onboarding.channel.enable": ("operator.admin", "command", "idempotent"),
     "onboarding.channel.disable": ("operator.admin", "command", "idempotent"),
+    "onboarding.llmProfile.upsertAndActivate": (
+        "operator.admin", "command", "non-idempotent",
+    ),
     "plugin.approval.status": ("operator.approvals", "query", "read-only"),
     "plugin.approval.resolve": ("operator.approvals", "command", "idempotent"),
     "plugin.approval.extend": ("operator.approvals", "command", "non-idempotent"),
@@ -39,6 +42,7 @@ EXPECTED_METHOD_METADATA = {
 }
 
 RESPONSE_VALIDATED_METHODS = (
+    "onboarding.llmProfile.upsertAndActivate",
     "sandbox.path.list",
     "workspaces.open",
     "workspaces.update",
@@ -48,6 +52,14 @@ RESPONSE_VALIDATED_METHODS = (
 )
 
 EXPECTED_ACCURATE_ERROR_CODES = {
+    "onboarding.llmProfile.upsertAndActivate": (
+        "INVALID_REQUEST",
+        "UNAUTHORIZED",
+        "UNAVAILABLE",
+        "INTERNAL_ERROR",
+        "ROUTER_PROVIDER_CONFLICT",
+        "LLM_PROFILE_INVALID",
+    ),
     "workspaces.open": (
         "OWNER_REQUIRED",
         "INVALID_PARAMS",
@@ -224,11 +236,18 @@ def test_contract_inventory_freezes_all_webui_reachable_wire_names() -> None:
 
     assert len(specs) == 224
     assert Counter(spec.contract_type for spec in specs) == {
-        "method": 215,
-        "event": 9,
+        "method": 214,
+        "event": 10,
     }
     assert EXPECTED_METHOD_METADATA.keys() <= {spec.wire_name for spec in specs}
     assert "models.routing.changed" in {spec.wire_name for spec in specs}
+    assert {
+        "sessions.executionLog.read",
+        "sessions.messages.snapshot.read",
+        "telemetry.product_active.record",
+        "transport.flow.update",
+        "transport.flow.dirty",
+    } <= {spec.wire_name for spec in specs}
 
 
 def test_remaining_method_metadata_matches_existing_gateway_policy() -> None:

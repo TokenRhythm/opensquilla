@@ -5,11 +5,13 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import NotRequired, Protocol, TypedDict
 
+from opensquilla.application.skill_source import resolve_install_source
+
 
 @dataclass(frozen=True, slots=True)
 class InstallSkill:
     identifier: str
-    source: str = "clawhub"
+    source: str | None = None
     operation_id: str = ""
     force: bool = False
     replace_source: bool = False
@@ -18,6 +20,7 @@ class InstallSkill:
     def __post_init__(self) -> None:
         if not self.identifier:
             raise ValueError("skill identifier is required")
+        object.__setattr__(self, "source", resolve_install_source(self.identifier, self.source))
 
 
 @dataclass(frozen=True, slots=True)

@@ -281,9 +281,9 @@ def _corrections_budget_fallback(model_id: str) -> tuple[int, int] | None:
 def _live_layer_fields(info: ModelInfo | None) -> dict[str, Any]:
     """Fields the live provider catalog knows, adapted per-1k → per-Mtok.
 
-    Capability booleans are computed deterministically from the provider
-    response at populate time, so they are emitted as known whenever the
-    model is in the cache. A 0.0 per-1k price is the live cache's "free or
+    Vision is known only when the provider actually supplied input modalities;
+    the compatibility boolean default is not evidence of a text-only model.
+    A 0.0 per-1k price is the live cache's "free or
     unknown" sentinel, so costs are emitted only when positive — this layer
     never claims a known $0 price.
     """
@@ -292,8 +292,9 @@ def _live_layer_fields(info: ModelInfo | None) -> dict[str, Any]:
     fields: dict[str, Any] = {
         "supports_reasoning": info.supports_reasoning,
         "supports_tools": info.supports_tools,
-        "supports_vision": info.supports_vision,
     }
+    if "supports_vision" in info.model_fields_set:
+        fields["supports_vision"] = info.supports_vision
     if info.display_name:
         fields["display_name"] = info.display_name
     if info.context_window > 0:
@@ -474,9 +475,16 @@ class ModelCatalog:
             max_completion = top_provider.get("max_completion_tokens") or 0
             supported = set(m.get("supported_parameters", []))
             architecture = m.get("architecture") or {}
-            input_modalities = {
-                str(item).lower() for item in architecture.get("input_modalities", [])
-            }
+            modalities = architecture.get("input_modalities")
+            vision_fields: dict[str, Any] = {}
+            if (
+                isinstance(modalities, list)
+                and modalities
+                and all(isinstance(item, str) and item.strip() for item in modalities)
+            ):
+                vision_fields["supports_vision"] = "image" in {
+                    item.strip().lower() for item in modalities
+                }
             pricing = m.get("pricing") or {}
             self._models[model_id] = ModelInfo(
                 provider="openrouter",
@@ -486,7 +494,7 @@ class ModelCatalog:
                 max_output_tokens=max_completion,
                 supports_reasoning="reasoning" in supported or "reasoning_effort" in supported,
                 supports_tools="tools" in supported or "tool_choice" in supported,
-                supports_vision="image" in input_modalities,
+                **vision_fields,
                 input_cost_per_1k=_price_per_1k(pricing.get("prompt")),
                 output_cost_per_1k=_price_per_1k(pricing.get("completion")),
             )

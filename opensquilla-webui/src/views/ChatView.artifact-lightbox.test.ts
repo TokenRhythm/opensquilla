@@ -1,7 +1,30 @@
 import { describe, expect, it } from 'vitest'
 import chatViewSource from './ChatView.vue?raw'
+import workbenchSource from '@/components/workbench/AppWorkbench.vue?raw'
 
 describe('ChatView artifact preview routing', () => {
+  it('keeps internal Documents reachable through the existing resource button', () => {
+    const countStart = chatViewSource.indexOf('const headerDeliverableCount = computed(')
+    const countEnd = chatViewSource.indexOf('\nconst attachmentWorkbenchResources', countStart)
+    const countSource = chatViewSource.slice(countStart, countEnd)
+    const openStart = chatViewSource.indexOf('async function openDeliverables()')
+    const openEnd = chatViewSource.indexOf('\nfunction focusInlineDeliverable', openStart)
+    const openSource = chatViewSource.slice(openStart, openEnd)
+
+    expect(countStart).toBeGreaterThan(-1)
+    expect(countSource).toContain('workbenchResourcesStore.navigationResources(sessionKey.value).length')
+    expect(countSource).toContain('sessionArtifacts.value.length')
+    expect(openSource).toContain('if (headerDeliverableCount.value === 0) return')
+    expect(openSource).not.toContain('if (sessionArtifacts.value.length === 0) return')
+    expect(openSource).toContain('createResourceCollectionWorkbenchItem({')
+
+    const eventStart = workbenchSource.indexOf('function onArtifactState(')
+    const eventEnd = workbenchSource.indexOf('\nfunction promptAnnotationItem(', eventStart)
+    const eventSource = workbenchSource.slice(eventStart, eventEnd)
+    expect(eventSource).toContain('workbenchResources.load(activeSessionKey, true)')
+    expect(eventSource).not.toContain('store.openItem(')
+  })
+
   it('routes visual artifacts to the lightbox before inline or unsupported fallbacks', () => {
     const start = chatViewSource.indexOf('function openArtifact(')
     const end = chatViewSource.indexOf('\nfunction closeDeliverables', start)
@@ -95,11 +118,25 @@ describe('ChatView artifact preview routing', () => {
     const refreshEnd = chatViewSource.indexOf('\nfunction openLegacyArtifactWorkbench', refreshStart)
     const refreshSource = chatViewSource.slice(refreshStart, refreshEnd)
 
-    expect(explicitOpenCalls).toHaveLength(8)
+    expect(explicitOpenCalls).toHaveLength(9)
     expect(chatViewSource).toContain('function artifactPreviewItemForExplicitOpen(')
     expect(refreshSource).toContain(
       'initialSectionRequestId: initialSectionRequestIdFromWorkbenchItem(item)',
     )
     expect(refreshSource).not.toContain('artifactPreviewItemForExplicitOpen(')
+  })
+
+  it('resolves message site pages read-only and keeps their open target on the same Document item', () => {
+    const start = chatViewSource.indexOf('async function resolveWorkspacePreviewResource(')
+    const end = chatViewSource.indexOf('\nfunction openArtifact(', start)
+    const source = chatViewSource.slice(start, end)
+    expect(source).not.toContain('workbenchResourcesStore.find(key, ref)')
+    expect(source).toContain('workbenchResourcesStore.resolve(key, ref)')
+    expect(source).toContain('if (previewPagePath) artifact.previewPagePath = previewPagePath')
+    expect(source).toContain('resourceIdentity: workbenchResourceKey(current.resource.resource)')
+    expect(source).toContain('artifactPreviewItemForExplicitOpen({')
+    expect(source).not.toContain('publishDocument')
+    expect(chatViewSource).toContain(':resolve-workspace-preview-resource="resolveWorkspacePreviewResource"')
+    expect(chatViewSource).toContain("typeof artifact.previewPagePath === 'string' ? artifact.previewPagePath : undefined")
   })
 })

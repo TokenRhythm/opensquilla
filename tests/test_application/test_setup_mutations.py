@@ -162,3 +162,51 @@ async def test_provider_setup_reconciles_only_after_candidate_install() -> None:
         "sync-media",
         "refresh-catalog",
     ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", [None, "persist", "pool", "router", "already_active"])
+async def test_profile_save_and_activate_commits_once_before_all_runtime_effects(failure):
+    from opensquilla.application.profile_lifecycle import ProfileLifecycle, UpsertAndActivateProfile
+    from opensquilla.gateway.adapters.setup_mutations import OnboardingSetupMutationPort
+    from opensquilla.gateway.config import GatewayConfig
+    from opensquilla.onboarding.mutations import LlmProfileActivationError
+
+    events = []
+    config = FakeConfigPort(events, fail_persist=failure == "persist")
+    config.config = GatewayConfig(
+        llm={"provider": "openai", "api_key": "old-key"},
+        squilla_router={"preset_binding": "custom", "tier_profile": "openai"}
+        if failure == "router"
+        else {"preset_binding": "follow_primary"},
+    )
+    before = config.config.model_dump()
+    lifecycle = ProfileLifecycle(
+        config, FakeRuntimePort(events), None, OnboardingSetupMutationPort()
+    )
+    command = UpsertAndActivateProfile(
+        provider_id="openai" if failure == "already_active" else "deepseek",
+        api_key="draft-key",
+        api_key_env_pool=["POOL_A"] if failure == "pool" else None,
+    )
+    if failure:
+        error = RuntimeError if failure == "persist" else LlmProfileActivationError
+        with pytest.raises(error):
+            await lifecycle.upsert_and_activate(command)
+        assert events == (["persist"] if failure == "persist" else [])
+        assert config.config.model_dump() == before
+    else:
+        result = await lifecycle.upsert_and_activate(command)
+        assert events == [
+            "persist",
+            "install",
+            "discard:deepseek",
+            "reconcile:deepseek",
+            "sync-primary",
+            "sync-media",
+            "refresh-catalog",
+        ]
+        assert result.entry["active"] is True
+        assert config.config.llm.provider == "deepseek"
+        assert config.config.llm.api_key == "draft-key"
+        assert "deepseek" not in config.config.llm_profiles

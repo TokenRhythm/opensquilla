@@ -1,10 +1,11 @@
 <template>
-  <!-- Prominent outcome banner after the reply is sent -->
+  <!-- Only confirmed answers or expired requests have a terminal outcome. -->
   <div
-    v-if="submitted"
+    v-if="submitted || expired"
     class="clarify-outcome"
     :class="{
       'is-busy': busy,
+      'clarify-outcome--expired': expired,
       'clarify-outcome--plan': isPlanQuestionnaire,
     }"
     data-testid="clarify-outcome"
@@ -13,14 +14,14 @@
     aria-atomic="true"
   >
     <span v-if="!isPlanQuestionnaire" class="clarify-outcome__icon" aria-hidden="true">
-      <Icon :name="busy ? 'clock' : 'check'" :size="18" />
+      <Icon :name="expired ? 'clock' : 'check'" :size="18" />
     </span>
     <span class="clarify-outcome__copy">
       <span class="clarify-outcome__title">
-        {{ busy ? t('chat.clarify.replyReceived') : t('chat.clarify.outcomeDoneTitle') }}
+        {{ expired ? t('chat.clarify.expiredTitle') : t('chat.clarify.outcomeDoneTitle') }}
       </span>
       <span class="clarify-outcome__detail">
-        {{ busy ? t('chat.clarify.outcomeBusyDetail') : t('chat.clarify.outcomeDoneDetail') }}
+        {{ expired ? t('chat.clarify.expiredDetail') : t('chat.clarify.outcomeDoneDetail') }}
       </span>
     </span>
   </div>
@@ -269,7 +270,7 @@
         role="status"
         aria-live="polite"
       >
-        {{ t('chat.clarify.sendingContinuing') }}
+        {{ t('chat.clarify.sendingReply') }}
       </p>
       <p v-if="error" class="clarify-card__error" role="alert">{{ error }}</p>
     </footer>
@@ -287,11 +288,13 @@ const { t } = useI18n()
 const props = withDefaults(defineProps<{
   request: ChatClarifyRequest
   submitted?: boolean
+  expired?: boolean
   busy?: boolean
   error?: string
   docked?: boolean
 }>(), {
   submitted: false,
+  expired: false,
   busy: false,
   error: '',
   docked: false,
@@ -886,7 +889,8 @@ function onSubmit() {
 }
 
 .clarify-outcome--plan,
-.clarify-outcome--plan.is-busy {
+.clarify-outcome--plan.is-busy,
+.clarify-outcome--expired {
   gap: var(--sp-2);
   background: var(--bg-surface);
   border-color: var(--border);

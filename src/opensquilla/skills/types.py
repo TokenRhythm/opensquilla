@@ -19,6 +19,26 @@ class SkillLayer(StrEnum):
     WORKSPACE = "workspace"
 
 
+class SkillVisibility(StrEnum):
+    """Which catalog surface may disclose a Skill."""
+
+    PUBLIC = "public"
+    META = "meta"
+    INTERNAL = "internal"
+    TOMBSTONE = "tombstone"
+    EXPERIMENTAL = "experimental"
+
+
+class SkillInvocation(StrEnum):
+    """Which execution domain may load or invoke a Skill."""
+
+    DIRECT = "direct"
+    META_ONLY = "meta_only"
+    CODING_ONLY = "coding_only"
+    HISTORICAL_ONLY = "historical_only"
+    EXPERIMENTAL_INTERNAL = "experimental_internal"
+
+
 @dataclass
 class SkillRequires:
     """Binary/env/config requirements for a skill."""
@@ -148,3 +168,9 @@ class SkillSpec:
     # a turn pinned to an older catalog cannot combine old instructions with
     # files published by a newer install or reload.
     tree_digest: str = ""
+    # Visibility and invocation are independent: a stable Meta root is visible
+    # on the Meta surface but never body-loadable through ordinary skill_view.
+    visibility: SkillVisibility = SkillVisibility.PUBLIC
+    invocation: SkillInvocation = SkillInvocation.DIRECT
+    # Stable Meta roots authorized to load this internal dependency.
+    owner_meta_skills: list[str] = field(default_factory=list)

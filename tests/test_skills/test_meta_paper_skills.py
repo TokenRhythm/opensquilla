@@ -560,12 +560,13 @@ def test_paper_refbib_stub_emits_bibtex_from_stdin_json(tmp_path: Path) -> None:
 def test_meta_paper_write_declares_long_paper_generation_contract() -> None:
     meta = (BUNDLED / "meta-paper-write" / "SKILL.md").read_text(encoding="utf-8")
     search = (BUNDLED / "multi-search-engine" / "SKILL.md").read_text(encoding="utf-8")
-    outline = (BUNDLED / "paper-outline-author" / "SKILL.md").read_text(encoding="utf-8")
     section = (BUNDLED / "paper-section-author" / "SKILL.md").read_text(encoding="utf-8")
 
     assert "{{ with.max_results | default(25) }}" in search
-    assert "10+ page" in outline
-    assert "20+ distinct citation keys" in outline
+    assert "paper_preferences" in meta
+    assert "writing_plan" in meta
+    assert "CITATION_TARGET" in meta
+    assert "TARGET_PAGES" in meta
     assert "writing-plan-derived" in section
     assert "Do not impose a fixed page count" in section
     assert "Write only the assigned section" in section
@@ -787,17 +788,6 @@ def test_meta_paper_write_scrubs_numeric_table_cells_before_compile() -> None:
     assert "Every non-label data cell MUST be a placeholder" in meta
 
 
-def test_paper_preference_planner_declares_two_generation_modes() -> None:
-    planner = (
-        BUNDLED / "paper-preference-planner" / "SKILL.md"
-    ).read_text(encoding="utf-8")
-
-    assert "MODE: DIRECT | PREFERENCE_DRIVEN" in planner
-    assert "direct generation" in planner
-    assert "ask the user" in planner
-    assert "do not invent preferences" in planner
-
-
 def test_bundled_meta_skills_do_not_exec_prompt_only_memory_skill() -> None:
     offenders: list[str] = []
     for skill_md in sorted([*BUNDLED.glob("meta-*/SKILL.md"), *EXP.glob("meta-*/SKILL.md")]):
@@ -822,242 +812,6 @@ def test_bundled_meta_skills_do_not_exec_prompt_only_memory_skill() -> None:
                 offenders.append(f"{data.get('name')}:{step.get('id')}")
 
     assert offenders == []
-
-
-def test_latex_compile_produces_pdf(tmp_path: Path) -> None:
-    pytest = __import__("pytest")
-    if shutil.which("xelatex") is None:
-        pytest.skip("xelatex not installed")
-
-    tex = tmp_path / "paper.tex"
-    tex.write_text(
-        r"""\documentclass{article}
-\begin{document}
-Hello, world.
-\end{document}
-""",
-        encoding="utf-8",
-    )
-    script = BUNDLED / "latex-compile" / "scripts" / "compile.py"
-    proc = subprocess.run(
-        [sys.executable, str(script), str(tex)],
-        check=True,
-        capture_output=True,
-        text=True,
-    )
-    pdf = tmp_path / "paper.pdf"
-    assert pdf.is_file()
-    assert pdf.read_bytes()[:4] == b"%PDF"
-    # stdout is the clean user-facing deliverable line (PDF path + size).
-    # The verbose xelatex log tail is routed to stderr so it survives for
-    # debugging without polluting the meta-skill's final_text payload.
-    assert "paper.pdf" in proc.stdout.lower()
-    assert "successfully" in proc.stdout.lower()
-
-
-def test_latex_compile_reassembles_clean_cjk_paper_from_section_files(
-    tmp_path: Path,
-) -> None:
-    from importlib.util import module_from_spec, spec_from_file_location
-
-    script = BUNDLED / "latex-compile" / "scripts" / "compile.py"
-    spec = spec_from_file_location("latex_compile_script", script)
-    assert spec is not None and spec.loader is not None
-    mod = module_from_spec(spec)
-    spec.loader.exec_module(mod)
-
-    workspace = tmp_path / "workspace"
-    paper_dir = workspace / "paper"
-    paper_dir.mkdir(parents=True)
-    tex = paper_dir / "paper.tex"
-    tex.write_text(
-        "\\documentclass{article}\n"
-        "\\begin{document}\n"
-        "Let me write the paper first. ```latex\\n"
-        "\\section{Method} 污染内容\\n```"
-        "\\end{document}\n",
-        encoding="utf-8",
-    )
-    (workspace / "abstract.tex").write_text(
-        "\\begin{abstract} 中文摘要。\\end{abstract}\n",
-        encoding="utf-8",
-    )
-    (workspace / "introduction.tex").write_text(
-        "\\section{Introduction} Clean intro.\n",
-        encoding="utf-8",
-    )
-    (paper_dir / "method.tex").write_text(
-        "\\section{实验方法} 中文方法。\n",
-        encoding="utf-8",
-    )
-    (workspace / "results.tex").write_text(
-        "\\section{Results} Clean results.\n",
-        encoding="utf-8",
-    )
-    (workspace / "discussion.tex").write_text(
-        "\\section{Discussion} Clean discussion.\n",
-        encoding="utf-8",
-    )
-    (paper_dir / "references.bib").write_text("", encoding="utf-8")
-
-    assert mod._prepare_tex_for_compile(tex) is True
-    rewritten = tex.read_text(encoding="utf-8")
-    assert "\\usepackage{xeCJK}" in rewritten
-    assert "\\setCJKmainfont" in rewritten
-    assert "\\section{实验方法} 中文方法。" in rewritten
-    assert "Let me write the paper first" not in rewritten
-    assert "```latex" not in rewritten
-
-
-def test_latex_compile_uses_managed_pinned_cjk_font(
-    tmp_path: Path,
-    monkeypatch,
-) -> None:
-    from importlib.util import module_from_spec, spec_from_file_location
-
-    script = BUNDLED / "latex-compile" / "scripts" / "compile.py"
-    spec = spec_from_file_location("latex_compile_managed_font", script)
-    assert spec is not None and spec.loader is not None
-    mod = module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    fonts = tmp_path / "managed-fonts"
-    fonts.mkdir()
-    (fonts / "NotoSansCJK-Regular.ttc").write_bytes(b"synthetic-font")
-    monkeypatch.setenv("OSFONTDIR", str(fonts))
-
-    preamble = mod._cjk_preamble("中文标题", "中文正文")
-
-    assert "\\usepackage{fontspec}" in preamble
-    assert "\\setmainfont[FontIndex=2]{NotoSansCJK-Regular.ttc}" in preamble
-    assert "xeCJK" not in preamble
-
-
-def test_latex_compile_keeps_clean_revised_body_over_section_files(
-    tmp_path: Path,
-) -> None:
-    from importlib.util import module_from_spec, spec_from_file_location
-
-    script = BUNDLED / "latex-compile" / "scripts" / "compile.py"
-    spec = spec_from_file_location("latex_compile_script", script)
-    assert spec is not None and spec.loader is not None
-    mod = module_from_spec(spec)
-    spec.loader.exec_module(mod)
-
-    workspace = tmp_path / "workspace"
-    paper_dir = workspace / "paper"
-    paper_dir.mkdir(parents=True)
-    tex = paper_dir / "paper.tex"
-    tex.write_text(
-        "\\documentclass{article}\n"
-        "\\begin{document}\n"
-        "\\begin{abstract} Final abstract.\\end{abstract}\n"
-        "\\section{Introduction} Revised intro.\n"
-        "\\section{Method} Revised method.\n"
-        "\\section{Results} Revised results.\n"
-        "\\section{Discussion} Revised discussion.\n"
-        "\\bibliography{references}\n"
-        "\\end{document}\n",
-        encoding="utf-8",
-    )
-    (workspace / "introduction.tex").write_text(
-        "\\section{Introduction} Stale intro.\n",
-        encoding="utf-8",
-    )
-    (paper_dir / "method.tex").write_text(
-        "\\section{Method} Stale method.\n",
-        encoding="utf-8",
-    )
-    (workspace / "results.tex").write_text(
-        "\\section{Results} Stale results.\n",
-        encoding="utf-8",
-    )
-    (workspace / "discussion.tex").write_text(
-        "\\section{Discussion} Stale discussion.\n",
-        encoding="utf-8",
-    )
-    (workspace / "abstract.tex").write_text(
-        "\\begin{abstract} Stale abstract.\\end{abstract}\n",
-        encoding="utf-8",
-    )
-
-    assert mod._prepare_tex_for_compile(tex) is False
-    rewritten = tex.read_text(encoding="utf-8")
-    assert "Revised intro" in rewritten
-    assert "Stale intro" not in rewritten
-
-
-def test_latex_compile_validates_long_paper_citation_contract(
-    tmp_path: Path,
-) -> None:
-    from importlib.util import module_from_spec, spec_from_file_location
-
-    script = BUNDLED / "latex-compile" / "scripts" / "compile.py"
-    spec = spec_from_file_location("latex_compile_script", script)
-    assert spec is not None and spec.loader is not None
-    mod = module_from_spec(spec)
-    spec.loader.exec_module(mod)
-
-    tex = tmp_path / "paper.tex"
-    tex.write_text(
-        "\\documentclass{article}\n"
-        "\\begin{document}\n"
-        "\\section{Introduction} Too few refs \\cite{ref1,ref2}.\n"
-        "\\bibliography{references}\n"
-        "\\end{document}\n",
-        encoding="utf-8",
-    )
-    (tmp_path / "references.bib").write_text(
-        "\n".join(
-            f"@misc{{ref{i}, title={{Reference {i}}}, year={{2026}}}}"
-            for i in range(1, 25)
-        ),
-        encoding="utf-8",
-    )
-
-    errors = mod._validate_citation_contract(tex, min_cited_refs=20)
-    assert any("at least 20 cited references" in error for error in errors)
-
-    tex.write_text(
-        "\\documentclass{article}\n"
-        "\\begin{document}\n"
-        "\\section{Introduction} "
-        + " ".join(f"\\cite{{ref{i}}}" for i in range(1, 21))
-        + " \\cite{missing_ref}.\n"
-        "\\bibliography{references}\n"
-        "\\end{document}\n",
-        encoding="utf-8",
-    )
-    errors = mod._validate_citation_contract(tex, min_cited_refs=20)
-    assert any("undefined citation keys: missing_ref" in error for error in errors)
-
-    tex.write_text(
-        "\\documentclass{article}\n"
-        "\\begin{document}\n"
-        "\\section{Introduction} "
-        + " ".join(f"\\cite{{ref{i}}}" for i in range(1, 21))
-        + ".\n"
-        "\\bibliography{references}\n"
-        "\\end{document}\n",
-        encoding="utf-8",
-    )
-    assert mod._validate_citation_contract(tex, min_cited_refs=20) == []
-
-
-def test_latex_compile_parses_minimum_page_contract() -> None:
-    from importlib.util import module_from_spec, spec_from_file_location
-
-    script = BUNDLED / "latex-compile" / "scripts" / "compile.py"
-    spec = spec_from_file_location("latex_compile_script", script)
-    assert spec is not None and spec.loader is not None
-    mod = module_from_spec(spec)
-    spec.loader.exec_module(mod)
-
-    short_log = "Output written on paper.pdf (9 pages, 12345 bytes)."
-    long_log = "Output written on paper.pdf (11 pages, 67890 bytes)."
-    assert mod._validate_page_contract(short_log, min_pages=10) == [
-        "paper must be at least 10 pages; compiled PDF has 9 pages"
-    ]
-    assert mod._validate_page_contract(long_log, min_pages=10) == []
 
 
 def test_meta_compile_pdf_reads_real_pdf_and_enforces_requested_pages(
@@ -1812,7 +1566,6 @@ def test_meta_compile_pdf_rejects_real_pdf_below_requested_pages(
     assert "PDF_PAGE_TARGET_NOT_MET" in error
     assert "requested at least 3 substantive pages; compiled PDF has 2 total" in error
     assert "PDF_PATH:" not in error
-
 
 @pytest.mark.parametrize("fail_at", [1, 2, 3, 4])
 def test_meta_compile_pdf_checks_every_tex_command_return_code(

@@ -299,7 +299,7 @@ async def test_transport_error_echoed_key_is_redacted_from_event_and_trace(
     errors = [event for event in events if isinstance(event, ErrorEvent)]
     assert len(errors) == 1
     error = errors[0]
-    assert error.code == "request_error"
+    assert error.code == "connection_failed"
     assert _API_KEY not in error.message
     assert _RAW_UPSTREAM_DETAIL in error.message
     assert classify_provider_error(
@@ -629,5 +629,5 @@ async def test_codex_transport_error_redacts_the_access_token(
 
     errors = [event for event in events if isinstance(event, ErrorEvent)]
     assert len(errors) == 1
-    assert errors[0].code == "request_error"
+    assert errors[0].code == "connection_failed"
     assert _ACCESS_TOKEN not in errors[0].message

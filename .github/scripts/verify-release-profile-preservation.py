@@ -4,10 +4,12 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import re
 import sqlite3
 import sys
+import tomllib
 from pathlib import Path
 
 _LABEL_PATTERN = re.compile(r"[A-Za-z0-9._-]{1,80}")
@@ -142,7 +144,7 @@ def _workspace_files(label: str) -> dict[str, str]:
     }
 
 
-def _config_text(home: Path, label: str) -> str:
+def _config_text(home: Path, label: str, *, signed_retained: bool = False) -> str:
     return (
         f"# Synthetic {label} release-preservation profile\n"
         f"state_dir = {json.dumps(str(home / 'state'))}\n"
@@ -153,7 +155,8 @@ def _config_text(home: Path, label: str) -> str:
         'provider = "ollama"\n'
         'model = "opensquilla-release-session-recovery-smoke"\n'
         'base_url = "http://127.0.0.1:11434"\n'
-        "\n"
+        + ("context_window_tokens = 131072\nmax_tokens = 4096\n" if signed_retained else "")
+        + "\n"
         "[squilla_router]\n"
         "enabled = false\n"
         "\n"
@@ -165,7 +168,7 @@ def _config_text(home: Path, label: str) -> str:
     )
 
 
-def _runtime_config_text(home: Path) -> str:
+def _runtime_config_text(home: Path, *, signed_retained: bool = False) -> str:
     """Return the deterministic config produced by the first current-runtime load."""
 
     return (
@@ -178,7 +181,8 @@ def _runtime_config_text(home: Path) -> str:
         'provider = "ollama"\n'
         'model = "opensquilla-release-session-recovery-smoke"\n'
         'base_url = "http://127.0.0.1:11434"\n'
-        "\n"
+        + ("context_window_tokens = 131072\nmax_tokens = 4096\n" if signed_retained else "")
+        + "\n"
         "[squilla_router]\n"
         "enabled = false\n"
         "\n"
@@ -228,8 +232,11 @@ def _verify_exact_bytes(path: Path, expected: bytes, label: str) -> None:
         raise AssertionError(f"{label} changed while installing or uninstalling Desktop")
 
 
-def seed_profile(home: Path, label: str, *, external_root: Path | None = None) -> None:
-    """Create a synthetic RC3-shaped profile without replacing any file."""
+def seed_profile(
+    home: Path, label: str, *, external_root: Path | None = None, signed_retained: bool = False,
+    baseline_version: str | None = None,
+) -> None:
+    """Create a synthetic historical profile without replacing any file."""
 
     home = home.resolve()
     workspace = home / "workspace"
@@ -245,14 +252,21 @@ def seed_profile(home: Path, label: str, *, external_root: Path | None = None) -
     state.mkdir(parents=True, exist_ok=True)
     for name, expected in _workspace_files(label).items():
         (workspace / name).write_text(expected, encoding="utf-8", newline="")
-    (home / "config.toml").write_text(_config_text(home, label), encoding="utf-8", newline="")
+    (home / "config.toml").write_text(
+        _config_text(home, label, signed_retained=signed_retained), encoding="utf-8", newline=""
+    )
     _write_new_bytes(_runtime_pack_sentinel_path(home), _RUNTIME_PACK_SENTINEL)
     if external_root is not None:
         for component, path in _external_sentinel_paths(external_root.resolve()).items():
             _write_new_bytes(path, _SYSTEM_TOOL_SENTINELS[component])
 
     with sqlite3.connect(state / "sessions.db") as connection:
-        connection.executescript(_RC3_SESSION_SCHEMA)
+        if baseline_version == "0.5.4":
+            from upgrade_baseline import schema_sql
+
+            connection.executescript(schema_sql())
+        else:
+            connection.executescript(_RC3_SESSION_SCHEMA)
         connection.execute(
             "CREATE TABLE release_preservation_chat (id TEXT PRIMARY KEY, body TEXT NOT NULL)"
         )
@@ -340,6 +354,48 @@ def seed_profile(home: Path, label: str, *, external_root: Path | None = None) -
         result = connection.execute("PRAGMA quick_check").fetchone()
         if result != ("ok",):
             raise RuntimeError(f"seeded sessions.db failed PRAGMA quick_check: {result!r}")
+    if baseline_version == "0.5.4":
+        from upgrade_baseline import verify_ledger
+
+        verify_ledger(state / "sessions.db", exact=True)
+
+
+def _config_change_summary(expected: str, actual: str) -> str:
+    """Diagnose preservation failures without printing configuration values."""
+
+    def changed_paths(before: dict, after: dict, prefix: str = "") -> list[str]:
+        missing = object()
+        paths: list[str] = []
+        for key in sorted(before.keys() | after.keys()):
+            path = f"{prefix}.{key}" if prefix else key
+            old, new = before.get(key, missing), after.get(key, missing)
+            if old == new:
+                continue
+            if isinstance(old, dict) or isinstance(new, dict):
+                paths.extend(
+                    changed_paths(
+                        old if isinstance(old, dict) else {},
+                        new if isinstance(new, dict) else {},
+                        path,
+                    )
+                )
+            else:
+                paths.append(path)
+        return paths
+
+    try:
+        paths = changed_paths(tomllib.loads(expected), tomllib.loads(actual))
+        semantic_change = {"changed_paths": paths[:20], "changed_path_count": len(paths)}
+    except tomllib.TOMLDecodeError:
+        semantic_change = {"invalid_toml": True}
+    return json.dumps(
+        {
+            "expected_text_sha256": hashlib.sha256(expected.encode("utf-8")).hexdigest(),
+            "actual_text_sha256": hashlib.sha256(actual.encode("utf-8")).hexdigest(),
+            **semantic_change,
+        },
+        sort_keys=True,
+    )
 
 
 def verify_profile(
@@ -347,6 +403,7 @@ def verify_profile(
     label: str,
     *,
     runtime_migrated: bool = False,
+    signed_retained: bool = False,
     external_root: Path | None = None,
 ) -> None:
     """Verify exact fixture bytes and a read-only SQLite integrity probe."""
@@ -361,11 +418,16 @@ def verify_profile(
 
     actual_config = (home / "config.toml").read_text(encoding="utf-8")
     expected_config = (
-        _runtime_config_text(home) if runtime_migrated else _config_text(home, label)
+        _runtime_config_text(home, signed_retained=signed_retained)
+        if runtime_migrated
+        else _config_text(home, label, signed_retained=signed_retained)
     )
     if actual_config != expected_config:
         phase = "after expected runtime migration" if runtime_migrated else "during installation"
-        raise AssertionError(f"config.toml changed unexpectedly {phase}")
+        raise AssertionError(
+            f"config.toml changed unexpectedly {phase}: "
+            f"{_config_change_summary(expected_config, actual_config)}"
+        )
 
     _verify_exact_bytes(
         _runtime_pack_sentinel_path(home),
@@ -441,9 +503,7 @@ def verify_profile(
         f"Synthetic retained switch session ({label})",
     )
     if switch_session_row != expected_switch_session:
-        raise AssertionError(
-            f"sessions.db switch-session row changed: {switch_session_row!r}"
-        )
+        raise AssertionError(f"sessions.db switch-session row changed: {switch_session_row!r}")
     expected_history = (
         LONG_SESSION_MESSAGE_COUNT,
         "release-recovery-message-0001",
@@ -454,38 +514,70 @@ def verify_profile(
     if history_row != expected_history:
         raise AssertionError(f"sessions.db long-session history changed: {history_row!r}")
     if first_message != (_long_history_message(label, 1),):
-        raise AssertionError(
-            f"sessions.db first long-session message changed: {first_message!r}"
-        )
+        raise AssertionError(f"sessions.db first long-session message changed: {first_message!r}")
     if last_message != (_long_history_message(label, LONG_SESSION_MESSAGE_COUNT),):
-        raise AssertionError(
-            f"sessions.db last long-session message changed: {last_message!r}"
-        )
+        raise AssertionError(f"sessions.db last long-session message changed: {last_message!r}")
 
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
-    parser.add_argument("operation", choices=("seed", "verify", "verify-runtime"))
+    parser.add_argument(
+        "operation",
+        choices=(
+            "seed",
+            "seed-signed-retained",
+            "verify",
+            "verify-runtime",
+            "verify-signed-retained",
+        ),
+    )
     parser.add_argument("--home", type=Path, required=True)
     parser.add_argument("--label", type=_validated_label, required=True)
     parser.add_argument("--external-root", type=Path)
+    parser.add_argument("--baseline-version", choices=("0.5.3", "0.5.4"))
     return parser
 
 
 def main() -> int:
     args = _parser().parse_args()
     try:
-        if args.operation == "seed":
-            seed_profile(args.home, args.label, external_root=args.external_root)
+        if args.operation in {"seed", "seed-signed-retained"}:
+            seed_profile(
+                args.home,
+                args.label,
+                external_root=args.external_root,
+                signed_retained=args.operation == "seed-signed-retained",
+                baseline_version=args.baseline_version,
+            )
             print(f"profile preservation fixture seeded: {args.home}")
         else:
             runtime_migrated = args.operation == "verify-runtime"
+            signed_retained = False
+            if args.operation == "verify-signed-retained":
+                # A signed current-runtime upgrade may leave the original
+                # config untouched. Accept only that exact seed or the exact
+                # known migration; every other preservation assertion remains
+                # identical. Legacy verify/verify-runtime keep their semantics.
+                home = args.home.resolve()
+                actual = (home / "config.toml").read_text(encoding="utf-8")
+                signed_retained = actual in {
+                    _config_text(home, args.label, signed_retained=True),
+                    _runtime_config_text(home, signed_retained=True),
+                }
+                runtime_migrated = actual != _config_text(
+                    home, args.label, signed_retained=signed_retained
+                )
             verify_profile(
                 args.home,
                 args.label,
                 runtime_migrated=runtime_migrated,
+                signed_retained=signed_retained,
                 external_root=args.external_root,
             )
+            if args.baseline_version == "0.5.4":
+                from upgrade_baseline import verify_ledger
+
+                verify_ledger(args.home / "state/sessions.db")
             suffix = " after runtime migration" if runtime_migrated else ""
             print(f"profile preservation verified{suffix}: {args.home}")
     except (

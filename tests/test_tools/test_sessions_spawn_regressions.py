@@ -750,6 +750,175 @@ async def test_spawned_child_restart_uses_persisted_inherited_authority_at_boot(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["managed", "configured"])
+@pytest.mark.parametrize("root_change", [None, "missing", "symlink", "ancestor_symlink"])
+async def test_task_workspace_spawn_survives_restart_and_revalidates(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, kind: str, root_change: str | None,
+) -> None:
+    from opensquilla.execution_workspaces import configured_execution_workspace
+    from opensquilla.project_workspaces import ProjectWorkspaceStateError
+    from opensquilla.sandbox.escalation import (
+        current_tool_run_context,
+        reset_resolved_run_context_overlays,
+    )
+    from opensquilla.sandbox.operation_runtime import SandboxOperationResult
+    from opensquilla.tools.builtin import filesystem
+
+    reset_resolved_run_context_overlays()
+    root = tmp_path / "task-parent" / "task-root"
+    fallback = tmp_path / "other-agent-default"
+    root.mkdir(parents=True)
+    fallback.mkdir()
+    binding = configured_execution_workspace(root)
+    binding["kind"] = kind
+    config = GatewayConfig(
+        workspace_dir=str(fallback), sandbox={"run_mode": "full"},
+        memory={"flush_enabled": False}, naming={"enabled": False},
+    )
+    database = tmp_path / "task-sessions.db"
+    storage = await SessionStorage.open(str(database))
+    manager = SessionManager(storage, inject_time_prefix=False)
+    runtime = _StubTaskRuntime()
+    parent = await manager.create(
+        "agent:main:webchat:task-parent", execution_workspace=binding,
+    )
+    sessions_tool.set_gateway_config(config)
+    sessions_tool.set_session_manager(manager)
+    sessions_tool.set_task_runtime(runtime)
+    # Even an old saved context cannot replace the durable directory authority.
+    context = RunContext(
+        workspace=str(fallback), run_mode=RunMode.SAFE,
+        run_mode_source="user", source="saved",
+    )
+    parent_context = ToolContext(
+        is_owner=True, caller_kind=CallerKind.AGENT, agent_id="main",
+        session_key=parent.session_key, task_id="task-parent",
+        sandbox_run_context=context, run_mode="standard",
+    )
+    setattr(parent_context, "_sandbox_run_context_fresh", True)
+    token = current_tool_context.set(parent_context)
+    try:
+        spawned = json.loads(await sessions_tool.sessions_spawn(
+            task="write child.txt in this task", agent_id="worker",
+        ))
+        child = await storage.get_session(spawned["session_key"])
+        assert child is not None
+        assert child.execution_workspace == binding
+        assert child.agent_id == "worker"
+    finally:
+        current_tool_context.reset(token)
+        await storage.close()
+
+    queued = runtime.enqueued[0]
+    run = TaskRun(
+        task_id=spawned["task_id"], envelope=queued["envelope"],
+        message=queued["message"], queue_mode=queued["mode"], run_kind=queued["run_kind"],
+    )
+    restarted = await SessionStorage.open(str(database))
+    observations: list[tuple[str | None, RunMode]] = []
+
+    class Backend:
+        name = "recording-filesystem"
+
+        def operation_domains_supported(self) -> frozenset[str]:
+            return frozenset({"filesystem"})
+
+        async def run_operation(self, operation: Any) -> SandboxOperationResult:
+            request = operation.request
+            request.path.write_text(request.content, encoding="utf-8")
+            return SandboxOperationResult(message="written", created=True)
+
+    monkeypatch.setattr(filesystem, "get_runtime", lambda: SimpleNamespace(
+        effective=SimpleNamespace(sandbox_enabled=True), backend=Backend(),
+        settings=SimpleNamespace(host_root_readonly=False), workspace=fallback,
+    ))
+
+    class Runner:
+        async def run(self, message: str, session_key: str, **kwargs: Any):
+            child_token = current_tool_context.set(kwargs["tool_context"])
+            try:
+                effective = current_tool_run_context()
+                assert effective is not None
+                observations.append((effective.workspace, effective.run_mode))
+                await filesystem.write_file("child.txt", "inherited task")
+            finally:
+                current_tool_context.reset(child_token)
+            yield DoneEvent()
+
+    async def emit(*args: Any, **kwargs: Any) -> None:
+        pass
+
+    if root_change == "ancestor_symlink":
+        root.parent.rename(tmp_path / "original-task-parent")
+        (fallback / "task-root").mkdir()
+        root.parent.symlink_to(fallback, target_is_directory=True)
+    elif root_change is not None:
+        root.rename(tmp_path / "original-task-root")
+        if root_change == "symlink":
+            root.symlink_to(fallback, target_is_directory=True)
+    try:
+        dispatch = dispatch_task_runtime_turn(
+            run, config=config,
+            session_manager=SessionManager(restarted, inject_time_prefix=False),
+            turn_runner=Runner(), event_emitter=emit,
+        )
+        if root_change is None:
+            await dispatch
+            assert observations == [(str(root), RunMode.SAFE)]
+            assert (root / "child.txt").read_text() == "inherited task"
+        else:
+            with pytest.raises(ProjectWorkspaceStateError):
+                await dispatch
+            assert observations == []
+            if root_change == "missing":
+                assert not root.exists()
+        assert not (fallback / "child.txt").exists()
+        assert not (fallback / "task-root" / "child.txt").exists()
+    finally:
+        await restarted.close()
+        reset_resolved_run_context_overlays()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("root_change", ["missing", "symlink"])
+async def test_task_workspace_spawn_rejects_invalid_root_before_creating_child(
+    tmp_path: Path, root_change: str,
+) -> None:
+    from opensquilla.execution_workspaces import configured_execution_workspace
+    from opensquilla.project_workspaces import ProjectWorkspaceStateError
+
+    root = tmp_path / "parent-workspace"
+    replacement = tmp_path / "replacement"
+    root.mkdir()
+    replacement.mkdir()
+    storage = await SessionStorage.open(str(tmp_path / "sessions.db"))
+    manager = SessionManager(storage, inject_time_prefix=False)
+    parent = await manager.create(
+        "agent:main:webchat:invalid-root-parent",
+        execution_workspace=configured_execution_workspace(root),
+    )
+    runtime = _StubTaskRuntime()
+    sessions_tool.set_session_manager(manager)
+    sessions_tool.set_task_runtime(runtime)
+    root.rename(tmp_path / "original-workspace")
+    if root_change == "symlink":
+        root.symlink_to(replacement, target_is_directory=True)
+    token = current_tool_context.set(ToolContext(
+        is_owner=True, caller_kind=CallerKind.AGENT,
+        agent_id="main", session_key=parent.session_key,
+    ))
+    try:
+        with pytest.raises(ProjectWorkspaceStateError):
+            await sessions_tool.sessions_spawn(task="must not run")
+        assert runtime.enqueued == []
+        assert len(await manager.list_sessions()) == 1
+        assert list(replacement.iterdir()) == []
+    finally:
+        current_tool_context.reset(token)
+        await storage.close()
+
+
+@pytest.mark.asyncio
 async def test_project_spawned_child_persists_binding_and_revalidates_queued_execution(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

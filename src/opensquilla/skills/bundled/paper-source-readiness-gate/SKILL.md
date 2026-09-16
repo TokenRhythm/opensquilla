@@ -1,5 +1,9 @@
 ---
 name: paper-source-readiness-gate
+visibility: internal
+invocation: meta_only
+owner_meta_skills:
+  - meta-paper-write
 description: "Deterministic early source-coverage gate for meta-paper-write. Stops drafting before expensive section generation when the curated, verifiable bibliography cannot meet the numeric citation target."
 user-invocable: false
 disable-model-invocation: true

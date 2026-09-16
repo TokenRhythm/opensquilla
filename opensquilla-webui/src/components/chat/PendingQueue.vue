@@ -31,6 +31,9 @@
       <p class="chat-pending-text" :title="displayText(item)">
         {{ displayText(item) }}
       </p>
+      <span v-if="item.retiredAnnotationInput" class="chat-pending-save-status" role="status">
+        {{ t('chat.pending.annotationUpgradeRequired') }}
+      </span>
       <span
         v-if="item.pendingPersistenceState === 'saving'"
         class="chat-pending-save-status"
@@ -105,7 +108,7 @@
             <button
               type="button"
               role="menuitem"
-              :disabled="!!item.deliveryState || !!item.steerAttempt || hasUneditableMaterial(item)"
+              :disabled="!!item.deliveryState || !!item.steerAttempt || !!item.pageContext || hasUneditableMaterial(item)"
               @click="chooseEdit(item.pendingUiId)"
             >
               <Icon name="pencil" :size="15" />
@@ -154,6 +157,8 @@ interface PendingQueueItem {
   pendingInputId?: string
   displayTextOverride?: string
   hiddenControl?: boolean
+  retiredAnnotationInput?: boolean
+  pageContext?: import('@/types/pageContext').ChatPageContext
   attachments?: Attachment[]
   deliveryState?: 'steering' | 'retryable'
   steerAttempt?: PendingSteerAttempt
@@ -286,7 +291,7 @@ function removeLabel(item: PendingQueueItem, index: number): string {
 }
 
 function canShowSteer(item: PendingQueueItem): boolean {
-  return !item.hiddenControl
+  return !item.hiddenControl && !item.retiredAnnotationInput && !item.pageContext
 }
 
 function hasUnsendableAttachment(item: PendingQueueItem): boolean {

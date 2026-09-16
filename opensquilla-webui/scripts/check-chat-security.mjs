@@ -1,4 +1,4 @@
-import { readFileSync } from 'node:fs'
+import { existsSync, readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
@@ -9,6 +9,17 @@ function read(rel) {
 }
 
 const failures = []
+
+for (const rel of [
+  'src/workbench/artifactPromptAnnotationProvider.ts',
+  'src/adapters/gateway/artifactPromptAnnotationsV4.ts',
+  'src/stores/workbenchDocumentContext.ts',
+  'src/components/workbench/ArtifactHtmlStudio.vue',
+]) {
+  if (existsSync(join(root, rel))) {
+    failures.push(`${rel}: retired document editing entry points must remain absent.`)
+  }
+}
 
 function assertAbsent(rel, pattern, message) {
   const body = read(rel)
@@ -56,7 +67,6 @@ for (const rel of [
 for (const rel of [
   'src/workbench/workbenchResourceProvider.ts',
   'src/workbench/artifactDocumentProvider.ts',
-  'src/workbench/artifactPromptAnnotationProvider.ts',
 ]) {
   assertAbsent(
     rel,

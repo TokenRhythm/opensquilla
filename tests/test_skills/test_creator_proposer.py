@@ -76,8 +76,8 @@ def test_meta_skill_fill_slots_with_stub_llm(monkeypatch) -> None:
         "meta_priority": 50,
         "triggers": ["synth test"],
         "steps": [
-            {"id": "a", "skill": "summarize", "task": "process", "with_keys": {}},
-            {"id": "b", "skill": "memory", "task": "save", "with_keys": {}},
+            {"id": "a", "skill": "deep-research", "task": "process", "with_keys": {}},
+            {"id": "b", "skill": "docx", "task": "save", "with_keys": {}},
         ],
     })
 
@@ -96,7 +96,8 @@ def test_meta_skill_fill_slots_with_stub_llm(monkeypatch) -> None:
     assert data["name"] == "synth-pipeline"
     assert len(call_log) == 1
     # Catalog injection: skill names must appear in prompt
-    assert "summarize" in call_log[0]
+    assert "deep-research" in call_log[0]
+    assert "docx" in call_log[0]
 
 
 def test_creator_package_import_registers_tools() -> None:

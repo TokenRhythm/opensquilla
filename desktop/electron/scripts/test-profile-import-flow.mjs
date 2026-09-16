@@ -263,6 +263,7 @@ function launchEnvironment(isolatedHome, port) {
     OPENSQUILLA_TEST_PROFILE_LOCK_ROOT: '1',
     OPENSQUILLA_DESKTOP_GATEWAY_PORT: String(port),
     OPENSQUILLA_DESKTOP_DISABLE_AUTO_UPDATE: '1',
+    OPENSQUILLA_TESTING: '1',
     OPENSQUILLA_OPENROUTER_LIVE_PRICING: '0',
     UV_CACHE_DIR: join(isolatedHome, '.uv-cache'),
     HTTP_PROXY: 'http://127.0.0.1:1',
@@ -296,6 +297,11 @@ async function onboardingPage(app) {
     }
     return null
   }, 'Desktop onboarding')
+}
+
+async function assertUnifiedTelemetryNotice(page) {
+  assert.equal(await page.locator('input[name="reliabilityDiagnosticsEnabled"], input[name="productAnalyticsEnabled"]').count(), 0)
+  assert.equal(await page.locator('[data-i18n="onboarding.telemetry.notice"]').count(), 1)
 }
 
 async function captureOnboarding(app, path) {
@@ -351,6 +357,7 @@ async function selectOllamaAndCompleteOnboarding(page) {
   if (!(await page.locator('#model').inputValue()).trim()) {
     await page.locator('#model').fill('synthetic-local-model')
   }
+  await assertUnifiedTelemetryNotice(page)
   await page.locator('#finish').click()
 }
 
@@ -584,6 +591,7 @@ try {
     join(settingsUserData, 'migration-provider-setup.json'),
   )
   await requiredKeyOnboarding.locator('#apiKey').fill('synthetic-new-imported-key')
+  await assertUnifiedTelemetryNotice(requiredKeyOnboarding)
   await requiredKeyOnboarding.locator('#finish').click()
 
   const rejectedProbeError = await waitFor(async () => {
@@ -643,10 +651,11 @@ try {
     'Bearer synthetic-new-imported-key',
   )
   assert.equal(JSON.parse(fakeProvider.requests[1].body).model, 'gpt-5.4-mini')
-  assert.deepEqual(
-    await readFile(join(settingsTarget, 'config.toml')),
-    importedConfigBeforeCredential,
-    'provider adoption rewrote imported config.toml',
+  const adoptedConfig = await readFile(join(settingsTarget, 'config.toml'), 'utf8')
+  assert.equal(
+    adoptedConfig,
+    importedConfigBeforeCredential.toString('utf8'),
+    'provider adoption must preserve the imported reporting configuration',
   )
   assert.deepEqual(
     await readFile(join(settingsTarget, '.env')),
@@ -665,6 +674,7 @@ try {
     await readFile(join(settingsUserData, settingsBackups[0], 'workspace', 'IDENTITY.md'), 'utf8'),
     TARGET_IDENTITY,
   )
+  assert.equal(Object.hasOwn(adopted, 'routerPresetBinding'), false)
   const credentialBackup = join(
     settingsUserData,
     `desktop-credential.import-backup.${adopted.importTransactionId}.json`,

@@ -77,35 +77,45 @@ Set `OPENSQUILLA_PREVIEW_FORCE_OFFLINE=1` before starting the Desktop app or
 gateway to disable full-network artifact previews as an incident-response
 measure.
 
-The release-gated Desktop PromptAnnotation workflow can bind modification
-instructions to exact elements in supported single-file HTML artifacts. It is
-disabled by default and has narrower format and trust-boundary requirements
-than ordinary preview. Maintainers and operators should use the
-[Prompt-Annotation editing guide](features/prompt-annotation-editing.md) for
-capability checks, safe local verification, rollout, and rollback.
+Use **Annotate** on an open page to attach selections and instructions to an
+ordinary chat message. The Agent chooses whether to inspect files, edit them,
+or use the Desktop browser tool on the existing preview. An annotation does
+not prescribe a sequence of tools. See the
+[HTML annotation and editing guide](features/prompt-annotation-editing.md) for
+working-file behavior, browser availability, and upgrade compatibility.
 
 ### Workbench resources and editable Documents
 
-The release-gated resource Workbench keeps four lifecycles separate even when
-they share one right-hand panel:
+The resource Workbench presents several related kinds of content in the same
+right-hand panel:
 
 - an attachment is an immutable session input;
-- a Document is an editable identity with a current head, immutable Revisions,
-  and audited ChangeSets;
+- a Document has normal working files, a current version, immutable historical
+  Revisions, and audited changes;
 - a deliverable is an immutable published snapshot;
-- a preview or EditSession is temporary host state, not stored content.
+- a preview is temporary host state that displays those resources.
 
-Previewing an attachment is read-only. Selecting **Edit** explicitly imports a
-copy into a Document; repeated or response-lost requests resolve the same
-durable import receipt. Editing the Document never changes the source
-attachment. Selecting **Publish** fixes one named Revision into a new
-deliverable, so later Document edits cannot alter an already published file.
+Opening supported HTML for editing imports a copy into a Document. Repeated
+or response-lost imports resolve the same durable receipt, and editing the
+copy never changes the source attachment. A generated HTML project that has
+been published can retain its exact workspace source as the Document's
+working files, so later edits continue the same document.
 
-The initial editable format is a bounded, single-file, NUL-free UTF-8 HTML
-document. Office files remain discoverable and downloadable, but preview and
-edit capabilities stay false with an explicit reason until their format
-adapter and renderer are available. Workspace paths, `file://` URLs, remote
-URLs, and automatic upload promotion are not canonical Document sources.
+Working files include the HTML entry and its saved local resources. Preview
+reflects those files; a successfully completed turn saves a version when the
+bundle changed. Failed or cancelled turns retain working files for later work
+without automatically saving a completion version. An explicit publication
+that already succeeded remains in history. Restoring a version restores its
+owned resource bundle while preserving unrelated workspace files. Publishing
+fixes a selected Revision into a deliverable that later edits cannot change.
+
+The editable entry must be supported, NUL-free UTF-8 HTML within the format's
+size limits; saved CSS, JavaScript, images, and other local bundle resources
+stay with it. This does not make Office formats editable: they remain
+available for discovery and download, with preview and edit support reported
+per format. Remote URLs and arbitrary workspace paths are not accepted as
+attachment imports. Generated workspace sources are bound only through their
+verified publication provenance; automatic upload promotion is not used.
 
 ## When to Use Artifacts Instead of Chat
 

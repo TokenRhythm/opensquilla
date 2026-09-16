@@ -39,6 +39,30 @@ describe('attachmentAccessUrl', () => {
 })
 
 describe('fetchDisplayAttachmentBlob', () => {
+  it('reads legacy image data URLs without fetching them', async () => {
+    const http = httpTransport()
+    const result = await fetchDisplayAttachmentBlob(http, attachment({
+      mime: 'image/png',
+      dataUrl: 'data:image/png;base64,aW1hZ2U=',
+    }))
+    expect(result.ok).toBe(true)
+    if (result.ok) {
+      expect(await result.blob.text()).toBe('image')
+      expect(result.blob.type).toBe('image/png')
+    }
+    expect(http.requestBinary).not.toHaveBeenCalled()
+  })
+
+  it('does not interpret active-document data URLs as inline images', async () => {
+    for (const mime of ['image/svg+xml', 'text/html']) {
+      const result = await fetchDisplayAttachmentBlob(httpTransport(), attachment({
+        mime: 'image/png',
+        dataUrl: `data:${mime};base64,aW1hZ2U=`,
+      }))
+      expect(result.ok).toBe(false)
+    }
+  })
+
   it('prefers the local file over inline bytes and staged URLs', async () => {
     const localFile = new File(['local'], '../local.html', { type: 'text/html' })
     const http = httpTransport()

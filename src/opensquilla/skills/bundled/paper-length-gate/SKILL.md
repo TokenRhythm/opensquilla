@@ -1,5 +1,9 @@
 ---
 name: paper-length-gate
+visibility: internal
+invocation: meta_only
+owner_meta_skills:
+  - meta-paper-write
 description: "Deterministic artifact-backed manuscript readiness gate for meta-paper-write. Validates the workspace LaTeX artifact before compilation while leaving final page-count enforcement to compile_pdf."
 user-invocable: false
 disable-model-invocation: true

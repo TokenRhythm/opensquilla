@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import copy
 import getpass
 import json
@@ -228,11 +229,7 @@ async def run_agent_once(
             AcceptedRunModeOverride,
         )
 
-        run_mode = (
-            "full"
-            if permissions_profile in {"bypass", "full"}
-            else "safe"
-        )
+        run_mode = "full" if permissions_profile in {"bypass", "full"} else "safe"
         accepted_run_mode_override = AcceptedRunModeOverride(
             run_mode=normalize_run_mode(run_mode),
             run_mode_source="user",
@@ -320,6 +317,7 @@ async def run_agent_once(
             failure_mode="raise",
             accept_opaque=bool(getattr(attachments_cfg, "accept_opaque", True)),
             opaque_limit_bytes=opaque_cap if isinstance(opaque_cap, int) else None,
+            persist_enabled=bool(getattr(attachments_cfg, "persist_transcripts", True)),
         )
         message = ingested_attachments.text
         run_attachments = ingested_attachments.attachments
@@ -457,6 +455,28 @@ async def run_agent_once(
             stateless_keep_project_rules=stateless_keep_project_rules,
         )
 
+        from opensquilla.telemetry.contracts.common import (
+            ClientEntrypoint,
+            ClientSurface,
+            ExecutionMode,
+        )
+
+        growth_sink = getattr(svc, "growth_event_sink", None)
+        record_launch = getattr(growth_sink, "record_client_launch", None)
+        # Internal coding Agents retain turn/tool diagnostics, but their
+        # disposable profiles must not inflate CLI users or launch counts.
+        # Stateless is independent: a user's stateless CLI run still counts.
+        if callable(record_launch) and os.environ.get("OPENSQUILLA_CODETASK_CHILD") != "1":
+            await record_launch(
+                surface=ClientSurface.CLI,
+                entrypoint=ClientEntrypoint.AGENT,
+                execution_mode=ExecutionMode.ONE_SHOT,
+            )
+        record_active = getattr(growth_sink, "record_product_active", None)
+        if callable(record_active) and os.environ.get("OPENSQUILLA_CODETASK_CHILD") != "1":
+            with contextlib.suppress(Exception):
+                await record_active(surface=ClientSurface.CLI)
+
         async for event in runner.run(
             message,
             session_key,
@@ -474,6 +494,8 @@ async def run_agent_once(
             no_memory_capture=no_memory_capture,
             attachments=run_attachments,
             bootstrap_context_mode=bootstrap_context_mode,
+            telemetry_surface=ClientSurface.CLI,
+            telemetry_execution_mode=ExecutionMode.ONE_SHOT,
             **owner_kwargs,
         ):
             if event_sink is not None:
@@ -494,13 +516,9 @@ async def run_agent_once(
                     errors.append(
                         {
                             "message": (
-                                event.terminal_error_message
-                                or "The model provider request failed."
+                                event.terminal_error_message or "The model provider request failed."
                             ),
-                            "code": (
-                                event.terminal_error_code
-                                or "ensemble_fixed_error"
-                            ),
+                            "code": (event.terminal_error_code or "ensemble_fixed_error"),
                         }
                     )
             elif isinstance(event, ErrorEvent):
@@ -592,11 +610,16 @@ def _with_agent_workspace_config(config: Any, workspace: str) -> Any:
     if memory is not None:
         update["memory"] = memory
     if hasattr(config, "model_copy"):
-        return config.model_copy(update=update)
-    copied = copy.copy(config)
-    setattr(copied, "workspace_dir", workspace)
-    if memory is not None:
-        setattr(copied, "memory", memory)
+        copied = config.model_copy(update=update)
+    else:
+        copied = copy.copy(config)
+        setattr(copied, "workspace_dir", workspace)
+        if memory is not None:
+            setattr(copied, "memory", memory)
+    # The CLI's effective startup root is trusted, including its legacy
+    # configured default. Gateway task allocation must not replace it.
+    if hasattr(copied, "_workspace_dir_explicit"):
+        copied._workspace_dir_explicit = True
     return copied
 
 
@@ -932,12 +955,14 @@ def run_agent_command(
     iteration_timeout_seconds: float | None = typer.Option(
         None,
         "--iteration-timeout-seconds",
-        help="Per-iteration timeout in seconds (one LLM call + its tool executions)",
+        help="Deprecated compatibility option; ignored.",
+        hidden=True,
     ),
     tool_timeout_seconds: float | None = typer.Option(
         None,
         "--tool-timeout-seconds",
-        help="Per-tool execution timeout in seconds",
+        help="Deprecated compatibility option; ignored.",
+        hidden=True,
     ),
     request_timeout_seconds: float | None = typer.Option(
         None,

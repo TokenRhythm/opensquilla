@@ -1,15 +1,114 @@
 from __future__ import annotations
 
+import base64
 import hashlib
 from pathlib import Path
+
+import pytest
 
 from opensquilla.attachment_refs import make_attachment_ref, write_transcript_material
 from opensquilla.attachment_workspace import (
     AttachmentWorkspaceMaterializer,
     is_materializable_attachment_mime,
 )
+from tests.helpers.image_bytes import image_bytes
 
 _MATERIALIZABLE_MIMES = frozenset({"application/pdf", "text/plain"})
+
+
+def test_materialization_checks_write_authority_before_creating_directories(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    checked = []
+
+    def reject_write(target: Path) -> None:
+        checked.append(target)
+        raise PermissionError("Workspace is read-only")
+
+    result = AttachmentWorkspaceMaterializer(
+        media_root=tmp_path / "media", workspace_dir=workspace, authorize_write=reject_write,
+    ).materialize_bytes(b"content", name="sample.txt", mime="text/plain", session_id="session-a")
+
+    assert not result.available
+    assert result.error == "Workspace is read-only"
+    assert len(checked) == 1
+    checked[0].relative_to(workspace / ".opensquilla" / "attachments" / "session-a")
+    assert not workspace.exists()
+
+
+def test_materialization_rejects_directory_escape_before_creating_scope(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    try:
+        (workspace / ".opensquilla").symlink_to(outside, target_is_directory=True)
+    except OSError:
+        pytest.skip("Creating directory symlinks requires host support")
+
+    result = AttachmentWorkspaceMaterializer(
+        media_root=tmp_path / "media", workspace_dir=workspace,
+    ).materialize_bytes(b"content", name="sample.txt", mime="text/plain", session_id="session-a")
+
+    assert not result.available
+    assert not list(outside.iterdir())
+
+
+def test_retained_image_path_uses_validated_bytes_and_controlled_scope(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    media_root = tmp_path / "media"
+    materializer = AttachmentWorkspaceMaterializer(media_root=media_root, workspace_dir=workspace)
+    payload = image_bytes("JPEG")
+    attachment = {
+        "type": "image/jpeg", "name": "../../image.jpg", "path": "/untrusted/image.jpg",
+        "data": base64.b64encode(payload).decode(),
+    }
+
+    path = materializer.materialize_image_path(attachment, "session-image")
+
+    assert path is not None
+    assert path.startswith(".opensquilla/attachments/session-image/")
+    assert (workspace / path).read_bytes() == payload
+    assert ".." not in Path(path).parts
+    assert attachment["path"] == "/untrusted/image.jpg"
+    assert materializer.materialize_image_path(attachment, "session-image") == path
+
+
+def test_retained_ref_image_path_can_reopen_a_forked_source(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    media_root = tmp_path / "media"
+    payload = image_bytes()
+    sha, source, _ = write_transcript_material(
+        media_root=media_root, session_id="source-session", payload=payload,
+    )
+    ref = make_attachment_ref(
+        sha256=sha, name="image.png", mime="image/png", size=len(payload),
+        session_id="source-session", source="transcript",
+    )
+    materializer = AttachmentWorkspaceMaterializer(media_root=media_root, workspace_dir=workspace)
+
+    path = materializer.materialize_image_path(ref, "fork-session")
+
+    assert path is not None
+    assert path.startswith(".opensquilla/attachments/fork-session/")
+    assert (workspace / path).read_bytes() == source.read_bytes() == payload
+    assert source.exists()
+
+
+def test_retained_image_path_does_not_advertise_missing_or_invalid_material(tmp_path: Path) -> None:
+    materializer = AttachmentWorkspaceMaterializer(
+        media_root=tmp_path / "media", workspace_dir=tmp_path / "workspace",
+    )
+    for attachment in [
+        {"type": "image/png", "data": base64.b64encode(b"invalid").decode()},
+        {"type": "image/png", "path": "/untrusted/image.png"},
+        {"type": "image/png", "sha256_ref": "a" * 64, "name": "missing.png"},
+        {
+            "type": "image/png", "data": base64.b64encode(image_bytes()).decode(),
+            "missing_reason": "not_persisted",
+        },
+    ]:
+        assert materializer.materialize_image_path(attachment, "session-image") is None
+    assert not (tmp_path / "workspace" / ".opensquilla").exists()
 
 
 def test_unsupported_mime_is_not_materialized(tmp_path: Path) -> None:

@@ -362,6 +362,7 @@ function showRawDetails() {
       inputRaw: redactActivityDetail(props.call.inputRaw || props.call.inputPreview),
       section: detail.rawSection,
       format: detail.detailMode === 'changes' ? 'diff' : undefined,
+      executionLogHandle: props.call.executionLogHandle,
     },
   )
 }

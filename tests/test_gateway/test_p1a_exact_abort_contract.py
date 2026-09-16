@@ -238,7 +238,10 @@ async def test_exact_abort_starts_process_cleanup_before_slow_completion_deadlin
 
     release_process.set()
     await asyncio.wait_for(process_finished.wait(), timeout=0.2)
-    await asyncio.wait_for(completion_cancelled.wait(), timeout=0.2)
+    # The cancellation is dispatched independently from the RPC response;
+    # allow slower Windows event-loop scheduling to deliver it without
+    # changing the production cleanup deadline being exercised above.
+    await asyncio.wait_for(completion_cancelled.wait(), timeout=1.0)
 
 
 @pytest.mark.asyncio

@@ -44,7 +44,8 @@ if ($env:OPENSQUILLA_PREFIX) {
 }
 
 $dryRun = $env:OPENSQUILLA_INSTALL_DRY_RUN -eq '1'
-$webuiDir = Join-Path (Split-Path -Parent $PSScriptRoot) 'opensquilla-webui'
+$sourceRoot = Split-Path -Parent $PSScriptRoot
+$webuiDir = Join-Path $sourceRoot 'opensquilla-webui'
 $nodeVersionFile = Join-Path $webuiDir '.node-version'
 if (-not (Test-Path $nodeVersionFile -PathType Leaf)) {
     Write-Error "install_source.ps1: required Node.js version file is missing: $nodeVersionFile"
@@ -118,9 +119,9 @@ switch ($profile) {
 
 $targetExtras += $installExtras
 $installTarget = if ($targetExtras.Count -gt 0) {
-    ".[$($targetExtras -join ',')]"
+    "${sourceRoot}[$($targetExtras -join ',')]"
 } else {
-    '.'
+    $sourceRoot
 }
 
 function Test-SquillaRouterAssets {
@@ -132,7 +133,7 @@ function Test-SquillaRouterAssets {
         return
     }
 
-    $modelRoot = 'src/opensquilla/squilla_router/models'
+    $modelRoot = Join-Path $sourceRoot 'src/opensquilla/squilla_router/models'
     $required = @(
         "$modelRoot/v4.2_phase3_inference/lgbm_main.bin",
         "$modelRoot/v4.2_phase3_inference/router.runtime.yaml",
@@ -157,7 +158,7 @@ function Test-SquillaRouterAssets {
 
     if ($missing.Count -gt 0 -or $pointers.Count -gt 0) {
         if ($WarnOnly) {
-            Write-Host 'install_source.ps1: dry-run note — real recommended install would fail until bundled squilla-router v4 assets are available in this checkout.'
+            Write-Host 'install_source.ps1: dry-run note - real recommended install would fail until bundled squilla-router v4 assets are available in this checkout.'
         }
         else {
             Write-Error 'install_source.ps1: bundled squilla-router v4 assets are unavailable in this checkout.'
@@ -190,8 +191,10 @@ function Build-WebUI {
         exit 1
     }
 
-    $rawNodeVersion = (& $nodeCommand.Source --version 2>$null | Select-Object -First 1)
-    if ($LASTEXITCODE -ne 0 -or -not $rawNodeVersion) {
+    $rawNodeVersion = & $nodeCommand.Source --version 2>$null
+    $nodeExitCode = $LASTEXITCODE
+    $rawNodeVersion = $rawNodeVersion | Select-Object -First 1
+    if ($nodeExitCode -ne 0 -or -not $rawNodeVersion) {
         Write-Error 'install_source.ps1: could not determine the installed Node.js version.'
         exit 1
     }
@@ -300,6 +303,104 @@ function Install-WindowsVCRedistIfNeeded {
     Write-Warning 'After installing, reopen PowerShell and restart OpenSquilla.'
 }
 
+# Read process identity only: even a temporary file-open probe can prevent a
+# client from starting on Windows. Unknown identity must not prevent an upgrade.
+$script:uvProcessCheckWarned = $false
+
+function Write-UvProcessCheckWarning {
+    if (-not $script:uvProcessCheckWarned) {
+        Write-Warning 'install_source.ps1: could not complete the uv environment process check; continuing with installation.'
+        $script:uvProcessCheckWarned = $true
+    }
+}
+
+function ConvertTo-NormalizedWindowsPath {
+    param([string]$Path)
+
+    $path = $Path.Replace('/', '\')
+    # IsPathRooted also accepts drive-relative paths; require an absolute path.
+    if ($path -notmatch '^(?:[A-Za-z]:\\|\\\\[^\\]+\\[^\\]+(?:\\|$))') {
+        throw 'An absolute Windows path is required.'
+    }
+    return [System.IO.Path]::GetFullPath($path)
+}
+
+function Assert-UvToolEnvironmentIdle {
+    if (-not $script:isWindowsHost -or $installer -ne 'uv') { return }
+
+    try {
+        # uv writes UTF-8 even when Windows PowerShell uses a legacy code page.
+        $previousEncoding = [Console]::OutputEncoding
+        try {
+            [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+            $toolDir = @(& $uvCommand tool dir 2>$null)
+        } finally {
+            [Console]::OutputEncoding = $previousEncoding
+        }
+        if ($LASTEXITCODE -ne 0 -or $toolDir.Count -ne 1) {
+            throw 'Could not resolve the uv tool directory.'
+        }
+        $targetDir = ConvertTo-NormalizedWindowsPath (Join-Path $toolDir[0] 'opensquilla')
+        if (-not (Test-Path -LiteralPath $targetDir -PathType Container)) { return }
+        $targetPrefix = $targetDir.TrimEnd('\') + '\'
+        $processes = @(Get-CimInstance -ClassName Win32_Process -Property ProcessId, Name, ExecutablePath -OperationTimeoutSec 5 -ErrorAction Stop)
+    } catch {
+        Write-UvProcessCheckWarning
+        return
+    }
+
+    $incomplete = $false
+    $executableNames = @()
+    if (@($processes | Where-Object { -not $_.ExecutablePath }).Count -gt 0) {
+        try {
+            $executableNames = @(Get-ChildItem -LiteralPath $targetDir -Filter '*.exe' -File -Recurse -ErrorAction Stop |
+                Select-Object -ExpandProperty Name -Unique)
+        } catch {
+            $incomplete = $true
+        }
+    }
+
+    $busyProcesses = @()
+    foreach ($process in $processes) {
+        $executablePath = $process.ExecutablePath
+        if (-not $executablePath) {
+            # Unreadable system processes are normal. Only investigate names
+            # that can actually belong to this environment, never names alone.
+            if ($process.Name -notin $executableNames) { continue }
+            try {
+                $candidate = Get-Process -Id $process.ProcessId -ErrorAction Stop
+                if (-not $candidate -or $candidate.HasExited) { continue }
+                $executablePath = $candidate.Path
+                if (-not $executablePath) { $incomplete = $true; continue }
+            } catch {
+                # A process disappearing during the snapshot needs no warning.
+                if ($_.FullyQualifiedErrorId -notlike 'NoProcessFoundForGivenId*') {
+                    $incomplete = $true
+                }
+                continue
+            }
+        }
+        try {
+            $executablePath = ConvertTo-NormalizedWindowsPath $executablePath
+            if ($executablePath.StartsWith($targetPrefix, [System.StringComparison]::OrdinalIgnoreCase)) {
+                $busyProcesses += $process
+            }
+        } catch {
+            $incomplete = $true
+        }
+    }
+
+    if ($busyProcesses.Count -gt 0) {
+        [Console]::Error.WriteLine("install_source.ps1: the uv tool environment is in use: $targetDir")
+        foreach ($process in $busyProcesses) {
+            [Console]::Error.WriteLine("  $($process.Name) (PID $($process.ProcessId))")
+        }
+        [Console]::Error.WriteLine('install_source.ps1: Stop these processes and retry scripts/install_source.ps1.')
+        exit 1
+    }
+    if ($incomplete) { Write-UvProcessCheckWarning }
+}
+
 # --- installer selection ----------------------------------------------------
 
 $installer = $null
@@ -313,7 +414,8 @@ if ($pythonCmd) {
     $pythonOk = ($LASTEXITCODE -eq 0)
 }
 
-if (Get-Command uv -ErrorAction SilentlyContinue) {
+$uvCommand = Get-Command uv -ErrorAction SilentlyContinue
+if ($uvCommand) {
     $installer = 'uv'
     $installArgs = @('tool', 'install', '--python', '3.12', '--force', '--reinstall-package', 'opensquilla', $installTarget)
 } elseif ($pythonOk) {
@@ -375,7 +477,7 @@ function Resolve-EntrypointDir {
     if ($installer -eq 'uv') {
         $uvBin = $null
         try {
-            $line = (& uv tool dir --bin 2>$null | Select-Object -First 1)
+            $line = (& $uvCommand tool dir --bin 2>$null | Select-Object -First 1)
             if ($line) { $uvBin = $line.Trim() }
         } catch { }
         if ($uvBin -and (Test-Path (Join-Path $uvBin 'opensquilla.exe') -PathType Leaf)) {
@@ -439,11 +541,14 @@ function Write-PathHint {
 }
 
 if ($dryRun) {
-    Write-Host "install_source.ps1: dry-run — would require Node.js >= $minimumNodeVersion and npm"
-    Write-Host "install_source.ps1: dry-run — would run in ${webuiDir}: npm ci"
-    Write-Host "install_source.ps1: dry-run — would run in ${webuiDir}: npm run build"
-    Write-Host "install_source.ps1: dry-run — would run: $installCmd"
-    Write-Host "install_source.ps1: dry-run — prefix: $prefix"
+    if ($script:isWindowsHost -and $installer -eq 'uv') {
+        Write-Host 'install_source.ps1: dry-run - would check the uv tool environment for running processes before build and immediately before install.'
+    }
+    Write-Host "install_source.ps1: dry-run - would require Node.js >= $minimumNodeVersion and npm"
+    Write-Host "install_source.ps1: dry-run - would run in ${webuiDir}: npm ci"
+    Write-Host "install_source.ps1: dry-run - would run in ${webuiDir}: npm run build"
+    Write-Host "install_source.ps1: dry-run - would run: $installCmd"
+    Write-Host "install_source.ps1: dry-run - prefix: $prefix"
     Test-SquillaRouterAssets -WarnOnly
     Write-Banner
     if ($env:OPENSQUILLA_LISTEN -eq '0.0.0.0') {
@@ -454,6 +559,17 @@ if ($dryRun) {
 
 # --- execute ---------------------------------------------------------------
 
+$sourceCommitId = $null
+$gitCommand = Get-Command git -ErrorAction SilentlyContinue
+if ($gitCommand) {
+    $candidate = (& $gitCommand.Source -C $sourceRoot rev-parse --verify HEAD 2>$null |
+        Select-Object -First 1)
+    if ($LASTEXITCODE -eq 0 -and $candidate -cmatch '^[0-9a-f]{40}$') {
+        $sourceCommitId = $candidate
+    }
+}
+
+Assert-UvToolEnvironmentIdle
 Test-SquillaRouterAssets
 Build-WebUI
 Install-WindowsVCRedistIfNeeded
@@ -461,7 +577,8 @@ Install-WindowsVCRedistIfNeeded
 Write-Host "install_source.ps1: installing via $installer into prefix $prefix"
 Write-Host "install_source.ps1: running: $installCmd"
 if ($installer -eq 'uv') {
-    & uv @installArgs
+    Assert-UvToolEnvironmentIdle
+    & $uvCommand @installArgs
 } else {
     & python @installArgs
 }
@@ -480,6 +597,7 @@ try {
     $receipt = [ordered]@{
         version        = 1
         install_method = $receiptMethod
+        source_commit_id = $sourceCommitId
         installed_at   = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
         entrypoints    = @()
         owned_paths    = @()

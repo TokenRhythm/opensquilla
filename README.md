@@ -27,8 +27,6 @@
 
 - 📢 **2026-08-22** — The English version of our technical report is now on aiXiv: [aixiv.260822.000001](https://aixiv.science/abs/aixiv.260822.000001), and the Chinese version is on ChinaXiv: [202608.00176](https://chinaxiv.org/abs/202608.00176). See [Citation](#citation) for how to cite OpenSquilla.
 
-- 📢 **2026-08-21** — PDF versions of our technical report are now available in this repo: [English](docs/report/opensquilla-report-en.pdf) · [中文](docs/report/opensquilla-report-zh.pdf).
-
 - 📢 **2026-07-14** — Our technical report **[Agentic Routing: The Harness-Native Data Flywheel](https://arxiv.org/abs/2607.11399)** is now on arXiv. It shows how the harness-native router turns everyday agent traffic into a self-improving data flywheel, and how **multi-model ensemble routing surpasses Fable 5**.
 
 ---
@@ -147,10 +145,11 @@ profile data during a normal uninstall.
 Code signing policy: [`docs/code-signing-policy.md`](docs/code-signing-policy.md).
 
 > [!NOTE]
-> Windows builds are currently unsigned. If SmartScreen appears, choose
-> **More info** → **Run anyway**. If Smart App Control or enterprise policy
-> blocks the unsigned app, use [Quick terminal install](#quick-terminal-install)
-> instead.
+> The published v0.5.4 Windows installer remains unsigned. The current Release
+> Assets workflow Authenticode signs new Windows installers as Beijing
+> TokenRhythm Technologies Co., Ltd. SmartScreen reputation can still take time
+> to build for a new publisher or application. If enterprise policy blocks the
+> Desktop app, use [Quick terminal install](#quick-terminal-install) instead.
 
 ### Quick terminal install
 
@@ -389,54 +388,37 @@ full reference.
 
 ---
 
-## Installation Privacy
+## Telemetry Privacy
 
-OpenSquilla uses pseudonymous installation telemetry to estimate install
-counts, version adoption, and runtime compatibility. Data is sent on first
-gateway startup and once per OpenSquilla version. It also records content-free daily
-aggregates of completed top-level conversations and token usage by UTC date,
-and attempts to upload pending cumulative UTC-day snapshots to the telemetry
-service at startup and once per hour. OpenSquilla may also make
-passive update checks, including automatic desktop update checks at startup
-and, while the app remains open, at most once per day. Uploads use a short
-timeout and never block startup.
+OpenSquilla uses the existing **Network reporting** switch for both telemetry
+streams. Reporting is enabled by default and can be turned off in Privacy
+settings, without separate onboarding choices or consent popups:
 
-See [`PRIVACY.md`](PRIVACY.md) for the full privacy policy covering local data,
-provider requests, network observability, logs, release downloads, and deletion.
+- **Reliability diagnostics** records bounded operation results for app and
+  Gateway startup, crashes, turns, tools, file parsing, updates, and session
+  performance.
+- **Product and growth analytics** records client launches, actual MetaSkill
+  and Coding Mode executions, and one-time acquisition, onboarding,
+  app-readiness, registration, and first-successful-turn milestones. Existing
+  installations do not become new-user cohorts just by enabling reporting.
 
-What is sent:
+The streams retain separate purpose-specific identifiers, durable queues,
+upload endpoints, and retention policies. Reliability events
+go to `/v1/reliability/events`; growth events go to `/v1/growth/events`.
+Retries reuse `event_id` for server-side deduplication, and growth events are
+not sampled.
 
-- schema version
-- locally generated stable `install_id` digest
-- OpenSquilla version
-- event type (`install`, `version_seen`, or `daily_usage`)
-- install method (`pip`, `source`, `docker`, `desktop`, or `unknown`)
-- operating system, OS version, CPU architecture, and Python major/minor
-  version
-- first-seen and sent timestamps
-- CI/test-environment marker (`ci_environment`)
-- completed UTC day, conversation count, and aggregate input/output/cache/cache-write
-  token counts for daily-usage events
+Telemetry never includes prompts, responses, file names, file paths, file
+contents, tool arguments, task parameters, provider configuration, raw account
+IDs, order data, MAC addresses, IP addresses, or device fingerprints. Complete
+crash stacks stay local unless the user explicitly prepares and shares a
+support bundle.
 
-The `install_id` is a local one-way SHA-256 digest derived from usable MAC
-addresses, then local IP addresses when no MAC is available, with a random
-persisted fallback. Raw MAC/IP values are not uploaded.
+The former automatic `/v1/install` upload, `/v1/usage` daily token aggregate,
+and `X-OpenSquilla-Install-Id` provider header are retired. OpenSquilla no
+longer creates or sends an identifier derived from a MAC address or local IP.
 
-By default, requests sent directly to the official TokenRhythm HTTPS API may
-also carry the same pseudonymous, cross-session installation identifier in the
-optional `X-OpenSquilla-Install-Id` header. Only the exact official
-`tokenrhythm.studio` and `api.tokenrhythm.studio` HTTPS hosts on port 443 are
-eligible; custom proxies, OpenRouter, other providers, browser pages,
-redirected nonofficial targets, and returned image/CDN downloads are excluded.
-The raw MAC/IP values are never sent. The header is omitted if its background
-resolution is not ready or fails, so requests continue normally.
-
-What is not sent: usernames, hostnames, paths, API keys, provider config,
-chat/session/memory/agent content, file names, or file contents. Source IP may
-be visible to HTTP servers at the transport layer, but is not part of the
-payload.
-
-To disable non-user-initiated network observability before startup:
+To force all non-user-initiated network observability off before startup:
 
 ```sh
 OPENSQUILLA_PRIVACY_DISABLE_NETWORK_OBSERVABILITY=true
@@ -449,15 +431,15 @@ or set:
 disable_network_observability = true
 ```
 
-That unified switch covers automatic install telemetry, daily aggregate usage
-telemetry, passive update checks, and automatic desktop update checks at
-startup and during long-running app sessions, as well as the TokenRhythm
-installation header. Explicit update-availability checks remain disabled while
-the unified or legacy opt-out is active. CI and test environments also
-suppress the installation header and installation telemetry automatically.
-Other user-initiated actions may still
-contact network services after user intent, including release downloads and
-configured providers, search, or channels.
+This is a hard veto over both telemetry scopes, passive update checks, and
+automatic desktop update checks. Turning it off pauses pending uploads and
+stops collection without deleting local telemetry state. Previously saved
+per-scope declines are migrated to the unified switch being off; users can
+then change that one setting. CI, test, and `DO_NOT_TRACK` environments
+also fail closed for telemetry. Other user-initiated actions may still contact
+configured providers, search services, channels, or release hosts.
+Explicit update-availability checks remain disabled while the unified or
+legacy update opt-out controls are active.
 
 Legacy opt-out environment variables remain honored:
 
@@ -466,18 +448,9 @@ OPENSQUILLA_TELEMETRY_DISABLED=true
 OPENSQUILLA_UPDATE_CHECK_DISABLED=true
 ```
 
-The legacy telemetry opt-out suppresses the TokenRhythm installation header;
-the update-check opt-out by itself does not. TokenRhythm must treat the header
-as optional and untrusted, and must not use it for authentication,
-authorization, billing, rate limiting, or anti-abuse decisions. See
-[`PRIVACY.md`](PRIVACY.md#tokenrhythm-installation-identifier) for the complete
-target and data-handling rules.
-
-Advanced deployments can use their own installation telemetry endpoint:
-
-```sh
-OPENSQUILLA_TELEMETRY_ENDPOINT=https://example.com/v1/install
-```
+The legacy telemetry variable is retained only as a global telemetry veto; it
+does not re-enable the retired endpoints. See [`PRIVACY.md`](PRIVACY.md) for
+the complete data, consent, deletion, update, and external-producer rules.
 
 ---
 

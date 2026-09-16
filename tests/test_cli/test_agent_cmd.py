@@ -73,6 +73,63 @@ class _FakeServices:
         return None
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("explicit_workspace", [False, True])
+async def test_cli_new_sessions_keep_the_effective_startup_workspace(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, explicit_workspace: bool
+) -> None:
+    from opensquilla.gateway.execution_workspaces import build_execution_workspace_factory
+
+    monkeypatch.setattr(
+        "opensquilla.gateway.config.default_opensquilla_home", lambda: tmp_path / "profile"
+    )
+    config = GatewayConfig.load(tmp_path / "config.toml", read_only=True)
+    selected = tmp_path / "selected" if explicit_workspace else Path(config.workspace_dir)
+    selected.mkdir(parents=True)
+    storage = await SessionStorage.open(str(tmp_path / "cli-workspace.db"))
+    contexts: list[Any] = []
+
+    class FakeTurnRunner:
+        def __init__(self, **kwargs: Any) -> None:
+            pass
+
+        async def run(
+            self, message: str, session_key: str, *,
+            expected_session_id: str | None = None,
+            expected_session_epoch: int | None = None,
+            **kwargs: Any,
+        ):
+            contexts.append(kwargs["tool_context"])
+            yield DoneEvent(text="ok")
+
+    async def fake_build_services(*, config: GatewayConfig, **kwargs: Any) -> _FakeServices:
+        manager = SessionManager(
+            storage,
+            execution_workspace_factory=build_execution_workspace_factory(
+                config, profile_home=tmp_path,
+            ),
+        )
+        return _FakeServices(config, manager)
+
+    monkeypatch.setattr("opensquilla.engine.runtime.TurnRunner", FakeTurnRunner)
+    monkeypatch.setattr("opensquilla.gateway.build_services", fake_build_services)
+    try:
+        for suffix in ("first", "second"):
+            key = f"agent:main:cli-workspace:{suffix}"
+            await run_agent_once(
+                message="pwd", session_id=key, config=config,
+                workspace=str(selected) if explicit_workspace else None,
+            )
+            session = await storage.get_session(key)
+            assert session.execution_workspace["kind"] == "configured"
+            assert session.execution_workspace["root"] == str(selected.resolve())
+    finally:
+        await storage.close()
+
+    assert [ctx.workspace_dir for ctx in contexts] == [str(selected.resolve())] * 2
+    assert config.workspace_dir_source == "default"
+
+
 def test_benchmark_transcript_preserves_tool_result_execution_status() -> None:
     status = {
         "version": 1,
@@ -1650,6 +1707,67 @@ async def test_run_agent_once_can_opt_into_interactive_single_shot(
 
     assert captured["tool_context"].interaction_mode is InteractionMode.INTERACTIVE
     assert captured["bootstrap_context_mode"] is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("child_marker", [None, "0", "1"])
+@pytest.mark.parametrize("stateless", [False, True])
+async def test_agent_launch_counts_user_cli_not_internal_coding_child(
+    monkeypatch: pytest.MonkeyPatch, child_marker: str | None, stateless: bool
+) -> None:
+    from opensquilla.telemetry.contracts.common import (
+        ClientEntrypoint,
+        ClientSurface,
+        ExecutionMode,
+    )
+
+    launches: list[dict[str, Any]] = []
+    active: list[dict[str, Any]] = []
+    turns: list[dict[str, Any]] = []
+
+    async def record_launch(**kwargs: Any) -> None:
+        launches.append(kwargs)
+
+    async def record_active(**kwargs: Any) -> None:
+        active.append(kwargs)
+
+    class FakeTurnRunner:
+        def __init__(self, **kwargs: Any) -> None:
+            pass
+
+        async def run(self, message: str, session_key: str, **kwargs: Any):
+            turns.append(kwargs)
+            yield DoneEvent(text="ok", model="synthetic-model")
+
+    async def fake_build_services(*, config: GatewayConfig, **kwargs: Any) -> _FakeServices:
+        svc = _FakeServices(config)
+        svc.growth_event_sink = SimpleNamespace(
+            record_client_launch=record_launch, record_product_active=record_active,
+        )
+        return svc
+
+    if child_marker is None:
+        monkeypatch.delenv("OPENSQUILLA_CODETASK_CHILD", raising=False)
+    else:
+        monkeypatch.setenv("OPENSQUILLA_CODETASK_CHILD", child_marker)
+    monkeypatch.setattr("opensquilla.engine.runtime.TurnRunner", FakeTurnRunner)
+    monkeypatch.setattr("opensquilla.gateway.build_services", fake_build_services)
+
+    result = await run_agent_once(
+        message="synthetic task", config=GatewayConfig(), stateless=stateless
+    )
+
+    assert result.status == "ok"
+    expected_launches = [] if child_marker == "1" else [{
+        "surface": ClientSurface.CLI,
+        "entrypoint": ClientEntrypoint.AGENT,
+        "execution_mode": ExecutionMode.ONE_SHOT,
+    }]
+    assert launches == expected_launches
+    assert active == ([] if child_marker == "1" else [{"surface": ClientSurface.CLI}])
+    assert len(turns) == 1
+    assert turns[0]["telemetry_surface"] is ClientSurface.CLI
+    assert turns[0]["telemetry_execution_mode"] is ExecutionMode.ONE_SHOT
 
 
 @pytest.mark.asyncio

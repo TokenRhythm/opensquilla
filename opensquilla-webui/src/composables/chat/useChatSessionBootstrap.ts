@@ -1,4 +1,4 @@
-import { ref, type Ref } from 'vue'
+import { getCurrentScope, onScopeDispose, ref, watch, type Ref } from 'vue'
 
 import type { SessionSubscriptionOutcome } from '@/composables/chat/useChatSessionSubscription'
 import {
@@ -54,6 +54,9 @@ export interface UseChatSessionBootstrapOptions {
   subscribeSession: (
     context: SessionBootstrapPhaseContext,
   ) => Promise<SessionSubscriptionOutcome>
+  /** Production recovery uses the existing lease, preserving subscription authority. */
+  reconcileSession?: (context: SessionBootstrapPhaseContext) => Promise<SessionSubscriptionOutcome>
+  connectionState?: Readonly<Ref<string>>
   cancelHistory: () => void
   cancelSubscription: () => void
 }
@@ -77,6 +80,13 @@ export function useChatSessionBootstrap(options: UseChatSessionBootstrapOptions)
   const historyPhase = ref<SessionHistoryPhase>('idle')
   const livePhase = ref<SessionLivePhase>('idle')
   let active: ActiveBootstrap | null = null
+  let recoveryTimer: ReturnType<typeof setTimeout> | null = null
+  let recoveryAttempt = 0
+  let queuedReconciliation: { run: ActiveBootstrap, promise: Promise<SessionSubscriptionOutcome> } | null = null
+  function clearRecoveryTimer() {
+    if (recoveryTimer !== null) clearTimeout(recoveryTimer)
+    recoveryTimer = null
+  }
   const ownership = createConversationBootstrapCoordinator<ActiveBootstrap>({
     budgetMs: SESSION_BOOTSTRAP_BUDGET_MS,
   })
@@ -186,7 +196,6 @@ export function useChatSessionBootstrap(options: UseChatSessionBootstrapOptions)
           return { ...lastResult, ok: false, cancelled: true }
         }
         if (lastResult.ok) {
-          historyPhase.value = 'ready'
           return lastResult
         }
         if (
@@ -197,10 +206,15 @@ export function useChatSessionBootstrap(options: UseChatSessionBootstrapOptions)
           break
         }
       }
-      if (isCurrent(run)) historyPhase.value = 'error'
       return lastResult
     })().then(result => {
+      // Publish the failure evidence before the reactive phase. Vue can flush
+      // the recovery watcher before a later Promise continuation; exposing
+      // `error` while result is still null permanently misses its retry.
       phase.result = result
+      if (isCurrent(run) && !result.cancelled) {
+        historyPhase.value = result.ok ? 'ready' : 'error'
+      }
       return result
     }).finally(() => {
       phase.running = false
@@ -208,7 +222,7 @@ export function useChatSessionBootstrap(options: UseChatSessionBootstrapOptions)
     return phase.promise
   }
 
-  function runLivePhase(run: ActiveBootstrap): Promise<SessionSubscriptionOutcome> {
+  function runLivePhase(run: ActiveBootstrap, reconcile = false): Promise<SessionSubscriptionOutcome> {
     const phase = run.live
     if (phase.running) return phase.promise
     phase.running = true
@@ -220,7 +234,9 @@ export function useChatSessionBootstrap(options: UseChatSessionBootstrapOptions)
       const context = contextFor(run, phase, 0)
       let result: SessionSubscriptionOutcome
       try {
-        result = await options.subscribeSession(context)
+        result = await (reconcile && options.reconcileSession
+          ? options.reconcileSession(context)
+          : options.subscribeSession(context))
       } catch (error: unknown) {
         result = {
           ...UNAVAILABLE_LIVE_RESULT,
@@ -334,6 +350,26 @@ export function useChatSessionBootstrap(options: UseChatSessionBootstrapOptions)
   }
 
   function retryLive(): Promise<SessionSubscriptionOutcome> {
+    const run = active
+    if (run && isCurrent(run) && leaseIsCurrent(run) && options.reconcileSession) {
+      if (run.live.running) {
+        if (queuedReconciliation?.run === run) return queuedReconciliation.promise
+        // A gap arriving during an older read needs one fresh snapshot after
+        // that read, not its pre-gap result as false recovery evidence.
+        const pending = run.live.promise.then(() => {
+          if (!isCurrent(run) || !leaseIsCurrent(run)) return UNAVAILABLE_LIVE_RESULT
+          run.live = liveRuntime(Date.now() + SESSION_BOOTSTRAP_BUDGET_MS)
+          return runLivePhase(run, true)
+        })
+        const observed = pending.finally(() => {
+          if (queuedReconciliation?.promise === observed) queuedReconciliation = null
+        })
+        queuedReconciliation = { run, promise: observed }
+        return observed
+      }
+      run.live = liveRuntime(Date.now() + SESSION_BOOTSTRAP_BUDGET_MS)
+      return runLivePhase(run, true)
+    }
     const priorHistoryPhase = historyPhase.value
     const replacement = startSessionBootstrap({ includeHistory: false, force: true })
     historyPhase.value = priorHistoryPhase
@@ -341,6 +377,8 @@ export function useChatSessionBootstrap(options: UseChatSessionBootstrapOptions)
   }
 
   function cancelSessionBootstrap(unsubscribe = true) {
+    clearRecoveryTimer()
+    recoveryAttempt = 0
     const cancelled = ownership.cancel() ?? active
     active = null
     options.cancelHistory()
@@ -433,6 +471,38 @@ export function useChatSessionBootstrap(options: UseChatSessionBootstrapOptions)
     }
     return publicRun(run)
   }
+
+  // Recovery is request-local. The shared socket and the current page remain
+  // owned by their existing lifecycles; a missing session is never retried.
+  const stopRecoveryWatch = options.connectionState ? watch(
+    [options.sessionKey, options.connectionState, historyPhase, livePhase],
+    () => {
+      clearRecoveryTimer()
+      const run = active
+      if (!run || !isCurrent(run) || options.connectionState?.value !== 'connected') return
+      const historyFailed = historyPhase.value === 'error'
+        && shouldRetrySessionPhase(run.history.result?.error)
+      const liveFailed = livePhase.value === 'degraded'
+        && !run.live.result?.sessionMissing
+        && shouldRetrySessionPhase(run.live.result?.error)
+      if (!historyFailed && !liveFailed) {
+        if (historyPhase.value === 'ready' && livePhase.value === 'ready') recoveryAttempt = 0
+        return
+      }
+      const delayMs = Math.min(15_000, 500 * 2 ** Math.min(recoveryAttempt, 5))
+      recoveryTimer = setTimeout(() => {
+        recoveryTimer = null
+        if (!isCurrent(run) || options.connectionState?.value !== 'connected') return
+        recoveryAttempt++
+        if (liveFailed) void retryLive().catch(() => {})
+        if (historyFailed) void retryHistory().catch(() => {})
+      }, delayMs)
+    },
+  ) : undefined
+  if (getCurrentScope()) onScopeDispose(() => {
+    stopRecoveryWatch?.()
+    clearRecoveryTimer()
+  })
 
   return {
     historyPhase,

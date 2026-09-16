@@ -1,3 +1,4 @@
+import type { ChatPageContext } from './pageContext'
 import type { ArtifactDocument, ArtifactRevision } from './artifactDocuments'
 import type { ArtifactPayload } from './artifacts'
 
@@ -50,10 +51,10 @@ export interface WorkbenchResourceCapabilities {
   preview: boolean
   download: boolean
   selectionContext: boolean
-  /** Legal user-facing edit entry; immutable sources use explicit copy-import. */
+  /** Legacy source-editor capability, retained for older resource projections. */
   manualEdit: boolean
   agentEdit: boolean
-  /** Compatibility summary for clients predating the independent edit axes. */
+  /** General editing capability; immutable sources use a working copy. */
   edit: boolean
   publish: boolean
   previewReasonCode?: string | null
@@ -84,6 +85,8 @@ export interface WorkbenchResource {
   createdAt?: number | string | null
   updatedAt?: number | string | null
   downloadUrl?: string
+  /** HTML members of the current registered bundle; opening revalidates access. */
+  previewPages?: string[]
   capabilities: WorkbenchResourceCapabilities
   relations: WorkbenchResourceRelations
 }
@@ -118,6 +121,8 @@ export interface WorkbenchPreviewResponse {
 export type WorkbenchResourceOpenResponse =
   | {
       disposition: 'document'
+      pageContext?: ChatPageContext
+      workingFile?: string
       resolution: { status: 'current' | 'materialized' }
       resource: WorkbenchResource
       document: ArtifactDocument

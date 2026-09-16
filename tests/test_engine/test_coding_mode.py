@@ -10,7 +10,7 @@ import pytest
 
 from opensquilla.application.app_settings import _SAFE_WRITE_PATCH_PATHS
 from opensquilla.engine.steps.coding_mode import enforce_coding_mode
-from opensquilla.engine.steps.skills_filter import _eligibility_ctx
+from opensquilla.engine.steps.skill_catalog_projection import _eligibility_ctx
 from opensquilla.gateway.config import GatewayConfig
 from opensquilla.skills.eligibility import (
     CODING_MODE_SKILLS,

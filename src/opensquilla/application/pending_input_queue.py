@@ -49,7 +49,7 @@ class PendingInputProjection(TypedDict, total=False):
     schemaVersion: int
     displayText: str
     confirmedPlainText: bool
-    promptAnnotationIds: list[str]
+    pageContext: dict[str, Any]
 
 
 class PendingInputEnqueueResult(PendingInputProjection, total=False):
@@ -472,15 +472,6 @@ class PendingInputQueue:
             raise PendingQueueRejectedError("control-command")
         if turn.display_text is not None and display != control and not escaped:
             raise PendingQueueRejectedError("display-mismatch")
-        if len(turn.prompt_annotation_ids) > 16:
-            raise ValueError("params.promptAnnotationIds supports at most 16 items")
-        if any(
-            not isinstance(item, str) or not item.strip() for item in turn.prompt_annotation_ids
-        ):
-            raise ValueError("params.promptAnnotationIds must contain non-empty strings")
-        if len(set(turn.prompt_annotation_ids)) != len(turn.prompt_annotation_ids):
-            raise ValueError("params.promptAnnotationIds must contain unique ids")
-
     @staticmethod
     def _client_identity(value: str | None, name: str) -> str:
         if not isinstance(value, str) or not value.strip():
@@ -581,7 +572,7 @@ class PendingInputQueue:
                         command.expected_turn_id, "expected_turn_id"
                     )
                     return rejected_steer(
-                        SteerTurn(key, message, "durable", expected_turn_id=expected_turn),
+                        SteerTurn(key, message, expected_turn_id=expected_turn),
                         failure_code="STEER_UNSUPPORTED_INPUT",
                         capability={
                             "mode": "queue_only",
@@ -596,7 +587,6 @@ class PendingInputQueue:
                 SteerTurn(
                     session_key=key,
                     message=message,
-                    mode="durable",
                     expected_turn_id=command.expected_turn_id,
                     client_request_id=request_id,
                     client_message_id=message_id,

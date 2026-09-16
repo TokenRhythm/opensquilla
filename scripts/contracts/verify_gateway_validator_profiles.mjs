@@ -54,6 +54,16 @@ export async function verifyProfiles({ baselineRoot, verificationRoot } = {}) {
   const selected = new Set(readProductionTargets(inventory, policy).map(target => (
     targetIdentity(target.kind, target.wireName, target.role)
   )))
+  for (const wireName of ['meta.inspect', 'meta.list', 'telemetry.product_active.record']) {
+    const contract = inventory.find(entry => entry.kind === 'method' && entry.wireName === wireName)
+    assert.ok(contract, `${wireName}: complete Contract is required`)
+    assert.deepEqual(contract.targets.map(target => target.role).sort(), [
+      'params', 'request', 'response', 'result',
+    ], `${wireName}: all verification roles are required`)
+    assert.deepEqual([...selected].filter(identity => identity.startsWith(`method:${wireName}:`)), [
+      `method:${wireName}:result`,
+    ], `${wireName}: production must expose only the result validator`)
+  }
   const fixtures = fixtureValues(repositoryRoot)
   const result = {
     contracts: inventory.length, roles: 0, comparedRoles: 0, comparedInputs: 0,
@@ -64,7 +74,7 @@ export async function verifyProfiles({ baselineRoot, verificationRoot } = {}) {
     assert.deepEqual(Object.keys(validators).sort(), contract.targets.map(target => target.exportName).sort())
     const stored = await storedValidators(baselineRoot ?? repositoryRoot, contract)
     const expectedExports = contract.targets.filter(target => baselineRoot
-      ? !(contract.wireName === 'sessions.list' && ['params', 'result'].includes(target.role))
+      ? !(contract.wireName === 'sessions.list' && target.role === 'params')
       : selected.has(targetIdentity(contract.kind, contract.wireName, target.role)))
     assert.deepEqual(Object.keys(stored).sort(), expectedExports.map(target => target.exportName).sort(),
       `${contract.wireName}: unexpected persistent exports`)
@@ -97,11 +107,11 @@ export async function verifyProfiles({ baselineRoot, verificationRoot } = {}) {
       result.roles++
     }
   }
-  assert.equal(result.roles, 869)
-  assert.equal(result.comparedRoles, baselineRoot ? 867 : selected.size)
+  assert.equal(result.roles, 866)
+  assert.equal(result.comparedRoles, baselineRoot ? 841 : selected.size)
   assert.deepEqual(result.rolesWithoutPositiveSeed, [], 'each role requires a positive seed')
   if (baselineRoot) assert.deepEqual(result.supplementalRoles, [
-    'method:sessions.list:params', 'method:sessions.list:result',
+    'method:sessions.list:params',
   ])
   return result
 }

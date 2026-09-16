@@ -14,6 +14,9 @@ import type {
   RoutingMode,
 } from '@/modules/providerConfiguration'
 import { ProviderConfigurationError } from '@/modules/providerConfiguration'
+import { mapSetupError } from './setupWorkflowV4'
+import { MODELS_ROUTING_RESET_RECOMMENDED_METHOD } from '@/contracts/generated/v4/modelsRoutingResetRecommended'
+import { validateParams as validateResetRecommendedParams, validateResult as validateResetRecommendedResult } from '@/contracts/generated/v4/modelsRoutingResetRecommendedValidators.mjs'
 import { MODELS_ROUTING_GET_METHOD } from '@/contracts/generated/v4/modelsRoutingGet'
 import { validateResult as validateModelsRoutingGetResult } from '@/contracts/generated/v4/modelsRoutingGetValidators.mjs'
 import { MODELS_LIST_METHOD } from '@/contracts/generated/v4/modelsList'
@@ -28,6 +31,7 @@ import { PROVIDERS_STATUS_METHOD } from '@/contracts/generated/v4/providersStatu
 import { validateParams as validateProvidersStatusParams, validateResult as validateProvidersStatusResult } from '@/contracts/generated/v4/providersStatusValidators.mjs'
 
 interface RpcTransport {
+  supports?(method: string): boolean
   request<T = unknown>(method: string, params?: Record<string, unknown>, options?: RpcCallOptions): Promise<T>
 }
 interface EventTransport {
@@ -60,7 +64,7 @@ function mapProviderError(error: unknown): ProviderConfigurationError {
           : code?.startsWith('INVALID_')
             ? 'invalid'
             : 'unavailable'
-  return new ProviderConfigurationError(domainCode, failure.message, error)
+  return new ProviderConfigurationError(domainCode, failure.message, error, mapSetupError(error).details)
 }
 
 async function requestProvider<T>(
@@ -207,6 +211,19 @@ export function createV4ProviderConfiguration(
   events: EventTransport,
 ): ProviderConfiguration {
   return {
+    get resetRecommendedSupported() {
+      return rpc.supports?.(MODELS_ROUTING_RESET_RECOMMENDED_METHOD) === true
+    },
+    async resetRecommended(command, request) {
+      if (rpc.supports?.(MODELS_ROUTING_RESET_RECOMMENDED_METHOD) !== true) {
+        throw new ProviderConfigurationError('unsupported', 'This Gateway does not support resetting recommended routing.')
+      }
+      const params = { ...command }
+      if (!validateResetRecommendedParams(params)) throw new ProviderConfigurationError('invalid', 'Invalid recommended routing parameters')
+      const result = await requestProvider(rpc, MODELS_ROUTING_RESET_RECOMMENDED_METHOD, params, options(request?.signal))
+      if (!validateResetRecommendedResult(result)) throw new Error(`${MODELS_ROUTING_RESET_RECOMMENDED_METHOD} returned an invalid response`)
+      return routing(result)
+    },
     async catalog(request) {
       const result = await requestProvider(rpc, ONBOARDING_CATALOG_METHOD, undefined, options(request?.signal))
       if (!validateOnboardingCatalogResult(result)) throw new Error(`${ONBOARDING_CATALOG_METHOD} returned an invalid response`)

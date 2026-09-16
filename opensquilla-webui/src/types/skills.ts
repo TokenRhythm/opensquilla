@@ -176,6 +176,22 @@ export interface Skill {
   lifecycle?: SkillLifecycle
   diagnostics?: SkillDiagnostic[]
   invocation?: SkillInvocationCapability
+  visibility?: 'public' | 'meta' | 'internal' | 'tombstone' | 'experimental' | string
+  invocation_mode?: 'direct' | 'meta_only' | 'coding_only' | 'historical_only' | 'experimental_internal' | string
+  owner_meta_skills?: string[]
+  generation?: number
+  digest?: string
+  source?: string
+  dependency_count?: number
+  dependencies?: Array<{
+    name: string
+    available: boolean
+    visibility?: string
+    invocation?: string
+    owners?: string[]
+    digest?: string
+    source?: string
+  }>
 }
 
 export interface Proposal {

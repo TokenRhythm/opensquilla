@@ -2,14 +2,28 @@
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any, cast
 
-from opensquilla.gateway.rpc import RpcContext, get_dispatcher
+from opensquilla.contracts.generated.v4.sessions_execution_log_read_metadata import (
+    SESSIONS_EXECUTION_LOG_READ_METHOD,
+)
+from opensquilla.engine.tool_result_store import ToolOutputNotReadyError
+from opensquilla.gateway.adapters._generated_contract_bindings import (
+    generated_contract_bindings,
+    register_generated_contract_binding,
+)
+from opensquilla.gateway.adapters.session_read_contract import decode_execution_log_read_params
+from opensquilla.gateway.guest_rpc_policy import is_guest_rpc_method_allowed
+from opensquilla.gateway.rpc import RpcContext, RpcHandlerError, get_dispatcher
 from opensquilla.gateway.search_status_runtime import read_search_status as _read_search_status
+from opensquilla.gateway.session_services import get_session_storage
+from opensquilla.paths import media_root_from_config
 from opensquilla.sandbox.integration import (
     run_in_process_network_action,
 )
 from opensquilla.sandbox.types import DenialResult
+from opensquilla.session.keys import canonicalize_session_key
 from opensquilla.tools.builtin.web import (
     _search_plan_argv_token,
     get_active_provider,
@@ -25,6 +39,45 @@ from opensquilla.tools.rpc_payload import (
 )
 
 _d = get_dispatcher()
+
+
+async def _handle_execution_log_read(params: dict | None, ctx: RpcContext) -> dict:
+    """Read one bounded page from an execution log owned by this session."""
+    from opensquilla.tools.builtin.tool_results import read_stored_tool_result_page
+    from opensquilla.tools.types import SafeToolError
+
+    session_key, handle, offset, limit = decode_execution_log_read_params(params)
+    storage = get_session_storage(ctx.session_manager)
+    if storage is None:
+        raise RpcHandlerError("NOT_FOUND", "Session not found")
+    session = await storage.get_session(canonicalize_session_key(session_key))
+    if session is None:
+        raise RpcHandlerError("NOT_FOUND", "Session not found")
+    try:
+        return await asyncio.to_thread(
+            read_stored_tool_result_page,
+            media_root_from_config(ctx.config) / "tool-results",
+            session.session_id,
+            handle,
+            offset=offset,
+            limit=limit,
+        )
+    except ToolOutputNotReadyError as exc:
+        raise RpcHandlerError(
+            "NOT_READY", "Execution log is still being saved", retryable=True,
+        ) from exc
+    except SafeToolError as exc:
+        raise RpcHandlerError("NOT_FOUND", "Execution log is not available") from exc
+
+
+_handle_execution_log_read_contract = register_generated_contract_binding(
+    _d,
+    generated_contract_bindings((SESSIONS_EXECUTION_LOG_READ_METHOD,), ValueError),
+    SESSIONS_EXECUTION_LOG_READ_METHOD,
+    _handle_execution_log_read,
+    internal_error=RpcHandlerError,
+    guest_allowed_checker=is_guest_rpc_method_allowed,
+)
 
 
 async def run_web_search_payload(

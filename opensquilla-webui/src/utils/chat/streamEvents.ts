@@ -49,17 +49,15 @@ export function payloadTaskId(payload: ConversationEventIdentity | null | undefi
   return payload?.task_id ?? ''
 }
 
-// Identity guard for the live stream: an event belongs to the current turn
-// unless it is tagged with a *different* task than the one rendering now.
-// Lenient on both sides — a missing activeTaskId (legacy/unknown) or a payload
-// with no task_id (non-TaskRuntime events: approvals, task groups, router…)
-// always passes, so only positively-mismatched TaskRuntime events are dropped.
+// TaskRuntime uses the accepted task id as its causal turn id. Older producer
+// events can carry only turn_id, which still proves ownership. Keep genuinely
+// untagged events lenient, but never treat an explicit old turn as untagged.
 export function isCurrentTaskPayload(
   payload: ConversationEventIdentity | null | undefined,
   activeTaskId: string,
 ): boolean {
   if (!activeTaskId) return true
-  const taskId = payloadTaskId(payload)
+  const taskId = payloadTaskId(payload) || payload?.turn_id || ''
   if (!taskId) return true
   return taskId === activeTaskId
 }

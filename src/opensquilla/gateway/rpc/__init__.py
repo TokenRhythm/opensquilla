@@ -45,11 +45,8 @@ __all__ = [
 ]
 
 # Import sibling submodules to trigger handler registration against the
-# module-level singleton. The import surface intentionally omits the deprecated
-# product RPC methods listed in ``REMOVED_PRODUCT_METHODS`` in
-# tests/test_gateway/test_rpc_extended.py. These methods MUST NOT register
-# handlers at boot — the release surface is contracted to reject them with
-# METHOD_NOT_FOUND.
+# module-level singleton. Retired methods are intentionally absent from these
+# modules, so the release surface rejects them with METHOD_NOT_FOUND.
 import opensquilla.gateway.rpc_agents  # noqa: E402, F401
 import opensquilla.gateway.rpc_approvals  # noqa: E402, F401
 import opensquilla.gateway.rpc_artifact_editing  # noqa: E402, F401
@@ -75,11 +72,12 @@ import opensquilla.gateway.rpc_proposals  # noqa: E402, F401
 import opensquilla.gateway.rpc_router  # noqa: E402, F401
 import opensquilla.gateway.rpc_routing  # noqa: E402, F401
 import opensquilla.gateway.rpc_sandbox  # noqa: E402, F401
-import opensquilla.gateway.rpc_secrets  # noqa: E402, F401
 import opensquilla.gateway.rpc_sessions as _rpc_sessions  # noqa: E402
 import opensquilla.gateway.rpc_skills  # noqa: E402, F401
 import opensquilla.gateway.rpc_system  # noqa: E402, F401
+import opensquilla.gateway.rpc_telemetry  # noqa: E402, F401
 import opensquilla.gateway.rpc_tools  # noqa: E402, F401
+import opensquilla.gateway.rpc_transport  # noqa: E402, F401
 import opensquilla.gateway.rpc_usage  # noqa: E402, F401
 import opensquilla.gateway.rpc_wizard  # noqa: E402, F401
 import opensquilla.gateway.rpc_workbench_resources  # noqa: E402, F401

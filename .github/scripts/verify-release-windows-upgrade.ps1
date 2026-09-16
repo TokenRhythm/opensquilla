@@ -1,18 +1,90 @@
+[CmdletBinding(DefaultParameterSetName = 'Manual')]
 param(
-  [Parameter(Mandatory = $true)]
+  [Parameter(Mandatory = $true, ParameterSetName = 'Manual')]
   [string]$CandidateInstaller,
-  [Parameter(Mandatory = $true)]
+  [Parameter(Mandatory = $true, ParameterSetName = 'Manual')]
   [ValidatePattern('^[A-Za-z0-9._-]{1,80}$')]
   [string]$Label,
+  [Parameter(ParameterSetName = 'Manual')]
   [switch]$VerifyLongRunningUpdateBanner,
+  [Parameter(ParameterSetName = 'Manual')]
   [string]$RealUpdateChannelManifest = '',
+  [Parameter(ParameterSetName = 'Manual')]
   [ValidateSet('custom', 'default')]
   [string]$InstallMode = 'custom',
+  [Parameter(ParameterSetName = 'Manual')]
   [ValidateSet('0.5.3', '0.5.4')]
-  [string]$BaselineVersion = '0.5.3'
+  [string]$BaselineVersion = '0.5.3',
+  [Parameter(Mandatory = $true, ParameterSetName = 'Signed')]
+  [string]$SignedAuditConfigPath
 )
 
 $ErrorActionPreference = 'Stop'
+
+if ($PSCmdlet.ParameterSetName -eq 'Signed') {
+  if (-not [IO.Path]::IsPathRooted($SignedAuditConfigPath)) { throw 'Signed audit config path must be absolute.' }
+  $config = Get-Content -LiteralPath $SignedAuditConfigPath -Raw | ConvertFrom-Json
+  $required = @('InstallRoot', 'UserDataDir', 'EvidenceRoot', 'BaselineVersion',
+    'BaselineExecutableSha256', 'BaselineSourceSha', 'CandidateInstaller',
+    'CandidateInstallerSha256', 'CandidateSourceSha', 'ChannelManifest')
+  $allowed = $required + @('InstallTimeoutSeconds', 'ProcessObservationMode', 'HandoffInputMode', 'DownloadSourceMode')
+  $arguments = @{}
+  foreach ($property in $config.PSObject.Properties) {
+    if ($property.Name -cnotin $allowed) { throw "Unknown signed audit field: $($property.Name)" }
+    $arguments[$property.Name] = $property.Value
+  }
+  foreach ($name in $required) {
+    if ($arguments[$name] -isnot [string] -or -not $arguments[$name]) { throw "Missing signed audit string: $name" }
+  }
+  & (Join-Path $PSScriptRoot 'verify-release-windows-signed-update.ps1') @arguments
+  exit $LASTEXITCODE
+}
+
+function Test-InstalledProductVersion {
+  param([string]$Actual, [string]$Expected)
+  if ([string]::IsNullOrWhiteSpace($Actual)) { return $false }
+  $value = $Actual.Trim()
+  if ($value -ceq $Expected) { return $true }
+  # Windows PE resources can append a zero revision to stable SemVer. Never
+  # discard a prerelease identity or accept another revision/version prefix.
+  return (
+    $Expected -cmatch '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$' -and
+    $value -ceq "$Expected.0"
+  )
+}
+
+function Get-NSISUserProgramsDirectory {
+  # electron-builder multiUser.nsh uses FOLDERID_UserProgramFiles, independent
+  # of the APPDATA/LOCALAPPDATA environment used to isolate the test profile.
+  if (-not ('OpenSquilla.ReleaseValidation.KnownFolders' -as [type])) {
+    Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+namespace OpenSquilla.ReleaseValidation {
+  public static class KnownFolders {
+    [DllImport("shell32.dll")]
+    private static extern int SHGetKnownFolderPath(
+      [MarshalAs(UnmanagedType.LPStruct)] Guid folder, uint flags,
+      IntPtr token, out IntPtr path);
+    public static string UserPrograms() {
+      IntPtr path = IntPtr.Zero;
+      try {
+        // Resolve without creating or requiring an existing Programs directory.
+        int result = SHGetKnownFolderPath(
+          new Guid("5CD7AEE2-2219-4A67-B85D-6C9CE15660CB"), 0x4000, IntPtr.Zero, out path);
+        if (result != 0) Marshal.ThrowExceptionForHR(result);
+        return Marshal.PtrToStringUni(path);
+      } finally {
+        if (path != IntPtr.Zero) Marshal.FreeCoTaskMem(path);
+      }
+    }
+  }
+}
+'@ | Out-Null
+  }
+  return [OpenSquilla.ReleaseValidation.KnownFolders]::UserPrograms()
+}
+
 $repository = 'TokenRhythm/opensquilla'
 $oldTag = "v$BaselineVersion"
 $oldAsset = "OpenSquilla-$BaselineVersion-win-x64.exe"
@@ -49,18 +121,40 @@ $localAppData = Join-Path $sandbox 'localappdata'
 $userData = Join-Path $appData 'OpenSquilla'
 $profile = Join-Path $userData 'opensquilla'
 $probe = Join-Path $PWD '.github\scripts\verify-release-profile-preservation.py'
+$migrationProbe = Join-Path $PWD '.github\scripts\verify-packaged-v054-upgrade.py'
+$migrationProfile = Join-Path $sandbox 'complete-v054-profile'
 $updateBannerSmoke = Join-Path $PWD 'desktop\electron\scripts\test-packaged-update-banner.mjs'
 $sessionRecoverySmoke = Join-Path $PWD 'desktop\electron\scripts\test-packaged-session-recovery.mjs'
 $realUpdateDriver = Join-Path $PWD 'desktop\electron\scripts\test-packaged-real-update-flow.mjs'
 $realUpdateResult = Join-Path $sandbox 'real-update-result.json'
 $externalSentinels = Join-Path $sandbox 'synthetic-system-tools'
+$signatureVerifier = Join-Path $PWD '.github\scripts\verify-windows-signatures.ps1'
+$installDir = if ($InstallMode -eq 'custom') {
+  Join-Path $sandbox 'OpenSquilla'
+} else {
+  $programsDirectory = Get-NSISUserProgramsDirectory
+  if (-not $programsDirectory -or -not [IO.Path]::IsPathRooted($programsDirectory)) {
+    throw 'NSIS UserProgramFiles must resolve to an absolute directory.'
+  }
+  $programsRoot = [IO.Path]::GetFullPath($programsDirectory)
+  $defaultInstallRoot = [IO.Path]::GetFullPath((Join-Path $programsRoot 'OpenSquilla'))
+  if (-not $defaultInstallRoot.StartsWith(
+    $programsRoot.TrimEnd([IO.Path]::DirectorySeparatorChar) + [IO.Path]::DirectorySeparatorChar,
+    [StringComparison]::OrdinalIgnoreCase
+  )) {
+    throw 'NSIS default installation escaped the UserProgramFiles directory.'
+  }
+  if (Test-Path -LiteralPath $defaultInstallRoot) {
+    throw 'NSIS default installation requires a fresh runner without an existing OpenSquilla directory.'
+  }
+  $defaultInstallRoot
+}
 $env:APPDATA = $appData
 $env:LOCALAPPDATA = $localAppData
 $env:OPENSQUILLA_DESKTOP_DISABLE_AUTO_UPDATE = '1'
 $env:OPENSQUILLA_RECOVERY_OFFLINE = '1'
 
 New-Item -ItemType Directory -Force -Path $oldDir, $appData, $localAppData | Out-Null
-$installDir = if ($InstallMode -eq 'custom') { Join-Path $sandbox 'OpenSquilla' } else { '' }
 gh release download $oldTag --repo $repository --pattern $oldAsset --dir $oldDir
 if ($LASTEXITCODE -ne 0) { throw "Failed to download the $oldTag Windows installer." }
 $oldInstaller = Join-Path $oldDir $oldAsset
@@ -89,16 +183,12 @@ try {
     -Wait -PassThru
   if ($old.ExitCode -ne 0) { throw "$oldTag installer failed with exit code $($old.ExitCode)." }
 
-  if ($InstallMode -eq 'default') {
-    $oldApp = Get-ChildItem -LiteralPath $localAppData -Filter 'OpenSquilla.exe' -File -Recurse |
-      Select-Object -First 1
-    if (-not $oldApp) { throw "$oldTag default installation did not publish OpenSquilla.exe." }
-    $installDir = $oldApp.Directory.FullName
-  }
-
   $oldAppPath = Join-Path $installDir 'OpenSquilla.exe'
+  if (-not (Test-Path -LiteralPath $oldAppPath -PathType Leaf)) {
+    throw "$oldTag $InstallMode installation did not publish OpenSquilla.exe at the expected installation root."
+  }
   $oldProductVersion = ([Diagnostics.FileVersionInfo]::GetVersionInfo($oldAppPath)).ProductVersion
-  if (-not $oldProductVersion -or $oldProductVersion.Trim() -ne $BaselineVersion) {
+  if (-not (Test-InstalledProductVersion -Actual $oldProductVersion -Expected $BaselineVersion)) {
     throw "Expected official $oldTag, found installed version: $oldProductVersion"
   }
   # v0.5.3 bundles developer tools; v0.5.4 uses the slim Runtime Pack layout.
@@ -125,8 +215,14 @@ try {
     }
   }
 
-  python $probe seed --home $profile --label $Label --external-root $externalSentinels
+  python $probe seed --home $profile --label $Label --external-root $externalSentinels --baseline-version $BaselineVersion
   if ($LASTEXITCODE -ne 0) { throw "Failed to seed the synthetic $oldTag profile." }
+  if ($BaselineVersion -eq '0.5.4') {
+    # Prepare complete old data before installing the candidate. Keep this
+    # native restart gate independent of Desktop config/keychain assertions.
+    python $probe seed --home $migrationProfile --label $Label --baseline-version '0.5.4'
+    if ($LASTEXITCODE -ne 0) { throw 'Failed to seed the complete v0.5.4 migration profile.' }
+  }
 
   if ($RealUpdateChannelManifest) {
     # Gate boundary: this proves updater discovery/download integrity, behavior while
@@ -173,13 +269,15 @@ try {
       throw "Official $oldTag downloaded installer bytes differ from the Draft candidate."
     }
   } else {
-    $installed = Start-Process -FilePath $candidate -ArgumentList @('/S', "/D=$installDir") `
+    $candidateArguments = @('/S')
+    if ($InstallMode -eq 'custom') { $candidateArguments += "/D=$installDir" }
+    $installed = Start-Process -FilePath $candidate -ArgumentList $candidateArguments `
       -Wait -PassThru
     if ($installed.ExitCode -ne 0) {
       throw "Candidate installer failed with exit code $($installed.ExitCode)."
     }
   }
-  python $probe verify --home $profile --label $Label --external-root $externalSentinels
+  python $probe verify --home $profile --label $Label --external-root $externalSentinels --baseline-version $BaselineVersion
   if ($LASTEXITCODE -ne 0) { throw "Candidate installation changed $oldTag profile data." }
 
   $candidateRuntime = Join-Path $installDir 'resources\runtime'
@@ -196,12 +294,17 @@ try {
   if (-not (Test-Path -LiteralPath $app -PathType Leaf)) {
     throw 'Candidate installation did not publish OpenSquilla.exe.'
   }
+  & $signatureVerifier -InstallerPath $candidate -InstalledRoot $installDir
+  if ($LASTEXITCODE -ne 0) {
+    throw 'Candidate or installed Windows Authenticode verification failed.'
+  }
+
   $actualProductVersion = ([Diagnostics.FileVersionInfo]::GetVersionInfo($app)).ProductVersion
   if (-not $actualProductVersion) {
     throw 'Installed OpenSquilla.exe does not declare a ProductVersion.'
   }
   $actualProductVersion = $actualProductVersion.Trim()
-  if ($actualProductVersion -cne $expectedInstalledVersion) {
+  if (-not (Test-InstalledProductVersion -Actual $actualProductVersion -Expected $expectedInstalledVersion)) {
     throw (
       "Installed OpenSquilla.exe ProductVersion $actualProductVersion does not match " +
       "the rehearsed version $expectedInstalledVersion."
@@ -243,6 +346,11 @@ try {
   $gateway = Get-ChildItem -Path (Join-Path $installDir 'resources\runtime\gateway') `
     -Filter 'opensquilla-gateway.exe' -File -Recurse | Select-Object -First 1
   if (-not $gateway) { throw 'Packaged recovery CLI was not found.' }
+  if ($BaselineVersion -eq '0.5.4') {
+    python $migrationProbe --gateway $gateway.FullName --home $migrationProfile `
+      --output (Join-Path $sandbox 'complete-v054-upgrade.json')
+    if ($LASTEXITCODE -ne 0) { throw 'Complete v0.5.4 upgrade and graceful restart gate failed.' }
+  }
   $inspectionRaw = & $gateway.FullName recovery inspect --home $profile --json
   if ($LASTEXITCODE -ne 0) { throw 'Packaged recovery inspection failed.' }
   $inspection = $inspectionRaw | ConvertFrom-Json
@@ -268,7 +376,7 @@ try {
   ) {
     throw 'Candidate selected a different state directory after upgrade.'
   }
-  python $probe verify --home $profile --label $Label --external-root $externalSentinels
+  python $probe verify --home $profile --label $Label --external-root $externalSentinels --baseline-version $BaselineVersion
   if ($LASTEXITCODE -ne 0) { throw "Candidate launch changed $oldTag profile data." }
 
   $uninstaller = Get-ChildItem -LiteralPath $installDir -Filter 'Uninstall*.exe' -File |
@@ -289,7 +397,7 @@ try {
   if (Test-Path -LiteralPath $app -PathType Leaf) {
     throw 'Candidate uninstaller did not remove OpenSquilla.exe.'
   }
-  python $probe verify --home $profile --label $Label --external-root $externalSentinels
+  python $probe verify --home $profile --label $Label --external-root $externalSentinels --baseline-version $BaselineVersion
   if ($LASTEXITCODE -ne 0) { throw "Candidate uninstaller changed $oldTag profile data." }
 } finally {
   Stop-InstalledProcesses

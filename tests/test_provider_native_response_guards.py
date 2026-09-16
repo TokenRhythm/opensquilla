@@ -804,6 +804,34 @@ def test_openai_stream_post_terminal_empty_choices_must_be_usage_only(
     _assert_not_committed(events, "invalid_stream_order")
 
 
+def test_custom_stream_accepts_llama_cpp_empty_terminal_epilogue(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_body(
+        monkeypatch,
+        _sse(
+            {"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]},
+            {"choices": []},
+        ),
+    )
+
+    events = _collect(
+        OpenAIProvider(
+            api_key="test",
+            model="local-model",
+            base_url="http://127.0.0.1:11436/v1",
+            provider_kind="openai",
+            provider_id="custom",
+        )
+    )
+
+    assert any(isinstance(event, DoneEvent) for event in events)
+    assert not any(
+        isinstance(event, ErrorEvent) and event.code == "invalid_stream_order"
+        for event in events
+    )
+
+
 def test_tokenrhythm_accepts_only_inert_choice_usage_epilogue(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

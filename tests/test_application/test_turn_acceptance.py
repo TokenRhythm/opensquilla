@@ -73,14 +73,6 @@ class _ReplayPorts:
         finally:
             self.events.append("intent-exit")
 
-    @asynccontextmanager
-    async def authority_scope(self):
-        self.events.append("authority-enter")
-        try:
-            yield
-        finally:
-            self.events.append("authority-exit")
-
     def clear_compaction_marker(self, session_key):
         self.events.append("clear-marker")
 
@@ -165,11 +157,9 @@ async def test_receipt_replay_returns_before_artifact_material_or_runtime_prepar
     }
     assert ports.events == [
         "intent-enter",
-        "authority-enter",
         "normalize",
         "replay",
         "project",
-        "authority-exit",
         "intent-exit",
     ]
 

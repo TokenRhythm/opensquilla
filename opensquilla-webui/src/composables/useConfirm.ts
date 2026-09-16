@@ -9,7 +9,7 @@ export interface ConfirmOptions {
 }
 
 export interface ConfirmChoiceOptions extends ConfirmOptions {
-  secondaryLabel: string
+  secondaryLabel?: string
   secondaryClass?: string
   showCancel?: boolean
 }

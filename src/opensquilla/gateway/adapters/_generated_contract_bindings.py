@@ -35,6 +35,15 @@ def _validation_errors(exc: ValidationError) -> tuple[dict[str, Any], ...]:
     )
 
 
+def validate_generated_contract_params(
+    method: str, params: Any, *, strict: bool | None = None,
+) -> dict[str, Any]:
+    """Project explicitly validated new-method params into plain domain values."""
+    descriptor = GATEWAY_METHOD_CONTRACTS[method]
+    validated = descriptor.params_model.model_validate(params, strict=strict)
+    return cast(dict[str, Any], validated.model_dump(exclude_unset=True))
+
+
 def _observe_request(
     method: str,
     descriptor: GatewayMethodContract,

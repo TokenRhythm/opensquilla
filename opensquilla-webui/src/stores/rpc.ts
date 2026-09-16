@@ -1,10 +1,12 @@
-import { ref, computed } from 'vue'
+import { ref, computed, onScopeDispose } from 'vue'
 import { defineStore } from 'pinia'
 import {
   RpcClient,
   type RpcCallOptions,
   type RpcConnectionWaitOptions,
   type RpcEventHandler,
+  type RpcLifecycle,
+  type RpcConsumptionHandler,
 } from '@/lib/rpc'
 import type { DesktopGatewayConnection } from '@/platform/types'
 import { getPlatform } from '@/platform'
@@ -87,6 +89,8 @@ export const useRpcStore = defineStore('rpc', () => {
   const events = ref<string[]>([])
   const unavailableMethods = ref<Set<string>>(new Set())
   const error = ref<string | null>(null)
+  const lifecycle = ref<RpcLifecycle>('stopped')
+  const health = ref<'healthy' | 'suspect'>('healthy')
   // RpcClient is stored as a class instance and several callbacks retain the
   // raw object, so its private generation mutations are not Vue-reactive.
   // Mirror the value explicitly at every transport/state boundary.
@@ -94,6 +98,69 @@ export const useRpcStore = defineStore('rpc', () => {
   let desktopConnectionRevision = -1
   let desktopConnectionKey = ''
   let desktopAuthToken = ''
+  let connectionDesired = true
+  let authRefreshAttempted = false
+  let descriptorTimer: ReturnType<typeof setTimeout> | null = null
+  let descriptorFetch: {
+    revision: number
+    manual: boolean
+    retry: boolean
+    promise: Promise<void>
+  } | null = null
+  let descriptorAttempt = 0
+  let descriptorRequestRevision = 0
+  const connectionSubscriptions: Array<() => void> = []
+
+  onScopeDispose(() => {
+    connectionDesired = false
+    cancelDescriptorRecovery()
+    for (const unsubscribe of connectionSubscriptions.splice(0)) unsubscribe()
+    client.value?.disconnect()
+  })
+
+  function cancelDescriptorRecovery(): void {
+    descriptorRequestRevision += 1
+    if (descriptorTimer !== null) clearTimeout(descriptorTimer)
+    descriptorTimer = null
+  }
+
+  function refreshDesktopConnection(retry = true, manual = false): Promise<void> {
+    const getConnection = getPlatform().gateway.getConnection
+    if (!connectionDesired || !getConnection) return Promise.resolve()
+    if (descriptorFetch?.revision === descriptorRequestRevision) {
+      descriptorFetch.manual ||= manual
+      descriptorFetch.retry ||= retry
+      return descriptorFetch.promise
+    }
+    const revision = descriptorRequestRevision
+    const request = { revision, manual, retry, promise: Promise.resolve() }
+    let timeout: ReturnType<typeof setTimeout> | undefined
+    request.promise = Promise.race([
+      Promise.resolve().then(() => getConnection()),
+      new Promise<never>((_, reject) => {
+        timeout = setTimeout(() => reject(new Error('Gateway descriptor unavailable')), 8_000)
+      }),
+    ]).then(payload => {
+      if (revision !== descriptorRequestRevision || !connectionDesired) return
+      descriptorAttempt = 0
+      applyDesktopConnection(payload, request.manual)
+    }).catch(() => {
+      if (revision !== descriptorRequestRevision || !connectionDesired) return
+      error.value = 'Gateway connection information is temporarily unavailable'
+      if (request.retry && descriptorTimer === null) {
+        const cap = Math.min(15_000, 500 * 2 ** Math.min(descriptorAttempt++, 10))
+        descriptorTimer = setTimeout(() => {
+          descriptorTimer = null
+          refreshDesktopConnection()
+        }, Math.max(250, Math.floor(cap * (0.5 + Math.random() * 0.5))))
+      }
+    }).finally(() => {
+      if (timeout !== undefined) clearTimeout(timeout)
+      if (descriptorFetch === request) descriptorFetch = null
+    })
+    descriptorFetch = request
+    return request.promise
+  }
 
   const isConnected = computed(() => state.value === 'connected')
   const isConnecting = computed(() => state.value === 'connecting')
@@ -121,18 +188,28 @@ export const useRpcStore = defineStore('rpc', () => {
     unavailableMethods.value = new Set()
   }
 
-  function applyDesktopConnection(payload: DesktopGatewayConnection): void {
+  function applyDesktopConnection(payload: DesktopGatewayConnection, manual = false): void {
     if (
-      !payload
+      !connectionDesired
+      || !payload
       || payload.schemaVersion !== 1
       || !Number.isInteger(payload.revision)
       || payload.revision < desktopConnectionRevision
-    ) return
+    ) {
+      if (manual && connectionDesired && (!payload || payload.schemaVersion !== 1)) {
+        error.value = 'Gateway connection information is temporarily unavailable'
+      }
+      return
+    }
 
     desktopConnectionRevision = payload.revision
     const nextUrl = typeof payload.wsUrl === 'string' ? payload.wsUrl.trim() : ''
     const nextInstance = typeof payload.instanceId === 'string' ? payload.instanceId : ''
     if (payload.status !== 'ready' || !nextUrl || !nextInstance) {
+      if (manual) {
+        error.value = payload.error || 'Gateway is not ready to connect'
+        return
+      }
       desktopConnectionKey = ''
       if (desktopAuthToken) {
         try {
@@ -143,30 +220,59 @@ export const useRpcStore = defineStore('rpc', () => {
         desktopAuthToken = ''
       }
       error.value = payload.error || null
-      if (client.value?.state !== 'disconnected') client.value?.disconnect()
+      if (client.value?.lifecycle !== 'stopped') client.value?.disconnect()
       clearConnectionIdentity()
       return
     }
 
-    const nextKey = `${nextInstance}\0${nextUrl}`
-    if (nextKey === desktopConnectionKey) return
     const nextAuthToken = typeof payload.authToken === 'string'
       ? payload.authToken.trim()
       : ''
+    const nextKey = `${payload.profileFingerprint}\0${nextInstance}\0${nextUrl}`
+    const explicitRestart = manual && (
+      client.value?.lifecycle === 'stopped' || client.value?.lifecycle === 'blocked'
+    )
+    if (nextKey === desktopConnectionKey && nextAuthToken === desktopAuthToken && !explicitRestart) {
+      if (client.value?.lifecycle !== 'blocked') error.value = null
+      client.value?.ensureConnected()
+      return
+    }
+    authRefreshAttempted = false
     desktopConnectionKey = nextKey
+    if (desktopAuthToken && !nextAuthToken) {
+      try {
+        if (sessionStorage.getItem(WS_TOKEN_KEY) === desktopAuthToken) sessionStorage.removeItem(WS_TOKEN_KEY)
+      } catch {}
+    }
+    desktopAuthToken = nextAuthToken
     if (nextAuthToken) {
-      desktopAuthToken = nextAuthToken
       try { sessionStorage.setItem(WS_TOKEN_KEY, nextAuthToken) } catch {}
     }
     error.value = null
     if (client.value?.state !== 'disconnected') client.value?.disconnect()
     clearConnectionIdentity()
-    client.value?.connect(nextUrl, nextAuthToken || loadConnectionSettings().token || undefined)
+    client.value?.connect(nextUrl, nextAuthToken || undefined, {
+      key: nextKey,
+      authentication: nextAuthToken ? 'owner' : 'guest-allowed',
+    })
   }
 
   function init() {
+    if (client.value) return
+    connectionDesired = true
     const rpc = new RpcClient()
     client.value = rpc
+
+    rpc.on('_status', (status: { lifecycle: RpcLifecycle; health: 'healthy' | 'suspect'; reason: string | null }) => {
+      lifecycle.value = status.lifecycle
+      health.value = status.health
+      if (status.lifecycle === 'blocked') error.value = status.reason
+    })
+    rpc.on('_blocked', () => {
+      if (authRefreshAttempted || !connectionDesired) return
+      authRefreshAttempted = true
+      refreshDesktopConnection(false)
+    })
 
     rpc.on('_state', (s: 'disconnected' | 'connecting' | 'connected') => {
       connectionGeneration.value = rpc.connectionGeneration
@@ -181,6 +287,7 @@ export const useRpcStore = defineStore('rpc', () => {
       auth?: Record<string, unknown>
       features?: { methods?: unknown; events?: unknown }
     }) => {
+      error.value = null
       policy.value = data.policy || null
       auth.value = data.auth || null
       methods.value = Array.isArray(data.features?.methods)
@@ -202,14 +309,15 @@ export const useRpcStore = defineStore('rpc', () => {
     })
 
     const gatewayPlatform = getPlatform().gateway
+    if (gatewayPlatform.onResume) {
+      connectionSubscriptions.push(gatewayPlatform.onResume(notifyResume))
+    }
     if (
       typeof gatewayPlatform.getConnection === 'function'
       && typeof gatewayPlatform.onConnection === 'function'
     ) {
-      gatewayPlatform.onConnection(applyDesktopConnection)
-      void gatewayPlatform.getConnection().then(applyDesktopConnection).catch((reason) => {
-        error.value = reason instanceof Error ? reason.message : String(reason)
-      })
+      connectionSubscriptions.push(gatewayPlatform.onConnection(payload => applyDesktopConnection(payload)))
+      refreshDesktopConnection()
       return
     }
 
@@ -224,6 +332,21 @@ export const useRpcStore = defineStore('rpc', () => {
   async function connect(url: string, token?: string) {
     if (!client.value) throw new Error('RPC client not initialized')
     error.value = null
+    connectionDesired = true
+    if (getPlatform().id === 'desktop') {
+      // The renderer origin and its form token are not the Desktop runtime's
+      // endpoint or credentials. Keep a working socket until its owner replies.
+      if (!getPlatform().gateway.getConnection) {
+        error.value = 'Gateway connection information is temporarily unavailable'
+        return
+      }
+      const retry = descriptorTimer !== null
+      if (descriptorTimer !== null) clearTimeout(descriptorTimer)
+      descriptorTimer = null
+      await refreshDesktopConnection(retry, true)
+      return
+    }
+    cancelDescriptorRecovery()
     saveConnectionSettings(url, token || '')
     client.value.connect(url, token)
   }
@@ -232,6 +355,7 @@ export const useRpcStore = defineStore('rpc', () => {
     const settings = consumeLinkTokenFromUrl()
     if (!settings) return false
     if (client.value) {
+      connectionDesired = true
       client.value.disconnect()
       error.value = null
       policy.value = null
@@ -245,10 +369,37 @@ export const useRpcStore = defineStore('rpc', () => {
   }
 
   function disconnect() {
+    connectionDesired = false
+    cancelDescriptorRecovery()
     client.value?.disconnect()
     desktopConnectionKey = ''
     state.value = 'disconnected'
     clearConnectionIdentity()
+  }
+
+  function notifyResume(): void {
+    if (!connectionDesired) return
+    client.value?.notifyResume()
+    refreshDesktopConnection()
+  }
+
+  function onGap(handler: (detail: unknown) => Promise<boolean>): () => void {
+    return client.value?.onGap(handler) || (() => {})
+  }
+
+  function onConsumedEvent(event: string, handler: RpcConsumptionHandler): () => void {
+    return client.value?.onConsumedEvent(event, handler) || (() => {})
+  }
+
+  function enableConsumptionFlow(): void { client.value?.enableConsumptionFlow() }
+
+  function consumeEvent(event: string, payload: unknown, meta: Record<string, unknown>) {
+    if (!client.value) return Promise.reject(new Error('RPC client not initialized'))
+    return client.value.consumeEvent(event, payload, meta)
+  }
+
+  function recoverGap(detail: unknown): Promise<boolean> {
+    return client.value?.recoverGap(detail) || Promise.resolve(false)
   }
 
   function hasRpcMethod(method: string): boolean {
@@ -312,6 +463,8 @@ export const useRpcStore = defineStore('rpc', () => {
     methods,
     events,
     error,
+    lifecycle,
+    health,
     connectionGeneration,
     isConnected,
     isConnecting,
@@ -322,6 +475,12 @@ export const useRpcStore = defineStore('rpc', () => {
     connect,
     applyLinkTokenFromUrl,
     disconnect,
+    notifyResume,
+    onGap,
+    onConsumedEvent,
+    enableConsumptionFlow,
+    consumeEvent,
+    recoverGap,
     hasRpcMethod,
     hasRpcEvent,
     rememberUnsupportedMethod,

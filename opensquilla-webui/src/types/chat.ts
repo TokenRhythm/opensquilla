@@ -145,7 +145,10 @@ export interface ChatPendingItem {
   pendingUiId: string
   text: string
   /** Annotation batch retained when a follow-up is queued behind an active turn. */
-  promptAnnotationIds?: string[]
+  draftIds?: string[]
+  /** Upgrade recovery requires the user to select the page again before sending. */
+  retiredAnnotationInput?: boolean
+  pageContext?: import('./pageContext').ChatPageContext
   attachments: Attachment[]
   intent: string | null
   /** Slash-prefixed text that a complete command catalog classified as ordinary input. */
@@ -243,7 +246,8 @@ export interface ChatRouterCell {
 
 export interface ChatRouterTierConfig {
   model: string
-  supportsImage: boolean
+  /** Accepted from legacy snapshots, not used to determine capability. */
+  supportsImage?: boolean
   imageOnly: boolean
   ensembleEnabled?: boolean
 }
@@ -260,6 +264,7 @@ export interface ChatToolCall {
   isError: boolean
   result: string
   resultPreview: string
+  executionLogHandle?: string
   sources?: unknown
   isOpen: boolean
   activityOrder?: number
@@ -295,6 +300,7 @@ export interface ToolResultContext {
   inputRaw?: string
   section?: 'input' | 'result' | 'error'
   format?: 'diff'
+  executionLogHandle?: string
 }
 
 export interface ChatToolCallGroup {

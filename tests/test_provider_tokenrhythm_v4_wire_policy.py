@@ -8,7 +8,6 @@ import httpx
 import pytest
 import structlog.testing
 
-from opensquilla.engine.agent import _chat_config_with_thinking_disabled
 from opensquilla.engine.types import ThinkingLevel
 from opensquilla.provider.openai import (
     OpenAIProvider,
@@ -414,21 +413,6 @@ def test_tokenrhythm_v4_unspecified_thinking_keeps_provider_default() -> None:
     assert "reasoning_effort" not in payload
 
 
-def test_tokenrhythm_v4_runtime_thinking_fallback_sends_explicit_disabled() -> None:
-    fallback_config = _chat_config_with_thinking_disabled(
-        _config(thinking=True, thinking_level=ThinkingLevel.HIGH)
-    )
-
-    payload = _payload(
-        _provider(),
-        [Message(role="user", content="Finish without more reasoning.")],
-        config=fallback_config,
-    )
-
-    assert payload["thinking"] == {"type": "disabled"}
-    assert "reasoning_effort" not in payload
-
-
 def test_tokenrhythm_v4_unspecified_thinking_degrades_required_tool_choice() -> None:
     payload = _payload(
         _provider(),
@@ -501,7 +485,7 @@ def test_tokenrhythm_generic_pro_explicit_off_keeps_required_tool_choice() -> No
     assert payload["thinking"] == {"type": "disabled"}
 
 
-def test_tokenrhythm_v4_unspecified_thinking_named_pin_disables_thinking() -> None:
+def test_tokenrhythm_v4_unspecified_thinking_named_pin_preserves_provider_default() -> None:
     named_pin = {"type": "function", "function": {"name": "lookup"}}
     payload = _payload(
         _provider(),
@@ -514,24 +498,26 @@ def test_tokenrhythm_v4_unspecified_thinking_named_pin_disables_thinking() -> No
         tools=[LOOKUP_TOOL],
     )
 
-    assert payload["tool_choice"] == named_pin
-    assert payload["thinking"] == {"type": "disabled"}
+    assert payload["tool_choice"] == "auto"
+    assert "thinking" not in payload
     assert "reasoning_effort" not in payload
 
 
 @pytest.mark.parametrize("model", TOKENRHYTHM_0813_MODELS)
 @pytest.mark.parametrize(
-    ("thinking", "thinking_level"),
+    ("thinking", "thinking_level", "expected_thinking", "expected_effort"),
     (
-        (True, ThinkingLevel.LOW),
-        (False, ThinkingLevel.OFF),
-        (False, None),
+        (True, ThinkingLevel.LOW, {"type": "enabled"}, "low"),
+        (False, ThinkingLevel.OFF, {"type": "disabled"}, None),
+        (False, None, None, None),
     ),
 )
-def test_tokenrhythm_0813_named_pin_wins_in_every_thinking_state(
+def test_tokenrhythm_0813_named_pin_never_changes_thinking_state(
     model: str,
     thinking: bool,
     thinking_level: ThinkingLevel | None,
+    expected_thinking: dict[str, str] | None,
+    expected_effort: str | None,
 ) -> None:
     named_pin = {"type": "function", "function": {"name": "lookup"}}
     payload = _payload(
@@ -545,9 +531,15 @@ def test_tokenrhythm_0813_named_pin_wins_in_every_thinking_state(
         tools=[LOOKUP_TOOL],
     )
 
-    assert payload["tool_choice"] == named_pin
-    assert payload["thinking"] == {"type": "disabled"}
-    assert "reasoning_effort" not in payload
+    assert payload["tool_choice"] == "auto"
+    if expected_thinking is None:
+        assert "thinking" not in payload
+    else:
+        assert payload["thinking"] == expected_thinking
+    if expected_effort is None:
+        assert "reasoning_effort" not in payload
+    else:
+        assert payload["reasoning_effort"] == expected_effort
 
 
 @pytest.mark.parametrize("tool_choice", ("auto", "none"))
@@ -579,7 +571,7 @@ def test_tokenrhythm_v4_thinking_degrades_required_tool_choice_to_auto() -> None
     assert payload["reasoning_effort"] == "high"
 
 
-def test_tokenrhythm_v4_named_tool_pin_wins_over_thinking() -> None:
+def test_tokenrhythm_v4_thinking_wins_over_named_tool_pin() -> None:
     named_pin = {"type": "function", "function": {"name": "lookup"}}
     payload = _payload(
         _provider(),
@@ -588,9 +580,9 @@ def test_tokenrhythm_v4_named_tool_pin_wins_over_thinking() -> None:
         tools=[LOOKUP_TOOL],
     )
 
-    assert payload["tool_choice"] == named_pin
-    assert payload["thinking"] == {"type": "disabled"}
-    assert "reasoning_effort" not in payload
+    assert payload["tool_choice"] == "auto"
+    assert payload["thinking"] == {"type": "enabled"}
+    assert payload["reasoning_effort"] == "high"
 
 
 def test_tokenrhythm_0813_required_rewrite_does_not_retry_reactively(

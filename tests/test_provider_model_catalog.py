@@ -382,6 +382,46 @@ def test_vision_support_distinguishes_live_evidence_from_synthesized_default() -
 
 
 @pytest.mark.parametrize(
+    ("architecture", "expected"),
+    [
+        ({}, "unknown"),
+        ({"input_modalities": None}, "unknown"),
+        ({"input_modalities": []}, "unknown"),
+        ({"input_modalities": "text"}, "unknown"),
+        ({"input_modalities": [None]}, "unknown"),
+        ({"input_modalities": [""]}, "unknown"),
+        ({"input_modalities": ["text"]}, "unsupported"),
+        ({"input_modalities": ["text", "image"]}, "supported"),
+        ({"input_modalities": [" TEXT ", " IMAGE "]}, "supported"),
+        ({"output_modalities": ["image"]}, "unknown"),
+    ],
+)
+def test_live_vision_requires_explicit_input_modality_evidence(
+    architecture: dict, expected: str,
+) -> None:
+    catalog = ModelCatalog()
+    catalog._populate_from_data(
+        [{"id": "synthetic/capability-check", "architecture": architecture}]
+    )
+
+    assert catalog.resolve_deployment_vision_support(
+        "synthetic/capability-check", provider="openrouter"
+    ) == expected
+
+
+def test_missing_live_vision_does_not_mask_known_catalog_input_capability() -> None:
+    catalog = ModelCatalog()
+    catalog._populate_from_data([{"id": "synthetic/catalog-vision"}])
+    with patch(
+        "opensquilla.provider.model_catalog._snapshot_layer_fields",
+        return_value={"supports_vision": True},
+    ):
+        assert catalog.resolve_vision_support(
+            "synthetic/catalog-vision", provider_name="openrouter"
+        ) == "supported"
+
+
+@pytest.mark.parametrize(
     ("reasoning_format", "supports_reasoning"),
     [("deepseek", True), ("none", False)],
 )

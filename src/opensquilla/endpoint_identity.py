@@ -2,9 +2,32 @@
 
 from __future__ import annotations
 
-from urllib.parse import urlsplit
+import hashlib
+import json
+from urllib.parse import urlparse, urlsplit
 
 _DEFAULT_PORTS = {"http": 80, "https": 443}
+
+
+def endpoint_replay_source(protocol: str, provider_id: str, endpoint: str) -> str:
+    """Hash the actual request route without persisting endpoint credentials."""
+    parsed = urlparse(endpoint)
+    scheme = parsed.scheme.lower()
+    port: int | str | None
+    try:
+        port = parsed.port
+    except ValueError:
+        # Leave URL rejection to the HTTP boundary while keeping invalid
+        # ports distinct from valid routes in the stored provenance.
+        port = f"invalid:{parsed.netloc.rsplit('@', 1)[-1]}"
+    if port is None:
+        port = _DEFAULT_PORTS.get(scheme)
+    identity = (
+        provider_id, scheme, (parsed.hostname or "").lower().rstrip("."), port,
+        parsed.path, parsed.params, parsed.query,
+    )
+    digest = hashlib.sha256(json.dumps(identity, ensure_ascii=False).encode("utf-8"))
+    return f"{protocol}:{digest.hexdigest()}"
 
 
 def _http_origin(value: str) -> tuple[str, str, int] | None:
@@ -118,4 +141,5 @@ __all__ = [
     "base_url_allows_credential_reuse",
     "base_url_matches_official_api",
     "credential_env_for_endpoint",
+    "endpoint_replay_source",
 ]

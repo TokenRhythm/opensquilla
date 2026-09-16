@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 import re
@@ -18,6 +19,7 @@ from opensquilla.result_budget import (
     DEFAULT_TOOL_RUN_BUDGET_POLICY,
     ToolRunBudgetPolicy,
 )
+from opensquilla.safety.secret_redaction import redact_secret_text
 from opensquilla.sandbox.integration import managed_network_httpx_kwargs
 from opensquilla.sandbox.operation_runtime import (
     NetworkOperationRequest,
@@ -135,6 +137,7 @@ async def _try_firecrawl(url: str, api_key: str) -> tuple[str, str, str] | None:
                     "maxAge": 900_000,
                 },
             )
+            resp.raise_for_status()
             data = resp.json()
             if data.get("success"):
                 scraped = data.get("data") or {}
@@ -205,6 +208,9 @@ async def run_web_fetch_payload(
     extract_mode: str = "markdown",
     max_chars: int | None = None,
     extractor: str = "auto",
+    *,
+    _tool_use_id: str = "",
+    _search_excerpt: bool = False,
 ) -> dict[str, Any]:
     # --- SSRF guard ---
     _check_ssrf(url)
@@ -221,7 +227,9 @@ async def run_web_fetch_payload(
     cache_key = (url, extract_mode, extractor_preference)
     if cache_key in _cache:
         cached: dict[str, Any] = dict(_cache[cache_key])
-        return _apply_max_chars(cached, effective_max_chars)
+        return await _present_content(
+            cached, effective_max_chars, _tool_use_id, search_excerpt=_search_excerpt
+        )
 
     if extractor_preference == "firecrawl":
         firecrawl_key = os.environ.get("FIRECRAWL_API_KEY", "")
@@ -270,7 +278,9 @@ async def run_web_fetch_payload(
             "text": _wrap_content(url, extracted_content),
         }
         _cache[cache_key] = firecrawl_payload
-        return _apply_max_chars(firecrawl_payload, effective_max_chars)
+        return await _present_content(
+            firecrawl_payload, effective_max_chars, _tool_use_id, search_excerpt=_search_excerpt
+        )
 
     # --- Fetch ---
     title = ""
@@ -379,26 +389,8 @@ async def run_web_fetch_payload(
             continue
         break
 
-    # --- Non-HTML: return as-is ---
-    is_html = "html" in content_type.lower()
-    if not is_html:
-        result = {
-            "url": url,
-            "final_url": final_url,
-            "status": status,
-            "content_type": content_type,
-            "title": "",
-            "extract_mode": extract_mode,
-            "extractor": "raw",
-            "truncated": False,
-            "length": len(raw_html),
-            "text": _wrap_content(final_url, raw_html),
-        }
-        _cache[cache_key] = result
-        return _apply_max_chars(result, effective_max_chars)
-
     # --- Error HTTP status: return empty ---
-    if status >= 400:
+    if not 200 <= status < 300:
         hint = (
             "rate-limited or blocked upstream; try a different URL from search results, "
             "retry after a brief delay, or use another source"
@@ -421,6 +413,26 @@ async def run_web_fetch_payload(
         if status not in _TRANSIENT_STATUSES:
             _cache[cache_key] = result
         return result
+
+    # --- Non-HTML: return as-is ---
+    is_html = "html" in content_type.lower()
+    if not is_html:
+        result = {
+            "url": url,
+            "final_url": final_url,
+            "status": status,
+            "content_type": content_type,
+            "title": "",
+            "extract_mode": extract_mode,
+            "extractor": "raw",
+            "truncated": False,
+            "length": len(raw_html),
+            "text": _wrap_content(final_url, raw_html),
+        }
+        _cache[cache_key] = result
+        return await _present_content(
+            result, effective_max_chars, _tool_use_id, search_excerpt=_search_excerpt
+        )
 
     # --- Extraction pipeline ---
     # Try local extractors first (zero-cost, handles ~90% of mainstream pages),
@@ -471,7 +483,9 @@ async def run_web_fetch_payload(
         "text": _wrap_content(final_url, extracted_content),
     }
     _cache[cache_key] = result
-    return _apply_max_chars(result, effective_max_chars)
+    return await _present_content(
+        result, effective_max_chars, _tool_use_id, search_excerpt=_search_excerpt
+    )
 
 
 @tool(
@@ -495,8 +509,10 @@ async def run_web_fetch_payload(
             "type": "integer",
             "description": (
                 "Maximum characters to return (minimum 100). "
-                "Defaults to 20,000 when omitted; override default with "
-                "OPENSQUILLA_WEB_FETCH_MAX_CHARS."
+                "Direct calls default to 20,000 (OPENSQUILLA_WEB_FETCH_MAX_CHARS overrides). "
+                "Agent dispatch may supply its runtime budget when omitted and may further "
+                "limit explicit values. Truncated bodies show head/tail; use content_recovery "
+                "when available to read the omitted portion."
             ),
             "minimum": 100,
         },
@@ -507,6 +523,7 @@ async def run_web_fetch_payload(
         },
     },
     required=["url"],
+    runtime_only_arguments={"_tool_use_id"},
     plan_access=PlanAccess.READ_ONLY,
     result_budget_class="external",
     sandbox=SandboxToolDescriptor.network(
@@ -526,12 +543,14 @@ async def web_fetch(
     extract_mode: str = "markdown",
     max_chars: int | None = None,
     extractor: str = "auto",
+    _tool_use_id: str = "",
 ) -> str:
     payload = await run_web_fetch_payload(
         url,
         extract_mode=extract_mode,
         max_chars=max_chars,
         extractor=extractor,
+        _tool_use_id=_tool_use_id,
     )
     raw_tool_result = payload.get(_RAW_TOOL_RESULT_KEY)
     if isinstance(raw_tool_result, str):
@@ -573,26 +592,104 @@ def _extract_inner(wrapped: str) -> str:
     return wrapped[start_tag_end + 1 : end_tag_start]
 
 
-def _apply_max_chars(result: dict[str, Any], max_chars: int | None) -> dict[str, Any]:
-    """Return a display copy with max_chars applied.
+def _head_tail_preview(inner: str, budget: int) -> tuple[str, int, int]:
+    """Return preview and the omitted interval in the original character space."""
+    budget = max(0, budget)
+    marker = "\n[... middle omitted ...]\n"
+    if budget < len(marker):
+        marker = "…" if budget else ""
+    remaining = budget - len(marker)
+    head_end = int(remaining * 0.65)
+    tail_start = len(inner) - (remaining - head_end)
+    # Prefer complete lines without growing the caller's character budget.
+    newline = inner.rfind("\n", 0, head_end)
+    if newline >= 0:
+        head_end = newline + 1
+    newline = inner.find("\n", tail_start)
+    if newline >= 0:
+        tail_start = newline + 1
+    # Do not split a CRLF pair when a cut falls exactly between its characters.
+    if 0 < head_end < len(inner) and inner[head_end - 1:head_end + 1] == "\r\n":
+        head_end -= 1
+    if 0 < tail_start < len(inner) and inner[tail_start - 1:tail_start + 1] == "\r\n":
+        tail_start += 1
+    return inner[:head_end] + marker + inner[tail_start:], head_end, tail_start
 
-    The cache stores untruncated content so callers can later request a larger
-    explicit cap without waiting for cache expiry.
-    """
-    if max_chars is None:
-        return dict(result)
 
+async def _present_content(
+    result: dict[str, Any],
+    max_chars: int | None,
+    tool_use_id: str,
+    *,
+    search_excerpt: bool = False,
+) -> dict[str, Any]:
+    """Present a session copy; shared extraction cache never receives handles."""
     output = dict(result)
-    inner = _extract_inner(str(output.get("text", "")))
-    if len(inner) <= max_chars:
-        output["original_length"] = len(inner)
-        output["returned_length"] = len(inner)
+    status = output.get("status")
+    if not isinstance(status, int) or not 200 <= status < 300 or output.get("error"):
+        return output
+    text = redact_secret_text(str(output.get("text") or ""))
+    output["text"] = text
+    inner = _extract_inner(text)
+    output["length"] = len(inner)
+    output["original_length"] = len(inner)
+    output["returned_length"] = len(inner)
+    if max_chars is None or len(inner) <= max_chars:
         return output
 
-    source = str(output.get("final_url") or output.get("url") or "")
-    output["text"] = _wrap_content(source, inner[:max_chars])
+    # Search-attached excerpts retain their original prefix clipping and never
+    # enter the standalone fetch recovery path, even with an ambient writer.
+    prefix_length = text.find(">") + 1
+    if search_excerpt:
+        output["text"] = (
+            text[:prefix_length] + inner[:max_chars] + text[text.rfind("</external-content>"):]
+        )
+        output["truncated"] = True
+        output["returned_length"] = max_chars
+        return output
+
+    preview, head_end, tail_start = _head_tail_preview(inner, max_chars)
+    # Preserve the exact redacted wrapper: offsets address this same stored text.
+    output["text"] = text[:prefix_length] + preview + text[text.rfind("</external-content>"):]
     output["truncated"] = True
-    output["original_length"] = len(inner)
-    output["returned_length"] = max_chars
-    output["length"] = len(inner)
+    output["returned_length"] = len(preview)
+    output["content_recovery"] = {"available": False}
+    context = current_tool_context.get()
+    writer = context.tool_result_snapshot_writer if context is not None else None
+    if (
+        writer is None
+        or context is None
+        or not context.tool_result_retrieval_available
+        or not isinstance(tool_use_id, str)
+        or not tool_use_id.strip()
+    ):
+        return output
+    try:
+        reference = await writer(text, "web_fetch", tool_use_id)
+    except Exception:
+        # Best-effort persistence must not turn a successful fetch into a failure.
+        # CancelledError is a BaseException and continues up the agent loop.
+        return output
+    if (
+        reference is None
+        or not re.fullmatch(r"tr-[0-9a-f]{32}", reference.get("handle", ""))
+        or reference.get("sha256") != hashlib.sha256(text.encode("utf-8")).hexdigest()
+    ):
+        return output
+    from opensquilla.tools.builtin.tool_results import _DEFAULT_MAX_CHARS
+
+    output["content_recovery"] = {
+        "available": True,
+        "handle": reference["handle"],
+        "sha256": reference["sha256"],
+        "next_call": {
+            "name": "retrieve_tool_result",
+            "arguments": {
+                "handle": reference["handle"],
+                "mode": "raw_slice",
+                "offset": prefix_length + head_end,
+                "limit": min(tail_start - head_end, _DEFAULT_MAX_CHARS),
+            },
+        },
+    }
     return output

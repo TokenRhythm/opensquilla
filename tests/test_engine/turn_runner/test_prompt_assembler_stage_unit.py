@@ -191,6 +191,7 @@ class _StubSelector:
 
     def override_model(self, model: str) -> None:
         self.overridden_models.append(model)
+        self.current_model = model
 
     def resolve(self):
         return self.resolve_returns
@@ -329,6 +330,25 @@ async def test_case01_plain_user_turn() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("explicit_model", [None, "synthetic/fixed-model"])
+async def test_image_continuation_authority_and_session_follow_stage_input(
+    explicit_model: str | None,
+) -> None:
+    turn = _make_turn()
+    turn.config = object()
+    selector = _StubSelector(resolve_returns=_StubProvider("selected"))
+    stage = _make_stage(executor=_RecordingPipelineExecutor(turn=turn))
+    inp = _make_input(cloned_selector=selector, model=explicit_model)
+
+    out = await stage.run(inp)
+
+    assert out.output.provider._image_routing_session_key == inp.session_key
+    assert out.output.provider._image_routing_config is (
+        None if explicit_model else turn.config
+    )
+
+
+@pytest.mark.asyncio
 async def test_provider_name_uses_selector_registry_identity_not_adapter_family() -> None:
     selector = _StubSelector("selector")
     selector.active_provider_id = "dashscope"
@@ -381,50 +401,6 @@ async def test_prompt_assembler_uses_effective_tool_workspace() -> None:
     assert prompt_assembler.last_kwargs["workspace_dir"] == "D:\\lrk\\opensquilla"
 
 
-@pytest.mark.asyncio
-async def test_restricted_tool_boundary_suppresses_workspace_prompt_inputs() -> None:
-    prompt_assembler = _RecordingPromptAssembler(
-        metadata_to_emit={"injected_workspace_files_count": 0}
-    )
-    executor = _RecordingPipelineExecutor(
-        turn=_make_turn(
-            metadata={
-                "skill_count": 0,
-                "skills_rendered_count": 0,
-                "skills_prompt_chars": 0,
-            }
-        ),
-        provider=_StubProvider(),
-    )
-    builder = _RecordingPromptReportBuilder()
-    stage = _make_stage(
-        assembler=prompt_assembler,
-        executor=executor,
-        builder=builder,
-    )
-    skill_catalog = object()
-
-    await stage.run(
-        _make_input(
-            extra_prompt_context={"project": "/secret/workspace"},
-            bootstrap_context_mode="full",
-            effective_tool_context=ToolContext(
-                workspace_dir="/secret/workspace",
-                exclusive_tools={"artifact_reader"},
-            ),
-            skill_catalog=skill_catalog,
-        )
-    )
-
-    assert prompt_assembler.last_kwargs["workspace_dir"] is None
-    assert prompt_assembler.last_kwargs["extra_context"] is None
-    assert (
-        prompt_assembler.last_kwargs["bootstrap_context_mode"]
-        == "restricted_tool_boundary"
-    )
-    assert executor.requests[0].skill_catalog is None
-    assert builder.last_kwargs["metadata"]["injected_workspace_files_count"] == 0
-    assert builder.last_kwargs["metadata"]["skill_count"] == 0
 
 
 @pytest.mark.asyncio
@@ -669,7 +645,7 @@ async def test_case03_history_router_context_threading() -> None:
 
 
 @pytest.mark.asyncio
-async def test_case04_squilla_router_fires_overrides_model() -> None:
+async def test_pipeline_recommendation_does_not_replace_physical_model_identity() -> None:
     selector = _StubSelector("sel4", current_model="claude-opus-4.5")
     routed_provider = _StubProvider("opus_routed")
     selector.resolve_returns = routed_provider
@@ -684,7 +660,7 @@ async def test_case04_squilla_router_fires_overrides_model() -> None:
     assert selector.overridden_models == []
     inner = getattr(out.output.provider, "_provider", None)
     assert inner is provider_after_pipeline
-    assert out.output.resolved_model == "claude-sonnet-4.5"
+    assert out.output.resolved_model == "claude-opus-4.5"
     assert out.output.squilla_router_tier == "premium"
 
 
@@ -721,6 +697,12 @@ async def test_explicit_model_override_reconciles_routed_model_and_clears_saving
     turn = _make_turn(
         metadata={
             "routed_model": "claude-sonnet-4.5",
+            "routed_model_vision_support": "unsupported",
+            "image_input_projection_required": True,
+            "image_input_mode": "marker",
+            "image_input_reason": "router_all_configured_tiers_unsupported",
+            "router_image_capability_exhausted": True,
+            "image_context_has_images": True,
             "savings_pct": 50.0,
             "savings_max_price_per_m": 9.0,
             "savings_routed_price_per_m": 3.0,
@@ -731,9 +713,18 @@ async def test_explicit_model_override_reconciles_routed_model_and_clears_saving
     stage = _make_stage(executor=executor)
     inp = _make_input(cloned_selector=selector, model="claude-haiku-4.5")
 
-    await stage.run(inp)
+    out = await stage.run(inp)
 
     # routed_model realigned to the model that actually ran; savings dropped.
+    assert out.output.resolved_model == "claude-haiku-4.5"
+    assert selector.current_config.model == out.output.resolved_model
+    assert turn.metadata["executed_model"] == out.output.resolved_model
+    assert "routed_model_vision_support" not in turn.metadata
+    assert "image_input_projection_required" not in turn.metadata
+    assert "image_input_mode" not in turn.metadata
+    assert "image_input_reason" not in turn.metadata
+    assert "router_image_capability_exhausted" not in turn.metadata
+    assert turn.metadata["image_context_has_images"] is True
     assert turn.metadata["routed_model"] == "claude-haiku-4.5"
     assert turn.metadata["savings_pct"] == 0.0
     assert turn.metadata["savings_max_price_per_m"] == 0.0
@@ -760,7 +751,7 @@ async def test_explicit_model_equal_to_routed_keeps_savings() -> None:
 
 
 @pytest.mark.asyncio
-async def test_case05_pipeline_filter_skills_metadata_merge() -> None:
+async def test_case05_pipeline_resolve_skill_catalog_metadata_merge() -> None:
     assembler = _RecordingPromptAssembler(metadata_to_emit={"skill_count": 2})
     executor = _RecordingPipelineExecutor(
         turn=_make_turn(metadata={"skills_prompt_chars": 1234}),

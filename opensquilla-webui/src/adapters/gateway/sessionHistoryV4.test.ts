@@ -177,6 +177,8 @@ describe('v4 SessionHistory Adapter', () => {
           turn_id: 'turn-1',
           future_context: { inner_snake: true },
         },
+        page_context: { targetRef: 'target-1', resourceId: 'document:doc-1', annotations: [{ text: 'Larger heading', selectionText: 'Welcome', locatorHint: 'h1' }] },
+        prompt_annotations: [{ body: 'Read-only legacy annotation' }],
         additive_message: { nested_snake: true },
       }],
       has_more: false,
@@ -223,6 +225,8 @@ describe('v4 SessionHistory Adapter', () => {
       expect.objectContaining({ timeoutAction: 'reject' }),
     )
     const message = page.messages[0]
+    expect(message?.pageContext).toEqual({ targetRef: 'target-1', resourceId: 'document:doc-1', annotations: [{ text: 'Larger heading', selectionText: 'Welcome', locatorHint: 'h1' }] })
+    expect(message?.promptAnnotations).toEqual([{ body: 'Read-only legacy annotation' }])
     const toolCall = message?.toolCalls[0] as Record<string, unknown>
     expect(toolCall).toMatchObject({
       tool_use_id: 'tool-1',

@@ -8,7 +8,7 @@ import {
 
 const request = {
   sessionKey: 'session-a',
-  operation: 'source.patch' as const,
+  operation: 'revision.restore' as const,
   requestId: 'request-a',
   documentId: 'document-a',
 }

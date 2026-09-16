@@ -7,11 +7,35 @@ from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, TypedDict
 
+from opensquilla.artifacts import ArtifactSource
 from opensquilla.contracts.tool_presentation import ToolPresentationCategory
 from opensquilla.contracts.turn_execution import SurfaceCapabilities
 from opensquilla.sandbox.operation_runtime import SandboxToolDescriptor
+
+# Set only by the trusted Meta scheduler around its internal skill_view
+# preface. It is intentionally separate from model-supplied tool arguments.
+current_meta_skill_owner: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "current_meta_skill_owner",
+    default="",
+)
+
+# A fresh dictionary per dispatch keeps output references out of tool text and
+# isolates parallel calls. Reader workers can update the shared per-call value.
+current_execution_log: contextvars.ContextVar[dict[str, str] | None] = contextvars.ContextVar(
+    "current_execution_log", default=None,
+)
+
+
+class ToolResultSnapshotReference(TypedDict):
+    handle: str
+    sha256: str
+
+
+ToolResultSnapshotWriter = Callable[
+    [str, str, str], Awaitable[ToolResultSnapshotReference | None]
+]
 
 
 class CallerKind(StrEnum):
@@ -64,6 +88,7 @@ class ToolContext:
     run_mode: str | None = None
     sandbox_mounts: list[dict[str, Any]] = field(default_factory=list)
     sandbox_run_context: Any | None = None
+    # Inert compatibility slots; no source-diff interventions or candidate capture.
     source_diff_preservation_mode: str = "log"
     source_diff_candidate_mode: str = "log"
     source_diff_candidates: list[dict[str, Any]] = field(default_factory=list)
@@ -118,9 +143,7 @@ class ToolContext:
     # tools consult it so a concurrent catalog publish cannot change the
     # definitions visible halfway through a tool loop.
     skill_catalog: Any | None = None
-    # Armed by the engine (mutated in place, same pattern as
-    # router_control_turn_hold_applied) once the endgame git freeze margin is
-    # reached; shell tools then block workspace-reverting git commands.
+    # Deprecated, unused compatibility slot; preserve positional arguments.
     endgame_git_freeze_active: bool = False
     # New runtime-only fields stay at the end to preserve the public dataclass's
     # historical positional constructor contract for embedded callers.
@@ -131,19 +154,13 @@ class ToolContext:
     execution_id: str | None = None
     sandbox_session_manager: Any | None = None
     sandbox_gateway_config: Any | None = None
-    # Resolved per turn by the engine (see tools.description_overrides).
-    # Keys name a tool or a "tool.param" parameter; values replace the
-    # matching model-facing description verbatim. None = mechanism off.
+    # Deprecated, unused compatibility slot; preserve construction and saved configs.
     tool_description_overrides: dict[str, str] | None = None
+    # Deprecated, unused compatibility slot; preserve construction and saved configs.
     tool_description_overrides_source: str | None = None  # "config" | "env_file"
-    # Set by the engine alongside the freeze margin reset: when True, a frozen
-    # git revert whose targeted diff is instrumentation-only (added print/log
-    # lines, nothing removed) is allowed through — cleaning up diagnostic
-    # output is exactly what the wrap-up window is for.
+    # Deprecated, unused compatibility slot; preserve positional arguments.
     endgame_git_freeze_instrumentation_exempt: bool = False
-    # Armed by the engine (mutated in place, pattern above) when the scratch
-    # verify-mirror lever is on: workspace write-deny messages then append
-    # guidance pointing at <scratch_dir>/verify-mirror/<workspace-relative-path>.
+    # Deprecated, unused compatibility slot; preserve positional arguments.
     scratch_verify_mirror_active: bool = False
 
     # Immutable Safe policy snapshot pinned at the start of this turn. New
@@ -190,39 +207,14 @@ class ToolContext:
     # Process-local Goal coordinator used only by Goal-owned main-agent turns.
     # The service is never serialized into task details or route metadata.
     goal_service: Any | None = field(default=None, repr=False)
-    # Validated editor state injected only by the Web/Desktop ingress after
-    # durable turn acceptance.  These handles are process-local authority and
-    # must never be copied into route metadata, transcripts, or decision logs.
-    artifact_context: Any | None = field(default=None, repr=False)
-    artifact_session: Any | None = field(default=None, repr=False)
-    desktop_artifact_bridge: Any | None = field(default=None, repr=False)
-    artifact_event_emitter: Callable[[dict[str, Any]], Awaitable[None]] | None = field(
-        default=None, repr=False
-    )
     # Narrow, runtime-only hook that turns a freshly published editable
     # deliverable into the session's canonical Document before the artifact
     # event crosses the public stream boundary. The engine never receives the
     # underlying persistence service and adoption failures remain recoverable
     # through the Workbench open path.
-    generated_artifact_adopter: Callable[[Any], Awaitable[None]] | None = field(
-        default=None, repr=False
-    )
-    # Hard upper bound on the tools that may be exposed or dispatched during
-    # this turn. Unlike ``allowed_tools``, declarative policy layers may never
-    # widen this set. It is used only for narrowly scoped runtime authorities
-    # such as a PromptAnnotation turn; ordinary contexts leave it unset.
-    #
-    # Runtime-only fields must remain appended here to preserve the historical
-    # positional constructor contract for embedded callers.
-    exclusive_tools: frozenset[str] | None = field(default=None, repr=False)
-    # Durable single-writer receipt controller for a PromptAnnotation turn.
-    # The Gateway constructs this only after TaskRuntime has attached the
-    # accepted task id. Dispatch consumes it before validating the first
-    # writer call; it must never be serialized or copied to another turn.
-    artifact_mutation_attempt_controller: Any | None = field(
-        default=None,
-        repr=False,
-    )
+    generated_artifact_adopter: (
+        Callable[[Any], Awaitable[None]] | None
+    ) = field(default=None, repr=False)
     # Process-local authority cleanup registered by ingress/runtime adapters.
     # The shared Agent turn boundary invokes these callbacks on every terminal
     # path without importing feature-specific tool implementations.
@@ -238,22 +230,6 @@ class ToolContext:
     # ownership. Raw values are never written to the owner registry.
     parent_session_key: str | None = field(default=None, repr=False)
     parent_task_id: str | None = field(default=None, repr=False)
-    # Process-local candidate-loop authority for PromptAnnotation turns.  It
-    # stages repeated edits in one draft ChangeSet and crosses the durable
-    # revision boundary only when the model invokes document_finish(commit).
-    # This field is intentionally at the end to preserve every historical
-    # positional ToolContext constructor contract.
-    artifact_candidate_loop_controller: Any | None = field(
-        default=None,
-        repr=False,
-    )
-    # Process-local preview materialization service used by the protocol-v4
-    # Electron candidate bridge.  It is never serialized or exposed to the
-    # model; the bridge receives only the controller's opaque handle.
-    artifact_preview_service: Any | None = field(
-        default=None,
-        repr=False,
-    )
     # Ephemeral binary evidence produced by a tool for the current provider
     # request. The map is keyed by tool_use_id and consumed by the Agent
     # before the next provider call; it is never persisted or exposed as a
@@ -272,14 +248,24 @@ class ToolContext:
     disclosed_tool_names: set[str] = field(default_factory=set, repr=False)
     tool_search_index: Any | None = field(default=None, repr=False)
     tool_search_namespaces: dict[str, str] = field(default_factory=dict, repr=False)
+    # Resolve at invocation time: a selector may have changed deployment since
+    # the turn started. No independent model selection is authorized by a tool.
+    image_analysis_target: Callable[[], tuple[Any, Any] | None] | None = field(
+        default=None, repr=False
+    )
+
+    desktop_browser: Any | None = field(default=None, repr=False)
+    artifact_source_paths: dict[str, ArtifactSource] = field(default_factory=dict, repr=False)
+    workspace_preview_opener: Callable[..., Awaitable[dict[str, Any]]] | None = field(
+        default=None, repr=False,
+    )
+    workspace_preview_scopes: list[dict[str, str]] = field(default_factory=list, repr=False)
+    # Output spools share the runtime's configured result-store budgets.
+    tool_result_store_max_bytes: int | None = 8 * 1024 * 1024
+    tool_result_store_disk_budget_bytes: int | None = 256 * 1024 * 1024
+    tool_result_store_retention_seconds: int | None = 7 * 24 * 60 * 60
 
     def __post_init__(self) -> None:
-        # A restricted turn's ceiling is an authority boundary, not a policy
-        # preference.  Normalize every caller (including embedded callers
-        # that still pass a mutable set) so no later hook can widen the live
-        # schema/dispatch ceiling in place.
-        if self.exclusive_tools is not None:
-            self.exclusive_tools = frozenset(self.exclusive_tools)
         self.validate_path_roots()
 
     def validate_path_roots(self) -> None:
@@ -299,6 +285,16 @@ class ToolContext:
             "scratch_dir must not equal or contain workspace_dir; use a disjoint "
             "scratch root or a dedicated scratch subdirectory inside the workspace"
         )
+
+    # Process-local, turn-bound callback; never included in a public wire schema.
+    # Keep after the published budget fields so their positions remain unchanged.
+    tool_result_snapshot_writer: ToolResultSnapshotWriter | None = field(
+        default=None, repr=False
+    )
+    # Live, read-only facts from this accepted turn; never persisted session settings.
+    execution_status_snapshot: Callable[[], dict[str, Any]] | None = field(default=None, repr=False)
+    # Frozen admission revision prevents old turns from changing newer holds.
+    router_control_routing_revision: int | None = None
 
 
 def is_goal_owned_main_default_turn(ctx: ToolContext | None) -> bool:
@@ -374,16 +370,6 @@ SUBAGENT_TOOL_DENY: frozenset[str] = frozenset(
         "session_search",
         "message",
         "publish_artifact",
-        "document_apply",
-        "document_browser_act",
-        "document_browser_inspect",
-        "document_browser_reload",
-        "document_browser_screenshot",
-        "document_finish",
-        "document_patch",
-        "document_inspect",
-        "document_locate",
-        "document_read",
     }
 )
 

@@ -1,4 +1,5 @@
 import { expect, test, type Page } from '@playwright/test'
+import { helloOkResponse } from './support/gateway-fixture'
 
 const CONTROL_URL = '/control/'
 const SESSION_KEY = 'agent:main:webchat:e2e-ensemble-router'
@@ -114,7 +115,7 @@ async function mockEnsembleHistory(page: Page, complexity: Complexity) {
         if (frame?.type !== 'req') return
         const method = String(frame.method || '')
         if (method === 'connect') {
-          ws.send(JSON.stringify({ protocol: 3, policy: { tick_interval_ms: 30000 } }))
+          ws.send(helloOkResponse())
           return
         }
         const payloads: Record<string, unknown> = {
@@ -127,7 +128,7 @@ async function mockEnsembleHistory(page: Page, complexity: Complexity) {
             permissions: {},
             skills: {},
           },
-          'sessions.list': { sessions: [], has_more: false },
+          'sessions.list': { sessions: [], count: 0, ts: 1_800_000_000, has_more: false },
           'sessions.messages.subscribe': {
             subscribed: true,
             replay_complete: true,
@@ -161,7 +162,7 @@ async function mockStreamingEnsembleRun(page: Page) {
         if (frame?.type !== 'req') return
         const method = String(frame.method || '')
         if (method === 'connect') {
-          ws.send(JSON.stringify({ protocol: 3, policy: { tick_interval_ms: 30000 } }))
+          ws.send(helloOkResponse())
           return
         }
         if (method === 'chat.send') {
@@ -203,7 +204,7 @@ async function mockStreamingEnsembleRun(page: Page) {
             permissions: {},
             skills: {},
           },
-          'sessions.list': { sessions: [], has_more: false },
+          'sessions.list': { sessions: [], count: 0, ts: 1_800_000_000, has_more: false },
           'sessions.messages.subscribe': {
             subscribed: true,
             replay_complete: true,
@@ -239,7 +240,7 @@ async function mockStreamingEnsembleWithProgress(page: Page) {
         if (frame?.type !== 'req') return
         const method = String(frame.method || '')
         if (method === 'connect') {
-          ws.send(JSON.stringify({ protocol: 3, policy: { tick_interval_ms: 30000 } }))
+          ws.send(helloOkResponse())
           return
         }
         if (method === 'chat.send') {
@@ -271,7 +272,7 @@ async function mockStreamingEnsembleWithProgress(page: Page) {
             permissions: {},
             skills: {},
           },
-          'sessions.list': { sessions: [], has_more: false },
+          'sessions.list': { sessions: [], count: 0, ts: 1_800_000_000, has_more: false },
           'sessions.messages.subscribe': { subscribed: true, replay_complete: true, current_stream_seq: 0, run_status: 'idle' },
           'usage.status': { sessions: [] },
         }
@@ -316,9 +317,8 @@ async function mockControlledEnsembleLifecycle(page: Page) {
         if (frame?.type !== 'req') return
         const method = String(frame.method || '')
         if (method === 'connect') {
-          ws.send(JSON.stringify({
-            protocol: 3,
-            policy: { tick_interval_ms: 30000, webui_stream_idle_grace_ms: 1_260_000 },
+          ws.send(helloOkResponse({
+            policy: { webui_stream_idle_grace_ms: 1_260_000 },
           }))
           return
         }
@@ -356,7 +356,7 @@ async function mockControlledEnsembleLifecycle(page: Page) {
             permissions: {},
             skills: {},
           },
-          'sessions.list': { sessions: [], has_more: false },
+          'sessions.list': { sessions: [], count: 0, ts: 1_800_000_000, has_more: false },
           'sessions.messages.subscribe': {
             subscribed: true, replay_complete: true, current_stream_seq: 0, run_status: 'idle',
           },
@@ -410,7 +410,7 @@ async function mockEnsembleScrollRetention(page: Page) {
         if (frame?.type !== 'req') return
         const method = String(frame.method || '')
         if (method === 'connect') {
-          ws.send(JSON.stringify({ protocol: 3, policy: { tick_interval_ms: 30000 } }))
+          ws.send(helloOkResponse())
           return
         }
         if (method === 'chat.send') {
@@ -448,7 +448,7 @@ async function mockEnsembleScrollRetention(page: Page) {
             permissions: {},
             skills: {},
           },
-          'sessions.list': { sessions: [], has_more: false },
+          'sessions.list': { sessions: [], count: 0, ts: 1_800_000_000, has_more: false },
           'sessions.messages.subscribe': { subscribed: true, replay_complete: true, current_stream_seq: 0, run_status: 'idle' },
           'usage.status': { sessions: [] },
         }
@@ -707,7 +707,7 @@ async function mockEnsembleModeWithTierDecision(page: Page) {
         const frame = JSON.parse(String(message))
         if (frame?.type !== 'req') return
         const method = String(frame.method || '')
-        if (method === 'connect') { ws.send(JSON.stringify({ protocol: 3, policy: { tick_interval_ms: 30000 } })); return }
+        if (method === 'connect') { ws.send(helloOkResponse()); return }
         if (method === 'chat.send') {
           ws.send(wsResponse(String(frame.id), { accepted: true, session: TIER_SESSION_KEY, task_id: 'tier-task', stream_seq: 1 }))
           ws.send(wsEvent('task.running', { key: TIER_SESSION_KEY, task_id: 'tier-task', stream_seq: 1 }))
@@ -736,7 +736,7 @@ async function mockEnsembleModeWithTierDecision(page: Page) {
             llm_ensemble: { enabled: true },
             permissions: {}, skills: {},
           },
-          'sessions.list': { sessions: [], has_more: false },
+          'sessions.list': { sessions: [], count: 0, ts: 1_800_000_000, has_more: false },
           'sessions.messages.subscribe': { subscribed: true, replay_complete: true, current_stream_seq: 0, run_status: 'idle' },
           'usage.status': { sessions: [] },
         }
@@ -774,7 +774,7 @@ test('ensemble inspector stays open while the answer keeps streaming', async ({ 
         const frame = JSON.parse(String(message))
         if (frame?.type !== 'req') return
         const method = String(frame.method || '')
-        if (method === 'connect') { ws.send(JSON.stringify({ protocol: 3, policy: { tick_interval_ms: 30000 } })); return }
+        if (method === 'connect') { ws.send(helloOkResponse()); return }
         if (method === 'chat.send') {
           ws.send(wsResponse(String(frame.id), { accepted: true, session: KEY, task_id: 'persist-task', stream_seq: 1 }))
           ws.send(wsEvent('task.running', { key: KEY, task_id: 'persist-task', stream_seq: 1 }))
@@ -795,7 +795,7 @@ test('ensemble inspector stays open while the answer keeps streaming', async ({ 
           'chat.history': { messages: [], has_more: false },
           'commands.list_for_surface': { commands: [] },
           'config.get': { squilla_router: { enabled: true, rollout_phase: 'full', tiers: {} }, llm_ensemble: { enabled: true }, permissions: {}, skills: {} },
-          'sessions.list': { sessions: [], has_more: false },
+          'sessions.list': { sessions: [], count: 0, ts: 1_800_000_000, has_more: false },
           'sessions.messages.subscribe': { subscribed: true, replay_complete: true, current_stream_seq: 0, run_status: 'idle' },
           'usage.status': { sessions: [] },
         }

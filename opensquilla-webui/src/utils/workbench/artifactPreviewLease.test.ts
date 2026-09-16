@@ -44,6 +44,40 @@ const lease = {
 }
 
 describe('artifact preview lease client', () => {
+  it.each(['desktop', 'web'] as const)('requests the selected page through %s transport', async client => {
+    const selected = { ...lease, page_path: 'pages/北京 页面.html',
+      launch_url: 'http://p-token.localhost:43123/pages/%E5%8C%97%E4%BA%AC%20%E9%A1%B5%E9%9D%A2.html' }
+    const create = vi.fn(async () => ({ ok: true as const, status: 201, payload: selected }))
+    const http = httpTransport({ requestJson: vi.fn(async () => selected) })
+    const result = await createArtifactPreviewLease(http, { id: 'art-page' }, 'full', client, {
+      baseOrigin: 'http://127.0.0.1:18792', sessionKey: 'session-a', pagePath: selected.page_path,
+      ...(client === 'desktop' ? { nativeBroker: { createArtifactPreviewLease: create } } : {}),
+    })
+    expect(result.entrypoint).toBe('index.html')
+    expect(result.page_path).toBe(selected.page_path)
+    if (client === 'desktop') expect(create).toHaveBeenCalledWith(expect.objectContaining({ pagePath: selected.page_path }))
+    else expect(http.requestJson).toHaveBeenCalledWith(expect.any(String), expect.objectContaining({
+      json: { version: 1, mode: 'full', client: 'web', pagePath: selected.page_path },
+    }))
+  })
+
+  it('fails closed and revokes when an older Gateway ignores the requested page', async () => {
+    const http = httpTransport({ requestJson: vi.fn(async () => lease) })
+    await expect(createArtifactPreviewLease(http, { id: 'art-page' }, 'full', 'web', {
+      baseOrigin: 'http://127.0.0.1:18792', sessionKey: 'session-a', pagePath: 'editorial.html',
+    })).rejects.toMatchObject({ code: 'PREVIEW_PAGE_UNSUPPORTED' })
+    expect(http.requestBlob).toHaveBeenCalledWith(expect.stringContaining('/lease-1'),
+      expect.objectContaining({ method: 'DELETE' }))
+  })
+
+  it('rejects unsafe page paths before contacting either transport', async () => {
+    const http = httpTransport()
+    await expect(createArtifactPreviewLease(http, { id: 'art-page' }, 'full', 'web', {
+      baseOrigin: 'http://127.0.0.1:18792', pagePath: '../private.html',
+    })).rejects.toMatchObject({ code: 'INVALID_REQUEST' })
+    expect(http.requestJson).not.toHaveBeenCalled()
+  })
+
   it('creates Desktop leases through the native broker without browser fetch', async () => {
     const http = httpTransport()
     const create = vi.fn(async () => ({
@@ -300,4 +334,19 @@ describe('artifact preview lease client', () => {
       preview_origin: null,
     }, 'https://control.example')).toThrow(ArtifactPreviewLeaseError)
   })
+})
+
+
+describe('working document lease identity', () => {
+  it('preserves the server identity and accepts older leases without it', () => {
+    expect(parseArtifactPreviewLease({ ...lease, workingDocumentId: 'document-fixture' }).workingDocumentId)
+      .toBe('document-fixture')
+    expect(parseArtifactPreviewLease(lease)).not.toHaveProperty('workingDocumentId')
+  })
+  it.each([null, 4, '', ' document-fixture', 'document-fixture\n', 'x'.repeat(513)])(
+    'rejects a malformed working document marker: %j', value => {
+      expect(() => parseArtifactPreviewLease({ ...lease, workingDocumentId: value }))
+        .toThrow('invalid working document')
+    },
+  )
 })

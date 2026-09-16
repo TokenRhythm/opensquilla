@@ -75,6 +75,7 @@ class GatewayAdmissionRuntime:
         publish: Callable[[str, str, dict[str, Any]], Awaitable[None]],
         normalize_terminal: Callable[[str, dict[str, Any]], dict[str, Any]],
         session_model: Callable[[SessionNode, str], str | None],
+        tui_connection: bool = False,
     ) -> None:
         self._runtime_config = config
         self._runtime_manager = manager
@@ -85,6 +86,7 @@ class GatewayAdmissionRuntime:
         self._runtime_publish = publish
         self._runtime_normalize_terminal = normalize_terminal
         self._runtime_session_model = session_model
+        self._runtime_tui_connection = tui_connection
 
     def normalize_input(self, command: AdmitTurn) -> NormalizedInput:
         # Source aliases are decoded once; reconstructing them here would lose
@@ -118,6 +120,7 @@ class GatewayAdmissionRuntime:
                 opaque_limit_bytes=opaque_cap if isinstance(opaque_cap, int) else None,
                 allow_material_refs=allow_material_refs,
                 expected_material_scope=session_id if allow_material_refs else None,
+                persist_enabled=bool(getattr(config, "persist_transcripts", True)),
             )
         except attachment_ingest.AttachmentResolutionError as exc:
             raise RpcHandlerError(
@@ -358,4 +361,5 @@ class GatewayAdmissionRuntime:
             publish=self._runtime_publish,
             normalize_terminal=self._runtime_normalize_terminal,
             session_model=self._runtime_session_model,
+            tui_connection=self._runtime_tui_connection,
         )

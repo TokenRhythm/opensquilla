@@ -43,6 +43,7 @@ cache-friendly system-prompt-rebuild contract.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
@@ -54,6 +55,7 @@ if TYPE_CHECKING:
         TurnTranscriptSnapshot,
     )
     from opensquilla.provider.types import ProviderRequestCorrelation
+    from opensquilla.session.compaction import CompactionRequestContext
     from opensquilla.session.compaction_deployment import CompactionExecutionPlan
 
 # Internal sentinels mirroring the runtime.py module-level constants. The
@@ -61,7 +63,6 @@ if TYPE_CHECKING:
 # to preflight; keeping a local copy avoids a runtime → stage import.
 _T3_NOT_APPLICABLE: str = "not_applicable"
 _T3_FLUSH_FAILED: str = "flush_failed"
-_RESTRICTED_TURN_SKIPPED: str = "restricted_turn_skipped"
 
 # ---------------------------------------------------------------------------
 # Ports — four narrow Protocols
@@ -99,6 +100,7 @@ class T3UpgradeCompactionPort(Protocol):
         compaction_provider: Any | None,
         compaction_model: str | None,
         compaction_plan: CompactionExecutionPlan | None = None,
+        compaction_request_context: CompactionRequestContext | None = None,
         history_capacity_tokens: int | None = None,
         history_capacity_chars: int | None = None,
         history_has_persisted_user: bool = False,
@@ -106,6 +108,7 @@ class T3UpgradeCompactionPort(Protocol):
         provider_request_correlation: ProviderRequestCorrelation | None = None,
         consumer_admission: Any | None = None,
         consumer_admission_fingerprint: str = "",
+        attachment_path_resolver: Callable[[dict[str, Any], str], str | None] | None = None,
         transcript_snapshot: TurnTranscriptSnapshot[Any] | None = None,
         expected_session_id: str | None = None,
         expected_session_epoch: int | None = None,
@@ -134,6 +137,7 @@ class PreflightCompactionPort(Protocol):
         compaction_provider: Any | None,
         compaction_model: str | None,
         compaction_plan: CompactionExecutionPlan | None = None,
+        compaction_request_context: CompactionRequestContext | None = None,
         history_capacity_tokens: int | None = None,
         history_capacity_chars: int | None = None,
         history_has_persisted_user: bool = False,
@@ -141,6 +145,7 @@ class PreflightCompactionPort(Protocol):
         provider_request_correlation: ProviderRequestCorrelation | None = None,
         consumer_admission: Any | None = None,
         consumer_admission_fingerprint: str = "",
+        attachment_path_resolver: Callable[[dict[str, Any], str], str | None] | None = None,
         transcript_snapshot: TurnTranscriptSnapshot[Any] | None = None,
         expected_session_id: str | None = None,
         expected_session_epoch: int | None = None,
@@ -170,7 +175,6 @@ class HistoryLoaderPort(Protocol):
         session_key: str,
         trim_last_user: bool,
         bound_user_message_id: str | None = None,
-        restricted_turn: bool = False,
         transcript_snapshot: TurnTranscriptSnapshot[Any] | None = None,
         expected_session_id: str | None = None,
         expected_session_epoch: int | None = None,
@@ -234,6 +238,9 @@ class CompactionAndHistoryStageInput:
         default=None,
         repr=False,
     )
+    compaction_request_context: CompactionRequestContext | None = field(
+        default=None, repr=False
+    )
     history_capacity_tokens: int | None = None
     history_capacity_chars: int | None = None
     bound_user_message_id: str | None = None
@@ -243,11 +250,13 @@ class CompactionAndHistoryStageInput:
     )
     consumer_admission: Any | None = field(default=None, repr=False)
     consumer_admission_fingerprint: str = ""
+    attachment_path_resolver: Callable[[dict[str, Any], str], str | None] | None = field(
+        default=None, repr=False,
+    )
     # Explicit authority boundary supplied by the runtime. Restricted turns
     # load canonical history for the primary provider projection, but may not
     # invoke T3/preflight compaction or replay durable summaries because those
     # paths can make auxiliary provider calls over unprojected history.
-    restricted_turn: bool = False
     # An upstream terminal preflight may suppress auxiliary compaction while
     # retaining the ordinary history-loading path.
     skip_compaction: bool = False
@@ -261,7 +270,6 @@ class CompactionAndHistoryStageOutput:
     """The pieces of state subsequent stages and the harness consume.
 
     - ``t3_upgrade_status``: one of the ``_T3_*`` sentinels,
-      ``"restricted_turn_skipped"`` at the restricted authority boundary, or
       ``"skipped"`` when an upstream terminal preflight suppresses compaction.
       Surfaced for observability + the equivalence harness snapshot;
       NOT consumed by downstream stages. It is used only
@@ -302,10 +310,6 @@ class CompactionAndHistoryStage:
        ``_T3_NOT_APPLICABLE`` or ``_T3_FLUSH_FAILED``).
     3. ``history_loader.load`` (always called).
     4. ``request_context_prepender.prepend`` (always called; pure).
-
-    Restricted turns skip steps 1 and 2 and suppress any previously durable
-    summary/context-state replay while still loading raw transcript history
-    for the Agent's restricted provider projection.
 
     The stage fires ``CompactionHook.before_compact`` and
     ``CompactionHook.after_compact`` around BOTH t3 and preflight calls.
@@ -352,13 +356,8 @@ class CompactionAndHistoryStage:
         )
         compaction_model = inp.compaction_model or inp.resolved_model
 
-        # Restricted PromptAnnotation turns cannot expose canonical transcript
-        # bytes to any auxiliary compactor. The main Agent still loads the
-        # transcript below and applies its provider-only history projection.
         preflight_invoked = False
-        if inp.restricted_turn:
-            t3_status = _RESTRICTED_TURN_SKIPPED
-        elif inp.skip_compaction:
+        if inp.skip_compaction:
             t3_status = "skipped"
         else:
             # 1. T3-upgrade compaction. Hook fires around the call so even a
@@ -372,6 +371,10 @@ class CompactionAndHistoryStage:
             )
             await self._fire_before_compact(t3_state)
             t3_kwargs: dict[str, Any] = {}
+            if inp.compaction_request_context is not None:
+                t3_kwargs["compaction_request_context"] = inp.compaction_request_context
+            if inp.attachment_path_resolver is not None:
+                t3_kwargs["attachment_path_resolver"] = inp.attachment_path_resolver
             if inp.transcript_snapshot is not None:
                 t3_kwargs["transcript_snapshot"] = inp.transcript_snapshot
             if inp.expected_session_id is not None or inp.expected_session_epoch is not None:
@@ -407,6 +410,10 @@ class CompactionAndHistoryStage:
                 )
                 await self._fire_before_compact(preflight_state)
                 preflight_kwargs: dict[str, Any] = {}
+                if inp.compaction_request_context is not None:
+                    preflight_kwargs["compaction_request_context"] = inp.compaction_request_context
+                if inp.attachment_path_resolver is not None:
+                    preflight_kwargs["attachment_path_resolver"] = inp.attachment_path_resolver
                 if inp.transcript_snapshot is not None:
                     preflight_kwargs["transcript_snapshot"] = inp.transcript_snapshot
                 if inp.expected_session_id is not None or inp.expected_session_epoch is not None:
@@ -436,21 +443,12 @@ class CompactionAndHistoryStage:
         if inp.expected_session_id is not None or inp.expected_session_epoch is not None:
             history_kwargs["expected_session_id"] = inp.expected_session_id
             history_kwargs["expected_session_epoch"] = inp.expected_session_epoch
-        loaded_compaction_summary_context = await self._history_loader.load(
+        compaction_summary_context = await self._history_loader.load(
             agent=inp.agent,
             session_key=inp.session_key,
             trim_last_user=inp.history_has_persisted_user,
             bound_user_message_id=inp.bound_user_message_id,
-            restricted_turn=inp.restricted_turn,
             **history_kwargs,
-        )
-        # A durable summary predates the restricted request projection and may
-        # contain historical tool arguments or workspace paths. Keep it out of
-        # this provider view without mutating persisted summary/transcript rows.
-        compaction_summary_context = (
-            None
-            if inp.restricted_turn
-            else loaded_compaction_summary_context
         )
 
         # 4. Prepend compaction summary context to request_context_prompt (pure).

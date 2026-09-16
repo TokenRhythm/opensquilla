@@ -1,4 +1,5 @@
 import { expect, test, type Page } from '@playwright/test'
+import { helloOkResponse } from './support/gateway-fixture'
 
 const CONTROL_URL = '/control/'
 const SESSION_KEY = 'agent:main:webchat:e2e-keepalive-contrast'
@@ -68,10 +69,8 @@ async function installMockGateway(page: Page) {
       const method = String(frame.method || '')
 
       if (method === 'connect') {
-        ws.send(JSON.stringify({
-          protocol: 3,
+        ws.send(helloOkResponse({
           features: { methods: KEEPALIVE_METHODS, events: [] },
-          policy: { tick_interval_ms: 30000 },
           auth: {
             runModePolicy: {
               allowedRunModes: ['safe', 'full'],
@@ -139,7 +138,7 @@ async function installMockGateway(page: Page) {
         },
         'onboarding.status': { audioConfigured: false },
         'sandbox.capability.status': { available: false },
-        'sessions.list': { sessions: [], has_more: false },
+        'sessions.list': { sessions: [], count: 0, ts: 1_800_000_000, has_more: false },
         'sessions.messages.unsubscribe': { subscribed: false },
         'usage.status': { sessions: [] },
       }

@@ -1,4 +1,5 @@
 import { expect, test, type Locator, type Page } from '@playwright/test'
+import { helloOkResponse } from './support/gateway-fixture'
 import {
   chatHistoryPayload,
   sessionMessagesHydratePayload,
@@ -219,9 +220,8 @@ async function installGatewayFixture(page: Page) {
       }
       if (frame.type !== 'req') return
       if (frame.method === 'connect') {
-        ws.send(JSON.stringify({
-          protocol: 3,
-          policy: { tick_interval_ms: 30_000, concurrent_history_reads: true },
+        ws.send(helloOkResponse({
+          policy: { concurrent_history_reads: true },
         }))
         return
       }
@@ -250,7 +250,7 @@ async function installGatewayFixture(page: Page) {
         'models.routing.get': { mode: 'direct' },
         'onboarding.status': { audioConfigured: false },
         'sandbox.run_mode.preference.get': { runMode: 'full', source: 'config' },
-        'sessions.list': { sessions: [], has_more: false },
+        'sessions.list': { sessions: [], count: 0, ts: 1_800_000_000, has_more: false },
         'sessions.messages.subscribe': sessionMessagesSubscribePayload(SESSION_KEY, {
           stream_generation: generation,
           current_stream_seq: settled ? 0 : 60,

@@ -70,7 +70,8 @@ fi
 
 dry_run="${OPENSQUILLA_INSTALL_DRY_RUN:-0}"
 profile="${cli_profile:-${OPENSQUILLA_INSTALL_PROFILE:-recommended}}"
-webui_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)/opensquilla-webui"
+source_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+webui_dir="${source_root}/opensquilla-webui"
 node_version_file="${webui_dir}/.node-version"
 if [[ ! -f "${node_version_file}" ]]; then
     echo "install_source.sh: required Node.js version file is missing: ${node_version_file}" >&2
@@ -135,9 +136,9 @@ if (( ${#install_extras[@]} > 0 )); then
 fi
 if (( ${#target_extras[@]} > 0 )); then
     joined_extras="$(IFS=,; echo "${target_extras[*]}")"
-    install_target=".[${joined_extras}]"
+    install_target="${source_root}[${joined_extras}]"
 else
-    install_target="."
+    install_target="${source_root}"
 fi
 
 check_squilla_router_assets() {
@@ -146,7 +147,7 @@ check_squilla_router_assets() {
         return 0
     fi
 
-    local model_root="src/opensquilla/squilla_router/models"
+    local model_root="${source_root}/src/opensquilla/squilla_router/models"
     local pointer_line="version https://git-lfs.github.com/spec/v1"
     local required=(
         "${model_root}/v4.2_phase3_inference/lgbm_main.bin"
@@ -329,6 +330,14 @@ fi
 
 # --- execute ---------------------------------------------------------------
 
+source_commit_id=""
+if command -v git >/dev/null 2>&1; then
+    source_commit_candidate="$(git -C "${source_root}" rev-parse --verify HEAD 2>/dev/null || true)"
+    if [[ "${source_commit_candidate}" =~ ^[0-9a-f]{40}$ ]]; then
+        source_commit_id="${source_commit_candidate}"
+    fi
+fi
+
 check_squilla_router_assets
 build_webui
 
@@ -348,11 +357,17 @@ write_install_receipt() {
     else
         method="pip"
     fi
+    if [[ -n "${source_commit_id}" ]]; then
+        source_commit_json="\"${source_commit_id}\""
+    else
+        source_commit_json="null"
+    fi
     mkdir -p "${home}" 2>/dev/null || return 0
     cat >"${receipt}" 2>/dev/null <<RECEIPT || return 0
 {
   "version": 1,
   "install_method": "${method}",
+  "source_commit_id": ${source_commit_json},
   "installed_at": "${installed_at}",
   "entrypoints": [],
   "owned_paths": [],

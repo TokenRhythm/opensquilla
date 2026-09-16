@@ -7,7 +7,7 @@ import inspect
 import time
 import uuid
 from collections.abc import Callable
-from dataclasses import asdict, is_dataclass, replace
+from dataclasses import replace
 from typing import Any
 
 import structlog
@@ -248,19 +248,6 @@ def _resolve_system_event_heartbeat_delivery_override(job: CronJob) -> dict[str,
     return None
 
 
-def _event_payload(event: Any) -> dict[str, Any]:
-    if is_dataclass(event):
-        payload = asdict(event)  # type: ignore[arg-type]
-    else:
-        payload = {
-            key: value
-            for key, value in getattr(event, "__dict__", {}).items()
-            if not key.startswith("_")
-        }
-    payload.pop("kind", None)
-    return payload
-
-
 def make_agent_run_handler(
     delivery_chain: DeliveryChain,
     turn_runner_ref: Callable[[], Any] | None = None,
@@ -391,6 +378,11 @@ def make_agent_run_handler(
                     session_key,
                     role="user",
                     content=task,
+                    provenance={
+                        "kind": "cron",
+                        "source_session_key": session_key,
+                        "source_tool": f"cron:{job.id}",
+                    },
                     **append_kwargs,
                 )
                 if _persisted is not None and isinstance(_persisted.content, str):

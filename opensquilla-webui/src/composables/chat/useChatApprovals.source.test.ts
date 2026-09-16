@@ -11,9 +11,9 @@ describe('useChatApprovals clarify submit source contract', () => {
     expect(source).toContain('...(request.runId ? { runId: request.runId } : {})')
   })
 
-  it('optimistically acknowledges the click before the backend finishes', () => {
-    expect(source).toContain('clarifySubmitted.value = true')
-    expect(source).toContain("setInterruptState(key, { resolution: 'replied', busy: true, error: '' })")
+  it('shows a pending send without acknowledging an answer before the Gateway', () => {
+    expect(source).toContain("setInterruptState(key, { resolution: null, busy: true, error: '' })")
+    expect(source).not.toContain("setInterruptState(key, { resolution: 'replied', busy: true, error: '' })")
     expect(source).toContain('clarifySubmitted.value = false')
     expect(source).toContain('setInterruptState(key, { resolution: null, busy: false, error: message })')
   })

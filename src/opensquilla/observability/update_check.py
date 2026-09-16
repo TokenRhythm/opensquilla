@@ -7,10 +7,9 @@ is available" notice. This is intentionally passive: it never downloads or
 installs anything, never blocks startup, and never raises.
 
 The result is cached under the state dir with a 24h TTL so each passive channel
-check performs at most one network attempt per day. The check honours the same
-disable switch as anonymous install telemetry (so a single env var silences all
-outbound "phone-home" calls) plus a dedicated switch, and is skipped
-automatically in CI and test environments.
+check performs at most one network attempt per day. The check honours the
+global network-observability veto plus its dedicated legacy update switch, and
+is skipped automatically in CI and test environments.
 
 Electron surfaces use the native updater when it is available. This module also
 powers the fallback notice used by unsigned desktop builds and the browser /
@@ -489,10 +488,6 @@ def _skip_reason(*, config: Any | None = None) -> str | None:
 def _endpoint(channel: _UpdateChannel | None = None) -> str:
     resolved = channel or _channel_for("0.0.0")
     return os.environ.get(UPDATE_CHECK_ENDPOINT_ENV, resolved.endpoint).strip()
-
-
-def _releases_page(channel: _UpdateChannel | None = None) -> str:
-    return (channel or _channel_for("0.0.0")).releases_page
 
 
 def _now_ts() -> int:

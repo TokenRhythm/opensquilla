@@ -32,8 +32,6 @@
 
 - 📢 **2026-08-22** — La versión en inglés de nuestro informe técnico ya está disponible en aiXiv: [aixiv.260822.000001](https://aixiv.science/abs/aixiv.260822.000001), y la versión en chino en ChinaXiv: [202608.00176](https://chinaxiv.org/abs/202608.00176). Consulta [Cita](#cita) para saber cómo citar OpenSquilla.
 
-- 📢 **2026-08-21** — Las versiones en PDF de nuestro informe técnico ya están disponibles en este repositorio: [English](docs/report/opensquilla-report-en.pdf) · [中文](docs/report/opensquilla-report-zh.pdf).
-
 - 📢 **2026-07-14** — Nuestro informe técnico **[Agentic Routing: The Harness-Native Data Flywheel](https://arxiv.org/abs/2607.11399)** ya está disponible en arXiv. Muestra cómo el enrutador nativo del harness convierte el tráfico cotidiano de los agentes en un volante de datos que se mejora a sí mismo, y cómo **el enrutamiento de conjunto multi-modelo supera a Fable 5**.
 
 ---

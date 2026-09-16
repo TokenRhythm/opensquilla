@@ -2,15 +2,43 @@
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 _UNCONFIRMED_BACKGROUND_TOOL_NAMES = frozenset({"background_process", "process"})
 
 
+def _background_receipt(name: str, result: Any) -> tuple[str | None, bool]:
+    if not isinstance(result, str):
+        return None, False
+    if name == "background_process":
+        first_line = result.partition("\n")[0]
+        if first_line.startswith("session_id="):
+            return first_line.removeprefix("session_id=").strip() or None, False
+        return None, False
+    try:
+        payload = json.loads(result)
+    except (TypeError, ValueError):
+        return None, False
+    if not isinstance(payload, dict) or not isinstance(payload.get("session"), dict):
+        return None, False
+    session = payload["session"]
+    session_id = session.get("session_id")
+    if not isinstance(session_id, str) or not session_id.strip():
+        return None, False
+    exited = (
+        payload.get("exited") is True
+        or session.get("status") == "done"
+        or type(session.get("returncode")) is int
+    )
+    return session_id.strip(), exited
+
+
 def _unconfirmed_background_tool_names(
     turn_segments: list[dict[str, Any]],
 ) -> list[str]:
-    names: list[str] = []
+    pending: dict[str, str] = {}
+    unidentified: list[str] = []
     for segment in turn_segments:
         if not isinstance(segment, dict) or segment.get("type") != "tool_result":
             continue
@@ -20,12 +48,22 @@ def _unconfirmed_background_tool_names(
         execution_status = segment.get("execution_status")
         if not isinstance(execution_status, dict):
             continue
+        session_id, exited = _background_receipt(name, segment.get("result"))
         if (
             execution_status.get("status") == "unknown"
             and execution_status.get("reason") == "background_running"
         ):
-            names.append(name)
-    return names
+            if session_id is not None:
+                pending[session_id] = name
+            else:
+                unidentified.append(name)
+        elif session_id is not None and exited and execution_status.get("status") in {
+            "success", "error", "timeout", "cancelled",
+        }:
+            # A later receipt settles only the process it identifies. Tool
+            # failure is a confirmed end too, not an unknown running action.
+            pending.pop(session_id, None)
+    return [*unidentified, *pending.values()]
 
 
 def unconfirmed_action_notice(

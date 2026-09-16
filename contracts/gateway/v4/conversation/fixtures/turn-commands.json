@@ -15,10 +15,21 @@
           "sessionKey": "agent:main:webchat:default",
           "clientRequestId": "request-1",
           "client_message_id": "message-1",
-          "promptAnnotationIds": ["annotation-1"],
-          "document_context": {"documentId": "doc-1", "headRevisionId": "rev-1"},
           "attachments": [],
-          "future_option": {"enabled": true}
+          "future_option": {
+            "enabled": true
+          },
+          "pageContext": {
+            "targetRef": "surface-synthetic-1",
+            "resourceId": "document:doc-1",
+            "annotations": [
+              {
+                "text": "Make the heading more prominent.",
+                "selectionText": "Hello",
+                "locatorHint": "heading"
+              }
+            ]
+          }
         }
       },
       "result": {
@@ -27,8 +38,9 @@
         "sessionKey": "agent:main:webchat:default",
         "task_id": "task-1",
         "replayed": false,
-        "acceptedPromptAnnotationIds": ["annotation-1"],
-        "future_result": {"trace": "kept"}
+        "future_result": {
+          "trace": "kept"
+        }
       },
       "response": {
         "type": "res",
@@ -40,8 +52,9 @@
           "sessionKey": "agent:main:webchat:default",
           "task_id": "task-1",
           "replayed": false,
-          "acceptedPromptAnnotationIds": ["annotation-1"],
-          "future_result": {"trace": "kept"}
+          "future_result": {
+            "trace": "kept"
+          }
         },
         "error": null
       }
@@ -160,7 +173,9 @@
           "client_request_id": "request-3",
           "client_message_id": "message-3",
           "surface_id": "webui",
-          "_source": {"run_mode": "safe"}
+          "_source": {
+            "run_mode": "safe"
+          }
         }
       },
       "result": {
@@ -176,7 +191,9 @@
         "disposition": "steering",
         "revision": 1,
         "fallback_safe": true,
-        "future_result": {"acceptedAt": 1700000000000}
+        "future_result": {
+          "acceptedAt": 1700000000000
+        }
       },
       "response": {
         "type": "res",
@@ -195,7 +212,9 @@
           "disposition": "steering",
           "revision": 1,
           "fallback_safe": true,
-          "future_result": {"acceptedAt": 1700000000000}
+          "future_result": {
+            "acceptedAt": 1700000000000
+          }
         },
         "error": null
       }
@@ -277,11 +296,41 @@
         "error": {
           "code": "STORAGE_BUSY",
           "message": "Session storage is temporarily busy. Retry this operation.",
-          "details": {"operation": "sessions.steer.v2"},
+          "details": {
+            "operation": "sessions.steer.v2"
+          },
           "retryable": true,
           "retry_after_ms": 250,
           "accepted": false
         }
+      }
+    },
+    {
+      "id": "chat.send.legacy-accepted-receipt",
+      "method": "chat.send",
+      "result": {
+        "ok": true,
+        "status": "accepted",
+        "replayed": true,
+        "task_id": "legacy-task-1",
+        "acceptedPromptAnnotationIds": [
+          "legacy-annotation-1"
+        ]
+      },
+      "response": {
+        "type": "res",
+        "id": "legacy-replay",
+        "ok": true,
+        "payload": {
+          "ok": true,
+          "status": "accepted",
+          "replayed": true,
+          "task_id": "legacy-task-1",
+          "acceptedPromptAnnotationIds": [
+            "legacy-annotation-1"
+          ]
+        },
+        "error": null
       }
     }
   ]

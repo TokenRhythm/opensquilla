@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from contextlib import AbstractAsyncContextManager
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
@@ -25,6 +26,7 @@ from opensquilla.gateway.provider_runtime import (
 from opensquilla.gateway.setup_config_runtime import sync_media_runtime
 from opensquilla.provider.model_catalog import shared_catalog
 from opensquilla.provider.preset_registry import legacy_profile_ids
+from opensquilla.telemetry.consent_transition import global_network_observability_transition
 
 if TYPE_CHECKING:
     from opensquilla.gateway.config import GatewayConfig
@@ -48,6 +50,12 @@ def _update_config_in_place(old: Any, new: Any) -> None:
     # lets the candidate's freshly derived records win per path.
     if hasattr(old, "reconcile_runtime_overrides") and hasattr(new, "_runtime_field_overrides"):
         old.reconcile_runtime_overrides(new)
+
+
+def update_gateway_config_in_place(old: Any, new: Any) -> None:
+    """Share the live-config replacement boundary with dedicated mutations."""
+
+    _update_config_in_place(old, new)
 
 
 async def _notify_goal_config_changed(task_runtime: Any, previous_config: Any) -> None:
@@ -147,6 +155,13 @@ class GatewayAppSettingsPort:
     profile_ids = legacy_profile_ids()
     replace = staticmethod(_update_config_in_place)
     reconcile_routing = staticmethod(reconcile_model_routing_write)
+
+    @staticmethod
+    def validate_routing(previous: Any, candidate: Any, explicit_paths: set[str]) -> None:
+        from opensquilla.onboarding.router_policy import validate_router_reactivation
+
+        validate_router_reactivation(previous, candidate, explicit_paths=explicit_paths)
+
     routing_snapshot = staticmethod(model_routing_public_snapshot)
     catalog_fingerprint = staticmethod(_live_catalog_fingerprint)
     resolve_provider = staticmethod(resolve_provider_selector_config)
@@ -214,6 +229,9 @@ class GatewayAppSettingsPort:
     def persist(config: GatewayConfig) -> None:
         persist_gateway_config(config)
 
+    def mutation_scope(self, candidate: GatewayConfig) -> AbstractAsyncContextManager[None]:
+        return global_network_observability_transition(self.config, candidate)
+
     def resolve_path(self) -> Path:
         from opensquilla.onboarding.config_store import resolve_config_path
 
@@ -263,7 +281,9 @@ class GatewayAppSettingsPort:
 
         await GatewayModelRoutingRuntimePort(
             self.provider_selector, self.subscription_manager
-        ).publish_changed(cast(ModelRoutingSnapshot, previous), candidate, source=self.source)
+        ).publish_changed(
+            cast(ModelRoutingSnapshot, previous), candidate, source=self.source, force=True
+        )
 
     async def reconcile_dream(self) -> bool | None:
         from opensquilla.gateway.dream_bridge import get_dream_reconciler

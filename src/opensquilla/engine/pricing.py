@@ -601,10 +601,6 @@ def _lookup_static_price_ex(model_id: str) -> tuple[PriceEntry, bool]:
     return _DEFAULT_PRICING, False
 
 
-def _lookup_static_price(model_id: str) -> PriceEntry:
-    return _lookup_static_price_ex(model_id)[0]
-
-
 def _should_fetch_live_price(model_id: str) -> bool:
     model_lower = model_id.lower().strip()
     if not _live_pricing_enabled():

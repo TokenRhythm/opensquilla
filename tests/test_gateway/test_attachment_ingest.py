@@ -1,11 +1,27 @@
 from __future__ import annotations
 
 import base64
+from pathlib import Path
 
 import pytest
 
+from opensquilla.attachment_refs import (
+    is_attachment_ref,
+    make_attachment_ref,
+    promote_pending_chat_input_attachments,
+    read_attachment_ref_bytes,
+    read_pending_chat_input_manifest,
+    read_pending_chat_input_promotions,
+    transcript_material_path,
+    write_transcript_material,
+)
 from opensquilla.contracts.attachments import SNIFF_PEEK_BYTES
-from opensquilla.gateway.attachment_ingest import ingest_attachments
+from opensquilla.gateway.attachment_ingest import (
+    ingest_attachments,
+    stage_pending_chat_input_attachments,
+)
+from opensquilla.gateway.uploads import UploadStore
+from tests.helpers.image_bytes import image_bytes
 
 
 @pytest.mark.asyncio
@@ -220,7 +236,7 @@ async def test_zip_upload_accepted_as_opaque_not_ooxml() -> None:
 async def test_unknown_claim_adopts_sniffed_rendered_type() -> None:
     # An image uploaded with a generic claim is routed to the image family by
     # its magic bytes instead of degrading to an opaque blob.
-    png = b"\x89PNG\r\n\x1a\n" + b"fake image body"
+    png = image_bytes()
     result = await ingest_attachments(
         "read it",
         [{"name": "shot", "mime_type": "application/octet-stream", "data": png}],
@@ -229,6 +245,59 @@ async def test_unknown_claim_adopts_sniffed_rendered_type() -> None:
 
     assert result.failures == []
     assert result.attachments[0]["type"] == "image/png"
+
+
+@pytest.mark.parametrize(
+    ("payload", "mime"),
+    [
+        (b"\x89PNG\r\n\x1a\ninvalid image body", "image/png"),
+        (b"plain text renamed to a photograph", "image/jpeg"),
+        (b"%PDF-1.4\nnot a photograph", "image/jpeg"),
+        (b"\x89PNG\r\n\x1a\ninvalid image body", "application/octet-stream"),
+    ],
+)
+@pytest.mark.parametrize("failure_mode", ["mark", "raise"])
+async def test_invalid_image_rejected_before_dispatch(payload, mime, failure_mode) -> None:
+    attachments = [{"name": "sample.jpg", "mime_type": mime, "data": payload}]
+    if failure_mode == "raise":
+        with pytest.raises(ValueError, match="upload a valid image"):
+            await ingest_attachments("inspect", attachments, failure_mode=failure_mode)
+        return
+    result = await ingest_attachments("inspect", attachments, failure_mode=failure_mode)
+    assert result.attachments == []
+    assert result.failures[0].reason == "invalid_image"
+    assert "[attachment unavailable: sample.jpg: invalid_image]" in result.text
+
+
+async def test_valid_image_mime_mismatch_still_uses_detected_format() -> None:
+    result = await ingest_attachments(
+        "inspect", [{"name": "sample.jpg", "type": "image/jpeg", "data": image_bytes()}],
+    )
+    assert result.failures == []
+    assert result.attachments[0]["type"] == "image/png"
+
+
+@pytest.mark.parametrize("valid_image", [False, True])
+async def test_durable_image_reference_revalidates_content(tmp_path, valid_image) -> None:
+    payload = image_bytes() if valid_image else b"\x89PNG\r\n\x1a\ninvalid image body"
+    sha, path, _ = write_transcript_material(
+        media_root=tmp_path, session_id="sample-session", payload=payload,
+    )
+    ref = make_attachment_ref(
+        sha256=sha, name="sample.png", mime="image/png", size=len(payload),
+        session_id="sample-session", source="upload",
+    )
+    result = await ingest_attachments(
+        "inspect", [ref], failure_mode="mark", allow_material_refs=True,
+        material_root=tmp_path, expected_material_scope="sample-session",
+    )
+    if valid_image:
+        assert result.attachments == [ref]
+        assert result.failures == []
+    else:
+        assert result.attachments == []
+        assert result.failures[0].reason == "invalid_image"
+    assert path.read_bytes() == payload
 
 
 @pytest.mark.asyncio
@@ -498,10 +567,118 @@ async def test_windows_jpeg_alias_admitted_in_strict_mode() -> None:
     # a deliberate strict-mode improvement over the legacy 415.
     result = await ingest_attachments(
         "read it",
-        [{"name": "photo.jpg", "mime_type": "image/jpg", "data": b"\xff\xd8\xff" + b"j" * 32}],
+        [{"name": "photo.jpg", "mime_type": "image/jpg", "data": image_bytes("JPEG")}],
         failure_mode="mark",
         accept_opaque=False,
     )
 
     assert result.failures == []
     assert result.attachments[0]["type"] == "image/jpeg"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("persist_enabled", [False, True], ids=["disabled", "default"])
+async def test_uuid_ingress_respects_persistence_without_consuming_upload(
+    tmp_path: Path, persist_enabled: bool,
+) -> None:
+    payload = image_bytes()
+    store = UploadStore(marker_dir=tmp_path / "upload-markers")
+    file_uuid = await store.put("sample.png", "image/png", payload)
+    original_upload = await store.get(file_uuid)
+    media_root = tmp_path / "media"
+    options = {} if persist_enabled else {"persist_enabled": False, "disk_budget_bytes": 0}
+
+    result = await ingest_attachments(
+        "inspect", [{"file_uuid": file_uuid, "type": "image/png", "name": "sample.png"}],
+        store=store, material_root=media_root, session_id="accepted-session", **options,
+    )
+
+    assert result.failures == []
+    assert result.consumed_file_uuids == [file_uuid]
+    assert await store.get(file_uuid) == original_upload
+    assert len(result.attachments) == 1
+    if persist_enabled:
+        ref = result.attachments[0]
+        assert is_attachment_ref(ref)
+        assert ref["scope"] == "accepted-session"
+        assert read_attachment_ref_bytes(ref, media_root=media_root) == payload
+        assert transcript_material_path(
+            media_root, "accepted-session", ref["sha256"],
+        ).read_bytes() == payload
+    else:
+        assert result.attachments == [{
+            "type": "image/png", "name": "sample.png",
+            "data": base64.b64encode(payload).decode("ascii"), "_was_staged": True,
+        }]
+        assert not (media_root / "transcripts").exists()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("persist_enabled", [False, True], ids=["disabled", "default"])
+async def test_queue_promotion_respects_persistence_and_retains_queue_material(
+    tmp_path: Path, persist_enabled: bool,
+) -> None:
+    payload = image_bytes()
+    store = UploadStore(marker_dir=tmp_path / "upload-markers")
+    file_uuid = await store.put("queued.png", "image/png", payload)
+    original_upload = await store.get(file_uuid)
+    media_root = tmp_path / "media"
+    staged = await stage_pending_chat_input_attachments(
+        [{"file_uuid": file_uuid, "type": "image/png", "name": "queued.png"}],
+        store=store, material_root=media_root, session_id="queued-session",
+        pending_input_id="queued-input", enqueue_fingerprint="sha256:" + "a" * 64,
+    )
+    assert staged.failures == []
+    assert staged.consumed_file_uuids == [file_uuid]
+    assert len(staged.attachments) == 1
+    queue_ref = dict(staged.attachments[0])
+    assert is_attachment_ref(queue_ref)
+    assert read_attachment_ref_bytes(queue_ref, media_root=media_root) == payload
+    manifest_before = read_pending_chat_input_manifest(
+        media_root=media_root, session_id="queued-session", pending_input_id="queued-input",
+    )
+    assert manifest_before is not None
+    files_before = {
+        path: path.read_bytes() for path in media_root.rglob("*") if path.is_file()
+    }
+    canonical_path = transcript_material_path(
+        media_root, "accepted-session", queue_ref["sha256"],
+    )
+    assert not canonical_path.exists()
+    assert not transcript_material_path(
+        media_root, "queued-session", queue_ref["sha256"],
+    ).exists()
+    options = {} if persist_enabled else {"persist_enabled": False, "disk_budget_bytes": 0}
+
+    promoted = promote_pending_chat_input_attachments(
+        staged.attachments, media_root=media_root, pending_input_id="queued-input",
+        target_session_id="accepted-session", **options,
+    )
+
+    assert staged.attachments == [queue_ref]
+    assert read_attachment_ref_bytes(queue_ref, media_root=media_root) == payload
+    assert await store.get(file_uuid) == original_upload
+    assert read_pending_chat_input_manifest(
+        media_root=media_root, session_id="queued-session", pending_input_id="queued-input",
+    ) == manifest_before
+    promotions = read_pending_chat_input_promotions(
+        media_root=media_root, source_session_id="queued-session", pending_input_id="queued-input",
+    )
+    assert len(promoted) == 1
+    assert promoted[0] is not staged.attachments[0]
+    if persist_enabled:
+        assert is_attachment_ref(promoted[0])
+        assert promoted[0]["scope"] == "accepted-session"
+        assert canonical_path.read_bytes() == payload
+        assert read_attachment_ref_bytes(promoted[0], media_root=media_root) == payload
+        assert promotions == {"accepted-session": {queue_ref["sha256"]}}
+    else:
+        assert promoted == [{
+            "type": "image/png", "name": "queued.png",
+            "data": base64.b64encode(payload).decode("ascii"), "_was_staged": True,
+        }]
+        assert promotions == {}
+        assert not canonical_path.exists()
+        assert {
+            path: path.read_bytes() for path in media_root.rglob("*") if path.is_file()
+        } == files_before

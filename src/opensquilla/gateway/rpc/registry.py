@@ -186,9 +186,8 @@ class RpcContext:
     originating_envelope: Any = None  # Channel RouteEnvelope for RPC side effects
     protocol: int = 4
     sandbox_schema_version: int = 2
-    # Runtime-only candidate preview materializer.  The value stays inside the
-    # Gateway process and is copied into a turn envelope only for bound
-    # PromptAnnotation turns; no public RPC payload contains it.
+    # Runtime-only preview lease and resource service. It remains inside the
+    # Gateway process; public RPC payloads carry only scoped preview references.
     artifact_preview_service: Any = None
 
     @property
@@ -442,6 +441,19 @@ class RpcRegistry:
                 details=details,
             )
         except ValueError as exc:
+            from opensquilla.onboarding.router_policy import (
+                PrimaryProviderChangedError,
+                RouterProviderConflictError,
+            )
+
+            if isinstance(exc, RouterProviderConflictError):
+                return make_error_res(
+                    req_id, "ROUTER_PROVIDER_CONFLICT", str(exc), details=exc.details
+                )
+            if isinstance(exc, PrimaryProviderChangedError):
+                return make_error_res(
+                    req_id, "CONFLICT", str(exc), details={"reason": "primary_changed"}
+                )
             if _is_artifact_product_method(method):
                 return _safe_artifact_dispatch_failure(
                     req_id,

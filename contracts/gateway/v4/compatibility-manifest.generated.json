@@ -143,6 +143,16 @@
       "wireNames": [
         "sessions.routing.changed"
       ]
+    },
+    {
+      "delivery": "live-only-best-effort",
+      "family": "transport.flow.dirty",
+      "schema": "transport/transport-flow-dirty.schema.json",
+      "schemaSha256": "5afafa2c3baca401b00b0cf666b1c1435fc8e5e18838e2c96873421368513d43",
+      "schemaVersion": 1,
+      "wireNames": [
+        "transport.flow.dirty"
+      ]
     }
   ],
   "format": 1,
@@ -245,33 +255,9 @@
     },
     {
       "lifecycle": "stable",
-      "name": "artifacts.prompt_annotations.create",
-      "schema": "workbench/artifacts-prompt-annotations-create.schema.json",
-      "schemaSha256": "31ddc88ed95a86369645860a767ec17aa07074a5a46744ef1febee66c6b51784"
-    },
-    {
-      "lifecycle": "stable",
-      "name": "artifacts.prompt_annotations.discard",
-      "schema": "workbench/artifacts-prompt-annotations-discard.schema.json",
-      "schemaSha256": "bcea0a06c1171b6671a28bee82369141ea890d504f25e2b40377585b928b4d58"
-    },
-    {
-      "lifecycle": "stable",
-      "name": "artifacts.prompt_annotations.focus",
-      "schema": "workbench/artifacts-prompt-annotations-focus.schema.json",
-      "schemaSha256": "943dab2a1546c02b8b20c3a76805441b3a352b2f42508d0ff770f13b7f1a6890"
-    },
-    {
-      "lifecycle": "stable",
       "name": "artifacts.prompt_annotations.list",
       "schema": "workbench/artifacts-prompt-annotations-list.schema.json",
       "schemaSha256": "f199f2c488228a52879d1eb135e0afdd98573c875e0ad8186fca8c0c1b8fdee0"
-    },
-    {
-      "lifecycle": "stable",
-      "name": "artifacts.prompt_annotations.update",
-      "schema": "workbench/artifacts-prompt-annotations-update.schema.json",
-      "schemaSha256": "24fdd283e2de59bfcb7594d60f747778453fe575fdaf8a79ec697274ab362f07"
     },
     {
       "lifecycle": "stable",
@@ -284,12 +270,6 @@
       "name": "artifacts.revisions.restore",
       "schema": "workbench/artifacts-revisions-restore.schema.json",
       "schemaSha256": "66ce079b166a1d5e6925e090abaa32aabc4bd547f3ad1284e22cb211f7f30cd6"
-    },
-    {
-      "lifecycle": "stable",
-      "name": "artifacts.source.patch",
-      "schema": "workbench/artifacts-source-patch.schema.json",
-      "schemaSha256": "3471d7d026d648ee6012450e5f27dee19c0994b0a5900b5e816d8ec634948134"
     },
     {
       "lifecycle": "stable",
@@ -361,19 +341,19 @@
       "lifecycle": "stable",
       "name": "chat.clarify_submit",
       "schema": "conversation/chat-clarify-submit.schema.json",
-      "schemaSha256": "58ec833adc647ea6877ca3e708f4a3e62be0de7a6d4521fdd78144452b8abc62"
+      "schemaSha256": "49ad25adf8a8ded9c0f1b6b644974d6c4de456311bd793e121cdac076dfbf1e8"
     },
     {
       "lifecycle": "stable",
       "name": "chat.history",
       "schema": "conversation/chat-history.schema.json",
-      "schemaSha256": "6661f0685e8196504534e01705197c55d484e979cf19de7789463b5891c06fac"
+      "schemaSha256": "1e03b12ae015c0875c29d943c0f8d1969bd225b69978c2a8a36e0135785cab85"
     },
     {
       "lifecycle": "stable",
       "name": "chat.send",
       "schema": "conversation/chat-send.schema.json",
-      "schemaSha256": "ee0da1e5d87a98bcd4c73cffc666b71f76f9d0500fb50f245ad251f549a47a17"
+      "schemaSha256": "a04623e2433138dc2f4d1f7337dbb36e7fb0cd1719df5241016911c6a2a41838"
     },
     {
       "lifecycle": "stable",
@@ -397,19 +377,13 @@
       "lifecycle": "stable",
       "name": "config.patch",
       "schema": "platform/config-patch.schema.json",
-      "schemaSha256": "a41e9e9f715642fb55191e807e719fc1516ba312ecf3b13d99146197f3d8549d"
+      "schemaSha256": "a4df1cfc34a8e5af7155f08b6f857268699d0d2cc8d61da041a7d1e5a75bb432"
     },
     {
       "lifecycle": "stable",
       "name": "config.patch.safe",
       "schema": "platform/config-patch-safe.schema.json",
-      "schemaSha256": "f638fc27348411265f12995eb8642212f9e01b052d2a1f68cc190f5e85119f6c"
-    },
-    {
-      "lifecycle": "stable",
-      "name": "cron.add",
-      "schema": "cron/cron-add.schema.json",
-      "schemaSha256": "423cfc15f92aae668792c87c924343a0845737cb19e0eedca42ac3f2ead066c6"
+      "schemaSha256": "2c8c7dda96c270bba0b5c499fe26fb29409e755acf44d864799f0bc4e93b04bd"
     },
     {
       "lifecycle": "stable",
@@ -470,24 +444,6 @@
       "name": "doctor.status",
       "schema": "observability/doctor-status.schema.json",
       "schemaSha256": "6250105e7ea721bd3b1f6b22d42497c078321fc15114518be136b7699a7d0535"
-    },
-    {
-      "lifecycle": "stable",
-      "name": "documents.editSessions.close",
-      "schema": "workbench/documents-edit-sessions-close.schema.json",
-      "schemaSha256": "3259b4e550e1e01e685bbad6d0547dd07f7b6688813c56627df2080185571f9d"
-    },
-    {
-      "lifecycle": "stable",
-      "name": "documents.editSessions.heartbeat",
-      "schema": "workbench/documents-edit-sessions-heartbeat.schema.json",
-      "schemaSha256": "c0fddc8a1ea601c0d9cce64f26d370b557b59865a2ab73a52782e699a257112a"
-    },
-    {
-      "lifecycle": "stable",
-      "name": "documents.editSessions.start",
-      "schema": "workbench/documents-edit-sessions-start.schema.json",
-      "schemaSha256": "0caf70c3626b0544f643d05e26a179aff3ab3f02a14c312c5a1ddbfe489c7596"
     },
     {
       "lifecycle": "stable",
@@ -704,6 +660,18 @@
     },
     {
       "lifecycle": "stable",
+      "name": "meta.inspect",
+      "schema": "meta/meta-inspect.schema.json",
+      "schemaSha256": "227d68672eb35f9b932945de916663db25054c8547a7e62ed8c800013c279719"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "meta.list",
+      "schema": "meta/meta-list.schema.json",
+      "schemaSha256": "9fcd18dc7d1c2e5d75cc3407a2afb1266539456e186e1139e30c2c590efd88fc"
+    },
+    {
+      "lifecycle": "stable",
       "name": "meta.run",
       "schema": "meta/meta-run.schema.json",
       "schemaSha256": "9a07117a5189afc6a757041cc890f22b5ed2b32b2c93bfbf499fb7cc404a3905"
@@ -770,9 +738,15 @@
     },
     {
       "lifecycle": "stable",
+      "name": "models.routing.resetRecommended",
+      "schema": "platform/models-routing-reset-recommended.schema.json",
+      "schemaSha256": "c38774a2ce580d398960e8114038b48400720da4fc861ad2d2779794ddd665ae"
+    },
+    {
+      "lifecycle": "stable",
       "name": "models.routing.set",
       "schema": "platform/models-routing-set.schema.json",
-      "schemaSha256": "071191f07419453b6258d09c1995736279d188e15defa82bf6ead3345f5b81eb"
+      "schemaSha256": "0e48986e51c7ac7879b6d00a2ca14f947f98787940a7e9d18ba37ee87e25676f"
     },
     {
       "lifecycle": "stable",
@@ -826,7 +800,7 @@
       "lifecycle": "stable",
       "name": "onboarding.ensemble.configure",
       "schema": "platform/onboarding-ensemble-configure.schema.json",
-      "schemaSha256": "fdf8e410557592b3613b6a7ebdac3ad8529468c6a9d67732c74cdfa0172ddbc1"
+      "schemaSha256": "eb197a889eeb5f8ac744ce2144947eb142e4882fd3db4b9169128f5b20ab7437"
     },
     {
       "lifecycle": "stable",
@@ -896,6 +870,12 @@
     },
     {
       "lifecycle": "stable",
+      "name": "onboarding.llmProfile.upsertAndActivate",
+      "schema": "platform/onboarding-llm-profile-upsert-and-activate.schema.json",
+      "schemaSha256": "e76809ed196d160d9ebbbb06c817cd6439145f5690e5d0aa59a1e499adb71bdd"
+    },
+    {
+      "lifecycle": "stable",
       "name": "onboarding.memory_embedding.configure",
       "schema": "platform/onboarding-memory-embedding-configure.schema.json",
       "schemaSha256": "0f1eb7452d7bdb97510e73c5ff16bb81daa17bde32ea02b94b22a0872feac5d6"
@@ -910,7 +890,7 @@
       "lifecycle": "stable",
       "name": "onboarding.provider.configure",
       "schema": "platform/onboarding-provider-configure.schema.json",
-      "schemaSha256": "630b4fd36ea57c1f7c8fcaf7b9d06094c00e5604754ad4c7b69d2eca25a26ad8"
+      "schemaSha256": "793f76bb6ccc564a2754412af4a22498de5147a525dfaf4c5f49851e34315e11"
     },
     {
       "lifecycle": "stable",
@@ -934,7 +914,7 @@
       "lifecycle": "stable",
       "name": "onboarding.router.configure",
       "schema": "platform/onboarding-router-configure.schema.json",
-      "schemaSha256": "ff69dba95d85610859125ec3ee974e539f399cff1cbc8538937b274958fe9bb2"
+      "schemaSha256": "9345c1e57f7fa6a7535c9379cf86ecceaa801d68c0b9e9029ab2f5cdb8c8ffde"
     },
     {
       "lifecycle": "stable",
@@ -1126,20 +1106,10 @@
       "schemaSha256": "61016f834fc17da15718f70abf40bd2fa5428a4f93237ab682a919e4c97a44b7"
     },
     {
-      "canonicalName": "sessions.contextCompact",
-      "lifecycle": "legacy",
-      "name": "sessions.compact",
-      "schema": "sessions/sessions-compact.schema.json",
-      "schemaSha256": "a035ca2d92acc1ea3fcff706c084b243e23b204f26cd2157319f161a87cdc085"
-    },
-    {
-      "compatibilityAliases": [
-        "sessions.compact"
-      ],
       "lifecycle": "stable",
       "name": "sessions.contextCompact",
       "schema": "sessions/sessions-context-compact.schema.json",
-      "schemaSha256": "87974f8351a1db92724c35dc5d57a2191b08b199c538b288e23c8be9d53b58bb"
+      "schemaSha256": "a9bcba2772be22bf06c9cfe11b7162afe60d77a1d7bfb2df39656bc83dc637f0"
     },
     {
       "lifecycle": "stable",
@@ -1152,6 +1122,12 @@
       "name": "sessions.delete",
       "schema": "sessions/sessions-delete.schema.json",
       "schemaSha256": "c9e1b7f977f68d6e0a1f08aea30f6315d011aacf6ca2a81030ff8f8ad38d2b2f"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "sessions.executionLog.read",
+      "schema": "sessions/sessions-execution-log-read.schema.json",
+      "schemaSha256": "306642eb0e8d1801242211af64af0590de4a23edd5da9c0664835402020ee77a"
     },
     {
       "lifecycle": "stable",
@@ -1185,6 +1161,12 @@
     },
     {
       "lifecycle": "stable",
+      "name": "sessions.messages.snapshot.read",
+      "schema": "sessions/sessions-messages-snapshot-read.schema.json",
+      "schemaSha256": "526f7c0939799eb8b595897cd987b3f298d49f841affe159147ef1bafa3e5e94"
+    },
+    {
+      "lifecycle": "stable",
       "name": "sessions.messages.subscribe",
       "schema": "sessions/sessions-messages-subscribe.schema.json",
       "schemaSha256": "3cd9dc014552f9f959d1e4f6aac8bc9621b994c645b7d43030651e4e8b28cedb"
@@ -1205,19 +1187,19 @@
       "lifecycle": "stable",
       "name": "sessions.pending_inputs.dispatch",
       "schema": "conversation/pending-inputs-dispatch.schema.json",
-      "schemaSha256": "8a9e3c72828bb6e40c0710699933a743e5ee3b90bc43678c06b1675d47d349bc"
+      "schemaSha256": "ebaddc3366f43a0fc435beb410dd02c1f44d91337f99d8f273a1a73762554e07"
     },
     {
       "lifecycle": "stable",
       "name": "sessions.pending_inputs.enqueue",
       "schema": "sessions/sessions-pending-inputs-enqueue.schema.json",
-      "schemaSha256": "a101c15c0c2dedd640c9c818b728f3f405d13c65385a51416a828b10022edcef"
+      "schemaSha256": "612550198948e9a22265cdf0db7e26a12a73b38403d7248c2f2d50733c814377"
     },
     {
       "lifecycle": "stable",
       "name": "sessions.pending_inputs.list",
       "schema": "sessions/sessions-pending-inputs-list.schema.json",
-      "schemaSha256": "7cbe1acf30fbe054bffe3bcb9364a635537fc1137542fe8d156fbc61c16530eb"
+      "schemaSha256": "4ad301f47c41b8359260466df0a4c6e7fa1d20b136e429044af6e911ad0db882"
     },
     {
       "lifecycle": "stable",
@@ -1295,23 +1277,13 @@
       "lifecycle": "stable",
       "name": "sessions.send",
       "schema": "conversation/sessions-send.schema.json",
-      "schemaSha256": "3382c9945ecbccda159ee5389b93af498ffdad1aa5716aedf961feb553b82ce7"
+      "schemaSha256": "eb3fdeda3dcac5d5b7acb51aa1238840415b0456a5e65e24d21085ad7664b331"
     },
     {
-      "canonicalName": "sessions.steer.v2",
-      "lifecycle": "legacy",
-      "name": "sessions.steer",
-      "schema": "conversation/sessions-steer.schema.json",
-      "schemaSha256": "e2a30e5b774165eef3924cbc029eb26b916a39638ff3ece7087f6bd2d02875e3"
-    },
-    {
-      "compatibilityAliases": [
-        "sessions.steer"
-      ],
       "lifecycle": "stable",
       "name": "sessions.steer.v2",
       "schema": "conversation/sessions-steer-v2.schema.json",
-      "schemaSha256": "664be659078f5b9a3bbcbbb51a40f2821fb28e87c686fb94b8eddc82ff2d309d"
+      "schemaSha256": "dc2c0486fac9807fe7aab1a0967ba0f02eb9255f71ea3a5e26a674800b92b700"
     },
     {
       "lifecycle": "stable",
@@ -1381,6 +1353,30 @@
     },
     {
       "lifecycle": "stable",
+      "name": "telemetry.client_launch.record",
+      "schema": "telemetry/telemetry-client-launch-record.schema.json",
+      "schemaSha256": "71c5a1c528d0b219e203642b14a9c127130be838b7625af0ced7063a6e5a7ad3"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "telemetry.consent.set",
+      "schema": "telemetry/telemetry-consent-set.schema.json",
+      "schemaSha256": "4e92546e99a7643b4aec81f077dd1ae8270e54dd92e475223d1994d7a4c80210"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "telemetry.product_active.record",
+      "schema": "telemetry/telemetry-product-active-record.schema.json",
+      "schemaSha256": "372d1c0dce0c65f429df582d67432cb9e1809ee8cac7fec28281ef2067475f20"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "transport.flow.update",
+      "schema": "transport/transport-flow-update.schema.json",
+      "schemaSha256": "c637cfebaf5aa6c70fa29c6349d36f091a6de2fe445fe125e49a332b2dd7f5e6"
+    },
+    {
+      "lifecycle": "stable",
       "name": "usage.cost",
       "schema": "conversation/usage-cost.schema.json",
       "schemaSha256": "9b2cc19bcf92c659bd92ce18d4ddf58ade65a0ae6ba8e78a0c4c2f3f0cbca206"
@@ -1419,7 +1415,7 @@
       "lifecycle": "stable",
       "name": "workbench.resources.open",
       "schema": "workbench/workbench-resources-open.schema.json",
-      "schemaSha256": "aa407e99c2a003fb64b2dfa42d3c41b0c8249a98041e5d9f4c3d5aa1ebd7f566"
+      "schemaSha256": "d57c3261e454a6db6f273e0c4d48cf787709e2fb9a5fd47299db382bb74d110f"
     },
     {
       "lifecycle": "stable",
@@ -1460,11 +1456,11 @@
   ],
   "protocol": "opensquilla-websocket-json",
   "source": {
-    "eventFamilyCount": 9,
-    "generatorSha256": "a4d9386a5dc58a59682c72a551d23aac995b95619a0d504abec20ef047671e00",
-    "methodCount": 215,
+    "eventFamilyCount": 10,
+    "generatorSha256": "0e0b513d7844d926e5f2c6065e64e4b523a1f8df2023317327ee6e05bfa29038",
+    "methodCount": 214,
     "schemaCount": 224,
-    "schemaTreeSha256": "4cad213cb5943a1f97618e7e6e6526761afe9e4a69db83ae2d5519309202be18"
+    "schemaTreeSha256": "7479e55aa84897a526ea6a8c8b5dca3f995ffb7fdde4dc57bc84123e21cdf8fc"
   },
   "wireVersion": 4
 }

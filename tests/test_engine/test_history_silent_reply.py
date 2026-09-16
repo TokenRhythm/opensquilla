@@ -153,6 +153,7 @@ async def test_turn_runner_load_history_passes_goal_provenance_to_sanitizer() ->
             preserve_historical_images=False,
         ),
         set_history=MagicMock(),
+        set_request_image_context=MagicMock(),
     )
 
     await runner._load_history(agent, "agent:main:test", trim_last_user=False)
@@ -236,6 +237,7 @@ async def test_exact_history_fails_closed_after_reset_without_mixing_replacement
             model_capabilities=None,
         ),
         set_history=MagicMock(),
+        set_request_image_context=MagicMock(),
     )
     try:
         with pytest.raises(StaleEpochError, match="context-state read"):
@@ -303,6 +305,7 @@ async def test_exact_history_discards_retired_owner_emergency_override_after_res
             model_capabilities=None,
         ),
         set_history=MagicMock(),
+        set_request_image_context=MagicMock(),
     )
 
     try:

@@ -58,7 +58,6 @@ async def test_commit_maps_every_field_once_without_copying_native_material():
     task = SimpleNamespace(task_id="task-demo")
     revision = SimpleNamespace(revision_id="revision-demo")
     run = SimpleNamespace(run_id="run-demo")
-    target = SimpleNamespace(expected_annotation=SimpleNamespace(annotation_id="annotation-demo"))
     guard = object()
     archive_writer = AsyncMock()
     command = AdmissionCommit(
@@ -84,8 +83,6 @@ async def test_commit_maps_every_field_once_without_copying_native_material():
         expected_active_plan_revision_id="active-demo",
         require_idle_for_current_plan_implementation=True,
         claim_current_goal=True,
-        prepared_prompt_annotation_targets=(target,),
-        prompt_annotation_turn_id="turn-demo",
         pending_input_id="pending-demo",
         pending_input_fingerprint="pending-fingerprint",
         pending_input_revision=9,
@@ -122,7 +119,6 @@ async def test_commit_defaults_do_not_create_goal_or_optional_mutation():
     assert args["goal_mutation"] is None
     assert args["reset_archive_writer"] is None
     assert args["initial_transcript_entries"] == ()
-    assert args["prepared_prompt_annotation_targets"] == ()
     assert args["require_idle_for_current_plan_implementation"] is False
     assert args["merge_into_task"] is False
     assert args["pending_input_revision"] is None

@@ -1,4 +1,5 @@
 import { expect, test, type Page } from '@playwright/test'
+import { helloOkResponse } from './support/gateway-fixture'
 
 const CONTROL_URL = '/control/'
 const SESSION_KEY = 'agent:main:webchat:e2e-user-newlines'
@@ -17,10 +18,7 @@ async function seedMultilineUserHistory(page: Page) {
         const frame = JSON.parse(String(message))
         if (frame?.type !== 'req') return
         if (frame.method === 'connect') {
-          ws.send(JSON.stringify({
-            protocol: 3,
-            policy: { tick_interval_ms: 30000 },
-          }))
+          ws.send(helloOkResponse())
           return
         }
 
@@ -55,7 +53,7 @@ async function seedMultilineUserHistory(page: Page) {
             permissions: {},
             skills: {},
           },
-          'sessions.list': { sessions: [], has_more: false },
+          'sessions.list': { sessions: [], count: 0, ts: 1_800_000_000, has_more: false },
           'sessions.messages.subscribe': {
             subscribed: true,
             replay_complete: true,

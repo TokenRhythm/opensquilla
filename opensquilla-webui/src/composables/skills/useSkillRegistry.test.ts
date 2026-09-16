@@ -937,3 +937,30 @@ describe('useSkillRegistry install state', () => {
     ])
   })
 })
+
+
+describe('Skill directory selection', () => {
+  it('only installs a server candidate and clears old risk acknowledgement', async () => {
+    const identifier = `acme/pack@${'a'.repeat(40)}:skills/demo/SKILL.md`
+    const call = vi.fn(async () => ({
+      success: false, message: 'Choose directory',
+      riskConfirmation: 'obsolete-token',
+      diagnostics: [{ code: 'SOURCE_TREE_AMBIGUOUS', details: {
+        selectionRequired: true, repository: 'acme/pack', immutableRevision: 'a'.repeat(40),
+        candidates: [{ name: 'demo', path: 'skills/demo', identifier }],
+      } }],
+    }))
+    const registry = useSkillRegistry({ call }, vi.fn(async () => true))
+    registry.githubUrl.value = 'https://github.com/acme/pack'
+    await registry.installGithub()
+    const item = registry.installActivities.value.github.items[0]
+    expect(item.status).toBe('selection_required')
+    await registry.retryQueueItem(item.id, true, 'https://evil.invalid/skill')
+    expect(call).toHaveBeenCalledTimes(1)
+    call.mockResolvedValueOnce({ success: true, message: 'Installed' } as never)
+    await registry.retryQueueItem(item.id, true, identifier)
+    expect(call).toHaveBeenLastCalledWith('skills.install', { identifier, source: 'github' })
+    expect(item.status).toBe('installed')
+    expect(registry.githubUrl.value).toBe('')
+  })
+})

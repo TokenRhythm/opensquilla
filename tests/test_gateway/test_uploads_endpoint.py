@@ -40,6 +40,7 @@ from opensquilla.gateway.uploads import (
     UploadStoreFullError,
     UploadUnsupportedMimeError,
 )
+from tests.helpers.image_bytes import image_bytes
 
 # ---------------------------------------------------------------------------
 # Direct unit tests against UploadStore (no network).
@@ -69,8 +70,8 @@ def _exact_pdf(size: int) -> bytes:
 
 
 def _exact_png(size: int) -> bytes:
-    header = b"\x89PNG\r\n\x1a\n"
-    return header + b"a" * (size - len(header))
+    payload = image_bytes()
+    return payload + b"a" * (size - len(payload))
 
 
 def test_upload_round_trip(store: UploadStore) -> None:
@@ -612,7 +613,7 @@ def test_upload_route_normalizes_windows_zip_spelling() -> None:
 
 
 def test_upload_route_sniffs_rendered_type_for_generic_claim() -> None:
-    png = b"\x89PNG\r\n\x1a\n" + b"fake image body"
+    png = image_bytes()
     with _route_client() as client:
         response = client.post(
             "/api/v1/files/upload",
@@ -621,6 +622,53 @@ def test_upload_route_sniffs_rendered_type_for_generic_claim() -> None:
 
     assert response.status_code == 200
     assert response.json()["mime"] == "image/png"
+
+
+@pytest.mark.parametrize(
+    ("payload", "mime"),
+    [
+        (b"\x89PNG\r\n\x1a\ninvalid image body", "image/png"),
+        (b"plain text renamed to a photograph", "image/jpeg"),
+        (b"\xff\xd8\xffinvalid image body", "image/jpeg"),
+        (b"\x89PNG\r\n\x1a\ninvalid image body", "application/octet-stream"),
+    ],
+)
+def test_upload_route_rejects_invalid_image_without_staging(store, payload, mime) -> None:
+    with _route_client(store=store) as client:
+        response = client.post(
+            "/api/v1/files/upload", files={"file": ("sample.jpg", payload, mime)},
+        )
+    assert response.status_code == 415
+    assert response.json()["code"] == "UNSUPPORTED_MEDIA_TYPE"
+    assert "upload a valid image" in response.json()["error"]
+    assert not store._entries
+    assert not list(store.marker_dir.glob("*.meta"))
+
+
+def test_upload_route_corrects_valid_image_format_before_staging(store) -> None:
+    with _route_client(store=store) as client:
+        response = client.post(
+            "/api/v1/files/upload", files={"file": ("sample.jpg", image_bytes(), "image/jpeg")},
+        )
+    assert response.status_code == 200
+    assert response.json()["mime"] == "image/png"
+    _, metadata = asyncio.run(store.get(response.json()["file_uuid"]))
+    assert metadata["mime"] == "image/png"
+
+
+def test_legacy_staged_image_is_revalidated_on_send(tmp_path) -> None:
+    store = _FakeUploadStore({
+        "u-legacy-image": (
+            b"\x89PNG\r\n\x1a\ninvalid image body",
+            {"name": "sample.png", "mime": "image/png"},
+        ),
+    })
+    with pytest.raises(ValueError, match="upload a valid image"):
+        asyncio.run(resolve_attachments(
+            [{"file_uuid": "u-legacy-image", "type": "image/png"}],
+            store=store, material_root=tmp_path / "media", session_id="sample-session",
+        ))
+    assert not (tmp_path / "media").exists()
 
 
 def test_upload_route_sniffs_text_for_missing_claim() -> None:
@@ -763,7 +811,7 @@ def test_upload_route_response_exposes_expires_at_and_ttl() -> None:
 
 
 def test_upload_route_sniffs_png_for_empty_claim() -> None:
-    png = b"\x89PNG\r\n\x1a\n" + b"fake image body"
+    png = image_bytes()
     with _route_client() as client:
         response = client.post(
             "/api/v1/files/upload",

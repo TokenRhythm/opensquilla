@@ -1,3 +1,4 @@
+import type { ChatPageContext } from '@/types/pageContext'
 import type { InjectionKey } from 'vue'
 import type { GatewayModelRoutingMode } from '@/types/modelRouting'
 import type { CollaborationMode } from '@/types/plans'
@@ -36,12 +37,6 @@ export class TurnCommandError extends Error {
   }
 }
 
-/** Exact editable document head bound to one turn admission. */
-export interface TurnDocumentContext {
-  documentId: string
-  headRevisionId: string
-}
-
 /** Source policy attached to a turn without exposing the v4 `_source` alias. */
 export interface TurnSendSource {
   elevated?: string
@@ -74,10 +69,8 @@ export interface TurnSendParams {
   clientRequestId?: string
   /** Stable client identity for reconciling the optimistic user row. */
   clientMessageId?: string
-  /** Ordered durable drafts consumed atomically with this chat ingress. */
-  promptAnnotationIds?: string[]
-  /** Current editable document head made available only to this turn. */
-  documentContext?: TurnDocumentContext
+  /** User-supplied page references and annotations for this turn. */
+  pageContext?: ChatPageContext
   /** Source policy; the v4 Adapter maps this to `_source`. */
   source?: TurnSendSource
   intent?: string
@@ -115,7 +108,6 @@ export interface TurnSendResponse {
   terminalReason?: string
   terminalMessage?: string
   reason?: string
-  acceptedPromptAnnotationIds?: string[]
   metadata?: Readonly<Record<string, unknown>>
 }
 

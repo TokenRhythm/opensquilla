@@ -1,6 +1,6 @@
 export const ARTIFACT_PRODUCT_ERROR_CODES = [
   'DOCUMENT_CHANGED',
-  'EDIT_SESSION_RENEWAL_REQUIRED',
+  'DOCUMENT_EDITING_RETIRED',
   'WRITE_BUSY',
   'MUTATION_NOT_APPLIED',
   'MUTATION_OUTCOME_PENDING',
@@ -9,6 +9,7 @@ export const ARTIFACT_PRODUCT_ERROR_CODES = [
   'PERMISSION_DENIED',
   'PREVIEW_CAPABILITY_EXPIRED',
   'PREVIEW_RENDERER_FAILED',
+  'PREVIEW_PAGE_UNSUPPORTED',
   'ANNOTATION_UNAVAILABLE',
   'ANNOTATION_BUSY',
   'INVALID_REQUEST',
@@ -21,7 +22,6 @@ export type ArtifactProductRecoveryAction =
   | 'none'
   | 'retry-same-request'
   | 'retry-new-request'
-  | 'reacquire-edit-session'
   | 'refresh-document'
   | 'reopen-preview'
   | 'ask-user'
@@ -55,7 +55,7 @@ export class ArtifactProductFailure extends Error {
 
 const ARTIFACT_SCOPED_CURRENT_CODES = new Set<string>([
   'DOCUMENT_CHANGED',
-  'EDIT_SESSION_RENEWAL_REQUIRED',
+  'DOCUMENT_EDITING_RETIRED',
   'WRITE_BUSY',
   'MUTATION_NOT_APPLIED',
   'MUTATION_OUTCOME_PENDING',
@@ -63,6 +63,7 @@ const ARTIFACT_SCOPED_CURRENT_CODES = new Set<string>([
   'RESOURCE_UNSUPPORTED',
   'PREVIEW_CAPABILITY_EXPIRED',
   'PREVIEW_RENDERER_FAILED',
+  'PREVIEW_PAGE_UNSUPPORTED',
   'ANNOTATION_UNAVAILABLE',
   'ANNOTATION_BUSY',
 ])
@@ -77,10 +78,10 @@ const PRESENTATION: Readonly<Record<ArtifactProductErrorCode, {
     fallback: 'The page changed. Refresh it before trying again.',
     recovery: 'refresh-document',
   },
-  EDIT_SESSION_RENEWAL_REQUIRED: {
-    key: 'workbench.artifactErrors.editSessionRenewalRequired',
-    fallback: 'Editing is reconnecting. Your unsaved changes are still available.',
-    recovery: 'reacquire-edit-session',
+  DOCUMENT_EDITING_RETIRED: {
+    key: 'workbench.artifactErrors.documentEditingRetired',
+    fallback: 'Update the client and reopen the page to send annotations as chat input.',
+    recovery: 'ask-user',
   },
   WRITE_BUSY: {
     key: 'workbench.artifactErrors.writeBusy',
@@ -121,6 +122,11 @@ const PRESENTATION: Readonly<Record<ArtifactProductErrorCode, {
     key: 'workbench.artifactErrors.previewRendererFailed',
     fallback: 'The preview could not be displayed. Try reopening it.',
     recovery: 'reopen-preview',
+  },
+  PREVIEW_PAGE_UNSUPPORTED: {
+    key: 'workbench.artifactErrors.previewPageUnsupported',
+    fallback: 'This client or Gateway does not support opening this subpage directly. Update and try again.',
+    recovery: 'ask-user',
   },
   ANNOTATION_UNAVAILABLE: {
     key: 'workbench.artifactErrors.annotationUnavailable',

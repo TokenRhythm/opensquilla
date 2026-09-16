@@ -1132,11 +1132,55 @@ describe('useChatPendingQueue delivery state', () => {
     queue.cleanup()
   })
 
+  it('retains an old annotation WAL for explicit recovery without staging or dispatching it', async () => {
+    const { wal } = memoryWal([{
+      schemaVersion: 1,
+      pendingInputId: 'pending-old-annotation',
+      sessionKey: 'agent:main:webchat:test',
+      clientRequestId: 'request-old-annotation',
+      clientMessageId: 'message-old-annotation',
+      text: 'Update this heading',
+      promptAnnotationIds: ['retired-draft'],
+      attachments: [],
+      intent: null,
+      state: 'local_only',
+      mayHaveServerCopy: false,
+      createdAt: 1,
+      updatedAt: 1,
+    }])
+    const dispatch = vi.fn(async () => 'accepted' as const)
+    const { queue, inputText } = makeQueue(dispatch, () => false, undefined, undefined, {
+      pendingInputWal: wal,
+    })
+    await vi.waitFor(() => expect(queue.pendingQueue.value).toHaveLength(1))
+    const item = queue.pendingQueue.value[0]!
+    expect(item.retiredAnnotationInput).toBe(true)
+    expect(queue.beginPendingDelivery(item.pendingUiId)).toBeNull()
+    expect(dispatch).not.toHaveBeenCalled()
+    expect(queue.editPendingItem(item.pendingUiId)).toBe(true)
+    await vi.waitFor(() => expect(inputText.value).toBe('Update this heading'))
+    queue.cleanup()
+  })
+
+  it('stages annotation-only input through the ordinary queue without changing the visible body', async () => {
+    const enqueue = vi.fn(async () => ({ requestFingerprint: 'fingerprint', revision: 1 }))
+    const { queue } = makeQueue(undefined, () => true, undefined, undefined, {
+      pendingInputQueue: { supportsQueue: () => true, supportsReorder: () => false, enqueue,
+        list: async () => [], cancel: async () => {}, reorder: async () => ({ items: [] }) },
+    })
+    const pageContext = { targetRef: 'target-1', annotations: [{ text: 'First change' }, { text: 'Second change' }] }
+    await queue.enqueuePendingPayload({ text: '', pageContext })
+    await vi.waitFor(() => expect(enqueue).toHaveBeenCalledWith(expect.objectContaining({
+      message: 'First change\nSecond change', displayText: '', pageContext,
+    })))
+    queue.cleanup()
+  })
+
   it('does not edit a queued annotation batch into plain text', async () => {
     const { inputText, queue } = makeQueue()
     await expect(queue.enqueuePendingPayload({
       text: 'apply the second selected edit',
-      promptAnnotationIds: ['annotation-2', 'annotation-1'],
+      pageContext: { targetRef: 'target-1', annotations: [{ text: 'Change this heading' }] },
     })).resolves.toBe(true)
     const itemId = pendingUiId(queue, 0)
     inputText.value = 'keep the current composer draft'
@@ -1145,7 +1189,7 @@ describe('useChatPendingQueue delivery state', () => {
     expect(queue.pendingQueue.value).toHaveLength(1)
     expect(queue.pendingQueue.value[0]).toMatchObject({
       text: 'apply the second selected edit',
-      promptAnnotationIds: ['annotation-2', 'annotation-1'],
+      pageContext: { targetRef: 'target-1', annotations: [{ text: 'Change this heading' }] },
     })
     expect(inputText.value).toBe('keep the current composer draft')
     queue.cleanup()

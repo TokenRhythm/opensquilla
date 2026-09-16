@@ -14,6 +14,7 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
+from starlette.websockets import WebSocket
 
 from opensquilla.engine.runtime import TurnRunner
 from opensquilla.engine.start_turn import reserve_turn_via_runtime
@@ -60,7 +61,7 @@ from opensquilla.gateway.task_runtime import (
     TaskRun,
     TaskRuntime,
 )
-from opensquilla.gateway.websocket import SubscriptionManager, get_registry
+from opensquilla.gateway.websocket import SubscriptionManager, WsConnection, get_registry
 from opensquilla.project_workspaces import (
     ProjectWorkspaceGuard,
     resolve_project_path,
@@ -100,6 +101,22 @@ _PRINCIPAL = Principal(
 )
 
 _TurnHandler = Callable[[TaskRun], Awaitable[None]]
+
+
+def _goal_connection(conn_id: str, principal: Principal = _PRINCIPAL) -> WsConnection:
+    """Exercise real subscription cleanup without allowing transport I/O."""
+
+    async def unexpected_receive() -> Any:
+        raise AssertionError("Goal RPC fixtures must not receive WebSocket frames")
+
+    async def unexpected_send(_message: Any) -> None:
+        raise AssertionError("Goal RPC fixtures must not send WebSocket frames")
+
+    return WsConnection(
+        conn_id=conn_id,
+        ws=WebSocket({"type": "websocket"}, unexpected_receive, unexpected_send),
+        principal=principal,
+    )
 
 
 def _uuid(index: int) -> str:
@@ -200,7 +217,7 @@ async def _open_goal_rpc_stack(
         subscription_manager=subscriptions,
     )
     await manager.create(SOURCE_KEY, agent_id="main")
-    get_registry().register(SimpleNamespace(conn_id=conn_id, principal=_PRINCIPAL))
+    get_registry().register(_goal_connection(conn_id))
     if subscribe:
         subscriptions.subscribe_messages(conn_id, SOURCE_KEY)
     try:
@@ -1823,7 +1840,7 @@ async def test_status_and_spectator_subscription_do_not_transfer_lease(
             subscription_manager=stack.subscriptions,
         )
         get_registry().register(
-            SimpleNamespace(conn_id=spectator_id, principal=_PRINCIPAL)
+            _goal_connection(spectator_id)
         )
         stack.subscriptions.subscribe_messages(spectator_id, SOURCE_KEY)
         try:
@@ -1900,7 +1917,7 @@ async def test_detached_goal_reattaches_with_token_and_supports_explicit_takeove
             subscription_manager=stack.subscriptions,
         )
         get_registry().register(
-            SimpleNamespace(conn_id=alternate_id, principal=_PRINCIPAL)
+            _goal_connection(alternate_id)
         )
         stack.subscriptions.subscribe_messages(alternate_id, SOURCE_KEY)
         try:
@@ -1967,7 +1984,7 @@ async def test_detached_goal_reattaches_with_token_and_supports_explicit_takeove
             subscription_manager=stack.subscriptions,
         )
         get_registry().register(
-            SimpleNamespace(conn_id=takeover_id, principal=takeover_principal)
+            _goal_connection(takeover_id, takeover_principal)
         )
         stack.subscriptions.subscribe_messages(takeover_id, SOURCE_KEY)
         try:
@@ -2051,7 +2068,7 @@ async def test_subscribed_authorized_connection_explicitly_takes_resume_lease(
             subscription_manager=stack.subscriptions,
         )
         get_registry().register(
-            SimpleNamespace(conn_id=alternate_id, principal=_PRINCIPAL)
+            _goal_connection(alternate_id)
         )
         stack.subscriptions.subscribe_messages(alternate_id, SOURCE_KEY)
         try:
@@ -2555,7 +2572,7 @@ async def test_disconnect_detaches_running_and_idle_goals_but_spectator_does_not
 
         spectator_id = f"goal-spectator-{uuid.uuid4()}"
         get_registry().register(
-            SimpleNamespace(conn_id=spectator_id, principal=_PRINCIPAL)
+            _goal_connection(spectator_id)
         )
         stack.subscriptions.subscribe_messages(spectator_id, SOURCE_KEY)
         try:
@@ -3877,6 +3894,8 @@ async def test_goal_settlement_storage_failure_compensates_fail_closed(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    from structlog.testing import capture_logs
+
     async with _open_goal_rpc_stack(
         tmp_path / "goal-settlement-failure.sqlite",
         wire_lifecycle=True,
@@ -3886,14 +3905,25 @@ async def test_goal_settlement_storage_failure_compensates_fail_closed(
             raise OSError("synthetic Goal settlement write failure")
 
         monkeypatch.setattr(stack.storage, "settle_goal_task", fail_settlement)
-        created = await _handle_goals_set(_set_params(), stack.context)
-        task = await stack.runtime.wait(created["taskId"], timeout=2.0)
-        paused = await _wait_for_goal(
-            stack.storage,
-            lambda goal: goal.status == "paused" and goal.active_task_id is None,
-        )
+        # Capture the expected failure without rendering a traceback on the event loop.
+        with capture_logs() as logs:
+            created = await _handle_goals_set(_set_params(), stack.context)
+            task = await stack.runtime.wait(created["taskId"], timeout=2.0)
+            paused = await _wait_for_goal(
+                stack.storage,
+                lambda goal: goal.status == "paused" and goal.active_task_id is None,
+            )
         assert task.status == AgentTaskStatus.SUCCEEDED
         assert paused.pause_reason == "persistence_error"
+        failures = [
+            event
+            for event in logs
+            if event["event"] == "goal.terminal_settlement_persistence_failed"
+        ]
+        assert len(failures) == 1
+        assert failures[0]["log_level"] == "error"
+        assert failures[0]["session_key"] == SOURCE_KEY
+        assert failures[0]["task_id"] == created["taskId"]
 
 
 @pytest.mark.asyncio
@@ -4677,18 +4707,23 @@ class _RunningGoalEditProvider:
             assert self.edited_objective in request_text
         elif call == 3:
             assert goal_tools <= set(tool_names)
-            tail_text = _goal_edit_request_text([messages[-1]])
-            assert "[Current Goal objective reminder]" in tail_text
-            assert self.edited_objective in tail_text
-            assert self.initial_objective not in tail_text
         elif call == 4:
             assert tool_names == []
-            tail_text = _goal_edit_request_text([messages[-1]])
-            assert "[Current Goal objective reminder]" in tail_text
-            assert self.edited_objective in tail_text
-            assert self.initial_objective not in tail_text
         else:
             raise AssertionError("Running Goal edit made an extra provider call")
+        if call >= 2:
+            # The accepted edit remains visible after its one-time steering
+            # boundary. It does not need a synthetic reminder on every call.
+            update_messages = [
+                _goal_edit_request_text([message])
+                for message in messages
+                if "[Persisted Goal objective update]" in _goal_edit_request_text([message])
+            ]
+            assert len(update_messages) == 1
+            assert '<goal_objective revision="2">' in update_messages[0]
+            assert self.edited_objective in update_messages[0]
+            assert self.initial_objective not in update_messages[0]
+            assert "[Current Goal objective reminder]" not in request_text
         return self._stream(call)
 
     async def _stream(self, call: int) -> AsyncIterator[Any]:
@@ -4764,7 +4799,6 @@ async def test_running_goal_edit_adopts_revision_in_same_task_without_transcript
     """A running Goal edit is internal control for the next real model call."""
 
     monkeypatch.setenv("OPENSQUILLA_OPENROUTER_LIVE_PRICING", "0")
-    monkeypatch.setenv("OPENSQUILLA_TURN_OBJECTIVE_REMINDER", "on")
     state: dict[str, Any] = {}
     runs: list[TaskRun] = []
 

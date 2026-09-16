@@ -225,15 +225,25 @@ async def test_external_turn_discovery_error_releases_pending_fence() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("activity_error", [False, True])
 async def test_gateway_runtime_connects_to_configured_gateway_target(
     monkeypatch: pytest.MonkeyPatch,
+    activity_error: bool,
 ) -> None:
     from opensquilla.cli.repl import gateway_runtime
+
+    calls: list[tuple[str, dict[str, Any]]] = []
 
     class _FakeGatewayClient:
         connected_url: str | None = None
         connected_token: str | None = None
         closed = False
+
+        async def call(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+            calls.append((method, params))
+            if activity_error and method == "telemetry.product_active.record":
+                raise RuntimeError("synthetic old Gateway")
+            return {"recorded": True}
 
         async def connect(self, url: str, *, token: str | None = None) -> None:
             type(self).connected_url = url
@@ -268,8 +278,11 @@ async def test_gateway_runtime_connects_to_configured_gateway_target(
         scope: gateway_runtime.GatewayRuntimeScope,
         dispatch,
         abort_active_turn=None,
+        on_surface_ready=None,
+        on_user_activity=None,
     ) -> None:
-        return None
+        await on_surface_ready()
+        await on_user_activity()
 
     deps = gateway_runtime.GatewayRuntimeDependencies(
         stream_response=cast(Any, None),
@@ -289,6 +302,11 @@ async def test_gateway_runtime_connects_to_configured_gateway_target(
     assert _FakeGatewayClient.connected_url == "ws://127.0.0.1:18790/ws"
     assert _FakeGatewayClient.connected_token == "branch-token"
     assert _FakeGatewayClient.closed is True
+    assert calls == [
+        ("telemetry.product_active.record", {"surface": "tui"}),
+        ("telemetry.client_launch.record", {}),
+        ("telemetry.product_active.record", {"surface": "tui"}),
+    ]
 
 
 @pytest.mark.asyncio

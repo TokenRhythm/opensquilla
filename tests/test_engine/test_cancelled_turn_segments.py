@@ -21,6 +21,7 @@ from opensquilla.provider import ReasoningDeltaEvent as ProviderReasoning
 from opensquilla.provider import TextDeltaEvent as ProviderText
 from opensquilla.provider import ToolUseEndEvent as ProviderToolUseEnd
 from opensquilla.provider import ToolUseStartEvent as ProviderToolUseStart
+from opensquilla.provider.types import ProviderReplayState
 from opensquilla.session.manager import SessionManager
 from opensquilla.session.storage import SessionStorage
 from opensquilla.tools.registry import ToolRegistry, ToolSpec
@@ -35,9 +36,10 @@ class _ToolThenHangingTextProvider:
 
     provider_name = "test"
 
-    def __init__(self) -> None:
+    def __init__(self, *, native_replay: bool = False) -> None:
         self.calls = 0
         self.model = "test/model"
+        self.native_replay = native_replay
 
     def chat(self, messages: list[Message], tools=None, config=None) -> AsyncIterator[Any]:
         self.calls += 1
@@ -47,7 +49,19 @@ class _ToolThenHangingTextProvider:
         if call_number == 1:
             yield ProviderToolUseStart(tool_use_id="tool-1", tool_name="lookup")
             yield ProviderToolUseEnd(tool_use_id="tool-1", tool_name="lookup", arguments={})
-            yield ProviderDone(stop_reason="tool_use", input_tokens=1, output_tokens=1)
+            yield ProviderDone(
+                stop_reason="tool_use", input_tokens=1, output_tokens=1,
+                reasoning_content="accepted tool reasoning" if self.native_replay else None,
+                provider_replay=(
+                    ProviderReplayState(
+                        protocol="openai_chat_completions", source="synthetic-origin",
+                        model="test/model", reasoning_details=[
+                            {"type": "reasoning.encrypted", "data": "synthetic-accepted-state"}
+                        ],
+                    )
+                    if self.native_replay else None
+                ),
+            )
             return
         yield ProviderText(text=PARTIAL_ANSWER)
         await asyncio.Event().wait()
@@ -204,9 +218,11 @@ def _registry() -> ToolRegistry:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("native_replay", [False, True])
 async def test_cancelled_turn_persists_trailing_text_segment(
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,
+    native_replay: bool,
 ) -> None:
     storage = SessionStorage(":memory:")
     await storage.connect()
@@ -226,7 +242,7 @@ async def test_cancelled_turn_persists_trailing_text_segment(
     )
     usage_sink = SessionUsageEventSink(storage, start_retry_delays=(), retry_delays=())
     runner = TurnRunner(
-        provider_selector=_ProviderSelector(_ToolThenHangingTextProvider()),
+        provider_selector=_ProviderSelector(_ToolThenHangingTextProvider(native_replay=native_replay)),
         tool_registry=_registry(),
         session_manager=manager,
         usage_event_sink=usage_sink,
@@ -269,6 +285,18 @@ async def test_cancelled_turn_persists_trailing_text_segment(
         assistant = assistants[-1]
         assert PARTIAL_ANSWER in assistant.content
         assert "[interrupted]" not in assistant.content
+        assert assistant.assistant_replay is not None
+        replay = [Message.model_validate(item) for item in assistant.assistant_replay["messages"]]
+        replay_assistants = [message for message in replay if message.role == "assistant"]
+        assert len(replay_assistants) == 1
+        assert PARTIAL_ANSWER not in str(assistant.assistant_replay)
+        assert any("lookup-result-payload" in str(message.content) for message in replay)
+        if native_replay:
+            assert replay_assistants[0].reasoning_content == "accepted tool reasoning"
+            assert replay_assistants[0].provider_replay is not None
+            assert replay_assistants[0].provider_replay.reasoning_details == [
+                {"type": "reasoning.encrypted", "data": "synthetic-accepted-state"}
+            ]
 
         segments = assistant.tool_calls or []
         segment_types = [str(seg.get("type")) for seg in segments if isinstance(seg, dict)]

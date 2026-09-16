@@ -8,9 +8,6 @@
         <button type="button" class="btn btn--primary" @click="go('/chat')">
           {{ t('notFound.goToChat') }}
         </button>
-        <button type="button" class="btn btn--ghost" @click="go('/sessions')">
-          {{ t('notFound.sessions') }}
-        </button>
       </div>
     </section>
   </main>

@@ -447,7 +447,7 @@ function phaseStatus(entry: ActivitySnapshotEntry): StatusPart | undefined {
     return {
       ...common,
       action: `provider:retrying:${attempt}:${limit}`,
-      label: `Retrying ${attempt}/${limit}`,
+      label: limit > 0 ? `Retrying ${attempt}/${limit}` : `Retrying · attempt ${attempt}`,
     }
   }
   if (phase === 'fallback') {

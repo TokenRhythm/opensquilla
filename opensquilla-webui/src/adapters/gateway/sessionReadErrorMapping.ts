@@ -18,17 +18,20 @@ export function mapSessionReadError(error: unknown): Error {
   if (code === 'NOT_FOUND' || code === 'SESSION_NOT_FOUND') {
     return new SessionReadSessionMissingError(failure.message, error)
   }
-  const kind = code === 'RPC_ABORTED' || (error instanceof Error && error.name === 'AbortError')
+  const kind = code === 'SNAPSHOT_TOO_LARGE'
+    ? 'too-large'
+    : code === 'RPC_ABORTED' || (error instanceof Error && error.name === 'AbortError')
     ? 'aborted'
     : code === 'RPC_TIMEOUT'
       ? 'timeout'
-      : code === 'STORAGE_BUSY'
+      : code === 'STORAGE_BUSY' || code === 'SNAPSHOT_BUSY'
         ? 'busy'
         : 'unavailable'
   return new SessionReadFailure(
     kind,
     failure.message,
-    failure.retryable === true || kind === 'timeout' || kind === 'busy' || !code,
+    code !== 'SNAPSHOT_TOO_LARGE' && (failure.retryable === true || kind === 'timeout'
+      || kind === 'busy' || code === 'SNAPSHOT_EXPIRED' || code === 'SNAPSHOT_STALE' || !code),
     failure.retryAfterMs ?? 0,
     error,
   )

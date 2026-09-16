@@ -1,3 +1,4 @@
+import { normalizePageContext } from '@/types/pageContext'
 import type { TransportCallOptions as RpcCallOptions } from './transportTypes'
 import type { WorkbenchResourceProvider } from '@/modules/artifactWorkbench'
 
@@ -261,6 +262,8 @@ export function createRpcWorkbenchResourceProvider(
         document,
         revision,
         ...(binding ? { binding } : {}),
+        ...(normalizePageContext(response.pageContext) ? { pageContext: normalizePageContext(response.pageContext)! } : {}),
+        ...(typeof response.workingFile === 'string' ? { workingFile: response.workingFile } : {}),
         materialized: boolAt(response, 'materialized'),
       }
     },

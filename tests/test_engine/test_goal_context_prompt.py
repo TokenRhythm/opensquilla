@@ -105,7 +105,7 @@ def test_goal_turn_renders_frozen_objective_and_structured_progress() -> None:
     assert "safe in-scope alternatives are exhausted" in block
     assert "true impasse" in block
     assert "starts a fresh blocked audit" in block
-    assert "general generated-file instruction to stop after publication yields" in block
+    assert "instruction to stop after publication" not in block
     assert "continue any remaining work through the normal tools and turns" in block
     assert "do not publish the unchanged file again" in block
     assert "call no more tools; give one concise final summary" in block
@@ -231,7 +231,7 @@ def test_goal_tools_visible_only_to_matching_main_default_turn(tmp_path: Path) -
     )
 
 
-def test_goal_artifact_note_continues_normal_loop_only_for_matching_goal_turn() -> None:
+def test_artifact_note_keeps_goal_guidance_scoped_without_forcing_other_turns_to_stop() -> None:
     context = _goal_context()
     goal_ctx = _tool_context(goal_context=context)
 
@@ -278,7 +278,8 @@ def test_goal_artifact_note_continues_normal_loop_only_for_matching_goal_turn() 
         non_default_note,
         cron_note,
     ):
-        assert "Send the final response now" in non_goal_note
+        assert "Send the final response now" not in non_goal_note
+        assert "Do not run more tools" not in non_goal_note
         assert "Follow the Active Goal instructions" not in non_goal_note
         assert "update_goal_progress remains optional" not in non_goal_note
     assert "Follow the Active Goal instructions" in named_agent_note
@@ -291,9 +292,10 @@ def test_generic_artifact_prompt_defers_to_active_goal_without_dynamic_flag() ->
         tools=["execute_code", "publish_artifact"],
     )
 
-    assert "unless an Active Goal context says otherwise" in prompt
+    assert "Publication does not end the turn" in prompt
     assert "publication alone does not finish the Goal" in prompt
-    assert "Send the final response" in prompt
+    assert "do not run more tools" not in prompt
+    assert "Send the final response" not in prompt
 
 
 def test_goal_tools_do_not_terminate_the_turn() -> None:

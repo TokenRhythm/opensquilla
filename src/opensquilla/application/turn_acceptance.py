@@ -24,9 +24,6 @@ from opensquilla.application.admission_errors import (
     AdmissionUnavailableError,
 )
 from opensquilla.application.admission_failures import (
-    AdmissionAnnotationConflictError,
-    AdmissionAnnotationNotFoundError,
-    AdmissionAnnotationValidationError,
     AdmissionIngressConflictError,
     AdmissionMetaControlConflictError,
     AdmissionPendingInputConflictError,
@@ -38,13 +35,12 @@ from opensquilla.application.admission_failures import (
 )
 from opensquilla.application.admission_views import (
     AdmissionAcceptance,
-    AdmissionAnnotation,
-    AdmissionAnnotationTarget,
     AdmissionArchive,
     AdmissionCommit,
     AdmissionMetaControl,
     AdmissionPlanRevision,
     AdmissionPlanRun,
+    AdmissionPreparation,
     AdmissionProjectOrigin,
     AdmissionSessionChanges,
     AdmissionSessionIntent,
@@ -87,13 +83,11 @@ class DurableTurnAdmission:
             else ports.explicit_ingress_intent(command.session_key)
         )
         async with intent_guard:
+            if command.receipt_replay_only:
+                return await _replay_retired_request(command, ports)
             try:
                 if command.surface == "webchat":
                     if ports.sessions is None:
-                        if command.prompt_annotation_ids or command.document_context is not None:
-                            raise AdmissionUnavailableError(
-                                "Artifact context requires durable session storage"
-                            )
                         if command.initial_collaboration_mode or command.initial_routing_mode:
                             raise AdmissionUnavailableError(
                                 "Initial session controls require atomic turn acceptance"
@@ -131,27 +125,26 @@ class DurableTurnAdmission:
                     command = replace(command, intent=intent or "continue")
                 guard = command.pending_input
                 plan = command.plan or PlanAdmissionContext()
-                async with ports.authority_scope():
-                    result = await _accept_turn(
-                        command,
-                        ports,
-                        plan_revision_id=plan.revision_id,
-                        plan_context_revision_id=plan.context_revision_id,
-                        plan_run_driver_kind=plan.run_driver_kind,
-                        plan_run_driver_id=plan.run_driver_id,
-                        required_collaboration_mode=plan.required_collaboration_mode,
-                        required_collaboration_revision=plan.required_collaboration_revision,
-                        initial_collaboration_mode=command.initial_collaboration_mode,
-                        initial_routing_mode=command.initial_routing_mode,
-                        expected_collaboration_revision=plan.expected_collaboration_revision,
-                        expected_active_plan_revision_id=plan.expected_active_revision_id,
-                        require_idle_for_current_plan_implementation=plan.require_idle,
-                        atomic_collaboration_mode_update=plan.atomic_mode_update,
-                        pending_input_id=guard.pending_input_id if guard else None,
-                        pending_input_fingerprint=guard.request_fingerprint if guard else None,
-                        pending_input_revision=guard.expected_revision if guard else None,
-                        trusted_run_kind=command.trusted_run_kind,
-                    )
+                result = await _accept_turn(
+                    command,
+                    ports,
+                    plan_revision_id=plan.revision_id,
+                    plan_context_revision_id=plan.context_revision_id,
+                    plan_run_driver_kind=plan.run_driver_kind,
+                    plan_run_driver_id=plan.run_driver_id,
+                    required_collaboration_mode=plan.required_collaboration_mode,
+                    required_collaboration_revision=plan.required_collaboration_revision,
+                    initial_collaboration_mode=command.initial_collaboration_mode,
+                    initial_routing_mode=command.initial_routing_mode,
+                    expected_collaboration_revision=plan.expected_collaboration_revision,
+                    expected_active_plan_revision_id=plan.expected_active_revision_id,
+                    require_idle_for_current_plan_implementation=plan.require_idle,
+                    atomic_collaboration_mode_update=plan.atomic_mode_update,
+                    pending_input_id=guard.pending_input_id if guard else None,
+                    pending_input_fingerprint=guard.request_fingerprint if guard else None,
+                    pending_input_revision=guard.expected_revision if guard else None,
+                    trusted_run_kind=command.trusted_run_kind,
+                )
                 if command.surface == "webchat":
                     key = result.get("sessionKey") or result.get("key") or command.session_key
                     result = {"ok": True, "sessionKey": key, **result}
@@ -162,10 +155,59 @@ class DurableTurnAdmission:
                 raise
 
 
+async def _replay_retired_request(
+    command: AdmitTurn, ports: AdmissionPrimitives
+) -> AdmitTurnResult:
+    """Read an accepted receipt without preparing or accepting another turn."""
+    storage = ports.storage
+    previous = None
+    if storage is not None and storage.capabilities.receipts and command.explicit_request_id:
+        previous = await storage.replay_turn_ingress_receipt(
+            source_scope=command.source_scope,
+            request_session_key=command.session_key,
+            client_request_id=command.client_request_id,
+        )
+    if previous is None or storage is None:
+        raise AdmissionError(
+            "DOCUMENT_EDITING_RETIRED",
+            "Update the client and send page annotations as ordinary chat input.",
+            details={"action": "update_client_and_reopen_page"},
+            retryable=False,
+            accepted=False,
+        )
+    if previous.receipt.request_fingerprint != command.request_fingerprint:
+        raise AdmissionError(
+            "IDEMPOTENCY_CONFLICT",
+            "clientRequestId was already used for a different turn",
+            retryable=False,
+            accepted=False,
+        )
+    result = await ports.accepted_response(
+        previous, client_request_id=command.client_request_id, storage=storage
+    )
+    if command.surface == "webchat":
+        result = {"ok": True, "sessionKey": previous.receipt.accepted_session_key, **result}
+    return result
+
+
 async def _accept_turn(
     command: AdmitTurn,
     ports: AdmissionPrimitives,
+    **options: Any,
+) -> AdmitTurnResult:
+    # Own preparations across route validation, receipt races and the final
+    # response, including failures before the commit/activation boundary.
+    async with contextlib.AsyncExitStack() as preparations:
+        return await _accept_turn_in_scope(
+            command, ports, preparations=preparations, **options,
+        )
+
+
+async def _accept_turn_in_scope(
+    command: AdmitTurn,
+    ports: AdmissionPrimitives,
     *,
+    preparations: contextlib.AsyncExitStack,
     plan_revision_id: str | None = None,
     plan_context_revision_id: str | None = None,
     plan_run_driver_kind: str | None = None,
@@ -181,32 +223,18 @@ async def _accept_turn(
     pending_input_id: str | None = None,
     pending_input_fingerprint: str | None = None,
     pending_input_revision: int | None = None,
-    _prompt_annotation_acceptance_retries: int = 1,
     trusted_run_kind: str | None = None,
 ) -> AdmitTurnResult:
     key = command.session_key
     message_text = command.message
-    prompt_annotation_ids = command.prompt_annotation_ids
-    document_context_request = command.document_context
-    if prompt_annotation_ids and document_context_request is not None:
+    page_context = command.page_context
+    if page_context is not None and (not ports.is_owner or not command.source.is_web):
         raise AdmissionError(
-            "DOCUMENT_CONTEXT_CONFLICT",
-            "A normal document context cannot be combined with prompt annotations.",
+            "PAGE_CONTEXT_FORBIDDEN",
+            "Page context requires an interactive owner Web session.",
             retryable=False,
             accepted=False,
         )
-    if prompt_annotation_ids or document_context_request is not None:
-        if command.source.caller_kind != "web" or not ports.is_owner:
-            raise AdmissionError(
-                (
-                    "ARTIFACT_PROMPT_ANNOTATIONS_FORBIDDEN"
-                    if prompt_annotation_ids
-                    else "DOCUMENT_CONTEXT_FORBIDDEN"
-                ),
-                "Document editing requires an interactive owner Web session.",
-                retryable=False,
-                accepted=False,
-            )
     requested_client_message_id = command.client_message_id
     requested_surface_id = command.surface_id
     normalized_input = ports.normalize_input(command)
@@ -227,13 +255,6 @@ async def _accept_turn(
     fork_before_message_id = command.fork_before_message_id
     if fork_before_message_id is not None and session_intent != "continue":
         raise ValueError("forkBeforeMessageId cannot be combined with non-continue intent")
-    if (prompt_annotation_ids or document_context_request is not None) and (
-        session_intent != "continue" or fork_before_message_id is not None
-    ):
-        raise ports.artifact_error(
-            "invalid_request",
-            retryable=False,
-        )
     param_initial_routing_mode = command.initial_routing_mode
     if (
         initial_routing_mode is not None
@@ -378,7 +399,6 @@ async def _accept_turn(
                 previous_acceptance,
                 client_request_id=ingress_identity.client_request_id,
                 storage=storage,
-                accepted_prompt_annotation_ids=prompt_annotation_ids,
             )
             if initial_collaboration_mode is not None:
                 replay_response["acceptedCollaboration"] = {
@@ -399,56 +419,8 @@ async def _accept_turn(
                 )
             return replay_response
 
-    if prompt_annotation_ids or document_context_request is not None:
-        existing_annotation_session = await storage.get_session(key)
-        existing_collaboration_mode = (
-            str(getattr(existing_annotation_session, "collaboration_mode", "default") or "default")
-            .strip()
-            .lower()
-        )
-        if (
-            plan_revision_id is not None
-            or plan_context_revision_id is not None
-            or required_collaboration_mode == "plan"
-            or initial_collaboration_mode == "plan"
-            or existing_collaboration_mode == "plan"
-        ):
-            raise AdmissionError(
-                (
-                    "ARTIFACT_PROMPT_ANNOTATIONS_PLAN_UNSUPPORTED"
-                    if prompt_annotation_ids
-                    else "DOCUMENT_CONTEXT_PLAN_UNSUPPORTED"
-                ),
-                "Document editing must be sent from the normal execution mode, not Plan.",
-                retryable=False,
-                accepted=False,
-            )
-        if ports.is_remote_guest(command.source):
-            raise AdmissionError(
-                (
-                    "ARTIFACT_PROMPT_ANNOTATIONS_FORBIDDEN"
-                    if prompt_annotation_ids
-                    else "DOCUMENT_CONTEXT_FORBIDDEN"
-                ),
-                "Document editing requires a locally proven owner.",
-                retryable=False,
-                accepted=False,
-            )
 
-    if prompt_annotation_ids and combined_attachments:
-        # The first annotation release binds only source-backed DOM anchors.
-        # Keep idempotent receipts replayable across upgrades, then reject every
-        # new mixed annotation/attachment request before ingest or provider work.
-        raise AdmissionError(
-            "PROMPT_ANNOTATION_ATTACHMENTS_UNSUPPORTED",
-            "Prompt annotations cannot be sent with file or image attachments.",
-            retryable=False,
-            accepted=False,
-        )
 
-    prompt_annotation_rows: tuple[AdmissionAnnotation, ...] = ()
-    prepared_prompt_annotation_targets: tuple[AdmissionAnnotationTarget, ...] = ()
-    prompt_annotation_snapshots: tuple[dict[str, Any], ...] = ()
 
     if require_idle_for_current_plan_implementation:
         pending_user_inputs = getattr(ports.runtime, "pending_user_inputs", None)
@@ -560,6 +532,9 @@ async def _accept_turn(
                 agent_id=ports.effective_agent_id(existing_session, key),
                 **create_kwargs,
             )
+            preparation = getattr(plan, "workspace_preparation", None)
+            if isinstance(preparation, AdmissionPreparation):
+                preparations.push_async_callback(preparation.close)
             return plan.node, plan
         if session_manager.capabilities.apply_intent:
             applied_session, _intent_applied = await session_manager.apply_intent(
@@ -651,15 +626,6 @@ async def _accept_turn(
         if isinstance(canonical_session_id, str) and canonical_session_id
         else key.split(":")[-1] or key
     )
-    binding = await ports.bind_artifact(
-        command,
-        key=key,
-        session_id=session_id,
-        session=session,
-    )
-    prompt_annotation_rows = binding.annotations
-    prepared_prompt_annotation_targets = binding.targets
-    prompt_annotation_snapshots = binding.snapshots
     plan_run: AdmissionPlanRun | None = None
     plan_revision_to_create: AdmissionPlanRevision | None = None
     selected_plan_revision_id = plan_revision_id
@@ -749,15 +715,7 @@ async def _accept_turn(
                 retryable=False,
                 accepted=False,
             )
-    # PromptAnnotation turns are a bounded artifact mutation protocol, including
-    # when the annotation batch is the session's first transcript entry.  An
-    # auxiliary naming request would escape that turn's provider-call budget and
-    # strict tool boundary, so annotation ingress must never arm auto-naming.
-    generate_title = (
-        False
-        if prompt_annotation_ids
-        else await ports.should_auto_title(storage, session, key, session_id)
-    )
+    generate_title = await ports.should_auto_title(storage, session, key, session_id)
     disk_budget = ports.policy.disk_budget_bytes
     if pending_input_id is not None:
         # SQLite deliberately retains queue-owned references. Only after the
@@ -777,6 +735,7 @@ async def _accept_turn(
                             media_root=media_root,
                             pending_input_id=pending_input_id,
                             target_session_id=session_id,
+                            persist_enabled=persist_enabled,
                             disk_budget_bytes=(
                                 disk_budget if isinstance(disk_budget, int) else None
                             ),
@@ -929,7 +888,6 @@ async def _accept_turn(
         key=key,
         session_id=session_id,
         atomic_intent_plan=atomic_intent_plan,
-        binding=binding,
         workspace_guard=workspace_guard,
     )
     agent_id = prepared_route.agent_id
@@ -941,6 +899,11 @@ async def _accept_turn(
     accepted_run_mode_origin = prepared_route.accepted_run_mode_origin
     workspace_guard = prepared_route.workspace_guard
     session = prepared_route.session
+    if prepared_route.page_context_text:
+        if display_text is None:
+            display_text = message_text
+        message_text = f"{message_text}\n\n{prepared_route.page_context_text}"
+        provider_message_text = f"{provider_message_text}\n\n{prepared_route.page_context_text}"
 
     def _cleanup_rejected_guest_profile() -> None:
         if guest_profile is not None:
@@ -1010,8 +973,7 @@ async def _accept_turn(
             "surface_id": surface_id,
             # The direct RPC execution path constructs ToolContext before a
             # TaskRuntime record exists. Keep the durable turn identity in the
-            # envelope so PromptAnnotation candidate loops never fall back to
-            # the legacy one-shot writer merely because task metadata is late.
+            # envelope so tool events and persisted messages share one owner.
             "task_id": turn_id,
             "turn_context_intent": "send",
             "turn_context_revision": 1,
@@ -1111,10 +1073,6 @@ async def _accept_turn(
         )
         ports.steer_metric("legacy_interrupt_requested", session_key=key)
     runtime_mode = "interrupt" if requested_mode == "steer" else requested_mode
-    if prompt_annotation_ids or document_context_request is not None:
-        # One accepted annotation batch owns one distinct turn and one
-        # ChangeSet. It must never be merged into or interrupt another turn.
-        runtime_mode = "followup"
     if durable_meta_control is not None:
         # A control must begin a fresh pipeline turn and must not interrupt
         # another accepted control. Collect could lose the pipeline marker;
@@ -1160,20 +1118,6 @@ async def _accept_turn(
             accepted=False,
         )
 
-    if prompt_annotation_ids and not atomic_runtime_acceptance:
-        raise AdmissionError(
-            "PROMPT_ANNOTATION_DURABILITY_UNAVAILABLE",
-            "Prompt annotations require atomic task acceptance; retry after Gateway recovery.",
-            retryable=True,
-            accepted=False,
-        )
-    if document_context_request is not None and not atomic_runtime_acceptance:
-        raise AdmissionError(
-            "DOCUMENT_CONTEXT_DURABILITY_UNAVAILABLE",
-            "Document editing requires atomic task acceptance; retry after Gateway recovery.",
-            retryable=True,
-            accepted=False,
-        )
 
     if pending_input_id is not None and not prepared_acceptance:
         raise AdmissionError(
@@ -1185,7 +1129,7 @@ async def _accept_turn(
 
     if prepared_acceptance:
         persist_content = message_text
-        if raw_attachments or display_text is not None or prompt_annotation_snapshots:
+        if raw_attachments or display_text is not None or page_context is not None:
             if raw_attachments and hasattr(ports.sessions, "stamp_user_text"):
                 stamped = session_manager.stamp_user_text(message_text)
                 if isinstance(stamped, str):
@@ -1198,7 +1142,7 @@ async def _accept_turn(
                 media_root=media_root,
                 persist_enabled=persist_enabled,
                 disk_budget_bytes=disk_budget if isinstance(disk_budget, int) else None,
-                prompt_annotations=prompt_annotation_snapshots,
+                page_context=page_context,
             )
 
         assert callable(prepare_message)
@@ -1212,7 +1156,7 @@ async def _accept_turn(
         if (
             not raw_attachments
             and display_text is None
-            and not prompt_annotation_snapshots
+            and page_context is None
             and isinstance(persisted_entry.content, str)
         ):
             message_text = persisted_entry.content
@@ -1221,7 +1165,11 @@ async def _accept_turn(
         """Persist a prefix edit and its numbered title in one allocation window."""
 
         if atomic_intent_plan is None or atomic_intent_plan.action != "fork":
-            return await storage.accept_turn(commit)
+            acceptance = await storage.accept_turn(commit)
+            preparation = getattr(atomic_intent_plan, "workspace_preparation", None)
+            if isinstance(preparation, AdmissionPreparation):
+                preparation.mark_committed(acceptance.receipt.session_id)
+            return acceptance
         title_parent = atomic_intent_plan.previous_node
         if title_parent is None:
             raise RuntimeError("Fork acceptance is missing its parent session")
@@ -1325,8 +1273,6 @@ async def _accept_turn(
                         require_idle_for_current_plan_implementation
                     ),
                     claim_current_goal=claim_current_goal,
-                    prepared_prompt_annotation_targets=prepared_prompt_annotation_targets,
-                    prompt_annotation_turn_id=(turn_id if prompt_annotation_rows else None),
                     pending_input_id=pending_input_id,
                     pending_input_fingerprint=pending_input_fingerprint,
                     pending_input_revision=pending_input_revision,
@@ -1457,62 +1403,6 @@ async def _accept_turn(
 
         try:
             acceptance = await complete_durable_ingress(_commit_with_session_admission())
-        except (
-            AdmissionAnnotationConflictError,
-            AdmissionAnnotationNotFoundError,
-        ) as exc:
-            _consumed_file_uuids = []
-            _cleanup_rejected_guest_profile()
-            if prompt_annotation_ids and _prompt_annotation_acceptance_retries > 0:
-                log.info(
-                    "prompt_annotations.accept_head_race_retry",
-                    session_key=key,
-                    attempts_remaining=_prompt_annotation_acceptance_retries,
-                )
-                await ports.release_untransferred_authorities()
-                return cast(
-                    AdmitTurnResult,
-                    await _accept_turn(
-                        command,
-                        ports,
-                        plan_revision_id=plan_revision_id,
-                        plan_context_revision_id=plan_context_revision_id,
-                        plan_run_driver_kind=plan_run_driver_kind,
-                        plan_run_driver_id=plan_run_driver_id,
-                        required_collaboration_mode=required_collaboration_mode,
-                        required_collaboration_revision=required_collaboration_revision,
-                        initial_collaboration_mode=initial_collaboration_mode,
-                        expected_collaboration_revision=expected_collaboration_revision,
-                        expected_active_plan_revision_id=expected_active_plan_revision_id,
-                        require_idle_for_current_plan_implementation=(
-                            require_idle_for_current_plan_implementation
-                        ),
-                        atomic_collaboration_mode_update=atomic_collaboration_mode_update,
-                        pending_input_id=pending_input_id,
-                        pending_input_fingerprint=pending_input_fingerprint,
-                        pending_input_revision=pending_input_revision,
-                        _prompt_annotation_acceptance_retries=(
-                            _prompt_annotation_acceptance_retries - 1
-                        ),
-                    ),
-                )
-            raise ports.artifact_error(
-                "document_changed",
-                exc,
-                operation="prompt_annotations.accept",
-                retryable=True,
-                session_key=key,
-            ) from exc
-        except AdmissionAnnotationValidationError as exc:
-            _consumed_file_uuids = []
-            _cleanup_rejected_guest_profile()
-            raise ports.artifact_error(
-                "annotation_unavailable",
-                exc,
-                operation="prompt_annotations.accept",
-                retryable=False,
-                session_key=key,
-            ) from exc
         except AdmissionShuttingDownError as exc:
             _cleanup_rejected_guest_profile()
             raise AdmissionError(
@@ -1806,7 +1696,6 @@ async def _accept_turn(
             client_request_id=ingress_identity.client_request_id,
             storage=storage,
             turn_context=(persisted_entry.turn_context if not acceptance.replayed else None),
-            accepted_prompt_annotation_ids=prompt_annotation_ids,
         )
         if initial_collaboration_mode is not None:
             accepted_collaboration: AcceptedCollaboration = {
@@ -1888,21 +1777,16 @@ async def _accept_turn(
             task = asyncio.create_task(_run_direct_turn())
             setattr(task, "_opensquilla_started", False)
             setattr(task, "_opensquilla_terminal_emitted", False)
-            turn_authority = ports.turn_authority(route_envelope)
             try:
                 direct_registry.register(
                     key,
                     task,
-                    terminal_cleanup=(
-                        turn_authority.aclose if turn_authority is not None else None
-                    ),
+                    terminal_cleanup=None,
                 )
             except BaseException:
                 task.cancel()
                 await asyncio.gather(task, return_exceptions=True)
                 raise
-            if turn_authority is not None:
-                turn_authority.handoff()
             return acceptance
 
         try:
@@ -2047,7 +1931,6 @@ async def _accept_turn(
             client_request_id=ingress_identity.client_request_id,
             storage=storage,
             turn_context=(persisted_entry.turn_context if not acceptance.replayed else None),
-            accepted_prompt_annotation_ids=prompt_annotation_ids,
         )
 
     # 1. Persist user message to transcript (include attachment metadata).
@@ -2065,7 +1948,7 @@ async def _accept_turn(
         )
         if callable(get_transcript):
             fresh_user_session = not bool(await get_transcript(key))
-        if raw_attachments or display_text is not None:
+        if raw_attachments or display_text is not None or page_context is not None:
             # Stamp up-front so both the stored envelope and the LLM path agree.
             if raw_attachments and hasattr(ports.sessions, "stamp_user_text"):
                 _stamped = session_manager.stamp_user_text(message_text)
@@ -2080,6 +1963,7 @@ async def _accept_turn(
                 media_root=media_root,
                 persist_enabled=persist_enabled,
                 disk_budget_bytes=disk_budget if isinstance(disk_budget, int) else None,
+                page_context=page_context,
             )
             legacy_persisted_entry = await session_manager.append_message(
                 key,
@@ -2120,21 +2004,16 @@ async def _accept_turn(
             task = asyncio.create_task(_run_direct_turn())
             setattr(task, "_opensquilla_started", False)
             setattr(task, "_opensquilla_terminal_emitted", False)
-            turn_authority = ports.turn_authority(route_envelope)
             try:
                 direct_registry.register(
                     key,
                     task,
-                    terminal_cleanup=(
-                        turn_authority.aclose if turn_authority is not None else None
-                    ),
+                    terminal_cleanup=None,
                 )
             except BaseException:
                 task.cancel()
                 await asyncio.gather(task, return_exceptions=True)
                 raise
-            if turn_authority is not None:
-                turn_authority.handoff()
 
         await ports.publish_disposition(
             key,

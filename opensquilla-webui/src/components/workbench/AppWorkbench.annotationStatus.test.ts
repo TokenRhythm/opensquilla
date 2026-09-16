@@ -3,6 +3,22 @@ import { describe, expect, it } from 'vitest'
 import appWorkbenchSource from './AppWorkbench.vue?raw'
 
 describe('AppWorkbench annotation mode status', () => {
+  it('omits reopening and refresh callbacks from the active preview file menu', () => {
+    const menu = appWorkbenchSource.match(/<ResourceActionsMenu\b[^>]*\/>/)?.[0]
+
+    expect(menu).toBeDefined()
+    expect(menu).toContain(':previewable="false"')
+    expect(menu).not.toContain('@open=')
+  })
+
+  it('keeps the original annotation target and includes its optional subpage when focusing', () => {
+    const start = appWorkbenchSource.indexOf('async function onPromptAnnotationFocus(')
+    const end = appWorkbenchSource.indexOf('\nasync function onPromptAnnotationReuse(', start)
+    const source = appWorkbenchSource.slice(start, end)
+    expect(source).toContain('targetRef: draft.targetRef')
+    expect(source).toContain('...(draft.pagePath ? { pagePath: draft.pagePath } : {})')
+    expect(source).not.toContain('getWorkbenchBrowserTarget')
+  })
   it('renders live guidance only for the active annotation toolbar action', () => {
     expect(appWorkbenchSource).toContain(
       'v-if="isActiveAnnotationToolbarItem(toolbarItem)"',
@@ -75,7 +91,7 @@ describe('AppWorkbench annotation mode status', () => {
     )
   })
 
-  it('routes source.patched invalidations through resource and preview refresh', () => {
+  it("routes document version invalidations through resource and preview refresh", () => {
     const start = appWorkbenchSource.indexOf('function onArtifactState(')
     const end = appWorkbenchSource.indexOf('\nfunction promptAnnotationItem(', start)
     const source = appWorkbenchSource.slice(start, end)
@@ -84,7 +100,7 @@ describe('AppWorkbench annotation mode status', () => {
     expect(source).toContain('workbenchResources.load(activeSessionKey, true)')
     expect(source).toContain('refreshResourceCollectionItem(activeSessionKey)')
     expect(source).toContain('void refreshArtifactDocumentItem(item)')
-    // Artifact actions, including source.patched, share one content-free
+    // Version actions share one content-free
     // invalidation path; filtering by action here would leave Preview stale.
     expect(source).not.toContain('event.action')
     expect(appWorkbenchSource).toContain(
@@ -92,14 +108,14 @@ describe('AppWorkbench annotation mode status', () => {
     )
   })
 
-  it('matches annotation acceptance across provisional and canonical session keys', () => {
-    const start = appWorkbenchSource.indexOf('async function onPromptAnnotationsAccepted')
+  it("matches sent page annotations across provisional and canonical session keys", () => {
+    const start = appWorkbenchSource.indexOf("async function onPageAnnotationsSent")
     const end = appWorkbenchSource.indexOf('\nasync function beforeCloseItem', start)
     const source = appWorkbenchSource.slice(start, end)
 
     expect(start).toBeGreaterThan(-1)
-    expect(source).toContain('promptAnnotationAcceptanceQueue.enqueue(detail)')
-    expect(source).toContain('schedulePromptAnnotationAcceptanceFlush()')
+    expect(source).toContain("pageAnnotationSendQueue.enqueue(detail)")
+    expect(source).toContain("schedulePageAnnotationSendFlush()")
     expect(appWorkbenchSource).toContain(
       'const stopPromptAnnotationLifecycle = store.onLifecycle',
     )

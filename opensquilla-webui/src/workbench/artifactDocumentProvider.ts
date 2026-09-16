@@ -1,8 +1,5 @@
 import type {
   ArtifactActorKind,
-  ArtifactAnchor,
-  ArtifactAnchorKind,
-  ArtifactAnchorState,
   ArtifactChangeSet,
   ArtifactChangeSetStatus,
   ArtifactDocument,
@@ -10,7 +7,6 @@ import type {
   ArtifactDocumentKind,
   ArtifactDocumentWorkspace,
   ArtifactEditCapabilities,
-  ArtifactEditSession,
   ArtifactRevision,
   ArtifactRevisionSource,
 } from '@/types/artifactDocuments'
@@ -30,10 +26,6 @@ const REVISION_SOURCES = new Set<ArtifactRevisionSource>([
 const CHANGE_SET_STATUSES = new Set<ArtifactChangeSetStatus>([
   'draft', 'ready', 'applied', 'rejected', 'conflict', 'failed',
 ])
-const ANCHOR_KINDS = new Set<ArtifactAnchorKind>([
-  'text_range', 'cell_range', 'slide_shape', 'dom_source', 'generic',
-])
-const ANCHOR_STATES = new Set<ArtifactAnchorState>(['resolved', 'orphaned'])
 
 const SPREADSHEET_EXTENSIONS = new Set([
   'csv', 'fods', 'ods', 'ots', 'xls', 'xlsb', 'xlsm', 'xlsx', 'xlt', 'xltm', 'xltx',
@@ -496,55 +488,6 @@ export function normalizeArtifactChangeSet(value: unknown): ArtifactChangeSet | 
     createdAt: timestampAt(raw, 'createdAt', 'created_at'),
     updatedAt: timestampAt(raw, 'updatedAt', 'updated_at'),
     schemaVersion: Math.max(1, numberAt(raw, 1, 'schemaVersion', 'schema_version')),
-  }
-}
-
-export function normalizeArtifactAnchor(value: unknown): ArtifactAnchor | null {
-  const raw = objectValue(value)
-  if (!raw) return null
-  const anchorId = stringAt(raw, 'anchorId', 'anchor_id').trim()
-  const documentId = stringAt(raw, 'documentId', 'document_id').trim()
-  const revisionId = stringAt(raw, 'revisionId', 'revision_id').trim()
-  if (!anchorId || !documentId || !revisionId) return null
-  return {
-    anchorId,
-    documentId,
-    revisionId,
-    kind: enumAt(raw, ANCHOR_KINDS, 'generic', 'kind'),
-    locator: objectValue(valueAt(raw, 'locator')) || {},
-    quote: nullableStringAt(raw, 'quote'),
-    context: objectValue(valueAt(raw, 'context')),
-    state: enumAt(raw, ANCHOR_STATES, 'resolved', 'state'),
-    remappedFromAnchorId: nullableStringAt(
-      raw,
-      'remappedFromAnchorId',
-      'remapped_from_anchor_id',
-    ),
-    createdAt: timestampAt(raw, 'createdAt', 'created_at'),
-    schemaVersion: Math.max(1, numberAt(raw, 1, 'schemaVersion', 'schema_version')),
-  }
-}
-
-export function normalizeArtifactEditSession(value: unknown): ArtifactEditSession | null {
-  const raw = objectValue(value)
-  if (!raw) return null
-  const editSessionId = stringAt(raw, 'id', 'editSessionId', 'edit_session_id').trim()
-  const documentId = stringAt(raw, 'documentId', 'document_id').trim()
-  if (!editSessionId || !documentId) return null
-  const mode = stringAt(raw, 'mode') === 'edit' ? 'edit' : 'view'
-  const statusValue = stringAt(raw, 'status')
-  const status = ['active', 'closed', 'expired', 'stale'].includes(statusValue)
-    ? statusValue as ArtifactEditSession['status']
-    : 'active'
-  return {
-    editSessionId,
-    documentId,
-    baseRevisionId: stringAt(raw, 'baseRevisionId', 'base_revision_id'),
-    lastSavedRevisionId: stringAt(raw, 'lastSavedRevisionId', 'last_saved_revision_id'),
-    mode,
-    status,
-    stateRevision: Math.max(1, numberAt(raw, 1, 'stateRevision', 'state_revision')),
-    expiresAt: timestampAt(raw, 'expiresAt', 'expires_at'),
   }
 }
 

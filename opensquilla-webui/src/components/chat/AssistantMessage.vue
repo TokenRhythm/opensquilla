@@ -40,7 +40,7 @@
           v-if="showActivityDisclosure"
           :lifecycle="activityLifecycle"
           :step-count="activityStepCount"
-          :failure-count="documentWriterFailureCount"
+          :failure-count="toolFailureCount"
           :duration-seconds="activityDurationSeconds"
           :summary-label="displayActivitySummaryLabel"
           :detail-label="displayActivityDetailLabel"
@@ -156,7 +156,11 @@
           <TextPart
             :part="activityProjection.answerPart"
             :sources="message.sources ?? []"
+            :workspace-previews="workspacePreviews"
+            :session-key="sessionKey"
+            @open-resource="emit('openArtifact', $event)"
             @citation="onCitation"
+            @workspace-preview="openWorkspacePreview"
           />
         </div>
       </template>
@@ -211,7 +215,20 @@
         class="plan-message-intro"
         :part="activityProjection.answerPart"
         :sources="message.sources ?? []"
+        :workspace-previews="workspacePreviews"
+        :session-key="sessionKey"
+        @open-resource="emit('openArtifact', $event)"
         @citation="onCitation"
+        @workspace-preview="openWorkspacePreview"
+      />
+
+      <TextPart
+        v-if="workspacePreviews.length && (!activityProjection.canSeparateActivity || !activityProjection.answerPart)"
+        :part="{ type: 'text', key: 'workspace-preview-fallback', rawText: '', html: '' }"
+        :workspace-previews="workspacePreviews"
+        :session-key="sessionKey"
+        @open-resource="emit('openArtifact', $event)"
+        @workspace-preview="openWorkspacePreview"
       />
 
       <PlanCard
@@ -458,8 +475,10 @@ import { useCopyFeedback } from '@/composables/chat/useCopyFeedback'
 import { useRelativeNow } from '@/composables/useRelativeNow'
 import { createdSessionsFromMessage } from '@/utils/chat/createdSessions'
 import {
-  isDocumentAgentToolName,
-  isDocumentWriterToolName,
+  workspacePreviewOpenAction, workspacePreviewPages, workspacePreviewsFromMessage, type WorkspacePreviewLink,
+} from '@/utils/chat/workspacePreviews'
+import type { WorkbenchResource } from '@/types/workbenchResources'
+import {
 } from '@/utils/chat/toolDisplay'
 import {
   hasIncompleteUsageCoverage,
@@ -527,6 +546,7 @@ const props = defineProps<{
   goalOutcome?: GoalSnapshot | null
   goalElapsed?: string
   resolveSessionAvailability?: (sessionKey: string) => Promise<boolean>
+  resolveWorkspacePreviewResource?: (sessionKey: string, documentId: string) => Promise<WorkbenchResource | null>
 }>()
 
 const emit = defineEmits<{
@@ -658,7 +678,13 @@ const standaloneInterruptParts = computed(() =>
     )
   )),
 )
-const outcomePresentation = computed(() => turnOutcomePresentation(props.message.turnOutcome))
+const outcomePresentation = computed(() => {
+  const outcome = turnOutcomePresentation(props.message.turnOutcome)
+  if (outcome !== 'completed') return outcome
+  if (props.message.interrupted) return 'interrupted'
+  if (props.message.terminalFailure) return 'failed'
+  return outcome
+})
 const processRestart = computed(() => isProcessRestartOutcome(props.message.turnOutcome))
 
 function epochMilliseconds(value: string | number | null | undefined): number {
@@ -818,6 +844,33 @@ const legacyTimelineItems = computed<ChatStreamTimelineItem[]>(() => {
 })
 
 const semanticCreatedSessions = computed(() => createdSessionsFromMessage(props.message))
+const registeredWorkspacePreviews = computed(() => workspacePreviewsFromMessage(props.message))
+const previewResources = ref<Record<string, WorkbenchResource>>({})
+const workspacePreviews = computed(() => registeredWorkspacePreviews.value.flatMap(
+  preview => workspacePreviewPages(preview, previewResources.value[preview.documentId]),
+))
+watch(
+  [() => props.sessionKey, () => props.resolveWorkspacePreviewResource,
+    () => JSON.stringify(registeredWorkspacePreviews.value)],
+  async ([key, resolve], _previous, onCleanup) => {
+    let active = true
+    onCleanup(() => { active = false })
+    previewResources.value = {}
+    if (!key || !resolve) return
+    const entries = await Promise.all(registeredWorkspacePreviews.value.filter(preview => preview.bundleRoot)
+      .map(async preview => {
+        try {
+          const resource = await resolve(key, preview.documentId)
+          return resource ? [preview.documentId, resource] as const : null
+        } catch { return null }
+      }))
+    if (active) previewResources.value = Object.fromEntries(entries.filter(entry => entry !== null))
+  },
+  { immediate: true, flush: 'sync' },
+)
+function openWorkspacePreview(preview: WorkspacePreviewLink) {
+  emit('openArtifact', workspacePreviewOpenAction(preview, props.sessionKey))
+}
 const createdSessions = computed(() => (
   props.message.createdSessionLinks ?? semanticCreatedSessions.value
 ))
@@ -830,25 +883,14 @@ const activityLifecycle = computed<AssistantActivityLifecycle>(() => {
   if (outcomePresentation.value === 'interrupted') return 'interrupted'
   if (outcomePresentation.value === 'timeout') return 'failed'
   if (outcomePresentation.value === 'failed') return 'failed'
-  if (props.message.interrupted) return 'interrupted'
-  if (props.message.terminalFailure) return 'failed'
-  const hasTerminalFailure = !props.message.text.trim()
-    && (
-      (props.message.toolCalls || []).some(call => call.isError || call.status === 'error')
-      || (props.message.timelineItems || []).some(item =>
-        item.type === 'tool-group'
-        && item.group.calls.some(call => call.isError || call.status === 'error'),
-      )
-  )
-  if (hasTerminalFailure) return 'failed'
   return props.message.isStreaming ? 'working' : 'settled'
 })
 
 const activityProjection = computed(() =>
   projectAssistantActivity(
-    props.message,
+    { ...props.message, timelineItems: withoutFailedActivity(props.message.timelineItems || []) },
     props.renderMarkdown,
-    legacyTimelineItems.value,
+    withoutFailedActivity(legacyTimelineItems.value),
     {
       lifecycle: activityLifecycle.value,
       statusHistory: statusHistory.value,
@@ -859,60 +901,16 @@ const activityProjection = computed(() =>
   ),
 )
 
-function withoutFailedActivity(
-  items: ChatStreamTimelineItem[],
-): ChatStreamTimelineItem[] {
+function withoutFailedActivity(items: ChatStreamTimelineItem[]): ChatStreamTimelineItem[] {
   return items.flatMap((item): ChatStreamTimelineItem[] => {
     if (item.type !== 'tool-group') return [item]
-    const documentAgentGroup = item.group.operationKey.startsWith('document.')
-      || isDocumentAgentToolName(item.group.operationKey)
-    const failedCalls = item.group.calls.filter(
-      call => call.isError || call.status === 'error',
-    )
-    // Some restored histories only carry the failure marker on the group.
-    // Treat that group-level state as authoritative when no call-level marker
-    // survived serialization.
-    if (
-      (item.group.isError || item.group.status === 'error')
-      && failedCalls.length === 0
-      && !documentAgentGroup
-    ) {
-      return []
-    }
-    const groupLevelWriterError = documentAgentGroup
-      && (item.group.isError || item.group.status === 'error')
-      && failedCalls.length === 0
-    const calls = item.group.calls.filter(
-      call => (
-        (
-          (!call.isError && call.status !== 'error')
-          || isDocumentAgentToolName(call.name)
-        )
-        && !createdSessionCallIds.value.has(call.toolId)
-      ),
-    ).map(call => groupLevelWriterError
-      ? { ...call, isError: true, status: 'error' as const }
-      : call)
-    if (calls.length === 0) return []
-    const isRunning = calls.some(call => call.isRunning)
-    const isError = calls.some(call => call.isError || call.status === 'error')
-      || (documentAgentGroup && (item.group.isError || item.group.status === 'error'))
-    return [{
-      ...item,
-      group: {
-        ...item.group,
-        calls,
-        isRunning,
-        isError,
-        status: isError
-          ? 'error'
-          : isRunning
-          ? ''
-          : calls.every(call => call.status === 'success')
-            ? 'success'
-            : '',
-      },
-    }]
+    const groupFailure = (item.group.isError || item.group.status === 'error')
+      && !item.group.calls.some(call => call.isError || call.status === 'error')
+    const calls = item.group.calls
+      .filter(call => !createdSessionCallIds.value.has(call.toolId))
+      .map(call => groupFailure ? { ...call, isError: true, status: 'error' as const } : call)
+    if (!calls.length) return []
+    return [{ ...item, group: { ...item.group, calls } }]
   })
 }
 
@@ -931,8 +929,7 @@ const visibleActivityCallKeys = computed(() => new Set(
 ))
 const visibleActivityClusters = computed(() =>
   activityProjection.value.activityClusters.filter(cluster =>
-    (!cluster.isFailure || cluster.calls.some(call => isDocumentAgentToolName(call.name)))
-    && cluster.calls.some(call => visibleActivityCallKeys.value.has(call.renderKey)),
+    cluster.calls.some(call => visibleActivityCallKeys.value.has(call.renderKey)),
   ),
 )
 const visibleActivityStatusSteps = computed(() =>
@@ -975,12 +972,11 @@ const showActivityDisclosure = computed(() =>
   || props.message.activitySnapshotIncomplete === true,
 )
 
-const documentWriterFailureCount = computed(() =>
+const toolFailureCount = computed(() =>
   visibleActivityItems.value.reduce((count, item) => {
     if (item.type !== 'tool-group') return count
     return count + item.group.calls.filter(call =>
-      isDocumentWriterToolName(call.name)
-      && (call.isError || call.status === 'error'),
+      call.isError || call.status === 'error',
     ).length
   }, 0),
 )
@@ -1156,12 +1152,6 @@ const activitySummaryLabel = computed(() => {
       activityCompactElapsedLabel.value,
     ].filter(Boolean).join(' · '))
   }
-  if (documentWriterFailureCount.value > 0) {
-    return withMaintenanceSummary([
-      String(t('sessions.status.failed')),
-      activityCompactElapsedLabel.value,
-    ].filter(Boolean).join(' · '))
-  }
   if (outcomePresentation.value !== 'completed') {
     const label = String(t({
       stopped: 'sessions.status.cancelled',
@@ -1173,6 +1163,12 @@ const activitySummaryLabel = computed(() => {
     return withMaintenanceSummary(
       [label, activityCompactElapsedLabel.value].filter(Boolean).join(' · '),
     )
+  }
+  if (activityLifecycle.value === 'failed') {
+    return withMaintenanceSummary([
+      String(t('sessions.status.failed')),
+      activityCompactElapsedLabel.value,
+    ].filter(Boolean).join(' · '))
   }
   if (activityCompletionConfirmed.value) {
     return withMaintenanceSummary([

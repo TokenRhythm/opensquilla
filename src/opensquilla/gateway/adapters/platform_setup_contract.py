@@ -8,6 +8,7 @@ from typing import Any, Final
 from opensquilla.gateway.adapters._generated_contract_bindings import (
     generated_contract_bindings,
     register_generated_contract_binding,
+    validate_generated_contract_params,
 )
 from opensquilla.gateway.adapters.contract_method import (
     ErrorFactory,
@@ -25,6 +26,7 @@ PLATFORM_SETUP_CONTRACT_METHODS: Final = (
     "onboarding.provider.credential.reveal",
     "onboarding.provider.credential.clear",
     "onboarding.llmProfile.upsert",
+    "onboarding.llmProfile.upsertAndActivate",
     "onboarding.llmProfile.activate",
     "onboarding.llmProfile.remove",
     "onboarding.llmProfile.active.remove",
@@ -58,6 +60,10 @@ _BINDINGS: Final = generated_contract_bindings(
 )
 
 
+def validate_upsert_and_activate_params(params: Any) -> dict[str, Any]:
+    return validate_generated_contract_params("onboarding.llmProfile.upsertAndActivate", params)
+
+
 def register_platform_setup_contract[ContextT, ResultT](
     registry: MethodRegistry[ContextT],
     method: str,
@@ -81,4 +87,5 @@ __all__ = [
     "PLATFORM_SETUP_CONTRACT_METHODS",
     "PlatformSetupContractError",
     "register_platform_setup_contract",
+    "validate_upsert_and_activate_params",
 ]

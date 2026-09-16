@@ -41,6 +41,7 @@ import {
 } from './sessionHistoryV4'
 import {
   SessionReadContractError,
+  SessionReadFailure,
   type SessionReadActivity,
   type SessionReadHistoryPage,
   type SessionReadJsonObject,
@@ -53,6 +54,13 @@ import {
   type SessionReadSnapshot,
 } from '@/modules/sessionReadLifecycle'
 import { mapSessionReadError } from './sessionReadErrorMapping'
+import { SESSIONS_MESSAGES_SNAPSHOT_READ_METHOD } from '@/contracts/generated/v4/sessionsMessagesSnapshotRead'
+import {
+  readV4SessionSnapshot,
+  type StagedSessionSnapshot,
+  type SnapshotDeliveryReceipt,
+  type SnapshotInstalledReceipt,
+} from './sessionSnapshotReadV4'
 
 const READY_TIMEOUT_MS = 15_000
 const READ_TIMEOUT_MS = 15_000
@@ -72,6 +80,9 @@ interface SessionReadV4Transport {
     abortAction?: 'reject' | 'reconnect'
   }): Promise<void>
   readonly generation: number
+  supports?(method: string): boolean
+  acknowledgeDelivery?(receipt: SnapshotDeliveryReceipt): Promise<void> | void
+  resumeFlow?(receipt: SnapshotInstalledReceipt): Promise<void> | void
 }
 
 export interface SessionReadV4AdapterOptions {
@@ -80,6 +91,10 @@ export interface SessionReadV4AdapterOptions {
 }
 
 type MetadataWire = SessionsMessagesSubscribeResult | SessionsMessagesHydrateResult
+type PendingUserInputsReadCursor = Pick<
+  SessionsMessagesSubscribeResult,
+  'stream_generation' | 'current_stream_seq'
+>
 
 interface SentLatch {
   readonly promise: Promise<number>
@@ -94,6 +109,7 @@ interface OpenContext {
   readonly metadata: Promise<SessionReadMetadata>
   readHistory(request: SessionReadPortHistoryRequest): Promise<SessionReadHistoryPage>
   retryMetadata(): Promise<SessionReadMetadata>
+  reconcile(): Promise<SessionReadPortLive>
 }
 
 function sentLatch(): SentLatch {
@@ -195,6 +211,15 @@ function objectValue(value: unknown): Record<string, unknown> | null {
     : null
 }
 
+function canonicalSessionMetadata(value: unknown): unknown {
+  const result = objectValue(value)
+  const lock = objectValue(result?.run_mode_lock)
+  // Protocol 3 encodes Safe as "trusted". Decode only that wire alias;
+  // all other fields and invalid values still go through strict validation.
+  if (!result || lock?.runMode !== 'trusted') return value
+  return { ...result, run_mode_lock: { ...lock, runMode: 'safe' } }
+}
+
 function projectJson(value: unknown): unknown {
   if (Array.isArray(value)) return Object.freeze(value.map(projectJson))
   const item = objectValue(value)
@@ -273,7 +298,10 @@ const METADATA_FIELDS = new Set([
   'replayed_count',
 ])
 
-function projectMetadata(value: MetadataWire): SessionReadMetadata {
+function projectMetadata(
+  value: MetadataWire,
+  readCursor?: PendingUserInputsReadCursor,
+): SessionReadMetadata {
   const lock = value.run_mode_lock
   const raw = value as unknown as Record<string, unknown>
   const rawLock = lock as unknown as Record<string, unknown>
@@ -302,6 +330,10 @@ function projectMetadata(value: MetadataWire): SessionReadMetadata {
     runStatus: value.run_status,
     queuedTaskIds: Object.freeze([...(value.queued_task_ids ?? [])]),
     epoch: numberValue(value.epoch),
+    pendingUserInputsCursor: Object.freeze({
+      streamGeneration: textValue(raw.stream_generation) ?? readCursor?.stream_generation ?? null,
+      currentStreamSeq: numberValue(raw.current_stream_seq) ?? readCursor?.current_stream_seq ?? null,
+    }),
     hydrationComplete: value.hydration_complete,
     deferredFields: Object.freeze([...value.deferred_fields]),
     additional: additionalFields(raw, METADATA_FIELDS),
@@ -331,6 +363,8 @@ function projectSnapshot(value: SessionsMessagesSnapshotResult): SessionReadSnap
   return Object.freeze({
     sessionKey: value.key,
     taskId: value.task_id,
+    streamGeneration: value.stream_generation,
+    currentStreamSeq: value.current_stream_seq,
     events: Object.freeze(value.events.flatMap(event => {
       const projected = projectConversationSnapshotEvent(event.event, projectObject(event.payload))
       return projected ? [Object.freeze({ ...projected, payload: Object.freeze(projected.payload) })] : []
@@ -343,6 +377,7 @@ async function hydrate(
   sessionKey: string,
   signal: AbortSignal,
   expectedGeneration: number,
+  readCursor: PendingUserInputsReadCursor,
 ): Promise<SessionReadMetadata> {
   const params: SessionsMessagesHydrateParams = { key: sessionKey }
   requireParams(SESSIONS_MESSAGES_HYDRATE_METHOD, params, validateSessionsMessagesHydrateParams)
@@ -358,11 +393,13 @@ async function hydrate(
   }
   const result = requireResult<SessionsMessagesHydrateResult>(
     SESSIONS_MESSAGES_HYDRATE_METHOD,
-    raw,
+    canonicalSessionMetadata(raw),
     validateSessionsMessagesHydrateResult,
   )
   if (result.key !== sessionKey) throw invalidContract(SESSIONS_MESSAGES_HYDRATE_METHOD)
-  return projectMetadata(result)
+  // Hydration does not carry its own cursor. A preceding confirmed read is
+  // a lower bound, so a delayed empty snapshot cannot erase a newer live input.
+  return projectMetadata(result, readCursor)
 }
 
 async function optionalSnapshot(
@@ -372,11 +409,15 @@ async function optionalSnapshot(
   expectedGeneration: number,
   latch: SentLatch,
 ): Promise<SessionsMessagesSnapshotResult | null> {
+  let sentGeneration: number | null = null
   try {
     const raw = await rpc.request(
       SESSIONS_MESSAGES_SNAPSHOT_METHOD,
       params,
-      callOptions(signal, SNAPSHOT_TIMEOUT_MS, expectedGeneration, latch.sent),
+      callOptions(signal, SNAPSHOT_TIMEOUT_MS, expectedGeneration, generation => {
+        sentGeneration = generation
+        latch.sent(generation)
+      }),
     )
     return requireResult<SessionsMessagesSnapshotResult>(
       SESSIONS_MESSAGES_SNAPSHOT_METHOD,
@@ -391,6 +432,17 @@ async function optionalSnapshot(
       return null
     }
     const projected = mapSessionReadError(error)
+    if (
+      projected instanceof SessionReadFailure
+      && projected.kind === 'timeout'
+      && sentGeneration === expectedGeneration
+      && rpc.generation === expectedGeneration
+      && !signal.aborted
+    ) {
+      // A sent snapshot can miss its own deadline without invalidating the
+      // independently acknowledged live subscription or its replay cursor.
+      return null
+    }
     latch.failed(projected)
     throw projected
   }
@@ -453,6 +505,31 @@ export function createV4SessionReadPort(
 
         const subscribeSent = sentLatch()
         const snapshotSent = sentLatch()
+        let stagedSnapshot: StagedSessionSnapshot | null = null
+        async function readSnapshot(latch: SentLatch): Promise<SessionsMessagesSnapshotResult | null> {
+          if (!rpc.supports?.(SESSIONS_MESSAGES_SNAPSHOT_READ_METHOD)) {
+            return optionalSnapshot(rpc, snapshotParams, request.signal, expectedGeneration, latch)
+          }
+          try {
+            const staged = await readV4SessionSnapshot(
+              rpc, request.sessionKey, request.signal, expectedGeneration, latch.sent,
+            )
+            stagedSnapshot = staged
+            return staged.value
+          } catch (error) {
+            latch.failed(error)
+            throw mapSessionReadError(error)
+          }
+        }
+        function assertSnapshotIdentity(metadata: SessionReadMetadata) {
+          if (!stagedSnapshot) return
+          const sessionId = textValue(metadata.additional.session_id, metadata.additional.sessionId)
+          if ((metadata.epoch !== null && metadata.epoch !== stagedSnapshot.sessionEpoch)
+            || (sessionId !== null && sessionId !== stagedSnapshot.sessionId)) {
+            throw new SessionReadContractError('Session snapshot identity changed during reconciliation.')
+          }
+        }
+        let acknowledgedSubscription: SessionsMessagesSubscribeResult | null = null
         const subscribePromise = rpc.request(
           SESSIONS_MESSAGES_SUBSCRIBE_METHOD,
           subscribeParams,
@@ -467,25 +544,20 @@ export function createV4SessionReadPort(
           ),
         ).then(raw => requireResult<SessionsMessagesSubscribeResult>(
           SESSIONS_MESSAGES_SUBSCRIBE_METHOD,
-          raw,
+          canonicalSessionMetadata(raw),
           validateSessionsMessagesSubscribeResult,
         )).then(result => {
           if (result.key !== request.sessionKey || !result.subscribed) {
             throw invalidContract(SESSIONS_MESSAGES_SUBSCRIBE_METHOD)
           }
+          acknowledgedSubscription = result
           return result
         }).catch(error => {
           const projected = subscriptionError(error)
           subscribeSent.failed(projected)
           throw projected
         })
-        const snapshotPromise = optionalSnapshot(
-          rpc,
-          snapshotParams,
-          request.signal,
-          expectedGeneration,
-          snapshotSent,
-        ).then(result => {
+        const snapshotPromise = readSnapshot(snapshotSent).then(result => {
           if (result && result.key !== request.sessionKey) {
             throw invalidContract(SESSIONS_MESSAGES_SNAPSHOT_METHOD)
           }
@@ -535,12 +607,15 @@ export function createV4SessionReadPort(
           subscribePromise,
           snapshotPromise,
           criticalRequestsQueued,
-        ]).then(([subscription, snapshot]) => Object.freeze({
+        ]).then(([subscription, snapshot]) => {
+          assertSnapshotIdentity(projectMetadata(subscription))
+          return Object.freeze({
           sessionKey: request.sessionKey,
           activity: activity(subscription, snapshot),
           activeTaskId: snapshot?.task_id ?? activeTaskId(subscription),
           initialMetadata: projectMetadata(subscription),
           snapshot: snapshot ? projectSnapshot(snapshot) : null,
+          confirmInstalled: stagedSnapshot?.confirmInstalled,
           cursor: Object.freeze({
             sessionKey: request.sessionKey,
             sessionEpoch: subscription.epoch,
@@ -557,7 +632,8 @@ export function createV4SessionReadPort(
                 currentStreamSeq: snapshot.current_stream_seq,
               })
             : null,
-        } satisfies SessionReadPortLive))
+        } satisfies SessionReadPortLive)
+        })
         void live.catch(() => {})
 
         const metadata = subscribePromise.then(subscription => {
@@ -567,6 +643,7 @@ export function createV4SessionReadPort(
             request.sessionKey,
             request.signal,
             expectedGeneration,
+            subscription,
           ))
         })
         void metadata.catch(() => {})
@@ -574,6 +651,74 @@ export function createV4SessionReadPort(
 
         let initialHistoryAvailable = initialHistory !== null
         let retry: Promise<SessionReadMetadata> | null = null
+        let reconciliation: Promise<SessionReadPortLive> | null = null
+
+        function reconcile(): Promise<SessionReadPortLive> {
+          if (closed || request.signal.aborted) return Promise.reject(abortError())
+          if (reconciliation) return reconciliation
+          const current = (async (): Promise<SessionReadPortLive> => {
+            if (rpc.generation !== expectedGeneration) throw abortError('The connection generation changed.')
+            // An initial subscribe response can be lost although registration
+            // succeeded. Repeating that idempotent registration is safe; an
+            // established subscription never takes the unsubscribe/open path.
+            if (!acknowledgedSubscription) {
+              const raw = await rpc.request(
+                SESSIONS_MESSAGES_SUBSCRIBE_METHOD,
+                subscribeParams,
+                callOptions(request.signal, READ_TIMEOUT_MS, expectedGeneration, generation => { subscribedGeneration = generation }),
+              )
+              const subscription = requireResult<SessionsMessagesSubscribeResult>(
+                SESSIONS_MESSAGES_SUBSCRIBE_METHOD, canonicalSessionMetadata(raw), validateSessionsMessagesSubscribeResult,
+              )
+              if (subscription.key !== request.sessionKey || !subscription.subscribed) {
+                throw invalidContract(SESSIONS_MESSAGES_SUBSCRIBE_METHOD)
+              }
+              acknowledgedSubscription = subscription
+            }
+            const snapshot = await readSnapshot(sentLatch())
+            if (snapshot && snapshot.key !== request.sessionKey) {
+              throw invalidContract(SESSIONS_MESSAGES_SNAPSHOT_METHOD)
+            }
+            const subscription = acknowledgedSubscription
+            // The completed snapshot precedes this hydration and is its latest
+            // known lower bound. Reusing only the initial subscribe cursor could
+            // keep old questions actionable forever after a missed terminal.
+            // Legacy Gateways without snapshots retain the conservative bound.
+            const metadata = await hydrate(
+              rpc, request.sessionKey, request.signal, expectedGeneration, snapshot ?? subscription,
+            )
+            assertSnapshotIdentity(metadata)
+            if (closed || request.signal.aborted || rpc.generation !== expectedGeneration) throw abortError()
+            initialHistoryAvailable = false
+            return Object.freeze({
+              sessionKey: request.sessionKey,
+              activity: activity({ ...subscription, run_status: metadata.runStatus,
+                active_task_group_ids: [...metadata.activeTaskGroupIds] } as MetadataWire, snapshot),
+              activeTaskId: snapshot?.task_id ?? textValue(metadata.activeTask?.task_id, metadata.activeTask?.taskId),
+              initialMetadata: metadata,
+              snapshot: snapshot ? projectSnapshot(snapshot) : null,
+              confirmInstalled: stagedSnapshot?.confirmInstalled,
+              cursor: Object.freeze({
+                sessionKey: request.sessionKey,
+                sessionEpoch: metadata.epoch,
+                streamGeneration: snapshot?.stream_generation ?? subscription.stream_generation,
+                currentStreamSeq: snapshot?.current_stream_seq ?? subscription.current_stream_seq,
+                replayComplete: true,
+              }),
+              snapshotCursor: snapshot ? Object.freeze({
+                sessionKey: request.sessionKey,
+                sessionEpoch: metadata.epoch,
+                streamGeneration: snapshot.stream_generation,
+                currentStreamSeq: snapshot.current_stream_seq,
+              }) : null,
+            })
+          })().catch(error => { throw mapSessionReadError(error) })
+          const observed = current.finally(() => {
+            if (reconciliation === observed) reconciliation = null
+          })
+          reconciliation = observed
+          return observed
+        }
 
         async function readHistory(
           historyRequest: SessionReadPortHistoryRequest,
@@ -607,11 +752,15 @@ export function createV4SessionReadPort(
         function retryMetadata(): Promise<SessionReadMetadata> {
           if (closed || request.signal.aborted) return Promise.reject(abortError())
           if (retry) return retry
-          const current = criticalRequestsQueued.then(() => hydrate(
+          const current = Promise.all([
+            criticalRequestsQueued,
+            subscribePromise,
+          ]).then(([, subscription]) => hydrate(
             rpc,
             request.sessionKey,
             request.signal,
             expectedGeneration,
+            subscription,
           ))
           const observed = current.finally(() => {
             if (retry === observed) retry = null
@@ -628,6 +777,7 @@ export function createV4SessionReadPort(
           metadata,
           readHistory,
           retryMetadata,
+          reconcile,
         }
       })().catch(error => {
         throw mapSessionReadError(error)
@@ -675,6 +825,7 @@ export function createV4SessionReadPort(
         metadata: setup.then(context => context.metadata),
         readHistory: historyRead,
         retryMetadata: () => setup.then(context => context.retryMetadata()),
+        reconcile: () => setup.then(context => context.reconcile()),
         close,
       })
     },

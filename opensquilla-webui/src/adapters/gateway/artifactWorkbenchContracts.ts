@@ -41,26 +41,6 @@ import {
 } from '@/contracts/generated/v4/artifactsMutationsResolve'
 import { validateResult as validateArtifactsMutationsResolve } from '@/contracts/generated/v4/artifactsMutationsResolveValidators.mjs'
 import {
-  ARTIFACTS_PROMPT_ANNOTATIONS_CREATE_METHOD,
-} from '@/contracts/generated/v4/artifactsPromptAnnotationsCreate'
-import { validateResult as validatePromptAnnotationsCreate } from '@/contracts/generated/v4/artifactsPromptAnnotationsCreateValidators.mjs'
-import {
-  ARTIFACTS_PROMPT_ANNOTATIONS_DISCARD_METHOD,
-} from '@/contracts/generated/v4/artifactsPromptAnnotationsDiscard'
-import { validateResult as validatePromptAnnotationsDiscard } from '@/contracts/generated/v4/artifactsPromptAnnotationsDiscardValidators.mjs'
-import {
-  ARTIFACTS_PROMPT_ANNOTATIONS_FOCUS_METHOD,
-} from '@/contracts/generated/v4/artifactsPromptAnnotationsFocus'
-import { validateResult as validatePromptAnnotationsFocus } from '@/contracts/generated/v4/artifactsPromptAnnotationsFocusValidators.mjs'
-import {
-  ARTIFACTS_PROMPT_ANNOTATIONS_LIST_METHOD,
-} from '@/contracts/generated/v4/artifactsPromptAnnotationsList'
-import { validateResult as validatePromptAnnotationsList } from '@/contracts/generated/v4/artifactsPromptAnnotationsListValidators.mjs'
-import {
-  ARTIFACTS_PROMPT_ANNOTATIONS_UPDATE_METHOD,
-} from '@/contracts/generated/v4/artifactsPromptAnnotationsUpdate'
-import { validateResult as validatePromptAnnotationsUpdate } from '@/contracts/generated/v4/artifactsPromptAnnotationsUpdateValidators.mjs'
-import {
   ARTIFACTS_REVISIONS_LIST_METHOD,
 } from '@/contracts/generated/v4/artifactsRevisionsList'
 import { validateResult as validateArtifactsRevisionsList } from '@/contracts/generated/v4/artifactsRevisionsListValidators.mjs'
@@ -69,10 +49,6 @@ import {
 } from '@/contracts/generated/v4/artifactsRevisionsRestore'
 import { validateResult as validateArtifactsRevisionsRestore } from '@/contracts/generated/v4/artifactsRevisionsRestoreValidators.mjs'
 import {
-  ARTIFACTS_SOURCE_PATCH_METHOD,
-} from '@/contracts/generated/v4/artifactsSourcePatch'
-import { validateResult as validateArtifactsSourcePatch } from '@/contracts/generated/v4/artifactsSourcePatchValidators.mjs'
-import {
   ARTIFACTS_SOURCE_READ_METHOD,
 } from '@/contracts/generated/v4/artifactsSourceRead'
 import { validateResult as validateArtifactsSourceRead } from '@/contracts/generated/v4/artifactsSourceReadValidators.mjs'
@@ -80,18 +56,6 @@ import {
   DOCUMENT_STATE_CHANGED_EVENT_METADATA,
 } from '@/contracts/generated/v4/artifactDocumentChangedEvent'
 import { validatePayload as validateDocumentStateChangedPayload } from '@/contracts/generated/v4/artifactDocumentChangedEventValidators.mjs'
-import {
-  DOCUMENTS_EDIT_SESSIONS_CLOSE_METHOD,
-} from '@/contracts/generated/v4/documentsEditSessionsClose'
-import { validateResult as validateEditSessionsClose } from '@/contracts/generated/v4/documentsEditSessionsCloseValidators.mjs'
-import {
-  DOCUMENTS_EDIT_SESSIONS_HEARTBEAT_METHOD,
-} from '@/contracts/generated/v4/documentsEditSessionsHeartbeat'
-import { validateResult as validateEditSessionsHeartbeat } from '@/contracts/generated/v4/documentsEditSessionsHeartbeatValidators.mjs'
-import {
-  DOCUMENTS_EDIT_SESSIONS_START_METHOD,
-} from '@/contracts/generated/v4/documentsEditSessionsStart'
-import { validateResult as validateEditSessionsStart } from '@/contracts/generated/v4/documentsEditSessionsStartValidators.mjs'
 import { DOCUMENTS_IMPORT_METHOD } from '@/contracts/generated/v4/documentsImport'
 import { validateResult as validateDocumentsImport } from '@/contracts/generated/v4/documentsImportValidators.mjs'
 import { DOCUMENTS_PUBLISH_METHOD } from '@/contracts/generated/v4/documentsPublish'
@@ -136,23 +100,8 @@ export const artifactDocumentContracts = {
   changesGet: descriptor(ARTIFACTS_CHANGES_GET_METHOD, validateArtifactsChangesGet),
   changesRevert: descriptor(ARTIFACTS_CHANGES_REVERT_METHOD, validateArtifactsChangesRevert),
   sourceRead: descriptor(ARTIFACTS_SOURCE_READ_METHOD, validateArtifactsSourceRead),
-  sourcePatch: descriptor(ARTIFACTS_SOURCE_PATCH_METHOD, validateArtifactsSourcePatch),
   mutationResolve: descriptor(ARTIFACTS_MUTATIONS_RESOLVE_METHOD, validateArtifactsMutationsResolve),
-  editSessionStart: descriptor(DOCUMENTS_EDIT_SESSIONS_START_METHOD, validateEditSessionsStart),
-  editSessionHeartbeat: descriptor(
-    DOCUMENTS_EDIT_SESSIONS_HEARTBEAT_METHOD,
-    validateEditSessionsHeartbeat,
-  ),
-  editSessionClose: descriptor(DOCUMENTS_EDIT_SESSIONS_CLOSE_METHOD, validateEditSessionsClose),
   legacyGet: descriptor(ARTIFACTS_GET_METHOD, validateArtifactsGet),
-} as const
-
-export const promptAnnotationContracts = {
-  create: descriptor(ARTIFACTS_PROMPT_ANNOTATIONS_CREATE_METHOD, validatePromptAnnotationsCreate),
-  list: descriptor(ARTIFACTS_PROMPT_ANNOTATIONS_LIST_METHOD, validatePromptAnnotationsList),
-  update: descriptor(ARTIFACTS_PROMPT_ANNOTATIONS_UPDATE_METHOD, validatePromptAnnotationsUpdate),
-  discard: descriptor(ARTIFACTS_PROMPT_ANNOTATIONS_DISCARD_METHOD, validatePromptAnnotationsDiscard),
-  focus: descriptor(ARTIFACTS_PROMPT_ANNOTATIONS_FOCUS_METHOD, validatePromptAnnotationsFocus),
 } as const
 
 export const workbenchResourceContracts = {

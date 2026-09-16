@@ -21,7 +21,6 @@ TURN_ADMISSION_CONTRACT_METHODS: Final = (
     "sessions.send",
     "sessions.abort",
     "sessions.steer.v2",
-    "sessions.steer",
 )
 
 

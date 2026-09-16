@@ -50,15 +50,3 @@ class AdmissionPlanSessionBusyError(RuntimeError):
 
 class AdmissionPlanConflictError(RuntimeError):
     """A plan revision or its execution overlay changed before acceptance."""
-
-
-class AdmissionAnnotationConflictError(RuntimeError):
-    """The bound annotation revision changed before acceptance."""
-
-
-class AdmissionAnnotationNotFoundError(RuntimeError):
-    """The bound annotation disappeared before acceptance."""
-
-
-class AdmissionAnnotationValidationError(ValueError):
-    """The annotation cannot be accepted in its current state."""
