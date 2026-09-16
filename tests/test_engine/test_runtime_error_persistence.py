@@ -12,6 +12,7 @@ from opensquilla.engine.types import ErrorEvent
 from opensquilla.provider import DoneEvent as ProviderDone
 from opensquilla.provider import TextDeltaEvent as ProviderText
 from opensquilla.session.storage import StaleEpochError
+from opensquilla.session.terminal_reply import CONTEXT_PAYLOAD_TOO_LARGE_MESSAGES
 from opensquilla.tools.types import CallerKind, ToolContext
 
 
@@ -139,6 +140,22 @@ async def test_provider_request_too_large_error_persistence_does_not_compact_tra
             "or a larger-context model.",
         )
     ]
+
+
+@pytest.mark.parametrize("message", CONTEXT_PAYLOAD_TOO_LARGE_MESSAGES.values())
+async def test_specific_request_budget_reason_survives_error_persistence(message: str) -> None:
+    manager = _RecordingSessionManager()
+    runner = TurnRunner(
+        provider_selector=None, session_manager=manager,
+        config=SimpleNamespace(context_window_tokens=100_000),
+    )
+
+    await runner._persist_turn_error(
+        "agent:main:webchat:test", ErrorEvent(message=message, code="provider_request_too_large"),
+    )
+
+    assert manager.compact_calls == []
+    assert manager.messages == [("agent:main:webchat:test", "system", f"Error: {message}")]
 
 
 @pytest.mark.asyncio

@@ -21,10 +21,10 @@
       {{ maintenance.detail }}
     </span>
     <span
-      v-else-if="maintenance?.durability === 'request_scoped'"
+      v-else-if="detailLabelCode"
       class="chat-compaction-event__detail"
     >
-      {{ t('chat.compact.requestScoped') }}
+      {{ t(detailLabelCode) }}
     </span>
     <time v-if="message.timeStr" class="chat-compaction-event__detail">
       {{ message.timeStr }}
@@ -36,7 +36,10 @@
 import { computed } from 'vue'
 import { useI18n } from 'vue-i18n'
 import type { ChatRenderedMessage } from '@/types/chat'
-import { compactionSkippedLabelCode } from '@/utils/chat/compactionStatus'
+import {
+  compactionCompletedLabelCode,
+  compactionSkippedLabelCode,
+} from '@/utils/chat/compactionStatus'
 
 const props = defineProps<{
   message: ChatRenderedMessage
@@ -53,12 +56,16 @@ const labelCode = computed(() => {
   if (maintenance.value?.state === 'stale' || maintenance.value?.state === 'cancelled') {
     return 'chat.compact.cancelled'
   }
+  return compactionCompletedLabelCode(maintenance.value?.durability)
+})
+const detailLabelCode = computed(() => {
+  if (maintenance.value?.durability === 'request_scoped') return 'chat.compact.requestScoped'
   if (maintenance.value?.historyArchived) {
     if (maintenance.value.canonicalComplete === true) return 'chat.compact.historyPreserved'
     if (maintenance.value.canonicalComplete === false) return 'chat.compact.historyIncomplete'
     return 'chat.compact.historySummarized'
   }
-  return 'chat.compact.compacted'
+  return ''
 })
 const liveRole = computed(() => {
   if (props.message.restoredFromHistory) return undefined

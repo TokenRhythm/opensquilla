@@ -100,6 +100,11 @@ RECENTLY_ADDED_ACTIVE_TESTS = {
     "tests/test_engine/test_agent_image_compaction_budget.py",
     "tests/test_provider_request_proof_images.py",
     "tests/test_session/test_compaction_media_budget.py",
+    # New compaction recovery suites use the provisional floor until a
+    # comparable three-run Windows duration refresh supplies timings.
+    "tests/test_engine/test_request_window.py",
+    "tests/test_engine/test_runtime_request_window.py",
+    "tests/test_session/test_compaction_integrity.py",
     # Artifact source/version regressions use the declared provisional floor.
     "tests/test_engine/test_artifact_delivery_sources.py",
     "tests/test_engine/test_runtime_artifact_context.py",

@@ -4218,6 +4218,8 @@
     "compact": {
       "compacting": "Organizing context…",
       "compacted": "Context organized",
+      "temporarilyReduced": "History temporarily reduced; continuing",
+      "summarySaved": "Summary saved",
       "historyPreserved": "Earlier context summarized; original messages remain available in history",
       "historyIncomplete": "Earlier context summarized; some original messages are unavailable",
       "historySummarized": "Earlier context summarized",

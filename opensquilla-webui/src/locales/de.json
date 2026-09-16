@@ -4133,6 +4133,8 @@
     "compact": {
       "compacting": "Kontext wird verdichtet",
       "compacted": "Kontext verdichtet",
+      "temporarilyReduced": "Verlauf vorübergehend gekürzt; Verarbeitung wird fortgesetzt",
+      "summarySaved": "Zusammenfassung gespeichert",
       "historyPreserved": "Früherer Kontext zusammengefasst; Originalnachrichten bleiben im Verlauf verfügbar",
       "historyIncomplete": "Früherer Kontext zusammengefasst; einige Originalnachrichten sind nicht verfügbar",
       "historySummarized": "Früherer Kontext zusammengefasst",

@@ -220,6 +220,7 @@ async def test_aborted_direct_turn_closes_real_runner_scopes(
             self._router_control_hold_store = None
             self._session_lock_provider = lambda _key: lock
             self._turn_compaction_attempted_sessions = set()
+            self._turn_compaction_failed_sessions = set()
             self._turn_compacted_sessions = set()
             self.stream: AsyncIterator[AgentEvent] | None = None
 
