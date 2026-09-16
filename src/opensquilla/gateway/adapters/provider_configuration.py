@@ -185,13 +185,19 @@ class GatewayModelCatalogPort:
                 if selected:
                     install_custom_capacity(catalog, identity, provider, selected)
             projected = [model_info_to_projection(item) for item in items]
+            # Only custom endpoint rows need the shared capacity enrichment.
+            # Other providers can carry credential-scoped snapshot limits that
+            # must not be replaced by a different deployment's catalog entry.
             capacities = resolve_model_capacities(catalog, self._config, [
                 {"provider": str(item["provider"]), "model": str(item["id"])}
                 for item in projected
+                if item["provider"].strip().lower() in identities
             ])["models"]
             by_key = {(row["provider"], row["model"]): row for row in capacities}
             for item in projected:
-                limits = by_key[(item["provider"].strip().lower(), item["id"].strip())]
+                limits = by_key.get((item["provider"].strip().lower(), item["id"].strip()))
+                if limits is None:
+                    continue
                 item["contextWindow"] = limits["contextWindow"]["value"]
                 item["maxOutputTokens"] = limits["maxOutputTokens"]["value"]
             return projected
