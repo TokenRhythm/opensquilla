@@ -11,9 +11,11 @@ import sys
 import threading
 import time
 from collections.abc import Callable
+from typing import NoReturn
 
 import structlog
 import typer
+from pydantic import ValidationError
 
 from opensquilla.cli.gateway_lifecycle import (
     DESKTOP_CONFIG_OUTSIDE_PROFILE,
@@ -22,6 +24,11 @@ from opensquilla.cli.gateway_lifecycle import (
     desktop_config_path_is_profile_local,
     desktop_profile_lifecycle_active,
     remote_gateway_status,
+)
+from opensquilla.cli.port_validation import (
+    GATEWAY_PORT_MESSAGE,
+    has_gateway_port_error,
+    validate_gateway_port,
 )
 from opensquilla.cli.ui import ACCENT_MARKUP, console
 from opensquilla.gateway.boot import (
@@ -160,9 +167,41 @@ def _gateway_bind_available(host: str, port: int) -> bool:
     return False if last_error is not None else True
 
 
-def _load_gateway_config(config_path: str | None, *, read_only: bool = False) -> GatewayConfig:
+def _invalid_gateway_port(*, action: str, json_output: bool) -> NoReturn:
+    if json_output:
+        typer.echo(json.dumps({
+            "ok": False,
+            "action": action,
+            "state": f"{action}_failed",
+            "code": "INVALID_PORT",
+            "message": GATEWAY_PORT_MESSAGE,
+        }))
+    else:
+        typer.echo(f"Error: {GATEWAY_PORT_MESSAGE}", err=True)
+    raise typer.Exit(code=2)
+
+
+def _check_gateway_port(port: int | None, *, action: str, json_output: bool) -> None:
+    if port is not None:
+        try:
+            validate_gateway_port(port)
+        except ValidationError:
+            _invalid_gateway_port(action=action, json_output=json_output)
+
+
+def _load_gateway_config(
+    config_path: str | None,
+    *,
+    read_only: bool = False,
+    action: str = "run",
+    json_output: bool = False,
+) -> GatewayConfig:
     try:
         return GatewayConfig.load(config_path, read_only=read_only)
+    except ValidationError as exc:
+        if not has_gateway_port_error(exc):
+            raise
+        _invalid_gateway_port(action=action, json_output=json_output)
     except ConfigParseError as exc:
         console.print(f"[red]Invalid gateway config:[/red] {exc}")
         console.print(
@@ -191,6 +230,7 @@ def run_gateway(
     matching what the field name promises.
     """
     gateway_startup_started_at = time.monotonic()
+    _check_gateway_port(port, action="run", json_output=False)
     requested_config = config_path or os.environ.get("OPENSQUILLA_GATEWAY_CONFIG_PATH")
     if not desktop_config_path_is_profile_local(requested_config):
         console.print("DESKTOP_CONFIG_OUTSIDE_PROFILE")
@@ -446,10 +486,15 @@ def _lifecycle_manager(
     config_path: str | None = None,
     health_timeout: float = 60.0,
     shutdown_timeout: float = 10.0,
+    action: str = "start",
+    json_output: bool = False,
 ) -> GatewayLifecycleManager:
+    _check_gateway_port(port, action=action, json_output=json_output)
     config = _load_gateway_config(
         config_path or os.environ.get("OPENSQUILLA_GATEWAY_CONFIG_PATH"),
         read_only=desktop_profile_lifecycle_active(),
+        action=action,
+        json_output=json_output,
     )
     host = _resolve_lifecycle_host(bind=bind or "127.0.0.1", listen=listen)
     if not listen and (bind is None or bind == "127.0.0.1"):
@@ -492,6 +537,8 @@ def start_gateway(
         listen=listen,
         config_path=config_path,
         health_timeout=health_timeout,
+        action="start",
+        json_output=json_output,
     )
     _emit_lifecycle_result(manager.start(), json_output=json_output)
 
@@ -506,11 +553,15 @@ def status_gateway(
 ) -> None:
     """Inspect the managed gateway process without mutating state."""
 
+    _check_gateway_port(port, action="status", json_output=json_output)
     if gateway_url:
         _emit_lifecycle_result(remote_gateway_status(gateway_url), json_output=json_output)
         return
 
-    manager = _lifecycle_manager(port=port, bind=bind, listen=listen, config_path=config_path)
+    manager = _lifecycle_manager(
+        port=port, bind=bind, listen=listen, config_path=config_path,
+        action="status", json_output=json_output,
+    )
     _emit_lifecycle_result(manager.status(), json_output=json_output)
 
 
@@ -536,6 +587,8 @@ def stop_gateway(
         shutdown_timeout=(
             shutdown_timeout if shutdown_timeout is not None else gateway_shutdown_deadline()
         ),
+        action="stop",
+        json_output=json_output,
     )
     _emit_lifecycle_result(manager.stop(), json_output=json_output)
 
@@ -564,6 +617,8 @@ def restart_gateway(
         shutdown_timeout=(
             shutdown_timeout if shutdown_timeout is not None else gateway_shutdown_deadline()
         ),
+        action="restart",
+        json_output=json_output,
     )
     _emit_lifecycle_result(manager.restart(), json_output=json_output)
 
