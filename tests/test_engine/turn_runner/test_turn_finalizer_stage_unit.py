@@ -142,12 +142,14 @@ class _RecordingTurnErrorPersist:
         session_key: str,
         event: ErrorEvent | None,
         append_transcript: bool = True,
+        **context: Any,
     ) -> None:
         self.calls.append(
             {
                 "session_key": session_key,
                 "event": event,
                 "append_transcript": append_transcript,
+                **context,
             }
         )
 
@@ -602,6 +604,8 @@ async def test_terminal_reset_persists_failure_snapshot_and_accounting() -> None
             "session_key": "agent:main:s1",
             "event": error,
             "append_transcript": False,
+            "surface": "user",
+            "fallback_hops": 0,
         }
     ]
     assert recs["session_totals"].calls[0]["done_event"] is done

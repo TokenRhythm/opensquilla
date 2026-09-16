@@ -1510,6 +1510,7 @@
       "tests/test_tools/test_shell_masked_pipeline.py",
       "tests/test_tools/test_tool_upgrade_compatibility.py",
       "tests/test_tools/test_web_fetch.py",
+      "tests/test_tools/test_web_fetch_proxy.py",
       "tests/test_tools/test_web_search_tool.py",
       "tests/test_uninstall/test_actions.py",
       "tests/test_uninstall/test_inventory.py",
