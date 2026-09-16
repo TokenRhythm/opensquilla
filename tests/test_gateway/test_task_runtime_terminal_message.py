@@ -834,6 +834,33 @@ async def test_task_runtime_stream_error_terminal_message_carries_error_ref() ->
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "code", ["timeout", "llm_timeout", "iteration_timeout", "stream_idle_timeout"]
+)
+async def test_timeout_translation_keeps_priority_over_preserved_provider_kind(code: str) -> None:
+    emitted: list[dict[str, Any]] = []
+
+    async def stream():
+        yield ErrorEvent(
+            message="synthetic provider timeout", code=code,
+            failure_kind="transport_transient", error_id="abcd1234",
+        )
+
+    async def emitter(_session: str, _event: str, payload: dict[str, Any]) -> None:
+        emitted.append(payload)
+
+    with pytest.raises(TaskRuntimeStreamError) as raised:
+        await _emit_task_runtime_stream_events(
+            stream(), "agent:main:test", emitter,
+            stream_event_sink=None, idle_timeout=1.0, heartbeat_interval=0.0,
+        )
+    assert raised.value.code == code
+    assert raised.value.terminal_reason == "timeout"
+    assert emitted[0]["message"] == "The task timed out before it could finish. (ref: abcd1234)"
+    assert emitted[0]["turn_outcome"]["failure_kind"] == "transport_transient"
+
+
+@pytest.mark.asyncio
 async def test_task_runtime_stream_error_keeps_failure_kind_internal() -> None:
     emitted: list[tuple[str, str, dict[str, Any]]] = []
 

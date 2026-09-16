@@ -87,6 +87,8 @@ _SAFE_PROVIDER_TERMINAL_CODES = frozenset(
         "invalid_response_status",
         "invalid_stream_frame",
         "invalid_stream_order",
+        "iteration_timeout",
+        "llm_timeout",
         "model_repetition_loop_detected",
         "provider_protocol_error",
         "provider_output_truncated",
@@ -97,6 +99,7 @@ _SAFE_PROVIDER_TERMINAL_CODES = frozenset(
         "request_error",
         "response_incomplete",
         "synthetic_upstream_failure",
+        "stream_idle_timeout",
         "timeout",
         "usage_limit_reached",
     }
@@ -178,7 +181,7 @@ def build_terminal_reply(
     if (
         status == AgentTaskStatus.TIMEOUT.value
         or reason == "timeout"
-        or error_class == "iteration_timeout"
+        or error_class in {"iteration_timeout", "llm_timeout", "stream_idle_timeout", "timeout"}
         or "timeouterror" in error_class
         or "iteration_timeout" in error_message
         or "stream idle" in error_message
