@@ -19,6 +19,7 @@ SKILL_MANAGEMENT_CONTRACT_METHODS: Final = (
     "skills.reload",
     "skills.install",
     "skills.install.cancel",
+    "skills.install.status",
     "skills.deps.install",
     "skills.uninstall",
 )

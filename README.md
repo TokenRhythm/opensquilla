@@ -390,8 +390,8 @@ full reference.
 
 ## Telemetry Privacy
 
-OpenSquilla uses the existing **Network reporting** switch for both telemetry
-streams. Reporting is enabled by default and can be turned off in Privacy
+OpenSquilla uses the existing **Network reporting** switch for V1 statistics and
+both V2 telemetry streams. Reporting is enabled by default and can be turned off in Privacy
 settings, without separate onboarding choices or consent popups:
 
 - **Reliability diagnostics** records bounded operation results for app and
@@ -408,15 +408,20 @@ go to `/v1/reliability/events`; growth events go to `/v1/growth/events`.
 Retries reuse `event_id` for server-side deduplication, and growth events are
 not sampled.
 
-Telemetry never includes prompts, responses, file names, file paths, file
+V2 telemetry never includes prompts, responses, file names, file paths, file
 contents, tool arguments, task parameters, provider configuration, raw account
 IDs, order data, MAC addresses, IP addresses, or device fingerprints. Complete
 crash stacks stay local unless the user explicitly prepares and shares a
 support bundle.
 
-The former automatic `/v1/install` upload, `/v1/usage` daily token aggregate,
-and `X-OpenSquilla-Install-Id` provider header are retired. OpenSquilla no
-longer creates or sends an identifier derived from a MAC address or local IP.
+V1 installation/version reporting at `/v1/install` and daily conversation/token
+totals at `/v1/usage` run alongside V2 after Gateway readiness. Only completed
+UTC days are uploaded; pending days retry hourly. Existing installation state
+is retained. Daily event IDs use a persistent random identity per aggregate
+database to separate profiles while keeping retries stable. V1 retains its pseudonymous installation
+ID derived locally from MAC/IP data, with a persisted random fallback; raw MAC/IP
+values are not uploaded. The `X-OpenSquilla-Install-Id` provider header remains
+retired, and V2 keeps its independent identities.
 
 To force all non-user-initiated network observability off before startup:
 
@@ -431,8 +436,8 @@ or set:
 disable_network_observability = true
 ```
 
-This is a hard veto over both telemetry scopes, passive update checks, and
-automatic desktop update checks. Turning it off pauses pending uploads and
+This is a hard veto over V1 and both V2 telemetry scopes, passive update checks, and
+automatic desktop update checks. Disabling Network reporting pauses pending uploads and
 stops collection without deleting local telemetry state. Previously saved
 per-scope declines are migrated to the unified switch being off; users can
 then change that one setting. CI, test, and `DO_NOT_TRACK` environments
@@ -448,9 +453,10 @@ OPENSQUILLA_TELEMETRY_DISABLED=true
 OPENSQUILLA_UPDATE_CHECK_DISABLED=true
 ```
 
-The legacy telemetry variable is retained only as a global telemetry veto; it
-does not re-enable the retired endpoints. See [`PRIVACY.md`](PRIVACY.md) for
-the complete data, consent, deletion, update, and external-producer rules.
+The legacy telemetry variable disables V1 and V2 reporting. The legacy update
+variable also suppresses V1 uploads for compatibility, but does not disable V2.
+See [`PRIVACY.md`](PRIVACY.md) for the complete data, reporting, deletion, update,
+and external-producer rules.
 
 ---
 

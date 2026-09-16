@@ -1985,6 +1985,7 @@ describe('useChatRpcEventHandlers compaction ownership', () => {
           status,
           source: 'automatic',
           compaction_id: 'cmp-committed',
+          ...(status === 'completed' ? { durability: 'durable' } : {}),
         }, { authoritativeLive: true })
 
         expect(messages.value).toHaveLength(2)
@@ -2000,6 +2001,11 @@ describe('useChatRpcEventHandlers compaction ownership', () => {
         expect(stream.startStreaming).not.toHaveBeenCalled()
         expect(stream.recordCompactionActivity).not.toHaveBeenCalled()
         expect(lastStreamSeq.value).toBe(31)
+        if (status === 'emergency_ephemeral' || status === 'completed') {
+          expect(messages.value[1]?.statusHistory?.[0]?.durability).toBe(
+            status === 'emergency_ephemeral' ? 'request_scoped' : 'durable',
+          )
+        }
       } finally {
         stop()
       }

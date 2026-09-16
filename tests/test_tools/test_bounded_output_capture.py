@@ -258,16 +258,22 @@ async def test_background_log_and_wait_retain_output_after_nonzero_exit(
         return await asyncio.create_subprocess_exec(*argv, **kwargs)
 
     monkeypatch.setattr(shell, "_create_host_shell_subprocess", create_process)
-    session_id = None
+    session = None
     try:
         result = await shell._start_host_background_process(
             command, cwd=None, effective_timeout=10, runtime=None,
         )
         session_id = result.splitlines()[0].split("=", 1)[1]
+        session = shell._bg_sessions[session_id]
         payload = json.loads(await shell.process("wait", session_id=session_id, timeout=10))
         assert payload["exited"] is True
+        # Process exit can precede retained-log finalization on a busy disk.
+        # Wait for the collector before asserting its completed session state.
+        assert session.collector_task is not None
+        await asyncio.wait_for(asyncio.shield(session.collector_task), timeout=10)
+        payload = json.loads(await shell.process("wait", session_id=session_id, timeout=10))
         assert payload["session"]["returncode"] == 7
-        capture = shell._bg_sessions[session_id].output_capture
+        capture = session.output_capture
         assert "last error" in capture.preview()
         assert all(not view.head and not view.tail for view in capture.previews.values())
         restored = await capture.preview_async()
@@ -281,9 +287,15 @@ async def test_background_log_and_wait_retain_output_after_nonzero_exit(
             handle, session_id="test-session",
         ).content
     finally:
-        if session_id:
-            await shell.process("remove", session_id=session_id)
-        current_tool_context.reset(token)
+        try:
+            if session is not None:
+                if session.process.returncode is None:
+                    await shell.process("kill", session_id=session.session_id)
+                if session.collector_task is not None:
+                    await asyncio.wait_for(asyncio.shield(session.collector_task), timeout=10)
+                await shell.process("remove", session_id=session.session_id)
+        finally:
+            current_tool_context.reset(token)
 
 
 def test_execute_code_declares_budget_including_cleanup() -> None:

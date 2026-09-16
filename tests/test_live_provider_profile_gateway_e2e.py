@@ -957,6 +957,7 @@ def test_attachment_capacity_runner_bounds_provider_http_failures_to_one_call(
         ("timeout", "transport", 0),
     ],
 )
+@pytest.mark.ci_serial
 def test_attachment_capacity_runner_fails_closed_for_stream_faults(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

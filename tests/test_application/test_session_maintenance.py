@@ -337,3 +337,37 @@ async def test_invalid_compaction_budget_never_loads_session() -> None:
         )
 
     assert ports.calls == []
+
+
+@pytest.mark.parametrize(
+    ("reason", "status"),
+    [
+        ("within_compaction_budget", "skipped"),
+        ("no_safe_turn_boundary", "skipped"),
+        ("stale_preimage", "stale"),
+        ("stale_context_state", "stale"),
+        ("consumer_admission_stale", "stale"),
+        ("consumer_admission_failed", "failed"),
+        ("summary_target_unavailable", "failed"),
+        ("coverage_blocked", "failed"),
+        ("summary_replay_incomplete", "failed"),
+        ("invalid_source_boundary", "failed"),
+        (None, "failed"),
+    ],
+)
+async def test_manual_compaction_classifies_unapplied_candidates(reason, status) -> None:
+    ports = _Ports()
+    ports.execution = SessionCompactionExecutionResult(
+        applied=False, summary_len=0, summary_source="skipped", skip_reason=reason,
+    )
+
+    result = await _application(ports).compact(CompactSession("agent:main:webchat:one"))
+
+    assert result.status == status
+    assert result.reason == (reason or "empty_summary")
+    assert result.applied is False
+    assert result.removed_count == 0
+    terminal = [event for event in ports.events if event.terminal]
+    assert len(terminal) == 1
+    assert terminal[0].status == status
+    assert terminal[0].reason == result.reason

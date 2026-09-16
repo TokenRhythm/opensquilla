@@ -555,6 +555,9 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
         message.statusHistory[statusIndex] = {
           ...marker,
           state,
+          durability: compactionStatus(payload) === 'emergency_ephemeral'
+            ? 'request_scoped'
+            : String(payload.durability || marker.durability || ''),
           reason: String(payload.reason || payload.skip_reason || marker.reason || ''),
           // The lifecycle stays anchored where its started frame first appeared.
           at: marker.at,

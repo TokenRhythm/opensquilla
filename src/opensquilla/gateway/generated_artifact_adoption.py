@@ -319,6 +319,7 @@ class GeneratedArtifactAdopter:
             session_id=self.session_id,
             ref=ref,
             working_source=source,
+            publication_id=event.publication_id,
         )
         if adopted is None:
             return

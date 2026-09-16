@@ -56,7 +56,7 @@ def _scope(sink: _Sink) -> UsageAccountingScope:
 def _response_payload(content: str = "summary") -> dict:
     return {
         "model": "provider/actual-model",
-        "choices": [{"message": {"content": content}}],
+        "choices": [{"finish_reason": "stop", "message": {"content": content}}],
         "usage": {
             "prompt_tokens": 11,
             "completion_tokens": 7,

@@ -3060,7 +3060,14 @@
       "expandActivity": "Expandir actividad de instalación",
       "collapseActivity": "Contraer actividad de instalación",
       "selectSkillDirectory": "Selecciona un directorio de habilidades",
+      "installPhase": {
+        "resolving": "Resolviendo la fuente",
+        "downloading": "Descargando archivos",
+        "scanning": "Analizando el contenido",
+        "committing": "Guardando la instalación"
+      },
       "queueStatus": {
+        "waiting": "Esperando el resultado de instalación",
         "selection_required": "Elegir directorio",
         "queued": "En cola",
         "installing": "Instalando",
@@ -4144,6 +4151,8 @@
     "compact": {
       "compacting": "Compactando el contexto",
       "compacted": "Contexto compactado",
+      "temporarilyReduced": "Historial reducido temporalmente; continuando",
+      "summarySaved": "Resumen guardado",
       "historyPreserved": "Contexto anterior resumido; los mensajes originales siguen disponibles en el historial",
       "historyIncomplete": "Contexto anterior resumido; algunos mensajes originales no están disponibles",
       "historySummarized": "Contexto anterior resumido",

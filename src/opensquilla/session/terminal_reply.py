@@ -12,6 +12,23 @@ from opensquilla.silent_reply import (
 )
 
 CONTEXT_PAYLOAD_TOO_LARGE_CODE = "provider_request_too_large"
+CONTEXT_PAYLOAD_TOO_LARGE_MESSAGES = {
+    "provider_system_prompt_too_large": (
+        "The fixed system instructions exceed the provider request budget. "
+        "Shorten the system instructions or choose a larger-context model. "
+        "Stored history was not changed."
+    ),
+    "provider_tool_schema_too_large": (
+        "The tool definitions exceed the provider request budget. "
+        "Reduce the available tools or choose a larger-context model. "
+        "Stored history was not changed."
+    ),
+    "provider_protected_context_too_large": (
+        "The current input and protected recent context still exceed the "
+        "provider request budget after safe history reduction. Shorten the "
+        "current input or choose a larger-context model. Stored history was not changed."
+    ),
+}
 ENSEMBLE_MULTIMODAL_UNSUPPORTED_CODE = "ensemble_multimodal_unsupported"
 ENSEMBLE_MULTIMODAL_UNSUPPORTED_MESSAGE = (
     "Ensemble does not support image input yet. "
@@ -190,6 +207,12 @@ def build_terminal_reply(
     if is_context_payload_too_large(record_or_payload) or (
         isinstance(existing, str) and _contains_context_payload_marker(existing)
     ):
+        # Only our complete, fixed diagnostics may survive this boundary.
+        # Upstream prose (including text appended to a known message) stays
+        # behind the generic context-error projection below.
+        for message in CONTEXT_PAYLOAD_TOO_LARGE_MESSAGES.values():
+            if error_message == _normalize(message):
+                return message
         return (
             "The request is too large for the provider context window after "
             "automatic context compaction and payload reduction. OpenSquilla "
