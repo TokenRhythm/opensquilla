@@ -1277,6 +1277,13 @@
     },
     {
       "kind": "method",
+      "wireName": "skills.install.status",
+      "roles": [
+        "result"
+      ]
+    },
+    {
+      "kind": "method",
       "wireName": "skills.list",
       "roles": [
         "result"

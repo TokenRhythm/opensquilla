@@ -24,7 +24,8 @@ test('production cannot import or re-export the verification compiler', () => {
 test('production references exactly match the reviewed target policy', () => {
   const result = evaluateProductionTargets()
   assert.deepEqual(result.failures, [])
-  assert.equal(result.targets.length, 218)
+  assert.ok(result.targets.includes('method:skills.install.status:result'))
+  assert.equal(result.targets.length, 219)
   assert.deepEqual(result.targets.filter(target => (
     target.startsWith('method:models.capacity.resolve:')
   )), [
